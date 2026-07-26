@@ -66,7 +66,9 @@ its definition.
 | Tuples | tuple types `(A, B)`, tuple expressions, positional access `t.0` |
 | Closures | non-capturing `|a: T| expr`, lifted to a plain function |
 | Paths | `a::b::C` in type position |
-| Module items | `use` and `extern crate` are erased; `core::ffi::c_*` map to their C types |
+| Module items | `use`, `extern crate` and `mod X;` are erased; `core::ffi::c_*` map to their C types |
+| Visibility | `pub`, `pub(crate)`, `pub(in path)`, `pub unsafe extern "C"` |
+| Lifetimes | `'a` is accepted and dropped |
 | Types | `i8 i16 i32 i64 isize`, `u8 u16 u32 u64 usize`, `f32 f64`, `bool`, `char`, `()`, `&str` |
 | Pointers | `*const T`, `*mut T`, `&T`, `&mut T` (all lower to `T *`) |
 | Arrays | `[T; N]`, and slices `&[T]` / `&mut [T]` |
@@ -488,12 +490,15 @@ Measuring compilation instead of translation changed the picture completely:
 
 | | files |
 |---|---|
-| translate (at least one lowered item) | 67 |
-| **actually compile to an object** | **33** |
+| translate (at least one lowered item) | 75 |
+| **actually compile to an object** | **50** |
 
 Erasing `use` and mapping the `c_*` types took that second number from 12 to
 33 — nearly a 3x improvement from two small changes that three rounds of
-ranking blockers by first-error frequency had never surfaced.
+ranking blockers by first-error frequency had never surfaced. Working through
+the compile-stage errors that remained (nested `use` groups, `mod X;`,
+visibility qualifiers, lifetimes) took it to 50. None of those was a language
+feature; all of them were things that translated cleanly and failed later.
 
 `survey --verify` now compiles the translatable files and reports both
 numbers, along with what stops the rest. It costs about a minute and it is the
@@ -505,6 +510,28 @@ how many blockers a typical file has (mean 3.1), how many files each feature
 would unlock *on its own*, and a greedy set-cover over the real data — which is
 a far better roadmap than a frequency ranking, because a file is only unlocked
 when every one of its blockers is gone.
+
+## Lifetimes and visibility
+
+**Lifetimes are dropped in the lexer.** Crust has no borrow checker, so `'a`
+carries nothing it could act on, and removing it there spares every later pass
+from knowing about it. A comma that follows one inside `<'a, T>` goes with it,
+so the remaining argument list stays well formed. Char literals are unaffected:
+the giveaway is that a char literal closes after one character, so `'x'` is a
+literal and `'a` is a lifetime.
+
+This one mattered more than its size suggests. The item scanner blanks string
+and char literals before looking for items, so a lifetime was being blanked as
+an unterminated char literal — swallowing everything up to the next quote and
+destroying the structure the scan exists to find. Files using lifetimes were
+not *partly* understood; they were invisible.
+
+**Visibility** is skipped wherever it can appear: `pub`, `pub(crate)`,
+`pub(in some::path)`, and any combination with `unsafe` and `extern "C"`. The
+modifier matcher runs against text whose string literals have been blanked, so
+it cannot look for the literal spelling of `extern "C"` — real FFI code writes
+`pub unsafe extern "C" fn` constantly, and matching the spelling missed all of
+it.
 
 ## Paths, tuples and closures
 
@@ -725,7 +752,7 @@ Where things stand on Redox (kernel + relibc + ion, 615 files):
 | partial (some items lowered) | 35 | 5.7% |
 | failed (items found, translation errored) | 459 | 74.6% |
 | empty (no Rust items recognized) | 89 | 14.5% |
-| **compile to an object** (`survey --verify`) | **33** | **5.4%** |
+| **compile to an object** (`survey --verify`) | **50** | **8.1%** |
 
 6355 top-level Rust items parse. With generics landed, the ranked blockers
 behind the 458 remaining failures are paths in type position (7.9%), `impl
