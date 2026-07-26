@@ -1511,3 +1511,96 @@ fn f() -> i32 { P::make().get() }
 """)
         self.assertNotIn("&P_make()", c)
         self.assertIn("P_make()", c)
+
+
+class TestCrustMacros(unittest.TestCase):
+    """Built-in macros and `macro_rules!`."""
+
+    def test_println_picks_specs_from_types(self):
+        c = crust.translate("""
+fn f() {
+    let i: i32 = 1;
+    let d: f64 = 1.0;
+    let s: &str = "x";
+    println!("{} {} {}", i, d, s);
+}
+""")
+        self.assertIn('"%d %g %s\\n"', c)
+
+    def test_braces_and_percent_are_escaped(self):
+        c = crust.translate('fn f() { println!("{{}} 50%"); }')
+        self.assertIn('"{} 50%%\\n"', c)
+
+    def test_format_hint_overrides_the_type(self):
+        c = crust.translate("fn f() { let n: i32 = 1; println!(\"{:x}\", n); }")
+        self.assertIn("%x", c)
+
+    def test_assert_aborts_on_failure(self):
+        self.assertEqual(_run("fn main() -> i32 { assert!(1 > 2); 0 }",
+                              suffix=".rs"), -6)      # SIGABRT
+
+    def test_assert_passes_quietly(self):
+        self.assertEqual(_run("""
+fn main() -> i32 { assert!(1 < 2); assert_eq!(2, 2); assert_ne!(2, 3); 42 }
+""", suffix=".rs"), 42)
+
+    def test_debug_assert_is_compiled_out(self):
+        self.assertEqual(_run(
+            "fn main() -> i32 { debug_assert!(1 > 2); 42 }",
+            suffix=".rs"), 42)
+
+    def test_cfg_is_false(self):
+        self.assertEqual(_run("""
+fn main() -> i32 { if cfg!(feature = "nope") { 1 } else { 42 } }
+""", suffix=".rs"), 42)
+
+    def test_unsupported_macro_is_named(self):
+        with self.assertRaises(crust.CrustError) as cm:
+            crust.translate('fn f() { let v = format!("{}", 1); }')
+        self.assertIn("format", str(cm.exception))
+
+    def test_macro_rules_single_arg(self):
+        self.assertEqual(_run("""
+macro_rules! square { ($x:expr) => { ($x) * ($x) }; }
+fn main() -> i32 { square!(6) + 6 }
+""", suffix=".rs"), 42)
+
+    def test_macro_rules_two_args(self):
+        self.assertEqual(_run("""
+macro_rules! maxof { ($a:expr, $b:expr) => { if $a > $b { $a } else { $b } }; }
+fn main() -> i32 { maxof!(11, 42) }
+""", suffix=".rs"), 42)
+
+    def test_macro_rules_no_args(self):
+        self.assertEqual(_run("""
+macro_rules! answer { () => { 42 }; }
+fn main() -> i32 { answer!() }
+""", suffix=".rs"), 42)
+
+    def test_macro_rules_picks_the_matching_rule(self):
+        self.assertEqual(_run("""
+macro_rules! pick {
+    () => { 1 };
+    ($a:expr) => { 40 };
+    ($a:expr, $b:expr) => { $a + $b };
+}
+fn main() -> i32 { pick!() + pick!(9) + pick!(1, 0) }
+""", suffix=".rs"), 42)
+
+    def test_macro_argument_is_a_full_expression(self):
+        # The capture must not stop at the comma inside `g(1, 2)`.
+        self.assertEqual(_run("""
+macro_rules! twice { ($x:expr) => { ($x) + ($x) }; }
+fn g(a: i32, b: i32) -> i32 { a + b }
+fn main() -> i32 { twice!(g(1, 20)) }
+""", suffix=".rs"), 42)
+
+    def test_no_matching_rule_is_reported(self):
+        with self.assertRaises(crust.CrustError):
+            crust.translate("macro_rules! one { ($a:expr) => { $a }; }\n"
+                            "fn f() -> i32 { one!(1, 2) }")
+
+    def test_macro_definition_emits_no_c(self):
+        c = crust.translate("macro_rules! unused { () => { 1 }; }\n"
+                            "fn f() -> i32 { 2 }")
+        self.assertNotIn("unused", c)
