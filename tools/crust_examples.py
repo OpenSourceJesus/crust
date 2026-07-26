@@ -57,6 +57,14 @@ EXAMPLES = [
      "widest = 3\n"
      "len2   = 25\n", True),
 
+    ("generic.rs", 0,
+     "Pair<i32>.sum     = 42\n"
+     "Pair<i32>.largest = 40\n"
+     "Pair<f64>.sum     = 3.75\n"
+     "max(3, 9)         = 9\n"
+     "max(2.5, 1.5)     = 2.5\n"
+     "id::<i32>(7)      = 7\n", True),
+
     ("iter.rs", 0,
      "sum         = 80\n"
      "max         = 23C\n"
