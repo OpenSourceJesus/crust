@@ -459,6 +459,7 @@ class Unit:
         self.consts = {}        # const/static name -> CType
         self.const_values = {}  # const name -> initializer text
         self.const_inits = {}   # name -> (kw, init text) for prelude render
+        self.type_aliases = {}  # name -> CType (fully resolved)
         self.needs = set()      # libc prototypes the lowering requires
         self.slices = {}        # slice struct name -> element CType
         self.tuples = {}        # tuple struct name -> [element CTypes]
@@ -755,6 +756,8 @@ class Parser:
                 if name == "str" and not self.behind_ref:
                     self.err("`str` is unsized; write `&str`")
                 return CType(PRIMITIVES[name])
+            if name in self.unit.type_aliases:
+                return self.unit.type_aliases[name]
             if name == "Result":
                 self.expect("<")
                 ok = self.parse_type()
@@ -841,9 +844,22 @@ class Parser:
         for cand in (flat, last):
             if (cand in self.unit.structs or cand in self.unit.generic_structs
                     or cand in self.unit.enums or cand in PRIMITIVES
-                    or cand in self.tysubst):
+                    or cand in self.tysubst or cand in self.unit.type_aliases):
                 return cand
         return flat
+
+    def parse_type_alias(self):
+        """Parse `type Name = Type;` and return `(name, CType)`."""
+        self.skip_attributes()
+        self.skip_visibility()
+        self.expect("type")
+        name = self.expect_ident()
+        if self.at("<", "punc"):
+            self.err("generic type aliases are not supported")
+        self.expect("=")
+        ty = self.parse_type()
+        self.expect(";")
+        return name, ty
 
     def parse_type_args(self):
         """Parse `<T1, T2>` in type position; return the concrete CTypes."""
@@ -3028,7 +3044,7 @@ def normalize_number(tok):
 # --------------------------------------------------------------------------
 
 _ITEM_START = re.compile(
-    r"\b(?P<kw>fn|struct|impl|enum|const|static|trait)"
+    r"\b(?P<kw>fn|struct|impl|enum|const|static|trait|type)"
     r"(?:\s+|\s*(?=<))(?:<[^<>]*>\s*)?"
     r"(?:mut\s+)?(?P<name>[A-Za-z_]\w*)")
 # Item modifiers that may precede `fn`/`struct`/... The scan text this runs
@@ -3211,6 +3227,15 @@ def find_rust_items(code, rust_file=False):
             continue
 
         after = scan[m.end():]
+        if kw == "type":
+            # `type Name = Type;` — no braces; ends at the semicolon.
+            eq = scan.find("=", m.end())
+            close = scan.find(";", m.end())
+            if eq < 0 or close < 0 or eq > close:
+                continue
+            spans.append((_extend_head(scan, start), close + 1, "type"))
+            continue
+
         if kw == "struct" and after.lstrip().startswith(";"):
             # `struct S;` is spelled identically in both languages: a Rust
             # unit struct and a C forward declaration of an incomplete type.
@@ -3383,7 +3408,8 @@ def collect_items(code, spans, unit, struct_order, fail=None):
     so that a later pass can resolve calls, methods and field types
     regardless of the order things are defined in.
     """
-    local = {"structs": [], "enums": [], "consts": [], "impl_consts": []}
+    local = {"structs": [], "enums": [], "consts": [], "impl_consts": [],
+             "type_aliases": []}
     for start, end, kind in spans:
         toks = tokenize(code[start:end], _line_of(code, start))
         p = Parser(toks, unit)
@@ -3434,6 +3460,10 @@ def collect_items(code, spans, unit, struct_order, fail=None):
                 unit.traits[tname] = methods
                 unit.trait_defaults[tname] = defaults
                 unit.supertraits[tname] = supers
+            elif kind == "type":
+                name, ty = p.parse_type_alias()
+                unit.type_aliases[name] = ty
+                local["type_aliases"].append(name)
             elif kind == "const":
                 kw, name, ty, init = p.parse_const_signature()
                 unit.consts[name] = ty
@@ -3552,6 +3582,7 @@ def _merge_unit(dst, src):
     dst.consts.update(src.consts)
     dst.const_values.update(src.const_values)
     dst.const_inits.update(src.const_inits)
+    dst.type_aliases.update(src.type_aliases)
     dst.generic_structs.update(src.generic_structs)
     dst.generic_fns.update(src.generic_fns)
     dst.traits.update(src.traits)
@@ -3573,7 +3604,7 @@ def collect_mod_items(names, path, unit, struct_order, _seen=None):
     function bodies are translated -- the sibling TU owns those.
     """
     seen = _seen if _seen is not None else set()
-    seeded = {"structs": [], "enums": [], "consts": []}
+    seeded = {"structs": [], "enums": [], "consts": [], "type_aliases": []}
     for name in names:
         filename = resolve_mod_path(name, path)
         if not filename or filename in seen:
@@ -3593,6 +3624,7 @@ def collect_mod_items(names, path, unit, struct_order, _seen=None):
         seeded["structs"].extend(local["structs"])
         seeded["enums"].extend(local["enums"])
         seeded["consts"].extend(local["consts"])
+        seeded["type_aliases"].extend(local["type_aliases"])
     return seeded
 
 
@@ -3879,13 +3911,15 @@ def translate(code, path=None):
     local = collect_items(code, spans, unit, struct_order, fail)
     # Local items win over mod-seeded ones of the same name.
     local_set = (set(local["structs"]) | set(local["enums"])
-                 | set(local["consts"]))
+                 | set(local["consts"]) | set(local["type_aliases"]))
     mod_structs = [n for n in dict.fromkeys(mod_seeded["structs"])
                    if n not in local_set]
     mod_enums = [n for n in dict.fromkeys(mod_seeded["enums"])
                  if n not in local_set]
     mod_consts = [n for n in dict.fromkeys(mod_seeded["consts"])
                   if n not in local_set]
+    mod_aliases = [n for n in dict.fromkeys(mod_seeded["type_aliases"])
+                   if n not in local_set]
 
     # Trait impls inherit any default methods they did not override. This runs
     # before pass 2 so a body can call a default the impl never wrote.
@@ -3898,7 +3932,7 @@ def translate(code, path=None):
         pieces.append(code[prev:start])
         line0 = _line_of(code, start)
         if kind in ("struct", "tuple_struct", "unit_struct", "enum",
-                    "const", "trait", "macro") \
+                    "const", "trait", "macro", "type") \
                 or _is_generic_span(code, start, end, kind):
             # Hoisted into the prelude, or -- for a generic -- a template
             # whose instantiations are appended after the unit instead.
@@ -3980,6 +4014,9 @@ def translate(code, path=None):
     for name in _toposort_structs(
             unit, mod_structs + local["structs"] + unit.struct_order):
         prelude.append(_render_struct(name, unit.structs[name]))
+    # Aliases after structs so `type Handle = Foo` can name a local struct.
+    for name in mod_aliases + local["type_aliases"]:
+        prelude.append("typedef %s;" % unit.type_aliases[name].decl(name))
     for name in sorted(unit.unwraps):
         if name in unit.options:
             if name in included_options:

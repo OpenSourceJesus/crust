@@ -1942,6 +1942,40 @@ fn main() -> i32 {
             shutil.rmtree(work, ignore_errors=True)
 
 
+class TestCrustTypeAliases(unittest.TestCase):
+    """`type Name = T;` as a typedef."""
+
+    def test_local_alias_translates(self):
+        c = crust.translate("type pid_t = i32;\nfn f(p: pid_t) -> pid_t { p }\n")
+        self.assertIn("typedef int pid_t;", c)
+        self.assertIn("int f(int p)", c)
+
+    def test_pub_alias(self):
+        c = crust.translate("pub type ssize_t = i64;\nfn f() -> i32 { 1 }\n")
+        self.assertIn("typedef long ssize_t;", c)
+
+    def test_sibling_alias_compiles(self):
+        self.assertEqual(_run("""
+mod types;
+fn main() -> i32 {
+    let p: pid_t = 40;
+    p + 2
+}
+""", suffix=".rs", extra={
+            "types.rs": "pub type pid_t = i32;\n",
+        }), 42)
+
+    def test_alias_to_struct(self):
+        self.assertEqual(_run("""
+type Handle = Foo;
+struct Foo { x: i32 }
+fn main() -> i32 {
+    let h: Handle = Foo { x: 42 };
+    h.x
+}
+""", suffix=".rs"), 42)
+
+
 class TestCrustVisibility(unittest.TestCase):
     """`pub`, `pub(crate)`, and `pub unsafe extern "C"`."""
 
