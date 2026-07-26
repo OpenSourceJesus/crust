@@ -50,6 +50,31 @@ default:
 	./crust examples/crust/shapes.c -o /tmp/shapes
 	/tmp/shapes
 
+# ---------------------------------------------------------------------------
+# Crust: the C+Rust(+rpython) front end. See CRUST.md.
+#
+#   make test_crust       full check -- the translation-layer unit tests plus
+#                         every example in examples/crust, each compiled, run
+#                         and checked against its expected output/exit status.
+#   make test_fast_crust  the same example runner over a subset that still
+#                         covers all three front ends and both include paths.
+#                         Leans on the /tmp transpile+object caches, so it is
+#                         quick enough to run on every edit.
+#
+# Both use tools/crust_examples.py, which holds the expected output for each
+# example so a silent miscompile that still exits 0 is caught.
+test_crust:
+	python3 -m unittest tests.test_crust -v 2>&1 | tail -5
+	python3 tools/crust_examples.py -v
+
+test_fast_crust:
+	@python3 tools/crust_examples.py --fast -v
+
+# Drop the cached rpython transpiles and runtime objects that a
+# `#include "*.py"` builds up under /tmp.
+clean_crust:
+	rm -rf /tmp/crust-rpy build/crust
+
 # Run the ENTIRE test suite via unittest discovery (still under pypy3).
 test: shim
 	cd tests && pypy3 -m unittest discover -s .

@@ -64,13 +64,14 @@ its definition.
 | Arrays | `[T; N]`, and slices `&[T]` / `&mut [T]` |
 | Option | `Option<T>`, `Some(x)`, `None`, `is_some`, `is_none`, `unwrap`, `unwrap_or`, `if let`, `while let` |
 | Result | `Result<T, E>`, `Ok(x)`, `Err(e)`, `is_ok`, `is_err`, `unwrap`, `unwrap_err`, `unwrap_or`, `ok`, and the `?` operator |
-| Statements | `let` (with `mut` and optional annotation), `return`, `if`/`else if`/`else`, `while`, `loop`, `for x in a..b` and `a..=b`, `match`, `break`, `continue`, local `const`, blocks |
-| Expressions | literals, array literals `[a, b, c]` and `[0; N]`, calls, indexing, field access, unary and binary operators, compound assignment, `as` casts, `if`/`else` as an expression |
+| Statements | `let` (with `mut` and optional annotation), `return`, `if`/`else if`/`else`, `while`, `loop`, `for x in a..b` and `a..=b`, `for x in slice_or_array`, `match`, `break`, `continue`, local `const`, blocks |
+| Expressions | literals, array literals `[a, b, c]` and repeats `[v; N]`, calls, indexing, field access, unary and binary operators, compound assignment, `as` casts, `if`/`else` as an expression |
 | Tail expressions | a trailing expression in a function body becomes its return value |
 | Structs | field declarations, struct literals `P { x: 1 }`, field access with auto-deref, nested struct fields |
 | Methods | `&self`, `&mut self`, `self`, associated functions, associated `const`s, `Self`, method calls `p.m()`, path calls `P::m()` |
 | Enums | C-like variants with optional discriminants, `E::V` paths, exhaustiveness-checked `match`, `impl` blocks |
 | Tuple structs | `struct P(T, U);`, construction `P(a, b)`, positional access `p.0` |
+| Unit structs | `struct S;`, used as its own value, with `impl` blocks |
 
 Type mapping is the obvious one (`i32` → `int`, `u64` → `unsigned long`,
 `f64` → `double`, `bool` → `_Bool`, `()` → `void`). An unrecognized named type
@@ -170,6 +171,72 @@ Because the representation is an ordinary C struct, **C can build and pass
 slices too** — `(crust_slice_int){data, 6}` is exactly what Crust emits — so
 the boundary stays free of conversion shims.
 
+## Iteration
+
+`for x in xs` walks a slice or an array directly, lowering to the index loop
+you would otherwise write by hand:
+
+```rust
+for x in xs { total += x; }
+```
+
+```c
+{ crust_slice_int _crust_opt1 = xs;
+  for (unsigned long _crust_i2 = 0; _crust_i2 < _crust_opt1.len; _crust_i2++)
+  { int x = _crust_opt1.ptr[_crust_i2]; total += x; } }
+```
+
+The subject is held in a temporary, so a call in that position is evaluated
+once per loop rather than once per iteration, and the whole construct is
+wrapped in a block to scope both the temporary and the induction variable. An
+array takes its length from its own type; a raw pointer is rejected, since its
+length is not known — slice it first (`&p[0..n]`) or use a range.
+
+The binding is a **copy** of the element, which is `for x in xs.iter().copied()`
+rather than Rust's reference binding. Crust has no borrow checker to make the
+difference observable, and a copy is what the C on the other side of the
+boundary would do. `.iter()` and `.iter_mut()` are accepted as no-ops so the
+idiomatic spelling reads the same; there is no iterator protocol behind them,
+so adaptors like `.map` are not available.
+
+## Unit structs
+
+`struct S;` declares a struct with no fields, and as in Rust its own name is
+its value. C11 has no empty struct, so the lowered type carries a single
+placeholder byte named `_crust_unit`; constructing one is just zeroing it.
+`impl` blocks work as they do on any other struct.
+
+C spells a forward declaration exactly the same way, and unlike the `enum`
+case (told apart by the trailing `;`) or a struct body (told apart by `name:
+type` fields), nothing in the text itself distinguishes the two. Reading a C
+forward declaration as a complete one-byte type would be a real miscompile —
+`sizeof(struct S)` on an incomplete type must fail, and would wrongly start
+succeeding. So Crust claims `struct S;` only on evidence:
+
+- the whole file is Rust (a `.rs` input, where there is no C to be ambiguous
+  with), or
+- the unit gives the name an `impl` block, which C cannot spell.
+
+The cost is that a unit struct with no `impl`, in a `.c` file, is left as C.
+That is the safe direction to fail, and it follows the same
+disambiguate-on-evidence rule the rest of the front end uses.
+
+## Array repeats
+
+`[v; N]` is written out element by element, so `[7; 3]` becomes `{7, 7, 7}`.
+The length must be an integer literal or an integer `const` — which Crust
+already lowers to a C enum constant precisely so it can size an array:
+
+```rust
+const LANES: usize = 4;
+let bias: [i32; LANES] = [3; LANES];
+```
+
+The all-zero form `[0; N]` is special-cased to `{0}`, which zero-fills
+whatever the annotation sizes and so needs no literal length at all. A
+non-zero repeat with a non-constant length has nothing to expand to and is
+rejected rather than silently mislowered.
+
 ## Option
 
 Crust has no generics, so each `Option<T>` is **monomorphised** into its own
@@ -251,17 +318,83 @@ the includer, without inlining its text. That is what lets a Rust function in
 the C file construct a `Vec2` or call `Vec2::new`, while the `#include` itself
 stays in place for the preprocessor to expand.
 
+## rpython modules by `#include`
+
+The repo already has a second source-to-source front end: `tools/py2c.py`,
+which lowers rpython to C. So `#include "foo.py"` can be answered the same way
+`#include "foo.rs"` is — transpile the module, splice the generated C in where
+the directive stood. The hook is the same one Crust uses
+(`preproc._do_include`), so `-I` directories, quoted vs angle-bracket lookup,
+nested includes and include guards all behave normally, and one translation
+unit can hold all three languages:
+
+```c
+#include "vec2.rs"        /* Rust    */
+#include "histogram.py"   /* rpython */
+
+fn bar(count: i32, total: i32) -> i32 {   /* Rust, calling rpython */
+    scale_to_width(count, total, 40)
+}
+
+int main(void) { ... }    /* C, calling both */
+```
+
+Everything is ordinary C by the time the lexer runs, so every call across
+those boundaries is a direct call — same IL, same register allocator, full
+inlining — exactly as it is between C and Rust.
+
+Two post-processing rules, shared with `main.process_py_file` so an included
+module and one named on the command line are classified identically:
+
+- A module that touches the transpiler runtime (lists, dicts, strings,
+  objects) keeps its `#include "shivyc_rt.h"`. The header is written into the
+  same cache directory as the generated C, so the nested include resolves
+  relative to it, and `shivyc_rt.c` is compiled and added to the link line.
+- A module that does not — a pure numeric kernel — gets the runtime include
+  dropped and only the libc/libm prototypes it actually names prepended, so it
+  compiles as plain C11 with nothing to link.
+
+### Caching
+
+Transpiling is by far the slowest step, and `shivyc_rt.c` is ~48KB of C that
+would otherwise be recompiled on every build. Both are cached under
+`/tmp/crust-rpy/`, keyed by a hash of the module text and of `py2c.py` itself,
+so editing either busts the cache. The compiled runtime object is cached
+alongside, keyed additionally by a hash of every code-generation flag, so an
+object is only ever reused for an identical configuration.
+
+The effect on a rebuild that touches nothing:
+
+| build | cold | warm |
+|---|---|---|
+| module using the runtime | 2.5s | 0.55s |
+| `make test_fast_crust` | 3.8s | 1.7s |
+
+Set `CRUST_RPY_CACHE` to move the cache; `make clean_crust` empties it.
+
+### Caveats
+
+`py2c` does not preserve line numbers, so unlike the `.rs` path — where
+diagnostics name the Rust module and its own line — a diagnostic from an
+included `.py` names the *generated* C in the cache directory. The generated
+file is kept on disk precisely so it can be read.
+
+A module with globals needs its generated `<module>_init()` called before
+those globals are live; the examples here have none. And `shivyc_rt.h` pulls
+in the bundled `<stdio.h>`, which declares `printf` with no prototype, so a
+unit that prints a `double` should declare `int printf(const char *, ...);`
+itself, as every example in `examples/crust` does.
+
 ## Not yet supported
 
 Traits, user-defined generics (`Option` and `Result` are the only
-monomorphised types), closures, modules, `Vec`, iterators (`for x in slice` —
-use `for i in 0..xs.len()`), `From`/`Into` conversions, lifetimes, and the
-borrow checker. Enums cannot carry data, `match` has no bindings, guards or range
-patterns, and unit structs are not recognized. Slices carry no bounds
-checking.
-Non-zero array repeat initializers (`[7; N]`) are rejected because C has no
-equivalent syntax. Paths (`a::b`) are flattened to `a_b`. These are the
-natural next increments — the parser is a few hundred lines of legible
+monomorphised types), closures, modules, `Vec`, the iterator protocol proper
+(`.map`, `.filter`, `.zip`, chained adaptors), `From`/`Into` conversions,
+lifetimes, and the borrow checker. Enums cannot carry data, and `match` has no
+bindings, guards or range patterns. Slices carry no bounds checking. A repeat
+initializer whose length is not a literal or `const` is rejected, since C has
+no repeat syntax to lower it to. Paths (`a::b`) are flattened to `a_b`. These
+are the natural next increments — the parser is a few hundred lines of legible
 Python, in keeping with the rest of the front end.
 
 ## Examples
@@ -280,6 +413,12 @@ Python, in keeping with the rest of the front end.
   `while let` and `unwrap_or`.
 - `examples/crust/parse.rs` — `Result<T, E>` with an error enum, the `?`
   operator, `unwrap_err` and `.ok()`.
+- `examples/crust/iter.rs` — `for x in xs` over slices and arrays, a unit
+  struct with an `impl` block, and the `[v; N]` repeat initializer.
+- `examples/crust/histogram.py` and `examples/crust/polyglot.c` — C, Rust and
+  rpython in one translation unit, each calling the other two.
+- `examples/crust/tally.py` and `examples/crust/tally.c` — an rpython module
+  that uses lists and strings, so the py2c runtime is linked in automatically.
 
 ## Tests
 
@@ -291,3 +430,15 @@ boundary in both directions.
 ```sh
 python3 -m pytest tests/test_crust.py -q
 ```
+
+Two make targets wrap this up with the examples:
+
+```sh
+make test_crust        # unit tests + every example, output and exit status
+make test_fast_crust   # a subset covering all three front ends, ~1.7s warm
+make clean_crust       # drop the /tmp transpile and runtime-object caches
+```
+
+Both drive `tools/crust_examples.py`, which holds the expected stdout and exit
+status for each example, so a silent miscompile that still exits 0 is caught
+rather than passing.
