@@ -10,7 +10,7 @@ import shivyc.tree.decl_nodes as decl_nodes
 from shivyc.ctypes import (PointerCType, ArrayCType, FunctionCType,
                            StructCType, UnionCType)
 from shivyc.errors import CompilerError, error_collector
-from shivyc.il_gen import ILValue
+from shivyc.il_gen import ILCode, ILValue
 from shivyc.tree.base_nodes import CNode
 from shivyc.tree.utils import DirectLValue, report_err
 
@@ -356,15 +356,20 @@ class DeclInfo:
                 il_code.static_initialize_block(
                     var, [(0, var.ctype.size, addr)], var.ctype.size)
                 return
+            # Evaluate on a probe IL so a non-constant init (e.g. a call)
+            # cannot crash with KeyError when cur_func is unset at file scope.
+            probe = ILCode()
+            probe.start_func("<static-init-probe>")
+            init = self.init.make_il(probe, symbol_table, c)
+            if not init.literal:
+                err = ("non-constant initializer for variable with static "
+                       "storage duration")
+                raise CompilerError(err, self.init.r)
+            il_code.static_initialize(var, getattr(init.literal, "val", None))
+            return
 
         init = self.init.make_il(il_code, symbol_table, c)
-        if storage == symbol_table.STATIC and not init.literal:
-            err = ("non-constant initializer for variable with static "
-                   "storage duration")
-            raise CompilerError(err, self.init.r)
-        elif storage == symbol_table.STATIC:
-            il_code.static_initialize(var, getattr(init.literal, "val", None))
-        elif var.ctype.is_arith() or var.ctype.is_pointer():
+        if var.ctype.is_arith() or var.ctype.is_pointer():
             lval = DirectLValue(var)
             lval.set_to(init, il_code, self.identifier.r)
         elif var.ctype.is_struct_union():
@@ -417,6 +422,9 @@ class DeclInfo:
         if storage == symbol_table.STATIC:
             consts = []
             all_zero = True
+            # Probe IL: file-scope cur_func is None; never emit into real code.
+            probe = ILCode()
+            probe.start_func("<static-init-probe>")
             for off, ctype, expr in entries:
                 addr = self._static_addr_const(
                     expr, symbol_table, il_code, c)
@@ -424,7 +432,7 @@ class DeclInfo:
                     consts.append((off, ctype.size, addr))
                     all_zero = False
                     continue
-                v = expr.make_il(il_code, symbol_table, c)
+                v = expr.make_il(probe, symbol_table, c)
                 if not v.literal:
                     err = ("non-constant initializer for variable with static "
                            "storage duration")

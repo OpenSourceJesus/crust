@@ -89,6 +89,11 @@ class ILCode:
         command (ILCommand) - command to be added
 
         """
+        # File-scope evaluation must use a probe IL (see DeclInfo.do_init).
+        # Hitting None here is an internal miss — never a bare KeyError.
+        if self.cur_func is None:
+            raise CompilerError(
+                "internal: IL command emitted outside of a function")
         self.commands[self.cur_func].append(command)
 
     def always_returns(self):
