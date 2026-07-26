@@ -1416,12 +1416,98 @@ fn main() -> i32 {
             crust.translate("struct W<T> { v: T }\nfn f() { let x = W { v: 1 }; }")
 
     def test_unknown_generic_names_the_problem(self):
-        # Redox is full of these: a generic Crust has no source for.
+        # Redox is full of these: a generic Crust has no source for. `Vec` is
+        # no longer one, since the bundled core supplies it -- but a std type
+        # core does not carry still is.
         with self.assertRaises(crust.CrustError) as cm:
-            crust.translate("fn f(v: Vec<i32>) -> i32 { 0 }")
+            crust.translate("fn f(v: BTreeMap<i32>) -> i32 { 0 }")
         self.assertIn("no definition for generic type", str(cm.exception))
 
     def test_wrong_arity_is_rejected(self):
         with self.assertRaises(crust.CrustError):
             crust.translate("struct P<T> { v: T }\n"
                             "fn f() { let x: P<i32, i32> = P { v: 1 }; }")
+
+
+class TestCrustCore(unittest.TestCase):
+    """The bundled minimal core: Vec<T>, Box<T>, Cell<T>, PhantomData<T>."""
+
+    def test_vec_push_and_get(self):
+        self.assertEqual(_run("""
+fn main() -> i32 {
+    let mut v: Vec<i32> = Vec::<i32>::new();
+    v.push(40);
+    v.push(2);
+    let r: i32 = v.get(0) + v.get(1);
+    v.free_buf();
+    r
+}
+""", suffix=".rs"), 42)
+
+    def test_vec_grows(self):
+        self.assertEqual(_run("""
+fn main() -> i32 {
+    let mut v: Vec<i32> = Vec::<i32>::new();
+    for i in 0..100 {
+        v.push(i);
+    }
+    let n: i32 = v.len() as i32;
+    v.free_buf();
+    n - 58
+}
+""", suffix=".rs"), 42)
+
+    def test_box_roundtrip(self):
+        self.assertEqual(_run("""
+fn main() -> i32 {
+    let mut b: Box<i32> = Box::<i32>::new(42);
+    let v: i32 = b.get();
+    b.free_box();
+    v
+}
+""", suffix=".rs"), 42)
+
+    def test_vec_is_a_plain_c_struct(self):
+        # The whole point: no boxing, so C can read it directly.
+        c = crust.translate("fn f() { let v: Vec<i32> = Vec::<i32>::new(); }")
+        self.assertIn("struct Vec_int { int *ptr;", c)
+
+    def test_two_element_types_are_distinct(self):
+        c = crust.translate("""
+fn f() { let a: Vec<i32> = Vec::<i32>::new(); }
+fn g() { let b: Vec<f64> = Vec::<f64>::new(); }
+""")
+        self.assertIn("struct Vec_int", c)
+        self.assertIn("struct Vec_double", c)
+
+    def test_unused_core_emits_nothing(self):
+        # Seeding must be free for a unit that never mentions core.
+        c = crust.translate("fn f() -> i32 { 1 }")
+        self.assertNotIn("Vec", c)
+        self.assertNotIn("malloc", c)
+
+    def test_local_definition_wins(self):
+        c = crust.translate("""
+struct Vec<T> { only: T }
+fn f() { let v: Vec<i32> = Vec { only: 1 }; }
+""")
+        self.assertIn("struct Vec_int { int only; };", c)
+        self.assertNotIn("cap", c)
+
+    def test_size_of_intrinsic(self):
+        c = crust.translate("fn f() -> usize { size_of::<f64>() }")
+        self.assertIn("sizeof(double)", c)
+
+    def test_auto_ref_materialises_a_temporary(self):
+        # `a.f().g()` -- the receiver is a value, so C cannot take its
+        # address; Crust must bind it to a temporary rather than emit `&f()`.
+        c = crust.translate("""
+struct P { v: i32 }
+impl P {
+    fn make() -> P { P { v: 1 } }
+    fn get(&self) -> i32 { self.v }
+}
+fn f() -> i32 { P::make().get() }
+""")
+        self.assertNotIn("&P_make()", c)
+        self.assertIn("P_make()", c)
