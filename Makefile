@@ -45,9 +45,10 @@ CPY_DEFS := -D Py_BUILD_CORE -D thread_local=_Thread_local \
 BSD_REPO ?= https://github.com/brentharts/2.11BSD-riscv
 BSD_DIR  ?= $(ROOT)/2.11BSD-riscv
 
-default: shim
-	cd tests && pypy3 ./test_all.py
-	cd tests && pypy3 ./test_float.py
+default:
+	chmod +x ./crust
+	./crust examples/crust/shapes.c -o /tmp/shapes
+	/tmp/shapes
 
 # Run the ENTIRE test suite via unittest discovery (still under pypy3).
 test: shim
