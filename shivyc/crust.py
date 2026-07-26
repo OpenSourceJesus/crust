@@ -426,6 +426,8 @@ class Unit:
         self.const_values = {}  # const name -> initializer text
         self.needs = set()      # libc prototypes the lowering requires
         self.slices = {}        # slice struct name -> element CType
+        self.tuples = {}        # tuple struct name -> [element CTypes]
+        self.fn_ptrs = {}       # fn-pointer typedef -> (ret, params)
         self.options = {}       # Option struct name -> element CType
         self.results = {}       # Result struct name -> (ok, err) CTypes
         self.unwraps = set()    # generated types needing unwrap helpers
@@ -452,6 +454,8 @@ class Unit:
         self.supertraits = {}       # trait -> [trait names]
         self.trait_impls = []       # (trait, owner, tokens)
         self.macros = {}            # macro_rules! name -> [(pattern, body)]
+        self.closure_n = 0          # lifted-closure counter
+        self.statics = set()        # fns with internal linkage
 
     def result_type(self, ok, err):
         """Return (and register) the tagged struct for `Result<ok, err>`."""
@@ -476,6 +480,28 @@ class Unit:
             self.options[name] = elem
             self.structs[name] = [("some", CType("_Bool")),
                                   ("value", elem)]
+        return CType(name)
+
+    def fn_ptr_type(self, ret, params):
+        """Return (and register) a typedef for a function-pointer type."""
+        name = "crust_fn_%s_%s" % (_mangle(ret),
+                                   "_".join(_mangle(t) for t in params)
+                                   or "void")
+        if name not in self.fn_ptrs:
+            self.fn_ptrs[name] = (ret, params)
+        return CType(name)
+
+    def tuple_type(self, elems):
+        """Return (and register) the struct for a tuple type `(A, B, ..)`.
+
+        Monomorphised on demand like a slice or an `Option`, with positional
+        fields named `_0`, `_1`, ... -- the same names a tuple struct already
+        uses, so `t.0` works through the ordinary field-access path.
+        """
+        name = "crust_tuple_" + "_".join(_mangle(e) for e in elems)
+        if name not in self.tuples:
+            self.tuples[name] = elems
+            self.structs[name] = [("_%d" % i, e) for i, e in enumerate(elems)]
         return CType(name)
 
     def slice_type(self, elem):
@@ -634,6 +660,18 @@ class Parser:
             self.next()
             self.next()
             return CType("void")
+        if t.val == "(" and t.kind == "punc":
+            # A tuple type. `(T)` is just a parenthesised T, as in Rust.
+            self.next()
+            elems = [self.parse_type()]
+            while self.accept(","):
+                if self.at(")", "punc"):
+                    break
+                elems.append(self.parse_type())
+            self.expect(")")
+            if len(elems) == 1:
+                return elems[0]
+            return self.unit.tuple_type(elems)
         if t.val == "*":
             self.next()
             if not (self.accept("const") or self.accept("mut")):
@@ -665,6 +703,19 @@ class Parser:
             return CType(inner.base, inner.ptr, dims)
         if t.kind in ("ident", "kw"):
             name = self.next().val
+            if self.at("::", "punc"):
+                # A qualified type: `fmt::Write`, `alloc::boxed::Box<T>`.
+                # Try the flattened spelling first, since that is what a Crust
+                # `mod::Type` definition lowers to; then fall back to the last
+                # segment, which is how a std path like `alloc::boxed::Box`
+                # finds the bundled `Box`. Neither is a guess: both names are
+                # only accepted if the unit actually defines them.
+                segs = [name]
+                while self.accept("::"):
+                    if self.at("<", "punc"):
+                        break                       # turbofish on a path
+                    segs.append(self.expect_ident())
+                name = self._resolve_path(segs)
             if name in PRIMITIVES:
                 if name == "str" and not self.behind_ref:
                     self.err("`str` is unsized; write `&str`")
@@ -740,6 +791,24 @@ class Parser:
 
     def skip_generic_params(self):
         self.parse_generic_params()
+
+    def _resolve_path(self, segs):
+        """Pick the name a qualified type path refers to.
+
+        `a::b::C` is looked up as `a_b_C` (a Crust module-style definition)
+        and then as `C` (the common case for a std path naming a type the
+        bundled core provides). If neither is known, the flattened spelling is
+        returned so the usual "no definition" diagnostic names what was
+        written.
+        """
+        flat = "_".join(segs)
+        last = segs[-1]
+        for cand in (flat, last):
+            if (cand in self.unit.structs or cand in self.unit.generic_structs
+                    or cand in self.unit.enums or cand in PRIMITIVES
+                    or cand in self.tysubst):
+                return cand
+        return flat
 
     def parse_type_args(self):
         """Parse `<T1, T2>` in type position; return the concrete CTypes."""
@@ -1228,7 +1297,11 @@ class Parser:
                 if generic and targs:
                     e = Expr(self.instantiate_fn(e.code, targs), None)
                     generic = False
-                params = self.fn_sigs.get(e.code, (None, []))[1] or []
+                sig = self.fn_sigs.get(e.code)
+                if sig is None and e.type is not None \
+                        and e.type.base in self.unit.fn_ptrs:
+                    sig = self.unit.fn_ptrs[e.type.base]
+                params = (sig[1] if sig else []) or []
                 args, atypes = [], []
                 while not self.at(")", "punc"):
                     want = params[len(args)] if len(args) < len(params) \
@@ -1247,7 +1320,7 @@ class Parser:
                 if e.code in self.unit.tuple_structs:
                     e = self.tuple_struct_literal(e.code, args)
                 else:
-                    ret = self.fn_sigs.get(e.code, (None, None))[0]
+                    ret = sig[0] if sig else None
                     e = Expr("%s(%s)" % (e.code, ", ".join(args)), ret)
             elif self.at("[", "punc"):
                 self.next()
@@ -1581,6 +1654,107 @@ class Parser:
                                        name))
         return Expr("(%s){%s}" % (name, ", ".join(inits)), CType(name))
 
+    def parse_closure(self):
+        """Lower `|a, b| expr` to a lifted top-level function.
+
+        Crust has no closure environment, so only a *non-capturing* closure
+        can be lowered: it becomes an ordinary static function, and the
+        expression evaluates to that function's name -- which in C is a
+        function pointer, so it can be stored, passed and called.
+
+        A closure that reads a local is rejected rather than silently
+        compiled with the wrong binding. Detecting that is the whole
+        difficulty, and it is done by checking every free identifier in the
+        body against the enclosing scopes.
+        """
+        start = self.cur
+        params = []
+        if self.accept("||"):
+            pass
+        else:
+            self.expect("|")
+            while not self.at("|", "punc"):
+                self.accept("mut")
+                pname = self.expect_ident()
+                pty = self.parse_type() if self.accept(":") else None
+                if pty is None:
+                    self.err("closure parameter `%s` needs a type "
+                             "annotation; Crust does not infer them", pname)
+                params.append((pname, pty))
+                if not self.accept(","):
+                    break
+            self.expect("|")
+        ret = self.parse_type() if self.accept("->") else None
+
+        body_start = self.i
+        if self.at("{", "punc"):
+            end = self.skip_to_body_end()
+        else:
+            depth = 0
+            while self.cur.kind != "eof":
+                v = self.cur.val
+                if v in ("(", "[", "{"):
+                    depth += 1
+                elif v in (")", "]", "}"):
+                    if depth == 0:
+                        break
+                    depth -= 1
+                elif depth == 0 and v in (",", ";"):
+                    break
+                self.next()
+            end = self.i
+        body = self.toks[body_start:end]
+
+        bound = {n for n, _ in params}
+        for tok in body:
+            if tok.kind != "ident" or tok.val in bound:
+                continue
+            if self.lookup(tok.val) is not None:
+                self.err("closure captures `%s` from its environment; Crust "
+                         "lowers a closure to a plain function and has no "
+                         "environment to capture into", tok.val)
+
+        self.unit.closure_n += 1
+        name = "_crust_closure%d" % self.unit.closure_n
+        sub = Parser(list(body) + [Token("eof", "", start.line)],
+                     self.unit, self.tysubst)
+        sub.impl_type = self.impl_type
+        sub.push()
+        for pname, pty in params:
+            sub.declare(pname, pty)
+        if ret is None:
+            probe = Parser(list(body) + [Token("eof", "", start.line)],
+                           self.unit, self.tysubst)
+            probe.push()
+            for pname, pty in params:
+                probe.declare(pname, pty)
+            try:
+                ret = probe.parse_expr().type or VOID
+            except CrustError:
+                ret = VOID
+        sub.ret_type = ret
+        out = Out(start.line)
+        out.line_at(start.line, "static %s(%s)"
+                    % (ret.decl(name), render_params(params) if params
+                       else "void"), 0)
+        if self.at("{", "punc"):
+            pass
+        out.write(" {")
+        e = sub.parse_expr()
+        for stmt in sub.pending:
+            out.write(" " + stmt)
+        out.write(" return %s; }" % e.code if not ret.is_void()
+                  else " %s; }" % e.code)
+        self.unit.emitted.append(out.text())
+        self.unit.fn_sigs[name] = (ret, [t for _, t in params])
+        self.unit.statics.add(name)
+        # The value of a closure expression is a function pointer. C cannot
+        # spell one inline in every position a type is needed, so each
+        # distinct signature gets a typedef, generated on demand exactly like
+        # a slice or tuple struct.
+        ptr = self.unit.fn_ptr_type(ret, [t for _, t in params])
+        return Expr(name, ptr)
+
     def parse_if_expr(self):
         """Lower `if c { a } else { b }` in expression position to `c ? a : b`.
 
@@ -1675,14 +1849,39 @@ class Parser:
         if t.val == "false":
             return Expr("0", CType("_Bool"))
         if t.val == "(":
-            e = self.parse_expr()
+            if self.at(")", "punc"):
+                self.next()
+                return Expr("0", VOID)              # the unit value
+            first = self.parse_expr()
+            if not self.at(",", "punc"):
+                self.expect(")")
+                return Expr("(%s)" % first.code, first.type)
+            items = [first]
+            while self.accept(","):
+                if self.at(")", "punc"):
+                    break
+                items.append(self.parse_expr())
             self.expect(")")
-            return Expr("(%s)" % e.code, e.type)
+            if any(i.type is None for i in items):
+                self.err("cannot infer the type of a tuple element; "
+                         "annotate it")
+            ty = self.unit.tuple_type([i.type for i in items])
+            inits = ", ".join("._%d = %s" % (k, i.code)
+                              for k, i in enumerate(items))
+            return Expr("(%s){%s}" % (ty.base, inits), ty)
         if t.val == "[" and t.kind == "punc":
             return self.parse_array_literal(t)
         if t.val == "if" and t.kind == "kw":
             self.i -= 1
             return self.parse_if_expr()
+        if (t.val == "|" and t.kind == "punc") or \
+                (t.val == "||" and t.kind == "punc"):
+            self.i -= 1
+            return self.parse_closure()
+        if t.val == "move" and t.kind == "ident" and \
+                self.cur.val in ("|", "||"):
+            self.next() if False else None
+            return self.parse_closure()
         if t.val == "unsafe" and t.kind == "kw" and self.at("{", "punc"):
             # `unsafe { expr }` as a value is its single tail expression.
             return self.parse_block_expr()
@@ -1743,6 +1942,8 @@ class Parser:
                     ty = CType(self.unit.variants[name])
                 elif name in self.unit.consts:
                     ty = self.unit.consts[name]
+            if self.lookup(name) is not None:
+                name = _c_name(name)
             out = Expr(name, ty)
             if targs is not None:
                 out.targs = targs
@@ -1799,7 +2000,7 @@ class Parser:
                         % (t.line, name, name))
                 ty = init.type
             self.declare(name, ty)
-            code = ty.decl(name)
+            code = ty.decl(_c_name(name))
             if init is not None:
                 code += " = " + init.code
             self.emit_pending(out, t.line, indent)
@@ -1869,9 +2070,10 @@ class Parser:
                 cmp_op = "<"
             hi = self.parse_cond()
             ity = wider(lo.type, hi.type)
+            cvar = _c_name(var)
             out.line_at(t.line, "for (%s = %s; %s %s %s; %s++)"
-                        % (ity.decl(var), lo.code, var, cmp_op, hi.code, var),
-                        indent)
+                        % (ity.decl(cvar), lo.code, cvar, cmp_op, hi.code,
+                           cvar), indent)
             self.push()
             self.declare(var, ity)
             self.parse_block(out, indent, False)
@@ -1952,7 +2154,7 @@ class Parser:
         self.push()
         self.declare(var, elem)
         self.emit_bound_block(out, indent, "%s = %s[%s];"
-                              % (elem.decl(var), base, idx))
+                              % (elem.decl(_c_name(var)), base, idx))
         self.pop()
         out.write(" }")
 
@@ -2692,6 +2894,26 @@ def _substitute(body, binds):
     return out
 
 
+# Identifiers that are ordinary names in Rust but keywords in C. A Rust
+# variable called `double` or `register` is perfectly legal, and lowering it
+# verbatim produces C that will not parse -- so locals and parameters are
+# renamed on the way out. The trailing underscore cannot collide with a Rust
+# identifier that Crust would produce for anything else.
+_C_KEYWORDS = {
+    "auto", "break", "case", "char", "const", "continue", "default", "do",
+    "double", "else", "enum", "extern", "float", "for", "goto", "if",
+    "inline", "int", "long", "register", "restrict", "return", "short",
+    "signed", "sizeof", "static", "struct", "switch", "typedef", "union",
+    "unsigned", "void", "volatile", "while", "_Bool", "_Complex", "asm",
+    "typeof", "complex",
+}
+
+
+def _c_name(name):
+    """Rename an identifier that would collide with a C keyword."""
+    return name + "_" if name in _C_KEYWORDS else name
+
+
 def _is_lvalue(code):
     """True if `code` denotes a place whose address C can take.
 
@@ -2719,7 +2941,7 @@ def _addressable(code):
 def render_params(params):
     if not params:
         return "void"
-    return ", ".join(ty.decl(nm) for nm, ty in params)
+    return ", ".join(ty.decl(_c_name(nm)) for nm, ty in params)
 
 
 def normalize_number(tok):
@@ -2867,9 +3089,12 @@ def find_rust_items(code, rust_file=False):
             continue
 
         if kw in ("const", "static"):
-            # Rust annotates the type; C never writes `NAME:` here.
-            rest = scan[m.end():]
-            if not rest.lstrip().startswith(":"):
+            # Rust annotates the type; C never writes `NAME:` here. A `::`
+            # is a path, not an annotation -- `*const self::P` names a type,
+            # and reading it as a `const` item would swallow the rest of the
+            # declaration looking for a `;`.
+            rest = scan[m.end():].lstrip()
+            if not rest.startswith(":") or rest.startswith("::"):
                 continue
             close = scan.find(";", m.end())
             if close < 0:
@@ -3524,6 +3749,14 @@ def translate(code, path=None):
             prelude.append("struct %s; typedef struct %s %s; %s"
                            % (name, name, name,
                               _render_struct(name, unit.structs[name])))
+    for name, (fret, fparams) in unit.fn_ptrs.items():
+        prelude.append("typedef %s (*%s)(%s);"
+                       % (fret.decl(), name,
+                          ", ".join(t.decl() for t in fparams) or "void"))
+    for name in unit.tuples:
+        prelude.append("struct %s; typedef struct %s %s; %s"
+                       % (name, name, name,
+                          _render_struct(name, unit.structs[name])))
     for name in unit.slices:
         if name not in included_slices:
             prelude.append("struct %s; typedef struct %s %s; %s"
@@ -3560,9 +3793,10 @@ def translate(code, path=None):
     for name, (ret, ps) in unit.fn_sigs.items():
         if name == "main" or name in included_fns:
             continue
-        prelude.append("%s(%s);" % (ret.decl(name),
-                                    ", ".join(t.decl() for t in ps)
-                                    if ps else "void"))
+        prelude.append("%s%s(%s);"
+                       % ("static " if name in unit.statics else "",
+                          ret.decl(name),
+                          ", ".join(t.decl() for t in ps) if ps else "void"))
     if unit.emitted:
         # Monomorphised bodies go after all original text, so no line number
         # in the user's own source moves. Their prototypes are in the prelude,
