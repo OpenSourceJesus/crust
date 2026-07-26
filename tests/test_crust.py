@@ -1779,3 +1779,86 @@ fn main() -> i32 { add(40, 2) }
         c = crust.translate("int use_count(int use) { return use; }\n"
                             "fn f() -> i32 { 1 }")
         self.assertIn("int use_count(int use)", c)
+
+
+class TestCrustModuleItemForms(unittest.TestCase):
+    """The `use` / `mod` / visibility forms real Rust actually writes."""
+
+    def test_nested_brace_group_is_erased(self):
+        # A regex cannot balance these; the scanner must.
+        c = crust.translate("use core::{cell::Cell, ops::{Deref, DerefMut}};\n"
+                            "fn f() -> i32 { 1 }")
+        self.assertNotIn("Deref", c)
+
+    def test_multiline_use_is_erased(self):
+        c = crust.translate("use crate::{\n    a::b,\n    c::d,\n};\n"
+                            "fn f() -> i32 { 1 }")
+        self.assertNotIn("a::b", c)
+
+    def test_mod_declaration_is_erased(self):
+        c = crust.translate("pub mod aligned_box;\nfn f() -> i32 { 1 }")
+        self.assertNotIn("aligned_box", c)
+
+    def test_inline_module_is_not_erased(self):
+        # `mod x { .. }` has contents; only the bare declaration is erased.
+        c = crust.translate("mod x { }\nfn f() -> i32 { 1 }")
+        self.assertIn("mod x", c)
+
+    def test_use_inside_a_string_survives(self):
+        c = crust.translate('fn f() -> &str { "use core::mem;" }')
+        self.assertIn("use core::mem;", c)
+
+
+class TestCrustVisibility(unittest.TestCase):
+    """`pub`, `pub(crate)`, and `pub unsafe extern "C"`."""
+
+    def test_pub_crate_function(self):
+        c = crust.translate("pub(crate) fn f() -> i32 { 1 }")
+        self.assertIn("int f(void)", c)
+
+    def test_pub_unsafe_extern_c_function(self):
+        # The scan text has string literals blanked, so the modifier matcher
+        # cannot look for the literal spelling of `extern "C"`.
+        c = crust.translate('pub unsafe extern "C" fn go() -> i32 { 7 }')
+        self.assertIn("int go(void)", c)
+
+    def test_pub_in_path_struct(self):
+        c = crust.translate("pub(in crate::x) struct S { v: i32 }\n"
+                            "fn f() -> i32 { 1 }")
+        self.assertIn("struct S { int v; }", c)
+
+    def test_visibility_forms_run(self):
+        self.assertEqual(_run("""
+pub(crate) fn a() -> i32 { 40 }
+pub unsafe extern "C" fn b() -> i32 { 2 }
+fn main() -> i32 { a() + b() }
+""", suffix=".rs"), 42)
+
+
+class TestCrustLifetimes(unittest.TestCase):
+    """Lifetimes are dropped in the lexer; char literals are not."""
+
+    def test_lifetime_in_generics(self):
+        c = crust.translate("fn f<'a>(x: *const i32) -> i32 { 1 }")
+        self.assertIn("int f(int *x)", c)
+
+    def test_lifetime_on_a_reference(self):
+        c = crust.translate("fn f<'a>(x: &'a i32) -> i32 { 1 }")
+        self.assertIn("int f(int *x)", c)
+
+    def test_char_literal_still_works(self):
+        self.assertEqual(_run("""
+fn main() -> i32 { let c: char = 'A'; (c as i32) - 23 }
+""", suffix=".rs"), 42)
+
+    def test_escaped_char_literal(self):
+        self.assertEqual(_run("""
+fn main() -> i32 { let c: char = '\\n'; (c as i32) + 32 }
+""", suffix=".rs"), 42)
+
+    def test_lifetime_does_not_swallow_the_file(self):
+        # The bug this guards: blanking `'a` as a char literal ran to the next
+        # quote and destroyed the item structure, so nothing was found at all.
+        c = crust.translate("struct L<'a, T> { v: *const T }\n"
+                            "fn g() -> i32 { 1 }")
+        self.assertIn("int g(void)", c)
