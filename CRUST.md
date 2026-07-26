@@ -60,6 +60,7 @@ its definition.
 |---|---|
 | Items | `fn`, `struct`, `impl`, `enum`, `const`, `static`, with optional `pub`, `unsafe`, `extern "C"`; `#[...]` attributes are skipped |
 | Generics | `fn f<T>`, `struct S<T>`, `impl<T> S<T>`, turbofish `f::<T>()`, monomorphised per instantiation |
+| Core | bundled `Vec<T>`, `Box<T>`, `Cell<T>`, `PhantomData<T>`, and `size_of::<T>()` |
 | Types | `i8 i16 i32 i64 isize`, `u8 u16 u32 u64 usize`, `f32 f64`, `bool`, `char`, `()`, `&str` |
 | Pointers | `*const T`, `*mut T`, `&T`, `&mut T` (all lower to `T *`) |
 | Arrays | `[T; N]`, and slices `&[T]` / `&mut [T]` |
@@ -458,6 +459,44 @@ generics, no generic enums, and no `where` clauses. Crust also monomorphises
 only from source it can see: a generic from `std`, `core` or another crate has
 no template to instantiate, and is reported as such rather than guessed at.
 
+## The bundled minimal core
+
+Monomorphisation needs a template, so a generic with no source in the unit
+cannot be instantiated. Real Rust reaches constantly for `Vec<T>` and `Box<T>`,
+which live in `alloc`/`core` and are written in a dialect far outside this
+subset — traits, intrinsics, allocator plumbing. Rather than try to compile
+the real ones, Crust ships small equivalents **written in the Crust subset
+itself** (`shivyc/crust_core/core.rs`) and seeds every unit with them.
+
+| type | what it is |
+|---|---|
+| `Vec<T>` | growable array: `new`, `with_capacity`, `push`, `pop`, `get`, `set`, `len`, `capacity`, `last`, `clear`, `as_ptr`, `free_buf` |
+| `Box<T>` | one heap value: `new`, `get`, `set`, `as_ptr`, `free_box` |
+| `Cell<T>` | a named holder for a value |
+| `PhantomData<T>` | zero-sized marker |
+
+`Vec<i32>` lowers to exactly the three words the real one uses, so C reads it
+with no conversion:
+
+```c
+struct Vec_int { int *ptr; unsigned long len; unsigned long cap; };
+```
+
+Seeding is free: templates are tokens in a table, and instantiation is
+demand-driven, so a unit that never mentions `Vec<T>` emits nothing — not even
+the allocation prototypes. **A local definition always wins**: a unit that
+brings its own `Vec` displaces the bundled template and its `impl`s entirely.
+
+`size_of::<T>()` is provided as an intrinsic, lowering to C `sizeof`. It is
+the one thing a monomorphised container cannot be written without.
+
+**This is a reimplementation, not the standard library.** The shape and the
+common methods match, so ordinary code reads the same. What is missing is
+missing rather than faked: no iterators, no traits, no `Drop` (buffers are
+released by an explicit `free_buf`/`free_box`), no bounds checking, and
+nothing thread-safe — `Arc`, `Mutex` and `RwLock` are deliberately *not*
+included, because without atomics or threads they could only be lies.
+
 ## Compiling real Rust: `tools/crustos.py`
 
 `tools/crustos.py` walks a Rust source tree, runs every `.rs` file through the
@@ -483,8 +522,8 @@ Where things stand on Redox (kernel + relibc + ion, 615 files):
 | outcome | files | |
 |---|---|---|
 | translated (most of the file lowered) | 27 | 4.4% |
-| partial (some items lowered) | 31 | 5.0% |
-| failed (items found, translation errored) | 458 | 74.5% |
+| partial (some items lowered) | 32 | 5.2% |
+| failed (items found, translation errored) | 457 | 74.3% |
 | empty (no Rust items recognized) | 99 | 16.1% |
 
 6355 top-level Rust items parse. With generics landed, the ranked blockers
@@ -499,13 +538,15 @@ files to 3 while total failures fell only from 471 to 469, and generics went
 from 142 files to 21 while total failures fell from 469 to 458. The next
 blocker in the same file was already waiting.
 
-Second, and more fundamental: the single largest remaining message is now
-`no definition for generic type X in this unit` (85 files). Monomorphisation
-needs a template, and Redox's generics are overwhelmingly `Vec`, `Box`,
-`BTreeMap` and friends — defined in `std`/`core`, which Crust has never seen.
-That is not a parser gap that more syntax support will close. Compiling real
-Redox needs a story for the standard library, whether that is a Crust-side
-minimal `core`, or teaching crustos to follow crate sources.
+Second, and more instructive: adding the bundled core (above) moved these
+numbers almost not at all — 58 files to 59. It resolves `Vec` and `Box`
+outright, but the files using them are blocked by traits and macros as well,
+and the *remaining* unresolved generics are mostly Redox's own types
+(`LockToken`, `PageFlags`, `RawCell`), defined in files that fail for those
+same other reasons. So the core's real value is that it makes OS-shaped code
+*writable* in Crust — see `examples/crust/kernel.rs` — not that it unlocks
+upstream Redox. Compiling Redox itself needs traits, and after that macros;
+there is no shortcut left that avoids them.
 
 ## Not yet supported
 
@@ -539,6 +580,8 @@ Python, in keeping with the rest of the front end.
   struct with an `impl` block, and the `[v; N]` repeat initializer.
 - `examples/crust/generic.rs` — a generic struct with an `impl` block and
   generic functions, instantiated at two types each.
+- `examples/crust/kernel.rs` — a mini-kernel sketch: tasks, an enum state
+  machine, a generic ring buffer over the bundled `Vec<T>`, and `Box<T>`.
 - `examples/crust/histogram.py` and `examples/crust/polyglot.c` — C, Rust and
   rpython in one translation unit, each calling the other two.
 - `examples/crust/tally.py` and `examples/crust/tally.c` — an rpython module
