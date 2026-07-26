@@ -1124,6 +1124,9 @@ class Parser:
         if t.val == "if" and t.kind == "kw":
             self.i -= 1
             return self.parse_if_expr()
+        if t.val == "unsafe" and t.kind == "kw" and self.at("{", "punc"):
+            # `unsafe { expr }` as a value is its single tail expression.
+            return self.parse_block_expr()
         if t.kind == "ident" or (t.kind == "kw" and t.val == "Self"):
             name = t.val
             if name == "Self" and self.impl_type:
@@ -1285,6 +1288,16 @@ class Parser:
 
         if t.val == "{" and t.kind == "punc":
             self.parse_block(out, indent, False)
+            return
+
+        if (t.val == "unsafe" and t.kind == "kw"
+                and self.peek().val == "{"):
+            # An `unsafe` block carries no meaning here: Crust has no borrow
+            # checker and no safety analysis to switch off, and the C it
+            # lowers to is unsafe throughout. So it is exactly its body.
+            # (`unsafe fn` is handled with the other item modifiers.)
+            self.next()
+            self.parse_block(out, indent, tail_returns)
             return
 
         # expression statement, or a trailing expression
