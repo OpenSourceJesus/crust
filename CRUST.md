@@ -62,6 +62,7 @@ its definition.
 | Generics | `fn f<T>`, `struct S<T>`, `impl<T> S<T>`, turbofish `f::<T>()`, monomorphised per instantiation |
 | Core | bundled `Vec<T>`, `Box<T>`, `Cell<T>`, `PhantomData<T>`, and `size_of::<T>()` |
 | Traits | `trait`, `impl Trait for Type`, default methods, supertraits, bounds `<T: Trait>`; static dispatch |
+| Macros | `println!`/`print!`/`eprintln!`, `assert!`/`assert_eq!`/`assert_ne!`, `panic!`/`unreachable!`/`todo!`, `debug_assert*!`, `cfg!`, `matches!`, and `macro_rules!` |
 | Types | `i8 i16 i32 i64 isize`, `u8 u16 u32 u64 usize`, `f32 f64`, `bool`, `char`, `()`, `&str` |
 | Pointers | `*const T`, `*mut T`, `&T`, `&mut T` (all lower to `T *`) |
 | Arrays | `[T; N]`, and slices `&[T]` / `&mut [T]` |
@@ -460,6 +461,58 @@ generics, no generic enums, and no `where` clauses. Crust also monomorphises
 only from source it can see: a generic from `std`, `core` or another crate has
 no template to instantiate, and is reported as such rather than guessed at.
 
+## Macros
+
+Two separate things share the `name!` syntax, and Crust handles them
+differently.
+
+**Built-in macros** are expanded directly. The printing family is the
+interesting one: Rust's `{}` carries no type of its own — `Display` decides the
+formatting at the call site — so Crust reads the conversion off the
+*argument's inferred type*.
+
+```rust
+println!("n={} f={} s={}", n, f, s);   // i32, f64, &str
+```
+
+```c
+printf("n=%d f=%g s=%s\n", n, f, s);
+```
+
+`{{` and `}}` become literal braces, a `%` in the original is escaped (it is
+ordinary text in Rust and a conversion in C), and an explicit hint like `{:x}`
+overrides the type-derived choice. `assert!`, `assert_eq!` and `assert_ne!`
+lower to a test and `abort()`; `panic!`, `unreachable!`, `todo!` and
+`unimplemented!` lower to `abort()` directly. `debug_assert*!` compiles out, as
+in a release build. `cfg!` is always false, which is the honest answer when
+nothing is configured in. A macro Crust does not know is named in the error
+rather than skipped, because a silently dropped macro changes behaviour
+invisibly.
+
+**`macro_rules!`** definitions are kept as raw token slices and matched at the
+invocation site. Literal tokens must match exactly; `$x:frag` captures a token
+run, respecting nesting so the comma in `twice!(add(1, 2))` does not end the
+capture. Rules are tried in order, so the usual overload-by-arity shape works:
+
+```rust
+macro_rules! pick {
+    () => { 0 };
+    ($a:expr) => { $a };
+    ($a:expr, $b:expr) => { if $a > $b { $a } else { $b } };
+}
+```
+
+`ident`, `literal` and `tt` capture a single token; `expr`, `ty`, `path`,
+`block` and `stmt` capture a run. An `expr` stops at a top-level comma, since
+one cannot contain it — without that a one-argument rule would greedily
+swallow a two-argument call and the correct rule would never be tried.
+
+**Not supported:** repetition (`$(...),*`), nested macro definitions, hygiene
+(captured names are substituted literally, so a body that introduces a
+binding can shadow one at the call site), procedural macros, and the macros
+that need types Crust does not have — `format!` and `write!` (no `String`),
+`vec!`, `asm!`, and `offset_of!`.
+
 ## Traits
 
 `impl Trait for Type` lowers to exactly what an inherent `impl` does: free
@@ -571,10 +624,10 @@ Where things stand on Redox (kernel + relibc + ion, 615 files):
 
 | outcome | files | |
 |---|---|---|
-| translated (most of the file lowered) | 26 | 4.2% |
-| partial (some items lowered) | 34 | 5.5% |
+| translated (most of the file lowered) | 28 | 4.6% |
+| partial (some items lowered) | 35 | 5.7% |
 | failed (items found, translation errored) | 463 | 75.3% |
-| empty (no Rust items recognized) | 92 | 15.0% |
+| empty (no Rust items recognized) | 89 | 14.5% |
 
 6355 top-level Rust items parse. With generics landed, the ranked blockers
 behind the 458 remaining failures are paths in type position (7.9%), `impl
@@ -640,6 +693,8 @@ Python, in keeping with the rest of the front end.
   machine, a generic ring buffer over the bundled `Vec<T>`, and `Box<T>`.
 - `examples/crust/traits.rs` — a trait with a default method, a supertrait,
   two impls and a bounded generic, all statically dispatched.
+- `examples/crust/macros.rs` — the printing and assertion macros, and
+  `macro_rules!` with several rules chosen by arity.
 - `examples/crust/histogram.py` and `examples/crust/polyglot.c` — C, Rust and
   rpython in one translation unit, each calling the other two.
 - `examples/crust/tally.py` and `examples/crust/tally.c` — an rpython module
