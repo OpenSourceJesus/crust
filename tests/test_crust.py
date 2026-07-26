@@ -8,6 +8,7 @@ call each other directly.
 
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -1823,12 +1824,14 @@ class TestCrustModuleItemForms(unittest.TestCase):
     def test_resolve_mod_path_rs_then_mod_rs(self):
         work = tempfile.mkdtemp()
         try:
-            open(os.path.join(work, "types.rs"), "w").write("struct T { x: i32 }\n")
+            with open(os.path.join(work, "types.rs"), "w") as f:
+                f.write("struct T { x: i32 }\n")
             os.makedirs(os.path.join(work, "helpers"))
-            open(os.path.join(work, "helpers", "mod.rs"), "w").write(
-                "struct H { y: i32 }\n")
+            with open(os.path.join(work, "helpers", "mod.rs"), "w") as f:
+                f.write("struct H { y: i32 }\n")
             parent = os.path.join(work, "user.rs")
-            open(parent, "w").write("mod types;\n")
+            with open(parent, "w") as f:
+                f.write("mod types;\n")
             self.assertEqual(
                 crust.resolve_mod_path("types", parent),
                 os.path.join(work, "types.rs"))
@@ -1843,6 +1846,100 @@ class TestCrustModuleItemForms(unittest.TestCase):
                 for name in dirs:
                     os.rmdir(os.path.join(root, name))
             os.rmdir(work)
+
+
+class TestCrustModSiblingTypes(unittest.TestCase):
+    """`mod name;` seeds type definitions from sibling .rs files."""
+
+    def test_translate_sees_sibling_struct_fields(self):
+        work = tempfile.mkdtemp()
+        try:
+            with open(os.path.join(work, "types.rs"), "w") as f:
+                f.write("pub struct Foo { x: i32 }\n")
+            user = os.path.join(work, "user.rs")
+            with open(user, "w") as f:
+                f.write("mod types;\n"
+                        "fn f(p: Foo) -> i32 { p.x }\n")
+            with open(user) as f:
+                src = f.read()
+            c = crust.translate(src, path=user)
+            self.assertIn("struct Foo", c)
+            self.assertIn("int x", c)
+            self.assertIn("return p.x;", c)
+            self.assertNotIn("mod types", c)
+        finally:
+            for name in ("types.rs", "user.rs"):
+                try:
+                    os.remove(os.path.join(work, name))
+                except OSError:
+                    pass
+            os.rmdir(work)
+
+    def test_sibling_struct_compiles(self):
+        self.assertEqual(_run("""
+mod types;
+fn main() -> i32 {
+    let p: Foo = Foo { x: 40 };
+    p.x + 2
+}
+""", suffix=".rs", extra={
+            "types.rs": "pub struct Foo { x: i32 }\n",
+        }), 42)
+
+    def test_sibling_enum_compiles(self):
+        self.assertEqual(_run("""
+mod kinds;
+fn main() -> i32 {
+    match Kind::B {
+        Kind::A => 1,
+        Kind::B => 42,
+    }
+}
+""", suffix=".rs", extra={
+            "kinds.rs": "pub enum Kind { A, B }\n",
+        }), 42)
+
+    def test_mod_rs_layout(self):
+        work = tempfile.mkdtemp()
+        try:
+            os.makedirs(os.path.join(work, "types"))
+            with open(os.path.join(work, "types", "mod.rs"), "w") as f:
+                f.write("pub struct Foo { x: i32 }\n")
+            user = os.path.join(work, "user.rs")
+            src = ("mod types;\n"
+                   "fn f(p: Foo) -> i32 { p.x }\n")
+            with open(user, "w") as f:
+                f.write(src)
+            c = crust.translate(src, path=user)
+            self.assertIn("struct Foo { int x; }", c)
+        finally:
+            for root, dirs, files in os.walk(work, topdown=False):
+                for name in files:
+                    os.remove(os.path.join(root, name))
+                for name in dirs:
+                    os.rmdir(os.path.join(root, name))
+            os.rmdir(work)
+
+    def test_compile_object_with_mod_types(self):
+        """crustos-style per-file `-c` succeeds when types come from a mod."""
+        work = tempfile.mkdtemp()
+        try:
+            with open(os.path.join(work, "types.rs"), "w") as f:
+                f.write("pub struct Foo { x: i32 }\n")
+            user = os.path.join(work, "user.rs")
+            with open(user, "w") as f:
+                f.write("mod types;\n"
+                        "fn use_foo(p: Foo) -> i32 { p.x }\n")
+            obj = os.path.join(work, "user.o")
+            root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            proc = subprocess.run(
+                [sys.executable, "-m", "shivyc.main", "-c", user, "-o", obj],
+                cwd=root, capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertTrue(os.path.exists(obj))
+        finally:
+            import shutil
+            shutil.rmtree(work, ignore_errors=True)
 
 
 class TestCrustVisibility(unittest.TestCase):
