@@ -57,6 +57,13 @@ EXAMPLES = [
      "widest = 3\n"
      "len2   = 25\n", True),
 
+    ("tail.rs", 0,
+     "divmod   = (9, 2)\n"
+     "stats    = (1, 9, 5.33333)\n"
+     "boxed    = 42\n"
+     "keywords = 42\n"
+     "closures = 42 42 7\n", True),
+
     ("macros.rs", 0,
      "n=6 f=1.5 s=crust\n"
      "hex=6 braces={} percent=100%\n"
