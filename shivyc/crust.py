@@ -333,7 +333,22 @@ class Unit:
         self.tuple_structs = set()   # struct names declared in tuple form
         self.consts = {}        # const/static name -> CType
         self.needs = set()      # libc prototypes the lowering requires
-        self.slices = {}        # generated slice struct name -> element CType
+        self.slices = {}        # slice struct name -> element CType
+        self.options = {}       # Option struct name -> element CType
+        self.unwraps = set()    # option types needing an unwrap helper
+
+    def option_type(self, elem):
+        """Return (and register) the tagged struct for `Option<elem>`.
+
+        Crust has no generics, so each instantiation is monomorphised into
+        its own struct, generated on demand exactly like a slice.
+        """
+        name = "crust_option_" + re.sub(r"\W+", "_", elem.decl()).strip("_")
+        if name not in self.options:
+            self.options[name] = elem
+            self.structs[name] = [("some", CType("_Bool")),
+                                  ("value", elem)]
+        return CType(name)
 
     def slice_type(self, elem):
         """Return (and register) the fat-pointer struct type for `&[elem]`."""
@@ -362,6 +377,8 @@ class Parser:
         self.impl_type = None           # enclosing `impl` type name, if any
         self.no_struct_lit = 0          # >0 while parsing a condition
         self.behind_ref = 0             # >0 while parsing the pointee of `&`
+        self.expected = []              # target types, for inferring `None`
+        self.tmp_n = 0                  # counter for generated temporaries
 
     # -- token helpers ----------------------------------------------------
 
@@ -397,6 +414,16 @@ class Parser:
         """Raise a CrustError tagged with the line being parsed."""
         line = self.toks[max(self.i - 1, 0)].line
         raise CrustError("line %d: %s" % (line, msg % args if args else msg))
+
+    def expect_gt(self):
+        """Consume a closing `>`.
+
+        A `>>` is one token, so a nested `Option<Option<T>>` splits it.
+        """
+        if self.at(">>", "punc"):
+            self.toks[self.i] = Token("punc", ">", self.cur.line)
+            return
+        self.expect(">")
 
     def expect_ident(self):
         if self.cur.kind != "ident":
@@ -479,6 +506,13 @@ class Parser:
                 if name == "str" and not self.behind_ref:
                     self.err("`str` is unsized; write `&str`")
                 return CType(PRIMITIVES[name])
+            if name == "Option":
+                self.expect("<")
+                elem = self.parse_type()
+                self.expect_gt()
+                if elem.is_void():
+                    self.err("`Option<()>` is not supported")
+                return self.unit.option_type(elem)
             if name == "Self":
                 if self.impl_type is None:
                     raise CrustError("line %d: `Self` outside an impl block"
@@ -493,6 +527,26 @@ class Parser:
 
     def parse_expr(self):
         return self.parse_assign()
+
+    def parse_expr_as(self, ty):
+        """Parse an expression whose target type is known.
+
+        `None` carries no type of its own, so it is resolved from the
+        context it appears in -- an annotation, a return type or a parameter.
+        """
+        self.expected.append(ty)
+        try:
+            return self.parse_expr()
+        finally:
+            self.expected.pop()
+
+    @property
+    def target(self):
+        return self.expected[-1] if self.expected else None
+
+    def new_temp(self):
+        self.tmp_n += 1
+        return "_crust_opt%d" % self.tmp_n
 
     def parse_cond(self):
         """Parse an expression in condition position.
@@ -569,9 +623,15 @@ class Parser:
         while True:
             if self.at("(", "punc"):
                 self.next()
+                if e.code == "Some":
+                    e = self.parse_some()
+                    continue
+                params = self.fn_sigs.get(e.code, (None, []))[1] or []
                 args = []
                 while not self.at(")", "punc"):
-                    args.append(self.parse_expr().code)
+                    want = params[len(args)] if len(args) < len(params) \
+                        else None
+                    args.append(self.parse_expr_as(want).code)
                     if not self.accept(","):
                         break
                 self.expect(")")
@@ -602,6 +662,47 @@ class Parser:
                     e = self.field_access(e, name)
             else:
                 return e
+
+    def parse_some(self):
+        """Lower `Some(x)` to a filled-in Option struct."""
+        want = self.target
+        elem = None
+        if want is not None and want.base in self.unit.options:
+            elem = self.unit.options[want.base]
+        inner = self.parse_expr_as(elem)
+        self.expect(")")
+        if elem is None:
+            elem = inner.type
+        if elem is None:
+            self.err("cannot infer the type held by `Some`; annotate the "
+                     "target (`let x: Option<i32> = ...`)")
+        opt = self.unit.option_type(elem)
+        return Expr("(%s){1, %s}" % (opt.base, inner.code), opt)
+
+    def none_expr(self):
+        """Lower `None`, whose type comes from the surrounding context."""
+        want = self.target
+        if want is None or want.base not in self.unit.options:
+            self.err("cannot infer the type of `None`; annotate the target "
+                     "(`let x: Option<i32> = None`)")
+        return Expr("(%s){0}" % want.base, want)
+
+    def option_method(self, recv, name, args):
+        """Lower the supported `Option` methods."""
+        elem = self.unit.options[recv.type.base]
+        if name == "is_some" and not args:
+            return Expr("%s.some" % recv.code, CType("_Bool"))
+        if name == "is_none" and not args:
+            return Expr("(!%s.some)" % recv.code, CType("_Bool"))
+        if name == "unwrap" and not args:
+            self.unit.unwraps.add(recv.type.base)
+            self.unit.needs.add("abort")
+            return Expr("%s_unwrap(%s)" % (recv.type.base, recv.code), elem)
+        if name == "unwrap_or" and len(args) == 1:
+            return Expr("(%s.some ? %s.value : %s)"
+                        % (recv.code, recv.code, args[0]), elem)
+        self.err("no method `%s` on `Option`; supported: is_some, is_none, "
+                 "unwrap, unwrap_or", name)
 
     def index(self, recv, idx):
         """Lower `recv[idx]`, reaching through a slice's data pointer."""
@@ -682,6 +783,8 @@ class Parser:
                 break
         self.expect(")")
 
+        if recv.type is not None and recv.type.base in self.unit.options:
+            return self.option_method(recv, name, args)
         if recv.type is not None and recv.type.base in self.unit.slices:
             if name == "len":
                 return Expr("%s.len" % recv.code, CType("unsigned long"))
@@ -844,6 +947,8 @@ class Parser:
             if (self.at("{", "punc") and not self.no_struct_lit
                     and name in self.unit.structs):
                 return self.parse_struct_literal(name, t.line)
+            if name == "None" and not self.at("::", "punc"):
+                return self.none_expr()
             ty = self.lookup(name)
             if ty is None:
                 if name in self.unit.variants:
@@ -893,7 +998,7 @@ class Parser:
                 ty = self.parse_type()
             init = None
             if self.accept("="):
-                init = self.parse_expr()
+                init = self.parse_expr_as(ty)
             self.expect(";")
             if ty is None:
                 if init is None or init.type is None:
@@ -914,7 +1019,7 @@ class Parser:
             if self.accept(";"):
                 out.line_at(t.line, "return;", indent)
                 return
-            e = self.parse_expr()
+            e = self.parse_expr_as(self.ret_type)
             self.expect(";")
             out.line_at(t.line, "return %s;" % e.code, indent)
             return
@@ -932,10 +1037,16 @@ class Parser:
             return
 
         if t.val == "if" and t.kind == "kw":
-            self.parse_if(out, indent, tail_returns)
+            if self.peek().val == "let":
+                self.parse_if_let(out, indent, tail_returns)
+            else:
+                self.parse_if(out, indent, tail_returns)
             return
 
         if t.val == "while" and t.kind == "kw":
+            if self.peek().val == "let":
+                self.parse_while_let(out, indent)
+                return
             self.next()
             cond = self.parse_cond()
             out.line_at(t.line, "while (%s)" % cond.code, indent)
@@ -974,7 +1085,7 @@ class Parser:
             return
 
         # expression statement, or a trailing expression
-        e = self.parse_expr()
+        e = self.parse_expr_as(self.ret_type if tail_returns else None)
         if self.accept(";"):
             out.line_at(t.line, e.code + ";", indent)
             return
@@ -1021,6 +1132,79 @@ class Parser:
                 self.parse_block(out, indent, tail_returns)
 
     # -- items ------------------------------------------------------------
+
+    def parse_let_pattern(self):
+        """Parse `let Some(NAME) = EXPR` and return (name, expr, elem)."""
+        self.expect("let")
+        head = self.expect_ident()
+        if head != "Some":
+            self.err("only `if let Some(x) = ...` is supported, not `%s`",
+                     head)
+        self.expect("(")
+        binding = self.expect_ident()
+        self.expect(")")
+        self.expect("=")
+        subject = self.parse_cond()
+        if subject.type is None or subject.type.base not in self.unit.options:
+            self.err("`if let Some(..)` needs an `Option`; annotate the "
+                     "subject if its type cannot be inferred")
+        return binding, subject, self.unit.options[subject.type.base]
+
+    def parse_if_let(self, out, indent, tail_returns):
+        """Lower `if let Some(x) = e { .. } else { .. }`.
+
+        The subject is held in a temporary so it is evaluated once, and the
+        whole construct is wrapped in a block to scope that temporary.
+        """
+        t = self.expect("if")
+        binding, subject, elem = self.parse_let_pattern()
+        tmp = self.new_temp()
+        out.line_at(t.line, "{ %s = %s;" % (subject.type.decl(tmp),
+                                            subject.code), indent)
+        out.write(" if (%s.some)" % tmp)
+        self.push()
+        self.declare(binding, elem)
+        self.emit_binding_block(out, indent, tail_returns, binding, elem, tmp)
+        self.pop()
+        if self.accept("else"):
+            out.write(" else")
+            if self.at("if", "kw"):
+                if self.peek().val == "let":
+                    self.parse_if_let(out, indent, tail_returns)
+                else:
+                    self.parse_if_tail(out, indent, tail_returns)
+            else:
+                self.parse_block(out, indent, tail_returns)
+        out.write(" }")
+
+    def parse_while_let(self, out, indent):
+        """Lower `while let Some(x) = e { .. }` to a loop with a break."""
+        t = self.expect("while")
+        binding, subject, elem = self.parse_let_pattern()
+        tmp = self.new_temp()
+        out.line_at(t.line, "for (;;) {", indent)
+        out.write(" %s = %s;" % (subject.type.decl(tmp), subject.code))
+        out.write(" if (!%s.some) break;" % tmp)
+        self.push()
+        self.declare(binding, elem)
+        self.emit_binding_block(out, indent, False, binding, elem, tmp)
+        self.pop()
+        out.write(" }")
+
+    def emit_binding_block(self, out, indent, tail_returns, binding, elem,
+                           tmp):
+        """Emit `{ elem binding = tmp.value; <body> }` for a `let` pattern."""
+        open_tok = self.expect("{")
+        out.line_at(open_tok.line, "{ %s = %s.value;"
+                    % (elem.decl(binding), tmp), indent)
+        self.push()
+        while not self.at("}", "punc"):
+            if self.cur.kind == "eof":
+                self.err("unterminated block")
+            self.parse_stmt(out, indent + 1, tail_returns)
+        close = self.expect("}")
+        self.pop()
+        out.line_at(close.line, "}", indent)
 
     def parse_match(self, out, indent, tail_returns):
         """Lower `match` to a C `switch`.
@@ -1935,6 +2119,7 @@ def translate(code, path=None):
     unit, struct_order = included
     included_fns = set(unit.fn_sigs)
     included_slices = set(unit.slices)
+    included_options = set(unit.options)
 
     def fail(exc, start):
         return CrustError("%sline %d: %s" % (where, _line_of(code, start),
@@ -1983,6 +2168,8 @@ def translate(code, path=None):
     prelude = []
     if "strlen" in unit.needs:
         prelude.append("unsigned long strlen(const char *);")
+    if "abort" in unit.needs:
+        prelude.append("void abort(void);")
     for name in local["enums"]:
         prelude.append(_render_enum(name, unit.enums[name]))
     for name in local["structs"]:
@@ -1990,6 +2177,11 @@ def translate(code, path=None):
                        % (name, name, name))
     # Slice structs hold only a pointer to their element, so the forward
     # declarations above are enough even for a slice of a user struct.
+    for name in unit.options:
+        if name not in included_options:
+            prelude.append("struct %s; typedef struct %s %s; %s"
+                           % (name, name, name,
+                              _render_struct(name, unit.structs[name])))
     for name in unit.slices:
         if name not in included_slices:
             prelude.append("struct %s; typedef struct %s %s; %s"
@@ -1997,6 +2189,13 @@ def translate(code, path=None):
                               _render_struct(name, unit.structs[name])))
     for name in _toposort_structs(unit, local["structs"]):
         prelude.append(_render_struct(name, unit.structs[name]))
+    for name in sorted(unit.unwraps):
+        if name in included_options:
+            continue
+        elem = unit.options[name]
+        prelude.append(
+            "static %s %s_unwrap(%s o) { if (!o.some) abort(); "
+            "return o.value; }" % (elem.decl(), name, name))
     for text in _render_consts(code, spans, unit):
         prelude.append(text)
     prelude.extend(local["impl_consts"])
