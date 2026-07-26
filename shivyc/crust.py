@@ -295,11 +295,21 @@ ASSIGN_OPS = {"=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=",
 class Expr:
     """A translated expression: C text plus its inferred C type."""
 
-    __slots__ = ("code", "type")
+    __slots__ = ("code", "type", "targs")
 
     def __init__(self, code, type_):
+        self.targs = None            # turbofish type arguments, if any
         self.code = code
         self.type = type_
+
+
+def _instance_name(name, args):
+    """The C name of one monomorphisation, e.g. `Pair<i32>` -> `Pair_int`.
+
+    Deterministic and readable, so the generated C can be read and debugged,
+    and so two references to the same instantiation always agree.
+    """
+    return name + "_" + "_".join(_mangle(a) for a in args)
 
 
 def _mangle(ty):
@@ -344,6 +354,19 @@ class Unit:
         self.options = {}       # Option struct name -> element CType
         self.results = {}       # Result struct name -> (ok, err) CTypes
         self.unwraps = set()    # generated types needing unwrap helpers
+        # Generics are monomorphised, exactly like Option/Result and like
+        # py2c's `_tlist_` types: a generic item is stored as its *tokens*,
+        # and each distinct set of type arguments re-parses those tokens with
+        # the parameters bound to concrete types. There is no boxing and no
+        # tag, so an instantiation is an ordinary C struct or function and
+        # stays directly callable from C.
+        self.generic_structs = {}   # name -> (params, tokens)
+        self.generic_fns = {}       # name -> (params, tokens)
+        self.generic_impls = []     # (params, type name, tokens)
+        self.instances = {}         # mangled -> (name, [CType])
+        self.emitted = []           # generated C, appended after the unit
+        self.struct_order = []      # instantiated structs, in creation order
+        self.emitting = set()       # guards against recursive instantiation
 
     def result_type(self, ok, err):
         """Return (and register) the tagged struct for `Result<ok, err>`."""
@@ -416,9 +439,14 @@ def _literal_count(code, unit):
 
 
 class Parser:
-    def __init__(self, toks, unit=None):
+    def __init__(self, toks, unit=None, tysubst=None):
         self.toks = toks
         self.i = 0
+        # Bindings for the enclosing generic item's type parameters. Empty for
+        # ordinary code; `{"T": CType("int")}` while an instantiation is being
+        # generated. Substitution happens in parse_type, so every other part
+        # of the parser is reused unchanged.
+        self.tysubst = tysubst or {}
         self.unit = unit or Unit()
         self.fn_sigs = self.unit.fn_sigs
         self.scopes = [{}]              # name -> CType
@@ -572,15 +600,207 @@ class Parser:
                 if elem.is_void():
                     self.err("`Option<()>` is not supported")
                 return self.unit.option_type(elem)
+            if name in self.tysubst:
+                # A type parameter of the generic item being instantiated.
+                return self.tysubst[name]
             if name == "Self":
                 if self.impl_type is None:
                     raise CrustError("line %d: `Self` outside an impl block"
                                      % t.line)
                 return CType(self.impl_type)
+            if name in self.unit.generic_structs and self.at("<", "punc"):
+                return self.instantiate_struct(name, self.parse_type_args())
+            if self.at("<", "punc") and name not in PRIMITIVES:
+                # A generic we have no template for -- a std type, or one
+                # defined in a crate Crust never saw. Say so plainly rather
+                # than failing on the `<` as a comparison operator.
+                self.err("no definition for generic type `%s` in this unit; "
+                         "Crust monomorphises from source and has no std", name)
             # Unknown named type: assume a C struct/typedef of the same name.
             return CType(name)
         raise CrustError("line %d: expected a type, found %r"
                          % (t.line, t.val or "<eof>"))
+
+    def parse_generic_params(self):
+        """Parse `<T, U>` after an item name; return the parameter names.
+
+        Trait bounds (`T: Clone`) and lifetimes (`'a`) are skipped rather than
+        recorded: Crust has no traits to check against and no borrow checker,
+        so a bound carries no information it could act on. Where a bound would
+        have caught a mistake, the resulting C simply fails to compile.
+        """
+        if not self.at("<", "punc"):
+            return []
+        self.next()
+        params, depth = [], 1
+        while depth > 0 and self.cur.kind != "eof":
+            v = self.cur.val
+            if v == "<":
+                depth += 1
+            elif v == ">":
+                depth -= 1
+                if depth == 0:
+                    self.next()
+                    break
+            elif v == ">>":
+                depth -= 2
+                if depth <= 0:
+                    self.next()
+                    break
+            elif depth == 1 and self.cur.kind == "ident" and (
+                    not params or self.toks[self.i - 1].val == ","):
+                params.append(v)
+            self.next()
+        return params
+
+    def skip_generic_params(self):
+        self.parse_generic_params()
+
+    def parse_type_args(self):
+        """Parse `<T1, T2>` in type position; return the concrete CTypes."""
+        self.expect("<")
+        args = [self.parse_type()]
+        while self.accept(","):
+            args.append(self.parse_type())
+        self.expect_gt()
+        return args
+
+    def instantiate_struct(self, name, args):
+        """Monomorphise `Name<args>`; return the concrete CType.
+
+        The template's tokens are re-parsed with the type parameters bound,
+        so the instantiation goes through exactly the same code path an
+        ordinary struct does and needs no separate lowering.
+        """
+        params, toks = self.unit.generic_structs[name]
+        if len(args) != len(params):
+            self.err("`%s` takes %d type argument%s, got %d", name,
+                     len(params), "" if len(params) == 1 else "s", len(args))
+        mangled = _instance_name(name, args)
+        if mangled in self.unit.structs:
+            return CType(mangled)
+        if mangled in self.unit.emitting:
+            self.err("recursive instantiation of `%s` (a generic struct "
+                     "cannot contain itself by value)", name)
+        self.unit.emitting.add(mangled)
+        try:
+            sub = dict(zip(params, args))
+            p = Parser(list(toks), self.unit, sub)
+            p.impl_type = mangled
+            _, fields = p.parse_struct()
+            self.unit.structs[mangled] = fields
+            self.unit.struct_order.append(mangled)
+            self.unit.instances[mangled] = (name, args)
+            self.instantiate_impls_for(name, mangled, args)
+        finally:
+            self.unit.emitting.discard(mangled)
+        return CType(mangled)
+
+    def instantiate_impls_for(self, name, mangled, args):
+        """Generate the methods of every `impl<..> Name<..>` for one instance."""
+        for params, owner, toks in self.unit.generic_impls:
+            if owner != name:
+                continue
+            sub = dict(zip(params, args))
+            p = Parser(list(toks), self.unit, sub)
+            p.instance_name = mangled
+            out = Out(1)
+            p.parse_impl(out, owner_override=mangled)
+            self.unit.emitted.append(out.text())
+
+    def instantiate_fn(self, name, args):
+        """Monomorphise a generic `fn`; return its concrete mangled name."""
+        params, toks = self.unit.generic_fns[name]
+        mangled = _instance_name(name, args)
+        if mangled in self.unit.fn_sigs:
+            return mangled
+        if mangled in self.unit.emitting:
+            return mangled              # recursive call: signature suffices
+        self.unit.emitting.add(mangled)
+        try:
+            sub = dict(zip(params, args))
+            sig = Parser(list(toks), self.unit, sub)
+            _, _, ps, ret = sig.parse_fn_signature()
+            self.unit.fn_sigs[mangled] = (ret, [t for _, t in ps])
+            self.unit.instances[mangled] = (name, args)
+            body = Parser(list(toks), self.unit, sub)
+            out = Out(1)
+            body.parse_fn(out, name_override=mangled)
+            self.unit.emitted.append(out.text())
+        finally:
+            self.unit.emitting.discard(mangled)
+        return mangled
+
+    def infer_type_args(self, name, arg_types):
+        """Infer a generic fn's type arguments from its call's argument types.
+
+        Crust has no type checker, so inference is deliberately shallow: a
+        parameter declared as exactly a type variable (`x: T`), or as one
+        reference or pointer step from one (`x: &T`), binds that variable to
+        the argument's type. Anything deeper -- `&[T]`, `Vec<T>` -- is not
+        inferred, and the call needs a turbofish. Failing loudly here is much
+        better than guessing wrong and emitting C that miscompiles.
+        """
+        params, toks = self.unit.generic_fns[name]
+        decls = Parser(list(toks), self.unit).fn_param_decls()
+        found = {}
+        for (pname, depth), aty in zip(decls, arg_types):
+            if pname not in params or aty is None or pname in found:
+                continue
+            if depth == 0:
+                found[pname] = aty
+            elif aty.ptr >= depth:
+                found[pname] = CType(aty.base, aty.ptr - depth, aty.array)
+        missing = [p for p in params if p not in found]
+        if missing:
+            self.err("cannot infer type argument%s %s for `%s`; give it "
+                     "explicitly with a turbofish, `%s::<i32>(..)`",
+                     "" if len(missing) == 1 else "s",
+                     ", ".join("`%s`" % m for m in missing), name, name)
+        return [found[p] for p in params]
+
+    def fn_param_decls(self):
+        """(declared type name, pointer depth) for each parameter of a `fn`.
+
+        Read off the raw tokens without resolving types, so a parameter
+        mentioning a type variable can be recognized before that variable has
+        a binding.
+        """
+        self.skip_attributes()
+        while self.cur.val in ("pub", "unsafe", "extern") or \
+                self.cur.kind == "str":
+            self.next()
+        self.expect("fn")
+        self.expect_ident()
+        self.skip_generic_params()
+        self.expect("(")
+        decls = []
+        while not self.at(")", "punc") and self.cur.kind != "eof":
+            self.expect_ident()
+            self.expect(":")
+            depth = 0
+            while self.cur.val in ("&", "*"):
+                if self.next().val == "*":
+                    self.accept("const") or self.accept("mut")
+                else:
+                    self.accept("mut")
+                depth += 1
+            nm = self.cur.val if self.cur.kind in ("ident", "kw") else None
+            decls.append((nm, depth))
+            d = 0
+            while self.cur.kind != "eof":
+                if self.cur.val in ("(", "[", "<"):
+                    d += 1
+                elif self.cur.val in (")", "]", ">"):
+                    if self.cur.val == ")" and d == 0:
+                        break
+                    d -= 1
+                elif self.cur.val == "," and d == 0:
+                    break
+                self.next()
+            if not self.accept(","):
+                break
+        return decls
 
     # -- expressions ------------------------------------------------------
 
@@ -688,15 +908,27 @@ class Parser:
                 if e.code in ("Ok", "Err"):
                     e = self.parse_result_ctor(e.code)
                     continue
+                generic = e.code in self.unit.generic_fns
+                targs = getattr(e, "targs", None)
+                if generic and targs:
+                    e = Expr(self.instantiate_fn(e.code, targs), None)
+                    generic = False
                 params = self.fn_sigs.get(e.code, (None, []))[1] or []
-                args = []
+                args, atypes = [], []
                 while not self.at(")", "punc"):
                     want = params[len(args)] if len(args) < len(params) \
                         else None
-                    args.append(self.parse_expr_as(want).code)
+                    a = self.parse_expr_as(want)
+                    args.append(a.code)
+                    atypes.append(a.type)
                     if not self.accept(","):
                         break
                 self.expect(")")
+                if generic:
+                    # No turbofish: infer the type arguments from what was
+                    # actually passed, then instantiate.
+                    e = Expr(self.instantiate_fn(
+                        e.code, self.infer_type_args(e.code, atypes)), None)
                 if e.code in self.unit.tuple_structs:
                     e = self.tuple_struct_literal(e.code, args)
                 else:
@@ -1131,14 +1363,41 @@ class Parser:
             name = t.val
             if name == "Self" and self.impl_type:
                 name = self.impl_type
+            targs = None
             while self.at("::", "punc"):        # path: foo::bar -> foo_bar
                 self.next()
+                if self.at("<", "punc"):
+                    # Turbofish. On a generic struct (`Pair::<i32>::new`) it
+                    # names an instantiation, so materialise it and continue
+                    # down the path; on a generic fn it is carried to the call
+                    # site, which is where the instantiation is needed.
+                    args = self.parse_type_args()
+                    if name in self.unit.generic_structs:
+                        name = self.instantiate_struct(name, args).base
+                    else:
+                        targs = args
+                    continue
                 name += "_" + self.expect_ident()
             # `Name { ... }` is a struct literal, except in a condition
             # position, where Rust also treats the brace as a block.
             if (self.at("{", "punc") and not self.no_struct_lit
                     and name in self.unit.structs):
                 return self.parse_struct_literal(name, t.line)
+            if (self.at("{", "punc") and not self.no_struct_lit
+                    and name in self.unit.generic_structs):
+                # `Pair { a: 1, b: 2 }` names a generic, so which
+                # instantiation it is comes from context -- a `let`
+                # annotation, a return type or a parameter -- exactly as
+                # `None` resolves its `Option`.
+                want = self.target
+                if want is not None and \
+                        self.unit.instances.get(want.base, (None, None))[0] \
+                        == name:
+                    return self.parse_struct_literal(want.base, t.line)
+                self.err("cannot tell which instantiation of `%s` this "
+                         "literal is; annotate it (`let x: %s<i32> = ..`) or "
+                         "use a turbofish (`%s::<i32> { .. }`)",
+                         name, name, name)
             if name == "None" and not self.at("::", "punc"):
                 return self.none_expr()
             if (name in self.unit.unit_structs and self.lookup(name) is None
@@ -1154,7 +1413,10 @@ class Parser:
                     ty = CType(self.unit.variants[name])
                 elif name in self.unit.consts:
                     ty = self.unit.consts[name]
-            return Expr(name, ty)
+            out = Expr(name, ty)
+            if targs is not None:
+                out.targs = targs
+            return out
         raise CrustError("line %d: unexpected %r in expression"
                          % (t.line, t.val or "<eof>"))
 
@@ -1671,6 +1933,7 @@ class Parser:
             self.next()
         self.expect("struct")
         name = self.expect_ident()
+        self.skip_generic_params()
         self.expect("{")
         fields = []
         while not self.at("}", "punc"):
@@ -1735,10 +1998,13 @@ class Parser:
         return self.toks[j].val == "const" and self.toks[j].kind == "kw"
 
     def parse_impl_header(self):
-        """Parse `impl Name {`, returning the type name."""
+        """Parse `impl[<P..>] Name[<A..>] {`, returning the type name."""
         self.skip_attributes()
         self.expect("impl")
+        self.impl_params = self.parse_generic_params()
         name = self.expect_ident()
+        if self.at("<", "punc"):
+            self.skip_generic_params()      # the arguments, e.g. `Pair<T>`
         self.expect("{")
         return name
 
@@ -1767,6 +2033,7 @@ class Parser:
             self.next()
         start = self.expect("fn")
         name = self.expect_ident()
+        self.skip_generic_params()
         self.expect("(")
         self_kind = self.parse_self_param()
         if self_kind != "none":
@@ -1801,9 +2068,11 @@ class Parser:
                 if depth == 0:
                     return
 
-    def parse_impl(self, out):
+    def parse_impl(self, out, owner_override=None):
         """Translate an `impl` block into free functions."""
         owner = self.parse_impl_header()
+        if owner_override is not None:
+            owner = owner_override
         self.impl_type = owner
         while not self.at("}", "punc"):
             if self.cur.kind == "eof":
@@ -1812,6 +2081,15 @@ class Parser:
                 self.parse_const_signature()     # hoisted into the prelude
                 continue
             start, info = self.parse_method_signature(owner)
+            if owner_override is not None:
+                self.unit.methods[(owner, info.name)] = info
+                selfp = []
+                if info.self_kind == "ref":
+                    selfp = [CType(owner, 1)]
+                elif info.self_kind == "value":
+                    selfp = [CType(owner)]
+                self.unit.fn_sigs[info.mangled] = (
+                    info.ret, selfp + [t for _, t in info.params])
             params = list(info.params)
             if info.self_kind == "ref":
                 params.insert(0, ("self", CType(owner, 1)))
@@ -1832,6 +2110,7 @@ class Parser:
                 self.next()
         start = self.expect("fn")
         name = self.expect_ident()
+        self.skip_generic_params()
         self.expect("(")
         params = []
         while not self.at(")", "punc"):
@@ -1848,8 +2127,10 @@ class Parser:
             ret = self.parse_type()
         return start, name, params, ret
 
-    def parse_fn(self, out):
+    def parse_fn(self, out, name_override=None):
         start, name, params, ret = self.parse_fn_signature()
+        if name_override is not None:
+            name = name_override
         synth_main_ret = False
         if name == "main" and ret.is_void():
             ret = INT
@@ -1959,7 +2240,8 @@ def normalize_number(tok):
 # --------------------------------------------------------------------------
 
 _ITEM_START = re.compile(
-    r"\b(?P<kw>fn|struct|impl|enum|const|static)\s+"
+    r"\b(?P<kw>fn|struct|impl|enum|const|static)"
+    r"(?:\s+|\s*(?=<))(?:<[^<>]*>\s*)?"
     r"(?:mut\s+)?(?P<name>[A-Za-z_]\w*)")
 _MODIFIER = re.compile(r"(?:\b(?:pub|unsafe)\b\s+|\bextern\s+\"C\"\s+)*$")
 
@@ -2196,6 +2478,34 @@ def _line_of(code, offset):
     return code.count("\n", 0, offset) + 1
 
 
+def _generic_params_of(toks, kind):
+    """(params, name) if this item is generic, else None.
+
+    Reads the token stream directly rather than the source text, so comments
+    and whitespace cannot confuse it, and so `impl<T>` and `impl <T>` are the
+    same thing.
+    """
+    if kind not in ("struct", "fn", "impl"):
+        return None
+    p = Parser(list(toks))
+    try:
+        p.skip_attributes()
+        while p.cur.val in ("pub", "unsafe", "extern") or p.cur.kind == "str":
+            p.next()
+        if not p.at(kind, "kw"):
+            return None
+        p.next()
+        if kind == "impl":
+            params = p.parse_generic_params()
+            name = p.expect_ident()
+            return (params, name) if params else None
+        name = p.expect_ident()
+        params = p.parse_generic_params()
+        return (params, name) if params else None
+    except CrustError:
+        return None
+
+
 def collect_items(code, spans, unit, struct_order, fail=None):
     """Populate `unit` from the Rust items in `code`; return struct names.
 
@@ -2205,7 +2515,22 @@ def collect_items(code, spans, unit, struct_order, fail=None):
     """
     local = {"structs": [], "enums": [], "consts": [], "impl_consts": []}
     for start, end, kind in spans:
-        p = Parser(tokenize(code[start:end], _line_of(code, start)), unit)
+        toks = tokenize(code[start:end], _line_of(code, start))
+        p = Parser(toks, unit)
+        # A generic item is not lowered here: it is a template, kept as
+        # tokens and re-parsed once per distinct set of type arguments. Only
+        # the instantiations reach the C output, so an unused generic costs
+        # nothing, exactly as in Rust.
+        gp = _generic_params_of(toks, kind)
+        if gp is not None:
+            params, name = gp
+            if kind == "struct":
+                unit.generic_structs[name] = (params, toks)
+            elif kind == "fn":
+                unit.generic_fns[name] = (params, toks)
+            elif kind == "impl":
+                unit.generic_impls.append((params, name, toks))
+            continue
         try:
             if kind in ("struct", "tuple_struct", "unit_struct"):
                 if kind == "struct":
@@ -2330,6 +2655,17 @@ def collect_include_items(code, path, _seen=None):
         struct_order.extend(sub_order)
         collect_items(text, find_rust_items(text), unit, struct_order)
     return unit, struct_order
+
+
+def _is_generic_span(code, start, end, kind):
+    """True if the item at this span declares type parameters."""
+    if kind not in ("struct", "fn", "impl"):
+        return False
+    try:
+        toks = tokenize(code[start:end], _line_of(code, start))
+    except CrustError:
+        return False
+    return _generic_params_of(toks, kind) is not None
 
 
 def _prelude_offset(code):
@@ -2472,8 +2808,10 @@ def translate(code, path=None):
         pieces.append(code[prev:start])
         line0 = _line_of(code, start)
         if kind in ("struct", "tuple_struct", "unit_struct", "enum",
-                    "const"):
-            text = ""            # hoisted into the prelude
+                    "const") or _is_generic_span(code, start, end, kind):
+            # Hoisted into the prelude, or -- for a generic -- a template
+            # whose instantiations are appended after the unit instead.
+            text = ""
         else:
             parser = Parser(tokenize(code[start:end], line0), unit)
             out = Out(line0)
@@ -2527,7 +2865,11 @@ def translate(code, path=None):
             prelude.append("struct %s; typedef struct %s %s; %s"
                            % (name, name, name,
                               _render_struct(name, unit.structs[name])))
-    for name in _toposort_structs(unit, local["structs"]):
+    for name in unit.struct_order:
+        if name in unit.structs:
+            prelude.append("struct %s; typedef struct %s %s;"
+                           % (name, name, name))
+    for name in _toposort_structs(unit, local["structs"] + unit.struct_order):
         prelude.append(_render_struct(name, unit.structs[name]))
     for name in sorted(unit.unwraps):
         if name in unit.options:
@@ -2557,6 +2899,11 @@ def translate(code, path=None):
         prelude.append("%s(%s);" % (ret.decl(name),
                                     ", ".join(t.decl() for t in ps)
                                     if ps else "void"))
+    if unit.emitted:
+        # Monomorphised bodies go after all original text, so no line number
+        # in the user's own source moves. Their prototypes are in the prelude,
+        # so definition order does not matter.
+        body = body.rstrip("\n") + "\n\n" + "\n".join(unit.emitted) + "\n"
     if not prelude:
         return body
     at = _prelude_offset(body)
