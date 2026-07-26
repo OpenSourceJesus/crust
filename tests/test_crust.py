@@ -8,6 +8,7 @@ call each other directly.
 
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -1807,6 +1808,172 @@ class TestCrustModuleItemForms(unittest.TestCase):
     def test_use_inside_a_string_survives(self):
         c = crust.translate('fn f() -> &str { "use core::mem;" }')
         self.assertIn("use core::mem;", c)
+
+    def test_find_mod_decls(self):
+        names = crust.find_mod_decls(
+            "pub mod types;\nmod helpers;\npub(crate) mod io;\n"
+            "mod inline { }\nfn f() -> i32 { 1 }\n")
+        self.assertEqual(names, ["types", "helpers", "io"])
+
+    def test_find_mod_decls_ignores_comments_and_strings(self):
+        self.assertEqual(
+            crust.find_mod_decls('// mod ghost;\nfn f() -> i32 { 1 }\n'), [])
+        self.assertEqual(
+            crust.find_mod_decls('fn f() -> &str { "mod ghost;" }\n'), [])
+
+    def test_resolve_mod_path_rs_then_mod_rs(self):
+        work = tempfile.mkdtemp()
+        try:
+            with open(os.path.join(work, "types.rs"), "w") as f:
+                f.write("struct T { x: i32 }\n")
+            os.makedirs(os.path.join(work, "helpers"))
+            with open(os.path.join(work, "helpers", "mod.rs"), "w") as f:
+                f.write("struct H { y: i32 }\n")
+            parent = os.path.join(work, "user.rs")
+            with open(parent, "w") as f:
+                f.write("mod types;\n")
+            self.assertEqual(
+                crust.resolve_mod_path("types", parent),
+                os.path.join(work, "types.rs"))
+            self.assertEqual(
+                crust.resolve_mod_path("helpers", parent),
+                os.path.join(work, "helpers", "mod.rs"))
+            self.assertIsNone(crust.resolve_mod_path("missing", parent))
+        finally:
+            for root, dirs, files in os.walk(work, topdown=False):
+                for name in files:
+                    os.remove(os.path.join(root, name))
+                for name in dirs:
+                    os.rmdir(os.path.join(root, name))
+            os.rmdir(work)
+
+
+class TestCrustModSiblingTypes(unittest.TestCase):
+    """`mod name;` seeds type definitions from sibling .rs files."""
+
+    def test_translate_sees_sibling_struct_fields(self):
+        work = tempfile.mkdtemp()
+        try:
+            with open(os.path.join(work, "types.rs"), "w") as f:
+                f.write("pub struct Foo { x: i32 }\n")
+            user = os.path.join(work, "user.rs")
+            with open(user, "w") as f:
+                f.write("mod types;\n"
+                        "fn f(p: Foo) -> i32 { p.x }\n")
+            with open(user) as f:
+                src = f.read()
+            c = crust.translate(src, path=user)
+            self.assertIn("struct Foo", c)
+            self.assertIn("int x", c)
+            self.assertIn("return p.x;", c)
+            self.assertNotIn("mod types", c)
+        finally:
+            for name in ("types.rs", "user.rs"):
+                try:
+                    os.remove(os.path.join(work, name))
+                except OSError:
+                    pass
+            os.rmdir(work)
+
+    def test_sibling_struct_compiles(self):
+        self.assertEqual(_run("""
+mod types;
+fn main() -> i32 {
+    let p: Foo = Foo { x: 40 };
+    p.x + 2
+}
+""", suffix=".rs", extra={
+            "types.rs": "pub struct Foo { x: i32 }\n",
+        }), 42)
+
+    def test_sibling_enum_compiles(self):
+        self.assertEqual(_run("""
+mod kinds;
+fn main() -> i32 {
+    match Kind::B {
+        Kind::A => 1,
+        Kind::B => 42,
+    }
+}
+""", suffix=".rs", extra={
+            "kinds.rs": "pub enum Kind { A, B }\n",
+        }), 42)
+
+    def test_mod_rs_layout(self):
+        work = tempfile.mkdtemp()
+        try:
+            os.makedirs(os.path.join(work, "types"))
+            with open(os.path.join(work, "types", "mod.rs"), "w") as f:
+                f.write("pub struct Foo { x: i32 }\n")
+            user = os.path.join(work, "user.rs")
+            src = ("mod types;\n"
+                   "fn f(p: Foo) -> i32 { p.x }\n")
+            with open(user, "w") as f:
+                f.write(src)
+            c = crust.translate(src, path=user)
+            self.assertIn("struct Foo { int x; }", c)
+        finally:
+            for root, dirs, files in os.walk(work, topdown=False):
+                for name in files:
+                    os.remove(os.path.join(root, name))
+                for name in dirs:
+                    os.rmdir(os.path.join(root, name))
+            os.rmdir(work)
+
+    def test_compile_object_with_mod_types(self):
+        """crustos-style per-file `-c` succeeds when types come from a mod."""
+        work = tempfile.mkdtemp()
+        try:
+            with open(os.path.join(work, "types.rs"), "w") as f:
+                f.write("pub struct Foo { x: i32 }\n")
+            user = os.path.join(work, "user.rs")
+            with open(user, "w") as f:
+                f.write("mod types;\n"
+                        "fn use_foo(p: Foo) -> i32 { p.x }\n")
+            obj = os.path.join(work, "user.o")
+            root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            proc = subprocess.run(
+                [sys.executable, "-m", "shivyc.main", "-c", user, "-o", obj],
+                cwd=root, capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertTrue(os.path.exists(obj))
+        finally:
+            import shutil
+            shutil.rmtree(work, ignore_errors=True)
+
+
+class TestCrustTypeAliases(unittest.TestCase):
+    """`type Name = T;` as a typedef."""
+
+    def test_local_alias_translates(self):
+        c = crust.translate("type pid_t = i32;\nfn f(p: pid_t) -> pid_t { p }\n")
+        self.assertIn("typedef int pid_t;", c)
+        self.assertIn("int f(int p)", c)
+
+    def test_pub_alias(self):
+        c = crust.translate("pub type ssize_t = i64;\nfn f() -> i32 { 1 }\n")
+        self.assertIn("typedef long ssize_t;", c)
+
+    def test_sibling_alias_compiles(self):
+        self.assertEqual(_run("""
+mod types;
+fn main() -> i32 {
+    let p: pid_t = 40;
+    p + 2
+}
+""", suffix=".rs", extra={
+            "types.rs": "pub type pid_t = i32;\n",
+        }), 42)
+
+    def test_alias_to_struct(self):
+        self.assertEqual(_run("""
+type Handle = Foo;
+struct Foo { x: i32 }
+fn main() -> i32 {
+    let h: Handle = Foo { x: 42 };
+    h.x
+}
+""", suffix=".rs"), 42)
 
 
 class TestCrustVisibility(unittest.TestCase):

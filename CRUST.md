@@ -66,7 +66,8 @@ its definition.
 | Tuples | tuple types `(A, B)`, tuple expressions, positional access `t.0` |
 | Closures | non-capturing `|a: T| expr`, lifted to a plain function |
 | Paths | `a::b::C` in type position |
-| Module items | `use`, `extern crate` and `mod X;` are erased; `core::ffi::c_*` map to their C types |
+| Module items | `use` and `extern crate` are erased; `mod X;` is erased but sibling `X.rs` / `X/mod.rs` are read for type definitions; `core::ffi::c_*` map to their C types |
+| Type aliases | `type Name = T;` (optional `pub`), emitted as a C `typedef` |
 | Visibility | `pub`, `pub(crate)`, `pub(in path)`, `pub unsafe extern "C"` |
 | Lifetimes | `'a` is accepted and dropped |
 | Types | `i8 i16 i32 i64 isize`, `u8 u16 u32 u64 usize`, `f32 f64`, `bool`, `char`, `()`, `&str` |
@@ -475,8 +476,23 @@ the C lexer runs there is nothing for a `use` to do — they are **erased**,
 blanked in place so line numbers do not move. `core::ffi::c_int` and its
 siblings map to exactly the C types they name.
 
-Both are trivial. What is worth recording is why they went unnoticed for so
-long, because it is a lesson about the tooling rather than about Rust.
+`mod X;` is erased the same way for line numbers, but Crust also opens the
+sibling file (`X.rs`, or `X/mod.rs`) and seeds the current unit from its
+type definitions — structs, enums, consts, `type` aliases, and method
+signatures. Those decls are hoisted into the prelude so a file that only
+*uses* a crate-local type can compile alone under `survey --verify`. Function
+bodies stay in the sibling; Crust does not inline whole modules, and does not
+model visibility or `use` path binding.
+
+`type Name = T;` (with optional `pub`) is a first-class item: it resolves in
+type position and emits as a C `typedef`. That is what makes crate-local
+aliases like `pid_t` and `ssize_t` visible across `mod` boundaries. Types that
+live only in std/core (`String`, `AtomicU32`, …) still need a definition Crust
+can see — there are no fake std stubs.
+
+Both erasures are otherwise trivial. What is worth recording is why they went
+unnoticed for so long, because it is a lesson about the tooling rather than
+about Rust.
 
 `crust.translate` passes text it does not recognize through byte-for-byte —
 that is the whole design, and it is what lets C and Rust share a file. So
