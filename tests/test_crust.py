@@ -1292,3 +1292,44 @@ class TestRpythonInclude(unittest.TestCase):
                            "impl Pair {\n"
                            "    fn sum(&self) -> i32 { self.a + self.b }\n"
                            "}\n"}), 42)
+
+
+class TestCrustUnsafe(unittest.TestCase):
+    """`unsafe { }` blocks -- the most common blocker in real Rust source."""
+
+    def test_unsafe_block_as_a_statement(self):
+        self.assertEqual(_run("""
+fn main() -> i32 {
+    let mut s: i32 = 0;
+    unsafe {
+        s = 42;
+    }
+    s
+}
+""", suffix=".rs"), 42)
+
+    def test_unsafe_block_as_an_expression(self):
+        self.assertEqual(_run("""
+fn get(p: *const i32) -> i32 {
+    let v: i32 = unsafe { p[1] };
+    v
+}
+fn main() -> i32 {
+    let a: [i32; 2] = [1, 42];
+    get(&a[0])
+}
+""", suffix=".rs"), 42)
+
+    def test_unsafe_block_can_return(self):
+        self.assertEqual(_run("""
+fn pick() -> i32 {
+    unsafe {
+        42
+    }
+}
+fn main() -> i32 { pick() }
+""", suffix=".rs"), 42)
+
+    def test_unsafe_fn_still_parses(self):
+        c = crust.translate("unsafe fn f(a: i32) -> i32 { a }")
+        self.assertIn("int f(int a)", c)
