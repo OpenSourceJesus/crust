@@ -59,6 +59,7 @@ its definition.
 | Area | Supported |
 |---|---|
 | Items | `fn`, `struct`, `impl`, `enum`, `const`, `static`, with optional `pub`, `unsafe`, `extern "C"`; `#[...]` attributes are skipped |
+| Generics | `fn f<T>`, `struct S<T>`, `impl<T> S<T>`, turbofish `f::<T>()`, monomorphised per instantiation |
 | Types | `i8 i16 i32 i64 isize`, `u8 u16 u32 u64 usize`, `f32 f64`, `bool`, `char`, `()`, `&str` |
 | Pointers | `*const T`, `*mut T`, `&T`, `&mut T` (all lower to `T *`) |
 | Arrays | `[T; N]`, and slices `&[T]` / `&mut [T]` |
@@ -396,6 +397,67 @@ This matters out of proportion to its size: in a survey of the Redox kernel,
 relibc and ion (615 files), `unsafe` blocks were the single largest blocker
 after generics, stopping 44 files on their own.
 
+## Generics
+
+Generics are **monomorphised**, the same way `Option` and `Result` already
+were: a generic item is kept as its tokens, and each distinct set of type
+arguments re-parses those tokens with the parameters bound to concrete types.
+
+```rust
+struct Pair<T> { a: T, b: T }
+impl<T> Pair<T> { fn sum(&self) -> T { self.a + self.b } }
+```
+
+```c
+struct Pair_int    { int a;    int b; };
+struct Pair_double { double a; double b; };
+int    Pair_int_sum(Pair_int *self);
+double Pair_double_sum(Pair_double *self);
+```
+
+An instantiation is an ordinary C struct and an ordinary C function. Nothing
+is boxed, nothing carries a tag, and there is no vtable or dispatch, so
+**C can build and call an instantiation directly** — `Pair_int_sum(&p)` — and
+the no-FFI property that motivates Crust survives generics intact.
+
+This is worth being explicit about, because the obvious shortcut is the wrong
+one here. py2c has a tagged dynamic word (`obj`) that could represent any `T`
+in one uniform layout, and reaching for it would have made the parser work
+much easier. But it erases the type: `T` as a struct field would no longer
+have the right size or offset, `sizeof` would be wrong, every value would need
+boxing and unboxing at the boundary, and C could no longer pass a `Pair<i32>`
+without conversion. Rust's own semantics are static, and so is the C we want
+out. py2c's *other* container model — the `_tlist_int` / `_tlist_double`
+types it generates on demand, one per element type — is the right precedent,
+and it is the same one Crust was already following.
+
+Instantiation is demand-driven: an unused generic emits nothing at all, and
+two calls at the same type share one instantiation.
+
+**Type arguments** come from a turbofish (`id::<i32>(x)`, `Pair::<f64>::new`)
+or are inferred from the call's arguments. Inference is deliberately shallow —
+Crust has no type checker. A parameter declared as exactly a type variable
+(`x: T`), or one reference or pointer step from one (`x: &T`), binds that
+variable. Anything deeper (`&[T]`, `Wrap<T>`) is not inferred and needs a
+turbofish. Where a type argument cannot be determined, Crust says so and names
+what to write instead of guessing:
+
+```
+line 2: cannot infer type argument `T` for `make`; give it explicitly with a
+turbofish, `make::<i32>(..)`
+```
+
+A generic struct literal reads its instantiation from context — a `let`
+annotation, a return type, a parameter — exactly as `None` resolves its
+`Option`. Where there is no context, it asks for one.
+
+**Not supported:** trait bounds are parsed and then ignored, since there are
+no traits to check against — where a bound would have caught a mistake, the
+generated C fails to compile instead. There are no lifetimes, no const
+generics, no generic enums, and no `where` clauses. Crust also monomorphises
+only from source it can see: a generic from `std`, `core` or another crate has
+no template to instantiate, and is reported as such rather than guessed at.
+
 ## Compiling real Rust: `tools/crustos.py`
 
 `tools/crustos.py` walks a Rust source tree, runs every `.rs` file through the
@@ -420,23 +482,30 @@ Where things stand on Redox (kernel + relibc + ion, 615 files):
 
 | outcome | files | |
 |---|---|---|
-| translated (most of the file lowered) | 17 | 2.8% |
-| partial (some items lowered) | 29 | 4.7% |
-| failed (items found, translation errored) | 469 | 76.3% |
-| empty (no Rust items recognized) | 100 | 16.3% |
+| translated (most of the file lowered) | 27 | 4.4% |
+| partial (some items lowered) | 31 | 5.0% |
+| failed (items found, translation errored) | 458 | 74.5% |
+| empty (no Rust items recognized) | 99 | 16.1% |
 
-6281 top-level Rust items parse. The ranked blockers behind the 469 failures
-are what the survey exists to produce, and they are unambiguous about the
-order of work: **generics** (30% of failing files), then paths in type
-position, `impl Trait for Type`, trait method resolution, closures and tuples,
-data-carrying enum variants, and macros.
+6355 top-level Rust items parse. With generics landed, the ranked blockers
+behind the 458 remaining failures are paths in type position (7.9%), `impl
+Trait for Type` (7.0%), trait method resolution (6.1%), closures and tuples
+(5.2%), data-carrying enum variants (4.6%), and macros (4.4%).
 
-One honest caveat the numbers make plain: most failing files are blocked by
-*several* of these at once, so landing any single feature moves the headline
-count very little. Adding `unsafe` blocks took that blocker from 44 files to
-3, but the overall failure count only fell from 471 to 469 -- the next blocker
-in the same file was waiting. Generics are the gate; little else will show up
-in the totals until they land.
+Two honest caveats the numbers make plain. First, most failing files are
+blocked by *several* features at once, so landing any one of them moves the
+headline count less than its own share suggests: `unsafe` blocks went from 44
+files to 3 while total failures fell only from 471 to 469, and generics went
+from 142 files to 21 while total failures fell from 469 to 458. The next
+blocker in the same file was already waiting.
+
+Second, and more fundamental: the single largest remaining message is now
+`no definition for generic type X in this unit` (85 files). Monomorphisation
+needs a template, and Redox's generics are overwhelmingly `Vec`, `Box`,
+`BTreeMap` and friends — defined in `std`/`core`, which Crust has never seen.
+That is not a parser gap that more syntax support will close. Compiling real
+Redox needs a story for the standard library, whether that is a Crust-side
+minimal `core`, or teaching crustos to follow crate sources.
 
 ## Not yet supported
 
@@ -468,6 +537,8 @@ Python, in keeping with the rest of the front end.
   operator, `unwrap_err` and `.ok()`.
 - `examples/crust/iter.rs` — `for x in xs` over slices and arrays, a unit
   struct with an `impl` block, and the `[v; N]` repeat initializer.
+- `examples/crust/generic.rs` — a generic struct with an `impl` block and
+  generic functions, instantiated at two types each.
 - `examples/crust/histogram.py` and `examples/crust/polyglot.c` — C, Rust and
   rpython in one translation unit, each calling the other two.
 - `examples/crust/tally.py` and `examples/crust/tally.c` — an rpython module
