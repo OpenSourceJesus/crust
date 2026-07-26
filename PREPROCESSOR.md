@@ -1057,6 +1057,15 @@ with `KeyError: None` (cur_func is None outside a function). Fixes
 __ctype_tolower_loc.c / __ctype_toupper_loc.c / prng/random.c. Differential-
 tested vs gcc.
 
+A related file-scope crash remained for non-constant static initializers that
+are not address constants — e.g. `int f(void); static int x = f();` with no
+prior function definition leaving `cur_func` unset. `DeclInfo.do_init` and
+`do_aggregate_init` now evaluate those on a probe IL (`<static-init-probe>`),
+so the existing “non-constant initializer for variable with static storage
+duration” diagnostic fires instead of `KeyError: None`. `ILCode.add` also
+rejects a null `cur_func` with an internal `CompilerError` rather than a bare
+dictionary miss.
+
 ## Extended inline-asm output constraints (musl atomics)
 
 ShivyC's inline asm now supports the full operand model musl's atomics use
