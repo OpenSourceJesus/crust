@@ -708,7 +708,11 @@ class _RelCommand(_ValueCmd):
         # scratch register, because `mov mem, imm64` is not encodable and the
         # move must go through `mov reg, imm64` (movabs).
         if isinstance(spot, LiteralSpot):
-            if -(2 ** 31) <= spot.value < 2 ** 31:
+            # A symbolic literal (e.g. an enum constant) has a string value,
+            # so its magnitude is not known here; fall through and give it a
+            # scratch register, which is always valid.
+            if isinstance(spot.value, int) and \
+                    -(2 ** 31) <= spot.value < 2 ** 31:
                 return spot
         elif isinstance(spot, RegSpot):
             return spot
