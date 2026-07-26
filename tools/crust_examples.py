@@ -57,6 +57,16 @@ EXAMPLES = [
      "widest = 3\n"
      "len2   = 25\n", True),
 
+    ("macros.rs", 0,
+     "n=6 f=1.5 s=crust\n"
+     "hex=6 braces={} percent=100%\n"
+     "square(6)    = 36\n"
+     "pick()       = 0\n"
+     "pick(7)      = 7\n"
+     "pick(3, 9)   = 9\n"
+     "twice(add)   = 42\n"
+     "cfg!         = false\n", True),
+
     ("traits.rs", 0,
      "disk: bytes=1048576 kib=1024\n"
      "ram: bytes=1048576 kib=1024\n"
