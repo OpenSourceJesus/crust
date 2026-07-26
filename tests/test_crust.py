@@ -1808,6 +1808,42 @@ class TestCrustModuleItemForms(unittest.TestCase):
         c = crust.translate('fn f() -> &str { "use core::mem;" }')
         self.assertIn("use core::mem;", c)
 
+    def test_find_mod_decls(self):
+        names = crust.find_mod_decls(
+            "pub mod types;\nmod helpers;\npub(crate) mod io;\n"
+            "mod inline { }\nfn f() -> i32 { 1 }\n")
+        self.assertEqual(names, ["types", "helpers", "io"])
+
+    def test_find_mod_decls_ignores_comments_and_strings(self):
+        self.assertEqual(
+            crust.find_mod_decls('// mod ghost;\nfn f() -> i32 { 1 }\n'), [])
+        self.assertEqual(
+            crust.find_mod_decls('fn f() -> &str { "mod ghost;" }\n'), [])
+
+    def test_resolve_mod_path_rs_then_mod_rs(self):
+        work = tempfile.mkdtemp()
+        try:
+            open(os.path.join(work, "types.rs"), "w").write("struct T { x: i32 }\n")
+            os.makedirs(os.path.join(work, "helpers"))
+            open(os.path.join(work, "helpers", "mod.rs"), "w").write(
+                "struct H { y: i32 }\n")
+            parent = os.path.join(work, "user.rs")
+            open(parent, "w").write("mod types;\n")
+            self.assertEqual(
+                crust.resolve_mod_path("types", parent),
+                os.path.join(work, "types.rs"))
+            self.assertEqual(
+                crust.resolve_mod_path("helpers", parent),
+                os.path.join(work, "helpers", "mod.rs"))
+            self.assertIsNone(crust.resolve_mod_path("missing", parent))
+        finally:
+            for root, dirs, files in os.walk(work, topdown=False):
+                for name in files:
+                    os.remove(os.path.join(root, name))
+                for name in dirs:
+                    os.rmdir(os.path.join(root, name))
+            os.rmdir(work)
+
 
 class TestCrustVisibility(unittest.TestCase):
     """`pub`, `pub(crate)`, and `pub unsafe extern "C"`."""

@@ -3121,7 +3121,39 @@ _ERASED_HEAD = re.compile(
     r"^[ \t]*(?:pub(?:\s*\([^)]*\))?\s+)?"
     r"(?:use\b|extern\s+crate\b|mod\s+\w+\s*;)", re.M)
 
+# Bare `mod name;` (optional `pub` / `pub(...)`) — not `mod name { ... }`.
+_MOD_DECL = re.compile(
+    r"^[ \t]*(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+(?P<name>\w+)\s*;", re.M)
+
 _MACRO_RULES = re.compile(r"\bmacro_rules!\s*(?P<name>[A-Za-z_]\w*)\s*\{")
+
+
+def find_mod_decls(code):
+    """Return module names from bare `mod name;` / `pub mod name;` items.
+
+    Inline modules (`mod name { ... }`) are not matched. Comments and string
+    literals are blanked first so a `mod` mentioned in prose is ignored.
+    """
+    scan = _blank(code)
+    return [m.group("name") for m in _MOD_DECL.finditer(scan)]
+
+
+def resolve_mod_path(name, path):
+    """Resolve `mod name;` to a sibling source file, or None if missing.
+
+    Looks for `name.rs` then `name/mod.rs` next to `path`. When `path` is
+    None or has no directory, searches the current working directory.
+    """
+    base = os.path.dirname(path) if path else ""
+    candidates = [
+        os.path.join(base, name + ".rs") if base else name + ".rs",
+        os.path.join(base, name, "mod.rs") if base
+        else os.path.join(name, "mod.rs"),
+    ]
+    for cand in candidates:
+        if os.path.isfile(cand):
+            return cand
+    return None
 
 
 def find_rust_items(code, rust_file=False):
