@@ -61,6 +61,7 @@ its definition.
 | Items | `fn`, `struct`, `impl`, `enum`, `const`, `static`, with optional `pub`, `unsafe`, `extern "C"`; `#[...]` attributes are skipped |
 | Generics | `fn f<T>`, `struct S<T>`, `impl<T> S<T>`, turbofish `f::<T>()`, monomorphised per instantiation |
 | Core | bundled `Vec<T>`, `Box<T>`, `Cell<T>`, `PhantomData<T>`, and `size_of::<T>()` |
+| Traits | `trait`, `impl Trait for Type`, default methods, supertraits, bounds `<T: Trait>`; static dispatch |
 | Types | `i8 i16 i32 i64 isize`, `u8 u16 u32 u64 usize`, `f32 f64`, `bool`, `char`, `()`, `&str` |
 | Pointers | `*const T`, `*mut T`, `&T`, `&mut T` (all lower to `T *`) |
 | Arrays | `[T; N]`, and slices `&[T]` / `&mut [T]` |
@@ -459,6 +460,55 @@ generics, no generic enums, and no `where` clauses. Crust also monomorphises
 only from source it can see: a generic from `std`, `core` or another crate has
 no template to instantiate, and is reported as such rather than guessed at.
 
+## Traits
+
+`impl Trait for Type` lowers to exactly what an inherent `impl` does: free
+functions named `Type_method`. **Dispatch is static.** A trait call is an
+ordinary direct call -- no vtable, no function pointer, no indirection -- so it
+inlines like any other call and C can invoke it with no shim:
+
+```rust
+trait Metric { fn bytes(&self) -> i64; }
+impl Metric for Disk { fn bytes(&self) -> i64 { self.sectors * 512 } }
+```
+
+```c
+long Disk_bytes(Disk *self) { return (self->sectors * 512); }
+```
+
+A trait declares nothing at C level; it exists only through its impls.
+
+**Default methods** are stored as tokens and generated per implementing type
+with `Self` bound to it -- the same substitution a generic instantiation does.
+An impl that overrides a default simply wins. **Supertraits** are followed, so
+`trait Device: Metric` gives `Device`'s impls the defaults of both.
+
+**Trait bounds** (`fn f<T: Metric>(x: T)`) compose with monomorphisation: the
+bound itself is not checked (Crust has no trait solver), but each instantiation
+resolves its method calls against the concrete type, so `f<Disk>` calls
+`Disk_bytes` directly. Where a bound would have caught a mistake, the generated
+C fails to compile instead.
+
+Trait paths are flattened, so `impl fmt::Debug for X` -- which Redox writes
+constantly -- gives `X_fmt`.
+
+**Not supported:** `dyn Trait` and trait objects (which would need the vtable
+this design deliberately avoids), associated types and associated consts
+(parsed and skipped), generic traits with their own parameters, blanket impls,
+and operator-trait sugar -- `a + b` never becomes `Add::add`.
+
+### Cost
+
+Static dispatch is the reason this is worth doing rather than boxing. On a
+20-million-iteration loop through a trait method, the generated C contains
+**zero** indirect calls, and the trait call is indistinguishable from a direct
+one. What is *not* yet competitive is the optimizer behind it: the same
+generated C, built by gcc -O2, runs about twice as fast as ShivyCX's own
+backend (0.094s vs 0.195s on that loop). So the lowering is right and the
+dispatch is free; the remaining gap is codegen quality, not the trait design.
+A comparison against rustc has not been made -- it could not be installed in
+the environment this was developed in -- so no claim is made about it.
+
 ## The bundled minimal core
 
 Monomorphisation needs a template, so a generic with no source in the unit
@@ -521,10 +571,10 @@ Where things stand on Redox (kernel + relibc + ion, 615 files):
 
 | outcome | files | |
 |---|---|---|
-| translated (most of the file lowered) | 27 | 4.4% |
-| partial (some items lowered) | 32 | 5.2% |
-| failed (items found, translation errored) | 457 | 74.3% |
-| empty (no Rust items recognized) | 99 | 16.1% |
+| translated (most of the file lowered) | 26 | 4.2% |
+| partial (some items lowered) | 34 | 5.5% |
+| failed (items found, translation errored) | 463 | 75.3% |
+| empty (no Rust items recognized) | 92 | 15.0% |
 
 6355 top-level Rust items parse. With generics landed, the ranked blockers
 behind the 458 remaining failures are paths in type position (7.9%), `impl
@@ -537,6 +587,12 @@ headline count less than its own share suggests: `unsafe` blocks went from 44
 files to 3 while total failures fell only from 471 to 469, and generics went
 from 142 files to 21 while total failures fell from 469 to 458. The next
 blocker in the same file was already waiting.
+
+Traits removed `impl Trait for Type` from the blocker list entirely (it was
+7.0%), and pushed `empty` down from 99 files to 92 as trait-only files started
+being recognized. But total failures went *up*, 457 to 463: files that used to
+stop at the first `impl ... for` now parse further and reach a later blocker.
+That is progress the headline number actively hides, and it is worth naming.
 
 Second, and more instructive: adding the bundled core (above) moved these
 numbers almost not at all — 58 files to 59. It resolves `Vec` and `Box`
@@ -582,6 +638,8 @@ Python, in keeping with the rest of the front end.
   generic functions, instantiated at two types each.
 - `examples/crust/kernel.rs` — a mini-kernel sketch: tasks, an enum state
   machine, a generic ring buffer over the bundled `Vec<T>`, and `Box<T>`.
+- `examples/crust/traits.rs` — a trait with a default method, a supertrait,
+  two impls and a bounded generic, all statically dispatched.
 - `examples/crust/histogram.py` and `examples/crust/polyglot.c` — C, Rust and
   rpython in one translation unit, each calling the other two.
 - `examples/crust/tally.py` and `examples/crust/tally.c` — an rpython module
