@@ -24,6 +24,7 @@ Line numbers are preserved: the emitter syncs to the line of each source
 construct, so diagnostics from later passes point at the Rust source line.
 """
 
+import os
 import re
 
 __all__ = ["CrustError", "translate", "has_rust", "translate_file"]
@@ -97,7 +98,7 @@ KEYWORDS = {
     "fn", "let", "mut", "if", "else", "while", "loop", "for", "in", "return",
     "break", "continue", "as", "true", "false", "pub", "unsafe", "extern",
     "const", "static", "struct", "impl", "match", "use", "mod", "crate",
-    "enum",
+    "enum", "trait", "dyn", "where", "type",
 }
 
 # Longest-first so multi-character operators win.
@@ -367,6 +368,15 @@ class Unit:
         self.emitted = []           # generated C, appended after the unit
         self.struct_order = []      # instantiated structs, in creation order
         self.emitting = set()       # guards against recursive instantiation
+        self.core_names = set()     # generics seeded from the bundled core
+        # Traits. Dispatch is static: `impl Trait for T` registers its methods
+        # under `T` with the same `T_method` mangling an inherent impl uses,
+        # so a trait call is an ordinary direct call -- no vtable, no
+        # indirection, and fully inlinable.
+        self.traits = {}            # trait -> {method: (params, ret, self_kind)}
+        self.trait_defaults = {}    # trait -> {method: tokens of the default}
+        self.supertraits = {}       # trait -> [trait names]
+        self.trait_impls = []       # (trait, owner, tokens)
 
     def result_type(self, ok, err):
         """Return (and register) the tagged struct for `Result<ok, err>`."""
@@ -682,6 +692,8 @@ class Parser:
         if mangled in self.unit.emitting:
             self.err("recursive instantiation of `%s` (a generic struct "
                      "cannot contain itself by value)", name)
+        if name in self.unit.core_names:
+            self.unit.needs.add("alloc")
         self.unit.emitting.add(mangled)
         try:
             sub = dict(zip(params, args))
@@ -697,13 +709,37 @@ class Parser:
         return CType(mangled)
 
     def instantiate_impls_for(self, name, mangled, args):
-        """Generate the methods of every `impl<..> Name<..>` for one instance."""
-        for params, owner, toks in self.unit.generic_impls:
-            if owner != name:
-                continue
+        """Generate the methods of every `impl<..> Name<..>` for one instance.
+
+        Two passes, for the same reason the unit-level collector uses two:
+        every method of the instance must be known before any body is
+        translated, so that one method can call another declared after it.
+        """
+        matching = [(p, t) for p, owner, t in self.unit.generic_impls
+                    if owner == name]
+        for params, toks in matching:                 # pass 1: signatures
             sub = dict(zip(params, args))
             p = Parser(list(toks), self.unit, sub)
-            p.instance_name = mangled
+            p.parse_impl_header()
+            p.impl_type = mangled
+            while not p.at("}", "punc") and p.cur.kind != "eof":
+                if p.is_assoc_const():
+                    kw, cname, cty, cinit = p.parse_const_signature()
+                    self.unit.consts["%s_%s" % (mangled, cname)] = cty
+                    continue
+                _, info = p.parse_method_signature(mangled)
+                self.unit.methods[(mangled, info.name)] = info
+                selfp = []
+                if info.self_kind == "ref":
+                    selfp = [CType(mangled, 1)]
+                elif info.self_kind == "value":
+                    selfp = [CType(mangled)]
+                self.unit.fn_sigs[info.mangled] = (
+                    info.ret, selfp + [t for _, t in info.params])
+                p.skip_to_body_end()
+        for params, toks in matching:                 # pass 2: bodies
+            sub = dict(zip(params, args))
+            p = Parser(list(toks), self.unit, sub)
             out = Out(1)
             p.parse_impl(out, owner_override=mangled)
             self.unit.emitted.append(out.text())
@@ -909,7 +945,15 @@ class Parser:
                     e = self.parse_result_ctor(e.code)
                     continue
                 generic = e.code in self.unit.generic_fns
-                targs = getattr(e, "targs", None)
+                targs = e.targs
+                if e.code in ("size_of", "mem_size_of") and targs:
+                    # `size_of::<T>()` -- the one intrinsic monomorphised
+                    # containers cannot be written without, since Crust has
+                    # no `sizeof` of its own.
+                    self.expect(")")
+                    e = Expr("sizeof(%s)" % targs[0].decl(),
+                             CType("unsigned long"))
+                    continue
                 if generic and targs:
                     e = Expr(self.instantiate_fn(e.code, targs), None)
                     generic = False
@@ -1220,8 +1264,20 @@ class Parser:
 
         # Rust auto-refs/derefs the receiver; C needs it spelled out.
         if info.self_kind == "ref":
-            recv_code = recv.code if recv.type.ptr else "&" + _addressable(
-                recv.code)
+            if recv.type.ptr:
+                recv_code = recv.code
+            elif _is_lvalue(recv.code):
+                recv_code = "&" + _addressable(recv.code)
+            else:
+                # `a.f().g()` -- the receiver is a value, not a place, and C
+                # cannot take its address. Rust materialises a temporary here,
+                # so Crust does too, reusing the same pending-statement
+                # mechanism `?` uses. This also keeps the receiver evaluated
+                # exactly once.
+                tmp = self.new_temp()
+                self.pending.append("%s = %s;" % (recv.type.decl(tmp),
+                                                  recv.code))
+                recv_code = "&" + tmp
         else:
             recv_code = ("(*%s)" % recv.code) if recv.type.ptr else recv.code
         return Expr("%s(%s)" % (info.mangled,
@@ -1998,15 +2054,87 @@ class Parser:
         return self.toks[j].val == "const" and self.toks[j].kind == "kw"
 
     def parse_impl_header(self):
-        """Parse `impl[<P..>] Name[<A..>] {`, returning the type name."""
+        """Parse `impl[<P..>] [Trait for] Name[<A..>] {`; return the type name.
+
+        `self.impl_trait` is set to the trait name for a trait impl and to
+        None for an inherent one. The *owner* is always the type after `for`,
+        because that is what the methods are named after and what a call site
+        will look them up under.
+        """
         self.skip_attributes()
         self.expect("impl")
         self.impl_params = self.parse_generic_params()
-        name = self.expect_ident()
+        self.impl_trait = None
+        name = self.parse_path_name()
         if self.at("<", "punc"):
-            self.skip_generic_params()      # the arguments, e.g. `Pair<T>`
+            self.skip_generic_params()
+        if self.accept("for"):
+            self.impl_trait = name
+            name = self.parse_path_name()
+            if self.at("<", "punc"):
+                self.skip_generic_params()
         self.expect("{")
         return name
+
+    def parse_path_name(self):
+        """Parse `Name` or `mod::Name`, flattening the path to `mod_Name`."""
+        name = self.expect_ident()
+        while self.at("::", "punc"):
+            self.next()
+            if self.at("<", "punc"):
+                self.skip_generic_params()
+                continue
+            name += "_" + self.expect_ident()
+        return name
+
+    def parse_trait(self):
+        """Parse `trait Name[: Super..] { .. }`.
+
+        Returns (name, supertraits, methods, defaults). A method with a body
+        is a *default*: its tokens are kept so that an `impl` which does not
+        override it can have one generated with `Self` bound to the
+        implementing type.
+        """
+        self.skip_attributes()
+        while self.cur.val in ("pub", "unsafe"):
+            self.next()
+        self.expect("trait")
+        name = self.expect_ident()
+        self.skip_generic_params()
+        supers = []
+        if self.accept(":"):
+            while True:
+                if self.cur.kind not in ("ident", "kw"):
+                    break
+                supers.append(self.parse_path_name())
+                if self.at("<", "punc"):
+                    self.skip_generic_params()
+                if not self.accept("+"):
+                    break
+        while self.cur.val == "where":       # `where` clauses carry no
+            while not self.at("{", "punc"):  # information Crust can act on
+                if self.cur.kind == "eof":
+                    self.err("unterminated `where` clause")
+                self.next()
+        self.expect("{")
+        methods, defaults = {}, {}
+        while not self.at("}", "punc"):
+            if self.cur.kind == "eof":
+                self.err("unterminated trait body")
+            if self.cur.val in ("type", "const"):
+                while not self.at(";", "punc") and self.cur.kind != "eof":
+                    self.next()
+                self.accept(";")
+                continue
+            start = self.i
+            _, info = self.parse_method_signature(name)
+            methods[info.name] = info
+            if self.at("{", "punc"):
+                defaults[info.name] = self.toks[start:self.skip_to_body_end()]
+            else:
+                self.expect(";")
+        self.expect("}")
+        return name, supers, methods, defaults
 
     def parse_self_param(self):
         """Parse a leading `self` / `&self` / `&mut self` parameter.
@@ -2066,7 +2194,7 @@ class Parser:
             elif t.val == "}" and t.kind == "punc":
                 depth -= 1
                 if depth == 0:
-                    return
+                    return self.i
 
     def parse_impl(self, out, owner_override=None):
         """Translate an `impl` block into free functions."""
@@ -2190,6 +2318,21 @@ def wider(a, b):
     return max(cands, key=lambda t: _RANK[t.base])
 
 
+def _is_lvalue(code):
+    """True if `code` denotes a place whose address C can take.
+
+    Deliberately conservative: names, field selections, dereferences and
+    indexing are places; anything containing a call or a compound literal is
+    not. Being wrong in the safe direction costs one temporary.
+    """
+    text = code.strip()
+    while text.startswith("(") and text.endswith(")"):
+        text = text[1:-1].strip()
+    if "(" in text or "{" in text:
+        return False
+    return bool(text) and all(c.isalnum() or c in "_.->[] " for c in text)
+
+
 def _addressable(code):
     """Wrap `code` in parens if `&` would otherwise bind too loosely."""
     if code.isidentifier() or (code.startswith("(") and code.endswith(")")):
@@ -2240,7 +2383,7 @@ def normalize_number(tok):
 # --------------------------------------------------------------------------
 
 _ITEM_START = re.compile(
-    r"\b(?P<kw>fn|struct|impl|enum|const|static)"
+    r"\b(?P<kw>fn|struct|impl|enum|const|static|trait)"
     r"(?:\s+|\s*(?=<))(?:<[^<>]*>\s*)?"
     r"(?:mut\s+)?(?P<name>[A-Za-z_]\w*)")
 _MODIFIER = re.compile(r"(?:\b(?:pub|unsafe)\b\s+|\bextern\s+\"C\"\s+)*$")
@@ -2311,7 +2454,8 @@ def _match_brace(scan, open_idx):
 def find_rust_items(code, rust_file=False):
     """Return (start, end, kind) spans of top-level Rust items in `code`.
 
-    `kind` is "fn", "struct", "tuple_struct", "impl", "enum" or "const". C
+    `kind` is "fn", "struct", "tuple_struct", "impl", "enum", "trait"
+    or "const". C
     code between the spans is left alone. Because C shares the `struct`,
     `const` and `static` keywords, those are only claimed when the syntax that
     follows is unambiguously Rust: `name: type` fields with no semicolons for
@@ -2385,6 +2529,10 @@ def find_rust_items(code, rust_file=False):
         if close is None:
             raise CrustError("unterminated Rust %s near offset %d"
                              % (kw, start))
+        if kw == "trait":
+            real_start = _extend_head(scan, start)
+            spans.append((real_start, close + 1, "trait"))
+            continue
         if kw == "struct" and not _is_rust_struct_body(
                 scan[open_idx + 1:close]):
             continue                    # a plain C struct definition
@@ -2497,7 +2645,11 @@ def _generic_params_of(toks, kind):
         p.next()
         if kind == "impl":
             params = p.parse_generic_params()
-            name = p.expect_ident()
+            name = p.parse_path_name()
+            if p.at("<", "punc"):
+                p.skip_generic_params()
+            if p.accept("for"):
+                name = p.parse_path_name()
             return (params, name) if params else None
         name = p.expect_ident()
         params = p.parse_generic_params()
@@ -2524,6 +2676,12 @@ def collect_items(code, spans, unit, struct_order, fail=None):
         gp = _generic_params_of(toks, kind)
         if gp is not None:
             params, name = gp
+            if name in unit.core_names:
+                # The unit defines this name itself; the seeded core template
+                # and its impls step aside entirely.
+                unit.core_names.discard(name)
+                unit.generic_impls[:] = [g for g in unit.generic_impls
+                                         if g[1] != name]
             if kind == "struct":
                 unit.generic_structs[name] = (params, toks)
             elif kind == "fn":
@@ -2550,6 +2708,11 @@ def collect_items(code, spans, unit, struct_order, fail=None):
                 for vname, _ in variants:
                     unit.variants["%s_%s" % (name, vname)] = name
                 local["enums"].append(name)
+            elif kind == "trait":
+                tname, supers, methods, defaults = p.parse_trait()
+                unit.traits[tname] = methods
+                unit.trait_defaults[tname] = defaults
+                unit.supertraits[tname] = supers
             elif kind == "const":
                 kw, name, ty, init = p.parse_const_signature()
                 unit.consts[name] = ty
@@ -2563,6 +2726,8 @@ def collect_items(code, spans, unit, struct_order, fail=None):
                 unit.fn_sigs[name] = (ret, [t for _, t in params])
             else:                                   # impl
                 owner = p.parse_impl_header()
+                if p.impl_trait is not None:
+                    unit.trait_impls.append((p.impl_trait, owner, toks))
                 p.impl_type = owner
                 while not p.at("}", "punc") and p.cur.kind != "eof":
                     if p.is_assoc_const():
@@ -2657,6 +2822,54 @@ def collect_include_items(code, path, _seen=None):
     return unit, struct_order
 
 
+def emit_trait_defaults(unit):
+    """Give every trait impl the default methods it did not override.
+
+    A default body is written against `Self`, so generating one for a type is
+    the same substitution a generic instantiation does -- re-parse the stored
+    tokens with `Self` bound to the implementing type. Because dispatch is
+    static, the result is an ordinary `Type_method` function, identical in
+    kind to one the impl had written out by hand.
+    """
+    for trait, owner, _toks in unit.trait_impls:
+        seen = set()
+        for tr in _trait_chain(unit, trait):
+            for mname, dtoks in unit.trait_defaults.get(tr, {}).items():
+                if mname in seen or (owner, mname) in unit.methods:
+                    continue
+                seen.add(mname)
+                p = Parser(list(dtoks), unit)
+                p.impl_type = owner
+                try:
+                    start, info = p.parse_method_signature(owner)
+                except CrustError:
+                    continue
+                params = list(info.params)
+                if info.self_kind == "ref":
+                    params.insert(0, ("self", CType(owner, 1)))
+                elif info.self_kind == "value":
+                    params.insert(0, ("self", CType(owner)))
+                unit.methods[(owner, info.name)] = info
+                unit.fn_sigs[info.mangled] = (
+                    info.ret, [t for _, t in params])
+                out = Out(1)
+                p.emit_fn_body(out, start, info.mangled, params, info.ret,
+                               False)
+                unit.emitted.append(out.text())
+
+
+def _trait_chain(unit, trait, seen=None):
+    """`trait` and its supertraits, nearest first, without cycling."""
+    seen = seen if seen is not None else set()
+    if trait in seen:
+        return []
+    seen.add(trait)
+    chain = [trait]
+    for sup in unit.supertraits.get(trait, ()):
+        chain.extend(_trait_chain(unit, sup, seen))
+    return chain
+
+
 def _is_generic_span(code, start, end, kind):
     """True if the item at this span declares type parameters."""
     if kind not in ("struct", "fn", "impl"):
@@ -2666,6 +2879,49 @@ def _is_generic_span(code, start, end, kind):
     except CrustError:
         return False
     return _generic_params_of(toks, kind) is not None
+
+
+_CORE_CACHE = {}
+
+
+def core_templates():
+    """Parse the bundled minimal core once; return its generic templates.
+
+    Returned as (generic_structs, generic_impls). Only templates are taken --
+    nothing from core reaches the output unless something instantiates it, so
+    a unit that never mentions `Vec<T>` pays only this one-time parse (and
+    that is cached across the whole process).
+    """
+    if "unit" not in _CORE_CACHE:
+        path = os.path.join(os.path.dirname(__file__),
+                            "crust_core", "core.rs")
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+        except OSError:                                    # pragma: no cover
+            _CORE_CACHE["unit"] = (({}, []))
+            return _CORE_CACHE["unit"]
+        unit = Unit()
+        collect_items(text, find_rust_items(text, rust_file=True), unit, [])
+        _CORE_CACHE["unit"] = (unit.generic_structs, unit.generic_impls)
+    return _CORE_CACHE["unit"]
+
+
+def seed_core(unit):
+    """Make the core templates available to `unit` without overriding it.
+
+    A definition already in the unit -- the user's own `Vec`, or one from an
+    included `.rs` -- always wins, so seeding can never change the meaning of
+    code that did not need core in the first place.
+    """
+    gstructs, gimpls = core_templates()
+    for name, tmpl in gstructs.items():
+        if name not in unit.generic_structs and name not in unit.structs:
+            unit.generic_structs[name] = tmpl
+            unit.core_names.add(name)
+    for params, owner, toks in gimpls:
+        if owner in unit.core_names:
+            unit.generic_impls.append((params, owner, toks))
 
 
 def _prelude_offset(code):
@@ -2799,7 +3055,16 @@ def translate(code, path=None):
 
     # Pass 1: collect structs, function signatures and methods, so that
     # definition order does not matter anywhere in the unit.
+    # The bundled core is seeded first, because pass 1 parses signatures and
+    # struct fields -- a `Vec<T>` there must already resolve. A local
+    # definition of the same name still wins: collect_items overwrites the
+    # template and drops the core `impl`s that went with it.
+    seed_core(unit)
     local = collect_items(code, spans, unit, struct_order, fail)
+
+    # Trait impls inherit any default methods they did not override. This runs
+    # before pass 2 so a body can call a default the impl never wrote.
+    emit_trait_defaults(unit)
 
     # Pass 2: translate each item in place. Struct definitions are hoisted
     # into the prelude (see below), so their source region becomes blank.
@@ -2808,7 +3073,8 @@ def translate(code, path=None):
         pieces.append(code[prev:start])
         line0 = _line_of(code, start)
         if kind in ("struct", "tuple_struct", "unit_struct", "enum",
-                    "const") or _is_generic_span(code, start, end, kind):
+                    "const", "trait") \
+                or _is_generic_span(code, start, end, kind):
             # Hoisted into the prelude, or -- for a generic -- a template
             # whose instantiations are appended after the unit instead.
             text = ""
@@ -2843,6 +3109,10 @@ def translate(code, path=None):
         prelude.append("unsigned long strlen(const char *);")
     if "abort" in unit.needs:
         prelude.append("void abort(void);")
+    if "alloc" in unit.needs:
+        prelude.append("void *malloc(unsigned long);")
+        prelude.append("void *realloc(void *, unsigned long);")
+        prelude.append("void free(void *);")
     for name in local["enums"]:
         prelude.append(_render_enum(name, unit.enums[name]))
     for name in local["structs"]:
