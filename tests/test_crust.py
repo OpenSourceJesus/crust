@@ -656,6 +656,159 @@ fn main() -> i32 { pick(21) + pick(-5) }
 """, suffix=".rs"), 42)
 
 
+class TestCrustEnumImpl(unittest.TestCase):
+    """`impl` blocks on enums."""
+
+    ENUM = """
+enum Color { Red, Green, Blue }
+impl Color {
+    fn weight(&self) -> i32 {
+        match *self {
+            Color::Red => 1,
+            Color::Green => 2,
+            Color::Blue => 3,
+        }
+    }
+}
+"""
+
+    def test_enum_method_lowers_like_a_struct_method(self):
+        c = crust.translate(self.ENUM)
+        self.assertIn("int Color_weight(Color *self)", c)
+
+    def test_enum_method_end_to_end(self):
+        self.assertEqual(_run(self.ENUM + """
+fn main() -> i32 {
+    let c: Color = Color::Blue;
+    c.weight() * 14
+}
+""", suffix=".rs"), 42)
+
+
+class TestCrustAssociatedConsts(unittest.TestCase):
+    """`const` items inside `impl` blocks."""
+
+    def test_associated_const_is_mangled(self):
+        c = crust.translate("struct P { x: i32 }\n"
+                            "impl P { const ZERO: i32 = 0; }")
+        self.assertIn("enum { P_ZERO = 0 };", c)
+
+    def test_associated_const_path_reference(self):
+        self.assertEqual(_run("""
+struct P { x: i32 }
+impl P {
+    const BASE: i32 = 40;
+    fn get(&self) -> i32 { self.x }
+}
+fn main() -> i32 {
+    let p: P = P { x: 2 };
+    P::BASE + p.get()
+}
+""", suffix=".rs"), 42)
+
+    def test_non_integer_associated_const(self):
+        c = crust.translate("struct P { x: i32 }\n"
+                            "impl P { const K: f64 = 0.5; }")
+        self.assertIn("static const double P_K = 0.5;", c)
+
+
+class TestCrustStr(unittest.TestCase):
+    """`&str` and string literals."""
+
+    def test_str_ref_is_const_char_pointer(self):
+        c = crust.translate("fn f(s: &str) -> &str { s }")
+        self.assertIn("const char *f(const char *s)", c)
+
+    def test_bare_str_is_rejected(self):
+        with self.assertRaises(crust.CrustError) as cm:
+            crust.translate("fn f(s: str) {}")
+        self.assertIn("unsized", str(cm.exception))
+
+    def test_len_lowers_to_strlen(self):
+        c = crust.translate("fn f(s: &str) -> usize { s.len() }")
+        self.assertIn("strlen(s)", c)
+        self.assertIn("unsigned long strlen(const char *);", c)
+
+    def test_str_end_to_end(self):
+        self.assertEqual(_run("""
+fn size(s: &str) -> i32 { s.len() as i32 }
+fn main() -> i32 { size("hello") * 8 + 2 }
+""", suffix=".rs"), 42)
+
+
+class TestCrustSlices(unittest.TestCase):
+    """`&[T]` slices as fat pointers."""
+
+    def test_slice_struct_is_generated(self):
+        c = crust.translate("fn f(xs: &[i32]) -> usize { xs.len() }")
+        self.assertIn("struct crust_slice_int { int *ptr; "
+                      "unsigned long len; };", c)
+
+    def test_len_is_a_field(self):
+        c = crust.translate("fn f(xs: &[i32]) -> usize { xs.len() }")
+        self.assertIn("return xs.len;", c)
+
+    def test_index_goes_through_the_data_pointer(self):
+        c = crust.translate("fn f(xs: &[i32]) -> i32 { xs[0] }")
+        self.assertIn("xs.ptr[0]", c)
+
+    def test_full_slice_of_array_takes_its_length(self):
+        c = crust.translate("fn f() { let a: [i32; 4] = [0; 4];"
+                            " let s: &[i32] = &a[..]; }")
+        self.assertIn("{a, 4}", c)
+
+    def test_ranged_slice(self):
+        c = crust.translate("fn f() { let a: [i32; 4] = [0; 4];"
+                            " let s: &[i32] = &a[1..3]; }")
+        self.assertIn("a + 1", c)
+
+    def test_array_reference_is_not_a_slice(self):
+        # `&[T; N]` is a reference to an array, not a slice.
+        c = crust.translate("fn f(a: &[i32; 4]) -> i32 { a[0] }")
+        self.assertNotIn("crust_slice", c)
+
+    def test_slicing_a_raw_pointer_needs_an_end_bound(self):
+        with self.assertRaises(crust.CrustError):
+            crust.translate("fn f(p: *const i32) { let s: &[i32] = &p[..]; }")
+
+    def test_unknown_slice_method_is_an_error(self):
+        with self.assertRaises(crust.CrustError):
+            crust.translate("fn f(xs: &[i32]) { xs.nope(); }")
+
+    def test_slices_end_to_end(self):
+        self.assertEqual(_run("""
+fn sum(xs: &[i32]) -> i32 {
+    let mut acc: i32 = 0;
+    for i in 0..xs.len() {
+        acc += xs[i];
+    }
+    acc
+}
+fn main() -> i32 {
+    let a: [i32; 5] = [1, 2, 3, 4, 30];
+    let all: &[i32] = &a[..];
+    let mid: &[i32] = &a[1..3];
+    sum(all) + sum(mid) + (all.len() as i32)
+}
+""", suffix=".rs"), 50)
+
+    def test_slice_of_struct_elements(self):
+        self.assertEqual(_run("""
+struct P { x: i32 }
+fn total(ps: &[P]) -> i32 {
+    let mut acc: i32 = 0;
+    for i in 0..ps.len() {
+        acc += ps[i].x;
+    }
+    acc
+}
+fn main() -> i32 {
+    let mut a: [P; 2] = [P { x: 20 }, P { x: 22 }];
+    total(&a[..])
+}
+""", suffix=".rs"), 42)
+
+
 class TestEnumLiteralSpotRegression(unittest.TestCase):
     """Backend fix: a symbolic literal must not be range-compared as an int.
 
