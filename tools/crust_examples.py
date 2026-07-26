@@ -57,6 +57,14 @@ EXAMPLES = [
      "widest = 3\n"
      "len2   = 25\n", True),
 
+    ("traits.rs", 0,
+     "disk: bytes=1048576 kib=1024\n"
+     "ram: bytes=1048576 kib=1024\n"
+     "disk summary = 1025\n"
+     "ram  summary = 1026\n"
+     "report(disk) = 1049601\n"
+     "report(ram)  = 1049602\n", True),
+
     ("kernel.rs", 0,
      "tasks     = 3\n"
      "switches  = 12\n"
