@@ -106,7 +106,7 @@ PUNCT = [
     "<<=", ">>=", "..=", "->", "=>", "..", "::", "==", "!=", "<=", ">=",
     "&&", "||", "<<", ">>", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=",
     "+", "-", "*", "/", "%", "!", "&", "|", "^", "<", ">", "=", "(", ")",
-    "{", "}", "[", "]", ",", ";", ":", ".", "#", "?", "@",
+    "{", "}", "[", "]", ",", ";", ":", ".", "#", "?", "@", "$",
 ]
 
 _NUM_SUFFIX = re.compile(r"(?:i8|i16|i32|i64|isize|u8|u16|u32|u64|usize"
@@ -304,6 +304,80 @@ class Expr:
         self.type = type_
 
 
+def _c_spec_for(ty):
+    """The printf conversion for a value of C type `ty`.
+
+    Rust's `{}` carries no type of its own -- `Display` picks the formatting
+    at the call site -- so Crust reads it off the argument's inferred type
+    instead. Where the type is unknown, `%d` is the least surprising default
+    and is what an untyped integer literal wants.
+    """
+    if ty is None:
+        return "%d"
+    if ty.ptr and ty.base == "const char":
+        return "%s"
+    if ty.ptr:
+        return "%p"
+    if ty.base in ("float", "double"):
+        return "%g"
+    if ty.base == "_Bool":
+        return "%d"
+    if ty.base in ("long", "unsigned long"):
+        return "%lu" if ty.base.startswith("unsigned") else "%ld"
+    if ty.base.startswith("unsigned"):
+        return "%u"
+    return "%d"
+
+
+_FMT_HINTS = {"x": "%x", "X": "%X", "o": "%o", "b": "%d", "e": "%e",
+              "p": "%p", "?": None, "": None}
+
+
+def _rust_format_to_c(fmt, types, newline):
+    """Translate a Rust format string into a C one.
+
+    `{}` and `{:?}` take their conversion from the argument's type; `{:x}`
+    and friends map to the matching C conversion. `{{` and `}}` are literal
+    braces. A `%` in the original must be escaped, since it means nothing in
+    Rust but everything to printf.
+    """
+    out, i, n, argi = [], 0, len(fmt), 0
+    while i < n:
+        c = fmt[i]
+        if c == "{" and i + 1 < n and fmt[i + 1] == "{":
+            out.append("{")
+            i += 2
+            continue
+        if c == "}" and i + 1 < n and fmt[i + 1] == "}":
+            out.append("}")
+            i += 2
+            continue
+        if c == "%":
+            out.append("%%")
+            i += 1
+            continue
+        if c == "{":
+            j = fmt.find("}", i)
+            if j < 0:
+                raise CrustError("unterminated `{` in format string")
+            body = fmt[i + 1:j]
+            hint = body.split(":", 1)[1] if ":" in body else ""
+            hint = hint.lstrip("0123456789.<>^+#")
+            ty = types[argi] if argi < len(types) else None
+            spec = _FMT_HINTS.get(hint) if hint in _FMT_HINTS else None
+            out.append(spec or _c_spec_for(ty))
+            argi += 1
+            i = j + 1
+            continue
+        out.append(c)
+        i += 1
+    if newline:
+        out.append("\\n")
+    return '"%s"' % "".join(out)
+
+
+
+
 def _instance_name(name, args):
     """The C name of one monomorphisation, e.g. `Pair<i32>` -> `Pair_int`.
 
@@ -377,6 +451,7 @@ class Unit:
         self.trait_defaults = {}    # trait -> {method: tokens of the default}
         self.supertraits = {}       # trait -> [trait names]
         self.trait_impls = []       # (trait, owner, tokens)
+        self.macros = {}            # macro_rules! name -> [(pattern, body)]
 
     def result_type(self, ok, err):
         """Return (and register) the tagged struct for `Result<ok, err>`."""
@@ -837,6 +912,202 @@ class Parser:
             if not self.accept(","):
                 break
         return decls
+
+    # -- macros -----------------------------------------------------------
+
+    def at_macro(self):
+        """True if the cursor is on `name !` followed by a delimiter."""
+        return (self.cur.kind == "ident" and self.peek().val == "!"
+                and self.peek().kind == "punc"
+                and self.peek(2).val in ("(", "[", "{"))
+
+    def macro_args(self):
+        """Parse a macro's delimited argument list into raw token slices.
+
+        Rust lets a macro be called with any of `()`, `[]` or `{}`, and the
+        contents are arbitrary token trees, so the arguments are split on
+        top-level commas without being parsed. Each slice is handed to a
+        fresh sub-parser only if the expansion actually needs it as an
+        expression.
+        """
+        self.next()                                  # the `!`
+        open_tok = self.next().val
+        close = {"(": ")", "[": "]", "{": "}"}[open_tok]
+        depth, parts, cur = 1, [], []
+        while True:
+            t = self.cur
+            if t.kind == "eof":
+                self.err("unterminated macro invocation")
+            if t.val in ("(", "[", "{") and t.kind == "punc":
+                depth += 1
+            elif t.val in (")", "]", "}") and t.kind == "punc":
+                depth -= 1
+                if depth == 0:
+                    self.next()
+                    break
+            if depth == 1 and t.val == "," and t.kind == "punc":
+                parts.append(cur)
+                cur = []
+                self.next()
+                continue
+            cur.append(t)
+            self.next()
+        if cur:
+            parts.append(cur)
+        return parts
+
+    def sub_expr(self, toks):
+        """Translate one raw token slice as an expression."""
+        if not toks:
+            return Expr("", None)
+        p = Parser(list(toks) + [Token("eof", "", toks[-1].line)],
+                   self.unit, self.tysubst)
+        p.scopes = self.scopes
+        p.impl_type = self.impl_type
+        p.ret_type = self.ret_type
+        e = p.parse_expr()
+        self.pending.extend(p.pending)
+        return e
+
+    def parse_macro(self, name):
+        """Expand a macro invocation, or report that it is not supported."""
+        line = self.cur.line
+        if name in self.unit.macros:
+            return self.expand_macro_rules(name, line)
+        if name not in _BUILTIN_MACROS:
+            self.macro_args()
+            self.err("macro `%s!` is not supported; Crust expands the "
+                     "standard control and printing macros and any "
+                     "`macro_rules!` defined in this unit", name)
+        return _BUILTIN_MACROS[name](self, self.macro_args(), line)
+
+    # -- the built-in macros ----------------------------------------------
+
+    def m_abort(self, args, line, _msg=None):
+        """`panic!` / `unreachable!` / `todo!` -- diverge immediately."""
+        self.unit.needs.add("abort")
+        return Expr("(abort(), 0)", INT)
+
+    def m_assert(self, args, line):
+        if not args:
+            self.err("`assert!` needs a condition")
+        cond = self.sub_expr(args[0])
+        self.unit.needs.add("abort")
+        return Expr("((%s) ? 0 : (abort(), 0))" % cond.code, INT)
+
+    def m_assert_cmp(self, args, line, op="=="):
+        if len(args) < 2:
+            self.err("`assert_eq!` needs two operands")
+        a, b = self.sub_expr(args[0]), self.sub_expr(args[1])
+        self.unit.needs.add("abort")
+        return Expr("(((%s) %s (%s)) ? 0 : (abort(), 0))"
+                    % (a.code, op, b.code), INT)
+
+    def m_print(self, args, line, newline=False, stream=None):
+        """`println!` and friends -- a printf with the format translated."""
+        if not args:
+            fmt, rest = '""', []
+        else:
+            fmt, rest = self._format_string(args[0], line), args[1:]
+        vals = [self.sub_expr(a) for a in rest]
+        spec = _rust_format_to_c(fmt, [v.type for v in vals], newline)
+        if stream:
+            self.unit.needs.add("fprintf")
+            call = "fprintf(%s, %s" % (stream, spec)
+        else:
+            self.unit.needs.add("printf")
+            call = "printf(%s" % spec
+        for v in vals:
+            call += ", " + v.code
+        return Expr(call + ")", INT)
+
+    def _format_string(self, toks, line):
+        if len(toks) != 1 or toks[0].kind != "str":
+            raise CrustError("line %d: the first argument of a printing "
+                             "macro must be a literal format string" % line)
+        text = toks[0].val
+        if len(text) >= 2 and text[0] == '"' and text[-1] == '"':
+            text = text[1:-1]
+        return text
+
+    def m_cfg(self, args, line):
+        # `cfg!(..)` is a compile-time predicate over features Crust has no
+        # notion of. Reporting false is the honest answer: nothing is
+        # configured in.
+        return Expr("0", CType("_Bool"))
+
+    def m_matches(self, args, line):
+        if len(args) < 2:
+            self.err("`matches!` needs a value and a pattern")
+        v = self.sub_expr(args[0])
+        pat = self.sub_expr(args[1])
+        return Expr("((%s) == (%s))" % (v.code, pat.code), CType("_Bool"))
+
+    def m_dbg_noop(self, args, line):
+        """`debug_assert*!` -- compiled out, as in a release build."""
+        for a in args:
+            pass
+        return Expr("0", INT)
+
+    def parse_macro_rules(self):
+        """Parse `macro_rules! name { (pat) => { body }; ... }`.
+
+        Rules are kept as raw token slices; matching and substitution happen
+        at the invocation site. Crust supports the common shape -- literal
+        tokens plus `$x:frag` metavariables -- and reports anything else
+        rather than expanding it wrongly, since a silently mis-expanded macro
+        is far worse than one that does not compile.
+        """
+        self.expect_ident()                          # `macro_rules`
+        self.expect("!")
+        name = self.expect_ident()
+        self.expect("{")
+        rules = []
+        while not self.at("}", "punc") and self.cur.kind != "eof":
+            pat = self._delimited()
+            self.expect("=>")
+            body = self._delimited()
+            rules.append((pat, body))
+            self.accept(";")
+        self.expect("}")
+        return name, rules
+
+    def _delimited(self):
+        """Consume one balanced `(..)`, `[..]` or `{..}`; return its inside."""
+        if self.cur.val not in ("(", "[", "{"):
+            self.err("expected a delimited group in `macro_rules!`")
+        self.next()
+        depth, toks = 1, []
+        while True:
+            t = self.cur
+            if t.kind == "eof":
+                self.err("unterminated group in `macro_rules!`")
+            if t.val in ("(", "[", "{") and t.kind == "punc":
+                depth += 1
+            elif t.val in (")", "]", "}") and t.kind == "punc":
+                depth -= 1
+                if depth == 0:
+                    self.next()
+                    return toks
+            toks.append(t)
+            self.next()
+
+    def expand_macro_rules(self, name, line):
+        """Match an invocation against the macro's rules and expand it."""
+        args = self.macro_args()
+        # Rejoin the argument slices with the commas that split them, since a
+        # pattern matches the raw token stream, not a comma-separated list.
+        flat = []
+        for k, part in enumerate(args):
+            if k:
+                flat.append(Token("punc", ",", line))
+            flat.extend(part)
+        for pat, body in self.unit.macros[name]:
+            binds = _match_pattern(pat, flat)
+            if binds is not None:
+                return self.sub_expr(_substitute(body, binds))
+        raise CrustError("line %d: no rule of `%s!` matches this invocation"
+                         % (line, name))
 
     # -- expressions ------------------------------------------------------
 
@@ -1415,6 +1686,9 @@ class Parser:
         if t.val == "unsafe" and t.kind == "kw" and self.at("{", "punc"):
             # `unsafe { expr }` as a value is its single tail expression.
             return self.parse_block_expr()
+        if t.kind == "ident" and self.at("!", "punc") and \
+                self.peek().val in ("(", "[", "{"):
+            return self.parse_macro(t.val)
         if t.kind == "ident" or (t.kind == "kw" and t.val == "Self"):
             name = t.val
             if name == "Self" and self.impl_type:
@@ -2318,6 +2592,106 @@ def wider(a, b):
     return max(cands, key=lambda t: _RANK[t.base])
 
 
+_BUILTIN_MACROS = {
+    "assert": Parser.m_assert,
+    "debug_assert": Parser.m_dbg_noop,
+    "debug_assert_eq": Parser.m_dbg_noop,
+    "debug_assert_ne": Parser.m_dbg_noop,
+    "assert_eq": lambda p, a, l: Parser.m_assert_cmp(p, a, l, "=="),
+    "assert_ne": lambda p, a, l: Parser.m_assert_cmp(p, a, l, "!="),
+    "panic": Parser.m_abort,
+    "unreachable": Parser.m_abort,
+    "unimplemented": Parser.m_abort,
+    "todo": Parser.m_abort,
+    "abort": Parser.m_abort,
+    "print": lambda p, a, l: Parser.m_print(p, a, l, False),
+    "println": lambda p, a, l: Parser.m_print(p, a, l, True),
+    "eprint": lambda p, a, l: Parser.m_print(p, a, l, False, "stderr"),
+    "eprintln": lambda p, a, l: Parser.m_print(p, a, l, True, "stderr"),
+    "cfg": Parser.m_cfg,
+    "matches": Parser.m_matches,
+}
+
+
+# Fragment specifiers Crust understands. They all capture a token run; the
+# difference between them is only how far it extends, and for the shapes
+# Crust supports that is decided by what follows in the pattern.
+_FRAGMENTS = {"expr", "ident", "ty", "tt", "literal", "path", "block", "stmt"}
+
+
+def _match_pattern(pat, toks):
+    """Match `toks` against a macro rule pattern; return the bindings or None.
+
+    Literal tokens must match exactly. `$x:frag` captures the token run up to
+    the pattern's next literal token, respecting nesting so that a comma
+    inside `f(a, b)` does not end the capture.
+    """
+    binds, pi, ti = {}, 0, 0
+    while pi < len(pat):
+        p = pat[pi]
+        if p.val == "$" and pi + 1 < len(pat):
+            var = pat[pi + 1].val
+            frag = None
+            if pi + 3 < len(pat) and pat[pi + 2].val == ":":
+                frag = pat[pi + 3].val
+                pi += 4
+            else:
+                pi += 2
+            if frag is not None and frag not in _FRAGMENTS:
+                return None
+            stop = pat[pi].val if pi < len(pat) else None
+            if frag in ("ident", "literal", "tt"):
+                # Exactly one token (a `tt` that opens a group is handled by
+                # the depth walk below, so only the simple case is special).
+                if ti >= len(toks):
+                    return None
+                if not (frag == "tt" and toks[ti].val in ("(", "[", "{")):
+                    binds[var] = [toks[ti]]
+                    ti += 1
+                    continue
+            start, depth = ti, 0
+            while ti < len(toks):
+                t = toks[ti]
+                if t.val in ("(", "[", "{") and t.kind == "punc":
+                    depth += 1
+                elif t.val in (")", "]", "}") and t.kind == "punc":
+                    depth -= 1
+                elif depth == 0 and stop is not None and t.val == stop:
+                    break
+                elif depth == 0 and stop is None and t.val == "," \
+                        and t.kind == "punc":
+                    # An `expr` cannot contain a top-level comma, so the
+                    # comma belongs to the caller's argument list, not to
+                    # this fragment. Without this a one-argument rule would
+                    # greedily swallow a two-argument invocation and the
+                    # later, correct rule would never be tried.
+                    break
+                ti += 1
+            if ti == start:
+                return None                       # a fragment cannot be empty
+            binds[var] = toks[start:ti]
+            continue
+        if ti >= len(toks) or toks[ti].val != p.val:
+            return None
+        pi += 1
+        ti += 1
+    return binds if ti == len(toks) else None
+
+
+def _substitute(body, binds):
+    """Replace every `$name` in a rule body with its captured tokens."""
+    out, i = [], 0
+    while i < len(body):
+        t = body[i]
+        if t.val == "$" and i + 1 < len(body) and body[i + 1].val in binds:
+            out.extend(binds[body[i + 1].val])
+            i += 2
+            continue
+        out.append(t)
+        i += 1
+    return out
+
+
 def _is_lvalue(code):
     """True if `code` denotes a place whose address C can take.
 
@@ -2451,6 +2825,9 @@ def _match_brace(scan, open_idx):
     return None
 
 
+_MACRO_RULES = re.compile(r"\bmacro_rules!\s*(?P<name>[A-Za-z_]\w*)\s*\{")
+
+
 def find_rust_items(code, rust_file=False):
     """Return (start, end, kind) spans of top-level Rust items in `code`.
 
@@ -2464,6 +2841,15 @@ def find_rust_items(code, rust_file=False):
     scan = _blank(code)
     depths = _depths(scan)
     spans = []
+    for m in _MACRO_RULES.finditer(scan):
+        start = m.start()
+        if depths[start] != 0:
+            continue
+        close = _match_brace(scan, scan.index("{", m.end() - 1))
+        if close is None:
+            raise CrustError("unterminated macro_rules! near offset %d"
+                             % start)
+        spans.append((start, close + 1, "macro"))
     for m in _ITEM_START.finditer(scan):
         start = m.start()
         if depths[start] != 0:
@@ -2708,6 +3094,9 @@ def collect_items(code, spans, unit, struct_order, fail=None):
                 for vname, _ in variants:
                     unit.variants["%s_%s" % (name, vname)] = name
                 local["enums"].append(name)
+            elif kind == "macro":
+                mname, rules = p.parse_macro_rules()
+                unit.macros[mname] = rules
             elif kind == "trait":
                 tname, supers, methods, defaults = p.parse_trait()
                 unit.traits[tname] = methods
@@ -3073,7 +3462,7 @@ def translate(code, path=None):
         pieces.append(code[prev:start])
         line0 = _line_of(code, start)
         if kind in ("struct", "tuple_struct", "unit_struct", "enum",
-                    "const", "trait") \
+                    "const", "trait", "macro") \
                 or _is_generic_span(code, start, end, kind):
             # Hoisted into the prelude, or -- for a generic -- a template
             # whose instantiations are appended after the unit instead.
@@ -3109,6 +3498,11 @@ def translate(code, path=None):
         prelude.append("unsigned long strlen(const char *);")
     if "abort" in unit.needs:
         prelude.append("void abort(void);")
+    if "printf" in unit.needs:
+        prelude.append("int printf(const char *, ...);")
+    if "fprintf" in unit.needs:
+        prelude.append("int fprintf(void *, const char *, ...);")
+        prelude.append("extern void *stderr;")
     if "alloc" in unit.needs:
         prelude.append("void *malloc(unsigned long);")
         prelude.append("void *realloc(void *, unsigned long);")
