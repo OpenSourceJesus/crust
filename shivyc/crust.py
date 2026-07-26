@@ -96,6 +96,7 @@ KEYWORDS = {
     "fn", "let", "mut", "if", "else", "while", "loop", "for", "in", "return",
     "break", "continue", "as", "true", "false", "pub", "unsafe", "extern",
     "const", "static", "struct", "impl", "match", "use", "mod", "crate",
+    "enum",
 }
 
 # Longest-first so multi-character operators win.
@@ -326,6 +327,10 @@ class Unit:
         self.fn_sigs = {}       # name -> (CType ret, [CType] params)
         self.structs = {}       # name -> [(field, CType)]
         self.methods = {}       # (type name, method name) -> MethodInfo
+        self.enums = {}         # name -> [(variant, explicit value or None)]
+        self.variants = {}      # mangled variant name -> enum name
+        self.tuple_structs = set()   # struct names declared in tuple form
+        self.consts = {}        # const/static name -> CType
 
     def field_type(self, struct_name, field):
         for fname, ftype in self.structs.get(struct_name, ()):
@@ -529,8 +534,11 @@ class Parser:
                     if not self.accept(","):
                         break
                 self.expect(")")
-                ret = self.fn_sigs.get(e.code, (None, None))[0]
-                e = Expr("%s(%s)" % (e.code, ", ".join(args)), ret)
+                if e.code in self.unit.tuple_structs:
+                    e = self.tuple_struct_literal(e.code, args)
+                else:
+                    ret = self.fn_sigs.get(e.code, (None, None))[0]
+                    e = Expr("%s(%s)" % (e.code, ", ".join(args)), ret)
             elif self.at("[", "punc"):
                 self.next()
                 idx = self.parse_expr()
@@ -542,6 +550,9 @@ class Parser:
                 e = Expr("%s[%s]" % (e.code, idx.code), ty)
             elif self.at(".", "punc"):
                 self.next()
+                if self.cur.kind == "num":      # tuple field: `p.0`
+                    e = self.field_access(e, "_" + self.next().val)
+                    continue
                 name = self.expect_ident()
                 if self.at("(", "punc"):
                     e = self.parse_method_call(e, name)
@@ -628,6 +639,73 @@ class Parser:
                                        name))
         return Expr("(%s){%s}" % (name, ", ".join(inits)), CType(name))
 
+    def parse_if_expr(self):
+        """Lower `if c { a } else { b }` in expression position to `c ? a : b`.
+
+        Only value-producing arms are accepted here; an `if` whose arms hold
+        statements is a statement, and is handled by `parse_stmt`.
+        """
+        self.expect("if")
+        cond = self.parse_cond()
+        then = self.parse_block_expr()
+        if not self.accept("else"):
+            self.err("`if` used as an expression needs an `else` arm")
+        if self.at("if", "kw"):
+            other = self.parse_if_expr()
+        else:
+            other = self.parse_block_expr()
+        ty = then.type if then.type is not None else other.type
+        return Expr("(%s ? %s : %s)" % (cond.code, then.code, other.code), ty)
+
+    def parse_block_expr(self):
+        """Parse `{ expr }` used as a value."""
+        self.expect("{")
+        e = self.parse_expr()
+        if not self.at("}", "punc"):
+            self.err("only a single expression is allowed in this block "
+                     "when `if` is used as an expression")
+        self.expect("}")
+        return e
+
+    def parse_array_literal(self, open_tok):
+        """Lower `[a, b, c]` and the `[0; N]` repeat form to a C initializer.
+
+        C has no repeat-initializer syntax, so only the all-zero form can be
+        lowered without knowing `N` at translation time; `{0}` zero-fills the
+        whole array.
+        """
+        if self.at("]", "punc"):
+            self.next()
+            self.err("empty array literal has no element type")
+        first = self.parse_expr()
+        if self.accept(";"):
+            self.parse_expr()               # length: taken from the annotation
+            self.expect("]")
+            if first.code.strip() not in ("0", "0.0"):
+                self.err("only the all-zero repeat form `[0; N]` is "
+                         "supported; list the elements explicitly")
+            return Expr("{0}", None)
+        items = [first]
+        while self.accept(","):
+            if self.at("]", "punc"):
+                break
+            items.append(self.parse_expr())
+        self.expect("]")
+        ty = items[0].type
+        if ty is not None:
+            ty = CType(ty.base, ty.ptr, (ty.array or []) + [str(len(items))])
+        return Expr("{%s}" % ", ".join(i.code for i in items), ty)
+
+    def tuple_struct_literal(self, name, args):
+        """Lower `P(a, b)` for a tuple struct to a compound literal."""
+        fields = self.unit.structs.get(name, [])
+        if len(args) != len(fields):
+            self.err("tuple struct `%s` takes %d field%s, got %d", name,
+                     len(fields), "" if len(fields) == 1 else "s", len(args))
+        inits = ", ".join(".%s = %s" % (f, a)
+                          for (f, _), a in zip(fields, args))
+        return Expr("(%s){%s}" % (name, inits), CType(name))
+
     def parse_primary(self):
         t = self.next()
         if t.kind == "num":
@@ -644,6 +722,11 @@ class Parser:
             e = self.parse_expr()
             self.expect(")")
             return Expr("(%s)" % e.code, e.type)
+        if t.val == "[" and t.kind == "punc":
+            return self.parse_array_literal(t)
+        if t.val == "if" and t.kind == "kw":
+            self.i -= 1
+            return self.parse_if_expr()
         if t.kind == "ident" or (t.kind == "kw" and t.val == "Self"):
             name = t.val
             if name == "Self" and self.impl_type:
@@ -657,6 +740,11 @@ class Parser:
                     and name in self.unit.structs):
                 return self.parse_struct_literal(name, t.line)
             ty = self.lookup(name)
+            if ty is None:
+                if name in self.unit.variants:
+                    ty = CType(self.unit.variants[name])
+                elif name in self.unit.consts:
+                    ty = self.unit.consts[name]
             return Expr(name, ty)
         raise CrustError("line %d: unexpected %r in expression"
                          % (t.line, t.val or "<eof>"))
@@ -682,6 +770,14 @@ class Parser:
 
     def parse_stmt(self, out, indent, tail_returns):
         t = self.cur
+
+        if t.val == "match" and t.kind == "kw":
+            self.parse_match(out, indent, tail_returns)
+            return
+
+        if t.val in ("const", "static") and t.kind == "kw":
+            self.parse_const_item(out, indent, local=True)
+            return
 
         if t.val == "let" and t.kind == "kw":
             self.next()
@@ -821,6 +917,159 @@ class Parser:
 
     # -- items ------------------------------------------------------------
 
+    def parse_match(self, out, indent, tail_returns):
+        """Lower `match` to a C `switch`.
+
+        Rust arms do not fall through, so each arm ends in an explicit
+        `break`. When the scrutinee is an enum and no `_` arm is present, the
+        arms must cover every variant -- Crust reports the missing ones
+        instead of silently falling through.
+        """
+        t = self.expect("match")
+        scrutinee = self.parse_cond()
+        out.line_at(t.line, "switch (%s)" % scrutinee.code, indent)
+        open_tok = self.expect("{")
+        out.line_at(open_tok.line, "{", indent)
+
+        enum_name = None
+        sty = scrutinee.type
+        if sty is not None and not sty.ptr and sty.base in self.unit.enums:
+            enum_name = sty.base
+        covered, has_default = set(), False
+
+        while not self.at("}", "punc"):
+            if self.cur.kind == "eof":
+                self.err("unterminated match")
+            arm = self.cur
+            labels = self.parse_patterns(enum_name, covered)
+            if labels is None:
+                has_default = True
+                out.line_at(arm.line, "default:", indent + 1)
+            else:
+                out.line_at(arm.line, " ".join("case %s:" % v
+                                               for v in labels), indent + 1)
+            self.expect("=>")
+            self.parse_arm_body(out, indent + 2, tail_returns)
+            out.write(" break;")
+            self.accept(",")
+
+        close = self.expect("}")
+        out.line_at(close.line, "}", indent)
+
+        if enum_name and not has_default:
+            missing = [v for v, _ in self.unit.enums[enum_name]
+                       if "%s_%s" % (enum_name, v) not in covered]
+            if missing:
+                self.err("non-exhaustive match on `%s`: %s not covered; "
+                         "add an arm or `_`", enum_name,
+                         ", ".join("`%s`" % m for m in missing))
+
+    def parse_patterns(self, enum_name, covered):
+        """Parse `P | Q | R` before `=>`; return None for the `_` wildcard."""
+        if self.cur.kind == "ident" and self.cur.val == "_":
+            self.next()
+            return None
+        labels = []
+        while True:
+            labels.append(self.parse_pattern(enum_name, covered))
+            if not self.accept("|"):
+                return labels
+
+    def parse_pattern(self, enum_name, covered):
+        """Parse one `match` pattern into a C `case` label."""
+        t = self.next()
+        if t.kind == "num":
+            return normalize_number(t)[0]
+        if t.kind == "chr":
+            return t.val
+        if t.val == "true":
+            return "1"
+        if t.val == "false":
+            return "0"
+        if t.val == "-" and self.cur.kind == "num":
+            return "-" + normalize_number(self.next())[0]
+        if t.kind == "ident":
+            name = t.val
+            while self.at("::", "punc"):
+                self.next()
+                name += "_" + self.expect_ident()
+            if name not in self.unit.variants:
+                # A bare name would bind, not compare; Crust has no bindings.
+                if enum_name and "%s_%s" % (enum_name, name) \
+                        in self.unit.variants:
+                    name = "%s_%s" % (enum_name, name)
+                elif name not in self.unit.consts:
+                    self.err("`%s` is not a constant pattern; only literals, "
+                             "enum variants and `_` are supported", name)
+            covered.add(name)
+            return name
+        self.err("unsupported pattern %r", t.val or "<eof>")
+
+    def parse_arm_body(self, out, indent, tail_returns):
+        """Parse the body of a match arm: a block or a single expression."""
+        if self.at("{", "punc"):
+            self.parse_block(out, indent, tail_returns)
+            return
+        t = self.cur
+        e = self.parse_expr()
+        if tail_returns and not self.ret_type.is_void():
+            out.line_at(t.line, "return %s;" % e.code, indent)
+        else:
+            out.line_at(t.line, e.code + ";", indent)
+
+    def parse_enum(self):
+        """Parse `enum Name { A, B = 5, C }`, returning (name, variants)."""
+        self.skip_attributes()
+        while self.cur.val in ("pub",):
+            self.next()
+        self.expect("enum")
+        name = self.expect_ident()
+        self.expect("{")
+        variants = []
+        while not self.at("}", "punc"):
+            self.skip_attributes()
+            vname = self.expect_ident()
+            if self.at("(", "punc") or self.at("{", "punc"):
+                self.err("data-carrying enum variant `%s` is not supported",
+                         vname)
+            value = None
+            if self.accept("="):
+                value = self.parse_expr().code
+            variants.append((vname, value))
+            if not self.accept(","):
+                break
+        self.expect("}")
+        return name, variants
+
+    def parse_const_signature(self):
+        """Parse `const|static [mut] NAME: T = expr;` without emitting."""
+        self.skip_attributes()
+        while self.cur.val in ("pub",):
+            self.next()
+        kw = self.next().val                     # const or static
+        self.accept("mut")
+        name = self.expect_ident()
+        self.expect(":")
+        ty = self.parse_type()
+        self.expect("=")
+        init = self.parse_expr()
+        self.expect(";")
+        return kw, name, ty, init
+
+    def parse_const_item(self, out, indent, local=False):
+        """Emit a `const`/`static` item as a C declaration."""
+        t = self.cur
+        kw, name, ty, init = self.parse_const_signature()
+        self.unit.consts[name] = ty
+        if local:
+            self.declare(name, ty)
+        quals = "" if local and kw == "static" else ""
+        prefix = "const " if kw == "const" else ""
+        if not local:
+            prefix = "static " + prefix
+        out.line_at(t.line, "%s%s%s = %s;" % (prefix, quals, ty.decl(name),
+                                              init.code), indent)
+
     def skip_attributes(self):
         """Skip `#[...]` outer attributes, which Crust does not interpret."""
         while self.at("#", "punc"):
@@ -862,6 +1111,27 @@ class Parser:
             if not self.accept(","):
                 break
         self.expect("}")
+        return name, fields
+
+    def parse_tuple_struct(self):
+        """Parse `struct P(T, U);`, naming the fields `_0`, `_1`, ..."""
+        self.skip_attributes()
+        while self.cur.val in ("pub",):
+            self.next()
+        self.expect("struct")
+        name = self.expect_ident()
+        self.expect("(")
+        fields = []
+        while not self.at(")", "punc"):
+            while self.cur.val in ("pub",):
+                self.next()
+            fields.append(("_%d" % len(fields), self.parse_type()))
+            if not self.accept(","):
+                break
+        self.expect(")")
+        self.expect(";")
+        if not fields:
+            self.err("tuple struct `%s` needs at least one field", name)
         return name, fields
 
     def parse_impl_header(self):
@@ -1086,7 +1356,8 @@ def normalize_number(tok):
 # --------------------------------------------------------------------------
 
 _ITEM_START = re.compile(
-    r"\b(?P<kw>fn|struct|impl)\s+(?P<name>[A-Za-z_]\w*)")
+    r"\b(?P<kw>fn|struct|impl|enum|const|static)\s+"
+    r"(?:mut\s+)?(?P<name>[A-Za-z_]\w*)")
 _MODIFIER = re.compile(r"(?:\b(?:pub|unsafe)\b\s+|\bextern\s+\"C\"\s+)*$")
 
 
@@ -1155,10 +1426,11 @@ def _match_brace(scan, open_idx):
 def find_rust_items(code):
     """Return (start, end, kind) spans of top-level Rust items in `code`.
 
-    `kind` is "fn", "struct" or "impl". C code between the spans is left
-    alone. A `struct` is only claimed when its body uses Rust field syntax
-    (`name: type` and no semicolons), so C struct definitions in the same
-    file are never mistaken for Rust ones.
+    `kind` is "fn", "struct", "tuple_struct", "impl", "enum" or "const". C
+    code between the spans is left alone. Because C shares the `struct`,
+    `const` and `static` keywords, those are only claimed when the syntax that
+    follows is unambiguously Rust: `name: type` fields with no semicolons for
+    a struct, and a `NAME: type` annotation for a constant.
     """
     scan = _blank(code)
     depths = _depths(scan)
@@ -1168,9 +1440,9 @@ def find_rust_items(code):
         if depths[start] != 0:
             continue
         kw = m.group("kw")
-        # C has no `fn`/`impl` keyword, but guard against `foo.fn(...)` and
-        # against a name inside a preprocessor directive such as
-        # `#define fn(x) ...`. Both checks are line-local: an earlier
+        # C has no `fn`/`impl`/Rust-`enum` syntax, but guard against
+        # `foo.fn(...)` and against a name inside a preprocessor directive
+        # such as `#define fn(x) ...`. Both checks are line-local: an earlier
         # directive elsewhere in the file says nothing about this item.
         line_start = scan.rfind("\n", 0, start) + 1
         before = scan[line_start:start]
@@ -1178,6 +1450,34 @@ def find_rust_items(code):
             continue
         if before.rstrip().endswith((".", ">")):
             continue
+
+        if kw in ("const", "static"):
+            # Rust annotates the type; C never writes `NAME:` here.
+            rest = scan[m.end():]
+            if not rest.lstrip().startswith(":"):
+                continue
+            close = scan.find(";", m.end())
+            if close < 0:
+                raise CrustError("unterminated Rust %s near offset %d"
+                                 % (kw, start))
+            spans.append((_extend_head(scan, start), close + 1, "const"))
+            continue
+
+        after = scan[m.end():]
+        if kw == "struct" and after.lstrip().startswith("("):
+            # Tuple struct: `struct P(f64, f64);`
+            open_idx = scan.index("(", m.end())
+            close_paren = _match_paren(scan, open_idx)
+            if close_paren is None:
+                raise CrustError("unterminated tuple struct near offset %d"
+                                 % start)
+            semi = scan.find(";", close_paren)
+            if semi < 0:
+                raise CrustError("tuple struct near offset %d needs `;`"
+                                 % start)
+            spans.append((_extend_head(scan, start), semi + 1, "tuple_struct"))
+            continue
+
         open_idx = scan.find("{", m.end())
         if open_idx < 0:
             continue
@@ -1188,6 +1488,8 @@ def find_rust_items(code):
         if kw == "struct" and not _is_rust_struct_body(
                 scan[open_idx + 1:close]):
             continue                    # a plain C struct definition
+        if kw == "enum" and not _is_rust_enum(scan, close):
+            continue                    # a plain C enum definition
         real_start = _extend_head(scan, start)
         spans.append((real_start, close + 1, kw))
     # Drop spans nested inside an earlier one (e.g. `fn` inside `impl`).
@@ -1198,6 +1500,29 @@ def find_rust_items(code):
             continue
         kept.append(span)
     return kept
+
+
+def _match_paren(scan, open_idx):
+    depth = 0
+    for j in range(open_idx, len(scan)):
+        if scan[j] == "(":
+            depth += 1
+        elif scan[j] == ")":
+            depth -= 1
+            if depth == 0:
+                return j
+    return None
+
+
+def _is_rust_enum(scan, close):
+    """True if the `enum X { ... }` ending at `close` is Rust, not C.
+
+    Both languages spell a simple enumeration identically, so the body is no
+    help. What separates them is what follows the closing brace: C requires a
+    `;` (or a declarator) to finish the declaration, and Rust forbids one.
+    """
+    rest = scan[close + 1:].lstrip()
+    return not rest.startswith(";")
 
 
 def _is_rust_struct_body(body):
@@ -1250,15 +1575,29 @@ def collect_items(code, spans, unit, struct_order, fail=None):
     so that a later pass can resolve calls, methods and field types
     regardless of the order things are defined in.
     """
-    local_structs = []
+    local = {"structs": [], "enums": [], "consts": []}
     for start, end, kind in spans:
         p = Parser(tokenize(code[start:end], _line_of(code, start)), unit)
         try:
-            if kind == "struct":
-                name, fields = p.parse_struct()
+            if kind in ("struct", "tuple_struct"):
+                if kind == "struct":
+                    name, fields = p.parse_struct()
+                else:
+                    name, fields = p.parse_tuple_struct()
+                    unit.tuple_structs.add(name)
                 unit.structs[name] = fields
                 struct_order.append(name)
-                local_structs.append(name)
+                local["structs"].append(name)
+            elif kind == "enum":
+                name, variants = p.parse_enum()
+                unit.enums[name] = variants
+                for vname, _ in variants:
+                    unit.variants["%s_%s" % (name, vname)] = name
+                local["enums"].append(name)
+            elif kind == "const":
+                _, name, ty, _ = p.parse_const_signature()
+                unit.consts[name] = ty
+                local["consts"].append(name)
             elif kind == "fn":
                 _, name, params, ret = p.parse_fn_signature()
                 if name == "main" and ret.is_void():
@@ -1282,7 +1621,7 @@ def collect_items(code, spans, unit, struct_order, fail=None):
             if fail is not None:
                 raise fail(e, start)
             raise
-    return local_structs
+    return local
 
 
 _RS_INCLUDE = re.compile(
@@ -1399,6 +1738,54 @@ def _toposort_structs(unit, order):
     return result
 
 
+def _render_enum(name, variants):
+    """Render a Rust enum as a C enum whose members are `Enum_Variant`."""
+    parts = []
+    for vname, value in variants:
+        member = "%s_%s" % (name, vname)
+        parts.append(member if value is None else "%s = %s" % (member, value))
+    return "enum %s { %s }; typedef enum %s %s;" % (
+        name, ", ".join(parts), name, name)
+
+
+def _render_consts(code, spans, unit):
+    """Render `const`/`static` items, hoisted so order does not matter.
+
+    A Rust `const` is a compile-time constant, so an integer one is emitted as
+    a C enum constant rather than `static const`: only the former is a
+    constant expression, and so only the former can size an array. Anything
+    else -- floats, pointers, non-literal initializers, `static` -- becomes an
+    ordinary file-scope object.
+    """
+    out = []
+    for start, end, kind in spans:
+        if kind != "const":
+            continue
+        p = Parser(tokenize(code[start:end], _line_of(code, start)), unit)
+        kw, name, ty, init = p.parse_const_signature()
+        if kw == "const" and _fits_c_enum(ty, init.code):
+            out.append("enum { %s = %s };" % (name, init.code))
+            continue
+        prefix = "static const " if kw == "const" else "static "
+        out.append("%s%s = %s;" % (prefix, ty.decl(name), init.code))
+    return out
+
+
+def _fits_c_enum(ty, init):
+    """True if a const can be emitted as a C enum constant.
+
+    C enum members have type `int`, so only integer constants that fit are
+    eligible.
+    """
+    if ty.ptr or ty.array or ty.base not in _RANK:
+        return False
+    try:
+        value = int(init, 0)
+    except ValueError:
+        return False
+    return -(2 ** 31) <= value < 2 ** 31
+
+
 def _render_struct(name, fields):
     body = " ".join("%s;" % ty.decl(f) for f, ty in fields)
     return "struct %s { %s };" % (name, body)
@@ -1428,7 +1815,7 @@ def translate(code, path=None):
 
     # Pass 1: collect structs, function signatures and methods, so that
     # definition order does not matter anywhere in the unit.
-    local_structs = collect_items(code, spans, unit, struct_order, fail)
+    local = collect_items(code, spans, unit, struct_order, fail)
 
     # Pass 2: translate each item in place. Struct definitions are hoisted
     # into the prelude (see below), so their source region becomes blank.
@@ -1436,8 +1823,8 @@ def translate(code, path=None):
     for start, end, kind in spans:
         pieces.append(code[prev:start])
         line0 = _line_of(code, start)
-        if kind == "struct":
-            text = ""
+        if kind in ("struct", "tuple_struct", "enum", "const"):
+            text = ""            # hoisted into the prelude
         else:
             parser = Parser(tokenize(code[start:end], line0), unit)
             out = Out(line0)
@@ -1465,10 +1852,15 @@ def translate(code, path=None):
     # incomplete-type forward declarations, then full struct definitions in
     # dependency order, then function prototypes that may use either.
     prelude = []
-    for name in local_structs:
-        prelude.append("struct %s; typedef struct %s %s;" % (name, name, name))
-    for name in _toposort_structs(unit, local_structs):
+    for name in local["enums"]:
+        prelude.append(_render_enum(name, unit.enums[name]))
+    for name in local["structs"]:
+        prelude.append("struct %s; typedef struct %s %s;"
+                       % (name, name, name))
+    for name in _toposort_structs(unit, local["structs"]):
         prelude.append(_render_struct(name, unit.structs[name]))
+    for text in _render_consts(code, spans, unit):
+        prelude.append(text)
     for name, (ret, ps) in unit.fn_sigs.items():
         if name == "main" or name in included_fns:
             continue
