@@ -70,6 +70,15 @@ test_crust:
 test_fast_crust:
 	@python3 tools/crust_examples.py --fast -v
 
+# Survey how much of a real Rust codebase Crust can compile, and what is
+# blocking the rest. Point it at any Rust tree:
+#     make crustos_survey REDOX=~/redox-kernel
+# tools/crustos.py also has `build` and `stage` modes; it ignores Cargo
+# entirely and just walks the tree for .rs files.
+REDOX ?= $(ROOT)/redox-kernel
+crustos_survey:
+	python3 tools/crustos.py survey $(REDOX) --blockers --files
+
 # Drop the cached rpython transpiles and runtime objects that a
 # `#include "*.py"` builds up under /tmp.
 clean_crust:

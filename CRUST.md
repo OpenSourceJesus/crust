@@ -385,6 +385,59 @@ in the bundled `<stdio.h>`, which declares `printf` with no prototype, so a
 unit that prints a `double` should declare `int printf(const char *, ...);`
 itself, as every example in `examples/crust` does.
 
+## `unsafe`
+
+`unsafe { ... }` is accepted in both statement and expression position and is
+exactly its body. Crust has no borrow checker and no safety analysis to switch
+off, and the C it lowers to is unsafe throughout, so the block carries no
+meaning beyond grouping. `unsafe fn` is handled with the other item modifiers.
+
+This matters out of proportion to its size: in a survey of the Redox kernel,
+relibc and ion (615 files), `unsafe` blocks were the single largest blocker
+after generics, stopping 44 files on their own.
+
+## Compiling real Rust: `tools/crustos.py`
+
+`tools/crustos.py` walks a Rust source tree, runs every `.rs` file through the
+Crust front end, and reports what happened -- then compiles the ones that
+work. It ignores Cargo completely, which is the point: no toolchain pin, no
+build scripts, no proc macros, no package manager.
+
+```sh
+python3 tools/crustos.py survey ~/redox-kernel --blockers --files
+python3 tools/crustos.py build  ~/redox-kernel -o build/crustos
+python3 tools/crustos.py stage  ~/redox-kernel -o /tmp/mini-redox
+make crustos_survey REDOX=~/redox-kernel
+```
+
+The survey is deliberately pessimistic about what counts as success. Crust
+passes a file through unchanged when it finds no Rust items in it, which is
+right for a C file but would score a Rust file Crust understood *nothing* of
+as a pass. So a file only counts when Crust actually lowered at least one
+item, and files it recognized nothing in are reported separately as `empty`.
+
+Where things stand on Redox (kernel + relibc + ion, 615 files):
+
+| outcome | files | |
+|---|---|---|
+| translated (most of the file lowered) | 17 | 2.8% |
+| partial (some items lowered) | 29 | 4.7% |
+| failed (items found, translation errored) | 469 | 76.3% |
+| empty (no Rust items recognized) | 100 | 16.3% |
+
+6281 top-level Rust items parse. The ranked blockers behind the 469 failures
+are what the survey exists to produce, and they are unambiguous about the
+order of work: **generics** (30% of failing files), then paths in type
+position, `impl Trait for Type`, trait method resolution, closures and tuples,
+data-carrying enum variants, and macros.
+
+One honest caveat the numbers make plain: most failing files are blocked by
+*several* of these at once, so landing any single feature moves the headline
+count very little. Adding `unsafe` blocks took that blocker from 44 files to
+3, but the overall failure count only fell from 471 to 469 -- the next blocker
+in the same file was waiting. Generics are the gate; little else will show up
+in the totals until they land.
+
 ## Not yet supported
 
 Traits, user-defined generics (`Option` and `Result` are the only
