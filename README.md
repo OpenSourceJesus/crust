@@ -1,6 +1,8 @@
 # Crust
 ## A Unified C/Rust Compiler Environment for Systems Programming
 
+Main Crust Documentation: [CRUST.md](CRUST.md)
+
 Modern systems development forces engineers to choose between two paradigms:
 - The ubiquitous simplicity and legacy ecosystem of C.
 - The type safety, spatial memory guarantees, and modern ergonomics of Rust.
