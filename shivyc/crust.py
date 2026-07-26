@@ -222,6 +222,27 @@ def tokenize(src, line0=1):
             i = j + 1
             continue
         # chars (Rust lifetimes are not supported, so `'` is always a literal)
+        if c == "'" and i + 1 < n and (src[i + 1].isalpha()
+                                       or src[i + 1] == "_") \
+                and not (i + 2 < n and src[i + 2] == "'"):
+            # A lifetime (`'a`, `'static`, `'_`), not a char literal -- the
+            # giveaway is that a char literal closes after one character.
+            # Crust has no borrow checker, so a lifetime carries nothing it
+            # could act on and is dropped here, where every later pass is
+            # spared having to know about it.
+            #
+            # The comma that follows one inside `<'a, T>` is dropped with it,
+            # so the remaining type argument list is still well formed.
+            j = i + 1
+            while j < n and (src[j].isalnum() or src[j] == "_"):
+                j += 1
+            k = j
+            while k < n and src[k] in " \t":
+                k += 1
+            if k < n and src[k] == ",":
+                j = k + 1
+            i = j
+            continue
         if c == "'":
             j, buf = i + 1, ["'"]
             while j < n and src[j] != "'":
@@ -960,8 +981,8 @@ class Parser:
         a binding.
         """
         self.skip_attributes()
-        while self.cur.val in ("pub", "unsafe", "extern") or \
-                self.cur.kind == "str":
+        self.skip_visibility()
+        while self.cur.val in ("unsafe", "extern") or self.cur.kind == "str":
             self.next()
         self.expect("fn")
         self.expect_ident()
@@ -2402,8 +2423,7 @@ class Parser:
     def parse_enum(self):
         """Parse `enum Name { A, B = 5, C }`, returning (name, variants)."""
         self.skip_attributes()
-        while self.cur.val in ("pub",):
-            self.next()
+        self.skip_visibility()
         self.expect("enum")
         name = self.expect_ident()
         self.expect("{")
@@ -2426,8 +2446,7 @@ class Parser:
     def parse_const_signature(self):
         """Parse `const|static [mut] NAME: T = expr;` without emitting."""
         self.skip_attributes()
-        while self.cur.val in ("pub",):
-            self.next()
+        self.skip_visibility()
         kw = self.next().val                     # const or static
         self.accept("mut")
         name = self.expect_ident()
@@ -2452,6 +2471,22 @@ class Parser:
         out.line_at(t.line, "%s%s%s = %s;" % (prefix, quals, ty.decl(name),
                                               init.code), indent)
 
+    def skip_visibility(self):
+        """Skip `pub`, `pub(crate)`, `pub(in path)` and friends."""
+        while self.cur.val == "pub":
+            self.next()
+            if self.at("(", "punc"):
+                depth = 0
+                while self.cur.kind != "eof":
+                    if self.cur.val == "(":
+                        depth += 1
+                    elif self.cur.val == ")":
+                        depth -= 1
+                        if depth == 0:
+                            self.next()
+                            break
+                    self.next()
+
     def skip_attributes(self):
         """Skip `#[...]` outer attributes, which Crust does not interpret."""
         while self.at("#", "punc"):
@@ -2474,8 +2509,7 @@ class Parser:
     def parse_struct(self):
         """Parse `struct Name { f: T, ... }`, returning (name, fields)."""
         self.skip_attributes()
-        while self.cur.val in ("pub",):
-            self.next()
+        self.skip_visibility()
         self.expect("struct")
         name = self.expect_ident()
         self.skip_generic_params()
@@ -2499,8 +2533,7 @@ class Parser:
     def parse_tuple_struct(self):
         """Parse `struct P(T, U);`, naming the fields `_0`, `_1`, ..."""
         self.skip_attributes()
-        while self.cur.val in ("pub",):
-            self.next()
+        self.skip_visibility()
         self.expect("struct")
         name = self.expect_ident()
         self.expect("(")
@@ -2526,8 +2559,7 @@ class Parser:
         literal ever mentions it.
         """
         self.skip_attributes()
-        while self.cur.val in ("pub",):
-            self.next()
+        self.skip_visibility()
         self.expect("struct")
         name = self.expect_ident()
         self.expect(";")
@@ -2585,7 +2617,8 @@ class Parser:
         implementing type.
         """
         self.skip_attributes()
-        while self.cur.val in ("pub", "unsafe"):
+        self.skip_visibility()
+        while self.cur.val == "unsafe":
             self.next()
         self.expect("trait")
         name = self.expect_ident()
@@ -2646,7 +2679,8 @@ class Parser:
     def parse_method_signature(self, owner):
         """Parse an `impl` method header into a MethodInfo."""
         self.skip_attributes()
-        while self.cur.val in ("pub", "unsafe"):
+        self.skip_visibility()
+        while self.cur.val == "unsafe":
             self.next()
         start = self.expect("fn")
         name = self.expect_ident()
@@ -2720,7 +2754,8 @@ class Parser:
     def parse_fn_signature(self):
         """Parse `[pub] [unsafe] [extern "C"] fn name(params) [-> T]`."""
         self.skip_attributes()
-        while self.cur.val in ("pub", "unsafe"):
+        self.skip_visibility()
+        while self.cur.val == "unsafe":
             self.next()
         if self.accept("extern"):
             if self.cur.kind == "str":
@@ -2995,7 +3030,13 @@ _ITEM_START = re.compile(
     r"\b(?P<kw>fn|struct|impl|enum|const|static|trait)"
     r"(?:\s+|\s*(?=<))(?:<[^<>]*>\s*)?"
     r"(?:mut\s+)?(?P<name>[A-Za-z_]\w*)")
-_MODIFIER = re.compile(r"(?:\b(?:pub|unsafe)\b\s+|\bextern\s+\"C\"\s+)*$")
+# Item modifiers that may precede `fn`/`struct`/... The scan text this runs
+# against has had string literals blanked, so `extern "C"` appears as
+# `extern " "` (or with the quotes gone entirely); matching the literal
+# spelling would miss every `pub unsafe extern "C" fn` in real FFI code.
+_MODIFIER = re.compile(
+    r"(?:\b(?:pub|unsafe)\b(?:\s*\([^)]*\))?\s+|\bextern\b\s*"
+    r"(?:\"[^\"]*\"|\'[^\']*\')?\s*)*$")
 
 
 def _blank(code):
@@ -3015,6 +3056,13 @@ def _blank(code):
                 if out[k] != "\n":
                     out[k] = " "
             i = j
+        elif (c == "'" and i + 1 < n and (code[i + 1].isalpha()
+                                          or code[i + 1] == "_")
+              and not (i + 2 < n and code[i + 2] == "'")):
+            # A lifetime, not a char literal. Blanking it as a literal would
+            # swallow everything up to the next quote and destroy the item
+            # structure this scan exists to find.
+            i += 1
         elif c in "\"'":
             quote, j = c, i + 1
             out[i] = " "
@@ -3069,10 +3117,9 @@ def _match_brace(scan, open_idx):
 # passes unrecognized text through byte-for-byte, so `use core::mem;` survives
 # translation intact and only fails later, in the C front end. Anything that
 # measures `translate()` alone will not see it.
-_ERASED_ITEM = re.compile(
+_ERASED_HEAD = re.compile(
     r"^[ \t]*(?:pub(?:\s*\([^)]*\))?\s+)?"
-    r"(?:use|extern\s+crate)\b"
-    r"(?:[^;{]|\{[^{}]*\})*;[ \t]*$", re.M | re.S)
+    r"(?:use\b|extern\s+crate\b|mod\s+\w+\s*;)", re.M)
 
 _MACRO_RULES = re.compile(r"\bmacro_rules!\s*(?P<name>[A-Za-z_]\w*)\s*\{")
 
@@ -3669,10 +3716,36 @@ def _render_struct(name, fields):
 
 
 def erase_module_items(code):
-    """Blank `use` / `extern crate` lines, preserving every line number."""
-    def blank(m):
-        return " " * (m.end() - m.start())
-    return _ERASED_ITEM.sub(blank, code)
+    """Blank `use`, `extern crate` and `mod X;` items, keeping line numbers.
+
+    Scanned rather than matched with a single regular expression, because a
+    `use` may nest brace groups arbitrarily -- `use core::{cell::Cell,
+    ops::{Deref, DerefMut}};` -- and a regex cannot balance them. The item
+    runs to the `;` that closes it at brace depth zero.
+
+    Blanking rather than deleting keeps every later line where the user wrote
+    it, so diagnostics still point at the right place. Comments and string
+    literals are blanked first so a `use` mentioned in prose is not erased
+    from live code.
+    """
+    scan = _blank(code)
+    out = list(code)
+    for m in _ERASED_HEAD.finditer(scan):
+        i, depth, n = m.start(), 0, len(scan)
+        while i < n:
+            ch = scan[i]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+            elif ch == ";" and depth == 0:
+                i += 1
+                break
+            i += 1
+        for k in range(m.start(), min(i, n)):
+            if out[k] != "\n":
+                out[k] = " "
+    return "".join(out)
 
 
 def translate(code, path=None):
