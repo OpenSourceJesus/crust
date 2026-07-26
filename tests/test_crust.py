@@ -1604,3 +1604,117 @@ fn main() -> i32 { twice!(g(1, 20)) }
         c = crust.translate("macro_rules! unused { () => { 1 }; }\n"
                             "fn f() -> i32 { 2 }")
         self.assertNotIn("unused", c)
+
+
+class TestCrustPaths(unittest.TestCase):
+    """Qualified paths in type position."""
+
+    def test_std_path_finds_the_bundled_type(self):
+        c = crust.translate("fn f() { let b: alloc::boxed::Box<i32> = "
+                            "Box::<i32>::new(1); }")
+        self.assertIn("Box_int", c)
+
+    def test_flattened_local_path_wins(self):
+        c = crust.translate("struct mod_P { v: i32 }\n"
+                            "fn f(p: *const mod::P) -> i32 { p.v }")
+        self.assertIn("mod_P *p", c)
+
+    def test_last_segment_fallback(self):
+        c = crust.translate("struct P { v: i32 }\n"
+                            "fn f(p: *const self::P) -> i32 { p.v }")
+        self.assertIn("P *p", c)
+
+    def test_c_const_pointer_is_not_read_as_a_const_item(self):
+        # `*const self::P` -- `::` means a path, not a `NAME: type` annotation.
+        c = crust.translate("struct P { v: i32 }\n"
+                            "fn f(p: *const self::P) -> i32 { p.v }")
+        self.assertIn("int f(P *p)", c)
+
+
+class TestCrustTuples(unittest.TestCase):
+    """Tuple types and expressions, monomorphised like slices."""
+
+    def test_tuple_return_and_field_access(self):
+        self.assertEqual(_run("""
+fn divmod(a: i32, b: i32) -> (i32, i32) { (a / b, a % b) }
+fn main() -> i32 {
+    let d: (i32, i32) = divmod(47, 5);
+    d.0 * 4 + d.1 * 3
+}
+""", suffix=".rs"), 42)
+
+    def test_mixed_element_types(self):
+        c = crust.translate("fn f() { let t: (i32, f64) = (1, 2.0); }")
+        self.assertIn("struct crust_tuple_int_double { int _0; double _1; }", c)
+
+    def test_one_element_parens_is_not_a_tuple(self):
+        c = crust.translate("fn f() -> i32 { let x: (i32) = 1; x }")
+        self.assertNotIn("crust_tuple", c)
+
+    def test_unit_type_still_void(self):
+        c = crust.translate("fn f() -> () { }")
+        self.assertIn("void f(void)", c)
+
+    def test_distinct_shapes_are_distinct_structs(self):
+        c = crust.translate("""
+fn f() { let a: (i32, i32) = (1, 2); }
+fn g() { let b: (i32, f64) = (1, 2.0); }
+""")
+        self.assertIn("crust_tuple_int_int", c)
+        self.assertIn("crust_tuple_int_double", c)
+
+
+class TestCrustClosures(unittest.TestCase):
+    """Non-capturing closures, lifted to plain functions."""
+
+    def test_closure_is_called(self):
+        self.assertEqual(_run("""
+fn main() -> i32 { let f = |a: i32| a * 2; f(21) }
+""", suffix=".rs"), 42)
+
+    def test_two_parameters(self):
+        self.assertEqual(_run("""
+fn main() -> i32 { let f = |a: i32, b: i32| a + b; f(40, 2) }
+""", suffix=".rs"), 42)
+
+    def test_no_parameters(self):
+        self.assertEqual(_run("fn main() -> i32 { let f = || 42; f() }",
+                              suffix=".rs"), 42)
+
+    def test_closure_lifts_to_a_static_function(self):
+        c = crust.translate("fn f() { let g = |a: i32| a + 1; }")
+        self.assertIn("static int _crust_closure1(int a)", c)
+
+    def test_capturing_closure_is_rejected(self):
+        # Crust has no environment; capturing must be an error, not a guess.
+        with self.assertRaises(crust.CrustError) as cm:
+            crust.translate("fn f() { let n: i32 = 1; let g = |a: i32| a + n; }")
+        self.assertIn("captures", str(cm.exception))
+
+    def test_unannotated_parameter_is_rejected(self):
+        with self.assertRaises(crust.CrustError):
+            crust.translate("fn f() { let g = |a| a + 1; }")
+
+
+class TestCrustCKeywords(unittest.TestCase):
+    """Rust identifiers that are C keywords."""
+
+    def test_local_named_double_is_renamed(self):
+        self.assertEqual(_run("""
+fn main() -> i32 { let double: i32 = 21; double * 2 }
+""", suffix=".rs"), 42)
+
+    def test_parameter_named_int_is_renamed(self):
+        self.assertEqual(_run("""
+fn f(int: i32, register: i32) -> i32 { int + register }
+fn main() -> i32 { f(40, 2) }
+""", suffix=".rs"), 42)
+
+    def test_loop_variable_named_short(self):
+        self.assertEqual(_run("""
+fn main() -> i32 {
+    let mut t: i32 = 0;
+    for short in 0..7 { t += short; }
+    t * 2
+}
+""", suffix=".rs"), 42)
