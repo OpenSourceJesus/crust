@@ -1,9 +1,17 @@
-# Crust — Rust syntax in the ShivyCX front end
+# Crust — C+Rust syntax
 
 Crust lets one translation unit hold C functions and Rust functions side by
 side, with no FFI boundary between them. A Rust function calls a C function
 (and vice versa) as a direct call: same IL, same register allocator, same
 whole-program passes, full inlining and interprocedural visibility.
+
+```sh
+chmod +x ./crust
+./crust mixed.c -o mixed     # C file containing Rust functions
+./crust prog.rs -o prog      # all-Rust file
+```
+
+or directly with Python (also works with PyPy3)
 
 ```sh
 python3 -m shivyc.main mixed.c -o mixed     # C file containing Rust functions
