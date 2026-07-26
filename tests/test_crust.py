@@ -809,6 +809,146 @@ fn main() -> i32 {
 """, suffix=".rs"), 42)
 
 
+class TestCrustOption(unittest.TestCase):
+    """`Option<T>`, monomorphised into a tagged struct per instantiation."""
+
+    FIND = """
+fn find(xs: &[i32], want: i32) -> Option<i32> {
+    for i in 0..xs.len() {
+        if xs[i] == want { return Some(i as i32); }
+    }
+    None
+}
+"""
+
+    def test_option_struct_is_generated(self):
+        c = crust.translate("fn f() -> Option<i32> { None }")
+        self.assertIn("struct crust_option_int { _Bool some; int value; };", c)
+
+    def test_one_struct_per_element_type(self):
+        c = crust.translate("fn f() -> Option<i32> { None }\n"
+                            "fn g() -> Option<f64> { None }")
+        self.assertIn("crust_option_int", c)
+        self.assertIn("crust_option_double", c)
+
+    def test_some_and_none_lowering(self):
+        c = crust.translate("fn f(n: i32) -> Option<i32> "
+                            "{ if n > 0 { Some(n) } else { None } }")
+        self.assertIn("(crust_option_int){1, n}", c)
+        self.assertIn("(crust_option_int){0}", c)
+
+    def test_none_infers_from_the_annotation(self):
+        c = crust.translate("fn f() { let x: Option<i64> = None; }")
+        self.assertIn("crust_option_long x = (crust_option_long){0};", c)
+
+    def test_none_without_context_is_an_error(self):
+        with self.assertRaises(crust.CrustError) as cm:
+            crust.translate("fn f() { let x = None; }")
+        self.assertIn("None", str(cm.exception))
+
+    def test_none_infers_from_a_parameter(self):
+        c = crust.translate("fn g(o: Option<i32>) {}\n"
+                            "fn f() { g(None); }")
+        self.assertIn("g((crust_option_int){0})", c)
+
+    def test_nested_option_splits_the_shift_token(self):
+        c = crust.translate("fn f() -> Option<Option<i32>> { None }")
+        self.assertIn("crust_option_crust_option_int", c)
+
+    def test_option_of_unit_is_rejected(self):
+        with self.assertRaises(crust.CrustError):
+            crust.translate("fn f() -> Option<()> { None }")
+
+    def test_is_some_and_is_none(self):
+        c = crust.translate("fn f(o: Option<i32>) -> bool "
+                            "{ o.is_some() }")
+        self.assertIn("return o.some;", c)
+        c = crust.translate("fn f(o: Option<i32>) -> bool "
+                            "{ o.is_none() }")
+        self.assertIn("(!o.some)", c)
+
+    def test_unwrap_or_is_inline(self):
+        c = crust.translate("fn f(o: Option<i32>) -> i32 "
+                            "{ o.unwrap_or(7) }")
+        self.assertIn("o.some ? o.value : 7", c)
+
+    def test_unwrap_emits_a_checked_helper(self):
+        c = crust.translate("fn f(o: Option<i32>) -> i32 { o.unwrap() }")
+        self.assertIn("if (!o.some) abort();", c)
+        self.assertIn("void abort(void);", c)
+
+    def test_unknown_option_method_is_an_error(self):
+        with self.assertRaises(crust.CrustError):
+            crust.translate("fn f(o: Option<i32>) { o.expect(); }")
+
+    def test_option_end_to_end(self):
+        self.assertEqual(_run(self.FIND + """
+fn main() -> i32 {
+    let a: [i32; 5] = [10, 20, 30, 40, 50];
+    let xs: &[i32] = &a[..];
+    let hit: Option<i32> = find(xs, 30);
+    let miss: Option<i32> = find(xs, 99);
+    hit.unwrap() * 10 + miss.unwrap_or(7)
+}
+""", suffix=".rs"), 27)
+
+    def test_unwrap_on_none_aborts(self):
+        # subprocess reports a signal as its negation; SIGABRT is 6.
+        self.assertEqual(_run("""
+fn get(n: i32) -> Option<i32> { if n > 0 { Some(n) } else { None } }
+fn main() -> i32 { let x: Option<i32> = get(-1); x.unwrap() }
+""", suffix=".rs"), -6)
+
+
+class TestCrustIfLet(unittest.TestCase):
+    """`if let` and `while let`."""
+
+    def test_if_let_binds_and_scopes_the_temporary(self):
+        c = crust.translate("fn f(o: Option<i32>) -> i32 "
+                            "{ if let Some(v) = o { v } else { 0 } }")
+        self.assertIn(".some)", c)
+        self.assertIn("int v = ", c)
+
+    def test_subject_is_evaluated_once(self):
+        c = crust.translate("fn g() -> Option<i32> { None }\n"
+                            "fn f() { if let Some(v) = g() { h(v); } }")
+        # The prototype spells `g(void)`, so this counts call sites only.
+        self.assertEqual(c.count("g()"), 1)
+
+    def test_non_option_subject_is_an_error(self):
+        with self.assertRaises(crust.CrustError):
+            crust.translate("fn f(n: i32) { if let Some(v) = n { } }")
+
+    def test_other_patterns_are_rejected(self):
+        with self.assertRaises(crust.CrustError):
+            crust.translate("fn f(o: Option<i32>) { if let Ok(v) = o { } }")
+
+    def test_if_let_end_to_end(self):
+        self.assertEqual(_run("""
+fn get(n: i32) -> Option<i32> { if n > 0 { Some(n * 2) } else { None } }
+fn main() -> i32 {
+    let mut total: i32 = 0;
+    if let Some(v) = get(20) { total += v; } else { total += 1; }
+    if let Some(v) = get(-1) { total += v; } else { total += 2; }
+    total
+}
+""", suffix=".rs"), 42)
+
+    def test_while_let_end_to_end(self):
+        self.assertEqual(_run("""
+static mut N: i32 = 0;
+fn next() -> Option<i32> {
+    N += 1;
+    if N < 4 { Some(N) } else { None }
+}
+fn main() -> i32 {
+    let mut sum: i32 = 0;
+    while let Some(v) = next() { sum += v; }
+    sum
+}
+""", suffix=".rs"), 6)
+
+
 class TestEnumLiteralSpotRegression(unittest.TestCase):
     """Backend fix: a symbolic literal must not be range-compared as an int.
 
