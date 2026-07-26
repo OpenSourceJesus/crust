@@ -29,8 +29,16 @@ class _Args:
         self.output_name = output_name
 
 
-def _run(source, suffix=".c"):
+def _run(source, suffix=".c", extra=None):
+    """Compile `source` and return its exit status.
+
+    `extra` maps auxiliary file names (e.g. an included `.rs`) to contents,
+    written alongside the main source so quoted includes resolve.
+    """
     workdir = tempfile.mkdtemp()
+    for name, text in (extra or {}).items():
+        with open(os.path.join(workdir, name), "w") as f:
+            f.write(text)
     src_path = os.path.join(workdir, "prog" + suffix)
     out_path = os.path.join(workdir, "prog")
     with open(src_path, "w") as f:
@@ -98,7 +106,12 @@ class TestCrustTranslation(unittest.TestCase):
         self.assertIn("1.5f", c)
 
     def test_line_numbers_are_preserved(self):
-        src = "int a;\nfn f() -> i32 {\n    let x: i32 = 1;\n    x\n}\nint b;\n"
+        src = ("int a;\n"
+               "fn f() -> i32 {\n"
+               "    let x: i32 = 1;\n"
+               "    x\n"
+               "}\n"
+               "int b;\n")
         out = crust.translate(src)
         # The prototype prefix shares line 1, so every line index still holds.
         self.assertEqual(out.count("\n"), src.count("\n"))
@@ -205,6 +218,228 @@ class TestCrustCompilation(unittest.TestCase):
     def test_syntax_error_is_reported(self):
         with self.assertRaises(AssertionError):
             _run("fn main() -> i32 { let x = ; }")
+
+
+PT = """
+struct Point {
+    x: f64,
+    y: f64,
+}
+
+impl Point {
+    fn new(x: f64, y: f64) -> Point {
+        Point { x: x, y: y }
+    }
+    fn norm2(&self) -> f64 {
+        self.x * self.x + self.y * self.y
+    }
+    fn scale(&mut self, k: f64) {
+        self.x = self.x * k;
+        self.y = self.y * k;
+    }
+    fn origin() -> Point {
+        Point { x: 0.0, y: 0.0 }
+    }
+}
+"""
+
+
+class TestCrustStructs(unittest.TestCase):
+    """`struct` items and their lowering."""
+
+    def test_struct_is_hoisted_and_typedefed(self):
+        c = crust.translate("struct P { x: i32, y: i32 }")
+        self.assertIn("struct P { int x; int y; };", c)
+        self.assertIn("typedef struct P P;", c)
+
+    def test_c_struct_is_not_claimed(self):
+        src = ("struct P { int x; int y; };\n"
+               "fn f() -> i32 { 1 }\n")
+        out = crust.translate(src)
+        self.assertIn("struct P { int x; int y; };", out)
+        # untouched: still exactly one definition, the C one
+        self.assertEqual(out.count("struct P {"), 1)
+
+    def test_struct_field_of_struct_type(self):
+        c = crust.translate("struct Inner { v: i32 }\n"
+                            "struct Outer { a: Inner, b: i32 }")
+        # dependency order: Inner must be defined before Outer
+        self.assertLess(c.index("struct Inner { int v; };"),
+                        c.index("struct Outer {"))
+
+    def test_recursive_struct_by_value_is_rejected(self):
+        with self.assertRaises(crust.CrustError):
+            crust.translate("struct N { next: N }")
+
+    def test_struct_literal_lowers_to_compound_literal(self):
+        c = crust.translate("struct P { x: i32 }\n"
+                            "fn f() -> P { P { x: 3 } }")
+        self.assertIn("(P){.x = 3}", c)
+
+    def test_missing_field_in_literal_is_an_error(self):
+        with self.assertRaises(crust.CrustError):
+            crust.translate("struct P { x: i32, y: i32 }\n"
+                            "fn f() -> P { P { x: 1 } }")
+
+    def test_unknown_field_in_literal_is_an_error(self):
+        with self.assertRaises(crust.CrustError):
+            crust.translate("struct P { x: i32 }\n"
+                            "fn f() -> P { P { z: 1 } }")
+
+    def test_unknown_field_access_is_an_error(self):
+        with self.assertRaises(crust.CrustError):
+            crust.translate("struct P { x: i32 }\n"
+                            "fn f(p: P) -> i32 { p.z }")
+
+    def test_struct_literal_not_parsed_in_condition_position(self):
+        # `if p.x > 0 { ... }` -- the brace opens a block, not a literal.
+        c = crust.translate(
+            "struct P { x: i32 }\n"
+            "fn f(p: P) -> i32 { if p.x > 0 { 1 } else { 2 } }")
+        self.assertIn("if ((p.x > 0))", c)
+
+    def test_attributes_are_skipped(self):
+        c = crust.translate("#[derive(Copy)]\nstruct P { x: i32 }")
+        self.assertIn("struct P { int x; };", c)
+
+
+class TestCrustImpl(unittest.TestCase):
+    """`impl` blocks, method lowering and call sites."""
+
+    def test_method_is_mangled_with_self_pointer(self):
+        c = crust.translate(PT)
+        self.assertIn("double Point_norm2(Point *self)", c)
+
+    def test_self_field_access_uses_arrow(self):
+        self.assertIn("self->x", crust.translate(PT))
+
+    def test_associated_fn_has_no_self_param(self):
+        c = crust.translate(PT)
+        self.assertIn("Point Point_origin(void)", c)
+
+    def test_method_call_auto_refs_receiver(self):
+        c = crust.translate(PT + "\nfn f(p: Point) -> f64 { p.norm2() }")
+        self.assertIn("Point_norm2(&p)", c)
+
+    def test_method_call_on_pointer_does_not_double_ref(self):
+        c = crust.translate(PT + "\nfn f(p: *mut Point) -> f64 "
+                                 "{ p.norm2() }")
+        self.assertIn("Point_norm2(p)", c)
+
+    def test_path_call_of_associated_fn(self):
+        c = crust.translate(PT + "\nfn f() -> Point { Point::origin() }")
+        self.assertIn("Point_origin()", c)
+
+    def test_self_type_alias(self):
+        c = crust.translate(
+            "struct P { x: i32 }\n"
+            "impl P { fn id(&self) -> Self { Self { x: 1 } } }")
+        self.assertIn("P P_id(P *self)", c)
+
+    def test_unknown_method_is_an_error(self):
+        with self.assertRaises(crust.CrustError):
+            crust.translate(PT + "\nfn f(p: Point) -> f64 { p.nope() }")
+
+    def test_method_on_untyped_receiver_is_an_error(self):
+        with self.assertRaises(crust.CrustError):
+            crust.translate("fn f(p: *mut i32) -> i32 { (*p).norm2() }")
+
+    def test_struct_and_impl_end_to_end(self):
+        # norm2 = 25; after scale(2.0) it is 100; total 125.
+        self.assertEqual(_run(PT + """
+fn main() -> i32 {
+    let mut p: Point = Point::new(3.0, 4.0);
+    let n: f64 = p.norm2();
+    p.scale(2.0);
+    (n + p.norm2()) as i32
+}
+""", suffix=".rs"), 125)
+
+    def test_method_chaining_through_fields(self):
+        self.assertEqual(_run("""
+struct Inner { v: i32 }
+struct Outer { a: Inner }
+impl Inner { fn get(&self) -> i32 { self.v } }
+fn main() -> i32 {
+    let o: Outer = Outer { a: Inner { v: 9 } };
+    o.a.get()
+}
+""", suffix=".rs"), 9)
+
+    def test_c_can_call_rust_methods(self):
+        self.assertEqual(_run(PT + """
+int main(void) {
+    Point p = Point_new(3.0, 4.0);
+    return (int)Point_norm2(&p);
+}
+"""), 25)
+
+
+class TestCrustRsInclude(unittest.TestCase):
+    """`#include "foo.rs"` from C."""
+
+    VEC = """
+struct Vec2 { x: f64, y: f64 }
+impl Vec2 {
+    fn new(x: f64, y: f64) -> Vec2 { Vec2 { x: x, y: y } }
+    fn dot(&self, o: *const Vec2) -> f64 { self.x * o.x + self.y * o.y }
+    fn len2(&self) -> f64 { self.dot(self) }
+}
+"""
+
+    def test_c_includes_rs_and_calls_it(self):
+        self.assertEqual(_run(
+            '#include "vec2.rs"\n'
+            "int main(void) { Vec2 a = Vec2_new(3.0, 4.0); "
+            "return (int)Vec2_len2(&a); }\n",
+            extra={"vec2.rs": self.VEC}), 25)
+
+    def test_rust_in_includer_uses_included_struct(self):
+        self.assertEqual(_run(
+            '#include "vec2.rs"\n'
+            "fn scaled(k: f64) -> Vec2 { Vec2::new(k, k * 2.0) }\n"
+            "int main(void) { Vec2 a = Vec2_new(3.0, 4.0); "
+            "Vec2 b = scaled(1.0); return (int)Vec2_dot(&a, &b); }\n",
+            extra={"vec2.rs": self.VEC}), 11)
+
+    def test_leading_directive_is_not_clobbered(self):
+        # The prelude must not be prefixed onto a `#` line.
+        out = crust.translate('#include "x.rs"\nfn f() -> i32 { 1 }\n')
+        self.assertTrue(out.split("\n")[0].lstrip().startswith("#include"))
+
+    def test_include_is_left_for_the_preprocessor(self):
+        out = crust.translate('#include "x.rs"\nfn f() -> i32 { 1 }\n')
+        self.assertIn('#include "x.rs"', out)
+
+    def test_error_in_included_rs_names_that_file_and_line(self):
+        # The diagnostic must point into the .rs module, not the includer.
+        workdir = tempfile.mkdtemp()
+        with open(os.path.join(workdir, "bad.rs"), "w") as f:
+            f.write("struct P { x: i32 }\n"
+                    "impl P {\n"
+                    "    fn get(&self) -> i32 {\n"
+                    "        self.nosuchfield\n"
+                    "    }\n"
+                    "}\n")
+        main_c = os.path.join(workdir, "prog.c")
+        with open(main_c, "w") as f:
+            f.write('#include "bad.rs"\nint main(void){ return 0; }\n')
+        args = _Args([main_c], [os.path.join(workdir, "prog")])
+        shivyc.main.get_arguments = lambda: args
+        messages = []
+        error_collector.show = lambda: messages.extend(
+            str(e) for e in error_collector.issues) or True
+        error_collector.clear()
+        self.assertNotEqual(shivyc.main.main(), 0)
+        joined = " ".join(messages)
+        self.assertIn("bad.rs", joined)
+        self.assertIn("line 4", joined)
+        self.assertIn("nosuchfield", joined)
+
+    def test_commented_out_include_is_ignored(self):
+        self.assertEqual(crust.find_rs_includes('// #include "a.rs"\n'), [])
+        self.assertEqual(crust.find_rs_includes('#include "a.rs"\n'),
+                         ['"a.rs"'])
 
 
 if __name__ == "__main__":
