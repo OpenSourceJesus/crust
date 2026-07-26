@@ -54,6 +54,7 @@ its definition.
 | Types | `i8 i16 i32 i64 isize`, `u8 u16 u32 u64 usize`, `f32 f64`, `bool`, `char`, `()`, `&str` |
 | Pointers | `*const T`, `*mut T`, `&T`, `&mut T` (all lower to `T *`) |
 | Arrays | `[T; N]`, and slices `&[T]` / `&mut [T]` |
+| Option | `Option<T>`, `Some(x)`, `None`, `is_some`, `is_none`, `unwrap`, `unwrap_or`, `if let`, `while let` |
 | Statements | `let` (with `mut` and optional annotation), `return`, `if`/`else if`/`else`, `while`, `loop`, `for x in a..b` and `a..=b`, `match`, `break`, `continue`, local `const`, blocks |
 | Expressions | literals, array literals `[a, b, c]` and `[0; N]`, calls, indexing, field access, unary and binary operators, compound assignment, `as` casts, `if`/`else` as an expression |
 | Tail expressions | a trailing expression in a function body becomes its return value |
@@ -160,6 +161,31 @@ Because the representation is an ordinary C struct, **C can build and pass
 slices too** — `(crust_slice_int){data, 6}` is exactly what Crust emits — so
 the boundary stays free of conversion shims.
 
+## Option
+
+Crust has no generics, so each `Option<T>` is **monomorphised** into its own
+tagged struct, generated on demand exactly like a slice:
+
+```c
+struct crust_option_int { _Bool some; int value; };
+```
+
+`Some(x)` fills it in and `None` zeroes it. `None` carries no type of its
+own, so it is resolved from the context it appears in — a `let` annotation, a
+return type or a parameter type. Where there is no context to read, Crust
+asks for an annotation instead of guessing.
+
+`unwrap()` is a real check, not a reinterpretation: it calls a generated
+helper that aborts when the option is empty, so a mistaken unwrap traps
+instead of returning garbage. `unwrap_or(d)` is inlined as a ternary, and
+`is_some`/`is_none` read the tag.
+
+`if let Some(x) = e { .. } else { .. }` and `while let Some(x) = e { .. }`
+lower to a temporary plus a test, so the subject is evaluated exactly once
+and the binding is scoped to the arm that owns it. Only the `Some(x)` pattern
+is supported — `match` on an `Option` needs pattern bindings, which Crust
+does not have.
+
 ## Rust modules by `#include`
 
 `#include "foo.rs"` works from C. The hook is in the preprocessor's include
@@ -180,9 +206,9 @@ stays in place for the preprocessor to expand.
 
 ## Not yet supported
 
-Traits, generics, closures, modules, `Vec`, `Option`/`Result`, iterators
-(`for x in slice` — use `for i in 0..xs.len()`), lifetimes, and the borrow
-checker. Enums cannot carry data, `match` has no bindings, guards or range
+Traits, generics (beyond the monomorphised `Option<T>`), closures, modules,
+`Vec`, `Result`, iterators (`for x in slice` — use `for i in 0..xs.len()`),
+lifetimes, and the borrow checker. Enums cannot carry data, `match` has no bindings, guards or range
 patterns, and unit structs are not recognized. Slices carry no bounds
 checking.
 Non-zero array repeat initializers (`[7; N]`) are rejected because C has no
@@ -202,6 +228,8 @@ Python, in keeping with the rest of the front end.
   a tuple struct, array literals and `if` as an expression.
 - `examples/crust/stats.c` — slices, `&str` and an associated constant, with C
   building a slice itself and calling the methods.
+- `examples/crust/lookup.rs` — `Option<T>` for fallible lookup, with `if let`,
+  `while let` and `unwrap_or`.
 
 ## Tests
 
