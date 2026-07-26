@@ -63,6 +63,9 @@ its definition.
 | Core | bundled `Vec<T>`, `Box<T>`, `Cell<T>`, `PhantomData<T>`, and `size_of::<T>()` |
 | Traits | `trait`, `impl Trait for Type`, default methods, supertraits, bounds `<T: Trait>`; static dispatch |
 | Macros | `println!`/`print!`/`eprintln!`, `assert!`/`assert_eq!`/`assert_ne!`, `panic!`/`unreachable!`/`todo!`, `debug_assert*!`, `cfg!`, `matches!`, and `macro_rules!` |
+| Tuples | tuple types `(A, B)`, tuple expressions, positional access `t.0` |
+| Closures | non-capturing `|a: T| expr`, lifted to a plain function |
+| Paths | `a::b::C` in type position |
 | Types | `i8 i16 i32 i64 isize`, `u8 u16 u32 u64 usize`, `f32 f64`, `bool`, `char`, `()`, `&str` |
 | Pointers | `*const T`, `*mut T`, `&T`, `&mut T` (all lower to `T *`) |
 | Arrays | `[T; N]`, and slices `&[T]` / `&mut [T]` |
@@ -461,6 +464,58 @@ generics, no generic enums, and no `where` clauses. Crust also monomorphises
 only from source it can see: a generic from `std`, `core` or another crate has
 no template to instantiate, and is reported as such rather than guessed at.
 
+## Paths, tuples and closures
+
+**Qualified paths** work in type position. `a::b::C` is looked up first as the
+flattened `a_b_C` -- which is what a Crust `mod::Type` definition lowers to --
+and then as the last segment `C`, which is how a std path like
+`alloc::boxed::Box<T>` finds the bundled core type. Neither is a guess: a
+candidate is only accepted if the unit actually defines it, and otherwise the
+flattened spelling is reported so the diagnostic names what was written.
+
+**Tuples** are monomorphised on demand, exactly like slices and `Option`:
+
+```rust
+fn divmod(a: i32, b: i32) -> (i32, i32) { (a / b, a % b) }
+```
+
+```c
+struct crust_tuple_int_int { int _0; int _1; };
+```
+
+Fields are positional (`t.0`, `t.1`), reusing the naming a tuple struct
+already had, so field access needs no special case. `(T)` is a parenthesised
+type rather than a one-element tuple, and `()` remains the unit type.
+
+**Closures** are lowered by lifting, not by capture. A non-capturing closure
+becomes an ordinary static function, and the expression's value is that
+function -- which in C is a function pointer, so it can be bound, passed and
+called:
+
+```rust
+let twice = |a: i32| a * 2;
+```
+
+```c
+static int _crust_closure1(int a) { return (a * 2); }
+typedef int (*crust_fn_int_int)(int);
+...
+crust_fn_int_int twice = _crust_closure1;
+```
+
+Each distinct signature gets a typedef, generated on demand like everything
+else. **A closure that reads a local is rejected**, because Crust has no
+environment to capture into and compiling it against the wrong binding would
+be silent and wrong. Parameter types must be annotated; Crust does not infer
+them.
+
+### C keyword collisions
+
+`double`, `int`, `register` and friends are ordinary identifiers in Rust and
+keywords in C, and real Rust source uses them. Locals, parameters and loop
+variables carrying such a name are renamed with a trailing underscore on the
+way out, so the generated C parses.
+
 ## Macros
 
 Two separate things share the `name!` syntax, and Crust handles them
@@ -624,9 +679,9 @@ Where things stand on Redox (kernel + relibc + ion, 615 files):
 
 | outcome | files | |
 |---|---|---|
-| translated (most of the file lowered) | 28 | 4.6% |
+| translated (most of the file lowered) | 32 | 5.2% |
 | partial (some items lowered) | 35 | 5.7% |
-| failed (items found, translation errored) | 463 | 75.3% |
+| failed (items found, translation errored) | 459 | 74.6% |
 | empty (no Rust items recognized) | 89 | 14.5% |
 
 6355 top-level Rust items parse. With generics landed, the ranked blockers
@@ -695,6 +750,8 @@ Python, in keeping with the rest of the front end.
   two impls and a bounded generic, all statically dispatched.
 - `examples/crust/macros.rs` — the printing and assertion macros, and
   `macro_rules!` with several rules chosen by arity.
+- `examples/crust/tail.rs` — tuple returns, a qualified path to the bundled
+  `Box`, non-capturing closures, and identifiers that are C keywords.
 - `examples/crust/histogram.py` and `examples/crust/polyglot.c` — C, Rust and
   rpython in one translation unit, each calling the other two.
 - `examples/crust/tally.py` and `examples/crust/tally.c` — an rpython module
