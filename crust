@@ -1,0 +1,5 @@
+#!/usr/bin/env python3
+import shivyc.main as S
+print(S)
+res = S.main()
+if res: raise RuntimeError(res)
