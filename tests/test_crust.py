@@ -442,5 +442,234 @@ impl Vec2 {
                          ['"a.rs"'])
 
 
+class TestCrustEnums(unittest.TestCase):
+    """`enum` items and their lowering."""
+
+    def test_enum_lowers_to_c_enum_with_prefixed_members(self):
+        c = crust.translate("enum Color { Red, Green, Blue }")
+        self.assertIn("enum Color { Color_Red, Color_Green, Color_Blue };", c)
+        self.assertIn("typedef enum Color Color;", c)
+
+    def test_explicit_discriminants_are_kept(self):
+        c = crust.translate("enum E { A, B = 5, C }")
+        self.assertIn("E_B = 5", c)
+
+    def test_variant_path_resolves(self):
+        c = crust.translate("enum Color { Red }\n"
+                            "fn f() -> Color { Color::Red }")
+        self.assertIn("return Color_Red;", c)
+
+    def test_c_enum_is_not_claimed(self):
+        # A C enum declaration ends in `;`; a Rust one never does.
+        src = "enum Level { LOW, HIGH = 9 };\nfn f() -> i32 { 1 }\n"
+        out = crust.translate(src)
+        self.assertIn("enum Level { LOW, HIGH = 9 };", out)
+        self.assertNotIn("Level_LOW", out)
+
+    def test_data_carrying_variant_is_rejected(self):
+        with self.assertRaises(crust.CrustError):
+            crust.translate("enum E { A(i32) }")
+
+    def test_enum_round_trip(self):
+        self.assertEqual(_run("""
+enum Color { Red, Green = 5, Blue }
+fn main() -> i32 { Color::Green as i32 }
+""", suffix=".rs"), 5)
+
+
+class TestCrustMatch(unittest.TestCase):
+    """`match` lowering to `switch`."""
+
+    def test_match_lowers_to_switch(self):
+        c = crust.translate("fn f(n: i32) -> i32 { match n "
+                            "{ 0 => 1, _ => 2 } }")
+        self.assertIn("switch (n)", c)
+        self.assertIn("case 0:", c)
+        self.assertIn("default:", c)
+
+    def test_or_patterns_become_stacked_cases(self):
+        c = crust.translate("fn f(n: i32) -> i32 { match n "
+                            "{ 1 | 2 => 1, _ => 2 } }")
+        self.assertIn("case 1: case 2:", c)
+
+    def test_arms_do_not_fall_through(self):
+        c = crust.translate("fn f(n: i32) { match n { 0 => g(), _ => h() } }")
+        self.assertEqual(c.count("break;"), 2)
+
+    def test_tail_match_arms_return(self):
+        c = crust.translate("fn f(n: i32) -> i32 { match n "
+                            "{ 0 => 7, _ => 8 } }")
+        self.assertIn("return 7;", c)
+        self.assertIn("return 8;", c)
+
+    def test_exhaustive_enum_match_needs_no_wildcard(self):
+        c = crust.translate("enum E { A, B }\n"
+                            "fn f(e: E) -> i32 { match e "
+                            "{ E::A => 1, E::B => 2 } }")
+        self.assertIn("case E_A:", c)
+
+    def test_non_exhaustive_enum_match_is_an_error(self):
+        with self.assertRaises(crust.CrustError) as cm:
+            crust.translate("enum E { A, B, C }\n"
+                            "fn f(e: E) -> i32 { match e "
+                            "{ E::A => 1, E::B => 2 } }")
+        self.assertIn("`C`", str(cm.exception))
+
+    def test_wildcard_satisfies_exhaustiveness(self):
+        c = crust.translate("enum E { A, B, C }\n"
+                            "fn f(e: E) -> i32 { match e "
+                            "{ E::A => 1, _ => 2 } }")
+        self.assertIn("default:", c)
+
+    def test_binding_pattern_is_rejected(self):
+        with self.assertRaises(crust.CrustError):
+            crust.translate("fn f(n: i32) -> i32 { match n "
+                            "{ other => other } }")
+
+    def test_match_end_to_end(self):
+        self.assertEqual(_run("""
+enum Color { Red, Green, Blue }
+fn score(c: Color) -> i32 {
+    match c {
+        Color::Red => 1,
+        Color::Green | Color::Blue => { 20 }
+    }
+}
+fn main() -> i32 { score(Color::Red) + score(Color::Blue) }
+""", suffix=".rs"), 21)
+
+
+class TestCrustConsts(unittest.TestCase):
+    """`const` and `static` items."""
+
+    def test_integer_const_lowers_to_enum_constant(self):
+        # An enum constant is a C constant expression; `static const` is not.
+        c = crust.translate("const MAX: i32 = 100;\nfn f() -> i32 { MAX }")
+        self.assertIn("enum { MAX = 100 };", c)
+
+    def test_integer_const_can_size_an_array(self):
+        self.assertEqual(_run("""
+const N: usize = 4;
+fn main() -> i32 {
+    let mut a: [i32; N] = [0; N];
+    a[3] = 42;
+    a[3]
+}
+""", suffix=".rs"), 42)
+
+    def test_non_integer_const_stays_an_object(self):
+        c = crust.translate("const K: f64 = 1.5;\nfn f() -> f64 { K }")
+        self.assertIn("static const double K = 1.5;", c)
+
+    def test_array_literal(self):
+        self.assertEqual(_run("""
+fn main() -> i32 {
+    let a: [i32; 3] = [10, 15, 17];
+    a[0] + a[1] + a[2]
+}
+""", suffix=".rs"), 42)
+
+    def test_nonzero_repeat_initializer_is_rejected(self):
+        with self.assertRaises(crust.CrustError):
+            crust.translate("fn f() { let a: [i32; 3] = [7; 3]; }")
+
+    def test_static_mut_lowers_to_static(self):
+        c = crust.translate("static mut N: i64 = 0;\nfn f() -> i64 { N }")
+        self.assertIn("static long N = 0;", c)
+
+    def test_c_const_is_not_claimed(self):
+        src = "const int MAX = 100;\nfn f() -> i32 { 1 }\n"
+        out = crust.translate(src)
+        self.assertIn("const int MAX = 100;", out)
+        self.assertNotIn("static const int MAX", out)
+
+    def test_const_is_usable_before_its_definition(self):
+        self.assertEqual(_run("""
+fn main() -> i32 { LIMIT / 2 }
+const LIMIT: i32 = 84;
+""", suffix=".rs"), 42)
+
+    def test_local_const(self):
+        self.assertEqual(_run(
+            "fn main() -> i32 { const K: i32 = 9; K }", suffix=".rs"), 9)
+
+
+class TestCrustTupleStructs(unittest.TestCase):
+    """Tuple structs and positional field access."""
+
+    def test_fields_are_named_positionally(self):
+        c = crust.translate("struct Wrap(i32, f64);")
+        self.assertIn("struct Wrap { int _0; double _1; };", c)
+
+    def test_construction_and_access(self):
+        c = crust.translate("struct W(i32);\n"
+                            "fn f() -> i32 { let w: W = W(5); w.0 }")
+        self.assertIn("(W){._0 = 5}", c)
+        self.assertIn("return w._0;", c)
+
+    def test_wrong_arity_is_an_error(self):
+        with self.assertRaises(crust.CrustError):
+            crust.translate("struct W(i32, i32);\nfn f() { let w = W(1); }")
+
+    def test_tuple_struct_end_to_end(self):
+        self.assertEqual(_run("""
+struct Pair(i32, i32);
+fn sum(p: Pair) -> i32 { p.0 + p.1 }
+fn main() -> i32 { sum(Pair(17, 25)) }
+""", suffix=".rs"), 42)
+
+
+class TestCrustIfExpression(unittest.TestCase):
+    """`if` in expression position."""
+
+    def test_if_expression_becomes_ternary(self):
+        c = crust.translate("fn f(b: bool) -> i32 { let v: i32 = "
+                            "if b { 1 } else { 2 }; v }")
+        self.assertIn("? 1 : 2", c)
+
+    def test_else_if_chain(self):
+        c = crust.translate("fn f(n: i32) -> i32 { let v: i32 = "
+                            "if n < 0 { 1 } else if n == 0 { 2 } "
+                            "else { 3 }; v }")
+        self.assertEqual(c.count("?"), 2)
+
+    def test_missing_else_is_an_error(self):
+        with self.assertRaises(crust.CrustError):
+            crust.translate("fn f(b: bool) -> i32 "
+                            "{ let v: i32 = if b { 1 }; v }")
+
+    def test_statements_in_arm_are_an_error(self):
+        with self.assertRaises(crust.CrustError):
+            crust.translate("fn f(b: bool) -> i32 { let v: i32 = "
+                            "if b { let q: i32 = 1; q } else { 2 }; v }")
+
+    def test_if_statement_still_works(self):
+        # A bare `if` as a statement must not be treated as an expression.
+        c = crust.translate("fn f(b: bool) { if b { g(); } }")
+        self.assertIn("if (b)", c)
+        self.assertNotIn("?", c)
+
+    def test_if_expression_end_to_end(self):
+        self.assertEqual(_run("""
+fn pick(n: i32) -> i32 { if n > 0 { n * 2 } else { 0 } }
+fn main() -> i32 { pick(21) + pick(-5) }
+""", suffix=".rs"), 42)
+
+
+class TestEnumLiteralSpotRegression(unittest.TestCase):
+    """Backend fix: a symbolic literal must not be range-compared as an int.
+
+    Storing an enum constant into a struct member crashed the register
+    allocator with a TypeError. This is plain C and independent of Crust.
+    """
+
+    def test_enum_constant_stored_to_struct_member(self):
+        self.assertEqual(_run(
+            "enum Level { LOW, HIGH = 9 };\n"
+            "struct P { int x; };\n"
+            "int main(void) { struct P p; p.x = HIGH; return p.x - 9; }\n"),
+            0)
+
+
 if __name__ == "__main__":
     unittest.main()
