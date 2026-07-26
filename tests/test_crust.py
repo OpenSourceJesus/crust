@@ -1333,3 +1333,95 @@ fn main() -> i32 { pick() }
     def test_unsafe_fn_still_parses(self):
         c = crust.translate("unsafe fn f(a: i32) -> i32 { a }")
         self.assertIn("int f(int a)", c)
+
+
+class TestCrustGenerics(unittest.TestCase):
+    """Generics, monomorphised like Option/Result rather than boxed."""
+
+    def test_generic_fn_infers_from_arguments(self):
+        self.assertEqual(_run("""
+fn id<T>(x: T) -> T { x }
+fn main() -> i32 { id(42) }
+""", suffix=".rs"), 42)
+
+    def test_turbofish_selects_the_instantiation(self):
+        c = crust.translate("fn id<T>(x: T) -> T { x }\n"
+                            "fn f() -> i32 { id::<i32>(1) }")
+        self.assertIn("id_int", c)
+
+    def test_one_instantiation_per_type(self):
+        c = crust.translate("""
+fn id<T>(x: T) -> T { x }
+fn f() -> i32 { id(1) }
+fn g() -> f64 { id(1.0) }
+fn h() -> i32 { id(2) }
+""")
+        self.assertIn("int id_int(int x)", c)
+        self.assertIn("double id_double(double x)", c)
+        # `id(1)` and `id(2)` share one instantiation.
+        self.assertEqual(c.count("int id_int(int x)"), 1)
+
+    def test_unused_generic_emits_nothing(self):
+        c = crust.translate("fn unused<T>(x: T) -> T { x }\n"
+                            "fn f() -> i32 { 1 }")
+        self.assertNotIn("unused", c)
+
+    def test_generic_struct_and_impl(self):
+        self.assertEqual(_run("""
+struct Pair<T> { a: T, b: T }
+impl<T> Pair<T> {
+    fn sum(&self) -> T { self.a + self.b }
+}
+fn main() -> i32 {
+    let p: Pair<i32> = Pair { a: 40, b: 2 };
+    p.sum()
+}
+""", suffix=".rs"), 42)
+
+    def test_two_instantiations_are_distinct_types(self):
+        c = crust.translate("""
+struct Wrap<T> { v: T }
+fn f() { let a: Wrap<i32> = Wrap { v: 1 }; let b: Wrap<f64> = Wrap { v: 1.0 }; }
+""")
+        self.assertIn("struct Wrap_int { int v; }", c)
+        self.assertIn("struct Wrap_double { double v; }", c)
+
+    def test_generic_struct_stays_a_plain_c_struct(self):
+        # The point of monomorphising rather than boxing: an instantiation is
+        # an ordinary struct C can build and pass with no conversion.
+        c = crust.translate("struct Wrap<T> { v: T }\n"
+                            "fn f() { let a: Wrap<i32> = Wrap { v: 1 }; }")
+        self.assertNotIn("obj", c)
+        self.assertIn("struct Wrap_int { int v; };", c)
+
+    def test_associated_fn_via_turbofish(self):
+        self.assertEqual(_run("""
+struct Box2<T> { a: T, b: T }
+impl<T> Box2<T> {
+    fn make(a: T, b: T) -> Box2<T> { Box2 { a: a, b: b } }
+    fn total(&self) -> T { self.a + self.b }
+}
+fn main() -> i32 {
+    let p: Box2<i32> = Box2::<i32>::make(20, 22);
+    p.total()
+}
+""", suffix=".rs"), 42)
+
+    def test_uninferable_type_argument_is_rejected(self):
+        with self.assertRaises(crust.CrustError):
+            crust.translate("fn make<T>() -> T { 0 }\nfn f() { make(); }")
+
+    def test_ambiguous_generic_literal_is_rejected(self):
+        with self.assertRaises(crust.CrustError):
+            crust.translate("struct W<T> { v: T }\nfn f() { let x = W { v: 1 }; }")
+
+    def test_unknown_generic_names_the_problem(self):
+        # Redox is full of these: a generic Crust has no source for.
+        with self.assertRaises(crust.CrustError) as cm:
+            crust.translate("fn f(v: Vec<i32>) -> i32 { 0 }")
+        self.assertIn("no definition for generic type", str(cm.exception))
+
+    def test_wrong_arity_is_rejected(self):
+        with self.assertRaises(crust.CrustError):
+            crust.translate("struct P<T> { v: T }\n"
+                            "fn f() { let x: P<i32, i32> = P { v: 1 }; }")
