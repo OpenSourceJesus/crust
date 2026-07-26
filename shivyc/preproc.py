@@ -510,6 +510,16 @@ class _Preprocessor:
                 return
         try:
             text, filename = read_file(header, this_file)
+            if filename.endswith(".rs"):
+                # A Rust header: lower it to C before lexing. Crust preserves
+                # line numbers, so diagnostics still point into the .rs file.
+                import shivyc.crust as crust
+                try:
+                    text = crust.translate(text, path=filename)
+                except crust.CrustError as e:
+                    error_collector.add(CompilerError(
+                        "crust: %s" % e, rest[0].r))
+                    return
             inc = lexer.tokenize(text, filename)
             out.extend(process(inc, filename, self.macros))
         except IOError:

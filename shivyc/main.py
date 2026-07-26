@@ -291,6 +291,8 @@ def process_file(file, args):
         return process_c_file(file, args)
     elif file[-3:] == ".py":
         return process_py_file(file, args)
+    elif file[-3:] == ".rs":
+        return process_c_file(file, args)
     elif file[-2:] == ".o":
         return file
     else:
@@ -527,6 +529,15 @@ def process_c_file(file, args):
     """Compile a C file into an object file and return the object file name."""
     code = read_file(file)
     if not error_collector.ok():
+        return None
+
+    # Crust front end: expand `#include "*.rs"` and lower any top-level
+    # Rust-syntax items to C before the C lexer sees the source.
+    import shivyc.crust as crust
+    try:
+        code = crust.translate(code, path=file)
+    except crust.CrustError as e:
+        error_collector.add(CompilerError("crust: %s" % e))
         return None
 
     # Language-extension pre-pass: recognize __stackless__/__metamorphic__
