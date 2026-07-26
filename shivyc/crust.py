@@ -38,6 +38,15 @@ class CrustError(Exception):
 # Type mapping
 # --------------------------------------------------------------------------
 
+_FFI_PRIMITIVES = {
+    "c_char": "char", "c_schar": "signed char", "c_uchar": "unsigned char",
+    "c_short": "short", "c_ushort": "unsigned short",
+    "c_int": "int", "c_uint": "unsigned int",
+    "c_long": "long", "c_ulong": "unsigned long",
+    "c_longlong": "long long", "c_ulonglong": "unsigned long long",
+    "c_float": "float", "c_double": "double", "c_void": "void",
+}
+
 PRIMITIVES = {
     "i8": "signed char",
     "i16": "short",
@@ -56,6 +65,10 @@ PRIMITIVES = {
     "char": "unsigned int",
     "()": "void",
 }
+
+# `core::ffi` names the C types exactly, so the mapping is not an
+# approximation -- real FFI-facing Rust is full of them.
+PRIMITIVES.update(_FFI_PRIMITIVES)
 
 
 class CType:
@@ -3047,6 +3060,20 @@ def _match_brace(scan, open_idx):
     return None
 
 
+# Item-level declarations that exist only for Rust's module system and have
+# no C counterpart at all. They are *erased*, not translated: `use` brings a
+# name into scope, and Crust resolves names by flattening paths instead, so by
+# the time the C lexer runs there is nothing for a `use` to do.
+#
+# This was invisible for a long time because these translate cleanly -- Crust
+# passes unrecognized text through byte-for-byte, so `use core::mem;` survives
+# translation intact and only fails later, in the C front end. Anything that
+# measures `translate()` alone will not see it.
+_ERASED_ITEM = re.compile(
+    r"^[ \t]*(?:pub(?:\s*\([^)]*\))?\s+)?"
+    r"(?:use|extern\s+crate)\b"
+    r"(?:[^;{]|\{[^{}]*\})*;[ \t]*$", re.M | re.S)
+
 _MACRO_RULES = re.compile(r"\bmacro_rules!\s*(?P<name>[A-Za-z_]\w*)\s*\{")
 
 
@@ -3641,6 +3668,13 @@ def _render_struct(name, fields):
     return "struct %s { %s };" % (name, body)
 
 
+def erase_module_items(code):
+    """Blank `use` / `extern crate` lines, preserving every line number."""
+    def blank(m):
+        return " " * (m.end() - m.start())
+    return _ERASED_ITEM.sub(blank, code)
+
+
 def translate(code, path=None):
     """Lower every top-level Rust item in `code` to C.
 
@@ -3648,6 +3682,7 @@ def translate(code, path=None):
     numbers are preserved throughout, so diagnostics from later compiler
     passes still point at the original source lines.
     """
+    code = erase_module_items(code)
     spans = find_rust_items(
         code, rust_file=bool(path) and path.endswith(".rs"))
     included = collect_include_items(code, path)
