@@ -302,6 +302,11 @@ class Expr:
         self.type = type_
 
 
+def _mangle(ty):
+    """Turn a C type into an identifier fragment for a generated struct."""
+    return re.sub(r"\W+", "_", ty.decl()).strip("_")
+
+
 class MethodInfo:
     """A lowered `impl` method: how it is named and how it takes `self`."""
 
@@ -335,7 +340,20 @@ class Unit:
         self.needs = set()      # libc prototypes the lowering requires
         self.slices = {}        # slice struct name -> element CType
         self.options = {}       # Option struct name -> element CType
-        self.unwraps = set()    # option types needing an unwrap helper
+        self.results = {}       # Result struct name -> (ok, err) CTypes
+        self.unwraps = set()    # generated types needing unwrap helpers
+
+    def result_type(self, ok, err):
+        """Return (and register) the tagged struct for `Result<ok, err>`."""
+        name = "crust_result_%s_e_%s" % (_mangle(ok), _mangle(err))
+        if name not in self.results:
+            self.results[name] = (ok, err)
+            fields = [("ok", CType("_Bool"))]
+            if not ok.is_void():
+                fields.append(("value", ok))
+            fields.append(("error", err))
+            self.structs[name] = fields
+        return CType(name)
 
     def option_type(self, elem):
         """Return (and register) the tagged struct for `Option<elem>`.
@@ -343,7 +361,7 @@ class Unit:
         Crust has no generics, so each instantiation is monomorphised into
         its own struct, generated on demand exactly like a slice.
         """
-        name = "crust_option_" + re.sub(r"\W+", "_", elem.decl()).strip("_")
+        name = "crust_option_" + _mangle(elem)
         if name not in self.options:
             self.options[name] = elem
             self.structs[name] = [("some", CType("_Bool")),
@@ -352,7 +370,7 @@ class Unit:
 
     def slice_type(self, elem):
         """Return (and register) the fat-pointer struct type for `&[elem]`."""
-        name = "crust_slice_" + re.sub(r"\W+", "_", elem.decl()).strip("_")
+        name = "crust_slice_" + _mangle(elem)
         if name not in self.slices:
             self.slices[name] = elem
             self.structs[name] = [("ptr", CType(elem.base, elem.ptr + 1)),
@@ -379,6 +397,7 @@ class Parser:
         self.behind_ref = 0             # >0 while parsing the pointee of `&`
         self.expected = []              # target types, for inferring `None`
         self.tmp_n = 0                  # counter for generated temporaries
+        self.pending = []               # statements hoisted out of `?`
 
     # -- token helpers ----------------------------------------------------
 
@@ -506,6 +525,15 @@ class Parser:
                 if name == "str" and not self.behind_ref:
                     self.err("`str` is unsized; write `&str`")
                 return CType(PRIMITIVES[name])
+            if name == "Result":
+                self.expect("<")
+                ok = self.parse_type()
+                self.expect(",")
+                err = self.parse_type()
+                self.expect_gt()
+                if err.is_void():
+                    self.err("`Result<_, ()>` is not supported")
+                return self.unit.result_type(ok, err)
             if name == "Option":
                 self.expect("<")
                 elem = self.parse_type()
@@ -626,6 +654,9 @@ class Parser:
                 if e.code == "Some":
                     e = self.parse_some()
                     continue
+                if e.code in ("Ok", "Err"):
+                    e = self.parse_result_ctor(e.code)
+                    continue
                 params = self.fn_sigs.get(e.code, (None, []))[1] or []
                 args = []
                 while not self.at(")", "punc"):
@@ -650,6 +681,9 @@ class Parser:
                     continue
                 self.expect("]")
                 e = self.index(e, lo)
+            elif self.at("?", "punc"):
+                self.next()
+                e = self.try_operator(e)
             elif self.at(".", "punc"):
                 self.next()
                 if self.cur.kind == "num":      # tuple field: `p.0`
@@ -678,6 +712,105 @@ class Parser:
                      "target (`let x: Option<i32> = ...`)")
         opt = self.unit.option_type(elem)
         return Expr("(%s){1, %s}" % (opt.base, inner.code), opt)
+
+    def try_operator(self, e):
+        """Lower the `?` operator to a hoisted test and an early return.
+
+        `?` is an expression in Rust but needs a statement in C, so the
+        temporary and the early return are queued as pending statements and
+        emitted just before the statement that contains them. The expression
+        itself becomes a read of the temporary's payload.
+        """
+        if e.type is None:
+            self.err("`?` needs a `Result` or `Option`; the operand's type "
+                     "could not be inferred")
+        src = e.type.base
+        ret = self.ret_type
+        tmp = self.new_temp()
+        self.pending.append("%s = %s;" % (e.type.decl(tmp), e.code))
+
+        if src in self.unit.results:
+            ok, err = self.unit.results[src]
+            if ret.base not in self.unit.results:
+                self.err("`?` on a `Result` needs the enclosing function to "
+                         "return a `Result`")
+            _, ret_err = self.unit.results[ret.base]
+            if ret_err.decl() != err.decl():
+                self.err("`?` cannot convert error type `%s` to `%s`; Crust "
+                         "has no `From` conversions", err.decl(),
+                         ret_err.decl())
+            self.pending.append(
+                "if (!%s.ok) return (%s){.ok = 0, .error = %s.error};"
+                % (tmp, ret.base, tmp))
+            if ok.is_void():
+                return Expr("(void)0", VOID)
+            return Expr("%s.value" % tmp, ok)
+
+        if src in self.unit.options:
+            if ret.base not in self.unit.options:
+                self.err("`?` on an `Option` needs the enclosing function to "
+                         "return an `Option`")
+            self.pending.append("if (!%s.some) return (%s){0};"
+                                % (tmp, ret.base))
+            return Expr("%s.value" % tmp, self.unit.options[src])
+
+        self.err("`?` applies to `Result` and `Option`, not `%s`",
+                 e.type.decl())
+
+    def emit_pending(self, out, line, indent):
+        """Emit statements hoisted out of the expression being translated."""
+        if not self.pending:
+            return
+        for stmt in self.pending:
+            out.line_at(line, stmt, indent)
+        self.pending = []
+
+    def parse_result_ctor(self, which):
+        """Lower `Ok(x)` / `Err(e)` using the target `Result` type."""
+        want = self.target
+        if want is None or want.base not in self.unit.results:
+            # Still parse the operand so the error points at the call, not
+            # at whatever token happens to follow it.
+            self.parse_expr()
+            self.accept(")")
+            self.err("cannot infer the `Result` type of `%s`; annotate the "
+                     "target or give the function a `-> Result<..>` return "
+                     "type", which)
+        ok, err = self.unit.results[want.base]
+        if which == "Ok" and ok.is_void():
+            self.expect(")")
+            return Expr("(%s){.ok = 1}" % want.base, want)
+        inner = self.parse_expr_as(ok if which == "Ok" else err)
+        self.expect(")")
+        field = "value" if which == "Ok" else "error"
+        flag = 1 if which == "Ok" else 0
+        return Expr("(%s){.ok = %d, .%s = %s}"
+                    % (want.base, flag, field, inner.code), want)
+
+    def result_method(self, recv, name, args):
+        """Lower the supported `Result` methods."""
+        ok, err = self.unit.results[recv.type.base]
+        if name == "is_ok" and not args:
+            return Expr("%s.ok" % recv.code, CType("_Bool"))
+        if name == "is_err" and not args:
+            return Expr("(!%s.ok)" % recv.code, CType("_Bool"))
+        if name in ("unwrap", "unwrap_err") and not args:
+            if name == "unwrap" and ok.is_void():
+                self.err("`unwrap` on `Result<(), _>` yields nothing; "
+                         "test `is_ok` instead")
+            self.unit.unwraps.add(recv.type.base)
+            self.unit.needs.add("abort")
+            return Expr("%s_%s(%s)" % (recv.type.base, name, recv.code),
+                        ok if name == "unwrap" else err)
+        if name == "unwrap_or" and len(args) == 1:
+            return Expr("(%s.ok ? %s.value : %s)"
+                        % (recv.code, recv.code, args[0]), ok)
+        if name == "ok" and not args:
+            opt = self.unit.option_type(ok)
+            return Expr("(%s){%s.ok, %s.value}"
+                        % (opt.base, recv.code, recv.code), opt)
+        self.err("no method `%s` on `Result`; supported: is_ok, is_err, "
+                 "unwrap, unwrap_err, unwrap_or, ok", name)
 
     def none_expr(self):
         """Lower `None`, whose type comes from the surrounding context."""
@@ -783,6 +916,8 @@ class Parser:
                 break
         self.expect(")")
 
+        if recv.type is not None and recv.type.base in self.unit.results:
+            return self.result_method(recv, name, args)
         if recv.type is not None and recv.type.base in self.unit.options:
             return self.option_method(recv, name, args)
         if recv.type is not None and recv.type.base in self.unit.slices:
@@ -1011,6 +1146,7 @@ class Parser:
             code = ty.decl(name)
             if init is not None:
                 code += " = " + init.code
+            self.emit_pending(out, t.line, indent)
             out.line_at(t.line, code + ";", indent)
             return
 
@@ -1021,6 +1157,7 @@ class Parser:
                 return
             e = self.parse_expr_as(self.ret_type)
             self.expect(";")
+            self.emit_pending(out, t.line, indent)
             out.line_at(t.line, "return %s;" % e.code, indent)
             return
 
@@ -1049,6 +1186,7 @@ class Parser:
                 return
             self.next()
             cond = self.parse_cond()
+            self.emit_pending(out, t.line, indent)
             out.line_at(t.line, "while (%s)" % cond.code, indent)
             self.parse_block(out, indent, False)
             return
@@ -1087,11 +1225,13 @@ class Parser:
         # expression statement, or a trailing expression
         e = self.parse_expr_as(self.ret_type if tail_returns else None)
         if self.accept(";"):
+            self.emit_pending(out, t.line, indent)
             out.line_at(t.line, e.code + ";", indent)
             return
         if not self.at("}", "punc"):
             raise CrustError("line %d: expected `;` after expression"
                              % self.cur.line)
+        self.emit_pending(out, t.line, indent)
         if tail_returns and not self.ret_type.is_void():
             out.line_at(t.line, "return %s;" % e.code, indent)
         else:
@@ -1100,6 +1240,7 @@ class Parser:
     def parse_if(self, out, indent, tail_returns):
         t = self.expect("if")
         cond = self.parse_cond()
+        self.emit_pending(out, t.line, indent)
         out.line_at(t.line, "if (%s)" % cond.code, indent)
         self.parse_block(out, indent, tail_returns)
         if self.accept("else"):
@@ -1216,6 +1357,7 @@ class Parser:
         """
         t = self.expect("match")
         scrutinee = self.parse_cond()
+        self.emit_pending(out, t.line, indent)
         out.line_at(t.line, "switch (%s)" % scrutinee.code, indent)
         open_tok = self.expect("{")
         out.line_at(open_tok.line, "{", indent)
@@ -2120,6 +2262,7 @@ def translate(code, path=None):
     included_fns = set(unit.fn_sigs)
     included_slices = set(unit.slices)
     included_options = set(unit.options)
+    included_results = set(unit.results)
 
     def fail(exc, start):
         return CrustError("%sline %d: %s" % (where, _line_of(code, start),
@@ -2177,6 +2320,11 @@ def translate(code, path=None):
                        % (name, name, name))
     # Slice structs hold only a pointer to their element, so the forward
     # declarations above are enough even for a slice of a user struct.
+    for name in unit.results:
+        if name not in included_results:
+            prelude.append("struct %s; typedef struct %s %s; %s"
+                           % (name, name, name,
+                              _render_struct(name, unit.structs[name])))
     for name in unit.options:
         if name not in included_options:
             prelude.append("struct %s; typedef struct %s %s; %s"
@@ -2190,12 +2338,24 @@ def translate(code, path=None):
     for name in _toposort_structs(unit, local["structs"]):
         prelude.append(_render_struct(name, unit.structs[name]))
     for name in sorted(unit.unwraps):
-        if name in included_options:
-            continue
-        elem = unit.options[name]
-        prelude.append(
-            "static %s %s_unwrap(%s o) { if (!o.some) abort(); "
-            "return o.value; }" % (elem.decl(), name, name))
+        if name in unit.options:
+            if name in included_options:
+                continue
+            elem = unit.options[name]
+            prelude.append(
+                "static %s %s_unwrap(%s o) { if (!o.some) abort(); "
+                "return o.value; }" % (elem.decl(), name, name))
+        else:
+            if name in included_results:
+                continue
+            ok, err = unit.results[name]
+            if not ok.is_void():
+                prelude.append(
+                    "static %s %s_unwrap(%s r) { if (!r.ok) abort(); "
+                    "return r.value; }" % (ok.decl(), name, name))
+            prelude.append(
+                "static %s %s_unwrap_err(%s r) { if (r.ok) abort(); "
+                "return r.error; }" % (err.decl(), name, name))
     for text in _render_consts(code, spans, unit):
         prelude.append(text)
     prelude.extend(local["impl_consts"])
