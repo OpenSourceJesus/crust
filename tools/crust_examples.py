@@ -57,6 +57,13 @@ EXAMPLES = [
      "widest = 3\n"
      "len2   = 25\n", True),
 
+    ("kernel.rs", 0,
+     "tasks     = 3\n"
+     "switches  = 12\n"
+     "task0 pid = 1 (ready)\n"
+     "weight(2) = 2\n"
+     "boxed     = 42\n", True),
+
     ("generic.rs", 0,
      "Pair<i32>.sum     = 42\n"
      "Pair<i32>.largest = 40\n"
