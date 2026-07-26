@@ -200,6 +200,44 @@ def survey(results, show_blockers, top, show_files):
         print("  %4d  %s" % (n, msg[:96]))
 
 
+def verify(results, out_dir):
+    """Compile the translatable files and report how many really build.
+
+    Translating is not compiling, and the gap between them is large: text
+    Crust does not recognize is passed through byte-for-byte, so a construct
+    with no C meaning survives translation intact and only fails later, in
+    the C front end. `use core::mem;` did exactly that for a long time --
+    invisible to any measurement that stops at `translate()`.
+
+    This is the number that answers "how much of Redox can Crust compile",
+    so it is worth the extra minute it costs.
+    """
+    import tempfile
+    out_dir = out_dir or tempfile.mkdtemp(prefix="crustos_verify_")
+    os.makedirs(out_dir, exist_ok=True)
+    usable = [r for r in results
+              if r.outcome in (TRANSLATED, PARTIAL)]
+    ok, causes = 0, collections.Counter()
+    for r in usable:
+        obj = os.path.join(out_dir, os.path.basename(r.path) + ".o")
+        proc = subprocess.run(
+            [sys.executable, "-m", "shivyc.main", "-c", r.path, "-o", obj],
+            cwd=ROOT, capture_output=True, text=True)
+        if proc.returncode == 0 and os.path.exists(obj):
+            ok += 1
+        else:
+            causes[_diagnostic(proc)] += 1
+    print("\nverified by compiling:")
+    print("  %d of %d translatable files produce an object  (%.1f%% of all "
+          "%d files)" % (ok, len(usable),
+                         100.0 * ok / len(results) if results else 0,
+                         len(results)))
+    if causes:
+        print("\n  what stops the rest:")
+        for msg, n in causes.most_common(10):
+            print("    %3d  %s" % (n, msg))
+
+
 def stage(results, out_dir):
     """Copy every file with a lowered item into `out_dir`, flattened."""
     os.makedirs(out_dir, exist_ok=True)
@@ -222,6 +260,25 @@ def stage(results, out_dir):
     return n
 
 
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _diagnostic(proc):
+    """Pull the real compiler message out of a failed run.
+
+    The last line of the output is usually caret/underline decoration, so
+    taking it verbatim produces a histogram of dashes rather than of causes.
+    Prefer the first line that actually carries a diagnostic.
+    """
+    text = _ANSI.sub("", (proc.stderr or "") + (proc.stdout or ""))
+    for line in text.splitlines():
+        if "error:" in line.lower():
+            tail = line.split("error:", 1)[-1].strip()
+            return (tail or line.strip())[:90]
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    return lines[-1].strip()[:90] if lines else "?"
+
+
 def build(results, out_dir, keep_going):
     """Compile every translatable file to an object with ShivyCX."""
     os.makedirs(out_dir, exist_ok=True)
@@ -238,9 +295,8 @@ def build(results, out_dir, keep_going):
             print("  ok    %s" % os.path.relpath(r.path))
         else:
             failed += 1
-            detail = (proc.stderr or proc.stdout or "").strip().splitlines()
             print("  FAIL  %s: %s" % (os.path.relpath(r.path),
-                                      detail[-1][:80] if detail else "?"))
+                                      _diagnostic(proc)))
             if not keep_going:
                 break
     print("\nbuild: %d objects, %d failures" % (ok, failed))
@@ -254,6 +310,9 @@ def main(argv):
     ap.add_argument("roots", nargs="+", help="Redox source trees or .rs files")
     ap.add_argument("-o", "--out", default="build/crustos",
                     help="output directory for build/stage")
+    ap.add_argument("--verify", action="store_true",
+                    help="also compile each translatable file, and report "
+                         "how many actually produce an object")
     ap.add_argument("--blockers", action="store_true",
                     help="show what is stopping the failing files")
     ap.add_argument("--files", action="store_true",
@@ -272,6 +331,8 @@ def main(argv):
 
     if args.mode == "survey":
         survey(results, args.blockers, args.top, args.files)
+        if args.verify:
+            verify(results, args.out)
         return 0
     if args.mode == "stage":
         stage(results, args.out)
