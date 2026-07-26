@@ -55,6 +55,7 @@ its definition.
 | Pointers | `*const T`, `*mut T`, `&T`, `&mut T` (all lower to `T *`) |
 | Arrays | `[T; N]`, and slices `&[T]` / `&mut [T]` |
 | Option | `Option<T>`, `Some(x)`, `None`, `is_some`, `is_none`, `unwrap`, `unwrap_or`, `if let`, `while let` |
+| Result | `Result<T, E>`, `Ok(x)`, `Err(e)`, `is_ok`, `is_err`, `unwrap`, `unwrap_err`, `unwrap_or`, `ok`, and the `?` operator |
 | Statements | `let` (with `mut` and optional annotation), `return`, `if`/`else if`/`else`, `while`, `loop`, `for x in a..b` and `a..=b`, `match`, `break`, `continue`, local `const`, blocks |
 | Expressions | literals, array literals `[a, b, c]` and `[0; N]`, calls, indexing, field access, unary and binary operators, compound assignment, `as` casts, `if`/`else` as an expression |
 | Tail expressions | a trailing expression in a function body becomes its return value |
@@ -186,6 +187,44 @@ and the binding is scoped to the arm that owns it. Only the `Some(x)` pattern
 is supported — `match` on an `Option` needs pattern bindings, which Crust
 does not have.
 
+## Result and `?`
+
+`Result<T, E>` is monomorphised exactly like `Option<T>`, into a struct
+carrying the tag and both payloads:
+
+```c
+struct crust_result_int_e_Error { _Bool ok; int value; Error error; };
+```
+
+`Ok(x)` and `Err(e)` use designated initializers, so the unused payload is
+zeroed rather than left indeterminate. Both read their type from context —
+usually the enclosing function's return type — the same way `None` does.
+
+`unwrap` and `unwrap_err` generate checked helpers that abort on the wrong
+variant. `.ok()` converts a `Result<T, E>` into an `Option<T>`, generating
+that `Option` instantiation if it doesn't already exist.
+
+The `?` operator is the reason error handling stops looking like C. It's an
+*expression* in Rust but needs a *statement* in C, so Crust queues the
+temporary and the early return as pending statements and emits them just
+before the statement containing the `?`; the expression itself becomes a read
+of the temporary's payload. This means the operand is evaluated exactly once
+even in `Ok(f()? + 1)`.
+
+```rust
+let x: i32 = parse_i32(a)?;
+```
+
+```c
+crust_result_int_e_Error _crust_opt1 = parse_i32(a);
+if (!_crust_opt1.ok) return (crust_result_int_e_Error){.ok = 0, .error = _crust_opt1.error};
+int x = _crust_opt1.value;
+```
+
+`?` also works on `Option` inside a function returning `Option`. Crust has no
+`From` conversions, so the error types must match exactly; a mismatch is a
+diagnostic naming both types rather than a silent reinterpretation.
+
 ## Rust modules by `#include`
 
 `#include "foo.rs"` works from C. The hook is in the preprocessor's include
@@ -206,9 +245,10 @@ stays in place for the preprocessor to expand.
 
 ## Not yet supported
 
-Traits, generics (beyond the monomorphised `Option<T>`), closures, modules,
-`Vec`, `Result`, iterators (`for x in slice` — use `for i in 0..xs.len()`),
-lifetimes, and the borrow checker. Enums cannot carry data, `match` has no bindings, guards or range
+Traits, user-defined generics (`Option` and `Result` are the only
+monomorphised types), closures, modules, `Vec`, iterators (`for x in slice` —
+use `for i in 0..xs.len()`), `From`/`Into` conversions, lifetimes, and the
+borrow checker. Enums cannot carry data, `match` has no bindings, guards or range
 patterns, and unit structs are not recognized. Slices carry no bounds
 checking.
 Non-zero array repeat initializers (`[7; N]`) are rejected because C has no
@@ -230,6 +270,8 @@ Python, in keeping with the rest of the front end.
   building a slice itself and calling the methods.
 - `examples/crust/lookup.rs` — `Option<T>` for fallible lookup, with `if let`,
   `while let` and `unwrap_or`.
+- `examples/crust/parse.rs` — `Result<T, E>` with an error enum, the `?`
+  operator, `unwrap_err` and `.ok()`.
 
 ## Tests
 
