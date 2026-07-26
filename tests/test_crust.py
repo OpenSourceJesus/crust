@@ -569,9 +569,26 @@ fn main() -> i32 {
 }
 """, suffix=".rs"), 42)
 
-    def test_nonzero_repeat_initializer_is_rejected(self):
+    def test_nonzero_repeat_expands_to_elements(self):
+        c = crust.translate("fn f() { let a: [i32; 3] = [7; 3]; }")
+        self.assertIn("{7, 7, 7}", c)
+
+    def test_nonzero_repeat_uses_const_length(self):
+        c = crust.translate(
+            "const CAP: usize = 4;\nfn f() { let a: [i32; CAP] = [1; CAP]; }")
+        self.assertIn("{1, 1, 1, 1}", c)
+
+    def test_zero_repeat_still_zero_fills(self):
+        c = crust.translate("fn f() { let a: [i32; 64] = [0; 64]; }")
+        self.assertIn("{0}", c)
+
+    def test_nonzero_repeat_needs_a_literal_length(self):
         with self.assertRaises(crust.CrustError):
-            crust.translate("fn f() { let a: [i32; 3] = [7; 3]; }")
+            crust.translate("fn f(n: usize) { let a: [i32; 3] = [7; n]; }")
+
+    def test_absurd_repeat_length_is_rejected(self):
+        with self.assertRaises(crust.CrustError):
+            crust.translate("fn f() { let a: [i32; 99999] = [7; 99999]; }")
 
     def test_static_mut_lowers_to_static(self):
         c = crust.translate("static mut N: i64 = 0;\nfn f() -> i64 { N }")
@@ -1101,3 +1118,177 @@ class TestEnumLiteralSpotRegression(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCrustForEach(unittest.TestCase):
+    """`for x in xs` over slices and arrays."""
+
+    def test_slice_iteration_sums(self):
+        self.assertEqual(_run("""
+fn total(xs: &[i32]) -> i32 {
+    let mut s: i32 = 0;
+    for x in xs {
+        s += x;
+    }
+    s
+}
+fn main() -> i32 {
+    let a: [i32; 4] = [10, 15, 8, 9];
+    total(&a[..])
+}
+""", suffix=".rs"), 42)
+
+    def test_array_iteration_uses_its_own_length(self):
+        self.assertEqual(_run("""
+fn main() -> i32 {
+    let a: [i32; 3] = [20, 14, 8];
+    let mut s: i32 = 0;
+    for v in a {
+        s += v;
+    }
+    s
+}
+""", suffix=".rs"), 42)
+
+    def test_iter_is_accepted_as_a_no_op(self):
+        c = crust.translate(
+            "fn f(xs: &[i32]) -> i32 { let mut s: i32 = 0; "
+            "for x in xs.iter() { s += x; } s }")
+        self.assertIn("for (unsigned long", c)
+
+    def test_subject_is_evaluated_once(self):
+        # The subject is bound to a temporary, so a call in that position runs
+        # once per loop rather than once per iteration. (The prototype spells
+        # it `get(void)`, so the only `get()` left is the single call site.)
+        c = crust.translate("""
+fn get() -> &[i32] { 0 }
+fn f() { for x in get() { } }
+""")
+        self.assertEqual(c.count("get()"), 1)
+
+    def test_break_and_continue_work_inside(self):
+        self.assertEqual(_run("""
+fn main() -> i32 {
+    let a: [i32; 5] = [1, 2, 99, 3, 4];
+    let mut s: i32 = 0;
+    for v in a {
+        if v == 99 { continue; }
+        s += v;
+    }
+    s * 4
+}
+""", suffix=".rs"), 40)
+
+    def test_iterating_a_raw_pointer_is_rejected(self):
+        with self.assertRaises(crust.CrustError):
+            crust.translate("fn f(p: *const i32) { for x in p { } }")
+
+    def test_iterating_an_untypeable_expression_is_rejected(self):
+        with self.assertRaises(crust.CrustError):
+            crust.translate("fn f() { for x in nope { } }")
+
+
+class TestCrustUnitStructs(unittest.TestCase):
+    """`struct S;` -- no fields, and its own name is its value."""
+
+    def test_unit_struct_lowers_with_a_placeholder_field(self):
+        # An `impl` block is the evidence that claims `struct Marker;` as
+        # Rust rather than a C forward declaration.
+        c = crust.translate(
+            "struct Marker;\n"
+            "impl Marker { fn id(&self) -> i32 { 1 } }\n"
+            "fn f() { let m: Marker = Marker; }")
+        self.assertIn("struct Marker", c)
+        self.assertIn("(Marker){0}", c)
+
+    def test_rs_file_needs_no_impl_as_evidence(self):
+        # In an all-Rust file there is no C to be ambiguous with.
+        c = crust.translate("struct Marker;\nfn f() { let m: Marker = Marker; }",
+                            path="prog.rs")
+        self.assertIn("(Marker){0}", c)
+
+    def test_unit_struct_takes_methods(self):
+        self.assertEqual(_run("""
+struct Tag;
+impl Tag {
+    fn value(&self) -> i32 { 42 }
+}
+fn main() -> i32 {
+    let t: Tag = Tag;
+    t.value()
+}
+""", suffix=".rs"), 42)
+
+    def test_c_forward_declaration_is_not_claimed(self):
+        # `struct X;` in C declares an incomplete type; the following C must
+        # survive untouched rather than being read as a Rust unit struct.
+        src = "struct Node;\nstruct Node { int v; };\nfn f() -> i32 { 1 }\n"
+        out = crust.translate(src)
+        self.assertIn("struct Node { int v; };", out)
+
+    def test_incomplete_c_type_stays_incomplete(self):
+        # The regression that motivated the evidence rule: claiming a C
+        # forward declaration as a one-byte Rust type would make sizeof
+        # wrongly succeed on an incomplete type.
+        out = crust.translate(
+            "struct S;\nfn f() -> i32 { 1 }\n"
+            "int main(){ return sizeof(struct S); }\n")
+        self.assertNotIn("_crust_unit", out)
+
+
+class TestRpythonInclude(unittest.TestCase):
+    """`#include "foo.py"` -- rpython modules lowered by tools/py2c.py."""
+
+    KERNEL = (
+        "def triple(n: int) -> int:\n"
+        "    return n * 3\n"
+    )
+
+    def test_pure_kernel_is_callable_from_c(self):
+        self.assertEqual(_run(
+            '#include "k.py"\nint main(void) { return triple(14); }\n',
+            extra={"k.py": self.KERNEL}), 42)
+
+    def test_pure_kernel_is_callable_from_rust(self):
+        self.assertEqual(_run(
+            '#include "k.py"\n'
+            'fn go() -> i32 { triple(14) }\n'
+            'int main(void) { return go(); }\n',
+            extra={"k.py": self.KERNEL}), 42)
+
+    def test_runtime_module_links(self):
+        # Uses lists/strings, so py2c's output needs shivyc_rt.c on the link
+        # line; the include hook has to arrange that on its own.
+        mod = (
+            'def joined(n: int) -> str:\n'
+            '    parts: "list[str]" = []\n'
+            '    i = 0\n'
+            '    while i < n:\n'
+            '        parts.append("x")\n'
+            '        i += 1\n'
+            '    return ",".join(parts)\n'
+        )
+        self.assertEqual(_run(
+            '#include "m.py"\n'
+            'int main(void) { return (int)strlen(joined(4)); }\n',
+            extra={"m.py": mod}), 7)          # "x,x,x,x"
+
+    def test_cache_is_keyed_on_source_text(self):
+        import shivyc.rpyinc as rpyinc
+        a = rpyinc.cache_key("def f(n: int) -> int:\n    return n\n")
+        b = rpyinc.cache_key("def f(n: int) -> int:\n    return n + 1\n")
+        self.assertNotEqual(a, b)
+        self.assertEqual(a, rpyinc.cache_key(
+            "def f(n: int) -> int:\n    return n\n"))
+
+    def test_all_three_languages_in_one_unit(self):
+        self.assertEqual(_run(
+            '#include "k.py"\n'
+            '#include "v.rs"\n'
+            'fn combined() -> i32 { triple(Pair::sum(&Pair { a: 3, b: 5 })) }\n'
+            'int main(void) { return combined() + 18; }\n',
+            extra={"k.py": self.KERNEL,
+                   "v.rs": "struct Pair { a: i32, b: i32 }\n"
+                           "impl Pair {\n"
+                           "    fn sum(&self) -> i32 { self.a + self.b }\n"
+                           "}\n"}), 42)
