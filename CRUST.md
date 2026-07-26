@@ -51,15 +51,15 @@ its definition.
 | Area | Supported |
 |---|---|
 | Items | `fn`, `struct`, `impl`, `enum`, `const`, `static`, with optional `pub`, `unsafe`, `extern "C"`; `#[...]` attributes are skipped |
-| Types | `i8 i16 i32 i64 isize`, `u8 u16 u32 u64 usize`, `f32 f64`, `bool`, `char`, `()` |
+| Types | `i8 i16 i32 i64 isize`, `u8 u16 u32 u64 usize`, `f32 f64`, `bool`, `char`, `()`, `&str` |
 | Pointers | `*const T`, `*mut T`, `&T`, `&mut T` (all lower to `T *`) |
-| Arrays | `[T; N]` |
+| Arrays | `[T; N]`, and slices `&[T]` / `&mut [T]` |
 | Statements | `let` (with `mut` and optional annotation), `return`, `if`/`else if`/`else`, `while`, `loop`, `for x in a..b` and `a..=b`, `match`, `break`, `continue`, local `const`, blocks |
 | Expressions | literals, array literals `[a, b, c]` and `[0; N]`, calls, indexing, field access, unary and binary operators, compound assignment, `as` casts, `if`/`else` as an expression |
 | Tail expressions | a trailing expression in a function body becomes its return value |
 | Structs | field declarations, struct literals `P { x: 1 }`, field access with auto-deref, nested struct fields |
-| Methods | `&self`, `&mut self`, `self`, associated functions, `Self`, method calls `p.m()`, path calls `P::m()` |
-| Enums | C-like variants with optional discriminants, `E::V` paths, exhaustiveness-checked `match` |
+| Methods | `&self`, `&mut self`, `self`, associated functions, associated `const`s, `Self`, method calls `p.m()`, path calls `P::m()` |
+| Enums | C-like variants with optional discriminants, `E::V` paths, exhaustiveness-checked `match`, `impl` blocks |
 | Tuple structs | `struct P(T, U);`, construction `P(a, b)`, positional access `p.0` |
 
 Type mapping is the obvious one (`i32` → `int`, `u64` → `unsigned long`,
@@ -135,6 +135,31 @@ because only the former is a constant expression and so only the former can
 size an array — `let a: [i32; N]` works. Floats, pointers and `static` items
 become ordinary file-scope objects.
 
+## Strings and slices
+
+`&str` lowers to `const char *`, so a Rust function returning a string is
+directly usable from C and a literal needs no conversion. `s.len()` becomes a
+`strlen` call, and the prototype is added to the prelude only when something
+uses it. Bare `str` is rejected the way Rust rejects it — unsized, write
+`&str` — rather than silently becoming a single character.
+
+`&[T]` and `&mut [T]` lower to a generated fat-pointer struct:
+
+```c
+struct crust_slice_int { int *ptr; unsigned long len; };
+```
+
+One struct is generated per element type, named after it, and emitted only
+when used. `xs.len()` reads the `len` field, `xs[i]` indexes through `ptr`,
+and `&a[..]`, `&a[lo..]`, `&a[lo..hi]` and `&a[lo..=hi]` build one — taking
+the length from the array's own type when no end bound is given. Slicing a
+raw pointer without an end bound is an error, since its length isn't known.
+`&[T; N]` remains a reference to an array, not a slice, as in Rust.
+
+Because the representation is an ordinary C struct, **C can build and pass
+slices too** — `(crust_slice_int){data, 6}` is exactly what Crust emits — so
+the boundary stays free of conversion shims.
+
 ## Rust modules by `#include`
 
 `#include "foo.rs"` works from C. The hook is in the preprocessor's include
@@ -155,9 +180,11 @@ stays in place for the preprocessor to expand.
 
 ## Not yet supported
 
-Traits, generics, closures, modules, slices and `Vec`, `Option`/`Result`,
-lifetimes, and the borrow checker. Enums cannot carry data, `match` has no
-bindings, guards or range patterns, and unit structs are not recognized.
+Traits, generics, closures, modules, `Vec`, `Option`/`Result`, iterators
+(`for x in slice` — use `for i in 0..xs.len()`), lifetimes, and the borrow
+checker. Enums cannot carry data, `match` has no bindings, guards or range
+patterns, and unit structs are not recognized. Slices carry no bounds
+checking.
 Non-zero array repeat initializers (`[7; N]`) are rejected because C has no
 equivalent syntax. Paths (`a::b`) are flattened to `a_b`. These are the
 natural next increments — the parser is a few hundred lines of legible
@@ -173,6 +200,8 @@ Python, in keeping with the rest of the front end.
   function in the C file using the struct.
 - `examples/crust/tokens.rs` — `enum`, exhaustiveness-checked `match`, `const`,
   a tuple struct, array literals and `if` as an expression.
+- `examples/crust/stats.c` — slices, `&str` and an associated constant, with C
+  building a slice itself and calling the methods.
 
 ## Tests
 
