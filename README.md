@@ -1,3 +1,25 @@
+# Crust
+## A Unified C/Rust Compiler Environment for Systems Programming
+
+Modern systems development forces engineers to choose between two paradigms:
+- The ubiquitous simplicity and legacy ecosystem of C.
+- The type safety, spatial memory guarantees, and modern ergonomics of Rust.
+
+Today, systems that use both languages must compile them through isolated pipelines (clang/gcc and rustc) and stitch them together using dynamic (.so) or static (.a) libraries via a foreign function interface (FFI).
+
+This FFI boundary comes at a steep price:
+- Forced C ABI lowerings that strip high-level type metadata.
+- Opaque calling conventions that inhibit aggressive interprocedural optimizations (IPO) and register allocation across language boundaries.
+- Heavy, fragile Link-Time Optimization (LTO) setups that slow compile times dramatically while still missing frontend-level alias and lifetime optimizations.
+
+Crust solves this by uniting C and Rust into a single compiler frontend. By natively accepting ISO C syntax alongside a growing subset of Rust syntax, Crust enables seamless, zero-overhead cohabitation of both paradigms inside a single compilation unit.
+
+# Crust Architectural Philosophy
+Function-Level Syntax Isolation
+To prevent syntactic ambiguity and parsing complexity, Crust enforces function-level syntax boundaries. A source file contains functions written entirely in standard C syntax alongside functions written in Rust syntax.
+
+---
+
 # ShivyCX — an extended C compiler in pure Python
 
 ShivyCX is a self-hosting-oriented C compiler written in Python3. It descends
