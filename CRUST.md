@@ -66,6 +66,7 @@ its definition.
 | Tuples | tuple types `(A, B)`, tuple expressions, positional access `t.0` |
 | Closures | non-capturing `|a: T| expr`, lifted to a plain function |
 | Paths | `a::b::C` in type position |
+| Module items | `use` and `extern crate` are erased; `core::ffi::c_*` map to their C types |
 | Types | `i8 i16 i32 i64 isize`, `u8 u16 u32 u64 usize`, `f32 f64`, `bool`, `char`, `()`, `&str` |
 | Pointers | `*const T`, `*mut T`, `&T`, `&mut T` (all lower to `T *`) |
 | Arrays | `[T; N]`, and slices `&[T]` / `&mut [T]` |
@@ -464,6 +465,47 @@ generics, no generic enums, and no `where` clauses. Crust also monomorphises
 only from source it can see: a generic from `std`, `core` or another crate has
 no template to instantiate, and is reported as such rather than guessed at.
 
+## Module items, and a measurement that was lying
+
+`use` and `extern crate` exist for Rust's module system and have no C
+counterpart. Crust resolves names by flattening paths instead, so by the time
+the C lexer runs there is nothing for a `use` to do — they are **erased**,
+blanked in place so line numbers do not move. `core::ffi::c_int` and its
+siblings map to exactly the C types they name.
+
+Both are trivial. What is worth recording is why they went unnoticed for so
+long, because it is a lesson about the tooling rather than about Rust.
+
+`crust.translate` passes text it does not recognize through byte-for-byte —
+that is the whole design, and it is what lets C and Rust share a file. So
+`use core::mem;` *translated* perfectly: it came out the other side unchanged
+and only failed later, in the C front end. `tools/crustos.py survey` measures
+translation, so it reported success for every one of those files. The feature
+never appeared in any blocker ranking, and `use` appears in 94.5% of the
+corpus.
+
+Measuring compilation instead of translation changed the picture completely:
+
+| | files |
+|---|---|
+| translate (at least one lowered item) | 67 |
+| **actually compile to an object** | **33** |
+
+Erasing `use` and mapping the `c_*` types took that second number from 12 to
+33 — nearly a 3x improvement from two small changes that three rounds of
+ranking blockers by first-error frequency had never surfaced.
+
+`survey --verify` now compiles the translatable files and reports both
+numbers, along with what stops the rest. It costs about a minute and it is the
+number that actually answers "how much of Redox can Crust compile".
+
+`tools/crustdeep.py` complements it by scanning every file for *all* the
+constructs Crust cannot handle, rather than stopping at the first. It reports
+how many blockers a typical file has (mean 3.1), how many files each feature
+would unlock *on its own*, and a greedy set-cover over the real data — which is
+a far better roadmap than a frequency ranking, because a file is only unlocked
+when every one of its blockers is gone.
+
 ## Paths, tuples and closures
 
 **Qualified paths** work in type position. `a::b::C` is looked up first as the
@@ -683,6 +725,7 @@ Where things stand on Redox (kernel + relibc + ion, 615 files):
 | partial (some items lowered) | 35 | 5.7% |
 | failed (items found, translation errored) | 459 | 74.6% |
 | empty (no Rust items recognized) | 89 | 14.5% |
+| **compile to an object** (`survey --verify`) | **33** | **5.4%** |
 
 6355 top-level Rust items parse. With generics landed, the ranked blockers
 behind the 458 remaining failures are paths in type position (7.9%), `impl
