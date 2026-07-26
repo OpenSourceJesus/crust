@@ -50,15 +50,17 @@ its definition.
 
 | Area | Supported |
 |---|---|
-| Items | `fn`, `struct`, `impl`, with optional `pub`, `unsafe`, `extern "C"`; `#[...]` attributes are skipped |
+| Items | `fn`, `struct`, `impl`, `enum`, `const`, `static`, with optional `pub`, `unsafe`, `extern "C"`; `#[...]` attributes are skipped |
 | Types | `i8 i16 i32 i64 isize`, `u8 u16 u32 u64 usize`, `f32 f64`, `bool`, `char`, `()` |
 | Pointers | `*const T`, `*mut T`, `&T`, `&mut T` (all lower to `T *`) |
 | Arrays | `[T; N]` |
-| Statements | `let` (with `mut` and optional annotation), `return`, `if`/`else if`/`else`, `while`, `loop`, `for x in a..b` and `a..=b`, `break`, `continue`, blocks |
-| Expressions | literals, calls, indexing, field access, unary and binary operators, compound assignment, `as` casts |
+| Statements | `let` (with `mut` and optional annotation), `return`, `if`/`else if`/`else`, `while`, `loop`, `for x in a..b` and `a..=b`, `match`, `break`, `continue`, local `const`, blocks |
+| Expressions | literals, array literals `[a, b, c]` and `[0; N]`, calls, indexing, field access, unary and binary operators, compound assignment, `as` casts, `if`/`else` as an expression |
 | Tail expressions | a trailing expression in a function body becomes its return value |
 | Structs | field declarations, struct literals `P { x: 1 }`, field access with auto-deref, nested struct fields |
 | Methods | `&self`, `&mut self`, `self`, associated functions, `Self`, method calls `p.m()`, path calls `P::m()` |
+| Enums | C-like variants with optional discriminants, `E::V` paths, exhaustiveness-checked `match` |
+| Tuple structs | `struct P(T, U);`, construction `P(a, b)`, positional access `p.0` |
 
 Type mapping is the obvious one (`i32` → `int`, `u64` → `unsigned long`,
 `f64` → `double`, `bool` → `_Bool`, `()` → `void`). An unrecognized named type
@@ -100,6 +102,39 @@ Missing or unknown fields are reported at translation time. As in Rust, a bare
 struct literal is not parsed in condition position, so `if p.x > 0 { ... }`
 reads the brace as the start of the body.
 
+## Enums and match
+
+An `enum` lowers to a C `enum` whose members are prefixed with the type name,
+so `Color::Red` becomes `Color_Red` and the C side can use the same spelling.
+Because C and Rust spell a simple enumeration body identically, Crust
+distinguishes them by what follows the closing brace: C requires a `;` there
+and Rust forbids one. Data-carrying variants are rejected rather than
+silently mislowered.
+
+`match` lowers to a `switch`. Rust arms don't fall through, so each arm ends
+in an explicit `break`; `|` patterns become stacked `case` labels and `_`
+becomes `default`. When the scrutinee is an enum and there is no `_` arm,
+Crust checks exhaustiveness and names the variants that are missing:
+
+```
+line 2: non-exhaustive match on `E`: `C` not covered; add an arm or `_`
+```
+
+Patterns are limited to literals, enum variants, constants and `_`. A bare
+identifier would be a *binding* in Rust, and Crust has no bindings, so it is
+rejected instead of being silently treated as a comparison.
+
+## Constants
+
+`const NAME: T = expr;` and `static [mut] NAME: T = expr;` are told apart from
+their C counterparts by the type annotation, which C never writes here. Both
+are hoisted into the prelude, so a constant may be used above its definition.
+
+An integer `const` becomes a C *enum constant* rather than `static const`,
+because only the former is a constant expression and so only the former can
+size an array — `let a: [i32; N]` works. Floats, pointers and `static` items
+become ordinary file-scope objects.
+
 ## Rust modules by `#include`
 
 `#include "foo.rs"` works from C. The hook is in the preprocessor's include
@@ -120,10 +155,12 @@ stays in place for the preprocessor to expand.
 
 ## Not yet supported
 
-`enum`, traits, generics, `match`, closures, modules, slices and `Vec`,
-`Option`/`Result`, lifetimes, and the borrow checker. Tuple structs and unit
-structs are not recognized. Paths (`a::b`) are flattened to `a_b`. These are
-the natural next increments — the parser is a few hundred lines of legible
+Traits, generics, closures, modules, slices and `Vec`, `Option`/`Result`,
+lifetimes, and the borrow checker. Enums cannot carry data, `match` has no
+bindings, guards or range patterns, and unit structs are not recognized.
+Non-zero array repeat initializers (`[7; N]`) are rejected because C has no
+equivalent syntax. Paths (`a::b`) are flattened to `a_b`. These are the
+natural next increments — the parser is a few hundred lines of legible
 Python, in keeping with the rest of the front end.
 
 ## Examples
@@ -134,6 +171,8 @@ Python, in keeping with the rest of the front end.
 - `examples/crust/vec2.rs` and `examples/crust/shapes.c` — a Rust struct with
   an `impl` block, included into C, with C calling the methods and a Rust
   function in the C file using the struct.
+- `examples/crust/tokens.rs` — `enum`, exhaustiveness-checked `match`, `const`,
+  a tuple struct, array literals and `if` as an expression.
 
 ## Tests
 
