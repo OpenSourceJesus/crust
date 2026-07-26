@@ -51,6 +51,7 @@ PRIMITIVES = {
     "f32": "float",
     "f64": "double",
     "bool": "_Bool",
+    "str": "const char",
     "char": "unsigned int",
     "()": "void",
 }
@@ -331,6 +332,17 @@ class Unit:
         self.variants = {}      # mangled variant name -> enum name
         self.tuple_structs = set()   # struct names declared in tuple form
         self.consts = {}        # const/static name -> CType
+        self.needs = set()      # libc prototypes the lowering requires
+        self.slices = {}        # generated slice struct name -> element CType
+
+    def slice_type(self, elem):
+        """Return (and register) the fat-pointer struct type for `&[elem]`."""
+        name = "crust_slice_" + re.sub(r"\W+", "_", elem.decl()).strip("_")
+        if name not in self.slices:
+            self.slices[name] = elem
+            self.structs[name] = [("ptr", CType(elem.base, elem.ptr + 1)),
+                                  ("len", CType("unsigned long"))]
+        return CType(name)
 
     def field_type(self, struct_name, field):
         for fname, ftype in self.structs.get(struct_name, ()):
@@ -349,6 +361,7 @@ class Parser:
         self.ret_type = VOID
         self.impl_type = None           # enclosing `impl` type name, if any
         self.no_struct_lit = 0          # >0 while parsing a condition
+        self.behind_ref = 0             # >0 while parsing the pointee of `&`
 
     # -- token helpers ----------------------------------------------------
 
@@ -410,6 +423,21 @@ class Parser:
 
     # -- types ------------------------------------------------------------
 
+    def _is_slice_type(self):
+        """Distinguish `&[T]` (slice) from `&[T; N]` (array reference)."""
+        depth = 0
+        for j in range(self.i, len(self.toks)):
+            v = self.toks[j].val
+            if v == "[":
+                depth += 1
+            elif v == "]":
+                depth -= 1
+                if depth == 0:
+                    return True
+            elif v == ";" and depth == 1:
+                return False
+        return True
+
     def parse_type(self):
         t = self.cur
         if t.val == "(" and self.peek().val == ")":
@@ -426,7 +454,16 @@ class Parser:
         if t.val == "&":
             self.next()
             self.accept("mut")
-            inner = self.parse_type()
+            if self.at("[", "punc") and self._is_slice_type():
+                self.next()
+                elem = self.parse_type()
+                self.expect("]")
+                return self.unit.slice_type(elem)
+            self.behind_ref += 1
+            try:
+                inner = self.parse_type()
+            finally:
+                self.behind_ref -= 1
             return CType(inner.base, inner.ptr + 1)
         if t.val == "[":
             self.next()
@@ -439,6 +476,8 @@ class Parser:
         if t.kind in ("ident", "kw"):
             name = self.next().val
             if name in PRIMITIVES:
+                if name == "str" and not self.behind_ref:
+                    self.err("`str` is unsized; write `&str`")
                 return CType(PRIMITIVES[name])
             if name == "Self":
                 if self.impl_type is None:
@@ -506,6 +545,8 @@ class Parser:
             if t.val == "&":
                 self.accept("mut")
                 e = self.parse_unary()
+                if e.type is not None and e.type.base in self.unit.slices:
+                    return e            # already a fat pointer
                 return Expr("&%s" % e.code,
                             CType(e.type.base, e.type.ptr + 1)
                             if e.type else None)
@@ -541,13 +582,14 @@ class Parser:
                     e = Expr("%s(%s)" % (e.code, ", ".join(args)), ret)
             elif self.at("[", "punc"):
                 self.next()
-                idx = self.parse_expr()
+                lo = None
+                if not self.at("..", "punc"):
+                    lo = self.parse_expr()
+                if self.at("..", "punc"):
+                    e = self.parse_slicing(e, lo)
+                    continue
                 self.expect("]")
-                ty = e.type
-                if ty is not None:
-                    ty = CType(ty.base, max(ty.ptr - 1, 0),
-                               (ty.array or [None])[1:] or None)
-                e = Expr("%s[%s]" % (e.code, idx.code), ty)
+                e = self.index(e, lo)
             elif self.at(".", "punc"):
                 self.next()
                 if self.cur.kind == "num":      # tuple field: `p.0`
@@ -560,6 +602,54 @@ class Parser:
                     e = self.field_access(e, name)
             else:
                 return e
+
+    def index(self, recv, idx):
+        """Lower `recv[idx]`, reaching through a slice's data pointer."""
+        ty = recv.type
+        if ty is not None and ty.base in self.unit.slices:
+            elem = self.unit.slices[ty.base]
+            return Expr("%s.ptr[%s]" % (recv.code, idx.code), elem)
+        if ty is not None:
+            ty = CType(ty.base, max(ty.ptr - 1, 0),
+                       (ty.array or [None])[1:] or None)
+        return Expr("%s[%s]" % (recv.code, idx.code), ty)
+
+    def parse_slicing(self, recv, lo):
+        """Lower `a[..]`, `a[lo..]`, `a[lo..hi]` to a fat pointer."""
+        self.expect("..")
+        self.accept("=")                 # `..=` end bound is inclusive
+        inclusive = self.toks[self.i - 1].val == "="
+        hi = None
+        if not self.at("]", "punc"):
+            hi = self.parse_expr()
+        self.expect("]")
+
+        ty = recv.type
+        if ty is None:
+            self.err("cannot slice a value of unknown type")
+        if ty.base in self.unit.slices:
+            elem = self.unit.slices[ty.base]
+            base, total = recv.code + ".ptr", recv.code + ".len"
+        elif ty.array:
+            elem = CType(ty.base, ty.ptr)
+            base, total = recv.code, ty.array[0]
+        elif ty.ptr:
+            elem = CType(ty.base, ty.ptr - 1)
+            base, total = recv.code, None
+        else:
+            self.err("`%s` cannot be sliced", ty.decl())
+
+        if hi is None and total is None:
+            self.err("slicing a raw pointer needs an end bound, as its "
+                     "length is not known")
+        end = total if hi is None else hi.code
+        if inclusive:
+            end = "(%s) + 1" % end
+        start = "0" if lo is None else lo.code
+        ptr = base if lo is None else "%s + %s" % (base, start)
+        length = end if lo is None else "(%s) - (%s)" % (end, start)
+        slice_ty = self.unit.slice_type(elem)
+        return Expr("(%s){%s, %s}" % (slice_ty.base, ptr, length), slice_ty)
 
     def field_access(self, recv, field):
         """Lower `recv.field`, auto-dereferencing a pointer receiver.
@@ -592,6 +682,21 @@ class Parser:
                 break
         self.expect(")")
 
+        if recv.type is not None and recv.type.base in self.unit.slices:
+            if name == "len":
+                return Expr("%s.len" % recv.code, CType("unsigned long"))
+            if name == "as_ptr":
+                return Expr("%s.ptr" % recv.code,
+                            CType(self.unit.slices[recv.type.base].base,
+                                  self.unit.slices[recv.type.base].ptr + 1))
+            self.err("no method `%s` on a slice", name)
+        if recv.type is not None and recv.type.ptr == 1 \
+                and recv.type.base == "const char" and name == "len":
+            # `&str` is a plain C string here, so its length is strlen.
+            if args:
+                self.err("`str::len` takes no arguments")
+            self.unit.needs.add("strlen")
+            return Expr("strlen(%s)" % recv.code, CType("unsigned long"))
         if recv.type is None:
             self.err("cannot infer the type of the receiver of `.%s()`; "
                      "annotate it", name)
@@ -711,7 +816,7 @@ class Parser:
         if t.kind == "num":
             return Expr(*normalize_number(t))
         if t.kind == "str":
-            return Expr(t.val, CType("char", 1))
+            return Expr(t.val, CType("const char", 1))
         if t.kind == "chr":
             return Expr(t.val, CType("int"))
         if t.val == "true":
@@ -1134,6 +1239,15 @@ class Parser:
             self.err("tuple struct `%s` needs at least one field", name)
         return name, fields
 
+    def is_assoc_const(self):
+        """True if an `impl` body item is `const NAME: T = ...;`."""
+        j = self.i
+        while self.toks[j].val in ("pub", "#"):
+            if self.toks[j].val == "#":
+                return False                     # attribute; let the parser
+            j += 1                               # handle it normally
+        return self.toks[j].val == "const" and self.toks[j].kind == "kw"
+
     def parse_impl_header(self):
         """Parse `impl Name {`, returning the type name."""
         self.skip_attributes()
@@ -1208,6 +1322,9 @@ class Parser:
         while not self.at("}", "punc"):
             if self.cur.kind == "eof":
                 self.err("unterminated impl block")
+            if self.is_assoc_const():
+                self.parse_const_signature()     # hoisted into the prelude
+                continue
             start, info = self.parse_method_signature(owner)
             params = list(info.params)
             if info.self_kind == "ref":
@@ -1575,7 +1692,7 @@ def collect_items(code, spans, unit, struct_order, fail=None):
     so that a later pass can resolve calls, methods and field types
     regardless of the order things are defined in.
     """
-    local = {"structs": [], "enums": [], "consts": []}
+    local = {"structs": [], "enums": [], "consts": [], "impl_consts": []}
     for start, end, kind in spans:
         p = Parser(tokenize(code[start:end], _line_of(code, start)), unit)
         try:
@@ -1607,6 +1724,13 @@ def collect_items(code, spans, unit, struct_order, fail=None):
                 owner = p.parse_impl_header()
                 p.impl_type = owner
                 while not p.at("}", "punc") and p.cur.kind != "eof":
+                    if p.is_assoc_const():
+                        kw, cname, cty, cinit = p.parse_const_signature()
+                        mangled = "%s_%s" % (owner, cname)
+                        unit.consts[mangled] = cty
+                        local["impl_consts"].append(
+                            _render_const(kw, mangled, cty, cinit.code))
+                        continue
                     _, info = p.parse_method_signature(owner)
                     unit.methods[(owner, info.name)] = info
                     selfp = []
@@ -1748,6 +1872,14 @@ def _render_enum(name, variants):
         name, ", ".join(parts), name, name)
 
 
+def _render_const(kw, name, ty, init):
+    """Render one `const`/`static` as a C file-scope declaration."""
+    if kw == "const" and _fits_c_enum(ty, init):
+        return "enum { %s = %s };" % (name, init)
+    prefix = "static const " if kw == "const" else "static "
+    return "%s%s = %s;" % (prefix, ty.decl(name), init)
+
+
 def _render_consts(code, spans, unit):
     """Render `const`/`static` items, hoisted so order does not matter.
 
@@ -1763,11 +1895,7 @@ def _render_consts(code, spans, unit):
             continue
         p = Parser(tokenize(code[start:end], _line_of(code, start)), unit)
         kw, name, ty, init = p.parse_const_signature()
-        if kw == "const" and _fits_c_enum(ty, init.code):
-            out.append("enum { %s = %s };" % (name, init.code))
-            continue
-        prefix = "static const " if kw == "const" else "static "
-        out.append("%s%s = %s;" % (prefix, ty.decl(name), init.code))
+        out.append(_render_const(kw, name, ty, init.code))
     return out
 
 
@@ -1806,6 +1934,7 @@ def translate(code, path=None):
     where = ("%s: " % path) if path else ""
     unit, struct_order = included
     included_fns = set(unit.fn_sigs)
+    included_slices = set(unit.slices)
 
     def fail(exc, start):
         return CrustError("%sline %d: %s" % (where, _line_of(code, start),
@@ -1852,15 +1981,25 @@ def translate(code, path=None):
     # incomplete-type forward declarations, then full struct definitions in
     # dependency order, then function prototypes that may use either.
     prelude = []
+    if "strlen" in unit.needs:
+        prelude.append("unsigned long strlen(const char *);")
     for name in local["enums"]:
         prelude.append(_render_enum(name, unit.enums[name]))
     for name in local["structs"]:
         prelude.append("struct %s; typedef struct %s %s;"
                        % (name, name, name))
+    # Slice structs hold only a pointer to their element, so the forward
+    # declarations above are enough even for a slice of a user struct.
+    for name in unit.slices:
+        if name not in included_slices:
+            prelude.append("struct %s; typedef struct %s %s; %s"
+                           % (name, name, name,
+                              _render_struct(name, unit.structs[name])))
     for name in _toposort_structs(unit, local["structs"]):
         prelude.append(_render_struct(name, unit.structs[name]))
     for text in _render_consts(code, spans, unit):
         prelude.append(text)
+    prelude.extend(local["impl_consts"])
     for name, (ret, ps) in unit.fn_sigs.items():
         if name == "main" or name in included_fns:
             continue
