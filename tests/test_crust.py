@@ -1718,3 +1718,64 @@ fn main() -> i32 {
     t * 2
 }
 """, suffix=".rs"), 42)
+
+
+class TestCrustModuleItems(unittest.TestCase):
+    """`use` / `extern crate` erasure, and the `core::ffi` types.
+
+    These matter out of proportion to their size: they translate cleanly (the
+    text passes through untouched) and only fail later in the C front end, so
+    any measurement that stops at `translate()` never sees them.
+    """
+
+    def test_use_is_erased(self):
+        c = crust.translate("use core::mem;\nfn f() -> i32 { 1 }")
+        self.assertNotIn("use core", c)
+
+    def test_use_with_a_brace_group_is_erased(self):
+        c = crust.translate("use core::ffi::{c_int, c_char};\n"
+                            "fn f() -> i32 { 1 }")
+        self.assertNotIn("use core", c)
+
+    def test_pub_use_is_erased(self):
+        c = crust.translate("pub use self::inner::Thing;\n"
+                            "fn f() -> i32 { 1 }")
+        self.assertNotIn("use self", c)
+
+    def test_extern_crate_is_erased(self):
+        c = crust.translate("extern crate alloc;\nfn f() -> i32 { 1 }")
+        self.assertNotIn("extern crate", c)
+
+    def test_erasure_preserves_line_numbers(self):
+        # Erasure blanks in place rather than deleting, so a diagnostic still
+        # points at the line the user wrote.
+        c = crust.translate("use core::mem;\nuse core::ptr;\n"
+                            "fn f() -> i32 { 1 }")
+        lines = c.split("\n")
+        self.assertIn("int f(void) { return 1; }", lines[2])
+
+    def test_use_compiles_end_to_end(self):
+        self.assertEqual(_run("""
+use core::mem;
+use core::ffi::{c_int, c_char};
+fn main() -> i32 { 42 }
+""", suffix=".rs"), 42)
+
+    def test_ffi_types_map_to_c(self):
+        c = crust.translate("fn f(a: c_int, b: c_ulong, s: *const c_char) "
+                            "-> c_int { a }")
+        self.assertIn("int f(int a, unsigned long b, char *s)", c)
+
+    def test_ffi_types_run(self):
+        self.assertEqual(_run("""
+use core::ffi::c_int;
+fn add(a: c_int, b: c_int) -> c_int { a + b }
+fn main() -> i32 { add(40, 2) }
+""", suffix=".rs"), 42)
+
+    def test_use_in_a_c_file_is_untouched(self):
+        # `use` is not a C keyword, so a C identifier called `use` must
+        # survive: erasure only applies to a whole `use ...;` item line.
+        c = crust.translate("int use_count(int use) { return use; }\n"
+                            "fn f() -> i32 { 1 }")
+        self.assertIn("int use_count(int use)", c)
