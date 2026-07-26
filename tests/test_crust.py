@@ -949,6 +949,141 @@ fn main() -> i32 {
 """, suffix=".rs"), 6)
 
 
+class TestCrustResult(unittest.TestCase):
+    """`Result<T, E>`, monomorphised like `Option<T>`."""
+
+    BASE = """
+enum Error { Overflow, Negative }
+fn nonneg(n: i32) -> Result<i32, Error> {
+    if n < 0 { Err(Error::Negative) } else { Ok(n) }
+}
+"""
+
+    def test_result_struct_is_generated(self):
+        c = crust.translate("fn f() -> Result<i32, i32> { Ok(1) }")
+        self.assertIn("_Bool ok; int value; int error;", c)
+
+    def test_distinct_instantiations_are_distinct_structs(self):
+        c = crust.translate("fn f() -> Result<i32, i32> { Ok(1) }\n"
+                            "fn g() -> Result<f64, i32> { Ok(1.0) }")
+        self.assertIn("crust_result_int_e_int", c)
+        self.assertIn("crust_result_double_e_int", c)
+
+    def test_ok_and_err_use_designated_initializers(self):
+        c = crust.translate("fn f(n: i32) -> Result<i32, i32> "
+                            "{ if n > 0 { Ok(n) } else { Err(9) } }")
+        self.assertIn(".ok = 1, .value = n", c)
+        self.assertIn(".ok = 0, .error = 9", c)
+
+    def test_ok_without_context_is_an_error(self):
+        with self.assertRaises(crust.CrustError):
+            crust.translate("fn f() { let x = Ok(1); }")
+
+    def test_is_ok_and_is_err(self):
+        c = crust.translate("fn f(r: Result<i32, i32>) -> bool "
+                            "{ r.is_err() }")
+        self.assertIn("(!r.ok)", c)
+
+    def test_unwrap_and_unwrap_err_emit_checked_helpers(self):
+        c = crust.translate("fn f(r: Result<i32, i32>) -> i32 "
+                            "{ r.unwrap() + r.unwrap_err() }")
+        self.assertIn("if (!r.ok) abort();", c)
+        self.assertIn("if (r.ok) abort();", c)
+
+    def test_ok_converts_to_option(self):
+        c = crust.translate("fn f(r: Result<i32, i32>) -> Option<i32> "
+                            "{ r.ok() }")
+        self.assertIn("crust_option_int", c)
+
+    def test_unknown_result_method_is_an_error(self):
+        with self.assertRaises(crust.CrustError):
+            crust.translate("fn f(r: Result<i32, i32>) { r.expect(); }")
+
+    def test_result_end_to_end(self):
+        self.assertEqual(_run(self.BASE + """
+fn main() -> i32 {
+    let good: Result<i32, Error> = nonneg(40);
+    let bad: Result<i32, Error> = nonneg(-1);
+    let mut t: i32 = good.unwrap();
+    if bad.is_err() { t += 2; }
+    t
+}
+""", suffix=".rs"), 42)
+
+
+class TestCrustTryOperator(unittest.TestCase):
+    """The `?` operator."""
+
+    BASE = TestCrustResult.BASE
+
+    def test_try_hoists_a_test_and_early_return(self):
+        c = crust.translate(self.BASE + """
+fn f(n: i32) -> Result<i32, Error> { let v: i32 = nonneg(n)?; Ok(v) }
+""")
+        self.assertIn("if (!", c)
+        self.assertIn(".ok) return", c)
+
+    def test_subject_is_evaluated_once(self):
+        c = crust.translate(self.BASE + """
+fn f(n: i32) -> Result<i32, Error> { Ok(nonneg(n)? + 1) }
+""")
+        self.assertEqual(c.count("nonneg(n)"), 1)
+
+    def test_try_outside_a_result_fn_is_an_error(self):
+        with self.assertRaises(crust.CrustError) as cm:
+            crust.translate(self.BASE + "fn f(n: i32) -> i32 "
+                                        "{ nonneg(n)? }")
+        self.assertIn("Result", str(cm.exception))
+
+    def test_try_rejects_mismatched_error_types(self):
+        with self.assertRaises(crust.CrustError) as cm:
+            crust.translate("fn g() -> Result<i32, i32> { Ok(1) }\n"
+                            "fn f() -> Result<i32, f64> { Ok(g()?) }")
+        self.assertIn("convert", str(cm.exception))
+
+    def test_try_on_a_plain_value_is_an_error(self):
+        with self.assertRaises(crust.CrustError):
+            crust.translate("fn f(n: i32) -> Result<i32, i32> { Ok(n?) }")
+
+    def test_try_propagates_the_error(self):
+        self.assertEqual(_run(self.BASE + """
+fn chain(a: i32, b: i32) -> Result<i32, Error> {
+    let x: i32 = nonneg(a)?;
+    let y: i32 = nonneg(b)?;
+    Ok(x + y)
+}
+fn main() -> i32 {
+    let good: Result<i32, Error> = chain(20, 22);
+    let bad: Result<i32, Error> = chain(20, -1);
+    let mut t: i32 = good.unwrap();
+    if bad.is_err() { t += 0; } else { t += 100; }
+    t
+}
+""", suffix=".rs"), 42)
+
+    def test_try_on_option(self):
+        self.assertEqual(_run("""
+fn head(xs: &[i32]) -> Option<i32> {
+    if xs.len() == 0 { return None; }
+    Some(xs[0])
+}
+fn twice(xs: &[i32]) -> Option<i32> {
+    let h: i32 = head(xs)?;
+    Some(h * 2)
+}
+fn main() -> i32 {
+    let a: [i32; 2] = [21, 9];
+    let s: &[i32] = &a[..];
+    twice(s).unwrap_or(0)
+}
+""", suffix=".rs"), 42)
+
+    def test_try_on_option_outside_an_option_fn_is_an_error(self):
+        with self.assertRaises(crust.CrustError):
+            crust.translate("fn g() -> Option<i32> { None }\n"
+                            "fn f() -> i32 { g()? }")
+
+
 class TestEnumLiteralSpotRegression(unittest.TestCase):
     """Backend fix: a symbolic literal must not be range-compared as an int.
 
