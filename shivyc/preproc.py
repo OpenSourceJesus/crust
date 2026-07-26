@@ -520,6 +520,20 @@ class _Preprocessor:
                     error_collector.add(CompilerError(
                         "crust: %s" % e, rest[0].r))
                     return
+            elif filename.endswith(".py"):
+                # An rpython module: transpile it with tools/py2c.py and lex
+                # the generated C in its place. The result is cached under
+                # /tmp, so only the first build of a given module pays for
+                # the transpile. py2c does not preserve line numbers, so the
+                # generated file is what later diagnostics name -- it is kept
+                # on disk in the cache precisely so it can be read.
+                import shivyc.rpyinc as rpyinc
+                try:
+                    text, filename = rpyinc.translate(filename, text)
+                except rpyinc.RpyIncludeError as e:
+                    error_collector.add(CompilerError(
+                        "rpython include: %s" % e, rest[0].r))
+                    return
             inc = lexer.tokenize(text, filename)
             out.extend(process(inc, filename, self.macros))
         except IOError:

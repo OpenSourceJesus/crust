@@ -1,6 +1,7 @@
 """Main executable for ShivyC compiler."""
 
 import argparse
+import os
 import pathlib
 import platform
 import subprocess
@@ -558,6 +559,29 @@ def process_c_file(file, args):
     token_list = preproc.process(token_list, file)
     if not error_collector.ok():
         return None
+
+    # An `#include "foo.py"` expanded above may have pulled in a module that
+    # leans on the py2c runtime. Compile shivyc_rt.c now and add it to the
+    # link line, the same way a `.py` named on the command line does.
+    import shivyc.rpyinc as rpyinc
+    for rt_c in rpyinc.take_runtime_sources():
+        if not os.path.exists(rt_c):
+            continue
+        rt_obj = rpyinc.runtime_object(rt_c, args)
+        if rt_obj is None:
+            saved = args._extensions if hasattr(args, "_extensions") else None
+            built = process_c_file(rt_c, args)
+            if saved is not None:
+                args._extensions = saved
+            if not built:
+                return None
+            rt_obj = rpyinc.runtime_object_path(rt_c, args)
+            try:
+                import shutil
+                shutil.copyfile(built, rt_obj)
+            except OSError:                            # pragma: no cover
+                rt_obj = built
+        getattr(args, "_extra_objs", []).append(rt_obj)
 
     # Any `unrecognized` token that survived preprocessing is in live code
     # (dead #if branches and #error message text were dropped/consumed by the

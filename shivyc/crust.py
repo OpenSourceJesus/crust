@@ -336,7 +336,9 @@ class Unit:
         self.enums = {}         # name -> [(variant, explicit value or None)]
         self.variants = {}      # mangled variant name -> enum name
         self.tuple_structs = set()   # struct names declared in tuple form
+        self.unit_structs = set()    # struct names declared as `struct S;`
         self.consts = {}        # const/static name -> CType
+        self.const_values = {}  # const name -> initializer text
         self.needs = set()      # libc prototypes the lowering requires
         self.slices = {}        # slice struct name -> element CType
         self.options = {}       # Option struct name -> element CType
@@ -382,6 +384,35 @@ class Unit:
             if fname == field:
                 return ftype
         return None
+
+
+# A `[v; N]` repeat is written out element by element, so a huge N would
+# blow up the generated C rather than the generated binary. The cap is well
+# above any hand-written literal and well below anything that would hurt.
+_MAX_REPEAT = 4096
+
+
+def _literal_count(code, unit):
+    """Resolve a `[v; N]` length to an int, or None if it is not constant.
+
+    A plain integer literal is the common case; a `const` is resolved through
+    the unit's table, since Crust lowers an integer `const` to a C enum
+    constant precisely so it can size an array.
+    """
+    text = code.strip()
+    try:
+        return int(text, 0)
+    except ValueError:
+        pass
+    seen = set()
+    while text in unit.const_values and text not in seen:
+        seen.add(text)
+        text = unit.const_values[text].strip()
+        try:
+            return int(text, 0)
+        except ValueError:
+            continue
+    return None
 
 
 class Parser:
@@ -923,6 +954,15 @@ class Parser:
         if recv.type is not None and recv.type.base in self.unit.slices:
             if name == "len":
                 return Expr("%s.len" % recv.code, CType("unsigned long"))
+            if name in ("iter", "iter_mut"):
+                # Crust has no iterator protocol; `for x in xs` walks the
+                # slice directly, so `.iter()` is accepted as a no-op purely
+                # so the idiomatic spelling reads the same as in Rust.
+                if args:
+                    self.err("`%s` takes no arguments", name)
+                return recv
+            if name == "is_empty":
+                return Expr("(%s.len == 0)" % recv.code, CType("_Bool"))
             if name == "as_ptr":
                 return Expr("%s.ptr" % recv.code,
                             CType(self.unit.slices[recv.type.base].base,
@@ -1011,23 +1051,37 @@ class Parser:
         return e
 
     def parse_array_literal(self, open_tok):
-        """Lower `[a, b, c]` and the `[0; N]` repeat form to a C initializer.
+        """Lower `[a, b, c]` and the `[v; N]` repeat form to a C initializer.
 
-        C has no repeat-initializer syntax, so only the all-zero form can be
-        lowered without knowing `N` at translation time; `{0}` zero-fills the
-        whole array.
+        C has no repeat-initializer syntax. Two cases can still be lowered:
+        an all-zero repeat, where `{0}` zero-fills whatever the annotation
+        sizes; and any repeat whose length is an integer literal, which is
+        written out as that many elements. A non-literal length with a
+        non-zero value has nothing to expand to and is rejected.
         """
         if self.at("]", "punc"):
             self.next()
             self.err("empty array literal has no element type")
         first = self.parse_expr()
         if self.accept(";"):
-            self.parse_expr()               # length: taken from the annotation
+            count = self.parse_expr()
             self.expect("]")
-            if first.code.strip() not in ("0", "0.0"):
-                self.err("only the all-zero repeat form `[0; N]` is "
-                         "supported; list the elements explicitly")
-            return Expr("{0}", None)
+            if first.code.strip() in ("0", "0.0"):
+                return Expr("{0}", None)
+            n = _literal_count(count.code, self.unit)
+            if n is None:
+                self.err("the repeat length in `[v; N]` must be an integer "
+                         "literal or a `const` when the value is not 0; "
+                         "list the elements explicitly")
+            if n > _MAX_REPEAT:
+                self.err("repeat length %d exceeds the %d-element limit for "
+                         "`[v; N]`; build the array in a loop", n, _MAX_REPEAT)
+            if n <= 0:
+                self.err("repeat length must be positive")
+            ty = first.type
+            if ty is not None:
+                ty = CType(ty.base, ty.ptr, (ty.array or []) + [str(n)])
+            return Expr("{%s}" % ", ".join([first.code] * n), ty)
         items = [first]
         while self.accept(","):
             if self.at("]", "punc"):
@@ -1084,6 +1138,13 @@ class Parser:
                 return self.parse_struct_literal(name, t.line)
             if name == "None" and not self.at("::", "punc"):
                 return self.none_expr()
+            if (name in self.unit.unit_structs and self.lookup(name) is None
+                    and not self.at("(", "punc")):
+                # A unit struct is its own value in Rust, so a bare mention
+                # constructs one. C has no empty struct, so the lowered type
+                # carries one placeholder byte; zeroing it is the whole
+                # construction.
+                return Expr("(%s){0}" % name, CType(name))
             ty = self.lookup(name)
             if ty is None:
                 if name in self.unit.variants:
@@ -1202,6 +1263,10 @@ class Parser:
             var = self.expect_ident()
             self.expect("in")
             lo = self.parse_cond()
+            if not self.at("..", "punc") and not self.at("..=", "punc"):
+                # `for x in xs` over a slice or an array, rather than a range.
+                self.parse_for_each(out, indent, t, var, lo)
+                return
             if self.accept("..="):
                 cmp_op = "<="
             else:
@@ -1236,6 +1301,72 @@ class Parser:
             out.line_at(t.line, "return %s;" % e.code, indent)
         else:
             out.line_at(t.line, e.code + ";", indent)
+
+    def parse_for_each(self, out, indent, t, var, subject):
+        """Lower `for x in xs { .. }` over a slice or an array.
+
+        Rust's `for` drives an iterator; Crust has none, so the loop is
+        lowered to the index loop the user would otherwise have written by
+        hand -- `for i in 0..xs.len()` plus `let x = xs[i]`. The subject is
+        held in a temporary so it is evaluated exactly once even when it is a
+        call, and the whole thing is wrapped in a block to scope both the
+        temporary and the induction variable.
+
+        The binding is a *copy* of the element, matching
+        `for x in xs.iter().copied()` rather than Rust's reference binding.
+        Crust has no borrow checker to make the difference observable, and a
+        copy is what the C the user is mixing with would do.
+        """
+        ty = subject.type
+        if ty is None:
+            self.err("cannot infer the type of the iterated expression; "
+                     "annotate it")
+
+        idx = self.new_index()
+        if ty.base in self.unit.slices:
+            elem = self.unit.slices[ty.base]
+            tmp = self.new_temp()
+            out.line_at(t.line, "{ %s = %s;" % (ty.decl(tmp), subject.code),
+                        indent)
+            base, count = tmp + ".ptr", tmp + ".len"
+        elif ty.array:
+            elem = CType(ty.base, ty.ptr, ty.array[1:] or None)
+            if elem.array:
+                self.err("iterating a multi-dimensional array is not "
+                         "supported; index the outer dimension")
+            out.line_at(t.line, "{", indent)
+            base, count = subject.code, ty.array[0]
+        elif ty.ptr:
+            self.err("cannot iterate a raw pointer, as its length is not "
+                     "known; slice it first (`&p[0..n]`) or use a range")
+        else:
+            self.err("`%s` cannot be iterated", ty.decl())
+
+        out.write(" for (unsigned long %s = 0; %s < %s; %s++)"
+                  % (idx, idx, count, idx))
+        self.push()
+        self.declare(var, elem)
+        self.emit_bound_block(out, indent, "%s = %s[%s];"
+                              % (elem.decl(var), base, idx))
+        self.pop()
+        out.write(" }")
+
+    def new_index(self):
+        self.tmp_n += 1
+        return "_crust_i%d" % self.tmp_n
+
+    def emit_bound_block(self, out, indent, decl):
+        """Emit `{ <decl> <body> }` for a loop or pattern binding."""
+        open_tok = self.expect("{")
+        out.line_at(open_tok.line, "{ " + decl, indent)
+        self.push()
+        while not self.at("}", "punc"):
+            if self.cur.kind == "eof":
+                self.err("unterminated block")
+            self.parse_stmt(out, indent + 1, False)
+        close = self.expect("}")
+        self.pop()
+        out.line_at(close.line, "}", indent)
 
     def parse_if(self, out, indent, tail_returns):
         t = self.expect("if")
@@ -1565,6 +1696,22 @@ class Parser:
             self.err("tuple struct `%s` needs at least one field", name)
         return name, fields
 
+    def parse_unit_struct(self):
+        """Parse `struct S;`, a struct with no fields.
+
+        C11 has no empty struct, so one placeholder byte is added. The field
+        is named with the reserved `_crust_` prefix so it cannot collide with
+        anything the user writes, and nothing but the generated compound
+        literal ever mentions it.
+        """
+        self.skip_attributes()
+        while self.cur.val in ("pub",):
+            self.next()
+        self.expect("struct")
+        name = self.expect_ident()
+        self.expect(";")
+        return name, [("_crust_unit", CType("char"))]
+
     def is_assoc_const(self):
         """True if an `impl` body item is `const NAME: T = ...;`."""
         j = self.i
@@ -1866,7 +2013,7 @@ def _match_brace(scan, open_idx):
     return None
 
 
-def find_rust_items(code):
+def find_rust_items(code, rust_file=False):
     """Return (start, end, kind) spans of top-level Rust items in `code`.
 
     `kind` is "fn", "struct", "tuple_struct", "impl", "enum" or "const". C
@@ -1907,6 +2054,21 @@ def find_rust_items(code):
             continue
 
         after = scan[m.end():]
+        if kw == "struct" and after.lstrip().startswith(";"):
+            # `struct S;` is spelled identically in both languages: a Rust
+            # unit struct and a C forward declaration of an incomplete type.
+            # Unlike the `enum` and struct-body cases, nothing in the text
+            # itself tells them apart, and reading a C forward declaration as
+            # a complete one-byte type would make `sizeof(struct S)` wrongly
+            # succeed. So claim it only on evidence: the whole file is Rust,
+            # or the unit gives the name an `impl` block, which C cannot.
+            name = m.group("name")
+            if rust_file or _has_impl_block(scan, name):
+                semi = scan.index(";", m.end())
+                spans.append((_extend_head(scan, start), semi + 1,
+                              "unit_struct"))
+            continue
+
         if kw == "struct" and after.lstrip().startswith("("):
             # Tuple struct: `struct P(f64, f64);`
             open_idx = scan.index("(", m.end())
@@ -1943,6 +2105,16 @@ def find_rust_items(code):
             continue
         kept.append(span)
     return kept
+
+
+def _has_impl_block(scan, name):
+    """True if the unit has a top-level `impl Name` block.
+
+    C has no `impl`, so its presence is unambiguous evidence that `struct
+    Name;` above was meant as a Rust unit struct.
+    """
+    return re.search(r"\bimpl\s+" + re.escape(name) + r"\s*\{",
+                     scan) is not None
 
 
 def _match_paren(scan, open_idx):
@@ -2022,9 +2194,12 @@ def collect_items(code, spans, unit, struct_order, fail=None):
     for start, end, kind in spans:
         p = Parser(tokenize(code[start:end], _line_of(code, start)), unit)
         try:
-            if kind in ("struct", "tuple_struct"):
+            if kind in ("struct", "tuple_struct", "unit_struct"):
                 if kind == "struct":
                     name, fields = p.parse_struct()
+                elif kind == "unit_struct":
+                    name, fields = p.parse_unit_struct()
+                    unit.unit_structs.add(name)
                 else:
                     name, fields = p.parse_tuple_struct()
                     unit.tuple_structs.add(name)
@@ -2038,8 +2213,10 @@ def collect_items(code, spans, unit, struct_order, fail=None):
                     unit.variants["%s_%s" % (name, vname)] = name
                 local["enums"].append(name)
             elif kind == "const":
-                _, name, ty, _ = p.parse_const_signature()
+                kw, name, ty, init = p.parse_const_signature()
                 unit.consts[name] = ty
+                if kw == "const":
+                    unit.const_values[name] = init.code
                 local["consts"].append(name)
             elif kind == "fn":
                 _, name, params, ret = p.parse_fn_signature()
@@ -2252,7 +2429,8 @@ def translate(code, path=None):
     numbers are preserved throughout, so diagnostics from later compiler
     passes still point at the original source lines.
     """
-    spans = find_rust_items(code)
+    spans = find_rust_items(
+        code, rust_file=bool(path) and path.endswith(".rs"))
     included = collect_include_items(code, path)
     if not spans:
         return code
@@ -2280,7 +2458,8 @@ def translate(code, path=None):
     for start, end, kind in spans:
         pieces.append(code[prev:start])
         line0 = _line_of(code, start)
-        if kind in ("struct", "tuple_struct", "enum", "const"):
+        if kind in ("struct", "tuple_struct", "unit_struct", "enum",
+                    "const"):
             text = ""            # hoisted into the prelude
         else:
             parser = Parser(tokenize(code[start:end], line0), unit)
