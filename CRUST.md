@@ -890,26 +890,34 @@ python3 tools/crustfuzz.py --family cast
 An input that produces a *diagnostic* is fine — this is not looking for
 unsupported constructs, only for the ones that fail in the wrong way.
 
-465 probes currently: 461 compile, 4 report, 0 crash.
+762 probes currently: 760 compile, 2 report, 0 crash. The two reports are
+genuine C errors (a bitfield wider than its type).
 
-### What it found
+### What it found, and how it was fixed
 
 Passing a struct of 3, 5, 6 or 7 bytes **by value** crashed the same way
-returning one did. Returning was fixed; passing is now *reported*, because it
-cannot be fixed the same way. A return reads its value out of a slot into RAX,
-so widening the read to a full eightbyte is safe. A parameter does the
-opposite — it writes a register into the parameter's home — and stack slots are
-packed, so widening the write clobbers the neighbouring local. That produces a
-program which compiles and then corrupts its own frame, which is far worse than
-one that does not compile.
+returning one did — a second family, on the other side of the call.
 
-Doing it properly means splitting the move into chunks on both sides of the
-call. Until that exists, Crust says so:
+The fix is asymmetric, because the two directions are:
 
-```
-error: passing a struct of 3 bytes by value is not supported; its size is not
-a register width, so it cannot be moved in one piece -- pass a pointer instead
-```
+* **Returning** reads a slot into RAX, so the read is widened to a whole
+  eightbyte. Safe: the extra bytes are padding the caller ignores.
+* **Passing, caller side** reads the struct out of its slot into an argument
+  register — also a read, so also widened. Stack slots are padded to eight
+  bytes so the read stays inside the slot rather than picking up the
+  neighbouring local.
+* **Passing, callee side** does the opposite: it *writes* an argument register
+  into the parameter's home. Widening a write clobbers whatever follows, so
+  the store is **split into power-of-two chunks** instead — 3 becomes 2+1, 7
+  becomes 4+2+1 — shifting the value down between them so each chunk writes
+  exactly the bytes it should.
+
+Widening the store was the obvious move and it was wrong: it compiled, and
+then the program hung on a corrupted frame. A build that fails is visible; a
+program that silently corrupts its own stack is not, which is why the chunked
+store is worth the extra instructions.
+
+Verified field-by-field against gcc on the same inputs.
 
 Code-generation errors are now collected like any other diagnostic rather than
 escaping as exceptions, so a limitation found this late still reads as a
