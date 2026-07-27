@@ -2437,3 +2437,49 @@ class TestOddSizedStructReturn(unittest.TestCase):
 
     def test_register_sized_still_works(self):
         self.assertEqual(self._sz("int a; int b;"), 42)
+
+
+class TestNoInternalCrashes(unittest.TestCase):
+    """A valid program must never produce a Python traceback.
+
+    `tools/crustfuzz.py` probes these systematically; the cases pinned here
+    are the ones it found, kept so they cannot regress silently.
+    """
+
+    def _compile(self, src):
+        import subprocess, tempfile, os as _os
+        d = tempfile.mkdtemp()
+        p = _os.path.join(d, "t.c")
+        with open(p, "w") as f:
+            f.write(src)
+        return subprocess.run(
+            [sys.executable, "-m", "shivyc.main", "-c", p,
+             "-o", _os.path.join(d, "t.o")],
+            cwd=_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+            capture_output=True, text=True)
+
+    def test_odd_struct_arg_reports_instead_of_crashing(self):
+        r = self._compile("struct S { char a; char b; char c; };\n"
+                          "int f(struct S s) { return 0; }\n"
+                          "int main(void) { struct S s; return f(s); }")
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertIn("not supported", r.stdout + r.stderr)
+
+    def test_seven_byte_struct_arg_reports(self):
+        r = self._compile("struct S { char v[7]; };\n"
+                          "int f(struct S s) { return 0; }\n"
+                          "int main(void) { struct S s; return f(s); }")
+        self.assertNotIn("Traceback", r.stderr)
+
+    def test_odd_struct_return_still_works(self):
+        # Returning one *is* supported -- only passing by value is not.
+        self.assertEqual(_run("struct S { char a; char b; char c; };\n"
+                              "struct S f(struct S *p) { return *p; }\n"
+                              "int main(void) { struct S s; s.a = 42;"
+                              " struct S r = f(&s); return r.a; }"), 42)
+
+    def test_register_sized_struct_arg_still_works(self):
+        self.assertEqual(_run("struct S { int a; int b; };\n"
+                              "int f(struct S s) { return s.a + s.b; }\n"
+                              "int main(void) { struct S s; s.a = 40; s.b = 2;"
+                              " return f(s); }"), 42)
