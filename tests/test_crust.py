@@ -2458,18 +2458,36 @@ class TestNoInternalCrashes(unittest.TestCase):
             cwd=_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
             capture_output=True, text=True)
 
-    def test_odd_struct_arg_reports_instead_of_crashing(self):
-        r = self._compile("struct S { char a; char b; char c; };\n"
-                          "int f(struct S s) { return 0; }\n"
-                          "int main(void) { struct S s; return f(s); }")
-        self.assertNotIn("Traceback", r.stderr)
-        self.assertIn("not supported", r.stdout + r.stderr)
+    def test_odd_struct_arg_passes_correctly(self):
+        # Was a crash, then a reported limitation, now supported: the store
+        # into the parameter's home is split into 2+1 byte chunks.
+        self.assertEqual(_run("struct S { char a; char b; char c; };\n"
+                              "int f(struct S s) { return s.a*100 + s.b*10"
+                              " + s.c; }\n"
+                              "int main(void) { struct S s; s.a=1; s.b=2;"
+                              " s.c=3; return f(s); }"), 123)
 
-    def test_seven_byte_struct_arg_reports(self):
-        r = self._compile("struct S { char v[7]; };\n"
-                          "int f(struct S s) { return 0; }\n"
-                          "int main(void) { struct S s; return f(s); }")
-        self.assertNotIn("Traceback", r.stderr)
+    def test_seven_byte_struct_arg_passes_correctly(self):
+        self.assertEqual(_run("struct S { char v[7]; };\n"
+                              "int f(struct S s) { return s.v[0] + s.v[6]; }\n"
+                              "int main(void) { struct S s; s.v[0]=40;"
+                              " s.v[6]=2; return f(s); }"), 42)
+
+    def test_five_and_six_byte_struct_args(self):
+        self.assertEqual(_run("struct S { char a; char b; char c; char d;"
+                              " char e; };\n"
+                              "int f(struct S s) { return s.a + s.e; }\n"
+                              "int main(void) { struct S s; s.a=40; s.e=2;"
+                              " return f(s); }"), 42)
+
+    def test_no_traceback_on_any_struct_size(self):
+        for body in ("char a; char b; char c;", "char v[7];",
+                     "int a; char b;", "long a; char b;"):
+            r = self._compile("struct S { %s };\n"
+                              "int f(struct S s) { return 0; }\n"
+                              "int main(void) { struct S s; return f(s); }"
+                              % body)
+            self.assertNotIn("Traceback", r.stderr, body)
 
     def test_odd_struct_return_still_works(self):
         # Returning one *is* supported -- only passing by value is not.
