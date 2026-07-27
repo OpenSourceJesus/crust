@@ -461,6 +461,7 @@ class Unit:
         self.structs = {}       # name -> [(field, CType)]
         self.methods = {}       # (type name, method name) -> MethodInfo
         self.enums = {}         # name -> [(variant, explicit value or None)]
+        self.data_enums = {}    # enum -> {variant: [(field|None, CType)]}
         self.variants = {}      # mangled variant name -> enum name
         self.tuple_structs = set()   # struct names declared in tuple form
         self.unit_structs = set()    # struct names declared as `struct S;`
@@ -608,6 +609,7 @@ class Parser:
         # generated. Substitution happens in parse_type, so every other part
         # of the parser is reused unchanged.
         self.tysubst = tysubst or {}
+        self.binds = []              # match-arm payload bindings
         self.unit = unit or Unit()
         self.fn_sigs = self.unit.fn_sigs
         self.scopes = [{}]              # name -> CType
@@ -1416,7 +1418,10 @@ class Parser:
                     # actually passed, then instantiate.
                     e = Expr(self.instantiate_fn(
                         e.code, self.infer_type_args(e.code, atypes)), None)
-                if e.code in self.unit.tuple_structs:
+                if e.code in self.unit.variants and \
+                        self._payload_of(e.code) is not None:
+                    e = self.data_variant_literal(e.code, args)
+                elif e.code in self.unit.tuple_structs:
                     e = self.tuple_struct_literal(e.code, args)
                 else:
                     ret = sig[0] if sig else None
@@ -1779,6 +1784,28 @@ class Parser:
                                        name))
         return Expr("(%s){%s}" % (name, ", ".join(inits)), CType(name))
 
+    def _payload_of(self, flat):
+        """Payload fields for a flattened `Enum_Variant` name, or None."""
+        owner = self.unit.variants.get(flat)
+        if owner is None:
+            return None
+        vname = flat[len(owner) + 1:]
+        return self.unit.data_enums.get(owner, {}).get(vname)
+
+    def data_variant_literal(self, flat, args):
+        """Build a tagged-union value for `Enum::Variant(a, b)`."""
+        owner = self.unit.variants[flat]
+        vname = flat[len(owner) + 1:]
+        fields = self.unit.data_enums[owner][vname]
+        if len(args) != len(fields):
+            self.err("`%s` takes %d value%s, got %d", flat, len(fields),
+                     "" if len(fields) == 1 else "s", len(args))
+        inits = ", ".join(
+            ".%s = %s" % (fname or "_%d" % i, a)
+            for i, ((fname, _ty), a) in enumerate(zip(fields, args)))
+        return Expr("(%s){.tag = %s, .u.%s = {%s}}"
+                    % (owner, flat, vname, inits), CType(owner))
+
     def parse_closure(self):
         """Lower `|a, b| expr` to a lifted top-level function.
 
@@ -2037,6 +2064,26 @@ class Parser:
             # `Name { ... }` is a struct literal, except in a condition
             # position, where Rust also treats the brace as a block.
             if (self.at("{", "punc") and not self.no_struct_lit
+                    and self._payload_of(name) is not None):
+                # `Shape::Rect { w: 3.0, h: 4.0 }` -- a struct-form variant.
+                fields = self._payload_of(name)
+                self.next()
+                given = {}
+                while not self.at("}", "punc"):
+                    fname = self.expect_ident()
+                    self.expect(":")
+                    want = dict((f, t) for f, t in fields).get(fname)
+                    given[fname] = self.parse_expr_as(want).code
+                    if not self.accept(","):
+                        break
+                self.expect("}")
+                missing = [f for f, _ in fields if f not in given]
+                if missing:
+                    self.err("`%s` is missing %s", name,
+                             ", ".join("`%s`" % m for m in missing))
+                return self.data_variant_literal(
+                    name, [given[f] for f, _ in fields])
+            if (self.at("{", "punc") and not self.no_struct_lit
                     and name in self.unit.structs):
                 return self.parse_struct_literal(name, t.line)
             if (self.at("{", "punc") and not self.no_struct_lit
@@ -2066,7 +2113,17 @@ class Parser:
             ty = self.lookup(name)
             if ty is None:
                 if name in self.unit.variants:
-                    ty = CType(self.unit.variants[name])
+                    owner = self.unit.variants[name]
+                    ty = CType(owner)
+                    if owner in self.unit.data_enums and \
+                            not self.at("(", "punc"):
+                        # A payload-free variant of a tagged union is still a
+                        # whole value, not a bare tag: `Shape::Empty` has to
+                        # build `(Shape){.tag = Shape_Empty}` so it can be
+                        # assigned and passed like any other `Shape`.
+                        out = Expr("(%s){.tag = %s}" % (owner, name), ty)
+                        out.from_path = saw_path
+                        return out
                 elif name in self.unit.consts:
                     ty = self.unit.consts[name]
             if self.lookup(name) is not None:
@@ -2424,7 +2481,21 @@ class Parser:
         t = self.expect("match")
         scrutinee = self.parse_cond()
         self.emit_pending(out, t.line, indent)
-        out.line_at(t.line, "switch (%s)" % scrutinee.code, indent)
+        sty0 = scrutinee.type
+        data_enum = (sty0 is not None and not sty0.ptr
+                     and sty0.base in self.unit.data_enums)
+        if data_enum:
+            # A tagged union switches on its tag, and each arm may bind the
+            # payload. The scrutinee is held in a temporary so it is evaluated
+            # once even when it is a call, and so the bindings have something
+            # stable to read from.
+            subject = self.new_temp()
+            out.line_at(t.line, "{ %s = %s;"
+                        % (sty0.decl(subject), scrutinee.code), indent)
+            out.write(" switch (%s.tag)" % subject)
+        else:
+            subject = None
+            out.line_at(t.line, "switch (%s)" % scrutinee.code, indent)
         open_tok = self.expect("{")
         out.line_at(open_tok.line, "{", indent)
 
@@ -2438,6 +2509,7 @@ class Parser:
             if self.cur.kind == "eof":
                 self.err("unterminated match")
             arm = self.cur
+            self.binds = []
             labels = self.parse_patterns(enum_name, covered)
             if labels is None:
                 has_default = True
@@ -2446,12 +2518,29 @@ class Parser:
                 out.line_at(arm.line, " ".join("case %s:" % v
                                                for v in labels), indent + 1)
             self.expect("=>")
+            binds = self.binds
+            self.binds = []
+            self.push()
+            if binds:
+                # Bindings are declared inside a block so their names cannot
+                # leak into a later arm, which C's fall-through-free `case`
+                # labels would otherwise allow.
+                out.write(" {")
+                for bname, bty, path in binds:
+                    self.declare(bname, bty)
+                    out.write(" %s = %s.u.%s;"
+                              % (bty.decl(_c_name(bname)), subject, path))
             self.parse_arm_body(out, indent + 2, tail_returns)
+            if binds:
+                out.write(" }")
+            self.pop()
             out.write(" break;")
             self.accept(",")
 
         close = self.expect("}")
         out.line_at(close.line, "}", indent)
+        if data_enum:
+            out.write(" }")
 
         if enum_name and not has_default:
             missing = [v for v, _ in self.unit.enums[enum_name]
@@ -2499,8 +2588,56 @@ class Parser:
                     self.err("`%s` is not a constant pattern; only literals, "
                              "enum variants and `_` are supported", name)
             covered.add(name)
+            fields = self._payload_of(name)
+            if self.at("(", "punc") or self.at("{", "punc"):
+                if fields is None:
+                    self.err("`%s` carries no data to destructure", name)
+                self._bind_payload(name, fields)
             return name
         self.err("unsupported pattern %r", t.val or "<eof>")
+
+    def _bind_payload(self, flat, fields):
+        """Record the bindings introduced by `Variant(a, b)` / `Variant { x }`.
+
+        Names are collected rather than emitted here, because the arm's body
+        has not been parsed yet -- `parse_match` declares them at the top of
+        the arm's block, where they are in scope for exactly that arm.
+        """
+        owner = self.unit.variants[flat]
+        vname = flat[len(owner) + 1:]
+        if self.accept("("):
+            i = 0
+            while not self.at(")", "punc"):
+                if self.accept("..") or self.accept("..."):
+                    break
+                bname = self.expect_ident()
+                if i >= len(fields):
+                    self.err("`%s` has only %d field%s", flat, len(fields),
+                             "" if len(fields) == 1 else "s")
+                fname, fty = fields[i]
+                if bname != "_":
+                    self.binds.append(
+                        (bname, fty, "%s.%s" % (vname, fname or "_%d" % i)))
+                i += 1
+                if not self.accept(","):
+                    break
+            self.expect(")")
+            return
+        self.expect("{")
+        by_name = {f: (k, t) for k, (f, t) in enumerate(fields) if f}
+        while not self.at("}", "punc"):
+            if self.accept("..") or self.accept("..."):
+                break
+            fname = self.expect_ident()
+            bname = self.expect_ident() if self.accept(":") else fname
+            if fname not in by_name:
+                self.err("`%s` has no field `%s`", flat, fname)
+            _, fty = by_name[fname]
+            if bname != "_":
+                self.binds.append((bname, fty, "%s.%s" % (vname, fname)))
+            if not self.accept(","):
+                break
+        self.expect("}")
 
     def parse_arm_body(self, out, indent, tail_returns):
         """Parse the body of a match arm: a block or a single expression."""
@@ -2515,27 +2652,54 @@ class Parser:
             out.line_at(t.line, e.code + ";", indent)
 
     def parse_enum(self):
-        """Parse `enum Name { A, B = 5, C }`, returning (name, variants)."""
+        """Parse an enum; return (name, variants, payloads).
+
+        A variant may carry data, in either tuple form `Circle(f64)` or struct
+        form `Rect { w: f64, h: f64 }`. Payload fields are recorded positionally
+        as `_0`, `_1`, ... for tuple variants and by name for struct ones, so
+        both are matched and constructed through one mechanism.
+        """
         self.skip_attributes()
         self.skip_visibility()
         self.expect("enum")
         name = self.expect_ident()
         self.expect("{")
-        variants = []
+        variants, payloads = [], {}
         while not self.at("}", "punc"):
             self.skip_attributes()
             vname = self.expect_ident()
-            if self.at("(", "punc") or self.at("{", "punc"):
-                self.err("data-carrying enum variant `%s` is not supported",
-                         vname)
+            payload = None
+            if self.at("(", "punc"):
+                # Tuple variant: `Circle(f64)`.
+                self.next()
+                payload = []
+                while not self.at(")", "punc"):
+                    payload.append((None, self.parse_type()))
+                    if not self.accept(","):
+                        break
+                self.expect(")")
+            elif self.at("{", "punc"):
+                # Struct variant: `Rect { w: f64, h: f64 }`.
+                self.next()
+                payload = []
+                while not self.at("}", "punc"):
+                    self.skip_attributes()
+                    fname = self.expect_ident()
+                    self.expect(":")
+                    payload.append((fname, self.parse_type()))
+                    if not self.accept(","):
+                        break
+                self.expect("}")
             value = None
             if self.accept("="):
                 value = self.parse_expr().code
+            if payload is not None:
+                payloads[vname] = payload
             variants.append((vname, value))
             if not self.accept(","):
                 break
         self.expect("}")
-        return name, variants
+        return name, variants, payloads
 
     def parse_const_signature(self):
         """Parse `const|static [mut] NAME: T = expr;` without emitting."""
@@ -3606,8 +3770,10 @@ def collect_items(code, spans, unit, struct_order, fail=None):
                 struct_order.append(name)
                 local["structs"].append(name)
             elif kind == "enum":
-                name, variants = p.parse_enum()
+                name, variants, payloads = p.parse_enum()
                 unit.enums[name] = variants
+                if payloads:
+                    unit.data_enums[name] = payloads
                 for vname, _ in variants:
                     unit.variants["%s_%s" % (name, vname)] = name
                 local["enums"].append(name)
@@ -4018,6 +4184,42 @@ def _toposort_structs(unit, order):
     for name in order:
         visit(name, set())
     return result
+
+
+def render_data_enum(name, variants, payloads):
+    """Lower a data-carrying enum to a tagged union.
+
+    The shape is the one a C programmer would write by hand:
+
+        enum Shape_tag { Shape_Circle, Shape_Rect };
+        struct Shape_Circle_data { double _0; };
+        struct Shape_Rect_data { double w; double h; };
+        typedef struct Shape {
+            enum Shape_tag tag;
+            union { struct Shape_Circle_data Circle; ... } u;
+        } Shape;
+
+    Payload structs are declared separately rather than inline, because a
+    named type is easier to read in a diagnostic and avoids relying on
+    anonymous-struct support in the C front end. A variant with no payload
+    contributes no union member and costs nothing.
+    """
+    parts = ["enum %s_tag { %s };"
+             % (name, ", ".join("%s_%s" % (name, v) for v, _ in variants))]
+    members = []
+    for vname, _ in variants:
+        fields = payloads.get(vname)
+        if not fields:
+            continue
+        decls = " ".join(
+            ty.decl(fname or "_%d" % i) + ";"
+            for i, (fname, ty) in enumerate(fields))
+        parts.append("struct %s_%s_data { %s };" % (name, vname, decls))
+        members.append("struct %s_%s_data %s;" % (name, vname, vname))
+    parts.append("struct %s; typedef struct %s %s;" % (name, name, name))
+    parts.append("struct %s { enum %s_tag tag; union { %s } u; };"
+                 % (name, name, " ".join(members) or "char _empty;"))
+    return " ".join(parts)
 
 
 def _render_enum(name, variants):
@@ -4434,7 +4636,11 @@ def translate(code, path=None):
         prelude.append("void *realloc(void *, unsigned long);")
         prelude.append("void free(void *);")
     for name in mod_enums + local["enums"]:
-        prelude.append(_render_enum(name, unit.enums[name]))
+        if name in unit.data_enums:
+            prelude.append(render_data_enum(name, unit.enums[name],
+                                            unit.data_enums[name]))
+        else:
+            prelude.append(_render_enum(name, unit.enums[name]))
     for name in sorted(unit.core_concrete):
         if name in unit.enums and name not in local_set:
             prelude.append(_render_enum(name, unit.enums[name]))
