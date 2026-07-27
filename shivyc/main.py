@@ -881,7 +881,17 @@ def process_c_file(file, args):
             if fn not in addr_taken and _eligible(fn)}
 
     asm_code = ASMCode(get_target(getattr(args, "target", "x86_64")))
-    ASMGen(il_code, symbol_table, asm_code, args).make_asm()
+    try:
+        ASMGen(il_code, symbol_table, asm_code, args).make_asm()
+    except CompilerError as e:
+        # Code generation can find a limitation the front end could not --
+        # a struct whose size has no register width, say. Collecting it here
+        # turns it into an ordinary diagnostic instead of an uncaught
+        # exception with a Python traceback.
+        error_collector.add(e)
+        return None
+    if not error_collector.ok():
+        return None
 
     # Emit recorded weak aliases as assembler directives.
     for alias_name, target, is_weak in aliases:
