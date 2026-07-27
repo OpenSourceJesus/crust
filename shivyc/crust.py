@@ -462,6 +462,7 @@ class Unit:
         self.methods = {}       # (type name, method name) -> MethodInfo
         self.enums = {}         # name -> [(variant, explicit value or None)]
         self.data_enums = {}    # enum -> {variant: [(field|None, CType)]}
+        self.derives = {}       # type name -> [derived trait names]
         self.variants = {}      # mangled variant name -> enum name
         self.tuple_structs = set()   # struct names declared in tuple form
         self.unit_structs = set()    # struct names declared as `struct S;`
@@ -610,6 +611,8 @@ class Parser:
         # of the parser is reused unchanged.
         self.tysubst = tysubst or {}
         self.binds = []              # match-arm payload bindings
+        self.derives = []            # traits from the last `#[..]` run
+        self.item_derives = []       # traits on the item being parsed
         self.unit = unit or Unit()
         self.fn_sigs = self.unit.fn_sigs
         self.scopes = [{}]              # name -> CType
@@ -2661,6 +2664,7 @@ class Parser:
         """
         self.skip_attributes()
         self.skip_visibility()
+        self.item_derives = self.derives
         self.expect("enum")
         name = self.expect_ident()
         self.expect("{")
@@ -2746,7 +2750,14 @@ class Parser:
                     self.next()
 
     def skip_attributes(self):
-        """Skip `#[...]` outer attributes, which Crust does not interpret."""
+        """Skip `#[...]` outer attributes, recording any `derive` list.
+
+        Everything except `derive` is genuinely ignored -- `#[repr(C)]` is
+        already how Crust lays a struct out, and `#[inline]` and friends are
+        the backend's business. The derived trait names are kept in
+        `self.derives` for the caller that is about to parse the item.
+        """
+        self.derives = []
         while self.at("#", "punc"):
             self.next()
             if not self.at("[", "punc"):
@@ -2763,11 +2774,19 @@ class Parser:
                     depth -= 1
                     if depth == 0:
                         break
+                elif t.kind == "ident" and t.val == "derive" \
+                        and self.at("(", "punc"):
+                    d = self.i + 1
+                    while d < len(self.toks) and self.toks[d].val != ")":
+                        if self.toks[d].kind == "ident":
+                            self.derives.append(self.toks[d].val)
+                        d += 1
 
     def parse_struct(self):
         """Parse `struct Name { f: T, ... }`, returning (name, fields)."""
         self.skip_attributes()
         self.skip_visibility()
+        self.item_derives = self.derives
         self.expect("struct")
         name = self.expect_ident()
         self.skip_generic_params()
@@ -3769,8 +3788,12 @@ def collect_items(code, spans, unit, struct_order, fail=None):
                 unit.structs[name] = fields
                 struct_order.append(name)
                 local["structs"].append(name)
+                if p.item_derives:
+                    unit.derives[name] = p.item_derives
             elif kind == "enum":
                 name, variants, payloads = p.parse_enum()
+                if p.item_derives:
+                    unit.derives[name] = p.item_derives
                 unit.enums[name] = variants
                 if payloads:
                     unit.data_enums[name] = payloads
@@ -3972,6 +3995,143 @@ def collect_mod_items(names, path, unit, struct_order, _seen=None,
         seeded["consts"].extend(local["consts"])
         seeded["type_aliases"].extend(local["type_aliases"])
     return seeded
+
+
+# Traits Crust can derive, and what each one generates. `Copy` and `Eq` are
+# markers in Rust -- they add no method of their own -- so they are accepted
+# and produce nothing rather than being reported as unsupported.
+_DERIVABLE = {"Clone", "Copy", "PartialEq", "Eq", "Default", "Debug"}
+
+
+# C spellings a derived method can safely compare with `==` or hand to
+# printf. The test is deliberately a whitelist: a struct field, an array, or a
+# type Crust has not seen cannot be handled, and at the time derives are
+# generated some of those types are not in `unit.structs` yet -- opaque stubs
+# for unknown types are created later, during translation. A negative test
+# ("not a struct") therefore lets exactly the wrong cases through.
+_SCALAR_BASES = set(PRIMITIVES.values()) | {
+    "int", "unsigned int", "long", "unsigned long", "short",
+    "unsigned short", "char", "signed char", "unsigned char", "float",
+    "double", "long long", "unsigned long long", "_Bool", "long double",
+}
+
+
+def _is_scalar(ty):
+    """True if `ty` is something C can compare and print directly."""
+    if ty is None or ty.array:
+        return False
+    if ty.ptr:
+        return True
+    return ty.base in _SCALAR_BASES
+
+
+def emit_derives(unit, local_names):
+    """Generate the methods named by `#[derive(..)]` on each type.
+
+    These are written exactly as the equivalent hand-rolled `impl` would be --
+    ordinary `Type_method` functions -- so they dispatch statically and cost
+    nothing extra. An `impl` that defines the same method wins: a hand-written
+    `clone` is never overwritten by a derived one.
+
+    Only structs are derived for. A data-carrying enum would need per-variant
+    comparison and copying through its union, which is a different piece of
+    work; deriving on one is accepted (so the attribute does not fail the
+    file) but generates nothing, and the missing method is reported at the
+    call site rather than silently doing the wrong thing.
+    """
+    for name, traits in sorted(unit.derives.items()):
+        if name not in local_names:
+            # The type was seeded from a sibling module, so this translation
+            # unit has its declaration but not its definition. Generating a
+            # method here would emit a body for a type the C front end only
+            # knows as incomplete -- and the sibling's own TU derives it
+            # anyway, so nothing is lost by leaving it alone.
+            continue
+        fields = unit.structs.get(name)
+        if fields is None:
+            continue
+        for trait in traits:
+            if trait not in _DERIVABLE:
+                continue
+            gen = _DERIVE_IMPL.get(trait)
+            if gen is None:
+                continue                      # marker trait: nothing to emit
+            mname = gen[0]
+            if (name, mname) in unit.methods:
+                continue                      # a hand-written impl wins
+            gen[1](unit, name, fields)
+
+
+def _derive_clone(unit, name, fields):
+    """`fn clone(&self) -> T` -- a value copy, which is what C assignment is."""
+    _register(unit, name, "clone", CType(name), [], self_kind="ref")
+    unit.emitted.append("%s %s_clone(%s *self) { return *self; }"
+                        % (name, name, name))
+
+
+def _derive_default(unit, name, fields):
+    """`fn default() -> T` -- every field zeroed."""
+    _register(unit, name, "default", CType(name), [], self_kind=None)
+    unit.emitted.append("%s %s_default(void) { %s v = {0}; return v; }"
+                        % (name, name, name))
+
+
+def _derive_eq(unit, name, fields):
+    """`fn eq(&self, other: &T) -> bool` -- field by field, in order."""
+    tests = []
+    for fname, fty in fields:
+        if not _is_scalar(fty):
+            # An array or a nested struct cannot be compared with `==`, and
+            # memcmp would compare padding too. Skip deriving entirely rather
+            # than emit a comparison that is quietly wrong.
+            return
+        tests.append("self->%s == other->%s" % (fname, fname))
+    _register(unit, name, "eq", CType("_Bool"),
+              [("other", CType(name, 1))], self_kind="ref")
+    unit.emitted.append("_Bool %s_eq(%s *self, %s *other) { return %s; }"
+                        % (name, name, name, " && ".join(tests) or "1"))
+
+
+def _derive_debug(unit, name, fields):
+    """`fn debug(&self)` -- print the value, the way `{:?}` would.
+
+    Rust's `Debug` writes into a formatter; Crust has no `String`, so the
+    derived method prints directly. The name is `debug` rather than `fmt`
+    because it takes no formatter and would not satisfy a real `fmt::Debug`
+    bound -- calling it something else keeps that difference visible.
+    """
+    _register(unit, name, "debug", VOID, [], self_kind="ref")
+    unit.needs.add("printf")
+    parts, args = [], []
+    for fname, fty in fields:
+        if not _is_scalar(fty):
+            parts.append("%s: ..." % fname)
+            continue
+        parts.append("%s: %s" % (fname, _c_spec_for(fty)))
+        args.append("self->%s" % fname)
+    body = 'printf("%s { %s }", %s);' % (
+        name, ", ".join(parts).replace('"', ""),
+        ", ".join(args)) if args else 'printf("%s { %s }");' % (
+            name, ", ".join(parts))
+    unit.emitted.append("void %s_debug(%s *self) { %s }"
+                        % (name, name, body))
+
+
+def _register(unit, owner, mname, ret, params, self_kind):
+    """Register a generated method so call sites resolve it."""
+    info = MethodInfo(owner, mname, ret, self_kind or "none", params)
+    unit.methods[(owner, mname)] = info
+    selfp = [CType(owner, 1)] if self_kind == "ref" else (
+        [CType(owner)] if self_kind == "value" else [])
+    unit.fn_sigs[info.mangled] = (ret, selfp + [t for _, t in params])
+
+
+_DERIVE_IMPL = {
+    "Clone": ("clone", _derive_clone),
+    "Default": ("default", _derive_default),
+    "PartialEq": ("eq", _derive_eq),
+    "Debug": ("debug", _derive_debug),
+}
 
 
 def emit_trait_defaults(unit):
@@ -4579,9 +4739,11 @@ def translate(code, path=None):
     mod_aliases = [n for n in dict.fromkeys(mod_seeded["type_aliases"])
                    if n not in local_set]
 
-    # Trait impls inherit any default methods they did not override. This runs
-    # before pass 2 so a body can call a default the impl never wrote.
+    # Trait impls inherit any default methods they did not override, and
+    # `#[derive(..)]` generates its methods. Both run before pass 2 so a body
+    # can call a method neither the impl nor the user wrote out.
     emit_trait_defaults(unit)
+    emit_derives(unit, set(local["structs"]))
 
     # Pass 2: translate each item in place. Struct definitions are hoisted
     # into the prelude (see below), so their source region becomes blank.
