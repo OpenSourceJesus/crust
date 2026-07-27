@@ -100,6 +100,12 @@ class CType:
 
 
 VOID = CType("void")
+
+# Names the prelude may declare via `unit.needs`; never emit a conflicting
+# `extern` for these when core templates call them.
+_PRELUDE_LIBC = frozenset({
+    "malloc", "realloc", "free", "strlen", "abort", "printf", "fprintf",
+})
 INT = CType("int")
 
 
@@ -461,7 +467,10 @@ class Unit:
         self.const_inits = {}   # name -> (kw, init text) for prelude render
         self.type_aliases = {}  # name -> CType (fully resolved)
         self.opaque_structs = set()  # path types with no definition in unit
-        self.extern_fns = {}    # name -> [arg CType|None] for foreign path calls
+        # Opaque names that appear by value (struct fields, returns) need a
+        # one-byte placeholder body; pointer-only opaques stay incomplete.
+        self.opaque_complete = set()
+        self.extern_fns = {}    # name -> (ret CType|None, [arg CType|None])
         self.needs = set()      # libc prototypes the lowering requires
         self.slices = {}        # slice struct name -> element CType
         self.tuples = {}        # tuple struct name -> [element CTypes]
@@ -483,6 +492,7 @@ class Unit:
         self.struct_order = []      # instantiated structs, in creation order
         self.emitting = set()       # guards against recursive instantiation
         self.core_names = set()     # generics seeded from the bundled core
+        self.core_concrete = set()  # concrete core types pulled on demand
         # Traits. Dispatch is static: `impl Trait for T` registers its methods
         # under `T` with the same `T_method` mangling an inherent impl uses,
         # so a trait call is an ordinary direct call -- no vtable, no
@@ -762,6 +772,13 @@ class Parser:
                 return CType(PRIMITIVES[name])
             if name in self.unit.type_aliases:
                 return self.unit.type_aliases[name]
+            # Concrete bundled types (atomics, Ordering) -- pull on demand.
+            ensure_core_concrete(self.unit, name)
+            if name in self.unit.enums and not self.at("<", "punc"):
+                return CType(name)
+            if name in self.unit.structs and not self.at("<", "punc") \
+                    and name not in self.unit.generic_structs:
+                return CType(name)
             if name == "Result":
                 self.expect("<")
                 ok = self.parse_type()
@@ -785,6 +802,12 @@ class Parser:
                 if self.impl_type is None:
                     raise CrustError("line %d: `Self` outside an impl block"
                                      % t.line)
+                # Bare `Self` in `impl Foo<false>` still needs a C typedef even
+                # when `Foo` only exists as a generic template (const params).
+                if (self.impl_type not in self.unit.structs
+                        and self.impl_type not in self.unit.enums
+                        and self.impl_type not in self.unit.type_aliases):
+                    self.unit.opaque_structs.add(self.impl_type)
                 return CType(self.impl_type)
             if name in self.unit.generic_structs and self.at("<", "punc"):
                 return self.instantiate_struct(name, self.parse_type_args())
@@ -797,10 +820,13 @@ class Parser:
             # Unknown named type: assume a C struct/typedef of the same name.
             # Qualified paths that resolved to nothing still use the flattened
             # spelling; register them so the prelude can forward-declare.
-            if was_path and name not in self.unit.structs \
-                    and name not in self.unit.enums \
-                    and name not in self.unit.generic_structs:
-                self.unit.opaque_structs.add(name)
+            # Capitalised bare names, and bare uses of a generic template
+            # (const-generic `impl Foo<false>` → `Foo`), get the same.
+            if name not in self.unit.structs and name not in self.unit.enums \
+                    and name not in self.unit.type_aliases:
+                if name in self.unit.generic_structs \
+                        or was_path or (name and name[0].isupper()):
+                    self.unit.opaque_structs.add(name)
             return CType(name)
         raise CrustError("line %d: expected a type, found %r"
                          % (t.line, t.val or "<eof>"))
@@ -831,9 +857,12 @@ class Parser:
                 if depth <= 0:
                     self.next()
                     break
-            elif depth == 1 and self.cur.kind == "ident" and (
-                    not params or self.toks[self.i - 1].val == ","):
-                params.append(v)
+            elif depth == 1 and self.cur.kind == "ident":
+                prev = self.toks[self.i - 1].val if self.i > 0 else None
+                # Type params start after `<` or `,`. Skip const-param names
+                # (`const N`) and the types that follow a `:`.
+                if prev != "const" and prev in ("<", ","):
+                    params.append(v)
             self.next()
         return params
 
@@ -1252,9 +1281,16 @@ class Parser:
         """
         self.expected.append(ty)
         try:
-            return self.parse_expr()
+            e = self.parse_expr()
         finally:
             self.expected.pop()
+        # Associated types (`Self::Target`) and other opaque names often
+        # disagree with the concrete pointer the body produces. GCC 14+
+        # rejects that as an error; insert an explicit cast.
+        if ty is not None and ty.ptr and e is not None:
+            if e.type is None or (e.type.ptr and e.type.base != ty.base):
+                e = Expr("(%s)(%s)" % (ty.decl(), e.code), ty)
+        return e
 
     @property
     def target(self):
@@ -1385,9 +1421,20 @@ class Parser:
                     if sig is None and e.type is None and e.code:
                         # Foreign path call (`rmm::aarch64::init_mair`) or
                         # other unknown callee: emit an extern prototype so
-                        # the C front end can compile this TU alone.
-                        self.unit.extern_fns.setdefault(e.code, atypes)
-                    e = Expr("%s(%s)" % (e.code, ", ".join(args)), ret)
+                        # the C front end can compile this TU alone. Prefer
+                        # an expected return type when the call sits in a
+                        # typed position (`return KernelMapper::lock()`).
+                        # Skip names the prelude already declares (alloc).
+                        if e.code not in _PRELUDE_LIBC:
+                            ret_ty = self.target
+                            prev = self.unit.extern_fns.get(e.code)
+                            if prev is None:
+                                self.unit.extern_fns[e.code] = (ret_ty, atypes)
+                            elif prev[0] is None and ret_ty is not None:
+                                self.unit.extern_fns[e.code] = (
+                                    ret_ty, prev[1] or atypes)
+                    e = Expr("%s(%s)" % (e.code, ", ".join(args)),
+                             ret if ret is not None else self.target)
             elif self.at("[", "punc"):
                 self.next()
                 lo = None
@@ -2556,6 +2603,8 @@ class Parser:
             ftype = self.parse_type()
             if ftype.is_void():
                 self.err("field `%s` of `%s` has unit type", fname, name)
+            if not ftype.ptr and ftype.base in self.unit.opaque_structs:
+                self.unit.opaque_complete.add(ftype.base)
             fields.append((fname, ftype))
             if not self.accept(","):
                 break
@@ -3223,7 +3272,8 @@ def find_rust_items(code, rust_file=False):
         before = scan[line_start:start]
         if before.lstrip().startswith("#"):
             continue
-        if before.rstrip().endswith((".", ">")):
+        # `>`: turbofish / C template junk. `<`: const generics (`<const N`).
+        if before.rstrip().endswith((".", ">", "<")):
             continue
 
         if kw in ("const", "static"):
@@ -3402,15 +3452,21 @@ def _generic_params_of(toks, kind):
             return None
         p.next()
         if kind == "impl":
+            # `impl<const N: ty>` has no type params after skipping const
+            # generics, but it is still a template (do not lower the body).
+            had_angle = p.at("<", "punc")
             params = p.parse_generic_params()
             name = p.parse_path_name()
             if p.at("<", "punc"):
                 p.skip_generic_params()
             if p.accept("for"):
                 name = p.parse_path_name()
-            return (params, name) if params else None
+            if had_angle:
+                return (params if params else ["_const"], name)
+            return None
         name = p.expect_ident()
         params = p.parse_generic_params()
+        # Const-only `struct Foo<const N: ty>` lowers as a plain struct.
         return (params, name) if params else None
     except CrustError:
         return None
@@ -3599,6 +3655,7 @@ def _merge_unit(dst, src):
     dst.const_inits.update(src.const_inits)
     dst.type_aliases.update(src.type_aliases)
     dst.opaque_structs |= src.opaque_structs
+    dst.opaque_complete |= src.opaque_complete
     dst.extern_fns.update(src.extern_fns)
     dst.generic_structs.update(src.generic_structs)
     dst.generic_fns.update(src.generic_fns)
@@ -3707,6 +3764,37 @@ def _is_generic_span(code, start, end, kind):
 _CORE_CACHE = {}
 
 
+def _load_core_unit():
+    """Parse crust_core/core.rs once into a Unit (generics + concrete items)."""
+    if "full" in _CORE_CACHE:
+        return _CORE_CACHE["full"]
+    path = os.path.join(os.path.dirname(__file__), "crust_core", "core.rs")
+    unit = Unit()
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:                                    # pragma: no cover
+        _CORE_CACHE["full"] = unit
+        return unit
+    spans = find_rust_items(text, rust_file=True)
+    collect_items(text, spans, unit, [])
+    # Emit bodies for concrete (non-generic) impls so callers can link them
+    # into a using unit. Generic impls stay as templates.
+    for start, end, kind in spans:
+        if kind != "impl" or _is_generic_span(text, start, end, kind):
+            continue
+        line0 = _line_of(text, start)
+        parser = Parser(tokenize(text[start:end], line0), unit)
+        out = Out(line0)
+        try:
+            parser.parse_impl(out)
+        except CrustError:                              # pragma: no cover
+            continue
+        unit.emitted.append(out.text())
+    _CORE_CACHE["full"] = unit
+    return unit
+
+
 def core_templates():
     """Parse the bundled minimal core once; return its generic templates.
 
@@ -3715,19 +3803,50 @@ def core_templates():
     a unit that never mentions `Vec<T>` pays only this one-time parse (and
     that is cached across the whole process).
     """
-    if "unit" not in _CORE_CACHE:
-        path = os.path.join(os.path.dirname(__file__),
-                            "crust_core", "core.rs")
-        try:
-            with open(path, encoding="utf-8") as f:
-                text = f.read()
-        except OSError:                                    # pragma: no cover
-            _CORE_CACHE["unit"] = (({}, []))
-            return _CORE_CACHE["unit"]
-        unit = Unit()
-        collect_items(text, find_rust_items(text, rust_file=True), unit, [])
-        _CORE_CACHE["unit"] = (unit.generic_structs, unit.generic_impls)
-    return _CORE_CACHE["unit"]
+    unit = _load_core_unit()
+    return (unit.generic_structs, unit.generic_impls)
+
+
+def ensure_core_concrete(unit, name):
+    """Pull a non-generic core type (`AtomicU32`, `Ordering`, …) into `unit`.
+
+    Demand-driven: only types that are actually named get their struct/enum,
+    methods and method bodies. A local definition of the same name wins.
+    """
+    if name in unit.structs or name in unit.enums \
+            or name in unit.generic_structs:
+        return
+    # Atomics depend on Ordering for their method signatures.
+    if name in ("AtomicU32", "AtomicUsize"):
+        ensure_core_concrete(unit, "Ordering")
+    core = _load_core_unit()
+    if name in core.generic_structs:
+        return
+    if name in core.enums and name not in unit.enums:
+        unit.enums[name] = core.enums[name]
+        for vname, _ in core.enums[name]:
+            unit.variants["%s_%s" % (name, vname)] = name
+        unit.core_concrete.add(name)
+    if name in core.structs and name not in unit.structs:
+        unit.structs[name] = core.structs[name]
+        unit.core_concrete.add(name)
+        if name in core.tuple_structs:
+            unit.tuple_structs.add(name)
+        if name in core.unit_structs:
+            unit.unit_structs.add(name)
+    if name not in unit.core_concrete:
+        return
+    for (owner, mname), info in core.methods.items():
+        if owner != name or (owner, mname) in unit.methods:
+            continue
+        unit.methods[(owner, mname)] = info
+        if info.mangled in core.fn_sigs:
+            unit.fn_sigs[info.mangled] = core.fn_sigs[info.mangled]
+    # Copy method bodies for this type from the core's emitted list.
+    prefix = name + "_"
+    for text in core.emitted:
+        if prefix in text and text not in unit.emitted:
+            unit.emitted.append(text)
 
 
 def seed_core(unit):
@@ -3737,6 +3856,8 @@ def seed_core(unit):
     included `.rs` -- always wins, so seeding can never change the meaning of
     code that did not need core in the first place.
     """
+    if not hasattr(unit, "core_concrete"):
+        unit.core_concrete = set()
     gstructs, gimpls = core_templates()
     for name, tmpl in gstructs.items():
         if name not in unit.generic_structs and name not in unit.structs:
@@ -3803,6 +3924,52 @@ def _render_enum(name, variants):
         name, ", ".join(parts), name, name)
 
 
+def _format_int_literal(value, ty):
+    """Format an integer for a `#define` / enum, with a C suffix from `ty`."""
+    bits = _int_bits(ty)
+    if "unsigned" in ty.base and bits:
+        value = value & ((1 << bits) - 1)
+    if value < 0:
+        body = str(value)
+    else:
+        body = "0x%X" % value if value >= 0x10000 else str(value)
+    if "unsigned" in ty.base:
+        body += "u"
+    if ty.base.endswith("long"):
+        body += "l"
+    return body
+
+
+def _int_bits(ty):
+    """Width in bits for an integer CType, or 0 if unknown."""
+    if ty.ptr or ty.array:
+        return 0
+    b = ty.base
+    if "char" in b:
+        return 8
+    if "short" in b:
+        return 16
+    if b.endswith("long"):
+        return 64
+    if "int" in b or b in _RANK:
+        return 32
+    return 0
+
+
+def _struct_new_to_compound(init, ty):
+    """Rewrite `Type_new(args)` to a brace initializer when `ty` is that struct.
+
+    Static storage cannot call a function; `AtomicU32::new(x)` must become
+    `{ x }` so it is a constant aggregate initializer.
+    """
+    if ty is None or ty.ptr or ty.array:
+        return None
+    m = re.match(r"^(%s)_new\((.*)\)$" % re.escape(ty.base), init.strip())
+    if not m:
+        return None
+    return "{ %s }" % m.group(2)
+
+
 def _render_const(kw, name, ty, init):
     """Render one `const`/`static` as a C file-scope declaration.
 
@@ -3816,26 +3983,23 @@ def _render_const(kw, name, ty, init):
         if folded is not None and not ty.ptr and not ty.array \
                 and ty.base in _RANK:
             text = _format_int_literal(folded, ty)
-            if -(2 ** 31) <= folded < 2 ** 31:
+            # Re-fold through format's unsigned mask for the fit check.
+            bits = _int_bits(ty)
+            check = folded
+            if "unsigned" in ty.base and bits:
+                check = folded & ((1 << bits) - 1)
+            if -(2 ** 31) <= check < 2 ** 31 and "unsigned" not in ty.base:
+                return "enum { %s = %s };" % (name, text)
+            if -(2 ** 31) <= check < 2 ** 31 and check <= 0x7FFFFFFF:
                 return "enum { %s = %s };" % (name, text)
             return "#define %s %s" % (name, text)
         if _fits_c_enum(ty, init):
             return "enum { %s = %s };" % (name, init)
+    compound = _struct_new_to_compound(init, ty)
+    if compound is not None:
+        init = compound
     prefix = "static const " if kw == "const" else "static "
     return "%s%s = %s;" % (prefix, ty.decl(name), init)
-
-
-def _format_int_literal(value, ty):
-    """Format an integer for a `#define` / enum, with a C suffix from `ty`."""
-    if value < 0:
-        body = str(value)
-    else:
-        body = "0x%X" % value if value >= 0x10000 else str(value)
-    if "unsigned" in ty.base:
-        body += "u"
-    if ty.base.endswith("long"):
-        body += "l"
-    return body
 
 
 def _fold_int_const(init, env):
@@ -3948,7 +4112,11 @@ def _render_consts(code, spans, unit):
             if val is not None and not ty.ptr and not ty.array \
                     and ty.base in _RANK:
                 text = _format_int_literal(val, ty)
-                if -(2 ** 31) <= val < 2 ** 31:
+                bits = _int_bits(ty)
+                check = val
+                if "unsigned" in ty.base and bits:
+                    check = val & ((1 << bits) - 1)
+                if -(2 ** 31) <= check < 2 ** 31:
                     out.append("enum { %s = %s };" % (name, text))
                 else:
                     out.append("#define %s %s" % (name, text))
@@ -4122,13 +4290,23 @@ def translate(code, path=None):
         prelude.append("void free(void *);")
     for name in mod_enums + local["enums"]:
         prelude.append(_render_enum(name, unit.enums[name]))
+    for name in sorted(unit.core_concrete):
+        if name in unit.enums and name not in local_set:
+            prelude.append(_render_enum(name, unit.enums[name]))
     # Incomplete types for qualified paths the unit never defined
     # (`crate::percpu::PercpuBlock` -> crate_percpu_PercpuBlock).
     for name in sorted(unit.opaque_structs):
         if name not in unit.structs and name not in local_set:
-            prelude.append("struct %s; typedef struct %s %s;"
-                           % (name, name, name))
-    for name in mod_structs + local["structs"]:
+            if name in unit.opaque_complete:
+                prelude.append(
+                    "struct %s { char _crust_opaque; }; "
+                    "typedef struct %s %s;" % (name, name, name))
+            else:
+                prelude.append("struct %s; typedef struct %s %s;"
+                               % (name, name, name))
+    core_structs = [n for n in sorted(unit.core_concrete)
+                    if n in unit.structs and n not in local_set]
+    for name in core_structs + mod_structs + local["structs"]:
         prelude.append("struct %s; typedef struct %s %s;"
                        % (name, name, name))
     # Slice structs hold only a pointer to their element, so the forward
@@ -4161,7 +4339,8 @@ def translate(code, path=None):
             prelude.append("struct %s; typedef struct %s %s;"
                            % (name, name, name))
     for name in _toposort_structs(
-            unit, mod_structs + local["structs"] + unit.struct_order):
+            unit, core_structs + mod_structs + local["structs"]
+            + unit.struct_order):
         prelude.append(_render_struct(name, unit.structs[name]))
     # Aliases after structs so `type Handle = Foo` can name a local struct.
     for name in mod_aliases + local["type_aliases"]:
@@ -4192,17 +4371,21 @@ def translate(code, path=None):
     for text in _render_consts(code, spans, unit):
         prelude.append(text)
     prelude.extend(local["impl_consts"])
-    for name, atypes in sorted(unit.extern_fns.items()):
+    for name, info in sorted(unit.extern_fns.items()):
         if name in unit.fn_sigs or name in included_fns:
             continue
+        ret_ty, atypes = info if isinstance(info, tuple) else (None, info)
         params = []
         for t in atypes:
             if t is None or t.is_void():
                 params.append("void *")
             else:
                 params.append(t.decl())
-        prelude.append("extern void %s(%s);"
-                       % (name, ", ".join(params) or "void"))
+        ret = "void"
+        if ret_ty is not None and not ret_ty.is_void():
+            ret = ret_ty.decl()
+        prelude.append("extern %s %s(%s);"
+                       % (ret, name, ", ".join(params) or "void"))
     for name, (ret, ps) in unit.fn_sigs.items():
         if name == "main" or name in included_fns:
             continue
