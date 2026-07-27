@@ -331,6 +331,25 @@ the includer, without inlining its text. That is what lets a Rust function in
 the C file construct a `Vec2` or call `Vec2::new`, while the `#include` itself
 stays in place for the preprocessor to expand.
 
+## Interop notes
+
+Three things bite when Rust and rpython meet in one unit, all mechanical once
+known:
+
+**Strings are `c_char`, not `char`.** py2c spells `str` as C `char *`. A Rust
+`char` is four bytes, so `*mut char` lowers to `unsigned int *` and will not
+match. The right spelling is `*mut c_char`, which is exactly C's `char *`.
+
+**Module globals need their initialiser.** py2c emits a `<module>_init()` per
+module that populates module-level globals. A module whose globals are plain
+integers works without it; one holding a list or a string does not, and the
+symptom is a silently empty table rather than a crash. Call it once before
+anything reads them.
+
+**A struct literal cannot sit directly in an `if` condition.** `if
+f(E::V { x: 1 }) { .. }` is ambiguous with the block that follows, in Crust as
+in Rust. Bind it first.
+
 ## rpython modules by `#include`
 
 The repo already has a second source-to-source front end: `tools/py2c.py`,
