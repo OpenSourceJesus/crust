@@ -506,8 +506,8 @@ Measuring compilation instead of translation changed the picture completely:
 
 | | files |
 |---|---|
-| translate (at least one lowered item) | 75 |
-| **actually compile to an object** | **50** |
+| translate (at least one lowered item) | 105 |
+| **actually compile to an object** | **92** |
 
 Erasing `use` and mapping the `c_*` types took that second number from 12 to
 33 — nearly a 3x improvement from two small changes that three rounds of
@@ -526,6 +526,40 @@ how many blockers a typical file has (mean 3.1), how many files each feature
 would unlock *on its own*, and a greedy set-cover over the real data — which is
 a far better roadmap than a frequency ranking, because a file is only unlocked
 when every one of its blockers is gone.
+
+## Cross-file types
+
+Crust compiles one translation unit at a time, but a Rust crate spreads its
+types across files: `pub type pid_t = c_int;` lives in `platform/types.rs` and
+is used everywhere. Two mechanisms bring those definitions into view.
+
+`mod X;` declarations are followed to any depth — they describe the crate's own
+tree, so following them is cheap and always relevant. `use crate::a::b::{..}`
+paths are followed **one level**, from the file being compiled only: a `use`
+can reach across an entire workspace, and the types worth having are almost
+always in the file named directly. `crate::` resolves against the directory
+holding `lib.rs` or `main.rs`, found by walking up from the current file;
+`super::` and `self::` resolve relative to it.
+
+Only *declarations* are taken — structs, enums, consts, type aliases and method
+signatures. No function body is translated, because the sibling owns its own
+translation unit.
+
+**Seeding is best effort and never fatal.** A sibling that cannot be read or
+parsed costs the types it defines and nothing more. This is the whole design
+constraint: if a broken sibling could fail the current file, then adding a
+`use` would be strictly worse than leaving a type undeclared, which is the
+opposite of the point.
+
+### File-scope macros
+
+A macro invoked at file scope — `global_asm!(..)`, `int_like!{..}` — expands to
+items Crust cannot produce, and passing it through verbatim guarantees a C
+syntax error (`global_asm!` in particular carries a multi-line assembly string
+the C lexer reads as an unterminated quote). These are erased. The cost is real
+— whatever the macro would have defined is lost — but the alternative is a file
+that cannot compile at all rather than one that compiles without those
+definitions. A macro call *inside* a body is untouched and expands normally.
 
 ## Lifetimes and visibility
 
@@ -768,7 +802,7 @@ Where things stand on Redox (kernel + relibc + ion, 615 files):
 | partial (some items lowered) | 35 | 5.7% |
 | failed (items found, translation errored) | 459 | 74.6% |
 | empty (no Rust items recognized) | 89 | 14.5% |
-| **compile to an object** (`survey --verify`) | **50** | **8.1%** |
+| **compile to an object** (`survey --verify`) | **92** | **15.0%** |
 
 6355 top-level Rust items parse. With generics landed, the ranked blockers
 behind the 458 remaining failures are paths in type position (7.9%), `impl
