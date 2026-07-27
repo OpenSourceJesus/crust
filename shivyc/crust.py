@@ -460,6 +460,7 @@ class Unit:
         self.const_values = {}  # const name -> initializer text
         self.const_inits = {}   # name -> (kw, init text) for prelude render
         self.type_aliases = {}  # name -> CType (fully resolved)
+        self.opaque_structs = set()  # path types with no definition in unit
         self.needs = set()      # libc prototypes the lowering requires
         self.slices = {}        # slice struct name -> element CType
         self.tuples = {}        # tuple struct name -> [element CTypes]
@@ -739,6 +740,7 @@ class Parser:
             return CType(inner.base, inner.ptr, dims)
         if t.kind in ("ident", "kw"):
             name = self.next().val
+            was_path = False
             if self.at("::", "punc"):
                 # A qualified type: `fmt::Write`, `alloc::boxed::Box<T>`.
                 # Try the flattened spelling first, since that is what a Crust
@@ -752,6 +754,7 @@ class Parser:
                         break                       # turbofish on a path
                     segs.append(self.expect_ident())
                 name = self._resolve_path(segs)
+                was_path = len(segs) > 1
             if name in PRIMITIVES:
                 if name == "str" and not self.behind_ref:
                     self.err("`str` is unsized; write `&str`")
@@ -791,6 +794,12 @@ class Parser:
                 self.err("no definition for generic type `%s` in this unit; "
                          "Crust monomorphises from source and has no std", name)
             # Unknown named type: assume a C struct/typedef of the same name.
+            # Qualified paths that resolved to nothing still use the flattened
+            # spelling; register them so the prelude can forward-declare.
+            if was_path and name not in self.unit.structs \
+                    and name not in self.unit.enums \
+                    and name not in self.unit.generic_structs:
+                self.unit.opaque_structs.add(name)
             return CType(name)
         raise CrustError("line %d: expected a type, found %r"
                          % (t.line, t.val or "<eof>"))
@@ -4105,6 +4114,12 @@ def translate(code, path=None):
         prelude.append("void free(void *);")
     for name in mod_enums + local["enums"]:
         prelude.append(_render_enum(name, unit.enums[name]))
+    # Incomplete types for qualified paths the unit never defined
+    # (`crate::percpu::PercpuBlock` -> crate_percpu_PercpuBlock).
+    for name in sorted(unit.opaque_structs):
+        if name not in unit.structs and name not in local_set:
+            prelude.append("struct %s; typedef struct %s %s;"
+                           % (name, name, name))
     for name in mod_structs + local["structs"]:
         prelude.append("struct %s; typedef struct %s %s;"
                        % (name, name, name))

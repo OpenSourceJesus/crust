@@ -1996,6 +1996,27 @@ fn main() -> i32 {
 """, suffix=".rs"), 42)
 
 
+class TestCrustOpaquePaths(unittest.TestCase):
+    """Qualified path types with no definition become incomplete structs."""
+
+    def test_path_type_is_forward_declared(self):
+        c = crust.translate(
+            "fn f(p: &crate::percpu::PercpuBlock) { }\n")
+        self.assertIn("struct crate_percpu_PercpuBlock;", c)
+        self.assertIn("typedef struct crate_percpu_PercpuBlock "
+                      "crate_percpu_PercpuBlock;", c)
+        self.assertIn("crate_percpu_PercpuBlock *", c)
+
+    def test_path_type_compiles(self):
+        self.assertEqual(_run("""
+fn take(_p: &crate::sync::Token) { }
+fn main() -> i32 {
+    // Never constructed; only the incomplete type is needed for -c.
+    42
+}
+""", suffix=".rs"), 42)
+
+
 class TestCrustVisibility(unittest.TestCase):
     """`pub`, `pub(crate)`, and `pub unsafe extern "C"`."""
 
