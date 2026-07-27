@@ -3787,11 +3787,117 @@ def _render_enum(name, variants):
 
 
 def _render_const(kw, name, ty, init):
-    """Render one `const`/`static` as a C file-scope declaration."""
-    if kw == "const" and _fits_c_enum(ty, init):
-        return "enum { %s = %s };" % (name, init)
+    """Render one `const`/`static` as a C file-scope declaration.
+
+    Integer `const`s that fit in a C `int` become enum constants (usable in
+    constant expressions). Larger integer consts become `#define`s for the
+    same reason -- `static const` is not a constant expression in C, so a
+    later `const B: usize = A + 4096` would otherwise fail at file scope.
+    """
+    if kw == "const":
+        folded = _fold_int_const(init, {})
+        if folded is not None and not ty.ptr and not ty.array \
+                and ty.base in _RANK:
+            text = _format_int_literal(folded, ty)
+            if -(2 ** 31) <= folded < 2 ** 31:
+                return "enum { %s = %s };" % (name, text)
+            return "#define %s %s" % (name, text)
+        if _fits_c_enum(ty, init):
+            return "enum { %s = %s };" % (name, init)
     prefix = "static const " if kw == "const" else "static "
     return "%s%s = %s;" % (prefix, ty.decl(name), init)
+
+
+def _format_int_literal(value, ty):
+    """Format an integer for a `#define` / enum, with a C suffix from `ty`."""
+    if value < 0:
+        body = str(value)
+    else:
+        body = "0x%X" % value if value >= 0x10000 else str(value)
+    if "unsigned" in ty.base:
+        body += "u"
+    if ty.base.endswith("long"):
+        body += "l"
+    return body
+
+
+def _fold_int_const(init, env):
+    """Evaluate a const initializer as an int, or return None.
+
+    Handles integer literals (with Rust `_` separators), parenthesised forms,
+    unary `+/-/~`, and binary `+ - *` / `| & ^` / `<< >>` over those. Names
+    are resolved through `env` (const name -> int).
+    """
+    s = init.strip()
+    if not s:
+        return None
+    # Replace known names first -- they may contain underscores (`FOO_BAR`).
+    if env:
+        for name in sorted(env, key=len, reverse=True):
+            if name in s:
+                s = re.sub(r"\b%s\b" % re.escape(name), str(env[name]), s)
+    # Strip Rust digit separators from numeric literals only.
+    s = re.sub(r"(?<=[\da-fA-FxX])_(?=[\da-fA-F])", "", s)
+    try:
+        import ast
+        tree = ast.parse(s, mode="eval")
+    except SyntaxError:
+        return None
+    try:
+        return _eval_int_ast(tree.body)
+    except Exception:
+        return None
+
+
+def _eval_int_ast(node):
+    import ast
+    if isinstance(node, ast.Constant) and isinstance(node.value, int):
+        return node.value
+    # Python < 3.8
+    if hasattr(ast, "Num") and isinstance(node, ast.Num):           # pragma: no cover
+        return int(node.n)
+    if isinstance(node, ast.UnaryOp):
+        v = _eval_int_ast(node.operand)
+        if isinstance(node.op, ast.UAdd):
+            return v
+        if isinstance(node.op, ast.USub):
+            return -v
+        if isinstance(node.op, ast.Invert):
+            return ~v
+    if isinstance(node, ast.BinOp):
+        a, b = _eval_int_ast(node.left), _eval_int_ast(node.right)
+        ops = {
+            ast.Add: lambda x, y: x + y,
+            ast.Sub: lambda x, y: x - y,
+            ast.Mult: lambda x, y: x * y,
+            ast.BitOr: lambda x, y: x | y,
+            ast.BitAnd: lambda x, y: x & y,
+            ast.BitXor: lambda x, y: x ^ y,
+            ast.LShift: lambda x, y: x << y,
+            ast.RShift: lambda x, y: x >> y,
+        }
+        fn = ops.get(type(node.op))
+        if fn is not None:
+            return fn(a, b)
+    raise ValueError("not an int const")
+
+
+def _emit_prelude(body, prelude):
+    """Insert prelude at a safe offset.
+
+    Ordinary items share one physical line so source line numbers do not
+    move. `#define`s need their own lines (the directive runs to newline),
+    so they are placed just before that shared line.
+    """
+    if not prelude:
+        return body
+    at = _prelude_offset(body)
+    defines = [p for p in prelude if p.startswith("#define ")]
+    rest = [p for p in prelude if not p.startswith("#define ")]
+    chunk = "".join(d + "\n" for d in defines)
+    if rest:
+        chunk += " ".join(rest) + " "
+    return body[:at] + chunk + body[at:]
 
 
 def _render_consts(code, spans, unit):
@@ -3799,17 +3905,38 @@ def _render_consts(code, spans, unit):
 
     A Rust `const` is a compile-time constant, so an integer one is emitted as
     a C enum constant rather than `static const`: only the former is a
-    constant expression, and so only the former can size an array. Anything
-    else -- floats, pointers, non-literal initializers, `static` -- becomes an
-    ordinary file-scope object.
+    constant expression, and so only the former can size an array. Values
+    that do not fit in a C `int` become `#define`s for the same reason.
+    Anything else -- floats, pointers, non-literal initializers, `static` --
+    becomes an ordinary file-scope object.
     """
-    out = []
+    # First pass: fold integer values so later consts can name earlier ones.
+    env = {}
+    items = []
     for start, end, kind in spans:
         if kind != "const":
             continue
         p = Parser(tokenize(code[start:end], _line_of(code, start)), unit)
         kw, name, ty, init = p.parse_const_signature()
-        out.append(_render_const(kw, name, ty, init.code))
+        items.append((kw, name, ty, init.code))
+        if kw == "const":
+            val = _fold_int_const(init.code, env)
+            if val is not None:
+                env[name] = val
+    out = []
+    for kw, name, ty, init in items:
+        # Re-fold with the full env so `B = A + 1` sees A's value.
+        if kw == "const":
+            val = _fold_int_const(init, env)
+            if val is not None and not ty.ptr and not ty.array \
+                    and ty.base in _RANK:
+                text = _format_int_literal(val, ty)
+                if -(2 ** 31) <= val < 2 ** 31:
+                    out.append("enum { %s = %s };" % (name, text))
+                else:
+                    out.append("#define %s %s" % (name, text))
+                continue
+        out.append(_render_const(kw, name, ty, init))
     return out
 
 
@@ -3821,11 +3948,10 @@ def _fits_c_enum(ty, init):
     """
     if ty.ptr or ty.array or ty.base not in _RANK:
         return False
-    try:
-        value = int(init, 0)
-    except ValueError:
+    folded = _fold_int_const(init, {})
+    if folded is None:
         return False
-    return -(2 ** 31) <= value < 2 ** 31
+    return -(2 ** 31) <= folded < 2 ** 31
 
 
 def _render_struct(name, fields):
@@ -4057,8 +4183,7 @@ def translate(code, path=None):
         body = body.rstrip("\n") + "\n\n" + "\n".join(unit.emitted) + "\n"
     if not prelude:
         return body
-    at = _prelude_offset(body)
-    return body[:at] + " ".join(prelude) + " " + body[at:]
+    return _emit_prelude(body, prelude)
 
 
 def translate_file(path):
