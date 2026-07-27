@@ -117,6 +117,71 @@ impl<T> Vec<T> {
 }
 
 // ---------------------------------------------------------------------------
+// PyList<T> -- the list an included rpython module builds.
+//
+// `tools/py2c.py` lowers a typed rpython list to
+//
+//     typedef struct _tlist_int { int* data; long len; long cap; } _tlist_int;
+//
+// which is the same three words in the same order as this type. That is the
+// whole point: an rpython function returning `list[int]` hands back something
+// Rust can walk directly, with a pointer cast and no copy.
+//
+// This is how Crust gets iteration over a built-up collection without having
+// an iterator protocol. RPython already has one, and its output is a plain
+// struct, so `for x in xs` over the result needs nothing new -- see
+// `examples/crust/polylist.c`.
+//
+// The layout must not drift from py2c's. `len` and `cap` are `i64` rather
+// than `usize` because py2c emits `long`, and a mismatch here would be a
+// silent misread rather than a compile error.
+// ---------------------------------------------------------------------------
+struct PyList<T> {
+    data: *mut T,
+    len: i64,
+    cap: i64,
+}
+
+impl<T> PyList<T> {
+    fn len(&self) -> i64 {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn capacity(&self) -> i64 {
+        self.cap
+    }
+
+    fn get(&self, i: i64) -> T {
+        self.data[i]
+    }
+
+    fn set(&mut self, i: i64, value: T) {
+        self.data[i] = value;
+    }
+
+    fn last(&self) -> T {
+        self.data[self.len - 1]
+    }
+
+    fn as_ptr(&self) -> *mut T {
+        self.data
+    }
+
+    // The buffer belongs to the rpython runtime, which allocated it with
+    // malloc; freeing it here is correct but must not be done twice.
+    fn free_buf(&mut self) {
+        free(self.data as *mut u8);
+        self.data = 0 as *mut T;
+        self.len = 0;
+        self.cap = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Box<T> -- a single heap-allocated value.
 //
 // Without `Drop` this is a thin, explicit wrapper: `new` allocates, `get`
