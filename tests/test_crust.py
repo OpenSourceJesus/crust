@@ -2501,3 +2501,67 @@ class TestNoInternalCrashes(unittest.TestCase):
                               "int f(struct S s) { return s.a + s.b; }\n"
                               "int main(void) { struct S s; s.a = 40; s.b = 2;"
                               " return f(s); }"), 42)
+
+
+class TestCrustPyList(unittest.TestCase):
+    """`PyList<T>` -- the list an included rpython module builds.
+
+    Its layout must match what `tools/py2c.py` emits for a typed list
+    (`struct _tlist_int { int* data; long len; long cap; }`), because the two
+    are passed to each other by a pointer cast with no conversion.
+    """
+
+    def test_layout_matches_py2c(self):
+        c = crust.translate("fn f(p: *mut PyList<i32>) -> i64 { p.len() }")
+        self.assertIn("struct PyList_int { int *data; long len; long cap; }", c)
+
+    def test_element_type_is_monomorphised(self):
+        c = crust.translate("""
+fn a(p: *mut PyList<i32>) -> i64 { p.len() }
+fn b(p: *mut PyList<f64>) -> i64 { p.len() }
+""")
+        self.assertIn("struct PyList_int", c)
+        self.assertIn("struct PyList_double", c)
+
+    def test_for_each_over_a_pylist_pointer(self):
+        c = crust.translate("""
+fn total(xs: *mut PyList<i32>) -> i32 {
+    let mut s: i32 = 0;
+    for x in xs { s += x; }
+    s
+}
+""")
+        self.assertIn("->data[", c)
+        self.assertIn("->len", c)
+
+    def test_for_each_over_a_pylist_value(self):
+        c = crust.translate("""
+fn total(xs: PyList<i32>) -> i32 {
+    let mut s: i32 = 0;
+    for x in xs { s += x; }
+    s
+}
+""")
+        self.assertIn(".data[", c)
+
+    def test_plain_pointer_is_still_rejected(self):
+        # Only a PyList pointer is iterable; a raw pointer has no length.
+        with self.assertRaises(crust.CrustError):
+            crust.translate("fn f(p: *const i32) { for x in p { } }")
+
+    def test_unused_pylist_costs_nothing(self):
+        c = crust.translate("fn f() -> i32 { 1 }")
+        self.assertNotIn("PyList", c)
+
+
+class TestRpythonPrototypes(unittest.TestCase):
+    """The libc prototypes a runtime-free rpython module gets."""
+
+    def test_realloc_takes_two_arguments(self):
+        # A one-argument `realloc` made any rpython module that grew a list
+        # fail to compile -- and only when the module avoided the runtime, so
+        # it went unnoticed until a list was passed to Rust.
+        import shivyc.rpyinc as rpyinc
+        protos = dict(rpyinc._LIBC_PROTOS)
+        self.assertEqual(protos["realloc"],
+                         "void *realloc(void *, unsigned long);")
