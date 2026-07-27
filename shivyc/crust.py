@@ -3678,9 +3678,22 @@ def _is_rust_enum(scan, close):
 
 
 def _is_rust_struct_body(body):
-    """True if a `struct X { ... }` body is Rust rather than C."""
-    if ";" in body:
-        return False                    # C members end in `;`
+    """True if a `struct X { ... }` body is Rust rather than C.
+
+    C members end in `;` and Rust fields are separated by `,`, so a semicolon
+    is the tell -- but only a *top-level* one. A Rust array type carries one
+    inside brackets (`a: [i32; 4]`), and counting that made every struct with
+    an array field read as C, which silently passed the whole declaration
+    through untranslated instead of reporting anything.
+    """
+    depth = 0
+    for ch in body:
+        if ch in "[(":
+            depth += 1
+        elif ch in "])":
+            depth -= 1
+        elif ch == ";" and depth <= 0:
+            return False
     return re.search(r"[A-Za-z_]\w*\s*:", body) is not None
 
 
