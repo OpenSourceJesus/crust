@@ -242,6 +242,191 @@ impl<T> Cell<T> {
 }
 
 // ---------------------------------------------------------------------------
+// UnsafeCell<T> / SyncUnsafeCell<T> -- interior mutability.
+//
+// These are faithful. In real Rust `UnsafeCell<T>` is literally a struct with
+// one field; all it does is tell the *compiler* that aliasing rules do not
+// apply to its contents. Crust has no aliasing rules to suspend, so the
+// wrapper carries exactly the same information here: none.
+// ---------------------------------------------------------------------------
+struct UnsafeCell<T> {
+    value: T,
+}
+
+impl<T> UnsafeCell<T> {
+    fn new(value: T) -> UnsafeCell<T> {
+        UnsafeCell { value: value }
+    }
+
+    fn get(&self) -> *mut T {
+        &self.value as *mut T
+    }
+
+    fn read(&self) -> T {
+        self.value
+    }
+
+    fn write(&mut self, value: T) {
+        self.value = value;
+    }
+}
+
+struct SyncUnsafeCell<T> {
+    value: T,
+}
+
+impl<T> SyncUnsafeCell<T> {
+    fn new(value: T) -> SyncUnsafeCell<T> {
+        SyncUnsafeCell { value: value }
+    }
+
+    fn get(&self) -> *mut T {
+        &self.value as *mut T
+    }
+
+    fn read(&self) -> T {
+        self.value
+    }
+
+    fn write(&mut self, value: T) {
+        self.value = value;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NonNull<T> -- a pointer asserted not to be null.
+//
+// Also faithful: in real Rust the guarantee is a *niche* for layout
+// optimisation and a promise the programmer makes, not a runtime check.
+// `is_null` is provided so code that wants the check can make it.
+// ---------------------------------------------------------------------------
+struct NonNull<T> {
+    ptr: *mut T,
+}
+
+impl<T> NonNull<T> {
+    fn new(ptr: *mut T) -> NonNull<T> {
+        NonNull { ptr: ptr }
+    }
+
+    fn as_ptr(&self) -> *mut T {
+        self.ptr
+    }
+
+    fn read(&self) -> T {
+        self.ptr[0]
+    }
+
+    fn write(&mut self, value: T) {
+        self.ptr[0] = value;
+    }
+
+    fn is_null(&self) -> bool {
+        self.ptr == 0 as *mut T
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Once<T> -- run-once initialisation.
+//
+// Faithful for a single-threaded caller: the flag records whether the value
+// has been produced. What is missing is the *blocking* half -- a real `Once`
+// makes a second thread wait for the first to finish. There are no threads
+// here, so there is nothing to wait for.
+// ---------------------------------------------------------------------------
+struct Once<T> {
+    value: T,
+    done: bool,
+}
+
+impl<T> Once<T> {
+    fn new(zero: T) -> Once<T> {
+        Once { value: zero, done: false }
+    }
+
+    fn is_completed(&self) -> bool {
+        self.done
+    }
+
+    fn call_once(&mut self, value: T) -> T {
+        if !self.done {
+            self.value = value;
+            self.done = true;
+        }
+        self.value
+    }
+
+    fn get(&self) -> T {
+        self.value
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mutex<T> / RwLock<T> -- NOT synchronising. Read this before using them.
+//
+// These exist so that code written against `std` parses and lowers. They do
+// no locking whatsoever: `lock()` hands back a pointer to the inner value and
+// nothing else happens.
+//
+// That is defensible only because Crust has no threads at all -- no spawn, no
+// atomics, no memory model. There is nothing here for a lock to protect
+// against, so a lock that does nothing is consistent with the rest of the
+// model rather than a hole in it. The moment real concurrency exists, these
+// become actively dangerous and must be replaced, not extended.
+//
+// They are deliberately *not* named something honest like `FakeMutex`,
+// because the whole point is to accept source written as `Mutex<T>`. The
+// warning has to live here instead.
+// ---------------------------------------------------------------------------
+struct Mutex<T> {
+    value: T,
+}
+
+impl<T> Mutex<T> {
+    fn new(value: T) -> Mutex<T> {
+        Mutex { value: value }
+    }
+
+    fn lock(&self) -> *mut T {
+        &self.value as *mut T
+    }
+
+    fn read(&self) -> T {
+        self.value
+    }
+
+    fn write(&mut self, value: T) {
+        self.value = value;
+    }
+}
+
+struct RwLock<T> {
+    value: T,
+}
+
+impl<T> RwLock<T> {
+    fn new(value: T) -> RwLock<T> {
+        RwLock { value: value }
+    }
+
+    fn read_ptr(&self) -> *mut T {
+        &self.value as *mut T
+    }
+
+    fn write_ptr(&self) -> *mut T {
+        &self.value as *mut T
+    }
+
+    fn read(&self) -> T {
+        self.value
+    }
+
+    fn write(&mut self, value: T) {
+        self.value = value;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PhantomData<T> -- a zero-sized marker. Real Rust uses it to tie a type
 // parameter to a struct that does not otherwise mention it; here it exists so
 // that such a struct still parses. It lowers to the same one-byte placeholder
