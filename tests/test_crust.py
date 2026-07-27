@@ -2565,3 +2565,53 @@ class TestRpythonPrototypes(unittest.TestCase):
         protos = dict(rpyinc._LIBC_PROTOS)
         self.assertEqual(protos["realloc"],
                          "void *realloc(void *, unsigned long);")
+
+
+class TestCrustArrayFields(unittest.TestCase):
+    """A struct field whose type is an array.
+
+    The Rust-vs-C struct-body test used to reject any body containing a `;`,
+    on the grounds that C members end in one. A Rust array type carries a
+    semicolon inside its brackets (`a: [i32; 4]`), so every struct with an
+    array field read as C and was passed through untranslated -- silently,
+    with no diagnostic, which is how it went unnoticed.
+    """
+
+    def test_array_field_is_translated(self):
+        c = crust.translate("struct T { a: [i32; 4], n: i32 }\n"
+                            "fn f() -> i32 { 1 }")
+        self.assertIn("struct T { int a[4]; int n; }", c)
+
+    def test_array_of_struct_field(self):
+        c = crust.translate("struct I { v: i32 }\n"
+                            "struct T { items: [I; 8], n: i32 }\n"
+                            "fn f() -> i32 { 1 }")
+        self.assertIn("I items[8]", c)
+
+    def test_c_struct_is_still_c(self):
+        c = crust.translate("struct C { int a; int b; };\n"
+                            "fn g() -> i32 { 1 }")
+        self.assertIn("struct C { int a; int b; };", c)
+
+    def test_array_field_round_trips(self):
+        self.assertEqual(_run("""
+struct T { a: [i32; 4], n: i32 }
+impl T {
+    fn fill(&mut self) {
+        for i in 0..4 { self.a[i] = i * 10; }
+        self.n = 4;
+    }
+    fn sum(&self) -> i32 {
+        let mut s: i32 = 0;
+        for i in 0..self.n { s += self.a[i]; }
+        s
+    }
+}
+fn main() -> i32 { let mut t: T = T { a: [0; 4], n: 0 }; t.fill();
+                   t.sum() + 12 }
+""", suffix=".rs"), 72)
+
+    def test_multi_dimensional_field(self):
+        c = crust.translate("struct G { grid: [[i32; 3]; 3] }\n"
+                            "fn f() -> i32 { 1 }")
+        self.assertIn("grid", c)
