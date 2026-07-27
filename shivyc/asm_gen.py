@@ -3120,7 +3120,13 @@ class ASMGen:
             self._near_off += size
             self._near_size = max(self._near_size, self._near_off)
             return spot
-        self.offset += size
+        # Slots are padded to eight bytes. A by-value struct of 3, 5, 6 or 7
+        # bytes has no matching move width, so passing one reads it out of its
+        # slot as a whole eightbyte; padding guarantees that read stays inside
+        # the slot rather than picking up the neighbouring local. The bytes
+        # above `size` are padding the callee never stores, so their contents
+        # do not matter. Eight-byte slots also keep every local aligned.
+        self.offset += size + (-size % 8)
         return MemSpot(spots.RBP, -self.offset)
 
     def _make_asm(self, commands, global_spotmap):
