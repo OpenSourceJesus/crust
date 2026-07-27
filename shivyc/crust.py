@@ -462,6 +462,7 @@ class Unit:
         self.methods = {}       # (type name, method name) -> MethodInfo
         self.enums = {}         # name -> [(variant, explicit value or None)]
         self.data_enums = {}    # enum -> {variant: [(field|None, CType)]}
+        self.result_error = None  # error type of a `Result<T>` alias
         self.derives = {}       # type name -> [derived trait names]
         self.variants = {}      # mangled variant name -> enum name
         self.tuple_structs = set()   # struct names declared in tuple form
@@ -789,8 +790,17 @@ class Parser:
             if name == "Result":
                 self.expect("<")
                 ok = self.parse_type()
-                self.expect(",")
-                err = self.parse_type()
+                if self.accept(","):
+                    err = self.parse_type()
+                else:
+                    # `Result<T>` with one argument. A crate that fixes its
+                    # error type almost always does it with
+                    # `type Result<T> = core::result::Result<T, Error>;` and
+                    # then writes the one-argument form everywhere -- Redox
+                    # does exactly that. If this unit declares such an alias,
+                    # its error type is used; otherwise the crate-wide
+                    # convention of a plain integer error code applies.
+                    err = self.unit.result_error or CType("int")
                 self.expect_gt()
                 if err.is_void():
                     self.err("`Result<_, ()>` is not supported")
@@ -895,13 +905,25 @@ class Parser:
         return flat
 
     def parse_type_alias(self):
-        """Parse `type Name = Type;` and return `(name, CType)`."""
+        """Parse `type Name = Type;`; return `(name, CType)` or `(None, None)`.
+
+        A *generic* alias (`type Result<T> = Result<T, Error>;`) has no
+        representation here -- Crust monomorphises, and an alias is not an
+        item to monomorphise. It is skipped rather than reported, because
+        failing the file over one would be far out of proportion: a crate that
+        declares such an alias is otherwise perfectly translatable, and the
+        one alias that matters in practice (`Result<T>`) is recognized
+        separately.
+        """
         self.skip_attributes()
         self.skip_visibility()
         self.expect("type")
         name = self.expect_ident()
         if self.at("<", "punc"):
-            self.err("generic type aliases are not supported")
+            while not self.at(";", "punc") and self.cur.kind != "eof":
+                self.next()
+            self.accept(";")
+            return None, None
         self.expect("=")
         ty = self.parse_type()
         self.expect(";")
@@ -3426,6 +3448,14 @@ _ERASED_HEAD = re.compile(
     r"(?:use\b|extern\s+crate\b|mod\s+\w+\s*;)", re.M)
 
 # Bare `mod name;` (optional `pub` / `pub(...)`) — not `mod name { ... }`.
+# `type Result<T> = ...Result<T, SomeError>;` -- the crate-wide alias that
+# makes the one-argument `Result<T>` spelling work. Matched on the text rather
+# than parsed, because the alias is generic and the generic-alias machinery
+# does not need to exist for this one very common shape.
+_RESULT_ALIAS = re.compile(
+    r"^[ \t]*(?:pub(?:\s*\([^)]*\))?\s+)?type\s+Result\s*<[^>]*>\s*=\s*"
+    r"[\w:]*Result\s*<[^,<>]*,\s*(?P<err>[\w:]+)\s*>", re.M)
+
 _MOD_DECL = re.compile(
     r"^[ \t]*(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+(?P<name>\w+)\s*;", re.M)
 
@@ -3838,8 +3868,9 @@ def collect_items(code, spans, unit, struct_order, fail=None):
                 unit.supertraits[tname] = supers
             elif kind == "type":
                 name, ty = p.parse_type_alias()
-                unit.type_aliases[name] = ty
-                local["type_aliases"].append(name)
+                if name is not None:
+                    unit.type_aliases[name] = ty
+                    local["type_aliases"].append(name)
             elif kind == "const":
                 kw, name, ty, init = p.parse_const_signature()
                 unit.consts[name] = ty
@@ -4754,6 +4785,9 @@ def translate(code, path=None):
     # definition of the same name still wins: collect_items overwrites the
     # template and drops the core `impl`s that went with it.
     seed_core(unit)
+    m = _RESULT_ALIAS.search(_blank(code))
+    if m:
+        unit.result_error = CType(m.group("err").split("::")[-1])
     local = collect_items(code, spans, unit, struct_order, fail)
     # Local items win over mod-seeded ones of the same name.
     local_set = (set(local["structs"]) | set(local["enums"])
