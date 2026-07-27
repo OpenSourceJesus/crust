@@ -49,11 +49,14 @@ def _strip(src):
 
 # Each entry is (label, regex). A file "needs" a feature if the pattern hits.
 # Ordered roughly by how self-contained the work would be.
+# Features Crust has since gained are removed from this list rather than left
+# in, because a detector that still flags a supported construct quietly
+# inflates every number below it -- `use` stayed at the top of this table for a
+# round after it was handled, and `lifetimes` with it. If a feature lands,
+# delete its entry here in the same change.
 FEATURES = [
     ("data-enum",
      re.compile(r"enum\s+\w+[^{]*\{[^}]*?\w+\s*[({]", re.S)),
-    ("lifetimes",
-     re.compile(r"&\s*'\w+|<\s*'\w+|'\w+\s*[,>]")),
     ("dyn-trait",
      re.compile(r"\bdyn\s+\w")),
     ("impl-trait-ret",
@@ -71,8 +74,6 @@ FEATURES = [
      re.compile(r"\|\s*\w*\s*\|\s*[^;{]*\b(self|move)\b|move\s*\|")),
     ("module",
      re.compile(r"^\s*(pub\s+)?mod\s+\w+\s*\{", re.M)),
-    ("use-import",
-     re.compile(r"^\s*(pub\s+)?use\s+\w", re.M)),
     ("string-type",
      re.compile(r"\bString\b|\.to_string\s*\(|\bformat!\s*\(")),
     ("std-generic",
