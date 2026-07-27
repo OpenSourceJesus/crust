@@ -26,6 +26,7 @@ construct, so diagnostics from later passes point at the Rust source line.
 
 import os
 import re
+import sys
 
 __all__ = ["CrustError", "translate", "has_rust", "translate_file"]
 
@@ -336,10 +337,11 @@ ASSIGN_OPS = {"=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=",
 class Expr:
     """A translated expression: C text plus its inferred C type."""
 
-    __slots__ = ("code", "type", "targs")
+    __slots__ = ("code", "type", "targs", "from_path")
 
     def __init__(self, code, type_):
         self.targs = None            # turbofish type arguments, if any
+        self.from_path = False       # name came from a `a::b` path
         self.code = code
         self.type = type_
 
@@ -1425,7 +1427,17 @@ class Parser:
                         # an expected return type when the call sits in a
                         # typed position (`return KernelMapper::lock()`).
                         # Skip names the prelude already declares (alloc).
-                        if e.code not in _PRELUDE_LIBC:
+                        #
+                        # Only a name that actually came from a `a::b` path
+                        # gets a guessed prototype. A bare identifier may well
+                        # be declared by text this unit cannot see yet --
+                        # anything pulled in by `#include`, which the
+                        # preprocessor expands only *after* translation. That
+                        # is how `labels` and `widest` from an included
+                        # rpython module ended up with conflicting `extern
+                        # void` guesses. A path call cannot come from an
+                        # include, so guessing for those stays safe.
+                        if e.code not in _PRELUDE_LIBC and e.from_path:
                             ret_ty = self.target
                             prev = self.unit.extern_fns.get(e.code)
                             if prev is None:
@@ -2006,7 +2018,9 @@ class Parser:
             if name == "Self" and self.impl_type:
                 name = self.impl_type
             targs = None
+            saw_path = False
             while self.at("::", "punc"):        # path: foo::bar -> foo_bar
+                saw_path = True
                 self.next()
                 if self.at("<", "punc"):
                     # Turbofish. On a generic struct (`Pair::<i32>::new`) it
@@ -2058,6 +2072,7 @@ class Parser:
             if self.lookup(name) is not None:
                 name = _c_name(name)
             out = Expr(name, ty)
+            out.from_path = saw_path
             if targs is not None:
                 out.targs = targs
             return out
@@ -3198,6 +3213,16 @@ def _match_brace(scan, open_idx):
 # passes unrecognized text through byte-for-byte, so `use core::mem;` survives
 # translation intact and only fails later, in the C front end. Anything that
 # measures `translate()` alone will not see it.
+# A macro invoked at file scope -- `global_asm!(..)`, `int_like!(..)`,
+# `syscall!(..)`. These expand to items Crust cannot produce, and passing them
+# through verbatim guarantees a C syntax error: `global_asm!` in particular
+# carries a multi-line assembly string that the C lexer reads as an
+# unterminated quote. Erasing loses whatever the macro would have defined,
+# which is a real cost, but the alternative is a file that cannot compile at
+# all rather than one that compiles without those definitions.
+_ITEM_MACRO = re.compile(r"^[ \t]*(?:pub(?:\s*\([^)]*\))?\s+)?"
+                         r"[A-Za-z_]\w*!\s*[\(\[\{]", re.M)
+
 _ERASED_HEAD = re.compile(
     r"^[ \t]*(?:pub(?:\s*\([^)]*\))?\s+)?"
     r"(?:use\b|extern\s+crate\b|mod\s+\w+\s*;)", re.M)
@@ -3217,6 +3242,69 @@ def find_mod_decls(code):
     """
     scan = _blank(code)
     return [m.group("name") for m in _MOD_DECL.finditer(scan)]
+
+
+_USE_PATH = re.compile(
+    r"^[ \t]*(?:pub(?:\s*\([^)]*\))?\s+)?use\s+"
+    r"(?P<path>(?:crate|super|self)(?:::\w+)*)", re.M)
+
+
+def find_use_paths(code):
+    """Module paths named by `use crate::a::b::..` and friends.
+
+    `mod name;` only reaches a *sibling* file. Real crates put shared types
+    behind a path -- `use crate::platform::types::{pid_t, size_t};` -- and
+    that path says exactly which file defines them, so it is worth following.
+    """
+    scan = _blank(code)
+    return [m.group("path") for m in _USE_PATH.finditer(scan)]
+
+
+def find_crate_root(path):
+    """The directory holding `lib.rs`/`main.rs` above `path`, or None.
+
+    That directory is what `crate::` refers to. Walking up is bounded so a
+    file outside any crate cannot send the search to the filesystem root.
+    """
+    d = os.path.dirname(os.path.abspath(path)) if path else ""
+    for _ in range(12):
+        if not d:
+            return None
+        for marker in ("lib.rs", "main.rs"):
+            if os.path.isfile(os.path.join(d, marker)):
+                return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+    return None
+
+
+def resolve_use_path(modpath, path):
+    """Resolve `crate::a::b` (or `super::`/`self::`) to a source file."""
+    segs = modpath.split("::")
+    head, rest = segs[0], segs[1:]
+    if head == "crate":
+        base = find_crate_root(path)
+    elif head == "self":
+        base = os.path.dirname(os.path.abspath(path)) if path else ""
+    elif head == "super":
+        base = os.path.dirname(os.path.dirname(os.path.abspath(path))) \
+            if path else ""
+    else:
+        return None
+    if not base or not rest:
+        return None
+    # The last segment may name an item rather than a module, so try the full
+    # path first and then one segment shorter.
+    for depth in (len(rest), len(rest) - 1):
+        if depth < 1:
+            continue
+        stem = os.path.join(base, *rest[:depth])
+        for cand in (stem + ".rs", os.path.join(stem, "mod.rs")):
+            if os.path.isfile(cand):
+                return cand
+    return None
 
 
 def resolve_mod_path(name, path):
@@ -3669,7 +3757,8 @@ def _merge_unit(dst, src):
     dst.macros.update(src.macros)
 
 
-def collect_mod_items(names, path, unit, struct_order, _seen=None):
+def collect_mod_items(names, path, unit, struct_order, _seen=None,
+                      depth=0):
     """Seed `unit` from sibling `mod name;` files; return seeded type names.
 
     Resolves each name to `name.rs` or `name/mod.rs`, recursively follows
@@ -3680,7 +3769,8 @@ def collect_mod_items(names, path, unit, struct_order, _seen=None):
     seen = _seen if _seen is not None else set()
     seeded = {"structs": [], "enums": [], "consts": [], "type_aliases": []}
     for name in names:
-        filename = resolve_mod_path(name, path)
+        filename = (resolve_use_path(name, path) if "::" in name
+                    else resolve_mod_path(name, path))
         if not filename or filename in seen:
             continue
         seen.add(filename)
@@ -3689,12 +3779,28 @@ def collect_mod_items(names, path, unit, struct_order, _seen=None):
                 text = f.read()
         except OSError:
             continue
-        sub = collect_mod_items(find_mod_decls(text), filename, unit,
-                                struct_order, seen)
-        for key in seeded:
-            seeded[key].extend(sub[key])
-        local = collect_items(
-            text, find_rust_items(text, rust_file=True), unit, struct_order)
+        # Seeding is best effort throughout. A sibling Crust cannot parse
+        # costs us the types it defines, but it must never fail the file that
+        # merely mentioned it -- otherwise adding a `use` would be strictly
+        # worse than leaving the type undeclared, which is the opposite of
+        # the point.
+        try:
+            # `mod` declarations are followed to any depth: they describe this
+            # crate's own tree. `use` paths are followed only from the file
+            # being compiled, since they reach across a whole workspace and
+            # the types worth having are in the file named directly.
+            nested = find_mod_decls(text)
+            if depth < 1:
+                nested = nested + find_use_paths(text)
+            sub = collect_mod_items(nested, filename, unit, struct_order,
+                                    seen, depth + 1)
+            for key in seeded:
+                seeded[key].extend(sub[key])
+            local = collect_items(
+                text, find_rust_items(text, rust_file=True), unit,
+                struct_order)
+        except (CrustError, RecursionError):
+            continue
         seeded["structs"].extend(local["structs"])
         seeded["enums"].extend(local["enums"])
         seeded["consts"].extend(local["consts"])
@@ -4034,9 +4140,12 @@ def _eval_int_ast(node):
     import ast
     if isinstance(node, ast.Constant) and isinstance(node.value, int):
         return node.value
-    # Python < 3.8
-    if hasattr(ast, "Num") and isinstance(node, ast.Num):           # pragma: no cover
-        return int(node.n)
+    # Python < 3.8 spelled an integer literal `ast.Num`. Merely *naming* the
+    # attribute warns on 3.12+, so the legacy branch is guarded by version
+    # rather than by hasattr.
+    if sys.version_info < (3, 8):                                   # pragma: no cover
+        if isinstance(node, ast.Num):
+            return int(node.n)
     if isinstance(node, ast.UnaryOp):
         v = _eval_int_ast(node.operand)
         if isinstance(node.op, ast.UAdd):
@@ -4144,6 +4253,25 @@ def _render_struct(name, fields):
     return "struct %s { %s };" % (name, body)
 
 
+def _match_delim(text, i):
+    """Index of the delimiter closing the one at `i`, or None."""
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    close = pairs.get(text[i])
+    if close is None:
+        return None
+    depth = 0
+    while i < len(text):
+        c = text[i]
+        if c in pairs:
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+
 def erase_module_items(code):
     """Blank `use`, `extern crate` and `mod X;` items, keeping line numbers.
 
@@ -4159,6 +4287,23 @@ def erase_module_items(code):
     """
     scan = _blank(code)
     out = list(code)
+    depths = _depths(scan)
+    for m in _ITEM_MACRO.finditer(scan):
+        if depths[m.start()] != 0:
+            continue            # inside a body: an ordinary macro call
+        open_idx = m.end() - 1
+        close = _match_delim(scan, open_idx)
+        if close is None:
+            continue
+        end = close + 1
+        while end < len(scan) and scan[end] in " \t":
+            end += 1
+        if end < len(scan) and scan[end] == ";":
+            end += 1
+        for k in range(m.start(), end):
+            if out[k] != "\n":
+                out[k] = " "
+    scan = "".join(out)
     for m in _ERASED_HEAD.finditer(scan):
         i, depth, n = m.start(), 0, len(scan)
         while i < n:
@@ -4186,7 +4331,7 @@ def translate(code, path=None):
     """
     # Capture bare `mod name;` before erase blanks them — those names are
     # how we find sibling files for cross-file type knowledge.
-    mod_names = find_mod_decls(code)
+    mod_names = find_mod_decls(code) + find_use_paths(code)
     code = erase_module_items(code)
     spans = find_rust_items(
         code, rust_file=bool(path) and path.endswith(".rs"))
