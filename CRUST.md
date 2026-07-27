@@ -868,6 +868,53 @@ released by an explicit `free_buf`/`free_box`), no bounds checking, and
 nothing thread-safe — `Arc`, `Mutex` and `RwLock` are deliberately *not*
 included, because without atomics or threads they could only be lies.
 
+## Finding crashes: `tools/crustfuzz.py`
+
+A compiler has two acceptable outcomes for any input: compile it, or reject it
+with a diagnostic. A Python traceback is never one of them.
+
+The `unexpected register size` bug found while implementing `#[derive(Clone)]`
+was reachable by any function returning a 3-byte struct, and had been for as
+long as struct returns existed — it was found by luck. There are 57
+`raise NotImplementedError` sites in the backend and no way to tell by reading
+them which are reachable, so `crustfuzz` answers the question by construction:
+it generates small programs across the axes that tend to matter (type widths,
+struct layouts, operators, casts, calling conventions) and classifies what
+comes back.
+
+```sh
+python3 tools/crustfuzz.py                # all families
+python3 tools/crustfuzz.py --family cast
+```
+
+An input that produces a *diagnostic* is fine — this is not looking for
+unsupported constructs, only for the ones that fail in the wrong way.
+
+465 probes currently: 461 compile, 4 report, 0 crash.
+
+### What it found
+
+Passing a struct of 3, 5, 6 or 7 bytes **by value** crashed the same way
+returning one did. Returning was fixed; passing is now *reported*, because it
+cannot be fixed the same way. A return reads its value out of a slot into RAX,
+so widening the read to a full eightbyte is safe. A parameter does the
+opposite — it writes a register into the parameter's home — and stack slots are
+packed, so widening the write clobbers the neighbouring local. That produces a
+program which compiles and then corrupts its own frame, which is far worse than
+one that does not compile.
+
+Doing it properly means splitting the move into chunks on both sides of the
+call. Until that exists, Crust says so:
+
+```
+error: passing a struct of 3 bytes by value is not supported; its size is not
+a register width, so it cannot be moved in one piece -- pass a pointer instead
+```
+
+Code-generation errors are now collected like any other diagnostic rather than
+escaping as exceptions, so a limitation found this late still reads as a
+compiler message.
+
 ## Compiling real Rust: `tools/crustos.py`
 
 `tools/crustos.py` walks a Rust source tree, runs every `.rs` file through the
