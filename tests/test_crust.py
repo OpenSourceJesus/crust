@@ -2138,3 +2138,95 @@ fn main() -> i32 { let c: char = '\\n'; (c as i32) + 32 }
         c = crust.translate("struct L<'a, T> { v: *const T }\n"
                             "fn g() -> i32 { 1 }")
         self.assertIn("int g(void)", c)
+
+
+class TestCrustItemMacros(unittest.TestCase):
+    """File-scope macro invocations are erased; calls inside bodies are not."""
+
+    def test_global_asm_is_erased(self):
+        c = crust.translate('global_asm!(\n    "\n    .global x\n"\n);\n'
+                            'fn f() -> i32 { 1 }')
+        self.assertNotIn(".global", c)
+        self.assertIn("int f(void)", c)
+
+    def test_item_macro_with_braces_is_erased(self):
+        c = crust.translate("int_like!{ Foo, FooAtomic, usize, AtomicUsize }\n"
+                            "fn f() -> i32 { 1 }")
+        self.assertNotIn("int_like", c)
+
+    def test_macro_call_inside_a_body_still_expands(self):
+        # The erasure must be file-scope only.
+        c = crust.translate('fn f() { let n: i32 = 1; println!("{}", n); }')
+        self.assertIn("printf", c)
+
+    def test_erasure_preserves_lines(self):
+        c = crust.translate('global_asm!("x");\nfn f() -> i32 { 1 }')
+        self.assertIn("int f(void) { return 1; }", c.split("\n")[1])
+
+
+class TestCrustUsePathSeeding(unittest.TestCase):
+    """Types are seeded across a crate by following `use crate::a::b`."""
+
+    def _crate(self, files):
+        import tempfile
+        root = tempfile.mkdtemp(prefix="crust_crate_")
+        for rel, text in files.items():
+            full = os.path.join(root, rel)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "w", encoding="utf-8") as f:
+                f.write(text)
+        return root
+
+    def test_use_path_seeds_a_type_alias(self):
+        root = self._crate({
+            "lib.rs": "pub mod platform;\n",
+            "platform/mod.rs": "pub mod types;\n",
+            "platform/types.rs": "pub type pid_t = i32;\n",
+            "header/mod.rs": ("use crate::platform::types::pid_t;\n"
+                              "pub struct Cred { pid: pid_t }\n"),
+        })
+        src = open(os.path.join(root, "header/mod.rs")).read()
+        c = crust.translate(src, path=os.path.join(root, "header/mod.rs"))
+        self.assertIn("int pid;", c)
+
+    def test_use_path_seeds_a_struct(self):
+        root = self._crate({
+            "lib.rs": "pub mod a;\n",
+            "a/mod.rs": "pub struct Inner { v: i32 }\n",
+            "b.rs": ("use crate::a::Inner;\n"
+                     "fn get(x: *const Inner) -> i32 { x.v }\n"),
+        })
+        src = open(os.path.join(root, "b.rs")).read()
+        c = crust.translate(src, path=os.path.join(root, "b.rs"))
+        self.assertIn("int get(Inner *x)", c)
+
+    def test_missing_use_target_is_not_fatal(self):
+        c = crust.translate("use crate::nowhere::Thing;\n"
+                            "fn f() -> i32 { 1 }",
+                            path="/tmp/crust_no_such_crate/x.rs")
+        self.assertIn("int f(void)", c)
+
+    def test_unparsable_sibling_is_not_fatal(self):
+        # Seeding must degrade, never fail the file that mentioned it.
+        root = self._crate({
+            "lib.rs": "pub mod broken;\n",
+            "broken.rs": "pub struct Bad { ",
+            "user.rs": "use crate::broken::Bad;\nfn f() -> i32 { 1 }\n",
+        })
+        src = open(os.path.join(root, "user.rs")).read()
+        c = crust.translate(src, path=os.path.join(root, "user.rs"))
+        self.assertIn("int f(void)", c)
+
+
+class TestCrustExternGuessing(unittest.TestCase):
+    """Prototype guessing is limited to genuine path calls."""
+
+    def test_bare_unknown_call_gets_no_guess(self):
+        # It may be declared by text pulled in later by `#include`, which the
+        # preprocessor expands only after translation.
+        c = crust.translate("fn f() -> i32 { labels(4) }")
+        self.assertNotIn("extern void labels", c)
+
+    def test_path_call_still_gets_a_prototype(self):
+        c = crust.translate("fn f() { rmm::aarch64::init_mair(); }")
+        self.assertIn("rmm_aarch64_init_mair", c)
