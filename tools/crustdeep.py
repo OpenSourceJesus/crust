@@ -55,8 +55,6 @@ def _strip(src):
 # round after it was handled, and `lifetimes` with it. If a feature lands,
 # delete its entry here in the same change.
 FEATURES = [
-    ("data-enum",
-     re.compile(r"enum\s+\w+[^{]*\{[^}]*?\w+\s*[({]", re.S)),
     ("dyn-trait",
      re.compile(r"\bdyn\s+\w")),
     ("impl-trait-ret",
@@ -84,8 +82,6 @@ FEATURES = [
                 r"(Add|Sub|Mul|Div|Rem|Not|BitAnd|BitOr|BitXor|Shl|Shr|"
                 r"Index|IndexMut|Deref|DerefMut|PartialEq|PartialOrd|Ord|Eq)"
                 r"\b")),
-    ("derive",
-     re.compile(r"#\s*\[\s*derive\s*\(")),
     ("const-generic",
      re.compile(r"<\s*const\s+\w+\s*:")),
     ("async",
