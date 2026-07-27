@@ -57,6 +57,26 @@ EXAMPLES = [
      "widest = 3\n"
      "len2   = 25\n", True),
 
+    ("small_os.c", 0,
+     "schemes    = 4\n"
+     "routed     = 4 of 5 accepted\n"
+     "path depth = 8\n"
+     "listing    = tcp -> /80 (depth 1)\n"
+     "frames     = 5 claimed, 251 free\n"
+     "runnable   = 2 of 3\n"
+     "switches   = 6\n"
+     "ticks(a,c) = 12 3\n"
+     "read(0,7)  = 7\n"
+     "close(0)   = 0\n"
+     "badfd      = -1\n", True),
+
+    ("mini_os.c", 0,
+     "levels    = 3\n"
+     "admitted  = 6\n"
+     "switches  = 6\n"
+     "demand    = 60\n"
+     "task0     = pid 1 prio 1 ticks 20\n", True),
+
     ("derive.rs", 0,
      "clone    = 42\n"
      "eq(a, b) = 1\n"
