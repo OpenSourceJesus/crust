@@ -64,6 +64,7 @@ its definition.
 | Traits | `trait`, `impl Trait for Type`, default methods, supertraits, bounds `<T: Trait>`; static dispatch |
 | Macros | `println!`/`print!`/`eprintln!`, `assert!`/`assert_eq!`/`assert_ne!`, `panic!`/`unreachable!`/`todo!`, `debug_assert*!`, `cfg!`, `matches!`, and `macro_rules!` |
 | Tuples | tuple types `(A, B)`, tuple expressions, positional access `t.0` |
+| Data enums | `enum E { A(T), B { x: T }, C }` as a tagged union, with `match` bindings |
 | Closures | non-capturing `|a: T| expr`, lifted to a plain function |
 | Paths | `a::b::C` in type position |
 | Module items | `use` and `extern crate` are erased; `mod X;` is erased but sibling `X.rs` / `X/mod.rs` are read for type definitions; `core::ffi::c_*` map to their C types |
@@ -527,6 +528,48 @@ would unlock *on its own*, and a greedy set-cover over the real data — which i
 a far better roadmap than a frequency ranking, because a file is only unlocked
 when every one of its blockers is gone.
 
+## Data-carrying enums
+
+An enum variant may carry data, in tuple form `Circle(f64)` or struct form
+`Rect { w: f64, h: f64 }`. These lower to the tagged union a C programmer
+would write by hand:
+
+```c
+enum Shape_tag { Shape_Circle, Shape_Rect, Shape_Empty };
+struct Shape_Circle_data { double _0; };
+struct Shape_Rect_data { double w; double h; };
+struct Shape { enum Shape_tag tag; union { ... } u; };
+```
+
+Payload structs are declared separately rather than inline: a named type reads
+better in a diagnostic, and it avoids depending on anonymous-struct support.
+Tuple fields are named positionally (`_0`, `_1`), which is the same convention
+tuple structs and tuples already use, so all three are constructed and matched
+through one mechanism. A variant with no payload contributes no union member.
+
+A payload-free variant of a data enum is still a whole value — `Shape::Empty`
+builds `(Shape){.tag = Shape_Empty}`, not a bare tag — so it can be assigned
+and passed like any other `Shape`.
+
+### Matching
+
+`match` on a data enum switches on the tag, with the scrutinee held in a
+temporary so it is evaluated once even when it is a call:
+
+```rust
+match s {
+    Shape::Circle(r)      => 3.14159265 * r * r,
+    Shape::Rect { w, h }  => w * h,
+    Shape::Empty          => 0.0,
+}
+```
+
+Each arm's bindings are declared inside their own block, so a name bound in one
+arm cannot leak into a later one — C's `case` labels would otherwise allow
+exactly that. Struct patterns may rename (`Msg::Move { x: got }`), `_` discards
+without declaring anything, and `..` skips the rest. Exhaustiveness is still
+checked: a missing variant is reported rather than silently falling through.
+
 ## Cross-file types
 
 Crust compiles one translation unit at a time, but a Rust crate spreads its
@@ -802,7 +845,7 @@ Where things stand on Redox (kernel + relibc + ion, 615 files):
 | partial (some items lowered) | 35 | 5.7% |
 | failed (items found, translation errored) | 459 | 74.6% |
 | empty (no Rust items recognized) | 89 | 14.5% |
-| **compile to an object** (`survey --verify`) | **92** | **15.0%** |
+| **compile to an object** (`survey --verify`) | **93** | **15.1%** |
 
 6355 top-level Rust items parse. With generics landed, the ranked blockers
 behind the 458 remaining failures are paths in type position (7.9%), `impl
@@ -870,6 +913,8 @@ Python, in keeping with the rest of the front end.
   two impls and a bounded generic, all statically dispatched.
 - `examples/crust/macros.rs` — the printing and assertion macros, and
   `macro_rules!` with several rules chosen by arity.
+- `examples/crust/enums.rs` — data-carrying enum variants in both forms, and
+  `match` arms that destructure them.
 - `examples/crust/tail.rs` — tuple returns, a qualified path to the bundled
   `Box`, non-capturing closures, and identifiers that are C keywords.
 - `examples/crust/histogram.py` and `examples/crust/polyglot.c` — C, Rust and
