@@ -2017,6 +2017,33 @@ fn main() -> i32 {
 """, suffix=".rs"), 42)
 
 
+class TestCrustExternPathCalls(unittest.TestCase):
+    """Unknown path calls get an extern prototype for per-file -c."""
+
+    def test_path_call_emits_extern(self):
+        c = crust.translate(
+            "fn init() { rmm::aarch64::init_mair(); }\n")
+        self.assertIn("extern void rmm_aarch64_init_mair(void);", c)
+        self.assertIn("rmm_aarch64_init_mair();", c)
+
+    def test_path_call_compiles(self):
+        # -c only; the symbol is undefined at link time.
+        work = tempfile.mkdtemp()
+        try:
+            src = os.path.join(work, "paging.rs")
+            with open(src, "w") as f:
+                f.write("fn init() { rmm::aarch64::init_mair(); }\n")
+            obj = os.path.join(work, "paging.o")
+            root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            proc = subprocess.run(
+                [sys.executable, "-m", "shivyc.main", "-c", src, "-o", obj],
+                cwd=root, capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        finally:
+            import shutil
+            shutil.rmtree(work, ignore_errors=True)
+
+
 class TestCrustVisibility(unittest.TestCase):
     """`pub`, `pub(crate)`, and `pub unsafe extern "C"`."""
 

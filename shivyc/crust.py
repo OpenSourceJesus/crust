@@ -461,6 +461,7 @@ class Unit:
         self.const_inits = {}   # name -> (kw, init text) for prelude render
         self.type_aliases = {}  # name -> CType (fully resolved)
         self.opaque_structs = set()  # path types with no definition in unit
+        self.extern_fns = {}    # name -> [arg CType|None] for foreign path calls
         self.needs = set()      # libc prototypes the lowering requires
         self.slices = {}        # slice struct name -> element CType
         self.tuples = {}        # tuple struct name -> [element CTypes]
@@ -1381,6 +1382,11 @@ class Parser:
                     e = self.tuple_struct_literal(e.code, args)
                 else:
                     ret = sig[0] if sig else None
+                    if sig is None and e.type is None and e.code:
+                        # Foreign path call (`rmm::aarch64::init_mair`) or
+                        # other unknown callee: emit an extern prototype so
+                        # the C front end can compile this TU alone.
+                        self.unit.extern_fns.setdefault(e.code, atypes)
                     e = Expr("%s(%s)" % (e.code, ", ".join(args)), ret)
             elif self.at("[", "punc"):
                 self.next()
@@ -3592,6 +3598,8 @@ def _merge_unit(dst, src):
     dst.const_values.update(src.const_values)
     dst.const_inits.update(src.const_inits)
     dst.type_aliases.update(src.type_aliases)
+    dst.opaque_structs |= src.opaque_structs
+    dst.extern_fns.update(src.extern_fns)
     dst.generic_structs.update(src.generic_structs)
     dst.generic_fns.update(src.generic_fns)
     dst.traits.update(src.traits)
@@ -4184,6 +4192,17 @@ def translate(code, path=None):
     for text in _render_consts(code, spans, unit):
         prelude.append(text)
     prelude.extend(local["impl_consts"])
+    for name, atypes in sorted(unit.extern_fns.items()):
+        if name in unit.fn_sigs or name in included_fns:
+            continue
+        params = []
+        for t in atypes:
+            if t is None or t.is_void():
+                params.append("void *")
+            else:
+                params.append(t.decl())
+        prelude.append("extern void %s(%s);"
+                       % (name, ", ".join(params) or "void"))
     for name, (ret, ps) in unit.fn_sigs.items():
         if name == "main" or name in included_fns:
             continue
