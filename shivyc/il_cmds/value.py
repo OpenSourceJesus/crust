@@ -4,6 +4,7 @@ import shivyc.asm_cmds as asm_cmds
 import shivyc.ctypes as ctypes
 import shivyc.spots as spots
 from shivyc.il_cmds.base import ILCommand
+from shivyc.errors import CompilerError
 from shivyc.spots import RegSpot, MemSpot, LiteralSpot
 
 from typing import TYPE_CHECKING
@@ -174,6 +175,24 @@ class LoadArg(ILCommand):
         # A register source can move directly to a register or memory dest.
         # A memory source (stack argument) cannot move directly to a memory
         # dest, so route it through a scratch register in that case.
+        if (self.output.ctype.is_struct_union()
+                and size not in (1, 2, 4, 8)):
+            # A struct of 3, 5, 6 or 7 bytes arrives in one whole register,
+            # but storing it into its home needs a move of its own size and
+            # there is no 3-byte move. Widening is not an option here: slots
+            # are packed, so writing eight bytes clobbers the neighbouring
+            # local -- that produces a program that compiles and then
+            # corrupts its own frame, which is far worse than not compiling.
+            # Doing it properly means splitting the store into chunks, which
+            # this does not yet do.
+            #
+            # Reporting beats the alternative: without this the backend
+            # raises `unexpected register size` from inside register naming,
+            # handing the user a Python traceback for a valid program.
+            raise CompilerError(
+                "passing a struct of %d bytes by value is not supported; "
+                "its size is not a register width, so it cannot be moved in "
+                "one piece -- pass a pointer instead" % size)
         if self.arg_reg is None and isinstance(dest, MemSpot):
             r = get_reg()
             asm_code.add(asm_cmds.Mov(r, src, size))

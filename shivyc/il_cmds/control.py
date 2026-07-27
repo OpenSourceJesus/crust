@@ -8,6 +8,29 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:                       # type-only; no runtime import cycle
     from shivyc.il_gen import ILValue
 from shivyc.spots import LiteralSpot, MemSpot, RegSpot
+from shivyc.errors import CompilerError
+
+
+def _check_arg_size(arg):
+    """Reject a by-value struct whose size has no register width.
+
+    A struct of 3, 5, 6 or 7 bytes travels in one whole register, but moving
+    it needs a move of its own size, and there is no 3-byte move. Handling it
+    properly means splitting the move into chunks on both sides of the call;
+    until that exists, this reports the limitation rather than letting the
+    backend raise `unexpected register size` from inside register naming.
+
+    A crash is much worse than a diagnostic here: it gives the user a Python
+    traceback for a valid program and no indication of which construct caused
+    it. This was found by a prober (`tools/crustfuzz.py`) rather than by a
+    user, which is the only reason it is being reported at all.
+    """
+    ctype = arg.ctype
+    if ctype.is_struct_union() and ctype.size not in (1, 2, 4, 8):
+        raise CompilerError(
+            "passing a struct of %d bytes by value is not supported; "
+            "its size is not a register width, so it cannot be moved in one "
+            "piece -- pass a pointer instead" % ctype.size)
 
 
 def _emit_parallel_int_moves(moves, asm_code):
@@ -494,6 +517,8 @@ class Call(ILCommand):
             # (const, a, b, c) where a/b/c already sit in the next argument
             # registers) needs real parallel-move scheduling, breaking any
             # cycle through a scratch register.
+            for _reg, arg in int_moves:
+                _check_arg_size(arg)
             moves = [(reg, spotmap[arg], arg.ctype.size)
                      for reg, arg in int_moves if spotmap[arg] != reg]
             _emit_parallel_int_moves(moves, asm_code)
