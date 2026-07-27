@@ -65,6 +65,7 @@ its definition.
 | Macros | `println!`/`print!`/`eprintln!`, `assert!`/`assert_eq!`/`assert_ne!`, `panic!`/`unreachable!`/`todo!`, `debug_assert*!`, `cfg!`, `matches!`, and `macro_rules!` |
 | Tuples | tuple types `(A, B)`, tuple expressions, positional access `t.0` |
 | Data enums | `enum E { A(T), B { x: T }, C }` as a tagged union, with `match` bindings |
+| Derive | `#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]` on structs |
 | Closures | non-capturing `|a: T| expr`, lifted to a plain function |
 | Paths | `a::b::C` in type position |
 | Module items | `use` and `extern crate` are erased; `mod X;` is erased but sibling `X.rs` / `X/mod.rs` are read for type definitions; `core::ffi::c_*` map to their C types |
@@ -528,6 +529,56 @@ would unlock *on its own*, and a greedy set-cover over the real data — which i
 a far better roadmap than a frequency ranking, because a file is only unlocked
 when every one of its blockers is gone.
 
+## `#[derive(..)]`
+
+A derived trait generates the same free functions a hand-written `impl` would,
+so it dispatches statically and costs nothing extra:
+
+```rust
+#[derive(Clone, PartialEq, Default, Debug)]
+struct Point { x: i32, y: i32 }
+```
+
+```c
+Point Point_clone(Point *self)              { return *self; }
+_Bool Point_eq(Point *self, Point *other)   { return self->x == other->x && ...; }
+Point Point_default(void)                   { Point v = {0}; return v; }
+void  Point_debug(Point *self)              { printf("Point { x: %d, y: %d }", ...); }
+```
+
+`Copy` and `Eq` are markers in Rust — they add no method — so they are accepted
+and generate nothing. A trait Crust cannot derive (`Hash`, `Serialize`, ...) is
+ignored rather than reported, since the attribute itself is not an error. **A
+hand-written `impl` always wins**: a derived method is never generated for a
+name the type already defines.
+
+`Debug`'s method is called `debug`, not `fmt`. Rust's writes into a formatter
+and Crust has no `String`, so the derived one prints directly — giving it a
+different name keeps that difference visible rather than implying it satisfies
+a real `fmt::Debug` bound.
+
+Derivation is skipped, rather than approximated, in two cases. A field that is
+not a C scalar cannot be compared with `==` or handed to printf, so a struct
+containing one derives nothing (`memcmp` would compare padding too). And a
+struct *seeded* from a sibling module is left alone: this translation unit has
+its declaration but not its definition, and the sibling's own unit derives it
+anyway.
+
+### A backend bug this exposed
+
+`Clone` returns a struct by value, which turned out to crash the backend for
+any struct whose size is 3, 5, 6 or 7 bytes — `NotImplementedError: unexpected
+register size`, raised from inside register naming rather than as a
+diagnostic. SysV returns such a struct in a full eightbyte of RAX, but the
+backend was moving exactly `size` bytes, and there is no 3-byte register.
+
+Fixed in `il_cmds/control.py` on both sides of the call, and for the partial
+high eightbyte of a 9..16 byte struct (sizes 11, 13, 14, 15 had the same
+problem). The widened move is safe from either kind of source: a register
+already holds the whole value, and a stack slot is allocated in eightbyte
+units. This was never specific to `derive` — any Rust or C function returning
+such a struct hit it.
+
 ## Data-carrying enums
 
 An enum variant may carry data, in tuple form `Circle(f64)` or struct form
@@ -913,6 +964,8 @@ Python, in keeping with the rest of the front end.
   two impls and a bounded generic, all statically dispatched.
 - `examples/crust/macros.rs` — the printing and assertion macros, and
   `macro_rules!` with several rules chosen by arity.
+- `examples/crust/derive.rs` — the derivable traits, and a hand-written
+  `impl` overriding a derived method.
 - `examples/crust/enums.rs` — data-carrying enum variants in both forms, and
   `match` arms that destructure them.
 - `examples/crust/tail.rs` — tuple returns, a qualified path to the bundled
