@@ -161,7 +161,90 @@ def family_rust_derive():
                    " let b: S = a.clone(); 0 }\n" % fields)
 
 
+def family_nested_struct():
+    """A struct containing a struct, at each awkward outer size."""
+    for inner in ["char a;", "char a; char b; char c;", "int a;",
+                  "long a; char b;"]:
+        for outer in ["struct I i;", "struct I i; char t;",
+                      "char t; struct I i;", "struct I i; struct I j;"]:
+            yield ("nested[%s | %s]" % (inner, outer),
+                   "struct I { %s };\nstruct O { %s };\n"
+                   "struct O f(struct O *p) { return *p; }\n"
+                   "int g(struct O o) { return 0; }\n"
+                   "int main(void) { struct O o; struct O r = f(&o);"
+                   " return g(r); }\n" % (inner, outer))
+
+
+def family_union():
+    """Unions as values, arguments and returns."""
+    for body in ["char a; int b;", "char a; char b;", "double a; long b;",
+                 "char a[3];", "char a[7];", "int a; char b[5];"]:
+        yield ("union[%s]" % body,
+               "union U { %s };\n"
+               "union U f(union U *p) { return *p; }\n"
+               "int g(union U u) { return 0; }\n"
+               "int main(void) { union U u; union U r = f(&u);"
+               " return g(r); }\n" % body)
+
+
+def family_bitfield():
+    """Bitfields, which have their own access-width rules."""
+    for base in ["int", "unsigned int", "char", "unsigned char", "long"]:
+        for widths in ["1", "3", "7", "1; %s b : 2" % base, "31"]:
+            yield ("bitfield[%s : %s]" % (base, widths),
+                   "struct S { %s a : %s; };\n"
+                   "int main(void) { struct S s; s.a = 1;"
+                   " return (int)s.a; }\n" % (base, widths))
+
+
+def family_vararg():
+    """Varargs with each scalar type, where promotion rules bite."""
+    for ty in SCALARS:
+        yield ("vararg[%s]" % ty,
+               "int printf(const char *, ...);\n"
+               "int main(void) { %s a = 1; printf(\"%%d\", (int)a);"
+               " return 0; }\n" % ty)
+
+
+def family_array_ops():
+    """Arrays of each scalar, indexed and passed as pointers."""
+    for ty, n in itertools.product(SCALARS, [1, 3, 7, 8]):
+        yield ("array[%s x%d]" % (ty, n),
+               "int f(%s *p) { return (int)p[0]; }\n"
+               "int main(void) { %s a[%d]; a[0] = 1; return f(a); }\n"
+               % (ty, ty, n))
+
+
+def family_unary():
+    """Unary operators across every scalar."""
+    for ty, op in itertools.product(SCALARS, ["-", "~", "!"]):
+        if ty in ("float", "double") and op == "~":
+            continue
+        yield ("unary[%s%s]" % (op, ty),
+               "int main(void) { %s a = 1; return (int)(%sa); }\n"
+               % (ty, op))
+
+
+def family_rust_scalar():
+    """Rust scalar widths through arithmetic and casts."""
+    rty = ["i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "usize",
+           "isize", "f32", "f64", "bool"]
+    for a, b in itertools.product(rty, rty):
+        if a == b:
+            continue
+        yield ("rust_cast[%s->%s]" % (a, b),
+               "fn f(x: %s) -> %s { x as %s }\n"
+               "fn main() -> i32 { 0 }\n" % (a, b, b))
+
+
 FAMILIES = {
+    "nested_struct": family_nested_struct,
+    "union": family_union,
+    "bitfield": family_bitfield,
+    "vararg": family_vararg,
+    "array_ops": family_array_ops,
+    "unary": family_unary,
+    "rust_scalar": family_rust_scalar,
     "struct_return": family_struct_return,
     "struct_arg": family_struct_arg,
     "struct_assign": family_struct_assign,
