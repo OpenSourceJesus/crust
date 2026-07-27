@@ -558,6 +558,26 @@ fn main() -> i32 {
 }
 """, suffix=".rs"), 42)
 
+    def test_large_integer_const_becomes_define(self):
+        # Values outside signed 32-bit cannot be C enum constants; #define
+        # keeps them usable in later constant expressions.
+        c = crust.translate(
+            "const LAPIC_OFFSET: usize = 0xD800_0000;\n"
+            "const IOAPIC_OFFSET: usize = LAPIC_OFFSET + 4096;\n"
+            "fn f() -> usize { IOAPIC_OFFSET }\n")
+        self.assertIn("#define LAPIC_OFFSET", c)
+        self.assertIn("#define IOAPIC_OFFSET", c)
+        self.assertNotIn("static const unsigned long LAPIC_OFFSET", c)
+
+    def test_large_const_chain_compiles(self):
+        self.assertEqual(_run("""
+const LAPIC_OFFSET: usize = 0xD800_0000;
+const IOAPIC_OFFSET: usize = LAPIC_OFFSET + 4096;
+fn main() -> i32 {
+    if IOAPIC_OFFSET == 0xD8001000 { 42 } else { 0 }
+}
+""", suffix=".rs"), 42)
+
     def test_non_integer_const_stays_an_object(self):
         c = crust.translate("const K: f64 = 1.5;\nfn f() -> f64 { K }")
         self.assertIn("static const double K = 1.5;", c)
@@ -1974,6 +1994,95 @@ fn main() -> i32 {
     h.x
 }
 """, suffix=".rs"), 42)
+
+
+class TestCrustOpaquePaths(unittest.TestCase):
+    """Qualified path types with no definition become incomplete structs."""
+
+    def test_path_type_is_forward_declared(self):
+        c = crust.translate(
+            "fn f(p: &crate::percpu::PercpuBlock) { }\n")
+        self.assertIn("struct crate_percpu_PercpuBlock;", c)
+        self.assertIn("typedef struct crate_percpu_PercpuBlock "
+                      "crate_percpu_PercpuBlock;", c)
+        self.assertIn("crate_percpu_PercpuBlock *", c)
+
+    def test_path_type_compiles(self):
+        self.assertEqual(_run("""
+fn take(_p: &crate::sync::Token) { }
+fn main() -> i32 {
+    // Never constructed; only the incomplete type is needed for -c.
+    42
+}
+""", suffix=".rs"), 42)
+
+
+class TestCrustExternPathCalls(unittest.TestCase):
+    """Unknown path calls get an extern prototype for per-file -c."""
+
+    def test_path_call_emits_extern(self):
+        c = crust.translate(
+            "fn init() { rmm::aarch64::init_mair(); }\n")
+        self.assertIn("extern void rmm_aarch64_init_mair(void);", c)
+        self.assertIn("rmm_aarch64_init_mair();", c)
+
+    def test_path_call_compiles(self):
+        # -c only; the symbol is undefined at link time.
+        work = tempfile.mkdtemp()
+        try:
+            src = os.path.join(work, "paging.rs")
+            with open(src, "w") as f:
+                f.write("fn init() { rmm::aarch64::init_mair(); }\n")
+            obj = os.path.join(work, "paging.o")
+            root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            proc = subprocess.run(
+                [sys.executable, "-m", "shivyc.main", "-c", src, "-o", obj],
+                cwd=root, capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        finally:
+            import shutil
+            shutil.rmtree(work, ignore_errors=True)
+
+
+class TestCrustAtomics(unittest.TestCase):
+    """Bundled AtomicU32 / AtomicUsize stubs."""
+
+    def test_atomic_static_init(self):
+        c = crust.translate(
+            "const N: u32 = !0;\n"
+            "static LOCK: AtomicU32 = AtomicU32::new(N);\n"
+            "fn f() -> i32 { 1 }\n")
+        self.assertIn("struct AtomicU32", c)
+        self.assertIn("static AtomicU32 LOCK = { N };", c)
+        self.assertIn("#define N 0xFFFFFFFFu", c)
+
+    def test_atomic_static_runs(self):
+        self.assertEqual(_run("""
+const NO_PROCESSOR: u32 = !0;
+static LOCK_OWNER: AtomicU32 = AtomicU32::new(NO_PROCESSOR);
+static LOCK_COUNT: AtomicUsize = AtomicUsize::new(0);
+fn main() -> i32 { 42 }
+""", suffix=".rs"), 42)
+
+    def test_atomic_methods_run(self):
+        self.assertEqual(_run("""
+fn main() -> i32 {
+    let mut a: AtomicU32 = AtomicU32::new(40);
+    let prev: u32 = a.fetch_add(2, Ordering::Relaxed);
+    (prev + a.load(Ordering::Relaxed)) as i32 - 40
+}
+""", suffix=".rs"), 42)
+
+    def test_const_generic_struct_lowers(self):
+        # Const-only generics are erased; the struct is a plain C type, and
+        # `impl Foo<false>` methods still typecheck.
+        c = crust.translate(
+            "struct Foo<const RW: bool> { v: i32 }\n"
+            "impl Foo<false> {\n"
+            "    fn get() -> Self { Foo { v: 1 } }\n"
+            "}\n")
+        self.assertIn("struct Foo { int v; }", c)
+        self.assertIn("Foo Foo_get(void)", c)
 
 
 class TestCrustVisibility(unittest.TestCase):

@@ -185,3 +185,108 @@ impl<T> Cell<T> {
 struct PhantomData<T> {
     _marker: u8,
 }
+
+// ---------------------------------------------------------------------------
+// AtomicU32 / AtomicUsize / Ordering -- stubs for kernel-style code.
+//
+// No real concurrency: load/store/compare_exchange/fetch_add are ordinary
+// reads and writes. They exist so `static LOCK: AtomicU32 = AtomicU32::new(0)`
+// and the common methods typecheck. A local definition always wins.
+// ---------------------------------------------------------------------------
+enum Ordering {
+    Relaxed,
+    Acquire,
+    Release,
+    AcqRel,
+    SeqCst,
+}
+
+struct AtomicU32 {
+    value: u32,
+}
+
+impl AtomicU32 {
+    fn new(value: u32) -> AtomicU32 {
+        AtomicU32 { value: value }
+    }
+
+    fn load(&self, _order: Ordering) -> u32 {
+        self.value
+    }
+
+    fn store(&mut self, value: u32, _order: Ordering) {
+        self.value = value;
+    }
+
+    fn compare_exchange(&mut self, current: u32, new: u32,
+                        _success: Ordering, _failure: Ordering) -> u32 {
+        if self.value == current {
+            self.value = new;
+            current
+        } else {
+            self.value
+        }
+    }
+
+    fn compare_exchange_weak(&mut self, current: u32, new: u32,
+                             success: Ordering, failure: Ordering) -> u32 {
+        self.compare_exchange(current, new, success, failure)
+    }
+
+    fn fetch_add(&mut self, value: u32, _order: Ordering) -> u32 {
+        let prev: u32 = self.value;
+        self.value = self.value + value;
+        prev
+    }
+
+    fn fetch_sub(&mut self, value: u32, _order: Ordering) -> u32 {
+        let prev: u32 = self.value;
+        self.value = self.value - value;
+        prev
+    }
+}
+
+struct AtomicUsize {
+    value: usize,
+}
+
+impl AtomicUsize {
+    fn new(value: usize) -> AtomicUsize {
+        AtomicUsize { value: value }
+    }
+
+    fn load(&self, _order: Ordering) -> usize {
+        self.value
+    }
+
+    fn store(&mut self, value: usize, _order: Ordering) {
+        self.value = value;
+    }
+
+    fn compare_exchange(&mut self, current: usize, new: usize,
+                        _success: Ordering, _failure: Ordering) -> usize {
+        if self.value == current {
+            self.value = new;
+            current
+        } else {
+            self.value
+        }
+    }
+
+    fn compare_exchange_weak(&mut self, current: usize, new: usize,
+                             success: Ordering, failure: Ordering) -> usize {
+        self.compare_exchange(current, new, success, failure)
+    }
+
+    fn fetch_add(&mut self, value: usize, _order: Ordering) -> usize {
+        let prev: usize = self.value;
+        self.value = self.value + value;
+        prev
+    }
+
+    fn fetch_sub(&mut self, value: usize, _order: Ordering) -> usize {
+        let prev: usize = self.value;
+        self.value = self.value - value;
+        prev
+    }
+}
