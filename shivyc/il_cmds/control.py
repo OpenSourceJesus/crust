@@ -147,6 +147,14 @@ class JumpNotZero(_GeneralJump):
     command = asm_cmds.Jne
 
 
+def _eightbyte_width(n):
+    """Round a partial eightbyte up to the register width that covers it."""
+    for w in (1, 2, 4, 8):
+        if n <= w:
+            return w
+    return 8
+
+
 class Return(ILCommand):
     """RETURN - returns the given value from function.
 
@@ -191,15 +199,31 @@ class Return(ILCommand):
             if size > 16 or not isinstance(src, MemSpot):
                 raise NotImplementedError(
                     "struct return larger than 16 bytes is not supported")
-            hi = size - 8
-            if hi not in (1, 2, 4, 8):
-                raise NotImplementedError(
-                    "struct return of this size is not supported")
+            # The high eightbyte is a partial one for sizes like 11 or 14.
+            # SysV returns the whole eightbyte regardless, so widen rather
+            # than refuse: the source is a stack slot, which is allocated and
+            # aligned in eightbyte units, so reading the full width cannot
+            # cross out of the frame.
+            hi = _eightbyte_width(size - 8)
             asm_code.add(asm_cmds.Mov(spots.RAX, src, 8))
             asm_code.add(asm_cmds.Mov(spots.RDX, src.shift(8), hi))
         elif self.arg and spotmap[self.arg] != spots.RAX:
             size = self.arg.ctype.size
-            asm_code.add(asm_cmds.Mov(spots.RAX, spotmap[self.arg], size))
+            src = spotmap[self.arg]
+            if (self.arg.ctype.is_struct_union()
+                    and size not in (1, 2, 4, 8)):
+                # A struct of 3, 5, 6 or 7 bytes has no matching register
+                # width, so the move is widened to the eightbyte SysV returns
+                # it in. Safe from either kind of source: a register already
+                # holds the whole value, and a stack slot is allocated and
+                # aligned in eightbyte units. The extra bytes are padding the
+                # caller must ignore anyway.
+                #
+                # Without this the backend raised `unexpected register size`
+                # from inside register naming -- a crash rather than a
+                # diagnostic, hit by any function returning such a struct.
+                size = 8
+            asm_code.add(asm_cmds.Mov(spots.RAX, src, size))
 
         # A frameless function set up no rbp frame, so there is nothing to
         # tear down before returning.
@@ -512,10 +536,7 @@ class Call(ILCommand):
                 if ret_size > 16 or not isinstance(dst, MemSpot):
                     raise NotImplementedError(
                         "struct return larger than 16 bytes is not supported")
-                hi = ret_size - 8
-                if hi not in (1, 2, 4, 8):
-                    raise NotImplementedError(
-                        "struct return of this size is not supported")
+                hi = _eightbyte_width(ret_size - 8)
                 asm_code.add(asm_cmds.Mov(dst, spots.RAX, 8))
                 asm_code.add(asm_cmds.Mov(dst.shift(8), spots.RDX, hi))
                 return
@@ -524,8 +545,15 @@ class Call(ILCommand):
                     fmov = asm_cmds.Movss if ret_size == 4 else asm_cmds.Movsd
                     asm_code.add(fmov(spotmap[self.ret], spots.XMM0, ret_size))
             elif spotmap[self.ret] != spots.RAX:
+                # The caller side of the same widening: a struct of 3, 5, 6
+                # or 7 bytes comes back in a full eightbyte of RAX, so the
+                # move out of it needs a real register width too.
+                mov_size = ret_size
+                if (self.ret.ctype.is_struct_union()
+                        and mov_size not in (1, 2, 4, 8)):
+                    mov_size = 8
                 asm_code.add(asm_cmds.Mov(spotmap[self.ret], spots.RAX,
-                                          ret_size))
+                                          mov_size))
 
         # Push stack arguments (the 7th onward) right-to-left, so the 7th ends
         # up at the lowest address ([rsp] at the call). The function body keeps
