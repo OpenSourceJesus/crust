@@ -467,9 +467,11 @@ class TestCrustEnums(unittest.TestCase):
         self.assertIn("enum Level { LOW, HIGH = 9 };", out)
         self.assertNotIn("Level_LOW", out)
 
-    def test_data_carrying_variant_is_rejected(self):
-        with self.assertRaises(crust.CrustError):
-            crust.translate("enum E { A(i32) }")
+    def test_data_carrying_variant_lowers_to_a_tagged_union(self):
+        c = crust.translate("enum E { A(i32), B }\nfn f() -> i32 { 1 }")
+        self.assertIn("enum E_tag { E_A, E_B };", c)
+        self.assertIn("struct E_A_data { int _0; };", c)
+        self.assertIn("union", c)
 
     def test_enum_round_trip(self):
         self.assertEqual(_run("""
@@ -2230,3 +2232,102 @@ class TestCrustExternGuessing(unittest.TestCase):
     def test_path_call_still_gets_a_prototype(self):
         c = crust.translate("fn f() { rmm::aarch64::init_mair(); }")
         self.assertIn("rmm_aarch64_init_mair", c)
+
+
+class TestCrustDataEnums(unittest.TestCase):
+    """Data-carrying enum variants, lowered to a tagged union."""
+
+    def test_tuple_variant_roundtrip(self):
+        self.assertEqual(_run("""
+enum E { N(i32), Nothing }
+fn get(e: E) -> i32 {
+    match e {
+        E::N(v) => v,
+        E::Nothing => 0,
+    }
+}
+fn main() -> i32 { get(E::N(42)) }
+""", suffix=".rs"), 42)
+
+    def test_struct_variant_roundtrip(self):
+        self.assertEqual(_run("""
+enum Shape { Rect { w: i32, h: i32 }, Empty }
+fn area(s: Shape) -> i32 {
+    match s {
+        Shape::Rect { w, h } => w * h,
+        Shape::Empty => 0,
+    }
+}
+fn main() -> i32 { area(Shape::Rect { w: 6, h: 7 }) }
+""", suffix=".rs"), 42)
+
+    def test_multiple_payload_fields(self):
+        self.assertEqual(_run("""
+enum P { Two(i32, i32), None2 }
+fn sum(p: P) -> i32 {
+    match p {
+        P::Two(a, b) => a + b,
+        P::None2 => 0,
+    }
+}
+fn main() -> i32 { sum(P::Two(40, 2)) }
+""", suffix=".rs"), 42)
+
+    def test_payload_free_variant_is_a_whole_value(self):
+        # `E::B` must build `(E){.tag = E_B}`, not a bare tag constant.
+        c = crust.translate("enum E { A(i32), B }\n"
+                            "fn f() -> E { E::B }")
+        self.assertIn("(E){.tag = E_B}", c)
+
+    def test_field_renaming_in_a_struct_pattern(self):
+        self.assertEqual(_run("""
+enum S { P { x: i32 }, Q }
+fn get(s: S) -> i32 {
+    match s {
+        S::P { x: got } => got,
+        S::Q => 0,
+    }
+}
+fn main() -> i32 { get(S::P { x: 42 }) }
+""", suffix=".rs"), 42)
+
+    def test_underscore_binding_is_not_declared(self):
+        c = crust.translate("""
+enum E { A(i32), B }
+fn f(e: E) -> i32 { match e { E::A(_) => 1, E::B => 2 } }
+""")
+        self.assertNotIn("int _ =", c)
+
+    def test_binding_does_not_leak_between_arms(self):
+        # Each arm's bindings live in their own block.
+        self.assertEqual(_run("""
+enum E { A(i32), B(i32) }
+fn f(e: E) -> i32 { match e { E::A(v) => v, E::B(v) => v * 2 } }
+fn main() -> i32 { f(E::B(21)) }
+""", suffix=".rs"), 42)
+
+    def test_scrutinee_is_evaluated_once(self):
+        c = crust.translate("""
+enum E { A(i32), B }
+fn make() -> E { E::B }
+fn f() -> i32 { match make() { E::A(v) => v, E::B => 0 } }
+""")
+        # The prototype spells it `make(void)`, so the single remaining
+        # `make()` is the one call site: the scrutinee is bound to a temporary
+        # rather than re-evaluated per arm.
+        self.assertEqual(c.count("make()"), 1)
+
+    def test_exhaustiveness_still_checked(self):
+        with self.assertRaises(crust.CrustError):
+            crust.translate("enum E { A(i32), B }\n"
+                            "fn f(e: E) -> i32 { match e { E::A(v) => v } }")
+
+    def test_wrong_arity_is_rejected(self):
+        with self.assertRaises(crust.CrustError):
+            crust.translate("enum E { A(i32), B }\nfn f() -> E { E::A(1, 2) }")
+
+    def test_destructuring_a_dataless_variant_is_rejected(self):
+        with self.assertRaises(crust.CrustError):
+            crust.translate("enum E { A(i32), B }\n"
+                            "fn f(e: E) -> i32 { match e { E::A(v) => v, "
+                            "E::B(x) => x } }")
