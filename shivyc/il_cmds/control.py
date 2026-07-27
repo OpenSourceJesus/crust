@@ -11,6 +11,14 @@ from shivyc.spots import LiteralSpot, MemSpot, RegSpot
 from shivyc.errors import CompilerError
 
 
+def _arg_move_size(arg):
+    """Register width to move an argument in."""
+    size = arg.ctype.size
+    if arg.ctype.is_struct_union() and size not in (1, 2, 4, 8):
+        return 8
+    return size
+
+
 def _check_arg_size(arg):
     """Reject a by-value struct whose size has no register width.
 
@@ -517,9 +525,11 @@ class Call(ILCommand):
             # (const, a, b, c) where a/b/c already sit in the next argument
             # registers) needs real parallel-move scheduling, breaking any
             # cycle through a scratch register.
-            for _reg, arg in int_moves:
-                _check_arg_size(arg)
-            moves = [(reg, spotmap[arg], arg.ctype.size)
+            # A by-value struct of 3, 5, 6 or 7 bytes travels in one whole
+            # register. Reading it out of its (eight-byte padded) slot as a
+            # full eightbyte is safe; the callee stores back only the bytes
+            # the struct actually has, using a chunked store.
+            moves = [(reg, spotmap[arg], _arg_move_size(arg))
                      for reg, arg in int_moves if spotmap[arg] != reg]
             _emit_parallel_int_moves(moves, asm_code)
             for regs, arg in struct_reg_moves:

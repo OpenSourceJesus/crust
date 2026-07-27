@@ -178,27 +178,52 @@ class LoadArg(ILCommand):
         if (self.output.ctype.is_struct_union()
                 and size not in (1, 2, 4, 8)):
             # A struct of 3, 5, 6 or 7 bytes arrives in one whole register,
-            # but storing it into its home needs a move of its own size and
-            # there is no 3-byte move. Widening is not an option here: slots
-            # are packed, so writing eight bytes clobbers the neighbouring
-            # local -- that produces a program that compiles and then
-            # corrupts its own frame, which is far worse than not compiling.
-            # Doing it properly means splitting the store into chunks, which
-            # this does not yet do.
+            # but storing it needs a move of its own size and there is no
+            # 3-byte move.
             #
-            # Reporting beats the alternative: without this the backend
-            # raises `unexpected register size` from inside register naming,
-            # handing the user a Python traceback for a valid program.
-            raise CompilerError(
-                "passing a struct of %d bytes by value is not supported; "
-                "its size is not a register width, so it cannot be moved in "
-                "one piece -- pass a pointer instead" % size)
+            # Widening the store is not an option: slots are packed, so
+            # writing eight bytes clobbers the neighbouring local, producing a
+            # program that compiles and then corrupts its own frame. So the
+            # store is split into power-of-two chunks instead -- 3 becomes
+            # 2+1, 7 becomes 4+2+1 -- shifting the value down between them so
+            # each chunk writes the bytes it should and nothing else.
+            _store_chunked(dest, src, size, get_reg, asm_code)
+            return
         if self.arg_reg is None and isinstance(dest, MemSpot):
             r = get_reg()
             asm_code.add(asm_cmds.Mov(r, src, size))
             asm_code.add(asm_cmds.Mov(dest, r, size))
         else:
             asm_code.add(asm_cmds.Mov(dest, src, size))
+
+
+def _chunks(size):
+    """Split `size` bytes into descending power-of-two move widths."""
+    out, remaining = [], size
+    for width in (8, 4, 2, 1):
+        while remaining >= width:
+            out.append(width)
+            remaining -= width
+    return out
+
+
+def _store_chunked(dest, src, size, get_reg, asm_code):
+    """Store exactly `size` bytes of register `src` into memory `dest`.
+
+    Used for a by-value struct whose size is not a register width. The value
+    is copied into a scratch register first, because the chunks are peeled off
+    by shifting it right and the incoming argument register may still be live
+    for another parameter.
+    """
+    scratch = get_reg()
+    asm_code.add(asm_cmds.Mov(scratch, src, 8))
+    offset = 0
+    for width in _chunks(size):
+        asm_code.add(asm_cmds.Mov(dest.shift(offset), scratch, width))
+        offset += width
+        if offset < size:
+            asm_code.add(asm_cmds.Shr(
+                scratch, LiteralSpot(str(width * 8)), 8, 1))
 
 
 class LoadStructArg(_ValueCmd):
