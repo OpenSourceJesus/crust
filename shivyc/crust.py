@@ -2316,6 +2316,8 @@ class Parser:
         if ty is None:
             self.err("cannot infer the type of the iterated expression; "
                      "annotate it")
+        if ty.ptr and self.unit.instances.get(ty.base, (None,))[0] == "PyList":
+            pass                       # handled below, unlike other pointers
 
         idx = self.new_index()
         if ty.base in self.unit.slices:
@@ -2331,6 +2333,19 @@ class Parser:
                          "supported; index the outer dimension")
             out.line_at(t.line, "{", indent)
             base, count = subject.code, ty.array[0]
+        elif self.unit.instances.get(ty.base, (None,))[0] == "PyList":
+            # The list an included rpython module built. It carries its own
+            # length, so it can be walked exactly like a slice -- which is how
+            # Crust gets iteration over a built-up collection without owning
+            # an iterator protocol. A pointer to one is accepted too, since
+            # that is how py2c hands it back.
+            elem = self.unit.instances[ty.base][1][0]
+            tmp = self.new_temp()
+            arrow = "->" if ty.ptr else "."
+            out.line_at(t.line, "{ %s = %s;" % (ty.decl(tmp), subject.code),
+                        indent)
+            base = "%s%sdata" % (tmp, arrow)
+            count = "%s%slen" % (tmp, arrow)
         elif ty.ptr:
             self.err("cannot iterate a raw pointer, as its length is not "
                      "known; slice it first (`&p[0..n]`) or use a range")

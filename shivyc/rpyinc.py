@@ -148,7 +148,7 @@ _USES_RT = re.compile(
 _LIBC_PROTOS = [
     ("malloc", "void *malloc(unsigned long);"),
     ("free", "void free(void *);"),
-    ("realloc", "void *realloc(unsigned long);"),
+    ("realloc", "void *realloc(void *, unsigned long);"),
     ("printf", "int printf(const char *, ...);"),
     ("puts", "int puts(const char *);"),
     ("atoi", "int atoi(const char *);"),
