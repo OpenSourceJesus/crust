@@ -2615,3 +2615,88 @@ fn main() -> i32 { let mut t: T = T { a: [0; 4], n: 0 }; t.fill();
         c = crust.translate("struct G { grid: [[i32; 3]; 3] }\n"
                             "fn f() -> i32 { 1 }")
         self.assertIn("grid", c)
+
+
+class TestCrustResultAlias(unittest.TestCase):
+    """`Result<T>` with one type argument."""
+
+    def test_single_argument_result(self):
+        c = crust.translate("fn f() -> Result<i32> { Ok(1) }")
+        self.assertIn("crust_result_int_e_int", c)
+
+    def test_alias_supplies_the_error_type(self):
+        c = crust.translate("struct Error { code: i32 }\n"
+                            "type Result<T> = core::result::Result<T, Error>;\n"
+                            "fn f() -> Result<i32> { Ok(1) }")
+        self.assertIn("crust_result_int_e_Error", c)
+
+    def test_two_argument_form_still_works(self):
+        c = crust.translate("fn f() -> Result<i32, i64> { Ok(1) }")
+        self.assertIn("crust_result_int_e_long", c)
+
+    def test_single_argument_result_runs(self):
+        self.assertEqual(_run("""
+fn half(n: i32) -> Result<i32> {
+    if n % 2 == 0 { Ok(n / 2) } else { Err(1) }
+}
+fn main() -> i32 {
+    let r: Result<i32> = half(84);
+    if r.is_ok() { r.unwrap() } else { 0 }
+}
+""", suffix=".rs"), 42)
+
+
+class TestCrustGenericAlias(unittest.TestCase):
+    """A generic `type` alias is skipped, not fatal."""
+
+    def test_generic_alias_does_not_fail_the_file(self):
+        # Crust monomorphises, so a generic alias has nothing to bind to.
+        # Failing the whole file over one would be wildly out of proportion.
+        c = crust.translate("type Pair<T> = (T, T);\nfn f() -> i32 { 42 }")
+        self.assertIn("int f(void) { return 42; }", c)
+
+    def test_plain_alias_still_resolves(self):
+        c = crust.translate("type Word = i64;\nfn f(x: Word) -> Word { x }")
+        self.assertIn("long f(long x)", c)
+
+
+class TestCrustSyncWrappers(unittest.TestCase):
+    """The std wrappers the bundled core supplies."""
+
+    def test_unsafe_cell_is_one_field(self):
+        c = crust.translate("fn f(c: *mut UnsafeCell<i32>) -> i32 "
+                            "{ c.read() }")
+        self.assertIn("struct UnsafeCell_int { int value; }", c)
+
+    def test_non_null_is_a_pointer(self):
+        c = crust.translate("fn f(p: *mut NonNull<i32>) -> i32 { p.read() }")
+        self.assertIn("struct NonNull_int { int *ptr; }", c)
+
+    def test_mutex_roundtrip(self):
+        self.assertEqual(_run("""
+fn main() -> i32 {
+    let mut m: Mutex<i32> = Mutex { value: 42 };
+    m.read()
+}
+""", suffix=".rs"), 42)
+
+    def test_once_runs_once(self):
+        self.assertEqual(_run("""
+fn main() -> i32 {
+    let mut o: Once<i32> = Once { value: 0, done: false };
+    o.call_once(42);
+    o.call_once(7);
+    o.get()
+}
+""", suffix=".rs"), 42)
+
+    def test_mutex_does_not_synchronise(self):
+        # Documented explicitly because the name promises otherwise: there is
+        # no lock in the generated C at all.
+        c = crust.translate("fn f(m: *mut Mutex<i32>) -> i32 { m.read() }")
+        self.assertNotIn("lock(", c.replace("Mutex_int_lock", ""))
+
+    def test_unused_wrappers_cost_nothing(self):
+        c = crust.translate("fn f() -> i32 { 1 }")
+        for name in ("Mutex", "RwLock", "Once", "NonNull", "UnsafeCell"):
+            self.assertNotIn(name, c)
