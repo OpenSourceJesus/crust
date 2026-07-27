@@ -57,6 +57,23 @@ EXAMPLES = [
      "widest = 3\n"
      "len2   = 25\n", True),
 
+    ("derive.rs", 0,
+     "clone    = 42\n"
+     "eq(a, b) = 1\n"
+     "default  = 0 0\n"
+     "debug    = Point { x: 40, y: 2 }\n"
+     "override = 40\n"
+     "zeroed   = 0\n", True),
+
+    ("enums.rs", 0,
+     "quit   = 0\n"
+     "move   = 307\n"
+     "write  = 42\n"
+     "color  = 42\n"
+     "just_x = 5\n"
+     "leaf   = 42\n"
+     "empty  = 7\n", True),
+
     ("tail.rs", 0,
      "divmod   = (9, 2)\n"
      "stats    = (1, 9, 5.33333)\n"
