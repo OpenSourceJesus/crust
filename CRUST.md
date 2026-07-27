@@ -598,6 +598,47 @@ already holds the whole value, and a stack slot is allocated in eightbyte
 units. This was never specific to `derive` — any Rust or C function returning
 such a struct hit it.
 
+## `Result<T>` and the crate-wide alias
+
+Almost every crate that fixes its error type does it once —
+`type Result<T> = core::result::Result<T, Error>;` — and then writes the
+**one-argument** `Result<T>` everywhere after. Redox does exactly that, and it
+was the second most common translation failure.
+
+Crust accepts both spellings. With one argument, the error type comes from the
+unit's own `Result<T>` alias if it declares one, and otherwise defaults to a
+plain integer error code.
+
+A *generic* type alias has no representation here — Crust monomorphises, and
+an alias is not an item to monomorphise — so one is **skipped rather than
+reported**. Failing a file over an alias would be out of proportion: a crate
+that declares one is otherwise perfectly translatable, and the alias that
+actually matters is recognized separately.
+
+## The sync and pointer wrappers
+
+`UnsafeCell<T>`, `SyncUnsafeCell<T>` and `NonNull<T>` are **faithful**. In real
+Rust `UnsafeCell<T>` is a struct with one field whose only job is to tell the
+compiler that aliasing rules do not apply; Crust has no aliasing rules to
+suspend, so the wrapper carries the same information here — none. `NonNull<T>`
+is a pointer plus a promise the programmer makes, not a runtime check.
+
+`Once<T>` is faithful for a single-threaded caller. What is missing is the
+blocking half: a real `Once` makes a second thread wait. There are no threads,
+so there is nothing to wait for.
+
+**`Mutex<T>` and `RwLock<T>` do not synchronise.** `lock()` hands back a
+pointer to the inner value and nothing else happens. This is defensible only
+because Crust has no threads at all — no spawn, no atomics, no memory model —
+so there is nothing for a lock to protect against, and a lock that does nothing
+is consistent with the rest of the model rather than a hole in it. **The moment
+real concurrency exists, these become actively dangerous and must be replaced,
+not extended.**
+
+They are deliberately not named something honest like `FakeMutex`, because the
+entire point is to accept source written as `Mutex<T>`. The warning has to live
+in the documentation instead, which is why it is stated this plainly.
+
 ## Data-carrying enums
 
 An enum variant may carry data, in tuple form `Circle(f64)` or struct form
