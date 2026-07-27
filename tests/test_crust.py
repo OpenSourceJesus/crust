@@ -2331,3 +2331,109 @@ fn f() -> i32 { match make() { E::A(v) => v, E::B => 0 } }
             crust.translate("enum E { A(i32), B }\n"
                             "fn f(e: E) -> i32 { match e { E::A(v) => v, "
                             "E::B(x) => x } }")
+
+
+class TestCrustDerive(unittest.TestCase):
+    """`#[derive(..)]` generates the same methods a hand-written impl would."""
+
+    def test_clone_returns_a_copy(self):
+        self.assertEqual(_run("""
+#[derive(Clone, Copy)]
+struct P { x: i32, y: i32 }
+fn main() -> i32 { let a: P = P { x: 40, y: 2 }; let b: P = a.clone();
+                   b.x + b.y }
+""", suffix=".rs"), 42)
+
+    def test_partial_eq_compares_fields(self):
+        self.assertEqual(_run("""
+#[derive(PartialEq)]
+struct P { x: i32, y: i32 }
+fn main() -> i32 {
+    let a: P = P { x: 1, y: 2 };
+    let b: P = P { x: 1, y: 2 };
+    let c: P = P { x: 9, y: 2 };
+    if a.eq(&b) { if a.eq(&c) { 0 } else { 42 } } else { 0 }
+}
+""", suffix=".rs"), 42)
+
+    def test_default_zeroes(self):
+        self.assertEqual(_run("""
+#[derive(Default)]
+struct P { x: i32, y: i32 }
+fn main() -> i32 { let p: P = P::default(); 42 + p.x + p.y }
+""", suffix=".rs"), 42)
+
+    def test_debug_prints_fields(self):
+        c = crust.translate("#[derive(Debug)]\nstruct P { x: i32 }\n"
+                            "fn f(p: *const P) { p.debug(); }")
+        self.assertIn("P_debug", c)
+        self.assertIn("x: %d", c)
+
+    def test_copy_and_eq_are_markers(self):
+        c = crust.translate("#[derive(Copy, Eq)]\nstruct P { x: i32 }\n"
+                            "fn f() -> i32 { 1 }")
+        self.assertNotIn("P_copy", c)
+        self.assertNotIn("P_eq", c)
+
+    def test_hand_written_impl_wins(self):
+        self.assertEqual(_run("""
+#[derive(Clone)]
+struct P { x: i32 }
+impl P { fn clone(&self) -> P { P { x: 42 } } }
+fn main() -> i32 { let a: P = P { x: 1 }; a.clone().x }
+""", suffix=".rs"), 42)
+
+    def test_non_scalar_field_skips_derivation(self):
+        # A nested struct cannot be compared with `==`, and an unknown type
+        # cannot be printed. Skipping is the only safe answer.
+        c = crust.translate("""
+struct Inner { v: i32 }
+#[derive(PartialEq, Debug)]
+struct Outer { i: Inner }
+fn f() -> i32 { 1 }
+""")
+        self.assertNotIn("Outer_eq", c)
+
+    def test_unknown_derive_is_ignored(self):
+        c = crust.translate("#[derive(Hash, Serialize)]\nstruct P { x: i32 }\n"
+                            "fn f() -> i32 { 1 }")
+        self.assertIn("int f(void)", c)
+
+    def test_derive_on_a_data_enum_is_accepted(self):
+        # Accepted so the attribute does not fail the file; nothing generated.
+        c = crust.translate("#[derive(Clone)]\nenum E { A(i32), B }\n"
+                            "fn f() -> i32 { 1 }")
+        self.assertIn("enum E_tag", c)
+
+
+class TestOddSizedStructReturn(unittest.TestCase):
+    """Returning a struct whose size is not a register width.
+
+    SysV returns a struct of 3, 5, 6 or 7 bytes in a full eightbyte of RAX,
+    but the backend was moving exactly `size` bytes and raising
+    `NotImplementedError` from inside register naming -- a crash rather than a
+    diagnostic. Any function returning such a struct hit it; `#[derive(Clone)]`
+    just made it easy to reach.
+    """
+
+    def _sz(self, fields):
+        return _run("struct S { %s };\n"
+                    "struct S f(struct S *p) { return *p; }\n"
+                    "int main(void) { struct S s; s.a = 42;"
+                    " struct S r = f(&s); return r.a; }" % fields)
+
+    def test_three_byte_struct(self):
+        self.assertEqual(self._sz("char a; char b; char c;"), 42)
+
+    def test_five_byte_struct(self):
+        self.assertEqual(self._sz("char a; char b; char c; char d; char e;"),
+                         42)
+
+    def test_six_byte_struct(self):
+        self.assertEqual(self._sz("int a; short b;"), 42)
+
+    def test_ten_byte_struct(self):
+        self.assertEqual(self._sz("int a; int b; short c;"), 42)
+
+    def test_register_sized_still_works(self):
+        self.assertEqual(self._sz("int a; int b;"), 42)
