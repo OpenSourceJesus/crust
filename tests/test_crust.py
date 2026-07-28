@@ -2829,3 +2829,65 @@ fn main() -> i32 {
         # A path whose head is not a type parameter is unaffected.
         c = crust.translate("fn f() { rmm::aarch64::init_mair(); }")
         self.assertIn("rmm_aarch64_init_mair", c)
+
+
+class TestCrustTraitConstDefaults(unittest.TestCase):
+    """Associated consts with defaults, inherited by an impl.
+
+    rmm's `Arch` trait declares twenty of these, several derived from another
+    (`const ENTRY_ADDRESS_SHIFT: usize = Self::PAGE_SHIFT;`). Without
+    inheritance the symbol was referenced but never defined, so the file
+    translated and then failed to link.
+    """
+
+    def test_default_is_inherited(self):
+        self.assertEqual(_run("""
+trait A { const N: i32 = 42; }
+struct X { v: i32 }
+impl A for X { }
+fn main() -> i32 { X::N }
+""", suffix=".rs"), 42)
+
+    def test_impl_overrides_the_default(self):
+        self.assertEqual(_run("""
+trait A { const N: i32 = 1; }
+struct X { v: i32 }
+impl A for X { const N: i32 = 42; }
+fn main() -> i32 { X::N }
+""", suffix=".rs"), 42)
+
+    def test_default_derived_from_another_const(self):
+        self.assertEqual(_run("""
+trait A { const N: i32; const M: i32 = Self::N; }
+struct X { v: i32 }
+impl A for X { const N: i32 = 42; }
+fn main() -> i32 { X::M }
+""", suffix=".rs"), 42)
+
+    def test_two_impls_get_their_own_values(self):
+        # The derived default must be computed per implementing type.
+        self.assertEqual(_run("""
+trait A { const SHIFT: u64; const SIZE: u64 = 1 << Self::SHIFT; }
+struct P4 { v: i32 }
+struct P64 { v: i32 }
+impl A for P4 { const SHIFT: u64 = 12; }
+impl A for P64 { const SHIFT: u64 = 16; }
+fn main() -> i32 { ((P64::SIZE / P4::SIZE) as i32) * 2 + 10 }
+""", suffix=".rs"), 42)
+
+    def test_inherited_const_is_declared_before_use(self):
+        # It has to reach the prelude: the appended block sits after every
+        # function body, which is too late for anything that reads it.
+        c = crust.translate("trait A { const N: i32 = 7; }\n"
+                            "struct X { v: i32 }\nimpl A for X { }\n"
+                            "fn f() -> i32 { X::N }")
+        define = c.index("#define X_N")
+        self.assertLess(define, c.index("return X_N"))
+
+    def test_declaration_without_default_is_not_invented(self):
+        # A trait const with no default must come from the impl; inventing
+        # one would silently give every implementor the same value.
+        c = crust.translate("trait A { const N: i32; }\n"
+                            "struct X { v: i32 }\nimpl A for X { const N: i32 = 5; }\n"
+                            "fn f() -> i32 { X::N }")
+        self.assertEqual(c.count("X_N ="), 1)
