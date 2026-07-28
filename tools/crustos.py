@@ -1,33 +1,40 @@
 #!/usr/bin/env python3
-"""crustos -- build a mini Redox with Crust, without cargo.
+"""crustos -- build a small OS from the parts of Redox that compile.
 
-Redox is a cargo workspace of ~100 crates that pulls in a nightly toolchain,
-build scripts, procedural macros and a package manager (the `redox` repo is
-the *cookbook*; the OS itself lives in sibling repos). None of that is needed
-to answer the question this tool exists to answer: **which Redox source files
-can Crust actually compile today, and what is stopping the rest?**
+Redox is a cargo workspace of roughly a hundred crates on a nightly toolchain.
+Crust compiles a subset of it, and this tool turns that subset into something
+that actually builds and runs, by supplying the rest itself.
 
-So crustos ignores Cargo.toml entirely. It walks a source tree, finds `.rs`
-files, runs each through the Crust front end, and reports what happened --
-then compiles the ones that work.
+The split is the point:
 
-    python3 tools/crustos.py survey ~/redox-kernel ~/redox-relibc
-    python3 tools/crustos.py survey ~/redox-kernel --blockers
-    python3 tools/crustos.py build  ~/redox-kernel -o build/crustos
-    python3 tools/crustos.py stage  ~/redox-kernel -o /tmp/mini-redox
+  vendor/     whatever of the real Redox kernel Crust can compile today:
+              memory-manager page tables and flags, the buddy and bump frame
+              allocators, architecture constants, syscall numbers. Genuine
+              Redox source, compiled by Crust, with no cargo involved.
 
-A note on honesty in the numbers. `crust.translate` passes a file through
-unchanged when it finds no top-level Rust items in it -- which is the right
-behaviour for a C file with no Rust in it, but would score a Redox file that
-Crust understood *nothing* of as a success. So a file only counts as
-translated here if Crust actually found and lowered at least one item, and the
-report separates the two cases explicitly.
+  crustos/    the parts Crust cannot compile, written to be small rather than
+              complete -- a scheme layer in rpython, and a frame allocator,
+              scheduler and syscall dispatch in Rust. This is where the
+              "smaller than Redox" claim lives, and it is honest only because
+              it does far less.
+
+Everything ends up as one binary. There is no bootloader and no bare-metal
+target: CrustOS runs hosted, as an ordinary program. That makes it a working
+model of the structure rather than an OS you can boot, and the distinction is
+worth keeping in view -- see CRUSTOS.md.
+
+    python3 tools/crustos.py fetch       # clone/update the Redox sources
+    python3 tools/crustos.py survey      # what compiles, and what stops the rest
+    python3 tools/crustos.py build       # upstream subset + crustos -> one binary
+    python3 tools/crustos.py run         # build, then run it
+    python3 tools/crustos.py clean
 """
 
 import argparse
 import collections
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -37,24 +44,32 @@ if ROOT not in sys.path:
 
 import shivyc.crust as crust                                  # noqa: E402
 
-# Directories that never hold OS source worth compiling.
+VENDOR = os.environ.get("CRUSTOS_VENDOR", os.path.join(ROOT, "vendor"))
+BUILD = os.environ.get("CRUSTOS_BUILD", os.path.join(ROOT, "build", "crustos"))
+SHIM = os.path.join(ROOT, "crustos")
+
+# The repositories that make up Redox proper. The `redox` repo itself is the
+# *cookbook* -- a package build tool with 25 .rs files, none of them the OS --
+# so these are the ones worth fetching.
+REPOS = [
+    ("kernel", "https://github.com/redox-os/kernel.git"),
+    ("relibc", "https://github.com/redox-os/relibc.git"),
+]
+
 SKIP_DIRS = {".git", "target", "tests", "test", "benches", "examples",
              "build", "node_modules", ".github"}
 
-# Outcome buckets, worst to best.
-EMPTY = "empty"        # no Rust items Crust recognizes -- nothing to do
-FAILED = "failed"      # items found, translation raised
-PARTIAL = "partial"    # translated, but Crust saw only some of the file
-TRANSLATED = "translated"   # translated, and Crust saw essentially all of it
+EMPTY, FAILED, PARTIAL, TRANSLATED = "empty", "failed", "partial", "translated"
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
 class Result:
     def __init__(self, path, outcome, items=0, lines=0, covered=0, error=None):
         self.path = path
         self.outcome = outcome
-        self.items = items          # top-level Rust items Crust found
-        self.lines = lines          # source lines
-        self.covered = covered      # lines inside those items
+        self.items = items
+        self.lines = lines
+        self.covered = covered
         self.error = error
 
     @property
@@ -62,8 +77,43 @@ class Result:
         return (self.covered / self.lines) if self.lines else 0.0
 
 
-def iter_sources(roots):
-    """Yield every .rs file under `roots`, skipping vendored/build dirs."""
+# -------------------------------------------------------------------------
+# fetch
+# -------------------------------------------------------------------------
+
+def fetch(update):
+    """Clone the Redox sources, or pull them if they are already here."""
+    if shutil.which("git") is None:
+        print("git is not available; clone these by hand into %s:" % VENDOR)
+        for name, url in REPOS:
+            print("  %s -> %s" % (url, os.path.join(VENDOR, name)))
+        return 1
+    os.makedirs(VENDOR, exist_ok=True)
+    for name, url in REPOS:
+        dest = os.path.join(VENDOR, name)
+        if os.path.isdir(os.path.join(dest, ".git")):
+            if not update:
+                print("  have  %s" % dest)
+                continue
+            print("  pull  %s" % dest)
+            proc = subprocess.run(["git", "-C", dest, "pull", "--ff-only"],
+                                  capture_output=True, text=True)
+        else:
+            # Shallow: the history is of no use here and the full one is large.
+            print("  clone %s" % url)
+            proc = subprocess.run(["git", "clone", "--depth", "1", url, dest],
+                                  capture_output=True, text=True)
+        if proc.returncode != 0:
+            detail = (proc.stderr or "").strip().splitlines()
+            print("  FAILED: %s" % (detail[-1] if detail else "?"))
+            print("  (no network? clone by hand into %s)" % dest)
+            return 1
+    return 0
+
+
+def sources(roots=None):
+    """Every .rs file under the vendored checkouts, or under explicit roots."""
+    roots = roots or [os.path.join(VENDOR, name) for name, _ in REPOS]
     for root in roots:
         if os.path.isfile(root) and root.endswith(".rs"):
             yield root
@@ -76,8 +126,26 @@ def iter_sources(roots):
                     yield os.path.join(dirpath, name)
 
 
+def require_sources(roots):
+    got = list(sources(roots))
+    if not got:
+        print("no Redox sources found under %s" % VENDOR)
+        print("run:  python3 tools/crustos.py fetch")
+        return None
+    return got
+
+
+# -------------------------------------------------------------------------
+# survey
+# -------------------------------------------------------------------------
+
 def classify(path):
-    """Run one file through Crust and bucket the outcome."""
+    """Run one file through Crust and bucket the outcome.
+
+    A file counts as translated only if Crust actually lowered an item.
+    Passing unrecognized text through is right for a C file with no Rust in
+    it, but it would score a Rust file Crust understood nothing of as a pass.
+    """
     try:
         src = open(path, encoding="utf-8", errors="replace").read()
     except OSError as e:
@@ -88,7 +156,6 @@ def classify(path):
         spans = crust.find_rust_items(src, rust_file=True)
     except crust.CrustError as e:
         return Result(path, FAILED, lines=lines, error=str(e))
-
     if not spans:
         return Result(path, EMPTY, lines=lines)
 
@@ -108,12 +175,8 @@ def classify(path):
     return Result(path, outcome, len(spans), lines, covered)
 
 
-# Error-message normalization, so a histogram groups the same cause together.
-_NORM = [
-    (re.compile(r"^.*?line \d+: "), ""),
-    (re.compile(r"`[^`]*`"), "`X`"),
-    (re.compile(r"\d+"), "N"),
-]
+_NORM = [(re.compile(r"^.*?line \d+: "), ""), (re.compile(r"`[^`]*`"), "`X`"),
+         (re.compile(r"\d+"), "N")]
 
 
 def normalize(msg):
@@ -122,154 +185,49 @@ def normalize(msg):
     return msg.strip()
 
 
-# Blockers worth naming as features rather than as parse errors. Each entry is
-# (label, test) where test looks at the raw error and the source.
-FEATURES = [
-    ("generics / turbofish `<T>`",
-     lambda e, s: "found '<'" in e or "found '>'" in e),
-    ("`unsafe { }` blocks",
-     lambda e, s: "'unsafe'" in e),
-    ("`impl Trait for Type`",
-     lambda e, s: "found 'for'" in e),
-    ("data-carrying enum variants",
-     lambda e, s: "data-carrying enum" in e),
-    ("macros (`name!`)",
-     lambda e, s: "found '!'" in e or "'#'" in e),
-    ("paths / `::` in type or pattern position",
-     lambda e, s: "found '::'" in e),
-    ("closures / tuples `(..)`",
-     lambda e, s: "found '('" in e or "a type, found '('" in e),
-    ("range or `..` patterns",
-     lambda e, s: "found '..'" in e),
-    ("method resolution (trait methods)",
-     lambda e, s: "no method" in e or "cannot infer the type of the receiver"
-     in e),
-]
-
-
-def survey(results, show_blockers, top, show_files):
-    buckets = collections.Counter(r.outcome for r in results)
+def survey(results, show_blockers, top, verify):
     total = len(results)
-    items = sum(r.items for r in results)
-    print("Redox source survey -- %d .rs files" % total)
-    print()
+    buckets = collections.Counter(r.outcome for r in results)
+    print("Redox source survey -- %d .rs files\n" % total)
     for label, key in [("translated (Crust saw most of the file)", TRANSLATED),
-                       ("partial    (some items lowered, rest passed through)",
-                        PARTIAL),
+                       ("partial    (some items lowered)", PARTIAL),
                        ("failed     (items found, translation errored)",
                         FAILED),
                        ("empty      (no Rust items Crust recognizes)", EMPTY)]:
         n = buckets[key]
-        print("  %-52s %4d  %5.1f%%" % (label, n, 100.0 * n / total if total
-                                        else 0))
-    print()
-    print("  top-level Rust items Crust parsed: %d" % items)
+        print("  %-46s %4d  %5.1f%%"
+              % (label, n, 100.0 * n / total if total else 0))
     usable = [r for r in results if r.outcome in (TRANSLATED, PARTIAL)]
+    print("\n  top-level Rust items parsed: %d"
+          % sum(r.items for r in results))
     print("  files with at least one lowered item: %d" % len(usable))
 
-    if show_files and usable:
-        print("\ncompilable files:")
-        for r in sorted(usable, key=lambda r: -r.items)[:top]:
-            print("  %3d items  %5.0f%%  %s"
-                  % (r.items, 100 * r.coverage, os.path.relpath(r.path)))
+    if verify:
+        objs, causes = compile_objects(usable, os.path.join(BUILD, "verify"))
+        print("\nverified by compiling:")
+        print("  %d of %d produce an object  (%.1f%% of all %d files)"
+              % (len(objs), len(usable),
+                 100.0 * len(objs) / total if total else 0, total))
+        if causes:
+            print("\n  what stops the rest:")
+            for msg, n in causes.most_common(10):
+                print("    %3d  %s" % (n, msg))
 
     if not show_blockers:
         return
     failed = [r for r in results if r.outcome == FAILED and r.error]
-
-    print("\nblocking features, by files affected (of %d failing files):"
-          % len(failed))
-    counts = collections.Counter()
-    for r in failed:
-        for label, test in FEATURES:
-            try:
-                if test(r.error, None):
-                    counts[label] += 1
-                    break
-            except Exception:                                 # pragma: no cover
-                pass
-        else:
-            counts["other"] += 1
-    for label, n in counts.most_common():
-        print("  %4d  %5.1f%%  %s" % (n, 100.0 * n / len(failed) if failed
-                                      else 0, label))
-
-    print("\nraw messages, most frequent %d:" % top)
-    raw = collections.Counter(normalize(r.error) for r in failed)
-    for msg, n in raw.most_common(top):
+    print("\nmost frequent messages (of %d failing files):" % len(failed))
+    for msg, n in collections.Counter(
+            normalize(r.error) for r in failed).most_common(top):
         print("  %4d  %s" % (n, msg[:96]))
 
 
-def verify(results, out_dir):
-    """Compile the translatable files and report how many really build.
+# -------------------------------------------------------------------------
+# build
+# -------------------------------------------------------------------------
 
-    Translating is not compiling, and the gap between them is large: text
-    Crust does not recognize is passed through byte-for-byte, so a construct
-    with no C meaning survives translation intact and only fails later, in
-    the C front end. `use core::mem;` did exactly that for a long time --
-    invisible to any measurement that stops at `translate()`.
-
-    This is the number that answers "how much of Redox can Crust compile",
-    so it is worth the extra minute it costs.
-    """
-    import tempfile
-    out_dir = out_dir or tempfile.mkdtemp(prefix="crustos_verify_")
-    os.makedirs(out_dir, exist_ok=True)
-    usable = [r for r in results
-              if r.outcome in (TRANSLATED, PARTIAL)]
-    ok, causes = 0, collections.Counter()
-    for r in usable:
-        obj = os.path.join(out_dir, os.path.basename(r.path) + ".o")
-        proc = subprocess.run(
-            [sys.executable, "-m", "shivyc.main", "-c", r.path, "-o", obj],
-            cwd=ROOT, capture_output=True, text=True)
-        if proc.returncode == 0 and os.path.exists(obj):
-            ok += 1
-        else:
-            causes[_diagnostic(proc)] += 1
-    print("\nverified by compiling:")
-    print("  %d of %d translatable files produce an object  (%.1f%% of all "
-          "%d files)" % (ok, len(usable),
-                         100.0 * ok / len(results) if results else 0,
-                         len(results)))
-    if causes:
-        print("\n  what stops the rest:")
-        for msg, n in causes.most_common(10):
-            print("    %3d  %s" % (n, msg))
-
-
-def stage(results, out_dir):
-    """Copy every file with a lowered item into `out_dir`, flattened."""
-    os.makedirs(out_dir, exist_ok=True)
-    n = 0
-    for r in results:
-        if r.outcome not in (TRANSLATED, PARTIAL):
-            continue
-        dest = os.path.join(out_dir, os.path.basename(r.path))
-        base, ext = os.path.splitext(dest)
-        k = 1
-        while os.path.exists(dest):
-            dest = "%s_%d%s" % (base, k, ext)
-            k += 1
-        with open(r.path, encoding="utf-8", errors="replace") as f:
-            src = f.read()
-        with open(dest, "w", encoding="utf-8") as f:
-            f.write(src)
-        n += 1
-    print("staged %d files into %s" % (n, out_dir))
-    return n
-
-
-_ANSI = re.compile(r"\x1b\[[0-9;]*m")
-
-
-def _diagnostic(proc):
-    """Pull the real compiler message out of a failed run.
-
-    The last line of the output is usually caret/underline decoration, so
-    taking it verbatim produces a histogram of dashes rather than of causes.
-    Prefer the first line that actually carries a diagnostic.
-    """
+def diagnostic(proc):
+    """The real message from a failed compile, not the caret line."""
     text = _ANSI.sub("", (proc.stderr or "") + (proc.stdout or ""))
     for line in text.splitlines():
         if "error:" in line.lower():
@@ -279,65 +237,200 @@ def _diagnostic(proc):
     return lines[-1].strip()[:90] if lines else "?"
 
 
-def build(results, out_dir, keep_going):
-    """Compile every translatable file to an object with ShivyCX."""
-    os.makedirs(out_dir, exist_ok=True)
-    ok = failed = 0
-    for r in results:
-        if r.outcome not in (TRANSLATED, PARTIAL):
-            continue
-        obj = os.path.join(out_dir, os.path.basename(r.path) + ".o")
-        proc = subprocess.run(
-            [sys.executable, "-m", "shivyc.main", "-c", r.path, "-o", obj],
-            cwd=ROOT, capture_output=True, text=True)
-        if proc.returncode == 0 and os.path.exists(obj):
-            ok += 1
-            print("  ok    %s" % os.path.relpath(r.path))
+def compile_one(path, obj):
+    os.makedirs(os.path.dirname(obj), exist_ok=True)
+    proc = subprocess.run(
+        [sys.executable, "-m", "shivyc.main", "-c", path, "-o", obj],
+        cwd=ROOT, capture_output=True, text=True)
+    return (proc.returncode == 0 and os.path.exists(obj)), proc
+
+
+def compile_objects(results, out_dir, verbose=False):
+    """Compile each translatable file; return (objects, failure causes)."""
+    objs, causes = [], collections.Counter()
+    for i, r in enumerate(results):
+        obj = os.path.join(out_dir, "u%03d_%s.o"
+                           % (i, os.path.basename(r.path)[:-3]))
+        ok, proc = compile_one(r.path, obj)
+        if ok:
+            objs.append(obj)
+            if verbose:
+                print("  ok    %s" % os.path.relpath(r.path, VENDOR))
         else:
-            failed += 1
-            print("  FAIL  %s: %s" % (os.path.relpath(r.path),
-                                      _diagnostic(proc)))
-            if not keep_going:
-                break
-    print("\nbuild: %d objects, %d failures" % (ok, failed))
-    return 0 if failed == 0 else 1
+            causes[diagnostic(proc)] += 1
+            if verbose:
+                print("  skip  %s: %s" % (os.path.relpath(r.path, VENDOR),
+                                          diagnostic(proc)))
+    return objs, causes
+
+
+def symbols(obj):
+    """(defined, undefined) global symbol names in an object file."""
+    proc = subprocess.run(["nm", "-g", obj], capture_output=True, text=True)
+    if proc.returncode != 0:
+        return set(), set()
+    defined, undef = set(), set()
+    for line in proc.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[-2] == "U":
+            undef.add(parts[-1])
+        elif len(parts) >= 3 and parts[-2] in "TDBRWVGSA":
+            defined.add(parts[-1])
+    return defined, undef
+
+
+def linkable_subset(objs, provided):
+    """Pick the objects that can actually be linked together.
+
+    Two things make the full set unlinkable, and both are consequences of
+    compiling files that were never meant to be one program:
+
+      * Redox ships one implementation per architecture, and Crust flattens
+        paths, so `aarch64` and `riscv64` versions of the same function end
+        up with the same symbol. The first is kept and later duplicates
+        dropped -- an arbitrary but consistent choice, and the alternative is
+        linking nothing.
+
+      * A file may reference a symbol from a part of Redox that does not
+        compile. Those objects are dropped too, rather than left to fail the
+        link with a message that names the symbol but not the file.
+
+    Returns (kept, dropped) where `dropped` maps object -> reason.
+    """
+    if shutil.which("nm") is None:
+        return objs, {}
+    info = {o: symbols(o) for o in objs}
+    seen = set(provided)
+    for _defined, _u in info.values():
+        pass
+    kept, dropped = [], {}
+    # Everything the whole set defines: an undefined symbol is only a problem
+    # if nothing anywhere provides it.
+    available = set(provided)
+    for o in objs:
+        available |= info[o][0]
+    for o in objs:
+        defined, undef = info[o]
+        clash = defined & seen
+        if clash:
+            dropped[o] = "duplicate symbol %s" % sorted(clash)[0]
+            continue
+        missing = {u for u in undef if u not in available}
+        if missing:
+            dropped[o] = "needs %s" % sorted(missing)[0]
+            continue
+        seen |= defined
+        kept.append(o)
+    return kept, dropped
+
+
+def build(roots, verbose, upstream_only):
+    """Compile the upstream subset and the CrustOS shim into one binary."""
+    paths = require_sources(roots)
+    if paths is None:
+        return 1
+
+    print("== upstream: the Redox files Crust understands ==")
+    results = [classify(p) for p in paths]
+    usable = [r for r in results if r.outcome in (TRANSLATED, PARTIAL)]
+    objs, causes = compile_objects(usable, os.path.join(BUILD, "upstream"),
+                                   verbose)
+    print("   %d of %d translatable files became objects"
+          % (len(objs), len(usable)))
+    if causes and verbose:
+        for msg, n in causes.most_common(5):
+            print("     %3d  %s" % (n, msg))
+    if upstream_only:
+        return 0
+
+    # libc symbols the final link supplies anyway.
+    provided = {"printf", "malloc", "free", "realloc", "memcpy", "memset",
+                "abort", "exit", "strlen", "puts", "fprintf", "stderr"}
+    objs, dropped = linkable_subset(objs, provided)
+    if dropped:
+        print("   %d dropped so the set links (%d kept)"
+              % (len(dropped), len(objs)))
+        if verbose:
+            for o, why in sorted(dropped.items())[:10]:
+                print("     %-38s %s" % (os.path.basename(o), why))
+
+    print("\n== crustos: the parts we supply ourselves ==")
+    main_src = os.path.join(SHIM, "kernel.c")
+    if not os.path.exists(main_src):
+        print("   missing %s" % main_src)
+        return 1
+    binary = os.path.join(BUILD, "crustos")
+    os.makedirs(BUILD, exist_ok=True)
+    # Upstream objects go on the link line. Most contribute layout constants
+    # and helpers rather than entry points, which is what a kernel takes from
+    # a memory manager anyway.
+    # Inputs first, then `-o`: the argument parser binds a trailing option
+    # before the positional list, so objects placed after `-o` are rejected.
+    cmd = ([sys.executable, "-m", "shivyc.main", main_src] + objs
+           + ["-o", binary])
+    proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
+    if proc.returncode != 0 or not os.path.exists(binary):
+        print("   FAILED: %s" % diagnostic(proc))
+        return 1
+    print("   linked %s  (%d upstream objects)" % (binary, len(objs)))
+    return 0
+
+
+def run(roots, verbose):
+    rc = build(roots, verbose, False)
+    if rc != 0:
+        return rc
+    print("\n== running ==")
+    proc = subprocess.run([os.path.join(BUILD, "crustos")],
+                          capture_output=True, text=True)
+    sys.stdout.write(proc.stdout)
+    if proc.stderr:
+        sys.stderr.write(proc.stderr)
+    return proc.returncode
+
+
+def clean():
+    if os.path.isdir(BUILD):
+        shutil.rmtree(BUILD)
+        print("  removed %s" % BUILD)
+    return 0
 
 
 def main(argv):
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("mode", choices=("survey", "build", "stage"))
-    ap.add_argument("roots", nargs="+", help="Redox source trees or .rs files")
-    ap.add_argument("-o", "--out", default="build/crustos",
-                    help="output directory for build/stage")
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("mode",
+                    choices=("fetch", "survey", "build", "run", "clean"))
+    ap.add_argument("roots", nargs="*",
+                    help="source trees to use instead of the vendored ones")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--update", action="store_true",
+                    help="fetch: pull even if the checkout already exists")
     ap.add_argument("--verify", action="store_true",
-                    help="also compile each translatable file, and report "
-                         "how many actually produce an object")
-    ap.add_argument("--blockers", action="store_true",
-                    help="show what is stopping the failing files")
-    ap.add_argument("--files", action="store_true",
-                    help="list the files that do translate")
-    ap.add_argument("--top", type=int, default=20,
-                    help="how many entries to show in each ranking")
-    ap.add_argument("-k", "--keep-going", action="store_true",
-                    help="keep building after a failure")
+                    help="survey: also compile, and report how many succeed")
+    ap.add_argument("--blockers", action="store_true")
+    ap.add_argument("--upstream-only", action="store_true",
+                    help="build: stop after the upstream objects")
+    ap.add_argument("--top", type=int, default=12)
     args = ap.parse_args(argv)
 
-    sources = list(iter_sources(args.roots))
-    if not sources:
-        print("no .rs files found under: %s" % ", ".join(args.roots))
-        return 1
-    results = [classify(p) for p in sources]
+    if args.mode == "fetch":
+        return fetch(args.update)
+    if args.mode == "clean":
+        return clean()
 
+    roots = args.roots or None
     if args.mode == "survey":
-        survey(results, args.blockers, args.top, args.files)
-        if args.verify:
-            verify(results, args.out)
+        paths = require_sources(roots)
+        if paths is None:
+            return 1
+        survey([classify(p) for p in paths], args.blockers, args.top,
+               args.verify)
         return 0
-    if args.mode == "stage":
-        stage(results, args.out)
-        return 0
-    return build(results, args.out, args.keep_going)
+    if args.mode == "build":
+        return build(roots, args.verbose, args.upstream_only)
+    return run(roots, args.verbose)
 
 
 if __name__ == "__main__":
