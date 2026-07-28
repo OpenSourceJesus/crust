@@ -516,6 +516,141 @@ impl Formatter {
 }
 
 // ---------------------------------------------------------------------------
+// Arc<T> / Rc<T> -- shared ownership, without the ownership.
+//
+// These count references and free at zero. What they do *not* do is any of
+// the automatic part: Rust drops a clone at end of scope, and Crust has no
+// `Drop`, so every `clone` must be matched by an explicit `release`. An
+// unmatched clone leaks rather than corrupting anything, which is the right
+// direction to fail.
+//
+// `Arc` is not atomic. It is `Rc` with a different name, because Crust has no
+// threads for its refcount to race with -- the same reasoning as `Mutex`, and
+// it stops holding the moment real concurrency exists.
+// ---------------------------------------------------------------------------
+struct Rc<T> {
+    ptr: *mut T,
+    count: *mut i64,
+}
+
+impl<T> Rc<T> {
+    fn new(value: T) -> Rc<T> {
+        let p: *mut T = malloc(size_of::<T>()) as *mut T;
+        p[0] = value;
+        let c: *mut i64 = malloc(size_of::<i64>()) as *mut i64;
+        c[0] = 1;
+        Rc { ptr: p, count: c }
+    }
+
+    fn get(&self) -> T {
+        self.ptr[0]
+    }
+
+    fn set(&mut self, value: T) {
+        self.ptr[0] = value;
+    }
+
+    fn as_ptr(&self) -> *mut T {
+        self.ptr
+    }
+
+    fn strong_count(&self) -> i64 {
+        self.count[0]
+    }
+
+    fn clone(&self) -> Rc<T> {
+        self.count[0] += 1;
+        Rc { ptr: self.ptr, count: self.count }
+    }
+
+    // Explicit, because there is no `Drop` to call it for you.
+    fn release(&mut self) {
+        self.count[0] -= 1;
+        if self.count[0] <= 0 {
+            free(self.ptr as *mut u8);
+            free(self.count as *mut u8);
+            self.ptr = 0 as *mut T;
+            self.count = 0 as *mut i64;
+        }
+    }
+}
+
+struct Arc<T> {
+    ptr: *mut T,
+    count: *mut i64,
+}
+
+impl<T> Arc<T> {
+    fn new(value: T) -> Arc<T> {
+        let p: *mut T = malloc(size_of::<T>()) as *mut T;
+        p[0] = value;
+        let c: *mut i64 = malloc(size_of::<i64>()) as *mut i64;
+        c[0] = 1;
+        Arc { ptr: p, count: c }
+    }
+
+    fn get(&self) -> T {
+        self.ptr[0]
+    }
+
+    fn set(&mut self, value: T) {
+        self.ptr[0] = value;
+    }
+
+    fn as_ptr(&self) -> *mut T {
+        self.ptr
+    }
+
+    fn strong_count(&self) -> i64 {
+        self.count[0]
+    }
+
+    fn clone(&self) -> Arc<T> {
+        self.count[0] += 1;
+        Arc { ptr: self.ptr, count: self.count }
+    }
+
+    fn release(&mut self) {
+        self.count[0] -= 1;
+        if self.count[0] <= 0 {
+            free(self.ptr as *mut u8);
+            free(self.count as *mut u8);
+            self.ptr = 0 as *mut T;
+            self.count = 0 as *mut i64;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MutexGuard<T> -- what `Mutex::lock()` returns in real Rust.
+//
+// There is no lock to hold, so there is nothing to release; this exists so a
+// signature written `MutexGuard<T>` resolves. See `Mutex<T>` above for why
+// that is defensible here and why it stops being so the moment threads exist.
+// ---------------------------------------------------------------------------
+struct MutexGuard<T> {
+    ptr: *mut T,
+}
+
+impl<T> MutexGuard<T> {
+    fn new(ptr: *mut T) -> MutexGuard<T> {
+        MutexGuard { ptr: ptr }
+    }
+
+    fn get(&self) -> T {
+        self.ptr[0]
+    }
+
+    fn set(&mut self, value: T) {
+        self.ptr[0] = value;
+    }
+
+    fn as_ptr(&self) -> *mut T {
+        self.ptr
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PhantomData<T> -- a zero-sized marker. Real Rust uses it to tie a type
 // parameter to a struct that does not otherwise mention it; here it exists so
 // that such a struct still parses. It lowers to the same one-byte placeholder
