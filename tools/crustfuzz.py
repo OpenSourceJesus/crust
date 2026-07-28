@@ -237,7 +237,26 @@ def family_rust_scalar():
                "fn main() -> i32 { 0 }\n" % (a, b, b))
 
 
+def family_vararg_overflow():
+    """Variadic calls past the six integer registers.
+
+    The bug this family exists for: every variadic call used to push all its
+    arguments, and a standard callee reads its overflow from the top of that
+    block -- which held the format pointer. Nothing had more than six
+    arguments until `write!` started generating them.
+    """
+    for n in range(1, 10):
+        specs = "".join("%d" for _ in range(n))
+        vals = ", ".join(str(i + 1) for i in range(n))
+        yield ("vararg_overflow[%d]" % n,
+               "int snprintf(char *, unsigned long, const char *, ...);\n"
+               "int main(void) { char b[128];"
+               " snprintf(b, 128, \"%s\", %s); return 0; }\n"
+               % (specs, vals))
+
+
 FAMILIES = {
+    "vararg_overflow": family_vararg_overflow,
     "nested_struct": family_nested_struct,
     "union": family_union,
     "bitfield": family_bitfield,
