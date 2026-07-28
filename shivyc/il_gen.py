@@ -110,6 +110,15 @@ class ILCode:
         """
         il_value.literal = IntegerLiteral(value)
         self.literals[il_value] = value
+        # Record it for the caller that is mid-codegen. Spots are assigned to
+        # every literal once, before functions are emitted, so a literal
+        # created *after* that -- the peephole's induction-variable stride is
+        # the only one today -- would otherwise never get one. The allocator
+        # then treats it as an ordinary value with no definition and hands it
+        # a register nothing ever writes, so the loop advances a pointer by
+        # whatever that register happened to hold.
+        if getattr(self, "new_literals", None) is not None:
+            self.new_literals.append(il_value)
 
     def register_float_literal(self, il_value, value):
         """Register a floating-point literal IL value."""
