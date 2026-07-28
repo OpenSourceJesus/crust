@@ -2071,6 +2071,13 @@ class Parser:
                 name = self.impl_type
             targs = None
             saw_path = False
+            if name in self.tysubst and self.at("::", "punc"):
+                # `T::CONST` inside a generic item being monomorphised. The
+                # type parameter has to be replaced with the concrete type
+                # before the path is flattened, or the result names a type
+                # that does not exist -- `T_N` rather than `X_N`. This is what
+                # makes a trait's associated consts reachable through a bound.
+                name = self.tysubst[name].base
             while self.at("::", "punc"):        # path: foo::bar -> foo_bar
                 saw_path = True
                 self.next()
