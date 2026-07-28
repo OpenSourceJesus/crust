@@ -1019,6 +1019,27 @@ Overflow arguments are now pushed again at the top, where a standard callee
 looks for them. `tools/crustfuzz.py --family vararg_overflow` covers one
 through nine arguments.
 
+## Blocks as expressions
+
+A block used as a value may run statements before its tail expression, which
+Rust code does constantly. C has no portable expression that does the same, so
+the statements are hoisted into the enclosing statement's *pending* list,
+where the `?` operator and match scrutinees already put work that must happen
+first.
+
+```rust
+let v: i32 = { let a: i32 = 6; a * 7 };
+```
+```c
+int _crust_opt1; { int a = 6; _crust_opt1 = (a * 7); } int v = _crust_opt1;
+```
+
+The braces matter. Emitting the hoisted statements bare put every block-local
+at function scope, so two blocks that each declared `a` collided with
+"redefinition of 'a'" — an ordinary thing to write. They now keep their own C
+scope and pass the value out through one temporary. A block with no tail
+expression has no value to give, and is reported.
+
 ## `core` free functions
 
 Beyond the bundled types, Crust lowers the handful of `core` free functions
