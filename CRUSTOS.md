@@ -21,6 +21,8 @@ CrustOS
   x86_64 kpage : 0x8000000000000003 present=1
   arm64 upage  : 0x40000000000043
   heap frame   : 917504
+  page size    : x86=4096 arm64=65536 (mask 0xffff)
+  page levels  : x86=4 arm64=3
   read(0,64)   : 64
   close(0)     : 0
   bad fd       : -1
@@ -87,6 +89,19 @@ constant resolved at compile time with no dispatch. The `x86_64 kpage` and
 The `heap frame` line is that logic applied to a genuinely upstream value —
 `kernel_heap_offset()` from `vendor/kernel/src/arch/x86/consts.rs`, shifted by
 the architecture's own `PAGE_SHIFT`.
+
+Upstream's `Arch` trait also declares most of its constants with **defaults**,
+several derived from another constant of the same trait:
+
+```rust
+const ENTRY_ADDRESS_SHIFT: usize = Self::PAGE_SHIFT;
+```
+
+An impl that does not override one inherits it, with `Self::` resolved to the
+implementing type — so `PAGE_SIZE = 1 << Self::PAGE_SHIFT` computes 4096 for
+x86_64 and 65536 for a 64K-granule arm64, from one line of source. The
+`page size` and `page levels` lines above show that, including arm64
+overriding the trait's default `PAGE_LEVELS`.
 
 Upstream's own `PageFlags<A>` still does not instantiate here, because it
 reaches for parts of `core` that Crust has no source for. What has been shown
