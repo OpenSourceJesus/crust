@@ -35,8 +35,14 @@ trait Arch {
     const ENTRY_FLAG_WRITABLE: u64;
     const ENTRY_FLAG_NO_EXEC: u64;
     const ENTRY_FLAG_USER: u64;
-    const PAGE_SIZE: u64;
     const PAGE_SHIFT: u64;
+
+    // Defaults, as upstream's `Arch` declares them -- including one derived
+    // from another constant of the same trait. An impl that does not override
+    // these inherits them, with `Self::` resolved to the implementing type.
+    const PAGE_SIZE: u64 = 1 << Self::PAGE_SHIFT;
+    const PAGE_MASK: u64 = Self::PAGE_SIZE - 1;
+    const PAGE_LEVELS: u64 = 4;
 }
 
 struct X86_64;
@@ -45,7 +51,6 @@ impl Arch for X86_64 {
     const ENTRY_FLAG_WRITABLE: u64 = 1 << 1;
     const ENTRY_FLAG_NO_EXEC: u64 = 1 << 63;
     const ENTRY_FLAG_USER: u64 = 1 << 2;
-    const PAGE_SIZE: u64 = 4096;
     const PAGE_SHIFT: u64 = 12;
 }
 
@@ -55,8 +60,8 @@ impl Arch for Aarch64 {
     const ENTRY_FLAG_WRITABLE: u64 = 0;
     const ENTRY_FLAG_NO_EXEC: u64 = 1 << 54;
     const ENTRY_FLAG_USER: u64 = 1 << 6;
-    const PAGE_SIZE: u64 = 4096;
-    const PAGE_SHIFT: u64 = 12;
+    const PAGE_SHIFT: u64 = 16;          // 64K granule
+    const PAGE_LEVELS: u64 = 3;          // overrides the trait default
 }
 
 struct PageFlags<A> {
@@ -349,6 +354,12 @@ fn user_page_bits_arm64() -> u64 {
     p.bits()
 }
 
+fn page_size_x86() -> u64 { X86_64::PAGE_SIZE }
+fn page_size_arm() -> u64 { Aarch64::PAGE_SIZE }
+fn page_mask_arm() -> u64 { Aarch64::PAGE_MASK }
+fn levels_x86() -> u64 { X86_64::PAGE_LEVELS }
+fn levels_arm() -> u64 { Aarch64::PAGE_LEVELS }
+
 fn heap_frame() -> u64 {
     // `kernel_heap_offset` is upstream Redox, compiled by Crust and linked
     // from vendor/kernel/src/arch/x86/consts.rs.
@@ -395,6 +406,12 @@ int main(void) {
            kernel_page_bits(), kernel_page_present());
     printf("  arm64 upage  : 0x%lx\n", user_page_bits_arm64());
     printf("  heap frame   : %lu\n", heap_frame());
+    /* Inherited trait consts: PAGE_SIZE is derived from each arch's own
+     * PAGE_SHIFT, and PAGE_LEVELS is a trait default arm64 overrides. */
+    printf("  page size    : x86=%lu arm64=%lu (mask 0x%lx)\n",
+           page_size_x86(), page_size_arm(), page_mask_arm());
+    printf("  page levels  : x86=%lu arm64=%lu\n",
+           levels_x86(), levels_arm());
 
     printf("  read(0,64)   : %d\n", Kernel_dispatch(&k, (Call){
         .tag = Call_Read, .u.Read = { ._0 = 0, ._1 = 64 } }));
