@@ -468,7 +468,39 @@ class Call(ILCommand):
             # the overflow area, whose layout differs from ShivyC's all-stack
             # push -- but every glibc variadic call ShivyC makes fits in
             # registers.) AL must give the number of vector registers used.
+            # Every argument is pushed, because ShivyC's own variadic callees
+            # read them all from the stack. A standard SysV callee (glibc's
+            # printf family) instead reads the first six integer and eight
+            # vector arguments from registers, and any *overflow* from the top
+            # of the stack -- so the overflow arguments are pushed a second
+            # time, on top, where such a callee looks for them.
+            #
+            # This used to assume no variadic call ever overflowed its
+            # registers, which held until `write!` started generating
+            # `snprintf(buf, size, fmt, a, b, c, d)` -- seven arguments, one
+            # past the six integer registers. The seventh was read from
+            # whatever happened to be at the top of the all-push block, which
+            # was the format pointer.
             stack_args = list(self.args)
+            overflow_args = []
+            _ii = _fi = 0
+            for arg in self.args:
+                if arg.ctype.is_struct_union() and arg.ctype.size > 8:
+                    _ii += (arg.ctype.size + 7) // 8
+                elif arg.ctype.is_floating():
+                    if _fi < len(xmm_regs):
+                        _fi += 1
+                    else:
+                        overflow_args.append(arg)
+                elif _ii < len(self.arg_regs):
+                    _ii += 1
+                else:
+                    overflow_args.append(arg)
+            # Prepended, not appended: the push loop runs right-to-left over
+            # this list, so its first element is the one that ends up at
+            # [rsp] -- exactly where a standard callee looks for the first
+            # overflow argument.
+            stack_args = overflow_args + stack_args
             ii = fi = 0
             for arg in self.args:
                 if arg.ctype.is_struct_union() and arg.ctype.size > 8:
