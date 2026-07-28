@@ -82,11 +82,7 @@ crustos:
 	python3 tools/crustos.py fetch
 	python3 tools/crustos.py run
 
-# Build and run CrustOS: the compatible subset of the real Redox kernel,
-# linked with the scheme layer and scheduler in crustos/. See CRUSTOS.md.
-crustos:
-	python3 tools/crustos.py fetch
-	python3 tools/crustos.py run
+
 
 crustos_survey:
 	python3 tools/crustos.py survey --blockers --verify
@@ -842,4 +838,4 @@ self:
         test_micropython_core test_micropython_objects \
         test_micropython_modules test_micropython_emitters test_micropython_port \
         install_cpython clean_cpython test_cpython test_cpython_objects \
-        install_bsd clean_bsd test_bsd test_bsd_bin test_bsd_usrbin
+        install_bsd clean_bsd test_bsd test_bsd_bin test_bsd_usrbin crustos
