@@ -68,6 +68,7 @@ its definition.
 | Derive | `#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]` on structs |
 | Closures | non-capturing `|a: T| expr`, lifted to a plain function |
 | Paths | `a::b::C` in type position |
+| Misc | `unsafe impl`, `const fn`, the never type `!`, `fn(A) -> R` pointer types, `let (a, b) = ..`, `pub(crate)` fields, block expressions |
 | Module items | `use` and `extern crate` are erased; `mod X;` is erased but sibling `X.rs` / `X/mod.rs` are read for type definitions; `core::ffi::c_*` map to their C types |
 | Type aliases | `type Name = T;` (optional `pub`), emitted as a C `typedef` |
 | Visibility | `pub`, `pub(crate)`, `pub(in path)`, `pub unsafe extern "C"` |
