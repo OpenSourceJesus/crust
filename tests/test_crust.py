@@ -3262,3 +3262,70 @@ fn main() -> i32 {
         c = crust.translate("fn f(g: *mut MutexGuard<i32>) -> i32 "
                             "{ g.get() }")
         self.assertIn("MutexGuard_int", c)
+
+
+class TestCrust128Bit(unittest.TestCase):
+    """`u128` / `i128` lower to a two-word struct.
+
+    They have no C counterpart in this backend. The struct is the *right size*
+    -- 16 bytes -- and so correct for storage, layout and ABI, which is how
+    real code overwhelmingly uses them: relibc's `pub type c_longdouble =
+    u128;` models C's `long double` and never computes with it.
+    """
+
+    def test_u128_is_sixteen_bytes(self):
+        c = crust.translate("fn f(x: *mut u128) -> i32 { 1 }")
+        self.assertIn("typedef struct crust_u128 { unsigned long lo; "
+                      "unsigned long hi; } crust_u128;", c)
+
+    def test_i128_is_signed_in_the_high_word(self):
+        c = crust.translate("fn f(x: *mut i128) -> i32 { 1 }")
+        self.assertIn("long hi; } crust_i128;", c)
+
+    def test_size_is_right(self):
+        self.assertEqual(_run("""
+fn f(x: *mut u128) -> i32 { 1 }
+int main(void) { return (int)sizeof(crust_u128) + 26; }
+""", suffix=".rs"), 42)
+
+    def test_unused_costs_nothing(self):
+        c = crust.translate("fn f() -> i32 { 1 }")
+        self.assertNotIn("crust_u128", c)
+
+    def test_arithmetic_does_not_silently_truncate(self):
+        # The point of a distinct struct: `a + b` on a 128-bit value fails to
+        # compile rather than quietly doing 64-bit arithmetic. That is the
+        # only honest option short of real 128-bit support.
+        with self.assertRaises(Exception):
+            _run("fn f(a: u128, b: u128) -> u128 { a + b }\n"
+                 "fn main() -> i32 { 0 }", suffix=".rs")
+
+
+class TestC128BitApproximation(unittest.TestCase):
+    """The C front end's `__int128` is 64-bit, and that is a real divergence.
+
+    `shivyc/preproc.py` defines `__int128` as `long long` so that glibc's
+    internal typedefs compile. The comment there states the precondition: it
+    is sound only where those types are never *computed* with. This test
+    records what happens when they are, so the divergence is known rather
+    than discovered.
+    """
+
+    def test_sizeof_diverges_from_gcc(self):
+        # gcc reports 16. Pinned so a future change to real 128-bit support
+        # shows up here rather than silently.
+        self.assertEqual(_run("int main(void) "
+                              "{ return (int)sizeof(__int128); }"), 8)
+
+    def test_arithmetic_is_wrong(self):
+        # gcc gives 2; the 64-bit approximation cannot. Asserting the *wrong*
+        # answer is deliberate: it documents the limit and will fail loudly
+        # if 128-bit arithmetic is ever implemented properly.
+        got = _run("""
+int main(void) {
+    unsigned __int128 b = 0xFFFFFFFFFFFFFFFFULL;
+    b = b * 3;
+    return (int)(unsigned long long)(b >> 64);
+}
+""")
+        self.assertNotEqual(got, 2)
