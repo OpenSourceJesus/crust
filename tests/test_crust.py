@@ -3405,3 +3405,99 @@ fn main() -> i32 {
         # Nothing to infer the element type from, exactly as in Rust.
         with self.assertRaises(crust.CrustError):
             crust.translate("fn f() { let v: Vec<i32> = vec![]; }")
+
+
+class TestCrustString(unittest.TestCase):
+    """`String` -- a growable, always NUL-terminated buffer.
+
+    Deliberately not rpython's `str`. py2c has a complete string runtime, but
+    reaching for it means linking `shivyc_rt.c` and its arena into every unit
+    that formats anything, and a kernel cannot use an arena before its heap
+    exists. A kernel's string handling is short and bounded; this is that.
+    """
+
+    def test_push_str_and_compare(self):
+        self.assertEqual(_run("""
+fn main() -> i32 {
+    let mut s: String = String::new();
+    s.push_str("hello");
+    s.push(32 as c_char);
+    s.push_str("world");
+    let ok: bool = s.eq_str("hello world");
+    let n: i64 = s.len();
+    s.free_buf();
+    if ok { (n as i32) + 31 } else { 0 }
+}
+""", suffix=".rs"), 42)
+
+    def test_growth_past_initial_capacity(self):
+        self.assertEqual(_run("""
+fn main() -> i32 {
+    let mut s: String = String::new();
+    for i in 0..100 { s.push(65 as c_char); }
+    let n: i64 = s.len();
+    s.free_buf();
+    (n as i32) - 58
+}
+""", suffix=".rs"), 42)
+
+    def test_always_nul_terminated(self):
+        # `as_ptr` must hand C something it can use directly.
+        self.assertEqual(_run("""
+int strlen_c(const char *);
+fn main() -> i32 {
+    let mut s: String = String::new();
+    s.push_str("abcdefghij");
+    let n: i32 = strlen_c(s.as_ptr());
+    s.free_buf();
+    n + 32
+}
+int strlen_c(const char *p) { int n = 0; while (p[n]) n++; return n; }
+""", suffix=".rs"), 42)
+
+    def test_clear_resets(self):
+        self.assertEqual(_run("""
+fn main() -> i32 {
+    let mut s: String = String::new();
+    s.push_str("junk");
+    s.clear();
+    s.push_str("ok");
+    let ok: bool = s.eq_str("ok");
+    s.free_buf();
+    if ok { 42 } else { 0 }
+}
+""", suffix=".rs"), 42)
+
+
+class TestPeepholeStrideLiteral(unittest.TestCase):
+    """A loop that walks a pointer, which the peephole strength-reduces.
+
+    The pass rewrites `addr = base + i` into a pointer advanced by a constant
+    stride, and registers that stride as a new literal. Spots are assigned to
+    every literal *before* functions are emitted, so a literal created during
+    codegen needs recording -- and `register_literal_var` was not doing it.
+    The allocator then treated the stride as an ordinary value with no
+    definition, gave it a register nothing ever wrote, and the loop advanced
+    the pointer by whatever that register happened to hold.
+
+    Reachable from plain C by any walk-a-string loop.
+    """
+
+    def test_walk_a_c_string(self):
+        self.assertEqual(_run("""
+int walk(char *p) { long i = 0; while (p[i] != (char)0) { i += 1; } return (int)i; }
+int main(void) { return walk("hello") + 37; }
+"""), 42)
+
+    def test_walk_with_int_index(self):
+        self.assertEqual(_run("""
+int walk(char *p) { int i = 0; while (p[i]) { i++; } return i; }
+int main(void) { return walk("abcdefg") + 35; }
+"""), 42)
+
+    def test_sum_an_array_in_a_loop(self):
+        self.assertEqual(_run("""
+int sum(int *a, int n) { int t = 0; long i = 0; while (i < n) { t += a[i]; i++; }
+                         return t; }
+int main(void) { int a[4]; a[0]=10; a[1]=20; a[2]=8; a[3]=4; return sum(a, 4); }
+"""), 42)
