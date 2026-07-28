@@ -506,6 +506,8 @@ class Unit:
         self.trait_defaults = {}    # trait -> {method: tokens of the default}
         self.supertraits = {}       # trait -> [trait names]
         self.trait_impls = []       # (trait, owner, tokens)
+        self.const_defaults = {}    # trait -> {const: tokens}
+        self.inherited_consts = []  # trait const defaults, for the prelude
         self.macros = {}            # macro_rules! name -> [(pattern, body)]
         self.closure_n = 0          # lifted-closure counter
         self.statics = set()        # fns with internal linkage
@@ -2962,11 +2964,24 @@ class Parser:
                     self.err("unterminated `where` clause")
                 self.next()
         self.expect("{")
-        methods, defaults = {}, {}
+        methods, defaults, const_defaults = {}, {}, {}
         while not self.at("}", "punc"):
             if self.cur.kind == "eof":
                 self.err("unterminated trait body")
-            if self.cur.val in ("type", "const"):
+            if self.cur.val == "const":
+                # An associated const. One with a default (`const N: i32 = 7;`
+                # or `const M = Self::N;`) is inherited by any impl that does
+                # not define it, exactly as a default method is -- rmm's
+                # `Arch` trait leans on this heavily.
+                start = self.i
+                end = self._to_semi()
+                has_default = any(t.val == "=" for t in self.toks[start:end])
+                if has_default:
+                    const_defaults[self.toks[start + 1].val] = \
+                        self.toks[start:end]
+                self.i = end                  # past the `;`
+                continue
+            if self.cur.val == "type":
                 while not self.at(";", "punc") and self.cur.kind != "eof":
                     self.next()
                 self.accept(";")
@@ -2979,7 +2994,14 @@ class Parser:
             else:
                 self.expect(";")
         self.expect("}")
-        return name, supers, methods, defaults
+        return name, supers, methods, defaults, const_defaults
+
+    def _to_semi(self):
+        """Index just past the `;` that ends the item at the cursor."""
+        j = self.i
+        while j < len(self.toks) and self.toks[j].val != ";":
+            j += 1
+        return j + 1
 
     def parse_self_param(self):
         """Parse a leading `self` / `&self` / `&mut self` parameter.
@@ -3979,9 +4001,10 @@ def collect_items(code, spans, unit, struct_order, fail=None):
                 mname, rules = p.parse_macro_rules()
                 unit.macros[mname] = rules
             elif kind == "trait":
-                tname, supers, methods, defaults = p.parse_trait()
+                tname, supers, methods, defaults, cdefaults = p.parse_trait()
                 unit.traits[tname] = methods
                 unit.trait_defaults[tname] = defaults
+                unit.const_defaults[tname] = cdefaults
                 unit.supertraits[tname] = supers
             elif kind == "type":
                 name, ty = p.parse_type_alias()
@@ -4320,6 +4343,35 @@ def emit_trait_defaults(unit):
     kind to one the impl had written out by hand.
     """
     for trait, owner, _toks in unit.trait_impls:
+        # Associated consts the impl did not define, taken from the trait's
+        # default. The default may name `Self::OTHER`, which resolves to the
+        # implementing type -- so the emission order below follows the order
+        # they were declared in, and a default referring to another default
+        # works as long as the other came first, which is how Rust reads too.
+        seen_c = set()
+        for tr in _trait_chain(unit, trait):
+            for cname, ctoks in unit.const_defaults.get(tr, {}).items():
+                flat = "%s_%s" % (owner, cname)
+                if cname in seen_c or flat in unit.consts:
+                    continue
+                seen_c.add(cname)
+                p = Parser(list(ctoks) + [Token("eof", "", 0)], unit)
+                p.impl_type = owner
+                try:
+                    _kw, _n, cty, cinit = p.parse_const_signature()
+                except CrustError:
+                    continue
+                unit.consts[flat] = cty
+                # Into the prelude, not the appended block: a `static const`
+                # has to be declared before the code that reads it, and the
+                # appended block sits after every function body.
+                # `#define`, not `static const`: a default may be derived
+                # from another constant (`PAGE_SIZE = 1 << Self::PAGE_SHIFT`),
+                # and in C one `static const` is not a constant expression
+                # usable in the initialiser of another. The prelude writer
+                # already lifts `#define` lines out onto their own lines.
+                unit.inherited_consts.append(
+                    "#define %s (%s)" % (flat, cinit.code))
         seen = set()
         for tr in _trait_chain(unit, trait):
             for mname, dtoks in unit.trait_defaults.get(tr, {}).items():
@@ -5081,6 +5133,7 @@ def translate(code, path=None):
     for text in _render_consts(code, spans, unit):
         prelude.append(text)
     prelude.extend(local["impl_consts"])
+    prelude.extend(unit.inherited_consts)
     for name, info in sorted(unit.extern_fns.items()):
         if name in unit.fn_sigs or name in included_fns:
             continue
