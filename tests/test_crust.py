@@ -3105,3 +3105,91 @@ fn f() { head(B { v: 1 }); }
                             "impl B { type Item = i32; }\n"
                             "fn f() -> i32 { 1 }")
         self.assertNotIn("Item", c)
+
+
+class TestCrustSyntaxGaps(unittest.TestCase):
+    """Small parser gaps, each measured from real Redox source.
+
+    None of these is a language feature so much as a spelling Crust had not
+    seen. They were picked by ranking the actual translation errors rather
+    than by guessing what might be missing.
+    """
+
+    def test_unsafe_impl(self):
+        # `unsafe impl Send for X {}` -- the marker-trait spelling. The
+        # `unsafe` is a promise to the borrow checker, which Crust lacks.
+        c = crust.translate("struct X { v: i32 }\n"
+                            "unsafe impl Send for X { }\n"
+                            "fn f() -> i32 { 1 }")
+        self.assertIn("int f(void)", c)
+
+    def test_never_type(self):
+        c = crust.translate("fn die() -> ! { loop { } }\nfn f() -> i32 { 1 }")
+        self.assertIn("void die(void)", c)
+
+    def test_fn_pointer_type(self):
+        # Reuses the typedef machinery closures already generate, so the two
+        # spellings produce the same C type.
+        self.assertEqual(_run("""
+fn twice(a: i32) -> i32 { a * 2 }
+fn apply(cb: fn(i32) -> i32, v: i32) -> i32 { cb(v) }
+fn main() -> i32 { apply(twice, 21) }
+""", suffix=".rs"), 42)
+
+    def test_fn_pointer_with_named_params(self):
+        c = crust.translate("fn f(cb: fn(x: i32, y: i32) -> i32) -> i32 "
+                            "{ cb(1, 2) }")
+        self.assertIn("crust_fn_int_int_int", c)
+
+    def test_tuple_destructuring_let(self):
+        self.assertEqual(_run("""
+fn divmod(a: i32, b: i32) -> (i32, i32) { (a / b, a % b) }
+fn main() -> i32 { let (q, r) = divmod(47, 5); q * 4 + r * 3 }
+""", suffix=".rs"), 42)
+
+    def test_tuple_destructuring_ignores_underscore(self):
+        c = crust.translate("fn f() { let (a, _, c) = (1, 2, 3); }")
+        self.assertNotIn("int _ =", c)
+
+    def test_tuple_destructuring_evaluates_once(self):
+        c = crust.translate("""
+fn pair() -> (i32, i32) { (1, 2) }
+fn f() { let (a, b) = pair(); }
+""")
+        self.assertEqual(c.count("pair()"), 1)   # the prototype is `pair(void)`
+
+    def test_tuple_arity_mismatch_is_reported(self):
+        with self.assertRaises(crust.CrustError):
+            crust.translate("fn f() { let (a, b, c) = (1, 2); }")
+
+    def test_const_fn(self):
+        # `const fn new(..)` is a function, not an associated constant. The
+        # tell is what follows `const`: a constant is `const NAME:`.
+        self.assertEqual(_run("""
+struct S { v: i32 }
+impl S {
+    pub const fn new(inner: i32) -> S { S { v: inner } }
+}
+fn main() -> i32 { let s: S = S::new(42); s.v }
+""", suffix=".rs"), 42)
+
+    def test_associated_const_still_recognised(self):
+        c = crust.translate("struct S { v: i32 }\nimpl S { const N: i32 = 5; }\n"
+                            "fn f() -> i32 { S::N }")
+        self.assertIn("S_N", c)
+
+    def test_pub_crate_struct_field(self):
+        self.assertEqual(_run("""
+struct S { pub(crate) a: i32, pub b: i32 }
+fn main() -> i32 { let s: S = S { a: 40, b: 2 }; s.a + s.b }
+""", suffix=".rs"), 42)
+
+    def test_block_expression(self):
+        # Rust code writes `{ self.x }` to force a copy out of a packed field
+        # before formatting it. In *tail* position a block is a scope rather
+        # than a value, as it is in C, so this is tested where it is
+        # unambiguously an expression.
+        self.assertEqual(_run("""
+struct S { x: i32 }
+fn main() -> i32 { let s: S = S { x: 42 }; let v: i32 = { s.x }; v }
+""", suffix=".rs"), 42)
