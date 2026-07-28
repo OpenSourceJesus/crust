@@ -76,8 +76,14 @@ test_fast_crust:
 # tools/crustos.py also has `build` and `stage` modes; it ignores Cargo
 # entirely and just walks the tree for .rs files.
 REDOX ?= $(ROOT)/redox-kernel
+# Build and run CrustOS: the compatible subset of the real Redox kernel,
+# linked with the scheme layer and scheduler in crustos/. See CRUSTOS.md.
+crustos:
+	python3 tools/crustos.py fetch
+	python3 tools/crustos.py run
+
 crustos_survey:
-	python3 tools/crustos.py survey $(REDOX) --blockers --files
+	python3 tools/crustos.py survey --blockers --verify
 
 # Drop the cached rpython transpiles and runtime objects that a
 # `#include "*.py"` builds up under /tmp.
