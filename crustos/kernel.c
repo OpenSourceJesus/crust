@@ -360,6 +360,34 @@ fn page_mask_arm() -> u64 { Aarch64::PAGE_MASK }
 fn levels_x86() -> u64 { X86_64::PAGE_LEVELS }
 fn levels_arm() -> u64 { Aarch64::PAGE_LEVELS }
 
+/* The frame bitmap, exposed as a slice built with `core::slice::from_raw_parts`
+ * -- upstream reaches for that constantly, and it is exactly Crust's own
+ * slice, so it needs no conversion. */
+fn bitmap_popcount(k: *mut Kernel) -> i32 {
+    let words: &[i64] = core::slice::from_raw_parts(&k.frames.words[0], 8);
+    let mut bits: i32 = 0;
+    for w in words {
+        let mut v: i64 = w;
+        while v != 0 {
+            bits += (v & 1) as i32;
+            v = (v >> 1) & 0x7FFFFFFFFFFFFFFF;
+        }
+    }
+    bits
+}
+
+/* `cmp::min` and the pointer helpers, in the shape upstream writes them. */
+fn budget(k: *mut Kernel, want: i32) -> i32 {
+    core::cmp::min(want, k.frames.free as i32)
+}
+
+fn zero_ticks(k: *mut Kernel, pid: i32) {
+    let slot: i32 = pid - 1;
+    if slot >= 0 && slot < k.used {
+        core::ptr::write(&k.ctx[slot].ticks, 0);
+    }
+}
+
 fn heap_frame() -> u64 {
     // `kernel_heap_offset` is upstream Redox, compiled by Crust and linked
     // from vendor/kernel/src/arch/x86/consts.rs.
@@ -412,6 +440,11 @@ int main(void) {
            page_size_x86(), page_size_arm(), page_mask_arm());
     printf("  page levels  : x86=%lu arm64=%lu\n",
            levels_x86(), levels_arm());
+    /* core intrinsics: a slice over the bitmap, and a clamped request. */
+    printf("  frames used  : %d (bitmap popcount)\n", bitmap_popcount(&k));
+    printf("  budget(1000) : %d\n", budget(&k, 1000));
+    zero_ticks(&k, init);
+    printf("  init ticks   : %ld (after ptr::write)\n", k.ctx[0].ticks);
 
     printf("  read(0,64)   : %d\n", Kernel_dispatch(&k, (Call){
         .tag = Call_Read, .u.Read = { ._0 = 0, ._1 = 64 } }));
