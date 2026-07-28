@@ -2769,3 +2769,63 @@ fn pick() -> i32 { 0 }
 fn pick() -> i32 { 42 }
 fn main() -> i32 { pick() }
 """, suffix=".rs"), 42)
+
+
+class TestCrustAssociatedConsts(unittest.TestCase):
+    """Associated consts reached through a generic's type parameter.
+
+    This is the shape `rmm/src/page/flags.rs` uses: `PageFlags<A>` generic over
+    the architecture, reading `A::ENTRY_FLAG_NO_EXEC` off a trait. Without
+    substituting the type parameter in *path* position the path flattened to
+    `A_ENTRY_FLAG_NO_EXEC`, naming a type that does not exist.
+    """
+
+    def test_const_through_a_type_parameter(self):
+        c = crust.translate("""
+trait A { const N: i32; }
+struct X { v: i32 }
+impl A for X { const N: i32 = 5; }
+fn g<T: A>() -> i32 { T::N }
+fn f() -> i32 { g::<X>() }
+""")
+        self.assertIn("return X_N;", c)
+        self.assertNotIn("T_N", c)
+
+    def test_one_instantiation_per_arch(self):
+        c = crust.translate("""
+trait Arch { const FLAG: u64; }
+struct X8 { v: i32 }
+struct A6 { v: i32 }
+impl Arch for X8 { const FLAG: u64 = 1; }
+impl Arch for A6 { const FLAG: u64 = 8; }
+struct Flags<A> { data: u64 }
+impl<A> Flags<A> {
+    fn new() -> Flags<A> { Flags { data: A::FLAG } }
+}
+fn f() { let a: Flags<X8> = Flags::<X8>::new();
+         let b: Flags<A6> = Flags::<A6>::new(); }
+""")
+        self.assertIn("X8_FLAG", c)
+        self.assertIn("A6_FLAG", c)
+
+    def test_arch_generic_flags_run(self):
+        self.assertEqual(_run("""
+trait Arch { const PRESENT: u64; const NX: u64; }
+struct X86 { v: i32 }
+impl Arch for X86 { const PRESENT: u64 = 1; const NX: u64 = 8; }
+struct PageFlags<A> { data: u64 }
+impl<A> PageFlags<A> {
+    fn new() -> PageFlags<A> { PageFlags { data: A::PRESENT | A::NX } }
+    fn present(&self) -> bool { (self.data & A::PRESENT) != 0 }
+    fn bits(&self) -> u64 { self.data }
+}
+fn main() -> i32 {
+    let p: PageFlags<X86> = PageFlags::<X86>::new();
+    if p.present() { (p.bits() as i32) + 33 } else { 0 }
+}
+""", suffix=".rs"), 42)
+
+    def test_plain_path_still_flattens(self):
+        # A path whose head is not a type parameter is unaffected.
+        c = crust.translate("fn f() { rmm::aarch64::init_mair(); }")
+        self.assertIn("rmm_aarch64_init_mair", c)
