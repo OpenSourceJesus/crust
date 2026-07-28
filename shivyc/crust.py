@@ -1404,6 +1404,28 @@ class Parser:
             % (n, call, n, over, n, room, ln, cap, cap, over, ln, n))
         return Expr("0", INT)
 
+    def m_vec(self, args, line):
+        """`vec![a, b, c]` -- build a bundled `Vec<T>` from the elements.
+
+        Lowered to a temporary plus one `push` each, hoisted into the pending
+        list so the whole thing is a single expression at the use site. The
+        element type comes from the first element, which is what Rust infers
+        too; `vec![]` has nothing to infer from and is rejected.
+        """
+        if not args:
+            self.err("`vec![]` is empty, so its element type cannot be "
+                     "inferred; annotate it and use `Vec::<T>::new()`")
+        vals = [self.sub_expr(a) for a in args]
+        elem = vals[0].type
+        if elem is None:
+            self.err("cannot infer the element type of this `vec!`")
+        ty = self.instantiate_struct("Vec", [elem])
+        tmp = self.new_temp()
+        self.pending.append("%s = %s_new();" % (ty.decl(tmp), ty.base))
+        for v in vals:
+            self.pending.append("%s_push(&%s, %s);" % (ty.base, tmp, v.code))
+        return Expr(tmp, ty)
+
     def m_cfg(self, args, line):
         # `cfg!(..)` is a compile-time predicate over features Crust has no
         # notion of. Reporting false is the honest answer: nothing is
@@ -2155,14 +2177,60 @@ class Parser:
         return Expr("(%s ? %s : %s)" % (cond.code, then.code, other.code), ty)
 
     def parse_block_expr(self):
-        """Parse `{ expr }` used as a value."""
-        self.expect("{")
-        e = self.parse_expr()
-        if not self.at("}", "punc"):
-            self.err("only a single expression is allowed in this block "
-                     "when `if` is used as an expression")
-        self.expect("}")
-        return e
+        """Parse `{ stmt; ..; expr }` used as a value.
+
+        A block in expression position may run statements before producing its
+        tail expression, and Rust code does that constantly -- an `assert!`
+        before the value, a `let` for a temporary. C has no expression that
+        does the same portably, so the statements are hoisted into the
+        enclosing statement's *pending* list, where the existing `?` and
+        match-scrutinee machinery already puts work that must happen first.
+
+        This only reads correctly because the pending list is emitted
+        immediately before the statement containing the block, which is
+        exactly when the block's own statements should run.
+        """
+        open_tok = self.expect("{")
+        out = Out(open_tok.line)
+        self.push()
+        try:
+            while True:
+                if self.cur.kind == "eof":
+                    self.err("unterminated block")
+                if self.at("}", "punc"):
+                    # A block with no tail expression has no value to give.
+                    self.err("this block ends without a value; a block used "
+                             "as an expression must finish with one")
+                save = self.i
+                try:
+                    e = self.parse_expr()
+                except CrustError:
+                    self.i = save
+                    e = None
+                if e is not None and self.at("}", "punc"):
+                    self.next()
+                    body = " ".join(l.strip()
+                                    for l in out.text().splitlines()
+                                    if l.strip())
+                    if not body:
+                        return e
+                    if e.type is None:
+                        self.err("cannot infer the type of this block's "
+                                 "value; annotate it")
+                    # The hoisted statements keep their own C scope, and the
+                    # value is passed out through one temporary. Emitting them
+                    # bare would put every block-local at function scope, so
+                    # two blocks that each declare `a` would collide -- which
+                    # they did.
+                    tmp = self.new_temp()
+                    self.pending.append("%s;" % e.type.decl(tmp))
+                    self.pending.append("{ %s %s = %s; }"
+                                        % (body, tmp, e.code))
+                    return Expr(tmp, e.type)
+                self.i = save
+                self.parse_stmt(out, 0, False)
+        finally:
+            self.pop()
 
     def parse_array_literal(self, open_tok):
         """Lower `[a, b, c]` and the `[v; N]` repeat form to a C initializer.
@@ -3501,6 +3569,7 @@ _BUILTIN_MACROS = {
     "eprintln": lambda p, a, l: Parser.m_print(p, a, l, True, "stderr"),
     "write": lambda p, a, l: Parser.m_write(p, a, l, False),
     "writeln": lambda p, a, l: Parser.m_write(p, a, l, True),
+    "vec": Parser.m_vec,
     "cfg": Parser.m_cfg,
     "matches": Parser.m_matches,
 }
