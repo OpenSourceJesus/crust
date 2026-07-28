@@ -649,6 +649,30 @@ reported**. Failing a file over an alias would be out of proportion: a crate
 that declares one is otherwise perfectly translatable, and the alias that
 actually matters is recognized separately.
 
+## `Rc<T>` and `Arc<T>`
+
+These count references and free at zero. What they do **not** do is the
+automatic half: Rust drops a clone at end of scope, and Crust has no `Drop`,
+so **every `clone()` must be matched by an explicit `release()`**. An unmatched
+clone leaks rather than corrupting anything, which is the right direction to
+fail.
+
+`Arc` is `Rc` with a different name. Its refcount is not atomic, because Crust
+has no threads for it to race with — the same reasoning as `Mutex<T>`, and it
+stops holding the moment real concurrency exists.
+
+`MutexGuard<T>` exists so a signature written that way resolves. There is no
+lock held, so there is nothing to release.
+
+## Qualified paths to core types
+
+`core::fmt::Formatter` flattens to `core_fmt_Formatter`, which nothing
+defines, and its last segment is not in the unit either — concrete core types
+are pulled in on demand rather than seeded. A path whose last segment names a
+core type now reaches that loader before the resolver gives up. A path to
+anything else keeps its flattened spelling, so the diagnostic still names what
+was written.
+
 ## The sync and pointer wrappers
 
 `UnsafeCell<T>`, `SyncUnsafeCell<T>` and `NonNull<T>` are **faithful**. In real
