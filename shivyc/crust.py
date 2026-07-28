@@ -69,6 +69,19 @@ PRIMITIVES = {
 
 # `core::ffi` names the C types exactly, so the mapping is not an
 # approximation -- real FFI-facing Rust is full of them.
+# `u128`/`i128` have no C counterpart in this backend. They lower to a
+# two-word struct, which is the *right size* (16 bytes) and so correct for
+# storage, layout and ABI -- which is how real code overwhelmingly uses them:
+# `pub type c_longdouble = u128;` in relibc models C's `long double`, and
+# never computes with it.
+#
+# What this deliberately does not do is pretend they are 64-bit. The C front
+# end already `#define`s `__int128` to `long long`, and that silently produces
+# wrong answers -- `(u64::MAX * 3) >> 64` gives 18446744073709551613 instead
+# of 2. Being a distinct struct means arithmetic fails to compile instead,
+# which is the only honest option short of real 128-bit support.
+PRIMITIVES["u128"] = "crust_u128"
+PRIMITIVES["i128"] = "crust_i128"
 PRIMITIVES.update(_FFI_PRIMITIVES)
 
 
@@ -837,6 +850,8 @@ class Parser:
                     segs.append(self.expect_ident())
                 name = self._resolve_path(segs)
                 was_path = len(segs) > 1
+            if name in ("u128", "i128"):
+                self.unit.needs.add("int128")
             if name in PRIMITIVES:
                 if name == "str" and not self.behind_ref:
                     self.err("`str` is unsized; write `&str`")
@@ -5673,6 +5688,11 @@ def translate(code, path=None):
     if "snprintf" in unit.needs:
         prelude.append("int snprintf(char *, unsigned long, "
                        "const char *, ...);")
+    if "int128" in unit.needs:
+        prelude.append("typedef struct crust_u128 { unsigned long lo; "
+                       "unsigned long hi; } crust_u128;")
+        prelude.append("typedef struct crust_i128 { unsigned long lo; "
+                       "long hi; } crust_i128;")
     if "memcpy" in unit.needs:
         prelude.append("void *memcpy(void *, const void *, unsigned long);")
     if "alloc" in unit.needs:
