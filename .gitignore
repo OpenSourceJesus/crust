@@ -18,3 +18,7 @@ gcc_output
 shivyc_output
 shivyc/transpile/
 generated/
+vendor
+build/
+crustos/*.o
+crustos/*.s
