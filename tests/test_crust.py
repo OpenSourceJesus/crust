@@ -3193,3 +3193,72 @@ fn main() -> i32 { let s: S = S { a: 40, b: 2 }; s.a + s.b }
 struct S { x: i32 }
 fn main() -> i32 { let s: S = S { x: 42 }; let v: i32 = { s.x }; v }
 """, suffix=".rs"), 42)
+
+
+class TestCrustCorePaths(unittest.TestCase):
+    """A qualified path to a concrete core type."""
+
+    def test_core_fmt_formatter(self):
+        # `core::fmt::Formatter` flattens to a name nothing defines; its last
+        # segment has to reach the demand-driven core loader instead.
+        c = crust.translate("fn f(p: *mut core::fmt::Formatter) -> i64 "
+                            "{ p.len() }")
+        self.assertIn("Formatter_len", c)
+
+    def test_short_fmt_path(self):
+        c = crust.translate("fn f(p: *mut fmt::Formatter) -> i64 { p.len() }")
+        self.assertIn("Formatter_len", c)
+
+    def test_unknown_path_still_flattens(self):
+        # Only a name core actually provides is pulled in; anything else keeps
+        # the flattened spelling so the diagnostic names what was written.
+        c = crust.translate("fn f(p: *const some::Unknown) -> i32 { 0 }")
+        self.assertIn("some_Unknown", c)
+
+    def test_local_path_type_still_wins(self):
+        c = crust.translate("struct P { v: i32 }\n"
+                            "fn f(p: *const self::P) -> i32 { p.v }")
+        self.assertIn("int f(P *p)", c)
+
+
+class TestCrustRefCounted(unittest.TestCase):
+    """`Rc<T>` and `Arc<T>` -- counted, but not automatic."""
+
+    def test_clone_and_release(self):
+        self.assertEqual(_run("""
+fn main() -> i32 {
+    let mut a: Rc<i32> = Rc::<i32>::new(42);
+    let mut b: Rc<i32> = a.clone();
+    let v: i32 = b.get();
+    b.release();
+    a.release();
+    v
+}
+""", suffix=".rs"), 42)
+
+    def test_strong_count_tracks_clones(self):
+        self.assertEqual(_run("""
+fn main() -> i32 {
+    let mut a: Rc<i32> = Rc::<i32>::new(1);
+    let mut b: Rc<i32> = a.clone();
+    let mut c: Rc<i32> = a.clone();
+    let n: i64 = a.strong_count();
+    b.release(); c.release(); a.release();
+    (n as i32) * 14
+}
+""", suffix=".rs"), 42)
+
+    def test_arc_is_rc_under_another_name(self):
+        # No atomics: Crust has no threads for the refcount to race with.
+        c = crust.translate("fn f() { let a: Arc<i32> = Arc::<i32>::new(1); }")
+        self.assertNotIn("atomic", c.lower())
+
+    def test_release_frees_at_zero(self):
+        c = crust.translate("fn f() { let mut a: Rc<i32> = Rc::<i32>::new(1);"
+                            " a.release(); }")
+        self.assertIn("free(", c)
+
+    def test_mutex_guard_resolves(self):
+        c = crust.translate("fn f(g: *mut MutexGuard<i32>) -> i32 "
+                            "{ g.get() }")
+        self.assertIn("MutexGuard_int", c)
