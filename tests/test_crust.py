@@ -2891,3 +2891,78 @@ fn main() -> i32 { ((P64::SIZE / P4::SIZE) as i32) * 2 + 10 }
                             "struct X { v: i32 }\nimpl A for X { const N: i32 = 5; }\n"
                             "fn f() -> i32 { X::N }")
         self.assertEqual(c.count("X_N ="), 1)
+
+
+class TestCrustCoreIntrinsics(unittest.TestCase):
+    """`core` free functions with an exact C lowering.
+
+    Not a standard library -- the handful of one-line helpers real Rust
+    reaches for constantly. Measured across the Redox kernel and relibc:
+    `slice::from_raw_parts` 25 uses, `ptr::null_mut` 21, `hint::spin_loop` 18,
+    `cmp::min` 15. Each was otherwise an undefined symbol at link time.
+    """
+
+    def test_null_is_a_typed_pointer(self):
+        c = crust.translate("fn f() -> *mut i32 "
+                            "{ core::ptr::null_mut::<i32>() }")
+        self.assertIn("((int *)0)", c)
+
+    def test_import_spelling_does_not_matter(self):
+        # A crate may import `core::ptr::null_mut`, `ptr::null_mut` or
+        # `null_mut`; the call site follows whatever was imported.
+        for call in ("core::ptr::null_mut::<i32>()", "ptr::null_mut::<i32>()",
+                     "null_mut::<i32>()"):
+            self.assertIn("0", crust.translate("fn f() -> *mut i32 { %s }"
+                                               % call))
+
+    def test_min_and_max(self):
+        self.assertEqual(_run("""
+fn main() -> i32 { core::cmp::min(60, 42) + core::cmp::max(0, 0) }
+""", suffix=".rs"), 42)
+
+    def test_from_raw_parts_is_a_real_slice(self):
+        self.assertEqual(_run("""
+fn total(xs: &[i32]) -> i32 { let mut s: i32 = 0; for x in xs { s += x; } s }
+fn main() -> i32 {
+    let a: [i32; 5] = [10, 20, 12, 99, 99];
+    let s: &[i32] = core::slice::from_raw_parts(&a[0], 3);
+    total(s)
+}
+""", suffix=".rs"), 42)
+
+    def test_read_and_write(self):
+        self.assertEqual(_run("""
+fn main() -> i32 { let mut v: i32 = 5; core::ptr::write(&v, 42);
+                   core::ptr::read(&v) }
+""", suffix=".rs"), 42)
+
+    def test_swap(self):
+        self.assertEqual(_run("""
+fn main() -> i32 { let mut a: i32 = 0; let mut b: i32 = 42;
+                   core::mem::swap(&a, &b); a }
+""", suffix=".rs"), 42)
+
+    def test_copy_nonoverlapping_argument_order(self):
+        # Rust puts the source first and counts elements; C's memcpy puts the
+        # destination first and counts bytes. Getting either backwards
+        # silently corrupts memory.
+        self.assertEqual(_run("""
+fn main() -> i32 {
+    let src: [i32; 3] = [40, 2, 0];
+    let mut dst: [i32; 3] = [0; 3];
+    core::ptr::copy_nonoverlapping(&src[0], &dst[0], 3);
+    dst[0] + dst[1]
+}
+""", suffix=".rs"), 42)
+
+    def test_spin_loop_is_a_no_op(self):
+        c = crust.translate("fn f() { core::hint::spin_loop(); }")
+        self.assertNotIn("spin_loop", c)
+
+    def test_local_definition_shadows_the_intrinsic(self):
+        # `min` is an ordinary thing to define; silently replacing it with the
+        # intrinsic would be a very confusing bug.
+        self.assertEqual(_run("""
+fn min(a: i32, b: i32) -> i32 { 42 }
+fn main() -> i32 { min(1, 2) }
+""", suffix=".rs"), 42)
