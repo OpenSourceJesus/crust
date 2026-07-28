@@ -923,6 +923,49 @@ dispatch is free; the remaining gap is codegen quality, not the trait design.
 A comparison against rustc has not been made -- it could not be installed in
 the environment this was developed in -- so no claim is made about it.
 
+## `fmt`: `Formatter`, `write!` and `writeln!`
+
+Redox makes 190 `write!`/`writeln!` calls and formats its types through
+`impl fmt::Debug for X { fn fmt(&self, f) }`. Crust supports that shape.
+
+`Formatter` in the bundled core is **bounded**: the caller supplies the
+storage and it never allocates. Real Rust's grows into a `String`, which Crust
+does not have — and a kernel formatter writes to a console or a serial port
+anyway. A write that would overflow is truncated, the buffer stays
+NUL-terminated, and `overflowed()` records that it happened. That is what a
+kernel log wants: losing the tail of a message is much better than a panic
+inside the panic handler.
+
+```rust
+impl fmt::Debug for Frame {
+    fn fmt(&self, f: *mut Formatter) -> i32 {
+        write!(f, "Frame {{ addr: 0x{:x}, order: {} }}", self.addr, self.order)
+    }
+}
+```
+
+`write!` lowers to `snprintf` into the formatter's remaining space, followed by
+advancing its length; the format string is translated from the argument types
+exactly as `println!`'s is. The sink may be a `Formatter` or a pointer to one,
+since `fn fmt(&self, f)` gives a pointer and a local gives a value.
+
+### The bug underneath
+
+Getting this working exposed an ABI bug that had nothing to do with
+formatting. ShivyC pushes *every* argument of a variadic call, because its own
+variadic callees read them all from the stack — and the code noted, correctly
+at the time, that no variadic call it generated ever overflowed the six
+integer registers.
+
+`write!` broke that assumption immediately: `snprintf(buf, size, fmt, a, b, c,
+d)` is seven arguments. A standard SysV callee reads its overflow from the
+*top* of the stack, which held the format pointer, so the seventh argument
+came out as a plausible-looking garbage integer rather than failing.
+
+Overflow arguments are now pushed again at the top, where a standard callee
+looks for them. `tools/crustfuzz.py --family vararg_overflow` covers one
+through nine arguments.
+
 ## `core` free functions
 
 Beyond the bundled types, Crust lowers the handful of `core` free functions

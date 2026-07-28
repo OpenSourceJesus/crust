@@ -26,6 +26,10 @@ CrustOS
   frames used  : 17 (bitmap popcount)
   budget(1000) : 495
   init ticks   : 0 (after ptr::write)
+  [1] Context { pid: 1, prio: 0, ticks: 0, frames: 12 }
+  [2] Context { pid: 2, prio: 1, ticks: 12, frames: 5 }
+  Frames { free: 495, used: 17 }
+  <no such pid 99>
   read(0,64)   : 64
   close(0)     : 0
   bad fd       : -1
