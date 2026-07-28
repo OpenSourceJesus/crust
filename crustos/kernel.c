@@ -20,6 +20,92 @@ int printf(const char *, ...);
 /* Supplied by vendor/kernel/src/arch/x86/consts.rs, compiled by Crust. */
 unsigned long kernel_heap_offset(void);
 
+/* ------------------------------------------------------------------ */
+/* Paging, in the shape rmm/src/page/flags.rs uses                      */
+/*                                                                      */
+/* Upstream's `PageFlags<A>` is generic over the architecture and reads  */
+/* its constants off a trait: `A::ENTRY_FLAG_NO_EXEC`. Crust now         */
+/* monomorphises that, so the same shape works here -- one set of flag   */
+/* logic, one instantiation per architecture, resolved at compile time   */
+/* with no dispatch.                                                     */
+/* ------------------------------------------------------------------ */
+
+trait Arch {
+    const ENTRY_FLAG_PRESENT: u64;
+    const ENTRY_FLAG_WRITABLE: u64;
+    const ENTRY_FLAG_NO_EXEC: u64;
+    const ENTRY_FLAG_USER: u64;
+    const PAGE_SIZE: u64;
+    const PAGE_SHIFT: u64;
+}
+
+struct X86_64;
+impl Arch for X86_64 {
+    const ENTRY_FLAG_PRESENT: u64 = 1;
+    const ENTRY_FLAG_WRITABLE: u64 = 1 << 1;
+    const ENTRY_FLAG_NO_EXEC: u64 = 1 << 63;
+    const ENTRY_FLAG_USER: u64 = 1 << 2;
+    const PAGE_SIZE: u64 = 4096;
+    const PAGE_SHIFT: u64 = 12;
+}
+
+struct Aarch64;
+impl Arch for Aarch64 {
+    const ENTRY_FLAG_PRESENT: u64 = 3;
+    const ENTRY_FLAG_WRITABLE: u64 = 0;
+    const ENTRY_FLAG_NO_EXEC: u64 = 1 << 54;
+    const ENTRY_FLAG_USER: u64 = 1 << 6;
+    const PAGE_SIZE: u64 = 4096;
+    const PAGE_SHIFT: u64 = 12;
+}
+
+struct PageFlags<A> {
+    data: u64,
+}
+
+impl<A> PageFlags<A> {
+    fn new() -> PageFlags<A> {
+        PageFlags { data: A::ENTRY_FLAG_PRESENT | A::ENTRY_FLAG_NO_EXEC }
+    }
+
+    fn write(&mut self, on: bool) {
+        if on {
+            self.data |= A::ENTRY_FLAG_WRITABLE;
+        } else {
+            self.data &= !A::ENTRY_FLAG_WRITABLE;
+        }
+    }
+
+    fn user(&mut self, on: bool) {
+        if on {
+            self.data |= A::ENTRY_FLAG_USER;
+        } else {
+            self.data &= !A::ENTRY_FLAG_USER;
+        }
+    }
+
+    fn execute(&mut self, on: bool) {
+        if on {
+            self.data &= !A::ENTRY_FLAG_NO_EXEC;
+        } else {
+            self.data |= A::ENTRY_FLAG_NO_EXEC;
+        }
+    }
+
+    fn bits(&self) -> u64 {
+        self.data
+    }
+
+    fn present(&self) -> bool {
+        (self.data & A::ENTRY_FLAG_PRESENT) != 0
+    }
+
+    /* Physical address of the frame this entry points at. */
+    fn frame_of(addr: u64) -> u64 {
+        addr >> A::PAGE_SHIFT
+    }
+}
+
 const FRAMES: i64 = 512;
 const MAX_CONTEXTS: usize = 16;
 const MAX_FILES: usize = 16;
@@ -243,6 +329,32 @@ fn open_batch(k: *mut Kernel, urls: *mut c_char, owner: i32) -> i32 {
     opened
 }
 
+/* C cannot name `PageFlags<X86_64>` -- an instantiation only exists if Rust
+ * code mentions it -- so the entry points into the paging layer are Rust. */
+fn kernel_page_bits() -> u64 {
+    let mut p: PageFlags<X86_64> = PageFlags::<X86_64>::new();
+    p.write(true);
+    p.execute(false);
+    p.bits()
+}
+
+fn kernel_page_present() -> bool {
+    let p: PageFlags<X86_64> = PageFlags::<X86_64>::new();
+    p.present()
+}
+
+fn user_page_bits_arm64() -> u64 {
+    let mut p: PageFlags<Aarch64> = PageFlags::<Aarch64>::new();
+    p.user(true);
+    p.bits()
+}
+
+fn heap_frame() -> u64 {
+    // `kernel_heap_offset` is upstream Redox, compiled by Crust and linked
+    // from vendor/kernel/src/arch/x86/consts.rs.
+    PageFlags::<X86_64>::frame_of(kernel_heap_offset())
+}
+
 int main(void) {
     /* rpython module globals -- the scheme name table -- must be built
      * before anything reads them. */
@@ -276,6 +388,13 @@ int main(void) {
     printf("  switches     : %ld\n", Kernel_schedule(&k, 4));
     printf("  ticks        : init=%ld shell=%ld idle=%ld\n",
            k.ctx[0].ticks, k.ctx[1].ticks, k.ctx[2].ticks);
+
+    /* Page flags in upstream's arch-generic shape: one implementation, two
+     * architectures, resolved at compile time with no dispatch. */
+    printf("  x86_64 kpage : 0x%lx present=%d\n",
+           kernel_page_bits(), kernel_page_present());
+    printf("  arm64 upage  : 0x%lx\n", user_page_bits_arm64());
+    printf("  heap frame   : %lu\n", heap_frame());
 
     printf("  read(0,64)   : %d\n", Kernel_dispatch(&k, (Call){
         .tag = Call_Read, .u.Read = { ._0 = 0, ._1 = 64 } }));
