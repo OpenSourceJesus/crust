@@ -952,6 +952,16 @@ class Parser:
                     or cand in self.unit.enums or cand in PRIMITIVES
                     or cand in self.tysubst or cand in self.unit.type_aliases):
                 return cand
+        # `core::fmt::Formatter` flattens to a name nothing defines, and its
+        # last segment is not in the unit yet because concrete core types are
+        # pulled in on demand. Offer it to that loader before giving up; only
+        # a name core actually provides is brought in.
+        try:
+            ensure_core_concrete(self.unit, last)
+        except CrustError:
+            pass
+        if last in self.unit.structs or last in self.unit.enums:
+            return last
         return flat
 
     def parse_type_alias(self):
