@@ -427,6 +427,95 @@ impl<T> RwLock<T> {
 }
 
 // ---------------------------------------------------------------------------
+// Formatter -- the sink `write!` writes into, and what `fn fmt` receives.
+//
+// Real Rust's `fmt::Formatter` wraps a `fmt::Write` implementation and can
+// grow. Crust has no `String`, and a kernel formatter writes to a console or
+// a serial port rather than to a heap buffer, so this one is bounded: the
+// caller supplies the storage and the formatter never allocates.
+//
+// A write that would overflow is truncated rather than growing or faulting,
+// and `overflowed` records that it happened. That is the behaviour a kernel
+// log wants -- losing the tail of a message is much better than a panic
+// inside the panic handler.
+// ---------------------------------------------------------------------------
+struct Formatter {
+    buf: *mut c_char,
+    cap: i64,
+    len: i64,
+    overflowed: bool,
+}
+
+impl Formatter {
+    fn new(buf: *mut c_char, cap: i64) -> Formatter {
+        let mut f: Formatter = Formatter { buf: buf, cap: cap, len: 0,
+                                           overflowed: false };
+        f.clear();
+        f
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+        self.overflowed = false;
+        if self.cap > 0 {
+            self.buf[0] = 0 as c_char;
+        }
+    }
+
+    fn len(&self) -> i64 {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn overflowed(&self) -> bool {
+        self.overflowed
+    }
+
+    fn as_str(&self) -> *mut c_char {
+        self.buf
+    }
+
+    // Room left, excluding the terminating NUL.
+    fn space(&self) -> i64 {
+        if self.cap <= self.len + 1 {
+            return 0;
+        }
+        self.cap - self.len - 1
+    }
+
+    fn write_str(&mut self, s: *const c_char) -> i32 {
+        let mut i: i64 = 0;
+        while s[i] != 0 as c_char {
+            if self.len + 1 >= self.cap {
+                self.overflowed = true;
+                return -1;
+            }
+            self.buf[self.len] = s[i];
+            self.len += 1;
+            i += 1;
+        }
+        if self.cap > 0 {
+            self.buf[self.len] = 0 as c_char;
+        }
+        0
+    }
+
+    fn write_char(&mut self, c: c_char) -> i32 {
+        if self.len + 1 >= self.cap {
+            self.overflowed = true;
+            return -1;
+        }
+        self.buf[self.len] = c;
+        self.len += 1;
+        self.buf[self.len] = 0 as c_char;
+        0
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PhantomData<T> -- a zero-sized marker. Real Rust uses it to tie a type
 // parameter to a struct that does not otherwise mention it; here it exists so
 // that such a struct still parses. It lowers to the same one-byte placeholder
