@@ -598,6 +598,39 @@ already holds the whole value, and a stack slot is allocated in eightbyte
 units. This was never specific to `derive` — any Rust or C function returning
 such a struct hit it.
 
+## `#[cfg(..)]`
+
+Real crates offer alternatives — one `ULONG_MAX` for 32-bit pointers and
+another for 64 — and Crust used to emit *both*, producing two conflicting
+definitions of the same name. That is what a `#[cfg]`-gated file looks like
+when the gate is ignored, and it made whole files uncompilable for a reason
+that had nothing to do with the language subset.
+
+Crust now evaluates `cfg` predicates against a fixed target:
+
+| key | value |
+|---|---|
+| `target_arch` | `x86_64` |
+| `target_pointer_width` | `64` |
+| `target_endian` | `little` |
+| `target_os` | `redox` |
+| `target_family` | `unix` |
+| `target_env` | `relibc` |
+
+`all(..)`, `any(..)`, `not(..)`, `key = "value"` and bare flags all work. An
+item whose `cfg` is false is **erased** — blanked in place, so line numbers do
+not move — because dropping it from the item list alone would leave its Rust
+source in the output for the C front end to choke on.
+
+Two deliberate choices. An **unknown key is false**: treating it as true would
+select several arms of the same set of alternatives, which is exactly the
+failure this exists to prevent. And an item with **no** `cfg` is always kept —
+this mechanism only ever removes an arm written for a different target, it
+never gates anything on its own.
+
+There is no way to change the target yet. When there is, it belongs in `CFG`
+in `shivyc/crust.py` and should be reachable from the command line.
+
 ## `Result<T>` and the crate-wide alias
 
 Almost every crate that fixes its error type does it once —
