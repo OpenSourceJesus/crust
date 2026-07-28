@@ -3032,3 +3032,76 @@ int main(void) {
 int f(int a,int b,int c,int d,int e,int g,int h){ return h; }
 int main(void){ return f(1,2,3,4,5,6,42); }
 """), 42)
+
+
+class TestCrustAssociatedTypes(unittest.TestCase):
+    """`type Item;` on a trait, bound per impl.
+
+    Redox uses these 45 times -- `type Target` for `Deref` (23) and
+    `type Item` for `Iterator` (22). An associated type is a type alias
+    attached to an impl, so it resolves at monomorphisation exactly as an
+    associated const does.
+    """
+
+    def test_self_associated_type(self):
+        c = crust.translate("""
+trait Container { type Item; fn first(&self) -> Self::Item; }
+struct B { v: i32 }
+impl Container for B { type Item = i32; fn first(&self) -> Self::Item { self.v } }
+""")
+        self.assertIn("int B_first(B *self)", c)
+
+    def test_through_a_generic_parameter(self):
+        self.assertEqual(_run("""
+trait Container { type Item; fn first(&self) -> Self::Item; }
+struct B { v: i32 }
+impl Container for B { type Item = i32; fn first(&self) -> Self::Item { self.v } }
+fn head<T: Container>(c: T) -> T::Item { c.first() }
+fn main() -> i32 { let b: B = B { v: 42 }; head(b) }
+""", suffix=".rs"), 42)
+
+    def test_each_impl_binds_its_own(self):
+        c = crust.translate("""
+trait C { type Item; fn first(&self) -> Self::Item; }
+struct I { v: i32 }
+struct F { v: f64 }
+impl C for I { type Item = i32; fn first(&self) -> Self::Item { self.v } }
+impl C for F { type Item = f64; fn first(&self) -> Self::Item { self.v } }
+""")
+        self.assertIn("int I_first(I *self)", c)
+        self.assertIn("double F_first(F *self)", c)
+
+    def test_target_naming_a_struct(self):
+        # The `Deref` shape: an associated type naming another struct.
+        self.assertEqual(_run("""
+struct Inner { v: i32 }
+struct W { inner: Inner }
+impl W {
+    type Target = Inner;
+    fn deref(&self) -> *mut Self::Target { &self.inner }
+}
+fn main() -> i32 { let w: W = W { inner: Inner { v: 42 } }; w.deref().v }
+""", suffix=".rs"), 42)
+
+    def test_missing_associated_type_is_reported(self):
+        with self.assertRaises(crust.CrustError):
+            crust.translate("""
+trait C { type Item; }
+struct B { v: i32 }
+impl C for B { }
+fn head<T: C>(c: T) -> T::Item { 0 }
+fn f() { head(B { v: 1 }); }
+""")
+
+    def test_qualified_path_still_flattens(self):
+        # `Self::Item` must be checked before the path handler, which would
+        # otherwise flatten it to the name `Self_Item`.
+        c = crust.translate("struct P { v: i32 }\n"
+                            "fn f(p: *const self::P) -> i32 { p.v }")
+        self.assertIn("int f(P *p)", c)
+
+    def test_associated_type_emits_no_c(self):
+        c = crust.translate("struct B { v: i32 }\n"
+                            "impl B { type Item = i32; }\n"
+                            "fn f() -> i32 { 1 }")
+        self.assertNotIn("Item", c)
