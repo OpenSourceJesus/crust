@@ -31,6 +31,11 @@ unsigned long kernel_heap_offset(void);
 /* ------------------------------------------------------------------ */
 
 trait Arch {
+    // An associated type, in the shape rmm uses for `Deref::Target` and
+    // `Iterator::Item`: each architecture names the integer width its page
+    // table entries are, and generic code refers to it as `A::Entry`.
+    type Entry;
+
     const ENTRY_FLAG_PRESENT: u64;
     const ENTRY_FLAG_WRITABLE: u64;
     const ENTRY_FLAG_NO_EXEC: u64;
@@ -47,6 +52,7 @@ trait Arch {
 
 struct X86_64;
 impl Arch for X86_64 {
+    type Entry = u64;
     const ENTRY_FLAG_PRESENT: u64 = 1;
     const ENTRY_FLAG_WRITABLE: u64 = 1 << 1;
     const ENTRY_FLAG_NO_EXEC: u64 = 1 << 63;
@@ -56,6 +62,7 @@ impl Arch for X86_64 {
 
 struct Aarch64;
 impl Arch for Aarch64 {
+    type Entry = u64;
     const ENTRY_FLAG_PRESENT: u64 = 3;
     const ENTRY_FLAG_WRITABLE: u64 = 0;
     const ENTRY_FLAG_NO_EXEC: u64 = 1 << 54;
@@ -105,9 +112,14 @@ impl<A> PageFlags<A> {
         (self.data & A::ENTRY_FLAG_PRESENT) != 0
     }
 
-    /* Physical address of the frame this entry points at. */
-    fn frame_of(addr: u64) -> u64 {
+    /* Physical address of the frame this entry points at. The entry width
+     * comes from the architecture's own associated type. */
+    fn frame_of(addr: A::Entry) -> A::Entry {
         addr >> A::PAGE_SHIFT
+    }
+
+    fn entry_bits() -> A::Entry {
+        (A::PAGE_SIZE - 1) as A::Entry
     }
 }
 
@@ -394,6 +406,49 @@ fn heap_frame() -> u64 {
     PageFlags::<X86_64>::frame_of(kernel_heap_offset())
 }
 
+/* ------------------------------------------------------------------ */
+/* Formatting, in the shape upstream writes it                          */
+/*                                                                      */
+/* Redox has 190 `write!`/`writeln!` calls and formats its types through */
+/* `impl fmt::Debug for X { fn fmt(&self, f) }`. The same shape works    */
+/* here, over a bounded formatter whose storage the caller supplies -- a */
+/* kernel log wants truncation, not allocation.                          */
+/* ------------------------------------------------------------------ */
+
+impl fmt::Debug for Context {
+    fn fmt(&self, f: *mut Formatter) -> i32 {
+        write!(f, "Context {{ pid: {}, prio: {}, ticks: {}, frames: {} }}",
+               self.pid, self.prio, self.ticks, self.frames)
+    }
+}
+
+impl fmt::Debug for Frames {
+    fn fmt(&self, f: *mut Formatter) -> i32 {
+        write!(f, "Frames {{ free: {}, used: {} }}",
+               self.free, FRAMES - self.free)
+    }
+}
+
+/* A kernel log line: the whole state of one context, rendered into a
+ * caller-owned buffer and returned as a C string. */
+fn log_context(k: *mut Kernel, pid: i32, buf: *mut c_char, cap: i64) -> *mut c_char {
+    let mut f: Formatter = Formatter::new(buf, cap);
+    let slot: i32 = pid - 1;
+    if slot < 0 || slot >= k.used {
+        write!(f, "<no such pid {}>", pid);
+        return f.as_str();
+    }
+    write!(f, "[{}] ", pid);
+    k.ctx[slot].fmt(&f);
+    f.as_str()
+}
+
+fn log_frames(k: *mut Kernel, buf: *mut c_char, cap: i64) -> *mut c_char {
+    let mut f: Formatter = Formatter::new(buf, cap);
+    k.frames.fmt(&f);
+    f.as_str()
+}
+
 int main(void) {
     /* rpython module globals -- the scheme name table -- must be built
      * before anything reads them. */
@@ -445,6 +500,13 @@ int main(void) {
     printf("  budget(1000) : %d\n", budget(&k, 1000));
     zero_ticks(&k, init);
     printf("  init ticks   : %ld (after ptr::write)\n", k.ctx[0].ticks);
+
+    /* Formatted kernel log lines, through `impl fmt::Debug`. */
+    char line[128];
+    printf("  %s\n", log_context(&k, init, line, 128));
+    printf("  %s\n", log_context(&k, shell, line, 128));
+    printf("  %s\n", log_frames(&k, line, 128));
+    printf("  %s\n", log_context(&k, 99, line, 128));
 
     printf("  read(0,64)   : %d\n", Kernel_dispatch(&k, (Call){
         .tag = Call_Read, .u.Read = { ._0 = 0, ._1 = 64 } }));
