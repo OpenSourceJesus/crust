@@ -3727,6 +3727,116 @@ def _is_rust_struct_body(body):
     return re.search(r"[A-Za-z_]\w*\s*:", body) is not None
 
 
+# The configuration Crust compiles for. Redox is full of `#[cfg]`-gated
+# alternatives -- one `ULONG_MAX` for 32-bit and another for 64 -- and
+# emitting every arm produces conflicting definitions rather than a choice.
+# So a small target is assumed and the predicates are evaluated against it.
+CFG = {
+    "target_arch": "x86_64",
+    "target_pointer_width": "64",
+    "target_endian": "little",
+    "target_os": "redox",
+    "target_family": "unix",
+    "target_env": "relibc",
+}
+
+# Bare flags (`#[cfg(unix)]`) that hold for that target.
+CFG_FLAGS = {"unix"}
+
+_CFG_ATTR = re.compile(r"#\s*\[\s*cfg\s*\(")
+
+
+def _cfg_predicate(text, i):
+    """Evaluate one `cfg` predicate starting at `text[i]`; return (value, end).
+
+    Understands `all(..)`, `any(..)`, `not(..)`, `key = "value"` and bare
+    flags. An unrecognized key is *false* rather than true: the point is to
+    pick one arm of a set of alternatives, and treating unknowns as true would
+    select several.
+    """
+    while i < len(text) and text[i] in " \t\n\r":
+        i += 1
+    m = re.compile(r"[A-Za-z_][\w]*").match(text, i)
+    if not m:
+        return False, i
+    word = m.group(0)
+    j = m.end()
+    while j < len(text) and text[j] in " \t\n\r":
+        j += 1
+    if j < len(text) and text[j] == "(":          # all / any / not
+        j += 1
+        vals = []
+        while True:
+            while j < len(text) and text[j] in " \t\n\r,":
+                j += 1
+            if j >= len(text) or text[j] == ")":
+                j += 1
+                break
+            v, j = _cfg_predicate(text, j)
+            vals.append(v)
+        if word == "all":
+            return all(vals) if vals else True, j
+        if word == "any":
+            return any(vals), j
+        if word == "not":
+            return (not vals[0]) if vals else False, j
+        return False, j
+    if j < len(text) and text[j] == "=":          # key = "value"
+        j += 1
+        while j < len(text) and text[j] in " \t\n\r":
+            j += 1
+        m2 = re.compile(r'"([^"]*)"').match(text, j)
+        if not m2:
+            return False, j
+        return CFG.get(word) == m2.group(1), m2.end()
+    return word in CFG_FLAGS, j                   # bare flag
+
+
+def leading_attrs(code, start):
+    """The `#[...]` groups at the head of an item, as one string.
+
+    `_extend_head` has already walked the span start back over them, so they
+    sit at the front. Only the leading run is taken: an attribute deeper in
+    the item belongs to a field or a method, not to the item itself.
+    """
+    out, i, n = [], start, len(code)
+    while i < n:
+        while i < n and code[i] in " \t\r\n":
+            i += 1
+        if i >= n or code[i] != "#":
+            break
+        j = code.find("[", i)
+        if j < 0:
+            break
+        depth, k = 0, j
+        while k < n:
+            if code[k] == "[":
+                depth += 1
+            elif code[k] == "]":
+                depth -= 1
+                if depth == 0:
+                    k += 1
+                    break
+            k += 1
+        out.append(code[i:k])
+        i = k
+    return "".join(out)
+
+
+def cfg_allows(attrs):
+    """True unless a `#[cfg(..)]` in `attrs` evaluates false.
+
+    Attributes other than `cfg` are ignored, and an item with no `cfg` is
+    always kept -- this only ever *removes* an alternative that was written
+    for a different target.
+    """
+    for m in _CFG_ATTR.finditer(attrs):
+        value, _ = _cfg_predicate(attrs, m.end())
+        if not value:
+            return False
+    return True
+
+
 def _extend_head(scan, start):
     """Walk `start` backwards over modifiers and `#[...]` attributes."""
     while True:
@@ -4756,6 +4866,24 @@ def translate(code, path=None):
     code = erase_module_items(code)
     spans = find_rust_items(
         code, rust_file=bool(path) and path.endswith(".rs"))
+    # Drop the arms written for a different target. Without this, every
+    # `#[cfg]`-gated alternative is emitted and they collide -- two
+    # `#define ULONG_MAX` with different values, say.
+    #
+    # The text is blanked as well as the span dropped: skipping only the span
+    # would leave the Rust source of the rejected arm sitting in the output to
+    # be handed to the C front end. Blanking preserves line numbers, so
+    # diagnostics still point at the right place.
+    dropped = [sp for sp in spans
+               if not cfg_allows(leading_attrs(code, sp[0]))]
+    if dropped:
+        buf = list(code)
+        for start, end, _kind in dropped:
+            for k in range(start, min(end, len(buf))):
+                if buf[k] != "\n":
+                    buf[k] = " "
+        code = "".join(buf)
+        spans = [sp for sp in spans if sp not in dropped]
     included = collect_include_items(code, path)
     if not spans:
         return code
