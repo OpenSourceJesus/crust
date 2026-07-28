@@ -790,6 +790,114 @@ impl<T> VecDeque<T> {
 }
 
 // ---------------------------------------------------------------------------
+// String -- a growable, NUL-terminated character buffer.
+//
+// Deliberately *not* rpython's `str`. py2c has a complete string runtime --
+// concat, split, join, `%` formatting -- and reaching for it would mean
+// linking `shivyc_rt.c` into every unit that formats anything, plus an arena
+// allocator a kernel cannot use before its heap exists. A kernel's string
+// handling is short and bounded; this is that.
+//
+// The buffer is always NUL-terminated, so `as_ptr` hands back something C can
+// take directly. There is no `Drop`, so `free_buf` is explicit.
+// ---------------------------------------------------------------------------
+struct String {
+    buf: *mut c_char,
+    len: i64,
+    cap: i64,
+}
+
+impl String {
+    fn new() -> String {
+        String { buf: 0 as *mut c_char, len: 0, cap: 0 }
+    }
+
+    fn with_capacity(cap: i64) -> String {
+        let mut s: String = String::new();
+        s.reserve(cap);
+        s
+    }
+
+    fn len(&self) -> i64 {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn capacity(&self) -> i64 {
+        self.cap
+    }
+
+    fn as_ptr(&self) -> *mut c_char {
+        self.buf
+    }
+
+    // Room for `want` characters plus the terminator, doubling so repeated
+    // appends stay amortised.
+    fn reserve(&mut self, want: i64) {
+        if want + 1 <= self.cap {
+            return;
+        }
+        let mut cap: i64 = self.cap;
+        if cap == 0 {
+            cap = 16;
+        }
+        while cap < want + 1 {
+            cap = cap * 2;
+        }
+        self.buf = realloc(self.buf as *mut u8, cap as usize) as *mut c_char;
+        self.cap = cap;
+        self.buf[self.len] = 0 as c_char;
+    }
+
+    fn push(&mut self, c: c_char) {
+        self.reserve(self.len + 1);
+        self.buf[self.len] = c;
+        self.len += 1;
+        self.buf[self.len] = 0 as c_char;
+    }
+
+    fn push_str(&mut self, s: *const c_char) {
+        let mut i: i64 = 0;
+        while s[i] != 0 as c_char {
+            self.push(s[i]);
+            i += 1;
+        }
+    }
+
+    fn get(&self, i: i64) -> c_char {
+        self.buf[i]
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+        if self.cap > 0 {
+            self.buf[0] = 0 as c_char;
+        }
+    }
+
+    fn eq_str(&self, other: *const c_char) -> bool {
+        let mut i: i64 = 0;
+        while i < self.len {
+            if other[i] != self.buf[i] {
+                return false;
+            }
+            i += 1;
+        }
+        other[self.len] == 0 as c_char
+    }
+
+    fn free_buf(&mut self) {
+        free(self.buf as *mut u8);
+        self.buf = 0 as *mut c_char;
+        self.len = 0;
+        self.cap = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PhantomData<T> -- a zero-sized marker. Real Rust uses it to tie a type
 // parameter to a struct that does not otherwise mention it; here it exists so
 // that such a struct still parses. It lowers to the same one-byte placeholder
