@@ -3812,6 +3812,11 @@ def _core_intrinsic(name):
     return None
 
 
+def _has_word(text, word):
+    """True if `word` appears in `text` as a whole identifier."""
+    return re.search(r"\b%s\b" % re.escape(word), text) is not None
+
+
 def _is_lvalue(code):
     """True if `code` denotes a place whose address C can take.
 
@@ -5106,6 +5111,13 @@ def ensure_core_concrete(unit, name):
     for text in core.emitted:
         if prefix in text and text not in unit.emitted:
             unit.emitted.append(text)
+            # A concrete core type can allocate too -- `String` grows with
+            # `realloc` -- and only the *generic* ones were asking for the
+            # libc prototypes. Read it off the bodies actually copied rather
+            # than maintaining a list of which types allocate.
+            for fn in ("malloc", "realloc", "free"):
+                if _has_word(text, fn):
+                    unit.needs.add("alloc")
 
 
 def _rebase_import(modpath, _via, filename):
