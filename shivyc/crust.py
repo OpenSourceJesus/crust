@@ -718,6 +718,31 @@ class Parser:
 
     def parse_type(self):
         t = self.cur
+        if t.val == "fn" and t.kind == "kw" and self.peek().val == "(":
+            # A function-pointer type. Crust already generates a typedef per
+            # signature for closures, so this reuses that machinery and the
+            # two spellings produce the same C type.
+            self.next()
+            self.expect("(")
+            params = []
+            while not self.at(")", "punc"):
+                # A parameter may be named (`fn(x: i32)`) or not.
+                if (self.cur.kind == "ident"
+                        and self.peek().val == ":"):
+                    self.next()
+                    self.next()
+                params.append(self.parse_type())
+                if not self.accept(","):
+                    break
+            self.expect(")")
+            ret = self.parse_type() if self.accept("->") else VOID
+            return self.unit.fn_ptr_type(ret, params)
+        if t.val == "!" and t.kind == "punc":
+            # The never type. A function returning `!` diverges, and C's way
+            # of saying that is a function that returns nothing and is never
+            # reached past the call.
+            self.next()
+            return CType("void")
         if t.val == "(" and self.peek().val == ")":
             self.next()
             self.next()
@@ -2158,6 +2183,12 @@ class Parser:
                 self.cur.val in ("|", "||"):
             self.next() if False else None
             return self.parse_closure()
+        if t.val == "{" and t.kind == "punc":
+            # A block in expression position: `{ self.x }`, which Rust code
+            # writes to force a copy out of a packed field before formatting
+            # it. Its value is its tail expression.
+            self.i -= 1
+            return self.parse_block_expr()
         if t.val == "unsafe" and t.kind == "kw" and self.at("{", "punc"):
             # `unsafe { expr }` as a value is its single tail expression.
             return self.parse_block_expr()
@@ -2300,6 +2331,12 @@ class Parser:
         if t.val == "let" and t.kind == "kw":
             self.next()
             self.accept("mut")
+            if self.at("(", "punc"):
+                # `let (a, b) = expr;` -- destructuring a tuple. Lowered to a
+                # temporary holding the tuple and one binding per element, so
+                # the initialiser is evaluated exactly once.
+                self.parse_tuple_let(out, indent, t)
+                return
             name = self.expect_ident()
             ty = None
             if self.accept(":"):
@@ -2424,6 +2461,41 @@ class Parser:
             out.line_at(t.line, "return %s;" % e.code, indent)
         else:
             out.line_at(t.line, e.code + ";", indent)
+
+    def parse_tuple_let(self, out, indent, t):
+        """Lower `let (a, b) = expr;` into a temporary and one binding each."""
+        self.expect("(")
+        names = []
+        while not self.at(")", "punc"):
+            self.accept("mut")
+            names.append(self.expect_ident())
+            if not self.accept(","):
+                break
+        self.expect(")")
+        want = None
+        if self.accept(":"):
+            want = self.parse_type()
+        self.expect("=")
+        init = self.parse_expr_as(want)
+        self.expect(";")
+        ty = want or init.type
+        if ty is None or ty.base not in self.unit.tuples:
+            self.err("`let (..)` needs a tuple on the right; got %s",
+                     ty.decl() if ty else "an expression with no type")
+        elems = self.unit.tuples[ty.base]
+        if len(names) != len(elems):
+            self.err("this tuple has %d element%s, but %d name%s given",
+                     len(elems), "" if len(elems) == 1 else "s",
+                     len(names), " was" if len(names) == 1 else "s were")
+        tmp = self.new_temp()
+        self.emit_pending(out, t.line, indent)
+        parts = ["%s = %s;" % (ty.decl(tmp), init.code)]
+        for i, (nm, ety) in enumerate(zip(names, elems)):
+            if nm == "_":
+                continue
+            self.declare(nm, ety)
+            parts.append("%s = %s._%d;" % (ety.decl(_c_name(nm)), tmp, i))
+        out.line_at(t.line, " ".join(parts), indent)
 
     def parse_for_each(self, out, indent, t, var, subject):
         """Lower `for x in xs { .. }` over a slice or an array.
@@ -2937,8 +3009,10 @@ class Parser:
         fields = []
         while not self.at("}", "punc"):
             self.skip_attributes()
-            while self.cur.val in ("pub",):
-                self.next()
+            # A field may carry a restricted visibility -- `pub(crate) x: T`
+            # is common in a kernel, where a type is public but its internals
+            # are not.
+            self.skip_visibility()
             fname = self.expect_ident()
             self.expect(":")
             ftype = self.parse_type()
@@ -3017,7 +3091,15 @@ class Parser:
             if self.toks[j].val == "#":
                 return False                     # attribute; let the parser
             j += 1                               # handle it normally
-        return self.toks[j].val == "const" and self.toks[j].kind == "kw"
+        if not (self.toks[j].val == "const" and self.toks[j].kind == "kw"):
+            return False
+        # `const fn new(..)` is a function whose `const` promises it can run
+        # at compile time -- not an associated constant. The tell is what
+        # follows: a constant is `const NAME:`, a function is `const fn`.
+        return (j + 1 < len(self.toks)
+                and self.toks[j + 1].kind == "ident"
+                and j + 2 < len(self.toks)
+                and self.toks[j + 2].val == ":")
 
     def parse_impl_header(self):
         """Parse `impl[<P..>] [Trait for] Name[<A..>] {`; return the type name.
@@ -3028,6 +3110,12 @@ class Parser:
         will look them up under.
         """
         self.skip_attributes()
+        self.skip_visibility()
+        while self.cur.val in ("unsafe", "default"):
+            # `unsafe impl Send for X {}` -- the marker-trait spelling. The
+            # `unsafe` is a promise to the borrow checker, which Crust does
+            # not have, so it carries nothing to act on.
+            self.next()
         self.expect("impl")
         self.impl_params = self.parse_generic_params()
         self.impl_trait = None
@@ -3146,6 +3234,11 @@ class Parser:
         self.skip_attributes()
         self.skip_visibility()
         while self.cur.val == "unsafe":
+            self.next()
+        while self.cur.val in ("const", "async"):
+            # `const fn` promises the function is callable at compile time.
+            # C has no such notion and does not need one: the body is
+            # ordinary code either way.
             self.next()
         start = self.expect("fn")
         name = self.expect_ident()
