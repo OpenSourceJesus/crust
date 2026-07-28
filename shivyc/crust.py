@@ -1414,6 +1414,24 @@ class Parser:
                     continue
                 generic = e.code in self.unit.generic_fns
                 targs = e.targs
+                # A locally defined function of the same name always wins:
+                # `min` is a perfectly ordinary thing to define, and silently
+                # replacing it with the intrinsic would be a very confusing
+                # bug.
+                core_fn = (None if (e.code in self.unit.fn_sigs
+                                    or e.code in self.unit.generic_fns)
+                           else _core_intrinsic(e.code))
+                if core_fn is not None:
+                    args, atys = [], []
+                    while not self.at(")", "punc"):
+                        a = self.parse_expr()
+                        args.append(a.code)
+                        atys.append(a.type)
+                        if not self.accept(","):
+                            break
+                    self.expect(")")
+                    e = core_fn(self, args, atys, targs)
+                    continue
                 if e.code in ("size_of", "mem_size_of") and targs:
                     # `size_of::<T>()` -- the one intrinsic monomorphised
                     # containers cannot be written without, since Crust has
@@ -3307,6 +3325,144 @@ def _c_name(name):
     return name + "_" if name in _C_KEYWORDS else name
 
 
+# `core` free functions with a direct C equivalent.
+#
+# These are not a standard library -- they are the handful of one-line helpers
+# real Rust reaches for constantly and that have an exact lowering. Measured
+# across the Redox kernel and relibc: `ptr::null_mut` 21 uses,
+# `slice::from_raw_parts` 25, `cmp::min` 15, `hint::spin_loop` 18. Each would
+# otherwise be an undefined symbol at link time.
+#
+# Matched on the tail of the flattened path, so `core::ptr::null_mut`,
+# `ptr::null_mut` and `null_mut` all resolve to the same thing -- crates spell
+# the import differently and the call site follows whatever was imported.
+
+
+def _ci_null(p, args, atys, targs):
+    ty = targs[0] if targs else CType("void")
+    return Expr("((%s)0)" % CType(ty.base, ty.ptr + 1).decl(),
+                CType(ty.base, ty.ptr + 1))
+
+
+def _ci_read(p, args, atys, targs):
+    if not args:
+        p.err("`ptr::read` needs a pointer")
+    ty = atys[0]
+    inner = CType(ty.base, max(ty.ptr - 1, 0), ty.array) if ty else None
+    return Expr("(*(%s))" % args[0], inner)
+
+
+def _ci_write(p, args, atys, targs):
+    if len(args) < 2:
+        p.err("`ptr::write` needs a pointer and a value")
+    return Expr("(*(%s) = (%s))" % (args[0], args[1]),
+                atys[1] if len(atys) > 1 else None)
+
+
+def _ci_copy(p, args, atys, targs):
+    """`ptr::copy_nonoverlapping(src, dst, count)` -- memcpy, in Rust's order.
+
+    Rust puts the source first and counts *elements*; C's memcpy puts the
+    destination first and counts bytes. Getting either backwards silently
+    corrupts memory, so the element size is taken from the pointee type
+    rather than assumed.
+    """
+    if len(args) < 3:
+        p.err("`copy_nonoverlapping` needs src, dst and count")
+    ty = atys[0]
+    elem = CType(ty.base, max(ty.ptr - 1, 0)).decl() if ty else "char"
+    p.unit.needs.add("memcpy")
+    return Expr("memcpy(%s, %s, (%s) * sizeof(%s))"
+                % (args[1], args[0], args[2], elem), CType("void"))
+
+
+def _ci_min(p, args, atys, targs):
+    if len(args) < 2:
+        p.err("`cmp::min` needs two operands")
+    return Expr("((%s) < (%s) ? (%s) : (%s))"
+                % (args[0], args[1], args[0], args[1]), atys[0])
+
+
+def _ci_max(p, args, atys, targs):
+    if len(args) < 2:
+        p.err("`cmp::max` needs two operands")
+    return Expr("((%s) > (%s) ? (%s) : (%s))"
+                % (args[0], args[1], args[0], args[1]), atys[0])
+
+
+def _ci_nop(p, args, atys, targs):
+    """`hint::spin_loop`, `hint::black_box` and friends -- nothing to emit.
+
+    `spin_loop` is a `pause` instruction hint; omitting it costs a little
+    power in a spin wait and changes no semantics.
+    """
+    return Expr("((void)0)", CType("void"))
+
+
+def _ci_swap(p, args, atys, targs):
+    if len(args) < 2:
+        p.err("`mem::swap` needs two pointers")
+    ty = atys[0]
+    inner = CType(ty.base, max(ty.ptr - 1, 0)) if ty else CType("int")
+    tmp = p.new_temp()
+    p.pending.append("%s = *(%s); *(%s) = *(%s); *(%s) = %s;"
+                     % (inner.decl(tmp), args[0], args[0], args[1],
+                        args[1], tmp))
+    return Expr("((void)0)", CType("void"))
+
+
+def _ci_from_raw_parts(p, args, atys, targs):
+    """`slice::from_raw_parts(ptr, len)` -- exactly Crust's own slice."""
+    if len(args) < 2:
+        p.err("`from_raw_parts` needs a pointer and a length")
+    ty = atys[0]
+    elem = CType(ty.base, max(ty.ptr - 1, 0)) if ty else CType("unsigned char")
+    sl = p.unit.slice_type(elem)
+    return Expr("(%s){.ptr = %s, .len = %s}" % (sl.base, args[0], args[1]), sl)
+
+
+_CORE_FNS = {
+    "ptr_null": _ci_null,
+    "ptr_null_mut": _ci_null,
+    "null": _ci_null,
+    "null_mut": _ci_null,
+    "ptr_read": _ci_read,
+    "ptr_read_volatile": _ci_read,
+    "ptr_write": _ci_write,
+    "ptr_write_volatile": _ci_write,
+    "ptr_copy_nonoverlapping": _ci_copy,
+    "copy_nonoverlapping": _ci_copy,
+    "cmp_min": _ci_min,
+    "cmp_max": _ci_max,
+    "min": _ci_min,
+    "max": _ci_max,
+    "hint_spin_loop": _ci_nop,
+    "spin_loop": _ci_nop,
+    "hint_black_box": _ci_nop,
+    "mem_swap": _ci_swap,
+    "swap": _ci_swap,
+    "slice_from_raw_parts": _ci_from_raw_parts,
+    "slice_from_raw_parts_mut": _ci_from_raw_parts,
+    "from_raw_parts": _ci_from_raw_parts,
+    "from_raw_parts_mut": _ci_from_raw_parts,
+}
+
+
+def _core_intrinsic(name):
+    """The lowering for a flattened `core` path call, or None.
+
+    Matched on the tail so `core_ptr_null_mut`, `ptr_null_mut` and `null_mut`
+    all resolve. A locally defined function of the same name shadows this --
+    the caller checks its own tables first.
+    """
+    if name in _CORE_FNS:
+        return _CORE_FNS[name]
+    for key, fn in _CORE_FNS.items():
+        if name.endswith("_" + key):
+            return fn
+    return None
+
+
 def _is_lvalue(code):
     """True if `code` denotes a place whose address C can take.
 
@@ -5042,6 +5198,8 @@ def translate(code, path=None):
     if "fprintf" in unit.needs:
         prelude.append("int fprintf(void *, const char *, ...);")
         prelude.append("extern void *stderr;")
+    if "memcpy" in unit.needs:
+        prelude.append("void *memcpy(void *, const void *, unsigned long);")
     if "alloc" in unit.needs:
         prelude.append("void *malloc(unsigned long);")
         prelude.append("void *realloc(void *, unsigned long);")
