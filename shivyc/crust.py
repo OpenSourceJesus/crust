@@ -507,6 +507,10 @@ class Unit:
         self.supertraits = {}       # trait -> [trait names]
         self.trait_impls = []       # (trait, owner, tokens)
         self.const_defaults = {}    # trait -> {const: tokens}
+        # Associated types: (owner type, name) -> CType. An associated type is
+        # a type alias attached to an impl, so it resolves at monomorphisation
+        # exactly as an associated const does.
+        self.assoc_types = {}       # (owner, name) -> CType
         self.inherited_consts = []  # trait const defaults, for the prelude
         self.macros = {}            # macro_rules! name -> [(pattern, body)]
         self.closure_n = 0          # lifted-closure counter
@@ -762,6 +766,26 @@ class Parser:
         if t.kind in ("ident", "kw"):
             name = self.next().val
             was_path = False
+            if self.at("::", "punc") and (
+                    name in self.tysubst
+                    or (name == "Self" and self.impl_type is not None)):
+                # An associated type: `T::Item` inside a generic being
+                # monomorphised, or `Self::Item` inside an impl. Resolved
+                # against the impl that binds it for the concrete type, and
+                # checked *before* the qualified-path handler below -- that
+                # would otherwise flatten `Self::Item` to the name
+                # `Self_Item`, which nothing defines.
+                owner = (self.tysubst[name].base if name in self.tysubst
+                         else self.impl_type)
+                save = self.i
+                self.next()
+                assoc = self.expect_ident()
+                got = self.unit.assoc_types.get((owner, assoc))
+                if got is not None:
+                    return got
+                if name in self.tysubst:
+                    self.err("`%s` has no associated type `%s`", owner, assoc)
+                self.i = save
             if self.at("::", "punc"):
                 # A qualified type: `fmt::Write`, `alloc::boxed::Box<T>`.
                 # Try the flattened spelling first, since that is what a Crust
@@ -815,7 +839,6 @@ class Parser:
                     self.err("`Option<()>` is not supported")
                 return self.unit.option_type(elem)
             if name in self.tysubst:
-                # A type parameter of the generic item being instantiated.
                 return self.tysubst[name]
             if name == "Self":
                 if self.impl_type is None:
@@ -988,6 +1011,12 @@ class Parser:
             p.parse_impl_header()
             p.impl_type = mangled
             while not p.at("}", "punc") and p.cur.kind != "eof":
+                if p.is_assoc_type():
+                    p.parse_assoc_type(mangled)
+                    continue
+                if p.is_assoc_type():
+                    p.parse_assoc_type(owner)
+                    continue
                 if p.is_assoc_const():
                     kw, cname, cty, cinit = p.parse_const_signature()
                     self.unit.consts["%s_%s" % (mangled, cname)] = cty
@@ -2958,6 +2987,29 @@ class Parser:
         self.expect(";")
         return name, [("_crust_unit", CType("char"))]
 
+    def is_assoc_type(self):
+        """True if the cursor is on an `type Name = Ty;` item."""
+        j = self.i
+        while j < len(self.toks) and self.toks[j].val in (
+                "pub", "#", "["):                # a crude attribute skip
+            j += 1
+        return (j < len(self.toks) and self.toks[j].val == "type"
+                and j + 1 < len(self.toks)
+                and self.toks[j + 1].kind == "ident")
+
+    def parse_assoc_type(self, owner):
+        """Parse `type Name = Ty;` in an impl; register it for `T::Name`."""
+        self.skip_attributes()
+        self.skip_visibility()
+        self.expect("type")
+        name = self.expect_ident()
+        self.skip_generic_params()
+        self.expect("=")
+        ty = self.parse_type()
+        self.expect(";")
+        self.unit.assoc_types[(owner, name)] = ty
+        return name, ty
+
     def is_assoc_const(self):
         """True if an `impl` body item is `const NAME: T = ...;`."""
         j = self.i
@@ -3141,6 +3193,9 @@ class Parser:
         while not self.at("}", "punc"):
             if self.cur.kind == "eof":
                 self.err("unterminated impl block")
+            if self.is_assoc_type():
+                self.parse_assoc_type(owner)     # a type alias, emits nothing
+                continue
             if self.is_assoc_const():
                 self.parse_const_signature()     # hoisted into the prelude
                 continue
@@ -4237,6 +4292,9 @@ def collect_items(code, spans, unit, struct_order, fail=None):
                     unit.trait_impls.append((p.impl_trait, owner, toks))
                 p.impl_type = owner
                 while not p.at("}", "punc") and p.cur.kind != "eof":
+                    if p.is_assoc_type():
+                        p.parse_assoc_type(owner)
+                        continue
                     if p.is_assoc_const():
                         kw, cname, cty, cinit = p.parse_const_signature()
                         mangled = "%s_%s" % (owner, cname)
