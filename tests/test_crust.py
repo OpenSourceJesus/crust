@@ -678,10 +678,22 @@ class TestCrustIfExpression(unittest.TestCase):
             crust.translate("fn f(b: bool) -> i32 "
                             "{ let v: i32 = if b { 1 }; v }")
 
-    def test_statements_in_arm_are_an_error(self):
+    def test_statements_in_arm_are_allowed(self):
+        # A block used as a value may run statements before its tail
+        # expression; Rust code does that constantly. They are hoisted into
+        # the enclosing statement's pending list, which is emitted just
+        # before it -- exactly when they should run.
+        self.assertEqual(_run("""
+fn main() -> i32 {
+    let v: i32 = if true { let a: i32 = 6; a * 7 } else { 0 };
+    v
+}
+""", suffix=".rs"), 42)
+
+    def test_block_without_a_tail_value_is_an_error(self):
         with self.assertRaises(crust.CrustError):
-            crust.translate("fn f(b: bool) -> i32 { let v: i32 = "
-                            "if b { let q: i32 = 1; q } else { 2 }; v }")
+            crust.translate("fn f() -> i32 { let x: i32 = { let a: i32 = 1; };"
+                            " x }")
 
     def test_if_statement_still_works(self):
         # A bare `if` as a statement must not be treated as an expression.
@@ -3329,3 +3341,67 @@ int main(void) {
 }
 """)
         self.assertNotEqual(got, 2)
+
+
+class TestCrustBlockExpression(unittest.TestCase):
+    """A block used as a value may run statements first."""
+
+    def test_statements_then_value(self):
+        self.assertEqual(_run("""
+fn main() -> i32 { let v: i32 = { let a: i32 = 6; let b: i32 = 7; a * b }; v }
+""", suffix=".rs"), 42)
+
+    def test_statements_run_before_the_use(self):
+        # The hoisted statements land in the pending list, which is emitted
+        # immediately before the statement containing the block.
+        c = crust.translate("fn f() -> i32 { let v: i32 = { let a: i32 = 2;"
+                            " a * 21 }; v }")
+        self.assertLess(c.index("int a = 2"), c.index("int v ="))
+
+    def test_nested_blocks(self):
+        self.assertEqual(_run("""
+fn main() -> i32 { let v: i32 = { let a: i32 = { let b: i32 = 21; b }; a * 2 };
+                   v }
+""", suffix=".rs"), 42)
+
+    def test_two_blocks_may_reuse_a_name(self):
+        # The hoisted statements keep their own C scope. Emitting them bare
+        # put every block-local at function scope, so two blocks that each
+        # declared `a` collided with "redefinition of 'a'".
+        self.assertEqual(_run("""
+fn main() -> i32 {
+    let x: i32 = { let a: i32 = 6; a };
+    let y: i32 = { let a: i32 = 7; a };
+    x * y
+}
+""", suffix=".rs"), 42)
+
+    def test_block_local_is_not_visible_after(self):
+        c = crust.translate("fn f() -> i32 { let v: i32 = { let a: i32 = 1;"
+                            " a }; v }")
+        # The declaration sits inside its own braces, not at function scope.
+        self.assertIn("{ int a = 1;", c)
+
+
+class TestCrustVecMacro(unittest.TestCase):
+    """`vec![..]` builds a bundled `Vec<T>`."""
+
+    def test_elements_are_pushed(self):
+        self.assertEqual(_run("""
+fn main() -> i32 {
+    let mut v: Vec<i32> = vec![10, 20, 12];
+    let mut s: i32 = 0;
+    for i in 0..v.len() { s += v.get(i); }
+    v.free_buf();
+    s
+}
+""", suffix=".rs"), 42)
+
+    def test_element_type_comes_from_the_first(self):
+        c = crust.translate("fn f() { let v: Vec<f64> = vec![1.0, 2.0]; }")
+        self.assertIn("Vec_double", c)
+
+    def test_empty_vec_is_rejected(self):
+        # Nothing to infer the element type from, exactly as in Rust.
+        with self.assertRaises(crust.CrustError):
+            crust.translate("fn f() { let v: Vec<i32> = vec![]; }")
