@@ -61,7 +61,7 @@ its definition.
 | Items | `fn`, `struct`, `impl`, `enum`, `const`, `static`, with optional `pub`, `unsafe`, `extern "C"`; `#[...]` attributes are skipped |
 | Generics | `fn f<T>`, `struct S<T>`, `impl<T> S<T>`, turbofish `f::<T>()`, monomorphised per instantiation |
 | Core | bundled `Vec<T>`, `Box<T>`, `Cell<T>`, `PhantomData<T>`, and `size_of::<T>()` |
-| Traits | `trait`, `impl Trait for Type`, default methods, supertraits, bounds `<T: Trait>`; static dispatch |
+| Traits | `trait`, `impl Trait for Type`, default methods, supertraits, bounds `<T: Trait>`, associated consts through a type parameter (`T::CONST`); static dispatch |
 | Macros | `println!`/`print!`/`eprintln!`, `assert!`/`assert_eq!`/`assert_ne!`, `panic!`/`unreachable!`/`todo!`, `debug_assert*!`, `cfg!`, `matches!`, and `macro_rules!` |
 | Tuples | tuple types `(A, B)`, tuple expressions, positional access `t.0` |
 | Data enums | `enum E { A(T), B { x: T }, C }` as a tagged union, with `match` bindings |

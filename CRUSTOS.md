@@ -18,6 +18,9 @@ CrustOS
   runnable     : 2 of 3
   switches     : 8
   ticks        : init=16 shell=12 idle=0
+  x86_64 kpage : 0x8000000000000003 present=1
+  arm64 upage  : 0x40000000000043
+  heap frame   : 917504
   read(0,64)   : 64
   close(0)     : 0
   bad fd       : -1
@@ -63,13 +66,41 @@ data-carrying enum. No allocator, no boxing, no GC anywhere near it.
 
 **C** gets `main`.
 
+## Paging, in upstream's shape
+
+`rmm/src/page/flags.rs` writes its page flags generically over the
+architecture, reading constants off a trait:
+
+```rust
+impl<A: Arch> PageFlags<A> {
+    pub fn new() -> Self {
+        Self::from_data(A::ENTRY_FLAG_DEFAULT_PAGE | A::ENTRY_FLAG_NO_EXEC)
+    }
+}
+```
+
+`crustos/kernel.c` uses the same shape, and Crust monomorphises it: one
+implementation of the flag logic, one instantiation per architecture, every
+constant resolved at compile time with no dispatch. The `x86_64 kpage` and
+`arm64 upage` lines above come from the same source code compiled twice.
+
+The `heap frame` line is that logic applied to a genuinely upstream value —
+`kernel_heap_offset()` from `vendor/kernel/src/arch/x86/consts.rs`, shifted by
+the architecture's own `PAGE_SHIFT`.
+
+Upstream's own `PageFlags<A>` still does not instantiate here, because it
+reaches for parts of `core` that Crust has no source for. What has been shown
+is that the *pattern* compiles, which is the part that was in doubt.
+
 ## What comes from upstream Redox
 
 Currently **93 of 106** translatable files compile to objects, of which 88 can
 be linked together. What survives is mostly the memory manager and the
 architecture definitions:
 
-- `rmm/src/page/` — page table entries, flags, mappers, table walking
+- `rmm/src/page/` — page table entries, flags, mappers, table walking. These
+  compile but export little, because a generic impl only produces code once
+  something instantiates it; see the section above.
 - `rmm/src/allocator/frame/` — the buddy and bump frame allocators
 - `src/arch/*/consts.rs` — memory layout constants. `kernel_heap_offset()` in
   the output above is upstream's, called from our `main`.
