@@ -60,7 +60,7 @@ its definition.
 |---|---|
 | Items | `fn`, `struct`, `impl`, `enum`, `const`, `static`, with optional `pub`, `unsafe`, `extern "C"`; `#[...]` attributes are skipped |
 | Generics | `fn f<T>`, `struct S<T>`, `impl<T> S<T>`, turbofish `f::<T>()`, monomorphised per instantiation |
-| Core | bundled `Vec<T>`, `Box<T>`, `Cell<T>`, `PhantomData<T>`, and `size_of::<T>()` |
+| Core | bundled `String`, `Vec<T>`, `Box<T>`, `Cell<T>`, `PhantomData<T>`, and `size_of::<T>()` |
 | Traits | `trait`, `impl Trait for Type`, default methods, supertraits, bounds `<T: Trait>`, associated consts through a type parameter (`T::CONST`) and with inherited defaults, associated types (`T::Item`, `Self::Target`); static dispatch |
 | Macros | `println!`/`print!`/`eprintln!`, `assert!`/`assert_eq!`/`assert_ne!`, `panic!`/`unreachable!`/`todo!`, `debug_assert*!`, `cfg!`, `matches!`, and `macro_rules!` |
 | Tuples | tuple types `(A, B)`, tuple expressions, positional access `t.0` |
@@ -1018,6 +1018,20 @@ came out as a plausible-looking garbage integer rather than failing.
 Overflow arguments are now pushed again at the top, where a standard callee
 looks for them. `tools/crustfuzz.py --family vararg_overflow` covers one
 through nine arguments.
+
+## `String`
+
+A growable, always NUL-terminated character buffer, so `as_ptr()` hands C
+something it can use directly. `push`, `push_str`, `get`, `len`, `clear`,
+`eq_str`, `with_capacity`, and an explicit `free_buf` since there is no `Drop`.
+
+Deliberately **not** rpython's `str`. py2c has a complete string runtime --
+concat, split, join, `%` formatting -- and reaching for it would give a lot
+for free, but it means linking `shivyc_rt.c` and its arena into every unit
+that formats anything, and a kernel cannot use an arena before its heap
+exists. A kernel's string handling is short and bounded. For *userspace*
+CrustOS code the tradeoff runs the other way, and the rpython runtime is the
+better answer there.
 
 ## Blocks as expressions
 
