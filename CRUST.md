@@ -923,6 +923,39 @@ dispatch is free; the remaining gap is codegen quality, not the trait design.
 A comparison against rustc has not been made -- it could not be installed in
 the environment this was developed in -- so no claim is made about it.
 
+## `core` free functions
+
+Beyond the bundled types, Crust lowers the handful of `core` free functions
+that real Rust reaches for constantly and that have an *exact* C equivalent.
+These are not a standard library; they are the calls that would otherwise be
+undefined symbols at link time. Counted across the Redox kernel and relibc:
+
+| function | uses | lowering |
+|---|---|---|
+| `slice::from_raw_parts` / `_mut` | 38 | a Crust slice, `{.ptr, .len}` |
+| `ptr::null` / `null_mut` | 34 | a typed null pointer |
+| `hint::spin_loop` | 18 | nothing |
+| `cmp::min` / `max` | 15 | a conditional |
+| `ptr::read` / `write` (and `_volatile`) | 25 | a dereference |
+| `ptr::copy_nonoverlapping` | | `memcpy` |
+| `mem::swap` | | a temporary and two stores |
+
+`slice::from_raw_parts` is the happiest case: it builds exactly Crust's own
+slice, so it needs no conversion at all.
+
+Matching is on the tail of the flattened path, so `core::ptr::null_mut`,
+`ptr::null_mut` and `null_mut` all resolve — a crate spells the import however
+it likes and the call site follows. **A locally defined function of the same
+name always wins**: `min` is an ordinary thing to define, and silently
+replacing it with an intrinsic would be a confusing bug.
+
+Two of these are easy to get subtly wrong and are tested accordingly.
+`copy_nonoverlapping` takes its source first and counts *elements*, where C's
+`memcpy` takes the destination first and counts *bytes* — either mistake
+corrupts memory silently. And `spin_loop` lowers to nothing: it is a `pause`
+hint, so omitting it costs a little power in a spin wait and changes no
+semantics.
+
 ## The bundled minimal core
 
 Monomorphisation needs a template, so a generic with no source in the unit

@@ -23,6 +23,9 @@ CrustOS
   heap frame   : 917504
   page size    : x86=4096 arm64=65536 (mask 0xffff)
   page levels  : x86=4 arm64=3
+  frames used  : 17 (bitmap popcount)
+  budget(1000) : 495
+  init ticks   : 0 (after ptr::write)
   read(0,64)   : 64
   close(0)     : 0
   bad fd       : -1
