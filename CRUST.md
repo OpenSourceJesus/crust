@@ -61,7 +61,7 @@ its definition.
 | Items | `fn`, `struct`, `impl`, `enum`, `const`, `static`, with optional `pub`, `unsafe`, `extern "C"`; `#[...]` attributes are skipped |
 | Generics | `fn f<T>`, `struct S<T>`, `impl<T> S<T>`, turbofish `f::<T>()`, monomorphised per instantiation |
 | Core | bundled `Vec<T>`, `Box<T>`, `Cell<T>`, `PhantomData<T>`, and `size_of::<T>()` |
-| Traits | `trait`, `impl Trait for Type`, default methods, supertraits, bounds `<T: Trait>`, associated consts through a type parameter (`T::CONST`) and with inherited defaults; static dispatch |
+| Traits | `trait`, `impl Trait for Type`, default methods, supertraits, bounds `<T: Trait>`, associated consts through a type parameter (`T::CONST`) and with inherited defaults, associated types (`T::Item`, `Self::Target`); static dispatch |
 | Macros | `println!`/`print!`/`eprintln!`, `assert!`/`assert_eq!`/`assert_ne!`, `panic!`/`unreachable!`/`todo!`, `debug_assert*!`, `cfg!`, `matches!`, and `macro_rules!` |
 | Tuples | tuple types `(A, B)`, tuple expressions, positional access `t.0` |
 | Data enums | `enum E { A(T), B { x: T }, C }` as a tagged union, with `match` bindings |
@@ -922,6 +922,34 @@ backend (0.094s vs 0.195s on that loop). So the lowering is right and the
 dispatch is free; the remaining gap is codegen quality, not the trait design.
 A comparison against rustc has not been made -- it could not be installed in
 the environment this was developed in -- so no claim is made about it.
+
+## Associated types
+
+`type Item;` on a trait, bound per impl. Redox uses these 45 times —
+`type Target` for `Deref` (23) and `type Item` for `Iterator` (22).
+
+An associated type is a type alias attached to an impl, so it resolves at
+monomorphisation exactly as an associated const does:
+
+```rust
+trait Container {
+    type Item;
+    fn first(&self) -> Self::Item;
+}
+impl Container for IntBox { type Item = i32;  fn first(&self) -> Self::Item { .. } }
+impl Container for FltBox { type Item = f64;  fn first(&self) -> Self::Item { .. } }
+
+fn head<T: Container>(c: T) -> T::Item { c.first() }
+```
+
+`head` compiled for `IntBox` returns `int`; for `FltBox`, `double`. The
+associated type declaration itself emits nothing — it is a binding, not an
+item.
+
+One ordering detail worth recording: `Self::Item` has to be resolved **before**
+the qualified-path handler, which would otherwise flatten it to the name
+`Self_Item` and then report that nothing defines it. The same applies to
+`T::Item` in a generic being monomorphised.
 
 ## `fmt`: `Formatter`, `write!` and `writeln!`
 
