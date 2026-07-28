@@ -2700,3 +2700,72 @@ fn main() -> i32 {
         c = crust.translate("fn f() -> i32 { 1 }")
         for name in ("Mutex", "RwLock", "Once", "NonNull", "UnsafeCell"):
             self.assertNotIn(name, c)
+
+
+class TestCrustCfg(unittest.TestCase):
+    """`#[cfg(..)]` selects one arm of a set of alternatives.
+
+    Without this every gated arm was emitted, so a crate offering a 32-bit and
+    a 64-bit constant produced two conflicting definitions of the same name.
+    """
+
+    def test_matching_arm_is_kept(self):
+        c = crust.translate('#[cfg(target_pointer_width = "64")]\n'
+                            'pub const W: i64 = 64;\n'
+                            'fn f() -> i32 { 1 }')
+        self.assertIn("64", c)
+
+    def test_non_matching_arm_is_erased(self):
+        c = crust.translate('#[cfg(target_pointer_width = "32")]\n'
+                            'pub const W: i64 = 32;\n'
+                            'fn f() -> i32 { 1 }')
+        self.assertNotIn("W", c.replace("void", ""))
+
+    def test_alternatives_do_not_collide(self):
+        c = crust.translate('#[cfg(target_pointer_width = "32")]\n'
+                            'pub const MAX: u64 = 0xFFFF_FFFF;\n'
+                            '#[cfg(target_pointer_width = "64")]\n'
+                            'pub const MAX: u64 = 0xFFFF_FFFF_FFFF_FFFF;\n'
+                            'fn f() -> i32 { 1 }')
+        self.assertEqual(c.count("#define MAX"), 1)
+        self.assertIn("0xFFFFFFFFFFFFFFFF", c)
+
+    def test_rejected_arm_leaves_no_rust_behind(self):
+        # Dropping only the span would leave its Rust source in the output
+        # for the C front end to choke on.
+        c = crust.translate('#[cfg(target_arch = "aarch64")]\n'
+                            'pub fn only_arm64(x: i32) -> i32 { x }\n'
+                            'fn f() -> i32 { 1 }')
+        self.assertNotIn("only_arm64", c)
+        self.assertNotIn("-> i32", c)
+
+    def test_line_numbers_survive_erasure(self):
+        c = crust.translate('#[cfg(target_arch = "aarch64")]\n'
+                            'pub fn gone() -> i32 { 1 }\n'
+                            'fn f() -> i32 { 42 }')
+        self.assertIn("int f(void) { return 42; }", c.split("\n")[2])
+
+    def test_any_and_not(self):
+        self.assertTrue(crust.cfg_allows(
+            '#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]'))
+        self.assertTrue(crust.cfg_allows('#[cfg(not(target_os = "linux"))]'))
+        self.assertFalse(crust.cfg_allows(
+            '#[cfg(all(unix, target_arch = "aarch64"))]'))
+
+    def test_unknown_key_is_false(self):
+        # Treating an unknown predicate as true would select several arms of
+        # a set of alternatives, which is the failure this exists to prevent.
+        self.assertFalse(crust.cfg_allows('#[cfg(feature = "nope")]'))
+
+    def test_item_without_cfg_is_kept(self):
+        self.assertTrue(crust.cfg_allows("#[derive(Clone)]"))
+        self.assertTrue(crust.cfg_allows(""))
+
+    def test_cfg_gated_items_run(self):
+        self.assertEqual(_run("""
+#[cfg(target_pointer_width = "32")]
+fn pick() -> i32 { 0 }
+#[cfg(target_pointer_width = "64")]
+fn pick() -> i32 { 42 }
+fn main() -> i32 { pick() }
+""", suffix=".rs"), 42)
