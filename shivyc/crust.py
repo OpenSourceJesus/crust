@@ -1220,6 +1220,56 @@ class Parser:
             text = text[1:-1]
         return text
 
+    def m_write(self, args, line, newline=False):
+        """`write!(f, "..", ..)` -- append to a Formatter.
+
+        Lowered to `snprintf` into the formatter's remaining space, followed
+        by advancing its length. Truncation is detected the way snprintf
+        reports it (a return larger than the space given) and recorded on the
+        formatter rather than silently ignored, so a caller can tell that a
+        message was cut short.
+
+        The format string is translated exactly as `println!`'s is, taking
+        each conversion from the type of the argument that supplies it.
+        """
+        if not args:
+            self.err("`write!` needs a formatter")
+        sink = self.sub_expr(args[0])
+        if len(args) < 2:
+            fmt, rest = '""', []
+        else:
+            fmt, rest = self._format_string(args[1], line), args[2:]
+        vals = [self.sub_expr(a) for a in rest]
+        spec = _rust_format_to_c(fmt, [v.type for v in vals], newline)
+        self.unit.needs.add("snprintf")
+
+        # `f` may be a Formatter or a pointer to one; both are common, since
+        # `fn fmt(&self, f: &mut Formatter)` gives a pointer and a local gives
+        # a value.
+        arrow = "->" if (sink.type is not None and sink.type.ptr) else "."
+        base = sink.code
+        # The space arithmetic is inlined rather than calling the formatter's
+        # own `space()`, so this expands to plain field access and does not
+        # depend on that method having been instantiated.
+        n = self.new_temp()
+        buf = "%s%sbuf" % (base, arrow)
+        ln = "%s%slen" % (base, arrow)
+        cap = "%s%scap" % (base, arrow)
+        over = "%s%soverflowed" % (base, arrow)
+        room = "(%s > %s ? %s - %s : 0)" % (cap, ln, cap, ln)
+        call = "snprintf(%s + %s, %s, %s" % (buf, ln, room, spec)
+        for v in vals:
+            call += ", " + v.code
+        call += ")"
+        # snprintf returns what it *would* have written, so a return at or
+        # above the room given means the text was truncated.
+        self.pending.append(
+            "int %s = %s; if (%s < 0) { %s = 1; } "
+            "else if ((long)%s >= %s) { %s = %s > 0 ? %s - 1 : 0; %s = 1; } "
+            "else { %s += %s; }"
+            % (n, call, n, over, n, room, ln, cap, cap, over, ln, n))
+        return Expr("0", INT)
+
     def m_cfg(self, args, line):
         # `cfg!(..)` is a compile-time predicate over features Crust has no
         # notion of. Reporting false is the honest answer: nothing is
@@ -3221,6 +3271,8 @@ _BUILTIN_MACROS = {
     "println": lambda p, a, l: Parser.m_print(p, a, l, True),
     "eprint": lambda p, a, l: Parser.m_print(p, a, l, False, "stderr"),
     "eprintln": lambda p, a, l: Parser.m_print(p, a, l, True, "stderr"),
+    "write": lambda p, a, l: Parser.m_write(p, a, l, False),
+    "writeln": lambda p, a, l: Parser.m_write(p, a, l, True),
     "cfg": Parser.m_cfg,
     "matches": Parser.m_matches,
 }
@@ -5198,6 +5250,9 @@ def translate(code, path=None):
     if "fprintf" in unit.needs:
         prelude.append("int fprintf(void *, const char *, ...);")
         prelude.append("extern void *stderr;")
+    if "snprintf" in unit.needs:
+        prelude.append("int snprintf(char *, unsigned long, "
+                       "const char *, ...);")
     if "memcpy" in unit.needs:
         prelude.append("void *memcpy(void *, const void *, unsigned long);")
     if "alloc" in unit.needs:
