@@ -2966,3 +2966,69 @@ fn main() -> i32 {
 fn min(a: i32, b: i32) -> i32 { 42 }
 fn main() -> i32 { min(1, 2) }
 """, suffix=".rs"), 42)
+
+
+class TestVariadicOverflowArgs(unittest.TestCase):
+    """A variadic call with more arguments than the registers hold.
+
+    ShivyC pushes every argument of a variadic call, because its own variadic
+    callees read them all from the stack. A standard SysV callee -- glibc's
+    printf family -- instead reads the first six integer arguments from
+    registers and any overflow from the *top* of the stack. The code assumed
+    no variadic call ever overflowed, which held until `write!` started
+    generating `snprintf(buf, size, fmt, a, b, c, d)`: seven arguments, one
+    past the six integer registers.
+
+    The seventh was read from whatever sat at the top of the all-push block,
+    which was the format pointer -- so it printed a plausible-looking garbage
+    integer rather than failing.
+    """
+
+    def test_six_varargs(self):
+        self.assertEqual(_run(
+            'int printf(const char *, ...);\n'
+            'int main(void) { char b[64]; return 0; }\n'
+            'int unused(void) { printf("%d%d%d%d%d%d", 1,2,3,4,5,6);'
+            ' return 0; }'), 0)
+
+    def test_sixth_vararg_is_correct(self):
+        self.assertEqual(_run("""
+int snprintf(char *, unsigned long, const char *, ...);
+int atoi(const char *);
+int main(void) {
+    char b[64];
+    snprintf(b, 64, "%d", 42);
+    return atoi(b);
+}
+"""), 42)
+
+    def test_overflow_vararg_is_correct(self):
+        # Seven arguments to snprintf: three fixed plus four varargs, so the
+        # last is the first stack-passed one.
+        self.assertEqual(_run("""
+int snprintf(char *, unsigned long, const char *, ...);
+int atoi(const char *);
+int main(void) {
+    char b[64];
+    snprintf(b, 64, "%d%d%d%d", 1, 2, 3, 42);
+    return atoi(b + 3);
+}
+"""), 42)
+
+    def test_mixed_widths_overflow(self):
+        self.assertEqual(_run("""
+int snprintf(char *, unsigned long, const char *, ...);
+int atoi(const char *);
+int main(void) {
+    char b[64];
+    long big = 7;
+    snprintf(b, 64, "%d%d%ld%d%d", 1, 2, big, 4, 42);
+    return atoi(b + 4);
+}
+"""), 42)
+
+    def test_non_variadic_seven_args_unaffected(self):
+        self.assertEqual(_run("""
+int f(int a,int b,int c,int d,int e,int g,int h){ return h; }
+int main(void){ return f(1,2,3,4,5,6,42); }
+"""), 42)
