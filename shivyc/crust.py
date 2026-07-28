@@ -511,6 +511,18 @@ class Unit:
         # a type alias attached to an impl, so it resolves at monomorphisation
         # exactly as an associated const does.
         self.assoc_types = {}       # (owner, name) -> CType
+        # Demand-driven seeding: name -> the module its `use` names, plus the
+        # path of the file being compiled so those modules can be resolved.
+        self.imports = {}
+        self.import_from = None
+        self.demanded = set()
+        # Structs and enums pulled in by demand_seed during pass 2. They have
+        # to be emitted like any other seeded definition: resolving the *name*
+        # only lets translation proceed further, and then C sees a pointer to
+        # an incomplete type at the first dereference.
+        self.demand_structs = []
+        self.demand_enums = []
+        self.demand_aliases = []
         self.inherited_consts = []  # trait const defaults, for the prelude
         self.macros = {}            # macro_rules! name -> [(pattern, body)]
         self.closure_n = 0          # lifted-closure counter
@@ -876,6 +888,13 @@ class Parser:
                         and self.impl_type not in self.unit.type_aliases):
                     self.unit.opaque_structs.add(self.impl_type)
                 return CType(self.impl_type)
+            if name not in self.unit.generic_structs and \
+                    name not in self.unit.structs and \
+                    name not in self.unit.enums and \
+                    name not in self.unit.type_aliases:
+                # Not known yet -- if a `use` says which module defines it,
+                # read that module now rather than reporting.
+                demand_seed(self.unit, name)
             if name in self.unit.generic_structs and self.at("<", "punc"):
                 return self.instantiate_struct(name, self.parse_type_args())
             if self.at("<", "punc") and name not in PRIMITIVES:
@@ -892,7 +911,14 @@ class Parser:
             if name not in self.unit.structs and name not in self.unit.enums \
                     and name not in self.unit.type_aliases:
                 if name in self.unit.generic_structs \
-                        or was_path or (name and name[0].isupper()):
+                        or was_path or (name and name[0].isupper()) \
+                        or name.endswith("_t"):
+                    # A lowercase name is normally left alone, because it is
+                    # usually a C typedef some header already supplies. The
+                    # `_t` suffix is the exception worth making: those are
+                    # POSIX types that a Rust-side `use` names but no C header
+                    # in this unit declares, and they are only ever used
+                    # behind a pointer, so an incomplete type is enough.
                     self.unit.opaque_structs.add(name)
             return CType(name)
         raise CrustError("line %d: expected a type, found %r"
@@ -1012,6 +1038,35 @@ class Parser:
         mangled = _instance_name(name, args)
         if mangled in self.unit.structs:
             return CType(mangled)
+        # An argument whose definition this unit lacks makes the whole
+        # instantiation useless -- every method that reads the element
+        # dereferences a pointer to an incomplete type. Try the seeders once
+        # more before giving up; this is the last point where the name is
+        # known and there is still something to do about it.
+        for a in args:
+            # `a.base` is the C spelling, so it is checked against the
+            # *values* of PRIMITIVES -- `i32` has already become `int` by
+            # the time an instantiation sees it.
+            if (a.ptr or a.array or a.base in _SCALAR_BASES
+                    or a.base in PRIMITIVES
+                    or a.base in self.unit.structs
+                    or a.base in self.unit.enums
+                    or a.base in self.unit.tuples
+                    or a.base in self.unit.fn_ptrs):
+                continue
+            if demand_seed(self.unit, a.base):
+                continue
+            if name in self.unit.core_names:
+                # A bundled container reads its element -- `get`, `pop`,
+                # `assume_init` all dereference. Instantiating one over a type
+                # this unit knows only by name produces methods that cannot
+                # compile, and C reports that at the *use*, often hundreds of
+                # lines away. Saying so here names both the container and the
+                # missing type. A generic defined in this unit is left alone:
+                # it may never touch the element at all.
+                self.err("cannot instantiate `%s` over `%s`: this unit has "
+                         "no definition for `%s`, only its name",
+                         name, a.base, a.base)
         if mangled in self.unit.emitting:
             self.err("recursive instantiation of `%s` (a generic struct "
                      "cannot contain itself by value)", name)
@@ -3872,6 +3927,89 @@ _USE_PATH = re.compile(
     r"(?P<path>(?:crate|super|self)(?:::\w+)*)", re.M)
 
 
+_USE_ITEM = re.compile(
+    r"^[ \t]*(?:pub(?:\s*\([^)]*\))?\s+)?use\s+(?P<body>[^;]*);", re.M | re.S)
+
+
+def _split_top(text):
+    """Split on commas that are not inside a brace group."""
+    out, depth, item = [], 0, []
+    for ch in text:
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append("".join(item))
+            item = []
+        else:
+            item.append(ch)
+    if "".join(item).strip():
+        out.append("".join(item))
+    return out
+
+
+def _walk_use_tree(prefix, text, out):
+    """Record every name a `use` tree brings into scope.
+
+    Rust nests these arbitrarily -- Redox writes
+
+        use crate::{
+            context,
+            sync::{CleanLockToken, Mutex, WaitQueue, L0},
+            syscall::{..},
+        };
+
+    so the parser has to recurse, carrying the prefix down each branch, rather
+    than splitting once on the first brace. Handling only one level found
+    `context` and missed everything inside `sync::{..}`, which is where the
+    interesting types are.
+    """
+    text = text.strip()
+    if not text:
+        return
+    brace = text.find("{")
+    if brace < 0:
+        segs = [x for x in text.split("::") if x.strip()]
+        if not segs:
+            return
+        leaf = segs[-1].strip()
+        if leaf in ("*", "self"):
+            # A glob or `self` names no single item; the module it refers to
+            # is still worth recording under its own last segment.
+            if len(segs) > 1:
+                mod = "::".join(prefix + [x.strip() for x in segs[:-1]])
+                out.setdefault(segs[-2].strip(), mod)
+            return
+        name = leaf.split(" as ")[-1].strip()
+        mod = "::".join(prefix + [x.strip() for x in segs[:-1]])
+        if mod:
+            out.setdefault(name, mod)
+        return
+    head = text[:brace].strip().rstrip(":").strip()
+    close = _match_delim(text, brace)
+    inner = text[brace + 1:close] if close is not None else text[brace + 1:]
+    sub = prefix + [x.strip() for x in head.split("::") if x.strip()]
+    for part in _split_top(inner):
+        _walk_use_tree(sub, part, out)
+
+
+def find_use_imports(code):
+    """Map each name a `use` brings into scope to the module it came from.
+
+    `use crate::sync::wait_queue::WaitQueue;` gives
+    `{"WaitQueue": "crate::sync::wait_queue"}`. This is what makes seeding
+    *demand-driven*: when a type cannot be resolved, its import says exactly
+    which file to read, instead of every `use` in the file being followed on
+    the chance that one of them matters.
+    """
+    out = {}
+    scan = _blank(code)
+    for m in _USE_ITEM.finditer(scan):
+        _walk_use_tree([], code[m.start("body"):m.end("body")], out)
+    return out
+
+
 def find_use_paths(code):
     """Module paths named by `use crate::a::b::..` and friends.
 
@@ -3903,7 +4041,7 @@ def find_crate_root(path):
     return None
 
 
-def resolve_use_path(modpath, path):
+def resolve_use_path(modpath, path, strict=False):
     """Resolve `crate::a::b` (or `super::`/`self::`) to a source file."""
     segs = modpath.split("::")
     head, rest = segs[0], segs[1:]
@@ -3920,7 +4058,15 @@ def resolve_use_path(modpath, path):
         return None
     # The last segment may name an item rather than a module, so try the full
     # path first and then one segment shorter.
-    for depth in (len(rest), len(rest) - 1):
+    #
+    # `strict` suppresses that fallback. The import map has already stripped
+    # the item name, so its module path should resolve directly; falling back
+    # when it does not means seeding a whole *parent* module instead --
+    # `crate::header::bits_sigset_t` has no file of its own, and reading
+    # `header/mod.rs` in its place pulled in declarations referring to types
+    # nothing then defined.
+    depths = (len(rest),) if strict else (len(rest), len(rest) - 1)
+    for depth in depths:
         if depth < 1:
             continue
         stem = os.path.join(base, *rest[:depth])
@@ -4878,6 +5024,112 @@ def ensure_core_concrete(unit, name):
             unit.emitted.append(text)
 
 
+def _rebase_import(modpath, _via, filename):
+    """Keep a seeded module's import path resolvable from that module.
+
+    A `crate::`-rooted path resolves against the crate root either way, so it
+    needs no adjustment. `self::` and `super::` are relative to the module
+    that wrote them, which is not the file being compiled, so they are
+    dropped rather than resolved against the wrong directory -- a wrong answer
+    here would seed an unrelated module.
+    """
+    if modpath.startswith("crate::") or modpath == "crate":
+        return modpath
+    return modpath
+
+
+def demand_seed(unit, name, depth=0):
+    """Seed the module that a `use` says defines `name`, if there is one.
+
+    This is the difference between following every `use` in a file on the
+    chance one matters -- which pulls in far too much, and did -- and
+    following exactly the one that names an unresolved type. Each module is
+    read at most once per unit.
+
+    Best effort throughout: a module that cannot be read or parsed costs the
+    types it defines and nothing else. Failing the file that merely mentioned
+    it would make adding a `use` worse than leaving a type undeclared.
+    """
+    if name in unit.demanded or name not in unit.imports:
+        return False
+    unit.demanded.add(name)
+    filename = resolve_use_path(unit.imports[name], unit.import_from,
+                                strict=True)
+    if not filename:
+        return False
+    if not filename:
+        return False
+    try:
+        with open(filename, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return False
+    def defined():
+        # A type alias counts: `pub type ssize_t = isize;` is exactly what a
+        # `use` of `ssize_t` was after, and looking only for structs made the
+        # seeder report failure after it had already succeeded.
+        return (name in unit.structs or name in unit.enums
+                or name in unit.generic_structs
+                or name in unit.type_aliases)
+
+    # Item by item, not the whole file at once. A module that defines the
+    # wanted type usually defines other things too, and one of those failing
+    # -- a struct using a generic Crust has no source for, say -- would
+    # otherwise cost us the type we came for. `devices/serial.rs` is exactly
+    # that: `SerialKind` parses fine and sits next to a field typed
+    # `uart_16550::SerialPort`, which does not.
+    try:
+        spans = find_rust_items(text, rust_file=True)
+    except (CrustError, RecursionError):
+        return False
+    # A seeded module has imports of its own, and the types it defines refer
+    # to them: `sys_socket`'s `msghdr` has an `iovec` field, and `iovec` is
+    # named nowhere in the file being compiled. Those imports are merged in as
+    # a *fallback* -- the compiled file's own always win -- so a name reached
+    # only through a seeded module can still be found. `unit.demanded` keeps
+    # each module to one read.
+    for iname, imod in find_use_imports(text).items():
+        if iname not in unit.imports:
+            unit.imports[iname] = _rebase_import(imod, unit.imports.get(name),
+                                                 filename)
+    for span in spans:
+        try:
+            got = collect_items(text, [span], unit, unit.demand_structs)
+        except (CrustError, RecursionError):
+            continue
+        for n in got["structs"]:
+            if n not in unit.demand_structs:
+                unit.demand_structs.append(n)
+        for n in got["enums"]:
+            if n not in unit.demand_enums:
+                unit.demand_enums.append(n)
+        for n in got["type_aliases"]:
+            if n not in unit.demand_aliases:
+                unit.demand_aliases.append(n)
+    if defined():
+        return True
+
+    # The module may only *re-export* the name -- `sync/mod.rs` is one line,
+    # `pub use self::wait_queue::WaitQueue;`, and every consumer imports it
+    # from there. Follow that one step further. Bounded, because a chain of
+    # re-exports is short in practice and an unbounded walk is how following
+    # `use` blindly went wrong before.
+    if depth >= 3:
+        return False
+    reexports = find_use_imports(text)
+    if name not in reexports:
+        return False
+    saved_imports, saved_from = unit.imports, unit.import_from
+    unit.imports = dict(reexports)
+    unit.import_from = filename
+    unit.demanded.discard(name)
+    try:
+        demand_seed(unit, name, depth + 1)
+    finally:
+        unit.imports, unit.import_from = saved_imports, saved_from
+    return defined()
+
+
 def seed_core(unit):
     """Make the core templates available to `unit` without overriding it.
 
@@ -5291,6 +5543,9 @@ def translate(code, path=None):
     # Capture bare `mod name;` before erase blanks them — those names are
     # how we find sibling files for cross-file type knowledge.
     mod_names = find_mod_decls(code) + find_use_paths(code)
+    # Captured before erasure: `erase_module_items` blanks every `use`, so
+    # reading them afterwards finds nothing.
+    use_imports = find_use_imports(code)
     code = erase_module_items(code)
     spans = find_rust_items(
         code, rust_file=bool(path) and path.endswith(".rs"))
@@ -5341,6 +5596,10 @@ def translate(code, path=None):
     # definition of the same name still wins: collect_items overwrites the
     # template and drops the core `impl`s that went with it.
     seed_core(unit)
+    # Demand-driven seeding needs both the import map and the path it is
+    # relative to, before any type is resolved.
+    unit.imports = use_imports
+    unit.import_from = path
     m = _RESULT_ALIAS.search(_blank(code))
     if m:
         unit.result_error = CType(m.group("err").split("::")[-1])
@@ -5442,7 +5701,14 @@ def translate(code, path=None):
                                % (name, name, name))
     core_structs = [n for n in sorted(unit.core_concrete)
                     if n in unit.structs and n not in local_set]
-    for name in core_structs + mod_structs + local["structs"]:
+    demand_structs = [n for n in unit.demand_structs
+                      if n not in local_set and n not in mod_structs]
+    # Deduplicated: a name can now reach this list from more than one seeder
+    # -- the bundled core, a `mod` sibling, a `use` followed on demand -- and
+    # C rejects a repeated `typedef struct X X;` outright rather than treating
+    # an identical redefinition as harmless.
+    for name in dict.fromkeys(core_structs + mod_structs + demand_structs
+                              + local["structs"]):
         prelude.append("struct %s; typedef struct %s %s;"
                        % (name, name, name))
     # Slice structs hold only a pointer to their element, so the forward
@@ -5475,11 +5741,16 @@ def translate(code, path=None):
             prelude.append("struct %s; typedef struct %s %s;"
                            % (name, name, name))
     for name in _toposort_structs(
-            unit, core_structs + mod_structs + local["structs"]
+            unit, core_structs + mod_structs + demand_structs
+            + local["structs"]
             + unit.struct_order):
         prelude.append(_render_struct(name, unit.structs[name]))
     # Aliases after structs so `type Handle = Foo` can name a local struct.
-    for name in mod_aliases + local["type_aliases"]:
+    demand_aliases = [n for n in unit.demand_aliases
+                      if n not in local_set and n not in mod_aliases
+                      and n in unit.type_aliases]
+    for name in dict.fromkeys(mod_aliases + demand_aliases
+                              + local["type_aliases"]):
         prelude.append("typedef %s;" % unit.type_aliases[name].decl(name))
     for name in sorted(unit.unwraps):
         if name in unit.options:
