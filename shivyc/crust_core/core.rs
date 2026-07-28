@@ -651,6 +651,145 @@ impl<T> MutexGuard<T> {
 }
 
 // ---------------------------------------------------------------------------
+// MaybeUninit<T> -- storage without a value in it yet.
+//
+// Faithful in the only way that matters here: in real Rust this is a union
+// whose job is to tell the compiler not to assume the contents are
+// initialised. Crust makes no such assumption about anything, so the wrapper
+// carries the same information it does there -- none. `assume_init` is a
+// read, and it is exactly as unchecked here as it is in Rust.
+// ---------------------------------------------------------------------------
+struct MaybeUninit<T> {
+    value: T,
+}
+
+impl<T> MaybeUninit<T> {
+    fn new(value: T) -> MaybeUninit<T> {
+        MaybeUninit { value: value }
+    }
+
+    fn write(&mut self, value: T) {
+        self.value = value;
+    }
+
+    fn assume_init(&self) -> T {
+        self.value
+    }
+
+    fn as_ptr(&self) -> *mut T {
+        &self.value as *mut T
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VecDeque<T> -- a double-ended queue over a ring buffer.
+//
+// Grows by doubling like `Vec<T>`, and like `Vec<T>` it has no `Drop`, so the
+// buffer is released by an explicit `free_buf`. `pop_front` on an empty deque
+// is undefined rather than returning an `Option`, which matches how the rest
+// of this core treats out-of-range access.
+// ---------------------------------------------------------------------------
+struct VecDeque<T> {
+    ptr: *mut T,
+    head: usize,
+    len: usize,
+    cap: usize,
+}
+
+impl<T> VecDeque<T> {
+    fn new() -> VecDeque<T> {
+        VecDeque { ptr: 0 as *mut T, head: 0, len: 0, cap: 0 }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn capacity(&self) -> usize {
+        self.cap
+    }
+
+    fn get(&self, i: usize) -> T {
+        self.ptr[(self.head + i) % self.cap]
+    }
+
+    // Growing a ring buffer means unrolling it: the elements are copied out
+    // in logical order so the new buffer starts at zero again.
+    fn reserve(&mut self, want: usize) {
+        if want <= self.cap {
+            return;
+        }
+        let mut cap: usize = self.cap;
+        if cap == 0 {
+            cap = 4;
+        }
+        while cap < want {
+            cap = cap * 2;
+        }
+        let fresh: *mut T = malloc(cap * size_of::<T>()) as *mut T;
+        for i in 0..self.len {
+            fresh[i] = self.ptr[(self.head + i) % self.cap];
+        }
+        if self.cap > 0 {
+            free(self.ptr as *mut u8);
+        }
+        self.ptr = fresh;
+        self.head = 0;
+        self.cap = cap;
+    }
+
+    fn push_back(&mut self, value: T) {
+        self.reserve(self.len + 1);
+        self.ptr[(self.head + self.len) % self.cap] = value;
+        self.len += 1;
+    }
+
+    fn push_front(&mut self, value: T) {
+        self.reserve(self.len + 1);
+        self.head = (self.head + self.cap - 1) % self.cap;
+        self.ptr[self.head] = value;
+        self.len += 1;
+    }
+
+    fn pop_front(&mut self) -> T {
+        let v: T = self.ptr[self.head];
+        self.head = (self.head + 1) % self.cap;
+        self.len -= 1;
+        v
+    }
+
+    fn pop_back(&mut self) -> T {
+        self.len -= 1;
+        self.ptr[(self.head + self.len) % self.cap]
+    }
+
+    fn front(&self) -> T {
+        self.ptr[self.head]
+    }
+
+    fn back(&self) -> T {
+        self.ptr[(self.head + self.len - 1) % self.cap]
+    }
+
+    fn clear(&mut self) {
+        self.head = 0;
+        self.len = 0;
+    }
+
+    fn free_buf(&mut self) {
+        free(self.ptr as *mut u8);
+        self.ptr = 0 as *mut T;
+        self.head = 0;
+        self.len = 0;
+        self.cap = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PhantomData<T> -- a zero-sized marker. Real Rust uses it to tie a type
 // parameter to a struct that does not otherwise mention it; here it exists so
 // that such a struct still parses. It lowers to the same one-byte placeholder
