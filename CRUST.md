@@ -1019,6 +1019,53 @@ Overflow arguments are now pushed again at the top, where a standard callee
 looks for them. `tools/crustfuzz.py --family vararg_overflow` covers one
 through nine arguments.
 
+## Linkage of bundled core types
+
+A bundled core type is emitted into **every** translation unit that names it,
+so its methods have internal linkage. Without that, two such units collide at
+link time — and worse, a crate with its own type of the same name collides
+with the bundled one. relibc has its own `String`, and linking CrustOS against
+it failed with `duplicate symbol String_as_ptr`.
+
+Within a single unit the local definition correctly wins, so the collision is
+invisible until two units are linked together. That is what made it hard to
+see: every test in the suite compiled exactly one translation unit, so the
+output was verified correct in each unit *individually* while the pair failed
+to link.
+
+`tests/test_crust.py` now has a `_run_units` helper that compiles several
+units separately and links them, with tests covering both emission paths --
+concrete core types and instantiations of core generics. Each fails if its
+half of the fix is reverted, which is the only way to know a regression test
+tests anything.
+
+Two details worth recording. A core `impl` block arrives as **one blob**
+holding all of its methods, so prefixing the string only reaches the first
+definition — `String_new` became `static` while `String_push` stayed external.
+Each definition has to be prefixed individually. And the same applies to
+instantiations of a core *generic*: `Vec_int_new` is emitted in every unit
+that uses `Vec<i32>`. A **user's** generic keeps external linkage, since its
+instantiations are part of that unit's linkage surface.
+
+## `format!`
+
+Renders into a fresh `String`, sized with the standard C idiom: `snprintf` with
+a NULL destination reports how many characters the result *would* take, so the
+buffer is reserved once at exactly the right size and written once — no guess,
+no grow-and-retry.
+
+```rust
+let s: String = format!("n={} f={:.1} s={}", 7, 2.5, "hi");   // "n=7 f=2.5 s=hi"
+```
+
+Conversions come from the argument types, exactly as `println!`'s do. The
+result **owns its buffer**, and since there is no `Drop` the caller must
+`free_buf()` it — the same contract every allocating type in the bundled core
+has, and the honest one when scope exit cannot run code.
+
+`format!("")` allocates rather than leaving the buffer null, so `as_ptr()`
+always returns a usable C string instead of printing `(null)`.
+
 ## `String`
 
 A growable, always NUL-terminated character buffer, so `as_ptr()` hands C

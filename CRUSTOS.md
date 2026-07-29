@@ -30,6 +30,7 @@ CrustOS
   [2] Context { pid: 2, prio: 1, ticks: 12, frames: 5 }
   Frames { free: 495, used: 17 }
   <no such pid 99>
+  frames 17/512 used, 3 contexts
   read(0,64)   : 64
   close(0)     : 0
   bad fd       : -1
