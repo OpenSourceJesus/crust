@@ -130,12 +130,12 @@ def _py2c_stamp():
 
 def cache_key(text):
     """The cache key for an rpython module with the given source text."""
-    h = hashlib.sha256()
-    h.update(text.encode("utf-8"))
-    h.update(b"\0")
-    h.update(_py2c_stamp().encode("ascii"))
-    h.update(b"\0v1")
-    return h.hexdigest()[:32]
+    # One shot over the concatenation rather than four `update` calls. The
+    # digest is identical -- SHA-256 of the same byte sequence -- and this
+    # module is itself transpiled when ShivyCX self-hosts, where py2c supports
+    # the one-shot form but not a stateful hasher.
+    blob = text + "\0" + _py2c_stamp() + "\0v1"
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:32]
 
 
 # Identifiers that only exist if the module leans on the transpiler runtime.
