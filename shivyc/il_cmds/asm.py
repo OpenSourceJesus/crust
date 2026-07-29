@@ -84,6 +84,10 @@ class InlineAsm(ILCommand):
         # memory output (`=m`), which is consumed to locate the store.
         ins = [v for _, v in self.in_ops]
         ins += [v for c, v in self.out_ops if "m" in c]
+        # A read-write register operand (`+r`) is read as well as written, so
+        # it must be listed here or the allocator treats it as dead on entry
+        # and drops the move that gave it its starting value.
+        ins += [v for c, v in self.out_ops if "m" not in c and "+" in c]
         return ins
 
     def outputs(self):
@@ -284,6 +288,12 @@ class InlineAsm(ILCommand):
                 pre_moves.append((spot, spotmap[v], size))
             else:
                 # Register output: copy the result back to its lvalue after.
+                # A read-write operand (`+r`) also has to be *loaded* first --
+                # it is an input too. Without the pre-move the asm operated on
+                # whatever the allocator left in the register, so
+                # `addl $37, %0` on a variable holding 5 produced an address.
+                if "+" in c:
+                    pre_moves.append((spot, spotmap[v], size))
                 post_moves.append((spotmap[v], spot, size))
 
         self._emit_parallel(pre_moves, asm_code)
