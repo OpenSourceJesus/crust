@@ -3885,3 +3885,59 @@ int main(void) {
     return many((PyList_int *)&zero) - 58;
 }
 """, extra={"b.py": self.LIST}), 42)
+
+
+class TestInlineAsmReadWrite(unittest.TestCase):
+    """Read-write inline asm operands (`+r`, `+m`).
+
+    A register output was given a fresh temporary that nothing initialised, so
+    a `+` operand -- an *input* as well as an output -- operated on whatever
+    the allocator had left in the register.
+
+    The shape matters: a lone `asm` in a tiny function passes either way,
+    because the allocator happens to leave the value where the asm reads it.
+    The bug needs enough surrounding code to make those disagree, which is why
+    these tests run several operations and observe the results together. A
+    minimal repro was checked against the unfixed compiler and did *not* fail.
+    """
+
+    def test_read_write_among_other_operations(self):
+        self.assertEqual(_run("""
+int printf(const char *, ...);
+int main(void) {
+    int x = 5;
+    __asm__ volatile ("addl $37, %0" : "+r"(x));
+    int y = 0;
+    __asm__ volatile ("movl $42, %0" : "=r"(y));
+    __asm__ volatile ("nop");
+    printf("%d %d\\n", x, y);
+    return x;
+}
+"""), 42)
+
+    def test_read_write_with_a_separate_input(self):
+        self.assertEqual(_run("""
+int printf(const char *, ...);
+int main(void) {
+    long a = 5, b = 37, r = 0;
+    __asm__ volatile ("addq %1, %0" : "+r"(a) : "r"(b));
+    __asm__ volatile ("movq %1, %0" : "=r"(r) : "r"(b));
+    long c1 = 20, c2 = 22;
+    __asm__ volatile ("addq %1, %0" : "+r"(c1) : "r"(c2) : "cc");
+    long m = 40;
+    __asm__ volatile ("addq $2, %0" : "+m"(m));
+    printf("%ld %ld %ld %ld\\n", a, r, c1, m);
+    return (int)(a == 42 && r == 37 && c1 == 42 && m == 42) * 42;
+}
+"""), 42)
+
+    def test_write_only_still_works(self):
+        self.assertEqual(_run("""
+int main(void) { int y = 0; __asm__ volatile ("movl $42, %0" : "=r"(y));
+                 return y; }
+"""), 42)
+
+    def test_bare_instruction(self):
+        self.assertEqual(_run("""
+int main(void) { __asm__ volatile ("nop"); return 42; }
+"""), 42)
