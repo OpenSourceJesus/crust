@@ -57,6 +57,13 @@ EXAMPLES = [
      "widest = 3\n"
      "len2   = 25\n", True),
 
+    ("twoway.c", 0,
+     "primes    = 10\n"
+     "sum       = 129\n"
+     "dropped   = 1\n"
+     "odd count = 9\n"
+     "odd sum   = 127\n", True),
+
     ("small_os.c", 0,
      "schemes    = 4\n"
      "routed     = 4 of 5 accepted\n"
