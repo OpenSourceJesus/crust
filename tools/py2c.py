@@ -3583,10 +3583,10 @@ def ambiguous_class_names(base_dir):
     name2mods = {}
     pkg = os.path.join(base_dir or ".", "shivyc")
     pkg_abs = os.path.abspath(pkg)
-    for dp, _dirs, fns in os.walk(pkg):
+    for dp, _dirs, fns in sorted(os.walk(pkg)):
         if "musl" in dp.split(os.sep):
             continue
-        for fn in fns:
+        for fn in sorted(fns):
             if not fn.endswith(".py"):
                 continue
             p = os.path.join(dp, fn)
@@ -3720,10 +3720,10 @@ def project_class_hierarchy(base_dir):
 
     pkg = os.path.join(base_dir or ".", "shivyc")
     pkg_abs = os.path.abspath(pkg)
-    for dp, _dirs, fns in os.walk(pkg):
+    for dp, _dirs, fns in sorted(os.walk(pkg)):
         if "musl" in dp.split(os.sep):
             continue
-        for fn in fns:
+        for fn in sorted(fns):
             if not fn.endswith(".py"):
                 continue
             p = os.path.join(dp, fn)
@@ -4769,8 +4769,13 @@ class Transpiler:
         # same name would shadow the bare extern in C (and break an inlined
         # default arg that references the global, e.g. token_kinds.open_paren).
         self._shadow_names = set()
-        for modname in set(self.import_alias.values()) | \
-                set(self.from_imports.values()):
+        # Sorted: `setdefault` below means the *first* module visited claims a
+        # class name. Iterating a set of module names let that winner vary per
+        # process, so a class defined in two modules bound differently between
+        # builds -- lowering a field read to a struct offset in one build and a
+        # generic `mp_getattr` in the next. Same source, two programs.
+        for modname in sorted(set(self.import_alias.values()) |
+                              set(self.from_imports.values())):
             reg = self.load_xmod(modname)
             if reg:
                 self._shadow_names |= set(reg.get("singletons", {})) | \
@@ -5015,7 +5020,10 @@ class Transpiler:
                 out.append("    unsigned int %s : %d;"
                            % (self.fnsym(fn), bf[fn]))
             else:
-                out.append("    %s %s;" % (ft, self.fnsym(fn)))
+                # Same emit-time qualification: a field typed by a class
+                # arrives as a bare `Class*`.
+                out.append("    %s %s;"
+                           % (self._qualify_class_ctype(ft), self.fnsym(fn)))
         out.append("};")
         return out
 
@@ -5026,10 +5034,14 @@ class Transpiler:
         whose defining module was never directly imported here."""
         if cls in self.xclasses or cls in self.classes:
             return cls in self.xclasses
-        roots = set(self.import_alias.values()) | set(self.from_imports.values())
+        # Sorted and consumed front-to-back: this is a *first match wins*
+        # search, so traversal order picks the winner when a class name is
+        # defined in more than one reachable module.
+        roots = sorted(set(self.import_alias.values())
+                       | set(self.from_imports.values()))
         seen, work = set(), list(roots)
         while work:
-            mod = work.pop()
+            mod = work.pop(0)
             if mod in seen:
                 continue
             seen.add(mod)
@@ -5043,7 +5055,7 @@ class Transpiler:
                     self.xclasses.setdefault(bn, (bci, src))
                     self.xclass_module.setdefault(bn, src)
                 return True
-            work += list(reg["imports"].values())
+            work += sorted(reg["imports"].values())
         # Fallback: the class's defining module is not reachable through this
         # module's import graph (the graph is directional -- e.g. il_cmds never
         # imports asm_gen, though asm_gen imports il_cmds). Resolve it through
@@ -5345,6 +5357,10 @@ class Transpiler:
             self.emit("/* module-level globals (init in %s_init) */"
                       % self.modname)
             for name, ctype, kind, val in self.mod_globals:
+                # `VOID: CType` emitted `CType* VOID;` while the struct was
+                # `crust__CType`; every later field access on one then failed
+                # as "member in something not a structure".
+                ctype = self._qualify_class_ctype(ctype)
                 # A leading underscore marks a module-private global (Python
                 # convention); give it `static` linkage so identically-named
                 # privates in different modules (e.g. a compiled-regex `_NAME_RE`)
@@ -5366,6 +5382,29 @@ class Transpiler:
             for ci, nm in statics:
                 self.emit("obj %s_%s;" % (ci.csym, cname(nm)))
             self.emit()
+
+    def _qualify_class_ctype(self, ctype):
+        """Map a bare `Class*` C type onto that class's emitted struct name.
+
+        The annotation resolver deliberately keeps a class reference as a bare
+        `Class*` so ClassInfo lookup keeps working, and expects emit-time csym
+        qualification. Function signatures did that; module globals and struct
+        fields did not.
+        """
+        if not ctype or not ctype.endswith("*"):
+            return ctype
+        bare = ctype[:-1].strip()
+        ci = self.classes.get(bare)
+        if ci is None:
+            # An *imported* class arrives the same way: `asm_gen` has a field
+            # typed `CType`, which lives in `ctypes` and is emitted as
+            # `ctypes__CType`.
+            x = self.xclasses.get(bare)
+            if x is not None:
+                ci = x[0] if isinstance(x, tuple) else x
+        if ci is not None and getattr(ci, "csym", None):
+            return ci.csym + "*"
+        return ctype
 
     def func_signature(self, node):
         ret = self._ret_ctype(node.returns)
@@ -9203,6 +9242,17 @@ class Transpiler:
 
     def value_ctype(self, node):
         """Best-effort C type of an expression, when determinable."""
+        # `x.count(y)` lowers to `list_count`, which returns `long`. Without
+        # this the target is inferred `obj` and the assignment is rejected --
+        # "incompatible types when assigning to type 'obj' from type 'long
+        # int'". The helper takes a boxed receiver, so this is only about the
+        # result type. `index` is deliberately excluded: `list_index` returns
+        # `obj`, and typing it `long` traded one error for another.
+        if isinstance(node, ast.Call) and len(node.args) == 1 \
+                and isinstance(node.func, ast.Attribute) \
+                and node.func.attr == "count" \
+                and node.func.attr not in self.method_owners:
+            return "long"
         if isinstance(node, ast.Call):
             _jm = self._match_json_decode(node)
             if _jm is not None:
