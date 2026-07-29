@@ -124,6 +124,15 @@ class InlineAsm(CNode):
                 out_ops.append((constraint, lval.addr(il_code)))
             else:
                 tmp = ILValue(lval.ctype())
+                if "+" in constraint:
+                    # A read-write operand (`+r`) is an input as well as an
+                    # output, so the temporary standing in for it has to start
+                    # holding the operand's current value. Without this the
+                    # asm read whatever the allocator left in the register:
+                    # `__asm__("addl $37, %0" : "+r"(x))` with x == 5 produced
+                    # an address rather than 42.
+                    import shivyc.il_cmds.value as value_cmds_il
+                    il_code.add(value_cmds_il.Set(tmp, lval.val(il_code)))
                 out_ops.append((constraint, tmp))
                 out_lvalues.append((lval, tmp))
 
