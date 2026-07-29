@@ -540,6 +540,7 @@ class Unit:
         self.macros = {}            # macro_rules! name -> [(pattern, body)]
         self.closure_n = 0          # lifted-closure counter
         self.statics = set()        # fns with internal linkage
+        self.static_prefixes = set()  # core type method prefixes
 
     def result_type(self, ok, err):
         """Return (and register) the tagged struct for `Result<ok, err>`."""
@@ -1141,7 +1142,16 @@ class Parser:
             p = Parser(list(toks), self.unit, sub)
             out = Out(1)
             p.parse_impl(out, owner_override=mangled)
-            self.unit.emitted.append(out.text())
+            text = out.text()
+            if name in self.unit.core_names:
+                # A bundled container is instantiated in every unit that uses
+                # it, so `Vec_int_new` would be defined in each of them.
+                # Internal linkage, for the same reason the concrete core
+                # types get it. A *user's* generic keeps external linkage:
+                # its instantiations are part of the unit's linkage surface.
+                text = _internalise(text)
+                self.unit.static_prefixes.add(mangled + "_")
+            self.unit.emitted.append(text)
 
     def instantiate_fn(self, name, args):
         """Monomorphise a generic `fn`; return its concrete mangled name."""
@@ -1403,6 +1413,42 @@ class Parser:
             "else { %s += %s; }"
             % (n, call, n, over, n, room, ln, cap, cap, over, ln, n))
         return Expr("0", INT)
+
+    def m_format(self, args, line):
+        """`format!("..", ..)` -- render into a fresh `String`.
+
+        Sized with the standard C idiom: `snprintf` with a NULL destination
+        reports how many characters the result *would* take, so the buffer is
+        reserved once at exactly the right size and written once. That avoids
+        both a guess and a grow-and-retry loop.
+
+        The result owns its buffer and there is no `Drop`, so the caller must
+        `free_buf()` it. That is the same contract every other allocating type
+        in the bundled core has, and it is the honest one when scope exit
+        cannot run code.
+        """
+        if not args:
+            fmt, rest = '""', []
+        else:
+            fmt, rest = self._format_string(args[0], line), args[1:]
+        vals = [self.sub_expr(a) for a in rest]
+        spec = _rust_format_to_c(fmt, [v.type for v in vals], False)
+        self.unit.needs.add("snprintf")
+        ensure_core_concrete(self.unit, "String")
+        arglist = "".join(", " + v.code for v in vals)
+        out = self.new_temp()
+        n = self.new_temp()
+        self.pending.append(
+            "String %s = String_new(); "
+            "int %s = snprintf(0, 0, %s%s); "
+            "if (%s >= 0) { String_reserve(&%s, (long)%s); "
+            "snprintf(%s.buf, (unsigned long)%s + 1, %s%s); "
+            "%s.len = (long)%s; }"
+            % (out, n, spec, arglist,
+               n, out, n,
+               out, n, spec, arglist,
+               out, n))
+        return Expr(out, CType("String"))
 
     def m_vec(self, args, line):
         """`vec![a, b, c]` -- build a bundled `Vec<T>` from the elements.
@@ -3569,6 +3615,7 @@ _BUILTIN_MACROS = {
     "eprintln": lambda p, a, l: Parser.m_print(p, a, l, True, "stderr"),
     "write": lambda p, a, l: Parser.m_write(p, a, l, False),
     "writeln": lambda p, a, l: Parser.m_write(p, a, l, True),
+    "format": Parser.m_format,
     "vec": Parser.m_vec,
     "cfg": Parser.m_cfg,
     "matches": Parser.m_matches,
@@ -5071,6 +5118,22 @@ def core_templates():
     return (unit.generic_structs, unit.generic_impls)
 
 
+_DEF_START = re.compile(
+    r"^(?!static\b)([A-Za-z_][\w ]*[\w*]\s+\**[A-Za-z_]\w*\s*\([^;]*\)\s*\{)",
+    re.M)
+
+
+def _internalise(text):
+    """Give every function definition in `text` internal linkage.
+
+    A core `impl` block arrives as one blob holding all of its methods, so
+    prefixing the whole string only reaches the first definition -- which is
+    how `String_new` became `static` while `String_push` stayed external and
+    collided at link time.
+    """
+    return _DEF_START.sub(r"static \1", text)
+
+
 def ensure_core_concrete(unit, name):
     """Pull a non-generic core type (`AtomicU32`, `Ordering`, …) into `unit`.
 
@@ -5110,7 +5173,14 @@ def ensure_core_concrete(unit, name):
     prefix = name + "_"
     for text in core.emitted:
         if prefix in text and text not in unit.emitted:
+            # `static`: a bundled core type is emitted into *every* unit that
+            # names it, so external linkage means two such units collide at
+            # link time. Worse, a crate with its own type of the same name --
+            # relibc has its own `String` -- collides with the bundled one
+            # even though within a single unit the local definition wins.
+            text = _internalise(text)
             unit.emitted.append(text)
+            unit.static_prefixes.add(prefix)
             # A concrete core type can allocate too -- `String` grows with
             # `realloc` -- and only the *generic* ones were asking for the
             # libc prototypes. Read it off the bodies actually copied rather
@@ -5898,8 +5968,11 @@ def translate(code, path=None):
     for name, (ret, ps) in unit.fn_sigs.items():
         if name == "main" or name in included_fns:
             continue
+        is_static = (name in unit.statics
+                     or any(name.startswith(pre)
+                            for pre in unit.static_prefixes))
         prelude.append("%s%s(%s);"
-                       % ("static " if name in unit.statics else "",
+                       % ("static " if is_static else "",
                           ret.decl(name),
                           ", ".join(t.decl() for t in ps) if ps else "void"))
     if unit.emitted:
