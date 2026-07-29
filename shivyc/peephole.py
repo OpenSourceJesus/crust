@@ -78,10 +78,21 @@ def _lit(il_code, v):
 
 
 def _pow2_shift(n):
-    """`k` if `n` is 2**k with k >= 1, else None."""
+    """`k` if `n` is 2**k with k >= 1, else None.
+
+    Counted with a shift loop rather than `int.bit_length()`: this module is
+    itself transpiled by py2c when ShivyCX self-hosts, and `bit_length` is not
+    a method py2c knows. It passed through undeclared, so C assumed an `int`
+    return and the surrounding arithmetic failed to compile.
+    """
     if n is None or n < 2 or (n & (n - 1)) != 0:
         return None
-    return n.bit_length() - 1
+    k = 0
+    v = n
+    while v > 1:
+        v >>= 1
+        k += 1
+    return k
 
 
 def strength_reduce_divmod(commands, il_code):

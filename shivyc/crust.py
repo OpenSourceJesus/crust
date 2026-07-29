@@ -85,7 +85,7 @@ PRIMITIVES["i128"] = "crust_i128"
 PRIMITIVES.update(_FFI_PRIMITIVES)
 
 
-class CType:
+class RustCType:
     """A C type split into a base specifier and a declarator shape."""
 
     def __init__(self, base, ptr=0, array=None):
@@ -110,17 +110,17 @@ class CType:
         return self.base in ("float", "double") and not self.ptr
 
     def __repr__(self):                            # pragma: no cover
-        return "CType(%s)" % self.decl()
+        return "RustCType(%s)" % self.decl()
 
 
-VOID = CType("void")
+VOID = RustCType("void")
 
 # Names the prelude may declare via `unit.needs`; never emit a conflicting
 # `extern` for these when core templates call them.
 _PRELUDE_LIBC = frozenset({
     "malloc", "realloc", "free", "strlen", "abort", "printf", "fprintf",
 })
-INT = CType("int")
+INT = RustCType("int")
 
 
 # --------------------------------------------------------------------------
@@ -146,7 +146,7 @@ _NUM_SUFFIX = re.compile(r"(?:i8|i16|i32|i64|isize|u8|u16|u32|u64|usize"
                          r"|f32|f64)$")
 
 
-class Token:
+class RustToken:
     __slots__ = ("kind", "val", "line")
 
     def __init__(self, kind, val, line):
@@ -199,7 +199,7 @@ def tokenize(src, line0=1):
             while j < n and (src[j].isalnum() or src[j] == "_"):
                 j += 1
             word = src[i:j]
-            toks.append(Token("kw" if word in KEYWORDS else "ident",
+            toks.append(RustToken("kw" if word in KEYWORDS else "ident",
                               word, line))
             i = j
             continue
@@ -220,7 +220,7 @@ def tokenize(src, line0=1):
                         j += 1
                 while j < n and (src[j].isalnum() or src[j] == "_"):
                     j += 1
-            toks.append(Token("num", src[i:j], line))
+            toks.append(RustToken("num", src[i:j], line))
             i = j
             continue
         # strings
@@ -238,7 +238,7 @@ def tokenize(src, line0=1):
             if j >= n:
                 raise CrustError("line %d: unterminated string" % line)
             buf.append('"')
-            toks.append(Token("str", "".join(buf), line))
+            toks.append(RustToken("str", "".join(buf), line))
             i = j + 1
             continue
         # chars (Rust lifetimes are not supported, so `'` is always a literal)
@@ -275,17 +275,17 @@ def tokenize(src, line0=1):
             if j >= n:
                 raise CrustError("line %d: unterminated char literal" % line)
             buf.append("'")
-            toks.append(Token("chr", "".join(buf), line))
+            toks.append(RustToken("chr", "".join(buf), line))
             i = j + 1
             continue
         for p in PUNCT:
             if src.startswith(p, i):
-                toks.append(Token("punc", p, line))
+                toks.append(RustToken("punc", p, line))
                 i += len(p)
                 break
         else:
             raise CrustError("line %d: unexpected character %r" % (line, c))
-    toks.append(Token("eof", "", line))
+    toks.append(RustToken("eof", "", line))
     return toks
 
 
@@ -470,30 +470,30 @@ class Unit:
     """
 
     def __init__(self):
-        self.fn_sigs = {}       # name -> (CType ret, [CType] params)
-        self.structs = {}       # name -> [(field, CType)]
+        self.fn_sigs = {}       # name -> (RustCType ret, [RustCType] params)
+        self.structs = {}       # name -> [(field, RustCType)]
         self.methods = {}       # (type name, method name) -> MethodInfo
         self.enums = {}         # name -> [(variant, explicit value or None)]
-        self.data_enums = {}    # enum -> {variant: [(field|None, CType)]}
+        self.data_enums = {}    # enum -> {variant: [(field|None, RustCType)]}
         self.result_error = None  # error type of a `Result<T>` alias
         self.derives = {}       # type name -> [derived trait names]
         self.variants = {}      # mangled variant name -> enum name
         self.tuple_structs = set()   # struct names declared in tuple form
         self.unit_structs = set()    # struct names declared as `struct S;`
-        self.consts = {}        # const/static name -> CType
+        self.consts = {}        # const/static name -> RustCType
         self.const_values = {}  # const name -> initializer text
         self.const_inits = {}   # name -> (kw, init text) for prelude render
-        self.type_aliases = {}  # name -> CType (fully resolved)
+        self.type_aliases = {}  # name -> RustCType (fully resolved)
         self.opaque_structs = set()  # path types with no definition in unit
         # Opaque names that appear by value (struct fields, returns) need a
         # one-byte placeholder body; pointer-only opaques stay incomplete.
         self.opaque_complete = set()
-        self.extern_fns = {}    # name -> (ret CType|None, [arg CType|None])
+        self.extern_fns = {}    # name -> (ret RustCType|None, [arg RustCType|None])
         self.needs = set()      # libc prototypes the lowering requires
-        self.slices = {}        # slice struct name -> element CType
+        self.slices = {}        # slice struct name -> element RustCType
         self.tuples = {}        # tuple struct name -> [element CTypes]
         self.fn_ptrs = {}       # fn-pointer typedef -> (ret, params)
-        self.options = {}       # Option struct name -> element CType
+        self.options = {}       # Option struct name -> element RustCType
         self.results = {}       # Result struct name -> (ok, err) CTypes
         self.unwraps = set()    # generated types needing unwrap helpers
         # Generics are monomorphised, exactly like Option/Result and like
@@ -505,7 +505,7 @@ class Unit:
         self.generic_structs = {}   # name -> (params, tokens)
         self.generic_fns = {}       # name -> (params, tokens)
         self.generic_impls = []     # (params, type name, tokens)
-        self.instances = {}         # mangled -> (name, [CType])
+        self.instances = {}         # mangled -> (name, [RustCType])
         self.emitted = []           # generated C, appended after the unit
         self.struct_order = []      # instantiated structs, in creation order
         self.emitting = set()       # guards against recursive instantiation
@@ -520,10 +520,10 @@ class Unit:
         self.supertraits = {}       # trait -> [trait names]
         self.trait_impls = []       # (trait, owner, tokens)
         self.const_defaults = {}    # trait -> {const: tokens}
-        # Associated types: (owner type, name) -> CType. An associated type is
+        # Associated types: (owner type, name) -> RustCType. An associated type is
         # a type alias attached to an impl, so it resolves at monomorphisation
         # exactly as an associated const does.
-        self.assoc_types = {}       # (owner, name) -> CType
+        self.assoc_types = {}       # (owner, name) -> RustCType
         # Demand-driven seeding: name -> the module its `use` names, plus the
         # path of the file being compiled so those modules can be resolved.
         self.imports = {}
@@ -547,12 +547,12 @@ class Unit:
         name = "crust_result_%s_e_%s" % (_mangle(ok), _mangle(err))
         if name not in self.results:
             self.results[name] = (ok, err)
-            fields = [("ok", CType("_Bool"))]
+            fields = [("ok", RustCType("_Bool"))]
             if not ok.is_void():
                 fields.append(("value", ok))
             fields.append(("error", err))
             self.structs[name] = fields
-        return CType(name)
+        return RustCType(name)
 
     def option_type(self, elem):
         """Return (and register) the tagged struct for `Option<elem>`.
@@ -563,9 +563,9 @@ class Unit:
         name = "crust_option_" + _mangle(elem)
         if name not in self.options:
             self.options[name] = elem
-            self.structs[name] = [("some", CType("_Bool")),
+            self.structs[name] = [("some", RustCType("_Bool")),
                                   ("value", elem)]
-        return CType(name)
+        return RustCType(name)
 
     def fn_ptr_type(self, ret, params):
         """Return (and register) a typedef for a function-pointer type."""
@@ -574,7 +574,7 @@ class Unit:
                                    or "void")
         if name not in self.fn_ptrs:
             self.fn_ptrs[name] = (ret, params)
-        return CType(name)
+        return RustCType(name)
 
     def tuple_type(self, elems):
         """Return (and register) the struct for a tuple type `(A, B, ..)`.
@@ -587,16 +587,16 @@ class Unit:
         if name not in self.tuples:
             self.tuples[name] = elems
             self.structs[name] = [("_%d" % i, e) for i, e in enumerate(elems)]
-        return CType(name)
+        return RustCType(name)
 
     def slice_type(self, elem):
         """Return (and register) the fat-pointer struct type for `&[elem]`."""
         name = "crust_slice_" + _mangle(elem)
         if name not in self.slices:
             self.slices[name] = elem
-            self.structs[name] = [("ptr", CType(elem.base, elem.ptr + 1)),
-                                  ("len", CType("unsigned long"))]
-        return CType(name)
+            self.structs[name] = [("ptr", RustCType(elem.base, elem.ptr + 1)),
+                                  ("len", RustCType("unsigned long"))]
+        return RustCType(name)
 
     def field_type(self, struct_name, field):
         for fname, ftype in self.structs.get(struct_name, ()):
@@ -639,7 +639,7 @@ class Parser:
         self.toks = toks
         self.i = 0
         # Bindings for the enclosing generic item's type parameters. Empty for
-        # ordinary code; `{"T": CType("int")}` while an instantiation is being
+        # ordinary code; `{"T": RustCType("int")}` while an instantiation is being
         # generated. Substitution happens in parse_type, so every other part
         # of the parser is reused unchanged.
         self.tysubst = tysubst or {}
@@ -648,7 +648,7 @@ class Parser:
         self.item_derives = []       # traits on the item being parsed
         self.unit = unit or Unit()
         self.fn_sigs = self.unit.fn_sigs
-        self.scopes = [{}]              # name -> CType
+        self.scopes = [{}]              # name -> RustCType
         self.ret_type = VOID
         self.impl_type = None           # enclosing `impl` type name, if any
         self.no_struct_lit = 0          # >0 while parsing a condition
@@ -698,7 +698,7 @@ class Parser:
         A `>>` is one token, so a nested `Option<Option<T>>` splits it.
         """
         if self.at(">>", "punc"):
-            self.toks[self.i] = Token("punc", ">", self.cur.line)
+            self.toks[self.i] = RustToken("punc", ">", self.cur.line)
             return
         self.expect(">")
 
@@ -768,11 +768,11 @@ class Parser:
             # of saying that is a function that returns nothing and is never
             # reached past the call.
             self.next()
-            return CType("void")
+            return RustCType("void")
         if t.val == "(" and self.peek().val == ")":
             self.next()
             self.next()
-            return CType("void")
+            return RustCType("void")
         if t.val == "(" and t.kind == "punc":
             # A tuple type. `(T)` is just a parenthesised T, as in Rust.
             self.next()
@@ -791,7 +791,7 @@ class Parser:
                 raise CrustError("line %d: raw pointer needs `const` or `mut`"
                                  % t.line)
             inner = self.parse_type()
-            return CType(inner.base, inner.ptr + 1)
+            return RustCType(inner.base, inner.ptr + 1)
         if t.val == "&":
             self.next()
             self.accept("mut")
@@ -805,7 +805,7 @@ class Parser:
                 inner = self.parse_type()
             finally:
                 self.behind_ref -= 1
-            return CType(inner.base, inner.ptr + 1)
+            return RustCType(inner.base, inner.ptr + 1)
         if t.val == "[":
             self.next()
             inner = self.parse_type()
@@ -813,7 +813,7 @@ class Parser:
             size = self.parse_expr()
             self.expect("]")
             dims = (inner.array or []) + [size.code]
-            return CType(inner.base, inner.ptr, dims)
+            return RustCType(inner.base, inner.ptr, dims)
         if t.kind in ("ident", "kw"):
             name = self.next().val
             was_path = False
@@ -856,16 +856,16 @@ class Parser:
             if name in PRIMITIVES:
                 if name == "str" and not self.behind_ref:
                     self.err("`str` is unsized; write `&str`")
-                return CType(PRIMITIVES[name])
+                return RustCType(PRIMITIVES[name])
             if name in self.unit.type_aliases:
                 return self.unit.type_aliases[name]
             # Concrete bundled types (atomics, Ordering) -- pull on demand.
             ensure_core_concrete(self.unit, name)
             if name in self.unit.enums and not self.at("<", "punc"):
-                return CType(name)
+                return RustCType(name)
             if name in self.unit.structs and not self.at("<", "punc") \
                     and name not in self.unit.generic_structs:
-                return CType(name)
+                return RustCType(name)
             if name == "Result":
                 self.expect("<")
                 ok = self.parse_type()
@@ -879,7 +879,7 @@ class Parser:
                     # does exactly that. If this unit declares such an alias,
                     # its error type is used; otherwise the crate-wide
                     # convention of a plain integer error code applies.
-                    err = self.unit.result_error or CType("int")
+                    err = self.unit.result_error or RustCType("int")
                 self.expect_gt()
                 if err.is_void():
                     self.err("`Result<_, ()>` is not supported")
@@ -903,7 +903,7 @@ class Parser:
                         and self.impl_type not in self.unit.enums
                         and self.impl_type not in self.unit.type_aliases):
                     self.unit.opaque_structs.add(self.impl_type)
-                return CType(self.impl_type)
+                return RustCType(self.impl_type)
             if name not in self.unit.generic_structs and \
                     name not in self.unit.structs and \
                     name not in self.unit.enums and \
@@ -936,7 +936,7 @@ class Parser:
                     # in this unit declares, and they are only ever used
                     # behind a pointer, so an incomplete type is enough.
                     self.unit.opaque_structs.add(name)
-            return CType(name)
+            return RustCType(name)
         raise CrustError("line %d: expected a type, found %r"
                          % (t.line, t.val or "<eof>"))
 
@@ -1007,7 +1007,7 @@ class Parser:
         return flat
 
     def parse_type_alias(self):
-        """Parse `type Name = Type;`; return `(name, CType)` or `(None, None)`.
+        """Parse `type Name = Type;`; return `(name, RustCType)` or `(None, None)`.
 
         A *generic* alias (`type Result<T> = Result<T, Error>;`) has no
         representation here -- Crust monomorphises, and an alias is not an
@@ -1041,7 +1041,7 @@ class Parser:
         return args
 
     def instantiate_struct(self, name, args):
-        """Monomorphise `Name<args>`; return the concrete CType.
+        """Monomorphise `Name<args>`; return the concrete RustCType.
 
         The template's tokens are re-parsed with the type parameters bound,
         so the instantiation goes through exactly the same code path an
@@ -1053,7 +1053,7 @@ class Parser:
                      len(params), "" if len(params) == 1 else "s", len(args))
         mangled = _instance_name(name, args)
         if mangled in self.unit.structs:
-            return CType(mangled)
+            return RustCType(mangled)
         # An argument whose definition this unit lacks makes the whole
         # instantiation useless -- every method that reads the element
         # dereferences a pointer to an incomplete type. Try the seeders once
@@ -1100,7 +1100,7 @@ class Parser:
             self.instantiate_impls_for(name, mangled, args)
         finally:
             self.unit.emitting.discard(mangled)
-        return CType(mangled)
+        return RustCType(mangled)
 
     def instantiate_impls_for(self, name, mangled, args):
         """Generate the methods of every `impl<..> Name<..>` for one instance.
@@ -1131,9 +1131,9 @@ class Parser:
                 self.unit.methods[(mangled, info.name)] = info
                 selfp = []
                 if info.self_kind == "ref":
-                    selfp = [CType(mangled, 1)]
+                    selfp = [RustCType(mangled, 1)]
                 elif info.self_kind == "value":
-                    selfp = [CType(mangled)]
+                    selfp = [RustCType(mangled)]
                 self.unit.fn_sigs[info.mangled] = (
                     info.ret, selfp + [t for _, t in info.params])
                 p.skip_to_body_end()
@@ -1195,7 +1195,7 @@ class Parser:
             if depth == 0:
                 found[pname] = aty
             elif aty.ptr >= depth:
-                found[pname] = CType(aty.base, aty.ptr - depth, aty.array)
+                found[pname] = RustCType(aty.base, aty.ptr - depth, aty.array)
         missing = [p for p in params if p not in found]
         if missing:
             self.err("cannot infer type argument%s %s for `%s`; give it "
@@ -1294,7 +1294,7 @@ class Parser:
         """Translate one raw token slice as an expression."""
         if not toks:
             return Expr("", None)
-        p = Parser(list(toks) + [Token("eof", "", toks[-1].line)],
+        p = Parser(list(toks) + [RustToken("eof", "", toks[-1].line)],
                    self.unit, self.tysubst)
         p.scopes = self.scopes
         p.impl_type = self.impl_type
@@ -1448,7 +1448,7 @@ class Parser:
                n, out, n,
                out, n, spec, arglist,
                out, n))
-        return Expr(out, CType("String"))
+        return Expr(out, RustCType("String"))
 
     def m_vec(self, args, line):
         """`vec![a, b, c]` -- build a bundled `Vec<T>` from the elements.
@@ -1476,14 +1476,14 @@ class Parser:
         # `cfg!(..)` is a compile-time predicate over features Crust has no
         # notion of. Reporting false is the honest answer: nothing is
         # configured in.
-        return Expr("0", CType("_Bool"))
+        return Expr("0", RustCType("_Bool"))
 
     def m_matches(self, args, line):
         if len(args) < 2:
             self.err("`matches!` needs a value and a pattern")
         v = self.sub_expr(args[0])
         pat = self.sub_expr(args[1])
-        return Expr("((%s) == (%s))" % (v.code, pat.code), CType("_Bool"))
+        return Expr("((%s) == (%s))" % (v.code, pat.code), RustCType("_Bool"))
 
     def m_dbg_noop(self, args, line):
         """`debug_assert*!` -- compiled out, as in a release build."""
@@ -1542,7 +1542,7 @@ class Parser:
         flat = []
         for k, part in enumerate(args):
             if k:
-                flat.append(Token("punc", ",", line))
+                flat.append(RustToken("punc", ",", line))
             flat.extend(part)
         for pat, body in self.unit.macros[name]:
             binds = _match_pattern(pat, flat)
@@ -1612,7 +1612,7 @@ class Parser:
             op = self.next().val
             right = self.parse_binary(level + 1)
             if op in ("||", "&&", "==", "!=", "<", ">", "<=", ">="):
-                type_ = CType("_Bool")
+                type_ = RustCType("_Bool")
             elif left.type is not None and not left.type.is_void():
                 type_ = left.type
             else:
@@ -1637,18 +1637,18 @@ class Parser:
                 if e.type is not None and e.type.base in self.unit.slices:
                     return e            # already a fat pointer
                 return Expr("&%s" % e.code,
-                            CType(e.type.base, e.type.ptr + 1)
+                            RustCType(e.type.base, e.type.ptr + 1)
                             if e.type else None)
             e = self.parse_unary()
             if t.val == "*":
-                ty = CType(e.type.base, max(e.type.ptr - 1, 0)) \
+                ty = RustCType(e.type.base, max(e.type.ptr - 1, 0)) \
                     if e.type else None
                 return Expr("(*%s)" % e.code, ty)
             if t.val == "!":
                 # Rust `!` is logical on bool and bitwise on integers.
                 if e.type is not None and e.type.base == "_Bool" \
                         and not e.type.ptr:
-                    return Expr("(!%s)" % e.code, CType("_Bool"))
+                    return Expr("(!%s)" % e.code, RustCType("_Bool"))
                 return Expr("(~%s)" % e.code, e.type)
             return Expr("(-%s)" % e.code, e.type)
         return self.parse_postfix()
@@ -1690,7 +1690,7 @@ class Parser:
                     # no `sizeof` of its own.
                     self.expect(")")
                     e = Expr("sizeof(%s)" % targs[0].decl(),
-                             CType("unsigned long"))
+                             RustCType("unsigned long"))
                     continue
                 if generic and targs:
                     e = Expr(self.instantiate_fn(e.code, targs), None)
@@ -1869,9 +1869,9 @@ class Parser:
         """Lower the supported `Result` methods."""
         ok, err = self.unit.results[recv.type.base]
         if name == "is_ok" and not args:
-            return Expr("%s.ok" % recv.code, CType("_Bool"))
+            return Expr("%s.ok" % recv.code, RustCType("_Bool"))
         if name == "is_err" and not args:
-            return Expr("(!%s.ok)" % recv.code, CType("_Bool"))
+            return Expr("(!%s.ok)" % recv.code, RustCType("_Bool"))
         if name in ("unwrap", "unwrap_err") and not args:
             if name == "unwrap" and ok.is_void():
                 self.err("`unwrap` on `Result<(), _>` yields nothing; "
@@ -1902,9 +1902,9 @@ class Parser:
         """Lower the supported `Option` methods."""
         elem = self.unit.options[recv.type.base]
         if name == "is_some" and not args:
-            return Expr("%s.some" % recv.code, CType("_Bool"))
+            return Expr("%s.some" % recv.code, RustCType("_Bool"))
         if name == "is_none" and not args:
-            return Expr("(!%s.some)" % recv.code, CType("_Bool"))
+            return Expr("(!%s.some)" % recv.code, RustCType("_Bool"))
         if name == "unwrap" and not args:
             self.unit.unwraps.add(recv.type.base)
             self.unit.needs.add("abort")
@@ -1922,7 +1922,7 @@ class Parser:
             elem = self.unit.slices[ty.base]
             return Expr("%s.ptr[%s]" % (recv.code, idx.code), elem)
         if ty is not None:
-            ty = CType(ty.base, max(ty.ptr - 1, 0),
+            ty = RustCType(ty.base, max(ty.ptr - 1, 0),
                        (ty.array or [None])[1:] or None)
         return Expr("%s[%s]" % (recv.code, idx.code), ty)
 
@@ -1943,10 +1943,10 @@ class Parser:
             elem = self.unit.slices[ty.base]
             base, total = recv.code + ".ptr", recv.code + ".len"
         elif ty.array:
-            elem = CType(ty.base, ty.ptr)
+            elem = RustCType(ty.base, ty.ptr)
             base, total = recv.code, ty.array[0]
         elif ty.ptr:
-            elem = CType(ty.base, ty.ptr - 1)
+            elem = RustCType(ty.base, ty.ptr - 1)
             base, total = recv.code, None
         else:
             self.err("`%s` cannot be sliced", ty.decl())
@@ -2009,7 +2009,7 @@ class Parser:
         if inst[0] == "PyList" and name == "clear":
             arrow = "->" if (recv.type and recv.type.ptr) else "."
             return Expr("(%s%slen = 0)" % (recv.code, arrow),
-                        CType("long"))
+                        RustCType("long"))
         if inst[0] == "PyList" and name in _PYLIST_MUTATORS:
             elem = inst[1][0]
             tl = _tlist_name(elem)
@@ -2023,11 +2023,11 @@ class Parser:
                 tl, fn[0], tl, arrow,
                 "".join(", " + a for a in args))
             return Expr(call, elem if ret == "elem" else
-                        (CType("void") if ret is None else CType(ret)))
+                        (RustCType("void") if ret is None else RustCType(ret)))
 
         if recv.type is not None and recv.type.base in self.unit.slices:
             if name == "len":
-                return Expr("%s.len" % recv.code, CType("unsigned long"))
+                return Expr("%s.len" % recv.code, RustCType("unsigned long"))
             if name in ("iter", "iter_mut"):
                 # Crust has no iterator protocol; `for x in xs` walks the
                 # slice directly, so `.iter()` is accepted as a no-op purely
@@ -2036,10 +2036,10 @@ class Parser:
                     self.err("`%s` takes no arguments", name)
                 return recv
             if name == "is_empty":
-                return Expr("(%s.len == 0)" % recv.code, CType("_Bool"))
+                return Expr("(%s.len == 0)" % recv.code, RustCType("_Bool"))
             if name == "as_ptr":
                 return Expr("%s.ptr" % recv.code,
-                            CType(self.unit.slices[recv.type.base].base,
+                            RustCType(self.unit.slices[recv.type.base].base,
                                   self.unit.slices[recv.type.base].ptr + 1))
             self.err("no method `%s` on a slice", name)
         if recv.type is not None and recv.type.ptr == 1 \
@@ -2048,7 +2048,7 @@ class Parser:
             if args:
                 self.err("`str::len` takes no arguments")
             self.unit.needs.add("strlen")
-            return Expr("strlen(%s)" % recv.code, CType("unsigned long"))
+            return Expr("strlen(%s)" % recv.code, RustCType("unsigned long"))
         if recv.type is None:
             self.err("cannot infer the type of the receiver of `.%s()`; "
                      "annotate it", name)
@@ -2106,7 +2106,7 @@ class Parser:
                              "`%s`" % (line, "" if len(missing) == 1 else "s",
                                        ", ".join("`%s`" % f for f in missing),
                                        name))
-        return Expr("(%s){%s}" % (name, ", ".join(inits)), CType(name))
+        return Expr("(%s){%s}" % (name, ", ".join(inits)), RustCType(name))
 
     def _payload_of(self, flat):
         """Payload fields for a flattened `Enum_Variant` name, or None."""
@@ -2128,7 +2128,7 @@ class Parser:
             ".%s = %s" % (fname or "_%d" % i, a)
             for i, ((fname, _ty), a) in enumerate(zip(fields, args)))
         return Expr("(%s){.tag = %s, .u.%s = {%s}}"
-                    % (owner, flat, vname, inits), CType(owner))
+                    % (owner, flat, vname, inits), RustCType(owner))
 
     def parse_closure(self):
         """Lower `|a, b| expr` to a lifted top-level function.
@@ -2192,14 +2192,14 @@ class Parser:
 
         self.unit.closure_n += 1
         name = "_crust_closure%d" % self.unit.closure_n
-        sub = Parser(list(body) + [Token("eof", "", start.line)],
+        sub = Parser(list(body) + [RustToken("eof", "", start.line)],
                      self.unit, self.tysubst)
         sub.impl_type = self.impl_type
         sub.push()
         for pname, pty in params:
             sub.declare(pname, pty)
         if ret is None:
-            probe = Parser(list(body) + [Token("eof", "", start.line)],
+            probe = Parser(list(body) + [RustToken("eof", "", start.line)],
                            self.unit, self.tysubst)
             probe.push()
             for pname, pty in params:
@@ -2335,7 +2335,7 @@ class Parser:
                 self.err("repeat length must be positive")
             ty = first.type
             if ty is not None:
-                ty = CType(ty.base, ty.ptr, (ty.array or []) + [str(n)])
+                ty = RustCType(ty.base, ty.ptr, (ty.array or []) + [str(n)])
             return Expr("{%s}" % ", ".join([first.code] * n), ty)
         items = [first]
         while self.accept(","):
@@ -2345,7 +2345,7 @@ class Parser:
         self.expect("]")
         ty = items[0].type
         if ty is not None:
-            ty = CType(ty.base, ty.ptr, (ty.array or []) + [str(len(items))])
+            ty = RustCType(ty.base, ty.ptr, (ty.array or []) + [str(len(items))])
         return Expr("{%s}" % ", ".join(i.code for i in items), ty)
 
     def tuple_struct_literal(self, name, args):
@@ -2356,20 +2356,20 @@ class Parser:
                      len(fields), "" if len(fields) == 1 else "s", len(args))
         inits = ", ".join(".%s = %s" % (f, a)
                           for (f, _), a in zip(fields, args))
-        return Expr("(%s){%s}" % (name, inits), CType(name))
+        return Expr("(%s){%s}" % (name, inits), RustCType(name))
 
     def parse_primary(self):
         t = self.next()
         if t.kind == "num":
             return Expr(*normalize_number(t))
         if t.kind == "str":
-            return Expr(t.val, CType("const char", 1))
+            return Expr(t.val, RustCType("const char", 1))
         if t.kind == "chr":
-            return Expr(t.val, CType("int"))
+            return Expr(t.val, RustCType("int"))
         if t.val == "true":
-            return Expr("1", CType("_Bool"))
+            return Expr("1", RustCType("_Bool"))
         if t.val == "false":
-            return Expr("0", CType("_Bool"))
+            return Expr("0", RustCType("_Bool"))
         if t.val == "(":
             if self.at(")", "punc"):
                 self.next()
@@ -2492,12 +2492,12 @@ class Parser:
                 # constructs one. C has no empty struct, so the lowered type
                 # carries one placeholder byte; zeroing it is the whole
                 # construction.
-                return Expr("(%s){0}" % name, CType(name))
+                return Expr("(%s){0}" % name, RustCType(name))
             ty = self.lookup(name)
             if ty is None:
                 if name in self.unit.variants:
                     owner = self.unit.variants[name]
-                    ty = CType(owner)
+                    ty = RustCType(owner)
                     if owner in self.unit.data_enums and \
                             not self.at("(", "punc"):
                         # A payload-free variant of a tagged union is still a
@@ -2748,7 +2748,7 @@ class Parser:
                         indent)
             base, count = tmp + ".ptr", tmp + ".len"
         elif ty.array:
-            elem = CType(ty.base, ty.ptr, ty.array[1:] or None)
+            elem = RustCType(ty.base, ty.ptr, ty.array[1:] or None)
             if elem.array:
                 self.err("iterating a multi-dimensional array is not "
                          "supported; index the outer dimension")
@@ -3283,7 +3283,7 @@ class Parser:
         self.expect("struct")
         name = self.expect_ident()
         self.expect(";")
-        return name, [("_crust_unit", CType("char"))]
+        return name, [("_crust_unit", RustCType("char"))]
 
     def is_assoc_type(self):
         """True if the cursor is on an `type Name = Ty;` item."""
@@ -3521,16 +3521,16 @@ class Parser:
                 self.unit.methods[(owner, info.name)] = info
                 selfp = []
                 if info.self_kind == "ref":
-                    selfp = [CType(owner, 1)]
+                    selfp = [RustCType(owner, 1)]
                 elif info.self_kind == "value":
-                    selfp = [CType(owner)]
+                    selfp = [RustCType(owner)]
                 self.unit.fn_sigs[info.mangled] = (
                     info.ret, selfp + [t for _, t in info.params])
             params = list(info.params)
             if info.self_kind == "ref":
-                params.insert(0, ("self", CType(owner, 1)))
+                params.insert(0, ("self", RustCType(owner, 1)))
             elif info.self_kind == "value":
-                params.insert(0, ("self", CType(owner)))
+                params.insert(0, ("self", RustCType(owner)))
             self.emit_fn_body(out, start, info.mangled, params, info.ret,
                               False)
         self.expect("}")
@@ -3765,16 +3765,16 @@ def _c_name(name):
 
 
 def _ci_null(p, args, atys, targs):
-    ty = targs[0] if targs else CType("void")
-    return Expr("((%s)0)" % CType(ty.base, ty.ptr + 1).decl(),
-                CType(ty.base, ty.ptr + 1))
+    ty = targs[0] if targs else RustCType("void")
+    return Expr("((%s)0)" % RustCType(ty.base, ty.ptr + 1).decl(),
+                RustCType(ty.base, ty.ptr + 1))
 
 
 def _ci_read(p, args, atys, targs):
     if not args:
         p.err("`ptr::read` needs a pointer")
     ty = atys[0]
-    inner = CType(ty.base, max(ty.ptr - 1, 0), ty.array) if ty else None
+    inner = RustCType(ty.base, max(ty.ptr - 1, 0), ty.array) if ty else None
     return Expr("(*(%s))" % args[0], inner)
 
 
@@ -3796,10 +3796,10 @@ def _ci_copy(p, args, atys, targs):
     if len(args) < 3:
         p.err("`copy_nonoverlapping` needs src, dst and count")
     ty = atys[0]
-    elem = CType(ty.base, max(ty.ptr - 1, 0)).decl() if ty else "char"
+    elem = RustCType(ty.base, max(ty.ptr - 1, 0)).decl() if ty else "char"
     p.unit.needs.add("memcpy")
     return Expr("memcpy(%s, %s, (%s) * sizeof(%s))"
-                % (args[1], args[0], args[2], elem), CType("void"))
+                % (args[1], args[0], args[2], elem), RustCType("void"))
 
 
 def _ci_min(p, args, atys, targs):
@@ -3822,19 +3822,19 @@ def _ci_nop(p, args, atys, targs):
     `spin_loop` is a `pause` instruction hint; omitting it costs a little
     power in a spin wait and changes no semantics.
     """
-    return Expr("((void)0)", CType("void"))
+    return Expr("((void)0)", RustCType("void"))
 
 
 def _ci_swap(p, args, atys, targs):
     if len(args) < 2:
         p.err("`mem::swap` needs two pointers")
     ty = atys[0]
-    inner = CType(ty.base, max(ty.ptr - 1, 0)) if ty else CType("int")
+    inner = RustCType(ty.base, max(ty.ptr - 1, 0)) if ty else RustCType("int")
     tmp = p.new_temp()
     p.pending.append("%s = *(%s); *(%s) = *(%s); *(%s) = %s;"
                      % (inner.decl(tmp), args[0], args[0], args[1],
                         args[1], tmp))
-    return Expr("((void)0)", CType("void"))
+    return Expr("((void)0)", RustCType("void"))
 
 
 def _ci_from_raw_parts(p, args, atys, targs):
@@ -3842,7 +3842,7 @@ def _ci_from_raw_parts(p, args, atys, targs):
     if len(args) < 2:
         p.err("`from_raw_parts` needs a pointer and a length")
     ty = atys[0]
-    elem = CType(ty.base, max(ty.ptr - 1, 0)) if ty else CType("unsigned char")
+    elem = RustCType(ty.base, max(ty.ptr - 1, 0)) if ty else RustCType("unsigned char")
     sl = p.unit.slice_type(elem)
     return Expr("(%s){.ptr = %s, .len = %s}" % (sl.base, args[0], args[1]), sl)
 
@@ -3946,7 +3946,7 @@ def render_params(params):
 
 
 def normalize_number(tok):
-    """Map a Rust numeric literal onto C, returning (code, CType)."""
+    """Map a Rust numeric literal onto C, returning (code, RustCType)."""
     text = tok.val.replace("_", "")
     m = _NUM_SUFFIX.search(text)
     suffix = ""
@@ -3962,8 +3962,8 @@ def normalize_number(tok):
                 or (("e" in text or "E" in text) and not is_hex))
     if suffix.startswith("f") or is_float:
         if suffix == "f32":
-            return text + "f", CType("float")
-        return text, CType("double")
+            return text + "f", RustCType("float")
+        return text, RustCType("double")
     if suffix:
         base = PRIMITIVES[suffix]
         c_suffix = ""
@@ -3971,8 +3971,8 @@ def normalize_number(tok):
             c_suffix += "u"
         if base.endswith("long"):
             c_suffix += "l"
-        return text + c_suffix, CType(base)
-    return text, CType("int")
+        return text + c_suffix, RustCType(base)
+    return text, RustCType("int")
 
 
 # --------------------------------------------------------------------------
@@ -4742,9 +4742,9 @@ def collect_items(code, spans, unit, struct_order, fail=None):
                     unit.methods[(owner, info.name)] = info
                     selfp = []
                     if info.self_kind == "ref":
-                        selfp = [CType(owner, 1)]
+                        selfp = [RustCType(owner, 1)]
                     elif info.self_kind == "value":
-                        selfp = [CType(owner)]
+                        selfp = [RustCType(owner)]
                     unit.fn_sigs[info.mangled] = (
                         info.ret, selfp + [t for _, t in info.params])
                     p.skip_to_body_end()
@@ -4965,14 +4965,14 @@ def emit_derives(unit, local_names):
 
 def _derive_clone(unit, name, fields):
     """`fn clone(&self) -> T` -- a value copy, which is what C assignment is."""
-    _register(unit, name, "clone", CType(name), [], self_kind="ref")
+    _register(unit, name, "clone", RustCType(name), [], self_kind="ref")
     unit.emitted.append("%s %s_clone(%s *self) { return *self; }"
                         % (name, name, name))
 
 
 def _derive_default(unit, name, fields):
     """`fn default() -> T` -- every field zeroed."""
-    _register(unit, name, "default", CType(name), [], self_kind=None)
+    _register(unit, name, "default", RustCType(name), [], self_kind=None)
     unit.emitted.append("%s %s_default(void) { %s v = {0}; return v; }"
                         % (name, name, name))
 
@@ -4987,8 +4987,8 @@ def _derive_eq(unit, name, fields):
             # than emit a comparison that is quietly wrong.
             return
         tests.append("self->%s == other->%s" % (fname, fname))
-    _register(unit, name, "eq", CType("_Bool"),
-              [("other", CType(name, 1))], self_kind="ref")
+    _register(unit, name, "eq", RustCType("_Bool"),
+              [("other", RustCType(name, 1))], self_kind="ref")
     unit.emitted.append("_Bool %s_eq(%s *self, %s *other) { return %s; }"
                         % (name, name, name, " && ".join(tests) or "1"))
 
@@ -5022,8 +5022,8 @@ def _register(unit, owner, mname, ret, params, self_kind):
     """Register a generated method so call sites resolve it."""
     info = MethodInfo(owner, mname, ret, self_kind or "none", params)
     unit.methods[(owner, mname)] = info
-    selfp = [CType(owner, 1)] if self_kind == "ref" else (
-        [CType(owner)] if self_kind == "value" else [])
+    selfp = [RustCType(owner, 1)] if self_kind == "ref" else (
+        [RustCType(owner)] if self_kind == "value" else [])
     unit.fn_sigs[info.mangled] = (ret, selfp + [t for _, t in params])
 
 
@@ -5057,7 +5057,7 @@ def emit_trait_defaults(unit):
                 if cname in seen_c or flat in unit.consts:
                     continue
                 seen_c.add(cname)
-                p = Parser(list(ctoks) + [Token("eof", "", 0)], unit)
+                p = Parser(list(ctoks) + [RustToken("eof", "", 0)], unit)
                 p.impl_type = owner
                 try:
                     _kw, _n, cty, cinit = p.parse_const_signature()
@@ -5088,9 +5088,9 @@ def emit_trait_defaults(unit):
                     continue
                 params = list(info.params)
                 if info.self_kind == "ref":
-                    params.insert(0, ("self", CType(owner, 1)))
+                    params.insert(0, ("self", RustCType(owner, 1)))
                 elif info.self_kind == "value":
-                    params.insert(0, ("self", CType(owner)))
+                    params.insert(0, ("self", RustCType(owner)))
                 unit.methods[(owner, info.name)] = info
                 unit.fn_sigs[info.mangled] = (
                     info.ret, [t for _, t in params])
@@ -5475,7 +5475,7 @@ def _format_int_literal(value, ty):
 
 
 def _int_bits(ty):
-    """Width in bits for an integer CType, or 0 if unknown."""
+    """Width in bits for an integer RustCType, or 0 if unknown."""
     if ty.ptr or ty.array:
         return 0
     b = ty.base
@@ -5819,7 +5819,7 @@ def translate(code, path=None):
     unit.import_from = path
     m = _RESULT_ALIAS.search(_blank(code))
     if m:
-        unit.result_error = CType(m.group("err").split("::")[-1])
+        unit.result_error = RustCType(m.group("err").split("::")[-1])
     local = collect_items(code, spans, unit, struct_order, fail)
     # Local items win over mod-seeded ones of the same name.
     local_set = (set(local["structs"]) | set(local["enums"])
