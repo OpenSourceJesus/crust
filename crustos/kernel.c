@@ -449,6 +449,18 @@ fn log_frames(k: *mut Kernel, buf: *mut c_char, cap: i64) -> *mut c_char {
     f.as_str()
 }
 
+/* `format!` renders into a fresh String, sized exactly by asking snprintf how
+ * much it needs. The caller owns the buffer -- there is no Drop -- so this
+ * frees it after printing, the contract every allocating core type has. */
+fn report_frames(k: *mut Kernel) -> i32 {
+    let mut s: String = format!("frames {}/{} used, {} contexts",
+                                FRAMES - k.frames.free, FRAMES, k.used);
+    printf("  %s\n", s.as_ptr());
+    let n: i32 = s.len() as i32;
+    s.free_buf();
+    n
+}
+
 int main(void) {
     /* rpython module globals -- the scheme name table -- must be built
      * before anything reads them. */
@@ -507,6 +519,8 @@ int main(void) {
     printf("  %s\n", log_context(&k, shell, line, 128));
     printf("  %s\n", log_frames(&k, line, 128));
     printf("  %s\n", log_context(&k, 99, line, 128));
+
+    report_frames(&k);
 
     printf("  read(0,64)   : %d\n", Kernel_dispatch(&k, (Call){
         .tag = Call_Read, .u.Read = { ._0 = 0, ._1 = 64 } }));
