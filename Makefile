@@ -619,6 +619,7 @@ testtorch:
 #     make benchmarks
 benchmarks:
 	cd benchmarks && python3 run_benchmarks.py
+	@echo "(also: python3 tools/crust_benchmarks.py [features|rpython|minipy|all])"
 
 # ---------------------------------------------------------------------------
 # rpython cross-runtime benchmarks: the same pure-Python programs run under

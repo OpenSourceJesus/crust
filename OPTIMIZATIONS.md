@@ -129,6 +129,14 @@ index with an invariant offset, a scaled index (`a[i*2]`), a reverse traversal
 (`a[n-1-i]`, negative stride), a store loop, two parallel pointers, nested
 loops, zero-trip loops, and a non-unit IV step.
 
+## 6. Multiply by power of two → left shift (`shivyc/peephole.py`)
+
+Integer `x * 2^k` becomes `x << k` (`LBitShift` / `sal`). Unlike division,
+signed and unsigned agree on left shift, so both are rewritten. Floating-point
+multiplies are left alone. Measured on `benchmarks/codegen/bench_mul_pow2.c`:
+ShivyCX emits `sal`/`shr` with **zero** `imul`/`idiv` for the power-of-two
+scale loops.
+
 ## Result
 
 | backend  | speedup vs CPython                   |

@@ -209,7 +209,7 @@ def main(argv):
     ap.add_argument("--near-miss", action="store_true")
     args = ap.parse_args(argv)
 
-    paths = list(crustos.iter_sources(args.roots))
+    paths = list(crustos.sources(args.roots))
     rows = analyse(paths)
     report(rows, args.top)
     if args.near_miss:

@@ -122,6 +122,39 @@ def strength_reduce_divmod(commands, il_code):
     return out
 
 
+def strength_reduce_mul_pow2(commands, il_code):
+    """Turn integer multiply by a power of two into a left shift.
+
+    `imul` is several cycles; `shl` is one. Address scaling and kernel
+    `frame << PAGE_SHIFT` style code hit this constantly. Signed and unsigned
+    integers both get the rewrite: multiplying by `2^k` is a left shift for
+    both (unlike division, where signed and unsigned disagree). Floating-point
+    multiplies are left alone.
+    """
+    out = []
+    for c in commands:
+        repl = None
+        if isinstance(c, math_cmds.Mult):
+            ctype = c.arg1.ctype
+            if not ctype.is_floating():
+                a = _lit(il_code, c.arg1)
+                b = _lit(il_code, c.arg2)
+                k = None
+                base = None
+                kb = _pow2_shift(b)
+                ka = _pow2_shift(a)
+                if kb is not None and kb > 0:
+                    k, base = kb, c.arg1
+                elif ka is not None and ka > 0:
+                    k, base = ka, c.arg2
+                if k is not None:
+                    sh = ILValue(c.arg2.ctype)
+                    il_code.register_literal_var(sh, str(k))
+                    repl = math_cmds.LBitShift(c.output, base, sh)
+        out.append(repl if repl is not None else c)
+    return out
+
+
 def simplify_arith(commands, il_code):
     """Replace arithmetic identities with copies / constant loads."""
     out = []
@@ -542,6 +575,7 @@ def strength_reduce_ivs(commands, il_code):
 def optimize(commands, il_code):
     """Run all IL peephole passes for one function."""
     commands = simplify_arith(commands, il_code)
+    commands = strength_reduce_mul_pow2(commands, il_code)
     commands = strength_reduce_divmod(commands, il_code)
     commands = hoist_loop_invariants(commands, il_code)
     commands = strength_reduce_ivs(commands, il_code)

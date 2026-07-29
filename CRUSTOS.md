@@ -1,155 +1,111 @@
 # CrustOS
 
-A small operating system built from the parts of [Redox](https://redox-os.org)
-that Crust can compile, plus the parts we supply ourselves.
+A small **macro-kernel-shaped** operating system built from the parts of
+[Redox](https://redox-os.org) that Crust can compile, plus the parts we supply
+ourselves. Schemes and drivers live in the CrustOS address space (unlike Redox
+userspace scheme daemons), so C drivers and rpython bookkeeping sit beside
+Rust `rmm` without IPC.
 
 ```sh
-python3 tools/crustos.py fetch    # clone the Redox kernel and relibc
-python3 tools/crustos.py run      # compile the compatible subset, link, run
+python3 tools/crustos.py fetch           # clone the Redox kernel and relibc
+python3 tools/crustos.py run             # compile, link, run (default guest ELF)
+python3 tools/crustos.py run --elf path  # load a guest ELF (sets CRUSTOS_ELF)
 ```
 
 ```
 CrustOS
-  schemes      : 6
+  schemes      : 7
   heap offset  : 0xe0000000  (from vendor/kernel arch consts)
   opened       : 4 of 5 URLs
   first fd     : sys:/context
   frames       : 495 free of 512
   runnable     : 2 of 3
   switches     : 8
-  ticks        : init=16 shell=12 idle=0
-  x86_64 kpage : 0x8000000000000003 present=1
-  arm64 upage  : 0x40000000000043
-  heap frame   : 917504
-  page size    : x86=4096 arm64=65536 (mask 0xffff)
-  page levels  : x86=4 arm64=3
-  frames used  : 17 (bitmap popcount)
-  budget(1000) : 495
-  init ticks   : 0 (after ptr::write)
-  [1] Context { pid: 1, prio: 0, ticks: 0, frames: 12 }
-  [2] Context { pid: 2, prio: 1, ticks: 12, frames: 5 }
-  Frames { free: 495, used: 17 }
-  <no such pid 99>
-  frames 17/512 used, 3 contexts
-  read(0,64)   : 64
-  close(0)     : 0
-  bad fd       : -1
+  ticks        : init=76 shell=72 idle=0
+  ...
+  elf load     : build/crustos/hello_guest.so -> 0
+  elf pid      : 4
+  elf image    : 16392 bytes, 4 PT_LOAD, dyn=1
+  elf reg_class: 1 (10 regs to save)
+  elf guest rc : 2
 ```
 
 ## What this is, and is not
 
 **It is** a working model of a Redox-shaped kernel: URL-addressed schemes, a
-context table, a physical frame allocator, a round-robin scheduler and a
-syscall interface — built with no cargo, no rustc, no LLVM and no nightly
-toolchain, linking **88 object files compiled from genuine Redox source**.
+context table, a physical frame allocator, a round-robin scheduler, a syscall
+interface, and a hosted **static/PIE ELF loader** — built with no cargo, no
+rustc, no LLVM and no nightly toolchain, linking **~89 object files compiled
+from genuine Redox source**.
 
 **It is not** an operating system you can boot. CrustOS runs hosted, as an
 ordinary program. There is no bootloader, no bare-metal target, no interrupt
-handling and no MMU work. Calling it an OS is a claim about *structure*, not
-about capability, and it is worth keeping that distinction sharp: what has
-been demonstrated is that this toolchain can compile real kernel source and
-build a coherent program out of it, not that the result runs on hardware.
+handling and no live MMU. Calling it an OS is a claim about *structure*, not
+about capability. Hosted micros and ELF load times are **not** RedoxOS-on-QEMU
+benchmarks; see [benchmarks/README.md](benchmarks/README.md) methodology.
+
+## Macro-kernel direction
+
+| Redox (micro) | CrustOS (macro-shaped) |
+|---|---|
+| Scheme daemons in userspace | Scheme routing + handlers in-kernel ([crustos/schemes.py](crustos/schemes.py)) |
+| Rust-only drivers | C welcome when faster (e.g. future Haiku NVIDIA path via a `gpu:` scheme) |
+| Full userspace ELF + IPC | Hosted ELF load + in-process guest for ET_DYN; ET_EXEC validate-only |
+
+## Static ELF and Crust-ELF
+
+[crustos/elf.c](crustos/elf.c) parses ELF64, maps `PT_LOAD` into a malloc'd
+image, charges frames on a `Context`, and for **ET_DYN/PIC** guests marks the
+image executable (`mprotect`) and calls the entry. Linux **ET_EXEC** static
+binaries are loaded and described but not jumped to (absolute VAs).
+
+**Crust-ELF register hints** (faster context switches):
+
+- Prefer a `PT_NOTE` named `CRUSTOS` with `desc[0] = reg_class` (0..3).
+- Also accepted: `e_flags` bits 8..9.
+- Classes: 0 = minimal callee-saved (6), 1 = +extras (10), 2 = full GPR (15),
+  3 = +xmm0-7 (23). The scheduler sizes its save/restore stand-in from this.
+
+```sh
+python3 tools/crust_elf_note.py guest.so --reg-class 1 -o guest_hinted.so
+CRUSTOS_ELF=guest_hinted.so python3 tools/crustos.py run --elf guest_hinted.so
+python3 benchmarks/crustos_elf/bench_elf_load.py
+```
+
+Example guest: [examples/crustos/hello_guest.c](examples/crustos/hello_guest.c).
 
 ## The three-way split
 
 | part | language | why |
 |---|---|---|
 | `vendor/kernel`, `vendor/relibc` | Rust (upstream) | genuine Redox source, compiled by Crust |
-| `crustos/schemes.py` | rpython | URL parsing, routing tables, listings |
-| `crustos/kernel.c` | Rust + C | frame allocator, contexts, scheduler, syscalls |
+| `crustos/schemes.py` | rpython | URL parsing, routing tables, listings (`gpu:` stub included) |
+| `crustos/kernel.c` + `elf.c` | Rust + C | frames, contexts, scheduler, syscalls, ELF load |
 
-The split is not arbitrary. Each half is written in the language that makes it
-short:
-
-**rpython** gets the text and list work. Scheme routing is string parsing and
-table lookup — exactly what the Crust subset is worst at, having no string
-type and no iterator protocol. `tools/py2c.py` lowers a typed rpython list to
-three words (`{ int* data; long len; long cap; }`), which the Rust side walks
-directly as a `PyList<i32>` with no copy and no conversion at the boundary. So
-the collection is *built* where collections are cheap and *consumed* where the
-machine is close, and neither side pays for the crossing — after lowering,
-there isn't one.
-
-**Rust** gets the fixed layouts and the hot loops: a bitmap frame allocator,
-the context array, the scheduler, and syscall dispatch through a
-data-carrying enum. No allocator, no boxing, no GC anywhere near it.
-
-**C** gets `main`.
+**rpython** gets text and list work. **Rust** gets fixed layouts and hot loops.
+**C** gets `main` and the ELF loader.
 
 ## Paging, in upstream's shape
 
-`rmm/src/page/flags.rs` writes its page flags generically over the
-architecture, reading constants off a trait:
-
-```rust
-impl<A: Arch> PageFlags<A> {
-    pub fn new() -> Self {
-        Self::from_data(A::ENTRY_FLAG_DEFAULT_PAGE | A::ENTRY_FLAG_NO_EXEC)
-    }
-}
-```
-
-`crustos/kernel.c` uses the same shape, and Crust monomorphises it: one
-implementation of the flag logic, one instantiation per architecture, every
-constant resolved at compile time with no dispatch. The `x86_64 kpage` and
-`arm64 upage` lines above come from the same source code compiled twice.
-
-The `heap frame` line is that logic applied to a genuinely upstream value —
-`kernel_heap_offset()` from `vendor/kernel/src/arch/x86/consts.rs`, shifted by
-the architecture's own `PAGE_SHIFT`.
-
-Upstream's `Arch` trait also declares most of its constants with **defaults**,
-several derived from another constant of the same trait:
-
-```rust
-const ENTRY_ADDRESS_SHIFT: usize = Self::PAGE_SHIFT;
-```
-
-An impl that does not override one inherits it, with `Self::` resolved to the
-implementing type — so `PAGE_SIZE = 1 << Self::PAGE_SHIFT` computes 4096 for
-x86_64 and 65536 for a 64K-granule arm64, from one line of source. The
-`page size` and `page levels` lines above show that, including arm64
-overriding the trait's default `PAGE_LEVELS`.
-
-Upstream's own `PageFlags<A>` still does not instantiate here, because it
-reaches for parts of `core` that Crust has no source for. What has been shown
-is that the *pattern* compiles, which is the part that was in doubt.
+`crustos/kernel.c` uses upstream's `PageFlags<A>` shape; Crust monomorphises
+it per architecture. `kernel_heap_offset()` is upstream's, linked from
+`vendor/kernel`.
 
 ## What comes from upstream Redox
 
-Currently **93 of 106** translatable files compile to objects, of which 88 can
-be linked together. What survives is mostly the memory manager and the
-architecture definitions:
+Live survey snapshot (kernel + relibc, after `fetch`): see
+[tools/crustos_survey_baseline.txt](tools/crustos_survey_baseline.txt) and
+[tools/crustdeep_baseline.txt](tools/crustdeep_baseline.txt).
 
-- `rmm/src/page/` — page table entries, flags, mappers, table walking. These
-  compile but export little, because a generic impl only produces code once
-  something instantiates it; see the section above.
-- `rmm/src/allocator/frame/` — the buddy and bump frame allocators
-- `src/arch/*/consts.rs` — memory layout constants. `kernel_heap_offset()` in
-  the output above is upstream's, called from our `main`.
-- `src/arch/*/paging.rs`, `ipi.rs`, syscall constants
-- `src/sync/wait_queue.rs`, `src/memory/kernel_mapper.rs`
-- relibc's `auxv_defs`, `limits`, various header modules
-
-Most of these contribute constants, layouts and helpers rather than entry
-points — which is what a kernel takes from a memory manager anyway.
+Approx. **94 of 108** translatable files compile to objects; **~89** link.
+What survives is mostly `rmm` and arch consts. Greedy set-cover for remaining
+files (via `tools/crustdeep.py`): match-binding, inline-asm, iterator-chain,
+nested-generic, std-generic, …
 
 ### Why some objects are dropped
 
-Five of the 93 cannot join the link, for two reasons that both follow from
-compiling files that were never meant to be one program:
-
-- **Duplicate symbols.** Redox ships one implementation per architecture, and
-  Crust flattens module paths, so the `aarch64` and `riscv64` versions of a
-  function end up with the same symbol. The first is kept and later duplicates
-  dropped — arbitrary, but the alternative is linking nothing.
-- **Unresolved references** into parts of Redox that do not compile
-  (`KernelMapper_lock`, `rmm_aarch64_init_mair`). Those objects are dropped
-  rather than left to fail the link with a message that names the symbol but
-  not the file.
-
-`tools/crustos.py` does this selection with `nm`, and `--verbose` reports what
-was dropped and why.
+Duplicate arch symbols after path flattening, and unresolved refs into parts
+of Redox that do not compile. `tools/crustos.py` selects with `nm`.
 
 ## Commands
 
@@ -158,37 +114,46 @@ was dropped and why.
 | `fetch` | shallow-clone `redox-os/kernel` and `redox-os/relibc` into `vendor/` |
 | `fetch --update` | pull existing checkouts |
 | `survey` | how much of the source Crust translates, and what stops the rest |
-| `survey --verify` | also compile, and report how many produce an object |
+| `survey --verify` | also compile, and report how many succeed |
 | `survey --blockers` | rank the failure messages |
-| `build` | compile the compatible subset and link it with `crustos/` |
+| `build` | compile subset + crustos; also build `hello_guest.so` |
 | `build --upstream-only` | stop after the upstream objects |
-| `run` | build, then run |
+| `run [--elf path]` | build, then run (default guest if present) |
 | `clean` | remove `build/crustos` |
 
-`CRUSTOS_VENDOR` and `CRUSTOS_BUILD` override the directories. Passing source
-trees as arguments uses those instead of `vendor/`.
+`CRUSTOS_VENDOR`, `CRUSTOS_BUILD`, and `CRUSTOS_ELF` override paths / guest.
+
+## Benchmarks and compiler
+
+```sh
+python3 tools/crust_benchmarks.py           # feature suite
+python3 tools/crust_benchmarks.py rpython   # includes OS-shaped micros
+```
+
+Codegen micros under `benchmarks/codegen/` (idiv, mul-pow2, struct) compare
+ShivyCX to gcc `-O0`/`-O2`. ShivyCX now strength-reduces **multiply by a power
+of two** to `shl`/`sal` (see [OPTIMIZATIONS.md](OPTIMIZATIONS.md)).
+
+## Future: GPU and tile / AI hardware
+
+- **GPU:** a `gpu:` scheme is registered; integrating C driver code (Haiku-style
+  NVIDIA accel) is the pragmatic path vs Rust-only.
+- **Tile / FPGA:** [examples/rpython2c/nn/](examples/rpython2c/nn/) is the CPU
+  golden model (POD + fusion + SIMD contracts). A tile IR / HLS backend is
+  not implemented yet; py2c remains the front-end seam for that work.
 
 ## Honest limits
 
-Beyond "it does not boot", four things are worth naming:
+Beyond "it does not boot":
 
-**`Mutex` does not lock.** The bundled core supplies `Mutex<T>` and
-`RwLock<T>` so that upstream source parses, and they do no synchronisation at
-all. That is defensible only because Crust has no threads — no spawn, no
-atomics, no memory model — so there is nothing for a lock to protect against.
-The moment real concurrency exists they become dangerous and must be
-*replaced*, not extended.
+**`Mutex` does not lock.** Replace before real concurrency.
 
-**`#[cfg]` is evaluated against a fixed target** (x86_64, 64-bit, little
-endian, redox/unix/relibc). There is no way to change it yet; it lives in
-`CFG` in `shivyc/crust.py`.
+**`#[cfg]` is a fixed target** in `shivyc/crust.py`.
 
-**rpython cannot run before the heap does.** py2c's lists are malloc-backed
-and its runtime has an arena, so the scheme layer is fine for bookkeeping and
-would be entirely wrong for an allocator or an interrupt handler. `crustos/`
-keeps that line, but nothing enforces it.
+**rpython needs the heap** — wrong for ISR / allocator paths.
 
-**The subset is about a sixth of Redox.** 117 of 615 files translate, 99
-compile. The rest need traits with associated types, iterator chains,
-`async`, inline assembly, and a real `core`. See `CRUST.md` for the current
-blocker analysis, and `tools/crustdeep.py` for the measurement behind it.
+**ELF guests:** ET_DYN run in-process after `mprotect`; ET_EXEC is
+validate-only. Full Linux static ABI (syscalls to CrustOS) is not there yet.
+
+**Redox coverage** is still a fraction of the tree; prefer
+`crustdeep` set-cover over headline file percentages. See `CRUST.md`.

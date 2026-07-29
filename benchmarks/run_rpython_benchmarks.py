@@ -258,6 +258,12 @@ BENCH_ARGS = {
     "stats": ["6000"],
     "svgplot": ["40000"],
     "json_decode": ["200000"],
+    # Wired orphans + OS-shaped CrustOS micros
+    "ack": ["3", "6"],
+    "nbody": ["20000"],
+    "scheme_route": ["200000"],
+    "frame_alloc": ["20000"],
+    "sched_ticks": ["500000"],
 }
 
 

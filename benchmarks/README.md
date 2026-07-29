@@ -253,6 +253,36 @@ The cross-runtime report shell is `tools/benchmarks.tex` (typeset by
 `make benchmarks_report`); its data-driven body, `report_body.tex`, is
 regenerated next to the figures on every run.
 
+## Running via tools/crust_benchmarks.py
+
+```sh
+python3 tools/crust_benchmarks.py              # feature suite (default)
+python3 tools/crust_benchmarks.py features
+python3 tools/crust_benchmarks.py rpython
+python3 tools/crust_benchmarks.py all
+```
+
+## Methodology honesty (CrustOS vs RedoxOS)
+
+Hosted CrustOS micros (`scheme_route`, `frame_alloc`, `sched_ticks`) and
+codegen benches (`codegen/*`) measure **structure and compiler quality**, not
+a bootable RedoxOS. Do not treat them as full-system Redox-on-QEMU results.
+Apples-to-apples comparisons are: (1) Crust-compiled Redox `rmm`/consts vs our
+C/rpython frame+scheme paths, (2) ShivyCX vs gcc `-O0` (fair peer) with `-O2`
+shown only as an aspirational upper bound, (3) later, ELF load+switch micros
+with register-class hints vs full save.
+
+## New tracks (roadmap)
+
+| Track | Location | What it isolates |
+|---|---|---|
+| Codegen idiv / mul-pow2 / struct | `codegen/` | ShivyCX vs gcc `-O0`/`-O2` |
+| OS-shaped | `rpython/scheme_route.py`, `frame_alloc.py`, `sched_ticks.py` | CrustOS-shaped work on all four rpython backends |
+| Reg-class switch | `threads/bench_reg_class.c` | Crust-ELF hint levels (regs saved) |
+| Wired orphans | `rpython/ack.py`, `rpython/nbody.py` | recursion / float loops |
+
+---
+
 ## Third peer: CCC
 
 [CCC](https://github.com/anthropics/claudes-c-compiler) (Claude's C Compiler) is
