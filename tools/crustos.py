@@ -303,25 +303,36 @@ def linkable_subset(objs, provided):
     seen = set(provided)
     for _defined, _u in info.values():
         pass
-    kept, dropped = [], {}
-    # Everything the whole set defines: an undefined symbol is only a problem
-    # if nothing anywhere provides it.
-    available = set(provided)
-    for o in objs:
-        available |= info[o][0]
-    for o in objs:
-        defined, undef = info[o]
-        clash = defined & seen
-        if clash:
-            dropped[o] = "duplicate symbol %s" % sorted(clash)[0]
-            continue
-        missing = {u for u in undef if u not in available}
-        if missing:
-            dropped[o] = "needs %s" % sorted(missing)[0]
-            continue
-        seen |= defined
-        kept.append(o)
-    return kept, dropped
+    dropped = {}
+    candidates = list(objs)
+    # Iterate to a fixed point. Dropping an object removes the symbols it
+    # defined, which can leave a *previously kept* object with an undefined
+    # reference -- that is how `KernelMapper_lock` survived the filter and
+    # then failed the link. One pass is not enough; each pass can only remove
+    # objects, so this terminates.
+    while True:
+        seen = set(provided)
+        available = set(provided)
+        for o in candidates:
+            available |= info[o][0]
+        kept, removed = [], []
+        for o in candidates:
+            defined, undef = info[o]
+            clash = defined & seen
+            if clash:
+                dropped[o] = "duplicate symbol %s" % sorted(clash)[0]
+                removed.append(o)
+                continue
+            missing = {u for u in undef if u not in available}
+            if missing:
+                dropped[o] = "needs %s" % sorted(missing)[0]
+                removed.append(o)
+                continue
+            seen |= defined
+            kept.append(o)
+        if not removed:
+            return kept, dropped
+        candidates = kept
 
 
 def build(roots, verbose, upstream_only):
