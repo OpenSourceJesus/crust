@@ -4022,3 +4022,59 @@ int main(void) { unsigned u = 336; return (int)(u / 8); }
                         "-o", asm], cwd=_ROOT, capture_output=True)
         with open(asm) as f:
             self.assertIn("idiv", f.read())
+
+
+class TestElseIfLineBreak(unittest.TestCase):
+    """`else if` chains where the source puts each branch on its own line.
+
+    Crust keeps `else if` on the branch's own line so that line numbers do not
+    drift, and it was writing the `else` twice -- once before the line sync and
+    once after -- producing `} else\\nelse if (..)`. C rejects that with
+    "expected expression, got 'else'".
+
+    A single-line chain was fine, which is why the suite missed it: the bug
+    only appears when the sync actually starts a new line.
+    """
+
+    def test_multiline_else_if_chain(self):
+        self.assertEqual(_run("""
+fn pick(n: i32) -> i32 {
+    let mut a: i32 = 0;
+    if n == 0 {
+        a = 1;
+    }
+    else if n == 1 {
+        a = 2;
+    }
+    else if n == 2 {
+        a = 42;
+    }
+    else {
+        a = 4;
+    }
+    a
+}
+fn main() -> i32 { pick(2) }
+""", suffix=".rs"), 42)
+
+    def test_no_duplicated_else_is_emitted(self):
+        c = crust.translate("""
+fn f(n: i32) -> i32 {
+    let mut a: i32 = 0;
+    if n == 0 {
+        a = 1;
+    }
+    else if n == 1 {
+        a = 2;
+    }
+    a
+}
+""")
+        self.assertNotIn("else\nelse", c)
+        self.assertNotIn("else else", c)
+
+    def test_single_line_chain_still_works(self):
+        self.assertEqual(_run("""
+fn pick(n: i32) -> i32 { if n == 0 { 1 } else if n == 1 { 42 } else { 3 } }
+fn main() -> i32 { pick(1) }
+""", suffix=".rs"), 42)
