@@ -30,6 +30,42 @@ class _Args:
         self.output_name = output_name
 
 
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _run_units(units, main_unit, suffix=".rs"):
+    """Compile several units separately, link them, and return the exit status.
+
+    Every other test compiles exactly one translation unit, which is why a
+    whole class of bug was invisible: a name can be emitted correctly in each
+    unit on its own and still collide when two of them are linked. The
+    bundled core does exactly that -- its methods go into every unit that
+    names a core type.
+
+    `units` maps a name to source; `main_unit` is the one holding `main`.
+    """
+    workdir = tempfile.mkdtemp()
+    objs = []
+    for name, text in units.items():
+        src = os.path.join(workdir, name + suffix)
+        with open(src, "w") as f:
+            f.write(text)
+        obj = os.path.join(workdir, name + ".o")
+        proc = subprocess.run(
+            [sys.executable, "-m", "shivyc.main", "-c", src, "-o", obj],
+            cwd=_ROOT, capture_output=True, text=True)
+        assert proc.returncode == 0 and os.path.exists(obj), (
+            "compiling %s failed: %s" % (name, proc.stderr or proc.stdout))
+        objs.append(obj)
+    out = os.path.join(workdir, "prog")
+    link = subprocess.run(
+        [sys.executable, "-m", "shivyc.main"] + objs + ["-o", out],
+        cwd=_ROOT, capture_output=True, text=True)
+    assert link.returncode == 0, (
+        "linking failed: %s" % (link.stderr or link.stdout))
+    return subprocess.run([out]).returncode
+
+
 def _run(source, suffix=".c", extra=None):
     """Compile `source` and return its exit status.
 
@@ -1590,9 +1626,12 @@ fn main() -> i32 { if cfg!(feature = "nope") { 1 } else { 42 } }
 """, suffix=".rs"), 42)
 
     def test_unsupported_macro_is_named(self):
+        # `format!` is supported now; `asm!` is deliberately not -- dropping
+        # inline assembly silently would change behaviour invisibly, and a
+        # kernel is exactly where that matters.
         with self.assertRaises(crust.CrustError) as cm:
-            crust.translate('fn f() { let v = format!("{}", 1); }')
-        self.assertIn("format", str(cm.exception))
+            crust.translate('fn f() { asm!("nop"); }')
+        self.assertIn("asm", str(cm.exception))
 
     def test_macro_rules_single_arg(self):
         self.assertEqual(_run("""
@@ -3501,3 +3540,217 @@ int sum(int *a, int n) { int t = 0; long i = 0; while (i < n) { t += a[i]; i++; 
                          return t; }
 int main(void) { int a[4]; a[0]=10; a[1]=20; a[2]=8; a[3]=4; return sum(a, 4); }
 """), 42)
+
+
+class TestCrustFormatMacro(unittest.TestCase):
+    """`format!` renders into a fresh `String`.
+
+    Sized with the standard C idiom: `snprintf` with a NULL destination
+    reports how many characters the result *would* take, so the buffer is
+    reserved once at exactly the right size and written once -- no guess and
+    no grow-and-retry loop.
+
+    The result owns its buffer and there is no `Drop`, so the caller must
+    `free_buf()` it, like every other allocating type in the bundled core.
+    """
+
+    def test_renders_values(self):
+        self.assertEqual(_run("""
+fn main() -> i32 {
+    let mut s: String = format!("n={} f={:.1} s={}", 7, 2.5, "hi");
+    let ok: bool = s.eq_str("n=7 f=2.5 s=hi");
+    s.free_buf();
+    if ok { 42 } else { 0 }
+}
+""", suffix=".rs"), 42)
+
+    def test_length_is_exact(self):
+        self.assertEqual(_run("""
+fn main() -> i32 {
+    let mut s: String = format!("{}{}{}{}{}{}", 1, 2, 3, 4, 5, 6);
+    let n: i64 = s.len();
+    s.free_buf();
+    (n as i32) + 36
+}
+""", suffix=".rs"), 42)
+
+    def test_empty_format_is_an_empty_string_not_null(self):
+        # `String::new()` leaves the buffer null, so the reserve must happen
+        # even when nothing is written -- `as_ptr()` printed "(null)".
+        self.assertEqual(_run("""
+fn main() -> i32 {
+    let mut s: String = format!("");
+    let ok: bool = s.eq_str("");
+    s.free_buf();
+    if ok { 42 } else { 0 }
+}
+""", suffix=".rs"), 42)
+
+    def test_braces_and_percent_are_literal(self):
+        self.assertEqual(_run("""
+fn main() -> i32 {
+    let mut s: String = format!("{{}} 100%");
+    let ok: bool = s.eq_str("{} 100%");
+    s.free_buf();
+    if ok { 42 } else { 0 }
+}
+""", suffix=".rs"), 42)
+
+    def test_no_arguments(self):
+        self.assertEqual(_run("""
+fn main() -> i32 {
+    let mut s: String = format!("plain");
+    let n: i64 = s.len();
+    s.free_buf();
+    (n as i32) + 37
+}
+""", suffix=".rs"), 42)
+
+
+class TestCoreInternalLinkage(unittest.TestCase):
+    """Bundled core methods have internal linkage.
+
+    A core type is emitted into *every* translation unit that names it, so
+    external linkage means two such units collide at link time -- and worse, a
+    crate with its own type of the same name collides with the bundled one.
+    relibc has its own `String`, and linking CrustOS against it failed with
+    "duplicate symbol String_as_ptr".
+
+    Within a single unit the local definition correctly wins, so the collision
+    is invisible until two units are linked together.
+    """
+
+    def _core_defs(self, src):
+        import re
+        c = crust.translate(src)
+        return re.findall(r"^\s*(static\s+)?[A-Za-z_][\w *]*?"
+                          r"(String|Vec_int)_\w+\s*\([^;]*\)\s*\{",
+                          c, re.M)
+
+    def test_every_definition_is_static(self):
+        # The whole `impl` block arrives as one blob, so prefixing the string
+        # only reached the first method -- `String_new` was static while
+        # `String_push` stayed external.
+        src = ("fn f() { let mut s: String = String::new();"
+               " s.push(65 as c_char); s.push_str(\"x\"); }")
+        defs = self._core_defs(src)
+        self.assertTrue(defs)
+        self.assertTrue(all(d[0].strip() == "static" for d in defs),
+                        [d for d in defs if d[0].strip() != "static"])
+
+    def test_generic_core_definitions_are_static_too(self):
+        defs = self._core_defs("fn f() { let v: Vec<i32> = Vec::<i32>::new(); }")
+        self.assertTrue(all(d[0].strip() == "static" for d in defs))
+
+    def test_prototype_matches_the_definition(self):
+        # A `static` definition with an extern prototype is a linkage error in
+        # its own right.
+        c = crust.translate("fn f() { let mut s: String = String::new();"
+                            " s.push(65 as c_char); }")
+        proto = [x for x in c.split(";")
+                 if "String_push(String" in x and "{" not in x]
+        self.assertTrue(proto)
+        self.assertIn("static", proto[0])
+
+    def test_user_function_is_not_made_static(self):
+        # Only core-provided methods get internal linkage; the unit's own
+        # functions are its linkage surface.
+        c = crust.translate("fn visible(a: i32) -> i32 { a }")
+        self.assertIn("int visible(int a)", c)
+        self.assertNotIn("static int visible", c)
+
+
+class TestMultiUnitLinking(unittest.TestCase):
+    """Two translation units linked together.
+
+    Every other test compiles one unit, and a name can be emitted correctly in
+    each unit on its own and still collide when they are linked. That is
+    exactly what happened: the bundled core emits its methods into every unit
+    that names a core type, and with external linkage two such units failed
+    with "duplicate symbol String_as_ptr". Within either unit alone the output
+    was perfectly correct.
+    """
+
+    def test_two_units_both_using_string(self):
+        self.assertEqual(_run_units({
+            "helper": """
+fn helper_len(text: *const c_char) -> i32 {
+    let mut s: String = String::new();
+    s.push_str(text);
+    let n: i32 = s.len() as i32;
+    s.free_buf();
+    n
+}
+""",
+            "main": """
+int helper_len(const char *);
+fn main() -> i32 {
+    let mut s: String = String::new();
+    s.push_str("abcdefg");
+    let mine: i32 = s.len() as i32;
+    s.free_buf();
+    mine + helper_len("abcdefghij") + 25
+}
+""",
+        }, "main"), 42)
+
+    def test_two_units_both_using_a_core_generic(self):
+        # `Vec_int_new` is emitted in every unit that names `Vec<i32>`.
+        self.assertEqual(_run_units({
+            "helper": """
+fn helper_sum() -> i32 {
+    let mut v: Vec<i32> = Vec::<i32>::new();
+    v.push(20);
+    v.push(1);
+    let t: i32 = v.get(0) + v.get(1);
+    v.free_buf();
+    t
+}
+""",
+            "main": """
+int helper_sum(void);
+fn main() -> i32 {
+    let mut v: Vec<i32> = Vec::<i32>::new();
+    v.push(21);
+    let mine: i32 = v.get(0);
+    v.free_buf();
+    mine + helper_sum()
+}
+""",
+        }, "main"), 42)
+
+    def test_unit_with_its_own_string_type(self):
+        # relibc has its own `String`, and it collided with the bundled one.
+        # A local definition wins within its unit; the other unit still gets
+        # the bundled type, and the two must not clash.
+        self.assertEqual(_run_units({
+            "theirs": """
+struct String { n: i32 }
+impl String {
+    fn as_ptr(&self) -> i32 { self.n }
+}
+fn theirs_value() -> i32 {
+    let s: String = String { n: 20 };
+    s.as_ptr()
+}
+""",
+            "main": """
+int theirs_value(void);
+fn main() -> i32 {
+    let mut s: String = String::new();
+    s.push_str("xx");
+    let mine: i32 = s.len() as i32;
+    s.free_buf();
+    mine + theirs_value() + 20
+}
+""",
+        }, "main"), 42)
+
+    def test_user_functions_stay_linkable(self):
+        # Only core-provided methods get internal linkage; a unit's own
+        # functions are its linkage surface and must remain callable.
+        self.assertEqual(_run_units({
+            "lib": "fn twice(a: i32) -> i32 { a * 2 }\n",
+            "main": ("int twice(int);\n"
+                     "fn main() -> i32 { twice(21) }\n"),
+        }, "main"), 42)
