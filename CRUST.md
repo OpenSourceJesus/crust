@@ -1105,6 +1105,39 @@ exists. A kernel's string handling is short and bounded. For *userspace*
 CrustOS code the tradeoff runs the other way, and the rpython runtime is the
 better answer there.
 
+## Optimisation: division by a power of two
+
+`idiv` costs tens of cycles where `shr` and `and` cost one, and kernel code
+divides by powers of two constantly — page sizes, bitmap words, alignment.
+An unsigned division or modulo by a power-of-two constant is now rewritten to
+a shift or a mask in the peephole.
+
+On `examples/crust/bench_rmm.rs`, built from Redox's own abstractions
+(`PageFlags<A>` over an arch trait, a bitmap frame allocator, a page-table
+walk), this is worth **4x on identical source** — 0.339s to 0.083s.
+
+Two measurements worth recording alongside it, because they redirect where
+effort should go:
+
+- The hot loop makes six function calls per iteration and inlines none of
+  them. That looks like the obvious problem and **is not**: rewriting the
+  benchmark with no abstraction at all gave 0.116s against 0.115s. An inliner
+  would have bought nothing here.
+- The remaining gap to `gcc -O2` is about 2x, down from 13x. What is left is
+  visible in the same loop: array indexing emits `imul rax, 8; add rcx, rax`
+  where x86 has scaled addressing (`[rcx + rdi*8]`).
+
+### Unsigned only, deliberately
+
+C rounds division toward zero; an arithmetic shift rounds toward negative
+infinity. `-7 / 2` is -3 but `-7 >> 1` is -4, and `-7 % 2` is -1 but `-7 & 1`
+is 1. Applying the rewrite to a signed operand is a silent wrong answer, so a
+signed operand keeps its `idiv` rather than getting the correction sequence —
+which is several instructions and worth much less than the unsigned case.
+
+Both directions are tested: that the unsigned form really loses its `idiv`,
+and that the signed form really keeps it.
+
 ## Inline assembly
 
 ShivyCX supports GCC-style `__asm__`, and Crust relies on it for anything that
