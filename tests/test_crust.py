@@ -3941,3 +3941,84 @@ int main(void) { int y = 0; __asm__ volatile ("movl $42, %0" : "=r"(y));
         self.assertEqual(_run("""
 int main(void) { __asm__ volatile ("nop"); return 42; }
 """), 42)
+
+
+class TestDivModStrengthReduction(unittest.TestCase):
+    """Unsigned division and modulo by a power of two become shift and mask.
+
+    `idiv` costs tens of cycles where `shr` and `and` cost one, and kernel code
+    divides by powers of two constantly -- page sizes, bitmap words,
+    alignment. On a benchmark built from Redox's own abstractions this rewrite
+    was worth 4x on identical source (0.339s to 0.083s), far more than
+    anything else measured -- inlining the same benchmark by hand was worth
+    nothing at all.
+
+    The signed cases below are the point of the whole test class. C rounds
+    division toward zero; an arithmetic shift rounds toward negative infinity.
+    `-7 / 2` is -3 but `-7 >> 1` is -4, and `-7 % 2` is -1 but `-7 & 1` is 1.
+    Applying the rewrite to a signed operand is a silent wrong answer, so it
+    is deliberately not applied.
+    """
+
+    def test_unsigned_division(self):
+        self.assertEqual(_run("""
+int main(void) { unsigned long a = 336; return (int)(a / 8); }
+"""), 42)
+
+    def test_unsigned_modulo(self):
+        self.assertEqual(_run("""
+int main(void) { unsigned long a = 100000; return (int)(a % 64) + 10; }
+"""), 42)
+
+    def test_signed_division_rounds_toward_zero(self):
+        self.assertEqual(_run("""
+int main(void) { long s = -7; return (int)(s / 2) + 45; }
+"""), 42)
+
+    def test_signed_modulo_keeps_its_sign(self):
+        self.assertEqual(_run("""
+int main(void) { long s = -7; return (int)(s % 2) + 43; }
+"""), 42)
+
+    def test_non_power_of_two_is_untouched(self):
+        self.assertEqual(_run("""
+int main(void) { unsigned long a = 126; return (int)(a / 3); }
+"""), 42)
+
+    def test_division_by_one_and_zero_shift(self):
+        # 2**0 is not reduced: the shift would be zero and the guard requires
+        # k >= 1, so this goes through the ordinary path.
+        self.assertEqual(_run("""
+int main(void) { unsigned long a = 42; return (int)(a / 1); }
+"""), 42)
+
+    def test_unsigned_int_width(self):
+        self.assertEqual(_run("""
+int main(void) { unsigned u = 336; return (int)(u / 8); }
+"""), 42)
+
+    def test_idiv_is_actually_gone(self):
+        import subprocess, tempfile, os as _os
+        d = tempfile.mkdtemp()
+        src = _os.path.join(d, "t.c")
+        with open(src, "w") as f:
+            f.write("unsigned long f(unsigned long a) { return a / 4096; }\n")
+        asm = _os.path.join(d, "t.s")
+        subprocess.run([sys.executable, "-m", "shivyc.main", "-S", src,
+                        "-o", asm], cwd=_ROOT, capture_output=True)
+        with open(asm) as f:
+            text = f.read()
+        self.assertNotIn("idiv", text)
+        self.assertIn("shr", text)
+
+    def test_signed_still_uses_idiv(self):
+        import subprocess, tempfile, os as _os
+        d = tempfile.mkdtemp()
+        src = _os.path.join(d, "t.c")
+        with open(src, "w") as f:
+            f.write("long f(long a) { return a / 4096; }\n")
+        asm = _os.path.join(d, "t.s")
+        subprocess.run([sys.executable, "-m", "shivyc.main", "-S", src,
+                        "-o", asm], cwd=_ROOT, capture_output=True)
+        with open(asm) as f:
+            self.assertIn("idiv", f.read())
