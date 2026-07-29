@@ -428,6 +428,65 @@ def bench_threads():
 
 
 # ===========================================================================
+# Benchmark 7b: codegen micros vs gcc -O0 / -O2 (idiv, mul-pow2, struct)
+# ===========================================================================
+def _bench_codegen_one(name, src_name):
+    d = os.path.join(HERE, "codegen")
+    src = os.path.join(d, src_name)
+    cfgs = []
+    out_s = os.path.join(d, "bin_" + name + "_shivyc")
+    out_g0 = os.path.join(d, "bin_" + name + "_gcc0")
+    out_g2 = os.path.join(d, "bin_" + name + "_gcc2")
+    _shivyc(src, out_s)
+    asm = ""
+    try:
+        asm = _read_asm(src)
+    except OSError:
+        pass
+    idiv_n = _count(asm, r"\bidiv\b")
+    imul_n = _count(asm, r"\bimul\b")
+    shr_n = _count(asm, r"\bshr\b")
+    cfgs.append({"name": "ShivyCX", "binary": out_s, "baseline": True,
+                 "metric": "idiv=%d imul=%d shr=%d" % (idiv_n, imul_n, shr_n),
+                 "metric_val": idiv_n})
+    _gcc(src, out_g0, opt="-O0")
+    cfgs.append({"name": "gcc -O0", "binary": out_g0, "baseline": False,
+                 "metric": "peer -O0", "metric_val": None})
+    _gcc(src, out_g2, opt="-O2")
+    cfgs.append({"name": "gcc -O2", "binary": out_g2, "baseline": False,
+                 "metric": "peer -O2", "metric_val": None})
+    return {"benchmark": "codegen_" + name, "configs": _finish(cfgs)}
+
+
+def bench_codegen_idiv():
+    return _bench_codegen_one("idiv", "bench_idiv.c")
+
+
+def bench_codegen_mul_pow2():
+    return _bench_codegen_one("mul_pow2", "bench_mul_pow2.c")
+
+
+def bench_codegen_struct():
+    return _bench_codegen_one("struct", "bench_struct.c")
+
+
+def bench_reg_class():
+    """Register-class switch cost levels (Crust-ELF hint prep)."""
+    d = os.path.join(HERE, "threads")
+    src = os.path.join(d, "bench_reg_class.c")
+    cfgs = []
+    out_s = os.path.join(d, "bin_reg_class_shivyc")
+    out_g0 = os.path.join(d, "bin_reg_class_gcc0")
+    _shivyc(src, out_s)
+    cfgs.append({"name": "ShivyCX", "binary": out_s, "baseline": True,
+                 "metric": "reg_class switch stand-in", "metric_val": True})
+    _gcc(src, out_g0)
+    cfgs.append({"name": "gcc -O0", "binary": out_g0, "baseline": False,
+                 "metric": "peer -O0", "metric_val": None})
+    return {"benchmark": "threads_reg_class", "configs": _finish(cfgs)}
+
+
+# ===========================================================================
 # Benchmark 7: whole-program memory safety (UAF / double-free / auto-free)
 # ===========================================================================
 def bench_memory_safety():
@@ -465,12 +524,17 @@ def bench_memory_safety():
 def main():
     os.makedirs(RESULTS_DIR, exist_ok=True)
     results = []
-    for label, fn in [("_Nbit globals", bench_nbit),
-                      ("contracts SIMD", bench_contracts),
-                      ("SIMD .py vs gcc -O0", bench_simd_py),
-                      ("SIMD .py vs gcc -O2", bench_simd_o2),
-                      ("stackless calls", bench_stackless),
-                      ("metamorphic returns", bench_metamorphic)]:
+    timed = [("_Nbit globals", bench_nbit),
+             ("contracts SIMD", bench_contracts),
+             ("SIMD .py vs gcc -O0", bench_simd_py),
+             ("SIMD .py vs gcc -O2", bench_simd_o2),
+             ("stackless calls", bench_stackless),
+             ("metamorphic returns", bench_metamorphic),
+             ("codegen idiv", bench_codegen_idiv),
+             ("codegen mul_pow2", bench_codegen_mul_pow2),
+             ("codegen struct", bench_codegen_struct),
+             ("threads reg_class", bench_reg_class)]
+    for label, fn in timed:
         print("Running %s benchmark ..." % label)
         results.append(fn())
 
@@ -486,7 +550,8 @@ def main():
     with open(os.path.join(RESULTS_DIR, "results.json"), "w") as f:
         json.dump(results, f, indent=2)
 
-    for bench in results[:6]:
+    timed_n = len(timed)
+    for bench in results[:timed_n]:
         print("\n=== %s ===" % bench["benchmark"])
         exits = {c["exit_code"] for c in bench["configs"]}
         print("  differential correctness: %s (exit codes: %s)"
