@@ -2111,7 +2111,7 @@ def _tlist_prelude(et):
         "}\n"
         "static void %s_push(%s* l, %s v) {\n"
         "    if (l->len >= l->cap) {\n"
-        "        l->cap = l->cap * 2;\n"
+        "        l->cap = l->cap ? l->cap * 2 : 4;\n"
         "        l->data = realloc(l->data, (unsigned long)l->cap * sizeof(%s));\n"
         "    }\n"
         "    l->data[l->len++] = v;\n"
