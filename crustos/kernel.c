@@ -14,6 +14,7 @@
  * an OS you can boot. See CRUSTOS.md.
  */
 #include "schemes.py"
+#include "elf.c"
 
 int printf(const char *, ...);
 
@@ -184,6 +185,10 @@ struct Context {
     ticks: i64,
     frames: i32,
     state: i32,          /* 0 free, 1 runnable, 2 blocked, 3 exited */
+    entry: u64,          /* guest entry (0 = no image) */
+    stack: u64,          /* guest stack top (hosted; optional) */
+    reg_class: i32,      /* Crust-ELF hint: 0..3 */
+    switches: i64,       /* times this context was switched to */
 }
 
 /* ------------------------------------------------------------------ */
@@ -197,6 +202,7 @@ enum Call {
     Close(i32),
     Alloc(i32, i32),
     Yield,
+    Exit(i32),
 }
 
 #[derive(Clone, Copy, Default)]
@@ -225,6 +231,10 @@ impl Kernel {
             self.ctx[i].ticks = 0;
             self.ctx[i].frames = 0;
             self.ctx[i].state = 0;
+            self.ctx[i].entry = 0;
+            self.ctx[i].stack = 0;
+            self.ctx[i].reg_class = 2; /* ELF_REG_FULL */
+            self.ctx[i].switches = 0;
             self.fds[i].scheme = SCHEME_NONE;
             self.fds[i].owner = 0;
             self.fds[i].bytes = 0;
@@ -268,7 +278,18 @@ impl Kernel {
             Call::Close(fd) => self.sys_close(fd),
             Call::Alloc(pid, n) => self.sys_alloc(pid, n),
             Call::Yield => 0,
+            Call::Exit(code) => self.sys_exit(code),
         }
+    }
+
+    fn sys_exit(&mut self, code: i32) -> i32 {
+        /* Mark current runnable contexts exited when demo calls Exit. */
+        for i in 0..self.used {
+            if self.ctx[i].state == 1 {
+                self.ctx[i].state = 3;
+            }
+        }
+        code
     }
 
     fn sys_open(&mut self, scheme: i32, owner: i32) -> i32 {
@@ -314,7 +335,8 @@ impl Kernel {
         got
     }
 
-    /* Round robin, charging each runnable context its priority quantum. */
+    /* Round robin: charge quantum, count a register save/restore sized by
+     * each context's Crust-ELF reg_class, and optionally enter a guest once. */
     fn schedule(&mut self, rounds: i32) -> i64 {
         let mut switches: i64 = 0;
         for _r in 0..rounds {
@@ -322,10 +344,42 @@ impl Kernel {
                 if self.ctx[i].state == 1 {
                     self.ctx[i].ticks += (4 - self.ctx[i].prio) as i64;
                     switches += 1;
+                    self.ctx[i].switches += 1;
+                    /* Stand-in for a real save/restore of N GPRs (+XMM). */
+                    let nregs: i32 = elf_regs_for_class(self.ctx[i].reg_class);
+                    let mut pad: i64 = 0;
+                    for _s in 0..nregs {
+                        pad += 1;
+                    }
+                    self.ctx[i].ticks += pad; /* fold cost into ticks */
                 }
             }
         }
         switches
+    }
+
+    /* Attach a loaded ELF image to a new context. Frames charged for image. */
+    fn spawn_elf(&mut self, prio: i32, entry: u64, reg_class: i32,
+                 image_frames: i32) -> i32 {
+        let pid: i32 = self.spawn(prio);
+        if pid < 0 {
+            return -1;
+        }
+        let slot: i32 = pid - 1;
+        self.ctx[slot].entry = entry;
+        self.ctx[slot].reg_class = reg_class;
+        let got: i32 = self.sys_alloc(pid, image_frames);
+        if got < image_frames {
+            return -1;
+        }
+        pid
+    }
+
+    fn mark_exited(&mut self, pid: i32) {
+        let slot: i32 = pid - 1;
+        if slot >= 0 && slot < self.used {
+            self.ctx[slot].state = 3;
+        }
     }
 }
 
@@ -528,5 +582,37 @@ int main(void) {
         .tag = Call_Close, .u.Close = { ._0 = 0 } }));
     printf("  bad fd       : %d\n", Kernel_dispatch(&k, (Call){
         .tag = Call_Read, .u.Read = { ._0 = 99, ._1 = 1 } }));
+
+    /* Optional hosted ELF: CRUSTOS_ELF=/path/to/guest */
+    {
+        char *elf_path = getenv("CRUSTOS_ELF");
+        if (elf_path && elf_path[0]) {
+            struct ElfImage img;
+            int erc = elf_load_path(elf_path, &img);
+            printf("  elf load     : %s -> %d\n", elf_path, erc);
+            if (erc == 0) {
+                int frames_need = (int)((img.size + 4095) / 4096);
+                if (frames_need < 1) frames_need = 1;
+                int gpid = Kernel_spawn_elf(&k, 0, img.entry, img.reg_class,
+                                            frames_need);
+                printf("  elf pid      : %d\n", gpid);
+                elf_describe(&img);
+                if (gpid > 0) {
+                    int grc = elf_run_guest_fn(&img);
+                    Kernel_mark_exited(&k, gpid);
+                    if (grc == -101)
+                        printf("  elf guest rc : (ET_EXEC validate-only)\n");
+                    else
+                        printf("  elf guest rc : %d\n", grc);
+                    printf("  elf switches : after schedule %ld\n",
+                           Kernel_schedule(&k, 2));
+                }
+                elf_free(&img);
+                fflush(0);
+            }
+        } else {
+            printf("  elf load     : (set CRUSTOS_ELF to run a guest)\n");
+        }
+    }
     return 0;
 }

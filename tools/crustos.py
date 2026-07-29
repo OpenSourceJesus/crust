@@ -26,7 +26,8 @@ worth keeping in view -- see CRUSTOS.md.
     python3 tools/crustos.py fetch       # clone/update the Redox sources
     python3 tools/crustos.py survey      # what compiles, and what stops the rest
     python3 tools/crustos.py build       # upstream subset + crustos -> one binary
-    python3 tools/crustos.py run         # build, then run it
+    python3 tools/crustos.py run         # build, then run (default guest ELF)
+    python3 tools/crustos.py run --elf G # run with CRUSTOS_ELF=G
     python3 tools/crustos.py clean
 """
 
@@ -335,6 +336,25 @@ def linkable_subset(objs, provided):
         candidates = kept
 
 
+def build_guest(out_path):
+    """Build a tiny CrustOS guest ELF (PIE shared object with guest_entry)."""
+    src = os.path.join(ROOT, "examples", "crustos", "hello_guest.c")
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    cmd = ["gcc", "-O0", "-fPIC", "-nostdlib", "-shared",
+           "-Wl,-e,guest_entry", src, "-o", out_path]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0 or not os.path.exists(out_path):
+        print("  guest build FAILED: %s" % (proc.stderr or proc.stdout or "?"))
+        return None
+    # Also build a static ET_EXEC for validate-only path.
+    static_path = out_path.replace(".so", ".static")
+    if static_path != out_path:
+        subprocess.run(["gcc", "-O0", "-nostdlib", "-static", "-fno-pie",
+                        "-no-pie", "-Wl,-e,guest_entry", src, "-o", static_path],
+                       capture_output=True, text=True)
+    return out_path
+
+
 def build(roots, verbose, upstream_only):
     """Compile the upstream subset and the CrustOS shim into one binary."""
     paths = require_sources(roots)
@@ -356,7 +376,9 @@ def build(roots, verbose, upstream_only):
 
     # libc symbols the final link supplies anyway.
     provided = {"printf", "malloc", "free", "realloc", "memcpy", "memset",
-                "abort", "exit", "strlen", "puts", "fprintf", "stderr"}
+                "abort", "exit", "strlen", "puts", "fprintf", "stderr",
+                "open", "close", "read", "lseek", "getenv", "mprotect",
+                "fflush"}
     objs, dropped = linkable_subset(objs, provided)
     if dropped:
         print("   %d dropped so the set links (%d kept)"
@@ -384,16 +406,26 @@ def build(roots, verbose, upstream_only):
         print("   FAILED: %s" % diagnostic(proc))
         return 1
     print("   linked %s  (%d upstream objects)" % (binary, len(objs)))
+    guest = build_guest(os.path.join(BUILD, "hello_guest.so"))
+    if guest:
+        print("   guest  %s" % guest)
     return 0
 
 
-def run(roots, verbose):
+def run(roots, verbose, elf_path=None):
     rc = build(roots, verbose, False)
     if rc != 0:
         return rc
     print("\n== running ==")
+    env = os.environ.copy()
+    if elf_path:
+        env["CRUSTOS_ELF"] = elf_path
+    elif "CRUSTOS_ELF" not in env:
+        guest = os.path.join(BUILD, "hello_guest.so")
+        if os.path.exists(guest):
+            env["CRUSTOS_ELF"] = guest
     proc = subprocess.run([os.path.join(BUILD, "crustos")],
-                          capture_output=True, text=True)
+                          capture_output=True, text=True, env=env)
     sys.stdout.write(proc.stdout)
     if proc.stderr:
         sys.stderr.write(proc.stderr)
@@ -423,6 +455,8 @@ def main(argv):
     ap.add_argument("--blockers", action="store_true")
     ap.add_argument("--upstream-only", action="store_true",
                     help="build: stop after the upstream objects")
+    ap.add_argument("--elf", default=None,
+                    help="run: path to a static/PIE guest ELF (sets CRUSTOS_ELF)")
     ap.add_argument("--top", type=int, default=12)
     args = ap.parse_args(argv)
 
@@ -441,7 +475,7 @@ def main(argv):
         return 0
     if args.mode == "build":
         return build(roots, args.verbose, args.upstream_only)
-    return run(roots, args.verbose)
+    return run(roots, args.verbose, elf_path=args.elf)
 
 
 if __name__ == "__main__":

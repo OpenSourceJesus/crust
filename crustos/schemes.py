@@ -12,7 +12,7 @@ a `PyList<i32>`, so nothing is copied at the boundary.
 
 SCHEME_NONE = -1
 
-_NAMES = ["sys", "memory", "file", "pipe", "irq", "debug"]
+_NAMES = ["sys", "memory", "file", "pipe", "irq", "debug", "gpu"]
 
 
 def scheme_count() -> int:
