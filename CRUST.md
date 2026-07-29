@@ -1105,6 +1105,25 @@ exists. A kernel's string handling is short and bounded. For *userspace*
 CrustOS code the tradeoff runs the other way, and the rpython runtime is the
 better answer there.
 
+## Inline assembly
+
+ShivyCX supports GCC-style `__asm__`, and Crust relies on it for anything that
+will eventually lower Rust's `asm!`. Read-write operands (`+r`, `+m`) needed a
+fix: a register output was given a fresh temporary that nothing initialised,
+so a `+` operand -- which is an *input* as well as an output -- operated on
+whatever the allocator had left in the register.
+`__asm__("addl $37, %0" : "+r"(x))` with `x == 5` produced an address.
+
+Three things have to agree, and fixing any two changes nothing: the tree pass
+seeds the temporary from the lvalue, `InlineAsm.inputs()` lists the operand so
+the allocator keeps it live, and `make_asm` emits the pre-move.
+
+A caution for anyone testing this: **a lone `asm` in a tiny function passes
+either way**, because the allocator happens to leave the value where the asm
+reads it. The bug only appears with enough surrounding code for those to
+disagree. A regression test here has to be checked against the unfixed
+compiler or it proves nothing.
+
 ## Blocks as expressions
 
 A block used as a value may run statements before its tail expression, which
