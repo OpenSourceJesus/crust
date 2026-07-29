@@ -4089,6 +4089,115 @@ static char* _ospath_abspath(char* p) {
     return _ospath_join(_cwd, p);
 }
 static int _ospath_exists(char* p) { return access(p, 0) == 0; }
+/* SHA-256, for `hashlib.sha256(x).hexdigest()`. Implemented rather than
+   stubbed because the one caller in this codebase uses it for *cache keys*:
+   a constant digest would silently make every module share one cache entry,
+   which is worse than a compile error. FIPS 180-4, tested against known
+   digests. */
+static const unsigned int _sha_k[64] = {
+0x428a2f98u,0x71374491u,0xb5c0fbcfu,0xe9b5dba5u,0x3956c25bu,0x59f111f1u,
+0x923f82a4u,0xab1c5ed5u,0xd807aa98u,0x12835b01u,0x243185beu,0x550c7dc3u,
+0x72be5d74u,0x80deb1feu,0x9bdc06a7u,0xc19bf174u,0xe49b69c1u,0xefbe4786u,
+0x0fc19dc6u,0x240ca1ccu,0x2de92c6fu,0x4a7484aau,0x5cb0a9dcu,0x76f988dau,
+0x983e5152u,0xa831c66du,0xb00327c8u,0xbf597fc7u,0xc6e00bf3u,0xd5a79147u,
+0x06ca6351u,0x14292967u,0x27b70a85u,0x2e1b2138u,0x4d2c6dfcu,0x53380d13u,
+0x650a7354u,0x766a0abbu,0x81c2c92eu,0x92722c85u,0xa2bfe8a1u,0xa81a664bu,
+0xc24b8b70u,0xc76c51a3u,0xd192e819u,0xd6990624u,0xf40e3585u,0x106aa070u,
+0x19a4c116u,0x1e376c08u,0x2748774cu,0x34b0bcb5u,0x391c0cb3u,0x4ed8aa4au,
+0x5b9cca4fu,0x682e6ff3u,0x748f82eeu,0x78a5636fu,0x84c87814u,0x8cc70208u,
+0x90befffau,0xa4506cebu,0xbef9a3f7u,0xc67178f2u};
+#define _SHR(x,n) ((x) >> (n))
+#define _ROR(x,n) (((x) >> (n)) | ((x) << (32 - (n))))
+static void _sha256_block(unsigned int* h, const unsigned char* p) {
+    unsigned int w[64], a,b,c,d,e,f,g,hh,t1,t2; int i;
+    for (i = 0; i < 16; i++)
+        w[i] = ((unsigned int)p[i*4] << 24) | ((unsigned int)p[i*4+1] << 16)
+             | ((unsigned int)p[i*4+2] << 8) | (unsigned int)p[i*4+3];
+    for (i = 16; i < 64; i++) {
+        unsigned int s0 = _ROR(w[i-15],7) ^ _ROR(w[i-15],18) ^ _SHR(w[i-15],3);
+        unsigned int s1 = _ROR(w[i-2],17) ^ _ROR(w[i-2],19) ^ _SHR(w[i-2],10);
+        w[i] = w[i-16] + s0 + w[i-7] + s1;
+    }
+    a=h[0];b=h[1];c=h[2];d=h[3];e=h[4];f=h[5];g=h[6];hh=h[7];
+    for (i = 0; i < 64; i++) {
+        unsigned int S1 = _ROR(e,6) ^ _ROR(e,11) ^ _ROR(e,25);
+        unsigned int ch = (e & f) ^ ((~e) & g);
+        unsigned int S0 = _ROR(a,2) ^ _ROR(a,13) ^ _ROR(a,22);
+        unsigned int mj = (a & b) ^ (a & c) ^ (b & c);
+        t1 = hh + S1 + ch + _sha_k[i] + w[i];
+        t2 = S0 + mj;
+        hh=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
+    }
+    h[0]+=a;h[1]+=b;h[2]+=c;h[3]+=d;h[4]+=e;h[5]+=f;h[6]+=g;h[7]+=hh;
+}
+static char* _sha256_hex(char* msg) {
+    unsigned int h[8] = {0x6a09e667u,0xbb67ae85u,0x3c6ef372u,0xa54ff53au,
+                         0x510e527fu,0x9b05688cu,0x1f83d9abu,0x5be0cd19u};
+    unsigned long n = msg ? (unsigned long)strlen(msg) : 0UL;
+    unsigned long i;
+    unsigned char blk[64];
+    for (i = 0; i + 64 <= n; i += 64)
+        _sha256_block(h, (const unsigned char*)msg + i);
+    unsigned long rem = n - i;
+    for (unsigned long j = 0; j < rem; j++) blk[j] = (unsigned char)msg[i+j];
+    blk[rem] = 0x80;
+    if (rem >= 56) {
+        for (unsigned long j = rem + 1; j < 64; j++) blk[j] = 0;
+        _sha256_block(h, blk);
+        for (unsigned long j = 0; j < 56; j++) blk[j] = 0;
+    } else {
+        for (unsigned long j = rem + 1; j < 56; j++) blk[j] = 0;
+    }
+    unsigned long bits = n * 8UL;
+    for (int j = 0; j < 8; j++)
+        blk[56 + j] = (unsigned char)((bits >> (56 - 8*j)) & 0xFFUL);
+    _sha256_block(h, blk);
+    char* out = malloc(65);
+    for (int j = 0; j < 8; j++) {
+        static const char* hx = "0123456789abcdef";
+        for (int k = 0; k < 8; k++)
+            out[j*8+k] = hx[(h[j] >> (28 - 4*k)) & 0xFu];
+    }
+    out[64] = 0;
+    return out;
+}
+/* os.path.getmtime: seconds since the epoch, or -1 if the path is gone. The
+   real one raises OSError; returning -1 keeps the common "is A newer than B"
+   comparison working, since a missing file compares older than anything. */
+/* os.path.splitext: returns (root, ext) as a two-element list so `[0]` and
+   `[1]` both work. The extension keeps its leading dot, as Python's does. */
+static obj _ospath_splitext(char* p) {
+    long n = p ? (long)strlen(p) : 0;
+    long dot = -1, i;
+    for (i = n - 1; i >= 0; i--) {
+        if (p[i] == '/') break;
+        if (p[i] == '.' && dot < 0) dot = i;
+    }
+    /* A leading dot is part of the name, not an extension: ".bashrc". */
+    long sl = -1;
+    for (i = n - 1; i >= 0; i--) { if (p[i] == '/') { sl = i; break; } }
+    if (dot <= sl + 1) dot = -1;
+    char* root; char* ext;
+    if (dot < 0) {
+        root = malloc((unsigned long)n + 1);
+        memcpy(root, p, (unsigned long)n); root[n] = 0;
+        ext = malloc(1); ext[0] = 0;
+    } else {
+        root = malloc((unsigned long)dot + 1);
+        memcpy(root, p, (unsigned long)dot); root[dot] = 0;
+        ext = malloc((unsigned long)(n - dot) + 1);
+        memcpy(ext, p + dot, (unsigned long)(n - dot)); ext[n - dot] = 0;
+    }
+    obj l = list_new();
+    list_append(l, OBJ_STR(root));
+    list_append(l, OBJ_STR(ext));
+    return l;
+}
+static long _ospath_getmtime(char* p) {
+    struct stat _st;
+    if (stat(p, &_st) != 0) return -1;
+    return (long)_st.st_mtime;
+}
 static obj _os_makedirs(char* p) {
     char b[4096]; long n = (long)strlen(p); if (n >= 4096) return OBJ_NONE;
     for (long i = 0; i <= n; i++) {
@@ -11103,6 +11212,17 @@ class Transpiler:
                 if f.attr == "exists":
                     self._ossys_used = True
                     return "_ospath_exists(%s)" % self._coerce_str_arg(node, 0)
+                if f.attr == "splitext":
+                    self._ossys_used = True
+                    return ("_ospath_splitext(%s)"
+                            % self._coerce_str_arg(node, 0))
+                if f.attr == "getmtime":
+                    # Unsupported before this: the emitted call treated
+                    # `os.path` as a receiver object that does not exist, so
+                    # the module failed with "'os_path' undeclared".
+                    self._ossys_used = True
+                    return ("_ospath_getmtime(%s)"
+                            % self._coerce_str_arg(node, 0))
                 if f.attr == "join" and len(node.args) >= 2:
                     self._ossys_used = True
                     e = "_ospath_join(%s, %s)" % (self._coerce_str_arg(node, 0), self._coerce_str_arg(node, 1))
@@ -11768,6 +11888,36 @@ class Transpiler:
             return "%s_%s((%s*)self%s)" % (
                 base.csym, func.attr, base.csym,
                 (", " + ", ".join(argstrs)) if argstrs else "")
+
+        # `hashlib.sha256(X).hexdigest()` -- the one-shot form. Matched before
+        # the generic attribute-call path below, which lowers the inner
+        # `sha256(...)` to OBJ_NONE and then emits an undeclared
+        # `hexdigest(...)` returning `int`, breaking any subsequent slice.
+        #
+        # Implemented rather than stubbed because the caller in `rpyinc` uses
+        # the digest as a *cache key*: a constant would silently make every
+        # module share one cache entry. The incremental form
+        # (`h = sha256(); h.update(..)`) is still unsupported.
+        if isinstance(func, ast.Attribute) and func.attr == "hexdigest" \
+                and not node.args \
+                and isinstance(func.value, ast.Call) \
+                and isinstance(func.value.func, ast.Attribute) \
+                and func.value.func.attr == "sha256" \
+                and isinstance(func.value.func.value, ast.Name) \
+                and func.value.func.value.id == "hashlib" \
+                and len(func.value.args) == 1:
+            self._ossys_used = True
+            inner = func.value.args[0]
+            # `.encode("utf-8")` is a no-op here: the runtime hashes the bytes
+            # of a C string either way.
+            while isinstance(inner, ast.Call) \
+                    and isinstance(inner.func, ast.Attribute) \
+                    and inner.func.attr == "encode":
+                inner = inner.func.value
+            # Boxed: `hexdigest()` is a `str`, and the common use is a slice
+            # (`[:12]`), whose helper takes an `obj`.
+            return "OBJ_STR(_sha256_hex(%s))" % self.coerce_to(
+                "char*", inner, self.expr(inner))
 
         if isinstance(func, ast.Attribute):
             # A receiver known to hold a compiled pattern (`_RE = re.compile(...)`)
