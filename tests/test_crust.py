@@ -3821,3 +3821,67 @@ fn total(xs: *mut PyList<i32>) -> i32 {
 }
 int main(void) { return total((PyList_int *)make(10)) - 3; }
 """, extra={"b.py": self.LIST}), 42)
+
+
+class TestPyListZeroCapacity(unittest.TestCase):
+    """Growing a list that starts with no capacity.
+
+    py2c's typed-list `push` doubled -- `cap = cap * 2` -- so a list with
+    `cap == 0` never allocated and the first write landed in a zero-sized
+    allocation. Its *dynamic* list helper already guarded this
+    (`cap ? cap * 2 : 4`); only the typed one did not.
+
+    That made a `PyList` unusable unless rpython had built it, which is a
+    surprising constraint to put on a type Rust can otherwise construct.
+    """
+
+    LIST = ('def make(n: int) -> "list[int]":\n'
+            '    out: "list[int]" = []\n'
+            '    i = 0\n'
+            '    while i < n:\n'
+            '        out.append(i)\n'
+            '        i += 1\n'
+            '    return out\n')
+
+    def test_push_onto_a_zero_capacity_list(self):
+        self.assertEqual(_run("""
+#include "b.py"
+fn fill(xs: *mut PyList<i32>) -> i32 {
+    for i in 0..5 { xs.push(i * 10); }
+    let mut s: i32 = 0;
+    for x in xs { s += x; }
+    s
+}
+int main(void) {
+    _tlist_int zero = {0, 0, 0};
+    return fill((PyList_int *)&zero) - 58;
+}
+""", extra={"b.py": self.LIST}), 42)
+
+    def test_push_after_clear(self):
+        # `clear` sets the length to zero but leaves the capacity, so this
+        # was already fine -- pinned so the fix above cannot regress it.
+        self.assertEqual(_run("""
+#include "b.py"
+fn refill(xs: *mut PyList<i32>) -> i32 {
+    xs.clear();
+    xs.push(42);
+    xs.pop()
+}
+int main(void) { return refill((PyList_int *)make(3)); }
+""", extra={"b.py": self.LIST}), 42)
+
+    def test_growth_past_the_initial_block(self):
+        self.assertEqual(_run("""
+#include "b.py"
+fn many(xs: *mut PyList<i32>) -> i32 {
+    for i in 0..100 { xs.push(1); }
+    let mut s: i32 = 0;
+    for x in xs { s += x; }
+    s
+}
+int main(void) {
+    _tlist_int zero = {0, 0, 0};
+    return many((PyList_int *)&zero) - 58;
+}
+""", extra={"b.py": self.LIST}), 42)
