@@ -2807,15 +2807,18 @@ class Parser:
         self.parse_block(out, indent, tail_returns)
         if self.accept("else"):
             if self.at("if", "kw"):
-                out.write(" else")
-                # keep `else if` on the branch's own line
+                # `else if` is kept on the branch's own line when the source
+                # put it there, so line numbers do not drift. The `else` is
+                # written *once*: either here, or after the sync if that
+                # started a fresh line -- writing it before the sync as well
+                # produced `} else\nelse if (..)`, which C rejects.
                 nxt = self.cur
                 out.sync(nxt.line)
                 if out.col == 0:
                     out.write("    " * indent)
                     out.write("else ")
                 else:
-                    out.write(" ")
+                    out.write(" else ")
                 self.parse_if_tail(out, indent, tail_returns)
             else:
                 out.write(" else")
