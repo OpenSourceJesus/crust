@@ -3754,3 +3754,70 @@ fn main() -> i32 {
             "main": ("int twice(int);\n"
                      "fn main() -> i32 { twice(21) }\n"),
         }, "main"), 42)
+
+
+class TestPyListMutation(unittest.TestCase):
+    """Writing to a list an rpython module built.
+
+    I claimed for several rounds that this direction was blocked because
+    py2c's list helpers are `static`. That was wrong: an `#include "x.py"`
+    puts the generated C in *this* translation unit, so they were callable all
+    along -- just unspelled, requiring
+    `_tlist_int_push(xs as *mut _tlist_int, v)` at the call site.
+    """
+
+    LIST = ('def make(n: int) -> "list[int]":\n'
+            '    out: "list[int]" = []\n'
+            '    i = 0\n'
+            '    while i < n:\n'
+            '        out.append(i)\n'
+            '        i += 1\n'
+            '    return out\n')
+
+    def test_push_grows_the_list(self):
+        self.assertEqual(_run("""
+#include "b.py"
+fn extend(xs: *mut PyList<i32>) -> i32 {
+    xs.push(100);
+    xs.push(200);
+    let mut s: i32 = 0;
+    for x in xs { s += x; }
+    s
+}
+int main(void) { return extend((PyList_int *)make(3)) - 261; }
+""", extra={"b.py": self.LIST}), 42)
+
+    def test_pop_returns_the_element(self):
+        self.assertEqual(_run("""
+#include "b.py"
+fn churn(xs: *mut PyList<i32>) -> i32 { xs.push(42); xs.pop() }
+int main(void) { return churn((PyList_int *)make(2)); }
+""", extra={"b.py": self.LIST}), 42)
+
+    def test_clear_resets_the_length(self):
+        # py2c emits `new`, `push` and `pop` and nothing else, so `clear` is
+        # lowered to what it is rather than a call that does not exist.
+        self.assertEqual(_run("""
+#include "b.py"
+fn wipe(xs: *mut PyList<i32>) -> i32 {
+    xs.clear();
+    xs.push(42);
+    xs.pop()
+}
+int main(void) { return wipe((PyList_int *)make(5)); }
+""", extra={"b.py": self.LIST}), 42)
+
+    def test_wrong_arity_is_reported(self):
+        with self.assertRaises(crust.CrustError):
+            crust.translate("fn f(xs: *mut PyList<i32>) { xs.push(); }")
+
+    def test_read_direction_still_works(self):
+        self.assertEqual(_run("""
+#include "b.py"
+fn total(xs: *mut PyList<i32>) -> i32 {
+    let mut s: i32 = 0;
+    for x in xs { s += x; }
+    s
+}
+int main(void) { return total((PyList_int *)make(10)) - 3; }
+""", extra={"b.py": self.LIST}), 42)
