@@ -332,6 +332,30 @@ the includer, without inlining its text. That is what lets a Rust function in
 the C file construct a `Vec2` or call `Vec2::new`, while the `#include` itself
 stays in place for the preprocessor to expand.
 
+## Writing to an rpython list
+
+`PyList<T>` is py2c's own list, so its mutating methods *are* py2c's helpers:
+`xs.push(v)` lowers to `_tlist_int_push((_tlist_int *)xs, v)`.
+
+Those helpers are `static`, and for several rounds I recorded that as the
+reason the write direction was blocked. **That was wrong.** An
+`#include "x.py"` puts the generated C in *this* translation unit, so they
+were callable the whole time — just unspelled, requiring the cast and the
+mangled name at every call site.
+
+`push`, `pop` and `clear` are supported. py2c emits only `new`, `push` and
+`pop`, so `clear` lowers to a length reset rather than a call to a function
+that does not exist.
+
+**A `PyList` must come from the rpython side.** py2c's `push` grows by
+doubling — `cap = cap * 2` — so a hand-constructed list with `cap == 0` never
+allocates and the first write lands in a zero-sized allocation. That is a
+latent bug in py2c rather than in Crust, but the constraint is real either
+way: get lists from rpython, do not build them in Rust.
+
+See `examples/crust/twoway.c` and `sieve.py`: rpython builds, Rust compacts in
+place, C reads the result, and nothing is copied in either direction.
+
 ## Interop notes
 
 Three things bite when Rust and rpython meet in one unit, all mechanical once
