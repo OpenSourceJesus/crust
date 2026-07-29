@@ -169,6 +169,15 @@ def _prelude_for(code):
     """
     import shivyc.main as main
     prelude = []
+    # A module that avoids the transpiler runtime loses `shivyc_rt.h`, and
+    # with it `<stdbool.h>`. py2c still writes `bool` for a Python truth
+    # value, so the typedef has to come from somewhere -- a pure numeric
+    # kernel that happens to use a flag was otherwise rejected with
+    # "expected ';' after 'bool'".
+    if main._has_word(code, "bool"):
+        prelude.append("typedef _Bool bool;")
+        prelude.append("#define true 1")
+        prelude.append("#define false 0")
     for sym, proto in _LIBC_PROTOS:
         if main._has_word(code, sym):
             prelude.append(proto)

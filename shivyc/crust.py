@@ -1998,6 +1998,33 @@ class Parser:
             return self.result_method(recv, name, args)
         if recv.type is not None and recv.type.base in self.unit.options:
             return self.option_method(recv, name, args)
+        # `PyList<T>` is py2c's own list, so its mutating methods are py2c's
+        # own helpers. They are `static`, which is fine: an `#include "x.py"`
+        # puts the generated C in *this* translation unit, so they are
+        # callable -- the write direction was never actually blocked, only
+        # unspelled. This turns `xs.push(v)` into the call the user would
+        # otherwise write as `_tlist_int_push(xs as *mut _tlist_int, v)`.
+        inst = self.unit.instances.get(
+            recv.type.base if recv.type is not None else "", (None, None))
+        if inst[0] == "PyList" and name == "clear":
+            arrow = "->" if (recv.type and recv.type.ptr) else "."
+            return Expr("(%s%slen = 0)" % (recv.code, arrow),
+                        CType("long"))
+        if inst[0] == "PyList" and name in _PYLIST_MUTATORS:
+            elem = inst[1][0]
+            tl = _tlist_name(elem)
+            arrow = recv.code if (recv.type and recv.type.ptr) \
+                else "&" + _addressable(recv.code)
+            fn, ret = _PYLIST_MUTATORS[name]
+            if len(args) != fn[1]:
+                self.err("`PyList::%s` takes %d argument%s, got %d", name,
+                         fn[1], "" if fn[1] == 1 else "s", len(args))
+            call = "%s_%s((%s *)%s%s)" % (
+                tl, fn[0], tl, arrow,
+                "".join(", " + a for a in args))
+            return Expr(call, elem if ret == "elem" else
+                        (CType("void") if ret is None else CType(ret)))
+
         if recv.type is not None and recv.type.base in self.unit.slices:
             if name == "len":
                 return Expr("%s.len" % recv.code, CType("unsigned long"))
@@ -3862,6 +3889,27 @@ def _core_intrinsic(name):
 def _has_word(text, word):
     """True if `word` appears in `text` as a whole identifier."""
     return re.search(r"\b%s\b" % re.escape(word), text) is not None
+
+
+def _tlist_name(elem):
+    """py2c's C struct name for a typed list, from `tools/py2c.py`.
+
+    Kept identical to `_tlist_name` there. The two must agree exactly: a
+    mismatch here produces a call to a function that does not exist, and the
+    error names a mangled symbol rather than the method that was written.
+    """
+    return "_tlist_" + elem.decl().replace(" ", "_").replace("*", "p")
+
+
+# `PyList` method -> (py2c helper suffix, arity), return kind.
+#
+# Only the helpers py2c actually generates. It emits `new`, `push` and `pop`
+# and nothing else, so `clear` is lowered to what it is -- a length reset --
+# rather than a call to a function that does not exist.
+_PYLIST_MUTATORS = {
+    "push": (("push", 1), None),
+    "pop": (("pop", 0), "elem"),
+}
 
 
 def _is_lvalue(code):
