@@ -347,11 +347,12 @@ mangled name at every call site.
 `pop`, so `clear` lowers to a length reset rather than a call to a function
 that does not exist.
 
-**A `PyList` must come from the rpython side.** py2c's `push` grows by
-doubling — `cap = cap * 2` — so a hand-constructed list with `cap == 0` never
-allocates and the first write lands in a zero-sized allocation. That is a
-latent bug in py2c rather than in Crust, but the constraint is real either
-way: get lists from rpython, do not build them in Rust.
+A `PyList` may be built on either side. py2c's typed-list `push` used to grow
+by doubling — `cap = cap * 2` — so a list starting at `cap == 0` never
+allocated and the first write landed in a zero-sized allocation. Its
+*dynamic* list helper already guarded that case; only the typed one did not.
+Fixed in `tools/py2c.py`, so a `PyList` Rust constructs behaves like one
+rpython handed over.
 
 See `examples/crust/twoway.c` and `sieve.py`: rpython builds, Rust compacts in
 place, C reads the result, and nothing is copied in either direction.
