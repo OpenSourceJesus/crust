@@ -1,0 +1,38 @@
+Redox source survey -- 525 .rs files
+
+  translated (Crust saw most of the file)          49    9.3%
+  partial    (some items lowered)                  59   11.2%
+  failed     (items found, translation errored)   379   72.2%
+  empty      (no Rust items Crust recognizes)      38    7.2%
+
+  top-level Rust items parsed: 7471
+  files with at least one lowered item: 108
+
+verified by compiling:
+  94 of 108 produce an object  (17.9% of all 525 files)
+
+  what stops the rest:
+      2  expected declaration specifier at 'crust_slice_Self_Char'
+      2  use of undeclared identifier '_SS_PADDING'
+      1  expected declaration specifier at 'CleanLockToken'
+      1  expected declaration specifier at 'crust_tuple_unsigned_long_unsigned_long_unsigned_long_u
+      1  expected declaration specifier at 'Page'
+      1  unexpected token at 'pub'
+      1  non-constant initializer for variable with static storage duration
+      1  use of undeclared identifier 'super_constants_SIGABRT'
+      1  use of undeclared identifier 'FIONREAD'
+      1  use of undeclared identifier 'ELF_PRARGSZ'
+
+most frequent messages (of 379 failing files):
+    52  no definition for generic type `X` in this unit; Crust monomorphises from source and has no std
+    36  no method `X` on type `X`
+    27  cannot infer a type for `X`; add an annotation (`X`)
+    22  unexpected '<eof>' in expression
+    22  cannot instantiate `X` over `X`: this unit has no definition for `X`, only its name
+    22  macro `X` is not supported; Crust expands the standard control and printing macros and any `X` d
+    12  expected `X` after expression
+    11  cannot infer the type of the receiver of `X`; annotate it
+    10  unexpected '#' in expression
+     8  cannot infer the type of `X`; annotate the target (`X`)
+     8  expected a type, found '..'
+     7  expected identifier, found '&'

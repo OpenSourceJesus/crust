@@ -1,0 +1,54 @@
+525 files: 108 with a lowered item, 417 without
+
+blockers per failing file:
+   0 blockers   107 files   25.7%   (cumulative  25.7%)
+   1 blocker    112 files   26.9%   (cumulative  52.5%)
+   2 blockers    74 files   17.7%   (cumulative  70.3%)
+   3 blockers    41 files    9.8%   (cumulative  80.1%)
+   4 blockers    41 files    9.8%   (cumulative  89.9%)
+   5 blockers    23 files    5.5%   (cumulative  95.4%)
+   6 blockers    10 files    2.4%   (cumulative  97.8%)
+   7 blockers     4 files    1.0%   (cumulative  98.8%)
+   8 blockers     3 files    0.7%   (cumulative  99.5%)
+   9 blockers     2 files    0.5%   (cumulative 100.0%)
+  mean 1.9 blockers per failing file
+
+frequency (how often a feature appears at all):
+   178   42.7%  match-binding
+   148   35.5%  iterator-chain
+   114   27.3%  nested-generic
+    82   19.7%  std-generic
+    62   14.9%  inline-asm
+    58   13.9%  string-type
+    43   10.3%  assoc-type
+    26    6.2%  closure-capture
+    19    4.6%  where-clause
+    18    4.3%  module
+    11    2.6%  union
+    10    2.4%  operator-trait
+
+sole blocker (files this feature would unlock on its own):
+    41  match-binding
+    26  inline-asm
+    19  iterator-chain
+     6  std-generic
+     5  nested-generic
+     5  string-type
+     4  assoc-type
+     4  union
+     1  where-clause
+     1  module
+
+greedy set cover (cumulative files unlocked):
+  +match-binding      unlocks   41  (total   41 of 417)
+  +inline-asm         unlocks   36  (total   77 of 417)
+  +iterator-chain     unlocks   40  (total  117 of 417)
+  +nested-generic     unlocks   19  (total  136 of 417)
+  +std-generic        unlocks   42  (total  178 of 417)
+  +string-type        unlocks   41  (total  219 of 417)
+  +assoc-type         unlocks   18  (total  237 of 417)
+  +module             unlocks   12  (total  249 of 417)
+  +where-clause       unlocks   11  (total  260 of 417)
+  +closure-capture    unlocks   12  (total  272 of 417)
+  +union              unlocks   11  (total  283 of 417)
+  +operator-trait     unlocks    8  (total  291 of 417)
