@@ -2390,7 +2390,8 @@ class Parser:
     def parse_primary(self):
         t = self.next()
         if t.kind == "num":
-            return Expr(*normalize_number(t))
+            return Expr(normalize_number_code(t),
+                        normalize_number_type(t))
         if t.kind == "str":
             return Expr(t.val, RustCType("const char", 1))
         if t.kind == "chr":
@@ -3036,7 +3037,7 @@ class Parser:
         """Parse one `match` pattern into a C `case` label."""
         t = self.next()
         if t.kind == "num":
-            return normalize_number(t)[0]
+            return normalize_number_code(t)
         if t.kind == "chr":
             return t.val
         if t.val == "true":
@@ -3044,7 +3045,7 @@ class Parser:
         if t.val == "false":
             return "0"
         if t.val == "-" and self.cur.kind == "num":
-            return "-" + normalize_number(self.next())[0]
+            return "-" + normalize_number_code(self.next())
         if t.kind == "ident":
             name = t.val
             while self.at("::", "punc"):
@@ -3982,41 +3983,76 @@ def render_params(params):
     return ", ".join(ty.decl(_c_name(nm)) for nm, ty in params)
 
 
-def normalize_number(tok):
-    """Map a Rust numeric literal onto C, returning (code, RustCType)."""
-    text = tok.val.replace("_", "")
-    # Longest suffix first, so `i16` is not read as `i1`+`6`. A plain endswith
-    # scan replaces the pattern; py2c has no regex engine.
-    suffix = ""
+def _num_suffix(text):
+    """The Rust type suffix on a numeric literal, or `""`."""
     for cand in _NUM_SUFFIXES:
         # `len(text) > len(cand)` keeps a bare type name from being read as a
-        # suffix with an empty body. The regex had no such guard; this only
-        # ever sees number tokens, so the difference is unreachable, but an
-        # empty literal would be a silent miscompile if it ever were.
+        # suffix with an empty body. The pattern this replaced had no such
+        # guard; this only ever sees number tokens, so the difference is
+        # unreachable, but an empty literal would be a silent miscompile.
         if text.endswith(cand) and len(text) > len(cand):
-            suffix = cand
-            text = text[:-len(cand)]
-            break
-    if text.startswith(("0b", "0B")):
-        text = str(int(text[2:], 2))
-    elif text.startswith(("0o", "0O")):
-        text = str(int(text[2:], 8))
-    is_hex = text.startswith(("0x", "0X"))
-    is_float = ("." in text
-                or (("e" in text or "E" in text) and not is_hex))
-    if suffix.startswith("f") or is_float:
-        if suffix == "f32":
-            return text + "f", RustCType("float")
-        return text, RustCType("double")
+            return cand
+    return ""
+
+
+def _num_body(text):
+    """A Rust numeric literal's digits as C, with the suffix and `_` removed.
+
+    Binary and octal are converted to decimal, since C has no `0b` and reads a
+    leading `0` as octal already; hex passes through.
+    """
+    text = text.replace("_", "")
+    suffix = _num_suffix(text)
     if suffix:
-        base = PRIMITIVES[suffix]
-        c_suffix = ""
-        if "unsigned" in base:
-            c_suffix += "u"
-        if base.endswith("long"):
-            c_suffix += "l"
-        return text + c_suffix, RustCType(base)
-    return text, RustCType("int")
+        text = text[:-len(suffix)]
+    if text.startswith(("0b", "0B")):
+        return str(int(text[2:], 2))
+    if text.startswith(("0o", "0O")):
+        return str(int(text[2:], 8))
+    return text
+
+
+def _num_is_float(body, suffix):
+    """True if a literal is floating point, by its digits or its suffix."""
+    if suffix.startswith("f"):
+        return True
+    is_hex = body.startswith(("0x", "0X"))
+    return "." in body or (("e" in body or "E" in body) and not is_hex)
+
+
+def normalize_number_code(tok):
+    """A Rust numeric literal as a C literal.
+
+    Split from `normalize_number_type` because py2c cannot represent a
+    tuple-returning function, and this module is transpiled by py2c when
+    ShivyCX self-hosts. Two callers only ever wanted the code, so the split
+    reads better than the pair did.
+    """
+    body = _num_body(tok.val)
+    suffix = _num_suffix(tok.val.replace("_", ""))
+    if _num_is_float(body, suffix):
+        return body + "f" if suffix == "f32" else body
+    if not suffix:
+        return body
+    base = PRIMITIVES[suffix]
+    c_suffix = ""
+    if "unsigned" in base:
+        c_suffix += "u"
+    if base.endswith("long"):
+        c_suffix += "l"
+    return body + c_suffix
+
+
+def normalize_number_type(tok):
+    """The C type of a Rust numeric literal."""
+    body = _num_body(tok.val)
+    suffix = _num_suffix(tok.val.replace("_", ""))
+    if _num_is_float(body, suffix):
+        return RustCType("float" if suffix == "f32" else "double")
+    if suffix:
+        return RustCType(PRIMITIVES[suffix])
+    return RustCType("int")
+
 
 
 # --------------------------------------------------------------------------
@@ -4726,6 +4762,52 @@ def _dedupe(items):
         seen[it] = True
         out.append(it)
     return out
+
+
+def _replace_word(text, word, repl):
+    """Replace whole-word occurrences of `word` with `repl`.
+
+    The `\\b..\\b` substitution, written out. Scanning left to right and
+    advancing past the replacement means a replacement containing `word` cannot
+    be rewritten again.
+    """
+    if not word:
+        return text
+    out = []
+    i = 0
+    n, w = len(text), len(word)
+    while True:
+        j = text.find(word, i)
+        if j < 0:
+            out.append(text[i:])
+            return "".join(out)
+        before_ok = j == 0 or not _is_word_char(text[j - 1])
+        after_ok = j + w >= n or not _is_word_char(text[j + w])
+        if before_ok and after_ok:
+            out.append(text[i:j])
+            out.append(repl)
+            i = j + w
+        else:
+            out.append(text[i:j + w])
+            i = j + w
+
+
+def _strip_digit_separators(text):
+    """Remove `_` between two digits of a numeric literal.
+
+    Rust writes `0xFFFF_FFFF` and `1_000`. The lookaround pattern this replaces
+    kept an underscore that was *not* between digits, so `FOO_BAR` survives --
+    which matters, because a const name reaches this function too.
+    """
+    hexish = "0123456789abcdefABCDEFxX"
+    digits = "0123456789abcdefABCDEF"
+    out = []
+    for i, ch in enumerate(text):
+        if ch == "_" and i > 0 and i + 1 < len(text) \
+                and text[i - 1] in hexish and text[i + 1] in digits:
+            continue
+        out.append(ch)
+    return "".join(out)
 
 
 def _is_identifier(text):
@@ -6098,9 +6180,9 @@ def _fold_int_const(init, env):
     if env:
         for name in sorted(env, key=len, reverse=True):
             if name in s:
-                s = re.sub(r"\b%s\b" % re.escape(name), str(env[name]), s)
+                s = _replace_word(s, name, str(env[name]))
     # Strip Rust digit separators from numeric literals only.
-    s = re.sub(r"(?<=[\da-fA-FxX])_(?=[\da-fA-F])", "", s)
+    s = _strip_digit_separators(s)
     try:
         val, end = _int_expr(s, 0)
     except (ValueError, RecursionError):
