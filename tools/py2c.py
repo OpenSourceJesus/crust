@@ -343,6 +343,7 @@ obj  str_partition(str s, str sep);/* (before, sep_or_'', after) as a 3-list  */
 obj  str_splitlines(str s);
 str  str_replace(str s, str a, str b);
 long str_find(str s, str sub, bool last);
+long str_find_from(str s, str sub, bool last, long start);
 bool str_isdigit(str s);
 bool str_isalpha(str s);
 bool str_isspace(str s);
@@ -813,6 +814,22 @@ static size_t g_ap = 0;
 #define ARENA_BUCKETS 4096u   /* sizes 16..65536 bytes are pooled for reuse */
 static void* g_free[ARENA_BUCKETS];
 
+
+/* Interned one-character strings. Indexing a string yields a fresh `str`, and
+ * `for ch in text` does that once per character -- which on a self-hosted
+ * compile was 67 million 16-byte allocations, 99% of the arena and the reason
+ * it ran out. There are only 256 of them, so they are built once and shared.
+ * Never freed, which is correct: they are immutable and always live. */
+static char g_chars[256][2];
+static int  g_chars_ready = 0;
+static char* _char_str(char ch) {
+    if (!g_chars_ready) {
+        for (int k = 0; k < 256; k++) { g_chars[k][0] = (char)k; g_chars[k][1] = 0; }
+        g_chars_ready = 1;
+    }
+    return g_chars[(unsigned char)ch];
+}
+
 void* aalloc(size_t n) {
     size_t a = (n + (ARENA_ALIGN - 1u)) & ~(size_t)(ARENA_ALIGN - 1u);
     if (a == 0) a = ARENA_ALIGN;
@@ -1240,8 +1257,7 @@ obj index_obj(obj container, long i) {
         long n = (long)strlen(container.u.s);
         if (i < 0) i += n;
         if (i < 0 || i >= n) return OBJ_NONE;
-        char* c = aalloc(2); c[0] = container.u.s[i]; c[1] = 0;
-        return OBJ_STR(c);
+        return OBJ_STR(_char_str(container.u.s[i]));
     }
     return OBJ_NONE;
 }
@@ -1614,12 +1630,18 @@ str str_replace(str s, str a, str b) {
     while ((q = strstr(p, a))) { memcpy(w, p, q - p); w += q - p; memcpy(w, b, lb); w += lb; p = q + la; }
     strcpy(w, p); return o;
 }
-long str_find(str s, str sub, bool last) {
+long str_find_from(str s, str sub, bool last, long start) {
+    long n = (long)strlen(s);
+    if (start < 0) start += n;
+    if (start < 0) start = 0;
+    if (start > n) return -1;
+    const char* base = s + start;
     const char* hit = NULL;
-    if (!last) { const char* q = strstr(s, sub); return q ? (long)(q - s) : -1; }
-    for (const char* p = s; (p = strstr(p, sub)); p++) hit = p;
+    if (!last) { const char* q = strstr(base, sub); return q ? (long)(q - s) : -1; }
+    for (const char* p = base; (p = strstr(p, sub)); p++) hit = p;
     return hit ? (long)(hit - s) : -1;
 }
+long str_find(str s, str sub, bool last) { return str_find_from(s, sub, last, 0); }
 bool str_isdigit(str s) { if (!*s) return false; for (; *s; s++) if (!isdigit((unsigned char)*s)) return false; return true; }
 bool str_isalpha(str s) { if (!*s) return false; for (; *s; s++) if (!isalpha((unsigned char)*s)) return false; return true; }
 bool str_isspace(str s) { if (!*s) return false; for (; *s; s++) if (!isspace((unsigned char)*s)) return false; return true; }
@@ -1824,12 +1846,13 @@ void del_item(obj c, obj k) {
 }
 
 str char_at(str s, long i) {
+    /* Interned rather than freshly allocated. `for ch in text` lowers to this,
+     * and a self-hosted compile made 67 million of these 16-byte allocations
+     * -- 99% of the arena, and the reason it ran out. The result is a
+     * one-character immutable string; there are only 256 of them. */
     long n = (long)strlen(s);
     if (i < 0) i += n;
-    char* o = aalloc(2);
-    o[0] = (i >= 0 && i < n) ? s[i] : 0;
-    o[1] = 0;
-    return o;
+    return _char_str((i >= 0 && i < n) ? s[i] : 0);
 }
 static long clamp_index(long i, long n) {
     if (i < 0) i += n;
@@ -13509,10 +13532,18 @@ class Transpiler:
                 return None
             return "str_replace(%s, %s, %s)" % (self.as_str(func.value), self.as_str(a[0]),
                                                 self.as_str(a[1]))
-        if m == "find":
-            return "str_find(%s, %s, false)" % (self.as_str(func.value), self.as_str(a[0]))
-        if m == "rfind":
-            return "str_find(%s, %s, true)" % (self.as_str(func.value), self.as_str(a[0]))
+        if m in ("find", "rfind"):
+            # The `start` argument was silently dropped, so `find(sub, pos)`
+            # always returned the *first* match. A scan loop written
+            # `pos = text.find(x, pos) + 1` then never advanced -- the
+            # self-hosted compiler hung on any input.
+            last = "true" if m == "rfind" else "false"
+            if len(a) >= 2:
+                return "str_find_from(%s, %s, %s, %s)" % (
+                    self.as_str(func.value), self.as_str(a[0]), last,
+                    self.as_long(a[1]))
+            return "str_find(%s, %s, %s)" % (
+                self.as_str(func.value), self.as_str(a[0]), last)
         if m in ("isdigit", "isalpha", "isspace", "isalnum"):
             return "str_%s(%s)" % (m, self.as_str(func.value))
         if m == "lower":
