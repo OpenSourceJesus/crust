@@ -12908,7 +12908,10 @@ class Transpiler:
             guard = ("if (%s) " % conds) if conds else ""
             body = "%s %sif (%s) { _r = %s; break; }" % (
                 " ".join(binds), guard, pred, hit)
-            src = self.expr(gen.iter)
+            # Boxed for the same reason as the plain-iterable branch below:
+            # the temp is declared `obj`, so a `char*` iterable has to be
+            # wrapped or the initialiser is a type error.
+            src = self.wrap_obj(gen.iter)
             self.scope = saved
         else:
             pred = "truthy(_e)"
@@ -12916,7 +12919,11 @@ class Transpiler:
                 pred = "!truthy(_e)"
             body = "obj _e = index_obj(%s, %s); if (%s) { _r = %s; break; }" \
                 % (it, idx, pred, hit)
-            src = self.expr(arg)
+            # Boxed: the temp below is declared `obj`, and an iterable that is
+            # already a C value -- a `char*` string, most often -- has to be
+            # wrapped or the initialiser is a type error. Every sibling loop
+            # lowering uses `wrap_obj` here; this one did not.
+            src = self.wrap_obj(arg)
         return ("({ bool _r = %s; obj %s = %s; long _n%d = pylen(%s); "
                 "for (long %s = 0; %s < _n%d; %s++) { %s } _r; })") % (
             init, it, src, self.loop_n, it, idx, idx, self.loop_n, idx, body)
