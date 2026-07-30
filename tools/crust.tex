@@ -1,0 +1,115 @@
+\section{What Crust is}
+
+Crust is a Rust subset that compiles through a C compiler. A single
+translation unit may hold C, Rust and rpython at once, and after lowering
+there is no boundary between them: everything becomes C, and the C compiler
+sees one program.
+
+\begin{verbatim}
+#include "schemes.py"        /* rpython: string and list work         */
+int printf(const char *, ...);
+struct Frames { words: [u64; 8], free: i64 }   /* Rust: fixed layouts  */
+impl Frames {
+    fn alloc(&mut self) -> i64 { ... }
+}
+int main(void) { ... }                          /* C: entry point      */
+\end{verbatim}
+
+The point of mixing three languages is that each is short at something
+different. rpython has lists, strings and a `\%'-formatting runtime, so URL
+parsing and table building are a few lines there and a rewrite in the Rust
+subset. Rust has fixed layouts, traits and generics with no allocator
+underneath, so a bitmap allocator or a scheduler is natural. C is the entry
+point and the linkage surface.
+
+Nothing is copied at the boundaries. \texttt{tools/py2c.py} lowers a typed
+rpython list to three words --- \texttt{\{ int* data; long len; long cap; \}}
+--- and \texttt{PyList<T>} in Crust's bundled core has exactly that layout, so
+a list rpython built is walked directly from Rust with a pointer cast and no
+conversion.
+
+\subsection{What is in the subset}
+
+Structs, enums (including data-carrying ones, lowered to tagged unions),
+traits with default methods and associated consts and types, generics by
+monomorphisation, closures lifted to static functions, slices, \texttt{match}
+with bindings, \texttt{?}, \texttt{impl} blocks, operator sugar for the
+bundled containers, and a small core: \texttt{Vec<T>}, \texttt{Box<T>},
+\texttt{String}, \texttt{Formatter} with \texttt{write!} and \texttt{format!},
+\texttt{Rc}/\texttt{Arc}, \texttt{VecDeque<T>}, and the \texttt{core} free
+functions real code reaches for (\texttt{slice::from\_raw\_parts},
+\texttt{ptr::null\_mut}, \texttt{cmp::min}).
+
+Generics are monomorphised, so a trait call is a direct call and an
+instantiation costs what a hand-written version would --- the
+\texttt{traits} and \texttt{generics} benchmarks below are there to check that
+claim rather than assert it.
+
+\subsection{What is deliberately absent}
+
+There is no borrow checker, no \texttt{dyn Trait}, no iterator protocol, and
+no \texttt{Drop}. Each of those is a decision rather than an omission waiting
+to be filled in:
+
+\begin{itemize}
+  \item \textbf{No \texttt{Drop}} means every allocating type has an explicit
+    \texttt{free\_buf}. Scope exit cannot run code, so pretending otherwise
+    would leak silently.
+  \item \textbf{No iterator protocol}, because rpython already has one and its
+    output is a plain struct. Iteration-heavy code is written on that side.
+  \item \textbf{\texttt{Mutex<T>} does not lock.} It exists so source written
+    against \texttt{std} parses. Crust has no threads --- no spawn, no atomics,
+    no memory model --- so there is nothing for a lock to protect against, and
+    a lock that does nothing is consistent with the rest of the model rather
+    than a hole in it. The moment real concurrency exists it becomes dangerous
+    and must be replaced, not extended.
+\end{itemize}
+
+\section{CrustOS, and what it borrows from Redox}
+
+CrustOS is a small operating system prototype assembled from the parts of
+\href{https://redox-os.org}{Redox} that Crust can compile, plus the parts
+supplied here. \texttt{tools/crustos.py} clones the Redox kernel and relibc,
+compiles the compatible subset, and links it with a scheme layer written in
+rpython and a scheduler written in Rust.
+
+\begin{verbatim}
+python3 tools/crustos.py fetch    # clone redox-os/kernel and relibc
+python3 tools/crustos.py run      # compile the subset, link, run
+\end{verbatim}
+
+\subsection{Redox Compatibility}
+
+Of 525 \texttt{.rs} files in the Redox kernel and relibc, Crust lowers items in
+about 110 and around 94 of those compile to objects, of which 89 link
+together. The upstream code that survives is mostly the memory manager and the
+architecture definitions --- \texttt{rmm}'s page tables and flags, the buddy
+and bump frame allocators, syscall numbers, layout constants. The
+\texttt{heap offset} CrustOS prints at startup is upstream's
+\texttt{kernel\_heap\_offset()}, called from code compiled here.
+
+Five of the ninety-four objects cannot join the link, for two reasons that
+both follow from compiling files never meant to be one program: Redox ships
+one implementation per architecture and Crust flattens module paths, so the
+\texttt{aarch64} and \texttt{riscv64} versions of a function collide; and some
+files reference symbols from parts of Redox that do not compile.
+\texttt{tools/crustos.py} selects a linkable subset with \texttt{nm} and
+reports what it dropped and why.
+
+\subsection{Redox Paging}
+
+Redox \texttt{rmm} writes its page flags generically over the architecture, reading
+constants off a trait:
+
+\begin{verbatim}
+impl<A: Arch> PageFlags<A> {
+    pub fn new() -> Self {
+        Self::from_data(A::ENTRY_FLAG_DEFAULT_PAGE | A::ENTRY_FLAG_NO_EXEC)
+    }
+}
+\end{verbatim}
+
+CrustOS uses the same shape, and Crust monomorphises it: one implementation of
+the flag logic, one instantiation per architecture, every constant resolved at
+compile time with no dispatch.
+
