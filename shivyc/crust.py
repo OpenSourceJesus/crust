@@ -3969,7 +3969,7 @@ def _is_lvalue(code):
 
 def _addressable(code):
     """Wrap `code` in parens if `&` would otherwise bind too loosely."""
-    if code.isidentifier() or (code.startswith("(") and code.endswith(")")):
+    if _is_identifier(code) or (code.startswith("(") and code.endswith(")")):
         return code
     if all(c.isalnum() or c in "_.->[]" for c in code):
         return code
@@ -4579,6 +4579,84 @@ _ITEM_KEYWORDS = ("fn", "struct", "impl", "enum", "const", "static",
                   "trait", "type")
 
 
+def _modifier_run_start(text, end):
+    """Where the run of item modifiers ending at `end` begins.
+
+    Walks backwards over `pub`, `pub(..)`, `unsafe`, and `extern` with an
+    optional ABI string, plus the whitespace between them. Returns `end` when
+    there is no such run.
+
+    Replaces the `$`-anchored `_MODIFIER` pattern. The scan text has had string
+    literals blanked, so an ABI appears as `extern " "` or with the quotes
+    gone; both are accepted, which is why the original matched an optional
+    quoted part rather than the literal `"C"`.
+    """
+    i = end
+    while True:
+        j = i
+        while j > 0 and text[j - 1] in " \t\r\n":
+            j -= 1
+        if j == 0:
+            return i
+        # An optional trailing quoted ABI, for `extern "C"`.
+        k = j
+        saw_quote = False
+        if text[k - 1] in "\"'":
+            saw_quote = True
+            q = text[k - 1]
+            open_q = text.rfind(q, 0, k - 1)
+            if open_q < 0:
+                return i
+            k = open_q
+            while k > 0 and text[k - 1] in " \t\r\n":
+                k -= 1
+        # An optional parenthesised part, for `pub(crate)`.
+        if k > 0 and text[k - 1] == ")":
+            depth, m = 0, k
+            while m > 0:
+                m -= 1
+                if text[m] == ")":
+                    depth += 1
+                elif text[m] == "(":
+                    depth -= 1
+                    if depth == 0:
+                        break
+            if depth != 0:
+                return i
+            k = m
+            while k > 0 and text[k - 1] in " \t\r\n":
+                k -= 1
+        w = k
+        while w > 0 and _is_word_char(text[w - 1]):
+            w -= 1
+        word = text[w:k]
+        if word not in ("pub", "unsafe", "extern"):
+            return i
+        if saw_quote and word != "extern":
+            # Only `extern` takes an ABI string; the parenthesised form
+            # belongs to `pub` / `unsafe` and is fine on either.
+            return i
+        i = w
+
+
+def _is_identifier(text):
+    """True if `text` is a single identifier.
+
+    Stands in for `str.isidentifier`, which py2c does not lower. Restricted to
+    ASCII, which is all this front end accepts anyway -- Python's version
+    admits any Unicode identifier character, and matching that here would be
+    claiming a capability the tokenizer does not have.
+    """
+    if not text:
+        return False
+    if not (text[0].isalpha() or text[0] == "_"):
+        return False
+    for ch in text[1:]:
+        if not (ch.isalnum() or ch == "_"):
+            return False
+    return True
+
+
 def _is_word_char(ch):
     return ch.isalnum() or ch == "_"
 
@@ -4891,10 +4969,12 @@ def _cfg_predicate(text, i):
         j += 1
         while j < len(text) and text[j] in " \t\n\r":
             j += 1
-        m2 = re.compile(r'"([^"]*)"').match(text, j)
-        if not m2:
+        if j >= len(text) or text[j] != '"':
             return False, j
-        return CFG.get(word) == m2.group(1), m2.end()
+        k = text.find('"', j + 1)
+        if k < 0:
+            return False, j
+        return CFG.get(word) == text[j + 1:k], k + 1
     return word in CFG_FLAGS, j                   # bare flag
 
 
@@ -4946,9 +5026,9 @@ def cfg_allows(attrs):
 def _extend_head(scan, start):
     """Walk `start` backwards over modifiers and `#[...]` attributes."""
     while True:
-        head = _MODIFIER.search(scan[:start])
-        if head and head.start() < start:
-            start = head.start()
+        run = _modifier_run_start(scan, start)
+        if run < start:
+            start = run
             continue
         stripped = scan[:start].rstrip()
         if stripped.endswith("]"):
@@ -4976,7 +5056,9 @@ def has_rust(code):
 
 
 def _line_of(code, offset):
-    return code.count("\n", 0, offset) + 1
+    # `count` over a slice rather than `count(sub, start, end)`: py2c lowers
+    # the two-argument form only.
+    return code[0:offset].count("\n") + 1
 
 
 def _generic_params_of(toks, kind):
@@ -5874,10 +5956,11 @@ def _struct_new_to_compound(init, ty):
     """
     if ty is None or ty.ptr or ty.array:
         return None
-    m = re.match(r"^(%s)_new\((.*)\)$" % re.escape(ty.base), init.strip())
-    if not m:
+    text = init.strip()
+    head = ty.base + "_new("
+    if not text.startswith(head) or not text.endswith(")"):
         return None
-    return "{ %s }" % m.group(2)
+    return "{ %s }" % text[len(head):-1]
 
 
 def _render_const(kw, name, ty, init):
@@ -6308,7 +6391,7 @@ def translate(code, path=None):
                 raise fail(e, start)
             text = out.text()
         # pad so the item occupies exactly as many lines as the original
-        want = code.count("\n", start, end)
+        want = code[start:end].count("\n")
         have = text.count("\n")
         if have < want:
             text += "\n" * (want - have)
