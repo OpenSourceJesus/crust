@@ -1352,6 +1352,45 @@ def raise_attr_error(st: "St") -> "int":
     return 0
 
 
+
+def raise_named_error(st: "St", want: "char*") -> "int":
+    """Set a catchable exception of class `want`, or `Exception` if absent.
+
+    The same shape as `raise_attr_error`, parameterised by class name so
+    `NameError` and its siblings do not each need a copy. A program whose
+    bytecode never mentions the class still gets a catchable `Exception`
+    rather than silently continuing.
+    """
+    classes = st.prog.classes
+    cid = -1
+    fallback = -1
+    i = 0
+    while i < len(classes):
+        cn = classes[i].cname
+        di = len(cn) - 1
+        cut = -1
+        while di >= 0:
+            if cn[di] == "$":                  # strip link prefix ($mod$Name)
+                cut = di
+                di = -1
+            else:
+                di = di - 1
+        short = cn
+        if cut >= 0:
+            short = cn[cut + 1:len(cn)]
+        if _strcmp(short, want) == 0:
+            cid = i
+        elif _strcmp(short, "Exception") == 0:
+            fallback = i
+        i = i + 1
+    use = cid
+    if use < 0:
+        use = fallback
+    if use >= 0:
+        st.exc_val = instantiate(st, use, new_v_list())
+    st.exc_flag = 1
+    return 0
+
 def method_id(name: "char*") -> "long":
     if name == "append":
         return 100
@@ -2429,7 +2468,15 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
         if op == 1:
             _lset(regs, a, const_to_v(st.prog, b)); pc = pc + 1
         elif op == 2:
-            _lset(regs, a, _lget(st.glob, b)); pc = pc + 1
+            gv = _lget(st.glob, b)
+            if gv.tag == 17:                   # never assigned -> NameError
+                # Globals start as a sentinel distinct from None, so reading a
+                # name that was never bound raises instead of silently
+                # yielding None and letting execution continue. The sentinel
+                # never escapes this branch, so no other tag check sees it.
+                raise_named_error(st, "NameError")
+            else:
+                _lset(regs, a, gv); pc = pc + 1
         elif op == 3:
             if fb == 1:                    # reclaimable global: free old value
                 ov = _lget(st.glob, b)
@@ -2952,7 +2999,7 @@ def build_state(prog: "Program", sargs: "list[str]") -> "St":
     st = St(prog, glob, heap, 0, v_none(), new_reg_pool(), mcc, mcf)
     k = 0
     while k < prog.nglobals:
-        glob.append(v_none())
+        glob.append(V(17, 0))                  # unset sentinel; see LOAD_GLOBAL
         k = k + 1
     gi = 0
     while gi < len(prog.names) and gi < len(glob):
