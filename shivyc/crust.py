@@ -5930,50 +5930,120 @@ def _fold_int_const(init, env):
     # Strip Rust digit separators from numeric literals only.
     s = re.sub(r"(?<=[\da-fA-FxX])_(?=[\da-fA-F])", "", s)
     try:
-        import ast
-        tree = ast.parse(s, mode="eval")
-    except SyntaxError:
+        val, end = _int_expr(s, 0)
+    except (ValueError, RecursionError):
         return None
-    try:
-        return _eval_int_ast(tree.body)
-    except Exception:
-        return None
+    if _skip_ws(s, end) != len(s):
+        return None                        # trailing junk: not a constant
+    return val
 
 
-def _eval_int_ast(node):
-    import ast
-    if isinstance(node, ast.Constant) and isinstance(node.value, int):
-        return node.value
-    # Python < 3.8 spelled an integer literal `ast.Num`. Merely *naming* the
-    # attribute warns on 3.12+, so the legacy branch is guarded by version
-    # rather than by hasattr.
-    if sys.version_info < (3, 8):                                   # pragma: no cover
-        if isinstance(node, ast.Num):
-            return int(node.n)
-    if isinstance(node, ast.UnaryOp):
-        v = _eval_int_ast(node.operand)
-        if isinstance(node.op, ast.UAdd):
-            return v
-        if isinstance(node.op, ast.USub):
-            return -v
-        if isinstance(node.op, ast.Invert):
-            return ~v
-    if isinstance(node, ast.BinOp):
-        a, b = _eval_int_ast(node.left), _eval_int_ast(node.right)
-        ops = {
-            ast.Add: lambda x, y: x + y,
-            ast.Sub: lambda x, y: x - y,
-            ast.Mult: lambda x, y: x * y,
-            ast.BitOr: lambda x, y: x | y,
-            ast.BitAnd: lambda x, y: x & y,
-            ast.BitXor: lambda x, y: x ^ y,
-            ast.LShift: lambda x, y: x << y,
-            ast.RShift: lambda x, y: x >> y,
-        }
-        fn = ops.get(type(node.op))
-        if fn is not None:
-            return fn(a, b)
-    raise ValueError("not an int const")
+def _int_expr(text, i):
+    """Parse an integer expression at `text[i]`; return `(value, next_i)`.
+
+    Recursive descent over the grammar `_fold_int_const` needs: integer
+    literals in decimal, hex, octal and binary, parentheses, unary `+ - ~`,
+    and binary `| ^ & << >> + - *` at conventional precedence.
+
+    Written out rather than using `ast.parse` because this module is
+    transpiled by py2c when ShivyCX self-hosts, and py2c cannot provide the
+    `ast` module at all. Unlike the regex conversions there was no smaller
+    stand-in available; this is the whole grammar, which is small.
+
+    Raises ValueError on anything it does not recognise, which the caller
+    turns into "not a constant".
+    """
+    return _int_or(text, i)
+
+
+_INT_BINARY_TIERS = (("|",), ("^",), ("&",), ("<<", ">>"), ("+", "-"), ("*",))
+
+
+def _int_or(text, i):
+    return _int_tier(text, i, 0)
+
+
+def _int_tier(text, i, tier):
+    """Left-associative binary operators at `tier`, tightest tier last."""
+    if tier >= len(_INT_BINARY_TIERS):
+        return _int_unary(text, i)
+    ops = _INT_BINARY_TIERS[tier]
+    val, i = _int_tier(text, i, tier + 1)
+    while True:
+        i = _skip_ws(text, i)
+        hit = None
+        for op in ops:
+            if text.startswith(op, i):
+                # `<<` must not be read as two `<`, and a lone `|` in `||`
+                # is not this grammar's operator.
+                if op in ("+", "-") and text.startswith(op * 2, i):
+                    continue
+                hit = op
+                break
+        if hit is None:
+            return val, i
+        rhs, i = _int_tier(text, i + len(hit), tier + 1)
+        if hit == "|":
+            val = val | rhs
+        elif hit == "^":
+            val = val ^ rhs
+        elif hit == "&":
+            val = val & rhs
+        elif hit == "<<":
+            val = val << rhs
+        elif hit == ">>":
+            val = val >> rhs
+        elif hit == "+":
+            val = val + rhs
+        elif hit == "-":
+            val = val - rhs
+        else:
+            val = val * rhs
+    return val, i
+
+
+def _int_unary(text, i):
+    i = _skip_ws(text, i)
+    if i < len(text) and text[i] in "+-~":
+        op = text[i]
+        val, i = _int_unary(text, i + 1)
+        if op == "-":
+            return -val, i
+        if op == "~":
+            return ~val, i
+        return val, i
+    return _int_atom(text, i)
+
+
+def _int_atom(text, i):
+    i = _skip_ws(text, i)
+    n = len(text)
+    if i >= n:
+        raise ValueError("empty")
+    if text[i] == "(":
+        val, i = _int_or(text, i + 1)
+        i = _skip_ws(text, i)
+        if i >= n or text[i] != ")":
+            raise ValueError("unbalanced")
+        return val, i + 1
+    j = i
+    if text[j] in "+-":
+        raise ValueError("sign handled by _int_unary")
+    while j < n and (text[j].isalnum() or text[j] == "_"):
+        j += 1
+    if j == i:
+        raise ValueError("not a literal at %d" % i)
+    lit = text[i:j]
+    low = lit.lower()
+    if low.startswith("0x"):
+        return int(lit[2:], 16), j
+    if low.startswith("0b"):
+        return int(lit[2:], 2), j
+    if low.startswith("0o"):
+        return int(lit[2:], 8), j
+    if not lit.isdigit():
+        raise ValueError("not an integer: %s" % lit)
+    return int(lit, 10), j
 
 
 def _emit_prelude(body, prelude):
