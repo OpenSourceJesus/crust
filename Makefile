@@ -637,10 +637,21 @@ benchmarks_report: benchmarks_rpython
 	python3 benchmarks/run_minipy_benchmarks.py
 	python3 benchmarks/plot_rpython.py $(BENCH_PLOT_DIR)
 	python3 benchmarks/plot_minipy.py $(BENCH_PLOT_DIR)
+# The Crust language benchmarks: same generated C, ShivyCX vs gcc.
+	-python3 benchmarks/run_crust_benchmarks.py
+	-python3 benchmarks/plot_crust.py $(BENCH_PLOT_DIR)
+# The ShivyCX-vs-gcc feature suite. It writes results/results.json, which
+# plot_results.py turns into the two comparison figures; both steps are
+# tolerated failing so a missing toolchain does not lose the rest of the
+# report.
+	-python3 tools/crust_benchmarks.py features
+	-python3 benchmarks/plot_results.py
+	-cp benchmarks/results/benchmarks.png benchmarks/results/benchmarks2.png \
+		$(BENCH_PLOT_DIR)/ 2>/dev/null || true
 	@command -v pdflatex >/dev/null 2>&1 || { \
 		echo "pdflatex not found; figures are in $(BENCH_PLOT_DIR) but the PDF was not built."; \
 		exit 0; }
-	cp tools/benchmarks.tex $(BENCH_PLOT_DIR)/
+	cp tools/benchmarks.tex tools/crust.tex $(BENCH_PLOT_DIR)/
 	cd $(BENCH_PLOT_DIR) && pdflatex -interaction=nonstopmode benchmarks.tex >/dev/null 2>&1 \
 		&& pdflatex -interaction=nonstopmode benchmarks.tex >/dev/null 2>&1
 	@echo "Benchmark report: $(BENCH_PLOT_DIR)/benchmarks.pdf"
