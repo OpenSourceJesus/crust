@@ -32,7 +32,22 @@ __all__ = ["CrustError", "translate", "has_rust", "translate_file"]
 
 
 class CrustError(Exception):
-    """A Crust front-end (Rust-subset) syntax or type error."""
+    """A Crust front-end (Rust-subset) syntax or type error.
+
+    The `__init__` is explicit rather than inherited. py2c models a class by
+    its own `__init__`, so relying on `Exception.__init__(*args)` produced a
+    no-argument `CrustError_new(void)` while every `raise` site passed a
+    message -- "too many arguments to function". ShivyCX's own `CompilerError`
+    declares one for the same reason.
+    """
+
+    def __init__(self, message):
+        # `self.args` is set directly rather than through
+        # `Exception.__init__` or `super().__init__`: py2c cannot call a
+        # builtin base's initialiser, and `str(e)` needs `args` populated --
+        # the tests and the CLI both read the message that way.
+        self.args = (message,)
+        self.message = message
 
 
 # --------------------------------------------------------------------------
@@ -1119,9 +1134,6 @@ class Parser:
             while not p.at("}", "punc") and p.cur.kind != "eof":
                 if p.is_assoc_type():
                     p.parse_assoc_type(mangled)
-                    continue
-                if p.is_assoc_type():
-                    p.parse_assoc_type(owner)
                     continue
                 if p.is_assoc_const():
                     kw, cname, cty, cinit = p.parse_const_signature()
