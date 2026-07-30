@@ -459,7 +459,20 @@ def _instance_name(name, args):
 
 def _mangle(ty):
     """Turn a C type into an identifier fragment for a generated struct."""
-    return re.sub(r"\W+", "_", ty.decl()).strip("_")
+    # Hand-written for the same reason as the item scanners: py2c has no
+    # regex engine. `\W+` collapses each run of non-word characters to one
+    # underscore, so `unsigned long *` becomes `unsigned_long`.
+    text = ty.decl()
+    out = []
+    prev_us = False
+    for ch in text:
+        if ch.isalnum() or ch == "_":
+            out.append(ch)
+            prev_us = False
+        elif not prev_us:
+            out.append("_")
+            prev_us = True
+    return "".join(out).strip("_")
 
 
 class MethodInfo:
@@ -3903,7 +3916,15 @@ def _core_intrinsic(name):
 
 def _has_word(text, word):
     """True if `word` appears in `text` as a whole identifier."""
-    return re.search(r"\b%s\b" % re.escape(word), text) is not None
+    n, w = len(text), len(word)
+    i = text.find(word)
+    while i >= 0:
+        before_ok = i == 0 or not _is_word_char(text[i - 1])
+        after_ok = i + w >= n or not _is_word_char(text[i + w])
+        if before_ok and after_ok:
+            return True
+        i = text.find(word, i + 1)
+    return False
 
 
 def _tlist_name(elem):
@@ -4445,8 +4466,15 @@ def _has_impl_block(scan, name):
     C has no `impl`, so its presence is unambiguous evidence that `struct
     Name;` above was meant as a Rust unit struct.
     """
-    return re.search(r"\bimpl\s+" + re.escape(name) + r"\s*\{",
-                     scan) is not None
+    for _start, after in _scan_line_items(scan, "impl"):
+        if not scan.startswith(name, after):
+            continue
+        k = after + len(name)
+        if k < len(scan) and _is_word_char(scan[k]):
+            continue                       # `impl NameSuffix`
+        if scan[_skip_ws(scan, k):_skip_ws(scan, k) + 1] == "{":
+            return True
+    return False
 
 
 def _match_paren(scan, open_idx):
@@ -4599,6 +4627,85 @@ def _scan_item_starts(text):
             i = m1
             continue
         i = j
+    return out
+
+
+def _scan_item_macros(text):
+    """`(start, open_index)` for each file-scope macro invocation.
+
+    Matches a line whose first token is `name!` followed by `(`, `[` or `{`,
+    with the usual optional `pub`. Replaces `_ITEM_MACRO`.
+    """
+    out = []
+    for line_start, tok in _scan_line_items_any(text):
+        n = len(text)
+        j = tok
+        while j < n and _is_word_char(text[j]):
+            j += 1
+        if j == tok or j >= n or text[j] != "!":
+            continue
+        k = _skip_ws(text, j + 1)
+        if k < n and text[k] in "([{":
+            out.append((line_start, k))
+    return out
+
+
+def _scan_line_items_any(text):
+    """`(match_start, token_start)` for every line with a token on it.
+
+    The shared front half of the line-anchored scanners. `match_start` is where
+    the *line's* indentation begins, because the patterns these replace were
+    written `^[ \t]*(?:pub..)?` and so reported the line start -- callers use
+    it to locate the item for erasure. `token_start` is past the indentation
+    and any visibility modifier, which is what the matching needs.
+    """
+    out = []
+    n = len(text)
+    pos = 0
+    while pos <= n:
+        nl = text.find("\n", pos)
+        end = n if nl < 0 else nl
+        i = pos
+        while i < end and text[i] in " \t":
+            i += 1
+        tok = _skip_visibility_text(text, i)
+        if tok < end:
+            out.append((pos, tok))
+        if nl < 0:
+            break
+        pos = nl + 1
+    return out
+
+
+def _scan_erased_heads(text):
+    """Start offsets of `use ..`, `extern crate ..` and bare `mod x;` lines.
+
+    Replaces `_ERASED_HEAD`. The caller erases from the returned offset to the
+    end of the item, so only the start matters.
+    """
+    out = []
+    n = len(text)
+    for line_start, start in _scan_line_items_any(text):
+        if text.startswith("use", start) and (
+                start + 3 >= n or not _is_word_char(text[start + 3])):
+            out.append(line_start)
+            continue
+        if text.startswith("extern", start):
+            k = start + 6
+            if k < n and not _is_word_char(text[k]):
+                k = _skip_ws(text, k)
+                if text.startswith("crate", k) and (
+                        k + 5 >= n or not _is_word_char(text[k + 5])):
+                    out.append(line_start)
+                    continue
+        if text.startswith("mod", start) and (
+                start + 3 >= n or not _is_word_char(text[start + 3])):
+            k = _skip_ws(text, start + 3)
+            m0 = k
+            while k < n and _is_word_char(text[k]):
+                k += 1
+            if k > m0 and text[_skip_ws(text, k):_skip_ws(text, k) + 1] == ";":
+                out.append(line_start)
     return out
 
 
@@ -5937,10 +6044,9 @@ def erase_module_items(code):
     scan = _blank(code)
     out = list(code)
     depths = _depths(scan)
-    for m in _ITEM_MACRO.finditer(scan):
-        if depths[m.start()] != 0:
+    for _mstart, open_idx in _scan_item_macros(scan):
+        if depths[_mstart] != 0:
             continue            # inside a body: an ordinary macro call
-        open_idx = m.end() - 1
         close = _match_delim(scan, open_idx)
         if close is None:
             continue
@@ -5949,12 +6055,12 @@ def erase_module_items(code):
             end += 1
         if end < len(scan) and scan[end] == ";":
             end += 1
-        for k in range(m.start(), end):
+        for k in range(_mstart, end):
             if out[k] != "\n":
                 out[k] = " "
     scan = "".join(out)
-    for m in _ERASED_HEAD.finditer(scan):
-        i, depth, n = m.start(), 0, len(scan)
+    for _estart in _scan_erased_heads(scan):
+        i, depth, n = _estart, 0, len(scan)
         while i < n:
             ch = scan[i]
             if ch == "{":
@@ -5965,7 +6071,7 @@ def erase_module_items(code):
                 i += 1
                 break
             i += 1
-        for k in range(m.start(), min(i, n)):
+        for k in range(_estart, min(i, n)):
             if out[k] != "\n":
                 out[k] = " "
     return "".join(out)
