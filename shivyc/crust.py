@@ -157,9 +157,13 @@ PUNCT = [
     "{", "}", "[", "]", ",", ";", ":", ".", "#", "?", "@", "$",
 ]
 
-_NUM_SUFFIX = re.compile(r"(?:i8|i16|i32|i64|isize|u8|u16|u32|u64|usize"
-                         r"|f32|f64)$")
-
+# Numeric literal suffixes, longest first so `usize` is not read as `u` and
+# `i16` is not read as `i1`. Deliberately the same set the regex had: `i128`
+# and `u128` are *not* here, even though Crust now has those types, because
+# adding them is a behaviour change and this is a mechanical conversion.
+# Recognising them is a real gap, separately.
+_NUM_SUFFIXES = ("isize", "usize", "f32", "f64",
+                 "i16", "i32", "i64", "u16", "u32", "u64", "i8", "u8")
 
 class RustToken:
     __slots__ = ("kind", "val", "line")
@@ -3981,11 +3985,18 @@ def render_params(params):
 def normalize_number(tok):
     """Map a Rust numeric literal onto C, returning (code, RustCType)."""
     text = tok.val.replace("_", "")
-    m = _NUM_SUFFIX.search(text)
+    # Longest suffix first, so `i16` is not read as `i1`+`6`. A plain endswith
+    # scan replaces the pattern; py2c has no regex engine.
     suffix = ""
-    if m:
-        suffix = m.group(0)
-        text = text[:m.start()]
+    for cand in _NUM_SUFFIXES:
+        # `len(text) > len(cand)` keeps a bare type name from being read as a
+        # suffix with an empty body. The regex had no such guard; this only
+        # ever sees number tokens, so the difference is unreachable, but an
+        # empty literal would be a silent miscompile if it ever were.
+        if text.endswith(cand) and len(text) > len(cand):
+            suffix = cand
+            text = text[:-len(cand)]
+            break
     if text.startswith(("0b", "0B")):
         text = str(int(text[2:], 2))
     elif text.startswith(("0o", "0O")):
@@ -4630,6 +4641,44 @@ def _scan_item_starts(text):
     return out
 
 
+def _scan_rs_includes(text):
+    """The quoted spellings of each `#include "x.rs"` / `#include <x.rs>`.
+
+    Replaces `_RS_INCLUDE`. Returns the include exactly as written, brackets
+    and all, which is what the caller compares against.
+    """
+    out = []
+    n = len(text)
+    pos = 0
+    while pos <= n:
+        nl = text.find("\n", pos)
+        end = n if nl < 0 else nl
+        i = pos
+        while i < end and text[i] in " \t":
+            i += 1
+        if i < end and text[i] == "#":
+            i += 1
+            while i < end and text[i] in " \t":
+                i += 1
+            if text.startswith("include", i):
+                i += 7
+                while i < end and text[i] in " \t":
+                    i += 1
+                if i < end and text[i] in '"<':
+                    q = text[i]
+                    closer = '"' if q == '"' else ">"
+                    j = i + 1
+                    while j < end and text[j] not in '">':
+                        j += 1
+                    name = text[i + 1:j]
+                    if j < end and name.endswith(".rs"):
+                        out.append(q + name + closer)
+        if nl < 0:
+            break
+        pos = nl + 1
+    return out
+
+
 def _scan_item_macros(text):
     """`(start, open_index)` for each file-scope macro invocation.
 
@@ -4812,11 +4861,12 @@ def _cfg_predicate(text, i):
     """
     while i < len(text) and text[i] in " \t\n\r":
         i += 1
-    m = re.compile(r"[A-Za-z_][\w]*").match(text, i)
-    if not m:
+    if i >= len(text) or not (text[i].isalpha() or text[i] == "_"):
         return False, i
-    word = m.group(0)
-    j = m.end()
+    j = i
+    while j < len(text) and _is_word_char(text[j]):
+        j += 1
+    word = text[i:j]
     while j < len(text) and text[j] in " \t\n\r":
         j += 1
     if j < len(text) and text[j] == "(":          # all / any / not
@@ -5091,9 +5141,7 @@ _RS_INCLUDE = re.compile(
 def find_rs_includes(code):
     """Return the `#include` header spellings that name a `.rs` file."""
     scan = _blank_directives_only(code)
-    return [m.group("q") + m.group("name")
-            + ('"' if m.group("q") == '"' else ">")
-            for m in _RS_INCLUDE.finditer(scan)]
+    return _scan_rs_includes(scan)
 
 
 def _blank_directives_only(code):
