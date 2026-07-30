@@ -4089,6 +4089,15 @@ static char* _ospath_abspath(char* p) {
     return _ospath_join(_cwd, p);
 }
 static int _ospath_exists(char* p) { return access(p, 0) == 0; }
+/* os.path.isfile / isdir: `access` cannot tell them apart, so this stats. */
+static int _ospath_isfile(char* p) {
+    struct stat _st;
+    return stat(p, &_st) == 0 && S_ISREG(_st.st_mode);
+}
+static int _ospath_isdir(char* p) {
+    struct stat _st;
+    return stat(p, &_st) == 0 && S_ISDIR(_st.st_mode);
+}
 /* SHA-256, for `hashlib.sha256(x).hexdigest()`. Implemented rather than
    stubbed because the one caller in this codebase uses it for *cache keys*:
    a constant digest would silently make every module share one cache entry,
@@ -11212,6 +11221,10 @@ class Transpiler:
                 if f.attr == "exists":
                     self._ossys_used = True
                     return "_ospath_exists(%s)" % self._coerce_str_arg(node, 0)
+                if f.attr in ("isfile", "isdir"):
+                    self._ossys_used = True
+                    return "_ospath_%s(%s)" % (f.attr,
+                                               self._coerce_str_arg(node, 0))
                 if f.attr == "splitext":
                     self._ossys_used = True
                     return ("_ospath_splitext(%s)"
