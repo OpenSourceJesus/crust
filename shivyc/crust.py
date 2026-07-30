@@ -4340,11 +4340,11 @@ def find_rust_items(code, rust_file=False):
             raise CrustError("unterminated macro_rules! near offset %d"
                              % start)
         spans.append((start, close + 1, "macro"))
-    for m in _ITEM_START.finditer(scan):
-        start = m.start()
+    for _istart, _ikw, _iname, _iend in _scan_item_starts(scan):
+        start = _istart
         if depths[start] != 0:
             continue
-        kw = m.group("kw")
+        kw = _ikw
         # C has no `fn`/`impl`/Rust-`enum` syntax, but guard against
         # `foo.fn(...)` and against a name inside a preprocessor directive
         # such as `#define fn(x) ...`. Both checks are line-local: an earlier
@@ -4362,21 +4362,21 @@ def find_rust_items(code, rust_file=False):
             # is a path, not an annotation -- `*const self::P` names a type,
             # and reading it as a `const` item would swallow the rest of the
             # declaration looking for a `;`.
-            rest = scan[m.end():].lstrip()
+            rest = scan[_iend:].lstrip()
             if not rest.startswith(":") or rest.startswith("::"):
                 continue
-            close = scan.find(";", m.end())
+            close = scan.find(";", _iend)
             if close < 0:
                 raise CrustError("unterminated Rust %s near offset %d"
                                  % (kw, start))
             spans.append((_extend_head(scan, start), close + 1, "const"))
             continue
 
-        after = scan[m.end():]
+        after = scan[_iend:]
         if kw == "type":
             # `type Name = Type;` — no braces; ends at the semicolon.
-            eq = scan.find("=", m.end())
-            close = scan.find(";", m.end())
+            eq = scan.find("=", _iend)
+            close = scan.find(";", _iend)
             if eq < 0 or close < 0 or eq > close:
                 continue
             spans.append((_extend_head(scan, start), close + 1, "type"))
@@ -4390,16 +4390,16 @@ def find_rust_items(code, rust_file=False):
             # a complete one-byte type would make `sizeof(struct S)` wrongly
             # succeed. So claim it only on evidence: the whole file is Rust,
             # or the unit gives the name an `impl` block, which C cannot.
-            name = m.group("name")
+            name = _iname
             if rust_file or _has_impl_block(scan, name):
-                semi = scan.index(";", m.end())
+                semi = scan.index(";", _iend)
                 spans.append((_extend_head(scan, start), semi + 1,
                               "unit_struct"))
             continue
 
         if kw == "struct" and after.lstrip().startswith("("):
             # Tuple struct: `struct P(f64, f64);`
-            open_idx = scan.index("(", m.end())
+            open_idx = scan.index("(", _iend)
             close_paren = _match_paren(scan, open_idx)
             if close_paren is None:
                 raise CrustError("unterminated tuple struct near offset %d"
@@ -4411,7 +4411,7 @@ def find_rust_items(code, rust_file=False):
             spans.append((_extend_head(scan, start), semi + 1, "tuple_struct"))
             continue
 
-        open_idx = scan.find("{", m.end())
+        open_idx = scan.find("{", _iend)
         if open_idx < 0:
             continue
         close = _match_brace(scan, open_idx)
@@ -4534,6 +4534,72 @@ def _skip_visibility_text(text, i):
             j += 1
     k = _skip_ws(text, j)
     return k if k > j else i          # `pub` must be followed by space
+
+
+_ITEM_KEYWORDS = ("fn", "struct", "impl", "enum", "const", "static",
+                  "trait", "type")
+
+
+def _is_word_char(ch):
+    return ch.isalnum() or ch == "_"
+
+
+def _scan_item_starts(text):
+    """`(start, keyword, name, end)` for each item head in `text`.
+
+    The shape is `KW [<generics>] [mut] NAME`, where `KW` is one of the item
+    keywords and the generic list may follow the keyword directly (`impl<T>`).
+    Replaces the `_ITEM_START` pattern: py2c has no regex engine, and a
+    scanner is smaller to own than one.
+
+    `end` is the offset just past the name, which is where every caller
+    resumes parsing.
+    """
+    out = []
+    n = len(text)
+    i = 0
+    while i < n:
+        if not (text[i].isalpha() or text[i] == "_"):
+            i += 1
+            continue
+        if i > 0 and _is_word_char(text[i - 1]):
+            while i < n and _is_word_char(text[i]):
+                i += 1
+            continue
+        j = i
+        while j < n and _is_word_char(text[j]):
+            j += 1
+        word = text[i:j]
+        if word not in _ITEM_KEYWORDS:
+            i = j
+            continue
+        # `fn foo` needs a space; `impl<T>` may go straight to the angle.
+        k = j
+        saw_space = False
+        while k < n and text[k] in " \t\r\n":
+            k += 1
+            saw_space = True
+        if not saw_space and not (k < n and text[k] == "<"):
+            i = j
+            continue
+        if k < n and text[k] == "<":                 # one non-nested level
+            close = text.find(">", k)
+            if close < 0 or "<" in text[k + 1:close]:
+                i = j
+                continue
+            k = _skip_ws(text, close + 1)
+        if text.startswith("mut", k) and k + 3 < n and not _is_word_char(text[k + 3]):
+            k = _skip_ws(text, k + 3)
+        m0 = k
+        if m0 < n and (text[m0].isalpha() or text[m0] == "_"):
+            m1 = m0
+            while m1 < n and _is_word_char(text[m1]):
+                m1 += 1
+            out.append((i, word, text[m0:m1], m1))
+            i = m1
+            continue
+        i = j
+    return out
 
 
 def _scan_macro_rules(text):

@@ -189,7 +189,10 @@ def _postprocess(code):
     """Turn py2c's module output into text that can be spliced into a unit."""
     if _USES_RT.search(code):
         return code, True
-    code = re.sub(r'#include "shivyc_rt\.h"\n', "", code)
+    # A plain replace: the pattern was a fixed string, and this module is
+    # transpiled by py2c when ShivyCX self-hosts, where `re.sub` has no
+    # lowering. `str.replace` removes every occurrence, as `re.sub` did.
+    code = code.replace('#include "shivyc_rt.h"\n', "")
     prelude = _prelude_for(code)
     if prelude:
         code = "\n".join(prelude) + "\n" + code
