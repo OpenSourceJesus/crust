@@ -9546,6 +9546,13 @@ class Transpiler:
                 if isinstance(f.value, ast.Name) and f.value.id == "os" \
                         and f.attr == "system":
                     return "int"
+                # `subprocess.check_call` lowers to `system`, so it has the
+                # same `int` result. Without this the target is inferred `obj`
+                # and the assignment is rejected.
+                if isinstance(f.value, ast.Name) \
+                        and f.value.id == "subprocess" \
+                        and f.attr in ("check_call", "call"):
+                    return "int"
                 if self.value_ctype(f.value) == "FILE*":
                     if f.attr in ("read", "readline"):
                         return "char*"
@@ -11205,6 +11212,37 @@ class Transpiler:
                     and f.attr == "system" and node.args:
                 self._io_used.add("system")
                 return "system(%s)" % self.as_str(node.args[0])
+            # `subprocess.check_call([...])` / `call` over a *literal*
+            # argv list becomes a shell command. This exists so a transpiled
+            # module can shell out to a tool it cannot import -- the
+            # self-hosted compiler invoking `py2c.py` for an
+            # `#include "x.py"`, rather than needing py2c compiled into it.
+            #
+            # `run` is deliberately excluded: it returns a CompletedProcess
+            # whose `.stdout` and `.returncode` callers read, so lowering it to
+            # `system()` and typing it `int` broke `thread_contracts`, which
+            # does exactly that.
+            #
+            # Only a list literal is accepted, and only of literals or names:
+            # building the command line from a runtime list would need
+            # quoting that this cannot do safely, and a silently mis-quoted
+            # shell command is a worse failure than a compile error.
+            if isinstance(recv, ast.Name) and recv.id == "subprocess" \
+                    and f.attr in ("check_call", "call") and node.args:
+                argv = node.args[0]
+                if isinstance(argv, ast.List) and argv.elts:
+                    self._io_used.add("system")
+                    # Space-joined into one shell command. Only a list literal
+                    # is accepted: building argv from a runtime list would need
+                    # quoting this cannot do safely, and a silently mis-quoted
+                    # shell command is a worse failure than a compile error.
+                    # `pyconcat` takes and returns `str` (a `char*`), so no
+                    # boxing: the joins stay at C-string level throughout.
+                    cmd = self.as_str(argv.elts[0])
+                    for el in argv.elts[1:]:
+                        cmd = 'pyconcat(pyconcat(%s, " "), %s)' % (
+                            cmd, self.as_str(el))
+                    return "system(%s)" % cmd
             # os.path.<fn>(...) -> string / libc shims (see OS_SYS_PRELUDE)
             if isinstance(recv, ast.Attribute) and \
                     isinstance(recv.value, ast.Name) and \
