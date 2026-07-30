@@ -141,9 +141,44 @@ def cache_key(text):
 # Identifiers that only exist if the module leans on the transpiler runtime.
 # Same test main.process_py_file uses, so an included module and a
 # command-line one are classified identically.
-_USES_RT = re.compile(
-    r"\b(obj_[a-z]|OBJ_[A-Z]|aalloc|afree|pystr|subscript|truthy|"
-    r"list_of|make_closure|pyconcat)")
+# Whole-word markers that mean the generated C needs the transpiler runtime.
+# `obj_` and `OBJ_` are prefixes, checked with a following-character test; the
+# rest are complete identifiers.
+_RT_PREFIXES = ("obj_", "OBJ_")
+_RT_WORDS = ("aalloc", "afree", "pystr", "subscript", "truthy",
+             "list_of", "make_closure", "pyconcat")
+
+
+def _uses_runtime(code):
+    """True if `code` references the py2c runtime.
+
+    Hand-written rather than a pattern: this module is transpiled by py2c when
+    ShivyCX self-hosts, and a `re.search` there is an undefined symbol at link
+    time. The original required a word boundary before the marker, so a name
+    that merely *contains* one does not count.
+    """
+    n = len(code)
+    for i, ch in enumerate(code):
+        if i > 0 and (code[i - 1].isalnum() or code[i - 1] == "_"):
+            continue                       # not at a word boundary
+        for pre in _RT_PREFIXES:
+            if code.startswith(pre, i) and i + len(pre) < n:
+                nxt = code[i + len(pre)]
+                # Nested `if` and range comparisons rather than
+                # `pre == ".." and nxt.islower()`: py2c lowers `and` to a
+                # ternary, and `islower` is an `int` while the other operand is
+                # a boxed bool, so the two arms disagree. ASCII-only, which is
+                # all generated C identifiers use.
+                if pre == "obj_":
+                    if nxt >= "a" and nxt <= "z":
+                        return True
+                if pre == "OBJ_":
+                    if nxt >= "A" and nxt <= "Z":
+                        return True
+        for w in _RT_WORDS:
+            if code.startswith(w, i):
+                return True
+    return False
 
 _LIBC_PROTOS = [
     ("malloc", "void *malloc(unsigned long);"),
@@ -187,7 +222,7 @@ def _prelude_for(code):
 
 def _postprocess(code):
     """Turn py2c's module output into text that can be spliced into a unit."""
-    if _USES_RT.search(code):
+    if _uses_runtime(code):
         return code, True
     # A plain replace: the pattern was a fixed string, and this module is
     # transpiled by py2c when ShivyCX self-hosts, where `re.sub` has no

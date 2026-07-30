@@ -958,8 +958,27 @@ class Parser:
             # (const-generic `impl Foo<false>` → `Foo`), get the same.
             if name not in self.unit.structs and name not in self.unit.enums \
                     and name not in self.unit.type_aliases:
+                # `bool(..)` rather than `name and ..`: the `and` form yields
+                # the *string* on the falsy branch, so the two arms of the
+                # lowered ternary have different C types and py2c rejects it.
+                # The value is only ever used as a condition.
+                # An explicit `if` rather than `and`: py2c lowers `A and B` to
+                # a ternary, and when the two operands have different C types
+                # -- here an `int` from `isupper` and a boxed bool -- the
+                # result is rejected. A statement form gives both branches the
+                # same type.
+                # A range comparison rather than `str.isupper()`: py2c types
+                # that helper `int` while `False` is a boxed bool, so the
+                # assignment is rejected. ASCII-only, which is all this front
+                # end accepts anyway -- the same restriction `_is_identifier`
+                # makes, and for the same reason.
+                starts_upper = False
+                if len(name) > 0:
+                    first = name[0]
+                    if first >= "A" and first <= "Z":
+                        starts_upper = True
                 if name in self.unit.generic_structs \
-                        or was_path or (name and name[0].isupper()) \
+                        or was_path or starts_upper \
                         or name.endswith("_t"):
                     # A lowercase name is normally left alone, because it is
                     # usually a C typedef some header already supplies. The
@@ -4362,7 +4381,12 @@ def resolve_use_path(modpath, path, strict=False):
     for depth in depths:
         if depth < 1:
             continue
-        stem = os.path.join(base, *rest[:depth])
+        # Joined one segment at a time rather than `os.path.join(base, *rest)`:
+        # py2c has no starred-argument form, and the sliced list arrives as an
+        # `obj` where a `char*` is wanted.
+        stem = base
+        for seg in rest[:depth]:
+            stem = os.path.join(stem, seg)
         for cand in (stem + ".rs", os.path.join(stem, "mod.rs")):
             if os.path.isfile(cand):
                 return cand
