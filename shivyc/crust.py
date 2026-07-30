@@ -4118,7 +4118,15 @@ def find_mod_decls(code):
     literals are blanked first so a `mod` mentioned in prose is ignored.
     """
     scan = _blank(code)
-    return [m.group("name") for m in _MOD_DECL.finditer(scan)]
+    names = []
+    for _start, after in _scan_line_items(scan, "mod"):
+        j = after
+        while j < len(scan) and (scan[j].isalnum() or scan[j] == "_"):
+            j += 1
+        k = _skip_ws(scan, j)
+        if j > after and k < len(scan) and scan[k] == ";":
+            names.append(scan[after:j])
+    return names
 
 
 _USE_PATH = re.compile(
@@ -4204,8 +4212,11 @@ def find_use_imports(code):
     """
     out = {}
     scan = _blank(code)
-    for m in _USE_ITEM.finditer(scan):
-        _walk_use_tree([], code[m.start("body"):m.end("body")], out)
+    for _start, after in _scan_line_items(scan, "use"):
+        semi = scan.find(";", after)
+        if semi < 0:
+            continue
+        _walk_use_tree([], code[after:semi], out)
     return out
 
 
@@ -4217,7 +4228,22 @@ def find_use_paths(code):
     that path says exactly which file defines them, so it is worth following.
     """
     scan = _blank(code)
-    return [m.group("path") for m in _USE_PATH.finditer(scan)]
+    paths = []
+    for _start, after in _scan_line_items(scan, "use"):
+        for root in ("crate", "super", "self"):
+            if not scan.startswith(root, after):
+                continue
+            j = after + len(root)
+            while scan.startswith("::", j):
+                k = j + 2
+                while k < len(scan) and (scan[k].isalnum() or scan[k] == "_"):
+                    k += 1
+                if k == j + 2:
+                    break
+                j = k
+            paths.append(scan[after:j])
+            break
+    return paths
 
 
 def find_crate_root(path):
@@ -4306,11 +4332,10 @@ def find_rust_items(code, rust_file=False):
     scan = _blank(code)
     depths = _depths(scan)
     spans = []
-    for m in _MACRO_RULES.finditer(scan):
-        start = m.start()
+    for start, name, brace in _scan_macro_rules(scan):
         if depths[start] != 0:
             continue
-        close = _match_brace(scan, scan.index("{", m.end() - 1))
+        close = _match_brace(scan, brace)
         if close is None:
             raise CrustError("unterminated macro_rules! near offset %d"
                              % start)
@@ -4483,6 +4508,124 @@ CFG = {
 # Bare flags (`#[cfg(unix)]`) that hold for that target.
 CFG_FLAGS = {"unix"}
 
+def _skip_ws(text, i):
+    """Index of the first non-whitespace character at or after `i`."""
+    n = len(text)
+    while i < n and text[i] in " \t\r\n":
+        i += 1
+    return i
+
+
+def _skip_visibility_text(text, i):
+    """Past a leading `pub` or `pub(..)` at `i`, or `i` unchanged."""
+    if not text.startswith("pub", i):
+        return i
+    j = i + 3
+    if j < len(text) and text[j] == "(":
+        depth = 0
+        while j < len(text):
+            if text[j] == "(":
+                depth += 1
+            elif text[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    j += 1
+                    break
+            j += 1
+    k = _skip_ws(text, j)
+    return k if k > j else i          # `pub` must be followed by space
+
+
+def _scan_macro_rules(text):
+    """`(start, name, brace_index)` for each `macro_rules! name {`."""
+    out = []
+    i = 0
+    while True:
+        j = text.find("macro_rules!", i)
+        if j < 0:
+            return out
+        i = j + len("macro_rules!")
+        if j > 0 and (text[j - 1].isalnum() or text[j - 1] == "_"):
+            continue                       # not a word start
+        k = _skip_ws(text, i)
+        n0 = k
+        while k < len(text) and (text[k].isalnum() or text[k] == "_"):
+            k += 1
+        if k == n0:
+            continue
+        b = _skip_ws(text, k)
+        if b < len(text) and text[b] == "{":
+            out.append((j, text[n0:k], b))
+    return out
+
+
+def _scan_line_items(text, keyword):
+    """Offsets just past `keyword` for each line that starts with it.
+
+    Tolerates leading indentation and an optional `pub` / `pub(crate)`, which
+    is the shape of every item declaration this module scans for -- `mod x;`,
+    `use a::b;`, a macro invocation at file scope. Replaces the line-anchored
+    `re` patterns for the same reason as `_scan_literal_seq`: py2c has no
+    regex engine, and this is smaller to own than one.
+    """
+    out = []
+    n = len(text)
+    pos = 0
+    while pos <= n:
+        nl = text.find("\n", pos)
+        end = n if nl < 0 else nl
+        i = pos
+        while i < end and text[i] in " \t":
+            i += 1
+        i = _skip_visibility_text(text, i)
+        if text.startswith(keyword, i):
+            k = i + len(keyword)
+            # The keyword must be a whole word, and followed by space unless
+            # the caller is matching a bare `keyword;`.
+            if k >= n or not (text[k].isalnum() or text[k] == "_"):
+                out.append((i, _skip_ws(text, k)))
+        if nl < 0:
+            break
+        pos = nl + 1
+    return out
+
+
+def _scan_literal_seq(text, parts, start=0):
+    """End offsets where `parts` occur in order, separated by optional space.
+
+    A hand-written stand-in for the whitespace-tolerant literal patterns this
+    module used `re` for -- a `cfg` attribute head and friends. Written out
+    because this module is transpiled by py2c when ShivyCX self-hosts, and
+    py2c has no regex engine; a small scanner is a far smaller thing to own
+    than one of those.
+
+    Yields the offset just past each complete match, which is what every
+    caller here wants (they continue parsing from there).
+    """
+    out = []
+    n = len(text)
+    i = 0
+    first = parts[0]
+    while True:
+        j = text.find(first, i)
+        if j < 0:
+            return out
+        k = j + len(first)
+        ok = True
+        for part in parts[1:]:
+            k = _skip_ws(text, k)
+            if not text.startswith(part, k):
+                ok = False
+                break
+            k += len(part)
+        if ok:
+            out.append(k)
+            i = k
+        else:
+            i = j + 1
+    return out
+
+
 _CFG_ATTR = re.compile(r"#\s*\[\s*cfg\s*\(")
 
 
@@ -4570,8 +4713,8 @@ def cfg_allows(attrs):
     always kept -- this only ever *removes* an alternative that was written
     for a different target.
     """
-    for m in _CFG_ATTR.finditer(attrs):
-        value, _ = _cfg_predicate(attrs, m.end())
+    for end in _scan_literal_seq(attrs, ["#", "[", "cfg", "("]):
+        value, _ = _cfg_predicate(attrs, end)
         if not value:
             return False
     return True
