@@ -125,6 +125,13 @@ def build_interp():
     if err or not cpath:
         raise RuntimeError("py2c failed on interp.py: %s" % err)
     binary = os.path.join(out_dir, "interp")
+    # The interpreter's ctypes FFI builtins lower to calls into the mb_ffi.c
+    # shim (dlopen/dlsym plus the indirect-call thunks). `tools/rpy.py` copies
+    # it in before globbing for the same reason; this path did not, so the
+    # link failed on `mb_dlsym`, `mb_call1i` and friends.
+    mbffi = os.path.join(TOOLS, "rpy_lib", "mb_ffi.c")
+    if os.path.isfile(mbffi):
+        shutil.copy(mbffi, os.path.join(out_dir, "mb_ffi.c"))
     csrcs = [os.path.join(out_dir, f) for f in os.listdir(out_dir)
              if f.endswith(".c")]
     p = subprocess.run(["gcc", "-std=c99", "-O2", "-I", out_dir]
