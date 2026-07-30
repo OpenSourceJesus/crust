@@ -39,6 +39,12 @@ class ILCode:
         # Per-function call-structure flags, set by the stackless pass.
         # Defaults to {} to match readers' getattr(il_code, ..., {}).
         self.stackless_info = {}
+        # Literals created during codegen, for the caller that assigns spots
+        # mid-run (see asm_gen). Initialised here rather than left to
+        # `getattr(.., None)`: under self-host the transpiler promotes it to a
+        # real struct field that is never set, so the guard saw garbage instead
+        # of None and appended to an uninitialised list.
+        self.new_literals = None
 
     def copy_code(self) -> "ILCode":
         """Make copy of this object.
@@ -117,7 +123,7 @@ class ILCode:
         # then treats it as an ordinary value with no definition and hands it
         # a register nothing ever writes, so the loop advances a pointer by
         # whatever that register happened to hold.
-        if getattr(self, "new_literals", None) is not None:
+        if self.new_literals is not None:
             self.new_literals.append(il_value)
 
     def register_float_literal(self, il_value, value):
