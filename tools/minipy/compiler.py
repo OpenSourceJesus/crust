@@ -1522,6 +1522,44 @@ class Compiler:
             return True
         return False
 
+    def ex_JoinedStr(self, f, node):
+        """An f-string, desugared to `str(part) + str(part) + ..`.
+
+        Rewriting to the AST minipy already compiles keeps this to one method:
+        a literal segment stays a `str` constant, and an interpolation becomes
+        a `str(..)` call. Nothing new is needed in the VM.
+
+        Format specs and conversions (`{x:>3}`, `{x!r}`) are *not* supported
+        and are reported rather than silently dropped -- rendering `{x:>3}` as
+        plain `str(x)` would produce quietly wrong output.
+        """
+        parts = []
+        for piece in node.values:
+            if isinstance(piece, ast.Constant) and isinstance(piece.value, str):
+                parts.append(ast.Constant(value=piece.value))
+            elif isinstance(piece, ast.FormattedValue):
+                if piece.format_spec is not None or piece.conversion not in (-1, None):
+                    raise CompileError(
+                        "f-string format specs and conversions are not "
+                        "supported (line %s)" % getattr(node, "lineno", "?"))
+                parts.append(ast.Call(
+                    func=ast.Name(id="str", ctx=ast.Load()),
+                    args=[piece.value], keywords=[]))
+            else:                                        # pragma: no cover
+                raise CompileError("unsupported f-string part: %s"
+                                   % type(piece).__name__)
+        if not parts:
+            return self._const_reg(f, ("str", ""))
+        joined = parts[0]
+        for nxt in parts[1:]:
+            joined = ast.BinOp(left=joined, op=ast.Add(), right=nxt)
+        ast.fix_missing_locations(ast.Expression(body=joined))
+        for sub in ast.walk(joined):
+            if not hasattr(sub, "lineno"):
+                sub.lineno = getattr(node, "lineno", 1)
+                sub.col_offset = getattr(node, "col_offset", 0)
+        return self.expr(f, joined)
+
     def ex_BinOp(self, f, node):
         rb = self.expr(f, node.left)
         rc = self.expr(f, node.right)
