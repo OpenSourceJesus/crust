@@ -251,6 +251,8 @@ obj  call_obj_a(obj f, obj* a, int n);         /* varargs-free call_obj         
 
 /* ---- arena: bump-allocate; free the whole compile at once (no refcount) -- */
 void* aalloc(size_t n);
+long pymod(long a, long b);
+long pyfdiv(long a, long b);
 void  afree(void* p, size_t n);   /* manual reclaim for Python `del` (see .c) */
 obj   arena_mark(void);           /* snapshot arena bump pointer (scratch scope) */
 void  arena_release(obj mark);    /* free everything bump-allocated since mark   */
@@ -828,6 +830,21 @@ static char* _char_str(char ch) {
         g_chars_ready = 1;
     }
     return g_chars[(unsigned char)ch];
+}
+
+/* Python's `%` and `//` floor; C's truncate. They differ only when exactly one
+   operand is negative, and then by one divisor. */
+long pymod(long a, long b) {
+    if (b == 0) return 0;
+    long r = a % b;
+    if (r != 0 && ((r < 0) != (b < 0))) r += b;
+    return r;
+}
+long pyfdiv(long a, long b) {
+    if (b == 0) return 0;
+    long q = a / b;
+    if ((a % b != 0) && ((a < 0) != (b < 0))) q -= 1;
+    return q;
 }
 
 void* aalloc(size_t n) {
@@ -13379,6 +13396,22 @@ class Transpiler:
             if isinstance(node.op, ast.Div):     # Python `/` is float division
                 return "((double)%s / (double)%s)" % (self.expr(node.left),
                                                       self.expr(node.right))
+            # Python's `%` and `//` *floor*; C's truncate toward zero. They
+            # agree for non-negative operands and differ otherwise: `-4 % 8` is
+            # 4 in Python and -4 in C. That is not academic -- ShivyCX's stack
+            # allocator computes its padding as `size + (-size % 8)`, which
+            # under C semantics is `4 + -4 == 0`, so every local landed at
+            # offset 0 and overwrote the saved frame pointer.
+            if isinstance(node.op, ast.Mod) and "double" not in (lt, rt) \
+                    and "float" not in (lt, rt):
+                self._need_pymod = True
+                return "pymod(%s, %s)" % (self.expr(node.left),
+                                          self.expr(node.right))
+            if isinstance(node.op, ast.FloorDiv) and "double" not in (lt, rt) \
+                    and "float" not in (lt, rt):
+                self._need_pymod = True
+                return "pyfdiv(%s, %s)" % (self.expr(node.left),
+                                           self.expr(node.right))
             return "(%s %s %s)" % (self.expr(node.left),
                                    self.binop_sym(node.op),
                                    self.expr(node.right))
