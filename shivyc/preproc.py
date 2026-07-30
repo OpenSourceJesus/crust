@@ -19,6 +19,8 @@ line numbers, which is what lets directives (which are line-oriented) be picked
 out of the flat token list.
 """
 
+import os
+
 import shivyc.lexer as lexer
 import shivyc.token_kinds as token_kinds
 from shivyc.tokens import Token, parse_c_int
@@ -519,6 +521,18 @@ class _Preprocessor:
                 except crust.CrustError as e:
                     error_collector.add(CompilerError(
                         "crust: %s" % e, rest[0].r))
+                    return
+            elif filename.endswith((".cpp", ".cc", ".cxx", ".hpp")):
+                # A C++ subset module: lowered in place, like an `.rs`. Line
+                # numbers are preserved where possible, but a class body is
+                # rewritten into free functions, so a diagnostic inside a
+                # method names the generated form.
+                import tools.cpprust as cpprust
+                try:
+                    text = cpprust.translate(text, path=filename)
+                except cpprust.CppError as e:
+                    error_collector.add(CompilerError(
+                        "cpprust: %s" % e, rest[0].r))
                     return
             elif filename.endswith(".py"):
                 # An rpython module: transpile it with tools/py2c.py and lex
