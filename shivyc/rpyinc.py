@@ -213,6 +213,20 @@ def _prelude_for(code):
         prelude.append("typedef _Bool bool;")
         prelude.append("#define true 1")
         prelude.append("#define false 0")
+    # `pymod` / `pyfdiv` implement Python's *flooring* `%` and `//`, which
+    # differ from C's truncating ones whenever exactly one operand is
+    # negative. They live in `shivyc_rt.c`, which a runtime-free module does
+    # not link, so the definitions are supplied inline -- they are three lines
+    # each and `static` keeps them from colliding across units.
+    if main._has_word(code, "pymod"):
+        prelude.append("static long pymod(long a, long b) { if (b == 0) "
+                       "return 0; long r = a %% b; if (r != 0 && ((r < 0) != "
+                       "(b < 0))) r += b; return r; }".replace("%%", "%"))
+    if main._has_word(code, "pyfdiv"):
+        prelude.append("static long pyfdiv(long a, long b) { if (b == 0) "
+                       "return 0; long q = a / b; if ((a %% b != 0) && "
+                       "((a < 0) != (b < 0))) q -= 1; return q; }"
+                       .replace("%%", "%"))
     for sym, proto in _LIBC_PROTOS:
         if main._has_word(code, sym):
             prelude.append(proto)
