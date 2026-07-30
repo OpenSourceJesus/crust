@@ -4639,6 +4639,95 @@ def _modifier_run_start(text, end):
         i = w
 
 
+def _find_result_alias_error(text):
+    """The error type of a `type Result<T> = ..Result<T, E>;` alias, or None.
+
+    Replaces the `_RESULT_ALIAS` pattern. Only the shape that matters is
+    recognised -- a crate that fixes its error type once and then writes the
+    one-argument `Result<T>` everywhere, which is what Redox does.
+    """
+    for _line_start, tok in _scan_line_items_any(text):
+        if not text.startswith("type", tok):
+            continue
+        i = _skip_ws(text, tok + 4)
+        if not text.startswith("Result", i):
+            continue
+        i = _skip_ws(text, i + 6)
+        if i >= len(text) or text[i] != "<":
+            continue
+        close = text.find(">", i)
+        if close < 0:
+            continue
+        i = _skip_ws(text, close + 1)
+        if i >= len(text) or text[i] != "=":
+            continue
+        i = _skip_ws(text, i + 1)
+        # A possibly qualified `Result` on the right-hand side.
+        j = i
+        while j < len(text) and (_is_word_char(text[j]) or text[j] == ":"):
+            j += 1
+        if not text[i:j].endswith("Result"):
+            continue
+        i = _skip_ws(text, j)
+        if i >= len(text) or text[i] != "<":
+            continue
+        comma = text.find(",", i)
+        gt = text.find(">", i)
+        if comma < 0 or gt < 0 or comma > gt:
+            continue
+        err = text[comma + 1:gt].strip()
+        if err and all(_is_word_char(ch) or ch == ":" for ch in err):
+            return err.split("::")[-1]
+    return None
+
+
+def _internalise_line(line):
+    """`static `-prefix one line if it opens a C function definition.
+
+    A definition here is `TYPE NAME(params) {` on one line, with no `;` in the
+    parameter list (which would make it a declaration) and not already
+    `static`. Replaces the `_DEF_START` pattern and its `\\1` backreference --
+    the only backreference this module used.
+    """
+    if not line or not (line[0].isalpha() or line[0] == "_"):
+        return line
+    if line.startswith("static") and (len(line) == 6
+                                      or not _is_word_char(line[6])):
+        return line
+    op = line.find("(")
+    if op < 0:
+        return line
+    close = line.rfind(")")
+    if close < op:
+        return line
+    if ";" in line[:close]:
+        return line
+    if line[_skip_ws(line, close + 1):_skip_ws(line, close + 1) + 1] != "{":
+        return line
+    # A type and a name must precede the parenthesis.
+    head = line[:op].rstrip()
+    if " " not in head and "*" not in head:
+        return line
+    return "static " + line
+
+
+def _dedupe(items):
+    """`items` with duplicates removed, first occurrence kept.
+
+    Replaces `_dedupe(..)`, which py2c cannot lower -- there is no `dict`
+    name to call a classmethod on. Order matters at every call site here: it
+    decides the order structs are declared in.
+    """
+    seen = {}
+    out = []
+    for it in items:
+        if it in seen:
+            continue
+        seen[it] = True
+        out.append(it)
+    return out
+
+
 def _is_identifier(text):
     """True if `text` is a single identifier.
 
@@ -5640,7 +5729,7 @@ def _internalise(text):
     how `String_new` became `static` while `String_push` stayed external and
     collided at link time.
     """
-    return _DEF_START.sub(r"static \1", text)
+    return "\n".join(_internalise_line(ln) for ln in text.split("\n"))
 
 
 def ensure_core_concrete(unit, name):
@@ -6345,20 +6434,20 @@ def translate(code, path=None):
     # relative to, before any type is resolved.
     unit.imports = use_imports
     unit.import_from = path
-    m = _RESULT_ALIAS.search(_blank(code))
-    if m:
-        unit.result_error = RustCType(m.group("err").split("::")[-1])
+    err = _find_result_alias_error(_blank(code))
+    if err:
+        unit.result_error = RustCType(err)
     local = collect_items(code, spans, unit, struct_order, fail)
     # Local items win over mod-seeded ones of the same name.
     local_set = (set(local["structs"]) | set(local["enums"])
                  | set(local["consts"]) | set(local["type_aliases"]))
-    mod_structs = [n for n in dict.fromkeys(mod_seeded["structs"])
+    mod_structs = [n for n in _dedupe(mod_seeded["structs"])
                    if n not in local_set]
-    mod_enums = [n for n in dict.fromkeys(mod_seeded["enums"])
+    mod_enums = [n for n in _dedupe(mod_seeded["enums"])
                  if n not in local_set]
-    mod_consts = [n for n in dict.fromkeys(mod_seeded["consts"])
+    mod_consts = [n for n in _dedupe(mod_seeded["consts"])
                   if n not in local_set]
-    mod_aliases = [n for n in dict.fromkeys(mod_seeded["type_aliases"])
+    mod_aliases = [n for n in _dedupe(mod_seeded["type_aliases"])
                    if n not in local_set]
 
     # Trait impls inherit any default methods they did not override, and
@@ -6457,7 +6546,7 @@ def translate(code, path=None):
     # -- the bundled core, a `mod` sibling, a `use` followed on demand -- and
     # C rejects a repeated `typedef struct X X;` outright rather than treating
     # an identical redefinition as harmless.
-    for name in dict.fromkeys(core_structs + mod_structs + demand_structs
+    for name in _dedupe(core_structs + mod_structs + demand_structs
                               + local["structs"]):
         prelude.append("struct %s; typedef struct %s %s;"
                        % (name, name, name))
@@ -6499,7 +6588,7 @@ def translate(code, path=None):
     demand_aliases = [n for n in unit.demand_aliases
                       if n not in local_set and n not in mod_aliases
                       and n in unit.type_aliases]
-    for name in dict.fromkeys(mod_aliases + demand_aliases
+    for name in _dedupe(mod_aliases + demand_aliases
                               + local["type_aliases"]):
         prelude.append("typedef %s;" % unit.type_aliases[name].decl(name))
     for name in sorted(unit.unwraps):
