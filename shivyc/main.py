@@ -538,7 +538,10 @@ def process_c_file(file, args):
     try:
         code = crust.translate(code, path=file)
     except crust.CrustError as e:
-        error_collector.add(CompilerError("crust: %s" % e))
+        # `.message`, not `%s % e`: py2c gives user classes no `__str__`, so
+        # formatting the exception renders as `<obj 0x...>` and the diagnostic
+        # is lost in the self-hosted build, where it is needed most.
+        error_collector.add(CompilerError("crust: " + e.message))
         return None
 
     # Language-extension pre-pass: recognize __stackless__/__metamorphic__

@@ -50,7 +50,18 @@ _memo = {}
 
 
 class RpyIncludeError(Exception):
-    """An rpython module could not be lowered to C."""
+    """An rpython module could not be lowered to C.
+
+    The `__init__` is explicit for the same reason `CrustError` spells one
+    out: py2c models a class by its own `__init__`, and it gives user classes
+    no `__str__`, so `"%s" % e` renders as `<obj 0x...>`. Callers read
+    `.message` instead, which survives transpilation -- and a self-hosted
+    build is exactly where a lost diagnostic costs the most.
+    """
+
+    def __init__(self, message):
+        self.args = (message,)
+        self.message = message
 
 
 def take_runtime_sources():

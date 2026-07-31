@@ -624,8 +624,12 @@ class _Preprocessor:
                 try:
                     text = crust.translate(text, path=filename)
                 except crust.CrustError as e:
+                    # `e.message`, not `%s % e`: py2c gives user classes no
+                    # `__str__`, so formatting the exception itself yields
+                    # `<obj 0x...>` and the diagnostic is lost in exactly the
+                    # build where it is hardest to get at.
                     error_collector.add(CompilerError(
-                        "crust: %s" % e, rest[0].r))
+                        "crust: " + e.message, rest[0].r))
                     return
             elif (filename.endswith(".cpp") or filename.endswith(".cc")
                   or filename.endswith(".cxx")
@@ -665,7 +669,7 @@ class _Preprocessor:
                     text, filename = rpyinc.translate(filename, text)
                 except rpyinc.RpyIncludeError as e:
                     error_collector.add(CompilerError(
-                        "rpython include: %s" % e, rest[0].r))
+                        "rpython include: " + e.message, rest[0].r))
                     return
             inc = lexer.tokenize(text, filename)
             out.extend(process(inc, filename, self.macros))

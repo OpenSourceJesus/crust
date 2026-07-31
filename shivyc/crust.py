@@ -742,10 +742,16 @@ class Parser:
 
     # -- scopes -----------------------------------------------------------
 
-    def push(self):
+    # Named `scope_push`/`scope_pop`, not `push`/`pop`. A user method called
+    # `pop` puts that name in py2c's virtual-method table, and every `.pop()`
+    # in the module then dispatches through it -- including `self.scopes.pop()`
+    # in this very method, where the receiver is a list whose TypeInfo has no
+    # such slot. That compiled to a call through a null pointer and segfaulted
+    # the self-hosted compiler on every `fn` item it parsed.
+    def scope_push(self):
         self.scopes.append({})
 
-    def pop(self):
+    def scope_pop(self):
         self.scopes.pop()
 
     def declare(self, name, type_):
@@ -2243,13 +2249,13 @@ class Parser:
         sub = Parser(list(body) + [RustToken("eof", "", start.line)],
                      self.unit, self.tysubst)
         sub.impl_type = self.impl_type
-        sub.push()
+        sub.scope_push()
         for pname, pty in params:
             sub.declare(pname, pty)
         if ret is None:
             probe = Parser(list(body) + [RustToken("eof", "", start.line)],
                            self.unit, self.tysubst)
-            probe.push()
+            probe.scope_push()
             for pname, pty in params:
                 probe.declare(pname, pty)
             try:
@@ -2313,7 +2319,7 @@ class Parser:
         """
         open_tok = self.expect("{")
         out = Out(open_tok.line)
-        self.push()
+        self.scope_push()
         try:
             while True:
                 if self.cur.kind == "eof":
@@ -2351,7 +2357,7 @@ class Parser:
                 self.i = save
                 self.parse_stmt(out, 0, False)
         finally:
-            self.pop()
+            self.scope_pop()
 
     def parse_array_literal(self, open_tok):
         """Lower `[a, b, c]` and the `[v; N]` repeat form to a C initializer.
@@ -2578,13 +2584,13 @@ class Parser:
         """
         open_tok = self.expect("{")
         out.line_at(open_tok.line, "{", indent)
-        self.push()
+        self.scope_push()
         while not self.at("}", "punc"):
             if self.cur.kind == "eof":
                 raise CrustError("line %d: unterminated block" % self.cur.line)
             self.parse_stmt(out, indent + 1, tail_returns)
         close = self.expect("}")
-        self.pop()
+        self.scope_pop()
         out.line_at(close.line, "}", indent)
 
     def parse_stmt(self, out, indent, tail_returns):
@@ -2697,10 +2703,10 @@ class Parser:
             out.line_at(t.line, "for (%s = %s; %s %s %s; %s++)"
                         % (ity.decl(cvar), lo.code, cvar, cmp_op, hi.code,
                            cvar), indent)
-            self.push()
+            self.scope_push()
             self.declare(var, ity)
             self.parse_block(out, indent, False)
-            self.pop()
+            self.scope_pop()
             return
 
         if t.val == "{" and t.kind == "punc":
@@ -2824,11 +2830,11 @@ class Parser:
 
         out.write(" for (unsigned long %s = 0; %s < %s; %s++)"
                   % (idx, idx, count, idx))
-        self.push()
+        self.scope_push()
         self.declare(var, elem)
         self.emit_bound_block(out, indent, "%s = %s[%s];"
                               % (elem.decl(_c_name(var)), base, idx))
-        self.pop()
+        self.scope_pop()
         out.write(" }")
 
     def new_index(self):
@@ -2839,13 +2845,13 @@ class Parser:
         """Emit `{ <decl> <body> }` for a loop or pattern binding."""
         open_tok = self.expect("{")
         out.line_at(open_tok.line, "{ " + decl, indent)
-        self.push()
+        self.scope_push()
         while not self.at("}", "punc"):
             if self.cur.kind == "eof":
                 self.err("unterminated block")
             self.parse_stmt(out, indent + 1, False)
         close = self.expect("}")
-        self.pop()
+        self.scope_pop()
         out.line_at(close.line, "}", indent)
 
     def parse_if(self, out, indent, tail_returns):
@@ -2917,10 +2923,10 @@ class Parser:
         out.line_at(t.line, "{ %s = %s;" % (subject.type.decl(tmp),
                                             subject.code), indent)
         out.write(" if (%s.some)" % tmp)
-        self.push()
+        self.scope_push()
         self.declare(binding, elem)
         self.emit_binding_block(out, indent, tail_returns, binding, elem, tmp)
-        self.pop()
+        self.scope_pop()
         if self.accept("else"):
             out.write(" else")
             if self.at("if", "kw"):
@@ -2940,10 +2946,10 @@ class Parser:
         out.line_at(t.line, "for (;;) {", indent)
         out.write(" %s = %s;" % (subject.type.decl(tmp), subject.code))
         out.write(" if (!%s.some) break;" % tmp)
-        self.push()
+        self.scope_push()
         self.declare(binding, elem)
         self.emit_binding_block(out, indent, False, binding, elem, tmp)
-        self.pop()
+        self.scope_pop()
         out.write(" }")
 
     def emit_binding_block(self, out, indent, tail_returns, binding, elem,
@@ -2952,13 +2958,13 @@ class Parser:
         open_tok = self.expect("{")
         out.line_at(open_tok.line, "{ %s = %s.value;"
                     % (elem.decl(binding), tmp), indent)
-        self.push()
+        self.scope_push()
         while not self.at("}", "punc"):
             if self.cur.kind == "eof":
                 self.err("unterminated block")
             self.parse_stmt(out, indent + 1, tail_returns)
         close = self.expect("}")
-        self.pop()
+        self.scope_pop()
         out.line_at(close.line, "}", indent)
 
     def parse_match(self, out, indent, tail_returns):
@@ -3011,7 +3017,7 @@ class Parser:
             self.expect("=>")
             binds = self.binds
             self.binds = []
-            self.push()
+            self.scope_push()
             if binds:
                 # Bindings are declared inside a block so their names cannot
                 # leak into a later arm, which C's fall-through-free `case`
@@ -3024,7 +3030,7 @@ class Parser:
             self.parse_arm_body(out, indent + 2, tail_returns)
             if binds:
                 out.write(" }")
-            self.pop()
+            self.scope_pop()
             out.write(" break;")
             self.accept(",")
 
@@ -3634,7 +3640,7 @@ class Parser:
         self.ret_type = ret
         out.line_at(start.line, "%s(%s)" % (ret.decl(name),
                                             render_params(params)), 0)
-        self.push()
+        self.scope_push()
         for pname, ptype in params:
             self.declare(pname, ptype)
         # body, with the trailing expression becoming the return value
@@ -3643,18 +3649,18 @@ class Parser:
             raise CrustError("line %d: expected function body" % open_tok.line)
         self.expect("{")
         out.line_at(open_tok.line, "{", 0)
-        self.push()
+        self.scope_push()
         while not self.at("}", "punc"):
             if self.cur.kind == "eof":
                 raise CrustError("line %d: unterminated function body"
                                  % self.cur.line)
             self.parse_stmt(out, 1, True)
         close = self.expect("}")
-        self.pop()
+        self.scope_pop()
         if synth_main_ret:
             out.line_at(close.line, "return 0;", 1)
         out.line_at(close.line, "}", 0)
-        self.pop()
+        self.scope_pop()
         self.ret_type = prev_ret
 
 
@@ -4571,6 +4577,37 @@ def _is_rust_enum(scan, close):
     return not rest.startswith(";")
 
 
+def _has_field_colon(body):
+    """True if `body` holds an `ident:` -- a Rust field declaration.
+
+    Replaces `re.search(r"[A-Za-z_]\\w*\\s*:", body)`. py2c has no regex
+    engine and substitutes `None` for the call, which made this test always
+    False in a self-hosted build: every Rust struct body was then read as C,
+    silently. The scan is written out for the same reason the item scanners
+    above are.
+
+    A path separator (`Foo::Bar`) matches here, exactly as the pattern did.
+    That is deliberate -- keeping the old behaviour matters more than
+    tightening it.
+    """
+    i, n = 0, len(body)
+    while i < n:
+        c = body[i]
+        if c.isalpha() or c == "_":
+            j = i
+            while j < n and (body[j].isalnum() or body[j] == "_"):
+                j += 1
+            k = j
+            while k < n and body[k] in " \t\r\n":
+                k += 1
+            if k < n and body[k] == ":":
+                return True
+            i = j
+        else:
+            i += 1
+    return False
+
+
 def _is_rust_struct_body(body):
     """True if a `struct X { ... }` body is Rust rather than C.
 
@@ -4588,7 +4625,7 @@ def _is_rust_struct_body(body):
             depth -= 1
         elif ch == ";" and depth <= 0:
             return False
-    return re.search(r"[A-Za-z_]\w*\s*:", body) is not None
+    return _has_field_colon(body)
 
 
 # The configuration Crust compiles for. Redox is full of `#[cfg]`-gated
