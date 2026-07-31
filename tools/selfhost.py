@@ -293,6 +293,28 @@ def run(cmd, **kw):
     return subprocess.run(cmd, capture_output=True, text=True, **kw)
 
 
+def forward_py2c_notes(r):
+    """Re-emit py2c's substitution warnings from a captured transpile.
+
+    A transpile can succeed and still have replaced something it could not
+    lower with a stand-in value -- `None` for an unsupported call, an empty
+    dict for `vars()`. Those lines are the only advance notice that the
+    native build will behave differently from the host, and `run` captures
+    stderr, so without this they are discarded in exactly the build where
+    they matter. Three self-hosting bugs were tracked down through segfaults
+    and bisection that these lines would have named outright.
+    """
+    notes = [ln for ln in (getattr(r, "stderr", "") or "").splitlines()
+             if ln.startswith("py2c: ")]
+    if not notes:
+        return
+    for ln in notes:
+        sys.stderr.write(ln + "\n")
+    sys.stderr.write(
+        "py2c: %d construct(s) replaced by a stand-in value; the self-hosted "
+        "build will not match the host on those lines.\n" % len(notes))
+
+
 def transpile(modules, out_dir, mp_bridge=False):
     """Transpile module(s) to C in out_dir. Always writes the runtime; with
     mp_bridge also writes the objcore bridge."""
@@ -301,6 +323,7 @@ def transpile(modules, out_dir, mp_bridge=False):
         r = run([sys.executable, PY2C, *paths, "--out", out_dir], cwd=REPO)
         if r.returncode != 0:
             raise RuntimeError("transpile failed:\n" + r.stderr)
+        forward_py2c_notes(r)
     # py2c writes shivyc_rt.{c,h}; for the bridge backend we also need
     # mp_stdlib_bridge.{c,h}, which write_runtime emits when mp_bridge=True.
     sys.path.insert(0, os.path.join(REPO, "tools"))
@@ -493,6 +516,7 @@ def cmd_coverage(build_root, args):
     for g in COVERAGE_GLOBS:
         mods += glob.glob(os.path.join(REPO, g))
     r = run([sys.executable, PY2C, *mods, "--out", out], cwd=REPO)
+    forward_py2c_notes(r)
     if r.returncode != 0:
         print("transpile failed:\n" + r.stderr); return 1
     sys.path.insert(0, os.path.join(REPO, "tools"))
@@ -538,6 +562,7 @@ def cmd_link(build_root, args):
     for g in COVERAGE_GLOBS:
         mods += glob.glob(os.path.join(REPO, g))
     r = run([sys.executable, PY2C, *mods, "--out", out], cwd=REPO)
+    forward_py2c_notes(r)
     if r.returncode != 0:
         print("transpile failed:\n" + r.stderr)
         return 1
@@ -657,6 +682,7 @@ def cmd_compiler(build_root, args):
     for g in COVERAGE_GLOBS:
         mods += glob.glob(os.path.join(REPO, g))
     r = run([sys.executable, PY2C, *mods, "--out", out], cwd=REPO)
+    forward_py2c_notes(r)
     if r.returncode != 0:
         print("transpile failed:\n" + r.stderr); return 1
     sys.path.insert(0, os.path.join(REPO, "tools"))

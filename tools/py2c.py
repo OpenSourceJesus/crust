@@ -339,6 +339,8 @@ obj  pyrange(long lo, long hi, long step);
 /* ---- string methods (operate on char*) ---- */
 bool str_startswith(str s, str p);
 bool str_endswith(str s, str p);
+bool str_startswith_at(str s, str p, long start);
+bool str_endswith_at(str s, str p, long start);
 str  str_strip(str s, int mode);   /* 0 both, 1 left, 2 right                 */
 obj  str_split(str s, str sep);    /* sep NULL -> split on whitespace runs    */
 obj  str_partition(str s, str sep);/* (before, sep_or_'', after) as a 3-list  */
@@ -1585,6 +1587,25 @@ bool str_endswith(str s, str p) {
     size_t ls = strlen(s), lp = strlen(p);
     return lp <= ls && memcmp(s + ls - lp, p, lp) == 0;
 }
+/* `s.startswith(p, i)` / `s.endswith(p, i)`: test from an offset rather than
+   from the head of the string. A negative index counts from the end, as in
+   Python; an out-of-range one simply cannot match. */
+static size_t _str_clamp(str s, long start) {
+    size_t ls = strlen(s);
+    if (start < 0) {
+        start += (long)ls;
+        if (start < 0) start = 0;
+    }
+    return (size_t)start > ls ? ls : (size_t)start;
+}
+bool str_startswith_at(str s, str p, long start) {
+    size_t off = _str_clamp(s, start);
+    return str_startswith(s + off, p);
+}
+bool str_endswith_at(str s, str p, long start) {
+    size_t off = _str_clamp(s, start);
+    return str_endswith(s + off, p);
+}
 str str_strip(str s, int mode) {
     size_t n = strlen(s); size_t a = 0, b = n;
     if (mode != 2) while (a < b && isspace((unsigned char)s[a])) a++;
@@ -2547,6 +2568,39 @@ def arg_ctype(fn, arg):
 # ==========================================================================
 # Class model
 # ==========================================================================
+
+def _contains_call(node):
+    """True if evaluating `node` could have a side effect.
+
+    Used to decide whether a short-circuit operand is safe to name twice in
+    the generated ternary. Calls are the case that matters; a name, attribute
+    or comparison can be repeated harmlessly.
+    """
+    for n in ast.walk(node):
+        if isinstance(n, (ast.Call, ast.Await, ast.Yield, ast.NamedExpr)):
+            return True
+    return False
+
+
+def _truth_of(var, ctype):
+    """A truth test for an already-evaluated temporary of type `ctype`."""
+    if ctype == OBJ:
+        return "truthy(%s)" % var
+    if ctype == "char*":
+        # Python string truthiness: empty is false, not merely non-NULL.
+        return "(%s && *%s)" % (var, var)
+    return "(%s)" % var
+
+
+class Py2CUnsupported(Exception):
+    """A construct py2c cannot lower correctly.
+
+    Raised rather than warned. The alternative -- emitting the closest
+    approximation and carrying on -- is how `s.startswith(p, i)` came to
+    compile into a test against position zero: correct-looking C that
+    silently answered the wrong question, and only in self-hosted builds.
+    """
+
 
 class ClassInfo:
     def __init__(self, node):
@@ -4122,6 +4176,16 @@ static char* _ospath_join(char* a, char* b) {
     if (sep) s[k++] = '/';
     for (long i = 0; i < lb; i++) s[k++] = b[i];
     s[k] = 0; return s;
+}
+/* os.getcwd(): arena-allocated so the result outlives the call, unlike a
+   static buffer that the next call would overwrite. */
+static char* _os_getcwd(void) {
+    char _b[4096];
+    if (!getcwd(_b, sizeof _b)) return (char*)".";
+    size_t n = strlen(_b);
+    char* s = (char*)aalloc(n + 1);
+    for (size_t i = 0; i <= n; i++) s[i] = _b[i];
+    return s;
 }
 static char* _ospath_abspath(char* p) {
     if (p[0] == '/') return p;
@@ -8610,6 +8674,36 @@ class Transpiler:
 
     # ---- untyped-container inference + rpython-rule warnings -------------
 
+    def _warn_unsupported(self, line, what, subst, hint=""):
+        """Report a construct that was replaced by a stand-in value.
+
+        These are the dangerous ones. An advisory about container typing costs
+        a reader nothing if ignored; a substitution changes what the program
+        *does*, and until now the only trace was a comment in the generated C
+        that nobody reads. Three separate self-hosting bugs were found the
+        hard way -- through a segfault and a bisect -- when a line of stderr
+        would have named the cause outright. `os.getcwd()` became `None`,
+        `os.path.join` was handed it, and the compiler died with no diagnostic
+        at all.
+
+        Deduplicated per (file, line, construct): a call in a loop body is one
+        problem, not one per iteration.
+        """
+        if os.environ.get("PY2C_NO_UNSUPPORTED_WARN"):
+            return
+        seen = getattr(self, "_unsupported_seen", None)
+        if seen is None:
+            seen = self._unsupported_seen = set()
+        src = getattr(self, "src_name", "?")
+        key = (src, line, what)
+        if key in seen:
+            return
+        seen.add(key)
+        msg = "%s is not lowered; substituted %s" % (what, subst)
+        if hint:
+            msg += " -- " + hint
+        sys.stderr.write("py2c: %s:%s: %s\n" % (src, line, msg))
+
     def _warn(self, line, msg):
         """Emit an rpython advisory to stderr (never affects generated code)."""
         if getattr(self, "_no_warn", False) or \
@@ -9457,6 +9551,9 @@ class Transpiler:
                     return "char*"       # returns a C string
                 if _f.attr == "exists":
                     return "int"
+            if isinstance(_f.value, ast.Name) and _f.value.id == "os" and \
+                    _f.attr == "getcwd":
+                return "char*"           # returns a C string, like abspath
             if isinstance(_f.value, ast.Name) and _f.value.id == "os" and \
                     _f.attr in ("makedirs", "unlink", "remove"):
                 return OBJ               # returns OBJ_NONE
@@ -11333,6 +11430,15 @@ class Transpiler:
                         else "OBJ_NONE")
                 return ("({ char* _ge = getenv(%s); "
                         "_ge ? OBJ_STR(_ge) : %s; })" % (key, dflt))
+            # `os.getcwd()` takes no arguments, so it has to be matched
+            # before the `node.args` guards below -- without this it fell
+            # through to the generic unsupported path, which substitutes
+            # `OBJ_NONE` and leaves a comment in the C. Passing that None to
+            # `os.path.join` segfaulted the self-hosted compiler.
+            if isinstance(recv, ast.Name) and recv.id == "os" \
+                    and f.attr == "getcwd" and not node.args:
+                self._ossys_used = True
+                return "_os_getcwd()"
             # a few os.* filesystem ops
             if isinstance(recv, ast.Name) and recv.id == "os" and node.args:
                 if f.attr == "makedirs":
@@ -11751,6 +11857,9 @@ class Transpiler:
             if fn == "repr" and node.args:
                 return "pyrepr(%s)" % self.wrap_obj(node.args[0])
             if fn == "vars":
+                self._warn_unsupported(
+                    node.lineno, "vars()", "an empty dict",
+                    "attribute introspection has no lowering")
                 return "dict_new() /* vars() unsupported */"
             if fn == "hasattr" and len(node.args) == 2 and \
                     isinstance(node.args[1], ast.Constant) and \
@@ -11766,6 +11875,9 @@ class Transpiler:
                     return "mp_hasattr(%s, %s)" % (
                         self.wrap_obj(node.args[0]),
                         c_string(node.args[1].value))
+                self._warn_unsupported(
+                    node.lineno, "hasattr() on a dynamic attribute", "False",
+                    "the attribute has no declared owner to check against")
                 return "0 /* hasattr: dynamic attr, unsupported */"
             if fn == "getattr" and len(node.args) >= 2 and \
                     not (isinstance(node.args[1], ast.Constant) and
@@ -12263,6 +12375,11 @@ class Transpiler:
                             fmt, self.wrap_obj(node.args[1]))
                     for a in node.args:
                         self.expr(a)
+                    self._warn_unsupported(
+                        node.lineno, "%s.%s()" % (func.value.id, func.attr),
+                        "None",
+                        "guard the call for the self-hosted build, or the "
+                        "None will reach whatever consumes the result")
                     return "OBJ_NONE /* %s.%s(...) unsupported */" % (
                         func.value.id, func.attr)
                 if func.value.id in self.modules:
@@ -13542,14 +13659,51 @@ class Transpiler:
             return "AS_INT(%s)" % self.expr(node)
         return "pyint(%s)" % self.wrap_obj(node)
 
+    def _lower_affix(self, m, func, node):
+        """Lower `s.startswith(..)` / `s.endswith(..)`.
+
+        Three forms have to be told apart, and getting this wrong is silent.
+        A bare `s.startswith("x")` is one runtime call. A start offset --
+        `s.startswith(p, i)` -- needs the `_at` variant; emitting the two-
+        argument call and dropping `i` compiles fine and then tests the wrong
+        position, which is how the Rust front end came to fail only when
+        self-hosted. A tuple of prefixes expands to a chain of ors, because
+        the runtime takes a `str`, and handing it a list object type-checks
+        through `AS_STR` and never matches.
+
+        Anything left over is rejected rather than approximated. A wrong
+        answer that compiles is worse than a build that stops.
+        """
+        a = node.args
+        if len(a) > 2:
+            raise Py2CUnsupported(
+                "%s:%s: %s() with both start and end offsets is not lowered"
+                % (getattr(self, "src_name", "?"), node.lineno, m))
+        base = self.as_str(func.value)
+        fn = "str_startswith" if m == "startswith" else "str_endswith"
+        off = self.as_long(a[1]) if len(a) == 2 else None
+        if off is not None:
+            fn += "_at"
+        first = a[0] if a else None
+        if isinstance(first, (ast.Tuple, ast.List)):
+            parts = []
+            for elt in first.elts:
+                if off is None:
+                    parts.append("%s(%s, %s)" % (fn, base, self.as_str(elt)))
+                else:
+                    parts.append("%s(%s, %s, %s)"
+                                 % (fn, base, self.as_str(elt), off))
+            return ("(" + " || ".join(parts) + ")") if parts else "false"
+        if off is None:
+            return "%s(%s, %s)" % (fn, base, self.as_str(first))
+        return "%s(%s, %s, %s)" % (fn, base, self.as_str(first), off)
+
     def lower_str_method(self, func, node):
         """Lower a string method call; returns C or None if not a str method."""
         m = func.attr
         a = node.args
-        if m == "startswith":
-            return "str_startswith(%s, %s)" % (self.as_str(func.value), self.as_str(a[0]))
-        if m == "endswith":
-            return "str_endswith(%s, %s)" % (self.as_str(func.value), self.as_str(a[0]))
+        if m in ("startswith", "endswith"):
+            return self._lower_affix(m, func, node)
         if m in ("strip", "lstrip", "rstrip"):
             mode = {"strip": 0, "lstrip": 1, "rstrip": 2}[m]
             return "str_strip(%s, %d)" % (self.as_str(func.value), mode)
@@ -13641,9 +13795,27 @@ class Transpiler:
         else:                                # unify to Tier-2 obj
             rend = render(self.wrap_obj)
             tests = ["truthy(%s)" % r for r in rend]
+        ctype = types[0] if same else OBJ
         expr = rend[-1]
         for i in range(len(vals) - 2, -1, -1):
-            if is_and:                       # a and b -> (test(a) ? b : a)
+            if _contains_call(vals[i]):
+                # The ternary names the left operand twice -- once to test it,
+                # once as the result -- so a call there runs twice. That is
+                # invisible for a pure operand and wrong for anything else:
+                # crust's `self.accept("const") or self.accept("mut")` consumed
+                # `const` in the test and then re-ran `accept`, which found the
+                # next token and returned None, so every `*const T` was
+                # rejected as a raw pointer missing its qualifier. Bind the
+                # operand to a temporary and evaluate it once.
+                self._boolop_tmp = getattr(self, "_boolop_tmp", 0) + 1
+                tmp = "_bo%d" % self._boolop_tmp
+                test = _truth_of(tmp, ctype)
+                if is_and:
+                    body = "%s ? %s : %s" % (test, expr, tmp)
+                else:
+                    body = "%s ? %s : %s" % (test, tmp, expr)
+                expr = "({ %s %s = %s; %s; })" % (ctype, tmp, rend[i], body)
+            elif is_and:                     # a and b -> (test(a) ? b : a)
                 expr = "(%s ? %s : %s)" % (tests[i], expr, rend[i])
             else:                            # a or b  -> (test(a) ? a : b)
                 expr = "(%s ? %s : %s)" % (tests[i], rend[i], expr)
