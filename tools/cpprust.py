@@ -22,16 +22,67 @@ The subset, deliberately small:
     access control is a compile-time property and this is a lowering, not a
     type checker; pretending to enforce it would be worse than not claiming to)
   * `template<typename T>` on classes, monomorphised on use
+  * single inheritance, with `virtual` methods and pure virtual (`= 0`)
+    declarations. A base is laid out as the first member, so a pointer to a
+    derived object already *is* a pointer to its base and upcasting is a
+    cast. The vtable pointer sits first in the root of the hierarchy, hence
+    at offset zero throughout it, and a derived class's table begins with
+    its base's slots -- which is what lets a `Base *` dispatch into a
+    derived override. Overrides reached through a table go via a small
+    thunk that converts `this`, so the generated table holds no
+    function-pointer casts.
+  * method call syntax: `g.get()` and `p->get()` become `VecGuard_get(&g)`
+    and `VecGuard_get(p)`. Receivers resolve against a scope-tracked symbol
+    table -- locals, parameters, and chains through class-typed fields
+    (`a.b.get()`). Inside a method, a bare `helper(x)` picks up the implicit
+    `this`. Anything that does not resolve to a class is left exactly as
+    written, so plain C in the same file is untouched.
+  * reference parameters and locals: `T &x` is a pointer the source did not
+    have to spell, so it is lowered back to `T *x` and call sites take the
+    address. `T &r = e;` becomes `T *r = &(e);`
 
-Drops run at `}` only; an early `return` does not insert destructor calls, so
-a non-void helper should nest the guarded locals in an inner block and return
-after that block closes. Call `_drop` explicitly when that shape does not fit.
+A reference *return* (`T& f()`) is rejected rather than lowered. Turning it
+into `T*` would silently change what assignment through the result means at
+every call site, which is the same failure mode as silently making `virtual`
+static.
 
-Not supported, and reported rather than mistranslated: inheritance, virtual
-functions, exceptions, operator overloading, `new`/`delete`, the STL. A `virtual`
-keyword is an error, not a silently-ignored token, because a program that
-expects dynamic dispatch and gets static is wrong in a way that will not
-surface until it matters.
+Only a single receiver is resolved, so `a.get().foo()` -- a method on a
+returned value -- is not rewritten and will not compile as C. Detecting it
+here would mean flagging `)` followed by `.name(`, which is legitimate C
+(`get_ops()->init(x)`), so it is left to the C compiler to reject.
+
+Drops run on every exit from a scope: the closing `}`, and also `return`,
+`break` and `continue`. `return` unwinds out to the function, `break` to the
+enclosing loop or switch, `continue` to the enclosing loop. A `return` with a
+value spills it to a temporary before the destructors run, because C++
+evaluates the operand first and `return g.get();` reads the very object about
+to be destroyed.
+
+`goto` is rejected when a destructor is pending: where it lands decides what
+should have been destroyed, and a lowering that scans forward cannot know
+that. With nothing live it is left alone, so plain C is unaffected.
+
+A class-typed member is constructed and destroyed with its container, in
+declaration order and reverse declaration order respectively. If a member
+needs either and the container declares neither, the container gets an
+implicit one, as in C++. A constructor initializer list (`C(int n) : a(n),
+k(n) { }`) supplies arguments to a member's constructor, or assigns a scalar
+field. A member whose class has no default constructor must appear in the
+initializer list -- that is an error rather than a silently unconstructed
+object. Pointer and array members are left to the author.
+
+Constructors run base first, then install the vtable pointer, then members,
+then the body; destructors run the body, then members in reverse, then the
+base. A class with a base, a member, or a vtable that needs either gets an
+implicit constructor or destructor. A class with a pure virtual method is
+abstract: no table is emitted for it and declaring one by value is an error
+rather than an object whose vptr is never set.
+
+Not supported, and reported rather than mistranslated: multiple inheritance,
+virtual inheritance, exceptions, operator overloading, `new`/`delete`, the
+STL. Multiple bases are rejected because the layout admits exactly one: with
+one base first, upcasting is free, and that is the property the rest of this
+lowering leans on.
 
 The lowering is the same shape Crust uses for `impl` blocks: a method becomes
 `Class_method(Class *this, ..)`, a template becomes one struct per
@@ -52,7 +103,7 @@ class CppError(Exception):
         self.message = message
 
 
-_UNSUPPORTED = ("virtual", "throw", "try", "catch", "operator", "new",
+_UNSUPPORTED = ("throw", "try", "catch", "operator", "new",
                 "delete", "dynamic_cast", "typeid")
 
 # `template<typename T>` / `template<class T>`, one parameter.
@@ -101,7 +152,31 @@ def _match_brace(text, open_idx):
     return None
 
 
+def _blank_strings(text):
+    """Blank string and char literal bodies, preserving length and newlines."""
+    out = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c in "\"'":
+            j = i + 1
+            while j < n and text[j] != c:
+                j += 2 if text[j] == "\\" else 1
+            j = min(j + 1, n)
+            out.append(c)
+            out.append("".join(ch if ch == "\n" else " "
+                               for ch in text[i + 1:j - 1]))
+            out.append(c if j - 1 < n else "")
+            i = j
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
 def _check_unsupported(scan, path):
+    # A literal is data, not code: `puts("new item")` uses no keyword.
+    scan = _blank_strings(scan)
     for kw in _UNSUPPORTED:
         m = re.search(r"\b%s\b" % kw, scan)
         if m:
@@ -113,28 +188,83 @@ def _check_unsupported(scan, path):
 
 
 class Member(object):
-    __slots__ = ("kind", "ret", "name", "params", "body", "line")
+    __slots__ = ("kind", "ret", "name", "params", "body", "line", "dim",
+                 "init", "virt", "pure")
 
-    def __init__(self, kind, ret, name, params, body, line):
+    def __init__(self, kind, ret, name, params, body, line, dim="",
+                 init=None, virt=False, pure=False):
         self.kind = kind          # "field" | "method" | "ctor" | "dtor"
         self.ret = ret
         self.name = name
         self.params = params
         self.body = body
         self.line = line
+        self.dim = dim            # array suffix on a field, e.g. "[10]"
+        self.init = init or []    # ctor initializer list: [(field, args)]
+        self.virt = virt          # declared `virtual`
+        self.pure = pure          # `= 0`, so no implementation here
 
 
 class Class(object):
-    __slots__ = ("name", "tparam", "members", "line")
+    __slots__ = ("name", "tparam", "members", "line", "base")
 
-    def __init__(self, name, tparam, members, line):
+    def __init__(self, name, tparam, members, line, base=None):
         self.name = name
         self.tparam = tparam      # template parameter, or None
+        self.base = base          # single base class name, or None
         self.members = members
         self.line = line
 
 
 _ACCESS = re.compile(r"\b(public|private|protected)\s*:")
+
+
+def _parse_init_list(tail, sig, cname):
+    """Parse `: a(1), b(x)` following a constructor's parameter list."""
+    tail = tail.strip()
+    if not tail:
+        return []
+    if not tail.startswith(":"):
+        raise CppError("cannot parse %r after %s in class %s"
+                       % (tail, sig, cname))
+    out = []
+    for part in _split_top(tail[1:]):
+        part = part.strip()
+        if not part:
+            continue
+        m = re.match(r"^(\w+)\s*\(", part)
+        end = _match_paren(part, part.index("(")) if m else None
+        if m is None or end is None:
+            raise CppError("cannot parse initializer %r in class %s"
+                           % (part, cname))
+        out.append((m.group(1), part[m.end():end].strip()))
+    return out
+
+
+def _pure_virtual(decl, cname, line0):
+    """Parse `virtual int area() = 0;` -- a slot with no implementation."""
+    body = decl[len("virtual"):].strip()
+    op = body.find("(")
+    cp = _match_paren(body, op) if op >= 0 else None
+    if op < 0 or cp is None:
+        raise CppError("cannot parse virtual member %r in class %s"
+                       % (decl, cname))
+    tail = body[cp + 1:].strip()
+    if not re.match(r"^=\s*0$", tail):
+        raise CppError(
+            "class %s: `%s` is a virtual declaration without a body; the "
+            "subset needs either a definition or `= 0`." % (cname, decl))
+    params = body[op + 1:cp].strip()
+    sig = body[:op].strip()
+    if sig.startswith("~"):
+        raise CppError("class %s: a pure virtual destructor is not in the "
+                       "C++ subset." % cname)
+    bits = sig.replace("*", " * ").split()
+    if len(bits) < 2:
+        raise CppError("cannot parse virtual member %r in class %s"
+                       % (decl, cname))
+    return Member("method", " ".join(bits[:-1]), bits[-1], params, None,
+                  line0, "", None, True, True)
 
 
 def _split_members(body, cname, line0):
@@ -156,12 +286,22 @@ def _split_members(body, cname, line0):
             i = semi + 1
             if not decl:
                 continue
+            if decl.startswith("virtual"):
+                members.append(_pure_virtual(decl, cname, line0))
+                continue
             parts = decl.replace("*", " * ").split()
             if len(parts) < 2:
                 raise CppError("cannot parse member %r in class %s"
                                % (decl, cname))
-            members.append(Member("field", " ".join(parts[:-1]), parts[-1],
-                                  None, None, line0))
+            # `int arr[10];` -- the declarator suffix is not part of the name.
+            # Keeping it in the name would make field qualification miss every
+            # use of `arr` in a method body.
+            fname, dim = parts[-1], ""
+            b = fname.find("[")
+            if b >= 0:
+                fname, dim = fname[:b], fname[b:]
+            members.append(Member("field", " ".join(parts[:-1]), fname,
+                                  None, None, line0, dim))
             continue
         if brace < 0:
             break
@@ -172,29 +312,58 @@ def _split_members(body, cname, line0):
         inner = body[brace + 1:close]
         i = close + 1
         op = head.find("(")
-        cp = head.rfind(")")
-        if op < 0 or cp < op:
+        if op < 0:
+            raise CppError("cannot parse member %r in class %s" % (head, cname))
+        # Match the opening paren rather than taking the last `)`: a ctor
+        # initializer list puts more parens after the parameter list.
+        cp = _match_paren(head, op)
+        if cp is None:
             raise CppError("cannot parse member %r in class %s" % (head, cname))
         params = head[op + 1:cp].strip()
         sig = head[:op].strip()
+        virt = bool(re.match(r"virtual\b", sig))
+        if virt:
+            sig = sig[len("virtual"):].strip()
+        init = _parse_init_list(head[cp + 1:], sig, cname)
         if sig == "~" + cname:
-            members.append(Member("dtor", "void", cname, params, inner, line0))
+            members.append(Member("dtor", "void", cname, params, inner, line0,
+                                  "", None, virt))
         elif sig == cname:
-            members.append(Member("ctor", "void", cname, params, inner, line0))
+            members.append(Member("ctor", "void", cname, params, inner, line0,
+                                  "", init))
         else:
             bits = sig.replace("*", " * ").split()
             if len(bits) < 2:
                 raise CppError("cannot parse method %r in class %s"
                                % (head, cname))
             members.append(Member("method", " ".join(bits[:-1]), bits[-1],
-                                  params, inner, line0))
+                                  params, inner, line0, "", None, virt))
     return members
+
+
+def _parse_base(clause, cname):
+    """`: public B` -> `B`. Single inheritance only."""
+    clause = (clause or "").strip()
+    if not clause.startswith(":"):
+        return None
+    bases = [b.strip() for b in _split_top(clause[1:]) if b.strip()]
+    if len(bases) > 1:
+        raise CppError(
+            "class %s: multiple inheritance is not in the C++ subset -- a "
+            "base is laid out as the first member, which admits one base."
+            % cname)
+    parts = [p for p in bases[0].split()
+             if p not in ("public", "private", "protected", "virtual")]
+    if len(parts) != 1:
+        raise CppError("class %s: cannot parse base clause %r"
+                       % (cname, clause))
+    return parts[0]
 
 
 def _find_classes(scan, text):
     """Locate `class`/`struct` definitions with bodies, template-aware."""
     classes = []
-    for m in re.finditer(r"\b(class|struct)\s+(\w+)\s*\{", scan):
+    for m in re.finditer(r"\b(class|struct)\s+(\w+)\s*(:[^{;]*)?\{", scan):
         open_idx = scan.index("{", m.start())
         close = _match_brace(scan, open_idx)
         if close is None:
@@ -212,8 +381,111 @@ def _find_classes(scan, text):
                               _split_members(text[open_idx + 1:close],
                                              m.group(2),
                                              scan.count("\n", 0, m.start()) + 1),
-                              scan.count("\n", 0, m.start()) + 1)))
+                              scan.count("\n", 0, m.start()) + 1,
+                              _parse_base(m.group(3), m.group(2)))))
     return classes
+
+
+def _match_paren(text, open_idx):
+    """Index of the `)` closing the `(` at `open_idx`, or None."""
+    depth = 0
+    i, n = open_idx, len(text)
+    quote = None
+    while i < n:
+        c = text[i]
+        if quote is not None:
+            if c == "\\":
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+        elif c in "\"'":
+            quote = c
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+
+def _split_top(text, sep=","):
+    """Split on `sep` at paren/bracket depth zero, ignoring string bodies."""
+    parts, cur, depth, quote = [], [], 0, None
+    for c in text:
+        if quote is not None:
+            cur.append(c)
+            if c == quote:
+                quote = None
+            continue
+        if c in "\"'":
+            quote = c
+        elif c in "([":
+            depth += 1
+        elif c in ")]":
+            depth -= 1
+        if c == sep and depth == 0:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(c)
+    parts.append("".join(cur))
+    return parts
+
+
+_KEYWORDS = frozenset((
+    "if", "for", "while", "switch", "return", "sizeof", "do", "else",
+    "case", "default", "break", "continue", "goto", "static", "const"))
+
+
+def _param_name(text):
+    """The declared name of one parameter, for forwarding it on."""
+    text = text.strip()
+    if not text or text == "void":
+        return None
+    toks = text.replace("&", " ").replace("*", " * ").split()
+    if not toks:
+        return None
+    name = toks[-1]
+    b = name.find("[")
+    if b >= 0:
+        name = name[:b]
+    if not name or not (name[0].isalpha() or name[0] == "_"):
+        return None
+    return name
+
+
+def _parse_param(text, names):
+    """`(class, is_ptr, varname)` for one parameter, or None if not a class.
+
+    A reference parameter counts as a pointer: `T &x` is lowered to `T *x`,
+    so every use of `x` on the C side goes through `->`.
+    """
+    text = text.strip()
+    if not text or text == "void":
+        return None
+    is_ref = "&" in text
+    toks = text.replace("&", " ").replace("*", " * ").split()
+    toks = [t for t in toks if t != "const"]
+    if len(toks) < 2:
+        return None
+    name = toks[-1]
+    if not (name[0].isalpha() or name[0] == "_") or name in _KEYWORDS:
+        return None
+    if toks[0] not in names:
+        return None
+    return (toks[0], "*" in toks[:-1] or is_ref, name)
+
+
+def _ref_positions(params, names):
+    """Indices of the parameters in `params` that are taken by reference."""
+    out = set()
+    for idx, p in enumerate(_split_top(params or "")):
+        if "&" in p and _parse_param(p, names) is not None:
+            out.add(idx)
+    return out
 
 
 def _subst_type(text, tparam, concrete):
@@ -226,35 +498,325 @@ def _mangle(name):
     return re.sub(r"\W+", "_", name).strip("_")
 
 
-def _emit_class(cls, targ=None):
-    """Emit a class as a C struct plus free functions."""
+def _type_alt(names):
+    return "|".join(re.escape(n) for n in sorted(names, key=len, reverse=True))
+
+
+def _check_ref_returns(scan, names, path):
+    """Reject `T& f()`. A reference return has no honest lowering here.
+
+    Lowering it to `T*` would silently change what `f(x)` means at every call
+    site -- assignment through the result would become a pointer assignment.
+    Following the rest of the subset, that is reported rather than guessed at.
+    """
+    if not names:
+        return
+    pat = re.compile(r"(?<![\w.])(?:const\s+)?(%s)\s*&\s*(\w+)\s*\("
+                     % _type_alt(names))
+    for m in pat.finditer(scan):
+        close = _match_paren(scan, scan.index("(", m.end() - 1))
+        if close is None:
+            continue
+        tail = scan[close + 1:close + 40].lstrip()
+        if tail.startswith("{") or tail.startswith(";"):
+            line = scan.count("\n", 0, m.start()) + 1
+            raise CppError(
+                "%s:%d: `%s&` return type is not in the C++ subset -- return "
+                "`%s *` explicitly. Reference *parameters* are supported."
+                % (os.path.basename(path), line, m.group(1), m.group(1)))
+
+
+def _lower_refs(text, names):
+    """`T &x` -> `T *x`, and `T &r = e;` -> `T *r = &(e);`.
+
+    Parameters and locals only: a reference is a pointer that the source did
+    not have to spell, so the lowering restores the spelling. Uses of `r` then
+    go through `->`, which the call rewriter handles from the symbol table.
+    """
+    if not names:
+        return text
+    alt = _type_alt(names)
+    # A reference local binds something; take its address.
+    text = re.sub(
+        r"(?<![\w.])((?:const\s+)?(?:%s))\s*&\s*(\w+)\s*=\s*([^;]+);" % alt,
+        lambda m: "%s *%s = &(%s);" % (m.group(1), m.group(2),
+                                       m.group(3).strip()),
+        text)
+    # Everything else: a reference parameter.
+    text = re.sub(r"(?<![\w.&])((?:const\s+)?(?:%s))\s*&(?!&)\s*(\w+)" % alt,
+                  lambda m: "%s *%s" % (m.group(1), m.group(2)), text)
+    return text
+
+
+def _implicit_this(body, mnames):
+    """`helper(x)` inside a method -> `this->helper(x)`.
+
+    Rewriting to an explicit receiver rather than straight to
+    `Cname_helper(this, x)` means the ordinary call pass resolves it, so a
+    bare call to an inherited method upcasts and a bare call to a virtual
+    one dispatches -- both for free, and both correct.
+    """
+    if not mnames:
+        return body
+    return re.sub(r"(?<![\w.>])(%s)\s*\(" % _type_alt(mnames),
+                  lambda m: "this->%s(" % m.group(1), body)
+
+
+def _member_prologue(cname, value_members, initmap, known, fieldset, line):
+    """Constructor calls for class-typed members, in declaration order."""
+    lines = []
+    seen = set()
+    for fname, fcls in value_members:
+        if fname in initmap:
+            args = initmap[fname]
+            seen.add(fname)
+            lines.append("%s_new(&this->%s%s);"
+                         % (fcls, fname, (", " + args) if args else ""))
+        elif known[fcls]["ctor"]:
+            if known[fcls]["ctor_args"]:
+                raise CppError(
+                    "%s: member `%s` of type `%s` has no default constructor; "
+                    "give it arguments in an initializer list, as "
+                    "`%s(..) : %s(..) { }`"
+                    % (cname, fname, fcls, cname, fname))
+            lines.append("%s_new(&this->%s);" % (fcls, fname))
+    # Anything else in the initializer list is a plain assignment.
+    for fname, args in initmap.items():
+        if fname in seen:
+            continue
+        if fname not in fieldset:
+            raise CppError("%s: `%s` in the initializer list is not a member"
+                           % (cname, fname))
+        lines.append("this->%s = %s;" % (fname, args))
+    return (" ".join(lines) + " ") if lines else ""
+
+
+def _member_epilogue(value_members, known):
+    """Destructor calls for class-typed members, in reverse order."""
+    lines = ["%s_drop(&this->%s);" % (fcls, fname)
+             for fname, fcls in reversed(value_members)
+             if known[fcls]["dtor"]]
+    return (" " + " ".join(lines)) if lines else ""
+
+
+def _vtable_slots(cls, cname, base_info, known):
+    """Ordered vtable layout: inherited slots first, then newly declared.
+
+    A slot keeps the signature of the class that first declared it, so a
+    derived vtable stays layout-compatible with its base's and a `Base *`
+    can dispatch through it. Overriding replaces the implementation, never
+    the slot's position or its `this` type.
+    """
+    slots = [dict(s) for s in (base_info["slots"] if base_info else [])]
+    by_name = dict((s["name"], s) for s in slots)
+    for m in cls.members:
+        if m.kind == "method" and m.virt:
+            if m.name in by_name:
+                slot = by_name[m.name]
+                slot["impl"] = None if m.pure else cname
+                slot["pure"] = m.pure
+            else:
+                slot = {"name": m.name, "decl": cname, "ret": m.ret,
+                        "params": m.params or "", "pure": m.pure,
+                        "impl": None if m.pure else cname}
+                slots.append(slot)
+                by_name[m.name] = slot
+        elif m.kind == "method" and m.name in by_name:
+            # An override without the keyword still overrides.
+            by_name[m.name]["impl"] = cname
+            by_name[m.name]["pure"] = False
+    return slots
+
+
+def _emit_class(cls, names, known, tsub, targ=None):
+    """Emit a class as a C struct plus free functions.
+
+    Returns the lines, the mangled name, and an info dict describing the
+    class to the later call-rewriting pass. `known` holds the classes already
+    emitted, which is what makes member construction and inheritance
+    possible: a base and a member type must both be complete, so both are
+    always emitted first.
+
+    A base class is laid out as the first member, so a pointer to a derived
+    object is already a pointer to its base -- upcasting is a cast and
+    nothing more. The vtable pointer sits first in the root of the
+    hierarchy, hence at offset zero throughout it.
+    """
     sub = (lambda s: _subst_type(s, cls.tparam, targ)) if targ else (lambda s: s)
     cname = cls.name if targ is None else "%s_%s" % (cls.name, _mangle(targ))
-    out = ["struct %s;" % cname, "typedef struct %s %s;" % (cname, cname)]
-    fields = [m for m in cls.members if m.kind == "field"]
-    body = " ".join("%s %s;" % (sub(f.ret), f.name) for f in fields) or \
-        "char _cpp_empty;"
-    out.append("struct %s { %s };" % (cname, body))
+    base = cls.base
+    if base is not None and base not in known:
+        raise CppError(
+            "class %s: base class `%s` is not defined above it. A base is "
+            "laid out as the first member, so it has to be complete first."
+            % (cls.name, base))
+    base_info = known[base] if base else None
 
-    for m in cls.members:
-        if m.kind == "field":
-            continue
-        params = sub(m.params or "").strip()
+    slots = _vtable_slots(cls, cname, base_info, known)
+    root = (base_info["root"] if base_info else cname) if slots else None
+    abstract = any(s["impl"] is None for s in slots)
+
+    head = ["struct %s;" % cname, "typedef struct %s %s;" % (cname, cname)]
+    out = []
+    fields = [m for m in cls.members if m.kind == "field"]
+
+    # The vtable type is emitted per class; the leading slots match the
+    # base's exactly, which is what makes the derived table usable through
+    # a base pointer.
+    if slots:
+        rows = []
+        for s in slots:
+            args = "%s *this" % s["decl"]
+            if s["params"]:
+                args += ", " + s["params"]
+            rows.append("%s (*%s)(%s);" % (s["ret"], s["name"], args))
+        head.append("struct %s_vtable { %s };" % (cname, " ".join(rows)))
+
+    parts = []
+    if base:
+        parts.append("%s _base;" % base)
+    elif slots:
+        parts.append("const struct %s_vtable *_vptr;" % cname)
+    parts.extend("%s %s%s;" % (sub(f.ret), f.name, f.dim) for f in fields)
+    head.append("struct %s { %s };" % (cname, " ".join(parts) or
+                                       "char _cpp_empty;"))
+
+    mnames = [m.name for m in cls.members if m.kind == "method"]
+    if base_info:
+        mnames = sorted(set(mnames) | set(base_info["methods"]))
+    info = {"ctor": False, "dtor": False, "ctor_args": "", "methods": {},
+            "fields": {}, "base": base, "slots": slots, "root": root,
+            "abstract": abstract, "vdtor": False}
+    if base_info:
+        # Inherited members and methods are reachable on the derived class.
+        for k, v in base_info["fields"].items():
+            info["fields"].setdefault(k, v)
+        for k, v in base_info["methods"].items():
+            info["methods"][k] = dict(v)
+        info["vdtor"] = base_info["vdtor"]
+
+    value_members = []
+    for f in fields:
+        t = tsub(sub(f.ret))
+        b = [x for x in t.replace("*", " ").split() if x != "const"]
+        b = b[0] if b else ""
+        is_ptr = "*" in t
+        info["fields"][f.name] = (b, is_ptr)
+        if b in known and not is_ptr and not f.dim:
+            value_members.append((f.name, b))
+    fieldset = set(info["fields"])
+
+    ctor = next((m for m in cls.members if m.kind == "ctor"), None)
+    dtor = next((m for m in cls.members if m.kind == "dtor"), None)
+    if dtor is not None and dtor.virt:
+        info["vdtor"] = True
+    initmap = dict(ctor.init) if ctor is not None else {}
+
+    # Base construction runs first, then the vptr is installed, then members.
+    prologue = ""
+    if base:
+        bargs = initmap.pop(base, None)
+        if known[base]["ctor"]:
+            if bargs is None and known[base]["ctor_args"]:
+                raise CppError(
+                    "class %s: base `%s` has no default constructor; pass its "
+                    "arguments as `%s(..) : %s(..) { }`"
+                    % (cls.name, base, cls.name, base))
+            prologue += "%s_new(&this->_base%s); " % (
+                base, (", " + bargs) if bargs else "")
+        elif bargs is not None:
+            raise CppError("class %s: base `%s` has no constructor to pass "
+                           "arguments to" % (cls.name, base))
+    if slots and not abstract:
+        prologue += "((%s *)this)->_vptr = (const struct %s_vtable *)&%s__vtable; " % (
+            root, root, cname)
+    prologue += _member_prologue(cname, value_members, initmap, known,
+                                 fieldset, cls.line)
+    # Members are destroyed in reverse, and the base last of all.
+    epilogue = _member_epilogue(value_members, known)
+    if base and known[base]["dtor"]:
+        epilogue += " %s_drop(&this->_base);" % base
+
+    def emit(kind, mname, params, raw):
+        refs = _ref_positions(params, names)
+        params = _lower_refs(params, names)
         # `this` is a pointer, exactly as an `impl` method's `self` is.
         arglist = "%s *this" % cname + (", " + params if params else "")
-        mname = "%s_%s" % (cname, m.name if m.kind == "method" else
-                           ("new" if m.kind == "ctor" else "drop"))
-        ret = sub(m.ret)
-        inner = sub(m.body or "")
+        inner = _implicit_this(raw, mnames)
         # Bare member names inside a body refer to fields; qualify them.
         for f in fields:
             inner = re.sub(r"(?<![\w.>])%s\b" % re.escape(f.name),
                            "this->" + f.name, inner)
         inner = inner.replace("this->this->", "this->")
-        out.append("static %s %s(%s) {%s}" % (ret, mname, arglist, inner))
-    has_ctor = any(m.kind == "ctor" for m in cls.members)
-    has_dtor = any(m.kind == "dtor" for m in cls.members)
-    return out, cname, has_ctor, has_dtor
+        out.append("static %s %s(%s) {%s}" % (kind, mname, arglist, inner))
+        return refs
+
+    for m in cls.members:
+        if m.kind == "field" or m.pure:
+            continue
+        params = sub(m.params or "").strip()
+        if m.kind == "ctor":
+            emit("void", "%s_new" % cname, params, prologue + sub(m.body or ""))
+            info["ctor"] = True
+            info["ctor_args"] = params
+        elif m.kind == "dtor":
+            emit("void", "%s_drop" % cname, params,
+                 sub(m.body or "") + epilogue)
+            info["dtor"] = True
+        else:
+            info["methods"][m.name] = {
+                "refs": emit(sub(m.ret), "%s_%s" % (cname, m.name), params,
+                             sub(m.body or "")),
+                "owner": cname, "virtual": False, "decl": cname}
+
+    # A base, a member, or a vtable pointer all oblige the class to have a
+    # constructor; a base or member destructor obliges a destructor.
+    if ctor is None and prologue:
+        out.append("static void %s_new(%s *this) { %s}"
+                   % (cname, cname, prologue))
+        info["ctor"] = True
+    if dtor is None and epilogue:
+        out.append("static void %s_drop(%s *this) {%s }"
+                   % (cname, cname, epilogue))
+        info["dtor"] = True
+
+    # Virtual methods resolve through the vtable rather than by name.
+    for s in slots:
+        info["methods"][s["name"]] = {
+            "refs": _ref_positions(s["params"], names), "owner": s["impl"],
+            "virtual": True, "decl": s["decl"]}
+
+    if slots and not abstract:
+        protos, entries, thunks = [], [], []
+        for s in slots:
+            impl = s["impl"]
+            plist = (", " + s["params"]) if s["params"].strip() else ""
+            if impl == s["decl"]:
+                entries.append("%s_%s" % (impl, s["name"]))
+                protos.append("static %s %s_%s(%s *this%s);"
+                              % (s["ret"], impl, s["name"], impl, plist))
+                continue
+            # The slot's `this` is the declaring class; the implementation
+            # takes its own. A thunk converts, which keeps the table free of
+            # function-pointer casts.
+            fwd = [n for n in (_param_name(x)
+                               for x in _split_top(s["params"])) if n]
+            thunk = "%s__thunk_%s" % (cname, s["name"])
+            ret = "" if s["ret"].strip() == "void" else "return "
+            protos.append("static %s %s(%s *this%s);"
+                          % (s["ret"], thunk, s["decl"], plist))
+            thunks.append("static %s %s(%s *this%s) { %s%s_%s((%s *)this%s); }"
+                          % (s["ret"], thunk, s["decl"], plist, ret, impl,
+                             s["name"], impl,
+                             "".join(", " + f for f in fwd)))
+            entries.append(thunk)
+        # The constructor installs the table, so the table has to be visible
+        # before the constructor is defined -- hence prototypes first.
+        head.extend(protos)
+        head.append("static const struct %s_vtable %s__vtable = { %s };"
+                    % (cname, cname, ", ".join("&" + e for e in entries)))
+        out.extend(thunks)
+    return head + out, cname, info
 
 
 def _prev_word(text, idx):
@@ -270,13 +832,123 @@ def _prev_word(text, idx):
     return text[j + 1:end]
 
 
+_STORAGE = re.compile(r"^(?:static|extern|inline|register|auto)\s+")
+
+
+def _open_paren_before(text, close_idx):
+    """Index of the `(` matching the `)` at `close_idx`, or None."""
+    depth = 0
+    j = close_idx
+    while j >= 0:
+        if text[j] == ")":
+            depth += 1
+        elif text[j] == "(":
+            depth -= 1
+            if depth == 0:
+                return j
+        j -= 1
+    return None
+
+
+def _func_return_type(text, open_paren):
+    """The return type of the function whose parameter list opens here.
+
+    Needed because a `return` that unwinds has to evaluate its expression
+    before the destructors run, which means spilling it to a temporary of
+    the right type.
+    """
+    head = text[:open_paren].rstrip()
+    cut = max(head.rfind(";"), head.rfind("}"), head.rfind("{"),
+              head.rfind(")"), head.rfind(":"))
+    decl = head[cut + 1:].strip()
+    m = re.match(r"^(.*?)([A-Za-z_]\w*)$", decl, re.S)
+    if m is None:
+        return None
+    ret = " ".join(m.group(1).split())
+    while True:
+        stripped = _STORAGE.sub("", ret)
+        if stripped == ret:
+            break
+        ret = stripped
+    return ret or None
+
+
+def _brace_kind(text, idx, at_file_scope):
+    """Classify the block opening at `idx` for unwinding purposes."""
+    j = idx - 1
+    while j >= 0 and text[j] in " \t\r\n":
+        j -= 1
+    if j < 0:
+        return "block", None
+    if text[j] == ")":
+        op = _open_paren_before(text, j)
+        if op is None:
+            return "block", None
+        word = _prev_word(text, op)
+        if word in ("for", "while"):
+            return "loop", None
+        if word == "switch":
+            return "switch", None
+        if word in ("if", "catch"):
+            return "block", None
+        if at_file_scope:
+            return "func", _func_return_type(text, op)
+        return "block", None
+    word = _prev_word(text, j + 1)
+    if word == "do":
+        return "loop", None
+    return "block", None
+
+
+def _stmt_end(text, i):
+    """Index of the `;` ending the statement starting at `i`, or None."""
+    depth, quote = 0, None
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if quote is not None:
+            if c == "\\":
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+        elif c in "\"'":
+            quote = c
+        elif c in "([":
+            depth += 1
+        elif c in ")]":
+            depth -= 1
+        elif c == ";" and depth == 0:
+            return i
+        i += 1
+    return None
+
+
+class _Frame(object):
+    __slots__ = ("live", "kind", "ret")
+
+    def __init__(self, kind, ret):
+        self.live = []        # (ctype, vname), in declaration order
+        self.kind = kind      # "file" | "func" | "loop" | "switch" | "block"
+        self.ret = ret        # enclosing function's return type
+
+
 def _rewrite_scopes(text, type_info):
-    """Emit ctor calls at local decls and dtor calls at each closing `}`.
+    """Emit ctor calls at local decls and dtor calls on every exit from scope.
 
     `type_info` maps mangled class name -> {"ctor": bool, "dtor": bool}.
     Only by-value locals inside a block are rewritten; file-scope decls,
-    pointers, and `struct`/`typedef` forms are left alone. Early `return`
-    does not insert drops -- that is a known bound on this pass.
+    pointers, and `struct`/`typedef` forms are left alone.
+
+    Falling off the end of a block drops at the `}`. `return` unwinds every
+    live object out to the function, `break` out to the enclosing loop or
+    switch, and `continue` out to the enclosing loop. A `return` with a value
+    spills it to a temporary first, because C++ evaluates the operand before
+    running destructors and the operand routinely reads the object about to
+    be destroyed (`return g.get();`).
+
+    `goto` is rejected when anything is live: where it lands decides what
+    should have been destroyed, and that is not knowable from this pass.
     """
     if not type_info:
         return text
@@ -286,14 +958,44 @@ def _rewrite_scopes(text, type_info):
     decl_re = re.compile(
         r"(?<![\w.])(%s)\s+(\w+)\s*(?:\(([^;]*)\))?\s*;" % type_alt)
 
+    agg_re = re.compile(r"\b(struct|union|enum)\b[^;{}]*$")
+    # Every lookback and keyword match below runs against a comment-blanked
+    # copy. `_strip_comments` preserves length, so indices still line up with
+    # `text`, which is what gets emitted. Without this, prose containing the
+    # word "struct" reads as a struct body and quietly suppresses every
+    # constructor after it.
+    look = _strip_comments(text)
+    ret_re = re.compile(r"(?<![\w.])return\b")
+    brk_re = re.compile(r"(?<![\w.])(break|continue)\s*;")
+    goto_re = re.compile(r"(?<![\w.])goto\s+(\w+)")
+
+    def unwind(upto):
+        """Drop calls for frames `upto..top`, innermost and latest first."""
+        pieces = []
+        for fr in reversed(scopes[upto:]):
+            for ctype, vname in reversed(fr.live):
+                pieces.append("%s_drop(&%s); " % (ctype, vname))
+        return "".join(pieces)
+
+    def frame_index(kinds):
+        for k in range(len(scopes) - 1, -1, -1):
+            if scopes[k].kind in kinds:
+                return k
+        return None
+
     out = []
-    scopes = [[]]          # stack of live (ctype, vname) lists
+    scopes = [_Frame("file", None)]
+    aggs = 0               # depth of enclosing struct/union/enum bodies
+    tmp = [0]              # counter for return-value temporaries
     i, n = 0, len(text)
     in_str = None
     while i < n:
-        c = text[i]
+        # Decide from the blanked copy, emit from the original. An apostrophe
+        # in prose ("the class's table") would otherwise open a string
+        # literal and swallow every brace up to the next one.
+        c = look[i]
         if in_str is not None:
-            out.append(c)
+            out.append(text[i])
             if c == "\\" and i + 1 < n:
                 out.append(text[i + 1])
                 i += 2
@@ -304,28 +1006,91 @@ def _rewrite_scopes(text, type_info):
             continue
         if c in "\"'":
             in_str = c
-            out.append(c)
+            out.append(text[i])
             i += 1
             continue
         if c == "{":
-            scopes.append([])
-            out.append(c)
+            # A struct/union/enum body is not a scope: its members are field
+            # declarations, not locals, so no ctor runs and nothing drops.
+            if aggs or agg_re.search(look[:i]):
+                aggs += 1
+                scopes.append(_Frame("block", None))
+            else:
+                kind, ret = _brace_kind(look, i, len(scopes) == 1)
+                if kind != "func":
+                    ret = scopes[-1].ret
+                scopes.append(_Frame(kind, ret))
+            out.append(text[i])
             i += 1
             continue
         if c == "}":
-            live = scopes.pop() if len(scopes) > 1 else []
-            for ctype, vname in reversed(live):
+            if aggs:
+                aggs -= 1
+            fr = scopes.pop() if len(scopes) > 1 else _Frame("block", None)
+            for ctype, vname in reversed(fr.live):
                 out.append("%s_drop(&%s); " % (ctype, vname))
             if not scopes:
-                scopes = [[]]
-            out.append(c)
+                scopes = [_Frame("file", None)]
+            out.append(text[i])
             i += 1
             continue
 
-        m = decl_re.match(text, i)
-        if m and _prev_word(text, i) not in ("struct", "typedef", "union"):
+        if not aggs:
+            m = ret_re.match(look, i)
+            if m is not None:
+                fidx = frame_index(("func",))
+                end = _stmt_end(look, m.end())
+                drops = unwind(fidx) if fidx is not None else ""
+                if drops and end is not None:
+                    expr = text[m.end():end].strip()
+                    rtype = scopes[fidx].ret
+                    if not expr:
+                        out.append("{ %sreturn; }" % drops)
+                    elif rtype and rtype != "void":
+                        name = "_cpp_ret%d" % tmp[0]
+                        tmp[0] += 1
+                        # Evaluate before destroying: the operand may read
+                        # the very object that is about to be dropped.
+                        out.append("{ %s %s = (%s); %sreturn %s; }"
+                                   % (rtype, name, expr, drops, name))
+                    else:
+                        out.append("{ %sreturn %s; }" % (drops, expr))
+                    i = end + 1
+                    continue
+
+            m = brk_re.match(look, i)
+            if m is not None:
+                kinds = (("loop", "switch") if m.group(1) == "break"
+                         else ("loop",))
+                idx = frame_index(kinds)
+                drops = unwind(idx) if idx is not None else ""
+                if drops:
+                    out.append("{ %s%s; }" % (drops, m.group(1)))
+                    i = m.end()
+                    continue
+
+            m = goto_re.match(look, i)
+            if m is not None:
+                fidx = frame_index(("func",))
+                if fidx is not None and unwind(fidx):
+                    # Not a line number: class lowering has already shifted
+                    # them, so the label is the findable thing.
+                    raise CppError(
+                        "`goto %s` cannot be lowered while a destructor is "
+                        "pending -- where it lands decides what should be "
+                        "destroyed. Restructure, or call `_drop` explicitly."
+                        % m.group(1))
+
+        m = decl_re.match(look, i)
+        if m and not aggs and \
+                _prev_word(look, i) not in ("struct", "typedef", "union"):
             ctype, vname, args = m.group(1), m.group(2), m.group(3)
             info = type_info[ctype]
+            if info.get("abstract") and len(scopes) > 1:
+                raise CppError(
+                    "`%s %s`: %s has a pure virtual method and cannot be "
+                    "instantiated. Declare a `%s *` instead."
+                    % (ctype, vname, ctype, ctype))
             # File-scope: leave the spelling alone (no automatic Drop).
             if len(scopes) <= 1 or not info["ctor"]:
                 out.append(m.group(0))
@@ -337,11 +1102,236 @@ def _rewrite_scopes(text, type_info):
             else:
                 out.append("%s_new(&%s, %s);" % (ctype, vname, args.strip()))
             if info["dtor"]:
-                scopes[-1].append((ctype, vname))
+                scopes[-1].live.append((ctype, vname))
             i = m.end()
             continue
 
-        out.append(c)
+        out.append(text[i])
+        i += 1
+    return "".join(out)
+
+
+def _free_ref_funcs(text, names):
+    """`{function name: set of by-reference parameter positions}`.
+
+    Collected before references are lowered, because afterwards a `T *` that
+    was written `T &` is indistinguishable from one the author spelled.
+    """
+    out = {}
+    for m in re.finditer(r"(?<![\w.])(\w+)\s*\(", text):
+        fname = m.group(1)
+        if fname in _KEYWORDS:
+            continue
+        close = _match_paren(text, m.end() - 1)
+        if close is None:
+            continue
+        tail = text[close + 1:close + 40].lstrip()
+        if not (tail.startswith("{") or tail.startswith(";")):
+            continue          # a call, not a declaration
+        refs = _ref_positions(text[m.end():close], names)
+        if refs:
+            out[fname] = refs
+    return out
+
+
+def _params_at(text, brace_idx):
+    """The parameter list of the function header ending just before `{`."""
+    j = brace_idx - 1
+    while j >= 0 and text[j] in " \t\r\n":
+        j -= 1
+    if j < 0 or text[j] != ")":
+        return None
+    depth = 0
+    while j >= 0:
+        if text[j] == ")":
+            depth += 1
+        elif text[j] == "(":
+            depth -= 1
+            if depth == 0:
+                return text[j + 1:_find_close(text, j)]
+        j -= 1
+    return None
+
+
+def _find_close(text, open_idx):
+    close = _match_paren(text, open_idx)
+    return close if close is not None else len(text)
+
+
+def _addr(expr, is_ptr):
+    return expr if is_ptr else "&" + expr
+
+
+def _rewrite_calls(text, cinfo, free_refs):
+    """`g.get()` -> `VecGuard_get(&g)`, `p->get()` -> `VecGuard_get(p)`.
+
+    Receivers are resolved against a scope-tracked symbol table: locals,
+    function parameters (including the generated `T *this`), and chains
+    through class-typed fields. Anything that does not resolve to a class in
+    `cinfo` is left exactly as written, so plain C is untouched.
+
+    Also inserts `&` on arguments passed to a by-reference parameter.
+    """
+    if not cinfo:
+        return text
+    names = set(cinfo)
+    alt = _type_alt(names)
+    decl_re = re.compile(
+        r"(?<![\w.])(%s)\s+(\*\s*)?(\w+)\s*(?=[;=,\[])" % alt)
+    call_re = re.compile(r"(?<![\w.>])(\w+)((?:\s*(?:\.|->)\s*\w+)+)\s*\(")
+    plain_re = re.compile(r"(?<![\w.>])(\w+)\s*\(")
+    # As in `_rewrite_scopes`: match against comment-blanked text so a `.`
+    # or a parenthesis inside prose cannot be read as code. Same length, so
+    # the indices address `text`, which is what is emitted.
+    look = _strip_comments(text)
+
+    def lookup(scopes, name):
+        for s in reversed(scopes):
+            if name in s:
+                return s[name]
+        return None
+
+    def resolve(scopes, base, fields_path):
+        """Resolve a receiver chain to `(expr_text, class, is_ptr)`."""
+        sym = lookup(scopes, base)
+        if sym is None:
+            return None
+        cls, is_ptr = sym
+        expr = base
+        for fld in fields_path:
+            if cls not in cinfo:
+                return None
+            fields = cinfo[cls]["fields"]
+            if fld not in fields:
+                return None
+            expr = "%s%s%s" % (expr, "->" if is_ptr else ".", fld)
+            cls, is_ptr = fields[fld]
+        return (expr, cls, is_ptr)
+
+    def fix_args(raw, refs, scopes):
+        """Insert `&` where a by-reference parameter wants an address."""
+        if not refs:
+            return raw.strip()
+        parts = _split_top(raw)
+        for idx in sorted(refs):
+            if idx >= len(parts):
+                continue
+            a = parts[idx].strip()
+            if not a or a.startswith("&") or a.startswith("*"):
+                continue
+            # `void take(Inner *r, int k);` is a declaration, not a call: its
+            # "arguments" parse as parameters. Leave the prototype alone.
+            if _parse_param(a, names) is not None:
+                continue
+            sym = lookup(scopes, a) if re.match(r"^\w+$", a) else None
+            if sym is not None and sym[1]:
+                continue          # already a pointer
+            parts[idx] = " &" + a if not re.match(r"^\w+$", a) else " &" + a
+        return ",".join(parts).strip()
+
+    out = []
+    scopes = [{}]
+    pdepth = 0
+    i, n = 0, len(text)
+    quote = None
+    while i < n:
+        # As above: state machine on the blanked copy, output from `text`.
+        c = look[i]
+        if quote is not None:
+            out.append(text[i])
+            if c == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            i += 1
+            continue
+        if c in "\"'":
+            quote = c
+            out.append(text[i])
+            i += 1
+            continue
+        if c == "{":
+            frame = {}
+            params = _params_at(look, i)
+            for p in _split_top(params or ""):
+                got = _parse_param(p, names)
+                if got is not None:
+                    frame[got[2]] = (got[0], got[1])
+            scopes.append(frame)
+            out.append(text[i])
+            i += 1
+            continue
+        if c == "}":
+            if len(scopes) > 1:
+                scopes.pop()
+            out.append(text[i])
+            i += 1
+            continue
+        if c == "(":
+            pdepth += 1
+        elif c == ")":
+            pdepth = max(0, pdepth - 1)
+
+        if pdepth == 0:
+            m = decl_re.match(look, i)
+            if m and _prev_word(look, i) not in ("struct", "typedef", "union"):
+                scopes[-1][m.group(3)] = (m.group(1), bool(m.group(2)))
+                out.append(m.group(0))
+                i = m.end()
+                continue
+
+        m = call_re.match(look, i)
+        if m:
+            op = m.end() - 1
+            close = _match_paren(look, op)
+            chain = [p for p in re.split(r"\s*(?:\.|->)\s*", m.group(2)) if p]
+            meth = chain[-1]
+            got = (resolve(scopes, m.group(1), chain[:-1])
+                   if close is not None else None)
+            if got is not None and got[1] in cinfo:
+                expr, cls, is_ptr = got
+                methods = cinfo[cls]["methods"]
+                if meth in methods:
+                    ent = methods[meth]
+                    args = fix_args(text[op + 1:close], ent["refs"], scopes)
+                    recv = _addr(expr, is_ptr)
+                    tail = (", " + args) if args else ""
+
+                    def cast(want, e):
+                        # Parenthesised: `->` binds tighter than a cast, so
+                        # `(Shape *)&sq->_vptr` would read the wrong thing.
+                        return e if want == cls else "((%s *)%s)" % (want, e)
+
+                    if ent["virtual"]:
+                        # Dispatch through the table. The vptr lives at
+                        # offset zero in the root, so the cast is free.
+                        out.append(
+                            "((const struct %s_vtable *)%s->_vptr)->%s(%s%s)"
+                            % (ent["decl"], cast(cinfo[cls]["root"], recv),
+                               meth, cast(ent["decl"], recv), tail))
+                    else:
+                        # An inherited method takes the base as `this`; the
+                        # base is the first member, so a cast reaches it.
+                        out.append("%s_%s(%s%s)"
+                                   % (ent["owner"], meth,
+                                      cast(ent["owner"], recv), tail))
+                    i = close + 1
+                    continue
+
+        m = plain_re.match(look, i)
+        if m and m.group(1) in free_refs:
+            op = m.end() - 1
+            close = _match_paren(look, op)
+            if close is not None:
+                args = fix_args(text[op + 1:close], free_refs[m.group(1)],
+                                scopes)
+                out.append("%s(%s)" % (m.group(1), args))
+                i = close + 1
+                continue
+
+        out.append(text[i])
         i += 1
     return "".join(out)
 
@@ -364,8 +1354,34 @@ def translate(text, path="<cpp>"):
                              scan):
             wanted.setdefault(cls.name, set()).add(m.group(1).strip())
 
+    # Every name a class-typed declaration could spell, mangled and not, so
+    # reference parameters can be recognised before anything is emitted.
+    names = set()
+    for _s, _e, cls in classes:
+        names.add(cls.name)
+        for targ in wanted.get(cls.name, ()):
+            names.add("%s_%s" % (cls.name, _mangle(targ)))
+    _check_ref_returns(scan, names, path)
+
+    # A field spelled `Holder<int>` has to be recognised as `Holder_int`
+    # while the containing class is emitted, not after.
+    tpairs = []
+    for _s, _e, cls in classes:
+        if not cls.tparam:
+            continue
+        for targ in sorted(wanted.get(cls.name, ())):
+            tpairs.append((re.compile(r"\b%s\s*<\s*%s\s*>"
+                                      % (re.escape(cls.name),
+                                         re.escape(targ))),
+                           "%s_%s" % (cls.name, _mangle(targ))))
+
+    def tsub(s):
+        for pat, mono in tpairs:
+            s = pat.sub(mono, s)
+        return s
+
     pieces = []
-    type_info = {}
+    cinfo = {}
     prev = 0
     for start, end, cls in classes:
         # Keep everything before the class, minus any `template<..>` header,
@@ -373,27 +1389,34 @@ def translate(text, path="<cpp>"):
         head = text[prev:start]
         head = _TEMPLATE.sub("", head)
         pieces.append(head)
-        if cls.tparam:
-            for targ in sorted(wanted.get(cls.name, ())):
-                emitted, cname, has_ctor, has_dtor = _emit_class(cls, targ)
-                pieces.append("\n".join(emitted))
-                type_info[cname] = {"ctor": has_ctor, "dtor": has_dtor}
-        else:
-            emitted, cname, has_ctor, has_dtor = _emit_class(cls)
+        targs = sorted(wanted.get(cls.name, ())) if cls.tparam else [None]
+        for targ in targs:
+            emitted, cname, info = _emit_class(cls, names, cinfo, tsub, targ)
             pieces.append("\n".join(emitted))
-            type_info[cname] = {"ctor": has_ctor, "dtor": has_dtor}
+            cinfo[cname] = info
         prev = end
     pieces.append(text[prev:])
     out = "".join(pieces)
 
     # Rewrite uses: `Ring<int> r;` -> `Ring_int r;`, `r.push(1)` is left to the
     # caller (see the README) since C has no method syntax.
-    for _s, _e, cls in classes:
-        if not cls.tparam:
-            continue
-        for targ in sorted(wanted.get(cls.name, ())):
-            out = re.sub(r"\b%s\s*<\s*%s\s*>" % (re.escape(cls.name),
-                                                 re.escape(targ)),
-                         "%s_%s" % (cls.name, _mangle(targ)), out)
+    # Rewrite uses: `Ring<int> r;` -> `Ring_int r;`. Field types were already
+    # normalised through `tsub` while their class was emitted.
+    for pat, mono in tpairs:
+        out = pat.sub(mono, out)
 
-    return _rewrite_scopes(out, type_info)
+    # Which free functions take a reference? Collected before lowering, while
+    # a `&` is still on the page.
+    free_refs = _free_ref_funcs(_strip_comments(out), names)
+    out = _lower_refs(out, names)
+    out = _rewrite_scopes(out, cinfo)
+
+    # Rewriting a call copies its arguments through verbatim, so a receiver
+    # nested in an argument list surfaces on the next pass. Iterate to a
+    # fixed point rather than recursing into every argument.
+    for _ in range(8):
+        nxt = _rewrite_calls(out, cinfo, free_refs)
+        if nxt == out:
+            break
+        out = nxt
+    return out

@@ -41,6 +41,16 @@ EXAMPLES = [
      "len      = 5\n"
      "released = 1\n", True),
 
+    # C++ single inheritance and virtual dispatch, with Rust reducing the
+    # results — base-as-first-member, so upcasting is a pointer cast.
+    ("dispatch.c", 42,
+     "area         = 9 24\n"
+     "via base     = 9 24\n"
+     "describe     = 10 25\n"
+     "scaled(10)   = 90 240\n"
+     "inherited    = 1\n"
+     "total        = 34\n", True),
+
     ("shapes.c", 0,
      "centroid  = (2, 3)\n"
      "len2      = 13\n"
