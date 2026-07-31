@@ -1098,6 +1098,30 @@ def _try_read(path):
     return data
 
 
+def _bundled_include_dir():
+    """Directory holding ShivyC's fallback headers.
+
+    `_dirname(__file__)` is right on the host and empty in a self-hosted
+    build, where py2c compiles `__file__` down to the bare string
+    "preproc.py". The bundled headers then resolved against the working
+    directory: `<stdbool.h>` was found when the compiler happened to run from
+    the repo root and not otherwise, so an rpython include -- whose generated
+    runtime needs it -- failed depending on where you stood. Try the module's
+    own directory first, then the same two fallbacks the other self-hosted
+    path lookups use.
+    """
+    env = os.environ.get("CRUST_INCLUDE")
+    if env:
+        return env
+    here = _dirname(os.path.abspath(__file__))
+    for cand in (_pjoin(here, "include"),
+                 _pjoin(_pjoin(os.getcwd(), "shivyc"), "include"),
+                 _pjoin(os.getcwd(), "include")):
+        if os.path.isdir(cand):
+            return cand
+    return _pjoin(here, "include")
+
+
 def read_file(include_file, this_file):
     """Read the text of the given include file.
 
@@ -1107,7 +1131,7 @@ def read_file(include_file, this_file):
     locating quoted headers.
     """
     name = include_file[1:-1]
-    bundled = _pjoin(_pjoin(_dirname(__file__), "include"), name)
+    bundled = _pjoin(_bundled_include_dir(), name)
     candidates = []
     if include_file[0] == '"':
         # Quoted: the including file's directory, then -I dirs, then ShivyC's

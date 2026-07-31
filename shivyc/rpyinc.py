@@ -115,17 +115,72 @@ def _flag_stamp(args):
     return hashlib.sha256("\0".join(items).encode("utf-8")).hexdigest()[:12]
 
 
-def _py2c():
-    """Import tools/py2c.py, which is not a package module."""
-    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    tools_dir = os.path.join(repo_root, "tools")
-    if tools_dir not in sys.path:
-        sys.path.insert(0, tools_dir)
-    try:
-        import py2c
-    except Exception as e:                             # pragma: no cover
-        raise RpyIncludeError("cannot import py2c: %s" % e)
-    return py2c
+def _py2c_script():
+    """Path to tools/py2c.py, or "" if it cannot be found.
+
+    Two layouts have to work, as in `preproc._cpprust_script`. On the host
+    `__file__` is `.../shivyc/rpyinc.py`, so the repo root is two levels up.
+    Self-hosted, py2c compiles `__file__` to the bare string "rpyinc.py", and
+    only one level should be stripped. Try both, plus the working directory,
+    with `$CRUST_PY2C` as an override.
+    """
+    env = os.environ.get("CRUST_PY2C")
+    if env:
+        return env if os.path.exists(env) else ""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for root in (os.path.dirname(here), here, os.getcwd()):
+        cand = os.path.join(root, "tools", "py2c.py")
+        if os.path.exists(cand):
+            return cand
+    return ""
+
+
+def _run_py2c(path, out_dir):
+    """Transpile `path` into `out_dir` out-of-process; return the .c path.
+
+    Importing py2c would compile into a cross-module symbol reference, and
+    py2c is not in the self-hosted source set -- it leans on regex features
+    it cannot lower for itself -- so the reference would be undefined at link
+    time. That is exactly what kept `#include "foo.py"` from working in a
+    self-hosted build. `preproc.py` shells out to `cpprust.py` for the same
+    reason; this is the same arrangement.
+    """
+    script = _py2c_script()
+    if not script:
+        raise RpyIncludeError(
+            "cannot find tools/py2c.py; set $CRUST_PY2C to its path")
+    cmd = [sys.executable, script, "--rpyinc", path, "--out", out_dir]
+    listing = os.path.join(out_dir, "_rpyinc_out.txt")
+    if sys.implementation.name != "shivyc":
+        import subprocess
+        try:
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE)
+        except OSError as e:
+            raise RpyIncludeError("cannot run %s: %s" % (script, e))
+        if proc.returncode != 0:
+            raise RpyIncludeError(
+                "py2c could not translate '%s': %s"
+                % (path, proc.stderr.decode("utf-8", "replace").strip()
+                   or "no output"))
+        produced = proc.stdout.decode("utf-8", "replace").strip()
+    else:
+        # Self-hosted: no subprocess module, so the child's stdout goes to a
+        # file and is read back. Same protocol, one more hop.
+        rc = os.system("python3 " + script + " --rpyinc " + path +
+                       " --out " + out_dir + " > " + listing + " 2>/dev/null")
+        if rc != 0:
+            raise RpyIncludeError(
+                "py2c could not translate '%s'" % path)
+        try:
+            with open(listing) as f:
+                produced = f.read().strip()
+        except IOError:
+            produced = ""
+    if not produced or not os.path.exists(produced):
+        raise RpyIncludeError(
+            "py2c produced no output for '%s'" % path)
+    return produced
 
 
 def _py2c_stamp():
@@ -295,25 +350,19 @@ def translate(path, text=None):
             _runtime_sources.append(rt_c)
         return code, out_c
 
-    py2c = _py2c()
-    os.makedirs(out_dir, exist_ok=True)
     try:
-        produced, err = py2c.transpile_file(path, out_dir)
-    except Exception as e:
-        raise RpyIncludeError("py2c failed on '%s': %s" % (path, e))
-    if err or not produced:
-        raise RpyIncludeError(
-            "py2c could not translate '%s': %s" % (path, err or "no output"))
+        os.makedirs(out_dir)
+    except OSError:
+        pass
+    produced = _run_py2c(path, out_dir)
 
     with open(produced, encoding="utf-8") as f:
         code = f.read()
     code, needs_rt = _postprocess(code)
-
-    if needs_rt:
-        # The generated C keeps `#include "shivyc_rt.h"`; put the header (and
-        # the matching .c) beside it so the nested include resolves and the
-        # runtime can be linked.
-        py2c.write_runtime(out_dir)
+    # The generated C keeps `#include "shivyc_rt.h"`; the subprocess writes
+    # the header and its .c beside the output, so the nested include resolves
+    # and the runtime can be linked. No separate `write_runtime` call is
+    # needed -- and none is possible, since py2c is not imported here.
 
     if produced != out_c and os.path.exists(produced):
         os.replace(produced, out_c)

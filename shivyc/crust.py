@@ -5816,11 +5816,35 @@ def _is_generic_span(code, start, end, kind):
 _CORE_CACHE = {}
 
 
+def _core_rs_path():
+    """Locate `crust_core/core.rs`.
+
+    Two layouts have to work. On the host `__file__` is `.../shivyc/crust.py`,
+    so the core sits beside it. Self-hosted, py2c compiles `__file__` down to
+    the bare string "crust.py": `dirname` is then empty and the path resolves
+    against the working directory, which is where this quietly went wrong --
+    the open failed, the `except OSError` swallowed it, and every generic type
+    was simply undefined, with `Vec<T>` reported as having no definition.
+
+    `$CRUST_CORE` overrides, for an install where the compiler does not sit
+    next to its sources.
+    """
+    env = os.environ.get("CRUST_CORE")
+    if env:
+        return env
+    here = os.path.dirname(os.path.abspath(__file__))
+    for root in (here, os.path.join(os.getcwd(), "shivyc"), os.getcwd()):
+        cand = os.path.join(root, "crust_core", "core.rs")
+        if os.path.exists(cand):
+            return cand
+    return os.path.join(here, "crust_core", "core.rs")
+
+
 def _load_core_unit():
     """Parse crust_core/core.rs once into a Unit (generics + concrete items)."""
     if "full" in _CORE_CACHE:
         return _CORE_CACHE["full"]
-    path = os.path.join(os.path.dirname(__file__), "crust_core", "core.rs")
+    path = _core_rs_path()
     unit = Unit()
     try:
         with open(path, encoding="utf-8") as f:
@@ -6561,10 +6585,14 @@ def translate(code, path=None):
     mod_seeded = collect_mod_items(mod_names, path, unit, struct_order)
 
     def fail(exc, start):
-        return CrustError("%sline %d: %s" % (where, _line_of(code, start),
-                                             exc)
-                          if "line " not in str(exc)
-                          else "%s%s" % (where, exc))
+        # `exc.message`, not `str(exc)` / `%s`: py2c gives user classes no
+        # `__str__`, so formatting the exception itself renders as
+        # `<obj 0x...>` and the diagnostic is lost in a self-hosted build.
+        # Every caller passes a CrustError, so the attribute is always there.
+        msg = exc.message
+        return CrustError("%sline %d: %s" % (where, _line_of(code, start), msg)
+                          if "line " not in msg
+                          else "%s%s" % (where, msg))
 
     # Pass 1: collect structs, function signatures and methods, so that
     # definition order does not matter anywhere in the unit.
