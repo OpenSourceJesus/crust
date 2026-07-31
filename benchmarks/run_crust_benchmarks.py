@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
 """Run the Crust (C+Rust) language benchmarks against gcc.
 
-Each benchmark in `examples/crust/bench` is written in the Rust subset and
-exercises one part of the lowering -- static trait dispatch, monomorphised
-generics, tagged-union enums, array and slice traffic. That separation is the
-point: a regression in, say, tag dispatch shows up as one number rather than
-being averaged into a single score.
+Each benchmark in `examples/crust/bench` exercises one part of the lowering --
+static trait dispatch, monomorphised generics, tagged-union enums, array and
+slice traffic on the Rust side; method calls, virtual dispatch and scope-exit
+destruction on the C++ side. That separation is the point: a regression in,
+say, tag dispatch shows up as one number rather than being averaged into a
+single score.
 
-The comparison is done on the *same C*. Crust translates the `.rs` to C, and
-that C is then compiled by ShivyCX and by gcc at three optimisation levels, so
-the difference measured is code generation and nothing else -- not the Rust
-front end, which both sides share.
+Both front ends are covered. A `.rs` benchmark is lowered by `shivyc.crust`
+and a `.cpp` one by `tools.cpprust`; from there they are the same thing, since
+both front ends emit plain C over struct pointers. `cpp_methods` and
+`cpp_dispatch` are a matched pair -- identical arithmetic and iteration count,
+one reached directly and one through a vtable -- so the gap between them is
+what dynamic dispatch costs.
+
+The comparison is done on the *same C*. The front end translates the source to
+C, and that C is then compiled by ShivyCX and by gcc at three optimisation
+levels, so the difference measured is code generation and nothing else -- not
+the front end, which both sides share.
 
 Writes `benchmarks/results/crust_results.json`; `plot_crust.py` renders it.
 """
@@ -46,23 +54,46 @@ DESCRIPTIONS = {
     "bench_rmm": "Redox's own shapes: `PageFlags<A>` generic over an "
                  "architecture trait with associated consts, a bitmap frame "
                  "allocator, a page-table walk.",
+    "cpp_methods": "C++ non-virtual method calls and member access. Measures "
+                   "whether a method really costs a direct call -- the "
+                   "baseline half of the pair with cpp_dispatch.",
+    "cpp_dispatch": "C++ virtual dispatch through a base pointer, over two "
+                    "derived types so the target cannot be devirtualised. "
+                    "Measures the vtable indirection plus the thunk that "
+                    "keeps the generated table free of function-pointer "
+                    "casts.",
+    "cpp_raii": "C++ construction and destruction at scope exit, including "
+                "the `continue`, `break` and early-`return` paths. Measures "
+                "whether automatic Drop costs what hand-written calls would.",
 }
+
+# Which front end lowers which source.
+FRONT_ENDS = {".rs": "crust", ".cpp": "cpprust"}
 
 
 def discover():
+    """Benchmark sources, as (name, extension) pairs."""
     if not os.path.isdir(BENCH_DIR):
         return []
-    return sorted(f for f in os.listdir(BENCH_DIR) if f.endswith(".rs"))
+    found = []
+    for f in sorted(os.listdir(BENCH_DIR)):
+        stem, ext = os.path.splitext(f)
+        if ext in FRONT_ENDS:
+            found.append((stem, ext))
+    return found
 
 
-def translate(src, out_c):
-    """Lower a Crust source to C, so both compilers see the same input."""
+def translate(src, ext, out_c):
+    """Lower a benchmark source to C, so both compilers see the same input."""
     sys.path.insert(0, ROOT)
-    import shivyc.crust as crust
     with open(src) as f:
         text = f.read()
+    if FRONT_ENDS[ext] == "cpprust":
+        import tools.cpprust as front
+    else:
+        import shivyc.crust as front
     with open(out_c, "w") as f:
-        f.write(crust.translate(text, path=src))
+        f.write(front.translate(text, path=src))
     return out_c
 
 
@@ -89,12 +120,13 @@ def build_gcc(cpath, out, level):
     return out if p.returncode == 0 and os.path.exists(out) else None
 
 
-def run_one(name):
-    src = os.path.join(BENCH_DIR, name + ".rs")
+def run_one(name, ext):
+    src = os.path.join(BENCH_DIR, name + ext)
     cpath = os.path.join(WORK, name + ".c")
-    translate(src, cpath)
+    translate(src, ext, cpath)
 
     rec = {"benchmark": name,
+           "language": "C++" if ext == ".cpp" else "Rust",
            "description": DESCRIPTIONS.get(name, ""),
            "configs": []}
     targets = [("ShivyCX", lambda o: build_shivyc(cpath, o))]
@@ -120,16 +152,17 @@ def run_one(name):
 def main():
     os.makedirs(WORK, exist_ok=True)
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    names = [f[:-3] for f in discover()]
+    names = discover()
     if not names:
         print("no benchmarks found in %s" % BENCH_DIR)
         return 1
 
     results = []
-    for name in names:
-        print("Running crust benchmark: %s" % name)
+    for name, ext in names:
+        print("Running crust benchmark: %s (%s)"
+              % (name, "C++" if ext == ".cpp" else "Rust"))
         try:
-            rec = run_one(name)
+            rec = run_one(name, ext)
         except Exception as e:
             # One benchmark failing costs that benchmark, not the suite.
             print("  SKIP %s: %s: %s" % (name, type(e).__name__, e))

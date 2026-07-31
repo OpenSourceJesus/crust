@@ -5,6 +5,12 @@ Two panels per figure rather than one combined score: the benchmarks measure
 different parts of the lowering and a single number would hide which part
 moved.
 
+Runtime is drawn on a log axis. The benchmarks do not share a workload -- the
+C++ ones run tens of millions of iterations, the Rust ones far fewer -- so bar
+heights are only meaningful *within* a benchmark, comparing compilers. On a
+linear axis the fastest benchmarks would be invisible next to the slowest,
+which would suggest a comparison that is not there to make.
+
 Usage: plot_crust.py [out_dir]
 """
 
@@ -37,18 +43,40 @@ def _series(benches, key):
     return labels, out
 
 
-def _grouped(ax, labels, series, ylabel, title):
+def _grouped(ax, labels, series, ylabel, title, log=False):
     n = len(labels)
     width = 0.8 / len(ORDER)
     xs = range(n)
+    if log:
+        ax.set_yscale("log")
     for i, cfg in enumerate(ORDER):
         off = [x + i * width - 0.4 + width / 2 for x in xs]
-        ax.bar(off, series[cfg], width, label=cfg, color=COLORS[cfg])
+        # A zero is a build that failed; on a log axis it simply has no bar.
+        vals = [v if v > 0 else float("nan") for v in series[cfg]] if log \
+            else series[cfg]
+        ax.bar(off, vals, width, label=cfg, color=COLORS[cfg])
     ax.set_xticks(list(xs))
     ax.set_xticklabels(labels, rotation=15, ha="right", fontsize=9)
     ax.set_ylabel(ylabel)
     ax.set_title(title, fontsize=11)
     ax.grid(axis="y", alpha=0.3)
+
+
+def _tex(s):
+    """Escape LaTeX specials in prose taken from the harness.
+
+    Descriptions are plain text written next to the benchmarks, so they are
+    free to mention things like `cpp_dispatch`. An unescaped underscore puts
+    LaTeX into math mode and takes the whole document down with it, which is
+    a poor trade for a filename.
+    """
+    for a, b in (("\\", r"\textbackslash{}"), ("&", r"\&"), ("%", r"\%"),
+                 ("$", r"\$"), ("#", r"\#"), ("_", r"\_"), ("{", r"\{"),
+                 ("}", r"\}"), ("~", r"\textasciitilde{}"),
+                 ("^", r"\textasciicircum{}"), ("<", r"\textless{}"),
+                 (">", r"\textgreater{}")):
+        s = s.replace(a, b)
+    return s
 
 
 def main():
@@ -65,14 +93,16 @@ def main():
 
     fig, (a1, a2) = plt.subplots(2, 1, figsize=(9, 8))
     labels, times = _series(benches, "time_s")
-    _grouped(a1, labels, times, "seconds (best of 3)",
-             "Crust benchmarks: runtime, same generated C")
+    _grouped(a1, labels, times, "seconds (best of 3, log)",
+             "Runtime by compiler, same generated C "
+             "(compare within a benchmark, not across)", log=True)
     labels, sizes = _series(benches, "size_bytes")
     sizes = {k: [v / 1024.0 for v in vs] for k, vs in sizes.items()}
     _grouped(a2, labels, sizes, "binary size (KiB)",
              "Binary size")
     a1.legend(ncol=4, fontsize=9, loc="upper right")
-    fig.suptitle("Crust (C+Rust) versus gcc on identical C input", fontsize=12)
+    fig.suptitle("Crust (C, Rust and C++) versus gcc on identical C input",
+                 fontsize=12)
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     for ext in ("png", "pdf"):
         fig.savefig(os.path.join(out_dir, "crust_bench." + ext), dpi=130)
@@ -82,9 +112,11 @@ def main():
     # every bar means rather than showing an unlabelled comparison.
     tex = ["\\begin{description}"]
     for b in benches:
-        desc = b.get("description") or "(no description)"
-        tex.append("\\item[\\texttt{%s}] %s"
-                   % (b["benchmark"].replace("_", "\\_"), desc))
+        desc = _tex(b.get("description") or "(no description)")
+        lang = b.get("language")
+        if lang:
+            desc = "(%s) %s" % (_tex(lang), desc)
+        tex.append("\\item[\\texttt{%s}] %s" % (_tex(b["benchmark"]), desc))
     tex.append("\\end{description}")
     body = os.path.join(out_dir, "crust_bench_body.tex")
     with open(body, "w") as f:
