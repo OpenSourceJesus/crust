@@ -1411,6 +1411,9 @@ Python, in keeping with the rest of the front end.
 - `examples/crust/owned.cpp` and `examples/crust/raii.c` — C++ destructors
   supplying the `Drop` Crust lacks: a `VecGuard` frees a Rust `Vec<i32>` at
   block exit (`#include "owned.cpp"` → `tools/cpprust.py`).
+- `examples/crust/dispatch.cpp` and `examples/crust/dispatch.c` — C++ single
+  inheritance and virtual dispatch: a `Shape *` calls into a `Cube` override
+  through a vtable, with Rust reducing the results in the same unit.
 - `examples/crust/tally.py` and `examples/crust/tally.c` — an rpython module
   that uses lists and strings, so the py2c runtime is linked in automatically.
 
@@ -1420,12 +1423,42 @@ The preprocessor lowers a small C++ subset in place the same way it lowers
 `.rs` and `.py`. Classes become C structs; methods become
 `Class_method(Class *this, …)` — the same shape as a Rust `impl` — so a
 destructor can call `Vec_int_free_buf` with no shim. Locals in the `.cpp`
-get `Type_new` at the declaration and `Type_drop` at the closing `}`; early
-`return` does not insert drops (nest an inner block when Drop must run first).
+get `Type_new` at the declaration and `Type_drop` on every exit from the
+scope: the closing `}`, and also `return`, `break` and `continue`. A `return`
+with a value spills it to a temporary before the destructors run, since C++
+evaluates the operand first and `return g.get();` reads the object about to be
+destroyed. `goto` is rejected while a destructor is pending, because where it
+lands decides what should have been destroyed.
 The guard holds a `Vec_int *` rather than a by-value field: the include is
 expanded before Crust emits the Rust type, so the type is incomplete in the
-class body. Inheritance, `virtual`, exceptions, `new`/`delete`, and the STL
-are rejected rather than mistranslated.
+class body. Single inheritance and `virtual` methods are supported: a base is
+laid out as the first member, so upcasting is a pointer cast, and the vtable
+pointer sits first in the hierarchy root, hence at offset zero throughout. A
+derived class's table begins with its base's slots, which is what lets a
+`Base *` dispatch into a derived override; overrides go through a small thunk
+that converts `this`, so the table holds no function-pointer casts. A class
+with a pure virtual (`= 0`) method is abstract, and declaring one by value is
+an error rather than an object whose vptr is never set. Multiple inheritance,
+virtual inheritance, exceptions, `new`/`delete`, and the STL are rejected
+rather than mistranslated.
+
+Method calls are written as C++: `g.get()` and `p->get()` lower to
+`VecGuard_get(&g)` and `VecGuard_get(p)`. Receivers resolve against a
+scope-tracked symbol table — locals, parameters, and chains through
+class-typed fields (`a.b.get()`) — and inside a method a bare `helper(x)`
+picks up the implicit `this`. A receiver that does not resolve to a class is
+left alone, so C in the same file is unaffected. Reference parameters and
+locals lower to pointers (`T &x` → `T *x`), with the address taken at call
+sites; a reference *return* is rejected, because lowering it to `T*` would
+quietly change what assignment through the result means.
+
+A class-typed member is constructed and destroyed with its container, in
+declaration order and reverse order respectively; if a member needs either and
+the container declares neither, the container gets an implicit one, as in C++.
+An initializer list (`Box(int t) : a(t), tag(t) { }`) supplies a member
+constructor's arguments or assigns a scalar. A member whose class has no
+default constructor must appear there, rather than being left unconstructed.
+Only one receiver is resolved, so `a.get().foo()` is not rewritten.
 
 ## Tests
 
@@ -1433,7 +1466,9 @@ are rejected rather than mistranslated.
 returns, line-number preservation, struct and method lowering, false-match
 rejection) and end-to-end compilation and execution across the C/Rust
 boundary in both directions. `tests/test_cpprust.py` covers the C++ subset
-lowering (classes, templates, scope-exit Drop, unsupported-keyword rejection).
+lowering: classes, templates, method call syntax, references, member
+construction, scope-exit and early-exit Drop, inheritance and vtables, and
+the cases that must be rejected rather than guessed at.
 
 ```sh
 python3 -m pytest tests/test_crust.py tests/test_cpprust.py -q
