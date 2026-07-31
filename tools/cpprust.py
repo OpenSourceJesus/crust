@@ -14,13 +14,18 @@ the Rust side keeps its explicit API for callers that want it.
 The subset, deliberately small:
 
   * `class` / `struct` with data members and methods
-  * constructors and a destructor, called at declaration and at scope exit
+  * constructors and a destructor: a local `Type name(args);` becomes
+    `Type_new` at the declaration and `Type_drop` at the closing `}` of the
+    enclosing block (inside the `.cpp` only -- the include hook never sees
+    the C TU that pulled the file in)
   * `public:` / `private:` / `protected:` labels (parsed, not enforced --
     access control is a compile-time property and this is a lowering, not a
     type checker; pretending to enforce it would be worse than not claiming to)
   * `template<typename T>` on classes, monomorphised on use
-  * references (`T&`) as pointers
-  * `namespace` as a name prefix
+
+Drops run at `}` only; an early `return` does not insert destructor calls, so
+a non-void helper should nest the guarded locals in an inner block and return
+after that block closes. Call `_drop` explicitly when that shape does not fit.
 
 Not supported, and reported rather than mistranslated: inheritance, virtual
 functions, exceptions, operator overloading, `new`/`delete`, the STL. A `virtual`
@@ -103,8 +108,7 @@ def _check_unsupported(scan, path):
             line = scan.count("\n", 0, m.start()) + 1
             raise CppError(
                 "%s:%d: `%s` is not in the C++ subset. Supported: classes, "
-                "constructors, destructors, single-parameter templates, "
-                "references and namespaces."
+                "constructors, destructors, and single-parameter templates."
                 % (os.path.basename(path), line, kw))
 
 
@@ -248,7 +252,98 @@ def _emit_class(cls, targ=None):
                            "this->" + f.name, inner)
         inner = inner.replace("this->this->", "this->")
         out.append("static %s %s(%s) {%s}" % (ret, mname, arglist, inner))
-    return out, cname
+    has_ctor = any(m.kind == "ctor" for m in cls.members)
+    has_dtor = any(m.kind == "dtor" for m in cls.members)
+    return out, cname, has_ctor, has_dtor
+
+
+def _prev_word(text, idx):
+    """Word immediately before `idx`, skipping whitespace."""
+    j = idx - 1
+    while j >= 0 and text[j] in " \t\r\n":
+        j -= 1
+    if j < 0:
+        return ""
+    end = j + 1
+    while j >= 0 and (text[j].isalnum() or text[j] == "_"):
+        j -= 1
+    return text[j + 1:end]
+
+
+def _rewrite_scopes(text, type_info):
+    """Emit ctor calls at local decls and dtor calls at each closing `}`.
+
+    `type_info` maps mangled class name -> {"ctor": bool, "dtor": bool}.
+    Only by-value locals inside a block are rewritten; file-scope decls,
+    pointers, and `struct`/`typedef` forms are left alone. Early `return`
+    does not insert drops -- that is a known bound on this pass.
+    """
+    if not type_info:
+        return text
+    names = sorted(type_info, key=len, reverse=True)
+    type_alt = "|".join(re.escape(n) for n in names)
+    # `Type name;` or `Type name(args);` -- not `Type *p` (star between).
+    decl_re = re.compile(
+        r"(?<![\w.])(%s)\s+(\w+)\s*(?:\(([^;]*)\))?\s*;" % type_alt)
+
+    out = []
+    scopes = [[]]          # stack of live (ctype, vname) lists
+    i, n = 0, len(text)
+    in_str = None
+    while i < n:
+        c = text[i]
+        if in_str is not None:
+            out.append(c)
+            if c == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if c == in_str:
+                in_str = None
+            i += 1
+            continue
+        if c in "\"'":
+            in_str = c
+            out.append(c)
+            i += 1
+            continue
+        if c == "{":
+            scopes.append([])
+            out.append(c)
+            i += 1
+            continue
+        if c == "}":
+            live = scopes.pop() if len(scopes) > 1 else []
+            for ctype, vname in reversed(live):
+                out.append("%s_drop(&%s); " % (ctype, vname))
+            if not scopes:
+                scopes = [[]]
+            out.append(c)
+            i += 1
+            continue
+
+        m = decl_re.match(text, i)
+        if m and _prev_word(text, i) not in ("struct", "typedef", "union"):
+            ctype, vname, args = m.group(1), m.group(2), m.group(3)
+            info = type_info[ctype]
+            # File-scope: leave the spelling alone (no automatic Drop).
+            if len(scopes) <= 1 or not info["ctor"]:
+                out.append(m.group(0))
+                i = m.end()
+                continue
+            out.append("%s %s; " % (ctype, vname))
+            if args is None or not args.strip():
+                out.append("%s_new(&%s);" % (ctype, vname))
+            else:
+                out.append("%s_new(&%s, %s);" % (ctype, vname, args.strip()))
+            if info["dtor"]:
+                scopes[-1].append((ctype, vname))
+            i = m.end()
+            continue
+
+        out.append(c)
+        i += 1
+    return "".join(out)
 
 
 def translate(text, path="<cpp>"):
@@ -270,6 +365,7 @@ def translate(text, path="<cpp>"):
             wanted.setdefault(cls.name, set()).add(m.group(1).strip())
 
     pieces = []
+    type_info = {}
     prev = 0
     for start, end, cls in classes:
         # Keep everything before the class, minus any `template<..>` header,
@@ -279,11 +375,13 @@ def translate(text, path="<cpp>"):
         pieces.append(head)
         if cls.tparam:
             for targ in sorted(wanted.get(cls.name, ())):
-                emitted, _ = _emit_class(cls, targ)
+                emitted, cname, has_ctor, has_dtor = _emit_class(cls, targ)
                 pieces.append("\n".join(emitted))
+                type_info[cname] = {"ctor": has_ctor, "dtor": has_dtor}
         else:
-            emitted, _ = _emit_class(cls)
+            emitted, cname, has_ctor, has_dtor = _emit_class(cls)
             pieces.append("\n".join(emitted))
+            type_info[cname] = {"ctor": has_ctor, "dtor": has_dtor}
         prev = end
     pieces.append(text[prev:])
     out = "".join(pieces)
@@ -297,4 +395,5 @@ def translate(text, path="<cpp>"):
             out = re.sub(r"\b%s\s*<\s*%s\s*>" % (re.escape(cls.name),
                                                  re.escape(targ)),
                          "%s_%s" % (cls.name, _mangle(targ)), out)
-    return out
+
+    return _rewrite_scopes(out, type_info)

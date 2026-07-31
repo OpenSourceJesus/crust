@@ -26,7 +26,7 @@ EX = os.path.join(ROOT, "examples", "crust")
 # (source, expected exit status, expected stdout or None to ignore, fast?)
 #
 # `fast` marks the examples that make test_fast_crust runs: enough to cover
-# each front end (C, Rust, rpython) and the include paths between them,
+# each front end (C, Rust, rpython, C++) and the include paths between them,
 # without recompiling the whole directory.
 EXAMPLES = [
     ("mixed.c", 0,
@@ -34,6 +34,12 @@ EXAMPLES = [
      "classify(-7)   = -1\n"
      "sum_to(100)    = 5050\n"
      "dot(u, v)      = 32\n", True),
+
+    # C++ destructor freeing a Crust Vec — automatic Drop at block exit.
+    ("raii.c", 42,
+     "sum      = 30\n"
+     "len      = 5\n"
+     "released = 1\n", True),
 
     ("shapes.c", 0,
      "centroid  = (2, 3)\n"

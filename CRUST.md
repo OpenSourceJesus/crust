@@ -1408,25 +1408,42 @@ Python, in keeping with the rest of the front end.
   `Box`, non-capturing closures, and identifiers that are C keywords.
 - `examples/crust/histogram.py` and `examples/crust/polyglot.c` — C, Rust and
   rpython in one translation unit, each calling the other two.
+- `examples/crust/owned.cpp` and `examples/crust/raii.c` — C++ destructors
+  supplying the `Drop` Crust lacks: a `VecGuard` frees a Rust `Vec<i32>` at
+  block exit (`#include "owned.cpp"` → `tools/cpprust.py`).
 - `examples/crust/tally.py` and `examples/crust/tally.c` — an rpython module
   that uses lists and strings, so the py2c runtime is linked in automatically.
+
+### C++ includes (`#include "foo.cpp"`)
+
+The preprocessor lowers a small C++ subset in place the same way it lowers
+`.rs` and `.py`. Classes become C structs; methods become
+`Class_method(Class *this, …)` — the same shape as a Rust `impl` — so a
+destructor can call `Vec_int_free_buf` with no shim. Locals in the `.cpp`
+get `Type_new` at the declaration and `Type_drop` at the closing `}`; early
+`return` does not insert drops (nest an inner block when Drop must run first).
+The guard holds a `Vec_int *` rather than a by-value field: the include is
+expanded before Crust emits the Rust type, so the type is incomplete in the
+class body. Inheritance, `virtual`, exceptions, `new`/`delete`, and the STL
+are rejected rather than mistranslated.
 
 ## Tests
 
 `tests/test_crust.py` covers the translation layer (type mapping, tail
 returns, line-number preservation, struct and method lowering, false-match
 rejection) and end-to-end compilation and execution across the C/Rust
-boundary in both directions.
+boundary in both directions. `tests/test_cpprust.py` covers the C++ subset
+lowering (classes, templates, scope-exit Drop, unsupported-keyword rejection).
 
 ```sh
-python3 -m pytest tests/test_crust.py -q
+python3 -m pytest tests/test_crust.py tests/test_cpprust.py -q
 ```
 
 Two make targets wrap this up with the examples:
 
 ```sh
 make test_crust        # unit tests + every example, output and exit status
-make test_fast_crust   # a subset covering all three front ends, ~1.7s warm
+make test_fast_crust   # a subset covering C, Rust, rpython, and C++, ~1.7s warm
 make clean_crust       # drop the /tmp transpile and runtime-object caches
 ```
 
