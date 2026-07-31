@@ -314,6 +314,7 @@ obj  dict_pop(obj d, obj k, obj dflt);
 obj  dict_setdefault(obj d, obj k, obj dflt);
 void dict_update(obj d, obj other);
 obj  pycopy(obj c);                /* shallow copy of a dict / list / set      */
+obj  dict_from(obj src);           /* dict(x): copy a dict, build from pairs   */
 obj  dict_keys(obj d);
 obj  dict_values(obj d);
 obj  dict_items(obj d);            /* list of [k, v] pairs                     */
@@ -337,6 +338,7 @@ long obj_cmp(obj a, obj b);        /* <0,0,>0 for < <= > >=                   */
 obj  pyrange(long lo, long hi, long step);
 
 /* ---- string methods (operate on char*) ---- */
+str str_mod_spread(str fmt, obj args);
 bool str_startswith(str s, str p);
 bool str_endswith(str s, str p);
 bool str_startswith_at(str s, str p, long start);
@@ -348,6 +350,7 @@ obj  str_splitlines(str s);
 str  str_replace(str s, str a, str b);
 long str_find(str s, str sub, bool last);
 long str_find_from(str s, str sub, bool last, long start);
+long str_find_range(str s, str sub, bool last, long start, long end);
 bool str_isdigit(str s);
 bool str_isalpha(str s);
 bool str_isspace(str s);
@@ -1412,6 +1415,26 @@ void dict_update(obj dd, obj other) {
     Dict* o = (Dict*)other.u.o;
     for (int i = 0; i < o->len; i++) dict_set(dd, o->e[i].key, o->e[i].val);
 }
+/* `dict(x)`: a dict copies, an iterable of pairs builds. `dict(zip(a, b))`
+   is the case that matters -- treating it as a shallow copy leaves a *list*
+   of pairs behind, and every subsequent `k in d` is then false. */
+obj dict_from(obj src) {
+    if (src.tag == T_DICT) return pycopy(src);
+    if (src.tag == T_LIST || src.tag == T_SET) {
+        obj d = dict_new();
+        List* l = (List*)src.u.o;
+        if (!l) return d;
+        for (long i = 0; i < l->len; i++) {
+            obj pair = l->data[i];
+            if (pair.tag != T_LIST || !pair.u.o) continue;
+            List* pl = (List*)pair.u.o;
+            if (pl->len < 2) continue;
+            dict_set(d, pl->data[0], pl->data[1]);
+        }
+        return d;
+    }
+    return pycopy(src);
+}
 obj pycopy(obj c) {                 /* shallow copy: dict / list / set */
     if (c.tag == T_DICT) { obj r = dict_new(); dict_update(r, c); return r; }
     if (c.tag == T_LIST || c.tag == T_SET) {
@@ -1579,6 +1602,13 @@ obj pyrange(long lo, long hi, long step) {
 }
 
 /* ---- string methods ---- */
+/* `fmt % args` where `args` is a function's collected *args: hand the list's
+   elements to str_mod rather than the list itself. */
+str str_mod_spread(str fmt, obj args) {
+    if (args.tag != T_LIST || !args.u.o) return str_mod(fmt, &args, 1);
+    List* l = (List*)args.u.o;
+    return str_mod(fmt, l->data, l->len);
+}
 bool str_startswith(str s, str p) {
     size_t ls = strlen(s), lp = strlen(p);
     return lp <= ls && memcmp(s, p, lp) == 0;
@@ -1678,6 +1708,26 @@ long str_find_from(str s, str sub, bool last, long start) {
     if (!last) { const char* q = strstr(base, sub); return q ? (long)(q - s) : -1; }
     for (const char* p = base; (p = strstr(p, sub)); p++) hit = p;
     return hit ? (long)(hit - s) : -1;
+}
+/* `s.find(sub, start, end)` / `s.rfind(...)`: search only `s[start:end]`.
+   Dropping the end bound made `rfind("\n", 0, start)` -- find the start of
+   the line containing `start` -- search the *whole* string, so it reported a
+   newline from later in the file. Every top-level Rust item after a
+   preprocessor directive then looked like it was on a `#` line and was
+   skipped, and a `.cpp` include followed by inline Rust compiled as neither. */
+long str_find_range(str s, str sub, bool last, long start, long end) {
+    long n = (long)strlen(s);
+    if (start < 0) start += n;
+    if (start < 0) start = 0;
+    if (end < 0) end += n;
+    if (end > n) end = n;
+    if (end < start) return -1;
+    long span = end - start;
+    char* tmp = (char*)aalloc((size_t)span + 1);
+    for (long i = 0; i < span; i++) tmp[i] = s[start + i];
+    tmp[span] = 0;
+    long r = str_find_from(tmp, sub, last, 0);
+    return r < 0 ? -1 : r + start;
 }
 long str_find(str s, str sub, bool last) { return str_find_from(s, sub, last, 0); }
 bool str_isdigit(str s) { if (!*s) return false; for (; *s; s++) if (!isdigit((unsigned char)*s)) return false; return true; }
@@ -7668,6 +7718,7 @@ class Transpiler:
                                           ", ".join(plist)))
             self.indent += 1
         if fn.args.vararg:
+            self._note_vararg(fn.args.vararg.arg)
             if virtual:
                 self.scope[fn.args.vararg.arg] = OBJ
             else:
@@ -7882,6 +7933,7 @@ class Transpiler:
                 self.elem_types[arg.arg] = et
         if fn.args.vararg:
             self.scope[fn.args.vararg.arg] = OBJ
+            self._note_vararg(fn.args.vararg.arg)
         if fn.args.kwarg:
             self.scope[fn.args.kwarg.arg] = OBJ
         ko = fn.args.kwonlyargs
@@ -10191,6 +10243,18 @@ class Transpiler:
             ci = ci.base
         return 0
 
+    @staticmethod
+    def _looks_exception_name(nm):
+        """True if `nm` reads as an exception class rather than a function.
+
+        The distinction matters at a `raise`: an exception class is
+        constructed and its message carried, while anything else has to be
+        called and its result raised.
+        """
+        return nm.endswith("Error") or nm.endswith("Exception") or \
+            nm in ("StopIteration", "KeyboardInterrupt", "SystemExit",
+                   "GeneratorExit", "StopAsyncIteration")
+
     def st_Raise(self, node):
         if node.exc is None:
             return ["rt_raise(g_exc_val);"]   # bare re-raise
@@ -10210,6 +10274,18 @@ class Transpiler:
                     exc = ast.Call(func=f, args=exc.args[:total], keywords=[])
                     ast.copy_location(exc, node.exc)
                 return ["rt_raise(%s);" % self.wrap_obj(exc)]
+            # `raise make_error(...)` -- a *factory* returning an exception,
+            # not an exception class. Evaluate the call and raise its result.
+            # Without this it fell into the builtin-exception heuristic below,
+            # which raises the call's first *argument*: crust's
+            # `raise fail(e, start)` became `rt_raise(code)`, so a parse error
+            # arrived at every handler as the raw source string, matched no
+            # `except CrustError`, and the compiler printed the program it had
+            # been asked to compile instead of the diagnostic.
+            if nm is not None and not self._looks_exception_name(nm) \
+                    and (nm in self.scope
+                         or nm in getattr(self, "func_nodes", ())):
+                return ["rt_raise(%s);" % self.wrap_obj(exc)]
             # builtin / unknown exception (NotImplementedError, ValueError, ...):
             # carry its message (or name) as a printable obj. Uncaught -> print
             # and exit; a catch-all handler still catches it.
@@ -10225,15 +10301,20 @@ class Transpiler:
             return ["rt_raise(OBJ_STR(%s));" % c_string(exc.id)]
         return ["rt_raise(%s);" % self.wrap_obj(exc)]
 
-    def _exc_match_cond(self, htype):
-        """C condition matching the in-flight exception g_exc_val against an
-        except clause's type. None means 'catch all' (bare except, Exception,
-        or a builtin/unknown type -- the native compiler is first-error-and-exit
-        so precise builtin matching is unnecessary)."""
+    def _exc_match_cond(self, htype, ev="g_exc_val"):
+        """C condition matching the in-flight exception against an except
+        clause's type. None means 'catch all' (bare except, Exception, or a
+        builtin/unknown type -- the native compiler is first-error-and-exit so
+        precise builtin matching is unnecessary).
+
+        `ev` names the value to test. Callers pass the handler's own snapshot
+        rather than `g_exc_val`, which is a single global and does not survive
+        anything the handler runs.
+        """
         if htype is None:
             return None
         if isinstance(htype, ast.Tuple):
-            sub = [self._exc_match_cond(e) for e in htype.elts]
+            sub = [self._exc_match_cond(e, ev) for e in htype.elts]
             if any(c is None for c in sub):
                 return None
             return " || ".join("(%s)" % c for c in sub)
@@ -10241,8 +10322,8 @@ class Transpiler:
             if isinstance(htype, (ast.Name, ast.Attribute)) else None
         if csym is None:
             return None
-        return ("(IS_OBJ(g_exc_val) && isinstance_of(AS_OBJ(g_exc_val), "
-                "(const void*)&%s_type))" % csym)
+        return ("(IS_OBJ(%s) && isinstance_of(AS_OBJ(%s), "
+                "(const void*)&%s_type))" % (ev, ev, csym))
 
     def _isinstance_class(self, ref):
         """Resolve an isinstance() 2nd-arg class reference to a known class
@@ -10595,6 +10676,7 @@ class Transpiler:
         fr = "_ef%d" % self.exc_n
         st = "_es%d" % self.exc_n
         hd = "_eh%d" % self.exc_n
+        ev = "_ev%d" % self.exc_n
 
         def fin():
             return self.suite(node.finalbody) if node.finalbody else []
@@ -10613,15 +10695,24 @@ class Transpiler:
         # --- exception path: dispatch handlers, run finally, re-raise if unhandled
         lines.append("  } else {")
         lines.append("    g_exc_sp = %s;" % fr)
+        # Snapshot the in-flight exception. `g_exc_val` is one global slot, so
+        # anything the handler runs that raises and catches internally
+        # overwrites it -- and the re-raise below would then propagate that
+        # unrelated value. That is not hypothetical: a CrustError unwinding
+        # through here was replaced by the bare string from a
+        # `raise ValueError("empty")` two frames down, so every outer
+        # `except CrustError` declined it and the compiler printed the raw
+        # source instead of a diagnostic.
+        lines.append("    obj %s = g_exc_val;" % ev)
         lines.append("    int %s = 0;" % hd)
         chain = []
         for i, h in enumerate(node.handlers):
-            cond = self._exc_match_cond(h.type)
+            cond = self._exc_match_cond(h.type, ev)
             binds = []
             if h.name:
                 if h.name not in self.scope:
                     self.scope[h.name] = OBJ
-                binds.append("obj %s = g_exc_val;" % cname(h.name))
+                binds.append("obj %s = %s;" % (cname(h.name), ev))
             hbody = binds + self.suite(h.body) + ["%s = 1;" % hd]
             if cond is None:
                 opener = "{" if i == 0 else "else {"
@@ -10635,7 +10726,7 @@ class Transpiler:
             chain.append("}")
         lines += self.indent_lines(self.indent_lines(chain))
         lines += self.indent_lines(self.indent_lines(fin()))
-        lines.append("    if (!%s) rt_raise(g_exc_val);" % hd)
+        lines.append("    if (!%s) rt_raise(%s);" % (hd, ev))
         lines.append("  }")
         lines.append("}")
         return lines
@@ -10808,17 +10899,34 @@ class Transpiler:
     # ---- expressions -----------------------------------------------------
 
     def expr(self, node):
+        # An expression that cannot be lowered becomes `OBJ_NONE`. That is
+        # deliberate -- it keeps a build going when the failure is in code the
+        # native compiler never runs -- but it *deletes* whatever the
+        # expression did, and the only trace was a comment in the generated C.
+        # A rejected `make_il(..., no_scope=True)` removed the call that emits
+        # every function body, and the result was a compiler that built
+        # cleanly and returned 0 from every program. Warn on both paths: the
+        # cost of a stray line on stderr is nothing against that.
         m = getattr(self, "ex_" + type(node).__name__, None)
         if m is None:
+            self._warn_unsupported(
+                getattr(node, "lineno", 0),
+                "expression of type %s" % type(node).__name__, "None",
+                "the expression is dropped, not evaluated")
             return "/* %s: %s */ OBJ_NONE" % (type(node).__name__,
                                               self.src1(node))
         try:
             return m(node)
         except Unsupported:
             raise
+        except Py2CUnsupported:
+            raise
         except Exception as e:
             if self.stdlib_root:
                 raise Unsupported(str(e)) from e
+            self._warn_unsupported(
+                getattr(node, "lineno", 0), "expression `%s`" % self.src1(node),
+                "None", "lowering failed: %s" % e)
             return "/* expr-error %s */ OBJ_NONE" % e
 
     def ex_Name(self, node):
@@ -11767,13 +11875,14 @@ class Transpiler:
                     return "dict_new()"
                 if self.stdlib_root:
                     return self._mp_import_call("builtins", "dict", node)
-                # dict(d): shallow-copy the argument dict. pycopy handles the
-                # T_DICT case (new dict + dict_update). Previously this emitted
-                # an empty dict_new(), so `dict(scope)` silently produced an
-                # empty dict -- which wiped the parser's snapshot/restore of the
-                # typedef symbol table and made every typedef name unresolvable
-                # in the self-hosted compiler.
-                return "pycopy(%s)" % self.wrap_obj(node.args[0])
+                # dict(x): a dict is copied, an iterable of pairs is
+                # built into one. This used to be a bare `pycopy`, which is
+                # right for `dict(other_dict)` and wrong for
+                # `dict(zip(params, args))` -- that left a *list* of pairs, so
+                # crust's type-parameter map answered False to every lookup
+                # and generic instantiation substituted nothing, reporting
+                # `cannot instantiate Vec over T`.
+                return "dict_from(%s)" % self.wrap_obj(node.args[0])
             if fn == "ord" and node.args:
                 a0 = node.args[0]
                 # ord(s[i]) on a char* -> direct byte read, no per-char string
@@ -12453,7 +12562,8 @@ class Transpiler:
                         owner.csym, self._class_ptr_expr(recv0, owner.csym),
                         (", " + ", ".join(rest)) if rest else "")
             if func.attr in VTABLE_METHODS:
-                return self.vcall(func.value, func.attr, node.args)
+                return self.vcall(func.value, func.attr,
+                                  self._call_args_with_kw(node, func.attr, func.value))
             # concrete class. Safe to devirtualize only for a leaf class, so no
             # subclass can override the method at runtime.
             if isinstance(func.value, ast.Name) and \
@@ -12802,6 +12912,32 @@ class Transpiler:
             return "AS_OBJ(%s)" % s
         return "(Obj*)(%s)" % s
 
+    def _varargs_call(self, recv_node, meth, arg_nodes, fndef, pct):
+        """Vtable call for a `*args` method, or None if the shape is unclear.
+
+        `def err(self, msg, *args)` lowers to `err(Obj*, char* msg, obj args)`:
+        the declared parameters keep their own types and the surplus is
+        collected into one list. Returning None leaves the caller's existing
+        fallback in place rather than guessing.
+        """
+        if fndef is None or not pct:
+            return None
+        named = len(fndef.args.args) - 1        # minus self
+        if named < 0 or len(pct) != named + 1:  # declared params + *args
+            return None
+        if len(arg_nodes) < named:
+            return None
+        head, rest = arg_nodes[:named], arg_nodes[named:]
+        try:
+            cargs = self.coerce_args(pct[:named], head,
+                                     self.defaults_for(fndef, True))
+        except Exception:
+            return None
+        packed = self._list_literal([self.wrap_obj(a) for a in rest])
+        xo = self.vtable_recv(recv_node)
+        return "TYPE(%s)->%s(%s)" % (
+            xo, vslot_name(meth), ", ".join([xo] + cargs + [packed]))
+
     def _mp_method_call_args(self, recv, attr, arg_nodes, fndef=None):
         args = list(arg_nodes)
         if fndef is not None:
@@ -12866,6 +13002,86 @@ class Transpiler:
             owner.csym, m.name, recv,
             (", " + ", ".join(cargs)) if cargs else "")
 
+    def _call_args_with_kw(self, node, meth, recv_node=None):
+        """Positional arguments for `node`, with keywords placed by name.
+
+        py2c matches arguments positionally, so a keyword argument used to be
+        dropped on the floor: `p.parse_impl(out, owner_override=mangled)`
+        compiled to `parse_impl(p, out, OBJ_NONE)`, and crust then parsed every
+        generic instantiation under the *template's* name -- so `Vec<i32>`
+        registered its methods as `Vec_int_*` and looked them up as `Vec_*`.
+
+        A keyword whose position cannot be determined is reported rather than
+        discarded; silently losing an argument is what made this cost a day.
+        """
+        kws = [k for k in getattr(node, "keywords", ()) if k.arg is not None]
+        if not kws:
+            return node.args
+        # A method name can be defined by many classes with different
+        # signatures -- `make_il` is on a dozen node types, and only
+        # `Compound.make_il` takes `no_scope`. Take the first definition that
+        # actually declares every keyword used here, rather than whichever
+        # class happens to come first: picking wrong meant rejecting a valid
+        # call, and a rejected expression becomes `OBJ_NONE`, which silently
+        # deleted the `make_il` that generates every function body.
+        wanted = set(k.arg for k in kws)
+        fndef = None
+        cands = []
+        if recv_node is not None:
+            for ci in self.method_owners.get(meth, []):
+                d = ci.methods.get(meth)
+                if d is not None:
+                    cands.append(d)
+        own = self.func_nodes.get(meth)
+        if own is not None:
+            cands.append(own)
+        for d in cands:
+            have = set(a.arg for a in d.args.args) | \
+                set(a.arg for a in d.args.kwonlyargs)
+            if wanted <= have:
+                fndef = d
+                break
+        if fndef is None and cands:
+            fndef = cands[0]
+        if fndef is None:
+            raise Py2CUnsupported(
+                "%s:%s: keyword argument(s) %s to `%s`, whose definition is "
+                "not visible here" % (getattr(self, "src_name", "?"),
+                                      node.lineno,
+                                      ", ".join(k.arg for k in kws), meth))
+        names = [a.arg for a in fndef.args.args]
+        if names and names[0] == "self":
+            names = names[1:]
+        names += [a.arg for a in fndef.args.kwonlyargs]
+        defaults = self.defaults_for(fndef, True) or []
+        # Only fill *trailing* keywords -- ones that sit at or after the last
+        # positional argument. Rewriting an earlier slot means synthesising
+        # the defaults in between, and `defaults_for` is indexed differently
+        # from `names` here: doing that produced a native compiler that built
+        # cleanly and then returned 0 from every program. A keyword that
+        # cannot be placed this way is reported, not guessed at.
+        out = list(node.args)
+        for k in kws:
+            if k.arg not in names:
+                raise Py2CUnsupported(
+                    "%s:%s: `%s` has no parameter named `%s`"
+                    % (getattr(self, "src_name", "?"), node.lineno, meth,
+                       k.arg))
+            idx = names.index(k.arg)
+            if idx < len(out):
+                raise Py2CUnsupported(
+                    "%s:%s: keyword `%s` to `%s` also given positionally"
+                    % (getattr(self, "src_name", "?"), node.lineno, k.arg,
+                       meth))
+            if idx != len(out):
+                raise Py2CUnsupported(
+                    "%s:%s: keyword `%s` to `%s` skips parameter(s); pass "
+                    "them positionally"
+                    % (getattr(self, "src_name", "?"), node.lineno, k.arg,
+                       meth))
+            out.append(k.value)
+        return out
+
     def vcall(self, recv_node, meth, arg_nodes):
         # POD class instance -> static dispatch (direct call, no vtable).
         rct = self.value_ctype(recv_node)
@@ -12910,7 +13126,23 @@ class Transpiler:
                                       ", ".join([recv] + cargs))
         if self.stdlib_root:
             return self._mp_method_call_args(recv_node, meth, arg_nodes, fndef)
-        if self._method_has_varargs(fndef) or len(arg_nodes) > len(pct):
+        if self._method_has_varargs(fndef):
+            # A `*args` method compiles to a normal C function whose last
+            # parameter is the collected list, so it can be reached through
+            # the vtable like any other -- pack the surplus arguments and
+            # call it.
+            #
+            # The old path went through `mp_call_method`, which resolves the
+            # name with `rt_getattr`: that finds *data* attributes holding a
+            # closure, never a method. It returned None and the call
+            # dereferenced it, so `self.err(...)` -- crust's own diagnostic
+            # helper -- segfaulted the compiler instead of reporting the
+            # error it was called to report.
+            packed = self._varargs_call(recv_node, meth, arg_nodes, fndef, pct)
+            if packed is not None:
+                return packed
+            return self._mp_method_call_args(recv_node, meth, arg_nodes, fndef)
+        if len(arg_nodes) > len(pct):
             return self._mp_method_call_args(recv_node, meth, arg_nodes, fndef)
         xo = self.vtable_recv(recv_node)
         defs = self.defaults_for(fndef, True) if fndef else None
@@ -13009,7 +13241,8 @@ class Transpiler:
                 cargs = self.coerce_args(pct, node.args, defs)
                 return "%s_%s(%s)" % (owner.csym, func.attr, ", ".join(cargs))
             if func.attr in VTABLE_METHODS:
-                return self.vcall(func.value, func.attr, node.args)
+                return self.vcall(func.value, func.attr,
+                                  self._call_args_with_kw(node, func.attr, func.value))
             m = owner.methods.get(func.attr)
             if m is not None:
                 return self._format_direct_method_call(
@@ -13498,6 +13731,15 @@ class Transpiler:
             # right-hand side spreads into multiple args; anything else is one.
             if isinstance(node.right, ast.Tuple):
                 args = [self.wrap_obj(e) for e in node.right.elts]
+            elif self._is_vararg_name(node.right):
+                # `msg % args` inside a `*args` function. Python spreads a
+                # tuple across the format's placeholders; py2c represents
+                # `*args` as a list, and passing it as one value filled the
+                # first `%s` with the whole collection -- crust's `self.err`
+                # reported `cannot instantiate ['Vec','T','T'] over None`
+                # instead of naming the type and the offender. Spread it.
+                return "str_mod_spread(%s, %s)" % (
+                    self.as_str(node.left), self.wrap_obj(node.right))
             else:
                 args = [self.wrap_obj(node.right)]
             return self._emit_str_mod(self.as_str(node.left), args)
@@ -13551,7 +13793,23 @@ class Transpiler:
     def looks_str(self, node):
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             return True
-        return self.static_type(node) == "char*"
+        if self.static_type(node) == "char*":
+            return True
+        # `code[j]` where `code` is a string is a one-character *string*, not
+        # an object. Without this, `code[j] != quote` fell through to the
+        # identity branch and compiled to a pointer comparison against an
+        # obj -- always unequal, so `_blank`'s string-literal scan never
+        # terminated and blanked the rest of the file. Every Rust item after
+        # an `#include "..."` then vanished before the item scanner ran.
+        if isinstance(node, ast.Subscript) and \
+                not isinstance(node.slice, ast.Slice):
+            base = node.value
+            if self.static_type(base) == "char*":
+                return True
+            if isinstance(base, ast.Name) and \
+                    self.scope.get(base.id) == "char*":
+                return True
+        return False
 
     def str_operand(self, node):
         s = self.expr(node)
@@ -13725,6 +13983,12 @@ class Transpiler:
             # `pos = text.find(x, pos) + 1` then never advanced -- the
             # self-hosted compiler hung on any input.
             last = "true" if m == "rfind" else "false"
+            if len(a) >= 3:
+                # `find(sub, start, end)`: the end bound was dropped, so the
+                # search ran past it.
+                return "str_find_range(%s, %s, %s, %s, %s)" % (
+                    self.as_str(func.value), self.as_str(a[0]), last,
+                    self.as_long(a[1]), self.as_long(a[2]))
             if len(a) >= 2:
                 return "str_find_from(%s, %s, %s, %s)" % (
                     self.as_str(func.value), self.as_str(a[0]), last,
@@ -14403,6 +14667,16 @@ class Transpiler:
         parts.append("_tl;")
         return "({ " + " ".join(parts) + " })"
 
+    def _note_vararg(self, name):
+        """Remember that `name` holds a function's collected `*args`."""
+        if not hasattr(self, "_vararg_names"):
+            self._vararg_names = set()
+        self._vararg_names.add(name)
+
+    def _is_vararg_name(self, node):
+        return (isinstance(node, ast.Name)
+                and node.id in getattr(self, "_vararg_names", ()))
+
     def _emit_str_mod(self, fmt_expr, arg_exprs):
         """`fmt % args` without obj-through-varargs: args go in a stack array."""
         n = len(arg_exprs)
@@ -14877,7 +15151,61 @@ def print_conventions():
     print(__doc__)
 
 
+def _rpyinc_one(argv):
+    """`--rpyinc SRC --out DIR`: transpile one file for `shivyc/rpyinc.py`.
+
+    A separate entry point from the ordinary CLI because the caller needs two
+    facts back -- where the C landed, and whether the runtime is required --
+    and parsing them out of the human-readable listing would be brittle. The
+    answer is written to stdout as two lines:
+
+        <path to the generated .c>
+        rt | pure
+
+    `rpyinc` runs this in a *subprocess* rather than importing py2c, for the
+    same reason `preproc.py` shells out to `cpprust.py`: an import compiles
+    into a cross-module symbol reference, and py2c is not part of the
+    self-hosted source set, so the reference is undefined at link time. A
+    subprocess leaves no symbol behind, and the self-hosted compiler can then
+    lower an rpython include by running it.
+    """
+    src = out = None
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--rpyinc":
+            src = argv[i + 1]
+            i += 2
+        elif argv[i] == "--out":
+            out = argv[i + 1]
+            i += 2
+        else:
+            i += 1
+    if not src or not out:
+        sys.stderr.write("usage: py2c.py --rpyinc <src.py> --out <dir>\n")
+        return 2
+    try:
+        os.makedirs(out)
+    except OSError:
+        pass
+    set_local_module_dirs([src])
+    set_compiled_modules([src])
+    uses_eval = _uses_eval_builtin(src)
+    write_runtime(out, mp_bridge=False, minipy_eval=uses_eval)
+    try:
+        produced, err = transpile_file(src, out)
+    except Exception as e:
+        sys.stderr.write("py2c: %s\n" % e)
+        return 1
+    if err or not produced:
+        sys.stderr.write("py2c: %s\n" % (err or "no output"))
+        return 1
+    sys.stdout.write("%s\n" % produced)
+    return 0
+
+
 def main(argv):
+    if "--rpyinc" in argv:
+        return _rpyinc_one(argv)
     out_dir = "/tmp"
     stdlib_dir = None
     report_path = None
@@ -15089,4 +15417,4 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    sys.exit(main(sys.argv[1:]) or 0)
