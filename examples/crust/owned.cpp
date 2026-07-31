@@ -20,9 +20,11 @@
  * container's API.
  *
  * Locals declared in this file get `Type_new` at the declaration and
- * `Type_drop` at the closing `}` (see tools/cpprust.py). An early `return`
- * does not insert drops, so `run_guarded` nests the guard in an inner block
- * and returns after that block closes.
+ * `Type_drop` on every exit from the scope -- the closing `}`, but also
+ * `return`, `break` and `continue` (see tools/cpprust.py). The inner block
+ * below is therefore not needed to make the destructor run; it is here
+ * because `*out_released` has to be set *after* the guard releases, so that
+ * the caller can observe the ordering.
  */
 struct Vec_int;
 typedef struct Vec_int Vec_int;
@@ -43,7 +45,7 @@ int run_guarded(Vec_int *v, unsigned long *out_len, int *out_released) {
     int sum = 0;
     {
         VecGuard g(v);
-        Vec_int *p = VecGuard_get(&g);
+        Vec_int *p = g.get();
         unsigned long n = Vec_int_len(p);
         unsigned long i;
         *out_len = n;
