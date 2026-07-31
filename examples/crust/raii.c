@@ -4,7 +4,7 @@
 int printf(const char *, ...);
 
 /* Rust builds the vector; its methods lower to the same C functions the C++
- * guard above calls. */
+ * guard in owned.cpp calls (Vec_int_free_buf, Vec_int_len, Vec_int_get). */
 fn seed(n: i32) -> Vec<i32> {
     let mut v: Vec<i32> = Vec::<i32>::new();
     for i in 0..n {
@@ -13,26 +13,14 @@ fn seed(n: i32) -> Vec<i32> {
     v
 }
 
-fn total(v: *mut Vec<i32>) -> i32 {
-    let mut s: i32 = 0;
-    for i in 0..v.len() {
-        s += v.get(i);
-    }
-    s
-}
-
 int main(void) {
     Vec_int owned = seed(5);
+    unsigned long len = 0;
+    int released = 0;
+    int sum = run_guarded(&owned, &len, &released);
 
-    /* The guard borrows it. `VecGuard_drop` is what a destructor call lowers
-     * to; a C++ front end with scope tracking would emit it automatically. */
-    VecGuard g;
-    VecGuard_new(&g, &owned);
-
-    printf("sum      = %d\n", total(VecGuard_get(&g)));
-    printf("len      = %lu\n", Vec_int_len(&owned));
-
-    VecGuard_drop(&g);              /* frees the buffer, clears the pointer */
-    printf("released = %d\n", VecGuard_get(&g) == 0);
+    printf("sum      = %d\n", sum);
+    printf("len      = %lu\n", len);
+    printf("released = %d\n", released);
     return 42;
 }

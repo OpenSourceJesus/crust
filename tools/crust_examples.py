@@ -35,7 +35,7 @@ EXAMPLES = [
      "sum_to(100)    = 5050\n"
      "dot(u, v)      = 32\n", True),
 
-    # C++ destructor freeing a Crust Vec — explicit VecGuard_new/drop for now.
+    # C++ destructor freeing a Crust Vec — automatic Drop at block exit.
     ("raii.c", 42,
      "sum      = 30\n"
      "len      = 5\n"

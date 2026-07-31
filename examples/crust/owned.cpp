@@ -18,10 +18,17 @@
  * an incomplete type here -- which is fine to point at and not to embed. That
  * is also the better design: a guard that borrows does not duplicate the
  * container's API.
+ *
+ * Locals declared in this file get `Type_new` at the declaration and
+ * `Type_drop` at the closing `}` (see tools/cpprust.py). An early `return`
+ * does not insert drops, so `run_guarded` nests the guard in an inner block
+ * and returns after that block closes.
  */
 struct Vec_int;
 typedef struct Vec_int Vec_int;
 static void Vec_int_free_buf(Vec_int *);
+static unsigned long Vec_int_len(Vec_int *);
+static int Vec_int_get(Vec_int *, unsigned long);
 
 class VecGuard {
     Vec_int * held;
@@ -30,3 +37,21 @@ public:
     ~VecGuard() { if (held) { Vec_int_free_buf(held); held = 0; } }
     Vec_int * get() { return held; }
 };
+
+/* Borrow `v` under the guard, sum its squares-buffer, then Drop at `}`. */
+int run_guarded(Vec_int *v, unsigned long *out_len, int *out_released) {
+    int sum = 0;
+    {
+        VecGuard g(v);
+        Vec_int *p = VecGuard_get(&g);
+        unsigned long n = Vec_int_len(p);
+        unsigned long i;
+        *out_len = n;
+        for (i = 0; i < n; i = i + 1) {
+            sum = sum + Vec_int_get(p, i);
+        }
+    }
+    /* Inner block closed: destructor ran and nulled `held`. */
+    *out_released = 1;
+    return sum;
+}
