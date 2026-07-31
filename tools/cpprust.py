@@ -93,6 +93,7 @@ unit without a shim.
 
 import os
 import re
+import sys
 
 
 class CppError(Exception):
@@ -1177,7 +1178,7 @@ def _rewrite_calls(text, cinfo, free_refs):
     names = set(cinfo)
     alt = _type_alt(names)
     decl_re = re.compile(
-        r"(?<![\w.])(%s)\s+(\*\s*)?(\w+)\s*(?=[;=,\[])" % alt)
+        r"(?<![\w.])(%s)\s+(\*\s*)?(\w+)\s*(?=[;=,])" % alt)
     call_re = re.compile(r"(?<![\w.>])(\w+)((?:\s*(?:\.|->)\s*\w+)+)\s*\(")
     plain_re = re.compile(r"(?<![\w.>])(\w+)\s*\(")
     # As in `_rewrite_scopes`: match against comment-blanked text so a `.`
@@ -1420,3 +1421,70 @@ def translate(text, path="<cpp>"):
             break
         out = nxt
     return out
+
+
+# ==========================================================================
+# Command line entry point
+#
+# `shivyc/preproc.py` runs this in a subprocess rather than importing it. The
+# reason is self-hosting: py2c transpiles the compiler's own sources, and an
+# `import tools.cpprust` inside preproc becomes a real cross-module reference
+# to `cpprust__translate`, which is then undefined at link time because this
+# module is not in the transpiled set. It cannot easily join that set either
+# -- it leans on compiled-pattern objects and match methods (`.sub`, `.start`,
+# `.finditer`) that py2c does not lower, whereas `shivyc/crust.py` stays
+# inside the supported subset on purpose.
+#
+# A subprocess removes the symbol entirely, so the self-hosted compiler links
+# with no reference to this file, and lowers a `.cpp` include by running it.
+# That does mean a `.cpp` include needs python3 and this script on disk at
+# compile time; a `.c` or `.rs` build needs neither.
+#
+# The protocol is deliberately small so the self-hosted caller can use it too,
+# where capturing a pipe is awkward: the translated source is written to the
+# output file on success, and on failure the *diagnostic* is written to that
+# same file and the exit status is non-zero. One file, one status, no pipes.
+# ==========================================================================
+
+def main(argv):
+    args = list(argv)
+    out_path = None
+    if "-o" in args:
+        i = args.index("-o")
+        if i + 1 >= len(args):
+            sys.stderr.write("cpprust: -o needs a path\n")
+            return 2
+        out_path = args[i + 1]
+        del args[i:i + 2]
+    if len(args) != 1 or out_path is None:
+        sys.stderr.write("usage: cpprust.py <source.cpp> -o <out.c>\n")
+        return 2
+
+    src = args[0]
+    try:
+        with open(src) as f:
+            text = f.read()
+    except IOError as e:
+        sys.stderr.write("cpprust: cannot read %s: %s\n" % (src, e))
+        return 2
+
+    try:
+        result = translate(text, path=src)
+    except CppError as e:
+        # The message goes where the output would have gone; the caller
+        # reads it back and reports it against the `#include` line.
+        try:
+            with open(out_path, "w") as f:
+                f.write(e.message)
+        except IOError:
+            pass
+        sys.stderr.write("cpprust: %s\n" % e.message)
+        return 1
+
+    with open(out_path, "w") as f:
+        f.write(result)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
