@@ -693,5 +693,21 @@ void f(void) { puts("} not a brace {"); B b; }
         self.assertIn("B b; B_new(&b);", out)
 
 
+    def test_array_of_class_pointers_not_a_scalar_symbol(self):
+        # `B *arr[2]` declares an array, not a `B *`. Registering `arr` as a
+        # receiver would rewrite `arr->get()` into something that is not what
+        # the author wrote. Subscripted receivers are simply not resolved.
+        out = cpprust.translate("""
+class B { int a; public: int get() { return a; } };
+int f(void) {
+    B *arr[2];
+    B one;
+    return one.get();
+}
+""")
+        self.assertIn("B *arr[2];", out)
+        self.assertIn("B_get(&one)", out)
+
+
 if __name__ == "__main__":
     unittest.main()
