@@ -633,11 +633,19 @@ benchmarks_rpython:
 
 # Full report: run the harness, render the matplotlib figures (PNG+PDF), and
 # typeset tools/benchmarks.tex into $(BENCH_PLOT_DIR)/benchmarks.pdf.
-benchmarks_report: benchmarks_rpython
-	python3 benchmarks/run_minipy_benchmarks.py
-	python3 benchmarks/plot_rpython.py $(BENCH_PLOT_DIR)
-	python3 benchmarks/plot_minipy.py $(BENCH_PLOT_DIR)
-# The Crust language benchmarks: same generated C, ShivyCX vs gcc.
+#
+# Every step here is tolerated failing. The report is a collection of
+# independent sections, and one of them being unbuildable -- a missing
+# toolchain, or a harness that needs the self-hosted native compiler -- should
+# cost that section rather than the whole document. `make benchmarks_rpython`
+# remains strict, so a regression there is still caught by its own target.
+benchmarks_report:
+	-python3 benchmarks/run_rpython_benchmarks.py
+	-python3 benchmarks/run_minipy_benchmarks.py
+	-python3 benchmarks/plot_rpython.py $(BENCH_PLOT_DIR)
+	-python3 benchmarks/plot_minipy.py $(BENCH_PLOT_DIR)
+# The Crust language benchmarks: same generated C, ShivyCX vs gcc, across
+# both the Rust and the C++ front ends.
 	-python3 benchmarks/run_crust_benchmarks.py
 	-python3 benchmarks/plot_crust.py $(BENCH_PLOT_DIR)
 # The ShivyCX-vs-gcc feature suite. It writes results/results.json, which
