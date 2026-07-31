@@ -20,11 +20,116 @@ out of the flat token list.
 """
 
 import os
+import sys
 
 import shivyc.lexer as lexer
 import shivyc.token_kinds as token_kinds
 from shivyc.tokens import Token, parse_c_int
 from shivyc.errors import error_collector, CompilerError
+
+
+# Where lowered `.cpp` sources are staged. Same convention as the rpython
+# include cache: a fixed root under /tmp, overridable for sandboxed builds.
+CPP_CACHE_ROOT = os.environ.get("CRUST_CPP_CACHE", "/tmp/crust-cpp")
+
+
+def _cpprust_script():
+    """Path to tools/cpprust.py, or "" if it cannot be found.
+
+    Two layouts have to work. On the host, `__file__` is `.../shivyc/
+    preproc.py`, so the repo root is two directories up. Self-hosted, py2c
+    compiles `__file__` down to the bare string "preproc.py", so `abspath`
+    resolves it against the current directory and only one level should be
+    stripped. Rather than guess which world we are in, try both -- plus the
+    working directory, and an explicit override for installs where the
+    compiler does not sit next to its sources.
+    """
+    env = os.environ.get("CRUST_CPPRUST")
+    if env:
+        return env if os.path.exists(env) else ""
+    here = os.path.dirname(os.path.abspath(__file__))
+    roots = [os.path.dirname(here), here, os.getcwd()]
+    for root in roots:
+        cand = os.path.join(root, "tools", "cpprust.py")
+        if os.path.exists(cand):
+            return cand
+    return ""
+
+
+def _read_or(path, fallback):
+    """The child's diagnostic, or `fallback` if it did not write one."""
+    try:
+        with open(path) as f:
+            msg = f.read().strip()
+        return msg or fallback
+    except IOError:
+        return fallback
+
+
+def _run_cpprust(filename, text):
+    """Lower a `.cpp` include out-of-process.
+
+    Returns `(True, lowered_source)` or `(False, diagnostic)`.
+
+    The script writes its output to a file, and on failure writes the
+    diagnostic to that same file with a non-zero exit status. One file and one
+    status is all the protocol needs, which matters for the self-hosted path
+    below: it drives the child through `os.system`, where capturing a pipe is
+    not available.
+    """
+    script = _cpprust_script()
+    if not script:
+        return False, ("cannot find tools/cpprust.py; set $CRUST_CPPRUST to "
+                       "its path")
+
+    try:
+        os.makedirs(CPP_CACHE_ROOT)
+    except OSError:
+        pass
+    stem = os.path.basename(filename)
+    src = os.path.join(CPP_CACHE_ROOT, stem + ".in")
+    out = os.path.join(CPP_CACHE_ROOT, stem + ".out.c")
+
+    # Hand the child the *current* text rather than the path on disk: an
+    # earlier stage may already have rewritten it, so the file on disk is not
+    # necessarily what is being compiled.
+    try:
+        with open(src, "w") as f:
+            f.write(text)
+    except IOError as e:
+        return False, "cannot stage %s: %s" % (src, e)
+    if os.path.exists(out):
+        os.remove(out)
+
+    if sys.implementation.name != "shivyc":
+        import subprocess
+        try:
+            proc = subprocess.run([sys.executable, script, src, "-o", out],
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE)
+        except OSError as e:
+            return False, "cannot run %s: %s" % (script, e)
+        if proc.returncode != 0:
+            # Prefer the structured message the script writes; fall back to
+            # its stderr, which is where a crash rather than a rejected
+            # program would show up.
+            msg = _read_or(out, "")
+            if not msg:
+                msg = proc.stderr.decode("utf-8", "replace").strip()
+            return False, msg or "translation failed"
+    else:
+        # Self-hosted: no subprocess module here, and a path with spaces
+        # would break. Acceptable for the same reason it is in main.py.
+        # stderr is dropped because the message is read back from `out`.
+        rc = os.system("python3 " + script + " " + src + " -o " + out +
+                       " 2>/dev/null")
+        if rc != 0:
+            return False, _read_or(out, "translation failed")
+
+    if not os.path.exists(out):
+        return False, "produced no output"
+    with open(out) as f:
+        return True, f.read()
 
 
 def process(tokens, this_file, macros=None):
@@ -522,17 +627,31 @@ class _Preprocessor:
                     error_collector.add(CompilerError(
                         "crust: %s" % e, rest[0].r))
                     return
-            elif filename.endswith((".cpp", ".cc", ".cxx", ".hpp")):
+            elif (filename.endswith(".cpp") or filename.endswith(".cc")
+                  or filename.endswith(".cxx")
+                  or filename.endswith(".hpp")):
+                # Spelled out rather than `endswith((...))`: py2c lowers the
+                # tuple form to `str_endswith(s, AS_STR(<list>))`, handing a
+                # list object where a `char *` suffix is expected. It never
+                # matches, so self-hosted builds skipped C++ lowering
+                # entirely and lexed the class body as C.
+                #
                 # A C++ subset module: lowered in place, like an `.rs`. Line
                 # numbers are preserved where possible, but a class body is
                 # rewritten into free functions, so a diagnostic inside a
                 # method names the generated form.
-                import tools.cpprust as cpprust
-                try:
-                    text = cpprust.translate(text, path=filename)
-                except cpprust.CppError as e:
+                #
+                # Run out-of-process rather than importing. `import
+                # tools.cpprust` transpiles into a cross-module call to
+                # `cpprust__translate`, undefined at link time because that
+                # module is not in the self-hosted source set -- and it cannot
+                # easily join it, since it leans on regex features py2c does
+                # not lower. A subprocess leaves no symbol behind, so the
+                # self-hosted compiler links clean and still lowers `.cpp`.
+                ok, text = _run_cpprust(filename, text)
+                if not ok:
                     error_collector.add(CompilerError(
-                        "cpprust: %s" % e, rest[0].r))
+                        "cpprust: %s" % text, rest[0].r))
                     return
             elif filename.endswith(".py"):
                 # An rpython module: transpile it with tools/py2c.py and lex
