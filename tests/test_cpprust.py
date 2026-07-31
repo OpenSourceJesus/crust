@@ -65,5 +65,62 @@ class TestCppReject(unittest.TestCase):
         self.assertIn("new", cm.exception.message)
 
 
+class TestCppScope(unittest.TestCase):
+    def test_ctor_at_decl_and_dtor_at_brace(self):
+        out = cpprust.translate("""
+class Guard {
+    int * p;
+public:
+    Guard(int * v) { p = v; }
+    ~Guard() { p = 0; }
+};
+void run(int *v) {
+    Guard g(v);
+    (void)v;
+}
+""")
+        self.assertIn("Guard g; Guard_new(&g, v);", out)
+        self.assertIn("Guard_drop(&g);", out)
+        # Drop comes before the function's closing brace, after the body.
+        body = out[out.index("void run"):]
+        self.assertLess(body.index("(void)v;"), body.index("Guard_drop(&g);"))
+        self.assertLess(body.index("Guard_drop(&g);"), body.rindex("}"))
+
+    def test_inner_block_drop_before_return(self):
+        out = cpprust.translate("""
+class Guard {
+    int * p;
+public:
+    Guard(int * v) { p = v; }
+    ~Guard() { p = 0; }
+};
+int run(int *v) {
+    int x;
+    {
+        Guard g(v);
+        x = 1;
+    }
+    return x;
+}
+""")
+        # Drop is tied to the inner `}`, so it runs before `return`.
+        inner = out[out.index("int x;"):]
+        self.assertLess(inner.index("Guard_drop(&g);"), inner.index("return x;"))
+
+    def test_file_scope_decl_untouched(self):
+        out = cpprust.translate("""
+class Box {
+    int x;
+public:
+    Box(int v) { x = v; }
+    ~Box() { x = 0; }
+};
+Box g;
+""")
+        self.assertIn("Box g;", out)
+        self.assertNotIn("Box_new(&g", out)
+        self.assertNotIn("Box_drop(&g", out)
+
+
 if __name__ == "__main__":
     unittest.main()
