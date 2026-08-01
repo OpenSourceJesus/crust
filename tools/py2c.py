@@ -1016,11 +1016,64 @@ obj pyfloat(obj v) {
     return OBJ_FLOAT((double)((v.tag == T_INT || v.tag == T_BOOL) ? v.u.i : 0));
 }
 
+/* CPython-compatible repr for a double.
+ *
+ * `%g` was used here, which is six significant digits: 3.141592653589793
+ * printed as 3.14159, and 1.0000000000000002 printed as 1. For a compiler that
+ * has to emit float constants into generated code, that is a value change, not
+ * a formatting difference -- and it is exactly what would break a byte-identical
+ * self-hosted compile.
+ *
+ * CPython's repr is the shortest decimal string that reads back as the same
+ * double, laid out fixed or exponential according to its exponent. Both halves
+ * matter: shortest-round-trip alone renders 15000000000.0 as "1.5e+10", where
+ * CPython gives "15000000000.0".
+ *
+ * Step 1: find the smallest precision, 1 through 17, whose %e rendering parses
+ *         back to the identical bit pattern. 17 always suffices for a double.
+ * Step 2: if the decimal exponent is in [-4, 16), reformat as fixed with just
+ *         enough places (at least one, so an integral value keeps its ".0");
+ *         otherwise the %e string is already in CPython's form.
+ */
+str fmt_double(double d) {
+    char* b;
+    char tmp[64];
+    int prec;
+    int exp;
+    int decimals;
+    const char* p;
+
+    if (d != d) return "nan";
+    if (d > 1.7976931348623157e308) return "inf";
+    if (d < -1.7976931348623157e308) return "-inf";
+
+    for (prec = 1; prec < 17; prec++) {
+        sprintf(tmp, "%.*e", prec - 1, d);
+        if (strtod(tmp, NULL) == d) break;
+    }
+    sprintf(tmp, "%.*e", prec - 1, d);
+
+    exp = 0;
+    for (p = tmp; *p; p++) {
+        if (*p == 'e') { exp = (int)strtol(p + 1, NULL, 10); break; }
+    }
+
+    b = aalloc(64);
+    if (exp >= -4 && exp < 16) {
+        decimals = prec - 1 - exp;
+        if (decimals < 1) decimals = 1;
+        sprintf(b, "%.*f", decimals, d);
+        return b;
+    }
+    sprintf(b, "%s", tmp);
+    return b;
+}
+
 str pystr(obj v) {
     char* b;
     switch (v.tag) {
         case T_INT:  b = aalloc(24); sprintf(b, "%ld", v.u.i); return b;
-        case T_FLOAT: b = aalloc(32); sprintf(b, "%g", v.u.d); return b;
+        case T_FLOAT: return fmt_double(v.u.d);
         case T_BOOL: return v.u.i ? "True" : "False";
         case T_STR:  return v.u.s ? v.u.s : "";
         case T_NONE: return "None";

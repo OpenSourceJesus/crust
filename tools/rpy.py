@@ -350,7 +350,16 @@ def _ensure_native(force=False):
     interp_src = _os.path.join(here, "minipy", "interp.py")
     if not _os.path.isfile(interp_src):
         return None
-    key = hashlib.md5(open(interp_src, "rb").read()).hexdigest()[:16]
+    # The binary depends on py2c.py as well as interp.py: py2c is both the
+    # compiler and the source of the C runtime that gets linked in, so a change
+    # to either must rebuild. Keying on interp.py alone meant a runtime fix
+    # (e.g. float formatting in pystr) silently kept serving the old binary.
+    _h = hashlib.md5()
+    _h.update(open(interp_src, "rb").read())
+    _p2c = _os.path.join(here, "py2c.py")
+    if _os.path.isfile(_p2c):
+        _h.update(open(_p2c, "rb").read())
+    key = _h.hexdigest()[:16]
     bdir = _os.path.join("/tmp", "minipy_interp_" + key)
     binp = _os.path.join(bdir, "interp")
     if not force and _os.path.isfile(binp):
