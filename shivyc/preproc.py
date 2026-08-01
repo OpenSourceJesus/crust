@@ -307,6 +307,16 @@ def _seed_builtins(macros):
 # every translation unit.
 _cmdline_define_prelude = (
     "#define __SHIVYC__ 1\n"
+    "#define __SIZE_TYPE__ unsigned long\n"
+    "#define __PTRDIFF_TYPE__ long\n"
+    "#define __WCHAR_TYPE__ int\n"
+    "#define __INTPTR_TYPE__ long\n"
+    "#define __UINTPTR_TYPE__ unsigned long\n"
+    "#define __INT64_TYPE__ long\n"
+    "#define __UINT64_TYPE__ unsigned long\n"
+    "#define __INT32_TYPE__ int\n"
+    "#define __UINT32_TYPE__ unsigned int\n"
+    "#define __CHAR_BIT__ 8\n"
     "#define __builtin_va_list char *\n"
     "#define __builtin_va_start(ap, last) "
     "((ap) = (char *)__builtin_va_start_addr())\n"
@@ -322,6 +332,16 @@ def set_defines(defines: "list[str]"):
     """
     global _cmdline_define_prelude
     lines = ["#define __SHIVYC__ 1",
+             "#define __SIZE_TYPE__ unsigned long",
+             "#define __PTRDIFF_TYPE__ long",
+             "#define __WCHAR_TYPE__ int",
+             "#define __INTPTR_TYPE__ long",
+             "#define __UINTPTR_TYPE__ unsigned long",
+             "#define __INT64_TYPE__ long",
+             "#define __UINT64_TYPE__ unsigned long",
+             "#define __INT32_TYPE__ int",
+             "#define __UINT32_TYPE__ unsigned int",
+             "#define __CHAR_BIT__ 8",
              "#define __builtin_va_list char *",
              "#define __builtin_va_start(ap, last) "
              "((ap) = (char *)__builtin_va_start_addr())",
