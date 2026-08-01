@@ -147,7 +147,8 @@ class VaStartAddr(_RExprNode):
             err = "va_start used outside of a variadic function"
             raise CompilerError(err, self.r)
         out = ILValue(PointerCType(ctypes.char))
-        il_code.add(value_cmds.VaStartAddr(out, named))
+        il_code.add(value_cmds.VaStartAddr(out, named,
+                                           getattr(c, "vararg_base", None)))
         return out
 
 

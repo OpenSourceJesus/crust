@@ -820,6 +820,13 @@ class DeclInfo:
             c = c.set_vararg_named(named_slots)
         il_code.start_func(self.identifier.content)
 
+        if variadic:
+            # The caller passes the base of the argument block in r11; capture
+            # it before anything can clobber it.
+            va_base = ILValue(PointerCType(ctypes.char))
+            il_code.add(value_cmds.VaSaveBase(va_base))
+            c = c.set_vararg_base(va_base)
+
         symbol_table.new_scope()
 
         num_params = len(self.ctype.args)
@@ -861,8 +868,11 @@ class DeclInfo:
                         arg, stack_index=vstack_i))
                     vstack_i += n
                 else:
+                    # positional: (output, arg_num, all_stack, reg, is_float,
+                    #              stack_index, base)
                     il_code.add(value_cmds.LoadArg(
-                        arg, vstack_i, True))
+                        arg, vstack_i, True, None, ctype.is_floating(), None,
+                        va_base))
                     vstack_i += 1
                 continue
             if (ctype.is_struct_union() and ctype.size > 8):
