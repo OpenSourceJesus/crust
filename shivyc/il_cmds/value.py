@@ -113,11 +113,21 @@ class LoadArg(ILCommand):
     arg_regs = [spots.RDI, spots.RSI, spots.RDX, spots.RCX, spots.R8, spots.R9]
 
     def __init__(self, output, arg_num, all_stack=False, reg=None,
-                 is_float=False, stack_index=None):
+                 is_float=False, stack_index=None, base=None):
         self.output = output
         self.arg_num = arg_num
         self.is_float = is_float
-        if reg is not None:
+        # `base`, when set, is an ILValue holding the address of the caller's
+        # argument block (a variadic call passes it in r11 and the prologue
+        # saves it). The block is not always at [rbp+16]: when the call had
+        # overflow arguments they were duplicated above it for a standard SysV
+        # callee, so a fixed rbp offset would read the duplicates instead.
+        self.base = base
+        self.base_index = arg_num if stack_index is None else stack_index
+        if base is not None:
+            self.arg_reg = None
+            self.stack_spot = None
+        elif reg is not None:
             # Explicit register (used by the ABI-aware generation site, which
             # counts integer and floating arguments in separate sequences).
             self.arg_reg = reg
@@ -137,7 +147,7 @@ class LoadArg(ILCommand):
             self.stack_spot = None
 
     def inputs(self):
-        return []
+        return [self.base] if self.base is not None else []
 
     def outputs(self):
         return [self.output]
@@ -158,6 +168,25 @@ class LoadArg(ILCommand):
     def make_asm(self, spotmap, home_spots, get_reg, asm_code: "asm_gen.ASMCode"):
         dest = spotmap[self.output]
         size = self.output.ctype.size
+        if self.base is not None:
+            r = get_reg([], [])
+            asm_code.add(asm_cmds.Mov(r, spotmap[self.base], 8))
+            src = MemSpot(r, 8 * self.base_index)
+            if self.is_float:
+                from shivyc.spots import XMM0
+                fmov = asm_cmds.Movss if size == 4 else asm_cmds.Movsd
+                asm_code.add(fmov(XMM0, src, size))
+                asm_code.add(fmov(dest, XMM0, size))
+                return
+            if (self.output.ctype.is_struct_union()
+                    and size not in (1, 2, 4, 8)):
+                _store_chunked(dest, src, size, get_reg, asm_code)
+                return
+            # reuse the base register as the scratch: it is read before it is
+            # overwritten, so no second register is needed
+            asm_code.add(asm_cmds.Mov(r, src, size))
+            asm_code.add(asm_cmds.Mov(dest, r, size))
+            return
         src = self.arg_reg if self.arg_reg else self.stack_spot
         if dest == src:
             return
@@ -899,18 +928,18 @@ class ReadRel(_RelCommand):
         self.move_data(spotmap[self.output], rel_spot, out_size, reg, asm_code)
 
 
-class VaStartAddr(ILCommand):
-    """Compute the address of the first variadic argument.
+class VaSaveBase(ILCommand):
+    """Save the variadic argument-block base the caller passed in r11.
 
-    Variadic functions receive all arguments on the stack, so the first
-    variadic argument lives at [rbp + 16 + 8*named_count], where named_count
-    is the number of named parameters.
+    Emitted as the first command of every variadic function. r11 is
+    caller-saved, so its value is only meaningful at function entry; copying it
+    into an ordinary local keeps it available for va_start further down, past
+    any intervening calls.
     """
     output: "ILValue"
 
-    def __init__(self, output, named_count):
+    def __init__(self, output):
         self.output = output
-        self.named_count = named_count
 
     def inputs(self):
         return []
@@ -922,6 +951,46 @@ class VaStartAddr(ILCommand):
         return []
 
     def make_asm(self, spotmap, home_spots, get_reg, asm_code: "asm_gen.ASMCode"):
+        asm_code.add(asm_cmds.Mov(spotmap[self.output], spots.R11, 8))
+
+
+class VaStartAddr(ILCommand):
+    """Compute the address of the first variadic argument.
+
+    Variadic functions receive all arguments on the stack, so the first
+    variadic argument lives at [rbp + 16 + 8*named_count], where named_count
+    is the number of named parameters.
+    """
+    output: "ILValue"
+
+    def __init__(self, output, named_count, base=None):
+        self.output = output
+        self.named_count = named_count
+        self.base = base
+
+    def inputs(self):
+        return [self.base] if self.base is not None else []
+
+    def outputs(self):
+        return [self.output]
+
+    def clobber(self):
+        return []
+
+    def make_asm(self, spotmap, home_spots, get_reg, asm_code: "asm_gen.ASMCode"):
+        if self.base is not None:
+            # base points at the caller's argument block; skip the named
+            # parameters to reach the first variadic one
+            r = get_reg([], [])
+            asm_code.add(asm_cmds.Mov(r, spotmap[self.base], 8))
+            src = MemSpot(r, 8 * self.named_count)
+            dest = spotmap[self.output]
+            if isinstance(dest, RegSpot):
+                asm_code.add(asm_cmds.Lea(dest, src))
+            else:
+                asm_code.add(asm_cmds.Lea(r, src))
+                asm_code.add(asm_cmds.Mov(dest, r, 8))
+            return
         off = 16 + 8 * self.named_count
         src = MemSpot(spots.RBP, off)
         dest = spotmap[self.output]

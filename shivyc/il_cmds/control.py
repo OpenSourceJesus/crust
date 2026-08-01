@@ -452,6 +452,7 @@ class Call(ILCommand):
         int_moves, flt_moves, stack_args = [], [], []
         struct_reg_moves = []  # (list-of-regs, struct arg) for 9..16-byte args
         variadic_xmm_count = 0
+        variadic_dup_count = 0
         if self.pack:
             # Packed calling convention: arguments are bit-packed into the
             # registers named by the plan; nothing is passed on the stack and no
@@ -501,6 +502,7 @@ class Call(ILCommand):
             # [rsp] -- exactly where a standard callee looks for the first
             # overflow argument.
             stack_args = overflow_args + stack_args
+            variadic_dup_count = len(overflow_args)
             ii = fi = 0
             for arg in self.args:
                 if arg.ctype.is_struct_union() and arg.ctype.size > 8:
@@ -681,6 +683,15 @@ class Call(ILCommand):
         if self.variadic:
             asm_code.add(asm_cmds.Mov(spots.RAX,
                                       LiteralSpot(str(variadic_xmm_count)), 4))
+            # ShivyC's own variadic callees read every argument from the
+            # all-push block, whose base is *not* [rbp+16] when overflow
+            # arguments were duplicated on top for a standard SysV callee.
+            # Hand the base over in r11: the SysV ABI makes it scratch, so a
+            # glibc callee ignores it, while a ShivyC callee saves it in its
+            # prologue and va_start works off it. Without this, a call with
+            # more than five varargs shifted the callee's whole argument list.
+            asm_code.add(asm_cmds.Raw(
+                "lea r11, [rsp + %d]" % (8 * variadic_dup_count)))
         # Metamorphic call: the target returns via a self-modified slot in
         # writable .text rather than the stack. We write our return address
         # into that slot, then jump (not call) into the callee. No return
