@@ -226,7 +226,11 @@ def encode_rm(reg_field, rm, start):
         out.append(modrm(0, rf, 5))
         # disp32 follows the ModRM byte
         if rm.sym != "":
-            relocs.append(Reloc(start + 1, rm.sym, 4, True, rm.disp))
+            # PC-relative addend: the processor adds the disp32 to the address
+            # of the *next* instruction, so the addend must step back over the
+            # four displacement bytes (and, in _assemble, over any trailing
+            # immediate) to make S + A - P land on the symbol.
+            relocs.append(Reloc(start + 1, rm.sym, 4, True, rm.disp - 4))
             out.extend(pack_le(0, 4))
         else:
             out.extend(pack_le(rm.disp, 4))
@@ -340,6 +344,86 @@ _JCC = {
 # shift mnemonic -> ext (/N in 0xC1 /N ib, 0xD3 /N cl, 0xD1 /N by-1)
 _SHIFT = {"rol": 0, "ror": 1, "sal": 4, "shl": 4, "shr": 5, "sar": 7}
 
+# setcc (0F 90+tttn /0 r/m8) and cmovcc (0F 40+tttn /r) share the Jcc
+# condition nibbles; derive both tables from _JCC so they stay in sync.
+_SETCC = {}
+_CMOV = {}
+
+
+def _init_cond_tables():
+    for k in _JCC:
+        cond = k[1:]                 # "jne" -> "ne"
+        _SETCC["set" + cond] = _JCC[k]
+        _CMOV["cmov" + cond] = _JCC[k]
+    # gas also accepts the "not-equal-or" spellings below; map the common ones.
+    _SETCC["setnb"] = _JCC["jae"]
+    _SETCC["setna"] = _JCC["jbe"]
+    _SETCC["setnae"] = _JCC["jb"]
+    _SETCC["setnbe"] = _JCC["ja"]
+    _SETCC["setng"] = _JCC["jle"]
+    _SETCC["setnge"] = _JCC["jl"]
+    _SETCC["setnl"] = _JCC["jge"]
+    _SETCC["setnle"] = _JCC["jg"]
+    _SETCC["setc"] = _JCC["jb"]
+    _SETCC["setnc"] = _JCC["jae"]
+    _CMOV["cmovnb"] = _JCC["jae"]
+    _CMOV["cmovna"] = _JCC["jbe"]
+    _CMOV["cmovnae"] = _JCC["jb"]
+    _CMOV["cmovnbe"] = _JCC["ja"]
+    _CMOV["cmovng"] = _JCC["jle"]
+    _CMOV["cmovnge"] = _JCC["jl"]
+    _CMOV["cmovnl"] = _JCC["jge"]
+    _CMOV["cmovnle"] = _JCC["jg"]
+    _CMOV["cmovc"] = _JCC["jb"]
+    _CMOV["cmovnc"] = _JCC["jae"]
+
+
+_init_cond_tables()
+
+# Instructions with no operands: mnemonic -> fixed opcode bytes.
+_NULLARY = {
+    "ret": [0xC3],
+    "retq": [0xC3],
+    "leave": [0xC9],
+    "nop": [0x90],
+    "cqo": [0x48, 0x99],
+    "cdq": [0x99],
+    "cdqe": [0x48, 0x98],
+    "cwde": [0x98],
+    "syscall": [0x0F, 0x05],
+    "sysret": [0x0F, 0x07],
+    "hlt": [0xF4],
+    "int3": [0xCC],
+    "ud2": [0x0F, 0x0B],
+    "cld": [0xFC],
+    "std": [0xFD],
+    "cli": [0xFA],
+    "sti": [0xFB],
+    "pause": [0xF3, 0x90],
+    "rdtsc": [0x0F, 0x31],
+    "cpuid": [0x0F, 0xA2],
+    "endbr64": [0xF3, 0x0F, 0x1E, 0xFA],
+    "lfence": [0x0F, 0xAE, 0xE8],
+    "mfence": [0x0F, 0xAE, 0xF0],
+    "sfence": [0x0F, 0xAE, 0xF8],
+    "movsb": [0xA4],
+    "movsw": [0x66, 0xA5],
+    "movsl": [0xA5],
+    "movsq": [0x48, 0xA5],
+    "stosb": [0xAA],
+    "stosw": [0x66, 0xAB],
+    "stosl": [0xAB],
+    "stosq": [0x48, 0xAB],
+    "lodsb": [0xAC],
+    "lodsq": [0x48, 0xAD],
+    "scasb": [0xAE],
+    "cmpsb": [0xA6],
+}
+
+# Legacy prefixes that may precede a mnemonic ("rep movsb", "lock add ...").
+_PREFIX = {"rep": 0xF3, "repe": 0xF3, "repz": 0xF3, "repne": 0xF2,
+           "repnz": 0xF2, "lock": 0xF0}
+
 # SSE scalar arithmetic: mnem -> (mandatory prefix, 0F opcode). reg=dst(xmm),
 # rm=src; no REX.W (size implied by the prefix).
 _SSE_ARITH = {
@@ -396,22 +480,53 @@ def _assemble(size, rex, opcode_bytes, mrm, imm_bytes, rl, force=False):
     i = 0
     while i < len(rl):
         r = rl[i]
-        relocs.append(Reloc(r.where + pre, r.sym, r.size, r.pcrel, r.add))
+        add = r.add
+        if r.pcrel:
+            # any immediate sits between the displacement field and the end of
+            # the instruction, which the PC-relative addend must also skip
+            add -= len(imm_bytes)
+        relocs.append(Reloc(r.where + pre, r.sym, r.size, r.pcrel, add))
         i += 1
     return out, relocs
 
 
 def encode(mnem, ops):
-    if mnem == "ret":
-        return [0xC3], []
-    if mnem == "cqo":
-        return [0x48, 0x99], []
-    if mnem == "cdq":
-        return [0x99], []
-    if mnem == "leave":
-        return [0xC9], []
-    if mnem == "nop":
-        return [0x90], []
+    # legacy prefix ("rep movsb", "lock cmpxchg ..."): encode the rest of the
+    # instruction and prepend the prefix byte, shifting any relocation offsets.
+    sp = mnem.find(" ")
+    if sp > 0 and mnem[:sp] in _PREFIX:
+        body, rl = encode(mnem[sp + 1:].strip(), ops)
+        out = [_PREFIX[mnem[:sp]]]
+        out.extend(body)
+        shifted = []
+        i = 0
+        while i < len(rl):
+            r = rl[i]
+            shifted.append(Reloc(r.where + 1, r.sym, r.size, r.pcrel, r.add))
+            i += 1
+        return out, shifted
+
+    if mnem in _NULLARY:
+        return _NULLARY[mnem], []
+
+    if mnem == "int":
+        return [0xCD, ops[0].imm & 0xFF], []
+    if mnem in _SETCC:
+        return _encode_setcc(_SETCC[mnem], ops[0])
+    if mnem in _CMOV:
+        return _encode_cmov(_CMOV[mnem], ops[0], ops[1])
+    if mnem == "inc":
+        return _encode_incdec(ops[0], 0)
+    if mnem == "dec":
+        return _encode_incdec(ops[0], 1)
+    if mnem == "xchg":
+        return _encode_xchg(ops[0], ops[1])
+    if mnem == "bswap":
+        o = ops[0]
+        rex = REX_B if o.reg_v >= 8 else 0
+        return _assemble(o.size, rex, [0x0F, 0xC8 | (o.reg_v & 7)], [], [], [])
+    if mnem == "movabs":
+        return _encode_movabs(ops[0], ops[1])
 
     if mnem == "push":
         return _encode_pushpop(ops[0], True)
@@ -538,6 +653,19 @@ def _encode_mov(dst, src):
         rex, mrm, rl = encode_rm(dst.reg_v, src, 0)
         return _assemble(dst.size, rex, [opc], mrm, [], rl, f8)
     if src.kind == "imm":
+        if src.sym != "":
+            # `mov reg, symbol` -- the immediate is an address, so the field
+            # needs an absolute relocation rather than a literal value.
+            if dst.kind == "reg" and dst.size == 64:
+                rex, mrm, rl = encode_rm(0, dst, 0)
+                out, relocs = _assemble(64, rex, [0xC7], mrm, pack_le(0, 4), rl)
+                relocs.append(Reloc(len(out) - 4, src.sym, 4, False, src.imm))
+                return out, relocs
+            rex, mrm, rl = encode_rm(0, dst, 0)
+            out, relocs = _assemble(dst.size, rex, [0xC7], mrm,
+                                    pack_le(0, 4), rl, f8)
+            relocs.append(Reloc(len(out) - 4, src.sym, 4, False, src.imm))
+            return out, relocs
         if dst.kind == "reg":
             size = dst.size
             if size == 64:
@@ -682,6 +810,88 @@ def _encode_movx(dst, src, signed):
         opc2 = 0xBF if signed else 0xB7
     rex, mrm, rl = encode_rm(dst.reg_v, src, 0)
     return _assemble(dst.size, rex, [0x0F, opc2], mrm, [], rl, _needs_rex8(src))
+
+
+def _encode_setcc(tttn, o):
+    # 0F 90+tttn /0 r/m8
+    rex, mrm, rl = encode_rm(0, o, 0)
+    return _assemble(8, rex, [0x0F, 0x90 | tttn], mrm, [], rl, _needs_rex8(o))
+
+
+def _encode_cmov(tttn, dst, src):
+    # 0F 40+tttn /r  (16/32/64-bit only)
+    rex, mrm, rl = encode_rm(dst.reg_v, src, 0)
+    return _assemble(dst.size, rex, [0x0F, 0x40 | tttn], mrm, [], rl)
+
+
+def _encode_incdec(o, ext):
+    opc = 0xFE if o.size == 8 else 0xFF
+    rex, mrm, rl = encode_rm(ext, o, 0)
+    return _assemble(o.size, rex, [opc], mrm, [], rl, _needs_rex8(o))
+
+
+def _encode_xchg(a, b):
+    # gas prefers the one-byte accumulator form (90+r) when one operand is
+    # rAX/eAX and the other is a plain register.
+    if a.kind == "reg" and b.kind == "reg" and a.size == b.size:
+        other = -1
+        if a.reg_v == 0:
+            other = b.reg_v
+        elif b.reg_v == 0:
+            other = a.reg_v
+        if other > 0:
+            rex = REX_B if other >= 8 else 0
+            return _assemble(a.size, rex, [0x90 + (other & 7)], [], [], [])
+    # 87 /r (r/m, r). Prefer the register in ModRM.reg.
+    if b.kind == "reg":
+        rex, mrm, rl = encode_rm(b.reg_v, a, 0)
+        return _assemble(a.size, rex, [0x87], mrm, [], rl,
+                         _needs_rex8(a) or _needs_rex8(b))
+    rex, mrm, rl = encode_rm(a.reg_v, b, 0)
+    return _assemble(a.size, rex, [0x87], mrm, [], rl, False)
+
+
+def _encode_movabs(dst, src):
+    # REX.W B8+r io -- always the full 64-bit immediate form, so a symbol can
+    # be relocated as R_X86_64_64.
+    out = []
+    rex = REX_B if dst.reg_v >= 8 else 0
+    out.extend(emit_rex(rex, 64, False))
+    out.append(0xB8 + (dst.reg_v & 7))
+    where = len(out)
+    out.extend(pack_le(src.imm, 8))
+    if src.sym != "":
+        return out, [Reloc(where, src.sym, 8, False, src.imm)]
+    return out, []
+
+
+# --------------------------------------------------------------------------
+# Short (rel8) branch forms, used by the driver's relaxation pass
+# --------------------------------------------------------------------------
+# The default encoders always emit rel32 so that any target -- including an
+# undefined external symbol -- is encodable. When the driver can prove a branch
+# reaches within +/-127 bytes it re-encodes it with these two-byte forms.
+
+def encode_jmp_short(o):
+    return [0xEB, 0x00], [Reloc(1, o.sym, 1, True, o.disp - 1)]
+
+
+def encode_jcc_short(tttn, o):
+    return [0x70 | tttn, 0x00], [Reloc(1, o.sym, 1, True, o.disp - 1)]
+
+
+# Branch classification for the driver: returns (kind, tttn) where kind is
+# "jmp", "jcc", "call" or "" (not a relaxable branch).
+def branch_kind(mnem, ops):
+    if len(ops) != 1 or ops[0].kind != "imm" or ops[0].sym == "":
+        return ("", 0)
+    if mnem == "jmp":
+        return ("jmp", 0)
+    if mnem == "call":
+        return ("call", 0)
+    if mnem in _JCC:
+        return ("jcc", _JCC[mnem])
+    return ("", 0)
 
 
 # --------------------------------------------------------------------------
@@ -919,7 +1129,12 @@ def _sse(prefix, opc, reg_op, rm_op, w):
     i = 0
     while i < len(rl):
         r = rl[i]
-        relocs.append(Reloc(r.where + pre, r.sym, r.size, r.pcrel, r.add))
+        add = r.add
+        if r.pcrel:
+            # any immediate sits between the displacement field and the end of
+            # the instruction, which the PC-relative addend must also skip
+            add -= len(imm_bytes)
+        relocs.append(Reloc(r.where + pre, r.sym, r.size, r.pcrel, add))
         i += 1
     return out, relocs
 
@@ -956,3 +1171,232 @@ def _encode_movd(dst, src):
     if dst.size == 128:
         return _sse(0x66, 0x6E, dst, src, False)      # xmm <- r/m32
     return _sse(0x66, 0x7E, src, dst, False)          # r/m32 <- xmm
+
+
+# --------------------------------------------------------------------------
+# AT&T-syntax parser
+# --------------------------------------------------------------------------
+# ShivyCX emits Intel syntax, but hand-written inline asm (and anything copied
+# from gcc output) is AT&T: `%reg` operands, `$imm` immediates, `disp(base,
+# index,scale)` memory, operands in the opposite order, and the operand size
+# carried by a mnemonic suffix instead of a `SIZE PTR` prefix. This front end
+# normalises such a line into the same (mnem, [Operand]) form the Intel parser
+# produces, so the encoder itself is shared.
+
+_ATT_SUFFIX = {"b": 8, "w": 16, "l": 32, "q": 64}
+
+# Mnemonics that take a b/w/l/q size suffix in AT&T syntax.
+_ATT_SIZED = {
+    "mov": True, "add": True, "sub": True, "and": True, "or": True,
+    "xor": True, "cmp": True, "test": True, "push": True, "pop": True,
+    "inc": True, "dec": True, "neg": True, "not": True, "mul": True,
+    "imul": True, "div": True, "idiv": True, "lea": True, "xchg": True,
+    "shl": True, "shr": True, "sar": True, "sal": True, "rol": True,
+    "ror": True, "call": True, "jmp": True, "movabs": True,
+}
+
+# AT&T spellings of the sign/zero-extending moves, mapped to the Intel
+# mnemonic the encoder knows plus (src bits, dst bits).
+_ATT_MOVX = {
+    "movsbw": ("movsx", 8, 16), "movsbl": ("movsx", 8, 32),
+    "movsbq": ("movsx", 8, 64), "movswl": ("movsx", 16, 32),
+    "movswq": ("movsx", 16, 64), "movslq": ("movsxd", 32, 64),
+    "movzbw": ("movzx", 8, 16), "movzbl": ("movzx", 8, 32),
+    "movzbq": ("movzx", 8, 64), "movzwl": ("movzx", 16, 32),
+    "movzwq": ("movzx", 16, 64),
+}
+
+_ATT_ALIAS = {
+    "cltq": "cdqe", "cqto": "cqo", "cltd": "cdq", "cwtl": "cwde",
+    "retq": "ret", "leaveq": "leave",
+}
+
+
+def _att_strip_comment(line):
+    out = ""
+    i = 0
+    while i < len(line):
+        c = line[i]
+        if c == "#":
+            break
+        if c == "/" and line[i + 1:i + 2] == "/":
+            break
+        out += c
+        i += 1
+    return out
+
+
+def _att_symbolic_imm(body):
+    """`sym`, `sym+8`, `sym-4` -> (symbol, addend)."""
+    plus = body.find("+")
+    minus = body.find("-", 1)
+    if plus > 0:
+        return (body[:plus], _parse_int(body[plus + 1:]))
+    if minus > 0:
+        return (body[:minus], -_parse_int(body[minus + 1:]))
+    return (body, 0)
+
+
+def parse_att_operand(text, size, is_branch):
+    t = text.strip()
+    if t == "":
+        raise AssemblerError("empty AT&T operand")
+    if t[0:1] == "*":                      # indirect call/jmp: *%rax, *(%rax)
+        return parse_att_operand(t[1:], size, False)
+    if t[0:1] == "$":                      # immediate
+        body = t[1:]
+        if _looks_int(body):
+            return op_imm(_parse_int(body))
+        o = Operand()
+        o.kind = "imm"
+        pair = _att_symbolic_imm(body)
+        o.sym = pair[0]
+        o.imm = pair[1]
+        return o
+    if t[0:1] == "%":                      # register
+        return op_reg(t[1:])
+    lp = t.find("(")
+    if lp >= 0:                            # disp(base,index,scale)
+        rp = t.rfind(")")
+        head = t[:lp].strip()
+        inner = t[lp + 1:rp]
+        base = MEM_NONE
+        index = MEM_NONE
+        scale = 1
+        rip = False
+        parts = inner.split(",")
+        if len(parts) > 0 and parts[0].strip() != "":
+            rname = parts[0].strip()
+            if rname[0:1] == "%":
+                rname = rname[1:]
+            if rname == "rip":
+                rip = True
+            else:
+                base = reg_val(rname)
+        if len(parts) > 1 and parts[1].strip() != "":
+            iname = parts[1].strip()
+            if iname[0:1] == "%":
+                iname = iname[1:]
+            index = reg_val(iname)
+        if len(parts) > 2 and parts[2].strip() != "":
+            scale = _parse_int(parts[2].strip())
+        disp = 0
+        sym = ""
+        if head != "":
+            if _looks_int(head):
+                disp = _parse_int(head)
+            else:
+                pair = _att_symbolic_imm(head)
+                sym = pair[0]
+                disp = pair[1]
+        return op_mem(size, base, index, scale, disp, sym, rip)
+    if is_branch:                          # bare label target
+        o = Operand()
+        o.kind = "imm"
+        o.sym = t
+        o.imm = 0
+        return o
+    if _looks_int(t):                      # absolute address
+        return op_mem(size, MEM_NONE, MEM_NONE, 1, _parse_int(t), "", False)
+    pair = _att_symbolic_imm(t)            # bare symbol = absolute memory ref
+    return op_mem(size, MEM_NONE, MEM_NONE, 1, pair[1], pair[0], False)
+
+
+def _att_split_ops(rest):
+    """Split on commas that are not inside parentheses."""
+    out = []
+    cur = ""
+    depth = 0
+    i = 0
+    while i < len(rest):
+        c = rest[i]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        if c == "," and depth == 0:
+            out.append(cur)
+            cur = ""
+        else:
+            cur += c
+        i += 1
+    if cur.strip() != "":
+        out.append(cur)
+    return out
+
+
+def parse_att_line(raw):
+    """Same contract as parse_line, for AT&T-syntax input."""
+    line = _att_strip_comment(raw).strip()
+    if line == "":
+        return ("blank", "", None)
+    if line[0:1] == ".":
+        return ("dir", line, None)
+    if line.endswith(":"):
+        return ("label", line[:-1], None)
+    sp = line.find(" ")
+    tab = line.find("\t")
+    cut = sp
+    if tab >= 0 and (tab < sp or sp < 0):
+        cut = tab
+    if cut < 0:
+        mnem = line
+        rest = ""
+    else:
+        mnem = line[:cut]
+        rest = line[cut:].strip()
+
+    if mnem in _ATT_ALIAS:
+        mnem = _ATT_ALIAS[mnem]
+    if mnem in _PREFIX and rest != "":
+        sub = parse_att_line(rest)
+        if sub[0] != "insn":
+            raise AssemblerError("bad prefixed instruction: %s" % line)
+        return ("insn", mnem + " " + sub[1], sub[2])
+    if mnem in _NULLARY and rest == "":
+        return ("insn", mnem, [])
+
+    # sign/zero-extending moves carry both operand sizes in the mnemonic
+    if mnem in _ATT_MOVX:
+        spec = _ATT_MOVX[mnem]
+        parts = _att_split_ops(rest)
+        src = parse_att_operand(parts[0], spec[1], False)
+        dst = parse_att_operand(parts[1], spec[2], False)
+        return ("insn", spec[0], [dst, src])
+
+    size = 0
+    base = mnem
+    if len(mnem) > 2 and mnem[-1:] in _ATT_SUFFIX and (
+            mnem[:-1] in _ATT_SIZED or mnem[:-1] in _CMOV):
+        size = _ATT_SUFFIX[mnem[-1:]]
+        base = mnem[:-1]
+    is_branch = (base == "jmp" or base == "call" or base in _JCC)
+    if is_branch and rest[0:1] == "*":
+        is_branch = False
+
+    ops = []
+    parts = _att_split_ops(rest)
+    i = 0
+    while i < len(parts):
+        p = parts[i].strip()
+        if p != "":
+            ops.append(parse_att_operand(p, size, is_branch))
+        i += 1
+    ops.reverse()                          # AT&T is src,dst; Intel is dst,src
+    if base == "mov":
+        # `movq %xmm0, %rax` is the SSE move, not a suffixed general `mov`.
+        xmm = False
+        i = 0
+        while i < len(ops):
+            if ops[i].kind == "reg" and ops[i].size == 128:
+                xmm = True
+            i += 1
+        if xmm:
+            base = "movq" if size == 64 else "movd"
+    # an untyped memory operand paired with a register takes the register size
+    if size == 0 and len(ops) == 2:
+        if ops[0].kind == "mem" and ops[1].kind == "reg":
+            ops[0].size = ops[1].size
+        elif ops[1].kind == "mem" and ops[0].kind == "reg":
+            ops[1].size = ops[0].size
+    return ("insn", base, ops)
