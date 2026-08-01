@@ -85,7 +85,7 @@ class Section(object):
         while i < len(relocs):
             r = relocs[i]
             f.relocs.append(rasm.Reloc(base + r.where, r.sym, r.size,
-                                       r.pcrel, r.add))
+                                       r.pcrel, r.add, r.signed))
             i += 1
 
     def emit_branch(self, bkind, tttn, sym, add):
@@ -207,12 +207,158 @@ def _split_quoted(rest):
     return out
 
 
+# --------------------------------------------------------------------------
+# Expression evaluation
+# --------------------------------------------------------------------------
+# gas lets a data directive or `.set` hold arithmetic over absolute values and
+# symbols: `-(MB_MAGIC + MB_FLAGS)`, `(1 << 16)`, `gdt64_ptr - gdt64 - 1`. A
+# small recursive-descent parser covers the operators that appear in boot code.
+# Expressions over *labels* cannot be folded until layout has assigned
+# addresses, so those are recorded as fixups and evaluated in finalize().
+
+class ExprError(Exception):
+    pass
+
+
+class _ExprParser(object):
+    def __init__(self, text, lookup):
+        self.t = text
+        self.i = 0
+        self.lookup = lookup       # name -> int, raises ExprError if unknown
+
+    def _skip(self):
+        while self.i < len(self.t) and self.t[self.i] == " ":
+            self.i += 1
+
+    def parse(self):
+        v = self._shift()
+        self._skip()
+        if self.i < len(self.t):
+            raise ExprError("trailing text in expression: %s" % self.t)
+        return v
+
+    def _shift(self):
+        v = self._add()
+        while True:
+            self._skip()
+            if self.t[self.i:self.i + 2] == "<<":
+                self.i += 2
+                v = v << self._add()
+            elif self.t[self.i:self.i + 2] == ">>":
+                self.i += 2
+                v = v >> self._add()
+            else:
+                return v
+
+    def _add(self):
+        v = self._mul()
+        while True:
+            self._skip()
+            c = self.t[self.i:self.i + 1]
+            if c == "+":
+                self.i += 1
+                v = v + self._mul()
+            elif c == "-":
+                self.i += 1
+                v = v - self._mul()
+            else:
+                return v
+
+    def _mul(self):
+        v = self._unary()
+        while True:
+            self._skip()
+            c = self.t[self.i:self.i + 1]
+            if c == "*":
+                self.i += 1
+                v = v * self._unary()
+            elif c == "/":
+                self.i += 1
+                d = self._unary()
+                v = v // d if d != 0 else 0
+            else:
+                return v
+
+    def _unary(self):
+        self._skip()
+        c = self.t[self.i:self.i + 1]
+        if c == "-":
+            self.i += 1
+            return -self._unary()
+        if c == "+":
+            self.i += 1
+            return self._unary()
+        if c == "~":
+            self.i += 1
+            return ~self._unary()
+        return self._atom()
+
+    def _atom(self):
+        self._skip()
+        if self.t[self.i:self.i + 1] == "(":
+            self.i += 1
+            v = self._shift()
+            self._skip()
+            if self.t[self.i:self.i + 1] != ")":
+                raise ExprError("unbalanced parenthesis")
+            self.i += 1
+            return v
+        start = self.i
+        while self.i < len(self.t):
+            c = self.t[self.i]
+            if (("0" <= c <= "9") or ("a" <= c <= "z") or ("A" <= c <= "Z")
+                    or c == "_" or c == "." or c == "$"):
+                self.i += 1
+            else:
+                break
+        tok = self.t[start:self.i]
+        if tok == "":
+            raise ExprError("expected a value in %r" % self.t)
+        if rasm._looks_int(tok):
+            return rasm._parse_int(tok)
+        return self.lookup(tok)
+
+
+def eval_expr(text, lookup):
+    return _ExprParser(text.strip(), lookup).parse()
+
+
+def _strip_block_comments(text):
+    """Remove /* ... */ comments, keeping newlines so line numbers survive.
+
+    gas accepts C block comments, and hand-written .S files lean on them for
+    the long explanations that make boot code readable.
+    """
+    out = ""
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] == "/" and text[i + 1:i + 2] == "*":
+            i += 2
+            while i < n and not (text[i] == "*" and text[i + 1:i + 2] == "/"):
+                if text[i] == "\n":
+                    out += "\n"
+                i += 1
+            i += 2
+            continue
+        out += text[i]
+        i += 1
+    return out
+
+
 class Assembler(object):
     def __init__(self):
         self.sections = {}
         self.order = []
         self.symbols = {}
-        self.att_mode = False
+        # gas assembles AT&T syntax unless told otherwise, and hand-written .S
+        # files rely on that. ShivyCX output opens with `.intel_syntax noprefix`
+        # and so switches on its first line.
+        self.att_mode = True
+        self.equates = {}          # .set / .equ absolute constants
+        self.fixups = []           # (section, offset, width, expr) after layout
+        self.local_seq = {}        # numeric local label -> times defined
+        self.mode = 64
         self._get_section(".text")
         self._get_section(".data")
         self._get_section(".bss")
@@ -231,8 +377,45 @@ class Assembler(object):
         return self.symbols[name]
 
     # -- entry point ------------------------------------------------------
+    def _const(self, name):
+        """Look a name up as an absolute constant (for expression folding)."""
+        if name in self.equates:
+            return self.equates[name]
+        raise ExprError("not an absolute value: %s" % name)
+
+    def _label_value(self, name):
+        """Look a name up as a laid-out label address."""
+        if name in self.equates:
+            return self.equates[name]
+        s = self.symbols.get(name, None)
+        if s is None or not s.defined:
+            raise ExprError("undefined symbol in expression: %s" % name)
+        return s.value
+
+    # -- numeric local labels ("1:" defined, "1b"/"1f" referenced) --------
+    def _local_def(self, n):
+        k = self.local_seq.get(n, 0) + 1
+        self.local_seq[n] = k
+        return ".L%s__%d" % (n, k)
+
+    def _local_ref(self, tok):
+        n = tok[:-1]
+        d = tok[-1:]
+        k = self.local_seq.get(n, 0)
+        if d == "f":
+            k += 1
+        return ".L%s__%d" % (n, k)
+
+    def _is_local_ref(self, tok):
+        if len(tok) < 2:
+            return False
+        if tok[-1:] != "b" and tok[-1:] != "f":
+            return False
+        return rasm._looks_int(tok[:-1])
+
     def assemble(self, text):
-        lines = text.split("\n")
+        rasm.set_mode(64)
+        lines = _strip_block_comments(text).split("\n")
         i = 0
         while i < len(lines):
             self._line(lines[i])
@@ -241,6 +424,20 @@ class Assembler(object):
         self.finalize()
 
     def _line(self, raw):
+        # gas allows a label to share its line with what follows
+        # (`gdt_ptr: .quad 0`, `1: mov %ecx,%eax`), so split one off first.
+        head, rest = self._split_label(raw)
+        if head is not None:
+            name = head
+            if rasm._looks_int(name):
+                name = self._local_def(name)
+            sym = self._sym(name)
+            sym.section = self.cur.name
+            sym.defined = True
+            self.cur.mark_label(name)
+            if rest.strip() != "":
+                self._line(rest)
+            return
         if self.att_mode:
             triple = rasm.parse_att_line(raw)
         else:
@@ -251,6 +448,8 @@ class Assembler(object):
         if kind == "blank":
             return
         if kind == "label":
+            if rasm._looks_int(a):
+                a = self._local_def(a)
             sym = self._sym(a)
             sym.section = self.cur.name
             sym.defined = True
@@ -259,6 +458,21 @@ class Assembler(object):
         if kind == "dir":
             self._directive(a)
             return
+        # substitute `.set` constants and numeric local-label references
+        # before anything looks at the operands
+        j = 0
+        while j < len(ops):
+            o = ops[j]
+            if o.sym != "":
+                if self._is_local_ref(o.sym):
+                    o.sym = self._local_ref(o.sym)
+                elif o.sym in self.equates:
+                    if o.kind == "imm":
+                        o.imm = self.equates[o.sym]
+                    else:
+                        o.disp += self.equates[o.sym]
+                    o.sym = ""
+            j += 1
         # instruction: relaxable branches become their own fragment
         bk = rasm.branch_kind(a, ops)
         if bk[0] == "jmp" or bk[0] == "jcc":
@@ -267,10 +481,42 @@ class Assembler(object):
         body, relocs = rasm.encode(a, ops)
         self.cur.emit_with_relocs(body, relocs)
 
+    def _split_label(self, raw):
+        """Return (label, remainder) if the line starts with `name:`."""
+        line = raw.strip()
+        if line == "" or line[0:1] == "#":
+            return (None, "")
+        i = 0
+        while i < len(line):
+            c = line[i]
+            if c == ":":
+                break
+            if not (("0" <= c <= "9") or ("a" <= c <= "z")
+                    or ("A" <= c <= "Z") or c == "_" or c == "." or c == "$"):
+                return (None, "")
+            i += 1
+        if i == 0 or i >= len(line) or line[i] != ":":
+            return (None, "")
+        if line[i + 1:i + 2] == ":":          # C++-style `label::` global
+            return (line[:i], line[i + 2:])
+        return (line[:i], line[i + 1:])
+
     # -- directives -------------------------------------------------------
     def _directive(self, line):
         parts = line.split()
         d = parts[0]
+        if d == ".code64" or d == ".code32" or d == ".code16":
+            bits = int(d[5:])
+            self.mode = bits
+            rasm.set_mode(bits)
+            return
+        if d == ".set" or d == ".equ":
+            rest = line[len(d):].strip()
+            comma = rest.find(",")
+            if comma > 0:
+                nm = rest[:comma].strip()
+                self.equates[nm] = eval_expr(rest[comma + 1:], self._const)
+            return
         if d == ".intel_syntax":
             self.att_mode = False
             return
@@ -355,6 +601,16 @@ class Assembler(object):
             if v != "":
                 if rasm._looks_int(v):
                     self.cur.emit(rasm.pack_le(rasm._parse_int(v), width))
+                elif self._expr_like(v):
+                    # arithmetic over constants folds now; anything involving a
+                    # label has to wait for layout, so record a fixup
+                    try:
+                        self.cur.emit(rasm.pack_le(
+                            eval_expr(v, self._const), width))
+                    except ExprError:
+                        off = self.cur_offset_marker()
+                        self.cur.emit(rasm.pack_le(0, width))
+                        self.fixups.append((self.cur, off, width, v))
                 else:
                     # a symbol reference in data -> absolute relocation
                     sym = v
@@ -365,8 +621,27 @@ class Assembler(object):
                         add = rasm._parse_int(v[plus + 1:])
                     self.cur.emit_with_relocs(
                         rasm.pack_le(0, width),
-                        [rasm.Reloc(0, sym, width, False, add)])
+                        [rasm.Reloc(0, sym, width, False, add, False)])
             k += 1
+
+    def _expr_like(self, v):
+        """True when `v` is arithmetic rather than a bare symbol reference."""
+        i = 0
+        while i < len(v):
+            c = v[i]
+            if c in "+-*/<>()~" and not (c == "+" and i > 0
+                                         and v[i - 1:i] != " "):
+                return True
+            i += 1
+        return False
+
+    def cur_offset_marker(self):
+        """A (fragment index, offset-in-fragment) marker for a pending fixup."""
+        f = self.cur.frags[-1] if len(self.cur.frags) > 0 else None
+        if f is None or f.kind != FRAG_BYTES:
+            f = Frag(FRAG_BYTES)
+            self.cur.frags.append(f)
+        return (len(self.cur.frags) - 1, len(f.data))
 
     # -- layout + relaxation ---------------------------------------------
     def _layout_once(self, sec):
@@ -466,14 +741,31 @@ class Assembler(object):
                 while j < len(rl):
                     r = rl[j]
                     relocs.append(rasm.Reloc(base + r.where, r.sym, r.size,
-                                             r.pcrel, r.add))
+                                             r.pcrel, r.add, r.signed))
                     j += 1
                 i += 1
             sec.data = data
             sec.relocs = relocs
             if not sec.nobits:
                 sec.size = len(data)
+        self._apply_fixups()
         self._resolve()
+
+    def _apply_fixups(self):
+        """Evaluate label expressions (e.g. `gdt_ptr - gdt - 1`) now that every
+        label has an address."""
+        for fx in self.fixups:
+            sec = fx[0]
+            marker = fx[1]
+            width = fx[2]
+            expr = fx[3]
+            value = eval_expr(expr, self._label_value)
+            off = sec.frags[marker[0]].offset + marker[1]
+            patch = rasm.pack_le(value, width)
+            k = 0
+            while k < width:
+                sec.data[off + k] = patch[k]
+                k += 1
 
     def _encode_branch(self, f):
         o = rasm.Operand()
@@ -584,7 +876,7 @@ def _reloc_type(r):
         return R_X86_64_PC32
     if r.size == 8:
         return R_X86_64_64
-    return R_X86_64_32S
+    return R_X86_64_32S if r.signed else R_X86_64_32
 
 
 def _sec_flags(name):
