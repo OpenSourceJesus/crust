@@ -602,6 +602,15 @@ class Linker(object):
         off = 0
         for nm in names:
             sym = self.commons[nm]
+            # ELF rule: a real definition beats a tentative one. If some object
+            # actually defined this symbol, the common is discarded rather than
+            # allocated -- otherwise we would shadow the definition with fresh
+            # zeroed .bss (e.g. rlibc's `char **environ;` versus the real slot
+            # rcrt.s defines and _start writes).
+            existing = self.globals.get(nm, None)
+            if existing is not None and existing.shndx != SHN_COMMON \
+                    and existing.section is not None:
+                continue
             a = sym.value if sym.value > 0 else 8
             if a > 1 and off % a != 0:
                 off += a - (off % a)

@@ -30,9 +30,17 @@ import rlink
 REPO = os.path.dirname(os.path.dirname(HERE))
 SHIVYC_MAIN = os.path.join(REPO, "shivyc", "main.py")
 RCRT = os.path.join(HERE, "rcrt.s")
+RLIBC = os.path.join(HERE, "rlibc.c")
 
 # Programs use only what the freestanding runtime provides.
 RUNTIME_DECLS = """
+int printf(const char *fmt, ...);
+int snprintf(char *b, unsigned long n, const char *fmt, ...);
+int strcmp(const char *a, const char *b);
+char *strstr(const char *h, const char *n);
+long strtol(const char *s, char **e, int base);
+int toupper(int c);
+int memcmp(const void *a, const void *b, unsigned long n);
 int puts(const char *s);
 int putchar(int c);
 void putint(long n);
@@ -43,6 +51,25 @@ unsigned long strlen(const char *s);
 """
 
 PROGRAMS = {
+    "printf_formats": """
+int main(){
+  printf("%s %d %x %05d %c %ld %%\\n", "fmt", 42, 48879, 7, 65, -1234567890123L);
+  char b[64];
+  snprintf(b, 64, "%s=%d", "k", 99);
+  puts(b);
+  return (int)strlen(b);
+}
+""",
+    "libc_string": """
+int main(){
+  putint((long)strcmp("abc", "abc")); putchar(10);
+  putint((long)(strstr("hello world", "wor") != 0)); putchar(10);
+  putint(strtol("  -1234", 0, 10)); putchar(10);
+  putint((long)toupper('q')); putchar(10);
+  putint((long)memcmp("ab", "ab", 2)); putchar(10);
+  return 0;
+}
+""",
     "exit_code": """
 int main(){ return 42; }
 """,
@@ -193,10 +220,26 @@ def link_with_rlink(objs, exe, entry="_start"):
     os.chmod(exe, 0o755)
 
 
+def build_rlibc(work):
+    """Compile the C half of the runtime with ShivyCX + rasm."""
+    obj = os.path.join(work, "rlibc.o")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = REPO
+    env["SHIVYC_RASM"] = "1"
+    env.pop("SHIVYC_RLINK", None)
+    r = run([sys.executable, "-m", "shivyc.main", "-c", RLIBC, "-o", obj],
+            cwd=REPO, env=env)
+    if not os.path.exists(obj):
+        raise RuntimeError("could not build rlibc.o: %s"
+                           % r.stderr.decode()[:200])
+    return obj
+
+
 def main():
     work = tempfile.mkdtemp(prefix="rlink_test_")
     crt_obj = os.path.join(work, "rcrt.o")
     assemble_with_rasm(RCRT, crt_obj)
+    libc_obj = build_rlibc(work)
 
     passed = 0
     failed = 0
@@ -219,7 +262,7 @@ def main():
         exe = os.path.join(work, name)
         try:
             assemble_with_rasm(asm, obj)
-            link_with_rlink([crt_obj, obj], exe)
+            link_with_rlink([crt_obj, libc_obj, obj], exe)
         except Exception as e:
             print("  FAIL  %-18s %s" % (name, e))
             failed += 1
@@ -248,7 +291,7 @@ def main():
         obj = os.path.join(work, "arch.o")
         exe = os.path.join(work, "arch")
         assemble_with_rasm(asm, obj)
-        link_with_rlink([obj, lib], exe)
+        link_with_rlink([obj, libc_obj, lib], exe)
         got = run([exe])
         ref = build_reference("arch", csrc, work)
         if ref is not None and got.returncode == ref[0] \
@@ -284,7 +327,7 @@ int main(void){
         if r.returncode != 0:
             raise RuntimeError(r.stderr.decode()[:200])
         exe = os.path.join(work, "interop")
-        link_with_rlink([crt_obj, obj], exe)
+        link_with_rlink([crt_obj, libc_obj, obj], exe)
         got = run([exe])
         if got.returncode == 36 and b"gcc object linked by rlink" in got.stdout:
             print("  ok    gcc object              exit=%d" % got.returncode)

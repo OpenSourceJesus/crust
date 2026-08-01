@@ -25,13 +25,23 @@
 .global memset
 .global memcpy
 .global sbrk
-.global malloc
+.global environ
+.global rsyscall1
+.global rsyscall3
+.global setjmp
+.global longjmp
+.global _setjmp
+.global _longjmp
 
 .text
 
 _start:
     mov rdi, QWORD PTR [rsp]            // argc
     lea rsi, QWORD PTR [rsp+8]          // argv
+    // envp follows argv and its NULL terminator: rsp + 8 + 8*(argc+1)
+    lea rdx, QWORD PTR [rdi+1]
+    lea rdx, QWORD PTR [rsi+rdx*8]
+    mov QWORD PTR [rip+environ], rdx
     and rsp, -16                        // ABI: 16-byte aligned before a call
     call main
     mov edi, eax
@@ -162,7 +172,8 @@ memcpy_done:
 // void *sbrk(long increment) -- SYS_brk(12) based
 sbrk:
     push rbx
-    mov rbx, rdi
+    push r12                            // r12 is callee-saved: the caller's
+    mov rbx, rdi                        // value must survive this call
     mov rax, QWORD PTR [rip+brk_cur]
     cmp rax, 0
     jne sbrk_have
@@ -181,18 +192,67 @@ sbrk_have:
     jl sbrk_fail
     mov QWORD PTR [rip+brk_cur], rax
     mov rax, r12
+    pop r12
     pop rbx
     ret
 sbrk_fail:
     mov rax, -1
+    pop r12
     pop rbx
     ret
 
-// void *malloc(unsigned long n) -- bump allocator, never freed
-malloc:
-    add rdi, 15
-    and rdi, -16
-    call sbrk
+// int setjmp(jmp_buf b) / void longjmp(jmp_buf b, int val)
+// The buffer holds the six callee-saved registers, the stack pointer as it
+// will be after `ret`, and the return address. longjmp restores them and jumps
+// straight back, so control resumes inside setjmp's caller with the given
+// value (never zero -- that is reserved for the original call).
+setjmp:
+_setjmp:
+    mov QWORD PTR [rdi], rbx
+    mov QWORD PTR [rdi+8], rbp
+    mov QWORD PTR [rdi+16], r12
+    mov QWORD PTR [rdi+24], r13
+    mov QWORD PTR [rdi+32], r14
+    mov QWORD PTR [rdi+40], r15
+    lea rax, QWORD PTR [rsp+8]
+    mov QWORD PTR [rdi+48], rax
+    mov rax, QWORD PTR [rsp]
+    mov QWORD PTR [rdi+56], rax
+    xor eax, eax
+    ret
+
+longjmp:
+_longjmp:
+    mov rbx, QWORD PTR [rdi]
+    mov rbp, QWORD PTR [rdi+8]
+    mov r12, QWORD PTR [rdi+16]
+    mov r13, QWORD PTR [rdi+24]
+    mov r14, QWORD PTR [rdi+32]
+    mov r15, QWORD PTR [rdi+40]
+    mov rsp, QWORD PTR [rdi+48]
+    mov eax, esi
+    cmp eax, 0
+    jne longjmp_go
+    mov eax, 1
+longjmp_go:
+    jmp QWORD PTR [rdi+56]
+
+// long rsyscall1(long n, long a)  /  long rsyscall3(long n, long a, long b, long c)
+// Generic escape hatches so the C runtime can reach syscalls that do not
+// deserve their own stub. The syscall number arrives in rdi, so shuffle the
+// arguments down into the kernel's argument registers first.
+rsyscall1:
+    mov rax, rdi
+    mov rdi, rsi
+    syscall
+    ret
+
+rsyscall3:
+    mov rax, rdi
+    mov rdi, rsi
+    mov rsi, rdx
+    mov rdx, rcx
+    syscall
     ret
 
 .data
@@ -201,6 +261,8 @@ nl:
 chbuf:
     .byte 0
 brk_cur:
+    .quad 0
+environ:
     .quad 0
 
 .bss
