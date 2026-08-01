@@ -2369,3 +2369,92 @@ The fourth executor first runs `build_rpy_ast.py --check`: if `rpy_ast.py` has d
 unavailable the fourth executor is **skipped**, not failed, so the test still runs in
 environments without a compiler. This makes the compiled parser a first-class, continuously
 checked executor: any py2c regression or source drift that changes a parse tree is caught.
+
+## Status update — rast.py parses the whole self-hosting path; float correctness
+
+Two pieces of work, found by measuring rather than by porting: `rast.py` was
+already much closer to complete than the plan assumed, and the gaps that
+remained were narrow. Fixing them exposed two float bugs that would have made
+a byte-identical self-hosted compile impossible.
+
+### rast.py now parses every file in the self-hosting path
+
+Before: `rast.py` already parsed `tools/py2c.py` in full (15,678 lines, ~50s
+under CPython), but failed on `tools/minipy/interp.py`. Three grammar gaps were
+responsible, all now closed:
+
+| gap | symptom | fix |
+|---|---|---|
+| `NUMBER` accepted only decimal and hex integers | any float constant failed, which is why `interp.py` did not parse | seven alternatives capturing the token as text, one `_numval()` action |
+| `ann_assign` required a bare `NAME` target | `self.op: "int(8)" = v` failed — the pattern `interp.py`'s `Instr` uses | target is now `trailed_atom` (name, attribute, subscript) |
+| `lambdef` used `parameters`, which permits `: annotation` | `lambda x: x` failed; only the zero-argument form worked, because the greedy optional ate the colon and the body | a separate annotation-free `lambda_parameters`, mirroring CPython's `varargslist` vs `typedargslist` |
+
+`_numval` uses `float(s)` for floats and hand-rolled digit accumulation for
+non-decimal integers. That split is forced: minipy's `float(str)` agrees with
+CPython exactly, but `int(s, base)` ignores its base argument — the same reason
+the older `_hexval` helper exists. Reconstructing floats from parts would lose
+mantissa bits, so they go to `float()`.
+
+Now parsing: `rast.py`, `interp.py`, `compiler.py`, `mpyc.py`, `rasm.py`,
+`rasm_obj.py`, `rlink.py`, `py2c.py`. **The `python3` shellout for an AST is no
+longer structurally required.**
+
+### Float repr and round-tripping
+
+The north star is `minipy py2c.py x.py` producing byte-identical C to CPython.
+Float constants pass through that pipeline, so repr and parse must both be
+exact. Neither was.
+
+**`str(float)` was `%g` — six significant digits.** In `py2c.py`'s runtime,
+`pystr` formatted `T_FLOAT` with `sprintf(b, "%g", ...)`:
+
+| value | CPython | minipy native (before) |
+|---|---|---|
+| `3.141592653589793` | `3.141592653589793` | `3.14159` |
+| `1.0000000000000002` | `1.0000000000000002` | `1` |
+| `123456789012345.0` | `123456789012345.0` | `1.23457e+14` |
+
+`1.0000000000000002` collapsing to `1` is a value change, not a formatting
+nit. Replaced with `fmt_double()`, which implements CPython's algorithm:
+shortest decimal that round-trips through `strtod`, then fixed or exponential
+by the decimal exponent (`-4 <= exp < 16` → fixed, with at least one decimal
+place so integral values keep their `.0`). Both halves are needed —
+shortest-round-trip alone renders `15000000000.0` as `1.5e+10`.
+
+**`float(str)` accumulated error.** `_str_to_float` in `interp.py` scaled the
+exponent with a loop of `p = p * 10.0`; across 308 iterations that turned
+`1e308` into `9.999999999999998e+307`. The comment on that loop claimed the
+values would "round-trip exactly", which is exactly what they did not do. It
+now delegates to `float(s)`, which is `strtod` natively and CPython's converter
+under the reference VM.
+
+**`_fmt_float` shortcut removed.** It special-cased integral doubles as
+`str(int(d)) + ".0"`. Wrong twice: `int(d)` is a 32-bit C `int` in the compiled
+interpreter, so anything past 2^31 overflowed into the `%g` path, and
+`int(-0.0)` is `0`, so negative zero came back as `"0.0"`.
+
+`tools/minipy/test_float_repr.py` pins all of this three ways, on values chosen
+to sit on the boundaries: where CPython switches notation (1e15/1e16,
+1e-4/1e-5), where 17 significant digits are needed, at both ends of the double
+range including a denormal, and at negative zero.
+
+### Cache-invalidation bug in `tools/rpy.py`
+
+`_ensure_native()` keyed the cached native interpreter on the md5 of
+`interp.py` alone. But the binary also depends on `py2c.py`, which is both the
+compiler and the source of the linked C runtime — so the `%g` fix above kept
+silently serving the stale binary. The key now folds in `py2c.py` too. Worth
+knowing when a runtime change appears to have no effect.
+
+### Known limitation, not on the critical path
+
+`v_pow()` returns `0.0` for a float or negative exponent — an explicit v0 stub,
+so `2.0 ** 0.5` is wrong. It does not block self-hosting: nothing in `py2c.py`,
+`rasm.py`, `rasm_obj.py`, `rlink.py` or `rast.py` uses `**` with anything but a
+non-negative integer exponent. Fixing it wants a real `pow()` (exp/log).
+
+### What is not yet established
+
+Parsing is the front half. `rast.py` parsing `py2c.py` in ~50s says nothing
+about how long that takes under minipy-native, and nothing at all about
+*executing* `py2c.py` under minipy, which has not been attempted.
