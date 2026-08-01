@@ -639,6 +639,34 @@ benchmarks_rpython:
 # toolchain, or a harness that needs the self-hosted native compiler -- should
 # cost that section rather than the whole document. `make benchmarks_rpython`
 # remains strict, so a regression there is still caught by its own target.
+# Fast turnaround for iterating on the compiler: the same report, built from
+# reduced measurements. Roughly 3 minutes against 8 for the full target.
+#
+# Three things make up the difference. The crust suite skips `memory`, whose
+# ShivyCX compile alone is ~115s -- over 80% of that suite -- because its
+# `[u64; 512]` arrays push the register allocator's interference graph past
+# 8000 nodes and the coalescing pass is quadratic in that. The rpython suite
+# runs every benchmark at a fraction of its workload rather than dropping any,
+# so every backend comparison stays intact. And the feature suite is left out
+# entirely, being the slowest step that contributes no timing data.
+#
+# The figures label themselves as a quick run. Use `make benchmarks_report`
+# for numbers worth quoting.
+benchmarks_report_fast:
+	-python3 benchmarks/run_rpython_benchmarks.py --quick
+	-python3 benchmarks/run_minipy_benchmarks.py
+	-python3 benchmarks/plot_rpython.py $(BENCH_PLOT_DIR)
+	-python3 benchmarks/plot_minipy.py $(BENCH_PLOT_DIR)
+	-python3 benchmarks/run_crust_benchmarks.py --quick
+	-python3 benchmarks/plot_crust.py $(BENCH_PLOT_DIR)
+	@command -v pdflatex >/dev/null 2>&1 || { \
+		echo "pdflatex not found; figures are in $(BENCH_PLOT_DIR)."; \
+		exit 0; }
+	cp tools/benchmarks.tex tools/crust.tex $(BENCH_PLOT_DIR)/
+	cd $(BENCH_PLOT_DIR) && pdflatex -interaction=nonstopmode benchmarks.tex >/dev/null 2>&1 \
+		&& pdflatex -interaction=nonstopmode benchmarks.tex >/dev/null 2>&1
+	@echo "Benchmark report (QUICK): $(BENCH_PLOT_DIR)/benchmarks.pdf"
+
 benchmarks_report:
 	-python3 benchmarks/run_rpython_benchmarks.py
 	-python3 benchmarks/run_minipy_benchmarks.py
