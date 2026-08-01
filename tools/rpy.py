@@ -447,7 +447,9 @@ def main(argv=None):
     vm.run()
     if interactive:
         _repl(prog, vm)
-    return 0
+    # An unhandled SystemExit sets exit_status; propagate it so `sys.exit(n)`
+    # in the guest means the same thing as it does under CPython.
+    return getattr(vm, "exit_status", 0)
 
 
 if __name__ == "__main__":
