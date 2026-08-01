@@ -1352,6 +1352,59 @@ def link_objs(binary_name, obj_names, writable_text=False, low_mem=False,
     """
     import os
 
+    if os.environ.get("SHIVYC_RLINK"):
+        # Self-hosted path: link with our own rlink instead of GNU ld. The
+        # result is a static, freestanding ET_EXEC -- no crt files, no dynamic
+        # loader, no libc -- so the runtime comes from tools/rpy_lib/rcrt.s
+        # (assembled by rasm) rather than from the system. Combined with
+        # SHIVYC_RASM this makes the whole compile->assemble->link chain ours.
+        try:
+            _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            _rlib = os.path.join(_root, "tools", "rpy_lib")
+            if _rlib not in sys.path:
+                sys.path.insert(0, _rlib)
+            import rasm_obj as _rasm_obj
+            import rlink as _rlink
+
+            _ln = _rlink.Linker()
+            _ln.entry_name = os.environ.get("SHIVYC_ENTRY", "_start")
+
+            # the freestanding runtime, assembled on the fly by rasm
+            if not os.environ.get("SHIVYC_NO_RCRT"):
+                _crt_s = os.path.join(_rlib, "rcrt.s")
+                with open(_crt_s) as _f:
+                    _crt = _rasm_obj.assemble_to_elf(_f.read())
+                _ln.add_object(_crt_s, list(_crt))
+
+            for _o in obj_names:
+                with open(_o, "rb") as _f:
+                    _data = list(_f.read())
+                if _rlink._is_archive(_data):
+                    _ln.add_archive(_o, _data)
+                else:
+                    _ln.add_object(_o, _data)
+            for _lib in (libs or []):
+                _found = None
+                for _d in (lib_dirs or []):
+                    _cand = os.path.join(_d, "lib" + _lib + ".a")
+                    if os.path.exists(_cand):
+                        _found = _cand
+                        break
+                if _found:
+                    with open(_found, "rb") as _f:
+                        _ln.add_archive(_found, list(_f.read()))
+
+            _image = _ln.link()
+            with open(binary_name, "wb") as _f:
+                _f.write(bytes(bytearray(_image)))
+            os.chmod(binary_name, 0o755)
+            for _w in _ln.warnings:
+                sys.stderr.write("rlink: warning: %s\n" % _w)
+            return True
+        except Exception as _e:
+            error_collector.add(CompilerError("rlink failed: %s" % _e))
+            return False
+
     crtnum = find_crtnum()
     if not crtnum:
         return False
