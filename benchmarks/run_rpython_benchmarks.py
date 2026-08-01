@@ -28,6 +28,7 @@ Results -> benchmarks/results/rpython_results.json.
 import json
 import os
 import resource
+import signal
 import shutil
 import subprocess
 import sys
@@ -47,6 +48,10 @@ os.environ["PYTHONPATH"] = (
     TOOLS + os.pathsep + os.environ.get("PYTHONPATH", "")).rstrip(os.pathsep)
 
 REPS = 5                      # best-of-N for runtime
+# No step should ever hang the whole report. A wedged compiler or a benchmark
+# that fails to terminate is killed and reported, not waited on forever.
+COMPILE_TIMEOUT = int(os.environ.get("BENCH_COMPILE_TIMEOUT", "300"))
+RUN_TIMEOUT = int(os.environ.get("BENCH_RUN_TIMEOUT", "300"))
 DEVNULL = open(os.devnull, "wb")
 
 # A tiny C helper measures a child's exact peak RSS. We must NOT fork from this
@@ -100,11 +105,24 @@ def _run_measured(argv, mem_probe, reps=REPS):
     exit_code = None
     for _ in range(reps):
         t0 = time.perf_counter()
-        p = subprocess.run(argv, stdout=DEVNULL, stderr=DEVNULL)
+        try:
+            p = subprocess.run(argv, stdout=DEVNULL, stderr=DEVNULL,
+                               timeout=RUN_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            print("  TIMEOUT after %ds: %s" % (RUN_TIMEOUT, " ".join(argv)))
+            return (time.perf_counter() - t0), 0, None
         best = min(best, time.perf_counter() - t0)
         exit_code = p.returncode
-    mp = subprocess.run([mem_probe] + argv,
-                        stdout=DEVNULL, stderr=subprocess.PIPE)
+        if exit_code < 0:
+            print("  died on signal %d (%s): %s"
+                  % (-exit_code, signal.Signals(-exit_code).name,
+                     " ".join(argv)))
+            break
+    try:
+        mp = subprocess.run([mem_probe] + argv, stdout=DEVNULL,
+                            stderr=subprocess.PIPE, timeout=RUN_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return best, 0, exit_code
     try:
         rss_kb = int(mp.stderr.strip().splitlines()[-1])
     except (ValueError, IndexError):
@@ -112,22 +130,46 @@ def _run_measured(argv, mem_probe, reps=REPS):
     return best, rss_kb, exit_code
 
 
-def _compile_timed(argv, out_binary):
+def _describe(p, out_binary):
+    """Human-readable reason a compile failed. A process killed by a signal
+    writes nothing to the pipe, so the raw stdout is empty and the caller would
+    otherwise print `FAILED:` followed by a blank line -- which is exactly what
+    a SIGSEGV in the compiler looked like."""
+    log = p.stdout.decode("utf-8", "replace") if p.stdout else ""
+    if p.returncode < 0:
+        signame = signal.Signals(-p.returncode).name
+        note = "compiler died on signal %d (%s)" % (-p.returncode, signame)
+        return (note + "\n" + log) if log.strip() else note
+    if p.returncode != 0:
+        return log if log.strip() else ("exited %d with no output"
+                                        % p.returncode)
+    if not os.path.exists(out_binary):
+        return log if log.strip() else ("exited 0 but produced no %s"
+                                        % os.path.basename(out_binary))
+    return log
+
+
+def _compile_timed(argv, out_binary, timeout=COMPILE_TIMEOUT):
     """Run a compiler command, returning (seconds, ok). Best-of-3 so a cold
-    cache / scheduler hiccup does not dominate."""
+    cache / scheduler hiccup does not dominate. A hung compiler is killed
+    rather than hanging the whole run."""
     best = float("inf")
     ok = False
     for _ in range(3):
         if os.path.exists(out_binary):
             os.remove(out_binary)
         t0 = time.perf_counter()
-        p = subprocess.run(argv, stdout=subprocess.PIPE,
-                           stderr=subprocess.STDOUT)
+        try:
+            p = subprocess.run(argv, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return (time.perf_counter() - t0), False, \
+                "compiler timed out after %ds: %s" % (timeout, " ".join(argv))
         dt = time.perf_counter() - t0
         best = min(best, dt)
         ok = (p.returncode == 0 and os.path.exists(out_binary))
         if not ok:
-            return best, False, p.stdout.decode("utf-8", "replace")
+            return best, False, _describe(p, out_binary)
     return best, ok, ""
 
 
@@ -148,10 +190,16 @@ def ensure_native(build_dir=None):
     inc = os.path.join(build_dir, "include")
     if not os.path.exists(native):
         print("Building self-hosted native compiler (one-time, ~2-3 min) ...")
-        p = subprocess.run(
-            [sys.executable, os.path.join(TOOLS, "selfhost.py"),
-             "compiler", "--build-dir", build_dir],
-            cwd=REPO)
+        try:
+            p = subprocess.run(
+                [sys.executable, os.path.join(TOOLS, "selfhost.py"),
+                 "compiler", "--build-dir", build_dir],
+                cwd=REPO, timeout=COMPILE_TIMEOUT * 4)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(
+                "building shivyc_native timed out; a stale partial build in "
+                "%s will be reused on the next run because only its existence "
+                "is checked -- remove that directory and retry" % build_dir)
         if p.returncode != 0 or not os.path.exists(native):
             raise RuntimeError("could not build shivyc_native")
     return native, inc
