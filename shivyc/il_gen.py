@@ -510,6 +510,8 @@ class Context:
         # Number of named parameters of the enclosing variadic function, or
         # None when not inside a variadic function. Used by va_start.
         self.vararg_named = None
+        # ILValue holding the base of the caller's variadic argument block.
+        self.vararg_base = None
         # Per-function map of goto label name -> IL label (shared by reference
         # across context copies within a function body).
         self.labels = None
@@ -540,6 +542,13 @@ class Context:
         """Return copy of self with the enclosing switch collector set."""
         c = copy(self)
         c.switch = switch
+        return c
+
+    def set_vararg_base(self, value):
+        """Return a copy with the variadic argument-block base recorded."""
+        import copy
+        c = copy.copy(self)
+        c.vararg_base = value
         return c
 
     def set_vararg_named(self, n):
