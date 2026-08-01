@@ -601,6 +601,9 @@ class Assembler(object):
             if v != "":
                 if rasm._looks_int(v):
                     self.cur.emit(rasm.pack_le(rasm._parse_int(v), width))
+                elif v in self.equates:
+                    # a bare `.set` constant, e.g. `.long MB_MAGIC`
+                    self.cur.emit(rasm.pack_le(self.equates[v], width))
                 elif self._expr_like(v):
                     # arithmetic over constants folds now; anything involving a
                     # label has to wait for layout, so record a fixup

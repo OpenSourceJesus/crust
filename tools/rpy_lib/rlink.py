@@ -457,6 +457,177 @@ def _order_key(name):
     return len(_ORDER)
 
 
+# --------------------------------------------------------------------------
+# Linker scripts
+# --------------------------------------------------------------------------
+# A bare-metal image cannot use the default layout: the Multiboot header has to
+# land in the first 8 KiB, everything sits at a fixed physical address, and the
+# boot code needs `_load_start` / `_load_end` / `_bss_end` to describe itself to
+# the loader. All of that lives in a linker script, so rlink understands the
+# subset those scripts actually use:
+#
+#     ENTRY(sym)
+#     SECTIONS {
+#         . = 0x00100000;
+#         _load_start = .;
+#         .text : { *(.multiboot) *(.text) *(.text.*) }
+#         _load_end = .;
+#         /DISCARD/ : { *(.comment) *(.note.*) }
+#     }
+#
+# Not supported: MEMORY regions, overlays, AT> load addresses, arithmetic beyond
+# a bare number or `.`, and ALIGN(). Those raise rather than being ignored, so a
+# script that needs them fails loudly instead of producing a subtly wrong image.
+
+SCMD_SETDOT = 0      # . = <value>
+SCMD_ASSIGN = 1      # name = .
+SCMD_SECTION = 2     # .name : { *(pat) ... }
+SCMD_DISCARD = 3     # /DISCARD/ : { *(pat) ... }
+
+
+class ScriptCmd(object):
+    def __init__(self, kind):
+        self.kind = kind
+        self.name = ""
+        self.value = 0
+        self.patterns = []
+        self.align = 0
+
+
+class Script(object):
+    def __init__(self):
+        self.entry = ""
+        self.cmds = []
+        self.discard = []
+
+
+def _script_tokens(text):
+    """Tokenise a script: strip comments, then split on whitespace and the
+    punctuation that matters."""
+    out = ""
+    i = 0
+    while i < len(text):
+        if text[i] == "/" and text[i + 1:i + 2] == "*":
+            i += 2
+            while i < len(text) and not (text[i] == "*"
+                                         and text[i + 1:i + 2] == "/"):
+                i += 1
+            i += 2
+            continue
+        c = text[i]
+        if c in "{}();=,":
+            out += " " + c + " "
+        elif c == "\n" or c == "\t" or c == "\r":
+            out += " "
+        else:
+            out += c
+        i += 1
+    return [t for t in out.split(" ") if t != ""]
+
+
+def parse_script(text):
+    toks = _script_tokens(text)
+    sc = Script()
+    i = 0
+    n = len(toks)
+    while i < n:
+        t = toks[i]
+        if t == "ENTRY":
+            sc.entry = toks[i + 2]
+            i += 4                      # ENTRY ( name )
+            continue
+        if t == "SECTIONS":
+            i += 2                      # SECTIONS {
+            while i < n and toks[i] != "}":
+                i = _parse_section_item(sc, toks, i)
+            i += 1
+            continue
+        if t == "OUTPUT_FORMAT" or t == "OUTPUT_ARCH":
+            while i < n and toks[i] != ")":
+                i += 1
+            i += 1
+            continue
+        i += 1
+    return sc
+
+
+def _parse_section_item(sc, toks, i):
+    t = toks[i]
+    if t == ".":                        # . = <value> ;
+        if toks[i + 1] != "=":
+            raise LinkError("unsupported script syntax near `.`")
+        cmd = ScriptCmd(SCMD_SETDOT)
+        cmd.value = _script_number(toks[i + 2])
+        sc.cmds.append(cmd)
+        return i + 3
+    if i + 1 < len(toks) and toks[i + 1] == "=":
+        # name = . ;   (a PROVIDE-style symbol at the current address)
+        if toks[i + 2] != ".":
+            raise LinkError("only `sym = .` assignments are supported, got "
+                            "`%s = %s`" % (t, toks[i + 2]))
+        cmd = ScriptCmd(SCMD_ASSIGN)
+        cmd.name = t
+        sc.cmds.append(cmd)
+        return i + 3
+    if t == ";":
+        return i + 1
+    # an output section: NAME : { *(pat) ... }
+    name = t
+    j = i + 1
+    while j < len(toks) and toks[j] != "{":
+        j += 1
+    j += 1
+    pats = []
+    while j < len(toks) and toks[j] != "}":
+        tok = toks[j]
+        if tok == "*" and toks[j + 1:j + 2] == ["("]:
+            # `*(.text .text.*)` -- every input section matching any of these
+            j += 2
+            while j < len(toks) and toks[j] != ")":
+                if toks[j] != ",":
+                    pats.append(toks[j])
+                j += 1
+        j += 1
+    j += 1
+    if name == "/DISCARD/":
+        sc.discard.extend(pats)
+    else:
+        cmd = ScriptCmd(SCMD_SECTION)
+        cmd.name = name
+        cmd.patterns = pats
+        sc.cmds.append(cmd)
+    return j
+
+
+def _script_number(tok):
+    t = tok
+    if t.endswith(";"):
+        t = t[:-1]
+    if t[0:2] == "0x" or t[0:2] == "0X":
+        return int(t[2:], 16)
+    if t.endswith("M"):
+        return int(t[:-1]) * 1024 * 1024
+    if t.endswith("K"):
+        return int(t[:-1]) * 1024
+    return int(t)
+
+
+def _pattern_match(pat, name):
+    """Glob matching for the `*(.text.*)` forms scripts use."""
+    if pat == name:
+        return True
+    star = pat.find("*")
+    if star < 0:
+        return False
+    head = pat[:star]
+    tail = pat[star + 1:]
+    if not name.startswith(head):
+        return False
+    if tail == "":
+        return True
+    return name.endswith(tail) and len(name) >= len(head) + len(tail)
+
+
 class Linker(object):
     def __init__(self):
         self.objects = []           # list[ObjFile] actually linked in
@@ -471,6 +642,8 @@ class Linker(object):
         self.entry = 0
         self.got_entries = {}       # symbol name -> offset in .got
         self.got_order = []
+        self.script = None          # Script, when -T was given
+        self.script_syms = {}       # name -> address, from `sym = .`
         self.warnings = []
 
     # -- inputs -----------------------------------------------------------
@@ -559,6 +732,8 @@ class Linker(object):
         return s
 
     def collect_sections(self):
+        if self.script is not None:
+            return self._collect_scripted()
         for obj in self.objects:
             for sec in obj.sections:
                 if not sec.keep or sec.name == "":
@@ -583,6 +758,99 @@ class Linker(object):
                     allnobits = False
             out.nobits = allnobits and len(out.inputs) > 0
         self.out_sections.sort(key=_order_sort_key)
+
+    def _collect_scripted(self):
+        """Group input sections the way the script says, in its order.
+
+        Order matters here in a way it does not for a hosted program: the
+        Multiboot header must be the first thing in the image, so `*(.multiboot)`
+        leading `.text` is load-bearing, not cosmetic.
+        """
+        taken = {}
+        for cmd in self.script.cmds:
+            if cmd.kind != SCMD_SECTION:
+                continue
+            out = self._get_out(cmd.name)
+            for pat in cmd.patterns:
+                if pat == "COMMON":
+                    continue          # commons are added by allocate_commons
+                for obj in self.objects:
+                    for sec in obj.sections:
+                        if not sec.keep or sec.name == "":
+                            continue
+                        key = "%s\x00%s" % (obj.name, sec.index)
+                        if key in taken:
+                            continue
+                        if not _pattern_match(pat, sec.name):
+                            continue
+                        if (sec.flags & SHF_TLS) != 0:
+                            raise LinkError("%s: thread-local storage is not "
+                                            "supported" % sec.name)
+                        taken[key] = True
+                        out.inputs.append(sec)
+                        sec.out = cmd.name
+                        if sec.align > out.align:
+                            out.align = sec.align
+                        out.flags |= sec.flags
+        # anything the script did not mention, and did not discard, is dropped
+        for obj in self.objects:
+            for sec in obj.sections:
+                if not sec.keep or sec.out != "":
+                    continue
+                sec.keep = False
+        for out in self.out_sections:
+            allnobits = True
+            for sec in out.inputs:
+                if sec.type != SHT_NOBITS:
+                    allnobits = False
+            out.nobits = allnobits and len(out.inputs) > 0
+
+    def _script_layout(self):
+        """Walk the script, placing sections and defining `sym = .` symbols.
+
+        Sections are packed tightly (the `-n` / nmagic behaviour bare-metal
+        images want): no page alignment between them, because the loader is a
+        flat copy, not mmap.
+        """
+        dot = self.base
+        file_off = PAGE          # contents start on a page so p_offset ~ p_vaddr
+        first_addr = -1
+        for cmd in self.script.cmds:
+            if cmd.kind == SCMD_SETDOT:
+                dot = cmd.value
+                continue
+            if cmd.kind == SCMD_ASSIGN:
+                self.script_syms[cmd.name] = dot
+                continue
+            out = self.out_by_name.get(cmd.name, None)
+            if out is None:
+                continue
+            if out.align > 1 and dot % out.align != 0:
+                pad = out.align - (dot % out.align)
+                dot += pad
+                if not out.nobits:
+                    file_off += pad
+            if first_addr < 0 and not out.nobits:
+                first_addr = dot
+                self.first_file_off = file_off
+            dot, file_off = self._place(out, dot, file_off)
+        self.base = first_addr if first_addr >= 0 else self.base
+        self.image_end = dot
+        self.image_file_end = file_off
+        # one loadable segment covering the whole image
+        self.exec_secs = []
+        self.rw_secs = []
+        for cmd in self.script.cmds:
+            if cmd.kind != SCMD_SECTION:
+                continue
+            out = self.out_by_name.get(cmd.name, None)
+            if out is not None:
+                self.exec_secs.append(out)
+        self.text_end = dot
+        self.text_file_end = file_off
+        self.data_end = dot
+        self.data_file_end = file_off
+        self.nphdr = 1
 
     def allocate_commons(self):
         """Tentative (SHN_COMMON) definitions get storage in .bss."""
@@ -629,6 +897,8 @@ class Linker(object):
     def layout(self):
         """Assign virtual addresses. Two PT_LOAD segments: RX then RW, each
         page-aligned so the kernel can map them with distinct protections."""
+        if self.script is not None:
+            return self._script_layout()
         # reserve room for the ELF header + program headers at the image base
         # (the classic trick: the first segment maps from file offset 0).
         self.nphdr = 3
@@ -697,6 +967,9 @@ class Linker(object):
                 elif sym.shndx == SHN_ABS:
                     sym.addr = sym.value
                     sym.resolved = True
+        # symbols the script defined with `sym = .`
+        for nm in sorted(self.script_syms.keys()):
+            self._provide_forced(nm, self.script_syms[nm])
         # linker-defined symbols a freestanding runtime expects
         self._provide("__executable_start", self.base)
         self._provide("__etext", self.text_end)
@@ -710,6 +983,18 @@ class Linker(object):
             self._provide("_edata", self.data_end)
         self._provide("_end", self.data_end)
         self._provide("end", self.data_end)
+
+    def _provide_forced(self, name, value):
+        """Define `name` unconditionally -- a script assignment wins."""
+        sym = InSymbol(name)
+        sym.bind = STB_GLOBAL
+        sym.shndx = SHN_ABS
+        sym.value = value
+        sym.addr = value
+        sym.resolved = True
+        self.globals[name] = sym
+        if name in self.undefined:
+            del self.undefined[name]
 
     def _provide(self, name, value):
         """Define `name` only if some object referenced it and nothing else
@@ -943,6 +1228,47 @@ class Linker(object):
             if rw_filesz < 0:
                 rw_filesz = 0
         phdrs = []
+        if self.script is not None:
+            # Script-driven (bare-metal) image: one tightly packed loadable
+            # segment. The ELF header and program headers are not part of it --
+            # the image starts at the script's address, and a Multiboot loader
+            # copies it there flat.
+            phdrs.append({"type": PT_LOAD, "flags": PF_R | PF_W | PF_X,
+                          "off": self.first_file_off, "vaddr": self.base,
+                          "filesz": self.image_file_end - self.first_file_off,
+                          "memsz": self.image_end - self.base, "align": PAGE})
+            shoff, shnum, shstrndx, tail = self._build_sheaders(len(out))
+            out.extend(tail)
+            hdr = []
+            hdr.extend([0x7F, ord('E'), ord('L'), ord('F'), 2, 1, 1, 0])
+            hdr.extend([0, 0, 0, 0, 0, 0, 0, 0])
+            hdr.extend(pack(ET_EXEC, 2))
+            hdr.extend(pack(EM_X86_64, 2))
+            hdr.extend(pack(1, 4))
+            hdr.extend(pack(self.entry, 8))
+            hdr.extend(pack(64, 8))
+            hdr.extend(pack(shoff, 8))
+            hdr.extend(pack(0, 4))
+            hdr.extend(pack(64, 2))
+            hdr.extend(pack(56, 2))
+            hdr.extend(pack(len(phdrs), 2))
+            hdr.extend(pack(64, 2))
+            hdr.extend(pack(shnum, 2))
+            hdr.extend(pack(shstrndx, 2))
+            for p in phdrs:
+                hdr.extend(pack(p["type"], 4))
+                hdr.extend(pack(p["flags"], 4))
+                hdr.extend(pack(p["off"], 8))
+                hdr.extend(pack(p["vaddr"], 8))
+                hdr.extend(pack(p["vaddr"], 8))
+                hdr.extend(pack(p["filesz"], 8))
+                hdr.extend(pack(p["memsz"], 8))
+                hdr.extend(pack(p["align"], 8))
+            i = 0
+            while i < len(hdr):
+                out[i] = hdr[i]
+                i += 1
+            return out
         phdrs.append({"type": PT_LOAD, "flags": PF_R | PF_X, "off": 0,
                       "vaddr": self.base, "filesz": text_filesz,
                       "memsz": text_memsz, "align": PAGE})
@@ -1185,6 +1511,7 @@ def main(argv):
     lib_dirs = []
     libs = []
     inputs = []
+    script = None
     i = 1
     while i < len(argv):
         a = argv[i]
@@ -1205,6 +1532,17 @@ def main(argv):
             libs.append(a[2:] if len(a) > 2 else argv[i + 1])
             if len(a) == 2:
                 i += 1
+        elif a == "-T" or a == "--script":
+            i += 1
+            f = open(argv[i])
+            script_text = f.read()
+            f.close()
+            script = parse_script(script_text)
+        elif a[0:2] == "-T" and len(a) > 2:
+            f = open(a[2:])
+            script_text = f.read()
+            f.close()
+            script = parse_script(script_text)
         elif a == "-static" or a == "-n" or a == "--no-dynamic-linker":
             pass                       # static is the only mode rlink has
         elif a[0:1] == "-":
@@ -1216,6 +1554,10 @@ def main(argv):
     ln = Linker()
     ln.entry_name = entry
     ln.base = base
+    if script is not None:
+        ln.script = script
+        if script.entry != "" and entry == "_start":
+            ln.entry_name = script.entry
     for path in inputs:
         data = _read_bytes(path)
         if _is_archive(data):
