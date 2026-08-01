@@ -32,12 +32,19 @@ RESULTS_DIR = os.path.join(HERE, "results")
 REPS = 5
 
 
-def _shivyc(src, out, extra=None):
+def _shivyc(src, out, extra=None, quiet=False):
     cmd = [sys.executable, "-m", "shivyc.main", "--no-cache", src, "-o", out]
     if extra:
         cmd[4:4] = extra
     p = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True)
-    return p.returncode, p.stdout + p.stderr
+    log = p.stdout + p.stderr
+    # Most callers ignore the return code and go straight to reading the .s
+    # this was meant to produce. Surface the failure here, or the first symptom
+    # is an unrelated FileNotFoundError several lines later.
+    if not quiet and (p.returncode != 0 or not os.path.exists(out)):
+        sys.stderr.write("shivyc failed on %s:\n%s\n"
+                         % (os.path.basename(src), log.strip()[:600]))
+    return p.returncode, log
 
 
 def _gcc(src, out, opt="-O0"):
@@ -97,7 +104,17 @@ def _time_best(binary, reps=REPS, args=None):
 
 
 def _read_asm(src):
-    with open(src[:-2] + ".s") as f:
+    """Assembly ShivyCX left beside `src`, or "" if the compile did not get far
+    enough to emit any. Returning "" degrades the affected metric instead of
+    aborting the whole suite -- one kernel that fails to compile should not
+    cost us results.json and every figure built from it."""
+    path = src[:-2] + ".s"
+    if not os.path.exists(path):
+        sys.stderr.write("no assembly at %s (compile failed?); "
+                         "metrics for it will be reported as unavailable\n"
+                         % os.path.basename(path))
+        return ""
+    with open(path) as f:
         return f.read()
 
 
@@ -213,6 +230,27 @@ def bench_contracts():
     return {"benchmark": "contracts_simd", "configs": _finish(cfgs)}
 
 
+# Runtime helpers py2c may emit for a kernel that is otherwise runtime-free.
+# Floor semantics, matching pymod/pyfdiv in the py2c runtime: Python rounds
+# toward negative infinity where C truncates toward zero.
+_MINI_RT = {
+    "pymod": (
+        "static long pymod(long a, long b) {\n"
+        "    if (b == 0) return 0;\n"
+        "    long r = a % b;\n"
+        "    if (r != 0 && ((r < 0) != (b < 0))) r += b;\n"
+        "    return r;\n"
+        "}\n"),
+    "pyfdiv": (
+        "static long pyfdiv(long a, long b) {\n"
+        "    if (b == 0) return 0;\n"
+        "    long q = a / b;\n"
+        "    if ((a % b != 0) && ((a < 0) != (b < 0))) q -= 1;\n"
+        "    return q;\n"
+        "}\n"),
+}
+
+
 def _py2c(py_src, out_c):
     """Transpile an rpython .py to C via tools/py2c.py and post-process it the
     way shivyc.main's .py path does: drop the unused runtime include (these
@@ -229,7 +267,17 @@ def _py2c(py_src, out_c):
         return None
     code = open(cpath).read()
     code = re.sub(r'#include "shivyc_rt\.h"\n', "", code)
-    code = "void *malloc(unsigned long);\nint atoi(const char *);\n" + code
+    prelude = "void *malloc(unsigned long);\nint atoi(const char *);\n"
+    # These kernels are meant to be runtime-free, but py2c lowers a few Python
+    # operators to runtime helpers regardless -- `int(x) % 250` becomes
+    # pymod(). Dropping the runtime header then left those undeclared and the
+    # compile failed. Supply a local definition of each helper the generated
+    # code actually references (semantics copied from the py2c runtime) so the
+    # source stays self-contained.
+    for name, defn in _MINI_RT.items():
+        if re.search(r"\b" + name + r"\s*\(", code):
+            prelude += defn
+    code = prelude + code
     with open(out_c, "w") as f:
         f.write(code)
     return out_c
@@ -501,7 +549,8 @@ def bench_memory_safety():
     rows = []
     for name, kind, desc in cases:
         src = os.path.join(mem, name + ".c")
-        rc, log = _shivyc(src, "/tmp/_ms", ["--check-memory"])
+        # A refusal to compile is the expected outcome for these cases.
+        rc, log = _shivyc(src, "/tmp/_ms", ["--check-memory"], quiet=True)
         if kind == "auto-free":
             shivy = "auto-free candidate" in log
         else:
