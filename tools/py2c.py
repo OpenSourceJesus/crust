@@ -216,6 +216,7 @@ typedef struct TypeInfoHdr {
     const FieldDesc* fields;
     obj (*tostr)(Obj*);
     bool (*eq)(Obj*, obj);
+    obj (*addfn)(Obj*, obj);  /* user __add__, or NULL */
     unsigned long objsize;   /* sizeof the concrete struct; for shallow copy */
 } TypeInfoHdr;
 
@@ -292,6 +293,7 @@ bool obj_eq(obj a, obj b);         /* == on Tier-2 values                     */
 bool pycontains(obj container, obj v);  /* v in container                     */
 bool in_str(str needle, const str* hay, int n);  /* x in ("a","b",...)        */
 void pyprint(obj v);               /* print(x)                                */
+void pyprint_a(obj* a, int n);     /* print(x, y, ...) -- space separated      */
 
 /* exceptions: try/except lowers to setjmp on g_exc_jmp; raise -> rt_raise. */
 extern jmp_buf g_exc_jmp[];
@@ -1355,6 +1357,16 @@ bool pycontains(obj container, obj v) {
     return false;
 }
 void pyprint(obj v) { printf("%s\n", pystr(v)); }
+/* print with several arguments: CPython joins them with a single space and
+   ends with a newline. Array-based (like pyfmt_a) rather than varargs so the
+   self-hosted front end can compile it. */
+void pyprint_a(obj* a, int n) {
+    for (int i = 0; i < n; i++) {
+        if (i) putchar(' ');
+        printf("%s", pystr(a[i]));
+    }
+    putchar('\n');
+}
 
 /* ---- dicts ---- */
 obj dict_new(void) {
@@ -1477,6 +1489,14 @@ static long as_num(obj v) { return (v.tag == T_INT || v.tag == T_BOOL) ? v.u.i :
 double as_dbl(obj v) { return v.tag == T_FLOAT ? v.u.d : (double)as_num(v); }
 
 obj obj_add(obj a, obj b) {
+    /* Honor a user-defined __add__ (populated into the type's `addfn` slot).
+       Without this a `Position + 1` fell through to the numeric path below,
+       which reinterprets the object pointer as an integer via as_num and
+       returns a T_INT that crashes when the caller casts it back. */
+    if (a.tag == T_OBJ && a.u.o) {
+        const TypeInfoHdr* _t = (const TypeInfoHdr*)((Obj*)a.u.o)->type;
+        if (_t && _t->addfn) return _t->addfn((Obj*)a.u.o, b);
+    }
     if (a.tag == T_STR && b.tag == T_STR) return OBJ_STR(pyconcat(a.u.s, b.u.s));
     if (a.tag == T_LIST && b.tag == T_LIST) {
         obj r = list_new();
@@ -2801,6 +2821,103 @@ def _assigned_names(fn):
     return out
 
 
+def _cellify_nonlocals(fn):
+    """Box variables that nested functions rebind via `nonlocal` into
+    one-element list cells, so the ordinary lift can handle them.
+
+    Captures are passed by value, so a nested `nonlocal x; x += 1` could not be
+    lowered at all -- the def was dropped and every call to it became an
+    undefined reference. Rewriting `x` to `x__cell[0]` throughout (and the
+    binding site to `x__cell = [init]`) turns the rebind into a mutation of a
+    shared list, which already has reference semantics when captured. After
+    this runs no `nonlocal` remains, so the normal lifting path applies.
+
+    Only names with an unambiguous binding site in `fn` (a parameter, or a
+    top-level `x = ...`) are converted; anything else is left alone so the
+    caller still reports it as unsupported.
+    """
+    declared = set()
+    for sub in fn.body:
+        if isinstance(sub, ast.FunctionDef):
+            for n in ast.walk(sub):
+                if isinstance(n, ast.Nonlocal):
+                    declared.update(n.names)
+    if not declared:
+        return set()
+
+    params = {a.arg for a in fn.args.args}
+    converted = set()
+    for x in sorted(declared):
+        cell = x + "__cell"
+        init_idx = None
+        if x not in params:
+            for i, st in enumerate(fn.body):
+                if isinstance(st, ast.Assign) and len(st.targets) == 1 \
+                        and isinstance(st.targets[0], ast.Name) \
+                        and st.targets[0].id == x:
+                    init_idx = i
+                    break
+            if init_idx is None:
+                continue                # no clear binding site; leave unsupported
+
+        class _Cellify(ast.NodeTransformer):
+            def visit_FunctionDef(self, node):
+                # A nested function that binds `x` without declaring it
+                # nonlocal has its own local `x`; do not touch its body.
+                decl = any(isinstance(n, ast.Nonlocal) and x in n.names
+                           for n in ast.walk(node))
+                if not decl and x in _assigned_names(node):
+                    return node
+                node.body = [s for s in (self.visit(t) for t in node.body)
+                             if s is not None]
+                return node
+
+            def visit_Nonlocal(self, node):
+                names = [n for n in node.names if n != x]
+                return ast.Nonlocal(names=names) if names else None
+
+            def visit_Name(self, node):
+                if node.id != x:
+                    return node
+                return ast.Subscript(
+                    value=ast.Name(id=cell, ctx=ast.Load()),
+                    slice=ast.Constant(value=0), ctx=node.ctx)
+
+        # Rewrite fn's body directly: the guard above is for *nested* defs, and
+        # applying it to fn itself would skip the whole function (fn binds `x`
+        # and of course does not declare it nonlocal).
+        _t = _Cellify()
+        fn.body = [s for s in (_t.visit(st) for st in fn.body)
+                   if s is not None]
+        if x in params:
+            fn.body.insert(0, ast.Assign(
+                targets=[ast.Name(id=cell, ctx=ast.Store())],
+                value=ast.List(elts=[ast.Name(id=x, ctx=ast.Load())],
+                               ctx=ast.Load())))
+        else:
+            old = fn.body[init_idx]     # now `cell[0] = <value>`
+            fn.body[init_idx] = ast.Assign(
+                targets=[ast.Name(id=cell, ctx=ast.Store())],
+                value=ast.List(elts=[old.value], ctx=ast.Load()))
+        converted.add(x)
+    ast.fix_missing_locations(fn)
+    return converted
+
+
+def _reads_self_fields(fn):
+    """True if `fn` reads an attribute off its first parameter (self). Used to
+    reject unsound multiple-inheritance vtable dispatch: a stateless mixin is
+    safe to resolve through, one that touches instance state is not."""
+    if not fn.args.args:
+        return False
+    selfname = fn.args.args[0].arg
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) \
+                and n.value.id == selfname:
+            return True
+    return False
+
+
 def _free_vars(sub, enclosing_names):
     """Enclosing locals that `sub` reads but does not itself bind/param."""
     params = {a.arg for a in sub.args.args}
@@ -2931,6 +3048,18 @@ def lift_nested_functions(tree):
     specs = {}
 
     def process(fn, prefix, cls=None):
+        _cellify_nonlocals(fn)
+        # Annotations of the enclosing function's params and annotated locals,
+        # so a captured local keeps its real (possibly unboxed) type when it
+        # becomes a parameter of the lifted function.
+        _encl_ann = {}
+        for a in fn.args.args:
+            if a.annotation is not None:
+                _encl_ann[a.arg] = a.annotation
+        for st in ast.walk(fn):
+            if isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name) \
+                    and st.annotation is not None:
+                _encl_ann.setdefault(st.target.id, st.annotation)
         encl = {a.arg for a in fn.args.args} | _assigned_names(fn)
         if fn.args.vararg:
             encl.add(fn.args.vararg.arg)
@@ -2943,6 +3072,15 @@ def lift_nested_functions(tree):
         orig_defaults = {}              # sub.name -> original-param default nodes
         for sub in nested:
             if any(isinstance(n, ast.Nonlocal) for n in ast.walk(sub)):
+                # Rebinds an enclosing local: not liftable (captures are passed
+                # by value, so the write would not be visible to the parent).
+                # Say so -- otherwise the def is silently dropped and every
+                # call to it becomes an undefined reference at link time.
+                sys.stderr.write(
+                    "py2c: line %s: nested function '%s' uses `nonlocal`; it is "
+                    "not lowered and calls to it will not link. Pass the value "
+                    "in and return the update, or use a one-element list as a "
+                    "mutable cell.\n" % (getattr(sub, "lineno", "?"), sub.name))
                 continue                # rebinds enclosing var; can't lift
             captures = _free_vars(sub, encl)
             mangled = "%s__%s" % (prefix, sub.name)
@@ -2952,6 +3090,29 @@ def lift_nested_functions(tree):
             orig_defaults[sub.name] = [None] * (np - nd) + list(sub.args.defaults)
         if not name_map:
             return
+        # Captures are transitive. `_free_vars` only sees names a function
+        # reads *directly*, but a sibling call is rewritten to pass that
+        # sibling's captures as arguments -- so the caller must capture them
+        # too. Without this, `def alloc(): ... taken(f) ...` (where only
+        # `taken` reads `words`) lifted to `alloc(void)` yet emitted
+        # `taken(words, f)`, and `words` was undeclared in that scope.
+        # Iterate to a fixed point so chains of any depth converge.
+        changed = True
+        while changed:
+            changed = False
+            for sub in nested:
+                if sub.name not in name_map:
+                    continue
+                mangled, caps = name_map[sub.name]
+                inherited = set(caps)
+                for n in ast.walk(sub):
+                    if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) \
+                            and n.func.id in name_map and n.func.id != sub.name:
+                        inherited |= set(name_map[n.func.id][1])
+                merged = sorted(inherited)
+                if merged != caps:
+                    name_map[sub.name] = (mangled, merged)
+                    changed = True
         rewriter = _CallRewriter(name_map)
         # drop the nested defs from the parent body, rewrite remaining calls
         fn.body = [s for s in fn.body if not (isinstance(s, ast.FunctionDef)
@@ -2979,8 +3140,15 @@ def lift_nested_functions(tree):
                 if cap_name in bound:
                     cap_name = c + "__cap"
                     _NameRenamer(c, cap_name).visit(sub)
-                ann = ast.Name(id=(cls if (c == "self" and cls) else "object"),
-                               ctx=ast.Load())
+                # Reuse the enclosing declaration's annotation when there is
+                # one. Defaulting everything to `object` boxes an unboxed
+                # container (`words: "list[int]"` -> _tlist_int*) as a bare
+                # T_OBJ, and the generic subscript/subscript_set runtime path
+                # then misreads it -- writes silently fail to land.
+                ann = _encl_ann.get(c)
+                if ann is None:
+                    ann = ast.Name(id=(cls if (c == "self" and cls)
+                                       else "object"), ctx=ast.Load())
                 cap_args.append(ast.arg(arg=cap_name, annotation=ann))
             sub.args.args = cap_args + sub.args.args
             rewriter.visit(sub)         # rewrite recursive/sibling calls
@@ -4107,6 +4275,7 @@ def pod_csyms(tree, order, pod_enabled, extra_subclassed=None):
                 and ci.name not in value_used
                 and not getattr(ci, "const_dicts", None)
                 and not getattr(ci, "class_statics", None)
+                and "__add__" not in getattr(ci, "methods", {})
                 and not getattr(ci, "class_attrs", None)):
             pod.add(ci.csym)
     return pod
@@ -5088,6 +5257,7 @@ class Transpiler:
         self.xvtable_impls = set()  # (clsname, method) imported vtable slot impls
         self._tostr_externs = set()  # csyms of imported classes whose __str__ we reference
         self._eq_externs = set()     # csyms of imported classes whose __eq__ we reference
+        self._add_externs = set()    # csyms of imported classes whose __add__ we reference
         self.xconstdict_externs = set()  # (clsname, dict) imported const-dict fns
         self.xclass_module = {}     # imported class name -> its module
         for cn, (ci, mod) in self.xclasses.items():
@@ -5455,7 +5625,7 @@ class Transpiler:
         if not (classes or funcs or singles or globs or self.used_xmethods or
                 self.xvt_needed or self.xtype_externs or self.xvtable_impls or
                 self.xconstdict_externs or self.xshadow_td or
-                self._tostr_externs or self._eq_externs):
+                self._tostr_externs or self._eq_externs or self._add_externs):
             return []
         out = ["/* ---- cross-module imports (extern declarations) ---- */"]
         emitted_td = set()
@@ -5530,6 +5700,8 @@ class Transpiler:
             out.append("extern obj %s___str__(Obj*);" % cs)
         for cs in sorted(self._eq_externs):              # imported __eq__ impls
             out.append("extern bool %s___eq__(Obj*, obj);" % cs)
+        for cs in sorted(self._add_externs):             # imported __add__ impls
+            out.append("extern obj %s___add__(Obj*, obj);" % cs)
         for (cls, d) in sorted(self.xconstdict_externs):  # imported const-dicts
             out.append("extern str %s_%s();" % (self.xcsym(cls), d))
             out.append("extern obj %s_%s_items();" % (self.xcsym(cls), d))
@@ -5544,6 +5716,7 @@ class Transpiler:
             out.append("    const FieldDesc* fields;")
             out.append("    obj (*tostr)(Obj*);")
             out.append("    bool (*eq)(Obj*, obj);")
+            out.append("    obj (*addfn)(Obj*, obj);")
             out.append("    unsigned long objsize;")
             for m in sorted(reg["vt"]):
                 ret, params = self.ximported_method_sig(mod, m)
@@ -5618,6 +5791,9 @@ class Transpiler:
             self.emit("/* forward declarations */")
             for p in protos:
                 self.emit(p)
+            # main calls this to run module-level global initialization; it is
+            # defined below, so it needs a prototype here.
+            self.emit("void %s_init(void);" % self.cmod)
             self.emit()
         _ctp = self.ctypes_externs() if hasattr(self, "ctypes_externs") else []
         if _ctp:
@@ -7050,6 +7226,7 @@ class Transpiler:
         self.emit("const FieldDesc* fields;")
         self.emit("obj (*tostr)(Obj*);")
         self.emit("bool (*eq)(Obj*, obj);")
+        self.emit("obj (*addfn)(Obj*, obj);")
         self.emit("unsigned long objsize;")
         for m in sorted(VTABLE_METHODS):
             self.emit(self.vslot_signature(m) + ";")
@@ -7258,6 +7435,9 @@ class Transpiler:
                     and ci.name not in value_used
                     and not getattr(ci, "const_dicts", None)
                     and not getattr(ci, "class_statics", None)
+                    # __add__ is dispatched at runtime through the TypeInfo
+                    # `addfn` slot, which a POD class does not have.
+                    and "__add__" not in getattr(ci, "methods", {})
                     and not self._resolved_class_attrs(ci)):
                 self._pod_set.add(ci.csym)
         # method AST nodes belonging to POD classes: their class-pointer params
@@ -7351,8 +7531,20 @@ class Transpiler:
             if mname == "__eq__" and mname not in ci.static_methods:
                 self.emit_eq_method(ci, fn)
                 continue
+            if mname == "__add__" and mname not in ci.static_methods:
+                self.emit_add_method(ci, fn)
+                continue
             if mname.startswith("__") and mname.endswith("__"):
                 if mname not in ("__enter__", "__exit__"):
+                    # Dropping it silently is how `Position.__add__` went
+                    # missing: `pos + 1` then fell through to numeric addition,
+                    # reinterpreted the pointer as an integer, and crashed on
+                    # the next dereference. Say so on stderr too -- a comment
+                    # buried in generated C is not a diagnostic.
+                    sys.stderr.write(
+                        "py2c: %s.%s is not lowered; uses of the corresponding "
+                        "operator will fall back to the generic path and may "
+                        "produce wrong results\n" % (ci.name, mname))
                     self.emit("/* %s.%s: dunder not lowered in this pass */"
                               % (ci.name, mname))
                     self.emit()
@@ -7760,6 +7952,25 @@ class Transpiler:
         self.emit("}")
         self.emit()
 
+    def emit_add_method(self, ci, fn):
+        """Lower `__add__` to a standalone `obj <Class>___add__(Obj*, obj)` so
+        obj_add can dispatch through the TypeInfo `addfn` slot. Otherwise it is
+        an unlowered dunder and `a + b` on such objects falls through to
+        numeric addition, which reinterprets the pointer as an integer and
+        hands back a value that crashes on the next dereference."""
+        other = fn.args.args[1].arg if len(fn.args.args) > 1 else "other"
+        self.enter_scope(fn, skip_self=True)
+        self.cur_ret = "obj"
+        self.emit("obj %s___add__(Obj* self_, obj %s) {"
+                  % (ci.csym, cname(other)))
+        self.indent += 1
+        self.emit("%s* self = (%s*)self_;" % (ci.csym, ci.csym))
+        self.emit("(void)self;")
+        self.emit_hoisted_body(fn.body)
+        self.indent -= 1
+        self.emit("}")
+        self.emit()
+
     def _vtable_slot_fn(self, m, owner):
         """Function pointer for a TypeInfo's `m` slot. Normally owner.csym_<m>,
         but when that impl declares MORE positional params than the (canonical,
@@ -7823,7 +8034,24 @@ class Transpiler:
                 self.xtype_externs.add(ci.base.name)
         slots = []
         for m in sorted(VTABLE_METHODS):
-            owner = ci.find_method_owner(m)
+            # MI-aware: a method inherited from a *secondary* base (e.g.
+            # `class Cast(Declaration, _RExprNode)` inheriting lvalue/make_il
+            # from _RExprNode) must still fill its vtable slot. Using the
+            # primary-chain-only lookup here emitted NULL, so any virtual call
+            # through that slot jumped to address 0.
+            owner = ci.find_method_owner_mi(m)
+            # Resolving through a *secondary* base is only sound for stateless
+            # mixins: only the primary base's fields form the struct prefix, so
+            # a secondary-base method that reads `self.<field>` would index a
+            # layout the object does not have. Flag it rather than miscompile.
+            if owner and owner is not ci.find_method_owner(m):
+                impl = owner.methods.get(m)
+                if impl is not None and _reads_self_fields(impl):
+                    sys.stderr.write(
+                        "py2c: %s inherits %s() from secondary base %s, which "
+                        "reads self fields; only the primary base's fields are "
+                        "in the struct prefix, so this dispatch is unsound\n"
+                        % (ci.name, m, owner.name))
             if owner and owner.name not in self.classes:  # imported impl
                 self.xvtable_impls.add((owner.name, m))
             slots.append(".%s = %s" % (vslot_name(m), self._vtable_slot_fn(m, owner)
@@ -7842,11 +8070,19 @@ class Transpiler:
                 self._eq_externs.add(eq_owner.csym)
         else:
             eqfn = "NULL"
+        add_owner = ci.find_method_owner_mi("__add__")
+        if add_owner and "__add__" not in add_owner.static_methods:
+            addfn = "%s___add__" % add_owner.csym
+            if add_owner.name not in self.classes:      # imported __add__ impl
+                self._add_externs.add(add_owner.csym)
+        else:
+            addfn = "NULL"
         init = ", ".join([".name = %s" % c_string(ci.name),
                           ".base = (const struct TypeInfo*)%s" % base,
                           ".fields = %s__fields" % ci.csym,
                           ".tostr = %s" % tostr,
                           ".eq = %s" % eqfn,
+                          ".addfn = %s" % addfn,
                           ".objsize = sizeof(%s)" % ci.csym] + slots)
         self.emit("const TypeInfo %s_type = { %s };" % (ci.csym, init))
         self.emit()
@@ -8421,6 +8657,12 @@ class Transpiler:
         self.emit("/* Initialize module-level globals (Python import-time). */")
         self.emit("void %s_init(void) {" % (self.cmod))
         self.indent += 1
+        # Idempotent: the multi-module driver emits an _entry.c that calls every
+        # module's init before main, while a single translation unit calls its
+        # own from the top of main. The guard makes both paths safe.
+        self.emit("static int _init_done = 0;")
+        self.emit("if (_init_done) return;")
+        self.emit("_init_done = 1;")
         if not self.mod_globals:
             self.emit("/* none */")
         for name, ctype, kind, val in self.mod_globals:
@@ -8720,6 +8962,12 @@ class Transpiler:
             self.emit("%s {" % sig)
         self.indent += 1
         self._emit_vararg_setup(node)
+        # Python runs module-level code at import time. A single translation
+        # unit has no _entry.c to do that, so main runs its own module init
+        # first -- otherwise module globals stay zeroed and, e.g., a global
+        # list reads back as empty. The init is idempotent.
+        if node.name == "main" and self.mod_globals:
+            self.emit("%s_init();" % self.cmod)
         self.emit_hoisted_body(body)
         self.indent -= 1
         self.emit("}")
@@ -11804,6 +12052,16 @@ class Transpiler:
                         self.value_ctype(node.args[0]) == "char*":
                     self._io_used.add("puts")
                     return "puts(%s)" % self.expr(node.args[0])
+                if len(node.args) > 1:
+                    # CPython prints every argument, space separated. Emitting
+                    # only args[0] silently dropped the rest.
+                    exprs = [self.wrap_obj(a) for a in node.args]
+                    self._list_tmp = getattr(self, "_list_tmp", 0) + 1
+                    v = "_pp%d" % self._list_tmp
+                    stores = " ".join("%s[%d] = %s;" % (v, i, e)
+                                      for i, e in enumerate(exprs))
+                    return "({ obj %s[%d]; %s pyprint_a(%s, %d); })" % (
+                        v, len(exprs), stores, v, len(exprs))
                 if node.args:
                     return "pyprint(%s)" % self.wrap_obj(node.args[0])
                 return 'pyprint(OBJ_STR(""))'
