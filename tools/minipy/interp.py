@@ -3198,6 +3198,23 @@ def mpy_call_iss(name: "char*", i: "int", s1: "char*", s2: "char*") -> "int":
     return -1
 
 
+def _exit_status(st: "St", ev: "V") -> "int":
+    # SystemExit(n).args[0] as a process status, following CPython: an int is
+    # used directly, None (or no argument) means 0, anything else means 1.
+    argsv = inst_get(st, ev, "args")
+    if argsv.tag != 10:
+        return 0
+    items = items_of(st, argsv)
+    if len(items) == 0:
+        return 0
+    first = items[0]
+    if first.tag == 1:
+        return int(first.iv)
+    if first.tag == 0:
+        return 0
+    return 1
+
+
 def interp_run(prog: "Program", sargs: "list[str]") -> "int":
     st = build_state(prog, sargs)
     run_func(st, prog.entry, new_v_list())
@@ -3217,6 +3234,13 @@ def interp_run(prog: "Program", sargs: "list[str]") -> "int":
             if cut >= 0:
                 cn = cn[cut + 1:len(cn)]
             desc = cn
+            # An unhandled SystemExit is a normal program ending, not a
+            # failure. compiler.py lowers `sys.exit(n)` to `raise
+            # SystemExit(n)`, so this is the path every script that calls
+            # sys.exit arrives on -- including py2c.py, whose last statement
+            # is `sys.exit(main(sys.argv[1:]) or 0)`.
+            if _strcmp(cn, "SystemExit") == 0:
+                return _exit_status(st, ev)
         print("minipy: unhandled exception: " + desc)
         return 1
     return 0

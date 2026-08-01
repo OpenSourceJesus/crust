@@ -129,6 +129,9 @@ _BUILTIN_EXC = [
     ("NotImplementedError", "RuntimeError"),
     ("RecursionError", "RuntimeError"),
     ("StopIteration", "Exception"),
+    # SystemExit derives from BaseException, not Exception, exactly as in
+    # CPython -- so `except Exception:` does not swallow an interpreter exit.
+    ("SystemExit", "BaseException"),
     ("TypeError", "Exception"),
     ("ValueError", "Exception"),
 ]
@@ -146,6 +149,13 @@ def _needed_builtin_excs(tree):
             user_classes.add(n.name)
         elif isinstance(n, ast.Name):
             used.add(n.id)
+        elif (isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
+                and n.value.id == "sys" and n.attr == "exit"):
+            # ex_Call rewrites `sys.exit(n)` into `raise SystemExit(n)`, but
+            # that rewrite happens during codegen -- after this scan. The name
+            # never appears in the source, so register it from the call site
+            # or the class is missing when the RAISE executes.
+            used.add("SystemExit")
     needed = set()
     for nm in used:
         cur = nm
@@ -1772,7 +1782,31 @@ class Compiler:
         f.numreg.discard(rfun)
         return rfun
 
+    def _sys_exit(self, f, node):
+        # `sys.exit(n)` -> `raise SystemExit(n)`, which is what CPython does.
+        # minipy has no `sys` module object (only the pre-bound sys.argv and
+        # sys.path globals), so without this the attribute lookup failed and
+        # the VM reported a bare Exception with no message. py2c.py ends with
+        # `sys.exit(main(sys.argv[1:]) or 0)`, so this is the first thing that
+        # stops it running at all.
+        # `sys.exit()` is SystemExit() with *no* args, not SystemExit(0):
+        # CPython leaves .args empty, and both mean status 0.
+        args = [node.args[0]] if node.args else []
+        call = ast.Call(func=ast.Name(id="SystemExit", ctx=ast.Load()),
+                        args=args, keywords=[])
+        ast.copy_location(call, node)
+        ast.copy_location(call.func, node)
+        ast.fix_missing_locations(call)
+        r = self.expr(f, call)
+        f.emit("RAISE", r)
+        return r
+
     def ex_Call(self, f, node):
+        if (isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "sys"
+                and node.func.attr == "exit"):
+            return self._sys_exit(f, node)
         if any(isinstance(a, ast.Starred) for a in node.args):
             return self._call_spread(f, node)
         if node.keywords:
@@ -2854,10 +2888,22 @@ class VM:
         if "_host_os" in self.names:
             import os as _realos
             self.globals[self.names.index("_host_os")] = _realos
+        self.exit_status = 0
         self._call(self.prog["entry"], [])
         if self._exc_flag:
-            # surface an unhandled exception rather than returning silently
             v = self._exc_val
+            # An unhandled SystemExit is how a program ends normally, not a
+            # failure: report its status to the caller instead of raising.
+            if isinstance(v, _Inst):
+                cn0 = self.prog["classes"][v.cid].get("cname", "")
+                d0 = cn0.rfind("$")
+                if (cn0[d0 + 1:] if d0 >= 0 else cn0) == "SystemExit":
+                    a0 = v.attrs.get("args", ())
+                    code = a0[0] if a0 else 0
+                    self.exit_status = code if isinstance(code, int) else (
+                        0 if code is None else 1)
+                    return
+            # surface an unhandled exception rather than returning silently
             desc = repr(v)
             if isinstance(v, _Inst):
                 cn = self.prog["classes"][v.cid].get("cname", "?")
@@ -3206,6 +3252,16 @@ class VM:
         return _pystr(x)
 
     def _raise_attr_error(self, name):
+        # MINIPY_TRACE_ATTR=1 names the attribute. Worth keeping: a missing
+        # attribute surfaces at top level as "unhandled exception: Exception"
+        # with no message and no location, because the fallback below has to
+        # use a bare Exception when the program registers no AttributeError
+        # class. That diagnostic is unactionable on its own -- this is what
+        # turned it into "sys.exit".
+        import os as _dbgos
+        import sys as _dbgsys
+        if _dbgos.environ.get("MINIPY_TRACE_ATTR"):
+            _dbgsys.stderr.write("[attr-error] " + repr(name) + "\n")
         # Set a catchable exception (matches `except Exception`) for a method
         # call on something that has no such method -- e.g. a method on an
         # unbound name left by an unlinked `import`. Mirrors CPython raising
