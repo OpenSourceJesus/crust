@@ -288,6 +288,62 @@ static int cmd_memtest(int argc, char **argv) {
     return 0;
 }
 
+/* ---- ramdisk commands -------------------------------------------------- */
+
+static int cmd_ls(int argc, char **argv) {
+    int i, n = ramfs_count();
+    (void)argc; (void)argv;
+
+    if (n == 0) {
+        con_puts("no ramdisk mounted (boot with -initrd)\n");
+        return 1;
+    }
+    for (i = 0; i < n; i++) {
+        int pad = 24 - (int)mini_strlen(ramfs_name(i));
+        con_puts("  ");
+        con_puts(ramfs_name(i));
+        while (pad-- > 0) con_putc(' ');
+        put_u64((u64)ramfs_size(i));
+        con_putc('\n');
+    }
+    con_puts("  ");
+    put_u64((u64)n);
+    con_puts(" file(s), module ");
+    put_u64((u64)ramfs_bytes());
+    con_puts(" bytes\n");
+    ser_puts("[mbos] ls listed files\n");
+    return 0;
+}
+
+static int cmd_cat(int argc, char **argv) {
+    int idx;
+    u32 size, i;
+    const u8 *data;
+
+    if (argc < 2) { con_puts("usage: cat <file>\n"); return 1; }
+
+    idx = ramfs_find(argv[1]);
+    if (idx < 0) {
+        con_puts(argv[1]);
+        con_puts(": no such file\n");
+        ser_puts("[mbos] cat: not found\n");
+        return 1;
+    }
+
+    data = ramfs_data(idx, &size);
+    if (!data) { con_puts("unreadable\n"); return 1; }
+
+    for (i = 0; i < size; i++) {
+        char c = (char)data[i];
+        /* Printable and newline only -- a stray control byte from a binary
+         * file would otherwise walk the cursor around the screen. */
+        if (c == '\n' || (c >= ' ' && c < 127)) con_putc(c);
+        else if (c == '\t') con_puts("    ");
+    }
+    if (size > 0 && data[size - 1] != '\n') con_putc('\n');
+    return 0;
+}
+
 static const struct command CMDS[] = {
     { "help",   cmd_help,   "list commands" },
     { "echo",   cmd_echo,   "print arguments" },
@@ -295,6 +351,8 @@ static const struct command CMDS[] = {
     { "ticks",  cmd_ticks,  "raw timer tick count" },
     { "uptime", cmd_uptime, "seconds since boot" },
     { "ver",    cmd_ver,    "kernel and console info" },
+    { "ls",     cmd_ls,     "list files on the ramdisk" },
+    { "cat",    cmd_cat,    "print a ramdisk file: cat <name>" },
     { "mem",    cmd_mem,    "heap summary; 'mem map', 'mem check'" },
     { "memtest",cmd_memtest,"alloc/free torture, then verify" },
     { "peek",   cmd_peek,   "hexdump memory: peek <addr> [n]" },
