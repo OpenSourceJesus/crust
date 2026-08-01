@@ -306,6 +306,18 @@ void *malloc(unsigned long n)
 
     total = n + 16;
     total = (total + 15) & ~15UL;
+    /* Large blocks are page-aligned. The ELF loader mprotects the page range
+     * covering an image it malloc'd, so a block that straddles a page start
+     * would have the protection change applied to unrelated heap memory
+     * before it -- and, worse, share a page with data that must stay
+     * non-executable. glibc's allocator hands out mmap'd (page-aligned)
+     * memory at this size, so code that works there relies on it. */
+    if (n >= 4096) {
+        unsigned long here;
+        here = (unsigned long)sbrk(0);
+        if ((here + 16) % 4096 != 0)
+            sbrk((long)(4096 - ((here + 16) % 4096)));
+    }
     b = (struct blk *)sbrk((long)total);
     if ((long)b == -1)
         return 0;
