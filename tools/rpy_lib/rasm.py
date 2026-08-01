@@ -652,10 +652,11 @@ def encode(mnem, ops):
         return _encode_m_group(ops[0], 7)
     if mnem == "ljmp":
         return _encode_ljmp(ops)
-    if mnem == "in":
-        return _encode_inout(ops, False)
-    if mnem == "out":
-        return _encode_inout(ops, True)
+    if mnem == "in" or mnem == "out":
+        return _encode_inout(ops, mnem == "out")
+    if mnem in _INOUT_SIZED:
+        pair = _INOUT_SIZED[mnem]
+        return _encode_inout(_sized_ops(ops, pair[1]), pair[0])
 
     if mnem == "push":
         return _encode_pushpop(ops[0], True)
@@ -1040,6 +1041,23 @@ def _encode_ljmp(ops):
     return out, []
 
 
+# suffixed spellings: mnemonic -> (is_out, operand bits)
+_INOUT_SIZED = {
+    "inb": (False, 8), "inw": (False, 16), "inl": (False, 32),
+    "outb": (True, 8), "outw": (True, 16), "outl": (True, 32),
+}
+
+
+def _sized_ops(ops, bits):
+    """Give an untyped operand the size the mnemonic suffix implies."""
+    i = 0
+    while i < len(ops):
+        if ops[i].kind == "mem" and ops[i].size == 0:
+            ops[i].size = bits
+        i += 1
+    return ops
+
+
 def _encode_inout(ops, is_out):
     """in/out with either an imm8 port or dx."""
     if is_out:
@@ -1048,7 +1066,7 @@ def _encode_inout(ops, is_out):
     else:
         acc = ops[0]
         port = ops[1]
-    size = acc.size
+    size = acc.size if acc.size != 0 else 32
     base = 0xE4 if not is_out else 0xE6      # imm8 port
     dxbase = 0xEC if not is_out else 0xEE    # dx port
     out = []
@@ -1488,6 +1506,7 @@ _ATT_SIZED = {
     "imul": True, "div": True, "idiv": True, "lea": True, "xchg": True,
     "shl": True, "shr": True, "sar": True, "sal": True, "rol": True,
     "ror": True, "call": True, "jmp": True, "movabs": True,
+    "in": True, "out": True,
 }
 
 # AT&T spellings of the sign/zero-extending moves, mapped to the Intel
