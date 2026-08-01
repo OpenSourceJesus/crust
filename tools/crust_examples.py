@@ -68,6 +68,15 @@ EXAMPLES = [
      "  n= 6  bar= 4\n"
      "  n= 2  bar= 1\n", True),
 
+    # Three languages building one thing: Rust geometry (mingine.rs), rpython
+    # level rules (mingine.py) and C framebuffer code (mingine.c), all in a
+    # single translation unit. The scene itself goes to stderr; stdout carries
+    # the deterministic summary, so this is a golden test as well as a demo.
+    ("baremetalgames/helloworld.c", 0,
+     "ball  = 56,44  foe = 34,37\n"
+     "score = 594\n"
+     "pixels= 2347ee01\n", True),
+
     ("tally.c", 0,
      "labels = b0,b1,b2,b3\n"
      "widest = 3\n"
