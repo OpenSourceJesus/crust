@@ -79,6 +79,18 @@ def _tex(s):
     return s
 
 
+def _split_meta(rows):
+    """Separate the `_meta` marker a `--quick` run writes from the data."""
+    meta = None
+    data = []
+    for r in rows:
+        if r.get("benchmark") == "_meta":
+            meta = r
+        else:
+            data.append(r)
+    return meta, data
+
+
 def main():
     out_dir = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "results")
     os.makedirs(out_dir, exist_ok=True)
@@ -87,15 +99,25 @@ def main():
         return 1
     with open(RESULTS) as f:
         benches = json.load(f)
+    meta, benches = _split_meta(benches)
     if not benches:
         print("crust_results.json is empty")
         return 1
 
+    quick = bool(meta and meta.get("quick"))
+    reps = (meta or {}).get("repeats", 3)
     fig, (a1, a2) = plt.subplots(2, 1, figsize=(9, 8))
     labels, times = _series(benches, "time_s")
-    _grouped(a1, labels, times, "seconds (best of 3, log)",
-             "Runtime by compiler, same generated C "
-             "(compare within a benchmark, not across)", log=True)
+    title = ("Runtime by compiler, same generated C "
+             "(compare within a benchmark, not across)")
+    if quick:
+        # Say so on the figure itself. A quick run is one sample with part of
+        # the suite missing, and a chart that does not admit that will be read
+        # as a full measurement.
+        title += "\nQUICK RUN -- single sample; %s not measured" % (
+            ", ".join((meta or {}).get("skipped") or ["some benchmarks"]))
+    _grouped(a1, labels, times, "seconds (best of %d, log)" % reps,
+             title, log=True)
     labels, sizes = _series(benches, "size_bytes")
     sizes = {k: [v / 1024.0 for v in vs] for k, vs in sizes.items()}
     _grouped(a2, labels, sizes, "binary size (KiB)",

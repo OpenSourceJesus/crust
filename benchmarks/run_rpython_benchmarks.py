@@ -266,6 +266,32 @@ BENCH_ARGS = {
     "sched_ticks": ["500000"],
 }
 
+# `--quick`: the same benchmarks at a fraction of the workload. Scaling the
+# arguments rather than dropping benchmarks keeps every backend comparison
+# intact -- what changes is the precision of the numbers, not what is covered.
+# Ratios between backends stay meaningful; absolute times are not comparable
+# with a full run, so the results are marked.
+QUICK_DIVISOR = 8
+QUICK_ARGS = {
+    "fib": ["24"],              # exponential: divide the exponent, not the arg
+    "ack": ["3", "3"],
+    "binary_trees": ["11"],
+}
+
+
+def quick_args(name, args):
+    """Smaller workload for `name`, or None to leave it unchanged."""
+    if name in QUICK_ARGS:
+        return QUICK_ARGS[name]
+    out = []
+    for a in args:
+        try:
+            n = int(a)
+        except ValueError:
+            return None
+        out.append(str(max(1, n // QUICK_DIVISOR)))
+    return out or None
+
 
 def discover():
     if not os.path.isdir(RPY_DIR):
@@ -273,7 +299,12 @@ def discover():
     return sorted(f for f in os.listdir(RPY_DIR) if f.endswith(".py"))
 
 
-def main():
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    quick = "--quick" in argv or "-q" in argv
+    if quick:
+        print("quick: reduced workloads; times are not comparable with a "
+              "full run\n")
     os.makedirs(RESULTS_DIR, exist_ok=True)
     native, inc = ensure_native()
     mem_probe = build_mem_probe()
@@ -282,6 +313,8 @@ def main():
         name = fn[:-3]
         py_file = os.path.join(RPY_DIR, fn)
         args = BENCH_ARGS.get(name, [])
+        if quick:
+            args = quick_args(name, args) or args
         print("Running rpython benchmark: %s %s" % (name, " ".join(args)))
         try:
             r = run_one(py_file, native, inc, mem_probe, args)

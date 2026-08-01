@@ -39,6 +39,27 @@ WORK = "/tmp/crust_bench"
 # run least disturbed by whatever else the machine was doing.
 REPEATS = 3
 
+# `--quick` trades measurement quality for turnaround, so that a change to the
+# compiler can be checked in seconds rather than minutes. It takes a single
+# timing run instead of the best of three, and skips the benchmarks below.
+QUICK_REPEATS = 1
+
+# Benchmarks whose *compile* time dominates the suite. `memory` is the whole
+# reason this mode exists: ShivyCX takes around 115s on it against roughly 0.3s
+# for every other benchmark, because its `[u64; 512]` arrays drive the register
+# allocator's interference graph past 8000 nodes and the coalescing pass
+# rescans every node on every round -- quadratic. That single compile is over
+# 80% of the suite's runtime.
+#
+# It is skipped here rather than deleted: it is the sharpest stress case in the
+# suite and the right benchmark to watch while working on the allocator. A
+# skipped benchmark is named in the output, never dropped silently.
+QUICK_SKIP = {
+    "memory": "ShivyCX compile is ~115s (register-allocator coalescing is "
+              "quadratic in interference-graph size); run the full suite to "
+              "measure it",
+}
+
 DESCRIPTIONS = {
     "traits": "Static trait dispatch: three impls of one trait, resolved at "
               "monomorphisation. Measures whether a trait call really costs a "
@@ -97,9 +118,9 @@ def translate(src, ext, out_c):
     return out_c
 
 
-def time_binary(path):
+def time_binary(path, repeats=None):
     best = None
-    for _ in range(REPEATS):
+    for _ in range(repeats or REPEATS):
         t0 = time.perf_counter()
         subprocess.run([path], stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL)
@@ -120,7 +141,7 @@ def build_gcc(cpath, out, level):
     return out if p.returncode == 0 and os.path.exists(out) else None
 
 
-def run_one(name, ext):
+def run_one(name, ext, repeats=None):
     src = os.path.join(BENCH_DIR, name + ext)
     cpath = os.path.join(WORK, name + ".c")
     translate(src, ext, cpath)
@@ -143,13 +164,17 @@ def run_one(name, ext):
         rec["configs"].append({
             "name": label,
             "ok": True,
-            "time_s": time_binary(binary),
+            "time_s": time_binary(binary, repeats),
             "size_bytes": os.path.getsize(binary),
         })
     return rec
 
 
-def main():
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    quick = "--quick" in argv or "-q" in argv
+    repeats = QUICK_REPEATS if quick else REPEATS
+
     os.makedirs(WORK, exist_ok=True)
     os.makedirs(RESULTS_DIR, exist_ok=True)
     names = discover()
@@ -157,12 +182,20 @@ def main():
         print("no benchmarks found in %s" % BENCH_DIR)
         return 1
 
+    if quick:
+        kept = [(n, e) for n, e in names if n not in QUICK_SKIP]
+        for n, _e in names:
+            if n in QUICK_SKIP:
+                print("quick: skipping %s -- %s" % (n, QUICK_SKIP[n]))
+        print("quick: best of %d run(s) instead of %d\n" % (repeats, REPEATS))
+        names = kept
+
     results = []
     for name, ext in names:
         print("Running crust benchmark: %s (%s)"
               % (name, "C++" if ext == ".cpp" else "Rust"))
         try:
-            rec = run_one(name, ext)
+            rec = run_one(name, ext, repeats)
         except Exception as e:
             # One benchmark failing costs that benchmark, not the suite.
             print("  SKIP %s: %s: %s" % (name, type(e).__name__, e))
@@ -180,6 +213,13 @@ def main():
                 rel = "  (%.1fx ShivyCX)" % (c["time_s"] / base)
             print("  %-10s %7.3fs%s" % (c["name"], c["time_s"], rel))
 
+    if quick:
+        # Mark the data. A quick run is a single timing sample with part of
+        # the suite missing; a reader looking at the figure has to be able to
+        # tell that from a full measurement, and the plot says so.
+        results.insert(0, {"benchmark": "_meta", "quick": True,
+                           "repeats": repeats,
+                           "skipped": sorted(QUICK_SKIP)})
     out = os.path.join(RESULTS_DIR, "crust_results.json")
     with open(out, "w") as f:
         json.dump(results, f, indent=1)
