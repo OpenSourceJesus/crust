@@ -79,6 +79,8 @@ class Interpreter:
         if code == 'int("".join(n[0] for n in s))':
             s = L['s']
             return int("".join(n[0] for n in s))
+        if code == "_numval(t)":
+            return _numval(L['t'])
         if code == "_hexval(h)":
             return _hexval(L['h'])
         if code == "reformat_atom(atom, trailers)":
@@ -266,6 +268,65 @@ def reformat_binary(start: "obj", tokens):
         lhs, index = _rb_parse(lhs, pairs, index)
     return lhs
 
+def _numval(t):
+    # Convert a numeric literal's source text to its value.
+    #
+    # Every Python numeric form except complex: decimal, 0x/0b/0o, floats with
+    # an optional fraction and/or exponent, and PEP 515 underscore separators.
+    # The grammar captures the whole token as text and hands it here, so all
+    # the form-specific knowledge lives in one place instead of being spread
+    # across seven grammar alternatives.
+    #
+    # int(s, base) is unavailable -- the minipy int() builtin ignores a base
+    # argument -- so non-decimal integers are accumulated digit by digit, the
+    # same way _hexval did. float(s) *is* available and agrees with CPython,
+    # so floats are handed to it rather than reconstructed from parts, which
+    # would lose the last bits of the mantissa.
+    text = ""
+    for c in t:
+        if c != "_":
+            text = text + c
+
+    if len(text) > 1 and text[0] == "0":
+        c = text[1]
+        base = 0
+        if c == "x" or c == "X":
+            base = 16
+        elif c == "b" or c == "B":
+            base = 2
+        elif c == "o" or c == "O":
+            base = 8
+        if base != 0:
+            return _baseval(text[2:], base)
+
+    is_float = False
+    for c in text:
+        if c == "." or c == "e" or c == "E":
+            is_float = True
+    if is_float:
+        return float(text)
+
+    v = 0
+    for c in text:
+        v = v * 10 + (ord(c) - 48)
+    return v
+
+
+def _baseval(digits, base):
+    # Accumulate an integer from its digits in the given base. Replaces
+    # int(s, base), which minipy's int() does not support.
+    v = 0
+    for c in digits:
+        if c >= "0" and c <= "9":
+            d = ord(c) - 48
+        elif c >= "a" and c <= "f":
+            d = ord(c) - 87
+        else:
+            d = ord(c) - 55
+        v = v * base + d
+    return v
+
+
 def _hexval(h):
     # Parse a list of matched hex-digit results into an int. int(s, 16) is
     # avoided because the minipy int() builtin ignores a base argument, so the
@@ -372,7 +433,11 @@ expr_stmt = aug_assign | ann_assign | regular_assign | testlist
 aug_assign_symbol = "+=" | "-=" | "*=" | "/=" | "%=" | "&="
                   | "|=" | "^=" | "<<=" | ">>=" | "**=" | "//="
 aug_assign = testlist aug_assign_symbol=operation (yield_expr|testlist)
-ann_assign = {NAME} ":" {test} {("=" {yield_expr|testlist})?=value}
+# Python allows any single assignable expression as the annotation target,
+# not just a bare name: `self.x: "int" = v` and `buf[i]: "int" = v` are both
+# legal, and the first is common in classes that annotate their fields in
+# __init__. trailed_atom covers name, attribute and subscript in one rule.
+ann_assign = {trailed_atom} ":" {test} {("=" {yield_expr|testlist})?=value}
 regular_assign = testlist ("=" {yield_expr|testlist})+
 # For normal assignments, additional restrictions enforced by the interpreter
 print_stmt! = "print" { {test ("," {test})*} ","?
@@ -445,7 +510,14 @@ listmaker! = (test list_for list_iter*)=listcomp
            | {test (comma {test})*} comma?
 testlist_comp = test list_for list_iter*
 tuple! = ({test} comma)+ test?
-lambdef! = "lambda" {parameters? | void=parameters} ":" {test}
+# A lambda's parameter list must not accept annotations. `parameters` does
+# (for `def`), and its optional `(":" {test})?` is greedy, so in `lambda x: x`
+# it swallows the colon and the body as an annotation and then lambdef has no
+# ":" left to match. CPython's grammar draws the same distinction: varargslist
+# for lambda, typedargslist for def.
+lambda_fpdef_opt = fpdef ("=" {test})? | "*" {NAME=remaining_args} | "**" {NAME=kwargs}
+lambda_parameters! = {lambda_fpdef_opt (comma {lambda_fpdef_opt})*} comma?
+lambdef! = "lambda" {lambda_parameters?=parameters | void=parameters} ":" {test}
 trailer = "(" spaces {arglist} spaces ")"
         | "[" spaces {subscriptlist} spaces "]"
         | "." {NAME}
@@ -481,8 +553,14 @@ testlist_safe = or_test ((',' or_test)+ ','?)?
 testlist1 = test ("," test)*
 
 comment! = '#' {(~'\n' {anything})*}
-NUMBER! = hspaces '0' ('x' | 'X') hexdigit+:h -> _hexval(h)
-        | hspaces digit+:s -> int("".join(n[0] for n in s))
+NUMBER! = hspaces {'0' ('x' | 'X') (hexdigit | '_')+}:t -> _numval(t)
+        | hspaces {'0' ('b' | 'B') ('0' | '1' | '_')+}:t -> _numval(t)
+        | hspaces {'0' ('o' | 'O') (digit | '_')+}:t -> _numval(t)
+        | hspaces {(digit | '_')+ '.' (digit | '_')* exponent?}:t -> _numval(t)
+        | hspaces {'.' (digit | '_')+ exponent?}:t -> _numval(t)
+        | hspaces {(digit | '_')+ exponent}:t -> _numval(t)
+        | hspaces {(digit | '_')+}:t -> _numval(t)
+exponent = ('e' | 'E') ('+' | '-')? (digit | '_')+
 # Probably need to check that the result isn't a reserved word.
 NAME! = hspaces {((letter | '_') (letter | digit | '_')*)}
 STRINGS = STRING (spaces {STRING})*

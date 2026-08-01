@@ -52,6 +52,30 @@ SNIPPETS = [
     "try:\n    pass\nexcept Exception as e:\n    raise Wrap(str(e)) from e\n",
     "a = r\"x\\ty\\nz\"\nb = r'''p\\nq\\tr'''\nc = \"esc\\there\"\n",
     "for i in xs:\n    if i:\n        a = 1\nelse:\n    a = 2\nwhile a:\n    a = a - 1\nelse:\n    b = 0\n",
+
+    # --- numeric literals ------------------------------------------------
+    # NUMBER used to accept only decimal and hex integers, which is why
+    # tools/minipy/interp.py could not be parsed: it is full of float
+    # constants. Every Python numeric form except complex is covered here.
+    "f = 1.0\ng = .5\nh = 10.\n",
+    "big = 1e308\nsmall = 1.5e-3\nup = 1E5\nsigned = 1.5e+10\n",
+    "b = 0b1010\no = 0o777\nx = 0xdead_beef\n",
+    "sep = 1_000\nfsep = 1_000.5\n",
+    "pi = 3.141592653589793\ntiny = 2.2250738585072014e-308\n",
+
+    # --- annotated assignment to a non-name target -----------------------
+    # ann_assign only accepted a bare NAME, so a class annotating its fields
+    # in __init__ (as interp.py's Instr does) failed to parse.
+    "class C:\n    def __init__(self, v):\n        self.op: \"int(8)\" = v\n        self.n: \"int\" = 0\n",
+    "buf[i]: \"int\" = v\na.b.c: \"T\" = z\n",
+
+    # --- lambda with parameters ------------------------------------------
+    # `parameters` allows an annotation, and its optional `":" test` is
+    # greedy, so in `lambda x: x` it ate the colon and the body and left
+    # lambdef with no ":" to match. Only the zero-argument form worked.
+    "f = lambda x: x\ng = lambda a, b: a + b\n",
+    "h = lambda a, b=2: a\nv = lambda *a: a\nw = lambda **k: k\n",
+    "s = sorted(xs, key=lambda p: p.n)\nz = lambda x: (lambda y: x + y)\n",
 ]
 
 # Driver appended to a copy of rast.py: parse each snippet and print a canonical
