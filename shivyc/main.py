@@ -1375,6 +1375,34 @@ def link_objs(binary_name, obj_names, writable_text=False, low_mem=False,
                 with open(_crt_s) as _f:
                     _crt = _rasm_obj.assemble_to_elf(_f.read())
                 _ln.add_object(_crt_s, list(_crt))
+                # ...and the C half of the runtime (printf, malloc, getenv,
+                # syscall wrappers). It is compiled by this same compiler, so
+                # it is built once and cached next to the build tree rather
+                # than recompiled on every link.
+                _libc_c = os.path.join(_rlib, "rlibc.c")
+                if os.path.exists(_libc_c):
+                    _cache = os.environ.get(
+                        "SHIVYC_RLIBC_OBJ",
+                        os.path.join(_rlib, "build", "rlibc.o"))
+                    _stale = (not os.path.exists(_cache)
+                              or os.path.getmtime(_cache)
+                              < os.path.getmtime(_libc_c))
+                    if _stale:
+                        os.makedirs(os.path.dirname(_cache), exist_ok=True)
+                        _env = dict(os.environ)
+                        _env["SHIVYC_RASM"] = "1"
+                        _env.pop("SHIVYC_RLINK", None)
+                        _env["PYTHONPATH"] = _root
+                        _r = subprocess.run(
+                            [sys.executable, "-m", "shivyc.main", "-c",
+                             _libc_c, "-o", _cache],
+                            cwd=_root, env=_env, capture_output=True)
+                        if not os.path.exists(_cache):
+                            raise CompilerError(
+                                "could not build the rlink C runtime: %s"
+                                % _r.stderr.decode()[:200])
+                    with open(_cache, "rb") as _f:
+                        _ln.add_object(_cache, list(_f.read()))
 
             for _o in obj_names:
                 with open(_o, "rb") as _f:
