@@ -13,7 +13,7 @@ char    *fgets(char *, int, FILE*);
 int      fileno(FILE*);
 void     flockfile(FILE*);
 FILE    *fopen(const char *, const char *);
-int      fprintf(); // vargargs not yet implemented
+int      fprintf(FILE *, const char *, ...);
 int      fputc(int, FILE*);
 int      fputs(const char *, FILE*);
 size_t   fread(void *, size_t, size_t, FILE *);
@@ -34,7 +34,7 @@ int      getw(void *);
 int      pclose(void *);
 void     perror(const char *);
 void    *popen(const char *, const char *);
-int      printf(); // vargargs not yet implemented
+int      printf(const char *, ...);
 int      putc(int, FILE*);
 int      putchar(int);
 int      putc_unlocked(int, FILE*);
@@ -47,8 +47,8 @@ void     rewind(FILE *);
 int      scanf(); // vargargs not yet implemented
 void     setbuf(FILE*, char *);
 int      setvbuf(FILE*, char *, int, size_t);
-int      snprintf();  // vargargs not yet implemented
-int      sprintf();  // vargargs not yet implemented
+int      snprintf(char *, size_t, const char *, ...);
+int      sprintf(char *, const char *, ...);
 int      sscanf(); // vargargs not yet implemented
 char    *tempnam(const char *, const char *);
 FILE    *tmpfile(void);
