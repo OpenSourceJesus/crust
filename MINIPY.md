@@ -2458,3 +2458,69 @@ non-negative integer exponent. Fixing it wants a real `pow()` (exp/log).
 Parsing is the front half. `rast.py` parsing `py2c.py` in ~50s says nothing
 about how long that takes under minipy-native, and nothing at all about
 *executing* `py2c.py` under minipy, which has not been attempted.
+
+## Status update — running py2c.py under minipy: sys.exit, and where it stops
+
+With `rast.py` parsing everything, the next question is execution. Answer so
+far: **`py2c.py` compiles to minipy bytecode cleanly (690 functions, ~3s) and
+runs partway under the reference VM**, but does not yet complete under either
+executor.
+
+### py2c.py compiles fine
+
+`compiler.compile_file("tools/py2c.py")` succeeds in about 3 seconds. Nothing
+in py2c.py is outside minipy's front end. The problems are all at run time.
+
+### First blocker: `sys.exit` (fixed)
+
+minipy has no `sys` module object -- `ex_Attribute` special-cases exactly
+`sys.argv` and `sys.path` into pre-bound globals. `sys.exit` was not among
+them, so the attribute lookup failed. py2c.py's last statement is
+`sys.exit(main(sys.argv[1:]) or 0)`, so it died before producing any output.
+
+The diagnostic was the worst part: `minipy: unhandled exception: Exception`,
+with no message and no location. `_raise_attr_error` falls back to a bare
+`Exception` when the program registers no `AttributeError` class, which loses
+the attribute name. `MINIPY_TRACE_ATTR=1` now prints it; that is what turned an
+unactionable message into "sys.exit" in one run, and it is worth reaching for
+first the next time a bare `Exception` appears.
+
+The fix follows CPython rather than special-casing:
+
+* `SystemExit` added to `_BUILTIN_EXC`, based on `BaseException` -- so a
+  blanket `except Exception:` does not swallow an interpreter exit.
+* `ex_Call` rewrites `sys.exit(n)` into `raise SystemExit(n)`, reusing the
+  existing exception machinery rather than adding an exit opcode.
+* `_needed_builtin_excs` registers `SystemExit` when it sees a `sys.exit`
+  call. That scan runs over the *source* AST, before codegen synthesises the
+  `Name("SystemExit")`, so without this the class is absent when the RAISE
+  executes -- the rewrite compiled but could not run.
+* Both executors treat an unhandled `SystemExit` as a normal ending carrying a
+  status: `VM.exit_status` in compiler.py, `_exit_status()` in interp.py.
+  `rpy.py` propagates it, so `sys.exit(n)` means the same thing as under
+  CPython.
+* `sys.exit()` with no argument builds `SystemExit()` with empty `.args`, not
+  `SystemExit(0)`. Both mean status 0, but `len(e.args)` differs and CPython's
+  is 0.
+
+`tools/minipy/test_sys_exit.py` pins the observable semantics three ways:
+catchability, `.args`, passing through `except Exception`, and `finally`
+running on the way out.
+
+### Where it stops now
+
+| executor | result |
+|---|---|
+| reference VM | runs on past `sys.exit`, writes `shivyc_rt.{h,c}`, still going when the harness timed out |
+| native | fails immediately, `unhandled exception: Exception`, no output |
+
+The reference VM getting further than native is the informative part: this is a
+*second, different* failure, in the compiled interpreter rather than in the
+program or the bytecode. Next step is to instrument `raise_attr_error` in
+interp.py the way `_raise_attr_error` is instrumented in compiler.py, and
+rebuild -- the native binary has no equivalent trace today.
+
+Speed is the other open question. The reference VM is a pure-Python bytecode
+interpreter and is far too slow to transpile a file of any size; native is the
+only realistic target, and its throughput on py2c.py has not been measured
+because it has not yet completed a run.
