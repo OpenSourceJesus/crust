@@ -376,69 +376,29 @@ def _inf_val() -> "double":
 
 
 def _str_to_float(s: "char*") -> "double":
-    n = len(s)
-    if n == 0:
-        return 0.0
-    if s == "inf":
-        return _inf_val()
-    if s == "-inf":
-        return -_inf_val()
-    if s == "nan" or s == "-nan":
-        return _inf_val() - _inf_val()          # IEEE nan
-    i = 0
-    sign: "double" = 1.0
-    if s[0] == "-":
-        sign = -1.0
-        i = 1
-    elif s[0] == "+":
-        i = 1
-    intpart: "double" = 0.0
-    while i < n and ord(s[i]) >= 48 and ord(s[i]) <= 57:
-        intpart = intpart * 10.0 + float(ord(s[i]) - 48)
-        i = i + 1
-    frac: "double" = 0.0
-    scale: "double" = 1.0
-    if i < n and s[i] == ".":
-        i = i + 1
-        while i < n and ord(s[i]) >= 48 and ord(s[i]) <= 57:
-            frac = frac * 10.0 + float(ord(s[i]) - 48)
-            scale = scale * 10.0
-            i = i + 1
-    result: "double" = sign * (intpart + frac / scale)
-    # exponent suffix (e.g. repr(1e-10) == '1e-10'): scale by 10**exp so the
-    # float `repr()` values written into .mpyc constants round-trip exactly.
-    if i < n and (s[i] == "e" or s[i] == "E"):
-        i = i + 1
-        esign = 1
-        if i < n and s[i] == "-":
-            esign = -1
-            i = i + 1
-        elif i < n and s[i] == "+":
-            i = i + 1
-        exp = 0
-        while i < n and ord(s[i]) >= 48 and ord(s[i]) <= 57:
-            exp = exp * 10 + (ord(s[i]) - 48)
-            i = i + 1
-        p: "double" = 1.0
-        k = 0
-        while k < exp:
-            p = p * 10.0
-            k = k + 1
-        if esign < 0:
-            result = result / p
-        else:
-            result = result * p
-    return result
+    # float(s) lowers to strtod() in the compiled interpreter and is CPython's
+    # own converter under the reference VM, so both are correctly rounded.
+    #
+    # This used to parse the string by hand, scaling the exponent with a loop of
+    # `p = p * 10.0`. That accumulates rounding error: 308 multiplications turn
+    # 1e308 into 9.999999999999998e+307. The comment on that loop claimed the
+    # values would "round-trip exactly", which is precisely what they did not
+    # do -- and repr/parse round-tripping is what a self-hosted compile depends
+    # on when it writes float constants into generated code.
+    return float(s)
 
 
 def _fmt_float(d: "double") -> "char*":
-    if d > 1e308:
-        return "inf"
-    if d < -1e308:
-        return "-inf"
-    asint = int(d)
-    if float(asint) == d:
-        return str(asint) + ".0"
+    # str() on a double is CPython's repr under the reference VM, and
+    # fmt_double() in the py2c runtime natively -- both produce the shortest
+    # round-tripping decimal, with inf/-inf/nan handled. So there is nothing
+    # left for this function to special-case.
+    #
+    # It used to shortcut integral values as str(int(d)) + ".0". That was wrong
+    # twice over: int(d) is a 32-bit C int in the compiled interpreter, so any
+    # value past 2**31 overflowed and fell through to the old %g path (printing
+    # 123456789012345.0 as 1.23457e+14), and int(-0.0) is 0, so negative zero
+    # came back as "0.0".
     return str(d)
 
 
