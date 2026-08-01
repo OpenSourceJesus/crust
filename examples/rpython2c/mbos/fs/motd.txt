@@ -1,0 +1,7 @@
+crust / mbos
+------------
+This file lives in a tar archive that the bootloader dropped into memory
+as a Multiboot module. The kernel walked the archive at boot and built a
+file table pointing straight into it -- nothing was copied.
+
+Try: ls, cat hello.py, mem
