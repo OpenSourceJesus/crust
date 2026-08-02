@@ -121,6 +121,19 @@ int         ramfs_find(const char *name);   /* index, or -1 */
 const u8   *ramfs_data(int i, u32 *size);
 u32         ramfs_bytes(void);       /* size of the whole module */
 
+/* ---- mingine demo (mingine_mbos.c) ------------------------------------ */
+/* The three-language game engine, compiled into mbos by gcc. The same scene
+ * also builds as its own ShivyCX kernel; both report the same checksum. */
+unsigned int mingine_render(void);   /* draw the scene, return mg_checksum() */
+void mingine_present(void);          /* upscale and blit to the framebuffer  */
+int  mingine_width(void);
+int  mingine_height(void);
+int  mingine_ball_x(void);
+int  mingine_ball_y(void);
+int  mingine_foe_x(void);
+int  mingine_foe_y(void);
+int  mingine_score(void);
+
 /* ---- shell (shell.c) -------------------------------------------------- */
 void shell_run(void);            /* never returns */
 

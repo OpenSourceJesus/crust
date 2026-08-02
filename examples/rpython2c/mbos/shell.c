@@ -371,6 +371,48 @@ static int cmd_gfxtest(int argc, char **argv) {
     return 0;
 }
 
+/* Run the three-language engine and show the result.
+ *
+ * The checksum printed here is the same number examples/baremetal/
+ * kernel_mingine.c reports when ShivyCX builds that scene as its own kernel,
+ * and the same one the hosted build prints. Three compilers' worth of paths
+ * through the same Rust + rpython + C, one 32-bit answer. */
+static int cmd_demo(int argc, char **argv) {
+    unsigned int sum;
+    (void)argc; (void)argv;
+
+    con_puts("rendering (rust geometry + rpython rules + c blitting)...\n");
+    sum = mingine_render();
+    mingine_present();
+
+    con_puts("scene   ");
+    put_u64((u64)mingine_width()); con_putc('x');
+    put_u64((u64)mingine_height()); con_putc('\n');
+    con_puts("ball    ");
+    put_u64((u64)mingine_ball_x()); con_putc(',');
+    put_u64((u64)mingine_ball_y()); con_putc('\n');
+    con_puts("foe     ");
+    put_u64((u64)mingine_foe_x()); con_putc(',');
+    put_u64((u64)mingine_foe_y()); con_putc('\n');
+    con_puts("score   ");
+    put_u64((u64)mingine_score()); con_putc('\n');
+    con_puts("pixels  ");
+    put_hex64((u64)sum); con_putc('\n');
+
+    ser_puts("[mbos] demo pixels ");
+    ser_dec((u64)sum);
+    ser_puts(" ball ");
+    ser_dec((u64)mingine_ball_x()); ser_puts(",");
+    ser_dec((u64)mingine_ball_y());
+    ser_puts(" foe ");
+    ser_dec((u64)mingine_foe_x()); ser_puts(",");
+    ser_dec((u64)mingine_foe_y());
+    ser_puts(" score ");
+    ser_dec((u64)mingine_score());
+    ser_puts("\n");
+    return 0;
+}
+
 /* ---- ramdisk commands -------------------------------------------------- */
 
 static int cmd_ls(int argc, char **argv) {
@@ -434,6 +476,7 @@ static const struct command CMDS[] = {
     { "ticks",  cmd_ticks,  "raw timer tick count" },
     { "uptime", cmd_uptime, "seconds since boot" },
     { "ver",    cmd_ver,    "kernel and console info" },
+    { "demo",   cmd_demo,   "run the mingine scene on the framebuffer" },
     { "gfx",    cmd_gfx,    "display mode, stride, vram" },
     { "gfxtest",cmd_gfxtest,"draw test bars to the framebuffer" },
     { "ls",     cmd_ls,     "list files on the ramdisk" },

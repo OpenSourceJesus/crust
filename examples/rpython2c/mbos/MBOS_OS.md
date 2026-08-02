@@ -341,3 +341,51 @@ now on the include path.
 The kernel carries its own COM1 routines rather than using minikraft's console.
 That keeps the image dependent on no OS piece at all, which is what lets the
 test assert the whole thing is ShivyCX's output.
+
+## mingine inside mbos: three compilers, one checksum
+
+The engine now also runs *under mbos*, built by gcc, as the shell's `demo`
+command — `mingine_mbos.c` renders the scene and hands the buffer to
+`gfx_present()`, which is the path that function was written for.
+
+So the same `scene.c` is now built three ways:
+
+| build | compiler | pixels |
+|---|---|---|
+| hosted process | ShivyCX | `41fcd6e7` |
+| bootable kernel | ShivyCX | `41fcd6e7` |
+| inside mbos | gcc | `41fcd6e7` |
+
+The third one is what makes the comparison worth something. The first two share
+a compiler: if ShivyCX ever miscompiled the engine — a wrong shift, a sign
+extension, an off-by-one in the Rust splice — agreeing with itself in two
+places would not reveal it. Agreeing with gcc would be a coincidence.
+`make mbos-test-mingine` asserts it, along with the sprite positions, so a
+future mismatch says whether the simulation diverged or only the rasterisation.
+
+### Getting the non-C halves past gcc
+
+ShivyCX splices `#include "mingine.rs"` and `#include "mingine.py"` itself.
+`gen_mingine.py` pre-lowers both — Rust through `shivyc/crust.py`, rpython
+through `tools/py2c.py` — and writes the resulting C out **under the original
+file names** into a staging directory, with `mingine.c` and `scene.c` copied in
+beside them. A quoted include resolves relative to the including file first, so
+the staged `mingine.c` finds the staged (now-C) `mingine.rs`. The engine
+compiles unmodified; only its dependencies are substituted.
+
+The alternative — a gcc-flavoured fork of `mingine.c` — would give two copies
+to keep in step, which defeats the point.
+
+The lowered rpython needs exactly two runtime symbols, `pymod` and `pyfdiv`
+(Python's floor-division and modulo take the sign of the divisor, unlike C's).
+`mingine_mbos.c` defines both rather than linking the whole ShivyCX runtime
+into the kernel for twenty lines.
+
+### mingine.rs is now rustc-checkable
+
+Four parameters were `*const Rect` / `*const Sprite` with `.field` access.
+Crust auto-derefs a raw pointer there; real Rust does not, so rustc rejected
+the file. Changing them to `&Rect` / `&Sprite` satisfies both toolchains, and
+the checksum was unchanged across the edit — which is exactly what that oracle
+is for. `make test-mingine` now runs rustc over the engine's Rust half first,
+skipping if no toolchain is present.
