@@ -285,3 +285,59 @@ relocation for branches to a `.global` symbol while `as` resolves same-section
 branches and relaxes nine of them to rel8. Functionally identical once linked.
 The mbos build still uses gcc for `idt.o` so that `rlink_baremetal_test.py` can
 keep comparing symbol addresses against an `ld`-built reference.
+
+---
+
+## A ShivyCX-built game kernel
+
+Separate from mbos, and the most direct exercise of the self-hosting path so
+far: `examples/baremetal/kernel_mingine.c` is a bootable image in which
+**every instruction came from ShivyCX** — `OS pieces linked in: (none)`.
+
+One translation unit, three languages, no FFI: C, plus Rust spliced in from
+`mingine.rs` by `shivyc/crust.py`, plus rpython lowered from `mingine.py` by
+`py2c.py`. It brings up a Bochs-VBE framebuffer over PCI, renders the shared
+scene in `examples/crust/baremetalgames/scene.c`, and blits it to the screen.
+
+`make test-mingine` compiles that same `scene.c` twice — hosted as a process,
+and as the kernel — and requires the two to agree:
+
+```
+scene 320x200 frames 24     ball 105,114
+foe 178,144                 score 594
+pixels 41fcd6e7             <- identical in both
+```
+
+The checksum is the point. "It booted and something appeared" is compatible
+with a great many bugs; "every pixel of the final frame hashes the same in both
+worlds" is not.
+
+### Three bugs this found in the bare-metal boot path
+
+All in minikraft's 64-bit stub, all latent because nothing had booted an image
+that needed them.
+
+1. **No Multiboot AOUT kludge.** `MB_FLAGS` was `0`, so `qemu -kernel` read the
+   ELF class, found ELFCLASS64, and refused with *"Cannot load x86-64 image,
+   give a 32bit one"*. Every `--image` build was unbootable this way. Fixed by
+   setting bit 16 and adding the five address fields, with `_load_start` /
+   `_load_end` / `_bss_end` now defined in `kernel64.ld`. mbos's own `boot64.S`
+   had solved this and documented why; minikraft's had not.
+
+2. **Only 1 GiB identity-mapped.** QEMU puts the Bochs-VBE framebuffer up
+   around `0xFD000000`, so writing a pixel page-faulted. Now maps 4 GiB with
+   four PDs, the same as mbos.
+
+3. **`ENABLE_LOGGING` never defined.** minikraft wraps every
+   `console_putchar` / `console_puts` body in `#ifdef ENABLE_LOGGING`, so the
+   console linked and did nothing. A "prints to VGA/serial" demo booted
+   silently. Now defined in `_BASE_CFLAGS`.
+
+Also fixed: `shivycx_baremetal.py` copies the app into a temp directory before
+compiling, which silently broke any `#include "..."` the app made relative to
+itself, so a multi-file application could not build. The original directory is
+now on the include path.
+
+The kernel carries its own COM1 routines rather than using minikraft's console.
+That keeps the image dependent on no OS piece at all, which is what lets the
+test assert the whole thing is ShivyCX's output.
