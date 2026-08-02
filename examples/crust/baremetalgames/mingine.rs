@@ -59,7 +59,7 @@ impl Rect {
     // survives, which is the caller's signal to draw nothing at all -- every
     // blit in the engine goes through here, so an off-screen sprite costs one
     // comparison rather than a loop over pixels that are thrown away.
-    fn clip(&mut self, bounds: *const Rect) -> i32 {
+    fn clip(&mut self, bounds: &Rect) -> i32 {
         let mut x0: i32 = self.x;
         let mut y0: i32 = self.y;
         let mut x1: i32 = self.x + self.w;
@@ -86,7 +86,7 @@ impl Rect {
         1
     }
 
-    fn overlaps(&self, other: *const Rect) -> i32 {
+    fn overlaps(&self, other: &Rect) -> i32 {
         if self.right() <= other.x {
             return 0;
         }
@@ -183,7 +183,7 @@ impl Sprite {
     }
 
     // Advance one tick, bouncing off the walls of `bounds`.
-    fn step(&mut self, bounds: *const Rect) {
+    fn step(&mut self, bounds: &Rect) {
         self.body.x = self.body.x + self.dx;
         self.body.y = self.body.y + self.dy;
         if self.body.x < bounds.x {
@@ -204,7 +204,7 @@ impl Sprite {
         }
     }
 
-    fn hits(&self, other: *const Sprite) -> i32 {
+    fn hits(&self, other: &Sprite) -> i32 {
         if self.alive == 0 {
             return 0;
         }
