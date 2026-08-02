@@ -48,6 +48,10 @@ _BASE_CFLAGS = [
     "-fno-pic",
     "-mno-red-zone",
     "-std=c11",
+    # minikraft wraps every console_putchar/console_puts body in
+    # `#ifdef ENABLE_LOGGING`. Without this the console links but does
+    # nothing, so a "prints to VGA/serial" demo boots silently.
+    "-DENABLE_LOGGING",
 ]
 
 
@@ -142,8 +146,14 @@ class BareMetalLinker:
         app_copy = os.path.join(self.workdir, os.path.basename(app_c))
         if os.path.abspath(app_copy) != os.path.abspath(app_c):
             shutil.copyfile(app_c, app_copy)
+        # The copy above moves the source away from its own directory, which
+        # silently breaks any `#include "..."` the app makes relative to
+        # itself. Put the original directory back on the include path so a
+        # multi-file application still resolves.
+        inc_app = os.path.dirname(os.path.abspath(app_c))
         cmd = [sys.executable, "-m", "shivyc.main", app_copy,
-               "-c", "-o", app_obj, "-I", inc_kernel, "-I", inc_include]
+               "-c", "-o", app_obj, "-I", inc_kernel, "-I", inc_include,
+               "-I", inc_app]
         self._log("compiling app with ShivyCX:", os.path.basename(app_c))
         r = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
         if r.returncode != 0 or not os.path.exists(app_obj):
@@ -222,6 +232,9 @@ class BareMetalLinker:
         if self._owns_workdir and os.path.isdir(self.workdir):
             shutil.rmtree(self.workdir, ignore_errors=True)
 
+    # Defined by kernel64.ld rather than by any translation unit.
+    _LINKER_PROVIDED = ("_load_start", "_load_end", "_bss_end")
+
     # -- bootable image (boot64.S + kernel64.ld) ------------------------
     def _install_idt64_overrides(self):
         """Swap the 32-bit idt.c out of the symbol pool and swap in the 64-bit
@@ -295,7 +308,11 @@ class BareMetalLinker:
         # closure over (app + boot) undefined symbols; app/boot define kmain,
         # _start, etc., so those are not "missing".
         always = [app_obj, boot_obj]
-        provided = set()
+        # Symbols the *linker script* defines, not any object: boot64.S's
+        # Multiboot AOUT-kludge header references the image layout, which only
+        # exists once ld has laid it out. They are not missing, so they must
+        # not be reported as such.
+        provided = set(self._LINKER_PROVIDED)
         seed = set()
         for o in always:
             provided.update(_defined_syms(o, nm))
