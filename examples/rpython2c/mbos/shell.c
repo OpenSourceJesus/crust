@@ -288,6 +288,89 @@ static int cmd_memtest(int argc, char **argv) {
     return 0;
 }
 
+/* ---- graphics ---------------------------------------------------------- */
+
+/* What the display device actually reports, as opposed to what the build asked
+ * for. The two differ more often at hi-res than anywhere else: a mode can fit
+ * the geometry limits and still not fit in video memory, and the scanline
+ * stride is not always the width. */
+static int cmd_gfx(int argc, char **argv) {
+    if (!gfx_up()) {
+        con_puts("no framebuffer (vga text mode)\n");
+        return 1;
+    }
+
+    if (argc >= 3 && mini_strcmp(argv[1], "fits") == 0) {
+        con_puts("usage: gfx fits <w> <h>\n");
+        return 1;
+    }
+
+    con_puts("mode    ");
+    put_u64((u64)gfx_width());  con_putc('x');
+    put_u64((u64)gfx_height()); con_puts(" 32bpp\n");
+
+    con_puts("stride  ");
+    put_u64((u64)gfx_stride());
+    con_puts(gfx_stride() == gfx_width() ? " px (== width)\n"
+                                         : " px (padded)\n");
+
+    con_puts("max     ");
+    put_u64((u64)gfx_max_width());  con_putc('x');
+    put_u64((u64)gfx_max_height()); con_putc('\n');
+
+    con_puts("vram    ");
+    put_u64((u64)(gfx_vram() >> 20)); con_puts(" MiB\n");
+
+    con_puts("frame   ");
+    put_u64(((u64)gfx_width() * gfx_height() * 4) >> 20);
+    con_puts(" MiB\n");
+
+    ser_puts("[mbos] gfx ");
+    ser_dec(gfx_width()); ser_puts("x"); ser_dec(gfx_height());
+    ser_puts(" stride "); ser_dec(gfx_stride());
+    ser_puts(" vram "); ser_dec(gfx_vram());
+    ser_puts(" max "); ser_dec(gfx_max_width());
+    ser_puts("x"); ser_dec(gfx_max_height());
+    ser_puts("\n");
+    return 0;
+}
+
+/* Draw straight to the framebuffer: colour bars, a gradient, and a set of
+ * one-pixel markers at the four corners. The corners are the useful part --
+ * if the stride is wrong the right-hand markers walk diagonally down the
+ * screen instead of sitting on the edge, which is visible at a glance and is
+ * exactly the bug that assuming stride == width would cause. */
+static int cmd_gfxtest(int argc, char **argv) {
+    u32 w = gfx_width(), h = gfx_height();
+    u32 i, x, y;
+    static const u32 BARS[8] = {
+        0xFFFFFF, 0xFFFF00, 0x00FFFF, 0x00FF00,
+        0xFF00FF, 0xFF0000, 0x0000FF, 0x202020
+    };
+    (void)argc; (void)argv;
+
+    if (!gfx_up()) { con_puts("no framebuffer\n"); return 1; }
+
+    for (i = 0; i < 8; i++)
+        gfx_rect(i * (w / 8), 0, w / 8, h / 2, BARS[i]);
+
+    for (y = h / 2; y < h; y++) {
+        u32 v = ((y - h / 2) * 255) / (h - h / 2);
+        gfx_rect(0, y, w, 1, (v << 16) | (v << 8) | v);
+    }
+
+    for (x = 0; x < 16; x++) {
+        gfx_pixel(x, 0, 0xFF0000);
+        gfx_pixel(w - 1 - x, 0, 0x00FF00);
+        gfx_pixel(x, h - 1, 0x0000FF);
+        gfx_pixel(w - 1 - x, h - 1, 0xFFFF00);
+    }
+
+    ser_puts("[mbos] gfxtest drew ");
+    ser_dec(w); ser_puts("x"); ser_dec(h); ser_puts("\n");
+    return 0;
+}
+
 /* ---- ramdisk commands -------------------------------------------------- */
 
 static int cmd_ls(int argc, char **argv) {
@@ -351,6 +434,8 @@ static const struct command CMDS[] = {
     { "ticks",  cmd_ticks,  "raw timer tick count" },
     { "uptime", cmd_uptime, "seconds since boot" },
     { "ver",    cmd_ver,    "kernel and console info" },
+    { "gfx",    cmd_gfx,    "display mode, stride, vram" },
+    { "gfxtest",cmd_gfxtest,"draw test bars to the framebuffer" },
     { "ls",     cmd_ls,     "list files on the ramdisk" },
     { "cat",    cmd_cat,    "print a ramdisk file: cat <name>" },
     { "mem",    cmd_mem,    "heap summary; 'mem map', 'mem check'" },

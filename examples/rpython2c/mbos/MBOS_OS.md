@@ -16,6 +16,9 @@ make test       render self-test
 make test-irq   timer + keyboard interrupts
 make test-shell shell dispatch, line editing, history
 make test-alloc heap: split, coalesce, rejection paths
+make test-fs    ramdisk: module discovery, tar walk, corrupt archives
+make test-gfx   graphics: caps, stride, mode negotiation to 3840x2160
+make fourk      boot at 3840x2160 in a QEMU window
 make check-rs   rustc over the Rust-authored modules
 ```
 
@@ -26,12 +29,13 @@ make check-rs   rustc over the Rust-authored modules
 | Layer | Files | State |
 |---|---|---|
 | Boot, long mode | `boot64.S` | works |
-| Console, framebuffer | `console.c`, `vbe.c`, `font8x16.h` | works |
+| Console, framebuffer | `console.c`, `font8x16.h` | works |
+| Graphics (to 4K) | `vbe.c` | works |
 | Interrupts | `idt.S`, `irq.c` | works |
 | Keyboard | `kbd.c` | works |
 | Shell | `shell.c`, `editbuf.rs` | works |
 | Heap | `alloc.c`, `alloc.rs` | works |
-| Filesystem | — | next |
+| Ramdisk | `ramfs.c`, `tarfs.rs`, `fs/` | works |
 | minipy | `tools/minipy/`, `tools/rpy_lib/rast.py` | not started |
 
 The toolchain half is further along than the OS half, which is unusual and
@@ -111,6 +115,95 @@ That has to be revisited when preemption arrives.
 available before anything else initialises. Step 4 brings in the Multiboot
 memory map, at which point this becomes the early-boot fallback.
 
+## Ramdisk (`ramfs.c`, `tarfs.rs`)
+
+Everything in `fs/` is tarred into `build/initrd.tar` at build time and handed
+to the kernel as a Multiboot module (`qemu -initrd`). `ramfs.c` finds the
+module through the Multiboot info structure, walks the archive, and builds a
+file table. `ls` and `cat` read it from the shell.
+
+Plain ustar, no compression — the kernel has no inflate and does not need one.
+
+**Nothing is copied.** The table points into the module image where the
+bootloader left it, so a 1 MiB ramdisk costs a few hundred bytes of heap rather
+than a second megabyte. That is safe because the ramdisk is read-only by
+construction, which is also why there is no write path here to get wrong.
+
+`tarfs.rs` holds the header parsing: fixed-offset fields of NUL-or-space
+terminated octal. That is parsing that fails quietly — an unterminated field
+runs into the next one, a digit outside 0-7 gets silently accepted, a size that
+overflows wraps into something plausible. Each of those is a bounds or range
+check, so it belongs on the checked side. `ramfs.c` keeps the pointer
+arithmetic and the Multiboot layout.
+
+Both the ustar magic *and* the header checksum are verified. The magic says
+this looks like a header; the checksum says it is one. Without the second, a
+walk that lost alignment would read file data as a header and keep going.
+
+A ramdisk arrives from outside the kernel, so `make test-fs` boots deliberately
+corrupted archives — a flipped header byte, a non-octal digit in the size
+field, an archive cut in half — and requires each to be refused with a message
+rather than faulted on. Booting with no ramdisk at all is also a normal
+outcome, not an error.
+
+The test compares the guest's view against the host's `tarfile` module: same
+names, same sizes, same file count, and `cat` output matching the source file
+line for line. That last one is the real check on the data pointer — a stride
+bug still produces plausible entries, but only a correct walk lands the data on
+the right byte.
+
+## Graphics (`vbe.c`)
+
+QEMU's std VGA exposes the Bochs display interface (DISPI) on ports
+0x1CE/0x1CF, so a linear-framebuffer mode can be set with no real-mode BIOS
+calls. mbos now runs up to **3840x2160** at 32bpp.
+
+Three things the driver learned:
+
+**Capabilities are queried, not assumed.** Setting the `GETCAPS` bit makes the
+geometry registers report maxima instead of the current mode; the VRAM register
+is a count of 64 KiB units. On QEMU's std VGA that comes back as a maximum of
+16000x12000 with 16 MiB of memory.
+
+**Geometry limits and memory limits are different limits**, and the second is
+the one that bites. 3840x2160 is well inside 16000x12000 but needs 31.6 MiB, so
+a 16 MiB device accepts the mode and then scans out past the end of VRAM.
+`gfx_mode_fits()` checks both, and an impossible mode is refused with a
+diagnostic naming the limit that was hit, falling back to VGA text:
+
+```
+[gfx] requested mode exceeds the device: 3840x2160 needs 31 MiB,
+      device has 16 MiB, max 16000x12000
+[con] text console
+```
+
+**Stride is not width.** The scanline stride is the device's *virtual* width,
+which it may round up for alignment. The old code indexed `fb[y * width + x]`,
+which is right for the common cases and quietly shears the image when it is
+not. The driver now takes `DISPI_VIRT_WIDTH` from the hardware.
+
+`gfx_present()` blits a caller-owned RAM buffer of exactly width x height
+pixels. That is the path a game should draw through: writes to VRAM are
+write-combined and fast, reads are not. `gfx_scroll()` is the one place the
+kernel still reads VRAM, and it is why console scrolling is the slowest thing
+at hi-res -- a one-line scroll at 4K moves ~32 MiB each way. A RAM back buffer
+would fix both that and give double buffering; it is the obvious next step.
+
+Shell: `gfx` reports mode, stride, VRAM and device maxima; `gfxtest` draws
+colour bars, a gradient, and corner markers.
+
+`make test-gfx` covers all of it, including reading the corner markers back out
+of a screenshot -- with a wrong stride the right-hand markers walk diagonally
+down the screen instead of sitting on the edge, which is precisely the failure
+the old code would have produced.
+
+### Correction to the README
+
+`examples/rpython2c/mbos/README.md` says hi-res needs `-device
+VGA,vgamem_mb=64`. That is true past roughly 2560x1600, but **1920x1080 needs
+only 7.9 MiB and runs fine on the 16 MiB std device** -- `make test-gfx`
+asserts it. 64 MiB is genuinely required at 4K.
+
 ---
 
 ## Writing parts of the kernel in Rust
@@ -166,8 +259,6 @@ knowing before relying on the Rust side feeling safe.
 
 ## Remaining steps
 
-**4. Ramdisk.** Pass a Multiboot module holding `.py` files. Easier than a disk
-driver and enough for "processes" to start meaning something.
 
 **5. minipy in-kernel.** `MINIPY.md` has minipy shelling out to `python3` to
 turn a `.py` file into a JSON AST. On bare metal there is no `python3` to shell

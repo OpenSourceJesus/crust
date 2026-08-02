@@ -56,22 +56,90 @@ void con_set_attr(u8 attr);
 void con_putc(char c);           /* also mirrored to serial */
 void con_puts(const char *s);
 void con_newline(void);
+void con_backspace(void);        /* erase the cell left of the cursor */
+void con_set_col(int col);       /* move the cursor within the current row */
+void con_clear_eol(void);         /* blank from the cursor to the row end */
+void con_mirror(int on);         /* enable/disable the serial mirror */
 int  con_col(void);              /* current cursor column (for word-wrap) */
 int  con_cols(void);             /* total character columns (text 80, gfx W/8) */
 int  con_rows(void);             /* total character rows */
 
 /* Serial-only output, for the headless test harness to scrape. */
 void ser_puts(const char *s);
+void ser_dec(u64 v);             /* decimal, for geometry/size diagnostics */
+
+/* ---- interrupts: 64-bit IDT + 8259 PIC + PIT (irq.c, idt.S) ----------- */
+/* Not built into the 32-bit text-mode kernel -- idt.S is long mode only. */
+typedef void (*irq_handler_t)(void);
+
+void irq_init(u32 hz);           /* IDT + PIC remap + timer + kbd, then sti  */
+void idt_init(void);
+void irq_register(u8 vec, irq_handler_t handler);
+void pic_enable_irq(u8 irq);
+void pit_init(u32 hz);
+u64  irq_ticks(void);            /* monotonic tick count since irq_init      */
+
+/* ---- keyboard: PS/2, scancode set 1 (kbd.c) --------------------------- */
+/* Extended keys are delivered above the ASCII range so a reader can switch on
+ * the value directly instead of decoding an escape sequence. */
+#define KEY_UP      0x100
+#define KEY_DOWN    0x101
+#define KEY_LEFT    0x102
+#define KEY_RIGHT   0x103
+#define KEY_HOME    0x104
+#define KEY_END     0x105
+#define KEY_DELETE  0x106
+
+void kbd_init(void);
+int  kbd_getch(void);            /* next char, or -1 if the ring is empty    */
+int  kbd_haskey(void);
+
+/* ---- kernel heap (alloc.c + alloc.rs) --------------------------------- */
+/* Block bookkeeping lives in alloc.rs and is checked by rustc; alloc.c owns
+ * the arena and the offset-to-pointer translation. Not interrupt-safe. */
+void  *kmalloc(size_t n);
+void  *kzalloc(size_t n);        /* kmalloc + zero */
+void   kfree(void *p);           /* NULL is a no-op; a bad pointer is reported */
+void   kheap_init(void);
+
+size_t kheap_total(void);
+size_t kheap_used(void);
+size_t kheap_largest(void);      /* biggest free run -- fragmentation signal */
+int    kheap_blocks(void);
+int    kheap_failures(void);
+int    kheap_verify(void);       /* 0 = consistent, else 1-based bad block */
+int    kheap_block(int i, size_t *off, size_t *size, int *used);
+
+/* ---- ramdisk (ramfs.c + tarfs.rs) ------------------------------------- */
+/* A tar archive handed to the kernel as a Multiboot module. Read-only: the
+ * table points into the module image rather than copying it. */
+int         ramfs_init(void *mbi);   /* returns the file count */
+int         ramfs_count(void);
+const char *ramfs_name(int i);
+u32         ramfs_size(int i);
+int         ramfs_find(const char *name);   /* index, or -1 */
+const u8   *ramfs_data(int i, u32 *size);
+u32         ramfs_bytes(void);       /* size of the whole module */
+
+/* ---- shell (shell.c) -------------------------------------------------- */
+void shell_run(void);            /* never returns */
 
 /* ---- graphics: Bochs-VBE linear framebuffer (vbe.c) ------------------- */
 int  gfx_init(u32 w, u32 h);     /* 0 on success; sets a 32-bpp LFB mode    */
 int  gfx_up(void);
 u32  gfx_width(void);
 u32  gfx_height(void);
+u32  gfx_stride(void);           /* pixels per scanline; may exceed width   */
+u32  gfx_vram(void);             /* bytes of video memory reported          */
+u32  gfx_max_width(void);        /* device maximum, from the GETCAPS query  */
+u32  gfx_max_height(void);
+int  gfx_mode_fits(u32 w, u32 h);/* geometry AND memory both allow it       */
 void gfx_pixel(u32 x, u32 y, u32 rgb);
 void gfx_fill(u32 rgb);
+void gfx_rect(u32 x, u32 y, u32 w, u32 h, u32 rgb);
 void gfx_glyph(const u8 *rows, u32 px, u32 py, u32 fg, u32 bg);
 void gfx_scroll(u32 dy, u32 bg);
+void gfx_present(const u32 *src); /* blit a width*height RAM buffer         */
 
 /* Default graphics geometry (fits the 16 MiB std-VGA default; override in the
  * Makefile with -DMBOS_GFX_W / -DMBOS_GFX_H for the hi-res target). */

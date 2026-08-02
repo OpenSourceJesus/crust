@@ -21,6 +21,7 @@ static u8  s_attr = 0;
 static int s_cols = VGA_COLS;
 static int s_rows = VGA_ROWS;
 static int s_gfx = 0;
+static int s_mirror = 1;    /* mirror con_putc to serial? */
 
 /* 16-colour VGA palette -> RGB, for graphics mode. */
 static const u32 PALETTE[16] = {
@@ -43,6 +44,17 @@ static void serial_putc(char c) {
 }
 void ser_puts(const char *s) {
     while (*s) { if (*s == '\n') serial_putc('\r'); serial_putc(*s++); }
+}
+
+/* Decimal to serial. There is no printf on bare metal, and the diagnostics
+ * that matter most -- geometry, sizes, counts -- are all numbers. */
+void ser_dec(u64 v) {
+    char buf[24];
+    int i = 23;
+    buf[i] = 0;
+    if (v == 0) buf[--i] = '0';
+    while (v > 0) { buf[--i] = (char)('0' + (v % 10)); v /= 10; }
+    ser_puts(&buf[i]);
 }
 
 /* ---- attribute helpers ------------------------------------------------- */
@@ -127,13 +139,48 @@ void con_newline(void) {
     move_cursor();
 }
 
+/* Serial mirroring is on by default so the headless tests see everything the
+ * screen shows. The line editor turns it off while repainting: a redraw is a
+ * screen operation, and echoing every intermediate state of the line to serial
+ * turns the log into noise. */
+void con_mirror(int on) { s_mirror = on; }
+
 void con_putc(char c) {
     if (c == '\n') { con_newline(); return; }
     draw_cell(s_col, s_row, c);
-    { int spin = 100000; while (spin-- > 0 && (inb(COM1 + 5) & 0x20) == 0) {} outb(COM1, (u8)c); }
+    if (s_mirror) { int spin = 100000; while (spin-- > 0 && (inb(COM1 + 5) & 0x20) == 0) {} outb(COM1, (u8)c); }
     s_col++;
     if (s_col >= s_cols) con_newline();
     else move_cursor();
 }
 
 void con_puts(const char *s) { while (*s) con_putc(*s++); }
+
+/* ---- line-editing primitives ------------------------------------------
+ *
+ * The renderers only ever append, so the console never needed to move the
+ * cursor backwards or erase. A line editor does: after an insert or a delete
+ * in the middle of the line it repaints the tail, which means rewinding to a
+ * known column and clearing whatever the previous, longer line left behind.
+ */
+void con_set_col(int col) {
+    if (col < 0) col = 0;
+    if (col > s_cols - 1) col = s_cols - 1;
+    s_col = col;
+    move_cursor();
+}
+
+void con_clear_eol(void) {
+    int c;
+    for (c = s_col; c < s_cols; c++) draw_cell(c, s_row, ' ');
+    move_cursor();
+}
+
+/* Erase the character to the left of the cursor. */
+void con_backspace(void) {
+    if (s_col == 0) return;
+    s_col--;
+    draw_cell(s_col, s_row, ' ');
+    move_cursor();
+    ser_puts("\b \b");
+}
