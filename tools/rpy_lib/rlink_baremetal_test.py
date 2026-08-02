@@ -36,8 +36,23 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 MBOS = os.path.join(REPO, "examples", "rpython2c", "mbos")
 SCRIPT = os.path.join(MBOS, "linker64.ld")
 BOOT = os.path.join(MBOS, "boot64.S")
-COBJS = ["main.o", "console.o", "libmini.o", "dom.o", "html.o", "render.o",
-         "net.o", "vbe.o"]
+# Must stay in the same order as the Makefile's link line -- symbol addresses
+# are compared against the ld-built build/mbos.elf, and input order decides
+# them.
+#
+# idt.o here is the gcc-built one from the Makefile. rasm *can* assemble idt.S
+# since macro support landed (see rasm_macro_test.py), but its object is 27
+# bytes larger: rasm keeps a relocation for branches to a global symbol, so it
+# cannot relax nine of them to rel8 the way gas does. Using it would shift
+# every symbol address and this test compares those against ld's. boot64.S
+# below is still assembled by rasm, so the rasm path stays covered.
+COBJS = ["idt.o",
+         # COBJS from the mbos Makefile, in order
+         "main.o", "console.o", "libmini.o", "dom.o", "html.o", "render.o",
+         "net.o", "vbe.o", "irq.o", "kbd.o", "shell.o", "alloc.o", "ramfs.o",
+         "mingine_mbos.o",
+         # RSOBJS: lowered from .rs by gen_rs.py, linked last
+         "rs_editbuf.o", "rs_alloc.o", "rs_tarfs.o"]
 
 
 def run(cmd, **kw):
