@@ -3,6 +3,8 @@
 
 Main Crust Documentation: [CRUST.md](CRUST.md)
 
+Crust Paper: https://doi.org/10.5281/zenodo.21777457
+
 Modern systems development forces engineers to choose between two paradigms:
 - The ubiquitous simplicity and legacy ecosystem of C.
 - The type safety, spatial memory guarantees, and modern ergonomics of Rust.
