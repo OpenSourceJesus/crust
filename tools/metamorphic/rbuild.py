@@ -11,7 +11,23 @@ sys.path.insert(0, RLIB)
 import rasm_obj, rlink
 
 
+def min_load_base():
+    """The lowest page a normal process may mmap. Loading below this segfaults,
+    so callers must not ask for a base under it (common values: 0x1000, 0x10000)."""
+    try:
+        with open("/proc/sys/vm/mmap_min_addr") as f:
+            v = int(f.read().strip())
+    except Exception:
+        v = 0x10000
+    return (v + 0xFFF) & ~0xFFF if v else 0x1000
+
+
+def effective_base(requested=0x1000):
+    return max(requested, min_load_base())
+
+
 def build(asm_path, out_path, base=0x1000):
+    base = effective_base(base)
     ln = rlink.Linker()
     ln.entry_name = "_start"
     ln.base = base
@@ -41,4 +57,4 @@ def build(asm_path, out_path, base=0x1000):
 if __name__ == "__main__":
     base = int(sys.argv[3], 0) if len(sys.argv) > 3 else 0x1000
     build(sys.argv[1], sys.argv[2], base)
-    print("built %s (base 0x%x)" % (sys.argv[2], base))
+    print("built %s (base 0x%x)" % (sys.argv[2], effective_base(base)))
