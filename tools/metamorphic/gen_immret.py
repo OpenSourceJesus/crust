@@ -25,10 +25,8 @@ Leaf work is identical (eax = x*3+1); the jump register is edx so it never
 clobbers the result in eax. Off-page slots for the memory variants; the
 immediate variants mprotect their code page RWX so the patch can land.
 """
-import sys
-
-N = 60_000_000
-
+import os, sys
+N = int(os.environ.get("METAMORPHIC_N", "60000000"))
 
 def s_bytes(text):
     return ",".join(str(b) for b in (text.encode() + b"\x00"))
