@@ -16,9 +16,8 @@ pure jumps.
     python3 bench_deep.py 4 8 16 24 32 48 64
 """
 import os, re, subprocess, sys, statistics
-
 HERE = os.path.dirname(os.path.abspath(__file__))
-N = 20_000_000
+N = int(os.environ.get("METAMORPHIC_N", "20000000"))
 LINE = re.compile(r"(NCALL|NMHO)\s+(\d+)\s+cyc", re.M)
 
 
