@@ -20,9 +20,8 @@ text in an R+X segment, so main mprotects the text pages to RWX at startup.
 That is the honest cost of the SMC-adjacent design and is exactly what the
 real -fmetamorphic .mtext section asks the loader for.
 """
-import sys
-
-N = 60_000_000
+import os, sys
+N = int(os.environ.get("METAMORPHIC_N", "60000000"))
 
 
 def s_bytes(text):
