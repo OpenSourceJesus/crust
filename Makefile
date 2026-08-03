@@ -659,6 +659,9 @@ benchmarks_report_fast:
 	-python3 benchmarks/plot_minipy.py $(BENCH_PLOT_DIR)
 	-python3 benchmarks/run_crust_benchmarks.py --quick
 	-python3 benchmarks/plot_crust.py $(BENCH_PLOT_DIR)
+	-METAMORPHIC_N=6000000 METAMORPHIC_DEPTHS="4 16 24 32 48" \
+		python3 benchmarks/run_metamorphic_benchmarks.py
+	-python3 benchmarks/plot_metamorphic.py $(BENCH_PLOT_DIR)
 	@command -v pdflatex >/dev/null 2>&1 || { \
 		echo "pdflatex not found; figures are in $(BENCH_PLOT_DIR)."; \
 		exit 0; }
@@ -684,6 +687,10 @@ benchmarks_report:
 	-python3 benchmarks/plot_results.py
 	-cp benchmarks/results/benchmarks.png benchmarks/results/benchmarks2.png \
 		$(BENCH_PLOT_DIR)/ 2>/dev/null || true
+# The metamorphic-return study: run the self-hosted rasm+rlink microbenchmarks
+# and render the two-panel figure. Tolerated failing like the rest.
+	-python3 benchmarks/run_metamorphic_benchmarks.py
+	-python3 benchmarks/plot_metamorphic.py $(BENCH_PLOT_DIR)
 	@command -v pdflatex >/dev/null 2>&1 || { \
 		echo "pdflatex not found; figures are in $(BENCH_PLOT_DIR) but the PDF was not built."; \
 		exit 0; }
