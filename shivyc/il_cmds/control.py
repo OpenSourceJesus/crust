@@ -262,8 +262,8 @@ class Return(ILCommand):
             asm_code.add(asm_cmds.Mov(spots.RSP, spots.RBP, 8))
             asm_code.add(asm_cmds.Pop(spots.RBP, None, 8))
 
-        # Metamorphic return: jump through the writable .text slot the caller
-        # patched, instead of popping a return address off the stack.
+        # Metamorphic return: jump through the slot in writable .data that the
+        # caller patched, instead of popping a return address off the stack.
         slot = getattr(asm_code, "metamorphic_current", None)
         if slot:
             asm_code.add(asm_cmds.Raw("jmp QWORD PTR [rip + %s]" % slot))
@@ -693,9 +693,10 @@ class Call(ILCommand):
             asm_code.add(asm_cmds.Raw(
                 "lea r11, [rsp + %d]" % (8 * variadic_dup_count)))
         # Metamorphic call: the target returns via a self-modified slot in
-        # writable .text rather than the stack. We write our return address
-        # into that slot, then jump (not call) into the callee. No return
-        # address is pushed. Takes precedence over tail/ordinary forms.
+        # writable .data (a separate page from the code) rather than the stack.
+        # We write our return address into that slot, then jump (not call) into
+        # the callee. No return address is pushed. Takes precedence over
+        # tail/ordinary forms.
         if (self.direct_name
                 and not has_stack_args
                 and self.direct_name in getattr(
