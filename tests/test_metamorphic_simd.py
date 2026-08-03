@@ -113,7 +113,13 @@ class TestMetamorphic(unittest.TestCase):
         helper = asm.split("helper:")[1].split("main:")[0]
         self.assertIn("jmp QWORD PTR [rip + helper__metaret]", helper)
         self.assertNotIn("\tret\n", helper)    # no stack return instruction
-        self.assertIn(".mtext", asm)           # writable+exec section
+        # The return slot lives in writable *data*, off the code page -- not in
+        # a writable+executable section next to the function. The old .mtext
+        # layout put the slot in the code's own cache line, so the caller's
+        # store forced a self-modifying-code machine clear on every call.
+        self.assertNotIn(".mtext", asm)
+        data = asm.split(".section .data")[1].split(".section .text")[0]
+        self.assertIn("helper__metaret:", data)   # slot is in .data
         # Caller patches the slot and jumps instead of calling.
         self.assertIn("mov QWORD PTR [rip + helper__metaret]", asm)
 
