@@ -105,7 +105,7 @@ def gen(depth):
     for i in range(depth):
         tgt = ".Lret_NMHO" if i == 0 else ".res_%d" % (i - 1)
         pre.append("\tlea rax, [rip + %s]\n\tlea r10, [rip + site_%d]\n"
-                   "\tmov WORD PTR [r10+1], ax" % (tgt, i))
+                   "\tmov DWORD PTR [r10+1], eax" % (tgt, i))
     a(timed("NMHO", "\n".join(pre), "\tjmp Km_0"))
 
     # correctness + report
@@ -133,6 +133,8 @@ def run(depth):
         out = subprocess.run([binp], capture_output=True, text=True).stdout
         for tag, cyc in LINE.findall(out):
             vals.setdefault(tag, []).append(int(cyc) / N)
+    if "NCALL" not in vals or "NMHO" not in vals:
+        return None, None
     return statistics.median(vals["NCALL"]), statistics.median(vals["NMHO"])
 
 
@@ -142,6 +144,9 @@ def main():
     print("-----   --------   -------   ------")
     for d in depths:
         c, m = run(d)
+        if c is None or m is None:
+            print("%5d   %8s   %7s   %s" % (d, "-", "-", "no output"))
+            continue
         win = "meta" if m < c else "call/ret"
         print("%5d   %8.2f   %7.2f   %s" % (d, c, m, win))
 

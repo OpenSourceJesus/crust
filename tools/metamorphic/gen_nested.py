@@ -159,17 +159,17 @@ def main():
     # NMETA_PC: patch all three sites every iteration, then run the chain
     preNMPC = "\tnop"
     bodyNMPC = (
-        "\tlea rax, [rip + .Cm_resume]\n\tlea r10, [rip + dm_site]\n\tmov WORD PTR [r10+1], ax\n"
-        "\tlea rax, [rip + .Bm_resume]\n\tlea r10, [rip + cm_site]\n\tmov WORD PTR [r10+1], ax\n"
-        "\tlea rax, [rip + .Lret_NMPC]\n\tlea r10, [rip + bm_site]\n\tmov WORD PTR [r10+1], ax\n"
+        "\tlea rax, [rip + .Cm_resume]\n\tlea r10, [rip + dm_site]\n\tmov DWORD PTR [r10+1], eax\n"
+        "\tlea rax, [rip + .Bm_resume]\n\tlea r10, [rip + cm_site]\n\tmov DWORD PTR [r10+1], eax\n"
+        "\tlea rax, [rip + .Lret_NMPC]\n\tlea r10, [rip + bm_site]\n\tmov DWORD PTR [r10+1], eax\n"
         "\tjmp Bm")
     a(timed("NMPC", preNMPC, bodyNMPC))
 
     # NMETA_HO: patch all three sites ONCE in the preamble; loop is pure jumps
     preNMHO = (
-        "\tlea rax, [rip + .Cm_resume]\n\tlea r10, [rip + dm_site]\n\tmov WORD PTR [r10+1], ax\n"
-        "\tlea rax, [rip + .Bm_resume]\n\tlea r10, [rip + cm_site]\n\tmov WORD PTR [r10+1], ax\n"
-        "\tlea rax, [rip + .Lret_NMHO]\n\tlea r10, [rip + bm_site]\n\tmov WORD PTR [r10+1], ax")
+        "\tlea rax, [rip + .Cm_resume]\n\tlea r10, [rip + dm_site]\n\tmov DWORD PTR [r10+1], eax\n"
+        "\tlea rax, [rip + .Bm_resume]\n\tlea r10, [rip + cm_site]\n\tmov DWORD PTR [r10+1], eax\n"
+        "\tlea rax, [rip + .Lret_NMHO]\n\tlea r10, [rip + bm_site]\n\tmov DWORD PTR [r10+1], eax")
     a(timed("NMHO", preNMHO, "\tjmp Bm"))
 
     # correctness

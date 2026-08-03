@@ -165,14 +165,14 @@ def main():
     # IMM_PC: patch the mov-immediate every call, jmp rdx
     bodyIPC = ("\tlea rax, [rip + .Lret_IPC]\n"
                "\tlea r10, [rip + ipc_site]\n"
-               "\tmov WORD PTR [r10+1], ax\n"
+               "\tmov DWORD PTR [r10+1], eax\n"
                "\tjmp Wipc")
     a(timed("IPC", "\tnop", bodyIPC))
 
     # IMM_HO: patch the mov-immediate once before the loop, jmp rdx in the loop
     preIHO = ("\tlea rax, [rip + .Lret_IHO]\n"
               "\tlea r10, [rip + iho_site]\n"
-              "\tmov WORD PTR [r10+1], ax")
+              "\tmov DWORD PTR [r10+1], eax")
     a(timed("IHO", preIHO, "\tjmp Wiho"))
 
     # correctness
