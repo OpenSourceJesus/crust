@@ -3,7 +3,9 @@
 
 Main Crust Documentation: [CRUST.md](CRUST.md)
 
-Crust Paper: https://doi.org/10.5281/zenodo.21777457
+Crust Papers:
+- https://doi.org/10.5281/zenodo.21777457
+- https://ai.vixra.org/pdf/2608.0014v1.pdf
 
 Modern systems development forces engineers to choose between two paradigms:
 - The ubiquitous simplicity and legacy ecosystem of C.
