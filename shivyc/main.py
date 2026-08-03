@@ -272,8 +272,11 @@ def main():
                 len(arguments.output_name) == 1:
             # set the output ELF name
             out = arguments.output_name[0]
-        writable_text = (getattr(arguments, "metamorphic", False)
-                         or getattr(arguments, "opt_level", 0) >= 4)
+        # -O4 near-function scratch still asks for a writable text segment.
+        # -fmetamorphic no longer does: its return slot lives in ordinary
+        # writable .data (off the code page), and the function body stays in
+        # normal read-execute .text -- so no RWX segment is needed.
+        writable_text = getattr(arguments, "opt_level", 0) >= 4
         if not link_objs(out, objs, writable_text,
                          getattr(arguments, "low_mem", False),
                          libs=getattr(arguments, "libs", []),
@@ -696,8 +699,9 @@ def process_c_file(file, args):
             il_code.commands[_fn], symbol_table)
 
     # Metamorphic returns (advanced/experimental): functions marked
-    # __metamorphic__ return via a self-modified slot in a writable, executable
-    # section instead of the stack. Only active when -fmetamorphic is passed.
+    # __metamorphic__ return via a self-modified slot in writable .data (off
+    # the code page), reached by an indirect jump instead of the stack. Only
+    # active when -fmetamorphic is passed.
     metamorphic_funcs = set()
     if getattr(args, "metamorphic", False) and ext_info:
         metamorphic_funcs = {name for name in ext_info.attrs

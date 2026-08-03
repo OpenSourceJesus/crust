@@ -464,15 +464,23 @@ class ASMGen:
 
             is_meta = func in metamorphic_funcs
             if is_meta:
-                # Metamorphic functions live in a writable+executable section
-                # with their return slot placed immediately before them -- the
-                # "writable .text, memory near the function" idea. The slot is
-                # self-modified at run time (the caller patches it).
+                # Metamorphic functions return through a per-function slot that
+                # the caller patches with the return address. The slot lives in
+                # writable *data* -- a separate page from any code, NOT next to
+                # the function body.
+                #
+                # The old layout put the slot in a writable+executable .mtext
+                # section immediately before the entry label. That placed the
+                # slot in the same cache line the CPU was fetching the function
+                # from, so the caller's store into it triggered a self-modifying
+                # -code machine clear on every call -- ~two orders of magnitude
+                # slower than an ordinary call/ret (measured in
+                # tools/metamorphic/). Off the code page the store is ordinary
+                # and the return reaches call/ret parity, and the body no longer
+                # needs a writable+executable section at all.
                 slot = func + "__metaret"
-                self.asm_code.add(
-                    asm_cmds.Raw(".section .mtext,\"awx\",@progbits"))
-                self.asm_code.add(asm_cmds.Raw(slot + ":"))
-                self.asm_code.add(asm_cmds.Raw(".quad 0"))
+                self.asm_code.data.append(slot + ":")
+                self.asm_code.data.append("\t.quad 0")
                 self.asm_code.metamorphic_current = slot
             else:
                 self.asm_code.metamorphic_current = None
@@ -545,9 +553,6 @@ class ASMGen:
                             global_spotmap[v] = LiteralSpot(
                                 self.il_code.literals[v])
                 self._make_asm(cmds, global_spotmap)
-
-            if is_meta:
-                self.asm_code.add(asm_cmds.Raw(".section .text"))
 
             # Declare the static scratch buffer (BSS) if this function used it.
             if self._near_active and self._near_size > 0:
