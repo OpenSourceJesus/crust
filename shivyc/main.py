@@ -1368,6 +1368,8 @@ def link_objs(binary_name, obj_names, writable_text=False, low_mem=False,
 
             _ln = _rlink.Linker()
             _ln.entry_name = os.environ.get("SHIVYC_ENTRY", "_start")
+            if os.environ.get("SHIVYC_BASE"):
+                _ln.base = int(os.environ["SHIVYC_BASE"], 0)
 
             # the freestanding runtime, assembled on the fly by rasm
             if not os.environ.get("SHIVYC_NO_RCRT"):
