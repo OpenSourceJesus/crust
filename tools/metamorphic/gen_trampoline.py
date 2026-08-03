@@ -29,9 +29,8 @@ between them is exactly the RSB-misprediction cost that the metamorphic return
 avoids. The slot lives off-page (the fix from the first benchmark) and takes a
 full 8-byte write, so no SMC and no store-forwarding stall muddy the result.
 """
-import sys
-
-N = 60_000_000
+import os, sys
+N = int(os.environ.get("METAMORPHIC_N", "60000000"))
 
 
 def s_bytes(text):
