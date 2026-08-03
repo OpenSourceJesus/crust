@@ -22,8 +22,8 @@
 
 \hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue}
 
-\title{Crust: The C + Rust Multi-Compiler}
-\author{B.S.Hartshorn \orcidlink{0009-0004-2853-655X}}
+\title{Crust: The C + C++ Rust Multi-Compiler}
+\author{B.S.Hartshorn \orcidlink{0009-0004-2853-655X} \small\url{https://github.com/brentharts/crust}}
 \date{\today}
 
 \begin{document}
@@ -152,6 +152,41 @@ fast is the generated code'', but ``what does the extension buy''.
   \caption{Memory-safety detection: which errors each compiler catches.}
   \end{figure}}{}
 
+\section{Metamorphic returns}
+
+A \texttt{\_\_metamorphic\_\_} function does not keep its return address on the
+stack. The caller writes the address the callee should come back to, and the
+callee ``returns'' with an indirect jump to it. The point is to avoid the
+stack traffic and the return predictor entirely --- but done carelessly it is
+far \emph{slower} than an ordinary call, so the interesting question is which
+lowering is correct and when the feature actually pays off.
+
+The right lowering is a register-indirect jump whose target has been patched
+into a \texttt{mov} immediate, with that patch \emph{hoisted} out of any loop
+whenever the call graph shows the return site is loop-invariant. Routing the
+return through a memory slot instead pays a load; patching the immediate on
+every call is a self-modifying-code machine clear and costs hundreds of cycles.
+
+\IfFileExists{metamorphic_bench.pdf}{%
+  \begin{figure}[H]\centering
+  \includegraphics[width=\linewidth]{metamorphic_bench.pdf}
+  \caption{Left: cycles per call for each return lowering (log axis). Right:
+  call/ret versus hoisted metamorphic as the call chain deepens.}
+  \end{figure}}{%
+  \emph{Metamorphic figures not built --- run \texttt{python3
+  benchmarks/run\_metamorphic\_benchmarks.py} first.}}
+
+\IfFileExists{metamorphic_body.tex}{\input{metamorphic_body.tex}}{}
+
+Unlike the classic way a compiler removes call overhead --- inlining --- this
+does not grow with the callee. Inlining a large or deeply-nested function
+explodes code size and instruction-cache pressure; the metamorphic return is a
+few bytes regardless of callee size, and its win over \texttt{call}/\texttt{ret}
+appears exactly where inlining and the return predictor both struggle: chains
+deeper than the return-stack buffer. See \texttt{METAMORPHIC.md} for the full
+discussion and the per-thread specialisation plan for multi-call-site
+functions.
+
 \section{Reproducing}
 
 \begin{verbatim}
@@ -163,5 +198,23 @@ The harness builds \texttt{shivyc\_native} once (or reuses one supplied via
 \texttt{\$SHIVYC\_NATIVE}); results land in
 \texttt{benchmarks/results/rpython\_results.json} and the figures in
 \texttt{\$BENCH\_PLOT\_DIR} (default \texttt{/tmp/shivyc\_benchmarks}).
+
+
+\begin{thebibliography}{99}
+
+\bibitem{vixra2607}
+B.S. Hartshorn, \emph{Beyond WebAssembly: Rethinking the Web Browser with
+Post-JavaScript, VM-Free Page Execution}, 2026.
+\url{https://ai.vixra.org/abs/2607.0013}
+
+\bibitem{vixra2606}
+B.S. Hartshorn, \emph{Rethinking Meta-Interpreters for High-Performance
+Execution}, 2026. \url{https://ai.vixra.org/abs/2606.0084}
+
+\bibitem{vixra2507}
+B.S. Hartshorn, \emph{Foundational Problems with Compilers and Operating
+Systems}, 7 July 2025. \url{https://ai.vixra.org/abs/2507.0081}
+
+\end{thebibliography}
 
 \end{document}
