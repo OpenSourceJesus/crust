@@ -404,11 +404,22 @@ def bench_metamorphic():
 
     _shivyc(src_on, os.path.join(d, "bin_shivyc_on"), ["-fmetamorphic"])
     asm = _read_asm(src_on)
-    smc = ".mtext" in asm and "metaret" in asm
+    # The feature is emitted when a return routes through a patched slot
+    # (`metaret`) instead of the stack. The improved lowering keeps that slot in
+    # writable .data -- off the code page -- so there is no RWX .mtext section
+    # and no self-modifying-code stall; the old lowering put it in .mtext,
+    # adjacent to the code, and paid an SMC machine clear on every call.
+    emitted = "metaret" in asm and "jmp QWORD PTR [rip +" in asm
+    if emitted and ".mtext" not in asm:
+        metric = "off-page .data slot, no SMC"
+    elif emitted:
+        metric = "RWX .mtext slot, SMC per call"
+    else:
+        metric = "no metamorphic emitted"
     cfgs.append({"name": "ShivyCX (-fmetamorphic)", "binary": os.path.join(d, "bin_shivyc_on"),
                  "baseline": False,
-                 "metric": "RWX .mtext slot, SMC per call" if smc else "no metamorphic emitted",
-                 "metric_val": smc})
+                 "metric": metric,
+                 "metric_val": emitted})
 
     _gcc(src_off, os.path.join(d, "bin_gcc0"))   # gcc can't parse __metamorphic__
     cfgs.append({"name": "gcc -O0", "binary": os.path.join(d, "bin_gcc0"),
