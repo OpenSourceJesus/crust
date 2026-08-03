@@ -28,10 +28,8 @@ Four lowerings of the depth-4 chain:
 NMETA_HO is the one to watch against NCALL: same predicted control flow, but
 without the per-level return-address memory traffic that call/ret carries.
 """
-import sys
-
-N = 60_000_000
-
+import os, sys
+N = int(os.environ.get("METAMORPHIC_N", "60000000"))
 
 def s_bytes(text):
     return ",".join(str(b) for b in (text.encode() + b"\x00"))
