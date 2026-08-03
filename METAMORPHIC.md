@@ -10,20 +10,21 @@ specifier marks which functions use it.
 A `__metamorphic__` function returns **without using the stack for the return
 address**. Instead:
 
-* The function is placed in a writable+executable section `.mtext`, with an
-  8-byte return slot laid down immediately before its entry label -- "memory
-  near the function", in writable text.
+* Each function gets an 8-byte return slot in writable `.data` -- a separate
+  page from any code. The function body stays in ordinary read-execute `.text`.
 * Each caller writes its own return address into that slot and then **jumps**
   into the function (no `call`).
 * The function returns by **jumping through the slot** (no `ret`).
 
 So no return address for a metamorphic function is ever pushed or popped. The
-slot is self-modified at run time, which is why the section must be writable.
+slot is self-modified at run time, which is why it lives in writable data.
 
 ```asm
-; in .mtext (writable + executable):
+; in .data (writable, a separate page from the code):
 helper__metaret:
     .quad 0                                  ; the return slot
+
+; in .text (ordinary read-execute):
 helper:
     ...                                      ; body, result in eax
     jmp QWORD PTR [rip + helper__metaret]    ; "return"
@@ -36,15 +37,23 @@ helper:
     ...                                           ; result is in eax
 ```
 
-## Why a section, not `ld -N`
+## Where the slot lives, and why not next to the code
 
-The obvious way to get writable text is the linker's `-N` (OMAGIC) mode, but
-that conflicts with the glibc C-runtime startup (`Scrt1.o` references
-`__ehdr_start`, which OMAGIC does not define), so links fail. Instead, the
-metamorphic code is emitted into a dedicated `.section .mtext,"awx",@progbits`.
-The loader maps that segment read-write-execute (the linker warns about the RWX
-segment -- that is expected and is the risk you are opting into). Ordinary
-functions stay in normal `.text`.
+An earlier version of this feature placed the slot in a writable+executable
+`.mtext` section *immediately before* the function's entry label -- "memory near
+the function". That was a mistake: the slot then shared a cache line with the
+code the CPU was fetching, so the caller's store into it triggered a
+self-modifying-code machine clear on **every call**. Measured, that layout ran
+~two orders of magnitude slower than an ordinary `call`/`ret` (see the
+`## Performance` section and `tools/metamorphic/`).
+
+Moving the slot into ordinary writable `.data`, off the code page, removes that
+stall entirely and brings the return to `call`/`ret` parity. It also means the
+feature no longer needs a writable+executable segment at all: the body is plain
+`R+X` text and the slot is plain `R+W` data, so `-fmetamorphic` no longer asks
+the linker for RWX memory (and no longer trips the linker's RWX-segment
+warning). The `-N`/OMAGIC linker mode the old design flirted with is likewise
+unnecessary.
 
 ## Correctness and limitations
 
@@ -64,9 +73,11 @@ This feature is **experimental**. It is correct only within clear limits:
 * **Leaf-friendly.** The demo and tests use leaf metamorphic functions. A
   metamorphic function that itself makes ordinary calls is not exercised here.
 
-* **RWX section.** `.mtext` is writable and executable. This is unsafe by
-  design; the flag exists for experimentation and as groundwork for further
-  optimizations (e.g. using near-function memory to reduce stack pressure).
+* **Self-modifying data.** The return slot is self-modified at run time (the
+  caller patches it before each jump). It lives in ordinary writable `.data`, so
+  no writable+executable memory is involved -- the body is plain read-execute
+  text. The remaining unsafety is the re-entrancy constraint above, not an RWX
+  segment.
 
 Without `-fmetamorphic`, the `__metamorphic__` specifier is ignored entirely
 and ordinary call/ret code is generated, so a program behaves identically.
@@ -84,7 +95,7 @@ generators and the full write-up are in `tools/metamorphic/`):
 | lowering                                   | cyc/call | note |
 |--------------------------------------------|----------|------|
 | ordinary `call`/`ret`                      | ~2.7     | reference |
-| slot in code's cache line, 8B write/call   | ~410     | today's `.mtext` layout -- SMC clear |
+| slot in code's cache line, 8B write/call   | ~410     | the old `.mtext` layout -- SMC clear (removed) |
 | slot moved off-page, 8B write/call         | ~4.4     | no SMC; the `jmp [slot]` load costs a little |
 | **`jmp reg`, immediate patched + hoisted** | **~3.5** | fastest; near `call`/`ret` parity |
 | `jmp reg`, immediate patched every call    | ~410     | SMC again -- the patch must be hoisted |
@@ -200,10 +211,17 @@ Two things break that, and the plan for each:
   depth counter -- would lift that limit for bounded recursion; until then the
   call-graph check stands.
 
+**Done (shipped).** The return slot now lives off the code page, in ordinary
+writable `.data`, reached by `jmp [slot]`. This is the ~410 -> ~4 cyc/call
+change, it removes the RWX segment, and it brings shallow metamorphic returns to
+`call`/`ret` parity.
+
 Planned lowering and compatibility work, in rough order:
 
-1. Move the return slot off the code page and switch the return to
-   `mov reg,imm ; jmp reg` (the ~410 -> ~3.5 cyc/call change above).
+1. Switch the return to a register-indirect `mov reg,imm ; jmp reg` whose
+   immediate is patched, and hoist that patch out of loop-invariant loops. This
+   is the further ~4 -> ~3.5 cyc/call step, and the form that unlocks the
+   deep-chain wins over `call`/`ret`. It depends on (2).
 2. A call-graph loop-invariance pass that hoists the immediate patches into the
    outermost invariant caller's preamble.
 3. Per-call-site specialisation (cloning) for multi-site functions, and
@@ -228,9 +246,9 @@ features otherwise compose: verified combined returns the correct result.
 `-O4` turns on whole-program stackless lowering and near-function scratch
 storage (see `NEAR_SCRATCH.md`), which moves register spills off the stack into
 a static per-function buffer. The metamorphic return slot is a related use of
-near-function storage -- self-modified, code-adjacent state -- but is opt-in
-separately via `-fmetamorphic` because it requires a writable+executable
-section.
+per-function static storage -- self-modified state the caller patches -- but is
+opt-in separately via `-fmetamorphic`. (It lives in writable `.data`; only
+`-O4` near-scratch still asks the linker for a writable text segment.)
 
 ## Verification
 
