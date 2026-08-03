@@ -93,12 +93,17 @@ def depth_sweep():
     import bench_deep
     depths = [int(x) for x in
               os.environ.get("METAMORPHIC_DEPTHS", "4 8 16 24 32 48 64").split()]
-    call, meta = [], []
+    kept, call, meta = [], [], []
     for d in depths:
         c, m = bench_deep.run(d)
+        if c is None or m is None:
+            sys.stderr.write("metamorphic: depth %d produced no output; "
+                             "skipping\n" % d)
+            continue
+        kept.append(d)
         call.append(c)
         meta.append(m)
-    return {"depths": depths, "call_ret": call, "meta_ho": meta}
+    return {"depths": kept, "call_ret": call, "meta_ho": meta}
 
 
 def main():

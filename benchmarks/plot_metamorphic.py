@@ -28,28 +28,35 @@ def _fig(data, out_dir):
     fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.2))
 
     # ---- left: mechanism costs ----
-    mech = data.get("mechanisms", [])
-    labels = [m["label"] for m in mech]
-    vals = [m["cyc_per_call"] for m in mech]
-    colors = [GROUP_COLOR.get(m["group"], "#777777") for m in mech]
-    ypos = range(len(labels))
-    axL.barh(list(ypos), vals, color=colors)
-    axL.set_yticks(list(ypos))
-    axL.set_yticklabels(labels, fontsize=9)
-    axL.invert_yaxis()
-    axL.set_xscale("log")
-    axL.set_xlabel("cycles per call (log)")
-    axL.set_title("Cost of each return lowering")
-    for y, v in zip(ypos, vals):
-        axL.text(v * 1.08, y, "%.1f" % v, va="center", fontsize=8)
-    axL.margins(x=0.25)
+    mech = [m for m in data.get("mechanisms", [])
+            if isinstance(m.get("cyc_per_call"), (int, float))
+            and m["cyc_per_call"] > 0]
+    if mech:
+        labels = [m["label"] for m in mech]
+        vals = [m["cyc_per_call"] for m in mech]
+        colors = [GROUP_COLOR.get(m["group"], "#777777") for m in mech]
+        ypos = range(len(labels))
+        axL.barh(list(ypos), vals, color=colors)
+        axL.set_yticks(list(ypos))
+        axL.set_yticklabels(labels, fontsize=9)
+        axL.invert_yaxis()
+        axL.set_xscale("log")
+        axL.set_xlabel("cycles per call (log)")
+        axL.set_title("Cost of each return lowering")
+        for y, v in zip(ypos, vals):
+            axL.text(v * 1.08, y, "%.1f" % v, va="center", fontsize=8)
+        axL.margins(x=0.25)
+    else:
+        axL.set_axis_off()
+        axL.text(0.5, 0.5, "no mechanism data", ha="center", va="center",
+                 transform=axL.transAxes, fontsize=10, color="#999999")
 
     # ---- right: depth sweep ----
     d = data.get("depth", {})
     xs = d.get("depths", [])
     cr = d.get("call_ret", [])
     mh = d.get("meta_ho", [])
-    if xs:
+    if xs and cr and mh:
         axR.plot(xs, cr, "o-", color="#4C72B0", label="call / ret")
         axR.plot(xs, mh, "s-", color="#DD8452", label="metamorphic (hoisted)")
         axR.set_yscale("log")
@@ -68,6 +75,10 @@ def _fig(data, out_dir):
             axR.text(cross, min(min(cr), min(mh)),
                      " metamorphic\n wins",
                      fontsize=8, color="#B5651D", va="bottom")
+    else:
+        axR.set_axis_off()
+        axR.text(0.5, 0.5, "no depth-sweep data", ha="center", va="center",
+                 transform=axR.transAxes, fontsize=10, color="#999999")
     fig.tight_layout()
     for ext in ("pdf", "png"):
         fig.savefig(os.path.join(out_dir, "metamorphic_bench." + ext),
