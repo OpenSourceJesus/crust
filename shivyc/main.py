@@ -1368,8 +1368,9 @@ def link_objs(binary_name, obj_names, writable_text=False, low_mem=False,
 
             _ln = _rlink.Linker()
             _ln.entry_name = os.environ.get("SHIVYC_ENTRY", "_start")
-            if os.environ.get("SHIVYC_BASE"):
-                _ln.base = int(os.environ["SHIVYC_BASE"], 0)
+            _base = os.environ.get("SHIVYC_BASE")
+            if _base:
+                _ln.base = int(_base, 0)
 
             # the freestanding runtime, assembled on the fly by rasm
             if not os.environ.get("SHIVYC_NO_RCRT"):
@@ -1391,10 +1392,17 @@ def link_objs(binary_name, obj_names, writable_text=False, low_mem=False,
                               < os.path.getmtime(_libc_c))
                     if _stale:
                         os.makedirs(os.path.dirname(_cache), exist_ok=True)
-                        _env = dict(os.environ)
-                        _env["SHIVYC_RASM"] = "1"
-                        _env.pop("SHIVYC_RLINK", None)
-                        _env["PYTHONPATH"] = _root
+                        # A minimal child environment built from os.environ.get
+                        # (the only environ access the self-hosted runtime
+                        # lowers -- there is no live environ dict there). We
+                        # need SHIVYC_RASM set and SHIVYC_RLINK *unset* to avoid
+                        # recursing; carrying PATH/HOME/TMPDIR is enough for the
+                        # child compile.
+                        _env = {"SHIVYC_RASM": "1", "PYTHONPATH": _root}
+                        for _k in ("PATH", "HOME", "TMPDIR", "LANG"):
+                            _v = os.environ.get(_k)
+                            if _v:
+                                _env[_k] = _v
                         _r = subprocess.run(
                             [sys.executable, "-m", "shivyc.main", "-c",
                              _libc_c, "-o", _cache],
@@ -1402,7 +1410,7 @@ def link_objs(binary_name, obj_names, writable_text=False, low_mem=False,
                         if not os.path.exists(_cache):
                             raise CompilerError(
                                 "could not build the rlink C runtime: %s"
-                                % _r.stderr.decode()[:200])
+                                % _r.stderr[:200])
                     with open(_cache, "rb") as _f:
                         _ln.add_object(_cache, list(_f.read()))
 
@@ -1426,7 +1434,7 @@ def link_objs(binary_name, obj_names, writable_text=False, low_mem=False,
 
             _image = _ln.link()
             with open(binary_name, "wb") as _f:
-                _f.write(bytes(bytearray(_image)))
+                _f.write(bytes(_image))
             os.chmod(binary_name, 0o755)
             for _w in _ln.warnings:
                 sys.stderr.write("rlink: warning: %s\n" % _w)
