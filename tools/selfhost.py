@@ -711,6 +711,21 @@ def cmd_compiler(build_root, args):
         "obj assemble_to_elf(char* _s) { (void)_s; "
         "fputs(\"SHIVYC_RASM is unavailable in the bootstrap compiler\\n\", "
         "stderr); abort(); }")
+    # Same story for the internal ELF linker (rlink): main.py imports
+    # tools/rpy_lib/rlink only under SHIVYC_RLINK, a runtime-only path that is
+    # not part of the native compiler. Stub the symbols the transpiled call
+    # sites reference (`_rlink.Linker()` -> Linker_new, `_rlink._is_archive`)
+    # so the never-taken references resolve at link time.
+    entry.append("obj Linker_new(void);")
+    entry.append("obj _is_archive(obj _d);")
+    entry.append(
+        "obj Linker_new(void) { "
+        "fputs(\"SHIVYC_RLINK is unavailable in the bootstrap compiler\\n\", "
+        "stderr); abort(); }")
+    entry.append(
+        "obj _is_archive(obj _d) { (void)_d; "
+        "fputs(\"SHIVYC_RLINK is unavailable in the bootstrap compiler\\n\", "
+        "stderr); abort(); }")
     entry.append("int main(int argc, char** argv) {")
     entry += ["    %s();" % s for s in inits]
     entry.append("    obj rc = shivyc_pymain(argc, argv);")
