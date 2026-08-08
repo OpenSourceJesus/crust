@@ -134,8 +134,22 @@ VOID = RustCType("void")
 # `extern` for these when core templates call them.
 _PRELUDE_LIBC = frozenset({
     "malloc", "realloc", "free", "strlen", "abort", "printf", "fprintf",
+    "memset",
 })
 INT = RustCType("int")
+
+# By-value locals of these core types are dropped at scope exit: Crust inserts
+# a call to the matching free method. Not a Rust `Drop` trait -- just the
+# existing `free_buf` / `free_box` hooks, applied automatically. Keyed by the
+# template / concrete name stored in `unit.instances` (or the bare base for
+# non-generic `String`).
+_OWNING_FREE = {
+    "Vec": "free_buf",
+    "String": "free_buf",
+    "Box": "free_box",
+    "VecDeque": "free_buf",
+    "PyList": "free_buf",
+}
 
 
 # --------------------------------------------------------------------------
@@ -681,6 +695,11 @@ class Parser:
         self.unit = unit or Unit()
         self.fn_sigs = self.unit.fn_sigs
         self.scopes = [{}]              # name -> RustCType
+        # Parallel to `scopes`: each frame holds owning by-value locals that
+        # need a free call on exit. Kept separate from the typing dict so
+        # py2c does not see a new shape on every `.scopes[-1][name] = ...`.
+        # kind is "file" | "func" | "loop" | "block".
+        self.live = [{"kind": "file", "items": []}]
         self.ret_type = VOID
         self.impl_type = None           # enclosing `impl` type name, if any
         self.no_struct_lit = 0          # >0 while parsing a condition
@@ -748,11 +767,13 @@ class Parser:
     # in this very method, where the receiver is a list whose TypeInfo has no
     # such slot. That compiled to a call through a null pointer and segfaulted
     # the self-hosted compiler on every `fn` item it parsed.
-    def scope_push(self):
+    def scope_push(self, kind="block"):
         self.scopes.append({})
+        self.live.append({"kind": kind, "items": []})
 
     def scope_pop(self):
         self.scopes.pop()
+        self.live.pop()
 
     def declare(self, name, type_):
         self.scopes[-1][name] = type_
@@ -761,6 +782,77 @@ class Parser:
         for s in reversed(self.scopes):
             if name in s:
                 return s[name]
+        return None
+
+    def owning_free(self, ty):
+        """Free method name for a by-value owning type, or None."""
+        if ty is None or ty.ptr or ty.array:
+            return None
+        if ty.base == "String":
+            return "free_buf"
+        inst = self.unit.instances.get(ty.base)
+        if inst is None:
+            return None
+        return _OWNING_FREE.get(inst[0])
+
+    def live_register(self, name, ty):
+        """Track `name` for scope-exit Drop when it owns a heap buffer."""
+        method = self.owning_free(ty)
+        if method is None:
+            return
+        info = self.unit.methods.get((ty.base, method))
+        if info is None:
+            return
+        # Drop any prior entry for the same name in this frame (re-let).
+        items = self.live[-1]["items"]
+        self.live[-1]["items"] = [it for it in items if it[0] != name]
+        self.live[-1]["items"].append((name, info.mangled, ty))
+
+    def live_unregister(self, name):
+        """Stop tracking `name` (after a move)."""
+        for fr in self.live:
+            fr["items"] = [it for it in fr["items"] if it[0] != name]
+
+    def live_frame_index(self, kinds):
+        """Index of the innermost frame whose kind is in `kinds`, or None."""
+        for k in range(len(self.live) - 1, -1, -1):
+            if self.live[k]["kind"] in kinds:
+                return k
+        return None
+
+    def emit_drops(self, out, line, indent, upto):
+        """Emit free calls for frames `upto..top`, innermost and latest first."""
+        if upto is None:
+            return
+        for fr in reversed(self.live[upto:]):
+            for name, mangled, _ty in reversed(fr["items"]):
+                out.line_at(line, "%s(&%s);" % (mangled, _c_name(name)),
+                            indent)
+
+    def emit_move_zero(self, out, line, indent, src_name, src_ty):
+        """After copying an owning local, zero the source so Drop is a no-op."""
+        self.unit.needs.add("memset")
+        csrc = _c_name(src_name)
+        out.line_at(line,
+                    "memset(&%s, 0, sizeof(%s));" % (csrc, csrc), indent)
+        self.live_unregister(src_name)
+
+    def simple_owning_local(self, expr):
+        """If `expr` is a bare owning local name, return (name, type), else None."""
+        if expr is None or expr.type is None or expr.code is None:
+            return None
+        if self.owning_free(expr.type) is None:
+            return None
+        text = expr.code.strip()
+        while text.startswith("(") and text.endswith(")"):
+            text = text[1:-1].strip()
+        if not text or not all(c.isalnum() or c == "_" for c in text):
+            return None
+        # Match against declared names (C keyword rename is a trailing `_`).
+        for s in reversed(self.scopes):
+            for name, ty in s.items():
+                if _c_name(name) == text and self.owning_free(ty) is not None:
+                    return name, ty
         return None
 
     # -- types ------------------------------------------------------------
@@ -1351,6 +1443,7 @@ class Parser:
         p = Parser(list(toks) + [RustToken("eof", "", toks[-1].line)],
                    self.unit, self.tysubst)
         p.scopes = self.scopes
+        p.live = self.live
         p.impl_type = self.impl_type
         p.ret_type = self.ret_type
         e = p.parse_expr()
@@ -6685,6 +6778,8 @@ def translate(code, path=None):
                        "long hi; } crust_i128;")
     if "memcpy" in unit.needs:
         prelude.append("void *memcpy(void *, const void *, unsigned long);")
+    if "memset" in unit.needs:
+        prelude.append("void *memset(void *, int, unsigned long);")
     if "alloc" in unit.needs:
         prelude.append("void *malloc(unsigned long);")
         prelude.append("void *realloc(void *, unsigned long);")
