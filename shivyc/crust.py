@@ -821,13 +821,18 @@ class Parser:
         return None
 
     def emit_drops(self, out, line, indent, upto):
-        """Emit free calls for frames `upto..top`, innermost and latest first."""
+        """Emit free calls for frames `upto..top`, innermost and latest first.
+
+        Clears the emitted entries so a later fall-through Drop (e.g. the
+        function epilogue after an early `return`) is a no-op.
+        """
         if upto is None:
             return
         for fr in reversed(self.live[upto:]):
             for name, mangled, _ty in reversed(fr["items"]):
                 out.line_at(line, "%s(&%s);" % (mangled, _c_name(name)),
                             indent)
+            fr["items"] = []
 
     def emit_move_zero(self, out, line, indent, src_name, src_ty):
         """After copying an owning local, zero the source so Drop is a no-op."""
@@ -1747,6 +1752,53 @@ class Parser:
         if self.cur.kind == "punc" and self.cur.val in ASSIGN_OPS:
             op = self.next().val
             rhs = self.parse_assign()
+            # Simple `dst = src` of owning locals: free the old destination
+            # (if live), copy, then zero the source so Drop does not
+            # double-free. Compound assigns (`+=`, …) are left alone.
+            if op == "=" and lhs.type is not None \
+                    and self.owning_free(lhs.type) is not None:
+                src = self.simple_owning_local(rhs)
+                dst_name = None
+                text = lhs.code.strip()
+                while text.startswith("(") and text.endswith(")"):
+                    text = text[1:-1].strip()
+                if text and all(c.isalnum() or c == "_" for c in text):
+                    for s in reversed(self.scopes):
+                        for name, ty in s.items():
+                            if _c_name(name) == text:
+                                dst_name = name
+                                break
+                        if dst_name is not None:
+                            break
+                parts = []
+                if dst_name is not None:
+                    # Free the previous value of dst before overwriting.
+                    for fr in self.live:
+                        for n, mangled, _ty in fr["items"]:
+                            if n == dst_name:
+                                parts.append("%s(&%s);"
+                                             % (mangled, _c_name(dst_name)))
+                                break
+                parts.append("%s = %s;" % (lhs.code, rhs.code))
+                if src is not None:
+                    self.unit.needs.add("memset")
+                    csrc = _c_name(src[0])
+                    parts.append("memset(&%s, 0, sizeof(%s));" % (csrc, csrc))
+                    self.live_unregister(src[0])
+                if dst_name is not None:
+                    self.live_register(dst_name, lhs.type)
+                # Return a comma-operator expression so a statement `a = b;`
+                # still ends with one semicolon from the caller. Prefer a
+                # statement sequence via pending when there is more than a
+                # plain assign.
+                if len(parts) == 1:
+                    return Expr("%s = %s" % (lhs.code, rhs.code), lhs.type)
+                for p in parts[:-1]:
+                    self.pending.append(p)
+                last = parts[-1]
+                if last.endswith(";"):
+                    last = last[:-1]
+                return Expr(last, lhs.type)
             return Expr("%s %s %s" % (lhs.code, op, rhs.code), lhs.type)
         return lhs
 
@@ -2669,20 +2721,23 @@ class Parser:
 
     # -- statements -------------------------------------------------------
 
-    def parse_block(self, out, indent, tail_returns):
+    def parse_block(self, out, indent, tail_returns, kind="block"):
         """Parse `{ ... }`, emitting C into `out`.
 
         `tail_returns` is True when a trailing expression should become a
-        return statement (the function-body case).
+        return statement (the function-body case). `kind` tags the live
+        frame (`block` or `loop`) so break/continue know what to unwind.
         """
         open_tok = self.expect("{")
         out.line_at(open_tok.line, "{", indent)
-        self.scope_push()
+        self.scope_push(kind)
         while not self.at("}", "punc"):
             if self.cur.kind == "eof":
                 raise CrustError("line %d: unterminated block" % self.cur.line)
             self.parse_stmt(out, indent + 1, tail_returns)
         close = self.expect("}")
+        # Drop this frame's owning locals before leaving the block.
+        self.emit_drops(out, close.line, indent + 1, len(self.live) - 1)
         self.scope_pop()
         out.line_at(close.line, "}", indent)
 
@@ -2723,32 +2778,44 @@ class Parser:
                 ty = init.type
             self.declare(name, ty)
             code = ty.decl(_c_name(name))
+            moved = None
             if init is not None:
+                moved = self.simple_owning_local(init)
                 code += " = " + init.code
             self.emit_pending(out, t.line, indent)
             out.line_at(t.line, code + ";", indent)
+            if moved is not None:
+                self.emit_move_zero(out, t.line, indent, moved[0], moved[1])
+            self.live_register(name, ty)
             return
 
         if t.val == "return" and t.kind == "kw":
             self.next()
             if self.accept(";"):
+                self.emit_pending(out, t.line, indent)
+                self.emit_drops(out, t.line, indent,
+                                self.live_frame_index(("func",)))
                 out.line_at(t.line, "return;", indent)
                 return
             e = self.parse_expr_as(self.ret_type)
             self.expect(";")
             self.emit_pending(out, t.line, indent)
-            out.line_at(t.line, "return %s;" % e.code, indent)
+            self._emit_return_value(out, t.line, indent, e)
             return
 
         if t.val == "break" and t.kind == "kw":
             self.next()
             self.expect(";")
+            self.emit_drops(out, t.line, indent,
+                            self.live_frame_index(("loop",)))
             out.line_at(t.line, "break;", indent)
             return
 
         if t.val == "continue" and t.kind == "kw":
             self.next()
             self.expect(";")
+            self.emit_drops(out, t.line, indent,
+                            self.live_frame_index(("loop",)))
             out.line_at(t.line, "continue;", indent)
             return
 
@@ -2767,13 +2834,13 @@ class Parser:
             cond = self.parse_cond()
             self.emit_pending(out, t.line, indent)
             out.line_at(t.line, "while (%s)" % cond.code, indent)
-            self.parse_block(out, indent, False)
+            self.parse_block(out, indent, False, kind="loop")
             return
 
         if t.val == "loop" and t.kind == "kw":
             self.next()
             out.line_at(t.line, "while (1)", indent)
-            self.parse_block(out, indent, False)
+            self.parse_block(out, indent, False, kind="loop")
             return
 
         if t.val == "for" and t.kind == "kw":
@@ -2796,9 +2863,9 @@ class Parser:
             out.line_at(t.line, "for (%s = %s; %s %s %s; %s++)"
                         % (ity.decl(cvar), lo.code, cvar, cmp_op, hi.code,
                            cvar), indent)
-            self.scope_push()
+            self.scope_push("block")
             self.declare(var, ity)
-            self.parse_block(out, indent, False)
+            self.parse_block(out, indent, False, kind="loop")
             self.scope_pop()
             return
 
@@ -2827,9 +2894,37 @@ class Parser:
                              % self.cur.line)
         self.emit_pending(out, t.line, indent)
         if tail_returns and not self.ret_type.is_void():
-            out.line_at(t.line, "return %s;" % e.code, indent)
+            self._emit_return_value(out, t.line, indent, e)
         else:
             out.line_at(t.line, e.code + ";", indent)
+
+    def _live_pending(self, upto):
+        """True if any owning local would be dropped from `upto` upward."""
+        if upto is None:
+            return False
+        for fr in self.live[upto:]:
+            if fr["items"]:
+                return True
+        return False
+
+    def _emit_return_value(self, out, line, indent, e):
+        """Drop live locals, then `return` -- spilling when Drop must run first."""
+        fidx = self.live_frame_index(("func",))
+        # Returning a bare owning local moves it out: do not free it here.
+        moved = self.simple_owning_local(e)
+        if moved is not None:
+            self.live_unregister(moved[0])
+        if self._live_pending(fidx) and not self.ret_type.is_void():
+            # Spill before Drop: the operand may read an owning local.
+            tmp = self.new_temp()
+            out.line_at(line,
+                        "%s = %s;" % (self.ret_type.decl(tmp), e.code),
+                        indent)
+            self.emit_drops(out, line, indent, fidx)
+            out.line_at(line, "return %s;" % tmp, indent)
+        else:
+            self.emit_drops(out, line, indent, fidx)
+            out.line_at(line, "return %s;" % e.code, indent)
 
     def parse_tuple_let(self, out, indent, t):
         """Lower `let (a, b) = expr;` into a temporary and one binding each."""
@@ -2923,10 +3018,11 @@ class Parser:
 
         out.write(" for (unsigned long %s = 0; %s < %s; %s++)"
                   % (idx, idx, count, idx))
-        self.scope_push()
+        self.scope_push("block")
         self.declare(var, elem)
         self.emit_bound_block(out, indent, "%s = %s[%s];"
-                              % (elem.decl(_c_name(var)), base, idx))
+                              % (elem.decl(_c_name(var)), base, idx),
+                              kind="loop")
         self.scope_pop()
         out.write(" }")
 
@@ -2934,16 +3030,17 @@ class Parser:
         self.tmp_n += 1
         return "_crust_i%d" % self.tmp_n
 
-    def emit_bound_block(self, out, indent, decl):
+    def emit_bound_block(self, out, indent, decl, kind="block"):
         """Emit `{ <decl> <body> }` for a loop or pattern binding."""
         open_tok = self.expect("{")
         out.line_at(open_tok.line, "{ " + decl, indent)
-        self.scope_push()
+        self.scope_push(kind)
         while not self.at("}", "punc"):
             if self.cur.kind == "eof":
                 self.err("unterminated block")
             self.parse_stmt(out, indent + 1, False)
         close = self.expect("}")
+        self.emit_drops(out, close.line, indent + 1, len(self.live) - 1)
         self.scope_pop()
         out.line_at(close.line, "}", indent)
 
@@ -3733,22 +3830,28 @@ class Parser:
         self.ret_type = ret
         out.line_at(start.line, "%s(%s)" % (ret.decl(name),
                                             render_params(params)), 0)
-        self.scope_push()
+        self.scope_push("func")
         for pname, ptype in params:
             self.declare(pname, ptype)
+            # By-value owning params are dropped when the function returns.
+            if pname not in ("self", "Self"):
+                self.live_register(pname, ptype)
         # body, with the trailing expression becoming the return value
         open_tok = self.cur
         if not self.at("{", "punc"):
             raise CrustError("line %d: expected function body" % open_tok.line)
         self.expect("{")
         out.line_at(open_tok.line, "{", 0)
-        self.scope_push()
+        self.scope_push("block")
         while not self.at("}", "punc"):
             if self.cur.kind == "eof":
                 raise CrustError("line %d: unterminated function body"
                                  % self.cur.line)
             self.parse_stmt(out, 1, True)
         close = self.expect("}")
+        # Drop body locals, then by-value owning params (func frame).
+        fidx = self.live_frame_index(("func",))
+        self.emit_drops(out, close.line, 1, fidx)
         self.scope_pop()
         if synth_main_ret:
             out.line_at(close.line, "return 0;", 1)

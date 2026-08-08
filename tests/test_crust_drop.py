@@ -1,8 +1,9 @@
-"""Pure-translation tests for Crust scope-exit Drop helpers."""
+"""Tests for Crust scope-exit Drop (auto free_buf / free_box)."""
 
 import unittest
 
 import shivyc.crust as crust
+from tests.test_crust import _run
 
 
 class TestOwningFree(unittest.TestCase):
@@ -48,6 +49,100 @@ class TestOwningFree(unittest.TestCase):
         self.assertEqual(p.live_frame_index(("func",)), 1)
         p.scope_pop()
         self.assertEqual(p.live_frame_index(("loop",)), None)
+
+
+class TestDropEmission(unittest.TestCase):
+    def test_vec_dropped_without_explicit_free(self):
+        out = crust.translate("""
+fn f() -> i32 {
+    let mut v: Vec<i32> = Vec::<i32>::new();
+    v.push(1);
+    v.len() as i32
+}
+""")
+        self.assertIn("Vec_int_free_buf(&v);", out)
+        self.assertEqual(out.count("Vec_int_free_buf(&v);"), 1)
+
+    def test_return_spills_before_drop(self):
+        out = crust.translate("""
+fn f() -> i32 {
+    let mut v: Vec<i32> = Vec::<i32>::new();
+    v.push(7);
+    return v.get(0);
+}
+""")
+        body = out[out.index("int f(void) {"):]
+        spill = body.index("_crust_opt")
+        free = body.index("Vec_int_free_buf(&v);")
+        ret = body.index("return ", free)
+        self.assertLess(spill, free)
+        self.assertLess(free, ret)
+
+    def test_move_out_skips_drop(self):
+        out = crust.translate("""
+fn give() -> Vec<i32> {
+    let mut v: Vec<i32> = Vec::<i32>::new();
+    v.push(1);
+    v
+}
+""")
+        body = out[out.index("Vec_int give"):out.index("static Vec_int Vec_int_new")]
+        self.assertNotIn("Vec_int_free_buf(&v);", body)
+
+    def test_simple_move_zeros_source(self):
+        out = crust.translate("""
+fn f() -> i32 {
+    let mut a: Vec<i32> = Vec::<i32>::new();
+    a.push(1);
+    let b = a;
+    b.get(0)
+}
+""")
+        self.assertIn("memset(&a, 0, sizeof(a));", out)
+        self.assertIn("Vec_int_free_buf(&b);", out)
+        self.assertNotIn("Vec_int_free_buf(&a);", out)
+
+    def test_break_drops_loop_local(self):
+        out = crust.translate("""
+fn f() -> i32 {
+    let mut s: i32 = 0;
+    loop {
+        let mut v: Vec<i32> = Vec::<i32>::new();
+        v.push(1);
+        s = s + v.get(0);
+        break;
+    }
+    s
+}
+""")
+        self.assertIn("Vec_int_free_buf(&v);", out)
+        # free before break
+        loop = out[out.index("while (1)"):]
+        self.assertLess(loop.index("Vec_int_free_buf(&v);"),
+                        loop.index("break;"))
+
+    def test_end_to_end_no_explicit_free(self):
+        self.assertEqual(_run("""
+fn main() -> i32 {
+    let mut v: Vec<i32> = Vec::<i32>::new();
+    v.push(40);
+    v.push(2);
+    v.get(0) + v.get(1)
+}
+""", suffix=".rs"), 42)
+
+    def test_end_to_end_move_and_give(self):
+        self.assertEqual(_run("""
+fn give() -> Vec<i32> {
+    let mut v: Vec<i32> = Vec::<i32>::new();
+    v.push(42);
+    v
+}
+fn main() -> i32 {
+    let w = give();
+    w.get(0)
+}
+""", suffix=".rs"), 42)
 
 
 if __name__ == "__main__":
