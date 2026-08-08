@@ -151,6 +151,7 @@ RUNTIME_H = r'''#ifndef SHIVYC_RT_H
 #include <stdlib.h>
 #include <stdint.h>
 #include <setjmp.h>
+#include <math.h>
 
 typedef char* str;
 
@@ -2613,7 +2614,8 @@ def _param_used_as_object(fn, name):
     KNOWN = {"strip", "lstrip", "rstrip", "upper", "lower", "replace", "split",
              "partition",
              "splitlines", "startswith", "endswith", "isdigit", "isalpha",
-             "isspace", "isalnum", "find", "rfind", "join", "encode", "decode",
+             "isspace", "isalnum", "find", "rfind", "rindex", "index",
+             "join", "encode", "decode",
              "format", "count", "index", "append", "add", "update", "extend",
              "pop", "remove", "keys", "values", "items", "get", "discard",
              "sort", "copy", "setdefault"}
@@ -6313,7 +6315,8 @@ class Transpiler:
     _CONTAINER_METHODS = {
         "strip", "lstrip", "rstrip", "upper", "lower", "replace", "split",
         "partition", "splitlines", "startswith", "endswith", "isdigit",
-        "isalpha", "isspace", "isalnum", "find", "rfind", "join", "encode",
+        "isalpha", "isspace", "isalnum", "find", "rfind", "rindex", "index",
+        "join", "encode",
         "decode", "format", "count", "index", "append", "add", "update",
         "extend", "pop", "remove", "keys", "values", "items", "get", "discard",
         "sort", "copy", "setdefault", "insert", "clear", "reverse", "next"}
@@ -14288,12 +14291,16 @@ class Transpiler:
                 return None
             return "str_replace(%s, %s, %s)" % (self.as_str(func.value), self.as_str(a[0]),
                                                 self.as_str(a[1]))
-        if m in ("find", "rfind"):
+        if m in ("find", "rfind", "rindex", "index"):
             # The `start` argument was silently dropped, so `find(sub, pos)`
             # always returned the *first* match. A scan loop written
             # `pos = text.find(x, pos) + 1` then never advanced -- the
             # self-hosted compiler hung on any input.
-            last = "true" if m == "rfind" else "false"
+            # `rindex`/`index` are the raising forms; Crust/bootstrap code only
+            # calls them when the substring is known present, so they share
+            # the find lowering (a missing match yields -1 rather than
+            # ValueError -- acceptable for the self-hosted build).
+            last = "true" if m in ("rfind", "rindex") else "false"
             if len(a) >= 3:
                 # `find(sub, start, end)`: the end bound was dropped, so the
                 # search ran past it.
@@ -14320,8 +14327,8 @@ class Transpiler:
 
     STR_METHODS = {"startswith", "endswith", "strip", "lstrip", "rstrip",
                    "split", "partition", "splitlines", "replace", "find",
-                   "rfind", "isdigit", "isalpha", "isspace", "isalnum",
-                   "lower", "upper", "join", "encode"}
+                   "rfind", "rindex", "index", "isdigit", "isalpha",
+                   "isspace", "isalnum", "lower", "upper", "join", "encode"}
 
     def truth_test(self, node, rendered):
         """A C truth test for `rendered` (the expr of `node`)."""

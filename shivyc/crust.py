@@ -5468,7 +5468,10 @@ def _extend_head(scan, start):
                         break
                 j -= 1
             if j > 0 and stripped[:j].rstrip().endswith("#"):
-                start = stripped[:j].rstrip().rindex("#")
+                # Use `rfind`, not `rindex`: py2c lowers `rfind` to the
+                # runtime helper, while bare `rindex` used to become the BSD
+                # C `rindex()` and break `make bootstrap`.
+                start = stripped[:j].rstrip().rfind("#")
                 continue
         return start
 
