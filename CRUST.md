@@ -676,11 +676,10 @@ actually matters is recognized separately.
 
 ## `Rc<T>` and `Arc<T>`
 
-These count references and free at zero. What they do **not** do is the
-automatic half: Rust drops a clone at end of scope, and Crust has no `Drop`,
-so **every `clone()` must be matched by an explicit `release()`**. An unmatched
-clone leaks rather than corrupting anything, which is the right direction to
-fail.
+These count references and free at zero. Scope-exit Drop covers `Vec` /
+`String` / `Box` / `VecDeque`, **not** `Rc`/`Arc`: **every `clone()` must
+still be matched by an explicit `release()`**. An unmatched clone leaks
+rather than corrupting anything, which is the right direction to fail.
 
 `Arc` is `Rc` with a different name. Its refcount is not atomic, because Crust
 has no threads for it to race with — the same reasoning as `Mutex<T>`, and it
@@ -1084,9 +1083,8 @@ let s: String = format!("n={} f={:.1} s={}", 7, 2.5, "hi");   // "n=7 f=2.5 s=hi
 ```
 
 Conversions come from the argument types, exactly as `println!`'s do. The
-result **owns its buffer**, and since there is no `Drop` the caller must
-`free_buf()` it — the same contract every allocating type in the bundled core
-has, and the honest one when scope exit cannot run code.
+result **owns its buffer**. Scope exit calls `free_buf` for a by-value
+`String` local; an earlier `free_buf()` is still fine (it nulls the pointer).
 
 `format!("")` allocates rather than leaving the buffer null, so `as_ptr()`
 always returns a usable C string instead of printing `(null)`.
@@ -1095,7 +1093,8 @@ always returns a usable C string instead of printing `(null)`.
 
 A growable, always NUL-terminated character buffer, so `as_ptr()` hands C
 something it can use directly. `push`, `push_str`, `get`, `len`, `clear`,
-`eq_str`, `with_capacity`, and an explicit `free_buf` since there is no `Drop`.
+`eq_str`, `with_capacity`, and `free_buf` (also run at scope exit for
+by-value locals).
 
 Deliberately **not** rpython's `str`. py2c has a complete string runtime --
 concat, split, join, `%` formatting -- and reaching for it would give a lot
@@ -1244,10 +1243,23 @@ the one thing a monomorphised container cannot be written without.
 
 **This is a reimplementation, not the standard library.** The shape and the
 common methods match, so ordinary code reads the same. What is missing is
-missing rather than faked: no iterators, no traits, no `Drop` (buffers are
-released by an explicit `free_buf`/`free_box`), no bounds checking, and
-nothing thread-safe — `Arc`, `Mutex` and `RwLock` are deliberately *not*
-included, because without atomics or threads they could only be lies.
+missing rather than faked: no iterators protocol proper, no user-defined
+`Drop` trait (by-value `Vec`/`String`/`Box`/`VecDeque` locals do get
+`free_buf`/`free_box` at scope exit), no bounds checking, and nothing
+thread-safe — `Arc`, `Mutex` and `RwLock` are deliberately *not* included,
+because without atomics or threads they could only be lies.
+
+### Scope-exit Drop
+
+For by-value locals (and by-value parameters) of `Vec`, `String`, `Box`,
+`VecDeque`, and `PyList`, Crust inserts the existing free method at every
+exit from the scope: the closing `}`, `return` (spilling the operand first
+when anything live must be dropped), `break`, and `continue`. A simple
+`let b = a` or `b = a` of an owning local moves: the source is zeroed so a
+later Drop is a no-op. Returning a bare owning local moves it out without
+freeing. This is not a Rust `Drop` trait — custom destructors and `Rc`/`Arc`
+auto-`release` are still out of scope. C++ RAII (`#include "owned.cpp"`)
+remains available for guards that wrap Crust types from the other side.
 
 ## Finding crashes: `tools/crustfuzz.py`
 
@@ -1408,9 +1420,11 @@ Python, in keeping with the rest of the front end.
   `Box`, non-capturing closures, and identifiers that are C keywords.
 - `examples/crust/histogram.py` and `examples/crust/polyglot.c` — C, Rust and
   rpython in one translation unit, each calling the other two.
-- `examples/crust/owned.cpp` and `examples/crust/raii.c` — C++ destructors
-  supplying the `Drop` Crust lacks: a `VecGuard` frees a Rust `Vec<i32>` at
-  block exit (`#include "owned.cpp"` → `tools/cpprust.py`).
+- `examples/crust/owned.cpp` and `examples/crust/raii.c` — C++ destructors as
+  an RAII guard over a Crust `Vec<i32>` (`#include "owned.cpp"` →
+  `tools/cpprust.py`), alongside native Rust scope-exit Drop.
+- `examples/crust/tail.rs` — includes a `Box` freed by scope-exit Drop with
+  no explicit `free_box`.
 - `examples/crust/dispatch.cpp` and `examples/crust/dispatch.c` — C++ single
   inheritance and virtual dispatch: a `Shape *` calls into a `Cube` override
   through a vtable, with Rust reducing the results in the same unit.

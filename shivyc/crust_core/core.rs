@@ -11,10 +11,12 @@
 //
 // This is a reimplementation, not the standard library. What is here matches
 // the shape and the common methods of the real types, so ordinary code reads
-// and compiles the same way. What is not here -- iterators, traits, `Drop`,
-// bounds checking, thread safety -- is absent rather than faked. A local
-// definition of the same name always wins, so a unit that brings its own
-// `Vec` is unaffected by any of this.
+// and compiles the same way. What is not here -- iterators, a user-defined
+// `Drop` trait, bounds checking, thread safety -- is absent rather than
+// faked. Scope exit does call `free_buf` / `free_box` for by-value locals of
+// these types (see `shivyc/crust.py`); the methods remain callable explicitly
+// too. A local definition of the same name always wins, so a unit that brings
+// its own `Vec` is unaffected by any of this.
 //
 // Instantiation is demand-driven, so a unit that never mentions `Vec<T>` pays
 // nothing for these templates: they are tokens in a table until something
@@ -26,8 +28,8 @@
 // The layout is the same three words the real `Vec` uses (pointer, length,
 // capacity), so it stays an ordinary C struct that C code can read directly.
 // There is no bounds checking: `get` on an out-of-range index is undefined,
-// exactly as indexing a raw C array would be. `Drop` does not exist in Crust,
-// so the buffer is freed by an explicit `free_buf` rather than by scope exit.
+// exactly as indexing a raw C array would be. Scope exit frees the buffer by
+// calling `free_buf`; the method is also available for an earlier release.
 // ---------------------------------------------------------------------------
 struct Vec<T> {
     ptr: *mut T,
@@ -107,7 +109,7 @@ impl<T> Vec<T> {
         self.ptr
     }
 
-    // Crust has no `Drop`, so releasing the buffer is explicit.
+    // Also invoked automatically at scope exit for by-value locals.
     fn free_buf(&mut self) {
         free(self.ptr as *mut u8);
         self.ptr = 0 as *mut T;
@@ -184,9 +186,9 @@ impl<T> PyList<T> {
 // ---------------------------------------------------------------------------
 // Box<T> -- a single heap-allocated value.
 //
-// Without `Drop` this is a thin, explicit wrapper: `new` allocates, `get`
-// reads, `free_box` releases. It exists mainly so that a signature written
-// `Box<T>` in real code has something to resolve to.
+// A thin wrapper: `new` allocates, `get` reads, `free_box` releases (also at
+// scope exit for by-value locals). It exists mainly so that a signature
+// written `Box<T>` in real code has something to resolve to.
 // ---------------------------------------------------------------------------
 struct Box<T> {
     ptr: *mut T,
@@ -563,7 +565,7 @@ impl<T> Rc<T> {
         Rc { ptr: self.ptr, count: self.count }
     }
 
-    // Explicit, because there is no `Drop` to call it for you.
+    // Explicit for `Rc`/`Arc`: scope-exit Drop does not auto-release clones.
     fn release(&mut self) {
         self.count[0] -= 1;
         if self.count[0] <= 0 {
@@ -684,10 +686,10 @@ impl<T> MaybeUninit<T> {
 // ---------------------------------------------------------------------------
 // VecDeque<T> -- a double-ended queue over a ring buffer.
 //
-// Grows by doubling like `Vec<T>`, and like `Vec<T>` it has no `Drop`, so the
-// buffer is released by an explicit `free_buf`. `pop_front` on an empty deque
-// is undefined rather than returning an `Option`, which matches how the rest
-// of this core treats out-of-range access.
+// Grows by doubling like `Vec<T>`. Scope exit calls `free_buf` for by-value
+// locals; the method remains available for an earlier release. `pop_front` on
+// an empty deque is undefined rather than returning an `Option`, which
+// matches how the rest of this core treats out-of-range access.
 // ---------------------------------------------------------------------------
 struct VecDeque<T> {
     ptr: *mut T,
@@ -799,7 +801,7 @@ impl<T> VecDeque<T> {
 // handling is short and bounded; this is that.
 //
 // The buffer is always NUL-terminated, so `as_ptr` hands back something C can
-// take directly. There is no `Drop`, so `free_buf` is explicit.
+// take directly. Scope exit calls `free_buf` for by-value locals.
 // ---------------------------------------------------------------------------
 struct String {
     buf: *mut c_char,

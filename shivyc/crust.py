@@ -1574,10 +1574,8 @@ class Parser:
         reserved once at exactly the right size and written once. That avoids
         both a guess and a grow-and-retry loop.
 
-        The result owns its buffer and there is no `Drop`, so the caller must
-        `free_buf()` it. That is the same contract every other allocating type
-        in the bundled core has, and it is the honest one when scope exit
-        cannot run code.
+        The result owns its buffer. Scope exit calls `free_buf` for a
+        by-value `String` local; an earlier explicit free is still fine.
         """
         if not args:
             fmt, rest = '""', []
