@@ -134,8 +134,22 @@ VOID = RustCType("void")
 # `extern` for these when core templates call them.
 _PRELUDE_LIBC = frozenset({
     "malloc", "realloc", "free", "strlen", "abort", "printf", "fprintf",
+    "memset",
 })
 INT = RustCType("int")
+
+# By-value locals of these core types are dropped at scope exit: Crust inserts
+# a call to the matching free method. Not a Rust `Drop` trait -- just the
+# existing `free_buf` / `free_box` hooks, applied automatically. Keyed by the
+# template / concrete name stored in `unit.instances` (or the bare base for
+# non-generic `String`).
+_OWNING_FREE = {
+    "Vec": "free_buf",
+    "String": "free_buf",
+    "Box": "free_box",
+    "VecDeque": "free_buf",
+    "PyList": "free_buf",
+}
 
 
 # --------------------------------------------------------------------------
@@ -681,6 +695,11 @@ class Parser:
         self.unit = unit or Unit()
         self.fn_sigs = self.unit.fn_sigs
         self.scopes = [{}]              # name -> RustCType
+        # Parallel to `scopes`: each frame holds owning by-value locals that
+        # need a free call on exit. Kept separate from the typing dict so
+        # py2c does not see a new shape on every `.scopes[-1][name] = ...`.
+        # kind is "file" | "func" | "loop" | "block".
+        self.live = [{"kind": "file", "items": []}]
         self.ret_type = VOID
         self.impl_type = None           # enclosing `impl` type name, if any
         self.no_struct_lit = 0          # >0 while parsing a condition
@@ -748,11 +767,13 @@ class Parser:
     # in this very method, where the receiver is a list whose TypeInfo has no
     # such slot. That compiled to a call through a null pointer and segfaulted
     # the self-hosted compiler on every `fn` item it parsed.
-    def scope_push(self):
+    def scope_push(self, kind="block"):
         self.scopes.append({})
+        self.live.append({"kind": kind, "items": []})
 
     def scope_pop(self):
         self.scopes.pop()
+        self.live.pop()
 
     def declare(self, name, type_):
         self.scopes[-1][name] = type_
@@ -761,6 +782,82 @@ class Parser:
         for s in reversed(self.scopes):
             if name in s:
                 return s[name]
+        return None
+
+    def owning_free(self, ty):
+        """Free method name for a by-value owning type, or None."""
+        if ty is None or ty.ptr or ty.array:
+            return None
+        if ty.base == "String":
+            return "free_buf"
+        inst = self.unit.instances.get(ty.base)
+        if inst is None:
+            return None
+        return _OWNING_FREE.get(inst[0])
+
+    def live_register(self, name, ty):
+        """Track `name` for scope-exit Drop when it owns a heap buffer."""
+        method = self.owning_free(ty)
+        if method is None:
+            return
+        info = self.unit.methods.get((ty.base, method))
+        if info is None:
+            return
+        # Drop any prior entry for the same name in this frame (re-let).
+        items = self.live[-1]["items"]
+        self.live[-1]["items"] = [it for it in items if it[0] != name]
+        self.live[-1]["items"].append((name, info.mangled, ty))
+
+    def live_unregister(self, name):
+        """Stop tracking `name` (after a move)."""
+        for fr in self.live:
+            fr["items"] = [it for it in fr["items"] if it[0] != name]
+
+    def live_frame_index(self, kinds):
+        """Index of the innermost frame whose kind is in `kinds`, or None."""
+        for k in range(len(self.live) - 1, -1, -1):
+            if self.live[k]["kind"] in kinds:
+                return k
+        return None
+
+    def emit_drops(self, out, line, indent, upto):
+        """Emit free calls for frames `upto..top`, innermost and latest first.
+
+        Clears the emitted entries so a later fall-through Drop (e.g. the
+        function epilogue after an early `return`) is a no-op.
+        """
+        if upto is None:
+            return
+        for fr in reversed(self.live[upto:]):
+            for name, mangled, _ty in reversed(fr["items"]):
+                out.line_at(line, "%s(&%s);" % (mangled, _c_name(name)),
+                            indent)
+            fr["items"] = []
+
+    def emit_move_zero(self, out, line, indent, src_name, src_ty):
+        """After copying an owning local, zero the source so Drop is a no-op."""
+        self.unit.needs.add("memset")
+        csrc = _c_name(src_name)
+        out.line_at(line,
+                    "memset(&%s, 0, sizeof(%s));" % (csrc, csrc), indent)
+        self.live_unregister(src_name)
+
+    def simple_owning_local(self, expr):
+        """If `expr` is a bare owning local name, return (name, type), else None."""
+        if expr is None or expr.type is None or expr.code is None:
+            return None
+        if self.owning_free(expr.type) is None:
+            return None
+        text = expr.code.strip()
+        while text.startswith("(") and text.endswith(")"):
+            text = text[1:-1].strip()
+        if not text or not all(c.isalnum() or c == "_" for c in text):
+            return None
+        # Match against declared names (C keyword rename is a trailing `_`).
+        for s in reversed(self.scopes):
+            for name, ty in s.items():
+                if _c_name(name) == text and self.owning_free(ty) is not None:
+                    return name, ty
         return None
 
     # -- types ------------------------------------------------------------
@@ -1351,6 +1448,7 @@ class Parser:
         p = Parser(list(toks) + [RustToken("eof", "", toks[-1].line)],
                    self.unit, self.tysubst)
         p.scopes = self.scopes
+        p.live = self.live
         p.impl_type = self.impl_type
         p.ret_type = self.ret_type
         e = p.parse_expr()
@@ -1476,10 +1574,8 @@ class Parser:
         reserved once at exactly the right size and written once. That avoids
         both a guess and a grow-and-retry loop.
 
-        The result owns its buffer and there is no `Drop`, so the caller must
-        `free_buf()` it. That is the same contract every other allocating type
-        in the bundled core has, and it is the honest one when scope exit
-        cannot run code.
+        The result owns its buffer. Scope exit calls `free_buf` for a
+        by-value `String` local; an earlier explicit free is still fine.
         """
         if not args:
             fmt, rest = '""', []
@@ -1654,6 +1750,53 @@ class Parser:
         if self.cur.kind == "punc" and self.cur.val in ASSIGN_OPS:
             op = self.next().val
             rhs = self.parse_assign()
+            # Simple `dst = src` of owning locals: free the old destination
+            # (if live), copy, then zero the source so Drop does not
+            # double-free. Compound assigns (`+=`, …) are left alone.
+            if op == "=" and lhs.type is not None \
+                    and self.owning_free(lhs.type) is not None:
+                src = self.simple_owning_local(rhs)
+                dst_name = None
+                text = lhs.code.strip()
+                while text.startswith("(") and text.endswith(")"):
+                    text = text[1:-1].strip()
+                if text and all(c.isalnum() or c == "_" for c in text):
+                    for s in reversed(self.scopes):
+                        for name, ty in s.items():
+                            if _c_name(name) == text:
+                                dst_name = name
+                                break
+                        if dst_name is not None:
+                            break
+                parts = []
+                if dst_name is not None:
+                    # Free the previous value of dst before overwriting.
+                    for fr in self.live:
+                        for n, mangled, _ty in fr["items"]:
+                            if n == dst_name:
+                                parts.append("%s(&%s);"
+                                             % (mangled, _c_name(dst_name)))
+                                break
+                parts.append("%s = %s;" % (lhs.code, rhs.code))
+                if src is not None:
+                    self.unit.needs.add("memset")
+                    csrc = _c_name(src[0])
+                    parts.append("memset(&%s, 0, sizeof(%s));" % (csrc, csrc))
+                    self.live_unregister(src[0])
+                if dst_name is not None:
+                    self.live_register(dst_name, lhs.type)
+                # Return a comma-operator expression so a statement `a = b;`
+                # still ends with one semicolon from the caller. Prefer a
+                # statement sequence via pending when there is more than a
+                # plain assign.
+                if len(parts) == 1:
+                    return Expr("%s = %s" % (lhs.code, rhs.code), lhs.type)
+                for p in parts[:-1]:
+                    self.pending.append(p)
+                last = parts[-1]
+                if last.endswith(";"):
+                    last = last[:-1]
+                return Expr(last, lhs.type)
             return Expr("%s %s %s" % (lhs.code, op, rhs.code), lhs.type)
         return lhs
 
@@ -2576,20 +2719,23 @@ class Parser:
 
     # -- statements -------------------------------------------------------
 
-    def parse_block(self, out, indent, tail_returns):
+    def parse_block(self, out, indent, tail_returns, kind="block"):
         """Parse `{ ... }`, emitting C into `out`.
 
         `tail_returns` is True when a trailing expression should become a
-        return statement (the function-body case).
+        return statement (the function-body case). `kind` tags the live
+        frame (`block` or `loop`) so break/continue know what to unwind.
         """
         open_tok = self.expect("{")
         out.line_at(open_tok.line, "{", indent)
-        self.scope_push()
+        self.scope_push(kind)
         while not self.at("}", "punc"):
             if self.cur.kind == "eof":
                 raise CrustError("line %d: unterminated block" % self.cur.line)
             self.parse_stmt(out, indent + 1, tail_returns)
         close = self.expect("}")
+        # Drop this frame's owning locals before leaving the block.
+        self.emit_drops(out, close.line, indent + 1, len(self.live) - 1)
         self.scope_pop()
         out.line_at(close.line, "}", indent)
 
@@ -2630,32 +2776,44 @@ class Parser:
                 ty = init.type
             self.declare(name, ty)
             code = ty.decl(_c_name(name))
+            moved = None
             if init is not None:
+                moved = self.simple_owning_local(init)
                 code += " = " + init.code
             self.emit_pending(out, t.line, indent)
             out.line_at(t.line, code + ";", indent)
+            if moved is not None:
+                self.emit_move_zero(out, t.line, indent, moved[0], moved[1])
+            self.live_register(name, ty)
             return
 
         if t.val == "return" and t.kind == "kw":
             self.next()
             if self.accept(";"):
+                self.emit_pending(out, t.line, indent)
+                self.emit_drops(out, t.line, indent,
+                                self.live_frame_index(("func",)))
                 out.line_at(t.line, "return;", indent)
                 return
             e = self.parse_expr_as(self.ret_type)
             self.expect(";")
             self.emit_pending(out, t.line, indent)
-            out.line_at(t.line, "return %s;" % e.code, indent)
+            self._emit_return_value(out, t.line, indent, e)
             return
 
         if t.val == "break" and t.kind == "kw":
             self.next()
             self.expect(";")
+            self.emit_drops(out, t.line, indent,
+                            self.live_frame_index(("loop",)))
             out.line_at(t.line, "break;", indent)
             return
 
         if t.val == "continue" and t.kind == "kw":
             self.next()
             self.expect(";")
+            self.emit_drops(out, t.line, indent,
+                            self.live_frame_index(("loop",)))
             out.line_at(t.line, "continue;", indent)
             return
 
@@ -2674,13 +2832,13 @@ class Parser:
             cond = self.parse_cond()
             self.emit_pending(out, t.line, indent)
             out.line_at(t.line, "while (%s)" % cond.code, indent)
-            self.parse_block(out, indent, False)
+            self.parse_block(out, indent, False, kind="loop")
             return
 
         if t.val == "loop" and t.kind == "kw":
             self.next()
             out.line_at(t.line, "while (1)", indent)
-            self.parse_block(out, indent, False)
+            self.parse_block(out, indent, False, kind="loop")
             return
 
         if t.val == "for" and t.kind == "kw":
@@ -2703,9 +2861,9 @@ class Parser:
             out.line_at(t.line, "for (%s = %s; %s %s %s; %s++)"
                         % (ity.decl(cvar), lo.code, cvar, cmp_op, hi.code,
                            cvar), indent)
-            self.scope_push()
+            self.scope_push("block")
             self.declare(var, ity)
-            self.parse_block(out, indent, False)
+            self.parse_block(out, indent, False, kind="loop")
             self.scope_pop()
             return
 
@@ -2734,9 +2892,37 @@ class Parser:
                              % self.cur.line)
         self.emit_pending(out, t.line, indent)
         if tail_returns and not self.ret_type.is_void():
-            out.line_at(t.line, "return %s;" % e.code, indent)
+            self._emit_return_value(out, t.line, indent, e)
         else:
             out.line_at(t.line, e.code + ";", indent)
+
+    def _live_pending(self, upto):
+        """True if any owning local would be dropped from `upto` upward."""
+        if upto is None:
+            return False
+        for fr in self.live[upto:]:
+            if fr["items"]:
+                return True
+        return False
+
+    def _emit_return_value(self, out, line, indent, e):
+        """Drop live locals, then `return` -- spilling when Drop must run first."""
+        fidx = self.live_frame_index(("func",))
+        # Returning a bare owning local moves it out: do not free it here.
+        moved = self.simple_owning_local(e)
+        if moved is not None:
+            self.live_unregister(moved[0])
+        if self._live_pending(fidx) and not self.ret_type.is_void():
+            # Spill before Drop: the operand may read an owning local.
+            tmp = self.new_temp()
+            out.line_at(line,
+                        "%s = %s;" % (self.ret_type.decl(tmp), e.code),
+                        indent)
+            self.emit_drops(out, line, indent, fidx)
+            out.line_at(line, "return %s;" % tmp, indent)
+        else:
+            self.emit_drops(out, line, indent, fidx)
+            out.line_at(line, "return %s;" % e.code, indent)
 
     def parse_tuple_let(self, out, indent, t):
         """Lower `let (a, b) = expr;` into a temporary and one binding each."""
@@ -2830,10 +3016,11 @@ class Parser:
 
         out.write(" for (unsigned long %s = 0; %s < %s; %s++)"
                   % (idx, idx, count, idx))
-        self.scope_push()
+        self.scope_push("block")
         self.declare(var, elem)
         self.emit_bound_block(out, indent, "%s = %s[%s];"
-                              % (elem.decl(_c_name(var)), base, idx))
+                              % (elem.decl(_c_name(var)), base, idx),
+                              kind="loop")
         self.scope_pop()
         out.write(" }")
 
@@ -2841,16 +3028,17 @@ class Parser:
         self.tmp_n += 1
         return "_crust_i%d" % self.tmp_n
 
-    def emit_bound_block(self, out, indent, decl):
+    def emit_bound_block(self, out, indent, decl, kind="block"):
         """Emit `{ <decl> <body> }` for a loop or pattern binding."""
         open_tok = self.expect("{")
         out.line_at(open_tok.line, "{ " + decl, indent)
-        self.scope_push()
+        self.scope_push(kind)
         while not self.at("}", "punc"):
             if self.cur.kind == "eof":
                 self.err("unterminated block")
             self.parse_stmt(out, indent + 1, False)
         close = self.expect("}")
+        self.emit_drops(out, close.line, indent + 1, len(self.live) - 1)
         self.scope_pop()
         out.line_at(close.line, "}", indent)
 
@@ -3640,22 +3828,28 @@ class Parser:
         self.ret_type = ret
         out.line_at(start.line, "%s(%s)" % (ret.decl(name),
                                             render_params(params)), 0)
-        self.scope_push()
+        self.scope_push("func")
         for pname, ptype in params:
             self.declare(pname, ptype)
+            # By-value owning params are dropped when the function returns.
+            if pname not in ("self", "Self"):
+                self.live_register(pname, ptype)
         # body, with the trailing expression becoming the return value
         open_tok = self.cur
         if not self.at("{", "punc"):
             raise CrustError("line %d: expected function body" % open_tok.line)
         self.expect("{")
         out.line_at(open_tok.line, "{", 0)
-        self.scope_push()
+        self.scope_push("block")
         while not self.at("}", "punc"):
             if self.cur.kind == "eof":
                 raise CrustError("line %d: unterminated function body"
                                  % self.cur.line)
             self.parse_stmt(out, 1, True)
         close = self.expect("}")
+        # Drop body locals, then by-value owning params (func frame).
+        fidx = self.live_frame_index(("func",))
+        self.emit_drops(out, close.line, 1, fidx)
         self.scope_pop()
         if synth_main_ret:
             out.line_at(close.line, "return 0;", 1)
@@ -5274,7 +5468,10 @@ def _extend_head(scan, start):
                         break
                 j -= 1
             if j > 0 and stripped[:j].rstrip().endswith("#"):
-                start = stripped[:j].rstrip().rindex("#")
+                # Use `rfind`, not `rindex`: py2c lowers `rfind` to the
+                # runtime helper, while bare `rindex` used to become the BSD
+                # C `rindex()` and break `make bootstrap`.
+                start = stripped[:j].rstrip().rfind("#")
                 continue
         return start
 
@@ -6685,6 +6882,8 @@ def translate(code, path=None):
                        "long hi; } crust_i128;")
     if "memcpy" in unit.needs:
         prelude.append("void *memcpy(void *, const void *, unsigned long);")
+    if "memset" in unit.needs:
+        prelude.append("void *memset(void *, int, unsigned long);")
     if "alloc" in unit.needs:
         prelude.append("void *malloc(unsigned long);")
         prelude.append("void *realloc(void *, unsigned long);")

@@ -289,11 +289,26 @@ def _param_map(cmds):
     return out
 
 
-def _alloc_name(prog, alloc):
+def _alloc_name(alloc):
     """Readable label for an allocation id."""
     if isinstance(alloc, tuple) and alloc and alloc[0] == "param":
-        return f"parameter {alloc[2]}"
+        return "parameter %s" % (alloc[2],)
     return "allocation"
+
+
+def _use_check(ctx, fn, freed, idx, pt, diags, addr: "ILValue", kind):
+    """Record a use-after-free if `addr` still points at a freed allocation.
+
+    Module-level (not nested): py2c name-infers bare `addr` as `int`, but
+    callers pass an ILValue; annotate so `make bootstrap` stays green.
+    """
+    for al in pt.get(addr, ()):
+        ctx.derefed.add(al)
+        if freed.get(al) in ("f", "mf") and ctx.record:
+            key = (idx, kind, al)
+            if key not in ctx.seen_diag:
+                ctx.seen_diag.add(key)
+                diags.append(Diagnostic(fn, "use-after-free", al, kind))
 
 
 class _Ctx:
@@ -426,16 +441,6 @@ class Analyzer:
             freed[al] = "f"
             ctx.freed_ever.add(al)
 
-        def use_check(addr, kind):
-            for al in pt.get(addr, ()):
-                ctx.derefed.add(al)
-                if freed.get(al) in ("f", "mf") and ctx.record:
-                    key = (idx, kind, al)
-                    if key not in ctx.seen_diag:
-                        ctx.seen_diag.add(key)
-                        self.diags.append(Diagnostic(
-                            fn, "use-after-free", al, kind))
-
         if isinstance(c, control_cmds.Call):
             name = c.direct_name
             args = list(c.args)
@@ -454,15 +459,18 @@ class Analyzer:
                             ctx.seen_diag.add(key)
                             self.diags.append(Diagnostic(
                                 fn, "double-free", al,
-                                f"free of an {_alloc_name(self.prog, al)} that was "
-                                f"already freed"))
+                                "free of an %s that was already freed" % (
+                                    _alloc_name(al),)))
                     mark_free(al)
                 return
             summ = self.summaries.get(name)
             if summ is not None and name in self.prog.defined:
                 for i, a in enumerate(args):
                     if i in summ.derefs_params:        # callee dereferences arg i
-                        use_check(a, f"passes a freed pointer to {name}(), which dereferences it")
+                        _use_check(
+                            ctx, fn, freed, idx, pt, self.diags, a,
+                            "passes a freed pointer to %s(), which "
+                            "dereferences it" % (name,))
                     if i in summ.frees_params:
                         for al in pt.get(a, ()):
                             if freed.get(al) in ("f", "mf") and ctx.record:
@@ -472,7 +480,7 @@ class Analyzer:
                                     self.diags.append(Diagnostic(
                                         fn, "double-free", al,
                                         "free of an allocation already freed "
-                                        f"(via {name})"))
+                                        "(via %s)" % (name,)))
                             mark_free(al)
                     if i in summ.escapes_params:
                         for al in pt.get(a, ()):
@@ -488,7 +496,8 @@ class Analyzer:
                 return
             # unknown / external call: pointer args may be used and they escape
             for a in args:
-                use_check(a, "passes a freed pointer to a function")
+                _use_check(ctx, fn, freed, idx, pt, self.diags, a,
+                           "passes a freed pointer to a function")
                 for al in pt.get(a, ()):
                     mark_escape(al)
             if c.ret is not None:
@@ -514,12 +523,16 @@ class Analyzer:
             return
 
         if isinstance(c, value_cmds.ReadAt):
-            use_check(c.addr, "dereferences a pointer after its allocation was freed")
+            _use_check(
+                ctx, fn, freed, idx, pt, self.diags, c.addr,
+                "dereferences a pointer after its allocation was freed")
             pt[c.output] = frozenset()
             return
 
         if isinstance(c, value_cmds.SetAt):
-            use_check(c.addr, "dereferences a pointer after its allocation was freed")
+            _use_check(
+                ctx, fn, freed, idx, pt, self.diags, c.addr,
+                "dereferences a pointer after its allocation was freed")
             for al in pt.get(c.val, ()):
                 mark_escape(al)
             return

@@ -26,9 +26,8 @@ fn stats(xs: &[i32]) -> (i32, i32, f64) {
 fn boxed_sum(n: i32) -> i32 {
     let mut b: alloc::boxed::Box<i32> = Box::<i32>::new(n);
     b.set(b.get() + 2);
-    let v: i32 = b.get();
-    b.free_box();
-    v
+    // Scope exit calls `free_box`; no explicit free needed.
+    b.get()
 }
 
 // `double`, `int` and `register` are ordinary Rust names and C keywords, so

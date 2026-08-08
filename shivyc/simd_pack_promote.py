@@ -97,9 +97,13 @@ def _natural_loops(cmds, label_idx):
     return safe
 
 
-def _region_is_safe(cmds, s, j, end_label, label_idx):
-    """Whether the loop body cmds[s..j] admits promotion."""
-    for k in range(s, j + 1):
+def _region_is_safe(cmds, start, end, end_label, label_idx):
+    """Whether the loop body cmds[start..end] admits promotion.
+
+    Parameter names avoid a single-letter `s`: py2c's type inference has
+    treated that name as `char*` and broken `make bootstrap`.
+    """
+    for k in range(start, end + 1):
         c = cmds[k]
         if isinstance(c, (control.Call, control.Return)):
             return False
@@ -107,16 +111,16 @@ def _region_is_safe(cmds, s, j, end_label, label_idx):
             ti = label_idx.get(t)
             # Every internal branch must stay inside the loop or exit to the
             # loop's single merge label.
-            if t != end_label and not (ti is not None and s <= ti <= j):
+            if t != end_label and not (ti is not None and start <= ti <= end):
                 return False
     # No branch from outside may jump into the loop interior (past the header),
     # which would bypass the decompress.
     for k, c in enumerate(cmds):
-        if s <= k <= j:
+        if start <= k <= end:
             continue
         for t in _targets(c):
             ti = label_idx.get(t)
-            if ti is not None and s < ti <= j:
+            if ti is not None and start < ti <= end:
                 return False
     return True
 
@@ -139,10 +143,10 @@ def _promote_in_function(cmds, globs):
     pre_insert = {}   # index -> commands to insert before it
     post_insert = {}  # index -> commands to insert after it
 
-    for (s, j, end_label) in regions:
-        if not _region_is_safe(cmds, s, j, end_label, label_idx):
+    for (start, end, end_label) in regions:
+        if not _region_is_safe(cmds, start, end, end_label, label_idx):
             continue
-        body = cmds[s:j + 1]
+        body = cmds[start:end + 1]
         # Packed globals actually accessed in this loop.
         used = []
         seen = set()
@@ -173,7 +177,7 @@ def _promote_in_function(cmds, globs):
         if not promoted:
             continue
         end_idx = label_idx[end_label]
-        pre_insert.setdefault(s, []).extend(
+        pre_insert.setdefault(start, []).extend(
             value.Set(temp, g) for g, temp in promoted)      # temp = g
         post_insert.setdefault(end_idx, []).extend(
             value.Set(g, temp) for g, temp in promoted)      # g = temp
