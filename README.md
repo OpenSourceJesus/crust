@@ -4,7 +4,7 @@
 Main Crust Documentation: [CRUST.md](CRUST.md)
 
 Crust Papers:
-- https://doi.org/10.5281/zenodo.21777457
+- https://dx.doi.org/10.2139/ssrn.7226482
 - https://ai.vixra.org/pdf/2608.0014v1.pdf
 
 Modern systems development forces engineers to choose between two paradigms:
