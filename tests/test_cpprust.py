@@ -848,6 +848,152 @@ public:
 """
 
 
+_CHAIN = """
+class Node {
+    int v;
+public:
+    Node(int x) { v = x; }
+    int get() { return v; }
+    Node *self() { return this; }
+};
+class Owner {
+    Node *held;
+public:
+    Owner() { held = 0; }
+    Node *node() { return held; }
+};
+"""
+
+
+class TestCppChainedReceivers(unittest.TestCase):
+    """The result of a call can be the receiver of the next one.
+
+    Each step is emitted into an expression that becomes the next step's
+    receiver, so no temporary is needed -- which matters because this is
+    expression position and C has no statement expression.
+    """
+
+    def test_two_link_chain(self):
+        out = cpprust.translate(_CHAIN + """
+int f(void) { Owner o; return o.node()->get(); }
+""")
+        self.assertIn("return Node_get(Owner_node(&o));", out)
+
+    def test_three_link_chain(self):
+        out = cpprust.translate(_CHAIN + """
+int f(void) { Owner o; return o.node()->self()->get(); }
+""")
+        self.assertIn("return Node_get(Node_self(Owner_node(&o)));", out)
+
+    def test_chain_inside_an_argument(self):
+        out = cpprust.translate(_CHAIN + """
+int take(int k);
+int f(void) { Owner o; return take(o.node()->get()); }
+""")
+        self.assertIn("take(Node_get(Owner_node(&o)))", out)
+
+    def test_free_function_chain_is_untouched(self):
+        """The case the subset always had to leave alone.
+
+        A chain only ever starts from a symbol that resolves to a class, so
+        plain C -- a free function returning a struct pointer -- still comes
+        through exactly as written.
+        """
+        out = cpprust.translate(_CHAIN + """
+struct Ops { int (*init)(int); };
+struct Ops *get_ops(void);
+int g(int x) { return get_ops()->init(x); }
+""")
+        self.assertIn("return get_ops()->init(x);", out)
+
+    def test_unknown_method_ends_the_chain(self):
+        out = cpprust.translate(_CHAIN + """
+int f(void) { Owner o; return o.node()->nosuch(); }
+""")
+        self.assertIn("Owner_node(&o)->nosuch()", out)
+
+    def test_value_return_cannot_be_a_receiver(self):
+        # C cannot take the address of a function result, and spilling would
+        # need a statement.
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate("""
+class Inner { public: int n; Inner() { n = 0; } int get() { return n; } };
+class Outer { public: Inner in; Outer() { } Inner val() { return in; } };
+int f(void) { Outer o; return o.val().get(); }
+""")
+        self.assertIn("returned by value", cm.exception.message)
+
+
+_VCHAIN = """
+class Shape {
+public:
+    int id;
+    Shape(int i) { id = i; }
+    virtual int area() { return 1; }
+    virtual Shape *twin() { return this; }
+};
+class Square : public Shape {
+public:
+    int side;
+    Square(int i, int s) : Shape(i) { side = s; }
+    int area() { return side * side; }
+};
+class Factory {
+public:
+    int n;
+    Factory() { n = 0; }
+    Shape *make() { n = n + 1; return 0; }
+};
+"""
+
+
+class TestCppVirtualChainEvaluation(unittest.TestCase):
+    """A virtual call must not evaluate its receiver twice.
+
+    The plain dispatch form names the receiver once to reach the vptr and
+    once as the argument. That is fine for a name, but a call receiver would
+    run twice -- `f.make()->area()` would build two objects.
+    """
+
+    def test_call_receiver_dispatches_through_a_helper(self):
+        out = cpprust.translate(_VCHAIN + """
+int f(void) { Factory k; return k.make()->area(); }
+""")
+        self.assertIn("Shape__vcall_area(Factory_make(&k))", out)
+        # The factory is named exactly once.
+        self.assertEqual(out.count("Factory_make(&k)"), 1)
+
+    def test_helper_evaluates_this_once(self):
+        out = cpprust.translate(_VCHAIN + """
+int f(void) { Factory k; return k.make()->area(); }
+""")
+        self.assertIn("static int Shape__vcall_area(Shape *this) { return "
+                      "((const struct Shape_vtable *)this->_vptr)"
+                      "->area(this); }", out)
+
+    def test_named_receiver_keeps_the_plain_form(self):
+        out = cpprust.translate(_VCHAIN + "int f(Shape *s) { return s->area(); }")
+        self.assertIn("((const struct Shape_vtable *)s->_vptr)->area(s)", out)
+
+    def test_no_helper_when_nothing_chains(self):
+        out = cpprust.translate(_VCHAIN + "int f(Shape *s) { return s->area(); }")
+        self.assertNotIn("__vcall", out)
+
+    def test_helper_is_emitted_by_the_declaring_class_only(self):
+        out = cpprust.translate(_VCHAIN + """
+int f(void) { Factory k; return k.make()->area(); }
+""")
+        self.assertNotIn("Square__vcall_area", out)
+
+    def test_return_this_upcasts_to_the_declared_base(self):
+        out = cpprust.translate("""
+class Base { public: int id; Base() { id = 0; } virtual Base *me() { return this; } };
+class Derived : public Base { public: int w; Derived() { w = 0; } Base *me() { return this; } };
+""")
+        self.assertIn("static Base * Derived_me(Derived *this) "
+                      "{ return (Base *)this; }", out)
+
+
 class TestCppVirtualDtor(unittest.TestCase):
     """A destructor is a vtable slot like any other virtual."""
 
