@@ -25,6 +25,12 @@ The subset, deliberately small:
     double free. `operator=` is not in the subset, so assigning to an
     owning object is refused for the same reason. A class with no
     destructor owns nothing, and copies bitwise exactly as C++ would.
+  * an owning class never crosses a call boundary by value. A by-value
+    parameter is a copy no constructor ran for and no destructor will run
+    for; a by-value *return* is worse, since the local is destroyed on the
+    way out and the caller receives a copy of a released object. Both are
+    errors naming the fix (`T &`, or `T *`). A class with no destructor owns
+    nothing and passes by value freely.
   * constructors and a destructor: a local `Type name(args);` becomes
     `Type_new` at the declaration and `Type_drop` at the closing `}` of the
     enclosing block (inside the `.cpp` only -- the include hook never sees
@@ -32,6 +38,23 @@ The subset, deliberately small:
   * `public:` / `private:` / `protected:` labels (parsed, not enforced --
     access control is a compile-time property and this is a lowering, not a
     type checker; pretending to enforce it would be worse than not claiming to)
+  * `operator=`, the one overload the subset has, lowered to `T__assign`.
+    Assignment to an owning object has no safe default -- a struct copy
+    leaves two owners -- so this is where the author supplies one. A chained
+    `a = b = c` is refused, because the call is lowered to `void`.
+  * a small `std`: `string` and `vector<T>`, supplied when the source names
+    them and written in this subset rather than special-cased in the
+    lowering. `std::` is stripped; there is no namespace support and
+    claiming otherwise would be worse. Element access is `get`/`set`/`ptr`,
+    not `v[i]`, since `operator[]` is not available. `vector<T>` stores
+    elements by assignment, so an element type with a destructor is refused
+    rather than double-freed.
+  * non-capturing lambdas, which are exactly functions and lower to one --
+    `auto f = [](int y) -> int { .. };` becomes a function pointer, so the
+    call site needs no rewriting at all. A capturing lambda is refused: it
+    needs a field per capture, and the type of a captured local is not
+    something this pass can see. A return type must be spelled, because
+    nothing here can deduce one and defaulting to `int` would truncate.
   * `template<typename T>` on classes, monomorphised on use. Any number of
     parameters (`template<typename K, typename V>`), and a non-type integer
     parameter (`template<typename T, int N>`) works too, because
@@ -173,8 +196,12 @@ class CppError(Exception):
         self.message = message
 
 
-_UNSUPPORTED = ("throw", "try", "catch", "operator",
+_UNSUPPORTED = ("throw", "try", "catch",
                 "dynamic_cast", "typeid")
+
+# `operator=` is supported; every other overload is not. Checked separately
+# from the keyword list so the diagnostic can name the operator.
+_OPERATOR = re.compile(r"\boperator\s*(=(?!=)|[^\s(]+)")
 
 # `template<typename T>` / `template<class T, typename U>`. The whole
 # parameter list is captured and split separately: the count is not fixed
@@ -287,6 +314,15 @@ def _blank_strings(text):
 def _check_unsupported(scan, path):
     # A literal is data, not code: `puts("new item")` uses no keyword.
     scan = _blank_strings(scan)
+    for m in _OPERATOR.finditer(scan):
+        if m.group(1) == "=":
+            continue
+        line = scan.count("\n", 0, m.start()) + 1
+        raise CppError(
+            "%s:%d: `operator%s` is not in the C++ subset. `operator=` is "
+            "the one overload it supports, because assignment to an owning "
+            "object has no safe default."
+            % (os.path.basename(path), line, m.group(1)))
     for kw in _UNSUPPORTED:
         m = re.search(r"\b%s\b" % kw, scan)
         if m:
@@ -438,6 +474,12 @@ def _split_members(body, cname, line0):
         if sig == "~" + cname:
             members.append(Member("dtor", "void", cname, params, inner, line0,
                                   "", None, virt))
+        elif re.search(r"\boperator\s*=$", sig):
+            # `T &operator=(const T &o)` or `void operator=(..)`. The return
+            # type is dropped: the result is lowered to `void`, so a chained
+            # `a = b = c` is rejected rather than silently yielding nothing.
+            members.append(Member("assign", "void", "operator=", params,
+                                  inner, line0))
         elif sig == cname:
             members.append(Member("ctor", "void", cname, params, inner, line0,
                                   "", init))
@@ -1015,7 +1057,8 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
     info = {"ctor": False, "dtor": False, "ctor_args": "", "methods": {},
             "fields": {}, "base": base, "slots": slots, "root": root,
             "abstract": abstract, "vdtor": False, "vdtor_decl": None,
-            "ctor_refs": set(), "paths": {}, "copy": False}
+            "ctor_refs": set(), "paths": {}, "copy": False,
+            "assign": False}
     if base_info:
         # Inherited members and methods are reachable on the derived class.
         # A base field is not at the same offset as an own field, though: the
@@ -1095,11 +1138,17 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
     if base and known[base]["dtor"]:
         epilogue += " %s_drop(&this->_base);" % base
 
+    mprotos = []
+
     def emit(kind, mname, params, raw):
         refs = _ref_positions(params, names)
         params = _lower_refs(params, names)
         # `this` is a pointer, exactly as an `impl` method's `self` is.
         arglist = "%s *this" % cname + (", " + params if params else "")
+        # Members are emitted in declaration order, but a body may call a
+        # method declared below it -- ordinary in a class, and an implicit
+        # declaration in C. Prototype everything first.
+        mprotos.append("static %s %s(%s);" % (kind, mname, arglist))
         inner = _implicit_this(raw, mnames)
         # Bare member names inside a body refer to fields; qualify them.
         # Inherited ones go through `_base`, so the path is substituted
@@ -1145,6 +1194,14 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
                                      prologue + sub(m.body or ""))
             info["ctor"] = True
             info["ctor_args"] = params
+        elif m.kind == "assign":
+            # Lowered to `T_assign(T *this, const T *o)`. Assignment is the
+            # one place the subset needs a user hook: a struct copy of an
+            # owning object leaves two owners, and there is no safe default.
+            # `__assign`, not `_assign`: a class may perfectly well declare
+            # a method called `assign`, and `string` does.
+            emit("void", "%s__assign" % cname, params, sub(m.body or ""))
+            info["assign"] = True
         elif m.kind == "dtor":
             emit("void", "%s_drop" % cname, params,
                  sub(m.body or "") + epilogue)
@@ -1255,7 +1312,7 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
         head.append("static const struct %s_vtable %s__vtable = { %s };"
                     % (cname, cname, ", ".join("&" + e for e in entries)))
         out.extend(thunks)
-    return head + out, cname, info
+    return head + mprotos + out, cname, info
 
 
 def _prev_word(text, idx):
@@ -1373,22 +1430,37 @@ class _Frame(object):
         self.vals = {}        # class-typed locals: vname -> class
 
 
-def _copy_source(expr, ctype, scopes):
-    """The name being copied, if `expr` is an object of class `ctype`.
+def _copy_source(expr, ctype, scopes, type_info):
+    """The object being copied, if `expr` names one of class `ctype`.
 
-    Only a plain local of the same class counts. A call result or any other
-    expression is not something this pass can copy-construct from, and
-    guessing would be the whole point of the bug.
+    A local, or a chain of value members from one (`t.nums`). A call result
+    or any other expression is not something this pass can copy-construct
+    from, and guessing would be the whole point of the bug.
     """
     if expr is None:
         return None
     expr = expr.strip()
-    if not re.match(r"^\w+$", expr):
+    parts = [p for p in re.split(r"\s*\.\s*", expr) if p]
+    if not parts or not all(re.match(r"^\w+$", p) for p in parts):
         return None
+    cls = None
     for fr in reversed(scopes):
-        if expr in fr.vals:
-            return expr if fr.vals[expr] == ctype else None
-    return None
+        if parts[0] in fr.vals:
+            cls = fr.vals[parts[0]]
+            break
+    if cls is None:
+        return None
+    out = parts[0]
+    for fld in parts[1:]:
+        info = type_info.get(cls)
+        if info is None or fld not in info["fields"]:
+            return None
+        fcls, is_ptr = info["fields"][fld]
+        if is_ptr:
+            return None              # a pointer member is not the object
+        out = "%s.%s" % (out, info["paths"].get(fld, fld))
+        cls = fcls
+    return out if cls == ctype else None
 
 
 def _copy_call(ctype, vname, src, info, where):
@@ -1580,7 +1652,7 @@ def _rewrite_scopes(text, type_info):
                 i = m.end()
                 continue
             out.append("%s %s; " % (ctype, vname))
-            src = _copy_source(args, ctype, scopes)
+            src = _copy_source(args, ctype, scopes, type_info)
             if args is None or not args.strip():
                 out.append("%s_new(&%s);" % (ctype, vname))
             elif src is not None:
@@ -1607,7 +1679,7 @@ def _rewrite_scopes(text, type_info):
                 out.append(m.group(0))
                 i = m.end()
                 continue
-            src = _copy_source(rhs, ctype, scopes)
+            src = _copy_source(rhs, ctype, scopes, type_info)
             if src is None and not info["dtor"] and not info["copy"]:
                 out.append(m.group(0))       # plain data: a bitwise copy is
                 i = m.end()                  # exactly what C++ would do
@@ -1634,6 +1706,23 @@ def _rewrite_scopes(text, type_info):
                 if lhs in fr.vals:
                     ctype = fr.vals[lhs]
                     break
+            if ctype is not None and type_info[ctype]["assign"]:
+                rhs = m.group(2).strip()
+                if "=" in _blank_strings(rhs).replace("==", ""):
+                    raise CppError(
+                        "`%s = %s`: a chained assignment is not in the C++ "
+                        "subset -- `operator=` is lowered to a `void` call, "
+                        "so there is no result to assign onward."
+                        % (lhs, rhs))
+                src = _copy_source(rhs, ctype, scopes, type_info)
+                if src is None:
+                    raise CppError(
+                        "`%s = %s`: the right-hand side is not an object of "
+                        "type %s that this pass can name. Assign it to a "
+                        "typed local first." % (lhs, rhs, ctype))
+                out.append("%s__assign(&%s, &%s);" % (ctype, lhs, src))
+                i = m.end()
+                continue
             if ctype is not None and type_info[ctype]["dtor"]:
                 # A struct assignment copies the representation and leaves
                 # both objects owning it, so both destructors run on the same
@@ -1642,13 +1731,100 @@ def _rewrite_scopes(text, type_info):
                 raise CppError(
                     "`%s = %s`: %s has a destructor, and assigning would "
                     "leave two objects owning one resource -- both would be "
-                    "destroyed. `operator=` is not in the C++ subset; copy "
-                    "at construction (`%s b(a);`) or assign the fields."
-                    % (lhs, m.group(2).strip(), ctype, ctype))
+                    "destroyed. Define `%s &operator=(const %s &o)`, or copy "
+                    "at construction (`%s b(a);`)."
+                    % (lhs, m.group(2).strip(), ctype, ctype, ctype, ctype))
 
         out.append(text[i])
         i += 1
     return "".join(out)
+
+
+_TYPE_WORDS = frozenset((
+    "void", "int", "char", "long", "short", "float", "double", "unsigned",
+    "signed", "struct", "union", "enum", "const", "..."))
+
+
+def _looks_like_params(parts, cinfo):
+    """Do these read as a declaration's parameters rather than arguments?
+
+    `Node n(1);` is a local with a constructor argument, not a function
+    returning `Node`; `void f(Node &n);` is a declaration. A parameter has a
+    type and a name, so a lone expression gives it away.
+    """
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        toks = [t for t in part.replace("*", " * ").split() if t != "const"]
+        toks = [t for t in toks if t != "*"]
+        if len(toks) >= 2:
+            continue
+        if toks and (toks[0] in _TYPE_WORDS or toks[0] in cinfo):
+            continue
+        return False
+    return True
+
+
+def _by_value_class(part, cinfo):
+    """The class a parameter is taken by value as, or None.
+
+    A declaration's parameter has a type and a name; a call's argument has
+    only an expression, which is what tells the two apart here.
+    """
+    toks = [t for t in part.replace("*", " * ").split() if t != "const"]
+    if len(toks) < 2 or "*" in toks or "[" in part:
+        return None
+    return toks[0] if toks[0] in cinfo else None
+
+
+def _check_by_value(text, cinfo, path):
+    """Reject by-value class parameters and returns for owning classes.
+
+    Both are silent miscompiles otherwise. A by-value parameter is a struct
+    copy that no constructor ran for and no destructor will run for. A
+    by-value *return* is worse: the local is destroyed on the way out, so
+    the caller receives a copy of an object whose resources were just
+    released -- a use-after-free that no diagnostic points at.
+
+    Doing these properly means copy-constructing into a temporary at the
+    call site, which needs a statement, and this is expression position.
+    Classes with no destructor own nothing and are left alone.
+    """
+    owning = set(n for n in cinfo if cinfo[n]["dtor"])
+    if not owning:
+        return
+    for m in re.finditer(r"(?<![\w.])(\w+)\s*\(", text):
+        if m.group(1) in _KEYWORDS:
+            continue
+        close = _match_paren(text, m.end() - 1)
+        if close is None:
+            continue
+        tail = text[close + 1:close + 40].lstrip()
+        if not (tail.startswith("{") or tail.startswith(";")):
+            continue                     # a call, not a declaration
+        parts = _split_top(text[m.end():close])
+        if not _looks_like_params(parts, cinfo):
+            continue                     # a local with constructor arguments
+        for part in parts:
+            cls = _by_value_class(part.strip(), cinfo)
+            if cls in owning:
+                raise CppError(
+                    "%s: `%s` takes `%s` by value, but %s has a destructor -- "
+                    "the copy is never constructed and never destroyed. Pass "
+                    "`%s &` instead."
+                    % (os.path.basename(path), m.group(1), cls, cls, cls))
+        ret = _func_return_type(text, m.end() - 1)
+        toks = [t for t in (ret or "").replace("*", " * ").split()
+                if t != "const"]
+        if toks and toks[0] in owning and "*" not in toks:
+            raise CppError(
+                "%s: `%s` returns `%s` by value, but %s has a destructor -- "
+                "the local is destroyed on the way out, so the caller would "
+                "receive a copy of a released object. Return `%s *`, or fill "
+                "a `%s &` parameter."
+                % (os.path.basename(path), m.group(1), toks[0], toks[0],
+                   toks[0], toks[0]))
 
 
 def _free_ref_funcs(text, names):
@@ -2143,8 +2319,283 @@ def _rewrite_calls(text, cinfo, free_refs):
     return "".join(out)
 
 
+# ==========================================================================
+# A very small `std`: `string` and `vector`, written in this subset rather
+# than special-cased in the lowering.
+#
+# That is the point of them being here. Every feature they need -- templates,
+# a copy constructor, `operator=`, a destructor, methods calling methods --
+# is one the subset already claims to have, so if the containers compile,
+# the claim holds. Nothing below is privileged: it goes through the same
+# passes as user code, and a bug in it shows up as a bug in the lowering.
+#
+# `std::` is stripped rather than modelled. There is no namespace support and
+# pretending otherwise would be worse than not claiming it.
+#
+# Deliberately not here: `operator[]`, iterators, `<<`. `operator=` is the
+# only overload the subset has, so element access is `get`/`set`/`ptr` and
+# not `v[i]`.
+# ==========================================================================
+
+_STD_DECLS = """void *malloc(unsigned long);
+void *realloc(void *, unsigned long);
+void free(void *);
+unsigned long strlen(const char *);
+void *memcpy(void *, const void *, unsigned long);
+int memcmp(const void *, const void *, unsigned long);
+"""
+
+_STD_STRING = """
+class string {
+public:
+    char *sd;
+    int sn;
+    int scap;
+    string() { sd = 0; sn = 0; scap = 0; }
+    string(const string &o) {
+        sd = 0; sn = 0; scap = 0;
+        reserve(o.sn);
+        if (o.sn > 0) { memcpy(sd, o.sd, (unsigned long)o.sn); }
+        sn = o.sn;
+        if (sd != 0) { sd[sn] = 0; }
+    }
+    string &operator=(const string &o) {
+        if (sd != o.sd) {
+            sn = 0;
+            reserve(o.sn);
+            if (o.sn > 0) { memcpy(sd, o.sd, (unsigned long)o.sn); }
+            sn = o.sn;
+            if (sd != 0) { sd[sn] = 0; }
+        }
+    }
+    ~string() { free(sd); sd = 0; sn = 0; scap = 0; }
+    int size() { return sn; }
+    int empty() { if (sn == 0) { return 1; } return 0; }
+    void reserve(int c) {
+        if (c + 1 > scap) {
+            int m = c + 1;
+            char *nd = (char *)realloc(sd, (unsigned long)m);
+            if (nd != 0) { sd = nd; scap = m; }
+        }
+    }
+    void clear() { sn = 0; if (sd != 0) { sd[0] = 0; } }
+    void push_back(char ch) {
+        reserve(sn + 1);
+        if (sd != 0) { sd[sn] = ch; sn = sn + 1; sd[sn] = 0; }
+    }
+    void assign(const char *s) {
+        int k = (int)strlen(s);
+        sn = 0;
+        reserve(k);
+        if (sd != 0) { memcpy(sd, s, (unsigned long)k); sn = k; sd[sn] = 0; }
+    }
+    void append(const char *s) {
+        int k = (int)strlen(s);
+        reserve(sn + k);
+        if (sd != 0) { memcpy(sd + sn, s, (unsigned long)k); sn = sn + k;
+                       sd[sn] = 0; }
+    }
+    char at(int i) { return sd[i]; }
+    const char *c_str() { if (sd == 0) { return ""; } return sd; }
+    int equals(const string &o) {
+        if (sn != o.sn) { return 0; }
+        if (sn == 0) { return 1; }
+        if (memcmp(sd, o.sd, (unsigned long)sn) == 0) { return 1; }
+        return 0;
+    }
+};
+"""
+
+_STD_VECTOR = """
+template<typename T>
+class vector {
+public:
+    T *vd;
+    int vn;
+    int vcap;
+    vector() { vd = 0; vn = 0; vcap = 0; }
+    vector(const vector<T> &o) {
+        vd = 0; vn = 0; vcap = 0;
+        reserve(o.vn);
+        int i = 0;
+        while (i < o.vn) { vd[i] = o.vd[i]; i = i + 1; }
+        vn = o.vn;
+    }
+    vector<T> &operator=(const vector<T> &o) {
+        if (vd != o.vd) {
+            vn = 0;
+            reserve(o.vn);
+            int i = 0;
+            while (i < o.vn) { vd[i] = o.vd[i]; i = i + 1; }
+            vn = o.vn;
+        }
+    }
+    ~vector() { free(vd); vd = 0; vn = 0; vcap = 0; }
+    int size() { return vn; }
+    int empty() { if (vn == 0) { return 1; } return 0; }
+    void reserve(int c) {
+        if (c > vcap) {
+            int m = c;
+            T *nd = (T *)realloc(vd, (unsigned long)m * sizeof(T));
+            if (nd != 0) { vd = nd; vcap = m; }
+        }
+    }
+    void push_back(T v) {
+        if (vn == vcap) {
+            int m = vcap * 2;
+            if (m < 4) { m = 4; }
+            reserve(m);
+        }
+        if (vn < vcap) { vd[vn] = v; vn = vn + 1; }
+    }
+    void pop_back() { if (vn > 0) { vn = vn - 1; } }
+    void clear() { vn = 0; }
+    T get(int i) { return vd[i]; }
+    void set(int i, T v) { vd[i] = v; }
+    T *ptr(int i) { return vd + i; }
+};
+"""
+
+_STD_INCLUDE = re.compile(r"^[ \t]*#\s*include\s*<(vector|string)>[ \t]*\n?",
+                          re.M)
+
+
+def _std_prelude(text):
+    """Strip `std::`, drop `#include <vector|string>`, and supply the classes.
+
+    Returns the rewritten source. `string` is emitted before `vector` so that
+    a `vector<string>` finds it complete -- the same declaration-order rule
+    every other nested instantiation obeys.
+    """
+    wanted = set(m.group(1) for m in _STD_INCLUDE.finditer(text))
+    probe = _blank_strings(_strip_comments(text))
+    for name in ("string", "vector"):
+        if re.search(r"\bstd\s*::\s*%s\b" % name, probe):
+            wanted.add(name)
+    if not wanted:
+        return text
+    text = _STD_INCLUDE.sub("", text)
+    text = _sub_code(re.compile(r"\bstd\s*::\s*"), "", text)
+    if "vector" in wanted:
+        # `vector<string>` needs `string`; supplying it is cheaper than
+        # working out whether this source asks for that combination.
+        wanted.add("string")
+    parts = [_STD_DECLS]
+    if "string" in wanted:
+        parts.append(_STD_STRING)
+    if "vector" in wanted:
+        parts.append(_STD_VECTOR)
+    return "".join(parts) + text
+
+
+_LAMBDA = re.compile(r"\[([^\]]*)\]\s*\(([^()]*)\)\s*(?:->\s*([\w ]+(?:\s*\*)*)\s*)?\{")
+_AUTO_LAMBDA = re.compile(r"(?<![\w.])auto\s+(\w+)\s*=\s*$")
+
+
+def _toplevel_start(text, idx):
+    """Index where the top-level declaration containing `idx` begins.
+
+    A generated function has to be defined before the code that names it,
+    but after anything that code depends on. The enclosing top-level
+    declaration is the nearest point satisfying both.
+    """
+    depth, bound = 0, 0
+    for k, c in enumerate(text[:idx]):
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth <= 0:
+                depth = 0
+                bound = k + 1
+        elif c == ";" and depth == 0:
+            bound = k + 1
+    return bound
+
+
+def _param_types(params):
+    """Just the types from a parameter list, for a function pointer type."""
+    out = []
+    for part in _split_top(params or ""):
+        part = part.strip()
+        if not part or part == "void":
+            continue
+        toks = part.replace("*", " * ").split()
+        # Drop the declared name; keep everything that spells the type.
+        if len(toks) > 1 and toks[-1] not in ("*",):
+            toks = toks[:-1]
+        out.append(" ".join(toks).replace(" *", " *"))
+    return ", ".join(out) or "void"
+
+
+def _lower_lambdas(text, path):
+    """`[](int y) -> int { .. }` becomes a static function.
+
+    A lambda with no captures is exactly a function, so that is what it
+    lowers to -- and because C already has function pointers, an `auto`
+    binding becomes one and the call site needs no rewriting at all.
+
+    A *capturing* lambda is refused. It would need a generated class with a
+    field per capture, and this pass does not know the captured variable's
+    type: it is an ordinary local, which may be plain C that no class table
+    describes. Guessing the type is exactly the kind of thing the rest of
+    this lowering refuses to do.
+
+    A return type must be spelled (`-> int`) when the body returns a value.
+    C++ deduces it from the body; nothing here can, and defaulting to `int`
+    would silently truncate a `double`.
+    """
+    n = 0
+    while True:
+        look = _blank_strings(_strip_comments(text))
+        m = _LAMBDA.search(look)
+        if m is None:
+            return text
+        captures = m.group(1).strip()
+        if captures:
+            line = look.count("\n", 0, m.start()) + 1
+            raise CppError(
+                "%s:%d: a capturing lambda (`[%s]`) is not in the C++ "
+                "subset -- it needs a field per capture, and the type of a "
+                "captured local is not something this pass can see. Pass the "
+                "values as parameters, or use a class with a method."
+                % (os.path.basename(path), line, captures))
+        close = _match_brace(look, look.index("{", m.end() - 1))
+        if close is None:
+            raise CppError("unterminated lambda body")
+        params = m.group(2).strip()
+        ret = (m.group(3) or "void").strip()
+        body = text[m.end():close]
+        name = "_cpp_lambda%d" % n
+        n += 1
+        fn = "\nstatic %s %s(%s) {%s}\n" % (ret, name, params or "void",
+                                             body)
+
+        # `auto f = [](..){..};` binds a function pointer, which is the C
+        # spelling of exactly this.
+        head = look[:m.start()]
+        am = _AUTO_LAMBDA.search(head)
+        tail = close + 1
+        if am is not None:
+            semi = look.find(";", close)
+            repl = "%s (*%s)(%s) = %s" % (ret, am.group(1),
+                                          _param_types(params), name)
+            start, tail = am.start(), (semi if semi >= 0 else close + 1)
+        else:
+            repl, start = name, m.start()
+        at = _toplevel_start(look, start)
+        text = text[:at] + fn + text[at:start] + repl + text[tail:]
+    return text
+
+
 def translate(text, path="<cpp>"):
     """Translate a C++ subset source to C. Raises CppError on anything else."""
+    # `std::string` / `std::vector` are supplied as ordinary subset source,
+    # so everything below sees one file with no special cases in it.
+    text = _std_prelude(text)
+    # Lambdas are lowered before anything else looks at the file: what comes
+    # out is ordinary subset source with a static function in it.
+    text = _lower_lambdas(text, path)
     scan = _strip_comments(text)
     _check_unsupported(scan, path)
 
@@ -2209,6 +2660,36 @@ def translate(text, path="<cpp>"):
             seen.append(targs)
 
     _monomorphise_uses(_blank_spans(scan, bodies), tnames, record)
+
+    # A template body may instantiate another template: `Outer<T>` holding an
+    # `Inner<T>` asks for `Inner<int>` only once `T` is known. So the set is
+    # closed transitively -- substitute each instantiation's arguments into
+    # its own body and scan that for further uses, until nothing new appears.
+    # The class supplying a nested instantiation still has to be declared
+    # above the one that needs it, since classes are emitted in order.
+    tspan = dict((cls.name, (s, e, cls))
+                 for s, e, cls in classes if cls.tparams)
+    cindex = dict((cls.name, idx)
+                  for idx, (_s, _e, cls) in enumerate(classes))
+    pending = [(n, t) for n in list(wanted) for t in list(wanted[n])]
+    seen = set(pending)
+    while pending:
+        name, targs = pending.pop()
+        s, e, cls = tspan[name]
+        body = _subst_type(scan[s:e], cls.tparams, targs)
+        found = []
+        _monomorphise_uses(body, tnames,
+                           lambda n2, t2: found.append((n2, t2)))
+        for pair in found:
+            if pair[0] != name and cindex[pair[0]] > cindex[name]:
+                raise CppError(
+                    "class %s: it instantiates `%s`, which is declared below "
+                    "it. A nested instantiation has to be complete first."
+                    % (name, pair[0]))
+            record(*pair)
+            if pair not in seen:
+                seen.add(pair)
+                pending.append(pair)
 
     # Every name a class-typed declaration could spell, mangled and not, so
     # reference parameters can be recognised before anything is emitted.
@@ -2277,6 +2758,9 @@ def translate(text, path="<cpp>"):
     # a `&` is still on the page.
     free_refs = _free_ref_funcs(_strip_comments(out), names)
     out = _lower_refs(out, names)
+    # After reference lowering, a class still spelled by value really is by
+    # value -- a `T &` the author wrote is a `T *` by now.
+    _check_by_value(out, cinfo, path)
     out = _rewrite_scopes(out, cinfo)
 
     # Rewriting a call copies its arguments through verbatim, so a receiver
