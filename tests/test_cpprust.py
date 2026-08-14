@@ -849,12 +849,14 @@ int use(A *p) { return p->f(); }
             cpprust.translate("class D : public Missing { int a; };")
         self.assertIn("not defined above it", cm.exception.message)
 
-    def test_virtual_declaration_without_body_is_error(self):
-        with self.assertRaises(cpprust.CppError) as cm:
-            cpprust.translate("class A { public: virtual int f(); };")
-        # Still an error, and now with the fix named: a member with no
-        # body needs an out-of-line definition in the same translation.
-        self.assertIn("declared but never defined", cm.exception.message)
+    def test_virtual_declaration_without_body_is_a_prototype(self):
+        # It used to be an error, on the grounds that an empty body would
+        # compile and silently do nothing. No empty body is emitted -- the
+        # declaration stays a declaration, which is what C does, and the
+        # definition is expected from whichever translation unit has it.
+        out = cpprust.translate("class A { public: virtual int f(); };")
+        self.assertIn("int A_f(A *this);", out)
+        self.assertNotIn("A_f(A *this) {", out)
 
 
 _NODE = """
@@ -2810,10 +2812,19 @@ void A::set(int n) { v = n; }
                                 path="t.cpp")
         self.assertIn("static int A_get(A *this)", out)
 
-    def test_declared_and_never_defined_is_reported(self):
-        with self.assertRaises(cpprust.CppError) as cm:
-            cpprust.translate("class A { public: int f(); };", path="t.cpp")
-        self.assertIn("declared but never defined", cm.exception.message)
+    def test_declared_and_never_defined_stays_a_declaration(self):
+        # Ordinary once headers are spliced: `css_length.h` declares
+        # `fromString` and `css_length.cpp` defines it, so a file that merely
+        # includes the header sees only the declaration.
+        out = cpprust.translate("class A { public: int f(); };", path="t.cpp")
+        self.assertIn("int A_f(A *this);", out)
+        self.assertNotIn("A_f(A *this) {", out)
+
+    def test_a_cross_unit_prototype_has_external_linkage(self):
+        # A `static` declaration with no definition in this unit could never
+        # be resolved.
+        out = cpprust.translate("class A { public: int f(); };", path="t.cpp")
+        self.assertNotIn("static int A_f(A *this);", out)
 
     def test_a_qualified_call_inside_a_body_is_not_a_definition(self):
         # Only at brace depth zero: `Foo::bar()` inside a body is a call, and
@@ -3577,3 +3588,61 @@ int f(void) { D d; B *p = (B *)&d; return p->area(); }
             "operator const int &() { return v; } };\n"
             "int f(void) { A a; return a.v; }", path="t.cpp")
         self.assertIn("A__conv", out)
+
+
+class TestCppBraceInitializers(unittest.TestCase):
+    """C++11 brace syntax in a constructor's initializer list."""
+
+    SRC = """
+class Doc { public: int v; Doc() { v = 4; } };
+class Holder {
+public:
+    struct Ref {
+        Doc *d { 0 };
+        int n { 9 };
+        Ref(Doc *p, int k) : d { p }, n(k) { }
+        Ref() { }
+    };
+};
+int f(void) { Doc x; Holder::Ref a(&x, 5); Holder::Ref b; return a.n + b.n; }
+"""
+
+    def test_brace_and_paren_initializers_both_parse(self):
+        # The braces mean list initialisation, which for everything this
+        # subset lowers is the same call with the same arguments.
+        out = cpprust.translate(self.SRC, path="t.cpp")
+        self.assertIn("this->d = p;", out)
+        self.assertIn("this->n = k;", out)
+
+    def test_an_initializer_brace_is_not_the_body(self):
+        # `: d { p }` puts a `{` between the parameters and the body, and
+        # taking the first one made the body start in the middle of the
+        # initializer list.
+        out = cpprust.translate(self.SRC, path="t.cpp")
+        self.assertIn("Holder_Ref_new_2(Holder_Ref *this, Doc *p, int k)", out)
+
+    def test_an_explicit_initializer_beats_the_default(self):
+        out = cpprust.translate(self.SRC, path="t.cpp")
+        ctor = out[out.index("Holder_Ref_new_2"):]
+        ctor = ctor[ctor.index("{"):]
+        self.assertNotIn("this->n = 9;", ctor[:ctor.index("}")])
+
+    def test_the_default_still_applies_where_none_is_given(self):
+        out = cpprust.translate(self.SRC, path="t.cpp")
+        self.assertIn("Holder_Ref_new(Holder_Ref *this) { this->d = 0; "
+                      "this->n = 9; }", out)
+
+    def test_an_anonymous_union_is_not_mistaken_for_an_initializer(self):
+        # The rule that skips initializer braces keys on a preceding name,
+        # and `union {` has one -- so it applies only where an initializer
+        # list is actually present.
+        out = cpprust.translate("""
+class P {
+    union { int x; int y; };
+public:
+    P() { x = 1; }
+    int get() { return x; }
+};
+int f(void) { P p; return p.get(); }
+""", path="t.cpp")
+        self.assertIn("union { int x; int y; };", out)
