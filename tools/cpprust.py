@@ -21,7 +21,17 @@ The subset, deliberately small:
   * `public:` / `private:` / `protected:` labels (parsed, not enforced --
     access control is a compile-time property and this is a lowering, not a
     type checker; pretending to enforce it would be worse than not claiming to)
-  * `template<typename T>` on classes, monomorphised on use
+  * `template<typename T>` on classes, monomorphised on use. Any number of
+    parameters (`template<typename K, typename V>`), and a non-type integer
+    parameter (`template<typename T, int N>`) works too, because
+    monomorphisation is textual substitution and `N` is replaced by the
+    literal the use site spelled. Arguments may themselves be
+    instantiations (`Holder<Pair<int,char>>`), resolved innermost first, in
+    which case the class supplying the argument must be declared above the
+    one consuming it -- the same completeness rule a base class obeys. A
+    template instantiated only from inside another template's body is
+    reported rather than emitted as a dangling name: the scan that
+    discovers instantiations cannot see through an unsubstituted parameter.
   * single inheritance, with `virtual` methods and pure virtual (`= 0`)
     declarations. A base is laid out as the first member, so a pointer to a
     derived object already *is* a pointer to its base and upcasting is a
@@ -39,7 +49,12 @@ The subset, deliberately small:
     written, so plain C in the same file is untouched.
   * reference parameters and locals: `T &x` is a pointer the source did not
     have to spell, so it is lowered back to `T *x` and call sites take the
-    address. `T &r = e;` becomes `T *r = &(e);`
+    address. `T &r = e;` becomes `T *r = &(e);`. Member *access* follows the
+    same symbol table as a method call, so `c.v` on a lowered reference
+    becomes `c->v`, and each step of a chain picks its own operator
+    (`o.in.n` on a reference is `o->in.n`, since the member itself is by
+    value). A receiver that does not resolve to a class is left alone, so
+    plain C struct access is untouched.
 
 A reference *return* (`T& f()`) is rejected rather than lowered. Turning it
 into `T*` would silently change what assignment through the result means at
@@ -107,8 +122,48 @@ class CppError(Exception):
 _UNSUPPORTED = ("throw", "try", "catch", "operator", "new",
                 "delete", "dynamic_cast", "typeid")
 
-# `template<typename T>` / `template<class T>`, one parameter.
-_TEMPLATE = re.compile(r"\btemplate\s*<\s*(?:typename|class)\s+(\w+)\s*>")
+# `template<typename T>` / `template<class T, typename U>`. The whole
+# parameter list is captured and split separately: the count is not fixed
+# here, so a header with two or five parameters is the same shape as one.
+_TEMPLATE = re.compile(r"\btemplate\s*<([^<>]*)>")
+
+# One template parameter: `typename T`, `class T`, or a non-type `int N`.
+_TPARAM = re.compile(r"^(?:typename|class)\s+(\w+)$")
+_TPARAM_NONTYPE = re.compile(r"^(?:int|long|short|char|unsigned|bool|size_t)"
+                             r"(?:\s+\w+)*\s+(\w+)$")
+
+
+def _parse_tparams(inner, where):
+    """Split a `template<..>` parameter list into declared parameter names.
+
+    Type parameters (`typename T` / `class T`) and non-type integer
+    parameters (`int N`) both lower the same way, because monomorphisation
+    here is textual substitution: `N` is replaced by the literal the use
+    site spelled, exactly as `T` is replaced by a type name. Anything else
+    -- defaults, parameter packs, template template parameters -- is
+    reported rather than half-translated.
+    """
+    names = []
+    for part in _split_targs(inner):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" in part:
+            raise CppError("%s: a default template argument is not in the "
+                           "C++ subset (`%s`)" % (where, part))
+        if "..." in part:
+            raise CppError("%s: a template parameter pack is not in the C++ "
+                           "subset (`%s`)" % (where, part))
+        m = _TPARAM.match(part) or _TPARAM_NONTYPE.match(part)
+        if m is None:
+            raise CppError("%s: cannot parse template parameter %r"
+                           % (where, part))
+        names.append(m.group(1))
+    if not names:
+        raise CppError("%s: empty template parameter list" % where)
+    if len(set(names)) != len(names):
+        raise CppError("%s: duplicate template parameter name" % where)
+    return tuple(names)
 
 
 def _strip_comments(text):
@@ -184,7 +239,7 @@ def _check_unsupported(scan, path):
             line = scan.count("\n", 0, m.start()) + 1
             raise CppError(
                 "%s:%d: `%s` is not in the C++ subset. Supported: classes, "
-                "constructors, destructors, and single-parameter templates."
+                "constructors, destructors, and templates."
                 % (os.path.basename(path), line, kw))
 
 
@@ -207,11 +262,11 @@ class Member(object):
 
 
 class Class(object):
-    __slots__ = ("name", "tparam", "members", "line", "base")
+    __slots__ = ("name", "tparams", "members", "line", "base")
 
-    def __init__(self, name, tparam, members, line, base=None):
+    def __init__(self, name, tparams, members, line, base=None):
         self.name = name
-        self.tparam = tparam      # template parameter, or None
+        self.tparams = tparams    # tuple of template parameter names, or ()
         self.base = base          # single base class name, or None
         self.members = members
         self.line = line
@@ -370,16 +425,24 @@ def _find_classes(scan, text):
         if close is None:
             raise CppError("unterminated class %s" % m.group(2))
         # A `template<..>` immediately before makes this a template class.
-        tparam = None
+        tparams = ()
         head = scan[:m.start()]
         tm = None
         for tm in _TEMPLATE.finditer(head):
             pass
         if tm is not None and not head[tm.end():].strip():
-            tparam = tm.group(1)
+            tparams = _parse_tparams(
+                tm.group(1),
+                "class %s" % m.group(2))
         classes.append((m.start(), close + 1,
-                        Class(m.group(2), tparam,
-                              _split_members(text[open_idx + 1:close],
+                        Class(m.group(2), tparams,
+                              # From `scan`, not `text`: a member is emitted
+                              # onto a single line, so a `//` comment carried
+                              # through from the class body would comment out
+                              # the generated declaration that follows it.
+                              # `_strip_comments` preserves length and string
+                              # literals, so bodies are otherwise unchanged.
+                              _split_members(scan[open_idx + 1:close],
                                              m.group(2),
                                              scan.count("\n", 0, m.start()) + 1),
                               scan.count("\n", 0, m.start()) + 1,
@@ -436,6 +499,136 @@ def _split_top(text, sep=","):
     return parts
 
 
+def _split_targs(text):
+    """Split a template argument/parameter list on top-level commas.
+
+    Like `_split_top`, but `<` and `>` also nest, so `Pair<int, Holder<int>>`
+    splits into two arguments rather than three.
+    """
+    parts, cur, depth, quote = [], [], 0, None
+    for c in text:
+        if quote is not None:
+            cur.append(c)
+            if c == quote:
+                quote = None
+            continue
+        if c in "\"'":
+            quote = c
+        elif c in "([<":
+            depth += 1
+        elif c in ")]>":
+            depth -= 1
+        if c == "," and depth == 0:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(c)
+    parts.append("".join(cur))
+    return parts
+
+
+def _match_angle(text, open_idx):
+    """Index of the `>` closing the `<` at `open_idx`, or None.
+
+    Bounded by the tokens that cannot appear inside an argument list, so a
+    stray relational operator on a name that happens to match a template
+    cannot run away to the end of the file. `>>` needs no special case: two
+    closers decrement twice.
+    """
+    depth = 0
+    for i in range(open_idx, len(text)):
+        c = text[i]
+        if c in ";{}()":
+            return None
+        if c == "<":
+            depth += 1
+        elif c == ">":
+            depth -= 1
+            if depth == 0:
+                return i
+    return None
+
+
+def _blank_spans(text, spans):
+    """Blank the given ranges, preserving length and newlines."""
+    out = list(text)
+    for start, end in spans:
+        for i in range(start, min(end, len(out))):
+            if out[i] != "\n":
+                out[i] = " "
+    return "".join(out)
+
+
+def _mono_name(name, targs):
+    """The monomorphised name for `name<targs..>`."""
+    return "%s_%s" % (name, "_".join(_mangle(a) for a in targs))
+
+
+def _find_template_use(text, tnames):
+    """The first *innermost* `Name<..>` use in `text`, or None.
+
+    Innermost first is what makes nesting work without a fixed point over
+    the whole file: `Holder<Pair<int,int>>` yields `Pair<int,int>` first, so
+    by the time the outer use is looked at its argument already reads
+    `Pair_int_int` and mangles to a name that exists.
+
+    Template *bodies* are blanked out before the recording scan rather than
+    filtered here, because whether `Holder<T>` names an instantiation depends
+    on where it sits, not on how it is spelled: inside a template body `T` is
+    a parameter and the use is the pattern, while at file scope `T` could
+    perfectly well be a typedef somebody wrote.
+    """
+    for m in re.finditer(r"(?<![\w.>])(\w+)\s*<", text):
+        if m.group(1) not in tnames:
+            continue
+        open_idx = m.end() - 1
+        close = _match_angle(text, open_idx)
+        if close is None:
+            continue
+        inner = text[open_idx + 1:close]
+        if "<" in inner:
+            continue                      # an outer use; its turn comes later
+        args = [a.strip() for a in _split_targs(inner)]
+        if not args or not all(args):
+            continue
+        return m.start(), close + 1, m.group(1), tuple(args)
+    return None
+
+
+def _monomorphise_uses(text, tnames, record=None, known=None):
+    """Rewrite every `Name<..>` to its mangled name, innermost use first.
+
+    With `record`, each instantiation is reported as `(name, targs)` as it is
+    rewritten -- which is how the set of classes to emit is discovered, in an
+    order that already has the inner ones first.
+
+    With `known`, a use that was never recorded is an error rather than a
+    mangled name with no class behind it. That happens when one template's
+    body instantiates another (`Holder<T>` inside `Outer<T>`): the recording
+    scan cannot see it, because at that point `T` is still a parameter.
+    Emitting `Holder_int` there would produce a C file referring to a struct
+    that is never defined, and the failure would surface as a confusing error
+    from the C compiler rather than from here.
+    """
+    if not tnames:
+        return text
+    for _ in range(1000):
+        hit = _find_template_use(text, tnames)
+        if hit is None:
+            return text
+        start, end, name, targs = hit
+        if record is not None:
+            record(name, targs)
+        if known is not None and tuple(targs) not in known.get(name, ()):
+            raise CppError(
+                "`%s<%s>` is instantiated from inside another template, "
+                "which this lowering cannot discover. Name it at file scope "
+                "as well (`%s x;`) so it is emitted."
+                % (name, ", ".join(targs), _mono_name(name, targs)))
+        text = text[:start] + _mono_name(name, targs) + text[end:]
+    raise CppError("template instantiation did not terminate")
+
+
 _KEYWORDS = frozenset((
     "if", "for", "while", "switch", "return", "sizeof", "do", "else",
     "case", "default", "break", "continue", "goto", "static", "const"))
@@ -489,10 +682,48 @@ def _ref_positions(params, names):
     return out
 
 
-def _subst_type(text, tparam, concrete):
-    if not tparam:
+def _sub_code(pattern, repl, text):
+    """`pattern.sub(repl, text)`, but only where the match is real code.
+
+    Every rewriting pass in this file that touches a body -- field
+    qualification, implicit `this`, template substitution, reference
+    lowering -- is a regex over source text, and a regex cannot tell a
+    field named `key` from the word `key` inside `printf("key=%d\\n", key)`.
+    Rewriting the literal changes what the program prints; rewriting a `//`
+    comment can comment out the code that follows it.
+
+    Matching runs against a copy with comment and literal *bodies* blanked,
+    so neither can contain a match. Both blanking passes preserve length, so
+    the match offsets address `text`, which is what gets emitted -- the same
+    `look`/`text` discipline `_rewrite_scopes` and `_rewrite_calls` use.
+    """
+    look = _blank_strings(_strip_comments(text))
+    out, pos = [], 0
+    for m in pattern.finditer(look):
+        out.append(text[pos:m.start()])
+        out.append(repl(m) if callable(repl) else m.expand(repl))
+        pos = m.end()
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _subst_type(text, tparams, concretes):
+    """Replace each template parameter with its argument, all in one pass.
+
+    One pass matters once there is more than one parameter: substituting
+    sequentially lets `template<typename T, typename U>` instantiated as
+    `<U, int>` rewrite `T` to `U` and then that same `U` to `int`, so both
+    fields come out `int`. A single alternation with a lookup cannot
+    re-examine text it has already produced.
+    """
+    if not tparams:
         return text
-    return re.sub(r"\b%s\b" % re.escape(tparam), concrete, text)
+    mapping = dict(zip(tparams, concretes))
+    # A parameter name inside a literal is text the program prints, not a
+    # type to substitute: `puts("T")` must not become `puts("int")`.
+    return _sub_code(
+        re.compile(r"\b(%s)\b" % "|".join(re.escape(p) for p in tparams)),
+        lambda m: mapping[m.group(1)], text)
 
 
 def _mangle(name):
@@ -538,14 +769,16 @@ def _lower_refs(text, names):
         return text
     alt = _type_alt(names)
     # A reference local binds something; take its address.
-    text = re.sub(
-        r"(?<![\w.])((?:const\s+)?(?:%s))\s*&\s*(\w+)\s*=\s*([^;]+);" % alt,
+    text = _sub_code(
+        re.compile(
+            r"(?<![\w.])((?:const\s+)?(?:%s))\s*&\s*(\w+)\s*=\s*([^;]+);" % alt),
         lambda m: "%s *%s = &(%s);" % (m.group(1), m.group(2),
                                        m.group(3).strip()),
         text)
     # Everything else: a reference parameter.
-    text = re.sub(r"(?<![\w.&])((?:const\s+)?(?:%s))\s*&(?!&)\s*(\w+)" % alt,
-                  lambda m: "%s *%s" % (m.group(1), m.group(2)), text)
+    text = _sub_code(
+        re.compile(r"(?<![\w.&])((?:const\s+)?(?:%s))\s*&(?!&)\s*(\w+)" % alt),
+        lambda m: "%s *%s" % (m.group(1), m.group(2)), text)
     return text
 
 
@@ -559,8 +792,8 @@ def _implicit_this(body, mnames):
     """
     if not mnames:
         return body
-    return re.sub(r"(?<![\w.>])(%s)\s*\(" % _type_alt(mnames),
-                  lambda m: "this->%s(" % m.group(1), body)
+    return _sub_code(re.compile(r"(?<![\w.>])(%s)\s*\(" % _type_alt(mnames)),
+                     lambda m: "this->%s(" % m.group(1), body)
 
 
 def _member_prologue(cname, value_members, initmap, known, fieldset, line):
@@ -629,7 +862,7 @@ def _vtable_slots(cls, cname, base_info, known):
     return slots
 
 
-def _emit_class(cls, names, known, tsub, targ=None):
+def _emit_class(cls, names, known, tsub, targs=None):
     """Emit a class as a C struct plus free functions.
 
     Returns the lines, the mangled name, and an info dict describing the
@@ -643,8 +876,9 @@ def _emit_class(cls, names, known, tsub, targ=None):
     nothing more. The vtable pointer sits first in the root of the
     hierarchy, hence at offset zero throughout it.
     """
-    sub = (lambda s: _subst_type(s, cls.tparam, targ)) if targ else (lambda s: s)
-    cname = cls.name if targ is None else "%s_%s" % (cls.name, _mangle(targ))
+    sub = ((lambda s: _subst_type(s, cls.tparams, targs)) if targs
+           else (lambda s: s))
+    cname = cls.name if targs is None else _mono_name(cls.name, targs)
     base = cls.base
     if base is not None and base not in known:
         raise CppError(
@@ -678,7 +912,12 @@ def _emit_class(cls, names, known, tsub, targ=None):
         parts.append("%s _base;" % base)
     elif slots:
         parts.append("const struct %s_vtable *_vptr;" % cname)
-    parts.extend("%s %s%s;" % (sub(f.ret), f.name, f.dim) for f in fields)
+    # The dimension is substituted as well as the type: a non-type parameter
+    # (`template<typename T, int N>` with a field `T buf[N];`) appears only
+    # in the declarator suffix, and leaving it alone would emit `[N]` with
+    # no `N` in scope.
+    parts.extend("%s %s%s;" % (sub(f.ret), f.name, sub(f.dim))
+                 for f in fields)
     head.append("struct %s { %s };" % (cname, " ".join(parts) or
                                        "char _cpp_empty;"))
 
@@ -745,9 +984,14 @@ def _emit_class(cls, names, known, tsub, targ=None):
         arglist = "%s *this" % cname + (", " + params if params else "")
         inner = _implicit_this(raw, mnames)
         # Bare member names inside a body refer to fields; qualify them.
-        for f in fields:
-            inner = re.sub(r"(?<![\w.>])%s\b" % re.escape(f.name),
-                           "this->" + f.name, inner)
+        # One alternation rather than a pass per field: each pass would have
+        # to re-blank the body, and a field qualified by an earlier pass
+        # would be re-examined by a later one.
+        if fields:
+            inner = _sub_code(
+                re.compile(r"(?<![\w.>])(%s)\b"
+                           % _type_alt([f.name for f in fields])),
+                lambda m: "this->" + m.group(1), inner)
         inner = inner.replace("this->this->", "this->")
         out.append("static %s %s(%s) {%s}" % (kind, mname, arglist, inner))
         return refs
@@ -1180,6 +1424,11 @@ def _rewrite_calls(text, cinfo, free_refs):
     decl_re = re.compile(
         r"(?<![\w.])(%s)\s+(\*\s*)?(\w+)\s*(?=[;=,])" % alt)
     call_re = re.compile(r"(?<![\w.>])(\w+)((?:\s*(?:\.|->)\s*\w+)+)\s*\(")
+    # The same chain, but not followed by `(` -- a member read or write
+    # rather than a call. The call pattern is tried first, so this only
+    # ever sees what that one left behind.
+    field_re = re.compile(
+        r"(?<![\w.>])(\w+)((?:\s*(?:\.|->)\s*\w+)+)(?!\s*\()")
     plain_re = re.compile(r"(?<![\w.>])(\w+)\s*\(")
     # As in `_rewrite_scopes`: match against comment-blanked text so a `.`
     # or a parenthesis inside prose cannot be read as code. Same length, so
@@ -1209,12 +1458,31 @@ def _rewrite_calls(text, cinfo, free_refs):
             cls, is_ptr = fields[fld]
         return (expr, cls, is_ptr)
 
+    def rewrite_fields(expr, scopes):
+        """Fix `.` to `->` in every member chain inside an expression.
+
+        The main loop cannot reach these: a call to a by-reference function
+        is emitted whole, arguments included, so the scan resumes past them.
+        Re-running the pass does not help either -- the next pass matches the
+        same call and copies the same arguments again. So the argument text
+        is rewritten here, where it is being copied.
+        """
+        parts, pos = [], 0
+        while True:
+            m = field_re.search(expr, pos)
+            if m is None:
+                parts.append(expr[pos:])
+                return "".join(parts)
+            chain = [p for p in re.split(r"\s*(?:\.|->)\s*", m.group(2)) if p]
+            got = resolve(scopes, m.group(1), chain)
+            parts.append(expr[pos:m.start()])
+            parts.append(got[0] if got is not None else m.group(0))
+            pos = m.end()
+
     def fix_args(raw, refs, scopes):
         """Insert `&` where a by-reference parameter wants an address."""
-        if not refs:
-            return raw.strip()
-        parts = _split_top(raw)
-        for idx in sorted(refs):
+        parts = [rewrite_fields(p, scopes) for p in _split_top(raw)]
+        for idx in sorted(refs or ()):
             if idx >= len(parts):
                 continue
             a = parts[idx].strip()
@@ -1227,7 +1495,7 @@ def _rewrite_calls(text, cinfo, free_refs):
             sym = lookup(scopes, a) if re.match(r"^\w+$", a) else None
             if sym is not None and sym[1]:
                 continue          # already a pointer
-            parts[idx] = " &" + a if not re.match(r"^\w+$", a) else " &" + a
+            parts[idx] = " &" + a
         return ",".join(parts).strip()
 
     out = []
@@ -1321,6 +1589,21 @@ def _rewrite_calls(text, cinfo, free_refs):
                     i = close + 1
                     continue
 
+        m = field_re.match(look, i)
+        if m:
+            # A member access that is not a call. `_lower_refs` turned
+            # `T &c` into `T *c`, so the `.` the author wrote is now a `.`
+            # applied to a pointer -- which does not compile. `resolve`
+            # already picks the operator from each step's pointer-ness, so
+            # rewriting the chain through it fixes the reference case and
+            # leaves a by-value receiver spelled exactly as it was.
+            chain = [p for p in re.split(r"\s*(?:\.|->)\s*", m.group(2)) if p]
+            got = resolve(scopes, m.group(1), chain)
+            if got is not None:
+                out.append(got[0])
+                i = m.end()
+                continue
+
         m = plain_re.match(look, i)
         if m and m.group(1) in free_refs:
             op = m.end() - 1
@@ -1346,40 +1629,65 @@ def translate(text, path="<cpp>"):
     if not classes:
         return text
 
-    # Which template instantiations does the rest of the file ask for?
+    tclasses = dict((cls.name, cls) for _s, _e, cls in classes if cls.tparams)
+    tnames = set(tclasses)
+
+    # Which instantiations does the file ask for? Template bodies are blanked
+    # first: inside one, `Holder<T>` is the pattern rather than a request for
+    # a class called `Holder_T`. Scanning innermost-first means a nested
+    # argument is already mangled by the time the use containing it is
+    # recorded, so `Holder<Pair<int,int>>` records `Pair<int,int>` and then
+    # `Holder<Pair_int_int>`.
+    bodies = [(s, e) for s, e, cls in classes if cls.tparams]
     wanted = {}
-    for _s, _e, cls in classes:
-        if not cls.tparam:
-            continue
-        for m in re.finditer(r"\b%s\s*<\s*([\w ]+?)\s*>" % re.escape(cls.name),
-                             scan):
-            wanted.setdefault(cls.name, set()).add(m.group(1).strip())
+
+    def record(name, targs):
+        cls = tclasses[name]
+        if len(targs) != len(cls.tparams):
+            raise CppError(
+                "%s: `%s` takes %d template argument%s, %d given (`%s<%s>`)"
+                % (os.path.basename(path), name, len(cls.tparams),
+                   "" if len(cls.tparams) == 1 else "s", len(targs),
+                   name, ", ".join(targs)))
+        seen = wanted.setdefault(name, [])
+        if targs not in seen:
+            seen.append(targs)
+
+    _monomorphise_uses(_blank_spans(scan, bodies), tnames, record)
 
     # Every name a class-typed declaration could spell, mangled and not, so
     # reference parameters can be recognised before anything is emitted.
     names = set()
     for _s, _e, cls in classes:
         names.add(cls.name)
-        for targ in wanted.get(cls.name, ()):
-            names.add("%s_%s" % (cls.name, _mangle(targ)))
+        for targs in wanted.get(cls.name, ()):
+            names.add(_mono_name(cls.name, targs))
     _check_ref_returns(scan, names, path)
+
+    # An instantiation used as another's argument has to be complete first,
+    # and classes are emitted in declaration order -- so the class supplying
+    # the argument must be declared above the one consuming it. Same rule as
+    # a base class, and reported the same way rather than silently emitting a
+    # member whose type is not yet a known class.
+    order = {}
+    for idx, (_s, _e, cls) in enumerate(classes):
+        for targs in wanted.get(cls.name, ()):
+            order[_mono_name(cls.name, targs)] = idx
+    for idx, (_s, _e, cls) in enumerate(classes):
+        for targs in wanted.get(cls.name, ()):
+            for arg in targs:
+                for tok in re.findall(r"\b\w+\b", arg):
+                    if order.get(tok, idx) > idx:
+                        raise CppError(
+                            "class %s: template argument `%s` names an "
+                            "instantiation of a class declared below it. A "
+                            "template argument has to be complete first."
+                            % (cls.name, tok))
 
     # A field spelled `Holder<int>` has to be recognised as `Holder_int`
     # while the containing class is emitted, not after.
-    tpairs = []
-    for _s, _e, cls in classes:
-        if not cls.tparam:
-            continue
-        for targ in sorted(wanted.get(cls.name, ())):
-            tpairs.append((re.compile(r"\b%s\s*<\s*%s\s*>"
-                                      % (re.escape(cls.name),
-                                         re.escape(targ))),
-                           "%s_%s" % (cls.name, _mangle(targ))))
-
     def tsub(s):
-        for pat, mono in tpairs:
-            s = pat.sub(mono, s)
-        return s
+        return _monomorphise_uses(s, tnames, known=wanted)
 
     pieces = []
     cinfo = {}
@@ -1390,21 +1698,23 @@ def translate(text, path="<cpp>"):
         head = text[prev:start]
         head = _TEMPLATE.sub("", head)
         pieces.append(head)
-        targs = sorted(wanted.get(cls.name, ())) if cls.tparam else [None]
-        for targ in targs:
-            emitted, cname, info = _emit_class(cls, names, cinfo, tsub, targ)
-            pieces.append("\n".join(emitted))
+        insts = wanted.get(cls.name, []) if cls.tparams else [None]
+        for targs in insts:
+            emitted, cname, info = _emit_class(cls, names, cinfo, tsub, targs)
+            # Trailing newline: two instantiations of the same template are
+            # emitted back to back, and without it the last line of one runs
+            # into the first line of the next.
+            pieces.append("\n".join(emitted) + "\n")
             cinfo[cname] = info
         prev = end
     pieces.append(text[prev:])
     out = "".join(pieces)
 
-    # Rewrite uses: `Ring<int> r;` -> `Ring_int r;`, `r.push(1)` is left to the
-    # caller (see the README) since C has no method syntax.
     # Rewrite uses: `Ring<int> r;` -> `Ring_int r;`. Field types were already
-    # normalised through `tsub` while their class was emitted.
-    for pat, mono in tpairs:
-        out = pat.sub(mono, out)
+    # normalised through `tsub` while their class was emitted; this catches
+    # the rest -- locals, parameters, and method bodies copied through
+    # verbatim.
+    out = _monomorphise_uses(out, tnames, known=wanted)
 
     # Which free functions take a reference? Collected before lowering, while
     # a `&` is still on the page.
