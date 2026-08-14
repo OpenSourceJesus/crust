@@ -661,7 +661,9 @@ int Shape::area() const { return w * h; }
 
 Two things make that work.
 
-**Quoted `#include`s are spliced by this pass**, so the class and its bodies
+**Quoted `#include`s are spliced by this pass**, resolved against the
+including file's own directory first and then a search path (`--incdir`,
+which `shivyc` fills from its `-I` options), so the class and its bodies
 arrive in one translation -- the lowering emits a class and its bodies
 together, and only the `#include` brings the two halves together. Each header
 is spliced once, which is what an include guard does and saves having to
@@ -681,7 +683,9 @@ spliced in at the top would otherwise put them above.
 A member declared and never defined is **reported**. An empty body would
 compile and do nothing.
 
-A trailing `const` on a member function is dropped: it constrains what the
+`explicit` is dropped: it constrains implicit conversion, which this
+lowering does not perform in the first place, since every construction is
+written out. A trailing `const` on a member function is dropped: it constrains what the
 body may do, `this` is a pointer either way, and the C front end checks the
 body regardless.
 
@@ -752,6 +756,27 @@ sees does not. Dropping it lands on the right behaviour for the case that
 matters: a deleted copy constructor leaves a class with a destructor and no
 copy constructor, which the Rule of Three check already refuses to copy.
 
+### Type aliases
+
+`typedef X Y;` and `using Y = X;` are resolved to what they name, and a
+`using` alias becomes a typedef, since C has only that spelling.
+
+Substituted throughout rather than threaded through each consumer: a field
+declared `elements_vector items;` records its type by spelling, and so does a
+local, and so does a parameter. Doing it once means every pass below sees the
+class the alias stood for without knowing aliases exist.
+
+Three things are deliberately left alone:
+
+- **A class-scoped typedef.** litehtml names its `ptr` and `vector`, and
+  taking those flatly would make every `vector` in the file mean
+  `box::vector` -- including the supplied template of that name.
+- **A typedef that names itself.** `typedef struct X X;` is the ordinary C
+  idiom and the C that Crust emits for its own types is full of them;
+  substituting it prepends `struct` once per round.
+- **A name a template also uses as a parameter.** Inside the template the
+  parameter is what the name means.
+
 ### Namespaces
 
 `namespace N { .. }` and `N::x` are flattened to `N_x` -- the same thing
@@ -762,6 +787,10 @@ a qualified name has to become an unqualified one. Nesting gives `a_b_x`, and
 Only what the namespace *declares* is prefixed. A class's members and a
 function's locals are not namespace names, and prefixing them renamed
 `Point::x` to `geo_x` and broke every use of it.
+
+A namespace may be **reopened**, which a project with one per header does --
+litehtml does it forty times. A name produced by flattening an earlier block
+of the same namespace is the same entity, not a collision.
 
 What this does not do is overload resolution or argument-dependent lookup.
 Flattening is name-mangling, not lookup, so the two ways it could quietly
