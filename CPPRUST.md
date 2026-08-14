@@ -637,6 +637,54 @@ __cpp_drop(T, x)                        // T_drop(&x), or nothing
 They are an internal seam, but nothing stops you using them to write your
 own owning container.
 
+## Header and source, split
+
+A class may declare its members and define them afterwards under a qualified
+name -- which is how C++ projects are actually laid out:
+
+```cpp
+/* shape.h */
+class Shape {
+    int w, h;
+public:
+    Shape(int a, int b);
+    ~Shape();
+    int area() const;
+};
+
+/* shape.cpp */
+#include "shape.h"
+Shape::Shape(int a, int b) { w = a; h = b; }
+Shape::~Shape() { .. }
+int Shape::area() const { return w * h; }
+```
+
+Two things make that work.
+
+**Quoted `#include`s are spliced by this pass**, so the class and its bodies
+arrive in one translation -- the lowering emits a class and its bodies
+together, and only the `#include` brings the two halves together. Each header
+is spliced once, which is what an include guard does and saves having to
+understand `#pragma once` or the `#ifndef` idiom. A header that cannot be
+found is left alone: it may be one the C front end resolves, and this pass is
+not the authority on the include path. Angle-bracket includes are untouched.
+
+**Definitions are lifted out and attached** to the member they belong to,
+keyed by class, name and arity, before anything is emitted. Only at brace
+depth zero: a qualified name *inside* a body is a call, and matching those
+would tear the middle out of a function.
+
+The bodies are then emitted **after everything else**, not at the class. The
+author wrote them below whatever file-scope names they read, and a header
+spliced in at the top would otherwise put them above.
+
+A member declared and never defined is **reported**. An empty body would
+compile and do nothing.
+
+A trailing `const` on a member function is dropped: it constrains what the
+body may do, `this` is a pointer either way, and the C front end checks the
+body regardless.
+
 ## C++11 spellings
 
 None of these change what the subset can express. They are *spellings*, each
