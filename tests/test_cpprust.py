@@ -1037,7 +1037,7 @@ class TestCppStd(unittest.TestCase):
     def test_string_is_supplied_on_demand(self):
         out = cpprust.translate("void f(void) { std::string s; }")
         self.assertIn("struct string {", out)
-        self.assertIn("static void string_new(string *this)", out)
+        self.assertIn("void string_new(string *this)", out)
 
     def test_namespace_is_stripped(self):
         out = cpprust.translate("void f(void) { std::string s; }")
@@ -1070,8 +1070,8 @@ void f(void) { std::vector<int> a; std::vector<char> b; }
 
     def test_string_has_copy_and_assignment(self):
         out = cpprust.translate("void f(void) { std::string s; }")
-        self.assertIn("static void string_copy(string *this,", out)
-        self.assertIn("static void string__assign(string *this,", out)
+        self.assertIn("void string_copy(string *this,", out)
+        self.assertIn("void string__assign(string *this,", out)
 
     def test_owning_element_type_is_refused_clearly(self):
         # `vector<T>` stores by assignment, which for a class with a
@@ -1252,6 +1252,149 @@ void f(void) {
 """)
         self.assertIn("vector_string_push_back(&v, a)", out)
         self.assertIn("string_drop(a); free(a);", out)
+
+
+_CALC = """
+class Calc {
+public:
+    int acc;
+    Calc() { acc = 0; }
+    int add() { return acc; }
+    int add(int a) { acc = acc + a; return acc; }
+    int add(int a, int b) { acc = acc + a + b; return acc; }
+};
+"""
+
+
+class TestCppMethodOverload(unittest.TestCase):
+    """Methods overload by argument count, like constructors."""
+
+    def test_each_arity_gets_its_own_symbol(self):
+        out = cpprust.translate(_CALC + "void f(void) { Calc c; c.add(1); }")
+        self.assertIn("static int Calc_add_0(Calc *this)", out)
+        self.assertIn("static int Calc_add_1(Calc *this, int a)", out)
+        self.assertIn("static int Calc_add_2(Calc *this, int a, int b)", out)
+
+    def test_call_picks_by_argument_count(self):
+        out = cpprust.translate(_CALC + """
+void f(void) { Calc c; c.add(); c.add(1); c.add(2, 3); }
+""")
+        self.assertIn("Calc_add_0(&c)", out)
+        self.assertIn("Calc_add_1(&c, 1)", out)
+        self.assertIn("Calc_add_2(&c, 2, 3)", out)
+
+    def test_single_method_keeps_the_plain_name(self):
+        out = cpprust.translate("""
+class C { public: int v; C() { v = 0; } int get() { return v; } };
+void f(void) { C c; c.get(); }
+""")
+        self.assertIn("static int C_get(C *this)", out)
+
+    def test_same_arity_overloads_are_error(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate("""
+class C { public: int v; C() { v = 0; }
+          int f(int a) { return a; } int f(char b) { return b; } };
+""")
+        self.assertIn("take 1 argument", cm.exception.message)
+
+    def test_virtual_overload_is_error(self):
+        # A virtual method occupies one vtable slot.
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate("""
+class C { public: int v; C() { v = 0; }
+          virtual int f() { return 1; } int f(int a) { return a; } };
+""")
+        self.assertIn("one vtable slot", cm.exception.message)
+
+    def test_wrong_arity_on_an_overload_set_is_error(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate(_CALC + "void f(void) { Calc c; c.add(1,2,3); }")
+        self.assertIn("no overload taking 3", cm.exception.message)
+
+
+class TestCppOwnVector(unittest.TestCase):
+    """`ownvector<T>` copy-constructs and destroys its elements.
+
+    It is separate from `vector<T>` because the two need different parameter
+    conventions: a scalar element wants `push_back(T v)` and an owning one
+    must not cross a call boundary by value at all.
+    """
+
+    def test_elements_are_copy_constructed(self):
+        out = cpprust.translate("""
+void f(void) { std::ownvector<std::string> v; std::string a("x");
+               v.push_back(a); }
+""")
+        self.assertIn("string_copy(&", out)
+
+    def test_elements_are_destroyed(self):
+        out = cpprust.translate("""
+void f(void) { std::ownvector<std::string> v; }
+""")
+        self.assertIn("string_drop(&", out)
+
+    def test_builtins_dispatch_on_the_element_class(self):
+        out = cpprust.translate("""
+class E { public: int *p; E() { p = 0; } E(const E &o) { p = o.p; }
+          ~E() { p = 0; } };
+void f(void) { std::ownvector<E> v; E e; v.push_back(e); }
+""")
+        self.assertIn("E_copy(&", out)
+        self.assertIn("E_drop(&", out)
+
+    def test_element_without_a_copy_constructor_is_error(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate("""
+class E { public: int *p; E() { p = 0; } ~E() { p = 0; } };
+void f(void) { std::ownvector<E> v; E e; v.push_back(e); }
+""")
+        self.assertIn("no copy constructor", cm.exception.message)
+
+    def test_scalar_element_is_refused(self):
+        # `__cpp_copy` is for element types with constructors.
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate("""
+void f(void) { std::ownvector<int> v; int k = 1; v.push_back(k); }
+""")
+        self.assertIn("not a class", cm.exception.message)
+
+    def test_vector_diagnostic_names_ownvector(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate(
+                "int f(void) { std::vector<std::string> v; return v.size(); }")
+        self.assertIn("ownvector<string>", cm.exception.message)
+
+    def test_subscript_result_can_receive_a_call(self):
+        # `v[i]` is a dereference, so it is addressable -- unlike a call
+        # result, which is why this is allowed where `f().g()` is not.
+        out = cpprust.translate("""
+int f(void) { std::ownvector<std::string> v; return v[0].size(); }
+""")
+        self.assertIn("string_size(&(*ownvector_string__index(&v, 0)))", out)
+
+
+class TestCppEmittedStorage(unittest.TestCase):
+    def test_supplied_containers_are_static_inline(self):
+        # An unused `static` function is a warning, and a program uses only
+        # a few of a container's methods. `static inline` is not.
+        out = cpprust.translate("void f(void) { std::string s; }")
+        self.assertIn("static inline void string_new(string *this)", out)
+
+    def test_user_classes_stay_plain_static(self):
+        # User code should still hear about functions it never calls.
+        out = cpprust.translate(
+            "class C { public: int v; C() { v = 0; } };"
+            "void f(void) { C c; }")
+        self.assertIn("static void C_new(C *this)", out)
+        self.assertNotIn("static inline void C_new", out)
+
+    def test_allocators_only_for_the_arities_used(self):
+        out = cpprust.translate(_POINT + """
+void f(void) { Point *p = new Point(1, 2); }
+""")
+        self.assertIn("Point__alloc_2", out)
+        self.assertNotIn("Point__alloc(", out)
 
 
 class TestCppLambda(unittest.TestCase):
