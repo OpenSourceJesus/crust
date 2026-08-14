@@ -179,24 +179,46 @@ Holder<Pair<int,char> > h;
 """)
         self.assertIn("declared below it", cm.exception.message)
 
-    def test_instantiation_inside_a_template_is_error(self):
-        """Not discoverable, so reported rather than left dangling.
+    def test_instantiation_inside_a_template(self):
+        """`Outer<int>` asks for `Inner<int>` only once `T` is known.
 
-        The recording scan blanks template bodies, because there `Inner<T>`
-        is the pattern. So this instantiation is only revealed after `T` is
-        substituted, by which time the class list is fixed -- emitting the
-        name anyway would reference a struct that is never defined.
+        The recording scan blanks template bodies, so a nested use is
+        invisible to it. The set is closed transitively instead:
+        each instantiation's arguments are substituted into its own body and
+        that is scanned in turn.
         """
+        out = cpprust.translate("""
+template<typename T>
+class Inner { public: T v; Inner() { } T get() { return v; } };
+template<typename T>
+class Outer { public: Inner<T> i; Outer() { } T get() { return i.get(); } };
+void f(void) { Outer<int> o; }
+""")
+        self.assertIn("struct Inner_int { int v; };", out)
+        self.assertIn("struct Outer_int { Inner_int i; };", out)
+        self.assertIn("Inner_int_get(&this->i)", out)
+
+    def test_transitive_instantiation_per_argument(self):
+        out = cpprust.translate("""
+template<typename T>
+class Inner { public: T v; Inner() { } };
+template<typename T>
+class Outer { public: Inner<T> i; Outer() { } };
+void f(void) { Outer<int> a; Outer<char> b; }
+""")
+        self.assertIn("struct Inner_int { int v; };", out)
+        self.assertIn("struct Inner_char { char v; };", out)
+
+    def test_nested_instantiation_declared_below_is_error(self):
         with self.assertRaises(cpprust.CppError) as cm:
             cpprust.translate("""
 template<typename T>
-class Inner { T v; };
+class Outer { public: Inner<T> i; Outer() { } };
 template<typename T>
-class Outer { Inner<T> i; };
-Outer<int> o;
+class Inner { public: T v; Inner() { } };
+void f(void) { Outer<int> o; }
 """)
-        self.assertIn("instantiated from inside another template",
-                      cm.exception.message)
+        self.assertIn("declared below", cm.exception.message)
 
     def test_relational_operator_is_not_a_template_use(self):
         """A template name in a comparison must not swallow the expression."""
@@ -750,7 +772,7 @@ int f(void) {
     def test_non_virtual_caller_still_dispatches_virtually(self):
         # `describe` is not virtual but its call to `area` is.
         out = cpprust.translate(_SHAPE)
-        body = out[out.index("Shape_describe(Shape *this)"):]
+        body = out[out.index("Shape_describe(Shape *this) {"):]
         self.assertIn("_vptr)->area(this)", body[:body.index("}")])
 
     def test_destructors_chain_to_the_base(self):
@@ -758,7 +780,9 @@ int f(void) {
 class B { int a; public: B() { a = 1; } ~B() { a = 0; } };
 class D : public B { int b; public: D() { b = 2; } ~D() { b = 0; } };
 """)
-        drop = out[out.index("D_drop(D *this)"):]
+        # Slice from the *definition*: every member is prototyped first, so
+        # the name occurs earlier without a body.
+        drop = out[out.index("static void D_drop(D *this) {"):]
         self.assertIn("B_drop(&this->_base);", drop[:drop.index("}")])
 
     def test_implicit_dtor_chains_to_the_base(self):
@@ -885,6 +909,233 @@ public:
 """
 
 
+_ASSIGNABLE = """
+class Buf {
+public:
+    int *p;
+    Buf() { p = 0; }
+    Buf(const Buf &o) { p = o.p; }
+    Buf &operator=(const Buf &o) { p = o.p; }
+    ~Buf() { p = 0; }
+};
+"""
+
+
+class TestCppByValue(unittest.TestCase):
+    """An owning class cannot cross a call boundary by value.
+
+    Both forms were silent. A by-value parameter is a struct copy no
+    constructor ran for and no destructor will run for. A by-value return is
+    worse: the local is destroyed on the way out, so the caller receives a
+    copy of a released object -- a use-after-free.
+    """
+
+    def test_by_value_parameter_is_error(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate(_OWNING + "void take(Own b) { b.p = 0; }")
+        self.assertIn("by value", cm.exception.message)
+
+    def test_by_value_return_is_error(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate(_OWNING + "Own make(void) { Own t; return t; }")
+        self.assertIn("released object", cm.exception.message)
+
+    def test_by_reference_is_fine(self):
+        out = cpprust.translate(_OWNING + "void take(Own &b) { b.p = 0; }")
+        self.assertIn("void take(Own *b)", out)
+
+    def test_pointer_return_is_fine(self):
+        out = cpprust.translate(_OWNING + "Own *make(void);")
+        self.assertIn("Own *make(void);", out)
+
+    def test_non_owning_class_may_pass_by_value(self):
+        # No destructor, so nothing owns anything and the copy is harmless.
+        out = cpprust.translate("""
+class Pod { public: int x; Pod() { x = 0; } };
+Pod make(void);
+void take(Pod p);
+""")
+        self.assertIn("void take(Pod p);", out)
+
+    def test_a_local_with_arguments_is_not_a_declaration(self):
+        # `Node n(1);` parses like a function returning `Node`; it is not.
+        out = cpprust.translate(_NODE + "void f(void) { Node n(1); }")
+        self.assertIn("Node_new(&n, 1);", out)
+
+
+class TestCppAssignOperator(unittest.TestCase):
+    """`operator=` is the one overload the subset supports."""
+
+    def test_assignment_calls_the_operator(self):
+        out = cpprust.translate(_ASSIGNABLE + """
+void f(void) { Buf a; Buf b; b = a; }
+""")
+        self.assertIn("Buf__assign(&b, &a);", out)
+
+    def test_operator_does_not_collide_with_a_method_named_assign(self):
+        out = cpprust.translate("""
+class S {
+public:
+    int v;
+    S() { v = 0; }
+    S &operator=(const S &o) { v = o.v; }
+    ~S() { v = 0; }
+    void assign(int k) { v = k; }
+};
+""")
+        self.assertIn("static void S__assign(S *this, const S *o)", out)
+        self.assertIn("static void S_assign(S *this, int k)", out)
+
+    def test_other_operators_are_still_rejected(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate(
+                "class S { public: int v; S() { v=0; } "
+                "int operator+(const S &o) { return v; } };")
+        self.assertIn("operator+", cm.exception.message)
+
+    def test_chained_assignment_is_error(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate(_ASSIGNABLE + """
+void f(void) { Buf a; Buf b; Buf c; c = b = a; }
+""")
+        self.assertIn("chained assignment", cm.exception.message)
+
+    def test_without_the_operator_assignment_is_still_refused(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate(_OWNING + "void f(void) { Own a; Own b; b = a; }")
+        self.assertIn("operator=", cm.exception.message)
+
+
+class TestCppMemberPrototypes(unittest.TestCase):
+    def test_a_method_may_call_one_declared_below_it(self):
+        # Members are emitted in declaration order, so without prototypes
+        # this was an implicit declaration in C.
+        out = cpprust.translate("""
+class C {
+public:
+    int v;
+    C() { v = 0; }
+    int first() { return second(); }
+    int second() { return v; }
+};
+""")
+        self.assertIn("static int C_second(C *this);", out)
+        self.assertLess(out.index("static int C_second(C *this);"),
+                        out.index("static int C_first(C *this) {"))
+
+
+class TestCppStd(unittest.TestCase):
+    """`std::string` and `std::vector`, written in the subset itself.
+
+    They are not special-cased anywhere in the lowering: they go through the
+    same passes as user code, so if they translate, the subset is expressive
+    enough to have written them.
+    """
+
+    def test_string_is_supplied_on_demand(self):
+        out = cpprust.translate("void f(void) { std::string s; }")
+        self.assertIn("struct string {", out)
+        self.assertIn("static void string_new(string *this)", out)
+
+    def test_namespace_is_stripped(self):
+        out = cpprust.translate("void f(void) { std::string s; }")
+        self.assertNotIn("std::", out)
+
+    def test_include_form_works_too(self):
+        out = cpprust.translate("#include <string>\nvoid f(void) { string s; }")
+        self.assertIn("struct string {", out)
+        self.assertNotIn("#include <string>", out)
+
+    def test_nothing_is_supplied_when_unused(self):
+        out = cpprust.translate("int f(void) { return 1; }")
+        self.assertNotIn("struct string", out)
+        self.assertNotIn("struct vector", out)
+
+    def test_vector_monomorphises_per_element_type(self):
+        out = cpprust.translate("""
+void f(void) { std::vector<int> a; std::vector<char> b; }
+""")
+        self.assertIn("struct vector_int {", out)
+        self.assertIn("struct vector_char {", out)
+
+    def test_vector_brings_string_for_nesting(self):
+        # `string` is declared above `vector`, so `vector<string>` would find
+        # it complete -- the same declaration-order rule as any nesting.
+        out = cpprust.translate("void f(void) { std::vector<int> v; }")
+        self.assertLess(out.index("struct string {"),
+                        out.index("class vector") if "class vector" in out
+                        else out.index("struct vector_int {"))
+
+    def test_string_has_copy_and_assignment(self):
+        out = cpprust.translate("void f(void) { std::string s; }")
+        self.assertIn("static void string_copy(string *this,", out)
+        self.assertIn("static void string__assign(string *this,", out)
+
+    def test_owning_element_type_is_refused_clearly(self):
+        # `vector<T>` stores by assignment, which for a class with a
+        # destructor would leave two owners.
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate(
+                "int f(void) { std::vector<std::string> v; return v.size(); }")
+        self.assertIn("by value", cm.exception.message)
+
+
+class TestCppLambda(unittest.TestCase):
+    """A lambda with no captures is exactly a function, so it becomes one."""
+
+    def test_lambda_becomes_a_static_function(self):
+        out = cpprust.translate("""
+void f(void) { auto g = [](int y) -> int { return y * 2; }; }
+""")
+        self.assertIn("static int _cpp_lambda0(int y) { return y * 2; }", out)
+
+    def test_auto_binding_becomes_a_function_pointer(self):
+        out = cpprust.translate("""
+void f(void) { auto g = [](int y) -> int { return y * 2; }; }
+""")
+        self.assertIn("int (*g)(int) = _cpp_lambda0;", out)
+
+    def test_inline_lambda_argument(self):
+        out = cpprust.translate("""
+int apply(int (*fn)(int), int v);
+int f(void) { return apply([](int z) -> int { return z + 1; }, 7); }
+""")
+        self.assertIn("apply(_cpp_lambda0, 7)", out)
+
+    def test_void_lambda_needs_no_return_type_spelled(self):
+        out = cpprust.translate("""
+int puts(const char *s);
+void f(void) { auto g = []() -> void { puts("hi"); }; }
+""")
+        self.assertIn("void (*g)(void) = _cpp_lambda0;", out)
+
+    def test_definition_precedes_the_use(self):
+        out = cpprust.translate("""
+void f(void) { auto g = [](int y) -> int { return y; }; }
+""")
+        self.assertLess(out.index("static int _cpp_lambda0"),
+                        out.index("(*g)(int)"))
+
+    def test_capturing_lambda_is_error(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate("""
+void f(void) { int x = 1; auto g = [x](int y) -> int { return x + y; }; }
+""")
+        self.assertIn("capturing lambda", cm.exception.message)
+
+    def test_capture_all_is_error(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate(
+                "void f(void) { auto g = [&](int y) -> int { return y; }; }")
+        self.assertIn("capturing lambda", cm.exception.message)
+
+    def test_array_subscript_is_not_a_lambda(self):
+        out = cpprust.translate("""
+int f(int *a) { int b[4]; b[0] = 1; return a[0] + b[0]; }
+""")
+        self.assertIn("return a[0] + b[0];", out)
+
+
 class TestCppCopy(unittest.TestCase):
     """Copying an owning object has to call a copy constructor, or be refused.
 
@@ -954,10 +1205,14 @@ void f(void) { int k; k = 3; Buf a; a.p = 0; }
         self.assertIn("Buf_copy", out)
 
     def test_copy_from_an_unnameable_expression_is_error(self):
+        # A copy constructor but no destructor, so returning by value is
+        # allowed -- what fails is that the source of the copy is not an
+        # object this pass can name.
         with self.assertRaises(cpprust.CppError) as cm:
-            cpprust.translate(_COPYABLE + """
-Buf make(void);
-void f(void) { Buf b = make(); }
+            cpprust.translate("""
+class Pod { public: int x; Pod() { x = 0; } Pod(const Pod &o) { x = o.x; } };
+Pod make(void);
+void f(void) { Pod b = make(); }
 """)
         self.assertIn("not an object of that type", cm.exception.message)
 
