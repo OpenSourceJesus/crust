@@ -15,6 +15,15 @@ knowing: members are destroyed in reverse declaration order, because that is
 C++'s rule, while Crust's field glue frees in declaration order, because that
 is Rust's. Each side follows its own source language.)
 
+A class may therefore *own* a Crust value rather than point at one. Crust
+publishes the types it lowered that own something and the preprocessor passes
+them as `--owning Name:dropfn,..`, since this module runs as a subprocess and
+cannot see the unit being compiled. A member of such a type is destroyed with
+its container -- so a class holding only Crust values needs no destructor at
+all -- and the copy rules apply to it, so copying one without a copy
+constructor is refused for the same reason as any other owning class. Without
+the mapping nothing changes and the member is plain data.
+
 The subset, deliberately small:
 
   * `class` / `struct` with data members and methods
@@ -973,12 +982,41 @@ def _member_prologue(cname, value_members, initmap, known, fieldset, line):
     return (" ".join(lines) + " ") if lines else ""
 
 
+def _dropfn(info, cname):
+    """The function that destroys one object of this class.
+
+    A class lowered here spells it `T_drop`. A type this file did not define
+    -- a Crust `Vec<i32>` arriving as `Vec_int` -- spells it whatever Crust
+    emits, which is `Vec_int_free_buf` for a core container and `T_drop` for
+    a user `impl Drop`. So it is recorded rather than assumed.
+    """
+    return (info or {}).get("dropfn") or ("%s_drop" % cname)
+
+
 def _member_epilogue(value_members, known):
     """Destructor calls for class-typed members, in reverse order."""
-    lines = ["%s_drop(&this->%s);" % (fcls, fname)
+    lines = ["%s(&this->%s);" % (_dropfn(known[fcls], fcls), fname)
              for fname, fcls in reversed(value_members)
              if known[fcls]["dtor"]]
     return (" " + " ".join(lines)) if lines else ""
+
+
+def _external_info(name, dropfn):
+    """A `cinfo` entry for a type defined outside this file.
+
+    Crust hands over the types it lowered that own something, so a C++ class
+    holding one **by value** is destroyed like any other member and obeys the
+    same copy rules. Everything else about the type is unknown here: it has
+    no methods this pass can call, no constructor, and no copy constructor --
+    which is exactly right, since the Rule of Three check then refuses to
+    copy a class that owns one, rather than duplicating the buffer.
+    """
+    return {"ctor": False, "dtor": True, "ctors": {}, "methods": {},
+            "fields": {}, "base": None, "slots": [], "root": None,
+            "abstract": False, "vdtor": False, "vdtor_decl": None,
+            "ctor_refs": set(), "paths": {}, "copy": False,
+            "assign": False, "index": None, "vcall": {},
+            "dropfn": dropfn, "external": True}
 
 
 # The destructor's vtable slot. Not a legal C++ member name, so it cannot
@@ -1110,7 +1148,8 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             "fields": {}, "base": base, "slots": slots, "root": root,
             "abstract": abstract, "vdtor": False, "vdtor_decl": None,
             "ctor_refs": set(), "paths": {}, "copy": False,
-            "assign": False, "index": None}
+            "assign": False, "index": None,
+            "dropfn": "%s_drop" % cname, "external": False}
     if base_info:
         # Inherited members and methods are reachable on the derived class.
         # A base field is not at the same offset as an own field, though: the
@@ -1653,7 +1692,8 @@ def _rewrite_scopes(text, type_info):
         pieces = []
         for fr in reversed(scopes[upto:]):
             for ctype, vname in reversed(fr.live):
-                pieces.append("%s_drop(&%s); " % (ctype, vname))
+                pieces.append("%s(&%s); "
+                              % (_dropfn(type_info.get(ctype), ctype), vname))
         return "".join(pieces)
 
     def frame_index(kinds):
@@ -1707,7 +1747,8 @@ def _rewrite_scopes(text, type_info):
                 aggs -= 1
             fr = scopes.pop() if len(scopes) > 1 else _Frame("block", None)
             for ctype, vname in reversed(fr.live):
-                out.append("%s_drop(&%s); " % (ctype, vname))
+                out.append("%s(&%s); "
+                           % (_dropfn(type_info.get(ctype), ctype), vname))
             if not scopes:
                 scopes = [_Frame("file", None)]
             out.append(text[i])
@@ -1771,6 +1812,23 @@ def _rewrite_scopes(text, type_info):
                     "instantiated. Declare a `%s *` instead."
                     % (ctype, vname, ctype, ctype))
             # File-scope: leave the spelling alone (no automatic Drop).
+            if len(scopes) <= 1:
+                out.append(m.group(0))
+                i = m.end()
+                continue
+            if not info["ctor"]:
+                # No constructor to call, but there may still be something to
+                # destroy: a class whose members are all Crust types owns
+                # everything through them and declares neither. Leave the
+                # declaration exactly as written and register it anyway --
+                # otherwise the implicit destructor built from those members
+                # is emitted and never called.
+                out.append(m.group(0))
+                if info["dtor"] and (args is None or not args.strip()):
+                    scopes[-1].live.append((ctype, vname))
+                    scopes[-1].vals[vname] = ctype
+                i = m.end()
+                continue
             if len(scopes) <= 1 or not info["ctor"]:
                 out.append(m.group(0))
                 i = m.end()
@@ -2398,7 +2456,7 @@ def _rewrite_calls(text, cinfo, free_refs):
                     "types with constructors; a scalar element needs no "
                     "copy or destroy step." % (kind, ty, ty))
             if kind == "__cpp_drop":
-                out.append("%s_drop(&%s)" % (ty, parts[1])
+                out.append("%s(&%s)" % (_dropfn(cinfo[ty], ty), parts[1])
                            if cinfo[ty]["dtor"] else "(void)0")
             else:
                 if not cinfo[ty]["copy"]:
@@ -2561,8 +2619,9 @@ def _rewrite_calls(text, cinfo, free_refs):
                 # Guarded and wrapped: `delete` on a null pointer is a no-op
                 # in C++, and a bare block would leave a stray `;` before an
                 # `else` when the delete is a branch's only statement.
-                out.append("do { if (%s) { %s_drop(%s); free(%s); } } "
-                           "while (0)" % (expr, dcls, expr, expr))
+                out.append("do { if (%s) { %s(%s); free(%s); } } "
+                           "while (0)" % (expr, _dropfn(cinfo[dcls], dcls),
+                                          expr, expr))
             else:
                 out.append("free(%s)" % expr)
             i = end
@@ -3116,8 +3175,14 @@ def _lower_lambdas(text, path):
     return text
 
 
-def translate(text, path="<cpp>"):
-    """Translate a C++ subset source to C. Raises CppError on anything else."""
+def translate(text, path="<cpp>", owning=None):
+    """Translate a C++ subset source to C. Raises CppError on anything else.
+
+    `owning` maps the name of a type this file does *not* define to the
+    function that destroys one -- the types Crust lowered that own a buffer,
+    handed over so a C++ class holding one by value is destroyed like any
+    other member, and refuses to be copied for the same reason.
+    """
     # `std::string` / `std::vector` are supplied as ordinary subset source,
     # so everything below sees one file with no special cases in it.
     text = _std_prelude(text)
@@ -3274,7 +3339,11 @@ def translate(text, path="<cpp>"):
         return _monomorphise_uses(s, tnames, known=wanted)
 
     pieces = []
-    cinfo = {}
+    # Types from the other side of the boundary seed the table, so a class
+    # emitted below sees them exactly as it sees one declared above it.
+    cinfo = dict((n, _external_info(n, fn))
+                 for n, fn in sorted((owning or {}).items())
+                 if n not in declared)
     prev = 0
     for start, end, cls in classes:
         # Keep everything before the class, minus any `template<..>` header,
@@ -3368,9 +3437,44 @@ def translate(text, path="<cpp>"):
 # same file and the exit status is non-zero. One file, one status, no pipes.
 # ==========================================================================
 
+def _parse_owning(spec):
+    """`Name:dropfn,Name2:dropfn2` -> a mapping.
+
+    Passed on the command line rather than discovered, because this module
+    runs as a subprocess and cannot see the unit Crust is translating. The
+    protocol stays one file and one exit status; this is only how the caller
+    says which foreign types own something.
+    """
+    out = {}
+    for part in (spec or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" not in part:
+            raise CppError("--owning wants `Name:dropfn`, got %r" % part)
+        name, fn = part.split(":", 1)
+        name, fn = name.strip(), fn.strip()
+        if not name or not fn:
+            raise CppError("--owning wants `Name:dropfn`, got %r" % part)
+        out[name] = fn
+    return out
+
+
 def main(argv):
     args = list(argv)
     out_path = None
+    owning = {}
+    if "--owning" in args:
+        i = args.index("--owning")
+        if i + 1 >= len(args):
+            sys.stderr.write("cpprust: --owning needs a spec\n")
+            return 2
+        try:
+            owning = _parse_owning(args[i + 1])
+        except CppError as e:
+            sys.stderr.write("cpprust: %s\n" % e.message)
+            return 2
+        del args[i:i + 2]
     if "-o" in args:
         i = args.index("-o")
         if i + 1 >= len(args):
@@ -3379,7 +3483,8 @@ def main(argv):
         out_path = args[i + 1]
         del args[i:i + 2]
     if len(args) != 1 or out_path is None:
-        sys.stderr.write("usage: cpprust.py <source.cpp> -o <out.c>\n")
+        sys.stderr.write("usage: cpprust.py <source.cpp> -o <out.c> "
+                         "[--owning Name:dropfn,..]\n")
         return 2
 
     src = args[0]
@@ -3391,7 +3496,7 @@ def main(argv):
         return 2
 
     try:
-        result = translate(text, path=src)
+        result = translate(text, path=src, owning=owning)
     except CppError as e:
         # The message goes where the output would have gone; the caller
         # reads it back and reports it against the `#include` line.
