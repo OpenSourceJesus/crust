@@ -2668,11 +2668,12 @@ int f(Ptr *p) { return p->v; }
         self.assertIn("unique_ptr_T__arrow", out)
 
     def test_other_overloads_are_still_reported(self):
+        # `+=` is supported now; the comparison and stream operators are not.
         with self.assertRaises(cpprust.CppError) as cm:
             cpprust.translate(
-                "class A { public: int v; A operator+=(int n) { return *this; } };",
-                path="t.cpp")
-        self.assertIn("operator+=", cm.exception.message)
+                "class A { public: int v; int operator<(const A &o) "
+                "{ return v < o.v; } };", path="t.cpp")
+        self.assertIn("operator<", cm.exception.message)
 
 
 class TestCppNamespaceHazards(unittest.TestCase):
@@ -3160,3 +3161,123 @@ class A { public: int v; A() { v = 0; } void set(const int &n) { v = n; } };
 int f(void) { A a; int k = 5; a.set(k); return a.v; }
 """, path="t.cpp")
         self.assertIn("A_set(&a, &k)", out)
+
+
+class TestCppCompoundAssignment(unittest.TestCase):
+    """`operator+=` and friends, lowered like `operator=`."""
+
+    M = """
+class M {
+public:
+    int a;
+    M() { a = 0; }
+    void operator+=(const M &o) { a = a + o.a; }
+    void operator-=(const M &o) { a = a - o.a; }
+};
+"""
+
+    def test_it_becomes_a_call(self):
+        out = cpprust.translate(
+            self.M + "int f(void) { M x; M y; y.a = 5; x += y; return x.a; }",
+            path="t.cpp")
+        self.assertIn("M__augadd(&x, &y);", out)
+
+    def test_each_operator_gets_its_own_symbol(self):
+        # Spelled out rather than punctuated: the symbol has to be a C
+        # identifier, and `__augsub` reads back to the operator it came from.
+        out = cpprust.translate(
+            self.M + "int f(void) { M x; M y; x -= y; return x.a; }",
+            path="t.cpp")
+        self.assertIn("M__augsub(&x, &y);", out)
+
+    def test_a_chained_compound_assignment_is_reported(self):
+        # The result is dropped, so there is nothing to assign onward.
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate(
+                self.M + "int f(void) { M x; M y; M z; x += y = z; return 0; }",
+                path="t.cpp")
+        self.assertIn("chained assignment", cm.exception.message)
+
+    def test_a_scalar_compound_assignment_is_untouched(self):
+        out = cpprust.translate(
+            "int f(void) { int n = 1; n += 2; return n; }", path="t.cpp")
+        self.assertIn("n += 2;", out)
+
+
+class TestCppTemplateParameterNames(unittest.TestCase):
+    """A template parameter is not a name its namespace declares."""
+
+    def test_template_class_t_is_not_flattened(self):
+        # `template<class T>` reads exactly like a class declaration to the
+        # scan that collects what a namespace declares. litehtml has one, and
+        # flattening turned every `T` in the template into `litehtml_T` --
+        # including the `operator T()` that made it visible.
+        out = cpp_auto.resolve_namespaces("""
+namespace n {
+    template<class T> class holder {
+        T val;
+    public:
+        holder() { }
+        T get() { return val; }
+    };
+    class Other { public: int v; };
+}
+int f(void) { n::Other o; return o.v; }
+""", "t.cpp")
+        self.assertIn("n_holder", out)
+        self.assertIn("n_Other", out)
+        self.assertNotIn("n_T", out)
+
+    def test_typename_spelling_too(self):
+        out = cpp_auto.resolve_namespaces("""
+namespace n {
+    template<typename T> class holder { T val; public: T get() { return val; } };
+}
+int f(void) { return 0; }
+""", "t.cpp")
+        self.assertNotIn("n_T", out)
+
+
+class TestCppConversionOperator(unittest.TestCase):
+    """`operator T()` gets its own diagnostic.
+
+    It is not one more overload to add but a different kind of thing: it
+    applies wherever the compiler decides a conversion is wanted, and this
+    pass reads types from how they are written.
+    """
+
+    def test_it_is_named_as_a_conversion(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate(
+                "class A { public: int v; operator int() { return v; } };",
+                path="t.cpp")
+        self.assertIn("conversion operator", cm.exception.message)
+
+    def test_a_missing_overload_still_reads_as_one(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate(
+                "class A { public: int v; int operator<(const A &o) "
+                "{ return v < o.v; } };", path="t.cpp")
+        self.assertIn("operator<", cm.exception.message)
+        self.assertNotIn("conversion", cm.exception.message)
+
+
+class TestCppDeclarationScanAnchors(unittest.TestCase):
+    """A member after an access label on its own line."""
+
+    def test_a_field_after_a_private_label_is_seen(self):
+        # The declaration scan anchored on `;{}(,` only, so `private:` on its
+        # own line hid every field that followed -- which is how litehtml
+        # declares `props_map m_properties;`, and why every deduction from
+        # `m_properties.find(..)` failed.
+        got = cpp_auto._declared_types(
+            "class S {\nprivate:\n\tmap<string, int>\t\tm_props;\n};")
+        self.assertEqual(got.get("m_props"), "map<string, int>")
+
+    def test_cpp_ref_does_not_hide_a_declaration(self):
+        # `__cpp_ref(T)` is a type spelled like a call, and the declarator
+        # scan reads a parameter list as having no parentheses in it.
+        n, m, f, tp = cpp_auto._scan_classes(cpp_auto._blank_like(
+            "template<typename K,typename V> class map { public: "
+            "pair<K,V> *find(__cpp_ref(K) k) { return 0; } };"))
+        self.assertEqual(m.get("map", {}).get("find"), "pair<K,V> *")
