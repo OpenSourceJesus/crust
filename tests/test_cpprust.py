@@ -1,5 +1,6 @@
 """Pure-translation tests for the C++ subset front end (tools.cpprust)."""
 
+import os
 import unittest
 
 import tools.cpprust as cpprust
@@ -768,7 +769,7 @@ class TestCppInheritance(unittest.TestCase):
 int f(Shape *s) { return s->area(); }
 """)
         self.assertIn(
-            "((const struct Shape_vtable *)s->_vptr)->area(s)", out)
+            "((const struct Shape_vtable *)(s)->_vptr)->area(s)", out)
 
     def test_inherited_method_upcasts(self):
         out = cpprust.translate(_SHAPE + """
@@ -833,7 +834,7 @@ class A { public: virtual int f() = 0; };
 class C : public A { int v; public: C() { v = 3; } int f() { return v; } };
 int use(A *p) { return p->f(); }
 """)
-        self.assertIn("((const struct A_vtable *)p->_vptr)->f(p)", out)
+        self.assertIn("((const struct A_vtable *)(p)->_vptr)->f(p)", out)
         self.assertIn("C__vtable = { &C__thunk_f };", out)
 
     def test_multiple_inheritance_is_error(self):
@@ -850,7 +851,9 @@ int use(A *p) { return p->f(); }
     def test_virtual_declaration_without_body_is_error(self):
         with self.assertRaises(cpprust.CppError) as cm:
             cpprust.translate("class A { public: virtual int f(); };")
-        self.assertIn("without a body", cm.exception.message)
+        # Still an error, and now with the fix named: a member with no
+        # body needs an out-of-line definition in the same translation.
+        self.assertIn("declared but never defined", cm.exception.message)
 
 
 _NODE = """
@@ -1804,7 +1807,7 @@ int f(void) { Factory k; return k.make()->area(); }
 
     def test_named_receiver_keeps_the_plain_form(self):
         out = cpprust.translate(_VCHAIN + "int f(Shape *s) { return s->area(); }")
-        self.assertIn("((const struct Shape_vtable *)s->_vptr)->area(s)", out)
+        self.assertIn("((const struct Shape_vtable *)(s)->_vptr)->area(s)", out)
 
     def test_no_helper_when_nothing_chains(self):
         out = cpprust.translate(_VCHAIN + "int f(Shape *s) { return s->area(); }")
@@ -2744,3 +2747,139 @@ public:
 int f(void) { N a; return 0; }
 """, path="t.cpp")
         self.assertNotIn("N_copy", out)
+
+
+class TestCppOutOfLineDefinitions(unittest.TestCase):
+    """Members declared in a class and defined under a qualified name.
+
+    This is how C++ projects are laid out, and the lowering needs both halves
+    in one place because it emits a class and its bodies together. The
+    definitions are lifted out of the file, keyed by class, name and arity,
+    and attached to the member they belong to before anything is emitted.
+    """
+
+    SPLIT = """
+class A {
+    int v;
+public:
+    A();
+    A(int n);
+    ~A();
+    int get() const;
+    void set(int n);
+};
+
+int gone = 0;
+
+A::A() { v = 0; }
+A::A(int n) { v = n; }
+A::~A() { gone = gone + 1; }
+int A::get() const { return v; }
+void A::set(int n) { v = n; }
+"""
+
+    def test_bodies_are_attached_to_the_declarations(self):
+        out = cpprust.translate(
+            self.SPLIT + "int f(void) { A a(5); a.set(7); return a.get(); }",
+            path="t.cpp")
+        self.assertIn("static int A_get(A *this) { return this->v; }", out)
+
+    def test_the_destructor_is_matched_through_its_tilde(self):
+        # It is written `~A` where it is defined and recorded as `A` on the
+        # member, so the key has to be put back together.
+        out = cpprust.translate(self.SPLIT + "int f(void) { A a; return 0; }",
+                                path="t.cpp")
+        self.assertIn("A_drop(A *this) { gone = gone + 1; }", out)
+
+    def test_overloaded_constructors_match_on_arity(self):
+        out = cpprust.translate(self.SPLIT + "int f(void) { A a(5); return 0; }",
+                                path="t.cpp")
+        self.assertIn("A_new(A *this) { this->v = 0; }", out)
+        self.assertIn("this->v = n;", out)
+
+    def test_a_trailing_const_is_dropped(self):
+        # It constrains what the body may do; `this` is a pointer either way,
+        # and the C front end checks the body regardless.
+        out = cpprust.translate(self.SPLIT + "int f(void) { A a; return a.get(); }",
+                                path="t.cpp")
+        self.assertIn("static int A_get(A *this)", out)
+
+    def test_declared_and_never_defined_is_reported(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate("class A { public: int f(); };", path="t.cpp")
+        self.assertIn("declared but never defined", cm.exception.message)
+
+    def test_a_qualified_call_inside_a_body_is_not_a_definition(self):
+        # Only at brace depth zero: `Foo::bar()` inside a body is a call, and
+        # matching it would tear the middle out of a function.
+        out = cpprust.translate("""
+class A { public: int v; A() { v = 1; } int g() { return v; } };
+int f(void) { A a; return A::g(&a) ? 1 : a.g(); }
+""", path="t.cpp")
+        self.assertIn("A_g", out)
+
+    def test_bodies_are_emitted_after_file_scope_names_they_read(self):
+        # The author wrote them below `gone`; emitting at the class would put
+        # them above it, and a header spliced in at the top makes that worse.
+        out = cpprust.translate(self.SPLIT + "int f(void) { A a; return 0; }",
+                                path="t.cpp")
+        self.assertLess(out.index("int gone = 0;"),
+                        out.index("gone = gone + 1;"))
+
+
+class TestCppHeaderExpansion(unittest.TestCase):
+    """`#include "x.h"` is spliced by this pass, so a class and its
+    definitions meet in one translation."""
+
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.mkdtemp()
+        with open(os.path.join(self.dir, "a.h"), "w") as f:
+            f.write("class A { int v; public: A(); int g(); };\n")
+        with open(os.path.join(self.dir, "b.h"), "w") as f:
+            f.write('#include "a.h"\nint helper(void);\n')
+
+    def test_a_header_supplies_the_declarations(self):
+        out = cpprust.translate(
+            '#include "a.h"\nA::A() { v = 3; }\nint A::g() { return v; }\n'
+            'int f(void) { A a; return a.g(); }\n',
+            path="a.cpp", basedir=self.dir)
+        self.assertIn("static int A_g(A *this) { return this->v; }", out)
+
+    def test_a_header_is_spliced_once(self):
+        # Which is what an include guard does, and saves understanding either
+        # `#pragma once` or the `#ifndef` idiom.
+        out = cpprust.translate(
+            '#include "a.h"\n#include "b.h"\n'
+            'A::A() { v = 3; }\nint A::g() { return v; }\n'
+            'int f(void) { A a; return a.g(); }\n',
+            path="a.cpp", basedir=self.dir)
+        self.assertEqual(out.count("struct A { int v; };"), 1)
+
+    def test_a_missing_header_is_left_alone(self):
+        # It may be one the C front end can resolve; this pass is not the
+        # authority on the include path.
+        out = cpprust.translate(
+            '#include "nosuch.h"\nint f(void) { return 0; }\n',
+            path="a.cpp", basedir=self.dir)
+        self.assertIn('#include "nosuch.h"', out)
+
+    def test_angle_bracket_includes_are_untouched(self):
+        out = cpprust.translate(
+            '#include <stdio.h>\nint f(void) { return 0; }\n',
+            path="a.cpp", basedir=self.dir)
+        self.assertIn("#include <stdio.h>", out)
+
+
+class TestCppVirtualOnAValue(unittest.TestCase):
+    """A virtual call through a value receiver."""
+
+    def test_the_receiver_is_parenthesised(self):
+        # The receiver may already be `&c`, and `&c->_vptr` parses as
+        # `&(c->_vptr)` -- the address of the pointer rather than the
+        # pointer. Dispatching on a value emitted that and did not compile.
+        out = cpprust.translate("""
+class C { int n; public: C() { n = 1; } virtual int scaled(int k) { return n * k; } };
+int f(void) { C c; return c.scaled(2); }
+""", path="t.cpp")
+        self.assertIn("(&c)->_vptr", out)
