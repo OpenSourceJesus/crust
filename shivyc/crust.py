@@ -722,6 +722,17 @@ class Parser:
         self.terminated = False
         # Set while emitting a `fn drop` that owes its fields a free.
         self.drop_owner = None
+        # Locals moved out of, and the line it happened on. A moved-from local
+        # is zeroed rather than poisoned at runtime, so reading one afterwards
+        # silently sees an empty container instead of what was there; Rust
+        # rejects that outright, and so does this.
+        self.moved = {}
+        # How many loops deep each binding was declared, and how deep we are
+        # now. A move of something declared *outside* the loop is a move that
+        # happens again on the next iteration, which is the one shape a
+        # single forward pass cannot otherwise see.
+        self.loop_depth = 0
+        self.decl_depth = {}
         self.ret_type = VOID
         self.impl_type = None           # enclosing `impl` type name, if any
         self.no_struct_lit = 0          # >0 while parsing a condition
@@ -799,6 +810,11 @@ class Parser:
 
     def declare(self, name, type_):
         self.scopes[-1][name] = type_
+        self.decl_depth[name] = self.loop_depth
+        # A fresh binding, so any move recorded against the old one is spent:
+        # `let c = ..;  take(c);  let c = ..;` shadows rather than reuses, and
+        # Rust is happy with it.
+        self.clear_moved(name)
 
     def lookup(self, name):
         for s in reversed(self.scopes):
@@ -882,6 +898,36 @@ class Parser:
         out.line_at(line,
                     "memset(&%s, 0, sizeof(%s));" % (csrc, csrc), indent)
         self.live_unregister(src_name)
+        self.mark_moved(src_name, line)
+
+    def mark_moved(self, name, line):
+        """Record that `name` was moved out of, for use-after-move."""
+        if self.loop_depth > self.decl_depth.get(name, self.loop_depth):
+            raise CrustError(
+                "line %d: `%s` is moved inside a loop but declared outside "
+                "it, so every iteration after the first moves a value that "
+                "is already gone -- here the source is zeroed, so the second "
+                "pass would quietly see an empty value. Rust rejects this "
+                "too. Move it into the loop, or pass `&%s`."
+                % (line, name, name))
+        self.moved[name] = line
+
+    def clear_moved(self, name):
+        """`name` owns something again: a re-`let`, or an assignment to it."""
+        if name in self.moved:
+            del self.moved[name]
+
+    def check_moved(self, name, line):
+        """Reject reading a local that was moved out of."""
+        if name not in self.moved:
+            return
+        raise CrustError(
+            "line %d: `%s` was moved on line %d and is not valid to use "
+            "again. Rust rejects this; here the move zeroes the source, so "
+            "reading it would quietly see an empty value rather than what "
+            "was there. Pass `&%s` if the callee only needs to borrow it, "
+            "or assign to `%s` again first."
+            % (line, name, self.moved[name], name, name))
 
     def simple_owning_local(self, expr):
         """If `expr` is a bare owning local name, return (name, type), else None."""
@@ -1490,6 +1536,11 @@ class Parser:
                    self.unit, self.tysubst)
         p.scopes = self.scopes
         p.live = self.live
+        # Shared, not copied: a macro argument reads the same locals as the
+        # code around it, so a local moved out of before the macro is just as
+        # moved inside one. Without this `println!("{}", a)` after `take(a)`
+        # printed the zeroed husk instead of being rejected.
+        p.moved = self.moved
         p.impl_type = self.impl_type
         p.ret_type = self.ret_type
         e = p.parse_expr()
@@ -2115,6 +2166,7 @@ class Parser:
             csrc = _c_name(moved[0])
             self.pending.append("%s = %s;" % (want.decl(tmp), args[idx]))
             self.pending.append("memset(&%s, 0, sizeof(%s));" % (csrc, csrc))
+            self.mark_moved(moved[0], self.cur.line)
             args[idx] = tmp
 
     def emit_pending(self, out, line, indent):
@@ -2793,6 +2845,16 @@ class Parser:
                 elif name in self.unit.consts:
                     ty = self.unit.consts[name]
             if self.lookup(name) is not None:
+                # Assigning *to* it gives it something to own again, so that
+                # clears the move rather than tripping it. `==` is a read.
+                if self.at("=", "punc") or self.at("+=", "punc") \
+                        or self.at("-=", "punc"):
+                    if self.at("=", "punc"):
+                        self.clear_moved(name)
+                    else:
+                        self.check_moved(name, t.line)
+                else:
+                    self.check_moved(name, t.line)
                 name = _c_name(name)
             out = Expr(name, ty)
             out.from_path = saw_path
@@ -2814,11 +2876,15 @@ class Parser:
         open_tok = self.expect("{")
         out.line_at(open_tok.line, "{", indent)
         self.scope_push(kind)
+        if kind == "loop":
+            self.loop_depth += 1
         while not self.at("}", "punc"):
             if self.cur.kind == "eof":
                 raise CrustError("line %d: unterminated block" % self.cur.line)
             self.parse_stmt(out, indent + 1, tail_returns)
         close = self.expect("}")
+        if kind == "loop":
+            self.loop_depth -= 1
         # Drop this frame's owning locals before leaving the block -- unless
         # the last statement already left it, in which case these would be
         # unreachable and, at the function frame, a second drop of the same
