@@ -118,6 +118,10 @@ def _run_cpprust(filename, text):
     if sys.implementation.name != "shivyc":
         import subprocess
         cmd = [sys.executable, script, src, "-o", out, "--basedir", basedir]
+        # The same `-I` directories the C compilation was given: a C++ project
+        # keeps its headers in one and the `.cpp` says `#include "x.h"`.
+        for d in _extra_include_dirs:
+            cmd += ["--incdir", d]
         if spec:
             cmd += ["--owning", spec]
         try:
@@ -139,6 +143,8 @@ def _run_cpprust(filename, text):
         # would break. Acceptable for the same reason it is in main.py.
         # stderr is dropped because the message is read back from `out`.
         extra = (" --owning " + spec) if spec else ""
+        for d in _extra_include_dirs:
+            extra += " --incdir " + d
         rc = os.system("python3 " + script + " " + src + " -o " + out +
                        " --basedir " + basedir + extra + " 2>/dev/null")
         if rc != 0:
