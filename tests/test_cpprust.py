@@ -738,7 +738,12 @@ class TestCppInheritance(unittest.TestCase):
 
     def test_derived_ctor_calls_base_then_installs_vtable(self):
         out = cpprust.translate(_SHAPE)
-        ctor = out[out.index("Square_new(Square *this"):]
+        # The *definition*, not the prototype. Prototypes are hoisted above
+        # every definition now -- a template instantiated over a class
+        # declared below it needs that -- so a bare name matches the
+        # declaration first, and slicing to the next `}` then gives an empty
+        # body rather than the constructor.
+        ctor = out[out.index("Square_new(Square *this, int n) {"):]
         ctor = ctor[:ctor.index("}")]
         self.assertLess(ctor.index("Shape_new(&this->_base);"),
                         ctor.index("Square__vtable"))
@@ -752,8 +757,11 @@ class TestCppInheritance(unittest.TestCase):
 
     def test_vtable_declared_before_the_ctor_uses_it(self):
         out = cpprust.translate(_SHAPE)
+        # Against the constructor's definition: its prototype is hoisted, and
+        # a prototype above the table is fine -- what must not happen is the
+        # body installing a table that has not been defined yet.
         self.assertLess(out.index("Shape__vtable = {"),
-                        out.index("static void Shape_new"))
+                        out.index("static void Shape_new(Shape *this) {"))
 
     def test_virtual_call_dispatches(self):
         out = cpprust.translate(_SHAPE + """
@@ -2351,3 +2359,244 @@ int f(void) {
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCppAuto(unittest.TestCase):
+    """C++11 `auto`, resolved to a written type before anything reads types.
+
+    A textual deduction, not a type checker: everything downstream reads
+    types by their spelling, so `auto` has to become one. What has a spelling
+    nearby resolves; what does not is reported rather than guessed.
+    """
+
+    CLASSES = ("class A { public: int v; A() { v = 7; } int g() "
+               "{ return v; } };\nint mk(void);\n")
+
+    def _decl(self, body):
+        out = cpprust.translate(self.CLASSES + "int f(void) {%s}" % body,
+                                path="t.cpp")
+        return out
+
+    def test_class_construction_becomes_direct_initialisation(self):
+        # `auto a = A();` is written as copy-initialisation but means direct
+        # initialisation -- C++17 elides the temporary, and the direct form
+        # is the only one this subset lowers.
+        out = self._decl(" auto a = A(); return a.g(); ")
+        self.assertIn("A_new(&a);", out)
+
+    def test_literals(self):
+        for init, want in ((" 3 ", "int n"), (" 1.5 ", "double n"),
+                           (' "hi" ', "const char * n"), (" 'x' ", "char n"),
+                           (" true ", "bool n")):
+            out = self._decl(" auto n =%s; return 0; " % init)
+            self.assertIn(want, out)
+
+    def test_new_deduces_a_pointer(self):
+        out = self._decl(" auto p = new A(); return p->v; ")
+        self.assertIn("A * p", out)
+
+    def test_function_and_method_return_types(self):
+        self.assertIn("int r", self._decl(" auto r = mk(); return r; "))
+        self.assertIn("int z", self._decl(" A a; auto z = a.g(); return z; "))
+
+    def test_subscript_deduces_through_the_template_parameter(self):
+        out = cpprust.translate("""
+template<typename T> class vec {
+    T *d; int n;
+public:
+    vec() { d = 0; n = 0; }
+    int size() { return n; }
+    T &operator[](int i) { return d[i]; }
+};
+int f(void) { vec<int> v; auto e = v[0]; return e; }
+""", path="t.cpp")
+        self.assertIn("int e = ", out)
+
+    def test_undeducible_forms_are_reported(self):
+        for body, why in (
+                (" auto x = 1 + 2 * 3; return x; ", "compound"),
+                (" auto x = mystery(); return 0; ", "mystery"),
+                (" auto x = nosuch; return 0; ", "nosuch")):
+            with self.assertRaises(cpprust.CppError) as cm:
+                self._decl(body)
+            self.assertIn("auto", cm.exception.message)
+
+
+class TestCppRangeFor(unittest.TestCase):
+    """C++11 range-`for`, rewritten to the index loop it stands for."""
+
+    VEC = """
+template<typename T> class vec {
+    T *d; int n; int cap;
+public:
+    vec() { d = 0; n = 0; cap = 0; }
+    ~vec() { free(d); }
+    int size() { return n; }
+    T &operator[](int i) { return d[i]; }
+};
+"""
+
+    def test_reference_form_aliases_the_element(self):
+        # A reference means the name *is* the element, so writing through it
+        # writes to the container. Done by substitution, which is exact.
+        out = cpprust.translate(
+            "int f(void) { int a[3]; for (auto &x : a) { x = 1; } return 0; }",
+            path="t.cpp")
+        self.assertIn("a[_cpp_it0] = 1;", out)
+
+    def test_value_form_declares_a_copy(self):
+        out = cpprust.translate(
+            "int f(void) { int a[3]; int s = 0; "
+            "for (auto x : a) { s = s + x; } return s; }", path="t.cpp")
+        self.assertIn("int x = a[_cpp_it0];", out)
+
+    def test_container_uses_size_and_subscript(self):
+        out = cpprust.translate(
+            self.VEC + "int f(void) { vec<int> v; int s = 0; "
+            "for (auto x : v) { s = s + x; } return s; }", path="t.cpp")
+        self.assertIn("vec_int_size(&v)", out)
+
+    def test_two_loops_get_distinct_counters(self):
+        # The blanked copy has to be rebuilt after the first rewrite; reading
+        # a stale one substituted nothing in the second loop.
+        out = cpprust.translate(
+            "int f(void) { int a[3]; for (auto &x : a) { x = 1; } "
+            "for (auto &y : a) { y = 2; } return 0; }", path="t.cpp")
+        self.assertIn("a[_cpp_it0] = 1;", out)
+        self.assertIn("a[_cpp_it1] = 2;", out)
+
+    def test_an_unwalkable_range_is_reported(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate(
+                "class C { public: int v; };\n"
+                "int f(void) { C c; for (auto x : c) { } return 0; }",
+                path="t.cpp")
+        self.assertIn("size()", cm.exception.message)
+
+
+class TestCppNamespaces(unittest.TestCase):
+    """`namespace N { .. }` and `N::x` flattened to `N_x`.
+
+    The same thing Crust does with Rust paths, and for the same reason: C has
+    one namespace, so a qualified name has to become an unqualified one.
+    """
+
+    def test_qualified_names_are_flattened(self):
+        out = cpprust.translate("""
+namespace geo {
+    class Point { public: int x; int y; int sum() { return x + y; } };
+    int twice(int v) { return v * 2; }
+}
+int f(void) { geo::Point p; p.x = 3; p.y = 4; return geo::twice(p.sum()); }
+""", path="t.cpp")
+        self.assertIn("geo_Point", out)
+        self.assertIn("geo_twice", out)
+
+    def test_members_are_not_prefixed(self):
+        # Only what the namespace declares. Prefixing members renamed
+        # `Point::x` to `geo_x` and broke every use of it.
+        out = cpprust.translate("""
+namespace geo { class Point { public: int x; int sum() { return x; } }; }
+int f(void) { geo::Point p; p.x = 1; return p.sum(); }
+""", path="t.cpp")
+        self.assertNotIn("geo_x", out)
+        self.assertIn("p.x", out)
+
+    def test_nested_namespaces_join(self):
+        out = cpprust.translate("""
+namespace a { namespace b { int mk(int n) { return n; } } }
+int f(void) { return a::b::mk(1); }
+""", path="t.cpp")
+        self.assertIn("a_b_mk", out)
+
+
+class TestCppSmartPointers(unittest.TestCase):
+    """`unique_ptr` and `shared_ptr`, written in the subset and supplied.
+
+    Like `string` and `vector`: every feature they need is one the subset
+    already claims, so if they compile the claim holds. `unique_ptr` declares
+    no copy constructor, which means the existing Rule of Three refusal *is*
+    its move-only semantics, for free.
+    """
+
+    THING = ("class Thing { public: int v; Thing() { v = 0; } "
+             "~Thing() { } };\n")
+
+    def test_unique_ptr_is_supplied_on_demand(self):
+        out = cpprust.translate(
+            "#include <memory>\n" + self.THING +
+            "int f(void) { std::unique_ptr<Thing> u(new Thing()); "
+            "return u.get()->v; }", path="t.cpp")
+        self.assertIn("unique_ptr_Thing_reset", out)
+
+    def test_unique_ptr_runs_the_element_destructor(self):
+        # Plain `delete p` inside a template frees without calling the
+        # element's destructor, because `T` is not known to be a class when
+        # the body is parsed. `__cpp_drop` is resolved per instantiation.
+        out = cpprust.translate(
+            "#include <memory>\n" + self.THING +
+            "int f(void) { std::unique_ptr<Thing> u(new Thing()); return 0; }",
+            path="t.cpp")
+        self.assertIn("Thing_drop", out)
+
+    def test_copying_a_unique_ptr_is_refused(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate(
+                "#include <memory>\n" + self.THING +
+                "int f(void) { std::unique_ptr<Thing> a(new Thing()); "
+                "std::unique_ptr<Thing> b = a; return 0; }", path="t.cpp")
+        self.assertIn("copy constructor", cm.exception.message)
+
+    def test_shared_ptr_has_a_copy_constructor_and_a_count(self):
+        out = cpprust.translate(
+            "#include <memory>\n" + self.THING +
+            "int f(void) { std::shared_ptr<Thing> a(new Thing()); "
+            "std::shared_ptr<Thing> b(a); return (int)b.use_count(); }",
+            path="t.cpp")
+        self.assertIn("shared_ptr_Thing_copy", out)
+        self.assertIn("shared_ptr_Thing_use_count", out)
+
+    def test_the_header_alone_supplies_nothing(self):
+        # An unused template would still be monomorphised.
+        out = cpprust.translate(
+            "#include <memory>\nclass C { public: int v; };\n"
+            "int f(void) { C c; return c.v; }", path="t.cpp")
+        self.assertNotIn("unique_ptr", out)
+
+
+class TestCppDeclarationHoisting(unittest.TestCase):
+    """Class names and prototypes precede every definition.
+
+    A template instantiated over a class defined *below* it emitted
+    `struct Box_Thing { Thing * bp; };` above `struct Thing;`. General, not
+    specific to the supplied templates -- a user template hit it identically.
+    """
+
+    SRC = """
+template<typename T> class Box { T *bp; public: Box() { bp = 0; } T *get() { return bp; } };
+class Thing { public: int v; Thing() { v = 1; } };
+int f(void) { Box<Thing> b; return b.get() ? 1 : 0; }
+"""
+
+    def test_a_template_over_a_later_class_orders_correctly(self):
+        out = cpprust.translate(self.SRC, path="t.cpp")
+        self.assertLess(out.index("struct Thing;"),
+                        out.index("struct Box_Thing {"))
+
+    def test_struct_definitions_stay_where_they_were(self):
+        # Only names and prototypes hoist. A by-value member needs its
+        # member's *definition* above it, so moving one would move them all.
+        out = cpprust.translate(self.SRC, path="t.cpp")
+        self.assertLess(out.index("struct Box_Thing {"),
+                        out.index("struct Thing { int v; };"))
+
+    def test_a_local_with_a_new_argument_is_not_a_declaration(self):
+        # `Holder h(new Thing())` read as a function declaration returning
+        # `Holder`, so the by-value check refused a perfectly good local.
+        out = cpprust.translate(
+            "class Thing { public: int v; Thing() { v = 1; } };\n"
+            "class H { Thing *p; public: H(Thing *q) { p = q; } "
+            "~H() { } Thing *get() { return p; } };\n"
+            "int f(void) { H h(new Thing()); return h.get()->v; }",
+            path="t.cpp")
+        self.assertIn("H_new(&h,", out)
