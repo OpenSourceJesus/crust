@@ -4,6 +4,7 @@ import os
 import unittest
 
 import tools.cpprust as cpprust
+import tools.cpp_auto as cpp_auto
 
 
 class TestCppClass(unittest.TestCase):
@@ -2883,3 +2884,130 @@ class C { int n; public: C() { n = 1; } virtual int scaled(int k) { return n * k
 int f(void) { C c; return c.scaled(2); }
 """, path="t.cpp")
         self.assertIn("(&c)->_vptr", out)
+
+
+class TestCppTypeAliases(unittest.TestCase):
+    """`typedef X Y;` and `using Y = X;` resolved to what they name."""
+
+    VEC = """
+template<typename T> class vec {
+    T *d; int n;
+public:
+    vec() { d = 0; n = 0; }
+    int size() { return n; }
+    T &operator[](int i) { return d[i]; }
+};
+"""
+
+    def test_a_typedef_container_can_be_walked(self):
+        # This is the shape that dominated the benchmark: a member declared
+        # with an alias, walked by a range-`for`.
+        out = cpprust.translate(self.VEC + """
+typedef vec<int> ints;
+class Bag { ints items; public: int total(); };
+int Bag::total() { int s = 0; for (auto &x : items) { s = s + x; } return s; }
+""", path="t.cpp")
+        self.assertIn("vec_int_size(&this->items)", out)
+
+    def test_a_using_alias_becomes_a_typedef(self):
+        # C has only the typedef.
+        out = cpprust.translate(self.VEC + """
+using ints = vec<int>;
+class Bag { ints items; public: int size(); };
+int Bag::size() { return items.size(); }
+""", path="t.cpp")
+        self.assertNotIn("using ints", out)
+        self.assertIn("vec_int_size", out)
+
+    def test_a_nested_template_argument_is_matched(self):
+        # `vec< vec<int> > x;` -- the declaration scan excluded nested angle
+        # brackets, so a member of a container of containers was invisible.
+        self.assertEqual(
+            cpp_auto._declared_types("vec< vec<int> > items;").get("items"),
+            "vec< vec<int> >")
+
+    def test_a_self_naming_typedef_is_left_alone(self):
+        # `typedef struct X X;` names itself. Substituting it prepends
+        # `struct` once per round, and the C Crust emits for its own types is
+        # full of them -- one pass produced `struct struct struct .. Vec_int`.
+        self.assertEqual(
+            cpp_auto._scan_typedefs("typedef struct Vec_int Vec_int;"), {})
+
+    def test_a_class_scoped_typedef_is_not_taken_globally(self):
+        # litehtml's are named `ptr` and `vector`; collecting those flatly
+        # would make every `vector` mean `box::vector`, including the
+        # supplied template of that name.
+        got = cpp_auto._scan_typedefs(
+            "typedef vec<int> ints;\nclass box { typedef vec<int> vector; };")
+        self.assertIn("ints", got)
+        self.assertNotIn("vector", got)
+
+    def test_a_template_parameter_shadows_an_alias(self):
+        # Inside the template the parameter is what the name means.
+        out = cpprust.translate("""
+typedef int B;
+template<typename A, typename B>
+class Two { A a; B b; };
+Two<B, char> x;
+""", path="t.cpp")
+        self.assertIn("struct Two_B_char { B a; char b; };", out)
+
+
+class TestCppIncludePath(unittest.TestCase):
+    """Headers found on a search path, not just beside the source."""
+
+    def setUp(self):
+        import tempfile
+        self.root = tempfile.mkdtemp()
+        self.inc = os.path.join(self.root, "include")
+        self.src = os.path.join(self.root, "src")
+        os.makedirs(self.inc)
+        os.makedirs(self.src)
+        with open(os.path.join(self.inc, "a.h"), "w") as f:
+            f.write("class A { int v; public: A(); int g(); };\n")
+
+    def test_a_header_on_the_search_path_resolves(self):
+        # A project whose headers live in `include/` rather than beside the
+        # source -- which is most of them.
+        out = cpprust.translate(
+            '#include "a.h"\nA::A() { v = 4; }\nint A::g() { return v; }\n'
+            'int f(void) { A a; return a.g(); }\n',
+            path="a.cpp", basedir=self.src, incdirs=[self.inc])
+        self.assertIn("static int A_g(A *this) { return this->v; }", out)
+
+
+class TestCppNamespaceReopening(unittest.TestCase):
+    """A namespace may be reopened, which a project with one per header does."""
+
+    def test_reopening_is_not_a_collision(self):
+        # A name this pass produced from an earlier block of the same
+        # namespace is the same entity; only one the author spelled `N_x` is
+        # a genuine collision.
+        out = cpprust.translate("""
+namespace n { class A { public: int v; }; }
+namespace n { int twice(int x) { return x * 2; } }
+int f(void) { n::A a; a.v = 3; return n::twice(a.v); }
+""", path="t.cpp")
+        self.assertIn("n_twice", out)
+
+    def test_a_real_collision_is_still_reported(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate("""
+int n_twice(int x) { return x; }
+namespace n { int twice(int x) { return x * 2; } }
+int f(void) { return n::twice(1); }
+""", path="t.cpp")
+        self.assertIn("one symbol", cm.exception.message)
+
+
+class TestCppExplicit(unittest.TestCase):
+    """`explicit` constrains implicit conversion, which this never performs."""
+
+    def test_an_explicit_constructor_is_accepted(self):
+        out = cpprust.translate("""
+class A { int v; public: explicit A(int n); int g(); };
+A::A(int n) { v = n; }
+int A::g() { return v; }
+int f(void) { A a(5); return a.g(); }
+""", path="t.cpp")
+        self.assertIn("A_new(A *this, int n)", out)
