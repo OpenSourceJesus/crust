@@ -347,7 +347,11 @@ def _deduce(expr, ctx, where):
             base = re.sub(r"[*&\s]+$", "", rty).split("<")[0].strip()
             ret = methods.get(base, {}).get(meth)
             if ret:
-                return ret
+                # A method of a *template* returns the type as the template
+                # spells it. `map<int,int>::begin()` reads `pair<K,V> *` in
+                # the source, and taking that literally asked for a class
+                # called `pair_K_V`.
+                return _subst_tparams(ret, base, rty, tparams)
         raise AutoError(
             "%s: `auto` cannot deduce from `%s.%s(..)` -- the return type of "
             "`%s` is not written anywhere this pass can read. Write the type."
@@ -413,12 +417,24 @@ def _element_type(name, ctx):
     if not ret:
         return None
     ret = re.sub(r"\s*&\s*$", "", ret).strip()
+    return _subst_tparams(ret, base, ty, tparams).strip()
+
+
+def _subst_tparams(ret, base, spelled, tparams):
+    """Put an instantiation's arguments back into a template's own spelling.
+
+    `spelled` is how the receiver was declared -- `map<int, int>` -- and
+    `ret` is written in terms of the template's parameters, so `pair<K,V> *`
+    becomes `pair<int,int> *`.
+    """
     params = tparams.get(base) or []
-    if params and args:
-        actual = [a.strip() for a in _split_top(args)]
-        for pname, aval in zip(params, actual):
-            ret = re.sub(r"(?<![\w])%s(?![\w])" % re.escape(pname), aval, ret)
-    return ret.strip()
+    m = re.search(r"<(.*)>", spelled.strip())
+    if not params or m is None:
+        return ret
+    actual = [a.strip() for a in _split_top(m.group(1))]
+    for pname, aval in zip(params, actual):
+        ret = re.sub(r"(?<![\w])%s(?![\w])" % re.escape(pname), aval, ret)
+    return ret
 
 
 def _split_top(text):

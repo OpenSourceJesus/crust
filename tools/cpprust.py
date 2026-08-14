@@ -1129,6 +1129,55 @@ def _mangle(name):
     return re.sub(r"\W+", "_", name).strip("_")
 
 
+#: Scalar spellings that may also be taken by reference. A reference is a
+#: pointer the source did not have to spell, and that is as true of `int &`
+#: as of `T &` -- it only ever worked for classes because the lowering was
+#: driven by the class table. A `map<int, ..>` taking its key by reference is
+#: what turned that up: `const int &k` came out unlowered and unparsable.
+_SCALAR_TYPES = frozenset((
+    "unsigned long long", "signed long long", "unsigned long",
+    "unsigned char", "unsigned short", "unsigned int", "long long",
+    "long double", "signed char", "unsigned", "double", "float", "short",
+    "long", "char", "bool", "int", "size_t"))
+
+
+def _expand_cpp_ref(params, known):
+    """`__cpp_ref(T)` -> `T` for a scalar, `const T &` for a class.
+
+    A container cannot pick one spelling for both. By value it refuses an
+    owning key -- the copy is never constructed or destroyed -- and by
+    reference it cannot bind `m[3]`, since a literal has no address. So the
+    spelling is decided per instantiation, like the copy and destroy steps
+    beside it.
+    """
+    return _sub_code(
+        re.compile(r"(?<![\w.>])__cpp_ref\s*\(\s*([\w:]+)\s*\)"),
+        lambda mm: ("const %s &" % mm.group(1)
+                    if mm.group(1) in known else mm.group(1)),
+        params)
+
+
+def _scalar_ref_names(params):
+    """Names of parameters declared as a reference to a scalar."""
+    out = []
+    for part in _split_top(params or ""):
+        if "&" not in part:
+            continue
+        words = [w for w in part.replace("&", " & ").replace("*", " * ").split()
+                 if w != "const"]
+        if "*" in words or "&" not in words:
+            continue
+        amp = words.index("&")
+        base = " ".join(words[:amp])
+        if base in _SCALAR_TYPES and len(words) > amp + 1:
+            out.append(words[amp + 1])
+    return out
+
+
+def _with_scalars(names):
+    return set(names) | _SCALAR_TYPES
+
+
 def _type_alt(names):
     return "|".join(re.escape(n) for n in sorted(names, key=len, reverse=True))
 
@@ -1502,15 +1551,33 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
     emitting_outline = [False]
 
     def emit(kind, mname, params, raw):
-        refs = _ref_positions(params, names)
-        params = _lower_refs(params, names)
+        # `__cpp_ref(T)` in a parameter: `T` for a scalar, `const T &` for a
+        # class. A container cannot pick one spelling for both -- by value it
+        # refuses an owning key (the copy is never constructed or destroyed),
+        # and by reference it cannot bind `m[3]`, since a literal has no
+        # address. So the spelling is decided per instantiation, like the
+        # copy and destroy steps beside it.
+        params = _expand_cpp_ref(params, known)
+        refs = _ref_positions(params, _with_scalars(names))
+        # A *scalar* reference parameter needs its uses dereferenced. A class
+        # one does not: every use of it is a member access, and the symbol
+        # table already turns `o.x` into `o->x`. A bare `k` has no member to
+        # go through, so `int &k` lowered to `int *k` left the body comparing
+        # a value against a pointer.
+        scalar_refs = _scalar_ref_names(params)
+        params = _lower_refs(params, _with_scalars(names))
         # `this` is a pointer, exactly as an `impl` method's `self` is.
         arglist = "%s *this" % cname + (", " + params if params else "")
         # Members are emitted in declaration order, but a body may call a
         # method declared below it -- ordinary in a class, and an implicit
         # declaration in C. Prototype everything first.
         mprotos.append("%s %s %s(%s);" % (stor, kind, mname, arglist))
-        inner = _implicit_this(raw, mnames)
+        inner = raw
+        for rname in scalar_refs:
+            inner = _sub_code(
+                re.compile(r"(?<![\w.>&])%s(?![\w])" % re.escape(rname)),
+                "(*%s)" % rname, inner)
+        inner = _implicit_this(inner, mnames)
         # Bare member names inside a body refer to fields; qualify them.
         # Inherited ones go through `_base`, so the path is substituted
         # rather than the bare name -- `id` in a derived method is
@@ -1574,7 +1641,10 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
                     "rather than to a copy."
                     % (cls.name, iret.replace("&", "").strip() or "T"))
             info["index"] = {"fn": "%s__index" % cname,
-                             "ret": tsub(iret.replace("&", "").strip())}
+                             "ret": tsub(iret.replace("&", "").strip()),
+                             "refs": _ref_positions(
+                                 _expand_cpp_ref(params, known),
+                                 _with_scalars(names))}
             # The body returns the element; the lowered function returns
             # its address, which is what a reference is.
             ibody = _sub_code(
@@ -2628,7 +2698,8 @@ def _rewrite_calls(text, cinfo, free_refs):
     # ever sees what that one left behind.
     field_re = re.compile(
         r"(?<![\w.>])(\w+)((?:\s*(?:\.|->)\s*\w+)+)(?!\s*\()")
-    builtin_re = re.compile(r"(?<![\w.>])(__cpp_copy|__cpp_drop)\s*\(")
+    builtin_re = re.compile(
+        r"(?<![\w.>])(__cpp_copy|__cpp_drop|__cpp_eq)\s*\(")
     # `v[i]` / `a.b[i]` on a class that overloads subscript.
     index_re = re.compile(r"(?<![\w.>\]])(\w+)((?:\s*(?:\.|->)\s*\w+)*)\s*\[")
     # `p->x` where `p` is a *class* with `operator->`, and `*p` likewise. A
@@ -2855,11 +2926,37 @@ def _rewrite_calls(text, cinfo, free_refs):
                 raise CppError("unterminated `%s`" % m.group(1))
             parts = [p.strip() for p in _split_top(text[m.end():close])]
             kind, ty = m.group(1), (parts[0] if parts else "")
+            if kind == "__cpp_eq":
+                # Comparing two elements. Unlike copy and destroy this has to
+                # work for a scalar too -- a `map<int, ..>` compares its keys
+                # with `==` and a `map<string, ..>` cannot.
+                if ty not in cinfo:
+                    out.append("((%s) == (%s))" % (parts[1], parts[2]))
+                elif "equals" in cinfo[ty]["methods"]:
+                    # The second operand arrives as a reference, which is
+                    # already a pointer by now; the first is an lvalue.
+                    out.append("%s_equals(&(%s), %s)"
+                               % (ty, parts[1], parts[2]))
+                else:
+                    raise CppError(
+                        "`__cpp_eq(%s, ..)`: %s is a class with no `equals`, "
+                        "so two of them cannot be compared. Add "
+                        "`int equals(const %s &o)`." % (ty, ty, ty))
+                i = close + 1
+                continue
             if ty not in cinfo:
-                raise CppError(
-                    "`%s(%s, ..)`: %s is not a class. These are for element "
-                    "types with constructors; a scalar element needs no "
-                    "copy or destroy step." % (kind, ty, ty))
+                # A scalar element: copying one is an assignment and
+                # destroying one is nothing. The point of these builtins is
+                # that a container can say "copy an element" once and have it
+                # mean the right thing per instantiation, and a container
+                # keyed on `int` is as much an instantiation as one keyed on
+                # `string`.
+                if kind == "__cpp_drop":
+                    out.append("(void)0")
+                else:
+                    out.append("(%s) = (%s)" % (parts[1], parts[2]))
+                i = close + 1
+                continue
             if kind == "__cpp_drop":
                 out.append("%s(&%s)" % (_dropfn(cinfo[ty], ty), parts[1])
                            if cinfo[ty]["dtor"] else "(void)0")
@@ -2929,9 +3026,15 @@ def _rewrite_calls(text, cinfo, free_refs):
                     # `v[i]` is `*v.at(i)` in the lowered form: the operator
                     # yields the element's address, and the dereference
                     # keeps `v[i] = x` an lvalue.
+                    # A subscript operator may take its argument by
+                    # reference -- `map<string, ..>` has to, since a key
+                    # that owns something cannot be passed by value -- so
+                    # the call site addresses it like any other.
                     sub_expr = ("(*%s(%s, %s))"
                                 % (ent["fn"], _addr(expr, is_ptr),
-                                   text[ob + 1:cb].strip()))
+                                   fix_args(text[ob + 1:cb],
+                                            ent.get("refs") or set(),
+                                            scopes).strip()))
                     ecls, eptr = _ret_class(ent["ret"], cinfo)
                     sub_expr, i = follow(sub_expr, ecls, eptr, cb + 1,
                                          "operator[]", addressable=True)
@@ -3325,12 +3428,85 @@ public:
 """
 
 
+_STD_PAIR = """
+template<typename K, typename V>
+class pair {
+public:
+    K first;
+    V second;
+};
+"""
+
+
+# A `map` whose iterator is a *pointer*. That is the whole design: `it->first`,
+# `++it`, `it != m.end()` and `*it` are then plain C on a plain pointer, and
+# none of `operator++`, `operator!=` or an iterator class has to exist. It
+# costs a linear `find` -- the storage is an unsorted array -- which is the
+# honest trade for a container written in a subset with no comparison
+# operator to order keys by.
+_STD_MAP = """
+template<typename K, typename V>
+class map {
+    pair<K,V> *pd;
+    int pn;
+    int pcap;
+public:
+    map() { pd = 0; pn = 0; pcap = 0; }
+    ~map() { free(pd); }
+    int size() { return pn; }
+    int empty() { return pn == 0; }
+    void clear() { pn = 0; }
+    pair<K,V> *begin() { return pd; }
+    pair<K,V> *end() { return pd + pn; }
+    void reserve(int c) {
+        if (c > pcap) {
+            pair<K,V> *nd;
+            nd = (pair<K,V> *)realloc(pd, sizeof(pair<K,V>) * c);
+            if (nd) { pd = nd; pcap = c; }
+        }
+    }
+    pair<K,V> *find(__cpp_ref(K) k) {
+        int i;
+        i = 0;
+        while (i < pn) {
+            if (__cpp_eq(K, pd[i].first, k)) { return pd + i; }
+            i = i + 1;
+        }
+        return pd + pn;
+    }
+    int count(__cpp_ref(K) k) { if (find(k) == pd + pn) { return 0; } return 1; }
+    V &operator[](__cpp_ref(K) k) {
+        pair<K,V> *f;
+        f = find(k);
+        if (f == pd + pn) {
+            if (pn == pcap) { reserve(pcap ? pcap * 2 : 8); }
+            __cpp_copy(K, pd[pn].first, k);
+            pn = pn + 1;
+            f = pd + pn - 1;
+        }
+        return f->second;
+    }
+    void erase(__cpp_ref(K) k) {
+        pair<K,V> *f;
+        int i;
+        f = find(k);
+        if (f != pd + pn) {
+            i = (int)(f - pd);
+            while (i < pn - 1) { pd[i] = pd[i + 1]; i = i + 1; }
+            pn = pn - 1;
+        }
+    }
+};
+"""
+
+
 _STD_INCLUDE = re.compile(
-    r"^[ \t]*#\s*include\s*<(vector|string|memory)>[ \t]*\n?", re.M)
+    r"^[ \t]*#\s*include\s*<(vector|string|memory|map|utility)>[ \t]*\n?",
+    re.M)
 
 
 _STD_CLASSES = frozenset(("string", "vector", "ownvector",
-                          "unique_ptr", "shared_ptr"))
+                          "unique_ptr", "shared_ptr", "pair", "map"))
 
 
 def _std_prelude(text):
@@ -3345,8 +3521,14 @@ def _std_prelude(text):
     # asking for the header alone should not supply a template the file never
     # names, since an unused one would still be monomorphised.
     wanted.discard("memory")
+    wanted.discard("utility")
+    # `<map>` names the header; `map` is the class. A `map` also needs `pair`,
+    # which is its element type.
+    if "map" in wanted:
+        wanted.discard("map")
     probe = _blank_strings(_strip_comments(text))
-    for name in ("string", "vector", "ownvector", "unique_ptr", "shared_ptr"):
+    for name in ("string", "vector", "ownvector", "unique_ptr",
+                 "shared_ptr", "pair", "map"):
         if re.search(r"\bstd\s*::\s*%s\b" % name, probe):
             wanted.add(name)
     if not wanted:
@@ -3368,6 +3550,10 @@ def _std_prelude(text):
         parts.append(_STD_UNIQUE)
     if "shared_ptr" in wanted:
         parts.append(_STD_SHARED)
+    if "pair" in wanted or "map" in wanted:
+        parts.append(_STD_PAIR)
+    if "map" in wanted:
+        parts.append(_STD_MAP)
     return "".join(parts) + text
 
 
@@ -3963,6 +4149,20 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
                 "Use `ownvector<%s>`, which copy-constructs each element, "
                 "or `vector<%s *>` with `new`/`delete`."
                 % (os.path.basename(path), elem, elem, elem, elem))
+    # And the other way. `ownvector` copy-constructs and destroys each
+    # element, which a scalar has neither of; steering that to `vector` used
+    # to fall out of `__cpp_copy` refusing scalars, but the builtins have to
+    # accept them now -- `map<int, ..>` copies a scalar key -- so the
+    # guidance is stated where it belongs instead of inferred from a
+    # mechanism that no longer implies it.
+    for targs in wanted.get("ownvector", []):
+        elem = targs[0]
+        if elem not in cinfo:
+            raise CppError(
+                "%s: `ownvector<%s>` copy-constructs and destroys each "
+                "element, and %s has neither. Use `vector<%s>`, which stores "
+                "by assignment."
+                % (os.path.basename(path), elem, elem, elem))
 
     # After reference lowering, a class still spelled by value really is by
     # value -- a `T &` the author wrote is a `T *` by now.
