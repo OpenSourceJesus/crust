@@ -49,12 +49,30 @@ The subset, deliberately small:
     not `v[i]`, since `operator[]` is not available. `vector<T>` stores
     elements by assignment, so an element type with a destructor is refused
     rather than double-freed.
-  * non-capturing lambdas, which are exactly functions and lower to one --
-    `auto f = [](int y) -> int { .. };` becomes a function pointer, so the
-    call site needs no rewriting at all. A capturing lambda is refused: it
-    needs a field per capture, and the type of a captured local is not
-    something this pass can see. A return type must be spelled, because
-    nothing here can deduce one and defaulting to `int` would truncate.
+  * lambdas, in two shapes. A *non-capturing* lambda is exactly a function
+    and lowers to one -- `auto f = [](int y) -> int { .. };` becomes a
+    function pointer, so the call site needs no rewriting and the lambda can
+    be passed anywhere a callback goes.
+
+    A *capturing* lambda is inlined at each call site instead. A capture
+    would otherwise need the captured variable's type, to become a field of
+    a closure struct, and that type is an ordinary local this pass cannot
+    see -- but a body placed where the call is has those variables in scope
+    already, so nothing has to be named. `return` inside the body must leave
+    the lambda rather than the enclosing function, so the body goes inside
+    `do { } while (0)` and `return` becomes `break`: a structured jump the
+    destructor unwinding already understands, where a label and `goto` are
+    refused outright whenever anything is live. A by-value capture is a copy
+    taken where the lambda is written, so it becomes a snapshot local
+    declared there; its type is looked up from the declaration and the
+    capture is refused if that is missing or ambiguous, since guessing it
+    would silently truncate. `[=]` names nothing to look up and is refused.
+
+    Because it is inlined, a capturing lambda has no value to pass around,
+    cannot recurse, and cannot be called from a loop condition or a
+    short-circuit operand, where the body would not run exactly once. Each
+    of those is reported. A return type must be spelled in both shapes:
+    nothing here can deduce one, and defaulting to `int` would truncate.
   * `template<typename T>` on classes, monomorphised on use. Any number of
     parameters (`template<typename K, typename V>`), and a non-type integer
     parameter (`template<typename T, int N>`) works too, because
@@ -2492,6 +2510,54 @@ _LAMBDA = re.compile(r"\[([^\]]*)\]\s*\(([^()]*)\)\s*(?:->\s*([\w ]+(?:\s*\*)*)\
 _AUTO_LAMBDA = re.compile(r"(?<![\w.])auto\s+(\w+)\s*=\s*$")
 
 
+_CONTROL = frozenset(("if", "while", "for", "switch"))
+
+
+def _stmt_start(text, idx):
+    """`(start, None)` for the statement containing `idx`, or `(None, why)`.
+
+    An inlined lambda body is a block, and a block cannot sit inside an
+    expression, so the expansion is hoisted to just before the statement
+    that contains the call. That is only sound where the call is evaluated
+    exactly once and unconditionally: a loop condition re-evaluates it, and
+    an operand of `&&`, `||` or `?:` may not evaluate it at all.
+    """
+    depth, j = 0, idx - 1
+    while j >= 0:
+        c = text[j]
+        if c in ")]":
+            depth += 1
+        elif c in "([":
+            if depth == 0:
+                word = _prev_word(text, j)
+                if word in _CONTROL:
+                    return None, ("the controlling expression of `%s`" % word)
+                depth = 0        # an enclosing call's argument list
+            else:
+                depth -= 1
+        elif depth == 0 and c in ";{}":
+            seg = text[j + 1:idx]
+            for op in ("&&", "||", "?"):
+                if op in seg:
+                    return None, "an operand of `%s`" % op
+            return j + 1, None
+        j -= 1
+    return 0, None
+
+
+def _enclosing_end(text, pos):
+    """Index of the `}` closing the block that `pos` sits in."""
+    depth = 0
+    for k in range(pos, len(text)):
+        if text[k] == "{":
+            depth += 1
+        elif text[k] == "}":
+            if depth == 0:
+                return k
+            depth -= 1
+    return len(text)
+
+
 def _toplevel_start(text, idx):
     """Index where the top-level declaration containing `idx` begins.
 
@@ -2528,6 +2594,167 @@ def _param_types(params):
     return ", ".join(out) or "void"
 
 
+def _local_type(text, start, end, name):
+    """The declared type of local `name` between `start` and `end`, or None.
+
+    Used only for a by-value capture, which is a copy made where the lambda
+    is written and therefore needs a type to declare. The declaration is
+    looked up rather than guessed: if the name is declared more than once
+    with different types, or not found at all, this returns None and the
+    capture is refused. A wrong type here would silently truncate, which is
+    exactly the kind of guess the rest of this lowering does not make.
+    """
+    pat = re.compile(
+        r"(?<![\w.>])((?:const\s+)?[A-Za-z_]\w*(?:\s*\*)*)\s+%s\s*(?=[;,=)\[])"
+        % re.escape(name))
+    found = set()
+    for m in pat.finditer(text, start, end):
+        ty = " ".join(m.group(1).split())
+        if ty.split()[-1].strip("*") in ("return", "else", "case", "auto"):
+            continue
+        found.add(ty)
+    return found.pop() if len(found) == 1 else None
+
+
+def _inline_lambda(text, look, m, close, captures, params, ret, body, n,
+                   path):
+    """Expand one call of a by-reference capturing lambda, in place.
+
+    A capture needs the captured variable's *type* if it is to become a
+    field, and that type is an ordinary local this pass cannot see. Inlining
+    sidesteps the question entirely: put the body where the call is, and the
+    captured variables are simply in scope. Nothing has to be named.
+
+    A lambda `return` must leave the lambda, not the enclosing function, so
+    the body goes inside `do { } while (0)` and `return` becomes `break`.
+    That is a structured jump rather than a label, which matters here: the
+    destructor unwinding already understands `break` -- it walks out to the
+    enclosing loop frame dropping what is live -- whereas `goto` is refused
+    outright whenever anything is live, which is most RAII code.
+
+    One call site per invocation; the caller loops. Splicing invalidates
+    every index, and rescanning is cheaper to be sure of than an offset.
+    """
+    where = "%s:%d" % (os.path.basename(path),
+                       look.count("\n", 0, m.start()) + 1)
+    am = _AUTO_LAMBDA.search(look[:m.start()])
+    if am is None:
+        raise CppError(
+            "%s: a capturing lambda has to be bound to a name "
+            "(`auto f = [&](..) -> T { .. };`) -- it is inlined at its call "
+            "sites, so there has to be a name to find them by." % where)
+    semi = look.find(";", close)
+    if semi < 0:
+        raise CppError("%s: lambda declaration without a `;`" % where)
+    name = am.group(1)
+
+    # A by-value capture is a copy taken where the lambda is written, so it
+    # becomes a snapshot local declared there and the body reads that
+    # instead. Its type is looked up from the declaration; `[=]` is refused
+    # because it names nothing to look up.
+    fn_start = _toplevel_start(look, am.start())
+    fn_end = _enclosing_end(look, semi + 1)
+    snaps = []
+    for cap in captures.split(","):
+        cap = cap.strip()
+        if not cap or cap.startswith("&"):
+            continue
+        if cap == "=":
+            raise CppError(
+                "%s: `[=]` captures everything by value, and a by-value "
+                "capture has to be declared, which means naming it. List the "
+                "variables (`[x, y]`), or capture by reference (`[&]`)."
+                % where)
+        if not re.match(r"^\w+$", cap):
+            raise CppError("%s: cannot parse capture `%s`" % (where, cap))
+        ty = _local_type(look, fn_start, fn_end, cap)
+        if ty is None:
+            raise CppError(
+                "%s: `%s` is captured by value, but its declaration is not "
+                "findable here (or is ambiguous), and a copy has to be "
+                "declared with a type. Capture it by reference (`[&%s]`), or "
+                "pass it as a parameter." % (where, cap, cap))
+        snap = "_cpp_cap_%s_%s" % (name, cap)
+        snaps.append((cap, snap, ty))
+
+    body = _sub_code(
+        re.compile(r"(?<![\w.>])(%s)(?![\w])"
+                   % "|".join(re.escape(c) for c, _s, _t in snaps)),
+        lambda mm: dict((c, s) for c, s, _t in snaps)[mm.group(1)],
+        body) if snaps else body
+
+    probe = _blank_strings(_strip_comments(body))
+    if re.search(r"(?<![\w.>])%s\s*\(" % re.escape(name), probe):
+        raise CppError(
+            "%s: `%s` calls itself; an inlined lambda cannot recurse."
+            % (where, name))
+    if re.search(r"(?<![\w.>])return\b", probe) and \
+            re.search(r"(?<![\w.>])(while|for|switch|do)\b", probe):
+        raise CppError(
+            "%s: `%s` returns from inside a loop or switch. The body is "
+            "inlined and `return` becomes `break`, which would leave only "
+            "that loop. Move the body into a function." % (where, name))
+
+    region_end = _enclosing_end(look, semi + 1)
+    call = re.compile(r"(?<![\w.>])%s\s*\(" % re.escape(name))
+    hit = call.search(look, semi + 1, region_end)
+    if hit is None:
+        # Every call has been expanded. The declaration has no meaning in C,
+        # but the by-value snapshots it stood for do -- they are the copies
+        # taken at this point, and the expansions read them.
+        rest = look[semi + 1:region_end]
+        if re.search(r"(?<![\w.>])%s(?![\w])" % re.escape(name), rest):
+            raise CppError(
+                "%s: `%s` is used as a value. A capturing lambda is inlined "
+                "at its call sites, so it has no representation to pass "
+                "around -- use a non-capturing lambda for a callback."
+                % (where, name))
+        keep = " ".join("%s %s = %s;" % (ty, snap, cap)
+                        for cap, snap, ty in snaps)
+        return text[:am.start()] + keep + text[semi + 1:], n
+
+    op = hit.end() - 1
+    cclose = _match_paren(look, op)
+    if cclose is None:
+        raise CppError("%s: unterminated call to `%s`" % (where, name))
+    start, why = _stmt_start(look, hit.start())
+    if start is None:
+        raise CppError(
+            "%s: `%s` is called from %s. The body is inlined before the "
+            "statement, which is only sound where the call runs exactly "
+            "once -- assign it to a local first." % (where, name, why))
+
+    args = [a.strip() for a in _split_top(text[op + 1:cclose])]
+    decls = []
+    for idx, p in enumerate(_split_top(params)):
+        p = p.strip()
+        if not p or p == "void":
+            continue
+        if idx >= len(args) or not args[idx]:
+            raise CppError("%s: `%s` called with too few arguments"
+                           % (where, name))
+        # The parameter list carries its own types, so the arguments need no
+        # inference -- unlike the captures.
+        decls.append("%s = %s;" % (p, args[idx]))
+
+    uid = "_cpp_lam%d" % n
+    res = "%s_r" % uid
+    inner = _sub_code(re.compile(r"(?<![\w.>])return\s*;"), "break;", body)
+    if ret != "void":
+        inner = _sub_code(
+            re.compile(r"(?<![\w.>])return\s+([^;]+);"),
+            lambda mm: "{ %s = %s; break; }" % (res, mm.group(1).strip()),
+            inner)
+        head = "%s %s; " % (ret, res)
+        repl = res
+    else:
+        head = ""
+        repl = "(void)0"
+    block = "%sdo { %s%s } while (0); " % (head, " ".join(decls), inner)
+    return (text[:start] + block + text[start:hit.start()] + repl +
+            text[cclose + 1:]), n + 1
+
+
 def _lower_lambdas(text, path):
     """`[](int y) -> int { .. }` becomes a static function.
 
@@ -2552,20 +2779,16 @@ def _lower_lambdas(text, path):
         if m is None:
             return text
         captures = m.group(1).strip()
-        if captures:
-            line = look.count("\n", 0, m.start()) + 1
-            raise CppError(
-                "%s:%d: a capturing lambda (`[%s]`) is not in the C++ "
-                "subset -- it needs a field per capture, and the type of a "
-                "captured local is not something this pass can see. Pass the "
-                "values as parameters, or use a class with a method."
-                % (os.path.basename(path), line, captures))
         close = _match_brace(look, look.index("{", m.end() - 1))
         if close is None:
             raise CppError("unterminated lambda body")
         params = m.group(2).strip()
         ret = (m.group(3) or "void").strip()
         body = text[m.end():close]
+        if captures:
+            text, n = _inline_lambda(text, look, m, close, captures, params,
+                                     ret, body, n, path)
+            continue
         name = "_cpp_lambda%d" % n
         n += 1
         fn = "\nstatic %s %s(%s) {%s}\n" % (ret, name, params or "void",
