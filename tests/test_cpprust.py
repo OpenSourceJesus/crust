@@ -830,6 +830,126 @@ public:
 """
 
 
+_HIER = """
+class Base {
+public:
+    int id;
+    Base() { id = 1; }
+    virtual ~Base() { id = 0; }
+    virtual int area() { return 1; }
+};
+class Derived : public Base {
+public:
+    int w;
+    Derived() { w = 2; }
+    ~Derived() { w = 0; }
+    int area() { return 2; }
+};
+"""
+
+
+class TestCppVirtualDtor(unittest.TestCase):
+    """A destructor is a vtable slot like any other virtual."""
+
+    def test_destructor_gets_a_slot(self):
+        out = cpprust.translate(_HIER + "void f(void) { Base b; }")
+        self.assertIn("void (*__dtor)(Base *this);", out)
+
+    def test_derived_table_keeps_the_slot_layout(self):
+        out = cpprust.translate(_HIER + "void f(void) { Derived d; }")
+        # Same slots, same order, same `this` type as the base's table --
+        # that is what lets a `Base *` dispatch through a derived table.
+        self.assertIn("struct Base_vtable { int (*area)(Base *this); "
+                      "void (*__dtor)(Base *this); };", out)
+        self.assertIn("struct Derived_vtable { int (*area)(Base *this); "
+                      "void (*__dtor)(Base *this); };", out)
+
+    def test_override_goes_through_a_thunk_that_converts_this(self):
+        out = cpprust.translate(_HIER + "void f(void) { Derived d; }")
+        self.assertIn("static void Derived__thunk___dtor(Base *this) "
+                      "{ Derived_drop((Derived *)this); }", out)
+
+    def test_slot_implementation_is_drop_not_the_slot_name(self):
+        out = cpprust.translate(_HIER + "void f(void) { Base b; }")
+        self.assertIn("&Base_drop", out)
+        self.assertNotIn("Base___dtor", out)
+
+    def test_derived_without_the_keyword_still_overrides(self):
+        # `~Derived()` is not marked `virtual`; it overrides anyway.
+        out = cpprust.translate(_HIER + "void f(void) { Derived d; }")
+        self.assertIn("Derived__thunk___dtor", out)
+
+    def test_implicit_derived_destructor_fills_the_slot(self):
+        out = cpprust.translate("""
+class B { public: int v; B() { v = 0; } virtual ~B() { v = 1; } };
+class D : public B { public: int w; D() { w = 0; } };
+void f(void) { D d; }
+""")
+        # D declares no destructor, but its epilogue has to chain to B's, so
+        # it has one -- and the slot points at it.
+        self.assertIn("static void D_drop(D *this)", out)
+        self.assertIn("D__thunk___dtor", out)
+
+    def test_destructor_slot_is_not_callable_as_a_method(self):
+        out = cpprust.translate(_HIER + "void f(Base *b) { delete b; }")
+        self.assertNotIn("Base___dtor(", out)
+
+    def test_by_value_local_still_drops_statically(self):
+        # The static type is known, so no dispatch is needed.
+        out = cpprust.translate(_HIER + "void f(void) { Derived d; }")
+        self.assertIn("Derived_drop(&d);", out)
+
+
+class TestCppInheritedFields(unittest.TestCase):
+    """A base field lives inside `_base`, not at the derived class's top.
+
+    Both of these emitted C that did not compile: an unqualified name in a
+    derived method, and a direct `.id` on a derived object.
+    """
+
+    def test_inherited_field_in_a_derived_method(self):
+        out = cpprust.translate("""
+class Base { public: int id; Base() { id = 1; } };
+class Derived : public Base {
+public:
+    int w;
+    Derived() { w = 2; }
+    int show() { return id + w; }
+};
+""")
+        self.assertIn("return this->_base.id + this->w;", out)
+
+    def test_inherited_field_through_a_pointer(self):
+        out = cpprust.translate("""
+class Base { public: int id; Base() { id = 1; } };
+class Derived : public Base { public: int w; Derived() { w = 2; } };
+int g(Derived *d) { return d->id; }
+""")
+        self.assertIn("return d->_base.id;", out)
+
+    def test_field_two_levels_up(self):
+        out = cpprust.translate("""
+class A { public: int a; A() { a = 1; } };
+class B : public A { public: int b; B() { b = 2; } };
+class C : public B { public: int c; C() { c = 3; } int all() { return a + b + c; } };
+""")
+        self.assertIn("this->_base._base.a", out)
+        self.assertIn("this->_base.b", out)
+
+    def test_own_field_shadows_an_inherited_one(self):
+        out = cpprust.translate("""
+class Base { public: int v; Base() { v = 1; } };
+class Derived : public Base {
+public:
+    int v;
+    Derived() { v = 2; }
+    int get() { return v; }
+};
+""")
+        self.assertIn("return this->v;", out)
+        self.assertNotIn("return this->_base.v;", out)
+
+
 class TestCppNewDelete(unittest.TestCase):
     """`new` lowers to a helper, `delete` lowers in place.
 
@@ -974,19 +1094,40 @@ void f(void) { Shape *s = new Shape(); }
 """)
         self.assertIn("pure virtual", cm.exception.message)
 
-    def test_delete_through_a_virtual_destructor_is_error(self):
-        """The vtable carries methods only, so a `_drop` cannot dispatch.
+    def test_delete_dispatches_through_a_virtual_destructor(self):
+        """`delete base_ptr` has to reach the derived destructor.
 
-        Deleting through a base pointer would run the base destructor and
-        leave the derived part untouched -- the exact bug `virtual ~T()` is
-        written to prevent -- so it is reported rather than mistranslated.
+        The destructor occupies a vtable slot like any other virtual, so a
+        base pointer dispatches to the most derived one. Without this, the
+        base destructor ran and the derived part leaked -- the exact bug
+        `virtual ~T()` is written to prevent.
         """
-        with self.assertRaises(cpprust.CppError) as cm:
-            cpprust.translate("""
-class B { public: int v; B() { v = 0; } virtual ~B() { v = 1; } };
-void f(B *b) { delete b; }
+        out = cpprust.translate(_HIER + "void f(Base *b) { delete b; }")
+        self.assertIn("->_vptr)->__dtor(b);", out)
+        self.assertIn("free(b);", out)
+
+    def test_new_derived_upcasts_to_a_base_pointer(self):
+        # C does not convert `Derived *` to `Base *` on its own; the base is
+        # the first member, so the cast is address-preserving.
+        out = cpprust.translate(_HIER + "void f(void) { Base *b = new Derived(); }")
+        self.assertIn("Base *b = (Base *)Derived__alloc();", out)
+
+    def test_new_of_the_same_class_is_not_cast(self):
+        out = cpprust.translate(_HIER + "void f(void) { Base *b = new Base(); }")
+        self.assertIn("Base *b = Base__alloc();", out)
+
+    def test_upcast_on_a_later_assignment(self):
+        out = cpprust.translate(_HIER + "void f(void) { Base *b; b = new Derived(); }")
+        self.assertIn("b = (Base *)Derived__alloc();", out)
+
+    def test_unrelated_class_is_not_cast(self):
+        # Only a proven ancestor is cast to; anything else stays a real
+        # mismatch for the C compiler to report.
+        out = cpprust.translate(_HIER + """
+class Other { public: int z; Other() { z = 0; } };
+void f(void) { Other *o = new Derived(); }
 """)
-        self.assertIn("virtual destructor", cm.exception.message)
+        self.assertIn("Other *o = Derived__alloc();", out)
 
     def test_delete_of_an_untyped_expression_is_error(self):
         with self.assertRaises(cpprust.CppError) as cm:
