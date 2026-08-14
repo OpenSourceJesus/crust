@@ -398,7 +398,9 @@ def _check_unsupported(scan, path):
         # reads types by how they are written. Spelled out rather than
         # lumped in with `operator<`, which really is just missing.
         spelled = m.group(1)
-        if re.match(r"^[A-Za-z_]\w*$", spelled) and spelled not in _KEYWORDS:
+        # A conversion operator names a *type*, which may start with `const`.
+        if re.match(r"^[A-Za-z_]\w*$", spelled) \
+                and (spelled == "const" or spelled not in _KEYWORDS):
             # A conversion operator is *declarable*: it lowers to an ordinary
             # method. What is limited is where the call can be inserted, and
             # that is reported at the use rather than here -- litehtml has
@@ -431,7 +433,7 @@ def _check_unsupported(scan, path):
 
 class Member(object):
     __slots__ = ("kind", "ret", "name", "params", "body", "line", "dim",
-                 "init", "virt", "pure", "outline")
+                 "init", "virt", "pure", "outline", "definit")
 
     def __init__(self, kind, ret, name, params, body, line, dim="",
                  init=None, virt=False, pure=False):
@@ -449,6 +451,10 @@ class Member(object):
         # where the author wrote it rather than at the class, so a body that
         # reads a file-scope name declared between the two still sees it.
         self.outline = False
+        # A C++11 default member initializer: `int x = 5;` or `int x {5};`.
+        # C has no such thing on a struct member, so it becomes an assignment
+        # at the top of every constructor -- which is what it means.
+        self.definit = None
 
 
 class Class(object):
@@ -496,6 +502,11 @@ def _pure_virtual(decl, cname, line0):
         raise CppError("cannot parse virtual member %r in class %s"
                        % (decl, cname))
     tail = body[cp + 1:].strip()
+    # A trailing `const` sits between the parameter list and the `= 0`, and
+    # it says the same thing here as anywhere else: nothing this lowering
+    # needs to model.
+    tail = re.sub(r"^(?:const|override|final|noexcept)\b\s*", "", tail)
+    tail = re.sub(r"^(?:const|override|final|noexcept)\b\s*", "", tail)
     if not re.match(r"^=\s*0$", tail):
         raise CppError(
             "class %s: `%s` is a virtual declaration without a body; the "
@@ -514,7 +525,13 @@ def _pure_virtual(decl, cname, line0):
 
 
 def _drop_trailing_const(head):
-    """Remove a `const` that qualifies the member function itself."""
+    """Remove the qualifiers that follow a member function's parameters.
+
+    `const` says what the body may do; `override` and `final` say what the
+    class hierarchy may do. All three are checked by the language rather than
+    lowered, and the C front end checks the body regardless -- so what is
+    left after the parameter list is dropped.
+    """
     op = head.find("(")
     if op < 0:
         return head
@@ -522,8 +539,29 @@ def _drop_trailing_const(head):
     if cp is None:
         return head
     tail = head[cp + 1:]
-    new_tail = re.sub(r"(?<![\w])const(?![\w])", "", tail, count=1)
+    new_tail = re.sub(r"(?<![\w])(?:const|override|final|noexcept)(?![\w])",
+                      "", tail)
     return head[:cp + 1] + new_tail
+
+
+def _top_level_eq(decl):
+    """Index of an `=` that starts an initializer, or -1.
+
+    Not one inside brackets -- a default template argument or an array
+    dimension can hold one -- and not `==`.
+    """
+    depth = 0
+    for k, c in enumerate(decl):
+        if c in "([{<":
+            depth += 1
+        elif c in ")]}>":
+            depth -= 1
+        elif c == "=" and depth == 0:
+            if decl[k + 1:k + 2] == "=" or decl[k - 1:k] in ("=", "!", "<",
+                                                             ">"):
+                continue
+            return k
+    return -1
 
 
 def _has_param_list(decl):
@@ -570,6 +608,11 @@ def _split_members(body, cname, line0):
             # no body; the body is attached once the out-of-line definitions
             # have been read.
             if not _has_param_list(decl):
+                definit = None
+                eq = _top_level_eq(decl)
+                if eq >= 0:
+                    definit = decl[eq + 1:].strip()
+                    decl = decl[:eq].strip()
                 parts = decl.replace("*", " * ").split()
                 if len(parts) < 2:
                     raise CppError("cannot parse member %r in class %s"
@@ -581,8 +624,10 @@ def _split_members(body, cname, line0):
                 b = fname.find("[")
                 if b >= 0:
                     fname, dim = fname[:b], fname[b:]
-                members.append(Member("field", " ".join(parts[:-1]), fname,
-                                      None, None, line0, dim))
+                fm = Member("field", " ".join(parts[:-1]), fname,
+                            None, None, line0, dim)
+                fm.definit = definit
+                members.append(fm)
                 continue
             head, inner = decl, None
         else:
@@ -603,11 +648,40 @@ def _split_members(body, cname, line0):
         # `explicit` constrains implicit conversion, which this lowering does
         # not perform in the first place: every construction is written out.
         head = re.sub(r"(?<![\w])explicit(?![\w])\s*", "", head)
+        # `final` says a class may not be derived from, and nothing here
+        # derives from anything it is not told about.
+        head = re.sub(r"(?<![\w])final(?![\w])\s*", "", head)
         # An anonymous `union { .. };` (or `struct { .. };`) member. C has
         # them and ShivyCX lowers them, so this is a matter of carrying the
         # group through and registering the names inside it -- a body writing
         # `m_value` means `this->m_value` exactly as it would for a plain
         # field, and the qualification pass has to know that.
+        # `T name { .. };` -- a default member initializer written with
+        # braces. It reaches here because the `{` comes before the `;`, but
+        # it is a field, not a method: there is no parameter list.
+        bm = (re.match(r"^([A-Za-z_][\w:<>,\s*&]*?)\s*(\w+)$", head)
+              if inner is not None and "(" not in head
+              and not re.match(r"^(union|struct)\s*\w*$", head) else None)
+        if bm:
+            j = close + 1
+            while j < n and body[j] in " \t\r\n":
+                j += 1
+            if j < n and body[j] == ";":
+                i = j + 1
+            fname, dim = bm.group(2), ""
+            b = fname.find("[")
+            if b >= 0:
+                fname, dim = fname[:b], fname[b:]
+            fm = Member("field", bm.group(1).strip(), fname, None, None,
+                        line0, dim)
+            # `""` rather than `None`: `T x {};` is value-initialisation,
+            # which is a request, and telling it from "no initializer at
+            # all" is the difference between zeroing the member and leaving
+            # it alone.
+            fm.definit = inner.strip()
+            members.append(fm)
+            continue
+
         anon = (re.match(r"^(union|struct)\s*(\w*)$", head)
                 if inner is not None else None)
         if anon:
@@ -669,9 +743,13 @@ def _split_members(body, cname, line0):
             bits = sig[:sig.index("operator")].strip()
             members.append(Member("star", bits, "operator*", params,
                                   inner, line0))
-        elif re.match(r"^operator\s+[A-Za-z_][\w:]*$", sig) and not params:
+        elif re.match(r"^operator\s+(?:const\s+)?[A-Za-z_][\w:]*"
+                      r"\s*[*&]*$", sig) and not params:
             # `operator T()`. The lowered form is an ordinary method that
             # returns `T`; only the *implicit* application is limited.
+            # `operator const T &()` returns a reference, and a reference is
+            # a pointer by the time this lowers -- so the `&` is kept and the
+            # normal reference handling applies.
             members.append(Member("conv", sig.split(None, 1)[1].strip(),
                                   "operator conv", params, inner, line0))
         elif re.search(r"\boperator\s*(==|!=|<=|>=|<|>)$", sig):
@@ -1641,6 +1719,22 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
                     % (root, root, cname))
         pro += _member_prologue(cname, value_members, initmap, known,
                                 fieldset, cls.line)
+        # C++11 default member initializers. C has no such thing on a struct
+        # member, so each becomes an assignment at the top of every
+        # constructor -- which is what it means. An explicit entry in this
+        # constructor's initializer list wins, exactly as in C++.
+        for f in fields:
+            if f.definit is None or f.name in initmap:
+                continue
+            expr = sub(f.definit).strip()
+            if not expr:
+                # `T x {};` is value-initialisation. A class member is
+                # already default-constructed by the member prologue above;
+                # a scalar one is zeroed here.
+                if any(f.name == vn for vn, _c in value_members):
+                    continue
+                expr = "0"
+            pro += " this->%s = %s;" % (f.name, expr)
         return pro
 
     prologue = make_prologue(ctor)
@@ -4151,6 +4245,16 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
             text, os.path.basename(path), blank=cpp_auto._blank_like(text))
         # Namespaces next: they rename the types the passes below read.
         text = cpp_auto.resolve_namespaces(
+            text, os.path.basename(path), blank=cpp_auto._blank_like(text))
+        # `final` on a class says it may not be derived from, and nothing
+        # here derives from anything it is not told about. Stripped before
+        # the class scans rather than inside each of them.
+        text = _sub_code(
+            re.compile(r"(?<![\w])(class|struct)\s+(\w+)\s+final(?![\w])"),
+            lambda mm: "%s %s" % (mm.group(1), mm.group(2)), text)
+        # Nested classes after namespaces (so the enclosing name is already
+        # flattened) and before everything that reads a class.
+        text = cpp_auto.resolve_nested_classes(
             text, os.path.basename(path), blank=cpp_auto._blank_like(text))
         # Type aliases after namespaces, because a namespace-scope one is at
         # depth zero only once the braces are gone -- and before everything

@@ -1018,3 +1018,97 @@ def resolve_aliases(text, path="<cpp>", blank=None):
         if not changed:
             break
     return text
+
+
+# --------------------------------------------------------------------------
+# Nested classes
+# --------------------------------------------------------------------------
+
+_CLASS_HEAD = re.compile(
+    r"(?<![\w.])(class|struct)\s+(\w+)(?:\s+final)?\s*(?::[^{;]*)?\{")
+
+
+def resolve_nested_classes(text, path="<cpp>", blank=None):
+    """Hoist `class Outer { struct Inner { .. }; }` to a top-level class.
+
+    The same thing namespaces get, and for the same reason: C has one flat
+    namespace of struct tags, so a name scoped to a class has to become an
+    unqualified one. `Outer::Inner` and a bare `Inner` written inside `Outer`
+    both become `Outer_Inner`.
+
+    Hoisted *before* the enclosing class rather than after: the outer class
+    may hold one by value, and a by-value member needs its type complete
+    above it.
+
+    Innermost first, so `A { B { C { } } }` gives `A_B_C` and the enclosing
+    rewrites see a body with no nesting left in it.
+    """
+    scan = blank if blank is not None else text
+    for _round in range(32):
+        found = None
+        for m in _CLASS_HEAD.finditer(scan):
+            open_idx = scan.index("{", m.start())
+            close = _match(scan, open_idx, "{", "}")
+            if close is None:
+                continue
+            body = scan[open_idx + 1:close]
+            inner = _CLASS_HEAD.search(body)
+            if inner is None:
+                continue
+            # Innermost: if this nested one itself nests, do that one first.
+            i_open = open_idx + 1 + body.index("{", inner.start())
+            i_close = _match(scan, i_open, "{", "}")
+            if i_close is None:
+                continue
+            if _CLASS_HEAD.search(scan[i_open + 1:i_close]):
+                continue
+            found = (m, open_idx, close, inner, i_open, i_close)
+            break
+        if found is None:
+            return text
+        m, open_idx, close, inner, i_open, i_close = found
+        outer, iname = m.group(2), inner.group(2)
+        new_name = "%s_%s" % (outer, iname)
+
+        # The nested declaration runs to the `;` after its closing brace.
+        end = i_close + 1
+        while end < len(scan) and scan[end] in " \t\r\n":
+            end += 1
+        if end < len(scan) and scan[end] == ";":
+            end += 1
+        i_start = open_idx + 1 + inner.start()
+        decl = text[i_start:end]
+        decl = _sub_name(decl, _blank_like(decl), iname, new_name)
+
+        # Remove it from the body, then rename what is left to point at it.
+        rest = text[:i_start] + text[end:]
+        rest_scan = _blank_like(rest)
+        rest = _sub_qualified_class(rest, rest_scan, outer, iname, new_name)
+        rest_scan = _blank_like(rest)
+        # A bare `Inner` inside `Outer` means `Outer::Inner`. The outer body
+        # has shrunk by what was cut, so its span is recomputed.
+        om = _CLASS_HEAD.search(rest_scan, max(0, m.start() - 1))
+        if om is not None:
+            o_open = rest_scan.index("{", om.start())
+            o_close = _match(rest_scan, o_open, "{", "}")
+            if o_close is not None:
+                obody = rest[o_open + 1:o_close]
+                obody = _sub_name(obody, _blank_like(obody), iname, new_name)
+                rest = rest[:o_open + 1] + obody + rest[o_close:]
+        # Hoist above the enclosing class.
+        at = rest.rfind("\n", 0, m.start()) + 1
+        text = rest[:at] + decl.strip() + "\n" + rest[at:]
+        scan = _blank_like(text)
+    raise AutoError("%s: classes nested more than 32 deep" % path)
+
+
+def _sub_qualified_class(text, scan, outer, iname, new_name):
+    """`Outer::Inner` -> `Outer_Inner`."""
+    out, last = [], 0
+    for m in re.finditer(r"(?<![\w.])%s\s*::\s*%s(?![\w])"
+                         % (re.escape(outer), re.escape(iname)), scan):
+        out.append(text[last:m.start()])
+        out.append(new_name)
+        last = m.end()
+    out.append(text[last:])
+    return "".join(out)
