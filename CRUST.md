@@ -1321,6 +1321,58 @@ two languages genuinely disagree here, and matching each to its own source
 language is more honest than picking one and being wrong in the other: the
 symbol is shared, the order is not.
 
+### Moves, and the double free underneath
+
+Passing an owning value to a function **by value is a move**, as it is in
+Rust. It used not to be, and that was not a leak but a real double free: a
+by-value owning parameter is dropped when the callee returns, and the caller
+dropped the same object again at its own scope exit. Both freed one buffer.
+
+```rust
+fn take(v: Vec<i32>) -> usize { v.len() }
+let mut a: Vec<i32> = Vec::<i32>::new();
+a.push(1);
+let n: usize = take(a);          // free(): double free detected
+```
+
+This hit the bundled `Vec`/`String`/`Box` as much as a user `Drop` type, and
+had done for as long as by-value owning parameters were dropped at all.
+
+The move is emitted as a spill and a zero *before* the call — the callee
+needs the value, so the source cannot be cleared until a copy of it exists:
+
+```c
+Vec_int _crust_opt1 = a; memset(&a, 0, sizeof(a)); unsigned long n = take(_crust_opt1);
+```
+
+Zeroing rather than unregistering is what keeps this right on every path.
+`if c { take(v); }` leaves the caller's drop emitted, where it frees on the
+path that did not move and is a no-op on the path that did. Unregistering
+would be the same per-path mistake the unwinding used to make.
+
+Two limits worth naming. A later **use** of a moved-from local reads zeros
+rather than being rejected — Crust has no borrow checker, so the use Rust
+would refuse compiles here. And a moved-from local still has its destructor
+*called*, on a zeroed value: invisible for the core types, whose free is
+idempotent, but a user `Drop` body runs and sees a zeroed `self`. A `Drop`
+body should therefore tolerate a zeroed `self`. This is the same divergence
+`let b = a` already had.
+
+### Copying an owning type
+
+`#[derive(Copy)]` and `#[derive(Clone)]` are **refused** on a type that owns
+something. A derived `clone` here is `return *self` — a bitwise copy — so
+both objects would own one buffer and both destructors would run on it. This
+is the Rule of Three in Rust's spelling, and it is the same refusal
+`tools/cpprust.py` makes for a C++ class with a destructor and no copy
+constructor.
+
+Rust forbids `Copy` on a `Drop` type outright, and its derived `Clone` clones
+each field rather than copying the representation. This lowering can do
+neither, so it says so rather than emitting a copy that is quietly wrong.
+Write `impl Clone` and copy the owned parts explicitly, or pass `&T`. A
+struct that owns nothing derives exactly as before.
+
 **Refused:** `return` inside a `fn drop` that owes its fields a free. The
 glue is appended after the body, so a `return` would jump over it and leak
 exactly the fields the destructor exists to release.
@@ -1540,8 +1592,12 @@ subset** rather than trusted on its own.)
 - `examples/crust/histogram.py` and `examples/crust/polyglot.c` — C, Rust and
   rpython in one translation unit, each calling the other two.
 - `examples/crust/owned.cpp` and `examples/crust/raii.c` — C++ destructors as
-  an RAII guard over a Crust `Vec<i32>` (`#include "owned.cpp"` →
+  an RAII guard *borrowing* a Crust `Vec<i32>` (`#include "owned.cpp"` →
   `tools/cpprust.py`), alongside native Rust scope-exit Drop.
+- `examples/crust/ownmember.cpp` and `examples/crust/ownmember.c` — the
+  *owning* shape: a C++ class holding a `Vec_int` and a Rust `impl Drop` type
+  by value, with no destructor written, plus transitive Rust field glue and an
+  owning value moved across a call boundary.
 - `examples/crust/tail.rs` — includes a `Box` freed by scope-exit Drop with
   no explicit `free_box`.
 - `examples/crust/dispatch.cpp` and `examples/crust/dispatch.c` — C++ single

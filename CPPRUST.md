@@ -60,6 +60,55 @@ declaration order**, because that is C++'s rule; Crust's field glue frees in
 and each side follows its own source language rather than one being made to
 match the other. The symbol is shared; the order is not.
 
+### Owning a Crust value, not just pointing at one
+
+The destructor above was written by hand. It need not be. Crust publishes the
+types it lowered that own something, and the preprocessor passes them on the
+command line:
+
+```sh
+python3 tools/cpprust.py t.cpp -o t.c --owning Vec_int:Vec_int_free_buf,Res:Res_drop
+```
+
+This module runs as a subprocess and cannot see the unit being compiled, so
+it has to be told; the protocol stays one file and one exit status, and this
+is only how the caller names the foreign types that own something. Each name
+maps to the function that destroys one — `T_drop` for a user `impl Drop`, but
+a bundled container keeps its own spelling (`Vec_int_free_buf`), so it is
+recorded rather than assumed.
+
+A member of such a type is then destroyed with its container like any other,
+which means a class can own Crust values and declare no destructor at all:
+
+```cpp
+class Tally {
+public:
+    Vec_int samples;                  /* a Crust `Vec<i32>` */
+    Res mark;                         /* a Crust `impl Drop` type */
+    void add(int v) { Vec_int_push(&samples, v); }
+};
+```
+
+```c
+static void Tally_drop(Tally *this) { Res_drop(&this->mark);
+                                      Vec_int_free_buf(&this->samples); }
+```
+
+It also means the **copy rules apply**. A class owning a Crust value has a
+destructor, so copying it without a copy constructor is refused for exactly
+the reason any other owning class is:
+
+```
+`Tally b(a)`: Tally has a destructor but no copy constructor, so copying it
+would leave two objects owning one resource and destroy it twice. Add
+`Tally(const Tally &o)`, or pass by reference (`Tally &`).
+```
+
+Without the mapping nothing changes: the member is plain data and the class
+is left exactly as it was, so a `.cpp` that manages the lifetime itself is
+unaffected. `examples/crust/ownmember.cpp` is the owning shape;
+`examples/crust/owned.cpp` remains the borrowing one.
+
 ## The guiding rule
 
 **Anything the lowering cannot do correctly is reported, not approximated.**
