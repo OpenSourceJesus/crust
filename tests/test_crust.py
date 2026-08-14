@@ -4078,3 +4078,311 @@ fn f(n: i32) -> i32 {
 fn pick(n: i32) -> i32 { if n == 0 { 1 } else if n == 1 { 42 } else { 3 } }
 fn main() -> i32 { pick(1) }
 """, suffix=".rs"), 42)
+
+
+class TestCrustScopeExitPaths(unittest.TestCase):
+    """Drops on *every* exit path, not just the textually last one.
+
+    `emit_drops` used to clear the live set as it emitted, which recorded a
+    per-path fact as global state: a conditional exit consumed the list and
+    every later fall-through emitted nothing. Each test here fails against
+    the unfixed compiler -- by leaking, which exits 0 and prints the right
+    answer, so only a balance count catches it.
+    """
+
+    #: A type that counts its own construction and destruction, so a missing
+    #: drop is a number rather than a leak nothing observes.
+    COUNTED = """
+static mut MADE: i32 = 0;
+static mut GONE: i32 = 0;
+
+struct R { id: i32 }
+
+impl R {
+    fn make(id: i32) -> R { unsafe { MADE += 1; } R { id: id } }
+}
+
+impl Drop for R {
+    fn drop(&mut self) { unsafe { GONE += 1; } }
+}
+"""
+
+    def _balanced(self, body):
+        """Exit status is 0 only when every object made was also dropped."""
+        src = self.COUNTED + body + """
+fn main() {
+    let mut k: i32 = 0;
+    while k < 3 {
+        exercise(k);
+        k += 1;
+    }
+    unsafe { if MADE == GONE { return 0; } }
+    unsafe { return MADE - GONE; }
+}
+"""
+        return _run(src, suffix=".rs")
+
+    def test_conditional_return_drops_on_fallthrough(self):
+        # The `return` is textually first, so it used to consume the live set
+        # and leave the tail expression with nothing to drop.
+        self.assertEqual(self._balanced("""
+fn exercise(n: i32) -> i32 {
+    let a: R = R::make(1);
+    if n > 0 { return a.id; }
+    0
+}
+"""), 0)
+
+    def test_break_leaves_loop_body_drop_intact(self):
+        # A `break` inside the body used to delete the closing-brace drop
+        # outright, so every non-breaking iteration leaked.
+        self.assertEqual(self._balanced("""
+fn exercise(n: i32) -> i32 {
+    let mut i: i32 = 0;
+    while i < 4 {
+        let c: R = R::make(2);
+        i += 1;
+        if i == 3 { break; }
+    }
+    n
+}
+"""), 0)
+
+    def test_continue_leaves_loop_body_drop_intact(self):
+        self.assertEqual(self._balanced("""
+fn exercise(n: i32) -> i32 {
+    let mut i: i32 = 0;
+    while i < 4 {
+        let c: R = R::make(3);
+        i += 1;
+        if i == 2 { continue; }
+    }
+    n
+}
+"""), 0)
+
+    def test_conditional_move_out_still_drops_on_other_path(self):
+        # `return a;` moves `a` out on that path only. Unregistering it
+        # permanently made the fall-through forget `a` as well.
+        self.assertEqual(self._balanced("""
+fn take(n: i32) -> R {
+    let a: R = R::make(4);
+    let b: R = R::make(5);
+    if n > 0 { return a; }
+    b
+}
+
+fn exercise(n: i32) -> i32 {
+    let got: R = take(n);
+    got.id
+}
+"""), 0)
+
+    def test_vec_freed_on_the_path_that_does_not_break(self):
+        """Isolates the leak from the Drop trait, on the bundled `Vec`.
+
+        The tests above all need `impl Drop` to observe a missing free, so on
+        a tree without it they fail for the wrong reason. This one reads the
+        generated C directly: a loop body holding a conditional `break` must
+        still free at its closing brace, and used not to.
+        """
+        out = crust.translate("""
+fn main() {
+    let mut i: i32 = 0;
+    while i < 3 {
+        let mut v: Vec<i32> = Vec::<i32>::new();
+        v.push(i);
+        if i == 1 { break; }
+        i += 1;
+    }
+}
+""", path="t.rs")
+        body = out[out.index("int main"):]
+        # Once for the `break` path, once for falling off the end of the body.
+        self.assertEqual(body.count("Vec_int_free_buf(&v);"), 2)
+
+    def test_vec_freed_on_the_path_that_does_not_return(self):
+        out = crust.translate("""
+fn f(n: i32) -> i32 {
+    let mut v: Vec<i32> = Vec::<i32>::new();
+    v.push(n);
+    if n > 0 { return 1; }
+    2
+}
+""", path="t.rs")
+        body = out[out.index("int f(int n) {"):]
+        body = body[:body.index("\n}")]
+        self.assertEqual(body.count("Vec_int_free_buf(&v);"), 2)
+
+    def test_unconditional_return_does_not_drop_twice(self):
+        # The other direction: the clearing existed to stop this, so the
+        # reachability rule that replaced it has to still prevent it.
+        self.assertEqual(self._balanced("""
+fn exercise(n: i32) -> i32 {
+    let a: R = R::make(6);
+    return a.id;
+}
+"""), 0)
+
+
+class TestCrustDropTrait(unittest.TestCase):
+    """`impl Drop for T`, and the field glue a type gets with or without one."""
+
+    def test_user_drop_runs_at_scope_exit(self):
+        self.assertEqual(_run("""
+struct G { id: i32 }
+impl Drop for G {
+    fn drop(&mut self) { unsafe { SEEN = self.id; } }
+}
+static mut SEEN: i32 = 0;
+fn main() {
+    { let g: G = G { id: 41 }; }
+    unsafe { return SEEN + 1; }
+}
+""", suffix=".rs"), 42)
+
+    def test_field_glue_without_a_user_impl(self):
+        # `Mid` declares no Drop, but owns a `Leaf` that does, so it gets a
+        # synthesized `Mid_drop` that chains to it.
+        self.assertEqual(_run("""
+static mut GONE: i32 = 0;
+struct Leaf { id: i32 }
+impl Drop for Leaf {
+    fn drop(&mut self) { unsafe { GONE += 1; } }
+}
+struct Mid { a: Leaf, b: Leaf }
+fn main() {
+    { let m: Mid = Mid { a: Leaf { id: 1 }, b: Leaf { id: 2 } }; }
+    unsafe { return GONE; }
+}
+""", suffix=".rs"), 2)
+
+    def test_field_glue_is_transitive(self):
+        self.assertEqual(_run("""
+static mut GONE: i32 = 0;
+struct Leaf { id: i32 }
+impl Drop for Leaf {
+    fn drop(&mut self) { unsafe { GONE += 1; } }
+}
+struct Mid { a: Leaf }
+struct Top { m: Mid }
+fn main() {
+    { let t: Top = Top { m: Mid { a: Leaf { id: 1 } } }; }
+    unsafe { return GONE + 40; }
+}
+""", suffix=".rs"), 41)
+
+    def test_user_body_runs_before_field_glue(self):
+        # Rust runs `Drop::drop` first, then drops the fields. Order is
+        # observable, so it is pinned here.
+        self.assertEqual(_run("""
+static mut ORDER: i32 = 0;
+struct Leaf { id: i32 }
+impl Drop for Leaf {
+    fn drop(&mut self) { unsafe { ORDER = ORDER * 10 + 2; } }
+}
+struct Both { l: Leaf }
+impl Drop for Both {
+    fn drop(&mut self) { unsafe { ORDER = ORDER * 10 + 1; } }
+}
+fn main() {
+    { let b: Both = Both { l: Leaf { id: 1 } }; }
+    unsafe { return ORDER; }
+}
+""", suffix=".rs"), 12)
+
+    def test_return_inside_drop_body_is_reported(self):
+        # The glue is appended after the body, so a `return` would skip it.
+        # Reported rather than silently leaked.
+        src = """
+struct B { l: L }
+struct L { n: i32 }
+impl Drop for L { fn drop(&mut self) { } }
+impl Drop for B {
+    fn drop(&mut self) { if self.l.n == 0 { return; } }
+}
+fn main() { let b: B = B { l: L { n: 0 } }; }
+"""
+        with self.assertRaises(crust.CrustError) as cm:
+            crust.translate(src, path="t.rs")
+        self.assertIn("would skip the field drops", cm.exception.message)
+
+
+class TestCrustCppOrdering(unittest.TestCase):
+    """A `.cpp` include may hold a Crust type by value.
+
+    Two things had to change for this: the prelude is placed above the
+    include (with a `#line` resync so diagnostics keep naming the user's own
+    lines), and the instantiations the `.cpp` names are seeded even when no
+    Rust or C in the unit mentions them.
+    """
+
+    BYVAL_CPP = """
+class Box {
+public:
+    Vec_int held;
+    Box() { held = Vec_int_new(); }
+    ~Box() { Vec_int_free_buf(&held); }
+    void add(int v) { Vec_int_push(&held, v); }
+    unsigned long n() { return Vec_int_len(&held); }
+};
+
+int build(void) {
+    Box b;
+    b.add(1);
+    b.add(2);
+    return (int)b.n();
+}
+"""
+
+    def test_by_value_crust_member_needs_no_forward_decl(self):
+        # Before the prelude moved, `Vec_int` was incomplete here and this
+        # failed to compile at the class body.
+        self.assertEqual(_run("""#include "byval.cpp"
+fn seed(n: i32) -> Vec<i32> {
+    let mut v: Vec<i32> = Vec::<i32>::new();
+    v.push(n);
+    v
+}
+int main(void) {
+    Vec_int owned = seed(9);
+    int k = build();
+    Vec_int_free_buf(&owned);
+    return k + 40;
+}
+""", extra={"byval.cpp": self.BYVAL_CPP}), 42)
+
+    def test_instantiation_seeded_from_the_cpp_alone(self):
+        # No Rust item anywhere, and no C mention of `Vec<i32>` -- the `.cpp`
+        # is the only thing naming the lowered type.
+        self.assertEqual(_run("""#include "byval.cpp"
+int main(void) { return build() + 40; }
+""", extra={"byval.cpp": self.BYVAL_CPP}), 42)
+
+    def test_cpp_destructor_calls_a_rust_drop_impl(self):
+        # `impl Drop for Res` lowers to `Res_drop(Res *)`, which is exactly
+        # the symbol cpprust emits for `~Res()`. The C++ destructor calls it
+        # with no shim -- the property the shared mangling exists for.
+        self.assertEqual(_run("""#include "guard.cpp"
+struct Res { id: i32 }
+impl Drop for Res {
+    fn drop(&mut self) { unsafe { SEEN = self.id; } }
+}
+static mut SEEN: i32 = 0;
+int main(void) {
+    hold(42);
+    return SEEN;                 /* a Rust `static mut` is a C global */
+}
+""", extra={"guard.cpp": """
+class Keeper {
+public:
+    Res r;
+    Keeper() { }
+    ~Keeper() { Res_drop(&r); }
+};
+
+void hold(int tag) {
+    Keeper k;
+    k.r.id = tag;
+}
+"""}), 42)
