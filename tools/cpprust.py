@@ -433,7 +433,8 @@ def _check_unsupported(scan, path):
 
 class Member(object):
     __slots__ = ("kind", "ret", "name", "params", "body", "line", "dim",
-                 "init", "virt", "pure", "outline", "definit")
+                 "init", "virt", "pure", "outline", "definit",
+                 "declared_only")
 
     def __init__(self, kind, ret, name, params, body, line, dim="",
                  init=None, virt=False, pure=False):
@@ -455,6 +456,9 @@ class Member(object):
         # C has no such thing on a struct member, so it becomes an assignment
         # at the top of every constructor -- which is what it means.
         self.definit = None
+        # Declared with no body and no out-of-line definition here: it lives
+        # in another translation unit, so only a prototype is emitted.
+        self.declared_only = False
 
 
 class Class(object):
@@ -484,13 +488,73 @@ def _parse_init_list(tail, sig, cname):
         part = part.strip()
         if not part:
             continue
-        m = re.match(r"^(\w+)\s*\(", part)
-        end = _match_paren(part, part.index("(")) if m else None
-        if m is None or end is None:
+        # `member(args)` or C++11's `member{args}`. The braces mean list
+        # initialisation, which for everything this subset lowers -- a
+        # constructor call or a scalar -- is the same call with the same
+        # arguments, so only the spelling differs.
+        m = re.match(r"^(\w+)\s*([({])", part)
+        if m is None:
+            raise CppError("cannot parse initializer %r in class %s"
+                           % (part, cname))
+        open_ch = m.group(2)
+        close_ch = ")" if open_ch == "(" else "}"
+        end = _match(part, m.end() - 1, open_ch, close_ch)
+        if end is None:
             raise CppError("cannot parse initializer %r in class %s"
                            % (part, cname))
         out.append((m.group(1), part[m.end():end].strip()))
     return out
+
+
+def _body_brace(body, start, brace):
+    """Index of the brace opening a member's body, skipping initializers.
+
+    Only when an initializer list is actually present: outside one, a `{`
+    preceded by a name is an anonymous `union`/`struct` member, which is a
+    different thing and must not be skipped.
+    """
+    head = body[start:brace]
+    close = head.rfind(")")
+    if close < 0 or ":" not in head[close:]:
+        return brace
+    k = brace
+    while k >= 0 and k < len(body):
+        j = k - 1
+        while j >= 0 and body[j] in " \t\r\n":
+            j -= 1
+        if j < 0 or not (body[j].isalnum() or body[j] == "_"):
+            return k                     # the body
+        end = _match(body, k, "{", "}")
+        if end is None:
+            return -1
+        k = body.find("{", end + 1)
+        if k < 0:
+            return -1
+    return -1
+
+
+def _member_symbol(cname, m):
+    """The C name a member lowers to, or None if it has no simple one."""
+    if m.kind == "ctor":
+        return "%s_new" % cname
+    if m.kind == "dtor":
+        return "%s_drop" % cname
+    if m.kind == "method":
+        return "%s_%s" % (cname, m.name)
+    return None
+
+
+def _match(text, idx, open_ch, close_ch):
+    """Index of the bracket closing the one at `idx`, or None."""
+    depth = 0
+    for k in range(idx, len(text)):
+        if text[k] == open_ch:
+            depth += 1
+        elif text[k] == close_ch:
+            depth -= 1
+            if depth == 0:
+                return k
+    return None
 
 
 def _pure_virtual(decl, cname, line0):
@@ -631,6 +695,14 @@ def _split_members(body, cname, line0):
                 continue
             head, inner = decl, None
         else:
+            if brace < 0:
+                break
+            # A C++11 initializer list may use braces -- `: d { p }, n(k)` --
+            # and the first `{` after the parameters is then an *initializer*
+            # rather than the body. Told apart by what precedes it: an
+            # initializer brace follows the member's name, the body brace
+            # follows a `)` or the `}` that closed the last initializer.
+            brace = _body_brace(body, start, brace)
             if brace < 0:
                 break
             head = body[start:brace].strip()
@@ -965,14 +1037,18 @@ def _attach_out_of_line(cls, defs, path):
         spelled = ("~" + cls.name) if m.kind == "dtor" else m.name
         got = defs.get((cls.name, spelled, _arity(m.params or "")))
         if got is None:
-            raise CppError(
-                "%s: `%s::%s` is declared but never defined. A member with "
-                "no body needs a `%s %s::%s(..) { .. }` in the same "
-                "translation, since the lowering emits the class and its "
-                "bodies together -- an empty one would compile and do "
-                "nothing."
-                % (os.path.basename(path), cls.name, spelled,
-                   (m.ret or "void"), cls.name, spelled))
+            # Declared here, defined in another translation unit -- which is
+            # ordinary once headers are spliced: `css_length.h` declares
+            # `fromString` and `css_length.cpp` defines it, and a file that
+            # merely includes the header sees only the declaration.
+            #
+            # So it stays a declaration. A *prototype* with no definition is
+            # exactly what C does with one, and the linker says so if nothing
+            # supplies it. This used to be refused, on the grounds that an
+            # empty body would compile and silently do nothing -- which is
+            # true, and is why no empty body is emitted either.
+            m.declared_only = True
+            continue
         m.params = got["params"]
         m.body = got["body"]
         m.outline = True
@@ -1811,6 +1887,21 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
 
     for m in cls.members:
         if m.kind in ("field", "anon") or m.pure:
+            continue
+        if m.declared_only:
+            # Prototype only. `emit` writes both, so the declaration is made
+            # here and the definition left to whoever has the body.
+            dparams = _lower_refs(_expand_cpp_ref(sub(m.params or ""), known),
+                                  _with_scalars(names))
+            mname = _member_symbol(cname, m)
+            if mname is not None:
+                # External linkage, not `static`: the definition is in
+                # another translation unit, and a `static` declaration with
+                # no definition there could never be resolved.
+                mprotos.append(
+                    "%s %s(%s *this%s);"
+                    % (tsub(sub(m.ret or "void")).strip() or "void",
+                       mname, cname, (", " + dparams) if dparams else ""))
             continue
         emitting_outline[0] = m.outline
         params = sub(m.params or "").strip()
