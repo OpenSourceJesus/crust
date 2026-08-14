@@ -15,6 +15,12 @@ knowing: members are destroyed in reverse declaration order, because that is
 C++'s rule, while Crust's field glue frees in declaration order, because that
 is Rust's. Each side follows its own source language.)
 
+C++11 spellings -- `auto`, range-`for`, namespaces, `unique_ptr` and
+`shared_ptr` -- are handled in `tools/cpp_auto.py` and the supplied templates
+below. None of them widen what the subset expresses: each is rewritten into
+something this lowering already handled, before any pass that reads types
+runs, because everything downstream reads types by how they are written.
+
 A class may therefore *own* a Crust value rather than point at one. Crust
 publishes the types it lowered that own something and the preprocessor passes
 them as `--owning Name:dropfn,..`, since this module runs as a subprocess and
@@ -230,6 +236,11 @@ unit without a shim.
 import os
 import re
 import sys
+
+try:
+    import tools.cpp_auto as cpp_auto
+except ImportError:                      # run as a script from tools/
+    import cpp_auto
 
 
 class CppError(Exception):
@@ -1475,7 +1486,14 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
         head.append("static const struct %s_vtable %s__vtable = { %s };"
                     % (cname, cname, ", ".join("&" + e for e in entries)))
         out.extend(thunks)
-    return head + mprotos + out, cname, info
+    # Split three ways rather than two. Only the *name* declarations and the
+    # prototypes are safe to hoist: the struct definition has to stay where
+    # it is, because a by-value member needs the member's definition above it
+    # and moving one moves them all. `head[:2]` is exactly the `struct X;` and
+    # its typedef, which is all a pointer field to a class defined later
+    # needs -- and that is the shape a template instantiated over a class
+    # declared below it always has.
+    return (head[:2], mprotos, head[2:] + out), cname, info
 
 
 def _prev_word(text, idx):
@@ -1950,6 +1968,12 @@ def _looks_like_params(parts, cinfo):
             continue
         toks = [t for t in part.replace("*", " * ").split() if t != "const"]
         toks = [t for t in toks if t != "*"]
+        # Two words usually mean a type and a name -- but not when the first
+        # is a keyword. `Holder h(new Thing())` is a local with a constructor
+        # argument, and reading `new Thing()` as a parameter made the by-value
+        # check refuse the declaration as if it were a function returning one.
+        if toks and toks[0] in ("new", "delete", "sizeof", "return"):
+            return False
         if len(toks) >= 2:
             continue
         if toks and (toks[0] in _TYPE_WORDS or toks[0] in cinfo):
@@ -2926,11 +2950,70 @@ public:
 };
 """
 
-_STD_INCLUDE = re.compile(r"^[ \t]*#\s*include\s*<(vector|string)>[ \t]*\n?",
-                          re.M)
+_STD_UNIQUE = """
+template<typename T>
+class unique_ptr {
+    T *up;
+public:
+    unique_ptr() { up = 0; }
+    unique_ptr(T *q) { up = q; }
+    ~unique_ptr() { reset(0); }
+    T *get() { return up; }
+    T *release() { T *q = up; up = 0; return q; }
+    void reset(T *q) {
+        if (up) { __cpp_drop(T, *up); free(up); }
+        up = q;
+    }
+};
+"""
 
 
-_STD_CLASSES = frozenset(("string", "vector", "ownvector"))
+_STD_SHARED = """
+template<typename T>
+class shared_ptr {
+    T *sp;
+    long *sc;
+public:
+    shared_ptr() { sp = 0; sc = 0; }
+    shared_ptr(T *q) {
+        sp = q;
+        sc = (long *)malloc(sizeof(long));
+        *sc = 1;
+    }
+    shared_ptr(const shared_ptr<T> &o) {
+        sp = o.sp;
+        sc = o.sc;
+        if (sc) { *sc = *sc + 1; }
+    }
+    shared_ptr<T> &operator=(const shared_ptr<T> &o) {
+        if (sc != o.sc) {
+            unshare();
+            sp = o.sp;
+            sc = o.sc;
+            if (sc) { *sc = *sc + 1; }
+        }
+    }
+    ~shared_ptr() { unshare(); }
+    void unshare() {
+        if (sc) {
+            *sc = *sc - 1;
+            if (*sc == 0) { __cpp_drop(T, *sp); free(sp); free(sc); }
+            sp = 0;
+            sc = 0;
+        }
+    }
+    T *get() { return sp; }
+    long use_count() { if (sc) { return *sc; } return 0; }
+};
+"""
+
+
+_STD_INCLUDE = re.compile(
+    r"^[ \t]*#\s*include\s*<(vector|string|memory)>[ \t]*\n?", re.M)
+
+
+_STD_CLASSES = frozenset(("string", "vector", "ownvector",
+                          "unique_ptr", "shared_ptr"))
 
 
 def _std_prelude(text):
@@ -2941,8 +3024,12 @@ def _std_prelude(text):
     every other nested instantiation obeys.
     """
     wanted = set(m.group(1) for m in _STD_INCLUDE.finditer(text))
+    # `<memory>` is the header, `unique_ptr`/`shared_ptr` are the classes:
+    # asking for the header alone should not supply a template the file never
+    # names, since an unused one would still be monomorphised.
+    wanted.discard("memory")
     probe = _blank_strings(_strip_comments(text))
-    for name in ("string", "vector", "ownvector"):
+    for name in ("string", "vector", "ownvector", "unique_ptr", "shared_ptr"):
         if re.search(r"\bstd\s*::\s*%s\b" % name, probe):
             wanted.add(name)
     if not wanted:
@@ -2960,6 +3047,10 @@ def _std_prelude(text):
         parts.append(_STD_VECTOR)
     if "ownvector" in wanted:
         parts.append(_STD_OWNVECTOR)
+    if "unique_ptr" in wanted:
+        parts.append(_STD_UNIQUE)
+    if "shared_ptr" in wanted:
+        parts.append(_STD_SHARED)
     return "".join(parts) + text
 
 
@@ -3289,6 +3380,23 @@ def translate(text, path="<cpp>", owning=None):
     # Lambdas are lowered before anything else looks at the file: what comes
     # out is ordinary subset source with a static function in it.
     text = _lower_lambdas(text, path)
+    # `auto` becomes a written type before anything reads types, because
+    # everything downstream -- the class emitter, the scope tracker, the call
+    # rewriter -- reads them by their spelling. Lambdas first: `auto f = []..`
+    # is consumed by the lowering above and never reaches this.
+    try:
+        # Range-`for` first: it emits ordinary declarations, some of them
+        # `auto`, which the deduction below then resolves. Layered rather
+        # than combined, so each pass has one thing to be right about.
+        # Namespaces first: they rename the types the passes below read.
+        text = cpp_auto.resolve_namespaces(
+            text, os.path.basename(path), blank=cpp_auto._blank_like(text))
+        text = cpp_auto.resolve_range_for(
+            text, os.path.basename(path), blank=cpp_auto._blank_like(text))
+        text = cpp_auto.resolve(
+            text, os.path.basename(path), blank=cpp_auto._blank_like(text))
+    except cpp_auto.AutoError as e:
+        raise CppError(e.message)
     scan = _strip_comments(text)
     _check_unsupported(scan, path)
 
@@ -3444,6 +3552,7 @@ def translate(text, path="<cpp>", owning=None):
                  for n, fn in sorted((owning or {}).items())
                  if n not in declared)
     prev = 0
+    fwd, fwd_protos = [], []
     for start, end, cls in classes:
         # Keep everything before the class, minus any `template<..>` header,
         # which has no C equivalent.
@@ -3452,16 +3561,30 @@ def translate(text, path="<cpp>", owning=None):
         pieces.append(head)
         insts = wanted.get(cls.name, []) if cls.tparams else [None]
         for targs in insts:
-            emitted, cname, info = _emit_class(
+            (names_, protos, defs), cname, info = _emit_class(
                 cls, names, cinfo, tsub, targs, new_used.get(cls.name),
                 chained, cls.name in std_classes)
             # Trailing newline: two instantiations of the same template are
             # emitted back to back, and without it the last line of one runs
             # into the first line of the next.
-            pieces.append("\n".join(emitted) + "\n")
+            pieces.append("\n".join(defs) + "\n")
+            fwd.extend(names_)
+            fwd_protos.extend(protos)
             cinfo[cname] = info
         prev = end
     pieces.append(text[prev:])
+    # Every class name declared up front, before any definition. A template
+    # instantiated over a class defined *later* emits its struct where the
+    # template sits, and the field type was then an unknown name:
+    # `struct Box_Thing { Thing * bp; };` ahead of `struct Thing;`. Which
+    # class is complete where still matters -- a by-value member needs a
+    # definition, not a declaration -- so this only hoists the names.
+    # Every class *name* first, then every prototype, then the definitions
+    # where they were. A prototype can mention a class declared below it --
+    # `unique_ptr_Thing_new_1(unique_ptr_Thing *, Thing *)` -- so the two
+    # groups cannot be interleaved per class.
+    if fwd or fwd_protos:
+        pieces.insert(0, "\n".join(fwd + fwd_protos) + "\n")
     out = "".join(pieces)
 
     # Rewrite uses: `Ring<int> r;` -> `Ring_int r;`. Field types were already
