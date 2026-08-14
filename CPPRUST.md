@@ -917,6 +917,24 @@ expression is *used at* -- which is type checking, not the reading of written
 types this pass does. Written targets are exactly the cases it can be sure
 of.
 
+### Anonymous unions and structs
+
+Both forms are supported, and both are carried through whole -- C has them
+and ShivyCX lowers them, so nothing needs inventing:
+
+```cpp
+class css_length {
+    union { float m_value; int m_predef; };   /* anonymous member  */
+    union { int a; float b; } u;              /* named, anon type  */
+};
+```
+
+The difference is what the names mean. An *anonymous* member contributes its
+own members to the class, so a body writing `m_value` means
+`this->m_value`. A *named* one does not: `a` is reached through `u`, so the
+body writes `u.a` and gets `this->u.a`. Its own type has no name to record,
+which is fine -- what is behind the dot is plain C from there.
+
 ### `bool`
 
 A keyword in C++ and a header in C. A `.cpp` writing `bool`, `true` or
@@ -952,8 +970,8 @@ use of one is a member access and the symbol table already turns `o.x` into
 
 Reported rather than mistranslated: exceptions (`throw` / `try` / `catch`),
 operator overloading other than `=`, a compound assignment, a comparison,
-`[]`, `->` and `*` (in particular the stream operators), anonymous `union`
-members, `dynamic_cast`, `typeid`,
+`[]`, `->` and `*` (in particular the stream operators), nested classes,
+`dynamic_cast`, `typeid`,
 multiple and virtual inheritance, iterators (`begin`/`end`), and the rest of
 the STL.
 
