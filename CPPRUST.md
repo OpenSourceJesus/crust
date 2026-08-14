@@ -590,8 +590,9 @@ v.push_back(1);
 v[0] = 42;
 ```
 
-`std::` is stripped. There is no namespace support and claiming otherwise
-would be worse than not claiming it.
+`std::` is stripped rather than resolved. Namespaces themselves are
+supported by flattening -- see the C++11 section below -- but `std` is not
+one this file declares, so its qualifier is simply removed.
 
 | Type | For | Elements |
 |---|---|---|
@@ -636,12 +637,107 @@ __cpp_drop(T, x)                        // T_drop(&x), or nothing
 They are an internal seam, but nothing stops you using them to write your
 own owning container.
 
+## C++11 spellings
+
+None of these change what the subset can express. They are *spellings*, each
+rewritten into something the lowering already handled, and each rewritten
+before any pass that reads types runs -- because everything downstream reads
+types by how they are written.
+
+### `auto`
+
+Resolved to a written type, textually. What has a spelling nearby resolves:
+
+```cpp
+auto a = A();               // a class construction     -> A
+auto p = new A();           // a heap allocation        -> A *
+auto n = 3;                 // literals of each kind    -> int
+auto q = other;             // a local, from its decl   -> its type
+auto r = mk();              // a function declared here -> its return
+auto z = v.size();          // a method of a known class-> its return
+auto e = v[0];              // through operator[]       -> the element type
+```
+
+`auto a = A();` is emitted as `A a(..)` -- direct-initialisation. It is
+written as copy-initialisation but means the other thing: C++17 guarantees
+the temporary is elided, and the direct form is the one this subset lowers.
+
+A subscript deduces through the template parameter, so `vector<int>` gives
+`int`: `operator[]`'s return type is read and the instantiation's arguments
+are put back in place of the parameters.
+
+Anything without a spelling to take -- a compound expression, a chained call
+whose intermediate type is written nowhere, an unknown name -- is **reported**
+with the reason. That is the change worth knowing: `auto` used to pass
+through untouched, so what came back was `expected expression, got 'A'` from
+the C front end rather than a diagnostic about `auto`.
+
+### Range-`for`
+
+Rewritten to the index loop it stands for:
+
+```cpp
+for (auto &x : v) { .. }
+for (int _cpp_it0 = 0; _cpp_it0 < v.size(); _cpp_it0 = _cpp_it0 + 1) { .. }
+```
+
+The reference form is done by **substitution** -- the name aliases the
+element, so writing through it writes to the container, which is what a
+reference means. The by-value form declares a copy instead. The two differ
+here exactly as they differ in C++, rather than one quietly behaving like
+the other.
+
+The range has to be a name: an array with a written size, or a class with
+`size()` and `operator[]`, optionally through a pointer. `begin()`/`end()`
+iterators are a different feature and are reported, not guessed at.
+
+### Namespaces
+
+`namespace N { .. }` and `N::x` are flattened to `N_x` -- the same thing
+Crust does with Rust paths, and for the same reason: C has one namespace, so
+a qualified name has to become an unqualified one. Nesting gives `a_b_x`, and
+`using namespace N;` makes the unqualified spellings visible.
+
+Only what the namespace *declares* is prefixed. A class's members and a
+function's locals are not namespace names, and prefixing them renamed
+`Point::x` to `geo_x` and broke every use of it.
+
+What this does not do is overload resolution or argument-dependent lookup.
+
+### `unique_ptr` and `shared_ptr`
+
+Supplied on `#include <memory>`, and like `string` and `vector` they are
+**written in this subset** rather than special-cased. Naming the header alone
+supplies nothing: an unused template would still be monomorphised.
+
+```cpp
+std::unique_ptr<Thing> u(new Thing());
+u.get()->v = 4;
+
+std::shared_ptr<Thing> a(new Thing());
+std::shared_ptr<Thing> b(a);            // use_count() == 2
+```                                     // released at zero
+
+`unique_ptr` declares no copy constructor, so the Rule of Three refusal the
+subset already makes **is** its move-only semantics -- copying one is
+rejected with the same diagnostic any other owning class gets, and nothing
+had to be added for it. `shared_ptr` refcounts through a copy constructor and
+`operator=`.
+
+Both use `__cpp_drop(T, *p)` rather than `delete p`. Inside a template, `T`
+is not known to be a class when the body is parsed, so a plain `delete` frees
+the memory without running the element's destructor; the builtin is resolved
+per instantiation and does.
+
+Access is through `get()`. `operator->` and `operator*` are overloads, and
+overloads other than `=` and `[]` are not in the subset.
+
 ## Not supported yet
 
 Reported rather than mistranslated: exceptions (`throw` / `try` / `catch`),
 operator overloading other than `=` and `[]`, `dynamic_cast`, `typeid`,
-multiple and virtual inheritance, namespaces, iterators, and the rest of the
-STL.
+multiple and virtual inheritance, iterators (`begin`/`end`), and the rest of
+the STL.
 
 ## Errors
 

@@ -1636,6 +1636,9 @@ subset** rather than trusted on its own.)
 - `examples/crust/owned.cpp` and `examples/crust/raii.c` — C++ destructors as
   an RAII guard *borrowing* a Crust `Vec<i32>` (`#include "owned.cpp"` →
   `tools/cpprust.py`), alongside native Rust scope-exit Drop.
+- `examples/crust/cpp11.cpp` and `examples/crust/cpp11.c` — C++11 spellings
+  (`auto`, range-`for`, namespaces, `unique_ptr`/`shared_ptr`) alongside Rust
+  in one unit.
 - `examples/crust/ownmember.cpp` and `examples/crust/ownmember.c` — the
   *owning* shape: a C++ class holding a `Vec_int` and a Rust `impl Drop` type
   by value, with no destructor written, plus transitive Rust field glue and an
