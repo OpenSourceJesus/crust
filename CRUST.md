@@ -1350,13 +1350,55 @@ Zeroing rather than unregistering is what keeps this right on every path.
 path that did not move and is a no-op on the path that did. Unregistering
 would be the same per-path mistake the unwinding used to make.
 
-Two limits worth naming. A later **use** of a moved-from local reads zeros
-rather than being rejected — Crust has no borrow checker, so the use Rust
-would refuse compiles here. And a moved-from local still has its destructor
+The C++ side does **not** do this, and refuses instead: handing an owned
+object to a Rust `fn` by value is rejected by `tools/cpprust.py` with the
+advice to pass a pointer, which is what a `&Vec<i32>` parameter lowers to
+anyway. See CPPRUST.md, "Handing an owned value to Rust".
+
+One limit worth naming: a moved-from local still has its destructor
 *called*, on a zeroed value: invisible for the core types, whose free is
 idempotent, but a user `Drop` body runs and sees a zeroed `self`. A `Drop`
 body should therefore tolerate a zeroed `self`. This is the same divergence
 `let b = a` already had.
+
+### Use after move
+
+Reading a local that was moved out of is **refused**. There is still no
+borrow checker, but this one check is worth having on its own: the move
+zeroes its source so a later drop is a no-op, which keeps memory correct and
+makes a later *read* quietly see an empty value rather than what was there.
+
+```rust
+let n: usize = take(a);
+let m: usize = a.len();     // `a` was moved on line 5 and is not valid to
+                            // use again
+```
+
+A macro argument counts as a read — `println!("{}", a)` goes through a
+sub-parser, which shares the move set with the code around it rather than
+starting clean.
+
+Two things clear the mark, because both give the binding something to own
+again: assigning to it, and re-declaring it with `let` in a nested scope.
+(Shadowing in the *same* scope was never supported — it lowers to a C
+redefinition.) Borrowing is not moving, so `borrow(&v)` leaves `v` alone.
+
+One shape a single forward pass cannot see is a move of something declared
+outside a loop, since the reader sees one move and no later read while every
+iteration after the first moves a value that is already gone. That is caught
+by comparing how many loops deep the binding was declared against how deep
+the move is, and reported the same way:
+
+```rust
+while i < 3 {
+    let n: usize = take(a);   // `a` is moved inside a loop but declared
+    i += 1;                   // outside it
+}
+```
+
+What is still *not* caught is a move on one branch and a read on another
+path that a linear reading does not order after it. This is a check, not a
+borrow checker.
 
 ### Copying an owning type
 

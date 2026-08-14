@@ -109,6 +109,34 @@ is left exactly as it was, so a `.cpp` that manages the lifetime itself is
 unaffected. `examples/crust/ownmember.cpp` is the owning shape;
 `examples/crust/owned.cpp` remains the borrowing one.
 
+### Handing an owned value to Rust
+
+**Refused:** passing an owned object by value to a function this file does
+not define. It is the cross-language shape of the double free Crust fixed on
+its own side, and it aborted rather than leaked:
+
+```cpp
+int go(void) {
+    Tally t;  t.start();  t.add(1);
+    return consume(t.samples);        /* a Rust `fn consume(v: Vec<i32>)` */
+}
+```
+
+Crust lowers a by-value owning parameter to a drop when the callee returns —
+passing by value is a *move* there — so `consume` frees the buffer, and
+`Tally_drop` frees it again on the way out. Refused for the same reason
+`_check_by_value` refuses this pass's own by-value owning parameters: doing
+it properly means moving out of the source, and this is expression position.
+
+Pass `&t.samples` instead. A Rust `&Vec<i32>` parameter lowers to exactly
+that pointer, so a reference-taking signature needs no change on either side.
+
+The check runs on the *lowered* text, and only for callees this file did not
+declare. That is what keeps it precise: a by-reference call has already
+become `f(&v)` by then, `Buf c(a);` has already become
+`Buf c; Buf_copy(&c, &a);`, and a constructor or method call is this pass's
+own business rather than a boundary.
+
 ## The guiding rule
 
 **Anything the lowering cannot do correctly is reported, not approximated.**
