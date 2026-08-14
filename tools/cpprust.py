@@ -257,6 +257,11 @@ class CppError(Exception):
 _AUG_NAMES = {"+": "add", "-": "sub", "*": "mul", "/": "div", "%": "mod",
               "|": "or", "&": "and", "^": "xor"}
 
+#: `a == b` becomes `T__cmpeq(&a, &b)`. Same reasoning as `_AUG_NAMES`: the
+#: symbol has to be a C identifier and should read back to its operator.
+_CMP_NAMES = {"==": "eq", "!=": "ne", "<=": "le", ">=": "ge",
+              "<": "lt", ">": "gt"}
+
 _AUG_ASSIGN_SPELLINGS = frozenset(
     ["%s=" % k for k in ("+", "-", "*", "/", "%", "|", "&", "^")])
 
@@ -383,6 +388,8 @@ def _check_unsupported(scan, path):
             continue
         if m.group(1) in _AUG_ASSIGN_SPELLINGS:
             continue
+        if m.group(1) in _CMP_NAMES:
+            continue
         line = scan.count("\n", 0, m.start()) + 1
         # A *conversion* operator is worth naming separately: it is not one
         # more overload to add but a different kind of thing. It applies
@@ -392,6 +399,13 @@ def _check_unsupported(scan, path):
         # lumped in with `operator<`, which really is just missing.
         spelled = m.group(1)
         if re.match(r"^[A-Za-z_]\w*$", spelled) and spelled not in _KEYWORDS:
+            # A conversion operator is *declarable*: it lowers to an ordinary
+            # method. What is limited is where the call can be inserted, and
+            # that is reported at the use rather than here -- litehtml has
+            # exactly one, in a header every file includes, so refusing the
+            # declaration refused forty files over two call sites.
+            continue
+        if False:
             raise CppError(
                 "%s:%d: `operator %s()` is a conversion operator, which is "
                 "not in the C++ subset. It applies wherever the compiler "
@@ -629,6 +643,18 @@ def _split_members(body, cname, line0):
             bits = sig[:sig.index("operator")].strip()
             members.append(Member("star", bits, "operator*", params,
                                   inner, line0))
+        elif re.match(r"^operator\s+[A-Za-z_][\w:]*$", sig) and not params:
+            # `operator T()`. The lowered form is an ordinary method that
+            # returns `T`; only the *implicit* application is limited.
+            members.append(Member("conv", sig.split(None, 1)[1].strip(),
+                                  "operator conv", params, inner, line0))
+        elif re.search(r"\boperator\s*(==|!=|<=|>=|<|>)$", sig):
+            # A comparison. Unlike an assignment its *result* is the point,
+            # so the declared return type is kept.
+            cm = re.search(r"\boperator\s*(==|!=|<=|>=|<|>)$", sig)
+            bits = sig[:sig.index("operator")].strip()
+            members.append(Member("cmp", bits, "operator%s" % cm.group(1),
+                                  params, inner, line0))
         elif re.search(r"\boperator\s*(\+|-|\*|/|%|\||&|\^)=$", sig):
             # A compound assignment. Lowered like `operator=`: the result is
             # dropped, so `a += b` is a statement and a chained
@@ -1350,7 +1376,8 @@ def _external_info(name, dropfn):
             "abstract": False, "vdtor": False, "vdtor_decl": None,
             "ctor_refs": set(), "paths": {}, "copy": False,
             "assign": False, "index": None, "arrow": None,
-            "star": None, "augassign": {}, "vcall": {},
+            "star": None, "augassign": {}, "cmp": {}, "conv": None,
+            "vcall": {},
             "dropfn": dropfn, "external": True}
 
 
@@ -1484,7 +1511,7 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             "abstract": abstract, "vdtor": False, "vdtor_decl": None,
             "ctor_refs": set(), "paths": {}, "copy": False,
             "assign": False, "index": None, "arrow": None,
-            "star": None, "augassign": {},
+            "star": None, "augassign": {}, "cmp": {}, "conv": None,
             "dropfn": "%s_drop" % cname, "external": False}
     if base_info:
         # Inherited members and methods are reachable on the derived class.
@@ -1721,6 +1748,20 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             # a method called `assign`, and `string` does.
             emit("void", "%s__assign" % cname, params, sub(m.body or ""))
             info["assign"] = True
+        elif m.kind == "cmp":
+            op = m.name[len("operator"):]
+            fn = "%s__cmp%s" % (cname, _CMP_NAMES[op])
+            cret = tsub(sub(m.ret or "int")).strip() or "int"
+            info["cmp"][op] = {
+                "fn": fn, "ret": cret,
+                "refs": _ref_positions(_expand_cpp_ref(sub(m.params or ""),
+                                                       known),
+                                       _with_scalars(names))}
+            emit(cret, fn, params, sub(m.body or ""))
+        elif m.kind == "conv":
+            cret = tsub(sub(m.ret or "")).strip()
+            info["conv"] = {"fn": "%s__conv" % cname, "ret": cret}
+            emit(cret, "%s__conv" % cname, params, sub(m.body or ""))
         elif m.kind == "augassign":
             op = m.name[len("operator"):-1]
             fn = "%s__aug%s" % (cname, _AUG_NAMES[op])
@@ -1998,6 +2039,14 @@ class _Frame(object):
         self.vals = {}        # class-typed locals: vname -> class
 
 
+def _conv_for(name, scopes, type_info):
+    """The conversion operator of `name`'s class, if it has one."""
+    for fr in reversed(scopes):
+        if name in fr.vals:
+            return (type_info.get(fr.vals[name]) or {}).get("conv")
+    return None
+
+
 def _copy_source(expr, ctype, scopes, type_info):
     """The object being copied, if `expr` names one of class `ctype`.
 
@@ -2080,6 +2129,20 @@ def _rewrite_scopes(text, type_info):
     # scope. Compound assignments are not matched: `+=` on a class is not a
     # copy, and C would reject it anyway.
     assign_re = re.compile(r"(?<![\w.>])(\w+)\s*=(?!=)\s*([^;]+);")
+    # `int w = dv;` / `w = dv;` where `dv` is a class with `operator T()`.
+    # A conversion is applied only where the target type is *written*: this
+    # pass reads types by their spelling, so a written one is exactly what it
+    # can be sure of. Anywhere else the conversion is left out and the C
+    # front end reports the type mismatch on the struct.
+    conv_init_re = re.compile(
+        r"(?<![\w.>])([A-Za-z_][\w]*)\s+(\w+)\s*=\s*(\w+)\s*;")
+    conv_assign_re = re.compile(r"(?<![\w.>])(\w+)\s*=(?!=)\s*(\w+)\s*;")
+    # `a == b` where `a` is a class with `operator==`. Longest spellings
+    # first, so `<=` is not read as `<`. Only a bare name on the left: this
+    # pass knows the type of a local, and an expression it would have to
+    # infer one for is left alone.
+    cmp_re = re.compile(
+        r"(?<![\w.>])(\w+)\s*(==|!=|<=|>=|<|>)\s*(\w+)(?![\w(<])")
     aug_re = re.compile(
         r"(?<![\w.>])(\w+)\s*([+\-*/%|&^])=(?!=)\s*([^;]+);")
 
@@ -2296,6 +2359,56 @@ def _rewrite_scopes(text, type_info):
             scopes[-1].vals[vname] = ctype
             i = m.end()
             continue
+
+        m = cmp_re.match(look, i)
+        if m and not aggs:
+            lhs = m.group(1)
+            ctype = None
+            for fr in reversed(scopes):
+                if lhs in fr.vals:
+                    ctype = fr.vals[lhs]
+                    break
+            ent = (type_info.get(ctype) or {}).get("cmp", {}).get(m.group(2)) \
+                if ctype else None
+            if ent is not None:
+                rhs = text[m.start(3):m.end(3)].strip()
+                src = _copy_source(rhs, ctype, scopes, type_info)
+                if src is None:
+                    raise CppError(
+                        "`%s %s %s`: the right-hand side is not an object of "
+                        "type %s that this pass can name. Assign it to a "
+                        "typed local first."
+                        % (lhs, m.group(2), rhs, ctype))
+                out.append("%s(&%s, &%s)" % (ent["fn"], lhs, src))
+                i = m.end()
+                continue
+
+        m = conv_init_re.match(look, i)
+        if m and not aggs and m.group(1) not in type_info:
+            ent = _conv_for(m.group(3), scopes, type_info)
+            if ent is not None and ent["ret"].replace("*", "").strip() \
+                    == m.group(1):
+                out.append("%s %s = %s(&%s);"
+                           % (m.group(1), m.group(2), ent["fn"], m.group(3)))
+                scopes[-1].vals.pop(m.group(2), None)
+                i = m.end()
+                continue
+
+        m = conv_assign_re.match(look, i)
+        if m and not aggs:
+            lhs = m.group(1)
+            known_lhs = None
+            for fr in reversed(scopes):
+                if lhs in fr.vals:
+                    known_lhs = fr.vals[lhs]
+                    break
+            if known_lhs is None:
+                ent = _conv_for(m.group(2), scopes, type_info)
+                if ent is not None:
+                    out.append("%s = %s(&%s);"
+                               % (lhs, ent["fn"], m.group(2)))
+                    i = m.end()
+                    continue
 
         m = aug_re.match(look, i)
         if m and not aggs:
@@ -3607,15 +3720,24 @@ def _std_prelude(text):
                  "shared_ptr", "pair", "map"):
         if re.search(r"\bstd\s*::\s*%s\b" % name, probe):
             wanted.add(name)
+    # `bool` is a keyword in C++ and a header in C. A `.cpp` writing `bool`
+    # has included nothing for it and should not have to. The bundled header
+    # is pulled in rather than the type redefined here, which would clash
+    # with a file that *does* include it -- and before the early return
+    # below, since a file using `bool` need name no container at all.
+    bool_prefix = ""
+    if re.search(r"(?<![\w])(?:bool|true|false)(?![\w])", probe) \
+            and not re.search(r"include\s*[<\"]stdbool\.h", probe):
+        bool_prefix = "#include <stdbool.h>\n"
     if not wanted:
-        return text
+        return bool_prefix + text
     text = _STD_INCLUDE.sub("", text)
     text = _sub_code(re.compile(r"\bstd\s*::\s*"), "", text)
     if "vector" in wanted or "ownvector" in wanted:
         # `vector<string>` needs `string`; supplying it is cheaper than
         # working out whether this source asks for that combination.
         wanted.add("string")
-    parts = [_STD_DECLS]
+    parts = [bool_prefix, _STD_DECLS]
     if "string" in wanted:
         parts.append(_STD_STRING)
     if "vector" in wanted:
