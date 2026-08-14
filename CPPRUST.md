@@ -802,6 +802,35 @@ change meaning are **reported**:
 - a name provided by more than one `using namespace`, which C++ rejects as
   ambiguous and which taking the first of would silently resolve.
 
+### `map` and `pair`
+
+Supplied on `#include <map>`, and written in the subset like the others.
+
+```cpp
+std::map<std::string, int> t;
+t[key] = 1;
+if (t.find(key) != t.end()) { .. }
+for (auto it = m.begin(); it != m.end(); ++it) { use(it->second); }
+```
+
+**The iterator is a pointer.** That is the whole design: `it->first`, `++it`,
+`it != m.end()` and `*it` are then plain C on a plain pointer, and none of
+`operator++`, `operator!=` or an iterator class has to exist. It costs a
+linear `find` -- the storage is an unsorted array -- which is the honest
+trade for a container written in a subset with no comparison operator to
+order keys by.
+
+Keys are compared with `__cpp_eq`, which is `==` for a scalar and `T_equals`
+for a class, decided per instantiation. A key class needs
+`int equals(const T &o)`.
+
+**A user-defined key class does not work yet.** The supplied templates are
+spliced above the file, so when `map<K, ..>` is emitted `K` is not a class
+this pass has seen, and the key gets the by-value spelling -- which is then
+refused if `K` owns anything. `string` keys work because `string` is supplied
+above `map`. Fixing this means ordering instantiations against the classes
+they mention rather than against the file.
+
 ### `unique_ptr` and `shared_ptr`
 
 Supplied on `#include <memory>`, and like `string` and `vector` they are
@@ -844,6 +873,30 @@ Neither applies to a genuine pointer: `Ptr *p; p->x` means a member of `Ptr`
 in C++, not the operator, and `this->` is the same shape -- rewriting
 pointers turned every field access inside a class into a call to its own
 `operator->`.
+
+### Element builtins
+
+A template body is textual, so it can spell `T` but not `T_copy`:
+substitution rewrites whole words. Four builtins are the hook that lets a
+container say what it wants once and have it mean the right thing per
+instantiation:
+
+| | class | scalar |
+|---|---|---|
+| `__cpp_copy(T, dst, src)` | `T_copy(&dst, src)` | `dst = src` |
+| `__cpp_drop(T, x)` | `T_drop(&x)` | nothing |
+| `__cpp_eq(T, a, b)` | `T_equals(&a, b)` | `a == b` |
+| `__cpp_ref(T)` | `const T &` | `T` |
+
+`__cpp_ref` exists because a container cannot pick one spelling for a key
+parameter: by value it refuses an owning key (the copy is never constructed
+or destroyed), and by reference it cannot bind `m[3]`, since a literal has no
+address.
+
+Scalar **references** are lowered too -- `int &x` becomes `int *x` and its
+uses are dereferenced. A class reference needs no dereference, because every
+use of one is a member access and the symbol table already turns `o.x` into
+`o->x`; a bare `k` has no member to go through.
 
 ## Not supported yet
 
