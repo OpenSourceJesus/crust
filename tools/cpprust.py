@@ -390,7 +390,7 @@ def _check_unsupported(scan, path):
 
 class Member(object):
     __slots__ = ("kind", "ret", "name", "params", "body", "line", "dim",
-                 "init", "virt", "pure")
+                 "init", "virt", "pure", "outline")
 
     def __init__(self, kind, ret, name, params, body, line, dim="",
                  init=None, virt=False, pure=False):
@@ -404,6 +404,10 @@ class Member(object):
         self.init = init or []    # ctor initializer list: [(field, args)]
         self.virt = virt          # declared `virtual`
         self.pure = pure          # `= 0`, so no implementation here
+        # Defined out of line, under a qualified name. Its body is emitted
+        # where the author wrote it rather than at the class, so a body that
+        # reads a file-scope name declared between the two still sees it.
+        self.outline = False
 
 
 class Class(object):
@@ -468,6 +472,34 @@ def _pure_virtual(decl, cname, line0):
                   line0, "", None, True, True)
 
 
+def _drop_trailing_const(head):
+    """Remove a `const` that qualifies the member function itself."""
+    op = head.find("(")
+    if op < 0:
+        return head
+    cp = _match_paren(head, op)
+    if cp is None:
+        return head
+    tail = head[cp + 1:]
+    new_tail = re.sub(r"(?<![\w])const(?![\w])", "", tail, count=1)
+    return head[:cp + 1] + new_tail
+
+
+def _has_param_list(decl):
+    """Does this `;`-terminated member declaration have a parameter list?
+
+    `void draw()` does; `int width` does not; `int (*fn)(int)` is a function
+    *pointer field* and does not either -- the parens belong to the
+    declarator, not to the member.
+    """
+    op = decl.find("(")
+    if op < 0:
+        return False
+    if decl[op + 1:].lstrip().startswith("*"):
+        return False
+    return bool(re.match(r"^[~\w][\w:<>,&*\s]*$", decl[:op].strip() or "~"))
+
+
 def _split_members(body, cname, line0):
     """Parse a class body into fields, methods, a constructor and destructor."""
     body = _ACCESS.sub("", body)
@@ -487,31 +519,46 @@ def _split_members(body, cname, line0):
             i = semi + 1
             if not decl:
                 continue
-            if decl.startswith("virtual"):
+            if decl.startswith("virtual") and decl.rstrip().endswith("0"):
                 members.append(_pure_virtual(decl, cname, line0))
                 continue
-            parts = decl.replace("*", " * ").split()
-            if len(parts) < 2:
-                raise CppError("cannot parse member %r in class %s"
-                               % (decl, cname))
-            # `int arr[10];` -- the declarator suffix is not part of the name.
-            # Keeping it in the name would make field qualification miss every
-            # use of `arr` in a method body.
-            fname, dim = parts[-1], ""
-            b = fname.find("[")
-            if b >= 0:
-                fname, dim = fname[:b], fname[b:]
-            members.append(Member("field", " ".join(parts[:-1]), fname,
-                                  None, None, line0, dim))
-            continue
-        if brace < 0:
-            break
-        head = body[start:brace].strip()
-        close = _match_brace(body, brace)
-        if close is None:
-            raise CppError("unterminated method body in class %s" % cname)
-        inner = body[brace + 1:close]
-        i = close + 1
+            # A parameter list makes this a *declaration* of a member defined
+            # out of line -- `void draw();` in a header against
+            # `void Class::draw() {..}` in the source. It classifies exactly
+            # as the inline form does, so it goes through the same code with
+            # no body; the body is attached once the out-of-line definitions
+            # have been read.
+            if not _has_param_list(decl):
+                parts = decl.replace("*", " * ").split()
+                if len(parts) < 2:
+                    raise CppError("cannot parse member %r in class %s"
+                                   % (decl, cname))
+                # `int arr[10];` -- the declarator suffix is not part of the
+                # name. Keeping it there would make field qualification miss
+                # every use of `arr` in a method body.
+                fname, dim = parts[-1], ""
+                b = fname.find("[")
+                if b >= 0:
+                    fname, dim = fname[:b], fname[b:]
+                members.append(Member("field", " ".join(parts[:-1]), fname,
+                                      None, None, line0, dim))
+                continue
+            head, inner = decl, None
+        else:
+            if brace < 0:
+                break
+            head = body[start:brace].strip()
+            close = _match_brace(body, brace)
+            if close is None:
+                raise CppError("unterminated method body in class %s" % cname)
+            inner = body[brace + 1:close]
+            i = close + 1
+        # A trailing `const` on a member function is a promise about what
+        # the body does, not part of the signature this lowers: `this` is a
+        # pointer either way, and the C front end checks the body regardless.
+        # Dropped rather than modelled, and only *after* the parameter list,
+        # so a `const` return type or parameter is untouched.
+        head = _drop_trailing_const(head)
         op = head.find("(")
         if op < 0:
             raise CppError("cannot parse member %r in class %s" % (head, cname))
@@ -588,6 +635,168 @@ def _parse_base(clause, cname):
         raise CppError("class %s: cannot parse base clause %r"
                        % (cname, clause))
     return parts[0]
+
+
+_OUTLINE = re.compile(
+    r"(?<![\w:])([A-Za-z_][\w:]*(?:\s*<[^;{}()]*>)?[\s*&]+)?"
+    r"([A-Za-z_]\w*)\s*::\s*(~?[A-Za-z_]\w*|operator\s*(?:\[\s*\]|->|\*|=))"
+    r"\s*\(")
+
+
+_QUOTED_INCLUDE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*"([^"]+)"[ \t]*$',
+                             re.MULTILINE)
+
+
+def _expand_headers(text, basedir, seen=None, depth=0):
+    """Splice in `#include "x.h"` so a class and its definitions meet.
+
+    A C++ project declares members in a header and defines them in a source
+    file that includes it. The two halves have to be in one translation for
+    the lowering to work at all -- it emits a class and its bodies together
+    -- and the only thing that brings them together is the `#include`.
+
+    Quoted includes only. An angle-bracket one names a system header, which
+    is either supplied here (`<string>`, `<vector>`, `<memory>`) or left for
+    the C front end.
+
+    Each header is spliced once, which is what an include guard would do and
+    saves having to understand `#pragma once` or the `#ifndef` idiom. A
+    header that cannot be found is left as-is rather than reported: it may
+    well be one the C front end can resolve, and this pass is not the
+    authority on the include path.
+    """
+    if seen is None:
+        seen = set()
+    if depth > 32:
+        raise CppError("`#include` nested more than 32 deep; a cycle?")
+    out, last = [], 0
+    for m in _QUOTED_INCLUDE.finditer(text):
+        name = m.group(1)
+        cand = os.path.normpath(os.path.join(basedir, name))
+        out.append(text[last:m.start()])
+        last = m.end()
+        if cand in seen:
+            continue                     # already spliced: an include guard
+        try:
+            with open(cand, "r") as f:
+                inner = f.read()
+        except IOError:
+            out.append(m.group(0))       # not ours to resolve
+            continue
+        seen.add(cand)
+        out.append(_expand_headers(inner, os.path.dirname(cand), seen,
+                                   depth + 1))
+    out.append(text[last:])
+    return "".join(out)
+
+
+def _extract_out_of_line(text, scan, names):
+    """Pull `Ret Class::method(params) { .. }` definitions out of the file.
+
+    C++ projects are laid out with members *declared* in a class and
+    *defined* afterwards under a qualified name. Both halves have to be in
+    hand before a class is emitted, because the lowering needs the body and
+    the declaration in the same place -- so the definitions are lifted out
+    here, keyed by class, name and arity, and attached to the member they
+    belong to before anything is emitted.
+
+    Only at brace depth zero. A qualified name *inside* a body is a call
+    (`Foo::bar()`), and matching those would tear the middle out of a
+    function.
+
+    Returns `(text, scan, defs)` with the definitions removed, so the class
+    scan that follows sees the file as if the bodies had been written inline.
+    """
+    defs, cuts, depth, i, n = {}, [], 0, 0, len(scan)
+    while i < n:
+        c = scan[i]
+        if c == "{":
+            depth += 1
+            i += 1
+            continue
+        if c == "}":
+            depth -= 1
+            i += 1
+            continue
+        if depth != 0 or not (c.isalpha() or c == "_"):
+            i += 1
+            continue
+        m = _OUTLINE.match(scan, i)
+        if m is None or m.group(2) not in names:
+            i += 1
+            continue
+        op = m.end() - 1
+        cp = _match_paren(scan, op)
+        if cp is None:
+            i += 1
+            continue
+        # A trailing `const` is a promise about the body, and the body is
+        # checked by the C front end either way; the initializer list of an
+        # out-of-line constructor is kept for the class emitter.
+        tail_start = cp + 1
+        brace = scan.find("{", tail_start)
+        if brace < 0:
+            i += 1
+            continue
+        between = scan[tail_start:brace]
+        if ";" in between or "}" in between:
+            i += 1                       # a declaration, not a definition
+            continue
+        close = _match_brace(scan, brace)
+        if close is None:
+            raise CppError("unterminated definition of %s::%s"
+                           % (m.group(2), m.group(3)))
+        cls, name = m.group(2), re.sub(r"\s+", "", m.group(3))
+        params = text[op + 1:cp].strip()
+        defs[(cls, name, _arity(params))] = {
+            "ret": (m.group(1) or "").strip(),
+            "params": params,
+            "init": text[tail_start:brace],
+            "body": text[brace + 1:close],
+        }
+        cuts.append((m.start(), close + 1))
+        i = close + 1
+    if not cuts:
+        return text, scan, defs
+    out_t, out_s, prev = [], [], 0
+    for a, b in cuts:
+        out_t.append(text[prev:a])
+        out_s.append(scan[prev:a])
+        # Newlines are kept so every line number below this point is the one
+        # the author wrote.
+        keep = "\n" * text.count("\n", a, b)
+        out_t.append(keep)
+        out_s.append(keep)
+        prev = b
+    out_t.append(text[prev:])
+    out_s.append(scan[prev:])
+    return "".join(out_t), "".join(out_s), defs
+
+
+def _attach_out_of_line(cls, defs, path):
+    """Give each declared-but-undefined member the body defined for it."""
+    for m in cls.members:
+        if m.body is not None or m.kind == "field" or m.pure:
+            continue
+        # A destructor is written `~Counter` where it is defined and recorded
+        # as `Counter` on the member, so the key has to be put back together
+        # rather than taken from the name.
+        spelled = ("~" + cls.name) if m.kind == "dtor" else m.name
+        got = defs.get((cls.name, spelled, _arity(m.params or "")))
+        if got is None:
+            raise CppError(
+                "%s: `%s::%s` is declared but never defined. A member with "
+                "no body needs a `%s %s::%s(..) { .. }` in the same "
+                "translation, since the lowering emits the class and its "
+                "bodies together -- an empty one would compile and do "
+                "nothing."
+                % (os.path.basename(path), cls.name, spelled,
+                   (m.ret or "void"), cls.name, spelled))
+        m.params = got["params"]
+        m.body = got["body"]
+        m.outline = True
+        if m.kind == "ctor" and got["init"].strip():
+            m.init = _parse_init_list(got["init"], cls.name, cls.name)
 
 
 def _find_classes(scan, text):
@@ -1273,6 +1482,9 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
     # should keep hearing about functions it never calls.
     stor = "static inline" if prelude else "static"
 
+    tail = []
+    emitting_outline = [False]
+
     def emit(kind, mname, params, raw):
         refs = _ref_positions(params, names)
         params = _lower_refs(params, names)
@@ -1307,12 +1519,14 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             inner = _sub_code(
                 re.compile(r"(?<![\w.>])return\s+this\s*;"),
                 "return (%s *)this;" % rcls[0], inner)
-        out.append("%s %s %s(%s) {%s}" % (stor, kind, mname, arglist, inner))
+        (tail if emitting_outline[0] else out).append(
+            "%s %s %s(%s) {%s}" % (stor, kind, mname, arglist, inner))
         return refs
 
     for m in cls.members:
         if m.kind == "field" or m.pure:
             continue
+        emitting_outline[0] = m.outline
         params = sub(m.params or "").strip()
         if m.kind == "ctor" and m is copy:
             # A copy constructor lowers to its own symbol: every other
@@ -1535,7 +1749,8 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
     # its typedef, which is all a pointer field to a class defined later
     # needs -- and that is the shape a template instantiated over a class
     # declared below it always has.
-    return (head[:2], mprotos, head[2:] + out), cname, info
+    emitting_outline[0] = False
+    return (head[:2], mprotos, head[2:] + out, tail), cname, info
 
 
 def _prev_word(text, idx):
@@ -2363,7 +2578,11 @@ def _emit_method_call(expr, cls, is_ptr, meth, args, ent, cinfo):
                     "single-evaluation helper that was not emitted. Assign "
                     "the receiver to a local first." % meth)
             return "%s(%s%s)" % (helper, cast(ent["decl"], recv), tail)
-        return ("((const struct %s_vtable *)%s->_vptr)->%s(%s%s)"
+        # The receiver is parenthesised: it may already be `&c` for a value,
+        # and `&c->_vptr` parses as `&(c->_vptr)` -- the address of the
+        # pointer rather than the pointer. Dispatching on a value receiver
+        # emitted that and did not compile.
+        return ("((const struct %s_vtable *)(%s)->_vptr)->%s(%s%s)"
                 % (ent["decl"], cast(cinfo[cls]["root"], recv), meth,
                    cast(ent["decl"], recv), tail))
     # An inherited method takes the base as `this`; the base is the first
@@ -2812,7 +3031,7 @@ def _rewrite_calls(text, cinfo, free_refs):
                     return e if want == dcls else "((%s *)%s)" % (want, e)
 
                 out.append(
-                    "do { if (%s) { ((const struct %s_vtable *)%s->_vptr)"
+                    "do { if (%s) { ((const struct %s_vtable *)(%s)->_vptr)"
                     "->%s(%s); free(%s); } } while (0)"
                     % (expr, decl, dcast(cinfo[dcls]["root"], expr),
                        _DTOR_SLOT, dcast(decl, expr), expr))
@@ -3447,7 +3666,7 @@ def _lower_lambdas(text, path):
     return text
 
 
-def translate(text, path="<cpp>", owning=None):
+def translate(text, path="<cpp>", owning=None, basedir=None):
     """Translate a C++ subset source to C. Raises CppError on anything else.
 
     `owning` maps the name of a type this file does *not* define to the
@@ -3457,6 +3676,10 @@ def translate(text, path="<cpp>", owning=None):
     """
     # `std::string` / `std::vector` are supplied as ordinary subset source,
     # so everything below sees one file with no special cases in it.
+    # Headers first, before anything reads a declaration: a member declared
+    # in one and defined here has to arrive in the same translation.
+    if basedir is not None:
+        text = _expand_headers(text, basedir)
     text = _std_prelude(text)
     std_classes = _STD_CLASSES
     # Lambdas are lowered before anything else looks at the file: what comes
@@ -3486,7 +3709,19 @@ def translate(text, path="<cpp>", owning=None):
     scan = _strip_comments(text)
     _check_unsupported(scan, path)
 
+    # Out-of-line member definitions come out first, keyed by class. They
+    # have to be in hand before any class is emitted, and lifting them also
+    # keeps the class scan below from seeing a definition where it expects a
+    # declaration.
+    cls_names = set(re.findall(r"\b(?:class|struct)\s+(\w+)", scan))
+    text, scan, outline = _extract_out_of_line(text, scan, cls_names)
+
     classes = _find_classes(scan, text)
+    # Unconditionally, even with nothing to attach: this is also where a
+    # member declared and never defined is caught, and a file with no
+    # out-of-line definitions at all is exactly the case where that happens.
+    for _s, _e, _c in classes:
+        _attach_out_of_line(_c, outline, path)
 
     # Which classes does the source apply `new` to? Scanned from a copy with
     # literals and comments blanked, so the word inside `puts("new item")`
@@ -3638,7 +3873,7 @@ def translate(text, path="<cpp>", owning=None):
                  for n, fn in sorted((owning or {}).items())
                  if n not in declared)
     prev = 0
-    fwd, fwd_protos = [], []
+    fwd, fwd_protos, outline_bodies = [], [], []
     for start, end, cls in classes:
         # Keep everything before the class, minus any `template<..>` header,
         # which has no C equivalent.
@@ -3647,7 +3882,7 @@ def translate(text, path="<cpp>", owning=None):
         pieces.append(head)
         insts = wanted.get(cls.name, []) if cls.tparams else [None]
         for targs in insts:
-            (names_, protos, defs), cname, info = _emit_class(
+            (names_, protos, defs, tails), cname, info = _emit_class(
                 cls, names, cinfo, tsub, targs, new_used.get(cls.name),
                 chained, cls.name in std_classes)
             # Trailing newline: two instantiations of the same template are
@@ -3656,9 +3891,15 @@ def translate(text, path="<cpp>", owning=None):
             pieces.append("\n".join(defs) + "\n")
             fwd.extend(names_)
             fwd_protos.extend(protos)
+            outline_bodies.extend(tails)
             cinfo[cname] = info
         prev = end
     pieces.append(text[prev:])
+    # Bodies defined out of line go after everything, not at the class: the
+    # author wrote them below whatever file-scope names they read, and a
+    # header spliced in at the top would otherwise put them above.
+    if outline_bodies:
+        pieces.append("\n" + "\n".join(outline_bodies) + "\n")
     # Every class name declared up front, before any definition. A template
     # instantiated over a class defined *later* emits its struct where the
     # template sits, and the field type was then an unknown name:
@@ -3777,6 +4018,14 @@ def main(argv):
     args = list(argv)
     out_path = None
     owning = {}
+    basedir = None
+    if "--basedir" in args:
+        i = args.index("--basedir")
+        if i + 1 >= len(args):
+            sys.stderr.write("cpprust: --basedir needs a directory\n")
+            return 2
+        basedir = args[i + 1]
+        del args[i:i + 2]
     if "--owning" in args:
         i = args.index("--owning")
         if i + 1 >= len(args):
@@ -3797,7 +4046,7 @@ def main(argv):
         del args[i:i + 2]
     if len(args) != 1 or out_path is None:
         sys.stderr.write("usage: cpprust.py <source.cpp> -o <out.c> "
-                         "[--owning Name:dropfn,..]\n")
+                         "[--owning Name:dropfn,..] [--basedir DIR]\n")
         return 2
 
     src = args[0]
@@ -3809,7 +4058,9 @@ def main(argv):
         return 2
 
     try:
-        result = translate(text, path=src, owning=owning)
+        if basedir is None:
+            basedir = os.path.dirname(os.path.abspath(src))
+        result = translate(text, path=src, owning=owning, basedir=basedir)
     except CppError as e:
         # The message goes where the output would have gone; the caller
         # reads it back and reports it against the `#include` line.
