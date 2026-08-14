@@ -565,6 +565,11 @@ class Unit:
         self.trait_defaults = {}    # trait -> {method: tokens of the default}
         self.supertraits = {}       # trait -> [trait names]
         self.trait_impls = []       # (trait, owner, tokens)
+        # Types needing a `T_drop`, and the field frees it must run. Filled
+        # by `compute_drop_glue` before bodies are translated, so a `let`
+        # inside one can already see that its type owns something.
+        self.drop_types = set()
+        self.drop_glue = {}         # type -> [field free calls]
         self.const_defaults = {}    # trait -> {const: tokens}
         # Associated types: (owner type, name) -> RustCType. An associated type is
         # a type alias attached to an impl, so it resolves at monomorphisation
@@ -700,6 +705,15 @@ class Parser:
         # py2c does not see a new shape on every `.scopes[-1][name] = ...`.
         # kind is "file" | "func" | "loop" | "block".
         self.live = [{"kind": "file", "items": []}]
+        # Did the statement just emitted leave this block unconditionally?
+        # Only `return`, `break` and `continue` set it, and only at the level
+        # they are written; a block resets it on the way out, so an `if` whose
+        # body returns never marks its *parent* terminated. Being wrong in that
+        # direction costs an unreachable free call, which is dead code; being
+        # wrong the other way would drop twice.
+        self.terminated = False
+        # Set while emitting a `fn drop` that owes its fields a free.
+        self.drop_owner = None
         self.ret_type = VOID
         self.impl_type = None           # enclosing `impl` type name, if any
         self.no_struct_lit = 0          # >0 while parsing a condition
@@ -788,6 +802,12 @@ class Parser:
         """Free method name for a by-value owning type, or None."""
         if ty is None or ty.ptr or ty.array:
             return None
+        # A user `impl Drop for T`, or a struct holding something that owns.
+        # Either way the type has a `T_drop(T *self)` -- the same symbol
+        # cpprust emits for `~T()` -- so everything below works unchanged;
+        # only this lookup was ever hardcoded to the bundled core's table.
+        if ty.base in self.unit.drop_types:
+            return "drop"
         if ty.base == "String":
             return "free_buf"
         inst = self.unit.instances.get(ty.base)
@@ -820,19 +840,32 @@ class Parser:
                 return k
         return None
 
-    def emit_drops(self, out, line, indent, upto):
+    def emit_drops(self, out, line, indent, upto, skip=None):
         """Emit free calls for frames `upto..top`, innermost and latest first.
 
-        Clears the emitted entries so a later fall-through Drop (e.g. the
-        function epilogue after an early `return`) is a no-op.
+        **Never mutates the live set.** The set is a property of a program
+        *point*, not of the emission order, and an early exit is one path
+        through that point rather than the only one. Clearing here -- which
+        this did, to stop a trailing `return` being dropped twice by the
+        function epilogue -- made every *later* fall-through emit nothing,
+        because a conditional exit is textually before the one it shares a
+        block with. `if c { return 1; } 2` freed on the `c` path and leaked
+        on the other; a loop body holding a conditional `break` lost its
+        closing-brace drop outright and leaked on every non-breaking pass.
+        Double-drop is prevented by reachability instead (`self.terminated`).
+
+        `skip` names locals this particular path moves out rather than frees,
+        which is likewise per-path: `if c { return v; }` moves `v` on that
+        path only, and the fall-through must still drop it.
         """
         if upto is None:
             return
         for fr in reversed(self.live[upto:]):
             for name, mangled, _ty in reversed(fr["items"]):
+                if skip is not None and name in skip:
+                    continue
                 out.line_at(line, "%s(&%s);" % (mangled, _c_name(name)),
                             indent)
-            fr["items"] = []
 
     def emit_move_zero(self, out, line, indent, src_name, src_ty):
         """After copying an owning local, zero the source so Drop is a no-op."""
@@ -2734,9 +2767,17 @@ class Parser:
                 raise CrustError("line %d: unterminated block" % self.cur.line)
             self.parse_stmt(out, indent + 1, tail_returns)
         close = self.expect("}")
-        # Drop this frame's owning locals before leaving the block.
-        self.emit_drops(out, close.line, indent + 1, len(self.live) - 1)
+        # Drop this frame's owning locals before leaving the block -- unless
+        # the last statement already left it, in which case these would be
+        # unreachable and, at the function frame, a second drop of the same
+        # objects the `return` just emitted.
+        if not self.terminated:
+            self.emit_drops(out, close.line, indent + 1, len(self.live) - 1)
         self.scope_pop()
+        # A block never marks its *parent* terminated: `if c { return; }`
+        # leaves the fall-through path live, and treating it as dead is how
+        # the drops after it went missing.
+        self.terminated = False
         out.line_at(close.line, "}", indent)
 
     def parse_stmt(self, out, indent, tail_returns):
@@ -2788,17 +2829,25 @@ class Parser:
             return
 
         if t.val == "return" and t.kind == "kw":
+            if self.drop_owner is not None:
+                raise CrustError(
+                    "line %d: `return` inside `impl Drop for %s` would skip "
+                    "the field drops appended after the body, silently "
+                    "leaking them. Restructure with `if`/`else`."
+                    % (t.line, self.drop_owner))
             self.next()
             if self.accept(";"):
                 self.emit_pending(out, t.line, indent)
                 self.emit_drops(out, t.line, indent,
                                 self.live_frame_index(("func",)))
                 out.line_at(t.line, "return;", indent)
+                self.terminated = True
                 return
             e = self.parse_expr_as(self.ret_type)
             self.expect(";")
             self.emit_pending(out, t.line, indent)
             self._emit_return_value(out, t.line, indent, e)
+            self.terminated = True
             return
 
         if t.val == "break" and t.kind == "kw":
@@ -2807,6 +2856,7 @@ class Parser:
             self.emit_drops(out, t.line, indent,
                             self.live_frame_index(("loop",)))
             out.line_at(t.line, "break;", indent)
+            self.terminated = True
             return
 
         if t.val == "continue" and t.kind == "kw":
@@ -2815,6 +2865,7 @@ class Parser:
             self.emit_drops(out, t.line, indent,
                             self.live_frame_index(("loop",)))
             out.line_at(t.line, "continue;", indent)
+            self.terminated = True
             return
 
         if t.val == "if" and t.kind == "kw":
@@ -2892,36 +2943,48 @@ class Parser:
                              % self.cur.line)
         self.emit_pending(out, t.line, indent)
         if tail_returns and not self.ret_type.is_void():
+            # A tail expression *is* the return, so it terminates the block
+            # exactly as `return e;` does -- without this the epilogue emits
+            # an unreachable second drop of everything it just freed.
             self._emit_return_value(out, t.line, indent, e)
+            self.terminated = True
         else:
             out.line_at(t.line, e.code + ";", indent)
 
-    def _live_pending(self, upto):
-        """True if any owning local would be dropped from `upto` upward."""
+    def _live_pending(self, upto, skip=None):
+        """True if any owning local would be dropped from `upto` upward.
+
+        `skip` is the same per-path move set `emit_drops` takes: a return
+        that moves out the only live local drops nothing, so it needs no
+        spill temporary either.
+        """
         if upto is None:
             return False
         for fr in self.live[upto:]:
-            if fr["items"]:
-                return True
+            for name, _mangled, _ty in fr["items"]:
+                if skip is None or name not in skip:
+                    return True
         return False
 
     def _emit_return_value(self, out, line, indent, e):
         """Drop live locals, then `return` -- spilling when Drop must run first."""
         fidx = self.live_frame_index(("func",))
-        # Returning a bare owning local moves it out: do not free it here.
+        # Returning a bare owning local moves it out, so it is not freed on
+        # *this* path. Passed as `skip` rather than unregistered: the move
+        # belongs to this return, and `if c { return v; }` leaves `v` still
+        # owned by every path that did not take it.
         moved = self.simple_owning_local(e)
-        if moved is not None:
-            self.live_unregister(moved[0])
-        if self._live_pending(fidx) and not self.ret_type.is_void():
+        skip = set([moved[0]]) if moved is not None else None
+        if self._live_pending(fidx, skip) and not self.ret_type.is_void():
             # Spill before Drop: the operand may read an owning local.
             tmp = self.new_temp()
             out.line_at(line,
                         "%s = %s;" % (self.ret_type.decl(tmp), e.code),
                         indent)
-            self.emit_drops(out, line, indent, fidx)
+            self.emit_drops(out, line, indent, fidx, skip)
             out.line_at(line, "return %s;" % tmp, indent)
         else:
-            self.emit_drops(out, line, indent, fidx)
+            self.emit_drops(out, line, indent, fidx, skip)
             out.line_at(line, "return %s;" % e.code, indent)
 
     def parse_tuple_let(self, out, indent, t):
@@ -3038,8 +3101,10 @@ class Parser:
                 self.err("unterminated block")
             self.parse_stmt(out, indent + 1, False)
         close = self.expect("}")
-        self.emit_drops(out, close.line, indent + 1, len(self.live) - 1)
+        if not self.terminated:
+            self.emit_drops(out, close.line, indent + 1, len(self.live) - 1)
         self.scope_pop()
+        self.terminated = False
         out.line_at(close.line, "}", indent)
 
     def parse_if(self, out, indent, tail_returns):
@@ -3826,6 +3891,16 @@ class Parser:
         """
         prev_ret = self.ret_type
         self.ret_type = ret
+        # Is this the `fn drop` of a user `impl Drop for T` whose fields also
+        # need freeing? If so its epilogue carries the field glue, so that
+        # `T_drop` remains the one complete destructor -- the symbol a C++
+        # member epilogue calls and the one scope exit calls.
+        prev_glue = self.drop_owner
+        self.drop_owner = None
+        if self.impl_type is not None \
+                and name == "%s_drop" % self.impl_type \
+                and self.unit.drop_glue.get(self.impl_type):
+            self.drop_owner = self.impl_type
         out.line_at(start.line, "%s(%s)" % (ret.decl(name),
                                             render_params(params)), 0)
         self.scope_push("func")
@@ -3849,7 +3924,15 @@ class Parser:
         close = self.expect("}")
         # Drop body locals, then by-value owning params (func frame).
         fidx = self.live_frame_index(("func",))
-        self.emit_drops(out, close.line, 1, fidx)
+        if not self.terminated:
+            self.emit_drops(out, close.line, 1, fidx)
+        if self.drop_owner is not None:
+            # Fields are freed after the body, in declaration order (Rust's
+            # rule -- C++ and so cpprust use reverse order for members).
+            for stmt in self.unit.drop_glue[self.drop_owner]:
+                out.line_at(close.line, stmt, 1)
+        self.drop_owner = prev_glue
+        self.terminated = False
         self.scope_pop()
         if synth_main_ret:
             out.line_at(close.line, "return 0;", 1)
@@ -4289,6 +4372,36 @@ _ITEM_START = re.compile(
 _MODIFIER = re.compile(
     r"(?:\b(?:pub|unsafe)\b(?:\s*\([^)]*\))?\s+|\bextern\b\s*"
     r"(?:\"[^\"]*\"|\'[^\']*\')?\s*)*$")
+
+
+def _cpp_wants_core(code, path):
+    """Does an included `.cpp` name a bundled-core type this unit must emit?
+
+    Crust passes a file with no Rust items through untouched, which is right
+    for plain C. But a `.cpp` holding a `Vec_int` is asking for a Crust type
+    even when the C around it never mentions one, and returning early would
+    leave the include with nothing to point at. Cheap: only the core generic
+    names are known this early, and a file with no Rust items has no generics
+    of its own for the `.cpp` to be naming.
+    """
+    headers = find_cpp_includes(code)
+    if not headers:
+        return False
+    import shivyc.preproc as preproc
+    try:
+        gstructs, _gimpls = core_templates()
+    except Exception:
+        return False
+    prefixes = tuple(n + "_" for n in gstructs)
+    for header in headers:
+        try:
+            text, _fn = preproc.read_file(header, path or ".")
+        except IOError:
+            continue
+        for ident in _identifiers(text):
+            if ident.startswith(prefixes):
+                return True
+    return False
 
 
 def _blank(code):
@@ -5679,6 +5792,130 @@ def _blank_comments(code):
     return "".join(out)
 
 
+_CPP_INCLUDE = re.compile(
+    r'^[ \t]*#[ \t]*include[ \t]*(?P<q>["<])'
+    r'(?P<name>[^">]*\.(?:cpp|cc|cxx|hpp))[">]',
+    re.MULTILINE)
+
+
+def find_cpp_includes(code):
+    """The `#include` header spellings that name a C++ subset file."""
+    scan = _blank_comments(code)
+    out = []
+    for m in _CPP_INCLUDE.finditer(scan):
+        q = m.group("q")
+        out.append('"%s"' % m.group("name") if q == '"'
+                   else "<%s>" % m.group("name"))
+    return out
+
+
+def _identifiers(text):
+    """Every identifier in `text`, with comments and literals blanked."""
+    return set(re.findall(r"[A-Za-z_]\w*", _blank_cpp_literals(
+        _blank_comments(text))))
+
+
+def _blank_cpp_literals(text):
+    """Blank string and char literal bodies, preserving length."""
+    out, i, n = list(text), 0, len(text)
+    while i < n:
+        c = text[i]
+        if c in "\"'":
+            j = i + 1
+            while j < n and text[j] != c:
+                j += 2 if text[j] == "\\" else 1
+            for k in range(i + 1, min(j, n)):
+                if out[k] != "\n":
+                    out[k] = " "
+            i = min(j + 1, n)
+        else:
+            i += 1
+    return "".join(out)
+
+
+def _split_mangled(suffix, cands, k):
+    """Every way `suffix` splits into `k` mangled candidate type names.
+
+    A mangled instantiation cannot be taken apart by reading it: `_mangle`
+    collapses each run of non-word characters to one underscore, so
+    `Vec_unsigned_long` could be `Vec<u64>` or a two-parameter generic over
+    `unsigned` and `long`. So this generates forward -- it re-mangles each
+    candidate and asks whether the suffix starts with it -- and the caller
+    reports rather than picks when more than one split comes back.
+    """
+    if k == 0:
+        return [[]] if suffix == "" else []
+    out = []
+    for c in cands:
+        m = _mangle(RustCType(c))
+        if not m:
+            continue
+        if k == 1:
+            if suffix == m:
+                out.append([c])
+        elif suffix.startswith(m + "_"):
+            for rest in _split_mangled(suffix[len(m) + 1:], cands, k - 1):
+                out.append([c] + rest)
+    return out
+
+
+def seed_cpp_instances(code, path, unit):
+    """Instantiate the Crust generics an included `.cpp` names.
+
+    A `.cpp` cannot spell `Vec<i32>` -- that is Rust syntax, and cpprust has
+    templates of its own -- so it names the *lowered* type, `Vec_int`, which
+    is exactly what Crust emits and what C reads with no conversion. But
+    instantiation is demand-driven off the Rust and C text, so a container
+    only the C++ file mentions is never emitted at all, and the include sees
+    an undeclared type.
+
+    Reading the included file for those names closes that gap, and does it
+    the same way `collect_include_items` reads an included `.rs` for its
+    items: the directive itself is left alone for the preprocessor.
+
+    Best effort, and never fatal on a file it cannot read -- a `.cpp` that
+    does not open here will be opened by the preprocessor a moment later,
+    which is where that error belongs.
+    """
+    headers = find_cpp_includes(code)
+    if not headers or not unit.generic_structs:
+        return
+    import shivyc.preproc as preproc
+    spelled = set()
+    for header in headers:
+        try:
+            text, _fn = preproc.read_file(header, path or ".")
+        except IOError:
+            continue                    # the preprocessor reports it
+        spelled |= _identifiers(text)
+    if not spelled:
+        return
+    # What a type argument could be: every primitive's C spelling, and every
+    # concrete type this unit already knows. A generic argument is not a
+    # candidate -- it has no lowered name to appear in a `.cpp`.
+    cands = sorted(set(PRIMITIVES.values())
+                   | set(n for n in unit.structs if n not in unit.generic_structs)
+                   | set(unit.enums))
+    p = Parser([RustToken("eof", "", 0)], unit)
+    for gname in sorted(unit.generic_structs):
+        params, _toks = unit.generic_structs[gname]
+        prefix = gname + "_"
+        for ident in sorted(spelled):
+            if not ident.startswith(prefix) or ident in unit.structs:
+                continue
+            splits = _split_mangled(ident[len(prefix):], cands, len(params))
+            if not splits:
+                continue
+            if len(splits) > 1:
+                raise CrustError(
+                    "`%s` in an included .cpp could be %s. The mangled name "
+                    "is ambiguous, so name the instantiation from the Rust "
+                    "or C side too and the .cpp will find it."
+                    % (ident, " or ".join(
+                        "`%s<%s>`" % (gname, ", ".join(s)) for s in splits)))
+            p.instantiate_struct(gname, [RustCType(a) for a in splits[0]])
+
+
 def collect_include_items(code, path, _seen=None):
     """Build a Unit seeded from every `.rs` file `code` includes.
 
@@ -5903,6 +6140,93 @@ def _derive_debug(unit, name, fields):
             name, ", ".join(parts))
     unit.emitted.append("void %s_debug(%s *self) { %s }"
                         % (name, name, body))
+
+
+def _needs_drop(unit, ty, drops):
+    """Does a by-value field of this type own something that must be freed?
+
+    A pointer or an array field is left to the author, exactly as a pointer
+    or array *member* is on the C++ side: neither language's implicit drop
+    reaches through one.
+    """
+    if ty is None or ty.ptr or ty.array:
+        return False
+    if ty.base == "String":
+        return True
+    if ty.base in drops:
+        return True
+    inst = unit.instances.get(ty.base)
+    return bool(inst and _OWNING_FREE.get(inst[0]))
+
+
+def _field_free(unit, ty, drops):
+    """The C function that frees a by-value field, or None."""
+    if not _needs_drop(unit, ty, drops):
+        return None
+    if ty.base in drops:
+        mname = "drop"
+    elif ty.base == "String":
+        mname = "free_buf"
+    else:
+        inst = unit.instances.get(ty.base)
+        mname = _OWNING_FREE.get(inst[0]) if inst else None
+    if mname is None:
+        return None
+    info = unit.methods.get((ty.base, mname))
+    return info.mangled if info else None
+
+
+def compute_drop_glue(unit):
+    """Work out which types need a `T_drop`, and what it has to free.
+
+    Two things make a type need one: a user `impl Drop for T`, and a field
+    that itself needs dropping. The second is transitive -- a struct holding
+    a struct holding a `Vec<i32>` needs one -- so the set is closed to a
+    fixed point rather than computed in one pass.
+
+    Fields are freed in **declaration order**, which is Rust's rule. This is
+    a deliberate divergence from `tools/cpprust.py`, whose `_member_epilogue`
+    destroys members in *reverse* declaration order, because that is C++'s.
+    The two languages genuinely disagree here, and matching each to its own
+    source language is more honest than picking one and being wrong in the
+    other -- the symbol is shared, the order is not.
+    """
+    user = set(owner for trait, owner, _t in unit.trait_impls
+               if trait == "Drop")
+    # A core instance (`Vec_int`) already has its own free method and must
+    # not be given a synthesized one; it only ever appears as a field.
+    core = set(n for n in unit.structs if n in unit.instances
+               and _OWNING_FREE.get(unit.instances[n][0]))
+    drops = set(user)
+    for _round in range(len(unit.structs) + 1):
+        grew = False
+        for name in unit.structs:
+            if name in drops or name in core:
+                continue
+            for _f, fty in unit.structs[name]:
+                if _needs_drop(unit, fty, drops):
+                    drops.add(name)
+                    grew = True
+                    break
+        if not grew:
+            break
+    unit.drop_types = drops
+    for name in sorted(drops):
+        glue = []
+        for fname, fty in unit.structs.get(name, []):
+            fn = _field_free(unit, fty, drops)
+            if fn is not None:
+                glue.append("%s(&self->%s);" % (fn, fname))
+        unit.drop_glue[name] = glue
+        if name in user:
+            # The user's own `fn drop` supplies the body; the glue is
+            # appended to it when it is emitted, so `T_drop` stays the one
+            # complete destructor -- which is what a C++ member epilogue
+            # calls, and what scope exit calls.
+            continue
+        _register(unit, name, "drop", VOID, [], self_kind="ref")
+        unit.emitted.append("void %s_drop(%s *self) { %s }"
+                            % (name, name, " ".join(glue) or "(void)self;"))
 
 
 def _register(unit, owner, mname, ret, params, self_kind):
@@ -6582,21 +6906,62 @@ def _int_atom(text, i):
     return int(lit, 10), j
 
 
-def _emit_prelude(body, prelude):
+_CPP_INCLUDE_LINE = re.compile(
+    r'^[ \t]*#[ \t]*include[ \t]*["<][^">]*\.(?:cpp|cc|cxx|hpp)[">]',
+    re.MULTILINE)
+
+
+def _cpp_include_offset(code):
+    """Offset of the line holding the first `#include` of a C++ subset file."""
+    scan = _blank_comments(code)
+    m = _CPP_INCLUDE_LINE.search(scan)
+    return m.start() if m else None
+
+
+def _emit_prelude(body, prelude, path=None):
     """Insert prelude at a safe offset.
 
     Ordinary items share one physical line so source line numbers do not
     move. `#define`s need their own lines (the directive runs to newline),
     so they are placed just before that shared line.
+
+    A `#include` of a C++ subset file is the one case that has to be placed
+    *above* rather than beside. The include is expanded later, by the
+    preprocessor, and the C++ it lowers may hold a Crust type by value -- a
+    `Vec_int` member rather than a `Vec_int *`. That needs the struct to be
+    complete at the include, and the ordinary offset puts the prelude on the
+    first line that is neither a directive nor comment interior, which is
+    always *after* it. Nothing could be prefixed onto the `#include` line
+    itself, since `#` has to come first on its line.
+
+    So the prelude goes on its own lines above the include and a `#line`
+    directive states where the original source resumes. Every diagnostic
+    after it names the line the user actually wrote, which is the property
+    the one-line form existed to protect in the first place.
     """
     if not prelude:
         return body
     at = _prelude_offset(body)
+    resync = None
+    cpp_at = _cpp_include_offset(body)
+    if cpp_at is not None and cpp_at < at:
+        at = cpp_at
+        # The include sits on this source line, and `#line N` names the line
+        # *after* the directive -- so this is exactly N.
+        resync = body.count("\n", 0, cpp_at) + 1
     defines = [p for p in prelude if p.startswith("#define ")]
     rest = [p for p in prelude if not p.startswith("#define ")]
     chunk = "".join(d + "\n" for d in defines)
+    if resync is None:
+        if rest:
+            chunk += " ".join(rest) + " "
+        return body[:at] + chunk + body[at:]
     if rest:
-        chunk += " ".join(rest) + " "
+        chunk += " ".join(rest) + "\n"
+    where = ""
+    if path:
+        where = ' "%s"' % str(path).replace("\\", "\\\\").replace('"', '\\"')
+    chunk += "#line %d%s\n" % (resync, where)
     return body[:at] + chunk + body[at:]
 
 
@@ -6766,7 +7131,7 @@ def translate(code, path=None):
         code = "".join(buf)
         spans = [sp for sp in spans if sp not in dropped]
     included = collect_include_items(code, path)
-    if not spans:
+    if not spans and not _cpp_wants_core(code, path):
         return code
 
     where = ("%s: " % path) if path else ""
@@ -6823,6 +7188,14 @@ def translate(code, path=None):
     # can call a method neither the impl nor the user wrote out.
     emit_trait_defaults(unit)
     emit_derives(unit, set(local["structs"]))
+    # A `.cpp` include may name a lowered Crust type (`Vec_int`) that nothing
+    # on the Rust or C side does; instantiate those before anything asks what
+    # the unit contains.
+    seed_cpp_instances(code, path, unit)
+    # Which types own something, and what their `T_drop` has to free. Before
+    # pass 2, because a body translated there asks `owning_free` whether each
+    # local needs a scope-exit drop.
+    compute_drop_glue(unit)
 
     # Pass 2: translate each item in place. Struct definitions are hoisted
     # into the prelude (see below), so their source region becomes blank.
@@ -7020,7 +7393,7 @@ def translate(code, path=None):
         body = body.rstrip("\n") + "\n\n" + "\n".join(unit.emitted) + "\n"
     if not prelude:
         return body
-    return _emit_prelude(body, prelude)
+    return _emit_prelude(body, prelude, path)
 
 
 def translate_file(path):

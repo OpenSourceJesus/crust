@@ -58,6 +58,17 @@ def token_key(tokens):
             h.update(str(getattr(t.kind, "text_repr", t.kind)).encode())
             h.update(b"\x01")
             h.update(str(getattr(t, "content", "")).encode())
+            # Position, too. A cached AST carries the `Range` of every node,
+            # so two streams that spell the same tokens at different lines are
+            # *not* interchangeable -- replaying one for the other reports
+            # every diagnostic against the wrong line. `#line` makes this
+            # reachable on purpose: it changes positions and nothing else, so
+            # without this the resync is silently undone by a cache hit.
+            h.update(b"\x02")
+            r = getattr(t, "r", None)
+            if r is not None and r.start is not None:
+                h.update(("%s:%d:%d" % (r.start.file, r.start.line,
+                                        r.start.col)).encode())
         return h.hexdigest()
     return ""
 

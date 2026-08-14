@@ -25,7 +25,7 @@ import sys
 import shivyc.lexer as lexer
 import shivyc.token_kinds as token_kinds
 from shivyc.tokens import Token, parse_c_int
-from shivyc.errors import error_collector, CompilerError
+from shivyc.errors import error_collector, CompilerError, Position, Range
 
 
 # Where lowered `.cpp` sources are staged. Same convention as the rpython
@@ -460,6 +460,60 @@ class _Macro:
 class _Preprocessor:
     def __init__(self, macros):
         self.macros = macros
+        # `#line` state. `shift` is added to every subsequent token's line
+        # number in *this* file, so a pass that inserts text can hand the
+        # line numbering back to the original source. An include runs its own
+        # `_Preprocessor`, so the remap never leaks across files.
+        self._line_shift = 0
+        self._line_file = None
+
+    def _remap(self, tok):
+        """Apply the active `#line` remap to one token, in place."""
+        if not self._line_shift and self._line_file is None:
+            return tok
+        r = getattr(tok, "r", None)
+        if r is None or r.start is None:
+            return tok
+
+        def mv(pos):
+            if pos is None:
+                return None
+            return Position(self._line_file or pos.file,
+                            pos.line + self._line_shift,
+                            pos.col, pos.full_line)
+
+        tok.r = Range(mv(r.start), mv(r.end))
+        return tok
+
+    def _do_line(self, rest, directive):
+        """`#line N ["file"]` -- renumber the lines that follow.
+
+        The operand names the line the *next* physical line is to be called,
+        which is what makes it a resync: a pass that inserted text above can
+        state where the original source resumes, and every later diagnostic
+        names the line the user actually wrote. Without this the only safe
+        place to add code was onto an existing line, which is why the Crust
+        prelude could never be put above a `#include`.
+        """
+        rest = [t for t in rest if t.kind is not token_kinds.pound]
+        if not rest:
+            return
+        text = str(rest[0].content).strip().strip("'\"")
+        if not text.isdigit():
+            return                      # not a line number: ignore, as before
+        want = int(text)
+        here = directive.r.start.line if directive.r else 0
+        self._line_shift = want - (here + 1)
+        if len(rest) > 1 and rest[1].kind is token_kinds.string:
+            # A string token's content is the NUL-terminated byte list the
+            # lexer built, not a `str` -- rendering it directly puts
+            # `[47, 116, ..]` where the file name belongs.
+            name = rest[1].content
+            if isinstance(name, (list, tuple)):
+                name = bytes(b for b in name if b).decode("utf-8", "replace")
+            elif isinstance(name, (bytes, bytearray)):
+                name = bytes(name).rstrip(b"\x00").decode("utf-8", "replace")
+            self._line_file = str(name).rstrip("\x00")
 
     def run(self, tokens, this_file):
         lines = self._group_lines(tokens)
@@ -480,7 +534,7 @@ class _Preprocessor:
                 flush()
                 self._directive(line, cond, out, this_file, emitting)
             elif emitting():
-                pending.extend(line)
+                pending.extend(self._remap(t) for t in line)
         flush()
 
         if cond:
@@ -579,7 +633,10 @@ class _Preprocessor:
             msg = " ".join(spell(t) for t in rest)
             error_collector.add(CompilerError("#error " + msg, line[0].r))
 
-        elif name in ("pragma", "line", "ident", "sccs", "warning"):
+        elif name == "line":
+            self._do_line(rest, line[0])
+
+        elif name in ("pragma", "ident", "sccs", "warning"):
             pass  # ignored
 
         # Unknown directives are silently ignored (lenient).
