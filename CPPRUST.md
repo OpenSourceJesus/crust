@@ -885,13 +885,44 @@ because the name has to be a C identifier.
 The operand is taken like `operator=`'s: it has to be something this pass can
 name and address.
 
+### Comparison operators
+
+`operator==`, `!=`, `<`, `<=`, `>`, `>=`. Unlike an assignment the *result*
+is the point, so the declared return type is kept: `a == b` becomes
+`P__cmpeq(&a, &b)`.
+
+Only a bare name on the left. This pass knows the type of a local; an
+expression it would have to infer one for is left alone -- which is also what
+keeps `vec<int> v;` from reading as a comparison.
+
 ### Conversion operators
 
-**Not supported, and reported as their own thing** rather than lumped in with
-the overloads that are merely missing. `operator T()` applies wherever the
-compiler decides a conversion is wanted, and this pass reads types from how
-they are written -- so there is no honest way to know where to insert the
-call. Give the class a named method and call it.
+`operator T()` is **declarable**, and lowers to an ordinary method
+`T__conv(Class *this)`. Refusing the declaration was refusing whole files
+over a feature they never used: litehtml has exactly one conversion
+operator, in a header every file includes.
+
+What is limited is where the call gets inserted. It goes in where the target
+type is **written**:
+
+```cpp
+int w = dv;          /* a declaration with a written type */
+w = dv;              /* assignment to a local of known type */
+```
+
+Anywhere else the conversion is left out, and the C front end reports the
+type mismatch on the struct. A conversion applies wherever the compiler
+decides one is wanted, and knowing that means knowing the type every
+expression is *used at* -- which is type checking, not the reading of written
+types this pass does. Written targets are exactly the cases it can be sure
+of.
+
+### `bool`
+
+A keyword in C++ and a header in C. A `.cpp` writing `bool`, `true` or
+`false` has included nothing for it and should not have to, so
+`<stdbool.h>` is pulled in -- rather than the type being redefined here,
+which would clash with a file that does include it.
 
 ### Element builtins
 
@@ -920,9 +951,9 @@ use of one is a member access and the symbol table already turns `o.x` into
 ## Not supported yet
 
 Reported rather than mistranslated: exceptions (`throw` / `try` / `catch`),
-operator overloading other than `=`, a compound assignment, `[]`, `->` and
-`*` (in particular comparison, stream and *conversion* operators),
-`dynamic_cast`, `typeid`,
+operator overloading other than `=`, a compound assignment, a comparison,
+`[]`, `->` and `*` (in particular the stream operators), anonymous `union`
+members, `dynamic_cast`, `typeid`,
 multiple and virtual inheritance, iterators (`begin`/`end`), and the rest of
 the STL.
 
