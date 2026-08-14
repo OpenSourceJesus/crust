@@ -110,9 +110,14 @@ def _run_cpprust(filename, text):
     owned = getattr(_crust, "OWNING_TYPES", None) or {}
     spec = ",".join("%s:%s" % (n, owned[n]) for n in sorted(owned))
 
+    # Where the `.cpp` really lives, not where it was staged: its own
+    # `#include "x.h"` are relative to it, and the child expands those itself
+    # so that a class declared in a header meets the definitions here.
+    basedir = os.path.dirname(os.path.abspath(filename)) or "."
+
     if sys.implementation.name != "shivyc":
         import subprocess
-        cmd = [sys.executable, script, src, "-o", out]
+        cmd = [sys.executable, script, src, "-o", out, "--basedir", basedir]
         if spec:
             cmd += ["--owning", spec]
         try:
@@ -135,7 +140,7 @@ def _run_cpprust(filename, text):
         # stderr is dropped because the message is read back from `out`.
         extra = (" --owning " + spec) if spec else ""
         rc = os.system("python3 " + script + " " + src + " -o " + out +
-                       extra + " 2>/dev/null")
+                       " --basedir " + basedir + extra + " 2>/dev/null")
         if rc != 0:
             return False, _read_or(out, "translation failed")
 
