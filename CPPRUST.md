@@ -691,6 +691,19 @@ The range has to be a name: an array with a written size, or a class with
 `size()` and `operator[]`, optionally through a pointer. `begin()`/`end()`
 iterators are a different feature and are reported, not guessed at.
 
+### `= default` and `= delete`
+
+`~T() = default;` asks for the destructor the compiler would have written,
+which here is the member epilogue -- and that is appended to whatever body a
+destructor has, so it is rewritten to an empty body. Rewritten rather than
+dropped, because that keeps `virtual` attached, and `virtual` decides whether
+the class gets a vtable slot.
+
+`= delete` asks for the member not to exist, and a member this pass never
+sees does not. Dropping it lands on the right behaviour for the case that
+matters: a deleted copy constructor leaves a class with a destructor and no
+copy constructor, which the Rule of Three check already refuses to copy.
+
 ### Namespaces
 
 `namespace N { .. }` and `N::x` are flattened to `N_x` -- the same thing
@@ -703,6 +716,14 @@ function's locals are not namespace names, and prefixing them renamed
 `Point::x` to `geo_x` and broke every use of it.
 
 What this does not do is overload resolution or argument-dependent lookup.
+Flattening is name-mangling, not lookup, so the two ways it could quietly
+change meaning are **reported**:
+
+- a flattened name that collides with something already declared, since the
+  two would become one symbol -- and the call sites merge before the C front
+  end ever gets to report the redefinition;
+- a name provided by more than one `using namespace`, which C++ rejects as
+  ambiguous and which taking the first of would silently resolve.
 
 ### `unique_ptr` and `shared_ptr`
 
@@ -729,8 +750,23 @@ is not known to be a class when the body is parsed, so a plain `delete` frees
 the memory without running the element's destructor; the builtin is resolved
 per instantiation and does.
 
-Access is through `get()`. `operator->` and `operator*` are overloads, and
-overloads other than `=` and `[]` are not in the subset.
+Access is through `get()`, `operator->` or `operator*`:
+
+```cpp
+u->v = 4;                               // operator->
+(*u).v = 4;                             // operator*
+u.get()->v = 4;                         // the explicit form
+```
+
+Both are supported on any class, not just these. `operator->` returns a plain
+pointer -- C++ keeps applying it until one comes back, and this subset does
+the first hop only. `operator*` returns a reference and is lowered like
+`operator[]`, so `*p = x` assigns through rather than to a copy.
+
+Neither applies to a genuine pointer: `Ptr *p; p->x` means a member of `Ptr`
+in C++, not the operator, and `this->` is the same shape -- rewriting
+pointers turned every field access inside a class into a call to its own
+`operator->`.
 
 ## Not supported yet
 
