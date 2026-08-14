@@ -669,6 +669,20 @@ def resolve_namespaces(text, path="<cpp>", blank=None):
         ns = m.group(1)
         body, body_scan = text[open_idx + 1:close], scan[open_idx + 1:close]
         declared = _declared_in(body_scan)
+        # Flattening is name-mangling, not lookup: if `N_x` is already taken
+        # by something declared outside, the two become one symbol. The C
+        # front end would report the redefinition, but the *call sites* merge
+        # before that -- `geo_twice(1)` and `geo::twice(1)` would already be
+        # calling the same function -- so it is caught here instead.
+        outside = _declared_in(scan[:m.start()] + scan[close + 1:])
+        for name in sorted(declared):
+            target = "%s_%s" % (ns, name)
+            if target in outside:
+                raise AutoError(
+                    "%s:%d: flattening `%s::%s` gives `%s`, which this file "
+                    "already declares. C has one namespace, so the two would "
+                    "become one symbol. Rename one of them."
+                    % (path, _line_of(text, m.start()), ns, name, target))
         for name in sorted(declared, key=len, reverse=True):
             body = _sub_name(body, _blank_like(body), name, ns + "_" + name)
             body_scan = _blank_like(body)
@@ -679,19 +693,34 @@ def resolve_namespaces(text, path="<cpp>", blank=None):
         scan = _blank_like(text)
 
     # `using namespace N;` -- the names are already `N_x`, so an unqualified
-    # spelling has to be pointed at one.
+    # spelling has to be pointed at one. All of them are collected first:
+    # two `using`s that both provide a name make it ambiguous, which C++
+    # rejects, and taking whichever came first would silently pick one.
+    opened = []
     while True:
         m = _USING_NS.search(scan)
         if m is None:
             break
-        ns = m.group(1)
+        opened.append((m.group(1), _line_of(text, m.start())))
         text = text[:m.start()] + text[m.end():]
         scan = _blank_like(text)
-        pref = ns + "_"
-        for name in sorted(set(re.findall(r"\b%s(\w+)\b" % re.escape(pref),
-                                          scan)), key=len, reverse=True):
-            text = _sub_name(text, _blank_like(text), name, pref + name)
-            scan = _blank_like(text)
+    if not opened:
+        return text
+    provides = {}
+    for ns, line in opened:
+        for name in set(re.findall(r"\b%s(\w+)\b" % re.escape(ns + "_"),
+                                   scan)):
+            provides.setdefault(name, []).append(ns)
+    for name in sorted(provides):
+        if len(provides[name]) > 1:
+            raise AutoError(
+                "%s: `%s` is provided by `using namespace` on more than one "
+                "of %s, so an unqualified use of it is ambiguous. Qualify it."
+                % (path, name, " and ".join("`%s`" % n
+                                            for n in sorted(provides[name]))))
+    for name in sorted(provides, key=len, reverse=True):
+        text = _sub_name(text, _blank_like(text), name,
+                         provides[name][0] + "_" + name)
     return text
 
 
@@ -745,3 +774,46 @@ def _sub_qualified(text, scan, ns):
         last = m.end()
     out.append(text[last:])
     return "".join(out)
+
+
+# --------------------------------------------------------------------------
+# `= default` and `= delete`
+# --------------------------------------------------------------------------
+
+_DEFAULTED = re.compile(r"\)\s*(?:const\s*)?=\s*(default|delete)\s*;")
+
+
+def resolve_defaulted(text, path="<cpp>", blank=None):
+    """Rewrite `= default` to an empty body and drop `= delete` members.
+
+    `~T() = default;` asks for the destructor the compiler would have
+    written, which here is the member epilogue -- and that is appended to
+    whatever body the member has, so an empty one gives exactly it. Rewriting
+    rather than dropping the member keeps `virtual` attached, which decides
+    whether the class gets a vtable slot.
+
+    `= delete` asks for the member *not* to exist, and a member this pass
+    never sees does not. Dropping it lands on the right behaviour for the
+    case that matters: a deleted copy constructor leaves a class with a
+    destructor and no copy constructor, which the Rule of Three check already
+    refuses to copy, with a diagnostic that names the fix.
+    """
+    scan = blank if blank is not None else text
+    if "=" not in scan:
+        return text
+    out, i = [], 0
+    while True:
+        m = _DEFAULTED.search(scan, i)
+        if m is None:
+            out.append(text[i:])
+            return "".join(out)
+        out.append(text[i:m.start()])
+        if m.group(1) == "default":
+            out.append(") { }")
+        else:
+            # Drop the whole declaration, back to the start of the member.
+            head = out.pop() if out else ""
+            cut = max(head.rfind(";"), head.rfind("{"), head.rfind("}"),
+                      head.rfind(":"))
+            out.append(head[:cut + 1])
+        i = m.end()
