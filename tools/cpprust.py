@@ -32,6 +32,10 @@ The subset, deliberately small:
     template instantiated only from inside another template's body is
     reported rather than emitted as a dangling name: the scan that
     discovers instantiations cannot see through an unsubstituted parameter.
+  * inherited fields, reached through the `_base` member they actually live
+    in: a derived method naming a base field, and `d->field` on a derived
+    object, both resolve through a recorded access path rather than
+    assuming every field sits at the top of the class.
   * single inheritance, with `virtual` methods and pure virtual (`= 0`)
     declarations. A base is laid out as the first member, so a pointer to a
     derived object already *is* a pointer to its base and upcasting is a
@@ -108,10 +112,17 @@ table; a cast or a call is reported rather than guessed at.
 Rejected here rather than mistranslated: `new T[n]` and `delete[]`, which
 would need the element count recorded beside the allocation; `new` of a
 non-class or of an abstract class; `delete` of a by-value object; and
-`delete` through a class with a `virtual` destructor, because the vtable
-carries methods only and the call could not dispatch -- running the base
-destructor and leaking the derived part is the exact bug `virtual ~T()` is
-written to prevent.
+`delete` of an operand whose type does not resolve through the symbol table.
+
+A `virtual` destructor occupies a vtable slot under a reserved name, so
+`delete base_ptr` dispatches to the most derived destructor, which then
+chains to its base through the ordinary epilogue. A derived class always
+overrides that slot -- explicitly, or through the destructor it is given
+implicitly to chain to the base -- so `virtual` need not be repeated. The
+slot is not addressable as a method. Because the base is the first member,
+`new Derived()` assigned to a `Base *` is upcast with an
+address-preserving cast, which is also why `free` on the base pointer
+releases the whole allocation.
 
 Not supported, and reported rather than mistranslated: multiple inheritance,
 virtual inheritance, exceptions, operator overloading, the STL. Multiple
@@ -853,6 +864,22 @@ def _member_epilogue(value_members, known):
     return (" " + " ".join(lines)) if lines else ""
 
 
+# The destructor's vtable slot. Not a legal C++ member name, so it cannot
+# collide with a method the source declared.
+_DTOR_SLOT = "__dtor"
+
+
+def _slot_fn(slot, impl):
+    """The C function implementing `slot` in class `impl`.
+
+    A destructor is emitted as `Class_drop`, not `Class___dtor`, so the two
+    kinds of slot spell their implementation differently.
+    """
+    if slot["name"] == _DTOR_SLOT:
+        return "%s_drop" % impl
+    return "%s_%s" % (impl, slot["name"])
+
+
 def _vtable_slots(cls, cname, base_info, known):
     """Ordered vtable layout: inherited slots first, then newly declared.
 
@@ -860,6 +887,14 @@ def _vtable_slots(cls, cname, base_info, known):
     derived vtable stays layout-compatible with its base's and a `Base *`
     can dispatch through it. Overriding replaces the implementation, never
     the slot's position or its `this` type.
+    A destructor occupies a slot like any other virtual, under a reserved
+    name so it cannot collide with a method. It differs in two ways. Its
+    implementation is not `Class_<slot>` but `Class_drop`, so the table entry
+    is spelled separately. And a derived class *always* overrides it: if the
+    base has a destructor then the derived class gets one too, explicitly or
+    implicitly, because its epilogue has to chain to the base. So the slot's
+    implementation is this class whenever the slot exists at all -- which is
+    knowable here, before the epilogue that proves it has been built.
     """
     slots = [dict(s) for s in (base_info["slots"] if base_info else [])]
     by_name = dict((s["name"], s) for s in slots)
@@ -879,6 +914,15 @@ def _vtable_slots(cls, cname, base_info, known):
             # An override without the keyword still overrides.
             by_name[m.name]["impl"] = cname
             by_name[m.name]["pure"] = False
+
+    dtor = next((m for m in cls.members if m.kind == "dtor"), None)
+    if _DTOR_SLOT in by_name:
+        # Inherited: this class has a destructor either way, so it overrides.
+        # `virtual` need not be repeated, exactly as for a method override.
+        by_name[_DTOR_SLOT]["impl"] = cname
+    elif dtor is not None and dtor.virt:
+        slots.append({"name": _DTOR_SLOT, "decl": cname, "ret": "void",
+                      "params": "", "pure": False, "impl": cname})
     return slots
 
 
@@ -946,14 +990,22 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False):
         mnames = sorted(set(mnames) | set(base_info["methods"]))
     info = {"ctor": False, "dtor": False, "ctor_args": "", "methods": {},
             "fields": {}, "base": base, "slots": slots, "root": root,
-            "abstract": abstract, "vdtor": False, "ctor_refs": set()}
+            "abstract": abstract, "vdtor": False, "vdtor_decl": None,
+            "ctor_refs": set(), "paths": {}}
     if base_info:
         # Inherited members and methods are reachable on the derived class.
+        # A base field is not at the same offset as an own field, though: the
+        # base is the first *member*, so reaching `id` means going through
+        # `_base`. Each class records the path from `this` to every field it
+        # can see, and a derived class prefixes its base's paths.
         for k, v in base_info["fields"].items():
             info["fields"].setdefault(k, v)
+        for k, v in base_info["paths"].items():
+            info["paths"][k] = "_base." + v
         for k, v in base_info["methods"].items():
             info["methods"][k] = dict(v)
-        info["vdtor"] = base_info["vdtor"]
+    # `vdtor` is not propagated by hand: the destructor slot is inherited
+    # through `slots` like any other, and is read back off it below.
 
     value_members = []
     for f in fields:
@@ -962,14 +1014,14 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False):
         b = b[0] if b else ""
         is_ptr = "*" in t
         info["fields"][f.name] = (b, is_ptr)
+        # An own field shadows an inherited one of the same name.
+        info["paths"][f.name] = f.name
         if b in known and not is_ptr and not f.dim:
             value_members.append((f.name, b))
     fieldset = set(info["fields"])
 
     ctor = next((m for m in cls.members if m.kind == "ctor"), None)
     dtor = next((m for m in cls.members if m.kind == "dtor"), None)
-    if dtor is not None and dtor.virt:
-        info["vdtor"] = True
     initmap = dict(ctor.init) if ctor is not None else {}
 
     # Base construction runs first, then the vptr is installed, then members.
@@ -1004,14 +1056,17 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False):
         arglist = "%s *this" % cname + (", " + params if params else "")
         inner = _implicit_this(raw, mnames)
         # Bare member names inside a body refer to fields; qualify them.
+        # Inherited ones go through `_base`, so the path is substituted
+        # rather than the bare name -- `id` in a derived method is
+        # `this->_base.id`, not `this->id`, which would not compile.
         # One alternation rather than a pass per field: each pass would have
         # to re-blank the body, and a field qualified by an earlier pass
         # would be re-examined by a later one.
-        if fields:
+        if info["paths"]:
             inner = _sub_code(
                 re.compile(r"(?<![\w.>])(%s)\b"
-                           % _type_alt([f.name for f in fields])),
-                lambda m: "this->" + m.group(1), inner)
+                           % _type_alt(list(info["paths"]))),
+                lambda m: "this->" + info["paths"][m.group(1)], inner)
         inner = inner.replace("this->this->", "this->")
         out.append("static %s %s(%s) {%s}" % (kind, mname, arglist, inner))
         return refs
@@ -1067,8 +1122,14 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False):
         out.append("static %s *%s__alloc(%s) { %s }"
                    % (cname, cname, cparams or "void", " ".join(body)))
 
-    # Virtual methods resolve through the vtable rather than by name.
+    # Virtual methods resolve through the vtable rather than by name. The
+    # destructor slot is not addressable as a method, so it is not listed
+    # here -- `delete` reaches it through `vdtor_decl`.
     for s in slots:
+        if s["name"] == _DTOR_SLOT:
+            info["vdtor"] = True
+            info["vdtor_decl"] = s["decl"]
+            continue
         info["methods"][s["name"]] = {
             "refs": _ref_positions(s["params"], names), "owner": s["impl"],
             "virtual": True, "decl": s["decl"]}
@@ -1079,9 +1140,9 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False):
             impl = s["impl"]
             plist = (", " + s["params"]) if s["params"].strip() else ""
             if impl == s["decl"]:
-                entries.append("%s_%s" % (impl, s["name"]))
-                protos.append("static %s %s_%s(%s *this%s);"
-                              % (s["ret"], impl, s["name"], impl, plist))
+                entries.append(_slot_fn(s, impl))
+                protos.append("static %s %s(%s *this%s);"
+                              % (s["ret"], _slot_fn(s, impl), impl, plist))
                 continue
             # The slot's `this` is the declaring class; the implementation
             # takes its own. A thunk converts, which keeps the table free of
@@ -1092,9 +1153,9 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False):
             ret = "" if s["ret"].strip() == "void" else "return "
             protos.append("static %s %s(%s *this%s);"
                           % (s["ret"], thunk, s["decl"], plist))
-            thunks.append("static %s %s(%s *this%s) { %s%s_%s((%s *)this%s); }"
-                          % (s["ret"], thunk, s["decl"], plist, ret, impl,
-                             s["name"], impl,
+            thunks.append("static %s %s(%s *this%s) { %s%s((%s *)this%s); }"
+                          % (s["ret"], thunk, s["decl"], plist, ret,
+                             _slot_fn(s, impl), impl,
                              "".join(", " + f for f in fwd)))
             entries.append(thunk)
         # The constructor installs the table, so the table has to be visible
@@ -1449,6 +1510,42 @@ def _addr(expr, is_ptr):
     return expr if is_ptr else "&" + expr
 
 
+def _is_ancestor(maybe_base, derived, cinfo):
+    """Is `maybe_base` a base of `derived`, however far up?"""
+    seen = set()
+    cur = cinfo.get(derived, {}).get("base")
+    while cur and cur not in seen:
+        if cur == maybe_base:
+            return True
+        seen.add(cur)
+        cur = cinfo.get(cur, {}).get("base")
+    return False
+
+
+_DECL_TARGET = re.compile(r"(?<![\w.])(\w+)\s*\*\s*\w+\s*=\s*$")
+_ASSIGN_TARGET = re.compile(r"(?<![\w.>])(\w+)\s*=\s*$")
+
+
+def _assign_target(before, scopes, cinfo):
+    """The class a `new` expression is being assigned into, or None.
+
+    Two shapes are recognised, which is what covers `Base *p = new
+    Derived();` and a later `p = new Derived();`. Anything else -- a
+    `return`, an argument, a field write through a chain -- yields None and
+    no cast is inserted, so the C compiler still reports a real mismatch.
+    """
+    m = _DECL_TARGET.search(before)
+    if m is not None:
+        return m.group(1) if m.group(1) in cinfo else None
+    m = _ASSIGN_TARGET.search(before)
+    if m is not None:
+        for s in reversed(scopes):
+            if m.group(1) in s:
+                cls, is_ptr = s[m.group(1)]
+                return cls if is_ptr else None
+    return None
+
+
 def _rewrite_calls(text, cinfo, free_refs):
     """`g.get()` -> `VecGuard_get(&g)`, `p->get()` -> `VecGuard_get(p)`.
 
@@ -1502,7 +1599,10 @@ def _rewrite_calls(text, cinfo, free_refs):
             fields = cinfo[cls]["fields"]
             if fld not in fields:
                 return None
-            expr = "%s%s%s" % (expr, "->" if is_ptr else ".", fld)
+            # Inherited fields sit inside `_base`, so the recorded path is
+            # what reaches them; an own field's path is just its name.
+            path = cinfo[cls]["paths"].get(fld, fld)
+            expr = "%s%s%s" % (expr, "->" if is_ptr else ".", path)
             cls, is_ptr = fields[fld]
         return (expr, cls, is_ptr)
 
@@ -1680,7 +1780,18 @@ def _rewrite_calls(text, cinfo, free_refs):
                     args = fix_args(text[op + 1:close],
                                     cinfo[tname]["ctor_refs"], scopes)
                     end = close + 1
-            out.append("%s__alloc(%s)" % (tname, args))
+            alloc = "%s__alloc(%s)" % (tname, args)
+            # `Base *p = new Derived(..)` is the shape the whole virtual
+            # story rests on, and C will not convert `Derived *` to `Base *`
+            # on its own. The base is the first member, so the cast is
+            # address-preserving; it is inserted only when the target really
+            # is an ancestor, so an unrelated mismatch still gets diagnosed
+            # by the C compiler rather than silently cast away.
+            target = _assign_target(look[:i], scopes, cinfo)
+            if target is not None and target != tname \
+                    and _is_ancestor(target, tname, cinfo):
+                alloc = "(%s *)%s" % (target, alloc)
+            out.append(alloc)
             i = end
             continue
 
@@ -1710,16 +1821,22 @@ def _rewrite_calls(text, cinfo, free_refs):
                     "A by-value local is destroyed at the end of its scope."
                     % operand)
             if cinfo[dcls]["vdtor"]:
-                # The vtable holds methods only, so a destructor call cannot
-                # dispatch. Deleting through a base pointer would run the
-                # base destructor and leave the derived part untouched --
-                # exactly the bug `virtual ~T()` is written to prevent.
-                raise CppError(
-                    "`delete %s`: %s has a virtual destructor, which this "
-                    "lowering cannot dispatch -- the vtable carries methods "
-                    "only. Call the concrete `_drop` and `free` explicitly."
-                    % (operand, dcls))
-            if cinfo[dcls]["dtor"]:
+                # Dispatch: the static type may be a base, and the object may
+                # be a derived one whose destructor has to run. The vptr sits
+                # at offset zero in the root, and the base is the first
+                # member, so both casts are address-preserving -- which is
+                # also why `free` on the base pointer frees the allocation.
+                decl = cinfo[dcls]["vdtor_decl"]
+
+                def dcast(want, e):
+                    return e if want == dcls else "((%s *)%s)" % (want, e)
+
+                out.append(
+                    "do { if (%s) { ((const struct %s_vtable *)%s->_vptr)"
+                    "->%s(%s); free(%s); } } while (0)"
+                    % (expr, decl, dcast(cinfo[dcls]["root"], expr),
+                       _DTOR_SLOT, dcast(decl, expr), expr))
+            elif cinfo[dcls]["dtor"]:
                 # Guarded and wrapped: `delete` on a null pointer is a no-op
                 # in C++, and a bare block would leave a stray `;` before an
                 # `else` when the delete is a branch's only statement.
