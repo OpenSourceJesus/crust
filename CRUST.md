@@ -677,8 +677,9 @@ actually matters is recognized separately.
 ## `Rc<T>` and `Arc<T>`
 
 These count references and free at zero. Scope-exit Drop covers `Vec` /
-`String` / `Box` / `VecDeque`, **not** `Rc`/`Arc`: **every `clone()` must
-still be matched by an explicit `release()`**. An unmatched clone leaks
+`String` / `Box` / `VecDeque` and any type with an `impl Drop`, **not**
+`Rc`/`Arc`: **every `clone()` must still be matched by an explicit
+`release()`**. An unmatched clone leaks
 rather than corrupting anything, which is the right direction to fail.
 
 `Arc` is `Rc` with a different name. Its refcount is not atomic, because Crust
@@ -1243,11 +1244,11 @@ the one thing a monomorphised container cannot be written without.
 
 **This is a reimplementation, not the standard library.** The shape and the
 common methods match, so ordinary code reads the same. What is missing is
-missing rather than faked: no iterators protocol proper, no user-defined
-`Drop` trait (by-value `Vec`/`String`/`Box`/`VecDeque` locals do get
-`free_buf`/`free_box` at scope exit), no bounds checking, and nothing
-thread-safe — `Arc`, `Mutex` and `RwLock` are deliberately *not* included,
-because without atomics or threads they could only be lies.
+missing rather than faked: no iterators protocol proper, no bounds checking,
+and nothing thread-safe — `Arc`, `Mutex` and `RwLock` are deliberately *not*
+included, because without atomics or threads they could only be lies. A
+user-defined `Drop` is supported (see below); `Rc`/`Arc` auto-`release` is
+not.
 
 ### Scope-exit Drop
 
@@ -1257,9 +1258,121 @@ exit from the scope: the closing `}`, `return` (spilling the operand first
 when anything live must be dropped), `break`, and `continue`. A simple
 `let b = a` or `b = a` of an owning local moves: the source is zeroed so a
 later Drop is a no-op. Returning a bare owning local moves it out without
-freeing. This is not a Rust `Drop` trait — custom destructors and `Rc`/`Arc`
-auto-`release` are still out of scope. C++ RAII (`#include "owned.cpp"`)
-remains available for guards that wrap Crust types from the other side.
+freeing.
+
+## The `Drop` trait
+
+`impl Drop for T` gives a type a destructor, and scope exit calls it:
+
+```rust
+struct Guard { id: i32 }
+
+impl Drop for Guard {
+    fn drop(&mut self) { println!("drop {}", self.id); }
+}
+```
+
+```c
+void Guard_drop(Guard *self) { printf("drop %d\n", self->id); }
+```
+
+Nothing about that lowering is special: `impl Drop for T` is an ordinary
+trait impl, and a trait impl already lowers to `Type_method`, so `drop` on
+`Guard` was always coming out as `Guard_drop`. What was missing was only the
+call. The scope-exit machinery is type-agnostic — it emits `mangled(&name)`
+— and the one thing pinning it to the bundled core was a table lookup, which
+now consults the set of types that actually need dropping.
+
+That matters more than it sounds, because **`T_drop` is exactly the symbol
+`tools/cpprust.py` emits for `~T()`**. A Rust `impl Drop` and a C++
+destructor over the same data produce the same C function, so a C++ class can
+hold a Crust type by value and its member epilogue calls the Rust destructor
+with no shim (see the C++ section below).
+
+### Field glue
+
+A type also needs a destructor when it merely *owns* one, and that is
+transitive: a struct holding a struct holding a `Vec<i32>` needs one too. The
+set is closed to a fixed point rather than computed in one pass, and a type
+with no `impl Drop` of its own gets a synthesized destructor:
+
+```rust
+struct Leaf { id: i32 }
+impl Drop for Leaf { fn drop(&mut self) { .. } }
+
+struct Mid { a: Leaf, buf: Vec<i32> }     // no impl Drop
+struct Top { m: Mid }                     // nor here
+```
+
+```c
+void Mid_drop(Mid *self) { Leaf_drop(&self->a); Vec_int_free_buf(&self->buf); }
+void Top_drop(Top *self) { Mid_drop(&self->m); }
+```
+
+Where a type has both an `impl Drop` *and* owning fields, the glue is
+appended to the body the user wrote, so `T_drop` stays the one complete
+destructor — which is what both a C++ member epilogue and scope exit call.
+The body runs first, then the fields, as in Rust.
+
+**Fields are freed in declaration order**, which is Rust's rule. This is a
+deliberate divergence from `tools/cpprust.py`, whose `_member_epilogue`
+destroys members in *reverse* declaration order, because that is C++'s. The
+two languages genuinely disagree here, and matching each to its own source
+language is more honest than picking one and being wrong in the other: the
+symbol is shared, the order is not.
+
+**Refused:** `return` inside a `fn drop` that owes its fields a free. The
+glue is appended after the body, so a `return` would jump over it and leak
+exactly the fields the destructor exists to release.
+
+A pointer or array field is left to the author, exactly as a pointer or array
+*member* is on the C++ side — neither language's implicit drop reaches
+through one. `Rc`/`Arc` auto-`release` is still out of scope.
+
+### The leak underneath
+
+Getting this working exposed a bug that had nothing to do with the `Drop`
+trait and had been there as long as scope-exit Drop had: **a conditional
+early exit deleted the drops on every path after it.**
+
+`emit_drops` cleared the live set as it emitted, to stop a trailing `return`
+being dropped a second time by the function epilogue. But that recorded a
+*per-path* fact as global state, and a conditional exit is textually before
+the fall-through it shares a block with — so the conditional exit consumed
+the list and the fall-through emitted nothing:
+
+```c
+int f(int n) {
+    Vec_int v = Vec_int_new();
+    if ((n > 0)) { int _crust_opt1 = 1; Vec_int_free_buf(&v); return _crust_opt1; }
+    return 2;                                    /* leaked */
+}
+```
+
+A loop body holding a conditional `break` lost its closing-brace drop
+outright, so every iteration that did not break leaked. `_emit_return_value`
+had the same defect in a second form: `return v;` moves `v` out, and it
+unregistered `v` *permanently*, so `if c { return v; }` left every other path
+forgetting it.
+
+The fix separates the two things the clearing was conflating. `emit_drops`
+never mutates — a move is passed per call as a skip set — and double-drop is
+prevented by **reachability** instead: `return`, `break`, `continue` and a
+tail expression mark the block terminated, and a block resets that on the way
+out, so an `if` whose body returns never marks its *parent* terminated. Being
+wrong in that direction costs one unreachable free call, which is dead code.
+Being wrong the other way drops twice.
+
+This is worth recording for how it hid. It leaked rather than corrupting, so
+the program exited 0 with the right answer; `tools/crust_examples.py` checks
+stdout and exit status, and `crustfuzz` classifies a clean compile as a pass.
+Neither could see it. `tests/test_crust.py` now reads the *generated C* for
+the free calls on both paths, which is the only place the difference is
+visible without a counting destructor.
+
+C++ RAII (`#include "owned.cpp"`) remains available for guards that wrap
+Crust types from the other side, and is still the right tool where the guard
+should borrow rather than own.
 
 ## Finding crashes: `tools/crustfuzz.py`
 
@@ -1376,15 +1489,21 @@ there is no shortcut left that avoids them.
 
 ## Not yet supported
 
-Traits, user-defined generics (`Option` and `Result` are the only
-monomorphised types), closures, modules, `Vec`, the iterator protocol proper
-(`.map`, `.filter`, `.zip`, chained adaptors), `From`/`Into` conversions,
-lifetimes, and the borrow checker. Enums cannot carry data, and `match` has no
-bindings, guards or range patterns. Slices carry no bounds checking. A repeat
+The iterator protocol proper (`.map`, `.filter`, `.zip`, chained adaptors),
+`From`/`Into` conversions, `dyn Trait` and trait objects, capturing closures,
+and the borrow checker. `match` has no guards or range patterns, and outside a
+data enum no pattern bindings. Slices carry no bounds checking. A repeat
 initializer whose length is not a literal or `const` is rejected, since C has
-no repeat syntax to lower it to. Paths (`a::b`) are flattened to `a_b`. These
-are the natural next increments — the parser is a few hundred lines of legible
-Python, in keeping with the rest of the front end.
+no repeat syntax to lower it to. Lifetimes are accepted and dropped rather
+than checked. Paths (`a::b`) are flattened to `a_b`. `Rc`/`Arc` do not
+auto-`release`, and there are no threads, so `Mutex`/`RwLock` do not
+synchronise. These are the natural next increments — the parser is a few
+hundred lines of legible Python, in keeping with the rest of the front end.
+
+(This list had drifted badly: it still named traits, generics, `Vec`,
+closures, modules and data-carrying enums, all of which have their own
+sections above. It is worth re-reading against the table in **Supported
+subset** rather than trusted on its own.)
 
 ## Examples
 
@@ -1443,9 +1562,7 @@ with a value spills it to a temporary before the destructors run, since C++
 evaluates the operand first and `return g.get();` reads the object about to be
 destroyed. `goto` is rejected while a destructor is pending, because where it
 lands decides what should have been destroyed.
-The guard holds a `Vec_int *` rather than a by-value field: the include is
-expanded before Crust emits the Rust type, so the type is incomplete in the
-class body. Single inheritance and `virtual` methods are supported: a base is
+Single inheritance and `virtual` methods are supported: a base is
 laid out as the first member, so upcasting is a pointer cast, and the vtable
 pointer sits first in the hierarchy root, hence at offset zero throughout. A
 derived class's table begins with its base's slots, which is what lets a
@@ -1455,6 +1572,42 @@ with a pure virtual (`= 0`) method is abstract, and declaring one by value is
 an error rather than an object whose vptr is never set. Multiple inheritance,
 virtual inheritance, exceptions, `new`/`delete`, and the STL are rejected
 rather than mistranslated.
+
+A class may hold a Crust type **by value** — a `Vec_int` member, not just a
+`Vec_int *` — and needs no forward declarations to do it. This used to be
+impossible: the include is expanded before Crust emits the Rust type, so the
+type was incomplete in the class body, and the guard had to hold a pointer.
+Two things changed. Crust now places its prelude *above* the first
+`#include` of a C++ file and emits a `#line` directive so the original line
+numbering resumes, which is what lets the struct be complete at the include
+without moving anybody's diagnostics. And the instantiations the `.cpp` names
+are seeded from the `.cpp` itself, so a `Vec_int` that no Rust or C in the
+unit mentions is still emitted.
+
+A `.cpp` cannot spell `Vec<i32>` — that is Rust syntax, and cpprust has
+templates of its own — so it names the lowered form, `Vec_int`, which is
+exactly what Crust emits and what C reads with no conversion. Resolving that
+name goes forward rather than by inversion: a mangled name cannot reliably be
+taken apart (`Vec_unsigned_long` could be `Vec<u64>` or a two-parameter
+generic over `unsigned` and `long`), so Crust re-mangles each candidate and
+asks whether the spelling matches, and **reports rather than picks** when
+more than one does.
+
+Because a Rust `impl Drop for T` and a C++ `~T()` produce the same
+`T_drop(T *)`, a C++ destructor calls a Rust one directly:
+
+```cpp
+class Holder {
+public:
+    Vec_int nums;                       /* by value */
+    Res r;                              /* Rust type with `impl Drop` */
+    Holder() { nums = Vec_int_new(); }
+    ~Holder() { Vec_int_free_buf(&nums); Res_drop(&r); }
+};
+```
+
+Borrowing a pointer is still the better design where the guard should not own
+the container, and `examples/crust/owned.cpp` keeps that shape.
 
 Method calls are written as C++: `g.get()` and `p->get()` lower to
 `VecGuard_get(&g)` and `VecGuard_get(p)`. Receivers resolve against a

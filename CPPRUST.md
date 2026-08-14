@@ -18,18 +18,47 @@ python3 tools/cpprust.py guard.cpp -o guard.c    # or use the include above
 
 ## Why C++ is here at all
 
-Crust has no `Drop`. Scope exit cannot run code, so every allocating type in
-its core carries an explicit `free_buf` and the caller has to remember. C++
-is the one of the three languages here whose object model is built around
-**deterministic destruction**, so a C++ class is the natural place to put an
-RAII wrapper around a Rust type: the destructor call is emitted at scope
-exit, and the Rust side keeps its explicit API for callers that want it.
+Crust now has a `Drop` trait of its own, so this is no longer the only place
+in the project where scope exit can run code. What C++ still brings is a
+*richer* object model around the same idea: constructors chosen by arity,
+copy construction and `operator=`, member and base construction ordering,
+inheritance and virtual dispatch. Where a Rust `impl Drop` gives a type a
+destructor, a C++ class gives it a whole lifecycle.
 
-The lowering is deliberately the same shape Crust uses for `impl` blocks — a
-method becomes `Class_method(Class *this, ..)`, a template becomes one
-struct per instantiation. That is not a coincidence. It means a C++ class
-and a Rust `impl` over the same data produce the same C, so the two can be
-mixed in one unit without a shim.
+The two meet at the symbol. The lowering is deliberately the same shape
+Crust uses for `impl` blocks — a method becomes `Class_method(Class *this,
+..)`, a template becomes one struct per instantiation. That is not a
+coincidence. It means a C++ class and a Rust `impl` over the same data
+produce the same C, so the two can be mixed in one unit without a shim.
+
+That extends to destruction: a Rust `impl Drop for T` lowers to
+`T_drop(T *self)`, which is exactly what `~T()` lowers to here. So a C++
+class may hold a Crust type **by value** and its member epilogue calls the
+Rust destructor directly:
+
+```cpp
+class Holder {
+public:
+    Vec_int nums;                       /* a Crust `Vec<i32>`, by value */
+    Res r;                              /* a Crust type with `impl Drop`  */
+    Holder() { nums = Vec_int_new(); }
+    ~Holder() { Vec_int_free_buf(&nums); Res_drop(&r); }
+};
+```
+
+No forward declarations are needed. Crust places its prelude above the first
+`#include` of a C++ file and emits a `#line` directive so the original line
+numbering resumes, which is what makes the struct complete here without
+moving anybody's diagnostics; and it seeds the instantiations this file names
+even when no Rust or C in the unit mentions them. Note the spelling: a `.cpp`
+names the *lowered* type, `Vec_int`, not `Vec<i32>` — the latter is Rust
+syntax, and `<>` here means a template of this subset's own.
+
+One ordering difference is worth knowing. Members are destroyed in **reverse
+declaration order**, because that is C++'s rule; Crust's field glue frees in
+**declaration order**, because that is Rust's. The two languages disagree,
+and each side follows its own source language rather than one being made to
+match the other. The symbol is shared; the order is not.
 
 ## The guiding rule
 
