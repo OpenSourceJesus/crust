@@ -2668,12 +2668,13 @@ int f(Ptr *p) { return p->v; }
         self.assertIn("unique_ptr_T__arrow", out)
 
     def test_other_overloads_are_still_reported(self):
-        # `+=` is supported now; the comparison and stream operators are not.
+        # `+=` and the comparisons are supported now; the stream operators
+        # are not.
         with self.assertRaises(cpprust.CppError) as cm:
             cpprust.translate(
-                "class A { public: int v; int operator<(const A &o) "
-                "{ return v < o.v; } };", path="t.cpp")
-        self.assertIn("operator<", cm.exception.message)
+                "class A { public: int v; A operator<<(int n) "
+                "{ return *this; } };", path="t.cpp")
+        self.assertIn("operator<<", cm.exception.message)
 
 
 class TestCppNamespaceHazards(unittest.TestCase):
@@ -3246,19 +3247,31 @@ class TestCppConversionOperator(unittest.TestCase):
     pass reads types from how they are written.
     """
 
-    def test_it_is_named_as_a_conversion(self):
-        with self.assertRaises(cpprust.CppError) as cm:
-            cpprust.translate(
-                "class A { public: int v; operator int() { return v; } };",
-                path="t.cpp")
-        self.assertIn("conversion operator", cm.exception.message)
+    def test_the_declaration_lowers_to_a_method(self):
+        # Refusing the declaration refused forty files over two call sites:
+        # litehtml has exactly one conversion operator, in a header every
+        # file includes. What is limited is where the call can be inserted.
+        out = cpprust.translate(
+            "class A { public: int v; A() { v = 0; } "
+            "operator int() { return v; } };" "\n"
+            "int f(void) { A a; return a.v; }", path="t.cpp")
+        self.assertIn("A__conv(A *this) { return this->v; }", out)
+
+    def test_it_applies_where_the_target_type_is_written(self):
+        out = cpprust.translate(
+            "class A { public: int v; A() { v = 3; } "
+            "operator int() { return v; } };" "\n"
+            "int f(void) { A a; int w = a; int z; z = a; return w + z; }",
+            path="t.cpp")
+        self.assertIn("int w = A__conv(&a);", out)
+        self.assertIn("z = A__conv(&a);", out)
 
     def test_a_missing_overload_still_reads_as_one(self):
         with self.assertRaises(cpprust.CppError) as cm:
             cpprust.translate(
-                "class A { public: int v; int operator<(const A &o) "
-                "{ return v < o.v; } };", path="t.cpp")
-        self.assertIn("operator<", cm.exception.message)
+                "class A { public: int v; A operator<<(int n) "
+                "{ return *this; } };", path="t.cpp")
+        self.assertIn("operator<<", cm.exception.message)
         self.assertNotIn("conversion", cm.exception.message)
 
 
@@ -3281,3 +3294,83 @@ class TestCppDeclarationScanAnchors(unittest.TestCase):
             "template<typename K,typename V> class map { public: "
             "pair<K,V> *find(__cpp_ref(K) k) { return 0; } };"))
         self.assertEqual(m.get("map", {}).get("find"), "pair<K,V> *")
+
+
+class TestCppComparisonOperators(unittest.TestCase):
+    """`operator==` and friends. Unlike an assignment the *result* is the
+    point, so the declared return type is kept."""
+
+    P = """
+class P {
+public:
+    int v;
+    P() { v = 0; }
+    int operator==(const P &o) { return v == o.v; }
+    int operator!=(const P &o) { return v != o.v; }
+    int operator<(const P &o) { return v < o.v; }
+    int operator<=(const P &o) { return v <= o.v; }
+};
+"""
+
+    def test_equality_becomes_a_call(self):
+        out = cpprust.translate(
+            self.P + "int f(void) { P a; P b; return a == b; }", path="t.cpp")
+        self.assertIn("P__cmpeq(&a, &b)", out)
+
+    def test_longest_spelling_wins(self):
+        # `<=` must not be read as `<`.
+        out = cpprust.translate(
+            self.P + "int f(void) { P a; P b; return a <= b; }", path="t.cpp")
+        # The class declares `operator<` too, so `P__cmplt` exists -- what
+        # matters is which one the *call site* picked.
+        call = out[out.index("int f(void)"):]
+        self.assertIn("P__cmple(&a, &b)", call)
+        self.assertNotIn("P__cmplt", call)
+
+    def test_scalar_comparisons_are_untouched(self):
+        out = cpprust.translate(
+            "int f(void) { int a = 1; int b = 2; return a == b; }",
+            path="t.cpp")
+        self.assertIn("a == b", out)
+
+    def test_a_template_use_is_not_a_comparison(self):
+        # `vec<int> v;` has a `<` in it and no class-typed local in front.
+        out = cpprust.translate("""
+template<typename T> class vec { T *d; public: vec() { d = 0; } };
+int f(void) { vec<int> v; return 0; }
+""", path="t.cpp")
+        self.assertIn("vec_int v;", out)
+
+    def test_an_unnameable_right_hand_side_is_reported(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate(
+                self.P + "int mk(void);\n"
+                "int f(void) { P a; return a == mk; }", path="t.cpp")
+        self.assertIn("not an object of type P", cm.exception.message)
+
+
+class TestCppBool(unittest.TestCase):
+    """`bool` is a keyword in C++ and a header in C."""
+
+    def test_bool_pulls_in_the_header(self):
+        out = cpprust.translate(
+            "class A { public: bool b; A() { b = true; } };\n"
+            "int f(void) { A a; return a.b ? 1 : 0; }", path="t.cpp")
+        self.assertIn("#include <stdbool.h>", out)
+
+    def test_true_and_false_alone_are_enough(self):
+        # A file may use the literals without ever writing the type.
+        out = cpprust.translate(
+            "int f(void) { int x = true; return x; }", path="t.cpp")
+        self.assertIn("#include <stdbool.h>", out)
+
+    def test_a_file_that_includes_it_is_left_alone(self):
+        # Redefining would clash with the real header.
+        out = cpprust.translate(
+            "#include <stdbool.h>\nint f(void) { bool x = true; return x; }",
+            path="t.cpp")
+        self.assertEqual(out.count("stdbool.h"), 1)
+
+    def test_a_file_without_bool_gets_nothing(self):
+        out = cpprust.translate("int f(void) { return 0; }", path="t.cpp")
+        self.assertNotIn("stdbool", out)
