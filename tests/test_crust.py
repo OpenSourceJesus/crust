@@ -14,6 +14,7 @@ import unittest
 
 import shivyc.main
 import shivyc.crust as crust
+import tools.cpprust as cpprust
 from shivyc.errors import error_collector
 
 
@@ -4386,3 +4387,403 @@ void hold(int tag) {
     k.r.id = tag;
 }
 """}), 42)
+
+
+class TestCrustOwningMoves(unittest.TestCase):
+    """An owning value crossing a call boundary is a move, not a copy.
+
+    It used to be a copy, and a real double free rather than a leak: a
+    by-value owning parameter is dropped when the callee returns, and the
+    caller dropped the same object again at its own scope exit. glibc
+    reported `free(): double free detected` and the process aborted.
+    """
+
+    def test_vec_by_value_does_not_double_free(self):
+        # Against the unfixed compiler this aborts with SIGABRT (139/134),
+        # not a wrong answer -- so the exit status is the whole assertion.
+        self.assertEqual(_run("""
+fn take(v: Vec<i32>) -> usize { v.len() }
+fn main() {
+    let mut a: Vec<i32> = Vec::<i32>::new();
+    a.push(1);
+    a.push(2);
+    let n: usize = take(a);
+    unsafe { return n as i32 + 40; }
+}
+""", suffix=".rs"), 42)
+
+    def test_move_is_a_spill_and_a_zero(self):
+        # The order matters: the callee needs the value, so the source cannot
+        # be cleared until a copy of it exists.
+        out = crust.translate("""
+fn take(v: Vec<i32>) -> usize { v.len() }
+fn main() {
+    let mut a: Vec<i32> = Vec::<i32>::new();
+    let n: usize = take(a);
+}
+""", path="t.rs")
+        body = out[out.index("int main"):]
+        spill = body.index("= a;")
+        zero = body.index("memset(&a")
+        call = body.index("take(_crust_opt")
+        self.assertLess(spill, zero)
+        self.assertLess(zero, call)
+
+    def test_conditional_move_frees_on_the_other_path(self):
+        # Zeroing rather than unregistering is what keeps both paths right:
+        # the caller's drop stays emitted, frees where nothing moved, and is
+        # a no-op where something did.
+        self.assertEqual(_run("""
+fn take(v: Vec<i32>) -> usize { v.len() }
+fn main() {
+    let mut n: usize = 0;
+    let mut k: i32 = 0;
+    while k < 2 {
+        let mut a: Vec<i32> = Vec::<i32>::new();
+        a.push(k);
+        if k == 1 { n += take(a); }
+        k += 1;
+    }
+    unsafe { return n as i32 + 41; }
+}
+""", suffix=".rs"), 42)
+
+    def test_user_drop_type_by_value_does_not_double_free(self):
+        self.assertEqual(_run("""
+static mut GONE: i32 = 0;
+struct R { p: Vec<i32> }
+impl Drop for R {
+    fn drop(&mut self) { unsafe { GONE += 1; } }
+}
+fn take(r: R) -> i32 { r.p.len() as i32 }
+fn main() {
+    let mut a: R = R { p: Vec::<i32>::new() };
+    /* Must actually allocate: an empty `Vec` has a null pointer, and
+       `free(NULL)` twice is harmless, so the double free would not show. */
+    a.p.push(7);
+    a.p.push(8);
+    let n: i32 = take(a);
+    unsafe { return n + 40; }
+}
+""", suffix=".rs"), 42)
+
+    def test_derive_clone_on_an_owning_type_is_refused(self):
+        # A derived `clone` is `return *self` -- a bitwise copy -- so both
+        # objects would own one buffer and both would drop it.
+        src = """
+#[derive(Clone)]
+struct R { p: Vec<i32> }
+impl Drop for R { fn drop(&mut self) { } }
+fn main() { let a: R = R { p: Vec::<i32>::new() }; }
+"""
+        with self.assertRaises(crust.CrustError) as cm:
+            crust.translate(src, path="t.rs")
+        self.assertIn("both objects would own one resource", cm.exception.message)
+
+    def test_derive_copy_on_an_owning_type_is_refused(self):
+        src = """
+#[derive(Copy)]
+struct R { p: Vec<i32> }
+impl Drop for R { fn drop(&mut self) { } }
+fn main() { let a: R = R { p: Vec::<i32>::new() }; }
+"""
+        with self.assertRaises(crust.CrustError) as cm:
+            crust.translate(src, path="t.rs")
+        self.assertIn("#[derive(Copy)]", cm.exception.message)
+
+    def test_derive_clone_on_a_plain_struct_still_works(self):
+        # The refusal is about ownership, not about deriving. A struct that
+        # owns nothing copies bitwise exactly as before.
+        self.assertEqual(_run("""
+#[derive(Clone)]
+struct P { x: i32, y: i32 }
+fn main() {
+    let a: P = P { x: 40, y: 2 };
+    let b: P = a.clone();
+    unsafe { return b.x + b.y; }
+}
+""", suffix=".rs"), 42)
+
+
+class TestCppOwnsCrustMembers(unittest.TestCase):
+    """A C++ class may hold a Crust type by value and own it properly.
+
+    Crust publishes the types it lowered that own something, and the
+    preprocessor hands them to `tools/cpprust.py` on the command line -- the
+    child runs as a subprocess and cannot see the unit otherwise. A member of
+    such a type is then destroyed with its container, and a class holding one
+    obeys the Rule of Three like any other owning class.
+    """
+
+    def test_members_destroyed_with_no_destructor_written(self):
+        self.assertEqual(_run("""#include "auto.cpp"
+struct Res { id: i32 }
+impl Drop for Res {
+    fn drop(&mut self) { unsafe { SEEN = self.id; } }
+}
+static mut SEEN: i32 = 0;
+int main(void) {
+    int n = run(40);
+    return SEEN + n;               /* 40 from the destructor, 2 elements */
+}
+""", extra={"auto.cpp": """
+class Holder {
+public:
+    Vec_int nums;
+    Res r;
+    void fill(int a, int b) {
+        nums = Vec_int_new();
+        Vec_int_push(&nums, a);
+        Vec_int_push(&nums, b);
+    }
+    unsigned long n() { return Vec_int_len(&nums); }
+};
+
+int run(int tag) {
+    Holder h;
+    h.r.id = tag;
+    h.fill(4, 5);
+    return (int)h.n();
+}
+"""}), 42)
+
+    def test_members_are_destroyed_in_reverse_declaration_order(self):
+        # C++'s rule, not Rust's. Crust's own field glue frees in declaration
+        # order; each side follows its own source language.
+        owning = {"Vec_int": "Vec_int_free_buf", "Res": "Res_drop"}
+        out = cpprust.translate("""
+class Holder {
+public:
+    Vec_int nums;
+    Res r;
+};
+void f(void) { Holder h; }
+""", path="t.cpp", owning=owning)
+        drop = out[out.index("Holder_drop"):]
+        self.assertLess(drop.index("Res_drop"), drop.index("Vec_int_free_buf"))
+
+    def test_copying_a_class_that_owns_a_crust_type_is_refused(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate("""
+class Holder {
+public:
+    Vec_int nums;
+};
+void f(void) {
+    Holder a;
+    Holder b = a;
+}
+""", path="t.cpp", owning={"Vec_int": "Vec_int_free_buf"})
+        self.assertIn("owning one resource", cm.exception.message)
+
+    def test_a_type_not_declared_owning_is_untouched(self):
+        # Without the mapping the member is plain data, exactly as before,
+        # so a `.cpp` that knows what it is doing is unaffected.
+        out = cpprust.translate("""
+class Holder {
+public:
+    Vec_int nums;
+};
+void f(void) { Holder h; }
+""", path="t.cpp")
+        self.assertNotIn("Holder_drop", out)
+
+
+class TestBundledMathHeader(unittest.TestCase):
+    """`#include <math.h>` resolves without the caller passing `-I`.
+
+    `tools/py2c.py` emits it into the rpython runtime header, so *any*
+    program including a `.py` module failed to compile without it -- which is
+    what both of this suite's long-standing failures actually were.
+    """
+
+    def test_math_h_is_bundled(self):
+        # The header itself has to supply the declaration -- declaring `sqrt`
+        # by hand would pass with or without it and prove nothing.
+        self.assertEqual(_run("""#include <math.h>
+int main(void) { return (int)sqrt(1764.0) + (int)floor(0.5); }
+"""), 42)
+
+    def test_rpython_runtime_links(self):
+        # The regression that hid behind the missing header.
+        self.assertEqual(_run(
+            '#include "m.py"\n'
+            'int main(void) { return (int)strlen(joined(4)); }\n',
+            extra={"m.py":
+                   'def joined(n: int) -> str:\n'
+                   '    parts: "list[str]" = []\n'
+                   '    i = 0\n'
+                   '    while i < n:\n'
+                   '        parts.append("x")\n'
+                   '        i += 1\n'
+                   '    return ",".join(parts)\n'}), 7)
+
+
+class TestCppHandsOwnershipToRust(unittest.TestCase):
+    """C++ passing an owned Crust value by value to a Rust `fn`.
+
+    Crust drops a by-value owning parameter when the callee returns, so the
+    buffer is freed there and again by the C++ destructor -- a cross-language
+    double free that aborted rather than leaked. Refused, for the reason
+    `_check_by_value` already refuses its own by-value owning parameters:
+    doing it properly means moving out of the source, and that is a statement
+    in expression position.
+    """
+
+    CPP = """
+class Tally {
+public:
+    Vec_int samples;
+    void start() { samples = Vec_int_new(); }
+    void add(int v) { Vec_int_push(&samples, v); }
+};
+
+int go(void) {
+    Tally t;
+    t.start();
+    t.add(1);
+    t.add(2);
+    return consume(%s);
+}
+"""
+
+    def test_handing_an_owned_member_over_by_value_is_refused(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate(self.CPP % "t.samples", path="t.cpp",
+                              owning={"Vec_int": "Vec_int_free_buf"})
+        self.assertIn("hands over a `Vec_int` by value", cm.exception.message)
+
+    def test_passing_a_pointer_is_accepted(self):
+        # The fix the diagnostic names, and what a Rust `&Vec<i32>` parameter
+        # lowers to anyway.
+        out = cpprust.translate(self.CPP % "&t.samples", path="t.cpp",
+                                owning={"Vec_int": "Vec_int_free_buf"})
+        self.assertIn("consume(&t.samples)", out)
+
+    def test_reference_taking_rust_fn_round_trips(self):
+        self.assertEqual(_run("""#include "x.cpp"
+fn consume(v: &Vec<i32>) -> i32 { v.len() as i32 }
+int main(void) { return go() + 40; }
+""", extra={"x.cpp": self.CPP % "&t.samples"}), 42)
+
+    def test_copy_construction_is_not_mistaken_for_a_hand_off(self):
+        # `Buf c(a);` is a declaration, not a call -- and by the time this
+        # check runs it has become `Buf c; Buf_copy(&c, &a);` anyway.
+        out = cpprust.translate("""
+class Buf {
+    int *p;
+public:
+    Buf() { p = 0; }
+    Buf(const Buf &o) { p = o.p; }
+    ~Buf() { }
+};
+void f(void) { Buf a; Buf c(a); }
+""", path="t.cpp")
+        self.assertIn("Buf_copy(&c, &a);", out)
+
+
+class TestCrustUseAfterMove(unittest.TestCase):
+    """Reading a local that was moved out of.
+
+    The move zeroes its source so that a later drop is a no-op, which keeps
+    memory correct but makes a later *read* quietly see an empty value rather
+    than what was there. Rust rejects the read; so does this.
+    """
+
+    TAKE = "fn take(v: Vec<i32>) -> usize { v.len() }\n"
+
+    def _err(self, body):
+        with self.assertRaises(crust.CrustError) as cm:
+            crust.translate(self.TAKE + body, path="t.rs")
+        return cm.exception.message
+
+    def test_reading_after_a_move_is_rejected(self):
+        self.assertIn("was moved on line", self._err("""
+fn main() {
+    let mut a: Vec<i32> = Vec::<i32>::new();
+    a.push(1);
+    let n: usize = take(a);
+    let m: usize = a.len();
+}
+"""))
+
+    def test_a_macro_argument_counts_as_a_read(self):
+        # `sub_expr` builds a fresh parser for macro arguments; it shares the
+        # moved set, or `println!("{}", a)` printed the zeroed husk.
+        self.assertIn("was moved on line", self._err("""
+fn main() {
+    let mut a: Vec<i32> = Vec::<i32>::new();
+    let n: usize = take(a);
+    println!("{}", a.len());
+}
+"""))
+
+    def test_moving_in_a_loop_what_was_declared_outside_is_rejected(self):
+        # A single forward pass sees one move and no later read, but every
+        # iteration after the first moves a value that is already gone.
+        self.assertIn("moved inside a loop", self._err("""
+fn main() {
+    let mut a: Vec<i32> = Vec::<i32>::new();
+    a.push(1);
+    let mut i: i32 = 0;
+    while i < 3 {
+        let n: usize = take(a);
+        i += 1;
+    }
+}
+"""))
+
+    def test_assigning_to_it_again_makes_it_valid(self):
+        self.assertEqual(_run(self.TAKE + """
+fn main() {
+    let mut a: Vec<i32> = Vec::<i32>::new();
+    a.push(1);
+    let n: usize = take(a);
+    a = Vec::<i32>::new();
+    a.push(2);
+    a.push(3);
+    unsafe { return (a.len() + n) as i32 + 39; }
+}
+""", suffix=".rs"), 42)
+
+    def test_borrowing_is_not_moving(self):
+        self.assertEqual(_run("""
+fn borrow(v: &Vec<i32>) -> usize { v.len() }
+fn main() {
+    let mut b: Vec<i32> = Vec::<i32>::new();
+    b.push(1);
+    let x: usize = borrow(&b);
+    b.push(2);
+    unsafe { return (b.len() + x) as i32 + 39; }
+}
+""", suffix=".rs"), 42)
+
+    def test_declared_inside_the_loop_moves_freely(self):
+        self.assertEqual(_run(self.TAKE + """
+fn main() {
+    let mut t: usize = 0;
+    let mut i: i32 = 0;
+    while i < 3 {
+        let mut d: Vec<i32> = Vec::<i32>::new();
+        d.push(i);
+        t += take(d);
+        i += 1;
+    }
+    unsafe { return t as i32 + 39; }
+}
+""", suffix=".rs"), 42)
+
+    def test_shadowing_in_a_nested_scope_is_a_fresh_binding(self):
+        self.assertEqual(_run(self.TAKE + """
+fn main() {
+    let mut c: Vec<i32> = Vec::<i32>::new();
+    let n: usize = take(c);
+    {
+        let mut c: Vec<i32> = Vec::<i32>::new();
+        c.push(1);
+        c.push(2);
+        c.push(3);
+        unsafe { return (c.len() + n) as i32 + 39; }
+    }
+}
+""", suffix=".rs"), 42)
