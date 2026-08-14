@@ -76,7 +76,8 @@ class TestCppMultiTemplate(unittest.TestCase):
 
     def test_distinct_instantiations_are_distinct_structs(self):
         out = cpprust.translate(
-            _PAIR + "void f(void) { Pair<int, double> a; Pair<char, int> b; }")
+            _PAIR + "void f(void) { Pair<int, double> a(1, 2.0); "
+            "Pair<char, int> b(65, 9); }")
         self.assertIn("struct Pair_int_double { int key; double val; };", out)
         self.assertIn("struct Pair_char_int { char key; int val; };", out)
 
@@ -542,6 +543,7 @@ public:
         self.assertIn("I_new(&this->a, n);", out)
 
     def test_member_without_default_ctor_is_error(self):
+        # (message unchanged: a member still needs a *default* constructor)
         with self.assertRaises(cpprust.CppError) as cm:
             cpprust.translate("class I { int v; public: I(int k) { v = k; } };"
                               "class O { I a; public: int f() { return 1; } };")
@@ -804,7 +806,7 @@ class D : public B { public: D(int n) : B(n) { } };
         with self.assertRaises(cpprust.CppError) as cm:
             cpprust.translate("class B { int a; public: B(int k) { a = k; } };"
                               "class D : public B { public: D() { } };")
-        self.assertIn("no default constructor", cm.exception.message)
+        self.assertIn("no constructor taking 0", cm.exception.message)
 
     def test_abstract_class_cannot_be_instantiated(self):
         with self.assertRaises(cpprust.CppError) as cm:
@@ -1077,7 +1079,179 @@ void f(void) { std::vector<int> a; std::vector<char> b; }
         with self.assertRaises(cpprust.CppError) as cm:
             cpprust.translate(
                 "int f(void) { std::vector<std::string> v; return v.size(); }")
-        self.assertIn("by value", cm.exception.message)
+        self.assertIn("stores its elements by assignment",
+                      cm.exception.message)
+        self.assertIn("vector<string *>", cm.exception.message)
+
+
+_ARR = """
+class Arr {
+public:
+    int d[8];
+    Arr() { d[0] = 0; }
+    int &operator[](int i) { return d[i]; }
+};
+"""
+
+_POINT = """
+class Point {
+public:
+    int x;
+    int y;
+    Point() { x = 0; y = 0; }
+    Point(int a) { x = a; y = a; }
+    Point(int a, int b) { x = a; y = b; }
+};
+"""
+
+
+class TestCppCtorOverload(unittest.TestCase):
+    """Constructors are told apart by argument count.
+
+    A call site is matched before types are known, so arity is the only
+    thing there is to resolve on -- which is why two constructors of the
+    same arity are refused rather than guessed between.
+    """
+
+    def test_each_arity_gets_its_own_symbol(self):
+        out = cpprust.translate(_POINT + "void f(void) { Point p; }")
+        self.assertIn("static void Point_new(Point *this)", out)
+        self.assertIn("static void Point_new_1(Point *this, int a)", out)
+        self.assertIn("static void Point_new_2(Point *this, int a, int b)",
+                      out)
+
+    def test_declaration_picks_by_argument_count(self):
+        out = cpprust.translate(_POINT + """
+void f(void) { Point p; Point q(5); Point r(2, 3); }
+""")
+        self.assertIn("Point_new(&p);", out)
+        self.assertIn("Point_new_1(&q, 5);", out)
+        self.assertIn("Point_new_2(&r, 2, 3);", out)
+
+    def test_new_picks_the_matching_allocator(self):
+        out = cpprust.translate(_POINT + """
+void f(void) { Point *a = new Point(); Point *b = new Point(7, 8); }
+""")
+        self.assertIn("Point__alloc()", out)
+        self.assertIn("Point__alloc_2(7, 8)", out)
+
+    def test_single_constructor_keeps_the_plain_name(self):
+        # Unchanged from before overloading existed.
+        out = cpprust.translate(
+            "class C { public: int v; C(int k) { v = k; } };"
+            "void f(void) { C c(1); }")
+        self.assertIn("static void C_new(C *this, int k)", out)
+        self.assertIn("C_new(&c, 1);", out)
+
+    def test_wrong_argument_count_is_error(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate(_POINT + "void f(void) { Point p(1, 2, 3); }")
+        self.assertIn("no constructor taking 3", cm.exception.message)
+
+    def test_missing_default_constructor_is_error(self):
+        # Previously this emitted a call with too few arguments and left the
+        # C compiler to report it.
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate(
+                "class C { public: int v; C(int k) { v = k; } };"
+                "void f(void) { C c; }")
+        self.assertIn("no constructor taking 0", cm.exception.message)
+
+    def test_base_overload_from_initializer_list(self):
+        out = cpprust.translate(_POINT + """
+class P3 : public Point { public: int z; P3(int a, int b) : Point(a, b) { z = 0; } };
+void f(void) { P3 p(1, 2); }
+""")
+        self.assertIn("Point_new_2(&this->_base, a, b);", out)
+
+    def test_string_takes_a_literal(self):
+        out = cpprust.translate('void f(void) { std::string s("hi"); }')
+        self.assertIn("string_new_1(&s,", out)
+
+
+class TestCppSubscript(unittest.TestCase):
+    """`operator[]` returns a reference, so `v[i] = x` assigns the element."""
+
+    def test_subscript_lowers_to_a_dereference(self):
+        out = cpprust.translate(_ARR + "int f(void) { Arr v; return v[2]; }")
+        self.assertIn("(*Arr__index(&v, 2))", out)
+
+    def test_subscript_is_an_lvalue(self):
+        out = cpprust.translate(_ARR + "void f(void) { Arr v; v[2] = 42; }")
+        self.assertIn("(*Arr__index(&v, 2)) = 42;", out)
+
+    def test_operator_returns_the_address(self):
+        out = cpprust.translate(_ARR)
+        self.assertIn("static int * Arr__index(Arr *this, int i) "
+                      "{ return &(this->d[i]); }", out)
+
+    def test_by_value_subscript_is_error(self):
+        # `v[i] = x` would assign to a copy.
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate("""
+class A { public: int d[4]; A() { d[0] = 0; } int operator[](int i) { return d[i]; } };
+""")
+        self.assertIn("has to return a reference", cm.exception.message)
+
+    def test_subscript_through_a_member(self):
+        out = cpprust.translate(_ARR + """
+class H { public: Arr a; H() { } };
+void f(void) { H h; h.a[0] = 7; }
+""")
+        self.assertIn("(*Arr__index(&h.a, 0)) = 7;", out)
+
+    def test_plain_c_array_is_untouched(self):
+        out = cpprust.translate(_ARR + """
+int f(int *a) { int b[4]; b[0] = 1; return a[0] + b[0]; }
+""")
+        self.assertIn("return a[0] + b[0];", out)
+
+    def test_pointer_field_indexing_is_untouched(self):
+        # `T *p; p[i]` walks an array; it is not `operator[]` on what `p`
+        # points at. Fields record their pointer-ness truthfully.
+        out = cpprust.translate(_ARR + """
+class Box { public: Arr *items; int n; Box() { items = 0; n = 0; }
+            void put(int i) { items[i].d[0] = 1; } };
+""")
+        self.assertIn("this->items[i]", out)
+        self.assertNotIn("Arr__index(this->items", out)
+
+    def test_operator_index_is_not_read_as_a_lambda(self):
+        # `operator[](int i) { .. }` has the shape of an empty capture list.
+        out = cpprust.translate(_ARR)
+        self.assertNotIn("_cpp_lambda", out)
+
+    def test_container_subscript(self):
+        out = cpprust.translate("""
+void f(void) { std::vector<int> v; v.push_back(1); v[0] = 2; }
+""")
+        self.assertIn("(*vector_int__index(&v, 0)) = 2;", out)
+
+    def test_subscript_result_can_be_a_receiver(self):
+        out = cpprust.translate("""
+int f(void) { std::vector<std::string*> v; return v[0]->size(); }
+""")
+        self.assertIn("string_size((*vector_string__index(&v, 0)))", out)
+
+
+class TestCppOwningElements(unittest.TestCase):
+    def test_owning_element_type_is_refused_with_the_alternative(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate("int f(void) { std::vector<std::string> v; return v.size(); }")
+        self.assertIn("stores its elements by assignment", cm.exception.message)
+        self.assertIn("vector<string *>", cm.exception.message)
+
+    def test_vector_of_pointers_works(self):
+        out = cpprust.translate("""
+void f(void) {
+    std::vector<std::string*> v;
+    std::string *a = new std::string("x");
+    v.push_back(a);
+    delete a;
+}
+""")
+        self.assertIn("vector_string_push_back(&v, a)", out)
+        self.assertIn("string_drop(a); free(a);", out)
 
 
 class TestCppLambda(unittest.TestCase):
@@ -1329,13 +1503,15 @@ void f(void) { int k; k = 3; Buf a; a.p = 0; }
         self.assertIn("k = 3;", out)
         self.assertIn("a.p = 0;", out)
 
-    def test_constructor_overloading_is_error(self):
-        # Two `P_new` definitions is a C redefinition, which used to be left
-        # for the C compiler to report.
+    def test_same_arity_overloads_are_error(self):
+        # Overloads are resolved by argument count, so two constructors of
+        # the same arity have nothing left to choose between them.
         with self.assertRaises(cpprust.CppError) as cm:
             cpprust.translate(
-                "class P { public: int x; P() { x=0; } P(int v) { x=v; } };")
-        self.assertIn("overloading", cm.exception.message)
+                "class P { public: int x; P(int v) { x=v; } "
+                "P(char c) { x=c; } };")
+        self.assertIn("same arity", cm.exception.message.replace(
+            "two constructors take 1 argument", "same arity"))
 
     def test_copy_constructor_is_not_the_overload_that_is_rejected(self):
         out = cpprust.translate(_COPYABLE)
