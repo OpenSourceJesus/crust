@@ -143,6 +143,14 @@ INT = RustCType("int")
 # existing `free_buf` / `free_box` hooks, applied automatically. Keyed by the
 # template / concrete name stored in `unit.instances` (or the bare base for
 # non-generic `String`).
+#: Types this unit lowered that own a buffer, mapped to the function that
+#: frees one. Read by `shivyc/preproc.py` when it lowers a `.cpp` include --
+#: see `compute_drop_glue`, which fills it. Module-level because the Crust
+#: pass finishes before the preprocessor starts, so it is a settled fact by
+#: the time anything reads it.
+OWNING_TYPES = {}
+
+
 _OWNING_FREE = {
     "Vec": "free_buf",
     "String": "free_buf",
@@ -1930,16 +1938,18 @@ class Parser:
                         and e.type.base in self.unit.fn_ptrs:
                     sig = self.unit.fn_ptrs[e.type.base]
                 params = (sig[1] if sig else []) or []
-                args, atypes = [], []
+                args, atypes, aexprs = [], [], []
                 while not self.at(")", "punc"):
                     want = params[len(args)] if len(args) < len(params) \
                         else None
                     a = self.parse_expr_as(want)
                     args.append(a.code)
                     atypes.append(a.type)
+                    aexprs.append(a)
                     if not self.accept(","):
                         break
                 self.expect(")")
+                self._move_by_value_args(params, args, aexprs)
                 if generic:
                     # No turbofish: infer the type arguments from what was
                     # actually passed, then instantiate.
@@ -2064,6 +2074,48 @@ class Parser:
 
         self.err("`?` applies to `Result` and `Option`, not `%s`",
                  e.type.decl())
+
+    def _move_by_value_args(self, params, args, aexprs):
+        """Passing an owning local by value is a *move*, as it is in Rust.
+
+        Without this it was a double free, and a real one rather than a leak:
+        a by-value owning parameter is dropped when the callee returns, and
+        the caller dropped the same object again at its own scope exit. Both
+        freed one buffer -- `free(): double free detected`, on the bundled
+        `Vec` as much as on a user `impl Drop` type.
+
+        The move is emitted as a spill and a zero *before* the call: the
+        callee needs the value, so the source cannot be cleared until a copy
+        of it exists. Zeroing rather than unregistering is what keeps this
+        correct on every path -- `if c { take(v); }` leaves the caller's drop
+        emitted, where it frees on the path that did not move and is a no-op
+        (a null pointer) on the path that did. Unregistering would be the
+        same per-path mistake the unwinding used to make.
+
+        Two limits worth naming. A later *use* of a moved-from local reads
+        zeros rather than being rejected: Crust has no borrow checker, so the
+        use Rust would refuse compiles here. And a moved-from local still has
+        its destructor called, on a zeroed value -- invisible for the core
+        types, whose free is idempotent, but a user `Drop` body runs and sees
+        a zeroed `self`. That is the same divergence `let b = a` already had.
+        """
+        for idx, a in enumerate(aexprs):
+            if idx >= len(params):
+                break
+            want = params[idx]
+            if want is None or want.ptr or want.array:
+                continue
+            if self.owning_free(want) is None:
+                continue
+            moved = self.simple_owning_local(a)
+            if moved is None:
+                continue                # not a name this pass can move from
+            tmp = self.new_temp()
+            self.unit.needs.add("memset")
+            csrc = _c_name(moved[0])
+            self.pending.append("%s = %s;" % (want.decl(tmp), args[idx]))
+            self.pending.append("memset(&%s, 0, sizeof(%s));" % (csrc, csrc))
+            args[idx] = tmp
 
     def emit_pending(self, out, line, indent):
         """Emit statements hoisted out of the expression being translated."""
@@ -6078,6 +6130,20 @@ def emit_derives(unit, local_names):
         for trait in traits:
             if trait not in _DERIVABLE:
                 continue
+            if trait in ("Copy", "Clone") and name in unit.drop_types:
+                # The Rule of Three, in Rust's spelling. A derived `clone`
+                # here is `return *self` -- a bitwise copy -- so both objects
+                # would own the same buffer and both destructors would run on
+                # it. Rust forbids `Copy` on a `Drop` type outright, and its
+                # derived `Clone` clones each field rather than copying the
+                # representation; this lowering can do neither, so it says so.
+                raise CrustError(
+                    "`#[derive(%s)]` on `%s`, which owns something and has a "
+                    "destructor: the derived copy is a bitwise one, so both "
+                    "objects would own one resource and both would drop it. "
+                    "Write `impl Clone for %s` and copy the owned parts "
+                    "explicitly, or pass `&%s`."
+                    % (trait, name, name, name))
             gen = _DERIVE_IMPL.get(trait)
             if gen is None:
                 continue                      # marker trait: nothing to emit
@@ -6211,6 +6277,28 @@ def compute_drop_glue(unit):
         if not grew:
             break
     unit.drop_types = drops
+    # Publish what owns something, for `tools/cpprust.py`. A `.cpp` include is
+    # lowered by a subprocess that cannot see this unit, so a C++ class
+    # holding a Crust type by value would otherwise neither destroy it nor
+    # refuse to copy it. Each name maps to the function that destroys one:
+    # `T_drop` for anything with a destructor here, but a bundled container
+    # keeps its own spelling (`Vec_int_free_buf`), so it is recorded rather
+    # than assumed.
+    owning = {}
+    for name in drops:
+        owning[name] = "%s_drop" % name
+    for name in unit.structs:
+        inst = unit.instances.get(name)
+        m = _OWNING_FREE.get(inst[0]) if inst else None
+        if m is None and name == "String":
+            m = "free_buf"
+        if m is None:
+            continue
+        info = unit.methods.get((name, m))
+        if info is not None:
+            owning[name] = info.mangled
+    global OWNING_TYPES
+    OWNING_TYPES = owning
     for name in sorted(drops):
         glue = []
         for fname, fty in unit.structs.get(name, []):
@@ -7187,7 +7275,6 @@ def translate(code, path=None):
     # `#[derive(..)]` generates its methods. Both run before pass 2 so a body
     # can call a method neither the impl nor the user wrote out.
     emit_trait_defaults(unit)
-    emit_derives(unit, set(local["structs"]))
     # A `.cpp` include may name a lowered Crust type (`Vec_int`) that nothing
     # on the Rust or C side does; instantiate those before anything asks what
     # the unit contains.
@@ -7196,6 +7283,9 @@ def translate(code, path=None):
     # pass 2, because a body translated there asks `owning_free` whether each
     # local needs a scope-exit drop.
     compute_drop_glue(unit)
+    # After the drop analysis, which `#[derive(Copy)]` and `#[derive(Clone)]`
+    # have to consult: a bitwise copy of an owning type is two owners.
+    emit_derives(unit, set(local["structs"]))
 
     # Pass 2: translate each item in place. Struct definitions are hoisted
     # into the prelude (see below), so their source region becomes blank.

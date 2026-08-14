@@ -101,10 +101,22 @@ def _run_cpprust(filename, text):
     if os.path.exists(out):
         os.remove(out)
 
+    # Which Crust types own something? A C++ class may hold one by value, and
+    # the child cannot see the unit being compiled to find out for itself.
+    # Read from the module rather than threaded through every caller: the
+    # Crust pass runs to completion before the preprocessor starts, so this is
+    # a finished fact by the time it is read, not shared mutable state.
+    import shivyc.crust as _crust
+    owned = getattr(_crust, "OWNING_TYPES", None) or {}
+    spec = ",".join("%s:%s" % (n, owned[n]) for n in sorted(owned))
+
     if sys.implementation.name != "shivyc":
         import subprocess
+        cmd = [sys.executable, script, src, "-o", out]
+        if spec:
+            cmd += ["--owning", spec]
         try:
-            proc = subprocess.run([sys.executable, script, src, "-o", out],
+            proc = subprocess.run(cmd,
                                   stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE)
         except OSError as e:
@@ -121,8 +133,9 @@ def _run_cpprust(filename, text):
         # Self-hosted: no subprocess module here, and a path with spaces
         # would break. Acceptable for the same reason it is in main.py.
         # stderr is dropped because the message is read back from `out`.
+        extra = (" --owning " + spec) if spec else ""
         rc = os.system("python3 " + script + " " + src + " -o " + out +
-                       " 2>/dev/null")
+                       extra + " 2>/dev/null")
         if rc != 0:
             return False, _read_or(out, "translation failed")
 
