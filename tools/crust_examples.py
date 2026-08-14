@@ -54,6 +54,15 @@ EXAMPLES = [
      "built    = 4\n"
      "moved    = 6\n", True),
 
+    # C++11 surface syntax -- `auto`, range-`for`, namespaces, and the
+    # smart pointers -- all resolved before the lowering runs, so what
+    # reaches ShivyCX is the same plain C every other example produces.
+    ("cpp11.c", 42,
+     "sum      = 60\n"
+     "owned    = 421\n"
+     "released = 2\n"
+     "combined = 481\n", True),
+
     # C++ single inheritance and virtual dispatch, with Rust reducing the
     # results — base-as-first-member, so upcasting is a pointer cast.
     ("dispatch.c", 42,
