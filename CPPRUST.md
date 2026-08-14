@@ -874,6 +874,25 @@ in C++, not the operator, and `this->` is the same shape -- rewriting
 pointers turned every field access inside a class into a call to its own
 `operator->`.
 
+### Compound assignment
+
+`operator+=` and its siblings (`-= *= /= %= |= &= ^=`) are supported, lowered
+like `operator=`: the result is dropped, so `a += b` is a statement and a
+chained `c = a += b` is rejected rather than quietly yielding nothing. Each
+gets its own symbol -- `a += b` becomes `T__augadd(&a, &b)` -- spelled out
+because the name has to be a C identifier.
+
+The operand is taken like `operator=`'s: it has to be something this pass can
+name and address.
+
+### Conversion operators
+
+**Not supported, and reported as their own thing** rather than lumped in with
+the overloads that are merely missing. `operator T()` applies wherever the
+compiler decides a conversion is wanted, and this pass reads types from how
+they are written -- so there is no honest way to know where to insert the
+call. Give the class a named method and call it.
+
 ### Element builtins
 
 A template body is textual, so it can spell `T` but not `T_copy`:
@@ -901,7 +920,9 @@ use of one is a member access and the symbol table already turns `o.x` into
 ## Not supported yet
 
 Reported rather than mistranslated: exceptions (`throw` / `try` / `catch`),
-operator overloading other than `=` and `[]`, `dynamic_cast`, `typeid`,
+operator overloading other than `=`, a compound assignment, `[]`, `->` and
+`*` (in particular comparison, stream and *conversion* operators),
+`dynamic_cast`, `typeid`,
 multiple and virtual inheritance, iterators (`begin`/`end`), and the rest of
 the STL.
 
