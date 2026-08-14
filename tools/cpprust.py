@@ -1,15 +1,19 @@
 """cpprust -- a minimal C++ subset, lowered to C.
 
 `#include "foo.cpp"` translates a small C++ dialect in place, the same way
-`#include "foo.py"` handles rpython. What the subset buys, and why it is worth
-having next to Rust rather than instead of it, is one thing: **destructors**.
+`#include "foo.py"` handles rpython. What the subset buys, next to Rust rather
+than instead of it, is a full **object lifecycle**: constructors chosen by
+arity, copy construction and `operator=`, member and base construction
+ordering, inheritance and virtual dispatch.
 
-Crust has no `Drop`. Scope exit cannot run code, so every allocating type in
-its core carries an explicit `free_buf` and the caller has to remember. C++ is
-the one of the three languages here whose object model is built around
-deterministic destruction, so a C++ class is the natural place to put an RAII
-wrapper around a Rust type -- the destructor call is emitted at scope exit, and
-the Rust side keeps its explicit API for callers that want it.
+Crust has a `Drop` trait of its own now, so destruction alone is no longer the
+reason this exists. The two meet at the symbol instead: a Rust
+`impl Drop for T` lowers to `T_drop(T *self)`, which is exactly what `~T()`
+lowers to here, so a C++ class may hold a Crust type *by value* and its member
+epilogue calls the Rust destructor with no shim. (One difference worth
+knowing: members are destroyed in reverse declaration order, because that is
+C++'s rule, while Crust's field glue frees in declaration order, because that
+is Rust's. Each side follows its own source language.)
 
 The subset, deliberately small:
 
