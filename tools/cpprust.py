@@ -3741,6 +3741,13 @@ public:
     void set(int i, T v) { vd[i] = v; }
     T *ptr(int i) { return vd + i; }
     T &operator[](int i) { return vd[i]; }
+    T *begin() { return vd; }
+    T *end() { return vd + vn; }
+    /* Reverse iteration, with the same pointer-as-iterator design: `rbegin`
+       is the last element and `rend` is one *before* the first, so the loop
+       walks with `--it` and compares against `rend()`. */
+    T *rbegin() { return vd + vn - 1; }
+    T *rend() { return vd - 1; }
 };
 """
 
