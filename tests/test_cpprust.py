@@ -865,6 +865,118 @@ public:
 """
 
 
+_COPYABLE = """
+class Buf {
+public:
+    int *p;
+    Buf() { p = 0; }
+    Buf(const Buf &o) { p = o.p; }
+    ~Buf() { p = 0; }
+};
+"""
+
+_OWNING = """
+class Own {
+public:
+    int *p;
+    Own() { p = 0; }
+    ~Own() { p = 0; }
+};
+"""
+
+
+class TestCppCopy(unittest.TestCase):
+    """Copying an owning object has to call a copy constructor, or be refused.
+
+    A struct copy duplicates the representation and leaves two objects
+    owning one resource, so both destructors run on it. That was silent:
+    `T b = a;` was neither constructed nor dropped, `T b(a);` called the
+    default constructor with an extra argument, and `b = a;` double-dropped.
+    """
+
+    def test_copy_constructor_gets_its_own_symbol(self):
+        out = cpprust.translate(_COPYABLE)
+        self.assertIn("static void Buf_copy(Buf *this, const Buf *o)", out)
+        self.assertIn("static void Buf_new(Buf *this)", out)
+
+    def test_copy_initialization_calls_it(self):
+        out = cpprust.translate(_COPYABLE + "void f(void) { Buf a; Buf b = a; }")
+        self.assertIn("Buf b; Buf_copy(&b, &a);", out)
+
+    def test_copy_construction_calls_it(self):
+        out = cpprust.translate(_COPYABLE + "void f(void) { Buf a; Buf c(a); }")
+        self.assertIn("Buf c; Buf_copy(&c, &a);", out)
+        self.assertNotIn("Buf_new(&c, a)", out)
+
+    def test_the_copy_is_dropped_too(self):
+        out = cpprust.translate(_COPYABLE + "void f(void) { Buf a; Buf b = a; }")
+        # Reverse declaration order, and the copy is dropped at all -- it
+        # previously fell out of the scope's live list entirely.
+        self.assertIn("Buf_drop(&b); Buf_drop(&a);", out)
+
+    def test_destructor_without_copy_constructor_is_error(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate(_OWNING + "void f(void) { Own a; Own b = a; }")
+        self.assertIn("no copy constructor", cm.exception.message)
+
+    def test_assignment_to_an_owning_object_is_error(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate(_COPYABLE + "void f(void) { Buf a; Buf b; b = a; }")
+        self.assertIn("two objects owning one resource",
+                      cm.exception.message)
+
+    def test_plain_data_still_copies_bitwise(self):
+        # No destructor: nothing owns anything, so the implicit copy is
+        # exactly what C++ would do.
+        out = cpprust.translate("""
+class Pod { public: int x; Pod() { x = 0; } };
+void f(void) { Pod a; Pod b = a; }
+""")
+        self.assertIn("b = a;", out)
+
+    def test_scalar_assignment_is_untouched(self):
+        out = cpprust.translate(_COPYABLE + """
+void f(void) { int k; k = 3; Buf a; a.p = 0; }
+""")
+        self.assertIn("k = 3;", out)
+        self.assertIn("a.p = 0;", out)
+
+    def test_constructor_overloading_is_error(self):
+        # Two `P_new` definitions is a C redefinition, which used to be left
+        # for the C compiler to report.
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate(
+                "class P { public: int x; P() { x=0; } P(int v) { x=v; } };")
+        self.assertIn("overloading", cm.exception.message)
+
+    def test_copy_constructor_is_not_the_overload_that_is_rejected(self):
+        out = cpprust.translate(_COPYABLE)
+        self.assertIn("Buf_copy", out)
+
+    def test_copy_from_an_unnameable_expression_is_error(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate(_COPYABLE + """
+Buf make(void);
+void f(void) { Buf b = make(); }
+""")
+        self.assertIn("not an object of that type", cm.exception.message)
+
+    def test_copy_constructor_installs_the_vptr(self):
+        # A copied object still has to dispatch.
+        out = cpprust.translate("""
+class B {
+public:
+    int v;
+    B() { v = 0; }
+    B(const B &o) { v = o.v; }
+    virtual ~B() { v = 1; }
+    virtual int get() { return v; }
+};
+""")
+        self.assertIn("static void B_copy(B *this, const B *o) "
+                      "{((B *)this)->_vptr", out)
+
+
 class TestCppChainedReceivers(unittest.TestCase):
     """The result of a call can be the receiver of the next one.
 
