@@ -93,10 +93,30 @@ implicit constructor or destructor. A class with a pure virtual method is
 abstract: no table is emitted for it and declaring one by value is an error
 rather than an object whose vptr is never set.
 
+`new` and `delete` allocate and destroy a single object. `new T(args)` sits
+in expression position and C has no statement expression, so it lowers to a
+generated `T__alloc(args)` -- malloc, construct, return -- emitted only for
+the classes the source actually applies `new` to. A failed malloc yields
+null rather than being constructed through, since the subset has no
+exceptions. `delete p` is a statement, so it lowers in place to a guarded
+`T_drop(p); free(p);` -- guarded because `delete` on null is a no-op in C++,
+and wrapped in `do { } while (0)` so that a delete as a branch's only
+statement does not leave a stray `;` before an `else`. The static type of
+the operand supplies the destructor, so it must resolve through the symbol
+table; a cast or a call is reported rather than guessed at.
+
+Rejected here rather than mistranslated: `new T[n]` and `delete[]`, which
+would need the element count recorded beside the allocation; `new` of a
+non-class or of an abstract class; `delete` of a by-value object; and
+`delete` through a class with a `virtual` destructor, because the vtable
+carries methods only and the call could not dispatch -- running the base
+destructor and leaking the derived part is the exact bug `virtual ~T()` is
+written to prevent.
+
 Not supported, and reported rather than mistranslated: multiple inheritance,
-virtual inheritance, exceptions, operator overloading, `new`/`delete`, the
-STL. Multiple bases are rejected because the layout admits exactly one: with
-one base first, upcasting is free, and that is the property the rest of this
+virtual inheritance, exceptions, operator overloading, the STL. Multiple
+bases are rejected because the layout admits exactly one: with one base
+first, upcasting is free, and that is the property the rest of this
 lowering leans on.
 
 The lowering is the same shape Crust uses for `impl` blocks: a method becomes
@@ -119,8 +139,8 @@ class CppError(Exception):
         self.message = message
 
 
-_UNSUPPORTED = ("throw", "try", "catch", "operator", "new",
-                "delete", "dynamic_cast", "typeid")
+_UNSUPPORTED = ("throw", "try", "catch", "operator",
+                "dynamic_cast", "typeid")
 
 # `template<typename T>` / `template<class T, typename U>`. The whole
 # parameter list is captured and split separately: the count is not fixed
@@ -862,7 +882,7 @@ def _vtable_slots(cls, cname, base_info, known):
     return slots
 
 
-def _emit_class(cls, names, known, tsub, targs=None):
+def _emit_class(cls, names, known, tsub, targs=None, wants_new=False):
     """Emit a class as a C struct plus free functions.
 
     Returns the lines, the mangled name, and an info dict describing the
@@ -926,7 +946,7 @@ def _emit_class(cls, names, known, tsub, targs=None):
         mnames = sorted(set(mnames) | set(base_info["methods"]))
     info = {"ctor": False, "dtor": False, "ctor_args": "", "methods": {},
             "fields": {}, "base": base, "slots": slots, "root": root,
-            "abstract": abstract, "vdtor": False}
+            "abstract": abstract, "vdtor": False, "ctor_refs": set()}
     if base_info:
         # Inherited members and methods are reachable on the derived class.
         for k, v in base_info["fields"].items():
@@ -1001,7 +1021,8 @@ def _emit_class(cls, names, known, tsub, targs=None):
             continue
         params = sub(m.params or "").strip()
         if m.kind == "ctor":
-            emit("void", "%s_new" % cname, params, prologue + sub(m.body or ""))
+            info["ctor_refs"] = emit("void", "%s_new" % cname, params,
+                                     prologue + sub(m.body or ""))
             info["ctor"] = True
             info["ctor_args"] = params
         elif m.kind == "dtor":
@@ -1024,6 +1045,27 @@ def _emit_class(cls, names, known, tsub, targs=None):
         out.append("static void %s_drop(%s *this) {%s }"
                    % (cname, cname, epilogue))
         info["dtor"] = True
+
+    # `new T(..)` sits in expression position, so it lowers to a call rather
+    # than to inline statements: C has no statement expression to allocate,
+    # construct and yield the pointer in one. One helper per class that the
+    # source actually applies `new` to -- emitting it unconditionally would
+    # leave an unused static function in every translation unit.
+    #
+    # `delete` needs no helper: it is a statement, so it lowers in place.
+    if wants_new and not abstract:
+        cparams = _lower_refs(info["ctor_args"], names)
+        fwd = [n for n in (_param_name(x) for x in _split_top(cparams)) if n]
+        body = ["%s *p = (%s *)malloc(sizeof(%s));" % (cname, cname, cname)]
+        if info["ctor"]:
+            # A failed allocation must not be constructed through. C++ would
+            # throw here; the subset has no exceptions, so `new` yields null
+            # and the caller checks, which is the C convention anyway.
+            body.append("if (p) { %s_new(p%s); }"
+                        % (cname, "".join(", " + f for f in fwd)))
+        body.append("return p;")
+        out.append("static %s *%s__alloc(%s) { %s }"
+                   % (cname, cname, cparams or "void", " ".join(body)))
 
     # Virtual methods resolve through the vtable rather than by name.
     for s in slots:
@@ -1430,6 +1472,12 @@ def _rewrite_calls(text, cinfo, free_refs):
     field_re = re.compile(
         r"(?<![\w.>])(\w+)((?:\s*(?:\.|->)\s*\w+)+)(?!\s*\()")
     plain_re = re.compile(r"(?<![\w.>])(\w+)\s*\(")
+    # `new T(..)` / `new T`, and `delete e` / `delete[] e`. The array forms
+    # are matched so they can be reported: they are not simply unsupported
+    # syntax, they are the shapes whose lowering would need an element count
+    # stored beside the allocation.
+    new_re = re.compile(r"(?<![\w.>])new\s+(\w+)\s*(\[)?")
+    del_re = re.compile(r"(?<![\w.>])delete\s*(\[\s*\])?\s*")
     # As in `_rewrite_scopes`: match against comment-blanked text so a `.`
     # or a parenthesis inside prose cannot be read as code. Same length, so
     # the indices address `text`, which is what is emitted.
@@ -1604,6 +1652,84 @@ def _rewrite_calls(text, cinfo, free_refs):
                 i = m.end()
                 continue
 
+        m = new_re.match(look, i)
+        if m:
+            tname = m.group(1)
+            if tname not in cinfo:
+                raise CppError(
+                    "`new %s`: %s is not a class defined in this file. The "
+                    "subset allocates only its own classes, because it has "
+                    "to know the constructor to call." % (tname, tname))
+            if m.group(2):
+                raise CppError(
+                    "`new %s[..]` is not in the C++ subset: array `new` has "
+                    "to store the element count beside the allocation for "
+                    "`delete[]` to destroy each element. Allocate one object "
+                    "at a time." % tname)
+            if cinfo[tname]["abstract"]:
+                raise CppError(
+                    "`new %s`: %s has a pure virtual method and cannot be "
+                    "instantiated." % (tname, tname))
+            args = ""
+            end = m.end()
+            after = look[end:len(look)].lstrip()
+            if after.startswith("("):
+                op = look.index("(", end)
+                close = _match_paren(look, op)
+                if close is not None:
+                    args = fix_args(text[op + 1:close],
+                                    cinfo[tname]["ctor_refs"], scopes)
+                    end = close + 1
+            out.append("%s__alloc(%s)" % (tname, args))
+            i = end
+            continue
+
+        m = del_re.match(look, i)
+        if m:
+            if m.group(1):
+                raise CppError(
+                    "`delete[]` is not in the C++ subset: it has to know how "
+                    "many elements to destroy, which array `new` would have "
+                    "had to record.")
+            end = _stmt_end(look, m.end())
+            if end is None:
+                raise CppError("`delete` without a terminating `;`")
+            operand = text[m.end():end].strip()
+            chain = [p for p in re.split(r"\s*(?:\.|->)\s*", operand) if p]
+            got = (resolve(scopes, chain[0], chain[1:])
+                   if all(re.match(r"^\w+$", p) for p in chain) else None)
+            if got is None or got[1] not in cinfo:
+                raise CppError(
+                    "`delete %s`: cannot tell what type this is, so the "
+                    "destructor to call is unknown. Assign it to a typed "
+                    "local first." % operand)
+            expr, dcls, is_ptr = got
+            if not is_ptr:
+                raise CppError(
+                    "`delete %s`: this is an object, not a pointer to one. "
+                    "A by-value local is destroyed at the end of its scope."
+                    % operand)
+            if cinfo[dcls]["vdtor"]:
+                # The vtable holds methods only, so a destructor call cannot
+                # dispatch. Deleting through a base pointer would run the
+                # base destructor and leave the derived part untouched --
+                # exactly the bug `virtual ~T()` is written to prevent.
+                raise CppError(
+                    "`delete %s`: %s has a virtual destructor, which this "
+                    "lowering cannot dispatch -- the vtable carries methods "
+                    "only. Call the concrete `_drop` and `free` explicitly."
+                    % (operand, dcls))
+            if cinfo[dcls]["dtor"]:
+                # Guarded and wrapped: `delete` on a null pointer is a no-op
+                # in C++, and a bare block would leave a stray `;` before an
+                # `else` when the delete is a branch's only statement.
+                out.append("do { if (%s) { %s_drop(%s); free(%s); } } "
+                           "while (0)" % (expr, dcls, expr, expr))
+            else:
+                out.append("free(%s)" % expr)
+            i = end
+            continue
+
         m = plain_re.match(look, i)
         if m and m.group(1) in free_refs:
             op = m.end() - 1
@@ -1626,6 +1752,32 @@ def translate(text, path="<cpp>"):
     _check_unsupported(scan, path)
 
     classes = _find_classes(scan, text)
+
+    # Which classes does the source apply `new` to? Scanned from a copy with
+    # literals and comments blanked, so the word inside `puts("new item")`
+    # asks for nothing. A template is matched by its bare name, so every one
+    # of its instantiations gets a helper.
+    #
+    # Checked here, before the no-class early return: `new int` is not a
+    # class allocation at all, and a file with no classes can still contain
+    # the keyword.
+    heap = _blank_strings(_strip_comments(text))
+    new_used = set(re.findall(r"(?<![\w.>])new\s+(\w+)", heap))
+    uses_heap = bool(new_used) or bool(
+        re.search(r"(?<![\w.>])delete\b", heap))
+    declared = set(cls.name for _s, _e, cls in classes)
+    for tname in sorted(new_used - declared):
+        raise CppError(
+            "%s: `new %s` is not in the C++ subset -- %s is not a class "
+            "defined in this file, and the lowering has to know the "
+            "constructor to call. Use `malloc` directly."
+            % (os.path.basename(path), tname, tname))
+    if uses_heap and not classes:
+        raise CppError(
+            "%s: `new`/`delete` are lowered against a class defined in this "
+            "file, and this file defines none. Use `malloc`/`free`."
+            % os.path.basename(path))
+
     if not classes:
         return text
 
@@ -1700,7 +1852,8 @@ def translate(text, path="<cpp>"):
         pieces.append(head)
         insts = wanted.get(cls.name, []) if cls.tparams else [None]
         for targs in insts:
-            emitted, cname, info = _emit_class(cls, names, cinfo, tsub, targs)
+            emitted, cname, info = _emit_class(
+                cls, names, cinfo, tsub, targs, cls.name in new_used)
             # Trailing newline: two instantiations of the same template are
             # emitted back to back, and without it the last line of one runs
             # into the first line of the next.
@@ -1730,6 +1883,15 @@ def translate(text, path="<cpp>"):
         if nxt == out:
             break
         out = nxt
+
+    # `new` and `delete` lower to `malloc`/`free`, so their declarations have
+    # to be in scope. Spelled the way the rest of Crust spells them rather
+    # than by including <stdlib.h>: a `.cpp` include is compiled by ShivyCX
+    # in the same unit as freestanding code, which has no libc headers.
+    # Redeclaring these identically is legal C, so a source that already
+    # declared them is unaffected.
+    if uses_heap:
+        out = ("void *malloc(unsigned long);\nvoid free(void *);\n") + out
     return out
 
 
