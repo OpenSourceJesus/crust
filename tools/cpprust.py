@@ -1040,7 +1040,7 @@ def _vtable_slots(cls, cname, base_info, known):
 
 
 def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
-                chained=frozenset()):
+                chained=frozenset(), prelude=False):
     """Emit a class as a C struct plus free functions.
 
     Returns the lines, the mangled name, and an info dict describing the
@@ -1118,7 +1118,7 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
         for k, v in base_info["paths"].items():
             info["paths"][k] = "_base." + v
         for k, v in base_info["methods"].items():
-            info["methods"][k] = dict(v)
+            info["methods"][k] = dict((ar, dict(e)) for ar, e in v.items())
     # `vdtor` is not propagated by hand: the destructor slot is inherited
     # through `slots` like any other, and is read back off it below.
 
@@ -1197,6 +1197,11 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
         epilogue += " %s_drop(&this->_base);" % base
 
     mprotos = []
+    # The supplied containers define far more methods than any one program
+    # calls, and an unused `static` function is a warning. `static inline`
+    # is not, and ShivyCX accepts it. Only the prelude is marked: user code
+    # should keep hearing about functions it never calls.
+    stor = "static inline" if prelude else "static"
 
     def emit(kind, mname, params, raw):
         refs = _ref_positions(params, names)
@@ -1206,7 +1211,7 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
         # Members are emitted in declaration order, but a body may call a
         # method declared below it -- ordinary in a class, and an implicit
         # declaration in C. Prototype everything first.
-        mprotos.append("static %s %s(%s);" % (kind, mname, arglist))
+        mprotos.append("%s %s %s(%s);" % (stor, kind, mname, arglist))
         inner = _implicit_this(raw, mnames)
         # Bare member names inside a body refer to fields; qualify them.
         # Inherited ones go through `_base`, so the path is substituted
@@ -1232,7 +1237,7 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             inner = _sub_code(
                 re.compile(r"(?<![\w.>])return\s+this\s*;"),
                 "return (%s *)this;" % rcls[0], inner)
-        out.append("static %s %s(%s) {%s}" % (kind, mname, arglist, inner))
+        out.append("%s %s %s(%s) {%s}" % (stor, kind, mname, arglist, inner))
         return refs
 
     for m in cls.members:
@@ -1290,13 +1295,30 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
                  sub(m.body or "") + epilogue)
             info["dtor"] = True
         else:
-            info["methods"][m.name] = {
-                "refs": emit(sub(m.ret), "%s_%s" % (cname, m.name), params,
-                             sub(m.body or "")),
+            ar = _arity(params)
+            over = len([x for x in cls.members
+                        if x.kind == "method" and x.name == m.name]) > 1
+            if over and m.virt:
+                # One vtable slot per name, so an overloaded virtual has
+                # nowhere for its second signature to live.
+                raise CppError(
+                    "class %s: `%s` is virtual and overloaded. A virtual "
+                    "method occupies one vtable slot, so its overloads "
+                    "would have to share it." % (cls.name, m.name))
+            mfn = ("%s_%s_%d" % (cname, m.name, ar) if over
+                   else "%s_%s" % (cname, m.name))
+            if ar in info["methods"].get(m.name, {}) and \
+                    info["methods"][m.name][ar]["owner"] == cname:
+                raise CppError(
+                    "class %s: two `%s` methods take %d argument%s. "
+                    "Overloads are resolved by argument count here."
+                    % (cls.name, m.name, ar, "" if ar == 1 else "s"))
+            info["methods"].setdefault(m.name, {})[ar] = {
+                "refs": emit(sub(m.ret), mfn, params, sub(m.body or "")),
                 # The return type is recorded so a call can be a receiver in
                 # turn: `o.node()->get()`. Monomorphised, because a method
                 # returning `Box<int> *` has to name the emitted struct.
-                "ret": tsub(sub(m.ret)),
+                "ret": tsub(sub(m.ret)), "fn": mfn,
                 "owner": cname, "virtual": False, "decl": cname}
 
     # A base, a member, or a vtable pointer all oblige the class to have a
@@ -1304,15 +1326,15 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
     if not plain and prologue:
         # A base, a member, or a vtable obliges a default constructor even
         # when the class declares only constructors that take arguments.
-        mprotos.append("static void %s_new(%s *this);" % (cname, cname))
-        out.append("static void %s_new(%s *this) { %s}"
-                   % (cname, cname, make_prologue(None)))
+        mprotos.append("%s void %s_new(%s *this);" % (stor, cname, cname))
+        out.append("%s void %s_new(%s *this) { %s}"
+                   % (stor, cname, cname, make_prologue(None)))
         info["ctors"][0] = {"fn": "%s_new" % cname, "params": "",
                             "refs": set(), "alloc": "%s__alloc" % cname}
         info["ctor"] = True
     if dtor is None and epilogue:
-        out.append("static void %s_drop(%s *this) {%s }"
-                   % (cname, cname, epilogue))
+        out.append("%s void %s_drop(%s *this) {%s }"
+                   % (stor, cname, cname, epilogue))
         info["dtor"] = True
 
     # `new T(..)` sits in expression position, so it lowers to a call rather
@@ -1323,9 +1345,10 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
     #
     # `delete` needs no helper: it is a statement, so it lowers in place.
     if wants_new and not abstract:
+        wants_new = set(wants_new)
         # One allocator per constructor, so `new T(a, b)` reaches the same
         # overload `T x(a, b);` would.
-        for ar in sorted(info["ctors"] or {0: None}):
+        for ar in sorted(wants_new):
             ent = info["ctors"].get(ar)
             cparams = _lower_refs(ent["params"] if ent else "", names)
             fwd = [n for n in (_param_name(x)
@@ -1340,8 +1363,9 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
                 body.append("if (p) { %s(p%s); }"
                             % (ent["fn"], "".join(", " + f for f in fwd)))
             body.append("return p;")
-            out.append("static %s *%s(%s) { %s }"
-                       % (cname, alloc, cparams or "void", " ".join(body)))
+            out.append("%s %s *%s(%s) { %s }"
+                       % (stor, cname, alloc, cparams or "void",
+                          " ".join(body)))
 
     # Virtual methods resolve through the vtable rather than by name. The
     # destructor slot is not addressable as a method, so it is not listed
@@ -1351,9 +1375,10 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             info["vdtor"] = True
             info["vdtor_decl"] = s["decl"]
             continue
-        info["methods"][s["name"]] = {
+        info["methods"][s["name"]] = {_arity(s["params"]): {
             "refs": _ref_positions(s["params"], names), "owner": s["impl"],
-            "ret": tsub(s["ret"]), "virtual": True, "decl": s["decl"]}
+            "ret": tsub(s["ret"]), "virtual": True, "decl": s["decl"],
+            "fn": "%s_%s" % (s["impl"], s["name"]) if s["impl"] else None}}
 
     # Single-evaluation dispatch helpers, for slots the source invokes on a
     # call result. Emitted only by the class that declares the slot, and
@@ -2116,8 +2141,7 @@ def _emit_method_call(expr, cls, is_ptr, meth, args, ent, cinfo):
                    cast(ent["decl"], recv), tail))
     # An inherited method takes the base as `this`; the base is the first
     # member, so a cast reaches it.
-    return "%s_%s(%s%s)" % (ent["owner"], meth, cast(ent["owner"], recv),
-                            tail)
+    return "%s(%s%s)" % (ent["fn"], cast(ent["owner"], recv), tail)
 
 
 def _rewrite_calls(text, cinfo, free_refs):
@@ -2142,6 +2166,7 @@ def _rewrite_calls(text, cinfo, free_refs):
     # ever sees what that one left behind.
     field_re = re.compile(
         r"(?<![\w.>])(\w+)((?:\s*(?:\.|->)\s*\w+)+)(?!\s*\()")
+    builtin_re = re.compile(r"(?<![\w.>])(__cpp_copy|__cpp_drop)\s*\(")
     # `v[i]` / `a.b[i]` on a class that overloads subscript.
     index_re = re.compile(r"(?<![\w.>\]])(\w+)((?:\s*(?:\.|->)\s*\w+)*)\s*\[")
     # A call continuing a chain: `.g(` or `->g(` right after a `)`.
@@ -2205,7 +2230,21 @@ def _rewrite_calls(text, cinfo, free_refs):
             parts.append(got[0] if got is not None else m.group(0))
             pos = m.end()
 
-    def follow(expr, cls, is_ptr, pos, from_meth):
+    def _pick(entries, raw, cls, meth):
+        """The overload of `meth` matching this argument count."""
+        ar = _arity(raw)
+        if ar in entries:
+            return entries[ar]
+        if len(entries) == 1:
+            # Not an overload set: let the C compiler report the arity, as
+            # it did before overloading existed.
+            return list(entries.values())[0]
+        raise CppError(
+            "`%s::%s` has no overload taking %d argument%s (it has %s)."
+            % (cls, meth, ar, "" if ar == 1 else "s",
+               ", ".join(str(k) for k in sorted(entries))))
+
+    def follow(expr, cls, is_ptr, pos, from_meth, addressable=False):
         """Consume `.g(..)` / `->g(..)` chained onto an expression.
 
         The result of one call is the receiver of the next, so each step is
@@ -2220,10 +2259,11 @@ def _rewrite_calls(text, cinfo, free_refs):
             meth = nm.group(1)
             if cls is None or meth not in cinfo[cls]["methods"]:
                 return expr, pos
-            if not is_ptr:
-                # C cannot take the address of a function result, and a
-                # method needs an addressable receiver. Spilling would need
-                # a statement, and this is an expression.
+            if not is_ptr and not addressable:
+                # C cannot take the address of a function *result*, and a
+                # method needs an addressable receiver. A dereference is a
+                # different matter -- `&(*p)` is fine -- which is why the
+                # subscript branch says so.
                 raise CppError(
                     "`%s().%s()`: %s is returned by value, so there is no "
                     "object to call `%s` on. Assign it to a local first, or "
@@ -2231,11 +2271,14 @@ def _rewrite_calls(text, cinfo, free_refs):
             nxt = _match_paren(look, nm.end() - 1)
             if nxt is None:
                 return expr, pos
-            ent = cinfo[cls]["methods"][meth]
+            ent = _pick(cinfo[cls]["methods"][meth], text[nm.end():nxt],
+                        cls, meth)
             args = fix_args(text[nm.end():nxt], ent["refs"], scopes)
             expr = _emit_method_call(expr, cls, is_ptr, meth, args, ent,
                                      cinfo)
             cls, is_ptr = _ret_class(ent["ret"], cinfo)
+            # The result of a call is a value, addressable no longer.
+            addressable = False
             pos, from_meth = nxt + 1, meth
 
     def fix_args(raw, refs, scopes):
@@ -2321,7 +2364,8 @@ def _rewrite_calls(text, cinfo, free_refs):
             if got is not None and got[1] in cinfo:
                 expr, cls, is_ptr = got
                 if meth in cinfo[cls]["methods"]:
-                    ent = cinfo[cls]["methods"][meth]
+                    ent = _pick(cinfo[cls]["methods"][meth],
+                                text[op + 1:close], cls, meth)
                     args = fix_args(text[op + 1:close], ent["refs"], scopes)
                     expr = _emit_method_call(expr, cls, is_ptr, meth, args,
                                              ent, cinfo)
@@ -2330,6 +2374,37 @@ def _rewrite_calls(text, cinfo, free_refs):
                     out.append(expr)
                     i = end
                     continue
+
+        m = builtin_re.match(look, i)
+        if m:
+            # `__cpp_copy(T, dst, src)` / `__cpp_drop(T, x)`. A template body
+            # is textual, so it can spell `T` but not `T_copy`: substitution
+            # rewrites whole words, and `T_copy` is one word. These are the
+            # hook that lets a container say "copy an element" and have it
+            # mean the copy constructor for a class and an assignment for a
+            # scalar, decided per instantiation.
+            close = _match_paren(look, m.end() - 1)
+            if close is None:
+                raise CppError("unterminated `%s`" % m.group(1))
+            parts = [p.strip() for p in _split_top(text[m.end():close])]
+            kind, ty = m.group(1), (parts[0] if parts else "")
+            if ty not in cinfo:
+                raise CppError(
+                    "`%s(%s, ..)`: %s is not a class. These are for element "
+                    "types with constructors; a scalar element needs no "
+                    "copy or destroy step." % (kind, ty, ty))
+            if kind == "__cpp_drop":
+                out.append("%s_drop(&%s)" % (ty, parts[1])
+                           if cinfo[ty]["dtor"] else "(void)0")
+            else:
+                if not cinfo[ty]["copy"]:
+                    raise CppError(
+                        "`__cpp_copy(%s, ..)`: %s has no copy constructor, "
+                        "so an element copy would duplicate whatever it "
+                        "owns. Add `%s(const %s &o)`." % (ty, ty, ty, ty))
+                out.append("%s_copy(&%s, %s)" % (ty, parts[1], parts[2]))
+            i = close + 1
+            continue
 
         m = index_re.match(look, i)
         if m:
@@ -2361,7 +2436,7 @@ def _rewrite_calls(text, cinfo, free_refs):
                                    text[ob + 1:cb].strip()))
                     ecls, eptr = _ret_class(ent["ret"], cinfo)
                     sub_expr, i = follow(sub_expr, ecls, eptr, cb + 1,
-                                         "operator[]")
+                                         "operator[]", addressable=True)
                     out.append(sub_expr)
                     continue
 
@@ -2646,8 +2721,54 @@ public:
 };
 """
 
+# The owning sibling of `vector`. It exists separately rather than as a
+# smarter `vector` because the two need different *parameter conventions*:
+# a scalar element wants `push_back(T v)` (you write `v.push_back(3)`, and
+# `3` has no address), while an owning element must not cross a call
+# boundary by value at all and wants `push_back(const T &v)`. One template
+# body cannot spell both, so there are two, each honest about what it takes.
+#
+# The element copy and destroy go through `__cpp_copy` / `__cpp_drop`, which
+# is the whole reason those builtins exist: `T` substitutes to a class name
+# but `T_copy` does not, since substitution rewrites whole words.
+_STD_OWNVECTOR = """
+template<typename T>
+class ownvector {
+public:
+    T *od;
+    int on;
+    int ocap;
+    ownvector() { od = 0; on = 0; ocap = 0; }
+    ~ownvector() { clear(); free(od); od = 0; ocap = 0; }
+    int size() { return on; }
+    int empty() { if (on == 0) { return 1; } return 0; }
+    void reserve(int c) {
+        if (c > ocap) {
+            int m = c;
+            T *nd = (T *)realloc(od, (unsigned long)m * sizeof(T));
+            if (nd != 0) { od = nd; ocap = m; }
+        }
+    }
+    void push_back(const T &v) {
+        if (on == ocap) {
+            int m = ocap * 2;
+            if (m < 4) { m = 4; }
+            reserve(m);
+        }
+        if (on < ocap) { __cpp_copy(T, od[on], v); on = on + 1; }
+    }
+    void pop_back() { if (on > 0) { on = on - 1; __cpp_drop(T, od[on]); } }
+    void clear() { while (on > 0) { on = on - 1; __cpp_drop(T, od[on]); } }
+    T *ptr(int i) { return od + i; }
+    T &operator[](int i) { return od[i]; }
+};
+"""
+
 _STD_INCLUDE = re.compile(r"^[ \t]*#\s*include\s*<(vector|string)>[ \t]*\n?",
                           re.M)
+
+
+_STD_CLASSES = frozenset(("string", "vector", "ownvector"))
 
 
 def _std_prelude(text):
@@ -2659,14 +2780,14 @@ def _std_prelude(text):
     """
     wanted = set(m.group(1) for m in _STD_INCLUDE.finditer(text))
     probe = _blank_strings(_strip_comments(text))
-    for name in ("string", "vector"):
+    for name in ("string", "vector", "ownvector"):
         if re.search(r"\bstd\s*::\s*%s\b" % name, probe):
             wanted.add(name)
     if not wanted:
         return text
     text = _STD_INCLUDE.sub("", text)
     text = _sub_code(re.compile(r"\bstd\s*::\s*"), "", text)
-    if "vector" in wanted:
+    if "vector" in wanted or "ownvector" in wanted:
         # `vector<string>` needs `string`; supplying it is cheaper than
         # working out whether this source asks for that combination.
         wanted.add("string")
@@ -2675,6 +2796,8 @@ def _std_prelude(text):
         parts.append(_STD_STRING)
     if "vector" in wanted:
         parts.append(_STD_VECTOR)
+    if "ownvector" in wanted:
+        parts.append(_STD_OWNVECTOR)
     return "".join(parts) + text
 
 
@@ -2994,6 +3117,7 @@ def translate(text, path="<cpp>"):
     # `std::string` / `std::vector` are supplied as ordinary subset source,
     # so everything below sees one file with no special cases in it.
     text = _std_prelude(text)
+    std_classes = _STD_CLASSES
     # Lambdas are lowered before anything else looks at the file: what comes
     # out is ordinary subset source with a static function in it.
     text = _lower_lambdas(text, path)
@@ -3011,7 +3135,24 @@ def translate(text, path="<cpp>"):
     # class allocation at all, and a file with no classes can still contain
     # the keyword.
     heap = _blank_strings(_strip_comments(text))
-    new_used = set(re.findall(r"(?<![\w.>])new\s+(\w+)", heap))
+    # Which class, at which argument count? An allocator is emitted per
+    # constructor the source actually applies `new` to, so an unused arity
+    # does not leave an unused function behind.
+    new_used = {}
+    for hm in re.finditer(r"(?<![\w.>])new\s+(\w+)\s*", heap):
+        ar, at = 0, hm.end()
+        if heap[at:at + 1] == "<":
+            # This scan runs before monomorphisation, so `new Box<int>(3)`
+            # still carries its template arguments.
+            ang = _match_angle(heap, at)
+            at = (ang + 1) if ang is not None else at
+            while at < len(heap) and heap[at] in " \t":
+                at += 1
+        if heap[at:at + 1] == "(":
+            hclose = _match_paren(heap, at)
+            if hclose is not None:
+                ar = _arity(heap[at + 1:hclose])
+        new_used.setdefault(hm.group(1), set()).add(ar)
     # Method names the source invokes on a call result. A virtual one needs
     # a single-evaluation dispatch helper, because the plain form names the
     # receiver twice and a call receiver must not run twice. The pattern is
@@ -3021,7 +3162,9 @@ def translate(text, path="<cpp>"):
     uses_heap = bool(new_used) or bool(
         re.search(r"(?<![\w.>])delete\b", heap))
     declared = set(cls.name for _s, _e, cls in classes)
-    for tname in sorted(new_used - declared):
+    # A template is matched by its bare name, so every instantiation of it
+    # gets the allocators its uses ask for.
+    for tname in sorted(set(new_used) - declared):
         raise CppError(
             "%s: `new %s` is not in the C++ subset -- %s is not a class "
             "defined in this file, and the lowering has to know the "
@@ -3138,8 +3281,8 @@ def translate(text, path="<cpp>"):
         insts = wanted.get(cls.name, []) if cls.tparams else [None]
         for targs in insts:
             emitted, cname, info = _emit_class(
-                cls, names, cinfo, tsub, targs, cls.name in new_used,
-                chained)
+                cls, names, cinfo, tsub, targs, new_used.get(cls.name),
+                chained, cls.name in std_classes)
             # Trailing newline: two instantiations of the same template are
             # emitted back to back, and without it the last line of one runs
             # into the first line of the next.
@@ -3169,9 +3312,9 @@ def translate(text, path="<cpp>"):
             raise CppError(
                 "%s: `vector<%s>` stores its elements by assignment, and %s "
                 "has a destructor -- two elements would own one resource. "
-                "Use `vector<%s *>` with `new`/`delete`, which is what the "
-                "subset can express."
-                % (os.path.basename(path), elem, elem, elem))
+                "Use `ownvector<%s>`, which copy-constructs each element, "
+                "or `vector<%s *>` with `new`/`delete`."
+                % (os.path.basename(path), elem, elem, elem, elem))
 
     # After reference lowering, a class still spelled by value really is by
     # value -- a `T &` the author wrote is a `T *` by now.
