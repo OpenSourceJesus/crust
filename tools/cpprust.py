@@ -603,6 +603,32 @@ def _split_members(body, cname, line0):
         # `explicit` constrains implicit conversion, which this lowering does
         # not perform in the first place: every construction is written out.
         head = re.sub(r"(?<![\w])explicit(?![\w])\s*", "", head)
+        # An anonymous `union { .. };` (or `struct { .. };`) member. C has
+        # them and ShivyCX lowers them, so this is a matter of carrying the
+        # group through and registering the names inside it -- a body writing
+        # `m_value` means `this->m_value` exactly as it would for a plain
+        # field, and the qualification pass has to know that.
+        anon = (re.match(r"^(union|struct)\s*(\w*)$", head)
+                if inner is not None else None)
+        if anon:
+            # A trailing declarator makes it a *named* member of an anonymous
+            # type -- `union { .. } u;` -- which is a different thing from an
+            # anonymous member: `u.field`, not `field`. Both are C, and both
+            # are carried through whole; only the unnamed one contributes its
+            # members' names to the class.
+            j = close + 1
+            while j < n and body[j] in " \t\r\n":
+                j += 1
+            k = j
+            while k < n and (body[k].isalnum() or body[k] == "_"):
+                k += 1
+            vname = body[j:k]
+            if vname:
+                i = k
+            members.append(Member("anon",
+                                  (anon.group(1) + " " + anon.group(2)).strip(),
+                                  vname, None, inner, line0))
+            continue
         op = head.find("(")
         if op < 0:
             raise CppError("cannot parse member %r in class %s" % (head, cname))
@@ -1476,6 +1502,16 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
     head = ["struct %s;" % cname, "typedef struct %s %s;" % (cname, cname)]
     out = []
     fields = [m for m in cls.members if m.kind == "field"]
+    anons = [m for m in cls.members if m.kind == "anon"]
+    # The members of an anonymous group are members of the class: they are
+    # what the body writes and what has to be qualified. Registered but not
+    # emitted as fields of their own -- the group is emitted whole, and
+    # listing them twice would give the struct both.
+    anon_fields = []
+    for a in anons:
+        if a.name:
+            continue                     # reached through `u.`, not bare
+        anon_fields.extend(_split_members(a.body or "", cls.name, a.line))
 
     # The vtable type is emitted per class; the leading slots match the
     # base's exactly, which is what makes the derived table usable through
@@ -1500,6 +1536,10 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
     # no `N` in scope.
     parts.extend("%s %s%s;" % (sub(f.ret), f.name, sub(f.dim))
                  for f in fields)
+    for a in anons:
+        parts.append(("%s { %s } %s;"
+                      % (a.ret, sub(a.body or "").strip(), a.name))
+                     .replace(" ;", ";"))
     head.append("struct %s { %s };" % (cname, " ".join(parts) or
                                        "char _cpp_empty;"))
 
@@ -1529,7 +1569,7 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
     # through `slots` like any other, and is read back off it below.
 
     value_members = []
-    for f in fields:
+    for f in fields + anon_fields:
         t = tsub(sub(f.ret))
         b = [x for x in t.replace("*", " ").split() if x != "const"]
         b = b[0] if b else ""
@@ -1539,6 +1579,13 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
         info["paths"][f.name] = f.name
         if b in known and not is_ptr and not f.dim:
             value_members.append((f.name, b))
+    # A *named* member of an anonymous type is a field like any other, and a
+    # body writing `u.a` means `this->u.a`. Its own type has no name to
+    # record, which is fine: what is behind the dot is plain C from here.
+    for a in anons:
+        if a.name:
+            info["fields"][a.name] = ("", False)
+            info["paths"][a.name] = a.name
     fieldset = set(info["fields"])
 
     ctors = [m for m in cls.members if m.kind == "ctor"]
@@ -1669,7 +1716,7 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
         return refs
 
     for m in cls.members:
-        if m.kind == "field" or m.pure:
+        if m.kind in ("field", "anon") or m.pure:
             continue
         emitting_outline[0] = m.outline
         params = sub(m.params or "").strip()
