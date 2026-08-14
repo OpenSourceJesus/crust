@@ -65,10 +65,22 @@ into `T*` would silently change what assignment through the result means at
 every call site, which is the same failure mode as silently making `virtual`
 static.
 
-Only a single receiver is resolved, so `a.get().foo()` -- a method on a
-returned value -- is not rewritten and will not compile as C. Detecting it
-here would mean flagging `)` followed by `.name(`, which is legitimate C
-(`get_ops()->init(x)`), so it is left to the C compiler to reject.
+A call can be the receiver of the next one, so `o.node()->get()` lowers to
+`Node_get(Owner_node(&o))` -- each step is emitted into an expression that
+becomes the next step's receiver, which is what avoids needing a temporary
+in expression position. A chain only ever starts from a symbol that
+resolves to a class, so legitimate C spelled the same way
+(`get_ops()->init(x)`, a free function returning a struct pointer) is still
+left exactly as written. A method returning a class *by value* ends the
+chain with a diagnostic rather than a guess: C cannot take the address of a
+function result, and spilling one would need a statement.
+
+Dispatching a virtual call on a call result goes through a generated
+`Decl__vcall_name` helper that takes the receiver as a parameter. The plain
+dispatch form names the receiver twice -- once to reach the vptr, once as
+the argument -- which is harmless for a name and wrong for a call, where
+`f.make()->area()` would build two objects. The helper is emitted only for
+the slots a source actually chains onto.
 
 Drops run on every exit from a scope: the closing `}`, and also `return`,
 `break` and `continue`. `return` unwinds out to the function, `break` to the
@@ -926,7 +938,8 @@ def _vtable_slots(cls, cname, base_info, known):
     return slots
 
 
-def _emit_class(cls, names, known, tsub, targs=None, wants_new=False):
+def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
+                chained=frozenset()):
     """Emit a class as a C struct plus free functions.
 
     Returns the lines, the mangled name, and an info dict describing the
@@ -1068,6 +1081,17 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False):
                            % _type_alt(list(info["paths"]))),
                 lambda m: "this->" + info["paths"][m.group(1)], inner)
         inner = inner.replace("this->this->", "this->")
+        # `Shape *twin() { return this; }` inside a derived class returns a
+        # `Derived *` where a `Shape *` is declared. The base is the first
+        # member, so the cast is address-preserving; without it the C
+        # compiler reports incompatible pointer types.
+        rcls = [t for t in kind.replace("*", " * ").split() if t != "const"]
+        if len(rcls) == 2 and rcls[1] == "*" and rcls[0] != cname \
+                and base is not None \
+                and (rcls[0] == base or _is_ancestor(rcls[0], base, known)):
+            inner = _sub_code(
+                re.compile(r"(?<![\w.>])return\s+this\s*;"),
+                "return (%s *)this;" % rcls[0], inner)
         out.append("static %s %s(%s) {%s}" % (kind, mname, arglist, inner))
         return refs
 
@@ -1088,6 +1112,10 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False):
             info["methods"][m.name] = {
                 "refs": emit(sub(m.ret), "%s_%s" % (cname, m.name), params,
                              sub(m.body or "")),
+                # The return type is recorded so a call can be a receiver in
+                # turn: `o.node()->get()`. Monomorphised, because a method
+                # returning `Box<int> *` has to name the emitted struct.
+                "ret": tsub(sub(m.ret)),
                 "owner": cname, "virtual": False, "decl": cname}
 
     # A base, a member, or a vtable pointer all oblige the class to have a
@@ -1132,7 +1160,29 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False):
             continue
         info["methods"][s["name"]] = {
             "refs": _ref_positions(s["params"], names), "owner": s["impl"],
-            "virtual": True, "decl": s["decl"]}
+            "ret": tsub(s["ret"]), "virtual": True, "decl": s["decl"]}
+
+    # Single-evaluation dispatch helpers, for slots the source invokes on a
+    # call result. Emitted only by the class that declares the slot, and
+    # only for the names that need one -- a helper per slot unconditionally
+    # would leave unused static functions all over the output.
+    info["vcall"] = {}
+    for s in slots:
+        if s["decl"] != cname or s["name"] == _DTOR_SLOT \
+                or s["name"] not in chained:
+            continue
+        helper = "%s__vcall_%s" % (cname, s["name"])
+        plist = (", " + s["params"]) if s["params"].strip() else ""
+        fwd = [n for n in (_param_name(x)
+                           for x in _split_top(s["params"])) if n]
+        vptr = "this" if root == cname else "((%s *)this)" % root
+        vret = "" if s["ret"].strip() == "void" else "return "
+        out.append(
+            "static %s %s(%s *this%s) { %s((const struct %s_vtable *)"
+            "%s->_vptr)->%s(this%s); }"
+            % (s["ret"], helper, cname, plist, vret, cname, vptr, s["name"],
+               "".join(", " + f for f in fwd)))
+        info["vcall"][s["name"]] = helper
 
     if slots and not abstract:
         protos, entries, thunks = [], [], []
@@ -1546,6 +1596,63 @@ def _assign_target(before, scopes, cinfo):
     return None
 
 
+def _ret_class(ret, cinfo):
+    """`(class, is_ptr)` for a method's return type, or `(None, False)`.
+
+    Only a single-level pointer to a known class can go on to be a receiver.
+    A `T **` is not an object, and a non-class return simply ends the chain.
+    """
+    toks = [t for t in (ret or "").replace("*", " * ").split()
+            if t != "const"]
+    if not toks or toks[0] not in cinfo:
+        return None, False
+    stars = toks.count("*")
+    if stars > 1:
+        return None, False
+    return toks[0], stars == 1
+
+
+def _emit_method_call(expr, cls, is_ptr, meth, args, ent, cinfo):
+    """One lowered method call, as a C expression.
+
+    Factored out because a chained call needs to produce a receiver
+    expression rather than write straight to the output.
+    """
+    recv = _addr(expr, is_ptr)
+    tail = (", " + args) if args else ""
+
+    def cast(want, e):
+        # Parenthesised: `->` binds tighter than a cast, so
+        # `(Shape *)&sq->_vptr` would read the wrong thing.
+        return e if want == cls else "((%s *)%s)" % (want, e)
+
+    if ent["virtual"]:
+        # Dispatch through the table. The vptr lives at offset zero in the
+        # root, so the cast is free.
+        #
+        # The plain form mentions the receiver twice -- once to reach the
+        # vptr, once as the argument -- which is fine for a name but wrong
+        # for a call: `f.make()->area()` would run the factory twice. When
+        # the receiver is an expression, dispatch goes through a helper that
+        # takes it as a parameter, so it is evaluated once. C has no
+        # statement expression to spill it into.
+        if "(" in recv:
+            helper = cinfo[ent["decl"]].get("vcall", {}).get(meth)
+            if helper is None:
+                raise CppError(
+                    "`%s` is dispatched on a call result, which needs a "
+                    "single-evaluation helper that was not emitted. Assign "
+                    "the receiver to a local first." % meth)
+            return "%s(%s%s)" % (helper, cast(ent["decl"], recv), tail)
+        return ("((const struct %s_vtable *)%s->_vptr)->%s(%s%s)"
+                % (ent["decl"], cast(cinfo[cls]["root"], recv), meth,
+                   cast(ent["decl"], recv), tail))
+    # An inherited method takes the base as `this`; the base is the first
+    # member, so a cast reaches it.
+    return "%s_%s(%s%s)" % (ent["owner"], meth, cast(ent["owner"], recv),
+                            tail)
+
+
 def _rewrite_calls(text, cinfo, free_refs):
     """`g.get()` -> `VecGuard_get(&g)`, `p->get()` -> `VecGuard_get(p)`.
 
@@ -1568,6 +1675,8 @@ def _rewrite_calls(text, cinfo, free_refs):
     # ever sees what that one left behind.
     field_re = re.compile(
         r"(?<![\w.>])(\w+)((?:\s*(?:\.|->)\s*\w+)+)(?!\s*\()")
+    # A call continuing a chain: `.g(` or `->g(` right after a `)`.
+    cont_re = re.compile(r"\s*(?:\.|->)\s*(\w+)\s*\(")
     plain_re = re.compile(r"(?<![\w.>])(\w+)\s*\(")
     # `new T(..)` / `new T`, and `delete e` / `delete[] e`. The array forms
     # are matched so they can be reported: they are not simply unsupported
@@ -1709,32 +1818,47 @@ def _rewrite_calls(text, cinfo, free_refs):
                    if close is not None else None)
             if got is not None and got[1] in cinfo:
                 expr, cls, is_ptr = got
-                methods = cinfo[cls]["methods"]
-                if meth in methods:
-                    ent = methods[meth]
-                    args = fix_args(text[op + 1:close], ent["refs"], scopes)
-                    recv = _addr(expr, is_ptr)
-                    tail = (", " + args) if args else ""
-
-                    def cast(want, e):
-                        # Parenthesised: `->` binds tighter than a cast, so
-                        # `(Shape *)&sq->_vptr` would read the wrong thing.
-                        return e if want == cls else "((%s *)%s)" % (want, e)
-
-                    if ent["virtual"]:
-                        # Dispatch through the table. The vptr lives at
-                        # offset zero in the root, so the cast is free.
-                        out.append(
-                            "((const struct %s_vtable *)%s->_vptr)->%s(%s%s)"
-                            % (ent["decl"], cast(cinfo[cls]["root"], recv),
-                               meth, cast(ent["decl"], recv), tail))
-                    else:
-                        # An inherited method takes the base as `this`; the
-                        # base is the first member, so a cast reaches it.
-                        out.append("%s_%s(%s%s)"
-                                   % (ent["owner"], meth,
-                                      cast(ent["owner"], recv), tail))
-                    i = close + 1
+                if meth in cinfo[cls]["methods"]:
+                    # Follow a chain of calls: the result of one is the
+                    # receiver of the next. Each step is emitted into a
+                    # string that becomes the next step's receiver
+                    # expression, so `o.node()->get()` needs no temporary.
+                    #
+                    # The chain only ever starts from a resolved symbol, so
+                    # `get_ops()->init(x)` -- a free function returning a
+                    # plain C struct -- is still left exactly as written.
+                    while True:
+                        ent = cinfo[cls]["methods"][meth]
+                        args = fix_args(text[op + 1:close], ent["refs"],
+                                        scopes)
+                        expr = _emit_method_call(expr, cls, is_ptr, meth,
+                                                 args, ent, cinfo)
+                        end = close + 1
+                        nm = cont_re.match(look, end)
+                        if nm is None:
+                            break
+                        rcls, rptr = _ret_class(ent["ret"], cinfo)
+                        if rcls is None or nm.group(1) not in \
+                                cinfo[rcls]["methods"]:
+                            break
+                        if not rptr:
+                            # C cannot take the address of a function result,
+                            # and a method needs an addressable receiver.
+                            # Spilling would need a statement, and this is an
+                            # expression.
+                            raise CppError(
+                                "`%s().%s()`: %s is returned by value, so "
+                                "there is no object to call `%s` on. Assign "
+                                "it to a local first, or return `%s *`."
+                                % (meth, nm.group(1), rcls, nm.group(1),
+                                   rcls))
+                        nxt = _match_paren(look, nm.end() - 1)
+                        if nxt is None:
+                            break
+                        cls, is_ptr, meth = rcls, rptr, nm.group(1)
+                        op, close = nm.end() - 1, nxt
+                    out.append(expr)
+                    i = end
                     continue
 
         m = field_re.match(look, i)
@@ -1880,6 +2004,12 @@ def translate(text, path="<cpp>"):
     # the keyword.
     heap = _blank_strings(_strip_comments(text))
     new_used = set(re.findall(r"(?<![\w.>])new\s+(\w+)", heap))
+    # Method names the source invokes on a call result. A virtual one needs
+    # a single-evaluation dispatch helper, because the plain form names the
+    # receiver twice and a call receiver must not run twice. The pattern is
+    # exactly the chained-call syntax, so this neither misses a case the
+    # rewriter will take nor is it worth narrowing further.
+    chained = set(re.findall(r"\)\s*(?:\.|->)\s*(\w+)\s*\(", heap))
     uses_heap = bool(new_used) or bool(
         re.search(r"(?<![\w.>])delete\b", heap))
     declared = set(cls.name for _s, _e, cls in classes)
@@ -1970,7 +2100,8 @@ def translate(text, path="<cpp>"):
         insts = wanted.get(cls.name, []) if cls.tparams else [None]
         for targs in insts:
             emitted, cname, info = _emit_class(
-                cls, names, cinfo, tsub, targs, cls.name in new_used)
+                cls, names, cinfo, tsub, targs, cls.name in new_used,
+                chained)
             # Trailing newline: two instantiations of the same template are
             # emitted back to back, and without it the last line of one runs
             # into the first line of the next.
