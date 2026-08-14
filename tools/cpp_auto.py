@@ -173,6 +173,75 @@ def _scan_classes(scan):
     return names, methods, fields, tparams
 
 
+_TYPEDEF = re.compile(r"(?<![\w.])typedef\s+([^;{}]+);")
+_USING_ALIAS = re.compile(r"(?<![\w.])using\s+(\w+)\s*=\s*([^;{}]+);")
+
+
+def _scan_typedefs(scan):
+    """`{alias: target}` for type aliases at file scope.
+
+    **Depth zero only.** A typedef inside a class body is scoped to it, and
+    litehtml's are named `ptr` and `vector` -- collecting those flatly would
+    make every `vector` in the file mean `box::vector`, including the
+    supplied template of that name. Namespaces are flattened before this
+    runs, so a namespace-scope alias is already at depth zero and is picked
+    up; a class-scoped one is left alone rather than half-understood.
+    """
+    out, depth, i, n = {}, 0, 0, len(scan)
+    while i < n:
+        c = scan[i]
+        if c == "{":
+            depth += 1
+            i += 1
+            continue
+        if c == "}":
+            depth -= 1
+            i += 1
+            continue
+        if depth != 0 or not (c.isalpha() or c == "_"):
+            i += 1
+            continue
+        m = _USING_ALIAS.match(scan, i)
+        if m:
+            out[m.group(1)] = " ".join(m.group(2).split())
+            i = m.end()
+            continue
+        m = _TYPEDEF.match(scan, i)
+        if m:
+            body = m.group(1).strip()
+            if "(" not in body:          # not a function-pointer typedef
+                parts = body.rsplit(None, 1)
+                if len(parts) == 2 and re.match(r"^\w+$", parts[1]):
+                    target = " ".join(parts[0].split())
+                    # `typedef struct X X;` names itself, and substituting it
+                    # prepends `struct` once per round: the C emitted by
+                    # Crust for its own types is full of them, and one pass
+                    # produced `struct struct struct .. Vec_int`.
+                    if not re.search(r"(?<![\w])%s(?![\w])"
+                                     % re.escape(parts[1]), target):
+                        out[parts[1]] = target
+            i = m.end()
+            continue
+        i += 1
+    return out
+
+
+def _resolve_alias(ty, tmap):
+    """Follow type aliases to what they name, or return `ty` unchanged."""
+    seen = set()
+    for _round in range(16):
+        base = ty.strip()
+        star = ""
+        while base.endswith("*") or base.endswith("&"):
+            star = base[-1] + star
+            base = base[:-1].strip()
+        if base not in tmap or base in seen:
+            return ty
+        seen.add(base)
+        ty = (tmap[base] + " " + star).strip()
+    return ty
+
+
 def _scan_functions(scan):
     """`{name: return type}` for functions declared or defined at file scope."""
     out = {}
@@ -195,7 +264,7 @@ def _declared_types(text):
     out = {}
     for m in re.finditer(
             r"(?:^|[;{}(,])\s*(?:const\s+|static\s+)*"
-            r"([A-Za-z_][\w:]*(?:\s*<[^;{}()<>]*>)?)\s*(\*+|&)?\s*"
+            r"([A-Za-z_][\w:]*(?:\s*<[^;{}()]*>)?)\s*(\*+|&)?\s*"
             r"(\w+)\s*(?=([;=,)\[]))", text):
         base, star, name = m.group(1), m.group(2) or "", m.group(3)
         if base in _KEYWORDS and base not in _BUILTIN:
@@ -220,7 +289,7 @@ def _strip_outer(expr):
 
 def _deduce(expr, ctx, where):
     """The written type of `expr`, or raise `AutoError` naming why not."""
-    classes, methods, fields, tparams, funcs, vars_ = ctx
+    classes, methods, fields, tparams, funcs, vars_, aliases = ctx
     e = _strip_outer(expr)
     if not e:
         raise AutoError("%s: `auto` with no initialiser to deduce from" % where)
@@ -273,7 +342,7 @@ def _deduce(expr, ctx, where):
     m = re.match(r"^([A-Za-z_]\w*)\s*(?:\.|->)\s*(\w+)\s*\(", e)
     if m and _match(e, e.index("("), "(", ")") == len(e) - 1:
         recv, meth = m.group(1), m.group(2)
-        rty = vars_.get(recv)
+        rty = _resolve_alias(vars_.get(recv) or "", aliases)
         if rty:
             base = re.sub(r"[*&\s]+$", "", rty).split("<")[0].strip()
             ret = methods.get(base, {}).get(meth)
@@ -300,7 +369,7 @@ def _deduce(expr, ctx, where):
     # `recv.field` / `recv->field`
     m = re.match(r"^([A-Za-z_]\w*)\s*(?:\.|->)\s*(\w+)$", e)
     if m:
-        rty = vars_.get(m.group(1))
+        rty = _resolve_alias(vars_.get(m.group(1)) or "", aliases)
         if rty:
             base = re.sub(r"[*&\s]+$", "", rty).split("<")[0].strip()
             fty = fields.get(base, {}).get(m.group(2))
@@ -310,7 +379,7 @@ def _deduce(expr, ctx, where):
     # A plain name.
     if re.match(r"^[A-Za-z_]\w*$", e):
         if e in vars_:
-            return vars_[e]
+            return _resolve_alias(vars_[e], aliases)
         raise AutoError(
             "%s: `auto` cannot deduce from `%s` -- no declaration of it is "
             "written where this pass can read one. Write the type."
@@ -324,11 +393,11 @@ def _deduce(expr, ctx, where):
 
 def _element_type(name, ctx):
     """The element type of array or container `name`, or None."""
-    classes, methods, fields, tparams, funcs, vars_ = ctx
+    classes, methods, fields, tparams, funcs, vars_, aliases = ctx
     ty = vars_.get(name)
     if not ty:
         return None
-    ty = ty.strip()
+    ty = _resolve_alias(ty, aliases).strip()
     if ty.endswith("[]"):
         return ty[:-2].strip()
     # A container reached through a pointer has the same elements as one
@@ -482,7 +551,8 @@ def resolve_range_for(text, path="<cpp>", blank=None):
 
         alen = _array_len(rng, scan)
         cls = None
-        vt = _declared_types(scan).get(rng, "")
+        vt = _resolve_alias(_declared_types(scan).get(rng, ""),
+                            _scan_typedefs(scan))
         cm = re.match(r"^([A-Za-z_]\w*)", vt.strip().lstrip("*"))
         if cm and cm.group(1) in classes:
             cls = cm.group(1)
@@ -580,6 +650,7 @@ def resolve(text, path="<cpp>", blank=None):
     classes, methods, fields, tparams = _scan_classes(scan)
     funcs = _scan_functions(scan)
     vars_ = _declared_types(scan)
+    aliases = _scan_typedefs(scan)
 
     out, i = [], 0
     while True:
@@ -594,7 +665,7 @@ def resolve(text, path="<cpp>", blank=None):
                 % (path, _line_of(text, m.start()), m.group(3)))
         where = "%s:%d" % (path, _line_of(text, m.start()))
         init = text[m.end():end]
-        ctx = (classes, methods, fields, tparams, funcs, vars_)
+        ctx = (classes, methods, fields, tparams, funcs, vars_, aliases)
         ty = _deduce(init, ctx, where)
         # A deduced reference or pointer keeps the sigil the author wrote;
         # `auto` itself never carries one, so this is additive.
@@ -648,6 +719,7 @@ def resolve_namespaces(text, path="<cpp>", blank=None):
     scan = blank if blank is not None else text
     if not _NAMESPACE.search(scan) and not _USING_NS.search(scan):
         return text
+    produced = set()
 
     # Innermost first, so an inner block is flattened before the outer one
     # renames through it.
@@ -677,7 +749,12 @@ def resolve_namespaces(text, path="<cpp>", blank=None):
         outside = _declared_in(scan[:m.start()] + scan[close + 1:])
         for name in sorted(declared):
             target = "%s_%s" % (ns, name)
-            if target in outside:
+            # A namespace may be reopened, and a project with one per header
+            # does exactly that -- forty times, in litehtml's case. A name
+            # this pass produced from an earlier block of the same namespace
+            # is the same entity, not a collision; only a name the *author*
+            # spelled `N_x` is.
+            if target in outside and target not in produced:
                 raise AutoError(
                     "%s:%d: flattening `%s::%s` gives `%s`, which this file "
                     "already declares. C has one namespace, so the two would "
@@ -686,6 +763,7 @@ def resolve_namespaces(text, path="<cpp>", blank=None):
         for name in sorted(declared, key=len, reverse=True):
             body = _sub_name(body, _blank_like(body), name, ns + "_" + name)
             body_scan = _blank_like(body)
+            produced.add(ns + "_" + name)
         text = text[:m.start()] + body + text[close + 1:]
         scan = _blank_like(text)
         # A qualified reference from outside, and any `using` for it.
@@ -817,3 +895,81 @@ def resolve_defaulted(text, path="<cpp>", blank=None):
                       head.rfind(":"))
             out.append(head[:cut + 1])
         i = m.end()
+
+
+def resolve_using_alias(text, path="<cpp>", blank=None):
+    """`using Y = X;` -> `typedef X Y;`.
+
+    An alias declaration is C++11 spelling for a typedef, and C has only the
+    typedef. Rewritten rather than resolved away, so the alias keeps its name
+    in the generated C and stays readable. `using namespace N;` has no `=`
+    and is left for the namespace pass.
+    """
+    scan = blank if blank is not None else text
+    if "using" not in scan:
+        return text
+    out, last = [], 0
+    for m in _USING_ALIAS.finditer(scan):
+        out.append(text[last:m.start()])
+        out.append("typedef %s %s;" % (text[m.start(2):m.end(2)].strip(),
+                                       m.group(1)))
+        last = m.end()
+    out.append(text[last:])
+    return "".join(out)
+
+
+def resolve_aliases(text, path="<cpp>", blank=None):
+    """Replace file-scope type aliases with what they name.
+
+    Threading an alias map through every consumer was not enough: a field
+    declared `int_vector items;` records its type by spelling, and so does a
+    local, and so does a parameter. Substituting once here means every pass
+    below sees the class the alias stood for without knowing aliases exist.
+
+    The typedef declarations themselves are left alone -- rewriting
+    `typedef vector_int int_vector;` in place would give
+    `typedef vector_int vector_int;` -- so the alias keeps its name in the
+    generated C and the header stays readable.
+
+    Depth zero only, for the reason `_scan_typedefs` gives: a class-scoped
+    `typedef .. vector;` must not be allowed to mean `vector` everywhere.
+    """
+    scan = blank if blank is not None else text
+    aliases = _scan_typedefs(scan)
+    # A template parameter shadows a file-scope alias of the same name, and
+    # inside the template the parameter is what the name means. Substituting
+    # there turned `template<typename A, typename B> class Two { A a; B b; }`
+    # against `typedef int B;` into a class with two `int` fields. Excluded
+    # wholesale rather than scoped: that falls back to leaving the alias
+    # alone, which is what happened before this pass existed.
+    shadowed = set()
+    for m in re.finditer(r"template\s*<([^<>]*)>", scan):
+        for part in m.group(1).split(","):
+            words = part.split()
+            if words:
+                shadowed.add(words[-1])
+    for name in shadowed:
+        aliases.pop(name, None)
+    if not aliases:
+        return text
+    for _round in range(8):
+        spans = [(m.start(), m.end()) for m in _TYPEDEF.finditer(scan)]
+        out, last, changed = [], 0, False
+        pat = re.compile(r"(?<![\w.>])(%s)(?![\w])"
+                         % "|".join(re.escape(a) for a in sorted(aliases)))
+        for m in pat.finditer(scan):
+            if any(a <= m.start() < b for a, b in spans):
+                continue                 # the declaration of the alias
+            target = _resolve_alias(m.group(1), aliases)
+            if target.strip() == m.group(1):
+                continue
+            out.append(text[last:m.start()])
+            out.append(target)
+            last = m.end()
+            changed = True
+        out.append(text[last:])
+        text = "".join(out)
+        scan = _blank_like(text)
+        if not changed:
+            break
+    return text

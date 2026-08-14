@@ -559,6 +559,9 @@ def _split_members(body, cname, line0):
         # Dropped rather than modelled, and only *after* the parameter list,
         # so a `const` return type or parameter is untouched.
         head = _drop_trailing_const(head)
+        # `explicit` constrains implicit conversion, which this lowering does
+        # not perform in the first place: every construction is written out.
+        head = re.sub(r"(?<![\w])explicit(?![\w])\s*", "", head)
         op = head.find("(")
         if op < 0:
             raise CppError("cannot parse member %r in class %s" % (head, cname))
@@ -647,7 +650,7 @@ _QUOTED_INCLUDE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*"([^"]+)"[ \t]*$',
                              re.MULTILINE)
 
 
-def _expand_headers(text, basedir, seen=None, depth=0):
+def _expand_headers(text, basedir, incdirs=(), seen=None, depth=0):
     """Splice in `#include "x.h"` so a class and its definitions meet.
 
     A C++ project declares members in a header and defines them in a source
@@ -672,20 +675,33 @@ def _expand_headers(text, basedir, seen=None, depth=0):
     out, last = [], 0
     for m in _QUOTED_INCLUDE.finditer(text):
         name = m.group(1)
-        cand = os.path.normpath(os.path.join(basedir, name))
         out.append(text[last:m.start()])
         last = m.end()
-        if cand in seen:
-            continue                     # already spliced: an include guard
-        try:
-            with open(cand, "r") as f:
-                inner = f.read()
-        except IOError:
+        # The including file's own directory first, then the search path --
+        # the same order a C++ build uses, and the reason a project whose
+        # headers live in `include/` rather than beside the source resolves
+        # at all.
+        inner = cand = None
+        for d in [basedir] + list(incdirs):
+            trial = os.path.normpath(os.path.join(d, name))
+            if trial in seen:
+                cand = trial
+                break
+            try:
+                with open(trial, "r") as f:
+                    inner = f.read()
+                cand = trial
+                break
+            except IOError:
+                continue
+        if cand is None:
             out.append(m.group(0))       # not ours to resolve
             continue
+        if inner is None:
+            continue                     # already spliced: an include guard
         seen.add(cand)
-        out.append(_expand_headers(inner, os.path.dirname(cand), seen,
-                                   depth + 1))
+        out.append(_expand_headers(inner, os.path.dirname(cand), incdirs,
+                                   seen, depth + 1))
     out.append(text[last:])
     return "".join(out)
 
@@ -3666,7 +3682,8 @@ def _lower_lambdas(text, path):
     return text
 
 
-def translate(text, path="<cpp>", owning=None, basedir=None):
+def translate(text, path="<cpp>", owning=None, basedir=None,
+              incdirs=()):
     """Translate a C++ subset source to C. Raises CppError on anything else.
 
     `owning` maps the name of a type this file does *not* define to the
@@ -3679,7 +3696,7 @@ def translate(text, path="<cpp>", owning=None, basedir=None):
     # Headers first, before anything reads a declaration: a member declared
     # in one and defined here has to arrive in the same translation.
     if basedir is not None:
-        text = _expand_headers(text, basedir)
+        text = _expand_headers(text, basedir, incdirs)
     text = _std_prelude(text)
     std_classes = _STD_CLASSES
     # Lambdas are lowered before anything else looks at the file: what comes
@@ -3693,12 +3710,21 @@ def translate(text, path="<cpp>", owning=None, basedir=None):
         # Range-`for` first: it emits ordinary declarations, some of them
         # `auto`, which the deduction below then resolves. Layered rather
         # than combined, so each pass has one thing to be right about.
-        # `= default` / `= delete` first: they are declarations, and every
+        # `using Y = X;` is C++11 spelling for a typedef, and C has only the
+        # typedef -- so it becomes one before anything reads declarations.
+        text = cpp_auto.resolve_using_alias(
+            text, os.path.basename(path), blank=cpp_auto._blank_like(text))
+        # `= default` / `= delete` next: they are declarations, and every
         # pass below reads declarations.
         text = cpp_auto.resolve_defaulted(
             text, os.path.basename(path), blank=cpp_auto._blank_like(text))
         # Namespaces next: they rename the types the passes below read.
         text = cpp_auto.resolve_namespaces(
+            text, os.path.basename(path), blank=cpp_auto._blank_like(text))
+        # Type aliases after namespaces, because a namespace-scope one is at
+        # depth zero only once the braces are gone -- and before everything
+        # below, which reads types by their spelling.
+        text = cpp_auto.resolve_aliases(
             text, os.path.basename(path), blank=cpp_auto._blank_like(text))
         text = cpp_auto.resolve_range_for(
             text, os.path.basename(path), blank=cpp_auto._blank_like(text))
@@ -4019,6 +4045,14 @@ def main(argv):
     out_path = None
     owning = {}
     basedir = None
+    incdirs = []
+    while "--incdir" in args:
+        i = args.index("--incdir")
+        if i + 1 >= len(args):
+            sys.stderr.write("cpprust: --incdir needs a directory\n")
+            return 2
+        incdirs.append(args[i + 1])
+        del args[i:i + 2]
     if "--basedir" in args:
         i = args.index("--basedir")
         if i + 1 >= len(args):
@@ -4046,7 +4080,8 @@ def main(argv):
         del args[i:i + 2]
     if len(args) != 1 or out_path is None:
         sys.stderr.write("usage: cpprust.py <source.cpp> -o <out.c> "
-                         "[--owning Name:dropfn,..] [--basedir DIR]\n")
+                         "[--owning Name:dropfn,..] [--basedir DIR] "
+                         "[--incdir DIR]..\n")
         return 2
 
     src = args[0]
@@ -4060,7 +4095,8 @@ def main(argv):
     try:
         if basedir is None:
             basedir = os.path.dirname(os.path.abspath(src))
-        result = translate(text, path=src, owning=owning, basedir=basedir)
+        result = translate(text, path=src, owning=owning,
+                           basedir=basedir, incdirs=incdirs)
     except CppError as e:
         # The message goes where the output would have gone; the caller
         # reads it back and reports it against the `#include` line.
