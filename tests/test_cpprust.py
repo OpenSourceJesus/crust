@@ -3374,3 +3374,81 @@ class TestCppBool(unittest.TestCase):
     def test_a_file_without_bool_gets_nothing(self):
         out = cpprust.translate("int f(void) { return 0; }", path="t.cpp")
         self.assertNotIn("stdbool", out)
+
+
+class TestCppAnonymousAggregates(unittest.TestCase):
+    """`union { .. };` and `union { .. } u;` inside a class.
+
+    C has both and ShivyCX lowers both, so this is a matter of carrying the
+    group through whole and registering the right names for qualification.
+    """
+
+    L = """
+class L {
+    union { float m_value; int m_predef; };
+    int m_units;
+public:
+    L() { m_value = 0; m_units = 1; }
+    float value() { return m_value; }
+    void set_predef(int p) { m_predef = p; }
+};
+"""
+
+    def test_the_group_is_emitted_once(self):
+        # Its members are registered but not emitted as fields of their own;
+        # listing them twice would give the struct both.
+        out = cpprust.translate(self.L + "int f(void) { L a; return 0; }",
+                                path="t.cpp")
+        self.assertIn(
+            "struct L { int m_units; union { float m_value; int m_predef; }; };",
+            out)
+
+    def test_its_members_are_qualified(self):
+        # A body writing `m_value` means `this->m_value`, exactly as it would
+        # for a plain field.
+        out = cpprust.translate(self.L + "int f(void) { L a; return 0; }",
+                                path="t.cpp")
+        self.assertIn("return this->m_value;", out)
+        self.assertIn("this->m_predef = p;", out)
+
+    def test_a_named_member_of_anonymous_type(self):
+        # `union { .. } u;` is a different thing: `u.a`, not `a`.
+        out = cpprust.translate("""
+class E {
+    union { int a; float b; } u;
+public:
+    E() { u.a = 1; }
+    int get() { return u.a; }
+};
+int f(void) { E e; return e.get(); }
+""", path="t.cpp")
+        self.assertIn("union { int a; float b; } u;", out)
+        self.assertIn("return this->u.a;", out)
+
+    def test_a_named_group_does_not_export_its_members(self):
+        # `a` is reached through `u`, so a bare `a` in a body is not a field.
+        out = cpprust.translate("""
+class E {
+    union { int a; int b; } u;
+    int a;
+public:
+    E() { a = 1; u.a = 2; }
+    int get() { return a; }
+};
+int f(void) { E e; return e.get(); }
+""", path="t.cpp")
+        self.assertIn("int a;", out)
+        self.assertIn("return this->a;", out)
+
+    def test_an_anonymous_struct_works_too(self):
+        out = cpprust.translate("""
+class P {
+    struct { int x; int y; };
+public:
+    P() { x = 1; y = 2; }
+    int sum() { return x + y; }
+};
+int f(void) { P p; return p.sum(); }
+""", path="t.cpp")
+        self.assertIn("struct { int x; int y; };", out)
+        self.assertIn("this->x + this->y", out)
