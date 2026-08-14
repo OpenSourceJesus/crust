@@ -1,7 +1,9 @@
 # Crust
 ## A Unified C/Rust Compiler Environment for Systems Programming
 
-Main Crust Documentation: [CRUST.md](CRUST.md)
+Main Crust Documentation: 
+- [CRUST.md](CRUST.md) C+Rust
+- [CPPRUST.md](CPPRUST.md) C+C++Rust
 
 Crust Papers:
 - https://dx.doi.org/10.2139/ssrn.7226482
