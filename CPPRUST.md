@@ -917,6 +917,36 @@ expression is *used at* -- which is type checking, not the reading of written
 types this pass does. Written targets are exactly the cases it can be sure
 of.
 
+### Nested classes
+
+`class Outer { struct Inner { .. }; };` is hoisted to a top-level
+`Outer_Inner`, and both `Outer::Inner` and a bare `Inner` written inside
+`Outer` are rewritten to it. The same thing namespaces get, and for the same
+reason: C has one flat namespace of struct tags.
+
+Hoisted *above* the enclosing class rather than below, since the outer class
+may hold one by value and a by-value member needs its type complete above
+it. Innermost first, so `A { B { C { } } }` gives `A_B_C`.
+
+### Default member initializers
+
+`int x = 5;` and `int x {5};` on a member. C has no such thing on a struct
+member, so each becomes an assignment at the top of **every** constructor,
+which is what it means. An explicit entry in a constructor's initializer list
+wins, exactly as in C++.
+
+`T x {};` is value-initialisation and is distinguished from having no
+initializer at all: a scalar member is zeroed, and a class member is already
+default-constructed by the member prologue.
+
+### Member specifiers
+
+`final` on a class, and `override`, `final`, `noexcept` or a trailing `const`
+after a member function's parameter list, are dropped -- including on a pure
+virtual, where they sit between the parameters and the `= 0`. All of them say
+what the language may do rather than what the lowering must, and the C front
+end checks the body regardless.
+
 ### Anonymous unions and structs
 
 Both forms are supported, and both are carried through whole -- C has them
@@ -970,8 +1000,8 @@ use of one is a member access and the symbol table already turns `o.x` into
 
 Reported rather than mistranslated: exceptions (`throw` / `try` / `catch`),
 operator overloading other than `=`, a compound assignment, a comparison,
-`[]`, `->` and `*` (in particular the stream operators), nested classes,
-`dynamic_cast`, `typeid`,
+`[]`, `->` and `*` (in particular the stream operators), `dynamic_cast`,
+`typeid`,
 multiple and virtual inheritance, iterators (`begin`/`end`), and the rest of
 the STL.
 
