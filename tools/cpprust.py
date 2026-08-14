@@ -1970,6 +1970,105 @@ def _by_value_class(part, cinfo):
     return toks[0] if toks[0] in cinfo else None
 
 
+def _check_owning_args(text, cinfo, path):
+    """Reject handing an owned object to a call by value.
+
+    This is the cross-language shape of the same double free Crust fixed on
+    its own side, and it aborts rather than leaks:
+
+        int go(void) {
+            Tally t;  t.start();  t.add(1);
+            return consume(t.samples);   // a Rust `fn consume(v: Vec<i32>)`
+        }
+
+    Crust lowers a by-value owning parameter to a drop when the callee
+    returns -- passing by value is a *move* there -- so `consume` frees the
+    buffer. `Tally_drop` then frees it again on the way out of `go`.
+
+    Refused rather than lowered, for the reason `_check_by_value` gives just
+    below: doing it properly means moving out of the source, and this is
+    expression position. The honest fix on the C++ side is to pass a pointer,
+    which is also what a Rust `&Vec<i32>` parameter lowers to -- so a
+    reference-taking signature needs no change here at all.
+
+    The *lowered* text is what gets scanned, which is what keeps this precise:
+    a by-reference call has already become `f(&v)` by now, so only a genuine
+    by-value hand-off is left looking like a bare name.
+    """
+    owning = set(n for n in cinfo if cinfo[n]["dtor"])
+    if not owning:
+        return
+    # Fields of an owning type, and locals declared as one.
+    members = {}
+    for cls in cinfo:
+        for fname, (fcls, is_ptr) in cinfo[cls]["fields"].items():
+            if not is_ptr and fcls in owning:
+                members[fname] = fcls
+    locals_ = {}
+    for m in re.finditer(r"(?<![\w.>])(\w+)\s+(\w+)\s*[;=]", text):
+        if m.group(1) in owning:
+            locals_[m.group(2)] = m.group(1)
+    if not members and not locals_:
+        return
+
+    # Only calls to something this file did *not* define. A call into a class
+    # here -- a constructor, a copy constructor, a method -- already has this
+    # pass managing the lifetime, and `Buf c(a);` is a declaration rather than
+    # a call at all. What is left is the boundary: a Rust `fn` taking an
+    # owning parameter, which is where ownership silently changes hands.
+    local_fns = set(cinfo)
+    for m in re.finditer(r"(?<![\w.])(\w+)\s*\(", text):
+        close = _match_paren(text, m.end() - 1)
+        if close is None:
+            continue
+        tail = text[close + 1:close + 40].lstrip()
+        if not (tail.startswith("{") or tail.startswith(";")):
+            continue
+        # `;` alone is not enough: `return consume(t.samples);` ends in one
+        # too. Parameters have a type *and* a name, which is what tells a
+        # declaration from a call -- the same test `_check_by_value` makes.
+        if _looks_like_params(_split_top(text[m.end():close]), cinfo):
+            local_fns.add(m.group(1))    # a definition or a declaration
+    for cls in cinfo:
+        local_fns.add("%s_drop" % cls)
+        local_fns.add(_dropfn(cinfo[cls], cls))
+        for meth in cinfo[cls]["methods"]:
+            local_fns.add("%s_%s" % (cls, meth))
+
+    for m in re.finditer(r"(?<![\w.>&])(\w+)\s*\(", text):
+        fn = m.group(1)
+        if fn in _KEYWORDS or fn in local_fns:
+            continue
+        # This pass's own output: the `__cpp_copy` / `__cpp_drop` placeholders
+        # substitution works through, and the generated methods of a supplied
+        # container. Their lifetimes are this pass's business, not a boundary.
+        if fn.startswith("__") or any(fn.startswith(c + "_") for c in cinfo):
+            continue
+        close = _match_paren(text, m.end() - 1)
+        if close is None:
+            continue
+        for part in _split_top(text[m.end():close]):
+            arg = part.strip()
+            if not arg or arg.startswith("&"):
+                continue                 # an address: nothing is handed over
+            cls = None
+            if arg in locals_:
+                cls = locals_[arg]
+            else:
+                mm = re.match(r"^[\w]+(?:\.|->)(\w+)$", arg)
+                if mm and mm.group(1) in members:
+                    cls = members[mm.group(1)]
+            if cls is None:
+                continue
+            raise CppError(
+                "%s: `%s(%s)` hands over a `%s` by value, but this side still "
+                "owns it and will destroy it -- and a by-value owning "
+                "parameter is destroyed by the callee too, so one buffer is "
+                "freed twice. Pass `&%s`; a Rust `&%s` parameter lowers to "
+                "exactly that pointer."
+                % (path, fn, arg, cls, arg, cls))
+
+
 def _check_by_value(text, cinfo, path):
     """Reject by-value class parameters and returns for owning classes.
 
@@ -3402,6 +3501,11 @@ def translate(text, path="<cpp>", owning=None):
         if nxt == out:
             break
         out = nxt
+
+    # After the rewrites, not before: `Buf c(a);` is a copy *construction*
+    # until `_rewrite_scopes` turns it into `Buf c; Buf_copy(&c, &a);`, and
+    # reading it earlier cannot tell it from a call handing `a` away.
+    _check_owning_args(out, cinfo, path)
 
     # `new` and `delete` lower to `malloc`/`free`, so their declarations have
     # to be in scope. Spelled the way the rest of Crust spells them rather
