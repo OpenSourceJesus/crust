@@ -3452,3 +3452,128 @@ int f(void) { P p; return p.sum(); }
 """, path="t.cpp")
         self.assertIn("struct { int x; int y; };", out)
         self.assertIn("this->x + this->y", out)
+
+
+class TestCppNestedClasses(unittest.TestCase):
+    """`class Outer { struct Inner { .. }; }` hoisted to `Outer_Inner`.
+
+    The same thing namespaces get, and for the same reason: C has one flat
+    namespace of struct tags.
+    """
+
+    SRC = """
+class Outer {
+    int v;
+public:
+    struct Inner final {
+        int a;
+        int b;
+    };
+    Outer() { v = 5; }
+    Inner mk() { Inner i; i.a = v; i.b = v * 2; return i; }
+};
+int f(void) { Outer o; Outer::Inner x = o.mk(); return x.a * 100 + x.b; }
+"""
+
+    def test_the_nested_class_is_hoisted_and_renamed(self):
+        out = cpprust.translate(self.SRC, path="t.cpp")
+        self.assertIn("struct Outer_Inner { int a; int b; };", out)
+
+    def test_it_is_hoisted_above_the_enclosing_class(self):
+        # The outer class may hold one by value, and a by-value member needs
+        # its type complete above it.
+        out = cpprust.translate(self.SRC, path="t.cpp")
+        self.assertLess(out.index("struct Outer_Inner {"),
+                        out.index("struct Outer {"))
+
+    def test_a_bare_inner_name_inside_outer_is_rewritten(self):
+        out = cpprust.translate(self.SRC, path="t.cpp")
+        self.assertIn("Outer_Inner Outer_mk(Outer *this)", out)
+
+    def test_a_qualified_name_outside_is_rewritten(self):
+        out = cpprust.translate(self.SRC, path="t.cpp")
+        self.assertIn("Outer_Inner x = ", out)
+
+
+class TestCppDefaultMemberInitializers(unittest.TestCase):
+    """C++11 `int x = 5;` and `int x {5};` on a member.
+
+    C has no such thing on a struct member, so each becomes an assignment at
+    the top of every constructor -- which is what it means.
+    """
+
+    A = """
+class A {
+    int x = 5;
+    int y {7};
+    int z {};
+public:
+    A() { }
+    A(int n) { x = n; }
+    int sum() { return x + y + z; }
+};
+"""
+
+    def test_both_spellings_reach_the_prologue(self):
+        out = cpprust.translate(self.A + "int f(void) { A a; return a.sum(); }",
+                                path="t.cpp")
+        self.assertIn("A_new(A *this) { this->x = 5; this->y = 7; "
+                      "this->z = 0; }", out)
+
+    def test_empty_braces_zero_a_scalar(self):
+        # `T x {};` is value-initialisation, which is a request -- telling it
+        # from no initializer at all is the difference between zeroing the
+        # member and leaving it alone.
+        out = cpprust.translate(self.A + "int f(void) { A a; return a.sum(); }",
+                                path="t.cpp")
+        self.assertIn("this->z = 0;", out)
+
+    def test_every_constructor_gets_them(self):
+        out = cpprust.translate(self.A + "int f(void) { A a(1); return 0; }",
+                                path="t.cpp")
+        body = out[out.index("A_new_1(A *this, int n) {"):]
+        self.assertIn("this->y = 7;", body[:body.index("}")])
+
+    def test_a_field_with_no_initializer_is_left_alone(self):
+        out = cpprust.translate(
+            "class B { int q; public: B() { } };\nint f(void) { B b; return 0; }",
+            path="t.cpp")
+        self.assertNotIn("this->q =", out)
+
+
+class TestCppMemberSpecifiers(unittest.TestCase):
+    """`final`, `override`, `noexcept` and a trailing `const`.
+
+    All say what the language may do rather than what the lowering must, and
+    the C front end checks the body regardless.
+    """
+
+    def test_final_on_a_class(self):
+        out = cpprust.translate(
+            "class A final { public: int v; A() { v = 1; } };\n"
+            "int f(void) { A a; return a.v; }", path="t.cpp")
+        self.assertIn("struct A { int v; };", out)
+
+    def test_override_after_the_parameter_list(self):
+        out = cpprust.translate("""
+class B { public: virtual int area() const = 0; virtual ~B() { } };
+class D : public B { public: int v; D() { v = 3; } int area() const override { return v; } };
+int f(void) { D d; return d.area(); }
+""", path="t.cpp")
+        self.assertIn("D_area", out)
+
+    def test_a_pure_virtual_may_be_const(self):
+        # The qualifier sits between the parameter list and the `= 0`.
+        out = cpprust.translate("""
+class B { public: virtual int area() const = 0; virtual ~B() { } };
+class D : public B { public: int v; D() { v = 2; } int area() const { return v; } };
+int f(void) { D d; B *p = (B *)&d; return p->area(); }
+""", path="t.cpp")
+        self.assertIn("B_vtable", out)
+
+    def test_a_const_conversion_operator(self):
+        out = cpprust.translate(
+            "class A { public: int v; A() { v = 1; } "
+            "operator const int &() { return v; } };\n"
+            "int f(void) { A a; return a.v; }", path="t.cpp")
+        self.assertIn("A__conv", out)
