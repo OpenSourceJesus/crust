@@ -370,13 +370,13 @@ def _check_unsupported(scan, path):
     # A literal is data, not code: `puts("new item")` uses no keyword.
     scan = _blank_strings(scan)
     for m in _OPERATOR.finditer(scan):
-        if m.group(1) in ("=", "[]", "["):
+        if m.group(1) in ("=", "[]", "[", "->", "*"):
             continue
         line = scan.count("\n", 0, m.start()) + 1
         raise CppError(
-            "%s:%d: `operator%s` is not in the C++ subset. `operator=` is "
-            "the one overload it supports, because assignment to an owning "
-            "object has no safe default."
+            "%s:%d: `operator%s` is not in the C++ subset. It supports "
+            "`operator=`, `operator[]`, `operator->` and `operator*` -- "
+            "assignment, element access, and the two a smart pointer needs."
             % (os.path.basename(path), line, m.group(1)))
     for kw in _UNSUPPORTED:
         m = re.search(r"\b%s\b" % kw, scan)
@@ -537,6 +537,20 @@ def _split_members(body, cname, line0):
             # `v[i] = x` write to a copy, so it is refused below.
             bits = sig[:sig.index("operator")].strip()
             members.append(Member("index", bits, "operator[]", params,
+                                  inner, line0))
+        elif re.search(r"\boperator\s*->$", sig):
+            # `T *operator->()`. C++ applies it repeatedly until something
+            # that is not a class comes back; a smart pointer returns a plain
+            # `T *` on the first hop, which is the only shape here.
+            bits = sig[:sig.index("operator")].strip()
+            members.append(Member("arrow", bits, "operator->", params,
+                                  inner, line0))
+        elif re.search(r"\boperator\s*\*$", sig):
+            # `T &operator*()`. Lowered like `operator[]`: the reference
+            # return becomes a pointer and the dereference is written back at
+            # the use, so `*p = x` still assigns through.
+            bits = sig[:sig.index("operator")].strip()
+            members.append(Member("star", bits, "operator*", params,
                                   inner, line0))
         elif re.search(r"\boperator\s*=$", sig):
             # `T &operator=(const T &o)` or `void operator=(..)`. The return
@@ -1026,7 +1040,8 @@ def _external_info(name, dropfn):
             "fields": {}, "base": None, "slots": [], "root": None,
             "abstract": False, "vdtor": False, "vdtor_decl": None,
             "ctor_refs": set(), "paths": {}, "copy": False,
-            "assign": False, "index": None, "vcall": {},
+            "assign": False, "index": None, "arrow": None,
+            "star": None, "vcall": {},
             "dropfn": dropfn, "external": True}
 
 
@@ -1159,7 +1174,8 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             "fields": {}, "base": base, "slots": slots, "root": root,
             "abstract": abstract, "vdtor": False, "vdtor_decl": None,
             "ctor_refs": set(), "paths": {}, "copy": False,
-            "assign": False, "index": None,
+            "assign": False, "index": None, "arrow": None,
+            "star": None,
             "dropfn": "%s_drop" % cname, "external": False}
     if base_info:
         # Inherited members and methods are reachable on the derived class.
@@ -1336,6 +1352,32 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
                 lambda mm: "return &(%s);" % mm.group(1).strip(),
                 sub(m.body or ""))
             emit(iret.replace("&", "*"), "%s__index" % cname, params, ibody)
+        elif m.kind == "arrow":
+            aret = sub(m.ret or "").strip()
+            if "*" not in aret:
+                raise CppError(
+                    "class %s: `operator->` has to return a pointer (`%s *`) "
+                    "-- C++ keeps applying it until one comes back, and this "
+                    "subset does the first hop only."
+                    % (cls.name, aret.replace("*", "").strip() or "T"))
+            info["arrow"] = {"fn": "%s__arrow" % cname,
+                             "ret": tsub(aret)}
+            emit(aret, "%s__arrow" % cname, params, sub(m.body or ""))
+        elif m.kind == "star":
+            sret = sub(m.ret or "").strip()
+            if "&" not in sret:
+                raise CppError(
+                    "class %s: `operator*` has to return a reference "
+                    "(`%s &`), so that `*p = x` assigns through rather than "
+                    "to a copy."
+                    % (cls.name, sret.replace("&", "").strip() or "T"))
+            info["star"] = {"fn": "%s__star" % cname,
+                            "ret": tsub(sret.replace("&", "").strip())}
+            sbody = _sub_code(
+                re.compile(r"(?<![\w.>])return\s+([^;]+);"),
+                lambda mm: "return &(%s);" % mm.group(1).strip(),
+                sub(m.body or ""))
+            emit(sret.replace("&", "*"), "%s__star" % cname, params, sbody)
         elif m.kind == "assign":
             # Lowered to `T_assign(T *this, const T *o)`. Assignment is the
             # one place the subset needs a user hook: a struct copy of an
@@ -2354,6 +2396,11 @@ def _rewrite_calls(text, cinfo, free_refs):
     builtin_re = re.compile(r"(?<![\w.>])(__cpp_copy|__cpp_drop)\s*\(")
     # `v[i]` / `a.b[i]` on a class that overloads subscript.
     index_re = re.compile(r"(?<![\w.>\]])(\w+)((?:\s*(?:\.|->)\s*\w+)*)\s*\[")
+    # `p->x` where `p` is a *class* with `operator->`, and `*p` likewise. A
+    # class-typed name followed by `->` is otherwise a lowered reference and
+    # is left alone; only a class that declares the operator is rewritten.
+    arrow_re = re.compile(r"(?<![\w.>\]])(\w+)\s*->\s*(?=[A-Za-z_])")
+    star_re = re.compile(r"(?<![\w)\]])\*\s*(\w+)(?![\w\s]*[\[(])")
     # A call continuing a chain: `.g(` or `->g(` right after a `)`.
     cont_re = re.compile(r"\s*(?:\.|->)\s*(\w+)\s*\(")
     plain_re = re.compile(r"(?<![\w.>])(\w+)\s*\(")
@@ -2590,6 +2637,37 @@ def _rewrite_calls(text, cinfo, free_refs):
                 out.append("%s_copy(&%s, %s)" % (ty, parts[1], parts[2]))
             i = close + 1
             continue
+
+        m = arrow_re.match(look, i)
+        if m:
+            got = resolve(scopes, m.group(1), [])
+            # Only on a class *value*. `Ptr *p; p->x` is ordinary member
+            # access on `Ptr` in C++, not the operator -- and `this->` is the
+            # same shape, so rewriting pointers turned every field access
+            # inside the class into a call to its own `operator->`.
+            if got is not None and not got[2] and got[1] in cinfo \
+                    and cinfo[got[1]]["arrow"] is not None:
+                expr, cls, is_ptr = got
+                ent = cinfo[cls]["arrow"]
+                # `u->v` is `u.operator->()->v`: the operator hands back a
+                # plain pointer and the `->` that follows is ordinary C.
+                out.append("%s(%s)->" % (ent["fn"], _addr(expr, is_ptr)))
+                i = m.end()
+                continue
+
+        m = star_re.match(look, i)
+        if m:
+            got = resolve(scopes, m.group(1), [])
+            # Likewise: `*p` on a genuine pointer is a plain dereference.
+            if got is not None and not got[2] and got[1] in cinfo \
+                    and cinfo[got[1]]["star"] is not None:
+                expr, cls, is_ptr = got
+                ent = cinfo[cls]["star"]
+                # Like `operator[]`: the lowered form yields the address, and
+                # the dereference written back keeps `*p = x` an lvalue.
+                out.append("(*%s(%s))" % (ent["fn"], _addr(expr, is_ptr)))
+                i = m.end()
+                continue
 
         m = index_re.match(look, i)
         if m:
@@ -2959,6 +3037,8 @@ public:
     unique_ptr(T *q) { up = q; }
     ~unique_ptr() { reset(0); }
     T *get() { return up; }
+    T *operator->() { return up; }
+    T &operator*() { return *up; }
     T *release() { T *q = up; up = 0; return q; }
     void reset(T *q) {
         if (up) { __cpp_drop(T, *up); free(up); }
@@ -3003,6 +3083,8 @@ public:
         }
     }
     T *get() { return sp; }
+    T *operator->() { return sp; }
+    T &operator*() { return *sp; }
     long use_count() { if (sc) { return *sc; } return 0; }
 };
 """
@@ -3388,7 +3470,11 @@ def translate(text, path="<cpp>", owning=None):
         # Range-`for` first: it emits ordinary declarations, some of them
         # `auto`, which the deduction below then resolves. Layered rather
         # than combined, so each pass has one thing to be right about.
-        # Namespaces first: they rename the types the passes below read.
+        # `= default` / `= delete` first: they are declarations, and every
+        # pass below reads declarations.
+        text = cpp_auto.resolve_defaulted(
+            text, os.path.basename(path), blank=cpp_auto._blank_like(text))
+        # Namespaces next: they rename the types the passes below read.
         text = cpp_auto.resolve_namespaces(
             text, os.path.basename(path), blank=cpp_auto._blank_like(text))
         text = cpp_auto.resolve_range_for(
