@@ -38,7 +38,19 @@ The subset, deliberately small:
   * `public:` / `private:` / `protected:` labels (parsed, not enforced --
     access control is a compile-time property and this is a lowering, not a
     type checker; pretending to enforce it would be worse than not claiming to)
-  * `operator=`, the one overload the subset has, lowered to `T__assign`.
+  * constructor overloading, resolved by argument *count*: a call site is
+    matched before types are known, so arity is all there is to resolve on,
+    and two constructors of the same arity are refused rather than guessed
+    between. The no-argument one keeps the plain `T_new`, since that is
+    what member and base default construction call; the others are
+    `T_new_<n>`, with a matching `T__alloc_<n>` for `new`.
+  * `operator[]`, which must return a reference (`T &`) and lowers to a
+    `T *`, so `v[i]` becomes `*T__index(&v, i)` and stays an lvalue -- a
+    by-value subscript would make `v[i] = x` write to a copy, so it is
+    refused. A subscript on a genuine pointer *field* is left as plain C
+    indexing, since `T *p; p[i]` walks an array rather than calling
+    anything.
+  * `operator=`, lowered to `T__assign`.
     Assignment to an owning object has no safe default -- a struct copy
     leaves two owners -- so this is where the author supplies one. A chained
     `a = b = c` is refused, because the call is lowered to `void`.
@@ -46,9 +58,10 @@ The subset, deliberately small:
     them and written in this subset rather than special-cased in the
     lowering. `std::` is stripped; there is no namespace support and
     claiming otherwise would be worse. Element access is `get`/`set`/`ptr`,
-    not `v[i]`, since `operator[]` is not available. `vector<T>` stores
+    and `v[i]`, which the containers now overload. `vector<T>` stores
     elements by assignment, so an element type with a destructor is refused
-    rather than double-freed.
+    -- with `vector<T *>` named as the shape that does work, since a
+    pointer copies cleanly and `new`/`delete` carry the lifetime.
   * lambdas, in two shapes. A *non-capturing* lambda is exactly a function
     and lowers to one -- `auto f = [](int y) -> int { .. };` becomes a
     function pointer, so the call site needs no rewriting and the lambda can
@@ -219,7 +232,7 @@ _UNSUPPORTED = ("throw", "try", "catch",
 
 # `operator=` is supported; every other overload is not. Checked separately
 # from the keyword list so the diagnostic can name the operator.
-_OPERATOR = re.compile(r"\boperator\s*(=(?!=)|[^\s(]+)")
+_OPERATOR = re.compile(r"\boperator\s*(=(?!=)|\[\s*\]|[^\s(]+)")
 
 # `template<typename T>` / `template<class T, typename U>`. The whole
 # parameter list is captured and split separately: the count is not fixed
@@ -333,7 +346,7 @@ def _check_unsupported(scan, path):
     # A literal is data, not code: `puts("new item")` uses no keyword.
     scan = _blank_strings(scan)
     for m in _OPERATOR.finditer(scan):
-        if m.group(1) == "=":
+        if m.group(1) in ("=", "[]", "["):
             continue
         line = scan.count("\n", 0, m.start()) + 1
         raise CppError(
@@ -492,6 +505,15 @@ def _split_members(body, cname, line0):
         if sig == "~" + cname:
             members.append(Member("dtor", "void", cname, params, inner, line0,
                                   "", None, virt))
+        elif re.search(r"\boperator\s*\[\s*\]$", sig):
+            # `T &operator[](int i)`. The reference return is lowered to a
+            # pointer and the subscript to a dereference, which keeps
+            # `v[i] = x` an assignable lvalue -- the whole point of the
+            # operator. A by-value `T operator[]` would silently make
+            # `v[i] = x` write to a copy, so it is refused below.
+            bits = sig[:sig.index("operator")].strip()
+            members.append(Member("index", bits, "operator[]", params,
+                                  inner, line0))
         elif re.search(r"\boperator\s*=$", sig):
             # `T &operator=(const T &o)` or `void operator=(..)`. The return
             # type is dropped: the result is lowered to `void`, so a chained
@@ -918,16 +940,24 @@ def _member_prologue(cname, value_members, initmap, known, fieldset, line):
         if fname in initmap:
             args = initmap[fname]
             seen.add(fname)
-            lines.append("%s_new(&this->%s%s);"
-                         % (fcls, fname, (", " + args) if args else ""))
+            ar = _arity(args)
+            if ar not in known[fcls]["ctors"]:
+                raise CppError(
+                    "%s: member `%s` of type `%s` has no constructor taking "
+                    "%d argument%s" % (cname, fname, fcls, ar,
+                                       "" if ar == 1 else "s"))
+            lines.append("%s(&this->%s%s);"
+                         % (known[fcls]["ctors"][ar]["fn"], fname,
+                            (", " + args) if args else ""))
         elif known[fcls]["ctor"]:
-            if known[fcls]["ctor_args"]:
+            if 0 not in known[fcls]["ctors"]:
                 raise CppError(
                     "%s: member `%s` of type `%s` has no default constructor; "
                     "give it arguments in an initializer list, as "
                     "`%s(..) : %s(..) { }`"
                     % (cname, fname, fcls, cname, fname))
-            lines.append("%s_new(&this->%s);" % (fcls, fname))
+            lines.append("%s(&this->%s);"
+                         % (known[fcls]["ctors"][0]["fn"], fname))
     # Anything else in the initializer list is a plain assignment.
     for fname, args in initmap.items():
         if fname in seen:
@@ -1072,11 +1102,11 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
     mnames = [m.name for m in cls.members if m.kind == "method"]
     if base_info:
         mnames = sorted(set(mnames) | set(base_info["methods"]))
-    info = {"ctor": False, "dtor": False, "ctor_args": "", "methods": {},
+    info = {"ctor": False, "dtor": False, "ctors": {}, "methods": {},
             "fields": {}, "base": base, "slots": slots, "root": root,
             "abstract": abstract, "vdtor": False, "vdtor_decl": None,
             "ctor_refs": set(), "paths": {}, "copy": False,
-            "assign": False}
+            "assign": False, "index": None}
     if base_info:
         # Inherited members and methods are reachable on the derived class.
         # A base field is not at the same offset as an own field, though: the
@@ -1109,12 +1139,19 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
     copies = [m for m in ctors
               if _is_copy_params(m.params, cname, cls.name, tsub, sub)]
     plain = [m for m in ctors if m not in copies]
-    if len(plain) > 1:
-        raise CppError(
-            "class %s: constructor overloading is not in the C++ subset -- "
-            "every constructor lowers to `%s_new`, so a second one would "
-            "redefine it. A copy constructor is the one exception; it "
-            "lowers to `%s_copy`." % (cls.name, cname, cname))
+    by_arity = {}
+    for c in plain:
+        ar = _arity(sub(c.params or ""))
+        if ar in by_arity:
+            # Overloads are told apart by argument *count*: a call site is
+            # matched before types are known, so two constructors of the
+            # same arity have nothing left to choose between them.
+            raise CppError(
+                "class %s: two constructors take %d argument%s. Overloads "
+                "are resolved by argument count here, so they cannot be "
+                "told apart." % (cls.name, ar, "" if ar == 1 else "s"))
+        by_arity[ar] = c
+    multi = len(plain) > 1
     if len(copies) > 1:
         raise CppError("class %s: more than one copy constructor" % cls.name)
     ctor = plain[0] if plain else None
@@ -1132,13 +1169,16 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
         if base:
             bargs = initmap.pop(base, None)
             if known[base]["ctor"]:
-                if bargs is None and known[base]["ctor_args"]:
+                bar = _arity(bargs) if bargs is not None else 0
+                if bar not in known[base]["ctors"]:
                     raise CppError(
-                        "class %s: base `%s` has no default constructor; pass "
-                        "its arguments as `%s(..) : %s(..) { }`"
-                        % (cls.name, base, cls.name, base))
-                pro += "%s_new(&this->_base%s); " % (
-                    base, (", " + bargs) if bargs else "")
+                        "class %s: base `%s` has no constructor taking %d "
+                        "argument%s; pass them as `%s(..) : %s(..) { }`"
+                        % (cls.name, base, bar, "" if bar == 1 else "s",
+                           cls.name, base))
+                pro += "%s(&this->_base%s); " % (
+                    known[base]["ctors"][bar]["fn"],
+                    (", " + bargs) if bargs else "")
             elif bargs is not None:
                 raise CppError("class %s: base `%s` has no constructor to "
                                "pass arguments to" % (cls.name, base))
@@ -1208,10 +1248,35 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
                  make_prologue(m) + sub(m.body or ""))
             info["copy"] = True
         elif m.kind == "ctor":
-            info["ctor_refs"] = emit("void", "%s_new" % cname, params,
-                                     prologue + sub(m.body or ""))
+            ar = _arity(params)
+            fn = _ctor_name(cname, ar, multi)
+            refs = emit("void", fn, params, make_prologue(m) + sub(m.body or ""))
+            info["ctors"][ar] = {
+                "fn": fn, "params": params, "refs": refs,
+                "alloc": fn.replace("_new", "__alloc", 1)}
+            info["ctor_refs"] = refs
             info["ctor"] = True
-            info["ctor_args"] = params
+        elif m.kind == "index":
+            # The declared `T &` becomes `T *`, and every `v[i]` becomes
+            # `*T_index(&v, i)`. Returning a reference is what makes
+            # `v[i] = x` mean anything; a by-value return would assign to a
+            # copy, so it is rejected rather than quietly lost.
+            iret = sub(m.ret or "").strip()
+            if "&" not in iret:
+                raise CppError(
+                    "class %s: `operator[]` has to return a reference "
+                    "(`%s &`), so that `v[i] = x` assigns to the element "
+                    "rather than to a copy."
+                    % (cls.name, iret.replace("&", "").strip() or "T"))
+            info["index"] = {"fn": "%s__index" % cname,
+                             "ret": tsub(iret.replace("&", "").strip())}
+            # The body returns the element; the lowered function returns
+            # its address, which is what a reference is.
+            ibody = _sub_code(
+                re.compile(r"(?<![\w.>])return\s+([^;]+);"),
+                lambda mm: "return &(%s);" % mm.group(1).strip(),
+                sub(m.body or ""))
+            emit(iret.replace("&", "*"), "%s__index" % cname, params, ibody)
         elif m.kind == "assign":
             # Lowered to `T_assign(T *this, const T *o)`. Assignment is the
             # one place the subset needs a user hook: a struct copy of an
@@ -1236,9 +1301,14 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
 
     # A base, a member, or a vtable pointer all oblige the class to have a
     # constructor; a base or member destructor obliges a destructor.
-    if ctor is None and prologue:
+    if not plain and prologue:
+        # A base, a member, or a vtable obliges a default constructor even
+        # when the class declares only constructors that take arguments.
+        mprotos.append("static void %s_new(%s *this);" % (cname, cname))
         out.append("static void %s_new(%s *this) { %s}"
-                   % (cname, cname, prologue))
+                   % (cname, cname, make_prologue(None)))
+        info["ctors"][0] = {"fn": "%s_new" % cname, "params": "",
+                            "refs": set(), "alloc": "%s__alloc" % cname}
         info["ctor"] = True
     if dtor is None and epilogue:
         out.append("static void %s_drop(%s *this) {%s }"
@@ -1253,18 +1323,25 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
     #
     # `delete` needs no helper: it is a statement, so it lowers in place.
     if wants_new and not abstract:
-        cparams = _lower_refs(info["ctor_args"], names)
-        fwd = [n for n in (_param_name(x) for x in _split_top(cparams)) if n]
-        body = ["%s *p = (%s *)malloc(sizeof(%s));" % (cname, cname, cname)]
-        if info["ctor"]:
-            # A failed allocation must not be constructed through. C++ would
-            # throw here; the subset has no exceptions, so `new` yields null
-            # and the caller checks, which is the C convention anyway.
-            body.append("if (p) { %s_new(p%s); }"
-                        % (cname, "".join(", " + f for f in fwd)))
-        body.append("return p;")
-        out.append("static %s *%s__alloc(%s) { %s }"
-                   % (cname, cname, cparams or "void", " ".join(body)))
+        # One allocator per constructor, so `new T(a, b)` reaches the same
+        # overload `T x(a, b);` would.
+        for ar in sorted(info["ctors"] or {0: None}):
+            ent = info["ctors"].get(ar)
+            cparams = _lower_refs(ent["params"] if ent else "", names)
+            fwd = [n for n in (_param_name(x)
+                               for x in _split_top(cparams)) if n]
+            alloc = ent["alloc"] if ent else "%s__alloc" % cname
+            body = ["%s *p = (%s *)malloc(sizeof(%s));" % (cname, cname, cname)]
+            if ent:
+                # A failed allocation must not be constructed through. C++
+                # would throw here; the subset has no exceptions, so `new`
+                # yields null and the caller checks, which is the C
+                # convention anyway.
+                body.append("if (p) { %s(p%s); }"
+                            % (ent["fn"], "".join(", " + f for f in fwd)))
+            body.append("return p;")
+            out.append("static %s *%s(%s) { %s }"
+                       % (cname, alloc, cparams or "void", " ".join(body)))
 
     # Virtual methods resolve through the vtable rather than by name. The
     # destructor slot is not addressable as a method, so it is not listed
@@ -1671,14 +1748,24 @@ def _rewrite_scopes(text, type_info):
                 continue
             out.append("%s %s; " % (ctype, vname))
             src = _copy_source(args, ctype, scopes, type_info)
+            ar = _arity(args)
+            if src is None and ar not in info["ctors"]:
+                raise CppError(
+                    "`%s %s(%s)`: %s has no constructor taking %d "
+                    "argument%s (it has %s)."
+                    % (ctype, vname, (args or "").strip(), ctype, ar,
+                       "" if ar == 1 else "s",
+                       ", ".join(str(k) for k in sorted(info["ctors"]))
+                       or "none"))
             if args is None or not args.strip():
-                out.append("%s_new(&%s);" % (ctype, vname))
+                out.append("%s(&%s);" % (info["ctors"][0]["fn"], vname))
             elif src is not None:
                 # `T b(a);` is a copy, not a call to the default constructor
                 # with an extra argument.
                 out.append(_copy_call(ctype, vname, src, info, ctype))
             else:
-                out.append("%s_new(&%s, %s);" % (ctype, vname, args.strip()))
+                out.append("%s(&%s, %s);"
+                           % (info["ctors"][ar]["fn"], vname, args.strip()))
             if info["dtor"]:
                 scopes[-1].live.append((ctype, vname))
             scopes[-1].vals[vname] = ctype
@@ -1892,6 +1979,19 @@ def _find_close(text, open_idx):
     return close if close is not None else len(text)
 
 
+def _match_bracket(text, open_idx):
+    """Index of the `]` closing the `[` at `open_idx`, or None."""
+    depth = 0
+    for i in range(open_idx, len(text)):
+        if text[i] == "[":
+            depth += 1
+        elif text[i] == "]":
+            depth -= 1
+            if depth == 0:
+                return i
+    return None
+
+
 def _addr(expr, is_ptr):
     return expr if is_ptr else "&" + expr
 
@@ -1946,6 +2046,23 @@ def _ret_class(ret, cinfo):
     if stars > 1:
         return None, False
     return toks[0], stars == 1
+
+
+def _arity(params):
+    """How many parameters a list declares."""
+    return len([p for p in _split_top(params or "")
+                if p.strip() and p.strip() != "void"])
+
+
+def _ctor_name(cname, arity, multi):
+    """`T_new`, or `T_new_<n>` when the class overloads its constructor.
+
+    The no-argument constructor keeps the plain name whenever there is one,
+    because that is what member and base default construction call.
+    """
+    if not multi or arity == 0:
+        return "%s_new" % cname
+    return "%s_new_%d" % (cname, arity)
 
 
 def _is_copy_params(params, cname, raw_name, tsub, sub):
@@ -2025,6 +2142,8 @@ def _rewrite_calls(text, cinfo, free_refs):
     # ever sees what that one left behind.
     field_re = re.compile(
         r"(?<![\w.>])(\w+)((?:\s*(?:\.|->)\s*\w+)+)(?!\s*\()")
+    # `v[i]` / `a.b[i]` on a class that overloads subscript.
+    index_re = re.compile(r"(?<![\w.>\]])(\w+)((?:\s*(?:\.|->)\s*\w+)*)\s*\[")
     # A call continuing a chain: `.g(` or `->g(` right after a `)`.
     cont_re = re.compile(r"\s*(?:\.|->)\s*(\w+)\s*\(")
     plain_re = re.compile(r"(?<![\w.>])(\w+)\s*\(")
@@ -2085,6 +2204,39 @@ def _rewrite_calls(text, cinfo, free_refs):
             parts.append(expr[pos:m.start()])
             parts.append(got[0] if got is not None else m.group(0))
             pos = m.end()
+
+    def follow(expr, cls, is_ptr, pos, from_meth):
+        """Consume `.g(..)` / `->g(..)` chained onto an expression.
+
+        The result of one call is the receiver of the next, so each step is
+        emitted into a string that the next step receives. Shared by the
+        call branch and the subscript branch, since `v[i]->name()` chains
+        for exactly the same reason `o.node()->name()` does.
+        """
+        while True:
+            nm = cont_re.match(look, pos)
+            if nm is None:
+                return expr, pos
+            meth = nm.group(1)
+            if cls is None or meth not in cinfo[cls]["methods"]:
+                return expr, pos
+            if not is_ptr:
+                # C cannot take the address of a function result, and a
+                # method needs an addressable receiver. Spilling would need
+                # a statement, and this is an expression.
+                raise CppError(
+                    "`%s().%s()`: %s is returned by value, so there is no "
+                    "object to call `%s` on. Assign it to a local first, or "
+                    "return `%s *`." % (from_meth, meth, cls, meth, cls))
+            nxt = _match_paren(look, nm.end() - 1)
+            if nxt is None:
+                return expr, pos
+            ent = cinfo[cls]["methods"][meth]
+            args = fix_args(text[nm.end():nxt], ent["refs"], scopes)
+            expr = _emit_method_call(expr, cls, is_ptr, meth, args, ent,
+                                     cinfo)
+            cls, is_ptr = _ret_class(ent["ret"], cinfo)
+            pos, from_meth = nxt + 1, meth
 
     def fix_args(raw, refs, scopes):
         """Insert `&` where a by-reference parameter wants an address."""
@@ -2169,46 +2321,48 @@ def _rewrite_calls(text, cinfo, free_refs):
             if got is not None and got[1] in cinfo:
                 expr, cls, is_ptr = got
                 if meth in cinfo[cls]["methods"]:
-                    # Follow a chain of calls: the result of one is the
-                    # receiver of the next. Each step is emitted into a
-                    # string that becomes the next step's receiver
-                    # expression, so `o.node()->get()` needs no temporary.
-                    #
-                    # The chain only ever starts from a resolved symbol, so
-                    # `get_ops()->init(x)` -- a free function returning a
-                    # plain C struct -- is still left exactly as written.
-                    while True:
-                        ent = cinfo[cls]["methods"][meth]
-                        args = fix_args(text[op + 1:close], ent["refs"],
-                                        scopes)
-                        expr = _emit_method_call(expr, cls, is_ptr, meth,
-                                                 args, ent, cinfo)
-                        end = close + 1
-                        nm = cont_re.match(look, end)
-                        if nm is None:
-                            break
-                        rcls, rptr = _ret_class(ent["ret"], cinfo)
-                        if rcls is None or nm.group(1) not in \
-                                cinfo[rcls]["methods"]:
-                            break
-                        if not rptr:
-                            # C cannot take the address of a function result,
-                            # and a method needs an addressable receiver.
-                            # Spilling would need a statement, and this is an
-                            # expression.
-                            raise CppError(
-                                "`%s().%s()`: %s is returned by value, so "
-                                "there is no object to call `%s` on. Assign "
-                                "it to a local first, or return `%s *`."
-                                % (meth, nm.group(1), rcls, nm.group(1),
-                                   rcls))
-                        nxt = _match_paren(look, nm.end() - 1)
-                        if nxt is None:
-                            break
-                        cls, is_ptr, meth = rcls, rptr, nm.group(1)
-                        op, close = nm.end() - 1, nxt
+                    ent = cinfo[cls]["methods"][meth]
+                    args = fix_args(text[op + 1:close], ent["refs"], scopes)
+                    expr = _emit_method_call(expr, cls, is_ptr, meth, args,
+                                             ent, cinfo)
+                    rcls, rptr = _ret_class(ent["ret"], cinfo)
+                    expr, end = follow(expr, rcls, rptr, close + 1, meth)
                     out.append(expr)
                     i = end
+                    continue
+
+        m = index_re.match(look, i)
+        if m:
+            chain = [p for p in re.split(r"\s*(?:\.|->)\s*", m.group(2) or "")
+                     if p]
+            got = resolve(scopes, m.group(1), chain)
+            # A subscript on a genuine pointer is plain C indexing, not
+            # `operator[]` on what it points at -- `T *p; p[i]` walks an
+            # array. Fields record their declared pointer-ness truthfully,
+            # so a chain ending in a pointer field is left alone. A bare
+            # symbol is not so clear: a reference parameter has already been
+            # lowered to a pointer and is indistinguishable from one the
+            # author spelled, and between the two readings `v[i]` on a
+            # `vector &` is the one people write.
+            if got is not None and chain and got[2]:
+                got = None
+            if got is not None and got[1] in cinfo \
+                    and cinfo[got[1]]["index"] is not None:
+                ob = m.end() - 1
+                cb = _match_bracket(look, ob)
+                if cb is not None:
+                    expr, cls, is_ptr = got
+                    ent = cinfo[cls]["index"]
+                    # `v[i]` is `*v.at(i)` in the lowered form: the operator
+                    # yields the element's address, and the dereference
+                    # keeps `v[i] = x` an lvalue.
+                    sub_expr = ("(*%s(%s, %s))"
+                                % (ent["fn"], _addr(expr, is_ptr),
+                                   text[ob + 1:cb].strip()))
+                    ecls, eptr = _ret_class(ent["ret"], cinfo)
+                    sub_expr, i = follow(sub_expr, ecls, eptr, cb + 1,
+                                         "operator[]")
+                    out.append(sub_expr)
                     continue
 
         m = field_re.match(look, i)
@@ -2246,15 +2400,29 @@ def _rewrite_calls(text, cinfo, free_refs):
                     "instantiated." % (tname, tname))
             args = ""
             end = m.end()
+            raw = ""
             after = look[end:len(look)].lstrip()
             if after.startswith("("):
                 op = look.index("(", end)
                 close = _match_paren(look, op)
                 if close is not None:
-                    args = fix_args(text[op + 1:close],
-                                    cinfo[tname]["ctor_refs"], scopes)
+                    raw = text[op + 1:close]
                     end = close + 1
-            alloc = "%s__alloc(%s)" % (tname, args)
+            ar = _arity(raw)
+            ctors = cinfo[tname]["ctors"]
+            if not ctors and ar == 0:
+                # No constructor at all: `new T` is just the allocation.
+                out.append("%s__alloc()" % tname)
+                i = end
+                continue
+            if ar not in ctors:
+                raise CppError(
+                    "`new %s(%s)`: %s has no constructor taking %d "
+                    "argument%s (it has %s)."
+                    % (tname, raw.strip(), tname, ar, "" if ar == 1 else "s",
+                       ", ".join(str(k) for k in sorted(ctors)) or "none"))
+            args = fix_args(raw, ctors[ar]["refs"], scopes) if raw else ""
+            alloc = "%s(%s)" % (ctors[ar]["alloc"], args)
             # `Base *p = new Derived(..)` is the shape the whole virtual
             # story rests on, and C will not convert `Derived *` to `Base *`
             # on its own. The base is the first member, so the cast is
@@ -2370,6 +2538,7 @@ public:
     int sn;
     int scap;
     string() { sd = 0; sn = 0; scap = 0; }
+    string(const char *s) { sd = 0; sn = 0; scap = 0; assign(s); }
     string(const string &o) {
         sd = 0; sn = 0; scap = 0;
         reserve(o.sn);
@@ -2414,6 +2583,7 @@ public:
                        sd[sn] = 0; }
     }
     char at(int i) { return sd[i]; }
+    char &operator[](int i) { return sd[i]; }
     const char *c_str() { if (sd == 0) { return ""; } return sd; }
     int equals(const string &o) {
         if (sn != o.sn) { return 0; }
@@ -2432,6 +2602,7 @@ public:
     int vn;
     int vcap;
     vector() { vd = 0; vn = 0; vcap = 0; }
+    vector(int n) { vd = 0; vn = 0; vcap = 0; reserve(n); }
     vector(const vector<T> &o) {
         vd = 0; vn = 0; vcap = 0;
         reserve(o.vn);
@@ -2471,6 +2642,7 @@ public:
     T get(int i) { return vd[i]; }
     void set(int i, T v) { vd[i] = v; }
     T *ptr(int i) { return vd + i; }
+    T &operator[](int i) { return vd[i]; }
 };
 """
 
@@ -2772,12 +2944,18 @@ def _lower_lambdas(text, path):
     C++ deduces it from the body; nothing here can, and defaulting to `int`
     would silently truncate a `double`.
     """
-    n = 0
+    n, pos = 0, 0
     while True:
         look = _blank_strings(_strip_comments(text))
-        m = _LAMBDA.search(look)
+        m = _LAMBDA.search(look, pos)
         if m is None:
             return text
+        if _prev_word(look, m.start()) == "operator":
+            # `operator[](int i) { .. }` is a subscript overload, not a
+            # lambda with an empty capture list.
+            pos = m.end()
+            continue
+        pos = 0
         captures = m.group(1).strip()
         close = _match_brace(look, look.index("{", m.end() - 1))
         if close is None:
@@ -2981,6 +3159,20 @@ def translate(text, path="<cpp>"):
     # a `&` is still on the page.
     free_refs = _free_ref_funcs(_strip_comments(out), names)
     out = _lower_refs(out, names)
+    # `vector<T>` stores elements by assignment, which for an owning class
+    # would leave two objects holding one resource. Caught here, against the
+    # element type the source asked for, rather than as a by-value complaint
+    # about a `push_back` the author never wrote.
+    for targs in wanted.get("vector", []):
+        elem = targs[0]
+        if elem in cinfo and cinfo[elem]["dtor"]:
+            raise CppError(
+                "%s: `vector<%s>` stores its elements by assignment, and %s "
+                "has a destructor -- two elements would own one resource. "
+                "Use `vector<%s *>` with `new`/`delete`, which is what the "
+                "subset can express."
+                % (os.path.basename(path), elem, elem, elem))
+
     # After reference lowering, a class still spelled by value really is by
     # value -- a `T &` the author wrote is a `T *` by now.
     _check_by_value(out, cinfo, path)
