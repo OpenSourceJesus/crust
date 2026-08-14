@@ -251,6 +251,15 @@ class CppError(Exception):
         self.message = message
 
 
+#: `a += b` becomes `T__augadd(&a, &b)`. Spelled out rather than punctuated
+#: because the symbol has to be a C identifier, and `__augadd` reads back to
+#: the operator it came from.
+_AUG_NAMES = {"+": "add", "-": "sub", "*": "mul", "/": "div", "%": "mod",
+              "|": "or", "&": "and", "^": "xor"}
+
+_AUG_ASSIGN_SPELLINGS = frozenset(
+    ["%s=" % k for k in ("+", "-", "*", "/", "%", "|", "&", "^")])
+
 _UNSUPPORTED = ("throw", "try", "catch",
                 "dynamic_cast", "typeid")
 
@@ -372,12 +381,30 @@ def _check_unsupported(scan, path):
     for m in _OPERATOR.finditer(scan):
         if m.group(1) in ("=", "[]", "[", "->", "*"):
             continue
+        if m.group(1) in _AUG_ASSIGN_SPELLINGS:
+            continue
         line = scan.count("\n", 0, m.start()) + 1
+        # A *conversion* operator is worth naming separately: it is not one
+        # more overload to add but a different kind of thing. It applies
+        # where the compiler decides a conversion is wanted, so lowering it
+        # means knowing the type every expression is used at -- and this pass
+        # reads types by how they are written. Spelled out rather than
+        # lumped in with `operator<`, which really is just missing.
+        spelled = m.group(1)
+        if re.match(r"^[A-Za-z_]\w*$", spelled) and spelled not in _KEYWORDS:
+            raise CppError(
+                "%s:%d: `operator %s()` is a conversion operator, which is "
+                "not in the C++ subset. It applies wherever the compiler "
+                "decides a conversion is wanted, and this pass reads types "
+                "from how they are written -- so there is no honest way to "
+                "know where to insert the call. Give the class a named "
+                "method and call it."
+                % (os.path.basename(path), line, spelled))
         raise CppError(
             "%s:%d: `operator%s` is not in the C++ subset. It supports "
-            "`operator=`, `operator[]`, `operator->` and `operator*` -- "
-            "assignment, element access, and the two a smart pointer needs."
-            % (os.path.basename(path), line, m.group(1)))
+            "`operator=`, a compound assignment (`+=` and friends), "
+            "`operator[]`, `operator->` and `operator*`."
+            % (os.path.basename(path), line, spelled))
     for kw in _UNSUPPORTED:
         m = re.search(r"\b%s\b" % kw, scan)
         if m:
@@ -601,6 +628,14 @@ def _split_members(body, cname, line0):
             # the use, so `*p = x` still assigns through.
             bits = sig[:sig.index("operator")].strip()
             members.append(Member("star", bits, "operator*", params,
+                                  inner, line0))
+        elif re.search(r"\boperator\s*(\+|-|\*|/|%|\||&|\^)=$", sig):
+            # A compound assignment. Lowered like `operator=`: the result is
+            # dropped, so `a += b` is a statement and a chained
+            # `c = a += b` is rejected rather than yielding nothing.
+            opm = re.search(r"\boperator\s*(\+|-|\*|/|%|\||&|\^)=$", sig)
+            members.append(Member("augassign", "void",
+                                  "operator%s=" % opm.group(1), params,
                                   inner, line0))
         elif re.search(r"\boperator\s*=$", sig):
             # `T &operator=(const T &o)` or `void operator=(..)`. The return
@@ -1315,7 +1350,7 @@ def _external_info(name, dropfn):
             "abstract": False, "vdtor": False, "vdtor_decl": None,
             "ctor_refs": set(), "paths": {}, "copy": False,
             "assign": False, "index": None, "arrow": None,
-            "star": None, "vcall": {},
+            "star": None, "augassign": {}, "vcall": {},
             "dropfn": dropfn, "external": True}
 
 
@@ -1449,7 +1484,7 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             "abstract": abstract, "vdtor": False, "vdtor_decl": None,
             "ctor_refs": set(), "paths": {}, "copy": False,
             "assign": False, "index": None, "arrow": None,
-            "star": None,
+            "star": None, "augassign": {},
             "dropfn": "%s_drop" % cname, "external": False}
     if base_info:
         # Inherited members and methods are reachable on the derived class.
@@ -1686,6 +1721,15 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             # a method called `assign`, and `string` does.
             emit("void", "%s__assign" % cname, params, sub(m.body or ""))
             info["assign"] = True
+        elif m.kind == "augassign":
+            op = m.name[len("operator"):-1]
+            fn = "%s__aug%s" % (cname, _AUG_NAMES[op])
+            info["augassign"][op] = {
+                "fn": fn,
+                "refs": _ref_positions(_expand_cpp_ref(sub(m.params or ""),
+                                                       known),
+                                       _with_scalars(names))}
+            emit("void", fn, params, sub(m.body or ""))
         elif m.kind == "dtor":
             emit("void", "%s_drop" % cname, params,
                  sub(m.body or "") + epilogue)
@@ -2036,6 +2080,8 @@ def _rewrite_scopes(text, type_info):
     # scope. Compound assignments are not matched: `+=` on a class is not a
     # copy, and C would reject it anyway.
     assign_re = re.compile(r"(?<![\w.>])(\w+)\s*=(?!=)\s*([^;]+);")
+    aug_re = re.compile(
+        r"(?<![\w.>])(\w+)\s*([+\-*/%|&^])=(?!=)\s*([^;]+);")
 
     agg_re = re.compile(r"\b(struct|union|enum)\b[^;{}]*$")
     # Every lookback and keyword match below runs against a comment-blanked
@@ -2250,6 +2296,36 @@ def _rewrite_scopes(text, type_info):
             scopes[-1].vals[vname] = ctype
             i = m.end()
             continue
+
+        m = aug_re.match(look, i)
+        if m and not aggs:
+            lhs, op = m.group(1), m.group(2)
+            ctype = None
+            for fr in reversed(scopes):
+                if lhs in fr.vals:
+                    ctype = fr.vals[lhs]
+                    break
+            ent = (type_info.get(ctype) or {}).get("augassign", {}).get(op) \
+                if ctype else None
+            if ent is not None:
+                rhs = text[m.start(3):m.end(3)].strip()
+                if _blank_strings(rhs).count("=") > rhs.count("=="):
+                    raise CppError(
+                        "`%s %s= %s`: a chained assignment is not in the C++ "
+                        "subset -- a compound assignment is lowered to a "
+                        "`void` call, so there is no result to assign onward."
+                        % (lhs, op, rhs))
+                # The operand is taken by reference, like `operator=`'s, so
+                # it has to be something this pass can name and address.
+                src = _copy_source(rhs, ctype, scopes, type_info)
+                if src is None:
+                    raise CppError(
+                        "`%s %s= %s`: the right-hand side is not an object "
+                        "of type %s that this pass can name. Assign it to a "
+                        "typed local first." % (lhs, op, rhs, ctype))
+                out.append("%s(&%s, &%s);" % (ent["fn"], lhs, src))
+                i = m.end()
+                continue
 
         m = assign_re.match(look, i)
         if m and not aggs:

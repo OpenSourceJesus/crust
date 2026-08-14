@@ -263,7 +263,10 @@ def _declared_types(text):
     """
     out = {}
     for m in re.finditer(
-            r"(?:^|[;{}(,])\s*(?:const\s+|static\s+)*"
+            # `:` and a newline anchor too: an access label ends in a colon
+            # and the member after it is on the next line, so `private:` on
+            # its own line hid every field that followed from this scan.
+            r"(?:^|[;{}(,:\n])\s*(?:const\s+|static\s+)*"
             r"([A-Za-z_][\w:]*(?:\s*<[^;{}()]*>)?)\s*(\*+|&)?\s*"
             r"(\w+)\s*(?=([;=,)\[]))", text):
         base, star, name = m.group(1), m.group(2) or "", m.group(3)
@@ -610,8 +613,19 @@ def resolve_range_for(text, path="<cpp>", blank=None):
     return text
 
 
+_CPP_REF_CALL = re.compile(r"__cpp_ref\s*\(\s*([\w:]+)\s*\)")
+
+
 def _blank_like(text):
-    """A same-length copy with comment and literal bodies blanked."""
+    """A same-length copy with comment and literal bodies blanked.
+
+    `__cpp_ref(T)` is blanked down to just `T` as well. It is a *type* in a
+    parameter list, but it is spelled like a call, and the declarator scan
+    reads a parameter list as having no parentheses in it -- so `map`'s
+    `find(__cpp_ref(K) k)` looked like no declaration at all, and every
+    deduction from `m.find(..)` failed. Length is preserved, as everywhere
+    else here, so positions in this copy still index the real text.
+    """
     out, i, n = list(text), 0, len(text)
     while i < n:
         c = text[i]
@@ -638,7 +652,12 @@ def _blank_like(text):
             i = j
         else:
             i += 1
-    return "".join(out)
+    blanked = "".join(out)
+    for m in _CPP_REF_CALL.finditer(blanked):
+        pad = m.end() - m.start() - len(m.group(1))
+        blanked = (blanked[:m.start()] + " " * (pad - 1) + m.group(1) + " "
+                   + blanked[m.end():])
+    return blanked
 
 
 def _sub_name(body, body_scan, name, repl):
@@ -838,8 +857,18 @@ def _blank_braced(text):
     return "".join(out)
 
 
+_TEMPLATE_HEAD = re.compile(r"template\s*<[^<>]*>")
+
+
 def _declared_in(body_scan):
     """Names a namespace body declares: types, functions, and variables."""
+    # A template parameter list is not a declaration of anything the
+    # namespace owns, and `template<class T>` reads exactly like a class
+    # declaration to the scan below. litehtml has one, and flattening turned
+    # every `T` in the template into `litehtml_T` -- including the `operator
+    # T()` that first made this visible.
+    body_scan = _TEMPLATE_HEAD.sub(lambda m: " " * (m.end() - m.start()),
+                                   body_scan)
     out = set()
     for m in re.finditer(r"\b(?:class|struct|enum|union)\s+(\w+)",
                          body_scan):
