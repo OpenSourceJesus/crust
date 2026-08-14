@@ -939,6 +939,41 @@ wins, exactly as in C++.
 initializer at all: a scalar member is zeroed, and a class member is already
 default-constructed by the member prologue.
 
+### Brace initializers
+
+A constructor's initializer list may use either spelling:
+
+```cpp
+Ref(Doc *p, int k) : d { p }, n(k) { }
+```
+
+The braces mean list initialisation, which for everything this subset lowers
+-- a constructor call or a scalar -- is the same call with the same
+arguments, so only the spelling differs.
+
+Telling an initializer brace from the body's is done by what precedes it: an
+initializer brace follows the member's *name*, the body's follows a `)` or
+the `}` that closed the last initializer. That rule is applied only where an
+initializer list is actually present, since `union {` has a name before it
+too and is a different thing.
+
+### Members defined elsewhere
+
+A member declared with no body and no out-of-line definition in this
+translation stays a **declaration**: a prototype is emitted, with external
+linkage, and nothing else. That is what C does with one, and the linker says
+so if nothing supplies it.
+
+This is ordinary once headers are spliced -- `css_length.h` declares
+`fromString` and `css_length.cpp` defines it, so a file that merely includes
+the header sees only the declaration. It used to be refused, on the grounds
+that an empty body would compile and silently do nothing; that is true, which
+is why no empty body is emitted either.
+
+**Translating is not linking.** A member defined in another `.cpp` still
+needs that file compiled and linked, which this pipeline does not yet do --
+it lowers one translation unit at a time.
+
 ### Member specifiers
 
 `final` on a class, and `override`, `final`, `noexcept` or a trailing `const`
