@@ -1116,18 +1116,155 @@ void f(void) { auto g = [](int y) -> int { return y; }; }
         self.assertLess(out.index("static int _cpp_lambda0"),
                         out.index("(*g)(int)"))
 
-    def test_capturing_lambda_is_error(self):
+    def test_capture_by_value_snapshots_at_the_definition(self):
+        """`[x]` copies where the lambda is written, `[&x]` does not.
+
+        The copy is a real local declared at that point, so a later change
+        to `x` is not visible through it -- which is the whole difference
+        between the two capture forms.
+        """
+        out = cpprust.translate("""
+int f(void) { int x = 10; auto g = [x](int k) -> int { return x + k; };
+              x = 99; return g(1); }
+""")
+        self.assertIn("int _cpp_cap_g_x = x;", out)
+        self.assertIn("_cpp_cap_g_x + k", out)
+
+    def test_capture_by_reference_sees_later_changes(self):
+        out = cpprust.translate("""
+int f(void) { int y = 1; auto g = [&y](int k) -> int { return y + k; };
+              y = 99; return g(1); }
+""")
+        self.assertIn("y + k", out)
+        self.assertNotIn("_cpp_cap_g_y", out)
+
+    def test_mixed_captures(self):
+        out = cpprust.translate("""
+int f(void) { int a = 1; int b = 2;
+              auto g = [a, &b](int k) -> int { return a + b + k; };
+              return g(3); }
+""")
+        self.assertIn("int _cpp_cap_g_a = a;", out)
+        self.assertIn("_cpp_cap_g_a + b + k", out)
+
+    def test_capture_all_by_value_is_error(self):
+        # `[=]` names nothing, and a by-value capture has to be declared.
         with self.assertRaises(cpprust.CppError) as cm:
             cpprust.translate("""
-void f(void) { int x = 1; auto g = [x](int y) -> int { return x + y; }; }
+void f(void) { int x = 1; auto g = [=](int y) -> int { return x + y; };
+               int r = g(1); }
 """)
-        self.assertIn("capturing lambda", cm.exception.message)
+        self.assertIn("`[=]`", cm.exception.message)
 
-    def test_capture_all_is_error(self):
+    def test_unfindable_capture_type_is_error(self):
+        # The declaration is a function parameter of a different function,
+        # so no unambiguous type is in scope to declare the copy with.
         with self.assertRaises(cpprust.CppError) as cm:
-            cpprust.translate(
-                "void f(void) { auto g = [&](int y) -> int { return y; }; }")
-        self.assertIn("capturing lambda", cm.exception.message)
+            cpprust.translate("""
+void f(void) { auto g = [nosuch](int y) -> int { return y; }; int r = g(1); }
+""")
+        self.assertIn("captured by value", cm.exception.message)
+
+    def test_capture_by_reference_inlines_at_the_call(self):
+        """No closure struct: the body goes where the call is.
+
+        A capture would need the captured variable's type to become a field,
+        and that type is an ordinary local this pass cannot see. Inlining
+        makes the question go away -- the variables are simply in scope.
+        """
+        out = cpprust.translate("""
+int f(void) { int t = 0; auto g = [&](int y) -> int { return t + y; }; return g(2); }
+""")
+        self.assertIn("do { int y = 2;", out)
+        self.assertIn("t + y", out)
+        self.assertNotIn("auto", out)
+
+    def test_return_becomes_break_not_goto(self):
+        # A lambda `return` leaves the lambda, not the function. `break` out
+        # of `do { } while (0)` is a structured jump the destructor
+        # unwinding already understands; `goto` is refused whenever anything
+        # is live, which is most RAII code.
+        out = cpprust.translate("""
+int f(void) { int t = 1; auto g = [&](int y) -> int { return t + y; }; return g(2); }
+""")
+        self.assertIn("break; }", out)
+        self.assertIn("} while (0);", out)
+        self.assertNotIn("goto", out)
+
+    def test_each_call_site_gets_its_own_expansion(self):
+        out = cpprust.translate("""
+int f(void) { int t = 0; auto g = [&](int y) -> int { return t + y; };
+              return g(1) + g(2); }
+""")
+        self.assertIn("_cpp_lam0_r", out)
+        self.assertIn("_cpp_lam1_r", out)
+
+    def test_void_capturing_lambda(self):
+        out = cpprust.translate("""
+int puts(const char *s);
+void f(void) { auto g = [&]() -> void { puts("hi"); }; g(); }
+""")
+        self.assertIn('puts("hi")', out)
+        self.assertIn("(void)0", out)
+
+    def test_capture_all_by_reference_is_supported(self):
+        out = cpprust.translate("""
+int f(void) { int a = 1; int b = 2; auto g = [&]() -> int { return a + b; };
+              return g(); }
+""")
+        self.assertIn("a + b", out)
+
+    def test_recursive_lambda_is_error(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate("""
+void f(void) { int x = 1; auto g = [&](int y) -> int { return g(y); }; int r = g(1); }
+""")
+        self.assertIn("cannot recurse", cm.exception.message)
+
+    def test_call_in_a_loop_condition_is_error(self):
+        # Hoisting the body before the statement would evaluate it once.
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate("""
+void f(void) { int x = 1; auto g = [&](int y) -> int { return x + y; };
+               while (g(1) < 5) { x = x + 1; } }
+""")
+        self.assertIn("controlling expression", cm.exception.message)
+
+    def test_call_in_a_short_circuit_operand_is_error(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate("""
+void f(void) { int x = 1; auto g = [&](int y) -> int { return x + y; };
+               int r = (x > 0 && g(1) > 2); }
+""")
+        self.assertIn("operand of", cm.exception.message)
+
+    def test_capturing_lambda_used_as_a_value_is_error(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate("""
+int h(int (*f)(int));
+void f(void) { int x = 1; auto g = [&](int y) -> int { return x + y; };
+               int r = h(g); }
+""")
+        self.assertIn("used as a value", cm.exception.message)
+
+    def test_return_inside_a_loop_in_the_body_is_error(self):
+        # `return` becomes `break`, which would leave only the inner loop.
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate("""
+void f(void) { int x = 1;
+               auto g = [&](int y) -> int { while (y > 0) { return x; } return 0; };
+               int r = g(1); }
+""")
+        self.assertIn("becomes `break`", cm.exception.message)
+
+    def test_capturing_lambda_composes_with_destructors(self):
+        out = cpprust.translate("""
+class G { public: int v; G() { v = 7; } ~G() { v = 0; } int get() { return v; } };
+int f(void) { G g; int b = 1; auto k = [&](int n) -> int { return b + n + g.get(); };
+              return k(2); }
+""")
+        self.assertIn("G_get(&g)", out)
+        self.assertIn("G_drop(&g);", out)
 
     def test_array_subscript_is_not_a_lambda(self):
         out = cpprust.translate("""
