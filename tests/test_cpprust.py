@@ -52,6 +52,178 @@ Holder<int> x;
         self.assertNotIn("template", out)
 
 
+_PAIR = """
+template<typename K, typename V>
+class Pair {
+    K key;
+    V val;
+public:
+    Pair(K k, V v) { key = k; val = v; }
+    K first() { return key; }
+    V second() { return val; }
+};
+"""
+
+
+class TestCppMultiTemplate(unittest.TestCase):
+    def test_two_parameters_monomorphise(self):
+        out = cpprust.translate(_PAIR + "Pair<int, double> p;\n")
+        self.assertIn("struct Pair_int_double { int key; double val; };", out)
+        self.assertIn("Pair_int_double_new(Pair_int_double *this, "
+                      "int k, double v)", out)
+        self.assertIn("Pair_int_double p;", out)
+        self.assertNotIn("Pair<", out)
+
+    def test_distinct_instantiations_are_distinct_structs(self):
+        out = cpprust.translate(
+            _PAIR + "void f(void) { Pair<int, double> a; Pair<char, int> b; }")
+        self.assertIn("struct Pair_int_double { int key; double val; };", out)
+        self.assertIn("struct Pair_char_int { char key; int val; };", out)
+
+    def test_method_calls_pick_the_right_instantiation(self):
+        out = cpprust.translate(_PAIR + """
+int f(void) {
+    Pair<int, double> a(1, 2.0);
+    Pair<char, int> b(65, 9);
+    return a.first() + b.second();
+}
+""")
+        self.assertIn("Pair_int_double_first(&a)", out)
+        self.assertIn("Pair_char_int_second(&b)", out)
+
+    def test_substitution_does_not_cascade(self):
+        """`<A,B>` instantiated as `<B,char>` must not rewrite A to B to char.
+
+        Substituting one parameter at a time would re-examine the text just
+        produced, so field `A a;` would become `B a;` and then `char a;`,
+        silently giving both fields the same type.
+        """
+        out = cpprust.translate("""
+typedef int B;
+template<typename A, typename B>
+class Two { A a; B b; };
+Two<B, char> x;
+""")
+        self.assertIn("struct Two_B_char { B a; char b; };", out)
+
+    def test_nested_instantiation_as_argument(self):
+        out = cpprust.translate("""
+template<typename A, typename B>
+class Pair { A x; B y; };
+template<typename T>
+class Holder { T v; };
+Holder<Pair<int, char> > h;
+""")
+        self.assertIn("struct Pair_int_char { int x; char y; };", out)
+        self.assertIn("struct Holder_Pair_int_char { Pair_int_char v; };", out)
+        self.assertIn("Holder_Pair_int_char h;", out)
+
+    def test_closing_angles_without_a_space(self):
+        """`>>` closes two argument lists; it is not a shift here."""
+        out = cpprust.translate("""
+template<typename A, typename B>
+class Pair { A x; B y; };
+template<typename T>
+class Holder { T v; };
+Holder<Pair<int,char>> h;
+""")
+        self.assertIn("struct Holder_Pair_int_char { Pair_int_char v; };", out)
+        self.assertIn("Holder_Pair_int_char h;", out)
+        self.assertNotIn("Pair<", out)
+        self.assertNotIn("Holder<", out)
+
+    def test_non_type_parameter_substitutes_array_dimension(self):
+        out = cpprust.translate("""
+template<typename T, int N>
+class Buf {
+    T data[N];
+public:
+    int cap() { return N; }
+};
+Buf<int, 8> b;
+""")
+        self.assertIn("struct Buf_int_8 { int data[8]; };", out)
+        self.assertIn("return 8;", out)
+
+    def test_wrong_arity_is_error(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate(_PAIR + "Pair<int> p;\n")
+        self.assertIn("takes 2 template arguments", cm.exception.message)
+
+    def test_default_argument_is_error(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate(
+                "template<typename A, typename B = int>\nclass P { A a; };\n")
+        self.assertIn("default template argument", cm.exception.message)
+
+    def test_parameter_pack_is_error(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate(
+                "template<typename... Ts>\nclass P { int a; };\n")
+        self.assertIn("parameter pack", cm.exception.message)
+
+    def test_duplicate_parameter_name_is_error(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate(
+                "template<typename T, typename T>\nclass P { T a; };\n")
+        self.assertIn("duplicate", cm.exception.message)
+
+    def test_argument_naming_a_later_class_is_error(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate("""
+template<typename T>
+class Holder { T v; };
+template<typename A, typename B>
+class Pair { A x; B y; };
+Holder<Pair<int,char> > h;
+""")
+        self.assertIn("declared below it", cm.exception.message)
+
+    def test_instantiation_inside_a_template_is_error(self):
+        """Not discoverable, so reported rather than left dangling.
+
+        The recording scan blanks template bodies, because there `Inner<T>`
+        is the pattern. So this instantiation is only revealed after `T` is
+        substituted, by which time the class list is fixed -- emitting the
+        name anyway would reference a struct that is never defined.
+        """
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate("""
+template<typename T>
+class Inner { T v; };
+template<typename T>
+class Outer { Inner<T> i; };
+Outer<int> o;
+""")
+        self.assertIn("instantiated from inside another template",
+                      cm.exception.message)
+
+    def test_relational_operator_is_not_a_template_use(self):
+        """A template name in a comparison must not swallow the expression."""
+        out = cpprust.translate(_PAIR + """
+int f(int Pair_x, int b) { return Pair_x < b; }
+""")
+        self.assertIn("return Pair_x < b;", out)
+
+    def test_destructors_run_for_each_instantiation(self):
+        out = cpprust.translate("""
+template<typename K, typename V>
+class E {
+    K k;
+    V v;
+public:
+    E() { k = 0; }
+    ~E() { k = 0; }
+};
+void f(void) { E<int, char> a; E<char, int> b; }
+""")
+        self.assertIn("E_char_int_drop(&b);", out)
+        self.assertIn("E_int_char_drop(&a);", out)
+        # Reverse declaration order: the later object drops first.
+        self.assertLess(out.index("E_char_int_drop(&b);"),
+                        out.index("E_int_char_drop(&a);"))
+
+
 class TestCppReject(unittest.TestCase):
     def test_typeid_is_error(self):
         with self.assertRaises(cpprust.CppError) as cm:
@@ -645,6 +817,189 @@ int use(A *p) { return p->f(); }
         with self.assertRaises(cpprust.CppError) as cm:
             cpprust.translate("class A { public: virtual int f(); };")
         self.assertIn("without a body", cm.exception.message)
+
+
+class TestCppFieldAccess(unittest.TestCase):
+    """A member read or write has to follow the same pointer-ness as a call.
+
+    `_lower_refs` turns `T &c` into `T *c`, so a `.` the author wrote is now
+    applied to a pointer. Only method *calls* were being rewritten, so
+    `c.v = 1` came out unchanged and the generated C did not compile.
+    """
+
+    def test_reference_param_field_becomes_arrow(self):
+        out = cpprust.translate(_COUNTER + """
+void addto(Counter &c, int k) { c.n = c.n + k; }
+""")
+        self.assertIn("c->n = c->n + k;", out)
+
+    def test_value_receiver_keeps_the_dot(self):
+        out = cpprust.translate(_COUNTER + """
+int f(void) { Counter c; return c.n; }
+""")
+        self.assertIn("return c.n;", out)
+
+    def test_reference_local_field_becomes_arrow(self):
+        out = cpprust.translate(_COUNTER + """
+void f(void) { Counter c; Counter &r = c; r.n = 3; }
+""")
+        self.assertIn("r->n = 3;", out)
+
+    def test_chain_mixes_operators_per_step(self):
+        out = cpprust.translate("""
+class Inner { public: int n; Inner() { n = 0; } };
+class Outer { public: Inner in; Outer() { } };
+void f(Outer &o) { o.in.n = 5; }
+""")
+        self.assertIn("o->in.n = 5;", out)
+
+    def test_field_nested_in_a_by_reference_argument(self):
+        # The call is emitted whole, arguments included, so the main scan
+        # never reaches inside them and re-running the pass re-copies the
+        # same text. The chain has to be fixed where it is copied.
+        out = cpprust.translate("""
+class Inner { public: int n; Inner() { n = 0; } };
+class Outer { public: Inner in; Outer() { } };
+void bump(Inner &i) { i.n = i.n + 1; }
+void f(Outer &o) { bump(o.in); }
+""")
+        self.assertIn("bump(&o->in);", out)
+
+    def test_array_field_through_a_reference(self):
+        out = cpprust.translate("""
+class B { public: int arr[4]; B() { arr[0] = 1; } };
+int f(B &b) { return b.arr[2]; }
+""")
+        self.assertIn("return b->arr[2];", out)
+
+    def test_plain_c_struct_access_is_untouched(self):
+        out = cpprust.translate(_COUNTER + """
+struct P { int x; };
+int f(struct P *p, struct P q) { return p->x + q.x; }
+""")
+        self.assertIn("return p->x + q.x;", out)
+
+    def test_unknown_member_is_left_alone(self):
+        # Not a field of the class, so nothing is known about it; the C
+        # compiler is the right place for that error.
+        out = cpprust.translate(_COUNTER + """
+void f(Counter &c) { c.nosuch = 1; }
+""")
+        self.assertIn("c.nosuch = 1;", out)
+
+    def test_rewriting_is_idempotent(self):
+        # `_rewrite_calls` runs to a fixed point, so a chain it has already
+        # converted must convert to itself on the next pass.
+        src = _COUNTER + "void f(Counter &c) { c.n = 1; }\n"
+        once = cpprust.translate(src)
+        self.assertIn("c->n = 1;", once)
+        self.assertNotIn("c->->n", once)
+        self.assertNotIn("c.n = 1;", once)
+
+
+class TestCppLiteralsAndComments(unittest.TestCase):
+    """A rewrite must not reach inside a string literal or a comment.
+
+    Every body-level pass here is a regex over source text, and a regex
+    cannot tell a field named `key` from the word `key` in
+    `printf("key=%d", key)`. Rewriting the literal changes what the program
+    prints; a `//` comment carried into a member declaration comments out
+    the generated code that follows it. Neither produced a diagnostic.
+    """
+
+    def test_field_name_in_a_literal_is_not_qualified(self):
+        out = cpprust.translate("""
+int printf(const char *fmt, ...);
+class C {
+    int key;
+public:
+    C() { key = 1; }
+    void show() { printf("key=%d\\n", key); }
+};
+""")
+        self.assertIn('printf("key=%d\\n", this->key);', out)
+        self.assertNotIn('"this->key', out)
+
+    def test_method_name_in_a_literal_gets_no_implicit_this(self):
+        out = cpprust.translate("""
+int puts(const char *s);
+class C {
+    int n;
+public:
+    C() { n = 0; }
+    int helper(void) { return n; }
+    int go(void) { puts("call helper() now"); return helper(); }
+};
+""")
+        self.assertIn('puts("call helper() now")', out)
+        self.assertIn("return C_helper(this);", out)
+
+    def test_template_parameter_in_a_literal_is_not_substituted(self):
+        out = cpprust.translate("""
+int puts(const char *s);
+template<typename T>
+class C { T v; public: void go() { puts("T is the parameter"); } };
+C<int> c;
+""")
+        self.assertIn('puts("T is the parameter")', out)
+
+    def test_reference_spelling_in_a_literal_is_not_lowered(self):
+        out = cpprust.translate("""
+int puts(const char *s);
+class Counter { public: int v; Counter() { v = 0; } };
+void g(void) { puts("Counter &c is a reference"); }
+""")
+        self.assertIn('puts("Counter &c is a reference")', out)
+
+    def test_line_comment_in_a_class_body_does_not_reach_the_output(self):
+        # A member is emitted onto one line, so a `//` carried through from
+        # the class body commented out the declaration after it -- the
+        # generated C was broken, with no diagnostic from here.
+        out = cpprust.translate("""
+class D {
+    int a;
+public:
+    // set it
+    void set(int v) { a = v; }
+};
+""")
+        self.assertNotIn("//", out)
+        self.assertIn("static void D_set(D *this, int v)", out)
+
+    def test_block_comment_in_a_class_body_does_not_reach_the_output(self):
+        out = cpprust.translate("""
+class D {
+    int a;
+public:
+    /* set it */
+    void set(int v) { a = v; }
+};
+""")
+        self.assertNotIn("set it", out)
+        self.assertIn("static void D_set(D *this, int v)", out)
+
+    def test_field_name_in_a_comment_is_not_qualified(self):
+        out = cpprust.translate("""
+class D {
+    int a;
+public:
+    D() { a = 1; /* a starts at one */ }
+};
+""")
+        self.assertNotIn("this->a starts", out)
+
+    def test_escaped_quote_and_char_literal_survive(self):
+        out = cpprust.translate("""
+int puts(const char *s);
+class C {
+    int n;
+public:
+    C() { n = 0; }
+    int f(void) { puts("say \\"n\\" now"); return n + 'n'; }
+};
+""")
+        self.assertIn('puts("say \\"n\\" now")', out)
+        self.assertIn("return this->n + 'n';", out)
 
 
 class TestCppComments(unittest.TestCase):
