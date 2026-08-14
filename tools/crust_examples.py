@@ -41,6 +41,19 @@ EXAMPLES = [
      "len      = 5\n"
      "released = 1\n", True),
 
+    # A C++ class *owning* Crust values by value rather than borrowing a
+    # pointer: the prelude sits above the include (with a `#line` resync), so
+    # `Vec_int` and `Res` are complete in the class body, and Crust hands over
+    # which types own something so the implicit destructor frees them. Also
+    # covers transitive Rust field glue and an owning value moved across a
+    # call boundary.
+    ("ownmember.c", 42,
+     "  Res_drop tag=7\n"
+     "total    = 12\n"
+     "count    = 3\n"
+     "built    = 4\n"
+     "moved    = 6\n", True),
+
     # C++ single inheritance and virtual dispatch, with Rust reducing the
     # results — base-as-first-member, so upcasting is a pointer cast.
     ("dispatch.c", 42,
