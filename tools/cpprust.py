@@ -14,6 +14,17 @@ the Rust side keeps its explicit API for callers that want it.
 The subset, deliberately small:
 
   * `class` / `struct` with data members and methods
+  * a copy constructor, `T(const T &o)`, lowered to `T_copy` -- the one
+    constructor that does not lower to `T_new`, since overloading `T_new`
+    would redefine it (a second ordinary constructor is reported rather
+    than emitted twice). `T b = a;` and `T b(a);` call it, and the copy is
+    registered for destruction like any other local. A class with a
+    destructor and no copy constructor cannot be copied: the struct copy
+    would leave two objects owning one resource and destroy it twice, so
+    that is an error naming the Rule of Three rather than a silent
+    double free. `operator=` is not in the subset, so assigning to an
+    owning object is refused for the same reason. A class with no
+    destructor owns nothing, and copies bitwise exactly as C++ would.
   * constructors and a destructor: a local `Type name(args);` becomes
     `Type_new` at the declaration and `Type_drop` at the closing `}` of the
     enclosing block (inside the `.cpp` only -- the include hook never sees
@@ -1004,7 +1015,7 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
     info = {"ctor": False, "dtor": False, "ctor_args": "", "methods": {},
             "fields": {}, "base": base, "slots": slots, "root": root,
             "abstract": abstract, "vdtor": False, "vdtor_decl": None,
-            "ctor_refs": set(), "paths": {}}
+            "ctor_refs": set(), "paths": {}, "copy": False}
     if base_info:
         # Inherited members and methods are reachable on the derived class.
         # A base field is not at the same offset as an own field, though: the
@@ -1033,30 +1044,52 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             value_members.append((f.name, b))
     fieldset = set(info["fields"])
 
-    ctor = next((m for m in cls.members if m.kind == "ctor"), None)
+    ctors = [m for m in cls.members if m.kind == "ctor"]
+    copies = [m for m in ctors
+              if _is_copy_params(m.params, cname, cls.name, tsub, sub)]
+    plain = [m for m in ctors if m not in copies]
+    if len(plain) > 1:
+        raise CppError(
+            "class %s: constructor overloading is not in the C++ subset -- "
+            "every constructor lowers to `%s_new`, so a second one would "
+            "redefine it. A copy constructor is the one exception; it "
+            "lowers to `%s_copy`." % (cls.name, cname, cname))
+    if len(copies) > 1:
+        raise CppError("class %s: more than one copy constructor" % cls.name)
+    ctor = plain[0] if plain else None
+    copy = copies[0] if copies else None
     dtor = next((m for m in cls.members if m.kind == "dtor"), None)
-    initmap = dict(ctor.init) if ctor is not None else {}
 
-    # Base construction runs first, then the vptr is installed, then members.
-    prologue = ""
-    if base:
-        bargs = initmap.pop(base, None)
-        if known[base]["ctor"]:
-            if bargs is None and known[base]["ctor_args"]:
-                raise CppError(
-                    "class %s: base `%s` has no default constructor; pass its "
-                    "arguments as `%s(..) : %s(..) { }`"
-                    % (cls.name, base, cls.name, base))
-            prologue += "%s_new(&this->_base%s); " % (
-                base, (", " + bargs) if bargs else "")
-        elif bargs is not None:
-            raise CppError("class %s: base `%s` has no constructor to pass "
-                           "arguments to" % (cls.name, base))
-    if slots and not abstract:
-        prologue += "((%s *)this)->_vptr = (const struct %s_vtable *)&%s__vtable; " % (
-            root, root, cname)
-    prologue += _member_prologue(cname, value_members, initmap, known,
-                                 fieldset, cls.line)
+    def make_prologue(member):
+        """Base, then vptr, then members -- for one constructor's init list.
+
+        Built per constructor rather than once, because a copy constructor
+        has its own initializer list and its own base arguments.
+        """
+        initmap = dict(member.init) if member is not None else {}
+        pro = ""
+        if base:
+            bargs = initmap.pop(base, None)
+            if known[base]["ctor"]:
+                if bargs is None and known[base]["ctor_args"]:
+                    raise CppError(
+                        "class %s: base `%s` has no default constructor; pass "
+                        "its arguments as `%s(..) : %s(..) { }`"
+                        % (cls.name, base, cls.name, base))
+                pro += "%s_new(&this->_base%s); " % (
+                    base, (", " + bargs) if bargs else "")
+            elif bargs is not None:
+                raise CppError("class %s: base `%s` has no constructor to "
+                               "pass arguments to" % (cls.name, base))
+        if slots and not abstract:
+            pro += ("((%s *)this)->_vptr = "
+                    "(const struct %s_vtable *)&%s__vtable; "
+                    % (root, root, cname))
+        pro += _member_prologue(cname, value_members, initmap, known,
+                                fieldset, cls.line)
+        return pro
+
+    prologue = make_prologue(ctor)
     # Members are destroyed in reverse, and the base last of all.
     epilogue = _member_epilogue(value_members, known)
     if base and known[base]["dtor"]:
@@ -1099,7 +1132,15 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
         if m.kind == "field" or m.pure:
             continue
         params = sub(m.params or "").strip()
-        if m.kind == "ctor":
+        if m.kind == "ctor" and m is copy:
+            # A copy constructor lowers to its own symbol: every other
+            # constructor is `T_new`, so overloading it is not available.
+            # `T &other` lowers to `T *other` like any reference parameter,
+            # so the body reads through `->` as usual.
+            emit("void", "%s_copy" % cname, params,
+                 make_prologue(m) + sub(m.body or ""))
+            info["copy"] = True
+        elif m.kind == "ctor":
             info["ctor_refs"] = emit("void", "%s_new" % cname, params,
                                      prologue + sub(m.body or ""))
             info["ctor"] = True
@@ -1323,12 +1364,47 @@ def _stmt_end(text, i):
 
 
 class _Frame(object):
-    __slots__ = ("live", "kind", "ret")
+    __slots__ = ("live", "kind", "ret", "vals")
 
     def __init__(self, kind, ret):
         self.live = []        # (ctype, vname), in declaration order
         self.kind = kind      # "file" | "func" | "loop" | "switch" | "block"
         self.ret = ret        # enclosing function's return type
+        self.vals = {}        # class-typed locals: vname -> class
+
+
+def _copy_source(expr, ctype, scopes):
+    """The name being copied, if `expr` is an object of class `ctype`.
+
+    Only a plain local of the same class counts. A call result or any other
+    expression is not something this pass can copy-construct from, and
+    guessing would be the whole point of the bug.
+    """
+    if expr is None:
+        return None
+    expr = expr.strip()
+    if not re.match(r"^\w+$", expr):
+        return None
+    for fr in reversed(scopes):
+        if expr in fr.vals:
+            return expr if fr.vals[expr] == ctype else None
+    return None
+
+
+def _copy_call(ctype, vname, src, info, where):
+    """`T_copy(&b, &a);`, or the Rule of Three diagnostic."""
+    if not info["copy"]:
+        if info["dtor"]:
+            raise CppError(
+                "`%s %s(%s)`: %s has a destructor but no copy constructor, "
+                "so copying it would leave two objects owning one resource "
+                "and destroy it twice. Add `%s(const %s &o)`, or pass by "
+                "reference (`%s &`)."
+                % (ctype, vname, src, ctype, ctype, ctype, ctype))
+        # No destructor: nothing owns anything, so a bitwise copy is exactly
+        # what C++ would do implicitly.
+        return "%s = %s;" % (vname, src)
+    return "%s_copy(&%s, &%s);" % (ctype, vname, src)
 
 
 def _rewrite_scopes(text, type_info):
@@ -1355,6 +1431,15 @@ def _rewrite_scopes(text, type_info):
     # `Type name;` or `Type name(args);` -- not `Type *p` (star between).
     decl_re = re.compile(
         r"(?<![\w.])(%s)\s+(\w+)\s*(?:\(([^;]*)\))?\s*;" % type_alt)
+
+    # `T b = a;` -- copy initialization, which the declaration pattern above
+    # cannot match because of the initializer.
+    init_re = re.compile(
+        r"(?<![\w.])(%s)\s+(\w+)\s*=\s*([^;]+);" % type_alt)
+    # `b = a;` on a bare name, checked against the class-typed locals in
+    # scope. Compound assignments are not matched: `+=` on a class is not a
+    # copy, and C would reject it anyway.
+    assign_re = re.compile(r"(?<![\w.>])(\w+)\s*=(?!=)\s*([^;]+);")
 
     agg_re = re.compile(r"\b(struct|union|enum)\b[^;{}]*$")
     # Every lookback and keyword match below runs against a comment-blanked
@@ -1495,14 +1580,71 @@ def _rewrite_scopes(text, type_info):
                 i = m.end()
                 continue
             out.append("%s %s; " % (ctype, vname))
+            src = _copy_source(args, ctype, scopes)
             if args is None or not args.strip():
                 out.append("%s_new(&%s);" % (ctype, vname))
+            elif src is not None:
+                # `T b(a);` is a copy, not a call to the default constructor
+                # with an extra argument.
+                out.append(_copy_call(ctype, vname, src, info, ctype))
             else:
                 out.append("%s_new(&%s, %s);" % (ctype, vname, args.strip()))
             if info["dtor"]:
                 scopes[-1].live.append((ctype, vname))
+            scopes[-1].vals[vname] = ctype
             i = m.end()
             continue
+
+        m = init_re.match(look, i)
+        if m and not aggs and \
+                _prev_word(look, i) not in ("struct", "typedef", "union"):
+            # `T b = a;` -- copy initialization. Without this the object was
+            # neither constructed nor dropped: a bitwise copy that the scope
+            # exit never saw.
+            ctype, vname, rhs = m.group(1), m.group(2), m.group(3).strip()
+            info = type_info[ctype]
+            if len(scopes) <= 1:
+                out.append(m.group(0))
+                i = m.end()
+                continue
+            src = _copy_source(rhs, ctype, scopes)
+            if src is None and not info["dtor"] and not info["copy"]:
+                out.append(m.group(0))       # plain data: a bitwise copy is
+                i = m.end()                  # exactly what C++ would do
+                continue
+            if src is None:
+                raise CppError(
+                    "`%s %s = %s;`: %s owns a resource, and the right-hand "
+                    "side is not an object of that type this pass can name. "
+                    "Assign to a typed local first."
+                    % (ctype, vname, rhs, ctype))
+            out.append("%s %s; " % (ctype, vname))
+            out.append(_copy_call(ctype, vname, src, info, ctype))
+            if info["dtor"]:
+                scopes[-1].live.append((ctype, vname))
+            scopes[-1].vals[vname] = ctype
+            i = m.end()
+            continue
+
+        m = assign_re.match(look, i)
+        if m and not aggs:
+            lhs = m.group(1)
+            ctype = None
+            for fr in reversed(scopes):
+                if lhs in fr.vals:
+                    ctype = fr.vals[lhs]
+                    break
+            if ctype is not None and type_info[ctype]["dtor"]:
+                # A struct assignment copies the representation and leaves
+                # both objects owning it, so both destructors run on the same
+                # resource. `operator=` is not in the subset, so there is
+                # nothing to call instead.
+                raise CppError(
+                    "`%s = %s`: %s has a destructor, and assigning would "
+                    "leave two objects owning one resource -- both would be "
+                    "destroyed. `operator=` is not in the C++ subset; copy "
+                    "at construction (`%s b(a);`) or assign the fields."
+                    % (lhs, m.group(2).strip(), ctype, ctype))
 
         out.append(text[i])
         i += 1
@@ -1610,6 +1752,20 @@ def _ret_class(ret, cinfo):
     if stars > 1:
         return None, False
     return toks[0], stars == 1
+
+
+def _is_copy_params(params, cname, raw_name, tsub, sub):
+    """Is this parameter list a copy constructor's -- one `T &` or `const T &`?
+
+    Checked on the spelling before reference lowering, because afterwards a
+    `T *` the author wrote is indistinguishable from one this pass made.
+    """
+    parts = [p for p in _split_top(params or "") if p.strip()]
+    if len(parts) != 1 or "&" not in parts[0]:
+        return False
+    toks = [t for t in tsub(sub(parts[0])).replace("&", " ")
+            .replace("*", " * ").split() if t != "const"]
+    return len(toks) >= 2 and "*" not in toks and toks[0] in (cname, raw_name)
 
 
 def _emit_method_call(expr, cls, is_ptr, meth, args, ent, cinfo):
