@@ -2600,3 +2600,147 @@ int f(void) { Box<Thing> b; return b.get() ? 1 : 0; }
             "int f(void) { H h(new Thing()); return h.get()->v; }",
             path="t.cpp")
         self.assertIn("H_new(&h,", out)
+
+
+class TestCppPointerOperators(unittest.TestCase):
+    """`operator->` and `operator*` -- the two a smart pointer needs."""
+
+    PTR = """
+class Ptr {
+    int *p;
+public:
+    Ptr() { p = 0; }
+    Ptr(int *q) { p = q; }
+    int *operator->() { return p; }
+    int &operator*() { return *p; }
+};
+"""
+
+    def test_star_is_an_lvalue(self):
+        # Lowered like `operator[]`: the function yields the address and the
+        # dereference is written back, so `*p = x` assigns through.
+        out = cpprust.translate(
+            self.PTR + "int f(int *q) { Ptr a(q); *a = 5; return *a; }",
+            path="t.cpp")
+        self.assertIn("(*Ptr__star(&a)) = 5;", out)
+
+    def test_arrow_hands_back_a_plain_pointer(self):
+        out = cpprust.translate("""
+class Node { public: int v; Node() { v = 0; } };
+class Handle {
+    Node *n;
+public:
+    Handle() { n = 0; }
+    Node *operator->() { return n; }
+};
+int f(void) { Handle h; return h->v; }
+""", path="t.cpp")
+        self.assertIn("Handle__arrow(&h)->v", out)
+
+    def test_this_is_not_rewritten(self):
+        # `this->` has the same shape. Rewriting pointers turned every field
+        # access inside the class into a call to its own `operator->`.
+        out = cpprust.translate(
+            self.PTR + "int f(int *q) { Ptr a(q); return *a; }", path="t.cpp")
+        self.assertNotIn("Ptr__arrow(this)", out)
+
+    def test_a_genuine_pointer_is_ordinary_member_access(self):
+        # `Ptr *p; p->x` means a member of `Ptr` in C++, not the operator.
+        out = cpprust.translate("""
+class Ptr { public: int v; int *operator->() { return &v; } };
+int f(Ptr *p) { return p->v; }
+""", path="t.cpp")
+        self.assertIn("p->v", out)
+
+    def test_smart_pointers_expose_both(self):
+        out = cpprust.translate(
+            "#include <memory>\n"
+            "class T { public: int v; T() { v = 0; } ~T() { } };\n"
+            "int f(void) { std::unique_ptr<T> u(new T()); u->v = 1; "
+            "return (*u).v; }", path="t.cpp")
+        self.assertIn("unique_ptr_T__arrow", out)
+
+    def test_other_overloads_are_still_reported(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate(
+                "class A { public: int v; A operator+=(int n) { return *this; } };",
+                path="t.cpp")
+        self.assertIn("operator+=", cm.exception.message)
+
+
+class TestCppNamespaceHazards(unittest.TestCase):
+    """Flattening is name-mangling, not lookup, so the ways it could quietly
+    change meaning are reported rather than resolved."""
+
+    def test_a_flattened_name_colliding_with_a_global_is_reported(self):
+        # Both become `geo_twice`. The C front end would report the
+        # redefinition, but the *call sites* merge before that.
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate("""
+int geo_twice(int n) { return n; }
+namespace geo { int twice(int n) { return n * 2; } }
+int f(void) { return geo::twice(1); }
+""", path="t.cpp")
+        self.assertIn("one symbol", cm.exception.message)
+
+    def test_ambiguous_using_namespace_is_reported(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate("""
+namespace a { int mk(int n) { return n; } }
+namespace b { int mk(int n) { return n * 2; } }
+using namespace a;
+using namespace b;
+int f(void) { return mk(1); }
+""", path="t.cpp")
+        self.assertIn("ambiguous", cm.exception.message)
+
+    def test_one_using_namespace_still_resolves(self):
+        out = cpprust.translate("""
+namespace a { int mk(int n) { return n; } }
+using namespace a;
+int f(void) { return mk(1); }
+""", path="t.cpp")
+        self.assertIn("a_mk(1)", out)
+
+
+class TestCppDefaulted(unittest.TestCase):
+    """`= default` and `= delete`."""
+
+    def test_defaulted_destructor_becomes_an_empty_body(self):
+        # Rewritten rather than dropped, so `virtual` stays attached -- it
+        # decides whether the class gets a vtable slot. The member epilogue
+        # is appended to whatever body a destructor has, so an empty one
+        # gives exactly the destructor the compiler would have written.
+        out = cpprust.translate("""
+class B {
+public:
+    int v;
+    B() { v = 1; }
+    virtual ~B() = default;
+    virtual int g() { return v; }
+};
+int f(void) { B b; return b.g(); }
+""", path="t.cpp")
+        self.assertIn("B_drop", out)
+
+    def test_defaulted_constructor_is_accepted(self):
+        out = cpprust.translate("""
+class A { public: int v; A() = default; int g() { return v; } };
+int f(void) { A a; return a.g(); }
+""", path="t.cpp")
+        self.assertIn("A_g", out)
+
+    def test_deleted_member_is_dropped(self):
+        # A deleted copy constructor leaves a class with a destructor and no
+        # copy constructor, which the Rule of Three already refuses to copy.
+        out = cpprust.translate("""
+class N {
+    int *p;
+public:
+    N() { p = 0; }
+    N(const N &o) = delete;
+    ~N() { }
+};
+int f(void) { N a; return 0; }
+""", path="t.cpp")
+        self.assertNotIn("N_copy", out)
