@@ -1364,12 +1364,15 @@ void f(void) { std::ownvector<E> v; E e; v.push_back(e); }
         self.assertIn("no copy constructor", cm.exception.message)
 
     def test_scalar_element_is_refused(self):
-        # `__cpp_copy` is for element types with constructors.
+        # `ownvector` copy-constructs and destroys each element, and a
+        # scalar has neither. Stated at the instantiation now rather than
+        # falling out of `__cpp_copy` refusing scalars -- the builtins have
+        # to accept them, since `map<int, ..>` copies a scalar key.
         with self.assertRaises(cpprust.CppError) as cm:
             cpprust.translate("""
 void f(void) { std::ownvector<int> v; int k = 1; v.push_back(k); }
 """)
-        self.assertIn("not a class", cm.exception.message)
+        self.assertIn("Use `vector<int>`", cm.exception.message)
 
     def test_vector_diagnostic_names_ownvector(self):
         with self.assertRaises(cpprust.CppError) as cm:
@@ -3011,3 +3014,149 @@ int A::g() { return v; }
 int f(void) { A a(5); return a.g(); }
 """, path="t.cpp")
         self.assertIn("A_new(A *this, int n)", out)
+
+
+class TestCppMap(unittest.TestCase):
+    """`<map>`, written in the subset like the other containers.
+
+    The iterator is a **pointer**. That is the whole design: `it->first`,
+    `++it`, `it != m.end()` and `*it` are then plain C on a plain pointer, and
+    none of `operator++`, `operator!=` or an iterator class has to exist. It
+    costs a linear `find`, which is the honest trade for a container written
+    in a subset with no comparison operator to order keys by.
+    """
+
+    def test_int_keys(self):
+        out = cpprust.translate("""#include <map>
+int f(void) {
+    std::map<int, int> m;
+    m[3] = 30;
+    m[7] = 70;
+    return m[3] + m[7] + m.size();
+}
+""", path="t.cpp")
+        self.assertIn("map_int_int__index", out)
+
+    def test_the_iterator_is_a_pointer(self):
+        out = cpprust.translate("""#include <map>
+int f(void) {
+    std::map<int, int> m;
+    int t = 0;
+    for (auto it = m.begin(); it != m.end(); ++it) { t = t + it->second; }
+    return t;
+}
+""", path="t.cpp")
+        self.assertIn("pair_int_int * it = ", out)
+
+    def test_a_method_return_is_substituted_per_instantiation(self):
+        # `map<int,int>::begin()` reads `pair<K,V> *` in the template source.
+        # Taking that literally asked for a class called `pair_K_V`.
+        out = cpprust.translate("""#include <map>
+int f(void) { std::map<int, int> m; auto it = m.begin(); return it == m.end(); }
+""", path="t.cpp")
+        self.assertNotIn("pair_K_V", out)
+
+    def test_class_keys_compare_through_equals(self):
+        out = cpprust.translate("""#include <map>
+#include <string>
+int f(void) {
+    std::map<std::string, int> t;
+    std::string a("x");
+    t[a] = 1;
+    return t.find(a) == t.end() ? 0 : t[a];
+}
+""", path="t.cpp")
+        self.assertIn("string_equals", out)
+
+    def test_a_user_key_class_is_reported(self):
+        # A *user* key class is refused, and the reason is ordering rather
+        # than the missing `equals`: the supplied templates are spliced above
+        # the file, so when `map<K, ..>` is emitted `K` is not a class this
+        # pass has seen yet, and `__cpp_ref(K)` picks the by-value spelling.
+        # The diagnostic is still accurate and actionable; a key class that
+        # works has to be one of the supplied ones (`string`) for now.
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate("""#include <map>
+class K { public: int v; K() { v = 0; } ~K() { } };
+int f(void) { std::map<K, int> m; K k; return m.count(k); }
+""", path="t.cpp")
+        self.assertIn("by value", cm.exception.message)
+
+    def test_the_header_alone_supplies_nothing(self):
+        out = cpprust.translate(
+            "#include <map>\nint f(void) { return 0; }", path="t.cpp")
+        self.assertNotIn("class map", out)
+
+
+class TestCppElementBuiltins(unittest.TestCase):
+    """`__cpp_copy` / `__cpp_drop` / `__cpp_eq` / `__cpp_ref`.
+
+    A template body is textual, so it can spell `T` but not `T_copy`. These
+    are the hook that lets a container say "copy an element" once and have it
+    mean the right thing per instantiation.
+    """
+
+    TPL = """
+template<typename T> class holder {
+    T a; T b;
+public:
+    holder() { }
+    int same() { return __cpp_eq(T, a, b); }
+};
+"""
+
+    def test_eq_on_a_scalar_is_an_operator(self):
+        out = cpprust.translate(
+            self.TPL + "int f(void) { holder<int> h; return h.same(); }",
+            path="t.cpp")
+        self.assertIn("((this->a) == (this->b))", out)
+
+    def test_eq_on_a_class_goes_through_equals(self):
+        out = cpprust.translate("""
+class S { public: int v; S() { v = 0; } int equals(const S &o) { return v == o.v; } };
+""" + self.TPL + "int f(void) { holder<S> h; return h.same(); }", path="t.cpp")
+        self.assertIn("S_equals", out)
+
+    def test_copy_and_drop_accept_scalars(self):
+        # They used to refuse, which is what made `ownvector<int>` an error.
+        # A `map<int, ..>` copies a scalar key, so they have to accept one.
+        out = cpprust.translate("""
+template<typename T> class cell {
+    T v;
+public:
+    cell() { }
+    void put(T x) { __cpp_copy(T, v, x); }
+    void drop() { __cpp_drop(T, v); }
+};
+int f(void) { cell<int> c; c.put(4); c.drop(); return 0; }
+""", path="t.cpp")
+        self.assertIn("(this->v) = (x)", out)
+
+    def test_ownvector_of_a_scalar_is_steered_to_vector(self):
+        # The guidance that used to fall out of `__cpp_copy` refusing
+        # scalars, stated where it belongs now.
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate(
+                "void f(void) { std::ownvector<int> v; int k = 1; "
+                "v.push_back(k); }", path="t.cpp")
+        self.assertIn("Use `vector<int>`", cm.exception.message)
+
+
+class TestCppScalarReferences(unittest.TestCase):
+    """`int &x` -- a reference is a pointer the source need not spell, and
+    that is as true of a scalar as of a class."""
+
+    def test_a_scalar_reference_parameter_is_lowered(self):
+        out = cpprust.translate("""
+class A { public: int v; A() { v = 0; } void set(const int &n) { v = n; } };
+int f(void) { A a; int k = 5; a.set(k); return a.v; }
+""", path="t.cpp")
+        self.assertIn("A_set(A *this, const int *n)", out)
+        self.assertIn("(*n)", out)
+
+    def test_the_call_site_takes_the_address(self):
+        out = cpprust.translate("""
+class A { public: int v; A() { v = 0; } void set(const int &n) { v = n; } };
+int f(void) { A a; int k = 5; a.set(k); return a.v; }
+""", path="t.cpp")
+        self.assertIn("A_set(&a, &k)", out)
