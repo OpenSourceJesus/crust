@@ -819,6 +819,181 @@ int use(A *p) { return p->f(); }
         self.assertIn("without a body", cm.exception.message)
 
 
+_NODE = """
+class Node {
+    int v;
+public:
+    Node(int x) { v = x; }
+    ~Node() { v = 0; }
+    int get() { return v; }
+};
+"""
+
+
+class TestCppNewDelete(unittest.TestCase):
+    """`new` lowers to a helper, `delete` lowers in place.
+
+    `new T(..)` sits in expression position and C has no statement
+    expression, so allocate-construct-yield has to be a function. `delete`
+    is a statement, so it needs no helper.
+    """
+
+    def test_new_calls_the_alloc_helper(self):
+        out = cpprust.translate(_NODE + """
+void f(void) { Node *p = new Node(5); }
+""")
+        self.assertIn("Node *p = Node__alloc(5);", out)
+
+    def test_alloc_helper_constructs_and_returns(self):
+        out = cpprust.translate(_NODE + "void f(void) { Node *p = new Node(5); }")
+        self.assertIn("static Node *Node__alloc(int x) {", out)
+        self.assertIn("malloc(sizeof(Node))", out)
+        self.assertIn("Node_new(p, x);", out)
+
+    def test_alloc_does_not_construct_through_a_failed_malloc(self):
+        # No exceptions in the subset, so `new` yields null and the caller
+        # checks -- constructing through null would fault instead.
+        out = cpprust.translate(_NODE + "void f(void) { Node *p = new Node(5); }")
+        self.assertIn("if (p) { Node_new(p, x); }", out)
+
+    def test_new_without_parentheses(self):
+        out = cpprust.translate("""
+class Bare { public: int v; };
+void f(void) { Bare *b = new Bare; }
+""")
+        self.assertIn("Bare *b = Bare__alloc();", out)
+
+    def test_delete_drops_then_frees(self):
+        out = cpprust.translate(_NODE + "void f(Node *p) { delete p; }")
+        self.assertIn("Node_drop(p);", out)
+        self.assertIn("free(p);", out)
+        self.assertLess(out.index("Node_drop(p);"), out.index("free(p);"))
+
+    def test_delete_is_a_no_op_on_null(self):
+        out = cpprust.translate(_NODE + "void f(Node *p) { delete p; }")
+        self.assertIn("if (p)", out)
+
+    def test_delete_survives_an_else_branch(self):
+        # A bare block would leave a stray `;` before the `else`.
+        out = cpprust.translate(_NODE + """
+void f(Node *p, int c) { if (c) delete p; else p->v = 2; }
+""")
+        self.assertIn("while (0); else", out)
+
+    def test_delete_without_a_destructor_is_just_free(self):
+        out = cpprust.translate("""
+class Bare { public: int v; };
+void f(Bare *b) { delete b; }
+""")
+        self.assertIn("free(b)", out)
+        self.assertNotIn("Bare_drop", out)
+
+    def test_delete_this(self):
+        out = cpprust.translate("""
+class N { public: int v; N() { v = 0; } ~N() { v = 1; } void kill() { delete this; } };
+""")
+        self.assertIn("N_drop(this);", out)
+        self.assertIn("free(this);", out)
+
+    def test_heap_pointer_gets_no_scope_drop(self):
+        # A pointer is not an automatic object; C++ leaks this too.
+        out = cpprust.translate(_NODE + "void f(void) { Node *p = new Node(1); }")
+        self.assertNotIn("Node_drop(&p)", out)
+
+    def test_malloc_and_free_are_declared(self):
+        out = cpprust.translate(_NODE + "void f(void) { Node *p = new Node(1); }")
+        self.assertIn("void *malloc(unsigned long);", out)
+        self.assertIn("void free(void *);", out)
+
+    def test_no_prelude_when_the_heap_is_unused(self):
+        out = cpprust.translate(_NODE + "int f(void) { Node n(1); return n.get(); }")
+        self.assertNotIn("malloc", out)
+
+    def test_alloc_helper_only_for_classes_that_need_it(self):
+        out = cpprust.translate(_NODE + """
+class Other { public: int v; Other() { v = 0; } };
+void f(void) { Node *p = new Node(1); }
+""")
+        self.assertIn("Node__alloc", out)
+        self.assertNotIn("Other__alloc", out)
+
+    def test_template_instantiation_allocates(self):
+        out = cpprust.translate("""
+template<typename T>
+class Box { T v; public: Box(T x) { v = x; } };
+void f(void) { Box<int> *b = new Box<int>(3); }
+""")
+        self.assertIn("static Box_int *Box_int__alloc(int x)", out)
+        self.assertIn("Box_int *b = Box_int__alloc(3);", out)
+
+    def test_new_in_a_method_body(self):
+        out = cpprust.translate("""
+class Node { public: int v; Node(int x) { v = x; } };
+class Maker {
+    int seed;
+public:
+    Maker() { seed = 2; }
+    Node *make() { return new Node(seed); }
+};
+""")
+        self.assertIn("return Node__alloc(this->seed);", out)
+
+    def test_keyword_in_a_literal_is_not_an_allocation(self):
+        out = cpprust.translate(_NODE + """
+int puts(const char *s);
+void f(void) { puts("new Node and delete it"); }
+""")
+        self.assertIn('puts("new Node and delete it");', out)
+        self.assertNotIn("malloc", out)
+
+    def test_new_of_a_non_class_is_error(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate(_NODE + "void f(void) { int *p = new int; }")
+        self.assertIn("not a class", cm.exception.message)
+
+    def test_array_new_is_error(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate(_NODE + "void f(void) { Node *p = new Node[4]; }")
+        self.assertIn("array `new`", cm.exception.message)
+
+    def test_array_delete_is_error(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate(_NODE + "void f(Node *p) { delete[] p; }")
+        self.assertIn("delete[]", cm.exception.message)
+
+    def test_deleting_a_value_is_error(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate(_NODE + "void f(void) { Node n(1); delete n; }")
+        self.assertIn("not a pointer", cm.exception.message)
+
+    def test_new_of_an_abstract_class_is_error(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate("""
+class Shape { public: virtual int area() = 0; };
+void f(void) { Shape *s = new Shape(); }
+""")
+        self.assertIn("pure virtual", cm.exception.message)
+
+    def test_delete_through_a_virtual_destructor_is_error(self):
+        """The vtable carries methods only, so a `_drop` cannot dispatch.
+
+        Deleting through a base pointer would run the base destructor and
+        leave the derived part untouched -- the exact bug `virtual ~T()` is
+        written to prevent -- so it is reported rather than mistranslated.
+        """
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate("""
+class B { public: int v; B() { v = 0; } virtual ~B() { v = 1; } };
+void f(B *b) { delete b; }
+""")
+        self.assertIn("virtual destructor", cm.exception.message)
+
+    def test_delete_of_an_untyped_expression_is_error(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate(_NODE + "void f(void *q) { delete (Node *)q; }")
+        self.assertIn("cannot tell what type", cm.exception.message)
+
+
 class TestCppFieldAccess(unittest.TestCase):
     """A member read or write has to follow the same pointer-ness as a call.
 
