@@ -961,11 +961,20 @@ class TestCppByValue(unittest.TestCase):
         body = out[out.index("Own make(void)"):]
         self.assertNotIn("Own_drop(&t);", body[:body.index("return")])
 
-    def test_by_value_return_of_an_expression_is_still_an_error(self):
-        # Nothing to move out of.
+    def test_returning_a_call_result_is_a_move(self):
+        # The callee already moved it out, so passing it straight on moves
+        # it again -- there is no local here to destroy.
+        out = cpprust.translate(
+            _OWNING + "Own mk(void); Own make(void) { return mk(); }")
+        self.assertIn("Own make(void)", out)
+
+    def test_by_value_return_of_a_borrowed_object_is_still_an_error(self):
+        # A member names an object somebody else still owns: returning it
+        # hands back a copy that is destroyed twice.
         with self.assertRaises(cpprust.CppError) as cm:
             cpprust.translate(
-                _OWNING + "Own mk(void); Own make(void) { return mk(); }")
+                _OWNING + "class H { public: Own o; H() { } "
+                "Own take() { return o; } };")
         self.assertIn("not a bare local", cm.exception.message)
 
     def test_by_reference_is_fine(self):
@@ -3669,3 +3678,72 @@ public:
 int f(void) { P p; return p.get(); }
 """, path="t.cpp")
         self.assertIn("union { int x; int y; };", out)
+
+
+class TestCppEnableSharedFromThis(unittest.TestCase):
+    """`enable_shared_from_this<T>`, supplied on `<memory>`.
+
+    The object remembers the control block the first `shared_ptr` gave it,
+    so `shared_from_this()` joins that one. Starting a second would free the
+    object twice.
+    """
+
+    NODE = """#include <memory>
+class node : public std::enable_shared_from_this<node> {
+public:
+    int v;
+    node() { v = 3; }
+    ~node() { }
+    std::shared_ptr<node> self() { return shared_from_this(); }
+};
+"""
+
+    def test_it_is_supplied_and_usable_as_a_base(self):
+        out = cpprust.translate(
+            self.NODE + "int f(void) { std::shared_ptr<node> a(new node()); "
+            "return (int)a.use_count(); }", path="t.cpp")
+        self.assertIn("struct node { enable_shared_from_this_node _base;", out)
+
+    def test_the_hook_goes_through_a_function(self):
+        # `shared_ptr<T>` is emitted above `T`, where `T` is still an
+        # incomplete type and `q->_base` would not compile. A prototype is
+        # enough for an incomplete type, and prototypes are hoisted.
+        out = cpprust.translate(
+            self.NODE + "int f(void) { std::shared_ptr<node> a(new node()); "
+            "return 0; }", path="t.cpp")
+        self.assertIn("node__share_hook(node *this, long *c)", out)
+
+    def test_the_declaring_template_gets_no_hook(self):
+        # It reaches its own fields by their bare names, and its `esp` is a
+        # `T *` while its `this` is the base's own type.
+        out = cpprust.translate(
+            self.NODE + "int f(void) { std::shared_ptr<node> a(new node()); "
+            "return 0; }", path="t.cpp")
+        self.assertNotIn("enable_shared_from_this_node__share_hook", out)
+
+    def test_a_class_without_the_base_gets_no_hook(self):
+        out = cpprust.translate(
+            "#include <memory>\n"
+            "class plain { public: int v; plain() { v = 1; } ~plain() { } };\n"
+            "int f(void) { std::shared_ptr<plain> a(new plain()); return 0; }",
+            path="t.cpp")
+        self.assertNotIn("__share_hook", out)
+
+
+class TestCppMoveSemantics(unittest.TestCase):
+    """Returning and taking an owning value by value.
+
+    The same rule Crust follows on the Rust side: a returned bare local is
+    moved out, and taking a returned value is a move in.
+    """
+
+    def test_a_chained_call_result_is_a_move_source(self):
+        self.assertTrue(cpprust._is_call_result("a.get()->self()"))
+        self.assertTrue(cpprust._is_call_result("mk()"))
+        self.assertTrue(cpprust._is_call_result("p->q()"))
+
+    def test_an_expression_is_not(self):
+        # Its value is not simply what a call returned.
+        self.assertFalse(cpprust._is_call_result("a + b()"))
+        self.assertFalse(cpprust._is_call_result("v[i]"))
+        self.assertFalse(cpprust._is_call_result("(*p).f()"))
