@@ -5,6 +5,7 @@ Main Crust Documentation:
 - [CRUST.md](CRUST.md) C+Rust
 - [CPPRUST.md](CPPRUST.md) C+C++Rust
 - [SHIVYCX.md](SHIVYCX.md) SHIVYC-X (C Compiler)
+- [CPP2RUST.md](CPP2RUST.md) C++ to Rust translator
 
 Crust Papers:
 - https://dx.doi.org/10.2139/ssrn.7226482
