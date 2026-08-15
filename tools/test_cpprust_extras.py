@@ -853,6 +853,48 @@ void f(void) { string val("x"); use(&val); }
 """, "hands over")
 
 
+class TestQualifiedNameFlattening(Base):
+    """`N::x` becomes `N_x` only for names flattening actually renamed.
+
+    The qualification says which namespace to look in, not what the name
+    became -- and this pass deliberately does not rename everything a
+    namespace holds. A typedef keeps its name so the generated C stays
+    readable.
+
+    litehtml writes `litehtml::tstring` in fourteen places while the
+    typedef in `os_types.h` stays `tstring`, so every qualified use
+    became `litehtml_tstring` and the declaration did not follow. Every
+    file reaching those headers translated clean and then failed to
+    compile on a type that appears nowhere -- around 35 of 43 sources,
+    and the reason the gcc stage exists.
+    """
+
+    def test_qualified_typedef_keeps_its_name(self):
+        out = self.assertLowers("""
+#include <string>
+namespace lh {
+    typedef std::string tstring;
+    lh::tstring pick(void);
+}
+""", "string lh_pick")
+        self.assertNotIn("lh_tstring", out)
+
+    def test_qualified_class_is_still_flattened(self):
+        """A name flattening *did* rename still gets the prefix."""
+        out = self.assertLowers("""
+namespace lh {
+    class Thing { public: int v; int get() { return v; } };
+}
+void f(void) { lh::Thing t; use(t.get()); }
+""", "lh_Thing")
+
+    def test_qualified_function_is_still_flattened(self):
+        self.assertLowers("""
+namespace lh { int helper(int a) { return a; } }
+void f(void) { use(lh::helper(1)); }
+""", "lh_helper")
+
+
 class TestFlattenCollision(Base):
     """From `litehtml/src/html.cpp`.
 

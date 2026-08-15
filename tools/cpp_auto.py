@@ -1214,7 +1214,7 @@ def resolve_namespaces(text, path="<cpp>", blank=None):
         text = text[:m.start()] + body + text[close + 1:]
         scan = _blank_like(text)
         # A qualified reference from outside, and any `using` for it.
-        text = _sub_qualified(text, _blank_like(text), ns)
+        text = _sub_qualified(text, _blank_like(text), ns, declared)
         scan = _blank_like(text)
         # And the *unqualified* references from the namespace's other blocks.
         # They share this scope, so a class in one header derives from a
@@ -1335,13 +1335,32 @@ def _declared_in(body_scan):
     return out - _KEYWORDS
 
 
-def _sub_qualified(text, scan, ns):
-    """`N::x` -> `N_x`, outside comments and literals."""
+def _sub_qualified(text, scan, ns, renamed=None):
+    """`N::x` -> `N_x` for the names that flattening actually renamed.
+
+    Only those. The qualification says which namespace to look in, not
+    what the name became, and this pass does not rename everything a
+    namespace contains -- a typedef is left with the name it was given,
+    deliberately, so that `tstring` stays readable in the generated C.
+
+    Rewriting `N::x` regardless produced a name nothing declared.
+    litehtml writes `litehtml::tstring` in fourteen places while its
+    typedef stays `tstring`, so every use became `litehtml_tstring` and
+    the declaration did not follow -- which is how a file could translate
+    clean and then fail to compile on a type that appears nowhere. Where
+    the name was not renamed, the qualification is simply dropped, which
+    is what flattening a namespace means for a name that keeps its
+    spelling.
+    """
     out, last = [], 0
     for m in re.finditer(r"(?<![\w.])%s\s*::\s*(\w+)" % re.escape(ns),
                          scan):
+        name = m.group(1)
         out.append(text[last:m.start()])
-        out.append("%s_%s" % (ns, m.group(1)))
+        if renamed is None or name in renamed:
+            out.append("%s_%s" % (ns, name))
+        else:
+            out.append(name)
         last = m.end()
     out.append(text[last:])
     return "".join(out)
