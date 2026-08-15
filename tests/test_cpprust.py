@@ -951,10 +951,22 @@ class TestCppByValue(unittest.TestCase):
             cpprust.translate(_OWNING + "void take(Own b) { b.p = 0; }")
         self.assertIn("by value", cm.exception.message)
 
-    def test_by_value_return_is_error(self):
+    def test_by_value_return_of_a_bare_local_is_a_move(self):
+        # `return t;` moves the local out: it is left out of that path's
+        # drops, so the caller receives the object that was here rather than
+        # a copy of a released one. Same rule Crust follows on the Rust side,
+        # and it is what makes returning a `shared_ptr` by value work.
+        out = cpprust.translate(
+            _OWNING + "Own make(void) { Own t; return t; }")
+        body = out[out.index("Own make(void)"):]
+        self.assertNotIn("Own_drop(&t);", body[:body.index("return")])
+
+    def test_by_value_return_of_an_expression_is_still_an_error(self):
+        # Nothing to move out of.
         with self.assertRaises(cpprust.CppError) as cm:
-            cpprust.translate(_OWNING + "Own make(void) { Own t; return t; }")
-        self.assertIn("released object", cm.exception.message)
+            cpprust.translate(
+                _OWNING + "Own mk(void); Own make(void) { return mk(); }")
+        self.assertIn("not a bare local", cm.exception.message)
 
     def test_by_reference_is_fine(self):
         out = cpprust.translate(_OWNING + "void take(Own &b) { b.p = 0; }")
@@ -1689,16 +1701,16 @@ void f(void) { int k; k = 3; Buf a; a.p = 0; }
         self.assertIn("Buf_copy", out)
 
     def test_copy_from_an_unnameable_expression_is_error(self):
-        # A copy constructor but no destructor, so returning by value is
-        # allowed -- what fails is that the source of the copy is not an
-        # object this pass can name.
+        # A call result is a *move in* now: the callee returned by value,
+        # which moved the object out of its local, so taking it needs no
+        # copy constructor. What is still refused is a source that is
+        # neither nameable nor a call.
         with self.assertRaises(cpprust.CppError) as cm:
             cpprust.translate("""
 class Pod { public: int x; Pod() { x = 0; } Pod(const Pod &o) { x = o.x; } };
-Pod make(void);
-void f(void) { Pod b = make(); }
+void f(void) { Pod b = *(Pod *)0 ; }
 """)
-        self.assertIn("not an object of that type", cm.exception.message)
+        self.assertIn("nor a call returning one", cm.exception.message)
 
     def test_copy_constructor_installs_the_vptr(self):
         # A copied object still has to dispatch.
