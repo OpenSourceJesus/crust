@@ -586,6 +586,78 @@ void f(void) { int_vector v; v.push_back(1); }
         self.assertNotIn("typedef vector_int vector_int;", out)
 
 
+class TestFunctionTemplates(Base):
+    """`template<..>` on a function.
+
+    From `litehtml/include/litehtml/context.h`, which every element file
+    includes, and which was the single biggest blocker in the tree -- 22
+    of 43 files:
+
+        template<class T>
+        void js_register_class(const char* className) {
+            ...
+            if (auto* ref { static_cast<typename T::js_object_ref*>(..) })
+                delete ref;
+        }
+
+    The subset monomorphises *class* templates. This was not recognised
+    as a template at all, so its body was lowered as ordinary code -- and
+    a template's body is not ordinary code: `typename T::js_object_ref`
+    names a type that exists only once `T` is known. The result was a
+    diagnostic about `delete` in files that never call the function.
+
+    An uninstantiated template emits nothing in C++, so it emits nothing
+    here. Only `context.cpp` instantiates this one; for the other 22 the
+    right answer was always to emit nothing at all.
+    """
+
+    def test_uninstantiated_function_template_emits_nothing(self):
+        out = self.assertLowers("""
+class Ctx {
+public:
+    int n;
+    template<class T>
+    void reg(const char *name) {
+        if (auto* ref { static_cast<typename T::inner*>(get(name)) }) {
+            delete ref;
+        }
+    }
+    int get_n() { return n; }
+};
+void f(void) { Ctx c; use(c.get_n()); }
+""", "Ctx_get_n")
+        self.assertNotIn("reg", out)
+        self.assertNotIn("template", out)
+
+    def test_class_template_is_untouched(self):
+        """`template<..> class X` is this pass's own business."""
+        self.assertLowers("""
+template<typename T>
+class Box { public: T v; Box() { } T get() { return v; } };
+void f(void) { Box<int> b; use(b.get()); }
+""", "Box_int_get")
+
+    def test_member_instantiation_is_reported(self):
+        self.refuses("""
+class Ctx { public: template<class T> void reg(const char *n) { use(n); } };
+void f(void) { Ctx c; c.reg<int>("x"); }
+""", "function template")
+
+    def test_free_instantiation_is_reported(self):
+        self.refuses("""
+template<class T> void reg(int n) { use(n); }
+void f(void) { reg<int>(1); }
+""", "function template")
+
+    def test_declaration_only_function_template(self):
+        """No body to hold back, and nothing to emit either."""
+        out = self.assertLowers("""
+template<class T> void reg(const char *n);
+int f(void) { return 1; }
+""", "int f(void)")
+        self.assertNotIn("template", out)
+
+
 class TestFlattenCollision(Base):
     """From `litehtml/src/html.cpp`.
 

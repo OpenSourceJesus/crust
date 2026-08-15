@@ -1172,6 +1172,87 @@ def _expand_headers(text, basedir, incdirs=(), seen=None, depth=0,
     return "".join(out)
 
 
+def _defer_function_templates(text, scan, path):
+    """Hold back `template<..>` on a *function*, and report an instantiation.
+
+    The subset monomorphises class templates. A *function* template --
+    litehtml's `template<class T> void js_register_class(const char *)` in
+    `context.h`, which every element file includes -- was not recognised
+    as a template at all, so its body was lowered as ordinary code. Bodies
+    of templates are not ordinary code: this one names
+    `typename T::js_object_ref`, a type that exists only once `T` is
+    known, and the result was a diagnostic about `delete` in a file that
+    never called the function.
+
+    An uninstantiated template emits nothing in C++, and now emits nothing
+    here, which is the whole fix for a header that merely declares one.
+    An instantiation is *reported*, because monomorphising a function
+    template is a feature this pass does not have yet and emitting the
+    call unresolved would be a link error at best.
+    """
+    out, last, names = [], 0, []
+    for m in re.finditer(r"(?<![\w])template\s*<", scan):
+        if m.start() < last:
+            continue
+        lt = m.end() - 1
+        gt = _match(scan, lt, "<", ">")
+        if gt is None:
+            continue
+        after = gt + 1
+        while after < len(scan) and scan[after].isspace():
+            after += 1
+        # `template<..> class X` is a class template and this pass's own
+        # business; anything else introduces a function.
+        if re.match(r"(?:class|struct)(?![\w])", scan[after:after + 6]):
+            continue
+        # To the body's `{`, or the `;` of a declaration with no body.
+        k, depth = after, 0
+        while k < len(scan):
+            c = scan[k]
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+            elif c == ";" and depth <= 0:
+                break
+            elif c == "{" and depth <= 0:
+                close = _match_brace(scan, k)
+                if close is None:
+                    return text, scan, names
+                k = close
+                break
+            k += 1
+        if k >= len(scan):
+            continue
+        nm = re.search(r"(\w+)\s*\(", scan[after:])
+        if nm:
+            names.append(nm.group(1))
+        out.append(text[last:m.start()])
+        # Blanked to the same length rather than cut: everything that has
+        # already been measured against this text is an offset into it.
+        out.append(re.sub(r"[^\n]", " ", text[m.start():k + 1]))
+        last = k + 1
+    if not names:
+        return text, scan, names
+    out.append(text[last:])
+    text = "".join(out)
+    scan = _strip_comments(text)
+    for n in names:
+        # `(?<![\w])` only: a member call is `c.reg<int>(..)`, so excluding
+        # a leading `.` or `->` would miss exactly the shape litehtml uses.
+        u = re.search(r"(?<![\w])%s\s*<[^;{}()]*>\s*\(" % re.escape(n), scan)
+        if u:
+            raise CppError(
+                "%s:%d: `%s<..>(..)` instantiates a function template, which "
+                "is not in the C++ subset -- this pass monomorphises class "
+                "templates only, and a function template's body cannot be "
+                "lowered until its parameters are known. Write the "
+                "instantiation out as an ordinary function."
+                % (os.path.basename(path), text.count("\n", 0, u.start()) + 1,
+                   n))
+    return text, scan, names
+
+
 def _extract_out_of_line(text, scan, names):
     """Pull `Ret Class::method(params) { .. }` definitions out of the file.
 
@@ -4928,6 +5009,12 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
                                defines=set(defines or ()))
     text = _std_prelude(text)
     std_classes = _STD_CLASSES
+    # Function templates come out before anything reads the file. Their
+    # bodies are not ordinary code -- they name types that exist only once
+    # the parameters are known -- so lowering one produces diagnostics
+    # about statements in a function the translation unit never calls.
+    text, _fscan, _ftmpl = _defer_function_templates(
+        text, _strip_comments(text), path)
     # Lambdas are lowered before anything else looks at the file: what comes
     # out is ordinary subset source with a static function in it.
     text = _lower_lambdas(text, path)
