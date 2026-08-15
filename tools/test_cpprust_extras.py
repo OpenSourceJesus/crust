@@ -699,6 +699,89 @@ void f(void) { string v("x"); consume(v); }
 """, "by value")
 
 
+class TestClangFallback(Base):
+    """`auto` that no written spelling can answer.
+
+    The textual pass reads types from how they are written, which is
+    exact where a spelling exists and reports where none does. Four
+    litehtml files fail there -- a ternary in `context.cpp`, iterator
+    arithmetic in `box.cpp`, `str.find(..)` in `style.cpp`,
+    `text.substr(..)` in `stylesheet.cpp`.
+
+    Where this pass reports, a C++ compiler already knows the answer.
+    So if `clang++` is installed its answer is asked for, from the
+    original file, before the report is raised.
+
+    Nothing is approximated, which is what keeps this inside the guiding
+    rule: clang either says what the type is or it does not, and if it
+    does not the original diagnostic stands unchanged. The tests below
+    are skipped where clang is absent -- which is itself the point worth
+    testing, since the fallback must not change what a machine without
+    clang does.
+    """
+
+    def setUp(self):
+        if not cpp_auto.clang_available():
+            self.skipTest("clang++ not installed")
+
+    def _lower_file(self, src):
+        import tempfile
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "t.cpp")
+        with open(p, "w") as f:
+            f.write(src)
+        return cpprust.translate(src, path=p)
+
+    def test_ternary_is_deduced(self):
+        out = self._lower_file("""
+struct Node { int v; int get(); };
+Node *lookup(int k);
+void use(int x);
+void f(void) {
+    auto a = lookup(1) ? lookup(2) : lookup(3);
+    use(a->v);
+}
+""")
+        self.assertIn("Node * a", out)
+
+    def test_scalar_expression_is_deduced(self):
+        out = self._lower_file("""
+int base(void);
+void use(int x);
+void f(void) { auto n = base() + 1; use(n); }
+""")
+        self.assertIn("int n", out)
+
+    def test_without_clang_the_diagnostic_is_unchanged(self):
+        """The fallback must not be load-bearing.
+
+        A machine with no clang has to behave exactly as before, so this
+        forces the unavailable path and asserts the original message.
+        """
+        saved = cpp_auto._CLANG_OK
+        cpp_auto._CLANG_OK = False
+        try:
+            self.refuses("""
+struct Node { int v; };
+Node *lookup(int k);
+void f(void) { auto a = lookup(1) ? lookup(2) : lookup(3); use(a->v); }
+""", "`auto` cannot deduce")
+        finally:
+            cpp_auto._CLANG_OK = saved
+
+    def test_a_type_the_subset_cannot_spell_is_not_taken(self):
+        """A nested `iterator` is not a spelling this subset has.
+
+        Taking clang's word for it would only move the error somewhere
+        less informative, so the `auto` diagnostic stands.
+        """
+        self.assertIsNone(cpp_auto._from_cxx_spelling(
+            "basic_string<char>::iterator"))
+        self.assertIsNone(cpp_auto._from_cxx_spelling(
+            "(lambda at t.cpp:3:5)"))
+        self.assertEqual(cpp_auto._from_cxx_spelling("std::string"), "string")
+
+
 class TestFlattenCollision(Base):
     """From `litehtml/src/html.cpp`.
 

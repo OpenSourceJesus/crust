@@ -32,7 +32,10 @@ enough. It runs *after* lambda lowering, which consumes `auto f = [](){..}`
 on its own.
 """
 
+import json
+import os
 import re
+import subprocess
 
 
 class AutoError(Exception):
@@ -95,6 +98,155 @@ _INDEXER = re.compile(
 
 _QUALIFIERS = frozenset(("static", "inline", "virtual", "const",
                          "explicit", "mutable", "extern"))
+
+
+
+# --------------------------------------------------------------------------
+# clang fallback
+#
+# The pass below reads types from how they are written, which is exact
+# where a spelling exists and reports where none does. That is the whole
+# design and it stays: a translation that needs no toolchain is the
+# default, and the diagnostics name what to write.
+#
+# Where it reports, though, a C++ compiler already knows the answer --
+# deduction is its job. So if `clang++` is on the machine, its answer is
+# asked for before the report is raised. Nothing is approximated: clang
+# either says what the type is or it does not, and if it does not, the
+# original diagnostic stands.
+#
+# Two things this deliberately does not do. It does not run clang unless
+# the textual pass has already failed, so a file that needs no help pays
+# nothing. And it does not take a type this subset has no spelling for --
+# a nested `iterator`, a closure type -- since emitting one only moves the
+# error somewhere less informative.
+# --------------------------------------------------------------------------
+
+#: Set once the first lookup has run, so `clang++ --version` is not
+#: spawned for every file in a build.
+_CLANG_OK = None
+
+
+def clang_available():
+    """Whether `clang++` can be run, checked once."""
+    global _CLANG_OK
+    if _CLANG_OK is None:
+        try:
+            subprocess.check_output(["clang++", "--version"],
+                                    stderr=subprocess.STDOUT)
+            _CLANG_OK = True
+        except (OSError, subprocess.CalledProcessError):
+            _CLANG_OK = False
+    return _CLANG_OK
+
+
+def _walk_vardecls(node, where, out):
+    """Collect `(file, name, type)` for every VarDecl in a clang AST.
+
+    clang's JSON omits a location field that has not changed since the
+    node before it, so both the file and the line have to be carried
+    forward rather than read off each node -- most `VarDecl`s carry
+    neither of their own.
+
+    Tracking the *file* is what makes this usable at all. A dump of one
+    litehtml source contains every declaration in every header it
+    reaches, several hundred of them from libstdc++ alone, under names
+    like `find`, `min`, `next` and `pi` that a program is perfectly
+    entitled to use for something else. Only the file being translated
+    can be taken from.
+    """
+    if isinstance(node, dict):
+        loc = node.get("loc") or {}
+        if isinstance(loc, dict):
+            if loc.get("file"):
+                where = loc["file"]
+            # An `expansionLoc` or `spellingLoc` carries the file for a
+            # node that came out of a macro.
+            for k in ("expansionLoc", "spellingLoc"):
+                sub = loc.get(k)
+                if isinstance(sub, dict) and sub.get("file"):
+                    where = sub["file"]
+        if node.get("kind") == "VarDecl" and node.get("name"):
+            ty = (node.get("type") or {}).get("qualType")
+            if ty:
+                out.append((where, node["name"], ty))
+        for kid in node.get("inner") or ():
+            where = _walk_vardecls(kid, where, out)
+    elif isinstance(node, list):
+        for kid in node:
+            where = _walk_vardecls(kid, where, out)
+    return where
+
+
+def _from_cxx_spelling(ty):
+    """A clang type spelling as this subset writes it, or None.
+
+    `std::` is stripped, the way the rest of this pass strips it. What is
+    deliberately not translated is anything the subset has no spelling for
+    at all: a nested `iterator`, a closure type, an `auto` clang itself
+    left dependent. Returning None for those keeps the textual pass's
+    diagnostic, which names what to write, instead of emitting a type that
+    means nothing downstream.
+    """
+    ty = (ty or "").strip()
+    if not ty or "(" in ty or "lambda" in ty or "anonymous" in ty:
+        return None
+    if re.search(r"(?<![\w:])auto(?![\w])", ty):
+        return None
+    ty = re.sub(r"(?<![\w])std\s*::\s*", "", ty)
+    # A qualified name this pass would still have to resolve is not one it
+    # can take on trust: `basic_string<char>::iterator` names nothing here.
+    if "::" in ty:
+        return None
+    return ty
+
+
+def clang_auto_types(path, incdirs=(), defines=()):
+    """`{name: type}` for the `auto` variables clang deduced, or `{}`.
+
+    Keyed by *name*, not by line: this runs on the original file, while
+    the deduction pass runs on text that has had headers spliced into it
+    and namespaces flattened, so no line number survives the trip. A name
+    clang gave more than one type is dropped rather than guessed between --
+    the same answer this pass gives a by-value lambda capture it cannot
+    pin down.
+    """
+    if not clang_available():
+        return {}
+    cmd = ["clang++", "-Xclang", "-ast-dump=json", "-fsyntax-only",
+           "-std=c++20", "-w"]
+    for d in incdirs:
+        cmd += ["-I", d]
+    for d in defines:
+        cmd += ["-D", d]
+    cmd.append(path)
+    try:
+        # clang reports on what it cannot parse and still dumps what it
+        # did, so a non-zero status is not a reason to discard the answer.
+        # No output is.
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL)
+        raw = proc.communicate()[0]
+        if not raw:
+            return {}
+        tree = json.loads(raw.decode("utf-8", "replace"))
+    except (OSError, ValueError, MemoryError):
+        return {}
+    found = []
+    _walk_vardecls(tree, path, found)
+    want = os.path.realpath(path)
+    seen = {}
+    for where, name, ty in found:
+        if os.path.realpath(where or path) != want:
+            continue                     # a header's declaration, not ours
+        spelled = _from_cxx_spelling(ty)
+        if spelled is None:
+            continue
+        if name in seen and seen[name] != spelled:
+            seen[name] = None            # two types, one name: ambiguous
+        elif name not in seen:
+            seen[name] = spelled
+    return dict((k, v) for k, v in seen.items() if v)
 
 
 def _split_declarator(before):
@@ -812,7 +964,7 @@ def _sub_name(body, body_scan, name, repl):
     return "".join(out)
 
 
-def resolve(text, path="<cpp>", blank=None):
+def resolve(text, path="<cpp>", blank=None, fallback=None):
     """Rewrite every `auto` declaration in `text` to a written type.
 
     `blank` is a copy of `text` with comments and string bodies blanked and
@@ -851,7 +1003,15 @@ def resolve(text, path="<cpp>", blank=None):
         where = "%s:%d" % (path, _line_of(text, m.start()))
         init = text[m.end():end]
         ctx = (classes, methods, fields, tparams, funcs, vars_, aliases)
-        ty = _deduce(init, ctx, where)
+        try:
+            ty = _deduce(init, ctx, where)
+        except AutoError:
+            # Only now, and only for this declaration: a file whose types
+            # are all written pays nothing for the fallback existing.
+            got = (fallback or {}).get(m.group(3))
+            if not got:
+                raise
+            ty = got
         # A deduced reference or pointer keeps the sigil the author wrote;
         # `auto` itself never carries one, so this is additive.
         sigil = m.group(2) or ""

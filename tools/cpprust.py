@@ -5099,8 +5099,17 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
             text, os.path.basename(path), blank=cpp_auto._blank_like(text))
         text = cpp_auto.resolve_range_for(
             text, os.path.basename(path), blank=cpp_auto._blank_like(text))
+        # The clang fallback is consulted only where the textual pass
+        # cannot read a type, and only if clang is installed. It answers
+        # from the *original* file, so it is gathered before anything has
+        # been spliced or flattened -- but lazily, so a translation that
+        # needs no help never spawns a compiler.
+        fallback = {}
+        if os.path.isfile(path) and cpp_auto.clang_available():
+            fallback = cpp_auto.clang_auto_types(path, incdirs, defines)
         text = cpp_auto.resolve(
-            text, os.path.basename(path), blank=cpp_auto._blank_like(text))
+            text, os.path.basename(path), blank=cpp_auto._blank_like(text),
+            fallback=fallback)
         # After `auto`, which deduces *from* a cast's written type, and
         # before anything that reads an expression -- a surviving
         # `static_cast<T>(e)` reads as a comparison to everything below.
