@@ -482,6 +482,38 @@ transitively.
 instantiation whose class is declared *below* the one that needs it —
 classes are emitted in order, so it has to be complete first.
 
+### Function templates
+
+```cpp
+template<class T> void js_register_class(const char* className) { .. }
+
+js_register_class<litehtml::document>("Document");
+```
+
+Monomorphised the same way and for the same reason, by substitution **in
+place**: what comes out is ordinary subset source, and every pass below
+lowers it without knowing a template was involved.
+
+Substituting in place is what makes a *member* template work at no extra
+cost. `js_register_class` is a member of `context` whose body names fields
+and calls other members; replacing it where it stands with one ordinary
+member per instantiation hands the whole problem to the class emitter,
+which already knows how to give a method its `this` and mangle its name.
+
+A template argument is mangled the way namespace flattening will spell it --
+`litehtml::document` gives `litehtml_document` -- so the two agree without
+either knowing about the other. `typename X::y` loses the keyword once `X`
+is known, since there is no longer a parser to tell.
+
+An **uninstantiated** template emits nothing, which is what C++ does with
+one. That is not an optimisation but the whole answer for a header that
+merely declares one: a template's body is not ordinary code, and lowering it
+produced diagnostics about statements in a function the translation unit
+never called.
+
+**Refused:** a call giving the wrong number of arguments. They are
+substituted by position and there are no defaults to fall back on.
+
 ## `operator[]`
 
 Must return a reference, and lowers to a pointer, so the subscript stays an
@@ -669,7 +701,63 @@ together, and only the `#include` brings the two halves together. Each header
 is spliced once, which is what an include guard does and saves having to
 understand `#pragma once` or the `#ifndef` idiom. A header that cannot be
 found is left alone: it may be one the C front end resolves, and this pass is
-not the authority on the include path. Angle-bracket includes are untouched.
+not the authority on the include path.
+
+Both spellings are spliced, but they are looked for in different places,
+which is what keeps the distinction meaningful. A quoted include is searched
+from the including file's own directory first and then the `--incdir` path;
+an angle one is searched *only* on that path, and is spliced only if found
+there. A header that resolves under a directory the caller named is this
+project's own, whichever brackets it was written with -- litehtml includes
+its own headers both ways, and leaving the angle form alone meant the
+classes it declares were never lowered, so a file could translate clean and
+then emit C naming a struct nobody defined. Anything not found under an
+`--incdir` is left exactly as written, so `<string.h>` still goes to the C
+front end and `<string>` still reaches the supplied containers; with no
+`--incdir` at all, no angle include is ever spliced.
+
+`<cstdint>` and its family are the C headers under their C++ spellings, and
+are rewritten to the C ones -- the same move as pulling in `<stdbool.h>`
+when a file writes `bool`. The table is written out rather than computed, so
+`<cstring>` cannot be confused with `<string>`, which is a different thing
+entirely.
+
+### Conditionals
+
+Simple `#if`s are evaluated **while** splicing, not after -- an `#include` in
+a branch that is not taken should never be followed, and a header that
+`#define`s a name has to decide the conditionals of the ones below it.
+
+A header that defines a type two ways otherwise contributes both. litehtml's
+`os_types.h` gives `tstring` as `std::wstring` or `std::string` under
+`#ifndef LITEHTML_UTF8`, and with neither branch resolved the templates over
+it were monomorphised twice -- a `vector_wstring` beside the real one, over a
+type the subset does not supply.
+
+**Decided:** `#ifdef`, `#ifndef`, `#if defined(X)`, `#if 0` / `#if 1`, and a
+chain of `defined` tests joined by one operator. That last matters in
+practice: litehtml wraps nearly all of `os_types.h` in
+`#if defined( WIN32 ) || defined( _WIN32 ) || defined( WINCE )`, and
+refusing that one shape left everything inside it unevaluated.
+
+**Not decided, and passed through untouched, directives and all:** a
+comparison like `_MSC_VER < 1900`, which needs a value this pass does not
+have, and a line mixing `||` and `&&`, which needs precedence. Nothing is
+reported -- an undecidable `#if` is not an error, it is simply not this
+pass's to answer.
+
+The invariant is that this only ever *narrows* what reaches the rest of the
+pass, and only where the answer is not in doubt. Names come from `-D` on the
+command line and from `#define` in live text.
+
+A class this translation only **declares** -- `class element;`, with the
+definition in a header nobody here included -- is lowered like a definition
+minus the body: a struct tag and its typedef. C++ allows the declaration
+wherever the type is used through a pointer, which is what a
+`shared_ptr<element>` does. Which class is *complete* where is untouched: a
+by-value member of one still gets no definition, so
+`struct Holder { Thing t; };` reaches the C front end, which reports
+`field 't' has incomplete type` and names the field.
 
 **Definitions are lifted out and attached** to the member they belong to,
 keyed by class, name and arity, before anything is emitted. Only at brace
@@ -724,6 +812,52 @@ with the reason. That is the change worth knowing: `auto` used to pass
 through untouched, so what came back was `expected expression, got 'A'` from
 the C front end rather than a diagnostic about `auto`.
 
+A named cast is the one compound expression that does resolve. The type is
+spelled in the angle brackets at the point of use, so nothing is inferred:
+`static_cast<T>(e)`, `reinterpret_cast`, `const_cast`, and the C-style
+`(T *)e`. All three named casts lower to the C cast `((T)(e))` -- the
+distinctions between them are checks the C++ front end performs and none
+survives lowering. `dynamic_cast` is deliberately absent: it is refused for
+wanting RTTI, and deducing through it would turn that refusal into a
+lowering that dispatches on nothing.
+
+`auto x { e }` -- brace initialisation -- is the same initialisation with the
+same operand for everything this subset lowers, so only the terminator
+differs. A declaration inside a condition, `if (auto *p = f())`, declares a
+name that is in scope for the branch; its initialiser ends at the enclosing
+`)` rather than at a `;` that is not there.
+
+#### The clang fallback
+
+Where this pass reports, a C++ compiler already knows -- deduction is its
+job. So if `clang++` is installed, its answer is asked for before the report
+is raised, from a `-ast-dump=json` of the original file.
+
+Nothing is approximated, which is what keeps this inside the guiding rule.
+clang either says what the type is or it does not, and if it does not the
+original diagnostic stands unchanged. Four things bound it:
+
+* **Only the file being translated.** A dump of one real source carries
+  every declaration in every header it reaches -- several hundred from
+  libstdc++ alone, under names like `find`, `min`, `next` and `pi` that a
+  program may perfectly well use for something else.
+* **Keyed by name, not line.** It answers from the original file while
+  deduction runs on text that has had headers spliced in and namespaces
+  flattened, so no line number survives the trip. A name clang gave two
+  types is dropped rather than guessed between.
+* **Only a type this subset can spell.** A nested `iterator` arrives spelled
+  bare, and emitting `iterator i = ..` into C declares a variable of a type
+  nothing defines -- worse than the diagnostic it replaced, because the error
+  moves to the C front end and stops naming `auto`.
+* **Lazily, and only on a declaration that already failed.** A file whose
+  types are all written never spawns a compiler.
+
+`--clang` requires it, `--no-clang` forbids it, and the default is to use it
+when present. A build wanting the same answer on every machine should pin
+it: with the fallback available a `.cpp` whose types are not written still
+translates, and on a machine without clang the same file does not. On
+success the run names what clang answered, on stderr.
+
 ### Range-`for`
 
 Rewritten to the index loop it stands for:
@@ -739,9 +873,19 @@ reference means. The by-value form declares a copy instead. The two differ
 here exactly as they differ in C++, rather than one quietly behaving like
 the other.
 
-The range has to be a name: an array with a written size, or a class with
+The range has to be written plainly enough to read a length from: a name, or
+a chain of them -- `m_right.m_attrs` is written just as plainly as `v` is,
+and each step has a declared type. Inside a method a bare name resolves as a
+field of the class being written, since that is what `this->name` means.
+Either way it must end at an array with a written size, or a class with
 `size()` and `operator[]`, optionally through a pointer. `begin()`/`end()`
 iterators are a different feature and are reported, not guessed at.
+
+The `:` here is the range-`for`'s own and never one half of a `::`. That has
+to be said because the type and name groups will otherwise backtrack to make
+one fit: `for (tstring::size_type i = 0; ..)` was read as type `t`, name
+`string`, and the first colon of the `::` as the range colon -- reporting an
+ordinary indexed loop as an unwalkable range.
 
 ### `= default` and `= delete`
 
@@ -787,6 +931,17 @@ a qualified name has to become an unqualified one. Nesting gives `a_b_x`, and
 Only what the namespace *declares* is prefixed. A class's members and a
 function's locals are not namespace names, and prefixing them renamed
 `Point::x` to `geo_x` and broke every use of it.
+
+`N::x` becomes `N_x` only for the names flattening actually renamed. The
+qualification says which namespace to look in, not what the name became, and
+this pass does not rename everything a namespace holds -- a typedef keeps its
+name so the generated C stays readable. Where the name was not renamed the
+qualification is simply dropped, which is what flattening means for a name
+that keeps its spelling. Rewriting `N::x` regardless produced a name nothing
+declared: litehtml writes `litehtml::tstring` in fourteen places while its
+typedef stays `tstring`, so every qualified use became `litehtml_tstring`
+and the declaration did not follow -- and around 35 of 43 sources translated
+clean and then failed to compile on a type appearing nowhere.
 
 A namespace may be **reopened**, which a project with one per header does --
 litehtml does it forty times. A name produced by flattening an earlier block
@@ -1056,8 +1211,22 @@ Reported rather than mistranslated: exceptions (`throw` / `try` / `catch`),
 operator overloading other than `=`, a compound assignment, a comparison,
 `[]`, `->` and `*` (in particular the stream operators), `dynamic_cast`,
 `typeid`,
-multiple and virtual inheritance, iterators (`begin`/`end`), and the rest of
-the STL.
+multiple and virtual inheritance, iterators (`begin`/`end`), default
+function arguments, and the rest of the STL.
+
+Two shapes are worth calling out because they are legal C++ that this subset
+cannot express, rather than features not yet written:
+
+* **A move-only type in a container.** `std::vector<std::unique_ptr<T>>` is
+  ordinary C++ and cannot work here. The subset has no moves, and its Rule
+  of Three refusal *is* `unique_ptr`'s move-only semantics, so a container
+  cannot copy an element into place. Hold the element by `shared_ptr`
+  instead.
+* **A class-scoped typedef.** `X::ptr` and `X::vector` are deliberately left
+  alone -- taking them flatly would make every `vector` in the file mean
+  `X::vector`, including the supplied template of that name. A qualified use
+  therefore reaches the C front end with its `::` intact, so write the type
+  out.
 
 ## Errors
 
@@ -1092,5 +1261,31 @@ at compile time; a `.c` or `.rs` build needs neither.
 ## Tests
 
 ```sh
-python3 -m unittest tests.test_cpprust
+python3 -m unittest tests.test_cpprust          # the subset itself
+python3 tools/test_cpprust_extras.py            # features in flight
+python3 tools/litehtml_test.py --groups         # against real litehtml
 ```
+
+`tests/test_cpprust.py` is the suite for the subset as documented here.
+
+`tools/test_cpprust_extras.py` is the inner loop for work in progress: each
+test is a *distilled* version of a shape found in real litehtml, cut down to
+the few lines that exercise the gap, and each docstring names the file it
+came from -- so when a test there passes and the corresponding litehtml file
+still fails, the distillation was incomplete, and that difference is itself
+worth knowing. Guardrail tests sit beside the feature tests, because for
+this pass a refusal *is* the contract: a feature that lands by turning a
+diagnostic into a silent miscompile is a regression, and the tests have to
+be able to say so.
+
+`tools/litehtml_test.py` is the acceptance test. It lowers the real litehtml
+sources with the include path already set and then runs `gcc -fsyntax-only`
+on the result -- ShivyCX is the real target, but gcc is much faster and
+rejects the same broken C. The compile stage is not a formality: it is what
+catches a lowering that *succeeded* and produced C that does not mean
+anything, which translation alone cannot see.
+
+`--groups` reports failures by cause rather than by file. One refusal in a
+shared header fails every file that includes it, and grouping is what shows
+which single fix buys the most files. Translations are cached against the
+translator's own sources, so editing `cpprust.py` invalidates everything.
