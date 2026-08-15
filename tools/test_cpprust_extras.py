@@ -637,17 +637,64 @@ class Box { public: T v; Box() { } T get() { return v; } };
 void f(void) { Box<int> b; use(b.get()); }
 """, "Box_int_get")
 
-    def test_member_instantiation_is_reported(self):
-        self.refuses("""
-class Ctx { public: template<class T> void reg(const char *n) { use(n); } };
-void f(void) { Ctx c; c.reg<int>("x"); }
-""", "function template")
+    def test_member_instantiation_is_monomorphised(self):
+        """The litehtml shape: a member template, instantiated in a method.
 
-    def test_free_instantiation_is_reported(self):
+        Substituting in place is what makes this cost nothing extra --
+        what comes out is an ordinary member, and the class emitter gives
+        it its `this` and mangles its name without knowing a template was
+        ever involved.
+        """
+        out = self.assertLowers("""
+struct Doc { int id; };
+class Ctx {
+public:
+    int n;
+    template<class T>
+    void reg(const char *name) { n = sizeof(T); use(name); }
+    void go() { reg<Doc>("Document"); }
+};
+""", "Ctx_reg_Doc(Ctx *this, const char *name)",
+     "Ctx_reg_Doc(this, \"Document\")")
+        self.assertNotIn("template", out)
+
+    def test_free_instantiation_is_monomorphised(self):
+        out = self.assertLowers("""
+template<class T> int idof(T *p) { return p->v; }
+struct A { int v; };
+void f(A *a) { use(idof<A>(a)); }
+""", "int idof_A(A *p)", "idof_A(a)")
+        self.assertNotIn("template", out)
+
+    def test_two_instantiations_give_two_functions(self):
+        out = self.assertLowers("""
+struct Doc { int id; };
+struct El { int id; };
+class Ctx {
+public:
+    int n;
+    template<class T> void reg(const char *nm) { n = sizeof(T); use(nm); }
+    void go() { reg<Doc>("D"); reg<El>("E"); }
+};
+""", "Ctx_reg_Doc", "Ctx_reg_El")
+        self.assertIn("sizeof(Doc)", out)
+        self.assertIn("sizeof(El)", out)
+
+    def test_wrong_argument_count_is_reported(self):
+        """Substituted by position, with no defaults to fall back on."""
         self.refuses("""
-template<class T> void reg(int n) { use(n); }
-void f(void) { reg<int>(1); }
-""", "function template")
+template<class T, class U> int both(T *a, U *b) { return 1; }
+struct A { int v; };
+void f(A *a) { use(both<A>(a, a)); }
+""", "template argument")
+
+    def test_qualified_argument_mangles_like_the_flattened_name(self):
+        """`lh::Doc` gives `_lh_Doc`, which is what flattening calls it."""
+        out = self.assertLowers("""
+namespace lh { struct Doc { int id; }; }
+template<class T> int idof(T *p) { return p->id; }
+void f(lh::Doc *d) { use(idof<lh::Doc>(d)); }
+""", "idof_lh_Doc")
 
     def test_declaration_only_function_template(self):
         """No body to hold back, and nothing to emit either."""

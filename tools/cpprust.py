@@ -1213,28 +1213,43 @@ def _expand_headers(text, basedir, incdirs=(), seen=None, depth=0,
     return "".join(out)
 
 
-def _defer_function_templates(text, scan, path):
-    """Hold back `template<..>` on a *function*, and report an instantiation.
+def _mangle_targ(arg):
+    """A template argument as part of a C identifier.
 
-    The subset monomorphises class templates. A *function* template --
-    litehtml's `template<class T> void js_register_class(const char *)` in
-    `context.h`, which every element file includes -- was not recognised
-    as a template at all, so its body was lowered as ordinary code. Bodies
-    of templates are not ordinary code: this one names
-    `typename T::js_object_ref`, a type that exists only once `T` is
-    known, and the result was a diagnostic about `delete` in a file that
-    never called the function.
-
-    An uninstantiated template emits nothing in C++, and now emits nothing
-    here, which is the whole fix for a header that merely declares one.
-    An instantiation is *reported*, because monomorphising a function
-    template is a feature this pass does not have yet and emitting the
-    call unresolved would be a link error at best.
+    `litehtml::document` -> `litehtml_document`, which is also what
+    namespace flattening will call that class, so the two agree without
+    either knowing about the other.
     """
-    out, last, names = [], 0, []
+    arg = re.sub(r"(?<![\w])(?:const|typename|class|struct)(?![\w])", " ", arg)
+    arg = arg.replace("::", "_").replace("*", "ptr").replace("&", "ref")
+    arg = re.sub(r"[<>,\s]+", "_", arg)
+    return arg.strip("_")
+
+
+def _monomorphise_function_templates(text, scan, path):
+    """Emit one ordinary function per instantiation of a function template.
+
+    The subset already monomorphises class templates by writing out a copy
+    per instantiation. A function template is the same idea with a smaller
+    body, and it is done here the same way -- by substitution, in place, so
+    that what comes out is ordinary subset source and every pass below this
+    one lowers it without knowing a template was involved.
+
+    That is what makes a *member* template work at no extra cost. litehtml's
+
+        template<class T> void js_register_class(const char* className)
+
+    is a member of `context`, and its body names fields and calls other
+    members. Replacing it, where it stands, with one ordinary member per
+    instantiation hands the whole problem to the class emitter, which
+    already knows how to give a method its `this` and mangle its name.
+
+    An uninstantiated template still emits nothing, which is what C++ does
+    with one. A template whose parameters cannot be matched to an
+    instantiation is reported rather than guessed at.
+    """
+    tmpl = []
     for m in re.finditer(r"(?<![\w])template\s*<", scan):
-        if m.start() < last:
-            continue
         lt = m.end() - 1
         gt = _match(scan, lt, "<", ">")
         if gt is None:
@@ -1242,12 +1257,9 @@ def _defer_function_templates(text, scan, path):
         after = gt + 1
         while after < len(scan) and scan[after].isspace():
             after += 1
-        # `template<..> class X` is a class template and this pass's own
-        # business; anything else introduces a function.
         if re.match(r"(?:class|struct)(?![\w])", scan[after:after + 6]):
-            continue
-        # To the body's `{`, or the `;` of a declaration with no body.
-        k, depth = after, 0
+            continue                      # a class template: not ours
+        k, depth, body_open = after, 0, None
         while k < len(scan):
             c = scan[k]
             if c == "(":
@@ -1257,41 +1269,86 @@ def _defer_function_templates(text, scan, path):
             elif c == ";" and depth <= 0:
                 break
             elif c == "{" and depth <= 0:
+                body_open = k
                 close = _match_brace(scan, k)
                 if close is None:
-                    return text, scan, names
+                    return text, scan, []
                 k = close
                 break
             k += 1
         if k >= len(scan):
             continue
-        nm = re.search(r"(\w+)\s*\(", scan[after:])
-        if nm:
-            names.append(nm.group(1))
-        out.append(text[last:m.start()])
-        # Blanked to the same length rather than cut: everything that has
-        # already been measured against this text is an offset into it.
-        out.append(re.sub(r"[^\n]", " ", text[m.start():k + 1]))
-        last = k + 1
-    if not names:
-        return text, scan, names
+        nm = re.search(r"(\w+)\s*\(", scan[after:k + 1])
+        if not nm:
+            continue
+        params = [p.strip().split()[-1]
+                  for p in _split_top(scan[lt + 1:gt]) if p.strip()]
+        tmpl.append({
+            "name": nm.group(1), "params": params,
+            "start": m.start(), "end": k + 1,
+            "decl_only": body_open is None,
+        })
+    if not tmpl:
+        return text, scan, []
+
+    # Which arguments each one is instantiated with. A member call is
+    # `c.reg<int>(..)`, so a leading `.` cannot be excluded.
+    out, last, names = [], 0, []
+    for t in sorted(tmpl, key=lambda t: t["start"]):
+        args = []
+        for u in re.finditer(
+                r"(?<![\w])%s\s*<([^;{}()]*)>\s*\(" % re.escape(t["name"]),
+                scan):
+            if t["start"] <= u.start() < t["end"]:
+                continue                  # a recursive use inside the body
+            got = [a.strip() for a in _split_top(u.group(1)) if a.strip()]
+            if len(got) != len(t["params"]):
+                raise CppError(
+                    "%s:%d: `%s<%s>` gives %d template argument%s to a "
+                    "template that takes %d. This pass substitutes them by "
+                    "position and has no defaults to fall back on."
+                    % (os.path.basename(path),
+                       text.count("\n", 0, u.start()) + 1, t["name"],
+                       u.group(1).strip(), len(got),
+                       "" if len(got) == 1 else "s", len(t["params"])))
+            if got not in args:
+                args.append(got)
+        body = text[t["start"]:t["end"]]
+        # Drop the `template<..>` head; what is left is an ordinary
+        # function once the parameters are gone.
+        head_gt = _match(body, body.index("<"), "<", ">")
+        body = body[head_gt + 1:]
+        copies = []
+        for got in args:
+            one = body
+            for pname, arg in zip(t["params"], got):
+                one = re.sub(r"(?<![\w])%s(?![\w])" % re.escape(pname),
+                             arg, one)
+            # `typename X::y` is C++ telling the parser that `y` names a
+            # type. With `X` known there is nothing left to tell it.
+            one = re.sub(r"(?<![\w])typename\s+", "", one)
+            suffix = "_".join(_mangle_targ(a) for a in got)
+            one = re.sub(r"(?<![\w])%s(?=\s*\()" % re.escape(t["name"]),
+                         "%s_%s" % (t["name"], suffix), one, count=1)
+            copies.append(one)
+            names.append("%s_%s" % (t["name"], suffix))
+        out.append(text[last:t["start"]])
+        out.append("\n".join(copies) if copies else
+                   re.sub(r"[^\n]", " ", text[t["start"]:t["end"]]))
+        last = t["end"]
     out.append(text[last:])
     text = "".join(out)
-    scan = _strip_comments(text)
-    for n in names:
-        # `(?<![\w])` only: a member call is `c.reg<int>(..)`, so excluding
-        # a leading `.` or `->` would miss exactly the shape litehtml uses.
-        u = re.search(r"(?<![\w])%s\s*<[^;{}()]*>\s*\(" % re.escape(n), scan)
-        if u:
-            raise CppError(
-                "%s:%d: `%s<..>(..)` instantiates a function template, which "
-                "is not in the C++ subset -- this pass monomorphises class "
-                "templates only, and a function template's body cannot be "
-                "lowered until its parameters are known. Write the "
-                "instantiation out as an ordinary function."
-                % (os.path.basename(path), text.count("\n", 0, u.start()) + 1,
-                   n))
-    return text, scan, names
+
+    # And the call sites, now that the copies exist to be called.
+    for t in tmpl:
+        def _fix(u, _t=t):
+            got = [a.strip() for a in _split_top(u.group(1)) if a.strip()]
+            return "%s_%s(" % (_t["name"],
+                               "_".join(_mangle_targ(a) for a in got))
+        text = re.sub(
+            r"(?<![\w])%s\s*<([^;{}()]*)>\s*\(" % re.escape(t["name"]),
+            _fix, text)
+    return text, _strip_comments(text), names
 
 
 def _extract_out_of_line(text, scan, names):
@@ -5071,7 +5128,7 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     # bodies are not ordinary code -- they name types that exist only once
     # the parameters are known -- so lowering one produces diagnostics
     # about statements in a function the translation unit never calls.
-    text, _fscan, _ftmpl = _defer_function_templates(
+    text, _fscan, _ftmpl = _monomorphise_function_templates(
         text, _strip_comments(text), path)
     # Lambdas are lowered before anything else looks at the file: what comes
     # out is ordinary subset source with a static function in it.
