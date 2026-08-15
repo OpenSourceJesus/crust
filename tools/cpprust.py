@@ -345,6 +345,47 @@ def _strip_comments(text):
     return "".join(out)
 
 
+def _blank_directives(text):
+    """Blank preprocessor directive lines, keeping length and newlines.
+
+    A directive is not code, and its replacement text is not an
+    expression this file evaluates. Reading one as code made litehtml's
+
+        #define t_to_string(val)   std::to_string(val)
+
+    look like a call handing a `string` over by value -- the macro's own
+    parameter `val` resolving against an unrelated local of that name
+    somewhere else in the file. That refusal fired on 22 of 43 sources,
+    every one of them for a line no compiler would ever evaluate here.
+
+    Blanked rather than removed, and only in the *scan*: the directives
+    themselves still reach the output, where ShivyCX expands them.
+    Continuation lines go too, since a `\\` carries the directive on.
+    """
+    out, i, n = [], 0, len(text)
+    while i < n:
+        j = text.find("\n", i)
+        j = n if j < 0 else j
+        line = text[i:j]
+        if line.lstrip().startswith("#"):
+            out.append(" " * len(line))
+            # A trailing backslash continues the directive onto the next
+            # line, which is just as much not code as the first.
+            while line.rstrip().endswith("\\") and j < n:
+                i = j + 1
+                out.append("\n")
+                j = text.find("\n", i)
+                j = n if j < 0 else j
+                line = text[i:j]
+                out.append(" " * len(line))
+        else:
+            out.append(line)
+        if j < n:
+            out.append("\n")
+        i = j + 1
+    return "".join(out)
+
+
 def _match_brace(text, open_idx):
     """Index of the `}` closing the `{` at `open_idx`, or None."""
     depth = 0
@@ -5378,7 +5419,9 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
 
     # After reference lowering, a class still spelled by value really is by
     # value -- a `T &` the author wrote is a `T *` by now.
-    _check_by_value(out, cinfo, path)
+    # Against the directive-blanked text: a `#define`'s replacement is
+    # not an expression this translation unit evaluates.
+    _check_by_value(_blank_directives(out), cinfo, path)
     out = _rewrite_scopes(out, cinfo)
 
     # Rewriting a call copies its arguments through verbatim, so a receiver
@@ -5393,7 +5436,7 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     # After the rewrites, not before: `Buf c(a);` is a copy *construction*
     # until `_rewrite_scopes` turns it into `Buf c; Buf_copy(&c, &a);`, and
     # reading it earlier cannot tell it from a call handing `a` away.
-    _check_owning_args(out, cinfo, path)
+    _check_owning_args(_blank_directives(out), cinfo, path)
 
     # `new` and `delete` lower to `malloc`/`free`, so their declarations have
     # to be in scope. Spelled the way the rest of Crust spells them rather

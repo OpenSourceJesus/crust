@@ -658,6 +658,47 @@ int f(void) { return 1; }
         self.assertNotIn("template", out)
 
 
+class TestDirectivesAreNotCode(Base):
+    """A `#define`'s replacement text is not an expression.
+
+    From `litehtml/include/litehtml/os_types.h`:
+
+        #define t_to_string(val)   std::to_string(val)
+
+    read as a call handing a `string` over by value -- the macro's own
+    parameter `val` resolving against an unrelated local of that name
+    elsewhere in the file. That refusal fired on 22 of 43 litehtml
+    sources, every one for a line no compiler evaluates here.
+
+    Blanked only in the *scan*; the directives still reach the output,
+    where ShivyCX expands them.
+    """
+
+    def test_macro_body_is_not_read_as_a_call(self):
+        out = self.assertLowers("""
+#include <string>
+#define t_to_string(val) to_string(val)
+void f(void) { string val("x"); use(&val); }
+""", "#define t_to_string")
+
+    def test_multiline_macro_is_not_read_as_code(self):
+        self.assertLowers("""
+#include <string>
+#define two_step(val) do { \\
+        to_string(val); \\
+    } while (0)
+void f(void) { string val("x"); use(&val); }
+""", "#define two_step")
+
+    def test_a_real_by_value_owning_argument_is_still_refused(self):
+        """The check has to keep working on actual code."""
+        self.refuses("""
+#include <string>
+void consume(string s);
+void f(void) { string v("x"); consume(v); }
+""", "by value")
+
+
 class TestFlattenCollision(Base):
     """From `litehtml/src/html.cpp`.
 
