@@ -2624,12 +2624,15 @@ int f(void) { Box<Thing> b; return b.get() ? 1 : 0; }
         self.assertLess(out.index("struct Thing;"),
                         out.index("struct Box_Thing {"))
 
-    def test_struct_definitions_stay_where_they_were(self):
-        # Only names and prototypes hoist. A by-value member needs its
-        # member's *definition* above it, so moving one would move them all.
+    def test_an_instantiation_follows_the_class_it_is_built_over(self):
+        # It used to be emitted where its template sits, which for a supplied
+        # container is above every user class. `Box_Thing` holds a `Thing *`
+        # so it would have been fine either way, but `vector<Thing>` copies
+        # and destroys its elements and needs `Thing` complete -- so the
+        # instantiation is held back to just after it.
         out = cpprust.translate(self.SRC, path="t.cpp")
-        self.assertLess(out.index("struct Box_Thing {"),
-                        out.index("struct Thing { int v; };"))
+        self.assertLess(out.index("struct Thing { int v; };"),
+                        out.index("struct Box_Thing {"))
 
     def test_a_local_with_a_new_argument_is_not_a_declaration(self):
         # `Holder h(new Thing())` read as a function declaration returning
@@ -3113,19 +3116,31 @@ int f(void) {
 """, path="t.cpp")
         self.assertIn("string_equals", out)
 
-    def test_a_user_key_class_is_reported(self):
-        # A *user* key class is refused, and the reason is ordering rather
-        # than the missing `equals`: the supplied templates are spliced above
-        # the file, so when `map<K, ..>` is emitted `K` is not a class this
-        # pass has seen yet, and `__cpp_ref(K)` picks the by-value spelling.
-        # The diagnostic is still accurate and actionable; a key class that
-        # works has to be one of the supplied ones (`string`) for now.
+    def test_a_user_key_class_without_equals_is_reported(self):
+        # A user key class works now -- `__cpp_ref` asks whether `K` is a
+        # class of the whole translation rather than of what has been emitted
+        # so far, so it gets the reference spelling. What is left is the real
+        # requirement: two keys have to be comparable.
         with self.assertRaises(cpprust.CppError) as cm:
             cpprust.translate("""#include <map>
 class K { public: int v; K() { v = 0; } ~K() { } };
 int f(void) { std::map<K, int> m; K k; return m.count(k); }
 """, path="t.cpp")
-        self.assertIn("by value", cm.exception.message)
+        self.assertIn("no `equals`", cm.exception.message)
+
+    def test_a_user_key_class_with_equals_works(self):
+        out = cpprust.translate("""#include <map>
+class K {
+public:
+    int v;
+    K() { v = 0; }
+    ~K() { }
+    K(const K &o) { v = o.v; }
+    int equals(const K &o) { return v == o.v; }
+};
+int f(void) { std::map<K, int> m; K k; return m.count(k); }
+""", path="t.cpp")
+        self.assertIn("K_equals", out)
 
     def test_the_header_alone_supplies_nothing(self):
         out = cpprust.translate(
@@ -3793,3 +3808,62 @@ int f(void) { g::square s; g::shape *p = (g::shape *)&s; return p->area(); }
 """, path="t.cpp")
         self.assertIn("g_shape_vtable", out)
         self.assertIn("g_square__thunk_area", out)
+
+
+class TestCppImplicitCopy(unittest.TestCase):
+    """The copy constructor and assignment C++ would have written.
+
+    The implicit *destructor* built from a class's members already existed;
+    these are its counterparts, and without them a class with an owning
+    member could not go in a container.
+    """
+
+    SEL = """#include <string>
+class sel { public: std::string name; int n; sel() { n = 0; } ~sel() { } };
+"""
+
+    def test_a_member_wise_copy_is_generated(self):
+        out = cpprust.translate(
+            self.SEL + "int f(void) { sel a; sel b(a); return b.n; }",
+            path="t.cpp")
+        self.assertIn("string_copy(&this->a", out.replace("name", "a"))
+
+    def test_assignment_is_generated_too(self):
+        out = cpprust.translate(
+            self.SEL + "int f(void) { sel a; sel b; b = a; return b.n; }",
+            path="t.cpp")
+        self.assertIn("sel__assign", out)
+
+    def test_assignment_guards_self_assignment(self):
+        # It releases what is already there first, so `a = a` would destroy
+        # the object and then copy from the wreckage.
+        out = cpprust.translate(
+            self.SEL + "int f(void) { sel a; a = a; return a.n; }",
+            path="t.cpp")
+        self.assertIn("if (this != o)", out)
+
+    def test_plain_data_still_copies_bitwise(self):
+        # No class-typed member, so nothing needs a member-wise copy and the
+        # rest of this pass keeps expecting a struct assignment.
+        out = cpprust.translate(
+            "class Pod { public: int x; Pod() { x = 0; } };\n"
+            "void f(void) { Pod a; Pod b = a; }", path="t.cpp")
+        self.assertNotIn("Pod_copy", out)
+
+    def test_a_raw_pointer_and_a_destructor_is_still_refused(self):
+        # The Rule of Three: no member knows how to duplicate what the
+        # pointer points at, so there is no member-wise copy to write.
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate(
+                "class B { int *p; public: B() { p = 0; } ~B() { } };\n"
+                "void f(void) { B a; B b(a); }", path="t.cpp")
+        self.assertIn("copy constructor", cm.exception.message)
+
+    def test_an_uncopyable_member_deletes_the_implicit_copy(self):
+        # C++ deletes it when a member cannot be copied; a Crust type handed
+        # over as owning is exactly that.
+        out = cpprust.translate("""
+class H { public: Vec_int v; };
+void f(void) { H a; }
+""", path="t.cpp", owning={"Vec_int": "Vec_int_free_buf"})
+        self.assertNotIn("H_copy", out)
