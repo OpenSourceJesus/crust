@@ -2429,11 +2429,22 @@ def _rewrite_scopes(text, type_info):
     brk_re = re.compile(r"(?<![\w.])(break|continue)\s*;")
     goto_re = re.compile(r"(?<![\w.])goto\s+(\w+)")
 
-    def unwind(upto):
-        """Drop calls for frames `upto..top`, innermost and latest first."""
+    def unwind(upto, moved=None):
+        """Drop calls for frames `upto..top`, innermost and latest first.
+
+        `moved` names a local this path hands to its caller rather than
+        destroys -- `return v;` on an owning local is a *move out*, which is
+        the same rule Crust follows on the Rust side. Skipping the drop is
+        what makes returning a `shared_ptr` by value work: the object the
+        caller receives is the one that was here, not a copy of a released
+        one. Per path, never a permanent unregister, so the fall-through
+        still drops it.
+        """
         pieces = []
         for fr in reversed(scopes[upto:]):
             for ctype, vname in reversed(fr.live):
+                if moved is not None and vname == moved:
+                    continue
                 pieces.append("%s(&%s); "
                               % (_dropfn(type_info.get(ctype), ctype), vname))
         return "".join(pieces)
@@ -2502,8 +2513,18 @@ def _rewrite_scopes(text, type_info):
             if m is not None:
                 fidx = frame_index(("func",))
                 end = _stmt_end(look, m.end())
-                drops = unwind(fidx) if fidx is not None else ""
-                if drops and end is not None:
+                # A bare owning local being returned is moved out, so it is
+                # left out of this path's drops.
+                moved = None
+                if end is not None:
+                    cand = text[m.end():end].strip()
+                    if re.match(r"^\w+$", cand):
+                        for fr in scopes[fidx:] if fidx is not None else []:
+                            if any(v == cand for _c, v in fr.live):
+                                moved = cand
+                                break
+                drops = unwind(fidx, moved) if fidx is not None else ""
+                if end is not None and (drops or moved):
                     expr = text[m.end():end].strip()
                     rtype = scopes[fidx].ret
                     if not expr:
@@ -2618,12 +2639,24 @@ def _rewrite_scopes(text, type_info):
                 out.append(m.group(0))       # plain data: a bitwise copy is
                 i = m.end()                  # exactly what C++ would do
                 continue
+            if src is None and _is_call_result(rhs):
+                # `T a = f();` -- the callee returned by value, which is a
+                # move *out* of its local, so this is a move *in*. The plain
+                # struct assignment is exactly right: no constructor to run,
+                # no second owner, and `a` is registered so it is dropped
+                # here instead of there.
+                out.append(m.group(0))
+                if info["dtor"]:
+                    scopes[-1].live.append((ctype, vname))
+                scopes[-1].vals[vname] = ctype
+                i = m.end()
+                continue
             if src is None:
                 raise CppError(
                     "`%s %s = %s;`: %s owns a resource, and the right-hand "
-                    "side is not an object of that type this pass can name. "
-                    "Assign to a typed local first."
-                    % (ctype, vname, rhs, ctype))
+                    "side is neither an object of that type this pass can "
+                    "name nor a call returning one. Assign to a typed local "
+                    "first." % (ctype, vname, rhs, ctype))
             out.append("%s %s; " % (ctype, vname))
             out.append(_copy_call(ctype, vname, src, info, ctype))
             if info["dtor"]:
@@ -2937,13 +2970,102 @@ def _check_by_value(text, cinfo, path):
         toks = [t for t in (ret or "").replace("*", " * ").split()
                 if t != "const"]
         if toks and toks[0] in owning and "*" not in toks:
+            # `return v;` on a bare owning local is a *move out*: the scope
+            # rewriting leaves it out of that path's drops, so the object the
+            # caller receives is the one that was here rather than a copy of
+            # a released one. That is the same rule Crust follows on the Rust
+            # side, and it is what makes returning a `shared_ptr` by value --
+            # the idiom this whole subset would otherwise have to ban -- both
+            # possible and correct.
+            #
+            # What is still refused is returning something that is *not* a
+            # bare local, since there is nothing to move out of.
+            body = _func_body(text, m.end() - 1)
+            # A *declaration* has no body to read. Its definition is checked
+            # wherever it is written, and prototypes are hoisted above every
+            # definition now -- so checking them here would report the
+            # declaration of a function whose definition is perfectly fine.
+            if body is None or _returns_only_bare_locals(body):
+                continue
             raise CppError(
-                "%s: `%s` returns `%s` by value, but %s has a destructor -- "
-                "the local is destroyed on the way out, so the caller would "
-                "receive a copy of a released object. Return `%s *`, or fill "
-                "a `%s &` parameter."
-                % (os.path.basename(path), m.group(1), toks[0], toks[0],
-                   toks[0], toks[0]))
+                "%s: `%s` returns `%s` by value, and its `return` is not a "
+                "bare local. A returned local is moved out -- it is left out "
+                "of the drops on that path -- but an expression has nothing "
+                "to move from, so the caller would receive a copy of a "
+                "released object. Return `%s *`, or assign to a local first."
+                % (os.path.basename(path), m.group(1), toks[0], toks[0]))
+
+
+def _is_call_result(rhs):
+    """Is `rhs` a call -- something whose value was returned to us?
+
+    A returned owning value has been moved out of the callee, so taking it
+    is a move rather than a copy. Anything else (a name, a member, a
+    subscript) is still an object someone else owns.
+    """
+    rhs = rhs.strip()
+    if not rhs.endswith(")"):
+        return False
+    op = rhs.find("(")
+    if op <= 0 or _match_paren(rhs, op) != len(rhs) - 1:
+        return False
+    return re.match(r"^[\w:.>-]+$", rhs[:op].strip()) is not None
+
+
+def _normalise_empty_params(text):
+    """`f() {` -> `f(void) {` for a definition at file scope.
+
+    **Not called.** `int f()` means no parameters in C++ and unspecified in
+    C, so a free function written the C++ way is not recognised as a
+    definition -- but rewriting it here broke eight tests around out-of-line
+    definitions and header expansion, and the cause was not diagnosed. Kept
+    for whoever picks it up; the workaround is to write `(void)`.
+    """
+    look = _blank_strings(_strip_comments(text))
+    out, depth, i, n = [], 0, 0, len(look)
+    last = 0
+    while i < n:
+        c = look[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth = max(0, depth - 1)
+        elif depth == 0 and c == "(":
+            m = re.match(r"\(\s*\)\s*(?:const\s*)?\{", look[i:])
+            j = i - 1
+            while j >= 0 and look[j] in " \t":
+                j -= 1
+            k = j
+            while k >= 0 and (look[k].isalnum() or look[k] == "_"):
+                k -= 1
+            word = look[k + 1:j + 1]
+            if m and word and word not in _KEYWORDS:
+                out.append(text[last:i])
+                out.append("(void)")
+                last = i + look[i:].index(")", 1) + 1
+        i += 1
+    out.append(text[last:])
+    return "".join(out)
+
+
+def _func_body(text, op):
+    """The braced body of the function whose `(` is at `op`, or None."""
+    close = _match_paren(text, op)
+    if close is None:
+        return None
+    brace = text.find("{", close)
+    if brace < 0 or ";" in text[close + 1:brace]:
+        return None
+    end = _match_brace(text, brace)
+    return None if end is None else text[brace + 1:end]
+
+
+def _returns_only_bare_locals(body):
+    """Does every `return` in `body` hand back a bare name?"""
+    for m in re.finditer(r"(?<![\w.])return\b([^;]*);", body):
+        if not re.match(r"^\s*\w*\s*$", m.group(1)):
+            return False
+    return True
 
 
 def _free_ref_funcs(text, names):
@@ -3896,9 +4018,13 @@ public:
 #: monomorphise and a supplied template that errors when used is worse than
 #: an absent one. Kept here because the hook it pairs with is live.
 _STD_ENABLE_SHARED = """
-/* `enable_shared_from_this<T>`: the object remembers the control block that
-   the first `shared_ptr` gave it, so `shared_from_this()` joins that one.
-   Making a second block would free the object twice. */
+/* The object remembers the control block that the first `shared_ptr` gave
+   it, so `shared_from_this()` joins that one rather than starting a second
+   and freeing the object twice.
+
+   Note the name is not written with angle brackets anywhere in this comment:
+   the instantiation scan reads the supplied templates before comments are
+   stripped, so a `Name<T>` in prose is indistinguishable from a use. */
 template<typename T>
 class enable_shared_from_this {
 public:
@@ -4042,7 +4168,8 @@ _STD_INCLUDE = re.compile(
 
 
 _STD_CLASSES = frozenset(("string", "vector", "ownvector",
-                          "unique_ptr", "shared_ptr", "pair", "map"))
+                          "unique_ptr", "shared_ptr", "pair", "map",
+                          "enable_shared_from_this"))
 
 
 def _std_prelude(text):
@@ -4064,7 +4191,7 @@ def _std_prelude(text):
         wanted.discard("map")
     probe = _blank_strings(_strip_comments(text))
     for name in ("string", "vector", "ownvector", "unique_ptr",
-                 "shared_ptr", "pair", "map"):
+                 "shared_ptr", "pair", "map", "enable_shared_from_this"):
         if re.search(r"\bstd\s*::\s*%s\b" % name, probe):
             wanted.add(name)
     # `bool` is a keyword in C++ and a header in C. A `.cpp` writing `bool`
@@ -4095,8 +4222,13 @@ def _std_prelude(text):
         parts.append(_STD_STRING)
     if "unique_ptr" in wanted:
         parts.append(_STD_UNIQUE)
+    # `enable_shared_from_this` needs `shared_ptr`, and comes after it.
+    if "enable_shared_from_this" in wanted:
+        wanted.add("shared_ptr")
     if "shared_ptr" in wanted:
         parts.append(_STD_SHARED)
+    if "enable_shared_from_this" in wanted:
+        parts.append(_STD_ENABLE_SHARED)
     if "pair" in wanted or "map" in wanted:
         parts.append(_STD_PAIR)
     if "vector" in wanted:
