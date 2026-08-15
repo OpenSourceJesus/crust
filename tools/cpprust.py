@@ -1664,6 +1664,12 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
            else (lambda s: s))
     cname = cls.name if targs is None else _mono_name(cls.name, targs)
     base = cls.base
+    # A base may be a template *instantiation* -- `class D : public Box<int>`,
+    # and `enable_shared_from_this<T>` is the shape that matters in practice.
+    # The spelling has to be monomorphised before it is looked up, or the
+    # name searched for is `Box<int>` and no class is ever called that.
+    if base is not None and base not in known:
+        base = tsub(sub(base)).strip()
     if base is not None and base not in known:
         raise CppError(
             "class %s: base class `%s` is not defined above it. A base is "
@@ -3160,7 +3166,8 @@ def _rewrite_calls(text, cinfo, free_refs):
     field_re = re.compile(
         r"(?<![\w.>])(\w+)((?:\s*(?:\.|->)\s*\w+)+)(?!\s*\()")
     builtin_re = re.compile(
-        r"(?<![\w.>])(__cpp_copy|__cpp_drop|__cpp_eq)\s*\(")
+        r"(?<![\w.>])(__cpp_copy|__cpp_drop|__cpp_eq|__cpp_share_hook)"
+        r"\s*\(")
     # `v[i]` / `a.b[i]` on a class that overloads subscript.
     index_re = re.compile(r"(?<![\w.>\]])(\w+)((?:\s*(?:\.|->)\s*\w+)*)\s*\[")
     # `p->x` where `p` is a *class* with `operator->`, and `*p` likewise. A
@@ -3393,6 +3400,22 @@ def _rewrite_calls(text, cinfo, free_refs):
                 raise CppError("unterminated `%s`" % m.group(1))
             parts = [p.strip() for p in _split_top(text[m.end():close])]
             kind, ty = m.group(1), (parts[0] if parts else "")
+            if kind == "__cpp_share_hook":
+                # `enable_shared_from_this<T>` needs the control block the
+                # first `shared_ptr` made, so that `shared_from_this()` joins
+                # it rather than starting a second one and freeing twice.
+                # There is no way to ask "does T derive from it" in this
+                # subset, so the question is asked of the *fields*: a class
+                # that has the hook's members has the hook.
+                paths = (cinfo.get(ty) or {}).get("paths") or {}
+                if "esp" in paths and "esc" in paths:
+                    out.append("((%s)->%s = (%s), (%s)->%s = (%s))"
+                               % (parts[1], paths["esp"], parts[1],
+                                  parts[1], paths["esc"], parts[2]))
+                else:
+                    out.append("(void)0")
+                i = close + 1
+                continue
             if kind == "__cpp_eq":
                 # Comparing two elements. Unlike copy and destroy this has to
                 # work for a scalar too -- a `map<int, ..>` compares its keys
@@ -3868,6 +3891,29 @@ public:
 """
 
 
+#: Not supplied yet -- see CPPRUST.md. The control-block hook below works and
+#: `shared_ptr` already calls it, but naming this template still fails to
+#: monomorphise and a supplied template that errors when used is worse than
+#: an absent one. Kept here because the hook it pairs with is live.
+_STD_ENABLE_SHARED = """
+/* `enable_shared_from_this<T>`: the object remembers the control block that
+   the first `shared_ptr` gave it, so `shared_from_this()` joins that one.
+   Making a second block would free the object twice. */
+template<typename T>
+class enable_shared_from_this {
+public:
+    T *esp;
+    long *esc;
+    enable_shared_from_this() { esp = 0; esc = 0; }
+    shared_ptr<T> shared_from_this() {
+        shared_ptr<T> r;
+        r.adopt(esp, esc);
+        return r;
+    }
+};
+"""
+
+
 _STD_SHARED = """
 template<typename T>
 class shared_ptr {
@@ -3879,6 +3925,14 @@ public:
         sp = q;
         sc = (long *)malloc(sizeof(long));
         *sc = 1;
+        __cpp_share_hook(T, q, sc);
+    }
+    /* Join an existing control block rather than starting one. */
+    void adopt(T *q, long *c) {
+        unshare();
+        sp = q;
+        sc = c;
+        if (sc) { *sc = *sc + 1; }
     }
     shared_ptr(const shared_ptr<T> &o) {
         sp = o.sp;
