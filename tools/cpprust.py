@@ -5417,8 +5417,60 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     # where they were. A prototype can mention a class declared below it --
     # `unique_ptr_Thing_new_1(unique_ptr_Thing *, Thing *)` -- so the two
     # groups cannot be interleaved per class.
-    if fwd or fwd_protos:
-        pieces.insert(0, "\n".join(fwd + fwd_protos) + "\n")
+    # Enum definitions, hoisted whole and given the typedef that lets the
+    # rest of the output name them without the `enum` keyword. C++ spells
+    # an enum type bare, so the prototypes below do too, and C has no way
+    # to forward-declare one -- the definition itself has to come first.
+    enums = []
+    def _lift_enum(m):
+        body_end = _match_brace(out0, m.start("brace"))
+        return m.group(0)
+    enum_re = re.compile(r"(?<![\w])enum\s+(\w+)\s*(?P<brace>\{)")
+    out0 = "".join(pieces)
+    lifted, last, k = [], 0, 0
+    while True:
+        m = enum_re.search(out0, k)
+        if m is None:
+            lifted.append(out0[last:])
+            break
+        close = _match_brace(out0, m.start("brace"))
+        if close is None:
+            k = m.end()
+            continue
+        end = close + 1
+        while end < len(out0) and out0[end] in " \t":
+            end += 1
+        # Only a plain `enum X { .. };`. A `typedef enum X { .. } X;`
+        # already carries its own typedef and must be moved whole or not
+        # at all -- quickjs writes them that way, and lifting just the
+        # `enum X { .. }` out of one leaves a stray `typedef` and a
+        # dangling name behind.
+        if end >= len(out0) or out0[end] != ";" \
+                or _prev_word(out0, m.start()) == "typedef":
+            k = end
+            continue
+        end += 1
+        name = m.group(1)
+        enums.append("%s\ntypedef enum %s %s;" % (out0[m.start():end],
+                                                 name, name))
+        lifted.append(out0[last:m.start()])
+        lifted.append(" " * (end - m.start()))
+        last = end
+        k = end
+    if enums:
+        pieces = ["".join(lifted)]
+    if fwd or fwd_protos or enums:
+        head = "\n".join(enums + fwd + fwd_protos) + "\n"
+        # These are hoisted above everything, including any `#include
+        # <stdbool.h>` the source or its headers already had -- litehtml
+        # has one, which is why nothing was added earlier. A prototype
+        # returning `bool` then names a type C has not been told about
+        # yet, several hundred lines before the include that would.
+        # stdbool.h is idempotent, so the safe answer is to carry one
+        # along with the block that needs it.
+        if re.search(r"(?<![\w])bool(?![\w])", head):
+            head = "#include <stdbool.h>\n" + head
+        pieces.insert(0, head)
     out = "".join(pieces)
 
     # Rewrite uses: `Ring<int> r;` -> `Ring_int r;`. Field types were already
