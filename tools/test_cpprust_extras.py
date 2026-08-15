@@ -769,6 +769,35 @@ void f(void) { auto a = lookup(1) ? lookup(2) : lookup(3); use(a->v); }
         finally:
             cpp_auto._CLANG_OK = saved
 
+    def test_an_unspellable_answer_is_refused(self):
+        """clang answers in C++'s terms, and some answers name nothing here.
+
+        `iterator` is the case that matters: a nested typedef, arriving
+        spelled bare. Emitting `iterator i = ..` into C declares a
+        variable of a type nothing defines -- worse than the diagnostic it
+        replaced, since the error moves to the C front end and stops
+        naming `auto`. So an answer is taken only if this translation
+        already knows the name.
+        """
+        self.assertFalse(cpp_auto._spellable("iterator", set(), {}))
+        self.assertTrue(cpp_auto._spellable("int", set(), {}))
+        self.assertTrue(cpp_auto._spellable("Node *", set(["Node"]), {}))
+        self.assertTrue(cpp_auto._spellable("unsigned long", set(), {}))
+
+    def test_a_name_declared_twice_is_not_guessed_between(self):
+        """`box.cpp` declares `i` four times, with different iterator
+        types. Keyed by name, that is ambiguous, and ambiguous is
+        reported rather than resolved to whichever came first."""
+        import tempfile
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "amb.cpp")
+        with open(p, "w") as f:
+            f.write("int mk(void); double dk(void);\n"
+                    "void f(void) { auto i = mk(); use(i); }\n"
+                    "void g(void) { auto i = dk(); use(i); }\n")
+        got = cpp_auto.clang_auto_types(p)
+        self.assertNotIn("i", got)
+
     def test_a_type_the_subset_cannot_spell_is_not_taken(self):
         """A nested `iterator` is not a spelling this subset has.
 

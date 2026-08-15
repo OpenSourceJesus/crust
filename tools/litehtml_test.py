@@ -122,6 +122,7 @@ class Result(object):
         self.ok = False
         self.message = ""
         self.cached = False
+        self.clang = ""
         self.seconds = 0.0
 
     @property
@@ -148,41 +149,56 @@ def _signature(msg):
     return " ".join(words)[:160]
 
 
-def translate(src, out, incdirs, cache_dir, use_cache, timeout, defines=()):
+def translate(src, out, incdirs, cache_dir, use_cache, timeout, defines=(),
+              clang=None):
     """Lower one .cpp to C. Returns (ok, message, cached)."""
     key = None
     if use_cache:
         deps = [src, CPPRUST, os.path.join(HERE, "cpp_auto.py")]
         deps += _header_set(incdirs)
         key = os.path.join(cache_dir,
-                           _digest(deps + ["-D" + d for d in defines]))
+                           _digest(deps + ["-D" + d for d in defines]
+                                   + ["clang=%s" % clang]))
         if os.path.exists(key + ".ok"):
             with open(key + ".ok") as f:
                 data = f.read()
             with open(out, "w") as f:
                 f.write(data)
-            return True, "", True
+            note = ""
+            if os.path.exists(key + ".clang"):
+                with open(key + ".clang") as f:
+                    note = f.read()
+            return True, "", True, note
         if os.path.exists(key + ".fail"):
             with open(key + ".fail") as f:
-                return False, f.read(), True
+                return False, f.read(), True, ""
 
     cmd = [sys.executable, CPPRUST, src, "-o", out]
     for d in incdirs:
         cmd += ["--incdir", d]
     for name in defines:
         cmd += ["-D", name]
+    if clang is not None:
+        cmd.append("--clang" if clang else "--no-clang")
     try:
         p = subprocess.run(cmd, capture_output=True, text=True,
                            timeout=timeout)
     except subprocess.TimeoutExpired:
-        return False, "timed out after %ds" % timeout, False
+        return False, "timed out after %ds" % timeout, False, ""
 
     # cpprust writes its diagnostic into the -o file on failure, so the
     # file existing is not success -- the exit status is what says.
     ok = p.returncode == 0
+    note = ""
+    for line in (p.stderr or "").splitlines():
+        if "clang answered" in line:
+            note = line.split("clang answered", 1)[1].strip()
     msg = "" if ok else (p.stderr.strip() or p.stdout.strip())
     msg = msg.replace("cpprust: ", "", 1)
 
+    if use_cache and key and note:
+        with open(key + ".clang", "w") as f:
+            f.write(note)
     if use_cache and key:
         if ok:
             with open(out) as f:
@@ -192,7 +208,7 @@ def translate(src, out, incdirs, cache_dir, use_cache, timeout, defines=()):
         else:
             with open(key + ".fail", "w") as f:
                 f.write(msg)
-    return ok, msg, False
+    return ok, msg, False, note
 
 
 def compile_c(path, incdirs, timeout, shim=None):
@@ -220,9 +236,10 @@ def run_one(name, src, cfg, args):
     r = Result(name)
     t0 = time.time()
     out = os.path.join(cfg["outdir"], name + ".c")
-    ok, msg, cached = translate(src, out, cfg["incdirs"], cfg["cache"],
-                                not args.no_cache, args.timeout,
-                                cfg["defines"])
+    ok, msg, cached, note = translate(src, out, cfg["incdirs"], cfg["cache"],
+                                      not args.no_cache, args.timeout,
+                                      cfg["defines"], cfg["clang"])
+    r.clang = note
     r.cached = cached
     if not ok:
         r.stage, r.message = "translate", msg
@@ -255,6 +272,11 @@ def main(argv=None):
     ap.add_argument("-D", "--define", action="append", default=[],
                     help="preprocessor name to define (default: "
                          "LITEHTML_UTF8, as juce_litehtml.h does)")
+    ap.add_argument("--clang", dest="clang", action="store_true",
+                    default=None, help="require the clang `auto` fallback")
+    ap.add_argument("--no-clang", dest="clang", action="store_false",
+                    help="forbid it, to see which `auto`s are genuinely "
+                         "written out rather than answered by a compiler")
     ap.add_argument("--no-cache", action="store_true")
     ap.add_argument("--no-shim", action="store_true",
                     help="do not map <cstdint> and friends to their C "
@@ -284,6 +306,7 @@ def main(argv=None):
         # translation that does not is reading the wrong half of
         # os_types.h -- `tstring` would be `std::wstring`.
         "defines": list(args.define) or ["LITEHTML_UTF8"],
+        "clang": args.clang,
     }
     os.makedirs(cfg["outdir"], exist_ok=True)
     os.makedirs(cfg["cache"], exist_ok=True)
@@ -306,6 +329,8 @@ def main(argv=None):
                                         else "GCC  ")
             note = " (cached)" if r.cached else " %.0fs" % r.seconds
             line = "%-6s %-24s%s" % (mark, n, "" if r.ok else note)
+            if r.clang:
+                line += "\n       clang answered %s" % r.clang[:110]
             if not r.ok and not args.verbose:
                 line += "\n       " + r.summary[:150]
             print(line)
@@ -315,6 +340,11 @@ def main(argv=None):
 
     good = [r for r in results if r.ok]
     bad = [r for r in results if not r.ok]
+    leaning = [r for r in results if r.clang]
+    if leaning:
+        print("\n%d file(s) needed the clang `auto` fallback -- without "
+              "clang these report. Re-run with --no-clang to see them."
+              % len(leaning))
     print("\n%d/%d ok, %d translate-fail, %d gcc-fail  (%.0fs)" % (
         len(good), len(results),
         len([r for r in bad if r.stage == "translate"]),

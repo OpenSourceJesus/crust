@@ -5030,7 +5030,7 @@ def _lower_lambdas(text, path):
 
 
 def translate(text, path="<cpp>", owning=None, basedir=None,
-              incdirs=(), defines=()):
+              incdirs=(), defines=(), clang=None):
     """Translate a C++ subset source to C. Raises CppError on anything else.
 
     `owning` maps the name of a type this file does *not* define to the
@@ -5104,9 +5104,21 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
         # from the *original* file, so it is gathered before anything has
         # been spliced or flattened -- but lazily, so a translation that
         # needs no help never spawns a compiler.
+        # `clang` is None for "use it if it is there", True to require
+        # it, False to forbid it. A build that wants the same answer on
+        # every machine pins it: with the fallback available, a `.cpp`
+        # whose types are not written still translates, and on a machine
+        # without clang the same file does not.
         fallback = {}
-        if os.path.isfile(path) and cpp_auto.clang_available():
-            fallback = cpp_auto.clang_auto_types(path, incdirs, defines)
+        del cpp_auto.CLANG_USED[:]
+        if clang is not False and os.path.isfile(path):
+            if clang is True and not cpp_auto.clang_available():
+                raise CppError(
+                    "--clang was given but `clang++` cannot be run. The "
+                    "fallback answers `auto` where no written spelling "
+                    "can; without it those declarations are reported.")
+            if cpp_auto.clang_available():
+                fallback = cpp_auto.clang_auto_types(path, incdirs, defines)
         text = cpp_auto.resolve(
             text, os.path.basename(path), blank=cpp_auto._blank_like(text),
             fallback=fallback)
@@ -5510,6 +5522,13 @@ def main(argv):
     owning = {}
     basedir = None
     incdirs = []
+    clang = None
+    if "--clang" in args:
+        clang = True
+        args.remove("--clang")
+    if "--no-clang" in args:
+        clang = False
+        args.remove("--no-clang")
     defines = []
     while "-D" in args:
         i = args.index("-D")
@@ -5553,7 +5572,8 @@ def main(argv):
     if len(args) != 1 or out_path is None:
         sys.stderr.write("usage: cpprust.py <source.cpp> -o <out.c> "
                          "[--owning Name:dropfn,..] [--basedir DIR] "
-                         "[--incdir DIR].. [-D NAME]..\n")
+                         "[--incdir DIR].. [-D NAME].. "
+                         "[--clang|--no-clang]\n")
         return 2
 
     src = args[0]
@@ -5569,7 +5589,7 @@ def main(argv):
             basedir = os.path.dirname(os.path.abspath(src))
         result = translate(text, path=src, owning=owning,
                            basedir=basedir, incdirs=incdirs,
-                           defines=defines)
+                           defines=defines, clang=clang)
     except CppError as e:
         # The message goes where the output would have gone; the caller
         # reads it back and reports it against the `#include` line.
@@ -5583,6 +5603,15 @@ def main(argv):
 
     with open(out_path, "w") as f:
         f.write(result)
+    # On stderr, so the protocol stays one file and one exit status. A
+    # caller that wants to know how much of a translation leans on clang
+    # reads this; nothing depends on it.
+    if cpp_auto.CLANG_USED:
+        sys.stderr.write(
+            "cpprust: clang answered %d `auto` declaration%s: %s\n"
+            % (len(cpp_auto.CLANG_USED),
+               "" if len(cpp_auto.CLANG_USED) == 1 else "s",
+               ", ".join("%s: %s" % nt for nt in cpp_auto.CLANG_USED)))
     return 0
 
 

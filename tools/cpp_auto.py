@@ -249,6 +249,39 @@ def clang_auto_types(path, incdirs=(), defines=()):
     return dict((k, v) for k, v in seen.items() if v)
 
 
+#: Names the clang fallback answered, for a caller that wants to say so.
+#: A build where these are many is one leaning on a compiler that a
+#: machine without clang does not have.
+CLANG_USED = []
+
+
+def _spellable(ty, classes, aliases):
+    """Whether a fallback type is one this translation can actually use.
+
+    clang answers in C++'s terms, and some of its answers name types that
+    exist only inside the standard library. `iterator` is the one that
+    matters here: it is a nested typedef, it arrives spelled bare, and
+    emitting `iterator i = ..` into C declares a variable of a type
+    nothing defines. Worse than the diagnostic it replaced, because the
+    error moves from this pass to the C front end and stops naming
+    `auto`.
+
+    So a fallback answer is taken only if the translation already knows
+    the name: a builtin, a class it has seen, or an alias it can resolve.
+    """
+    base = re.sub(r"[*&\s]+$", "", ty.strip())
+    base = re.sub(r"^(?:const|volatile|struct|union|enum)\s+", "", base)
+    base = base.split("<")[0].strip()
+    if not base:
+        return False
+    if base in _BUILTIN or base in classes or base in aliases:
+        return True
+    # A multi-word builtin -- `unsigned long`, `long long`.
+    return all(w in _BUILTIN or w in ("const", "unsigned", "signed",
+                                      "long", "short")
+               for w in base.split())
+
+
 def _split_declarator(before):
     """`(type, None)` for a declarator's leading text, or `(None, why)`.
 
@@ -1009,9 +1042,10 @@ def resolve(text, path="<cpp>", blank=None, fallback=None):
             # Only now, and only for this declaration: a file whose types
             # are all written pays nothing for the fallback existing.
             got = (fallback or {}).get(m.group(3))
-            if not got:
+            if not got or not _spellable(got, classes, aliases):
                 raise
             ty = got
+            CLANG_USED.append((m.group(3), ty))
         # A deduced reference or pointer keeps the sigil the author wrote;
         # `auto` itself never carries one, so this is additive.
         sigil = m.group(2) or ""
