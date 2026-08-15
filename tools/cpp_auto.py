@@ -775,6 +775,11 @@ def resolve_namespaces(text, path="<cpp>", blank=None):
         m, open_idx, close = best
         ns = m.group(1)
         body, body_scan = text[open_idx + 1:close], scan[open_idx + 1:close]
+        # Everything the namespace declares, not just this block. A namespace
+        # is one scope however many times it is reopened, so a class in one
+        # header may derive from a class in another -- and renaming only what
+        # this block declares left `class html_tag : public element` pointing
+        # at a name that no longer existed.
         declared = _declared_in(body_scan)
         # Flattening is name-mangling, not lookup: if `N_x` is already taken
         # by something declared outside, the two become one symbol. The C
@@ -803,6 +808,12 @@ def resolve_namespaces(text, path="<cpp>", blank=None):
         scan = _blank_like(text)
         # A qualified reference from outside, and any `using` for it.
         text = _sub_qualified(text, _blank_like(text), ns)
+        scan = _blank_like(text)
+        # And the *unqualified* references from the namespace's other blocks.
+        # They share this scope, so a class in one header derives from a
+        # class in another by its bare name; once this block is flattened,
+        # that name is only reachable as `N_x`.
+        text = _rename_in_blocks(text, _blank_like(text), ns, declared)
         scan = _blank_like(text)
 
     # `using namespace N;` -- the names are already `N_x`, so an unqualified
@@ -858,6 +869,36 @@ def _blank_braced(text):
 
 
 _TEMPLATE_HEAD = re.compile(r"template\s*<[^<>]*>")
+
+
+def _rename_in_blocks(text, scan, ns, names):
+    """Rewrite `names` to `ns_name` inside every other block of `ns`."""
+    if not names:
+        return text
+    while True:
+        hit = None
+        for m in _NAMESPACE.finditer(scan):
+            if m.group(1) != ns:
+                continue
+            open_idx = scan.index("{", m.start())
+            close = _match(scan, open_idx, "{", "}")
+            if close is None:
+                continue
+            body = text[open_idx + 1:close]
+            new = body
+            for name in sorted(names, key=len, reverse=True):
+                if name.startswith(ns + "_"):
+                    continue
+                new = _sub_name(new, _blank_like(new), name,
+                                "%s_%s" % (ns, name))
+            if new != body:
+                hit = (open_idx, close, new)
+                break
+        if hit is None:
+            return text
+        open_idx, close, new = hit
+        text = text[:open_idx + 1] + new + text[close:]
+        scan = _blank_like(text)
 
 
 def _declared_in(body_scan):
