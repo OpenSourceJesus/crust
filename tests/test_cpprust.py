@@ -3747,3 +3747,49 @@ class TestCppMoveSemantics(unittest.TestCase):
         self.assertFalse(cpprust._is_call_result("a + b()"))
         self.assertFalse(cpprust._is_call_result("v[i]"))
         self.assertFalse(cpprust._is_call_result("(*p).f()"))
+
+
+class TestCppReopenedNamespaceScope(unittest.TestCase):
+    """A namespace is one scope however many times it is reopened.
+
+    Renaming only what a single block declared left a class in one header
+    deriving from a class in another by a name that no longer existed --
+    `class html_tag : public element` against `class litehtml_element`.
+    """
+
+    SRC = """
+namespace n { class base { public: int v; base() { v = 4; } }; }
+namespace n { class derived : public base { public: int w; derived() { w = 5; } }; }
+namespace n { int twice(int x) { return x * 2; } }
+int f(void) { n::derived d; return n::twice(d.w) + d.v; }
+"""
+
+    def test_a_base_from_another_block_is_renamed(self):
+        out = cpprust.translate(self.SRC, path="t.cpp")
+        self.assertIn("struct n_derived { n_base _base;", out)
+
+    def test_names_are_not_prefixed_twice(self):
+        # The rename is pushed *out* to the other blocks as each one is
+        # flattened, rather than pulled in -- pulling in renamed a block's
+        # own names a second time and gave `n_n_derived`.
+        out = cpprust.translate(self.SRC, path="t.cpp")
+        self.assertNotIn("n_n_", out)
+
+    def test_a_function_in_a_third_block_still_resolves(self):
+        out = cpprust.translate(self.SRC, path="t.cpp")
+        self.assertIn("n_twice", out)
+
+    def test_virtual_dispatch_across_blocks(self):
+        out = cpprust.translate("""
+namespace g {
+    class shape { public: int w; shape() { w = 4; }
+                  virtual int area() { return w; } virtual ~shape() { } };
+}
+namespace g {
+    class square : public shape { public: int h; square() { h = 5; }
+                                  int area() { return w * h; } };
+}
+int f(void) { g::square s; g::shape *p = (g::shape *)&s; return p->area(); }
+""", path="t.cpp")
+        self.assertIn("g_shape_vtable", out)
+        self.assertIn("g_square__thunk_area", out)
