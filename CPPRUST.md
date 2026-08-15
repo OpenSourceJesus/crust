@@ -824,12 +824,13 @@ Keys are compared with `__cpp_eq`, which is `==` for a scalar and `T_equals`
 for a class, decided per instantiation. A key class needs
 `int equals(const T &o)`.
 
-**A user-defined key class does not work yet.** The supplied templates are
-spliced above the file, so when `map<K, ..>` is emitted `K` is not a class
-this pass has seen, and the key gets the by-value spelling -- which is then
-refused if `K` owns anything. `string` keys work because `string` is supplied
-above `map`. Fixing this means ordering instantiations against the classes
-they mention rather than against the file.
+A user-defined key class works, provided it has that `equals`. This used to
+be refused for a reason that has since gone: the supplied templates are
+spliced above the file, so `K` was not a class this pass had *emitted* when
+`map<K, ..>` was emitted, and the key got the by-value spelling. Asking
+whether `K` is a class of the whole translation rather than of what has been
+emitted so far is the whole fix, and instantiations are now held back until
+the classes they are built over are complete.
 
 ### `unique_ptr` and `shared_ptr`
 
@@ -1006,6 +1007,24 @@ A keyword in C++ and a header in C. A `.cpp` writing `bool`, `true` or
 `false` has included nothing for it and should not have to, so
 `<stdbool.h>` is pulled in -- rather than the type being redefined here,
 which would clash with a file that does include it.
+
+### Implicit copy and assignment
+
+A class with a class-typed member gets the copy constructor and assignment
+C++ would have written, member by member. The implicit *destructor* built
+from the same members already existed; without these a class with an owning
+member could not go in a container at all.
+
+Both are generated on C++'s terms:
+
+- **Only when a member knows how to copy itself.** Plain data keeps its
+  bitwise copy, and a class whose only owned thing is a *raw pointer* still
+  gets the Rule of Three refusal -- no member knows how to duplicate what it
+  points at.
+- **Deleted when a member cannot be copied**, exactly as in C++. A Crust
+  type handed over as owning is one such member.
+- **Assignment releases first and guards self-assignment**, since `a = a`
+  would otherwise destroy the object and copy from the wreckage.
 
 ### Element builtins
 
