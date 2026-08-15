@@ -47,8 +47,14 @@ class AutoError(Exception):
 # initialiser has to be an `=` form: `auto x(1);` is a declaration whose type
 # is the thing being deduced, which reads as a call and is not worth the
 # ambiguity.
+#: `auto x = e` and `auto x { e }`. The braced spelling is list
+#: initialisation, which for everything this subset lowers -- a
+#: constructor call or a scalar -- is the same initialisation with the
+#: same operand, so only the delimiter differs. Group 4 says which was
+#: written, because the two end differently: one at the `;`, the other at
+#: the matching `}`.
 _AUTO_DECL = re.compile(
-    r"(?<![\w.])(?:(const)\s+)?auto\s*(\*|&)?\s*(\w+)\s*=\s*")
+    r"(?<![\w.])(?:(const)\s+)?auto\s*(\*|&)?\s*(\w+)\s*(=|\{)\s*")
 
 _INT_LIT = re.compile(r"^[+-]?(?:0[xX][0-9a-fA-F]+|0[bB][01]+|\d+)"
                       r"([uU]?[lL]{0,2}|[lL]{0,2}[uU]?)$")
@@ -290,6 +296,27 @@ def _strip_outer(expr):
     return expr
 
 
+def _is_type_spelling(inner, ctx):
+    """Whether `inner` reads as a type rather than a value.
+
+    Only used to tell a C-style cast from a parenthesised expression, so
+    it errs towards saying no: a wrong yes would take `(a) + b` for a
+    cast, and the cost of a wrong no is only that `auto` reports instead
+    of deducing, which is the documented behaviour anyway.
+    """
+    classes, _, _, tparams, _, _, aliases = ctx
+    words = inner.replace("*", " ").split()
+    if not words or "(" in inner or "[" in inner:
+        return False
+    for w in words:
+        if w in ("const", "unsigned", "signed", "struct", "long", "short"):
+            continue
+        if w in _BUILTIN or w in classes or w in aliases or w in tparams:
+            continue
+        return False
+    return True
+
+
 def _deduce(expr, ctx, where):
     """The written type of `expr`, or raise `AutoError` naming why not."""
     classes, methods, fields, tparams, funcs, vars_, aliases = ctx
@@ -305,6 +332,37 @@ def _deduce(expr, ctx, where):
     # `&x` -- deduce the operand and add a star.
     if e.startswith("&") and not e.startswith("&&"):
         return _deduce(e[1:], ctx, where) + " *"
+
+    # A named cast. The target type is spelled in the angle brackets, at
+    # the point of use, which is as written as a type ever gets -- so this
+    # is the one deduction that needs nothing looked up. `dynamic_cast` is
+    # deliberately absent: it is refused elsewhere for wanting RTTI, and
+    # deducing through it here would turn that refusal into a lowering
+    # that compiles and dispatches on nothing.
+    m = re.match(r"^(static_cast|reinterpret_cast|const_cast)\s*<", e)
+    if m:
+        lt = e.index("<")
+        gt = _match(e, lt, "<", ">")
+        if gt > 0:
+            rest = e[gt + 1:].lstrip()
+            if rest.startswith("(") and _match(e, e.index("(", gt), "(",
+                                               ")") == len(e) - 1:
+                ty = e[lt + 1:gt].strip()
+                # `const_cast` exists to remove the qualifier; keeping it
+                # would declare a local nothing can be assigned through.
+                if m.group(1) == "const_cast":
+                    ty = re.sub(r"(?<![\w])const\s+", "", ty).strip()
+                return ty
+
+    # A C-style cast, `(T *)e`. Told from a parenthesised expression by
+    # what is inside: a type, not something that reads as a value.
+    if e.startswith("("):
+        close = _match(e, 0, "(", ")")
+        if close > 0 and close < len(e) - 1:
+            inner = e[1:close].strip()
+            after = e[close + 1:].strip()
+            if after and _is_type_spelling(inner, ctx):
+                return inner
 
     # Literals.
     if _INT_LIT.match(e):
@@ -485,6 +543,11 @@ def _end_of_init(text, at):
             depth_p += 1
         elif c == ")":
             depth_p -= 1
+            # Below where it started means this is the `)` of an enclosing
+            # `if (..)` or `while (..)`, and a declaration in a condition
+            # ends there rather than at a `;` -- there is no `;` to find.
+            if depth_p < 0:
+                return k
         elif c == "[":
             depth_b += 1
         elif c == "]":
@@ -499,9 +562,14 @@ def _end_of_init(text, at):
     return None
 
 
+#: The `:` here is the range-`for`'s own, never one half of a `::`. That
+#: has to be said, because the type and name groups will happily backtrack
+#: to make a `::` fit: `for (tstring::size_type i = 0; ..)` was read as
+#: type `t`, name `string`, and the first colon of the `::` as the range
+#: colon -- reporting an ordinary indexed loop as an unwalkable range.
 _RANGE_FOR = re.compile(
     r"(?<![\w.])for\s*\(\s*(?:(const)\s+)?"
-    r"(auto|[A-Za-z_][\w:]*(?:\s*<[^;()]*>)?)\s*(&)?\s*(\w+)\s*:\s*")
+    r"(auto|[A-Za-z_][\w:]*(?:\s*<[^;()]*>)?)\s*(&)?\s*(\w+)\s*:(?!:)\s*")
 
 
 def _array_len(name, scan):
@@ -511,6 +579,55 @@ def _array_len(name, scan):
     if m is None:
         return None
     return m.group(1).strip() or None
+
+
+def _enclosing_class(scan, idx):
+    """The innermost class whose body contains `idx`, or None.
+
+    A method body writing a bare `m_attrs` means `this->m_attrs`, so
+    resolving one needs to know which class is being written inside.
+    """
+    best = None
+    for m in re.finditer(r"\b(?:class|struct)\s+(\w+)\s*(?::[^{;]*)?\{", scan):
+        open_idx = scan.index("{", m.start())
+        close = _match(scan, open_idx, "{", "}")
+        if close is None or not (open_idx < idx < close):
+            continue
+        # Innermost wins: a nested class's body is inside its outer's.
+        if best is None or open_idx > best[1]:
+            best = (m.group(1), open_idx)
+    return best[0] if best else None
+
+
+def _chain_type(expr, scan, ctx, idx):
+    """The written type of a `a.b->c` chain, or None.
+
+    The head is a local, a parameter, or -- inside a method -- a field of
+    the enclosing class; each step after it is a field of what the last
+    one resolved to. Every part is read from how it was *declared*, which
+    is the same thing this pass does for a bare name; a chain is not a
+    different kind of knowledge, only more of the same.
+    """
+    classes, _methods, fields, _tp, _f, vars_, aliases = ctx
+    parts = [p for p in re.split(r"\s*(?:\.|->)\s*", expr) if p]
+    if not parts:
+        return None
+    ty = _resolve_alias(vars_.get(parts[0], ""), aliases)
+    if not ty:
+        owner = _enclosing_class(scan, idx)
+        if owner:
+            ty = _resolve_alias(fields.get(owner, {}).get(parts[0], ""),
+                                aliases)
+    if not ty:
+        return None
+    for step in parts[1:]:
+        base = re.sub(r"[*&\s]+$", "", ty).split("<")[0].strip()
+        if base not in classes:
+            return None
+        ty = _resolve_alias(fields.get(base, {}).get(step, ""), aliases)
+        if not ty:
+            return None
+    return ty
 
 
 def resolve_range_for(text, path="<cpp>", blank=None):
@@ -534,7 +651,7 @@ def resolve_range_for(text, path="<cpp>", blank=None):
     scan = blank if blank is not None else text
     if "for" not in scan:
         return text
-    classes, methods, _f, _t = _scan_classes(scan)
+    classes, methods, fields, _t = _scan_classes(scan)
     n = 0
     while True:
         m = _RANGE_FOR.search(scan)
@@ -551,12 +668,17 @@ def resolve_range_for(text, path="<cpp>", blank=None):
         # a pointer is the ordinary way to pass one to a function.
         deref = bool(re.match(r"^\*\s*[A-Za-z_]\w*$", rng))
         rng = rng.lstrip("*").strip()
-        if not re.match(r"^[A-Za-z_]\w*$", rng):
+        # A name, or a chain of them: `m_right.m_attrs` is written just as
+        # plainly as `v` is, and each step has a declared type to read. The
+        # restriction to a bare name was narrower than the reason for it,
+        # which is only that the length has to be readable from the
+        # spelling.
+        if not re.match(r"^[A-Za-z_]\w*(?:\s*(?:\.|->)\s*\w+)*$", rng):
             raise AutoError(
-                "%s: a range-`for` here needs a named array or container "
-                "(optionally through a pointer); `%s` is an expression, and "
-                "this pass reads the length from how the range is written. "
-                "Assign it to a name first."
+                "%s: a range-`for` here needs a named array or container, or "
+                "a member of one (optionally through a pointer); `%s` is an "
+                "expression, and this pass reads the length from how the "
+                "range is written. Assign it to a name first."
                 % (where, text[m.end():head_end].strip()[:40]))
         # Where does the body start, and how long is the range?
         body_open = scan.find("{", head_end)
@@ -570,11 +692,29 @@ def resolve_range_for(text, path="<cpp>", blank=None):
 
         alen = _array_len(rng, scan)
         cls = None
-        vt = _resolve_alias(_declared_types(scan).get(rng, ""),
-                            _scan_typedefs(scan))
+        chain = bool(re.search(r"\.|->", rng))
+        if chain:
+            vt = _chain_type(rng, scan, (classes, methods, fields, {}, {},
+                                         _declared_types(scan),
+                                         _scan_typedefs(scan)),
+                             m.start()) or ""
+        else:
+            vt = _resolve_alias(_declared_types(scan).get(rng, ""),
+                                _scan_typedefs(scan))
+            if not vt:
+                # A bare name inside a method may be a field of the class
+                # being written, which is `this->name` and just as declared.
+                owner = _enclosing_class(scan, m.start())
+                if owner:
+                    vt = _resolve_alias(fields.get(owner, {}).get(rng, ""),
+                                        _scan_typedefs(scan))
         cm = re.match(r"^([A-Za-z_]\w*)", vt.strip().lstrip("*"))
         if cm and cm.group(1) in classes:
             cls = cm.group(1)
+        # A chain ending in a pointer field is reached with `->`, the same
+        # way a dereferenced name is.
+        if vt.rstrip().endswith("*"):
+            deref = True
         if alen is None and (cls is None
                              or "size" not in methods.get(cls, {})
                              or "[]" not in methods.get(cls, {})):
@@ -693,11 +833,21 @@ def resolve(text, path="<cpp>", blank=None):
         if m is None:
             out.append(text[i:])
             break
-        end = _end_of_init(scan, m.end())
+        braced = m.group(4) == "{"
+        if braced:
+            # The initialiser is what the braces hold, so it ends at the
+            # matching `}` rather than at the `;`.
+            close = _match(scan, m.start(4), "{", "}")
+            end = close if close and close > 0 else None
+            resume = end + 1 if end is not None else None
+        else:
+            end = _end_of_init(scan, m.end())
+            resume = end
         if end is None:
             raise AutoError(
-                "%s:%d: `auto %s = ..` has no `;` to end it"
-                % (path, _line_of(text, m.start()), m.group(3)))
+                "%s:%d: `auto %s %s ..` has no %s to end it"
+                % (path, _line_of(text, m.start()), m.group(3),
+                   m.group(4), "`}`" if braced else "`;`"))
         where = "%s:%d" % (path, _line_of(text, m.start()))
         init = text[m.end():end]
         ctx = (classes, methods, fields, tparams, funcs, vars_, aliases)
@@ -719,7 +869,12 @@ def resolve(text, path="<cpp>", blank=None):
             # elided, and this subset only lowers the direct form. So it is
             # emitted as `A a(x)`, which becomes `A a; A_new(&a, x);`.
             out.append("%s %s(%s)" % (ty.strip(), m.group(3), ctor))
-            i = end                      # the `;` is copied through below
+            i = resume                   # the `;` is copied through below
+        elif braced:
+            # `T x { e }` is `T x = e`. The braces are consumed here, so
+            # nothing downstream has to know the spelling existed.
+            out.append(decl + " = " + init)
+            i = resume
         else:
             out.append(decl + " = ")
             i = m.end()
@@ -732,6 +887,57 @@ def resolve(text, path="<cpp>", blank=None):
 
 _NAMESPACE = re.compile(r"(?<![\w.])namespace\s+(\w+)\s*\{")
 _USING_NS = re.compile(r"(?<![\w.])using\s+namespace\s+(\w+)\s*;")
+
+
+_NAMED_CAST = re.compile(
+    r"(?<![\w.])(static_cast|reinterpret_cast|const_cast)\s*<")
+
+
+def resolve_casts(text, path="<cpp>", blank=None):
+    """Rewrite `static_cast<T>(e)` and friends to the C cast `((T)(e))`.
+
+    All three mean the same thing once the types are gone, which is what
+    C has: the distinctions between them are checks the C++ front end
+    performs, and none survives lowering. `const_cast` keeps the cast
+    rather than dropping it, because the qualifier is still written on
+    the operand and casting it away is the whole point of the call.
+
+    `dynamic_cast` is not here. It is refused in `_check_unsupported`
+    for wanting RTTI, and rewriting it to a C cast would turn a
+    diagnostic into a silent wrong answer -- the one trade this pass
+    never makes.
+    """
+    scan = blank if blank is not None else text
+    out, i = [], 0
+    while True:
+        m = _NAMED_CAST.search(scan, i)
+        if m is None:
+            out.append(text[i:])
+            break
+        lt = m.end() - 1
+        gt = _match(scan, lt, "<", ">")
+        if gt is None:
+            raise AutoError(
+                "%s:%d: `%s<` has no closing `>`"
+                % (path, _line_of(text, m.start()), m.group(1)))
+        op = gt + 1
+        while op < len(scan) and scan[op].isspace():
+            op += 1
+        if op >= len(scan) or scan[op] != "(":
+            raise AutoError(
+                "%s:%d: `%s<..>` is not followed by a parenthesised "
+                "operand" % (path, _line_of(text, m.start()), m.group(1)))
+        close = _match(scan, op, "(", ")")
+        if close is None:
+            raise AutoError(
+                "%s:%d: `%s<..>(` has no closing `)`"
+                % (path, _line_of(text, m.start()), m.group(1)))
+        ty = text[lt + 1:gt].strip()
+        operand = text[op + 1:close]
+        out.append(text[i:m.start()])
+        out.append("((%s)(%s))" % (ty, operand))
+        i = close + 1
+    return "".join(out)
 
 
 def resolve_namespaces(text, path="<cpp>", blank=None):
@@ -1019,10 +1225,15 @@ def resolve_aliases(text, path="<cpp>", blank=None):
     local, and so does a parameter. Substituting once here means every pass
     below sees the class the alias stood for without knowing aliases exist.
 
-    The typedef declarations themselves are left alone -- rewriting
+    A typedef keeps the *name* it declares -- rewriting
     `typedef vector_int int_vector;` in place would give
     `typedef vector_int vector_int;` -- so the alias keeps its name in the
-    generated C and the header stays readable.
+    generated C and the header stays readable. Only that name is held
+    back, not the whole declaration: an alias built on another alias,
+    `typedef vector<tstring> string_vector;`, has one to resolve on its
+    right-hand side, and skipping the declaration whole was how a template
+    came to be monomorphised over the alias rather than over what it names
+    -- `vector_tstring` instead of `vector_string`.
 
     Depth zero only, for the reason `_scan_typedefs` gives: a class-scoped
     `typedef .. vector;` must not be allowed to mean `vector` everywhere.
@@ -1046,7 +1257,16 @@ def resolve_aliases(text, path="<cpp>", blank=None):
     if not aliases:
         return text
     for _round in range(8):
-        spans = [(m.start(), m.end()) for m in _TYPEDEF.finditer(scan)]
+        # The declared name only: everything else in a typedef is a type
+        # to resolve like any other.
+        spans = []
+        for td in _TYPEDEF.finditer(scan):
+            nm = None
+            for w in re.finditer(r"\w+", td.group(1)):
+                nm = w
+            if nm:
+                base = td.start(1)
+                spans.append((base + nm.start(), base + nm.end()))
         out, last, changed = [], 0, False
         pat = re.compile(r"(?<![\w.>])(%s)(?![\w])"
                          % "|".join(re.escape(a) for a in sorted(aliases)))

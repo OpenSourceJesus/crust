@@ -544,8 +544,16 @@ def _member_symbol(cname, m):
     return None
 
 
-def _in_for_head(look, i):
-    """Is `i` inside the parentheses of a `for` head?
+#: The heads that may hold a declaration inside their parentheses. C++
+#: lets a condition declare a name -- `if (auto *p = f())` -- and that
+#: name is in scope for the branch, so it has to reach the symbol table
+#: the same way a `for` initialiser does. `switch` is here for the same
+#: reason; an ordinary argument list is none of these and is untouched.
+_DECL_HEADS = ("for", "if", "while", "switch")
+
+
+def _in_for_head(look, i, heads=_DECL_HEADS):
+    """Is `i` inside the parentheses of a head that may declare a name?
 
     Walks back to the `(` that is still open and checks the word before it.
     Cheap because it only runs where a declaration pattern already matched.
@@ -558,7 +566,7 @@ def _in_for_head(look, i):
             depth += 1
         elif c == "(":
             if depth == 0:
-                return _prev_word(look, k) == "for"
+                return _prev_word(look, k) in heads
             depth -= 1
         elif c in ";{}" and depth == 0:
             return False
@@ -908,8 +916,187 @@ _OUTLINE = re.compile(
 _QUOTED_INCLUDE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*"([^"]+)"[ \t]*$',
                              re.MULTILINE)
 
+#: Both spellings. Which one was written decides where it is looked for,
+#: not whether it is spliced at all: an angle include of a header sitting
+#: under an `--incdir` is this project's own, and litehtml includes its
+#: headers both ways.
+_ANY_INCLUDE = re.compile(
+    r'^[ \t]*#[ \t]*include[ \t]*(?:"([^"]+)"|<([^>]+)>)[ \t]*$',
+    re.MULTILINE)
 
-def _expand_headers(text, basedir, incdirs=(), seen=None, depth=0):
+
+#: A conditional this pass is willing to decide. Deliberately small: a
+#: name being defined or not, and the literal `0` / `1`. Anything with an
+#: operator in it -- `#if A || B`, `#if VER > 2` -- is left alone rather
+#: than half-understood, because a wrong answer here silently deletes
+#: code rather than reporting anything.
+_IFDEF = re.compile(r"^[ \t]*#[ \t]*(ifdef|ifndef)[ \t]+(\w+)[ \t]*$")
+_IF_DEFINED = re.compile(
+    r"^[ \t]*#[ \t]*if[ \t]+(!)?[ \t]*defined[ \t]*\(?[ \t]*(\w+)"
+    r"[ \t]*\)?[ \t]*$")
+_IF_LITERAL = re.compile(r"^[ \t]*#[ \t]*if[ \t]+([01])[ \t]*$")
+#: A chain of `defined(..)` tests joined by one operator. Real headers
+#: guard on a family of names -- litehtml asks
+#: `#if defined( WIN32 ) || defined( _WIN32 ) || defined( WINCE )` and
+#: puts the rest of the file inside it, so refusing this one shape left
+#: everything below it unevaluated. Still only `defined`: a comparison
+#: like `_MSC_VER < 1900` needs a value, and this pass has none.
+_DEFINED_TERM = re.compile(r"^(!)?[ \t]*defined[ \t]*\([ \t]*(\w+)[ \t]*\)$"
+                           r"|^(!)?[ \t]*defined[ \t]+(\w+)$")
+_IF_ANY = re.compile(r"^[ \t]*#[ \t]*if(?:def|ndef)?[ \t\(!]")
+_ELSE_ANY = re.compile(r"^[ \t]*#[ \t]*el(?:se|if)\b")
+_ENDIF = re.compile(r"^[ \t]*#[ \t]*endif\b")
+_DEFINE = re.compile(r"^[ \t]*#[ \t]*define[ \t]+(\w+)")
+_UNDEF = re.compile(r"^[ \t]*#[ \t]*undef[ \t]+(\w+)")
+
+
+def _cond_value(line, defines):
+    """`True`/`False` for a conditional this pass can decide, else None."""
+    m = _IFDEF.match(line)
+    if m:
+        got = m.group(2) in defines
+        return got if m.group(1) == "ifdef" else not got
+    m = _IF_DEFINED.match(line)
+    if m:
+        got = m.group(2) in defines
+        return not got if m.group(1) else got
+    m = _IF_LITERAL.match(line)
+    if m:
+        return m.group(1) == "1"
+    # `defined(A) || defined(B) || ..`, or the same with `&&`. Mixing the
+    # two would need precedence, so a line with both is left undecided
+    # rather than answered by evaluation order.
+    m = re.match(r"^[ \t]*#[ \t]*if[ \t]+(.*?)[ \t]*$", line)
+    if m and "defined" in m.group(1):
+        expr = m.group(1)
+        if "||" in expr and "&&" in expr:
+            return None
+        op = "||" if "||" in expr else ("&&" if "&&" in expr else None)
+        if op is None:
+            return None
+        vals = []
+        for part in expr.split(op):
+            part = part.strip()
+            # A redundant wrapping paren is common and means nothing here.
+            while part.startswith("(") and part.endswith(")") \
+                    and _match_paren(part, 0) == len(part) - 1:
+                part = part[1:-1].strip()
+            t = _DEFINED_TERM.match(part)
+            if not t:
+                return None
+            neg = t.group(1) or t.group(3)
+            name = t.group(2) or t.group(4)
+            got = name in defines
+            vals.append((not got) if neg else got)
+        return any(vals) if op == "||" else all(vals)
+    return None
+
+
+def _eval_conditionals(text, defines):
+    """Drop the dead branches of the conditionals this pass can decide.
+
+    A header that defines a type two ways -- litehtml's `os_types.h` gives
+    `tstring` as `std::wstring` or `std::string` under
+    `#ifndef LITEHTML_UTF8` -- contributes *both* to one translation
+    unless the conditional is resolved. Templates were then monomorphised
+    over both, producing a `vector_wstring` alongside the real one, over a
+    type the subset does not supply.
+
+    The evaluation is deliberately partial, and what it does with a
+    condition it cannot decide is the important half: the whole block is
+    passed through untouched, directives and all, for the C front end to
+    resolve as it always did. So this only ever *narrows* what reaches the
+    rest of the pass, and only where the answer is not in doubt. Nothing
+    is reported -- an undecidable `#if` is not an error, it is simply not
+    this pass's to answer.
+
+    `#define` and `#undef` in live text are tracked, which is what makes
+    an include guard resolve and what lets one header decide a later
+    one's conditionals.
+    """
+    if "#" not in text:
+        return text
+    out = []
+    lines = text.split("\n")
+    i = 0
+    # Each entry: whether this branch's lines are being kept, and whether
+    # any branch of this conditional has been taken yet.
+    stack = []
+    while i < len(lines):
+        line = lines[i]
+        live = all(s[0] for s in stack)
+
+        if _IF_ANY.match(line):
+            val = _cond_value(line, defines) if live else None
+            if val is None:
+                # Undecidable, or inside a branch already being dropped.
+                # Either way the block is copied verbatim -- and skipped
+                # over as a unit, so a nested conditional inside it is not
+                # evaluated against defines that may not apply.
+                depth, j = 0, i
+                while j < len(lines):
+                    if _IF_ANY.match(lines[j]):
+                        depth += 1
+                    elif _ENDIF.match(lines[j]):
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    j += 1
+                if live:
+                    out.extend(lines[i:j + 1])
+                i = j + 1
+                continue
+            stack.append((val, val))
+            i += 1
+            continue
+
+        if _ELSE_ANY.match(line) and stack:
+            keep, taken = stack[-1]
+            if line.lstrip().lstrip("#").lstrip().startswith("elif"):
+                val = _cond_value(re.sub(r"#\s*elif", "#if", line, count=1),
+                                  defines)
+                if val is None:
+                    # An `#elif` this pass cannot decide, in a conditional
+                    # it started to evaluate. Nothing sound is left to do
+                    # with the rest of the chain, so the whole conditional
+                    # is abandoned: emit what is left of it verbatim.
+                    depth, j = 1, i
+                    while j < len(lines) and depth > 0:
+                        j += 1
+                        if j < len(lines) and _IF_ANY.match(lines[j]):
+                            depth += 1
+                        elif j < len(lines) and _ENDIF.match(lines[j]):
+                            depth -= 1
+                    stack.pop()
+                    if all(s[0] for s in stack):
+                        out.extend(lines[i:j + 1])
+                    i = j + 1
+                    continue
+                stack[-1] = ((not taken) and val, taken or val)
+            else:
+                stack[-1] = (not taken, True)
+            i += 1
+            continue
+
+        if _ENDIF.match(line) and stack:
+            stack.pop()
+            i += 1
+            continue
+
+        if live:
+            m = _DEFINE.match(line)
+            if m:
+                defines.add(m.group(1))
+            m = _UNDEF.match(line)
+            if m:
+                defines.discard(m.group(1))
+            out.append(line)
+        i += 1
+    return "\n".join(out)
+
+
+def _expand_headers(text, basedir, incdirs=(), seen=None, depth=0,
+                    defines=None):
     """Splice in `#include "x.h"` so a class and its definitions meet.
 
     A C++ project declares members in a header and defines them in a source
@@ -917,9 +1104,19 @@ def _expand_headers(text, basedir, incdirs=(), seen=None, depth=0):
     the lowering to work at all -- it emits a class and its bodies together
     -- and the only thing that brings them together is the `#include`.
 
-    Quoted includes only. An angle-bracket one names a system header, which
-    is either supplied here (`<string>`, `<vector>`, `<memory>`) or left for
-    the C front end.
+    Both spellings are spliced, but they are looked for in different
+    places, which is what keeps the distinction meaningful. A quoted
+    include is searched from the including file's own directory first and
+    then the `--incdir` path. An angle one is searched *only* on that
+    path, and only spliced if it is found there -- a header that resolves
+    under a directory the caller named is this project's own, whichever
+    brackets it was written with, and litehtml includes its own headers
+    both ways.
+
+    Anything not found under an `--incdir` is left exactly as written, so
+    `<string.h>` still goes to the C front end and `<string>` still
+    reaches the supplied containers. The rule never widens on its own:
+    with no `--incdir` at all, no angle include is ever spliced.
 
     Each header is spliced once, which is what an include guard would do and
     saves having to understand `#pragma once` or the `#ifndef` idiom. A
@@ -929,19 +1126,29 @@ def _expand_headers(text, basedir, incdirs=(), seen=None, depth=0):
     """
     if seen is None:
         seen = set()
+    if defines is None:
+        defines = set()
     if depth > 32:
         raise CppError("`#include` nested more than 32 deep; a cycle?")
+    # Before the includes are looked for, not after: an `#include` in a
+    # branch that is not taken should never be followed, and a header can
+    # `#define` a name that decides a later one's conditionals -- which is
+    # how litehtml's LITEHTML_UTF8 reaches os_types.h.
+    text = _eval_conditionals(text, defines)
     out, last = [], 0
-    for m in _QUOTED_INCLUDE.finditer(text):
-        name = m.group(1)
+    for m in _ANY_INCLUDE.finditer(text):
+        name = m.group(1) or m.group(2)
+        angled = m.group(1) is None
         out.append(text[last:m.start()])
         last = m.end()
         # The including file's own directory first, then the search path --
         # the same order a C++ build uses, and the reason a project whose
         # headers live in `include/` rather than beside the source resolves
-        # at all.
+        # at all. An angle include skips the first of those: it is not
+        # relative to the includer, and searching there would make
+        # `<string>` mean a file that happened to sit beside the source.
         inner = cand = None
-        for d in [basedir] + list(incdirs):
+        for d in (list(incdirs) if angled else [basedir] + list(incdirs)):
             trial = os.path.normpath(os.path.join(d, name))
             if trial in seen:
                 cand = trial
@@ -960,7 +1167,7 @@ def _expand_headers(text, basedir, incdirs=(), seen=None, depth=0):
             continue                     # already spliced: an include guard
         seen.add(cand)
         out.append(_expand_headers(inner, os.path.dirname(cand), incdirs,
-                                   seen, depth + 1))
+                                   seen, depth + 1, defines))
     out.append(text[last:])
     return "".join(out)
 
@@ -3416,7 +3623,7 @@ def _rewrite_calls(text, cinfo, free_refs):
     # syntax, they are the shapes whose lowering would need an element count
     # stored beside the allocation.
     new_re = re.compile(r"(?<![\w.>])new\s+(\w+)\s*(\[)?")
-    del_re = re.compile(r"(?<![\w.>])delete\s*(\[\s*\])?\s*")
+    del_re = re.compile(r"(?<![\w.>])delete\b\s*(\[\s*\])?\s*")
     # As in `_rewrite_scopes`: match against comment-blanked text so a `.`
     # or a parenthesis inside prose cannot be read as code. Same length, so
     # the indices address `text`, which is what is emitted.
@@ -4295,6 +4502,24 @@ _STD_CLASSES = frozenset(("string", "vector", "ownvector",
                           "enable_shared_from_this"))
 
 
+#: `<cstdint>` and friends: the C headers under their C++ spellings. The
+#: mapping is `c<name>` -> `<name>.h` for every one of them, but it is
+#: written out rather than computed so that a header this subset has no
+#: story for cannot be silently invented -- `<cmath>` is here because
+#: `<math.h>` exists, and `<cstring>` is *not* `<string>`.
+_CXX_C_HEADERS = {
+    "cstdint": "stdint", "cstring": "string", "cstdlib": "stdlib",
+    "cstdio": "stdio", "cstddef": "stddef", "cctype": "ctype",
+    "cmath": "math", "cassert": "assert", "climits": "limits",
+    "cwchar": "wchar", "cerrno": "errno", "ctime": "time",
+    "cstdarg": "stdarg", "cfloat": "float", "clocale": "locale",
+    "csignal": "signal", "csetjmp": "setjmp", "cwctype": "wctype",
+}
+
+_CXX_C_HEADER = re.compile(
+    r"#\s*include\s*<\s*(%s)\s*>" % "|".join(sorted(_CXX_C_HEADERS)))
+
+
 def _std_prelude(text):
     """Strip `std::`, drop `#include <vector|string>`, and supply the classes.
 
@@ -4326,6 +4551,14 @@ def _std_prelude(text):
     if re.search(r"(?<![\w])(?:bool|true|false)(?![\w])", probe) \
             and not re.search(r"include\s*[<\"]stdbool\.h", probe):
         bool_prefix = "#include <stdbool.h>\n"
+    # C++ spells the C headers without the `.h` and with a leading `c`.
+    # They name the same headers, so the spelling is rewritten rather than
+    # the include dropped -- the declarations are still wanted. Only this
+    # fixed list: `<string>` is `std::string`, a different thing entirely
+    # from `<string.h>`, and the rest of the STL is not this pass's to
+    # supply.
+    text = _CXX_C_HEADER.sub(
+        lambda m: "#include <%s.h>" % _CXX_C_HEADERS[m.group(1)], text)
     if not wanted:
         return bool_prefix + text
     text = _STD_INCLUDE.sub("", text)
@@ -4675,7 +4908,7 @@ def _lower_lambdas(text, path):
 
 
 def translate(text, path="<cpp>", owning=None, basedir=None,
-              incdirs=()):
+              incdirs=(), defines=()):
     """Translate a C++ subset source to C. Raises CppError on anything else.
 
     `owning` maps the name of a type this file does *not* define to the
@@ -4687,8 +4920,12 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     # so everything below sees one file with no special cases in it.
     # Headers first, before anything reads a declaration: a member declared
     # in one and defined here has to arrive in the same translation.
-    if basedir is not None:
-        text = _expand_headers(text, basedir, incdirs)
+    # An `--incdir` is enough on its own: an angle include is searched only
+    # there, so a caller that supplies a path but no basedir still gets its
+    # headers spliced.
+    if basedir is not None or incdirs:
+        text = _expand_headers(text, basedir or ".", incdirs,
+                               defines=set(defines or ()))
     text = _std_prelude(text)
     std_classes = _STD_CLASSES
     # Lambdas are lowered before anything else looks at the file: what comes
@@ -4735,6 +4972,11 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
         text = cpp_auto.resolve_range_for(
             text, os.path.basename(path), blank=cpp_auto._blank_like(text))
         text = cpp_auto.resolve(
+            text, os.path.basename(path), blank=cpp_auto._blank_like(text))
+        # After `auto`, which deduces *from* a cast's written type, and
+        # before anything that reads an expression -- a surviving
+        # `static_cast<T>(e)` reads as a comparison to everything below.
+        text = cpp_auto.resolve_casts(
             text, os.path.basename(path), blank=cpp_auto._blank_like(text))
     except cpp_auto.AutoError as e:
         raise CppError(e.message)
@@ -4906,6 +5148,37 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
                  if n not in declared)
     prev = 0
     fwd, fwd_protos, outline_bodies = [], [], []
+    # A class this translation only ever *declares* -- `class element;` with
+    # the definition in a header nobody here included. C++ allows that
+    # wherever the type is used through a pointer, which is exactly what a
+    # `shared_ptr<element>` does, so litehtml leans on it heavily; the
+    # instantiation is then emitted over a name C has never heard of.
+    #
+    # The declaration lowers the same way a definition's does, minus the
+    # body: a struct tag and the typedef that lets the rest of the output
+    # spell it without `struct`. Which class is *complete* where is
+    # untouched by this -- a by-value member of one still needs a
+    # definition, and still says so.
+    defined = set(c.name for (_s, _e, c) in classes)
+    fwd_only = []
+    for m in re.finditer(r"(?<![\w])(?:class|struct)\s+(\w+)\s*;", scan):
+        name = m.group(1)
+        if name in defined or name in fwd_only:
+            continue
+        fwd_only.append(name)
+    for name in fwd_only:
+        fwd.append("struct %s;" % name)
+        fwd.append("typedef struct %s %s;" % (name, name))
+    if fwd_only:
+        # The C++ spelling is dropped where it stood: `class X;` is not C,
+        # and the lowered pair has already been hoisted above everything
+        # that could name it. Blanked to the same length rather than cut
+        # out -- the class spans found above are offsets into this text,
+        # and shifting it under them moves every one of them.
+        pat = re.compile(r"(?<![\w])class\s+(%s)\s*;"
+                         % "|".join(re.escape(n) for n in fwd_only))
+        text = pat.sub(lambda m: " " * len(m.group(0)), text)
+        scan = pat.sub(lambda m: " " * len(m.group(0)), scan)
     # Where each class sits, so an instantiation can be held back until the
     # classes it is built over are complete.
     at = dict((c.name, k) for k, (_s, _e, c) in enumerate(classes))
@@ -5098,6 +5371,14 @@ def main(argv):
     owning = {}
     basedir = None
     incdirs = []
+    defines = []
+    while "-D" in args:
+        i = args.index("-D")
+        if i + 1 >= len(args):
+            sys.stderr.write("cpprust: -D needs a name\n")
+            return 2
+        defines.append(args[i + 1].split("=")[0])
+        del args[i:i + 2]
     while "--incdir" in args:
         i = args.index("--incdir")
         if i + 1 >= len(args):
@@ -5133,7 +5414,7 @@ def main(argv):
     if len(args) != 1 or out_path is None:
         sys.stderr.write("usage: cpprust.py <source.cpp> -o <out.c> "
                          "[--owning Name:dropfn,..] [--basedir DIR] "
-                         "[--incdir DIR]..\n")
+                         "[--incdir DIR].. [-D NAME]..\n")
         return 2
 
     src = args[0]
@@ -5148,7 +5429,8 @@ def main(argv):
         if basedir is None:
             basedir = os.path.dirname(os.path.abspath(src))
         result = translate(text, path=src, owning=owning,
-                           basedir=basedir, incdirs=incdirs)
+                           basedir=basedir, incdirs=incdirs,
+                           defines=defines)
     except CppError as e:
         # The message goes where the output would have gone; the caller
         # reads it back and reports it against the `#include` line.
