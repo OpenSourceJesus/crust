@@ -801,6 +801,13 @@ def resolve_namespaces(text, path="<cpp>", blank=None):
                     "become one symbol. Rename one of them."
                     % (path, _line_of(text, m.start()), ns, name, target))
         for name in sorted(declared, key=len, reverse=True):
+            # Already flattened -- by this pass, when an earlier block of the
+            # same namespace declared it and pushed the rename outward. A
+            # forward declaration in one header and the definition in another
+            # is exactly that shape, and prefixing again gave
+            # `litehtml_litehtml_html_tag`.
+            if name.startswith(ns + "_") and name in produced:
+                continue
             body = _sub_name(body, _blank_like(body), name, ns + "_" + name)
             body_scan = _blank_like(body)
             produced.add(ns + "_" + name)

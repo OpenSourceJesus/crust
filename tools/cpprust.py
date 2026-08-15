@@ -1221,6 +1221,26 @@ def _blank_spans(text, spans):
     return "".join(out)
 
 
+def _derives_from(cls, tname, targs):
+    """Does `cls` derive from `tname<targs>`, however it is spelled?
+
+    Compared against the *written* base, since this runs before the base is
+    monomorphised: `class node : public enable_shared_from_this<node>` is
+    the shape, and whitespace is the only thing that varies.
+    """
+    if cls.base is None:
+        return False
+    want = "%s<%s>" % (tname, ",".join(t.strip() for t in targs))
+    return re.sub(r"\s+", "", cls.base) == want
+
+
+def _base_name(targ):
+    """The class name a template argument names, ignoring `*`, `&`, `const`."""
+    t = re.sub(r"\b(?:const|volatile)\b", " ", targ)
+    t = t.replace("*", " ").replace("&", " ").strip()
+    return t.split()[0] if t.split() else targ.strip()
+
+
 def _mono_name(name, targs):
     """The monomorphised name for `name<targs..>`."""
     return "%s_%s" % (name, "_".join(_mangle(a) for a in targs))
@@ -1404,8 +1424,14 @@ _SCALAR_TYPES = frozenset((
     "long", "char", "bool", "int", "size_t"))
 
 
-def _expand_cpp_ref(params, known):
+def _expand_cpp_ref(params, names):
     """`__cpp_ref(T)` -> `T` for a scalar, `const T &` for a class.
+
+    `known` here is every class *name* in the translation, not the classes
+    emitted so far. The question is whether `T` is a class, which does not
+    depend on emission order -- and the supplied containers are emitted
+    above the user's classes by construction, so asking the emitted set gave
+    `vector<floated_box>` a by-value `push_back` for an owning element.
 
     A container cannot pick one spelling for both. By value it refuses an
     owning key -- the copy is never constructed or destroyed -- and by
@@ -1416,7 +1442,7 @@ def _expand_cpp_ref(params, known):
     return _sub_code(
         re.compile(r"(?<![\w.>])__cpp_ref\s*\(\s*([\w:]+)\s*\)"),
         lambda mm: ("const %s &" % mm.group(1)
-                    if mm.group(1) in known else mm.group(1)),
+                    if mm.group(1) in names else mm.group(1)),
         params)
 
 
@@ -1876,7 +1902,7 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
         # and by reference it cannot bind `m[3]`, since a literal has no
         # address. So the spelling is decided per instantiation, like the
         # copy and destroy steps beside it.
-        params = _expand_cpp_ref(params, known)
+        params = _expand_cpp_ref(params, names)
         refs = _ref_positions(params, _with_scalars(names))
         # A *scalar* reference parameter needs its uses dereferenced. A class
         # one does not: every use of it is a member access, and the symbol
@@ -1931,7 +1957,7 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
         if m.declared_only:
             # Prototype only. `emit` writes both, so the declaration is made
             # here and the definition left to whoever has the body.
-            dparams = _lower_refs(_expand_cpp_ref(sub(m.params or ""), known),
+            dparams = _lower_refs(_expand_cpp_ref(sub(m.params or ""), names),
                                   _with_scalars(names))
             mname = _member_symbol(cname, m)
             if mname is not None:
@@ -1977,7 +2003,7 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             info["index"] = {"fn": "%s__index" % cname,
                              "ret": tsub(iret.replace("&", "").strip()),
                              "refs": _ref_positions(
-                                 _expand_cpp_ref(params, known),
+                                 _expand_cpp_ref(params, names),
                                  _with_scalars(names))}
             # The body returns the element; the lowered function returns
             # its address, which is what a reference is.
@@ -2192,6 +2218,51 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
     # its typedef, which is all a pointer field to a class defined later
     # needs -- and that is the shape a template instantiated over a class
     # declared below it always has.
+    # An implicit copy constructor, when the class has members that need one
+    # and declares none. C++ writes one member-wise, and so does this -- the
+    # implicit *destructor* built from the same members already exists, and a
+    # class with one and no way to be copied cannot go in a container.
+    # C++ deletes the implicit copy when a member cannot be copied, and so
+    # does this: a member that owns something and offers no copy constructor
+    # -- a Crust `Vec_int` among them -- has no member-wise copy to write,
+    # and generating one would duplicate the thing it owns.
+    copyable = all(not (known[b]["dtor"] and not known[b]["copy"])
+                   for _n, b in value_members if b in known)
+    # Only when there is a class-typed member to copy. Plain data keeps its
+    # bitwise copy, which is what C++ does and what the rest of this pass
+    # expects; and a class whose only owned thing is a *raw pointer* still
+    # gets the Rule of Three refusal, because there is no member that knows
+    # how to duplicate what it points at.
+    if not info["copy"] and copy is None and copyable and value_members:
+        lines = []
+        if base and known[base]["copy"]:
+            lines.append("%s_copy(&this->_base, &o->_base);" % base)
+        elif base:
+            lines.append("this->_base = o->_base;")
+        for f in fields:
+            if f.dim:
+                continue                 # an array member is not assignable
+            lines.append("__cpp_copy(%s, this->%s, &o->%s);"
+                         % (info["fields"].get(f.name, ("", False))[0]
+                            or "int", f.name, f.name)
+                         if info["fields"].get(f.name, ("", False))[0]
+                         in known and not info["fields"][f.name][1]
+                         else "this->%s = o->%s;" % (f.name, f.name))
+        if lines:
+            emit("void", "%s_copy" % cname,
+                 "const %s &o" % cname, " " + " ".join(lines))
+            info["copy"] = True
+            # And the implicit assignment, which C++ generates on the same
+            # terms. It has to release what is already there first, and
+            # guard self-assignment -- `a = a` would otherwise destroy the
+            # object and then copy from the wreckage.
+            if not info["assign"]:
+                emit("void", "%s__assign" % cname, "const %s &o" % cname,
+                     " if (this != o) {%s %s }"
+                     % (_member_epilogue(value_members, known),
+                        " ".join(lines)))
+                info["assign"] = True
+
     # A class that carries `enable_shared_from_this`'s members gets the
     # function `shared_ptr` calls to hand it the control block. Emitted with
     # the class, where its fields are complete.
@@ -3617,6 +3688,14 @@ def _rewrite_calls(text, cinfo, free_refs):
                 out.append("%s(&%s)" % (_dropfn(cinfo[ty], ty), parts[1])
                            if cinfo[ty]["dtor"] else "(void)0")
             else:
+                if not cinfo[ty]["copy"] and not cinfo[ty]["dtor"]:
+                    # Neither a copy constructor nor a destructor: the class
+                    # owns nothing, so copying it *is* assignment -- which is
+                    # what C++ does for one too. The refusal below is about
+                    # duplicating something owned.
+                    out.append("(%s) = (%s)" % (parts[1], parts[2]))
+                    i = close + 1
+                    continue
                 if not cinfo[ty]["copy"]:
                     raise CppError(
                         "`__cpp_copy(%s, ..)`: %s has no copy constructor, "
@@ -4827,7 +4906,44 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
                  if n not in declared)
     prev = 0
     fwd, fwd_protos, outline_bodies = [], [], []
-    for start, end, cls in classes:
+    # Where each class sits, so an instantiation can be held back until the
+    # classes it is built over are complete.
+    at = dict((c.name, k) for k, (_s, _e, c) in enumerate(classes))
+    deferred = {}
+    for idx, (start, end, cls) in enumerate(classes):
+        insts = wanted.get(cls.name, []) if cls.tparams else [None]
+        for targs in insts or []:
+            if not targs:
+                continue
+            need = max([at.get(_base_name(a), -1) for a in targs] + [-1])
+            # Unless the class it depends on *derives* from it. That is the
+            # CRTP shape -- `class node : public enable_shared_from_this<node>`
+            # -- and there the base has to come first. It can: such a base
+            # holds a `T *`, never a `T`, so it needs no complete type.
+            if need > idx and _derives_from(classes[need][2],
+                                            cls.name, targs):
+                need = -1
+            if need > idx:
+                # `vector<floated_box>` copies and destroys its elements, so
+                # its body needs `floated_box` *complete* -- and the supplied
+                # containers are emitted above the user's classes by
+                # construction. Held back to just after the class it needs.
+                deferred.setdefault(need, []).append((cls, targs))
+
+    def emit_one(cls, targs):
+        (names_, protos, defs, tails), cname, info = _emit_class(
+            cls, names, cinfo, tsub, targs, new_used.get(cls.name),
+            chained, cls.name in std_classes)
+        # Trailing newline: two instantiations of the same template are
+        # emitted back to back, and without it the last line of one runs
+        # into the first line of the next.
+        pieces.append("\n".join(defs) + "\n")
+        fwd.extend(names_)
+        fwd_protos.extend(protos)
+        outline_bodies.extend(tails)
+        cinfo[cname] = info
+
+    for idx, (start, end, cls) in enumerate(classes):
         # Keep everything before the class, minus any `template<..>` header,
         # which has no C equivalent.
         head = text[prev:start]
@@ -4835,18 +4951,17 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
         pieces.append(head)
         insts = wanted.get(cls.name, []) if cls.tparams else [None]
         for targs in insts:
-            (names_, protos, defs, tails), cname, info = _emit_class(
-                cls, names, cinfo, tsub, targs, new_used.get(cls.name),
-                chained, cls.name in std_classes)
-            # Trailing newline: two instantiations of the same template are
-            # emitted back to back, and without it the last line of one runs
-            # into the first line of the next.
-            pieces.append("\n".join(defs) + "\n")
-            fwd.extend(names_)
-            fwd_protos.extend(protos)
-            outline_bodies.extend(tails)
-            cinfo[cname] = info
+            # Compared on the *template* as well as the arguments: two
+            # templates instantiated over the same class share `targs`, and
+            # matching on those alone held back an instantiation that was
+            # never deferred.
+            if targs and any(c.name == cls.name and t == targs
+                             for ps in deferred.values() for c, t in ps):
+                continue                 # emitted after what it is built on
+            emit_one(cls, targs)
         prev = end
+        for dcls, dtargs in deferred.get(idx, []):
+            emit_one(dcls, dtargs)
     pieces.append(text[prev:])
     # Bodies defined out of line go after everything, not at the class: the
     # author wrote them below whatever file-scope names they read, and a
