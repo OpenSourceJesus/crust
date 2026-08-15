@@ -270,6 +270,100 @@ class Rustc(unittest.TestCase):
         self.assertEqual(code, 0, err)
 
 
+class Operators(unittest.TestCase):
+    """The eight member kinds that used to be dropped on the floor."""
+
+    def test_subscript_returns_a_borrow(self):
+        """`T &operator[](int)` returning `&mut T` with an elided lifetime is
+        what makes the borrow checker responsible for the result -- the one
+        claim this pass could not previously back."""
+        rust = raise_src(
+            "class A { public: int d[4]; int &operator[](int i)"
+            " { return d[i]; } };")
+        self.assertIn("fn index_op(&mut self, i: i32) -> &mut i32", rust)
+
+    def test_assignment_operator_is_kept(self):
+        rust = raise_src(
+            "class A { public: int *p; ~A() { }\n"
+            "  A &operator=(const A &o) { return *this; } };")
+        self.assertIn("fn assign_op", rust)
+
+    def test_comparison_operator_is_named(self):
+        rust = raise_src(
+            "class P { public: int x; int operator==(const P &o)"
+            " { return 0; } };")
+        self.assertIn("fn cmp_eq", rust)
+
+    def test_anonymous_union_is_reported_not_flattened(self):
+        """Flattening would give each member of one storage its own drop --
+        a double free this pass would have invented rather than found."""
+        with self.assertRaises(cpp2rust.RustError) as cm:
+            raise_src("class L { union { float v; int p; }; public: int q; };")
+        self.assertIn("double free", cm.exception.message)
+
+
+class Heap(unittest.TestCase):
+
+    NODE = """
+class Node { public: int v; Node() { v = 0; } ~Node() { } };
+"""
+
+    def test_new_becomes_a_box(self):
+        rust = raise_src(self.NODE + """
+int main(void) { Node *a = new Node(); delete a; return 0; }
+""", mode="ownership")
+        self.assertIn("Box::new(Node::new())", rust)
+        self.assertIn("drop(a);", rust)
+
+    def test_double_delete_is_a_move(self):
+        """`delete p` moves the box out, so a second one is a use of a moved
+        value -- the double free reported as the thing it is."""
+        rust = raise_src(self.NODE + """
+int main(void) { Node *a = new Node(); delete a; delete a; return 0; }
+""", mode="ownership")
+        body = rust[rust.index("pub fn __own_main"):]
+        self.assertEqual(body.count("drop(a);"), 2,
+                         "both deletes should survive, so rustc sees the "
+                         "second as a use of a moved value")
+
+    def test_use_after_delete_survives(self):
+        rust = raise_src(self.NODE + """
+int printf(const char *, ...);
+int main(void) { Node *a = new Node(); delete a; printf("%d", a->v); return 0; }
+""", mode="ownership")
+        body = rust[rust.index("pub fn __own_main"):]
+        self.assertLess(body.index("drop(a);"), body.index("let _ = &a;"))
+
+
+class FreeFunctions(unittest.TestCase):
+
+    def test_signature_is_emitted(self):
+        rust = raise_src(
+            "class A { public: int x; };\n"
+            "int f(A *p, int k) { return k; }")
+        self.assertIn("pub fn f(p: *mut A, k: i32) -> i32", rust)
+
+    def test_parameters_are_declared_in_the_skeleton(self):
+        """A class-typed parameter is live for the whole body. With an empty
+        parameter list every statement reading one was erased by the guard,
+        and the function was checked for nothing."""
+        rust = raise_src(
+            "class A { public: int *p; ~A() { } int get() { return 0; } };\n"
+            "int f(A a) { return a.get(); }", mode="ownership")
+        self.assertIn("pub fn __own_f(a: A)", rust)
+        body = rust[rust.index("pub fn __own_f"):]
+        # Read through the fallback rather than as a statement-position
+        # call, since `return a.get();` is a return. Either way `a` is live
+        # here, which is the whole point of declaring it.
+        self.assertIn("&a", body)
+
+    def test_variadic_prototype_is_skipped(self):
+        rust = raise_src(
+            "class A { public: int x; };\n"
+            "int printf(const char *f, ...);")
+        self.assertNotIn("pub fn printf", rust)
+
+
 if __name__ == "__main__":
     if not HAVE_RUSTC:
         sys.stderr.write(

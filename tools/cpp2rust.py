@@ -242,7 +242,7 @@ class RClass(object):
     """
 
     __slots__ = ("cls", "name", "fields", "methods", "ctors", "dtor",
-                 "copy_ctor", "base", "virtuals", "owns")
+                 "copy_ctor", "assign_op", "base", "virtuals", "owns")
 
     def __init__(self, cls):
         self.cls = cls
@@ -253,6 +253,7 @@ class RClass(object):
         self.ctors = []
         self.dtor = None
         self.copy_ctor = None
+        self.assign_op = None
         self.virtuals = []
         self.owns = False
 
@@ -313,6 +314,45 @@ def _instantiate(cls, targs, tsub):
                          sub(cls.base) if cls.base else None)
 
 
+# The operator kinds `cpprust._split_members` produces, and the Rust method
+# name each becomes. Spelled out rather than derived: the name has to be a
+# Rust identifier, and a table cannot mis-spell one.
+_OPNAME = {
+    "assign": "assign_op",
+    "index": "index_op",
+    "arrow": "arrow_op",
+    "star": "deref_op",
+    "conv": "conv_op",
+}
+
+_CMPNAME = {
+    "==": "cmp_eq", "!=": "cmp_ne", "<": "cmp_lt",
+    "<=": "cmp_le", ">": "cmp_gt", ">=": "cmp_ge",
+}
+
+_AUGNAME = {
+    "+=": "aug_add", "-=": "aug_sub", "*=": "aug_mul", "/=": "aug_div",
+    "%=": "aug_rem", "|=": "aug_or", "&=": "aug_and", "^=": "aug_xor",
+}
+
+# Kinds that reach here as ordinary methods once renamed. `index` and `star`
+# are the interesting ones: both return a reference, which is where this pass
+# stops taking cpprust's word for the lifetimes and has rustc check them.
+_OPERATOR_KINDS = frozenset(
+    list(_OPNAME) + ["cmp", "augassign"])
+
+
+def _op_method_name(m):
+    """The Rust name for an operator member."""
+    if m.kind == "cmp":
+        op = m.name.replace("operator", "").strip()
+        return _CMPNAME.get(op)
+    if m.kind == "augassign":
+        op = m.name.replace("operator", "").strip()
+        return _AUGNAME.get(op)
+    return _OPNAME.get(m.kind)
+
+
 def read_class(cls, classes, owning):
     """Sort a cpprust Class into the shape the Rust emitter wants."""
     rc = RClass(cls)
@@ -334,6 +374,38 @@ def read_class(cls, classes, owning):
             rc.methods.append(m)
             if m.virt or m.pure:
                 rc.virtuals.append(m)
+        elif m.kind in _OPERATOR_KINDS:
+            name = _op_method_name(m)
+            if name is None:
+                raise RustError(
+                    "class %s: `%s` is an operator this pass has no Rust "
+                    "spelling for. It is dropped rather than guessed at, "
+                    "which would make the check quieter without saying so."
+                    % (cls.name, m.name))
+            # Renamed in place. Nothing below this point cares that it was
+            # an operator -- a `operator[]` returning `T &` is a method
+            # returning a reference, and that is the whole of what the
+            # borrow checker needs to know about it.
+            op = _clone_member(m, m.ret, m.params, m.dim)
+            op.name = name
+            op.kind = "method"
+            rc.methods.append(op)
+            if m.kind == "assign":
+                rc.assign_op = op
+        elif m.kind == "anon":
+            # An anonymous union contributes its members to the class, and
+            # flattening them here would give each one its own drop -- two
+            # owning members over one storage, which is a double free this
+            # pass would have invented. C++ does not allow an owning member
+            # in a union without saying so, but this pass cannot check that,
+            # so it says what it cannot do instead of guessing.
+            raise RustError(
+                "class %s: an anonymous union or struct member is not "
+                "raised. Its members share storage, and giving each one a "
+                "Rust field would give each one a drop -- inventing a double "
+                "free. Name the union (`union { .. } u;`) so it is one "
+                "member, or check this file with `cpprust.py` alone."
+                % cls.name)
     return rc
 
 
@@ -554,7 +626,66 @@ _DECL_PLAIN = re.compile(r"^\s*(\w+)\s+(\w+)\s*;")
 _METHOD_CALL = re.compile(r"^\s*([\w.]+)\s*(?:\.|->)\s*(\w+)\s*\(([^;]*)\)\s*;")
 
 
-def skeleton(body, rc, table, classes, owning, where):
+_DECL_NEW = re.compile(
+    r"^\s*(\w+)\s*\*\s*(\w+)\s*=\s*new\s+(\w+)\s*(?:\(([^;]*)\))?\s*;")
+_DELETE = re.compile(r"^\s*(?:if\s*\([^)]*\)\s*)?delete\s+(\w+)\s*;")
+
+
+def _statements(body):
+    """Split a body into statements and block braces.
+
+    Splitting on newlines was wrong and quietly so: a body written
+    `{ Node *a = new Node(); delete a; }` is one line, so everything after
+    the first statement was dropped and the function checked for nothing.
+    Braces are yielded on their own because they are what decides when a
+    destructor runs.
+    """
+    out = []
+    depth = 0
+    cur = []
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if ch in "\"'":
+            # A string may hold a brace or a semicolon and means neither.
+            j = i + 1
+            while j < len(body):
+                if body[j] == "\\":
+                    j += 2
+                    continue
+                if body[j] == ch:
+                    break
+                j += 1
+            cur.append(body[i:j + 1])
+            i = j + 1
+            continue
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        if depth == 0 and ch == ";":
+            cur.append(";")
+            out.append("".join(cur).strip())
+            cur = []
+            i += 1
+            continue
+        if depth == 0 and ch in "{}":
+            rest = "".join(cur).strip()
+            if rest:
+                out.append(rest)
+            cur = []
+            out.append(ch)
+            i += 1
+            continue
+        cur.append(ch)
+        i += 1
+    rest = "".join(cur).strip()
+    if rest:
+        out.append(rest)
+    return out
+
+
+def skeleton(body, rc, table, classes, owning, where, known=None):
     """Translate a body down to what can violate ownership.
 
     Kept: constructing a local, copying one, calling a method on one,
@@ -581,9 +712,9 @@ def skeleton(body, rc, table, classes, owning, where):
     # a use of something that does not exist -- a diagnostic about this pass,
     # dressed as a finding about the source. Quieter is a cost; wrong is not
     # allowed.
-    known = set()
+    known = set(known or ())
 
-    for raw in body.split("\n"):
+    for raw in _statements(body):
         line = raw.strip()
         if not line or line.startswith("//"):
             continue
@@ -596,6 +727,26 @@ def skeleton(body, rc, table, classes, owning, where):
                 out.append(stmt)
                 return True
             return False
+
+        # `T *p = new T(..)` is an owned allocation, and `Box` is Rust's.
+        # The pairing is what earns the check: `delete p` moves the box out,
+        # so a second `delete p` -- or any read of `p` after one -- is a use
+        # of a moved value, which is the double free and the use-after-free
+        # reported as one thing.
+        m = _DECL_NEW.match(line)
+        if m and m.group(3) in table:
+            pname, cname = m.group(2), m.group(3)
+            target = table[cname]
+            ctor = _ctor_for(target, cpprust._arity(m.group(4) or ""))
+            out.append("    let mut %s = Box::new(%s::%s());   // new %s"
+                       % (pname, cname, ctor, cname))
+            known.add(pname)
+            continue
+
+        m = _DELETE.match(line)
+        if m:
+            emitted("    drop(%s);   // delete" % m.group(1), [m.group(1)])
+            continue
 
         m = _DECL_CTOR.match(line)
         if m and m.group(1) in table and m.group(2) not in ("if", "while",
@@ -614,9 +765,7 @@ def skeleton(body, rc, table, classes, owning, where):
                 known.add(vname)
             elif not src or not re.match(r"^\w+$", src):
                 out.append("    let mut %s = %s::%s();" % (
-                    vname, cname,
-                    _ctor_name(target, target.ctors[0])
-                    if target.ctors else "new"))
+                    vname, cname, _ctor_for(target, cpprust._arity(args))))
                 known.add(vname)
             continue
 
@@ -638,7 +787,8 @@ def skeleton(body, rc, table, classes, owning, where):
         if m and m.group(1) in table:
             cname, vname = m.group(1), m.group(2)
             target = table[cname]
-            out.append("    let mut %s = %s::new();" % (vname, cname))
+            out.append("    let mut %s = %s::%s();"
+                       % (vname, cname, _ctor_for(target, 0)))
             known.add(vname)
             continue
 
@@ -697,6 +847,19 @@ def _reads(line, known, exclude=()):
             seen.add(tok)
             out.append(tok)
     return out
+
+
+def _ctor_for(target, arity):
+    """The constructor of a given argument count, by the scheme cpprust uses.
+
+    Constructors are told apart by arity here as they are there, since a
+    call site is matched before types are known and arity is all there is
+    to resolve on.
+    """
+    for c in target.ctors:
+        if cpprust._arity(c.params or "") == arity:
+            return _ctor_name(target, c)
+    return _ctor_name(target, target.ctors[0]) if target.ctors else "new"
 
 
 def _copy_expr(src, target):
@@ -887,22 +1050,106 @@ def raise_to_rust(text, path="<cpp>", owning=None, incdirs=(), defines=(),
     for rc in order:
         lines.extend(emit_class(rc, table, classes, owning, mode))
 
+    if mode == "types":
+        spans = [(s, e) for s, e, _c in found]
+        lines.extend(emit_free_functions(
+            _free_functions(text, scan, spans), table, classes, owning))
+
     if mode == "ownership":
         # Class bodies are blanked first. A method defined inside one is not
         # a free function, and reading it as one produced a skeleton called
         # `__own_head` over a body whose `this` nothing had declared.
         spans = [(s, e) for s, e, _c in found]
-        lines.extend(_emit_skeletons(
-            text, cpprust._blank_spans(scan, spans), table, classes, owning))
+        lines.extend(emit_free_functions(
+            _free_functions(text, scan, spans), table, classes, owning))
+        lines.extend(_emit_skeletons(text, scan, table, classes, owning,
+                                     spans))
 
     return "\n".join(lines) + "\n"
 
 
 _FREE_FN = re.compile(
-    r"(?<![\w:])(\w[\w\s*&]*?)\s+(\w+)\s*\(([^;{)]*)\)\s*\{")
+    r"(?<![\w:])([A-Za-z_][\w\s*&]*?)\s+(\w+)\s*\(([^;{)]*)\)\s*\{")
+
+_NOT_A_FN = frozenset((
+    "if", "else", "while", "for", "do", "switch", "return", "sizeof",
+    "catch", "and", "or", "not"))
 
 
-def _emit_skeletons(text, scan, table, classes, owning):
+def _free_functions(text, scan, spans):
+    """Every function defined at file scope, with its written signature.
+
+    Class bodies are blanked first: a method defined inside one is not a
+    free function, and reading it as one produced a skeleton over a body
+    whose receiver nothing had declared.
+    """
+    blanked = cpprust._blank_spans(scan, spans)
+    out = []
+    for m in _FREE_FN.finditer(blanked):
+        name = m.group(2)
+        if name in _NOT_A_FN:
+            continue
+        # A variadic prototype belongs to the C library, not to this
+        # translation. Rust can declare one, but nothing here calls it and a
+        # `...` parameter is not worth the spelling.
+        if "..." in m.group(3):
+            continue
+        brace = m.end() - 1
+        close = cpprust._match_brace(text, brace)
+        if close is None:
+            continue
+        out.append((m.group(1).strip(), name, m.group(3),
+                    text[brace + 1:close]))
+    return out
+
+
+def emit_free_functions(fns, table, classes, owning):
+    """Signatures at file scope, bodies stubbed.
+
+    Worth emitting even with no body: a signature is where a type is
+    written, so this is what makes a parameter or return naming a class the
+    borrow checker's business rather than a comment.
+    """
+    out = []
+    for ret, name, params, _body in fns:
+        where = "function %s" % name
+        try:
+            sig = _params_text(params, classes, owning, where)
+            rty = parse_type(ret)
+            rs = "" if rty is None or (rty.base == "void" and not rty.ptr
+                                       and not rty.ref) \
+                else " -> %s" % rust_type(rty, classes, owning, where)
+        except RustError:
+            # A file-scope function whose signature cannot be spelled is
+            # skipped rather than reported. Unlike a class it carries no
+            # ownership on its own, and refusing the file over one prototype
+            # would lose every check the classes in it were going to get.
+            continue
+        out.append("pub fn %s(%s)%s { unimplemented!() }" % (name, sig, rs))
+    if out:
+        out.insert(0, "// ---- file-scope functions ----")
+        out.append("")
+    return out
+
+
+def _params_text(params, classes, owning, where):
+    """Translate a written parameter list with no receiver in front."""
+    got = []
+    for part in cpprust._split_top(params or ""):
+        part = part.strip()
+        if not part or part == "void":
+            continue
+        pname = cpprust._param_name(part) or "_a%d" % len(got)
+        decl = part
+        if pname:
+            decl = re.sub(r"\b%s\b" % re.escape(pname), "", part, count=1)
+        ty = parse_type(decl)
+        got.append("%s: %s" % (pname,
+                               rust_type(ty, classes, owning, where)))
+    return ", ".join(got)
+
+
+def _emit_skeletons(text, scan, table, classes, owning, spans):
     """One `fn` per free function in the file, carrying only its ownership."""
     out = ["// ---- ownership skeletons ----",
            "//",
@@ -911,18 +1158,25 @@ def _emit_skeletons(text, scan, table, classes, owning):
            "// arithmetic cannot double-free anything, so leaving it out",
            "// makes the check quieter but never wrong.",
            ""]
-    for m in _FREE_FN.finditer(scan):
-        name = m.group(2)
-        if name in ("if", "for", "while", "switch", "return", "sizeof"):
+    for ret, name, params, body in _free_functions(text, scan, spans):
+        where = "function %s" % name
+        # The real parameter list, not an empty one. A parameter of class
+        # type is a live object for the whole body, and declaring it is what
+        # lets a statement that reads one survive the guard below -- with an
+        # empty list every such statement was erased, and the function was
+        # checked for nothing.
+        try:
+            sig = _params_text(params, classes, owning, where)
+        except RustError:
             continue
-        brace = m.end() - 1
-        close = cpprust._match_brace(text, brace)
-        if close is None:
-            continue
-        body = text[brace + 1:close]
-        stmts = skeleton(body, None, table, classes, owning,
-                         "function %s" % name)
-        out.append("pub fn __own_%s() {" % name)
+        declared = set()
+        for part in cpprust._split_top(params or ""):
+            pn = cpprust._param_name(part.strip())
+            if pn:
+                declared.add(pn)
+        stmts = skeleton(body, None, table, classes, owning, where,
+                         known=declared)
+        out.append("pub fn __own_%s(%s) {" % (name, sig))
         out.extend(stmts)
         out.append("}")
         out.append("")
