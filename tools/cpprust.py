@@ -3279,10 +3279,29 @@ def _check_owning_args(text, cinfo, path):
         for fname, (fcls, is_ptr) in cinfo[cls]["fields"].items():
             if not is_ptr and fcls in owning:
                 members[fname] = fcls
+    # Kept per enclosing function, not per file. A flat map made every
+    # `val` in the translation a `string` because one function declared
+    # one: quickjs.h's `JS_NewBool(JSContext *, JS_BOOL val)` was refused
+    # for handing a `string` to `JS_MKVAL`, on a parameter that is an
+    # `int`. The name is the same; the variable is not.
     locals_ = {}
     for m in re.finditer(r"(?<![\w.>])(\w+)\s+(\w+)\s*[;=]", text):
         if m.group(1) in owning:
-            locals_[m.group(2)] = m.group(1)
+            locals_.setdefault(m.group(2), []).append(
+                (_toplevel_start(text, m.start()), m.group(1)))
+
+    def owner_at(name, pos):
+        """The owning class `name` has where `pos` is, if any.
+
+        A declaration counts only if it sits in the same top-level
+        declaration as the use -- which is what makes two functions each
+        naming a `val` two variables rather than one.
+        """
+        here = _toplevel_start(text, pos)
+        for start, cls in locals_.get(name, ()):
+            if start == here:
+                return cls
+        return None
     if not members and not locals_:
         return
 
@@ -3326,10 +3345,8 @@ def _check_owning_args(text, cinfo, path):
             arg = part.strip()
             if not arg or arg.startswith("&"):
                 continue                 # an address: nothing is handed over
-            cls = None
-            if arg in locals_:
-                cls = locals_[arg]
-            else:
+            cls = owner_at(arg, m.start())
+            if cls is None:
                 mm = re.match(r"^[\w]+(?:\.|->)(\w+)$", arg)
                 if mm and mm.group(1) in members:
                     cls = members[mm.group(1)]

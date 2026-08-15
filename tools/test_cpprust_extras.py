@@ -811,6 +811,48 @@ void f(void) { auto a = lookup(1) ? lookup(2) : lookup(3); use(a->v); }
         self.assertEqual(cpp_auto._from_cxx_spelling("std::string"), "string")
 
 
+class TestOwningArgScope(Base):
+    """The owning-argument check has to know which `val` it is looking at.
+
+    `locals_` was a flat, file-wide map from name to owning class, so one
+    `string val` anywhere made *every* `val` in the translation a
+    `string`. quickjs.h has
+
+        static js_force_inline JSValue JS_NewBool(JSContext *ctx,
+                                                  JS_BOOL val)
+        { return JS_MKVAL(JS_TAG_BOOL, (val != 0)); }
+
+    and litehtml has a `string val` of its own elsewhere, so the pass
+    refused a parameter that is an `int`. The name is the same; the
+    variable is not.
+
+    A declaration now counts only where it sits in the same top-level
+    declaration as the use.
+    """
+
+    def test_same_name_in_another_function_is_not_confused(self):
+        self.assertLowers("""
+#include <string>
+int mkval(int val) { return JS_MKVAL(TAG, val); }
+void f(void) { string val("x"); use(&val); }
+""", "mkval")
+
+    def test_the_real_case_is_still_refused(self):
+        """Handing an owning local over by value is still the bug it was."""
+        self.refuses("""
+#include <string>
+void f(void) { string v("x"); consume(v); }
+""", "hands over")
+
+    def test_two_owning_locals_of_the_same_name(self):
+        """Each function's own declaration is the one that applies."""
+        self.refuses("""
+#include <string>
+void g(void) { string val("y"); consume(val); }
+void f(void) { string val("x"); use(&val); }
+""", "hands over")
+
+
 class TestFlattenCollision(Base):
     """From `litehtml/src/html.cpp`.
 
