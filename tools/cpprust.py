@@ -544,6 +544,28 @@ def _member_symbol(cname, m):
     return None
 
 
+def _in_for_head(look, i):
+    """Is `i` inside the parentheses of a `for` head?
+
+    Walks back to the `(` that is still open and checks the word before it.
+    Cheap because it only runs where a declaration pattern already matched.
+    """
+    depth = 0
+    k = i - 1
+    while k >= 0:
+        c = look[k]
+        if c == ")":
+            depth += 1
+        elif c == "(":
+            if depth == 0:
+                return _prev_word(look, k) == "for"
+            depth -= 1
+        elif c in ";{}" and depth == 0:
+            return False
+        k -= 1
+    return False
+
+
 def _match(text, idx, open_ch, close_ch):
     """Index of the bracket closing the one at `idx`, or None."""
     depth = 0
@@ -1760,6 +1782,18 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
         by_arity[ar] = c
     multi = len(plain) > 1
     if len(copies) > 1:
+        # An `&&` parameter reads as a copy constructor to the check above,
+        # because it is a reference with one more `&`. Named properly here:
+        # the two are not two copies, they are a copy and a *move*, and move
+        # semantics are a language feature rather than a missing overload.
+        if any("&&" in (c.params or "") for c in copies):
+            raise CppError(
+                "class %s: `%s(%s &&)` is a move constructor, and rvalue "
+                "references are not in the C++ subset. Ownership moves on "
+                "the Rust side of this project, which has them; here a class "
+                "is copied by its copy constructor. Remove the move "
+                "constructor -- the copy does the same work."
+                % (cls.name, cls.name, cls.name))
         raise CppError("class %s: more than one copy constructor" % cls.name)
     ctor = plain[0] if plain else None
     copy = copies[0] if copies else None
@@ -3310,7 +3344,13 @@ def _rewrite_calls(text, cinfo, free_refs):
         elif c == ")":
             pdepth = max(0, pdepth - 1)
 
-        if pdepth == 0:
+        # Declarations are looked for outside parentheses -- an argument list
+        # is full of names that are not declarations -- with one exception:
+        # a `for` initialiser is a declaration *inside* parentheses, and
+        # `for (string *it = v.begin(); ..)` is the iterator idiom the
+        # containers here are built around. Recognised by the `for` that
+        # opened the paren, so an ordinary argument list is untouched.
+        if pdepth == 0 or (pdepth == 1 and _in_for_head(look, i)):
             m = decl_re.match(look, i)
             if m and _prev_word(look, i) not in ("struct", "typedef", "union"):
                 scopes[-1][m.group(3)] = (m.group(1), bool(m.group(2)))
@@ -4356,6 +4396,10 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
         # `using Y = X;` is C++11 spelling for a typedef, and C has only the
         # typedef -- so it becomes one before anything reads declarations.
         text = cpp_auto.resolve_using_alias(
+            text, os.path.basename(path), blank=cpp_auto._blank_like(text))
+        # Default arguments become one member per arity, before anything
+        # counts arguments -- overloads are resolved by count here.
+        text = cpp_auto.resolve_default_arguments(
             text, os.path.basename(path), blank=cpp_auto._blank_like(text))
         # `= default` / `= delete` next: they are declarations, and every
         # pass below reads declarations.

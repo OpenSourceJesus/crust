@@ -1112,3 +1112,99 @@ def _sub_qualified_class(text, scan, outer, iname, new_name):
         last = m.end()
     out.append(text[last:])
     return "".join(out)
+
+
+# --------------------------------------------------------------------------
+# Default arguments
+# --------------------------------------------------------------------------
+
+def resolve_default_arguments(text, path="<cpp>", blank=None):
+    """Expand `f(A a, B b = e)` into one member per callable arity.
+
+    Overloads are resolved by argument *count* in this subset, so a default
+    argument is not a spelling -- it is several members that happen to share
+    a body. They are written out:
+
+        f(A a, B b, C c) { body }
+        f(A a, B b)      { C c = e2; body }
+        f(A a)           { B b = e1; C c = e2; body }
+
+    The shorter forms declare the missing parameters as locals holding their
+    defaults, which is exactly what the caller would have passed. Delegating
+    to the longest form would be tidier, but delegating constructors are not
+    in the subset either, and this works for a constructor and a method
+    alike.
+
+    Only members with a body. A declaration whose definition is out of line
+    has nothing here to copy, and is left for the reference-return-style
+    report rather than half-expanded.
+    """
+    scan = blank if blank is not None else text
+    if "=" not in scan:
+        return text
+    out, i = [], 0
+    while True:
+        m = _DEFAULTED_PARAMS.search(scan, i)
+        if m is None:
+            out.append(text[i:])
+            return "".join(out)
+        op = scan.index("(", m.start())
+        cp = _match(scan, op, "(", ")")
+        if cp is None:
+            out.append(text[i:m.end()])
+            i = m.end()
+            continue
+        parts = _split_top(text[op + 1:cp])
+        split = [_split_default(p) for p in parts]
+        if not any(d is not None for _n, d in split):
+            out.append(text[i:cp + 1])
+            i = cp + 1
+            continue
+        # The body has to follow, with nothing but qualifiers between.
+        brace = scan.find("{", cp)
+        between = scan[cp + 1:brace] if brace >= 0 else ";"
+        if brace < 0 or ";" in between or "}" in between:
+            out.append(text[i:cp + 1])
+            i = cp + 1
+            continue
+        close = _match(scan, brace, "{", "}")
+        if close is None:
+            out.append(text[i:cp + 1])
+            i = cp + 1
+            continue
+        head = text[m.start():op]
+        body = text[brace + 1:close]
+        first = next(k for k, (_n, d) in enumerate(split) if d is not None)
+        forms = []
+        for keep in range(len(split), first - 1, -1):
+            sig = ", ".join(n for n, _d in split[:keep])
+            pre = "".join(" %s = %s;" % (split[k][0].strip(), split[k][1])
+                          for k in range(keep, len(split)))
+            forms.append("%s(%s) {%s%s}" % (head.rstrip(), sig, pre, body))
+        out.append(text[i:m.start()])
+        out.append("\n".join(forms))
+        i = close + 1
+
+
+_DEFAULTED_PARAMS = re.compile(
+    r"(?:(?<=[;{}:\n])|\A)\s*(?:explicit\s+)?"
+    r"(?:[A-Za-z_][\w:]*(?:\s*<[^;{}()]*>)?[\s*&]+)*"
+    r"~?[A-Za-z_]\w*\s*\([^;{}()]*=[^;{}()]*\)")
+
+
+def _split_default(part):
+    """`(declarator, default)` for one parameter, `default` None if absent."""
+    eq = -1
+    depth = 0
+    for k, c in enumerate(part):
+        if c in "([{<":
+            depth += 1
+        elif c in ")]}>":
+            depth -= 1
+        elif c == "=" and depth == 0 and part[k + 1:k + 2] != "=" \
+                and part[k - 1:k] not in ("=", "!", "<", ">"):
+            eq = k
+            break
+    if eq < 0:
+        return part.strip(), None
+    return part[:eq].strip(), part[eq + 1:].strip()
