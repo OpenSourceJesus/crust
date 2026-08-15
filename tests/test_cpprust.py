@@ -1087,15 +1087,16 @@ void f(void) { std::vector<int> a; std::vector<char> b; }
         self.assertIn("void string_copy(string *this,", out)
         self.assertIn("void string__assign(string *this,", out)
 
-    def test_owning_element_type_is_refused_clearly(self):
-        # `vector<T>` stores by assignment, which for a class with a
-        # destructor would leave two owners.
-        with self.assertRaises(cpprust.CppError) as cm:
-            cpprust.translate(
-                "int f(void) { std::vector<std::string> v; return v.size(); }")
-        self.assertIn("stores its elements by assignment",
-                      cm.exception.message)
-        self.assertIn("vector<string *>", cm.exception.message)
+    def test_vector_owns_its_elements(self):
+        # `vector<T>` copy-constructs and destroys its elements now, which
+        # is what `std::vector` does -- so an owning element type needs no
+        # steering and is simply accepted. It used to store by assignment
+        # and refer the author to `ownvector`; the element builtins accept
+        # scalars, so one implementation is right for both.
+        out = cpprust.translate(
+            "int f(void) { std::vector<std::string> v; return v.size(); }")
+        self.assertIn("vector_string", out)
+        self.assertIn("string_copy", out)
 
 
 _ARR = """
@@ -1249,11 +1250,16 @@ int f(void) { std::vector<std::string*> v; return v[0]->size(); }
 
 
 class TestCppOwningElements(unittest.TestCase):
-    def test_owning_element_type_is_refused_with_the_alternative(self):
-        with self.assertRaises(cpprust.CppError) as cm:
-            cpprust.translate("int f(void) { std::vector<std::string> v; return v.size(); }")
-        self.assertIn("stores its elements by assignment", cm.exception.message)
-        self.assertIn("vector<string *>", cm.exception.message)
+    def test_an_owning_element_type_copy_constructs(self):
+        # `vector<T>` copy-constructs and destroys its elements now, which
+        # is what `std::vector` does -- so an owning element type needs no
+        # steering and is simply accepted. It used to store by assignment
+        # and refer the author to `ownvector`; the element builtins accept
+        # scalars, so one implementation is right for both.
+        out = cpprust.translate(
+            "int f(void) { std::vector<std::string> v; return v.size(); }")
+        self.assertIn("vector_string", out)
+        self.assertIn("string_copy", out)
 
     def test_vector_of_pointers_works(self):
         out = cpprust.translate("""
@@ -1376,11 +1382,16 @@ void f(void) { std::ownvector<int> v; int k = 1; v.push_back(k); }
 """)
         self.assertIn("Use `vector<int>`", cm.exception.message)
 
-    def test_vector_diagnostic_names_ownvector(self):
-        with self.assertRaises(cpprust.CppError) as cm:
-            cpprust.translate(
-                "int f(void) { std::vector<std::string> v; return v.size(); }")
-        self.assertIn("ownvector<string>", cm.exception.message)
+    def test_an_owning_element_type_is_accepted(self):
+        # `vector<T>` copy-constructs and destroys its elements now, which
+        # is what `std::vector` does -- so an owning element type needs no
+        # steering and is simply accepted. It used to store by assignment
+        # and refer the author to `ownvector`; the element builtins accept
+        # scalars, so one implementation is right for both.
+        out = cpprust.translate(
+            "int f(void) { std::vector<std::string> v; return v.size(); }")
+        self.assertIn("vector_string", out)
+        self.assertIn("string_copy", out)
 
     def test_subscript_result_can_receive_a_call(self):
         # `v[i]` is a dereference, so it is addressable -- unlike a call
