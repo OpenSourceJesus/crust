@@ -3111,8 +3111,14 @@ def _rewrite_calls(text, cinfo, free_refs):
         return text
     names = set(cinfo)
     alt = _type_alt(names)
+    # `;`, `=` and `,` end a declaration -- and so does a `)` when the
+    # declaration is a `for` initialiser with no third clause, but that case
+    # is covered by the `;` inside the `for` head. What was missing is that a
+    # `for (T *it = ..; ..)` declaration ends at `;` *inside* parentheses,
+    # which this pattern already allows; the gap was the pointer form being
+    # required to have its star attached to the type.
     decl_re = re.compile(
-        r"(?<![\w.])(%s)\s+(\*\s*)?(\w+)\s*(?=[;=,])" % alt)
+        r"(?<![\w.])(%s)\s*(\*\s*)?(\w+)\s*(?=[;=,)])" % alt)
     call_re = re.compile(r"(?<![\w.>])(\w+)((?:\s*(?:\.|->)\s*\w+)+)\s*\(")
     # The same chain, but not followed by `(` -- a member read or write
     # rather than a call. The call pattern is tried first, so this only
@@ -3705,7 +3711,7 @@ public:
         vd = 0; vn = 0; vcap = 0;
         reserve(o.vn);
         int i = 0;
-        while (i < o.vn) { vd[i] = o.vd[i]; i = i + 1; }
+        while (i < o.vn) { __cpp_copy(T, vd[i], &o.vd[i]); i = i + 1; }
         vn = o.vn;
     }
     vector<T> &operator=(const vector<T> &o) {
@@ -3713,11 +3719,11 @@ public:
             vn = 0;
             reserve(o.vn);
             int i = 0;
-            while (i < o.vn) { vd[i] = o.vd[i]; i = i + 1; }
+            while (i < o.vn) { __cpp_copy(T, vd[i], &o.vd[i]); i = i + 1; }
             vn = o.vn;
         }
     }
-    ~vector() { free(vd); vd = 0; vn = 0; vcap = 0; }
+    ~vector() { clear(); free(vd); vd = 0; vcap = 0; }
     int size() { return vn; }
     int empty() { if (vn == 0) { return 1; } return 0; }
     void reserve(int c) {
@@ -3727,18 +3733,20 @@ public:
             if (nd != 0) { vd = nd; vcap = m; }
         }
     }
-    void push_back(T v) {
+    void push_back(__cpp_ref(T) v) {
         if (vn == vcap) {
             int m = vcap * 2;
             if (m < 4) { m = 4; }
             reserve(m);
         }
-        if (vn < vcap) { vd[vn] = v; vn = vn + 1; }
+        if (vn < vcap) { __cpp_copy(T, vd[vn], v); vn = vn + 1; }
     }
-    void pop_back() { if (vn > 0) { vn = vn - 1; } }
-    void clear() { vn = 0; }
-    T get(int i) { return vd[i]; }
-    void set(int i, T v) { vd[i] = v; }
+    void pop_back() { if (vn > 0) { vn = vn - 1; __cpp_drop(T, vd[vn]); } }
+    void clear() { while (vn > 0) { vn = vn - 1; __cpp_drop(T, vd[vn]); } }
+    /* No `T get(int i)`: returning an element by value copies an object the
+       caller never constructed, which is refused for an owning element type
+       and would be wrong for it anyway. `v[i]` yields the element itself. */
+    void set(int i, __cpp_ref(T) v) { __cpp_drop(T, vd[i]); __cpp_copy(T, vd[i], v); }
     T *ptr(int i) { return vd + i; }
     T &operator[](int i) { return vd[i]; }
     T *begin() { return vd; }
@@ -3791,6 +3799,12 @@ public:
     void clear() { while (on > 0) { on = on - 1; __cpp_drop(T, od[on]); } }
     T *ptr(int i) { return od + i; }
     T &operator[](int i) { return od[i]; }
+    /* The same pointer-as-iterator design `vector` and `map` use: `it->f`,
+       `++it` and `it != end()` are then plain C on a plain pointer. */
+    T *begin() { return od; }
+    T *end() { return od + on; }
+    T *rbegin() { return od + on - 1; }
+    T *rend() { return od - 1; }
 };
 """
 
@@ -3977,18 +3991,24 @@ def _std_prelude(text):
         # working out whether this source asks for that combination.
         wanted.add("string")
     parts = [bool_prefix, _STD_DECLS]
+    # Dependency order, not alphabetical or historical. An instantiation used
+    # as another's *argument* has to be complete first -- a
+    # `vector<shared_ptr<el>>` holds a `shared_ptr_el` by value -- and these
+    # are emitted where their template is declared. So the ones that get used
+    # as arguments come first: `string` and the smart pointers, then the
+    # containers, then `map`, which holds a `pair`.
     if "string" in wanted:
         parts.append(_STD_STRING)
-    if "vector" in wanted:
-        parts.append(_STD_VECTOR)
-    if "ownvector" in wanted:
-        parts.append(_STD_OWNVECTOR)
     if "unique_ptr" in wanted:
         parts.append(_STD_UNIQUE)
     if "shared_ptr" in wanted:
         parts.append(_STD_SHARED)
     if "pair" in wanted or "map" in wanted:
         parts.append(_STD_PAIR)
+    if "vector" in wanted:
+        parts.append(_STD_VECTOR)
+    if "ownvector" in wanted:
+        parts.append(_STD_OWNVECTOR)
     if "map" in wanted:
         parts.append(_STD_MAP)
     return "".join(parts) + text
@@ -4587,15 +4607,11 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     # would leave two objects holding one resource. Caught here, against the
     # element type the source asked for, rather than as a by-value complaint
     # about a `push_back` the author never wrote.
-    for targs in wanted.get("vector", []):
-        elem = targs[0]
-        if elem in cinfo and cinfo[elem]["dtor"]:
-            raise CppError(
-                "%s: `vector<%s>` stores its elements by assignment, and %s "
-                "has a destructor -- two elements would own one resource. "
-                "Use `ownvector<%s>`, which copy-constructs each element, "
-                "or `vector<%s *>` with `new`/`delete`."
-                % (os.path.basename(path), elem, elem, elem, elem))
+    # `vector<T>` copy-constructs and destroys its elements, which is what
+    # `std::vector` does, so an owning element type needs no steering. It used
+    # to store by assignment and refer the author to `ownvector`; the element
+    # builtins accept scalars now, so one implementation is right for both and
+    # the split has gone.
     # And the other way. `ownvector` copy-constructs and destroys each
     # element, which a scalar has neither of; steering that to `vector` used
     # to fall out of `__cpp_copy` refusing scalars, but the builtins have to
