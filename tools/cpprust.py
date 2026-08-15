@@ -2192,6 +2192,20 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
     # its typedef, which is all a pointer field to a class defined later
     # needs -- and that is the shape a template instantiated over a class
     # declared below it always has.
+    # A class that carries `enable_shared_from_this`'s members gets the
+    # function `shared_ptr` calls to hand it the control block. Emitted with
+    # the class, where its fields are complete.
+    # Only a class that *inherits* them: the one that declares them reaches
+    # its own fields by their bare names, and its `esp` is a `T *` while its
+    # `this` is the base's own type.
+    if info["paths"].get("esp", "esp") != "esp" \
+            and info["paths"].get("esc", "esc") != "esc":
+        mprotos.append("%s void %s__share_hook(%s *this, long *c);"
+                       % (stor, cname, cname))
+        out.append("%s void %s__share_hook(%s *this, long *c) "
+                   "{ this->%s = this; this->%s = c; }"
+                   % (stor, cname, cname,
+                      info["paths"]["esp"], info["paths"]["esc"]))
     emitting_outline[0] = False
     return (head[:2], mprotos, head[2:] + out, tail), cname, info
 
@@ -3006,10 +3020,22 @@ def _is_call_result(rhs):
     rhs = rhs.strip()
     if not rhs.endswith(")"):
         return False
-    op = rhs.find("(")
-    if op <= 0 or _match_paren(rhs, op) != len(rhs) - 1:
+    # The *last* call in the expression is the one whose value this is, so
+    # the opening paren to match is the one that closes at the end. A chain
+    # like `a.get()->self()` has earlier parens that close sooner.
+    op = -1
+    for k, c in enumerate(rhs):
+        if c == "(" and _match_paren(rhs, k) == len(rhs) - 1:
+            op = k
+            break
+    if op <= 0:
         return False
-    return re.match(r"^[\w:.>-]+$", rhs[:op].strip()) is not None
+    head = rhs[:op].strip()
+    # Whatever precedes it has to read as a callee -- a name, a member path,
+    # or a chain of calls on one. Anything with an operator in it is an
+    # expression whose value is not simply what a call returned.
+    return re.match(r"^[\w:.>()\[\]\s-]+$", head) is not None \
+        and not re.search(r"[+*/%!&|^~?]|(?<![-<])>(?!)|<(?!)", head)
 
 
 def _normalise_empty_params(text):
@@ -3061,10 +3087,24 @@ def _func_body(text, op):
 
 
 def _returns_only_bare_locals(body):
-    """Does every `return` in `body` hand back a bare name?"""
+    """Does every `return` in `body` hand an owning value on safely?
+
+    Two shapes are safe. A **bare local** is moved out: the scope rewriting
+    leaves it out of that path's drops. A **call result** was already moved
+    out of the callee, so passing it straight on moves it again -- there is
+    no local here to destroy, and no destructor runs on a temporary.
+
+    Anything else -- a member, a subscript, a dereference -- names an object
+    somebody else still owns, and returning it would hand back a copy that
+    is destroyed twice.
+    """
     for m in re.finditer(r"(?<![\w.])return\b([^;]*);", body):
-        if not re.match(r"^\s*\w*\s*$", m.group(1)):
-            return False
+        expr = m.group(1).strip()
+        if re.match(r"^\w*$", expr):
+            continue                     # a bare local, or `return;`
+        if _is_call_result(expr):
+            continue
+        return False
     return True
 
 
@@ -3531,9 +3571,13 @@ def _rewrite_calls(text, cinfo, free_refs):
                 # that has the hook's members has the hook.
                 paths = (cinfo.get(ty) or {}).get("paths") or {}
                 if "esp" in paths and "esc" in paths:
-                    out.append("((%s)->%s = (%s), (%s)->%s = (%s))"
-                               % (parts[1], paths["esp"], parts[1],
-                                  parts[1], paths["esc"], parts[2]))
+                    # Through a function, not by reaching into the object:
+                    # `shared_ptr<T>` is emitted above `T`, where `T` is
+                    # still an incomplete type and `q->_base` will not
+                    # compile. A prototype is enough for an incomplete type,
+                    # and prototypes are hoisted above every definition.
+                    out.append("%s__share_hook(%s, %s)"
+                               % (ty, parts[1], parts[2]))
                 else:
                     out.append("(void)0")
                 i = close + 1
