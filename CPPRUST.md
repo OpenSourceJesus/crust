@@ -124,9 +124,14 @@ int go(void) {
 
 Crust lowers a by-value owning parameter to a drop when the callee returns —
 passing by value is a *move* there — so `consume` frees the buffer, and
-`Tally_drop` frees it again on the way out. Refused for the same reason
-`_check_by_value` refuses this pass's own by-value owning parameters: doing
-it properly means moving out of the source, and this is expression position.
+`Tally_drop` frees it again on the way out.
+
+This is **not** the same shape as this pass's own by-value owning parameters,
+which are constructed at the call and dropped by the callee (see "By value
+across a call"). A Rust callee taking by value *moves*: it takes the object
+and the source must be left out of this side's drops. That is Crust's
+move-out rather than a materialised temporary, and conflating the two would
+reintroduce exactly the double free this refuses. So it stays refused.
 
 Pass `&t.samples` instead. A Rust `&Vec<i32>` parameter lowers to exactly
 that pointer, so a reference-taking signature needs no change on either side.
@@ -296,19 +301,43 @@ C++ would.
 
 ### By value across a call
 
-An owning class never crosses a call boundary by value:
+A by-value **parameter** of an owning class is an object the *callee* owns.
+C++ constructs it at the call and destroys it when the function returns, and
+both halves are written out:
 
 ```cpp
-void take(Buf b);                       // refused
-Buf make(void);                         // refused
+int sink(Buf b) { return b.val(); }
+Buf a;
+sink(std::move(a));                     /* moved in  */
+sink(a);                                /* copied in */
+```
+```c
+int sink(Buf b) { { int _cpp_ret0 = (Buf_val(&b)); Buf_drop(&b);
+                    return _cpp_ret0; } Buf_drop(&b); }
+sink(({ Buf _cpp_mv0; Buf_move(&_cpp_mv0, &a); _cpp_mv0; }));
+sink(({ Buf _cpp_ba0; Buf_copy(&_cpp_ba0, &(a)); _cpp_ba0; }));
 ```
 
-A by-value parameter is a copy no constructor ran for and no destructor will
-run for. A by-value **return** is worse: the local is destroyed on the way
-out, so the caller receives a copy of a released object — a use-after-free.
-Doing either properly means copy-constructing into a temporary at the call
-site, which needs a statement, and this is expression position. Pass `T &`
-or return `T *`. A class with no destructor passes by value freely.
+The parameter is registered like a local, so it drops on every exit from the
+function, and the argument is *constructed* rather than handed over as a
+struct copy. **The two halves have to travel together.** Writing only the
+callee's drop turns every call into a double free — both sides then own one
+buffer and both free it, which is what a sanitizer caught the moment the
+refusal was lifted without the call sites rewritten.
+
+This used to be refused, and the refusal was right at the time: neither half
+existed, so the copy was never constructed and never destroyed.
+
+**Refused:** an argument whose class has a destructor and no copy
+constructor. There is nothing to construct the parameter with — reported at
+the *call*, where the choice is, rather than at the declaration, since
+`std::move` is the answer and only the call site can write it.
+
+A by-value **return** is a different matter and is unchanged: the local is
+destroyed on the way out, so the caller would receive a copy of a released
+object. A `return` of a bare local is a move out and is fine; anything else
+is refused. Return `T *`, or assign to a local first. A class with no
+destructor passes and returns by value freely.
 
 ### `std::move`
 
