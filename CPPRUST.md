@@ -310,6 +310,134 @@ Doing either properly means copy-constructing into a temporary at the call
 site, which needs a statement, and this is expression position. Pass `T &`
 or return `T *`. A class with no destructor passes by value freely.
 
+### `std::move`
+
+A **move constructor** `T(T &&o)` lowers to `T_move`, beside `T_copy` and for
+the same reason: `T_new` is taken and overloading it is not available. An
+`operator=(T &&)` lowers to `T__moveassign`, beside `T__assign`. `T &&o` is a
+reference like any other and lowers to `T *o`, so the body reads through `->`
+and can null the source.
+
+```cpp
+class Buf {
+public:
+    int *d;
+    Buf() { d = (int *)malloc(16); }
+    Buf(const Buf &o) { d = (int *)malloc(16); d[0] = o.d[0]; }
+    Buf(Buf &&o) { d = o.d; o.d = 0; }      /* the move */
+    ~Buf() { free(d); }
+};
+
+Buf a;
+Buf b = std::move(a);                       /* Buf b; Buf_move(&b, &a); */
+```
+
+Three things decide what this means, and each is C++'s rule rather than a
+convenience.
+
+**The moved-from object is still destroyed.** This is the one worth stating
+outright, because Crust's own move goes the other way. A C++ moved-from object
+is valid-but-unspecified, not dead: `a` stays live to the end of its scope and
+`Buf_drop(&a)` runs there, exactly as it would have without the move. What
+makes that harmless is the move constructor nulling the source — that is what
+the author is *for*, and why `~Buf` is written to survive `d == 0`. The scope
+rewriting already has a move-out that suppresses a drop (`unwind(moved=)`,
+used for `return v;`), and it is deliberately not used here. It is right there
+because it is right for `return v;`, where the object is handed over bitwise
+with no constructor involved and no second owner. Reaching for it here would
+give `std::move` Rust semantics under a C++ spelling, and on a well-written
+class the two are indistinguishable — `free(0)` is a no-op, so the leak only
+appears on a class whose destructor still has work to do. Both drops are
+emitted, in reverse declaration order:
+
+```c
+HeavyBuffer source; HeavyBuffer_new(&source, 8, 7);
+HeavyBuffer target; HeavyBuffer_move(&target, &source);
+HeavyBuffer_drop(&target); HeavyBuffer_drop(&source);
+```
+
+**No move constructor means the copy runs.** `std::move` is a cast, not a
+call: it produces an rvalue, and `T(const T &)` binds one perfectly well. So a
+class that has not been given a move constructor is copied, which is what C++
+overload resolution does — and is what makes adding `std::move` to an existing
+source safe rather than a rewrite. A class with *neither* is still refused by
+the Rule of Three, at the same place and with the same message.
+
+**Only the qualified spelling.** `std::` is stripped rather than resolved, so
+`std::move` is read before that happens and rewritten to the internal
+`__cpp_move`. After stripping it would be indistinguishable from a project's
+own `move` — litehtml moves boxes — and every one of those calls would be
+rewritten. The cost is that `using namespace std;` plus a bare `move` is not
+recognised, which is a shape worth not guessing at.
+
+**Expression position** — a `return`, an argument, an operand — is lowered
+through a GNU **statement expression**, which is the one construct that can
+declare a temporary where C has no statement to declare one in:
+
+```cpp
+Buf mk(void) { Buf a; return std::move(a); }
+```
+```c
+Buf mk(void) { Buf a; Buf_new(&a);
+    { Buf _cpp_ret0 = (({ Buf _cpp_mv0; Buf_move(&_cpp_mv0, &a); _cpp_mv0; }));
+      Buf_drop(&a); return _cpp_ret0; } }
+```
+
+Declare, move into, yield — what a C++ compiler does with a materialised
+temporary, written out. This is a GNU extension rather than ISO C, and it is
+used anyway because gcc, clang **and ShivyCX** all implement it; all three
+were checked against this exact shape, and all three agree. So there is still
+one output and no backend to choose between, which is the property the rest of
+the pipeline leans on.
+
+Two orderings make this correct, and both were already there. `return`
+evaluates its operand into a temporary *before* the destructors run, because
+C++ evaluates the operand first — which is exactly what a move needs: the
+source is still alive when it is moved from, and its own drop then finds the
+husk. And the temporary is deliberately **not** registered for destruction:
+it is yielded by value, so the caller receives a bitwise copy holding the
+resource, and destroying the husk left behind would be destroying what the
+caller now owns.
+
+**Still refused:** an operand that is not an object this pass can name, and a
+class with a destructor but neither a move nor a copy constructor — there is
+nothing to construct the temporary with.
+
+### Moving into a container
+
+A container argument is the one expression position that is **not**
+materialised, because it must not be. A move overload lowers to
+`push_back(T *v)`, so what the call wants is the address of the source; a
+statement expression yields an rvalue, and its address cannot be taken.
+
+```cpp
+std::vector<std::unique_ptr<Thing>> w;
+std::unique_ptr<Thing> p(new Thing());
+w.push_back(std::move(p));          /* vector_..._push_back__move(&w, &p) */
+```
+
+Three things meet here, and each is the same move already made elsewhere:
+
+* **A move overload.** `push_back(__cpp_rref(T))` sits beside
+  `push_back(__cpp_ref(T))`, and the two are told apart by whether the call
+  site wrote `std::move` — not by arity, which cannot tell them apart at all.
+  That is exactly how `operator=` and `operator=(T &&)` are already chosen.
+  `__cpp_rref(T)` is `T &&` for a class and plain `T` for a scalar; a scalar
+  has nothing to move, so the two would be one signature and the move
+  overload is simply not emitted.
+* **`__cpp_movein(T, dst, src)`**, which is to `__cpp_copy` what a move
+  constructor is to a copy one: `T_move`, falling back to `T_copy` when the
+  element has no move constructor, and a plain assignment for a scalar.
+* **Deleted copy members.** A container member whose body copies an element
+  the element type cannot copy is *deleted*, exactly as C++ deletes it —
+  rather than the whole instantiation being refused over members the program
+  never calls. A **call** to one is then an error naming the reason, because
+  dropping it silently would turn a diagnostic into an undefined symbol from
+  the C front end.
+
+`std::forward` is absent. It means something only inside a template taking
+`T &&`, which this subset does not have.
+
 ## Methods and calls
 
 ```cpp
@@ -629,8 +757,11 @@ one this file declares, so its qualifier is simply removed.
 | Type | For | Elements |
 |---|---|---|
 | `string` | text | `size` `empty` `at` `[]` `c_str` `assign` `append` `push_back` `clear` `reserve` `equals` |
-| `vector<T>` | scalars, pointers, plain data | `size` `empty` `get` `set` `ptr` `[]` `push_back` `pop_back` `clear` `reserve` |
-| `ownvector<T>` | classes that own something | same, minus `get`/`set` |
+| `vector<T>` | scalars, pointers, plain data | `size` `empty` `get` `set` `ptr` `[]` `push_back` `pop_back` `clear` `reserve` || `ownvector<T>` | classes that own something | same, minus `get`/`set` |
+
+`push_back` on `vector<T>` has a **move overload** for a class element, taken
+when the call site writes `std::move` -- which is what lets a `vector` hold a
+move-only element such as `unique_ptr<T>`. See "Moving into a container".
 
 `vector<T>` stores elements by assignment, so an element type with a
 destructor would leave two owners. `ownvector<T>` copy-constructs each
@@ -1001,11 +1132,24 @@ std::shared_ptr<Thing> a(new Thing());
 std::shared_ptr<Thing> b(a);            // use_count() == 2
 ```                                     // released at zero
 
-`unique_ptr` declares no copy constructor, so the Rule of Three refusal the
-subset already makes **is** its move-only semantics -- copying one is
-rejected with the same diagnostic any other owning class gets, and nothing
-had to be added for it. `shared_ptr` refcounts through a copy constructor and
-`operator=`.
+`unique_ptr` declares a move constructor and a move assignment and **no copy
+constructor**, which is exactly what move-only means -- and the second half is
+enforced by the Rule of Three refusal the subset already made, so copying one
+is still rejected with the same diagnostic any other owning class gets:
+
+```cpp
+std::unique_ptr<Thing> a(new Thing());
+std::unique_ptr<Thing> b(std::move(a));   /* moves; `a` is left null */
+std::unique_ptr<Thing> c(a);              /* refused, as in C++ */
+```
+
+A `vector<unique_ptr<T>>` works, through `push_back`'s move overload.
+
+Both spell the injected class name with its arguments -- `unique_ptr<T> &&o`,
+not a bare `unique_ptr &&o` -- because substitution rewrites the template
+arguments and the bare name is not one of them. Written bare, the parameter
+came out as a type nothing defines. `shared_ptr` refcounts through a copy
+constructor and `operator=`.
 
 Both use `__cpp_drop(T, *p)` rather than `delete p`. Inside a template, `T`
 is not known to be a class when the body is parsed, so a plain `delete` frees
@@ -1191,9 +1335,11 @@ instantiation:
 | | class | scalar |
 |---|---|---|
 | `__cpp_copy(T, dst, src)` | `T_copy(&dst, src)` | `dst = src` |
+| `__cpp_movein(T, dst, src)` | `T_move(&dst, src)` | `dst = src` |
 | `__cpp_drop(T, x)` | `T_drop(&x)` | nothing |
 | `__cpp_eq(T, a, b)` | `T_equals(&a, b)` | `a == b` |
 | `__cpp_ref(T)` | `const T &` | `T` |
+| `__cpp_rref(T)` | `T &&` | `T` |
 
 `__cpp_ref` exists because a container cannot pick one spelling for a key
 parameter: by value it refuses an owning key (the copy is never constructed
@@ -1217,11 +1363,10 @@ function arguments, and the rest of the STL.
 Two shapes are worth calling out because they are legal C++ that this subset
 cannot express, rather than features not yet written:
 
-* **A move-only type in a container.** `std::vector<std::unique_ptr<T>>` is
-  ordinary C++ and cannot work here. The subset has no moves, and its Rule
-  of Three refusal *is* `unique_ptr`'s move-only semantics, so a container
-  cannot copy an element into place. Hold the element by `shared_ptr`
-  instead.
+* **A move-only type in a container.** `std::vector<std::unique_ptr<T>>`
+  works now -- see "Moving into a container" below. What is still out is a
+  container of a type with *neither* a copy nor a move constructor: there is
+  no way to get an element into place.
 * **A class-scoped typedef.** `X::ptr` and `X::vector` are deliberately left
   alone -- taking them flatly would make every `vector` in the file mean
   `X::vector`, including the supplied template of that name. A qualified use
@@ -1263,6 +1408,7 @@ at compile time; a `.c` or `.rs` build needs neither.
 ```sh
 python3 -m unittest tests.test_cpprust          # the subset itself
 python3 tools/test_cpprust_extras.py            # features in flight
+python3 tools/test_std_move_lowering.py         # `std::move`
 python3 tools/litehtml_test.py --groups         # against real litehtml
 ```
 
@@ -1277,6 +1423,15 @@ worth knowing. Guardrail tests sit beside the feature tests, because for
 this pass a refusal *is* the contract: a feature that lands by turning a
 diagnostic into a silent miscompile is a regression, and the tests have to
 be able to say so.
+
+`tools/test_std_move_lowering.py` is the same loop for `std::move`, kept in
+its own file while expression position is still open. Its centre of gravity
+is `TestMovedFromIsStillDestroyed`, which asserts something no *output* is
+wrong without: that the source is dropped. A regression there produces C that
+compiles, runs, and passes every other test in the tree, because the classes
+one writes to be moved from are exactly the ones whose destructors tolerate
+being run on a husk. It folds into `test_cpprust_extras.py` when the feature
+is whole.
 
 `tools/litehtml_test.py` is the acceptance test. It lowers the real litehtml
 sources with the include path already set and then runs `gcc -fsyntax-only`
