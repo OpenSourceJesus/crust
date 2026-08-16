@@ -469,11 +469,72 @@ def _method_name(rc, member):
     return "%s_%d" % (member.name, cpprust._arity(member.params or ""))
 
 
-def _params(member, classes, owning, where, selfish=True):
+def _assigns_member(body, fieldnames):
+    """Does this body write to one of the class's own fields?
+
+    Read from the written body rather than from `const`, which
+    `cpprust._split_members` does not carry. A method that only reads its
+    fields can take `&self`, and that distinction is what keeps a borrow of
+    a container from colliding with a harmless `size()` call on it.
+    """
+    if not body:
+        return False
+    for f in fieldnames:
+        name = re.escape(f)
+        # `f = x`, `f[i] = x`, `this->f = x`, `f += x`. A `==` is not an
+        # assignment, so the lookahead excludes it. Built by concatenation
+        # rather than %-formatting: the compound-assignment class contains a
+        # literal `%`, which a format string would try to interpret.
+        assign = (r"(?:\bthis\s*->\s*)?\b" + name + r"\b\s*"
+                  r"(?:\[[^\]]*\])?\s*"
+                  r"(?:[-+*/%|&^]|<<|>>)?=(?!=)")
+        if re.search(assign, body):
+            return True
+        # Taking a mutable reference or address of a field hands out the
+        # right to write it, so the method is treated as writing.
+        if re.search(r"&\s*(?:this\s*->\s*)?\b" + name + r"\b", body):
+            return True
+    return False
+
+
+def _infer_receiver_mut(rc, table):
+    """Which methods need `&mut self`.
+
+    A fixed point, because a method that only calls another method of the
+    same class is mutating exactly when that one is. Constructors, the
+    destructor and anything returning a reference are mutating outright: a
+    returned `&mut T` hands the caller the right to write through it.
+    """
+    fields = [m.name for m, _ty in rc.fields]
+    names = set(m.name for m in rc.methods)
+    mut = set()
+    for m in rc.methods:
+        ret = parse_type(m.ret or "void")
+        if ret is not None and ret.ref and not ret.const:
+            mut.add(m.name)
+        elif _assigns_member(m.body, fields):
+            mut.add(m.name)
+    changed = True
+    while changed:
+        changed = False
+        for m in rc.methods:
+            if m.name in mut or not m.body:
+                continue
+            for other in names:
+                if other in mut and re.search(
+                        r"(?:\bthis\s*->\s*)?\b%s\s*\(" % re.escape(other),
+                        m.body):
+                    mut.add(m.name)
+                    changed = True
+                    break
+    return mut
+
+
+def _params(member, classes, owning, where, selfish=True, mut_self=True):
     """Translate a parameter list, with `this` in front where there is one."""
     out = []
     if selfish:
-        out.append("&mut self")
+        out.append("&mut self" if mut_self else "&self")
     for part in cpprust._split_top(member.params or ""):
         part = part.strip()
         if not part or part == "void":
@@ -498,6 +559,7 @@ def emit_class(rc, table, classes, owning, mode):
     """One class: the struct, its Drop, its Clone, and its methods."""
     out = []
     where = "class %s" % rc.name
+    mutset = _infer_receiver_mut(rc, table)
 
     # Fields in *reverse* declaration order, with the base last.
     #
@@ -562,7 +624,8 @@ def emit_class(rc, table, classes, owning, mode):
         for m in rc.virtuals:
             out.append("    fn %s(%s)%s;" % (
                 _method_name(rc, m),
-                _params(m, classes, owning, where),
+                _params(m, classes, owning, where,
+                        mut_self=m.name in mutset),
                 _ret(m, classes, owning, where)))
         out.append("}")
         out.append("")
@@ -578,7 +641,8 @@ def emit_class(rc, table, classes, owning, mode):
             body = "unimplemented!()"
             out.append("    pub fn %s(%s)%s { %s }" % (
                 _method_name(rc, m),
-                _params(m, classes, owning, where),
+                _params(m, classes, owning, where,
+                        mut_self=m.name in mutset),
                 _ret(m, classes, owning, where), body))
         out.append("}")
         out.append("")
@@ -588,7 +652,8 @@ def emit_class(rc, table, classes, owning, mode):
         for m in rc.virtuals:
             out.append("    fn %s(%s)%s { unimplemented!() }" % (
                 _method_name(rc, m),
-                _params(m, classes, owning, where),
+                _params(m, classes, owning, where,
+                        mut_self=m.name in mutset),
                 _ret(m, classes, owning, where)))
         out.append("}")
         out.append("")
@@ -629,6 +694,42 @@ _METHOD_CALL = re.compile(r"^\s*([\w.]+)\s*(?:\.|->)\s*(\w+)\s*\(([^;]*)\)\s*;")
 _DECL_NEW = re.compile(
     r"^\s*(\w+)\s*\*\s*(\w+)\s*=\s*new\s+(\w+)\s*(?:\(([^;]*)\))?\s*;")
 _DELETE = re.compile(r"^\s*(?:if\s*\([^)]*\)\s*)?delete\s+(\w+)\s*;")
+
+# `T &r = <expr>;` -- a C++ reference local, which is where borrows enter
+# the skeleton. Pointers deliberately do not: a `T *` carries no lifetime
+# and modelling one as a borrow would have rustc check a claim the source
+# never made.
+_DECL_REF = re.compile(r"^\s*(?:const\s+)?(\w+)\s*&\s*(\w+)\s*=\s*([^;]+);")
+_SUBSCRIPT = re.compile(r"^(\w+)\s*\[([^\]]*)\]$")
+_RECV_CALL = re.compile(r"^(\w+)\s*(?:\.|->)\s*(\w+)\s*\((.*)\)$")
+
+
+def _mutated_from(stmts, locals_ty, table, mutsets):
+    """For each statement index, which locals are mutated at or after it.
+
+    This decides whether a reference local is worth modelling as a live
+    borrow. A borrow never followed by a mutation of what it borrows cannot
+    conflict with anything, so emitting one could only produce a complaint
+    about aliasing that C++ permits -- two subscripts of one container being
+    the obvious case. Gating on a later mutation keeps the borrow for the
+    shape that is actually a bug: borrow, mutate, then use.
+    """
+    at = []
+    for line in stmts:
+        hit = set()
+        m = re.match(r"^\s*(\w+)\s*(?:\.|->)\s*(\w+)\s*\(", line)
+        if m:
+            root, meth = m.group(1), m.group(2)
+            cname = locals_ty.get(root)
+            if cname and meth in mutsets.get(cname, set()):
+                hit.add(root)
+        at.append(hit)
+    after = [set() for _ in stmts]
+    running = set()
+    for i in range(len(stmts) - 1, -1, -1):
+        running = running | at[i]
+        after[i] = set(running)
+    return after
 
 
 def _statements(body):
@@ -685,7 +786,8 @@ def _statements(body):
     return out
 
 
-def skeleton(body, rc, table, classes, owning, where, known=None):
+def skeleton(body, rc, table, classes, owning, where, known=None,
+             mutsets=None, param_types=None):
     """Translate a body down to what can violate ownership.
 
     Kept: constructing a local, copying one, calling a method on one,
@@ -713,8 +815,34 @@ def skeleton(body, rc, table, classes, owning, where, known=None):
     # dressed as a finding about the source. Quieter is a cost; wrong is not
     # allowed.
     known = set(known or ())
+    mutsets = mutsets or {}
+    # Which class each declared local holds, so a call on one can be judged
+    # mutating or not. Names alone were enough while every method took
+    # `&mut self`; they are not now that the receiver's mutability is
+    # inferred per method.
+    locals_ty = dict(param_types or {})
 
-    for raw in _statements(body):
+    # Comments are blanked first. `_free_functions` takes bodies from the
+    # unstripped text, so a statement preceded by a comment arrived as
+    # `/* .. */\n    v.push(7);` and missed every anchored pattern -- another
+    # way for the skeleton to check less than it appears to.
+    stmts = [x.strip() for x in _statements(cpprust._strip_comments(body))]
+
+    # Declarations are read once before anything is emitted. The mutation
+    # lookahead needs to know what class each local holds in order to judge
+    # a call on it, and filling that in as statements were emitted meant the
+    # lookahead ran against an empty table and never fired.
+    for line in stmts:
+        for pat, grp in ((_DECL_CTOR, (1, 2)), (_DECL_COPY, (1, 2)),
+                         (_DECL_PLAIN, (1, 2)), (_DECL_NEW, (3, 2))):
+            m = pat.match(line)
+            if m and m.group(grp[0]) in table:
+                locals_ty.setdefault(m.group(grp[1]), m.group(grp[0]))
+                break
+
+    mutated_from = _mutated_from(stmts, locals_ty, table, mutsets)
+
+    for idx, raw in enumerate(stmts):
         line = raw.strip()
         if not line or line.startswith("//"):
             continue
@@ -741,11 +869,54 @@ def skeleton(body, rc, table, classes, owning, where, known=None):
             out.append("    let mut %s = Box::new(%s::%s());   // new %s"
                        % (pname, cname, ctor, cname))
             known.add(pname)
+            locals_ty[pname] = cname
             continue
 
         m = _DELETE.match(line)
         if m:
             emitted("    drop(%s);   // delete" % m.group(1), [m.group(1)])
+            continue
+
+        # `T &r = v[i];` -- a C++ reference local. This is the only place a
+        # borrow enters the skeleton, and it is gated: unless what it
+        # borrows is mutated later in the body, the borrow cannot conflict
+        # with anything and is emitted as an ordinary read instead. Without
+        # that gate, two subscripts of one container -- legal C++, and
+        # common -- would collide as two `&mut` borrows.
+        m = _DECL_REF.match(line)
+        if m and m.group(1) in table or (m and m.group(1) in _PRIM):
+            rname, rhs = m.group(2), m.group(3).strip()
+            base, expr = None, None
+            sub = _SUBSCRIPT.match(rhs)
+            call = _RECV_CALL.match(rhs)
+            if sub and sub.group(1) in known:
+                base = sub.group(1)
+                cname = locals_ty.get(base)
+                target = table.get(cname) if cname else None
+                if target is not None and any(
+                        x.name == "index_op" for x in target.methods):
+                    expr = "%s.index_op(%s)" % (base, "0")
+            elif call and call.group(1) in known:
+                base = call.group(1)
+                cname = locals_ty.get(base)
+                target = table.get(cname) if cname else None
+                meth = call.group(2)
+                if target is not None:
+                    for x in target.methods:
+                        rt = parse_type(x.ret or "void")
+                        if x.name == meth and rt is not None and rt.ref:
+                            expr = "%s.%s()" % (base, meth)
+                            break
+            elif re.match(r"^\w+$", rhs) and rhs in known:
+                base, expr = rhs, "&mut %s" % rhs
+
+            if expr is not None and base in mutated_from[idx]:
+                out.append("    let %s = %s;   // %s &%s = %s"
+                           % (rname, expr, m.group(1), rname, rhs))
+                known.add(rname)
+            elif base is not None:
+                emitted("    let _ = &%s;   // read for &%s" % (base, rname),
+                        [base])
             continue
 
         m = _DECL_CTOR.match(line)
@@ -763,10 +934,12 @@ def skeleton(body, rc, table, classes, owning, where, known=None):
                            % (vname, _copy_expr(src, target), cname,
                               vname, src))
                 known.add(vname)
+                locals_ty[vname] = cname
             elif not src or not re.match(r"^\w+$", src):
                 out.append("    let mut %s = %s::%s();" % (
                     vname, cname, _ctor_for(target, cpprust._arity(args))))
                 known.add(vname)
+                locals_ty[vname] = cname
             continue
 
         m = _DECL_COPY.match(line)
@@ -778,6 +951,7 @@ def skeleton(body, rc, table, classes, owning, where, known=None):
                            % (vname, _copy_expr(src, target), cname,
                               vname, src))
                 known.add(vname)
+                locals_ty[vname] = cname
             continue
 
         # `T name;` -- default construction, and the declaration that makes
@@ -790,6 +964,7 @@ def skeleton(body, rc, table, classes, owning, where, known=None):
             out.append("    let mut %s = %s::%s();"
                        % (vname, cname, _ctor_for(target, 0)))
             known.add(vname)
+            locals_ty[vname] = cname
             continue
 
         m = _METHOD_CALL.match(line)
@@ -1158,6 +1333,8 @@ def _emit_skeletons(text, scan, table, classes, owning, spans):
            "// arithmetic cannot double-free anything, so leaving it out",
            "// makes the check quieter but never wrong.",
            ""]
+    mutsets = dict((n, _infer_receiver_mut(rc, table))
+                   for n, rc in table.items())
     for ret, name, params, body in _free_functions(text, scan, spans):
         where = "function %s" % name
         # The real parameter list, not an empty one. A parameter of class
@@ -1170,12 +1347,19 @@ def _emit_skeletons(text, scan, table, classes, owning, spans):
         except RustError:
             continue
         declared = set()
+        ptypes = {}
         for part in cpprust._split_top(params or ""):
-            pn = cpprust._param_name(part.strip())
+            part = part.strip()
+            pn = cpprust._param_name(part)
             if pn:
                 declared.add(pn)
+                pty = parse_type(re.sub(r"\b%s\b" % re.escape(pn), "",
+                                        part, count=1))
+                if pty is not None and pty.base in table:
+                    ptypes[pn] = pty.base
         stmts = skeleton(body, None, table, classes, owning, where,
-                         known=declared)
+                         known=declared, mutsets=mutsets,
+                         param_types=ptypes)
         out.append("pub fn __own_%s(%s) {" % (name, sig))
         out.extend(stmts)
         out.append("}")

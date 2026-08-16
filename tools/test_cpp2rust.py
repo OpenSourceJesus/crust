@@ -269,6 +269,20 @@ class Rustc(unittest.TestCase):
                                          mode="ownership"))
         self.assertEqual(code, 0, err)
 
+    def test_invalidation_is_reported(self):
+        code, err = self.check(raise_src(ReceiverMutability.V + """
+int bad(void) { V v; int &r = v[0]; v.push(7); return r; }
+""", mode="ownership"))
+        self.assertNotEqual(code, 0, "rustc accepted a stale reference")
+        self.assertTrue("E0499" in err or "E0502" in err, err)
+
+    def test_two_subscripts_are_accepted(self):
+        """The false positive the mutation gate exists to prevent."""
+        code, err = self.check(raise_src(ReceiverMutability.V + """
+int fine(void) { V v; int &a = v[0]; int &b = v[1]; return a + b; }
+""", mode="ownership"))
+        self.assertEqual(code, 0, err)
+
 
 class Operators(unittest.TestCase):
     """The eight member kinds that used to be dropped on the floor."""
@@ -362,6 +376,119 @@ class FreeFunctions(unittest.TestCase):
             "class A { public: int x; };\n"
             "int printf(const char *f, ...);")
         self.assertNotIn("pub fn printf", rust)
+
+
+class ReceiverMutability(unittest.TestCase):
+    """`const` does not survive into the IR, so it is inferred from bodies."""
+
+    V = """
+class V {
+public:
+    int n; int d[8];
+    V() { n = 0; }
+    int size() { return n; }
+    int &operator[](int i) { return d[i]; }
+    void push(int v) { d[n] = v; n = n + 1; }
+    int total() { return size() + n; }
+};
+"""
+
+    def test_reader_takes_shared_self(self):
+        """A method that only reads its fields can take `&self`. Marking
+        every method `&mut self` made a harmless `size()` collide with any
+        live borrow of the container."""
+        rust = raise_src(self.V)
+        self.assertIn("fn size(&self)", rust)
+
+    def test_writer_takes_mut_self(self):
+        rust = raise_src(self.V)
+        self.assertIn("fn push(&mut self", rust)
+
+    def test_reference_return_is_mutating(self):
+        """Handing out `&mut T` hands out the right to write through it."""
+        rust = raise_src(self.V)
+        self.assertIn("fn index_op(&mut self", rust)
+
+    def test_inference_reaches_a_fixed_point(self):
+        """`total` only calls `size`, which does not mutate, so neither
+        does it."""
+        rust = raise_src(self.V)
+        self.assertIn("fn total(&self)", rust)
+
+    def test_calling_a_mutator_is_mutating(self):
+        rust = raise_src("""
+class W {
+public:
+    int n;
+    void bump() { n = n + 1; }
+    void twice() { bump(); bump(); }
+};
+""")
+        self.assertIn("fn twice(&mut self)", rust)
+
+
+class Borrows(unittest.TestCase):
+    """Reference locals, which is where lifetimes stop being signature-deep."""
+
+    def test_invalidation_materialises_a_borrow(self):
+        """Borrow, mutate, use -- the iterator-invalidation shape. The
+        borrow has to be live across the mutation for rustc to object."""
+        rust = raise_src(ReceiverMutability.V + """
+int bad(void) { V v; int &r = v[0]; v.push(7); return r; }
+""", mode="ownership")
+        body = rust[rust.index("pub fn __own_bad"):]
+        self.assertIn("let r = v.index_op(0);", body)
+        self.assertLess(body.index("let r ="), body.index("&mut v"))
+        self.assertLess(body.index("&mut v"), body.index("let _ = &r;"))
+
+    def test_no_mutation_means_no_borrow(self):
+        """Two subscripts of one container is legal C++ and would be two
+        `&mut` borrows in Rust. With nothing mutating the container the
+        borrow cannot conflict, so it is not emitted at all."""
+        rust = raise_src(ReceiverMutability.V + """
+int fine(void) { V v; int &a = v[0]; int &b = v[1]; return a + b; }
+""", mode="ownership")
+        body = rust[rust.index("pub fn __own_fine"):]
+        self.assertNotIn("index_op", body)
+
+    def test_reader_call_does_not_trigger_a_borrow(self):
+        """`size()` takes `&self`, so it is not a mutation and must not make
+        a borrow live."""
+        rust = raise_src(ReceiverMutability.V + """
+int ok(void) { V v; int &a = v[0]; v.size(); return a; }
+""", mode="ownership")
+        body = rust[rust.index("pub fn __own_ok"):]
+        self.assertNotIn("index_op", body)
+
+    def test_pointers_do_not_borrow(self):
+        """A `T *` carries no lifetime; only a `T &` does."""
+        rust = raise_src(ReceiverMutability.V + """
+int p(void) { V v; int *q = &v.d[0]; v.push(1); return 0; }
+""", mode="ownership")
+        body = rust[rust.index("pub fn __own_p"):]
+        self.assertNotIn("index_op", body)
+
+
+class Statements(unittest.TestCase):
+
+    def test_comments_do_not_hide_statements(self):
+        """Bodies come from the unstripped text, so a statement preceded by
+        a comment used to miss every anchored pattern."""
+        rust = raise_src(Heap.NODE + """
+int main(void) {
+    Node *a = new Node();
+    /* a comment */
+    delete a;
+    return 0;
+}
+""", mode="ownership")
+        self.assertIn("drop(a);", rust)
+
+    def test_one_line_body_is_split(self):
+        rust = raise_src(Heap.NODE + """
+int main(void) { Node *a = new Node(); delete a; return 0; }
+""", mode="ownership")
+        self.assertIn("drop(a);", rust)
 
 
 if __name__ == "__main__":
