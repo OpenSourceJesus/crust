@@ -1810,6 +1810,22 @@ _SCALAR_TYPES = frozenset((
     "long", "char", "bool", "int", "size_t"))
 
 
+def _expand_cpp_rref(params, names):
+    """`__cpp_rref(T)` -> `T` for a scalar, `T &&` for a class.
+
+    The rvalue-reference counterpart of `__cpp_ref`, and it exists for the
+    same reason: a container cannot pick one spelling for both. A scalar has
+    nothing to move and no address to bind, so `push_back(std::move(3))` has
+    to stay by value; a class must not cross a call boundary by value at
+    all, so it binds a reference the move constructor then empties.
+    """
+    return _sub_code(
+        re.compile(r"(?<![\w.>])__cpp_rref\s*\(\s*([\w:]+)\s*\)"),
+        lambda mm: ("%s &&" % mm.group(1)
+                    if mm.group(1) in names else mm.group(1)),
+        params)
+
+
 def _expand_cpp_ref(params, names):
     """`__cpp_ref(T)` -> `T` for a scalar, `const T &` for a class.
 
@@ -1898,6 +1914,15 @@ def _lower_refs(text, names):
         lambda m: "%s *%s = &(%s);" % (m.group(1), m.group(2),
                                        m.group(3).strip()),
         text)
+    # An rvalue reference is a reference: `T &&o` is a pointer the source did
+    # not have to spell, exactly as `T &o` is. Taken before the single-`&`
+    # rule below, which is written to skip `&&` and would otherwise leave one
+    # `&` behind. There is no expression this could catch by mistake: the
+    # left operand of a logical `&&` is a value, and a bare type name is not
+    # one.
+    text = _sub_code(
+        re.compile(r"(?<![\w.&])((?:const\s+)?(?:%s))\s*&&\s*(\w+)" % alt),
+        lambda m: "%s *%s" % (m.group(1), m.group(2)), text)
     # Everything else: a reference parameter.
     text = _sub_code(
         re.compile(r"(?<![\w.&])((?:const\s+)?(?:%s))\s*&(?!&)\s*(\w+)" % alt),
@@ -1988,8 +2013,8 @@ def _external_info(name, dropfn):
     return {"ctor": False, "dtor": True, "ctors": {}, "methods": {},
             "fields": {}, "base": None, "slots": [], "root": None,
             "abstract": False, "vdtor": False, "vdtor_decl": None,
-            "ctor_refs": set(), "paths": {}, "copy": False,
-            "assign": False, "index": None, "arrow": None,
+            "ctor_refs": set(), "paths": {}, "copy": False, "move": False,
+            "assign": False, "moveassign": False, "move_methods": {}, "deleted": {}, "index": None, "arrow": None,
             "star": None, "augassign": {}, "cmp": {}, "conv": None,
             "vcall": {},
             "dropfn": dropfn, "external": True}
@@ -2143,8 +2168,8 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
     info = {"ctor": False, "dtor": False, "ctors": {}, "methods": {},
             "fields": {}, "base": base, "slots": slots, "root": root,
             "abstract": abstract, "vdtor": False, "vdtor_decl": None,
-            "ctor_refs": set(), "paths": {}, "copy": False,
-            "assign": False, "index": None, "arrow": None,
+            "ctor_refs": set(), "paths": {}, "copy": False, "move": False,
+            "assign": False, "moveassign": False, "move_methods": {}, "deleted": {}, "index": None, "arrow": None,
             "star": None, "augassign": {}, "cmp": {}, "conv": None,
             "dropfn": "%s_drop" % cname, "external": False}
     if base_info:
@@ -2183,9 +2208,16 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
     fieldset = set(info["fields"])
 
     ctors = [m for m in cls.members if m.kind == "ctor"]
-    copies = [m for m in ctors
-              if _is_copy_params(m.params, cname, cls.name, tsub, sub)]
-    plain = [m for m in ctors if m not in copies]
+    # An `&&` parameter satisfies `_is_copy_params` -- it is a reference with
+    # one more `&` -- so the two are separated here rather than there. They
+    # are not two copy constructors: they are a copy and a *move*, and each
+    # gets its own symbol.
+    refs = [m for m in ctors
+            if _is_copy_params(m.params, cname, cls.name, tsub, sub)]
+    moves = [m for m in refs
+             if _is_move_params(m.params, cname, cls.name, tsub, sub)]
+    copies = [m for m in refs if m not in moves]
+    plain = [m for m in ctors if m not in refs]
     by_arity = {}
     for c in plain:
         ar = _arity(sub(c.params or ""))
@@ -2200,21 +2232,12 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
         by_arity[ar] = c
     multi = len(plain) > 1
     if len(copies) > 1:
-        # An `&&` parameter reads as a copy constructor to the check above,
-        # because it is a reference with one more `&`. Named properly here:
-        # the two are not two copies, they are a copy and a *move*, and move
-        # semantics are a language feature rather than a missing overload.
-        if any("&&" in (c.params or "") for c in copies):
-            raise CppError(
-                "class %s: `%s(%s &&)` is a move constructor, and rvalue "
-                "references are not in the C++ subset. Ownership moves on "
-                "the Rust side of this project, which has them; here a class "
-                "is copied by its copy constructor. Remove the move "
-                "constructor -- the copy does the same work."
-                % (cls.name, cls.name, cls.name))
         raise CppError("class %s: more than one copy constructor" % cls.name)
+    if len(moves) > 1:
+        raise CppError("class %s: more than one move constructor" % cls.name)
     ctor = plain[0] if plain else None
     copy = copies[0] if copies else None
+    move = moves[0] if moves else None
     dtor = next((m for m in cls.members if m.kind == "dtor"), None)
 
     def make_prologue(member):
@@ -2288,7 +2311,7 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
         # and by reference it cannot bind `m[3]`, since a literal has no
         # address. So the spelling is decided per instantiation, like the
         # copy and destroy steps beside it.
-        params = _expand_cpp_ref(params, names)
+        params = _expand_cpp_ref(_expand_cpp_rref(params, names), names)
         refs = _ref_positions(params, _with_scalars(names))
         # A *scalar* reference parameter needs its uses dereferenced. A class
         # one does not: every use of it is a member access, and the symbol
@@ -2343,7 +2366,7 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
         if m.declared_only:
             # Prototype only. `emit` writes both, so the declaration is made
             # here and the definition left to whoever has the body.
-            dparams = _lower_refs(_expand_cpp_ref(sub(m.params or ""), names),
+            dparams = _lower_refs(_expand_cpp_ref(_expand_cpp_rref(sub(m.params or ""), names), names),
                                   _with_scalars(names))
             mname = _member_symbol(cname, m)
             if mname is not None:
@@ -2357,6 +2380,15 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             continue
         emitting_outline[0] = m.outline
         params = sub(m.params or "").strip()
+        if _needs_deleted_copy(sub(m.body or ""), known):
+            # A member whose body copies an element the element type cannot
+            # copy. C++ *deletes* such a member rather than rejecting the
+            # class, which is what makes `vector<unique_ptr<T>>` legal there
+            # and a copy of one an error at the call. Recorded rather than
+            # silently dropped, so a call site gets a diagnostic naming the
+            # reason instead of an undefined symbol from the C front end.
+            info["deleted"][m.name] = True
+            continue
         if m.kind == "ctor" and m is copy:
             # A copy constructor lowers to its own symbol: every other
             # constructor is `T_new`, so overloading it is not available.
@@ -2365,6 +2397,15 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             emit("void", "%s_copy" % cname, params,
                  make_prologue(m) + sub(m.body or ""))
             info["copy"] = True
+        elif m.kind == "ctor" and m is move:
+            # A move constructor gets `T_move`, beside `T_copy`, and for the
+            # same reason: `T_new` is taken and overloading it is not
+            # available. `T &&o` lowers to `T *o` like any other reference
+            # parameter, so the body reads `o->d` and can null it -- which is
+            # what leaves the source safe for the destructor that still runs.
+            emit("void", "%s_move" % cname, params,
+                 make_prologue(m) + sub(m.body or ""))
+            info["move"] = True
         elif m.kind == "ctor":
             ar = _arity(params)
             fn = _ctor_name(cname, ar, multi)
@@ -2389,7 +2430,7 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             info["index"] = {"fn": "%s__index" % cname,
                              "ret": tsub(iret.replace("&", "").strip()),
                              "refs": _ref_positions(
-                                 _expand_cpp_ref(params, names),
+                                 _expand_cpp_ref(_expand_cpp_rref(params, names), names),
                                  _with_scalars(names))}
             # The body returns the element; the lowered function returns
             # its address, which is what a reference is.
@@ -2424,6 +2465,14 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
                 lambda mm: "return &(%s);" % mm.group(1).strip(),
                 sub(m.body or ""))
             emit(sret.replace("&", "*"), "%s__star" % cname, params, sbody)
+        elif m.kind == "assign" and "&&" in (m.params or ""):
+            # `operator=(T &&)` -- move assignment. Its own symbol, because
+            # the two overloads would otherwise both be `T__assign` and the
+            # second would redefine the first. Which one a statement calls is
+            # decided at the call site by whether `std::move` is written
+            # there, since that is exactly what decides it in C++.
+            emit("void", "%s__moveassign" % cname, params, sub(m.body or ""))
+            info["moveassign"] = True
         elif m.kind == "assign":
             # Lowered to `T_assign(T *this, const T *o)`. Assignment is the
             # one place the subset needs a user hook: a struct copy of an
@@ -2461,8 +2510,26 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             info["dtor"] = True
         else:
             ar = _arity(params)
+            # A method taking `T &&` is a *move* overload. It is not told
+            # apart by arity -- `push_back(const T &)` and `push_back(T &&)`
+            # both take one argument -- but by whether the call site wrote
+            # `std::move`, which is exactly what decides it in C++ and
+            # exactly what already decides `operator=` from
+            # `operator=(T &&)`. Its own symbol, so the two can coexist.
+            #
+            # Read from the *expanded* parameters, because a container
+            # spells this `__cpp_rref(T)` and the `&&` only appears once the
+            # instantiation is known. That is also what makes the scalar
+            # case work: `__cpp_rref(int)` is plain `int`, so the two
+            # overloads would be the same signature -- there is nothing to
+            # move about a scalar -- and the move one is simply not emitted.
+            is_move_over = "&&" in _expand_cpp_rref(params, names)
+            if "__cpp_rref" in (m.params or "") and not is_move_over:
+                continue
             over = len([x for x in cls.members
-                        if x.kind == "method" and x.name == m.name]) > 1
+                        if x.kind == "method" and x.name == m.name
+                        and ("__cpp_rref" in (x.params or "")
+                             or "&&" in (x.params or "")) == is_move_over]) > 1
             if over and m.virt:
                 # One vtable slot per name, so an overloaded virtual has
                 # nowhere for its second signature to live.
@@ -2472,13 +2539,16 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
                     "would have to share it." % (cls.name, m.name))
             mfn = ("%s_%s_%d" % (cname, m.name, ar) if over
                    else "%s_%s" % (cname, m.name))
-            if ar in info["methods"].get(m.name, {}) and \
-                    info["methods"][m.name][ar]["owner"] == cname:
+            if is_move_over:
+                mfn = "%s__move" % mfn
+            slot = "move_methods" if is_move_over else "methods"
+            if ar in info[slot].get(m.name, {}) and \
+                    info[slot][m.name][ar]["owner"] == cname:
                 raise CppError(
                     "class %s: two `%s` methods take %d argument%s. "
                     "Overloads are resolved by argument count here."
                     % (cls.name, m.name, ar, "" if ar == 1 else "s"))
-            info["methods"].setdefault(m.name, {})[ar] = {
+            info[slot].setdefault(m.name, {})[ar] = {
                 "refs": emit(sub(m.ret), mfn, params, sub(m.body or "")),
                 # The return type is recorded so a call can be a receiver in
                 # turn: `o.node()->get()`. Monomorphised, because a method
@@ -2790,12 +2860,14 @@ def _conv_for(name, scopes, type_info):
     return None
 
 
-def _copy_source(expr, ctype, scopes, type_info):
-    """The object being copied, if `expr` names one of class `ctype`.
+def _named_object(expr, scopes, type_info):
+    """`(path, class)` for an expression that names an object, else None.
 
-    A local, or a chain of value members from one (`t.nums`). A call result
-    or any other expression is not something this pass can copy-construct
-    from, and guessing would be the whole point of the bug.
+    A local, or a chain of value members from one (`t.nums`). Factored out
+    of `_copy_source`, which asks whether a name is an object of a class it
+    already knows; expression-position `std::move` has to ask the other
+    question -- which class this name *is* -- because there is no
+    declaration beside it to read the type from.
     """
     if expr is None:
         return None
@@ -2820,7 +2892,239 @@ def _copy_source(expr, ctype, scopes, type_info):
             return None              # a pointer member is not the object
         out = "%s.%s" % (out, info["paths"].get(fld, fld))
         cls = fcls
+    return (out, cls)
+
+
+def _copy_source(expr, ctype, scopes, type_info):
+    """The object being copied, if `expr` names one of class `ctype`.
+
+    A local, or a chain of value members from one (`t.nums`). A call result
+    or any other expression is not something this pass can copy-construct
+    from, and guessing would be the whole point of the bug.
+    """
+    found = _named_object(expr, scopes, type_info)
+    if found is None:
+        return None
+    out, cls = found
     return out if cls == ctype else None
+
+
+_MOVE_CALL = re.compile(r"^__cpp_move\s*\(")
+
+
+def _move_operand(expr):
+    """The `x` in `__cpp_move(x)`, or None if this is not one.
+
+    Only when the move is the *whole* expression. `f(__cpp_move(a))` and
+    `__cpp_move(a).size()` are expression position, where materialising the
+    temporary needs a statement there is nowhere to put -- they are reported
+    by `_check_stray_moves` rather than half-handled here.
+    """
+    if expr is None:
+        return None
+    expr = expr.strip()
+    m = _MOVE_CALL.match(expr)
+    if m is None:
+        return None
+    close = _match_paren(expr, m.end() - 1)
+    if close is None or close != len(expr) - 1:
+        return None
+    return expr[m.end():close].strip()
+
+
+def _move_temporary(ctype, src, info, n):
+    """A move in expression position, as a GNU statement expression.
+
+    `({ T __cpp_mv0; T_move(&__cpp_mv0, &a); __cpp_mv0; })` -- declare a
+    temporary, move into it, yield it. That is what a C++ compiler does with
+    a materialised temporary, written out.
+
+    A statement expression is what makes this possible at all. Everywhere
+    else this pass meets expression position it reports, because a move has
+    to construct into something and C has no way to declare a temporary
+    inside an expression. `({ .. })` is exactly that way. It is a GNU
+    extension rather than ISO C, but gcc, clang and ShivyCX all implement
+    it, and all three were checked against this shape -- so the output stays
+    one file with no backend to choose between, which is the property the
+    whole pipeline is built on.
+
+    The temporary is deliberately **not** registered for destruction. It is
+    yielded by value, so what the caller receives is a bitwise copy holding
+    the resource, and the husk left behind owns nothing -- destroying it
+    would be destroying the copy the caller now owns. The *source* is still
+    dropped by its own scope, as every other move here leaves it.
+    """
+    tmp = "_cpp_mv%d" % n
+    if not info["move"]:
+        if not info["copy"]:
+            return None
+        # No move constructor: the copy binds the rvalue, exactly as in
+        # statement position and for the same reason.
+        return "({ %s %s; %s_copy(&%s, &%s); %s; })" % (
+            ctype, tmp, ctype, tmp, src, tmp)
+    return "({ %s %s; %s_move(&%s, &%s); %s; })" % (
+        ctype, tmp, ctype, tmp, src, tmp)
+
+
+def _needs_deleted_copy(body, known):
+    """Does this body copy an element whose type cannot be copied?
+
+    A supplied container says "copy an element" as `__cpp_copy(T, ..)`, and
+    for a `T` that owns something and offers no copy constructor there is no
+    such operation. C++ answers by *deleting* the member -- the container is
+    still a usable type, it just cannot be copied -- and this is that answer.
+    Refusing instead rejected `vector<unique_ptr<T>>` outright, over members
+    the program never calls.
+
+    Only a class that owns something. A plain-data element with no copy
+    constructor copies bitwise, exactly as `__cpp_copy` already lowers it.
+    """
+    for mm in re.finditer(r"(?<![\w.>])__cpp_copy\s*\(\s*([\w:]+)\s*,", body):
+        ent = known.get(mm.group(1))
+        if ent is not None and ent["dtor"] and not ent["copy"]:
+            return True
+    return False
+
+
+def _move_method_receiver(text, at, scopes, type_info):
+    """Is the `__cpp_move` at `at` the sole argument of `recv.meth(..)`?
+
+    Returns the receiver's class when that method has a move overload, else
+    None. This is the one place an expression-position move must *not* be
+    materialised: a move overload lowers to `meth(T *v)`, so what the call
+    wants is the address of the source, not a temporary yielded by value.
+    Materialising here would hand it a statement expression's result, whose
+    address cannot be taken.
+
+    Scanned backwards because the call rewriter has not run yet -- at this
+    point `v.push_back(..)` is still spelled the way the author wrote it.
+    """
+    j = at - 1
+    while j >= 0 and text[j].isspace():
+        j -= 1
+    if j < 0 or text[j] != "(":
+        return None
+    j -= 1
+    while j >= 0 and text[j].isspace():
+        j -= 1
+    end = j + 1
+    while j >= 0 and (text[j].isalnum() or text[j] == "_"):
+        j -= 1
+    meth = text[j + 1:end]
+    if not meth:
+        return None
+    while j >= 0 and text[j].isspace():
+        j -= 1
+    if j >= 0 and text[j] == ".":
+        j -= 1
+    elif j >= 1 and text[j - 1:j + 1] == "->":
+        j -= 2
+    else:
+        return None
+    rend = j + 1
+    while j >= 0 and (text[j].isalnum() or text[j] in "_." or
+                      (text[j] == ">" and j >= 1 and text[j - 1] == "-") or
+                      (text[j] == "-" and text[j + 1:j + 2] == ">")):
+        j -= 1
+    recv = text[j + 1:rend].strip()
+    if not recv:
+        return None
+    found = _named_object(recv.replace("->", "."), scopes, type_info)
+    if found is None:
+        return None
+    cls = found[1]
+    info = type_info.get(cls)
+    if info is None or meth not in info.get("move_methods", {}):
+        return None
+    return cls
+
+
+def _materialise_moves(expr, scopes, type_info, mvn):
+    """Rewrite every `__cpp_move(x)` in `expr` to a statement expression.
+
+    Called from the scope rewriter's fall-through, which is where an
+    expression-position move surfaces, and again from the `return` handler,
+    which consumes its operand whole and would otherwise carry one through
+    untouched.
+    """
+    if "__cpp_move" not in expr:
+        return expr
+    out = []
+    i = 0
+    while i < len(expr):
+        if expr.startswith("__cpp_move", i) and \
+                (i == 0 or not (expr[i - 1].isalnum() or expr[i - 1] == "_")):
+            om = _MOVE_CALL.match(expr, i)
+            if om is not None:
+                close = _match_paren(expr, om.end() - 1)
+                if close is not None:
+                    inner = expr[om.end():close].strip()
+                    found = _named_object(inner, scopes, type_info)
+                    if found is None:
+                        raise CppError(
+                            "`std::move(%s)`: the operand has to be an object "
+                            "this pass can name -- a local, or a chain of "
+                            "value members from one. Assign it to a typed "
+                            "local first." % inner)
+                    src, ctype = found
+                    info = type_info[ctype]
+                    made = _move_temporary(ctype, src, info, mvn[0])
+                    if made is None:
+                        raise CppError(
+                            "`std::move(%s)`: %s has a destructor but neither "
+                            "a move nor a copy constructor, so there is no "
+                            "way to construct the temporary this needs. Add "
+                            "`%s(%s &&o)`." % (inner, ctype, ctype, ctype))
+                    mvn[0] += 1
+                    out.append(made)
+                    i = close + 1
+                    continue
+        out.append(expr[i])
+        i += 1
+    return "".join(out)
+
+
+def _move_call(ctype, vname, src, info, where):
+    """`T_move(&b, &a);`, falling back to the copy constructor.
+
+    A class with no move constructor is *copied* from an rvalue, because
+    `std::move` is a cast rather than a call: it produces an rvalue, and
+    `T(const T &)` binds one perfectly well. So the fall-back is not a
+    concession, it is what C++ overload resolution does -- which is also
+    what makes adding `std::move` to an existing source safe.
+
+    The source is **not** dropped from the enclosing scope. A moved-from
+    object in C++ is valid-but-unspecified and is still destroyed; the move
+    constructor is what makes that harmless, by leaving the source holding
+    nothing. That is the one place this differs from Crust's own move-out,
+    which really does hand the object over and suppress the drop.
+    """
+    if not info["move"]:
+        return _copy_call(ctype, vname, src, info, where)
+    return "%s_move(&%s, &%s);" % (ctype, vname, src)
+
+
+def _check_stray_moves(text, path):
+    """Any `__cpp_move` left is one the declaration sites did not consume.
+
+    Move construction and move assignment are statements, and both are
+    rewritten where they stand. What reaches here is `std::move` in
+    *expression* position -- an argument, a `return`, an operand -- where
+    lowering it means copy-constructing into a temporary, which needs a
+    statement to declare. That is the same wall `_check_by_value` and the
+    chaining rule hit, and it is reported for the same reason: emitting
+    `__cpp_move(a)` into the C would name a function nothing defines.
+    """
+    for m in re.finditer(r"(?<![\w.>])__cpp_move\s*\(", text):
+        close = _match_paren(text, m.end() - 1)
+        inner = text[m.end():close] if close is not None else "?"
+        raise CppError(
+            "%s: `std::move(%s)` is in expression position, which is not in "
+            "the C++ subset yet. A move has to construct into something, and "
+            "here there is no declaration to construct into -- the temporary "
+            "would need a statement of its own. Move into a local first "
+            "(`T tmp = std::move(%s);`) and pass `&tmp`."
+            % (os.path.basename(path), inner.strip(), inner.strip()))
 
 
 def _copy_call(ctype, vname, src, info, where):
@@ -2930,6 +3234,7 @@ def _rewrite_scopes(text, type_info):
     scopes = [_Frame("file", None)]
     aggs = 0               # depth of enclosing struct/union/enum bodies
     tmp = [0]              # counter for return-value temporaries
+    mvn = [0]              # counter for materialised move temporaries
     i, n = 0, len(text)
     in_str = None
     while i < n:
@@ -2997,6 +3302,13 @@ def _rewrite_scopes(text, type_info):
                 drops = unwind(fidx, moved) if fidx is not None else ""
                 if end is not None and (drops or moved):
                     expr = text[m.end():end].strip()
+                    # A `std::move` here is expression position, and the
+                    # spill below is already the statement it needs: the
+                    # operand is evaluated into the temporary *before* the
+                    # drops run, so the move happens while the source is
+                    # still alive and the source's own drop then finds the
+                    # husk the move left.
+                    expr = _materialise_moves(expr, scopes, type_info, mvn)
                     rtype = scopes[fidx].ret
                     if not expr:
                         out.append("{ %sreturn; }" % drops)
@@ -3068,6 +3380,29 @@ def _rewrite_scopes(text, type_info):
                 i = m.end()
                 continue
             out.append("%s %s; " % (ctype, vname))
+            # `T b(std::move(a));` -- a move construction, which is a copy
+            # construction that picks the other constructor. The operand is
+            # resolved the same way a copy's is, so a move from something
+            # this pass cannot name is refused for the same reason.
+            moved = _move_operand(args)
+            if moved is not None:
+                src = _copy_source(moved, ctype, scopes, type_info)
+                if src is None:
+                    raise CppError(
+                        "`%s %s(std::move(%s));`: the operand of `std::move` "
+                        "has to be an object of type %s that this pass can "
+                        "name -- a local, or a chain of value members from "
+                        "one. Assign to a typed local first."
+                        % (ctype, vname, moved, ctype))
+                out.append(_move_call(ctype, vname, src, info, ctype))
+                # The source stays live: a moved-from object is still
+                # destroyed in C++, and the move constructor is what makes
+                # that harmless.
+                if info["dtor"]:
+                    scopes[-1].live.append((ctype, vname))
+                scopes[-1].vals[vname] = ctype
+                i = m.end()
+                continue
             src = _copy_source(args, ctype, scopes, type_info)
             ar = _arity(args)
             if src is None and ar not in info["ctors"]:
@@ -3103,6 +3438,24 @@ def _rewrite_scopes(text, type_info):
             info = type_info[ctype]
             if len(scopes) <= 1:
                 out.append(m.group(0))
+                i = m.end()
+                continue
+            # `T b = std::move(a);` -- the benchmark's own shape.
+            moved = _move_operand(rhs)
+            if moved is not None:
+                src = _copy_source(moved, ctype, scopes, type_info)
+                if src is None:
+                    raise CppError(
+                        "`%s %s = std::move(%s);`: the operand of `std::move` "
+                        "has to be an object of type %s that this pass can "
+                        "name -- a local, or a chain of value members from "
+                        "one. Assign to a typed local first."
+                        % (ctype, vname, moved, ctype))
+                out.append("%s %s; " % (ctype, vname))
+                out.append(_move_call(ctype, vname, src, info, ctype))
+                if info["dtor"]:
+                    scopes[-1].live.append((ctype, vname))
+                scopes[-1].vals[vname] = ctype
                 i = m.end()
                 continue
             src = _copy_source(rhs, ctype, scopes, type_info)
@@ -3224,6 +3577,27 @@ def _rewrite_scopes(text, type_info):
                 if lhs in fr.vals:
                     ctype = fr.vals[lhs]
                     break
+            info_a = type_info.get(ctype) if ctype is not None else None
+            moved = _move_operand(m.group(2)) if info_a is not None else None
+            if moved is not None and (info_a["moveassign"] or info_a["assign"]):
+                # `b = std::move(a);`. With no `operator=(T &&)` the const-ref
+                # overload binds the rvalue, which is what C++ does -- so a
+                # source that gains a `std::move` keeps working before the
+                # move assignment is written.
+                src = _copy_source(moved, ctype, scopes, type_info)
+                if src is None:
+                    raise CppError(
+                        "`%s = std::move(%s)`: the operand of `std::move` has "
+                        "to be an object of type %s that this pass can name. "
+                        "Assign it to a typed local first."
+                        % (lhs, moved, ctype))
+                fn = "%s__moveassign" % ctype if info_a["moveassign"] \
+                    else "%s__assign" % ctype
+                # The source is not dropped from this scope: a moved-from
+                # object is still destroyed in C++.
+                out.append("%s(&%s, &%s);" % (fn, lhs, src))
+                i = m.end()
+                continue
             if ctype is not None and type_info[ctype]["assign"]:
                 rhs = m.group(2).strip()
                 if "=" in _blank_strings(rhs).replace("==", ""):
@@ -3252,6 +3626,29 @@ def _rewrite_scopes(text, type_info):
                     "destroyed. Define `%s &operator=(const %s &o)`, or copy "
                     "at construction (`%s b(a);`)."
                     % (lhs, m.group(2).strip(), ctype, ctype, ctype, ctype))
+
+        if text.startswith("__cpp_move", i) and \
+                (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")):
+            # Everything above consumed the *statement* positions -- a
+            # declaration, an assignment -- and returned before reaching
+            # here. What is left is expression position, which is exactly
+            # what a statement expression can hold.
+            om = _MOVE_CALL.match(text, i)
+            if om is not None:
+                close = _match_paren(text, om.end() - 1)
+                if close is not None:
+                    if _move_method_receiver(text, i, scopes,
+                                             type_info) is not None:
+                        # A move overload takes the source by reference, so
+                        # this one is carried through untouched and the call
+                        # rewriter picks the overload from it.
+                        out.append(text[i:close + 1])
+                        i = close + 1
+                        continue
+                    out.append(_materialise_moves(
+                        text[i:close + 1], scopes, type_info, mvn))
+                    i = close + 1
+                    continue
 
         out.append(text[i])
         i += 1
@@ -3729,6 +4126,37 @@ def _is_copy_params(params, cname, raw_name, tsub, sub):
     return len(toks) >= 2 and "*" not in toks and toks[0] in (cname, raw_name)
 
 
+def _mark_std_move(text):
+    """`std::move(x)` -> `__cpp_move(x)`, on the qualified spelling only.
+
+    `std::` is stripped rather than resolved, so this has to run before that
+    happens: afterwards `move(x)` is just a call, and a project with its own
+    `move` -- litehtml moves boxes -- would have every one of them rewritten.
+    Requiring the qualifier is the whole safeguard, and it costs only
+    `using namespace std;` plus a bare `move`, which is a shape worth not
+    guessing at anyway.
+
+    `std::forward` is deliberately absent: it means something only inside a
+    template taking `T &&`, which this subset does not have, so a file naming
+    it is refused elsewhere rather than quietly moved from.
+    """
+    return _sub_code(re.compile(r"\bstd\s*::\s*move\s*\("), "__cpp_move(",
+                     text)
+
+
+def _is_move_params(params, cname, raw_name, tsub, sub):
+    """Is this parameter list a *move* constructor's -- one `T &&`?
+
+    Read on the spelling, like `_is_copy_params`, and before reference
+    lowering for the same reason. An `&&` parameter satisfies that test too
+    -- it is a reference with one more `&` -- so the two are told apart by
+    this one, and a caller that wants only copies has to subtract them.
+    """
+    if not _is_copy_params(params, cname, raw_name, tsub, sub):
+        return False
+    return "&&" in (params or "")
+
+
 def _emit_method_call(expr, cls, is_ptr, meth, args, ent, cinfo):
     """One lowered method call, as a C expression.
 
@@ -3802,7 +4230,8 @@ def _rewrite_calls(text, cinfo, free_refs):
     field_re = re.compile(
         r"(?<![\w.>])(\w+)((?:\s*(?:\.|->)\s*\w+)+)(?!\s*\()")
     builtin_re = re.compile(
-        r"(?<![\w.>])(__cpp_copy|__cpp_drop|__cpp_eq|__cpp_share_hook)"
+        r"(?<![\w.>])(__cpp_copy|__cpp_movein|__cpp_drop|__cpp_eq"
+        r"|__cpp_share_hook)"
         r"\s*\(")
     # `v[i]` / `a.b[i]` on a class that overloads subscript.
     index_re = re.compile(r"(?<![\w.>\]])(\w+)((?:\s*(?:\.|->)\s*\w+)*)\s*\[")
@@ -4011,6 +4440,40 @@ def _rewrite_calls(text, cinfo, free_refs):
                    if close is not None else None)
             if got is not None and got[1] in cinfo:
                 expr, cls, is_ptr = got
+                raw = text[op + 1:close]
+                mvarg = _move_operand(raw.strip())
+                if mvarg is not None and \
+                        meth in cinfo[cls].get("move_methods", {}):
+                    # `v.push_back(std::move(p))`. The overload is chosen by
+                    # the `std::move` being written, exactly as `operator=`
+                    # is -- there is no arity to tell them apart. The
+                    # operand is passed by reference, so `fix_args` takes
+                    # its address like any other reference argument and no
+                    # temporary is built.
+                    ent = _pick(cinfo[cls]["move_methods"][meth], mvarg,
+                                cls, meth)
+                    args = fix_args(mvarg, ent["refs"], scopes)
+                    expr = _emit_method_call(expr, cls, is_ptr, meth, args,
+                                             ent, cinfo)
+                    rcls, rptr = _ret_class(ent["ret"], cinfo)
+                    expr, end = follow(expr, rcls, rptr, close + 1, meth)
+                    out.append(expr)
+                    i = end
+                    continue
+                if meth in cinfo[cls].get("deleted", {}) and \
+                        meth not in cinfo[cls]["methods"]:
+                    # The member was deleted because its body copies an
+                    # element the element type cannot copy. C++ deletes it
+                    # too -- but a *call* to a deleted member is an error
+                    # there, and it has to be one here rather than an
+                    # undefined symbol from the C front end.
+                    raise CppError(
+                        "`%s::%s` copies an element, and this element type "
+                        "has a destructor and no copy constructor -- so the "
+                        "member is deleted, exactly as in C++. Give the "
+                        "element a copy constructor, or hand the element "
+                        "over with `std::move(..)` if it has a move "
+                        "constructor." % (cls, meth))
                 if meth in cinfo[cls]["methods"]:
                     ent = _pick(cinfo[cls]["methods"][meth],
                                 text[op + 1:close], cls, meth)
@@ -4054,6 +4517,31 @@ def _rewrite_calls(text, cinfo, free_refs):
                                % (ty, parts[1], parts[2]))
                 else:
                     out.append("(void)0")
+                i = close + 1
+                continue
+            if kind == "__cpp_movein":
+                # `__cpp_movein(T, dst, srcptr)` -- construct `dst` from an
+                # element the caller has handed over. The counterpart of
+                # `__cpp_copy`, and the reason a container can hold a
+                # move-only element at all: `__cpp_copy` refuses one, which
+                # is correct, so a move needs its own spelling rather than a
+                # weakening of that.
+                if ty not in cinfo:
+                    # A scalar has nothing to move; the assignment is the
+                    # whole operation, as it is for `__cpp_copy`.
+                    out.append("(%s) = (%s)" % (parts[1], parts[2]))
+                elif cinfo[ty]["move"]:
+                    out.append("%s_move(&%s, %s)" % (ty, parts[1], parts[2]))
+                elif cinfo[ty]["copy"]:
+                    # No move constructor: the copy binds the rvalue, which
+                    # is what C++ overload resolution does here too.
+                    out.append("%s_copy(&%s, %s)" % (ty, parts[1], parts[2]))
+                else:
+                    raise CppError(
+                        "`__cpp_movein(%s, ..)`: %s has neither a move nor a "
+                        "copy constructor, so an element cannot be "
+                        "constructed in place. Add `%s(%s &&o)`."
+                        % (ty, ty, ty, ty))
                 i = close + 1
                 continue
             if kind == "__cpp_eq":
@@ -4452,6 +4940,18 @@ public:
         }
         if (vn < vcap) { __cpp_copy(T, vd[vn], v); vn = vn + 1; }
     }
+    /* The move overload. Told apart from the one above by whether the call
+       site wrote `std::move`, not by arity -- both take one argument. This
+       is what lets a container hold a move-only element: `__cpp_copy`
+       refuses one, correctly, so a move needs its own spelling. */
+    void push_back(__cpp_rref(T) v) {
+        if (vn == vcap) {
+            int m = vcap * 2;
+            if (m < 4) { m = 4; }
+            reserve(m);
+        }
+        if (vn < vcap) { __cpp_movein(T, vd[vn], v); vn = vn + 1; }
+    }
     void pop_back() { if (vn > 0) { vn = vn - 1; __cpp_drop(T, vd[vn]); } }
     void clear() { while (vn > 0) { vn = vn - 1; __cpp_drop(T, vd[vn]); } }
     /* No `T get(int i)`: returning an element by value copies an object the
@@ -4526,6 +5026,15 @@ class unique_ptr {
 public:
     unique_ptr() { up = 0; }
     unique_ptr(T *q) { up = q; }
+    /* The move is what makes this usable without `release()`. There is
+       still no copy constructor, so copying one is refused by the Rule of
+       Three exactly as before -- which is what move-only means. */
+    unique_ptr(unique_ptr<T> &&o) { up = o.up; o.up = 0; }
+    unique_ptr<T> &operator=(unique_ptr<T> &&o) {
+        /* Guarded: `a = std::move(a)` would otherwise release the object
+           and then adopt the pointer it just freed. */
+        if (up != o.up) { reset(o.up); o.up = 0; }
+    }
     ~unique_ptr() { reset(0); }
     T *get() { return up; }
     T *operator->() { return up; }
@@ -5122,6 +5631,12 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     if basedir is not None or incdirs:
         text = _expand_headers(text, basedir or ".", incdirs,
                                defines=set(defines or ()))
+    # `std::move` is read here, before `std::` is stripped, because after
+    # that it is indistinguishable from a method or function the project
+    # named `move` -- and a layout engine moving a box is not a rarity.
+    # Rewritten to `__cpp_move`, the spelling the element builtins already
+    # use, so the rest of the pass has one reserved name to look for.
+    text = _mark_std_move(text)
     text = _std_prelude(text)
     std_classes = _STD_CLASSES
     # Function templates come out before anything reads the file. Their
@@ -5405,26 +5920,52 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     # Where each class sits, so an instantiation can be held back until the
     # classes it is built over are complete.
     at = dict((c.name, k) for k, (_s, _e, c) in enumerate(classes))
-    deferred = {}
-    for idx, (start, end, cls) in enumerate(classes):
-        insts = wanted.get(cls.name, []) if cls.tparams else [None]
-        for targs in insts or []:
+    # Each instantiation's slot: the class index it must be emitted after.
+    # Two things can push it down, and the second is why this is a fixpoint
+    # rather than one pass. A template argument may name a *class*, which is
+    # `at`; it may also name another *instantiation*, which has a slot of its
+    # own that may itself have been pushed down. `vector<unique_ptr<Thing>>`
+    # is exactly that chain: `unique_ptr<Thing>` waits for `Thing`, a user
+    # class declared below both templates, so `vector<unique_ptr_Thing>` has
+    # to wait for it too. Reading only `at` missed the middle step, and the
+    # vector was emitted while its element was still an unknown name -- which
+    # cost it the knowledge that the element cannot be copied.
+    slot, insts_all = {}, []
+    for idx, (_s, _e, cls) in enumerate(classes):
+        for targs in (wanted.get(cls.name, []) if cls.tparams else []):
             if not targs:
                 continue
-            need = max([at.get(_base_name(a), -1) for a in targs] + [-1])
+            nm = _mono_name(cls.name, targs)
+            slot[nm] = idx
+            insts_all.append((idx, cls, targs, nm))
+    for _ in range(len(insts_all) + 2):
+        changed = False
+        for idx, cls, targs, nm in insts_all:
+            need = slot[nm]
+            for a in targs:
+                need = max(need, at.get(_base_name(a), -1))
+                if a in slot:
+                    need = max(need, slot[a])
             # Unless the class it depends on *derives* from it. That is the
             # CRTP shape -- `class node : public enable_shared_from_this<node>`
             # -- and there the base has to come first. It can: such a base
             # holds a `T *`, never a `T`, so it needs no complete type.
-            if need > idx and _derives_from(classes[need][2],
-                                            cls.name, targs):
-                need = -1
-            if need > idx:
-                # `vector<floated_box>` copies and destroys its elements, so
-                # its body needs `floated_box` *complete* -- and the supplied
-                # containers are emitted above the user's classes by
-                # construction. Held back to just after the class it needs.
-                deferred.setdefault(need, []).append((cls, targs))
+            if need > idx and need < len(classes) and \
+                    _derives_from(classes[need][2], cls.name, targs):
+                need = idx
+            if need > slot[nm]:
+                slot[nm] = need
+                changed = True
+        if not changed:
+            break
+    deferred = {}
+    for idx, cls, targs, nm in insts_all:
+        if slot[nm] > idx:
+            # `vector<floated_box>` copies and destroys its elements, so its
+            # body needs `floated_box` *complete* -- and the supplied
+            # containers are emitted above the user's classes by
+            # construction. Held back to just after the class it needs.
+            deferred.setdefault(slot[nm], []).append((cls, targs))
 
     def emit_one(cls, targs):
         (names_, protos, defs, tails), cname, info = _emit_class(
@@ -5584,6 +6125,12 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     # until `_rewrite_scopes` turns it into `Buf c; Buf_copy(&c, &a);`, and
     # reading it earlier cannot tell it from a call handing `a` away.
     _check_owning_args(_blank_directives(out), cinfo, path)
+
+    # After `_rewrite_scopes`, which is what consumes a `std::move` in the
+    # statement positions the subset lowers. Anything still spelled here is
+    # expression position, and would otherwise reach the C front end as a
+    # call to a function nothing declares.
+    _check_stray_moves(_blank_directives(out), path)
 
     # `new` and `delete` lower to `malloc`/`free`, so their declarations have
     # to be in scope. Spelled the way the rest of Crust spells them rather
