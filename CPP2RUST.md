@@ -72,6 +72,7 @@ the exercise is that the two arrive at them independently:
 | destructor and no copy constructor, copied (Rule of Three) | `E0382` borrow of moved value |
 | `delete` twice, or a read after one | `E0382`, via `Box` |
 | `T &f()` returning a reference | lifetime does not live long enough |
+| a reference used across a mutation | `E0499` / `E0502` (iterator invalidation) |
 | `goto` with a destructor pending | there is no `goto` |
 
 A worked case. `Owner` has a destructor and no copy constructor:
@@ -178,11 +179,76 @@ the move above it had nothing to collide with, and the Rule of Three case
 went silent while cpprust was still reporting it. Reads now survive the
 statements around them.
 
-A third was subtler. Statements were split on **newlines**, so a body
-written `{ Node *a = new Node(); delete a; }` on one line lost everything
-after the first statement and the function was checked for nothing. Splitting
-is now on statement boundaries, tracking parenthesis depth and string
-literals.
+Two more were the same failure in different clothes. Statements were split on
+**newlines**, so a body written `{ Node *a = new Node(); delete a; }` on one
+line lost everything after the first statement. And bodies were taken from
+the *unstripped* text, so any statement preceded by a comment arrived as
+`/* .. */\n    v.push(7);` and missed every anchored pattern — which is why
+the invalidation check appeared not to work on its own test case. Splitting
+is now on statement boundaries tracking parenthesis depth and string
+literals, and comments are blanked first.
+
+The pattern is worth naming since it has now recurred four times: this pass
+fails by **quietly checking less than it appears to**, never by reporting
+something false. That asymmetry is by design, but it does mean a silent
+success proves nothing, and every capability here needs a test that fails
+before the feature exists.
+
+## Receiver mutability
+
+`cpprust._split_members` does not carry `const`, so whether a method takes
+`&self` or `&mut self` is inferred from what its body does: a method is
+mutating if it assigns to one of its own fields, hands out the address of
+one, returns a reference, or calls another mutating method of the same class
+(a fixed point).
+
+This is not cosmetic. With every method marked `&mut self`, a harmless
+`v.size()` collided with any live borrow of `v`, and the tool reported its
+own mapping as a finding. Inferring it means:
+
+```cpp
+int size() { return n; }              -> fn size(&self) -> i32
+void push(int v) { d[n] = v; n++; }   -> fn push(&mut self, v: i32)
+int &operator[](int i)                -> fn index_op(&mut self, ..) -> &mut i32
+int total() { return size() + n; }    -> fn total(&self) -> i32
+```
+
+`total` is `&self` because the only method it calls is not mutating.
+`index_op` is mutating because handing out `&mut T` hands out the right to
+write through it.
+
+## Borrows, and the gate on them
+
+A C++ **reference** local is the only thing that becomes a live Rust borrow.
+Pointers do not, for the reason given below: a `T *` carries no lifetime.
+
+The borrow is *gated* on a later mutation of what it borrows. Ungated, this
+would fire on legal C++:
+
+```cpp
+int &a = v[0];
+int &b = v[1];        // two &mut borrows of v -- E0499, but fine in C++
+```
+
+So a reference local is emitted as a borrow only when the thing it borrows
+is mutated at or after that point, by a method inferred `&mut self` above.
+That keeps the shape that is actually a bug:
+
+```cpp
+V v;
+int &r = v[0];        // borrow
+v.push(7);            // mutate while borrowed
+return r;             // use the stale reference
+```
+```rust
+let mut v = V::new();
+let r = v.index_op(0);   // borrow of v
+let _ = &mut v;          // .push() -- second mutable borrow
+let _ = &r;              // r read here, so the borrow is live across it
+```
+
+`rustc` reports E0499. This is iterator invalidation, and it is the first
+check here that lifetimes rather than moves are responsible for.
 
 ## What is raised
 
@@ -298,11 +364,12 @@ to do to this file.
 
 * Bodies are stubs or skeletons, so nothing checks control flow, arithmetic
   overflow, or anything an expression does.
-* The lifetime row of the table above is earned only at the **signature**
-  level: `operator[]` returns `&mut T` with an elided lifetime, so the
-  borrow is rustc's business, but no skeleton yet builds the two overlapping
-  borrows that would make it fire. Iterator invalidation is the obvious next
-  target and needs real expression translation rather than erasure.
+* Borrows are gated on a *later* mutation, so an invalidation whose
+  mutation the skeleton could not read goes unreported. Quieter, as always,
+  rather than wrong.
+* Only subscripts, reference-returning method calls, and bare names are
+  recognised on the right of a reference local. A reference bound to
+  anything more involved falls back to a read.
 * A skeleton never calls another skeleton, so nothing is interprocedural.
 * Members defined in another translation unit are not raised, for the same
   reason CPPRUST.md gives: translating is not linking.
