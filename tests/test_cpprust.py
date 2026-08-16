@@ -946,9 +946,22 @@ class TestCppByValue(unittest.TestCase):
     copy of a released object -- a use-after-free.
     """
 
-    def test_by_value_parameter_is_error(self):
+    def test_by_value_parameter_is_destroyed_by_the_callee(self):
+        # No longer refused. A by-value owning parameter is an object the
+        # callee owns, and C++ destroys it when the function returns -- so
+        # it is registered like a local and dropped on every exit.
+        out = cpprust.translate(_OWNING + "void take(Own b) { b.p = 0; }")
+        self.assertIn("Own_drop(&b)", out)
+
+    def test_by_value_argument_without_a_copy_is_error(self):
+        # The caller has to *construct* the parameter, since the callee
+        # destroys it. `Own` has a destructor and no copy constructor, so
+        # there is nothing to construct it with -- reported at the call,
+        # where the choice is, rather than at the declaration.
         with self.assertRaises(cpprust.CppError) as cm:
-            cpprust.translate(_OWNING + "void take(Own b) { b.p = 0; }")
+            cpprust.translate(
+                _OWNING + "void take(Own b) { b.p = 0; }"
+                "void f(void) { Own a; take(a); }")
         self.assertIn("by value", cm.exception.message)
 
     def test_by_value_return_of_a_bare_local_is_a_move(self):
