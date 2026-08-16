@@ -503,5 +503,71 @@ public:
             "deleted")
 
 
+class TestByValueOwningParameters(Base):
+    """A by-value owning parameter is an object the *callee* owns.
+
+    C++ constructs it at the call and destroys it when the function
+    returns. This used to be refused because neither half was written: the
+    copy was never constructed and never destroyed. Both halves exist now,
+    and they have to travel together -- writing only the callee's drop
+    turns every call into a double free.
+    """
+
+    SINK = BUF + "int sink(Buf b) { return 0; }\n"
+
+    def test_callee_drops_the_parameter(self):
+        self.assertLowers(self.SINK, "Buf_drop(&b)")
+
+    def test_move_argument_is_materialised(self):
+        self.assertLowers(
+            self.SINK + "int go(void) { Buf a; int r = sink(std::move(a));"
+            " return r; }",
+            "Buf_move(&_cpp_mv0, &a);")
+
+    def test_copy_argument_is_constructed(self):
+        """`sink(a)` copy-constructs, because the callee will destroy it.
+
+        A struct copy here would leave both sides owning one buffer and
+        both freeing it -- which is what happened before the call sites
+        were rewritten, and what a sanitizer caught immediately.
+        """
+        self.assertLowers(
+            COPYONLY + "int sink(Cbuf b) { return 0; }\n"
+            "int go(void) { Cbuf a; int r = sink(a); return r; }",
+            "Cbuf_copy(&_cpp_ba0, &(a));")
+
+    def test_call_ending_in_a_semicolon_is_not_a_declaration(self):
+        """`int r = sink(a);` ends in `;`, and so does a declaration.
+
+        Told apart by whether the parentheses hold *parameters* -- a type
+        and a name -- rather than by what follows them. Reading the
+        terminator alone left this call's argument handed over as a struct
+        copy while the identical call inside a `return` was rewritten.
+        """
+        out = self.lower(
+            COPYONLY + "int sink(Cbuf b) { return 0; }\n"
+            "int go(void) { Cbuf a; int r = sink(a); return r; }")
+        self.assertIn("_cpp_ba", out)
+
+    def test_argument_without_a_copy_constructor_is_refused(self):
+        """Nothing to construct the parameter with. Reported at the call."""
+        src = """
+class Own {
+public:
+    int *p;
+    Own() { p = 0; }
+    ~Own() { p = 0; }
+};
+int sink(Own b) { return 0; }
+int go(void) { Own a; int r = sink(a); return r; }
+"""
+        self.refuses(src, "std::move")
+
+    def test_by_value_return_is_still_checked(self):
+        """Only the parameter half was relaxed; the return half was not."""
+        self.refuses(
+            BUF + "Buf mk(void) { Buf a; return f(a); }", "by value")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

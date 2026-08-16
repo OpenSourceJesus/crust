@@ -44,12 +44,14 @@ The subset, deliberately small:
     double free. `operator=` is not in the subset, so assigning to an
     owning object is refused for the same reason. A class with no
     destructor owns nothing, and copies bitwise exactly as C++ would.
-  * an owning class never crosses a call boundary by value. A by-value
-    parameter is a copy no constructor ran for and no destructor will run
-    for; a by-value *return* is worse, since the local is destroyed on the
-    way out and the caller receives a copy of a released object. Both are
-    errors naming the fix (`T &`, or `T *`). A class with no destructor owns
-    nothing and passes by value freely.
+  * a by-value owning *parameter* is an object the callee owns: it is
+    constructed at the call -- moved in when the site writes `std::move`,
+    copied otherwise -- and dropped on every exit from the function, which
+    is what C++ does. An argument whose class has no copy constructor is an
+    error naming `std::move`. A by-value *return* is still refused unless it
+    returns a bare local, since the local is destroyed on the way out and
+    the caller would receive a copy of a released object. A class with no
+    destructor owns nothing and passes by value freely.
   * constructors and a destructor: a local `Type name(args);` becomes
     `Type_new` at the declaration and `Type_drop` at the closing `}` of the
     enclosing block (inside the `.cpp` only -- the include hook never sees
@@ -2909,7 +2911,7 @@ def _copy_source(expr, ctype, scopes, type_info):
     return out if cls == ctype else None
 
 
-_MOVE_CALL = re.compile(r"^__cpp_move\s*\(")
+_MOVE_CALL = re.compile(r"__cpp_move\s*\(")   # `.match()` anchors; `^` would pin to index 0
 
 
 def _move_operand(expr):
@@ -3267,7 +3269,23 @@ def _rewrite_scopes(text, type_info):
                 kind, ret = _brace_kind(look, i, len(scopes) == 1)
                 if kind != "func":
                     ret = scopes[-1].ret
-                scopes.append(_Frame(kind, ret))
+                fr = _Frame(kind, ret)
+                if kind == "func":
+                    # A by-value owning parameter is an object the callee
+                    # owns: C++ destroys it when the function returns, and a
+                    # parameter is exactly a local for that purpose. Reference
+                    # lowering has already run, so a class still spelled by
+                    # value here really is by value -- a `T &` the author
+                    # wrote is a `T *` by now.
+                    for part in _split_top(_params_at(look, i) or ""):
+                        pcls = _by_value_class(part.strip(), type_info)
+                        if pcls is None or not type_info[pcls]["dtor"]:
+                            continue
+                        pnm = _param_name(part.strip())
+                        if pnm:
+                            fr.live.append((pcls, pnm))
+                            fr.vals[pnm] = pcls
+                scopes.append(fr)
             out.append(text[i])
             i += 1
             continue
@@ -3818,19 +3836,21 @@ def _check_owning_args(text, cinfo, path):
 def _check_by_value(text, cinfo, path):
     """Reject by-value class parameters and returns for owning classes.
 
-    Both are silent miscompiles otherwise. A by-value parameter is a struct
-    copy that no constructor ran for and no destructor will run for. A
-    by-value *return* is worse: the local is destroyed on the way out, so
-    the caller receives a copy of an object whose resources were just
-    released -- a use-after-free that no diagnostic points at.
+    A by-value *return* is a silent miscompile otherwise: the local is
+    destroyed on the way out, so the caller receives a copy of an object
+    whose resources were just released -- a use-after-free that no
+    diagnostic points at.
 
-    Doing these properly means copy-constructing into a temporary at the
-    call site, which needs a statement, and this is expression position.
-    Classes with no destructor own nothing and are left alone.
+    A by-value *parameter* used to be refused here for the matching reason,
+    that the copy was never constructed and never destroyed. Both halves
+    exist now, so instead of refusing this collects them:
+    `{function: {position: (class, parameter name)}}`. Classes with no
+    destructor own nothing and are left alone.
     """
+    byval = {}
     owning = set(n for n in cinfo if cinfo[n]["dtor"])
     if not owning:
-        return
+        return byval
     for m in re.finditer(r"(?<![\w.])(\w+)\s*\(", text):
         if m.group(1) in _KEYWORDS:
             continue
@@ -3843,14 +3863,19 @@ def _check_by_value(text, cinfo, path):
         parts = _split_top(text[m.end():close])
         if not _looks_like_params(parts, cinfo):
             continue                     # a local with constructor arguments
-        for part in parts:
+        for idx, part in enumerate(parts):
             cls = _by_value_class(part.strip(), cinfo)
             if cls in owning:
-                raise CppError(
-                    "%s: `%s` takes `%s` by value, but %s has a destructor -- "
-                    "the copy is never constructed and never destroyed. Pass "
-                    "`%s &` instead."
-                    % (os.path.basename(path), m.group(1), cls, cls, cls))
+                # No longer refused. A by-value owning parameter is an object
+                # the *callee* owns: C++ constructs it at the call and
+                # destroys it when the function returns, and both halves are
+                # now written out -- the caller constructs into it (below)
+                # and the callee's frame drops it like a local. Recorded here
+                # so the call sites can be rewritten, since a bitwise copy
+                # with no constructor is still what plain C would do.
+                nm = _param_name(part.strip())
+                if nm:
+                    byval.setdefault(m.group(1), {})[idx] = (cls, nm)
         ret = _func_return_type(text, m.end() - 1)
         toks = [t for t in (ret or "").replace("*", " * ").split()
                 if t != "const"]
@@ -3879,6 +3904,88 @@ def _check_by_value(text, cinfo, path):
                 "to move from, so the caller would receive a copy of a "
                 "released object. Return `%s *`, or assign to a local first."
                 % (os.path.basename(path), m.group(1), toks[0], toks[0]))
+    return byval
+
+
+def _construct_byval_args(text, byval, cinfo, path):
+    """Copy-construct the arguments a by-value owning parameter takes.
+
+    A by-value owning parameter is an object the callee destroys, so the
+    caller has to *construct* it rather than hand over a struct copy --
+    otherwise both sides own one resource and both free it. A `std::move`
+    argument has already become a statement expression yielding a
+    constructed temporary, and is left alone; everything else is a copy, and
+    is materialised the same way:
+
+        sink(a)   ->   sink(({ Buf _cpp_ba0; Buf_copy(&_cpp_ba0, &a); _cpp_ba0; }))
+
+    Run after the call rewriting, so what is seen here is the lowered call.
+    """
+    if not byval:
+        return text
+    n = [0]
+
+    def one(mtext, fname):
+        close = _match_paren(text, mtext.end() - 1)
+        if close is None:
+            return None
+        parts = _split_top(text[mtext.end():close])
+        tail = text[close + 1:close + 40].lstrip()
+        if (tail.startswith("{") or tail.startswith(";")) and \
+                _looks_like_params(parts, cinfo):
+            # The declaration or definition, not a call. Told apart by the
+            # *parameters* rather than by the terminator: `int r = sink(a);`
+            # ends in a `;` too, and reading that as a declaration left its
+            # argument handed over as a struct copy -- both sides then owned
+            # one buffer and both freed it.
+            return None
+        slots = byval[fname]
+        if len(parts) != len(slots) and not slots:
+            return None
+        outp = []
+        for idx, part in enumerate(parts):
+            arg = part.strip()
+            if idx not in slots or arg.startswith("({"):
+                outp.append(part)
+                continue
+            cls = slots[idx][0]
+            info = cinfo.get(cls)
+            if info is None:
+                outp.append(part)
+                continue
+            if not info["copy"]:
+                raise CppError(
+                    "%s: `%s` takes `%s` by value, which the callee "
+                    "destroys, so the argument has to be constructed -- and "
+                    "%s has a destructor but no copy constructor. Hand it "
+                    "over with `std::move(..)`, or add `%s(const %s &o)`."
+                    % (os.path.basename(path), fname, cls, cls, cls, cls))
+            tmp = "_cpp_ba%d" % n[0]
+            n[0] += 1
+            outp.append(" ({ %s %s; %s_copy(&%s, &(%s)); %s; })"
+                        % (cls, tmp, cls, tmp, arg, tmp))
+        return (close, "%s(%s)" % (fname, ",".join(outp)))
+
+    out, i = [], 0
+    while i < len(text):
+        m = re.compile(r"(?<![\w.>])(\w+)\s*\(").match(text, i)
+        if m is not None and m.group(1) in byval:
+            got = one(m, m.group(1))
+            if got is not None:
+                out.append(got[1])
+                i = got[0] + 1
+                continue
+        out.append(text[i])
+        i += 1
+    return "".join(out)
+
+
+def _param_name(part):
+    """The declared name of one parameter, or None."""
+    toks = [t for t in part.replace("*", " * ").split() if t != "const"]
+    if len(toks) < 2 or not re.match(r"^\w+$", toks[-1]):
+        return None
+    return toks[-1]
 
 
 def _is_call_result(rhs):
@@ -6109,7 +6216,7 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     # value -- a `T &` the author wrote is a `T *` by now.
     # Against the directive-blanked text: a `#define`'s replacement is
     # not an expression this translation unit evaluates.
-    _check_by_value(_blank_directives(out), cinfo, path)
+    byval = _check_by_value(_blank_directives(out), cinfo, path)
     out = _rewrite_scopes(out, cinfo)
 
     # Rewriting a call copies its arguments through verbatim, so a receiver
@@ -6125,6 +6232,11 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     # until `_rewrite_scopes` turns it into `Buf c; Buf_copy(&c, &a);`, and
     # reading it earlier cannot tell it from a call handing `a` away.
     _check_owning_args(_blank_directives(out), cinfo, path)
+
+    # After the call rewriting, so the calls are in their lowered form. A
+    # by-value owning parameter is destroyed by the callee, so its argument
+    # has to be constructed here rather than handed over as a struct copy.
+    out = _construct_byval_args(out, byval, cinfo, path)
 
     # After `_rewrite_scopes`, which is what consumes a `std::move` in the
     # statement positions the subset lowers. Anything still spelled here is

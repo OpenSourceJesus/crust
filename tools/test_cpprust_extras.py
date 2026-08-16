@@ -737,13 +737,19 @@ void f(void) { string val("x"); use(&val); }
 void f(void) { string val("x"); use(&val); }
 """, "#define two_step")
 
-    def test_a_real_by_value_owning_argument_is_still_refused(self):
-        """The check has to keep working on actual code."""
-        self.refuses("""
+    def test_a_real_by_value_owning_argument_is_constructed(self):
+        """The check has to keep working on actual code.
+
+        No longer a refusal: `string` has a copy constructor, so the
+        argument is copy-constructed into the parameter the callee will
+        destroy -- which is what C++ does. What is still refused is the
+        same call for a type with no copy constructor.
+        """
+        self.assertLowers("""
 #include <string>
 void consume(string s);
 void f(void) { string v("x"); consume(v); }
-""", "by value")
+""", "string_copy(&")
 
 
 class TestClangFallback(Base):
