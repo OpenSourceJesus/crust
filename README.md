@@ -8,6 +8,7 @@ Main Crust Documentation:
 - [CPP2RUST.md](CPP2RUST.md) C++ to Rust translator
 
 Crust Papers:
+- https://ai.vixra.org/pdf/2608.0059v1.pdf
 - https://dx.doi.org/10.2139/ssrn.7226482
 - https://ai.vixra.org/pdf/2608.0014v1.pdf
 
