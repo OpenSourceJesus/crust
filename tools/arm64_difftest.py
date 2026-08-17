@@ -297,6 +297,149 @@ STAGE13 = [
 ]
 
 
+# String literals and pointer access width. A string literal lives at a
+# symbol in .data and is reached like a global; neither of these back ends
+# emitted that storage at all until now. The pointer cases guard the width
+# of loads and stores made *through* a pointer, which a plain ldr/str gets
+# wrong in a way nothing notices unless the neighbouring bytes are read.
+STRINGS = [
+    ("a64_str_index", "int main(){char *s=\"hi\"; return s[0];}"),
+    ("a64_str_index2", "int main(){char *s=\"hello\"; return s[4];}"),
+    ("a64_str_walk", "int main(){char *s=\"abc\"; int n=0;"
+                    " while(*s){ n = n + *s; s = s + 1; } return n % 251;}"),
+    ("a64_str_len", "int slen(char *s){int n=0; while(s[n]) n=n+1; return n;}"
+                   " int main(){return slen(\"abcdefg\");}"),
+    ("a64_str_two", "int main(){char *a=\"ab\"; char *b=\"cd\";"
+                   " return a[0]+b[0];}"),
+    ("a64_str_array", "int main(){char a[6]=\"hi\"; return a[0]+a[1];}"),
+    ("a64_str_global", "char *g = \"xy\"; int main(){return g[0]+g[1];}"),
+    # Store *width* through a pointer. A plain str/sd writes 4 or 8 bytes,
+    # which is invisible unless something reads the bytes that follow.
+    ("a64_ptr_store_narrow",
+     "int main(){char b[16]; int i; for(i=0;i<16;i++) b[i]=i+1;"
+     " char *p=b; *p=9; return b[0]+b[1]*10+b[2]*100;}"),
+    ("a64_ptr_store_short",
+     "int main(){short a[8]; int i; for(i=0;i<8;i++) a[i]=i+1;"
+     " short *p=a; *p=9; return a[0]+a[1]*10+a[2]*100;}"),
+    ("a64_ptr_load_narrow",
+     "int main(){char b[16]; int i; for(i=0;i<16;i++) b[i]=i*7;"
+     " char *p=b; p=p+2; return (*p) / 3;}"),
+    ("a64_ptr_load_short",
+     "int main(){short a[8]; int i; for(i=0;i<8;i++) a[i]=i*100;"
+     " short *p=a; p=p+1; return (*p) / 3;}"),
+]
+
+
+# Indirect calls through function pointers. The address of a function is
+# recorded so a *direct* call stays a `bl`/`call`, but it must also be
+# materialised, because once function pointers exist the value can be stored,
+# passed, reassigned or indexed -- at which point a note to the call site is
+# not enough.
+FUNCPTR = [
+    ("a64_fp_basic", "int a(int x){return x+1;}"
+                    " int main(){int (*f)(int)=a; return f(41);}"),
+    ("a64_fp_reassign", "int a(int x){return x+1;} int b(int x){return x*2;}"
+                       " int main(){int (*f)(int)=a; int r=f(5); f=b;"
+                       " return r+f(10);}"),
+    ("a64_fp_two_args", "int add(int a,int b){return a+b;}"
+                       " int main(){int (*f)(int,int)=add; return f(20,22);}"),
+    ("a64_fp_param", "int a(int x){return x+1;}"
+                    " int apply(int (*f)(int), int v){return f(v);}"
+                    " int main(){return apply(a,41);}"),
+    ("a64_fp_copy", "int a(int x){return x+1;}"
+                   " int main(){int (*f)(int)=a; int (*g)(int)=f;"
+                   " return g(41);}"),
+    ("a64_fp_table", "int a(int x){return x+1;} int b(int x){return x*2;}"
+                    " int main(){int (*t[2])(int); t[0]=a; t[1]=b;"
+                    " return t[0](5)+t[1](10);}"),
+    ("a64_fp_float", "double d(double x){return x*2.0;}"
+                    " int main(){double (*f)(double)=d; return (int)f(21.0);}"),
+    ("a64_fp_void", "int g; void s(int v){g=v;}"
+                   " int main(){void (*f)(int)=s; f(37); return g;}"),
+    ("a64_fp_global", "int a(int x){return x+1;} int (*gf)(int);"
+                     " int main(){gf=a; return gf(41);}"),
+    ("a64_fp_loop", "int a(int x){return x+1;} int b(int x){return x*2;}"
+                   " int main(){int (*t[2])(int); t[0]=a; t[1]=b;"
+                   " int s=0,i; for(i=0;i<2;i++) s+=t[i](i+3); return s;}"),
+]
+
+
+# Stack arguments. Both ABIs pass the first eight of each class in registers
+# and the rest on the stack. The two targets need opposite treatments: arm64
+# addresses its frame off x29, so sp can move around a call for an outgoing
+# area, while RV64 addresses its frame off sp, so the outgoing area has to be
+# reserved *inside* the frame and everything else shifted past it.
+STACKARGS = [
+    ("a64_sa_nine", "int f(int a,int b,int c,int d,int e,int g,int h,int i,"
+                   "int j){return a+b+c+d+e+g+h+i+j;}"
+                   " int main(){return f(1,2,3,4,5,6,7,8,9);}"),
+    ("a64_sa_twelve", "int f(int a,int b,int c,int d,int e,int g,int h,int i,"
+                     "int j,int k,int l,int m)"
+                     "{return a+b+c+d+e+g+h+i+j+k+l+m;}"
+                     " int main(){return f(1,2,3,4,5,6,7,8,9,10,11,12);}"),
+    ("a64_sa_last_only", "int f(int a,int b,int c,int d,int e,int g,int h,"
+                        "int i,int j){return j;}"
+                        " int main(){return f(1,2,3,4,5,6,7,8,42);}"),
+    ("a64_sa_order", "int f(int a,int b,int c,int d,int e,int g,int h,int i,"
+                    "int j,int k){return j*10+k;}"
+                    " int main(){return f(1,2,3,4,5,6,7,8,3,7);}"),
+    ("a64_sa_long", "long f(long a,long b,long c,long d,long e,long g,long h,"
+                   "long i,long j){return a+b+c+d+e+g+h+i+j;}"
+                   " int main(){return (int)f(1,2,3,4,5,6,7,8,9);}"),
+    ("a64_sa_double", "double f(double a,double b,double c,double d,double e,"
+                     "double g,double h,double i,double j)"
+                     "{return a+b+c+d+e+g+h+i+j;}"
+                     " int main(){return (int)f(1,2,3,4,5,6,7,8,9);}"),
+    ("a64_sa_float", "float f(float a,float b,float c,float d,float e,"
+                    "float g,float h,float i,float j)"
+                    "{return a+b+c+d+e+g+h+i+j;}"
+                    " int main(){return (int)f(1,2,3,4,5,6,7,8,9);}"),
+    ("a64_sa_mixed", "int f(int a,double b,int c,double d,int e,double g,"
+                    "int h,double i,int j,double k)"
+                    "{return a+c+e+h+j+(int)(b+d+g+i+k);}"
+                    " int main(){return f(1,1.0,2,2.0,3,3.0,4,4.0,5,5.0);}"),
+    ("a64_sa_nested", "int g(int a,int b,int c,int d,int e,int f,int h,int i,"
+                     "int j){return a+j;}"
+                     " int f2(int a,int b,int c,int d,int e,int f,int h,int i,"
+                     "int j){return g(a,b,c,d,e,f,h,i,j)+j;}"
+                     " int main(){return f2(1,2,3,4,5,6,7,8,9);}"),
+    ("a64_sa_locals", "int f(int a,int b,int c,int d,int e,int g,int h,int i,"
+                     "int j){int arr[4]; int k; for(k=0;k<4;k++) arr[k]=k;"
+                     " return a+j+arr[3];}"
+                     " int main(){return f(1,2,3,4,5,6,7,8,9);}"),
+    ("a64_sa_recursive", "int f(int n,int b,int c,int d,int e,int g,int h,"
+                        "int i,int acc){if(n==0) return acc;"
+                        " return f(n-1,b,c,d,e,g,h,i,acc+n);}"
+                        " int main(){return f(9,0,0,0,0,0,0,0,0);}"),
+]
+
+
+# arm64-only gaps closed alongside stack arguments: a variable index whose
+# element size is not a power of two (needs a real multiply rather than a
+# shifted addressing mode), and a whole-aggregate copy where either side is a
+# global (needs its address materialised rather than a frame offset).
+ARM64EXTRA = [
+    ("a64_idx_struct12", "struct S{int a;int b;int c;};"
+     " int main(){struct S v[4]; int i;"
+     " for(i=0;i<4;i++){v[i].a=i; v[i].b=i*2; v[i].c=i*3;}"
+     " int s=0; for(i=0;i<4;i++) s+=v[i].a+v[i].b+v[i].c; return s;}"),
+    ("a64_idx_char5", "struct T{char x[5];};"
+     " int main(){struct T t[3]; int i,j;"
+     " for(i=0;i<3;i++) for(j=0;j<5;j++) t[i].x[j]=i+j;"
+     " return t[2].x[4];}"),
+    ("a64_idx_arr3", "int main(){int a[3][3]; int i,j;"
+     " for(i=0;i<3;i++) for(j=0;j<3;j++) a[i][j]=i*3+j;"
+     " int s=0; for(i=0;i<3;i++) s+=a[i][2]; return s;}"),
+    ("a64_agg_from_global", "struct P{int x;int y;}; struct P g={3,4};"
+     " int main(){struct P a=g; return a.x*10+a.y;}"),
+    ("a64_agg_to_global", "struct P{int x;int y;}; struct P g;"
+     " int main(){struct P a; a.x=5; a.y=6; g=a; return g.x*10+g.y;}"),
+    ("a64_agg_global_both", "struct P{int x;int y;};"
+     " struct P g1={1,2}; struct P g2;"
+     " int main(){g2=g1; return g2.x*10+g2.y;}"),
+]
+
+
 def _run(cmd):
     p = subprocess.run(cmd, capture_output=True, text=True)
     return p.returncode, p.stdout, p.stderr
@@ -364,7 +507,7 @@ def main(argv):
             with open(path) as f:
                 progs.append((os.path.basename(path), f.read()))
     else:
-        progs = STAGE2 + STAGE3 + STAGE4 + STAGE6 + STAGE7 + STAGE8 + STAGE9 + STAGE10 + STAGE11 + STAGE12 + STAGE13
+        progs = STAGE2 + STAGE3 + STAGE4 + STAGE6 + STAGE7 + STAGE8 + STAGE9 + STAGE10 + STAGE11 + STAGE12 + STAGE13 + STRINGS + FUNCPTR + STACKARGS + ARM64EXTRA
 
     workdir = tempfile.mkdtemp(prefix="arm64diff-")
     counts = {"PASS": 0, "FAIL": 0, "SKIP": 0, "ERROR": 0}
