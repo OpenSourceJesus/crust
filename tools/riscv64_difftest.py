@@ -524,6 +524,47 @@ STACKARGS = [
 ]
 
 
+# Variadic functions. ShivyCX's own callees read every argument from one
+# contiguous stack block whose base the caller hands over in a scratch
+# register, rather than from AArch64's real va_list (separate general and FP
+# save areas plus four offsets). That is far simpler and, since both sides are
+# ours, sufficient -- it is the same model the x86-64 back end uses.
+VARIADIC = [
+    ("rv_va_three", "int vs(int n, ...){__builtin_va_list ap; int s=0,i;"
+     " __builtin_va_start(ap,n); for(i=0;i<n;i++) s+=__builtin_va_arg(ap,int);"
+     " __builtin_va_end(ap); return s;}"
+     " int main(){return vs(3,10,20,12);}"),
+    ("rv_va_eight", "int vs(int n, ...){__builtin_va_list ap; int s=0,i;"
+     " __builtin_va_start(ap,n); for(i=0;i<n;i++) s+=__builtin_va_arg(ap,int);"
+     " __builtin_va_end(ap); return s;}"
+     " int main(){return vs(8,1,2,3,4,5,6,7,8);}"),
+    ("rv_va_overflow", "int vs(int n, ...){__builtin_va_list ap; int s=0,i;"
+     " __builtin_va_start(ap,n); for(i=0;i<n;i++) s+=__builtin_va_arg(ap,int);"
+     " __builtin_va_end(ap); return s;}"
+     " int main(){return vs(12,1,2,3,4,5,6,7,8,9,10,11,12);}"),
+    ("rv_va_none", "int vs(int n, ...){__builtin_va_list ap; int s=0,i;"
+     " __builtin_va_start(ap,n); for(i=0;i<n;i++) s+=__builtin_va_arg(ap,int);"
+     " __builtin_va_end(ap); return s;} int main(){return vs(0)+33;}"),
+    ("rv_va_twice", "int vs(int n, ...){__builtin_va_list ap; int s=0,i;"
+     " __builtin_va_start(ap,n); for(i=0;i<n;i++) s+=__builtin_va_arg(ap,int);"
+     " __builtin_va_end(ap); return s;}"
+     " int main(){return vs(2,20,22)+vs(1,0);}"),
+    ("rv_va_long", "long vl(int n, ...){__builtin_va_list ap; long s=0; int i;"
+     " __builtin_va_start(ap,n); for(i=0;i<n;i++) s+=__builtin_va_arg(ap,long);"
+     " __builtin_va_end(ap); return s;}"
+     " int main(){return (int)vl(3,100L,200L,42L) % 251;}"),
+    ("rv_va_named2", "int vs(int a, int n, ...){__builtin_va_list ap;"
+     " int s=a,i; __builtin_va_start(ap,n);"
+     " for(i=0;i<n;i++) s+=__builtin_va_arg(ap,int);"
+     " __builtin_va_end(ap); return s;}"
+     " int main(){return vs(5,3,10,20,7);}"),
+    # Large frames: a local buffer past the immediate range of the frame
+    # instructions (arm64 stp is a scaled 7-bit field, riscv addi 12 signed).
+    ("rv_bigframe", "int main(){char b[4096]; int i;"
+     " for(i=0;i<4096;i++) b[i]=(char)(i&7); return b[4095]+35;}"),
+    ("rv_fneg", "int main(){double d=12.5; return (int)(-d + 50);}"),
+]
+
 def _run(cmd):
     p = subprocess.run(cmd, capture_output=True, text=True)
     return p.returncode, p.stdout, p.stderr
@@ -592,7 +633,7 @@ def main(argv):
     else:
         progs = (CORE + GLOBALS + BITOPS + CONVERSIONS + MEMORY
                  + FLOATS + STRINGS + FUNCPTR
-                 + STACKARGS)
+                 + STACKARGS + VARIADIC)
 
     workdir = tempfile.mkdtemp(prefix="riscv64diff-")
     counts = {"PASS": 0, "FAIL": 0, "SKIP": 0, "ERROR": 0,
