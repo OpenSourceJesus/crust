@@ -230,7 +230,8 @@ Planned lowering and compatibility work, in rough order:
    and any recursion stack live in the same per-function static region.
 5. ARM64: the same idea lowers to patching the immediate of a `MOVZ`/`MOVK`
    pair before a `BR` register branch. The AArch64 back end is currently
-   conservative about indirect calls (see `ARM64.md`), so this is future work.
+   conservative about indirect calls (see `ARM64.md` / `RISCV64.md`), so this is
+   future work.
 
 
 ## Interaction with stackless

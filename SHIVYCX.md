@@ -34,7 +34,8 @@ On top of standard C, ShivyCX adds:
   RISC-V 64 cross targets sharing a liveness-based linear-scan register
   allocator, plus the first steps of a Motorola 68000 / **Neo-Geo** target — all
   validated differentially against the GNU cross toolchains under qemu, and
-  selected with `--target` (see [ARM64.md](ARM64.md) and [NEOGEO.md](NEOGEO.md)).
+  selected with `--target` (see [ARM64.md](ARM64.md),
+  [RISCV64.md](RISCV64.md) and [NEOGEO.md](NEOGEO.md)).
   For AArch64 and RV64 the *whole* toolchain is ours: our assembler and linker
   turn C into a running static binary with no external tool and no libc.
 - **A Python→C transpiler** — toward compiling the front end with itself, which
@@ -198,7 +199,8 @@ register allocator is a **liveness-based linear scan with a caller/callee split*
 values live across a call get callee-saved homes, call-clean values get
 caller-saved homes that need no save/restore, and leaf functions come out
 frameless — beating `gcc -O0` instruction counts on leaf and call-light code.
-See **[ARM64.md](ARM64.md)** for the full design, the staged bring-up, and the
+See **[ARM64.md](ARM64.md)** and **[RISCV64.md](RISCV64.md)** for the full
+design, the staged bring-up, and the
 differential-testing methodology.
 
 **RISC-V 64** was brought up next to validate the seam, and has since caught up
@@ -279,7 +281,8 @@ register-promotion of `_Nbit` packed globals is an IL pass in
 [`simd_pack_promote.py`](shivyc/simd_pack_promote.py).
 
 The same IL feeds three cross targets selected with `--target`: AArch64 and
-RISC-V 64 back ends (both feature-complete — see [ARM64.md](ARM64.md)), and the
+RISC-V 64 back ends (both feature-complete — see [ARM64.md](ARM64.md) and
+[RISCV64.md](RISCV64.md)), and the
 first steps of a Motorola 68000 / Neo-Geo back end (see [NEOGEO.md](NEOGEO.md))
 — all sharing a target-neutral liveness-based linear-scan register allocator
 (the `_il_*` methods in [`asm_gen.py`](shivyc/asm_gen.py)).

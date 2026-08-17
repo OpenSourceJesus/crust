@@ -141,6 +141,12 @@ selfhost_bench:
 selfhost_coverage:
 	python3 tools/selfhost.py coverage
 
+# Gate on the code generator specifically: asm_gen.py must keep transpiling
+# through py2c and compiling as C. Fast enough to run on every back-end
+# change, unlike the full coverage sweep.
+selfhost_asmgen:
+	python3 tools/selfhost_asmgen_test.py
+
 # Build the self-host artifacts into a fixed /tmp directory (kept on disk) and
 # run the simple per-module self-host tests against them. The build dir holds
 # the transpiled+compiled module test exes (tokens, ilbase, weak_alias).

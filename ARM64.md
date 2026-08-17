@@ -1,15 +1,20 @@
-# The ShivyCX AArch64 and RV64 back ends
+# The ShivyCX AArch64 back end
 
 ShivyCX compiles the same architecture-neutral IL its x86-64 back end consumes
-into AArch64 or RISC-V assembly, selected with `--target arm64` or
-`--target riscv64`. Both back ends live in [`shivyc/asm_gen.py`](shivyc/asm_gen.py)
-behind a `Target` seam ([`shivyc/targets`](shivyc/targets/__init__.py)); the
-x86-64 path is untouched by any of it.
+into AArch64 assembly with `--target arm64`. The back end lives in
+[`shivyc/asm_gen.py`](shivyc/asm_gen.py) (the `_arm64_*` methods) behind a
+`Target` seam ([`shivyc/targets`](shivyc/targets/__init__.py)); the x86-64 path
+is untouched by any of it.
 
-The toolchain below them is also our own. [`rasm`](tools/rpy_lib/RASM.md)
+There is a second bare-metal target, RISC-V 64, documented separately in
+[RISCV64.md](RISCV64.md). It shares the register allocator described below
+verbatim — that section is the canonical description for both. This page
+otherwise covers AArch64 only.
+
+The toolchain below it is also our own. [`rasm`](tools/rpy_lib/RASM.md)
 assembles both ISAs and [`rlink`](tools/rpy_lib/LINKER.md) links them, so a C
-program becomes a running AArch64 or RV64 binary without invoking a single
-external tool and without libc:
+program becomes a running AArch64 binary without invoking a single external
+tool and without libc:
 
 ```
 C  ->  ShivyCX  ->  rasm  ->  rlink  ->  static ELF executable
@@ -22,13 +27,8 @@ increment is checked the same way — differentially, against a real toolchain.
 ## Trying it
 
 ```sh
-# C -> assembly
 python3 -m shivyc.main prog.c -S -o prog.s --target arm64
-python3 -m shivyc.main prog.c -S -o prog.s --target riscv64
-
-# assemble + link + run with the GNU cross toolchain
 aarch64-linux-gnu-gcc -static prog.s -o prog && qemu-aarch64 ./prog
-riscv64-linux-gnu-gcc -static prog.s -o prog && qemu-riscv64 ./prog
 ```
 
 The differential testers do this end to end and check each exit code against
@@ -36,27 +36,22 @@ the same program compiled by `gcc`:
 
 ```sh
 python3 tools/arm64_difftest.py     # arm64 difftest: 168 pass, 0 fail
-python3 tools/riscv64_difftest.py   # riscv64 difftest: 169 pass, 0 fail, 1 xfail
 ```
 
-Both need the cross toolchain and qemu:
-`apt install gcc-aarch64-linux-gnu gcc-riscv64-linux-gnu qemu-user`.
+Needs `apt install gcc-aarch64-linux-gnu qemu-user`.
 
 For the fully self-hosted path — our assembler, our linker, our runtime, no
-libc — see [`RASM.md`](tools/rpy_lib/RASM.md); the end-to-end testers
-`tools/rpy_lib/rasm_arm64_obj_test.py` and `rasm_riscv_obj_test.py` exercise
-it over the same programs.
+libc — see [`RASM.md`](tools/rpy_lib/RASM.md);
+`tools/rpy_lib/rasm_arm64_obj_test.py` exercises it over the same programs
+(56 pass, 0 skip).
 
 ## What is supported
 
-Both back ends now cover the same ground:
+Both bare-metal back ends cover the same ground; where RV64 differs in *how*,
+[RISCV64.md](RISCV64.md) has the detail.
 
 - **Integers** of every width: `char`/`short`/`int`/`long`, signed and
-  unsigned, with correct narrowing and widening on assignment. On RV64 that
-  needs explicit care: the psABI keeps *every* 32-bit value sign-extended in a
-  register regardless of signedness, so widening an unsigned int must
-  zero-extend rather than move, and narrowing must truncate to the target
-  width and re-extend by the target's signedness.
+  unsigned, with correct narrowing and widening on assignment.
 - **Arithmetic and bitwise**: `+ - * / %`, `& | ^ ~`, `<< >>` (logical or
   arithmetic by signedness), unary `-`, with immediate forms where the
   encoding allows.
@@ -70,7 +65,7 @@ Both back ends now cover the same ground:
   multi-dimensional arrays, `struct`/`union` (including by-value copy),
   compound assignment, and string literals.
 - **Globals**: file-scope/static storage emitted as `.data`/`.bss`, addressed
-  with `adrp`/`add` on arm64 and `lla` on RV64.
+  with `adrp`/`add`.
 - **Calls**: direct calls and recursion under AAPCS64 and lp64d, including the
   separate integer and floating-point argument sequences and the matching
   return registers.
@@ -94,10 +89,8 @@ as skips, never as silent miscompiles.
 Plain `char` is **unsigned** on both the AArch64 and RISC-V psABIs but
 **signed** on x86-64; ShivyCX treats it as signed on every target. This is a
 target-dependent front-end issue, not a back-end one, and it affects both
-architectures equally. It is recorded as an `XFAIL` case
-(`rv_g_plainchar_abi`) so the gap stays visible; the harness treats an
-unexpected *pass* as a failure, so fixing it will prompt removing the marker
-rather than going unnoticed.
+architectures equally. It is tracked as an `XFAIL` case in the RV64 corpus
+(`rv_g_plainchar_abi`) so the gap stays visible.
 
 ## Pipeline
 
@@ -108,8 +101,7 @@ C  ->  lexer  ->  parser  ->  tree  ->  il_gen  ->  IL  ->  make_asm  ->  text
 
 `ASMGen.make_asm` dispatches on `target.name`. On arm64 it calls
 `_make_asm_arm64`, which walks each function's IL through `_arm64_function`
-(allocation + framing) and `_lower_arm64` (per-command instruction selection);
-riscv64 has the matching `_rv_*` pair. Integer values get register homes,
+(allocation + framing) and `_lower_arm64` (per-command instruction selection). Integer values get register homes,
 floating-point values a parallel file, and anything in memory (spills,
 address-taken locals, aggregates) a frame slot. Scratch registers are reserved
 for operand staging and never used as value homes.
@@ -117,9 +109,10 @@ for operand staging and never used as value homes.
 ## Register allocation: liveness-based linear scan with a caller/callee split
 
 The allocator is the most interesting part, and most of it is
-**architecture-neutral** — the same `_il_*` methods serve both back ends. When
-floating point was added to riscv64 the allocator needed *no* changes at all:
-it already took FP register pools as parameters.
+**architecture-neutral** — the same `_il_*` methods serve every back end, and
+this section is the canonical description for RV64 as well. When floating point
+was added to riscv64 the allocator needed *no* changes at all: it already took
+FP register pools as parameters.
 
 1. **Copy coalescing.** A `Set(out, tmp)` copying a single-use temporary can
    let the defining instruction write `out` directly, eliding the move — but
@@ -181,8 +174,9 @@ is the natural next allocator step.
 
 ## Floating point
 
-Both back ends run a pipeline parallel to the integer one. The interesting part
-is how differently the two ISAs express it:
+Both back ends run a pipeline parallel to the integer one, over a separate
+register file with its own caller/callee split. The interesting part is how
+differently the two ISAs express it:
 
 | | AArch64 | RV64 |
 |---|---|---|
@@ -191,10 +185,9 @@ is how differently the two ISAs express it:
 | float→int | `fcvtzs`/`fcvtzu` truncate by definition | needs an explicit `rtz` operand — the default rounding mode is round-to-nearest |
 | literals | `.data` + `adrp`/`add`/`ldr` | `.data` + `lla`/`fld` |
 
-RV64's comparisons are all *ordered* (NaN yields 0), which is what C wants for
-`<`, `<=`, `>` and `>=`; `!=` is the negation of `feq` and so correctly yields
-1 for NaN. On arm64, FP comparisons are excluded from branch fusion to avoid
-the unordered-condition subtleties.
+On arm64, FP comparisons are excluded from branch fusion to avoid the
+unordered-condition subtleties. The RV64 side is covered in
+[RISCV64.md](RISCV64.md).
 
 ## How it was built and validated
 
@@ -202,15 +195,24 @@ Each back end grew in independently shippable stages, every one a delta on the
 previous and gated by three checks:
 
 - **Differential correctness.** [`tools/arm64_difftest.py`](tools/arm64_difftest.py)
-  and [`tools/riscv64_difftest.py`](tools/riscv64_difftest.py) compile a corpus
-  with both ShivyCX and the cross `gcc`, run both under qemu, and assert the
-  exit codes match. Using a real compiler as an oracle is what caught the bugs
-  that mattered.
+  compiles a corpus with both ShivyCX and the cross `gcc`, runs both under
+  qemu, and asserts the exit codes match. Using a real compiler as an oracle is
+  what caught the bugs that mattered.
 - **No x86 regression.** The full x86-64 test suite (`make testfast`) must stay
   green; the new paths are wholly separate.
 - **Self-host safety.** `shivyc/asm_gen.py` must still transpile through the
-  Python→C front end (`py2c`), so the compiler can eventually compile itself
-  for these targets too.
+  Python→C front end (`py2c`) and compile as C, so the compiler can eventually
+  compile itself for these targets too. `make selfhost_asmgen` enforces this.
+
+  That gate was stated from the start but not *enforced*, and it silently
+  regressed: a helper added for the arm64 back end took a register name and an
+  ILValue, and py2c inferred the wrong C type for both, emitting calls that
+  passed a `char *` where the prototype said `int`. Nothing caught it, because
+  the Python is valid and every differential test passes — only the transpiled
+  C is wrong, and only as a compiler *warning*. The lesson for new helpers is
+  to pass register *numbers* and plain flags rather than formatted names and IL
+  objects, matching the surrounding code; the test now fails on any new warning
+  in the transpiled output.
 
 ### On the corpora
 
@@ -234,12 +236,11 @@ element of a padded array and checked its neighbours survived.
 
 - [`shivyc/targets/__init__.py`](shivyc/targets/__init__.py) — the `Target`
   seam (`X86_64Target`, `Arm64Target`, `RiscV64Target`, `get_target`).
-- [`shivyc/asm_gen.py`](shivyc/asm_gen.py) — `_make_asm_arm64` /
-  `_make_asm_riscv64`, their `_arm64_*` / `_rv_*` lowering helpers, and the
-  shared `_il_*` allocator core.
-- [`tools/arm64_difftest.py`](tools/arm64_difftest.py),
-  [`tools/riscv64_difftest.py`](tools/riscv64_difftest.py) — the differential
-  testers.
+- [`shivyc/asm_gen.py`](shivyc/asm_gen.py) — `_make_asm_arm64`, the `_arm64_*`
+  lowering helpers, and the shared `_il_*` allocator core.
+- [`tools/arm64_difftest.py`](tools/arm64_difftest.py) — the differential
+  tester.
+- [`RISCV64.md`](RISCV64.md) — the RV64 back end.
 - [`tools/rpy_lib/RASM.md`](tools/rpy_lib/RASM.md),
   [`tools/rpy_lib/LINKER.md`](tools/rpy_lib/LINKER.md) — the assembler and
   linker, including their AArch64 and RV64 support.
