@@ -1480,7 +1480,7 @@ class ASMGen:
             self._arm64_into(base, an, reg_of, slot_of)   # pointer value -> x<an>
             bsrc = addr
         ci = self._arm64_use(count, an + 1, reg_of, slot_of)
-        self._arm64_scale_index(addr, bsrc, ci, chunk, count, an)
+        self._arm64_scale_index(an, bsrc, ci, chunk, count.ctype.size <= 4)
         return "[%s]" % addr
 
     def _arm64_addr_into(self, base, chunk, count, an, reg_of, slot_of):
@@ -1521,7 +1521,7 @@ class ASMGen:
                 self.asm_code.add(asm_cmds.Raw("mov\t%s, %s" % (addr, bsrc)))
             return addr
         ci = self._arm64_use(count, an + 1, reg_of, slot_of)
-        self._arm64_scale_index(addr, bsrc, ci, chunk, count, an)
+        self._arm64_scale_index(an, bsrc, ci, chunk, count.ctype.size <= 4)
         return addr
 
     def _arm64_agg_base(self, value, an, slot_of):
@@ -1538,8 +1538,13 @@ class ASMGen:
             return reg, 0
         return "x29", slot_of[value]
 
-    def _arm64_scale_index(self, addr, bsrc, ci, chunk, count, an):
-        """Emit `addr = bsrc + ci*chunk` for a variable index.
+    def _arm64_scale_index(self, an, bsrc, ci, chunk, narrow):
+        """Emit `x<an> = bsrc + ci*chunk` for a variable index.
+
+        Takes the destination as a register *number* and the index width as a
+        flag rather than a name and an ILValue: the transpiler infers each
+        parameter's C type from its uses, and a name shared with an int-typed
+        parameter elsewhere makes it pick the wrong one.
 
         A power-of-two element size folds the scale into the addressing mode's
         shift. Anything else -- a struct of 12 or 20 bytes, say -- needs a real
@@ -1547,8 +1552,8 @@ class ASMGen:
         multiplied by it. x<an+2> is free here: an+1 already holds the index
         and both are scratch, never value homes.
         """
+        addr = "x%d" % an
         sh = self._arm64_pow2_log(chunk)
-        narrow = count.ctype.size <= 4
         if sh >= 0:
             ext = "sxtw" if narrow else "lsl"
             self.asm_code.add(asm_cmds.Raw(
