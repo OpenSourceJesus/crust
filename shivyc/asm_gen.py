@@ -591,6 +591,27 @@ class ASMGen:
         self._arm64_saved_fp = []
         self._arm64_int_save_off = {}
         self._arm64_fp_save_off = {}
+        # String-literal storage. A literal lives at a symbol in .data, not in
+        # any frame, so it is emitted once here and then treated exactly like
+        # a global: `char *p = "hi"` is an AddrOf of that symbol. Names are
+        # generated if the front end did not already intern one, and recorded
+        # so every reference uses the same label.
+        self._arm64_strlit = {}
+        snum = 0
+        for v in self.il_code.string_literals:
+            nm = self.il_code.string_literal_names.get(v)
+            if nm is None:
+                nm = "__arm64str%d" % snum
+                self.il_code.string_literal_names[v] = nm
+            snum += 1
+            elem_size = v.ctype.el.size if v.ctype.is_array() else 1
+            self.asm_code.add_string_literal(
+                nm, self.il_code.string_literals[v], elem_size)
+            self._arm64_strlit[v] = nm
+            # Also record it in the global map: the per-function value scan
+            # skips anything carrying a `.literal` attribute, and a string
+            # literal does, so it would never be registered there.
+            self._arm64_glob[v] = nm
         for func in self.il_code.commands:
             self._arm64_function(func, self.il_code.commands[func])
 
@@ -665,6 +686,7 @@ class ASMGen:
                 glob[v] = self.symbol_table.asm_name(v)
                 self._arm64_glob[v] = glob[v]
                 self._arm64_emit_global_storage(v)
+
         # Count how often each global is referenced; frequently-used ones get
         # their (link-time-invariant) address cached in a register for the whole
         # function instead of recomputing adrp/add at every access.
@@ -696,13 +718,26 @@ class ASMGen:
         self._arm64_argfp = {}
         agp = 0
         afp = 0
+        # Parameters past the eighth of their class arrive on the caller's
+        # stack, in order. Their offsets are recorded as a byte index and
+        # biased by the frame size at use.
+        self._arm64_argstk = {}
+        astk = 0
         for c in cmds:
             if isinstance(c, value_cmds.LoadArg):
                 if c.output.ctype.is_floating():
-                    self._arm64_argfp[c.arg_num] = afp
+                    if afp >= 8:
+                        self._arm64_argstk[c.arg_num] = astk
+                        astk += 8
+                    else:
+                        self._arm64_argfp[c.arg_num] = afp
                     afp += 1
                 else:
-                    self._arm64_arggp[c.arg_num] = agp
+                    if agp >= 8:
+                        self._arm64_argstk[c.arg_num] = astk
+                        astk += 8
+                    else:
+                        self._arm64_arggp[c.arg_num] = agp
                     agp += 1
 
         # Copy coalescing: a `Set(out, tmp)` whose source is a single-use, single-
@@ -1444,17 +1479,8 @@ class ASMGen:
         else:
             self._arm64_into(base, an, reg_of, slot_of)   # pointer value -> x<an>
             bsrc = addr
-        sh = self._arm64_pow2_log(chunk)
-        if sh < 0:
-            raise NotImplementedError(
-                "arm64 back end: variable index with non-power-of-2 element size")
         ci = self._arm64_use(count, an + 1, reg_of, slot_of)
-        if count.ctype.size <= 4:
-            self.asm_code.add(asm_cmds.Raw(
-                "add\t%s, %s, %s, sxtw #%d" % (addr, bsrc, ci, sh)))
-        else:
-            self.asm_code.add(asm_cmds.Raw(
-                "add\t%s, %s, %s, lsl #%d" % (addr, bsrc, ci, sh)))
+        self._arm64_scale_index(addr, bsrc, ci, chunk, count, an)
         return "[%s]" % addr
 
     def _arm64_addr_into(self, base, chunk, count, an, reg_of, slot_of):
@@ -1494,18 +1520,59 @@ class ASMGen:
             elif bsrc != addr:
                 self.asm_code.add(asm_cmds.Raw("mov\t%s, %s" % (addr, bsrc)))
             return addr
-        sh = self._arm64_pow2_log(chunk)
-        if sh < 0:
-            raise NotImplementedError(
-                "arm64 back end: variable index with non-power-of-2 element size")
         ci = self._arm64_use(count, an + 1, reg_of, slot_of)
-        if count.ctype.size <= 4:
-            self.asm_code.add(asm_cmds.Raw(
-                "add\t%s, %s, %s, sxtw #%d" % (addr, bsrc, ci, sh)))
-        else:
-            self.asm_code.add(asm_cmds.Raw(
-                "add\t%s, %s, %s, lsl #%d" % (addr, bsrc, ci, sh)))
+        self._arm64_scale_index(addr, bsrc, ci, chunk, count, an)
         return addr
+
+    def _arm64_agg_base(self, value, an, slot_of):
+        """Return (base register name, offset) addressing aggregate `value`.
+
+        A global's address is materialised into x<an>; a frame-homed aggregate
+        is already addressable off x29, so no instruction is needed."""
+        gname = self._arm64_glob.get(value)
+        if gname is not None:
+            reg = "x%d" % an
+            self.asm_code.add(asm_cmds.Raw("adrp\t%s, %s" % (reg, gname)))
+            self.asm_code.add(asm_cmds.Raw(
+                "add\t%s, %s, :lo12:%s" % (reg, reg, gname)))
+            return reg, 0
+        return "x29", slot_of[value]
+
+    def _arm64_scale_index(self, addr, bsrc, ci, chunk, count, an):
+        """Emit `addr = bsrc + ci*chunk` for a variable index.
+
+        A power-of-two element size folds the scale into the addressing mode's
+        shift. Anything else -- a struct of 12 or 20 bytes, say -- needs a real
+        multiply, so the size goes into a scratch register and the index is
+        multiplied by it. x<an+2> is free here: an+1 already holds the index
+        and both are scratch, never value homes.
+        """
+        sh = self._arm64_pow2_log(chunk)
+        narrow = count.ctype.size <= 4
+        if sh >= 0:
+            ext = "sxtw" if narrow else "lsl"
+            self.asm_code.add(asm_cmds.Raw(
+                "add\t%s, %s, %s, %s #%d" % (addr, bsrc, ci, ext, sh)))
+            return
+        idx = "x%d" % (an + 1)
+        # NOTE: unexercised. This branch replaces a NotImplementedError, but no
+        # C program has been found that reaches it -- the front end decomposes
+        # struct-array indexing into a multiply plus a byte-offset AddrRel with
+        # chunk 1, so `chunk` is always a power of two here in practice. Kept
+        # because it is correct by construction and cheaper than a raise if the
+        # IL shape ever changes; not claimed as tested.
+        if narrow:
+            # Sign-extend the 32-bit index before multiplying: the product is
+            # a 64-bit byte offset, and `mul` has no extending form.
+            self.asm_code.add(asm_cmds.Raw("sxtw\t%s, %s" % (idx, ci)))
+        elif idx != ci:
+            self.asm_code.add(asm_cmds.Raw("mov\t%s, %s" % (idx, ci)))
+        scale = "x%d" % (an + 2)
+        self._arm64_mov_imm(scale, chunk, 8)
+        self.asm_code.add(asm_cmds.Raw(
+            "mul\t%s, %s, %s" % (idx, idx, scale)))
+        self.asm_code.add(asm_cmds.Raw(
+            "add\t%s, %s, %s" % (addr, bsrc, idx)))
 
     def _arm64_mov_imm(self, dest, val, size):
         """Materialize integer literal `val` into register `dest`. AArch64 cannot
@@ -1593,6 +1660,33 @@ class ASMGen:
         if isinstance(cmd, value_cmds.LoadArg):
             # Parameter arrives in its AAPCS64 register (x<gp> for integers,
             # v<fp> for floats); move/spill it to its home before any call.
+            if cmd.arg_num in self._arm64_argstk:
+                # Past the eighth of its class, so the caller left it just
+                # above our frame: the prologue's `stp x29, x30, [sp, #-frame]!`
+                # moved sp down by `frame` and x29 points at the new bottom, so
+                # the caller's outgoing area starts at x29 + frame.
+                # A frameless function never ran the prologue, so x29 still
+                # holds the *caller's* frame pointer; sp is unchanged from
+                # entry and the incoming area starts right at it.
+                if frame:
+                    base = "x29"
+                    off = frame + self._arm64_argstk[cmd.arg_num]
+                else:
+                    base = "sp"
+                    off = self._arm64_argstk[cmd.arg_num]
+                out = cmd.output
+                if out.ctype.is_floating():
+                    rd = self._arm64_fdefreg(out, 16)
+                    self.asm_code.add(asm_cmds.Raw(
+                        "ldr\t%s, [%s, #%d]" % (rd, base, off)))
+                    self._arm64_fwb(out, 16, slot_of)
+                else:
+                    rd = self._arm64_defreg(out, 9, reg_of)
+                    self.asm_code.add(asm_cmds.Raw(
+                        "ldr\t%s, [%s, #%d]"
+                        % (self._arm64_xname(rd), base, off)))
+                    self._arm64_wb(out, 9, reg_of, slot_of)
+                return
             if cmd.output.ctype.is_floating():
                 self._arm64_ffrom(
                     self._arm64_argfp[cmd.arg_num], cmd.output, slot_of)
@@ -1601,23 +1695,74 @@ class ASMGen:
                     self._arm64_arggp[cmd.arg_num], cmd.output, reg_of, slot_of)
             return
         if isinstance(cmd, control.Call):
+            # A statically known callee reaches us one of two ways: an
+            # explicit AddrOf of the function (older IL shape), or
+            # Call.direct_name, set by the stackless-calls pass, which elides
+            # that AddrOf entirely. Consult both, else it is a real indirect
+            # call through a function pointer.
             name = addrof_name.get(cmd.func)
             if name is None:
-                raise NotImplementedError(
-                    "arm64 back end: only direct calls are implemented yet")
-            if len(cmd.args) > 8:
-                raise NotImplementedError(
-                    "arm64 back end: >8 arguments (stack args) not implemented")
+                name = cmd.direct_name
+            # AAPCS64 passes the first eight of each class in registers and
+            # the rest on the stack, in order, at [sp+0], [sp+8], ... The frame
+            # is addressed off x29, so moving sp for the outgoing area cannot
+            # disturb any slot.
+            nstack = 0
             gp = 0
             fp = 0
             for a in cmd.args:
                 if a.ctype.is_floating():
+                    if fp >= 8:
+                        nstack += 1
+                    fp += 1
+                else:
+                    if gp >= 8:
+                        nstack += 1
+                    gp += 1
+            outgoing = ((nstack * 8) + 15) & ~15      # keep sp 16-byte aligned
+            if outgoing:
+                self.asm_code.add(asm_cmds.Raw(
+                    "sub\tsp, sp, #%d" % outgoing))
+            gp = 0
+            fp = 0
+            soff = 0
+            for a in cmd.args:
+                onstack = (fp >= 8) if a.ctype.is_floating() else (gp >= 8)
+                if onstack:
+                    # Stage through a scratch register, then store. x15/d16 are
+                    # scratch and never value homes.
+                    if a.ctype.is_floating():
+                        src = self._arm64_floatuse(a, 16, slot_of)
+                        self.asm_code.add(asm_cmds.Raw(
+                            "str\t%s, [sp, #%d]" % (src, soff)))
+                        fp += 1
+                    else:
+                        src = self._arm64_use(a, 15, reg_of, slot_of)
+                        self.asm_code.add(asm_cmds.Raw(
+                            "str\t%s, [sp, #%d]"
+                            % (self._arm64_xname(src), soff)))
+                        gp += 1
+                    soff += 8
+                elif a.ctype.is_floating():
                     self._arm64_finto(a, fp, slot_of)        # arg -> v<fp>
                     fp += 1
                 else:
                     self._arm64_into(a, gp, reg_of, slot_of)  # arg -> w/x<gp>
                     gp += 1
-            self.asm_code.add(asm_cmds.Raw("bl\t%s" % spots.mangle_symbol(name)))
+            if name is not None:
+                self.asm_code.add(asm_cmds.Raw(
+                    "bl\t%s" % spots.mangle_symbol(name)))
+            else:
+                # Indirect call through a function pointer. The target is
+                # loaded *after* the arguments are staged, so that materialising
+                # it cannot disturb x0-x7; x15 is scratch and never a value
+                # home, so it is safe to land on here.
+                ra = self._arm64_use(cmd.func, 15, reg_of, slot_of)
+                self.asm_code.add(asm_cmds.Raw(
+                    "blr\t%s" % self._arm64_xname(ra)))
+            if outgoing:
+                self.asm_code.add(asm_cmds.Raw(
+                    "add\tsp, sp, #%d" % outgoing))
             if not cmd.void_return:
                 if cmd.ret.ctype.is_floating():
                     self._arm64_ffrom(0, cmd.ret, slot_of)    # s0/d0 -> ret home
@@ -1627,7 +1772,19 @@ class ASMGen:
         if isinstance(cmd, value_cmds.AddrOf):
             name = self.symbol_table.names.get(cmd.var)
             if name is not None and cmd.var.ctype.is_function():
+                # Record the name so a Call through this value stays a direct
+                # `bl`, and *also* materialise the address: once function
+                # pointers exist the value may be stored, passed or reassigned,
+                # and then it has to be a real address rather than a note to
+                # the call site.
                 addrof_name[cmd.output] = name
+                sym = spots.mangle_symbol(name)
+                rd = self._arm64_xname(
+                    self._arm64_defreg(cmd.output, 9, reg_of))
+                self.asm_code.add(asm_cmds.Raw("adrp\t%s, %s" % (rd, sym)))
+                self.asm_code.add(asm_cmds.Raw(
+                    "add\t%s, %s, :lo12:%s" % (rd, rd, sym)))
+                self._arm64_wb(cmd.output, 9, reg_of, slot_of)
                 return
             gname = self._arm64_glob.get(cmd.var)
             if gname is not None:
@@ -1659,7 +1816,11 @@ class ASMGen:
                 self._arm64_fwb(cmd.output, 16, slot_of)
                 return
             rd = self._arm64_defreg(cmd.output, 10, reg_of)
-            self.asm_code.add(asm_cmds.Raw("ldr\t%s, [%s]" % (rd, ra)))
+            # Width matters: a plain `ldr` reads 4 or 8 bytes, so reading
+            # through a `char *` would pull in the neighbouring bytes.
+            op = self._arm64_ldr_op(cmd.output.ctype.size,
+                                    self._arm64_signed(cmd.output))
+            self.asm_code.add(asm_cmds.Raw("%s\t%s, [%s]" % (op, rd, ra)))
             self._arm64_wb(cmd.output, 10, reg_of, slot_of)
             return
         if isinstance(cmd, value_cmds.SetAt):
@@ -1669,7 +1830,10 @@ class ASMGen:
                 self.asm_code.add(asm_cmds.Raw("str\t%s, [%s]" % (rv, ra)))
                 return
             rv = self._arm64_use(cmd.val, 10, reg_of, slot_of)
-            self.asm_code.add(asm_cmds.Raw("str\t%s, [%s]" % (rv, ra)))
+            # Likewise for stores: a plain `str` writes 4 or 8 bytes, so
+            # `*charptr = c` would overwrite the bytes after it.
+            op = self._arm64_str_op(cmd.val.ctype.size)
+            self.asm_code.add(asm_cmds.Raw("%s\t%s, [%s]" % (op, rv, ra)))
             return
         if isinstance(cmd, value_cmds.ReadRel):
             # output = *(base + chunk*count)   (array / pointer indexed load)
@@ -1765,37 +1929,37 @@ class ASMGen:
             # Whole-aggregate copy (struct/array assignment): both operands are
             # memory-homed; copy size bytes in 8/4/2/1-byte chunks via scratch.
             if out.ctype.is_struct_union() or out.ctype.is_array():
-                if out in self._arm64_glob or arg in self._arm64_glob:
-                    raise NotImplementedError(
-                        "arm64 back end: whole-aggregate copy with a global"
-                        " operand not implemented yet")
-                oo = slot_of[out]
-                ao = slot_of[arg]
+                # Either side may be a frame slot or a global. Resolve each to
+                # a (base register, offset) pair first; a global's address is
+                # materialised into a scratch register, a local stays relative
+                # to the frame pointer.
+                obase, oo = self._arm64_agg_base(out, 10, slot_of)
+                abase, ao = self._arm64_agg_base(arg, 11, slot_of)
                 sz = out.ctype.size
                 done = 0
                 while sz - done >= 8:
                     self.asm_code.add(asm_cmds.Raw(
-                        "ldr\tx9, [x29, #%d]" % (ao + done)))
+                        "ldr\tx9, [%s, #%d]" % (abase, ao + done)))
                     self.asm_code.add(asm_cmds.Raw(
-                        "str\tx9, [x29, #%d]" % (oo + done)))
+                        "str\tx9, [%s, #%d]" % (obase, oo + done)))
                     done += 8
                 while sz - done >= 4:
                     self.asm_code.add(asm_cmds.Raw(
-                        "ldr\tw9, [x29, #%d]" % (ao + done)))
+                        "ldr\tw9, [%s, #%d]" % (abase, ao + done)))
                     self.asm_code.add(asm_cmds.Raw(
-                        "str\tw9, [x29, #%d]" % (oo + done)))
+                        "str\tw9, [%s, #%d]" % (obase, oo + done)))
                     done += 4
                 while sz - done >= 2:
                     self.asm_code.add(asm_cmds.Raw(
-                        "ldrh\tw9, [x29, #%d]" % (ao + done)))
+                        "ldrh\tw9, [%s, #%d]" % (abase, ao + done)))
                     self.asm_code.add(asm_cmds.Raw(
-                        "strh\tw9, [x29, #%d]" % (oo + done)))
+                        "strh\tw9, [%s, #%d]" % (obase, oo + done)))
                     done += 2
                 while sz - done >= 1:
                     self.asm_code.add(asm_cmds.Raw(
-                        "ldrb\tw9, [x29, #%d]" % (ao + done)))
+                        "ldrb\tw9, [%s, #%d]" % (abase, ao + done)))
                     self.asm_code.add(asm_cmds.Raw(
-                        "strb\tw9, [x29, #%d]" % (oo + done)))
+                        "strb\tw9, [%s, #%d]" % (obase, oo + done)))
                     done += 1
                 return
             r = reg_of.get(out, -1)
@@ -2053,8 +2217,95 @@ class ASMGen:
         for v in self.symbol_table.linkages[EXTERNAL].values():
             if self.symbol_table.def_state.get(v) == DEFINED:
                 self.asm_code.add_global(self.symbol_table.names[v])
+        # value -> assembler symbol, for static/file-scope globals, plus a
+        # dedup map so each global's storage is emitted only once.
+        self._rv_glob = {}
+        self._rv_gemit = {}
+        self._rv_freg = {}
+        self._rv_fltlit = {}
+        self._rv_fltlit_n = 0
+        self._rv_saved_fp = []
+        self._rv_fp_save_off = {}
+        # String-literal storage. A literal lives at a symbol in .data, not in
+        # any frame, so it is emitted once here and then treated exactly like
+        # a global: `char *p = "hi"` is an AddrOf of that symbol. Names are
+        # generated if the front end did not already intern one, and recorded
+        # so every reference uses the same label.
+        self._rv_strlit = {}
+        snum = 0
+        for v in self.il_code.string_literals:
+            nm = self.il_code.string_literal_names.get(v)
+            if nm is None:
+                nm = "__rvstr%d" % snum
+                self.il_code.string_literal_names[v] = nm
+            snum += 1
+            elem_size = v.ctype.el.size if v.ctype.is_array() else 1
+            self.asm_code.add_string_literal(
+                nm, self.il_code.string_literals[v], elem_size)
+            self._rv_strlit[v] = nm
+            # Also record it in the global map: the per-function value scan
+            # skips anything carrying a `.literal` attribute, and a string
+            # literal does, so it would never be registered there.
+            self._rv_glob[v] = nm
         for func in self.il_code.commands:
             self._rv_function(func, self.il_code.commands[func])
+
+    def _rv_emit_global_storage(self, v):
+        """Emit `.comm`/`.data` storage for a static/file-scope global `v`
+        (once), mirroring the arm64 and x86 paths."""
+        name = self.symbol_table.asm_name(v)
+        if name in self._rv_gemit:
+            return
+        self._rv_gemit[name] = 1
+        TENTATIVE = self.symbol_table.TENTATIVE
+        INTERNAL = self.symbol_table.INTERNAL
+        if self.symbol_table.def_state.get(v) == TENTATIVE:
+            local = (self.symbol_table.linkage_type[v] == INTERNAL)
+            self.asm_code.add_comm(name, v.ctype.size, local)
+        elif v in self.il_code.static_block_inits:
+            entries, total = self.il_code.static_block_inits[v]
+            self.asm_code.add_data_block(name, entries, total)
+        else:
+            init_val = self.il_code.static_inits.get(v, 0)
+            self.asm_code.add_data(name, v.ctype.size, init_val)
+
+    def _rv_signed(self, value):
+        """Whether `value` needs a sign-extending sub-word load. Only 1- and
+        2-byte integers care; wider or non-integer types (pointers have no
+        `signed` attribute) report False safely via the size short-circuit."""
+        if value.ctype.size <= 2:
+            return value.ctype.signed
+        return False
+
+    def _rv_ld_op(self, size, signed):
+        """Load mnemonic for a `size`-byte value. RISC-V spells the choice as
+        signed-vs-unsigned per width: lb/lbu, lh/lhu, lw/lwu, ld."""
+        if size == 1:
+            return "lb" if signed else "lbu"
+        if size == 2:
+            return "lh" if signed else "lhu"
+        if size <= 4:
+            return "lw"
+        return "ld"
+
+    def _rv_st_op(self, size):
+        """Store mnemonic for a `size`-byte value."""
+        if size == 1:
+            return "sb"
+        if size == 2:
+            return "sh"
+        if size <= 4:
+            return "sw"
+        return "sd"
+
+    def _rv_gaddr(self, value, areg):
+        """Materialize the address of global `value` into x<areg> and return
+        that register name. `lla` expands to auipc+addi with the PC-relative
+        relocation pair; the assembler owns that expansion."""
+        name = self._rv_glob[value]
+        a = self._rv_rn(areg)
+        self.asm_code.add(asm_cmds.Raw("lla\t%s, %s" % (a, name)))
+        return a
 
     def _rv_rn(self, regnum):
         """RISC-V register name (x0..x31)."""
@@ -2072,6 +2323,12 @@ class ASMGen:
         if r >= 0:
             return self._rv_rn(r)
         name = self._rv_rn(scratch)
+        if value in self._rv_glob:
+            a = self._rv_gaddr(value, scratch)
+            op = self._rv_ld_op(value.ctype.size, self._rv_signed(value))
+            self.asm_code.add(asm_cmds.Raw(
+                "%s\t%s, 0(%s)" % (op, name, a)))
+            return name
         op = "lw" if value.ctype.size <= 4 else "ld"
         self.asm_code.add(asm_cmds.Raw(
             "%s\t%s, %d(sp)" % (op, name, slot_of[value])))
@@ -2086,10 +2343,19 @@ class ASMGen:
 
     def _rv_wb(self, value, scratch, reg_of, slot_of):
         """Store x<scratch> back to `value`'s spill slot, if it has no home."""
-        if reg_of.get(value, -1) < 0:
-            op = "sw" if value.ctype.size <= 4 else "sd"
+        if reg_of.get(value, -1) >= 0:
+            return
+        if value in self._rv_glob:
+            # The value is already in x<scratch>, so the address needs a
+            # different register: t3 is reserved for exactly this.
+            a = self._rv_gaddr(value, 28)
+            op = self._rv_st_op(value.ctype.size)
             self.asm_code.add(asm_cmds.Raw(
-                "%s\t%s, %d(sp)" % (op, self._rv_rn(scratch), slot_of[value])))
+                "%s\t%s, 0(%s)" % (op, self._rv_rn(scratch), a)))
+            return
+        op = "sw" if value.ctype.size <= 4 else "sd"
+        self.asm_code.add(asm_cmds.Raw(
+            "%s\t%s, %d(sp)" % (op, self._rv_rn(scratch), slot_of[value])))
 
     def _rv_into(self, value, n, reg_of, slot_of):
         """Force `value` into x<n> (call argument / return value)."""
@@ -2104,6 +2370,11 @@ class ASMGen:
                 self.asm_code.add(asm_cmds.Raw(
                     "mv\t%s, %s" % (name, self._rv_rn(r))))
             return
+        if value in self._rv_glob:
+            a = self._rv_gaddr(value, 28)
+            op = self._rv_ld_op(value.ctype.size, self._rv_signed(value))
+            self.asm_code.add(asm_cmds.Raw("%s\t%s, 0(%s)" % (op, name, a)))
+            return
         op = "lw" if value.ctype.size <= 4 else "ld"
         self.asm_code.add(asm_cmds.Raw(
             "%s\t%s, %d(sp)" % (op, name, slot_of[value])))
@@ -2116,15 +2387,277 @@ class ASMGen:
             if r != n:
                 self.asm_code.add(asm_cmds.Raw(
                     "mv\t%s, %s" % (self._rv_rn(r), src)))
+        elif value in self._rv_glob:
+            a = self._rv_gaddr(value, 28)
+            op = self._rv_st_op(value.ctype.size)
+            self.asm_code.add(asm_cmds.Raw("%s\t%s, 0(%s)" % (op, src, a)))
         else:
             op = "sw" if value.ctype.size <= 4 else "sd"
             self.asm_code.add(asm_cmds.Raw(
                 "%s\t%s, %d(sp)" % (op, src, slot_of[value])))
 
+    def _rv_ctype_signed(self, ctype):
+        """Whether `ctype` is a signed integer. Pointers and unsigned types
+        are not; anything else is."""
+        return not (ctype.is_pointer()
+                    or (ctype.is_integral() and not ctype.signed))
+
+    def _rv_canon(self, rd, rs, size, signed):
+        """Emit code so `rd` holds `rs` truncated to `size` bytes and extended
+        to the RV64 canonical register form for that type.
+
+        RV64 keeps every 32-bit value sign-extended in a register, signed or
+        not -- that is the psABI's rule, not a choice -- so a 4-byte result is
+        always `addiw`. Narrower types are canonicalised by their own
+        signedness, which is what makes an unsigned char zero-extended and a
+        signed char sign-extended.
+        """
+        if size >= 8:
+            if rd != rs:
+                self.asm_code.add(asm_cmds.Raw("mv\t%s, %s" % (rd, rs)))
+            return
+        if size == 4:
+            self.asm_code.add(asm_cmds.Raw("addiw\t%s, %s, 0" % (rd, rs)))
+            return
+        if size == 2:
+            self.asm_code.add(asm_cmds.Raw("slli\t%s, %s, 48" % (rd, rs)))
+            op = "srai" if signed else "srli"
+            self.asm_code.add(asm_cmds.Raw("%s\t%s, %s, 48" % (op, rd, rd)))
+            return
+        if signed:
+            self.asm_code.add(asm_cmds.Raw("slli\t%s, %s, 56" % (rd, rs)))
+            self.asm_code.add(asm_cmds.Raw("srai\t%s, %s, 56" % (rd, rd)))
+        else:
+            self.asm_code.add(asm_cmds.Raw("andi\t%s, %s, 255" % (rd, rs)))
+
+    def _rv_convert(self, rd, rs, out, arg):
+        """Emit the conversion for `Set(out, arg)`: truncate or extend `rs`
+        into `rd` so it is canonical for `out`'s type."""
+        so = out.ctype.size
+        sa = arg.ctype.size
+        if so < sa:
+            self._rv_canon(rd, rs, so, self._rv_ctype_signed(out.ctype))
+            return
+        if so > sa and sa == 4 and not self._rv_ctype_signed(arg.ctype):
+            # Widening an *unsigned* 32-bit value. The register holds it
+            # sign-extended (the canonical 32-bit form), so a plain `mv` would
+            # carry that sign into the high half -- 0x80000000u would become
+            # negative rather than 2147483648. Zero-extend explicitly.
+            self.asm_code.add(asm_cmds.Raw("slli\t%s, %s, 32" % (rd, rs)))
+            self.asm_code.add(asm_cmds.Raw("srli\t%s, %s, 32" % (rd, rd)))
+            return
+        # Widening from 1 or 2 bytes needs nothing: those are already stored
+        # in the canonical form their own signedness dictates, which is
+        # exactly the widened value. Same-size assignment is a plain move.
+        if rd != rs:
+            self.asm_code.add(asm_cmds.Raw("mv\t%s, %s" % (rd, rs)))
+
+    def _rv_frn(self, regnum):
+        """FP register name. Unlike AArch64 -- where s<n> and d<n> select the
+        access width -- RISC-V has one name per register and the *instruction*
+        carries the precision suffix, so this needs no value argument."""
+        return "f%d" % regnum
+
+    def _rv_fsuffix(self, value):
+        """Instruction suffix for `value`'s precision: `.s` or `.d`."""
+        return "s" if value.ctype.size == 4 else "d"
+
+    def _rv_fld_op(self, value):
+        return "flw" if value.ctype.size == 4 else "fld"
+
+    def _rv_fst_op(self, value):
+        return "fsw" if value.ctype.size == 4 else "fsd"
+
+    def _rv_float_label(self, value):
+        """Emit the data for float literal `value` once and return its label."""
+        name = self._rv_fltlit.get(value)
+        if name is not None:
+            return name
+        import struct
+        val = self.il_code.float_literals[value]
+        name = "__rvflt%d" % self._rv_fltlit_n
+        if value.ctype.size == 4:
+            bits = struct.unpack("<I", struct.pack("<f", val))[0]
+            self.asm_code.add_data(name, 4, bits)
+        else:
+            bits = struct.unpack("<Q", struct.pack("<d", val))[0]
+            self.asm_code.add_data(name, 8, bits)
+        self._rv_fltlit_n += 1
+        self._rv_fltlit[value] = name
+        return name
+
+    def _rv_fload_lit(self, value, fn):
+        """Load float literal `value` into f<fn> via its .data label.
+
+        The address goes in t2, deliberately not t3: t3 is where the indexed
+        addressing helpers leave a computed address, and a literal operand is
+        loaded *after* that address is formed. Using t3 here would overwrite
+        the destination of the very store being set up, so `v.x = 1.5` would
+        write into .data instead of the struct.
+        """
+        name = self._rv_float_label(value)
+        self.asm_code.add(asm_cmds.Raw("lla\tt2, %s" % name))
+        self.asm_code.add(asm_cmds.Raw(
+            "%s\t%s, 0(t2)" % (self._rv_fld_op(value), self._rv_frn(fn))))
+
+    def _rv_faddr(self, value, areg, slot_of):
+        """Address operand for a memory-homed float: `0(t3)` for a global,
+        `<slot>(sp)` for a frame slot."""
+        gname = self._rv_glob.get(value)
+        if gname is not None:
+            a = self._rv_rn(areg)
+            self.asm_code.add(asm_cmds.Raw("lla\t%s, %s" % (a, gname)))
+            return "0(%s)" % a
+        return "%d(sp)" % slot_of[value]
+
+    def _rv_fuse(self, value, scratch, slot_of):
+        """Return an FP register name holding float `value`: its home (no
+        code), a loaded literal, or a load from its slot/global into
+        f<scratch>."""
+        if value in self.il_code.float_literals:
+            self._rv_fload_lit(value, scratch)
+            return self._rv_frn(scratch)
+        r = self._rv_freg.get(value, -1)
+        if r >= 0:
+            return self._rv_frn(r)
+        target = self._rv_faddr(value, 28, slot_of)
+        name = self._rv_frn(scratch)
+        self.asm_code.add(asm_cmds.Raw(
+            "%s\t%s, %s" % (self._rv_fld_op(value), name, target)))
+        return name
+
+    def _rv_fdefreg(self, value, scratch):
+        """FP register to write float `value` into: home, else f<scratch>."""
+        r = self._rv_freg.get(value, -1)
+        if r >= 0:
+            return self._rv_frn(r)
+        return self._rv_frn(scratch)
+
+    def _rv_fwb(self, value, scratch, slot_of):
+        """Store f<scratch> back to float `value`'s slot/global, if it has no
+        register home."""
+        if self._rv_freg.get(value, -1) >= 0:
+            return
+        target = self._rv_faddr(value, 28, slot_of)
+        self.asm_code.add(asm_cmds.Raw(
+            "%s\t%s, %s" % (self._rv_fst_op(value),
+                            self._rv_frn(scratch), target)))
+
+    def _rv_finto(self, value, n, slot_of):
+        """Force float `value` into f<n> (call argument / return value)."""
+        name = self._rv_frn(n)
+        if value in self.il_code.float_literals:
+            self._rv_fload_lit(value, n)
+            return
+        r = self._rv_freg.get(value, -1)
+        if r >= 0:
+            src = self._rv_frn(r)
+            if src != name:
+                self.asm_code.add(asm_cmds.Raw(
+                    "fmv.%s\t%s, %s" % (self._rv_fsuffix(value), name, src)))
+            return
+        target = self._rv_faddr(value, 28, slot_of)
+        self.asm_code.add(asm_cmds.Raw(
+            "%s\t%s, %s" % (self._rv_fld_op(value), name, target)))
+
+    def _rv_ffrom(self, n, value, slot_of):
+        """Store f<n> into float `value`'s home/slot/global (parameter unload
+        or call result)."""
+        src = self._rv_frn(n)
+        r = self._rv_freg.get(value, -1)
+        if r >= 0:
+            dst = self._rv_frn(r)
+            if dst != src:
+                self.asm_code.add(asm_cmds.Raw(
+                    "fmv.%s\t%s, %s" % (self._rv_fsuffix(value), dst, src)))
+            return
+        target = self._rv_faddr(value, 28, slot_of)
+        self.asm_code.add(asm_cmds.Raw(
+            "%s\t%s, %s" % (self._rv_fst_op(value), src, target)))
+
+    def _rv_base_addr(self, base, areg, reg_of, slot_of):
+        """Emit the base address of `base` into x<areg> and return its name.
+
+        A base is one of three things: a global (its symbol), storage that
+        lives in the frame -- an array or struct, whose *address* is sp+slot
+        rather than its contents -- or an ordinary pointer value, which is
+        already an address.
+        """
+        gname = self._rv_glob.get(base)
+        a = self._rv_rn(areg)
+        if gname is not None:
+            self.asm_code.add(asm_cmds.Raw("lla\t%s, %s" % (a, gname)))
+            return a
+        if base.ctype.is_array() or base.ctype.is_struct_union():
+            self.asm_code.add(asm_cmds.Raw(
+                "addi\t%s, sp, %d" % (a, slot_of[base])))
+            return a
+        return self._rv_use(base, areg, reg_of, slot_of)
+
+    def _rv_rel_base(self, base, chunk, count, rd, reg_of, slot_of):
+        """Emit `rd = base + chunk*count` (or base + chunk when count is
+        None), the address form shared by ReadRel/SetRel/AddrRel."""
+        const_off = None
+        if count is None:
+            const_off = chunk
+        else:
+            lit = getattr(count, "literal", None)
+            if lit is not None:
+                const_off = chunk * lit.val
+        if const_off is not None:
+            b = self._rv_base_addr(base, 28, reg_of, slot_of)
+            if const_off == 0:
+                if rd != b:
+                    self.asm_code.add(asm_cmds.Raw("mv\t%s, %s" % (rd, b)))
+            elif -2048 <= const_off <= 2047:
+                self.asm_code.add(asm_cmds.Raw(
+                    "addi\t%s, %s, %d" % (rd, b, const_off)))
+            else:
+                # Beyond addi's 12-bit reach; materialize the offset first.
+                self.asm_code.add(asm_cmds.Raw("li\tt2, %d" % const_off))
+                self.asm_code.add(asm_cmds.Raw(
+                    "add\t%s, %s, t2" % (rd, b)))
+            return
+        # Variable index: scale it by the element size, then add. The index is
+        # loaded before the base so that computing the base cannot clobber it.
+        ri = self._rv_use(count, 7, reg_of, slot_of)
+        b = self._rv_base_addr(base, 28, reg_of, slot_of)
+        if chunk == 1:
+            self.asm_code.add(asm_cmds.Raw("add\t%s, %s, %s" % (rd, b, ri)))
+            return
+        sh = -1
+        c = chunk
+        k = 0
+        while c > 0 and k < 63:
+            if c == 1:
+                sh = k
+                break
+            if c % 2 != 0:
+                break
+            c = c // 2
+            k += 1
+        if sh > 0:
+            self.asm_code.add(asm_cmds.Raw("slli\tt2, %s, %d" % (ri, sh)))
+        else:
+            self.asm_code.add(asm_cmds.Raw("li\tt2, %d" % chunk))
+            self.asm_code.add(asm_cmds.Raw("mul\tt2, %s, t2" % ri))
+        self.asm_code.add(asm_cmds.Raw("add\t%s, %s, t2" % (rd, b)))
+
+    def _rv_rel_addr(self, base, chunk, count, areg, reg_of, slot_of):
+        """Return a `0(reg)` operand addressing base + chunk*count, emitting
+        the address computation into x<areg>."""
+        a = self._rv_rn(areg)
+        self._rv_rel_base(base, chunk, count, a, reg_of, slot_of)
+        return "0(%s)" % a
+
     def _rv_epilogue(self, frame, has_call):
         for r in self._rv_saved_int:
             self.asm_code.add(asm_cmds.Raw(
                 "ld\t%s, %d(sp)" % (self._rv_rn(r), self._rv_int_save_off[r])))
+        for r in self._rv_saved_fp:
+            self.asm_code.add(asm_cmds.Raw(
+                "fld\t%s, %d(sp)" % (self._rv_frn(r),
+                                     self._rv_fp_save_off[r])))
         if has_call:
             self.asm_code.add(asm_cmds.Raw(
                 "ld\tra, %d(sp)" % self._rv_ra_off))
@@ -2150,17 +2683,32 @@ class ASMGen:
                 if v is None or getattr(v, "literal", None) is not None:
                     continue
                 if self.symbol_table.storage.get(v) == STATIC:
-                    raise NotImplementedError(
-                        "riscv64 back end: globals not implemented yet")
-                if v.ctype.is_floating() or v.ctype.is_array() \
-                        or v.ctype.is_struct_union() or v.ctype.size > 8:
-                    raise NotImplementedError(
-                        "riscv64 back end: only the integer core is implemented")
+                    # A static / file-scope global lives at a symbol, not in
+                    # the frame, so it is deliberately kept out of `values`:
+                    # it gets neither a register home nor a spill slot, and
+                    # every access goes through lla + load/store.
+
+                    if v not in self._rv_glob:
+                        self._rv_glob[v] = self.symbol_table.asm_name(v)
+                        self._rv_emit_global_storage(v)
+                    continue
                 if v not in seen:
                     seen[v] = 1
                     values.append(v)
 
+        # A value whose address is taken, or that is an aggregate (too big for
+        # a register), must live in memory: the first so a real address
+        # exists, the second so it fits at all.
         forced = {}
+        for c in cmds:
+            if isinstance(c, value_cmds.AddrOf) \
+                    and not c.var.ctype.is_function():
+                forced[c.var] = 1
+        for v in values:
+            if v.ctype.is_array() or v.ctype.is_struct_union() \
+                    or v.ctype.size > 8:
+                forced[v] = 1
+
         glob = {}
         fused_out = {}
         usecount = {}
@@ -2172,13 +2720,34 @@ class ASMGen:
             for v in c.outputs():
                 if v is not None:
                     defcount[v] = defcount.get(v, 0) + 1
-        # int parameter count / mapping
+        # Parameter mapping. lp64d counts integer and floating-point
+        # arguments in *separate* sequences -- a0..a7 and fa0..fa7 -- so a
+        # function's third parameter may arrive in a0 if the first two were
+        # doubles. Both maps are keyed by argument number.
         self._rv_arggp = {}
+        self._rv_argfp = {}
+        # Parameters past the eighth of their class arrive in the caller's
+        # outgoing area, just above our frame.
+        self._rv_argstk = {}
         agp = 0
+        afp = 0
+        astk = 0
         for c in cmds:
             if isinstance(c, value_cmds.LoadArg):
-                self._rv_arggp[c.arg_num] = agp
-                agp += 1
+                if c.output.ctype.is_floating():
+                    if afp >= 8:
+                        self._rv_argstk[c.arg_num] = astk
+                        astk += 8
+                    else:
+                        self._rv_argfp[c.arg_num] = afp
+                    afp += 1
+                else:
+                    if agp >= 8:
+                        self._rv_argstk[c.arg_num] = astk
+                        astk += 8
+                    else:
+                        self._rv_arggp[c.arg_num] = agp
+                    agp += 1
 
         # Copy coalescing (shared safety check).
         defidx = {}
@@ -2193,10 +2762,26 @@ class ASMGen:
             if isinstance(c, value_cmds.Set):
                 arg = c.arg
                 out = c.output
+                # The `forced` and aggregate tests below are defensive
+                # rather than load-bearing: a forced value is already kept out
+                # of `order`, so it has no register home, and coalescing onto
+                # it would still write through its frame slot. Mutation
+                # testing confirms removing them changes the code emitted but
+                # not its behaviour. They are kept for parity with the arm64
+                # path, and so the invariant survives a future change to how
+                # allocation picks homes.
                 if getattr(arg, "literal", None) is None \
                         and usecount.get(arg, 0) == 1 \
                         and defcount.get(arg, 0) == 1 \
+                        and arg not in self._rv_glob \
+                        and out not in self._rv_glob \
+                        and arg not in forced and out not in forced \
+                        and not out.ctype.is_struct_union() \
+                        and not out.ctype.is_array() \
+                        and out.ctype.size <= 8 \
                         and out.ctype.size == arg.ctype.size \
+                        and out.ctype.is_floating() \
+                            == arg.ctype.is_floating() \
                         and self._il_coalesce_safe(
                             cmds, defidx.get(arg, -1), k, out):
                     coalesce[arg] = out
@@ -2222,14 +2807,30 @@ class ASMGen:
         # Argument set-up writes a0..a<gp_max-1>; parameters arrive in a0..
         # a<agp-1>. Caller-saved homes are placed above both.
         gp_max = 0
+        fp_max = 0
+        out_max = 0                   # widest outgoing stack-argument area
         for c in cmds:
             if isinstance(c, control.Call):
-                g = len(c.args)
+                g = 0
+                fcnt = 0
+                for a in c.args:
+                    if a.ctype.is_floating():
+                        fcnt += 1
+                    else:
+                        g += 1
+                ns = 0
                 if g > 8:
-                    raise NotImplementedError(
-                        "riscv64 back end: >8 arguments not implemented")
+                    ns += g - 8
+                    g = 8
+                if fcnt > 8:
+                    ns += fcnt - 8
+                    fcnt = 8
+                if ns > out_max:
+                    out_max = ns
                 if g > gp_max:
                     gp_max = g
+                if fcnt > fp_max:
+                    fp_max = fcnt
         cs = gp_max
         if agp > cs:
             cs = agp
@@ -2248,6 +2849,30 @@ class ASMGen:
         while r <= 27:                       # s2..s11
             int_callee.append(r)
             r += 1
+        # Floating-point file. Caller-saved homes are the temporaries above
+        # the argument registers this function actually uses: ft0..ft7 are
+        # f0..f7, and fa<fs>..fa7 are f10+fs..f17. ft8/ft9 (f28/f29) join
+        # them; ft10/ft11 (f30/f31) are reserved as scratch and never become
+        # homes. Callee-saved homes are fs0..fs11 -- f8, f9 and f18..f27.
+        fp_caller = []
+        rr = 0
+        while rr <= 7:                       # ft0..ft7
+            fp_caller.append(rr)
+            rr += 1
+        fs = fp_max
+        if afp > fs:
+            fs = afp
+        rr = fs
+        while rr <= 7:                       # unused fa registers
+            fp_caller.append(10 + rr)
+            rr += 1
+        fp_caller.append(28)                 # ft8
+        fp_caller.append(29)                 # ft9
+        fp_callee = [8, 9]                   # fs0, fs1
+        rr = 18
+        while rr <= 27:                      # fs2..fs11
+            fp_callee.append(rr)
+            rr += 1
 
         busy_int = {}
         busy_fp = {}
@@ -2257,21 +2882,30 @@ class ASMGen:
         order = []
         for v in values:
             cv = self._il_canon(v, coalesce)
-            if cv in reps:
+            if cv in reps or cv in forced:
                 continue
             reps[cv] = 1
             order.append(cv)
         order.sort(key=lambda vv: start.get(vv, 0))
         reg_of, freg_of, spill = self._il_linear_scan(
-            order, start, end, crosses, int_caller, int_callee, [], [],
-            busy_int, busy_fp, used_int_callee, used_fp_callee)
+            order, start, end, crosses, int_caller, int_callee,
+            fp_caller, fp_callee, busy_int, busy_fp,
+            used_int_callee, used_fp_callee)
+        self._rv_freg = freg_of
 
         # Frame: ra (if any call) + used callee saves + spills, sp-relative.
         saved_int = []
         for r in range(18, 28):
             if r in used_int_callee:
                 saved_int.append(r)
-        off = 0
+        # lp64d passes arguments past the eighth of each class on the stack at
+        # [sp+0], [sp+8], ... of the *caller's* frame. Unlike arm64, this frame
+        # is addressed off sp, so sp cannot move around a call -- the outgoing
+        # area is instead reserved at the bottom of the frame and everything
+        # else shifts up past it.
+        outgoing = ((out_max * 8) + 15) & ~15
+        self._rv_outgoing = outgoing
+        off = outgoing
         self._rv_ra_off = 0
         if has_call:
             self._rv_ra_off = off
@@ -2279,6 +2913,14 @@ class ASMGen:
         int_save_off = {}
         for r in saved_int:
             int_save_off[r] = off
+            off += 8
+        saved_fp = []
+        for r in [8, 9] + list(range(18, 28)):
+            if r in used_fp_callee:
+                saved_fp.append(r)
+        fp_save_off = {}
+        for r in saved_fp:
+            fp_save_off[r] = off
             off += 8
         slot_of = {}
         for v in values:
@@ -2298,6 +2940,8 @@ class ASMGen:
             o = self._il_canon(arg, coalesce)
             if o in reg_of:
                 reg_of[arg] = reg_of[o]
+            if o in freg_of:
+                freg_of[arg] = freg_of[o]
             if o in slot_of:
                 slot_of[arg] = slot_of[o]
         for idx in range(n):
@@ -2306,10 +2950,13 @@ class ASMGen:
                 skip[idx] = 1
 
         frame = 0
-        if len(saved_int) > 0 or len(slot_of) > 0 or has_call:
+        if len(saved_int) > 0 or len(saved_fp) > 0 or len(slot_of) > 0 \
+                or has_call:
             frame = off + (-off % 16)
         self._rv_saved_int = saved_int
         self._rv_int_save_off = int_save_off
+        self._rv_saved_fp = saved_fp
+        self._rv_fp_save_off = fp_save_off
 
         self.asm_code.add(asm_cmds.AsmLabel(func))
         if frame:
@@ -2320,6 +2967,9 @@ class ASMGen:
             for r in saved_int:
                 self.asm_code.add(asm_cmds.Raw(
                     "sd\t%s, %d(sp)" % (self._rv_rn(r), int_save_off[r])))
+            for r in saved_fp:
+                self.asm_code.add(asm_cmds.Raw(
+                    "fsd\t%s, %d(sp)" % (self._rv_frn(r), fp_save_off[r])))
         addrof_name = {}
         for idx in range(n):
             if idx in skip:
@@ -2347,17 +2997,56 @@ class ASMGen:
         if isinstance(cmd, value_cmds.Set):
             out = cmd.output
             arg = cmd.arg
+            of = out.ctype.is_floating()
+            af = arg.ctype.is_floating()
+            if of or af:
+                if of and af:
+                    src = self._rv_fuse(arg, 30, slot_of)
+                    fd = self._rv_fdefreg(out, 30)
+                    if out.ctype.size == arg.ctype.size:
+                        if fd != src:
+                            self.asm_code.add(asm_cmds.Raw(
+                                "fmv.%s\t%s, %s"
+                                % (self._rv_fsuffix(out), fd, src)))
+                    else:                       # float <-> double
+                        self.asm_code.add(asm_cmds.Raw(
+                            "fcvt.%s.%s\t%s, %s"
+                            % (self._rv_fsuffix(out),
+                               self._rv_fsuffix(arg), fd, src)))
+                    self._rv_fwb(out, 30, slot_of)
+                elif of:                        # integer -> float
+                    ra = self._rv_use(arg, 5, reg_of, slot_of)
+                    fd = self._rv_fdefreg(out, 30)
+                    sg = self._rv_ctype_signed(arg.ctype)
+                    isz = "l" if arg.ctype.size > 4 else "w"
+                    if not sg:
+                        isz = isz + "u"
+                    self.asm_code.add(asm_cmds.Raw(
+                        "fcvt.%s.%s\t%s, %s"
+                        % (self._rv_fsuffix(out), isz, fd, ra)))
+                    self._rv_fwb(out, 30, slot_of)
+                else:                           # float -> integer
+                    fa = self._rv_fuse(arg, 30, slot_of)
+                    rd = self._rv_defreg(out, 5, reg_of)
+                    sg = self._rv_ctype_signed(out.ctype)
+                    isz = "l" if out.ctype.size > 4 else "w"
+                    if not sg:
+                        isz = isz + "u"
+                    # C truncates toward zero; RISC-V's default rounding mode
+                    # is dynamic (round-to-nearest), so `rtz` is required, not
+                    # decoration.
+                    self.asm_code.add(asm_cmds.Raw(
+                        "fcvt.%s.%s\t%s, %s, rtz"
+                        % (isz, self._rv_fsuffix(arg), rd, fa)))
+                    self._rv_wb(out, 5, reg_of, slot_of)
+                return
             lit = getattr(arg, "literal", None)
             rd = self._rv_defreg(out, 5, reg_of)
             if lit is not None:
                 self.asm_code.add(asm_cmds.Raw("li\t%s, %s" % (rd, lit.val)))
             else:
                 rs = self._rv_use(arg, 5, reg_of, slot_of)
-                if out.ctype.size <= 4 and arg.ctype.size > 4:
-                    self.asm_code.add(asm_cmds.Raw(
-                        "addiw\t%s, %s, 0" % (rd, rs)))   # narrow to 32-bit
-                elif rd != rs:
-                    self.asm_code.add(asm_cmds.Raw("mv\t%s, %s" % (rd, rs)))
+                self._rv_convert(rd, rs, out, arg)
             self._rv_wb(out, 5, reg_of, slot_of)
             return
 
@@ -2365,6 +3054,21 @@ class ASMGen:
                 or isinstance(cmd, math_cmds.Mult):
             ins = cmd.inputs()
             out = cmd.outputs()[0]
+            if out.ctype.is_floating():
+                fa = self._rv_fuse(ins[0], 30, slot_of)
+                fb = self._rv_fuse(ins[1], 31, slot_of)
+                fd = self._rv_fdefreg(out, 30)
+                if isinstance(cmd, math_cmds.Add):
+                    fop = "fadd"
+                elif isinstance(cmd, math_cmds.Subtr):
+                    fop = "fsub"
+                else:
+                    fop = "fmul"
+                self.asm_code.add(asm_cmds.Raw(
+                    "%s.%s\t%s, %s, %s"
+                    % (fop, self._rv_fsuffix(out), fd, fa, fb)))
+                self._rv_fwb(out, 30, slot_of)
+                return
             ra = self._rv_use(ins[0], 5, reg_of, slot_of)
             rb = self._rv_use(ins[1], 6, reg_of, slot_of)
             rd = self._rv_defreg(out, 5, reg_of)
@@ -2377,6 +3081,15 @@ class ASMGen:
         if isinstance(cmd, math_cmds.Div) or isinstance(cmd, math_cmds.Mod):
             ins = cmd.inputs()
             out = cmd.outputs()[0]
+            if out.ctype.is_floating():        # Mod is not valid for floats
+                fa = self._rv_fuse(ins[0], 30, slot_of)
+                fb = self._rv_fuse(ins[1], 31, slot_of)
+                fd = self._rv_fdefreg(out, 30)
+                self.asm_code.add(asm_cmds.Raw(
+                    "fdiv.%s\t%s, %s, %s"
+                    % (self._rv_fsuffix(out), fd, fa, fb)))
+                self._rv_fwb(out, 30, slot_of)
+                return
             ra = self._rv_use(ins[0], 5, reg_of, slot_of)
             rb = self._rv_use(ins[1], 6, reg_of, slot_of)
             rd = self._rv_defreg(out, 5, reg_of)
@@ -2392,9 +3105,117 @@ class ASMGen:
             self._rv_wb(out, 5, reg_of, slot_of)
             return
 
+        if isinstance(cmd, math_cmds.BitAnd) or isinstance(cmd, math_cmds.BitOr) \
+                or isinstance(cmd, math_cmds.BitXor):
+            ins = cmd.inputs()
+            out = cmd.outputs()[0]
+            ra = self._rv_use(ins[0], 5, reg_of, slot_of)
+            rb = self._rv_use(ins[1], 6, reg_of, slot_of)
+            rd = self._rv_defreg(out, 5, reg_of)
+            if isinstance(cmd, math_cmds.BitAnd):
+                op = "and"
+            elif isinstance(cmd, math_cmds.BitOr):
+                op = "or"
+            else:
+                op = "xor"
+            # No `w` forms exist for the logical ops, and none are needed:
+            # RV64 keeps 32-bit values sign-extended in registers, and a
+            # bitwise combination of two sign-extended values is itself
+            # sign-extended.
+            self.asm_code.add(asm_cmds.Raw(
+                "%s\t%s, %s, %s" % (op, rd, ra, rb)))
+            self._rv_wb(out, 5, reg_of, slot_of)
+            return
+
+        if isinstance(cmd, math_cmds.LBitShift) \
+                or isinstance(cmd, math_cmds.RBitShift):
+            ins = cmd.inputs()
+            out = cmd.outputs()[0]
+            ra = self._rv_use(ins[0], 5, reg_of, slot_of)
+            rd = self._rv_defreg(out, 5, reg_of)
+            # Right shift is arithmetic or logical by the *operand's*
+            # signedness. The 32-bit `w` forms shift within 32 bits and
+            # sign-extend the result, which is what a shift of an `int` means.
+            if isinstance(cmd, math_cmds.LBitShift):
+                base = "sll"
+            else:
+                ct = ins[0].ctype
+                sg = not (ct.is_pointer()
+                          or (ct.is_integral() and not ct.signed))
+                base = "sra" if sg else "srl"
+            narrow = out.ctype.size <= 4
+            lit = getattr(ins[1], "literal", None)
+            limit = 32 if narrow else 64
+            if lit is not None and 0 <= lit.val < limit:
+                op = base + "i" + ("w" if narrow else "")
+                self.asm_code.add(asm_cmds.Raw(
+                    "%s\t%s, %s, %d" % (op, rd, ra, lit.val)))
+            else:
+                rb = self._rv_use(ins[1], 6, reg_of, slot_of)
+                op = base + ("w" if narrow else "")
+                self.asm_code.add(asm_cmds.Raw(
+                    "%s\t%s, %s, %s" % (op, rd, ra, rb)))
+            self._rv_wb(out, 5, reg_of, slot_of)
+            return
+
+        if isinstance(cmd, math_cmds.Neg) or isinstance(cmd, math_cmds.Not):
+            ins = cmd.inputs()
+            out = cmd.outputs()[0]
+            if out.ctype.is_floating():
+                fa = self._rv_fuse(ins[0], 30, slot_of)
+                fd = self._rv_fdefreg(out, 30)
+                self.asm_code.add(asm_cmds.Raw(
+                    "fneg.%s\t%s, %s"
+                    % (self._rv_fsuffix(out), fd, fa)))
+                self._rv_fwb(out, 30, slot_of)
+                return
+            ra = self._rv_use(ins[0], 5, reg_of, slot_of)
+            rd = self._rv_defreg(out, 5, reg_of)
+            if isinstance(cmd, math_cmds.Not):
+                # `not` is xori rd, rs, -1; it needs no width variant.
+                op = "not"
+            else:
+                op = "negw" if out.ctype.size <= 4 else "neg"
+            self.asm_code.add(asm_cmds.Raw("%s\t%s, %s" % (op, rd, ra)))
+            self._rv_wb(out, 5, reg_of, slot_of)
+            return
+
+
         if isinstance(cmd, cmp_cmds._GeneralCmp):
             ins = cmd.inputs()
             out = cmd.outputs()[0]
+            if ins[0].ctype.is_floating():
+                # RISC-V compares floats straight into an integer register,
+                # so there is no flag register or conditional-set step. All
+                # three are *ordered* comparisons -- NaN yields 0 -- which is
+                # what C wants for <, <=, > and >=; `!=` is the negation of
+                # feq, and so correctly yields 1 for NaN.
+                fa = self._rv_fuse(ins[0], 30, slot_of)
+                fb = self._rv_fuse(ins[1], 31, slot_of)
+                rd = self._rv_defreg(out, 5, reg_of)
+                sfx = self._rv_fsuffix(ins[0])
+                if isinstance(cmd, cmp_cmds.EqualCmp):
+                    self.asm_code.add(asm_cmds.Raw(
+                        "feq.%s\t%s, %s, %s" % (sfx, rd, fa, fb)))
+                elif isinstance(cmd, cmp_cmds.NotEqualCmp):
+                    self.asm_code.add(asm_cmds.Raw(
+                        "feq.%s\t%s, %s, %s" % (sfx, rd, fa, fb)))
+                    self.asm_code.add(asm_cmds.Raw(
+                        "xori\t%s, %s, 1" % (rd, rd)))
+                elif isinstance(cmd, cmp_cmds.LessCmp):
+                    self.asm_code.add(asm_cmds.Raw(
+                        "flt.%s\t%s, %s, %s" % (sfx, rd, fa, fb)))
+                elif isinstance(cmd, cmp_cmds.GreaterCmp):
+                    self.asm_code.add(asm_cmds.Raw(
+                        "flt.%s\t%s, %s, %s" % (sfx, rd, fb, fa)))
+                elif isinstance(cmd, cmp_cmds.LessOrEqCmp):
+                    self.asm_code.add(asm_cmds.Raw(
+                        "fle.%s\t%s, %s, %s" % (sfx, rd, fa, fb)))
+                else:                          # GreaterOrEqCmp
+                    self.asm_code.add(asm_cmds.Raw(
+                        "fle.%s\t%s, %s, %s" % (sfx, rd, fb, fa)))
+                self._rv_wb(out, 5, reg_of, slot_of)
+                return
             ra = self._rv_use(ins[0], 5, reg_of, slot_of)
             rb = self._rv_use(ins[1], 6, reg_of, slot_of)
             rd = self._rv_defreg(out, 5, reg_of)
@@ -2436,33 +3257,164 @@ class ASMGen:
             return
 
         if isinstance(cmd, value_cmds.LoadArg):
-            self._rv_from(10 + self._rv_arggp[cmd.arg_num], cmd.output,
-                          reg_of, slot_of)
+            if cmd.arg_num in self._rv_argstk:
+                # sp was lowered by `frame`, so the caller's outgoing area
+                # begins at frame(sp).
+                off = frame + self._rv_argstk[cmd.arg_num]
+                out = cmd.output
+                if out.ctype.is_floating():
+                    fd = self._rv_fdefreg(out, 30)
+                    self.asm_code.add(asm_cmds.Raw(
+                        "%s\t%s, %d(sp)" % (self._rv_fld_op(out), fd, off)))
+                    self._rv_fwb(out, 30, slot_of)
+                else:
+                    rd = self._rv_defreg(out, 5, reg_of)
+                    self.asm_code.add(asm_cmds.Raw(
+                        "ld\t%s, %d(sp)" % (rd, off)))
+                    self._rv_wb(out, 5, reg_of, slot_of)
+                return
+            if cmd.output.ctype.is_floating():
+                self._rv_ffrom(10 + self._rv_argfp[cmd.arg_num],
+                               cmd.output, slot_of)
+            else:
+                self._rv_from(10 + self._rv_arggp[cmd.arg_num], cmd.output,
+                              reg_of, slot_of)
             return
         if isinstance(cmd, value_cmds.AddrOf):
             name = self.symbol_table.names.get(cmd.var)
             if name is not None and cmd.var.ctype.is_function():
+                # As on arm64: record the name so a direct call stays direct,
+                # and materialise the address so the value is usable as one.
                 addrof_name[cmd.output] = name
+                rd = self._rv_defreg(cmd.output, 5, reg_of)
+                self.asm_code.add(asm_cmds.Raw(
+                    "lla\t%s, %s" % (rd, spots.mangle_symbol(name))))
+                self._rv_wb(cmd.output, 5, reg_of, slot_of)
                 return
-            raise NotImplementedError(
-                "riscv64 back end: address-of a variable not implemented yet")
+            rd = self._rv_defreg(cmd.output, 5, reg_of)
+            gname = self._rv_glob.get(cmd.var)
+            if gname is not None:
+                self.asm_code.add(asm_cmds.Raw("lla\t%s, %s" % (rd, gname)))
+            else:
+                # Address of a local: sp + its frame slot. The variable was
+                # forced to memory in _rv_function, so slot_of[var] exists.
+                self.asm_code.add(asm_cmds.Raw(
+                    "addi\t%s, sp, %d" % (rd, slot_of[cmd.var])))
+            self._rv_wb(cmd.output, 5, reg_of, slot_of)
+            return
+        if isinstance(cmd, value_cmds.ReadAt):
+            ra = self._rv_use(cmd.addr, 5, reg_of, slot_of)
+            out = cmd.output
+            if out.ctype.is_floating():
+                fd = self._rv_fdefreg(out, 30)
+                self.asm_code.add(asm_cmds.Raw(
+                    "%s\t%s, 0(%s)" % (self._rv_fld_op(out), fd, ra)))
+                self._rv_fwb(out, 30, slot_of)
+                return
+            rd = self._rv_defreg(out, 6, reg_of)
+            op = self._rv_ld_op(out.ctype.size, self._rv_signed(out))
+            self.asm_code.add(asm_cmds.Raw("%s\t%s, 0(%s)" % (op, rd, ra)))
+            self._rv_wb(out, 6, reg_of, slot_of)
+            return
+        if isinstance(cmd, value_cmds.SetAt):
+            ra = self._rv_use(cmd.addr, 5, reg_of, slot_of)
+            if cmd.val.ctype.is_floating():
+                fv = self._rv_fuse(cmd.val, 30, slot_of)
+                self.asm_code.add(asm_cmds.Raw(
+                    "%s\t%s, 0(%s)" % (self._rv_fst_op(cmd.val), fv, ra)))
+                return
+            rv = self._rv_use(cmd.val, 6, reg_of, slot_of)
+            op = self._rv_st_op(cmd.val.ctype.size)
+            self.asm_code.add(asm_cmds.Raw("%s\t%s, 0(%s)" % (op, rv, ra)))
+            return
+        if isinstance(cmd, value_cmds.ReadRel):
+            # output = *(base + chunk*count)   (array / pointer indexed load)
+            addr = self._rv_rel_addr(
+                cmd.base, cmd.chunk, cmd.count, 28, reg_of, slot_of)
+            out = cmd.output
+            if out.ctype.is_floating():
+                fd = self._rv_fdefreg(out, 30)
+                self.asm_code.add(asm_cmds.Raw(
+                    "%s\t%s, %s" % (self._rv_fld_op(out), fd, addr)))
+                self._rv_fwb(out, 30, slot_of)
+                return
+            rd = self._rv_defreg(out, 6, reg_of)
+            op = self._rv_ld_op(out.ctype.size, self._rv_signed(out))
+            self.asm_code.add(asm_cmds.Raw("%s\t%s, %s" % (op, rd, addr)))
+            self._rv_wb(out, 6, reg_of, slot_of)
+            return
+        if isinstance(cmd, value_cmds.SetRel):
+            # *(base + chunk*count) = val      (array / pointer indexed store)
+            addr = self._rv_rel_addr(
+                cmd.base, cmd.chunk, cmd.count, 28, reg_of, slot_of)
+            if cmd.val.ctype.is_floating():
+                fv = self._rv_fuse(cmd.val, 30, slot_of)
+                self.asm_code.add(asm_cmds.Raw(
+                    "%s\t%s, %s" % (self._rv_fst_op(cmd.val), fv, addr)))
+                return
+            rv = self._rv_use(cmd.val, 6, reg_of, slot_of)
+            op = self._rv_st_op(cmd.val.ctype.size)
+            self.asm_code.add(asm_cmds.Raw("%s\t%s, %s" % (op, rv, addr)))
+            return
+        if isinstance(cmd, value_cmds.AddrRel):
+            # output = &(base + chunk*count)   (e.g. &a[i])
+            out = cmd.output
+            rd = self._rv_defreg(out, 6, reg_of)
+            self._rv_rel_base(cmd.base, cmd.chunk, cmd.count, rd,
+                              reg_of, slot_of)
+            self._rv_wb(out, 6, reg_of, slot_of)
+            return
         if isinstance(cmd, control.Call):
             name = addrof_name.get(cmd.func)
             if name is None:
-                raise NotImplementedError(
-                    "riscv64 back end: only direct calls are implemented")
+                name = cmd.direct_name          # stackless-calls pass
             gp = 0
+            fp = 0
+            soff = 0
             for arg in cmd.args:
-                self._rv_into(arg, 10 + gp, reg_of, slot_of)
-                gp += 1
-            self.asm_code.add(asm_cmds.Raw(
-                "call\t%s" % spots.mangle_symbol(name)))
+                onstack = (fp >= 8) if arg.ctype.is_floating() else (gp >= 8)
+                if onstack:
+                    # The outgoing area sits at the bottom of our own frame,
+                    # so sp does not move: store straight to soff(sp).
+                    if arg.ctype.is_floating():
+                        src = self._rv_fuse(arg, 30, slot_of)
+                        self.asm_code.add(asm_cmds.Raw(
+                            "%s\t%s, %d(sp)"
+                            % (self._rv_fst_op(arg), src, soff)))
+                        fp += 1
+                    else:
+                        src = self._rv_use(arg, 5, reg_of, slot_of)
+                        self.asm_code.add(asm_cmds.Raw(
+                            "sd\t%s, %d(sp)" % (src, soff)))
+                        gp += 1
+                    soff += 8
+                elif arg.ctype.is_floating():
+                    self._rv_finto(arg, 10 + fp, slot_of)     # arg -> fa<fp>
+                    fp += 1
+                else:
+                    self._rv_into(arg, 10 + gp, reg_of, slot_of)
+                    gp += 1
+            if name is not None:
+                self.asm_code.add(asm_cmds.Raw(
+                    "call\t%s" % spots.mangle_symbol(name)))
+            else:
+                # Indirect call: load the target after the arguments are
+                # staged, so materialising it cannot disturb a0-a7. t3 is
+                # scratch and never a value home.
+                ra = self._rv_use(cmd.func, 28, reg_of, slot_of)
+                self.asm_code.add(asm_cmds.Raw("jalr\t%s" % ra))
             if not cmd.void_return:
-                self._rv_from(10, cmd.ret, reg_of, slot_of)
+                if cmd.ret.ctype.is_floating():
+                    self._rv_ffrom(10, cmd.ret, slot_of)      # fa0 -> ret home
+                else:
+                    self._rv_from(10, cmd.ret, reg_of, slot_of)
             return
         if isinstance(cmd, control.Return):
             if cmd.arg is not None:
-                self._rv_into(cmd.arg, 10, reg_of, slot_of)   # a0
+                if cmd.arg.ctype.is_floating():
+                    self._rv_finto(cmd.arg, 10, slot_of)      # fa0
+                else:
+                    self._rv_into(cmd.arg, 10, reg_of, slot_of)   # a0
             self._rv_epilogue(frame, has_call)
             return
         raise NotImplementedError(
@@ -3061,8 +4013,10 @@ class ASMGen:
         if isinstance(cmd, control.Call):
             name = addrof_name.get(cmd.func)
             if name is None:
+                name = cmd.direct_name          # stackless-calls pass
+            if name is None:
                 raise NotImplementedError(
-                    "m68k back end: only direct calls are implemented")
+                    "m68k back end: indirect calls are not implemented")
             i = len(cmd.args) - 1
             while i >= 0:                    # push arguments right-to-left
                 src = self._m68_src(cmd.args[i], reg_of, slot_of)
