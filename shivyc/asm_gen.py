@@ -964,8 +964,19 @@ class ASMGen:
 
         self.asm_code.add(asm_cmds.AsmLabel(func))
         if frame:
-            self.asm_code.add(asm_cmds.Raw(
-                "stp\tx29, x30, [sp, #-%d]!" % frame))
+            # stp's pre-index offset is a *scaled 7-bit* field: +/-512 bytes
+            # for a pair of 64-bit registers. A larger frame -- easily reached
+            # by a function with a sizeable local buffer -- has to lower sp
+            # separately. x16/x17 are ABI scratch, and at entry only the
+            # argument registers and x16 (the variadic block base) are live, so
+            # x17 is free here.
+            if frame <= 504:
+                self.asm_code.add(asm_cmds.Raw(
+                    "stp\tx29, x30, [sp, #-%d]!" % frame))
+            else:
+                self._arm64_mov_imm("x17", frame, 8)
+                self.asm_code.add(asm_cmds.Raw("sub\tsp, sp, x17"))
+                self.asm_code.add(asm_cmds.Raw("stp\tx29, x30, [sp]"))
             self.asm_code.add(asm_cmds.Raw("mov\tx29, sp"))
             for r in saved_int:
                 self.asm_code.add(asm_cmds.Raw(
@@ -1187,8 +1198,13 @@ class ASMGen:
             self.asm_code.add(asm_cmds.Raw(
                 "ldr\td%d, [x29, #%d]" % (r, self._arm64_fp_save_off[r])))
         if frame:
-            self.asm_code.add(asm_cmds.Raw(
-                "ldp\tx29, x30, [sp], #%d" % frame))
+            if frame <= 504:
+                self.asm_code.add(asm_cmds.Raw(
+                    "ldp\tx29, x30, [sp], #%d" % frame))
+            else:
+                self.asm_code.add(asm_cmds.Raw("ldp\tx29, x30, [sp]"))
+                self._arm64_mov_imm("x17", frame, 8)
+                self.asm_code.add(asm_cmds.Raw("add\tsp, sp, x17"))
         self.asm_code.add(asm_cmds.Raw("ret"))
 
     def _arm64_frn(self, regnum, value):
@@ -1289,6 +1305,33 @@ class ASMGen:
             return "x%d" % regnum
         return "w%d" % regnum
 
+    def _arm64_frame_ref(self, off, areg):
+        """Return a memory operand addressing `off` bytes into the frame.
+
+        The unsigned-offset load/store forms carry a 12-bit field, so an offset
+        past 4095 -- a function with a local buffer of a few KB reaches that
+        easily -- has to be folded into a register first. Returns `[x29, #off]`
+        when it fits and `[x<areg>]` otherwise, emitting the address
+        computation.
+        """
+        if 0 <= off <= 4095:
+            return "[x29, #%d]" % off
+        a = "x%d" % areg
+        self._arm64_mov_imm(a, off, 8)
+        self.asm_code.add(asm_cmds.Raw("add\t%s, x29, %s" % (a, a)))
+        return "[%s]" % a
+
+    def _arm64_frame_addr_into(self, dest, off, scratch):
+        """Emit `dest = x29 + off`, materialising the offset when `add`'s
+        12-bit immediate cannot hold it."""
+        if 0 <= off <= 4095:
+            self.asm_code.add(asm_cmds.Raw(
+                "add\t%s, x29, #%d" % (dest, off)))
+            return
+        t = "x%d" % scratch
+        self._arm64_mov_imm(t, off, 8)
+        self.asm_code.add(asm_cmds.Raw("add\t%s, x29, %s" % (dest, t)))
+
     def _arm64_mem_addr(self, value, areg, slot_of):
         """Addressing operand for a memory-resident `value`. For a local it is
         `[x29, #slot]` (no code emitted). For a global it emits adrp/add of the
@@ -1303,7 +1346,7 @@ class ASMGen:
             self.asm_code.add(asm_cmds.Raw(
                 "add\t%s, %s, :lo12:%s" % (a, a, name)))
             return "[%s]" % a
-        return "[x29, #%d]" % slot_of[value]
+        return self._arm64_frame_ref(slot_of[value], areg)
 
     def _arm64_use(self, value, scratch, reg_of, slot_of):
         """Return a register name holding `value`, emitting a load if needed:
@@ -1456,7 +1499,8 @@ class ASMGen:
                     return "[%s]" % a
                 return "[%s, #%d]" % (a, const_off)
             if base_is_mem:
-                return "[x29, #%d]" % (slot_of[base] + const_off)
+                return self._arm64_frame_ref(
+                    slot_of[base] + const_off, an)
             rb = self._arm64_use(base, an, reg_of, slot_of)
             if const_off == 0:
                 return "[%s]" % rb
@@ -1473,8 +1517,7 @@ class ASMGen:
                 "add\t%s, %s, :lo12:%s" % (addr, addr, gname)))
             bsrc = addr
         elif base_is_mem:
-            self.asm_code.add(asm_cmds.Raw(
-                "add\t%s, x29, #%d" % (addr, slot_of[base])))
+            self._arm64_frame_addr_into(addr, slot_of[base], an)
             bsrc = addr
         else:
             self._arm64_into(base, an, reg_of, slot_of)   # pointer value -> x<an>
@@ -1498,8 +1541,7 @@ class ASMGen:
                 "add\t%s, %s, :lo12:%s" % (addr, addr, gname)))
             bsrc = addr
         elif base.ctype.is_array() or base.ctype.is_struct_union():
-            self.asm_code.add(asm_cmds.Raw(
-                "add\t%s, x29, #%d" % (addr, slot_of[base])))
+            self._arm64_frame_addr_into(addr, slot_of[base], an)
             bsrc = addr
         else:
             self._arm64_into(base, an, reg_of, slot_of)   # pointer value -> addr
@@ -1662,6 +1704,34 @@ class ASMGen:
         import shivyc.il_cmds.math as math_cmds
         import shivyc.il_cmds.compare as cmp_cmds
 
+        if isinstance(cmd, value_cmds.VaSaveBase):
+            # The caller left the base of the all-argument block in x16. That
+            # register is caller-saved scratch, so it is only meaningful at
+            # entry -- copy it to an ordinary home before anything else can
+            # clobber it, which is exactly what the x86-64 back end does with
+            # r11.
+            rd = self._arm64_defreg(cmd.output, 9, reg_of)
+            self.asm_code.add(asm_cmds.Raw(
+                "mov\t%s, x16" % self._arm64_xname(rd)))
+            self._arm64_wb(cmd.output, 9, reg_of, slot_of)
+            return
+
+        if isinstance(cmd, value_cmds.VaStartAddr):
+            # Address of the first variadic argument: the block holds every
+            # argument in order, so skip the named ones.
+            if cmd.base is None:
+                raise NotImplementedError(
+                    "arm64 back end: va_start without a caller-provided "
+                    "argument block is not implemented")
+            rb = self._arm64_use(cmd.base, 9, reg_of, slot_of)
+            rd = self._arm64_defreg(cmd.output, 10, reg_of)
+            off = 8 * cmd.named_count
+            self.asm_code.add(asm_cmds.Raw(
+                "add\t%s, %s, #%d"
+                % (self._arm64_xname(rd), self._arm64_xname(rb), off)))
+            self._arm64_wb(cmd.output, 10, reg_of, slot_of)
+            return
+
         if isinstance(cmd, value_cmds.LoadArg):
             # Parameter arrives in its AAPCS64 register (x<gp> for integers,
             # v<fp> for floats); move/spill it to its home before any call.
@@ -1712,6 +1782,19 @@ class ASMGen:
             # the rest on the stack, in order, at [sp+0], [sp+8], ... The frame
             # is addressed off x29, so moving sp for the outgoing area cannot
             # disturb any slot.
+            #
+            # A *variadic* call is different: ShivyCX's own variadic callees
+            # read every argument from one contiguous stack block rather than
+            # from the AAPCS64 register/stack split, because that is far
+            # simpler than AArch64's real va_list (which needs separate
+            # general and FP save areas plus four offsets). So for a variadic
+            # call every argument is written to the block, its base is handed
+            # over in x16, and the first eight of each class are *also* loaded
+            # into their AAPCS64 registers so the callee's named parameters
+            # arrive the ordinary way. x16 (IP0) is the natural carrier: the
+            # ABI makes it scratch, so it costs nothing and nothing else wants
+            # it across a call boundary.
+            variadic = getattr(cmd, "variadic", False)
             nstack = 0
             gp = 0
             fp = 0
@@ -1724,14 +1807,46 @@ class ASMGen:
                     if gp >= 8:
                         nstack += 1
                     gp += 1
+            if variadic:
+                nstack = len(cmd.args)
             outgoing = ((nstack * 8) + 15) & ~15      # keep sp 16-byte aligned
             if outgoing:
                 self.asm_code.add(asm_cmds.Raw(
                     "sub\tsp, sp, #%d" % outgoing))
+            if variadic:
+                # The all-argument block, in declaration order, eight bytes
+                # each. Sub-word integers go in as full 64-bit words so the
+                # callee can read any width from the low end of the slot.
+                voff = 0
+                for a in cmd.args:
+                    if a.ctype.is_floating():
+                        src = self._arm64_floatuse(a, 16, slot_of)
+                        self.asm_code.add(asm_cmds.Raw(
+                            "str\t%s, [sp, #%d]" % (src, voff)))
+                    else:
+                        src = self._arm64_use(a, 15, reg_of, slot_of)
+                        self.asm_code.add(asm_cmds.Raw(
+                            "str\t%s, [sp, #%d]"
+                            % (self._arm64_xname(src), voff)))
+                    voff += 8
+                self.asm_code.add(asm_cmds.Raw("mov\tx16, sp"))
             gp = 0
             fp = 0
             soff = 0
             for a in cmd.args:
+                if variadic:
+                    # Registers still get the first eight of each class, for
+                    # the callee's named parameters; the block above carries
+                    # the rest.
+                    if a.ctype.is_floating():
+                        if fp < 8:
+                            self._arm64_finto(a, fp, slot_of)
+                        fp += 1
+                    else:
+                        if gp < 8:
+                            self._arm64_into(a, gp, reg_of, slot_of)
+                        gp += 1
+                    continue
                 onstack = (fp >= 8) if a.ctype.is_floating() else (gp >= 8)
                 if onstack:
                     # Stage through a scratch register, then store. x15/d16 are
@@ -2142,6 +2257,15 @@ class ASMGen:
         if isinstance(cmd, math_cmds.Not) or isinstance(cmd, math_cmds.Neg):
             ins = cmd.inputs()
             out = cmd.outputs()[0]
+            if out.ctype.is_floating():
+                # Negating a double is `fneg`, not `neg`. Without this the
+                # operand goes through the *integer* helpers, which look for a
+                # frame slot that a value with an FP home does not have.
+                fa = self._arm64_floatuse(ins[0], 16, slot_of)
+                fd = self._arm64_fdefreg(out, 16)
+                self.asm_code.add(asm_cmds.Raw("fneg\t%s, %s" % (fd, fa)))
+                self._arm64_fwb(out, 16, slot_of)
+                return
             ra = self._arm64_use(ins[0], 9, reg_of, slot_of)
             op = "mvn" if isinstance(cmd, math_cmds.Not) else "neg"
             rd = self._arm64_defreg(out, 9, reg_of)
@@ -2655,6 +2779,21 @@ class ASMGen:
         self._rv_rel_base(base, chunk, count, a, reg_of, slot_of)
         return "0(%s)" % a
 
+    def _rv_sp_adjust(self, delta):
+        """Move sp by `delta` bytes (negative to allocate).
+
+        `addi` carries a signed 12-bit immediate, so a frame larger than 2047
+        bytes -- easily reached by a function with a sizeable local buffer --
+        needs the amount materialised first. t1 is used rather than t0: at
+        function entry t0 holds the variadic argument-block base that
+        VaSaveBase is about to read, and the prologue runs before it.
+        """
+        if -2048 <= delta <= 2047:
+            self.asm_code.add(asm_cmds.Raw("addi\tsp, sp, %d" % delta))
+            return
+        self.asm_code.add(asm_cmds.Raw("li\tt1, %d" % delta))
+        self.asm_code.add(asm_cmds.Raw("add\tsp, sp, t1"))
+
     def _rv_epilogue(self, frame, has_call):
         for r in self._rv_saved_int:
             self.asm_code.add(asm_cmds.Raw(
@@ -2667,7 +2806,7 @@ class ASMGen:
             self.asm_code.add(asm_cmds.Raw(
                 "ld\tra, %d(sp)" % self._rv_ra_off))
         if frame:
-            self.asm_code.add(asm_cmds.Raw("addi\tsp, sp, %d" % frame))
+            self._rv_sp_adjust(frame)
         self.asm_code.add(asm_cmds.Raw("ret"))
 
     def _rv_function(self, func, cmds):
@@ -2830,6 +2969,10 @@ class ASMGen:
                 if fcnt > 8:
                     ns += fcnt - 8
                     fcnt = 8
+                if getattr(c, "variadic", False):
+                    # A variadic call needs room for *every* argument, not
+                    # just the overflow: they all go in one block.
+                    ns = len(c.args)
                 if ns > out_max:
                     out_max = ns
                 if g > gp_max:
@@ -2965,7 +3108,7 @@ class ASMGen:
 
         self.asm_code.add(asm_cmds.AsmLabel(func))
         if frame:
-            self.asm_code.add(asm_cmds.Raw("addi\tsp, sp, -%d" % frame))
+            self._rv_sp_adjust(-frame)
             if has_call:
                 self.asm_code.add(asm_cmds.Raw(
                     "sd\tra, %d(sp)" % self._rv_ra_off))
@@ -3261,6 +3404,24 @@ class ASMGen:
                 "bnez\t%s, %s" % (rc, spots.mangle_symbol(cmd.label))))
             return
 
+        if isinstance(cmd, value_cmds.VaSaveBase):
+            rd = self._rv_defreg(cmd.output, 5, reg_of)
+            self.asm_code.add(asm_cmds.Raw("mv\t%s, t0" % rd))
+            self._rv_wb(cmd.output, 5, reg_of, slot_of)
+            return
+
+        if isinstance(cmd, value_cmds.VaStartAddr):
+            if cmd.base is None:
+                raise NotImplementedError(
+                    "riscv64 back end: va_start without a caller-provided "
+                    "argument block is not implemented")
+            rb = self._rv_use(cmd.base, 5, reg_of, slot_of)
+            rd = self._rv_defreg(cmd.output, 6, reg_of)
+            self.asm_code.add(asm_cmds.Raw(
+                "addi\t%s, %s, %d" % (rd, rb, 8 * cmd.named_count)))
+            self._rv_wb(cmd.output, 6, reg_of, slot_of)
+            return
+
         if isinstance(cmd, value_cmds.LoadArg):
             if cmd.arg_num in self._rv_argstk:
                 # sp was lowered by `frame`, so the caller's outgoing area
@@ -3373,10 +3534,45 @@ class ASMGen:
             name = addrof_name.get(cmd.func)
             if name is None:
                 name = cmd.direct_name          # stackless-calls pass
+            # A variadic call uses the same all-argument-block convention as
+            # arm64: every argument goes in one contiguous stack block whose
+            # base is handed over in t0, and the first eight of each class are
+            # also loaded into their lp64d registers for the callee's named
+            # parameters. t0 is a temporary, so nothing else wants it across
+            # the call.
+            variadic = getattr(cmd, "variadic", False)
+            if variadic:
+                voff = self._rv_outgoing - (len(cmd.args) * 8)
+                if voff < 0:
+                    voff = 0
+                base_off = voff
+                for arg in cmd.args:
+                    if arg.ctype.is_floating():
+                        src = self._rv_fuse(arg, 30, slot_of)
+                        self.asm_code.add(asm_cmds.Raw(
+                            "%s\t%s, %d(sp)"
+                            % (self._rv_fst_op(arg), src, voff)))
+                    else:
+                        src = self._rv_use(arg, 6, reg_of, slot_of)
+                        self.asm_code.add(asm_cmds.Raw(
+                            "sd\t%s, %d(sp)" % (src, voff)))
+                    voff += 8
+                self.asm_code.add(asm_cmds.Raw(
+                    "addi\tt0, sp, %d" % base_off))
             gp = 0
             fp = 0
             soff = 0
             for arg in cmd.args:
+                if variadic:
+                    if arg.ctype.is_floating():
+                        if fp < 8:
+                            self._rv_finto(arg, 10 + fp, slot_of)
+                        fp += 1
+                    else:
+                        if gp < 8:
+                            self._rv_into(arg, 10 + gp, reg_of, slot_of)
+                        gp += 1
+                    continue
                 onstack = (fp >= 8) if arg.ctype.is_floating() else (gp >= 8)
                 if onstack:
                     # The outgoing area sits at the bottom of our own frame,

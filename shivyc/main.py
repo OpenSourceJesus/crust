@@ -1425,15 +1425,11 @@ def link_objs(binary_name, obj_names, writable_text=False, low_mem=False,
                 # syscall wrappers). It is compiled by this same compiler, so
                 # it is built once and cached next to the build tree rather
                 # than recompiled on every link.
-                # The C half of the runtime (printf, malloc, getenv) is only
-                # linked in for targets whose back end can compile it. printf
-                # is variadic, and AArch64/RV64 do not lower VaSaveBase yet, so
-                # on those targets a program gets the assembly runtime alone
-                # (puts/putchar/putint/write/read/memcpy/memset/sbrk). A
-                # program that calls printf there fails at link time with an
-                # undefined reference, which is the honest outcome.
+                # The C half of the runtime: printf, malloc, getenv and the
+                # syscall wrappers. Built for whichever target we are linking,
+                # and cached per target.
                 _libc_c = os.path.join(_rlib, "rlibc.c")
-                if os.path.exists(_libc_c) and target == "x86_64":
+                if os.path.exists(_libc_c):
                     # Cache per target: the object is architecture-specific,
                     # and a shared name would hand an x86-64 rlibc.o to an
                     # AArch64 link (rlink rejects it, but only after the
