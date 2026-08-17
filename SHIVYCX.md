@@ -35,7 +35,8 @@ On top of standard C, ShivyCX adds:
   allocator, plus the first steps of a Motorola 68000 / **Neo-Geo** target — all
   validated differentially against the GNU cross toolchains under qemu, and
   selected with `--target` (see [ARM64.md](ARM64.md),
-  [RISCV64.md](RISCV64.md) and [NEOGEO.md](NEOGEO.md)).
+  [RISCV64.md](RISCV64.md) and [NEOGEO.md](NEOGEO.md); for Raspberry Pi and
+  Jetson Nano see [BOARDS.md](BOARDS.md)).
   For AArch64 and RV64 the *whole* toolchain is ours: our assembler and linker
   turn C into a running static binary with no external tool and no libc.
 - **A Python→C transpiler** — toward compiling the front end with itself, which

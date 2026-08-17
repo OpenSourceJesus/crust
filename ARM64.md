@@ -6,6 +6,9 @@ into AArch64 assembly with `--target arm64`. The back end lives in
 `Target` seam ([`shivyc/targets`](shivyc/targets/__init__.py)); the x86-64 path
 is untouched by any of it.
 
+Running on a Raspberry Pi or Jetson Nano? Both are AArch64 Linux and use this
+back end unchanged; see [BOARDS.md](BOARDS.md) for the board-specific setup.
+
 There is a second bare-metal target, RISC-V 64, documented separately in
 [RISCV64.md](RISCV64.md). It shares the register allocator described below
 verbatim — that section is the canonical description for both. This page

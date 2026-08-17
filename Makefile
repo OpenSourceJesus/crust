@@ -147,6 +147,12 @@ selfhost_coverage:
 selfhost_asmgen:
 	python3 tools/selfhost_asmgen_test.py
 
+# The self-hosted command-line path, per target: our compiler, assembler,
+# linker and runtime, driven exactly as a Raspberry Pi or Jetson Nano would
+# drive it. Needs qemu-user for the cross targets.
+selfhosted_cli:
+	python3 tools/selfhosted_cli_test.py
+
 # Build the self-host artifacts into a fixed /tmp directory (kept on disk) and
 # run the simple per-module self-host tests against them. The build dir holds
 # the transpiled+compiled module test exes (tokens, ilbase, weak_alias).
