@@ -149,6 +149,8 @@ inference, so x86-64 output is unchanged.
 
 ### AArch64 (`rasm_arm64.py`)
 
+See [ARM64.md](../../ARM64.md) for the back end that drives it.
+
 Covers the vocabulary the arm64 back end emits plus what a freestanding runtime
 needs: moves (including `mov`-immediate's movz/movn/logical-immediate
 selection, as gas chooses), add/sub immediate and shifted-register, logical
@@ -160,6 +162,8 @@ load/store family (scaled unsigned, unscaled ldur/stur, pre/post-index,
 **`rasm_arm64_test.py`: 182/182 byte-identical to `aarch64-linux-gnu-as`.**
 
 ### RV64 (`rasm_riscv.py`)
+
+See [RISCV64.md](../../RISCV64.md) for the back end that drives it.
 
 Covers RV64IMFD — the R/I/S/B/U/J formats, loads and stores, branches,
 lui/auipc, ecall/ebreak, and the F/D set including the full `fcvt` matrix with
