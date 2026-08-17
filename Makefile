@@ -153,6 +153,11 @@ selfhost_asmgen:
 selfhosted_cli:
 	python3 tools/selfhosted_cli_test.py
 
+# The Raspberry Pi / Jetson Nano driver scripts: build, package, run under
+# qemu with the board's own CPU model, and the test-script hook.
+board_tools:
+	python3 tools/board_tools_test.py
+
 # Build the self-host artifacts into a fixed /tmp directory (kept on disk) and
 # run the simple per-module self-host tests against them. The build dir holds
 # the transpiled+compiled module test exes (tokens, ilbase, weak_alias).

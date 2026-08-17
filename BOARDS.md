@@ -31,6 +31,48 @@ There is **no 32-bit ARM back end**. On a 32-bit userland `uname -m` reports
 `armv6l` or `armv7l`, and ShivyCX has nothing to offer; check with
 `uname -m` before starting — it should print `aarch64`.
 
+## The board tools
+
+`tools/raspi.py` and `tools/jetnano.py` take your sources, compile them with
+everything the board needs, package the result so the directory can be copied
+straight over, and optionally run it here under the board's actual core:
+
+```sh
+python3 tools/raspi.py prog.c --qemu               # build and run
+python3 tools/jetnano.py prog.c --cross --qemu     # link with glibc instead
+python3 tools/raspi.py prog.c --test-script=t.py --debug
+python3 tools/raspi.py --info                      # what is and isn't emulated
+```
+
+By default they use **our own assembler, linker and runtime** — no gcc, no
+binutils, no libc. That is also the only mode that works when cross-compiling
+from an x86-64 host without a cross toolchain installed, since otherwise
+ShivyCX hands AArch64 assembly to the host's `as`. `--cross` switches to the
+GNU cross toolchain and brings in the full glibc.
+
+`--qemu` runs under qemu-user with `-cpu` set to the board's real core —
+`cortex-a72` for the Pi 4, `cortex-a57` for the Jetson Nano.
+
+### Test scripts
+
+`--test-script=FILE` runs a plain Python file against the result, with
+`record`, `registers`, `stdout`, `stderr`, `exit_code` and `qemu_log` in
+scope. Fail by raising, by asserting, or by returning a message from
+`check(rec)`:
+
+```python
+def check(rec):
+    if rec.exit_code != 42:
+        return "expected 42, got %d" % rec.exit_code
+    if rec.registers.get("X00", 0) & 0xFF != 42:
+        return "X0 did not hold the return value"
+```
+
+With `--debug`, qemu's `-d cpu` log is captured and the final register state
+parsed into `rec.registers`, so a test can assert on machine state rather than
+just on a program's exit code — which is what makes this useful for chasing
+miscompiles and for diff-testing against a known-good build.
+
 ## Two ways to build
 
 ### Cross-compile from an x86-64 machine
@@ -88,14 +130,13 @@ system `gcc`, so it is a real test wherever it runs.
 
 ## Known constraints
 
-- **`printf` is not available on arm64 yet.** The C half of the runtime
-  (`rlibc.c`) is variadic, and the arm64 back end does not lower `VaSaveBase`.
-  Under `SHIVYC_RLINK` a program on this target links against the assembly
-  runtime alone — `puts`, `putchar`, `putint`, `write`, `read`, `strlen`,
-  `memset`, `memcpy`, `sbrk` — and calling `printf` fails at link time with an
-  undefined reference. Linking with the system `gcc` instead gives the full
-  libc. Variadic support is the single most useful next addition for these
-  boards.
+- **`printf` works, via our own libc.** Variadic functions are supported on
+  both AArch64 and RV64, so `rlibc.c` (printf, malloc, getenv, syscall
+  wrappers) is compiled and linked for these targets. ShivyCX's variadic
+  convention is its own — every argument in one contiguous stack block, base
+  handed over in `x16` — rather than AArch64's real `va_list`, so a *glibc*
+  variadic callee reached without `--cross` would not see its arguments. Both
+  sides are ours in the default mode, so this does not arise in practice.
 - **4 KB pages are assumed.** The linker aligns segments to `0x1000`. Both
   64-bit Pi OS and Jetson L4T use 4 KB pages, so this is not a constraint in
   practice on either board — but an AArch64 distro built for 64 KB pages
