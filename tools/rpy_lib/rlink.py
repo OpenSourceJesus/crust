@@ -26,6 +26,7 @@ Style constraints match the rest of the dialect: no metaclasses, decorators,
 generators or `**kwargs`; uniform record classes; bytes handled as lists of
 ints.
 """
+import rasm_arch
 
 
 # --------------------------------------------------------------------------
@@ -102,6 +103,8 @@ class LinkError(Exception):
 ET_REL = 1
 ET_EXEC = 2
 EM_X86_64 = 62
+EM_AARCH64 = 183
+EM_RISCV = 243
 
 SHT_NULL = 0
 SHT_PROGBITS = 1
@@ -154,6 +157,43 @@ R_X86_64_PC8 = 15
 R_X86_64_PC64 = 24
 R_X86_64_GOTPCRELX = 41
 R_X86_64_REX_GOTPCRELX = 42
+
+# AArch64 and RISC-V relocation numbers live in rasm_arch (shared with the
+# assembler, which emits them); alias them here so the appliers read cleanly.
+R_AARCH64_ABS64 = rasm_arch.R_AARCH64_ABS64
+R_AARCH64_ABS32 = rasm_arch.R_AARCH64_ABS32
+R_AARCH64_ABS16 = rasm_arch.R_AARCH64_ABS16
+R_AARCH64_PREL64 = rasm_arch.R_AARCH64_PREL64
+R_AARCH64_PREL32 = rasm_arch.R_AARCH64_PREL32
+R_AARCH64_ADR_PREL_PG_HI21 = rasm_arch.R_AARCH64_ADR_PREL_PG_HI21
+R_AARCH64_ADD_ABS_LO12_NC = rasm_arch.R_AARCH64_ADD_ABS_LO12_NC
+R_AARCH64_TSTBR14 = rasm_arch.R_AARCH64_TSTBR14
+R_AARCH64_CONDBR19 = rasm_arch.R_AARCH64_CONDBR19
+R_AARCH64_JUMP26 = rasm_arch.R_AARCH64_JUMP26
+R_AARCH64_CALL26 = rasm_arch.R_AARCH64_CALL26
+R_AARCH64_LDST8_ABS_LO12_NC = rasm_arch.R_AARCH64_LDST8_ABS_LO12_NC
+R_AARCH64_LDST16_ABS_LO12_NC = rasm_arch.R_AARCH64_LDST16_ABS_LO12_NC
+R_AARCH64_LDST32_ABS_LO12_NC = rasm_arch.R_AARCH64_LDST32_ABS_LO12_NC
+R_AARCH64_LDST64_ABS_LO12_NC = rasm_arch.R_AARCH64_LDST64_ABS_LO12_NC
+R_AARCH64_LDST128_ABS_LO12_NC = rasm_arch.R_AARCH64_LDST128_ABS_LO12_NC
+R_AARCH64_MOVW_UABS_G0_NC = rasm_arch.R_AARCH64_MOVW_UABS_G0_NC
+R_AARCH64_MOVW_UABS_G1_NC = rasm_arch.R_AARCH64_MOVW_UABS_G1_NC
+R_AARCH64_MOVW_UABS_G2_NC = rasm_arch.R_AARCH64_MOVW_UABS_G2_NC
+R_AARCH64_MOVW_UABS_G3 = rasm_arch.R_AARCH64_MOVW_UABS_G3
+
+R_RISCV_32 = rasm_arch.R_RISCV_32
+R_RISCV_64 = rasm_arch.R_RISCV_64
+R_RISCV_BRANCH = rasm_arch.R_RISCV_BRANCH
+R_RISCV_JAL = rasm_arch.R_RISCV_JAL
+R_RISCV_CALL = rasm_arch.R_RISCV_CALL
+R_RISCV_CALL_PLT = rasm_arch.R_RISCV_CALL_PLT
+R_RISCV_PCREL_HI20 = rasm_arch.R_RISCV_PCREL_HI20
+R_RISCV_PCREL_LO12_I = rasm_arch.R_RISCV_PCREL_LO12_I
+R_RISCV_PCREL_LO12_S = rasm_arch.R_RISCV_PCREL_LO12_S
+R_RISCV_HI20 = rasm_arch.R_RISCV_HI20
+R_RISCV_LO12_I = rasm_arch.R_RISCV_LO12_I
+R_RISCV_LO12_S = rasm_arch.R_RISCV_LO12_S
+R_RISCV_RELAX = rasm_arch.R_RISCV_RELAX
 
 PAGE = 0x1000
 DEFAULT_BASE = 0x400000
@@ -210,6 +250,7 @@ class ObjFile(object):
         self.sections = []          # list[InSection], indexed by ELF index
         self.symbols = []           # list[InSymbol], indexed by symtab index
         self.included = True
+        self.machine = EM_X86_64    # set by read_object
 
 
 # --------------------------------------------------------------------------
@@ -229,8 +270,9 @@ def read_object(name, data):
     if etype != ET_REL:
         raise LinkError("%s: not a relocatable object (e_type=%d)"
                         % (name, etype))
-    if machine != EM_X86_64:
-        raise LinkError("%s: not an x86-64 object (e_machine=%d)"
+    if (machine != EM_X86_64 and machine != EM_AARCH64
+            and machine != EM_RISCV):
+        raise LinkError("%s: unsupported architecture (e_machine=%d)"
                         % (name, machine))
 
     shoff = u64(data, 40)
@@ -260,6 +302,7 @@ def read_object(name, data):
     shstr_off = hdrs[shstrndx]["off"] if shnum > 0 else 0
 
     obj = ObjFile(name)
+    obj.machine = machine
     i = 0
     while i < shnum:
         h = hdrs[i]
@@ -429,6 +472,16 @@ def _out_name(sec_name):
         return ".data"
     if n[0:5] == ".data":
         return ".data"
+    # RISC-V small data. A real link script keeps .sdata/.sbss as their own
+    # output sections so they cluster around the global pointer; we fold them
+    # into .data/.bss and place gp relative to .data, which is equivalent for
+    # a static link that never relaxes (see __global_pointer$ below).
+    if n[0:6] == ".sdata":
+        return ".data"
+    if n[0:5] == ".sbss":
+        return ".bss"
+    if n == ".scommon":
+        return ".bss"
     if n[0:4] == ".bss":
         return ".bss"
     if n[0:11] == ".init_array":
@@ -645,6 +698,10 @@ class Linker(object):
         self.script = None          # Script, when -T was given
         self.script_syms = {}       # name -> address, from `sym = .`
         self.warnings = []
+        # Architecture of the output, taken from the first input object; every
+        # later object must agree. -1 means "not yet determined".
+        self.machine = -1
+        self.arch = rasm_arch.get_arch("x86_64")
 
     # -- inputs -----------------------------------------------------------
     def add_object(self, name, data):
@@ -655,6 +712,20 @@ class Linker(object):
         self.archives.append(read_archive(name, data))
 
     def _absorb(self, obj):
+        # All inputs must target one architecture. Catching a mismatch here
+        # gives a clear message instead of a storm of unknown-relocation
+        # errors later.
+        if self.machine < 0:
+            self.machine = obj.machine
+            a = rasm_arch.arch_for_machine(obj.machine)
+            if a is None:
+                raise LinkError("%s: unsupported architecture (e_machine=%d)"
+                                % (obj.name, obj.machine))
+            self.arch = a
+        elif obj.machine != self.machine:
+            raise LinkError("%s: %s object cannot be linked with %s objects"
+                            % (obj.name, rasm_arch.machine_name(obj.machine),
+                               rasm_arch.machine_name(self.machine)))
         self.objects.append(obj)
         for sym in obj.symbols:
             if sym.bind == STB_LOCAL:
@@ -983,6 +1054,20 @@ class Linker(object):
             self._provide("_edata", self.data_end)
         self._provide("_end", self.data_end)
         self._provide("end", self.data_end)
+        # RISC-V: gp anchors the small-data area, and crt code sets it with
+        # `la gp, __global_pointer$` before anything else runs. The ABI puts
+        # it 0x800 past the start of small data so gp's signed 12-bit
+        # displacement reaches a full 4KB window rather than only the 2KB
+        # above it. We fold .sdata into .data, so .data is that start.
+        if self.arch.name == "riscv64":
+            data = self.out_by_name.get(".data", None)
+            if data is not None:
+                gp_base = data.addr
+            elif bss is not None:
+                gp_base = bss.addr
+            else:
+                gp_base = self.data_end
+            self._provide("__global_pointer$", gp_base + 0x800)
 
     def _provide_forced(self, name, value):
         """Define `name` unconditionally -- a script assignment wins."""
@@ -1097,19 +1182,42 @@ class Linker(object):
                     self._apply(obj, sec, r, got_addr)
 
     def _apply(self, obj, sec, r, got_addr):
+        """Apply one relocation. The GOT-relative family and the symbol lookup
+        are shared; the per-type field arithmetic is architecture-specific and
+        lives in the _apply_<arch> methods below."""
         t = r.rtype
-        if t == R_X86_64_NONE:
+        if t == 0:                             # R_*_NONE on every target
             return
         where = "%s+0x%x" % (sec.name, r.offset)
         P = sec.addr + r.offset            # address of the field itself
         A = r.addend
-        if (t == R_X86_64_GOTPCREL or t == R_X86_64_GOTPCRELX
-                or t == R_X86_64_REX_GOTPCRELX):
-            sym = obj.symbols[r.symidx]
-            G = got_addr + self.got_entries[sym.name]
-            self._put_field(sec, r.offset, G + A - P, 4, True, where)
+        if self.arch.name == "x86_64":
+            if (t == R_X86_64_GOTPCREL or t == R_X86_64_GOTPCRELX
+                    or t == R_X86_64_REX_GOTPCRELX):
+                sym = obj.symbols[r.symidx]
+                G = got_addr + self.got_entries[sym.name]
+                self._put_field(sec, r.offset, G + A - P, 4, True, where)
+                return
+            S = self._sym_addr(obj, r.symidx, where)
+            self._apply_x86_64(obj, sec, r, t, S, A, P, where)
+            return
+        if self.arch.name == "riscv64" and t == R_RISCV_RELAX:
+            # A relaxation *hint*: it carries the null symbol, so it must be
+            # dropped before any symbol lookup. We never relax, so ignoring
+            # it is always correct -- it only ever permits shrinking a
+            # sequence, never requires it.
             return
         S = self._sym_addr(obj, r.symidx, where)
+        if self.arch.name == "arm64":
+            self._apply_arm64(obj, sec, r, t, S, A, P, where)
+            return
+        if self.arch.name == "riscv64":
+            self._apply_riscv64(obj, sec, r, t, S, A, P, where)
+            return
+        raise LinkError("%s: no relocation support for %s"
+                        % (obj.name, self.arch.name))
+
+    def _apply_x86_64(self, obj, sec, r, t, S, A, P, where):
         if t == R_X86_64_64:
             self._put_field(sec, r.offset, S + A, 8, False, where)
         elif t == R_X86_64_PC64:
@@ -1132,6 +1240,265 @@ class Linker(object):
         else:
             raise LinkError("%s: unsupported relocation type %d at %s"
                             % (obj.name, t, where))
+
+    # -- fixed-width instruction patching ---------------------------------
+    #
+    # AArch64 and RV64 relocations do not overwrite a whole field: they splice
+    # a bit-slice of the resolved value into an instruction word that already
+    # holds opcode and register bits. So the helpers below read the existing
+    # 32-bit word, mask in the new immediate, and write it back -- as opposed
+    # to _put_field, which replaces bytes wholesale.
+
+    def _read_insn(self, sec, off):
+        return (sec.data[off] | (sec.data[off + 1] << 8)
+                | (sec.data[off + 2] << 16) | (sec.data[off + 3] << 24))
+
+    def _write_insn(self, sec, off, word):
+        w = word & 0xFFFFFFFF
+        sec.data[off] = w & 0xFF
+        sec.data[off + 1] = (w >> 8) & 0xFF
+        sec.data[off + 2] = (w >> 16) & 0xFF
+        sec.data[off + 3] = (w >> 24) & 0xFF
+
+    def _check_signed(self, value, bits, where, what):
+        lo = -(1 << (bits - 1))
+        hi = (1 << (bits - 1)) - 1
+        if value < lo or value > hi:
+            raise LinkError("relocation overflow at %s: %s value 0x%x does "
+                            "not fit in %d signed bits"
+                            % (where, what, value, bits))
+
+    def _apply_arm64(self, obj, sec, r, t, S, A, P, where):
+        # Branches: the immediate is an instruction count, not a byte count,
+        # so the byte displacement is shifted right by 2. AArch64 branch
+        # targets are always 4-byte aligned, so no low bits are lost.
+        if t == R_AARCH64_CALL26 or t == R_AARCH64_JUMP26:
+            delta = S + A - P
+            if (delta & 3) != 0:
+                raise LinkError("%s: misaligned branch target at %s"
+                                % (obj.name, where))
+            self._check_signed(delta >> 2, 26, where, "branch")
+            w = self._read_insn(sec, r.offset)
+            w = (w & 0xFC000000) | ((delta >> 2) & 0x03FFFFFF)
+            self._write_insn(sec, r.offset, w)
+            return
+        if t == R_AARCH64_CONDBR19:
+            delta = S + A - P
+            if (delta & 3) != 0:
+                raise LinkError("%s: misaligned branch target at %s"
+                                % (obj.name, where))
+            self._check_signed(delta >> 2, 19, where, "conditional branch")
+            w = self._read_insn(sec, r.offset)
+            w = (w & 0xFF00001F) | (((delta >> 2) & 0x7FFFF) << 5)
+            self._write_insn(sec, r.offset, w)
+            return
+        if t == R_AARCH64_TSTBR14:
+            delta = S + A - P
+            self._check_signed(delta >> 2, 14, where, "test-and-branch")
+            w = self._read_insn(sec, r.offset)
+            w = (w & 0xFFF8001F) | (((delta >> 2) & 0x3FFF) << 5)
+            self._write_insn(sec, r.offset, w)
+            return
+        # adrp: the delta between the 4KB *page* holding the instruction and
+        # the page holding the symbol. Both addresses are truncated to their
+        # page base first -- that truncation is the whole point of the
+        # instruction, and getting it wrong is the classic adrp bug.
+        if t == R_AARCH64_ADR_PREL_PG_HI21:
+            page_s = (S + A) & ~0xFFF
+            page_p = P & ~0xFFF
+            delta = page_s - page_p
+            self._check_signed(delta >> 12, 21, where, "adrp page")
+            imm = (delta >> 12) & 0x1FFFFF
+            w = self._read_insn(sec, r.offset)
+            # immlo is bits 30:29, immhi is bits 23:5 -- a split field.
+            w = (w & 0x9F00001F) | ((imm & 3) << 29) | (((imm >> 2) & 0x7FFFF) << 5)
+            self._write_insn(sec, r.offset, w)
+            return
+        # The _NC ("no check") LO12 group: the high bits come from the paired
+        # adrp, so an out-of-range value here is not an error -- it is
+        # deliberately truncated.
+        if t == R_AARCH64_ADD_ABS_LO12_NC:
+            imm = (S + A) & 0xFFF
+            w = self._read_insn(sec, r.offset)
+            w = (w & 0xFFC003FF) | (imm << 10)
+            self._write_insn(sec, r.offset, w)
+            return
+        if (t == R_AARCH64_LDST8_ABS_LO12_NC
+                or t == R_AARCH64_LDST16_ABS_LO12_NC
+                or t == R_AARCH64_LDST32_ABS_LO12_NC
+                or t == R_AARCH64_LDST64_ABS_LO12_NC
+                or t == R_AARCH64_LDST128_ABS_LO12_NC):
+            # ldr/str scale their 12-bit offset by the access size, so the
+            # offset must be a multiple of that size and is stored divided.
+            if t == R_AARCH64_LDST8_ABS_LO12_NC:
+                shift = 0
+            elif t == R_AARCH64_LDST16_ABS_LO12_NC:
+                shift = 1
+            elif t == R_AARCH64_LDST32_ABS_LO12_NC:
+                shift = 2
+            elif t == R_AARCH64_LDST64_ABS_LO12_NC:
+                shift = 3
+            else:
+                shift = 4
+            val = (S + A) & 0xFFF
+            if (val & ((1 << shift) - 1)) != 0:
+                raise LinkError("%s: misaligned ld/st offset at %s (0x%x "
+                                "is not %d-byte aligned)"
+                                % (obj.name, where, val, 1 << shift))
+            w = self._read_insn(sec, r.offset)
+            w = (w & 0xFFC003FF) | ((val >> shift) << 10)
+            self._write_insn(sec, r.offset, w)
+            return
+        if (t == R_AARCH64_MOVW_UABS_G0_NC or t == R_AARCH64_MOVW_UABS_G1_NC
+                or t == R_AARCH64_MOVW_UABS_G2_NC
+                or t == R_AARCH64_MOVW_UABS_G3):
+            if t == R_AARCH64_MOVW_UABS_G0_NC:
+                sh = 0
+            elif t == R_AARCH64_MOVW_UABS_G1_NC:
+                sh = 16
+            elif t == R_AARCH64_MOVW_UABS_G2_NC:
+                sh = 32
+            else:
+                sh = 48
+            imm = ((S + A) >> sh) & 0xFFFF
+            w = self._read_insn(sec, r.offset)
+            w = (w & 0xFFE0001F) | (imm << 5)
+            self._write_insn(sec, r.offset, w)
+            return
+        # Plain data words.
+        if t == R_AARCH64_ABS64:
+            self._put_field(sec, r.offset, S + A, 8, False, where)
+            return
+        if t == R_AARCH64_ABS32:
+            self._put_field(sec, r.offset, S + A, 4, False, where)
+            return
+        if t == R_AARCH64_ABS16:
+            self._put_field(sec, r.offset, S + A, 2, False, where)
+            return
+        if t == R_AARCH64_PREL64:
+            self._put_field(sec, r.offset, S + A - P, 8, False, where)
+            return
+        if t == R_AARCH64_PREL32:
+            self._put_field(sec, r.offset, S + A - P, 4, True, where)
+            return
+        raise LinkError("%s: unsupported aarch64 relocation type %d at %s"
+                        % (obj.name, t, where))
+
+    def _apply_riscv64(self, obj, sec, r, t, S, A, P, where):
+        if t == R_RISCV_RELAX:
+            # A hint that the preceding relocation's instruction pair may be
+            # shortened. We do not relax, so ignoring it is always correct.
+            return
+        if t == R_RISCV_64:
+            self._put_field(sec, r.offset, S + A, 8, False, where)
+            return
+        if t == R_RISCV_32:
+            self._put_field(sec, r.offset, S + A, 4, False, where)
+            return
+        if t == R_RISCV_BRANCH:
+            delta = S + A - P
+            self._check_signed(delta, 13, where, "branch")
+            w = self._read_insn(sec, r.offset)
+            # B-type scatters the offset: [12|10:5] in 31:25, [4:1|11] in 11:7.
+            w = w & 0x01FFF07F
+            w = w | (((delta >> 12) & 1) << 31)
+            w = w | (((delta >> 5) & 0x3F) << 25)
+            w = w | (((delta >> 1) & 0xF) << 8)
+            w = w | (((delta >> 11) & 1) << 7)
+            self._write_insn(sec, r.offset, w)
+            return
+        if t == R_RISCV_JAL:
+            delta = S + A - P
+            self._check_signed(delta, 21, where, "jal")
+            w = self._read_insn(sec, r.offset)
+            # J-type: [20|10:1|11|19:12] packed into bits 31:12.
+            w = w & 0x00000FFF
+            w = w | (((delta >> 20) & 1) << 31)
+            w = w | (((delta >> 1) & 0x3FF) << 21)
+            w = w | (((delta >> 11) & 1) << 20)
+            w = w | (((delta >> 12) & 0xFF) << 12)
+            self._write_insn(sec, r.offset, w)
+            return
+        if t == R_RISCV_CALL or t == R_RISCV_CALL_PLT:
+            # One relocation, two instructions: auipc gets the high 20 bits,
+            # the following jalr the low 12. Because jalr sign-extends its
+            # immediate, a low half >= 0x800 borrows 1 from the high half.
+            delta = S + A - P
+            self._check_signed(delta, 32, where, "call")
+            hi = (delta + 0x800) >> 12
+            lo = delta - (hi << 12)
+            w0 = self._read_insn(sec, r.offset)
+            w0 = (w0 & 0x00000FFF) | ((hi & 0xFFFFF) << 12)
+            self._write_insn(sec, r.offset, w0)
+            w1 = self._read_insn(sec, r.offset + 4)
+            w1 = (w1 & 0x000FFFFF) | ((lo & 0xFFF) << 20)
+            self._write_insn(sec, r.offset + 4, w1)
+            return
+        if t == R_RISCV_PCREL_HI20 or t == R_RISCV_HI20:
+            if t == R_RISCV_HI20:
+                value = S + A
+            else:
+                value = S + A - P
+            hi = (value + 0x800) >> 12
+            w = self._read_insn(sec, r.offset)
+            w = (w & 0x00000FFF) | ((hi & 0xFFFFF) << 12)
+            self._write_insn(sec, r.offset, w)
+            return
+        if t == R_RISCV_PCREL_LO12_I or t == R_RISCV_PCREL_LO12_S:
+            # The symbol of a PCREL_LO12 names the *label on the auipc*, not
+            # the ultimate target: the addend arithmetic must be redone
+            # against that instruction's own PC. Resolve the paired HI20.
+            value = self._riscv_pcrel_pair(obj, r, where)
+            lo = value - (((value + 0x800) >> 12) << 12)
+            w = self._read_insn(sec, r.offset)
+            if t == R_RISCV_PCREL_LO12_I:
+                w = (w & 0x000FFFFF) | ((lo & 0xFFF) << 20)
+            else:
+                # S-type splits the immediate: 11:5 in 31:25, 4:0 in 11:7.
+                w = w & 0x01FFF07F
+                w = w | (((lo >> 5) & 0x7F) << 25)
+                w = w | ((lo & 0x1F) << 7)
+            self._write_insn(sec, r.offset, w)
+            return
+        if t == R_RISCV_LO12_I or t == R_RISCV_LO12_S:
+            value = S + A
+            lo = value - (((value + 0x800) >> 12) << 12)
+            w = self._read_insn(sec, r.offset)
+            if t == R_RISCV_LO12_I:
+                w = (w & 0x000FFFFF) | ((lo & 0xFFF) << 20)
+            else:
+                w = w & 0x01FFF07F
+                w = w | (((lo >> 5) & 0x7F) << 25)
+                w = w | ((lo & 0x1F) << 7)
+            self._write_insn(sec, r.offset, w)
+            return
+        raise LinkError("%s: unsupported riscv relocation type %d at %s"
+                        % (obj.name, t, where))
+
+    def _riscv_pcrel_pair(self, obj, r, where):
+        """Value the PCREL_HI20 paired with this PCREL_LO12 computed.
+
+        RISC-V splits a PC-relative address across auipc+addi, but the LO12
+        relocation's symbol points at the *auipc's label*, so its own PC is
+        the wrong base. Find the HI20 relocation sitting at that label's
+        offset and recompute S + A - P using the auipc's address."""
+        sym = obj.symbols[r.symidx]
+        hi_sec = None
+        if sym.shndx < len(obj.sections):
+            hi_sec = obj.sections[sym.shndx]
+        if hi_sec is None:
+            raise LinkError("%s: PCREL_LO12 at %s names a symbol with no "
+                            "section" % (obj.name, where))
+        hi_off = sym.value
+        for hr in hi_sec.relocs:
+            if hr.offset != hi_off:
+                continue
+            if hr.rtype != R_RISCV_PCREL_HI20:
+                continue
+            hs = self._sym_addr(obj, hr.symidx, where)
+            return hs + hr.addend - (hi_sec.addr + hi_off)
+        raise LinkError("%s: PCREL_LO12 at %s has no matching PCREL_HI20"
+                        % (obj.name, where))
 
     def _put_field(self, sec, off, value, nbytes, signed, where):
         if nbytes == 4:
@@ -1243,12 +1610,12 @@ class Linker(object):
             hdr.extend([0x7F, ord('E'), ord('L'), ord('F'), 2, 1, 1, 0])
             hdr.extend([0, 0, 0, 0, 0, 0, 0, 0])
             hdr.extend(pack(ET_EXEC, 2))
-            hdr.extend(pack(EM_X86_64, 2))
+            hdr.extend(pack(self.arch.elf_machine, 2))
             hdr.extend(pack(1, 4))
             hdr.extend(pack(self.entry, 8))
             hdr.extend(pack(64, 8))
             hdr.extend(pack(shoff, 8))
-            hdr.extend(pack(0, 4))
+            hdr.extend(pack(self.arch.elf_flags, 4))
             hdr.extend(pack(64, 2))
             hdr.extend(pack(56, 2))
             hdr.extend(pack(len(phdrs), 2))
@@ -1288,12 +1655,12 @@ class Linker(object):
         hdr.extend([0x7F, ord('E'), ord('L'), ord('F'), 2, 1, 1, 0])
         hdr.extend([0, 0, 0, 0, 0, 0, 0, 0])
         hdr.extend(pack(ET_EXEC, 2))
-        hdr.extend(pack(EM_X86_64, 2))
+        hdr.extend(pack(self.arch.elf_machine, 2))
         hdr.extend(pack(1, 4))
         hdr.extend(pack(self.entry, 8))
         hdr.extend(pack(64, 8))                 # e_phoff
         hdr.extend(pack(shoff, 8))              # e_shoff
-        hdr.extend(pack(0, 4))                  # e_flags
+        hdr.extend(pack(self.arch.elf_flags, 4))  # e_flags
         hdr.extend(pack(64, 2))                 # e_ehsize
         hdr.extend(pack(56, 2))                 # e_phentsize
         hdr.extend(pack(len(phdrs), 2))
