@@ -54,6 +54,33 @@ from shivyc.asm_gen import ASMCode, ASMGen
 from shivyc.targets import get_target
 
 
+def default_target():
+    """Back-end architecture to use when --target is not given.
+
+    Defaults to whatever the machine we are running on is, so ShivyCX behaves
+    like a native compiler on an AArch64 board (Raspberry Pi OS 64-bit, Jetson
+    Nano / L4T) rather than silently emitting x86-64 assembly that the local
+    assembler will reject. An unrecognised machine falls back to x86_64, which
+    is the original and most complete target.
+
+    Note there is no 32-bit ARM back end: a Raspberry Pi running a 32-bit
+    userland reports `armv6l`/`armv7l` and gets the x86_64 fallback, which its
+    assembler will reject. See BOARDS.md -- those boards need a 64-bit OS.
+    """
+    try:
+        import platform
+        m = platform.machine().lower()
+    except Exception:
+        return "x86_64"
+    if m in ("aarch64", "arm64", "armv8b", "armv8l"):
+        return "arm64"
+    if m in ("riscv64", "rv64"):
+        return "riscv64"
+    if m in ("x86_64", "amd64"):
+        return "x86_64"
+    return "x86_64"
+
+
 def main():
     """Run the main compiler script."""
 
@@ -282,7 +309,8 @@ def main():
                          libs=getattr(arguments, "libs", []),
                          lib_dirs=getattr(arguments, "lib_dirs", []),
                          export_dynamic=getattr(arguments, "export_dynamic",
-                                                False)):
+                                                False),
+                         target=getattr(arguments, "target", "x86_64")):
             err = "linker returned non-zero status"
             print(CompilerError(err))
             return 1
@@ -927,7 +955,7 @@ def process_c_file(file, args):
             return out_names[0]
         return asm_file
 
-    assemble(asm_file, obj_file)
+    assemble(asm_file, obj_file, getattr(args, "target", "x86_64"))
     if not error_collector.ok():
         return None
 
@@ -954,7 +982,7 @@ class Arguments:
         self.low_mem = False
         self.pointer_compression = False
         self.opt_level = 0
-        self.target = "x86_64"
+        self.target = default_target()
         self.output_name = None
         self.include_dirs = []
         self.defines = []
@@ -1158,8 +1186,9 @@ def get_arguments(argv=None):
                             dest="opt_level")
         # Back-end architecture. x86-64 is the original, fully-supported target;
         # arm64/aarch64 is the in-progress cross target (see shivyc/targets).
-        parser.add_argument("--target", dest="target", default="x86_64",
-                            help="back-end architecture: x86_64 (default), arm64")
+        parser.add_argument("--target", dest="target", default=default_target(),
+                            help="back-end architecture: x86_64, arm64, "
+                                 "riscv64 (default: this machine's)")
         # Generate binary file with file name
         parser.add_argument(
             "-o",
@@ -1291,7 +1320,7 @@ def write_asm(asm_source, asm_filename):
         error_collector.add(CompilerError(descrip))
 
 
-def assemble(asm_name, obj_name):
+def assemble(asm_name, obj_name, target="x86_64"):
     """Assemble the given assembly file into an object file.
 
     With SHIVYC_RASM set, use the self-hosted rasm assembler (written in the
@@ -1307,7 +1336,7 @@ def assemble(asm_name, obj_name):
                 sys.path.insert(0, _rlib)
             import rasm_obj
             with open(asm_name) as _f:
-                _elf = rasm_obj.assemble_to_elf(_f.read())
+                _elf = rasm_obj.assemble_to_elf(_f.read(), target)
             with open(obj_name, "wb") as _o:
                 _o.write(bytes(_elf))
             return True
@@ -1330,7 +1359,8 @@ def assemble(asm_name, obj_name):
 
 
 def link_objs(binary_name, obj_names, writable_text=False, low_mem=False,
-              libs=None, lib_dirs=None, export_dynamic=False):
+              libs=None, lib_dirs=None, export_dynamic=False,
+              target="x86_64"):
     """Assemble the given object files into a binary.
 
     `libs` / `lib_dirs` add `-l<name>` / `-L<dir>` to the ld command (like the C
@@ -1376,21 +1406,42 @@ def link_objs(binary_name, obj_names, writable_text=False, low_mem=False,
             if _base:
                 _ln.base = int(_base, 0)
 
-            # the freestanding runtime, assembled on the fly by rasm
+            # The freestanding runtime, assembled on the fly by rasm. Each
+            # architecture has its own: the syscall numbers and the entry
+            # sequence differ, and AArch64/RV64 use the "generic" syscall
+            # table rather than x86-64's.
+            _crt_by_target = {"x86_64": "rcrt.s", "arm64": "rcrt_arm64.s",
+                              "riscv64": "rcrt_riscv64.s"}
             if not os.environ.get("SHIVYC_NO_RCRT"):
-                _crt_s = os.path.join(_rlib, "rcrt.s")
+                _crt_name = _crt_by_target.get(target)
+                if _crt_name is None:
+                    raise CompilerError(
+                        "no freestanding runtime for target '%s'" % target)
+                _crt_s = os.path.join(_rlib, _crt_name)
                 with open(_crt_s) as _f:
-                    _crt = _rasm_obj.assemble_to_elf(_f.read())
+                    _crt = _rasm_obj.assemble_to_elf(_f.read(), target)
                 _ln.add_object(_crt_s, list(_crt))
                 # ...and the C half of the runtime (printf, malloc, getenv,
                 # syscall wrappers). It is compiled by this same compiler, so
                 # it is built once and cached next to the build tree rather
                 # than recompiled on every link.
+                # The C half of the runtime (printf, malloc, getenv) is only
+                # linked in for targets whose back end can compile it. printf
+                # is variadic, and AArch64/RV64 do not lower VaSaveBase yet, so
+                # on those targets a program gets the assembly runtime alone
+                # (puts/putchar/putint/write/read/memcpy/memset/sbrk). A
+                # program that calls printf there fails at link time with an
+                # undefined reference, which is the honest outcome.
                 _libc_c = os.path.join(_rlib, "rlibc.c")
-                if os.path.exists(_libc_c):
+                if os.path.exists(_libc_c) and target == "x86_64":
+                    # Cache per target: the object is architecture-specific,
+                    # and a shared name would hand an x86-64 rlibc.o to an
+                    # AArch64 link (rlink rejects it, but only after the
+                    # confusing detour).
                     _cache = os.environ.get(
                         "SHIVYC_RLIBC_OBJ",
-                        os.path.join(_rlib, "build", "rlibc.o"))
+                        os.path.join(_rlib, "build",
+                                     "rlibc-%s.o" % target))
                     _stale = (not os.path.exists(_cache)
                               or os.path.getmtime(_cache)
                               < os.path.getmtime(_libc_c))
@@ -1409,7 +1460,7 @@ def link_objs(binary_name, obj_names, writable_text=False, low_mem=False,
                                 _env[_k] = _v
                         _r = subprocess.run(
                             [sys.executable, "-m", "shivyc.main", "-c",
-                             _libc_c, "-o", _cache],
+                             _libc_c, "-o", _cache, "--target", target],
                             cwd=_root, env=_env, capture_output=True)
                         if not os.path.exists(_cache):
                             raise CompilerError(
@@ -1444,6 +1495,9 @@ def link_objs(binary_name, obj_names, writable_text=False, low_mem=False,
                 sys.stderr.write("rlink: warning: %s\n" % _w)
             return True
         except Exception as _e:
+            if os.environ.get("SHIVYC_RLINK_TRACEBACK"):
+                import traceback
+                traceback.print_exc()
             error_collector.add(CompilerError("rlink failed: %s" % _e))
             return False
 
