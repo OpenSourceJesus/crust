@@ -30,12 +30,13 @@ On top of standard C, ShivyCX adds:
   automatic `free` insertion for unannotated C.
 - **Bare-metal operation** — freestanding, bootable 64-bit images with an inlined
   mini-OS.
-- **Multiple back ends** — besides x86-64, an AArch64 (ARM64) cross target with a
-  liveness-based linear-scan register allocator, an integer-core RISC-V 64 target,
-  and the first steps of a Motorola 68000 / **Neo-Geo** target — all reusing the
-  same allocator, all validated differentially against the GNU cross toolchains
-  under qemu, and selected with `--target` (see [ARM64.md](ARM64.md) and
-  [NEOGEO.md](NEOGEO.md)).
+- **Multiple back ends** — besides x86-64, feature-complete AArch64 (ARM64) and
+  RISC-V 64 cross targets sharing a liveness-based linear-scan register
+  allocator, plus the first steps of a Motorola 68000 / **Neo-Geo** target — all
+  validated differentially against the GNU cross toolchains under qemu, and
+  selected with `--target` (see [ARM64.md](ARM64.md) and [NEOGEO.md](NEOGEO.md)).
+  For AArch64 and RV64 the *whole* toolchain is ours: our assembler and linker
+  turn C into a running static binary with no external tool and no libc.
 - **A Python→C transpiler** — toward compiling the front end with itself, which
   doubles as **rpython**: a fast, runtime-free Python subset (typed numpy-style
   arrays, auto-contract SIMD, libm, file/socket I/O) that `shivyc.main` compiles
@@ -200,16 +201,18 @@ frameless — beating `gcc -O0` instruction counts on leaf and call-light code.
 See **[ARM64.md](ARM64.md)** for the full design, the staged bring-up, and the
 differential-testing methodology.
 
-**RISC-V 64** was brought up next, and deliberately small, to validate the seam:
-it implements the integer core and **reuses the entire architecture-neutral
-middle end verbatim** — copy-coalescing with its safety check, the live-variable
-analysis, live-interval and call-cross detection, and the caller/callee
-linear-scan allocator are all shared methods (`_il_*` in
-[`asm_gen.py`](shivyc/asm_gen.py)); only instruction selection, the register
-file, and the lp64 ABI are new. Standing up a working second ISA — locals,
-`+ - * / %`, comparisons, `if`/`while`, direct calls, recursion, register
-pressure with spills, and cross-call liveness — therefore took only a lowering
-pass, which is exactly the payoff of doing compiler work at the rpython level.
+**RISC-V 64** was brought up next to validate the seam, and has since caught up
+to AArch64: globals, bitwise ops and shifts, pointers and address-of, arrays and
+structs, string literals, and full `float`/`double` support. It **reuses the
+entire architecture-neutral middle end verbatim** — copy-coalescing with its
+safety check, the live-variable analysis, live-interval and call-cross
+detection, and the caller/callee linear-scan allocator are all shared methods
+(`_il_*` in [`asm_gen.py`](shivyc/asm_gen.py)); only instruction selection, the
+register file, and the lp64d ABI are new. When floating point was added the
+allocator needed **no changes at all** — it already took FP register pools as
+parameters for AArch64. Standing up a second ISA to parity therefore took only
+lowering passes, which is exactly the payoff of doing compiler work at the
+rpython level.
 
 **Motorola 68000 / Neo-Geo** is the first step toward the console's main CPU
 (the [ngdevkit](https://github.com/dciabrin/ngdevkit) toolchain cross-compiles C
@@ -275,11 +278,11 @@ whole-program pass in [`pack_args.py`](shivyc/pack_args.py), and loop
 register-promotion of `_Nbit` packed globals is an IL pass in
 [`simd_pack_promote.py`](shivyc/simd_pack_promote.py).
 
-The same IL feeds three cross targets selected with `--target`: an AArch64 back
-end (see [ARM64.md](ARM64.md)), an integer-core RISC-V 64 back end, and the first
-steps of a Motorola 68000 / Neo-Geo back end (see [NEOGEO.md](NEOGEO.md)) — all
-sharing a target-neutral liveness-based linear-scan register allocator (the
-`_il_*` methods in [`asm_gen.py`](shivyc/asm_gen.py)).
+The same IL feeds three cross targets selected with `--target`: AArch64 and
+RISC-V 64 back ends (both feature-complete — see [ARM64.md](ARM64.md)), and the
+first steps of a Motorola 68000 / Neo-Geo back end (see [NEOGEO.md](NEOGEO.md))
+— all sharing a target-neutral liveness-based linear-scan register allocator
+(the `_il_*` methods in [`asm_gen.py`](shivyc/asm_gen.py)).
 
 #### Whole-program call graph
 The driver can build and print the program-wide call graph
