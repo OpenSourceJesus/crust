@@ -20,6 +20,9 @@ nothing, the layout is stable and fragments are flattened into bytes.
 Kept flat and RPython-friendly (uniform record classes, explicit byte lists).
 """
 import rasm
+import rasm_arch
+import rasm_arm64
+import rasm_riscv
 
 
 # --------------------------------------------------------------------------
@@ -28,6 +31,29 @@ import rasm
 FRAG_BYTES = 0     # fixed bytes (an encoded instruction, or data)
 FRAG_BRANCH = 1    # a jmp/jcc whose encoding may shrink
 FRAG_ALIGN = 2     # padding to a power-of-two boundary
+
+
+def _strip_fixed_comment(line, arch_name):
+    """Strip comments from a fixed-width-ISA assembly line.
+
+    The comment character is not the same on both targets, and it collides
+    with operand syntax on one of them. AArch64 gas uses `//`, and `#`
+    introduces an immediate (`mov x0, #5`), so `#` can only start a comment
+    at the beginning of a line. RISC-V gas uses `#` as the comment character
+    anywhere on the line and does not accept `//` at all.
+    """
+    i = line.find("//")
+    if i >= 0:
+        line = line[:i]
+    if arch_name == "riscv64":
+        h = line.find("#")
+        if h >= 0:
+            line = line[:h]
+        return line
+    st = line.strip()
+    if st[0:1] == "#":
+        return ""
+    return line
 
 
 class Frag(object):
@@ -85,7 +111,7 @@ class Section(object):
         while i < len(relocs):
             r = relocs[i]
             f.relocs.append(rasm.Reloc(base + r.where, r.sym, r.size,
-                                       r.pcrel, r.add, r.signed))
+                                       r.pcrel, r.add, r.signed, r.kind))
             i += 1
 
     def emit_branch(self, bkind, tttn, sym, add):
@@ -347,7 +373,9 @@ def _strip_block_comments(text):
 
 
 class Assembler(object):
-    def __init__(self):
+    def __init__(self, arch_name="x86_64"):
+        self.arch_name = arch_name
+        self.arch = rasm_arch.get_arch(arch_name)
         self.sections = {}
         self.order = []
         self.symbols = {}
@@ -358,6 +386,7 @@ class Assembler(object):
         self.equates = {}          # .set / .equ absolute constants
         self.fixups = []           # (section, offset, width, expr) after layout
         self.local_seq = {}        # numeric local label -> times defined
+        self.pcrel_seq = 0         # counter for .Lpcrel_hiN labels
         self.mode = 64
         self._get_section(".text")
         self._get_section(".data")
@@ -438,6 +467,9 @@ class Assembler(object):
             if rest.strip() != "":
                 self._line(rest)
             return
+        if self.arch.fixed_width:
+            self._line_fixed(raw)
+            return
         if self.att_mode:
             triple = rasm.parse_att_line(raw)
         else:
@@ -479,6 +511,90 @@ class Assembler(object):
             self.cur.emit_branch(bk[0], bk[1], ops[0].sym, ops[0].imm)
             return
         body, relocs = rasm.encode(a, ops)
+        self.cur.emit_with_relocs(body, relocs)
+
+    def _line_fixed(self, raw):
+        """Assemble one line for a fixed-width ISA (AArch64, RV64).
+
+        Directives are shared with the x86 path -- section handling, symbol
+        binding and data emission are architecture-neutral -- so only the
+        instruction case is different: one mnemonic, one operand string, one
+        4-byte word."""
+        line = _strip_fixed_comment(raw, self.arch.name).strip()
+        if line == "":
+            return
+        if line[0] == ".":
+            # A directive, unless it is a label like `.L1:` (handled by the
+            # caller's _split_label, so anything reaching here is a directive).
+            self._directive(line)
+            return
+        parts = line.split(None, 1)
+        mnem = parts[0]
+        rest = parts[1] if len(parts) > 1 else ""
+        if self.arch.name == "arm64":
+            body, relocs = rasm_arm64.encode_line(mnem, rest)
+        elif self.arch.name == "riscv64":
+            m = mnem.lower()
+            if m == "la" or m == "lla":
+                self._riscv_la(m, rest)
+                return
+            body, relocs = rasm_riscv.encode_line(mnem, rest)
+        else:
+            raise AsmError("no encoder for architecture '%s'"
+                           % self.arch.name)
+        # Numeric local-label references (`1b`, `2f`) resolve the same way as
+        # on x86; symbol equates likewise.
+        j = 0
+        while j < len(relocs):
+            r = relocs[j]
+            if r.sym != "" and self._is_local_ref(r.sym):
+                r.sym = self._local_ref(r.sym)
+            j += 1
+        self.cur.emit_with_relocs(body, relocs)
+
+    def _riscv_la(self, mnem, rest):
+        """Expand `la`/`lla rd, sym` into a labelled auipc/addi pair.
+
+        This one pseudo-instruction cannot live in the encoder. The RISC-V
+        psABI splits a PC-relative address across auipc+addi with *two*
+        relocations, and the low one does not name the target: it names a
+        label sitting on the auipc, because that is the instruction whose PC
+        the high half was computed against. Emitting it therefore requires
+        defining a symbol, which only the assembler owns -- so the driver
+        rewrites the pseudo-instruction into what gas would have produced:
+
+            .Lpcrel_hiN:
+                auipc rd, %pcrel_hi(sym)
+                addi  rd, rd, %pcrel_lo(.Lpcrel_hiN)
+
+        gas names every one of these `.L0 ` (with a trailing space, so it
+        cannot collide with a user label) and tells them apart by symbol
+        index. Our symbol table is keyed by name, so each gets a distinct
+        name instead. rlink's _riscv_pcrel_pair already resolves the pair by
+        finding the HI20 relocation at the named label's offset, which is
+        exactly this shape.
+
+        On a static link `la` and `lla` are the same thing; they differ only
+        under PIC, where `la` would go through the GOT.
+        """
+        ops = rasm_riscv.split_operands(rest)
+        if len(ops) != 2:
+            raise AsmError("%s: expected `%s rd, symbol`" % (mnem, mnem))
+        rd = ops[0].strip()
+        sym = ops[1].strip()
+
+        label = ".Lpcrel_hi%d" % self.pcrel_seq
+        self.pcrel_seq += 1
+        lsym = self._sym(label)
+        lsym.section = self.cur.name
+        lsym.defined = True
+        self.cur.mark_label(label)
+
+        body, relocs = rasm_riscv.encode_line(
+            "auipc", "%s, %%pcrel_hi(%s)" % (rd, sym))
+        self.cur.emit_with_relocs(body, relocs)
+        body, relocs = rasm_riscv.encode_line(
+            "addi", "%s, %s, %%pcrel_lo(%s)" % (rd, rd, label))
         self.cur.emit_with_relocs(body, relocs)
 
     def _split_label(self, raw):
@@ -566,7 +682,7 @@ class Assembler(object):
             n = int(parts[1].strip(","))
             self.cur.emit([0] * n)
             return
-        if d in _DATA_WIDTH:
+        if d in self.arch.data_widths:
             self._data(d, line[len(d):].strip())
             return
         if d == ".align" or d == ".balign":
@@ -589,11 +705,16 @@ class Assembler(object):
     def _align(self, n):
         if n <= 1:
             return
-        fill = 0x90 if self.cur.name[0:5] == ".text" else 0
+        # 0x90 is the x86 nop. On a fixed-width ISA a single 0x90 byte is
+        # not an instruction at all, so pad with zero there.
+        if self.arch.fixed_width:
+            fill = 0
+        else:
+            fill = 0x90 if self.cur.name[0:5] == ".text" else 0
         self.cur.emit_align(n, fill)
 
     def _data(self, d, rest):
-        width = _DATA_WIDTH[d]
+        width = self.arch.data_widths[d]
         items = rest.split(",")
         k = 0
         while k < len(items):
@@ -744,7 +865,8 @@ class Assembler(object):
                 while j < len(rl):
                     r = rl[j]
                     relocs.append(rasm.Reloc(base + r.where, r.sym, r.size,
-                                             r.pcrel, r.add, r.signed))
+                                             r.pcrel, r.add, r.signed,
+                                             r.kind))
                     j += 1
                 i += 1
             sec.data = data
@@ -786,7 +908,17 @@ class Assembler(object):
 
     def _resolve(self):
         """Resolve same-section PC-relative refs to local (non-global) labels
-        in place; keep the rest as ELF relocations."""
+        in place; keep the rest as ELF relocations.
+
+        Only for variable-width ISAs. Patching in place here means writing the
+        displacement as a plain little-endian field of r.size bytes, which is
+        right on x86-64 (the field *is* those bytes) but would overwrite the
+        opcode and register bits of a fixed-width instruction word. On AArch64
+        and RV64 the displacement is a bit-slice spliced into an existing
+        word, so those targets keep every relocation and let the linker apply
+        it with the correct mask and shift."""
+        if self.arch.fixed_width:
+            return
         for name in self.order:
             sec = self.sections[name]
             keep = []
@@ -874,12 +1006,9 @@ class _StrTab(object):
         return off
 
 
-def _reloc_type(r):
-    if r.pcrel:
-        return R_X86_64_PC32
-    if r.size == 8:
-        return R_X86_64_64
-    return R_X86_64_32S if r.signed else R_X86_64_32
+def _reloc_type(r, arch):
+    """Numeric ELF relocation type for an abstract rasm.Reloc, per target."""
+    return arch.reloc_type(r.kind, r.size, r.pcrel, r.signed)
 
 
 def _sec_flags(name):
@@ -892,11 +1021,11 @@ def _sec_flags(name):
     return SHF_ALLOC | SHF_WRITE
 
 
-def _sec_align(sec):
+def _sec_align(sec, arch):
     if sec.align > 1:
         return sec.align
     if sec.name[0:5] == ".text":
-        return 16
+        return arch.text_align
     return 8
 
 
@@ -915,7 +1044,9 @@ def _emitted_sections(asm):
     return out
 
 
-def write_elf(asm):
+def write_elf(asm, arch=None):
+    if arch is None:
+        arch = rasm_arch.get_arch(asm.arch_name)
     data_secs = _emitted_sections(asm)
 
     sec_index = {}
@@ -998,7 +1129,7 @@ def write_elf(asm):
         if sec.nobits:
             sec_file[sn] = ehdr_size + len(body)
             continue
-        a = _sec_align(sec)
+        a = _sec_align(sec, arch)
         while (ehdr_size + len(body)) % a != 0:
             body.append(0)
         sec_file[sn] = ehdr_size + len(body)
@@ -1030,7 +1161,7 @@ def write_elf(asm):
         rela_files[sn] = ehdr_size + len(body)
         for r in sec.relocs:
             si = symindex.get(r.sym, secsym_index.get(sn, 0))
-            info = (si << 32) | _reloc_type(r)
+            info = (si << 32) | _reloc_type(r, arch)
             body.extend(_u64(r.where))
             body.extend(_u64(info))
             body.extend(rasm.pack_le(r.add, 8))
@@ -1066,7 +1197,7 @@ def write_elf(asm):
         typ = SHT_NOBITS if sec.nobits else SHT_PROGBITS
         size = sec.size if sec.nobits else len(sec.data)
         add_sh(name_off[sn], typ, _sec_flags(sn), sec_file[sn], size,
-               0, 0, _sec_align(sec), 0)
+               0, 0, _sec_align(sec, arch), 0)
     symtab_idx = len(sh)
     add_sh(n_symtab, SHT_SYMTAB, 0, sym_file, sym_size,
            symtab_idx + 1, first_global, 8, 24)
@@ -1100,12 +1231,12 @@ def write_elf(asm):
     eh.extend([0x7F, ord('E'), ord('L'), ord('F'), 2, 1, 1, 0])
     eh.extend([0, 0, 0, 0, 0, 0, 0, 0])       # e_ident padding
     eh.extend(_u16(1))                         # e_type ET_REL
-    eh.extend(_u16(62))                        # e_machine EM_X86_64
+    eh.extend(_u16(arch.elf_machine))           # e_machine
     eh.extend(_u32(1))                         # e_version
     eh.extend(_u64(0))                         # e_entry
     eh.extend(_u64(0))                         # e_phoff
     eh.extend(_u64(shoff))                     # e_shoff
-    eh.extend(_u32(0))                         # e_flags
+    eh.extend(_u32(arch.elf_flags))            # e_flags
     eh.extend(_u16(64))                        # e_ehsize
     eh.extend(_u16(0))                         # e_phentsize
     eh.extend(_u16(0))                         # e_phnum
@@ -1119,7 +1250,7 @@ def write_elf(asm):
     return out
 
 
-def assemble_to_elf(text):
-    a = Assembler()
+def assemble_to_elf(text, arch_name="x86_64"):
+    a = Assembler(arch_name)
     a.assemble(text)
-    return write_elf(a)
+    return write_elf(a, rasm_arch.get_arch(arch_name))

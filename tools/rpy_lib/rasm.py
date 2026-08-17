@@ -236,7 +236,7 @@ def op_mem(size, base, index, scale, disp, sym, rip, asize=0):
 # a `size`-byte field references `sym` with addend `add`; `pcrel` marks
 # RIP/relative (R_X86_64_PC32) vs absolute (R_X86_64_32/32S).
 class Reloc(object):
-    def __init__(self, where, sym, size, pcrel, add, signed=True):
+    def __init__(self, where, sym, size, pcrel, add, signed=True, kind=""):
         self.where = where
         self.sym = sym
         self.size = size
@@ -245,6 +245,12 @@ class Reloc(object):
         # gas emits R_X86_64_32 (unsigned) for a symbol in a data word and
         # R_X86_64_32S for one used as a sign-extended immediate.
         self.signed = signed
+        # Instruction-specific relocation kind, for fixed-width ISAs where the
+        # owning instruction -- not the field width -- picks the type (an
+        # AArch64 4-byte word can hold a 26-bit branch, a 21-bit page delta, or
+        # a 12-bit page offset). "" means infer from size/pcrel/signed, which
+        # is what x86-64 does. See rasm_arch.Arch.reloc_type.
+        self.kind = kind
 
 
 # --------------------------------------------------------------------------
