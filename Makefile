@@ -857,6 +857,65 @@ baremetal-irq: shim
 	@mkdir -p $(BUILD)
 	pypy3 shivycx_baremetal.py examples/baremetal/kernel_irq.c -o $(BUILD)/irq.elf --image
 
+# Bare-metal AArch64 image for qemu-system-aarch64 -M virt: boot (EL2->EL1),
+# PL011 console, exception vectors and MMU. Unlike the x86 targets above this
+# uses no minikraft: that mini-OS is 32-bit x86 and its drivers (VGA, PS/2,
+# PIC/PIT) have no counterpart on an AArch64 machine.
+baremetal-arm64:
+	@mkdir -p $(BUILD)
+	python3 tools/baremetal_arm64.py examples/baremetal/kernel_arm64.c \
+		-o $(BUILD)/kernel_arm64.elf
+
+# Raspberry Pi 3 bare-metal image, booted under qemu -M raspi3b.
+baremetal-raspi:
+	@mkdir -p $(BUILD)
+	python3 tools/baremetal_arm64.py examples/baremetal/kernel_raspi.c \
+		--board raspi3 -o $(BUILD)/kernel_raspi.elf --run
+
+# Timer interrupts on the Pi 3, routed by the BCM local controller.
+baremetal-raspi-irq:
+	@mkdir -p $(BUILD)
+	python3 tools/baremetal_arm64.py examples/baremetal/kernel_raspi_irq.c \
+		--board raspi3 -o $(BUILD)/kernel_raspi_irq.elf --run
+
+# Interrupt-driven serial echo: timer and UART sharing the vector.
+baremetal-echo:
+	@mkdir -p $(BUILD)
+	python3 tools/baremetal_arm64.py examples/baremetal/kernel_echo.c \
+		-o $(BUILD)/kernel_echo.elf --run
+
+baremetal-echo-raspi:
+	@mkdir -p $(BUILD)
+	python3 tools/baremetal_arm64.py examples/baremetal/kernel_echo.c \
+		--board raspi3 -o $(BUILD)/kernel_echo_raspi.elf --run
+
+# Jetson Nano image. No qemu machine models a Tegra, so this builds only;
+# tools/uart_8250_test.py is what checks its console driver.
+baremetal-jetson:
+	@mkdir -p $(BUILD)
+	python3 tools/baremetal_arm64.py examples/baremetal/kernel_raspi.c \
+		--board jetson -o $(BUILD)/kernel_jetson.elf
+
+# Same image, booted here under qemu.
+baremetal-arm64-run:
+	@mkdir -p $(BUILD)
+	python3 tools/baremetal_arm64.py examples/baremetal/kernel_arm64.c \
+		-o $(BUILD)/kernel_arm64.elf --run
+
+# The checks that guard the AArch64 bare-metal path. These are cheap and
+# catch failures that are invisible to the hosted difftests: an extern whose
+# address is taken from the frame instead of its symbol, and a vector slot
+# that has outgrown its 128-byte entry.
+test_baremetal_arm64:
+	python3 tools/extern_symbol_test.py
+	python3 tools/vectors_size_test.py
+	python3 tools/rlink_script_test.py
+	python3 tools/irq_timer_test.py
+	python3 tools/uart_rx_irq_test.py
+	python3 tools/uart_8250_test.py
+	python3 tools/gic_base_test.py
+	cd tools/rpy_lib && python3 rasm_arm64_sys_test.py
+
 # gcc-build the inlined 32-bit MiniKraft baseline from minikraft.py.
 minikraft: shim
 	@mkdir -p $(BUILD)
@@ -899,7 +958,7 @@ mbos-rpython-test-net:
 self:
 	cd tools && pypy3 py2c.py
 
-.PHONY: default test testfast testminipy testfast_native testpromote testpgo testfuse testtorch shim install install_deps clean baremetal baremetal-hello \
+.PHONY: default test testfast testminipy testfast_native testpromote testpgo testfuse testtorch shim install install_deps clean baremetal baremetal-arm64 baremetal-arm64-run baremetal-raspi baremetal-raspi-irq baremetal-echo baremetal-echo-raspi baremetal-jetson test_baremetal_arm64 baremetal-hello \
         bootstrap bootstrap2 \
         selfhost selfhost_objcore selfhost_bench selfhost_coverage \
         selfhost_coverage_musl selfhost_link selfhost_build selfhost_compiler \
