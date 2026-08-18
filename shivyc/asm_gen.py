@@ -680,12 +680,29 @@ class ASMGen:
         # Static / file-scope globals are not x29-relative; they live at a
         # symbol and are addressed with adrp/add. Record them and emit storage.
         STATIC = self.symbol_table.STATIC
+        EXTERNAL = self.symbol_table.EXTERNAL
         glob = {}
         for v in values:
             if self.symbol_table.storage.get(v) == STATIC:
                 glob[v] = self.symbol_table.asm_name(v)
                 self._arm64_glob[v] = glob[v]
                 self._arm64_emit_global_storage(v)
+            elif self.symbol_table.linkage_type.get(v) == EXTERNAL \
+                    and not v.ctype.is_function():
+                # An `extern` object declared here but defined elsewhere --
+                # including one defined only by a *linker script*, which is
+                # how a bare-metal image reaches `__bss_start` or a page-table
+                # region. It carries EXTERNAL linkage but no storage duration
+                # (nothing in this translation unit allocates it), so it
+                # matched neither this test nor the DEFINED check above and
+                # fell through to the local path, where AddrOf handed back an
+                # x29-relative frame address. That is a *silent* miscompile:
+                # the code links, runs, and reads whatever is on the stack.
+                # It lives at a symbol, so record it as a global -- but emit
+                # no storage, since defining it here would preempt the real
+                # definition.
+                glob[v] = self.symbol_table.asm_name(v)
+                self._arm64_glob[v] = glob[v]
 
         # Count how often each global is referenced; frequently-used ones get
         # their (link-time-invariant) address cached in a register for the whole
@@ -2820,6 +2837,7 @@ class ASMGen:
         seen = {}
         has_call = False
         STATIC = self.symbol_table.STATIC
+        EXTERNAL = self.symbol_table.EXTERNAL
         for c in cmds:
             if isinstance(c, control.Call):
                 has_call = True
@@ -2835,6 +2853,18 @@ class ASMGen:
                     if v not in self._rv_glob:
                         self._rv_glob[v] = self.symbol_table.asm_name(v)
                         self._rv_emit_global_storage(v)
+                    continue
+                if self.symbol_table.linkage_type.get(v) == EXTERNAL \
+                        and not v.ctype.is_function():
+                    # An `extern` object defined in another translation unit
+                    # or by a linker script: EXTERNAL linkage, but no storage
+                    # duration here, so the STATIC test above misses it. It is
+                    # addressed by symbol like any other global; no storage is
+                    # emitted, since the definition is elsewhere. See the
+                    # matching comment in _arm64_function -- both bare-metal
+                    # back ends had this bug and it was silent on both.
+                    if v not in self._rv_glob:
+                        self._rv_glob[v] = self.symbol_table.asm_name(v)
                     continue
                 if v not in seen:
                     seen[v] = 1
