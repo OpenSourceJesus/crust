@@ -7,10 +7,15 @@ Main Crust Documentation:
 - [SHIVYCX.md](SHIVYCX.md) SHIVYC-X (C Compiler)
 - [CPP2RUST.md](CPP2RUST.md) C++ to Rust translator
 
+Hardware:
+- [BAREMETAL_ARM64.md](BAREMETAL_ARM64.md)
+- [RASPI.md](RASPI.md) Raspberry Pi
+- [JETSON_NANO.md](JETSON_NANO.md) Nvidia Jetson Nano
+
 Crust Papers:
-- https://ai.vixra.org/pdf/2608.0059v1.pdf
-- https://dx.doi.org/10.2139/ssrn.7226482
-- https://ai.vixra.org/pdf/2608.0014v1.pdf
+- https://ai.vixra.org/pdf/2608.0059v1.pdf "Interoperation Without an Interface: C++ and Rust in One Translation Unit, and One Toolchain"
+- https://dx.doi.org/10.2139/ssrn.7226482 "Full-stackless Computing: A Multi-language Compiler That Builds and Boots its Own Operating System"
+
 
 Modern systems development forces engineers to choose between two paradigms:
 - The ubiquitous simplicity and legacy ecosystem of C.
