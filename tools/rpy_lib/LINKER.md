@@ -105,6 +105,55 @@ for RV64 as `.data + 0x800`. That is a real ABI requirement, not a nicety: crt
 code loads `gp` from it before any small-data access, and GNU `ld` will relax
 PC-relative sequences into gp-relative ones that fault without it.
 
+## Linker scripts
+
+`-T script.ld` drives the layout instead of the built-in default. This is what
+makes a bare-metal image possible at all: such an image *is* its script — the
+load address, which section leads, alignment constraints, and the symbols the
+boot code resolves against.
+
+Supported, and differentially tested against `ld` in `rlink_script_test.py`
+(**11 pass, 0 fail**):
+
+* `ENTRY(sym)`, `OUTPUT_FORMAT`/`OUTPUT_ARCH` (parsed and ignored)
+* `SECTIONS { ... }` with output sections `NAME [ALIGN(n)] : { *(pat) ... }`,
+  wildcard patterns, `KEEP(...)`, `COMMON`, and `/DISCARD/`
+* the location counter: `. = <expr>;`, including `. = ALIGN(n);` and
+  `. = . + n;` for reserving a region such as a stack or page tables
+* symbol assignment `sym = <expr>;` and `PROVIDE(sym = <expr>)`
+* `. = ALIGN(n);` at the end of a section body
+* expressions over `+ - * /`, parentheses, numbers with `K`/`M` suffixes,
+  `ALIGN(x)` / `ALIGN(addr, align)`, `.`, and previously defined script symbols
+
+Expressions are stored as token lists at parse time and evaluated during
+layout, because most of them depend on where `.` has reached — a value that
+does not exist until sections are being placed.
+
+Two details are load-bearing:
+
+* **File offsets are derived from addresses, not accumulated.** A script may
+  leave large gaps (`. = . + 0x10000` to reserve a stack), and those cost
+  address space but no file bytes. Accumulating an offset across a gap pads the
+  output with zeros up to the next section, since the writer fills the file to
+  each section's `file_off`. Deriving `file_off = first_file_off + (addr -
+  first_addr)` keeps `p_offset` congruent to `p_vaddr` modulo the page size —
+  which the kernel requires — while leaving gaps free. On the AArch64
+  bare-metal kernel this is 16 KiB of output against `ld`'s 83 KiB, for images
+  that behave identically.
+* **A section a script names is placed whether or not it has `SHF_ALLOC`.**
+  `.section .multiboot` in gas carries no flags unless the source spells them
+  out, and `boot64.S` does not. Requiring `SHF_ALLOC` silently dropped the
+  12-byte Multiboot header, putting `_start` at the image's first byte and
+  producing an image GRUB would refuse for having no header in its first 8 KiB.
+  Nothing about that failure looks like a linker bug from the outside. Only
+  linker bookkeeping (`.rela*`, symtab, strtab) is never placeable.
+
+Not supported: `MEMORY` regions, `AT(...)` load addresses distinct from virtual
+ones, `SORT`, section fill patterns, `OVERLAY`, and conditional or
+`MAX`/`MIN`/`ADDR`/`SIZEOF` expressions. Each raises rather than being ignored,
+so a script using them fails visibly instead of laying out something subtly
+wrong.
+
 ### Testing
 
 `rlink_cross_test.py` assembles with the GNU cross assembler, links the *same*
@@ -143,8 +192,6 @@ the entry symbol.
   `PT_GNU_EH_FRAME` header, so C++-style unwinding would not work.
 * **Section GC and identical-code folding** (`--gc-sections`, `--icf`): every
   allocated input section is kept.
-* **Linker scripts**: layout is fixed (a sensible default script's worth); only
-  `--base` is adjustable.
 * **RISC-V relaxation** (`R_RISCV_RELAX`): the hint is ignored, which is always
   correct but leaves our RV64 output larger than `ld`'s and not byte-identical
   to it.
@@ -163,3 +210,5 @@ the entry symbol.
 * `tools/rpy_lib/rlink_test.py` — end-to-end pipeline, archive and interop tests.
 * `tools/rpy_lib/rlink_cross_test.py` — AArch64/RV64 relocation differential
   test against GNU `ld`.
+* `tools/rlink_script_test.py` — linker-script layout differential test against
+  GNU `ld`, plus the AArch64 bare-metal image linked both ways and booted.

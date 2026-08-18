@@ -166,6 +166,7 @@ R_AARCH64_ABS16 = rasm_arch.R_AARCH64_ABS16
 R_AARCH64_PREL64 = rasm_arch.R_AARCH64_PREL64
 R_AARCH64_PREL32 = rasm_arch.R_AARCH64_PREL32
 R_AARCH64_ADR_PREL_PG_HI21 = rasm_arch.R_AARCH64_ADR_PREL_PG_HI21
+R_AARCH64_ADR_PREL_LO21 = rasm_arch.R_AARCH64_ADR_PREL_LO21
 R_AARCH64_ADD_ABS_LO12_NC = rasm_arch.R_AARCH64_ADD_ABS_LO12_NC
 R_AARCH64_TSTBR14 = rasm_arch.R_AARCH64_TSTBR14
 R_AARCH64_CONDBR19 = rasm_arch.R_AARCH64_CONDBR19
@@ -545,6 +546,13 @@ class ScriptCmd(object):
         self.value = 0
         self.patterns = []
         self.align = 0
+        # Expression token lists, evaluated during layout rather than at parse
+        # time because they may reference the location counter. For SETDOT and
+        # ASSIGN this is the value; for SECTION it is the section's ALIGN(n)
+        # attribute, if any.
+        self.expr = []
+        self.end_align = []
+        self.provide = False
 
 
 class Script(object):
@@ -595,6 +603,13 @@ def parse_script(text):
                 i = _parse_section_item(sc, toks, i)
             i += 1
             continue
+        if t in _UNSUPPORTED_TOP:
+            raise LinkError(
+                "script: `%s` is not supported. rlink lays out a single "
+                "loadable image from SECTIONS; it has no notion of named "
+                "memory regions or overlays, and silently ignoring this "
+                "would place sections somewhere the script did not ask for."
+                % t)
         if t == "OUTPUT_FORMAT" or t == "OUTPUT_ARCH":
             while i < n and toks[i] != ")":
                 i += 1
@@ -604,37 +619,103 @@ def parse_script(text):
     return sc
 
 
+# Script constructs rlink does not implement. Each is rejected rather than
+# skipped: every one of them *moves things*, so quietly ignoring it produces a
+# layout that differs from what the script asked for, and a bare-metal image
+# whose sections are in the wrong place fails at boot with nothing pointing
+# back at the script.
+_UNSUPPORTED_TOP = ["MEMORY", "OVERLAY", "PHDRS", "VERSION", "INSERT"]
+_UNSUPPORTED_BODY = ["SORT", "SORT_BY_NAME", "SORT_BY_ALIGNMENT",
+                     "SORT_BY_INIT_PRIORITY"]
+# Expression functions that are recognised only well enough to say no.
+_UNSUPPORTED_FUNCS = ["MAX", "MIN", "ADDR", "LOADADDR", "SIZEOF",
+                      "SEGMENT_START", "DEFINED", "ABSOLUTE", "DATA_SEGMENT_ALIGN"]
+
+
 def _parse_section_item(sc, toks, i):
     t = toks[i]
-    if t == ".":                        # . = <value> ;
+    if t in _UNSUPPORTED_TOP:
+        # OVERLAY appears *inside* SECTIONS, so the top-level check never sees
+        # it; both places have to reject.
+        raise LinkError(
+            "script: `%s` is not supported inside SECTIONS" % t)
+    if t == ".":                        # . = <expr> ;
         if toks[i + 1] != "=":
             raise LinkError("unsupported script syntax near `.`")
         cmd = ScriptCmd(SCMD_SETDOT)
-        cmd.value = _script_number(toks[i + 2])
+        end = _expr_end(toks, i + 2)
+        cmd.expr = toks[i + 2:end]
         sc.cmds.append(cmd)
-        return i + 3
+        return end + 1 if end < len(toks) and toks[end] == ";" else end
+    if t == "PROVIDE" or t == "PROVIDE_HIDDEN":
+        # PROVIDE(sym = expr) -- define only if referenced and undefined.
+        # Everything rlink defines from a script is already conditional in
+        # that sense, so this parses to the same command.
+        j = i + 1
+        if toks[j:j + 1] == ["("]:
+            j += 1
+        name = toks[j]
+        if toks[j + 1] != "=":
+            raise LinkError("script: malformed PROVIDE near `%s`" % name)
+        end = _expr_end(toks, j + 2)
+        cmd = ScriptCmd(SCMD_ASSIGN)
+        cmd.name = name
+        cmd.expr = toks[j + 2:end]
+        cmd.provide = True
+        sc.cmds.append(cmd)
+        while end < len(toks) and toks[end] in (")", ";"):
+            end += 1
+        return end
     if i + 1 < len(toks) and toks[i + 1] == "=":
-        # name = . ;   (a PROVIDE-style symbol at the current address)
-        if toks[i + 2] != ".":
-            raise LinkError("only `sym = .` assignments are supported, got "
-                            "`%s = %s`" % (t, toks[i + 2]))
+        # `sym = <expr> ;` -- a symbol defined at some point in the layout.
         cmd = ScriptCmd(SCMD_ASSIGN)
         cmd.name = t
+        end = _expr_end(toks, i + 2)
+        cmd.expr = toks[i + 2:end]
         sc.cmds.append(cmd)
-        return i + 3
+        return end + 1 if end < len(toks) and toks[end] == ";" else end
     if t == ";":
         return i + 1
-    # an output section: NAME : { *(pat) ... }
+    # An output section:  NAME [ALIGN(n)] [(TYPE)] : [AT(...)] { *(pat) ... }
     name = t
     j = i + 1
+    align_expr = []
     while j < len(toks) and toks[j] != "{":
+        if toks[j] == "AT":
+            raise LinkError(
+                "script: `%s : AT(...)` is not supported -- rlink emits one "
+                "PT_LOAD whose physical address equals its virtual address, "
+                "so a separate load address cannot be honoured" % name)
+        if toks[j] == "ALIGN" and toks[j + 1:j + 2] == ["("]:
+            end = _expr_end(toks, j + 2)
+            align_expr = toks[j + 2:end]
+            j = end
         j += 1
     j += 1
     pats = []
+    end_align = []
     while j < len(toks) and toks[j] != "}":
         tok = toks[j]
+        if tok == "." and toks[j + 1:j + 2] == ["="]:
+            # `. = ALIGN(8);` inside a section body. Rather than model a dot
+            # that moves *within* a section, this is recorded as an alignment
+            # of the section's end -- which is what every real use of it means
+            # (rounding .bss up so a following symbol is aligned).
+            end = _expr_end(toks, j + 2)
+            end_align = toks[j + 2:end]
+            j = end
+            continue
+        if tok in _UNSUPPORTED_BODY:
+            raise LinkError(
+                "script: `%s(...)` in section `%s` is not supported -- input "
+                "sections are placed in the order the patterns list them, so "
+                "ignoring a sort would silently give a different layout"
+                % (tok, name))
         if tok == "*" and toks[j + 1:j + 2] == ["("]:
-            # `*(.text .text.*)` -- every input section matching any of these
+            # `*(.text .text.*)` -- every input section matching any of these.
+            # KEEP(*(...)) reaches here too: rlink never garbage-collects
+            # sections, so KEEP is already the behaviour and the wrapper only
+            # needs to not confuse the scan.
             j += 2
             while j < len(toks) and toks[j] != ")":
                 if toks[j] != ",":
@@ -648,6 +729,8 @@ def _parse_section_item(sc, toks, i):
         cmd = ScriptCmd(SCMD_SECTION)
         cmd.name = name
         cmd.patterns = pats
+        cmd.expr = align_expr
+        cmd.end_align = end_align
         sc.cmds.append(cmd)
     return j
 
@@ -663,6 +746,195 @@ def _script_number(tok):
     if t.endswith("K"):
         return int(t[:-1]) * 1024
     return int(t)
+
+
+def _looks_number(tok):
+    t = tok
+    if t.endswith(";"):
+        t = t[:-1]
+    if t == "":
+        return False
+    if t[0:2] == "0x" or t[0:2] == "0X":
+        body = t[2:]
+        if body == "":
+            return False
+        for c in body:
+            if c not in "0123456789abcdefABCDEF":
+                return False
+        return True
+    if t.endswith("M") or t.endswith("K"):
+        t = t[:-1]
+    if t == "":
+        return False
+    for c in t:
+        if c < "0" or c > "9":
+            return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Script expressions
+# ---------------------------------------------------------------------------
+# `. = 0x40080000;` can be evaluated the moment it is parsed, but
+# `. = ALIGN(4096);` and `. = . + 0x10000;` cannot: both depend on where the
+# location counter has got to, which is only known during layout. So an
+# expression is *stored* as its token list and evaluated later, against the dot
+# and the symbols defined so far.
+#
+# The grammar is the useful subset of ld's:
+#
+#   expr    := sum
+#   sum     := product (('+' | '-') product)*
+#   product := atom (('*' | '/') atom)*
+#   atom    := NUMBER | '.' | SYMBOL | '(' expr ')' | ALIGN '(' expr [',' expr] ')'
+#
+# No conditionals, no MAX/MIN, no ADDR/SIZEOF -- those are not needed by any
+# script here, and a clear error beats a half-working evaluator.
+def _expr_end(toks, i):
+    """Index just past the expression starting at `i`, stopping at `;`.
+
+    Parentheses are tracked so `ALIGN(8)` does not terminate early.
+    """
+    depth = 0
+    n = len(toks)
+    while i < n:
+        t = toks[i]
+        if t == "(":
+            depth += 1
+        elif t == ")":
+            if depth == 0:
+                return i
+            depth -= 1
+        elif depth == 0 and (t == ";" or t == "}" or t == ":"):
+            return i
+        i += 1
+    return i
+
+
+def _align_up(value, align):
+    if align <= 1:
+        return value
+    rem = value % align
+    if rem == 0:
+        return value
+    return value + (align - rem)
+
+
+class _ExprEval(object):
+    """Evaluate a script expression token list."""
+
+    def __init__(self, toks, dot, syms):
+        self.toks = toks
+        self.i = 0
+        self.dot = dot
+        self.syms = syms
+
+    def _peek(self):
+        if self.i < len(self.toks):
+            return self.toks[self.i]
+        return ""
+
+    def _next(self):
+        t = self._peek()
+        self.i += 1
+        return t
+
+    def parse(self):
+        v = self._sum()
+        return v
+
+    def _sum(self):
+        v = self._product()
+        while True:
+            t = self._peek()
+            if t == "+":
+                self._next()
+                v = v + self._product()
+            elif t == "-":
+                self._next()
+                v = v - self._product()
+            else:
+                return v
+
+    def _product(self):
+        v = self._atom()
+        while True:
+            t = self._peek()
+            if t == "*":
+                self._next()
+                v = v * self._atom()
+            elif t == "/":
+                self._next()
+                d = self._atom()
+                if d == 0:
+                    raise LinkError("script: division by zero")
+                v = v // d
+            else:
+                return v
+
+    def _atom(self):
+        t = self._next()
+        if t == "":
+            raise LinkError("script: unexpected end of expression")
+        if t == "(":
+            v = self._sum()
+            if self._peek() == ")":
+                self._next()
+            return v
+        if t == "ALIGN":
+            if self._peek() != "(":
+                raise LinkError("script: ALIGN must be followed by `(`")
+            self._next()
+            first = self._sum()
+            second = -1
+            if self._peek() == ",":
+                self._next()
+                second = self._sum()
+            if self._peek() == ")":
+                self._next()
+            # One argument aligns the current dot; two aligns the first to the
+            # second, which is the form `ALIGN(addr, align)`.
+            if second >= 0:
+                return _align_up(first, second)
+            return _align_up(self.dot, first)
+        if t == ".":
+            return self.dot
+        if _looks_number(t):
+            return _script_number(t)
+        if t == "-":
+            return -self._atom()
+        nm = t
+        if nm.endswith(";"):
+            nm = nm[:-1]
+        if nm in self.syms:
+            return self.syms[nm]
+        if nm in _UNSUPPORTED_FUNCS:
+            raise LinkError(
+                "script: `%s(...)` is not supported in an expression" % nm)
+        raise LinkError("script: unknown symbol `%s` in expression" % nm)
+
+
+def _eval_expr(toks, dot, syms):
+    if len(toks) == 0:
+        return dot
+    return _ExprEval(toks, dot, syms).parse()
+
+
+def _placeable(sec):
+    """Can a linker script place this input section?
+
+    Anything that holds bytes or reserves space can be placed. Relocation
+    sections, symbol and string tables are the linker's own bookkeeping and
+    never are, whatever a wildcard matches.
+    """
+    if sec.type == SHT_NOBITS:
+        return True
+    if sec.type != SHT_PROGBITS:
+        return False
+    n = sec.name
+    if n[0:5] == ".rela" or n[0:4] == ".rel":
+        return False
+    return True
 
 
 def _pattern_match(pat, name):
@@ -847,7 +1119,18 @@ class Linker(object):
                     continue          # commons are added by allocate_commons
                 for obj in self.objects:
                     for sec in obj.sections:
-                        if not sec.keep or sec.name == "":
+                        if sec.name == "":
+                            continue
+                        # A section a script *names* is placed whether or not
+                        # it carries SHF_ALLOC. `.section .multiboot` in gas
+                        # gets no flags at all unless the source spells them
+                        # out, and boot64.S does not -- so requiring SHF_ALLOC
+                        # here silently dropped the Multiboot header, leaving
+                        # `_start` at the image's first byte and an image GRUB
+                        # would refuse. GNU ld places anything an output
+                        # section explicitly matches; this now does the same.
+                        # Only linker metadata is never a candidate.
+                        if not sec.keep and not _placeable(sec):
                             continue
                         key = "%s\x00%s" % (obj.name, sec.index)
                         if key in taken:
@@ -858,6 +1141,7 @@ class Linker(object):
                             raise LinkError("%s: thread-local storage is not "
                                             "supported" % sec.name)
                         taken[key] = True
+                        sec.keep = True
                         out.inputs.append(sec)
                         sec.out = cmd.name
                         if sec.align > out.align:
@@ -877,37 +1161,81 @@ class Linker(object):
             out.nobits = allnobits and len(out.inputs) > 0
 
     def _script_layout(self):
-        """Walk the script, placing sections and defining `sym = .` symbols.
+        """Walk the script, placing sections and defining symbols.
 
         Sections are packed tightly (the `-n` / nmagic behaviour bare-metal
         images want): no page alignment between them, because the loader is a
         flat copy, not mmap.
+
+        Expressions are evaluated here rather than at parse time: `. =
+        ALIGN(4096);` and `. = . + 0x10000;` both depend on where the location
+        counter has reached, and a reserved region (`. = . + 0x4000;` for page
+        tables, or a stack) is expressed exactly that way.
         """
         dot = self.base
-        file_off = PAGE          # contents start on a page so p_offset ~ p_vaddr
         first_addr = -1
+        file_off = PAGE          # contents start on a page so p_offset ~ p_vaddr
+        content_end = -1
         for cmd in self.script.cmds:
             if cmd.kind == SCMD_SETDOT:
-                dot = cmd.value
+                new_dot = _eval_expr(cmd.expr, dot, self.script_syms)
+                if first_addr >= 0 and new_dot < dot:
+                    raise LinkError(
+                        "script: `.` moved backwards, from 0x%x to 0x%x"
+                        % (dot, new_dot))
+                dot = new_dot
                 continue
             if cmd.kind == SCMD_ASSIGN:
-                self.script_syms[cmd.name] = dot
+                self.script_syms[cmd.name] = _eval_expr(
+                    cmd.expr, dot, self.script_syms)
                 continue
             out = self.out_by_name.get(cmd.name, None)
             if out is None:
+                # A section the script names but no input supplies. Its ALIGN
+                # still applies, since a following `sym = .` may depend on it.
+                if len(cmd.expr) > 0:
+                    dot = _align_up(
+                        dot, _eval_expr(cmd.expr, dot, self.script_syms))
                 continue
+            # An explicit `NAME ALIGN(n) :` attribute raises the section's
+            # alignment. The vector table's ALIGN(2048) is load-bearing:
+            # VBAR_EL1 ignores the low 11 bits of whatever it is given, so a
+            # misaligned table is not rejected, it is silently truncated to
+            # the aligned address below it.
+            if len(cmd.expr) > 0:
+                want = _eval_expr(cmd.expr, dot, self.script_syms)
+                if want > out.align:
+                    out.align = want
             if out.align > 1 and dot % out.align != 0:
-                pad = out.align - (dot % out.align)
-                dot += pad
-                if not out.nobits:
-                    file_off += pad
+                dot += out.align - (dot % out.align)
             if first_addr < 0 and not out.nobits:
                 first_addr = dot
+                # p_offset must be congruent to p_vaddr modulo the page size
+                # or the kernel refuses the image.
+                file_off = PAGE + (dot % PAGE)
                 self.first_file_off = file_off
-            dot, file_off = self._place(out, dot, file_off)
+            # File offsets are *derived* from addresses rather than
+            # accumulated. A script may leave large gaps -- `. = . + 0x10000`
+            # to reserve a stack, or a page-table region -- and those cost
+            # address space but no file bytes. Accumulating an offset across
+            # such a gap would pad the output with tens of KiB of zeros, since
+            # the writer fills the file up to each section's file_off.
+            if not out.nobits and first_addr >= 0:
+                file_off = self.first_file_off + (dot - first_addr)
+            dot, _unused = self._place(out, dot, file_off)
+            if len(cmd.end_align) > 0:
+                want = _eval_expr(cmd.end_align, dot, self.script_syms)
+                new_dot = _align_up(dot, want)
+                out.size += new_dot - dot
+                dot = new_dot
+            if not out.nobits:
+                content_end = dot
         self.base = first_addr if first_addr >= 0 else self.base
         self.image_end = dot
-        self.image_file_end = file_off
+        if content_end < 0:
+            content_end = self.base
+        self.image_file_end = self.first_file_off + (content_end - self.base)
+        file_off = self.image_file_end
         # one loadable segment covering the whole image
         self.exec_secs = []
         self.rw_secs = []
@@ -937,7 +1265,20 @@ class Linker(object):
         holder = InSection(None, ".bss.common", -1)
         holder.type = SHT_NOBITS
         holder.flags = SHF_ALLOC | SHF_WRITE
-        holder.align = 16
+        # The holder's alignment is the strictest any common actually asks
+        # for, not a fixed guess. It propagates to the whole .bss output
+        # section, so a hardcoded 16 silently over-aligns .bss whenever every
+        # common needs only 8 -- which moved __bss_end 8 bytes past where GNU
+        # ld puts it. Harmless for a program that only clears the range, but a
+        # gratuitous divergence from the oracle, and the sort of drift that
+        # hides a real one.
+        holder.align = 1
+        for nm in names:
+            a = self.commons[nm].value
+            if a > holder.align:
+                holder.align = a
+        if holder.align < 1:
+            holder.align = 1
         off = 0
         for nm in names:
             sym = self.commons[nm]
@@ -1303,6 +1644,20 @@ class Linker(object):
         # the page holding the symbol. Both addresses are truncated to their
         # page base first -- that truncation is the whole point of the
         # instruction, and getting it wrong is the classic adrp bug.
+        if t == R_AARCH64_ADR_PREL_LO21:
+            # `adr Xd, sym`: the byte delta from this instruction to the
+            # symbol, no page rounding. Same split immediate field as adrp
+            # (immlo at 30:29, immhi at 23:5) but the value is not shifted --
+            # which is exactly the difference that makes it worth its own
+            # applier rather than reusing the adrp one.
+            delta = S + A - P
+            self._check_signed(delta, 21, where, "adr")
+            imm = delta & 0x1FFFFF
+            w = self._read_insn(sec, r.offset)
+            w = (w & 0x9F00001F) | ((imm & 3) << 29) \
+                | (((imm >> 2) & 0x7FFFF) << 5)
+            self._write_insn(sec, r.offset, w)
+            return
         if t == R_AARCH64_ADR_PREL_PG_HI21:
             page_s = (S + A) & ~0xFFF
             page_p = P & ~0xFFF
