@@ -142,9 +142,20 @@ system `gcc`, so it is a real test wherever it runs.
   practice on either board — but an AArch64 distro built for 64 KB pages
   (some enterprise distros are) would reject the resulting binaries, because
   the kernel requires `p_offset ≡ p_vaddr (mod pagesize)` for every `PT_LOAD`.
-- **No GPIO, no peripherals, no bare metal.** These are Linux userland
-  binaries. Driving Pi GPIO or Jetson hardware means `mmap`-ing `/dev/mem` or
-  using the kernel interfaces, and the runtime does not wrap those yet.
+- **No GPIO and no peripherals from Linux userland.** The binaries on this
+  page are Linux userland binaries; driving Pi GPIO or Jetson hardware from
+  one means `mmap`-ing `/dev/mem` or using the kernel interfaces, and the
+  runtime does not wrap those yet. There is now a separate *bare-metal*
+  AArch64 path — no OS at all, with its own boot, exception and MMU bring-up —
+  documented in [BAREMETAL_ARM64.md](BAREMETAL_ARM64.md), with the
+  board-specific details in [RASPI.md](RASPI.md) and
+  [JETSON_NANO.md](JETSON_NANO.md). It boots on
+  `qemu-system-aarch64 -M virt` and on `-M raspi3b`, each with its own load
+  address, console and interrupt controller — a GICv2 on virt, the BCM2837's
+  ARM local peripherals on the Pi — and takes timer interrupts on both. A
+  Jetson image builds too, with a Tegra 16550 console and a relocated GICv2,
+  but no qemu machine models a Tegra so it is verified at register level
+  only, never booted.
 - **No CPU tuning.** The back end emits baseline ARMv8-A. It does not use
   Cortex-A72 or A76 specific scheduling, nor any optional extension (the Pi 5's
   ARMv8.2 features, crypto extensions, or SVE on newer Jetsons).

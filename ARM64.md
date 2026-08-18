@@ -9,6 +9,10 @@ is untouched by any of it.
 Running on a Raspberry Pi or Jetson Nano? Both are AArch64 Linux and use this
 back end unchanged; see [BOARDS.md](BOARDS.md) for the board-specific setup.
 
+Running with no operating system underneath at all — boot, exception vectors
+and MMU — is a separate path documented in
+[BAREMETAL_ARM64.md](BAREMETAL_ARM64.md); it uses this same back end.
+
 There is a second bare-metal target, RISC-V 64, documented separately in
 [RISCV64.md](RISCV64.md). It shares the register allocator described below
 verbatim — that section is the canonical description for both. This page
