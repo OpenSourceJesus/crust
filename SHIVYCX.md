@@ -107,6 +107,118 @@ python3 -m shivyc.main threads_demo.c \
 # writes switcher.s (cooperative) and switcher.preempt.s (timer-driven)
 ```
 
+### AArch64
+
+`--target arm64` is supported. The analysis, the budget feedback and the
+switcher are all per-target; asking for an unsupported one now refuses rather
+than emitting the x86 switcher.
+
+```sh
+python3 -m shivyc.main bench_threads.c \
+    --emit-thread-switcher switcher.s --target arm64
+#   left  GP footprint : x19
+#   right GP footprint : x26          -> footprints are disjoint
+#   context switch saves: 1 reg (vs 18 for save-all)
+```
+
+Two differences from x86-64 are worth knowing before writing a benchmark:
+
+**The pool is the callee-saved range, x19-x28.** ShivyCX's AArch64 allocator
+gives a value a callee-saved home only when it must survive a call; everything
+else goes to caller-saved scratch (x0-x18). A cooperative switch *is* a call,
+so caller-saved registers are already dead across it by the ABI — the
+callee-saved set is exactly what the switcher must preserve. Ten homes, none
+of them argument registers, so a two-way split is more comfortable than on
+x86, where the pool overlaps the ABI's argument registers.
+
+**A call-free thread has almost nothing to partition.** This is the opposite of
+the x86 intuition, and it decides what a useful benchmark looks like.
+`bench_threads.c` uses call-free bodies deliberately, "so the register
+partition fully controls each thread's footprint" — on AArch64 that guarantees
+a *tiny* footprint instead. Measured: five live values per side still produced
+a one-register footprint, and tightening the budget from three registers to one
+cost nothing — same instruction count, same single spill, because the values
+simply moved to caller-saved scratch.
+
+`benchmarks/threads/bench_threads_calls.c` gives each thread a call so the live
+values must occupy callee-saved homes. Two threads then want eight of the ten,
+and they *cannot* be disjoint. The tool reports the overlap rather than
+claiming a partition it did not achieve, and the switcher stays correct — it
+saves the outgoing footprint and restores the incoming one however they
+overlap, as four `stp`/`ldp` pairs rather than eight moves.
+
+**The preemptive path saves a different set from the cooperative one.** This is
+the subtlest part and it is a correctness matter, not a tuning one. A
+cooperative switch is a *call*, so caller-saved registers are already dead
+across it by the ABI — preserving `x19-x28` is enough. A timer interrupt lands
+at an arbitrary instruction, where `x0-x18` hold live values, so the ISR must
+save the thread's **full** footprint. Measured on `bench_threads.c`: 1 register
+cooperatively, 9 preemptively. Saving the cooperative set on a tick would
+corrupt the interrupted thread intermittently, depending where the tick fell.
+
+The generated ISR is an alternative body for the EL1h IRQ vector slot
+(`VBAR_EL1 + 0x280`) — the generic entry in `baremetal64/vectors_arm64.S` saves
+a fixed twenty-two registers on every tick because it cannot know what the
+interrupted code was using. It also saves `ELR_EL1` and `SPSR_EL1`, since
+`eret` restores from both and preserving registers without the flags resumes a
+thread with someone else's condition codes and interrupt mask.
+
+On exception entry no register is free, so `timer_dispatch` parks two on the
+stack and the specialized entries inherit that frame — the entry recovers the
+originals from it and reclaims the space. Selection is data, not a branch:
+`timer_vector` holds the running side's entry and each side flips it to the
+other.
+
+The paradigm as a whole — one core, two threads, and what it measures on a
+printf-shaped workload — is written up in
+[BAREMETAL_THREADS.md](BAREMETAL_THREADS.md).
+
+#### It runs
+
+```sh
+make baremetal-preempt
+```
+
+builds a bare-metal image whose EL1h IRQ vector slot branches to the generated
+switcher, and boots it under `qemu-system-aarch64 -M virt`:
+
+```
+  left=1227960000  right=2093684604  switches=50522  corrupt(l/r)=0/0
+```
+
+Two threads, fifty thousand preemptions, and the number that matters is the
+last one. Each worker re-derives an arithmetic invariant every iteration, so a
+live register the switcher failed to preserve shows up as a mismatch rather
+than as silence. **Zero mismatches across fifty thousand switches is the
+evidence that saving only the running group's footprint — not the whole
+register file — is sufficient.** `tools/thread_partition_test.py` asserts all
+of this on every run.
+
+#### A bug only booting could find
+
+The first version passed every static check: correct save sets, balanced
+scratch frames, `ELR` and `SPSR` handled, assembling under both GNU `as` and
+`rasm`, twenty-three tests including mutations. It still could not switch twice.
+
+`bl timer_ack` clobbers `x9`. It is caller-saved, so the callee is entitled to
+destroy it — and does. The cur/next exchange immediately after read `x9` as the
+outgoing TCB pointer, so `next_tcb` received garbage and the *second* switch
+resumed from a corrupt TCB: `eret` landed at EL0 on a misaligned PC, followed
+by an exception storm.
+
+Nothing about that is visible in the emitted text, which is why the test that
+found it is the one that boots the thing. Two diagnostics misled on the way,
+both worth knowing: `ISR_EL1` reads zero when interrupts are *unmasked*
+(an asserted interrupt is taken, not left pending), so it says nothing there;
+and a flood of stray output looks exactly like too-few-registers-saved but was
+not, since the tick counter proved the handler never completed. What settled it
+was `qemu -d int` — two IRQs, then a Prefetch Abort from EL0 with `ESR` EC
+`0x22`, which points straight at a bad `ELR`/`SPSR` pair and therefore at the
+TCB pointer.
+
+Still hardcoded: the ISR alternates left/right rather than consulting a run
+queue. That is a scheduler, not a switcher, and is the natural next piece.
+
 Details in [`shivyc/README.md`](shivyc/README.md)
 ---
 

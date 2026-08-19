@@ -469,6 +469,35 @@ correct. It waits for the guest to print `READY` and types afterwards. A flaky
 test here would be worse than none: it teaches a reader to rerun rather than
 believe the result.
 
+### A second vector table: register-partitioned preemption
+
+`vectors_preempt_arm64.S` is the vector table used by
+`examples/baremetal/kernel_preempt.c`. It is identical to `vectors_arm64.S`
+except in one slot: the EL1h IRQ entry (`VBAR_EL1 + 0x280`) branches to a timer
+ISR **ShivyCX generated from a whole-program register partition**, rather than
+to the generic `exc_common` path.
+
+That is the point of the exercise. `exc_common` saves a fixed twenty-two
+registers on every tick because it cannot know what the interrupted code was
+using; the compiler does know, so the generated entry saves only the running
+thread's footprint. Every other slot still routes to `exc_common` — a data
+abort is a fault to report, not a thread switch.
+
+`make baremetal-preempt` boots two threads that preempt each other:
+
+```
+  left=1227960000  right=2093684604  switches=50522  corrupt(l/r)=0/0
+```
+
+The mechanism, the measured save sets, and the caller-saved bug that took a
+boot to find are documented in [SHIVYCX.md](SHIVYCX.md) under
+*Register-partitioned threads*, and the paradigm and its benchmarks in
+[BAREMETAL_THREADS.md](BAREMETAL_THREADS.md). Two pieces of this page are load-bearing for
+it: `thread_launch` (which `eret`s into the first thread, so the first entry
+and every later resume take the same route) and `irq_ack_timer` (the board hook
+the ISR calls, since rearming `CNTP_TVAL` and the EOI protocol differ per
+board).
+
 ### The exception level a board hands you
 
 The boot stub descends from EL3, EL2 or EL1, whichever it is entered at,
@@ -586,6 +615,8 @@ pointing back at the script. Each is rejected with a message naming it.
 - [`baremetal64/uart_8250.c`](baremetal64/uart_8250.c) — Tegra 16550 console (Jetson)
 - [`baremetal64/virt_arm64.ld`](baremetal64/virt_arm64.ld), [`raspi_arm64.ld`](baremetal64/raspi_arm64.ld), [`jetson_arm64.ld`](baremetal64/jetson_arm64.ld) — image layout per board
 - [`baremetal64/irq_none_arm64.c`](baremetal64/irq_none_arm64.c) — IRQ stub for boards with no controller wired up
+- [`baremetal64/vectors_preempt_arm64.S`](baremetal64/vectors_preempt_arm64.S) — vector table routing IRQ to a generated switcher
+- [`examples/baremetal/kernel_preempt.c`](examples/baremetal/kernel_preempt.c) — two threads preempting each other
 - [`tools/baremetal_arm64.py`](tools/baremetal_arm64.py) — build and run driver
 - [`tools/rlink_script_test.py`](tools/rlink_script_test.py) — linker-script
   layout, differentially against `ld`

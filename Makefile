@@ -889,6 +889,17 @@ baremetal-echo-raspi:
 	python3 tools/baremetal_arm64.py examples/baremetal/kernel_echo.c \
 		--board raspi3 -o $(BUILD)/kernel_echo_raspi.elf --run
 
+# Two register-partitioned threads preempting each other, with the timer ISR
+# ShivyCX generated from the partition installed in the EL1h IRQ vector.
+baremetal-preempt:
+	@mkdir -p $(BUILD)
+	python3 -m shivyc.main examples/baremetal/kernel_preempt.c \
+		tools/preempt_threads.c --emit-thread-switcher $(BUILD)/sw.s \
+		--target arm64
+	python3 tools/baremetal_arm64.py examples/baremetal/kernel_preempt.c \
+		--extra-asm vectors_preempt_arm64.S --extra-asm $(BUILD)/sw.preempt.s \
+		-o $(BUILD)/kernel_preempt.elf --run
+
 # Jetson Nano image. No qemu machine models a Tegra, so this builds only;
 # tools/uart_8250_test.py is what checks its console driver.
 baremetal-jetson:
@@ -912,6 +923,7 @@ test_baremetal_arm64:
 	python3 tools/rlink_script_test.py
 	python3 tools/irq_timer_test.py
 	python3 tools/uart_rx_irq_test.py
+	python3 tools/thread_partition_test.py
 	python3 tools/uart_8250_test.py
 	python3 tools/gic_base_test.py
 	cd tools/rpy_lib && python3 rasm_arm64_sys_test.py
@@ -958,7 +970,7 @@ mbos-rpython-test-net:
 self:
 	cd tools && pypy3 py2c.py
 
-.PHONY: default test testfast testminipy testfast_native testpromote testpgo testfuse testtorch shim install install_deps clean baremetal baremetal-arm64 baremetal-arm64-run baremetal-raspi baremetal-raspi-irq baremetal-echo baremetal-echo-raspi baremetal-jetson test_baremetal_arm64 baremetal-hello \
+.PHONY: default test testfast testminipy testfast_native testpromote testpgo testfuse testtorch shim install install_deps clean baremetal baremetal-arm64 baremetal-arm64-run baremetal-raspi baremetal-raspi-irq baremetal-echo baremetal-echo-raspi baremetal-preempt baremetal-jetson test_baremetal_arm64 baremetal-hello \
         bootstrap bootstrap2 \
         selfhost selfhost_objcore selfhost_bench selfhost_coverage \
         selfhost_coverage_musl selfhost_link selfhost_build selfhost_compiler \
