@@ -613,6 +613,12 @@ class ASMGen:
             # literal does, so it would never be registered there.
             self._arm64_glob[v] = nm
         for func in self.il_code.commands:
+            # Thread register partitioning. The x86 path applies this in
+            # make_asm, but make_asm dispatches to _make_asm_arm64 *before*
+            # reaching that point, so it has to be applied here too -- without
+            # it the budget was computed, written to JSON, passed on the
+            # command line, and then quietly ignored.
+            self._apply_thread_budget(func)
             self._arm64_function(func, self.il_code.commands[func])
 
     def _arm64_emit_global_storage(self, v):
@@ -875,6 +881,12 @@ class ASMGen:
         while rr <= 28:
             int_callee.append(rr)
             rr += 1
+        # Thread partitioning: restrict this function's callee-saved homes to
+        # its group's budget, so the two sides cannot land on the same
+        # register and the emitted switcher really is minimal.
+        _budget = getattr(self, "_a64_budget", None)
+        if _budget:
+            int_callee = [r for r in int_callee if r in _budget]
         fp_caller = []
         rr = 18                              # v18..v31: caller-saved, never args
         while rr <= 31:
@@ -4282,6 +4294,26 @@ class ASMGen:
         pressure spills to memory rather than to another group's register).
         """
         table = getattr(self.arguments, "_thread_alloc", None)
+        # AArch64 does not allocate from spots.registers at all: value homes
+        # come from x19-x28 in _arm64_function. So the budget is handed over as
+        # a set of register *numbers* there rather than by rewriting the x86
+        # spot lists here -- setting alloc_registers would be silently ignored
+        # and the partition would stay an observation rather than a guarantee.
+        self._a64_budget = None
+        if table:
+            b = table.get(func)
+            if b:
+                nums = []
+                for rn in b:
+                    if rn[0:1] == "x" and rn[1:].isdigit():
+                        n = int(rn[1:])
+                        if 19 <= n <= 28:
+                            nums.append(n)
+                # Keep a floor so the allocator always has somewhere to put a
+                # value; anything over budget spills to memory, which is
+                # correct, never into the other thread's bank.
+                if len(nums) >= 2:
+                    self._a64_budget = nums
         if not table:
             self.alloc_registers = type(self).alloc_registers
             self.all_registers = type(self).all_registers
