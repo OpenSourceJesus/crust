@@ -5868,6 +5868,12 @@ public:
     void clear() { pn = 0; }
     pair<K,V> *begin() { return pd; }
     pair<K,V> *end() { return pd + pn; }
+    /* Integer access, for walking the map in a range-`for`. Deliberately
+       not an `operator[]` overload: this map is keyed on `K`, and a second
+       subscript taking `int` would be an overload on the parameter *type*
+       at one arity, which this subset resolves by argument count and so
+       cannot tell apart. A separate name says the same thing unambiguously. */
+    pair<K,V> *at_index(int i) { return pd + i; }
     void reserve(int c) {
         if (c > pcap) {
             pair<K,V> *nd;

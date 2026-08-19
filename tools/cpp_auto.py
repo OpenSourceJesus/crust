@@ -900,9 +900,15 @@ def resolve_range_for(text, path="<cpp>", blank=None):
         # way a dereferenced name is.
         if vt.rstrip().endswith("*"):
             deref = True
+        # `at_index(int)` is the integer accessor of a container whose
+        # `operator[]` is keyed on something else -- a map. Preferred when
+        # present, so walking a map reads its entries in order rather than
+        # looking each one up by an integer key it does not have.
+        has_at_index = "at_index" in methods.get(cls, {}) if cls else False
         if alen is None and (cls is None
                              or "size" not in methods.get(cls, {})
-                             or "[]" not in methods.get(cls, {})):
+                             or ("[]" not in methods.get(cls, {})
+                                 and not has_at_index)):
             raise AutoError(
                 "%s: `%s` is not something this pass can walk -- an array "
                 "needs a written size, and a container needs both `size()` "
@@ -919,8 +925,31 @@ def resolve_range_for(text, path="<cpp>", blank=None):
         # no symbol in front of the bracket and comes out as raw C indexing
         # on a struct.
         limit = alen if alen is not None else "%s%ssize()" % (rng, arrow)
+        # `at_index` hands back a pointer -- a reference return on a named
+        # method is not read as one here, and a pointer needs no such
+        # reading. The dereference is written out so the element expression
+        # is an lvalue of the element type either way.
         elem = "%s[%s]" % (rng, it)
         body = text[body_open + 1:body_close]
+        if has_at_index:
+            # A container walked through `at_index` binds the element to a
+            # name rather than substituting the call in textually. The
+            # substituted form left `property.first.c_str()` reading
+            # `(*map_at_index(&m, i)).first.c_str()`, and the call rewriter
+            # resolves a *symbol* -- there is none in front of that dot, so
+            # the method never lowered. A declared local is a symbol, and a
+            # class-typed one that happens to be a pointer is the case the
+            # field and call rewriting already handle.
+            #
+            # `auto`, because the element type has no spelling available
+            # here; this pass runs before deduction, which reads it off
+            # `at_index`'s written return type.
+            decl = " auto %s = %s%sat_index(%s);" % (m.group(4), rng, arrow, it)
+            head = ("for (int %s = 0; %s < %s; %s = %s + 1) {%s"
+                    % (it, it, limit, it, it, decl))
+            text = text[:m.start()] + head + body + text[body_close:]
+            scan = _blank_like(text)
+            continue
         if m.group(3):                   # `auto &x` / `T &x`: an alias
             # `scan`, not `blank`: after the first rewrite the two no longer
             # line up, and reading the stale one silently substituted nothing.
