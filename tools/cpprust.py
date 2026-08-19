@@ -1850,6 +1850,34 @@ def _expand_cpp_ref(params, names):
         params)
 
 
+def _declared_param_names(params):
+    """Names of the parameters in a lowered parameter list.
+
+    Used to stop field qualification from rewriting a parameter that shares
+    a field's name. In C++ the parameter shadows the member, which is why
+    `position(int x, ..) { this->x = x; }` is the ordinary way to write a
+    constructor -- and why qualifying that bare `x` produced `this->x =
+    this->x`, a self-assignment that compiled cleanly and silently dropped
+    the argument.
+
+    The last identifier in a declarator is the name: `const string &s` and
+    `int buf[4]` both end in one. Anything with no identifier (an unnamed
+    parameter, or `void`) contributes nothing.
+    """
+    out = set()
+    for part in _split_top(params or ""):
+        part = part.split("=")[0]                    # default argument
+        part = re.sub(r"\[[^\]]*\]", " ", part)      # array declarator
+        words = re.findall(r"[A-Za-z_]\w*", part)
+        if not words:
+            continue
+        name = words[-1]
+        if name in _KEYWORDS or name == "void":
+            continue
+        out.add(name)
+    return out
+
+
 def _scalar_ref_names(params):
     """Names of parameters declared as a reference to a scalar."""
     out = []
@@ -1946,8 +1974,18 @@ def _implicit_this(body, mnames):
                      lambda m: "this->%s(" % m.group(1), body)
 
 
-def _member_prologue(cname, value_members, initmap, known, fieldset, line):
-    """Constructor calls for class-typed members, in declaration order."""
+def _member_prologue(cname, value_members, initmap, known, fieldset, line,
+                     pmap=None):
+    """Constructor calls for class-typed members, in declaration order.
+
+    `pmap` maps this constructor's parameter names to their class, for the
+    one case where arity is not enough to choose: `url(const string &s) :
+    str_(s)` initializes a `string` member *from a string*, which is the
+    copy constructor, not the one-argument converting constructor that
+    happens to share its arity. Picking by count alone handed a `string *`
+    to a constructor expecting a `const char *`.
+    """
+    pmap = pmap or {}
     lines = []
     seen = set()
     for fname, fcls in value_members:
@@ -1955,6 +1993,19 @@ def _member_prologue(cname, value_members, initmap, known, fieldset, line):
             args = initmap[fname]
             seen.add(fname)
             ar = _arity(args)
+            bare = (args or "").strip()
+            if ar == 1 and pmap.get(bare) == fcls:
+                # The argument is an object of the member's own class, so
+                # this is a copy. A reference parameter is already a pointer
+                # by now, which is exactly what `_copy` wants.
+                if known[fcls]["copy"]:
+                    lines.append("%s_copy(&this->%s, %s);"
+                                 % (fcls, fname, bare))
+                else:
+                    # Plain data: no copy constructor was emitted because
+                    # none is needed, and assignment is the copy.
+                    lines.append("this->%s = *(%s);" % (fname, bare))
+                continue
             if ar not in known[fcls]["ctors"]:
                 raise CppError(
                     "%s: member `%s` of type `%s` has no constructor taking "
@@ -2270,8 +2321,27 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             pro += ("((%s *)this)->_vptr = "
                     "(const struct %s_vtable *)&%s__vtable; "
                     % (root, root, cname))
+        # Which of this constructor's parameters are objects of a class we
+        # know, by value or by reference? Only those can make an initializer
+        # a copy rather than a conversion.
+        pmap = {}
+        if member is not None:
+            for part in _split_top(sub(member.params or "")):
+                part = part.strip()
+                if not part or "*" in part:
+                    continue          # a pointer parameter is not the object
+                words = [w for w in part.replace("&", " ").split()
+                         if w != "const"]
+                if len(words) >= 2:
+                    # `_param_name` reads the lowered pointer spelling; these
+                    # params are still as written, where the name is simply
+                    # the last identifier.
+                    pn = words[-1]
+                    bt = tsub(words[0])
+                    if bt in known and re.match(r"^[A-Za-z_]\w*$", pn):
+                        pmap[pn] = bt
         pro += _member_prologue(cname, value_members, initmap, known,
-                                fieldset, cls.line)
+                                fieldset, cls.line, pmap)
         # C++11 default member initializers. C has no such thing on a struct
         # member, so each becomes an assignment at the top of every
         # constructor -- which is what it means. An explicit entry in this
@@ -2342,10 +2412,17 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
         # to re-blank the body, and a field qualified by an earlier pass
         # would be re-examined by a later one.
         if info["paths"]:
-            inner = _sub_code(
-                re.compile(r"(?<![\w.>])(%s)\b"
-                           % _type_alt(list(info["paths"]))),
-                lambda m: "this->" + info["paths"][m.group(1)], inner)
+            # A parameter of the same name shadows the field, exactly as in
+            # C++. Without this the bare `x` in `this->x = x` was qualified
+            # into `this->x = this->x` -- which compiles, runs, and silently
+            # ignores the argument. `position(int x, int y, ..)` is the usual
+            # spelling of a constructor, so this was not a corner case.
+            shadowed = _declared_param_names(params)
+            visible = [n for n in info["paths"] if n not in shadowed]
+            if visible:
+                inner = _sub_code(
+                    re.compile(r"(?<![\w.>])(%s)\b" % _type_alt(visible)),
+                    lambda m: "this->" + info["paths"][m.group(1)], inner)
         inner = inner.replace("this->this->", "this->")
         # `Shape *twin() { return this; }` inside a derived class returns a
         # `Derived *` where a `Shape *` is declared. The base is the first
@@ -2780,6 +2857,13 @@ def _func_return_type(text, open_paren):
     head = text[:open_paren].rstrip()
     cut = max(head.rfind(";"), head.rfind("}"), head.rfind("{"),
               head.rfind(")"), head.rfind(":"))
+    # A preprocessor directive is not part of a declaration, and contains
+    # none of the characters above -- so `#include <stdio.h>` immediately
+    # before `int main()` was read as part of the return type, and the
+    # spilled temporary came out as `#include <stdio.h> int _cpp_ret0`.
+    # A directive ends at its newline; nothing up to there belongs here.
+    for pm in re.finditer(r"(?m)^[ \t]*#.*$", head):
+        cut = max(cut, pm.end())
     decl = head[cut + 1:].strip()
     m = re.match(r"^(.*?)([A-Za-z_]\w*)$", decl, re.S)
     if m is None:
@@ -2865,16 +2949,23 @@ def _conv_for(name, scopes, type_info):
 def _named_object(expr, scopes, type_info):
     """`(path, class)` for an expression that names an object, else None.
 
-    A local, or a chain of value members from one (`t.nums`). Factored out
-    of `_copy_source`, which asks whether a name is an object of a class it
-    already knows; expression-position `std::move` has to ask the other
-    question -- which class this name *is* -- because there is no
-    declaration beside it to read the type from.
+    A local, `this`, or a chain of value members from either (`t.nums`,
+    `this->str_`). Factored out of `_copy_source`, which asks whether a name
+    is an object of a class it already knows; expression-position
+    `std::move` has to ask the other question -- which class this name *is*
+    -- because there is no declaration beside it to read the type from.
+
+    `this->` is in the chain because by the time this pass runs, field
+    qualification has already put it there: a method body that said `str_`
+    reaches here as `this->str_`, so a pass that only understood `.` could
+    not name a single one of its own fields. That is what refused
+    `tstring tmp = str_;` in url.cpp -- not the copy, which is ordinary, but
+    the inability to say what was being copied.
     """
     if expr is None:
         return None
     expr = expr.strip()
-    parts = [p for p in re.split(r"\s*\.\s*", expr) if p]
+    parts = [p for p in re.split(r"\s*(?:\.|->)\s*", expr) if p]
     if not parts or not all(re.match(r"^\w+$", p) for p in parts):
         return None
     cls = None
@@ -2885,6 +2976,9 @@ def _named_object(expr, scopes, type_info):
     if cls is None:
         return None
     out = parts[0]
+    # `this` is a pointer and every field of a class is a value, so only the
+    # first hop off it is an arrow; the rest are dots either way.
+    sep = "->" if parts[0] == "this" else "."
     for fld in parts[1:]:
         info = type_info.get(cls)
         if info is None or fld not in info["fields"]:
@@ -2892,9 +2986,60 @@ def _named_object(expr, scopes, type_info):
         fcls, is_ptr = info["fields"][fld]
         if is_ptr:
             return None              # a pointer member is not the object
-        out = "%s.%s" % (out, info["paths"].get(fld, fld))
+        out = "%s%s%s" % (out, sep, info["paths"].get(fld, fld))
+        sep = "."
         cls = fcls
     return (out, cls)
+
+
+def _converting_operand(rhs, scopes, type_info):
+    """Is `rhs` something a one-argument constructor should be given?
+
+    `string s = str;` where `str` is a `const char *` is copy-initialization
+    through a converting constructor -- C++ builds the temporary and, since
+    C++17, constructs `s` directly from it. `string s(str);` already lowers
+    here; only the `=` spelling was refused, and the two mean the same thing.
+
+    Deliberately narrow. A literal, or a bare name that is not a known
+    object of any class, is something whose type this pass can be sure is
+    *not* the class being built. Anything larger -- a conditional, an
+    arithmetic expression, a member chain -- could be an object of that
+    class the pass simply failed to name, and handing one to a converting
+    constructor would build the wrong thing silently. Those keep the
+    refusal, which is the honest answer.
+    """
+    if not rhs:
+        return False
+    rhs = rhs.strip()
+    if re.match(r'^".*"$', rhs, re.S) or re.match(r"^'.*'$", rhs, re.S):
+        return True
+    if re.match(r"^\w+$", rhs) and rhs not in ("nullptr", "NULL", "true",
+                                               "false"):
+        return _named_object(rhs, scopes, type_info) is None
+    return False
+
+
+def _fix_ctor_args(args, refs, scopes, type_info):
+    """Insert `&` where a constructor's by-reference parameter wants one.
+
+    Method calls go through `fix_args` in the call pass, but a constructor
+    is reached from a *declaration* -- `url u(base);` -- which this pass
+    lowers itself, and it was passing arguments through untouched. A
+    `const string &` parameter is a `const string *` by the time it is
+    emitted, so a by-value argument arrived as the wrong type.
+    """
+    parts = _split_top(args or "")
+    for idx in sorted(refs or ()):
+        if idx >= len(parts):
+            continue
+        a = parts[idx].strip()
+        if not a or a.startswith("&") or a.startswith("*"):
+            continue
+        found = _named_object(a, scopes, type_info)
+        if found is None:
+            continue                  # not something we can take an address of
+        parts[idx] = " &" + found[0]
+    return ",".join(parts).strip()
 
 
 def _copy_source(expr, ctype, scopes, type_info):
@@ -3285,6 +3430,15 @@ def _rewrite_scopes(text, type_info):
                         if pnm:
                             fr.live.append((pcls, pnm))
                             fr.vals[pnm] = pcls
+                    # A lowered method takes `Cname *this` first. Recording
+                    # it lets `this->field` be named like any other object;
+                    # it is deliberately not added to `live`, because the
+                    # method does not own the receiver and must not drop it.
+                    first = (_split_top(_params_at(look, i) or "")
+                             or [""])[0].strip()
+                    tm = re.match(r"^(?:const\s+)?(\w+)\s*\*\s*this$", first)
+                    if tm and tm.group(1) in type_info:
+                        fr.vals["this"] = tm.group(1)
                 scopes.append(fr)
             out.append(text[i])
             i += 1
@@ -3318,6 +3472,46 @@ def _rewrite_scopes(text, type_info):
                                 moved = cand
                                 break
                 drops = unwind(fidx, moved) if fidx is not None else ""
+                # `return m_root;` -- an owning value returned from something
+                # that is not a local. C++ copy-constructs into the return
+                # slot here, which for a `shared_ptr` is exactly the refcount
+                # increment that makes the idiom work; a bitwise struct copy
+                # would hand the caller a second owner of one resource and
+                # both would free it.
+                #
+                # Handled before the `drops or moved` gate below, because a
+                # getter like `document::root()` typically has neither: no
+                # owning local to drop, and nothing to move out. Without this
+                # it fell through and emitted the bitwise copy.
+                if end is not None and moved is None and fidx is not None:
+                    rexpr = text[m.end():end].strip()
+                    rcls = _owning_return_class(scopes[fidx].ret, type_info)
+                    if rcls is not None and rexpr \
+                            and not _is_call_result(rexpr) \
+                            and _move_operand(rexpr) is None:
+                        rsrc = _copy_source(rexpr, rcls, scopes, type_info)
+                        if rsrc is not None:
+                            if not type_info[rcls]["copy"]:
+                                # Owns something and cannot be copied: the
+                                # Rule of Three refusal, reported here rather
+                                # than emitting a double free.
+                                raise CppError(
+                                    "`return %s;`: %s owns a resource and has "
+                                    "no copy constructor, so returning "
+                                    "something this function does not own "
+                                    "would hand back a second owner. Add "
+                                    "`%s(const %s &o)`, or return `%s *`."
+                                    % (rexpr, rcls, rcls, rcls, rcls))
+                            name = "_cpp_ret%d" % tmp[0]
+                            tmp[0] += 1
+                            # Copy first, drop second: the drops may release
+                            # objects the source is reached through.
+                            out.append("{ %s %s; %s_copy(&%s, &%s); "
+                                       "%sreturn %s; }"
+                                       % (rcls, name, rcls, name, rsrc,
+                                          drops, name))
+                            i = end + 1
+                            continue
                 if end is not None and (drops or moved):
                     expr = text[m.end():end].strip()
                     # A `std::move` here is expression position, and the
@@ -3438,8 +3632,11 @@ def _rewrite_scopes(text, type_info):
                 # with an extra argument.
                 out.append(_copy_call(ctype, vname, src, info, ctype))
             else:
-                out.append("%s(&%s, %s);"
-                           % (info["ctors"][ar]["fn"], vname, args.strip()))
+                out.append(
+                    "%s(&%s, %s);"
+                    % (info["ctors"][ar]["fn"], vname,
+                       _fix_ctor_args(args, info["ctors"][ar].get("refs"),
+                                      scopes, type_info)))
             if info["dtor"]:
                 scopes[-1].live.append((ctype, vname))
             scopes[-1].vals[vname] = ctype
@@ -3476,6 +3673,28 @@ def _rewrite_scopes(text, type_info):
                 scopes[-1].vals[vname] = ctype
                 i = m.end()
                 continue
+            # `T x = T(a);` -- copy-initialisation from a temporary of the
+            # same type, which C++17 guarantees is elided into direct
+            # initialisation. Lowered as `T x; T_new(&x, a);`, the form this
+            # subset already emits for `T x(a);`. `make_shared<T>(..)`
+            # rewrites to exactly this shape, so it is the case that makes
+            # the rewrite usable rather than merely accepted.
+            cm = re.match(r"^%s\s*\(" % re.escape(ctype), rhs)
+            if cm is not None and _match_paren(rhs, cm.end() - 1) == len(rhs) - 1:
+                inner = rhs[cm.end():len(rhs) - 1]
+                car = _arity(inner)
+                if car in info["ctors"]:
+                    fixed = _fix_ctor_args(
+                        inner, info["ctors"][car].get("refs"), scopes,
+                        type_info)
+                    out.append("%s %s; %s(&%s%s);"
+                               % (ctype, vname, info["ctors"][car]["fn"],
+                                  vname, (", " + fixed) if fixed else ""))
+                    if info["dtor"]:
+                        scopes[-1].live.append((ctype, vname))
+                    scopes[-1].vals[vname] = ctype
+                    i = m.end()
+                    continue
             src = _copy_source(rhs, ctype, scopes, type_info)
             if src is None and not info["dtor"] and not info["copy"]:
                 out.append(m.group(0))       # plain data: a bitwise copy is
@@ -3488,6 +3707,20 @@ def _rewrite_scopes(text, type_info):
                 # no second owner, and `a` is registered so it is dropped
                 # here instead of there.
                 out.append(m.group(0))
+                if info["dtor"]:
+                    scopes[-1].live.append((ctype, vname))
+                scopes[-1].vals[vname] = ctype
+                i = m.end()
+                continue
+            if src is None and 1 in info["ctors"] and \
+                    _converting_operand(rhs, scopes, type_info):
+                # `T x = e;` where `e` is plainly not a `T`: copy-initialize
+                # through the one-argument constructor, which is what
+                # `T x(e);` already does one branch up and what C++ does for
+                # both spellings.
+                out.append("%s %s; " % (ctype, vname))
+                out.append("%s(&%s, %s);"
+                           % (info["ctors"][1]["fn"], vname, rhs))
                 if info["dtor"]:
                     scopes[-1].live.append((ctype, vname))
                 scopes[-1].vals[vname] = ctype
@@ -3625,6 +3858,29 @@ def _rewrite_scopes(text, type_info):
                         "so there is no result to assign onward."
                         % (lhs, rhs))
                 src = _copy_source(rhs, ctype, scopes, type_info)
+                if src is None and _is_call_result(rhs):
+                    # `a = f();` -- the callee returned by value, which is a
+                    # move *out* of its local, so there is no second owner
+                    # and nothing to copy. The old value still has to be
+                    # destroyed, and the result put in its place.
+                    #
+                    # Order matters, and the temporary is what gets it
+                    # right: `tmp = tmp.substr(1)` reads the very object
+                    # being assigned, so dropping first would hand the call
+                    # a freed buffer. Evaluate, then drop, then move in --
+                    # the order C++ uses too.
+                    #
+                    # The temporary is deliberately not registered as live:
+                    # its representation is handed to `lhs`, which already
+                    # is, and dropping both would free once too often.
+                    tmpn = "__cpp_as%d" % mvn[0]
+                    mvn[0] += 1
+                    out.append("{ %s %s = %s; %s(&%s); %s = %s; }"
+                               % (ctype, tmpn, rhs,
+                                  _dropfn(type_info.get(ctype), ctype), lhs,
+                                  lhs, tmpn))
+                    i = m.end()
+                    continue
                 if src is None:
                     raise CppError(
                         "`%s = %s`: the right-hand side is not an object of "
@@ -4009,6 +4265,17 @@ def _is_call_result(rhs):
     if op <= 0:
         return False
     head = rhs[:op].strip()
+    # `make_shared<css_selector>(..)` -- a template argument list is part of
+    # the callee's *name*, not an operator, but the guard below reads a bare
+    # `<` as a comparison and so refused every one of these. Stripping a
+    # balanced trailing `<..>` that hangs off an identifier leaves an
+    # ordinary callee for that check to pass on.
+    #
+    # One level only: a nested list (`make_shared<vector<int>>`) is left to
+    # be refused rather than half-parsed here.
+    tm = re.match(r"^(.*\w)\s*<([^<>]*)>$", head)
+    if tm is not None:
+        head = tm.group(1)
     # Whatever precedes it has to read as a callee -- a name, a member path,
     # or a chain of calls on one. Anything with an operator in it is an
     # expression whose value is not simply what a call returned.
@@ -4064,17 +4331,42 @@ def _func_body(text, op):
     return None if end is None else text[brace + 1:end]
 
 
+def _owning_return_class(rtype, type_info):
+    """The class of a by-value return type that owns something, else None.
+
+    A pointer return hands back a borrow and needs no copy; a class with no
+    destructor owns nothing and its bitwise copy is already correct.
+    """
+    toks = [t for t in (rtype or "").replace("*", " * ").split()
+            if t != "const"]
+    if not toks or "*" in toks:
+        return None
+    info = type_info.get(toks[0])
+    if info is None or not info["dtor"]:
+        return None
+    return toks[0]
+
+
 def _returns_only_bare_locals(body):
     """Does every `return` in `body` hand an owning value on safely?
 
-    Two shapes are safe. A **bare local** is moved out: the scope rewriting
-    leaves it out of that path's drops. A **call result** was already moved
-    out of the callee, so passing it straight on moves it again -- there is
-    no local here to destroy, and no destructor runs on a temporary.
+    Three shapes are safe. A **bare local** is moved out: the scope
+    rewriting leaves it out of that path's drops. A **call result** was
+    already moved out of the callee, so passing it straight on moves it
+    again -- there is no local here to destroy, and no destructor runs on a
+    temporary. A **named object** -- `m_root`, `this->m_root`, `a.b.c` --
+    is copy-constructed into the return slot by the scope rewriting, which
+    is what C++ does for `return m_root;` and what makes a `shared_ptr`
+    getter increment the refcount rather than alias it.
 
-    Anything else -- a member, a subscript, a dereference -- names an object
-    somebody else still owns, and returning it would hand back a copy that
-    is destroyed twice.
+    That last case is only checked for *shape* here, because this pass has
+    no scope information to resolve the name with. The rewriting resolves it
+    properly and refuses there if the class cannot be copied, so a chain
+    that reaches this point and turns out to be uncopyable is still caught.
+
+    Anything else -- a subscript, a dereference, an arithmetic expression --
+    names no object this pass can copy from, and returning it would hand
+    back a copy that is destroyed twice.
     """
     for m in re.finditer(r"(?<![\w.])return\b([^;]*);", body):
         expr = m.group(1).strip()
@@ -4082,6 +4374,8 @@ def _returns_only_bare_locals(body):
             continue                     # a bare local, or `return;`
         if _is_call_result(expr):
             continue
+        if re.match(r"^\w+(?:\s*(?:\.|->)\s*\w+)+$", expr):
+            continue                     # a named object: copied, not aliased
         return False
     return True
 
@@ -4231,6 +4525,94 @@ def _is_copy_params(params, cname, raw_name, tsub, sub):
     toks = [t for t in tsub(sub(parts[0])).replace("&", " ")
             .replace("*", " * ").split() if t != "const"]
     return len(toks) >= 2 and "*" not in toks and toks[0] in (cname, raw_name)
+
+
+_EXTERN_LINKAGE = re.compile(r'\bextern\s*"C(?:\+\+)?"\s*')
+
+
+def _strip_extern_c(text):
+    """Remove `extern "C"` / `extern "C++"` linkage specifications.
+
+    C has one linkage, so the specification means nothing once the C++ is
+    gone -- but it is very much something to the C parser downstream, which
+    stops at the string literal with `expected ';' after 'extern'`. Both
+    spellings appear in real headers: a prefix on one declaration, and a
+    brace block wrapping a whole file's worth of them.
+
+    The block form is the one that has to be handled rather than rejected.
+    Any C header guarded for C++ inclusion -- which is nearly all of them --
+    wraps its entire body in `extern "C" { .. }`, so refusing it refuses the
+    header and every file that includes it.
+
+    Everything is blanked in place rather than deleted, and the braces of a
+    block are blanked individually so the declarations between them keep
+    their offsets. Every pass below reports by line number, and a header
+    that lost a line here would move every diagnostic after it.
+    """
+    scan = _strip_comments(text)
+    # Comments are gone but literals are not, because the match *is* a
+    # literal: `"C"` blanked is `" "`, which no pattern can find. `look` is
+    # consulted only to tell code from the inside of a string -- there, the
+    # word `extern` itself would be blank.
+    look = _blank_strings(scan)
+    blanks = []
+    for m in _EXTERN_LINKAGE.finditer(scan):
+        if look[m.start():m.start() + 6] != "extern":
+            continue                      # inside a string literal
+        blanks.append((m.start(), m.end()))
+        if scan[m.end():m.end() + 1] == "{":
+            close = _match_brace(scan, m.end())
+            if close is None:
+                line = scan.count("\n", 0, m.start()) + 1
+                raise CppError(
+                    "%d: `extern \"C\" {` is never closed." % line)
+            blanks.append((m.end(), m.end() + 1))
+            blanks.append((close, close + 1))
+
+    if not blanks:
+        return text
+    out = list(text)
+    for start, end in blanks:
+        for i in range(start, end):
+            if out[i] != "\n":
+                out[i] = " "
+    return "".join(out)
+
+
+_MAKE_PTR = re.compile(r"(?<![\w.>])make_(shared|unique)\s*<([^<>]+)>\s*\(")
+
+
+def _lower_make_ptr(text):
+    """`make_shared<T>(a, b)` -> `shared_ptr<T>(new T(a, b))`.
+
+    `make_shared` cannot be written as a subset template: it has to forward
+    an arbitrary number of arguments of types the call site never spells,
+    and this subset has neither variadics nor deduction from a call. What it
+    *can* be is the thing it is shorthand for, which is what this rewrite
+    produces -- one allocation instead of make_shared's combined one, and
+    otherwise the same object with the same lifetime.
+
+    Nested template arguments (`make_shared<vector<int>>`) are left alone
+    rather than half-matched; they are refused later, which is the honest
+    outcome.
+    """
+    out, pos = [], 0
+    while True:
+        m = _MAKE_PTR.search(text, pos)
+        if m is None:
+            out.append(text[pos:])
+            break
+        close = _match_paren(text, m.end() - 1)
+        if close is None:
+            out.append(text[pos:m.end()])
+            pos = m.end()
+            continue
+        kind, ty = m.group(1), m.group(2).strip()
+        args = text[m.end():close]
+        out.append(text[pos:m.start()])
+        out.append("%s_ptr<%s>(new %s(%s))" % (kind, ty, ty, args))
+        pos = close + 1
+    return "".join(out)
 
 
 def _mark_std_move(text):
@@ -4643,6 +5025,24 @@ def _rewrite_calls(text, cinfo, free_refs):
                     # No move constructor: the copy binds the rvalue, which
                     # is what C++ overload resolution does here too.
                     out.append("%s_copy(&%s, %s)" % (ty, parts[1], parts[2]))
+                elif not cinfo[ty]["dtor"]:
+                    # Neither constructor, but nothing owned either: the
+                    # class is plain data, so constructing from a handed-over
+                    # element is assignment -- the same reading `__cpp_copy`
+                    # takes one branch up, and the same one C++ takes, where
+                    # a struct of four ints has an implicit copy constructor
+                    # and needs no move.
+                    #
+                    # Without this a `vector<position>` was refused outright:
+                    # the implicit-copy pass deliberately leaves plain data
+                    # its bitwise copy and so sets no `copy` flag, and this
+                    # hook read that absence as "cannot be copied" rather
+                    # than "does not need to be".
+                    #
+                    # The source is a reference, already lowered to a
+                    # pointer, so it is dereferenced here; the scalar branch
+                    # above receives a value and does not.
+                    out.append("(%s) = (*(%s))" % (parts[1], parts[2]))
                 else:
                     raise CppError(
                         "`__cpp_movein(%s, ..)`: %s has neither a move nor a "
@@ -4691,7 +5091,17 @@ def _rewrite_calls(text, cinfo, free_refs):
                     # owns nothing, so copying it *is* assignment -- which is
                     # what C++ does for one too. The refusal below is about
                     # duplicating something owned.
-                    out.append("(%s) = (%s)" % (parts[1], parts[2]))
+                    #
+                    # The source is an address here, not a value: every
+                    # caller of this hook on a *class* passes one, because
+                    # the `%s_copy` form below takes a pointer and the two
+                    # have to agree. The scalar branch further up is the one
+                    # that receives a value. Assigning without the
+                    # dereference put a pointer where the element goes, which
+                    # the C front end rejected as an invalid conversion --
+                    # visible only once a plain-data class reached this
+                    # branch at all.
+                    out.append("(%s) = (*(%s))" % (parts[1], parts[2]))
                     i = close + 1
                     continue
                 if not cinfo[ty]["copy"]:
@@ -4938,6 +5348,7 @@ void *realloc(void *, unsigned long);
 void free(void *);
 unsigned long strlen(const char *);
 void *memcpy(void *, const void *, unsigned long);
+void *memmove(void *, const void *, unsigned long);
 int memcmp(const void *, const void *, unsigned long);
 """
 
@@ -4995,6 +5406,41 @@ public:
     char at(int i) { return sd[i]; }
     char &operator[](int i) { return sd[i]; }
     const char *c_str() { if (sd == 0) { return ""; } return sd; }
+    int length() { return sn; }
+    string substr(int pos, int n) {
+        string r;
+        if (pos < 0) { pos = 0; }
+        if (pos > sn) { return r; }
+        if (n < 0 || pos + n > sn) { n = sn - pos; }
+        r.reserve(n);
+        if (n > 0) { memcpy(r.sd, sd + pos, (unsigned long)n); }
+        r.sn = n;
+        if (r.sd != 0) { r.sd[n] = 0; }
+        return r;
+    }
+    string substr_from(int pos) { return substr(pos, -1); }
+    int find_char(char c, int from) {
+        int i = from;
+        if (i < 0) { i = 0; }
+        while (i < sn) { if (sd[i] == c) { return i; } i = i + 1; }
+        return -1;
+    }
+    int find(char c) { return find_char(c, 0); }
+    int rfind(char c) {
+        int i = sn - 1;
+        while (i >= 0) { if (sd[i] == c) { return i; } i = i - 1; }
+        return -1;
+    }
+    int find_first_of(char c) { return find_char(c, 0); }
+    int find_last_of(char c) { return rfind(c); }
+    void erase(int pos, int n) {
+        if (pos < 0 || pos >= sn) { return; }
+        if (n < 0 || pos + n > sn) { n = sn - pos; }
+        if (n <= 0) { return; }
+        memmove(sd + pos, sd + pos + n, (unsigned long)(sn - pos - n));
+        sn = sn - n;
+        sd[sn] = 0;
+    }
     int equals(const string &o) {
         if (sn != o.sn) { return 0; }
         if (sn == 0) { return 1; }
@@ -5738,6 +6184,11 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     if basedir is not None or incdirs:
         text = _expand_headers(text, basedir or ".", incdirs,
                                defines=set(defines or ()))
+    # Linkage specifications go now: after the splice, so a header that
+    # wrapped its body in `extern "C" { .. }` is unwrapped too, and before
+    # every pass below, all of which read declarations that one would still
+    # be hiding behind a string literal.
+    text = _strip_extern_c(text)
     # `std::move` is read here, before `std::` is stripped, because after
     # that it is indistinguishable from a method or function the project
     # named `move` -- and a layout engine moving a box is not a rarity.
@@ -5745,6 +6196,10 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     # use, so the rest of the pass has one reserved name to look for.
     text = _mark_std_move(text)
     text = _std_prelude(text)
+    # After `std::` is stripped, so both spellings are already one, and
+    # before anything scans for `new` -- the rewrite introduces one, and the
+    # class emitter has to see it to emit the allocator.
+    text = _lower_make_ptr(text)
     std_classes = _STD_CLASSES
     # Function templates come out before anything reads the file. Their
     # bodies are not ordinary code -- they name types that exist only once
