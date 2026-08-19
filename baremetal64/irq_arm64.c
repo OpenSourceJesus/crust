@@ -156,6 +156,24 @@ void rx_stop(void)
     uart_disable_rx_irq();
 }
 
+/* Acknowledge one timer tick without doing any dispatch.
+ *
+ * The generated preemptive switcher (see SHIVYCX.md, register-partitioned
+ * threads) replaces irq_dispatch entirely: it saves the running thread's
+ * footprint itself and erets into the other thread. But it still has to quiet
+ * the timer, and how differs per board -- rearming CNTP_TVAL_EL0 is what
+ * deasserts the timer, and the controller then needs its own end-of-interrupt
+ * (a real write on a GIC, nothing at all on the Pi's BCM controller). Both
+ * live behind the intc_* seam, so this one function covers every board.
+ */
+void irq_ack_timer(void)
+{
+    int iar = intc_acknowledge();
+    timer_set_tval(tick_interval);
+    tick_count = tick_count + 1;
+    intc_eoi(iar);
+}
+
 void irq_init(void)
 {
     intc_init();
