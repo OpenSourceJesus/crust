@@ -3859,12 +3859,35 @@ def _rewrite_scopes(text, type_info):
             # `_named_object` resolves a bare local and a member chain alike,
             # and hands back the path to write -- which for a lowered
             # reference parameter is a dereference rather than the name.
+            lhs_is_chain = bool(re.search(r"\.|->", lhs))
             lfound = _named_object(lhs, scopes, type_info)
             # A chain ending in a scalar field resolves fine and names no
             # class; everything below reads `type_info[ctype]`, so only a
             # class it knows is taken.
             if lfound is not None and lfound[1] in type_info:
                 lhs, ctype = lfound
+            _rhs = m.group(2).strip()
+            _can_lower = ctype is not None and (
+                _rhs in ("nullptr", "NULL")
+                or _move_operand(m.group(2)) is not None
+                or (type_info[ctype]["assign"]
+                    and _copy_source(_rhs, ctype, scopes,
+                                     type_info) is not None))
+            if lhs_is_chain and ctype is not None and not _can_lower:
+                # A member assignment whose right-hand side this pass cannot
+                # name as the same class. Before member chains were matched
+                # at all these fell through untouched, and refusing them now
+                # would reject files that have always translated.
+                #
+                # litehtml's `borders` is the case in hand: it assigns a
+                # `css_border` to a `border`, which is `operator=` overloaded
+                # on the parameter *type* at one arity. Overloads here are
+                # told apart by argument count, so the second one cannot be
+                # represented -- and until it can, the honest thing is to
+                # leave the statement exactly as it was rather than claim a
+                # refusal the pass has not earned.
+                ctype = None
+                lhs = m.group(1)
             info_a = type_info.get(ctype) if ctype is not None else None
             if info_a is not None and info_a["dtor"] and 0 in info_a["ctors"] \
                     and m.group(2).strip() in ("nullptr", "NULL"):
@@ -5599,6 +5622,56 @@ public:
        and would be wrong for it anyway. `v[i]` yields the element itself. */
     void set(int i, __cpp_ref(T) v) { __cpp_drop(T, vd[i]); __cpp_copy(T, vd[i], v); }
     T *ptr(int i) { return vd + i; }
+    /* Insert before `pos`, returning an iterator to the new element.
+       An iterator here is a `T *` into the buffer, so the position is
+       taken as an index *before* `reserve` -- a reallocation moves the
+       buffer and would leave the caller's pointer dangling.
+       The tail is shifted by its representation rather than element by
+       element: moving an object is exactly what that is, and it avoids
+       constructing into storage that already holds something. */
+    T *insert(T *pos, __cpp_ref(T) v) {
+        int idx = (int)(pos - vd);
+        if (idx < 0) { idx = 0; }
+        if (idx > vn) { idx = vn; }
+        reserve(vn + 1);
+        if (vn > idx) {
+            memmove(vd + idx + 1, vd + idx,
+                    (unsigned long)((vn - idx) * (int)sizeof(T)));
+        }
+        __cpp_copy(T, vd[idx], v);
+        vn = vn + 1;
+        return vd + idx;
+    }
+    /* Erase [first, last), returning an iterator to what followed the
+       range. The two-iterator form is a separate arity, so it does not
+       collide with the one below. */
+    T *erase(T *first, T *last) {
+        int i = (int)(first - vd);
+        int j = (int)(last - vd);
+        if (i < 0) { i = 0; }
+        if (j > vn) { j = vn; }
+        if (j <= i) { return vd + i; }
+        int k = i;
+        while (k < j) { __cpp_drop(T, vd[k]); k = k + 1; }
+        if (vn - j > 0) {
+            memmove(vd + i, vd + j, (unsigned long)((vn - j) * (int)sizeof(T)));
+        }
+        vn = vn - (j - i);
+        return vd + i;
+    }
+    /* Erase at `pos`, returning an iterator to what followed it -- which is
+       why a loop written `it = v.erase(it)` keeps working. */
+    T *erase(T *pos) {
+        int idx = (int)(pos - vd);
+        if (idx < 0 || idx >= vn) { return vd + vn; }
+        __cpp_drop(T, vd[idx]);
+        if (vn - idx - 1 > 0) {
+            memmove(vd + idx, vd + idx + 1,
+                    (unsigned long)((vn - idx - 1) * (int)sizeof(T)));
+        }
+        vn = vn - 1;
+        return vd + idx;
+    }
     T &operator[](int i) { return vd[i]; }
     T *begin() { return vd; }
     T *end() { return vd + vn; }
