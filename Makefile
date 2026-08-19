@@ -894,7 +894,8 @@ baremetal-echo-raspi:
 baremetal-preempt:
 	@mkdir -p $(BUILD)
 	python3 -m shivyc.main examples/baremetal/kernel_preempt.c \
-		tools/preempt_threads.c --emit-thread-switcher $(BUILD)/sw.s \
+		examples/baremetal/preempt_threads.c \
+		--emit-thread-switcher $(BUILD)/sw.s \
 		--target arm64
 	python3 tools/baremetal_arm64.py examples/baremetal/kernel_preempt.c \
 		--extra-asm vectors_preempt_arm64.S --extra-asm $(BUILD)/sw.preempt.s \
