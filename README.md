@@ -11,6 +11,7 @@ Hardware:
 - [BAREMETAL_ARM64.md](BAREMETAL_ARM64.md)
 - [RASPI.md](RASPI.md) Raspberry Pi
 - [JETSON_NANO.md](JETSON_NANO.md) Nvidia Jetson Nano
+- [BAREMETAL_THREADS.md](BAREMETAL_THREADS.md)
 
 Crust Papers:
 - https://ai.vixra.org/pdf/2608.0059v1.pdf "Interoperation Without an Interface: C++ and Rust in One Translation Unit, and One Toolchain"
