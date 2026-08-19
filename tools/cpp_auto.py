@@ -1156,6 +1156,25 @@ def resolve_namespaces(text, path="<cpp>", blank=None):
         return text
     produced = set()
 
+    # Out-of-line definitions -- `void litehtml::css::parse_selectors(..)`
+    # -- look their bodies up in the enclosing namespace. That is done once,
+    # here, before the loop below starts rewriting declarators and bodies:
+    # every name a namespace declares has to be in hand at the same time,
+    # since a body in one header names a class from another, and the `ns::`
+    # on the declarator does not survive the first block that touches it.
+    ns_names = {}
+    for _m in _NAMESPACE.finditer(scan):
+        _open = scan.index("{", _m.start())
+        _close = _match(scan, _open, "{", "}")
+        if _close is None:
+            continue
+        ns_names.setdefault(_m.group(1), set()).update(
+            _declared_in(scan[_open + 1:_close]))
+    for _ns in sorted(ns_names):
+        text = _rename_in_qualified_defs(text, _blank_like(text), _ns,
+                                         ns_names[_ns])
+    scan = _blank_like(text)
+
     # Innermost first, so an inner block is flattened before the outer one
     # renames through it.
     while True:
@@ -1276,6 +1295,72 @@ def _blank_braced(text):
 
 
 _TEMPLATE_HEAD = re.compile(r"template\s*<[^<>]*>")
+
+
+def _rename_in_qualified_defs(text, scan, ns, names):
+    """Rewrite `names` to `ns_name` inside out-of-line definitions of `ns`.
+
+    litehtml writes almost every definition as
+
+        void litehtml::css::parse_selectors(..) { .. css_selector .. }
+
+    rather than reopening `namespace litehtml { }`. C++ looks names up in
+    the enclosing namespace of the qualified declarator, so the unqualified
+    `css_selector` in that body is `litehtml::css_selector` -- but nothing
+    here modelled that, so the body kept a bare name that no longer existed
+    once the namespace was flattened.
+
+    It only surfaced where something demanded a *known* class: `new
+    css_selector` reported a class not defined in this file, while the same
+    expression inside `namespace litehtml { }` a few files over lowered
+    fine. Every other unqualified reference in these bodies was equally
+    unflattened and simply had not been asked about yet.
+
+    A definition is recognised by its *class*, not by a `ns::` prefix. The
+    prefix is unreliable: by the time the block declaring `css_selector` is
+    reached, an earlier block has already been over this declarator and
+    `litehtml::css::parse_selectors` reads plainly as `css::parse_selectors`.
+    The class name survives that, so `X::f(..) {` with `X` declared in `ns`
+    is what identifies the body -- which is also the rule C++ itself uses.
+
+    Called once with every name `ns` declares, before the flattening loop
+    starts rewriting either the declarators or the bodies.
+    """
+    if not names:
+        return text
+    head = re.compile(r"(?<![\w:])(?:%s\s*::\s*)?(\w+)\s*::\s*~?\w+\s*\("
+                      % re.escape(ns))
+    pos = 0
+    while True:
+        m = head.search(scan, pos)
+        if m is None:
+            return text
+        pos = m.end()
+        if m.group(1) not in names:
+            continue                     # not a class this namespace owns
+        close = _match(scan, m.end() - 1, "(", ")")
+        if close is None:
+            continue
+        j = close + 1
+        # `const`, `noexcept`, an initialiser list -- skip to the brace.
+        while j < len(scan) and scan[j] not in "{;":
+            j += 1
+        if j >= len(scan) or scan[j] != "{":
+            continue                     # a declaration, not a definition
+        end = _match(scan, j, "{", "}")
+        if end is None:
+            continue
+        body = text[j + 1:end]
+        new = body
+        for name in sorted(names, key=len, reverse=True):
+            if name.startswith(ns + "_"):
+                continue
+            new = _sub_name(new, _blank_like(new), name, "%s_%s" % (ns, name))
+        if new != body:
+            text = text[:j + 1] + new + text[end:]
+            scan = _blank_like(text)
+            pos = j + 1                  # offsets are stable: same length
+    return text
 
 
 def _rename_in_blocks(text, scan, ns, names):

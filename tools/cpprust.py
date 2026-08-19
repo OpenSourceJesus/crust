@@ -2929,13 +2929,17 @@ def _stmt_end(text, i):
 
 
 class _Frame(object):
-    __slots__ = ("live", "kind", "ret", "vals")
+    __slots__ = ("live", "kind", "ret", "vals", "ptrs")
 
     def __init__(self, kind, ret):
         self.live = []        # (ctype, vname), in declaration order
         self.kind = kind      # "file" | "func" | "loop" | "switch" | "block"
         self.ret = ret        # enclosing function's return type
         self.vals = {}        # class-typed locals: vname -> class
+        # Names in `vals` that are already pointers -- a reference parameter
+        # after lowering, and `this`. They name an object just as a local
+        # does, but reaching it needs a dereference rather than an address.
+        self.ptrs = set()
 
 
 def _conv_for(name, scopes, type_info):
@@ -2969,16 +2973,24 @@ def _named_object(expr, scopes, type_info):
     if not parts or not all(re.match(r"^\w+$", p) for p in parts):
         return None
     cls = None
+    is_ptr_base = False
     for fr in reversed(scopes):
         if parts[0] in fr.vals:
             cls = fr.vals[parts[0]]
+            is_ptr_base = parts[0] in fr.ptrs
             break
     if cls is None:
         return None
     out = parts[0]
-    # `this` is a pointer and every field of a class is a value, so only the
-    # first hop off it is an arrow; the rest are dots either way.
-    sep = "->" if parts[0] == "this" else "."
+    # `this` and a lowered reference parameter are pointers; every field of
+    # a class is a value. So only the first hop off a pointer is an arrow,
+    # and the rest are dots either way.
+    sep = "->" if (parts[0] == "this" or is_ptr_base) else "."
+    if is_ptr_base and len(parts) == 1:
+        # Named on its own rather than reached through: the caller wants an
+        # object, and `&(*p)` is `p` -- written out so the address the
+        # caller takes is the one it wants rather than the pointer's own.
+        out = "(*%s)" % parts[0]
     for fld in parts[1:]:
         info = type_info.get(cls)
         if info is None or fld not in info["fields"]:
@@ -3322,7 +3334,12 @@ def _rewrite_scopes(text, type_info):
     # `b = a;` on a bare name, checked against the class-typed locals in
     # scope. Compound assignments are not matched: `+=` on a class is not a
     # copy, and C would reject it anyway.
-    assign_re = re.compile(r"(?<![\w.>])(\w+)\s*=(?!=)\s*([^;]+);")
+    # The left side may be a member chain (`this->css_baseurl`), not just a
+    # bare local: litehtml assigns to its own fields constantly, and a
+    # pattern that only matched a bare name left every one of those to fall
+    # through as a plain struct assignment.
+    assign_re = re.compile(
+        r"(?<![\w.>])(\w+(?:\s*(?:\.|->)\s*\w+)*)\s*=(?!=)\s*([^;]+);")
     # `int w = dv;` / `w = dv;` where `dv` is a class with `operator T()`.
     # A conversion is applied only where the target type is *written*: this
     # pass reads types by their spelling, so a written one is exactly what it
@@ -3439,6 +3456,21 @@ def _rewrite_scopes(text, type_info):
                     tm = re.match(r"^(?:const\s+)?(\w+)\s*\*\s*this$", first)
                     if tm and tm.group(1) in type_info:
                         fr.vals["this"] = tm.group(1)
+                    # A reference parameter of class type. Reference lowering
+                    # has already turned `const string &s` into
+                    # `const string *s`, so it is a pointer here -- but it
+                    # still names an object, and a body assigning or copying
+                    # from one was refused for want of anything to name.
+                    # Recorded in `ptrs`, not `live`: the callee borrows it
+                    # and must not destroy it.
+                    for part in _split_top(_params_at(look, i) or ""):
+                        pm = re.match(r"^(?:const\s+)?(\w+)\s*\*\s*(\w+)$",
+                                      part.strip())
+                        if pm is None or pm.group(2) == "this":
+                            continue
+                        if pm.group(1) in type_info:
+                            fr.vals[pm.group(2)] = pm.group(1)
+                            fr.ptrs.add(pm.group(2))
                 scopes.append(fr)
             out.append(text[i])
             i += 1
@@ -3824,11 +3856,28 @@ def _rewrite_scopes(text, type_info):
         if m and not aggs:
             lhs = m.group(1)
             ctype = None
-            for fr in reversed(scopes):
-                if lhs in fr.vals:
-                    ctype = fr.vals[lhs]
-                    break
+            # `_named_object` resolves a bare local and a member chain alike,
+            # and hands back the path to write -- which for a lowered
+            # reference parameter is a dereference rather than the name.
+            lfound = _named_object(lhs, scopes, type_info)
+            # A chain ending in a scalar field resolves fine and names no
+            # class; everything below reads `type_info[ctype]`, so only a
+            # class it knows is taken.
+            if lfound is not None and lfound[1] in type_info:
+                lhs, ctype = lfound
             info_a = type_info.get(ctype) if ctype is not None else None
+            if info_a is not None and info_a["dtor"] and 0 in info_a["ctors"] \
+                    and m.group(2).strip() in ("nullptr", "NULL"):
+                # `p = nullptr;` on an owning class -- release what is held
+                # and leave a default-constructed object, which is what
+                # `shared_ptr::operator=(nullptr_t)` does. Without this the
+                # struct was overwritten with zeroes and whatever it owned
+                # was never freed.
+                out.append("%s(&%s); %s(&%s);"
+                           % (_dropfn(info_a, ctype), lhs,
+                              info_a["ctors"][0]["fn"], lhs))
+                i = m.end()
+                continue
             moved = _move_operand(m.group(2)) if info_a is not None else None
             if moved is not None and (info_a["moveassign"] or info_a["assign"]):
                 # `b = std::move(a);`. With no `operator=(T &&)` the const-ref
