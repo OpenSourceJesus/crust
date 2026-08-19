@@ -3001,6 +3001,23 @@ def _named_object(expr, scopes, type_info):
             is_ptr_base = parts[0] in fr.ptrs
             break
     if cls is None:
+        # A bare field of the class being written in. Field qualification
+        # puts `this->` in front of one inside a class body, but litehtml
+        # defines nearly every method out of line -- `void box::add_element()`
+        # -- and those bodies are never rewritten, so `m_items` arrives
+        # exactly as written. `this` is in scope either way, and C++ reads
+        # the bare name as a member of it.
+        for fr in reversed(scopes):
+            if "this" in fr.vals:
+                tinfo = type_info.get(fr.vals["this"])
+                if tinfo is not None and parts[0] in tinfo["fields"]:
+                    fcls, fptr = tinfo["fields"][parts[0]]
+                    if not fptr:
+                        parts = ["this"] + parts
+                        cls = fr.vals["this"]
+                        is_ptr_base = True
+                break
+    if cls is None:
         return None
     out = parts[0]
     # `this` and a lowered reference parameter are pointers; every field of
