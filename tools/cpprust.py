@@ -2969,6 +2969,27 @@ def _named_object(expr, scopes, type_info):
     if expr is None:
         return None
     expr = expr.strip()
+    # `v[i]` -- a subscript names an element, and `operator[]` returns a
+    # reference precisely so that it does. The element type is read off that
+    # return rather than assumed, and the expression is handed back as
+    # written: the call pass rewrites `v[i]` to `*v__index(&v, i)` later, so
+    # an `&` taken here lands on the element either way.
+    sub_m = re.match(r"^(\w+(?:\s*(?:\.|->)\s*\w+)*)\s*\[([^\[\]]*)\]$", expr)
+    if sub_m is not None:
+        base = _named_object(sub_m.group(1), scopes, type_info)
+        if base is None:
+            return None
+        binfo = type_info.get(base[1])
+        if binfo is None or not binfo.get("index"):
+            return None
+        # Emitted in its lowered form rather than left as `v[i]`: this pass
+        # runs after the one that rewrites subscripts, so a `v[i]` written
+        # here would survive into the C output, where it is a subscript on a
+        # struct.
+        return ("(*%s(%s, %s))"
+                % (binfo["index"]["fn"], _addr_of_expr(base[0]),
+                   sub_m.group(2)),
+                binfo["index"]["ret"])
     parts = [p for p in re.split(r"\s*(?:\.|->)\s*", expr) if p]
     if not parts or not all(re.match(r"^\w+$", p) for p in parts):
         return None
