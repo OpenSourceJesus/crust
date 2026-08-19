@@ -495,10 +495,45 @@ def _enc_addsub(mnem, ops, base_imm, base_reg):
     raise Arm64Error("%s: unsupported operand form" % mnem)
 
 
+# Logical immediate: sf opc 100100 N immr imms Rn Rd. Only the four base
+# operations have an immediate form -- `bic`/`orn`/`eon` do not, since the
+# assembler would have to invert the immediate, and an inverted value is very
+# often no longer a valid logical immediate at all.
+_LOGIC_IMM = {"and": 0x12000000, "orr": 0x32000000,
+              "eor": 0x52000000, "ands": 0x72000000}
+
+
+def _enc_logic_imm(mnem, ops, rd, rn):
+    """`and/orr/eor/ands Xd, Xn, #imm` -- the bitmask-immediate form.
+
+    Boot code leans on this constantly (`and x0, x0, #3` to take the CPU id
+    out of MPIDR_EL1, `orr x0, x0, #(1 << 31)` to set HCR_EL2.RW), so its
+    absence stops a boot stub at the second instruction.
+    """
+    if mnem not in _LOGIC_IMM:
+        raise Arm64Error("%s: no immediate form; use a register operand"
+                         % mnem)
+    width = 64 if rd.size == 64 else 32
+    v = ops[2].val
+    uv = v & ((1 << width) - 1)
+    bits = _logical_imm_bits(uv, width)
+    if bits < 0:
+        raise Arm64Error("%s: 0x%x is not a valid logical immediate; load it "
+                         "into a register first" % (mnem, v))
+    n = (bits >> 12) & 1
+    immr = (bits >> 6) & 0x3F
+    imms = bits & 0x3F
+    return _w((_LOGIC_IMM[mnem] >> 24, 0xFF, 24), (_sf(rd), 1, 31),
+              (n, 1, 22), (immr, 0x3F, 16), (imms, 0x3F, 10),
+              (rn.num, 0x1F, 5), (rd.num, 0x1F, 0)), []
+
+
 def _enc_logic(mnem, ops):
     base = _LOGIC_REG[mnem]
     rd = _need_reg(ops, 0, mnem)
     rn = _need_reg(ops, 1, mnem)
+    if len(ops) > 2 and ops[2].kind == "imm":
+        return _enc_logic_imm(mnem, ops, rd, rn)
     rm = _need_reg(ops, 2, mnem)
     shift = 0
     amount = 0
@@ -1117,6 +1152,289 @@ def _enc_nop():
 
 
 # ---------------------------------------------------------------------------
+# System instructions
+# ---------------------------------------------------------------------------
+# Everything bare metal needs that ordinary user-mode code never does: reading
+# and writing system registers, barriers, the exception return, TLB and cache
+# maintenance, and PC-relative address formation with `adr`.
+#
+# A system register is identified by five fields (op0, op1, CRn, CRm, op2), and
+# `mrs`/`msr` simply drop them into fixed positions. The table below is the
+# subset the boot, exception and MMU paths use; anything absent can still be
+# written in the architectural `S<op0>_<op1>_C<n>_C<m>_<op2>` form, which
+# `_parse_sysreg` also accepts, so an unlisted register is never a hard wall.
+_SYSREGS = {
+    # -- identification ------------------------------------------------
+    "midr_el1":     (3, 0, 0, 0, 0),
+    "mpidr_el1":    (3, 0, 0, 0, 5),
+    "id_aa64mmfr0_el1": (3, 0, 0, 7, 0),
+    "currentel":    (3, 0, 4, 2, 2),
+    "daif":         (3, 3, 4, 2, 1),
+    # -- exception handling --------------------------------------------
+    "vbar_el1":     (3, 0, 12, 0, 0),
+    "vbar_el2":     (3, 4, 12, 0, 0),
+    "esr_el1":      (3, 0, 5, 2, 0),
+    "esr_el2":      (3, 4, 5, 2, 0),
+    "far_el1":      (3, 0, 6, 0, 0),
+    "far_el2":      (3, 4, 6, 0, 0),
+    "elr_el1":      (3, 0, 4, 0, 1),
+    "elr_el2":      (3, 4, 4, 0, 1),
+    "elr_el3":      (3, 6, 4, 0, 1),
+    "spsr_el1":     (3, 0, 4, 0, 0),
+    "spsr_el2":     (3, 4, 4, 0, 0),
+    "spsr_el3":     (3, 6, 4, 0, 0),
+    "sp_el0":       (3, 0, 4, 1, 0),
+    "sp_el1":       (3, 4, 4, 1, 0),
+    # -- control -------------------------------------------------------
+    "sctlr_el1":    (3, 0, 1, 0, 0),
+    "sctlr_el2":    (3, 4, 1, 0, 0),
+    "cpacr_el1":    (3, 0, 1, 0, 2),
+    "hcr_el2":      (3, 4, 1, 1, 0),
+    "scr_el3":      (3, 6, 1, 1, 0),
+    # -- translation ---------------------------------------------------
+    "ttbr0_el1":    (3, 0, 2, 0, 0),
+    "ttbr1_el1":    (3, 0, 2, 0, 1),
+    "tcr_el1":      (3, 0, 2, 0, 2),
+    "mair_el1":     (3, 0, 10, 2, 0),
+    # -- timer / thread ------------------------------------------------
+    # The generic timer is the only interrupt source a bare-metal image gets
+    # for free: no device tree, no driver, just three registers per timer.
+    # CTL is the enable/mask/status word, TVAL a countdown the hardware
+    # decrements, CVAL an absolute compare value against the counter.
+    "cntfrq_el0":   (3, 3, 14, 0, 0),
+    "cntpct_el0":   (3, 3, 14, 0, 1),
+    "cntvct_el0":   (3, 3, 14, 0, 2),
+    "cntp_tval_el0": (3, 3, 14, 2, 0),
+    "cntp_ctl_el0": (3, 3, 14, 2, 1),
+    "cntp_cval_el0": (3, 3, 14, 2, 2),
+    "cntv_tval_el0": (3, 3, 14, 3, 0),
+    "cntv_ctl_el0": (3, 3, 14, 3, 1),
+    "cntv_cval_el0": (3, 3, 14, 3, 2),
+    "cntkctl_el1":  (3, 0, 14, 1, 0),
+    "cnthctl_el2":  (3, 4, 14, 1, 0),
+    "cntvoff_el2":  (3, 4, 14, 0, 3),
+    # Interrupt Status: which of I/F/A is pending, readable without taking
+    # the exception. Useful for a polled sanity check before unmasking.
+    "isr_el1":      (3, 0, 12, 1, 0),
+    "tpidr_el0":    (3, 3, 13, 0, 2),
+    "tpidr_el1":    (3, 0, 13, 0, 4),
+}
+
+
+def _sysreg_text(op):
+    """The raw text of an operand that should name a system register."""
+    if op.kind == "sym":
+        return op.sym
+    if op.text != "":
+        return op.text
+    return ""
+
+
+def _parse_sysreg(name):
+    """(op0, op1, CRn, CRm, op2) for a system register name, or None.
+
+    Accepts a known name or the architectural `S<op0>_<op1>_C<n>_C<m>_<op2>`
+    escape hatch, so a register missing from the table above is still
+    reachable without editing this file.
+    """
+    low = name.lower()
+    if low in _SYSREGS:
+        return _SYSREGS[low]
+    if low[0:1] != "s":
+        return None
+    parts = low[1:].split("_")
+    if len(parts) != 5:
+        return None
+    vals = []
+    for i in range(5):
+        p = parts[i]
+        # CRn and CRm are written `c4`; op0/op1/op2 are bare digits.
+        if i in (2, 3):
+            if p[0:1] != "c":
+                return None
+            p = p[1:]
+        if not _all_digits(p):
+            return None
+        vals.append(int(p))
+    if vals[0] not in (2, 3):
+        return None
+    return (vals[0], vals[1], vals[2], vals[3], vals[4])
+
+
+# `msr <pstatefield>, #imm` is a different encoding from `msr <sysreg>, <Xt>`:
+# the immediate form addresses a PSTATE field, not a register file entry.
+# op1 and op2 select the field; CRn is fixed at 0b0100.
+_PSTATE_FIELDS = {
+    "spsel":   (0, 5),
+    "daifset": (3, 6),
+    "daifclr": (3, 7),
+}
+
+
+def _enc_msr_mrs(mnem, ops):
+    """`mrs Xt, sysreg` / `msr sysreg, Xt` / `msr pstatefield, #imm`."""
+    if len(ops) < 2:
+        raise Arm64Error("%s: needs two operands" % mnem)
+
+    if mnem == "mrs":
+        rt = _need_reg(ops, 0, "mrs")
+        if rt.size != 64:
+            raise Arm64Error("mrs: destination must be a 64-bit register")
+        name = _sysreg_text(ops[1])
+        el = 1
+        rt_num = rt.num
+    else:
+        name = _sysreg_text(ops[0])
+        # PSTATE immediate form, e.g. `msr daifset, #2`.
+        low = name.lower()
+        if low in _PSTATE_FIELDS:
+            op1, op2 = _PSTATE_FIELDS[low]
+            crm = _need_imm(ops, 1, "msr")
+            if crm < 0 or crm > 15:
+                raise Arm64Error("msr %s: immediate must be 0..15" % low)
+            word = _w((0xD5000000 >> 24, 0xFF, 24), (0, 1, 21),
+                      (op1, 0x7, 16), (4, 0xF, 12), (crm, 0xF, 8),
+                      (op2, 0x7, 5), (0x1F, 0x1F, 0))
+            return word, []
+        rt = _need_reg(ops, 1, "msr")
+        if rt.size != 64:
+            raise Arm64Error("msr: source must be a 64-bit register")
+        el = 0
+        rt_num = rt.num
+
+    if name == "":
+        raise Arm64Error("%s: expected a system register name" % mnem)
+    fields = _parse_sysreg(name)
+    if fields is None:
+        raise Arm64Error("%s: unknown system register '%s'" % (mnem, name))
+    op0, op1, crn, crm, op2 = fields
+    # 1101 0101 00 L op0 op1 CRn CRm op2 Rt -- L=1 reads (mrs), L=0 writes.
+    word = _w((0xD5000000 >> 24, 0xFF, 24), (el, 1, 21), (op0, 0x3, 19),
+              (op1, 0x7, 16), (crn, 0xF, 12), (crm, 0xF, 8),
+              (op2, 0x7, 5), (rt_num, 0x1F, 0))
+    return word, []
+
+
+# Barrier options, in encoding order; `sy` (full system) is the default and
+# the only one the boot path needs, but the rest are cheap to accept.
+_BARRIER_OPTS = {
+    "oshld": 1, "oshst": 2, "osh": 3,
+    "nshld": 5, "nshst": 6, "nsh": 7,
+    "ishld": 9, "ishst": 10, "ish": 11,
+    "ld": 13, "st": 14, "sy": 15,
+}
+_BARRIERS = {"dsb": 4, "dmb": 5, "isb": 6}
+
+
+def _enc_barrier(mnem, ops):
+    """`isb`, `dsb <opt>`, `dmb <opt>` -- CRm carries the option."""
+    crm = 15                                    # `sy` when omitted
+    if len(ops) > 0:
+        if ops[0].kind == "imm":
+            crm = ops[0].val
+        else:
+            opt = _sysreg_text(ops[0]).lower()
+            if opt not in _BARRIER_OPTS:
+                raise Arm64Error("%s: unknown barrier option '%s'"
+                                 % (mnem, opt))
+            crm = _BARRIER_OPTS[opt]
+    if crm < 0 or crm > 15:
+        raise Arm64Error("%s: barrier option out of range" % mnem)
+    word = _w((0xD5033000 >> 12, 0xFFFFF, 12), (crm, 0xF, 8),
+              (_BARRIERS[mnem], 0x7, 5), (0x1F, 0x1F, 0))
+    return word, []
+
+
+# The hint space. `nop` is hint 0 and already has its own encoder; the rest
+# matter for parking a core (`wfi`/`wfe`) in the boot path.
+_HINTS = {"nop": 0, "yield": 1, "wfe": 2, "wfi": 3, "sev": 4, "sevl": 5}
+
+
+def _enc_hint(mnem, ops):
+    # Shifting the full constant right by 12 to get the base drops the fixed
+    # Rt=31 in the low five bits, so it is restored explicitly here -- the
+    # same trap the _FP_DP2 table comments warn about.
+    return _w((0xD503201F >> 12, 0xFFFFF, 12), (_HINTS[mnem], 0x7F, 5),
+              (0x1F, 0x1F, 0)), []
+
+
+def _enc_eret(ops):
+    return 0xD69F03E0, []
+
+
+# TLB and cache maintenance share one encoding with the register-argument
+# system instructions: 1101 0101 0000 1 op1 CRn CRm op2 Rt, with Rt = 31 when
+# the operation takes no register.
+_SYS_OPS = {
+    ("tlbi", "vmalle1"):   (0, 8, 7, 0),
+    ("tlbi", "vmalle1is"): (0, 8, 3, 0),
+    ("tlbi", "alle1"):     (4, 8, 7, 4),
+    ("tlbi", "alle1is"):   (4, 8, 3, 4),
+    ("tlbi", "alle2"):     (4, 8, 7, 0),
+    ("tlbi", "vae1"):      (0, 8, 7, 1),
+    ("tlbi", "vae1is"):    (0, 8, 3, 1),
+    ("tlbi", "aside1"):    (0, 8, 7, 2),
+    ("tlbi", "vaae1"):     (0, 8, 7, 3),
+    ("ic",   "ialluis"):   (0, 7, 1, 0),
+    ("ic",   "iallu"):     (0, 7, 5, 0),
+    ("ic",   "ivau"):      (3, 7, 5, 1),
+    ("dc",   "ivac"):      (0, 7, 6, 1),
+    ("dc",   "isw"):       (0, 7, 6, 2),
+    ("dc",   "csw"):       (0, 7, 10, 2),
+    ("dc",   "cisw"):      (0, 7, 14, 2),
+    ("dc",   "zva"):       (3, 7, 4, 1),
+    ("dc",   "cvac"):      (3, 7, 10, 1),
+    ("dc",   "cvau"):      (3, 7, 11, 1),
+    ("dc",   "civac"):     (3, 7, 14, 1),
+}
+# Operations that take a register argument; the rest encode Rt = 31.
+_SYS_NEEDS_REG = {
+    ("tlbi", "vae1"), ("tlbi", "vae1is"), ("tlbi", "aside1"),
+    ("tlbi", "vaae1"), ("ic", "ivau"),
+    ("dc", "ivac"), ("dc", "isw"), ("dc", "csw"), ("dc", "cisw"),
+    ("dc", "zva"), ("dc", "cvac"), ("dc", "cvau"), ("dc", "civac"),
+}
+
+
+def _enc_sysinstr(mnem, ops):
+    """`tlbi <op>[, Xt]`, `ic <op>[, Xt]`, `dc <op>, Xt`."""
+    if len(ops) < 1:
+        raise Arm64Error("%s: needs an operation" % mnem)
+    opname = _sysreg_text(ops[0]).lower()
+    key = (mnem, opname)
+    if key not in _SYS_OPS:
+        raise Arm64Error("%s: unsupported operation '%s'" % (mnem, opname))
+    op1, crn, crm, op2 = _SYS_OPS[key]
+    rt = 31
+    if key in _SYS_NEEDS_REG:
+        if len(ops) < 2:
+            raise Arm64Error("%s %s: needs a register operand"
+                             % (mnem, opname))
+        rt = _need_reg(ops, 1, mnem).num
+    elif len(ops) > 1:
+        raise Arm64Error("%s %s: takes no register operand" % (mnem, opname))
+    word = _w((0xD5080000 >> 19, 0x1FFF, 19), (op1, 0x7, 16), (crn, 0xF, 12),
+              (crm, 0xF, 8), (op2, 0x7, 5), (rt, 0x1F, 0))
+    return word, []
+
+
+def _enc_adr(ops):
+    """`adr Xd, label` -- PC-relative, +/-1 MiB, no page rounding.
+
+    Unlike `adrp` this needs no companion `add`, which is what makes it the
+    natural way for the boot stub to find the stack top and the vector table
+    before any of the addressing machinery is up.
+    """
+    rd = _need_reg(ops, 0, "adr")
+    if rd.size != 64:
+        raise Arm64Error("adr: destination must be a 64-bit register")
+    if len(ops) < 2 or _not_label(ops, 1):
+        raise Arm64Error("adr: second operand must be a symbol")
+    word = _w((0x10000000 >> 24, 0xFF, 24), (rd.num, 0x1F, 0))
+    return word, [rasm.Reloc(0, ops[1].sym, 4, True, 0, False, "adr_prel_lo21")]
+
+
+# ---------------------------------------------------------------------------
 # Top-level dispatch
 # ---------------------------------------------------------------------------
 def encode(mnem, ops):
@@ -1137,6 +1455,18 @@ def encode(mnem, ops):
         return _enc_svc(ops)
     if m == "adrp":
         return _enc_adrp(ops)
+    if m == "adr":
+        return _enc_adr(ops)
+    if m == "mrs" or m == "msr":
+        return _enc_msr_mrs(m, ops)
+    if m in _BARRIERS:
+        return _enc_barrier(m, ops)
+    if m in _HINTS:
+        return _enc_hint(m, ops)
+    if m == "eret":
+        return _enc_eret(ops)
+    if m == "tlbi" or m == "ic" or m == "dc":
+        return _enc_sysinstr(m, ops)
     if m == "cbz" or m == "cbnz":
         return _enc_cbz(m, ops)
     if m == "tbz" or m == "tbnz":

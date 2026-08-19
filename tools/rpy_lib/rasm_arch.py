@@ -51,6 +51,12 @@ R_AARCH64_PREL32 = 261
 # Page-relative address materialization: adrp gives the +/-4GB page delta in
 # 21 bits, a following add/ldr supplies the 12-bit offset within that page.
 R_AARCH64_ADR_PREL_PG_HI21 = 275
+# Plain PC-relative address, no page rounding: `adr Xd, sym` reaches +/-1MB and
+# needs no companion `add`. Distinct from ADR_PREL_PG_HI21 above, which is the
+# adrp form. Without this the kind falls through to the data path and becomes a
+# PREL32 -- a 32-bit write that overwrites the whole instruction word instead
+# of splicing an immediate into it, turning the `adr` into a `udf`.
+R_AARCH64_ADR_PREL_LO21 = 274
 R_AARCH64_ADD_ABS_LO12_NC = 277
 # Branches. TSTBR14 is tbz/tbnz, CONDBR19 is b.<cc>/cbz/cbnz, JUMP26 is b,
 # CALL26 is bl. The last two share an encoding but keep distinct types.
@@ -178,6 +184,8 @@ class Arm64Arch(Arch):
             return R_AARCH64_TSTBR14
         if kind == "adr_pg_hi21":
             return R_AARCH64_ADR_PREL_PG_HI21
+        if kind == "adr_prel_lo21":
+            return R_AARCH64_ADR_PREL_LO21
         if kind == "add_lo12":
             return R_AARCH64_ADD_ABS_LO12_NC
         if kind == "ldst8_lo12":

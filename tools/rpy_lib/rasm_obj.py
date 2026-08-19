@@ -22,6 +22,7 @@ Kept flat and RPython-friendly (uniform record classes, explicit byte lists).
 import rasm
 import rasm_arch
 import rasm_arm64
+import rasm_macro
 import rasm_riscv
 
 
@@ -444,7 +445,17 @@ class Assembler(object):
 
     def assemble(self, text):
         rasm.set_mode(64)
-        lines = _strip_block_comments(text).split("\n")
+        text = _strip_block_comments(text)
+        # `.macro` is what makes a 16-slot exception vector table writable
+        # without sixteen copies of the same prologue. rasm_macro has always
+        # been able to expand it, but nothing called it, so a `.macro` in real
+        # input reached the encoder with `\arg` unsubstituted and failed as an
+        # unsupported operand form -- pointing at the instruction rather than
+        # at the missing expansion. Expansion runs after block comments are
+        # stripped so a commented-out `.endm` cannot end a macro early.
+        if rasm_macro.has_macros(text):
+            text = rasm_macro.expand(text)
+        lines = text.split("\n")
         i = 0
         while i < len(lines):
             self._line(lines[i])
