@@ -174,7 +174,8 @@ def assemble(src, obj):
 
 
 def build(app_sources, out_elf, objdir, script=None, extra_os=None,
-          gnu_ld=False, board="virt", extra_defines=None):
+          gnu_ld=False, board="virt", extra_defines=None,
+          vectors=None, extra_asm=None):
     prof = BOARDS[board]
     os.makedirs(objdir, exist_ok=True)
     script = script or os.path.join(BAREMETAL, prof["script"])
@@ -183,14 +184,26 @@ def build(app_sources, out_elf, objdir, script=None, extra_os=None,
 
     # Boot stub first: it must be the first object so .text.boot -- and so
     # _start -- lands at the image's entry address.
-    asm_sources = OS_ASM
+    asm_sources = list(OS_ASM)
+    if vectors:
+        asm_sources = [vectors if n == "vectors_arm64.S" else n
+                       for n in asm_sources]
+    asm_sources = asm_sources + list(extra_asm or [])
     if not prof["irq"]:
         asm_sources = [n for n in asm_sources if n != "timer_arm64.S"]
     for name in asm_sources:
-        obj = os.path.join(objdir, name.replace(".", "_") + ".o")
-        assemble(os.path.join(BAREMETAL, name), obj)
+        obj = os.path.join(objdir, os.path.basename(name).replace(".", "_")
+                           + ".o")
+        # A bare name is a file in baremetal64/; anything that exists as
+        # given (an absolute path, or one relative to the invocation) is used
+        # as-is, so generated assembly can be pulled in from a build dir.
+        if os.path.isabs(name) or os.path.exists(name):
+            src_path = name
+        else:
+            src_path = os.path.join(BAREMETAL, name)
+        assemble(src_path, obj)
         objs.append(obj)
-        log("rasm    ", name)
+        log("rasm    ", os.path.basename(name))
 
     sources = extra_os or (OS_SOURCES + [prof["console"]])
     if prof["irq"] and prof.get("intc"):
@@ -264,6 +277,9 @@ def main(argv):
     do_run = False
     gnu_ld = False
     board = "virt"
+    vectors = None
+    extra_asm = []
+    defines = []
     machine = "virt"
     cpu = "cortex-a57"
     i = 0
@@ -274,6 +290,20 @@ def main(argv):
             i += 1
         elif a == "--run":
             do_run = True
+        elif a == "--vectors":
+            # Swap the vector table, e.g. for the register-partitioned
+            # preemptive scheduler whose IRQ slot branches to a generated
+            # switcher instead of the generic exc_common path.
+            vectors = args[i + 1]
+            i += 1
+        elif a == "-D":
+            defines.append(args[i + 1])
+            i += 1
+        elif a[0:2] == "-D" and len(a) > 2:
+            defines.append(a[2:])
+        elif a == "--extra-asm":
+            extra_asm.append(args[i + 1])
+            i += 1
         elif a == "--gnu-ld":
             gnu_ld = True
         elif a == "--board":
@@ -307,7 +337,8 @@ def main(argv):
     out = out or os.path.join(ROOT, "build", "arm64bm", "kernel.elf")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     objdir = os.path.join(os.path.dirname(out), "obj")
-    build(sources, out, objdir, gnu_ld=gnu_ld, board=board)
+    build(sources, out, objdir, gnu_ld=gnu_ld, board=board,
+          vectors=vectors, extra_asm=extra_asm, extra_defines=defines)
 
     if do_run:
         prof = BOARDS[board]
