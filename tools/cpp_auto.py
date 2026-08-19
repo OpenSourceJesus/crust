@@ -523,6 +523,33 @@ def _is_type_spelling(inner, ctx):
     return True
 
 
+def _chain_type_ctx(expr, ctx):
+    """The written type of a `a.b.c` chain, from context alone.
+
+    `_chain_type` is the same walk but needs `scan` and a position, so it
+    can fall back to a field of the enclosing class. `_deduce` has neither
+    -- it is handed an expression and a context -- and a chain whose head is
+    a declared local or parameter needs no more than that.
+    """
+    classes, _methods, fields, _tp, _funcs, vars_, aliases = ctx
+    parts = [p for p in re.split(r"\s*(?:\.|->)\s*", expr) if p]
+    if not parts:
+        return None
+    ty = _resolve_alias(vars_.get(parts[0], "") or "", aliases)
+    if not ty:
+        return None
+    for step in parts[1:]:
+        base = re.sub(r"[*&\s]+$", "", ty).split("<")[0].strip()
+        if base not in classes:
+            base = next((k for k in classes if k.endswith("_" + base)), base)
+            if base not in classes:
+                return None
+        ty = _resolve_alias(fields.get(base, {}).get(step, "") or "", aliases)
+        if not ty:
+            return None
+    return ty
+
+
 def _deduce(expr, ctx, where):
     """The written type of `expr`, or raise `AutoError` naming why not."""
     classes, methods, fields, tparams, funcs, vars_, aliases = ctx
@@ -606,10 +633,17 @@ def _deduce(expr, ctx, where):
 
     # `recv.method(..)` / `recv->method(..)` -- one level, and the receiver
     # has to be something whose type is written.
-    m = re.match(r"^([A-Za-z_]\w*)\s*(?:\.|->)\s*(\w+)\s*\(", e)
+    m = re.match(r"^([A-Za-z_]\w*(?:\s*(?:\.|->)\s*\w+)*)\s*(?:\.|->)\s*"
+                 r"(\w+)\s*\(", e)
     if m and _match(e, e.index("("), "(", ")") == len(e) - 1:
         recv, meth = m.group(1), m.group(2)
         rty = _resolve_alias(vars_.get(recv) or "", aliases)
+        if not rty and re.search(r"\.|->", recv):
+            # A chain receiver -- `src.m_properties.at_index(i)`. Reading
+            # only a bare name meant a method called on a *field* could not
+            # be typed, which is what a range-`for` over a member container
+            # produces once it binds the element.
+            rty = _chain_type_ctx(recv, ctx) or ""
         if rty:
             base = re.sub(r"[*&\s]+$", "", rty).split("<")[0].strip()
             ret = methods.get(base, {}).get(meth)
@@ -848,7 +882,14 @@ def _chain_type(expr, scan, ctx, idx):
     for step in parts[1:]:
         base = re.sub(r"[*&\s]+$", "", ty).split("<")[0].strip()
         if base not in classes:
-            return None
+            # A parameter of an out-of-line definition keeps the spelling it
+            # was written with -- `const style& src` -- while the class it
+            # names became `litehtml_style` when the namespace was
+            # flattened. The declarator is not rewritten, so the two only
+            # meet if a flattened spelling is accepted here.
+            base = next((k for k in classes if k.endswith("_" + base)), base)
+            if base not in classes:
+                return None
         ty = _resolve_alias(fields.get(base, {}).get(step, ""), aliases)
         if not ty:
             return None

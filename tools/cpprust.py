@@ -3930,6 +3930,22 @@ def _rewrite_scopes(text, type_info):
                         "so there is no result to assign onward."
                         % (lhs, rhs))
                 src = _copy_source(rhs, ctype, scopes, type_info)
+                if src is None and 1 in info_a["ctors"] and \
+                        _converting_operand(rhs, scopes, type_info):
+                    # `str = name;` where `name` is a `const char *`. C++
+                    # builds a temporary through the one-argument
+                    # constructor and assigns from it; written out, that is
+                    # exactly this. The temporary is destroyed straight
+                    # after, so nothing outlives the statement.
+                    tmpn = "__cpp_cv%d" % mvn[0]
+                    mvn[0] += 1
+                    out.append("{ %s %s; %s(&%s, %s); %s__assign(&%s, &%s); "
+                               "%s(&%s); }"
+                               % (ctype, tmpn, info_a["ctors"][1]["fn"],
+                                  tmpn, rhs, ctype, lhs, tmpn,
+                                  _dropfn(info_a, ctype), tmpn))
+                    i = m.end()
+                    continue
                 if src is None and _is_call_result(rhs):
                     # `a = f();` -- the callee returned by value, which is a
                     # move *out* of its local, so there is no second owner
