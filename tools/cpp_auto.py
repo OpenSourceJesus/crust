@@ -368,7 +368,19 @@ _TYPEDEF = re.compile(r"(?<![\w.])typedef\s+([^;{}]+);")
 _USING_ALIAS = re.compile(r"(?<![\w.])using\s+(\w+)\s*=\s*([^;{}]+);")
 
 
-def _scan_typedefs(scan):
+def _class_body(scan, name):
+    """The text between the braces of `class`/`struct` `name`, or None."""
+    m = re.search(r"(?<![\w])(?:class|struct)\s+%s\s*(?::[^{;]*)?\{"
+                  % re.escape(name), scan)
+    if m is None:
+        return None
+    close = _match(scan, m.end() - 1, "{", "}")
+    if close is None:
+        return None
+    return scan[m.end():close]
+
+
+def _scan_typedefs(scan, owner=None):
     """`{alias: target}` for type aliases at file scope.
 
     **Depth zero only.** A typedef inside a class body is scoped to it, and
@@ -377,7 +389,16 @@ def _scan_typedefs(scan):
     supplied template of that name. Namespaces are flattened before this
     runs, so a namespace-scope alias is already at depth zero and is picked
     up; a class-scoped one is left alone rather than half-understood.
+
+    `owner` asks for the aliases of one class instead: the body of that
+    class is scanned at its own depth zero, so `typedef std::vector<..> rows;`
+    inside `table_grid` is found without `rows` becoming a file-wide name.
+    That is what lets a field declared `rows m_cells;` be walked -- without
+    it the field's type resolved to the alias itself, which names no class.
     """
+    if owner is not None:
+        body = _class_body(scan, owner)
+        return _scan_typedefs(body) if body is not None else {}
     out, depth, i, n = {}, 0, 0, len(scan)
     while i < n:
         c = scan[i]
@@ -781,7 +802,26 @@ def _enclosing_class(scan, idx):
         # Innermost wins: a nested class's body is inside its outer's.
         if best is None or open_idx > best[1]:
             best = (m.group(1), open_idx)
-    return best[0] if best else None
+    if best is not None:
+        return best[0]
+    # No lexically enclosing class body -- but an out-of-line definition,
+    # `void table_grid::clear() { .. }`, is just as much inside one. C++
+    # looks a bare `m_cells` there up in `table_grid`, and litehtml writes
+    # nearly every method that way, so without this a member reference in
+    # one resolved to nothing at all.
+    for m in re.finditer(r"(?<![\w:])(\w+)\s*::\s*~?\w+\s*\(", scan):
+        close = _match(scan, m.end() - 1, "(", ")")
+        if close is None:
+            continue
+        j = close + 1
+        while j < len(scan) and scan[j] not in "{;":
+            j += 1
+        if j >= len(scan) or scan[j] != "{":
+            continue                     # a declaration, not a definition
+        end = _match(scan, j, "{", "}")
+        if end is not None and j < idx < end:
+            return m.group(1)
+    return None
 
 
 def _chain_type(expr, scan, ctx, idx):
@@ -878,21 +918,31 @@ def resolve_range_for(text, path="<cpp>", blank=None):
         alen = _array_len(rng, scan)
         cls = None
         chain = bool(re.search(r"\.|->", rng))
+        # A class-scoped typedef is invisible at file scope by design, so
+        # the aliases of the class being written in are added here. The name
+        # comes off an out-of-line declarator (`table_grid::clear`), which
+        # namespace flattening leaves unqualified while the class itself
+        # became `litehtml_table_grid` -- so a flattened spelling is
+        # accepted too rather than the owner silently not being found.
+        _own = _enclosing_class(scan, m.start())
+        if _own is not None and _own not in classes:
+            _own = next((k for k in classes if k.endswith("_" + _own)), _own)
+        tmap = dict(_scan_typedefs(scan))
+        if _own:
+            tmap.update(_scan_typedefs(scan, _own))
         if chain:
             vt = _chain_type(rng, scan, (classes, methods, fields, {}, {},
-                                         _declared_types(scan),
-                                         _scan_typedefs(scan)),
+                                         _declared_types(scan), tmap),
                              m.start()) or ""
+            vt = _resolve_alias(vt, tmap)
         else:
-            vt = _resolve_alias(_declared_types(scan).get(rng, ""),
-                                _scan_typedefs(scan))
+            vt = _resolve_alias(_declared_types(scan).get(rng, ""), tmap)
             if not vt:
                 # A bare name inside a method may be a field of the class
                 # being written, which is `this->name` and just as declared.
-                owner = _enclosing_class(scan, m.start())
-                if owner:
-                    vt = _resolve_alias(fields.get(owner, {}).get(rng, ""),
-                                        _scan_typedefs(scan))
+                if _own:
+                    vt = _resolve_alias(fields.get(_own, {}).get(rng, ""),
+                                        tmap)
         cm = re.match(r"^([A-Za-z_]\w*)", vt.strip().lstrip("*"))
         if cm and cm.group(1) in classes:
             cls = cm.group(1)
