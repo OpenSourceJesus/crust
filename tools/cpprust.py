@@ -4244,6 +4244,22 @@ def _param_name(part):
     return toks[-1]
 
 
+def _addr_of_expr(expr):
+    """`&expr`, or `expr` when it is already an address.
+
+    `T_copy` takes a pointer. A copy source is written as a value
+    (`*val.m_left`, `other`), so it normally needs an `&` -- except where
+    the author already dereferenced a pointer, in which case the two cancel
+    and the pointer itself is what to pass.
+    """
+    expr = expr.strip()
+    if expr.startswith("*"):
+        return expr[1:].strip()
+    if expr.startswith("&"):
+        return expr
+    return "&(%s)" % expr
+
+
 def _is_call_result(rhs):
     """Is `rhs` a call -- something whose value was returned to us?
 
@@ -5235,6 +5251,28 @@ def _rewrite_calls(text, cinfo, free_refs):
                 i = end
                 continue
             if ar not in ctors:
+                if ar == 1 and cinfo[tname]["copy"]:
+                    # `new T(other)` -- copy construction. The copy
+                    # constructor is kept apart from `ctors` (it lowers to
+                    # `T_copy`, not `T_new`), so an arity-1 lookup misses it
+                    # and the class looks as if it has no such constructor.
+                    #
+                    # `make_shared<T>(*p)` lowers to exactly this shape, so
+                    # refusing it refused every copy through a smart pointer
+                    # -- `css_selector`'s own copy constructor among them.
+                    #
+                    # Allocate, then copy into the storage: the statement
+                    # expression yields the pointer, which is what `new`
+                    # evaluates to.
+                    csrc = raw.strip()
+                    out.append(
+                        "({ %s *__cpp_nc = %s(); %s_copy(__cpp_nc, %s); "
+                        "__cpp_nc; })"
+                        % (tname, cinfo[tname]["ctors"][0]["alloc"]
+                           if 0 in ctors else "%s__alloc" % tname,
+                           tname, _addr_of_expr(csrc)))
+                    i = end
+                    continue
                 raise CppError(
                     "`new %s(%s)`: %s has no constructor taking %d "
                     "argument%s (it has %s)."
