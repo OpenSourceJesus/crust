@@ -1470,14 +1470,30 @@ def _rename_in_qualified_defs(text, scan, ns, names):
         end = _match(scan, j, "{", "}")
         if end is None:
             continue
+        def _flatten(src):
+            out = src
+            for name in sorted(names, key=len, reverse=True):
+                if name.startswith(ns + "_"):
+                    continue
+                out = _sub_name(out, _blank_like(out), name,
+                                "%s_%s" % (ns, name))
+            return out
+
+        # The parameter list as well as the body. A parameter written
+        # `const std::shared_ptr<media_query_list>& media` in an out-of-line
+        # declarator names the class unflattened, so it monomorphised to
+        # `shared_ptr_media_query_list` while the same type named inside the
+        # namespace became `shared_ptr_litehtml_media_query_list` -- two
+        # instantiations of one template, and a copy between them looked
+        # like a copy between unrelated classes.
+        op = m.end() - 1
+        params = text[op + 1:close]
+        new_params = _flatten(params)
         body = text[j + 1:end]
-        new = body
-        for name in sorted(names, key=len, reverse=True):
-            if name.startswith(ns + "_"):
-                continue
-            new = _sub_name(new, _blank_like(new), name, "%s_%s" % (ns, name))
-        if new != body:
-            text = text[:j + 1] + new + text[end:]
+        new_body = _flatten(body)
+        if new_params != params or new_body != body:
+            text = (text[:op + 1] + new_params + text[close:j + 1]
+                    + new_body + text[end:])
             scan = _blank_like(text)
             pos = j + 1                  # offsets are stable: same length
     return text
