@@ -1797,6 +1797,42 @@ def resolve_nested_classes(text, path="<cpp>", blank=None):
                 obody = rest[o_open + 1:o_close]
                 obody = _sub_name(obody, _blank_like(obody), iname, new_name)
                 rest = rest[:o_open + 1] + obody + rest[o_close:]
+        # Out-of-line definitions of the enclosing class see the nested name
+        # unqualified too: `void element::create_js_object()` writes
+        # `new js_object_ref(..)`, and C++ looks that up in `element`. The
+        # body is not lexically inside the class, so the rename above never
+        # reached it and the allocation named a class that does not exist.
+        #
+        # The declarator may spell the class either way -- namespace
+        # flattening renames the class but leaves an out-of-line head alone
+        # -- so a suffix match is accepted as well.
+        rest_scan = _blank_like(rest)
+        _head = re.compile(r"(?<![\w:])(\w+)\s*::\s*~?\w+\s*\(")
+        _pos = 0
+        while True:
+            hm = _head.search(rest_scan, _pos)
+            if hm is None:
+                break
+            _pos = hm.end()
+            if hm.group(1) != outer and not outer.endswith("_" + hm.group(1)):
+                continue
+            hclose = _match(rest_scan, hm.end() - 1, "(", ")")
+            if hclose is None:
+                continue
+            bj = hclose + 1
+            while bj < len(rest_scan) and rest_scan[bj] not in "{;":
+                bj += 1
+            if bj >= len(rest_scan) or rest_scan[bj] != "{":
+                continue
+            bend = _match(rest_scan, bj, "{", "}")
+            if bend is None:
+                continue
+            span = rest[hm.end():bend]
+            new_span = _sub_name(span, _blank_like(span), iname, new_name)
+            if new_span != span:
+                rest = rest[:hm.end()] + new_span + rest[bend:]
+                rest_scan = _blank_like(rest)
+
         # Hoist above the enclosing class.
         at = rest.rfind("\n", 0, m.start()) + 1
         text = rest[:at] + decl.strip() + "\n" + rest[at:]
