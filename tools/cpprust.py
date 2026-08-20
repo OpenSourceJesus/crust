@@ -1385,7 +1385,18 @@ def _extract_out_of_line(text, scan, names):
             i += 1
             continue
         m = _OUTLINE.match(scan, i)
-        if m is None or m.group(2) not in names:
+        oname = m.group(2) if m is not None else None
+        via_fallback = False
+        if oname is not None and oname not in names:
+            # Namespace flattening renames the class but leaves an
+            # out-of-line declarator alone, so `void el_title::f()` names a
+            # class the scan knows as `litehtml_el_title`. Unmatched, the
+            # body was never attached -- and a bare call to an inherited
+            # method inside it was then read as a hand-over to an unknown
+            # function rather than as `this->f()`.
+            oname = next((k for k in names if k.endswith("_" + oname)), oname)
+            via_fallback = oname in names
+        if m is None or oname not in names:
             i += 1
             continue
         op = m.end() - 1
@@ -1407,9 +1418,15 @@ def _extract_out_of_line(text, scan, names):
             continue
         close = _match_brace(scan, brace)
         if close is None:
+            if via_fallback:
+                # Reached only through the fallback above. Before it existed
+                # this head was not recognised at all and was left in place,
+                # so skipping is the old behaviour rather than a new failure.
+                i += 1
+                continue
             raise CppError("unterminated definition of %s::%s"
                            % (m.group(2), m.group(3)))
-        cls, name = m.group(2), re.sub(r"\s+", "", m.group(3))
+        cls, name = oname, re.sub(r"\s+", "", m.group(3))
         params = text[op + 1:cp].strip()
         defs[(cls, name, _arity(params))] = {
             "ret": (m.group(1) or "").strip(),
@@ -2418,7 +2435,15 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             # ignores the argument. `position(int x, int y, ..)` is the usual
             # spelling of a constructor, so this was not a corner case.
             shadowed = _declared_param_names(params)
-            visible = [n for n in info["paths"] if n not in shadowed]
+            # A field whose name is also a class name is left alone. The two
+            # collide in type position -- litehtml has a `document` field and
+            # a `document` class -- and qualifying there turned
+            # `shared_ptr<document>` into `shared_ptr<this->document>`.
+            # A bare use in *expression* position then goes unqualified and
+            # fails loudly, which is the better way round: a refusal can be
+            # read and fixed, a mangled type cannot.
+            visible = [n for n in info["paths"]
+                       if n not in shadowed and n not in names]
             if visible:
                 inner = _sub_code(
                     re.compile(r"(?<![\w.>])(%s)\b" % _type_alt(visible)),
@@ -6594,7 +6619,18 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
         if targs not in seen:
             seen.append(targs)
 
-    _monomorphise_uses(_blank_spans(scan, bodies), tnames, record)
+    # Out-of-line bodies were lifted out of `scan` above, taking their
+    # template uses with them. `shared_ptr<element>` written only inside one
+    # of those would then never be recorded, and asking for it later -- once
+    # the body is attached to its class -- reports an instantiation the scan
+    # "cannot discover". Appending them for the recording pass alone puts
+    # them back where they were read from, without touching the real text.
+    _outline_uses = "\n".join(
+        "%s %s %s" % (d.get("ret") or "", d.get("params") or "",
+                      d.get("body") or "")
+        for d in outline.values())
+    _monomorphise_uses(_blank_spans(scan, bodies) + "\n" + _outline_uses,
+                       tnames, record)
 
     # A template body may instantiate another template: `Outer<T>` holding an
     # `Inner<T>` asks for `Inner<int>` only once `T` is known. So the set is
