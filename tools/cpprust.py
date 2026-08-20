@@ -4893,7 +4893,8 @@ def _is_move_params(params, cname, raw_name, tsub, sub):
     return "&&" in (params or "")
 
 
-def _emit_method_call(expr, cls, is_ptr, meth, args, ent, cinfo):
+def _emit_method_call(expr, cls, is_ptr, meth, args, ent, cinfo,
+                      recv_const=False):
     """One lowered method call, as a C expression.
 
     Factored out because a chained call needs to produce a receiver
@@ -4905,7 +4906,15 @@ def _emit_method_call(expr, cls, is_ptr, meth, args, ent, cinfo):
     def cast(want, e):
         # Parenthesised: `->` binds tighter than a cast, so
         # `(Shape *)&sq->_vptr` would read the wrong thing.
-        return e if want == cls else "((%s *)%s)" % (want, e)
+        #
+        # A const receiver is cast even when the class already matches,
+        # because the cast is also what discards the qualifier: `this` is a
+        # plain `T *`, so a `const T *` -- what a `const T &` parameter
+        # lowers to -- cannot be passed as one. Written only for that case,
+        # so every other call comes out byte for byte as before.
+        if want == cls and not recv_const:
+            return e
+        return "((%s *)%s)" % (want, e)
 
     if ent["virtual"]:
         # Dispatch through the table. The vptr lives at offset zero in the
@@ -4958,7 +4967,7 @@ def _rewrite_calls(text, cinfo, free_refs):
     # which this pattern already allows; the gap was the pointer form being
     # required to have its star attached to the type.
     decl_re = re.compile(
-        r"(?<![\w.])(%s)\s*(\*\s*)?(\w+)\s*(?=[;=,)])" % alt)
+        r"(?<![\w.])(const\s+)?(%s)\s*(\*\s*)?(\w+)\s*(?=[;=,)])" % alt)
     call_re = re.compile(r"(?<![\w.>])(\w+)((?:\s*(?:\.|->)\s*\w+)+)\s*\(")
     # The same chain, but not followed by `(` -- a member read or write
     # rather than a call. The call pattern is tried first, so this only
@@ -5138,6 +5147,14 @@ def _rewrite_calls(text, cinfo, free_refs):
                 got = _parse_param(p, names)
                 if got is not None:
                     frame[got[2]] = (got[0], got[1])
+                    if re.match(r"^\s*const\b", p):
+                        # A `const T &` parameter lowers to `const T *`, and
+                        # `this` is a plain `T *` -- so using one as a
+                        # receiver needs the qualifier cast away. Noted here
+                        # because a parameter never goes through the
+                        # declaration pattern below: that one is read
+                        # outside parentheses.
+                        frame[("const", got[2])] = True
             scopes.append(frame)
             out.append(text[i])
             i += 1
@@ -5162,7 +5179,16 @@ def _rewrite_calls(text, cinfo, free_refs):
         if pdepth == 0 or (pdepth == 1 and _in_for_head(look, i)):
             m = decl_re.match(look, i)
             if m and _prev_word(look, i) not in ("struct", "typedef", "union"):
-                scopes[-1][m.group(3)] = (m.group(1), bool(m.group(2)))
+                scopes[-1][m.group(4)] = (m.group(2), bool(m.group(3)))
+                if m.group(1):
+                    # Recorded beside the symbol, under a key no identifier
+                    # can collide with. A method takes a plain `T *this` --
+                    # the trailing `const` on a declaration is dropped,
+                    # since nothing here models it -- so a `const T *`
+                    # receiver needs the qualifier cast away to be used as
+                    # one at all. Only that case, so every other emission
+                    # stays exactly as it was.
+                    scopes[-1][("const", m.group(4))] = True
                 out.append(m.group(0))
                 i = m.end()
                 continue
@@ -5177,6 +5203,11 @@ def _rewrite_calls(text, cinfo, free_refs):
                    if close is not None else None)
             if got is not None and got[1] in cinfo:
                 expr, cls, is_ptr = got
+                # Only when the receiver is the const symbol itself. Reached
+                # through a field, the qualifier is the field's business and
+                # the chain has already been built.
+                rconst = bool(lookup(scopes, ("const", m.group(1)))) \
+                    and not chain[:-1]
                 raw = text[op + 1:close]
                 mvarg = _move_operand(raw.strip())
                 if mvarg is not None and \
@@ -5191,7 +5222,7 @@ def _rewrite_calls(text, cinfo, free_refs):
                                 cls, meth)
                     args = fix_args(mvarg, ent["refs"], scopes)
                     expr = _emit_method_call(expr, cls, is_ptr, meth, args,
-                                             ent, cinfo)
+                                             ent, cinfo, rconst)
                     rcls, rptr = _ret_class(ent["ret"], cinfo)
                     expr, end = follow(expr, rcls, rptr, close + 1, meth)
                     out.append(expr)
@@ -5216,7 +5247,7 @@ def _rewrite_calls(text, cinfo, free_refs):
                                 text[op + 1:close], cls, meth)
                     args = fix_args(text[op + 1:close], ent["refs"], scopes)
                     expr = _emit_method_call(expr, cls, is_ptr, meth, args,
-                                             ent, cinfo)
+                                             ent, cinfo, rconst)
                     rcls, rptr = _ret_class(ent["ret"], cinfo)
                     expr, end = follow(expr, rcls, rptr, close + 1, meth)
                     out.append(expr)
