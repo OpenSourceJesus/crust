@@ -4283,10 +4283,15 @@ def _check_owning_args(text, cinfo, path):
         for meth in cinfo[cls]["methods"]:
             local_fns.add("%s_%s" % (cls, meth))
 
-    for m in re.finditer(r"(?<![\w.>&])(\w+)\s*\(", text):
+    # A qualified name is skipped -- `Cls::name(..)` is a static member,
+    # which lowers to `Cls_name(..)` a pass below with its parameters
+    # handled there. Read as a bare call it looked like an unknown function,
+    # and passing an owning argument to one looks like a hand-over.
+    for m in re.finditer(r"(?<![\w.>&:])(\w+)\s*\(", text):
         fn = m.group(1)
         if fn in _KEYWORDS or fn in local_fns:
             continue
+
         # This pass's own output: the `__cpp_copy` / `__cpp_drop` placeholders
         # substitution works through, and the generated methods of a supplied
         # container. Their lifetimes are this pass's business, not a boundary.
