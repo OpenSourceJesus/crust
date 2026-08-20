@@ -477,7 +477,7 @@ def _check_unsupported(scan, path):
 class Member(object):
     __slots__ = ("kind", "ret", "name", "params", "body", "line", "dim",
                  "init", "virt", "pure", "outline", "definit",
-                 "declared_only")
+                 "declared_only", "stat")
 
     def __init__(self, kind, ret, name, params, body, line, dim="",
                  init=None, virt=False, pure=False):
@@ -491,6 +491,10 @@ class Member(object):
         self.init = init or []    # ctor initializer list: [(field, args)]
         self.virt = virt          # declared `virtual`
         self.pure = pure          # `= 0`, so no implementation here
+        # Declared `static`: a member function with no receiver. It is
+        # emitted without a `this` parameter and called as `Cls::name(..)`
+        # rather than through an object.
+        self.stat = False
         # Defined out of line, under a qualified name. Its body is emitted
         # where the author wrote it rather than at the class, so a body that
         # reads a file-scope name declared between the two still sees it.
@@ -923,11 +927,19 @@ def _split_members(body, cname, line0):
                                   "", init))
         else:
             bits = sig.replace("*", " * ").split()
+            # `static` is a storage class, not part of the return type. Left
+            # in, it became `static factory` and the method was emitted with
+            # a `this` it has no business having.
+            is_static = bool(bits) and bits[0] == "static"
+            if is_static:
+                bits = bits[1:]
             if len(bits) < 2:
                 raise CppError("cannot parse method %r in class %s"
                                % (head, cname))
-            members.append(Member("method", " ".join(bits[:-1]), bits[-1],
-                                  params, inner, line0, "", None, virt))
+            _m = Member("method", " ".join(bits[:-1]), bits[-1],
+                        params, inner, line0, "", None, virt)
+            _m.stat = is_static
+            members.append(_m)
     return members
 
 
@@ -2425,7 +2437,7 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
     tail = []
     emitting_outline = [False]
 
-    def emit(kind, mname, params, raw):
+    def emit(kind, mname, params, raw, static=False):
         # `__cpp_ref(T)` in a parameter: `T` for a scalar, `const T &` for a
         # class. A container cannot pick one spelling for both -- by value it
         # refuses an owning key (the copy is never constructed or destroyed),
@@ -2441,8 +2453,13 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
         # a value against a pointer.
         scalar_refs = _scalar_ref_names(params)
         params = _lower_refs(params, _with_scalars(names))
-        # `this` is a pointer, exactly as an `impl` method's `self` is.
-        arglist = "%s *this" % cname + (", " + params if params else "")
+        # `this` is a pointer, exactly as an `impl` method's `self` is --
+        # unless the member is `static`, which by definition has no
+        # receiver to point at.
+        if static:
+            arglist = params or "void"
+        else:
+            arglist = "%s *this" % cname + (", " + params if params else "")
         # Members are emitted in declaration order, but a body may call a
         # method declared below it -- ordinary in a class, and an implicit
         # declaration in C. Prototype everything first.
@@ -2695,7 +2712,11 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
                     "Overloads are resolved by argument count here."
                     % (cls.name, m.name, ar, "" if ar == 1 else "s"))
             info[slot].setdefault(m.name, {})[ar] = {
-                "refs": emit(sub(m.ret), mfn, params, sub(m.body or "")),
+                "refs": emit(sub(m.ret), mfn, params, sub(m.body or ""),
+                             static=m.stat),
+                # Recorded so a `Cls::name(..)` call can be lowered without
+                # inventing a receiver for it.
+                "static": m.stat,
                 # The return type is recorded so a call can be a receiver in
                 # turn: `o.node()->get()`. Monomorphised, because a method
                 # returning `Box<int> *` has to name the emitted struct.
@@ -4953,6 +4974,7 @@ def _rewrite_calls(text, cinfo, free_refs):
     # A call continuing a chain: `.g(` or `->g(` right after a `)`.
     cont_re = re.compile(r"\s*(?:\.|->)\s*(\w+)\s*\(")
     plain_re = re.compile(r"(?<![\w.>])(\w+)\s*\(")
+    static_re = re.compile(r"(?<![\w.>:])(\w+)\s*::\s*(\w+)\s*\(")
     # `new T(..)` / `new T`, and `delete e` / `delete[] e`. The array forms
     # are matched so they can be reported: they are not simply unsupported
     # syntax, they are the shapes whose lowering would need an element count
@@ -5551,6 +5573,27 @@ def _rewrite_calls(text, cinfo, free_refs):
                 out.append("free(%s)" % expr)
             i = end
             continue
+
+        # `Cls::name(..)` -- a static member function. It has no receiver,
+        # so it is a plain call to the emitted `Cls_name`; without this the
+        # qualified name survived into the C output and the callee looked
+        # like an unknown external function, which in turn made passing an
+        # owning argument look like a double free.
+        m = static_re.match(look, i)
+        if m:
+            _sinfo = (cinfo.get(m.group(1)) or {}).get("methods", {})
+            _cands = _sinfo.get(m.group(2)) or {}
+            op = m.end() - 1
+            close = _match_paren(look, op)
+            _ent = None
+            if close is not None:
+                _ar = _arity(text[op + 1:close])
+                _ent = _cands.get(_ar)
+            if _ent is not None and _ent.get("static"):
+                args = fix_args(text[op + 1:close], _ent["refs"], scopes)
+                out.append("%s(%s)" % (_ent["fn"], args))
+                i = close + 1
+                continue
 
         m = plain_re.match(look, i)
         if m and m.group(1) in free_refs:
