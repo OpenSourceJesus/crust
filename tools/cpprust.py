@@ -1353,6 +1353,38 @@ def _monomorphise_function_templates(text, scan, path):
     return text, _strip_comments(text), names
 
 
+def _blank_literal_braces(text):
+    """Blank `{` and `}` inside literals, leaving the rest of them intact.
+
+    A CSS parser writes `_t('{')`, and its strings hold braces too. Counted
+    as real ones they made `css::parse_stylesheet` look like it was never
+    closed, so its body was never lifted out of line and the bare member
+    calls inside it were read as hand-overs to unknown functions.
+
+    Only the braces, not the whole literal: blanking string contents breaks
+    monomorphisation of a member template instantiated in a method, because
+    a pass below reads the string in `reg<Doc>("Document")` out of this same
+    scan. Braces are the only characters that miscount here, so they are the
+    only ones that go.
+    """
+    out, i, n = list(text), 0, len(text)
+    while i < n:
+        q = text[i]
+        if q not in "\"'":
+            i += 1
+            continue
+        j = i + 1
+        while j < n and text[j] != q:
+            j += 2 if text[j] == "\\" else 1
+        if j >= n:
+            break                        # unterminated; leave it as it is
+        for k in range(i + 1, j):
+            if out[k] in "{}":
+                out[k] = " "
+        i = j + 1
+    return "".join(out)
+
+
 def _extract_out_of_line(text, scan, names):
     """Pull `Ret Class::method(params) { .. }` definitions out of the file.
 
@@ -6525,7 +6557,7 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
             text, os.path.basename(path), blank=cpp_auto._blank_like(text))
     except cpp_auto.AutoError as e:
         raise CppError(e.message)
-    scan = _strip_comments(text)
+    scan = _blank_literal_braces(_strip_comments(text))
     _check_unsupported(scan, path)
 
     # Out-of-line member definitions come out first, keyed by class. They
