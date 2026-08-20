@@ -2634,8 +2634,18 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
         elif m.kind == "augassign":
             op = m.name[len("operator"):-1]
             fn = "%s__aug%s" % (cname, _AUG_NAMES[op])
+            # The operand's own class, which need not be the class the
+            # operator belongs to: litehtml's `position` takes `margins` in
+            # `operator+=`. Reading it off the declaration keeps the operand
+            # check honest -- asking for the left side's type instead
+            # rejected `pos += m_padding`, which is exactly what the
+            # operator is for.
+            _aug_words = [w for w in sub(m.params or "").replace("&", " ")
+                          .replace("*", " ").split() if w != "const"]
+            _aug_cls = _aug_words[0] if _aug_words else None
             info["augassign"][op] = {
                 "fn": fn,
+                "operand": _aug_cls if _aug_cls in known else None,
                 "refs": _ref_positions(_expand_cpp_ref(sub(m.params or ""),
                                                        known),
                                        _with_scalars(names))}
@@ -3561,11 +3571,22 @@ def _rewrite_scopes(text, type_info):
                     for part in _split_top(_params_at(look, i) or ""):
                         pm = re.match(r"^(?:const\s+)?(\w+)\s*\*\s*(\w+)$",
                                       part.strip())
-                        if pm is None or pm.group(2) == "this":
+                        if pm is not None and pm.group(2) == "this":
                             continue
-                        if pm.group(1) in type_info:
+                        if pm is not None and pm.group(1) in type_info:
                             fr.vals[pm.group(2)] = pm.group(1)
                             fr.ptrs.add(pm.group(2))
+                            continue
+                        pv = re.match(r"^(?:const\s+)?(\w+)\s+(\w+)$",
+                                      part.strip())
+                        if pv is not None and pv.group(1) in type_info:
+                            # A by-value class parameter. It names an object
+                            # like any local -- `pos += m_padding` on one was
+                            # left alone for want of a type -- and is not a
+                            # pointer, so it takes no dereference. Ownership
+                            # of it is handled elsewhere; this is only about
+                            # being able to name it.
+                            fr.vals[pv.group(2)] = pv.group(1)
                 scopes.append(fr)
             out.append(text[i])
             i += 1
@@ -3937,12 +3958,13 @@ def _rewrite_scopes(text, type_info):
                         % (lhs, op, rhs))
                 # The operand is taken by reference, like `operator=`'s, so
                 # it has to be something this pass can name and address.
-                src = _copy_source(rhs, ctype, scopes, type_info)
+                otype = ent.get("operand") or ctype
+                src = _copy_source(rhs, otype, scopes, type_info)
                 if src is None:
                     raise CppError(
                         "`%s %s= %s`: the right-hand side is not an object "
                         "of type %s that this pass can name. Assign it to a "
-                        "typed local first." % (lhs, op, rhs, ctype))
+                        "typed local first." % (lhs, op, rhs, otype))
                 out.append("%s(&%s, &%s);" % (ent["fn"], lhs, src))
                 i = m.end()
                 continue
