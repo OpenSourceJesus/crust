@@ -305,7 +305,16 @@ def main(argv=None):
         # juce_litehtml.h defines this before including litehtml, so a
         # translation that does not is reading the wrong half of
         # os_types.h -- `tstring` would be `std::wstring`.
-        "defines": list(args.define) or ["LITEHTML_UTF8"],
+        #
+        # LITEHTML_NO_IOSTREAM goes with it because juce_litehtml's own
+        # build.py defines it on the crust path: it compiles out the one
+        # stream inserter in the tree (`operator<<` on tstring_view, which
+        # nothing calls), and `<<` is not in the subset. Without it here the
+        # harness translates a different source than the build does, and
+        # reports tstring_view.cpp as failing on a function the real build
+        # never sees.
+        "defines": list(args.define) or ["LITEHTML_UTF8",
+                                         "LITEHTML_NO_IOSTREAM"],
         "clang": args.clang,
     }
     os.makedirs(cfg["outdir"], exist_ok=True)
