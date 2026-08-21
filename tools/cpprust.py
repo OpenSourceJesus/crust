@@ -1743,7 +1743,14 @@ def _monomorphise_uses(text, tnames, record=None, known=None):
     """
     if not tnames:
         return text
-    for _ in range(1000):
+    # One use is rewritten per pass, so the bound has to scale with the file
+    # rather than sit at a constant: a flat 1000 was reached by
+    # `litehtml/src/document.cpp`, which names more template uses than that
+    # and is not looping at all. What actually distinguishes a loop is
+    # *progress* -- a rewrite that leaves the text unchanged would spin
+    # forever -- so that is checked directly, and the count is left only as
+    # a backstop that no real file can reach.
+    for _ in range(max(1000, len(text))):
         hit = _find_template_use(text, tnames)
         if hit is None:
             return text
@@ -1756,7 +1763,10 @@ def _monomorphise_uses(text, tnames, record=None, known=None):
                 "which this lowering cannot discover. Name it at file scope "
                 "as well (`%s x;`) so it is emitted."
                 % (name, ", ".join(targs), _mono_name(name, targs)))
-        text = text[:start] + _mono_name(name, targs) + text[end:]
+        rewritten = text[:start] + _mono_name(name, targs) + text[end:]
+        if rewritten == text:
+            raise CppError("template instantiation did not terminate")
+        text = rewritten
     raise CppError("template instantiation did not terminate")
 
 
@@ -2132,6 +2142,11 @@ def _external_info(name, dropfn):
             "star": None, "augassign": {}, "cmp": {}, "conv": None,
             "vcall": {},
             "dropfn": dropfn, "external": True}
+
+
+# The member a derived class stores its base in. Written once here because
+# both the path builder and the name walker have to agree on it.
+_BASE_MEMBER = "_base"
 
 
 # The destructor's vtable slot. Not a legal C++ member name, so it cannot
@@ -2796,12 +2811,22 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
         fwd = [n for n in (_param_name(x)
                            for x in _split_top(s["params"])) if n]
         vptr = "this" if root == cname else "((%s *)this)" % root
-        vret = "" if s["ret"].strip() == "void" else "return "
-        out.append(
-            "static %s %s(%s *this%s) { %s((const struct %s_vtable *)"
-            "%s->_vptr)->%s(this%s); }"
-            % (s["ret"], helper, cname, plist, vret, cname, vptr, s["name"],
-               "".join(", " + f for f in fwd)))
+        call = ("((const struct %s_vtable *)%s->_vptr)->%s(this%s)"
+                % (cname, vptr, s["name"],
+                   "".join(", " + f for f in fwd)))
+        if s["ret"].strip() == "void":
+            body = "%s;" % call
+        else:
+            # Through a local rather than `return <call>;`. A by-value return
+            # of an owning class is checked for being a bare local -- a
+            # returned local is moved out, an expression has nothing to move
+            # from -- and this forwarder was tripping that check on its own
+            # generated code. Forwarding a callee's return value is a pure
+            # move, so the local says exactly that, and the check stays
+            # general rather than growing an exemption.
+            body = ("%s _cpp_vr = %s; return _cpp_vr;" % (s["ret"], call))
+        out.append("static %s %s(%s *this%s) { %s }"
+                   % (s["ret"], helper, cname, plist, body))
         info["vcall"][s["name"]] = helper
 
     if slots and not abstract:
@@ -3119,6 +3144,47 @@ def _named_object(expr, scopes, type_info):
         out = "(*%s)" % parts[0]
     for fld in parts[1:]:
         info = type_info.get(cls)
+        # `_base` is the synthesized hop to the base class, not a declared
+        # field, so it is not in `fields` -- an inherited field is flattened
+        # into the derived class's `fields` under its own name instead. But
+        # field qualification has already rewritten the body, and it writes
+        # the *path*: a method that said `m_children` reaches here as
+        # `this->_base.m_children`. Walking that path meant stepping through
+        # a hop this loop could not name, so no inherited field of an owning
+        # type could be named at all -- `return m_children[idx];` in a
+        # derived class was refused for that reason and no other. Stepping
+        # into the base keeps the rest of the walk unchanged, and nests for
+        # `_base._base.x`.
+        if (info is not None and fld == _BASE_MEMBER
+                and fld not in info["fields"] and info.get("base")):
+            out = "%s%s%s" % (out, sep, _BASE_MEMBER)
+            sep = "."
+            cls = info["base"]
+            continue
+        # A smart pointer hop. `el_ptr->m_children` reaches a field of the
+        # *pointee*, not of the handle, so a walk that only looked in the
+        # handle's own fields stopped here -- and `shared_ptr<T>` is how
+        # litehtml passes every element around, so no field reached through
+        # one could be named. `operator->` already has a lowered form
+        # registered; going through it is the same step the call pass takes,
+        # written here so the name walker agrees with it.
+        if (info is not None and fld not in info["fields"]
+                and info.get("arrow")):
+            ent = info["arrow"]
+            pointee = ent["ret"].replace("*", "").strip()
+            pinfo = type_info.get(pointee)
+            if pinfo is not None and fld in pinfo["fields"]:
+                # `sep` is "->" exactly when what we have is already a
+                # pointer -- `this`, or a lowered reference parameter. Taking
+                # its address again would hand `operator->` a pointer to the
+                # handle rather than the handle.
+                recv = out if sep == "->" else _addr_of_expr(out)
+                out = "%s(%s)" % (ent["fn"], recv)
+                sep = "->"
+                cls = pointee
+                info = pinfo
+            else:
+                return None
         if info is None or fld not in info["fields"]:
             return None
         fcls, is_ptr = info["fields"][fld]

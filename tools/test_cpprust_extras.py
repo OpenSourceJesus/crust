@@ -205,6 +205,91 @@ void f(void *p) {
         self.assertNotIn("auto", out)
 
 
+# ------------------------------------------------- inherited field by name
+
+class TestInheritedFieldNamed(Base):
+    """Naming an inherited field of an owning type.
+
+    From `litehtml/src/html_tag.cpp`:
+
+        std::shared_ptr<element> html_tag::get_child(int idx) const
+        { return m_children[idx]; }
+
+    `m_children` is declared on the base, and field qualification rewrites
+    the body to the path it actually lives at -- `this->_base.m_children`.
+    The name walker had no step for that `_base` hop, because an inherited
+    field is flattened into the derived class's own field table under its
+    plain name and `_base` is not a declared field of anything. So an
+    inherited field of an owning type could not be named at all, and every
+    copy out of one was refused with "not an object of that type this pass
+    can name" -- a diagnostic about the copy, for what was really a gap in
+    the walk.
+    """
+
+    SRC = """
+#include <vector>
+#include <memory>
+
+class elem { public: int v; };
+class base_c { public: std::vector<std::shared_ptr<elem> > m_children; };
+class derived_c : public base_c {
+public:
+    std::shared_ptr<elem> get_child(int idx);
+};
+std::shared_ptr<elem> derived_c::get_child(int idx) {
+    std::shared_ptr<elem> ret = m_children[idx];
+    return ret;
+}
+"""
+
+    def test_copy_from_inherited_container_subscript(self):
+        out = self.assertLowers(self.SRC, "shared_ptr_elem_copy")
+        # The copy reads through the base hop and the container's own
+        # `operator[]`, rather than subscripting the struct.
+        self.assertIn("this->_base.m_children", out)
+        self.assertIn("__index", out)
+
+    def test_inherited_field_still_dropped(self):
+        """The copy is an owner, so the local is still dropped."""
+        out = self.lower(self.SRC)
+        self.assertIn("shared_ptr_elem_drop", out)
+
+
+class TestSmartPointerFieldNamed(Base):
+    """Naming a field reached through a smart pointer.
+
+    From `litehtml/src/document.cpp`:
+
+        std::shared_ptr<element> child = el_ptr->m_children[i];
+
+    `el_ptr->m_children` is a field of the *pointee*, not of the handle, so
+    a walk that looked only in the handle's own fields stopped at the hop.
+    `shared_ptr<T>` is how litehtml passes every element around, so this
+    meant no field reached through one could be named, and copying out of
+    one was refused. `operator->` already has a lowered form registered;
+    the walker goes through it, which is the same step the call pass takes.
+    """
+
+    SRC = """
+#include <vector>
+#include <memory>
+
+class leaf { public: int v; };
+class holder { public: std::vector<leaf> items; };
+void f(std::shared_ptr<holder>& p, int i) {
+    leaf x = p->items[i];
+    (void)x;
+}
+"""
+
+    def test_copy_through_arrow(self):
+        out = self.assertLowers(self.SRC, "__arrow")
+        # The handle is already a pointer here, so it is passed straight to
+        # `operator->` rather than having its address taken again.
+        self.assertIn("shared_ptr_holder__arrow(p)", out)
+        self.assertNotIn("shared_ptr_holder__arrow(&(p))", out)
+
+
 # ------------------------------------------------------------ range-for
 
 class TestRangeForMember(Base):
