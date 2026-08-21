@@ -3042,7 +3042,7 @@ def _stmt_end(text, i):
 
 
 class _Frame(object):
-    __slots__ = ("live", "kind", "ret", "vals", "ptrs")
+    __slots__ = ("live", "kind", "ret", "vals", "ptrs", "ptrvals")
 
     def __init__(self, kind, ret):
         self.live = []        # (ctype, vname), in declaration order
@@ -3053,6 +3053,13 @@ class _Frame(object):
         # after lowering, and `this`. They name an object just as a local
         # does, but reaching it needs a dereference rather than an address.
         self.ptrs = set()
+        # Pointer locals of class type, kept apart from `vals`. The name
+        # walker needs them; the copy and assignment handlers must not
+        # see them, because `p = q` on two pointers is a pointer
+        # assignment, not a class one -- putting them in `vals` made the
+        # supplied containers' own `T *nd = realloc(..)` look like a
+        # class assignment and broke them.
+        self.ptrvals = {}
 
 
 def _conv_for(name, scopes, type_info):
@@ -3112,6 +3119,15 @@ def _named_object(expr, scopes, type_info):
         if parts[0] in fr.vals:
             cls = fr.vals[parts[0]]
             is_ptr_base = parts[0] in fr.ptrs
+            break
+        # Only when something is reached *through* it. A pointer local named
+        # on its own is a pointer, not the object: `p = q` is a pointer
+        # assignment, and resolving it to the pointee's class made the
+        # assignment handler demand an `operator=` for a copy that is not
+        # happening.
+        if len(parts) > 1 and parts[0] in fr.ptrvals:
+            cls = fr.ptrvals[parts[0]]
+            is_ptr_base = True
             break
     if cls is None:
         # A bare field of the class being written in. Field qualification
@@ -3519,6 +3535,17 @@ def _rewrite_scopes(text, type_info):
     decl_re = re.compile(
         r"(?<![\w.])(%s)\s+(\w+)\s*(?:\(([^;]*)\))?\s*;" % type_alt)
 
+    # `T *p = ..;` -- a pointer local of class type. Recorded so the name
+    # walker can reach through it, exactly as it already does for a pointer
+    # *parameter*. Only parameters were registered before, so a body that
+    # bound a local to an element (`const attr_t *a = &v[i];`) could not name
+    # `a->val` and every copy out of one was refused. The declaration itself
+    # is left exactly as written: a pointer local owns nothing, so it takes
+    # no constructor, no drop, and no rewriting -- this is only about being
+    # able to name what it points at.
+    ptr_decl_re = re.compile(
+        r"(?<![\w.])(?:const\s+)?(%s)\s*\*\s*(\w+)\s*(?==|;)" % type_alt)
+
     # `T b = a;` -- copy initialization, which the declaration pattern above
     # cannot match because of the initializer.
     init_re = re.compile(
@@ -3793,6 +3820,15 @@ def _rewrite_scopes(text, type_info):
                         "pending -- where it lands decides what should be "
                         "destroyed. Restructure, or call `_drop` explicitly."
                         % m.group(1))
+
+        m = ptr_decl_re.match(look, i)
+        if m and not aggs and len(scopes) > 1 and \
+                _prev_word(look, i) not in ("struct", "typedef", "union"):
+            scopes[-1].ptrvals[m.group(2)] = m.group(1)
+            scopes[-1].ptrs.add(m.group(2))
+            out.append(text[m.start():m.end()])
+            i = m.end()
+            continue
 
         m = decl_re.match(look, i)
         if m and not aggs and \

@@ -290,6 +290,60 @@ void f(std::shared_ptr<holder>& p, int i) {
         self.assertNotIn("shared_ptr_holder__arrow(&(p))", out)
 
 
+class TestPointerLocalNamed(Base):
+    """Naming a field through a pointer *local*.
+
+    From `litehtml/src/html_tag.cpp`, after the attribute loop was indexed:
+
+        const css_attribute_selector *attr = &selector.m_attrs[ai];
+        selector_name = attr->val;
+
+    A pointer *parameter* of class type was already registered, because
+    reference lowering turns `const T &p` into `const T *p` and the body
+    still has to name it. A pointer *local* was not, so binding one to an
+    element and copying out of it was refused.
+
+    Kept in `ptrvals` rather than `vals` deliberately: the copy and
+    assignment handlers read `vals`, and `p = q` on two pointers is a
+    pointer assignment, not a class one. Registering these in `vals` made
+    the supplied containers' own `T *nd = (T *)realloc(..)` look like a
+    class assignment and broke every container in the tree.
+    """
+
+    SRC = """
+#include <vector>
+#include <string>
+
+class attr_t { public: std::string val; };
+class holder { public: std::vector<attr_t> attrs; };
+
+void f(holder& h, int i) {
+    const attr_t *attr = &h.attrs[i];
+    std::string selector_name;
+    selector_name = attr->val;
+    (void)selector_name;
+}
+"""
+
+    def test_copy_through_pointer_local(self):
+        out = self.assertLowers(self.SRC, "string__assign")
+        self.assertIn("attr->val", out)
+
+    def test_pointer_local_is_not_treated_as_a_class_object(self):
+        """A pointer local is reassignable as a pointer, not copied."""
+        out = self.assertLowers("""
+class thing { public: int v; ~thing() { v = 0; } };
+void f(thing *a, thing *b) {
+    thing *p = a;
+    p = b;
+    (void)p;
+}
+""", "thing")
+        # No copy call generated for `p = b`, and no drop for the pointer.
+        self.assertNotIn("thing_copy(&p", out)
+        self.assertNotIn("thing_drop(&p)", out)
+
+
 # ------------------------------------------------------------ range-for
 
 class TestRangeForMember(Base):
