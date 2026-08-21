@@ -1353,7 +1353,25 @@ def resolve_namespaces(text, path="<cpp>", blank=None):
         text = text[:m.start()] + body + text[close + 1:]
         scan = _blank_like(text)
         # A qualified reference from outside, and any `using` for it.
-        text = _sub_qualified(text, _blank_like(text), ns, declared)
+        #
+        # Every name the namespace declares anywhere, not just this block.
+        # A qualified name whose block has not been flattened yet is still a
+        # name of this namespace, and `_sub_qualified` drops the `ns::` from
+        # anything it is not told to rename -- so the first block processed
+        # was stripping the qualifier off names belonging to later ones.
+        # `litehtml::element_js_object_ref` reached the C front end as a bare
+        # `element_js_object_ref` while every registry held
+        # `litehtml_element_js_object_ref`, and nothing could resolve it.
+        # `ns_names` is the union, already collected above for exactly this
+        # reason; the in-block rename below stays per-block.
+        _union = declared | ns_names.get(ns, set())
+        text = _sub_qualified(text, _blank_like(text), ns, _union)
+        # Anything just rewritten is a name *this pass* produced, so record
+        # it. Otherwise the collision guard above sees the flattened spelling
+        # when the block that declares it comes round, reads it as a name the
+        # author spelled `N_x`, and reports a clash of the entity with
+        # itself.
+        produced.update("%s_%s" % (ns, n) for n in _union)
         scan = _blank_like(text)
         # And the *unqualified* references from the namespace's other blocks.
         # They share this scope, so a class in one header derives from a
