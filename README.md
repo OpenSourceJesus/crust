@@ -14,7 +14,7 @@ Hardware:
 - [BAREMETAL_THREADS.md](BAREMETAL_THREADS.md)
 
 Crust Papers:
-- https://ai.vixra.org/pdf/2608.0059v1.pdf "Interoperation Without an Interface: C++ and Rust in One Translation Unit, and One Toolchain"
+- https://dx.doi.org/10.2139/ssrn.7315678 "Interoperation Without an Interface: C++ and Rust in One Translation Unit, and One Toolchain"
 - https://dx.doi.org/10.2139/ssrn.7226482 "Full-stackless Computing: A Multi-language Compiler That Builds and Boots its Own Operating System"
 
 
