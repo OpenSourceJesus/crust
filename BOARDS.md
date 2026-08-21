@@ -10,6 +10,10 @@ What *is* board-specific is the plumbing around the compiler — which
 architecture it defaults to, which runtime it links, and whether it needs a
 system toolchain at all. That is what this page covers.
 
+# Armulator
+Work in progress on Raspi and Jetson emulation:
+https://github.com/crustos/armulator
+
 ## Which boards work
 
 The requirement is a 64-bit ARMv8 CPU **running a 64-bit OS**. That second
@@ -155,7 +159,7 @@ system `gcc`, so it is a real test wherever it runs.
   ARM local peripherals on the Pi — and takes timer interrupts on both. A
   Jetson image builds too, with a Tegra 16550 console and a relocated GICv2,
   but no qemu machine models a Tegra so it is verified at register level
-  only, never booted.
+  only, never booted, we are working on armulator to fix this issue, see: https://github.com/crustos/armulator.
 - **No CPU tuning.** The back end emits baseline ARMv8-A. It does not use
   Cortex-A72 or A76 specific scheduling, nor any optional extension (the Pi 5's
   ARMv8.2 features, crypto extensions, or SVE on newer Jetsons).
