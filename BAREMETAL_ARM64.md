@@ -123,12 +123,36 @@ looks exactly like a real one.
 
 ## The MMU
 
-`mmu_arm64.c` builds a flat identity map of the low 1 GiB using 2 MiB blocks:
-peripherals (including the UART) as Device memory, RAM as Normal cacheable
-inner-shareable. `mmu_enable_arm64.S` commits `MAIR_EL1`, `TCR_EL1` and
-`TTBR0_EL1`, then sets `SCTLR_EL1.M`, `.C` and `.I`.
+`mmu_arm64.c` builds an identity map in 2 MiB blocks: peripherals (including
+the UART) as Device memory, RAM as Normal cacheable inner-shareable.
+`mmu_enable_arm64.S` commits `MAIR_EL1`, `TCR_EL1` and `TTBR0_EL1`, then sets
+`SCTLR_EL1.M`, `.C` and `.I`.
 
-Two details that produce silent failures rather than errors:
+**Which** memory gets mapped is board-specific, and comes from three defines
+the board profile in `tools/baremetal_arm64.py` supplies:
+
+| define | what it means |
+|---|---|
+| `RAM_BASE` | where DRAM starts |
+| `PERIPH_BASE` | where the device window starts |
+| `PERIPH_SIZE` | how far it runs |
+
+The map covers every distinct gigabyte those touch — at most three, which is
+also the ceiling the linker script's 16 KiB of table space allows (four 4 KiB
+tables, one of them the level-1 table). Attributes are chosen **per 2 MiB
+block**, not per gigabyte.
+
+Both of those generalisations are forced by real boards rather than
+speculative:
+
+- **Per block**, because on the Pi 3 RAM starts at `0` and the BCM peripherals
+  are at `0x3F000000` — the same gigabyte. One attribute for the whole
+  gigabyte is wrong whichever is chosen.
+- **Straddling a gigabyte**, because the Pi 3's ARM *local* peripherals — which
+  route the generic timer — are at `0x40000000`, in the *next* gigabyte from
+  the BCM ones.
+
+Three details that produce silent failures rather than errors:
 
 - A **table descriptor is `0b11`** — valid *and* table. Writing `0b10` gives an
   entry the walker treats as invalid, so every translation faults the instant
@@ -137,6 +161,15 @@ Two details that produce silent failures rather than errors:
 - Mapping the **UART as Normal cacheable** memory would let console writes sit
   in the cache instead of reaching the device, so the console goes silent
   exactly when caching is enabled — which reads as "the MMU broke everything".
+- **Mapping the wrong gigabyte** is the same class of failure and was a real
+  bug. This originally hardcoded level-1 entries 0 and 1 with `RAM_BASE` at
+  `0x40000000`, which is correct for virt and for the Pi and cannot work on a
+  Jetson, whose DRAM is at `0x80000000` in entry **2**. The image mapped
+  neither its own code nor the vector table it would fault into: `ESR =
+  0x86000005`, an instruction abort with a level-1 translation fault whose
+  `FAR` is the vector address, looping with nothing able to report it. It went
+  unnoticed until the Jetson image was booted for the first time under
+  armulator — see [JETSON_NANO.md](JETSON_NANO.md).
 
 `T0SZ = 25` gives a 39-bit address space, so the walk **starts at level 1**. A
 48-bit configuration (`T0SZ = 16`) starts at level 0, and the same code would
