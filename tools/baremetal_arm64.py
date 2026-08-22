@@ -59,7 +59,9 @@ BOARDS = {
         "script": "virt_arm64.ld",
         "machine": "virt",
         "cpu": "cortex-a57",
-        "defines": [],
+        # RAM at 0x40000000, peripherals in the gigabyte below it.
+        "defines": ["RAM_BASE=0x40000000UL", "PERIPH_BASE=0x0UL",
+                    "PERIPH_SIZE=0x40000000UL"],
         "irq": True,
         "intc": "gic_arm64.c",
         "console": "uart_arm64.c",
@@ -70,7 +72,15 @@ BOARDS = {
         "machine": "raspi3b",
         "cpu": "cortex-a53",
         # Peripherals at 0x3F000000 on the BCM2837.
-        "defines": ["PL011_BASE=0x3F201000", "RASPI_GPIO_BASE=0x3F200000"],
+        # RAM starts at 0 and the peripherals sit at 0x3F000000, so both
+        # land in gigabyte 0 and the MMU picks attributes per 2 MiB block.
+        "defines": ["PL011_BASE=0x3F201000", "RASPI_GPIO_BASE=0x3F200000",
+                    # The window has to reach past 0x40000000: the BCM
+                    # peripherals are at 0x3F000000 but the ARM *local*
+                    # peripherals that route the generic timer are at
+                    # 0x40000000, in the next gigabyte.
+                    "RAM_BASE=0x0UL", "PERIPH_BASE=0x3F000000UL",
+                    "PERIPH_SIZE=0x1100000UL"],
         # The BCM2837 has no GIC: the generic timer is routed by the ARM
         # local peripherals at 0x40000000, and GPU sources by a legacy
         # controller at 0x3F00B200.
@@ -95,7 +105,11 @@ BOARDS = {
                     "GICD_BASE=0x50041000", "GICC_BASE=0x50042000",
                     # Tegra X1 UART-A is INTID 68, not virt's 33. Untested:
                     # no qemu machine models a Tegra.
-                    "UART_IRQ=68"],
+                    "UART_IRQ=68",
+                    # DRAM starts at 0x80000000 (gigabyte 2); the GIC and the
+                    # UART both sit in gigabyte 1.
+                    "RAM_BASE=0x80000000UL", "PERIPH_BASE=0x50000000UL",
+                    "PERIPH_SIZE=0x30000000UL"],
         "irq": True,
         "intc": "gic_arm64.c",
         "console": "uart_8250.c",
@@ -114,7 +128,9 @@ BOARDS = {
         # The BCM2711 does have a GIC-400 (GICD 0xFF841000, GICC 0xFF842000),
         # but nothing here has been able to exercise it, so it is left off
         # rather than shipped untested.
-        "defines": ["PL011_BASE=0xFE201000", "RASPI_GPIO_BASE=0xFE200000"],
+        "defines": ["PL011_BASE=0xFE201000", "RASPI_GPIO_BASE=0xFE200000",
+                    "RAM_BASE=0x0UL", "PERIPH_BASE=0xFE000000UL",
+                    "PERIPH_SIZE=0x2000000UL"],
         "irq": False,
         "console": "uart_arm64.c",
         "desc": "Raspberry Pi 4 / 400 (BCM2711, load at 0x80000)",
