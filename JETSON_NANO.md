@@ -10,13 +10,20 @@ The general AArch64 bare-metal design — boot sequence, exception vectors, MMU,
 the `intc_*` seam — is in [BAREMETAL_ARM64.md](BAREMETAL_ARM64.md). This page is
 what is specific to a Tegra.
 
-> **Read this first.** Unlike virt and the Raspberry Pi, **the Jetson image has
-> never been booted.** No qemu machine models a Tegra, so there is nowhere to
-> run it. What exists is an image that builds at the right address, a console
-> driver and an interrupt controller configuration, each verified at register
-> level against a RAM-backed harness. That is a real and useful check — it
-> catches the failure modes that do not need hardware — but it is not the same
-> claim as "it boots". Everything below says which is which.
+> **Read this first.** The Jetson image **now boots under
+> [armulator](https://github.com/crustos/armulator)**, a pure-Python ARM
+> emulator with a Cortex-A57 core — the Nano's actual core — and a Tegra X1
+> board model. It runs to completion: EL1 entry, the MMU brought up and
+> translating, a deliberate fault taken and recovered, and timer interrupts
+> arriving through the GIC at 100 Hz with none spurious.
+>
+> No qemu machine models a Tegra, so `--run` still refuses there; armulator is
+> what fills that gap. But armulator models the **CPU, the GIC and the
+> console**, not the SoC — there is no clock-and-reset controller, no memory
+> controller, no PMIC, display or USB. So a passing run is evidence about the
+> image's CPU, MMU, exception and interrupt behaviour, and **not** evidence
+> that a physical Nano boots it. **Still never run on hardware.** Everything
+> below says which claim is which.
 
 ## Trying it
 
@@ -34,6 +41,40 @@ built and can be copied to hardware.
 
 A blank console is exactly what a hung image looks like, so refusing is better
 than producing one.
+
+### Booting it under armulator
+
+```sh
+git clone https://github.com/crustos/armulator.git ../armulator
+python3 tools/jetson_armulator.py
+```
+
+[`tools/jetson_armulator.py`](tools/jetson_armulator.py) builds the image,
+loads its `PT_LOAD` segments into armulator's `JetsonNanoA64` board, streams
+the console, and exits nonzero if the image faults through the vector table or
+never prints what was expected — so it works as a CI check, not just a demo.
+It ends with:
+
+```
+  unmasked, waiting 300ms: 30 ticks (expect ~30)
+  spurious=0 unexpected=0
+
+== all stages ok ==
+
+[jetson-armulator] 300000 instructions, halted=False fault_loop=False
+[jetson-armulator] OK
+```
+
+That is the same output the virt machine produces under qemu, on a board qemu
+cannot model at all.
+
+`--elf` boots a prebuilt image, `--armulator PATH` points at a checkout
+elsewhere, and `--expect` changes the string that has to appear.
+
+`halted=False` is expected rather than a problem: once timer interrupts are
+live, the firmware's parked halt loop is entered and left on every tick, so
+the tight-self-branch detection never fires. The tool stops on the expected
+text instead.
 
 The toolchain is entirely ours:
 
@@ -123,13 +164,15 @@ CPU-interface write `0xF000` into the *distributor's* address space — where th
 writes are accepted and quietly do something else. Nothing reports an error;
 interrupts simply never arrive.
 
-## How something unbootable is tested
+## How this is tested
 
-No qemu machine models a Tegra, so the choice was between testing nothing and
-testing what can actually be tested. The failure modes above need no hardware
-to catch, so both drivers are compiled with their bases pointing at ordinary
-**RAM**, run under `-M virt` with the PL011 as the real console, and the
-resulting register file is dumped and checked.
+There are now two layers, and they catch different things.
+
+**Register level.** No qemu machine models a Tegra, so both drivers are also
+compiled with their bases pointing at ordinary **RAM**, run under `-M virt`
+with the PL011 as the real console, and the resulting register file is dumped
+and checked. This predates the armulator work and still runs: it is fast, needs
+no emulator, and pins down exactly which register each write lands on.
 
 [`tools/uart_8250_test.py`](tools/uart_8250_test.py) checks: the divisor written
 behind `DLAB`, `LCR` left at 8N1 with `DLAB` *clear*, FIFOs enabled, DTR/RTS
@@ -148,24 +191,59 @@ Both are mutation-tested: wrong spacing, `DLAB` left set, inverted polarity,
 derived GIC offset, ignored base override, wrong `ISENABLER` offset — all
 caught.
 
-### What these tests do and do not prove
+**Emulated boot.** `tools/jetson_armulator.py` runs the whole image on
+armulator's Tegra X1 board. This is the layer that catches what register checks
+structurally cannot: that the parts compose, in order, on a running core.
 
-They prove **the drivers write what they mean to write, where they mean to
-write it.**
+### What each layer does and does not prove
 
-They do not prove that a real Tegra accepts the sequence, that the clock and
-divisor suit the board, that anything reaches a wire, or that an interrupt is
-ever delivered. Those need hardware.
+The register tests prove **the drivers write what they mean to write, where
+they mean to write it.**
 
-What reduces the residual risk is that the *interrupt path itself* — the timer,
-the dispatch, the acknowledge/EOI protocol — is the same code booted and
-exercised at 1000 Hz on virt and on a Raspberry Pi. What is untested on the
-Jetson is specifically whether Tegra's addresses and ids are right.
+The armulator boot proves the image **gets from reset to the end of `kmain`**
+on a Cortex-A57 with a Tegra memory map: the exception-level descent, the
+`.bss` clear, the MMU tables, translation, fault entry and return, GIC
+enable, and timer interrupts at the rate asked for.
+
+Neither proves that a real Tegra accepts the sequence, that the clock and
+divisor suit the board, that anything reaches a wire, or that the SoC's clock
+and reset controller has even enabled UART-A by the time the image runs. Those
+need hardware.
+
+The residual risk is narrower than it was. The *interrupt path* — timer,
+dispatch, acknowledge/EOI — is the same code booted and exercised at 1000 Hz on
+virt and on a Raspberry Pi, and now at 100 Hz on the Tegra map. What is still
+untested on a Jetson is specifically whether Tegra's addresses and ids are
+right on silicon.
+
+### What booting it caught
+
+Worth recording, because it is the argument for having done this: the MMU
+identity map in `baremetal64/mmu_arm64.c` **could never have worked on a
+Jetson**. It hardcoded level-1 entries 0 and 1 with `RAM_BASE` at
+`0x40000000`, which is right for virt and for the Pi. The Nano's DRAM is at
+`0x80000000` — level-1 entry **2** — so the image mapped neither the code it
+was executing nor the vector table it would fault into.
+
+The failure is as undiagnosable as that sounds: `ESR = 0x86000005`, an
+instruction abort with a level-1 translation fault whose `FAR` is the vector
+address itself, looping forever with nothing left that could report it. No
+register-level test would have found it, because every individual register
+write was correct.
+
+The map is now built from `RAM_BASE`, `PERIPH_BASE` and `PERIPH_SIZE` supplied
+per board, per gigabyte and per 2 MiB block. Per-block matters because on the
+Pi the two are not separable — RAM at 0 and peripherals at `0x3F000000` share
+gigabyte 0 — and the window has to be able to straddle a gigabyte boundary,
+because the Pi 3's ARM *local* peripherals sit at `0x40000000` in the next one.
 
 ## Unverified constants
 
-Everything on this list is from documentation, not from a running board. If the
-image ever reaches hardware, these are the first things to check:
+Everything on this list is from documentation, not from a **physical** board.
+Booting under armulator exercises them against a model built from the same
+documentation, so agreement there is a consistency check between two readings
+of the TRM rather than confirmation from silicon. If the image ever reaches
+hardware, these are still the first things to check:
 
 | constant | value | note |
 |---|---|---|
@@ -174,12 +252,18 @@ image ever reaches hardware, these are the first things to check:
 | register shift | 2 (4 bytes) | wrong value fails silently |
 | `UART8250_CLK` | 408 MHz | U-Boot has usually already set the divisor |
 | GICD / GICC | `0x50041000` / `0x50042000` | |
-| UART interrupt | INTID 68 | never exercised |
+| UART interrupt | INTID 68 | wired in armulator; never exercised on silicon |
+| RAM base | `0x80000000` | decides which level-1 entry the MMU fills |
 | entry exception level | EL2 assumed | U-Boot usually hands off at EL2; the boot stub descends from EL3, EL2 or EL1, so this should not matter |
 
 ## What is not done
 
-- **Never booted.** See above.
+- **Never run on hardware.** It boots under armulator; that is not the same
+  claim. See the note at the top of this page.
+- **No SoC model.** armulator has the CPU, the GIC, the console and the GPIO
+  block. Tegra's clock and reset controller, memory controller, power
+  management, display and USB are all absent, so nothing that depends on them
+  is exercised anywhere.
 - **No packaging story.** Getting an image onto a Jetson means going through
   U-Boot — `booti` from a TFTP or SD load, or a flashed partition. None of that
   is automated here.
