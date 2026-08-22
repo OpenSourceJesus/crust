@@ -17,7 +17,17 @@ secondary cores are parked, EL1 is entered, FP is enabled, the vectors are
 installed, the stack is set and .bss is cleared.
 
     python3 tools/baremetal_arm64.py app.c -o kernel.elf --run
-    python3 tools/baremetal_arm64.py app.c --run --machine virt
+    python3 tools/baremetal_arm64.py app.c --run --board raspi3
+    python3 tools/baremetal_arm64.py --boards            # list the profiles
+
+``--board`` and ``--machine`` are not the same thing and are easy to confuse.
+``--board`` picks a profile here: it decides the linker script and load
+address, the console driver, the interrupt controller and the memory map the
+image is *built* with. ``--machine`` only passes a machine name through to
+qemu at run time. Passing a board name to ``--machine`` is rejected rather
+than accepted silently, because the two names differ where it matters --
+the ``raspi3`` board's qemu machine is ``raspi3b``, and the ``jetson`` and
+``raspi4`` boards have no qemu machine at all.
 
 The link is done by our own ``rlink``, which reads the linker script, so no
 external tool is involved at any stage. ``--gnu-ld`` switches the final link to
@@ -125,13 +135,21 @@ BOARDS = {
         "machine": None,
         "cpu": "cortex-a72",
         # Peripherals move to 0xFE000000 on the BCM2711.
-        # The BCM2711 does have a GIC-400 (GICD 0xFF841000, GICC 0xFF842000),
-        # but nothing here has been able to exercise it, so it is left off
-        # rather than shipped untested.
+        # The BCM2711 has a GIC-400 rather than the Pi 3's bespoke ARM local
+        # controller, so gic_arm64.c and the generic timer work unchanged --
+        # only the two base addresses move. Like the Tegra, and unlike virt,
+        # the distributor-to-CPU-interface gap is 0x1000.
+        #
+        # The peripheral window has to reach past the legacy 0xFE000000
+        # block: the GIC sits at 0xFF84xxxx, outside it.
         "defines": ["PL011_BASE=0xFE201000", "RASPI_GPIO_BASE=0xFE200000",
+                    "GICD_BASE=0xFF841000", "GICC_BASE=0xFF842000",
+                    # BCM2711 routes PL011 UART0 to SPI 121, INTID 153.
+                    "UART_IRQ=153",
                     "RAM_BASE=0x0UL", "PERIPH_BASE=0xFE000000UL",
                     "PERIPH_SIZE=0x2000000UL"],
-        "irq": False,
+        "irq": True,
+        "intc": "gic_arm64.c",
         "console": "uart_arm64.c",
         "desc": "Raspberry Pi 4 / 400 (BCM2711, load at 0x80000)",
     },
@@ -296,11 +314,23 @@ def main(argv):
     vectors = None
     extra_asm = []
     defines = []
-    machine = "virt"
-    cpu = "cortex-a57"
+    # None means "not given". Using the default *value* as the sentinel is
+    # what made --machine and --board confusable: with machine defaulting to
+    # "virt" there was no way to tell an explicit --machine virt from no flag
+    # at all, so the profile silently won or silently lost depending on which.
+    machine = None
+    cpu = None
+
+    # Flags that consume the next argument. Without this a trailing "--machine"
+    # raises IndexError and prints a traceback instead of saying what is wrong.
+    TAKES_VALUE = ("-o", "--vectors", "-D", "--extra-asm", "--board",
+                   "--machine", "--cpu")
     i = 0
     while i < len(args):
         a = args[i]
+        if a in TAKES_VALUE and i + 1 >= len(args):
+            print("%s needs a value" % a)
+            return 2
         if a == "-o":
             out = args[i + 1]
             i += 1
@@ -335,6 +365,26 @@ def main(argv):
             return 0
         elif a == "--machine":
             machine = args[i + 1]
+            # --machine names a *qemu* machine; --board names a profile here.
+            # They look interchangeable and are not: the board decides the
+            # load address, linker script, console and interrupt controller
+            # the image is built with, and --machine only decides what qemu
+            # is then asked to boot it on. Passing a board name here used to
+            # be accepted silently and fail much later as an undefined
+            # reference to intc_*, which points at the interrupt controller
+            # when the mistake was the flag.
+            if machine in BOARDS and machine != BOARDS[machine]["machine"]:
+                real = BOARDS[machine]["machine"]
+                print("--machine %r is a board name, not a qemu machine."
+                      % machine)
+                if real is None:
+                    print("  Use --board %s. (No qemu machine models that "
+                          "board, so it can be built but not run here.)"
+                          % machine)
+                else:
+                    print("  Use --board %s, whose qemu machine is %r."
+                          % (machine, real))
+                return 2
             i += 1
         elif a == "--cpu":
             cpu = args[i + 1]
@@ -358,15 +408,30 @@ def main(argv):
 
     if do_run:
         prof = BOARDS[board]
-        if prof["machine"] is None and machine == "virt":
+        if prof["machine"] is None and machine is None:
             log("cannot run %s here: no qemu machine models this board's "
                 "peripherals, so the image would boot to a silent console. "
                 "The image itself is built and can be copied to hardware."
                 % board)
+            if board == "jetson":
+                log("to boot it anyway, under armulator's Tegra model: "
+                    "python3 tools/jetson_armulator.py")
             return 0
-        if machine == "virt":
+
+        # An explicit --machine wins, but say so when it disagrees with the
+        # board: the image's load address, console and interrupt controller
+        # are already baked in by this point, so booting it somewhere else
+        # produces a silent console rather than an error.
+        if machine is None:
             machine = prof["machine"]
-        if cpu == "cortex-a57":
+        elif machine != prof["machine"]:
+            log("warning: --machine %s with --board %s -- the image was "
+                "built for %s (%s: its own load address, console and "
+                "interrupt controller). If the console stays silent, this "
+                "is why."
+                % (machine, board, board, prof["script"]))
+
+        if cpu is None:
             cpu = prof["cpu"]
         log("booting under qemu-system-aarch64 -M %s -cpu %s" % (machine, cpu))
         print(qemu_run(out, machine, cpu))

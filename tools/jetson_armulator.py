@@ -1,4 +1,7 @@
-"""jetson_armulator.py - boot a bare-metal Jetson image under armulator.
+"""jetson_armulator.py - boot a bare-metal image under armulator.
+
+Named for the Jetson, which is what it was written for, but it boots the
+Raspberry Pi 4 too -- the other board with no qemu machine. Pass ``--board``.
 
 No qemu machine models a Tegra, so ``baremetal_arm64.py --board jetson --run``
 refuses: it will build the image but has nowhere to run it, and booting a
@@ -14,6 +17,7 @@ modelling only a handful of the T210's several dozen peripherals. A vendor
 Linux kernel would get nowhere.
 
     python3 tools/jetson_armulator.py                    # build and boot
+    python3 tools/jetson_armulator.py --board raspi4     # BCM2711 GIC-400
     python3 tools/jetson_armulator.py examples/baremetal/kernel_arm64.c
     python3 tools/jetson_armulator.py --elf build/jetson.elf
     python3 tools/jetson_armulator.py --armulator ../armulator
@@ -63,10 +67,20 @@ def find_armulator(explicit=None):
         )
 
 
-def build_image(app, out):
-    """Build ``app`` for the jetson board with baremetal_arm64.py."""
+#: Boards this can boot, and the armulator class that models each.
+#: Both are boards qemu has no machine for, which is the whole reason this
+#: exists. The Pi 3 and virt are deliberately absent: qemu boots those, and
+#: qemu is the better oracle where it is available.
+ARMULATOR_BOARDS = {
+    "jetson": ("JetsonNanoA64", "Cortex-A57, Tegra X1 map"),
+    "raspi4": ("RaspberryPi4A64", "Cortex-A72, BCM2711 map"),
+}
+
+
+def build_image(app, out, board="jetson"):
+    """Build ``app`` for ``board`` with baremetal_arm64.py."""
     cmd = [sys.executable, os.path.join(HERE, "baremetal_arm64.py"),
-           app, "--board", "jetson", "-o", out]
+           app, "--board", board, "-o", out]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         raise SystemExit("build failed:\n%s%s" % (proc.stdout, proc.stderr))
@@ -104,8 +118,8 @@ def load_segments(path):
 
 
 def boot(elf, max_instructions=2000000, ram_size=0x400000, quiet=False,
-         expect=None, slice_size=50000):
-    """Boot ``elf`` on armulator's Jetson board. Returns the console text.
+         expect=None, slice_size=50000, board_name="jetson"):
+    """Boot ``elf`` on the named armulator board. Returns the console text.
 
     Runs in slices so the boot can stop as soon as ``expect`` appears. Once
     timer interrupts are live the firmware's parked halt loop is entered and
@@ -113,10 +127,11 @@ def boot(elf, max_instructions=2000000, ram_size=0x400000, quiet=False,
     fires and the run would otherwise always burn the full instruction
     budget.
     """
-    from armulator.boards import JetsonNanoA64
+    import armulator.boards as boards_module
 
+    cls_name = ARMULATOR_BOARDS[board_name][0]
     entry, segments = load_segments(elf)
-    board = JetsonNanoA64(ram_size=ram_size)
+    board = getattr(boards_module, cls_name)(ram_size=ram_size)
 
     for vaddr, blob in segments:
         end = vaddr + len(blob)
@@ -152,9 +167,13 @@ def boot(elf, max_instructions=2000000, ram_size=0x400000, quiet=False,
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Boot a bare-metal Jetson image under armulator.")
+        description="Boot a bare-metal image under armulator.")
     parser.add_argument("app", nargs="?", default=DEFAULT_APP,
                         help="C source to build (default: kernel_arm64.c)")
+    parser.add_argument("--board", default="jetson",
+                        choices=sorted(ARMULATOR_BOARDS),
+                        help="which board to build for and boot "
+                             "(default: jetson)")
     parser.add_argument("--elf", help="boot this prebuilt image instead")
     parser.add_argument("--armulator", help="path to an armulator checkout")
     parser.add_argument("--ram", type=lambda s: int(s, 0), default=0x400000,
@@ -174,17 +193,21 @@ def main(argv=None):
         if args.elf:
             elf = args.elf
         else:
-            tmp = tempfile.mkdtemp(prefix="jetson-")
-            elf = build_image(args.app, os.path.join(tmp, "jetson.elf"))
+            tmp = tempfile.mkdtemp(prefix="armulator-")
+            elf = build_image(args.app,
+                              os.path.join(tmp, args.board + ".elf"),
+                              board=args.board)
 
+        cls_name, description = ARMULATOR_BOARDS[args.board]
         print("[jetson-armulator] armulator: %s" % where)
         print("[jetson-armulator] image:     %s" % elf)
-        print("[jetson-armulator] booting JetsonNanoA64 (Cortex-A57, "
-              "Tegra X1 map)\n")
+        print("[jetson-armulator] booting %s (%s)\n"
+              % (cls_name, description))
 
         text, board, executed = boot(
             elf, max_instructions=args.max_instructions,
-            ram_size=args.ram, quiet=args.quiet, expect=args.expect)
+            ram_size=args.ram, quiet=args.quiet, expect=args.expect,
+            board_name=args.board)
     finally:
         if tmp:
             import shutil
