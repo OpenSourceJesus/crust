@@ -208,3 +208,143 @@ other, and agree that 115200 baud off Tegra's 408 MHz UART clock is divisor
   actual mistake.
 * raspi4's GIC-400 is still `irq: False` — present on the BCM2711, never
   exercised.
+
+# Board fidelity: CLI, the Pi 4's GIC, and two emulator approximations
+
+Builds on `bf4f89f` (crust) and `c2ee196` (armulator). Clears the four items
+left open at the end of the previous section.
+
+**New in this tree: `tools/board_machine_test.py`, `tools/armulator_boards_test.py`.
+New in armulator: `tests/test_board_fidelity.py`. All three need `git add`.**
+
+## 1. `--board` and `--machine` can no longer be silently confused
+
+The root cause was that `"virt"` was both the default value *and* the sentinel
+for "not given", so an explicit `--machine virt` was indistinguishable from no
+flag at all. Both now default to `None`.
+
+`--machine raspi3` used to be accepted, silently leave the profile at virt,
+and fail at link time with `undefined reference to: intc_raw_source` — which
+points at the interrupt controller when the mistake was the flag. And
+`raspi3` is not a qemu machine name anyway; qemu's is `raspi3b`.
+
+    $ python3 tools/baremetal_arm64.py app.c --run --machine raspi3
+    --machine 'raspi3' is a board name, not a qemu machine.
+      Use --board raspi3, whose qemu machine is 'raspi3b'.        # exit 2
+
+`jetson` and `raspi4` get the variant that says no qemu machine models them.
+A real mismatch (`--board raspi3 --machine virt`) warns and names the linker
+script, so a silent console is explicable. Missing flag values now print
+`--machine needs a value` instead of an `IndexError` traceback.
+
+## 2. The Pi 4's GIC-400 is wired up and exercised
+
+`raspi4` had `irq: False` because nothing could run it. It now carries
+`GICD_BASE=0xFF841000`, `GICC_BASE=0xFF842000`, `UART_IRQ=153` and
+`intc: gic_arm64.c`, and boots under armulator's `RaspberryPi4A64`: MMU on,
+fault recovered, 30 ticks in 300 ms, `spurious=0`, `== all stages ok ==`.
+The existing `PERIPH_SIZE` already reached the GIC at `0xFF84xxxx`, so the
+MMU window needed no change.
+
+That boot immediately caught a bug introduced in the previous section: it
+reported the Jetson's 19.2 MHz. **The BCM2711 clocks its architected timer at
+54 MHz.** `CNTFRQ_EL0` had been hardcoded as an architectural constant when it
+is a board property — firmware derives its tick period from it, so every delay
+was being scaled by 2.8x with nothing reporting an error.
+
+## 3. Unmapped physical addresses abort (fidelity gap 1)
+
+`MemoryControllerHub` returned zero for unclaimed reads and discarded
+unclaimed writes. Firmware that walks off its own map therefore looked fine
+here and would fail on hardware.
+
+Unclaimed accesses now raise a synchronous external abort, fault status
+`0b010000`. The Jetson image's deliberate bad store reports
+`ESR = 0x96000050`, "external abort" — byte-identical to qemu — and its fault
+count went from 1 to **2**, matching what qemu reports for the same code.
+
+Deliberately scoped to the **MMU-off** path. With translation on, an address
+outside the tables already faults as a translation fault, which is the more
+specific report; and firmware routinely identity-maps a whole gigabyte of
+peripheral space, so aborting there would punish it for peripherals armulator
+does not model — a different thing from the firmware being wrong. Opt-in per
+board (`FAULT_ON_UNMAPPED`), off for the ARMv6 boards whose tests rely on the
+permissive behaviour.
+
+## 4. PPIs are banked per core (fidelity gap 2)
+
+`lines`, `pending`, `active` and `enabled` were flat arrays, so a cluster's
+four timers appeared as one interrupt and whichever core fired last determined
+what every core saw. New `BankedInterruptState` banks interrupt IDs below
+`SPI_BASE` — the 16 SGIs and 16 PPIs, which the architecture specifies as
+banked — while SPIs stay shared, since one device drives one line.
+
+Arming only core 2's timer on a four-core cluster now asserts only core 2's
+PPI 30; the other three stay low.
+
+## Files
+
+* **`tools/baremetal_arm64.py`**: `None` sentinels for `--machine`/`--cpu`;
+  board names rejected as machines; mismatch warning; missing-value handling;
+  `raspi4` GIC defines and `irq: True`; usage text explaining the distinction.
+* **`tools/jetson_armulator.py`**: `--board {jetson,raspi4}`. Name kept — it
+  is historical, and the docstring says so.
+* **`tools/board_machine_test.py`** (new): 20 checks over the CLI.
+* **`tools/armulator_boards_test.py`** (new): boots both no-qemu boards and
+  checks timer rate, the unmapped-store abort, and interrupt counts. Skips
+  cleanly when armulator is absent.
+* **Docs**: `BOARDS.md`, `BAREMETAL_ARM64.md`, `RASPI.md`, `JETSON_NANO.md`.
+
+### armulator
+
+* **`armulator/armv6/memory_controller_hub.py`**: `fault_on_unmapped`,
+  `is_mapped(address, size)`. An access straddling the end of a region counts
+  as unmapped, since the far half would silently read zero.
+* **`armulator/armv8/arm_v8.py`**: `_check_physical_address` raises the
+  external abort.
+* **`armulator/peripherals/gic400.py`**: `BankedInterruptState`; `set_line`
+  takes a `cpu`; candidate selection and SGI dispatch read the bank of the
+  core being asked about rather than the selected one.
+* **`armulator/boards/__init__.py`**: `TIMER_FREQUENCY` and
+  `FAULT_ON_UNMAPPED` per board; `sample_timer` drives every core's own PPI.
+* **`tests/test_board_fidelity.py`** (new): 25 tests.
+* **Docs**: `JETSON.md`, `README.md`.
+
+## Verification
+
+* armulator → **1423 pass** (1398 + 25 new), 0 fail
+* `tools/board_machine_test.py` → **20 pass, 0 fail**
+* `tools/armulator_boards_test.py` → **16 pass, 0 fail** (jetson + raspi4)
+* `tools/irq_timer_test.py` → 22 pass, 0 fail — unchanged
+* `tools/board_tools_test.py` → 12 pass, 0 fail — unchanged
+* `tools/rlink_script_test.py` → 19 pass, 0 fail — unchanged
+* `tools/gic_base_test.py`, `tools/uart_8250_test.py` → pass — unchanged
+* qemu boots: `kernel_arm64` on virt, `kernel_raspi` and `kernel_raspi_irq` on
+  raspi3 → all reach their OK lines
+
+Every fix was mutation-tested rather than trusted green: reverting the Pi 4
+frequency fails 2 tests, primary-only timer sampling 1, disabling unmapped
+aborts 4, unbanking the PPIs 5, and reverting the `--machine` validation 7 of
+20. All caught.
+
+### One existing test was modified
+
+Banking `enabled` broke `test_a_broadcast_sgi_reaches_every_target`. Its
+fixture wrote `GICD_ISENABLER` once, with `current_cpu` left at 1 from a
+preceding loop, so core 0 never had the SGI enabled — it only passed because
+the old model shared the array. `GICD_ISENABLER0` covers the SGIs and PPIs and
+is banked per core in GICv2, so the write moved inside the per-core loop.
+Flagged because it is a test being changed to match new code, and deserves a
+second opinion.
+
+## Still not done
+
+* **Never run on physical hardware.** armulator models the CPU, GIC,
+  architected timer and console — not the SoC. No clock and reset controller,
+  memory controller, PMIC, display or USB.
+* **`UART_IRQ=153` (Pi 4) and INTID 68 (Jetson) are unexercised.** The timer
+  arrives as PPI 30, so nothing drives either UART's SPI. Both come from
+  documentation.
+* **`priority`, `targets` and `config` are still shared** across cores. They
+  are banked below `SPI_BASE` on real hardware too; only the state that
+  mattered for the reported bug was split.

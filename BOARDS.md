@@ -162,12 +162,16 @@ system `gcc`, so it is a real test wherever it runs.
   `qemu-system-aarch64 -M virt` and on `-M raspi3b`, each with its own load
   address, console and interrupt controller — a GICv2 on virt, the BCM2837's
   ARM local peripherals on the Pi — and takes timer interrupts on both. The
-  Jetson image **boots too, under [armulator](https://github.com/crustos/armulator)**
-  rather than qemu, which models no Tegra: `python3 tools/jetson_armulator.py`
-  runs it to `== all stages ok ==` on a Cortex-A57 with the Tegra X1 memory
-  map. armulator models the CPU, GIC and console but not the SoC, so that is
-  evidence about the image, not about silicon — no board here has been run on
-  physical hardware.
+  **Jetson and the Pi 4 boot too, under
+  [armulator](https://github.com/crustos/armulator)** rather than qemu, which
+  models neither a Tegra nor a BCM2711:
+  `python3 tools/jetson_armulator.py --board jetson|raspi4` runs each to
+  `== all stages ok ==`, on a Cortex-A57 with the Tegra X1 map and a
+  Cortex-A72 with the BCM2711 map respectively, both taking timer interrupts
+  through a GIC-400 at 100 Hz with none spurious. armulator models the CPU,
+  GIC, architected timer and console but not the SoC, so that is evidence
+  about the image, not about silicon — no board here has been run on physical
+  hardware.
 - **No CPU tuning.** The back end emits baseline ARMv8-A. It does not use
   Cortex-A72 or A76 specific scheduling, nor any optional extension (the Pi 5's
   ARMv8.2 features, crypto extensions, or SVE on newer Jetsons).
@@ -182,4 +186,9 @@ system `gcc`, so it is a real test wherever it runs.
 - [`tools/rpy_lib/rcrt_arm64.s`](tools/rpy_lib/rcrt_arm64.s) — the
   freestanding runtime linked when no libc is used.
 - [`tools/jetson_armulator.py`](tools/jetson_armulator.py) — boots a
-  bare-metal Jetson image under armulator, since qemu cannot.
+  bare-metal Jetson or Pi 4 image under armulator, since qemu models neither.
+- [`tools/armulator_boards_test.py`](tools/armulator_boards_test.py) — boots
+  both of those under armulator and checks the timer rate, the abort on an
+  unmapped store, and the interrupt counts. Skips if armulator is absent.
+- [`tools/board_machine_test.py`](tools/board_machine_test.py) — checks that
+  `--board` and `--machine` cannot be silently confused.

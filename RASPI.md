@@ -203,9 +203,15 @@ it has run on a physical Pi.** Where the two are likely to differ:
 
 ## What is not done
 
-- **No Pi 4 interrupts.** The BCM2711 has a GIC-400 at `0xFF841000`/`0xFF842000`
-  and the base parameterisation already covers it, but nothing here can
-  exercise it, so it is left off rather than shipped untested.
+- **Pi 4 interrupts are on, but not verified on hardware.** The BCM2711's
+  GIC-400 (GICD `0xFF841000`, GICC `0xFF842000`) is now wired up and boots:
+  no qemu machine models a BCM2711, so it runs under
+  [armulator](https://github.com/crustos/armulator) instead --
+  `python3 tools/jetson_armulator.py --board raspi4` takes timer interrupts
+  at 100 Hz with none spurious. armulator models the CPU, GIC, timer and
+  console, not the SoC, so that is evidence about the image rather than
+  about silicon. The UART's own interrupt (INTID 153) is still unexercised:
+  the timer arrives as PPI 30 and nothing drives the UART's SPI.
 - **No GPIO, DMA or transmit interrupts.** Only the timer and UART receive.
 - **Secondary cores are parked.** The boot stub sends every core but the first
   to `wfi`. The Pi's spin-table protocol for starting them is not implemented,

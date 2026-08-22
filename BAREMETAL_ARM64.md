@@ -621,18 +621,17 @@ pointing back at the script. Each is rejected with a message naming it.
   qemu machine models a Tegra.
 - **Secondary cores are parked.** The boot stub sends every core but the first
   to `wfi`; nothing uses the Pi's spin table or PSCI on virt to start them.
-- **The Jetson is built but not booted.** No qemu machine models a Tegra, so
-  its 16550 console and its relocated GICv2 are verified at register level
-  only (see above), never against hardware. The interrupt path is the same
-  code that is booted and exercised on virt; what is untested is that Tegra's
-  addresses are right.
-- **`raspi4`'s GIC-400 is not wired up.** The BCM2711 has one (GICD
-  `0xFF841000`, GICC `0xFF842000`) and the parameterisation would cover it,
-  but nothing here can exercise it, so it is left off rather than shipped
-  untested.
-- **`raspi4` is built but not booted.** No qemu machine models a BCM2711, so
-  `--run` refuses rather than leaving a blank console to be misread as a hang.
+- **Neither the Jetson nor the Pi 4 has a qemu machine.** `--run` refuses for
+  both rather than leaving a blank console to be misread as a hang. Both boot
+  under [armulator](https://github.com/crustos/armulator) instead:
+  `python3 tools/jetson_armulator.py --board jetson|raspi4`, checked by
+  [`tools/armulator_boards_test.py`](tools/armulator_boards_test.py).
 - **Not run on physical hardware** — same caveat as [BOARDS.md](BOARDS.md).
+  armulator models the CPU, the GIC, the architected timer and the console,
+  not the SoC. A passing boot is evidence about the image, not about silicon.
+- **The Pi 4's `UART_IRQ` (INTID 153) is unexercised.** The timer arrives as
+  PPI 30, so nothing here drives the UART's SPI. Same status as the Jetson's
+  INTID 68: from documentation, never observed.
 
 ## Files
 

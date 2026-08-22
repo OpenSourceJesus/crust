@@ -70,6 +70,13 @@ cannot model at all.
 
 `--elf` boots a prebuilt image, `--armulator PATH` points at a checkout
 elsewhere, and `--expect` changes the string that has to appear.
+`--board raspi4` boots the Pi 4 instead — the other board with no qemu
+machine — which is why the tool is not Jetson-only despite the name.
+
+[`tools/armulator_boards_test.py`](tools/armulator_boards_test.py) runs both
+and checks the parts that only appear when the image really executes: the
+counter frequency, the abort on the deliberate bad store, and the interrupt
+counts. It skips cleanly when armulator is not checked out.
 
 `halted=False` is expected rather than a problem: once timer interrupts are
 live, the firmware's parked halt loop is entered and left on every tick, so
