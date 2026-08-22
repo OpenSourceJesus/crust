@@ -11,8 +11,13 @@ architecture it defaults to, which runtime it links, and whether it needs a
 system toolchain at all. That is what this page covers.
 
 # Armulator
-Work in progress on Raspi and Jetson emulation:
+
+A pure-Python ARM emulator with Raspberry Pi and Jetson board models:
 https://github.com/crustos/armulator
+
+It is how the bare-metal Jetson image gets booted at all — no qemu machine
+models a Tegra. See [`tools/jetson_armulator.py`](tools/jetson_armulator.py)
+and [JETSON_NANO.md](JETSON_NANO.md).
 
 ## Which boards work
 
@@ -156,10 +161,13 @@ system `gcc`, so it is a real test wherever it runs.
   [JETSON_NANO.md](JETSON_NANO.md). It boots on
   `qemu-system-aarch64 -M virt` and on `-M raspi3b`, each with its own load
   address, console and interrupt controller — a GICv2 on virt, the BCM2837's
-  ARM local peripherals on the Pi — and takes timer interrupts on both. A
-  Jetson image builds too, with a Tegra 16550 console and a relocated GICv2,
-  but no qemu machine models a Tegra so it is verified at register level
-  only, never booted, we are working on armulator to fix this issue, see: https://github.com/crustos/armulator.
+  ARM local peripherals on the Pi — and takes timer interrupts on both. The
+  Jetson image **boots too, under [armulator](https://github.com/crustos/armulator)**
+  rather than qemu, which models no Tegra: `python3 tools/jetson_armulator.py`
+  runs it to `== all stages ok ==` on a Cortex-A57 with the Tegra X1 memory
+  map. armulator models the CPU, GIC and console but not the SoC, so that is
+  evidence about the image, not about silicon — no board here has been run on
+  physical hardware.
 - **No CPU tuning.** The back end emits baseline ARMv8-A. It does not use
   Cortex-A72 or A76 specific scheduling, nor any optional extension (the Pi 5's
   ARMv8.2 features, crypto extensions, or SVE on newer Jetsons).
@@ -173,3 +181,5 @@ system `gcc`, so it is a real test wherever it runs.
   against `gcc`; useful to run on the board itself.
 - [`tools/rpy_lib/rcrt_arm64.s`](tools/rpy_lib/rcrt_arm64.s) — the
   freestanding runtime linked when no libc is used.
+- [`tools/jetson_armulator.py`](tools/jetson_armulator.py) — boots a
+  bare-metal Jetson image under armulator, since qemu cannot.
