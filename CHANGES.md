@@ -348,3 +348,216 @@ second opinion.
 * **`priority`, `targets` and `config` are still shared** across cores. They
   are banked below `SPI_BASE` on real hardware too; only the state that
   mattered for the reported bug was split.
+
+# hostsim: running firmware at native speed
+
+Builds on `82f281f`. A second way to run a bare-metal image, for the questions
+instruction-level emulation is too slow to answer. Nothing in armulator
+changes; this is entirely additive and no existing path is altered.
+
+**All new, all needing `git add`: `hostsim/`, `examples/hostsim/`,
+`tools/hostsim.py`, `tools/hostsim_build.py`, `tools/hostsim_test.py`,
+`tools/hostsim_difftest.py`, `HOSTSIM.md`.**
+
+## Why
+
+armulator executes AArch64 one instruction at a time and manages about
+**17,000 instructions a second** — roughly 80,000x slower than a Jetson. That
+is the right tool for "does this image boot", and hopeless for "do twenty
+boards driving motors and talking to each other behave".
+
+Measured on `examples/baremetal/kernel_arm64.c`, same program both ways:
+
+| | armulator | hostsim |
+|---|---|---|
+| full run | 17.0 s | **0.0043 s** |
+| versus real time | ~80,000x slower | 120–1000x faster |
+| 16 boards in lockstep | — | ~100,000 board-ms/sec |
+
+**About 4,000x.** Enough that a parameter sweep or a fault-injection campaign
+is worth setting up.
+
+## What it is
+
+The application's C is compiled for the host by `gcc -O3` and runs at native
+speed on its own thread inside a shared object; only the layer underneath --
+console, timer, interrupt counters, MMU flags, motor and sensor values -- is
+replaced, by `hostsim/hostsim.c`. The same idea as Zephyr's `native_posix` or
+NuttX's simulator target: keep the application, replace the hardware.
+
+Virtual time is driven from outside. Delay loops spin on `timer_count()`,
+which blocks until the controller grants more with `step()`. Nothing advances
+on its own, so runs are bit-for-bit repeatable regardless of host load, and
+several boards can share one clock.
+
+## Note on the approach
+
+The original suggestion was to compile natively and have the result talk to
+armulator. Measuring the seam first showed that is not worth doing: it is only
+about 20 functions, and reimplementing them in C is ~400 lines, whereas
+calling back into armulator's Python device models would cost a Python call
+per MMIO access and give back most of the speed.
+
+For the same reason the RPython/`py2c.py` translation of armulator is not
+needed here. The fast path does not want armulator's device models; it wants a
+small hand-written C layer plus a differential test proving the two still
+agree.
+
+MMIO interception was considered and rejected for now. The drivers reach
+registers through a `static volatile unsigned int *` accessor, so intercepting
+them would need an x86-64 instruction decoder in a `SIGSEGV` handler. The seam
+is drawn at values instead -- `sim_motor_write(duty)`, not a PWM register --
+which is right for system questions and wrong for driver questions. Drivers
+should be tested against armulator, where the registers exist.
+
+## Files
+
+* **`hostsim/hostsim.c`, `hostsim/hostsim.h`**: the host implementation of the
+  seam, plus the controller interface, a message link, and injectable faults.
+* **`tools/hostsim_build.py`**: compiles an application plus the backend into
+  a shared object. `-l` links host libraries, which is the route to CUDA or
+  BLAS.
+* **`tools/hostsim.py`**: `Sim` (one board) and `Fleet` (several in lockstep,
+  with message routing).
+* **`examples/hostsim/motor_node.c`**: a PI control loop.
+* **`examples/hostsim/sensor_node.c`**: reports over the link, takes commands
+  from it, and stops on a console keystroke.
+* **`examples/hostsim/fleet_demo.py`**: three boards, a plant model in Python,
+  two injected faults and a matplotlib plot.
+* **`tools/hostsim_test.py`**: 23 checks. Needs only gcc.
+* **`tools/hostsim_difftest.py`**: runs the same image both ways and compares.
+* **`HOSTSIM.md`**, plus links from `BOARDS.md` and `BAREMETAL_ARM64.md`.
+
+## Verification
+
+* `tools/hostsim_test.py` -> **23 pass, 0 fail**
+* `tools/hostsim_difftest.py` -> **8 pass, 0 fail** — hostsim and armulator
+  agree on the computation, the fault count (2), the tick counts, spurious and
+  unexpected counts, and completion
+* mutation: making the host timer double-count drops the difftest to 7/8 with
+  a diagnostic naming model drift as the likely cause
+* regressions unchanged: `armulator_boards_test.py` 16/0,
+  `board_machine_test.py` 20/0, armulator 1423/0
+
+Injected faults are checked end to end rather than only at the API: with the
+link forced down, the controller counts 7 drops and the firmware's own
+`lost=7` counter agrees -- the error reaches application code instead of being
+swallowed by the model.
+
+### Bugs found while building it
+
+* `sim_uart_feed` filled a receive buffer **no firmware function could read**
+  — dead code until `uart_getc`/`uart_rx_ready` were added.
+* The controller ran ahead of the simulation: `sim_step` waited on an
+  `app_waiting` flag the application had set on its *previous* block, so it
+  returned immediately. Timer interrupts were then credited against granted
+  rather than consumed time, giving 51 ticks where 30 were expected.
+* A stuck encoder froze at zero rather than at its current value, because the
+  held reading was captured lazily on the next read instead of when the fault
+  was injected. Found by `hostsim_test.py`, not by hand.
+* The first fault-recovery attempt used `sigsetjmp` inside `exc_expect()`,
+  whose frame is dead by the time the fault arrives. Replaced by a `SIGSEGV`
+  handler that maps a page at the faulting address and returns, re-executing
+  the instruction — which needs no instruction decoding.
+* The fleet demo claimed integral windup to saturation; the firmware's
+  integral clamp prevents it. Replaced with a stall detector, which is what
+  the run actually shows.
+
+## Still not done
+
+* **No ARM is executed**, so code generation, instruction selection, the boot
+  sequence and the vectors are untested on this path.
+* **No MMU**: `mmu_enable()` sets a flag. No translation, no ESR, no FAR.
+* **No register-level device behaviour.** The drivers in `baremetal64/` are
+  not used on this path at all.
+* **`examples/hostsim/motor_node.c` does not build for a board** — it needs a
+  PWM and quadrature driver that does not exist in this tree, and fails at the
+  link rather than being quietly substituted.
+* The difftest compares 8 extracted facts. MMIO interception would widen that
+  to every register write, and is the obvious next step if this path is going
+  to carry driver work as well as system work.
+* **Not run on physical hardware.**
+
+# hostsim: a socket bridge, and an accelerator seam
+
+Builds on the previous section. Two additions, both to the host path only;
+armulator and every existing path are untouched.
+
+**New: `tools/hostsim_net.py`, `hostsim/accel.c`, `hostsim/accel.h`,
+`hostsim/accel_cuda.cu`, `examples/hostsim/vision_node.c`,
+`examples/hostsim/vision_demo.py`. All need `git add`.**
+
+## 1. A fleet can join a real dev-ops test
+
+`SocketBridge` connects a `Fleet` to a TCP service. It is an *endpoint*, not a
+special case: it exposes the same `link_pop_all` and `link_push` a board does,
+so a router addresses it identically and the service on the far end never
+learns the boards are simulated. `Fleet` gained `endpoints=` and a
+`participants` property; `broadcast` includes endpoints.
+
+Messages are framed with a four-byte big-endian length, because link traffic
+is whole messages and TCP is not. `Newline` is provided for line-oriented
+peers and `codec=` takes anything else. `SocketBridge.listen()` accepts a
+peer, `connect()` dials one, and `EchoService` is a throwaway peer for tests.
+
+Bridges are polled, never blocked on, so a slow peer cannot stall the virtual
+clock. The cost is that a bridged run is not deterministic the way a closed
+fleet is -- documented, with the advice to assert on what was exchanged and to
+drain first.
+
+## 2. An accelerator seam, for the Jetson AI case
+
+A Jetson exists for the GPU beside the CPU, and firmware running an inference
+per frame is precisely what armulator cannot study: about a day per simulated
+second, and no GPU modelled to run the inference on.
+
+`hostsim/accel.h` is the seam -- one call taking a frame and returning a
+classification, which is its shape on a real board too. `accel.c` is plain C
+and is always built and tested. `accel_cuda.cu` is the same arithmetic as a
+kernel, selected with `--cuda`. Everything is integer so the two must agree
+*exactly*; `accel_selftest()` runs both over generated frames and counts
+disagreements.
+
+**The CUDA path has never been compiled or run.** There is no GPU and no CUDA
+toolkit in the environment this was written in. `accel_cuda.cu` carries a
+prominent warning saying so, and `--cuda` refuses outright when `nvcc` is
+missing rather than falling back -- a silent fallback would look exactly like
+a GPU build that was merely slow.
+
+Frames come from the controlling process, so they can be a dataset, a
+generator or a camera. There is one frame of slack rather than a queue: an
+uncollected frame is overwritten as a camera DMAing into a double buffer
+would, which is why `vision_node.c` counts dropped frames.
+
+## Verification
+
+* `tools/hostsim_test.py` -> **52 pass, 0 fail** (was 23)
+* `tools/hostsim_difftest.py` -> 8 pass, 0 fail — unchanged
+* `examples/hostsim/vision_demo.py` -> three nodes, 240 inferences each,
+  **599 reports sent and 599 received over real TCP**, stable across runs,
+  in ~0.6 s of wall clock
+* regressions unchanged: armulator 1423/0, `armulator_boards_test.py` 16/0,
+  `board_machine_test.py` 20/0, `irq_timer_test.py` 22/0,
+  `board_tools_test.py` 12/0, qemu boots on virt and raspi3
+
+### Found while building it
+
+* The demo first reported **597 of 599** reports received. Not a bug in the
+  bridge: reports were still in the outbound buffer and in the socket when the
+  run ended. A drain phase fixed it, and the episode is documented, because
+  needing to drain before asserting is a real integration concern rather than
+  a simulation artefact.
+* A framing test of mine asserted that eight bytes of a nine-byte message
+  should decode. The codec was right and the test was wrong; it now checks
+  both sides of the boundary.
+
+## Still not done
+
+* **The CUDA kernel is unverified.** The C reference is tested; the kernel has
+  never run. `accel_selftest()` is the check to run first on real hardware.
+* **A bridged run is not reproducible** in the way a closed fleet is, since
+  real network timing is involved.
+* **`SocketBridge` handles one peer.** No reconnection, no TLS, no
+  multiplexing; a closed peer is reported and pushes fail rather than raising.
+* Everything from the previous section still stands: no ARM executed, no MMU,
+  no register-level device behaviour, never run on physical hardware.

@@ -627,6 +627,9 @@ pointing back at the script. Each is rejected with a message naming it.
   `python3 tools/jetson_armulator.py --board jetson|raspi4`, checked by
   [`tools/armulator_boards_test.py`](tools/armulator_boards_test.py).
 - **Not run on physical hardware** — same caveat as [BOARDS.md](BOARDS.md).
+  Note that [HOSTSIM.md](HOSTSIM.md) describes a third way to run these
+  images, compiled for the host. It is far faster and executes no ARM at all,
+  so it tests the system rather than the image.
   armulator models the CPU, the GIC, the architected timer and the console,
   not the SoC. A passing boot is evidence about the image, not about silicon.
 - **The Pi 4's `UART_IRQ` (INTID 153) is unexercised.** The timer arrives as

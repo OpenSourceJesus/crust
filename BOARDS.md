@@ -192,3 +192,9 @@ system `gcc`, so it is a real test wherever it runs.
   unmapped store, and the interrupt counts. Skips if armulator is absent.
 - [`tools/board_machine_test.py`](tools/board_machine_test.py) — checks that
   `--board` and `--machine` cannot be silently confused.
+- [`HOSTSIM.md`](HOSTSIM.md) — the other way to run an image: compiled for the
+  host, roughly 4,000× faster than instruction-level emulation, for
+  simulating many boards, their motors and the links between them. It executes
+  no ARM, so it answers system questions rather than image questions;
+  [`tools/hostsim_difftest.py`](tools/hostsim_difftest.py) checks the two
+  still agree.
