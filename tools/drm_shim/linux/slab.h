@@ -47,4 +47,14 @@ void kmem_cache_destroy(struct kmem_cache *c);
 void *kmem_cache_alloc(struct kmem_cache *c, gfp_t flags);
 void *kmem_cache_zalloc(struct kmem_cache *c, gfp_t flags);
 void kmem_cache_free(struct kmem_cache *c, void *obj);
+
+/* Upstream derives the cache name and size from the struct itself, and its
+ * alignment via __alignof__. ShivyCX does not implement __alignof__ on a type,
+ * and since this macro is ours rather than upstream's, depending on it would
+ * manufacture a ShivyCX gap out of shim code -- the same mistake the
+ * __builtin_ffsll usage made earlier. Pointer alignment is a safe upper bound
+ * for every struct these caches hold. */
+#define KMEM_CACHE(struct_name, flags) \
+    kmem_cache_create(#struct_name, sizeof(struct struct_name), \
+                      sizeof(void *), (flags), NULL)
 #endif

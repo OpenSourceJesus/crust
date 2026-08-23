@@ -37,11 +37,29 @@ static inline int test_and_set_bit(unsigned nr, unsigned long *addr)
     return old;
 }
 
+/* The __ prefixed forms are the non-atomic variants upstream. Everything
+ * here is already non-atomic, so they are the same functions under both
+ * names -- but they must exist under both, because drm_mm calls __set_bit. */
+static inline void __set_bit(unsigned nr, unsigned long *addr) { set_bit(nr, addr); }
+static inline void __clear_bit(unsigned nr, unsigned long *addr) { clear_bit(nr, addr); }
+static inline void __change_bit(unsigned nr, unsigned long *addr) { change_bit(nr, addr); }
+
 static inline int test_and_clear_bit(unsigned nr, unsigned long *addr)
 {
     int old = test_bit(nr, addr);
     clear_bit(nr, addr);
     return old;
+}
+
+/* The _lock/_unlock forms carry acquire/release ordering upstream. There is
+ * no other context to order against here, so they are the plain operations --
+ * the same caveat as spinlock.h, and it stops being true the moment there is
+ * a second core or an interrupt. */
+static inline void clear_bit_unlock(unsigned nr, unsigned long *addr) { clear_bit(nr, addr); }
+static inline void set_bit_lock(unsigned nr, unsigned long *addr) { set_bit(nr, addr); }
+static inline int test_and_set_bit_lock(unsigned nr, unsigned long *addr)
+{
+    return test_and_set_bit(nr, addr);
 }
 
 /* The bit-scan and population-count helpers below are written as plain C

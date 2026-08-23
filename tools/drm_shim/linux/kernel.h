@@ -58,6 +58,14 @@ static inline u64 mul_u32_u32(u32 a, u32 b) { return (u64)a * (u64)b; }
 static inline u64 div64_u64(u64 a, u64 b) { return b ? a / b : 0; }
 static inline u64 div_u64(u64 a, u32 b) { return b ? a / b : 0; }
 static inline s64 div64_s64(s64 a, s64 b) { return b ? a / b : 0; }
+/* Quotient and remainder in one call. drm_mm uses it for alignment maths on
+ * 64-bit ranges, where a 32-bit division would silently truncate. */
+static inline u64 div64_u64_rem(u64 a, u64 b, u64 *rem)
+{
+    if (!b) { *rem = 0; return 0; }
+    *rem = a % b;
+    return a / b;
+}
 #define WARN_ON(c) (!!(c))
 #define EXPORT_SYMBOL(s)
 #define EXPORT_SYMBOL_GPL(s)

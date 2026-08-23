@@ -99,6 +99,22 @@ static inline void list_move_tail(struct list_head *e, struct list_head *head)
 #define list_for_each_entry_from(pos, head, member) \
     for (; &pos->member != (head); pos = list_next_entry(pos, member))
 
+/* Unlink without poisoning. Upstream distinguishes __list_del_entry (leaves
+ * the entry's pointers alone) from list_del (which poisons them to catch
+ * use-after-free). No poison values here, so they coincide. */
+static inline void __list_del_entry(struct list_head *entry)
+{
+    list_del(entry);
+}
+
+/* Move an entry to another list. Unlink then link -- the entry keeps its
+ * identity, only its position changes. */
+static inline void list_move(struct list_head *entry, struct list_head *head)
+{
+    list_del(entry);
+    list_add(entry, head);
+}
+
 static inline bool list_is_singular(const struct list_head *head)
 {
     return head->next != head && head->next == head->prev;
