@@ -97,6 +97,7 @@ static inline s64 div64_s64(s64 a, s64 b) { return b ? a / b : 0; }
 #include <linux/log2.h>
 #include <linux/sched.h>
 #include <linux/kgdb.h>
+#include <linux/bug.h>
 #include <linux/err.h>
 
 /* NB: this guard must close at the very end of the file. It previously closed
