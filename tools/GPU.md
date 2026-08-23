@@ -167,7 +167,7 @@ is real work rather than shim work, and it should be counted as such.
 
 An earlier version of this section reported 2 of 10, but it was not
 reproducible from a clean checkout, and the harness behind it was more
-permissive than the target. Three things were wrong, and are now fixed:
+permissive than the target. Four things were wrong, and are now fixed:
 
 * **The shim was committed flat** in `tools/drm_shim/` while every DRM source
   includes it as `<linux/NAME.h>`. None of the hand-written headers was ever
@@ -185,6 +185,24 @@ permissive than the target. Three things were wrong, and are now fixed:
   cleanly, with gcc assuming `int ERR_PTR()` and truncating a 64-bit pointer.
   That is wrong code counted as a success. `-w` also defeats `-Werror=`
   regardless of ordering, so it is no longer passed at all.
+* **gcc's host-OS predefines leaked in.** `-nostdinc` removes the host's
+  *headers*; it does not touch `__linux__` and `__unix__`, which gcc defines
+  from the host triplet. drm-kmod is a FreeBSD port and branches on
+  `#ifdef __linux__ … #elif defined(__FreeBSD__)` throughout `drm_print.h`, so
+  gcc silently compiled the Linux branch while ShivyCX, predefining neither,
+  compiled no branch at all and found `DRM_DEBUG_KMS` undefined. The survey
+  now passes `-D__linux__ -D__unix__` explicitly to both compilers: not
+  because a bare-metal target is Unix, but because whatever the oracle
+  assumes, the compiler under test has to assume too.
+
+A fourth problem was in the shim rather than the harness. `linux/printk.h`
+defined `drm_info`, `drm_warn`, `drm_err`, `drm_WARN_ON` and the `DRM_*`
+family -- names belonging to `<drm/drm_print.h>`, which is included later. So
+upstream's real definitions won, ours were dead code, and gcc emitted a
+redefinition warning on every file. Those no-ops were also *masking* the
+`__linux__` problem above: they satisfied `DRM_DEBUG_KMS` for both compilers
+and hid the fact that upstream's definition was unreachable for one of them.
+`linux/printk.h` now defines only the Linux `printk` API.
 
 The numbers above are taken with `-nostdinc`, gcc's own freestanding headers
 handed back explicitly, and implicit declarations promoted to errors. Every
@@ -196,8 +214,10 @@ ShivyCX gap out of its own code and reports it against the DRM sources is
 worse than useless.
 
 [`tools/drm_shim_test.py`](tools/drm_shim_test.py) locks all of it down --
-reachability, hermeticity, strictness, guard idempotence, and that no autostub
-ever shadows a hand-written header. It is mutation-tested (`--mutate`) and
+reachability, hermeticity, strictness, guard idempotence, that no autostub
+ever shadows a hand-written header, that no shim header defines a `drm_*`
+symbol, and that the survey sets every host-OS predefine gcc would otherwise
+supply on its own. It is mutation-tested (`--mutate`) and
 needs no drm-kmod checkout, so it runs anywhere gcc does. The reachability
 check earns its keep beyond the original defect: it compiles each header
 *alone*, which caught three include cycles the survey could not see, because

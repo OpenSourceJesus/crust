@@ -206,8 +206,62 @@ def test_no_shadowing():
 
 
 # --------------------------------------------------------------------------
-# Mutation mode: break each condition on purpose, confirm the check notices.
+# 6. Namespace.  Defect: linux/printk.h defined drm_info, drm_warn, drm_err,
+#    drm_WARN_ON and the DRM_* family. Those belong to <drm/drm_print.h>,
+#    which is included later -- so upstream's real definitions won, ours were
+#    dead code, and gcc reported a redefinition on every single file. Worse,
+#    the dead no-ops had been masking a genuine ShivyCX gap: with them gone,
+#    DRM_DEBUG_KMS turned out to be undefined for ShivyCX because drm_print.h
+#    branches on #ifdef __linux__, which gcc predefines from the host triplet
+#    and ShivyCX does not.
+#
+#    A Linux shim header has no business defining a drm_* symbol. Checked by
+#    name, so it needs no vendor checkout.
 # --------------------------------------------------------------------------
+FOREIGN = ("drm_", "DRM_", "i915_", "amdgpu_", "nouveau_")
+
+
+def test_namespace(shim_dir=SHIM):
+    linux_dir = os.path.join(shim_dir, "linux")
+    if not os.path.isdir(linux_dir):
+        return check(False, "no shim header defines a drm_* symbol",
+                     "no linux/ subdirectory")
+    define_re = re.compile(r"^\s*#\s*define\s+(\w+)")
+    bad = []
+    for h in sorted(os.listdir(linux_dir)):
+        if not h.endswith(".h"):
+            continue
+        with open(os.path.join(linux_dir, h)) as f:
+            for i, ln in enumerate(f, 1):
+                m = define_re.match(ln)
+                if m and m.group(1).startswith(FOREIGN):
+                    bad.append("%s:%d defines %s" % (h, i, m.group(1)))
+    return check(not bad, "no shim header defines a drm_* symbol",
+                 "\n        ".join(bad[:8]))
+
+
+# --------------------------------------------------------------------------
+# 7. Predefines.  The oracle must not rely on gcc's host-triplet predefines.
+#    -nostdinc removes the host's *headers*; it does not touch __linux__ or
+#    __unix__, which gcc defines because it was built for a Linux host. Any
+#    source that branches on them gets a different program under each
+#    compiler unless the survey sets them explicitly.
+# --------------------------------------------------------------------------
+def test_predefines():
+    p = subprocess.run(["gcc", "-dM", "-E", "-nostdinc", "-ffreestanding", "-"],
+                       stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    host = [m for m in ("__linux__", "__unix__") if m in p.stdout]
+    if not host:
+        return check(True, "the survey sets host-OS predefines explicitly", "")
+    drmdeep = os.path.join(HERE, "drmdeep.py")
+    if not os.path.exists(drmdeep):
+        return check(True, "the survey sets host-OS predefines explicitly", "")
+    with open(drmdeep) as f:
+        src = f.read()
+    ok = all(("-D" + m) in src for m in host)
+    return check(ok, "the survey sets host-OS predefines explicitly",
+                 "gcc predefines %s but drmdeep.py does not set them, so "
+                 "ShivyCX sees a different program" % " ".join(host))
 def mutate():
     """Break each condition on purpose and confirm the check notices.
 
@@ -246,9 +300,21 @@ def mutate():
         else:
             print("        NOT CAUGHT: early guard accepted")
 
+    # 3. a shim header reaching into DRM's namespace, as printk.h did
+    with tempfile.TemporaryDirectory() as td:
+        bad = os.path.join(td, "drm_shim", "linux")
+        os.makedirs(bad)
+        with open(os.path.join(bad, "printk.h"), "w") as f:
+            f.write("#ifndef _G\n#define _G\n#define drm_WARN_ON(...) (0)\n#endif\n")
+        print("  [shim defining drm_WARN_ON]")
+        if not test_namespace(os.path.dirname(bad)):
+            caught += 1
+        else:
+            print("        NOT CAUGHT: drm_* definition accepted")
+
     PASS[:], FAIL[:] = saved_pass, saved_fail
-    print("\n  %d of 2 mutations caught" % caught)
-    return caught == 2
+    print("\n  %d of 3 mutations caught" % caught)
+    return caught == 3
 
 
 def main():
@@ -263,6 +329,8 @@ def main():
     test_strict()
     test_idempotent()
     test_no_shadowing()
+    test_namespace()
+    test_predefines()
 
     ok = True
     if args.mutate:

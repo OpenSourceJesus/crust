@@ -157,6 +157,30 @@ def first_error(text):
     return "?"
 
 
+def defines():
+    """Preprocessor defines both compilers must agree on.
+
+    __linux__ is the important one, and it is host contamination of exactly
+    the same kind -nostdinc fixed for headers. gcc predefines __linux__ and
+    __unix__ from the *host triplet*, not the include path, so -nostdinc and
+    -ffreestanding leave them in place. drm-kmod is a FreeBSD port and branches
+    on `#ifdef __linux__ ... #elif defined(__FreeBSD__)` throughout
+    drm_print.h, so gcc silently took the Linux branch while ShivyCX -- which
+    predefines neither -- took no branch at all and found DRM_DEBUG_KMS
+    undefined. That was recorded as a ShivyCX gap; it was the oracle carrying a
+    host assumption the target does not have.
+
+    Setting it explicitly makes the choice visible and gives both compilers the
+    same source. A freestanding bare-metal target is not Linux, but these are
+    Linux DRM sources, so the Linux branch is the one that matches.
+
+    Both __linux__ and __unix__ are set, because gcc predefined both. The
+    point is not that a bare-metal target is Unix -- it is not -- but that
+    whatever the oracle assumes, the compiler under test must assume too.
+    """
+    return ["-D__KERNEL__", "-D__linux__", "-D__unix__"]
+
+
 def gcc_own_include():
     """gcc's own freestanding headers (stddef.h, stdarg.h).
 
@@ -193,7 +217,7 @@ def build_gcc(path, obj):
     # and the verdict comes from the exit status.
     cmd = (["gcc", "-c", "-nostdinc", "-ffreestanding", "-nostdlib",
             "-fno-pic", "-Werror=implicit-function-declaration",
-            "-Werror=implicit-int", "-D__KERNEL__"] + gcc_own_include()
+            "-Werror=implicit-int"] + defines() + gcc_own_include()
            + includes() + ["-o", obj, path])
     p = subprocess.run(cmd, capture_output=True, text=True)
     return (p.returncode == 0 and os.path.exists(obj), p)
@@ -204,7 +228,7 @@ def build_shivyc(path, obj):
     env["SHIVYC_RASM"] = "1"
     env.pop("SHIVYC_RLINK", None)
     cmd = ([sys.executable, "-m", "shivyc.main", "-c", path, "-o", obj,
-            "-D__KERNEL__"] + includes())
+            ] + defines() + includes())
     p = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True,
                        env=env)
     return (os.path.exists(obj), p)
