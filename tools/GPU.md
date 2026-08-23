@@ -48,14 +48,15 @@ structural template for a `gpu:` scheme than any real driver.
 
 `drm_rect.c` was compiled freestanding to find out how much Linux it really
 needs. The original answer was a 67-line shim. Carrying the same exercise
-through `drm_fourcc` and `drm_displayid`, and fixing the harness defects noted
-below, grew it to **28 headers and about 1200 lines** in
+through `drm_fourcc`, `drm_displayid` and `drm_buddy`, and fixing the harness
+defects noted below, grew it to **31 headers and about 1800 lines** in
 `tools/drm_shim/linux/`, covering
 
 * the scalar typedefs (`u8`..`s64`, `size_t`, `ssize_t`, `bool`, `va_list`),
 * `min`/`max`/`clamp`/`swap`/`ARRAY_SIZE`, alignment and rounding,
 * the attribute macros (`__printf`, `__iomem`, `__must_check`, …) as no-ops,
-* real implementations where the algorithms depend on them: `list.h`,
+* real implementations where the algorithms depend on them: `rbtree.h` and
+  `interval_tree_generic.h` (a full augmented red-black tree), `list.h`,
   `bitops.h`, `bits.h`, `log2.h`, `err.h`, `string.h` prototypes,
 * types that DRM embeds *by value* and so cannot be forward-declared:
   `spinlock_t`, `struct kref`, `struct idr`, `wait_queue_head_t`,
@@ -132,36 +133,78 @@ $ python3 tools/drmdeep.py survey --priority --autostub -v
   ok    drm_rect.c                 7 symbols
   ok    drm_fourcc.c               9 symbols
   ok    drm_displayid.c            5 symbols
-  shim  drm_mm.c                   unknown type name 'rb'   (INTERVAL_TREE_DEFINE)
+  ok    drm_buddy.c                9 symbols
   shim  drm_blend.c                field 'data' has incomplete type  (union hdmi_infoframe)
-  shim  drm_buddy.c                implicit declaration of 'kmemleak_update_trace'
+  shim  drm_edid.c                 implicit declaration of 'video_firmware_drivers_only'
   ...
-  3 of 10 files compile        (1008 lines, 21 symbols)
-  7 need more shim             (gcc rejects them too)
-  0 are ShivyCX gaps           (gcc accepts them)
+  4 of 10 files compile        (2202 lines, 30 symbols)
+  5 need more shim             (gcc rejects them too)
+  1 are ShivyCX gaps           (gcc accepts them)
+
+  ShivyCX gaps are the actionable ones:
+    drm_mm.c                   line 372: expected '{'
 ```
 
-**Zero ShivyCX gaps is the headline.** Every file that is portable enough for
-gcc to build freestanding, our own compiler also builds. `drm_rect.c`,
-`drm_fourcc.c` and `drm_displayid.c` are upstream DRM sources, unmodified,
-compiled by ShivyCX and assembled by rasm -- and `drm_fourcc` + `drm_rect` is
-the first rung of the adoption ladder above.
+`drm_rect.c`, `drm_fourcc.c`, `drm_displayid.c` and `drm_buddy.c` are upstream
+DRM sources, unmodified, compiled by ShivyCX and assembled by rasm. That
+covers the first rung of the adoption ladder above (`drm_fourcc` + `drm_rect`)
+and half of the second (`drm_buddy`).
 
-### What is left, and why it is no longer mechanical
+### The first real ShivyCX gap
 
-The cheap shim work is done. The seven remaining files no longer fail on
-missing typedefs and one-line macros; they fail on two substantial pieces of
-kernel infrastructure and a long tail:
+Every previous run reported zero, and every apparent gap along the way turned
+out to be the oracle being more permissive than the target, or the shim
+depending on a gcc builtin. This one is neither.
 
-| blocker | files | what it actually needs |
-|---|---|---|
-| `INTERVAL_TREE_DEFINE` | `drm_mm` | a real augmented rbtree -- an implementation, not a header |
-| `union hdmi_infoframe` | `drm_blend`, `drm_color_mgmt`, `drm_modes` | `<linux/hdmi.h>`, several hundred lines of infoframe layout |
-| `kmemleak_*`, `video_firmware_drivers_only` | `drm_buddy`, `drm_edid`, `drm_dumb_buffers` | small, but each pulls another subsystem's header |
+`drm_mm.c:372` declares a function taking an enum by value:
 
-The interval tree is the honest one to call out: `drm_mm` *is* a range
-allocator built on an augmented rbtree, so a stub cannot stand in for it. That
-is real work rather than shim work, and it should be counted as such.
+```c
+static struct drm_mm_node *
+first_hole(struct drm_mm *mm, u64 start, u64 end, u64 size,
+           enum drm_mm_insert_mode mode)
+```
+
+ShivyCX cannot parse an `enum` tag used as a parameter type. Reduced:
+
+```c
+enum mode { A, B };
+static int f(enum mode m) { return (int)m; }   /* line 2: expected '{', found 'm' */
+```
+
+That is a compiler bug, not shim work, and it is the one item in this track
+that belongs to ShivyCX rather than to the shim. `drm_mm` is otherwise
+complete -- it compiles under gcc, augmented interval tree and all.
+
+### drm_mm needed a real interval tree
+
+`INTERVAL_TREE_DEFINE` was the last structural blocker, and unlike everything
+else in the shim it could not be stubbed: `drm_mm` is a range allocator built
+on an augmented red-black tree, where each node caches the maximum interval
+end in its subtree so overlap queries can skip whole branches.
+
+`linux/rbtree.h` is therefore a real implementation -- insert and erase with
+colour rebalancing, augmentation callbacks threaded through the rotations, and
+the cached-leftmost bookkeeping -- and `linux/interval_tree_generic.h` builds
+the query macros on top.
+
+**That breaks the assumption the rest of this survey rests on.** `drmdeep`
+compiles files and counts symbols; it never runs a line. A no-op spinlock
+cannot be subtly wrong, but a red-black tree that rebalances incorrectly
+compiles perfectly and returns wrong answers at runtime.
+
+[`tools/drm_shim_rbtree_test.py`](tools/drm_shim_rbtree_test.py) closes that
+gap for these two headers, and only these two. It compiles the shim into a
+native binary and runs it, re-checking after every operation that no red node
+has a red parent, that black heights agree, that in-order traversal is sorted,
+that the cached leftmost really is the minimum, that every subtree summary
+equals the real maximum below it, and that interval queries return exactly
+what brute-force search returns. Default is 50,000 randomised operations; it
+is mutation-tested against four deliberate breakages.
+
+It earned its keep immediately: the first draft of the augmentation walked
+from the inserted node to the root, which misses nodes that a rotation
+*demotes* off that path. Every file still compiled. The test caught it in
+under 2000 operations.
 
 ### What that number is measured against
 
