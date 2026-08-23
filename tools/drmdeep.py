@@ -86,6 +86,17 @@ def autostub(text):
     header = m.group(1)
     if ".." in header or header.startswith("/"):
         return None
+    # A placeholder for a header we hand-wrote is always a bug: it means the
+    # real one is not reachable at the path the sources include it by, and
+    # stubbing over it would replace (say) a real intrusive-list
+    # implementation with an empty file and report that as progress. Say so
+    # instead of doing it.
+    if os.path.exists(os.path.join(SHIM, header)):
+        raise SystemExit(
+            "drmdeep: refusing to autostub <%s>: a hand-written shim header\n"
+            "         exists at %s but was not found on the include path.\n"
+            "         The shim is misplaced, not missing."
+            % (header, os.path.join(SHIM, header)))
     path = os.path.join(AUTO, header)
     if os.path.exists(path):
         return None
@@ -146,9 +157,44 @@ def first_error(text):
     return "?"
 
 
+def gcc_own_include():
+    """gcc's own freestanding headers (stddef.h, stdarg.h).
+
+    -nostdinc removes these along with the host's, but they are part of the
+    compiler rather than the distribution: a freestanding target is entitled
+    to them. Handing them back explicitly keeps the difference between "the
+    compiler provides it" and "the host distribution happened to provide it".
+    """
+    p = subprocess.run(["gcc", "-print-file-name=include"],
+                       capture_output=True, text=True)
+    d = p.stdout.strip()
+    return ["-I", d] if d and os.path.isdir(d) else []
+
+
 def build_gcc(path, obj):
-    cmd = (["gcc", "-c", "-ffreestanding", "-nostdlib", "-fno-pic", "-w",
-            "-D__KERNEL__"] + includes() + ["-o", obj, path])
+    # -nostdinc is load-bearing. Without it, -ffreestanding and -nostdlib do
+    # NOT remove the host include path: -nostdlib affects linking, and these
+    # are -c compiles. #include <linux/errno.h> then resolves against
+    # /usr/include/linux/errno.h from the distribution's linux-libc-dev, so a
+    # file can appear to build freestanding while depending on an ambient host
+    # package -- and ShivyCX, which has no such path, gets filed as having a
+    # compiler gap for correctly failing where gcc should have failed too.
+    #
+    # The two -Werror= flags are load-bearing for the same reason. gcc 13
+    # still treats an implicit function declaration as a warning, so a file
+    # calling an undeclared ERR_PTR() compiles "fine" -- with gcc assuming
+    # int ERR_PTR(), truncating a 64-bit pointer to int and emitting wrong
+    # code. ShivyCX rejects it, correctly, and without these flags the survey
+    # records that correctness as a ShivyCX gap.
+    #
+    # -w is deliberately NOT passed. It defeats -Werror= regardless of the
+    # order the two appear in, which would leave the strictness silently
+    # inert. Warnings are ignored instead: first_error() reads "error:" lines
+    # and the verdict comes from the exit status.
+    cmd = (["gcc", "-c", "-nostdinc", "-ffreestanding", "-nostdlib",
+            "-fno-pic", "-Werror=implicit-function-declaration",
+            "-Werror=implicit-int", "-D__KERNEL__"] + gcc_own_include()
+           + includes() + ["-o", obj, path])
     p = subprocess.run(cmd, capture_output=True, text=True)
     return (p.returncode == 0 and os.path.exists(obj), p)
 
