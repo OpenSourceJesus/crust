@@ -4421,6 +4421,146 @@ static obj _re_slice(char* t, long a, long b) {
     s[n] = 0;
     return OBJ_STR(s);
 }
+
+/* Span accessors over the match layout [g0..gn, s0,e0, ..., sn,en]: the group
+ * count is 3*(ng+1)/3, so the spans begin at pylen/3. */
+static long _re_span(obj m, long g, int which) {
+    long n3 = pylen(m) / 3;
+    long at = n3 + 2 * g + which;
+    if (g < 0 || at >= pylen(m)) return -1;
+    return AS_INT(index_obj(m, at));
+}
+
+/* re.escape: backslash every character that is not [A-Za-z0-9_]. CPython
+ * leaves those alone and escapes the rest, which is what callers building a
+ * pattern out of an identifier rely on. Pure string work, no engine needed. */
+static obj _re_escape(char* t) {
+    if (!t) return OBJ_NONE;
+    long n = (long)strlen(t), i, k = 0;
+    char* s = (char*)aalloc((size_t)n * 2 + 1);
+    for (i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)t[i];
+        int plain = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                 || (c >= '0' && c <= '9') || c == '_';
+        if (!plain) s[k++] = '\\';
+        s[k++] = (char)c;
+    }
+    s[k] = 0;
+    return OBJ_STR(s);
+}
+"""
+
+
+SUBPROC_PRELUDE = r"""/* ---- rpython subprocess.run / tempfile.mkdtemp shim ---- */
+#include <unistd.h>
+#include <sys/wait.h>
+#include <poll.h>
+#include <fcntl.h>
+
+/* Grow-on-demand byte buffer for a child's output. */
+typedef struct { char* p; long n, cap; } _sp_buf;
+
+static void _sp_push(_sp_buf* b, const char* src, long n) {
+    if (b->n + n + 1 > b->cap) {
+        long want = (b->cap ? b->cap * 2 : 4096);
+        while (want < b->n + n + 1) want *= 2;
+        char* np = (char*)aalloc((size_t)want);
+        for (long i = 0; i < b->n; i++) np[i] = b->p[i];
+        b->p = np; b->cap = want;
+    }
+    for (long i = 0; i < n; i++) b->p[b->n + i] = src[i];
+    b->n += n;
+    b->p[b->n] = 0;
+}
+
+/* subprocess.run(argv, capture_output=, text=, cwd=).
+ * Returns a LIST [returncode, stdout, stderr] -- the same trick the regex
+ * matcher uses, so .returncode/.stdout/.stderr lower to a plain index and no
+ * new runtime type is needed. */
+static obj _sp_run(obj argv, char* cwd, int capture) {
+    long n = pylen(argv), i;
+    char** av = (char**)aalloc((size_t)(n + 1) * sizeof(char*));
+    int op[2], ep[2];
+    pid_t pid;
+    _sp_buf ob, eb;
+    obj res;
+    int status = 0;
+
+    ob.p = 0; ob.n = 0; ob.cap = 0;
+    eb.p = 0; eb.n = 0; eb.cap = 0;
+    for (i = 0; i < n; i++) av[i] = AS_STR(index_obj(argv, i));
+    av[n] = 0;
+    if (n == 0) return OBJ_NONE;
+
+    if (capture) {
+        if (pipe(op) != 0) return OBJ_NONE;
+        if (pipe(ep) != 0) { close(op[0]); close(op[1]); return OBJ_NONE; }
+    }
+    pid = fork();
+    if (pid < 0) {
+        if (capture) { close(op[0]); close(op[1]); close(ep[0]); close(ep[1]); }
+        return OBJ_NONE;
+    }
+    if (pid == 0) {
+        if (cwd && cwd[0]) { if (chdir(cwd) != 0) _exit(127); }
+        if (capture) {
+            dup2(op[1], 1); dup2(ep[1], 2);
+            close(op[0]); close(op[1]); close(ep[0]); close(ep[1]);
+        }
+        execvp(av[0], av);
+        _exit(127);
+    }
+    if (capture) {
+        struct pollfd pf[2];
+        int open_n = 2;
+        char tmp[4096];
+        close(op[1]); close(ep[1]);
+        pf[0].fd = op[0]; pf[0].events = POLLIN;
+        pf[1].fd = ep[0]; pf[1].events = POLLIN;
+        /* Both pipes are drained together. Reading one to EOF first would
+         * deadlock as soon as the child filled the other. */
+        while (open_n > 0) {
+            int k;
+            if (poll(pf, 2, -1) < 0) break;
+            for (k = 0; k < 2; k++) {
+                if (pf[k].fd < 0) continue;
+                if (pf[k].revents & (POLLIN | POLLHUP)) {
+                    long got = (long)read(pf[k].fd, tmp, sizeof tmp);
+                    if (got > 0) _sp_push(k == 0 ? &ob : &eb, tmp, got);
+                    else { close(pf[k].fd); pf[k].fd = -1; open_n--; }
+                }
+            }
+        }
+    }
+    while (waitpid(pid, &status, 0) < 0) { }
+
+    res = list_new();
+    list_append(res, OBJ_INT(WIFEXITED(status) ? WEXITSTATUS(status)
+                                               : 128 + WTERMSIG(status)));
+    list_append(res, OBJ_STR(ob.p ? ob.p : ""));
+    list_append(res, OBJ_STR(eb.p ? eb.p : ""));
+    return res;
+}
+
+/* tempfile.mkdtemp(prefix=) -- a real mkdtemp under $TMPDIR (default /tmp). */
+static char* _tf_mkdtemp(char* prefix) {
+    const char* base = getenv("TMPDIR");
+    char* tmpl;
+    long bl, pl;
+    if (!base || !base[0]) base = "/tmp";
+    if (!prefix) prefix = "tmp";
+    bl = (long)strlen(base);
+    pl = (long)strlen(prefix);
+    tmpl = (char*)aalloc((size_t)(bl + pl + 10));
+    { long i, k = 0;
+      for (i = 0; i < bl; i++) tmpl[k++] = base[i];
+      if (k == 0 || tmpl[k-1] != '/') tmpl[k++] = '/';
+      for (i = 0; i < pl; i++) tmpl[k++] = prefix[i];
+      for (i = 0; i < 6; i++) tmpl[k++] = 'X';
+      tmpl[k] = 0; }
+    if (!mkdtemp(tmpl)) return "";
+    return tmpl;
+}
 """
 
 
@@ -4802,11 +4942,25 @@ def regex_parse(pattern):
 
 
 def _re_emit_build(pid, ng, indent):
+    """Build the match value: the captured strings, then their spans.
+
+    Layout is [g0..gn, s0,e0, s1,e1, ..., sn,en] -- length always 3*(ng+1), so
+    a consumer recovers the group count from the length alone. Keeping the
+    strings first means `.group(i)` stays a plain index into the list, while
+    `.start(i)`/`.end(i)` (130 call sites in cpprust.py alone) become an index
+    at len/3 + 2i. Appending rather than restructuring is what makes this
+    backwards compatible with every existing consumer.
+    """
     parts = ["%s{ obj _m = list_new();" % indent]
     parts.append("%s  list_append(_m, _re_slice(_t, _g0s, _g0e));" % indent)
     for k in range(1, ng + 1):
         parts.append("%s  list_append(_m, _re_slice(_t, _g%ds, _g%de));"
                      % (indent, k, k))
+    parts.append("%s  list_append(_m, OBJ_INT(_g0s));" % indent)
+    parts.append("%s  list_append(_m, OBJ_INT(_g0e));" % indent)
+    for k in range(1, ng + 1):
+        parts.append("%s  list_append(_m, OBJ_INT(_g%ds));" % (indent, k))
+        parts.append("%s  list_append(_m, OBJ_INT(_g%de));" % (indent, k))
     parts.append("%s  return _m; }" % indent)
     return "\n".join(parts)
 
@@ -4910,7 +5064,14 @@ class Transpiler:
         self.cur_class = None
         self.modules = set()
         self._regex_ids = {}        # pattern string -> matcher id (per module)
-        self._regex_parsed = {}     # id -> parsed pattern struct
+        self._regex_parsed = {}     # id -> parsed pattern struct (tier 1)
+        self._regex_vm = {}         # id -> pattern string (tier 2: crust_re VM)
+        self._regex_dyn = False     # a runtime-valued pattern needs the VM
+        self._regex_escape = False  # re.escape used (needs no engine)
+        self._subproc_used = False  # subprocess.run / tempfile.mkdtemp shim
+        self._subproc_vars = set()  # names bound to a subprocess.run result
+        self._regex_dyn_vars = set()  # names bound to re.compile(<runtime expr>)
+        self._regex_var_pat = {}    # name -> pattern text, for constant compiles
         self._regex_vars = set()    # names bound to re.compile(const) (a matcher id)
         self._regex_match_vars = set()  # names bound to a .search()/.match() result
         self._regex_list_vars = set()   # names bound to a list of re.compile(const)
@@ -5216,6 +5377,32 @@ class Transpiler:
                     and _n.args and isinstance(_n.args[0], ast.Constant) \
                     and isinstance(_n.args[0].value, str):
                 self._re_intern(_n.args[0].value)
+        # Same pre-pass for runtime-valued patterns: the match-object lowering
+        # is gated on the regex feature being active, and a module whose only
+        # regex use is dynamic interns no pattern at all, so the flag has to be
+        # decided here rather than when the call is finally emitted.
+        for _n in ast.walk(tree):
+            if isinstance(_n, ast.Call) and isinstance(_n.func, ast.Attribute) \
+                    and isinstance(_n.func.value, ast.Name) \
+                    and _n.func.value.id == "re" \
+                    and _n.func.attr in ("search", "match") \
+                    and len(_n.args) == 2 \
+                    and not (isinstance(_n.args[0], ast.Constant)
+                             and isinstance(_n.args[0].value, str)):
+                self._regex_dyn = True
+        # Names bound to a subprocess.run(...) result, so `r.returncode` and
+        # friends lower to an index. Same shape as the regex match-var pass
+        # below, and for the same reason: the field access has to know what
+        # kind of value it is reading.
+        for _n in ast.walk(tree):
+            if isinstance(_n, ast.Assign) and len(_n.targets) == 1 \
+                    and isinstance(_n.targets[0], ast.Name) \
+                    and isinstance(_n.value, ast.Call) \
+                    and isinstance(_n.value.func, ast.Attribute) \
+                    and _n.value.func.attr == "run" \
+                    and isinstance(_n.value.func.value, ast.Name) \
+                    and _n.value.func.value.id == "subprocess":
+                self._subproc_vars.add(_n.targets[0].id)
         # Track names bound to a compiled pattern (`X = re.compile(const)`) and
         # to a match result (`m = X.search(...)` / `m = re.search(const, ...)`).
         # Their `.search`/`.match`/`.group` calls must lower to the generated
@@ -5229,7 +5416,22 @@ class Transpiler:
         for _n in ast.walk(tree):
             if isinstance(_n, ast.Assign) and len(_n.targets) == 1 and \
                     isinstance(_n.targets[0], ast.Name) and _is_re_compile(_n.value):
-                self._regex_vars.add(_n.targets[0].id)
+                # A constant pattern interns to an integer matcher id; a
+                # runtime one compiles to nothing at all -- the "compiled
+                # object" is just the pattern string, and _cre_dyn_get's cache
+                # makes reusing it as cheap as an id would have been.
+                _a = _n.value.args
+                if _a and isinstance(_a[0], ast.Constant) \
+                        and isinstance(_a[0].value, str):
+                    self._regex_vars.add(_n.targets[0].id)
+                    # Remember the text as well as the id. Plain .search()/
+                    # .match() keep the specialized matcher, but findall/sub/
+                    # finditer and the 3-arg search have no specialized form
+                    # and need the pattern to reach the bridge.
+                    self._regex_var_pat[_n.targets[0].id] = _a[0].value
+                else:
+                    self._regex_dyn = True
+                    self._regex_dyn_vars.add(_n.targets[0].id)
         for _n in ast.walk(tree):
             if isinstance(_n, ast.Assign) and len(_n.targets) == 1 and \
                     isinstance(_n.targets[0], ast.Name) and \
@@ -5238,6 +5440,7 @@ class Transpiler:
                     _n.value.func.attr in ("search", "match") and \
                     isinstance(_n.value.func.value, ast.Name) and \
                     (_n.value.func.value.id in self._regex_vars or
+                     _n.value.func.value.id in self._regex_dyn_vars or
                      _n.value.func.value.id == "re"):
                 self._regex_match_vars.add(_n.targets[0].id)
         # a list literal of compiled patterns (`_HOT_RE = [re.compile(...), ...]`)
@@ -5249,6 +5452,18 @@ class Transpiler:
                     isinstance(_n.value, ast.List) and _n.value.elts and \
                     all(_is_re_compile(e) for e in _n.value.elts):
                 self._regex_list_vars.add(_n.targets[0].id)
+        # `for m in ....finditer(...)` binds a match to the loop variable; it is
+        # an ast.For target, not an Assign, so the match-var pass above misses
+        # it and .start()/.group() on m would not be typed.
+        for _n in ast.walk(tree):
+            _it2 = _tg2 = None
+            if isinstance(_n, (ast.For, ast.comprehension)):
+                _it2, _tg2 = _n.iter, _n.target
+            if isinstance(_it2, ast.Call) \
+                    and isinstance(_it2.func, ast.Attribute) \
+                    and _it2.func.attr == "finditer" \
+                    and isinstance(_tg2, ast.Name):
+                self._regex_match_vars.add(_tg2.id)
         for _n in ast.walk(tree):
             _it = _tgt = None
             if isinstance(_n, ast.comprehension):
@@ -5463,6 +5678,9 @@ class Transpiler:
         if self._sock_used:
             self.lines[self.extern_idx:self.extern_idx] = \
                 SOCKET_PRELUDE.splitlines()
+        if self._subproc_used:
+            self.lines[self.extern_idx:self.extern_idx] = \
+                SUBPROC_PRELUDE.splitlines()
         if self._ossys_used:
             self.lines[self.extern_idx:self.extern_idx] = \
                 OS_SYS_PRELUDE.splitlines()
@@ -5488,14 +5706,19 @@ class Transpiler:
                             % (ci.csym, ci.csym))
             self.lines[self.extern_idx:self.extern_idx] = head
             self.lines.extend(tail)
-        if self._regex_ids:
+        if self._regex_ids or self._regex_dyn or self._regex_escape:
             pre = REGEX_HELPER.splitlines()
+            if self._regex_vm or self._regex_dyn:
+                pre.extend(self._regex_vm_prelude())
             for pid in sorted(self._regex_parsed):
                 pre.extend(regex_emit_c(pid, self._regex_parsed[pid]).splitlines())
             disp = ["static obj _re_search(long id, char* t, int anc) {"]
             for pid in sorted(self._regex_parsed):
                 disp.append("    if (id == %d) return _re_p%d(t, anc);"
                             % (pid, pid))
+            for pid in sorted(self._regex_vm):
+                disp.append("    if (id == %d) return _cre_run(%d, t, anc);"
+                            % (pid, self._regex_vm_slot[pid]))
             disp.append("    return OBJ_NONE;")
             disp.append("}")
             pre.extend(disp)
@@ -9888,8 +10111,37 @@ class Transpiler:
             # be obj too -- otherwise a name-typed-int target like
             # `chunk = next(...)` is declared `int` and the obj RHS won't assign.
             return OBJ
+        # Methods on a dynamically compiled pattern: search/match/finditer and
+        # findall all yield obj, sub yields a C string.
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
-                and self._regex_ids \
+                and isinstance(node.func.value, ast.Name) \
+                and (node.func.value.id in self._regex_dyn_vars
+                     or node.func.value.id in self._regex_var_pat):
+            if node.func.attr in ("search", "match", "finditer", "findall"):
+                return OBJ
+            if node.func.attr == "sub":
+                return "char*"
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                and isinstance(node.func.value, ast.Name) \
+                and node.func.value.id == "re" \
+                and node.func.attr in ("finditer", "findall"):
+            return OBJ
+        # `.start()`/`.end()` on a match are byte offsets, so they are long,
+        # not obj -- checked before the obj group below.
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                and (self._regex_ids or self._regex_dyn) \
+                and node.func.attr in ("start", "end") \
+                and node.func.attr not in self.method_owners \
+                and node.func.attr not in self.xmethod_owners:
+            # Same conservative guard as .group() below: a receiver known to
+            # hold a match takes it outright, anything else only when no real
+            # class defines .start/.end. Requiring a tracked receiver was too
+            # narrow -- a match reached through a call or an element still
+            # yields an offset, and typing it obj made `m.end() - 1` lower to
+            # obj arithmetic on a long.
+            return "long"
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                and (self._regex_ids or self._regex_dyn) \
                 and node.func.attr in ("search", "match", "group") \
                 and node.func.attr not in self.method_owners \
                 and node.func.attr not in self.xmethod_owners:
@@ -9910,6 +10162,12 @@ class Transpiler:
             if isinstance(_f.value, ast.Name) and _f.value.id == "os" and \
                     _f.attr == "getcwd":
                 return "char*"           # returns a C string, like abspath
+            if isinstance(_f.value, ast.Name) and _f.value.id == "tempfile" and \
+                    _f.attr == "mkdtemp":
+                return "char*"           # a path, same as abspath
+            if isinstance(_f.value, ast.Name) and _f.value.id == "subprocess" and \
+                    _f.attr == "run":
+                return OBJ               # LIST [returncode, stdout, stderr]
             if isinstance(_f.value, ast.Name) and _f.value.id == "os" and \
                     _f.attr in ("makedirs", "unlink", "remove"):
                 return OBJ               # returns OBJ_NONE
@@ -11437,7 +11695,17 @@ class Transpiler:
             return node.attr
         return None
 
+    _SUBPROC_FIELDS = {"returncode": 0, "stdout": 1, "stderr": 2}
+
     def ex_Attribute(self, node):
+        # A subprocess.run result is a LIST [returncode, stdout, stderr]; its
+        # three fields are a plain index. Checked before _std_stream, which
+        # would otherwise claim `r.stdout` as the process-wide stream.
+        if isinstance(node.value, ast.Name) \
+                and node.value.id in self._subproc_vars \
+                and node.attr in self._SUBPROC_FIELDS:
+            return "index_obj(%s, %d)" % (self.expr(node.value),
+                                          self._SUBPROC_FIELDS[node.attr])
         stream = self._std_stream(node)
         if stream is not None:
             self._io_used.add(stream)
@@ -12551,7 +12819,7 @@ class Transpiler:
             # generated translation-time matcher, taking priority over any regex
             # module (minire/test_minire) whose Pattern/Match classes share those
             # method names -- those modules aren't part of the bootstrap link.
-            if self._regex_ids and isinstance(func.value, ast.Name) and (
+            if (self._regex_ids or self._regex_dyn) and isinstance(func.value, ast.Name) and (
                     func.value.id in self._regex_vars or
                     func.value.id in self._regex_match_vars):
                 if func.attr in ("search", "match") and len(node.args) == 1:
@@ -12784,6 +13052,88 @@ class Transpiler:
                             txt = self.coerce_to("char*", node.args[1],
                                                  self.expr(node.args[1]))
                             return "_re_search(%d, %s, %s)" % (pid, txt, anc)
+                    # A pattern only known at runtime -- an interpreter passing
+                    # a guest script's pattern through, say. Compiled on first
+                    # use and cached, so a loop over the same pattern pays once.
+                    if modname == "re" and func.attr in ("search", "match") \
+                            and len(node.args) == 2:
+                        self._regex_dyn = True
+                        anc = "1" if func.attr == "match" else "0"
+                        pat = self.coerce_to("char*", node.args[0],
+                                             self.expr(node.args[0]))
+                        txt = self.coerce_to("char*", node.args[1],
+                                             self.expr(node.args[1]))
+                        return "_cre_dyn(%s, %s, %s)" % (pat, txt, anc)
+                    # subprocess.run(argv, capture_output=, text=, cwd=).
+                    # Only those keywords are lowered: check= would need to
+                    # raise, and env=/stdout=/stderr= change the plumbing, so a
+                    # call using them keeps warning rather than having the
+                    # option silently dropped.
+                    if modname == "subprocess" and func.attr == "run" \
+                            and len(node.args) == 1:
+                        kw = {k.arg: k.value for k in node.keywords if k.arg}
+                        if all(k in ("capture_output", "text", "cwd") for k in kw) \
+                                and not any(k.arg is None for k in node.keywords):
+                            cap = "1" if self._const_true(kw.get("capture_output")) else "0"
+                            cwd = ("(char*)0" if "cwd" not in kw else
+                                   self.coerce_to("char*", kw["cwd"],
+                                                  self.expr(kw["cwd"])))
+                            self._subproc_used = True
+                            return "_sp_run(%s, %s, %s)" % (
+                                self.wrap_obj(node.args[0]), cwd, cap)
+                    if modname == "tempfile" and func.attr == "mkdtemp" \
+                            and not node.args:
+                        kw = {k.arg: k.value for k in node.keywords if k.arg}
+                        if all(k == "prefix" for k in kw):
+                            self._subproc_used = True
+                            pre = ('OBJ_STR("tmp")' if "prefix" not in kw
+                                   else self.expr(kw["prefix"]))
+                            pre = self.coerce_to("char*", kw.get("prefix"), pre) \
+                                if "prefix" in kw else '"tmp"'
+                            return "_tf_mkdtemp(%s)" % pre
+                    if modname == "re" and func.attr == "compile" \
+                            and len(node.args) == 1:
+                        self._regex_dyn = True
+                        return self.wrap_obj(node.args[0])
+                    # re.escape needs no engine at all -- it is pure string
+                    # work, so it is lowered even in a program with no other
+                    # regex use.
+                    if modname == "re" and func.attr == "escape" \
+                            and len(node.args) == 1:
+                        self._regex_escape = True
+                        return "_re_escape(%s)" % self.coerce_to(
+                            "char*", node.args[0], self.expr(node.args[0]))
+                    if modname == "re" and func.attr == "finditer" \
+                            and len(node.args) == 2:
+                        self._regex_dyn = True
+                        return "_cre_finditer(%s, %s)" % (
+                            self.coerce_to("char*", node.args[0],
+                                           self.expr(node.args[0])),
+                            self.coerce_to("char*", node.args[1],
+                                           self.expr(node.args[1])))
+                    if modname == "re" and func.attr == "findall" \
+                            and len(node.args) == 2:
+                        self._regex_dyn = True
+                        return "_cre_findall(%s, %s)" % (
+                            self.coerce_to("char*", node.args[0],
+                                           self.expr(node.args[0])),
+                            self.coerce_to("char*", node.args[1],
+                                           self.expr(node.args[1])))
+                    # Only a literal-string replacement is lowered. A callable
+                    # repl would need the match object passed back into guest
+                    # code, so it is left to warn rather than be silently
+                    # mishandled.
+                    if modname == "re" and func.attr == "sub" \
+                            and len(node.args) == 3 \
+                            and self._is_str_repl(node.args[1]):
+                        self._regex_dyn = True
+                        return "_cre_sub(%s, %s, %s)" % (
+                            self.coerce_to("char*", node.args[0],
+                                           self.expr(node.args[0])),
+                            self.coerce_to("char*", node.args[1],
+                                           self.expr(node.args[1])),
+                            self.coerce_to("char*", node.args[2],
+                                           self.expr(node.args[2])))
                     # struct.pack/unpack subset (see STRUCT_PRELUDE)
                     if modname == "struct" and func.attr in ("pack", "unpack") \
                             and len(node.args) == 2:
@@ -13045,8 +13395,75 @@ class Transpiler:
             # conservative guard so a real ShivyCX `.search`/`.group` isn't shadowed.
             _re_recv = isinstance(func.value, ast.Name) and (
                 func.value.id in self._regex_vars or
+                func.value.id in self._regex_dyn_vars or
                 func.value.id in self._regex_match_vars)
-            if self._regex_ids and (_re_recv or (
+            # A dynamically compiled pattern IS its pattern string, so its
+            # methods go straight to the dynamic bridge rather than through
+            # the id dispatch.
+            # A constant-pattern var keeps the specialized matcher for plain
+            # search/match, but everything else routes through the bridge with
+            # the pattern text recovered from the pre-pass.
+            if isinstance(func.value, ast.Name) \
+                    and func.value.id in self._regex_var_pat:
+                _pt = c_string(self._regex_var_pat[func.value.id])
+                _a0 = (self.coerce_to("char*", node.args[0],
+                                      self.expr(node.args[0]))
+                       if node.args else None)
+                if func.attr in ("search", "match") and len(node.args) == 2:
+                    self._regex_dyn = True
+                    return "_cre_at(%s, %s, %s, %s)" % (
+                        _pt, _a0,
+                        self.coerce_to("int", node.args[1],
+                                       self.expr(node.args[1])),
+                        "1" if func.attr == "match" else "0")
+                if func.attr == "finditer" and len(node.args) == 1:
+                    self._regex_dyn = True
+                    return "_cre_finditer(%s, %s)" % (_pt, _a0)
+                if func.attr == "findall" and len(node.args) == 1:
+                    self._regex_dyn = True
+                    return "_cre_findall(%s, %s)" % (_pt, _a0)
+                if func.attr == "sub" and len(node.args) == 2 \
+                        and self._is_str_repl(node.args[0]):
+                    self._regex_dyn = True
+                    return "_cre_sub(%s, %s, %s)" % (
+                        _pt, _a0,
+                        self.coerce_to("char*", node.args[1],
+                                       self.expr(node.args[1])))
+            if isinstance(func.value, ast.Name) \
+                    and func.value.id in self._regex_dyn_vars:
+                if func.attr in ("search", "match") and 1 <= len(node.args) <= 2:
+                    anc = "1" if func.attr == "match" else "0"
+                    txt = self.coerce_to("char*", node.args[0],
+                                         self.expr(node.args[0]))
+                    pat = self.coerce_to("char*", func.value,
+                                         self.expr(func.value))
+                    if len(node.args) == 2:
+                        pos = self.coerce_to("int", node.args[1],
+                                             self.expr(node.args[1]))
+                        return "_cre_at(%s, %s, %s, %s)" % (pat, txt, pos, anc)
+                    return "_cre_dyn(%s, %s, %s)" % (pat, txt, anc)
+                if func.attr == "findall" and len(node.args) == 1:
+                    return "_cre_findall(%s, %s)" % (
+                        self.coerce_to("char*", func.value,
+                                       self.expr(func.value)),
+                        self.coerce_to("char*", node.args[0],
+                                       self.expr(node.args[0])))
+                if func.attr == "sub" and len(node.args) == 2 \
+                        and self._is_str_repl(node.args[0]):
+                    return "_cre_sub(%s, %s, %s)" % (
+                        self.coerce_to("char*", func.value,
+                                       self.expr(func.value)),
+                        self.coerce_to("char*", node.args[0],
+                                       self.expr(node.args[0])),
+                        self.coerce_to("char*", node.args[1],
+                                       self.expr(node.args[1])))
+                if func.attr == "finditer" and len(node.args) == 1:
+                    return "_cre_finditer(%s, %s)" % (
+                        self.coerce_to("char*", func.value,
+                                       self.expr(func.value)),
+                        self.coerce_to("char*", node.args[0],
+                                       self.expr(node.args[0])))
+            if (self._regex_ids or self._regex_dyn) and (_re_recv or (
                     func.attr not in self.method_owners
                     and func.attr not in self.xmethod_owners)):
                 if func.attr in ("search", "match") and len(node.args) == 1:
@@ -13066,6 +13483,18 @@ class Transpiler:
                         gi = self.coerce_to("int", n_arg, self.expr(n_arg))
                     return "index_obj(%s, %s)" % (
                         self.wrap_obj(func.value), gi)
+                if func.attr in ("start", "end") and len(node.args) <= 1:
+                    n_arg = node.args[0] if node.args else None
+                    if n_arg is None:
+                        gi = "0"
+                    elif isinstance(n_arg, ast.Constant) and \
+                            isinstance(n_arg.value, int):
+                        gi = str(n_arg.value)
+                    else:
+                        gi = self.coerce_to("int", n_arg, self.expr(n_arg))
+                    return "_re_span(%s, %s, %d)" % (
+                        self.wrap_obj(func.value), gi,
+                        0 if func.attr == "start" else 1)
             if self.stdlib_root:
                 return self._mp_method_call(func.value, func.attr, node)
             recv = self.expr(func.value)
@@ -13724,19 +14153,317 @@ class Transpiler:
                     return owner.field_ctype(tgt.attr)
         return None
 
+    @staticmethod
+    def _const_true(node):
+        """Is `node` a literal True? capture_output=some_flag is not lowered,
+        because the emitted call has to know at translation time whether the
+        pipes exist."""
+        return isinstance(node, ast.Constant) and node.value is True
+
+    def _is_str_repl(self, node):
+        """Is this replacement an actual string?
+
+        A callable repl needs the match object handed back into guest code, so
+        it must keep warning rather than be lowered. Excluding ast.Lambda alone
+        was not enough -- cpprust passes a *named* function, which reached
+        _cre_sub as a closure and failed to compile.
+        """
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return True
+        return self.value_ctype(node) == "char*"
+
     def _re_intern(self, pattern):
-        """Register a static regex `pattern` and return its matcher id, or None
-        if the pattern falls outside the supported subset (caller then falls
-        back to the dynamic/unsupported path -- never a wrong matcher)."""
+        """Register a static regex `pattern` and return its matcher id.
+
+        Two tiers. A pattern inside the narrow subset `regex_parse` accepts is
+        lowered to a specialized C matcher -- no engine, no bytecode, just the
+        comparisons that pattern needs. Anything else (alternation, `(?:...)`,
+        `\\b`, quantified groups, ...) is handed to the crust_re VM, which is
+        linked into the generated program only when tier 2 is actually used.
+
+        Whether crust_re accepts the pattern is deliberately NOT re-decided
+        here: mirroring its parser in Python is exactly the kind of duplicated
+        rule set that drifts and then lies. The generated program compiles every
+        tier-2 pattern during startup and aborts with the pattern and the
+        engine's own message if one is rejected. Patterns are compile-time
+        constants, so that failure is deterministic and fires on the first run.
+        """
         if pattern in self._regex_ids:
             return self._regex_ids[pattern]
-        parsed = regex_parse(pattern)
-        if parsed is None:
-            return None
         pid = len(self._regex_ids)
+        parsed = regex_parse(pattern)
         self._regex_ids[pattern] = pid
-        self._regex_parsed[pid] = parsed
+        if parsed is None:
+            self._regex_vm[pid] = pattern
+        else:
+            self._regex_parsed[pid] = parsed
         return pid
+
+    def _regex_vm_prelude(self):
+        """Engine source, pattern table, startup check and obj bridge for the
+        tier-2 (crust_re) patterns. Emitted only when tier 2 is used, so a
+        program whose patterns all fit the specializer links no engine."""
+        # Loaded by path: py2c is run from many working directories, and
+        # rpy_lib is not necessarily on sys.path.
+        _src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "rpy_lib", "crust_re_src.py")
+        _ns = {}
+        with open(_src, encoding="utf-8") as _f:
+            exec(compile(_f.read(), _src, "exec"), _ns)
+        crust_re_src = type("m", (), _ns)
+
+        pats = sorted(self._regex_vm)
+        self._regex_vm_slot = {pid: i for i, pid in enumerate(pats)}
+        out = []
+        out.append("/* ---- crust_re: regex VM for patterns outside the "
+                   "specializer's subset ---- */")
+        out.extend(crust_re_src.HEADER.splitlines())
+        out.extend(crust_re_src.SOURCE.splitlines())
+        out.append("")
+        n = len(pats)
+        out.append("#define _CRE_N %d" % max(n, 1))
+        out.append("#define _CRE_ARENA 16384")
+        out.append("static const char* _cre_pat[_CRE_N] = {")
+        for pid in pats:
+            out.append("    %s," % c_string(self._regex_vm[pid]))
+        if not pats:
+            out.append("    \"\",")   # only dynamic patterns in this program
+        out.append("};")
+        out.append("static char _cre_arena[_CRE_N][_CRE_ARENA];")
+        out.append("static crust_re* _cre_h[_CRE_N];")
+        out.append("static int _cre_ready = 0;")
+        out.append("")
+        # Compile-on-first-use, but check every pattern at once: a pattern the
+        # engine rejects must not wait for its own call site to be reached.
+        out.append("static void _cre_init(void) {")
+        out.append("    int i;")
+        out.append("    if (_cre_ready) return;")
+        out.append("    _cre_ready = 1;")
+        out.append("    for (i = 0; i < %d; i++) {" % n)
+        out.append("        const char* e = 0;")
+        out.append("        _cre_h[i] = crust_re_compile(_cre_pat[i], _cre_arena[i],")
+        out.append("                                     _CRE_ARENA, &e);")
+        out.append("        if (!_cre_h[i]) {")
+        out.append("            fprintf(stderr, \"regex: cannot compile %s: %s\\n\",")
+        out.append("                    _cre_pat[i], e ? e : \"unknown\");")
+        out.append("            abort();")
+        out.append("        }")
+        out.append("    }")
+        out.append("}")
+        out.append("")
+        # Same result shape as the specialized matchers: a LIST of captured
+        # strings, so `if m:` and `m.group(n)` need no new runtime type.
+        out.append("static obj _cre_run(int slot, char* t, int anc) {")
+        out.append("    int caps[128];")
+        out.append("    int ng, i, rc;")
+        out.append("    obj m;")
+        out.append("    if (!t) return OBJ_NONE;")
+        out.append("    _cre_init();")
+        out.append("    ng = crust_re_ngroups(_cre_h[slot]);")
+        out.append("    if (2 * (ng + 1) > 128) return OBJ_NONE;")
+        out.append("    rc = crust_re_exec(_cre_h[slot], t, strlen(t), anc,")
+        out.append("                       caps, 2 * (ng + 1));")
+        out.append("    if (rc != CRUST_RE_MATCH) return OBJ_NONE;")
+        out.append("    m = list_new();")
+        out.append("    for (i = 0; i <= ng; i++)")
+        out.append("        list_append(m, _re_slice(t, caps[2*i], caps[2*i+1]));")
+        out.append("    /* spans after the strings: see _re_emit_build */")
+        out.append("    for (i = 0; i <= ng; i++) {")
+        out.append("        list_append(m, OBJ_INT(caps[2*i]));")
+        out.append("        list_append(m, OBJ_INT(caps[2*i+1]));")
+        out.append("    }")
+        out.append("    return m;")
+        out.append("}")
+        out.extend(self._regex_dyn_bridge())
+        # findall/sub are built on _cre_dyn_get, so they must not be emitted
+        # for a program that only has constant patterns -- the bridge that
+        # defines it would be absent and the link would fail.
+        if self._regex_dyn:
+            out.extend(self._regex_api())
+        return out
+
+    def _regex_api(self):
+        """findall / sub over the dynamic bridge.
+
+        Both walk the subject with repeated anchored-at-offset matching rather
+        than re-scanning from zero, so an unanchored pattern over a long string
+        stays linear in the number of matches. An empty match advances one byte,
+        matching CPython, so `re.sub("x*", "-", "ab")` terminates."""
+        out = []
+        out.append("")
+        out.append("/* ---- re.findall / re.sub ---- */")
+        out.append("static obj _cre_findall(char* pat, char* t) {")
+        out.append("    obj res = list_new();")
+        out.append("    int caps[128];")
+        out.append("    crust_re* h;")
+        out.append("    long off = 0, len;")
+        out.append("    int ng, rc;")
+        out.append("    if (!pat || !t) return res;")
+        out.append("    h = _cre_dyn_get(pat);")
+        out.append("    ng = crust_re_ngroups(h);")
+        out.append("    len = (long)strlen(t);")
+        out.append("    while (off <= len) {")
+        out.append("        rc = crust_re_exec(h, t + off, (size_t)(len - off), 0,")
+        out.append("                           caps, 2 * (ng + 1));")
+        out.append("        if (rc != CRUST_RE_MATCH) break;")
+        out.append("        /* findall yields group 1 when there is exactly one")
+        out.append("         * group, else the whole match -- as CPython does. */")
+        out.append("        if (ng == 1)")
+        out.append("            list_append(res, _re_slice(t, off + caps[2], off + caps[3]));")
+        out.append("        else")
+        out.append("            list_append(res, _re_slice(t, off + caps[0], off + caps[1]));")
+        out.append("        if (caps[1] == caps[0]) off += caps[1] + 1;")
+        out.append("        else off += caps[1];")
+        out.append("    }")
+        out.append("    return res;")
+        out.append("}")
+        out.append("")
+        out.append("/* pat.search(text, pos): match from an offset. Spans are")
+        out.append(" * reported relative to the whole subject, as CPython does,")
+        out.append(" * so a caller stepping through with .end() keeps working. */")
+        out.append("static obj _cre_at(char* pat, char* t, int pos, int anc) {")
+        out.append("    int caps[128];")
+        out.append("    crust_re* h;")
+        out.append("    long len, i;")
+        out.append("    int ng, rc;")
+        out.append("    obj m;")
+        out.append("    if (!pat || !t) return OBJ_NONE;")
+        out.append("    len = (long)strlen(t);")
+        out.append("    if (pos < 0) pos = 0;")
+        out.append("    if (pos > len) return OBJ_NONE;")
+        out.append("    h = _cre_dyn_get(pat);")
+        out.append("    ng = crust_re_ngroups(h);")
+        out.append("    if (2 * (ng + 1) > 128) return OBJ_NONE;")
+        out.append("    rc = crust_re_exec(h, t + pos, (size_t)(len - pos), anc,")
+        out.append("                       caps, 2 * (ng + 1));")
+        out.append("    if (rc != CRUST_RE_MATCH) return OBJ_NONE;")
+        out.append("    m = list_new();")
+        out.append("    for (i = 0; i <= ng; i++)")
+        out.append("        list_append(m, _re_slice(t, pos + caps[2*i], pos + caps[2*i+1]));")
+        out.append("    for (i = 0; i <= ng; i++) {")
+        out.append("        list_append(m, OBJ_INT(caps[2*i] < 0 ? -1 : pos + caps[2*i]));")
+        out.append("        list_append(m, OBJ_INT(caps[2*i+1] < 0 ? -1 : pos + caps[2*i+1]));")
+        out.append("    }")
+        out.append("    return m;")
+        out.append("}")
+        out.append("")
+        out.append("/* re.finditer -> a LIST of match values, so `for m in ...`")
+        out.append(" * iterates it with no iterator protocol needed. */")
+        out.append("static obj _cre_finditer(char* pat, char* t) {")
+        out.append("    obj res = list_new();")
+        out.append("    long off = 0, len;")
+        out.append("    if (!pat || !t) return res;")
+        out.append("    len = (long)strlen(t);")
+        out.append("    while (off <= len) {")
+        out.append("        obj m = _cre_at(pat, t, (int)off, 0);")
+        out.append("        long e, s;")
+        out.append("        if (IS_NONE(m)) break;")
+        out.append("        list_append(res, m);")
+        out.append("        s = _re_span(m, 0, 0);")
+        out.append("        e = _re_span(m, 0, 1);")
+        out.append("        off = (e == s) ? e + 1 : e;")
+        out.append("    }")
+        out.append("    return res;")
+        out.append("}")
+        out.append("")
+        out.append("static char* _cre_sub(char* pat, char* rep, char* t) {")
+        out.append("    obj parts = list_new();")
+        out.append("    int caps[128];")
+        out.append("    crust_re* h;")
+        out.append("    long off = 0, len;")
+        out.append("    int ng, rc;")
+        out.append("    if (!pat || !t) return \"\";")
+        out.append("    if (!rep) rep = \"\";")
+        out.append("    h = _cre_dyn_get(pat);")
+        out.append("    ng = crust_re_ngroups(h);")
+        out.append("    len = (long)strlen(t);")
+        out.append("    while (off <= len) {")
+        out.append("        rc = crust_re_exec(h, t + off, (size_t)(len - off), 0,")
+        out.append("                           caps, 2 * (ng + 1));")
+        out.append("        if (rc != CRUST_RE_MATCH) break;")
+        out.append("        list_append(parts, _re_slice(t, off, off + caps[0]));")
+        out.append("        list_append(parts, OBJ_STR(rep));")
+        out.append("        if (caps[1] == caps[0]) {")
+        out.append("            /* zero-width: emit the byte we step over, or the")
+        out.append("             * loop would drop it. */")
+        out.append("            if (off + caps[1] < len)")
+        out.append("                list_append(parts, _re_slice(t, off + caps[1], off + caps[1] + 1));")
+        out.append("            off += caps[1] + 1;")
+        out.append("        } else {")
+        out.append("            off += caps[1];")
+        out.append("        }")
+        out.append("    }")
+        out.append("    if (off <= len) list_append(parts, _re_slice(t, off, len));")
+        out.append("    return pyjoin(\"\", parts);")
+        out.append("}")
+        return out
+
+    def _regex_dyn_bridge(self):
+        """`_cre_dyn(pat, text, anchored)` for patterns only known at runtime.
+
+        Compiled on first use behind a small direct-mapped cache, so a loop
+        matching the same pattern repeatedly compiles it once. A pattern the
+        engine rejects aborts naming the pattern and the message: there is no
+        exception channel here, and returning "no match" would turn a broken
+        pattern into a silently wrong answer."""
+        if not self._regex_dyn:
+            return []
+        out = []
+        out.append("")
+        out.append("/* ---- crust_re: runtime-valued patterns ---- */")
+        out.append("#define _CRED_N 8")
+        out.append("#define _CRED_PATMAX 512")
+        out.append("static char _cred_arena[_CRED_N][_CRE_ARENA];")
+        out.append("static char _cred_pat[_CRED_N][_CRED_PATMAX];")
+        out.append("static crust_re* _cred_h[_CRED_N];")
+        out.append("static int _cred_fill = 0;")
+        out.append("")
+        out.append("static crust_re* _cre_dyn_get(const char* pat) {")
+        out.append("    int i;")
+        out.append("    const char* e = 0;")
+        out.append("    size_t n = strlen(pat);")
+        out.append("    for (i = 0; i < _cred_fill; i++)")
+        out.append("        if (strcmp(_cred_pat[i], pat) == 0) return _cred_h[i];")
+        out.append("    if (n + 1 > _CRED_PATMAX) {")
+        out.append("        fprintf(stderr, \"regex: pattern too long (%lu bytes)\\n\",")
+        out.append("                (unsigned long)n);")
+        out.append("        abort();")
+        out.append("    }")
+        out.append("    /* Cache full: recompile into the last slot each time rather")
+        out.append("     * than evicting wrongly. Correct, just slower. */")
+        out.append("    i = _cred_fill < _CRED_N ? _cred_fill++ : _CRED_N - 1;")
+        out.append("    memcpy(_cred_pat[i], pat, n + 1);")
+        out.append("    _cred_h[i] = crust_re_compile(pat, _cred_arena[i], _CRE_ARENA, &e);")
+        out.append("    if (!_cred_h[i]) {")
+        out.append("        fprintf(stderr, \"regex: cannot compile %s: %s\\n\",")
+        out.append("                pat, e ? e : \"unknown\");")
+        out.append("        abort();")
+        out.append("    }")
+        out.append("    return _cred_h[i];")
+        out.append("}")
+        out.append("")
+        out.append("static obj _cre_dyn(char* pat, char* t, int anc) {")
+        out.append("    int caps[128];")
+        out.append("    int ng, i, rc;")
+        out.append("    obj m;")
+        out.append("    crust_re* h;")
+        out.append("    if (!pat || !t) return OBJ_NONE;")
+        out.append("    h = _cre_dyn_get(pat);")
+        out.append("    ng = crust_re_ngroups(h);")
+        out.append("    if (2 * (ng + 1) > 128) return OBJ_NONE;")
+        out.append("    rc = crust_re_exec(h, t, strlen(t), anc, caps, 2 * (ng + 1));")
+        out.append("    if (rc != CRUST_RE_MATCH) return OBJ_NONE;")
+        out.append("    m = list_new();")
+        out.append("    for (i = 0; i <= ng; i++)")
+        out.append("        list_append(m, _re_slice(t, caps[2*i], caps[2*i+1]));")
+        out.append("    /* spans after the strings: see _re_emit_build */")
+        out.append("    for (i = 0; i <= ng; i++) {")
+        out.append("        list_append(m, OBJ_INT(caps[2*i]));")
+        out.append("        list_append(m, OBJ_INT(caps[2*i+1]));")
+        out.append("    }")
+        out.append("    return m;")
+        out.append("}")
+        return out
 
     def coerce_to(self, target, value_node, rendered):
         """Coerce `rendered` (an expr for value_node) to the `target` C type."""

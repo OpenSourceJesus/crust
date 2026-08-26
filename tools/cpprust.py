@@ -1759,11 +1759,16 @@ def _iter_template_uses(text, tnames):
     a parameter and the use is the pattern, while at file scope `T` could
     perfectly well be a typedef somebody wrote.
 
-    The uses this yields never overlap: an innermost one holds no `<` in its
+    The uses this returns never overlap: an innermost one holds no `<` in its
     arguments, and the pattern above needs one, so the next match can only
     start past the closing `>`. That is what lets a caller rewrite the whole
     run from a single scan instead of one per pass.
+
+    Returns a list rather than generating. Both callers iterate the whole scan
+    over a finite string and nothing here has a side effect between elements,
+    so the two are equivalent -- and py2c lowers a list, not a generator.
     """
+    out = []
     for m in _TEMPLATE_OPEN.finditer(text):
         if m.group(1) not in tnames:
             continue
@@ -1777,7 +1782,8 @@ def _iter_template_uses(text, tnames):
         args = [a.strip() for a in _split_targs(inner)]
         if not args or not all(args):
             continue
-        yield m.start(), close + 1, m.group(1), tuple(args)
+        out.append((m.start(), close + 1, m.group(1), tuple(args)))
+    return out
 
 
 def _find_template_use(text, tnames):
