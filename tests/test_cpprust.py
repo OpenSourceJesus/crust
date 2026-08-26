@@ -1,6 +1,7 @@
 """Pure-translation tests for the C++ subset front end (tools.cpprust)."""
 
 import os
+import time
 import unittest
 
 import tools.cpprust as cpprust
@@ -3880,3 +3881,123 @@ class H { public: Vec_int v; };
 void f(void) { H a; }
 """, path="t.cpp", owning={"Vec_int": "Vec_int_free_buf"})
         self.assertNotIn("H_copy", out)
+
+
+class TestTranslationScales(unittest.TestCase):
+    """The lowering has to stay linear in the size of the file.
+
+    Every check here is about *work done*, not wall-clock time, so a slow
+    machine cannot turn one into a false failure. Each pins a place where
+    the pass used to rescan or re-copy the whole translation unit once per
+    thing it found, which is what made `litehtml/src/document.cpp` -- 1175
+    lines, but a megabyte with its headers spliced in -- take minutes.
+    """
+
+    def test_monomorphisation_costs_one_scan_per_nesting_level(self):
+        """`Name<..>` uses are rewritten a pass at a time, not one at a time.
+
+        A pass is a scan of the whole text, so one per *use* is quadratic.
+        Rewriting every innermost use together makes the pass count the
+        nesting depth instead -- here 1, plus the scan that finds nothing
+        left to do.
+        """
+        scans = []
+        real = cpprust._iter_template_uses
+
+        def counting(text, tnames):
+            scans.append(len(text))
+            return real(text, tnames)
+
+        src = " ".join("Box<int> b%d;" % i for i in range(400))
+        cpprust._iter_template_uses = counting
+        try:
+            out = cpprust._monomorphise_uses(src, {"Box"})
+        finally:
+            cpprust._iter_template_uses = real
+        self.assertEqual(out.count("Box_int"), 400)
+        self.assertNotIn("Box<", out)
+        self.assertLessEqual(len(scans), 2)
+
+    def test_nested_uses_are_still_recorded_inner_first(self):
+        """Batching must not disturb the order the emitter depends on."""
+        seen = []
+        out = cpprust._monomorphise_uses(
+            "Holder<Pair<int,int>> h; Pair<char,char> p;",
+            {"Holder", "Pair"},
+            record=lambda name, targs: seen.append((name, targs)))
+        self.assertEqual(seen, [("Pair", ("int", "int")),
+                                ("Pair", ("char", "char")),
+                                ("Holder", ("Pair_int_int",))])
+        self.assertIn("Holder_Pair_int_int h;", out)
+
+    def test_lookback_ignores_the_text_before_it(self):
+        """Reading back from a `{` or a `(` must not cost the whole prefix.
+
+        `_func_return_type` and `_assign_target` both look at the few tokens
+        before a fixed offset. Both used to be handed a fresh `text[:idx]`,
+        which makes one call cost a copy of everything before it and the
+        pass as a whole quadratic. The same offset in a file a hundred times
+        longer should take the same time; the bound is loose enough that
+        only that quadratic shape can break it.
+        """
+        tail = "\nstatic int compute(void) { return 0; }"
+        near = "int pad;\n" * 20 + tail
+        far = "int pad;\n" * 2000 + tail
+        scopes, cinfo = [{}], {}
+        for fn in (
+            lambda t: cpprust._func_return_type(t, t.index("(void")),
+            lambda t: cpprust._assign_target(t, t.index("(void"),
+                                             scopes, cinfo),
+        ):
+            t_near = _elapsed_repeatedly(fn, near)
+            t_far = _elapsed_repeatedly(fn, far)
+            self.assertLess(t_far, max(t_near * 20, 0.05))
+
+    def test_flattening_blanks_a_body_once_per_visit(self):
+        """Namespace flattening rewrites every name in one scan of the body.
+
+        It used to substitute one name at a time and re-blank the body after
+        each, so a namespace declaring a few hundred names -- litehtml
+        declares more -- paid a few hundred copies of the file per block.
+        """
+        calls = []
+        real = cpp_auto._blank_like
+
+        def counting(text):
+            calls.append(len(text))
+            return real(text)
+
+        names = ["nm%d" % i for i in range(60)]
+        src = ("namespace geo {\n"
+               + "".join("int %s(void);\n" % n for n in names)
+               + "}\n")
+        cpp_auto._blank_like = counting
+        try:
+            out = cpp_auto.resolve_namespaces(src)
+        finally:
+            cpp_auto._blank_like = real
+        self.assertIn("int geo_nm0(void);", out)
+        self.assertIn("int geo_nm59(void);", out)
+        self.assertLess(len(calls), len(names))
+
+    def test_declarator_scan_skips_impossible_positions(self):
+        """`_anchored_finditer` is `finditer`, minus the offsets that cannot match."""
+        src = """
+struct point { int x; int y; };
+int add(int a, int b);
+void run(void) { int t = add(1, 2); }
+const char *name;
+"""
+        for pat in (cpp_auto._DECLARATOR, cpp_auto._FIELD, cpp_auto._INDEXER):
+            self.assertEqual(
+                [(m.start(), m.groups()) for m in pat.finditer(src)],
+                [(m.start(), m.groups())
+                 for m in cpp_auto._anchored_finditer(pat, src)])
+
+
+def _elapsed_repeatedly(fn, text, rounds=200):
+    """Wall time for `rounds` calls, so one cheap call is still measurable."""
+    start = time.perf_counter()
+    for _ in range(rounds):
+        fn(text)
+    return time.perf_counter() - start

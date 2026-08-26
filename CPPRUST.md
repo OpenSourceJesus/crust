@@ -1432,6 +1432,38 @@ self-hosted caller can drive it through `os.system` where capturing a pipe
 is awkward. A `.cpp` include therefore needs python3 and this script on disk
 at compile time; a `.c` or `.rs` build needs neither.
 
+## What a translation costs
+
+A `.cpp` is not lowered on its own. Every header it includes is spliced in
+first, because a class this file uses is only a class if its declaration is
+in hand -- so `litehtml/src/document.cpp`, 1175 lines on disk, is a little
+over a megabyte by the time the passes below run over it.
+
+That makes the shape of each pass matter more than its constant. A pass that
+rescans the unit once per thing it finds is quadratic in the file, and a
+translation unit this size is where that stops being theoretical: it is the
+difference between a wait and a break. The passes are held to one scan per
+sweep, and the tests in `TestTranslationScales` pin the properties that
+keep them there:
+
+* **Monomorphisation** rewrites every innermost `Name<..>` use in one pass,
+  so the number of passes is the nesting depth rather than the number of
+  instantiations. `document.cpp` names some seven thousand uses and nests
+  two deep.
+* **Lookbacks** -- the return type before a `(`, the target of a `new`,
+  whether a `{` opens a struct body -- read the run of characters they can
+  actually match, never a fresh copy of the file up to that point.
+* **The character walkers** (`_rewrite_scopes`, `_rewrite_calls`) try their
+  patterns only where one could begin, which is a `*` or the first character
+  of a word. Between those they copy and move on.
+* **Blanking** (comments, literals, braces) jumps from one opener to the
+  next instead of walking every character, and namespace flattening blanks a
+  body once per visit rather than once per name it renames.
+
+None of this changes what is translated or what is refused. If a change here
+makes a file translate that did not before, or produces different C, that is
+a bug in the change and not an improvement.
+
 ## Tests
 
 ```sh

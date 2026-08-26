@@ -318,33 +318,72 @@ def _parse_tparams(inner, where):
     return tuple(names)
 
 
+_COMMENT_OPEN = re.compile(r"//|/\*|[\"']")
+_NOT_NEWLINE = re.compile(r"[^\n]")
+
+
 def _strip_comments(text):
-    """Blank comments, preserving newlines so line numbers hold."""
-    out = []
-    i, n = 0, len(text)
-    while i < n:
+    """Blank comments, preserving newlines so line numbers hold.
+
+    The scan jumps between openers instead of walking every character:
+    ordinary code is the overwhelming majority of a translation unit and
+    none of it needs inspecting, only copying.
+    """
+    n = len(text)
+    out, last, pos = [], 0, 0
+    while True:
+        m = _COMMENT_OPEN.search(text, pos)
+        if m is None:
+            break
+        i = m.start()
         if text.startswith("//", i):
             j = text.find("\n", i)
             j = n if j < 0 else j
+            out.append(text[last:i])
             out.append(" " * (j - i))
-            i = j
+            last = pos = j
         elif text.startswith("/*", i):
             j = text.find("*/", i + 2)
             j = n if j < 0 else j + 2
-            out.append("".join(c if c == "\n" else " " for c in text[i:j]))
-            i = j
-        elif text[i] in "\"'":
+            out.append(text[last:i])
+            out.append(_NOT_NEWLINE.sub(" ", text[i:j]))
+            last = pos = j
+        else:                              # a literal, which is kept as is
             q = text[i]
             j = i + 1
             while j < n and text[j] != q:
                 j += 2 if text[j] == "\\" else 1
-            j = min(j + 1, n)
-            out.append(text[i:j])
-            i = j
-        else:
-            out.append(text[i])
-            i += 1
+            pos = min(j + 1, n)
+        if pos <= i:
+            pos = i + 1
+    out.append(text[last:])
     return "".join(out)
+
+
+_PROBE_START = re.compile(r"\*|(?<!\w)\w")
+
+
+def _probe_positions(*texts):
+    """Where the character walkers need to try their patterns at all.
+
+    Both `_rewrite_scopes` and `_rewrite_calls` walk the file one character
+    at a time and try a dozen compiled patterns at every position. Every one
+    of those patterns can only begin at a `*` or at the first character of a
+    word -- their lookbehinds all reject a word character immediately
+    before -- and in a real source file the great majority of positions are
+    neither. Marking the candidates in one pass per text turns twelve regex
+    attempts per character into one byte lookup, which was the largest cost
+    left in both passes once the quadratic scans were gone.
+
+    More than one text is taken because a walker decides from the
+    comment-blanked copy but occasionally reads the original; marking both
+    keeps the filter a superset of what either could match.
+    """
+    hits = bytearray(len(texts[0]))
+    for t in texts:
+        for m in _PROBE_START.finditer(t):
+            hits[m.start()] = 1
+    return hits
 
 
 def _blank_directives(text):
@@ -401,25 +440,33 @@ def _match_brace(text, open_idx):
     return None
 
 
+_QUOTE = re.compile(r"[\"']")
+
+
 def _blank_strings(text):
-    """Blank string and char literal bodies, preserving length and newlines."""
-    out = []
-    i, n = 0, len(text)
-    while i < n:
+    """Blank string and char literal bodies, preserving length and newlines.
+
+    Only the literals are looked at; the code between them is copied in
+    whole slices rather than a character at a time.
+    """
+    n = len(text)
+    out, last, pos = [], 0, 0
+    while True:
+        m = _QUOTE.search(text, pos)
+        if m is None:
+            break
+        i = m.start()
         c = text[i]
-        if c in "\"'":
-            j = i + 1
-            while j < n and text[j] != c:
-                j += 2 if text[j] == "\\" else 1
-            j = min(j + 1, n)
-            out.append(c)
-            out.append("".join(ch if ch == "\n" else " "
-                               for ch in text[i + 1:j - 1]))
-            out.append(c if j - 1 < n else "")
-            i = j
-        else:
-            out.append(c)
-            i += 1
+        j = i + 1
+        while j < n and text[j] != c:
+            j += 2 if text[j] == "\\" else 1
+        j = min(j + 1, n)
+        out.append(text[last:i])
+        out.append(c)
+        out.append(_NOT_NEWLINE.sub(" ", text[i + 1:j - 1]))
+        out.append(c if j - 1 < n else "")
+        last = pos = j
+    out.append(text[last:])
     return "".join(out)
 
 
@@ -1695,8 +1742,11 @@ def _mono_name(name, targs):
     return "%s_%s" % (name, "_".join(_mangle(a) for a in targs))
 
 
-def _find_template_use(text, tnames):
-    """The first *innermost* `Name<..>` use in `text`, or None.
+_TEMPLATE_OPEN = re.compile(r"(?<![\w.>])(\w+)\s*<")
+
+
+def _iter_template_uses(text, tnames):
+    """Every *innermost* `Name<..>` use in `text`, left to right.
 
     Innermost first is what makes nesting work without a fixed point over
     the whole file: `Holder<Pair<int,int>>` yields `Pair<int,int>` first, so
@@ -1708,8 +1758,13 @@ def _find_template_use(text, tnames):
     on where it sits, not on how it is spelled: inside a template body `T` is
     a parameter and the use is the pattern, while at file scope `T` could
     perfectly well be a typedef somebody wrote.
+
+    The uses this yields never overlap: an innermost one holds no `<` in its
+    arguments, and the pattern above needs one, so the next match can only
+    start past the closing `>`. That is what lets a caller rewrite the whole
+    run from a single scan instead of one per pass.
     """
-    for m in re.finditer(r"(?<![\w.>])(\w+)\s*<", text):
+    for m in _TEMPLATE_OPEN.finditer(text):
         if m.group(1) not in tnames:
             continue
         open_idx = m.end() - 1
@@ -1722,7 +1777,13 @@ def _find_template_use(text, tnames):
         args = [a.strip() for a in _split_targs(inner)]
         if not args or not all(args):
             continue
-        return m.start(), close + 1, m.group(1), tuple(args)
+        yield m.start(), close + 1, m.group(1), tuple(args)
+
+
+def _find_template_use(text, tnames):
+    """The first *innermost* `Name<..>` use in `text`, or None."""
+    for hit in _iter_template_uses(text, tnames):
+        return hit
     return None
 
 
@@ -1743,27 +1804,44 @@ def _monomorphise_uses(text, tnames, record=None, known=None):
     """
     if not tnames:
         return text
-    # One use is rewritten per pass, so the bound has to scale with the file
-    # rather than sit at a constant: a flat 1000 was reached by
-    # `litehtml/src/document.cpp`, which names more template uses than that
-    # and is not looping at all. What actually distinguishes a loop is
-    # *progress* -- a rewrite that leaves the text unchanged would spin
-    # forever -- so that is checked directly, and the count is left only as
-    # a backstop that no real file can reach.
+    # Every innermost use is rewritten per pass rather than one, so a pass
+    # costs a single scan and the number of passes is the *nesting depth* --
+    # two or three -- instead of the number of instantiations. Rewriting one
+    # at a time rescanned the whole file per use, which is what made
+    # `litehtml/src/document.cpp` take minutes: it names some seven thousand
+    # uses, so the scan ran seven thousand times over a file that only ever
+    # nests two deep.
+    #
+    # Doing them together is safe because the uses in one scan cannot
+    # overlap (see `_iter_template_uses`) and none of them contains another,
+    # so no rewrite can invalidate a later hit from the same scan. An *outer*
+    # use only becomes innermost once its argument is mangled, which is the
+    # next pass -- exactly the order the one-at-a-time loop produced.
+    #
+    # The bound scales with the file rather than sitting at a constant, and
+    # is only a backstop: what actually distinguishes a loop is *progress* --
+    # a pass that leaves the text unchanged would spin forever -- so that is
+    # checked directly.
     for _ in range(max(1000, len(text))):
-        hit = _find_template_use(text, tnames)
-        if hit is None:
+        out, last = [], 0
+        for start, end, name, targs in _iter_template_uses(text, tnames):
+            if start < last:
+                continue              # already covered by an earlier rewrite
+            if record is not None:
+                record(name, targs)
+            if known is not None and tuple(targs) not in known.get(name, ()):
+                raise CppError(
+                    "`%s<%s>` is instantiated from inside another template, "
+                    "which this lowering cannot discover. Name it at file "
+                    "scope as well (`%s x;`) so it is emitted."
+                    % (name, ", ".join(targs), _mono_name(name, targs)))
+            out.append(text[last:start])
+            out.append(_mono_name(name, targs))
+            last = end
+        if not out:
             return text
-        start, end, name, targs = hit
-        if record is not None:
-            record(name, targs)
-        if known is not None and tuple(targs) not in known.get(name, ()):
-            raise CppError(
-                "`%s<%s>` is instantiated from inside another template, "
-                "which this lowering cannot discover. Name it at file scope "
-                "as well (`%s x;`) so it is emitted."
-                % (name, ", ".join(targs), _mono_name(name, targs)))
-        rewritten = text[:start] + _mono_name(name, targs) + text[end:]
+        out.append(text[last:])
+        rewritten = "".join(out)
         if rewritten == text:
             raise CppError("template instantiation did not terminate")
         text = rewritten
@@ -2943,6 +3021,7 @@ def _prev_word(text, idx):
 
 
 _STORAGE = re.compile(r"^(?:static|extern|inline|register|auto)\s+")
+_DIRECTIVE_LINE = re.compile(r"(?m)^[ \t]*#.*$")
 
 
 def _open_paren_before(text, close_idx):
@@ -2967,17 +3046,26 @@ def _func_return_type(text, open_paren):
     before the destructors run, which means spilling it to a temporary of
     the right type.
     """
-    head = text[:open_paren].rstrip()
-    cut = max(head.rfind(";"), head.rfind("}"), head.rfind("{"),
-              head.rfind(")"), head.rfind(":"))
+    # Bounds only -- the text before the declaration is never sliced out.
+    # This runs once per brace at file scope, and copying the whole prefix
+    # each time is what turned a 1175-line file into minutes of work.
+    stop = open_paren
+    while stop > 0 and text[stop - 1] in " \t\r\n":
+        stop -= 1
+    cut = -1
+    for ch in ";}{):":
+        cut = max(cut, text.rfind(ch, 0, stop))
     # A preprocessor directive is not part of a declaration, and contains
     # none of the characters above -- so `#include <stdio.h>` immediately
     # before `int main()` was read as part of the return type, and the
     # spilled temporary came out as `#include <stdio.h> int _cpp_ret0`.
     # A directive ends at its newline; nothing up to there belongs here.
-    for pm in re.finditer(r"(?m)^[ \t]*#.*$", head):
+    # Only the line `cut` sits on can carry one past it: every earlier
+    # directive ends at a newline that is itself before `cut`.
+    lo = text.rfind("\n", 0, max(cut, 0)) + 1
+    for pm in _DIRECTIVE_LINE.finditer(text, lo, stop):
         cut = max(cut, pm.end())
-    decl = head[cut + 1:].strip()
+    decl = text[cut + 1:stop].strip()
     m = re.match(r"^(.*?)([A-Za-z_]\w*)$", decl, re.S)
     if m is None:
         return None
@@ -3583,6 +3671,20 @@ def _rewrite_scopes(text, type_info):
     # word "struct" reads as a struct body and quietly suppresses every
     # constructor after it.
     look = _strip_comments(text)
+
+    def opens_aggregate(at):
+        """Does the `{` at `at` open a struct/union/enum body?
+
+        `agg_re` cannot reach back past a `;`, `{` or `}` -- its tail forbids
+        all three -- so only the run since the nearest one is searched.
+        Handing the pattern that window instead of a fresh `look[:at]` slice
+        is what keeps this linear: the slice made every brace in the file
+        cost a copy of everything before it.
+        """
+        j = max(look.rfind(";", 0, at), look.rfind("{", 0, at),
+                look.rfind("}", 0, at))
+        return agg_re.search(look, j + 1, at) is not None
+
     ret_re = re.compile(r"(?<![\w.])return\b")
     brk_re = re.compile(r"(?<![\w.])(break|continue)\s*;")
     goto_re = re.compile(r"(?<![\w.])goto\s+(\w+)")
@@ -3618,6 +3720,7 @@ def _rewrite_scopes(text, type_info):
     aggs = 0               # depth of enclosing struct/union/enum bodies
     tmp = [0]              # counter for return-value temporaries
     mvn = [0]              # counter for materialised move temporaries
+    probe = _probe_positions(look, text)
     i, n = 0, len(text)
     in_str = None
     while i < n:
@@ -3643,7 +3746,7 @@ def _rewrite_scopes(text, type_info):
         if c == "{":
             # A struct/union/enum body is not a scope: its members are field
             # declarations, not locals, so no ctor runs and nothing drops.
-            if aggs or agg_re.search(look[:i]):
+            if aggs or opens_aggregate(i):
                 aggs += 1
                 scopes.append(_Frame("block", None))
             else:
@@ -3714,6 +3817,12 @@ def _rewrite_scopes(text, type_info):
                            % (_dropfn(type_info.get(ctype), ctype), vname))
             if not scopes:
                 scopes = [_Frame("file", None)]
+            out.append(text[i])
+            i += 1
+            continue
+
+        # Nothing below can start here -- see `_probe_positions`.
+        if not probe[i]:
             out.append(text[i])
             i += 1
             continue
@@ -4809,18 +4918,38 @@ _DECL_TARGET = re.compile(r"(?<![\w.])(\w+)\s*\*\s*\w+\s*=\s*$")
 _ASSIGN_TARGET = re.compile(r"(?<![\w.>])(\w+)\s*=\s*$")
 
 
-def _assign_target(before, scopes, cinfo):
+# Both patterns above spell out nothing but identifiers, `*`, `=` and
+# whitespace, so a match can only begin inside the run of those characters
+# ending where the search does.
+_TARGET_CHARS = frozenset("*= \t\r\n\f\v")
+
+
+def _assign_target(look, at, scopes, cinfo):
     """The class a `new` expression is being assigned into, or None.
 
     Two shapes are recognised, which is what covers `Base *p = new
     Derived();` and a later `p = new Derived();`. Anything else -- a
     `return`, an argument, a field write through a chain -- yields None and
     no cast is inserted, so the C compiler still reports a real mismatch.
+
+    Both patterns are anchored at `at`, and only the short run before it can
+    hold a match, so that is the window they are given. Handing them a fresh
+    `look[:at]` copied the file before every `new` in it.
     """
-    m = _DECL_TARGET.search(before)
+    lo = at
+    while lo > 0:
+        c = look[lo - 1]
+        if c in _TARGET_CHARS or c.isalnum() or c == "_":
+            lo -= 1
+        else:
+            break
+    # `search(look, lo, at)` rather than a slice, so the lookbehinds still
+    # see the character before the window -- a `.` there means the name is a
+    # member and neither pattern applies.
+    m = _DECL_TARGET.search(look, lo, at)
     if m is not None:
         return m.group(1) if m.group(1) in cinfo else None
-    m = _ASSIGN_TARGET.search(before)
+    m = _ASSIGN_TARGET.search(look, lo, at)
     if m is not None:
         for s in reversed(scopes):
             if m.group(1) in s:
@@ -5222,6 +5351,7 @@ def _rewrite_calls(text, cinfo, free_refs):
     out = []
     scopes = [{}]
     pdepth = 0
+    probe = _probe_positions(look, text)
     i, n = 0, len(text)
     quote = None
     while i < n:
@@ -5271,6 +5401,13 @@ def _rewrite_calls(text, cinfo, free_refs):
             pdepth += 1
         elif c == ")":
             pdepth = max(0, pdepth - 1)
+
+        # Nothing below can start here -- see `_probe_positions`. Checked
+        # before the `for`-head lookback too, which is not free either.
+        if not probe[i]:
+            out.append(text[i])
+            i += 1
+            continue
 
         # Declarations are looked for outside parentheses -- an argument list
         # is full of names that are not declarations -- with one exception:
@@ -5651,7 +5788,7 @@ def _rewrite_calls(text, cinfo, free_refs):
             # address-preserving; it is inserted only when the target really
             # is an ancestor, so an unrelated mismatch still gets diagnosed
             # by the C compiler rather than silently cast away.
-            target = _assign_target(look[:i], scopes, cinfo)
+            target = _assign_target(look, i, scopes, cinfo)
             if target is not None and target != tname \
                     and _is_ancestor(target, tname, cinfo):
                 alloc = "(%s *)%s" % (target, alloc)
