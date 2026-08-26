@@ -8,9 +8,18 @@
 #   * + ? and their lazy forms *? +? ??, the anchors ^ and $, escaped
 #   metacharacters (\( \) \[ \] \" \\ ...), and capturing groups ( ... ).
 #
-# There is no alternation (|), no back-references, and no quantified groups,
-# because py2c never uses them. Group captures and lazy/greedy backtracking are
-# matched to CPython's `re` semantics (verified differentially in the tests).
+# There is no alternation (|), no counted repetition ({m,n}), no extension
+# groups ((?:...), (?P<n>...), lookaround), no word boundaries (\b), no
+# back-references, and no quantified groups, because py2c never uses them.
+# Group captures and lazy/greedy backtracking are matched to CPython's `re`
+# semantics (verified differentially in the tests).
+#
+# Anything outside that subset raises MinreError at compile time. This is a
+# hard requirement, not a nicety: an unsupported metacharacter that falls
+# through to the literal branch is wrong in BOTH directions -- `a|b` would fail
+# to match "b" AND would match the literal text "a|b" -- with no diagnostic
+# anywhere. When adding syntax here, add it to the rejection list in
+# test_minire.py first, then implement it.
 #
 # Written in the minipy subset (classes, while/for, recursion, lists, string
 # indexing -- no comprehensions, lambdas, or imports) so the same source runs on
@@ -28,6 +37,21 @@
 #   ["r", lo, hi]   inclusive character range
 #   ["s", ch]       a shorthand: 'w' 'd' 's' 'W' 'D' 'S'
 #   ["c", ch]       a single literal character
+
+
+class MinreError(Exception):
+    """Raised for any pattern outside minire's supported subset.
+
+    minire implements a deliberate subset of `re`. Anything outside it must
+    fail loudly here rather than being silently reinterpreted -- treating an
+    unsupported metacharacter as a literal produces confidently wrong matches
+    in BOTH directions (`a|b` failing to match "b", and matching "a|b").
+    """
+    pass
+
+
+# Mirrors `re.error` so callers can catch either name.
+error = MinreError
 
 
 def _is_word(ch):
@@ -99,23 +123,46 @@ def _compile_class(pat, i):
         negated = 1
         i = i + 1
     items = []
-    while i < len(pat) and pat[i] != "]":
+    closed = 0
+    while i < len(pat):
         c = pat[i]
+        if c == "]":
+            closed = 1
+            break
         if c == "\\":
+            if i + 1 >= len(pat):
+                raise MinreError("bad escape (end of pattern) in character class")
             nxt = pat[i + 1]
             if nxt == "w" or nxt == "d" or nxt == "s" or nxt == "W" or nxt == "D" or nxt == "S":
                 items.append(["s", nxt])
+            elif nxt == "b":
+                # inside a class \b is a backspace in CPython, not a boundary.
+                raise MinreError("\\b inside a character class is not supported")
+            elif _is_digit(nxt):
+                raise MinreError("numeric escape in character class is not supported")
+            elif nxt == "x" or nxt == "u" or nxt == "U" or nxt == "N" or nxt == "0":
+                raise MinreError("escape \\" + nxt + " is not supported")
             else:
                 items.append(["c", nxt])
             i = i + 2
         else:
             # a range like a-z (only when '-' is between two plain chars)
             if i + 2 < len(pat) and pat[i + 1] == "-" and pat[i + 2] != "]":
-                items.append(["r", c, pat[i + 2]])
+                lo = c
+                hi = pat[i + 2]
+                if hi == "\\":
+                    raise MinreError("escaped bound in character range is not supported")
+                if lo > hi:
+                    raise MinreError("bad character range " + lo + "-" + hi)
+                items.append(["r", lo, hi])
                 i = i + 3
             else:
                 items.append(["c", c])
                 i = i + 1
+    if closed == 0:
+        raise MinreError("unterminated character set")
+    if len(items) == 0:
+        raise MinreError("empty character set")
     return [negated, items], i + 1        # skip ']'
 
 
@@ -128,17 +175,34 @@ def _compile(pat):
     while i < n:
         c = pat[i]
         atom = None
-        if c == "(":
+        if c == "|":
+            raise MinreError("alternation '|' is not supported")
+        elif c == "{":
+            raise MinreError("counted repetition '{m,n}' is not supported")
+        elif c == "*" or c == "+":
+            raise MinreError("nothing to repeat at position " + str(i))
+        elif c == "(":
+            if i + 1 < n and pat[i + 1] == "?":
+                raise MinreError(
+                    "extension group '(?...)' is not supported "
+                    "(non-capturing, named, lookaround, flags)")
             ngroups = ngroups + 1
             gstack.append(ngroups)
             atoms.append(["gs", ngroups, 1, 1, 1])
             i = i + 1
             continue
         elif c == ")":
+            if len(gstack) == 0:
+                raise MinreError("unbalanced parenthesis at position " + str(i))
             g = gstack[len(gstack) - 1]
             gstack = gstack[0:len(gstack) - 1]
             atoms.append(["ge", g, 1, 1, 1])
             i = i + 1
+            # A quantifier here would apply to the whole group, which the
+            # flat atom list cannot express -- reject instead of dropping it.
+            if i < n and (pat[i] == "*" or pat[i] == "+" or pat[i] == "?" or pat[i] == "{"):
+                raise MinreError("quantified group '(...)" + pat[i]
+                                 + "' is not supported")
             continue
         elif c == "^":
             atoms.append(["bol", 0, 1, 1, 1])
@@ -155,9 +219,19 @@ def _compile(pat):
             spec, i = _compile_class(pat, i + 1)
             atom = ["cls", spec, 1, 1, 1]
         elif c == "\\":
+            if i + 1 >= n:
+                raise MinreError("bad escape (end of pattern)")
             nxt = pat[i + 1]
             if nxt == "w" or nxt == "d" or nxt == "s" or nxt == "W" or nxt == "D" or nxt == "S":
                 atom = ["cls", [0, [["s", nxt]]], 1, 1, 1]
+            elif nxt == "b" or nxt == "B":
+                raise MinreError("word boundary '\\" + nxt + "' is not supported")
+            elif nxt == "A" or nxt == "Z" or nxt == "G":
+                raise MinreError("anchor '\\" + nxt + "' is not supported")
+            elif _is_digit(nxt):
+                raise MinreError("backreference '\\" + nxt + "' is not supported")
+            elif nxt == "x" or nxt == "u" or nxt == "U" or nxt == "N":
+                raise MinreError("escape '\\" + nxt + "' is not supported")
             else:
                 atom = ["lit", nxt, 1, 1, 1]
             i = i + 2
@@ -180,7 +254,14 @@ def _compile(pat):
             if i < n and pat[i] == "?":
                 atom[4] = 0
                 i = i + 1
+            # `a**`, `a+*`, `a?{2}` etc: a second quantifier on one atom.
+            if i < n and (pat[i] == "*" or pat[i] == "+" or pat[i] == "{"):
+                raise MinreError("multiple repeat at position " + str(i))
+        elif i < n and pat[i] == "{":
+            raise MinreError("counted repetition '{m,n}' is not supported")
         atoms.append(atom)
+    if len(gstack) != 0:
+        raise MinreError("missing ), unterminated subpattern")
     return _Compiled(atoms, ngroups)
 
 
