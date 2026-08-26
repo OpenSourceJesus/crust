@@ -471,6 +471,17 @@ testminipy:
 	if python3 tools/rpy_lib/rast_test.py    >/dev/null 2>&1; then echo "  ok    rast_test (4-way)"; else echo "  FAIL  rast_test"; fail=1; fi; \
 	if python3 tools/rpy_lib/minipy2c_test.py >/dev/null 2>&1; then echo "  ok    minipy2c_test (3-way)"; else echo "  FAIL  minipy2c_test"; fail=1; fi; \
 	if python3 tools/rpy_lib/minast_native_test.py >/dev/null 2>&1; then echo "  ok    minast_native_test (3-way)"; else echo "  FAIL  minast_native_test"; fail=1; fi; \
+	echo "-- minire --"; \
+	if python3 tools/rpy_lib/sync_test_minire.py --check >/dev/null 2>&1; then echo "  ok    minire embedded copy in sync"; else echo "  FAIL  test_minire.py out of sync with minire.py (run tools/rpy_lib/sync_test_minire.py)"; fail=1; fi; \
+	run3 tools/rpy_lib/test_minire.py; \
+	echo "-- crust_re (C core) --"; \
+	if python3 runtime/crust_re_difftest.py -n 4000 >/tmp/crust_re_diff.txt 2>&1; then echo "  ok    crust_re differential vs CPython re"; else echo "  FAIL  crust_re differential (see /tmp/crust_re_diff.txt)"; fail=1; fi; \
+	if sh runtime/run_cpp_test.sh >/tmp/crust_re_cpp.txt 2>&1; then echo "  ok    crust_re C++ frontend (host == cpprust)"; else echo "  FAIL  crust_re C++ frontend (see /tmp/crust_re_cpp.txt)"; fail=1; fi; \
+	if python3 tools/pack_crust_re.py --check >/dev/null 2>&1; then echo "  ok    crust_re packaged source in sync"; else echo "  FAIL  crust_re_src.py stale (run tools/pack_crust_re.py)"; fail=1; fi; \
+	if sh tools/rpy_lib/run_crust_re_py2c_test.sh >/tmp/crust_re_py2c.txt 2>&1; then echo "  ok    crust_re RPython frontend (cpython == py2c native)"; else echo "  FAIL  crust_re RPython frontend (see /tmp/crust_re_py2c.txt)"; fail=1; fi; \
+	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_subprocess_py2c.py >/tmp/subproc_py2c.txt 2>&1; then echo "  ok    subprocess/tempfile shim (cpython == py2c native)"; else echo "  FAIL  subprocess/tempfile shim (see /tmp/subproc_py2c.txt)"; fail=1; fi; \
+	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_re_spans_py2c.py >/tmp/spans_py2c.txt 2>&1; then echo "  ok    match spans .start()/.end() (cpython == py2c native)"; else echo "  FAIL  match spans (see /tmp/spans_py2c.txt)"; fail=1; fi; \
+	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_re_finditer_py2c.py >/tmp/finditer_py2c.txt 2>&1; then echo "  ok    finditer + dynamic compile (cpython == py2c native)"; else echo "  FAIL  finditer/dynamic compile (see /tmp/finditer_py2c.txt)"; fail=1; fi; \
 	if [ $$fail = 0 ]; then echo "testminipy: PASS"; \
 	else echo "testminipy: FAIL"; fi; exit $$fail
 
