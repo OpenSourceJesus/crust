@@ -105,7 +105,14 @@ BUILTINS = {n: i for i, n in enumerate(
     ["print", "len", "range", "int", "str", "float", "abs", "bool",
      "list", "dict", "set", "tuple", "repr", "sorted", "sum", "min", "max",
      "isinstance", "enumerate", "zip", "any", "all", "ord", "chr",
-     "reversed", "getattr", "hasattr", "type", "setattr", "frozenset"])}
+     "reversed", "getattr", "hasattr", "type", "setattr", "frozenset",
+     # The regex seam. These are the only way guest code reaches a regex
+     # engine: rpy_lib/crustre.py (registered below as `re`) calls them, and
+     # interp.py implements them with a runtime-valued re.search/re.match that
+     # py2c lowers to the crust_re core. One engine for guests, py2c-compiled
+     # programs, C and C++ alike -- rather than a second Python implementation
+     # to keep in sync.
+     "__re_search", "__re_match"])}
 
 # Builtin exception hierarchy (name -> base name), parents before children so a
 # class's base is already registered when it is.  These are materialised as real
@@ -2275,7 +2282,7 @@ def _module_registry():
     here = os.path.dirname(os.path.abspath(__file__))
     lib = os.path.join(here, "..", "rpy_lib")
     return {
-        "re": os.path.join(lib, "minire.py"),
+        "re": os.path.join(lib, "crustre.py"),
         "os": os.path.join(lib, "minios.py"),
         "rast": os.path.join(lib, "rast.py"),
         "ast": os.path.join(lib, "minast.py"),
@@ -3339,6 +3346,20 @@ class VM:
                          or self._lookup_method(obj.cid, args[1]) is not None))
         if name == "type":
             return self._typeof(args[0])
+        if name == "__re_search" or name == "__re_match":
+            # Reference VM half of the regex seam. interp.py implements these
+            # with a runtime-valued re.search/re.match that py2c lowers to
+            # crust_re; here the stdlib stands in, which is what makes the
+            # cpython/ref/native comparison meaningful rather than circular.
+            import re as _re
+            pat, txt = args[0], args[1]
+            m = (_re.match(pat, txt) if name == "__re_match"
+                 else _re.search(pat, txt))
+            if m is None:
+                return None
+            ng = m.re.groups
+            return ([m.group(i) for i in range(ng + 1)]
+                    + [x for i in range(ng + 1) for x in m.span(i)])
         raise RuntimeError("unknown builtin id %d" % bid)
 
     def _typeof(self, x):

@@ -11,6 +11,7 @@ common container/string methods, and %-formatting. Containers live in a side
 heap indexed from the value box, so the scalar fast path stays allocation-free.
 Opcode numbers and the builtin/method tables mirror minipy/compiler.py.
 """
+import re
 import sys
 import json
 import rpy
@@ -1631,6 +1632,40 @@ def file_method(st: "St", nm: "char*", args: "list[V]") -> "V":
     return v_none()
 
 
+def _re_ngroups(pat: "char*") -> "long":
+    """Capturing groups in `pat`, counted from the pattern text.
+
+    Both sides of the seam agree on this number without asking the engine:
+    under CPython `m` is a stdlib match object and under minipy it is the flat
+    capture list crust_re returned, and neither exposes a group count the
+    subset can read. Counting '(' here is the one answer both agree on.
+    """
+    n = 0
+    i = 0
+    while i < len(pat):
+        c = pat[i]
+        if c == "\\":
+            i = i + 2
+            continue
+        if c == "[":                      # a '(' inside a class is literal
+            i = i + 1
+            while i < len(pat) and pat[i] != "]":
+                if pat[i] == "\\":
+                    i = i + 1
+                i = i + 1
+            i = i + 1
+            continue
+        if c == "(":
+            if i + 1 < len(pat) and pat[i + 1] == "?":
+                # (?P<name>...) captures; (?:...) and lookaround do not.
+                if i + 3 < len(pat) and pat[i + 2] == "P" and pat[i + 3] == "<":
+                    n = n + 1
+            else:
+                n = n + 1
+        i = i + 1
+    return n
+
+
 def do_builtin(st: "St", bid: "long", args: "list[V]") -> "V":
     if bid >= 100:
         return do_method(st, bid, args)
@@ -1718,6 +1753,41 @@ def do_builtin(st: "St", bid: "long", args: "list[V]") -> "V":
             for e in materialize(st, args[0]):
                 _set_add(st, sv, e)
         return sv
+    if bid == 30 or bid == 31:  # __re_search / __re_match
+        # The regex seam. Both arguments are guest strings, so the pattern is
+        # runtime-valued -- which is precisely what py2c lowers to crust_re's
+        # dynamic bridge. Returns the flat capture list [whole, g1, ...] that
+        # rpy_lib/crustre.py wraps, or None. Building the list here rather
+        # than a match object keeps the value crossing the seam to strings.
+        if len(args) < 2:
+            return v_none()
+        pat = args[0].sv
+        txt = args[1].sv
+        if bid == 31:
+            m = re.match(pat, txt)
+        else:
+            m = re.search(pat, txt)
+        if m is None:
+            return v_none()
+        out = new_v_list()
+        ng = _re_ngroups(pat)
+        gi = 0
+        while gi <= ng:
+            g = m.group(gi)
+            if g is None:
+                out.append(v_none())
+            else:
+                out.append(v_str(g))
+            gi = gi + 1
+        # Spans after the strings, matching the layout py2c builds for a match
+        # (see _re_emit_build): [g0..gn, s0,e0, ..., sn,en]. Keeping the two
+        # sides on one layout is what lets crustre.py read either.
+        gi = 0
+        while gi <= ng:
+            out.append(v_int(m.start(gi)))
+            out.append(v_int(m.end(gi)))
+            gi = gi + 1
+        return v_container(st, 7, 0, out)
     if bid == 29:              # frozenset (minipy: same as set, no immutability)
         out = new_v_list()
         sv = v_container(st, 9, 2, out)
