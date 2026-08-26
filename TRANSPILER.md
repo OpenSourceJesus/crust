@@ -498,7 +498,46 @@ named 'copy', but this project also uses the stdlib 'copy' module ...`). The
 advisory never changes the generated code; it only points at the classes to
 rename.
 
-## 9. Layout and running it
+## 9. Stdlib lowering, and the rule about guessing
+
+A growing set of stdlib calls lower to C shims rather than being left to the
+`is not lowered; substituted None` path. `regex` is documented separately in
+[REGEX.md](REGEX.md); the shape of the rest:
+
+| Call | Lowers to |
+|---|---|
+| `subprocess.run(argv, capture_output=, text=, cwd=)` | `fork`/`execvp` with both pipes drained by `poll()` |
+| `tempfile.mkdtemp(prefix=)` | `mkdtemp(3)` under `$TMPDIR` |
+| `re.*`, match `.group()`/`.start()`/`.end()` | the `crust_re` engine, or a specialized matcher |
+
+**Partial support is refused, not approximated.** `subprocess.run` lowers only
+for `capture_output`, `text` and `cwd`. `check=` would have to raise, and
+`env=`/`stdout=`/`stderr=` change the plumbing, so a call using them keeps
+warning instead of having the option silently dropped. Likewise `capture_output`
+must be a literal `True`, because the emitted call has to know at translation
+time whether the pipes exist.
+
+That is the general rule for this area. The failure mode being avoided is not a
+missing feature — it is a program that compiles, runs, and quietly does
+something other than what the Python did. `py2c` already warns and substitutes
+`None` rather than failing, so the transpiler is only as trustworthy as its
+willingness to say no.
+
+Two shim details that cost real debugging and are easy to repeat:
+
+- A shim returning a **string** should return `char*`, not `obj`. Returning
+  `obj` from `mkdtemp` made a comparison against its result lower to a pointer
+  compare between an `obj` and a `char*` — no error, wrong answer.
+- A shim's return type must be registered in `value_ctype`, or callers default
+  to `int` and `str()`/`join()` of the result fails to compile. Match
+  `.start()`/`.end()` return `long`; without that, `m.end() - 1` lowered to
+  `obj` arithmetic on a `long`.
+
+Both pipes of a captured `subprocess.run` are drained together with `poll()`.
+Reading `stdout` to EOF first deadlocks the moment the child fills `stderr`,
+which is why the test captures 5000 lines rather than a greeting.
+
+## 10. Layout and running it
 
 The transpiler is a single file, `tools/py2c.py`. Run from `tools/`:
 

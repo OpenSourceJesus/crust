@@ -810,6 +810,37 @@ a.assign("changed");                    // v[0] is still "alpha"
 `vector<T *>` with `new`/`delete` is the other shape that works, when you
 want the elements to outlive the container.
 
+### Regular expressions
+
+`std::regex` is not supplied and will not be: it wants exceptions, locales and
+iterators, none of which the subset has. `runtime/crust_re.hpp` gives you
+`cre::regex` over the same C engine the Rust and C sides use, and it is written
+in this subset for the same reason `string` and `vector` are.
+
+```cpp
+#include "crust_re.hpp"
+
+cre::regex re("(\\w+)=(\\d+)");
+if (!re.ok()) { /* re.error() names the problem -- nothing is thrown */ }
+
+cre::smatch m;
+if (cre::regex_search(re, "port=8080", m)) {
+    char buf[64];
+    m.str(1, buf, sizeof buf);          // "port"
+}
+```
+
+One wrinkle worth knowing, because it is a property of the subset rather than
+of the header: the capture-less forms are named `regex_matches` and
+`regex_contains`, not overloads of `regex_match`/`regex_search`. **Method**
+overloading is supported; **free-function** overloading is not, because free
+functions lower to plain C names and two `regex_match`es collide in the
+generated C. A host C++ compiler accepts the overloaded version happily, which
+is why `runtime/run_cpp_test.sh` builds the same source both with `g++` and
+through `cpprust.py` and diffs the output.
+
+See [REGEX.md](REGEX.md) for the supported pattern subset.
+
 Supplied container methods are emitted `static inline`, so the ones a
 program does not call are not warned about. User classes stay plain
 `static`, because you should still hear about your own dead code.

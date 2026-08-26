@@ -45,7 +45,10 @@ Stdlib surface actually used by py2c (measured, not guessed):
   classes used for `isinstance` checks and node construction. **Central — the
   interpreter must ship a real `ast` module.**
 - `os`: `environ`, `path`, `sep`, `fspath`, `listdir`, `makedirs`, `walk`
-- `re`: `match` **only** (a single call site)
+- `re`: `match` **only** (a single call site) — note this measured py2c's own
+  use, not what a guest may reach for. Guests now get a full `re` backed by the
+  `crust_re` engine (search, match, compile, findall, finditer, sub, escape,
+  groups and spans); see [REGEX.md](REGEX.md).
 - `sys`: `argv`, `exit`, `path`, `stderr`
 - `pathlib`, `pickle`, `shutil`, `subprocess` (per the requirement)
 - builtins: `all any dict enumerate float getattr hasattr int isinstance len

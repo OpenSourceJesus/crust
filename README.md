@@ -6,6 +6,9 @@ Main Crust Documentation:
 - [CPPRUST.md](CPPRUST.md) C+C++Rust
 - [SHIVYCX.md](SHIVYCX.md) SHIVYC-X (C Compiler)
 - [CPP2RUST.md](CPP2RUST.md) C++ to Rust translator
+- [TRANSPILER.md](TRANSPILER.md) the Python→C transpiler (`py2c.py`)
+- [REGEX.md](REGEX.md) one regex engine, shared by C, C++, RPython and minipy
+- [BUILDTOOLS.md](BUILDTOOLS.md) lowering `tools/` to native binaries
 
 Hardware:
 - [BAREMETAL_ARM64.md](BAREMETAL_ARM64.md)
