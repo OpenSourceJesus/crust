@@ -96,6 +96,49 @@ _INDEXER = re.compile(
     r"((?:[A-Za-z_][\w:]*(?:\s*<[^;{}()]*>)?[\s*&]+)+)"
     r"operator\s*\[\s*\]\s*\(")
 
+# The three patterns above can only begin just after one of these, or at the
+# very start of the text -- that is what their leading lookbehind says. The
+# lookahead carries the rest of what they all insist on (whitespace, then the
+# first character of a type name), so a boundary that cannot start one is
+# rejected by the scan instead of by a failed match attempt.
+_DECL_ANCHOR = re.compile(r"[;{}:\n](?=\s*[A-Za-z_])")
+
+
+def _anchored_finditer(pat, text):
+    """`pat.finditer(text)` for a pattern anchored at a declaration boundary.
+
+    Same matches, same non-overlapping rule -- but the boundaries are found
+    by one scan for `_DECL_ANCHOR` instead of retrying the whole pattern at
+    every offset in the file. The regex engine cannot see the anchor through
+    a lookbehind, so left to itself it does retry everywhere, and these
+    patterns are expensive to fail: a nested quantifier over type names,
+    backtracked at every character of a spliced translation unit.
+
+    `\A` matches only at offset 0 and not at a `pos` handed to `match`,
+    which is why position 0 is tried on its own rather than treated as one
+    more boundary.
+    """
+    n = len(text)
+    m = pat.match(text, 0)
+    nxt = 0
+    if m is not None:
+        yield m
+        nxt = m.end()
+    while True:
+        a = _DECL_ANCHOR.search(text, max(nxt - 1, 0))
+        if a is None:
+            return
+        start = a.start() + 1
+        if start > n:
+            return
+        m = pat.match(text, start)
+        if m is None:
+            nxt = start + 1
+            continue
+        yield m
+        nxt = max(m.end(), start + 1)
+
+
 _QUALIFIERS = frozenset(("static", "inline", "virtual", "const",
                          "explicit", "mutable", "extern"))
 
@@ -349,15 +392,15 @@ def _scan_classes(scan):
         body = scan[open_idx + 1:close]
         mm = methods.setdefault(cname, {})
         ff = fields.setdefault(cname, {})
-        for d in _INDEXER.finditer(body):
+        for d in _anchored_finditer(_INDEXER, body):
             ret, extra = _split_declarator(d.group(1))
             if ret and extra is None:
                 methods.setdefault(cname, {})["[]"] = ret
-        for d in _DECLARATOR.finditer(body):
+        for d in _anchored_finditer(_DECLARATOR, body):
             ret, name = _split_declarator(d.group(1))
             if ret and name is None and d.group(2):
                 mm[d.group(2)] = ret
-        for d in _FIELD.finditer(body):
+        for d in _anchored_finditer(_FIELD, body):
             ret, name = _split_declarator(d.group(1))
             if ret and name is None and d.group(2):
                 ff[d.group(2)] = ret
@@ -457,7 +500,7 @@ def _resolve_alias(ty, tmap):
 def _scan_functions(scan):
     """`{name: return type}` for functions declared or defined at file scope."""
     out = {}
-    for m in _DECLARATOR.finditer(scan):
+    for m in _anchored_finditer(_DECLARATOR, scan):
         ret, extra = _split_declarator(m.group(1))
         if extra is not None or not ret or m.group(2) in _KEYWORDS:
             continue
@@ -1059,6 +1102,9 @@ def resolve_range_for(text, path="<cpp>", blank=None):
 
 
 _CPP_REF_CALL = re.compile(r"__cpp_ref\s*\(\s*([\w:]+)\s*\)")
+_BLANK_OPEN = re.compile(r"[\"']|//|/\*")
+_BRACE = re.compile(r"[{}]")
+_NOT_NEWLINE = re.compile(r"[^\n]")
 
 
 def _blank_like(text):
@@ -1071,38 +1117,48 @@ def _blank_like(text):
     deduction from `m.find(..)` failed. Length is preserved, as everywhere
     else here, so positions in this copy still index the real text.
     """
-    out, i, n = list(text), 0, len(text)
-    while i < n:
+    n = len(text)
+    out, last, pos = [], 0, 0
+    # Jump from one literal or comment opener to the next rather than
+    # walking every character: this runs over the whole translation unit
+    # once per rewrite, so the characters *between* the interesting ones
+    # are the bulk of the work and none of them need looking at.
+    while True:
+        m = _BLANK_OPEN.search(text, pos)
+        if m is None:
+            break
+        i = m.start()
         c = text[i]
         if c in "\"'":
             q, j = c, i + 1
             while j < n and text[j] != q:
                 j += 2 if text[j] == "\\" else 1
-            for k in range(i + 1, min(j, n)):
-                if out[k] != "\n":
-                    out[k] = " "
-            i = min(j + 1, n)
-        elif c == "/" and text[i:i + 2] == "//":
+            lo, hi, pos = i + 1, min(j, n), min(j + 1, n)
+        elif text[i:i + 2] == "//":
             j = text.find("\n", i)
             j = n if j < 0 else j
-            for k in range(i, j):
-                out[k] = " "
-            i = j
-        elif c == "/" and text[i:i + 2] == "/*":
+            lo, hi, pos = i, j, j
+        else:
             j = text.find("*/", i + 2)
             j = n if j < 0 else j + 2
-            for k in range(i, j):
-                if out[k] != "\n":
-                    out[k] = " "
-            i = j
-        else:
-            i += 1
+            lo, hi, pos = i, j, j
+        out.append(text[last:lo])
+        out.append(_NOT_NEWLINE.sub(" ", text[lo:hi]))
+        last = hi
+        if pos <= i:
+            pos = i + 1
+    out.append(text[last:])
     blanked = "".join(out)
+    if "__cpp_ref" not in blanked:
+        return blanked
+    out, last = [], 0
     for m in _CPP_REF_CALL.finditer(blanked):
         pad = m.end() - m.start() - len(m.group(1))
-        blanked = (blanked[:m.start()] + " " * (pad - 1) + m.group(1) + " "
-                   + blanked[m.end():])
-    return blanked
+        out.append(blanked[last:m.start()])
+        out.append(" " * (pad - 1) + m.group(1) + " ")
+        last = m.end()
+    out.append(blanked[last:])
+    return "".join(out)
 
 
 def _sub_name(body, body_scan, name, repl):
@@ -1112,6 +1168,36 @@ def _sub_name(body, body_scan, name, repl):
                          body_scan):
         out.append(body[last:m.start()])
         out.append(repl)
+        last = m.end()
+    out.append(body[last:])
+    return "".join(out)
+
+
+def _flatten_pattern(names):
+    """One whole-word pattern matching every one of `names`, or None.
+
+    Built once and reused, because the alternative is what the flattening
+    passes below used to do: loop over some hundreds of names and, for each
+    one, substitute into the body and re-blank the result. All of that
+    collapses into a single scan -- and it is exactly equivalent, because at
+    any one position only a single name can match. `(?![\w])` means a match
+    ends where an identifier ends and `(?<![\w.>])` means it begins where
+    one begins, so the only candidate anywhere is the whole word sitting
+    there, and which name is tried first cannot change the answer.
+    """
+    names = list(names)
+    if not names:
+        return None
+    return re.compile(r"(?<![\w.>])(%s)(?![\w])"
+                      % "|".join(re.escape(n) for n in names))
+
+
+def _sub_flattened(body, body_scan, pat, ns):
+    """Rewrite every name `pat` finds to `ns_name`, guided by the copy."""
+    out, last = [], 0
+    for m in pat.finditer(body_scan):
+        out.append(body[last:m.start()])
+        out.append("%s_%s" % (ns, m.group(1)))
         last = m.end()
     out.append(body[last:])
     return "".join(out)
@@ -1339,17 +1425,17 @@ def resolve_namespaces(text, path="<cpp>", blank=None):
                     "already declares. C has one namespace, so the two would "
                     "become one symbol. Rename one of them."
                     % (path, _line_of(text, m.start()), ns, name, target))
-        for name in sorted(declared, key=len, reverse=True):
-            # Already flattened -- by this pass, when an earlier block of the
-            # same namespace declared it and pushed the rename outward. A
-            # forward declaration in one header and the definition in another
-            # is exactly that shape, and prefixing again gave
-            # `litehtml_litehtml_html_tag`.
-            if name.startswith(ns + "_") and name in produced:
-                continue
-            body = _sub_name(body, _blank_like(body), name, ns + "_" + name)
-            body_scan = _blank_like(body)
-            produced.add(ns + "_" + name)
+        # Names already flattened -- by this pass, when an earlier block of
+        # the same namespace declared one and pushed the rename outward -- are
+        # left alone. A forward declaration in one header and the definition
+        # in another is exactly that shape, and prefixing again gave
+        # `litehtml_litehtml_html_tag`.
+        renaming = [name for name in declared
+                    if not (name.startswith(ns + "_") and name in produced)]
+        pat = _flatten_pattern(renaming)
+        if pat is not None:
+            body = _sub_flattened(body, _blank_like(body), pat, ns)
+        produced.update("%s_%s" % (ns, name) for name in renaming)
         text = text[:m.start()] + body + text[close + 1:]
         scan = _blank_like(text)
         # A qualified reference from outside, and any `using` for it.
@@ -1419,16 +1505,23 @@ def _blank_braced(text):
     and a function's locals are not namespace names, and prefixing them
     renamed `Point::x` to `geo_x` and broke every use of it.
     """
-    out, depth = list(text), 0
-    for i, ch in enumerate(text):
-        if ch == "{":
+    # Only the braces themselves need looking at: the runs between them are
+    # either kept whole or blanked whole, so they are handled by the slice
+    # rather than a character at a time. This runs over the whole file once
+    # per namespace block, and litehtml reopens its namespace forty times.
+    out, depth, last = [], 0, 0
+    for m in _BRACE.finditer(text):
+        i = m.start()
+        chunk = text[last:i]
+        out.append(_NOT_NEWLINE.sub(" ", chunk) if depth > 0 else chunk)
+        out.append(text[i])
+        last = i + 1
+        if text[i] == "{":
             depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth < 0:
-                depth = 0
-        elif depth > 0 and out[i] != "\n":
-            out[i] = " "
+        else:
+            depth = max(0, depth - 1)
+    chunk = text[last:]
+    out.append(_NOT_NEWLINE.sub(" ", chunk) if depth > 0 else chunk)
     return "".join(out)
 
 
@@ -1466,6 +1559,9 @@ def _rename_in_qualified_defs(text, scan, ns, names):
     """
     if not names:
         return text
+    flat = _flatten_pattern(n for n in names if not n.startswith(ns + "_"))
+    if flat is None:
+        return text
     head = re.compile(r"(?<![\w:])(?:%s\s*::\s*)?(\w+)\s*::\s*~?\w+\s*\("
                       % re.escape(ns))
     pos = 0
@@ -1489,13 +1585,7 @@ def _rename_in_qualified_defs(text, scan, ns, names):
         if end is None:
             continue
         def _flatten(src):
-            out = src
-            for name in sorted(names, key=len, reverse=True):
-                if name.startswith(ns + "_"):
-                    continue
-                out = _sub_name(out, _blank_like(out), name,
-                                "%s_%s" % (ns, name))
-            return out
+            return _sub_flattened(src, _blank_like(src), flat, ns)
 
         # The parameter list as well as the body. A parameter written
         # `const std::shared_ptr<media_query_list>& media` in an out-of-line
@@ -1521,6 +1611,9 @@ def _rename_in_blocks(text, scan, ns, names):
     """Rewrite `names` to `ns_name` inside every other block of `ns`."""
     if not names:
         return text
+    flat = _flatten_pattern(n for n in names if not n.startswith(ns + "_"))
+    if flat is None:
+        return text
     while True:
         hit = None
         for m in _NAMESPACE.finditer(scan):
@@ -1531,12 +1624,7 @@ def _rename_in_blocks(text, scan, ns, names):
             if close is None:
                 continue
             body = text[open_idx + 1:close]
-            new = body
-            for name in sorted(names, key=len, reverse=True):
-                if name.startswith(ns + "_"):
-                    continue
-                new = _sub_name(new, _blank_like(new), name,
-                                "%s_%s" % (ns, name))
+            new = _sub_flattened(body, _blank_like(body), flat, ns)
             if new != body:
                 hit = (open_idx, close, new)
                 break
@@ -1563,11 +1651,11 @@ def _declared_in(body_scan):
     body_scan = _blank_braced(body_scan)
     for m in re.finditer(r"\b(?:class|struct|enum|union)\s+(\w+)", body_scan):
         out.add(m.group(1))
-    for m in _DECLARATOR.finditer(body_scan):
+    for m in _anchored_finditer(_DECLARATOR, body_scan):
         ret, extra = _split_declarator(m.group(1))
         if ret and extra is None and m.group(2) not in _KEYWORDS:
             out.add(m.group(2))
-    for m in _FIELD.finditer(body_scan):
+    for m in _anchored_finditer(_FIELD, body_scan):
         ret, extra = _split_declarator(m.group(1))
         if ret and extra is None and m.group(2) not in _KEYWORDS:
             out.add(m.group(2))

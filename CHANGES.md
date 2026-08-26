@@ -1,3 +1,101 @@
+# cpprust: translating litehtml to C, in seconds rather than minutes
+
+Fixes brentharts/crust#6. `tools/cpprust.py` hung on
+`juce_litehtml/litehtml/src/document.cpp`: 1175 lines of C++, two and a half
+minutes to reach a diagnostic. Three files changed, no new ones.
+
+**Nothing about the translation changes.** Every file that translated before
+translates now, every refusal is refused with the same sentence, and the C
+that comes out is byte-for-byte what came out before -- verified by running
+both trees over ten litehtml sources and diffing.
+
+## Why it was slow
+
+`document.cpp` is 1175 lines on disk and a little over a megabyte once its
+headers are spliced in, which they must be: a class this file uses is only a
+class if its declaration is in hand. Several passes were quadratic in that
+size -- each rescanned or re-copied the whole unit once per thing it found.
+At 40 KB nobody notices. At 1 MB it is minutes.
+
+The fixes are all the same shape: do the sweep once instead of once per hit.
+
+* **Monomorphisation.** `_monomorphise_uses` rewrote one `Name<..>` use per
+  pass and rescanned the file for the next. `document.cpp` names some seven
+  thousand uses, so the scan ran seven thousand times over a megabyte.
+  Innermost uses in one scan cannot overlap and none contains another, so
+  they are now all rewritten together and the pass count is the *nesting
+  depth* -- two. **55s of 175s.**
+* **Prefix slices.** `_func_return_type`, the struct-body lookback in
+  `_rewrite_scopes`, and `_assign_target` each took `text[:idx]` and searched
+  it end-anchored. Each pattern can only reach back to the nearest `;`, `{`,
+  `}` or a run of `[\w*=\s]`, so each now gets that window via
+  `search(text, lo, hi)` -- no copy, and the lookbehinds still see the
+  character before it. **55s.**
+* **Character walkers.** `_rewrite_scopes` and `_rewrite_calls` tried a dozen
+  compiled patterns at every character. All of them start at a `*` or the
+  first character of a word -- their lookbehinds say so -- so
+  `_probe_positions` marks those offsets once and the walkers skip straight
+  to copying at the rest. 23M regex attempts became 3M. **~5s.**
+* **Blanking.** `_blank_like`, `_strip_comments`, `_blank_strings` and
+  `_blank_braced` walked every character in Python. They now jump between
+  openers and copy the runs between them whole. **~20s.**
+* **Namespace flattening.** `_rename_in_blocks`, `_rename_in_qualified_defs`
+  and the per-block rename in `resolve_namespaces` substituted one name at a
+  time and re-blanked the body after each -- litehtml declares hundreds. One
+  alternation pattern does all of them in one scan; this is exact, because at
+  any position only the whole word sitting there can match. `_blank_like`
+  call count dropped from 50539 to 2587.
+* **Declarator scans.** `_DECLARATOR` and `_FIELD` are anchored on
+  `(?<=[;{}:\n])|\A`, which the regex engine cannot see through, so it
+  retried a backtracking nested quantifier at every offset.
+  `_anchored_finditer` finds the boundaries first and matches only there.
+  **~5s.**
+
+## Files
+
+* **`tools/cpprust.py`**: `_iter_template_uses` (generator; `_find_template_use`
+  keeps its signature on top of it) and the batched `_monomorphise_uses`;
+  `_probe_positions` + `_PROBE_START`; windowed `_func_return_type`,
+  `opens_aggregate`, `_assign_target` (now takes `(look, at)` rather than a
+  slice); opener-jumping `_strip_comments` and `_blank_strings`.
+* **`tools/cpp_auto.py`**: `_anchored_finditer` + `_DECL_ANCHOR`;
+  `_flatten_pattern` and `_sub_flattened`; opener-jumping `_blank_like` and
+  `_blank_braced`.
+* **`tests/test_cpprust.py`**: `TestTranslationScales` -- five tests that pin
+  the scaling properties rather than a wall-clock budget, so a slow machine
+  cannot make one fail spuriously.
+* **`CPPRUST.md`**: a "What a translation costs" section stating the rule the
+  passes are held to.
+* **`.gitignore`**: `.litehtml_out/` and `.litehtml_cache/`, which
+  `tools/litehtml_test.py` generates.
+
+## Verification
+
+* `document.cpp`: **2m29s -> 15s** (~10x), same diagnostic, same output file.
+* `python3 tools/litehtml_test.py --stage translate --no-cache`:
+  **41/43 ok, 2 translate-fail, 0 gcc-fail** -- the same two files, with the
+  same two messages, as before the change.
+* Ten litehtml sources translated on both trees: **byte-identical C**, and
+  byte-identical diagnostics for the two that are refused.
+* `tests/test_cpprust.py` + `test_cpprust_extras` + `test_crust`: 907 tests,
+  the same 2 pre-existing failures as `master`
+  (`test_by_value_return_of_a_borrowed_object_is_still_an_error`,
+  `test_helper_evaluates_this_once`).
+* `tools/test_cpprust_extras.py` 65 OK, `tools/test_std_move_lowering.py`
+  41 OK, `tools/test_cpp2rust.py` 3 errors -- all unchanged from `master`.
+* Every rewritten helper was differential-tested against the old
+  implementation: tens of thousands of fuzzed inputs plus the whole litehtml
+  corpus, zero differences.
+
+## What was left alone
+
+`clang_auto_types` (~4.5s: a subprocess and a JSON AST) is real external
+work, not a scanning bug. The `using namespace` rename in
+`resolve_namespaces` has the same one-name-at-a-time shape but does not
+register on litehtml, which qualifies explicitly, so it was not touched.
+
+---
+
 # rpython FFI / ctypes bridge — change summary
 
 Builds on `b224c42 "rpy 8bit quantized neural networks"`. Five files (three new).
