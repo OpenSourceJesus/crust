@@ -436,12 +436,12 @@ class FunctionWriter:
             return
         if op == "memory.size":
             dst = self.push(w.I32)
-            self.emit("%s = MEM_SIZE / 65536u;" % dst)
+            self.emit("%s = (u32)(MEM_SIZE / 65536u);" % dst)
             return
         if op == "memory.grow":
-            self.pop()
+            delta, _ = self.pop()
             dst = self.push(w.I32)
-            self.emit("%s = (u32)-1;  /* memory is fixed-size here */" % dst)
+            self.emit("%s = wasm_memory_grow(%s);" % (dst, delta))
             return
         if op == "memory.copy":
             n, _ = self.pop()
@@ -844,8 +844,13 @@ def func_c_name(mod, index):
     return "w2c_f%d" % index
 
 
-def write_module(mod, module_name="module"):
-    """Render a decoded module as C source text."""
+def write_module(mod, module_name="module", emit_main=True):
+    """Render a decoded module as C source text.
+
+    `emit_main` off leaves out the entry point, so the translation can be
+    linked into a driver of the caller's own -- which is how
+    tools/wasm_module_difftest.py drives each export separately.
+    """
     lines = []
     ap = lines.append
 
@@ -864,15 +869,27 @@ def write_module(mod, module_name="module"):
     # -- memory
     pages = mod.memory_pages if mod.memory_pages else 0
     if pages:
-        ap("#define MEM_PAGES %d" % pages)
-        ap("#define MEM_SIZE ((u64)MEM_PAGES * 65536u)")
-        ap("static u8 mem[MEM_SIZE];")
+        # Memory is allocated rather than a fixed array, because a module may
+        # grow it -- an allocator in a real module does so on its first call,
+        # and a fixed array turns that into a trap.
+        ap("#define MEM_INITIAL_PAGES %d" % pages)
+        ap("#define MEM_MAX_PAGES %d" % (mod.memory_max_pages
+                                         if mod.memory_max_pages >= 0
+                                         else 65536))
+        ap("static u8 *mem = 0;")
+        ap("static u64 wasm_mem_size = 0;")
+        ap("#define MEM_SIZE wasm_mem_size")
+        ap("static u32 wasm_memory_grow(u32 delta);")
     else:
         # A module with no memory still compiles: the helpers take the base
         # and size as arguments, so a zero-sized memory simply traps on any
         # access -- which cannot happen, since such a module has no loads.
-        ap("#define MEM_SIZE 0u")
-        ap("static u8 mem[1];")
+        ap("#define MEM_INITIAL_PAGES 0")
+        ap("#define MEM_MAX_PAGES 0")
+        ap("static u8 *mem = 0;")
+        ap("static u64 wasm_mem_size = 0;")
+        ap("#define MEM_SIZE wasm_mem_size")
+        ap("static u32 wasm_memory_grow(u32 delta);")
     ap("")
     # The WASI shims reach into linear memory, so they can only be defined
     # once MEM_SIZE and `mem` exist.
@@ -977,7 +994,34 @@ def write_module(mod, module_name="module"):
         ap("")
 
     # -- initialisation and entry point
-    ap("static void wasm_init(void) {")
+    ap("/* Grow linear memory by `delta` pages, returning the previous size")
+    ap(" * in pages, or -1 if it cannot grow. The new pages read as zero, as")
+    ap(" * the specification requires. */")
+    ap("static u32 wasm_memory_grow(u32 delta) {")
+    ap("  u64 old_pages = wasm_mem_size / 65536u;")
+    ap("  u64 new_pages = old_pages + (u64)delta;")
+    ap("  u8 *p;")
+    ap("  if (new_pages > (u64)MEM_MAX_PAGES) return (u32)-1;")
+    ap("  p = (u8 *)realloc(mem, (size_t)(new_pages * 65536u));")
+    ap("  if (!p) return (u32)-1;")
+    ap("  memset(p + wasm_mem_size, 0,")
+    ap("         (size_t)(new_pages * 65536u - wasm_mem_size));")
+    ap("  mem = p;")
+    ap("  wasm_mem_size = new_pages * 65536u;")
+    ap("  return (u32)old_pages;")
+    ap("}")
+    ap("")
+    ap("/* Exposed so an external driver can inspect memory. */")
+    ap("u8 *wasm_memory(void) { return mem; }")
+    ap("u64 wasm_memory_size(void) { return MEM_SIZE; }")
+    ap("")
+    ap("void wasm_init(void) {")
+    ap("  /* calloc, so memory starts zeroed as the specification requires;")
+    ap("   * the data segments are then laid over it. */")
+    ap("  size_t _init = (size_t)MEM_INITIAL_PAGES * 65536u;")
+    ap("  mem = (u8 *)calloc(_init ? _init : 1u, 1u);")
+    ap('  if (!mem) wasm_trap("out of memory");')
+    ap("  wasm_mem_size = (u64)MEM_INITIAL_PAGES * 65536u;")
     ap("  wasm_init_memory();")
     for idx in sorted(mod.table_entries):
         ap("  wasm_table[%d] = (wasm_anyfunc)%s;"
@@ -1016,6 +1060,9 @@ def write_module(mod, module_name="module"):
         ap("}")
         ap("")
 
+    if not emit_main:
+        return "\n".join(lines) + "\n"
+
     ap("int main(int argc, char **argv) {")
     ap("  (void)argc; (void)argv;")
     ap("  wasm_init();")
@@ -1040,16 +1087,19 @@ def write_module(mod, module_name="module"):
 def main(argv):
     args = []
     out_path = None
+    emit_main = True
     i = 1
     while i < len(argv):
         if argv[i] == "-o":
             i += 1
             out_path = argv[i]
+        elif argv[i] == "--no-main":
+            emit_main = False
         else:
             args.append(argv[i])
         i += 1
     if not args:
-        print("usage: wasm2c.py <module.wasm> [-o out.c]")
+        print("usage: wasm2c.py <module.wasm> [-o out.c] [--no-main]")
         return 2
 
     in_path = args[0]
@@ -1059,7 +1109,7 @@ def main(argv):
         sys.stderr.write("wasm2c: cannot read %s: %s\n" % (in_path, e))
         return 1
     try:
-        text = write_module(mod)
+        text = write_module(mod, emit_main=emit_main)
     except Wasm2CError as e:
         sys.stderr.write("wasm2c: %s\n" % e)
         return 1
