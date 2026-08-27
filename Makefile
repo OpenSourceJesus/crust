@@ -95,6 +95,10 @@ roundtrip_wasm:
 test_wasm_simd:
 	python3 tools/wasm_simd_difftest.py -v
 
+# Reference types (funcref/externref): hand-built modules checked against node.
+test_wasm_ref:
+	python3 tools/wasm_ref_difftest.py -v
+
 # Run a real third-party module under node and under its wasm2c translation
 # and compare every export's result *and* a hash of linear memory:
 #     make test_wasm_module MODULES="a.wasm b.wasm"

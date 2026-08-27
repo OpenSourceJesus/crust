@@ -396,7 +396,34 @@ four-iteration loop over `.u32x4`. No vector intrinsics are used: the point is
 portable C that says what the specification says, and compilers re-vectorise
 these loops perfectly well.
 
-**Reference types** are still not decoded, and say so rather than mis-reading.
+### Reference types
+
+`funcref` and `externref` decode and translate. A reference is opaque -- null,
+a function, or a host value -- so it becomes `void *` in C, with `NULL` as
+`ref.null`. Tables are arrays of those: a funcref table's entries are function
+pointers, which is what makes `call_indirect` a cast and a call, and an
+externref table's are whatever the host put there.
+
+What the proposal actually added, and what had to change:
+
+  - **Reference value types**, so a local, a parameter or a table slot can
+    hold one. `select` gained a typed form (`0x1C`) because the untyped one
+    cannot say which reference it is choosing.
+  - **Multiple tables**, each with its own element type. The old code assumed
+    exactly one funcref table; `call_indirect` now honours the table index in
+    its immediate.
+  - **Table instructions** -- `table.get/set/size/grow/fill/copy/init` and
+    `elem.drop` -- none of which existed in the MVP.
+  - **Seven new element-segment encodings.** Before, there was one form:
+    active, table 0, a vector of function indices. Reference types added
+    passive and declarative segments, explicit table indices, and initialisers
+    written as expressions, selected by the low three bits of a flags field.
+    Refusing those seven is what made wasm-bindgen output undecodable.
+
+`tools/wasm_ref_difftest.py` builds modules using each of these and compares
+the result against node. The modules are hand-encoded because Crust's own back
+end emits none of it -- which also makes it the only test exercising the
+element-segment forms no other producer here generates.
 
 ### What real modules do
 
@@ -441,6 +468,7 @@ make test_wasm                       # fixed corpus vs gcc
 make roundtrip_wasm                  # C -> wasm -> C -> native, vs gcc
 make fuzz_wasm SEED=3 COUNT=300      # random programs vs gcc
 make test_wasm_simd                  # SIMD translation vs node
+make test_wasm_ref                   # funcref/externref vs node
 make test_wasm_module MODULES=x.wasm # run a real module both ways
 make wasm2c WASM=prog.wasm           # translate one module back to C
 ```
