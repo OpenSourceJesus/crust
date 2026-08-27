@@ -90,6 +90,11 @@ fuzz_wasm:
 roundtrip_wasm:
 	python3 tools/wasm_roundtrip.py
 
+# SIMD: check the generated opcode table and the translation of v128
+# operators against node, which is an independent implementation.
+test_wasm_simd:
+	python3 tools/wasm_simd_difftest.py -v
+
 # Translate a .wasm back to C:  make wasm2c WASM=prog.wasm
 WASM ?= build/wasm/hello.wasm
 wasm2c:

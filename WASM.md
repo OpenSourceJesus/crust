@@ -359,9 +359,54 @@ The decoder targets the format, not this compiler's habits, so modules from
 elsewhere work. A Rust-built `qcms_bg.wasm` (138 functions, 41,660
 instructions) decodes, translates to 45,000 lines of C, and compiles clean.
 
-Two extensions are not decoded yet and say so rather than mis-reading:
-**SIMD** (`v128`, the `0xFD` opcode prefix) and **reference types**. Those are
-the next things to add if arbitrary real-world modules matter.
+### SIMD
+
+All 256 SIMD opcodes decode, and 216 of the 236 core operators translate to C.
+The remaining twenty are **relaxed SIMD**, whose results the specification
+leaves implementation defined by design -- translating them would mean picking
+one behaviour and presenting it as the answer, so they are refused by name
+instead.
+
+Both halves are generated rather than written out. `shivyc/wasm_simd.py`
+builds the opcode table from the structure of the space:
+
+    cmp_int(35, "i8x16")        # the ten comparisons, in their fixed order
+    seq(224, FLOAT_ARITH, "f32x4.%s")
+
+and `shivyc/wasm_simd_c.py` generates the C for each operator family:
+
+    lanewise(["add"], ints, "A + B")
+    lanewise(["sub"], ints, "A - B")
+
+That is 256 opcodes and 216 handlers from roughly 300 lines, and -- more to
+the point -- a mistake in a family is a mistake in one visible line rather
+than in one of six that all look alike.
+
+Generation has its own failure mode, though, which is why both halves are
+checked. `self_check()` re-derives the opcode counts and rejects duplicates,
+`coverage()` reports any operator in the table with no code path, and
+`tools/wasm_simd_difftest.py` builds small SIMD modules and compares the
+module's result under node against its translation compiled by cc. That last
+check immediately caught `i32x4.sub` computing an *addition*: a single
+`lanewise(["add", "sub"], ints, "A + B")` had given both operators the same
+expression. Six operators, one wrong line, invisible on inspection.
+
+A v128 is rendered as a union of lane arrays, so `i32x4.add` becomes a
+four-iteration loop over `.u32x4`. No vector intrinsics are used: the point is
+portable C that says what the specification says, and compilers re-vectorise
+these loops perfectly well.
+
+**Reference types** are still not decoded, and say so rather than mis-reading.
+
+### What real modules do
+
+Three third-party modules, all built by toolchains other than this one:
+
+| Module | Functions | Instructions | SIMD | Result |
+| --- | --- | --- | --- | --- |
+| `qcms_bg.wasm` (Rust) | 138 | 41,660 | 0 | 45k lines of C, compiles |
+| `jbig2.wasm` | 121 | 49,924 | 709 | 55k lines of C, compiles |
+| `openjpeg.wasm` | 202 | 112,690 | 1,790 | 119k lines of C, compiles |
 
 ## Testing
 
@@ -369,6 +414,7 @@ the next things to add if arbitrary real-world modules matter.
 make test_wasm                       # fixed corpus vs gcc
 make roundtrip_wasm                  # C -> wasm -> C -> native, vs gcc
 make fuzz_wasm SEED=3 COUNT=300      # random programs vs gcc
+make test_wasm_simd                  # SIMD translation vs node
 make wasm2c WASM=prog.wasm           # translate one module back to C
 ```
 
