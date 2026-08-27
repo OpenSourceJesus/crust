@@ -947,10 +947,19 @@ deducing `K` from `m.begin()` would be *wrong* rather than unsupported.
 Anything else — a call result, a by-value parameter, more than one template
 parameter — is reported, and you write `f<T>(..)`.
 
-Deduction never reads a declaration above your first line. The supplied
-templates have ordinary local names in them, and without that bound a
-`T *a` parameter inside `swap` answered for a call whose `a` was your own
-`int a[4]`.
+Deduction reads only what is in scope at the call: a brace region that
+opened and closed above it is skipped, so another function's locals and an
+earlier `if` block's locals cannot answer for a name they merely share.
+Within what remains, the nearest declaration wins, so a local still shadows
+a global.
+
+It also never reads above your first line. The supplied templates have
+ordinary local names in them, and without that bound a `T *a` parameter
+inside `swap` answered for a call whose `a` was your own `int a[4]`.
+
+It is not a symbol table — this pass runs before one exists. What it cannot
+type confidently it declines to type, and the call is reported rather than
+guessed.
 
 `push_back` on `vector<T>` has a **move overload** for a class element, taken
 when the call site writes `std::move` -- which is what lets a `vector` hold a
