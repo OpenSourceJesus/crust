@@ -111,6 +111,8 @@ def main():
 
     # Apply any -I include directories to the preprocessor.
     preproc.set_include_dirs(include_dirs)
+    # Before set_defines: the target selects which macros are predefined.
+    preproc.set_target(get_target(getattr(arguments, "target", "x86_64")).name)
     preproc.set_defines(defines)
 
     # Whether to alias long double to double (-f-long-double-as-double).

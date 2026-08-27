@@ -362,6 +362,16 @@ class FuncBody:
         self.code.extend(uleb(type_idx))
         self.code.append(0x00)           # table index
 
+    def simd(self, code, imm_bytes=None):
+        """A SIMD instruction: the 0xFD prefix, the operator index, and
+        whatever immediate bytes it carries (a lane index, a shuffle mask,
+        a memarg)."""
+        self.code.append(0xFD)
+        self.code.extend(uleb(code))
+        if imm_bytes:
+            for b in imm_bytes:
+                self.code.append(b)
+
     def trunc_sat(self, to_type, from_type, signed):
         """A saturating float-to-integer conversion (0xFC-prefixed)."""
         self.code.append(TRUNC_SAT_PREFIX)

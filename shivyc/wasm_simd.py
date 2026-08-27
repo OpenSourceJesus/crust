@@ -261,3 +261,96 @@ def self_check():
                             % (nm, names[nm], code))
         names[nm] = code
     return problems
+
+
+# ------------------------------------------------- operator signatures
+#
+# Kinds a SIMD operand or result can have. Derived from the operator's name
+# rather than tabulated separately: the shape prefix and the suffix already
+# say what the types are, and a second table would only be a second thing to
+# keep in step with the first.
+K_V128 = "v128"
+K_I32 = "i32"
+K_I64 = "i64"
+K_F32 = "f32"
+K_F64 = "f64"
+
+# The scalar a shape's lanes are read and written as. Sub-word lanes are
+# handled as i32, exactly as extract_lane/replace_lane define them.
+LANE_SCALAR = {
+    "i8x16": K_I32, "i16x8": K_I32, "i32x4": K_I32,
+    "i64x2": K_I64, "f32x4": K_F32, "f64x2": K_F64,
+}
+
+_UNARY = ("neg", "abs", "sqrt", "ceil", "floor", "trunc", "nearest",
+          "popcnt", "not")
+
+
+def signature(name):
+    """(parameter kinds, result kind) for a SIMD operator.
+
+    `None` as the result means the operator produces nothing.
+    """
+    shape = name.split(".")[0]
+    base = name.split(".")[-1]
+
+    if name == "v128.store":
+        return [K_I32, K_V128], None
+    if name.startswith("v128.store") and name.endswith("_lane"):
+        return [K_I32, K_V128], None
+    if name.startswith("v128.load") and name.endswith("_lane"):
+        return [K_I32, K_V128], K_V128
+    if name.startswith("v128.load"):
+        return [K_I32], K_V128
+    if name == "v128.const":
+        return [], K_V128
+    if name == "v128.bitselect":
+        return [K_V128, K_V128, K_V128], K_V128
+    if name == "v128.any_true":
+        return [K_V128], K_I32
+    if name == "v128.not":
+        return [K_V128], K_V128
+    if name in ("v128.and", "v128.or", "v128.xor", "v128.andnot"):
+        return [K_V128, K_V128], K_V128
+
+    if base == "splat":
+        return [LANE_SCALAR[shape]], K_V128
+    if base == "all_true" or base == "bitmask":
+        return [K_V128], K_I32
+    if "extract_lane" in base:
+        return [K_V128], LANE_SCALAR[shape]
+    if "replace_lane" in base:
+        return [K_V128, LANE_SCALAR[shape]], K_V128
+    if base in ("shl", "shr_s", "shr_u"):
+        # The shift count is a scalar, not a vector of counts.
+        return [K_V128, K_I32], K_V128
+    if name == "i8x16.shuffle":
+        return [K_V128, K_V128], K_V128
+    if base in _UNARY:
+        return [K_V128], K_V128
+    if ("extend_" in name or "extadd_" in name or "convert_" in name
+            or "trunc_sat_" in name or "demote_" in name
+            or "promote_" in name):
+        return [K_V128], K_V128
+    return [K_V128, K_V128], K_V128
+
+
+def builtin_name(op):
+    """The C builtin spelling of a SIMD operator.
+
+    `i32x4.add` becomes `__builtin_wasm_i32x4_add`. Mechanical, so the header
+    and the back end agree without either listing the operators.
+    """
+    return "__builtin_wasm_" + op.replace(".", "_")
+
+
+def op_for_builtin(name):
+    """Inverse of builtin_name, or None if `name` is not one."""
+    prefix = "__builtin_wasm_"
+    if not name.startswith(prefix):
+        return None
+    tail = name[len(prefix):]
+    for code in OPCODES:
+        if builtin_name(OPCODES[code][0]) == name:
+            return OPCODES[code][0]
+    return None

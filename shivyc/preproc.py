@@ -348,6 +348,15 @@ _cmdline_define_prelude = (
     "#define __builtin_va_copy(dst, src) ((dst) = (src))\n")
 
 
+_target_name = "x86_64"
+
+
+def set_target(name):
+    """Record the target, so target-conditional macros can be predefined."""
+    global _target_name
+    _target_name = name
+
+
 def set_defines(defines: "list[str]"):
     """Record command-line ``-D`` macros (each ``NAME`` or ``NAME=VALUE``).
 
@@ -371,6 +380,12 @@ def set_defines(defines: "list[str]"):
              "((ap) = (char *)__builtin_va_start_addr())",
              "#define __builtin_va_end(ap) ((void)((ap) = (char *)0))",
              "#define __builtin_va_copy(dst, src) ((dst) = (src))"]
+    if _target_name == "wasm":
+        # Lets a header select the wasm spelling of an intrinsic, exactly as
+        # it would under clang. shivyc/include/wasm_simd128.h uses it to pick
+        # between the builtins and a portable scalar fallback.
+        lines.append("#define __wasm__ 1")
+        lines.append("#define __wasm32__ 1")
     for d in defines or []:
         name, eq, val = d.partition("=")
         lines.append("#define %s %s" % (name, val if eq else "1"))

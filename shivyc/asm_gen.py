@@ -5764,6 +5764,11 @@ class ASMGen:
                 nm = c.direct_name
                 if nm is None or nm in self.il_code.commands:
                     continue            # indirect, or defined here
+                if nm.startswith("__builtin_wasm_"):
+                    # A SIMD intrinsic. It has no definition anywhere and is
+                    # not a host function: the back end turns it into an
+                    # instruction, so it must not become an import.
+                    continue
                 if nm in self._wasm_imports:
                     continue
                 params, results = self._wasm_import_sig(nm)
@@ -5928,7 +5933,8 @@ class ASMGen:
         # a local index is meaningful only inside the function that declared
         # it. Caching them across functions silently aims a store at whatever
         # local happens to share the number in the next one.
-        key = "i64" if valtype == 0x7E else "i32"
+        key = {0x7E: "i64", 0x7D: "f32", 0x7C: "f64",
+               0x7B: "v128"}.get(valtype, "i32")
         idx = self._wasm_scratches.get(key, -1)
         if idx < 0:
             idx = nparams + body.add_local(valtype)
@@ -6697,6 +6703,9 @@ class ASMGen:
             if fname is None:
                 self._wasm_indirect_call(cmd, body, locals_of, nparams, mod)
                 return
+            if fname.startswith("__builtin_wasm_"):
+                self._wasm_simd_builtin(cmd, fname, body, locals_of, nparams)
+                return
 
             idx = mod.func_index(fname)
             if idx < 0:
@@ -6936,6 +6945,116 @@ class ASMGen:
             body.const_i32(cmd.chunk)
             body.op(wasm.I32_BIN["mul"])
         body.op(wasm.I32_BIN["add"])
+
+    def _wasm_simd_builtin(self, cmd, fname, body, locals_of, nparams):
+        """Lower a `__builtin_wasm_*` call to the SIMD instruction it names.
+
+        The mapping is mechanical -- `__builtin_wasm_i32x4_add` is
+        `i32x4.add` -- so every operator in the table is reachable from C
+        without either side listing them.
+
+        v128 values live in the frame rather than in a wasm local, because
+        the front end sees them as a 16-byte struct and that is where it puts
+        aggregates. So each vector operand is loaded from its address, the
+        instruction runs on the operand stack, and a vector result is stored
+        back. That costs memory traffic between consecutive intrinsics, which
+        an engine's own optimiser largely removes; keeping v128 in a local
+        would need a value type the front end does not have.
+        """
+        import shivyc.wasm as wasm
+        import shivyc.wasm_simd as simd
+
+        op = simd.op_for_builtin(fname)
+        if op is None:
+            raise NotImplementedError(
+                "wasm back end: unknown builtin '%s'" % fname)
+        if simd.is_relaxed(op):
+            raise NotImplementedError(
+                "wasm back end: relaxed SIMD operator '%s' has "
+                "implementation-defined results" % op)
+
+        code = None
+        imm_kind = None
+        for c in simd.OPCODES:
+            if simd.OPCODES[c][0] == op:
+                code = c
+                imm_kind = simd.OPCODES[c][1]
+                break
+
+        params, result = simd.signature(op)
+        # Operators carrying an immediate take it as a trailing C argument,
+        # which must be a literal: it is encoded into the instruction, not
+        # evaluated.
+        imm_bytes = []
+        args = list(cmd.args)
+        if imm_kind == simd.IMM_LANE:
+            if not args:
+                raise NotImplementedError(
+                    "wasm back end: '%s' needs a lane index" % op)
+            lane = args.pop()
+            lit = getattr(lane, "literal", None)
+            if lit is None:
+                raise NotImplementedError(
+                    "wasm back end: the lane index of '%s' must be a "
+                    "constant" % op)
+            imm_bytes = [int(lit.val) & 0xFF]
+        elif imm_kind == simd.IMM_MEMARG:
+            # Alignment 0 (unknown) and offset 0: the address argument
+            # already carries the whole address.
+            imm_bytes = [0, 0]
+        elif imm_kind not in (simd.IMM_NONE, None):
+            raise NotImplementedError(
+                "wasm back end: '%s' takes an immediate form that is not "
+                "expressible as a C call" % op)
+
+        if len(args) != len(params):
+            raise NotImplementedError(
+                "wasm back end: '%s' takes %d arguments, got %d"
+                % (op, len(params), len(args)))
+
+        SIMD_V128_LOAD = 0
+        SIMD_V128_STORE = 11
+
+        for i in range(len(args)):
+            arg = args[i]
+            if params[i] == simd.K_V128:
+                # A vector operand lives in the frame; load it onto the
+                # operand stack.
+                self._wasm_push_addr(arg, body)
+                body.simd(SIMD_V128_LOAD, [0, 0])
+            else:
+                self._wasm_push(arg, body, locals_of, nparams)
+                self._wasm_convert(body, self._wasm_scalar_ctype(params[i]),
+                                   arg.ctype)
+
+        body.simd(code, imm_bytes)
+
+        if result is None:
+            return
+        if result == simd.K_V128:
+            # A v128 store wants the address below the value, so the value is
+            # parked in a scratch local first -- the same shape as any other
+            # aggregate store here.
+            sc = self._wasm_scratch(body, 0x7B, nparams)
+            body.local_set(sc)
+            self._wasm_push_addr(cmd.ret, body)
+            body.local_get(sc)
+            body.simd(SIMD_V128_STORE, [0, 0])
+            return
+        self._wasm_pop_into(cmd.ret, body, locals_of, nparams)
+
+    def _wasm_scalar_ctype(self, kind):
+        """A C type matching a SIMD operator's scalar operand kind, so the
+        usual conversion path can bring an argument to it."""
+        import shivyc.ctypes as ctypes
+        import shivyc.wasm_simd as simd
+        if kind == simd.K_I64:
+            return ctypes.longint
+        if kind == simd.K_F32:
+            return ctypes.flt
+        if kind == simd.K_F64:
+            return ctypes.dbl
+        return ctypes.integer
 
     def _wasm_indirect_call(self, cmd, body, locals_of, nparams, mod):
         """A call through a function pointer.
