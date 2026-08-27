@@ -53,6 +53,12 @@ SEC_START = 8
 SEC_ELEMENT = 9
 SEC_CODE = 10
 SEC_DATA = 11
+# Bulk memory adds a DataCount section, which states how many data segments
+# follow so that a streaming validator can check memory.init without having
+# read the data section yet. The encoder here never needs it (it emits no
+# memory.init), but the decoder must know the id to read other producers'
+# modules.
+SEC_DATACOUNT = 12
 
 # ------------------------------------------------------------------- opcodes
 
