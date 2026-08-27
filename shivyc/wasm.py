@@ -215,6 +215,7 @@ EXTERNAL_KIND_GLOBAL = 0x03
 
 # The only element type the MVP table can hold: a function reference.
 FUNCREF = 0x70
+EXTERNREF = 0x6F
 
 # Bulk-memory operations share the 0xFC prefix with the saturating
 # conversions and are distinguished by the index that follows.
@@ -494,6 +495,12 @@ class WasmModule:
         # null function pointer traps when called instead of dispatching to
         # whatever landed at index 0.
         self.table_entries = []
+        # Element type of the generated table. funcref unless a caller wants
+        # an externref table, which only the reference-type tests do.
+        self.table_elem_type = FUNCREF
+        # An extra, empty table declared after the function table -- enough
+        # for a test to exercise table.get/set/grow on a reference table.
+        self.extra_tables = []
         # Set when a call_indirect is emitted. A module can contain one
         # without ever taking a function's address -- `int (*f)(int) = 0;
         # f(1);` -- and the instruction names table 0, so the table has to
@@ -610,10 +617,21 @@ class WasmModule:
                              _vec_n(payload, len(self.func_types)))
 
         # --- table section
+        n_tables = 0
+        payload = []
         if self.table_entries or self.needs_table:
             size = len(self.table_entries) + 1     # + the reserved null slot
-            payload = [FUNCREF, 0x00] + uleb(size)
-            out = out + _section(SEC_TABLE, _vec_n(payload, 1))
+            payload = payload + [self.table_elem_type, 0x00] + uleb(size)
+            n_tables += 1
+        for elem_type, minimum, maximum in self.extra_tables:
+            if maximum >= 0:
+                payload = payload + [elem_type, 0x01] + uleb(minimum) \
+                    + uleb(maximum)
+            else:
+                payload = payload + [elem_type, 0x00] + uleb(minimum)
+            n_tables += 1
+        if n_tables:
+            out = out + _section(SEC_TABLE, _vec_n(payload, n_tables))
 
         # --- memory section
         if self.memory_pages is not None:

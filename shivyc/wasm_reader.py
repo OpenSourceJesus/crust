@@ -29,6 +29,15 @@ import shivyc.wasm_simd as simd
 # one; the decoder must still recognise it.
 V128 = 0x7B
 
+# Reference types. A reference is opaque: it is either null or a handle to
+# something the program cannot inspect -- a function, or a host object it was
+# handed. `funcref` tables are what call_indirect dispatches through;
+# `externref` is how wasm-bindgen hands JavaScript values across the
+# boundary, which is why most current Rust output needs these.
+FUNCREF = 0x70
+EXTERNREF = 0x6F
+REFTYPES = (FUNCREF, EXTERNREF)
+
 
 class WasmDecodeError(Exception):
     """Raised when a module is malformed or uses something not decoded here.
@@ -69,6 +78,8 @@ IMM_MEMARG_LANE = simd.IMM_MEMARG_LANE
 IMM_LANE = simd.IMM_LANE
 IMM_V128 = simd.IMM_V128
 IMM_SHUFFLE = simd.IMM_SHUFFLE
+IMM_REFTYPE = "reftype"     # a single reference type byte
+IMM_SELECT_T = "select_t"   # a vector of result types
 
 
 def _numeric_table():
@@ -159,6 +170,11 @@ def _build_opcodes():
         0x11: ("call_indirect", IMM_U32X2),
         0x1A: ("drop", IMM_NONE),
         0x1B: ("select", IMM_NONE),
+        # `select` with an explicit result type, needed once a value can be
+        # a reference: the untyped form cannot express which.
+        0x1C: ("select_t", IMM_SELECT_T),
+        0x25: ("table.get", IMM_U32),
+        0x26: ("table.set", IMM_U32),
         0x20: ("local.get", IMM_U32),
         0x21: ("local.set", IMM_U32),
         0x22: ("local.tee", IMM_U32),
@@ -170,6 +186,9 @@ def _build_opcodes():
         0x42: ("i64.const", IMM_I64),
         0x43: ("f32.const", IMM_F32),
         0x44: ("f64.const", IMM_F64),
+        0xD0: ("ref.null", IMM_REFTYPE),
+        0xD1: ("ref.is_null", IMM_NONE),
+        0xD2: ("ref.func", IMM_U32),
     }
     for op in control:
         t[op] = control[op]
@@ -208,6 +227,12 @@ FC_OPCODES = {
     9: ("data.drop", IMM_U32),
     10: ("memory.copy", IMM_U32X2),
     11: ("memory.fill", IMM_BYTE),
+    12: ("table.init", IMM_U32X2),
+    13: ("elem.drop", IMM_U32),
+    14: ("table.copy", IMM_U32X2),
+    15: ("table.grow", IMM_U32),
+    16: ("table.size", IMM_U32),
+    17: ("table.fill", IMM_U32),
 }
 
 
@@ -261,6 +286,30 @@ class Func:
         self.instrs = instrs
 
 
+class Table:
+    def __init__(self, elem_type, minimum, maximum):
+        self.elem_type = elem_type
+        self.minimum = minimum
+        self.maximum = maximum
+
+
+class ElemSegment:
+    """One element segment.
+
+    `mode` is active, passive or declarative. Active segments are copied into
+    their table at instantiation; passive ones wait for a `table.init`;
+    declarative ones exist only to let `ref.func` name a function and are
+    otherwise inert.
+    """
+
+    def __init__(self, mode, table_index, offset, elem_type, items):
+        self.mode = mode
+        self.table_index = table_index
+        self.offset = offset
+        self.elem_type = elem_type
+        self.items = items              # function indices, or None for null
+
+
 class Global:
     def __init__(self, valtype, mutable, init):
         self.valtype = valtype
@@ -288,8 +337,10 @@ class Module:
         self.imports = []
         self.funcs = []                     # defined functions, in index order
         self.func_type_index = []           # imports + defined, whole space
-        self.table_size = 0
-        self.table_entries = {}             # table index -> function index
+        self.tables = []                    # imported first, then defined
+        self.table_size = 0                 # table 0's minimum, for callers
+        self.table_entries = {}             # slot -> function index (table 0)
+        self.elem_segments = []
         self.memory_pages = None
         self.memory_max_pages = -1          # -1 when none was declared
         self.globals = []
@@ -387,9 +438,8 @@ class Reader:
         b = self.byte()
         if b == V128:
             return V128
-        if b in (0x70, 0x6F):
-            raise WasmDecodeError(
-                "reference types are not decoded yet", self.pos - 1)
+        if b in REFTYPES:
+            return b
         if b not in (w.I32, w.I64, w.F32, w.F64):
             raise WasmDecodeError("unknown value type 0x%x" % b, self.pos - 1)
         return b
@@ -485,6 +535,13 @@ def _decode_instrs(r, end_pos):
             args = [struct.unpack("<d", bytes(bytearray(r.bytes(8))))[0]]
         elif imm == IMM_BYTE:
             args = [r.byte()]
+        elif imm == IMM_REFTYPE:
+            args = [r.byte()]
+        elif imm == IMM_SELECT_T:
+            types = []
+            for _ in range(r.uleb()):
+                types.append(r.valtype())
+            args = [types]
         out.append(Instr(name, args, offset))
 
     if r.pos != end_pos:
@@ -520,6 +577,93 @@ def _const_expr(r):
     if end != w.OP_END:
         raise WasmDecodeError("constant expression not terminated", r.pos - 1)
     return val
+
+
+def _ref_expr(r):
+    """A constant expression producing a reference.
+
+    Only two forms are constant: a null reference, or a named function. Both
+    reduce to "which function, or none", which is all a table slot holds.
+    """
+    offset = r.pos
+    op = r.byte()
+    if op == 0xD0:                      # ref.null <reftype>
+        r.byte()
+        val = None
+    elif op == 0xD2:                    # ref.func <funcidx>
+        val = r.uleb()
+    elif op == w.OP_GLOBAL_GET:
+        raise WasmDecodeError(
+            "element segment initialised from a global is not decoded",
+            offset)
+    else:
+        raise WasmDecodeError(
+            "not a constant reference expression (opcode 0x%x)" % op, offset)
+    end = r.byte()
+    if end != w.OP_END:
+        raise WasmDecodeError("constant expression not terminated", r.pos - 1)
+    return val
+
+
+def _decode_elem_segment(r, mod):
+    """One element segment, in any of the eight encodings.
+
+    Before reference types there was one form: active, table 0, a vector of
+    function indices. Reference types added passive and declarative segments,
+    an explicit table index, and initialisers written as expressions rather
+    than bare indices -- eight combinations, selected by the low three bits of
+    a leading flags field. Refusing the seven new ones is what made
+    wasm-bindgen output undecodable.
+
+        bit 0  passive or declarative rather than active
+        bit 1  an explicit table index (active), or declarative (passive)
+        bit 2  initialisers are expressions rather than function indices
+    """
+    flags = r.uleb()
+    if flags > 7:
+        raise WasmDecodeError("unknown element segment flags %d" % flags,
+                              r.pos)
+    use_expr = (flags & 4) != 0
+    passive = (flags & 1) != 0
+    explicit_table = (flags & 2) != 0
+
+    table_index = 0
+    offset = None
+    mode = "active"
+    if passive:
+        mode = "declarative" if explicit_table else "passive"
+    else:
+        if explicit_table:
+            table_index = r.uleb()
+        offset = _const_expr(r)
+        if not isinstance(offset, int):
+            raise WasmDecodeError(
+                "element segment offset is not a constant", r.pos)
+
+    elem_type = FUNCREF
+    if passive or explicit_table:
+        # Non-trivial segments carry their element type: a single byte
+        # "elemkind" for index form, a full reference type for expression
+        # form.
+        if use_expr:
+            elem_type = r.valtype()
+        else:
+            kind = r.byte()
+            if kind != 0x00:
+                raise WasmDecodeError("unknown elemkind %d" % kind,
+                                      r.pos - 1)
+
+    items = []
+    for _ in range(r.uleb()):
+        items.append(_ref_expr(r) if use_expr else r.uleb())
+
+    seg = ElemSegment(mode, table_index, offset, elem_type, items)
+    mod.elem_segments.append(seg)
+    if mode == "active" and table_index == 0:
+        # Kept so existing callers that only look at table 0 keep working.
+        for k in range(len(items)):
+            if items[k] is not None:
+                mod.table_entries[offset + k] = items[k]
 
 
 def decode(data):
@@ -585,11 +729,13 @@ def decode(data):
                     mod.imports.append(Import(m, f, kind, tidx))
                     func_type_indices.append(tidx)
                 elif kind == w.EXTERNAL_KIND_TABLE:
-                    r.byte()                        # element type
+                    elem_type = r.byte()
                     flags = r.byte()
-                    r.uleb()
+                    minimum = r.uleb()
+                    maximum = -1
                     if flags:
-                        r.uleb()
+                        maximum = r.uleb()
+                    mod.tables.append(Table(elem_type, minimum, maximum))
                     mod.imports.append(Import(m, f, kind, -1))
                 elif kind == w.EXTERNAL_KIND_MEMORY:
                     flags = r.byte()
@@ -609,11 +755,18 @@ def decode(data):
                 func_type_indices.append(r.uleb())
         elif sec_id == w.SEC_TABLE:
             for _ in range(r.uleb()):
-                r.byte()                            # element type
+                elem_type = r.byte()
                 flags = r.byte()
-                mod.table_size = r.uleb()
+                minimum = r.uleb()
+                maximum = -1
                 if flags:
-                    r.uleb()
+                    maximum = r.uleb()
+                mod.tables.append(Table(elem_type, minimum, maximum))
+                if len(mod.tables) == 1:
+                    # Kept for callers written before multiple tables were
+                    # decoded; table 0 is still the one call_indirect uses
+                    # unless an instruction names another.
+                    mod.table_size = minimum
         elif sec_id == w.SEC_MEMORY:
             for _ in range(r.uleb()):
                 flags = r.byte()
@@ -634,17 +787,7 @@ def decode(data):
             mod.start = r.uleb()
         elif sec_id == w.SEC_ELEMENT:
             for _ in range(r.uleb()):
-                flags = r.uleb()
-                if flags != 0:
-                    raise WasmDecodeError(
-                        "only active element segments on table 0 are decoded",
-                        r.pos)
-                base = _const_expr(r)
-                if not isinstance(base, int):
-                    raise WasmDecodeError(
-                        "element segment offset is not a constant", r.pos)
-                for k in range(r.uleb()):
-                    mod.table_entries[base + k] = r.uleb()
+                _decode_elem_segment(r, mod)
         elif sec_id == w.SEC_CODE:
             for _ in range(r.uleb()):
                 body_size = r.uleb()
