@@ -1038,11 +1038,20 @@ public:
         self.assertIn("static void S_assign(S *this, int k)", out)
 
     def test_other_operators_are_still_rejected(self):
+        # `operator+` and the rest of the arithmetic binaries are in the
+        # subset now, so the rejection is shown with one that is not.
+        # `operator<<` needs a stream, and there is none here.
         with self.assertRaises(cpprust.CppError) as cm:
             cpprust.translate(
                 "class S { public: int v; S() { v=0; } "
-                "int operator+(const S &o) { return v; } };")
-        self.assertIn("operator+", cm.exception.message)
+                "int operator<<(const S &o) { return v; } };")
+        self.assertIn("operator<<", cm.exception.message)
+
+    def test_a_binary_arithmetic_operator_is_supported(self):
+        out = cpprust.translate(
+            "class S { public: int v; S() { v=0; } "
+            "int operator+(const S &o) { return v + o.v; } };")
+        self.assertIn("S__binadd", out)
 
     def test_chained_assignment_is_error(self):
         with self.assertRaises(cpprust.CppError) as cm:
@@ -1798,16 +1807,34 @@ int f(void) { Owner o; return o.node()->nosuch(); }
 """)
         self.assertIn("Owner_node(&o)->nosuch()", out)
 
-    def test_value_return_cannot_be_a_receiver(self):
-        # C cannot take the address of a function result, and spilling would
-        # need a statement.
-        with self.assertRaises(cpprust.CppError) as cm:
-            cpprust.translate("""
+    def test_value_return_can_be_a_receiver_when_nothing_is_owned(self):
+        # C still cannot take the address of a function result, so the
+        # receiver goes in by *value*, through a variant emitted for the
+        # methods a source chains onto. Safe only because `Inner` owns
+        # nothing -- see the next test for the case that still refuses.
+        out = cpprust.translate("""
 class Inner { public: int n; Inner() { n = 0; } int get() { return n; } };
 class Outer { public: Inner in; Outer() { } Inner val() { return in; } };
 int f(void) { Outer o; return o.val().get(); }
 """)
-        self.assertIn("returned by value", cm.exception.message)
+        self.assertIn("Inner__byval_get_0(Outer_val(&o))", out)
+
+    def test_an_owning_value_return_still_cannot_be_a_receiver(self):
+        # A struct copy of an owning receiver would leave two objects
+        # holding one resource, so there is no by-value variant to use.
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate("""
+class Inner {
+public:
+    char *p;
+    Inner() { p = 0; }
+    ~Inner() { free(p); }
+    int get() { return 1; }
+};
+class Outer { public: Outer() { } Inner val() { Inner r; return r; } };
+int f(void) { Outer o; return o.val().get(); }
+""")
+        self.assertIn("owns a resource", cm.exception.message)
 
 
 _VCHAIN = """
@@ -3140,9 +3167,13 @@ int f(void) {
 class K { public: int v; K() { v = 0; } ~K() { } };
 int f(void) { std::map<K, int> m; K k; return m.count(k); }
 """, path="t.cpp")
-        self.assertIn("no `equals`", cm.exception.message)
+        # `compare`, not `equals`: the map is sorted and binary-searched
+        # now, so what a key has to supply is an *order*. Equality falls
+        # out of it as a zero comparison, which is also why there is no
+        # second requirement to keep consistent with the first.
+        self.assertIn("no `compare`", cm.exception.message)
 
-    def test_a_user_key_class_with_equals_works(self):
+    def test_a_user_key_class_with_compare_works(self):
         out = cpprust.translate("""#include <map>
 class K {
 public:
@@ -3150,11 +3181,12 @@ public:
     K() { v = 0; }
     ~K() { }
     K(const K &o) { v = o.v; }
-    int equals(const K &o) { return v == o.v; }
+    int compare(const K &o) { if (v < o.v) { return -1; }
+                              if (o.v < v) { return 1; } return 0; }
 };
 int f(void) { std::map<K, int> m; K k; return m.count(k); }
 """, path="t.cpp")
-        self.assertIn("K_equals", out)
+        self.assertIn("K_compare", out)
 
     def test_the_header_alone_supplies_nothing(self):
         out = cpprust.translate(
