@@ -1633,6 +1633,16 @@ driven through an `#include`, the message is reported against the include
 line; on the command line it goes to the output file and stderr with a
 non-zero status.
 
+Most carry a line number, and it is a line of *your* file. That is not
+free: by the time anything is reported, a few hundred lines of supplied
+`std` sit above your first line, and every class has been replaced by
+generated C that does not have the same number of lines the class was
+written on. So the text carries anchors — one above your first line, and
+one after every class emitted — each saying "the line after me is source
+line N". A line number is that N plus the newlines between, which stays
+exact however much the emitter added or removed. The anchors are stripped
+from the output once every diagnostic that could fire has fired.
+
 ```
 guard.cpp:12: `new Node[..]` is not in the C++ subset: array `new` has to
 store the element count beside the allocation for `delete[]` to destroy each
