@@ -22,6 +22,12 @@ restricted-Python translator can lower this.
 """
 
 import shivyc.wasm as w
+import shivyc.wasm_simd as simd
+
+
+# The SIMD value type. Not in shivyc/wasm.py because the encoder never emits
+# one; the decoder must still recognise it.
+V128 = 0x7B
 
 
 class WasmDecodeError(Exception):
@@ -57,6 +63,12 @@ IMM_I64 = "i64"             # signed LEB
 IMM_F32 = "f32"             # 4 raw IEEE bytes
 IMM_F64 = "f64"             # 8 raw IEEE bytes
 IMM_BYTE = "byte"           # a single reserved byte (memory.size / grow)
+# SIMD adds four more, defined alongside the opcode table in wasm_simd.py so
+# the table and its immediate shapes stay in one place.
+IMM_MEMARG_LANE = simd.IMM_MEMARG_LANE
+IMM_LANE = simd.IMM_LANE
+IMM_V128 = simd.IMM_V128
+IMM_SHUFFLE = simd.IMM_SHUFFLE
 
 
 def _numeric_table():
@@ -372,9 +384,8 @@ class Reader:
 
     def valtype(self):
         b = self.byte()
-        if b == 0x7B:
-            raise WasmDecodeError(
-                "v128 (SIMD) values are not decoded yet", self.pos - 1)
+        if b == V128:
+            return V128
         if b in (0x70, 0x6F):
             raise WasmDecodeError(
                 "reference types are not decoded yet", self.pos - 1)
@@ -394,6 +405,25 @@ def _decode_instrs(r, end_pos):
     while r.pos < end_pos:
         offset = r.pos
         op = r.byte()
+
+        if op == 0xFD:                     # SIMD
+            sub = r.uleb()
+            if sub not in simd.OPCODES:
+                raise WasmDecodeError("unknown SIMD opcode %d" % sub, offset)
+            name, imm = simd.OPCODES[sub]
+            args = []
+            if imm == IMM_MEMARG:
+                args = [r.uleb(), r.uleb()]
+            elif imm == IMM_MEMARG_LANE:
+                args = [r.uleb(), r.uleb(), r.byte()]
+            elif imm == IMM_LANE:
+                args = [r.byte()]
+            elif imm == IMM_V128:
+                args = [list(r.bytes(16))]
+            elif imm == IMM_SHUFFLE:
+                args = [list(r.bytes(16))]
+            out.append(Instr(name, args, offset))
+            continue
 
         if op == w.BULK_PREFIX:            # 0xFC: bulk memory + trunc_sat
             sub = r.uleb()
