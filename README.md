@@ -9,6 +9,7 @@ Main Crust Documentation:
 - [TRANSPILER.md](TRANSPILER.md) the Python→C transpiler (`py2c.py`)
 - [REGEX.md](REGEX.md) one regex engine, shared by C, C++, RPython and minipy
 - [BUILDTOOLS.md](BUILDTOOLS.md) lowering `tools/` to native binaries
+- [WASM.md](WASM.md) the WebAssembly back end (`--target wasm`)
 
 Hardware:
 - [BAREMETAL_ARM64.md](BAREMETAL_ARM64.md)

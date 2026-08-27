@@ -70,6 +70,26 @@ test_crust:
 test_fast_crust:
 	@python3 tools/crust_examples.py --fast -v
 
+# WebAssembly back end. Unlike the other cross targets there is no cross
+# compiler and no emulator to install: ShivyC emits the .wasm binary itself
+# (shivyc/wasm.py) and node both validates and runs it, with gcc as the oracle.
+#     make test_wasm      fixed corpus, a few seconds
+#     make fuzz_wasm      random programs vs gcc (SEED/COUNT to override)
+test_wasm:
+	python3 tools/wasm_difftest.py
+
+SEED  ?= 1
+COUNT ?= 200
+fuzz_wasm:
+	python3 tools/wasm_fuzz.py --count $(COUNT) --seed $(SEED)
+
+# Compile and run a WASI hello-world end to end: C in, .wasm out, real output.
+demo_wasm:
+	@mkdir -p build/wasm
+	@printf '#include <wasi.h>\nint main(void){\n  puts("hello from crust wasm");\n  printf("%%s: %%d + %%d = %%d\\n", "crust", 20, 22, 42);\n  return 0;\n}\n' > build/wasm/hello.c
+	python3 -m shivyc.main --target wasm build/wasm/hello.c -o build/wasm/hello.wasm
+	node tools/wasm_run.js build/wasm/hello.wasm
+
 # Survey how much of a real Rust codebase Crust can compile, and what is
 # blocking the rest. Point it at any Rust tree:
 #     make crustos_survey REDOX=~/redox-kernel
