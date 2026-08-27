@@ -31,6 +31,14 @@ class Target:
         # native syntax and emits neither.
         self.asm_syntax_prologue = []
         self.asm_syntax_epilogue = []
+        # True for targets that emit a finished binary artifact directly from
+        # the back end rather than assembler text for `as` + `ld`. The driver
+        # in main.py branches on this instead of on the target name, so a
+        # second such target costs nothing here.
+        self.is_binary = False
+        # Filename extension of the back end's output. Only meaningful when
+        # is_binary is set; the text targets always produce ".s".
+        self.output_ext = ".s"
 
 
 class X86_64Target(Target):
@@ -94,6 +102,32 @@ class M68kTarget(Target):
         self.asm_syntax_epilogue = []
 
 
+class WasmTarget(Target):
+    """WebAssembly (wasm32, MVP binary format).
+
+    The first target here that is not a register machine, and so the first that
+    shares none of the middle end: there are no physical registers to allocate
+    (locals are unbounded and typed, and the engine's own JIT does the real
+    allocation), and there is no flat instruction stream to branch around --
+    control flow must be expressed as structured block/loop/br, so the IL's
+    label-and-jump CFG is reconstructed into a br_table dispatch by asm_gen.
+
+    It is also the first target with no external assembler step. shivyc/wasm.py
+    emits the `.wasm` binary itself, so `as` and `ld` are never invoked; the
+    is_binary flag below is what tells the driver to skip them.
+    """
+
+    def __init__(self):
+        Target.__init__(self)
+        self.name = "wasm"
+        self.triple = "wasm32-unknown-unknown"
+        # No assembler text is produced at all, so there is no syntax to select.
+        self.asm_syntax_prologue = []
+        self.asm_syntax_epilogue = []
+        self.is_binary = True
+        self.output_ext = ".wasm"
+
+
 # Canonical name plus accepted aliases -> constructor.
 def get_target(name):
     """Return a fresh Target instance for `name` (default x86-64). Aliases:
@@ -109,13 +143,15 @@ def get_target(name):
         return RiscV64Target()
     if n == "m68k" or n == "neogeo" or n == "68k":
         return M68kTarget()
+    if n == "wasm" or n == "wasm32" or n == "webassembly":
+        return WasmTarget()
     return X86_64Target()
 
 
 def is_known_target(name):
     """True if `name` is a recognized target or alias."""
     return name in ("x86_64", "amd64", "arm64", "aarch64", "riscv64", "rv64",
-                    "m68k", "neogeo", "68k")
+                    "m68k", "neogeo", "68k", "wasm", "wasm32", "webassembly")
 
 
 DEFAULT_TARGET = "x86_64"
