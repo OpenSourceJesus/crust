@@ -188,6 +188,11 @@ checker; claiming to enforce it would be worse than not claiming it.
 Members are prototyped before they are defined, so a method may call one
 declared below it.
 
+A field declaration may carry several declarators — `int x, y;` — and each
+star binds to its own name, so `int *p, q;` makes `p` a pointer and `q` an
+`int`, exactly as C says. A comma inside `<>` belongs to a template argument
+list, so `map<int, int> m;` is one field.
+
 ## Constructors, destructors, and scope
 
 A local `Type name(args);` becomes a constructor call at the declaration and
@@ -500,9 +505,26 @@ that resolves to a class, so legitimate C spelled the same way —
 `get_ops()->init(x)`, a free function returning a struct pointer — is still
 left exactly as written.
 
-**Refused:** chaining onto a method that returns a class **by value**. C
-cannot take the address of a function result, and spilling one needs a
-statement. (A subscript is fine: `v[i].size()` works, because a dereference
+Chaining onto a method that returns a class **by value** works too, through
+a generated `Cls__byval_meth_<n>` taking its receiver by value:
+
+```cpp
+o.make().get()    ->   inner__byval_get_0(outer_make(&o))
+```
+
+C cannot take the address of a function result and spilling one needs a
+statement, so the value goes in as a value — the same way out the binary
+operators take for `a + b + c`, resting on the same condition: the class
+must own nothing, since a struct copy of an owning receiver would leave two
+objects holding one resource. The variants are emitted only for the names a
+source actually chains onto.
+
+**Refused:** the same chain when the returned class *does* own something, and
+when the chained method is **virtual** — dispatch needs a receiver whose
+address can be taken to reach the vtable. Each says which of the two it is.
+Assign to a local first, or return `Cls *`.
+
+(A subscript is fine either way: `v[i].size()` works, because a dereference
 *is* addressable.)
 
 ### Method overloading
@@ -690,6 +712,46 @@ copy.
 A subscript on a genuine pointer **field** is left as plain C indexing:
 `T *p; p[i]` walks an array rather than calling anything.
 
+## Binary arithmetic operators
+
+`+ - * / % | & ^` lower to `T__binadd` and so on, in the one case that has
+an honest lowering: **a class that owns nothing**.
+
+```cpp
+class vec2 {
+public:
+    int x, y;
+    vec2() { x = 0; y = 0; }
+    vec2(int a, int b) { x = a; y = b; }
+    vec2 operator+(const vec2 &o) { vec2 r(x + o.x, y + o.y); return r; }
+};
+
+vec2 s = a + b + c;      ->   vec2__binadd_v(vec2__binadd(&a, &b), &c)
+```
+
+The operator hands back a new object **by value**, and a by-value return of
+an owning class is not in this subset — the local is destroyed on the way out
+and the caller would receive a copy of a released object. So a class with a
+destructor is refused, and pointed at `operator+=`, which writes into an
+object that already exists.
+
+A *run* of them chains, through a variant taking its left operand by value:
+C cannot take the address of a function result, so the result of the first
+call is passed straight into the second as a value. That is sound only
+because the class owns nothing, so the by-value parameter is a struct copy
+with nothing to construct or destroy.
+
+**Refused, rather than mistranslated:**
+
+* **Mixed precedence.** `a + b * c` would chain left to right into
+  `(a + b) * c` — the wrong grouping, and silently wrong arithmetic. Assign
+  the tighter-binding part to a temporary. Parentheses do not help.
+* **An operand that is not a plain name.** Operands are passed by address,
+  and there is none to take of a parenthesised expression or a call result.
+
+`operator*` is told apart from the dereference by whether it takes an
+operand, which is the only difference between them on the page.
+
 ## Lambdas
 
 Two shapes, because they can do genuinely different things.
@@ -785,8 +847,110 @@ one this file declares, so its qualifier is simply removed.
 
 | Type | For | Elements |
 |---|---|---|
-| `string` | text | `size` `empty` `at` `[]` `c_str` `assign` `append` `push_back` `clear` `reserve` `equals` |
-| `vector<T>` | scalars, pointers, plain data | `size` `empty` `get` `set` `ptr` `[]` `push_back` `pop_back` `clear` `reserve` || `ownvector<T>` | classes that own something | same, minus `get`/`set` |
+| `string` | text | `size` `empty` `at` `[]` `c_str` `assign` `append` `push_back` `clear` `reserve` `equals` `compare` `substr` `find` `rfind` `erase` |
+| | substrings | `find_str` `find_str_from` `rfind_str` `contains` `starts_with` `ends_with` |
+| `vector<T>` | scalars, pointers, plain data | `size` `empty` `get` `set` `ptr` `[]` `push_back` `pop_back` `clear` `reserve` `insert` `erase` `begin` `end` |
+| `ownvector<T>` | classes that own something | same, minus `get`/`set` |
+| `pair<K,V>` | two values | `first` `second` |
+| `map<K,V>` | keyed lookup, **sorted** | `size` `empty` `clear` `[]` `find` `count` `erase` `lower_bound` `at_index` `begin` `end` |
+| `set<T>` | membership, **sorted** | `size` `empty` `clear` `insert` `erase` `find` `count` `lower_bound` `begin` `end` |
+| `unordered_map` / `unordered_set` | — | aliases of the above; nothing here hashes |
+| `priority_queue<T>` | max-heap | `size` `empty` `clear` `push` `pop` `top` `[]` |
+| `stack<T>` | LIFO | `size` `empty` `clear` `push` `pop` `top` `[]` |
+| `queue<T>` | FIFO | `size` `empty` `clear` `push` `pop` `front` `back` `[]` `begin` `end` |
+| `array<T,N>` | fixed size, plain data only | `size` `empty` `[]` `data` `fill` `begin` `end` |
+| `optional<T>` | a value or nothing | `has_value` `value` `set` `reset` |
+
+### Ordered containers
+
+`map` and `set` keep their elements **sorted** and binary-search them. A key
+that is a class therefore supplies `compare`, returning negative, zero or
+positive:
+
+```cpp
+class K {
+public:
+    int v;
+    int compare(const K &o) { if (v < o.v) { return -1; }
+                              if (o.v < v) { return 1; } return 0; }
+};
+```
+
+Three-way rather than a `less` predicate because the builtin's operands are
+not symmetric — the right one arrives as an already-lowered pointer and the
+left as an lvalue, so `b < a` cannot be had by swapping the arguments of
+`a < b`. One comparison answers both ordering and equality, so there is no
+second requirement to keep consistent with the first.
+
+`unordered_map` and `unordered_set` are rewritten to `map` and `set`.
+Nothing here hashes and nothing in this subset can write `hash<T>`
+generically, so a separate copy would have the unordered *interface* and the
+ordered *behaviour*. The alias says so. Iteration comes out sorted, which
+code relying on no order is not broken by; lookups are O(log n), not O(1).
+
+### `<algorithm>` and `<numeric>`
+
+Free function templates over a `T *` range — which is what every container
+here hands out, so they work over any of them without an iterator
+abstraction existing.
+
+```cpp
+#include <algorithm>
+#include <vector>
+
+std::vector<int> v;
+v.push_back(3); v.push_back(1);
+std::sort(v.begin(), v.end());              // T deduced from the range
+int at = std::lower_bound(v.begin(), v.end(), 3) - v.begin();
+```
+
+| Header | Functions |
+|---|---|
+| `<algorithm>` | `sort` `lower_bound` `upper_bound` `binary_search` `find` `count` `reverse` `fill` `min_element` `max_element` `swap` `copy` |
+| `<numeric>` | `accumulate` `iota` `inner_product` `partial_sum` `adjacent_difference` |
+
+Points where these diverge from `std`, each for a reason the subset forces:
+
+* **`swap` takes pointers** — `swap(&a, &b)`. A `T &` parameter is lowered
+  only for a class, so `swap(int &, int &)` would keep its `&`; and
+  `__cpp_ref(T)` gives a scalar by value, which is what a swap cannot have.
+  Pointers are the one spelling that works for both.
+* **`sort` relocates**, with `memmove`, rather than assigning. An owning
+  element keeps its one owner and needs no `operator=`. It is an insertion
+  sort: a recursive one would need the template to call itself over its own
+  parameter, which the instantiation scan cannot see through.
+* **`find` and `count` ask `__cpp_eq`**, not `__cpp_cmp`. Matching does not
+  need an order, and demanding one would refuse a class that reasonably has
+  equality and no ordering.
+* **`fill` and `copy` need a constructed destination** when the element owns
+  something. Both destroy each destination before constructing over it —
+  right for a container's range, and a segfault for raw storage. The
+  destination has to be visibly a container's own range (`begin()`, `ptr()`,
+  or one local aliasing one); anything else is reported. A plain-data
+  element has nothing to destroy, so the check never fires.
+* **`<numeric>` is scalars only.** These combine elements with `+` and `*`,
+  which a class would need `operator+` for; a class element is reported
+  against the call rather than left to fail inside a template body. `accumulate`
+  answers to its own name as well as to the header, since it lived in
+  `<algorithm>` here before `<numeric>` existed.
+
+### Template arguments are deduced, narrowly
+
+`sort(v.begin(), v.end())` works without spelling `<int>`. Deduction reads
+one shape: a parameter written `T *`, matched against an argument whose
+pointee this file declares — a container's `begin()`, an array, or a pointer
+local. A deduced call is rewritten to spell its arguments the long way and
+the ordinary substitution runs on that, so both forms take one code path.
+
+`map` is deliberately out of range: its iterator is a `pair<K,V> *`, so
+deducing `K` from `m.begin()` would be *wrong* rather than unsupported.
+Anything else — a call result, a by-value parameter, more than one template
+parameter — is reported, and you write `f<T>(..)`.
+
+Deduction never reads a declaration above your first line. The supplied
+templates have ordinary local names in them, and without that bound a
+`T *a` parameter inside `swap` answered for a call whose `a` was your own
+`int a[4]`.
 
 `push_back` on `vector<T>` has a **move overload** for a class element, taken
 when the call site writes `std::move` -- which is what lets a `vector` hold a
@@ -845,7 +1009,7 @@ Supplied container methods are emitted `static inline`, so the ones a
 program does not call are not warned about. User classes stay plain
 `static`, because you should still hear about your own dead code.
 
-### `__cpp_copy` and `__cpp_drop`
+### The element builtins
 
 `ownvector` needs to say "copy an element" and have that mean the copy
 constructor for a class. It cannot spell `T_copy`: substitution rewrites
@@ -855,10 +1019,29 @@ per instantiation:
 ```cpp
 __cpp_copy(T, dst, srcptr)              // T_copy(&dst, srcptr)
 __cpp_drop(T, x)                        // T_drop(&x), or nothing
+__cpp_movein(T, dst, srcptr)            // T_move(&dst, srcptr)
+__cpp_eq(T, a, b)                       // T_equals(&a, b), or `a == b`
+__cpp_cmp(T, a, b)                      // T_compare(&a, b), or two `<`s
+__cpp_addr(T, x)                        // &(x) for a class, (x) for a scalar
+__cpp_ref(T) / __cpp_rref(T)            // `const T &` / `T &&`, or plain `T`
 ```
 
+`__cpp_cmp` is three-way, like `strcmp`. The scalar form is written with two
+comparisons rather than a subtraction, because `a - b` overflows for wide or
+unsigned types and gets the order backwards when it does. Both operands are
+expanded twice there, so a container must pass side-effect-free expressions.
+
+`__cpp_addr` exists because `__cpp_cmp` and `__cpp_eq` want their *right*
+operand as a pointer for a class and a value for a scalar. A container gets
+that spelling free from a parameter declared `__cpp_ref(T)`; code that builds
+its own value — `sort` holding an element aside while it shifts the tail —
+has no such parameter, and no one expression is an address in one
+instantiation and a value in the other.
+
 They are an internal seam, but nothing stops you using them to write your
-own owning container.
+own owning container. One caveat: they are expanded while lowering *classes*,
+so a file that defines none — using only `<algorithm>`, say — is reported
+rather than emitting `__cpp_cmp(int, ..)` into the C.
 
 ## Header and source, split
 
@@ -1414,11 +1597,12 @@ use of one is a member access and the symbol table already turns `o.x` into
 ## Not supported yet
 
 Reported rather than mistranslated: exceptions (`throw` / `try` / `catch`),
-operator overloading other than `=`, a compound assignment, a comparison,
-`[]`, `->` and `*` (in particular the stream operators), `dynamic_cast`,
-`typeid`,
-multiple and virtual inheritance, iterators (`begin`/`end`), default
-function arguments, and the rest of the STL.
+`dynamic_cast`, `typeid`, multiple and virtual inheritance, a conversion
+operator, the stream operators, and the rest of the STL.
+
+Operator overloading is **partly** in: `=`, the compound assignments, the
+comparisons, `[]`, `->`, `*`, and the binary arithmetic operators (see
+above). What is out is everything else, including `<<` and `>>`.
 
 Two shapes are worth calling out because they are legal C++ that this subset
 cannot express, rather than features not yet written:
