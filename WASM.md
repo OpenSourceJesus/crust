@@ -321,11 +321,55 @@ Anything the back end genuinely cannot lower still raises
 `NotImplementedError` naming what is missing, rather than emitting a module
 that runs and is wrong.
 
+## Going the other way: wasm2c
+
+    python3 tools/wasm2c.py prog.wasm -o prog.c
+    gcc -std=c99 -Itools prog.c -o prog -lm && ./prog
+
+`shivyc/wasm_reader.py` decodes the binary format (the inverse of
+`shivyc/wasm.py`) and `tools/wasm2c.py` renders a decoded module as C. Two
+things have to be bridged, and both have a standard answer:
+
+**The operand stack.** A valid module's stack depth and types are known
+statically at every point, so the stack flattens into ordinary locals: depth 0
+of type i32 is always `i0`, depth 1 of type i64 is `j1`. `i32.add` becomes
+`i0 = i0 + i1;`. No runtime stack exists in the output.
+
+**Structured control flow.** A `block` becomes a label at its `end` and a
+`loop` a label at its start, so `br N` is a `goto` to the label of the Nth
+enclosing construct -- which is exactly what `br` means. That single
+difference in label placement is the whole distinction between the two.
+
+`tools/wasm2c_rt.h` supplies the operations that cannot be written as a direct
+C expression without being wrong: wasm traps on a zero divisor and *defines*
+`INT_MIN % -1` as 0 where C leaves both undefined; wasm masks shift counts
+where C leaves an over-wide shift undefined; memory access goes through
+`memcpy` so an unaligned or type-punned load is not undefined behaviour.
+`tools/wasm2c_rt_wasi.h` binds WASI imports to POSIX, so a translated module
+becomes a working native binary.
+
+This was written independently. The approach is shared with wabt's `wasm2c`
+and other tools -- it is the obvious way to do it -- but no code is taken from
+any of them, and the tree stays MIT rather than acquiring wabt's Apache-2.0
+terms.
+
+### Reading other producers' modules
+
+The decoder targets the format, not this compiler's habits, so modules from
+elsewhere work. A Rust-built `qcms_bg.wasm` (138 functions, 41,660
+instructions) decodes, translates to 45,000 lines of C, and compiles clean.
+
+Two extensions are not decoded yet and say so rather than mis-reading:
+**SIMD** (`v128`, the `0xFD` opcode prefix) and **reference types**. Those are
+the next things to add if arbitrary real-world modules matter.
+
 ## Testing
 
 ```sh
 make test_wasm                       # fixed corpus vs gcc
+make roundtrip_wasm                  # C -> wasm -> C -> native, vs gcc
 make fuzz_wasm SEED=3 COUNT=300      # random programs vs gcc
+make wasm2c WASM=prog.wasm           # translate one module back to C
 ```
 
 `tools/wasm_difftest.py` runs a fixed corpus: compile with ShivyC, run under
@@ -341,6 +385,24 @@ would only prove the module matches our own reading of the spec, the difftest
 also runs one module under **node's real WASI** and checks its stdout and exit
 status -- an independent implementation, which is what would catch a subtly
 wrong import signature or `_start` contract.
+
+`tools/wasm_roundtrip.py` closes the loop:
+
+    prog.c --shivyc--> prog.wasm --wasm2c--> prog_back.c --cc--> binary
+
+and requires that binary to agree with `cc prog.c` on both stdout and exit
+status. It is a stronger check than either half alone, for two reasons. A
+back-end bug that the difftest misses because the module happens to run
+correctly on one engine still has to survive being read back, re-expressed as
+C, and compiled by a different compiler. And the encoder and decoder were
+written from the specification rather than from each other, so a
+misunderstanding on one side shows up here instead of cancelling out.
+
+Its corpus is imported from `wasm_difftest.py`, so every case that file gains
+is round-tripped too, with no second list to maintain. One case is expected to
+*differ* -- the float-to-int saturation above -- and is listed in
+`EXPECTED_DIVERGENT`; if it ever stops diverging, that means wasm semantics
+were lost in translation, so the harness fails the run.
 
 `tools/wasm_fuzz.py` generates random integer programs -- nested expressions,
 mixed widths and signedness, loops, calls -- and checks each against gcc.

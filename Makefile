@@ -83,12 +83,29 @@ COUNT ?= 200
 fuzz_wasm:
 	python3 tools/wasm_fuzz.py --count $(COUNT) --seed $(SEED)
 
+# Round-trip: C -> .wasm -> C -> native binary, checked against gcc on both
+# stdout and exit status. Exercises the encoder and the decoder against each
+# other, and is a much stronger check than either half alone.
+#     make roundtrip_wasm
+roundtrip_wasm:
+	python3 tools/wasm_roundtrip.py
+
+# Translate a .wasm back to C:  make wasm2c WASM=prog.wasm
+WASM ?= build/wasm/hello.wasm
+wasm2c:
+	python3 tools/wasm2c.py $(WASM) -o $(basename $(WASM)).c
+	@echo "wrote $(basename $(WASM)).c"
+
 # Compile and run a WASI hello-world end to end: C in, .wasm out, real output.
 demo_wasm:
 	@mkdir -p build/wasm
 	@printf '#include <wasi.h>\nint main(void){\n  puts("hello from crust wasm");\n  printf("%%s: %%d + %%d = %%d\\n", "crust", 20, 22, 42);\n  return 0;\n}\n' > build/wasm/hello.c
 	python3 -m shivyc.main --target wasm build/wasm/hello.c -o build/wasm/hello.wasm
 	node tools/wasm_run.js build/wasm/hello.wasm
+	@echo "-- and the same module translated back to C and run natively --"
+	python3 tools/wasm2c.py build/wasm/hello.wasm -o build/wasm/hello_back.c
+	$(CC) -std=c99 -w -Itools build/wasm/hello_back.c -o build/wasm/hello_back -lm
+	./build/wasm/hello_back
 
 # Survey how much of a real Rust codebase Crust can compile, and what is
 # blocking the rest. Point it at any Rust tree:
