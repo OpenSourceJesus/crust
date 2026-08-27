@@ -205,145 +205,6 @@ void f(void *p) {
         self.assertNotIn("auto", out)
 
 
-# ------------------------------------------------- inherited field by name
-
-class TestInheritedFieldNamed(Base):
-    """Naming an inherited field of an owning type.
-
-    From `litehtml/src/html_tag.cpp`:
-
-        std::shared_ptr<element> html_tag::get_child(int idx) const
-        { return m_children[idx]; }
-
-    `m_children` is declared on the base, and field qualification rewrites
-    the body to the path it actually lives at -- `this->_base.m_children`.
-    The name walker had no step for that `_base` hop, because an inherited
-    field is flattened into the derived class's own field table under its
-    plain name and `_base` is not a declared field of anything. So an
-    inherited field of an owning type could not be named at all, and every
-    copy out of one was refused with "not an object of that type this pass
-    can name" -- a diagnostic about the copy, for what was really a gap in
-    the walk.
-    """
-
-    SRC = """
-#include <vector>
-#include <memory>
-
-class elem { public: int v; };
-class base_c { public: std::vector<std::shared_ptr<elem> > m_children; };
-class derived_c : public base_c {
-public:
-    std::shared_ptr<elem> get_child(int idx);
-};
-std::shared_ptr<elem> derived_c::get_child(int idx) {
-    std::shared_ptr<elem> ret = m_children[idx];
-    return ret;
-}
-"""
-
-    def test_copy_from_inherited_container_subscript(self):
-        out = self.assertLowers(self.SRC, "shared_ptr_elem_copy")
-        # The copy reads through the base hop and the container's own
-        # `operator[]`, rather than subscripting the struct.
-        self.assertIn("this->_base.m_children", out)
-        self.assertIn("__index", out)
-
-    def test_inherited_field_still_dropped(self):
-        """The copy is an owner, so the local is still dropped."""
-        out = self.lower(self.SRC)
-        self.assertIn("shared_ptr_elem_drop", out)
-
-
-class TestSmartPointerFieldNamed(Base):
-    """Naming a field reached through a smart pointer.
-
-    From `litehtml/src/document.cpp`:
-
-        std::shared_ptr<element> child = el_ptr->m_children[i];
-
-    `el_ptr->m_children` is a field of the *pointee*, not of the handle, so
-    a walk that looked only in the handle's own fields stopped at the hop.
-    `shared_ptr<T>` is how litehtml passes every element around, so this
-    meant no field reached through one could be named, and copying out of
-    one was refused. `operator->` already has a lowered form registered;
-    the walker goes through it, which is the same step the call pass takes.
-    """
-
-    SRC = """
-#include <vector>
-#include <memory>
-
-class leaf { public: int v; };
-class holder { public: std::vector<leaf> items; };
-void f(std::shared_ptr<holder>& p, int i) {
-    leaf x = p->items[i];
-    (void)x;
-}
-"""
-
-    def test_copy_through_arrow(self):
-        out = self.assertLowers(self.SRC, "__arrow")
-        # The handle is already a pointer here, so it is passed straight to
-        # `operator->` rather than having its address taken again.
-        self.assertIn("shared_ptr_holder__arrow(p)", out)
-        self.assertNotIn("shared_ptr_holder__arrow(&(p))", out)
-
-
-class TestPointerLocalNamed(Base):
-    """Naming a field through a pointer *local*.
-
-    From `litehtml/src/html_tag.cpp`, after the attribute loop was indexed:
-
-        const css_attribute_selector *attr = &selector.m_attrs[ai];
-        selector_name = attr->val;
-
-    A pointer *parameter* of class type was already registered, because
-    reference lowering turns `const T &p` into `const T *p` and the body
-    still has to name it. A pointer *local* was not, so binding one to an
-    element and copying out of it was refused.
-
-    Kept in `ptrvals` rather than `vals` deliberately: the copy and
-    assignment handlers read `vals`, and `p = q` on two pointers is a
-    pointer assignment, not a class one. Registering these in `vals` made
-    the supplied containers' own `T *nd = (T *)realloc(..)` look like a
-    class assignment and broke every container in the tree.
-    """
-
-    SRC = """
-#include <vector>
-#include <string>
-
-class attr_t { public: std::string val; };
-class holder { public: std::vector<attr_t> attrs; };
-
-void f(holder& h, int i) {
-    const attr_t *attr = &h.attrs[i];
-    std::string selector_name;
-    selector_name = attr->val;
-    (void)selector_name;
-}
-"""
-
-    def test_copy_through_pointer_local(self):
-        out = self.assertLowers(self.SRC, "string__assign")
-        self.assertIn("attr->val", out)
-
-    def test_pointer_local_is_not_treated_as_a_class_object(self):
-        """A pointer local is reassignable as a pointer, not copied."""
-        out = self.assertLowers("""
-class thing { public: int v; ~thing() { v = 0; } };
-void f(thing *a, thing *b) {
-    thing *p = a;
-    p = b;
-    (void)p;
-}
-""", "thing")
-        # No copy call generated for `p = b`, and no drop for the pointer.
-        self.assertNotIn("thing_copy(&p", out)
-        self.assertNotIn("thing_drop(&p)", out)
-
-
 # ------------------------------------------------------------ range-for
 
 class TestRangeForMember(Base):
@@ -725,368 +586,6 @@ void f(void) { int_vector v; v.push_back(1); }
         self.assertNotIn("typedef vector_int vector_int;", out)
 
 
-class TestFunctionTemplates(Base):
-    """`template<..>` on a function.
-
-    From `litehtml/include/litehtml/context.h`, which every element file
-    includes, and which was the single biggest blocker in the tree -- 22
-    of 43 files:
-
-        template<class T>
-        void js_register_class(const char* className) {
-            ...
-            if (auto* ref { static_cast<typename T::js_object_ref*>(..) })
-                delete ref;
-        }
-
-    The subset monomorphises *class* templates. This was not recognised
-    as a template at all, so its body was lowered as ordinary code -- and
-    a template's body is not ordinary code: `typename T::js_object_ref`
-    names a type that exists only once `T` is known. The result was a
-    diagnostic about `delete` in files that never call the function.
-
-    An uninstantiated template emits nothing in C++, so it emits nothing
-    here. Only `context.cpp` instantiates this one; for the other 22 the
-    right answer was always to emit nothing at all.
-    """
-
-    def test_uninstantiated_function_template_emits_nothing(self):
-        out = self.assertLowers("""
-class Ctx {
-public:
-    int n;
-    template<class T>
-    void reg(const char *name) {
-        if (auto* ref { static_cast<typename T::inner*>(get(name)) }) {
-            delete ref;
-        }
-    }
-    int get_n() { return n; }
-};
-void f(void) { Ctx c; use(c.get_n()); }
-""", "Ctx_get_n")
-        self.assertNotIn("reg", out)
-        self.assertNotIn("template", out)
-
-    def test_class_template_is_untouched(self):
-        """`template<..> class X` is this pass's own business."""
-        self.assertLowers("""
-template<typename T>
-class Box { public: T v; Box() { } T get() { return v; } };
-void f(void) { Box<int> b; use(b.get()); }
-""", "Box_int_get")
-
-    def test_member_instantiation_is_monomorphised(self):
-        """The litehtml shape: a member template, instantiated in a method.
-
-        Substituting in place is what makes this cost nothing extra --
-        what comes out is an ordinary member, and the class emitter gives
-        it its `this` and mangles its name without knowing a template was
-        ever involved.
-        """
-        out = self.assertLowers("""
-struct Doc { int id; };
-class Ctx {
-public:
-    int n;
-    template<class T>
-    void reg(const char *name) { n = sizeof(T); use(name); }
-    void go() { reg<Doc>("Document"); }
-};
-""", "Ctx_reg_Doc(Ctx *this, const char *name)",
-     "Ctx_reg_Doc(this, \"Document\")")
-        self.assertNotIn("template", out)
-
-    def test_free_instantiation_is_monomorphised(self):
-        out = self.assertLowers("""
-template<class T> int idof(T *p) { return p->v; }
-struct A { int v; };
-void f(A *a) { use(idof<A>(a)); }
-""", "int idof_A(A *p)", "idof_A(a)")
-        self.assertNotIn("template", out)
-
-    def test_two_instantiations_give_two_functions(self):
-        out = self.assertLowers("""
-struct Doc { int id; };
-struct El { int id; };
-class Ctx {
-public:
-    int n;
-    template<class T> void reg(const char *nm) { n = sizeof(T); use(nm); }
-    void go() { reg<Doc>("D"); reg<El>("E"); }
-};
-""", "Ctx_reg_Doc", "Ctx_reg_El")
-        self.assertIn("sizeof(Doc)", out)
-        self.assertIn("sizeof(El)", out)
-
-    def test_wrong_argument_count_is_reported(self):
-        """Substituted by position, with no defaults to fall back on."""
-        self.refuses("""
-template<class T, class U> int both(T *a, U *b) { return 1; }
-struct A { int v; };
-void f(A *a) { use(both<A>(a, a)); }
-""", "template argument")
-
-    def test_qualified_argument_mangles_like_the_flattened_name(self):
-        """`lh::Doc` gives `_lh_Doc`, which is what flattening calls it."""
-        out = self.assertLowers("""
-namespace lh { struct Doc { int id; }; }
-template<class T> int idof(T *p) { return p->id; }
-void f(lh::Doc *d) { use(idof<lh::Doc>(d)); }
-""", "idof_lh_Doc")
-
-    def test_declaration_only_function_template(self):
-        """No body to hold back, and nothing to emit either."""
-        out = self.assertLowers("""
-template<class T> void reg(const char *n);
-int f(void) { return 1; }
-""", "int f(void)")
-        self.assertNotIn("template", out)
-
-
-class TestDirectivesAreNotCode(Base):
-    """A `#define`'s replacement text is not an expression.
-
-    From `litehtml/include/litehtml/os_types.h`:
-
-        #define t_to_string(val)   std::to_string(val)
-
-    read as a call handing a `string` over by value -- the macro's own
-    parameter `val` resolving against an unrelated local of that name
-    elsewhere in the file. That refusal fired on 22 of 43 litehtml
-    sources, every one for a line no compiler evaluates here.
-
-    Blanked only in the *scan*; the directives still reach the output,
-    where ShivyCX expands them.
-    """
-
-    def test_macro_body_is_not_read_as_a_call(self):
-        out = self.assertLowers("""
-#include <string>
-#define t_to_string(val) to_string(val)
-void f(void) { string val("x"); use(&val); }
-""", "#define t_to_string")
-
-    def test_multiline_macro_is_not_read_as_code(self):
-        self.assertLowers("""
-#include <string>
-#define two_step(val) do { \\
-        to_string(val); \\
-    } while (0)
-void f(void) { string val("x"); use(&val); }
-""", "#define two_step")
-
-    def test_a_real_by_value_owning_argument_is_constructed(self):
-        """The check has to keep working on actual code.
-
-        No longer a refusal: `string` has a copy constructor, so the
-        argument is copy-constructed into the parameter the callee will
-        destroy -- which is what C++ does. What is still refused is the
-        same call for a type with no copy constructor.
-        """
-        self.assertLowers("""
-#include <string>
-void consume(string s);
-void f(void) { string v("x"); consume(v); }
-""", "string_copy(&")
-
-
-class TestClangFallback(Base):
-    """`auto` that no written spelling can answer.
-
-    The textual pass reads types from how they are written, which is
-    exact where a spelling exists and reports where none does. Four
-    litehtml files fail there -- a ternary in `context.cpp`, iterator
-    arithmetic in `box.cpp`, `str.find(..)` in `style.cpp`,
-    `text.substr(..)` in `stylesheet.cpp`.
-
-    Where this pass reports, a C++ compiler already knows the answer.
-    So if `clang++` is installed its answer is asked for, from the
-    original file, before the report is raised.
-
-    Nothing is approximated, which is what keeps this inside the guiding
-    rule: clang either says what the type is or it does not, and if it
-    does not the original diagnostic stands unchanged. The tests below
-    are skipped where clang is absent -- which is itself the point worth
-    testing, since the fallback must not change what a machine without
-    clang does.
-    """
-
-    def setUp(self):
-        if not cpp_auto.clang_available():
-            self.skipTest("clang++ not installed")
-
-    def _lower_file(self, src):
-        import tempfile
-        d = tempfile.mkdtemp()
-        p = os.path.join(d, "t.cpp")
-        with open(p, "w") as f:
-            f.write(src)
-        return cpprust.translate(src, path=p)
-
-    def test_ternary_is_deduced(self):
-        out = self._lower_file("""
-struct Node { int v; int get(); };
-Node *lookup(int k);
-void use(int x);
-void f(void) {
-    auto a = lookup(1) ? lookup(2) : lookup(3);
-    use(a->v);
-}
-""")
-        self.assertIn("Node * a", out)
-
-    def test_scalar_expression_is_deduced(self):
-        out = self._lower_file("""
-int base(void);
-void use(int x);
-void f(void) { auto n = base() + 1; use(n); }
-""")
-        self.assertIn("int n", out)
-
-    def test_without_clang_the_diagnostic_is_unchanged(self):
-        """The fallback must not be load-bearing.
-
-        A machine with no clang has to behave exactly as before, so this
-        forces the unavailable path and asserts the original message.
-        """
-        saved = cpp_auto._CLANG_OK
-        cpp_auto._CLANG_OK = False
-        try:
-            self.refuses("""
-struct Node { int v; };
-Node *lookup(int k);
-void f(void) { auto a = lookup(1) ? lookup(2) : lookup(3); use(a->v); }
-""", "`auto` cannot deduce")
-        finally:
-            cpp_auto._CLANG_OK = saved
-
-    def test_an_unspellable_answer_is_refused(self):
-        """clang answers in C++'s terms, and some answers name nothing here.
-
-        `iterator` is the case that matters: a nested typedef, arriving
-        spelled bare. Emitting `iterator i = ..` into C declares a
-        variable of a type nothing defines -- worse than the diagnostic it
-        replaced, since the error moves to the C front end and stops
-        naming `auto`. So an answer is taken only if this translation
-        already knows the name.
-        """
-        self.assertFalse(cpp_auto._spellable("iterator", set(), {}))
-        self.assertTrue(cpp_auto._spellable("int", set(), {}))
-        self.assertTrue(cpp_auto._spellable("Node *", set(["Node"]), {}))
-        self.assertTrue(cpp_auto._spellable("unsigned long", set(), {}))
-
-    def test_a_name_declared_twice_is_not_guessed_between(self):
-        """`box.cpp` declares `i` four times, with different iterator
-        types. Keyed by name, that is ambiguous, and ambiguous is
-        reported rather than resolved to whichever came first."""
-        import tempfile
-        d = tempfile.mkdtemp()
-        p = os.path.join(d, "amb.cpp")
-        with open(p, "w") as f:
-            f.write("int mk(void); double dk(void);\n"
-                    "void f(void) { auto i = mk(); use(i); }\n"
-                    "void g(void) { auto i = dk(); use(i); }\n")
-        got = cpp_auto.clang_auto_types(p)
-        self.assertNotIn("i", got)
-
-    def test_a_type_the_subset_cannot_spell_is_not_taken(self):
-        """A nested `iterator` is not a spelling this subset has.
-
-        Taking clang's word for it would only move the error somewhere
-        less informative, so the `auto` diagnostic stands.
-        """
-        self.assertIsNone(cpp_auto._from_cxx_spelling(
-            "basic_string<char>::iterator"))
-        self.assertIsNone(cpp_auto._from_cxx_spelling(
-            "(lambda at t.cpp:3:5)"))
-        self.assertEqual(cpp_auto._from_cxx_spelling("std::string"), "string")
-
-
-class TestOwningArgScope(Base):
-    """The owning-argument check has to know which `val` it is looking at.
-
-    `locals_` was a flat, file-wide map from name to owning class, so one
-    `string val` anywhere made *every* `val` in the translation a
-    `string`. quickjs.h has
-
-        static js_force_inline JSValue JS_NewBool(JSContext *ctx,
-                                                  JS_BOOL val)
-        { return JS_MKVAL(JS_TAG_BOOL, (val != 0)); }
-
-    and litehtml has a `string val` of its own elsewhere, so the pass
-    refused a parameter that is an `int`. The name is the same; the
-    variable is not.
-
-    A declaration now counts only where it sits in the same top-level
-    declaration as the use.
-    """
-
-    def test_same_name_in_another_function_is_not_confused(self):
-        self.assertLowers("""
-#include <string>
-int mkval(int val) { return JS_MKVAL(TAG, val); }
-void f(void) { string val("x"); use(&val); }
-""", "mkval")
-
-    def test_the_real_case_is_still_refused(self):
-        """Handing an owning local over by value is still the bug it was."""
-        self.refuses("""
-#include <string>
-void f(void) { string v("x"); consume(v); }
-""", "hands over")
-
-    def test_two_owning_locals_of_the_same_name(self):
-        """Each function's own declaration is the one that applies."""
-        self.refuses("""
-#include <string>
-void g(void) { string val("y"); consume(val); }
-void f(void) { string val("x"); use(&val); }
-""", "hands over")
-
-
-class TestQualifiedNameFlattening(Base):
-    """`N::x` becomes `N_x` only for names flattening actually renamed.
-
-    The qualification says which namespace to look in, not what the name
-    became -- and this pass deliberately does not rename everything a
-    namespace holds. A typedef keeps its name so the generated C stays
-    readable.
-
-    litehtml writes `litehtml::tstring` in fourteen places while the
-    typedef in `os_types.h` stays `tstring`, so every qualified use
-    became `litehtml_tstring` and the declaration did not follow. Every
-    file reaching those headers translated clean and then failed to
-    compile on a type that appears nowhere -- around 35 of 43 sources,
-    and the reason the gcc stage exists.
-    """
-
-    def test_qualified_typedef_keeps_its_name(self):
-        out = self.assertLowers("""
-#include <string>
-namespace lh {
-    typedef std::string tstring;
-    lh::tstring pick(void);
-}
-""", "string lh_pick")
-        self.assertNotIn("lh_tstring", out)
-
-    def test_qualified_class_is_still_flattened(self):
-        """A name flattening *did* rename still gets the prefix."""
-        out = self.assertLowers("""
-namespace lh {
-    class Thing { public: int v; int get() { return v; } };
-}
-void f(void) { lh::Thing t; use(t.get()); }
-""", "lh_Thing")
-
-    def test_qualified_function_is_still_flattened(self):
-        self.assertLowers("""
-namespace lh { int helper(int a) { return a; } }
-void f(void) { use(lh::helper(1)); }
-""", "lh_helper")
-
-
 class TestFlattenCollision(Base):
     """From `litehtml/src/html.cpp`.
 
@@ -1104,6 +603,1546 @@ class TestFlattenCollision(Base):
 int n_x(void) { return 1; }
 namespace n { int x(void) { return 2; } }
 """, "one symbol")
+
+
+# ------------------------------------------------------------------ set
+
+class TestStdSet(Base):
+    """`std::set<T>`, a sorted array keyed by `__cpp_cmp`.
+
+    `map` stores insertion-ordered and scans linearly because, when it was
+    written, there was no way to ask whether one `K` sorted before another.
+    `__cpp_cmp` is that way -- a three-way comparison, two `<`s for a
+    scalar and a `compare` method for a class -- so `set` binary-searches
+    and, more importantly, iterates in the order `std::set` promises.
+    """
+
+    def test_int_set_is_supplied_and_sorted(self):
+        out = self.assertLowers("""
+#include <set>
+int f(void) {
+    std::set<int> s;
+    s.insert(5);
+    s.insert(1);
+    return s.size();
+}
+""", "set_int_insert", "set_int_new")
+        # The ordering test is the binary search: a linear container would
+        # not need one, so its presence is what says this is sorted.
+        self.assertIn("lower_index", out)
+
+    def test_scalar_ordering_is_a_plain_comparison(self):
+        """`__cpp_cmp(int, ..)` is `<`, not a call to a method int has not got."""
+        out = self.assertLowers("""
+#include <set>
+int f(void) { std::set<int> s; s.insert(2); return s.count(2); }
+""")
+        self.assertNotIn("int_compare", out)
+
+    def test_scalar_ordering_does_not_subtract(self):
+        """`a - b` overflows for wide or unsigned types and inverts the order."""
+        out = self.assertLowers("""
+#include <set>
+int f(void) { std::set<int> s; s.insert(2); return s.count(2); }
+""")
+        self.assertIn("? -1 :", out)
+
+    def test_string_set_orders_by_the_compare_method(self):
+        """A class element dispatches to `T_compare`, which `string` now has."""
+        self.assertLowers("""
+#include <set>
+#include <string>
+int f(void) {
+    std::set<std::string> s;
+    std::string a("pear");
+    s.insert(a);
+    return s.size();
+}
+""", "string_compare")
+
+    def test_element_without_compare_is_reported(self):
+        """Not silently ordered by address, which would iterate arbitrarily."""
+        self.refuses("""
+#include <set>
+class K {
+public:
+    int v;
+    int equals(const K &o) { return v == o.v; }
+};
+int f(void) { std::set<K> s; K k; s.insert(k); return s.size(); }
+""", "no `compare`", "int compare(const K &o)")
+
+    def test_compare_alone_is_enough_for_an_element(self):
+        """The point of three-way: no separate `equals` to keep in step."""
+        self.assertLowers("""
+#include <set>
+class K {
+public:
+    int v;
+    int compare(const K &o) { if (v < o.v) { return -1; }
+                              if (o.v < v) { return 1; } return 0; }
+};
+int f(void) { std::set<K> s; K k; s.insert(k); return s.size(); }
+""", "K_compare")
+
+    def test_owning_element_is_destroyed_with_the_set(self):
+        """`clear` runs the element destructor, so `set<string>` does not leak."""
+        self.assertLowers("""
+#include <set>
+#include <string>
+int f(void) {
+    std::set<std::string> s;
+    std::string a("fig");
+    s.insert(a);
+    return s.size();
+}
+""", "string_drop")
+
+    def test_set_is_not_supplied_when_unnamed(self):
+        """An unused template would still be monomorphised, so it is not added."""
+        out = self.assertLowers("int f(void) { return 0; }")
+        self.assertNotIn("lower_index", out)
+
+
+# ------------------------------------------------------- <algorithm>
+
+class TestStdAlgorithm(Base):
+    """`lower_bound`/`upper_bound`/`binary_search` over a `T *` range.
+
+    Free *function* templates, which the subset already monomorphised --
+    but only from an explicit `f<T>(..)`, since argument deduction is not
+    implemented. A range is a pair of pointers because that is what every
+    container here already hands out.
+    """
+
+    def test_deduced_call_is_reported_not_blanked(self):
+        """The bug this found: no instantiation blanked the body silently.
+
+        The call then survived over a definition that had just been erased
+        and failed at link time naming a symbol the source never wrote.
+        """
+        self.refuses("""
+template<typename T>
+T twice(T x) { return x + x; }
+int f(void) { return twice(3); }
+""", "no template arguments", "twice<T>(..)")
+
+    def test_explicit_instantiation_still_works(self):
+        """The deduction check must not catch the form that does work."""
+        self.assertLowers("""
+template<typename T>
+T twice(T x) { return x + x; }
+int f(void) { return twice<int>(3); }
+""", "int twice_int(int x)", "return twice_int(3)")
+
+    def test_unused_template_is_still_blanked(self):
+        """A template the file never calls emits nothing, as in C++."""
+        out = self.assertLowers("""
+template<typename T>
+T twice(T x) { return x + x; }
+int f(void) { return 0; }
+""")
+        self.assertNotIn("twice", out)
+
+    def test_scalar_range_lowers(self):
+        self.assertLowers("""
+#include <algorithm>
+#include <vector>
+int f(void) {
+    std::vector<int> v;
+    v.push_back(2);
+    return (int)(std::lower_bound<int>(v.begin(), v.end(), 2) - v.begin());
+}
+""", "lower_bound_int")
+
+    def test_class_element_takes_the_key_by_reference(self):
+        """`__cpp_ref(T)` expanded per instantiation, once `T` is concrete.
+
+        Before this it reached the C as `__cpp_ref(string)`, an unknown
+        type name -- the class emitter expands it for a *method*, and a
+        free template has no class to be expanded against.
+        """
+        self.assertLowers("""
+#include <algorithm>
+#include <set>
+#include <string>
+int f(void) {
+    std::set<std::string> s;
+    std::string q("fig");
+    std::string *lo = s.begin();
+    std::string *hi = s.end();
+    return std::binary_search<std::string>(lo, hi, q);
+}
+""", "binary_search_string", "const string * v")
+
+    def test_algorithm_alone_is_reported(self):
+        """No class in the unit means the builtin expansion never runs."""
+        self.refuses("""
+#include <algorithm>
+int f(void) {
+    int a[4];
+    return (int)(std::lower_bound<int>(a, a + 4, 2) - a);
+}
+""", "__cpp_cmp", "survived")
+
+
+# --------------------------------------------- nested calls by reference
+
+class TestNestedCallInRefArg(Base):
+    """A method call inside an argument list of a by-reference call.
+
+    Pre-existing, and not about `std` at all: rewriting a call that takes a
+    reference *consumed* its arguments -- the scan resumed past the closing
+    paren -- so a method call nested in one was never visited, and reached
+    the C as `take(&a, a.get())`, which is not a function that exists. The
+    fixed-point loop could not help: every pass made the same jump.
+    """
+
+    def test_nested_method_call_is_lowered(self):
+        self.assertLowers("""
+class Box {
+public:
+    int v;
+    Box() { v = 7; }
+    int get() { return v; }
+};
+void take(const Box &b, int k);
+int f(void) {
+    Box a;
+    take(a, a.get());
+    return 0;
+}
+""", "take(&a, Box_get(&a))")
+
+    def test_plain_c_argument_still_gets_the_address(self):
+        """The wait must be bounded: a receiver that will never be rewritten
+        must not defer, or the loop runs out with no `&` inserted at all."""
+        self.assertLowers("""
+struct raw { int n; };
+int rawget(struct raw *r);
+class Box {
+public:
+    int v;
+    Box() { v = 7; }
+};
+void take(const Box &b, int k);
+int f(void) {
+    Box a;
+    struct raw r;
+    take(a, rawget(&r));
+    return 0;
+}
+""", "take(&a, rawget(&r))")
+
+    def test_container_iterator_nested_in_an_algorithm_call(self):
+        """What the fix was for: `s.begin()` inside `lower_bound<T>(..)`."""
+        self.assertLowers("""
+#include <algorithm>
+#include <set>
+#include <string>
+int f(void) {
+    std::set<std::string> s;
+    std::string q("fig");
+    return std::binary_search<std::string>(s.begin(), s.end(), q);
+}
+""", "set_string_begin(&s)", "set_string_end(&s)")
+
+
+# ------------------------------------------------------------- sort
+
+class TestStdSort(Base):
+    """`sort` over a `T *` range, moving elements by representation."""
+
+    def test_scalar_sort_lowers(self):
+        self.assertLowers("""
+#include <algorithm>
+#include <vector>
+int f(void) {
+    std::vector<int> v;
+    v.push_back(2);
+    std::sort<int>(v.begin(), v.end());
+    return 0;
+}
+""", "sort_int")
+
+    def test_owning_element_moves_rather_than_assigns(self):
+        """No copy constructor call and no destructor in the sort body.
+
+        An element is relocated, not copied and destroyed, so it keeps its
+        one owner -- which is what lets an owning type be sorted at all
+        without `operator=`.
+        """
+        out = self.assertLowers("""
+#include <algorithm>
+#include <vector>
+#include <string>
+int f(void) {
+    std::vector<std::string> v;
+    std::string a("pear");
+    v.push_back(a);
+    std::sort<std::string>(v.begin(), v.end());
+    return 0;
+}
+""", "sort_string")
+        body = out[out.index("sort_string"):]
+        body = body[:body.index("\n}")]
+        self.assertNotIn("string_copy", body)
+        self.assertNotIn("string_drop", body)
+
+    def test_addr_builtin_spells_the_right_operand(self):
+        """`__cpp_addr` is an address for a class and the value for a scalar."""
+        out = self.assertLowers("""
+#include <algorithm>
+#include <vector>
+int f(void) {
+    std::vector<int> v;
+    std::sort<int>(v.begin(), v.end());
+    return 0;
+}
+""")
+        self.assertNotIn("__cpp_addr", out)
+
+
+# --------------------------------------------------------- sorted map
+
+class TestSortedMap(Base):
+    """`map` moved onto `__cpp_cmp`: sorted, binary-searched, and owning.
+
+    It was an unsorted array with a linear `find`, which also meant it
+    iterated in *insertion* order -- quietly unlike `std::map`, so code
+    that walked one and relied on the order was wrong with nothing
+    reporting it.
+    """
+
+    def test_lookup_is_a_binary_search(self):
+        out = self.assertLowers("""
+#include <map>
+int f(void) { std::map<int, int> m; m[1] = 2; return m.count(1); }
+""")
+        self.assertIn("lower_index", out)
+
+    def test_key_class_needs_compare_not_equals(self):
+        """The contract change: an order, not an equality."""
+        self.refuses("""
+#include <map>
+class K { public: int v; K() { v = 0; } ~K() { } };
+int f(void) { std::map<K, int> m; K k; return m.count(k); }
+""", "no `compare`")
+
+    def test_owning_key_and_value_are_both_destroyed(self):
+        """`~map` freed only the array, leaking every owning key in it."""
+        self.assertLowers("""
+#include <map>
+#include <string>
+int f(void) {
+    std::map<std::string, std::string> m;
+    std::string k("a");
+    std::string v("b");
+    m[k] = v;
+    return m.size();
+}
+""", "map_string_string_clear", "string_drop")
+
+    def test_a_new_value_is_zeroed(self):
+        """`std::map` value-initialises; `realloc` storage holds junk.
+
+        Reading `m[absent]` gave whatever was in the block, and a
+        `map<K,string>` would have destroyed a pointer nobody set.
+        """
+        self.assertLowers("""
+#include <map>
+int f(void) { std::map<int, int> m; return m[7]; }
+""", "memset")
+
+    def test_erase_shifts_by_representation(self):
+        """Relocation, not assignment: an owning entry keeps its one owner
+        and is not destroyed a second time on the way past."""
+        self.assertLowers("""
+#include <map>
+#include <string>
+int f(void) {
+    std::map<std::string, int> m;
+    std::string k("a");
+    m[k] = 1;
+    m.erase(k);
+    return m.size();
+}
+""", "memmove")
+
+
+# ------------------------------------------------- argument deduction
+
+class TestTemplateArgDeduction(Base):
+    """`sort(v.begin(), v.end())` without spelling `<int>`.
+
+    Deliberately narrow: a range is a pair of pointers, so typing the
+    *first* argument types the call. A deduced call is rewritten to spell
+    its arguments the long way and the ordinary substitution runs on that,
+    so there is one code path for both forms rather than two that can
+    drift apart.
+    """
+
+    def test_deduced_from_a_container_iterator(self):
+        self.assertLowers("""
+#include <algorithm>
+#include <vector>
+int f(void) {
+    std::vector<int> v;
+    std::sort(v.begin(), v.end());
+    return 0;
+}
+""", "sort_int")
+
+    def test_deduced_from_an_array(self):
+        """An array decays to `T *`, so it types the call too."""
+        self.assertLowers("""
+#include <algorithm>
+#include <vector>
+int f(void) {
+    std::vector<int> keep;
+    int a[4];
+    std::sort(a, a + 4);
+    return 0;
+}
+""", "sort_int")
+
+    def test_deduced_from_a_declared_pointer_local(self):
+        self.assertLowers("""
+#include <algorithm>
+#include <vector>
+#include <string>
+int f(void) {
+    std::vector<std::string> v;
+    std::string *lo = v.begin();
+    std::string *hi = v.end();
+    std::sort(lo, hi);
+    return 0;
+}
+""", "sort_string")
+
+    def test_map_iterator_is_not_deduced(self):
+        """`map::begin()` is a `pair<K,V> *`, not a `K *`.
+
+        Deducing `K` from it would be wrong rather than merely
+        unsupported, which is why `map` is left out of the containers
+        deduction reads through.
+        """
+        self.refuses("""
+#include <algorithm>
+#include <map>
+int f(void) {
+    std::map<int,int> m;
+    return (int)(std::lower_bound(m.begin(), m.end(), 1) - m.begin());
+}
+""", "could not be deduced")
+
+    def test_an_untypeable_argument_is_reported(self):
+        """A call result has no declaration to read, so it is refused."""
+        self.refuses("""
+#include <algorithm>
+#include <vector>
+int *mystery(void);
+int f(void) {
+    std::vector<int> v;
+    std::sort(mystery(), mystery() + 4);
+    return 0;
+}
+""", "could not be deduced")
+
+    def test_a_non_pointer_parameter_is_not_deduced(self):
+        """Deduction reads a parameter written `T *` and nothing else."""
+        self.refuses("""
+template<typename T>
+T twice(T x) { return x + x; }
+int f(void) { return twice(3); }
+""", "could not be deduced")
+
+    def test_explicit_arguments_still_work(self):
+        """The long form is unchanged -- and is what deduction produces."""
+        self.assertLowers("""
+#include <algorithm>
+#include <vector>
+int f(void) {
+    std::vector<int> v;
+    std::sort<int>(v.begin(), v.end());
+    return 0;
+}
+""", "sort_int")
+
+
+# ------------------------------------------------- priority_queue
+
+class TestPriorityQueue(Base):
+    """A max-heap in an array, sifted by hole rather than by swapping."""
+
+    def test_scalar_queue_lowers(self):
+        self.assertLowers("""
+#include <queue>
+int f(void) {
+    std::priority_queue<int> q;
+    q.push(3);
+    q.pop();
+    return q.size();
+}
+""", "priority_queue_int_push", "priority_queue_int_pop")
+
+    def test_element_class_needs_compare(self):
+        """Ordering is `__cpp_cmp`, so a class element supplies `compare`."""
+        self.refuses("""
+#include <queue>
+class K { public: int v; K() { v = 0; } ~K() { } };
+int f(void) {
+    std::priority_queue<K> q;
+    K k;
+    q.push(k);
+    return q.size();
+}
+""", "no `compare`")
+
+    def test_owning_element_is_relocated_not_assigned(self):
+        """Sifting moves by representation, so no copy or destroy per step.
+
+        Two live copies of an owning object never exist at once, which is
+        what lets an owning element be heaped without `operator=`.
+        """
+        out = self.assertLowers("""
+#include <queue>
+#include <string>
+int f(void) {
+    std::priority_queue<std::string> q;
+    std::string a("pear");
+    q.push(a);
+    return q.size();
+}
+""", "priority_queue_string_push")
+        # The definition, not the prototype: take the occurrence that is
+        # followed by a body.
+        at = out.index("priority_queue_string_pop(priority_queue_string "
+                       "*this) {")
+        body = out[at:out.index("\n", at)]
+        self.assertNotIn("string_copy", body)
+
+    def test_abandoned_queue_frees_its_elements(self):
+        """`~priority_queue` clears before freeing the block."""
+        self.assertLowers("""
+#include <queue>
+#include <string>
+int f(void) {
+    std::priority_queue<std::string> q;
+    std::string a("pear");
+    q.push(a);
+    return q.size();
+}
+""", "priority_queue_string_clear", "string_drop")
+
+
+# --------------------------------------------------- reference returns
+
+class TestScalarRefReturn(Base):
+    """`int &get()` -- documented as rejected, but only classes were checked.
+
+    A reference return of a built-in type reached the C as `int_&get`,
+    which is not an identifier, with no diagnostic at all. Found while
+    writing `priority_queue::top()`.
+    """
+
+    def test_scalar_reference_return_is_reported(self):
+        self.refuses("""
+class B {
+public:
+    int v;
+    B() { v = 1; }
+    int &get() { return v; }
+};
+int f(void) { B b; return b.get(); }
+""", "int&", "not in the C++ subset")
+
+    def test_operator_index_may_still_return_one(self):
+        """It is required there: a by-value subscript would make `v[i] = x`
+        write to a copy."""
+        self.assertLowers("""
+#include <vector>
+int f(void) {
+    std::vector<int> v;
+    v.push_back(1);
+    return v[0];
+}
+""", "vector_int__index")
+
+
+# ------------------------------------------------------ line numbers
+
+class TestDiagnosticLineNumbers(Base):
+    """A reported line has to be a line the author can open.
+
+    Two bugs compounded here. The supplied `std` prelude is hundreds of
+    lines of `string`, `vector` and `map` prepended above the source, and
+    counting from the start of the buffer named line 6 as line 197. On top
+    of that, each `#include <vector>` was *deleted*, shifting everything
+    below it up by one -- so the more headers a file used, the further off
+    the number got.
+    """
+
+    def _line_of(self, src, *needles):
+        msg = self.refuses(src, *needles)
+        mm = __import__("re").search(r":(\d+):", msg)
+        self.assertIsNotNone(mm, "no line number in: %s" % msg)
+        return int(mm.group(1))
+
+    def test_line_is_the_authors_not_the_preludes(self):
+        """One header: the prelude is above, the count starts below it."""
+        self.assertEqual(self._line_of("""#include <vector>
+class B {
+public:
+    int v;
+    B() { v = 1; }
+    int &get() { return v; }
+};
+int f(void) { B b; return b.get(); }
+""", "not in the C++ subset"), 6)
+
+    def test_each_dropped_include_keeps_its_line(self):
+        """Three headers, so the old deletion bug would report line 3."""
+        self.assertEqual(self._line_of("""#include <vector>
+#include <string>
+#include <map>
+class B {
+public:
+    int v;
+    B() { v = 1; }
+    int &get() { return v; }
+};
+int f(void) { B b; return b.get(); }
+""", "not in the C++ subset"), 8)
+
+    def test_line_survives_monomorphisation_above_it(self):
+        """Why a marker and not a recorded offset.
+
+        Instantiating a template replaces its body with one copy per use,
+        so the number of lines above the author's code depends on what the
+        file asks for. A fixed offset would be wrong by however much that
+        added; the marker moves with the text below it.
+        """
+        self.assertEqual(self._line_of("""#include <vector>
+#include <map>
+#include <set>
+int g(void) {
+    std::vector<int> a;
+    std::map<int,int> b;
+    std::set<int> c;
+    return 0;
+}
+class B {
+public:
+    int v;
+    B() { v = 1; }
+    int &get() { return v; }
+};
+int f(void) { B b; return b.get(); }
+""", "not in the C++ subset"), 14)
+
+    def test_the_marker_does_not_reach_the_c(self):
+        """It is this module's bookkeeping, not part of the output."""
+        out = self.assertLowers("""#include <vector>
+int f(void) { std::vector<int> v; v.push_back(1); return v[0]; }
+""")
+        self.assertNotIn("__crust_src_origin__", out)
+
+
+class TestMemberParseLineNumbers(Base):
+    """Class-body parse failures name the member's line.
+
+    `_split_members` already received the line the class was declared on,
+    so a member's line is that plus the newlines above it in the body. It
+    runs before class emission, where text and source still correspond
+    exactly -- which is the boundary that decides whether a line number can
+    be trusted at all here.
+    """
+
+    def _line_of(self, src, *needles):
+        msg = self.refuses(src, *needles)
+        mm = __import__("re").search(r":(\d+):", msg)
+        self.assertIsNotNone(mm, "no line number in: %s" % msg)
+        return int(mm.group(1))
+
+    def test_unparsable_member_names_its_line(self):
+        self.assertEqual(self._line_of("""#include <vector>
+class B {
+public:
+    int v;
+    B() { v = 1; }
+    zzz;
+};
+int f(void) { B b; return b.v; }
+""", "cannot parse member"), 6)
+
+    def test_the_line_is_the_members_not_the_classs(self):
+        """A class declared on 2 with a bad member on 9 reports 9."""
+        self.assertEqual(self._line_of("""#include <vector>
+class B {
+public:
+    int a;
+    int b;
+    int c;
+    int d;
+    B() { a = 1; }
+    zzz;
+};
+int f(void) { B x; return x.a; }
+""", "cannot parse member"), 9)
+
+
+# ------------------------------------------- stack/queue/array/optional
+
+class TestContainerBatch(Base):
+    """Four small containers, each with one design question of its own."""
+
+    def test_stack_indexes_from_the_top(self):
+        """`s[0]` and `top()` must agree, so index 0 counts down."""
+        self.assertLowers("""
+#include <stack>
+int f(void) {
+    std::stack<int> s;
+    s.push(1);
+    return s[0];
+}
+""", "stack_int_push", "stack_int__index")
+
+    def test_queue_is_a_head_index_not_a_ring(self):
+        """A wrapped range cannot be handed out as a pointer pair, which is
+        the iteration every other container here offers."""
+        self.assertLowers("""
+#include <queue>
+int f(void) {
+    std::queue<int> q;
+    q.push(1);
+    q.pop();
+    return q.size();
+}
+""", "queue_int_begin", "queue_int_end")
+
+    def test_owning_queue_compacts_by_relocation(self):
+        """Reclaiming popped space moves elements rather than copying them."""
+        self.assertLowers("""
+#include <queue>
+#include <string>
+int f(void) {
+    std::queue<std::string> q;
+    std::string a("x");
+    q.push(a);
+    q.pop();
+    return q.size();
+}
+""", "memmove", "string_drop")
+
+    def test_array_refuses_an_owning_element(self):
+        """The bug this caught: `array<string,3>` segfaulted.
+
+        Elements live in a plain array *member*, which this subset neither
+        constructs nor destroys, so the first `fill` copy-constructed over
+        garbage and followed a wild pointer. Refused now, pointing at
+        `vector`, which does construct and destroy what it holds.
+        """
+        self.refuses("""
+#include <array>
+#include <string>
+int f(void) {
+    std::array<std::string, 3> a;
+    std::string k("x");
+    a.fill(k);
+    return a.size();
+}
+""", "array<string, 3>", "Use `vector<string>`")
+
+    def test_array_of_plain_data_is_fine(self):
+        """A class with neither constructor nor destructor owns nothing and
+        is exactly what `std::array` holds."""
+        self.assertLowers("""
+#include <array>
+class P { public: int x; int y; };
+int f(void) {
+    std::array<P, 3> a;
+    a[0].x = 1;
+    return a[0].x;
+}
+""", "array_P_3")
+
+    def test_optional_holds_its_value_behind_a_pointer(self):
+        """A `T` member would be constructed and destroyed with the
+        container, which is exactly what an optional must not do -- an
+        empty one holds nothing, and `reset()` would then be a second
+        destruction of what the epilogue also destroys."""
+        out = self.assertLowers("""
+#include <optional>
+#include <string>
+int f(void) {
+    std::optional<std::string> o;
+    std::string k("x");
+    o.set(k);
+    return o.has_value();
+}
+""", "optional_string_reset", "string_drop")
+        self.assertIn("malloc", out)
+
+    def test_optional_value_is_null_when_empty(self):
+        self.assertLowers("""
+#include <optional>
+int f(void) {
+    std::optional<int> o;
+    return o.value() == 0;
+}
+""", "optional_int_value")
+
+
+class TestMoreAlgorithms(Base):
+    """`find`, `count`, `reverse`, `fill`, `min_element`, `max_element`."""
+
+    def test_find_asks_equality_not_ordering(self):
+        """`std::find` needs only `==`, so requiring `compare` would refuse
+        a class that reasonably has equality and no order."""
+        self.assertLowers("""
+#include <algorithm>
+#include <vector>
+class K {
+public:
+    int v;
+    K() { v = 0; }
+    ~K() { }
+    K(const K &o) { v = o.v; }
+    int equals(const K &o) { return v == o.v; }
+};
+int f(void) {
+    std::vector<K> v;
+    K k;
+    return (int)(std::find(v.begin(), v.end(), k) - v.begin());
+}
+""", "K_equals")
+
+    def test_reverse_swaps_by_representation(self):
+        """No copy or destroy per swap, so an owning element keeps its
+        one owner and needs no `operator=`."""
+        out = self.assertLowers("""
+#include <algorithm>
+#include <vector>
+#include <string>
+int f(void) {
+    std::vector<std::string> v;
+    std::reverse(v.begin(), v.end());
+    return 0;
+}
+""", "reverse_string")
+        at = out.index("void reverse_string(")
+        self.assertNotIn("string_copy", out[at:out.index("\n", at)])
+
+    def test_min_element_chains_onto_its_result(self):
+        """The bug this caught: `min_element(..)->c_str()` was left as
+        written, because a chain only ever started from a *symbol* that
+        resolved to a class and a call result is not one."""
+        self.assertLowers("""
+#include <algorithm>
+#include <vector>
+#include <string>
+int f(void) {
+    std::vector<std::string> v;
+    return (int)std::min_element(v.begin(), v.end())->size();
+}
+""", "string_size(min_element_string(")
+
+
+class TestDeclarationShadowing(Base):
+    """Deduction reads the *nearest* declaration above the call.
+
+    `re.search` returns the first match in the file, and the supplied
+    templates sit above the author's code with ordinary local names in
+    them -- so `T *lo` inside `reverse` was found for a call whose `lo` was
+    the author's `string *`, and the call deduced a type named `T`.
+    """
+
+    def test_a_prelude_local_does_not_shadow_the_authors(self):
+        self.assertLowers("""
+#include <algorithm>
+#include <vector>
+#include <string>
+int f(void) {
+    std::vector<std::string> v;
+    std::string *lo = v.begin();
+    std::string *hi = v.end();
+    std::sort(lo, hi);
+    return 0;
+}
+""", "sort_string")
+
+
+class TestUnorderedAliases(Base):
+    """`unordered_map`/`unordered_set` are the ordered ones renamed.
+
+    Nothing here hashes, and nothing in this subset can write `hash<T>`
+    generically, so a separate copy would have the unordered interface and
+    the ordered behaviour. Aliasing says that rather than hiding it.
+    """
+
+    def test_unordered_map_is_map(self):
+        self.assertLowers("""
+#include <unordered_map>
+int f(void) {
+    std::unordered_map<int, int> m;
+    m[1] = 2;
+    return m.size();
+}
+""", "map_int_int_new")
+
+    def test_unordered_set_is_set(self):
+        self.assertLowers("""
+#include <unordered_set>
+int f(void) {
+    std::unordered_set<int> s;
+    s.insert(1);
+    return s.size();
+}
+""", "set_int_insert")
+
+
+class TestSwapAccumulateCopy(Base):
+    """`swap`, `accumulate`, `copy`."""
+
+    def test_swap_takes_pointers(self):
+        """`std::swap` takes references, which cannot be spelled here.
+
+        A `T &` parameter is lowered to `T *` only for a *class*, so
+        `swap(int &, int &)` would keep its `&`; and `__cpp_ref(T)` gives a
+        scalar by value, which is what a swap cannot have. Pointers are the
+        one spelling that works for both.
+        """
+        self.assertLowers("""
+#include <algorithm>
+#include <vector>
+int f(void) {
+    std::vector<int> keep;
+    int a = 1;
+    int b = 2;
+    std::swap(&a, &b);
+    return a;
+}
+""", "swap_int(&a, &b)")
+
+    def test_swap_moves_by_representation(self):
+        """No copy or destroy, so an owning element keeps its one owner."""
+        out = self.assertLowers("""
+#include <algorithm>
+#include <string>
+#include <vector>
+int f(void) {
+    std::vector<int> keep;
+    std::string x("a");
+    std::string y("b");
+    std::swap(&x, &y);
+    return 0;
+}
+""", "swap_string")
+        at = out.index("void swap_string(")
+        self.assertNotIn("string_copy", out[at:out.index("\n", at)])
+
+    def test_accumulate_and_copy(self):
+        self.assertLowers("""
+#include <algorithm>
+#include <vector>
+int f(void) {
+    std::vector<int> v;
+    std::vector<int> w;
+    std::copy(v.begin(), v.end(), w.begin());
+    return std::accumulate(v.begin(), v.end(), 0);
+}
+""", "accumulate_int", "copy_int")
+
+
+class TestDeductionIgnoresThePrelude(Base):
+    """Deduction never reads a declaration above the author's first line.
+
+    Searching backwards for the nearest declaration was not enough on its
+    own: `swap` declares a parameter `T *a`, above everything, so a call
+    whose `a` was the author's `int a[4]` found the template's parameter
+    and deduced a type literally named `T`. The prelude is now out of
+    range entirely.
+    """
+
+    def test_a_template_parameter_does_not_answer_for_a_local(self):
+        self.assertLowers("""
+#include <algorithm>
+#include <vector>
+int f(void) {
+    std::vector<int> keep;
+    int a[4];
+    std::sort(a, a + 4);
+    return 0;
+}
+""", "sort_int")
+
+
+class TestStringSubstringSearch(Base):
+    """`find_str`, not an overload of `find`.
+
+    `std::string` overloads `find` on `char` and `const char *`, which are
+    the same arity -- and this subset resolves overloads by argument
+    *count*, before types are known, so the two cannot be told apart.
+    """
+
+    def test_substring_search_lowers(self):
+        self.assertLowers("""
+#include <string>
+int f(void) {
+    std::string s("hello");
+    return s.find_str("ell");
+}
+""", "string_find_str")
+
+    def test_char_find_still_works_alongside_it(self):
+        self.assertLowers("""
+#include <string>
+int f(void) {
+    std::string s("hello");
+    return s.find('e');
+}
+""", "string_find")
+
+
+class TestRangeWriteSafety(Base):
+    """`fill`/`copy` of an owning element need a constructed destination.
+
+    Both destroy each destination before constructing over it, which is
+    what assignment would have done and is right for a container's range.
+    Handed raw storage they destroy garbage and follow whatever the bytes
+    were -- a segfault, reproduced before this landed, and the same hazard
+    `array<T,N>` of an owning element was refused for.
+    """
+
+    def test_owning_copy_into_raw_storage_is_refused(self):
+        self.refuses("""
+#include <algorithm>
+#include <vector>
+#include <string>
+int f(void) {
+    std::vector<std::string> v;
+    std::string *raw = (std::string *)malloc(sizeof(std::string) * 2);
+    std::copy(v.begin(), v.end(), raw);
+    return 0;
+}
+""", "destroying each one", "not visibly a container's own range")
+
+    def test_the_explicit_form_is_checked_too(self):
+        """`copy<string>(..)` skips deduction but not this."""
+        self.refuses("""
+#include <algorithm>
+#include <vector>
+#include <string>
+int f(void) {
+    std::vector<std::string> v;
+    std::string *raw = (std::string *)malloc(sizeof(std::string));
+    std::copy<std::string>(v.begin(), v.end(), raw);
+    return 0;
+}
+""", "destroying each one")
+
+    def test_a_container_range_is_accepted(self):
+        self.assertLowers("""
+#include <algorithm>
+#include <vector>
+#include <string>
+int f(void) {
+    std::vector<std::string> v;
+    std::vector<std::string> w;
+    std::copy(v.begin(), v.end(), w.begin());
+    return 0;
+}
+""", "copy_string")
+
+    def test_one_level_of_alias_is_followed(self):
+        """`T *dst = w.begin();` is the ordinary way to name a range, and
+        refusing it would fire the check mostly on correct code."""
+        self.assertLowers("""
+#include <algorithm>
+#include <vector>
+#include <string>
+int f(void) {
+    std::vector<std::string> v;
+    std::vector<std::string> w;
+    std::string *dst = w.begin();
+    std::copy(v.begin(), v.end(), dst);
+    return 0;
+}
+""", "copy_string")
+
+    def test_a_scalar_element_may_go_anywhere(self):
+        """Plain data has nothing to destroy, so `__cpp_drop` is a no-op on
+        it and raw storage is a perfectly good destination."""
+        self.assertLowers("""
+#include <algorithm>
+#include <vector>
+int f(void) {
+    std::vector<int> v;
+    int raw[4];
+    std::fill(raw, raw + 4, 7);
+    std::copy(v.begin(), v.end(), raw);
+    return 0;
+}
+""", "fill_int", "copy_int")
+
+    def test_fill_over_an_owning_range_is_accepted(self):
+        self.assertLowers("""
+#include <algorithm>
+#include <vector>
+#include <string>
+int f(void) {
+    std::vector<std::string> v;
+    std::string k("x");
+    std::fill(v.begin(), v.end(), k);
+    return 0;
+}
+""", "fill_string")
+
+
+class TestNumericHeader(Base):
+    """`<numeric>` as its own header, now that it is more than one
+    function."""
+
+    def test_the_header_supplies_them(self):
+        self.assertLowers("""
+#include <numeric>
+#include <vector>
+int f(void) {
+    std::vector<int> v;
+    std::iota(v.begin(), v.end(), 1);
+    return std::accumulate(v.begin(), v.end(), 0);
+}
+""", "iota_int", "accumulate_int")
+
+    def test_accumulate_still_answers_to_its_name(self):
+        """It lived in `<algorithm>` here until this header existed.
+
+        A file that included only that one and called it would otherwise
+        have stopped compiling, with a link error naming a function the
+        author *did* write -- so the name is probed for as well as the
+        header.
+        """
+        self.assertLowers("""
+#include <algorithm>
+#include <vector>
+int f(void) {
+    std::vector<int> v;
+    return std::accumulate(v.begin(), v.end(), 0);
+}
+""", "accumulate_int")
+
+    def test_partial_sum_and_adjacent_difference(self):
+        self.assertLowers("""
+#include <numeric>
+#include <vector>
+int f(void) {
+    std::vector<int> v;
+    std::partial_sum(v.begin(), v.end(), v.begin());
+    std::adjacent_difference(v.begin(), v.end(), v.begin());
+    return 0;
+}
+""", "partial_sum_int", "adjacent_difference_int")
+
+    def test_a_class_element_is_reported_against_the_call(self):
+        """Not against `sum = sum + *it`, a line inside a supplied template
+        the author never wrote and cannot act on."""
+        msg = self.refuses("""
+#include <numeric>
+#include <vector>
+#include <string>
+int f(void) {
+    std::vector<std::string> v;
+    std::string z("");
+    return std::accumulate(v.begin(), v.end(), z).size();
+}
+""", "combines elements with `+`", "string is a class")
+        self.assertNotIn("sum = sum", msg)
+
+
+class TestBinaryArithmeticOperators(Base):
+    """`operator+` and friends, in the one case that has an honest lowering.
+
+    A binary operator hands back a new object *by value*, which this subset
+    cannot do for a class that owns something -- the local is destroyed on
+    the way out and the caller gets a copy of a released object. For a
+    class that owns nothing the struct copy is exactly what C++ does, so
+    that is where the operator is available and the other case is reported.
+    """
+
+    def test_plain_data_class_gets_the_operator(self):
+        self.assertLowers("""
+class vec2 {
+public:
+    int x;
+    vec2() { x = 0; }
+    vec2 operator+(const vec2 &o) { vec2 r; r.x = x + o.x; return r; }
+};
+int f(void) {
+    vec2 a;
+    vec2 b;
+    vec2 c = a + b;
+    return c.x;
+}
+""", "vec2__binadd(&a, &b)")
+
+    def test_an_owning_class_is_reported(self):
+        self.refuses("""
+class buf {
+public:
+    char *p;
+    buf() { p = 0; }
+    ~buf() { free(p); }
+    buf operator+(const buf &o) { buf r; return r; }
+};
+int f(void) { buf a; buf b; buf c = a + b; return 0; }
+""", "returns buf by value", "Use `operator+=`")
+
+    def test_scalars_are_untouched(self):
+        """The receiver has to resolve to a class with the operator, so
+        ordinary arithmetic is left exactly as written."""
+        self.assertLowers("""
+class vec2 {
+public:
+    int x;
+    vec2() { x = 0; }
+    vec2 operator+(const vec2 &o) { vec2 r; r.x = x + o.x; return r; }
+};
+int f(void) {
+    int i = 3;
+    int j = 4;
+    return i + j;
+}
+""", "return i + j")
+
+    def test_compound_assignment_is_not_eaten(self):
+        """`a += b` is a different lowering, and the `+` must not be taken
+        for the binary one."""
+        self.assertLowers("""
+class vec2 {
+public:
+    int x;
+    vec2() { x = 0; }
+    vec2 operator+(const vec2 &o) { vec2 r; r.x = x + o.x; return r; }
+    void operator+=(const vec2 &o) { x = x + o.x; }
+};
+int f(void) {
+    vec2 a;
+    vec2 b;
+    a += b;
+    return a.x;
+}
+""", "vec2__augadd(&a, &b)")
+
+    def test_dereference_and_multiply_are_told_apart(self):
+        """`operator*` is spelled the same either way; the difference on
+        the page is whether it takes an operand."""
+        self.assertLowers("""
+class num {
+public:
+    int v;
+    num() { v = 0; }
+    num operator*(const num &o) { num r; r.v = v * o.v; return r; }
+};
+int f(void) {
+    num a;
+    num b;
+    num c = a * b;
+    return c.v;
+}
+""", "num__binmul(&a, &b)")
+
+
+class TestCtorCallInMethodBody(Base):
+    """A parenthesised constructor call inside a method body.
+
+    It was not lowered: `vec2 r(5);` in a method reached the C unchanged,
+    so `r` was never declared and the call was not a call. The cause was
+    the declaration pattern's argument group, which could run past its own
+    closing paren -- so for a method whose *return type* is a class, it
+    matched from the function's own name to the first `;` inside the body,
+    swallowing the real declaration. Only a class return type put the
+    header in range, which is why `T name(args)` worked everywhere else and
+    the gap looked like a general limitation.
+    """
+
+    def test_ctor_call_in_a_method_body_is_lowered(self):
+        self.assertLowers("""
+class vec2 {
+public:
+    int x;
+    vec2() { x = 0; }
+    vec2(int a) { x = a; }
+    vec2 mk() { vec2 r(5); return r; }
+};
+int f(void) { vec2 a; return a.mk().x; }
+""", "vec2 r; vec2_new_1(&r, 5);")
+
+    def test_a_nested_call_in_the_arguments_still_works(self):
+        """Braces are excluded from the argument group rather than parens,
+        because an argument may legitimately contain a call -- and the
+        balance check is what keeps that from over-matching again."""
+        self.assertLowers("""
+int dbl(int v);
+class vec2 {
+public:
+    int x;
+    vec2() { x = 0; }
+    vec2(int a) { x = a; }
+    vec2 mk() { vec2 r(dbl(2)); return r; }
+};
+int f(void) { vec2 a; return a.mk().x; }
+""", "vec2_new_1(&r, dbl(2))")
+
+    def test_the_no_argument_form_does_lower(self):
+        self.assertLowers("""
+class vec2 {
+public:
+    int x;
+    vec2() { x = 0; }
+    vec2 mk() { vec2 r; r.x = 5; return r; }
+};
+int f(void) { vec2 a; return a.mk().x; }
+""", "vec2 r; vec2_new(&r);")
+
+
+class TestChainedBinaryOperators(Base):
+    """`a + b + c`, through a by-value front door.
+
+    The left operand of the second `+` is the *result* of the first, and C
+    cannot take the address of a function result -- the same wall a
+    by-value method return hits in a chain. So each operator gets a variant
+    taking its left operand by value, which a call to the ordinary form can
+    be passed straight into. Safe precisely because a binary operator is
+    only available to a class that owns nothing, so the by-value parameter
+    is a struct copy with nothing to construct or destroy.
+    """
+
+    _VEC = """
+class vec2 {
+public:
+    int x;
+    vec2() { x = 0; }
+    vec2(int a) { x = a; }
+    vec2 operator+(const vec2 &o) { vec2 r(x + o.x); return r; }
+    vec2 operator-(const vec2 &o) { vec2 r(x - o.x); return r; }
+    vec2 operator*(const vec2 &o) { vec2 r(x * o.x); return r; }
+};
+"""
+
+    def test_a_run_chains_left_to_right(self):
+        self.assertLowers(self._VEC + """
+int f(void) {
+    vec2 a(1);
+    vec2 b(2);
+    vec2 c(3);
+    vec2 s = a + b + c;
+    return s.x;
+}
+""", "vec2__binadd_v(vec2__binadd(&a, &b), &c)")
+
+    def test_subtraction_keeps_its_grouping(self):
+        """`c - b - a` is `(c - b) - a`. Right-associating it would be a
+        different number, so this is the shape worth pinning."""
+        self.assertLowers(self._VEC + """
+int f(void) {
+    vec2 a(1);
+    vec2 b(2);
+    vec2 c(3);
+    vec2 d = c - b - a;
+    return d.x;
+}
+""", "vec2__binsub_v(vec2__binsub(&c, &b), &a)")
+
+    def test_mixed_precedence_is_reported(self):
+        """`a + b * c` would chain to `(a + b) * c`, which is the wrong
+        grouping -- so it is refused rather than computed."""
+        self.refuses(self._VEC + """
+int f(void) {
+    vec2 a(1);
+    vec2 b(2);
+    vec2 c(3);
+    vec2 s = a + b * c;
+    return s.x;
+}
+""", "different precedence", "temporary")
+
+    def test_equal_precedence_may_mix(self):
+        """`+` and `-` bind equally, so left to right is correct."""
+        self.assertLowers(self._VEC + """
+int f(void) {
+    vec2 a(1);
+    vec2 b(2);
+    vec2 c(3);
+    vec2 e = a + b - c;
+    return e.x;
+}
+""", "vec2__binsub_v(vec2__binadd(&a, &b), &c)")
+
+    def test_a_parenthesised_operand_is_reported(self):
+        """And the diagnostic does not suggest parentheses, which do not
+        help: an operand has to be a plain name either way."""
+        msg = self.refuses(self._VEC + """
+int f(void) {
+    vec2 a(1);
+    vec2 b(2);
+    vec2 c(3);
+    vec2 s = a + (b * c);
+    return s.x;
+}
+""", "has to be a plain name")
+        self.assertIn("temporary", msg)
+
+    def test_the_by_value_wrapper_is_only_for_class_returns(self):
+        """An operator returning a scalar (`int operator+`) has nothing to
+        chain, so no wrapper is emitted for it."""
+        out = self.assertLowers("""
+class S {
+public:
+    int v;
+    S() { v = 0; }
+    int operator+(const S &o) { return v + o.v; }
+};
+int f(void) { S a; S b; return a + b; }
+""", "S__binadd(&a, &b)")
+        self.assertNotIn("S__binadd_v", out)
+
+
+class TestByValueReceiverChain(Base):
+    """`o.make().get()` -- a method called on a by-value return.
+
+    The other half of the wall `a + b + c` hit: C cannot take the address
+    of a function result. Same way out, too -- a variant of the method
+    taking its receiver by value, emitted only for the names a source
+    actually chains onto, and only for a class that owns nothing.
+    """
+
+    _SRC = """
+class inner {
+public:
+    int v;
+    inner() { v = 0; }
+    inner(int a) { v = a; }
+    int get() { return v; }
+    int plus(int k) { return v + k; }
+};
+class outer {
+public:
+    int n;
+    outer() { n = 5; }
+    inner make() { inner r(n * 2); return r; }
+};
+"""
+
+    def test_a_value_return_can_receive_a_call(self):
+        self.assertLowers(self._SRC + """
+int f(void) { outer o; return o.make().get(); }
+""", "inner__byval_get_0(outer_make(&o))")
+
+    def test_arguments_are_forwarded(self):
+        """The variant repeats the method's own parameter list, which meant
+        recording it -- only the reference *positions* were kept before,
+        enough to fix up a call but not to declare a forwarder."""
+        self.assertLowers(self._SRC + """
+int f(void) { outer o; return o.make().plus(3); }
+""", "inner__byval_plus_1(outer_make(&o), 3)")
+
+    def test_an_owning_return_is_still_refused(self):
+        """A struct copy of an owning receiver would leave two objects
+        holding one resource, so no variant exists for it."""
+        self.refuses("""
+class buf {
+public:
+    char *p;
+    buf() { p = 0; }
+    ~buf() { free(p); }
+    int get() { return 1; }
+};
+class mk {
+public:
+    mk() { }
+    buf make() { buf r; return r; }
+};
+int f(void) { mk m; return m.make().get(); }
+""", "owns a resource")
+
+    def test_a_virtual_call_says_why_it_cannot(self):
+        """And does not claim the class owns a resource, which would send
+        the author looking for one it has not got."""
+        msg = self.refuses("""
+class shp { public: shp() { } virtual int area() { return 1; } };
+class fac { public: fac() { } shp mk() { shp r; return r; } };
+int f(void) { fac k; return k.mk().area(); }
+""", "through the vtable")
+        self.assertNotIn("owns a resource", msg)
+
+    def test_the_variant_is_only_emitted_for_chained_names(self):
+        """One per method unconditionally would leave unused static
+        functions all over the output."""
+        out = self.assertLowers(self._SRC + """
+int f(void) { outer o; return o.make().get(); }
+""")
+        self.assertNotIn("inner__byval_plus", out)
+
+
+class TestCommaSeparatedFields(Base):
+    """`int x, y;` -- one declaration, several declarators.
+
+    Found by compiling a documentation example rather than by reading the
+    code. It was parsed as a single field named `y` of type `int x,`, so
+    `x` was not a field at all and a method body using it emitted a bare
+    `x` naming nothing.
+    """
+
+    def test_two_names_become_two_fields(self):
+        self.assertLowers("""
+class vec2 {
+public:
+    int x, y;
+    vec2() { x = 1; y = 2; }
+    int sum() { return x + y; }
+};
+int f(void) { vec2 v; return v.sum(); }
+""", "struct vec2 { int x; int y; }", "this->x + this->y")
+
+    def test_a_star_belongs_to_its_declarator(self):
+        """`int *p, q;` makes `p` a pointer and `q` an int, as C says.
+
+        Carrying the star into the base type made `q` a pointer too, so a
+        body adding it to an int silently did pointer arithmetic.
+        """
+        self.assertLowers("""
+class T {
+public:
+    int *p, q;
+    T() { p = 0; q = 4; }
+};
+int f(void) { T t; return t.q; }
+""", "int * p; int q;")
+
+    def test_a_template_comma_is_not_a_declarator_break(self):
+        """`map<int, int> m;` is one field. The declarator splitter tracks
+        angle brackets, which `_split_top` deliberately does not -- it is
+        used for call arguments, where `<` is as often a comparison."""
+        self.assertLowers("""
+#include <map>
+class T {
+public:
+    std::map<int, int> m;
+    T() { }
+};
+int f(void) { T t; return t.m.size(); }
+""", "map_int_int m;")
+
+    def test_an_array_declarator_keeps_its_dimension(self):
+        self.assertLowers("""
+class T {
+public:
+    int arr[3], n;
+    T() { n = 6; }
+};
+int f(void) { T t; return t.n; }
+""", "int arr[3]; int n;")
 
 
 def _main():

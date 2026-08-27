@@ -71,13 +71,127 @@ The subset, deliberately small:
     refused. A subscript on a genuine pointer *field* is left as plain C
     indexing, since `T *p; p[i]` walks an array rather than calling
     anything.
+  * the binary arithmetic operators `+ - * / % | & ^`, lowered to
+    `T__binadd` and so on, in the one case that has an honest lowering: a
+    class that owns nothing. The operator hands back a new object *by
+    value*, and a by-value return of an owning class is not in this subset
+    -- the local is destroyed on the way out and the caller would receive a
+    copy of a released object -- so an owning class is reported and
+    pointed at `operator+=`, which writes into an object that already
+    exists. Both operands must be plain names that resolve to the class;
+    one that is itself an expression would need a temporary to take the
+    address of, so `a + b + c` is not in this. `operator*` is told apart
+    from the dereference by whether it takes an operand, which is the only
+    difference between them on the page. The body may build its result the
+    obvious way (`vec2 r(x + o.x, y + o.y); return r;`) -- a constructor
+    call inside a method body used to reach the C unlowered whenever the
+    method returned a class, which made that shape look unsupported.
   * `operator=`, lowered to `T__assign`.
     Assignment to an owning object has no safe default -- a struct copy
     leaves two owners -- so this is where the author supplies one. A chained
     `a = b = c` is refused, because the call is lowered to `void`.
-  * a small `std`: `string` and `vector<T>`, supplied when the source names
-    them and written in this subset rather than special-cased in the
-    lowering. `std::` is stripped; there is no namespace support and
+  * a small `std`: `string`, `vector<T>`, `map<K,V>` and `set<T>`, supplied
+    when the source names them and written in this subset rather than
+    special-cased in the lowering. `set<T>` keeps its elements *sorted*,
+    where `map` does not: ordering two values generically needs
+    `__cpp_cmp(T, a, b)`, a three-way comparison -- two `<`s for a scalar,
+    a `compare` method for a class -- and `map` predates it. Three-way
+    rather than a `less` predicate because the builtin's operands are not
+    symmetric: the right one arrives as an already-lowered pointer and the
+    left as an lvalue, so `b < a` cannot be had by swapping the arguments
+    of `a < b`. A boolean would therefore leave a container unable to
+    derive equality from ordering and force it to demand `equals` too,
+    where one comparison answers both. A class element with no `compare`
+    is reported rather than ordered by address.
+  * `priority_queue<T>`, a max-heap in an array, ordered by `__cpp_cmp`
+    like `set` and `map`. Elements are sifted *by hole* -- the one being
+    placed is held aside and the ones it passes are relocated with
+    `memmove` into the gap -- so an owning element never has two live
+    copies and needs no `operator=`. `top()` returns a `T *` rather than
+    the reference `std::priority_queue` returns, since a reference return
+    is not in this subset; `q[0]` reaches the same element as an lvalue.
+  * `stack<T>`, `queue<T>`, `array<T,N>` and `optional<T>`, each with one
+    thing it cannot do the way `std` does. `stack::top` and `queue::front`
+    return `T *`, since a reference return is not in this subset, and
+    `s[0]` is the same element as an lvalue -- `stack` indexes from the
+    top so those two agree. `queue` keeps a head index and slides its live
+    range back down when the array fills, rather than wrapping: a wrapped
+    range cannot be handed out as the pointer pair every container here
+    iterates as. `array<T,N>` holds a plain array *member*, which this
+    subset neither constructs nor destroys, so it takes plain data only and
+    an element with a constructor or destructor is refused with `vector<T>`
+    named -- without that check it segfaulted on the first `fill`.
+    `optional<T>` keeps its value behind a pointer rather than in a `T`
+    member, because a member is constructed and destroyed with its
+    container and an empty optional must hold nothing; that costs an
+    allocation per engaged value, which is the price of having no
+    placement new.
+  * a small `<algorithm>`: `lower_bound`, `upper_bound`, `binary_search`,
+    `sort`, `find`, `count`, `reverse`, `fill`, `min_element`,
+    `max_element`, `swap` and `copy`, as free function templates over a
+    `T *` range. `swap` takes *pointers* where `std::swap`
+    takes references, because a `T &` parameter is lowered only for a class
+    and `__cpp_ref(T)` gives a scalar by value -- neither spells both, and
+    a swap cannot have a copy. `fill` and `copy` write into a range that
+    already holds constructed elements, destroying each before
+    constructing over it -- so for an element type that owns something the
+    destination has to be visibly a container's own range (`begin()`,
+    `ptr()`, or one local aliasing one). Anything this cannot see through
+    is reported: handed raw storage it would destroy garbage and follow
+    bytes nothing set, which is a segfault rather than a diagnostic. A
+    plain-data element has nothing to destroy, so any destination is fine
+    and the check never fires. The
+    searching pair ask `__cpp_eq` rather than `__cpp_cmp`, since matching
+    does not need an order and demanding one would refuse a class that
+    reasonably has equality and no ordering. A call to one of these can be
+    the receiver of the next (`min_element(..)->size()`), because the
+    return types of the monomorphised copies are known -- unlike a call to
+    plain C spelled the same way, which is still left exactly as written.
+  * `string` searches a substring as `find_str`, not as an overload of
+    `find`. `std::string` overloads that name on `char` and `const char *`,
+    which are the same arity, and this subset resolves an overload by
+    argument *count* before types are known -- so the two cannot be told
+    apart and a separate name says which is meant. `rfind_str`,
+    `contains`, `starts_with` and `ends_with` come with it.
+  * `<numeric>`: `accumulate`, `iota`, `inner_product`, `partial_sum` and
+    `adjacent_difference`, over the same `T *` ranges. These combine
+    elements with `+` and `*`, so the element has to be a scalar -- a class
+    would need `operator+`, which is not in this subset, and is reported
+    against the call rather than left to fail inside a template body the
+    author never wrote. `partial_sum` and `adjacent_difference` read each
+    element before writing, so the destination may be the source.
+    `accumulate` answers to its own name as well as to the header, since it
+    lived in `<algorithm>` here before this header existed.
+  * `unordered_map` and `unordered_set`, which are `map` and `set` under
+    another name. Nothing here hashes and nothing in this subset can write
+    `hash<T>` generically, so a separate copy would have the unordered
+    interface and the ordered behaviour; the alias says so. Iteration comes
+    out sorted, which code relying on no order is not broken by, and
+    lookups are O(log n) rather than O(1), which it cannot observe. A range is a
+    pair of pointers because that is already what every container here
+    hands out, so these work over `vector`, `ownvector`, `set` and `map`
+    without an iterator abstraction existing. Ordering goes through
+    `__cpp_cmp`, so a class element supplies `compare` and these come with
+    it; there is no comparator parameter, which would need a function type
+    this subset cannot spell generically. `sort` relocates elements with
+    `memmove` rather than assigning them, so an owning element keeps its
+    one owner and needs no `operator=`; it is an insertion sort, because a
+    recursive one would need the template to call itself over its own
+    parameter and the instantiation scan cannot see through that.
+
+    `sort(v.begin(), v.end())` works without spelling `<int>`, but only in
+    one narrow shape: a parameter written `T *`, matched against an
+    argument whose pointee this file declares -- a container's `begin()`,
+    an array, or a pointer local. A deduced call is rewritten to spell its
+    arguments the long way and the ordinary substitution runs on that, so
+    both forms take one code path. `map` is left out on purpose: its
+    iterator is a `pair<K,V> *`, so deducing `K` from `m.begin()` would be
+    wrong rather than merely unsupported. Anything else -- a call result,
+    a by-value parameter, more than one template parameter -- is reported,
+    as is a template called with no arguments at all, which used to have
+    its body blanked and its call left to fail at link time. They also need a class somewhere in the
+    unit, since the builtins they compare through are expanded while
+    lowering classes; a file using only `<algorithm>` is told so. `std::` is stripped; there is no namespace support and
     claiming otherwise would be worse. Element access is `get`/`set`/`ptr`,
     and `v[i]`, which the containers now overload. `vector<T>` stores
     elements by assignment, so an element type with a destructor is refused
@@ -157,9 +271,17 @@ becomes the next step's receiver, which is what avoids needing a temporary
 in expression position. A chain only ever starts from a symbol that
 resolves to a class, so legitimate C spelled the same way
 (`get_ops()->init(x)`, a free function returning a struct pointer) is still
-left exactly as written. A method returning a class *by value* ends the
-chain with a diagnostic rather than a guess: C cannot take the address of a
-function result, and spilling one would need a statement.
+left exactly as written. A method returning a class *by value* continues the chain through a
+generated `Cls__byval_meth_<n>` taking its receiver by value: C cannot take
+the address of a function result, and spilling one would need a statement,
+so the value goes in as a value. That is the same way out the binary
+operators take for `a + b + c`, and it rests on the same condition -- the
+class must own nothing, since a struct copy of an owning receiver would
+leave two objects holding one resource. An owning one still ends the chain
+with a diagnostic, as does a virtual call, which needs a receiver whose
+address can be taken to reach the vtable; each says which of the two it
+is. The variants are emitted only for the names a source actually chains
+onto.
 
 Dispatching a virtual call on a call result goes through a generated
 `Decl__vcall_name` helper that takes the receiver as a parameter. The plain
@@ -223,7 +345,9 @@ address-preserving cast, which is also why `free` on the base pointer
 releases the whole allocation.
 
 Not supported, and reported rather than mistranslated: multiple inheritance,
-virtual inheritance, exceptions, operator overloading, the STL. Multiple
+virtual inheritance, exceptions, most operator overloading (the arithmetic
+binaries, the comparisons, `[]`, `=`, `->`, `*` and the compound
+assignments are in; a conversion operator, `<<` and the rest are not). Multiple
 bases are rejected because the layout admits exactly one: with one base
 first, upcasting is free, and that is the property the rest of this
 lowering leans on.
@@ -245,6 +369,56 @@ except ImportError:                      # run as a script from tools/
     import cpp_auto
 
 
+#: Marks where the supplied `std` prelude ends and the author's own source
+#: begins. A line number is only useful if it names a line the author can
+#: open, and by the time anything is reported the text has grown a few
+#: hundred lines of `string`, `vector` and `map` at the top -- so counting
+#: from the start of the buffer named their line 6 as line 197.
+#:
+#: A *marker* rather than a recorded offset, because an offset does not
+#: survive the passes: monomorphisation replaces each template body with
+#: one copy per instantiation, which changes how many lines sit above the
+#: author's code, and does so differently for every file. The marker moves
+#: with the text it precedes, so whatever happens above it, the count from
+#: the marker to a position is still the author's line number.
+#:
+#: Spelled as a declaration rather than a comment because `_strip_comments`
+#: blanks comments out of the scan that most positions are found in, and a
+#: marker that vanishes from the text being searched is no marker at all.
+_SRC_MARK = "__crust_src_origin__"
+_SRC_MARK_DECL = "typedef int %s;\n" % _SRC_MARK
+
+
+#: Where this stops working, which is worth knowing before trying to put a
+#: line number on every diagnostic. The marker survives the passes *above*
+#: class emission, and those are exact. Class emission itself replaces each
+#: class's source span with generated C -- methods emitted one per line,
+#: bodies hoisted -- which does not have the same number of lines the class
+#: was written on. Everything below the first class has shifted by the
+#: difference from then on.
+#:
+#: So `_rewrite_calls` and `_rewrite_scopes`, which between them raise
+#: thirty of this module's diagnostics and run after emission, cannot be
+#: given a trustworthy line this way. A wrapper locating them was written
+#: and removed: it reported the copy on line 10 as line 8, and a number
+#: that looks right and is wrong is worse than none. Making it work means
+#: making class emission preserve line counts, which is a real change to
+#: the emitter, not a change here.
+def _src_line(text, pos):
+    """The author's 1-based line number for `pos`, or the raw one.
+
+    Positions above the marker are inside the supplied prelude -- a
+    diagnostic about `vector`'s own body, which is this module's bug rather
+    than the author's. Those keep counting from the top, since there is no
+    better answer and pretending otherwise would point at an unrelated line
+    of their file.
+    """
+    at = text.rfind(_SRC_MARK, 0, pos)
+    if at < 0:
+        return text.count("\n", 0, pos) + 1
+    return text.count("\n", at, pos)
+
+
 class CppError(Exception):
     """A C++ subset translation error."""
 
@@ -263,6 +437,21 @@ _AUG_NAMES = {"+": "add", "-": "sub", "*": "mul", "/": "div", "%": "mod",
 #: symbol has to be a C identifier and should read back to its operator.
 _CMP_NAMES = {"==": "eq", "!=": "ne", "<=": "le", ">=": "ge",
               "<": "lt", ">": "gt"}
+
+#: C's precedence among the binary arithmetic operators. Used only to
+#: decide whether a *run* of them may be chained left to right: `a + b - c`
+#: may, `a + b * c` may not, because the multiply binds tighter and
+#: chaining would compute `(a + b) * c`. Rather than build an expression
+#: tree for a subset that has no other use for one, a mixed run is
+#: reported and the author writes the parentheses.
+_BIN_PREC = {"*": 5, "/": 5, "%": 5, "+": 4, "-": 4,
+             "&": 3, "^": 2, "|": 1}
+
+#: `a + b` becomes `T__binadd(&a, &b)`. Distinct from `__aug*`, which is
+#: the compound assignment `a += b`: that one is a statement whose result
+#: is dropped, this one is an expression whose result is the point.
+_BIN_NAMES = {"+": "add", "-": "sub", "*": "mul", "/": "div", "%": "mod",
+              "|": "or", "&": "and", "^": "xor"}
 
 _AUG_ASSIGN_SPELLINGS = frozenset(
     ["%s=" % k for k in ("+", "-", "*", "/", "%", "|", "&", "^")])
@@ -480,7 +669,9 @@ def _check_unsupported(scan, path):
             continue
         if m.group(1) in _CMP_NAMES:
             continue
-        line = scan.count("\n", 0, m.start()) + 1
+        if m.group(1) in _BIN_NAMES:
+            continue
+        line = _src_line(scan, m.start())
         # A *conversion* operator is worth naming separately: it is not one
         # more overload to add but a different kind of thing. It applies
         # where the compiler decides a conversion is wanted, so lowering it
@@ -514,7 +705,7 @@ def _check_unsupported(scan, path):
     for kw in _UNSUPPORTED:
         m = re.search(r"\b%s\b" % kw, scan)
         if m:
-            line = scan.count("\n", 0, m.start()) + 1
+            line = _src_line(scan, m.start())
             raise CppError(
                 "%s:%d: `%s` is not in the C++ subset. Supported: classes, "
                 "constructors, destructors, and templates."
@@ -767,8 +958,19 @@ def _has_param_list(decl):
     return bool(re.match(r"^[~\w][\w:<>,&*\s]*$", decl[:op].strip() or "~"))
 
 
-def _split_members(body, cname, line0):
-    """Parse a class body into fields, methods, a constructor and destructor."""
+def _split_members(body, cname, line0, path="<cpp>"):
+    """Parse a class body into fields, methods, a constructor and destructor.
+
+    `line0` is the line the class was declared on, so a member's line is
+    that plus the newlines above it in the body -- which is how the parse
+    failures below name a line the author can open. This pass runs before
+    class emission, where the correspondence between the text and the
+    source is still exact.
+    """
+    def _at(idx):
+        return "%s:%d: " % (os.path.basename(path),
+                            line0 + body.count("\n", 0, idx))
+
     body = _ACCESS.sub("", body)
     members = []
     i, n = 0, len(body)
@@ -801,21 +1003,53 @@ def _split_members(body, cname, line0):
                 if eq >= 0:
                     definit = decl[eq + 1:].strip()
                     decl = decl[:eq].strip()
-                parts = decl.replace("*", " * ").split()
-                if len(parts) < 2:
-                    raise CppError("cannot parse member %r in class %s"
-                                   % (decl, cname))
-                # `int arr[10];` -- the declarator suffix is not part of the
-                # name. Keeping it there would make field qualification miss
-                # every use of `arr` in a method body.
-                fname, dim = parts[-1], ""
-                b = fname.find("[")
-                if b >= 0:
-                    fname, dim = fname[:b], fname[b:]
-                fm = Member("field", " ".join(parts[:-1]), fname,
-                            None, None, line0, dim)
-                fm.definit = definit
-                members.append(fm)
+                # `int x, y;` -- one declaration, several declarators, which
+                # is ordinary C++ and was read as a single field named `y`
+                # of type `int x,`. The type is whatever precedes the first
+                # declarator, and each name after a comma repeats it. `x`
+                # was then not a field at all, so a method body using it
+                # emitted a bare `x` that named nothing.
+                #
+                # Split at top level only: a comma inside `<>` belongs to a
+                # template argument list, and `map<int, int> m;` is one
+                # field, not two.
+                decls = [d.strip() for d in _split_declarators(decl)
+                         if d.strip()]
+                first = decls[0].replace("*", " * ").split()
+                if len(first) < 2:
+                    raise CppError("%scannot parse member %r in class %s"
+                                   % (_at(start), decl, cname))
+                # The base type is what precedes the *first* declarator,
+                # with its stars removed: in `int *p, q;` the `*` belongs to
+                # `p`, and C says `q` is a plain `int`. Carrying the star
+                # into the base made `q` a pointer, so a body adding it to
+                # an int silently did pointer arithmetic.
+                base = " ".join(t for t in first[:-1] if t != "*")
+                for idx, one in enumerate(decls):
+                    if idx == 0:
+                        parts = first
+                    else:
+                        # A later declarator carries only its own name, and
+                        # its own stars: `int *p, q;` makes `p` a pointer
+                        # and `q` an int, exactly as C says.
+                        parts = [base] + one.replace("*", " * ").split()
+                        if len(parts) < 2:
+                            raise CppError(
+                                "%scannot parse member %r in class %s"
+                                % (_at(start), decl, cname))
+                    # `int arr[10];` -- the declarator suffix is not part of
+                    # the name. Keeping it there would make field
+                    # qualification miss every use of `arr` in a method body.
+                    fname, dim = parts[-1], ""
+                    b = fname.find("[")
+                    if b >= 0:
+                        fname, dim = fname[:b], fname[b:]
+                    fm = Member("field", " ".join(parts[:-1]), fname,
+                                None, None, line0, dim)
+                    # An initialiser belongs to the declarator it was
+                    # written on, which is the last one here.
+                    fm.definit = definit if idx == len(decls) - 1 else None
+                    members.append(fm)
                 continue
             head, inner = decl, None
         else:
@@ -832,7 +1066,8 @@ def _split_members(body, cname, line0):
             head = body[start:brace].strip()
             close = _match_brace(body, brace)
             if close is None:
-                raise CppError("unterminated method body in class %s" % cname)
+                raise CppError("%sunterminated method body in class %s"
+                           % (_at(start), cname))
             inner = body[brace + 1:close]
             i = close + 1
         # A trailing `const` on a member function is a promise about what
@@ -901,12 +1136,14 @@ def _split_members(body, cname, line0):
             continue
         op = head.find("(")
         if op < 0:
-            raise CppError("cannot parse member %r in class %s" % (head, cname))
+            raise CppError("%scannot parse member %r in class %s"
+                           % (_at(start), head, cname))
         # Match the opening paren rather than taking the last `)`: a ctor
         # initializer list puts more parens after the parameter list.
         cp = _match_paren(head, op)
         if cp is None:
-            raise CppError("cannot parse member %r in class %s" % (head, cname))
+            raise CppError("%scannot parse member %r in class %s"
+                           % (_at(start), head, cname))
         params = head[op + 1:cp].strip()
         sig = head[:op].strip()
         virt = bool(re.match(r"virtual\b", sig))
@@ -932,8 +1169,11 @@ def _split_members(body, cname, line0):
             bits = sig[:sig.index("operator")].strip()
             members.append(Member("arrow", bits, "operator->", params,
                                   inner, line0))
-        elif re.search(r"\boperator\s*\*$", sig):
-            # `T &operator*()`. Lowered like `operator[]`: the reference
+        elif re.search(r"\boperator\s*\*$", sig) and not params.strip():
+            # `T &operator*()`. The *dereference*, told apart from the
+            # binary multiply below by taking no operand -- which is the
+            # only difference between them on the page.
+            # Lowered like `operator[]`: the reference
             # return becomes a pointer and the dereference is written back at
             # the use, so `*p = x` still assigns through.
             bits = sig[:sig.index("operator")].strip()
@@ -954,6 +1194,21 @@ def _split_members(body, cname, line0):
             cm = re.search(r"\boperator\s*(==|!=|<=|>=|<|>)$", sig)
             bits = sig[:sig.index("operator")].strip()
             members.append(Member("cmp", bits, "operator%s" % cm.group(1),
+                                  params, inner, line0))
+        elif re.search(r"\boperator\s*(\+|-|/|%|\||&|\^)$", sig) or \
+                (re.search(r"\boperator\s*\*$", sig) and params.strip()):
+            # A binary arithmetic operator. Like a comparison and unlike a
+            # compound assignment, its *result* is the point, so the
+            # declared return type is kept.
+            #
+            # `operator*` is the awkward one: spelled the same as the
+            # dereference above, and told apart by whether it takes an
+            # operand. A dereference takes none. That test is made here
+            # rather than in the pattern because the pattern cannot see the
+            # parameter list.
+            bm = re.search(r"\boperator\s*(\+|-|\*|/|%|\||&|\^)$", sig)
+            bits = sig[:sig.index("operator")].strip()
+            members.append(Member("binop", bits, "operator%s" % bm.group(1),
                                   params, inner, line0))
         elif re.search(r"\boperator\s*(\+|-|\*|/|%|\||&|\^)=$", sig):
             # A compound assignment. Lowered like `operator=`: the result is
@@ -981,8 +1236,8 @@ def _split_members(body, cname, line0):
             if is_static:
                 bits = bits[1:]
             if len(bits) < 2:
-                raise CppError("cannot parse method %r in class %s"
-                               % (head, cname))
+                raise CppError("%scannot parse method %r in class %s"
+                               % (_at(start), head, cname))
             _m = Member("method", " ".join(bits[:-1]), bits[-1],
                         params, inner, line0, "", None, virt)
             _m.stat = is_static
@@ -1287,7 +1542,344 @@ def _mangle_targ(arg):
     return arg.strip("_")
 
 
-def _monomorphise_function_templates(text, scan, path):
+#: Containers supplied by this module whose `begin()`/`end()` yield a
+#: pointer to their *first* template argument. `map` is absent on purpose:
+#: its iterator is a `pair<K,V> *`, not a `K *`, so deducing `K` from
+#: `m.begin()` would be wrong rather than merely unsupported.
+_ELEM_CONTAINERS = ("vector", "ownvector", "set")
+
+
+#: Words that can stand where a type would in the declaration patterns
+#: below, and are not one. `return x;` reads as a declaration of `x` with
+#: type `return` to a regex that only knows "word word".
+_DECL_NOISE = frozenset(("return", "sizeof", "case", "else", "typedef",
+                         "struct", "union", "enum", "const"))
+
+
+def _last_before(pat, scan, at, lo=0):
+    """The last match of `pat` starting in `scan[lo:at]`, or None.
+
+    Declarations are read out of the file text, and `re.search` returns the
+    *first* match in it -- which is the wrong one whenever a name is
+    declared more than once. The supplied templates are prepended above the
+    author's code and have ordinary local names in them, so `T *lo` inside
+    `reverse` was found for a call whose `lo` was the author's `string *`,
+    and the call deduced a type literally named `T`.
+
+    Searching backwards from the call is both the fix and the more correct
+    rule generally: the declaration that governs a name is the nearest one
+    above its use.
+
+    Backwards is still not enough on its own, though, which is what `lo`
+    is for. `swap` declares a parameter `T *a`, and it sits above the
+    author's code, so for a call whose `a` was `int a[4]` the *nearest*
+    preceding declaration was still the template's. The caller bounds the
+    search at the end of the supplied prelude, so a name the author never
+    wrote can never answer for one they did.
+    """
+    found = None
+    for mm in pat.finditer(scan, lo, at):
+        found = mm
+    return found
+
+
+def _pointee_of(expr, scan, at):
+    """`T` for an expression of type `T *`, or None if that is not clear.
+
+    Deduction, kept to the one shape the algorithms actually take: a range
+    is a pair of pointers, so typing the *first* argument types the call.
+    Everything here reads declarations out of the source text, because this
+    pass runs before any symbol table exists -- which is also why it is
+    narrow. Whatever it cannot type confidently it declines to type, and
+    the caller reports that rather than guessing a `T`.
+    """
+    e = expr.strip()
+    # Never look above the author's first line. Everything up there is
+    # supplied by this module, and its locals and parameters are not names
+    # the call could possibly have meant.
+    origin = scan.rfind(_SRC_MARK, 0, at)
+    lo = origin + len(_SRC_MARK) if origin >= 0 else 0
+    # `first + i`, `v.end() - 1`: pointer arithmetic does not change the
+    # pointee, so the operand carries the type.
+    while True:
+        mm = re.match(r"^(.*?)\s*[-+]\s*[\w.>\-]+$", e)
+        if not mm or not mm.group(1).strip():
+            break
+        e = mm.group(1).strip()
+    while e.startswith("(") and _match_paren(e, 0) == len(e) - 1:
+        e = e[1:-1].strip()
+    # `c.begin()` / `c->end()` on a supplied container: the element type is
+    # the container's first template argument.
+    mm = re.match(r"^(\w+)\s*(?:\.|->)\s*(?:begin|end|rbegin|rend|ptr)"
+                  r"\s*\(", e)
+    if mm:
+        decl = _last_before(re.compile(
+            r"(?<![\w])(%s)\s*<([^<>]*)>\s+%s\s*[;=,)]"
+            % ("|".join(_ELEM_CONTAINERS), re.escape(mm.group(1)))),
+            scan, at, lo)
+        if decl:
+            first = _split_top(decl.group(2))[0].strip()
+            return first or None
+        return None
+    # `&x`, which is a `T *` when `x` is a `T`. This is how a call site
+    # spells an argument to `swap`, whose parameters are pointers because
+    # a reference cannot be spelled for a scalar and a class at once.
+    if e.startswith("&"):
+        base = e[1:].strip()
+        if not re.match(r"^\w+$", base):
+            return None
+        # `(` as well as the rest: `string x("alpha");` is a declaration
+        # of `x` whose type is followed by a constructor argument list, and
+        # it is the ordinary way to declare an owning local.
+        d = _last_before(re.compile(
+            r"(?<![\w*])([A-Za-z_]\w*)\s+%s\s*[;=,)(]" % re.escape(base)),
+            scan, at, lo)
+        if d and d.group(1) not in _DECL_NOISE:
+            return d.group(1)
+        return None
+    if not re.match(r"^\w+$", e):
+        return None
+    # A local or parameter declared `T *name`.
+    d = _last_before(re.compile(
+        r"(?<![\w])([A-Za-z_]\w*)\s*\*\s*%s\s*[;=,)]" % re.escape(e)),
+        scan, at, lo)
+    if d and d.group(1) not in _DECL_NOISE:
+        return d.group(1)
+    # An array `T name[..]`, which decays to `T *`.
+    d = _last_before(re.compile(
+        r"(?<![\w])([A-Za-z_]\w*)\s+%s\s*\[" % re.escape(e)),
+        scan, at, lo)
+    if d and d.group(1) not in _DECL_NOISE:
+        return d.group(1)
+    return None
+
+
+def _bare_call(t, scan):
+    """The first call to `t` that spelled no template arguments, or None.
+
+    Not one inside the template's own span -- that is its definition, or a
+    recursive use. And not one inside a class body: a method may share a
+    name with a free template (`set::lower_bound` does, exactly as in C++)
+    and inside its own class it is called bare, with the implicit `this`.
+    Read as a call to the template, that reported every `set<T>`.
+    """
+    bodies = []
+    for cm in re.finditer(r"(?<![\w])(?:class|struct)\s+\w+[^{;]*\{", scan):
+        b_open = scan.index("{", cm.start())
+        b_close = _match_brace(scan, b_open)
+        if b_close is not None:
+            bodies.append((cm.start(), b_close))
+    return next((u for u in re.finditer(
+        r"(?<![\w.>])%s\s*\(" % re.escape(t["name"]), scan)
+        if not (t["start"] <= u.start() < t["end"])
+        and not any(b0 <= u.start() < b1 for b0, b1 in bodies)), None)
+
+
+#: Which argument of a supplied range-writing template is the destination.
+#: `fill(first, last, v)` writes over the range itself; `copy(first, last,
+#: dst)` writes at `dst`.
+_RANGE_WRITERS = {"fill": 0, "copy": 2}
+
+#: A destination this pass can see is *constructed*: a container handing
+#: out its own storage. Everything a container gives you here has been
+#: through its `push_back` or its constructor, so the elements are real
+#: objects and destroying one before writing over it is correct.
+_CONSTRUCTED_RANGE = re.compile(
+    r"^\s*&?\s*\w+\s*(?:\.|->)\s*(?:begin|end|ptr|data|rbegin)\s*\(")
+
+
+def _constructed_range(expr, scan, at):
+    """Is `expr` visibly a range whose elements have been constructed?
+
+    Directly, when it is a container handing out its own storage. Or
+    through one local: `T *dst = v.begin();` is the ordinary way to name a
+    range before using it, and refusing that would mean the check fired
+    most often on code that was already correct.
+
+    One level only. Following a chain of aliases means tracking
+    assignments, which is a dataflow this pass does not do -- and the
+    answer for anything deeper is the same as for anything unrecognised:
+    say so, rather than assume.
+    """
+    if _CONSTRUCTED_RANGE.match(expr):
+        return True
+    e = expr.strip()
+    if not re.match(r"^\w+$", e):
+        return False
+    origin = scan.rfind(_SRC_MARK, 0, at)
+    lo = origin + len(_SRC_MARK) if origin >= 0 else 0
+    d = _last_before(re.compile(
+        r"(?<![\w])[A-Za-z_]\w*\s*\*\s*%s\s*=([^;]*);" % re.escape(e)),
+        scan, at, lo)
+    return bool(d) and bool(_CONSTRUCTED_RANGE.match(d.group(1)))
+
+
+#: The `<numeric>` templates, which combine elements with `+` and `*`.
+_NUMERIC_FNS = ("accumulate", "iota", "inner_product", "partial_sum",
+                "adjacent_difference")
+
+
+def _check_numeric_elements(text, scan, path):
+    """Refuse a `<numeric>` call over a class element type.
+
+    These sum and multiply their elements, which needs `operator+` -- not
+    in this subset. Left alone the failure still surfaced, but as a
+    complaint about `sum = sum + *it`, a line inside a supplied template
+    the author never wrote and cannot act on. Named here against the call
+    instead.
+    """
+    for name in _NUMERIC_FNS:
+        for u in re.finditer(
+                r"(?<![\w.>])%s\s*(?:<([^;{}()]*)>)?\s*\(" % name, scan):
+            if scan.rfind(_SRC_MARK, 0, u.start()) < 0:
+                continue                  # the supplied prelude's own text
+            open_at = scan.index("(", u.end() - 1)
+            close = _match_paren(scan, open_at)
+            if close is None:
+                continue
+            args = [a.strip() for a in _split_top(scan[open_at + 1:close])]
+            if not args:
+                continue
+            targ = (u.group(1) or "").strip()
+            elem = targ or _pointee_of(args[0], scan, u.start())
+            if not elem:
+                continue                  # deduction reports this itself
+            if not re.search(r"(?<![\w])(?:class|struct)\s+%s(?![\w])"
+                             % re.escape(elem), scan):
+                continue
+            raise CppError(
+                "%s:%d: `%s` combines elements with `+`, and %s is a class. "
+                "Operator overloading is not in this subset, so there is no "
+                "`+` for it to use. Sum a scalar field instead, or write "
+                "the loop."
+                % (os.path.basename(path), _src_line(scan, u.start()),
+                   name, elem))
+
+
+def _check_range_writes(text, scan, path):
+    """Refuse `fill`/`copy` of an owning element into unrecognised storage.
+
+    Both destroy each destination before constructing over it, which is
+    what assignment would have done and is right for a container's range.
+    Handed a pointer into memory nothing has constructed -- a `malloc`,
+    a plain array -- it destroys garbage and follows whatever the bytes
+    happened to be. That is a segfault rather than a diagnostic, and it is
+    the same hazard `array<T,N>` of an owning element was refused for.
+
+    Only for an element type that owns something: a class with a
+    destructor. Plain data has nothing to destroy, so `__cpp_drop` is a
+    no-op on it and any destination is fine -- which is most uses, and none
+    of them are made harder by this.
+
+    Recognising the safe shapes rather than proving the unsafe ones: a
+    destination that is visibly a container's own range is accepted, and
+    anything this pass cannot see through is reported with the container
+    form named. Guessing the other way is what crashed.
+    """
+    for name, dst_idx in _RANGE_WRITERS.items():
+        for u in re.finditer(
+                r"(?<![\w.>])%s\s*(?:<([^;{}()]*)>)?\s*\(" % name, scan):
+            origin = scan.rfind(_SRC_MARK, 0, u.start())
+            if origin < 0:
+                continue                  # the supplied prelude's own text
+            close = _match_paren(scan, scan.index("(", u.end() - 1))
+            if close is None:
+                continue
+            args = [a.strip() for a in
+                    _split_top(scan[scan.index("(", u.end() - 1) + 1:close])]
+            if dst_idx >= len(args):
+                continue
+            targ = (u.group(1) or "").strip()
+            elem = targ or _pointee_of(args[0], scan, u.start())
+            if not elem:
+                continue                  # deduction reports this itself
+            # Owning is a destructor, the same test used everywhere here.
+            # Asked of the text because classes are not parsed yet: this
+            # runs before anything reads types, so that a diagnostic about
+            # a template body is never emitted.
+            if not re.search(r"~\s*%s\s*\(" % re.escape(elem), scan):
+                continue
+            if _constructed_range(args[dst_idx], scan, u.start()):
+                continue
+            raise CppError(
+                "%s:%d: `%s` writes over `%s` elements, destroying each one "
+                "before constructing over it -- which needs a destination "
+                "whose elements have been constructed. `%s` is not visibly "
+                "a container's own range, and %s owns a resource, so "
+                "destroying whatever is there would follow bytes nothing "
+                "set. Pass a container's `begin()` or `ptr()`, or use "
+                "`push_back` to build the destination."
+                % (os.path.basename(path), _src_line(scan, u.start()),
+                   name, elem, args[dst_idx], elem))
+
+
+def _spell_deduced_calls(text, scan, tmpl):
+    """Rewrite `f(..)` to `f<T>(..)` wherever `T` can be deduced.
+
+    Deduction is done by *spelling the call the long way* and letting the
+    ordinary substitution below run on it, rather than by threading a
+    deduced type through the monomorphiser. What comes out is a source the
+    author could have written, so there is one code path for both forms
+    and no second place for them to disagree.
+
+    Returns the rewritten text, or None if nothing was deduced.
+    """
+    edits = []
+    for t in tmpl:
+        while True:
+            u = _bare_call(t, scan)
+            if u is None:
+                break
+            op = u.end() - 1
+            close = _match_paren(scan, op)
+            if close is None:
+                break
+            args = [a.strip() for a in _split_top(scan[op + 1:close])]
+            got = _deduce_targs(t, args, scan, u.start())
+            if not got:
+                break
+            edits.append((u.start(), u.end(),
+                          "%s<%s>(" % (t["name"], ", ".join(got))))
+            # Blank this call's name in the scan so the next round finds
+            # the following one rather than looping on this same match.
+            scan = (scan[:u.start()]
+                    + " " * (u.end() - u.start()) + scan[u.end():])
+    if not edits:
+        return None
+    edits.sort()
+    out, prev = [], 0
+    for a, b, rep in edits:
+        out.append(text[prev:a])
+        out.append(rep)
+        prev = b
+    out.append(text[prev:])
+    return "".join(out)
+
+
+def _deduce_targs(t, callsite_args, scan, at):
+    """Template arguments for a call that spelled none, or None.
+
+    Only the shape the supplied algorithms use: one type parameter, and a
+    function parameter written `T *`. Matching that against an argument of
+    type `X *` gives `T = X`. Anything else -- more than one parameter,
+    no pointer parameter, an argument that will not type -- returns None,
+    and the call is reported.
+    """
+    if len(t["params"]) != 1:
+        return None
+    tp = t["params"][0]
+    for idx, fp in enumerate(t["fparams"]):
+        if not re.match(r"^%s\s*\*\s*\w+$" % re.escape(tp), fp.strip()):
+            continue
+        if idx >= len(callsite_args):
+            continue
+        got = _pointee_of(callsite_args[idx], scan, at)
+        if got:
+            return [got]
+    return None
+
+
+def _monomorphise_function_templates(text, scan, path, _depth=0):
     """Emit one ordinary function per instantiation of a function template.
 
     The subset already monomorphises class templates by writing out a copy
@@ -1344,13 +1936,36 @@ def _monomorphise_function_templates(text, scan, path):
             continue
         params = [p.strip().split()[-1]
                   for p in _split_top(scan[lt + 1:gt]) if p.strip()]
+        # The function's own parameter list, kept so a call with no
+        # explicit arguments can be matched against it below.
+        sig_open = scan.index("(", after + nm.start())
+        sig_close = _match_paren(scan, sig_open)
+        fparams = ([q.strip() for q in
+                    _split_top(scan[sig_open + 1:sig_close])]
+                   if sig_close is not None else [])
         tmpl.append({
             "name": nm.group(1), "params": params,
             "start": m.start(), "end": k + 1,
             "decl_only": body_open is None,
+            "fparams": [q for q in fparams if q],
         })
     if not tmpl:
         return text, scan, []
+
+    # Deduction, before anything is substituted: a call that spelled no
+    # template arguments is rewritten to spell them, and the whole pass
+    # restarts over that text. Restarting rather than continuing because
+    # every offset recorded above indexes the old text, and the rewrite
+    # moves them. `_depth` bounds it -- the second pass has explicit
+    # arguments everywhere deduction succeeded, so it deduces nothing new
+    # and cannot rewrite again.
+    if _depth == 0:
+        _check_numeric_elements(text, scan, path)
+        _check_range_writes(text, scan, path)
+        spelled = _spell_deduced_calls(text, scan, tmpl)
+        if spelled is not None:
+            return _monomorphise_function_templates(
+                spelled, _strip_comments(spelled), path, _depth=1)
 
     # Which arguments each one is instantiated with. A member call is
     # `c.reg<int>(..)`, so a leading `.` cannot be excluded.
@@ -1369,7 +1984,7 @@ def _monomorphise_function_templates(text, scan, path):
                     "template that takes %d. This pass substitutes them by "
                     "position and has no defaults to fall back on."
                     % (os.path.basename(path),
-                       text.count("\n", 0, u.start()) + 1, t["name"],
+                       _src_line(text, u.start()), t["name"],
                        u.group(1).strip(), len(got),
                        "" if len(got) == 1 else "s", len(t["params"])))
             if got not in args:
@@ -1388,11 +2003,48 @@ def _monomorphise_function_templates(text, scan, path):
             # `typename X::y` is C++ telling the parser that `y` names a
             # type. With `X` known there is nothing left to tell it.
             one = re.sub(r"(?<![\w])typename\s+", "", one)
+            # `__cpp_ref(T)` in a *free* function's parameters. The class
+            # emitter expands it for a method, against the class it belongs
+            # to; a free template has none. Here, though, `T` has just been
+            # replaced by the type the call spelled, so the question "is
+            # this a class" can finally be asked -- which is why this sits
+            # after substitution and not before it, where `__cpp_ref(T)`
+            # would read `T` as a scalar and pass an owning element by
+            # value.
+            #
+            # `const T &` for a class flows on into the ordinary reference
+            # lowering, which makes it a `T *` and takes the address at each
+            # call -- exactly the pointer `__cpp_cmp` wants on its right. A
+            # scalar stays by value, so a literal argument still binds.
+            if "__cpp_ref" in one or "__cpp_rref" in one:
+                cnames = set(re.findall(
+                    r"(?<![\w])(?:class|struct)\s+(\w+)", scan))
+                one = _expand_cpp_ref(_expand_cpp_rref(one, cnames), cnames)
             suffix = "_".join(_mangle_targ(a) for a in got)
             one = re.sub(r"(?<![\w])%s(?=\s*\()" % re.escape(t["name"]),
                          "%s_%s" % (t["name"], suffix), one, count=1)
             copies.append(one)
             names.append("%s_%s" % (t["name"], suffix))
+        if not copies and not t["decl_only"]:
+            # No explicit instantiation anywhere. Blanking the body is right
+            # for a template the file never uses -- there is nothing to
+            # emit it over -- but wrong, and silently so, if the file calls
+            # it *without* arguments: deduction is not implemented here, so
+            # the call would survive over a definition that just went away
+            # and fail at link time naming a symbol the source never wrote.
+            # Reported here, against the source, rather than there.
+            bare = _bare_call(t, scan)
+            if bare is not None:
+                raise CppError(
+                    "%s:%d: `%s` is a function template called with no "
+                    "template arguments, and they could not be deduced "
+                    "from the arguments. Deduction here only reads a "
+                    "parameter written `T *` against an argument whose "
+                    "pointee is declared in this file, so write "
+                    "`%s<T>(..)` at the call."
+                    % (os.path.basename(path),
+                       _src_line(scan, bare.start()),
+                       t["name"], t["name"]))
         out.append(text[last:t["start"]])
         out.append("\n".join(copies) if copies else
                    re.sub(r"[^\n]", " ", text[t["start"]:t["end"]]))
@@ -1574,7 +2226,7 @@ def _attach_out_of_line(cls, defs, path):
             m.init = _parse_init_list(got["init"], cls.name, cls.name)
 
 
-def _find_classes(scan, text):
+def _find_classes(scan, text, path="<cpp>"):
     """Locate `class`/`struct` definitions with bodies, template-aware."""
     classes = []
     for m in re.finditer(r"\b(class|struct)\s+(\w+)\s*(:[^{;]*)?\{", scan):
@@ -1602,8 +2254,9 @@ def _find_classes(scan, text):
                               # literals, so bodies are otherwise unchanged.
                               _split_members(scan[open_idx + 1:close],
                                              m.group(2),
-                                             scan.count("\n", 0, m.start()) + 1),
-                              scan.count("\n", 0, m.start()) + 1,
+                                             _src_line(scan, m.start()),
+                                             path),
+                              _src_line(scan, m.start()),
                               _parse_base(m.group(3), m.group(2)))))
     return classes
 
@@ -1631,6 +2284,42 @@ def _match_paren(text, open_idx):
                 return i
         i += 1
     return None
+
+
+def _split_declarators(decl):
+    """Split `int x, y` into its declarators, respecting `<>`.
+
+    Not `_split_top`, which tracks parens and brackets but deliberately not
+    angle brackets: it is used for call arguments, where `<` is a
+    comparison as often as a template bracket, and treating it as one
+    would mis-split `f(a < b, c)`. In a *declaration* there is no such
+    ambiguity -- `<` there opens a template argument list -- so
+    `map<int, int> m` is one declarator rather than two.
+    """
+    parts, cur, depth, angle, quote = [], [], 0, 0, None
+    for c in decl:
+        if quote is not None:
+            cur.append(c)
+            if c == quote:
+                quote = None
+            continue
+        if c in "\"'":
+            quote = c
+        elif c in "([":
+            depth += 1
+        elif c in ")]":
+            depth -= 1
+        elif c == "<":
+            angle += 1
+        elif c == ">" and angle > 0:
+            angle -= 1
+        if c == "," and depth == 0 and angle == 0:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(c)
+    parts.append("".join(cur))
+    return parts
 
 
 def _split_top(text, sep=","):
@@ -2065,6 +2754,17 @@ def _check_ref_returns(scan, names, path):
     site -- assignment through the result would become a pointer assignment.
     Following the rest of the subset, that is reported rather than guessed at.
     """
+    # Scalars too, not just the classes of this unit. `int &get()` lowered
+    # to `int_&get`, which is not an identifier -- the rejection this
+    # function exists for was documented but only ever applied to class
+    # types, so a reference return of a built-in type produced invalid C
+    # with no diagnostic at all.
+    #
+    # `operator[]` is exempt without being special-cased: the name pattern
+    # below wants a word followed by `(`, and `operator[](` is not one. A
+    # reference return is *required* there, which is why it must not be
+    # caught here.
+    names = set(names) | set(_SCALAR_TYPES)
     if not names:
         return
     pat = re.compile(r"(?<![\w.])(?:const\s+)?(%s)\s*&\s*(\w+)\s*\("
@@ -2075,7 +2775,7 @@ def _check_ref_returns(scan, names, path):
             continue
         tail = scan[close + 1:close + 40].lstrip()
         if tail.startswith("{") or tail.startswith(";"):
-            line = scan.count("\n", 0, m.start()) + 1
+            line = _src_line(scan, m.start())
             raise CppError(
                 "%s:%d: `%s&` return type is not in the C++ subset -- return "
                 "`%s *` explicitly. Reference *parameters* are supported."
@@ -2223,7 +2923,8 @@ def _external_info(name, dropfn):
             "abstract": False, "vdtor": False, "vdtor_decl": None,
             "ctor_refs": set(), "paths": {}, "copy": False, "move": False,
             "assign": False, "moveassign": False, "move_methods": {}, "deleted": {}, "index": None, "arrow": None,
-            "star": None, "augassign": {}, "cmp": {}, "conv": None,
+            "star": None, "augassign": {}, "cmp": {}, "binop": {},
+            "conv": None,
             "vcall": {},
             "dropfn": dropfn, "external": True}
 
@@ -2383,7 +3084,8 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             "abstract": abstract, "vdtor": False, "vdtor_decl": None,
             "ctor_refs": set(), "paths": {}, "copy": False, "move": False,
             "assign": False, "moveassign": False, "move_methods": {}, "deleted": {}, "index": None, "arrow": None,
-            "star": None, "augassign": {}, "cmp": {}, "conv": None,
+            "star": None, "augassign": {}, "cmp": {}, "binop": {},
+            "conv": None,
             "dropfn": "%s_drop" % cname, "external": False}
     if base_info:
         # Inherited members and methods are reachable on the derived class.
@@ -2733,6 +3435,59 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             # a method called `assign`, and `string` does.
             emit("void", "%s__assign" % cname, params, sub(m.body or ""))
             info["assign"] = True
+        elif m.kind == "binop":
+            op = m.name[len("operator"):]
+            # A binary operator hands back a new object by value, and this
+            # subset cannot return an owning one that way: the local it
+            # names is destroyed on the way out and the caller would get a
+            # copy of a released object. So the operator is available to a
+            # class that owns nothing, where the struct copy is exactly
+            # what C++ does implicitly.
+            #
+            # Reported here rather than left to the by-value rules, which
+            # refuse it correctly but describe the *initialiser* rather
+            # than the operator that produced it.
+            if dtor is not None and (m.ret or "").strip() == cname:
+                raise CppError(
+                    "`%s::operator%s` returns %s by value, and %s has a "
+                    "destructor. A by-value return of an owning class is not "
+                    "in this subset -- the local is destroyed on the way out "
+                    "and the caller would receive a copy of a released "
+                    "object. Use `operator%s=`, which writes into an object "
+                    "that already exists."
+                    % (cname, op, cname, cname, op))
+            fn = "%s__bin%s" % (cname, _BIN_NAMES[op])
+            cret = tsub(sub(m.ret or "")).strip()
+            info["binop"][op] = {
+                "fn": fn, "ret": cret,
+                "refs": _ref_positions(_expand_cpp_ref(sub(m.params or ""),
+                                                       known),
+                                       _with_scalars(names))}
+            emit(cret, fn, params, sub(m.body or ""))
+            # A by-value front door, so a chain can nest.
+            #
+            # `a + b + c` is `(a + b) + c`, and the left operand of the
+            # second `+` is the *result* of the first. C cannot take the
+            # address of a function result, so the ordinary form -- which
+            # wants `&lhs` -- has nowhere to point. This variant takes its
+            # left operand by value instead, and a call to the ordinary
+            # form can be passed straight into it.
+            #
+            # Safe precisely because a binary operator is only available to
+            # a class that owns nothing: the by-value parameter is a struct
+            # copy with no constructor or destructor to run, exactly as C++
+            # would pass it. That is the same condition checked above, so
+            # there is no case where this wrapper exists and copying is
+            # wrong.
+            if cret == cname:
+                vfn = "%s_v" % fn
+                info["binop"][op]["vfn"] = vfn
+                mprotos.append("static %s %s(%s lhs, const %s *o);"
+                               % (cname, vfn, cname, cname))
+                (tail if emitting_outline[0] else out).append(
+                    "static %s %s(%s lhs, const %s *o) "
+                    "{ return %s(&lhs, o); }"
+                    % (cname, vfn, cname, cname, fn))
         elif m.kind == "cmp":
             op = m.name[len("operator"):]
             fn = "%s__cmp%s" % (cname, _CMP_NAMES[op])
@@ -2820,6 +3575,13 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
                 # turn: `o.node()->get()`. Monomorphised, because a method
                 # returning `Box<int> *` has to name the emitted struct.
                 "ret": tsub(sub(m.ret)), "fn": mfn,
+                # The lowered parameter list, kept so a by-value receiver
+                # variant can repeat it. Only the *reference* positions
+                # were recorded before, which is enough to fix up a call
+                # but not to declare a forwarder.
+                "params": _lower_refs(
+                    _expand_cpp_ref(_expand_cpp_rref(params, names), names),
+                    _with_scalars(names)),
                 "owner": cname, "virtual": False, "decl": cname}
 
     # A base, a member, or a vtable pointer all oblige the class to have a
@@ -2880,6 +3642,50 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             "refs": _ref_positions(s["params"], names), "owner": s["impl"],
             "ret": tsub(s["ret"]), "virtual": True, "decl": s["decl"],
             "fn": "%s_%s" % (s["impl"], s["name"]) if s["impl"] else None}}
+
+    # By-value receiver variants, for methods the source invokes on a call
+    # *result*. C cannot take the address of a function result, so
+    # `o.make().get()` has no object to call `get` on -- the same wall the
+    # binary operators hit for `a + b + c`, and the same way out: a variant
+    # taking its receiver by value, which the result is passed straight
+    # into.
+    #
+    # Only for a class that owns nothing. The receiver crosses the call
+    # boundary as a struct copy, and for an owning class that would leave
+    # two objects holding one resource -- which is the same condition the
+    # by-value rules enforce everywhere else here.
+    #
+    # And only for the names actually chained onto: a variant per method
+    # unconditionally would leave unused static functions all over the
+    # output, exactly as the dispatch helpers below note.
+    info["byval"] = {}
+    if not info["dtor"]:
+        for mname_, ars in info["methods"].items():
+            if mname_ not in chained:
+                continue
+            for ar, ent in ars.items():
+                if ent.get("virtual") or not ent.get("fn"):
+                    continue
+                vfn = "%s__byval_%s_%d" % (cname, mname_, ar)
+                plist = (ent.get("params") or "").strip()
+                fwd = "".join(
+                    ", " + n for n in
+                    (_param_name(x) for x in _split_top(plist)) if n)
+                ret = (ent.get("ret") or "void").strip() or "void"
+                proto = ("static %s %s(%s self%s);"
+                         % (ret, vfn, cname,
+                            (", " + plist) if plist.strip() else ""))
+                if ret == "void":
+                    body = "%s(&self%s);" % (ent["fn"], fwd)
+                else:
+                    body = ("%s _cpp_bv = %s(&self%s); return _cpp_bv;"
+                            % (ret, ent["fn"], fwd))
+                mprotos.append(proto)
+                out.append("static %s %s(%s self%s) { %s }"
+                           % (ret, vfn, cname,
+                              (", " + plist) if plist.strip() else "",
+                              body))
+                info["byval"].setdefault(mname_, {})[ar] = vfn
 
     # Single-evaluation dispatch helpers, for slots the source invokes on a
     # call result. Emitted only by the class that declares the slot, and
@@ -3604,6 +4410,7 @@ def _copy_call(ctype, vname, src, info, where):
     return "%s_copy(&%s, &%s);" % (ctype, vname, src)
 
 
+
 def _rewrite_scopes(text, type_info):
     """Emit ctor calls at local decls and dtor calls on every exit from scope.
 
@@ -3626,8 +4433,24 @@ def _rewrite_scopes(text, type_info):
     names = sorted(type_info, key=len, reverse=True)
     type_alt = "|".join(re.escape(n) for n in names)
     # `Type name;` or `Type name(args);` -- not `Type *p` (star between).
+    # `T name;` or `T name(args);`. The argument list may not span a brace:
+    # `[^;]*` alone let it run straight past its own closing paren, so for a
+    # method whose *return type* is a class
+    #
+    #     static vec2 mk(vec2 *this) { vec2 r(5); return r; }
+    #
+    # the pattern matched from the function's own name to the first `;`
+    # inside the body -- one bogus declaration of a variable called `mk`,
+    # swallowing the real declaration of `r`, which therefore never got its
+    # constructor and never got declared. It only bit where the return type
+    # was a class, since that is what puts the header in `type_alt`, which
+    # is why `T name(args)` worked everywhere else and looked supported.
+    #
+    # Braces are excluded rather than parens: an argument may legitimately
+    # contain a nested call (`vec2 r(f(1));`), and the balance check below
+    # is what keeps that honest.
     decl_re = re.compile(
-        r"(?<![\w.])(%s)\s+(\w+)\s*(?:\(([^;]*)\))?\s*;" % type_alt)
+        r"(?<![\w.])(%s)\s+(\w+)\s*(?:\(([^;{}]*)\))?\s*;" % type_alt)
 
     # `T *p = ..;` -- a pointer local of class type. Recorded so the name
     # walker can reach through it, exactly as it already does for a pointer
@@ -3949,6 +4772,13 @@ def _rewrite_scopes(text, type_info):
         if m and not aggs and \
                 _prev_word(look, i) not in ("struct", "typedef", "union"):
             ctype, vname, args = m.group(1), m.group(2), m.group(3)
+            # And the parens have to balance. Without this a declaration
+            # whose argument holds a nested call could still match across
+            # its own closing paren into whatever followed.
+            if args is not None and (args.count("(") != args.count(")")):
+                out.append(text[i])
+                i += 1
+                continue
             info = type_info[ctype]
             if info.get("abstract") and len(scopes) > 1:
                 raise CppError(
@@ -5047,7 +5877,7 @@ def _strip_extern_c(text):
         if scan[m.end():m.end() + 1] == "{":
             close = _match_brace(scan, m.end())
             if close is None:
-                line = scan.count("\n", 0, m.start()) + 1
+                line = _src_line(scan, m.start())
                 raise CppError(
                     "%d: `extern \"C\" {` is never closed." % line)
             blanks.append((m.end(), m.end() + 1))
@@ -5183,7 +6013,40 @@ def _emit_method_call(expr, cls, is_ptr, meth, args, ent, cinfo,
     return "%s(%s%s)" % (ent["fn"], cast(ent["owner"], recv), tail)
 
 
-def _rewrite_calls(text, cinfo, free_refs):
+#: A chain call -- `a.get()` / `p->get()` -- appearing inside an argument
+#: list. Matched to decide whether a call is ready to be rewritten yet.
+_NESTED_CHAIN = re.compile(r"(?<![\w.>])(\w+)((?:\s*(?:\.|->)\s*\w+)+)\s*\(")
+
+
+def _defers_to_nested(raw, scopes, lookup):
+    """Does this argument list still hold a method call to be lowered first?
+
+    Rewriting a call by reference *consumes* its arguments -- the scan
+    resumes past the closing paren -- so a method call nested in one was
+    never visited, on this pass or any later one, and reached the C as
+    `take(&a, a.get())`. The fixed-point loop above cannot help, because
+    every pass makes the same jump.
+
+    So the call waits instead. While an argument still names a receiver
+    that resolves to a class, this reports true and the call is left for
+    the ordinary character-by-character path, which descends into the
+    arguments and lowers what is in them; on the next pass round the
+    arguments are plain and the reference rewriting fires.
+
+    Only a receiver that *resolves* -- checking that, rather than the
+    shape, is what stops a wait that would never end. Plain C spelled the
+    same way (`s.field`, or a struct the file never declared) resolves to
+    nothing, is never going to be rewritten, and so must not defer, or the
+    loop would run out its iterations with no `&` inserted at all.
+    """
+    for mm in _NESTED_CHAIN.finditer(raw):
+        if lookup(scopes, mm.group(1)) is not None:
+            return True
+    return False
+
+
+
+def _rewrite_calls(text, cinfo, free_refs, free_rets=None):
     """`g.get()` -> `VecGuard_get(&g)`, `p->get()` -> `VecGuard_get(p)`.
 
     Receivers are resolved against a scope-tracked symbol table: locals,
@@ -5211,8 +6074,34 @@ def _rewrite_calls(text, cinfo, free_refs):
     # ever sees what that one left behind.
     field_re = re.compile(
         r"(?<![\w.>])(\w+)((?:\s*(?:\.|->)\s*\w+)+)(?!\s*\()")
+    # `a + b`, where both sides are plain names that resolve to a class
+    # with that operator. Rewritten here rather than with the other
+    # operators in `_rewrite_scopes`, because a binary operator's result is
+    # an *expression*: `vec2 c = a + b;` is a declaration whose initialiser
+    # has to be lowered in place, and by this pass the declaration is
+    # already plain C with the sum still sitting in it.
+    #
+    # Both operands must be plain names. One that is itself an expression
+    # would need a temporary to take the address of, which is the same wall
+    # a by-value method return hits, so `a + b + c` is not in this. `=`
+    # must not follow the operator, or this would eat the `+` of `a += b`.
+    bin_re = re.compile(
+        r"(?<![\w.>])(\w+)\s*([+\-*/%|&^])(?!=)\s*(\w+)(?![\w(<])")
+    # The continuation of a run: `+ c` after `a + b` has already been
+    # consumed. No leading name, because the left operand is the result
+    # carried in from the previous step.
+    bin_re_cont = re.compile(
+        r"\s*([+\-*/%|&^])(?!=)\s*(\w+)(?![\w(<])")
+    # The same head with *no* usable right operand. Tried after `bin_re`,
+    # so it only ever sees what that one declined: a parenthesised
+    # subexpression, a call, a literal. Reported rather than left in the C
+    # as `a + <something>`, which the C front end would complain about in
+    # terms of the generated struct rather than the operator written.
+    bin_head_re = re.compile(
+        r"(?<![\w.>])(\w+)\s*([+\-*/%|&^])(?!=)\s*(?=[(])")
     builtin_re = re.compile(
-        r"(?<![\w.>])(__cpp_copy|__cpp_movein|__cpp_drop|__cpp_eq"
+        r"(?<![\w.>])(__cpp_copy|__cpp_movein|__cpp_drop|__cpp_eq|__cpp_cmp"
+        r"|__cpp_addr"
         r"|__cpp_share_hook)"
         r"\s*\(")
     # `v[i]` / `a.b[i]` on a class that overloads subscript.
@@ -5313,21 +6202,47 @@ def _rewrite_calls(text, cinfo, free_refs):
             meth = nm.group(1)
             if cls is None or meth not in cinfo[cls]["methods"]:
                 return expr, pos
-            if not is_ptr and not addressable:
-                # C cannot take the address of a function *result*, and a
-                # method needs an addressable receiver. A dereference is a
-                # different matter -- `&(*p)` is fine -- which is why the
-                # subscript branch says so.
-                raise CppError(
-                    "`%s().%s()`: %s is returned by value, so there is no "
-                    "object to call `%s` on. Assign it to a local first, or "
-                    "return `%s *`." % (from_meth, meth, cls, meth, cls))
             nxt = _match_paren(look, nm.end() - 1)
             if nxt is None:
                 return expr, pos
             ent = _pick(cinfo[cls]["methods"][meth], text[nm.end():nxt],
                         cls, meth)
             args = fix_args(text[nm.end():nxt], ent["refs"], scopes)
+            if not is_ptr and not addressable:
+                # C cannot take the address of a function *result*, and a
+                # method needs an addressable receiver. A dereference is a
+                # different matter -- `&(*p)` is fine -- which is why the
+                # subscript branch says so.
+                #
+                # So the receiver goes in by *value* instead, through a
+                # variant emitted for exactly the methods a source chains
+                # onto. That exists only for a class with no destructor:
+                # a struct copy of an owning receiver would leave two
+                # objects holding one resource, which is why the refusal
+                # below still stands for one.
+                vfn = (cinfo[cls].get("byval", {})
+                       .get(meth, {}).get(_arity(text[nm.end():nxt])))
+                if vfn is None:
+                    # Two different reasons, and saying the wrong one sends
+                    # the author looking for a resource their class has not
+                    # got.
+                    if cinfo[cls]["dtor"]:
+                        why = ("owns a resource, so it cannot be copied "
+                               "into the call")
+                    else:
+                        why = ("reaches `%s` through the vtable, and a "
+                               "virtual call needs a receiver whose address "
+                               "can be taken" % meth)
+                    raise CppError(
+                        "`%s().%s()`: %s is returned by value and %s -- and "
+                        "there is no address to take of a function result. "
+                        "Assign it to a local first, or return `%s *`."
+                        % (from_meth, meth, cls, why, cls))
+                expr = "%s(%s%s)" % (vfn, expr, (", " + args) if args else "")
+                cls, is_ptr = _ret_class(ent["ret"], cinfo)
+                addressable = False
+                pos, from_meth = nxt + 1, meth
+                continue
             expr = _emit_method_call(expr, cls, is_ptr, meth, args, ent,
                                      cinfo)
             cls, is_ptr = _ret_class(ent["ret"], cinfo)
@@ -5354,6 +6269,7 @@ def _rewrite_calls(text, cinfo, free_refs):
             parts[idx] = " &" + a
         return ",".join(parts).strip()
 
+    free_rets = free_rets or {}
     out = []
     scopes = [{}]
     pdepth = 0
@@ -5499,6 +6415,69 @@ def _rewrite_calls(text, cinfo, free_refs):
                     i = end
                     continue
 
+        m = bin_re.match(look, i)
+        if m:
+            sym = lookup(scopes, m.group(1))
+            ent = None
+            if sym is not None and sym[0] in cinfo:
+                ent = cinfo[sym[0]].get("binop", {}).get(m.group(2))
+            if ent is not None:
+                rsym = lookup(scopes, m.group(3))
+                if rsym is not None and rsym[0] == sym[0]:
+                    ldr = "" if sym[1] else "&"
+                    rdr = "" if rsym[1] else "&"
+                    expr = ("%s(%s%s, %s%s)"
+                            % (ent["fn"], ldr, m.group(1),
+                               rdr, m.group(3)))
+                    pos = m.end()
+                    # Continue the run: each further operand takes the
+                    # previous result by value, which is what the `_v`
+                    # wrapper exists for.
+                    while True:
+                        cm2 = bin_re_cont.match(look, pos)
+                        if cm2 is None:
+                            break
+                        op2, rhs2 = cm2.group(1), cm2.group(2)
+                        if _BIN_PREC[op2] != _BIN_PREC[m.group(2)]:
+                            raise CppError(
+                                "`%s %s %s %s %s`: mixing `%s` and `%s` in "
+                                "one run of overloaded operators is not in "
+                                "this subset -- they have different "
+                                "precedence and this lowering goes left to "
+                                "right, so it would compute the wrong "
+                                "grouping. Assign the tighter-binding part "
+                                "to a temporary first (`T t = %s %s %s;`) "
+                                "-- parentheses do not help, since an "
+                                "operand has to be a plain name."
+                                % (m.group(1), m.group(2), m.group(3),
+                                   op2, rhs2, m.group(2), op2,
+                                   m.group(3), op2, rhs2))
+                        ent2 = cinfo[sym[0]].get("binop", {}).get(op2)
+                        rs2 = lookup(scopes, rhs2)
+                        if ent2 is None or ent2.get("vfn") is None \
+                                or rs2 is None or rs2[0] != sym[0]:
+                            break
+                        expr = ("%s(%s, %s%s)"
+                                % (ent2["vfn"], expr,
+                                   "" if rs2[1] else "&", rhs2))
+                        pos = cm2.end()
+                    out.append(expr)
+                    i = pos
+                    continue
+
+        m = bin_head_re.match(look, i)
+        if m:
+            sym = lookup(scopes, m.group(1))
+            if sym is not None and sym[0] in cinfo \
+                    and cinfo[sym[0]].get("binop", {}).get(m.group(2)):
+                raise CppError(
+                    "`%s %s ...`: the right-hand side of an overloaded `%s` "
+                    "has to be a plain name of the same class. This lowering "
+                    "passes operands by address, and there is no address to "
+                    "take of a parenthesised expression or a call result. "
+                    "Assign it to a temporary first."
+                    % (m.group(1), m.group(2), m.group(2)))
+
         m = builtin_re.match(look, i)
         if m:
             # `__cpp_copy(T, dst, src)` / `__cpp_drop(T, x)`. A template body
@@ -5591,6 +6570,56 @@ def _rewrite_calls(text, cinfo, free_refs):
                         "`__cpp_eq(%s, ..)`: %s is a class with no `equals`, "
                         "so two of them cannot be compared. Add "
                         "`int equals(const %s &o)`." % (ty, ty, ty))
+                i = close + 1
+                continue
+            if kind == "__cpp_addr":
+                # `__cpp_addr(T, x)` -- spell `x` the way `__cpp_cmp` and
+                # `__cpp_eq` want their *right* operand: a pointer for a
+                # class, the value itself for a scalar.
+                #
+                # A container gets that spelling for free, because the
+                # value arrives in a parameter declared `__cpp_ref(T)`,
+                # which is already a pointer for a class. Code that builds
+                # its own value -- `sort` holding an element aside while it
+                # shifts the tail -- has no such parameter, and no way to
+                # write one expression that is an address in one
+                # instantiation and a value in the other. This is that way.
+                if ty not in cinfo:
+                    out.append("(%s)" % parts[1])
+                else:
+                    out.append("&(%s)" % parts[1])
+                i = close + 1
+                continue
+            if kind == "__cpp_cmp":
+                # Three-way ordering: negative, zero, positive, like
+                # `strcmp`. Three-way rather than a boolean `less` because
+                # the builtin's operands are *not* symmetric -- the right
+                # one arrives as an already-lowered pointer and the left as
+                # an lvalue -- so `b < a` cannot be spelled by swapping the
+                # arguments of `a < b`. A predicate would therefore leave a
+                # container unable to derive equality from ordering, and it
+                # would have to demand `equals` as well; one comparison
+                # answers both questions and is what a class supplies once.
+                if ty not in cinfo:
+                    # A scalar. Written with two comparisons rather than a
+                    # subtraction: `a - b` overflows for wide or unsigned
+                    # types and gets the order backwards when it does.
+                    # Both operands are expanded twice, so a container must
+                    # pass side-effect-free expressions here -- which is
+                    # equally true of `__cpp_eq` above.
+                    out.append("((%s) < (%s) ? -1 : ((%s) < (%s) ? 1 : 0))"
+                               % (parts[1], parts[2], parts[2], parts[1]))
+                elif "compare" in cinfo[ty]["methods"]:
+                    # As in `__cpp_eq`: the second operand is a reference,
+                    # already lowered to a pointer, the first an lvalue.
+                    out.append("%s_compare(&(%s), %s)"
+                               % (ty, parts[1], parts[2]))
+                else:
+                    raise CppError(
+                        "`__cpp_cmp(%s, ..)`: %s is a class with no "
+                        "`compare`, so two of them cannot be ordered. Add "
+                        "`int compare(const %s &o)` returning negative, zero "
+                        "or positive." % (ty, ty, ty))
                 i = close + 1
                 continue
             if ty not in cinfo:
@@ -5877,14 +6906,26 @@ def _rewrite_calls(text, cinfo, free_refs):
                 continue
 
         m = plain_re.match(look, i)
-        if m and m.group(1) in free_refs:
+        if m and (m.group(1) in free_refs or m.group(1) in free_rets):
             op = m.end() - 1
             close = _match_paren(look, op)
-            if close is not None:
-                args = fix_args(text[op + 1:close], free_refs[m.group(1)],
-                                scopes)
-                out.append("%s(%s)" % (m.group(1), args))
-                i = close + 1
+            if close is not None and not _defers_to_nested(
+                    text[op + 1:close], scopes, lookup):
+                fn = m.group(1)
+                args = fix_args(text[op + 1:close], free_refs.get(fn), scopes)
+                expr = "%s(%s)" % (fn, args)
+                # A free function returning `T *` can be the receiver of the
+                # next call, the same way a method returning one can:
+                # `min_element(..)->c_str()`. Without this the chain was
+                # left as written, because a chain only ever starts from a
+                # *symbol* that resolves to a class and a call result is not
+                # one -- which is right for plain C spelled the same way,
+                # but wrong for the supplied templates, whose return types
+                # this pass does know.
+                rcls, rptr = free_rets.get(fn, (None, False))
+                expr, end = follow(expr, rcls, rptr, close + 1, fn)
+                out.append(expr)
+                i = end
                 continue
 
         out.append(text[i])
@@ -5916,6 +6957,7 @@ void free(void *);
 unsigned long strlen(const char *);
 void *memcpy(void *, const void *, unsigned long);
 void *memmove(void *, const void *, unsigned long);
+void *memset(void *, int, unsigned long);
 int memcmp(const void *, const void *, unsigned long);
 """
 
@@ -5993,6 +7035,69 @@ public:
         return -1;
     }
     int find(char c) { return find_char(c, 0); }
+    /* Substring search, under a different name than `find`. `std::string`
+       overloads `find` on `char` and `const char *`, which are the same
+       arity -- and this subset resolves an overload by argument *count*,
+       before types are known, so the two cannot be told apart. A separate
+       name says it unambiguously rather than picking one and silently
+       mismatching the other.
+
+       Plain O(n*m) scanning: no Boyer-Moore, no KMP table, because the
+       table would need storage this has nowhere to put. */
+    int find_str_from(const char *s, int from) {
+        int k = (int)strlen(s);
+        int i = from;
+        int j;
+        int ok;
+        if (i < 0) { i = 0; }
+        if (k == 0) { if (i > sn) { return -1; } return i; }
+        while (i + k <= sn) {
+            ok = 1;
+            j = 0;
+            while (j < k) {
+                if (sd[i + j] != s[j]) { ok = 0; j = k; }
+                else { j = j + 1; }
+            }
+            if (ok) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+    int find_str(const char *s) { return find_str_from(s, 0); }
+    int rfind_str(const char *s) {
+        int k = (int)strlen(s);
+        int i = sn - k;
+        int j;
+        int ok;
+        if (k == 0) { return sn; }
+        while (i >= 0) {
+            ok = 1;
+            j = 0;
+            while (j < k) {
+                if (sd[i + j] != s[j]) { ok = 0; j = k; }
+                else { j = j + 1; }
+            }
+            if (ok) { return i; }
+            i = i - 1;
+        }
+        return -1;
+    }
+    int contains(const char *s) {
+        if (find_str_from(s, 0) < 0) { return 0; }
+        return 1;
+    }
+    int starts_with(const char *s) {
+        int k = (int)strlen(s);
+        if (k > sn) { return 0; }
+        if (memcmp(sd, s, (unsigned long)k) == 0) { return 1; }
+        return 0;
+    }
+    int ends_with(const char *s) {
+        int k = (int)strlen(s);
+        if (k > sn) { return 0; }
+        if (memcmp(sd + sn - k, s, (unsigned long)k) == 0) { return 1; }
+        return 0;
+    }
     int rfind(char c) {
         int i = sn - 1;
         while (i >= 0) { if (sd[i] == c) { return i; } i = i - 1; }
@@ -6012,6 +7117,23 @@ public:
         if (sn != o.sn) { return 0; }
         if (sn == 0) { return 1; }
         if (memcmp(sd, o.sd, (unsigned long)sn) == 0) { return 1; }
+        return 0;
+    }
+    /* Lexicographic, which is what `std::set<string>` and `std::map` order
+       by. `memcmp` over the shorter length first, then length breaks the
+       tie -- comparing over the longer one would read past the end of the
+       shorter buffer. Three-way, like `std::string::compare`, which is
+       also exactly what `__cpp_cmp` asks a class for. */
+    int compare(const string &o) {
+        int n = sn;
+        int r;
+        if (o.sn < n) { n = o.sn; }
+        if (n > 0) {
+            r = memcmp(sd, o.sd, (unsigned long)n);
+            if (r != 0) { return r; }
+        }
+        if (sn < o.sn) { return -1; }
+        if (sn > o.sn) { return 1; }
         return 0;
     }
 };
@@ -6307,10 +7429,14 @@ public:
 
 # A `map` whose iterator is a *pointer*. That is the whole design: `it->first`,
 # `++it`, `it != m.end()` and `*it` are then plain C on a plain pointer, and
-# none of `operator++`, `operator!=` or an iterator class has to exist. It
-# costs a linear `find` -- the storage is an unsorted array -- which is the
-# honest trade for a container written in a subset with no comparison
-# operator to order keys by.
+# none of `operator++`, `operator!=` or an iterator class has to exist.
+#
+# Sorted by key, and binary-searched, now that `__cpp_cmp` can order two
+# `K`s. It was an unsorted array with a linear `find` when there was no way
+# to ask which of two keys came first -- which also meant it iterated in
+# insertion order, quietly unlike `std::map`, so code that walked one and
+# depended on the order was wrong in a way nothing reported. A key class
+# therefore supplies `compare` where it used to supply `equals`.
 _STD_MAP = """
 template<typename K, typename V>
 class map {
@@ -6319,10 +7445,19 @@ class map {
     int pcap;
 public:
     map() { pd = 0; pn = 0; pcap = 0; }
-    ~map() { free(pd); }
+    ~map() { clear(); free(pd); pd = 0; pcap = 0; }
     int size() { return pn; }
-    int empty() { return pn == 0; }
-    void clear() { pn = 0; }
+    int empty() { if (pn == 0) { return 1; } return 0; }
+    /* Both halves of each entry are destroyed, not just the array freed.
+       A `map<string, string>` owns two objects per element, and releasing
+       only the block they sat in leaks both. */
+    void clear() {
+        while (pn > 0) {
+            pn = pn - 1;
+            __cpp_drop(K, pd[pn].first);
+            __cpp_drop(V, pd[pn].second);
+        }
+    }
     pair<K,V> *begin() { return pd; }
     pair<K,V> *end() { return pd + pn; }
     /* Integer access, for walking the map in a range-`for`. Deliberately
@@ -6338,26 +7473,53 @@ public:
             if (nd) { pd = nd; pcap = c; }
         }
     }
-    pair<K,V> *find(__cpp_ref(K) k) {
-        int i;
-        i = 0;
-        while (i < pn) {
-            if (__cpp_eq(K, pd[i].first, k)) { return pd + i; }
-            i = i + 1;
+    /* The first entry whose key is not less than `k` -- the insertion
+       point, and the start of every lookup. */
+    int lower_index(__cpp_ref(K) k) {
+        int lo = 0;
+        int hi = pn;
+        int mid;
+        while (lo < hi) {
+            mid = lo + (hi - lo) / 2;
+            if (__cpp_cmp(K, pd[mid].first, k) < 0) { lo = mid + 1; }
+            else { hi = mid; }
         }
+        return lo;
+    }
+    pair<K,V> *lower_bound(__cpp_ref(K) k) { return pd + lower_index(k); }
+    pair<K,V> *find(__cpp_ref(K) k) {
+        int i = lower_index(k);
+        if (i < pn) { if (__cpp_cmp(K, pd[i].first, k) == 0) { return pd + i; } }
         return pd + pn;
     }
     int count(__cpp_ref(K) k) { if (find(k) == pd + pn) { return 0; } return 1; }
     V &operator[](__cpp_ref(K) k) {
-        pair<K,V> *f;
-        f = find(k);
-        if (f == pd + pn) {
-            if (pn == pcap) { reserve(pcap ? pcap * 2 : 8); }
-            __cpp_copy(K, pd[pn].first, k);
-            pn = pn + 1;
-            f = pd + pn - 1;
+        int i;
+        i = lower_index(k);
+        if (i < pn) {
+            if (__cpp_cmp(K, pd[i].first, k) == 0) { return pd[i].second; }
         }
-        return f->second;
+        if (pn == pcap) { reserve(pcap ? pcap * 2 : 8); }
+        if (pn == pcap) { return pd[0].second; }
+        /* Shift by representation, which is what moving an object is: the
+           tail is relocated rather than assigned, so an owning key or
+           value keeps its one owner and nothing is destroyed on the way. */
+        if (pn > i) {
+            memmove(pd + i + 1, pd + i,
+                    (unsigned long)((pn - i) * (int)sizeof(pair<K,V>)));
+        }
+        /* The value slot is zeroed before the key goes in. `std::map`
+           value-initialises a new mapped value, and the storage `realloc`
+           returned holds whatever was there before -- so reading `m[k]`
+           for an absent key gave a garbage int, and a `map<K,string>`
+           would have destroyed a pointer nobody set. Zero is what an
+           empty `string`, `vector` and pointer all are here; a class whose
+           default constructor does something else still needs assigning
+           to, exactly as before. */
+        memset(&pd[i].second, 0, sizeof(V));
+        __cpp_copy(K, pd[i].first, k);
+        pn = pn + 1;
+        return pd[i].second;
     }
     void erase(__cpp_ref(K) k) {
         pair<K,V> *f;
@@ -6365,22 +7527,692 @@ public:
         f = find(k);
         if (f != pd + pn) {
             i = (int)(f - pd);
-            while (i < pn - 1) { pd[i] = pd[i + 1]; i = i + 1; }
+            __cpp_drop(K, pd[i].first);
+            __cpp_drop(V, pd[i].second);
+            if (pn - i - 1 > 0) {
+                memmove(pd + i, pd + i + 1,
+                        (unsigned long)((pn - i - 1) * (int)sizeof(pair<K,V>)));
+            }
             pn = pn - 1;
         }
     }
 };
 """
 
+# A `set` that keeps its elements *sorted*, which is where this diverges
+# from `map`. `map` is an unsorted array because it was written before there
+# was any way to order two `K`s generically; `__cpp_cmp` is that way, so a set
+# can binary-search its lookups and -- the part that actually matters --
+# iterate in the order `std::set` promises, rather than in insertion order
+# that happens to look right until it doesn't.
+#
+# Because the comparison is three-way, an element type supplies `compare`
+# and nothing else: equality is `compare(..) == 0`, so there is no separate
+# `equals` to keep consistent with it.
+#
+# The iterator is a `T *` into the buffer, the same design `vector` and `map`
+# use, so `++it`, `*it` and `it != end()` stay plain C. The cost is that
+# `insert` shifts the tail, which `std::set` does not; for the sizes this
+# subset is aimed at that is the cheaper mistake to make.
+_STD_SET = """
+template<typename T>
+class set {
+    T *td;
+    int tn;
+    int tcap;
+public:
+    set() { td = 0; tn = 0; tcap = 0; }
+    ~set() { clear(); free(td); td = 0; tcap = 0; }
+    int size() { return tn; }
+    int empty() { if (tn == 0) { return 1; } return 0; }
+    void clear() { while (tn > 0) { tn = tn - 1; __cpp_drop(T, td[tn]); } }
+    T *begin() { return td; }
+    T *end() { return td + tn; }
+    T *rbegin() { return td + tn - 1; }
+    T *rend() { return td - 1; }
+    void reserve(int c) {
+        if (c > tcap) {
+            T *nd = (T *)realloc(td, (unsigned long)c * sizeof(T));
+            if (nd != 0) { td = nd; tcap = c; }
+        }
+    }
+    /* The first element not less than `v` -- `std::lower_bound`, and the
+       insertion point. Every other lookup is phrased in terms of this one. */
+    int lower_index(__cpp_ref(T) v) {
+        int lo = 0;
+        int hi = tn;
+        int mid;
+        while (lo < hi) {
+            mid = lo + (hi - lo) / 2;
+            if (__cpp_cmp(T, td[mid], v) < 0) { lo = mid + 1; }
+            else { hi = mid; }
+        }
+        return lo;
+    }
+    T *lower_bound(__cpp_ref(T) v) { return td + lower_index(v); }
+    T *find(__cpp_ref(T) v) {
+        int i = lower_index(v);
+        /* `lower_index` lands on the first element not less than `v`, so
+           the only candidate is that one, and a zero comparison decides
+           it -- the same comparison the search already used, rather than a
+           separate equality that could disagree with it. */
+        if (i < tn) { if (__cpp_cmp(T, td[i], v) == 0) { return td + i; } }
+        return td + tn;
+    }
+    int count(__cpp_ref(T) v) { if (find(v) == td + tn) { return 0; } return 1; }
+    /* Returns 1 if the element was new, 0 if it was already there -- the
+       `.second` of what `std::set::insert` returns, spelled as the whole
+       result because this subset has no `pair` return by value. */
+    int insert(__cpp_ref(T) v) {
+        int i = lower_index(v);
+        if (i < tn) { if (__cpp_cmp(T, td[i], v) == 0) { return 0; } }
+        if (tn == tcap) {
+            int m = tcap * 2;
+            if (m < 4) { m = 4; }
+            reserve(m);
+        }
+        if (tn == tcap) { return 0; }
+        if (tn > i) {
+            memmove(td + i + 1, td + i,
+                    (unsigned long)((tn - i) * (int)sizeof(T)));
+        }
+        __cpp_copy(T, td[i], v);
+        tn = tn + 1;
+        return 1;
+    }
+    int erase(__cpp_ref(T) v) {
+        T *f = find(v);
+        int i;
+        if (f == td + tn) { return 0; }
+        i = (int)(f - td);
+        __cpp_drop(T, td[i]);
+        if (tn - i - 1 > 0) {
+            memmove(td + i, td + i + 1,
+                    (unsigned long)((tn - i - 1) * (int)sizeof(T)));
+        }
+        tn = tn - 1;
+        return 1;
+    }
+};
+"""
+
+
+# `<algorithm>`, as function templates over a `T *` range. A range is a pair
+# of pointers because that is already what every container here hands out:
+# `vector`, `ownvector`, `set` and `map` all iterate as `T *`, so these work
+# on any of them without an iterator abstraction existing.
+#
+# Ordering goes through `__cpp_cmp`, so a class element supplies `compare`
+# and these come with it -- there is no second predicate to pass and no
+# comparator parameter, which would need a function type this subset cannot
+# spell generically.
+#
+# Called with explicit arguments (`lower_bound<int>(..)`), since template
+# argument deduction is not implemented; calling one without them is
+# reported rather than blanked.
+_STD_ALGORITHM = """
+template<typename T>
+T *lower_bound(T *first, T *last, __cpp_ref(T) v) {
+    int lo = 0;
+    int hi = (int)(last - first);
+    int mid;
+    while (lo < hi) {
+        mid = lo + (hi - lo) / 2;
+        if (__cpp_cmp(T, *(first + mid), v) < 0) { lo = mid + 1; }
+        else { hi = mid; }
+    }
+    return first + lo;
+}
+template<typename T>
+T *upper_bound(T *first, T *last, __cpp_ref(T) v) {
+    int lo = 0;
+    int hi = (int)(last - first);
+    int mid;
+    while (lo < hi) {
+        mid = lo + (hi - lo) / 2;
+        /* The one difference from `lower_bound`: `<= 0` rather than `< 0`,
+           so an element equal to `v` moves the low end past it and the
+           result is one *after* the last match. */
+        if (__cpp_cmp(T, *(first + mid), v) <= 0) { lo = mid + 1; }
+        else { hi = mid; }
+    }
+    return first + lo;
+}
+/* An insertion sort, moving elements by their representation rather than
+   by assignment. `memmove` is what a *move* of an object is here: the
+   element is not copied and not destroyed, it is relocated, so an owning
+   element keeps its one owner and no copy constructor is required. An
+   assignment-based sort would need `operator=` on the element and would
+   destroy the object it overwrote.
+
+   Insertion rather than quicksort because the recursion would need the
+   template to call itself over its own parameter, which the instantiation
+   scan cannot see through -- the same limit `binary_search` notes below.
+   It is quadratic, and that is the honest cost of the restriction. */
+template<typename T>
+void sort(T *first, T *last) {
+    int n = (int)(last - first);
+    int i = 1;
+    int j;
+    char tmp[sizeof(T)];
+    while (i < n) {
+        j = i;
+        memcpy(tmp, first + i, sizeof(T));
+        while (j > 0) {
+            if (__cpp_cmp(T, *(first + j - 1), __cpp_addr(T, *(T *)tmp)) <= 0) { break; }
+            memmove(first + j, first + j - 1, sizeof(T));
+            j = j - 1;
+        }
+        memcpy(first + j, tmp, sizeof(T));
+        i = i + 1;
+    }
+}
+/* `find`/`count` ask `__cpp_eq`, not `__cpp_cmp`. Searching a range does
+   not need an order and `std::find` asks only for `==`, so requiring
+   `compare` here would refuse a class that reasonably has equality and no
+   ordering. The two builtins are separate for exactly this reason: a
+   container that sorts says `__cpp_cmp`, one that only matches says
+   `__cpp_eq`, and a class supplies whichever its uses need. */
+template<typename T>
+T *find(T *first, T *last, __cpp_ref(T) v) {
+    T *it = first;
+    while (it != last) {
+        if (__cpp_eq(T, *it, v)) { return it; }
+        it = it + 1;
+    }
+    return last;
+}
+template<typename T>
+int count(T *first, T *last, __cpp_ref(T) v) {
+    T *it = first;
+    int n = 0;
+    while (it != last) {
+        if (__cpp_eq(T, *it, v)) { n = n + 1; }
+        it = it + 1;
+    }
+    return n;
+}
+/* Swapping by representation, as `sort` moves by it: the two elements are
+   relocated past each other rather than assigned, so an owning element
+   keeps its one owner and no `operator=` is needed. */
+template<typename T>
+void reverse(T *first, T *last) {
+    T *lo = first;
+    T *hi = last - 1;
+    char tmp[sizeof(T)];
+    while (lo < hi) {
+        memcpy(tmp, lo, sizeof(T));
+        memmove(lo, hi, sizeof(T));
+        memcpy(hi, tmp, sizeof(T));
+        lo = lo + 1;
+        hi = hi - 1;
+    }
+}
+template<typename T>
+void fill(T *first, T *last, __cpp_ref(T) v) {
+    T *it = first;
+    while (it != last) {
+        __cpp_drop(T, *it);
+        __cpp_copy(T, *it, v);
+        it = it + 1;
+    }
+}
+/* `end` for an empty range, which is what `std::min_element` returns and
+   the only answer that does not invent an element. */
+template<typename T>
+T *min_element(T *first, T *last) {
+    T *best = first;
+    T *it = first;
+    while (it != last) {
+        if (__cpp_cmp(T, *it, __cpp_addr(T, *best)) < 0) { best = it; }
+        it = it + 1;
+    }
+    return best;
+}
+template<typename T>
+T *max_element(T *first, T *last) {
+    T *best = first;
+    T *it = first;
+    while (it != last) {
+        if (__cpp_cmp(T, *it, __cpp_addr(T, *best)) > 0) { best = it; }
+        it = it + 1;
+    }
+    return best;
+}
+/* `swap` takes *pointers*, where `std::swap` takes references. A `T &`
+   parameter is lowered to `T *` only for a class -- `names` there is the
+   set of class names -- so `swap(int &a, int &b)` would reach the C with
+   the `&` still on it. And `__cpp_ref(T)`, which does spell both, gives a
+   scalar *by value*, which is exactly what a swap cannot have. Pointers
+   are the one spelling that works for both, so the call site writes
+   `swap(&a, &b)`.
+
+   By representation, like every other relocation here, so an owning
+   element keeps its one owner and needs no `operator=`. */
+template<typename T>
+void swap(T *a, T *b) {
+    char tmp[sizeof(T)];
+    if (a == b) { return; }
+    memcpy(tmp, a, sizeof(T));
+    memmove(a, b, sizeof(T));
+    memcpy(b, tmp, sizeof(T));
+}
+/* Copy into a range that already holds constructed elements -- a
+   container's, not raw storage. Each destination is destroyed before being
+   constructed over, which is what assignment would have done; handing this
+   a `T *` into memory nothing has constructed would destroy garbage, the
+   same way `array<T,N>` of an owning element did before that was refused.
+   Returns one past the last element written, as `std::copy` does. */
+template<typename T>
+T *copy(T *first, T *last, T *dst) {
+    T *it = first;
+    T *out = dst;
+    while (it != last) {
+        __cpp_drop(T, *out);
+        __cpp_copy(T, *out, __cpp_addr(T, *it));
+        it = it + 1;
+        out = out + 1;
+    }
+    return out;
+}
+template<typename T>
+int binary_search(T *first, T *last, __cpp_ref(T) v) {
+    /* The search is repeated rather than delegated to `lower_bound<T>`.
+       Instantiations are found by scanning for `name<args>(`, and inside a
+       template body `T` is still the parameter -- so a call spelled
+       `lower_bound<T>(..)` there is recorded as an instantiation over a
+       type literally named `T`, and emitted as one. Until the scan can see
+       through an unsubstituted parameter, a template calling another over
+       its own parameter is not available. */
+    int lo = 0;
+    int hi = (int)(last - first);
+    int mid;
+    while (lo < hi) {
+        mid = lo + (hi - lo) / 2;
+        if (__cpp_cmp(T, *(first + mid), v) < 0) { lo = mid + 1; }
+        else { hi = mid; }
+    }
+    if (first + lo == last) { return 0; }
+    if (__cpp_cmp(T, *(first + lo), v) == 0) { return 1; }
+    return 0;
+}
+"""
+
+# A max-heap in an array, which is what `std::priority_queue` is too. The
+# element never crosses a call boundary by value: `push` copies into the
+# slot with `__cpp_copy`, and every sift step *relocates* with `memmove`
+# rather than assigning, so an owning element keeps its one owner and needs
+# no `operator=` -- the same argument `sort` makes.
+#
+# Sift by hole rather than by swapping. The element being placed is held
+# aside in a buffer and the ones it passes are moved up (or down) into the
+# hole, which is half the moves of a swap chain and, more importantly,
+# never has two live copies of an owning object at once.
+#
+# `top()` returns a *pointer*, where `std::priority_queue` returns a
+# reference. A reference return has no honest lowering in this subset --
+# turning it into `T *` would silently change what assignment through the
+# result means -- and is rejected, `operator[]` being the one exception
+# because a by-value subscript would make `v[i] = x` write to a copy. So
+# `top()` is spelled the way the subset can say it, and `q[0]` reaches the
+# same element as an lvalue for anyone who wants one.
+#
+# There is no `T pop()` returning the element either: that would copy an
+# object the caller never constructed, which is refused for an owning
+# element and would be wrong for it anyway. Read the top, then `pop()`.
+_STD_PRIORITY_QUEUE = """
+template<typename T>
+class priority_queue {
+    T *qd;
+    int qn;
+    int qcap;
+public:
+    priority_queue() { qd = 0; qn = 0; qcap = 0; }
+    ~priority_queue() { clear(); free(qd); qd = 0; qcap = 0; }
+    int size() { return qn; }
+    int empty() { if (qn == 0) { return 1; } return 0; }
+    void clear() { while (qn > 0) { qn = qn - 1; __cpp_drop(T, qd[qn]); } }
+    void reserve(int c) {
+        if (c > qcap) {
+            T *nd = (T *)realloc(qd, (unsigned long)c * sizeof(T));
+            if (nd != 0) { qd = nd; qcap = c; }
+        }
+    }
+    T *top() { return qd; }
+    T &operator[](int i) { return qd[i]; }
+    void push(__cpp_ref(T) v) {
+        int i;
+        int par;
+        char tmp[sizeof(T)];
+        if (qn == qcap) {
+            int m = qcap * 2;
+            if (m < 4) { m = 4; }
+            reserve(m);
+        }
+        if (qn == qcap) { return; }
+        __cpp_copy(T, qd[qn], v);
+        qn = qn + 1;
+        i = qn - 1;
+        memcpy(tmp, qd + i, sizeof(T));
+        par = (i - 1) / 2;
+        while (i > 0) {
+            if (__cpp_cmp(T, qd[par], __cpp_addr(T, *(T *)tmp)) >= 0) {
+                break;
+            }
+            memmove(qd + i, qd + par, sizeof(T));
+            i = par;
+            par = (i - 1) / 2;
+        }
+        memcpy(qd + i, tmp, sizeof(T));
+    }
+    void pop() {
+        int i;
+        int l;
+        int r;
+        int big;
+        char tmp[sizeof(T)];
+        if (qn == 0) { return; }
+        __cpp_drop(T, qd[0]);
+        qn = qn - 1;
+        if (qn == 0) { return; }
+        /* The last element is the one looking for a home: the root's slot
+           is the hole, and it sifts down into it. */
+        memcpy(tmp, qd + qn, sizeof(T));
+        i = 0;
+        l = 1;
+        while (l < qn) {
+            big = l;
+            r = l + 1;
+            if (r < qn) {
+                if (__cpp_cmp(T, qd[l], __cpp_addr(T, qd[r])) < 0) { big = r; }
+            }
+            if (__cpp_cmp(T, qd[big], __cpp_addr(T, *(T *)tmp)) <= 0) {
+                break;
+            }
+            memmove(qd + i, qd + big, sizeof(T));
+            i = big;
+            l = i * 2 + 1;
+        }
+        memcpy(qd + i, tmp, sizeof(T));
+    }
+};
+"""
+
+
+# LIFO over the same growable array `vector` uses. An adapter in name only:
+# `std::stack` wraps a container and forwards, and forwarding would need a
+# member of a template type this subset would have to monomorphise twice
+# over. The storage is three fields either way.
+#
+# `top()` returns a `T *`, not the reference `std::stack` returns, for the
+# reason `priority_queue::top` does: a reference return is not in this
+# subset. `s[0]` is the top as an lvalue for anyone who wants one.
+_STD_STACK = """
+template<typename T>
+class stack {
+    T *sk;
+    int sn;
+    int scp;
+public:
+    stack() { sk = 0; sn = 0; scp = 0; }
+    ~stack() { clear(); free(sk); sk = 0; scp = 0; }
+    int size() { return sn; }
+    int empty() { if (sn == 0) { return 1; } return 0; }
+    void clear() { while (sn > 0) { sn = sn - 1; __cpp_drop(T, sk[sn]); } }
+    void reserve(int c) {
+        if (c > scp) {
+            T *nd = (T *)realloc(sk, (unsigned long)c * sizeof(T));
+            if (nd != 0) { sk = nd; scp = c; }
+        }
+    }
+    /* Index 0 is the top, so `s[0]` and `top()` agree. Counting down from
+       the end rather than up from the start is what makes that true. */
+    T &operator[](int i) { return sk[sn - 1 - i]; }
+    T *top() { return sk + sn - 1; }
+    void push(__cpp_ref(T) v) {
+        if (sn == scp) {
+            int m = scp * 2;
+            if (m < 4) { m = 4; }
+            reserve(m);
+        }
+        if (sn == scp) { return; }
+        __cpp_copy(T, sk[sn], v);
+        sn = sn + 1;
+    }
+    void pop() { if (sn > 0) { sn = sn - 1; __cpp_drop(T, sk[sn]); } }
+};
+"""
+
+
+# FIFO as a head index into the same array, rather than a ring. A ring
+# would wrap, and a wrapped range cannot be handed out as a pointer pair --
+# which is the iteration every other container here offers. Instead the
+# live range slides back down to the front when the array fills, so the
+# cost is paid once per growth rather than on every access, and `front()`
+# stays a plain pointer into the buffer.
+_STD_QUEUE = """
+template<typename T>
+class queue {
+    T *cd;
+    int chd;
+    int ctl;
+    int ccp;
+public:
+    queue() { cd = 0; chd = 0; ctl = 0; ccp = 0; }
+    ~queue() { clear(); free(cd); cd = 0; ccp = 0; }
+    int size() { return ctl - chd; }
+    int empty() { if (ctl == chd) { return 1; } return 0; }
+    void clear() {
+        while (ctl > chd) { ctl = ctl - 1; __cpp_drop(T, cd[ctl]); }
+        chd = 0;
+        ctl = 0;
+    }
+    void reserve(int c) {
+        if (c > ccp) {
+            T *nd = (T *)realloc(cd, (unsigned long)c * sizeof(T));
+            if (nd != 0) { cd = nd; ccp = c; }
+        }
+    }
+    T *front() { return cd + chd; }
+    T *back() { return cd + ctl - 1; }
+    T &operator[](int i) { return cd[chd + i]; }
+    T *begin() { return cd + chd; }
+    T *end() { return cd + ctl; }
+    void push(__cpp_ref(T) v) {
+        if (ctl == ccp) {
+            if (chd > 0) {
+                /* Reclaim the space popped elements left at the front,
+                   by relocation -- the elements are moved, not copied and
+                   destroyed, so an owning element keeps its one owner. */
+                memmove(cd, cd + chd,
+                        (unsigned long)((ctl - chd) * (int)sizeof(T)));
+                ctl = ctl - chd;
+                chd = 0;
+            }
+        }
+        if (ctl == ccp) {
+            int m = ccp * 2;
+            if (m < 4) { m = 4; }
+            reserve(m);
+        }
+        if (ctl == ccp) { return; }
+        __cpp_copy(T, cd[ctl], v);
+        ctl = ctl + 1;
+    }
+    void pop() {
+        if (ctl > chd) { __cpp_drop(T, cd[chd]); chd = chd + 1; }
+    }
+};
+"""
+
+
+# Fixed size, from the non-type template parameter -- `N` is replaced by
+# the literal the use site spelled, since monomorphisation is textual.
+#
+# The elements are a plain array member, and this subset leaves array
+# members to the author: they are not constructed with the container and
+# not destroyed with it. So `array<T,N>` holds *plain data*. An owning
+# element wants `vector<T>`, which does construct and destroy what it
+# holds. That is a real difference from `std::array` and is why there is
+# no `clear()` here to imply otherwise.
+_STD_ARRAY = """
+template<typename T, int N>
+class array {
+public:
+    T ad[N];
+    int size() { return N; }
+    int empty() { if (N == 0) { return 1; } return 0; }
+    T &operator[](int i) { return ad[i]; }
+    T *data() { return ad; }
+    T *begin() { return ad; }
+    T *end() { return ad + N; }
+    T *rbegin() { return ad + N - 1; }
+    T *rend() { return ad - 1; }
+    void fill(__cpp_ref(T) v) {
+        int i = 0;
+        while (i < N) { __cpp_copy(T, ad[i], v); i = i + 1; }
+    }
+};
+"""
+
+
+# The value lives behind a pointer rather than in a `T` member. A member of
+# class type is constructed with its container and destroyed with it, by
+# this subset's own rules -- which is exactly what an `optional` must not
+# do, since an empty one holds nothing to destroy and `reset()` would then
+# be a second destruction of an object the epilogue also destroys. A
+# pointer makes "has a value" and "owns a value" the same fact.
+#
+# The cost is an allocation per engaged value, which `std::optional` does
+# not pay. It is the honest price of not having placement new or a union
+# with a non-trivial member.
+_STD_OPTIONAL = """
+template<typename T>
+class optional {
+    T *op;
+public:
+    optional() { op = 0; }
+    ~optional() { reset(); }
+    int has_value() { if (op != 0) { return 1; } return 0; }
+    void reset() {
+        if (op != 0) { __cpp_drop(T, *op); free(op); op = 0; }
+    }
+    void set(__cpp_ref(T) v) {
+        reset();
+        op = (T *)malloc(sizeof(T));
+        if (op != 0) { __cpp_copy(T, *op, v); }
+    }
+    /* Null when empty, which is the check `has_value()` makes too. There
+       is no `T value()` returning by value: that would copy an object the
+       caller never constructed, refused for an owning element. */
+    T *value() { return op; }
+};
+"""
+
+
+# `<numeric>`, separately from `<algorithm>` now that it is more than one
+# function. Everything here combines elements arithmetically, so the
+# element type has to be one `+` and `*` apply to -- a scalar. A class
+# would need `operator+`, which is not in this subset, so a class element
+# is reported rather than left to fail as C.
+_STD_NUMERIC = """
+template<typename T>
+T accumulate(T *first, T *last, T init) {
+    T *it = first;
+    T sum = init;
+    while (it != last) {
+        sum = sum + *it;
+        it = it + 1;
+    }
+    return sum;
+}
+/* Fill with successive values from `start`, as `std::iota` does. */
+template<typename T>
+void iota(T *first, T *last, T start) {
+    T *it = first;
+    T v = start;
+    while (it != last) {
+        *it = v;
+        v = v + 1;
+        it = it + 1;
+    }
+}
+/* The sum of products of two ranges. The second is given by its start
+   only, as `std::inner_product` takes it -- it is required to be at least
+   as long as the first, which nothing here can check. */
+template<typename T>
+T inner_product(T *first, T *last, T *first2, T init) {
+    T *it = first;
+    T *it2 = first2;
+    T sum = init;
+    while (it != last) {
+        sum = sum + (*it) * (*it2);
+        it = it + 1;
+        it2 = it2 + 1;
+    }
+    return sum;
+}
+/* Running totals into `dst`, returning one past the last written.
+   Assignment rather than `__cpp_copy`, because the value written is a sum
+   rather than a copy of an element -- which is another way of saying
+   these are for scalars. `dst` may be `first`, and the read of the
+   element happens before the write, so writing in place is safe. */
+template<typename T>
+T *partial_sum(T *first, T *last, T *dst) {
+    T *it = first;
+    T *out = dst;
+    T sum;
+    if (it == last) { return out; }
+    sum = *it;
+    *out = sum;
+    it = it + 1;
+    out = out + 1;
+    while (it != last) {
+        sum = sum + *it;
+        *out = sum;
+        it = it + 1;
+        out = out + 1;
+    }
+    return out;
+}
+/* The difference between each element and the one before it. The previous
+   element is held in a local before the write, so this too may run in
+   place. */
+template<typename T>
+T *adjacent_difference(T *first, T *last, T *dst) {
+    T *it = first;
+    T *out = dst;
+    T prev;
+    T cur;
+    if (it == last) { return out; }
+    prev = *it;
+    *out = prev;
+    it = it + 1;
+    out = out + 1;
+    while (it != last) {
+        cur = *it;
+        *out = cur - prev;
+        prev = cur;
+        it = it + 1;
+        out = out + 1;
+    }
+    return out;
+}
+"""
+
 
 _STD_INCLUDE = re.compile(
-    r"^[ \t]*#\s*include\s*<(vector|string|memory|map|utility)>[ \t]*\n?",
+    r"^[ \t]*#\s*include\s*<(vector|string|memory|map|set|algorithm"
+    r"|queue|stack|array|optional|unordered_map|unordered_set"
+    r"|numeric"
+    r"|utility)>[ \t]*\n?",
     re.M)
 
 
 _STD_CLASSES = frozenset(("string", "vector", "ownvector",
-                          "unique_ptr", "shared_ptr", "pair", "map",
-                          "enable_shared_from_this"))
+                          "unique_ptr", "shared_ptr", "pair", "map", "set",
+                          "priority_queue", "stack", "queue", "array",
+                          "optional", "enable_shared_from_this"))
 
 
 #: `<cstdint>` and friends: the C headers under their C++ spellings. The
@@ -6401,6 +8233,19 @@ _CXX_C_HEADER = re.compile(
     r"#\s*include\s*<\s*(%s)\s*>" % "|".join(sorted(_CXX_C_HEADERS)))
 
 
+#: `unordered_map` and `unordered_set` are the ordered ones under another
+#: name. Neither hashes: there is no `hash<T>` here and no way to write one
+#: generically in this subset, so what would be supplied is a container
+#: with the unordered *interface* and the ordered container's behaviour.
+#:
+#: Saying so by aliasing is more honest than a separate copy that pretends
+#: otherwise. The difference an author can observe is iteration order --
+#: `std::unordered_map` promises none, these iterate sorted, and code that
+#: relies on no order is not broken by getting one. The difference they
+#: cannot observe is complexity: these are O(log n) lookups, not O(1).
+_STD_UNORDERED = {"unordered_map": "map", "unordered_set": "set"}
+
+
 def _std_prelude(text):
     """Strip `std::`, drop `#include <vector|string>`, and supply the classes.
 
@@ -6418,9 +8263,48 @@ def _std_prelude(text):
     # which is its element type.
     if "map" in wanted:
         wanted.discard("map")
+    # `<set>` names the header, `set` the class -- same rule as `<map>`.
+    wanted.discard("set")
+    # `<queue>` is the header; `priority_queue` and `queue` are the classes,
+    # and the header shares its name with one of them -- so including it is
+    # not by itself a request for `queue`, which the probe below decides.
+    wanted.discard("queue")
+    # Same for the rest: header named, class asked for by use.
+    wanted.discard("stack")
+    wanted.discard("array")
+    wanted.discard("optional")
+    wanted.discard("unordered_map")
+    wanted.discard("unordered_set")
+    # `<algorithm>` is the header *and* the only way to ask for these: they
+    # are free functions, so there is no `std::algorithm` spelling for the
+    # probe below to find. Including it is the request.
+    algorithm = "algorithm" in wanted
+    wanted.discard("algorithm")
+    # `<numeric>` the same way -- and *also* by name, unlike `<algorithm>`.
+    # `accumulate` lived in `<algorithm>` here until this header existed,
+    # so a file that included only that one and called it would otherwise
+    # have stopped compiling, with a link error naming a function the
+    # author did write. Answering to the name as well costs nothing and
+    # keeps `std::accumulate` meaning what it did.
+    numeric = "numeric" in wanted
+    wanted.discard("numeric")
+    probe = _blank_strings(_strip_comments(text))
+    for fn in ("accumulate", "iota", "inner_product", "partial_sum",
+               "adjacent_difference"):
+        if re.search(r"\bstd\s*::\s*%s\b" % fn, probe):
+            numeric = True
+    # Rewritten to the ordered spelling before anything looks for classes,
+    # so every pass below sees one container rather than two names for it.
+    for un, real in _STD_UNORDERED.items():
+        if re.search(r"\b(?:std\s*::\s*)?%s\b" % un, probe):
+            text = _sub_code(re.compile(r"(?<![\w])%s(?![\w])" % un),
+                             real, text)
+            wanted.add(real)
     probe = _blank_strings(_strip_comments(text))
     for name in ("string", "vector", "ownvector", "unique_ptr",
-                 "shared_ptr", "pair", "map", "enable_shared_from_this"):
+                 "shared_ptr", "pair", "map", "set", "priority_queue",
+                 "stack", "queue", "array", "optional",
+                 "enable_shared_from_this"):
         if re.search(r"\bstd\s*::\s*%s\b" % name, probe):
             wanted.add(name)
     # `bool` is a keyword in C++ and a header in C. A `.cpp` writing `bool`
@@ -6440,9 +8324,14 @@ def _std_prelude(text):
     # supply.
     text = _CXX_C_HEADER.sub(
         lambda m: "#include <%s.h>" % _CXX_C_HEADERS[m.group(1)], text)
-    if not wanted:
+    if not wanted and not algorithm and not numeric:
         return bool_prefix + text
-    text = _STD_INCLUDE.sub("", text)
+    # Blanked to the same *line* count, not cut out. Removing the line
+    # shifted every line of the author's file up by one per `#include`
+    # dropped, so a diagnostic named a line two or three above the one it
+    # meant -- and the more headers a file used, the further off it got.
+    text = _STD_INCLUDE.sub(
+        lambda m: "\n" if m.group(0).endswith("\n") else "", text)
     text = _sub_code(re.compile(r"\bstd\s*::\s*"), "", text)
     if "vector" in wanted or "ownvector" in wanted:
         # `vector<string>` needs `string`; supplying it is cheaper than
@@ -6474,7 +8363,25 @@ def _std_prelude(text):
         parts.append(_STD_OWNVECTOR)
     if "map" in wanted:
         parts.append(_STD_MAP)
-    return "".join(parts) + text
+    if "set" in wanted:
+        parts.append(_STD_SET)
+    if "priority_queue" in wanted:
+        parts.append(_STD_PRIORITY_QUEUE)
+    if "stack" in wanted:
+        parts.append(_STD_STACK)
+    if "queue" in wanted:
+        parts.append(_STD_QUEUE)
+    if "array" in wanted:
+        parts.append(_STD_ARRAY)
+    if "optional" in wanted:
+        parts.append(_STD_OPTIONAL)
+    if algorithm:
+        parts.append(_STD_ALGORITHM)
+    if numeric:
+        parts.append(_STD_NUMERIC)
+    # The marker goes last, immediately above the author's first line, so
+    # that everything supplied above it is what a line number counts past.
+    return "".join(parts) + _SRC_MARK_DECL + text
 
 
 _LAMBDA = re.compile(r"\[([^\]]*)\]\s*\(([^()]*)\)\s*(?:->\s*([\w ]+(?:\s*\*)*)\s*)?\{")
@@ -6607,7 +8514,7 @@ def _inline_lambda(text, look, m, close, captures, params, ret, body, n,
     every index, and rescanning is cheaper to be sure of than an offset.
     """
     where = "%s:%d" % (os.path.basename(path),
-                       look.count("\n", 0, m.start()) + 1)
+                       _src_line(look, m.start()))
     am = _AUTO_LAMBDA.search(look[:m.start()])
     if am is None:
         raise CppError(
@@ -6913,7 +8820,7 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     cls_names = set(re.findall(r"\b(?:class|struct)\s+(\w+)", scan))
     text, scan, outline = _extract_out_of_line(text, scan, cls_names)
 
-    classes = _find_classes(scan, text)
+    classes = _find_classes(scan, text, path)
     # Unconditionally, even with nothing to attach: this is also where a
     # member declared and never defined is caught, and a file with no
     # out-of-line definitions at all is exactly the case where that happens.
@@ -6971,6 +8878,28 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
             % os.path.basename(path))
 
     if not classes:
+        # Nothing to lower -- unless a supplied *free* template left a
+        # builtin behind. `__cpp_cmp` and friends are expanded by the call
+        # rewriting below, which this return skips; a file that uses only
+        # `<algorithm>` defines no class, so returning here emitted
+        # `__cpp_cmp(int, ..)` into the C and let the compiler report it
+        # against generated code the author never wrote. Reported here
+        # instead, against something they can act on.
+        # Falling through with an empty class list does *not* work: the
+        # emission path below is guarded again further down and never
+        # reaches the call rewriting, so the builtin survives just the
+        # same. Restructuring that is a real change and not this one's, so
+        # the limitation is reported rather than half-fixed.
+        left = re.search(r"(?<![\w.>])(__cpp_\w+)\s*\(",
+                         _strip_comments(text))
+        if left:
+            raise CppError(
+                "%s: `%s` survived: it is expanded while lowering classes, "
+                "and this file defines none. `lower_bound` and friends "
+                "compare elements through it, so a file using only "
+                "`<algorithm>` has nothing to hang that pass off. Use them "
+                "on a container (`<vector>`, `<set>`), which supplies one."
+                % (os.path.basename(path), left.group(1)))
         return text
 
     tclasses = dict((cls.name, cls) for _s, _e, cls in classes if cls.tparams)
@@ -7276,6 +9205,16 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     # Which free functions take a reference? Collected before lowering, while
     # a `&` is still on the page.
     free_refs = _free_ref_funcs(_strip_comments(out), names)
+    # The return type of each function the template monomorphiser emitted,
+    # so a call to one can be chained onto. Read back off the definition
+    # rather than threaded down from the substitution: what was substituted
+    # is `T *`, and the concrete spelling is what is on the page now.
+    free_rets = {}
+    for fn in _ftmpl:
+        dm = re.search(r"(?<![\w])(\w+)\s*(\*\s*)?%s\s*\("
+                       % re.escape(fn), _strip_comments(out))
+        if dm and dm.group(1) in cinfo:
+            free_rets[fn] = (dm.group(1), bool(dm.group(2)))
     out = _lower_refs(out, names)
     # `vector<T>` stores elements by assignment, which for an owning class
     # would leave two objects holding one resource. Caught here, against the
@@ -7301,6 +9240,27 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
                 "by assignment."
                 % (os.path.basename(path), elem, elem, elem))
 
+    # `array<T,N>` holds its elements in a plain array *member*, and this
+    # subset leaves array members to the author: they are neither
+    # constructed with the container nor destroyed with it. For plain data
+    # that is exactly `std::array`. For a class that owns something it is
+    # not: the elements start as whatever the stack held, so the first
+    # `fill` copy-constructs over a garbage destination and follows a wild
+    # pointer -- a segfault rather than a diagnostic.
+    #
+    # A destructor is the test, as everywhere else here: a class with one
+    # owns something, and a class without owns nothing and copies bitwise.
+    for targs in wanted.get("array", []):
+        elem = targs[0]
+        ent = cinfo.get(elem)
+        if ent is not None and (ent["dtor"] or ent["ctor"]):
+            raise CppError(
+                "%s: `array<%s, %s>` holds its elements in a plain array "
+                "member, which this subset does not construct or destroy, "
+                "and %s has a constructor or destructor. Use `vector<%s>`, "
+                "which constructs and destroys what it holds."
+                % (os.path.basename(path), elem, targs[1], elem, elem))
+
     # After reference lowering, a class still spelled by value really is by
     # value -- a `T &` the author wrote is a `T *` by now.
     # Against the directive-blanked text: a `#define`'s replacement is
@@ -7312,7 +9272,7 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     # nested in an argument list surfaces on the next pass. Iterate to a
     # fixed point rather than recursing into every argument.
     for _ in range(8):
-        nxt = _rewrite_calls(out, cinfo, free_refs)
+        nxt = _rewrite_calls(out, cinfo, free_refs, free_rets)
         if nxt == out:
             break
         out = nxt
@@ -7341,6 +9301,11 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     # declared them is unaffected.
     if uses_heap:
         out = ("void *malloc(unsigned long);\nvoid free(void *);\n") + out
+    # The origin marker has done its job -- every diagnostic that was going
+    # to be raised has been. Blanked rather than cut, so the C keeps the
+    # line numbering the diagnostics used and a `#line` directive or a
+    # debugger still lands where the messages said.
+    out = out.replace(_SRC_MARK_DECL, "\n")
     return out
 
 
