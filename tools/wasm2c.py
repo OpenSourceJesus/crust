@@ -60,6 +60,10 @@ VALTYPE = {
     w.F32: ("f32", "f"),
     w.F64: ("f64", "d"),
     reader.V128: ("v128", "v"),
+    # A reference is opaque: null, a function, or a host object. `void *`
+    # holds all three, and NULL is exactly ref.null.
+    reader.FUNCREF: ("wasm_ref", "r"),
+    reader.EXTERNREF: ("wasm_ref", "r"),
 }
 
 # Binary operators that are a plain C infix expression on the wasm type.
@@ -214,7 +218,14 @@ class FunctionWriter:
     # -- operand stack -----------------------------------------------------
 
     def push(self, valtype):
-        """Push a value and return the C variable that now holds it."""
+        """Push a value and return the C variable that now holds it.
+
+        The two reference types are folded together: they have the same C
+        representation, so keeping them apart would only mean two sets of
+        temporaries with the same names.
+        """
+        if valtype == reader.EXTERNREF:
+            valtype = reader.FUNCREF
         name = self._slot(valtype, len(self.stack))
         self.stack.append(valtype)
         d = len(self.stack)
@@ -273,7 +284,9 @@ class FunctionWriter:
             self.instr(ins, func, ftype, nparams)
 
         decls = []
-        for vt in (w.I32, w.I64, w.F32, w.F64, reader.V128):
+        # funcref and externref share a C type and so share a slot prefix;
+        # declaring both would declare the same variables twice.
+        for vt in (w.I32, w.I64, w.F32, w.F64, reader.V128, reader.FUNCREF):
             n = self.max_depth.get(vt, 0)
             if n:
                 names = []
@@ -367,7 +380,7 @@ class FunctionWriter:
             self._call(a[0])
             return
         if op == "call_indirect":
-            self._call_indirect(a[0])
+            self._call_indirect(a[0], a[1] if len(a) > 1 else 0)
             return
 
         # ---- variables
@@ -456,6 +469,78 @@ class FunctionWriter:
             dst_a, _ = self.pop()
             self.emit("wasm_memory_fill(mem, MEM_SIZE, %s, %s, %s);"
                       % (dst_a, val, n))
+            return
+
+        # ---- reference types
+        if op == "ref.null":
+            dst = self.push(ins.args[0])
+            self.emit("%s = 0;" % dst)
+            return
+        if op == "ref.is_null":
+            src, _ = self.pop()
+            dst = self.push(w.I32)
+            self.emit("%s = (%s == 0);" % (dst, src))
+            return
+        if op == "ref.func":
+            dst = self.push(reader.FUNCREF)
+            self.emit("%s = (wasm_ref)%s;"
+                      % (dst, func_c_name(self.mod, ins.args[0])))
+            return
+        if op == "table.get":
+            idx, _ = self.pop()
+            dst = self.push(self._table_type(ins.args[0]))
+            self.emit("%s = wasm_table_get(%d, %s);" % (dst, ins.args[0], idx))
+            return
+        if op == "table.set":
+            val, _ = self.pop()
+            idx, _ = self.pop()
+            self.emit("wasm_table_set(%d, %s, %s);"
+                      % (ins.args[0], idx, val))
+            return
+        if op == "table.size":
+            dst = self.push(w.I32)
+            self.emit("%s = wasm_table_size(%d);" % (dst, ins.args[0]))
+            return
+        if op == "table.grow":
+            n, _ = self.pop()
+            init, _ = self.pop()
+            dst = self.push(w.I32)
+            self.emit("%s = wasm_table_grow(%d, %s, %s);"
+                      % (dst, ins.args[0], init, n))
+            return
+        if op == "table.fill":
+            n, _ = self.pop()
+            val, _ = self.pop()
+            start, _ = self.pop()
+            self.emit("wasm_table_fill(%d, %s, %s, %s);"
+                      % (ins.args[0], start, val, n))
+            return
+        if op == "table.copy":
+            n, _ = self.pop()
+            src, _ = self.pop()
+            dst_i, _ = self.pop()
+            self.emit("wasm_table_copy(%d, %d, %s, %s, %s);"
+                      % (ins.args[0], ins.args[1], dst_i, src, n))
+            return
+        if op == "table.init":
+            n, _ = self.pop()
+            src, _ = self.pop()
+            dst_i, _ = self.pop()
+            self.emit("wasm_table_init(%d, %d, %s, %s, %s);"
+                      % (ins.args[1], ins.args[0], dst_i, src, n))
+            return
+        if op == "elem.drop":
+            # Dropping a passive segment only frees host memory; the segment
+            # data here is static, so there is nothing to release.
+            self.emit("/* elem.drop %d: segments are static here */"
+                      % ins.args[0])
+            return
+        if op == "select_t":
+            cond, _ = self.pop()
+            b, vt = self.pop()
+            aa, _ = self.pop()
+            dst = self.push(vt)
+            self.emit("%s = %s ? %s : %s;" % (dst, cond, aa, b))
             return
 
         # ---- SIMD
@@ -726,7 +811,13 @@ class FunctionWriter:
         else:
             self.emit("%s;" % call)
 
-    def _call_indirect(self, type_index):
+    def _table_type(self, index):
+        """Element type of table `index`, defaulting to funcref."""
+        if index < len(self.mod.tables):
+            return self.mod.tables[index].elem_type
+        return reader.FUNCREF
+
+    def _call_indirect(self, type_index, table_index=0):
         ftype = self.mod.types[type_index]
         idx, _ = self.pop()
         args = []
@@ -740,7 +831,8 @@ class FunctionWriter:
         # the outer parentheses C reads this as casting the call's *result*,
         # and then applies the arguments to a function it thinks returns u32.
         cast = "(%s (*)(%s))" % (ret, sig)
-        call = "((%swasm_table_get(%s)))(%s)" % (cast, idx, ", ".join(args))
+        call = "((%swasm_funcref(%d, %s)))(%s)" % (cast, table_index, idx,
+                                                   ", ".join(args))
         if ftype.results:
             dst = self.push(ftype.results[0])
             self.emit("%s = %s;" % (dst, call))
@@ -827,6 +919,20 @@ class FunctionWriter:
                       % (dst, ctype, a, INFIX[base], b))
             return
         raise Wasm2CError("unhandled instruction '%s'" % op)
+
+
+def _needs_table(mod):
+    """Whether any function body contains an indirect call.
+
+    A module can call through a table without ever putting anything in one
+    -- `int (*f)(int) = 0; f(1);` compiles to exactly that -- and the
+    instruction still names a table, so one has to exist.
+    """
+    for func in mod.funcs:
+        for ins in func.instrs:
+            if ins.op == "call_indirect":
+                return True
+    return False
 
 
 def func_c_name(mod, index):
@@ -926,17 +1032,115 @@ def write_module(mod, module_name="module", emit_main=True):
             ap("static %s %s(%s);" % (ret, name, params))
     ap("")
 
-    # -- function table
-    if mod.table_size:
-        ap("/* The function table. Entries are stored as generic pointers and")
-        ap(" * cast back to the right signature at each call_indirect, whose")
-        ap(" * type index tells us what that signature is. */")
+    # -- tables
+    #
+    # One array per table, each holding opaque references. A funcref table's
+    # entries are function pointers cast to void*, which is what makes
+    # call_indirect a cast and a call; an externref table's entries are
+    # whatever the host put there.
+    ap("/* A reference is opaque: null, a function, or a host value. */")
+    ap("typedef void *wasm_ref;")
+    ap("")
+    tables = mod.tables
+    if not tables and (mod.table_size or _needs_table(mod)):
+        tables = [reader.Table(reader.FUNCREF, mod.table_size, -1)]
+    if tables:
+        ap("/* Tables. Entries are opaque references: a function pointer for")
+        ap(" * a funcref table, a host value for an externref table. Null is")
+        ap(" * a null reference, which is what makes an indirect call through")
+        ap(" * an empty slot trap rather than jump somewhere. */")
+        ap("typedef void *wasm_ref;")
         ap("typedef void (*wasm_anyfunc)(void);")
-        ap("static wasm_anyfunc wasm_table[%d];" % mod.table_size)
-        ap("static wasm_anyfunc wasm_table_get(u32 i) {")
-        ap("  if (i >= %du || !wasm_table[i])" % mod.table_size)
-        ap('    wasm_trap("undefined element");')
-        ap("  return wasm_table[i];")
+        for i in range(len(tables)):
+            t = tables[i]
+            cap = t.maximum if t.maximum >= 0 else max(t.minimum * 2, 1024)
+            ap("static wasm_ref wasm_tab%d[%d];" % (i, max(cap, 1)))
+            ap("static u32 wasm_tab%d_size = %d;" % (i, t.minimum))
+        ap("static wasm_ref *wasm_table_base(u32 t) {")
+        for i in range(len(tables)):
+            ap("  if (t == %d) return wasm_tab%d;" % (i, i))
+        ap('  wasm_trap("no such table");')
+        ap("  return 0;")
+        ap("}")
+        ap("static u32 wasm_table_size(u32 t) {")
+        for i in range(len(tables)):
+            ap("  if (t == %d) return wasm_tab%d_size;" % (i, i))
+        ap("  return 0;")
+        ap("}")
+        ap("static u32 wasm_table_cap(u32 t) {")
+        for i in range(len(tables)):
+            t_i = tables[i]
+            cap = (t_i.maximum if t_i.maximum >= 0
+                   else max(t_i.minimum * 2, 1024))
+            ap("  if (t == %d) return %d;" % (i, max(cap, 1)))
+        ap("  return 0;")
+        ap("}")
+        ap("static wasm_ref wasm_table_get(u32 t, u32 i) {")
+        ap('  if (i >= wasm_table_size(t)) wasm_trap("undefined element");')
+        ap("  return wasm_table_base(t)[i];")
+        ap("}")
+        ap("static void wasm_table_set(u32 t, u32 i, wasm_ref v) {")
+        ap('  if (i >= wasm_table_size(t)) wasm_trap("undefined element");')
+        ap("  wasm_table_base(t)[i] = v;")
+        ap("}")
+        ap("/* An indirect call needs a *non-null* funcref; a null slot is")
+        ap(" * the classic uninitialised-table trap. */")
+        ap("static wasm_anyfunc wasm_funcref(u32 t, u32 i) {")
+        ap("  wasm_ref r = wasm_table_get(t, i);")
+        ap('  if (!r) wasm_trap("uninitialized element");')
+        ap("  return (wasm_anyfunc)r;")
+        ap("}")
+        ap("static u32 wasm_table_grow(u32 t, wasm_ref init, u32 n) {")
+        ap("  u32 old = wasm_table_size(t), k;")
+        ap("  if ((u64)old + n > (u64)wasm_table_cap(t)) return (u32)-1;")
+        ap("  for (k = 0; k < n; k++) wasm_table_base(t)[old + k] = init;")
+        for i in range(len(tables)):
+            ap("  if (t == %d) wasm_tab%d_size = old + n;" % (i, i))
+        ap("  return old;")
+        ap("}")
+        ap("static void wasm_table_fill(u32 t, u32 start, wasm_ref v, u32 n)"
+           " {")
+        ap("  u32 k;")
+        ap("  if ((u64)start + n > (u64)wasm_table_size(t))")
+        ap('    wasm_trap("out of bounds table access");')
+        ap("  for (k = 0; k < n; k++) wasm_table_base(t)[start + k] = v;")
+        ap("}")
+        ap("static void wasm_table_copy(u32 dt, u32 st, u32 d, u32 s, u32 n)"
+           " {")
+        ap("  if ((u64)d + n > (u64)wasm_table_size(dt) ||")
+        ap("      (u64)s + n > (u64)wasm_table_size(st))")
+        ap('    wasm_trap("out of bounds table access");')
+        ap("  memmove(wasm_table_base(dt) + d, wasm_table_base(st) + s,")
+        ap("          (size_t)n * sizeof(wasm_ref));")
+        ap("}")
+        ap("")
+
+    # -- passive element segments, for table.init
+    passive = []
+    for seg in mod.elem_segments:
+        if seg.mode == "passive":
+            passive.append(seg)
+    if passive:
+        for i in range(len(passive)):
+            seg = passive[i]
+            entries = []
+            for item in seg.items:
+                entries.append("0" if item is None
+                               else "(wasm_ref)%s"
+                               % func_c_name(mod, item))
+            ap("static wasm_ref wasm_elem%d[] = {%s};"
+               % (i, ", ".join(entries) if entries else "0"))
+        ap("static void wasm_table_init(u32 t, u32 e, u32 d, u32 s, u32 n) {")
+        ap("  const wasm_ref *src = 0; u32 len = 0, k;")
+        for i in range(len(passive)):
+            ap("  if (e == %d) { src = wasm_elem%d; len = %d; }"
+               % (mod.elem_segments.index(passive[i]), i,
+                  len(passive[i].items)))
+        ap("  if (!src) return;")
+        ap("  if ((u64)s + n > (u64)len ||")
+        ap("      (u64)d + n > (u64)wasm_table_size(t))")
+        ap('    wasm_trap("out of bounds table access");')
+        ap("  for (k = 0; k < n; k++) wasm_table_base(t)[d + k] = src[s + k];")
         ap("}")
         ap("")
 
@@ -978,6 +1182,8 @@ def write_module(mod, module_name="module", emit_main=True):
             # designated-initialiser form zeroes the whole thing.
             if vt == reader.V128:
                 zero = "{{0}}"
+            elif vt in (reader.FUNCREF, reader.EXTERNREF):
+                zero = "0"
             elif vt in (w.F32, w.F64):
                 zero = "0.0"
             else:
@@ -1023,9 +1229,15 @@ def write_module(mod, module_name="module", emit_main=True):
     ap('  if (!mem) wasm_trap("out of memory");')
     ap("  wasm_mem_size = (u64)MEM_INITIAL_PAGES * 65536u;")
     ap("  wasm_init_memory();")
-    for idx in sorted(mod.table_entries):
-        ap("  wasm_table[%d] = (wasm_anyfunc)%s;"
-           % (idx, func_c_name(mod, mod.table_entries[idx])))
+    for seg in mod.elem_segments:
+        if seg.mode != "active":
+            continue
+        for k in range(len(seg.items)):
+            if seg.items[k] is None:
+                continue
+            ap("  wasm_tab%d[%d] = (wasm_ref)%s;"
+               % (seg.table_index, seg.offset + k,
+                  func_c_name(mod, seg.items[k])))
     ap("}")
     ap("")
 
