@@ -372,54 +372,91 @@ except ImportError:                      # run as a script from tools/
     import cpp_auto
 
 
-#: Marks where the supplied `std` prelude ends and the author's own source
-#: begins. A line number is only useful if it names a line the author can
-#: open, and by the time anything is reported the text has grown a few
-#: hundred lines of `string`, `vector` and `map` at the top -- so counting
-#: from the start of the buffer named their line 6 as line 197.
+#: Anchors that tie a position in the generated text back to a line of the
+#: author's file. A line number is only useful if it names a line they can
+#: open, and by the time anything is reported the text bears little
+#: relation to what was written: a few hundred lines of supplied `std` sit
+#: on top, and every class has been replaced by generated C that does not
+#: have the same number of lines the class was written on.
 #:
-#: A *marker* rather than a recorded offset, because an offset does not
-#: survive the passes: monomorphisation replaces each template body with
-#: one copy per instantiation, which changes how many lines sit above the
-#: author's code, and does so differently for every file. The marker moves
-#: with the text it precedes, so whatever happens above it, the count from
-#: the marker to a position is still the author's line number.
+#: So the text carries its own anchors. Each says "the line after me is
+#: source line N", and a line number is that N plus the newlines between.
+#: One goes above the author's first line, and another after every class
+#: emitted, which is what makes the count survive emission -- an anchor
+#: costs nothing to re-place and does not care how many lines the emitter
+#: added or removed.
 #:
 #: Spelled as a declaration rather than a comment because `_strip_comments`
-#: blanks comments out of the scan that most positions are found in, and a
-#: marker that vanishes from the text being searched is no marker at all.
-_SRC_MARK = "__crust_src_origin__"
-_SRC_MARK_DECL = "typedef int %s;\n" % _SRC_MARK
+#: blanks comments out of the scan that most positions are found in, and an
+#: anchor that vanishes from the text being searched is no anchor at all.
+_SRC_MARK = "__crust_src_line_"
+_SRC_MARK_RE = re.compile(r"__crust_src_line_(\d+)__")
 
 
-#: Where this stops working, which is worth knowing before trying to put a
-#: line number on every diagnostic. The marker survives the passes *above*
-#: class emission, and those are exact. Class emission itself replaces each
-#: class's source span with generated C -- methods emitted one per line,
-#: bodies hoisted -- which does not have the same number of lines the class
-#: was written on. Everything below the first class has shifted by the
-#: difference from then on.
-#:
-#: So `_rewrite_calls` and `_rewrite_scopes`, which between them raise
-#: thirty of this module's diagnostics and run after emission, cannot be
-#: given a trustworthy line this way. A wrapper locating them was written
-#: and removed: it reported the copy on line 10 as line 8, and a number
-#: that looks right and is wrong is worse than none. Making it work means
-#: making class emission preserve line counts, which is a real change to
-#: the emitter, not a change here.
+def _src_mark(line):
+    """The anchor declaring that the next line is source line `line`."""
+    return "typedef int %s%d__;\n" % (_SRC_MARK, line)
+
+
+#: The origin anchor, above the author's first line.
+_SRC_MARK_DECL = _src_mark(1)
+
+
+def _locate(exc, text, pos, path):
+    """Re-raise `exc` with a `file:line:` prefix, if it has none.
+
+    A prefix rather than a rewrite of every message: the two passes that
+    report most of this module's diagnostics -- call rewriting and scope
+    rewriting -- walk the text with an index, so the position of whatever
+    they were looking at is known where the error escapes, even though it
+    is not known where each individual message is written. One wrapper
+    locates all thirty.
+
+    This was written once before and removed: it reported a copy on line 10
+    as line 8, because the anchors did not yet survive class emission, and
+    a number that looks right and is wrong is worse than none. They do now.
+
+    Messages that already carry a location keep it: those were written
+    against a more specific position than "wherever the scan had reached",
+    and it would be wrong to overwrite a class's declaration line with the
+    line of the use that tripped over it.
+    """
+    msg = exc.args[0] if exc.args else str(exc)
+    if re.match(r"^[^\s:]+:\d+:", msg):
+        return exc
+    return CppError("%s:%d: %s"
+                    % (os.path.basename(path), _src_line(text, pos), msg))
+
+
+def _after_origin(text, pos):
+    """Index just past the last anchor above `pos`, or 0.
+
+    Where the author's own text begins, as far as anything before `pos` is
+    concerned. Used to keep a declaration search out of the supplied
+    prelude; the anchors after each class serve here too, since everything
+    between them is the author's.
+    """
+    best = None
+    for mm in _SRC_MARK_RE.finditer(text, 0, pos):
+        best = mm
+    return best.end() if best is not None else 0
+
+
 def _src_line(text, pos):
     """The author's 1-based line number for `pos`, or the raw one.
 
-    Positions above the marker are inside the supplied prelude -- a
-    diagnostic about `vector`'s own body, which is this module's bug rather
-    than the author's. Those keep counting from the top, since there is no
-    better answer and pretending otherwise would point at an unrelated line
-    of their file.
+    Counted from the nearest anchor above it. Positions above every anchor
+    are inside the supplied prelude -- a diagnostic about `vector`'s own
+    body, which is this module's bug rather than the author's. Those keep
+    counting from the top, since there is no better answer and pretending
+    otherwise would point at an unrelated line of their file.
     """
-    at = text.rfind(_SRC_MARK, 0, pos)
-    if at < 0:
+    best = None
+    for mm in _SRC_MARK_RE.finditer(text, 0, pos):
+        best = mm
+    if best is None:
         return text.count("\n", 0, pos) + 1
-    return text.count("\n", at, pos)
+    return int(best.group(1)) + text.count("\n", best.start(), pos) - 1
 
 
 class CppError(Exception):
@@ -1635,8 +1672,7 @@ def _pointee_of(expr, scan, at):
     # Never look above the author's first line. Everything up there is
     # supplied by this module, and its locals and parameters are not names
     # the call could possibly have meant.
-    origin = scan.rfind(_SRC_MARK, 0, at)
-    lo = origin + len(_SRC_MARK) if origin >= 0 else 0
+    lo = _after_origin(scan, at)
     # And not into a scope that has already closed -- another function, or
     # a block earlier in this one.
     scan = _visible_view(scan, lo, at)
@@ -1747,8 +1783,7 @@ def _constructed_range(expr, scan, at):
     e = expr.strip()
     if not re.match(r"^\w+$", e):
         return False
-    origin = scan.rfind(_SRC_MARK, 0, at)
-    lo = origin + len(_SRC_MARK) if origin >= 0 else 0
+    lo = _after_origin(scan, at)
     d = _last_before(re.compile(
         r"(?<![\w])[A-Za-z_]\w*\s*\*\s*%s\s*=([^;]*);" % re.escape(e)),
         scan, at, lo)
@@ -4452,7 +4487,23 @@ def _copy_call(ctype, vname, src, info, where):
 
 
 
-def _rewrite_scopes(text, type_info):
+def _rewrite_scopes(text, type_info, path="<cpp>"):
+    """`_rewrite_scopes_inner`, with a line number on whatever it reports.
+
+    The scan's own index is the position: this pass reports about
+    the construct it has just reached, and none of its messages said
+    where. Locating them here rather than at each `raise` keeps one
+    place that knows the file name.
+    """
+    pos = [0]
+    try:
+        return _rewrite_scopes_inner(text, type_info, pos)
+    except CppError as e:
+        raise _locate(e, text, pos[0], path)
+
+
+
+def _rewrite_scopes_inner(text, type_info, _pos):
     """Emit ctor calls at local decls and dtor calls on every exit from scope.
 
     `type_info` maps mangled class name -> {"ctor": bool, "dtor": bool}.
@@ -4594,6 +4645,7 @@ def _rewrite_scopes(text, type_info):
     i, n = 0, len(text)
     in_str = None
     while i < n:
+        _pos[0] = i
         # Decide from the blanked copy, emit from the original. An apostrophe
         # in prose ("the class's table") would otherwise open a string
         # literal and swallow every brace up to the next one.
@@ -6087,7 +6139,23 @@ def _defers_to_nested(raw, scopes, lookup):
 
 
 
-def _rewrite_calls(text, cinfo, free_refs, free_rets=None):
+def _rewrite_calls(text, cinfo, free_refs, free_rets=None, path="<cpp>"):
+    """`_rewrite_calls_inner`, with a line number on whatever it reports.
+
+    The scan's own index is the position: this pass reports about
+    the construct it has just reached, and none of its messages said
+    where. Locating them here rather than at each `raise` keeps one
+    place that knows the file name.
+    """
+    pos = [0]
+    try:
+        return _rewrite_calls_inner(text, cinfo, free_refs, free_rets, pos)
+    except CppError as e:
+        raise _locate(e, text, pos[0], path)
+
+
+
+def _rewrite_calls_inner(text, cinfo, free_refs, free_rets, _pos):
     """`g.get()` -> `VecGuard_get(&g)`, `p->get()` -> `VecGuard_get(p)`.
 
     Receivers are resolved against a scope-tracked symbol table: locals,
@@ -6318,6 +6386,7 @@ def _rewrite_calls(text, cinfo, free_refs, free_rets=None):
     i, n = 0, len(text)
     quote = None
     while i < n:
+        _pos[0] = i
         # As above: state machine on the blanked copy, output from `text`.
         c = look[i]
         if quote is not None:
@@ -9165,6 +9234,18 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
         prev = end
         for dcls, dtargs in deferred.get(idx, []):
             emit_one(dcls, dtargs)
+        # Re-anchor. The generated C above does not have the same number of
+        # lines the class was written on, so from here down a count from
+        # the previous anchor would be off by the difference -- and by the
+        # sum of every class's difference further on. An anchor naming the
+        # line the class ended on costs one line of output and makes the
+        # count exact again for everything below it.
+        # Not the line *after* the class: `end` sits just past its closing
+        # brace, and the source resumes there -- with the `;` and the rest
+        # of that same line still to come. So the anchor names the line the
+        # brace is on, and the newline that ends it is counted like any
+        # other.
+        pieces.append(_src_mark(_src_line(text, end)))
     pieces.append(text[prev:])
     # Bodies defined out of line go after everything, not at the class: the
     # author wrote them below whatever file-scope names they read, and a
@@ -9307,13 +9388,13 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     # Against the directive-blanked text: a `#define`'s replacement is
     # not an expression this translation unit evaluates.
     byval = _check_by_value(_blank_directives(out), cinfo, path)
-    out = _rewrite_scopes(out, cinfo)
+    out = _rewrite_scopes(out, cinfo, path)
 
     # Rewriting a call copies its arguments through verbatim, so a receiver
     # nested in an argument list surfaces on the next pass. Iterate to a
     # fixed point rather than recursing into every argument.
     for _ in range(8):
-        nxt = _rewrite_calls(out, cinfo, free_refs, free_rets)
+        nxt = _rewrite_calls(out, cinfo, free_refs, free_rets, path)
         if nxt == out:
             break
         out = nxt
@@ -9346,7 +9427,11 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     # to be raised has been. Blanked rather than cut, so the C keeps the
     # line numbering the diagnostics used and a `#line` directive or a
     # debugger still lands where the messages said.
-    out = out.replace(_SRC_MARK_DECL, "\n")
+    # Every anchor, not just the origin one: a re-anchor is emitted after
+    # each class too, and stripping only the first left the rest in the C
+    # as stray typedefs. Blanked to a bare newline rather than cut, so the
+    # output keeps the line numbering the diagnostics were counted against.
+    out = _SRC_MARK_RE.sub("", out).replace("typedef int ;\n", "\n")
     return out
 
 

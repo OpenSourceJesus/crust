@@ -2230,6 +2230,127 @@ int f(void) {
 """, "sort_int")
 
 
+class TestPostEmissionLineNumbers(Base):
+    """Diagnostics raised *after* class emission name the author's line.
+
+    The anchors used to be one, above the author's first line, and class
+    emission broke the count: generated C does not have the same number of
+    lines the class was written on, so everything below the first class had
+    shifted. A wrapper locating these was written and removed once for
+    exactly that reason -- it reported the copy below as line 8.
+
+    Now an anchor is re-placed after every class, naming the line its brace
+    is on, so the count is exact again from there down however much the
+    emitter added.
+    """
+
+    _B = """
+class B {
+public:
+    int v;
+    B() { v = 1; }
+    ~B() { }
+};
+"""
+
+    def _line_of(self, src, *needles):
+        msg = self.refuses(src, *needles)
+        mm = __import__("re").search(r":(\d+):", msg)
+        self.assertIsNotNone(mm, "no line number in: %s" % msg)
+        return int(mm.group(1))
+
+    def test_rule_of_three_names_the_copy_line(self):
+        """The exact case that reported 8 for a copy on 10."""
+        self.assertEqual(self._line_of("""#include <vector>
+class B {
+public:
+    int v;
+    B() { v = 1; }
+    ~B() { }
+};
+int f(void) {
+    B a;
+    B c = a;
+    return c.v;
+}
+""", "no copy constructor"), 10)
+
+    def test_the_count_survives_several_classes(self):
+        """Each class shifts the text by its own difference, so the error
+        compounds without a re-anchor after every one."""
+        self.assertEqual(self._line_of("""#include <vector>
+class A { public: int a; A() { a = 1; } };
+class B {
+public:
+    int v;
+    B() { v = 1; }
+    ~B() { }
+};
+class C { public: int c; C() { c = 3; } };
+int f(void) {
+    A x;
+    C y;
+    B a;
+    B c = a;
+    return c.v + x.a + y.c;
+}
+""", "no copy constructor"), 14)
+
+    def test_the_count_survives_template_instantiation(self):
+        """`vector`, `map`, `string` and `pair` all emit above the call."""
+        self.assertEqual(self._line_of("""#include <vector>
+#include <string>
+#include <map>
+class B {
+public:
+    int v;
+    B() { v = 1; }
+    ~B() { }
+};
+int f(void) {
+    std::vector<int> a;
+    std::map<std::string, int> m;
+    std::string k("x");
+    m[k] = 1;
+    B p;
+    B q = p;
+    return q.v;
+}
+""", "no copy constructor"), 16)
+
+    def test_a_call_rewriting_diagnostic_is_located_too(self):
+        """The other pass of the thirty."""
+        self.assertEqual(self._line_of("""#include <vector>
+class inner {
+public:
+    int v;
+    inner() { v = 0; }
+    ~inner() { }
+    int get() { return v; }
+};
+class outer {
+public:
+    outer() { }
+    inner make() { inner r; return r; }
+};
+int f(void) {
+    outer o;
+    return o.make().get();
+}
+""", "owns a resource"), 16)
+
+    def test_no_anchor_reaches_the_c(self):
+        """A re-anchor per class, so stripping only the origin one left the
+        rest behind as stray typedefs."""
+        out = self.assertLowers("""#include <vector>
+class A { public: int a; A() { a = 1; } };
+class C { public: int c; C() { c = 3; } };
+int f(void) { A x; C y; return x.a + y.c; }
+""")
+        self.assertNotIn("__crust_src_line_", out)
+        self.assertNotIn("typedef int ;", out)
+
+
 def _main():
     argv = [a for a in sys.argv[1:] if a != "--failing"]
     if "--failing" in sys.argv[1:]:
