@@ -291,6 +291,7 @@ class Module:
         self.table_size = 0
         self.table_entries = {}             # table index -> function index
         self.memory_pages = None
+        self.memory_max_pages = -1          # -1 when none was declared
         self.globals = []
         self.exports = []
         self.data_segments = []
@@ -618,7 +619,7 @@ def decode(data):
                 flags = r.byte()
                 mod.memory_pages = r.uleb()
                 if flags:
-                    r.uleb()                        # maximum
+                    mod.memory_max_pages = r.uleb()
         elif sec_id == w.SEC_GLOBAL:
             for _ in range(r.uleb()):
                 vt = r.valtype()
