@@ -57,6 +57,11 @@ class ASMCode:
         self.metamorphic_current = None
         self.pack_args_enabled = False
         self.simd_pack = None
+        # Binary back ends (wasm) put their finished module here instead of
+        # appending assembler text to `lines`; the driver writes it straight to
+        # disk. None for every text target. Declared here rather than
+        # monkey-patched so the transpiler lays out the field.
+        self.wasm_bytes = None
 
     def add(self, cmd):
         """Add a command to the code.
@@ -442,6 +447,8 @@ class ASMGen:
             return self._make_asm_riscv64()
         if self.asm_code.target.name == "m68k":
             return self._make_asm_m68k()
+        if self.asm_code.target.name == "wasm":
+            return self._make_asm_wasm()
 
         global_spotmap = self._get_global_spotmap()
 
@@ -1732,6 +1739,18 @@ class ASMGen:
         import shivyc.il_cmds.value as value_cmds
         import shivyc.il_cmds.math as math_cmds
         import shivyc.il_cmds.compare as cmp_cmds
+
+        if isinstance(cmd, value_cmds.LoadStructArg):
+            # A struct parameter too big for a register on SysV. Here every
+            # struct parameter arrives the same way -- as the address of the
+            # caller's object -- so this is the aggregate LoadArg case again:
+            # copy it into our own frame to make the parameter by value.
+            pidx = self._wasm_argmap.get(id(cmd), 0)
+            self._wasm_push_addr(cmd.output, body)
+            body.local_get(pidx)
+            body.const_i32(cmd.output.ctype.size)
+            body.memory_copy()
+            return
 
         if isinstance(cmd, value_cmds.VaSaveBase):
             # The caller left the base of the all-argument block in x16. That
@@ -3444,6 +3463,18 @@ class ASMGen:
             rc = self._rv_use(cmd.cond, 5, reg_of, slot_of)
             self.asm_code.add(asm_cmds.Raw(
                 "bnez\t%s, %s" % (rc, spots.mangle_symbol(cmd.label))))
+            return
+
+        if isinstance(cmd, value_cmds.LoadStructArg):
+            # A struct parameter too big for a register on SysV. Here every
+            # struct parameter arrives the same way -- as the address of the
+            # caller's object -- so this is the aggregate LoadArg case again:
+            # copy it into our own frame to make the parameter by value.
+            pidx = self._wasm_argmap.get(id(cmd), 0)
+            self._wasm_push_addr(cmd.output, body)
+            body.local_get(pidx)
+            body.const_i32(cmd.output.ctype.size)
+            body.memory_copy()
             return
 
         if isinstance(cmd, value_cmds.VaSaveBase):
@@ -5246,3 +5277,1825 @@ class ASMGen:
 
         # Emit the buffered body after the prologue.
         self.asm_code.lines.extend(body)
+
+    # ======================= WebAssembly (wasm32) back end =======================
+    # The first non-register target, and so the first that shares none of the
+    # middle end above. Two things are structurally different from arm64 /
+    # riscv64 / m68k, and both are worth stating plainly because they are why
+    # none of the shared machinery is reused:
+    #
+    #   Registers. There are none. A wasm function has an unbounded supply of
+    #   typed locals and the engine's own JIT does the real allocation, so
+    #   _il_liveness / _il_intervals / _il_linear_scan are simply not called:
+    #   every IL value gets its own local and that is the end of it. Nothing is
+    #   ever spilled, because there is nothing to spill from.
+    #
+    #   Control flow. wasm has no `goto`. Branches may only exit an enclosing
+    #   block or re-enter an enclosing loop, so the IL's arbitrary
+    #   Label/Jump/JumpZero CFG cannot be emitted edge-for-edge. It is instead
+    #   reconstructed as a dispatch loop: the function body is split into basic
+    #   blocks, a `state` local holds the index of the block to run next, and a
+    #   br_table at the top of a `loop` jumps to it. Every block ends by either
+    #   assigning `state` and branching back to the dispatch, or returning, so
+    #   control never falls from one block into the next.
+    #
+    #   That shape is O(1) to generate and correct for any CFG, at the cost of a
+    #   dispatch per edge. A relooper that recovers the original loops and ifs
+    #   is the obvious follow-up, and it is deliberately confined to
+    #   _wasm_emit_body: nothing else here knows how control flow is spelled.
+    #
+    # Scope is the integer core, exactly as riscv64 started: locals, + - * / %,
+    # the bitwise and shift operators, the six comparisons, if/while, direct
+    # calls and recursion. Floats, pointers, arrays, structs, globals and string
+    # literals all need linear memory and a shadow stack, which is the next
+    # milestone; until then they *refuse* rather than miscompile.
+
+    # Memory layout. Address 0 is left unmapped-in-spirit so that a null
+    # dereference hits the low guard region rather than a real object; static
+    # data starts above it, and the shadow stack sits above that and grows
+    # down.
+    WASM_NULL_GUARD = 1024
+    WASM_STACK_SIZE = 1 << 18          # 256 KiB of shadow stack
+    WASM_PAGE = 65536
+
+    def _wasm_valtype(self, ctype):
+        """The wasm value type for a C type, or a refusal.
+
+        Pointers are the interesting case. wasm32 addresses are 32-bit, but
+        this compiler's `sizeof(void *)` is 8 everywhere -- struct layouts,
+        arrays of pointers and the rest all assume it. Rather than fork the
+        type system for one target, a pointer is carried as an i64 holding a
+        32-bit address and wrapped to i32 at the point of access. The high
+        half is always zero, so nothing is lost.
+        """
+        import shivyc.wasm as wasm
+        if ctype.is_floating():
+            # `long double` is an alias for double in this compiler (size 8),
+            # so there are only the two widths wasm has natively.
+            return wasm.F32 if ctype.size == 4 else wasm.F64
+        if ctype.is_array() or ctype.is_struct_union():
+            # An aggregate is never a value in a local: it lives in the frame
+            # or in static data, and is reached by address. Callers that need
+            # a *value* type for one are asking the wrong question.
+            raise NotImplementedError(
+                "wasm back end: aggregate '%s' cannot be held in a register"
+                % ("array" if ctype.is_array() else "struct"))
+        if ctype.size > 4:
+            return wasm.I64
+        return wasm.I32
+
+    def _wasm_addr_of_stack(self, body):
+        """Wrap the i64 pointer on top of the stack down to an i32 address."""
+        import shivyc.wasm as wasm
+        body.op(wasm.OP_I32_WRAP_I64)
+
+    def _wasm_load_op(self, ctype):
+        """(opcode, align) for a load of `ctype` from linear memory."""
+        import shivyc.wasm as wasm
+        size = ctype.size
+        if ctype.is_floating():
+            return ((wasm.OP_F32_LOAD, 2) if size == 4
+                    else (wasm.OP_F64_LOAD, 3))
+        signed = self._wasm_signed(ctype)
+        if size > 4:                    # i64 destination (long, pointer)
+            return wasm.OP_I64_LOAD, 3
+        if size == 4:
+            return wasm.OP_I32_LOAD, 2
+        if size == 2:
+            return (wasm.OP_I32_LOAD16_S if signed
+                    else wasm.OP_I32_LOAD16_U), 1
+        return (wasm.OP_I32_LOAD8_S if signed else wasm.OP_I32_LOAD8_U), 0
+
+    def _wasm_store_op(self, ctype):
+        """(opcode, align) for a store of `ctype` to linear memory."""
+        import shivyc.wasm as wasm
+        size = ctype.size
+        if ctype.is_floating():
+            return ((wasm.OP_F32_STORE, 2) if size == 4
+                    else (wasm.OP_F64_STORE, 3))
+        if size > 4:
+            return wasm.OP_I64_STORE, 3
+        if size == 4:
+            return wasm.OP_I32_STORE, 2
+        if size == 2:
+            return wasm.OP_I32_STORE16, 1
+        return wasm.OP_I32_STORE8, 0
+
+    def _wasm_signed(self, ctype):
+        """Whether `ctype` is a signed integer. Types with no `signed`
+        attribute (pointers, which are out of scope here anyway) read as
+        unsigned, which is the safe direction for shifts and division."""
+        return bool(getattr(ctype, "signed", False))
+
+    def _wasm_func_sig(self, name):
+        """(params, results) value types for the function called `name`.
+
+        Taken from the symbol table's ctype rather than from the body's
+        LoadArg commands: a parameter that is never read emits no LoadArg, and
+        deriving the arity from the body would then silently produce a
+        signature the call sites disagree with.
+
+        Aggregates never appear as wasm value types. A struct *parameter* is
+        passed as the i32 address of the caller's object, which the callee
+        copies into its own frame on entry -- that copy is what makes the
+        parameter by value. A struct *return* is written through a hidden
+        leading i32 parameter into storage the caller allocated, and the
+        function returns nothing. Both are forced by the same fact: a wasm
+        value type is one of i32/i64/f32/f64, and a struct is none of them.
+        """
+        import shivyc.wasm as wasm
+        var = self.symbol_table.linkages[self.symbol_table.EXTERNAL].get(name)
+        if var is None:
+            var = self.symbol_table.linkages[
+                self.symbol_table.INTERNAL].get(name)
+        if var is None or getattr(var, "ctype", None) is None:
+            raise NotImplementedError(
+                "wasm back end: no signature for function '%s'" % name)
+        ctype = var.ctype
+
+        front_sret, my_sret = self._wasm_sret_kind(ctype)
+        params = []
+        if front_sret:
+            # The front end already turned this into a hidden pointer
+            # parameter (SysV's memory-class return, for a struct over 16
+            # bytes) and made the call void. Nothing to invent here -- just
+            # declare the parameter it is already passing. It is an ordinary
+            # C pointer, so it takes the usual i64 representation.
+            params.append(wasm.I64)
+        elif my_sret:
+            # A struct of 16 bytes or less is returned *by value* by the front
+            # end, because SysV hands it back in registers. wasm has no such
+            # thing: a result is a single value type. So the same hidden
+            # pointer convention is applied here instead, one size band lower.
+            params.append(wasm.I32)
+
+        # A variadic function takes no *declared* wasm parameters: every
+        # argument, named and unnamed alike, arrives through the caller's
+        # argument block. A wasm signature is fixed-arity, so the trailing
+        # arguments have nowhere else to go, and giving the named ones a
+        # separate path would mean two mechanisms where the IL already expects
+        # one (LoadArg carries a base_index into the block for them).
+        if not getattr(ctype, "variadic", False):
+            for a in ctype.args:
+                if a.is_struct_union() or a.is_array():
+                    params.append(wasm.I32)
+                else:
+                    params.append(self._wasm_valtype(a))
+
+        results = []
+        if not ctype.ret.is_void() and not front_sret and not my_sret:
+            results.append(self._wasm_valtype(ctype.ret))
+        return params, results
+
+    def _wasm_sret_kind(self, ctype):
+        """(front_sret, my_sret) for a function ctype.
+
+        An aggregate return reaches this back end in one of two shapes, and
+        which one depends on its size, because the front end implements the
+        SysV rule directly:
+
+          size > 16  -- the front end has *already* rewritten the call: it
+                        allocates the result, passes its address as a hidden
+                        first argument, and marks the call void. There is
+                        nothing to do but declare that parameter.
+          size <= 16 -- SysV returns it in registers, so the front end leaves
+                        it as a by-value result. wasm has no multi-register
+                        return, so the same hidden-pointer trick is applied
+                        here, at a size the front end did not cover.
+
+        Getting this wrong is not subtle: treating the first case like the
+        second passes *two* hidden pointers and every later argument lands one
+        position off.
+        """
+        ret = ctype.ret
+        if not (ret.is_struct_union() or ret.is_array()):
+            return False, False
+        if getattr(ctype, "variadic", False):
+            return False, ret.is_struct_union() or ret.is_array()
+        if ret.is_struct_union() and ret.size > 16:
+            return True, False
+        return False, True
+
+
+    def _wasm_sig_info(self, name):
+        """(agg_ret, sret_offset) for a function: whether it returns an
+        aggregate, and how many hidden parameters precede the declared ones."""
+        var = self.symbol_table.linkages[self.symbol_table.EXTERNAL].get(name)
+        if var is None:
+            var = self.symbol_table.linkages[
+                self.symbol_table.INTERNAL].get(name)
+        if var is None or getattr(var, "ctype", None) is None:
+            return False, 0
+        front_sret, my_sret = self._wasm_sret_kind(var.ctype)
+        # `my_sret` is the only one the back end has to *do* anything about at
+        # a call site; the front end's own sret pointer is already an ordinary
+        # argument by the time it gets here.
+        return my_sret, (1 if (front_sret or my_sret) else 0)
+
+    # The WASI preview-1 functions this back end knows how to import. A C
+    # program does not call these directly -- it calls write(), and the small
+    # C runtime in shivyc/include/wasi.h calls fd_write -- but the names have
+    # to be recognised here so they are imported from the right module.
+    #
+    # Anything not on this list is imported from "env" instead, which is the
+    # convention a plain JS host expects: the program declares `int ext(int);`
+    # without defining it, and the host supplies `env.ext`.
+    WASI_MODULE = "wasi_snapshot_preview1"
+    WASI_FUNCS = ("fd_write", "fd_read", "fd_close", "fd_seek",
+                  "proc_exit", "environ_get", "environ_sizes_get",
+                  "args_get", "args_sizes_get", "random_get",
+                  "clock_time_get", "fd_fdstat_get", "path_open")
+
+    def _wasm_abi_valtype(self, ctype):
+        """Value type for a parameter or result **at an import boundary**.
+
+        Inside the module a pointer is an i64 holding a 32-bit address, which
+        keeps sizeof(void *) == 8 consistent with the rest of the compiler.
+        That representation must not escape to the host: a WASI function's
+        signature is 32-bit throughout, and declaring an import with an i64
+        pointer parameter both fails to match a real WASI host and hands a
+        JavaScript one a BigInt. So a pointer narrows to i32 here, and the
+        call site wraps the value to match.
+        """
+        import shivyc.wasm as wasm
+        if ctype.is_pointer():
+            return wasm.I32
+        return self._wasm_valtype(ctype)
+
+    def _wasm_import_sig(self, name):
+        """(params, results) for an imported function, in the wasm32 ABI."""
+        var = self.symbol_table.linkages[self.symbol_table.EXTERNAL].get(name)
+        if var is None:
+            var = self.symbol_table.linkages[
+                self.symbol_table.INTERNAL].get(name)
+        if var is None or getattr(var, "ctype", None) is None:
+            raise NotImplementedError(
+                "wasm back end: no signature for imported function '%s'"
+                % name)
+        ctype = var.ctype
+        params = []
+        for a in ctype.args:
+            params.append(self._wasm_abi_valtype(a))
+        results = []
+        if not ctype.ret.is_void():
+            results.append(self._wasm_abi_valtype(ctype.ret))
+        return params, results
+
+    def _wasm_import_origin(self, name):
+        """(module, field) an undefined function is imported from."""
+        base = name
+        # The C runtime spells these `__wasi_fd_write` and friends so the
+        # names cannot collide with a user function called `fd_write`.
+        if base.startswith("__wasi_"):
+            base = base[len("__wasi_"):]
+        if base in self.WASI_FUNCS:
+            return self.WASI_MODULE, base
+        return "env", name
+
+    def _wasm_align(self, addr, alignment):
+        """Round `addr` up to a multiple of `alignment`."""
+        rem = addr % alignment
+        if rem:
+            return addr + (alignment - rem)
+        return addr
+
+    def _wasm_alloc_static(self, size, alignment):
+        """Reserve `size` bytes of static data and return the address."""
+        if alignment > 8:
+            alignment = 8
+        if alignment < 1:
+            alignment = 1
+        addr = self._wasm_align(self._wasm_next_addr, alignment)
+        self._wasm_next_addr = addr + (size if size > 0 else 1)
+        return addr
+
+    def _wasm_int_bytes(self, val, size):
+        """`size` bytes of `val`, little-endian -- which is what wasm linear
+        memory is, on every engine, by specification."""
+        v = int(val) & ((1 << (size * 8)) - 1)
+        out = []
+        for _ in range(size):
+            out.append(v & 0xFF)
+            v = v >> 8
+        return out
+
+    def _wasm_float_bytes(self, val, size):
+        """`size` bytes of the IEEE-754 image of `val`, little-endian."""
+        import struct
+        raw = struct.pack("<f" if size == 4 else "<d", float(val))
+        out = []
+        for byte in raw:
+            out.append(byte)
+        return out
+
+    def _wasm_init_bytes(self, val, size):
+        """Byte image of a scalar static initializer, integer or floating."""
+        if isinstance(val, float):
+            return self._wasm_float_bytes(val, size)
+        return self._wasm_int_bytes(val, size)
+
+    def _wasm_layout_statics(self):
+        """Assign addresses to every string literal and static object, then
+        build the byte images of their initializers.
+
+        Two passes, and the split is load-bearing: a static initializer may
+        name another static (`static char *p = "hi";` refers to the literal's
+        address), and that address has to exist before the image referring to
+        it can be built. Placing everything first makes the order in which
+        objects appear irrelevant.
+        """
+        # Symbol name -> address, so a ("sym", name, addend) initializer entry
+        # can be resolved to a number. Wasm has no relocations at this level:
+        # every address is known at compile time and becomes a constant.
+        self._wasm_addr_by_name = {}
+
+        # --- pass 1: assign addresses
+        placed = []
+        snum = 0
+        for v in self.il_code.string_literals:
+            nm = self.il_code.string_literal_names.get(v)
+            if nm is None:
+                nm = "__wasmstr%d" % snum
+                self.il_code.string_literal_names[v] = nm
+            snum += 1
+            chars = self.il_code.string_literals[v]
+            elem = v.ctype.el.size if v.ctype.is_array() else 1
+            data = []
+            for ch in chars:
+                data = data + self._wasm_int_bytes(ch, elem)
+            addr = self._wasm_alloc_static(len(data), elem if elem <= 8 else 8)
+            self._wasm_addr[v] = addr
+            self._wasm_addr_by_name[nm] = addr
+            self._wasm_data.append((addr, data))
+
+        # Every static in the symbol table, not merely those a command
+        # mentions: an object can be referenced only from another object's
+        # initializer (`int g; int *gp = &g;`), in which case it appears in no
+        # IL command at all and would otherwise never be given an address.
+        # The symbol table's order is declaration order, so the layout is
+        # stable between runs.
+        STATIC = self.symbol_table.STATIC
+        seen = {}
+        for v in self.symbol_table.storage:
+            if v in seen:
+                continue
+            if self.symbol_table.storage.get(v) != STATIC:
+                continue
+            if getattr(v, "ctype", None) is None or v.ctype.is_function():
+                continue
+            if getattr(v, "literal", None) is not None:
+                continue
+            seen[v] = 1
+            size = v.ctype.size
+            align = size if size in (1, 2, 4, 8) else 8
+            if v.ctype.is_array():
+                esz = v.ctype.el.size
+                align = esz if esz in (1, 2, 4, 8) else 8
+            addr = self._wasm_alloc_static(size, align)
+            self._wasm_addr[v] = addr
+            nm = self.symbol_table.asm_name(v)
+            if nm is not None:
+                self._wasm_addr_by_name[nm] = addr
+            placed.append(v)
+
+        # --- pass 2: build initializer images
+        for v in placed:
+            self._wasm_place_static(v)
+
+    def _wasm_sym_addr(self, name, addend):
+        """Resolve a symbolic address constant to a number."""
+        addr = self._wasm_addr_by_name.get(name)
+        if addr is None:
+            raise NotImplementedError(
+                "wasm back end: static initializer refers to '%s', which has "
+                "no address in this module" % name)
+        return addr + (addend if addend else 0)
+
+    def _wasm_place_static(self, v):
+        """Build one static object's initializer image at its address."""
+        addr = self._wasm_addr[v]
+        size = v.ctype.size
+
+        if v in self.il_code.static_block_inits:
+            entries, total = self.il_code.static_block_inits[v]
+            data = [0] * total
+            for off, esize, val in entries:
+                if isinstance(val, tuple) and val and val[0] == "sym":
+                    # An address constant. Every address is a compile-time
+                    # constant here -- there is no linker and no relocation --
+                    # so this resolves to a plain number. The stored width is
+                    # whatever the field is; a pointer field is 8 bytes and the
+                    # high half is simply zero.
+                    _, sym, addend = val
+                    img = self._wasm_int_bytes(
+                        self._wasm_sym_addr(sym, addend), esize)
+                else:
+                    img = self._wasm_init_bytes(val, esize)
+                for i in range(esize):
+                    if off + i < total:
+                        data[off + i] = img[i]
+            self._wasm_data.append((addr, data))
+            return
+
+        init = self.il_code.static_inits.get(v, 0)
+        if isinstance(init, tuple) and init and init[0] == "sym":
+            _, sym, addend = init
+            self._wasm_data.append(
+                (addr, self._wasm_int_bytes(
+                    self._wasm_sym_addr(sym, addend), size)))
+            return
+        if init:
+            # A float initializer of 0.0 is skipped by this test, which is
+            # correct: its IEEE image is all-zero bytes and memory starts
+            # zeroed. (-0.0 is not zero-valued in Python's `if`, so it still
+            # gets a segment, as it must.)
+            self._wasm_data.append((addr, self._wasm_init_bytes(init, size)))
+        # An uninitialized static is zero, and linear memory starts zeroed, so
+        # no data segment is needed for it at all.
+
+    def _make_asm_wasm(self):
+        """WebAssembly lowering. Runs only under `--target wasm`.
+
+        Unlike every other back end this writes no assembler text: the module
+        is built as bytes and handed to the driver on `asm_code.wasm_bytes`,
+        which skips `as` and `ld` entirely (see targets.WasmTarget.is_binary).
+        """
+        import shivyc.wasm as wasm
+        import shivyc.il_cmds.control as control
+
+        mod = wasm.WasmModule()
+
+        # Static data first: every global and string literal is given a fixed
+        # address now, so a function body can refer to one as a constant no
+        # matter which order the functions are emitted in.
+        self._wasm_addr = {}            # ILValue -> absolute address
+        self._wasm_data = []            # (address, bytes) to emit
+        self._wasm_next_addr = self.WASM_NULL_GUARD
+        self._wasm_mod = mod
+        self._wasm_layout_statics()
+
+        # The shadow stack sits above the static data. Locals whose address is
+        # taken, and aggregates, live here rather than in wasm locals -- a
+        # wasm local has no address, so `&x` is not expressible for one.
+        stack_low = self._wasm_align(self._wasm_next_addr, 16)
+        stack_top = stack_low + self.WASM_STACK_SIZE
+        pages = (stack_top + self.WASM_PAGE - 1) // self.WASM_PAGE
+        mod.set_memory(pages)
+        self._wasm_sp = mod.add_global_i32(stack_top)
+        # The base of a variadic call's argument block, handed from caller to
+        # callee. This is the same trick the register back ends use -- riscv64
+        # passes it in t0, arm64 in a scratch register -- except that wasm has
+        # no registers, so a global stands in. It is safe for the same reason:
+        # the callee's prologue copies it into a local (VaSaveBase) before it
+        # can make any call of its own that would overwrite it.
+        self._wasm_va_base = mod.add_global_i32(0)
+        for addr, data in self._wasm_data:
+            mod.add_data(addr, data)
+
+        # Imports first: they occupy the low function indices, so every one
+        # must be declared before the first defined function. That means
+        # scanning for calls to undefined functions up front rather than
+        # discovering them while emitting bodies.
+        self._wasm_imports = {}
+        for func in self.il_code.commands:
+            for c in self.il_code.commands[func]:
+                if not isinstance(c, control.Call):
+                    continue
+                nm = c.direct_name
+                if nm is None or nm in self.il_code.commands:
+                    continue            # indirect, or defined here
+                if nm in self._wasm_imports:
+                    continue
+                params, results = self._wasm_import_sig(nm)
+                module, field = self._wasm_import_origin(nm)
+                mod.declare_import(nm, module, field, params, results)
+                self._wasm_imports[nm] = 1
+
+        # A WASI *command* module is entered at `_start`, not at `main`: the
+        # host calls it with no arguments and learns the exit status from
+        # proc_exit. `_start` is synthesised below, so proc_exit has to be
+        # imported here, while imports can still be declared.
+        self._wasm_has_main = "main" in self.il_code.commands
+        if self._wasm_has_main and "__wasi_proc_exit" not in self._wasm_imports:
+            mod.declare_import("__wasi_proc_exit", self.WASI_MODULE,
+                               "proc_exit", [wasm.I32], [])
+            self._wasm_imports["__wasi_proc_exit"] = 1
+
+        # Reserve an index for every defined function *before* emitting any
+        # body, so a call to a function defined later in the file -- or a
+        # mutually recursive pair -- resolves without a second pass.
+        for func in self.il_code.commands:
+            params, results = self._wasm_func_sig(func)
+            mod.declare_func(func, params, results)
+
+        for func in self.il_code.commands:
+            body = self._wasm_function(func, self.il_code.commands[func], mod)
+            mod.set_body(func, body)
+
+        # Export every function with external linkage that we actually define.
+        # The difftest harness calls `main`; exporting the rest costs a few
+        # bytes and makes a module far easier to poke at from the host.
+        EXTERNAL = self.symbol_table.EXTERNAL
+        DEFINED = self.symbol_table.DEFINED
+        exported = {}
+        for v in self.symbol_table.linkages[EXTERNAL].values():
+            if self.symbol_table.def_state.get(v) != DEFINED:
+                continue
+            nm = self.symbol_table.names.get(v)
+            if nm is None or nm in exported:
+                continue
+            if mod.func_index(nm) < 0:
+                continue
+            exported[nm] = 1
+            mod.export_func(nm)
+
+        # The host reads and writes the module's memory directly -- an iovec
+        # handed to fd_write is a pointer into it -- so it must be exported.
+        mod.export_memory = True
+
+        if self._wasm_has_main:
+            self._wasm_emit_start(mod)
+
+        self.asm_code.wasm_bytes = wasm.module_bytes(mod)
+
+    def _wasm_emit_start(self, mod):
+        """Synthesise the WASI entry point.
+
+        `_start` takes nothing and returns nothing; it calls main and hands the
+        result to proc_exit. A process exit status is 8 bits, so the value is
+        masked here rather than left for the host to interpret -- otherwise a
+        main returning -1 would exit with 4294967295.
+
+        main may be declared either `(void)` or `(int, char **)`; the second
+        form gets a zero argc and a null argv, since nothing supplies real
+        arguments yet.
+        """
+        import shivyc.wasm as wasm
+        mod.declare_func("_start", [], [])
+        body = wasm.FuncBody()
+
+        params, results = self._wasm_func_sig("main")
+        for p in params:
+            # argc = 0, argv = NULL.
+            body.const(p, 0)
+        body.call(mod.func_index("main"))
+        if not results:
+            # A void main still has to produce a status for proc_exit.
+            body.const_i32(0)
+        else:
+            if results[0] == wasm.I64:
+                body.op(wasm.OP_I32_WRAP_I64)
+            body.const_i32(0xFF)
+            body.op(wasm.I32_BIN["and"])
+        body.call(mod.func_index("__wasi_proc_exit"))
+        mod.set_body("_start", body)
+        mod.export_func("_start")
+
+    # ---------------------------------------------------------- basic blocks
+
+    def _wasm_is_terminator(self, cmd):
+        """Whether `cmd` ends a basic block."""
+        import shivyc.il_cmds.control as control
+        return isinstance(cmd, control.Jump) \
+            or isinstance(cmd, control.JumpZero) \
+            or isinstance(cmd, control.JumpNotZero) \
+            or isinstance(cmd, control.Return)
+
+    def _wasm_split_blocks(self, cmds):
+        """Split a command list into basic blocks.
+
+        Returns (blocks, label_block) where `blocks` is a list of command
+        lists and `label_block` maps an IL label name to the index of the
+        block it starts. A block begins at a Label or immediately after a
+        terminator, which is the standard partition; the only wrinkle is that
+        consecutive Labels must each get their own (possibly empty) block, so
+        that a jump to either one lands in the right place.
+        """
+        import shivyc.il_cmds.control as control
+
+        blocks = [[]]
+        label_block = {}
+        for cmd in cmds:
+            if isinstance(cmd, control.Label):
+                # Start a fresh block unless the current one is still empty,
+                # in which case reuse it -- otherwise every label would leave
+                # an empty block behind and inflate the dispatch table.
+                if blocks[-1]:
+                    blocks.append([])
+                label_block[cmd.label] = len(blocks) - 1
+                continue
+            blocks[-1].append(cmd)
+            if self._wasm_is_terminator(cmd):
+                blocks.append([])
+
+        # A trailing empty block is harmless but pointless; drop it unless it
+        # is the only block (an empty function body still needs one).
+        if len(blocks) > 1 and not blocks[-1]:
+            # Only safe to drop if no label points at it. If one does, keep it:
+            # it is the natural landing pad for a jump to the end of a function.
+            last = len(blocks) - 1
+            pointed_at = False
+            for lbl in label_block:
+                if label_block[lbl] == last:
+                    pointed_at = True
+            if not pointed_at:
+                blocks.pop()
+
+        return blocks, label_block
+
+    # ------------------------------------------------------- value plumbing
+
+    def _wasm_local(self, value, body, locals_of, nparams):
+        """The local index holding `value`, allocating one on first sight."""
+        idx = locals_of.get(value, -1)
+        if idx >= 0:
+            return idx
+        vt = self._wasm_valtype(value.ctype)
+        rel = body.add_local(vt)
+        idx = nparams + rel
+        locals_of[value] = idx
+        return idx
+
+    def _wasm_scratch(self, body, valtype, nparams):
+        """A reusable scratch local of the given type.
+
+        Needed because a wasm store takes the address *below* the value on the
+        stack, while the rest of the lowering naturally produces the value
+        first. Parking the value in a scratch lets the address be pushed
+        underneath it without re-ordering every caller.
+        """
+        # Reset per function by _wasm_function: these are *local* indices, and
+        # a local index is meaningful only inside the function that declared
+        # it. Caching them across functions silently aims a store at whatever
+        # local happens to share the number in the next one.
+        key = "i64" if valtype == 0x7E else "i32"
+        idx = self._wasm_scratches.get(key, -1)
+        if idx < 0:
+            idx = nparams + body.add_local(valtype)
+            self._wasm_scratches[key] = idx
+        return idx
+
+    def _wasm_push_addr(self, value, body):
+        """Push the i32 address of an object that lives in memory: a static at
+        its fixed address, or a frame slot at $fp + offset."""
+        import shivyc.wasm as wasm
+        addr = self._wasm_addr.get(value)
+        if addr is not None:
+            body.const_i32(addr)
+            return
+        off = self._wasm_slot.get(value)
+        if off is None:
+            raise NotImplementedError(
+                "wasm back end: no address for a value that needs one")
+        body.local_get(self._wasm_fp)
+        if off:
+            body.const_i32(off)
+            body.op(wasm.I32_BIN["add"])
+
+    def _wasm_in_memory(self, value):
+        """Whether `value` lives in linear memory rather than a wasm local."""
+        return value in self._wasm_addr or value in self._wasm_slot
+
+    def _wasm_push(self, value, body, locals_of, nparams):
+        """Push `value` onto the operand stack: an immediate if it is a
+        literal, a load if it lives in memory, otherwise a read of its local."""
+        lit = getattr(value, "literal", None)
+        if lit is not None:
+            vt = self._wasm_valtype(value.ctype)
+            if value.ctype.is_floating():
+                # A float literal's value lives in il_code.float_literals; the
+                # FloatLiteral attached to the value is a marker, and reading
+                # it as an int would silently truncate.
+                body.const(vt, self.il_code.float_literals[value])
+            else:
+                body.const(vt, int(lit.val))
+            return
+        if self._wasm_in_memory(value):
+            if value.ctype.is_array() or value.ctype.is_struct_union():
+                # An aggregate is not a value. Copying one is handled by the
+                # Set case above, which works on addresses; reaching here means
+                # something wants an aggregate *in a register*, which is a
+                # by-value parameter or return this back end does not lower.
+                raise NotImplementedError(
+                    "wasm back end: passing or returning an aggregate by "
+                    "value is not implemented yet")
+            self._wasm_push_addr(value, body)
+            op, align = self._wasm_load_op(value.ctype)
+            body.mem(op, align, 0)
+            return
+        body.local_get(self._wasm_local(value, body, locals_of, nparams))
+
+    def _wasm_pop_into(self, value, body, locals_of, nparams):
+        """Pop the operand stack into `value`'s home."""
+        if self._wasm_in_memory(value):
+            vt = self._wasm_valtype(value.ctype)
+            sc = self._wasm_scratch(body, vt, nparams)
+            body.local_set(sc)
+            self._wasm_push_addr(value, body)
+            body.local_get(sc)
+            op, align = self._wasm_store_op(value.ctype)
+            body.mem(op, align, 0)
+            return
+        body.local_set(self._wasm_local(value, body, locals_of, nparams))
+
+    def _wasm_convert(self, body, to_ctype, from_ctype):
+        """Convert the value on top of the stack from one C type to another.
+
+        Two separate jobs hide here. Changing wasm value type (i32 <-> i64) is
+        a wrap or an extend. Narrowing *within* i32 -- `(char)x`, `(short)x` --
+        changes no wasm type at all but must still discard the high bits, or
+        the next comparison sees a value C says cannot exist.
+        """
+        import shivyc.wasm as wasm
+        to_vt = self._wasm_valtype(to_ctype)
+        from_vt = self._wasm_valtype(from_ctype)
+
+        to_f = to_ctype.is_floating()
+        from_f = from_ctype.is_floating()
+
+        if to_f or from_f:
+            if to_f and from_f:
+                # float <-> double. Same type is a no-op; otherwise demote or
+                # promote. Demotion rounds, which is what C says a narrowing
+                # float conversion does.
+                if to_vt != from_vt:
+                    body.op(wasm.OP_F32_DEMOTE_F64 if to_vt == wasm.F32
+                            else wasm.OP_F64_PROMOTE_F32)
+                return
+            if to_f:
+                # integer -> float. Named by the *source* signedness, and
+                # exact for every value either integer width can hold.
+                src = "i64" if from_vt == wasm.I64 else "i32"
+                sg = self._wasm_signed(from_ctype)
+                table = (wasm.F32_CONVERT if to_vt == wasm.F32
+                         else wasm.F64_CONVERT)
+                body.op(table[(src, sg)])
+                return
+            # float -> integer. C truncates toward zero, which is what the
+            # trunc family does. The saturating form is used so that a value
+            # too large for the destination clamps instead of trapping; C
+            # leaves that case undefined, and a trap would take down the
+            # module over an expression the program may not even use.
+            src = "f32" if from_vt == wasm.F32 else "f64"
+            dst = "i64" if to_vt == wasm.I64 else "i32"
+            sg = self._wasm_signed(to_ctype)
+            body.trunc_sat(dst, src, sg)
+            # A narrow destination (char, short) still needs its high bits
+            # dropped after the conversion.
+            width = 4 if to_vt == wasm.I32 else 8
+            if to_ctype.size < width:
+                self._wasm_truncate(body, to_ctype, to_vt)
+            return
+
+        if to_vt == wasm.I32 and from_vt == wasm.I64:
+            body.op(wasm.OP_I32_WRAP_I64)
+            from_vt = wasm.I32
+        elif to_vt == wasm.I64 and from_vt == wasm.I32:
+            # The *source* type's signedness decides how to widen: widening a
+            # negative int to long must sign-extend, an unsigned int must not.
+            if self._wasm_signed(from_ctype):
+                body.op(wasm.OP_I64_EXTEND_I32_S)
+            else:
+                body.op(wasm.OP_I64_EXTEND_I32_U)
+            from_vt = wasm.I64
+
+        # Narrowing to a sub-word width. The rule is just: if the C type is
+        # narrower than the wasm value type now holding it, the high bits are
+        # not C's to keep. Truncating a value that is already in range is a
+        # semantic no-op, so this needs no cleverness about whether the
+        # previous step happened to leave it canonical -- and the engine folds
+        # the redundant cases anyway.
+        width = 4 if to_vt == wasm.I32 else 8
+        if to_ctype.size < width:
+            self._wasm_truncate(body, to_ctype, to_vt)
+
+    def _wasm_truncate(self, body, ctype, vt):
+        """Reduce the top of stack to `ctype`'s width, sign- or zero-extending
+        back out as C requires."""
+        import shivyc.wasm as wasm
+        if ctype.is_floating():
+            # A float value is always exactly its type's width; there are no
+            # high bits to discard.
+            return
+        size = ctype.size
+        if size >= 8:
+            return
+        if vt == wasm.I32 and size >= 4:
+            return
+        signed = self._wasm_signed(ctype)
+        if signed:
+            if size == 1:
+                body.op(wasm.OP_I32_EXTEND8_S if vt == wasm.I32
+                        else wasm.OP_I64_EXTEND8_S)
+            elif size == 2:
+                body.op(wasm.OP_I32_EXTEND16_S if vt == wasm.I32
+                        else wasm.OP_I64_EXTEND16_S)
+            elif size == 4 and vt == wasm.I64:
+                body.op(wasm.OP_I64_EXTEND32_S)
+            return
+        mask = (1 << (size * 8)) - 1
+        body.const(vt, mask)
+        body.op(wasm.I32_BIN["and"] if vt == wasm.I32 else wasm.I64_BIN["and"])
+
+    # --------------------------------------------------------- function body
+
+    def _wasm_function(self, func, cmds, mod):
+        """Emit the body of one function and return its FuncBody."""
+        import shivyc.wasm as wasm
+        import shivyc.il_cmds.value as value_cmds
+        import shivyc.il_cmds.control as control
+
+        params, results = self._wasm_func_sig(func)
+        nparams = len(params)
+        self._wasm_agg_ret, self._wasm_sret = self._wasm_sig_info(func)
+
+        # Map each LoadArg to the wasm parameter it reads. A map is needed
+        # rather than plain arithmetic on arg_num because the front end's sret
+        # pointer and the first real parameter *both* carry arg_num 0 -- the
+        # register back ends tell them apart by the assigned register, which
+        # wasm does not have. The sret LoadArg is always emitted first, so
+        # position disambiguates them.
+        self._wasm_argmap = {}
+        _first = True
+        _fs = (self._wasm_sret and not self._wasm_agg_ret)
+        _pos = 0
+        for c in cmds:
+            is_la = isinstance(c, value_cmds.LoadArg)
+            is_lsa = isinstance(c, value_cmds.LoadStructArg)
+            if not is_la and not is_lsa:
+                continue
+            if _fs and _first and is_la:
+                # Only the *front end's* sret emits a LoadArg for the hidden
+                # pointer. When this back end synthesises the pointer instead,
+                # no LoadArg reads it, so the first one here is a real
+                # parameter and must not be mapped to slot 0.
+                self._wasm_argmap[id(c)] = 0
+                _first = False
+                continue
+            _first = False
+            if is_la:
+                # arg_num is authoritative for an ordinary parameter.
+                _pos = c.arg_num
+            # LoadStructArg carries no arg_num at all -- it identifies its
+            # parameter by SysV register or stack slot, neither of which
+            # exists here -- so its position is tracked by counting. The front
+            # end emits one load per declared parameter, in order, so the
+            # count and the declaration order agree.
+            self._wasm_argmap[id(c)] = _pos + self._wasm_sret
+            _pos += 1
+
+        body = wasm.FuncBody()
+        locals_of = {}
+        self._wasm_scratches = {}
+
+        # Which values must live in the frame rather than in a wasm local?
+        # Two kinds: anything whose address is taken (a wasm local has no
+        # address, so `&x` cannot be formed for one), and any aggregate (too
+        # big for a value type at all). Everything else stays a local.
+        import shivyc.il_cmds.value as vcmds
+        STATIC = self.symbol_table.STATIC
+        forced = {}
+        for c in cmds:
+            if isinstance(c, vcmds.AddrOf) and not c.var.ctype.is_function():
+                if self.symbol_table.storage.get(c.var) != STATIC:
+                    forced[c.var] = 1
+        for c in cmds:
+            for v in c.inputs() + c.outputs():
+                if v is None or getattr(v, "literal", None) is not None:
+                    continue
+                if self.symbol_table.storage.get(v) == STATIC:
+                    continue
+                if v.ctype.is_array() or v.ctype.is_struct_union():
+                    # Aggregates always live in the frame; they have no value
+                    # type, so _wasm_valtype must not be asked about them.
+                    forced[v] = 1
+                else:
+                    self._wasm_valtype(v.ctype)   # refuse floats early
+
+        # A variadic call needs a contiguous block of 8-byte slots in *this*
+        # function's frame to stage its arguments in. Reserve enough for the
+        # widest such call; they cannot overlap in time, so one block serves
+        # all of them.
+        va_out = 0
+        for c in cmds:
+            if isinstance(c, control.Call) and getattr(c, "variadic", False):
+                need = 8 * len(c.args)
+                if need > va_out:
+                    va_out = need
+
+        # Lay the forced values out in the frame.
+        self._wasm_slot = {}
+        frame = 0
+        for v in forced:
+            size = v.ctype.size
+            align = 8
+            if size in (1, 2, 4):
+                align = size
+            frame = self._wasm_align(frame, align)
+            self._wasm_slot[v] = frame
+            frame += size if size > 0 else 1
+        # The outgoing block sits above the forced values, at a known offset.
+        self._wasm_va_out = -1
+        if va_out:
+            frame = self._wasm_align(frame, 8)
+            self._wasm_va_out = frame
+            frame += va_out
+        frame = self._wasm_align(frame, 16)
+
+        # `state` holds the index of the basic block to run next. It is the
+        # only piece of state the dispatch needs, and it is an ordinary local
+        # like any other.
+        state_local = nparams + body.add_local(wasm.I32)
+
+        # The frame pointer, when this function needs a frame at all. A leaf
+        # that takes no addresses and holds no aggregates needs none, and pays
+        # nothing: no prologue, no epilogue, no global traffic.
+        self._wasm_frame = frame
+        self._wasm_fp = -1
+        if frame:
+            self._wasm_fp = nparams + body.add_local(wasm.I32)
+
+        blocks, label_block = self._wasm_split_blocks(cmds)
+
+        # A LoadArg must either name a real wasm parameter or carry a base
+        # into the caller's argument block. Anything else would read a local
+        # that does not exist.
+        for c in cmds:
+            if isinstance(c, value_cmds.LoadArg):
+                if c.base is None and c.arg_num >= nparams:
+                    raise NotImplementedError(
+                        "wasm back end: parameter %d has no home (function "
+                        "declares %d)" % (c.arg_num, nparams))
+
+        # Prologue: claim the frame by lowering the shadow stack pointer, and
+        # keep its base in $fp. Emitted before the dispatch loop, so it runs
+        # exactly once however control flows afterwards.
+        if frame:
+            body.global_get(self._wasm_sp)
+            body.const_i32(frame)
+            body.op(wasm.I32_BIN["sub"])
+            body.op_u(wasm.OP_LOCAL_TEE, self._wasm_fp)
+            body.global_set(self._wasm_sp)
+
+        self._wasm_emit_body(body, blocks, label_block, state_local,
+                             locals_of, nparams, results, mod, func)
+        return body
+
+    def _wasm_epilogue(self, body):
+        """Give the frame back. Emitted at every return, since a wasm function
+        can leave from any point and there is no single exit to hang it on."""
+        import shivyc.wasm as wasm
+        if self._wasm_frame:
+            body.local_get(self._wasm_fp)
+            body.const_i32(self._wasm_frame)
+            body.op(wasm.I32_BIN["add"])
+            body.global_set(self._wasm_sp)
+
+    def _wasm_emit_body(self, body, blocks, label_block, state_local,
+                        locals_of, nparams, results, mod, func):
+        """Emit the dispatch loop and every basic block inside it.
+
+        The shape is:
+
+            loop $L                     ;; re-entered once per CFG edge
+              block $b_{n-1}
+                ...
+                  block $b_0
+                    local.get $state
+                    br_table 0 1 .. n-1 (default n-1)
+                  end                   ;; branching to $b_0 lands here
+                  <block 0>
+                end                     ;; ... $b_1 lands here
+                <block 1>
+              ...
+            end
+            unreachable
+
+        Branching to depth i exits blocks b_0..b_i and resumes just past b_i's
+        `end`, which is exactly where block i's code sits. Every block ends in
+        a `br` back to $L or a `return`, so the fallthrough from one block's
+        code into the next block's `end` never happens.
+        """
+        import shivyc.wasm as wasm
+
+        n = len(blocks)
+
+        body.loop()
+        for _ in range(n):
+            body.block()
+
+        body.local_get(state_local)
+        depths = []
+        for i in range(n):
+            depths.append(i)
+        # Any index outside the table takes the default. `state` is only ever
+        # written from this generator, so it cannot actually go out of range;
+        # the default is required by the encoding regardless.
+        body.br_table(depths, n - 1)
+
+        for i in range(n):
+            body.end()
+            # Depth from here back to the enclosing loop: blocks b_0..b_i have
+            # been closed, so b_{i+1}..b_{n-1} plus the loop still enclose us.
+            loop_depth = n - 1 - i
+            self._wasm_emit_block(body, blocks[i], i, n, loop_depth,
+                                  label_block, state_local, locals_of,
+                                  nparams, results, mod, func)
+
+        body.end()                       # close the loop
+        # The loop is only ever left by a `return` from inside a block, so
+        # falling out of it is unreachable. Saying so keeps the body
+        # well-typed without inventing a return value.
+        body.op(wasm.OP_UNREACHABLE)
+
+    def _wasm_goto(self, body, target_block, loop_depth, state_local):
+        """Emit an unconditional transfer to `target_block`: set the dispatch
+        state and branch back to the loop header."""
+        body.const_i32(target_block)
+        body.local_set(state_local)
+        body.br(loop_depth)
+
+    def _wasm_emit_block(self, body, cmds, blk_idx, nblocks, loop_depth,
+                         label_block, state_local, locals_of, nparams,
+                         results, mod, func):
+        """Emit one basic block, terminator included."""
+        import shivyc.wasm as wasm
+        import shivyc.il_cmds.control as control
+
+        for cmd in cmds:
+            if self._wasm_is_terminator(cmd):
+                break
+            self._lower_wasm(cmd, body, locals_of, nparams, mod)
+
+        term = None
+        if cmds and self._wasm_is_terminator(cmds[-1]):
+            term = cmds[-1]
+
+        nxt = blk_idx + 1
+
+        if term is None:
+            # Fell off the end of the block. If another block follows, this is
+            # a plain fallthrough edge; if not, control ran off the end of the
+            # function.
+            if nxt < nblocks:
+                self._wasm_goto(body, nxt, loop_depth, state_local)
+            elif not results:
+                self._wasm_epilogue(body)
+                body.op(wasm.OP_RETURN)
+            else:
+                # Running off the end of a value-returning function is
+                # undefined in C. `unreachable` traps instead of returning
+                # garbage, which is the more useful failure.
+                body.op(wasm.OP_UNREACHABLE)
+            return
+
+        if isinstance(term, control.Return):
+            if getattr(self, "_wasm_agg_ret", False) and term.arg is not None:
+                # Write the result into the caller's destination, whose
+                # address arrived as the hidden leading parameter, then return
+                # nothing.
+                body.local_get(0)
+                self._wasm_push_addr(term.arg, body)
+                body.const_i32(term.arg.ctype.size)
+                body.memory_copy()
+                self._wasm_epilogue(body)
+                body.op(wasm.OP_RETURN)
+                return
+            if results and term.arg is None:
+                # The front end appends an implicit valueless Return to close
+                # every function, including value-returning ones -- reaching it
+                # means control ran off the end, which C leaves undefined. A
+                # bare `return` here would not type-check (wasm wants the
+                # result on the stack), and inventing a zero would invent an
+                # answer, so trap instead.
+                body.op(wasm.OP_UNREACHABLE)
+                return
+            if term.arg is not None and results:
+                self._wasm_push(term.arg, body, locals_of, nparams)
+                self._wasm_convert(body, self._wasm_ret_ctype(func),
+                                   term.arg.ctype)
+            # Release the frame before leaving. The return value is already on
+            # the stack and the epilogue is stack-neutral, so it does not
+            # disturb it.
+            self._wasm_epilogue(body)
+            body.op(wasm.OP_RETURN)
+            return
+
+        if isinstance(term, control.Jump):
+            self._wasm_goto(body, label_block[term.label], loop_depth,
+                            state_local)
+            return
+
+        # Conditional. Both candidate block indices are pushed, then `select`
+        # picks between them on the condition -- which keeps the `br` outside
+        # any nested construct, so `loop_depth` stays valid. (An if/else here
+        # would put the branch one level deeper and require adjusting it.)
+        taken = label_block[term.label]
+        body.const_i32(taken)
+        body.const_i32(nxt)
+        self._wasm_push(term.cond, body, locals_of, nparams)
+        cond_vt = self._wasm_valtype(term.cond.ctype)
+        if isinstance(term, control.JumpZero):
+            # select keeps the first operand when the condition is non-zero,
+            # so the condition to compute is `cond == 0`.
+            body.op(wasm.OP_I32_EQZ if cond_vt == wasm.I32
+                    else wasm.OP_I64_EQZ)
+        else:                            # JumpNotZero
+            if cond_vt == wasm.I64:
+                # select's condition must be i32; reduce the i64 to a 0/1
+                # flag by double negation rather than wrapping, which would
+                # lose a set bit above bit 32.
+                body.op(wasm.OP_I64_EQZ)
+                body.op(wasm.OP_I32_EQZ)
+        body.op(wasm.OP_SELECT)
+        body.local_set(state_local)
+        body.br(loop_depth)
+
+    def _wasm_ret_ctype(self, func):
+        """The declared return type of `func`, for converting a returned
+        value that the front end left at a different width."""
+        var = self.symbol_table.linkages[self.symbol_table.EXTERNAL].get(func)
+        if var is None:
+            var = self.symbol_table.linkages[
+                self.symbol_table.INTERNAL].get(func)
+        return var.ctype.ret
+
+    # --------------------------------------------------- instruction selection
+
+    def _wasm_binop_name(self, cmd, math_cmds, signed):
+        """Mnemonic suffix for an arithmetic / bitwise IL command."""
+        if isinstance(cmd, math_cmds.Add):
+            return "add"
+        if isinstance(cmd, math_cmds.Subtr):
+            return "sub"
+        if isinstance(cmd, math_cmds.Mult):
+            return "mul"
+        if isinstance(cmd, math_cmds.Div):
+            return "div_s" if signed else "div_u"
+        if isinstance(cmd, math_cmds.Mod):
+            return "rem_s" if signed else "rem_u"
+        if isinstance(cmd, math_cmds.BitAnd):
+            return "and"
+        if isinstance(cmd, math_cmds.BitOr):
+            return "or"
+        if isinstance(cmd, math_cmds.BitXor):
+            return "xor"
+        if isinstance(cmd, math_cmds.LBitShift):
+            return "shl"
+        if isinstance(cmd, math_cmds.RBitShift):
+            # C's >> on a signed value is arithmetic, on an unsigned value
+            # logical. wasm spells that as two different instructions.
+            return "shr_s" if signed else "shr_u"
+        return None
+
+    def _wasm_cmp_name(self, cmd, cmp_cmds, signed):
+        """Mnemonic suffix for a comparison IL command."""
+        if isinstance(cmd, cmp_cmds.EqualCmp):
+            return "eq"
+        if isinstance(cmd, cmp_cmds.NotEqualCmp):
+            return "ne"
+        if isinstance(cmd, cmp_cmds.LessCmp):
+            return "lt_s" if signed else "lt_u"
+        if isinstance(cmd, cmp_cmds.GreaterCmp):
+            return "gt_s" if signed else "gt_u"
+        if isinstance(cmd, cmp_cmds.LessOrEqCmp):
+            return "le_s" if signed else "le_u"
+        if isinstance(cmd, cmp_cmds.GreaterOrEqCmp):
+            return "ge_s" if signed else "ge_u"
+        return None
+
+    def _lower_wasm(self, cmd, body, locals_of, nparams, mod):
+        """Lower one non-terminator IL command into `body`.
+
+        Terminators are handled by _wasm_emit_block, which owns the dispatch
+        state; everything else is a straightforward stack-machine expansion:
+        push the operands, apply the operator, pop into the output's local.
+        """
+        import shivyc.wasm as wasm
+        import shivyc.il_cmds.control as control
+        import shivyc.il_cmds.value as value_cmds
+        import shivyc.il_cmds.math as math_cmds
+        import shivyc.il_cmds.compare as cmp_cmds
+
+        if isinstance(cmd, value_cmds.LoadArg):
+            if cmd.base is not None:
+                # A named parameter of a variadic function. It lives in the
+                # caller's argument block, not in a wasm parameter -- the
+                # function has none -- at a fixed 8-byte slot.
+                self._wasm_push(cmd.base, body, locals_of, nparams)
+                self._wasm_addr_of_stack(body)
+                op, align = self._wasm_load_op(cmd.output.ctype)
+                # Slots are 8 bytes and little-endian, so a narrower load from
+                # the slot's start reads the right bytes; the store side
+                # widened the value to fill the slot.
+                body.mem(op, 0, 8 * cmd.base_index)
+                self._wasm_pop_into(cmd.output, body, locals_of, nparams)
+                return
+            pidx = self._wasm_argmap.get(id(cmd), cmd.arg_num)
+            if cmd.output.ctype.is_struct_union() \
+                    or cmd.output.ctype.is_array():
+                # A struct parameter arrives as the address of the caller's
+                # object. Copying it into our own frame here is what makes the
+                # parameter by *value*: the callee may then modify it freely
+                # without the caller seeing the change.
+                self._wasm_push_addr(cmd.output, body)
+                body.local_get(pidx)
+                body.const_i32(cmd.output.ctype.size)
+                body.memory_copy()
+                return
+            # Parameters are already locals 0..n-1; copy into the value's own
+            # local so later writes to it cannot disturb the incoming argument.
+            body.local_get(pidx)
+            self._wasm_pop_into(cmd.output, body, locals_of, nparams)
+            return
+
+        if isinstance(cmd, value_cmds.LoadStructArg):
+            # A struct parameter too big for a register on SysV. Here every
+            # struct parameter arrives the same way -- as the address of the
+            # caller's object -- so this is the aggregate LoadArg case again:
+            # copy it into our own frame to make the parameter by value.
+            pidx = self._wasm_argmap.get(id(cmd), 0)
+            self._wasm_push_addr(cmd.output, body)
+            body.local_get(pidx)
+            body.const_i32(cmd.output.ctype.size)
+            body.memory_copy()
+            return
+
+        if isinstance(cmd, value_cmds.VaSaveBase):
+            # The caller left the block's address in the va-base global; take a
+            # private copy before anything else can disturb it.
+            body.global_get(self._wasm_va_base)
+            body.op(wasm.OP_I64_EXTEND_I32_U)
+            self._wasm_pop_into(cmd.output, body, locals_of, nparams)
+            return
+
+        if isinstance(cmd, value_cmds.VaStartAddr):
+            # va_start: point the list just past the named parameters.
+            if cmd.base is None:
+                raise NotImplementedError(
+                    "wasm back end: va_start without a caller-provided "
+                    "argument block is not implemented")
+            self._wasm_push(cmd.base, body, locals_of, nparams)
+            if cmd.named_count:
+                body.const_i64(8 * cmd.named_count)
+                body.op(wasm.I64_BIN["add"])
+            self._wasm_pop_into(cmd.output, body, locals_of, nparams)
+            return
+
+        if isinstance(cmd, value_cmds.Set):
+            out = cmd.output
+            if out.ctype.is_array() or out.ctype.is_struct_union():
+                # Struct assignment. Both sides live in memory, so this is a
+                # block copy: memory.copy takes (dest, src, len) and is
+                # defined to handle overlap, which matters because assigning
+                # from an overlapping source is legal C.
+                if out.ctype.size != cmd.arg.ctype.size:
+                    raise NotImplementedError(
+                        "wasm back end: aggregate assignment between "
+                        "different sizes (%d and %d)"
+                        % (out.ctype.size, cmd.arg.ctype.size))
+                self._wasm_push_addr(out, body)
+                self._wasm_push_addr(cmd.arg, body)
+                body.const_i32(out.ctype.size)
+                body.memory_copy()
+                return
+            self._wasm_push(cmd.arg, body, locals_of, nparams)
+            self._wasm_convert(body, cmd.output.ctype, cmd.arg.ctype)
+            self._wasm_pop_into(cmd.output, body, locals_of, nparams)
+            return
+
+        if isinstance(cmd, math_cmds.Neg) or isinstance(cmd, math_cmds.Not):
+            out = cmd.output
+            vt = self._wasm_valtype(out.ctype)
+            if out.ctype.is_floating():
+                if isinstance(cmd, math_cmds.Not):
+                    # ~ has no meaning on a floating operand; the front end
+                    # should have rejected this.
+                    raise NotImplementedError(
+                        "wasm back end: bitwise complement of a floating "
+                        "value is not a valid operation")
+                self._wasm_push(cmd.arg, body, locals_of, nparams)
+                self._wasm_convert(body, out.ctype, cmd.arg.ctype)
+                # f*.neg flips the sign bit. Computing 0 - x instead would be
+                # wrong for -0.0, which must negate to +0.0 rather than to
+                # -0.0 as the subtraction would give.
+                body.op(wasm.OP_F32_NEG if vt == wasm.F32
+                        else wasm.OP_F64_NEG)
+                self._wasm_pop_into(out, body, locals_of, nparams)
+                return
+            if isinstance(cmd, math_cmds.Neg):
+                # wasm has no unary negate: 0 - x.
+                body.const(vt, 0)
+                self._wasm_push(cmd.arg, body, locals_of, nparams)
+                self._wasm_convert(body, out.ctype, cmd.arg.ctype)
+                body.op(wasm.I32_BIN["sub"] if vt == wasm.I32
+                        else wasm.I64_BIN["sub"])
+            else:
+                # ...nor a bitwise complement: x ^ -1.
+                self._wasm_push(cmd.arg, body, locals_of, nparams)
+                self._wasm_convert(body, out.ctype, cmd.arg.ctype)
+                body.const(vt, -1)
+                body.op(wasm.I32_BIN["xor"] if vt == wasm.I32
+                        else wasm.I64_BIN["xor"])
+            self._wasm_truncate(body, out.ctype, vt)
+            self._wasm_pop_into(out, body, locals_of, nparams)
+            return
+
+        name = self._wasm_binop_name(cmd, math_cmds,
+                                     self._wasm_signed(
+                                         cmd.outputs()[0].ctype)
+                                     if cmd.outputs() else True)
+        if name is not None:
+            ins = cmd.inputs()
+            out = cmd.outputs()[0]
+            vt = self._wasm_valtype(out.ctype)
+            if out.ctype.is_floating():
+                # The name was chosen using integer signedness, which a float
+                # type does not have -- `/` arrives here as "div_u" because
+                # _wasm_signed reads a missing `signed` attribute as unsigned.
+                # Strip the suffix; a float operation has only one form.
+                fname = name.split("_")[0]
+                if fname not in ("add", "sub", "mul", "div"):
+                    # %, the bitwise operators and the shifts have no floating
+                    # form in C either.
+                    raise NotImplementedError(
+                        "wasm back end: '%s' is not defined on floating "
+                        "operands" % fname)
+                self._wasm_push(ins[0], body, locals_of, nparams)
+                self._wasm_convert(body, out.ctype, ins[0].ctype)
+                self._wasm_push(ins[1], body, locals_of, nparams)
+                self._wasm_convert(body, out.ctype, ins[1].ctype)
+                body.op(wasm.F32_BIN[fname] if vt == wasm.F32
+                        else wasm.F64_BIN[fname])
+                self._wasm_pop_into(out, body, locals_of, nparams)
+                return
+            # The IL documents that a binop's three values share a type, but
+            # converting each operand to the output type anyway costs nothing
+            # when that holds and keeps a shift by a differently-sized count
+            # correct when it does not.
+            self._wasm_push(ins[0], body, locals_of, nparams)
+            self._wasm_convert(body, out.ctype, ins[0].ctype)
+            self._wasm_push(ins[1], body, locals_of, nparams)
+            self._wasm_convert(body, out.ctype, ins[1].ctype)
+            body.op(wasm.I32_BIN[name] if vt == wasm.I32
+                    else wasm.I64_BIN[name])
+            # Sub-word arithmetic can carry out of the C type's width, so
+            # bring the result back into range before it is stored.
+            self._wasm_truncate(body, out.ctype, vt)
+            self._wasm_pop_into(out, body, locals_of, nparams)
+            return
+
+        cname = self._wasm_cmp_name(cmd, cmp_cmds, True)
+        if cname is not None:
+            ins = cmd.inputs()
+            out = cmd.outputs()[0]
+            if ins[0].ctype.is_floating() or ins[1].ctype.is_floating():
+                # Compare at the wider of the two float types, promoting an
+                # integer operand if one side is not floating at all.
+                a, b = ins[0], ins[1]
+                op_ctype = a.ctype if (a.ctype.is_floating() and
+                                       (not b.ctype.is_floating() or
+                                        a.ctype.size >= b.ctype.size)) \
+                    else b.ctype
+                op_vt = self._wasm_valtype(op_ctype)
+                self._wasm_push(a, body, locals_of, nparams)
+                self._wasm_convert(body, op_ctype, a.ctype)
+                self._wasm_push(b, body, locals_of, nparams)
+                self._wasm_convert(body, op_ctype, b.ctype)
+                # Strip the _s/_u suffix the integer namer added: a float
+                # comparison has no signedness.
+                fname = cname.split("_")[0]
+                body.op(wasm.F32_CMP[fname] if op_vt == wasm.F32
+                        else wasm.F64_CMP[fname])
+                out_vt = self._wasm_valtype(out.ctype)
+                if out_vt == wasm.I64:
+                    body.op(wasm.OP_I64_EXTEND_I32_U)
+                self._wasm_pop_into(out, body, locals_of, nparams)
+                return
+            # The comparison happens at the *operands'* width and signedness;
+            # the result is always an int (i32), regardless.
+            a, b = ins[0], ins[1]
+            op_ctype = a.ctype if a.ctype.size >= b.ctype.size else b.ctype
+            signed = self._wasm_signed(a.ctype) and self._wasm_signed(b.ctype)
+            cname = self._wasm_cmp_name(cmd, cmp_cmds, signed)
+            op_vt = self._wasm_valtype(op_ctype)
+            self._wasm_push(a, body, locals_of, nparams)
+            self._wasm_convert(body, op_ctype, a.ctype)
+            self._wasm_push(b, body, locals_of, nparams)
+            self._wasm_convert(body, op_ctype, b.ctype)
+            body.op(wasm.I32_CMP[cname] if op_vt == wasm.I32
+                    else wasm.I64_CMP[cname])
+            # Comparisons yield i32 0/1; widen if the output is a long.
+            out_vt = self._wasm_valtype(out.ctype)
+            if out_vt == wasm.I64:
+                body.op(wasm.OP_I64_EXTEND_I32_U)
+            self._wasm_pop_into(out, body, locals_of, nparams)
+            return
+
+        if isinstance(cmd, control.Call):
+            fname = cmd.direct_name
+            if fname is None:
+                self._wasm_indirect_call(cmd, body, locals_of, nparams, mod)
+                return
+
+            idx = mod.func_index(fname)
+            if idx < 0:
+                raise NotImplementedError(
+                    "wasm back end: call to '%s', which is neither defined "
+                    "here nor importable" % fname)
+            is_import = fname in getattr(self, "_wasm_imports", {})
+            if is_import:
+                params, results = self._wasm_import_sig(fname)
+            else:
+                params, results = self._wasm_func_sig(fname)
+            # The variadic path is taken before the arity check: a variadic
+            # callee declares no wasm parameters at all, so its "arity" never
+            # matches the call's argument count and never should.
+            if getattr(cmd, "variadic", False):
+                self._wasm_variadic_call(cmd, idx, body, locals_of, nparams)
+                if cmd.void_return or not results:
+                    if results:
+                        body.op(wasm.OP_DROP)
+                    return
+                self._wasm_pop_into(cmd.ret, body, locals_of, nparams)
+                return
+
+            # `callee_agg_ret` is true only when *this* back end synthesises
+            # the hidden pointer. When the front end already did (a struct
+            # over 16 bytes), the pointer is simply cmd.args[0] and the call
+            # needs no special treatment at all -- so `extra` counts only the
+            # pointer we have to add ourselves.
+            callee_agg_ret = False
+            front_callee = False
+            if not is_import:
+                callee_agg_ret, _ = self._wasm_sig_info(fname)
+                front_callee = self._wasm_front_sret(fname)
+            extra = 1 if callee_agg_ret else 0
+            if len(cmd.args) + extra != len(params):
+                raise NotImplementedError(
+                    "wasm back end: call to '%s' with %d arguments but %d "
+                    "parameters" % (fname, len(cmd.args), len(params)))
+
+            if callee_agg_ret:
+                # The destination for the returned struct goes in first. It is
+                # cmd.ret's own storage -- an aggregate, so it already has a
+                # frame slot -- which means the callee writes the result
+                # straight where it is wanted, with no extra copy.
+                self._wasm_push_addr(cmd.ret, body)
+
+            # Arguments are pushed left to right; wasm pops them into the
+            # callee's locals in the same order, so no shuffling is needed.
+            i = 0
+            first_arg = True
+            for arg in cmd.args:
+                if front_callee and first_arg:
+                    # The front end's hidden result pointer. It is not a
+                    # declared parameter, so it has no entry in ctype.args and
+                    # must not consume an index -- it is just an ordinary
+                    # pointer value, passed through unchanged.
+                    first_arg = False
+                    self._wasm_push(arg, body, locals_of, nparams)
+                    continue
+                first_arg = False
+                if arg.ctype.is_struct_union() or arg.ctype.is_array():
+                    # Pass the address; the callee makes its own copy.
+                    self._wasm_push_addr(arg, body)
+                    i += 1
+                    continue
+                pctype = self._wasm_arg_ctype(fname, i)
+                self._wasm_push(arg, body, locals_of, nparams)
+                self._wasm_convert(body, pctype, arg.ctype)
+                if is_import and pctype.is_pointer():
+                    # Narrow the i64 pointer to the i32 address the host's
+                    # 32-bit signature declares.
+                    body.op(wasm.OP_I32_WRAP_I64)
+                i += 1
+            body.call(idx)
+            if callee_agg_ret:
+                # Nothing came back on the stack; the result is already in
+                # cmd.ret's storage.
+                return
+            if cmd.void_return or not results:
+                # A non-void callee whose result is discarded still leaves a
+                # value on the stack, and wasm validation rejects that.
+                if results:
+                    body.op(wasm.OP_DROP)
+                return
+            if is_import and cmd.ret.ctype.is_pointer():
+                # The host returned a 32-bit address; widen it back to the
+                # i64 a pointer is carried in.
+                body.op(wasm.OP_I64_EXTEND_I32_U)
+            self._wasm_pop_into(cmd.ret, body, locals_of, nparams)
+            return
+
+        if isinstance(cmd, value_cmds.AddrOf):
+            # &x. The object was forced into memory precisely so this address
+            # exists; producing it is just its frame slot or static address,
+            # widened to the i64 a pointer is carried in.
+            if cmd.var.ctype.is_function():
+                # A function pointer is its index in the module's function
+                # table -- wasm has no code addresses, and an indirect call
+                # names a table slot. Index 0 is left empty, so a null pointer
+                # traps when called rather than dispatching somewhere.
+                fname = self.symbol_table.names.get(cmd.var)
+                if fname is None or mod.func_index(fname) < 0:
+                    raise NotImplementedError(
+                        "wasm back end: address taken of function '%s', which "
+                        "is not in this module" % fname)
+                body.const_i32(mod.table_index(fname))
+                body.op(wasm.OP_I64_EXTEND_I32_U)
+                self._wasm_pop_into(cmd.output, body, locals_of, nparams)
+                return
+            self._wasm_push_addr(cmd.var, body)
+            body.op(wasm.OP_I64_EXTEND_I32_U)
+            self._wasm_pop_into(cmd.output, body, locals_of, nparams)
+            return
+
+        if isinstance(cmd, value_cmds.ReadAt):
+            if cmd.output.ctype.is_array() \
+                    or cmd.output.ctype.is_struct_union():
+                self._wasm_push_addr(cmd.output, body)
+                self._wasm_push(cmd.addr, body, locals_of, nparams)
+                self._wasm_addr_of_stack(body)
+                body.const_i32(cmd.output.ctype.size)
+                body.memory_copy()
+                return
+            # *p
+            self._wasm_push(cmd.addr, body, locals_of, nparams)
+            self._wasm_addr_of_stack(body)
+            op, align = self._wasm_load_op(cmd.output.ctype)
+            body.mem(op, align, 0)
+            self._wasm_pop_into(cmd.output, body, locals_of, nparams)
+            return
+
+        if isinstance(cmd, value_cmds.SetAt):
+            if cmd.val.ctype.is_array() or cmd.val.ctype.is_struct_union():
+                self._wasm_push(cmd.addr, body, locals_of, nparams)
+                self._wasm_addr_of_stack(body)
+                self._wasm_push_addr(cmd.val, body)
+                body.const_i32(cmd.val.ctype.size)
+                body.memory_copy()
+                return
+            # *p = v. Address first, then the value: the order wasm wants.
+            self._wasm_push(cmd.addr, body, locals_of, nparams)
+            self._wasm_addr_of_stack(body)
+            self._wasm_push(cmd.val, body, locals_of, nparams)
+            op, align = self._wasm_store_op(cmd.val.ctype)
+            body.mem(op, align, 0)
+            return
+
+        if isinstance(cmd, value_cmds.ReadRel):
+            if cmd.output.ctype.is_array() \
+                    or cmd.output.ctype.is_struct_union():
+                # Reading a whole aggregate out of an array element or member:
+                # a block copy into the destination's own storage. Destination
+                # address first, since that is memory.copy's operand order.
+                self._wasm_push_addr(cmd.output, body)
+                self._wasm_rel_addr(cmd, body, locals_of, nparams)
+                body.const_i32(cmd.output.ctype.size)
+                body.memory_copy()
+                return
+            self._wasm_rel_addr(cmd, body, locals_of, nparams)
+            op, align = self._wasm_load_op(cmd.output.ctype)
+            body.mem(op, align, 0)
+            self._wasm_pop_into(cmd.output, body, locals_of, nparams)
+            return
+
+        if isinstance(cmd, value_cmds.SetRel):
+            if cmd.val.ctype.is_array() or cmd.val.ctype.is_struct_union():
+                # Storing a whole aggregate into an array element or member.
+                self._wasm_rel_addr(cmd, body, locals_of, nparams)
+                self._wasm_push_addr(cmd.val, body)
+                body.const_i32(cmd.val.ctype.size)
+                body.memory_copy()
+                return
+            self._wasm_rel_addr(cmd, body, locals_of, nparams)
+            self._wasm_push(cmd.val, body, locals_of, nparams)
+            op, align = self._wasm_store_op(cmd.val.ctype)
+            body.mem(op, align, 0)
+            return
+
+        if isinstance(cmd, value_cmds.AddrRel):
+            self._wasm_rel_addr(cmd, body, locals_of, nparams)
+            body.op(wasm.OP_I64_EXTEND_I32_U)
+            self._wasm_pop_into(cmd.output, body, locals_of, nparams)
+            return
+
+        raise NotImplementedError(
+            "wasm back end: IL command '%s' not implemented yet"
+            % type(cmd).__name__)
+
+    def _wasm_rel_base(self, base, body, locals_of, nparams):
+        """Push the i32 base address for a relative access.
+
+        A base is one of three things, exactly as on the register back ends: a
+        static object (its fixed address), an aggregate in the frame (its
+        address, not its contents), or an ordinary pointer value (already an
+        address, carried as i64).
+        """
+        if base in self._wasm_addr:
+            self._wasm_push_addr(base, body)
+            return
+        if base.ctype.is_array() or base.ctype.is_struct_union():
+            self._wasm_push_addr(base, body)
+            return
+        self._wasm_push(base, body, locals_of, nparams)
+        self._wasm_addr_of_stack(body)
+
+    def _wasm_rel_addr(self, cmd, body, locals_of, nparams):
+        """Push the i32 address `base + chunk*count` used by the Rel commands.
+
+        `count` may be absent (a plain displacement, e.g. a struct member) or
+        a literal (a constant index), in which case the whole offset folds
+        into a single constant add rather than a runtime multiply.
+        """
+        import shivyc.wasm as wasm
+        self._wasm_rel_base(cmd.base, body, locals_of, nparams)
+
+        if not cmd.count:
+            if cmd.chunk:
+                body.const_i32(cmd.chunk)
+                body.op(wasm.I32_BIN["add"])
+            return
+
+        lit = getattr(cmd.count, "literal", None)
+        if lit is not None:
+            off = int(lit.val) * cmd.chunk
+            if off:
+                body.const_i32(off)
+                body.op(wasm.I32_BIN["add"])
+            return
+
+        # Runtime index. The count is a full-width integer; narrow it to the
+        # i32 the address arithmetic is done in, then scale by the element
+        # size.
+        self._wasm_push(cmd.count, body, locals_of, nparams)
+        if self._wasm_valtype(cmd.count.ctype) == wasm.I64:
+            body.op(wasm.OP_I32_WRAP_I64)
+        if cmd.chunk != 1:
+            body.const_i32(cmd.chunk)
+            body.op(wasm.I32_BIN["mul"])
+        body.op(wasm.I32_BIN["add"])
+
+    def _wasm_indirect_call(self, cmd, body, locals_of, nparams, mod):
+        """A call through a function pointer.
+
+        The pointer holds a table index rather than a code address, so this is
+        `call_indirect`: arguments first, the index on top, and a signature
+        that the engine checks at run time. A mismatch traps -- which is
+        stricter than the register back ends, where calling through a
+        wrongly-typed pointer just runs.
+
+        The signature comes from the pointer's pointee type rather than from
+        the argument values, so that an implicit conversion at the call site
+        cannot silently produce a signature the callee does not have.
+        """
+        import shivyc.wasm as wasm
+        fctype = cmd.func.ctype
+        if fctype.is_pointer():
+            fctype = fctype.arg
+        if not fctype.is_function():
+            raise NotImplementedError(
+                "wasm back end: indirect call through a non-function pointer")
+        variadic = getattr(fctype, "variadic", False)
+        front_sret, my_sret = self._wasm_sret_kind(fctype)
+
+        # Build the callee's signature exactly as _wasm_func_sig would for a
+        # direct call, so a pointer and the function it points at agree. They
+        # must: call_indirect compares the two at run time and traps if they
+        # differ, so any disagreement here shows up as a trap rather than as a
+        # quietly wrong call.
+        params = []
+        if front_sret:
+            params.append(wasm.I64)
+        elif my_sret:
+            params.append(wasm.I32)
+        if not variadic:
+            for a in fctype.args:
+                if a.is_struct_union() or a.is_array():
+                    params.append(wasm.I32)
+                else:
+                    params.append(self._wasm_valtype(a))
+        results = []
+        if not fctype.ret.is_void() and not front_sret and not my_sret:
+            results.append(self._wasm_valtype(fctype.ret))
+
+        if variadic:
+            # A variadic callee takes no declared parameters: the arguments go
+            # into a block in this frame and the base travels in the va-base
+            # global, exactly as for a direct variadic call. Only the dispatch
+            # differs.
+            self._wasm_stage_variadic_args(cmd, body, locals_of, nparams)
+        else:
+            extra = 1 if my_sret else 0
+            if len(cmd.args) + extra != len(params):
+                raise NotImplementedError(
+                    "wasm back end: indirect call with %d arguments but %d "
+                    "parameters" % (len(cmd.args), len(params)))
+            if my_sret:
+                self._wasm_push_addr(cmd.ret, body)
+            i = 0
+            first_arg = True
+            for arg in cmd.args:
+                if front_sret and first_arg:
+                    first_arg = False
+                    self._wasm_push(arg, body, locals_of, nparams)
+                    continue
+                first_arg = False
+                if arg.ctype.is_struct_union() or arg.ctype.is_array():
+                    self._wasm_push_addr(arg, body)
+                    i += 1
+                    continue
+                self._wasm_push(arg, body, locals_of, nparams)
+                self._wasm_convert(body, fctype.args[i], arg.ctype)
+                i += 1
+
+        # The table index goes on top, above the arguments.
+        self._wasm_push(cmd.func, body, locals_of, nparams)
+        self._wasm_addr_of_stack(body)
+        mod.needs_table = True
+        body.call_indirect(mod.type_index(params, results))
+
+        if my_sret:
+            return                       # the result is already in cmd.ret
+        if cmd.void_return or not results:
+            if results:
+                body.op(wasm.OP_DROP)
+            return
+        self._wasm_pop_into(cmd.ret, body, locals_of, nparams)
+
+    def _wasm_variadic_call(self, cmd, idx, body, locals_of, nparams):
+        """Stage a variadic call's arguments and transfer the block's address.
+
+        Every argument -- named and unnamed alike -- goes into one contiguous
+        run of 8-byte slots in this function's frame, and the block's address
+        is handed over in the va-base global. The callee then reads its named
+        parameters out of the block by index and walks the rest with va_arg.
+
+        Each slot is 8 bytes regardless of the argument's own width, because
+        that is what va_arg's pointer arithmetic assumes. Narrow integers are
+        widened and floats are promoted to double, which is what C's default
+        argument promotions require of an unprototyped argument anyway.
+        """
+        self._wasm_stage_variadic_args(cmd, body, locals_of, nparams)
+        # The callee takes no wasm parameters; everything travelled in the
+        # block.
+        body.call(idx)
+
+    def _wasm_stage_variadic_args(self, cmd, body, locals_of, nparams):
+        """Fill the outgoing argument block and publish its address.
+
+        Shared by direct and indirect variadic calls -- only the dispatch
+        instruction afterwards differs.
+        """
+        import shivyc.wasm as wasm
+        if self._wasm_va_out < 0:
+            raise NotImplementedError(
+                "wasm back end: no outgoing block reserved for a variadic "
+                "call")
+        off = self._wasm_va_out
+        for arg in cmd.args:
+            body.local_get(self._wasm_fp)
+            if arg.ctype.is_floating():
+                # Default argument promotion: float becomes double.
+                self._wasm_push(arg, body, locals_of, nparams)
+                if self._wasm_valtype(arg.ctype) == wasm.F32:
+                    body.op(wasm.OP_F64_PROMOTE_F32)
+                body.mem(wasm.OP_F64_STORE, 0, off)
+            else:
+                # Widen to fill the slot so a later narrow load from its start
+                # reads defined bytes rather than whatever was there before.
+                self._wasm_push(arg, body, locals_of, nparams)
+                if self._wasm_valtype(arg.ctype) == wasm.I32:
+                    if self._wasm_signed(arg.ctype):
+                        body.op(wasm.OP_I64_EXTEND_I32_S)
+                    else:
+                        body.op(wasm.OP_I64_EXTEND_I32_U)
+                body.mem(wasm.OP_I64_STORE, 0, off)
+            off += 8
+
+        body.local_get(self._wasm_fp)
+        if self._wasm_va_out:
+            body.const_i32(self._wasm_va_out)
+            body.op(wasm.I32_BIN["add"])
+        body.global_set(self._wasm_va_base)
+
+    def _wasm_front_sret(self, fname):
+        """Whether the front end already rewrote calls to `fname` to pass a
+        hidden result pointer as their first argument."""
+        var = self.symbol_table.linkages[self.symbol_table.EXTERNAL].get(fname)
+        if var is None:
+            var = self.symbol_table.linkages[
+                self.symbol_table.INTERNAL].get(fname)
+        if var is None or getattr(var, "ctype", None) is None:
+            return False
+        front, _ = self._wasm_sret_kind(var.ctype)
+        return front
+
+    def _wasm_arg_ctype(self, fname, i):
+        """Declared type of parameter `i` of function `fname`."""
+        var = self.symbol_table.linkages[self.symbol_table.EXTERNAL].get(fname)
+        if var is None:
+            var = self.symbol_table.linkages[
+                self.symbol_table.INTERNAL].get(fname)
+        return var.ctype.args[i]

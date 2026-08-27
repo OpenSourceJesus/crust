@@ -51,7 +51,7 @@ def _concat_adjacent_strings(tokens):
         i += 1
     return out
 from shivyc.asm_gen import ASMCode, ASMGen
-from shivyc.targets import get_target
+from shivyc.targets import get_target, is_known_target
 
 
 def default_target():
@@ -282,6 +282,21 @@ def main():
 
     # -S: assembly already written by process_c_file; nothing to assemble/link.
     if getattr(arguments, "asm_only", False):
+        return 0
+
+    # A binary back end emits a finished, self-contained module per source
+    # file; there is no object format and no linker for it here, so the work
+    # is done. Multi-file programs for such a target need the front end to
+    # merge translation units first -- refuse rather than silently emit only
+    # the last module.
+    _tgt = get_target(getattr(arguments, "target", "x86_64"))
+    if _tgt.is_binary:
+        if len(objs) > 1:
+            error_collector.add(CompilerError(
+                "target '%s' cannot link multiple files; compile one "
+                "translation unit at a time" % _tgt.name))
+            error_collector.show()
+            return 1
         return 0
 
     # -c: compile and assemble only, leaving the .o files; do not link.
@@ -934,6 +949,28 @@ def process_c_file(file, args):
             asm_code.add_weak(alias_name)
         asm_code.add_alias(alias_name, target)
 
+    # A binary back end (wasm) has already produced its finished artifact;
+    # there is no assembler text, so `as` and `ld` are skipped entirely and the
+    # module bytes are the compiler's output. -S has nothing separate to show
+    # for these targets, so it publishes the same file.
+    if asm_code.target.is_binary:
+        if asm_code.wasm_bytes is None:
+            error_collector.add(CompilerError(
+                "%s back end produced no output" % asm_code.target.name))
+            return None
+        out_file = file[:-2] + asm_code.target.output_ext
+        out_names = getattr(args, "output_name", None)
+        if out_names and len(out_names) == 1:
+            out_file = out_names[0]
+        try:
+            with open(out_file, "wb") as _f:
+                _f.write(asm_code.wasm_bytes)
+        except IOError as e:
+            error_collector.add(CompilerError("could not write %s: %s"
+                                              % (out_file, e)))
+            return None
+        return out_file
+
     asm_source = asm_code.full_code()
     if not error_collector.ok():
         return None
@@ -1290,9 +1327,29 @@ def get_arguments(argv=None):
                                  "TikZ call graph, and the run output in an "
                                  "appendix). Output directory defaults to /tmp.")
 
-        return parser.parse_args()
+        return _validate_target(parser.parse_args())
 
-    return _parse_args_selfhost(argv)
+    return _validate_target(_parse_args_selfhost(argv))
+
+
+def _validate_target(args):
+    """Reject an unrecognized --target instead of silently falling back.
+
+    shivyc.targets.get_target returns x86-64 for any name it does not know, so
+    that a bad name cannot crash the compiler -- but that means a typo used to
+    produce a working x86-64 ELF with no diagnostic at all. That is merely
+    confusing when the intended target was another ELF architecture, and
+    actively misleading now that a target can emit a different *kind* of
+    artifact: `--target wasm32x` would quietly hand back a linked executable
+    where a .wasm module was asked for. The targets module already documents
+    that front ends should validate the name; this is that check.
+    """
+    name = getattr(args, "target", None)
+    if name and not is_known_target(name):
+        error_collector.add(CompilerError(
+            "unrecognized target '%s'; known targets are x86_64, arm64, "
+            "riscv64, m68k, wasm" % name))
+    return args
 
 
 def read_file(file):
