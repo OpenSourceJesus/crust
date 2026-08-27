@@ -439,6 +439,22 @@ def arith_conversion_type(type1, type2):
     #     return type2_promo.make_unsigned()
 
 
+def integer_promote(value, il_code):
+    """Apply the C integer promotions to a single ILValue.
+
+    Every integer type narrower than `int` can be represented by `int`, so it
+    converts to `int`; anything already at least that wide is unchanged. This
+    is the *per-operand* half of the conversion rules -- `arith_convert` then
+    brings a pair to a common type on top of it. The shift operators need only
+    this half, since their operands are promoted independently (C99 6.5.7p3).
+    """
+    if not value.ctype.is_integral():
+        return value
+    if value.ctype.size < 4:
+        return set_type(value, ctypes.integer, il_code)
+    return value
+
+
 def arith_convert(left, right, il_code):
     """Cast two arithmetic ILValues to a common converted type."""
     ctype = arith_conversion_type(left.ctype, right.ctype)
