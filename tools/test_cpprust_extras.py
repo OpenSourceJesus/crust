@@ -2145,6 +2145,91 @@ int f(void) { T t; return t.n; }
 """, "int arr[3]; int n;")
 
 
+class TestDeductionScope(Base):
+    """Deduction reads only the scopes still open at the call.
+
+    Searching backwards for the nearest declaration is right *within* one
+    scope, but a file has many. A local in an unrelated function above the
+    call, or in an `if` block earlier in the same function, was nearer than
+    the global the call actually meant -- and answered, deducing
+    `sort_string` for an `int *`. Wrong rather than declined, which is the
+    worse of the two failures.
+
+    The rule is one line of C++: a brace region that opened and closed
+    before the call is out of scope; one still open encloses it.
+    """
+
+    def test_another_functions_local_does_not_answer(self):
+        self.assertLowers("""
+#include <algorithm>
+#include <vector>
+#include <string>
+int *data;
+void earlier(void) {
+    std::vector<std::string> v;
+    std::string *data = v.begin();
+}
+int f(void) {
+    static int store[4];
+    data = store;
+    std::sort(data, data + 4);
+    return 0;
+}
+""", "sort_int")
+
+    def test_a_closed_inner_block_does_not_answer(self):
+        """The nested case: same function, but the block has ended."""
+        self.assertLowers("""
+#include <algorithm>
+#include <vector>
+#include <string>
+int *p;
+int f(void) {
+    static int store[2];
+    if (store[0] > 0) {
+        std::vector<std::string> inner;
+        std::string *p = inner.begin();
+    }
+    p = store;
+    std::sort(p, p + 2);
+    return 0;
+}
+""", "sort_int")
+
+    def test_a_local_still_shadows_a_global(self):
+        """Narrowing what is visible must not lose the nearest-wins rule
+        inside what remains."""
+        self.assertLowers("""
+#include <algorithm>
+#include <vector>
+#include <string>
+std::string *data;
+int f(void) {
+    std::vector<int> w;
+    int *data = w.begin();
+    std::sort(data, data + 2);
+    return 0;
+}
+""", "sort_int")
+
+    def test_an_enclosing_block_is_still_visible(self):
+        """A scope still open at the call encloses it, however deep."""
+        self.assertLowers("""
+#include <algorithm>
+#include <vector>
+int f(void) {
+    std::vector<int> w;
+    int *p = w.begin();
+    if (w.size() > 0) {
+        for (int k = 0; k < 1; k = k + 1) {
+            std::sort(p, p + 2);
+        }
+    }
+    return 0;
+}
+""", "sort_int")
+
+
 def _main():
     argv = [a for a in sys.argv[1:] if a != "--failing"]
     if "--failing" in sys.argv[1:]:

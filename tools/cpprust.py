@@ -184,7 +184,10 @@ The subset, deliberately small:
     argument whose pointee this file declares -- a container's `begin()`,
     an array, or a pointer local. A deduced call is rewritten to spell its
     arguments the long way and the ordinary substitution runs on that, so
-    both forms take one code path. `map` is left out on purpose: its
+    both forms take one code path. Only the scopes still open at the call
+    are read -- a brace region that closed above it is skipped -- so
+    another function's locals, or an earlier block's, cannot answer for a
+    name they merely share. `map` is left out on purpose: its
     iterator is a `pair<K,V> *`, so deducing `K` from `m.begin()` would be
     wrong rather than merely unsupported. Anything else -- a call result,
     a by-value parameter, more than one template parameter -- is reported,
@@ -1583,6 +1586,41 @@ def _last_before(pat, scan, at, lo=0):
     return found
 
 
+def _visible_view(scan, lo, at):
+    """`scan` with every scope that has already *closed* blanked out.
+
+    What a declaration search may see. Searching backwards for the nearest
+    declaration is right within one scope, but a file has many: a local in
+    an unrelated function above the call is nearer than the global the call
+    actually means, and a local in an `if` block earlier in the same
+    function is nearer still. Both would answer, and answering with the
+    wrong type is worse than declining -- it deduced `sort_string` for an
+    `int *`.
+
+    The rule is one line of C++: a brace region that opened and closed
+    before the call is out of scope; one still open at the call encloses
+    it. So every complete `{...}` above the call is blanked and the rest
+    left alone, which leaves exactly the enclosing function's own text, the
+    blocks around the call, and file scope. Blanked rather than cut so the
+    offsets still line up with `scan`.
+
+    Order within a scope is still the backwards search's job -- this says
+    which text is eligible, not which match wins.
+    """
+    buf = list(scan)
+    stack = []
+    for mm in re.finditer(r"[{}]", scan[lo:at]):
+        pos = lo + mm.start()
+        if mm.group(0) == "{":
+            stack.append(pos)
+        elif stack:
+            open_at = stack.pop()
+            for k in range(open_at, pos + 1):
+                if buf[k] != "\n":
+                    buf[k] = " "
+    return "".join(buf)
+
+
 def _pointee_of(expr, scan, at):
     """`T` for an expression of type `T *`, or None if that is not clear.
 
@@ -1599,6 +1637,9 @@ def _pointee_of(expr, scan, at):
     # the call could possibly have meant.
     origin = scan.rfind(_SRC_MARK, 0, at)
     lo = origin + len(_SRC_MARK) if origin >= 0 else 0
+    # And not into a scope that has already closed -- another function, or
+    # a block earlier in this one.
+    scan = _visible_view(scan, lo, at)
     # `first + i`, `v.end() - 1`: pointer arithmetic does not change the
     # pointee, so the operand carries the type.
     while True:
@@ -1613,10 +1654,10 @@ def _pointee_of(expr, scan, at):
     mm = re.match(r"^(\w+)\s*(?:\.|->)\s*(?:begin|end|rbegin|rend|ptr)"
                   r"\s*\(", e)
     if mm:
-        decl = _last_before(re.compile(
+        cont_pat = re.compile(
             r"(?<![\w])(%s)\s*<([^<>]*)>\s+%s\s*[;=,)]"
-            % ("|".join(_ELEM_CONTAINERS), re.escape(mm.group(1)))),
-            scan, at, lo)
+            % ("|".join(_ELEM_CONTAINERS), re.escape(mm.group(1))))
+        decl = _last_before(cont_pat, scan, at, lo)
         if decl:
             first = _split_top(decl.group(2))[0].strip()
             return first or None
@@ -1631,24 +1672,24 @@ def _pointee_of(expr, scan, at):
         # `(` as well as the rest: `string x("alpha");` is a declaration
         # of `x` whose type is followed by a constructor argument list, and
         # it is the ordinary way to declare an owning local.
-        d = _last_before(re.compile(
-            r"(?<![\w*])([A-Za-z_]\w*)\s+%s\s*[;=,)(]" % re.escape(base)),
-            scan, at, lo)
+        val_pat = re.compile(
+            r"(?<![\w*])([A-Za-z_]\w*)\s+%s\s*[;=,)(]" % re.escape(base))
+        d = _last_before(val_pat, scan, at, lo)
         if d and d.group(1) not in _DECL_NOISE:
             return d.group(1)
         return None
     if not re.match(r"^\w+$", e):
         return None
     # A local or parameter declared `T *name`.
-    d = _last_before(re.compile(
-        r"(?<![\w])([A-Za-z_]\w*)\s*\*\s*%s\s*[;=,)]" % re.escape(e)),
-        scan, at, lo)
+    ptr_pat = re.compile(
+        r"(?<![\w])([A-Za-z_]\w*)\s*\*\s*%s\s*[;=,)]" % re.escape(e))
+    d = _last_before(ptr_pat, scan, at, lo)
     if d and d.group(1) not in _DECL_NOISE:
         return d.group(1)
     # An array `T name[..]`, which decays to `T *`.
-    d = _last_before(re.compile(
-        r"(?<![\w])([A-Za-z_]\w*)\s+%s\s*\[" % re.escape(e)),
-        scan, at, lo)
+    arr_pat = re.compile(
+        r"(?<![\w])([A-Za-z_]\w*)\s+%s\s*\[" % re.escape(e))
+    d = _last_before(arr_pat, scan, at, lo)
     if d and d.group(1) not in _DECL_NOISE:
         return d.group(1)
     return None
