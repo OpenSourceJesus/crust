@@ -95,6 +95,15 @@ roundtrip_wasm:
 test_wasm_simd:
 	python3 tools/wasm_simd_difftest.py -v
 
+# Run a real third-party module under node and under its wasm2c translation
+# and compare every export's result *and* a hash of linear memory:
+#     make test_wasm_module MODULES="a.wasm b.wasm"
+MODULES ?=
+test_wasm_module:
+	@if [ -z "$(MODULES)" ]; then \
+	  echo "usage: make test_wasm_module MODULES=\"path/to/a.wasm ...\""; \
+	else python3 tools/wasm_module_difftest.py $(MODULES); fi
+
 # Translate a .wasm back to C:  make wasm2c WASM=prog.wasm
 WASM ?= build/wasm/hello.wasm
 wasm2c:

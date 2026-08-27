@@ -400,13 +400,39 @@ these loops perfectly well.
 
 ### What real modules do
 
-Three third-party modules, all built by toolchains other than this one:
+Three third-party modules, all built by toolchains other than this one, and
+all of them *run*, not merely compile:
 
-| Module | Functions | Instructions | SIMD | Result |
-| --- | --- | --- | --- | --- |
-| `qcms_bg.wasm` (Rust) | 138 | 41,660 | 0 | 45k lines of C, compiles |
-| `jbig2.wasm` | 121 | 49,924 | 709 | 55k lines of C, compiles |
-| `openjpeg.wasm` | 202 | 112,690 | 1,790 | 119k lines of C, compiles |
+| Module | Functions | Instructions | SIMD | C lines | Checks |
+| --- | --- | --- | --- | --- | --- |
+| `qcms_bg.wasm` (Rust) | 138 | 41,660 | 0 | 45k | 84 pass |
+| `jbig2.wasm` | 121 | 49,924 | 709 | 55k | 20 pass |
+| `openjpeg.wasm` | 202 | 112,690 | 1,790 | 119k | 16 pass |
+
+`tools/wasm_module_difftest.py` calls every export with a fixed argument
+vector under node and under the translated C, and compares the return value
+*and a hash of the whole of linear memory*. The memory hash is what makes it
+worth running: a wrong store offset, a lane written in the wrong order, a load
+that sign-extends when it should not -- none of those need change a return
+value, but all of them change memory.
+
+Each export runs in its own process, because a trap on the C side exits and
+there would be no way to reach the next one. Imports are stubbed to return
+zero on both sides -- not a simulation of the host, but a *deterministic* one,
+which is all the comparison needs.
+
+Two caveats worth stating. The arguments are generic (0, 1, 16, 1024), so
+these calls reach the modules' entry points and allocators rather than every
+SIMD kernel inside them; driving `jbig2` with a real image would exercise far
+more. And a stubbed host means code paths that depend on host replies are not
+reached at all.
+
+### Linear memory grows
+
+Memory is `calloc`ed and `realloc`ed rather than a fixed array, because real
+modules grow it -- an allocator does so on its first call, and a fixed array
+turns that into a trap. `memory.grow` honours the module's declared maximum
+and zeroes the new pages, as the specification requires.
 
 ## Testing
 
@@ -415,6 +441,7 @@ make test_wasm                       # fixed corpus vs gcc
 make roundtrip_wasm                  # C -> wasm -> C -> native, vs gcc
 make fuzz_wasm SEED=3 COUNT=300      # random programs vs gcc
 make test_wasm_simd                  # SIMD translation vs node
+make test_wasm_module MODULES=x.wasm # run a real module both ways
 make wasm2c WASM=prog.wasm           # translate one module back to C
 ```
 
