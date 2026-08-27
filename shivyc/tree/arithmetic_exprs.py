@@ -5,7 +5,8 @@ import shivyc.il_cmds.math as math_cmds
 from shivyc.errors import CompilerError
 from shivyc.il_gen import ILValue
 from shivyc.tree.expr_base import _RExprNode
-from shivyc.tree.utils import arith_convert, get_size, shift_into_range
+from shivyc.tree.utils import (arith_convert, get_size, integer_promote,
+                                shift_into_range)
 
 
 class _ArithBinOp(_RExprNode):
@@ -30,7 +31,7 @@ class _ArithBinOp(_RExprNode):
         right = self.right.make_il(il_code, symbol_table, c)
 
         if self._check_type(left, right):
-            left, right = arith_convert(left, right, il_code)
+            left, right = self._convert_operands(left, right, il_code)
 
             if left.literal and right.literal:
                 if left.ctype.is_floating():
@@ -74,6 +75,20 @@ class _ArithBinOp(_RExprNode):
         right - ILValue for right operand
         """
         return left.ctype.is_arith() and right.ctype.is_arith()
+
+    def _convert_operands(self, left, right, il_code):
+        """Convert the operands to the types the operation computes in.
+
+        Almost every arithmetic operator uses the *usual arithmetic
+        conversions*, which bring both operands to one common type -- so that
+        is the default. The shift operators are the exception and override
+        this; see _BitShift.
+
+        Returns the converted (left, right) pair. `left.ctype` afterwards is
+        taken as the type of the result, by both _arith and the constant
+        folding above, so an override must leave the result type on the left.
+        """
+        return arith_convert(left, right, il_code)
 
     def _arith(self, left, right, il_code):
         """Return the result of this operation on given arithmetic operands.
@@ -327,6 +342,25 @@ class _BitShift(_IntBinOp):
     def __init__(self, left, right, op):
         """Initialize node."""
         super().__init__(left, right, op)
+
+    def _convert_operands(self, left, right, il_code):
+        """Promote each operand on its own, rather than to a common type.
+
+        C99 6.5.7p3: "The integer promotions are performed on each of the
+        operands. The type of the result is that of the promoted left
+        operand." A shift is not a symmetric arithmetic operation -- the right
+        operand is a bit count, not a value the result is computed from -- so
+        the usual arithmetic conversions do not apply to it.
+
+        Using them anyway is wrong in a way that survives the shift itself:
+        `int >> unsigned` would convert the *left* operand to unsigned, and
+        while the shifted bits come out identical, the result's type does not.
+        Any comparison consuming it then runs unsigned, so a subsequent
+        `>= -423` sees a huge number instead of a negative one and silently
+        takes the wrong branch.
+        """
+        return (integer_promote(left, il_code),
+                integer_promote(right, il_code))
 
     def _nonarith(self, left, right, il_code):
         err = "invalid operand types for bitwise shift"
