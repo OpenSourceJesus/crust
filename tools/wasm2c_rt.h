@@ -22,6 +22,7 @@
 #ifndef WASM2C_RT_H
 #define WASM2C_RT_H
 
+#include <stdio.h>
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
@@ -41,10 +42,10 @@ typedef double f64;
 /* A wasm trap. The generated code has no way to unwind, and a trap is
  * unrecoverable for our purposes, so this exits with a distinctive status. */
 static void wasm_trap(const char *what) {
-    /* Written with write(2) rather than fprintf so that a trap inside a
-     * program that is having its stdout compared cannot interleave with it. */
-    extern int fputs(const char *, void *);
-    extern void *stderr;
+    /* To stderr, so a trap cannot interleave with the stdout a differential
+     * test is comparing. An earlier version hand-declared `stderr` to avoid
+     * including <stdio.h>; that conflicts with the real declaration the
+     * moment any other header pulls stdio in, so it is included properly. */
     fputs("wasm trap: ", stderr);
     fputs(what, stderr);
     fputs("\n", stderr);

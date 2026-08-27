@@ -44,6 +44,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import shivyc.wasm as w                                       # noqa: E402
 import shivyc.wasm_reader as reader                           # noqa: E402
+import shivyc.wasm_simd as simd                               # noqa: E402
+import shivyc.wasm_simd_c as simd_c                           # noqa: E402
 
 
 class Wasm2CError(Exception):
@@ -57,6 +59,7 @@ VALTYPE = {
     w.I64: ("u64", "j"),
     w.F32: ("f32", "f"),
     w.F64: ("f64", "d"),
+    reader.V128: ("v128", "v"),
 }
 
 # Binary operators that are a plain C infix expression on the wasm type.
@@ -270,7 +273,7 @@ class FunctionWriter:
             self.instr(ins, func, ftype, nparams)
 
         decls = []
-        for vt in (w.I32, w.I64, w.F32, w.F64):
+        for vt in (w.I32, w.I64, w.F32, w.F64, reader.V128):
             n = self.max_depth.get(vt, 0)
             if n:
                 names = []
@@ -455,8 +458,175 @@ class FunctionWriter:
                       % (dst_a, val, n))
             return
 
+        # ---- SIMD
+        if self._is_simd(op):
+            self._simd(ins)
+            return
+
         # ---- numeric
         self._numeric(op)
+
+    # -- SIMD --------------------------------------------------------------
+
+    def _is_simd(self, op):
+        if op.startswith("v128."):
+            return True
+        for shape in simd.SHAPES:
+            if op.startswith(shape + "."):
+                return True
+        return False
+
+    def _simd(self, ins):
+        """Lower one SIMD instruction.
+
+        Almost everything goes through the generated handler table in
+        wasm_simd_c; only the operators carrying an immediate (a lane index,
+        a shuffle mask, a literal vector) are emitted here, because the
+        immediate has to be spliced into the C text.
+        """
+        op = ins.op
+        V = reader.V128
+
+        if simd.is_relaxed(op):
+            # Relaxed SIMD leaves its results implementation defined by
+            # design. Translating it would mean picking one behaviour and
+            # presenting it as the answer, which is worse than refusing.
+            raise Wasm2CError(
+                "relaxed SIMD operator '%s' has implementation-defined "
+                "results and is not translated" % op)
+
+        if op == "v128.const":
+            dst = self.push(V)
+            byts = ", ".join(["%d" % b for b in ins.args[0]])
+            self.emit("{ static const u8 _c[16] = {%s}; "
+                      "memcpy(%s.bytes, _c, 16); }" % (byts, dst))
+            return
+
+        if op == "i8x16.shuffle":
+            b, _ = self.pop()
+            a, _ = self.pop()
+            dst = self.push(V)
+            sel = ins.args[0]
+            # Selectors 0..15 index the first vector, 16..31 the second.
+            parts = []
+            for k in range(16):
+                s_k = sel[k]
+                src = a if s_k < 16 else b
+                parts.append("%s.u8x16[%d]" % (src, s_k & 15))
+            self.emit("{ v128 _t; %s %s = _t; }"
+                      % (" ".join(["_t.u8x16[%d] = %s;" % (k, parts[k])
+                                   for k in range(16)]), dst))
+            return
+
+        if ".extract_lane" in op:
+            shape = op.split(".")[0]
+            lanes, uf, sf, is_float = simd.SHAPES[shape]
+            src, _ = self.pop()
+            rt = {"i8x16": w.I32, "i16x8": w.I32, "i32x4": w.I32,
+                  "i64x2": w.I64, "f32x4": w.F32, "f64x2": w.F64}[shape]
+            dst = self.push(rt)
+            field = sf if op.endswith("_s") else uf
+            cast = ""
+            if op.endswith("_s"):
+                cast = "(u32)(s32)"
+            self.emit("%s = %s%s.%s[%d];" % (dst, cast, src, field,
+                                             ins.args[0]))
+            return
+
+        if ".replace_lane" in op:
+            shape = op.split(".")[0]
+            lanes, uf, sf, is_float = simd.SHAPES[shape]
+            val, _ = self.pop()
+            vec, _ = self.pop()
+            dst = self.push(V)
+            self.emit("%s = %s; %s.%s[%d] = %s;"
+                      % (dst, vec, dst, uf, ins.args[0], val))
+            return
+
+        if op.startswith("v128.load") and op.endswith("_lane"):
+            width = op[len("v128.load"):-len("_lane")]
+            field = {"8": "u8x16", "16": "u16x8",
+                     "32": "u32x4", "64": "u64x2"}[width]
+            loader = {"8": "wasm_load_u8", "16": "wasm_load_u16",
+                      "32": "wasm_load_u32", "64": "wasm_load_u64"}[width]
+            vec, _ = self.pop()
+            addr, _ = self.pop()
+            dst = self.push(V)
+            self.emit("%s = %s; %s.%s[%d] = %s(mem, MEM_SIZE, "
+                      "(u32)(%s + %du));"
+                      % (dst, vec, dst, field, ins.args[2], loader,
+                         addr, ins.args[1]))
+            return
+
+        if op.startswith("v128.store") and op.endswith("_lane"):
+            width = op[len("v128.store"):-len("_lane")]
+            field = {"8": "u8x16", "16": "u16x8",
+                     "32": "u32x4", "64": "u64x2"}[width]
+            storer = {"8": "wasm_store_u8", "16": "wasm_store_u16",
+                      "32": "wasm_store_u32", "64": "wasm_store_u64"}[width]
+            vec, _ = self.pop()
+            addr, _ = self.pop()
+            self.emit("%s(mem, MEM_SIZE, (u32)(%s + %du), %s.%s[%d]);"
+                      % (storer, addr, ins.args[1], vec, field,
+                         ins.args[2]))
+            return
+
+        fn = simd_c.HANDLERS.get(op)
+        if fn is None:
+            raise Wasm2CError("unhandled SIMD instruction '%s'" % op)
+
+        # Operand and result types, worked out from the operator's name.
+        arity, result = self._simd_shape(op)
+        args = []
+        for _ in range(arity):
+            name, _vt = self.pop()
+            args.append(name)
+        args.reverse()
+        if result is None:
+            self.emit(fn(self, None, args, ins))
+            return
+        dst = self.push(result)
+        self.emit(fn(self, dst, args, ins))
+
+    def _simd_shape(self, op):
+        """(argument count, result type) for a SIMD operator.
+
+        Derived from the name rather than tabulated: the shape prefix and the
+        operator suffix already say what the types are, and a second table
+        would only be a second thing to keep in step.
+        """
+        V = reader.V128
+        if op == "v128.store":
+            return 2, None
+        if op == "v128.bitselect":
+            return 3, V
+        if op == "v128.any_true":
+            return 1, w.I32
+        if op.endswith(".all_true"):
+            return 1, w.I32
+        if op.endswith(".bitmask"):
+            return 1, w.I32
+        if op.endswith(".splat"):
+            # Takes one *scalar* and produces a vector. The scalar's type is
+            # not needed here -- popping does not depend on it -- but the
+            # result is a v128, not the scalar type the shape names.
+            return 1, V
+        if op.startswith("v128.load"):
+            return 1, V
+        # A shift takes a vector and a scalar count; everything else with two
+        # operands takes two vectors.
+        base = op.split(".")[-1]
+        if base in ("shl", "shr_s", "shr_u"):
+            return 2, V
+        unary = ("neg", "abs", "sqrt", "ceil", "floor", "trunc", "nearest",
+                 "popcnt", "not")
+        if base in unary:
+            return 1, V
+        if ("extend_" in op or "extadd_" in op or "convert_" in op
+                or "trunc_sat_" in op or "demote_" in op
+                or "promote_" in op):
+            return 1, V
+        return 2, V
 
     # -- helpers -----------------------------------------------------------
 
@@ -688,6 +858,7 @@ def write_module(mod, module_name="module"):
     ap(" *   gcc -std=c99 -I tools this.c -o prog -lm")
     ap(" */")
     ap('#include "wasm2c_rt.h"')
+    ap('#include "wasm2c_rt_simd.h"')
     ap("")
 
     # -- memory
@@ -786,7 +957,14 @@ def write_module(mod, module_name="module"):
 
         for k in range(len(func.local_types)):
             vt = func.local_types[k]
-            zero = "0" if vt not in (w.F32, w.F64) else "0.0"
+            # A v128 is a union and cannot be initialised from 0; the
+            # designated-initialiser form zeroes the whole thing.
+            if vt == reader.V128:
+                zero = "{{0}}"
+            elif vt in (w.F32, w.F64):
+                zero = "0.0"
+            else:
+                zero = "0"
             ap("  %s L%d = %s;" % (VALTYPE[vt][0], len(ft.params) + k, zero))
         for d in decls:
             ap(d)
