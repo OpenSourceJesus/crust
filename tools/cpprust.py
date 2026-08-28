@@ -3164,6 +3164,15 @@ def load_decls(paths):
                 "--decls %s: this is version %r and cpprust reads version "
                 "%d. Regenerate it with the py2c that matches this tree."
                 % (path, d.get("version"), DECLS_VERSION))
+        if (d.get("lang") or "rpython") == "cpp":
+            raise CppError(
+                "--decls %s: this digest describes C++ classes, and cpprust "
+                "cannot yet inherit from one. A C++ base needs its "
+                "`struct <Base>_vtable` declared here to build a derived "
+                "table, and a digest carries the descriptor's *layout* "
+                "rather than that per-class type. The C++ digest exists for "
+                "the other consumer -- py2c, so an rpython class can "
+                "subclass a C++ one. Include the header instead." % path)
         desc = d.get("descriptor") or {}
         vnames = set(sl["name"] for sl in desc.get("slots") or ())
         for c in d.get("classes") or ():
@@ -3220,6 +3229,96 @@ def _ext_descriptor(cls, cinfo):
         info = cinfo[cls]
         if info.get("external"):
             return info.get("descriptor") or "TypeInfo"
+        cls = info.get("base")
+    return None
+
+
+def dump_decls(cinfo, module):
+    """The digest for the classes *this* translation defines.
+
+    The mirror of `load_decls`, and deliberately the same shape: one
+    artifact, two producers, two consumers. What differs is only what the
+    two languages call things -- `lang` says which, so a consumer knows
+    whether a base constructor is spelled `T_new` or `T___init__`.
+
+    External classes are skipped. They came from somebody else's digest and
+    re-publishing them would make two files claim to define one class,
+    which is how a base chain acquires two roots.
+
+    The slot list goes under `descriptor`, once, exactly as py2c writes it
+    -- but here it is genuinely per hierarchy rather than per module, so a
+    file with two unrelated hierarchies publishes the union. A consumer
+    reads slots by name, so a name it does not implement is simply absent
+    from its table; the union costs it nothing.
+    """
+    slots, seen = [], set()
+    classes = []
+    for cname in sorted(cinfo):
+        info = cinfo[cname]
+        if info.get("external") or info.get("declared_only"):
+            continue
+        for sl in info.get("slots") or ():
+            if sl["name"] in seen or sl["name"] == _DTOR_SLOT:
+                continue
+            seen.add(sl["name"])
+            slots.append({"name": sl["name"], "ret": sl["ret"],
+                          "params": [p.strip() for p in
+                                     _split_top(sl["params"]) if p.strip()]})
+        methods = []
+        for mname in sorted(info.get("methods") or {}):
+            entries = info["methods"][mname]
+            ent = list(entries.values())[0] if entries else {}
+            methods.append({"name": mname,
+                            "virtual": bool(ent.get("virtual")),
+                            "fn": ent.get("fn") or "%s_%s" % (cname, mname)})
+        classes.append({
+            "name": cname,
+            "struct": cname,
+            "base": info.get("base"),
+            "ibases": list(info.get("ibases") or ()),
+            # A concrete class *is* its own descriptor -- the vtable's
+            # header prefix -- so the symbol is the table. An abstract one
+            # has a standalone header object instead. Same two spellings
+            # `_typeinfo_ref` picks between, published so a consumer need
+            # not know the rule.
+            "typeinfo": ("%s__typeinfo" % cname if info.get("abstract")
+                         else "%s__vtable" % cname),
+            "abstract": bool(info.get("abstract")),
+            "fields": [{"name": f, "ctype": t}
+                       for f, (t, _p) in sorted(
+                           (info.get("fields") or {}).items())],
+            "methods": methods,
+        })
+    return {"version": DECLS_VERSION, "lang": "cpp", "module": module,
+            "descriptor": {"type": "_CppTypeInfo",
+                           "header": [r.split()[-1].rstrip(";").lstrip("*")
+                                      for r in _RTTI_ROWS],
+                           "slots": sorted(slots, key=lambda x: x["name"])},
+            "classes": classes}
+
+
+def _ext_ctor(base, info):
+    """The symbol that initialises an external base in place.
+
+    rpython splits the two: `Cls_new` arena-allocates *and* stamps the
+    descriptor, while `Cls___init__` only assigns fields -- and a C++
+    constructor chaining into it stamps the descriptor itself afterwards,
+    because there is nowhere else that would happen. A C++ base from another
+    translation has no such split, so its `Cls_new` is the initialiser.
+    """
+    if (info.get("lang") or "rpython") == "cpp":
+        return "%s_new" % base
+    return "%s___init__" % base
+
+
+def _ext_lang(cls, cinfo):
+    """The language of the hierarchy root of `cls`, or None if it is local."""
+    seen = set()
+    while cls in cinfo and cls not in seen:
+        seen.add(cls)
+        info = cinfo[cls]
+        if info.get("external"):
+            return info.get("lang") or "rpython"
         cls = info.get("base")
     return None
 
@@ -3583,12 +3682,16 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
         if base:
             bargs = initmap.pop(base, None)
             if known[base].get("external"):
-                # The other language named it `Cls___init__`, and its arity
-                # is whatever the digest's initializer takes -- checked by
-                # the C compiler rather than here, since the digest records
-                # the symbol and not its signature.
-                pro += "%s___init__(&this->_base%s); " % (
-                    base, (", " + bargs) if bargs else "")
+                # Which symbol depends on which language wrote the base:
+                # rpython splits allocation from initialisation and names
+                # the latter `Cls___init__`, while a C++ base emitted by
+                # another translation is an ordinary `Cls_new`. This is what
+                # `lang` is in the digest for. The arity is whatever that
+                # function takes -- checked by the C compiler rather than
+                # here, since the digest records a symbol, not a signature.
+                pro += "%s(&this->_base%s); " % (
+                    _ext_ctor(base, known[base]),
+                    (", " + bargs) if bargs else "")
             elif known[base]["ctor"]:
                 bar = _arity(bargs) if bargs is not None else 0
                 if bar not in known[base]["ctors"]:
@@ -3603,11 +3706,14 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             elif bargs is not None:
                 raise CppError("class %s: base `%s` has no constructor to "
                                "pass arguments to" % (cls.name, base))
-        if slots and not abstract and ext_root:
+        if slots and not abstract and ext_root \
+                and ext_root.get("lang") != "cpp":
             # The rpython root spells its descriptor pointer `_hdr.type`
             # through `Obj`, not `_vptr`. Same word at the same offset --
             # which is the whole reason the two models meet -- but the
-            # member has to be named the way that struct declares it.
+            # member has to be named the way that struct declares it. A C++
+            # root from another translation declares `_vptr` like any
+            # other, so it falls through to the ordinary path below.
             pro += ("((Obj *)this)->type = &%s__vtable; " % cname)
         elif slots and not abstract:
             pro += ("((%s *)this)->_vptr = "
@@ -6548,7 +6654,7 @@ def _emit_method_call(expr, cls, is_ptr, meth, args, ent, cinfo,
         # through `Obj`, not `_vptr`. Same word at the same offset, so only
         # the spelling changes; the slot is still reached by name.
         xroot = _ext_descriptor(cls, cinfo)
-        if xroot is not None:
+        if xroot is not None and _ext_lang(cls, cinfo) != "cpp":
             return ("((const %s *)((Obj *)%s)->type)->%s((Obj *)%s%s)"
                     % (xroot, recv, meth, recv, tail))
         return ("((const struct %s_vtable *)(%s)->_vptr)->%s(%s%s)"
@@ -9500,7 +9606,8 @@ def _lower_lambdas(text, path):
 
 
 def translate(text, path="<cpp>", owning=None, basedir=None,
-              incdirs=(), defines=(), clang=None, rtti=False, decls=()):
+              incdirs=(), defines=(), clang=None, rtti=False, decls=(),
+              decls_out=None):
     """Translate a C++ subset source to C. Raises CppError on anything else.
 
     `owning` maps the name of a type this file does *not* define to the
@@ -10041,6 +10148,18 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
         pieces.insert(0, head)
     out = "".join(pieces)
 
+    if decls_out:
+        # Here, not at the end: this is the point where every class this
+        # file defines has an entry and none of the later passes add or
+        # remove one. Written even if a later pass then refuses the file --
+        # the digest describes declarations, and a body that does not lower
+        # does not change what this file declares.
+        import json as _json
+        with open(decls_out, "w") as _df:
+            _json.dump(dump_decls(cinfo,
+                                  os.path.splitext(os.path.basename(path))[0]),
+                       _df, indent=1, sort_keys=True)
+
     # Rewrite uses: `Ring<int> r;` -> `Ring_int r;`. Field types were already
     # normalised through `tsub` while their class was emitted; this catches
     # the rest -- locals, parameters, and method bodies copied through
@@ -10224,6 +10343,14 @@ def main(argv):
     clang = None
     rtti = False
     decls = []
+    decls_out = None
+    if "--emit-decls" in args:
+        i = args.index("--emit-decls")
+        if i + 1 >= len(args):
+            sys.stderr.write("cpprust: --emit-decls needs a path\n")
+            return 2
+        decls_out = args[i + 1]
+        del args[i:i + 2]
     while "--decls" in args:
         i = args.index("--decls")
         if i + 1 >= len(args):
@@ -10301,7 +10428,7 @@ def main(argv):
         result = translate(text, path=src, owning=owning,
                            basedir=basedir, incdirs=incdirs,
                            defines=defines, clang=clang, rtti=rtti,
-                           decls=decls)
+                           decls=decls, decls_out=decls_out)
     except CppError as e:
         # The message goes where the output would have gone; the caller
         # reads it back and reports it against the `#include` line.
