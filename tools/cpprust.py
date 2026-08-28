@@ -499,6 +499,57 @@ _AUG_ASSIGN_SPELLINGS = frozenset(
 _UNSUPPORTED = ("throw", "try", "catch",
                 "dynamic_cast", "typeid")
 
+#: Refused only when `--rtti` is off. With it on, these two lower against
+#: the descriptor below; the rest of `_UNSUPPORTED` stays refused either way.
+_RTTI_KEYWORDS = ("dynamic_cast", "typeid")
+
+#: The type descriptor, emitted only under `--rtti`.
+#:
+#: Layout-identical to py2c's `TypeInfoHdr` (shivyc_rt.h), deliberately and
+#: field for field. That is what lets an object built by either side be
+#: asked its type by the other: py2c's `isinstance_of` walks `{name; base}`
+#: at a fixed offset and does not care which language wrote the descriptor.
+#:
+#: The three function-pointer slots py2c fills (`tostr`, `eq`, `addfn`) are
+#: spelled `const void *` here and left null. They are a pointer wide either
+#: way, so the layouts agree, and spelling them concretely would drag `obj`
+#: and `Obj` into a translation unit that may have no rpython in it at all.
+#: A `.cpp` therefore gets RTTI with nothing to link.
+#:
+#: `objsize` is `sizeof` the concrete struct. py2c uses it for a shallow
+#: copy; nothing here reads it yet, and it is emitted because leaving a hole
+#: in a shared layout is how the two sides drift apart.
+_RTTI_PRELUDE = """\
+/* Type descriptor. Layout-identical to py2c's `TypeInfoHdr`, so an object
+   from either language can be asked its type by the other. */
+typedef struct _CppTypeInfo {
+    const char *name;
+    const struct _CppTypeInfo *base;
+    const void *fields;                 /* FieldDesc *; null from C++ */
+    const void *tostr;                  /* obj (*)(Obj *); null from C++ */
+    const void *eq;                     /* bool (*)(Obj *, obj); null */
+    const void *addfn;                  /* obj (*)(Obj *, obj); null */
+    unsigned long objsize;
+} _CppTypeInfo;
+
+/* The base-chain walk, spelled exactly as `isinstance_of` spells it. Bounded
+   by the depth of the hierarchy, which is fixed at compile time -- there are
+   no virtual bases in this subset, so this is a walk and never a search. */
+static inline int _cpp_isinstance(const void *o, const void *t) {
+    const _CppTypeInfo *want = (const _CppTypeInfo *)t;
+    const _CppTypeInfo *k = o ? *(const _CppTypeInfo *const *)o : 0;
+    for (; k; k = k->base) if (k == want) return 1;
+    return 0;
+}
+
+/* `dynamic_cast<D *>(p)`: the pointer form, which yields null on failure.
+   The reference form throws, and this subset has no exceptions, so it stays
+   refused rather than being given a silent null. */
+static inline void *_cpp_dyncast(void *o, const void *t) {
+    return _cpp_isinstance(o, t) ? o : 0;
+}
+"""
+
 # `operator=` is supported; every other overload is not. Checked separately
 # from the keyword list so the diagnostic can name the operator.
 _OPERATOR = re.compile(r"\boperator\s*(=(?!=)|\[\s*\]|[^\s(]+)")
@@ -699,7 +750,7 @@ def _blank_strings(text):
     return "".join(out)
 
 
-def _check_unsupported(scan, path):
+def _check_unsupported(scan, path, rtti=False):
     # A literal is data, not code: `puts("new item")` uses no keyword.
     scan = _blank_strings(scan)
     for m in _OPERATOR.finditer(scan):
@@ -743,13 +794,21 @@ def _check_unsupported(scan, path):
             "`operator[]`, `operator->` and `operator*`."
             % (os.path.basename(path), line, spelled))
     for kw in _UNSUPPORTED:
+        if rtti and kw in _RTTI_KEYWORDS:
+            continue          # lowered against the descriptor instead
         m = re.search(r"\b%s\b" % kw, scan)
         if m:
             line = _src_line(scan, m.start())
+            extra = ""
+            if kw in _RTTI_KEYWORDS:
+                extra = (" It needs a type descriptor on every polymorphic "
+                         "class, which is off by default because it costs a "
+                         "static descriptor per class; pass `--rtti` to turn "
+                         "it on.")
             raise CppError(
                 "%s:%d: `%s` is not in the C++ subset. Supported: classes, "
-                "constructors, destructors, and templates."
-                % (os.path.basename(path), line, kw))
+                "constructors, destructors, and templates.%s"
+                % (os.path.basename(path), line, kw, extra))
 
 
 class Member(object):
@@ -787,12 +846,18 @@ class Member(object):
 
 
 class Class(object):
-    __slots__ = ("name", "tparams", "members", "line", "base")
+    __slots__ = ("name", "tparams", "members", "line", "base", "extra_bases")
 
-    def __init__(self, name, tparams, members, line, base=None):
+    def __init__(self, name, tparams, members, line, base=None,
+                 extra_bases=()):
         self.name = name
         self.tparams = tparams    # tuple of template parameter names, or ()
-        self.base = base          # single base class name, or None
+        self.base = base          # layout base class name, or None
+        # Bases after the first. Each contributes a vptr of its own at a
+        # fixed offset rather than a struct prefix, so it must carry no
+        # data -- checked in `_emit_class`, where the base's members are
+        # in hand.
+        self.extra_bases = list(extra_bases)
         self.members = members
         self.line = line
 
@@ -1286,22 +1351,42 @@ def _split_members(body, cname, line0, path="<cpp>"):
 
 
 def _parse_base(clause, cname):
-    """`: public B` -> `B`. Single inheritance only."""
+    """`: public B, public I` -> `("B", ["I"])`.
+
+    The first base is the *layout* base: it is laid out as the first
+    member, so a pointer to a derived object already is a pointer to it and
+    upcasting stays a cast. Every base after the first is a secondary base,
+    which reaches its object through a vptr of its own at a fixed offset --
+    see `_emit_class`. Which one is which is decided here, by writing
+    order, exactly as C++ decides it.
+
+    A `virtual` base is refused rather than ordered, because the property
+    that makes the rest of this work -- that a base sits at an offset
+    known at compile time -- is the one it gives up.
+    """
     clause = (clause or "").strip()
     if not clause.startswith(":"):
-        return None
+        return None, []
     bases = [b.strip() for b in _split_top(clause[1:]) if b.strip()]
-    if len(bases) > 1:
-        raise CppError(
-            "class %s: multiple inheritance is not in the C++ subset -- a "
-            "base is laid out as the first member, which admits one base."
-            % cname)
-    parts = [p for p in bases[0].split()
-             if p not in ("public", "private", "protected", "virtual")]
-    if len(parts) != 1:
-        raise CppError("class %s: cannot parse base clause %r"
-                       % (cname, clause))
-    return parts[0]
+    names = []
+    for b in bases:
+        parts = [p for p in b.split()
+                 if p not in ("public", "private", "protected")]
+        if "virtual" in parts:
+            raise CppError(
+                "class %s: `virtual` inheritance is not in the C++ subset. A "
+                "virtual base's offset depends on the most-derived type, so "
+                "every access to one of its members becomes a runtime table "
+                "lookup and `dynamic_cast` an unbounded search -- which is "
+                "the cost this subset exists to not have. Use a base with no "
+                "data members (any number of those may be inherited), or "
+                "hold a reference to the shared object."
+                % cname)
+        if len(parts) != 1:
+            raise CppError("class %s: cannot parse base clause %r"
+                           % (cname, clause))
+        names.append(parts[0])
+    return names[0], names[1:]
 
 
 _OUTLINE = re.compile(
@@ -2333,7 +2418,7 @@ def _find_classes(scan, text, path="<cpp>"):
                                              _src_line(scan, m.start()),
                                              path),
                               _src_line(scan, m.start()),
-                              _parse_base(m.group(3), m.group(2)))))
+                              *_parse_base(m.group(3), m.group(2)))))
     return classes
 
 
@@ -3010,6 +3095,13 @@ def _external_info(name, dropfn):
 _BASE_MEMBER = "_base"
 
 
+def _ivptr(bname):
+    """The vptr field a secondary base contributes. Named after the base so
+    a class may have several, and prefixed so it cannot collide with a
+    member the author wrote."""
+    return "_vptr_%s" % bname
+
+
 # The destructor's vtable slot. Not a legal C++ member name, so it cannot
 # collide with a method the source declared.
 _DTOR_SLOT = "__dtor"
@@ -3024,6 +3116,68 @@ def _slot_fn(slot, impl):
     if slot["name"] == _DTOR_SLOT:
         return "%s_drop" % impl
     return "%s_%s" % (impl, slot["name"])
+
+
+def _find_impl(mname, cls, cname, base_info):
+    """The C function this class supplies for an interface slot, or None.
+
+    Looked for on the class itself first, then along its *primary* chain --
+    which is where an inherited implementation lives, since the primary
+    chain is the one with storage. A secondary base's own implementation is
+    not searched: it is what `None` means here, and the caller uses the
+    slot's recorded implementation for that case, unadjusted.
+
+    A destructor is not looked up by name. An interface's destructor slot
+    is filled by the class's own `_drop`, which the epilogue emits whether
+    or not the author wrote one.
+    """
+    if mname == _DTOR_SLOT:
+        return "%s_drop" % cname
+    for m in cls.members:
+        if m.kind == "method" and m.name == mname:
+            return "%s_%s" % (cname, mname)
+    if base_info and mname in base_info.get("methods", {}):
+        # Inherited through the layout base. Its `this` is a prefix of this
+        # class's, so the address the thunk computes is right for it too
+        # and no second adjustment is needed. The arity map holds one entry
+        # per overload; an interface slot is one name, so a single entry is
+        # the only shape that can fill it.
+        overloads = base_info["methods"][mname]
+        if len(overloads) == 1:
+            fn = list(overloads.values())[0].get("fn")
+            if fn:
+                return fn
+    return None
+
+
+#: The header rows prefixed onto a vtable struct under `--rtti`, in
+#: `_CppTypeInfo` order. The slots follow, so a dispatch site -- which names
+#: a slot rather than indexing one -- is unchanged by their presence, and a
+#: derived table stays prefix-compatible with its base's exactly as before.
+_RTTI_ROWS = ["const char *name;",
+              "const struct _CppTypeInfo *base;",
+              "const void *fields;",
+              "const void *tostr;",
+              "const void *eq;",
+              "const void *addfn;",
+              "unsigned long objsize;"]
+
+
+def _typeinfo_ref(cname, info):
+    """The C expression for a pointer to `cname`'s descriptor.
+
+    A concrete class *is* its own descriptor: the vtable's header prefix is
+    the descriptor, and the vptr already points at it, so no second object
+    is needed and the cast is free.
+
+    An abstract class has no vtable instance -- nothing may be constructed
+    to point at one -- but a derived class still has to name it as its base,
+    and `dynamic_cast<Abstract *>` is a legitimate question to ask. So it
+    gets a standalone header object instead. Two spellings, one meaning.
+    """
+    if info.get("abstract"):
+        return "&%s__typeinfo" % cname
+    return "(const struct _CppTypeInfo *)&%s__vtable" % cname
 
 
 def _vtable_slots(cls, cname, base_info, known):
@@ -3073,7 +3227,7 @@ def _vtable_slots(cls, cname, base_info, known):
 
 
 def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
-                chained=frozenset(), prelude=False):
+                chained=frozenset(), prelude=False, rtti=False):
     """Emit a class as a C struct plus free functions.
 
     Returns the lines, the mangled name, and an info dict describing the
@@ -3104,6 +3258,53 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             % (cls.name, base))
     base_info = known[base] if base else None
 
+    # Secondary bases. The layout base is a struct prefix; these are not.
+    # Each contributes one word -- a vptr of its own -- at an offset fixed
+    # by the declaration, so `(I *)d` is a constant adjustment and the
+    # thunks in `I`'s table subtract the same constant to get `this` back.
+    # That is the whole of the mechanism, and it is only sound while the
+    # base carries no data: a field reached through `I *` would be read at
+    # `I`'s offset, and there is no `I` there to read it from.
+    extras = []
+    for bn in cls.extra_bases:
+        rn = bn if bn in known else tsub(sub(bn)).strip()
+        if rn not in known:
+            raise CppError(
+                "class %s: base class `%s` is not defined above it. A base "
+                "has to be complete before the class that inherits it."
+                % (cls.name, rn))
+        binfo = known[rn]
+        if binfo.get("fields"):
+            raise CppError(
+                "class %s: secondary base `%s` has data members (%s), which "
+                "is not in the C++ subset. Only the first base is laid out "
+                "as a struct prefix; the others are reached through a vptr "
+                "of their own, so their fields would have no storage to sit "
+                "in. Make `%s` an interface (methods only), or make it the "
+                "first base."
+                % (cls.name, rn, ", ".join(sorted(binfo["fields"])), rn))
+        if not binfo.get("slots"):
+            raise CppError(
+                "class %s: secondary base `%s` has no virtual methods, so "
+                "inheriting it adds nothing that could be dispatched and "
+                "nothing that could be laid out. Give it a virtual method, "
+                "or drop it from the base list."
+                % (cls.name, rn))
+        extras.append((rn, binfo))
+    # An interface reached through the layout base needs a table of *this*
+    # class too: the field is declared once, by whoever named the base, but
+    # the table it points at has to carry this class's overrides. Without
+    # this a derived class dispatches to its base's implementation through
+    # the interface while dispatching to its own through the layout base --
+    # the same object answering two different ways.
+    all_extras = [(bn, bi, "") for bn, bi in extras]
+    if base_info:
+        for bn, bi, bpath in base_info.get("ibases_all") or ():
+            if any(bn == x[0] for x in all_extras):
+                continue
+            all_extras.append((bn, bi, "%s.%s" % (_BASE_MEMBER, bpath)
+                               if bpath else "%s." % _BASE_MEMBER))
+
     slots = _vtable_slots(cls, cname, base_info, known)
     root = (base_info["root"] if base_info else cname) if slots else None
     abstract = any(s["impl"] is None for s in slots)
@@ -3126,7 +3327,7 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
     # base's exactly, which is what makes the derived table usable through
     # a base pointer.
     if slots:
-        rows = []
+        rows = list(_RTTI_ROWS) if rtti else []
         for s in slots:
             args = "%s *this" % s["decl"]
             if s["params"]:
@@ -3139,6 +3340,11 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
         parts.append("%s _base;" % base)
     elif slots:
         parts.append("const struct %s_vtable *_vptr;" % cname)
+    # One vptr per secondary base, after the layout base and before this
+    # class's own fields. Position is what makes the adjustment a constant,
+    # so it is fixed here rather than left to fall out of declaration order.
+    for bn, _bi in extras:
+        parts.append("const struct %s_vtable *%s;" % (bn, _ivptr(bn)))
     # The dimension is substituted as well as the type: a non-type parameter
     # (`template<typename T, int N>` with a field `T buf[N];`) appears only
     # in the declarator suffix, and leaving it alone would emit `[N]` with
@@ -3151,12 +3357,30 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
                      .replace(" ;", ";"))
     head.append("struct %s { %s };" % (cname, " ".join(parts) or
                                        "char _cpp_empty;"))
+    # An abstract class gets its descriptor as an object of its own, since it
+    # will never have a vtable instance for one to sit in front of. It still
+    # needs one: a derived class names it as its base, and asking
+    # `dynamic_cast<Abstract *>` is legitimate.
+    #
+    # After the struct rather than beside the vtable type above, because it
+    # is the first thing here to need the struct *complete* rather than
+    # merely declared -- `objsize` is a `sizeof`.
+    if rtti and abstract:
+        head.append(
+            "static const struct _CppTypeInfo %s__typeinfo = "
+            "{ \"%s\", %s, 0, 0, 0, 0, sizeof(struct %s) };"
+            % (cname, cname,
+               (_typeinfo_ref(base, base_info)
+                if base_info and base_info.get("slots") else "0"),
+               cname))
 
     mnames = [m.name for m in cls.members if m.kind == "method"]
     if base_info:
         mnames = sorted(set(mnames) | set(base_info["methods"]))
     info = {"ctor": False, "dtor": False, "ctors": {}, "methods": {},
             "fields": {}, "base": base, "slots": slots, "root": root,
+            "ibases": [bn for bn, _ in extras],
+            "ibases_all": [(bn, bi, pth) for bn, bi, pth in all_extras],
             "abstract": abstract, "vdtor": False, "vdtor_decl": None,
             "ctor_refs": set(), "paths": {}, "copy": False, "move": False,
             "assign": False, "moveassign": False, "move_methods": {}, "deleted": {}, "index": None, "arrow": None,
@@ -3259,6 +3483,12 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             pro += ("((%s *)this)->_vptr = "
                     "(const struct %s_vtable *)&%s__vtable; "
                     % (root, root, cname))
+        # Each secondary base's vptr, beside the primary one. A `B *` taken
+        # before this ran would dispatch through an uninitialised word, so
+        # it is installed in the same prologue for the same reason.
+        for _bn, _bi, _pth in all_extras:
+            pro += ("this->%s%s = &%s__vtable_%s; "
+                    % (_pth, _ivptr(_bn), cname, _bn))
         # Which of this constructor's parameters are objects of a class we
         # know, by value or by reference? Only those can make an initializer
         # a copy rather than a conversion.
@@ -3822,9 +4052,73 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
         # The constructor installs the table, so the table has to be visible
         # before the constructor is defined -- hence prototypes first.
         head.extend(protos)
+        # The descriptor values come first because the header rows do. The
+        # base link is the *nearest base that has a table*: a base with no
+        # virtuals has no descriptor to point at, and a chain that skipped
+        # it would claim a relationship the layout does not have.
+        vals = []
+        if rtti:
+            bref = "0"
+            if base_info and base_info.get("slots"):
+                bref = _typeinfo_ref(base, base_info)
+            vals = ["\"%s\"" % cname, bref, "0", "0", "0", "0",
+                    "sizeof(struct %s)" % cname]
         head.append("static const struct %s_vtable %s__vtable = { %s };"
-                    % (cname, cname, ", ".join("&" + e for e in entries)))
+                    % (cname, cname,
+                       ", ".join(vals + ["&" + e for e in entries])))
         out.extend(thunks)
+
+    # A table per secondary base. Emitted whether or not this class has a
+    # primary table of its own: a class may implement an interface and
+    # declare no virtual of its own, and the interface still has to
+    # dispatch.
+    for bn, binfo, ipath in all_extras:
+        bentries, bprotos, bthunks = [], [], []
+        for sl in binfo["slots"]:
+            plist = (", " + sl["params"]) if sl["params"].strip() else ""
+            fwd = [n for n in (_param_name(x)
+                               for x in _split_top(sl["params"])) if n]
+            own = _find_impl(sl["name"], cls, cname, base_info)
+            if own is None:
+                if sl["impl"] is None:
+                    raise CppError(
+                        "class %s: `%s::%s` is pure and %s does not "
+                        "implement it, so there is nothing to put in the "
+                        "table. Declaring a value of such a class is "
+                        "refused anyway, so this is a gap rather than an "
+                        "abstract class."
+                        % (cls.name, bn, sl["name"], cls.name))
+                # The base implements it and `this` is already a `B *`,
+                # so the slot takes the base's function unadjusted.
+                bentries.append(_slot_fn(sl, sl["impl"]))
+                continue
+            # This class overrides it. The slot hands over a `B *` pointing
+            # at the vptr field; the implementation wants the whole object,
+            # which is that address less the field's offset.
+            thunk = "%s__ithunk_%s_%s" % (cname, bn, sl["name"])
+            ret = "" if sl["ret"].strip() == "void" else "return "
+            bprotos.append("static %s %s(%s *this%s);"
+                           % (sl["ret"], thunk, bn, plist))
+            bthunks.append(
+                "static %s %s(%s *this%s) { %s%s((%s *)((char *)this - "
+                "offsetof(struct %s, %s%s))%s); }"
+                % (sl["ret"], thunk, bn, plist, ret, own, cname,
+                   cname, ipath, _ivptr(bn),
+                   "".join(", " + f for f in fwd)))
+            bentries.append(thunk)
+        bvals = []
+        if rtti:
+            # The descriptor names *this* class, not the interface: asking
+            # a `B *` what it is should answer with what it really is. Its
+            # base is the interface, which is the relationship a
+            # `dynamic_cast<B *>` walks.
+            bvals = ["\"%s\"" % cname, _typeinfo_ref(bn, binfo),
+                     "0", "0", "0", "0", "sizeof(struct %s)" % cname]
+        head.extend(bprotos)
+        head.append("static const struct %s_vtable %s__vtable_%s = { %s };"
+                    % (bn, cname, bn,
+                       ", ".join(bvals + ["&" + e for e in bentries])))
+        out.extend(bthunks)
     # Split three ways rather than two. Only the *name* declarations and the
     # prototypes are safe to hoist: the struct definition has to stay where
     # it is, because a by-value member needs the member's definition above it
@@ -6139,6 +6433,204 @@ def _defers_to_nested(raw, scopes, lookup):
 
 
 
+#: `dynamic_cast<T *>(e)` and `typeid(e)`. The angle brackets are matched
+#: non-greedily and without nesting: a target type here is a class name and
+#: a `*`, never another template, because the descriptor is per class and a
+#: `dynamic_cast<vector<int> *>` has nothing to walk to.
+_DYNCAST = re.compile(r"(?<![\w.>])dynamic_cast\s*<([^<>]*)>\s*\(")
+_TYPEID = re.compile(r"(?<![\w.>])typeid\s*\(")
+
+#: `.name()` immediately after a `typeid(..)`, which is the only member of
+#: `std::type_info` this subset answers.
+_TYPEID_NAME = re.compile(r"\s*\.\s*name\s*\(\s*\)")
+
+
+def _rtti_operand_addr(operand, path, line, what):
+    """The address of a `typeid` operand.
+
+    `typeid(*p)` asks about the object `p` points at, so the address is `p`
+    with the dereference removed rather than `&*p` -- which is the same
+    address, but written the way the source already had it. Anything else is
+    an object, so its address is taken.
+    """
+    operand = operand.strip()
+    if not operand:
+        raise CppError("%s:%d: `%s()` needs an operand."
+                       % (os.path.basename(path), line, what))
+    if operand.startswith("*"):
+        inner = operand[1:].strip()
+        if inner:
+            return "(%s)" % inner
+    return "&(%s)" % operand
+
+
+def _lower_rtti(text, cinfo, path="<cpp>"):
+    """Lower `dynamic_cast` and `typeid` against the emitted descriptors.
+
+    Both read the descriptor pointer that a polymorphic object already
+    carries at offset zero -- the vptr *is* the descriptor pointer under
+    `--rtti`, since the descriptor is the vtable's own header. So neither
+    needs the symbol table: the operand's static type does not matter, only
+    that it is a pointer to something polymorphic, and a non-polymorphic
+    operand is exactly what C++ refuses here too.
+
+    `typeid(e)` yields the descriptor pointer itself rather than a
+    `type_info` object. That is what makes `typeid(a) == typeid(b)` mean the
+    right thing with no class behind it, and `.name()` a field read.
+    """
+    out, i, n = [], 0, len(text)
+    look = _strip_comments(text)
+    while i < n:
+        m = _DYNCAST.search(look, i)
+        t = _TYPEID.search(look, i)
+        if m is None and t is None:
+            out.append(text[i:])
+            break
+        if m is not None and (t is None or m.start() <= t.start()):
+            close = _match_paren(look, m.end() - 1)
+            if close is None:
+                raise CppError("`dynamic_cast` without a closing `)`")
+            line = _src_line(look, m.start())
+            targ = m.group(1).strip()
+            if targ.endswith("&"):
+                raise CppError(
+                    "%s:%d: `dynamic_cast<%s>` is the reference form, which "
+                    "throws on failure -- and this subset has no exceptions, "
+                    "so there is nothing for it to do. Use the pointer form "
+                    "and test the result for null."
+                    % (os.path.basename(path), line, targ))
+            if not targ.endswith("*"):
+                raise CppError(
+                    "%s:%d: `dynamic_cast<%s>` casts to a value, which is a "
+                    "conversion rather than a downcast. Cast to `%s *`."
+                    % (os.path.basename(path), line, targ, targ))
+            tname = targ[:-1].strip()
+            info = cinfo.get(tname)
+            if info is None:
+                raise CppError(
+                    "%s:%d: `dynamic_cast<%s *>`: `%s` is not a class defined "
+                    "in this translation. The descriptor to compare against "
+                    "is emitted with the class, so it has to be here."
+                    % (os.path.basename(path), line, tname, tname))
+            if not info.get("slots"):
+                raise CppError(
+                    "%s:%d: `dynamic_cast<%s *>`: `%s` has no virtual "
+                    "methods, so it carries no type descriptor and there is "
+                    "nothing to check at run time. C++ refuses this too. "
+                    "Give the hierarchy a virtual method (a virtual "
+                    "destructor is the usual one), or use a plain cast."
+                    % (os.path.basename(path), line, tname, tname))
+            operand = text[m.end():close].strip()
+            out.append(text[i:m.start()])
+            out.append("((%s *)_cpp_dyncast((void *)(%s), %s))"
+                       % (tname, operand, _typeinfo_ref(tname, info)))
+            i = close + 1
+            continue
+        close = _match_paren(look, t.end() - 1)
+        if close is None:
+            raise CppError("`typeid` without a closing `)`")
+        line = _src_line(look, t.start())
+        operand = text[t.end():close].strip()
+        addr = _rtti_operand_addr(operand, path, line, "typeid")
+        desc = "(*(const struct _CppTypeInfo *const *)%s)" % addr
+        end = close + 1
+        nm = _TYPEID_NAME.match(look, end)
+        if nm:
+            desc = "%s->name" % desc
+            end = nm.end()
+        out.append(text[i:t.start()])
+        out.append(desc)
+        i = end
+    return "".join(out)
+
+
+def _ibase_owner(dcls, iname, cinfo):
+    """The member path from a `dcls *` to the vptr field for `iname`, or None.
+
+    A class that names the interface itself has the field directly, so the
+    path is empty. A class that inherits it through its *layout* base has
+    the field inside `_base`, one hop per level -- which is exactly why the
+    layout base is a struct prefix: the address arithmetic stays static
+    however deep the chain is.
+
+    None means no class on that chain names the interface, so this is not a
+    conversion to a secondary base and nothing should be adjusted.
+    """
+    info = cinfo.get(dcls)
+    if info is None:
+        return None
+    for bn, _bi, pth in info.get("ibases_all") or ():
+        if bn == iname:
+            return pth
+    return None
+
+
+def _check_ibase_conversions(text, cinfo, path="<cpp>"):
+    """Refuse a conversion to a secondary base, which is not lowered yet.
+
+    A secondary base is reached through a vptr at a fixed offset, so `(I *)d`
+    becomes `(I *)&d->_vptr_I` -- an adjustment by a compile-time constant.
+    The call rewriter inserts it wherever it can name the source type, which
+    is a symbol or a member chain. What is left over is every other operand
+    shape: a call result, another cast, an array element. For those there is
+    no offset to apply, and an unadjusted pointer compiles cleanly while
+    dispatching through the wrong table.
+
+    That is a silent miscompile, which is the one outcome this translator is
+    written never to produce, so the leftovers are reported here. The check
+    runs *after* the rewriting for that reason: what remains is exactly what
+    could not be lowered.
+    """
+    ibases = set()
+    for info in cinfo.values():
+        ibases.update(info.get("ibases") or ())
+    if not ibases:
+        return
+    look = _strip_comments(text)
+    for bn in sorted(ibases):
+        # An unlowered cast: the operand was not a plain member chain, so
+        # the walker had no type to adjust from. A cast the walker *did*
+        # lower still spells `(I *)`, so the adjusted shape -- the cast, an
+        # `&`, and the vptr field it reaches -- is matched and skipped
+        # first. Anchoring on that shape rather than merely looking for the
+        # field name nearby is what keeps an unlowered cast that happens to
+        # sit near a lowered one from being passed.
+        adjusted = re.compile(
+            r"\(\s*%s\s*\*\s*\)\s*&\([^;]{0,200}?\)->[\w.]*%s(?![\w])"
+            % (re.escape(bn), re.escape(_ivptr(bn))))
+        m = None
+        for cast in re.finditer(r"\(\s*%s\s*\*\s*\)" % re.escape(bn),
+                                look):
+            if adjusted.match(look, cast.start()):
+                continue
+            m = cast
+            break
+        if m is None:
+            # Or an implicit conversion -- `I *p = &d;` with no cast at
+            # all. Adjusted initialisers name the vptr field by now, so
+            # one that does not is a conversion that never happened.
+            for d in re.finditer(
+                    r"(?<![\w])%s\s*\*\s*\w+\s*=([^;]*);" % re.escape(bn),
+                    look):
+                if _ivptr(bn) not in d.group(1) and d.group(1).strip() != "0":
+                    m = d
+                    break
+        if m is None:
+            continue
+        raise CppError(
+            "%s:%d: cannot convert this to the secondary base `%s`. `%s` is "
+            "reached through a vptr of its own at a fixed offset, so the "
+            "conversion has to adjust the address by that offset -- which "
+            "needs the type of what is being converted *from*. That is "
+            "known for a named object or a member chain (`(%s *)&obj`, "
+            "`(%s *)ptr`), and not for anything else: a call result, a "
+            "cast, an array element. An unadjusted pointer would dispatch "
+            "through the wrong table and compile without complaint, so it "
+            "is reported instead. Assign it to a typed local first."
+            % (os.path.basename(path), _src_line(look, m.start()),
+               bn, bn, bn, bn))
+
+
 def _rewrite_calls(text, cinfo, free_refs, free_rets=None, path="<cpp>"):
     """`_rewrite_calls_inner`, with a line number on whatever it reports.
 
@@ -6230,6 +6722,15 @@ def _rewrite_calls_inner(text, cinfo, free_refs, free_rets, _pos):
     # stored beside the allocation.
     new_re = re.compile(r"(?<![\w.>])new\s+(\w+)\s*(\[)?")
     del_re = re.compile(r"(?<![\w.>])delete\b\s*(\[\s*\])?\s*")
+    # `(I *)&obj` / `(I *)ptr`. Only a plain member chain as the operand:
+    # anything else needs the type of an arbitrary expression, which this
+    # pass does not have, and a conversion it cannot adjust is reported by
+    # `_check_ibase_conversions` rather than emitted unadjusted.
+    ibase_cast_re = re.compile(
+        r"\(\s*(\w+)\s*\*\s*\)\s*(&\s*)?([A-Za-z_][\w.]*(?:->\w+)*)")
+    all_ibases = set()
+    for _ci in cinfo.values():
+        all_ibases.update(_ci.get("ibases") or ())
     # As in `_rewrite_scopes`: match against comment-blanked text so a `.`
     # or a parenthesis inside prose cannot be read as code. Same length, so
     # the indices address `text`, which is what is emitted.
@@ -6404,6 +6905,40 @@ def _rewrite_calls_inner(text, cinfo, free_refs, free_rets, _pos):
             out.append(text[i])
             i += 1
             continue
+        # `(I *)e` where `I` is a secondary base of `e`'s class. The base is
+        # reached through a vptr of its own, so the conversion is an
+        # adjustment by that field's offset -- which is why it is done here,
+        # where the symbol table can say what `e` is. Without the source
+        # type there is no offset to apply, and an unadjusted pointer
+        # dispatches through the wrong table while compiling cleanly.
+        #
+        # In the character dispatch rather than with `new` and `delete`
+        # below: those are matched where a *word* can begin, and a cast
+        # begins with a parenthesis, so a pattern tried there is never
+        # reached.
+        if c == "(" and all_ibases:
+            m = ibase_cast_re.match(look, i)
+            if m and m.group(1) in all_ibases:
+                iname, amp, chain_txt = m.group(1), m.group(2), m.group(3)
+                chain = [q for q in re.split(r"\s*(?:\.|->)\s*", chain_txt)
+                         if q]
+                got = (resolve(scopes, chain[0], chain[1:])
+                       if all(re.match(r"^\w+$", q) for q in chain) else None)
+                if got is not None:
+                    expr, dcls, is_ptr = got
+                    owner = _ibase_owner(dcls, iname, cinfo)
+                    # `&obj` on a value, or a bare pointer. `&ptr` is a
+                    # pointer to a pointer and `obj` alone is not a pointer
+                    # at all -- neither is a conversion to a base, so both
+                    # are left for the C front end to judge in its own terms.
+                    ptr = (("&(%s)" % expr) if (amp and not is_ptr)
+                           else (expr if (not amp and is_ptr) else None))
+                    if owner is not None and ptr is not None:
+                        out.append("((%s *)&(%s)->%s%s)"
+                                   % (iname, ptr, owner, _ivptr(iname)))
+                        i = m.end()
+                        continue
+
         if c == "{":
             frame = {}
             params = _params_at(look, i)
@@ -8806,13 +9341,21 @@ def _lower_lambdas(text, path):
 
 
 def translate(text, path="<cpp>", owning=None, basedir=None,
-              incdirs=(), defines=(), clang=None):
+              incdirs=(), defines=(), clang=None, rtti=False):
     """Translate a C++ subset source to C. Raises CppError on anything else.
 
     `owning` maps the name of a type this file does *not* define to the
     function that destroys one -- the types Crust lowered that own a buffer,
     handed over so a C++ class holding one by value is destroyed like any
     other member, and refuses to be copied for the same reason.
+
+    `rtti` prefixes every vtable with a type descriptor, which is what
+    `dynamic_cast` and `typeid` read. It is off by default: it costs one
+    static descriptor per polymorphic class and nothing per object, but
+    "nothing per object" is only true because the vptr a polymorphic class
+    already carries *is* the descriptor pointer -- so a class with no
+    virtuals gains no header and cannot be asked its type, exactly as in
+    C++, where `dynamic_cast` requires a polymorphic operand.
     """
     # `std::string` / `std::vector` are supplied as ordinary subset source,
     # so everything below sees one file with no special cases in it.
@@ -8921,7 +9464,7 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     except cpp_auto.AutoError as e:
         raise CppError(e.message)
     scan = _blank_literal_braces(_strip_comments(text))
-    _check_unsupported(scan, path)
+    _check_unsupported(scan, path, rtti=rtti)
 
     # Out-of-line member definitions come out first, keyed by class. They
     # have to be in hand before any class is emitted, and lifting them also
@@ -9205,7 +9748,7 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     def emit_one(cls, targs):
         (names_, protos, defs, tails), cname, info = _emit_class(
             cls, names, cinfo, tsub, targs, new_used.get(cls.name),
-            chained, cls.name in std_classes)
+            chained, cls.name in std_classes, rtti=rtti)
         # Trailing newline: two instantiations of the same template are
         # emitted back to back, and without it the last line of one runs
         # into the first line of the next.
@@ -9304,6 +9847,13 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
         k = end
     if enums:
         pieces = ["".join(lifted)]
+    if rtti:
+        # Above the forward declarations, not with them: every vtable struct
+        # names `struct _CppTypeInfo` in its first row, so the descriptor has
+        # to be complete before the first of them. Emitted whenever the flag
+        # is on rather than when a cast is found -- the helpers are `static
+        # inline`, so an unused one costs nothing and warns about nothing.
+        fwd.insert(0, _RTTI_PRELUDE)
     if fwd or fwd_protos or enums:
         head = "\n".join(enums + fwd + fwd_protos) + "\n"
         # These are hoisted above everything, including any `#include
@@ -9315,6 +9865,10 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
         # along with the block that needs it.
         if re.search(r"(?<![\w])bool(?![\w])", head):
             head = "#include <stdbool.h>\n" + head
+        # Same reasoning for `offsetof`, which an interface thunk uses to
+        # step from a secondary base's vptr back to the whole object.
+        if "offsetof" in head or any("offsetof" in p for p in pieces):
+            head = "#include <stddef.h>\n" + head
         pieces.insert(0, head)
     out = "".join(pieces)
 
@@ -9388,6 +9942,13 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     # Against the directive-blanked text: a `#define`'s replacement is
     # not an expression this translation unit evaluates.
     byval = _check_by_value(_blank_directives(out), cinfo, path)
+    # Before scope and call rewriting, not after: `dynamic_cast<T *>(e)` has
+    # angle brackets and a `::`-free type name, which the scope rewriter has
+    # no reason to understand, and `typeid(x).name()` looks exactly like a
+    # method call on an object named `typeid` to the call rewriter. Lowering
+    # both here leaves those passes nothing unusual to see.
+    if rtti:
+        out = _lower_rtti(out, cinfo, path)
     out = _rewrite_scopes(out, cinfo, path)
 
     # Rewriting a call copies its arguments through verbatim, so a receiver
@@ -9398,6 +9959,10 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
         if nxt == out:
             break
         out = nxt
+    # After the rewriting, not before: a conversion this pass *could*
+    # adjust has already been lowered by now, so what is left is exactly
+    # what it could not, which is what this reports.
+    _check_ibase_conversions(out, cinfo, path)
 
     # After the rewrites, not before: `Buf c(a);` is a copy *construction*
     # until `_rewrite_scopes` turns it into `Buf c; Buf_copy(&c, &a);`, and
@@ -9488,6 +10053,10 @@ def main(argv):
     basedir = None
     incdirs = []
     clang = None
+    rtti = False
+    if "--rtti" in args:
+        rtti = True
+        args.remove("--rtti")
     if "--clang" in args:
         clang = True
         args.remove("--clang")
@@ -9537,7 +10106,7 @@ def main(argv):
     if len(args) != 1 or out_path is None:
         sys.stderr.write("usage: cpprust.py <source.cpp> -o <out.c> "
                          "[--owning Name:dropfn,..] [--basedir DIR] "
-                         "[--incdir DIR].. [-D NAME].. "
+                         "[--incdir DIR].. [-D NAME].. [--rtti] "
                          "[--clang|--no-clang]\n")
         return 2
 
@@ -9554,7 +10123,7 @@ def main(argv):
             basedir = os.path.dirname(os.path.abspath(src))
         result = translate(text, path=src, owning=owning,
                            basedir=basedir, incdirs=incdirs,
-                           defines=defines, clang=clang)
+                           defines=defines, clang=clang, rtti=rtti)
     except CppError as e:
         # The message goes where the output would have gone; the caller
         # reads it back and reports it against the `#include` line.
