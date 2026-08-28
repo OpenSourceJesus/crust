@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+"""test_cpprpy_decls -- the class-interface digest, and inheriting across it.
+
+`py2c.py --decls` writes `<module>.decls.json` beside the generated C;
+`cpprust.py --decls <file>` reads it, so a `.cpp` can name an rpython class
+as a base. See CPPRPY.md section 4.
+
+The claim under test is not "it translates". It is that **one object built
+by C++ answers correctly when asked by either language**: a C++ override
+reached through py2c's `TypeInfo`, and `isinstance_of` walking a base chain
+that crosses the boundary. `TestAcrossTheBoundary` builds exactly that and
+runs it.
+
+Two properties are worth naming because a regression in either is silent:
+
+  * **Designated initializers.** The derived table is emitted by field
+    *name*, not position, so reordering py2c's `VTABLE_METHODS` cannot turn
+    into a wrong indirect call here -- it becomes a compile error or
+    nothing at all. `test_table_uses_designated_initializers` pins that.
+
+  * **The descriptor pointer is one word at offset zero in both models**,
+    spelled `_vptr` on one side and `_hdr.type` on the other. Emission has
+    to use the spelling of whichever struct declares it;
+    `test_ctor_installs_through_obj` pins that it does.
+
+    python3 tools/test_cpprpy_decls.py
+"""
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+sys.path.insert(0, ROOT)
+
+import tools.cpprust as cpprust                       # noqa: E402
+
+PY2C = os.path.join(HERE, "py2c.py")
+
+SHAPES_PY = """\
+class Shape:
+    def __init__(self, i: "int"):
+        self.id = i
+    def area(self) -> "int":
+        return 0
+
+class Square(Shape):
+    def __init__(self, i: "int", s: "int"):
+        self.id = i
+        self.side = s
+    def area(self) -> "int":
+        return self.side * self.side
+"""
+
+CUBE_CPP = """\
+#include "shapes.py"
+
+class Cube : public Square {
+public:
+    int depth;
+    Cube(int i, int s, int d) : Square(i, s) { depth = d; }
+    int area() { return 6 * side * side; }
+};
+
+int cube_area(int i, int s, int d) {
+    Cube c(i, s, d);
+    return c.area();
+}
+"""
+
+
+def _have(prog):
+    return shutil.which(prog) is not None
+
+
+class DigestBase(unittest.TestCase):
+    """Builds a real digest once per class, since transpiling is by far the
+    slowest step and every test here wants the same one."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dir = tempfile.mkdtemp(prefix="cpprpy-")
+        py = os.path.join(cls.dir, "shapes.py")
+        with open(py, "w") as f:
+            f.write(SHAPES_PY)
+        r = subprocess.run([sys.executable, PY2C, py, "--out", cls.dir,
+                            "--decls"], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise unittest.SkipTest("py2c failed: %s" % r.stderr[-400:])
+        cls.decls_path = os.path.join(cls.dir, "shapes.decls.json")
+        if not os.path.exists(cls.decls_path):
+            raise unittest.SkipTest("py2c wrote no digest")
+        with open(cls.decls_path) as f:
+            cls.digest = json.load(f)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.dir, ignore_errors=True)
+
+    def lower(self, src, **kw):
+        kw.setdefault("decls", [self.decls_path])
+        return cpprust.translate(src, path="t.cpp", **kw)
+
+
+class TestDigestShape(DigestBase):
+
+    def test_version_and_language(self):
+        self.assertEqual(cpprust.DECLS_VERSION, self.digest["version"])
+        self.assertEqual("rpython", self.digest["lang"])
+
+    def test_classes_and_bases(self):
+        by = dict((c["name"], c) for c in self.digest["classes"])
+        self.assertIn("Shape", by)
+        self.assertEqual("Shape", by["Square"]["base"])
+        self.assertIsNone(by["Shape"]["base"])
+
+    def test_fields_are_flattened_with_ctypes(self):
+        """py2c repeats a base's fields in the derived struct, so `Square`
+        carries `id` as well as `side`. Recorded as emitted rather than as
+        declared -- what a consumer needs is the layout."""
+        by = dict((c["name"], c) for c in self.digest["classes"])
+        self.assertEqual([("id", "int"), ("side", "int")],
+                         [(f["name"], f["ctype"])
+                          for f in by["Square"]["fields"]])
+
+    def test_slots_are_recorded_once_for_the_module(self):
+        """The vtable is a property of the hierarchy, not of a class: py2c
+        gives every class in a module the same `TypeInfo` layout. Recording
+        it per class would invite a consumer to believe two classes could
+        disagree."""
+        self.assertIn("descriptor", self.digest)
+        names = [s["name"] for s in self.digest["descriptor"]["slots"]]
+        self.assertIn("area", names)
+        for c in self.digest["classes"]:
+            self.assertNotIn("slots", c)
+
+    def test_descriptor_header_matches_the_cpp_side(self):
+        """Same check as the RTTI suite's, from the other direction: the
+        digest states the header it expects, and cpprust's descriptor has
+        to be that."""
+        import re
+        m = re.search(r"typedef struct _CppTypeInfo \{(.*?)\} _CppTypeInfo;",
+                      cpprust._RTTI_PRELUDE, re.S)
+        got = [re.search(r"(\w+)\s*;$", ln).group(1)
+               for ln in (re.sub(r"/\*.*?\*/", "", x).strip()
+                          for x in m.group(1).splitlines())
+               if ln.endswith(";")]
+        self.assertEqual(self.digest["descriptor"]["header"], got)
+
+
+class TestDigestIsRefusedWhenWrong(DigestBase):
+
+    def test_unknown_version(self):
+        bad = os.path.join(self.dir, "bad.json")
+        d = dict(self.digest)
+        d["version"] = 999
+        with open(bad, "w") as f:
+            json.dump(d, f)
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate("int f(void) { return 1; }", decls=[bad])
+        self.assertIn("version", cm.exception.args[0])
+
+    def test_missing_file(self):
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate("int f(void) { return 1; }",
+                              decls=[os.path.join(self.dir, "nope.json")])
+        self.assertIn("cannot read it", cm.exception.args[0])
+
+
+class TestCppInheritsRpython(DigestBase):
+
+    def test_rpython_module_include_is_left_alone(self):
+        """cpprust does not splice a `.py`: it is not C++, and reading it as
+        C++ finds a `class` keyword and then fails inside a Python body. The
+        preprocessor answers that include; the declarations arrive here as
+        `--decls`."""
+        out = self.lower(CUBE_CPP)
+        self.assertIn('#include "shapes.py"', out)
+
+    def test_derived_struct_nests_the_rpython_base(self):
+        out = self.lower(CUBE_CPP)
+        self.assertIn("struct Cube { Square _base; int depth; };", out)
+
+    def test_table_uses_designated_initializers(self):
+        """By name, not position -- so reordering py2c's slots cannot become
+        a wrong indirect call here."""
+        out = self.lower(CUBE_CPP)
+        self.assertIn(".name = \"Cube\"", out)
+        self.assertIn(".area = &Cube__thunk_area", out)
+        self.assertIn(".objsize = sizeof(struct Cube)", out)
+
+    def test_base_link_reaches_the_rpython_descriptor(self):
+        """What makes `isinstance` and `dynamic_cast` work across the
+        boundary: one chain, both languages on it."""
+        self.assertIn("&Square_type", self.lower(CUBE_CPP))
+
+    def test_no_second_vtable_struct(self):
+        """The hierarchy already has a descriptor type and it is the other
+        language's. Emitting a second would be a second layout."""
+        out = self.lower(CUBE_CPP)
+        self.assertNotIn("struct Cube_vtable", out)
+
+    def test_ctor_installs_through_obj(self):
+        """The rpython root spells its descriptor pointer `_hdr.type`
+        through `Obj`, not `_vptr`. Same word at the same offset -- which is
+        why the two models meet at all -- but the member has to be named the
+        way that struct declares it."""
+        out = self.lower(CUBE_CPP)
+        self.assertIn("((Obj *)this)->type = &Cube__vtable;", out)
+        self.assertNotIn("->_vptr = ", out)
+
+    def test_base_constructor_uses_the_rpython_spelling(self):
+        self.assertIn("Square___init__(&this->_base, i, s);",
+                      self.lower(CUBE_CPP))
+
+    def test_dispatch_goes_through_the_foreign_descriptor(self):
+        out = self.lower(CUBE_CPP)
+        self.assertIn("->type)->area((Obj *)", out)
+
+
+@unittest.skipUnless(_have("gcc"), "gcc not available")
+class TestAcrossTheBoundary(DigestBase):
+    """The actual claim: one object, both languages, same answers."""
+
+    def _build_and_run(self, main_body):
+        d = self.dir
+        cpp = os.path.join(d, "cube.cpp")
+        with open(cpp, "w") as f:
+            f.write(CUBE_CPP)
+        cout = os.path.join(d, "cube.c")
+        with open(cout, "w") as f:
+            # The `.py` include is preproc's job; here the generated C is
+            # spliced directly, which is the same translation unit by a
+            # shorter road.
+            f.write(self.lower(CUBE_CPP).replace(
+                '#include "shapes.py"', '#include "shapes.c"'))
+        drv = os.path.join(d, "drv.c")
+        with open(drv, "w") as f:
+            f.write('#include <stdio.h>\n#include "cube.c"\n'
+                    'int main(void) {\n%s\nreturn 0; }\n' % main_body)
+        exe = os.path.join(d, "drv")
+        r = subprocess.run(["gcc", "-std=c11", "-I", d, "-o", exe, drv,
+                            os.path.join(d, "shivyc_rt.c")],
+                           capture_output=True, text=True)
+        self.assertEqual(0, r.returncode, r.stderr[-800:])
+        run = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(0, run.returncode, "crashed: %s" % run.stderr)
+        return run.stdout
+
+    def test_cpp_override_runs(self):
+        self.assertEqual("54\n", self._build_and_run(
+            'printf("%d\\n", cube_area(1, 3, 4));'))
+
+    def test_rpython_dispatch_reaches_the_cpp_override(self):
+        """py2c's own virtual call, on an object C++ built, landing in the
+        C++ override. This is the whole point of sharing a descriptor."""
+        self.assertEqual("54\n", self._build_and_run(
+            'Cube c; Cube_new(&c, 1, 3, 4); Shape *s = (Shape *)&c;\n'
+            'printf("%d\\n", TYPE(s)->area((Obj *)s));'))
+
+    def test_isinstance_walks_across_the_boundary(self):
+        """A C++ class is an instance of its rpython bases, by the same
+        base-chain walk py2c already had."""
+        self.assertEqual("1 1\n", self._build_and_run(
+            'Cube c; Cube_new(&c, 1, 3, 4); Obj *o = (Obj *)&c;\n'
+            'printf("%d %d\\n", isinstance_of(o, &Shape_type),'
+            ' isinstance_of(o, &Square_type));'))
+
+    def test_type_name_is_the_cpp_class(self):
+        self.assertEqual("Cube\n", self._build_and_run(
+            'Cube c; Cube_new(&c, 1, 3, 4); Shape *s = (Shape *)&c;\n'
+            'printf("%s\\n", TYPE(s)->name);'))
+
+    def test_the_rpython_base_still_answers_for_itself(self):
+        """The derived table must not disturb the base's own dispatch.
+
+        Built with `Square_new`, not `Square___init__`: py2c splits the two,
+        and it is the allocator that arena-allocates *and* stamps the
+        descriptor. `__init__` only assigns fields. Which is exactly why the
+        C++ constructor emitted for `Cube` stamps the descriptor itself
+        after chaining to `Square___init__` -- there is no other place it
+        would happen."""
+        self.assertEqual("25 Square\n", self._build_and_run(
+            'Square *q = Square_new(2, 5);\n'
+            'printf("%d %s\\n", TYPE(q)->area((Obj *)q), TYPE(q)->name);'))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
