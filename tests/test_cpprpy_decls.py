@@ -223,6 +223,67 @@ class TestCppInheritsRpython(DigestBase):
         self.assertIn("->type)->area((Obj *)", out)
 
 
+class TestCppProducesADigest(DigestBase):
+    """`cpprust --emit-decls` writes the same shape py2c does. The consumer
+    for it is py2c -- so an rpython class can subclass a C++ one -- which is
+    not wired up yet; what is pinned here is that the artifact is produced
+    and is the same artifact."""
+
+    POOL = """\
+class Pool {
+public:
+    int cap;
+    int used;
+    Pool(int c) { cap = c; used = 0; }
+    virtual ~Pool() { }
+    virtual int take() { used = used + 1; return used; }
+};
+"""
+
+    def _emit(self):
+        out = os.path.join(self.dir, "pool.decls.json")
+        cpprust.translate(self.POOL, path="pool.cpp", rtti=True,
+                          decls_out=out)
+        with open(out) as f:
+            return json.load(f)
+
+    def test_same_version_and_shape_as_the_rpython_digest(self):
+        d = self._emit()
+        self.assertEqual(self.digest["version"], d["version"])
+        self.assertEqual(sorted(self.digest.keys()), sorted(d.keys()))
+        self.assertEqual("cpp", d["lang"])
+
+    def test_descriptor_header_agrees_with_the_rpython_one(self):
+        """The two languages publish the same header, which is the claim
+        the whole digest rests on."""
+        self.assertEqual(self.digest["descriptor"]["header"],
+                         self._emit()["descriptor"]["header"])
+
+    def test_fields_and_slots(self):
+        d = self._emit()
+        c = d["classes"][0]
+        self.assertEqual([("cap", "int"), ("used", "int")],
+                         [(f["name"], f["ctype"]) for f in c["fields"]])
+        self.assertIn("take", [s["name"] for s in d["descriptor"]["slots"]])
+
+    def test_concrete_class_publishes_its_table_as_the_descriptor(self):
+        """A concrete class *is* its own descriptor -- the vtable's header
+        prefix -- so the symbol is the table. Published so a consumer need
+        not know that rule."""
+        self.assertEqual("Pool__vtable", self._emit()["classes"][0]["typeinfo"])
+
+    def test_cpprust_refuses_to_consume_a_cpp_digest(self):
+        """Not the intended direction, and it cannot work as written: a
+        derived table needs the base's per-class `struct <B>_vtable`, which
+        a digest does not carry. Refused rather than half-supported."""
+        out = os.path.join(self.dir, "pool.decls.json")
+        self._emit()
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate("class D : public Pool { public: int f; };",
+                              decls=[out])
+        self.assertIn("cannot yet inherit from one", cm.exception.args[0])
+
+
 @unittest.skipUnless(_have("gcc"), "gcc not available")
 class TestAcrossTheBoundary(DigestBase):
     """The actual claim: one object, both languages, same answers."""
