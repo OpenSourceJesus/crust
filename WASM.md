@@ -241,6 +241,23 @@ from the pointer's *pointee type* rather than from the argument values, so an
 implicit conversion at the call site cannot quietly produce a signature the
 callee does not have.
 
+wasm2c makes the same check. A reference carries the identity of its
+signature alongside its pointer -- `struct { void *ptr; u32 type; }` -- rather
+than the table slot carrying it, because a reference *moves*: `ref.func` puts
+one in a local, `table.set` stores it, `table.copy` moves it again, and a
+parallel array of types would have to be kept in step through all of that.
+Carrying it in the value means an indirect call can check wherever the
+reference came from.
+
+Signature identities are canonicalised on the *shape*, not on the module's
+type indices, which may list one shape twice -- two indices for one signature
+would make a legitimate call trap.
+
+Without the check an indirect call is a cast and a jump, so a table entry of
+the wrong shape would be called with arguments read from wherever the ABI
+left them. `wasm_ref_difftest.py` carries `funcref_type_mismatch_traps` for
+exactly that case.
+
 ## Aggregate copies
 
 Struct assignment lowers to `memory.copy` (bulk memory), one instruction
