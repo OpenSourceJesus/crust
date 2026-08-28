@@ -527,22 +527,42 @@ def truthy(st: "St", v: "V") -> "int":
 
 # ---- equality / ordering (value semantics for scalars) ----
 def _strcmp(a: "char*", b: "char*") -> "int":
-    # Single pass, null-terminated: stop at the first differing byte (the cheap
-    # "prefix compare" German strings get for free) instead of scanning both
-    # strings to length first. Most compares -- dict keys, attr/method names,
+    # Stop at the first differing byte (the cheap "prefix compare" German
+    # strings get for free). Most compares -- dict keys, attr/method names,
     # grammar tokens -- differ in the first byte or two, so this exits early.
+    #
+    # Bounded by the shorter length rather than by a NUL. Reading `a[i]` past
+    # the end and relying on the terminator is a C idiom, and it is correct
+    # in the generated C -- but this same source runs on the reference VM
+    # under CPython, where an index past the end raises rather than yielding
+    # zero. So *every equal comparison crashed the oracle*: two equal strings
+    # never differ, so the loop always ran off the end, and a prefix did the
+    # same. Only strings differing before either ended worked, which is why
+    # the failure hid -- most compares do differ early.
+    #
+    # The two `len()` calls are what the previous version was written to
+    # avoid. They cost a `strlen` each in C, which is vectorised, against a
+    # byte-at-a-time loop that still exits at the first difference; the early
+    # exit is preserved and the oracle works.
+    na = len(a)
+    nb = len(b)
+    n = na
+    if nb < n:
+        n = nb
     i = 0
-    while 1:
+    while i < n:
         ca = ord(a[i])
         cb = ord(b[i])
         if ca != cb:
             if ca < cb:
                 return -1
             return 1
-        if ca == 0:                          # equal so far and both ended
-            return 0
         i = i + 1
-    return 0
+    if na == nb:                             # equal for the whole length
+        return 0
+    if na < nb:                              # a is a proper prefix of b
+        return -1
+    return 1
 
 
 def v_eq_bool(x: "V", y: "V") -> "int":
