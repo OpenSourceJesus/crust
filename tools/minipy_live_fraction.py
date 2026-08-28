@@ -89,6 +89,22 @@ while i < 3000:
     total = total + mk(i)[1]
     i = i + 1
 """,
+    # Exists for the root cross-check rather than for the live figure: the
+    # container dies exactly at the return, so a frame left on `st.frames`
+    # by a missing pop retains something the stack walk does not see. The
+    # other programs cannot tell the two root sets apart, because whatever
+    # their frames hold is still reachable from the caller afterwards.
+    "dead-at-return": """
+def waste(i):
+    tmp = [i, i, i]
+    return i + 1
+
+total = 0
+i = 0
+while i < 3000:
+    total = total + waste(i)
+    i = i + 1
+""",
     "scalar-only": """
 total = 0
 i = 0
@@ -123,6 +139,28 @@ def _stack_register_arrays():
         f = f.f_back
         depth += 1
     return out
+
+
+def _active_run_func_frames():
+    """How many `run_func` activations are on the interpreter's stack.
+
+    `st.frames` should have exactly one entry per activation. A missing push
+    or pop shows up here and nowhere else, because pooling makes the arrays
+    themselves indistinguishable.
+    """
+    n = 0
+    depth = 0
+    try:
+        f = sys._getframe(1)
+    except ValueError:
+        return None
+    while f is not None and depth < 200000:
+        if f.f_code.co_name == "run_func" \
+                and f.f_globals.get("__name__", "").endswith("minipy.interp"):
+            n += 1
+        f = f.f_back
+        depth += 1
+    return n
 
 
 def _trace(st, extra_roots):
@@ -171,8 +209,12 @@ def _trace(st, extra_roots):
     push_seq(getattr(st, "mcache_fidx", []))
     if hasattr(getattr(st, "exc_val", None), "tag"):
         push_v(st.exc_val)
-    for arr in st.regpool or ():
-        push_seq(arr)
+    # `st.regpool` is deliberately NOT a root. It holds register arrays no
+    # frame is using, and their contents are stale by definition: on reuse,
+    # every named local is overwritten with an argument or cleared to None,
+    # and temps are written before they are read. Tracing them would keep
+    # the last call's garbage alive -- which is the conservative-root
+    # problem, and on these workloads it is most of the heap.
     for arr in extra_roots:
         push_seq(arr)
 
@@ -195,7 +237,8 @@ def measure(name, src, interval=100):
                       object_hook=hook)
 
     orig = interp._heap_put
-    state = {"n": 0, "peak": 0, "worst": None, "rows": []}
+    state = {"n": 0, "peak": 0, "worst": None, "rows": [],
+             "mismatch": None, "depth": None}
 
     def counting(st, kind, items):
         r = orig(st, kind, items)
@@ -204,7 +247,28 @@ def measure(name, src, interval=100):
         if n > state["peak"]:
             state["peak"] = n
         if state["n"] % interval == 0 and n > 0:
-            live = len(_trace(st, _stack_register_arrays()))
+            # Two independent root sets, traced separately and compared.
+            #
+            # `st.frames` is what a collector would use; walking the
+            # interpreter's own Python stack is what this script had to do
+            # before that field existed. They should name the same live set
+            # -- and if they ever do not, `st.frames` is missing a push or a
+            # pop, which is the one bug in this area that a collector turns
+            # into freeing a live object. Cheap to check here and very
+            # expensive to find later.
+            walked = _trace(st, _stack_register_arrays())
+            declared = _trace(st, list(getattr(st, "frames", []) or []))
+            if walked != declared:
+                state["mismatch"] = (len(walked), len(declared))
+            # And the structural invariant, which is the one that catches a
+            # missing pop. The value comparison above cannot: frame pooling
+            # recycles the array, so a stale entry in `st.frames` points at
+            # the *same object* the live frame is using and traces to the
+            # same set. Depth is what actually differs.
+            depth = _active_run_func_frames()
+            if depth is not None and depth != len(getattr(st, "frames", [])):
+                state["depth"] = (depth, len(st.frames))
+            live = len(walked)
             state["rows"].append((n, live))
             frac = live / float(n)
             if state["worst"] is None or frac < state["worst"][2]:
@@ -217,6 +281,14 @@ def measure(name, src, interval=100):
     finally:
         interp._heap_put = orig
 
+    if state["depth"] is not None:
+        a, b = state["depth"]
+        print("  !! FRAME DEPTH in %s: %d active run_func, st.frames has %d"
+              % (name, a, b))
+    if state["mismatch"] is not None:
+        w, d = state["mismatch"]
+        print("  !! ROOT MISMATCH in %s: stack-walk found %d live, "
+              "st.frames found %d" % (name, w, d))
     if not state["rows"]:
         # Too few allocations for the interval to fire. Sample once at the
         # end instead of reporting nothing: a program that allocates almost
