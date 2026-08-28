@@ -198,6 +198,29 @@ def build_funcref_cases():
     m2.needs_table = True
     m2.table_entries.append("target")
     out.append(("funcref_null_traps", w.module_bytes(m2)))
+
+    # A table slot holding a function of the *wrong shape*, called through a
+    # signature it does not have. Engines check this at run time and trap;
+    # generated C that only cast the pointer would make the call anyway, with
+    # arguments read from wherever the ABI happened to leave them. This is
+    # the case that check exists for.
+    m3 = w.WasmModule()
+    m3.declare_func("two", [w.I32, w.I32], [w.I32])
+    tb3 = w.FuncBody()
+    tb3.local_get(0)
+    tb3.local_get(1)
+    tb3.op(w.I32_BIN["add"])
+    m3.set_body("two", tb3)
+    m3.declare_func("run", [], [w.I32])
+    b3 = w.FuncBody()
+    b3.const_i32(5)
+    b3.const_i32(1)
+    b3.call_indirect(m3.type_index([w.I32], [w.I32]))
+    m3.set_body("run", b3)
+    m3.export_func("run")
+    m3.needs_table = True
+    m3.table_entries.append("two")
+    out.append(("funcref_type_mismatch_traps", w.module_bytes(m3)))
     return out
 
 

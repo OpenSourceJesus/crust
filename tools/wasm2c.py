@@ -474,17 +474,19 @@ class FunctionWriter:
         # ---- reference types
         if op == "ref.null":
             dst = self.push(ins.args[0])
-            self.emit("%s = 0;" % dst)
+            self.emit("%s = wasm_ref_null();" % dst)
             return
         if op == "ref.is_null":
             src, _ = self.pop()
             dst = self.push(w.I32)
-            self.emit("%s = (%s == 0);" % (dst, src))
+            self.emit("%s = (%s.ptr == 0);" % (dst, src))
             return
         if op == "ref.func":
             dst = self.push(reader.FUNCREF)
-            self.emit("%s = (wasm_ref)%s;"
-                      % (dst, func_c_name(self.mod, ins.args[0])))
+            ft = self.mod.type_of_func(ins.args[0])
+            self.emit("%s = wasm_ref_func((void*)%s, %du);"
+                      % (dst, func_c_name(self.mod, ins.args[0]),
+                         self.mod.sig_ids[sig_key(ft)]))
             return
         if op == "table.get":
             idx, _ = self.pop()
@@ -831,8 +833,9 @@ class FunctionWriter:
         # the outer parentheses C reads this as casting the call's *result*,
         # and then applies the arguments to a function it thinks returns u32.
         cast = "(%s (*)(%s))" % (ret, sig)
-        call = "((%swasm_funcref(%d, %s)))(%s)" % (cast, table_index, idx,
-                                                   ", ".join(args))
+        want = self.mod.sig_ids[sig_key(ftype)]
+        call = "((%swasm_funcref(%d, %s, %du)))(%s)" % (
+            cast, table_index, idx, want, ", ".join(args))
         if ftype.results:
             dst = self.push(ftype.results[0])
             self.emit("%s = %s;" % (dst, call))
@@ -919,6 +922,28 @@ class FunctionWriter:
                       % (dst, ctype, a, INFIX[base], b))
             return
         raise Wasm2CError("unhandled instruction '%s'" % op)
+
+
+def sig_key(ftype):
+    """A canonical name for a signature.
+
+    The module's own type section may list the same shape twice, so the type
+    index cannot be used as an identity: two indices for one signature would
+    make a legitimate indirect call trap. Canonicalising on the shape itself
+    avoids that.
+    """
+    return "%s->%s" % (",".join(str(p) for p in ftype.params),
+                       ",".join(str(r) for r in ftype.results))
+
+
+def build_sig_ids(mod):
+    """Signature key -> small integer, assigned in a stable order."""
+    ids = {}
+    for ft in mod.types:
+        k = sig_key(ft)
+        if k not in ids:
+            ids[k] = len(ids)
+    return ids
 
 
 def _needs_table(mod):
@@ -1038,8 +1063,26 @@ def write_module(mod, module_name="module", emit_main=True):
     # entries are function pointers cast to void*, which is what makes
     # call_indirect a cast and a call; an externref table's entries are
     # whatever the host put there.
-    ap("/* A reference is opaque: null, a function, or a host value. */")
-    ap("typedef void *wasm_ref;")
+    mod.sig_ids = build_sig_ids(mod)
+
+    ap("/* A reference: a pointer, plus the identity of the signature it has")
+    ap(" * if it is a function.")
+    ap(" *")
+    ap(" * The type travels *with* the reference rather than alongside the")
+    ap(" * table slot, because a reference moves -- ref.func puts one in a")
+    ap(" * local, table.set stores it somewhere else, table.copy moves it")
+    ap(" * again -- and a parallel array of types would have to be kept in")
+    ap(" * step through every one of those. Carrying it in the value means")
+    ap(" * call_indirect can check the signature wherever the reference came")
+    ap(" * from.")
+    ap(" *")
+    ap(" * Without that check an indirect call is a cast and a jump, and a")
+    ap(" * module whose table holds a function of the wrong shape gets a")
+    ap(" * call with mismatched arguments -- reading whatever happened to be")
+    ap(" * in the argument registers. Engines check this at run time; so must")
+    ap(" * generated C that might see a module it did not produce. */")
+    ap("typedef struct { void *ptr; u32 type; } wasm_ref;")
+    ap("#define WASM_REF_NULL_TYPE 0xFFFFFFFFu")
     ap("")
     tables = mod.tables
     if not tables and (mod.table_size or _needs_table(mod)):
@@ -1049,7 +1092,6 @@ def write_module(mod, module_name="module", emit_main=True):
         ap(" * a funcref table, a host value for an externref table. Null is")
         ap(" * a null reference, which is what makes an indirect call through")
         ap(" * an empty slot trap rather than jump somewhere. */")
-        ap("typedef void *wasm_ref;")
         ap("typedef void (*wasm_anyfunc)(void);")
         for i in range(len(tables)):
             t = tables[i]
@@ -1079,16 +1121,25 @@ def write_module(mod, module_name="module", emit_main=True):
         ap('  if (i >= wasm_table_size(t)) wasm_trap("undefined element");')
         ap("  return wasm_table_base(t)[i];")
         ap("}")
+        ap("static wasm_ref wasm_ref_null(void) {")
+        ap("  wasm_ref r; r.ptr = 0; r.type = WASM_REF_NULL_TYPE; return r;")
+        ap("}")
+        ap("static wasm_ref wasm_ref_func(void *p, u32 ty) {")
+        ap("  wasm_ref r; r.ptr = p; r.type = ty; return r;")
+        ap("}")
         ap("static void wasm_table_set(u32 t, u32 i, wasm_ref v) {")
         ap('  if (i >= wasm_table_size(t)) wasm_trap("undefined element");')
         ap("  wasm_table_base(t)[i] = v;")
         ap("}")
-        ap("/* An indirect call needs a *non-null* funcref; a null slot is")
-        ap(" * the classic uninitialised-table trap. */")
-        ap("static wasm_anyfunc wasm_funcref(u32 t, u32 i) {")
+        ap("/* An indirect call needs a non-null funcref *of the expected")
+        ap(" * signature*. Both checks trap; the second is what stops a")
+        ap(" * mismatched table entry becoming a call with the wrong")
+        ap(" * arguments. */")
+        ap("static wasm_anyfunc wasm_funcref(u32 t, u32 i, u32 want) {")
         ap("  wasm_ref r = wasm_table_get(t, i);")
-        ap('  if (!r) wasm_trap("uninitialized element");')
-        ap("  return (wasm_anyfunc)r;")
+        ap('  if (!r.ptr) wasm_trap("uninitialized element");')
+        ap('  if (r.type != want) wasm_trap("indirect call type mismatch");')
+        ap("  return (wasm_anyfunc)r.ptr;")
         ap("}")
         ap("static u32 wasm_table_grow(u32 t, wasm_ref init, u32 n) {")
         ap("  u32 old = wasm_table_size(t), k;")
@@ -1125,11 +1176,16 @@ def write_module(mod, module_name="module", emit_main=True):
             seg = passive[i]
             entries = []
             for item in seg.items:
-                entries.append("0" if item is None
-                               else "(wasm_ref)%s"
-                               % func_c_name(mod, item))
-            ap("static wasm_ref wasm_elem%d[] = {%s};"
-               % (i, ", ".join(entries) if entries else "0"))
+                if item is None:
+                    entries.append("{ 0, WASM_REF_NULL_TYPE }")
+                else:
+                    entries.append(
+                        "{ (void*)%s, %du }"
+                        % (func_c_name(mod, item),
+                           mod.sig_ids[sig_key(mod.type_of_func(item))]))
+            ap("static const wasm_ref wasm_elem%d[] = {%s};"
+               % (i, ", ".join(entries) if entries
+                  else "{ 0, WASM_REF_NULL_TYPE }"))
         ap("static void wasm_table_init(u32 t, u32 e, u32 d, u32 s, u32 n) {")
         ap("  const wasm_ref *src = 0; u32 len = 0, k;")
         for i in range(len(passive)):
@@ -1222,6 +1278,18 @@ def write_module(mod, module_name="module", emit_main=True):
     ap("u64 wasm_memory_size(void) { return MEM_SIZE; }")
     ap("")
     ap("void wasm_init(void) {")
+    if tables:
+        ap("  /* A table starts full of null references. Zeroing the memory")
+        ap("   * would leave type 0, which is a real signature -- so the")
+        ap("   * slots are filled explicitly. */")
+        ap("  { u32 _i;")
+        for i in range(len(tables)):
+            t_i = tables[i]
+            cap = (t_i.maximum if t_i.maximum >= 0
+                   else max(t_i.minimum * 2, 1024))
+            ap("    for (_i = 0; _i < %du; _i++) wasm_tab%d[_i] = "
+               "wasm_ref_null();" % (max(cap, 1), i))
+        ap("  }")
     ap("  /* calloc, so memory starts zeroed as the specification requires;")
     ap("   * the data segments are then laid over it. */")
     ap("  size_t _init = (size_t)MEM_INITIAL_PAGES * 65536u;")
@@ -1235,9 +1303,11 @@ def write_module(mod, module_name="module", emit_main=True):
         for k in range(len(seg.items)):
             if seg.items[k] is None:
                 continue
-            ap("  wasm_tab%d[%d] = (wasm_ref)%s;"
+            fidx = seg.items[k]
+            ap("  wasm_tab%d[%d] = wasm_ref_func((void*)%s, %du);"
                % (seg.table_index, seg.offset + k,
-                  func_c_name(mod, seg.items[k])))
+                  func_c_name(mod, fidx),
+                  mod.sig_ids[sig_key(mod.type_of_func(fidx))]))
     ap("}")
     ap("")
 
@@ -1256,7 +1326,11 @@ def write_module(mod, module_name="module", emit_main=True):
     for exp in mod.exports:
         if exp.kind != w.EXTERNAL_KIND_FUNC:
             continue
-        if exp.name in ("main", "_start"):
+        if emit_main and exp.name in ("main", "_start"):
+            # These two are reachable through the generated entry point, and
+            # a wrapper called `main` would clash with it. Without an entry
+            # point there is no clash, and a caller linking this module in
+            # needs the wrapper like any other export.
             continue
         ft = mod.type_of_func(exp.index)
         ret = VALTYPE[ft.results[0]][0] if ft.results else "void"
