@@ -2309,6 +2309,7 @@ def _tlist_prelude(et):
 
 KNOWN_CLASSES = {}      # name -> ClassInfo
 VTABLE_METHODS = set()  # method names that are virtual somewhere in the module
+EMIT_DECLS = False       # --decls: also write <module>.decls.json
 _XMOD_CACHE = {}        # dotted module name -> imported-symbol registry
 
 # Directories to search when resolving a co-compiled local module by its bare
@@ -16059,6 +16060,61 @@ def _stdlib_context(path, stdlib_dir=None):
 SHOW_OBJECT_MODEL = False
 
 
+#: The digest a `.py` publishes so a `.cpp` can inherit from its classes,
+#: and vice versa. One artifact, two producers, two consumers -- see
+#: CPPRPY.md section 4. Bumped when the shape changes; a consumer that
+#: reads a version it does not know refuses rather than guesses.
+DECLS_VERSION = 1
+
+
+def emit_decls(t, modname):
+    """The class-interface digest for a transpiled module.
+
+    What a *consumer* needs is narrower than what the transpiler knows: the
+    struct's name and field types (to lay out a derived class), the
+    descriptor symbol (to link a base chain), and the canonical vtable slot
+    list (to emit a table that is layout-compatible slot for slot).
+
+    The slot list is recorded **once, for the module**, not per class. That
+    is not a compression: py2c gives every class in a module the same
+    `TypeInfo` layout, so the vtable is a property of the hierarchy rather
+    than of any one class, and writing it per class would invite a consumer
+    to believe two classes could disagree.
+
+    Field *access* is deliberately not described. py2c repeats a base's
+    fields in the derived struct (`{Obj, id, side}`) where cpprust nests the
+    base (`{{vptr, id}, side}`); those are the same bytes in the same order
+    but spelled differently, so each side reaches a field its own way and
+    only the layout has to agree.
+    """
+    slots = []
+    for mname in sorted(VTABLE_METHODS):
+        ret, params, _ = t.method_proto(mname)
+        slots.append({"name": mname, "ret": ret, "params": list(params)})
+    classes = []
+    for ci in t.class_order:
+        methods = []
+        for mname in sorted(ci.methods):
+            methods.append({"name": mname,
+                            "virtual": mname in VTABLE_METHODS,
+                            "fn": "%s_%s" % (ci.csym, mname)})
+        classes.append({
+            "name": ci.name,
+            "struct": ci.csym,
+            "base": ci.base.name if ci.base else ci.base_name,
+            "ibases": list(ci.extra_base_names),
+            "typeinfo": "%s_type" % ci.csym,
+            "fields": [{"name": n, "ctype": c} for n, c in ci.full_fields()],
+            "methods": methods,
+        })
+    return {"version": DECLS_VERSION, "lang": "rpython", "module": modname,
+            "descriptor": {"type": "TypeInfo",
+                           "header": ["name", "base", "fields", "tostr",
+                                      "eq", "addfn", "objsize"],
+                           "slots": slots},
+            "classes": classes}
+
+
 def transpile_file(path, out_dir, stdlib_dir=None):
     # Profile-guided auto-typing: when RPY_PROFILE_GENERATE is set, profile the
     # user's script and compile an auto-annotated copy instead. Single user
@@ -16124,6 +16180,12 @@ def transpile_file(path, out_dir, stdlib_dir=None):
     out_path = os.path.join(out_dir, modname + ".c")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(out)
+    if EMIT_DECLS:
+        import json as _json
+        dpath = os.path.join(out_dir, modname + ".decls.json")
+        with open(dpath, "w", encoding="utf-8") as f:
+            _json.dump(emit_decls(_t, modname), f, indent=1, sort_keys=True)
+        print("  decls -> %s" % dpath)
     # Always surface the high-precision "object stored in a scalar field"
     # diagnostics (these indicate a real truncation bug). The full POD/object
     # table is opt-in via --show-object-model.
@@ -16291,6 +16353,14 @@ def main(argv):
         if a == "--report":
             report_path = argv[i + 1]
             i += 2
+            continue
+        if a == "--decls":
+            # Also write `<module>.decls.json`: the class-interface digest a
+            # `.cpp` reads to inherit from these classes. Off by default --
+            # a build that mixes no languages has no use for it.
+            global EMIT_DECLS
+            EMIT_DECLS = True
+            i += 1
             continue
         if a in ("--show-object-model", "--show-objmodel"):
             global SHOW_OBJECT_MODEL

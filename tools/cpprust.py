@@ -1621,6 +1621,14 @@ def _expand_headers(text, basedir, incdirs=(), seen=None, depth=0,
     for m in _ANY_INCLUDE.finditer(text):
         name = m.group(1) or m.group(2)
         angled = m.group(1) is None
+        # An rpython module is not spliced. It is not C++, and reading it as
+        # C++ finds a `class` keyword and then fails inside a body that is
+        # Python. The preprocessor answers this include by transpiling the
+        # module and splicing the *C*; what this pass needs from it is the
+        # declarations, which arrive separately as `--decls`. So the line is
+        # left exactly where it is, for preproc to handle downstream.
+        if name.endswith(".py"):
+            continue
         out.append(text[last:m.start()])
         last = m.end()
         # The including file's own directory first, then the search path --
@@ -3118,6 +3126,104 @@ def _slot_fn(slot, impl):
     return "%s_%s" % (impl, slot["name"])
 
 
+#: The digest version this reads. A file claiming another one is refused
+#: rather than guessed at: the whole point of the artifact is that both
+#: sides agree on a layout, so a disagreement about its shape is exactly
+#: the thing not to paper over.
+DECLS_VERSION = 1
+
+
+def load_decls(paths):
+    """Read class-interface digests into `cinfo` entries.
+
+    A class from a digest is *external*: its struct, its descriptor and its
+    methods are emitted by the other language and are already in this
+    translation unit, because the `.py` was spliced in above. What this
+    needs from the digest is only enough to inherit: the fields (so a
+    derived struct lays out behind them), the descriptor symbol (so the
+    base chain links), and the virtual slot names (so an override is known
+    to be one).
+
+    Slot *order* is deliberately not used. A derived table is emitted with
+    designated initializers, so the C compiler places each slot by name in
+    whatever order the other language's descriptor declares -- which means
+    a reordering there cannot silently produce a wrong indirect call here.
+    The order is still carried in the digest, because a future consumer
+    that must emit a positional table will need it.
+    """
+    import json
+    out = {}
+    for path in paths or ():
+        try:
+            with open(path) as f:
+                d = json.load(f)
+        except (IOError, ValueError) as e:
+            raise CppError("--decls %s: cannot read it (%s)" % (path, e))
+        if d.get("version") != DECLS_VERSION:
+            raise CppError(
+                "--decls %s: this is version %r and cpprust reads version "
+                "%d. Regenerate it with the py2c that matches this tree."
+                % (path, d.get("version"), DECLS_VERSION))
+        desc = d.get("descriptor") or {}
+        vnames = set(sl["name"] for sl in desc.get("slots") or ())
+        for c in d.get("classes") or ():
+            slots = []
+            for sl in desc.get("slots") or ():
+                # The declaring class is the hierarchy root as far as this
+                # side is concerned; `impl` is a name, not a class here,
+                # since the other language already emitted the function.
+                slots.append({"name": sl["name"], "decl": "Obj",
+                              "ret": sl["ret"], "params": "", "pure": False,
+                              "impl": c["struct"], "external": True})
+            methods = {}
+            for m in c.get("methods") or ():
+                if m["name"] == "__init__":
+                    continue
+                methods[m["name"]] = {0: {
+                    "refs": set(), "owner": c["struct"], "ret": "int",
+                    "virtual": m["name"] in vnames, "decl": c["struct"],
+                    "fn": m["fn"]}}
+            out[c["struct"]] = {
+                "ctor": True, "dtor": False,
+                "ctors": {}, "methods": methods,
+                "fields": dict((f["name"], (f["ctype"], False))
+                               for f in c.get("fields") or ()),
+                "paths": dict((f["name"], f["name"])
+                              for f in c.get("fields") or ()),
+                "base": c.get("base"), "slots": slots,
+                "root": c["struct"], "abstract": False,
+                "vdtor": False, "vdtor_decl": None, "ctor_refs": set(),
+                "copy": False, "move": False, "assign": False,
+                "moveassign": False, "move_methods": {}, "deleted": {},
+                "index": None, "arrow": None, "ibases": [],
+                "ibases_all": [],
+                # What marks this as somebody else's class. Every emission
+                # path checks it before writing a struct, a table or a
+                # function: the other language wrote all three already.
+                "external": True,
+                "lang": d.get("lang") or "rpython",
+                "typeinfo": c["typeinfo"],
+                "descriptor": desc.get("type") or "TypeInfo",
+                "vslots": sorted(vnames),
+            }
+    return out
+
+
+def _ext_descriptor(cls, cinfo):
+    """The descriptor type of `cls`'s hierarchy if it is rooted in another
+    language, else None. Walking the chain rather than reading one flag
+    because a C++ class three levels below an rpython base is as much part
+    of that hierarchy as its immediate child."""
+    seen = set()
+    while cls in cinfo and cls not in seen:
+        seen.add(cls)
+        info = cinfo[cls]
+        if info.get("external"):
+            return info.get("descriptor") or "TypeInfo"
+        cls = info.get("base")
+    return None
+
+
 def _find_impl(mname, cls, cname, base_info):
     """The C function this class supplies for an interface slot, or None.
 
@@ -3306,6 +3412,16 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
                                if bpath else "%s." % _BASE_MEMBER))
 
     slots = _vtable_slots(cls, cname, base_info, known)
+    # Is this hierarchy rooted in a class the other language emitted? If so
+    # its descriptor type, its layout and its slot names are already fixed,
+    # and this class joins them rather than defining its own.
+    ext_root = None
+    walk = base_info
+    while walk is not None:
+        if walk.get("external"):
+            ext_root = walk
+            break
+        walk = known.get(walk.get("base")) if walk.get("base") else None
     root = (base_info["root"] if base_info else cname) if slots else None
     abstract = any(s["impl"] is None for s in slots)
 
@@ -3333,7 +3449,8 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             if s["params"]:
                 args += ", " + s["params"]
             rows.append("%s (*%s)(%s);" % (s["ret"], s["name"], args))
-        head.append("struct %s_vtable { %s };" % (cname, " ".join(rows)))
+        if not ext_root:
+            head.append("struct %s_vtable { %s };" % (cname, " ".join(rows)))
 
     parts = []
     if base:
@@ -3465,7 +3582,14 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
         pro = ""
         if base:
             bargs = initmap.pop(base, None)
-            if known[base]["ctor"]:
+            if known[base].get("external"):
+                # The other language named it `Cls___init__`, and its arity
+                # is whatever the digest's initializer takes -- checked by
+                # the C compiler rather than here, since the digest records
+                # the symbol and not its signature.
+                pro += "%s___init__(&this->_base%s); " % (
+                    base, (", " + bargs) if bargs else "")
+            elif known[base]["ctor"]:
                 bar = _arity(bargs) if bargs is not None else 0
                 if bar not in known[base]["ctors"]:
                     raise CppError(
@@ -3479,7 +3603,13 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             elif bargs is not None:
                 raise CppError("class %s: base `%s` has no constructor to "
                                "pass arguments to" % (cls.name, base))
-        if slots and not abstract:
+        if slots and not abstract and ext_root:
+            # The rpython root spells its descriptor pointer `_hdr.type`
+            # through `Obj`, not `_vptr`. Same word at the same offset --
+            # which is the whole reason the two models meet -- but the
+            # member has to be named the way that struct declares it.
+            pro += ("((Obj *)this)->type = &%s__vtable; " % cname)
+        elif slots and not abstract:
             pro += ("((%s *)this)->_vptr = "
                     "(const struct %s_vtable *)&%s__vtable; "
                     % (root, root, cname))
@@ -4051,22 +4181,43 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             entries.append(thunk)
         # The constructor installs the table, so the table has to be visible
         # before the constructor is defined -- hence prototypes first.
-        head.extend(protos)
         # The descriptor values come first because the header rows do. The
         # base link is the *nearest base that has a table*: a base with no
         # virtuals has no descriptor to point at, and a chain that skipped
         # it would claim a relationship the layout does not have.
-        vals = []
-        if rtti:
-            bref = "0"
-            if base_info and base_info.get("slots"):
-                bref = _typeinfo_ref(base, base_info)
-            vals = ["\"%s\"" % cname, bref, "0", "0", "0", "0",
-                    "sizeof(struct %s)" % cname]
-        head.append("static const struct %s_vtable %s__vtable = { %s };"
-                    % (cname, cname,
-                       ", ".join(vals + ["&" + e for e in entries])))
-        out.extend(thunks)
+        if ext_root:
+            # Designated initializers, so the *other* language's field
+            # order decides the layout and a reordering there cannot
+            # silently produce a wrong indirect call here. `base` links
+            # into its chain, which is what makes `isinstance` and
+            # `dynamic_cast` work across the boundary.
+            named = [".name = \"%s\"" % cname,
+                     ".base = (const struct %s *)&%s"
+                     % (ext_root["descriptor"], base_info["typeinfo"]
+                        if base_info.get("external")
+                        else "%s__vtable" % base),
+                     ".objsize = sizeof(struct %s)" % cname]
+            for sl, e in zip(slots, entries):
+                if sl["name"] == _DTOR_SLOT:
+                    continue
+                named.append(".%s = &%s" % (sl["name"], e))
+            head.extend(protos)
+            head.append("static const %s %s__vtable = { %s };"
+                        % (ext_root["descriptor"], cname, ", ".join(named)))
+            out.extend(thunks)
+        else:
+            vals = []
+            if rtti:
+                bref = "0"
+                if base_info and base_info.get("slots"):
+                    bref = _typeinfo_ref(base, base_info)
+                vals = ["\"%s\"" % cname, bref, "0", "0", "0", "0",
+                        "sizeof(struct %s)" % cname]
+            head.extend(protos)
+            head.append("static const struct %s_vtable %s__vtable = { %s };"
+                        % (cname, cname,
+                           ", ".join(vals + ["&" + e for e in entries])))
+            out.extend(thunks)
 
     # A table per secondary base. Emitted whether or not this class has a
     # primary table of its own: a class may implement an interface and
@@ -6392,6 +6543,14 @@ def _emit_method_call(expr, cls, is_ptr, meth, args, ent, cinfo,
         # and `&c->_vptr` parses as `&(c->_vptr)` -- the address of the
         # pointer rather than the pointer. Dispatching on a value receiver
         # emitted that and did not compile.
+        # A hierarchy rooted in the other language keeps its descriptor
+        # pointer under the name that language gave it -- `_hdr.type`
+        # through `Obj`, not `_vptr`. Same word at the same offset, so only
+        # the spelling changes; the slot is still reached by name.
+        xroot = _ext_descriptor(cls, cinfo)
+        if xroot is not None:
+            return ("((const %s *)((Obj *)%s)->type)->%s((Obj *)%s%s)"
+                    % (xroot, recv, meth, recv, tail))
         return ("((const struct %s_vtable *)(%s)->_vptr)->%s(%s%s)"
                 % (ent["decl"], cast(cinfo[cls]["root"], recv), meth,
                    cast(ent["decl"], recv), tail))
@@ -9341,7 +9500,7 @@ def _lower_lambdas(text, path):
 
 
 def translate(text, path="<cpp>", owning=None, basedir=None,
-              incdirs=(), defines=(), clang=None, rtti=False):
+              incdirs=(), defines=(), clang=None, rtti=False, decls=()):
     """Translate a C++ subset source to C. Raises CppError on anything else.
 
     `owning` maps the name of a type this file does *not* define to the
@@ -9364,6 +9523,11 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     # An `--incdir` is enough on its own: an angle include is searched only
     # there, so a caller that supplies a path but no basedir still gets its
     # headers spliced.
+    # Before anything reads the source. A digest that cannot be read or is
+    # the wrong version is a caller error, and reporting it should not
+    # depend on whether this particular file happens to declare a class --
+    # which is what deferring it to the class table did.
+    external = load_decls(decls)
     if basedir is not None or incdirs:
         text = _expand_headers(text, basedir or ".", incdirs,
                                defines=set(defines or ()))
@@ -9662,6 +9826,11 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     cinfo = dict((n, _external_info(n, fn))
                  for n, fn in sorted((owning or {}).items())
                  if n not in declared)
+    # And classes from the other language, read from a digest. Seeded the
+    # same way and for the same reason: a class emitted below should see one
+    # exactly as it sees a class declared above it, so that inheriting from
+    # an rpython class is not a special case anywhere further down.
+    cinfo.update(external)
     prev = 0
     fwd, fwd_protos, outline_bodies = [], [], []
     # A class this translation only ever *declares* -- `class element;` with
@@ -10054,6 +10223,14 @@ def main(argv):
     incdirs = []
     clang = None
     rtti = False
+    decls = []
+    while "--decls" in args:
+        i = args.index("--decls")
+        if i + 1 >= len(args):
+            sys.stderr.write("cpprust: --decls needs a file\n")
+            return 2
+        decls.append(args[i + 1])
+        del args[i:i + 2]
     if "--rtti" in args:
         rtti = True
         args.remove("--rtti")
@@ -10123,7 +10300,8 @@ def main(argv):
             basedir = os.path.dirname(os.path.abspath(src))
         result = translate(text, path=src, owning=owning,
                            basedir=basedir, incdirs=incdirs,
-                           defines=defines, clang=clang, rtti=rtti)
+                           defines=defines, clang=clang, rtti=rtti,
+                           decls=decls)
     except CppError as e:
         # The message goes where the output would have gone; the caller
         # reads it back and reports it against the `#include` line.
