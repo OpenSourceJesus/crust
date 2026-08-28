@@ -95,6 +95,15 @@ roundtrip_wasm:
 test_wasm_simd:
 	python3 tools/wasm_simd_difftest.py -v
 
+# Compiling SIMD: C intrinsics -> wasm SIMD, checked against the same source
+# built with the header's scalar fallback by an ordinary compiler.
+test_wasm_simd_compile:
+	python3 tools/wasm_simd_compile_difftest.py -v
+
+# Regenerate shivyc/include/wasm_simd128.h from the opcode table.
+gen_wasm_simd128:
+	python3 tools/gen_wasm_simd128.py
+
 # Reference types (funcref/externref): hand-built modules checked against node.
 test_wasm_ref:
 	python3 tools/wasm_ref_difftest.py -v
