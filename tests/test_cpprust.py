@@ -839,11 +839,37 @@ int use(A *p) { return p->f(); }
         self.assertIn("((const struct A_vtable *)(p)->_vptr)->f(p)", out)
         self.assertIn("C__vtable = { &C__thunk_f };", out)
 
-    def test_multiple_inheritance_is_error(self):
+    def test_multiple_inheritance_with_a_data_base_is_error(self):
+        """Multiple inheritance is in, for *interface* secondary bases. A
+        secondary base with data members is still refused: only the first
+        base is laid out as a struct prefix, so the second's fields would
+        have no storage to sit in."""
         with self.assertRaises(cpprust.CppError) as cm:
             cpprust.translate("class X { int a; }; class Y { int b; };"
                               " class Z : public X, public Y { int c; };")
-        self.assertIn("multiple inheritance", cm.exception.message)
+        self.assertIn("has data members", cm.exception.message)
+
+    def test_multiple_inheritance_with_an_interface_base_lowers(self):
+        out = cpprust.translate(
+            "class I { public: virtual int f() = 0; };"
+            " class X { public: int a; virtual ~X() { } };"
+            " class Z : public X, public I {"
+            " public: int c; int f() { return c; } };")
+        # One vptr per secondary base, after the layout base.
+        self.assertIn("struct Z { X _base; const struct I_vtable "
+                      "*_vptr_I; int c; };", out)
+        # And a table of its own, whose thunk steps back to the object.
+        self.assertIn("Z__vtable_I", out)
+        self.assertIn("offsetof(struct Z, _vptr_I)", out)
+
+    def test_virtual_inheritance_is_error(self):
+        """Refused as a design position, not a gap: a virtual base's offset
+        depends on the most-derived type, which is the property the rest of
+        this lowering is built on not needing."""
+        with self.assertRaises(cpprust.CppError) as cm:
+            cpprust.translate("class X { public: virtual int f() { return 1; } };"
+                              " class Z : public virtual X { int c; };")
+        self.assertIn("`virtual` inheritance", cm.exception.message)
 
     def test_undefined_base_is_error(self):
         with self.assertRaises(cpprust.CppError) as cm:
