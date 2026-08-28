@@ -210,13 +210,30 @@ class Cont:
 class St:
     def __init__(self, prog: "Program", glob: "list[V]", heap: "list[Cont]",
                  exc_flag: "int", exc_val: "V", regpool: "list[list[V]]",
-                 mcache_cls: "list[V]", mcache_fidx: "list[V]"):
+                 mcache_cls: "list[V]", mcache_fidx: "list[V]",
+                 frames: "list[list[V]]"):
         self.prog = prog
         self.glob = glob
         self.heap = heap
         self.exc_flag = exc_flag
         self.exc_val = exc_val
         self.regpool = regpool
+        # The register array of every frame *currently executing*, innermost
+        # last. `regpool` is its opposite: arrays no frame is using, kept for
+        # reuse. Together they account for every register array in existence.
+        #
+        # This exists so the whole root set is reachable from `st`. Calls
+        # nest by recursion, so without it a running frame's registers live
+        # only as a local of `exec_func` -- on the interpreter's own stack,
+        # which is a C stack in the native build and cannot be walked. A
+        # collector that could not see them would free everything the
+        # running frames hold.
+        #
+        # Argument arrays (`callargs` and friends) are deliberately *not*
+        # tracked. Every value in one was read out of the caller's registers
+        # a moment earlier, so it is already reachable through the caller's
+        # frame; adding them would be redundant roots, not missing ones.
+        self.frames = frames
         # Monomorphic method inline cache, indexed by method-name const id:
         # (class id seen last, resolved func idx). A CALL_METHOD whose receiver's
         # class still matches skips lookup_method entirely (no base-walk/strcmp).
@@ -2463,6 +2480,7 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
         regs = st.regpool.pop()
     else:
         regs = new_v_list()
+    st.frames.append(regs)                   # live until this frame returns
     na = len(args)
     np = fn.nparams
     va = fn.vararg                           # reg of *args param, or -1
@@ -2539,6 +2557,7 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
             _lset(regs, a, _lget(regs, b)); pc = pc + 1
         elif op == 5:
             rret = _lget(regs, a)
+            st.frames.pop()
             st.regpool.append(regs)
             return rret
         elif op == 6:
@@ -3015,8 +3034,10 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
                 pc = blocks[bn].iv         # jump to nearest handler
                 st.exc_flag = 0
             else:
+                st.frames.pop()
                 st.regpool.append(regs)
                 return v_none()            # propagate to caller
+    st.frames.pop()
     st.regpool.append(regs)
     return v_none()
 
@@ -3046,7 +3067,8 @@ def build_state(prog: "Program", sargs: "list[str]") -> "St":
         mcc.append(v_int(-1))               # -1 == empty cache slot
         mcf.append(v_int(-1))
         zc = zc + 1
-    st = St(prog, glob, heap, 0, v_none(), new_reg_pool(), mcc, mcf)
+    st = St(prog, glob, heap, 0, v_none(), new_reg_pool(), mcc, mcf,
+            new_reg_pool())
     k = 0
     while k < prog.nglobals:
         glob.append(V(17, 0))                  # unset sentinel; see LOAD_GLOBAL
