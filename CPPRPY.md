@@ -434,6 +434,47 @@ interface gave the base. Caught by a differential test against g++ (101 vs
   data-carrying secondary base, a secondary base with no virtuals, virtual
   inheritance, and a conversion whose source type is not nameable.
 
+### Step 4: the digest (a first vertical slice)
+
+`py2c.py --decls` writes `<module>.decls.json` beside the generated C;
+`cpprust.py --decls <file>` reads it, so a `.cpp` may name an rpython class
+as a base. A C++ class three levels below an rpython root dispatches through
+py2c's `TypeInfo`, and `isinstance_of` walks a chain that crosses the
+boundary.
+
+Four things the build taught, none of them visible from the design:
+
+* **The slot list belongs to the module, not the class.** py2c gives every
+  class in a module the same `TypeInfo` layout, so the digest records the
+  vtable once under `descriptor` rather than per class. Writing it per class
+  would invite a consumer to believe two classes could disagree.
+* **Designated initializers remove the ordering hazard entirely.** Section 4
+  worried that a slot-order mismatch would surface as a wrong indirect call
+  rather than a diagnostic, and proposed carrying canonical order
+  explicitly. The digest still does -- but the derived table is emitted by
+  field *name*, so a reordering upstream becomes a compile error or nothing
+  at all. The dangerous failure mode is designed out rather than tested for.
+* **The two structs are layout-compatible and spelled differently.** py2c
+  repeats a base's fields (`{Obj, id, side}`); cpprust nests the base
+  (`{{vptr, id}, side}`). Same bytes in the same order, so each side reaches
+  a field its own way and only the layout has to agree. The digest describes
+  the layout and says nothing about access.
+* **`__init__` is not the constructor.** py2c splits allocation from
+  initialisation: `Square_new` arena-allocates *and* stamps the descriptor,
+  while `Square___init__` only assigns fields. So a C++ constructor chaining
+  to an rpython base must stamp the descriptor itself -- there is nowhere
+  else it would happen. This is the destructor question from section 9 seen
+  from the other end, and it is the one place the two memory models really
+  differ rather than merely differing in spelling.
+
+cpprust also stops splicing a `#include "some.py"`: it is not C++, and
+reading it as C++ finds a `class` keyword and then fails inside a Python
+body. The preprocessor already answers that include by transpiling and
+splicing the C; the declarations arrive separately as `--decls`.
+
+`tools/test_cpprpy_decls.py`, 20 tests, five of which build and run a real
+mixed translation unit.
+
 ### What is refused that a later step should take
 
 Converting to a secondary base from anything that is not a symbol or a
