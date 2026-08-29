@@ -496,8 +496,360 @@ _BIN_NAMES = {"+": "add", "-": "sub", "*": "mul", "/": "div", "%": "mod",
 _AUG_ASSIGN_SPELLINGS = frozenset(
     ["%s=" % k for k in ("+", "-", "*", "/", "%", "|", "&", "^")])
 
-_UNSUPPORTED = ("throw", "try", "catch",
+_UNSUPPORTED = ("throw", "catch",
                 "dynamic_cast", "typeid")
+
+#: The checked-error state, emitted once per translation unit when the
+#: `try`/`except` lowering is used. Deliberately minimal: a flag and one
+#: machine word of payload. This is minipy's `st.exc_flag`/`st.exc_val`
+#: with C spelling, and it is the whole mechanism -- an error is a value,
+#: propagation is a checked return, and there is no unwinder anywhere.
+#: A single static per unit; threading is out of scope and said so rather
+#: than pretended at.
+_EXC_PRELUDE = """\
+/* Checked error state. Set by `raise`, tested after every call to a
+   function declared `except`, cleared on entry to a handler. No unwinder,
+   no unwind tables, no allocation: the error path is the ordinary return
+   path with a flag set, which is why destructors still run on it. */
+static struct { int flag; long val; } _cpp_exc;
+"""
+
+_FALLIBLE_SIG = re.compile(
+    r"([A-Za-z_][\w \*]*?)\b([A-Za-z_]\w*)\s*\(([^()]*)\)\s*except\b")
+
+_RAISE_RE = re.compile(r"(?<![\w.>])raise\b")
+_TRY_RE = re.compile(r"(?<![\w.>])try\b")
+
+
+def _except_zero(ret):
+    """The dummy a poisoned return carries. Nobody reads it -- the caller
+    tests the flag before the value -- but C wants one of the right shape."""
+    ret = ret.strip()
+    if ret == "void":
+        return None
+    if ret.endswith("*"):
+        return "0"
+    if ret in ("float", "double"):
+        return "0.0"
+    return "0"
+
+
+def _exc_check(handlers):
+    """What a statement that may have failed is followed by: jump to the
+    innermost `except`, or -- with no `try` around it but a fallible
+    enclosing function -- a poisoned return, which propagates. The two
+    spellings are the same decision minipy's block stack makes: nearest
+    handler, else hand the flag to the caller."""
+    kind, arg = handlers[-1]
+    if kind == "try":
+        return " if (_cpp_exc.flag) goto %s;" % arg
+    zr = arg
+    if zr is None:
+        return " if (_cpp_exc.flag) return;"
+    return " if (_cpp_exc.flag) { return %s; }" % zr
+
+
+def _lower_except(text, path="<cpp>"):
+    """Lower `except` functions, `raise`, and `try`/`except` to the checked
+    model, before anything else reads the source.
+
+    Runs this early on purpose: `raise E;` becomes a flag-set and an
+    *ordinary return*, and the return lowering that runs later already
+    emits every destructor a return needs (`{ int _cpp_ret0 = ..;
+    Buf_drop(&b); return _cpp_ret0; }`). Being upstream of that pass is
+    what makes the error path run destructors without this pass knowing
+    what a destructor is. The same holds for the propagation checks.
+
+    The one thing a `goto` into a handler would skip is the scope-end
+    destructor of a class local *declared inside the try block*, so that
+    is refused (declare it before the `try`). Everything else is plain
+    statement rewriting.
+    """
+    look = _strip_comments(text)
+    if "except" not in look and _RAISE_RE.search(look) is None \
+            and _TRY_RE.search(look) is None:
+        # Nothing of ours in the file. (`try` is in the test on purpose:
+        # it left the generic unsupported-keyword list when this pass took
+        # ownership of it, so a `try` this pass ignores would otherwise
+        # reach the C compiler verbatim -- caught by exactly that
+        # happening to `try { } return 0;`.)
+        return text, False
+
+    # -- fallible signatures: collect, then strip the keyword ------------
+    fallible = {}
+    for m in _FALLIBLE_SIG.finditer(look):
+        fallible[m.group(2)] = _except_zero(m.group(1))
+    if not fallible and _TRY_RE.search(look) is None \
+            and _RAISE_RE.search(look) is None:
+        return text, False
+    text = re.sub(r"(\))\s*except\b(\s*[;{])", r"\1\2", text)
+    look = _strip_comments(text)
+
+    call_re = (re.compile(r"(?<![\w.>])(%s)\s*\("
+                          % "|".join(re.escape(n) for n in sorted(fallible)))
+               if fallible else None)
+    labels = [0]
+
+    # Class names declared in this translation, for the try-local check.
+    classes = set(re.findall(r"(?<![\w.>])class\s+([A-Za-z_]\w*)", look))
+
+    def stmt_needs_check(seg, at=None):
+        if call_re is None:
+            return False
+        sl = _strip_comments(seg)
+        for cm in call_re.finditer(sl):
+            # The definition site of the function itself is not a call.
+            before = sl[:cm.start()].rstrip()
+            if before.endswith(("int", "long", "void", "double", "float",
+                                "char", "*")):
+                continue
+            if at is not None \
+                    and before.count("(") > before.count(")"):
+                # Inside another call's argument list. The flag check
+                # this pass appends runs after the statement -- too late
+                # once the enclosing call has consumed the poisoned
+                # value: `printf("%d", c())` prints garbage first and
+                # jumps to the handler second. A hazard the model cannot
+                # check is a refusal, not a quiet reordering.
+                raise CppError(
+                    "%s:%d: a call to `%s` (declared `except`) is an "
+                    "argument to another call. The failure check runs "
+                    "after the statement, which is too late once the "
+                    "enclosing call has used the value -- bind it to a "
+                    "local first: `T v = %s(..);` then use `v`."
+                    % (os.path.basename(path), at, cm.group(1),
+                       cm.group(1)))
+            return True
+        return False
+
+    def walk(body, handlers, off=0, depth=0):
+        """Rewrite one block body. `handlers` is the context stack,
+        innermost last: ('try', label) or ('fn', zero-or-None) or
+        ('none', None) at the bottom, which is where a fallible call with
+        nowhere to go becomes a diagnostic.
+
+        `off` is the body's start in the whole file, so a diagnostic's
+        line number is counted in the file the author is looking at and
+        not in the slice this recursion happens to hold. (The first
+        version reported `exc3.cpp:1` for a call on line 2.)"""
+        out = []
+        i, n = 0, len(body)
+        seg_start = 0
+        # Hoisted: stripping comments per loop step made the walk
+        # quadratic in the block size. Positions align with `body`, so
+        # one strip serves every probe below.
+        lm = _strip_comments(body)
+
+        def line(at):
+            return _src_line(look, off + at)
+
+        def flush(upto, insert_after=None):
+            out.append(body[seg_start:upto])
+            if insert_after:
+                out.append(insert_after)
+
+        while i < n:
+            tm = _TRY_RE.match(lm, i)
+            rm = _RAISE_RE.match(lm, i)
+            if tm:
+                ob = body.find("{", tm.end())
+                if ob < 0:
+                    raise CppError("%s: `try` without a block"
+                                   % os.path.basename(path))
+                cb = _match_brace(lm, ob)
+                if cb is None:
+                    raise CppError("%s: `try` block never closes"
+                                   % os.path.basename(path))
+                after = lm[cb + 1:]
+                em = re.match(r"\s*except\b\s*(\(([^()]*)\))?\s*\{",
+                              after)
+                if em is None:
+                    raise CppError(
+                        "%s:%d: `try` without an `except` after it. This "
+                        "subset's error handling is the checked model -- "
+                        "`try { .. } except (long e) { .. }` -- and a "
+                        "`try` with no handler has nothing to check into."
+                        % (os.path.basename(path), line(i)))
+                hob = cb + 1 + em.end() - 1
+                hcb = _match_brace(lm, hob)
+                if hcb is None:
+                    raise CppError("%s: `except` block never closes"
+                                   % os.path.basename(path))
+                tbody = body[ob + 1:cb]
+                hbody = body[hob + 1:hcb]
+                # Class locals declared inside the try: the handler is
+                # reached by `goto`, which leaves the block without
+                # passing its closing brace -- where the scope-end
+                # destructor call will later be placed. A destructor the
+                # error path silently skips is a leak dressed as
+                # handling, so it is refused with the fix in hand.
+                tl = _strip_comments(tbody)
+                for cn in classes:
+                    if re.search(r"(?<![\w.>])%s\s+[A-Za-z_]\w*\s*[(;=]"
+                                 % re.escape(cn), tl):
+                        raise CppError(
+                            "%s:%d: `%s` is declared inside a `try` "
+                            "block. The handler is reached by a jump that "
+                            "leaves the block early, so a destructor at "
+                            "the block's end would be skipped on exactly "
+                            "the path it matters most. Declare it before "
+                            "the `try`."
+                            % (os.path.basename(path),
+                               line(i), cn))
+                labels[0] += 1
+                lab = labels[0]
+                hl, dl = "_cpp_h_%d" % lab, "_cpp_done_%d" % lab
+                new_t = walk(tbody, handlers + [("try", hl)], off + ob + 1,
+                             depth + 1)
+                new_h = walk(hbody, handlers, off + hob + 1, depth + 1)
+                binder = ""
+                if em.group(2) and em.group(2).strip():
+                    bd = em.group(2).strip()
+                    bm = re.match(r"(?:long|int)\s+([A-Za-z_]\w*)$", bd)
+                    if bm is None:
+                        raise CppError(
+                            "%s:%d: `except (%s)` -- the payload is one "
+                            "machine word, so the binding is `long e` (or "
+                            "`int e`). Richer payloads are a later step, "
+                            "not a missing cast."
+                            % (os.path.basename(path),
+                               line(i), bd))
+                    binder = "long %s = _cpp_exc.val; " % bm.group(1)
+                flush(i)
+                out.append(
+                    "{ %s goto %s; %s: { %s_cpp_exc.flag = 0; %s } %s: ; }"
+                    % (new_t, dl, hl, binder, new_h, dl))
+                i = hcb + 1
+                seg_start = i
+                continue
+            if rm:
+                se = lm.find(";", rm.end())
+                if se < 0:
+                    raise CppError("%s: `raise` without a `;`"
+                                   % os.path.basename(path))
+                payload = body[rm.end():se].strip()
+                # A raise goes to the *innermost* handler -- the same
+                # dispatch a failed call takes. Inside a `try`, that try
+                # catches it; in a bare `except` function, it returns
+                # poisoned and the caller's check picks it up; a re-raise
+                # in a handler body goes to the next handler out, because
+                # the handler is walked under the outer context. (The
+                # first version always returned: a raise inside a try
+                # escaped the function, and a legitimate re-raise in
+                # `main` was refused with its outer try standing right
+                # there.)
+                kind, arg = handlers[-1]
+                if kind == "none":
+                    raise CppError(
+                        "%s:%d: `raise` with nowhere for the error to "
+                        "go: no `try` around it, and the enclosing "
+                        "function is not declared `except`. Fallibility "
+                        "is part of the signature here, so either wrap "
+                        "this in `try { .. } except (long e) { .. }` or "
+                        "add `except` after the parameter list."
+                        % (os.path.basename(path), line(i)))
+                if not payload:
+                    payload = "_cpp_exc.val"      # re-raise, value kept
+                if kind == "try":
+                    disp = "goto %s;" % arg
+                elif arg is None:
+                    disp = "return;"
+                else:
+                    disp = "return %s;" % arg
+                flush(i)
+                out.append("{ _cpp_exc.flag = 1; _cpp_exc.val = "
+                           "(long)(%s); %s }" % (payload, disp))
+                i = se + 1
+                seg_start = i
+                continue
+            c = lm[i]
+            if c == ";":
+                seg = body[seg_start:i + 1]
+                if stmt_needs_check(seg, line(i)):
+                    kind, _a = handlers[-1]
+                    if kind == "none":
+                        raise CppError(
+                            "%s:%d: this statement calls a function "
+                            "declared `except`, and there is nothing to "
+                            "handle a failure: no `try` around it, and "
+                            "the enclosing function is not `except` "
+                            "itself. An unhandled error is a compile "
+                            "error here, not a terminate() later -- wrap "
+                            "the call in `try { .. } except (long e) "
+                            "{ .. }`, or mark this function `except` to "
+                            "pass the error up."
+                            % (os.path.basename(path), line(i)))
+                    flush(i + 1, _exc_check(handlers))
+                    seg_start = i + 1
+                i += 1
+                continue
+            if c in "{}":
+                flush(i + 1)
+                seg_start = i + 1
+                i += 1
+                continue
+            i += 1
+        flush(n)
+        return "".join(out)
+
+    # -- per top-level function body ------------------------------------
+    out, pos = [], 0
+    fn_re = re.compile(r"([A-Za-z_][\w \*]*?)\b([A-Za-z_]\w*)\s*"
+                       r"\(([^()]*)\)\s*\{")
+    while True:
+        m = None
+        for cand in fn_re.finditer(look, pos):
+            # Top level only: a method's body is inside a class brace and
+            # the slice keeps `try`/`raise` out of methods for now.
+            if _brace_depth(look, cand.start()) == 0:
+                m = cand
+                break
+        if m is None:
+            break
+        ob = m.end() - 1
+        cb = _match_brace(look, ob)
+        if cb is None:
+            break
+        body = text[ob + 1:cb]
+        name = m.group(2)
+        if name in fallible:
+            base = [("fn", fallible[name])]
+        else:
+            base = [("none", None)]
+        lb = _strip_comments(body)
+        if _TRY_RE.search(lb) or _RAISE_RE.search(lb) \
+                or stmt_needs_check(lb + ";"):
+            body = walk(body, base, ob + 1)
+        out.append(text[pos:ob + 1])
+        out.append(body)
+        out.append(text[cb:cb + 1])
+        pos = cb + 1
+    out.append(text[pos:])
+    new = "".join(out)
+    # `try`/`raise` left in a class body: the slice keeps error handling
+    # in free functions, and a leftover keyword would otherwise fall
+    # through to the generic unsupported-keyword refusal with no hint.
+    leftover = _strip_comments(new)
+    lm = _TRY_RE.search(leftover) or _RAISE_RE.search(leftover)
+    if lm:
+        raise CppError(
+            "%s:%d: `try`/`raise` inside a class body is not in the C++ "
+            "subset yet -- the checked-error lowering covers free "
+            "functions first. Move the handling into a free function, or "
+            "wait for the method step."
+            % (os.path.basename(path), _src_line(leftover, lm.start())))
+    return new, True
+
+
+def _brace_depth(look, pos):
+    d = 0
+    for ch in look[:pos]:
+        if ch == "{":
+            d += 1
+        elif ch == "}":
+            d -= 1
+    return d
+
 
 #: Refused only when `--rtti` is off. With it on, these two lower against
 #: the descriptor below; the rest of `_UNSUPPORTED` stays refused either way.
@@ -800,6 +1152,12 @@ def _check_unsupported(scan, path, rtti=False):
         if m:
             line = _src_line(scan, m.start())
             extra = ""
+            if kw in ("throw", "catch"):
+                extra = (" Error handling here is the checked model, "
+                         "spelled `try { .. } except (long e) { .. }` "
+                         "with `raise` -- an error is a value and "
+                         "propagation is a checked return, so there is "
+                         "no unwinder for `%s` to reach." % kw)
             if kw in _RTTI_KEYWORDS:
                 extra = (" It needs a type descriptor on every polymorphic "
                          "class, which is off by default because it costs a "
@@ -3231,6 +3589,58 @@ def _ext_descriptor(cls, cinfo):
             return info.get("descriptor") or "TypeInfo"
         cls = info.get("base")
     return None
+
+
+def _publish_decls_linkage(text, digest, rtti):
+    """Give the digest's symbols external linkage, and alias the descriptor.
+
+    Two rewrites, both keyed on the digest so nothing unpublished changes:
+
+    * `static <ret> <fn>(` -> `<ret> <fn>(` for every function the digest
+      names, plus each class's `_new` and `_drop`, in both the prototype
+      and the definition.
+    * `static const struct C_vtable C__vtable` -> external, plus a gcc
+      alias `C_type` for it -- because py2c links a derived class's base
+      chain through `extern const TypeInfo C_type`, and the alias is what
+      lets that resolve to the vtable object without a second copy of it.
+      The layouts agree by the pinned field-order test; the alias makes
+      them agree by *address* too.
+    """
+    names = set()
+    for c in digest.get("classes") or ():
+        cname = c["struct"]
+        names.add("%s_new" % cname)
+        names.add("%s_drop" % cname)
+        for m in c.get("methods") or ():
+            names.add(m["fn"])
+    for fn in sorted(names):
+        text = re.sub(r"\bstatic (\w[\w \*]*?%s\()" % re.escape(fn),
+                      r"\1", text)
+    if rtti:
+        for c in digest.get("classes") or ():
+            cname = c["struct"]
+            vt = "static const struct %s_vtable %s__vtable" % (cname, cname)
+            if vt in text:
+                text = text.replace(vt, vt[len("static "):], 1)
+                anchor = "const struct %s_vtable %s__vtable" % (cname, cname)
+                idx = text.find(anchor)
+                end = text.find(";", idx)
+                alias = ("\nextern const struct %s_vtable %s_type "
+                         "__attribute__((alias(\"%s__vtable\")));"
+                         % (cname, cname, cname))
+                text = text[:end + 1] + alias + text[end + 1:]
+            ti = ("static const struct _CppTypeInfo %s__typeinfo"
+                  % cname)
+            if ti in text:
+                text = text.replace(ti, ti[len("static "):], 1)
+                anchor = ("const struct _CppTypeInfo %s__typeinfo" % cname)
+                idx = text.find(anchor)
+                end = text.find(";", idx)
+                alias = ("\nextern const struct _CppTypeInfo %s_type "
+                         "__attribute__((alias(\"%s__typeinfo\")));"
+                         % (cname, cname))
+                text = text[:end + 1] + alias + text[end + 1:]
+    return text
 
 
 def dump_decls(cinfo, module):
@@ -9735,6 +10145,10 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     except cpp_auto.AutoError as e:
         raise CppError(e.message)
     scan = _blank_literal_braces(_strip_comments(text))
+    text, _exc_used = _lower_except(text, path)
+    if _exc_used:
+        text = _EXC_PRELUDE + text
+    scan = _strip_comments(text)
     _check_unsupported(scan, path, rtti=rtti)
 
     # Out-of-line member definitions come out first, keyed by class. They
@@ -10155,10 +10569,28 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
         # the digest describes declarations, and a body that does not lower
         # does not change what this file declares.
         import json as _json
+        digest = dump_decls(cinfo,
+                            os.path.splitext(os.path.basename(path))[0])
         with open(decls_out, "w") as _df:
-            _json.dump(dump_decls(cinfo,
-                                  os.path.splitext(os.path.basename(path))[0]),
-                       _df, indent=1, sort_keys=True)
+            _json.dump(digest, _df, indent=1, sort_keys=True)
+        # Publishing a class *is* a linkage decision. Everything cpprust
+        # emits is `static`, which is right for a self-contained unit and
+        # wrong the moment another translation unit -- py2c's, importing
+        # this module through the digest -- calls `Pool_take` by symbol:
+        # an `extern` declaration followed by a `static` definition in the
+        # combined build is a hard error, and separate objects simply fail
+        # to link. So the symbols the digest names, and only those, are
+        # given external linkage here. Thunks stay static: they are
+        # reached through the table, never by name.
+        #
+        # Applied to the assembled text at the very end of `translate`, not
+        # to `pieces` here: the prototypes and the vtable live in the
+        # forward-declaration block, which is only spliced in front of the
+        # pieces later, so a rewrite at this point ran over text that did
+        # not yet contain most of what it was for. (It did exactly nothing,
+        # which is how it was caught: `nm` showed every symbol still
+        # lowercase.)
+        _publish = (digest, rtti)
 
     # Rewrite uses: `Ring<int> r;` -> `Ring_int r;`. Field types were already
     # normalised through `tsub` while their class was emitted; this catches
@@ -10285,6 +10717,8 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     # as stray typedefs. Blanked to a bare newline rather than cut, so the
     # output keeps the line numbering the diagnostics were counted against.
     out = _SRC_MARK_RE.sub("", out).replace("typedef int ;\n", "\n")
+    if decls_out:
+        out = _publish_decls_linkage(out, _publish[0], _publish[1])
     return out
 
 

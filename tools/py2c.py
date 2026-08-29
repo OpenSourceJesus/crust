@@ -4012,7 +4012,24 @@ def project_method_owners(base_dir):
 
     def scan(path, modname):
         try:
-            t = ast.parse(open(path, encoding="utf-8").read())
+            if path.endswith(".decls.json"):
+                # A C++ module, present as its class digest. Rendered
+                # through the same stub the import path uses and harvested
+                # by the same ClassDef walk below -- one rendering, every
+                # consumer. Without this the hierarchy scan cannot see a
+                # C++ base at all, so a py2c subclass becomes its own
+                # hierarchy root and the canonical vtable shrinks to its
+                # own methods, dropping the inherited slots. (Caught as
+                # `.take` missing from a derived TypeInfo and a segfault
+                # through the NULL slot.)
+                import json as _json
+                with open(path, encoding="utf-8") as f:
+                    stub = _stub_from_decls(_json.load(f), modname, path)
+                if stub is None:
+                    return
+                t = ast.parse(stub)
+            else:
+                t = ast.parse(open(path, encoding="utf-8").read())
         except Exception:
             return
         for n in t.body:
@@ -4027,6 +4044,12 @@ def project_method_owners(base_dir):
         if "musl" in dp.split(os.sep):
             continue
         for fn in fns:
+            if fn.endswith(".decls.json"):
+                p = os.path.join(dp, fn)
+                mod = os.path.relpath(p, base_dir or ".")
+                mod = mod[:-len(".decls.json")].replace(os.sep, ".")
+                scan(p, mod)
+                continue
             if not fn.endswith(".py"):
                 continue
             p = os.path.join(dp, fn)
@@ -4040,6 +4063,8 @@ def project_method_owners(base_dir):
         for fn in sorted(os.listdir(d)):
             if fn.endswith(".py"):
                 scan(os.path.join(d, fn), fn[:-3])
+            elif fn.endswith(".decls.json"):
+                scan(os.path.join(d, fn), fn[:-len(".decls.json")])
     _PROJECT_METHOD_CACHE[ckey] = owners
     return owners
 
@@ -4073,7 +4098,20 @@ def project_class_hierarchy(base_dir):
 
     def scan(path, modname):
         try:
-            t = ast.parse(open(path, encoding="utf-8").read())
+            if path.endswith(".decls.json"):
+                # A C++ module, present as its class digest, rendered
+                # through the same stub the import path uses -- without it
+                # the hierarchy cannot see a C++ base, a py2c subclass
+                # becomes its own root, and the canonical vtable shrinks
+                # to its own methods, dropping the inherited slots.
+                import json as _json
+                with open(path, encoding="utf-8") as f:
+                    stub = _stub_from_decls(_json.load(f), modname, path)
+                if stub is None:
+                    return
+                t = ast.parse(stub)
+            else:
+                t = ast.parse(open(path, encoding="utf-8").read())
         except Exception:
             return
         for n in t.body:
@@ -4105,6 +4143,8 @@ def project_class_hierarchy(base_dir):
         for fn in sorted(os.listdir(d)):
             if fn.endswith(".py"):
                 scan(os.path.join(d, fn), fn[:-3])
+            elif fn.endswith(".decls.json"):
+                scan(os.path.join(d, fn), fn[:-len(".decls.json")])
     _PROJECT_HIER_CACHE[ckey] = (classes, byname)
     return classes, byname
 
@@ -6639,6 +6679,24 @@ class Transpiler:
         if typeinfo:
             self.xshadow_type[ci.csym] = ci
 
+    def _find_decls_digest(self, modname):
+        """Path to `<modname>.decls.json` beside the inputs, or None. Same
+        search roots as `_find_local_module`, and looked for only after it
+        fails: a real Python module always wins over a digest of the same
+        name, because the module *is* its own best description."""
+        rel = os.path.join(*modname.split("."))
+        dirs = []
+        if self.base_dir:
+            dirs.append(self.base_dir)
+        for d in _LOCAL_MODULE_DIRS:
+            if d not in dirs:
+                dirs.append(d)
+        for d in dirs:
+            cand = os.path.join(d, rel + ".decls.json")
+            if os.path.isfile(cand):
+                return cand
+        return None
+
     def _find_local_module(self, modname):
         """Path to a co-compiled local module `modname`, or None.
 
@@ -6684,9 +6742,33 @@ class Transpiler:
             # name against the input directories): treat it as local so calls
             # into it become direct C calls, not dynamic mp_call_import.
             path = self._find_local_module(modname)
+        src = None
+        from_digest = False
         if path:
+            src = open(path, encoding="utf-8").read()
+        else:
+            # No Python module by that name -- is there a C++ one? A digest
+            # (`cpprust --emit-decls`) beside the inputs is rendered as the
+            # Python a matching module would have been written as, and the
+            # ordinary path below parses it. So `import pool_cpp` resolves,
+            # `class MyPool(pool_cpp.Pool)` lays out over the C++ struct,
+            # and calls lower to the symbols the digest published.
+            dpath = self._find_decls_digest(modname)
+            if dpath:
+                import json as _json
+                try:
+                    with open(dpath, encoding="utf-8") as f:
+                        digest = _json.load(f)
+                except (IOError, ValueError) as e:
+                    raise RuntimeError("%s: unreadable class digest (%s)"
+                                       % (dpath, e))
+                src = _stub_from_decls(digest, modname, dpath)
+                if src is not None:
+                    path = dpath
+                    from_digest = True
+        if src is not None:
             try:
-                t = ast.parse(open(path, encoding="utf-8").read())
+                t = ast.parse(src)
                 classes, order, vt = collect_classes(t)
                 amb = ambiguous_class_names(self.base_dir)
                 for cn, ci in classes.items():
@@ -6697,7 +6779,17 @@ class Transpiler:
                 # importers must dispatch its methods directly (and not read a
                 # nonexistent Obj `type` header). Keep a method in vt only if
                 # some *non-POD* class in the module defines it.
-                pods = pod_csyms(t, order, self._pod_enabled,
+                # For a digest-backed module the POD question is not a
+                # heuristic: cpprust already decided which classes carry a
+                # vtable, and the stub only renders those (see
+                # _stub_from_decls). The classifier would call the base POD
+                # anyway -- nothing subclasses it *inside the stub file*,
+                # which is the only file it can see -- and a POD base means
+                # the importer drops its slots, leaving a NULL in the
+                # derived table where `take` should be. (Caught as a
+                # segfault through exactly that slot.)
+                pods = pod_csyms(t, order,
+                                 self._pod_enabled and not from_digest,
                                  self._project_subclassed())
                 for ci in order:
                     ci.pod = ci.csym in pods
@@ -16113,6 +16205,134 @@ def emit_decls(t, modname):
                                       "eq", "addfn", "objsize"],
                            "slots": slots},
             "classes": classes}
+
+
+#: C type -> the annotation the stub spells it with, and the zero a stub
+#: `__init__` assigns so field-type inference lands on the same C type.
+_DECLS_CTYPES = {"int": ("int", "0"), "long": ("long", "0"),
+                 "double": ("float", "0.0"), "float": ("float", "0.0"),
+                 "bool": ("bool", "0"), "char*": ("str", '""'),
+                 "char *": ("str", '""'), "const char*": ("str", '""'),
+                 "const char *": ("str", '""')}
+
+
+def _stub_from_decls(digest, modname, path):
+    """A Python module, as source text, describing a C++ digest's classes.
+
+    This is the whole trick of the consumer: rather than synthesizing
+    `ClassInfo` objects by hand -- a structure with two dozen fields and a
+    parser's worth of downstream expectations -- the digest is rendered as
+    the *Python a matching module would have been written as*, and the
+    ordinary import path parses it. Everything after `ast.parse` is code
+    that already works.
+
+    The stub is interface, not implementation: bodies are zeros. That is
+    correct because an importer never emits an imported class's code -- it
+    externs the symbols and calls them -- and the symbols are exactly what
+    `cpprust --emit-decls` gave external linkage to.
+
+    Field types map through `_DECLS_CTYPES`; a C type outside it is
+    refused by name rather than guessed at, since a wrong field type here
+    is a wrong struct offset in every importer.
+    """
+    if digest.get("lang") != "cpp":
+        return None
+    lines = ["# synthesized from %s -- a C++ module's class digest.\n"
+             "# Interface only; the implementation is the C that cpprust\n"
+             "# emitted, linked in by the build." % os.path.basename(path)]
+    slot_sig = {}
+    for sl in (digest.get("descriptor") or {}).get("slots") or ():
+        slot_sig[sl["name"]] = sl
+    for c in digest.get("classes") or ():
+        # Only polymorphic classes are rendered. A C++ class with no
+        # virtual methods is a bare struct -- no vptr, no descriptor --
+        # and every py2c class carries an `Obj` header at offset zero, so
+        # laying one over the other would shift every field by a word.
+        # Absent from the stub means importing it is a missing-name
+        # diagnostic rather than a silently wrong layout.
+        if not any(m.get("virtual") for m in c.get("methods") or ()):
+            continue
+        base = c.get("base")
+        lines.append("class %s%s:" % (c["name"],
+                                      "(%s)" % base if base else ""))
+        body = []
+        fields = c.get("fields") or ()
+        # Fields are assigned from *annotated parameters*, not literals:
+        # `self.cap = 0` makes py2c infer a boxed `obj` field, and a
+        # derived class repeats a base's fields at the base's types -- so
+        # one lazily-typed stub field mislays every subclass's struct.
+        # (Caught as `obj cap;` in the importer where the C++ struct has
+        # `int cap;`.)
+        inits, params = [], ["self"]
+        first_field = None
+        for f in fields:
+            ct = f["ctype"].strip()
+            if ct not in _DECLS_CTYPES:
+                raise RuntimeError(
+                    "%s: field %s.%s has C type %r, which the digest "
+                    "consumer has no annotation for. Add it to "
+                    "_DECLS_CTYPES if the mapping is sound, or drop the "
+                    "field from the published class -- a guessed type here "
+                    "is a wrong struct offset in every importer."
+                    % (path, c["name"], f["name"], ct))
+            ann = _DECLS_CTYPES[ct][0]
+            params.append('%s: "%s"' % (f["name"], ann))
+            inits.append("        self.%s = %s" % (f["name"], f["name"]))
+            if first_field is None:
+                first_field = f["name"]
+        if inits:
+            body.append("    def __init__(%s):" % ", ".join(params))
+            body.extend(inits)
+        for m in c.get("methods") or ():
+            sig = slot_sig.get(m["name"])
+            if sig is None:
+                # A method the digest names but carries no signature for
+                # (cpprust only records full signatures for virtuals). It
+                # cannot be *called* from this side without one, so it is
+                # simply absent from the stub -- absent means a call is a
+                # missing-attribute diagnostic, not a miscompiled one.
+                continue
+            params = ["self"]
+            for prm in sig.get("params") or ():
+                prm = prm.strip()
+                if not prm:
+                    continue
+                bits = prm.rsplit(" ", 1)
+                pct = bits[0].strip() if len(bits) == 2 else prm
+                pnm = bits[1].strip("* ") if len(bits) == 2 else "a"
+                ann = _DECLS_CTYPES.get(pct, ("int", "0"))[0]
+                params.append('%s: "%s"' % (pnm, ann))
+            ret = sig.get("ret", "int").strip()
+            rann, rzero = _DECLS_CTYPES.get(ret, ("int", "0"))
+            # The body reads an instance field when the class has one. Not
+            # decoration: py2c's POD classifier treats a class whose
+            # methods never touch instance state as vtable-free, importers
+            # then skip its slot -- and a C++ class whose methods are all
+            # `return 0` stubs is exactly that shape. The read declares
+            # what is true of the real implementation: these methods use
+            # the object. (Caught as a NULL `take` slot and a segfault.)
+            touch = ("self.%s" % first_field) if first_field else None
+            wr = ("        %s = %s" % (touch, touch)) if touch else None
+            if ret == "void":
+                body.append("    def %s(%s):" % (m["name"],
+                                                 ", ".join(params)))
+                if wr:
+                    body.append(wr)
+                body.append("        return")
+            else:
+                body.append('    def %s(%s) -> "%s":'
+                            % (m["name"], ", ".join(params), rann))
+                if wr:
+                    body.append(wr)
+                if touch and rann in ("int", "long"):
+                    body.append("        return %s * 0" % touch)
+                else:
+                    body.append("        return %s" % rzero)
+        if not body:
+            body = ["    pass"]
+        lines.extend(body)
+        lines.append("")
+    return "\n".join(lines) + "\n"
 
 
 def transpile_file(path, out_dir, stdlib_dir=None):
