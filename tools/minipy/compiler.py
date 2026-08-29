@@ -190,6 +190,12 @@ METHODS = {
     "update": 120, "setdefault": 121, "splitlines": 122, "rstrip": 123,
     "lstrip": 124, "isdigit": 125, "isupper": 126, "islower": 127,
     "isalpha": 128, "isalnum": 129,
+    # set.discard / set.remove / list.remove. Absent from this table they were
+    # not lowered to a builtin method at all and silently did nothing, so
+    # `numreg.discard(r)` never cleared a register and the compiler kept
+    # believing stale registers held numbers -- emitting ADD_NN/SUB_NN/GT_NN
+    # where the generic op was required.
+    "discard": 130, "remove": 131,
 }
 
 
@@ -2821,6 +2827,46 @@ def _lower_class_attrs(tree):
     return tree
 
 
+def _bind_staticmethods(tree):
+    """Give every `@staticmethod` an explicit leading `self` parameter.
+
+    minipy compiles a class method as a plain function whose first parameter is
+    the receiver, and it does not implement the descriptor protocol -- so a
+    `@staticmethod` was called with the instance still prepended and every
+    argument landed one position to the left. In compiler.py that showed up as
+    `self._scope_locals(fnode)` binding `fnode` to the Compiler instance and
+    then failing on `.args`, which is what stopped compiler.py from compiling
+    itself.
+
+    Adding the parameter rather than stripping the receiver at the call site
+    keeps the change local to the definition: the call already passes the
+    instance, so arity now matches and the body simply ignores it. That covers
+    `self.f(x)` and `obj.f(x)`. It does *not* cover `Cls.f(x)`, which passes no
+    receiver -- minipy has no class-object call path for methods at all, so that
+    form was already unsupported and is unaffected by this.
+
+    The parameter is named `_staticself` rather than `self` so a static method
+    that happens to use the name `self` for something of its own is not shadowed.
+    """
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for m in node.body:
+            if not isinstance(m, ast.FunctionDef):
+                continue
+            keep = []
+            is_static = 0
+            for d in m.decorator_list:
+                if isinstance(d, ast.Name) and d.id == "staticmethod":
+                    is_static = 1
+                else:
+                    keep.append(d)
+            if is_static == 1:
+                m.decorator_list = keep
+                m.args.args.insert(0, ast.arg(arg="_staticself", annotation=None))
+    return tree
+
+
 def compile_source(src, source_name="<module>"):
     tree = ast.parse(src, filename=source_name)
     # expose __file__ so programs that introspect their own path work (pathlib)
@@ -2834,6 +2880,7 @@ def compile_source(src, source_name="<module>"):
     tree = _link_modules(tree)               # inline supported library imports
     tree = _WithDesugar().visit(tree)        # with -> manager-protocol + try/finally
     tree = _StripOpenKwargs().visit(tree)    # open(..., encoding=..) -> open(..)
+    tree = _bind_staticmethods(tree)         # @staticmethod -> explicit receiver param
     tree = _lower_class_attrs(tree)          # class variables -> self.X in __init__
     tree = _lift_closures(tree)              # nested funcs -> top-level + captures
     tree = _lift_nested_classes(tree)        # nested class methods capture locals

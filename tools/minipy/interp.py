@@ -159,8 +159,15 @@ class V:
 # setup_cache() at interpreter start. Caching None/True/False and small ints
 # avoids a heap V allocation on the hottest paths (comparisons, loop counters,
 # default register slots).
-_CACHE_LO = -8
-_CACHE_HI = 256
+# The range is wide because the workload says so, not out of caution. Profiling
+# v_int on a self-hosted compile: 45% of the integers built fall in the old
+# -8..256 window, and *every* remaining one is under 32768 -- they are bytecode
+# offsets, register numbers, constant indices and string lengths, all bounded by
+# program size. Extending the window to cover them turns ~3.4M heap V
+# allocations into array reads. The cache itself costs one V and one list slot
+# per entry, about 2 MB for the whole range, paid once at startup.
+_CACHE_LO = -1024
+_CACHE_HI = 65535
 _cache_ready: "int" = 0
 _none_v: "V" = None
 _true_v: "V" = None
@@ -858,11 +865,64 @@ def _strcmp(a: "char*", b: "char*") -> "int":
     return 1
 
 
-def v_eq_bool(x: "V", y: "V") -> "int":
+def v_eq_bool(st: "St", x: "V", y: "V") -> "int":
     if x.tag == 3 and y.tag == 3:
         return 1 if _strcmp(x.sv, y.sv) == 0 else 0
     if x.tag == 0 or y.tag == 0:
         return 1 if x.tag == y.tag else 0
+    if x.tag == 7 or x.tag == 10:
+        # Lists and tuples compare element-wise, like CPython. This used to be
+        # heap identity for every container, which made two structurally equal
+        # tuples unequal -- and therefore useless as dict keys, because v_hash
+        # returns a constant for containers and relies entirely on this check to
+        # separate them. compiler.py keys its constant table on (kind, payload)
+        # tuples, so the dedup silently never fired and a self-hosted compile
+        # emitted 899 constants where CPython emits 231.
+        if y.tag != x.tag:
+            return 0
+        if x.iv == y.iv:
+            return 1                                  # same object: cheap path
+        xs = items_of(st, x)
+        ys = items_of(st, y)
+        if len(xs) != len(ys):
+            return 0
+        i = 0
+        while i < len(xs):
+            if v_eq_bool(st, xs[i], ys[i]) == 0:
+                return 0
+            i = i + 1
+        return 1
+    if x.tag == 8 and y.tag == 8:
+        # Dicts compare by contents, not by insertion order, so this looks each
+        # key up in the other dict rather than walking both item arrays in step.
+        if x.iv == y.iv:
+            return 1
+        xs = items_of(st, x)
+        ys = items_of(st, y)
+        if len(xs) != len(ys):
+            return 0
+        ycont = cont_of(st, y)
+        j = 0
+        while j < len(xs):
+            k = dict_lookup(st, ycont, xs[j])
+            if k < 0:
+                return 0
+            if v_eq_bool(st, xs[j + 1], ycont.items[k + 1]) == 0:
+                return 0
+            j = j + 2
+        return 1
+    if x.tag == 9 and y.tag == 9:
+        if x.iv == y.iv:
+            return 1
+        xs = items_of(st, x)
+        if len(xs) != len(items_of(st, y)):
+            return 0
+        i = 0
+        while i < len(xs):
+            if set_has(st, y, xs[i]) == 0:
+                return 0
+            i = i + 1
+        return 1
     if x.tag >= 7 or y.tag >= 7:
         return 1 if (x.tag == y.tag and x.iv == y.iv) else 0   # container identity
     return 1 if to_float(x) == to_float(y) else 0
@@ -896,7 +956,20 @@ def v_add(st: "St", x: "V", y: "V") -> "V":
     return v_int(x.iv + y.iv)
 
 
-def v_sub(x: "V", y: "V") -> "V":
+def v_sub(st: "St", x: "V", y: "V") -> "V":
+    if x.tag == 9 and y.tag == 9:           # set difference
+        # v_bitand and v_bitxor already special-cased sets; `-` did not, so it
+        # fell through to `x.iv - y.iv` and subtracted the two heap indices,
+        # yielding a meaningless int. compiler.py computes its reclaimable-local
+        # set as `assigned - escaped - not_fresh - params`, so under minipy that
+        # was always empty and no local ever got a free hint: a self-hosted
+        # compile emitted zero ACC_ADD_L fusions where CPython emits fifteen.
+        out = new_v_list()
+        sv = v_container(st, 9, 2, out)
+        for e in items_of(st, x):
+            if set_has(st, y, e) == 0:
+                _set_add(st, sv, e)
+        return sv
     if x.tag == 2 or y.tag == 2:
         return v_float(to_float(x) - to_float(y))
     return v_int(x.iv - y.iv)
@@ -1026,7 +1099,7 @@ def set_has(st: "St", setv: "V", item: "V") -> "int":
     items = items_of(st, setv)
     j = 0
     while j < len(items):
-        if v_eq_bool(items[j], item) != 0:
+        if v_eq_bool(st, items[j], item) != 0:
             return 1
         j = j + 1
     return 0
@@ -1244,7 +1317,7 @@ def dict_reindex(cont: "Cont") -> "int":
     return 0
 
 
-def dict_lookup(cont: "Cont", key: "V") -> "long":
+def dict_lookup(st: "St", cont: "Cont", key: "V") -> "long":
     buckets = cont.buckets
     cap = len(buckets)
     if cap == 0:
@@ -1260,15 +1333,15 @@ def dict_lookup(cont: "Cont", key: "V") -> "long":
         ki = buckets[slot].iv
         if ki == -1:
             return -1
-        if v_eq_bool(cont.items[ki], key) != 0:
+        if v_eq_bool(st, cont.items[ki], key) != 0:
             return ki
         slot = (slot + 1) & (cap - 1)
         probes = probes + 1
     return -1
 
 
-def dict_insert(cont: "Cont", key: "V", val: "V") -> "int":
-    ki = dict_lookup(cont, key)
+def dict_insert(st: "St", cont: "Cont", key: "V", val: "V") -> "int":
+    ki = dict_lookup(st, cont, key)
     if ki >= 0:
         cont.items[ki + 1] = val
         return 0
@@ -1288,11 +1361,11 @@ def dict_insert(cont: "Cont", key: "V", val: "V") -> "int":
     return 0
 
 
-def dict_find(items: "list[V]", key: "V") -> "int":
+def dict_find(st: "St", items: "list[V]", key: "V") -> "int":
     j = 0
     n = len(items)
     while j < n:
-        if v_eq_bool(items[j], key) != 0:
+        if v_eq_bool(st, items[j], key) != 0:
             return j
         j = j + 2
     return -1
@@ -1308,7 +1381,7 @@ def v_index(st: "St", seq: "V", idx: "V") -> "V":
         return items[i]
     if seq.tag == 8:
         cont = st.heap[seq.iv]
-        j = dict_lookup(cont, idx)
+        j = dict_lookup(st, cont, idx)
         if j >= 0:
             return cont.items[j + 1]
         return v_none()
@@ -1323,7 +1396,7 @@ def v_setindex(st: "St", seq: "V", idx: "V", val: "V") -> "int":
         return 0
     if seq.tag == 8:
         cont = st.heap[seq.iv]
-        dict_insert(cont, idx, val)
+        dict_insert(st, cont, idx, val)
         return 0
     return 0
 
@@ -1335,13 +1408,13 @@ def v_contains(st: "St", container: "V", item: "V") -> "V":
         items = items_of(st, container)
         j = 0
         while j < len(items):
-            if v_eq_bool(items[j], item) != 0:
+            if v_eq_bool(st, items[j], item) != 0:
                 return v_bool(1)
             j = j + 1
         return v_bool(0)
     if container.tag == 8:
         cont = st.heap[container.iv]
-        return v_bool(1 if dict_lookup(cont, item) >= 0 else 0)
+        return v_bool(1 if dict_lookup(st, cont, item) >= 0 else 0)
     return v_bool(0)
 
 
@@ -1372,7 +1445,7 @@ def _set_add(st: "St", setv: "V", item: "V") -> "int":
     items = items_of(st, setv)
     j = 0
     while j < len(items):
-        if v_eq_bool(items[j], item) != 0:
+        if v_eq_bool(st, items[j], item) != 0:
             return 0
         j = j + 1
     items.append(item)
@@ -1457,19 +1530,28 @@ def _pad(piece: "char*", width: "int", left: "int", zero: "int") -> "char*":
 
 
 def str_format(st: "St", fmt: "char*", args: "list[V]") -> "char*":
-    out = ""
+    # Collect the pieces and join once. Appending to `out` per character made
+    # this the interpreter's single largest string allocator: 13.7M pyconcat
+    # calls on a self-hosted compile, ~113 MB, because every character of every
+    # literal run re-copied the whole result so far. Literal runs are now taken
+    # as one slice each, and `"".join` lowers to the runtime's pyjoin, which
+    # sums the lengths and fills a single allocation.
+    parts = []
     i = 0
     ai = 0
     n = len(fmt)
     while i < n:
         ch = fmt[i]
         if ch != "%":
-            out = out + ch
-            i = i + 1
+            j = i
+            while j < n and fmt[j] != "%":
+                j = j + 1
+            parts.append(fmt[i:j])
+            i = j
             continue
         i = i + 1
         if i < n and fmt[i] == "%":
-            out = out + "%"
+            parts.append("%")
             i = i + 1
             continue
         left = 0
@@ -1514,8 +1596,8 @@ def str_format(st: "St", fmt: "char*", args: "list[V]") -> "char*":
             piece = _hexfmt(to_int(arg))
         else:
             piece = to_disp(st, arg, 0)
-        out = out + _pad(piece, width, left, zero)
-    return out
+        parts.append(_pad(piece, width, left, zero))
+    return "".join(parts)
 
 
 # ---- classes / instances ----
@@ -1734,6 +1816,10 @@ def method_id(name: "char*") -> "long":
         return 128
     if name == "isalnum":
         return 129
+    if name == "discard":
+        return 130
+    if name == "remove":
+        return 131
     return -1
 
 
@@ -2411,7 +2497,7 @@ def do_method(st: "St", mid: "long", args: "list[V]") -> "V":
         return items.pop()                 # no-arg -> list_pop (removes last)
     if mid == 102:             # dict.get
         cont = st.heap[recv.iv]
-        dj = dict_lookup(cont, args[1])
+        dj = dict_lookup(st, cont, args[1])
         if dj >= 0:
             return cont.items[dj + 1]
         if len(args) >= 3:
@@ -2446,6 +2532,36 @@ def do_method(st: "St", mid: "long", args: "list[V]") -> "V":
         return v_container(st, 7, 0, out)
     if mid == 106:             # set.add
         _set_add(st, recv, args[1])
+        return v_none()
+    if mid == 130 or mid == 131:   # set.discard(x) / set.remove(x) / list.remove(x)
+        # Both were missing entirely -- not in compiler.METHODS, so the call
+        # lowered to nothing and quietly did nothing. That made
+        # `numreg.discard(r)` a no-op inside the compiler itself, which left
+        # stale registers marked numeric and mis-specialised arithmetic.
+        #
+        # A set stores its elements as a flat item list scanned linearly (see
+        # set_has / _set_add), so removal is a scan, a shift-down and a pop --
+        # there is no bucket index to repair. A list uses the same layout, so
+        # the same loop serves list.remove.
+        items = items_of(st, recv)
+        j = 0
+        while j < len(items):
+            if v_eq_bool(st, items[j], args[1]) != 0:
+                k = j
+                while k + 1 < len(items):
+                    items[k] = items[k + 1]
+                    k = k + 1
+                items.pop()
+                return v_none()
+            j = j + 1
+        if mid == 131:
+            # discard() on a missing element is defined to do nothing; remove()
+            # raises -- KeyError from a set, ValueError from a list, matching
+            # CPython.
+            if recv.tag == 9:
+                raise_named_error(st, "KeyError")
+            else:
+                raise_named_error(st, "ValueError")
         return v_none()
     if mid == 110:             # startswith (str, or tuple/list of prefixes)
         if args[1].tag == 10 or args[1].tag == 7:
@@ -2542,7 +2658,7 @@ def do_method(st: "St", mid: "long", args: "list[V]") -> "V":
         items = items_of(st, recv)
         j = 0
         while j < len(items):
-            if v_eq_bool(items[j], args[1]) != 0:
+            if v_eq_bool(st, items[j], args[1]) != 0:
                 return v_int(j)
             j = j + 1
         return v_int(-1)
@@ -2551,7 +2667,7 @@ def do_method(st: "St", mid: "long", args: "list[V]") -> "V":
         c = 0
         j = 0
         while j < len(items):
-            if v_eq_bool(items[j], args[1]) != 0:
+            if v_eq_bool(st, items[j], args[1]) != 0:
                 c = c + 1
             j = j + 1
         return v_int(c)
@@ -2564,7 +2680,7 @@ def do_method(st: "St", mid: "long", args: "list[V]") -> "V":
         return v_none()
     if mid == 121:             # dict.setdefault(key[, default])
         cont = st.heap[recv.iv]
-        dj = dict_lookup(cont, args[1])
+        dj = dict_lookup(st, cont, args[1])
         if dj >= 0:
             return cont.items[dj + 1]
         dv = v_none()
@@ -2897,12 +3013,12 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
             else:
                 pc = b
         elif op == 80:                     # JF_EQ: if not(a == c) -> pc = b
-            if v_eq_bool(_lget(regs, a), _lget(regs, c)) != 0:
+            if v_eq_bool(st, _lget(regs, a), _lget(regs, c)) != 0:
                 pc = pc + 1
             else:
                 pc = b
         elif op == 81:                     # JF_NE: if not(a != c) -> pc = b
-            if v_eq_bool(_lget(regs, a), _lget(regs, c)) == 0:
+            if v_eq_bool(st, _lget(regs, a), _lget(regs, c)) == 0:
                 pc = pc + 1
             else:
                 pc = b
@@ -2932,12 +3048,12 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
             else:
                 pc = pc + 1
         elif op == 87:                     # JT_EQ: if (a == c) -> pc = b
-            if v_eq_bool(_lget(regs, a), _lget(regs, c)) != 0:
+            if v_eq_bool(st, _lget(regs, a), _lget(regs, c)) != 0:
                 pc = b
             else:
                 pc = pc + 1
         elif op == 88:                     # JT_NE: if (a != c) -> pc = b
-            if v_eq_bool(_lget(regs, a), _lget(regs, c)) == 0:
+            if v_eq_bool(st, _lget(regs, a), _lget(regs, c)) == 0:
                 pc = b
             else:
                 pc = pc + 1
@@ -3083,7 +3199,7 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
         elif op == 68:                     # ACC_SUB_L: reg[a] = reg[a] - reg[b]; reclaim
             la = _lget(regs, a)
             lb = _lget(regs, b)
-            _lset(regs, a, v_sub(la, lb))
+            _lset(regs, a, v_sub(st, la, lb))
             _free_v(la)
             if c == 1:
                 _free_v(lb)
@@ -3186,7 +3302,7 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
             pc = pc + 1
         elif op == 21:
             ob = _lget(regs, b); oc = _lget(regs, c)
-            _lset(regs, ra, v_sub(ob, oc))
+            _lset(regs, ra, v_sub(st, ob, oc))
             if fc == 1:
                 _free_v(oc)
             if fb == 1:
@@ -3256,12 +3372,12 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
         elif op == 33:
             _lset(regs, a, v_bool(1 if v_cmp(_lget(regs, b), _lget(regs, c)) >= 0 else 0)); pc = pc + 1
         elif op == 34:
-            _lset(regs, a, v_bool(v_eq_bool(_lget(regs, b), _lget(regs, c)))); pc = pc + 1
+            _lset(regs, a, v_bool(v_eq_bool(st, _lget(regs, b), _lget(regs, c)))); pc = pc + 1
         elif op == 35:
-            _lset(regs, a, v_bool(1 if v_eq_bool(_lget(regs, b), _lget(regs, c)) == 0 else 0)); pc = pc + 1
+            _lset(regs, a, v_bool(1 if v_eq_bool(st, _lget(regs, b), _lget(regs, c)) == 0 else 0)); pc = pc + 1
         elif op == 59:                     # IS: tag-strict identity (1 is True -> 0)
             ob = _lget(regs, b); oc = _lget(regs, c)
-            if ob.tag == oc.tag and v_eq_bool(ob, oc) == 1:
+            if ob.tag == oc.tag and v_eq_bool(st, ob, oc) == 1:
                 _lset(regs, a, v_bool(1))
             else:
                 _lset(regs, a, v_bool(0))
@@ -3286,7 +3402,7 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
             if ob.tag == 1 and oc.tag == 1:
                 _lset(regs, ra, v_int(ob.iv - oc.iv))
             else:
-                _lset(regs, ra, v_sub(ob, oc))
+                _lset(regs, ra, v_sub(st, ob, oc))
             if fc == 1:
                 _free_v(oc)
             if fb == 1:
