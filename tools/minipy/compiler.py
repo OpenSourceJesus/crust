@@ -23,6 +23,14 @@ later without changing the format.
 """
 from __future__ import annotations
 import ast
+# `sys` is used only for the `sys.implementation.name` guards that fold away
+# when compiler.py is itself compiled by minipy. minipy treats `import sys` as a
+# recognised no-op, so this line is safe on both implementations.
+import sys
+# `os` is needed by _module_registry(). It must be imported at module level: the
+# linker rewrites top-level imports only, and on minipy `os` resolves to
+# rpy_lib/minios.py.
+import os
 
 # ---------------------------------------------------------------------------
 # Opcodes. Numbers are grouped so AOT-specialised variants get their own band
@@ -2278,7 +2286,9 @@ class _WithDesugar(ast.NodeTransformer):
 # recognised-no-op import behavior (e.g. CPython-only modules gated behind a
 # `sys.implementation.name` check).
 def _module_registry():
-    import os
+    # `import os` lives at module level (see the top of the file): the module
+    # linker only rewrites top-level imports, so a function-local one leaves
+    # `os` unbound when compiler.py is itself compiled by minipy.
     here = os.path.dirname(os.path.abspath(__file__))
     lib = os.path.join(here, "..", "rpy_lib")
     return {
@@ -2996,11 +3006,23 @@ class VM:
                 if isinstance(callee, tuple):
                     fullargs = self._bind_kwargs(callee, posvals, kwnames, kwvals)
                     regs[a] = self._invoke(callee, fullargs)
-                else:                           # host callable: real kwargs
+                elif sys.implementation.name != "minipy":
+                    # Host callable: real kwargs. `callee(*posvals, **kw)` is the
+                    # single construct the v0 code generator rejects, and it was
+                    # the only thing stopping compiler.py from compiling itself.
+                    # The branch is dead on minipy -- a host callable is a
+                    # CPython function object reached through the reference VM,
+                    # and the reference VM is exactly what the native
+                    # interpreter replaces -- so the impl guard folds it away at
+                    # compile time. That is cheaper and more honest than adding a
+                    # CALL_SPREAD_KW opcode that no compiled program would use.
                     kw = {}
                     for k in range(nkw):
                         kw[kwnames[k]] = kwvals[k]
                     regs[a] = callee(*posvals, **kw)
+                else:
+                    raise CompileError("CALL_KW: host callable %r has no minipy "
+                                       "equivalent" % (callee,))
             elif op == 89:                      # CALL_FUNC (direct)
                 fnum = c // 256; nargs = c % 256
                 ca = [regs[b + k] for k in range(nargs)]

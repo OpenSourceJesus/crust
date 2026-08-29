@@ -1969,6 +1969,13 @@ def do_builtin(st: "St", bid: "long", args: "list[V]") -> "V":
             for e in materialize(st, args[0]):
                 _set_add(st, sv, e)
         return sv
+    # Builtin ids are a SINGLE space shared with the compiler. 0..31 belong to
+    # compiler.BUILTINS (see its list; __re_search=30, __re_match=31 are the
+    # last two) and are emitted directly by generated code. Interpreter-only
+    # builtins -- the ones bound by name at boot rather than called by id --
+    # must therefore start at 32. `open` and `_native_exists` were handed 30 and
+    # 31, so the branch below shadowed them and every file object came back
+    # unopened; they now live at 47/48, above the _native_call* block.
     if bid == 30 or bid == 31:  # __re_search / __re_match
         # The regex seam. Both arguments are guest strings, so the pattern is
         # runtime-valued -- which is precisely what py2c lowers to crust_re's
@@ -2165,9 +2172,9 @@ def do_builtin(st: "St", bid: "long", args: "list[V]") -> "V":
             if obj.tag == 12:
                 inst_set(st, obj, args[1].sv, args[2])
         return v_none()
-    if bid == 30:              # open -> buffered file object (tag 16)
+    if bid == 47:              # open -> buffered file object (tag 16)
         return file_open(st, args)
-    if bid == 31:             # native os.path.exists (compiles to access())
+    if bid == 48:             # native os.path.exists (compiles to access())
         if len(args) > 0 and args[0].tag == 3 and os.path.exists(args[0].sv):
             return v_bool(1)
         return v_bool(0)
@@ -3274,10 +3281,18 @@ def build_state(prog: "Program", sargs: "list[str]") -> "St":
             glob[gi] = v_container(st, 7, 0, av)
         elif _strcmp(nm, "__syspath__") == 0:
             glob[gi] = v_container(st, 7, 0, new_v_list())
+        elif _strcmp(nm, "_host_os") == 0:
+            # rpy_lib/minios.py guards every filesystem call with
+            # `if _host_os is not None`, documenting that native minipy "leaves
+            # it unset (None)". But an unset global is the tag-17 sentinel, and
+            # LOAD_GLOBAL turns that into a NameError -- so the guard raised
+            # instead of falling through to the _native_* path. Bind it to a
+            # real None so the intended fallback happens.
+            glob[gi] = v_none()
         elif _strcmp(nm, "open") == 0:
-            glob[gi] = v_builtin(30)            # do_builtin(30) -> file_open
+            glob[gi] = v_builtin(47)            # do_builtin(47) -> file_open
         elif _strcmp(nm, "_native_exists") == 0:
-            glob[gi] = v_builtin(31)            # minios exists/isfile fallback
+            glob[gi] = v_builtin(48)            # minios exists/isfile fallback
         elif _strcmp(nm, "_native_makedirs") == 0:
             glob[gi] = v_builtin(32)            # minios makedirs fallback
         elif _strcmp(nm, "_native_dlopen") == 0:
