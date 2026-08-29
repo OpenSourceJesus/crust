@@ -184,6 +184,12 @@ _empty_blocks: "list[V]" = None
 # list there and allocated one per container. They borrow this sentinel instead;
 # a dict replaces it with its own list on first reindex.
 _empty_buckets: "list[V]" = None
+# A single shared empty list parked in reclaimed heap slots after their real
+# items array has been freed. Sharing one avoids making the sweep an allocator
+# (a fresh [] per reclaimed slot is exactly the cost the old sweep avoided by
+# not freeing at all); the slot is dead, so nothing ever reads or mutates it
+# before _heap_put reassigns items.
+_empty_items: "list[V]" = None
 # Per-program cache of materialized constant values (filled once at startup).
 _const_vs: "list[V]" = None
 # Free-list of uniquely-owned, dead arithmetic temporaries (large ints / floats)
@@ -260,8 +266,14 @@ class St:
 
 
 def new_int_list() -> "list[int]":
-    r = []
-    return r
+    # Return the literal directly. `r = []; return r` types the local from its
+    # initialiser -- a *generic* boxed list -- and the return then pointer-casts
+    # it to _tlist_int*. Those are different structs ({obj* data; int len; int
+    # cap;} vs {int* data; long len; long cap;}), so push/pop read data and cap
+    # from the wrong offsets and realloc() an arena pointer. py2c only builds a
+    # real typed list when the returned node *is* the literal (coerce_to), so
+    # the local defeated it and _tlist_int_new was never called anywhere.
+    return []
 
 
 def new_v_list() -> "list[V]":
@@ -276,9 +288,10 @@ def new_reg_pool() -> "list[list[V]]":
 
 def setup_cache() -> "int":
     global _cache_ready, _none_v, _true_v, _false_v, _int_cache, _empty_blocks
-    global _empty_buckets, _v_freelist
+    global _empty_buckets, _empty_items, _v_freelist
     _empty_blocks = new_v_list()
     _empty_buckets = new_v_list()
+    _empty_items = new_v_list()
     _v_freelist = new_v_list()
     _none_v = V(0, 0)
     _false_v = V(4, 0)
@@ -375,7 +388,7 @@ def v_builtin(bid: "long") -> "V":
 # `live * GC_GROWTH` on an obj is a call into the boxed-arithmetic runtime
 # that the C compiler then rightly refuses. Found by *building* the
 # transpiled C, not by transpiling it; the transpile alone passed.
-GC_ON = 0
+GC_ON = 1
 GC_MIN_HEAP = 4096                # never collect below this; startup is noise
 GC_GROWTH = 2                     # collect again at this multiple of live
 
@@ -482,12 +495,16 @@ def gc_collect(st: "St") -> "long":
             if c.kind >= 0:               # not already on the free list
                 c.kind = -1               # -1 marks a slot as free
                 c.cursor = 0
-                # `items` is left in place. The tracer never visits a free
-                # slot -- nothing references it, and marking starts from
-                # roots -- so the stale list is unread until reuse
-                # overwrites it. The first version allocated a fresh empty
-                # list here, which made the sweep itself an allocator: one
-                # dead list per reclaimed slot, paid into the arena.
+                # Hand the items array back to the arena. Reclaiming the heap
+                # *slot* alone left the list itself -- struct plus backing
+                # array -- allocated forever, so peak memory tracked total
+                # allocations instead of the live set: a loop building and
+                # dropping one list at a time still grew without bound. The
+                # slot is unreachable at this point (marking starts from the
+                # roots and did not reach it), so nothing can observe the
+                # freed array; `items` is reassigned by the next _heap_put.
+                del c.items
+                c.items = _empty_items
                 c.buckets = _empty_buckets
                 if st.nfree < len(st.freelist):
                     _lset(st.freelist, st.nfree, V(1, j))
@@ -2716,7 +2733,7 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
         # takes values out of registers and puts results back, so nothing is
         # in flight here. That is what makes the root set complete, and it
         # is why the trigger is here rather than in the allocator.
-        if GC_ON != 0 and len(st.heap) >= st.gc_next:
+        if GC_ON != 0 and (len(st.heap) - st.nfree) >= st.gc_next:
             if has_blocks != 0:
                 _gc_mark_frame_blocks(st, blocks, bn)
             gc_collect(st)
