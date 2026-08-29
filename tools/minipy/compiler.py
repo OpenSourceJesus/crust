@@ -340,7 +340,22 @@ class Compiler:
     # conservative (any unrecognised position is treated as an escape) and the
     # runtime _free_v gate is an independent backstop (only large ints/floats are
     # ever actually recycled), so a missed case cannot corrupt a live binding.
-    _READONLY_BUILTINS = ("print", "len")
+    # Builtins that inspect an argument without keeping a reference to it, so
+    # passing a name to one does not make that name escape. This is the gate on
+    # whether a global/local can have its old value reclaimed on reassignment,
+    # and it was previously just print/len -- which meant a single `str(acc)`
+    # anywhere in the module disqualified `acc` for the whole program and every
+    # `acc = acc + 1` leaked its previous V. Each name here was checked against
+    # its do_builtin implementation: all of them read the argument and return a
+    # fresh scalar or a class id, none store it.
+    #
+    # Deliberately absent: list/tuple/dict/set/sorted/min/max/sum. They do not
+    # retain the *argument* either, but they return values that alias its
+    # elements, which is a different question from the one this gate answers and
+    # not worth the risk here.
+    _READONLY_BUILTINS = ("print", "len", "str", "repr", "int", "float",
+                          "bool", "abs", "ord", "chr", "type", "isinstance",
+                          "hasattr")
 
     @staticmethod
     def _scope_locals(fnode):
