@@ -114,12 +114,12 @@ class AnnAssign(AST):
 
 
 class For(AST):
-    def __init__(self, target, itr, body, orelse):
+    def __init__(self, target, iter, body, orelse):
         self._fields = ("target", "iter", "body", "orelse", "type_comment")
         self._typename = "For"
         self._init_loc()
         self.target = target
-        self.iter = itr
+        self.iter = iter
         self.body = body
         self.orelse = orelse
         self.type_comment = None
@@ -313,12 +313,12 @@ class Attribute(AST):
 
 
 class Subscript(AST):
-    def __init__(self, value, slce, ctx):
+    def __init__(self, value, slice, ctx):
         self._fields = ("value", "slice", "ctx")
         self._typename = "Subscript"
         self._init_loc()
         self.value = value
-        self.slice = slce
+        self.slice = slice
         self.ctx = ctx
 
 
@@ -413,11 +413,11 @@ class Dict(AST):
 
 
 class comprehension(AST):
-    def __init__(self, target, itr, ifs, is_async):
+    def __init__(self, target, iter, ifs, is_async):
         self._fields = ("target", "iter", "ifs", "is_async")
         self._typename = "comprehension"
         self.target = target
-        self.iter = itr
+        self.iter = iter
         self.ifs = ifs
         self.is_async = is_async
 
@@ -460,11 +460,11 @@ class DictComp(AST):
 
 
 class arg(AST):
-    def __init__(self, argname, annotation):
+    def __init__(self, arg, annotation):
         self._fields = ("arg", "annotation", "type_comment")
         self._typename = "arg"
         self._init_loc()
-        self.arg = argname
+        self.arg = arg
         self.annotation = annotation
         self.type_comment = None
 
@@ -1167,6 +1167,25 @@ def _skip_noise(nm):
     return nm == "EMPTY_LINE" or nm == "comment"
 
 
+def _append_stmt(node, out):
+    """Convert one grammar statement node and append it to `out`.
+
+    `simple_stmt` is the grammar's wrapper for a single source *line* of small
+    statements -- `a = 1; b = 2` parses to one simple_stmt with two children --
+    so one node can produce several body entries. Every place that builds a
+    statement list has to expand it; converting it directly fell through
+    _conv_stmt's final `Expr(_conv(node))` and raised "cannot convert expr node:
+    simple_stmt". rast.py uses this form 12 times and compiler.py 84 times, so
+    minast could not convert either of them and self-hosting stopped here.
+    """
+    if node.name == "simple_stmt":
+        for c in node.children:
+            if is_node(c) and not _skip_noise(c.name):
+                _append_stmt(c, out)
+        return
+    out.append(_conv_stmt(node))
+
+
 def _suite(children, start):
     out = []
     i = start
@@ -1176,9 +1195,9 @@ def _suite(children, start):
             if c.name == "suite":
                 for sc in c.children:
                     if is_node(sc) and not _skip_noise(sc.name):
-                        out.append(_conv_stmt(sc))
+                        _append_stmt(sc, out)
             elif c.name != "elseblock" and not _skip_noise(c.name):
-                out.append(_conv_stmt(c))
+                _append_stmt(c, out)
         i = i + 1
     return out
 
@@ -1408,11 +1427,17 @@ class Try(AST):
 
 
 class ExceptHandler(AST):
-    def __init__(self, etype, name, body):
+    # Parameter names deliberately match CPython's _fields, even where that
+    # shadows a builtin inside the constructor (`type`, `iter`, `slice`, `arg`).
+    # Callers construct these by keyword -- compiler.py does
+    # `ast.ExceptHandler(type=..., name=..., body=...)` -- so a renamed
+    # parameter is a TypeError at the call site even though the attribute it
+    # sets was already correct.
+    def __init__(self, type, name, body):
         self._fields = ("type", "name", "body")
         self._typename = "ExceptHandler"
         self._init_loc()
-        self.type = etype
+        self.type = type
         self.name = name
         self.body = body
 
@@ -1524,11 +1549,13 @@ def _flatten_stmt(c):
         out = []
         for sc in c.children:
             if is_node(sc) and not _skip_noise(sc.name):
-                out.append(_conv_stmt(sc))
+                _append_stmt(sc, out)
         return out
     if _skip_noise(c.name):
         return []
-    return [_conv_stmt(c)]
+    out = []
+    _append_stmt(c, out)
+    return out
 
 
 def _conv_excepthandler(ec):
@@ -2203,7 +2230,7 @@ def parse(source, filename="<unknown>", mode="exec", type_comments=0, feature_ve
     if _is(tree, "And"):
         for c in tree.children:
             if is_node(c) and not _skip_noise(c.name):
-                body.append(_conv_stmt(c))
+                _append_stmt(c, body)
     else:
-        body.append(_conv_stmt(tree))
+        _append_stmt(tree, body)
     return Module(body)

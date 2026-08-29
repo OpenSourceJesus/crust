@@ -427,7 +427,7 @@ fplist = {fpdef (comma {fpdef})*} comma?
 stmt = compound_stmt | simple_stmt
 simple_stmt = {small_stmt (";" {small_stmt})*} ";"? NEWLINE
 small_stmt = del_stmt | pass_stmt | flow_stmt | comment
-           | import_stmt | global_stmt | exec_stmt | assert_stmt | expr_stmt
+           | import_stmt | global_stmt | assert_stmt | expr_stmt
 
 expr_stmt = aug_assign | ann_assign | regular_assign | testlist
 aug_assign_symbol = "+=" | "-=" | "*=" | "/=" | "%=" | "&="
@@ -460,6 +460,12 @@ dotted_as_name = dotted_name ("as" {NAME})?
 import_as_names! = {import_as_name ("," {import_as_name})*} ","?
 dotted_name = NAME ("." {NAME})*
 global_stmt = "global" NAME ("," NAME)*
+# exec_stmt is Python 2 and is no longer reachable from small_stmt. It was
+# tried before expr_stmt, so a Python 3 call like `exec(compile(src), ns)`
+# matched it -- "exec" followed by a parenthesised expression is exactly the
+# py2 statement form -- and produced an exec_stmt node that minast has no
+# conversion for. print_stmt below is the same vintage and was already unwired.
+# The rule is kept for reference; deleting it would change rule numbering.
 exec_stmt! = "exec" {expr ("in" {test} ("," {test})?)?}
 assert_stmt! = "assert" {test ("," test)?}
 
