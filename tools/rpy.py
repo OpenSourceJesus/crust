@@ -271,6 +271,22 @@ def _cache_key(path):
         h.update(cs.encode("utf-8"))
     except OSError:
         pass
+    # The linked library modules (rpy_lib/minast.py, rast.py, crustre.py, ...)
+    # are compiled *into* the program by _link_modules, so editing one changes
+    # the emitted bytecode. They are not reachable through _project_files -- the
+    # script imports `ast`, not `rpy_lib/minast.py` -- so a source-only key
+    # happily served bytecode built against the previous minast. Fold them in.
+    try:
+        reg = _minipy_compiler()._module_registry()
+        for key in sorted(reg):
+            h.update(("\x00mod\x00" + key).encode("utf-8"))
+            try:
+                with open(reg[key], encoding="utf-8") as fh:
+                    h.update(fh.read().encode("utf-8"))
+            except OSError:
+                pass
+    except AttributeError:
+        pass
     return h.hexdigest()
 
 
