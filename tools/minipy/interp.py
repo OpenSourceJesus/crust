@@ -211,7 +211,7 @@ class St:
     def __init__(self, prog: "Program", glob: "list[V]", heap: "list[Cont]",
                  exc_flag: "int", exc_val: "V", regpool: "list[list[V]]",
                  mcache_cls: "list[V]", mcache_fidx: "list[V]",
-                 frames: "list[list[V]]", freelist: "list[int]"):
+                 frames: "list[list[V]]", freelist: "list[V]"):
         self.prog = prog
         self.glob = glob
         self.heap = heap
@@ -238,7 +238,15 @@ class St:
         # here before it appends, which is what turns `st.heap` from an
         # append-only log into a table with reuse -- the whole point of the
         # collector, and the only line of it that the fast path touches.
+        # Free indices are carried as `V(1, index)` and the live count is
+        # `nfree`, the same shape the block stack uses -- a `list[int]`
+        # field stays boxed through py2c, so popping one hands back an
+        # `obj` where a `long` is needed, and the native build fails. The
+        # block stack's comment ("list[int].pop is miscompiled by py2c, so
+        # index by bn") is the precedent; entries above `nfree` are stale
+        # and reused in place rather than popped.
         self.freelist = freelist
+        self.nfree = 0
         # Collect when the heap has grown to this size. Set to a multiple of
         # the live set after each collection, so collection cost is
         # proportional to what survives rather than to what was allocated,
@@ -361,9 +369,15 @@ def v_builtin(bid: "long") -> "V":
 # Off by default (`GC_ON`). A program that allocates few containers should
 # not pay for a collector, and the growth trigger below is what makes that
 # true even when it is on.
-GC_ON: "int" = 0
-GC_MIN_HEAP: "long" = 4096        # never collect below this; startup is noise
-GC_GROWTH: "long" = 2             # collect again at this multiple of live
+# Plain assignments, not annotated ones: py2c lowers `NAME = <int>` at
+# module level to a C integer constant (`_METH_SHIFT` above is the
+# precedent), while an annotated module global becomes a boxed `obj` -- and
+# `live * GC_GROWTH` on an obj is a call into the boxed-arithmetic runtime
+# that the C compiler then rightly refuses. Found by *building* the
+# transpiled C, not by transpiling it; the transpile alone passed.
+GC_ON = 0
+GC_MIN_HEAP = 4096                # never collect below this; startup is noise
+GC_GROWTH = 2                     # collect again at this multiple of live
 
 
 def _gc_mark(v: "V", marks: "list[int]", work: "list[int]") -> "None":
@@ -468,9 +482,18 @@ def gc_collect(st: "St") -> "long":
             if c.kind >= 0:               # not already on the free list
                 c.kind = -1               # -1 marks a slot as free
                 c.cursor = 0
-                c.items = new_v_list()    # drop the references it held
+                # `items` is left in place. The tracer never visits a free
+                # slot -- nothing references it, and marking starts from
+                # roots -- so the stale list is unread until reuse
+                # overwrites it. The first version allocated a fresh empty
+                # list here, which made the sweep itself an allocator: one
+                # dead list per reclaimed slot, paid into the arena.
                 c.buckets = _empty_buckets
-                st.freelist.append(j)
+                if st.nfree < len(st.freelist):
+                    _lset(st.freelist, st.nfree, V(1, j))
+                else:
+                    st.freelist.append(V(1, j))
+                st.nfree = st.nfree + 1
                 freed = freed + 1
         j = j + 1
     nxt = live * GC_GROWTH
@@ -487,8 +510,9 @@ def _heap_put(st: "St", kind: "int", items: "list[V]") -> "long":
     # only in an interpreter local, which is not a root. Collecting here
     # freed it. The trigger lives at the dispatch loop's safepoint instead,
     # where every live value is in a register by construction.
-    if len(st.freelist) > 0:
-        h = st.freelist.pop()
+    if st.nfree > 0:
+        st.nfree = st.nfree - 1
+        h = st.freelist[st.nfree].iv
         c = st.heap[h]
         c.kind = kind
         c.cursor = 0
@@ -3232,7 +3256,7 @@ def build_state(prog: "Program", sargs: "list[str]") -> "St":
         mcf.append(v_int(-1))
         zc = zc + 1
     st = St(prog, glob, heap, 0, v_none(), new_reg_pool(), mcc, mcf,
-            new_reg_pool(), new_int_list())
+            new_reg_pool(), new_v_list())
     k = 0
     while k < prog.nglobals:
         glob.append(V(17, 0))                  # unset sentinel; see LOAD_GLOBAL
