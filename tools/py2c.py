@@ -8185,7 +8185,15 @@ class Transpiler:
         self.emit("%s* %s_new(%s) {" % (ci.csym, ci.csym, plist))
         self.indent += 1
         if ci.csym in self._pod_set:
-            self.emit("%s* self = malloc(sizeof *self);" % ci.csym)
+            # Arena, not libc malloc. A POD is a bare struct with no Obj header,
+            # so it is usually small -- minipy's V is 16 bytes -- and glibc
+            # rounds a 16-byte request up to a 32-byte chunk plus bookkeeping,
+            # so half the memory was allocator overhead. The arena hands out
+            # exactly the aligned size with no header, and `del` already lowers
+            # to afree(), which previously silently ignored malloc'd pointers
+            # and leaked them. Non-POD classes have always used aalloc; this
+            # just makes the two paths agree.
+            self.emit("%s* self = aalloc(sizeof *self);" % ci.csym)
         else:
             self.emit("%s* self = aalloc(sizeof *self);" % ci.csym)
             self.emit("((Obj*)self)->type = &%s_type;" % ci.csym)
@@ -8213,7 +8221,7 @@ class Transpiler:
         self.emit("%s* %s_new(void) {" % (ci.csym, ci.csym))
         self.indent += 1
         if ci.csym in self._pod_set:
-            self.emit("%s* self = malloc(sizeof *self);" % ci.csym)
+            self.emit("%s* self = aalloc(sizeof *self);" % ci.csym)   # see above
         else:
             self.emit("%s* self = aalloc(sizeof *self);" % ci.csym)
             self.emit("((Obj*)self)->type = &%s_type;" % ci.csym)
@@ -10891,10 +10899,17 @@ class Transpiler:
                 expr = self.expr(t)
                 cls = ct[:-1]
                 ci = self.classes.get(cls)
-                if ci is not None and \
-                        ci.csym not in getattr(self, "_pod_set", set()):
+                if ci is not None:
+                    # Every class instance -- POD or not -- comes from aalloc,
+                    # so every one goes back through afree. This used to be
+                    # split, with POD instances libc-freed to match their
+                    # libc-malloc; now that PODs are arena-allocated too, a
+                    # free() here hands the allocator a pointer into the arena
+                    # ("free(): invalid pointer", immediately, on the first
+                    # `del` of a POD).
                     out.append("afree(%s, sizeof(*(%s)));" % (expr, expr))
                 else:
+                    # Not a class: a typed array or other libc-malloc'd buffer.
                     out.append("free(%s);" % expr)
                 continue
             # `del` on an obj-typed value: if it holds a list, hand it back to
