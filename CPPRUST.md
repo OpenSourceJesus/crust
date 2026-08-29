@@ -816,6 +816,94 @@ would leave only that loop. `[=]` names nothing to look up, and a by-value
 capture whose declaration is missing or ambiguous is refused rather than
 guessed at — a wrong type there would silently truncate.
 
+## Checked errors: `except`, `raise`, `try`
+
+Error handling is in, and it is not C++ exceptions. It is the checked model
+— the one the safety standards that ban `throw` are actually asking for —
+and it is the same mechanism the rpython half of a mixed translation unit
+runs on, so one unit has one error model.
+
+```cpp
+int parse(int x) except {          /* fallibility is in the signature   */
+    if (x < 0) { raise 42; }
+    return x * 2;
+}
+
+int main(void) {
+    int r;
+    try {
+        r = parse(n);
+    } except (long e) {            /* one machine word of payload       */
+        log(e);
+    }
+    return 0;
+}
+```
+
+An error is a value in a static per-unit slot (`_cpp_exc`: a flag and one
+`long`). `raise E;` sets it and takes an **ordinary return**; every
+statement that calls an `except` function is followed by a flag check; a
+handler clears the flag and binds the payload. No unwinder, no unwind
+tables, no allocation, and every control edge is visible in the generated
+C. It is spelled `except`, not `catch`, as a load-bearing signal: a
+reviewer working to a standard that bans `catch` can see at a glance this
+is not that thing.
+
+Four properties, each the reason a standard banned the C++ version:
+
+* **Destructors run on the error path.** The lowering runs before the
+  return pass, so a `raise` and a propagation are ordinary returns — and
+  ordinary returns already emit every destructor. C++ exceptions need an
+  unwinder for this sentence; the checked model gets it from the existing
+  epilogue.
+* **Fallibility is part of the signature.** A call to a non-`except`
+  function emits no check, so code that does not use the model pays
+  nothing — the 18-example sweep is byte-identical.
+* **An unhandled error is a compile error**, not a `terminate()` later. A
+  fallible call with no `try` around it, in a function not marked
+  `except` itself, refuses to translate. This is the check `noexcept`
+  never gave anyone.
+* **A `raise` dispatches to the innermost handler**, exactly as a failed
+  call does: inside a `try`, that `try` catches it; in a bare `except`
+  function it propagates as a poisoned return; a bare `raise;` in a
+  handler re-raises the held value one level out.
+
+Methods take `except` too, including virtuals — the check follows the
+*call*, not the static type, so a call through a base reference is checked
+whichever override sets the flag. Calls are recognized by name on purpose:
+if any class marks `take` fallible, every `take` call is checked, which
+closes the classic base-not-fallible/derived-raises escape at the cost of
+a never-taken branch on unrelated same-named methods.
+
+What is refused, and why each refusal is the feature:
+
+* **A constructor or destructor cannot be `except`, and cannot `raise`.**
+  A constructor has no return value to poison and a failure would leave a
+  partially-built object with no one owning it. The diagnostic carries
+  the design: a `static T make(..) except` factory that constructs only
+  after the fallible part succeeded.
+* **A fallible call embedded in another call's arguments.**
+  `printf("%d", c())` would print garbage first and jump to the handler
+  second — the statement-level check runs too late. Bind it to a local
+  first. (`return a() + 1;` inside an `except` function stays sound: the
+  value is garbage, but the caller tests the flag before the value, which
+  is the whole contract.)
+* **A class local declared inside a `try` block** — the handler is
+  reached by a jump that leaves the block early, skipping the scope-end
+  destructor on exactly the path it matters most. Declare it before the
+  `try`.
+* `throw` and `catch` stay refused permanently; their diagnostics name
+  the replacement.
+
+Known limits, stated rather than discovered: the payload is one machine
+word (richer payloads must not cost the no-allocation property); and a
+`try` in a scope that already holds a destructor-bearing local is refused
+by the scope pass's conservative goto guard — the handler labels happen to
+be same-scope, and teaching the guard that is a named next step. The
+design's origin and its rpython twin are in [CPPRPY.md](CPPRPY.md); the
+argument for why this model rather than `-fexceptions` is in
+[CPP_DIRECTION.md](CPP_DIRECTION.md).
+
 ## A small `std`
 
 `string` and `vector<T>` are supplied when the source names them, and are
@@ -1605,9 +1693,14 @@ use of one is a member access and the symbol table already turns `o.x` into
 
 ## Not supported yet
 
-Reported rather than mistranslated: exceptions (`throw` / `try` / `catch`),
-`dynamic_cast`, `typeid`, multiple and virtual inheritance, a conversion
-operator, the stream operators, and the rest of the STL.
+Reported rather than mistranslated: virtual inheritance (refused as a
+design position, not a gap — see [CPPRPY.md](CPPRPY.md) §3), a conversion
+operator, the stream operators, and the rest of the STL. Several entries
+that used to sit in this list have moved out of it: exceptions became the
+checked `except` model above (`throw`/`catch` themselves stay refused,
+with the replacement named in the diagnostic); `dynamic_cast` and
+`typeid` work under `--rtti`; and tier-1 multiple inheritance — one
+layout base plus interface bases — is in, verified against `g++`.
 
 Operator overloading is **partly** in: `=`, the compound assignments, the
 comparisons, `[]`, `->`, `*`, and the binary arithmetic operators (see

@@ -1,6 +1,65 @@
 # Crust
 ## A Unified C/C++/Rust Compiler Environment for Systems Programming
 
+## A new C++, from a self-contained system
+
+C++26 adds features to a language whose problem was never a shortage of
+features. Crust goes the other direction: a **C++ subset with opinions**,
+compiled by a self-contained toolchain that owns the whole stack — the
+compiler, the C it emits, the boot path, the threading model — with no
+clang, no gcc frontend, no rustc, and for the bare-metal targets, **no
+operating system underneath**. The position paper is
+[CPP_DIRECTION.md](CPP_DIRECTION.md); the short version is that every
+credible safety story in this space — JSF, MISRA, seL4, SPARK — is a
+*subtraction* story, and the first mover that makes the smaller language
+load-bearing gets to define it.
+
+Owning the full stack is not a purity exercise. It is what lets the line
+between language, runtime and OS blur where blurring wins:
+
+**Threading is the clearest case.** `std::thread` and `thread_local` are
+OS thinking: the language cannot see thread structure, so every context
+switch saves the whole architectural register file, and every
+thread-local is a memory segment reached through an indirection register.
+Crust's bare-metal model declares the threads **to the compiler**:
+
+```c
+assert io_thread      in threads.left(  core=0 )
+assert compute_thread in threads.right( core=0 )
+```
+
+From two declarations, the compiler computes each thread's transitive
+register footprint over the whole-program call graph, splits the register
+file into **disjoint left/right banks**, re-runs allocation under each
+budget, and **generates the context switcher** — which saves only what
+the running side actually uses. A thread's persistent state lives *in its
+registers across switches*: what `thread_local` approximates with a TLS
+segment and a `tp`-relative load, this model gets for the price of
+nothing, because the other thread provably cannot touch the bank.
+
+Measured, not projected ([BAREMETAL_THREADS.md](BAREMETAL_THREADS.md)): a
+printf-shaped IO thread against a compute thread on bare-metal AArch64 —
+IO's seven-function call graph needs six callee-saved homes, compute
+needs **zero**, so switching away from compute saves nothing at all;
+50,522 preemptive switches with the generated switcher in the IRQ vector
+and **zero corruptions**, verified by per-iteration invariants; the
+partitioned ISR is 60 instructions against 75 for save-all. None of this
+is expressible in a `std::thread` world, because pthreads sits below the
+language and the language cannot see through it.
+
+The same ownership runs the rest of the way down: the toolchain builds
+and boots its own OS ([CRUSTOS.md](CRUSTOS.md), and the *Full-stackless
+Computing* paper below), C++ and Rust meet in one translation unit with
+one destructor lowering, error handling is the checked `except` model —
+destructors on the error path with **no unwinder**, unhandled errors as
+*compile* errors ([CPPRUST.md](CPPRUST.md)) — and one class digest lets a
+C++ class subclass an rpython one and the reverse
+([CPPRPY.md](CPPRPY.md)). What the subset refuses, it refuses with the
+reason and the replacement in the diagnostic; the refusals are tested as
+pinned behaviour, because for this compiler a refusal *is* the
+deliverable.
+
+
 Main Crust Documentation: 
 - [CRUST.md](CRUST.md) C+Rust
 - [CPPRUST.md](CPPRUST.md) C+C++Rust
