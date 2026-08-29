@@ -579,13 +579,40 @@ def _lower_except(text, path="<cpp>"):
     fallible = {}
     for m in _FALLIBLE_SIG.finditer(look):
         fallible[m.group(2)] = _except_zero(m.group(1))
+    # A constructor that can fail has no return channel to poison and
+    # leaves a partially-built object behind -- the exact situation the
+    # standards that ban throwing constructors are naming. The checked
+    # model's answer is a factory: `static T make(..) except`. Enforced
+    # here rather than documented, because the refusal *is* the design.
+    for cn in re.findall(r"(?<![\w.>])class\s+([A-Za-z_]\w*)", look):
+        cm = re.search(r"(?<![\w.>])~?%s\s*\([^()]*\)\s*except\b"
+                       % re.escape(cn), look)
+        if cm:
+            raise CppError(
+                "%s:%d: a %s cannot be declared `except`. It has no "
+                "return value to poison, and a failure would leave a "
+                "partially-built object with no one owning it. Make a "
+                "factory instead: `static %s make(..) except` that "
+                "constructs only after the fallible part succeeded."
+                % (os.path.basename(path), _src_line(look, cm.start()),
+                   "destructor" if look[cm.start()] == "~"
+                   else "constructor", cn))
     if not fallible and _TRY_RE.search(look) is None \
             and _RAISE_RE.search(look) is None:
         return text, False
     text = re.sub(r"(\))\s*except\b(\s*[;{])", r"\1\2", text)
     look = _strip_comments(text)
 
-    call_re = (re.compile(r"(?<![\w.>])(%s)\s*\("
+    # Calls are recognized by *name*, whether spelled `f(..)`, `x.f(..)`
+    # or `p->f(..)`. Coarse on purpose: if any class marks `take` as
+    # `except`, every `take` call is checked. A spurious check on an
+    # unrelated same-named method costs one never-taken branch (every
+    # fallible call clears or handles the flag in the same statement, so
+    # it cannot be left set). What the coarseness *buys* is override
+    # safety for free -- a call through a base reference is checked even
+    # when only the derived override can fail, which is the classic
+    # escape hatch in signature-based schemes.
+    call_re = (re.compile(r"(?<!\w)(%s)\s*\("
                           % "|".join(re.escape(n) for n in sorted(fallible)))
                if fallible else None)
     labels = [0]
@@ -792,16 +819,47 @@ def _lower_except(text, path="<cpp>"):
         flush(n)
         return "".join(out)
 
-    # -- per top-level function body ------------------------------------
+    # -- per function and method body -----------------------------------
     out, pos = [], 0
     fn_re = re.compile(r"([A-Za-z_][\w \*]*?)\b([A-Za-z_]\w*)\s*"
-                       r"\(([^()]*)\)\s*\{")
+                       r"\(([^()]*)\)\s*(?:const\s*)?\{")
+    #: Statement keywords fn_re would otherwise mistake for a definition
+    #: once bodies at depth > 0 are in play: `while (i < 5) {` has the
+    #: name-parens-brace shape too.
+    _STMT_KW = {"if", "while", "for", "switch", "return", "except",
+                "sizeof"}
+
+    def _in_class(at):
+        """Whether position `at` sits directly inside a class body -- one
+        brace deep, and the brace *that opened this scope* was a class's.
+        Method definitions live exactly there; anything deeper is inside
+        a body this walker already owns.
+
+        The opener is kept on a stack, not as last-brace-seen: after a
+        constructor's `{ ... }` closes, the last brace seen is the
+        constructor's, but the scope position `at` is in belongs to the
+        class. The first version checked the constructor's brace, decided
+        `take()` was not in a class, and every method after the first
+        braced member fell through to the leftover refusal."""
+        stack = []
+        for j, ch in enumerate(look[:at]):
+            if ch == "{":
+                stack.append(j)
+            elif ch == "}" and stack:
+                stack.pop()
+        if len(stack) != 1:
+            return False
+        opener = stack[0]
+        head = look[max(0, opener - 200):opener]
+        return re.search(r"(?<![\w.>])(?:class|struct)\s+[A-Za-z_]\w*"
+                         r"[^;{]*$", head) is not None
     while True:
         m = None
         for cand in fn_re.finditer(look, pos):
-            # Top level only: a method's body is inside a class brace and
-            # the slice keeps `try`/`raise` out of methods for now.
-            if _brace_depth(look, cand.start()) == 0:
+            if cand.group(2) in _STMT_KW:
+                continue
+            d = _brace_depth(look, cand.start())
+            if d == 0 or (d == 1 and _in_class(cand.start())):
                 m = cand
                 break
         if m is None:
@@ -826,17 +884,20 @@ def _lower_except(text, path="<cpp>"):
         pos = cb + 1
     out.append(text[pos:])
     new = "".join(out)
-    # `try`/`raise` left in a class body: the slice keeps error handling
-    # in free functions, and a leftover keyword would otherwise fall
-    # through to the generic unsupported-keyword refusal with no hint.
+    # A `try`/`raise` still standing can only be inside a constructor or
+    # destructor body -- ordinary methods and free functions were walked
+    # above. Same position as the `except`-on-a-constructor refusal, and
+    # the same fix.
     leftover = _strip_comments(new)
     lm = _TRY_RE.search(leftover) or _RAISE_RE.search(leftover)
     if lm:
         raise CppError(
-            "%s:%d: `try`/`raise` inside a class body is not in the C++ "
-            "subset yet -- the checked-error lowering covers free "
-            "functions first. Move the handling into a free function, or "
-            "wait for the method step."
+            "%s:%d: `raise`/`try` inside a constructor or destructor "
+            "body. A constructor has no return value to poison and a "
+            "failure would leave a partially-built object; a destructor "
+            "that can fail has nowhere to report to. Do the fallible "
+            "work in a `static T make(..) except` factory (or an "
+            "ordinary `except` method) and construct from its result."
             % (os.path.basename(path), _src_line(leftover, lm.start())))
     return new, True
 

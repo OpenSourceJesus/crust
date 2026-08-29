@@ -302,6 +302,95 @@ int main(void) {
         self.assertEqual("handled\n", out)
 
 
+# ------------------------------------------------------------- methods
+
+@unittest.skipUnless(_have_gcc(), "gcc not available")
+class TestMethods(Base):
+    """`except` on methods: same lowering, member or `this` call syntax.
+    Calls are recognized by *name* -- if any class marks `take` fallible,
+    every `take` call is checked. Coarse on purpose: a spurious check on
+    an unrelated same-named method is one never-taken branch (the flag
+    cannot be left set across statements), and the coarseness buys
+    override safety for free -- a call through a base reference is
+    checked even when only the derived override raises, which is the
+    classic escape in signature-based schemes."""
+
+    MEMBER = r'''#include <stdio.h>
+class Pool {
+public:
+    int cap;
+    int used;
+    Pool(int c) { cap = c; used = 0; }
+    int take() except {
+        if (used >= cap) { raise 507; }
+        used = used + 1;
+        return used;
+    }
+    int drain() except {
+        int a = this->take();
+        int b = take();
+        return a + b;
+    }
+};
+int main(void) {
+    Pool p(1);
+    int v;
+    try {
+        v = p.take();
+        printf("first %d\n", v);
+        v = p.take();
+        printf("second %d\n", v);
+    } except (long e) { printf("full %ld\n", e); }
+    Pool q(2);
+    try { v = q.drain(); printf("drain %d\n", v); }
+    except (long e) { printf("no %ld\n", e); }
+    return 0;
+}
+'''
+
+    VIRT = r'''#include <stdio.h>
+class Src {
+public:
+    virtual ~Src() { }
+    virtual int next() except { return 1; }
+};
+class Dry : public Src {
+public:
+    int next() except { raise 88; }
+};
+void run(Src *s, const char *tag) {
+    int v;
+    try { v = s->next(); printf("%s %d\n", tag, v * 10); }
+    except (long e) { printf("%se %ld\n", tag, e); }
+}
+int main(void) {
+    Src a;
+    Dry b;
+    run(&a, "a");
+    run(&b, "b");
+    return 0;
+}
+'''
+
+    def test_member_call_and_this_call(self):
+        out = self.run_c(self.MEMBER)
+        self.assertEqual("first 1\nfull 507\ndrain 3\n", out)
+
+    def test_virtual_fallible_method_through_the_base(self):
+        """The check follows the *call*, not the static type: dispatch
+        goes through the vtable, the flag is one shared word, and the
+        statement-level check picks it up whichever override set it.
+
+        The `try` lives in `run()`, not `main()`, and the placement is a
+        finding: the scope-rewrite pass refuses a `goto` while a
+        destructor-bearing local is pending, and the handler jump is a
+        goto. Conservative but *sound* -- these labels happen to be
+        same-scope, and teaching the guard that is a named next step,
+        not a workaround someone has to rediscover."""
+        out = self.run_c(self.VIRT)
+        self.assertEqual("a 10\nbe 88\n", out)
+
+
 # ----------------------------------------------------------- refusals
 
 class TestRefusals(Base):
@@ -346,6 +435,24 @@ class TestRefusals(Base):
         self.refuses("int main(void) { try { int x = 1; } "
                      "catch (int e) { } return 0; }",
                      "`try` without an `except`")
+
+    def test_constructor_cannot_be_except(self):
+        """No return value to poison, and a failure would leave a
+        partially-built object with no one owning it. The refusal
+        carries the design: a `static T make(..) except` factory."""
+        self.refuses("class R { public: int n; R(int k) except "
+                     "{ n = k; } };",
+                     "constructor cannot be declared", "factory")
+
+    def test_destructor_cannot_be_except(self):
+        self.refuses("class R { public: int n; R(int k) { n = k; } "
+                     "~R() except { } };",
+                     "destructor cannot be declared")
+
+    def test_raise_in_a_constructor_body(self):
+        self.refuses("class R { public: int n; R(int k) "
+                     "{ if (k < 0) { raise 1; } n = k; } };",
+                     "constructor or destructor body", "factory")
 
     def test_throw_names_the_replacement(self):
         self.refuses("int f(int x) { if (x) throw 1; return 0; }",
