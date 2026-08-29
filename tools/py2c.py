@@ -2318,7 +2318,17 @@ def _tlist_prelude(et):
         "static %s %s_pop(%s* l) {\n"
         "    return l->data[--l->len];\n"
         "}\n"
-        % (tl, et, tl, tl, tl, tl, et, tl, tl, et, et, et, tl, tl))
+        # Counterpart to _new. A typed list is libc-malloc'd, not arena-
+        # allocated, so `del` on one must actually free it -- without this the
+        # prelude could only ever grow a program's memory, and a caller that
+        # built a typed list per iteration (a collector's mark vector, say)
+        # leaked it every time while the arena itself stayed flat.
+        "static void %s_free(%s* l) {\n"
+        "    if (!l) return;\n"
+        "    free(l->data); l->data = 0; l->len = 0; l->cap = 0;\n"
+        "    free(l);\n"
+        "}\n"
+        % (tl, et, tl, tl, tl, tl, et, tl, tl, et, et, et, tl, tl, tl, tl))
 
 
 KNOWN_CLASSES = {}      # name -> ClassInfo
@@ -10870,6 +10880,13 @@ class Transpiler:
             # the arena free list with afree; a POD instance or a typed array
             # is libc-malloc'd, so it is released with free(). Borrowed/scalar
             # values (char*, void*, obj, int, ...) keep the bulk-reclaim no-op.
+            # A typed list owns two allocations -- the struct and its backing
+            # array -- so it must be released through its own helper. The
+            # generic pointer branch below would emit a bare free(l), which
+            # frees the struct and leaks l->data; this has to be tested first.
+            if ct and ct.startswith("_tlist_") and ct.endswith("*"):
+                out.append("%s_free(%s);" % (ct[:-1], self.expr(t)))
+                continue
             if ct and ct.endswith("*") and ct not in ("char*", "void*"):
                 expr = self.expr(t)
                 cls = ct[:-1]
