@@ -397,16 +397,20 @@ def _gc_mark(v: "V", marks: "list[int]", work: "list[int]") -> "None":
     """Mark the heap slot `v` refers to, if it refers to one.
 
     The tag says whether it does. 7..12 (list, dict, set, tuple, iter,
-    instance) and 15 (bound builtin) carry a heap index directly. 14 (bound
-    method) *packs* one -- `iv = hidx * _METH_SHIFT + fidx` -- so it has to
-    be divided out; missing that would collect the receiver of every bound
-    method while the binding still pointed at it. 13 is a class id and not
-    an index at all. Everything below 7 is an immediate.
+    instance), 15 (bound builtin) and 16 (file object) carry a heap index
+    directly. 14 (bound method) *packs* one -- `iv = hidx * _METH_SHIFT +
+    fidx` -- so it has to be divided out; missing that would collect the
+    receiver of every bound method while the binding still pointed at it. 13
+    is a class id and not an index at all. Everything below 7 is an immediate.
+
+    Tag 16 was absent here until the collector was actually switched on: a
+    file object is a container like any other (`v_container(st, 16, 8, ...)`),
+    so leaving it unmarked made every open file collectable while still live.
     """
     t = v.tag
     if t == 14:
         h = v.iv // _METH_SHIFT
-    elif t == 15:
+    elif t == 15 or t == 16:
         h = v.iv
     elif t >= 7 and t <= 12:
         h = v.iv
@@ -517,6 +521,17 @@ def gc_collect(st: "St") -> "long":
     if nxt < GC_MIN_HEAP:
         nxt = GC_MIN_HEAP
     st.gc_next = nxt
+    # Release the mark vector and work stack. They are `list[int]`, which lowers
+    # to a libc-malloc'd _tlist_int rather than an arena block, so they are the
+    # one thing in a collection the arena does not reclaim in bulk: without this
+    # every cycle leaked a vector the size of the heap, and peak memory grew
+    # with the number of collections even though the arena itself stayed flat.
+    # They cannot be hoisted to module scope and reused instead -- py2c boxes a
+    # `list[int]` global or field back to a generic list (see the freelist
+    # comment in St) and then casts it to _tlist_int*, which is the type pun
+    # that broke the collector in the first place.
+    del marks
+    del work
     return freed
 
 
