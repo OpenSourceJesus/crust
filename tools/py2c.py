@@ -289,6 +289,7 @@ void list_extend(obj lst, obj it);      /* append all elements of it           *
 obj  list_get(obj lst, long i);    /* supports negative indices               */
 void list_set(obj lst, long i, obj v);
 long pylen(obj v);                 /* len(list) or len(str)                   */
+void list_free(obj lst);           /* reclaim a dead list (see .c)            */
 obj  index_obj(obj container, long i);  /* container[i] for list/str          */
 bool obj_eq(obj a, obj b);         /* == on Tier-2 values                     */
 bool pycontains(obj container, obj v);  /* v in container                     */
@@ -1212,6 +1213,19 @@ obj list_new(void) {
     l->len = 0; l->cap = 4;
     l->data = aalloc(sizeof(obj) * l->cap);
     obj r; r.tag = T_LIST; r.u.o = (Obj*)l; return r;
+}
+/* Return a dead list's backing array and struct to the arena free list.
+   list_append already afree()s the *old* backing when it grows, so growth
+   does not leak -- but a whole list that becomes garbage was never reclaimed,
+   which made peak memory scale with total allocations rather than with the
+   live set. Tag-checked so it is a no-op on anything that is not a list, and
+   afree itself ignores pointers that did not come from the arena. */
+void list_free(obj lst) {
+    if (lst.tag != T_LIST || !lst.u.o) return;
+    List* l = (List*)lst.u.o;
+    if (l->data && l->cap) afree(l->data, sizeof(obj) * l->cap);
+    l->data = NULL; l->len = 0; l->cap = 0;
+    afree(l, sizeof *l);
 }
 void list_append(obj lst, obj v) {
     List* l = (List*)lst.u.o;
@@ -10865,6 +10879,14 @@ class Transpiler:
                     out.append("afree(%s, sizeof(*(%s)));" % (expr, expr))
                 else:
                     out.append("free(%s);" % expr)
+                continue
+            # `del` on an obj-typed value: if it holds a list, hand it back to
+            # the arena. list_free tag-checks, so this stays a no-op for any
+            # other obj (int, str, dict, None) and keeps the bulk-reclaim
+            # meaning of `del` for those. Same manual-ownership contract as the
+            # pointer case above -- `del` asserts the value is dead.
+            if ct == OBJ and isinstance(t, (ast.Name, ast.Attribute)):
+                out.append("list_free(%s);" % self.expr(t))
                 continue
             # no-op (arena reclaims in bulk); use source text, never the
             # generated C, so inner /* */ can't break the comment
