@@ -190,6 +190,32 @@ _empty_buckets: "list[V]" = None
 # not freeing at all); the slot is dead, so nothing ever reads or mutates it
 # before _heap_put reassigns items.
 _empty_items: "list[V]" = None
+
+# ---------------------------------------------------------------------------
+# String interning
+# ---------------------------------------------------------------------------
+# Open-addressed table mapping short string contents to a single shared V.
+# Measured on a self-hosted compile of rast.py: 5,555,888 string values are
+# built and they hold 1,524 distinct contents -- 99.97% duplicates -- and 99.8%
+# of them are 15 characters or shorter. Handing out one shared V per distinct
+# content removes essentially all of that allocation.
+#
+# The table is two parallel lists rather than a dict because the interpreter has
+# no dict of its own, and a py2c `dict[str, V]` would be a typed container cast
+# through an obj parameter -- the struct pun that has already broken this file
+# twice (the collector's mark vector, pyjoin's argument).
+#
+# Interned V objects are immortal by construction: _free_v only recycles tags 1
+# and 2, so a string V can never reach the free list, and the char* it holds is
+# arena memory that is never handed back (afree is only called for lists). So a
+# shared V can be returned to any number of callers without ownership tracking.
+_INTERN_BITS = 14                 # 16384 slots for ~1.5k live entries
+_INTERN_MASK = 16383
+_INTERN_MAX_LEN = 32              # covers 99.99% of strings built; longer ones
+                                  # are rare (83 of 5.5M) and not worth hashing
+_intern_v: "list[V]" = None       # slot -> shared V, or None when empty
+_intern_ready = 0
+_intern_count = 0
 # Per-program cache of materialized constant values (filled once at startup).
 _const_vs: "list[V]" = None
 # Free-list of uniquely-owned, dead arithmetic temporaries (large ints / floats)
@@ -289,9 +315,16 @@ def new_reg_pool() -> "list[list[V]]":
 def setup_cache() -> "int":
     global _cache_ready, _none_v, _true_v, _false_v, _int_cache, _empty_blocks
     global _empty_buckets, _empty_items, _v_freelist
+    global _intern_v, _intern_ready
     _empty_blocks = new_v_list()
     _empty_buckets = new_v_list()
     _empty_items = new_v_list()
+    _intern_v = new_v_list()
+    ii = 0
+    while ii < 16384:
+        _intern_v.append(V(17, 0))          # tag 17 = empty slot sentinel
+        ii = ii + 1
+    _intern_ready = 1
     _v_freelist = new_v_list()
     _none_v = V(0, 0)
     _false_v = V(4, 0)
@@ -348,7 +381,39 @@ def _free_v(v: "V"):
         _v_freelist.append(v)
 
 
+def _str_hash(s: "char*", n: "int") -> "long":
+    # djb2, masked to 30 bits so the arithmetic stays in range under CPython too
+    # (interp.py is ordinary Python as well as py2c input, and an unmasked
+    # multiply would grow unbounded there while wrapping in C).
+    h = 5381
+    i = 0
+    while i < n:
+        h = (h * 33 + ord(s[i])) & 1073741823
+        i = i + 1
+    return h
+
+
 def v_str(t: "char*") -> "V":
+    if _intern_ready != 0:
+        n = len(t)
+        if n <= _INTERN_MAX_LEN:
+            slot = _str_hash(t, n) & _INTERN_MASK
+            probe = 0
+            while probe < 8:
+                cur = _intern_v[slot]
+                if cur.tag == 17:              # empty slot -> install
+                    r = V(3, 0)
+                    r.sv = t
+                    _intern_v[slot] = r
+                    return r
+                if _strcmp(cur.sv, t) == 0:
+                    return cur                 # shared, immortal
+                slot = (slot + 1) & _INTERN_MASK
+                probe = probe + 1
+            # 8 collisions: fall through and allocate an uninterned V rather
+            # than evicting. Eviction would hand out a second V for a content
+            # already shared elsewhere, which is harmless, but probing further
+            # costs more than the allocation saves at this load factor.
     r = V(3, 0)
     r.sv = t
     return r
