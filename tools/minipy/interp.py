@@ -211,7 +211,7 @@ class St:
     def __init__(self, prog: "Program", glob: "list[V]", heap: "list[Cont]",
                  exc_flag: "int", exc_val: "V", regpool: "list[list[V]]",
                  mcache_cls: "list[V]", mcache_fidx: "list[V]",
-                 frames: "list[list[V]]"):
+                 frames: "list[list[V]]", freelist: "list[int]"):
         self.prog = prog
         self.glob = glob
         self.heap = heap
@@ -234,6 +234,16 @@ class St:
         # a moment earlier, so it is already reachable through the caller's
         # frame; adding them would be redundant roots, not missing ones.
         self.frames = frames
+        # Heap slots the collector has reclaimed. `_heap_put` takes one from
+        # here before it appends, which is what turns `st.heap` from an
+        # append-only log into a table with reuse -- the whole point of the
+        # collector, and the only line of it that the fast path touches.
+        self.freelist = freelist
+        # Collect when the heap has grown to this size. Set to a multiple of
+        # the live set after each collection, so collection cost is
+        # proportional to what survives rather than to what was allocated,
+        # and a program holding almost nothing collects almost never.
+        self.gc_next = GC_MIN_HEAP
         # Monomorphic method inline cache, indexed by method-name const id:
         # (class id seen last, resolved func idx). A CALL_METHOD whose receiver's
         # class still matches skips lookup_method entirely (no base-walk/strcmp).
@@ -339,7 +349,152 @@ def v_builtin(bid: "long") -> "V":
     return V(6, bid)
 
 
+# Precise, non-moving mark-sweep over `st.heap`.
+#
+# `st.heap` is a handle table: a container V holds an *index* into it, never
+# an address (see `cont_of`). That is the expensive half of a collector
+# already built. Enumerating the heap is a loop over indices -- no object
+# headers, no walking an arena, no knowing where objects begin -- and
+# nothing has to move, because freeing a slot and reusing its index changes
+# no V anywhere.
+#
+# Off by default (`GC_ON`). A program that allocates few containers should
+# not pay for a collector, and the growth trigger below is what makes that
+# true even when it is on.
+GC_ON: "int" = 0
+GC_MIN_HEAP: "long" = 4096        # never collect below this; startup is noise
+GC_GROWTH: "long" = 2             # collect again at this multiple of live
+
+
+def _gc_mark(v: "V", marks: "list[int]", work: "list[int]") -> "None":
+    """Mark the heap slot `v` refers to, if it refers to one.
+
+    The tag says whether it does. 7..12 (list, dict, set, tuple, iter,
+    instance) and 15 (bound builtin) carry a heap index directly. 14 (bound
+    method) *packs* one -- `iv = hidx * _METH_SHIFT + fidx` -- so it has to
+    be divided out; missing that would collect the receiver of every bound
+    method while the binding still pointed at it. 13 is a class id and not
+    an index at all. Everything below 7 is an immediate.
+    """
+    t = v.tag
+    if t == 14:
+        h = v.iv // _METH_SHIFT
+    elif t == 15:
+        h = v.iv
+    elif t >= 7 and t <= 12:
+        h = v.iv
+    else:
+        return
+    if h < 0 or h >= len(marks):
+        return
+    if marks[h] != 0:
+        return
+    marks[h] = 1
+    work.append(h)
+
+
+def _gc_mark_list(arr: "list[V]", marks: "list[int]", work: "list[int]") -> "None":
+    i = 0
+    while i < len(arr):
+        _gc_mark(arr[i], marks, work)
+        i = i + 1
+
+
+def _gc_mark_frame_blocks(st: "St", blocks: "list[V]", bn: "int") -> "None":
+    """The per-frame block stack is *not* a root, and this documents why.
+
+    Its entries are handler program counters -- `pc = blocks[bn].iv` -- so
+    they are immediates, not heap indices, and marking them would be a
+    no-op. It is called at the safepoint anyway so that if the block stack
+    ever grows to carry a value (a `with` manager, say), the place that
+    would have to change is already named instead of silently wrong.
+    """
+    return None
+
+
+def gc_collect(st: "St") -> "long":
+    """Mark from the roots, sweep the rest onto the free list. Returns how
+    many slots were reclaimed.
+
+    The roots are every V-array reachable from `st` *that a running program
+    can still read*:
+
+      * `st.glob`, the module globals;
+      * `_const_vs`, the materialised constants (a constant tuple is a
+        container like any other);
+      * `st.exc_val`, the exception in flight;
+      * the method caches;
+      * `st.frames` -- the registers of every frame currently executing.
+
+    `st.regpool` is deliberately NOT a root, and neither is `_v_freelist`.
+    Both hold values that are dead by construction: a pooled register array
+    is fully re-initialised before it is read (parameters overwrite theirs,
+    other named locals are cleared to None, temps are written before read),
+    so nothing ever observes a stale slot. Tracing them would keep the last
+    call's garbage alive, which on allocation-heavy loops is most of the
+    heap -- the conservative-root problem, and the reason those two are
+    called out here rather than left to be inferred.
+    """
+    n = len(st.heap)
+    marks = new_int_list()
+    i = 0
+    while i < n:
+        marks.append(0)
+        i = i + 1
+    work = new_int_list()
+    _gc_mark_list(st.glob, marks, work)
+    _gc_mark_list(st.mcache_cls, marks, work)
+    _gc_mark_list(st.mcache_fidx, marks, work)
+    if _const_vs_ready != 0:
+        _gc_mark_list(_const_vs, marks, work)
+    _gc_mark(st.exc_val, marks, work)
+    fi = 0
+    while fi < len(st.frames):
+        _gc_mark_list(st.frames[fi], marks, work)
+        fi = fi + 1
+    while len(work) > 0:
+        h = work.pop()
+        c = st.heap[h]
+        _gc_mark_list(c.items, marks, work)
+        _gc_mark_list(c.buckets, marks, work)
+    freed = 0
+    live = 0
+    j = 0
+    while j < n:
+        if marks[j] != 0:
+            live = live + 1
+        else:
+            c = st.heap[j]
+            if c.kind >= 0:               # not already on the free list
+                c.kind = -1               # -1 marks a slot as free
+                c.cursor = 0
+                c.items = new_v_list()    # drop the references it held
+                c.buckets = _empty_buckets
+                st.freelist.append(j)
+                freed = freed + 1
+        j = j + 1
+    nxt = live * GC_GROWTH
+    if nxt < GC_MIN_HEAP:
+        nxt = GC_MIN_HEAP
+    st.gc_next = nxt
+    return freed
+
+
 def _heap_put(st: "St", kind: "int", items: "list[V]") -> "long":
+    # No collection here. `_heap_put` is called from the middle of building
+    # a value -- `instantiate` allocates an instance and then allocates
+    # again to fill it -- and at that moment the half-built object is held
+    # only in an interpreter local, which is not a root. Collecting here
+    # freed it. The trigger lives at the dispatch loop's safepoint instead,
+    # where every live value is in a register by construction.
+    if len(st.freelist) > 0:
+        h = st.freelist.pop()
+        c = st.heap[h]
+        c.kind = kind
+        c.cursor = 0
+        c.items = items
+        c.buckets = _empty_buckets
+        return h
     c = Cont(kind, 0, items, _empty_buckets)
     st.heap.append(c)
     return len(st.heap) - 1
@@ -2525,6 +2680,15 @@ def run_func(st: "St", fidx: "long", args: "list[V]") -> "V":
     bn = 0                                  # block-stack depth (list[int].pop is
     pc = 0                                  # miscompiled by py2c, so index by bn)
     while pc < n:
+        # Safepoint. Between two opcodes every live value is in a register,
+        # in a global, or in `st.exc_val` -- an opcode is the unit that
+        # takes values out of registers and puts results back, so nothing is
+        # in flight here. That is what makes the root set complete, and it
+        # is why the trigger is here rather than in the allocator.
+        if GC_ON != 0 and len(st.heap) >= st.gc_next:
+            if has_blocks != 0:
+                _gc_mark_frame_blocks(st, blocks, bn)
+            gc_collect(st)
         ins = _lget(code, pc)
         op = ins.op
         a = ins.ra                          # flags already separated at load time,
@@ -3068,7 +3232,7 @@ def build_state(prog: "Program", sargs: "list[str]") -> "St":
         mcf.append(v_int(-1))
         zc = zc + 1
     st = St(prog, glob, heap, 0, v_none(), new_reg_pool(), mcc, mcf,
-            new_reg_pool())
+            new_reg_pool(), new_int_list())
     k = 0
     while k < prog.nglobals:
         glob.append(V(17, 0))                  # unset sentinel; see LOAD_GLOBAL
