@@ -139,3 +139,37 @@ Add an entry to `SMOKE` in `buildtools.py`:
 with the same argv and their exit codes and output compared. Until a tool has
 one of these it can never be installed, however cleanly it builds — which is
 the intended default.
+
+## 6. minipy is a target too
+
+`minipy` does not come out of `tool_scripts()` — the thing that gets lowered is
+`tools/minipy/interp.py`, one file inside a package whose other half
+(`compiler.py`) stays on CPython. It is built anyway, by `build_minipy()`,
+because it is the same four-stage pipeline and, unlike the other tools, it is
+the one binary the self-hosting story depends on.
+
+Its verify gate is stricter than a `SMOKE` entry's single fixture. minipy is a
+Python implementation, so "does it work" is a suite question, not a one-shot
+diff: every `tools/minipy/test_*.py` is run under CPython and under the native
+interpreter and the outputs must match byte for byte. That is the same 3-way
+check `make testminipy` performs, folded into the install gate so a regressed
+interpreter cannot reach `PREFIX`.
+
+```
+$ python3 buildtools.py --only minipy --install
+  ok   minipy    verified    20/20 tests match CPython
+installed 1 binaries into /tmp/crusted/usr/bin
+```
+
+Two mechanical details this target forced, both of which apply to any future
+non-`tools/*.py` target:
+
+* `transpile()` takes the source path and the C-file stem separately, because
+  they are not the same here (`tools/minipy/interp.py` -> `interp.c`, installed
+  as `minipy`).
+* `Result` carries an explicit `install_name`. The old code derived it with
+  `r.name[:-3]`, which would have installed minipy as `min`.
+
+The installed binary runs bytecode (`.mpyc` or the JSON form), not `.py`
+directly — the compiler front end is still CPython-hosted. See MINIPY.md for
+where that stands.

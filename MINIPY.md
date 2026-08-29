@@ -2527,3 +2527,170 @@ Speed is the other open question. The reference VM is a pure-Python bytecode
 interpreter and is far too slow to transpile a file of any size; native is the
 only realistic target, and its throughput on py2c.py has not been measured
 because it has not yet completed a run.
+
+## Status update — self-hosting: rast.py compiles byte-identically under minipy
+
+`compiler.py`, running on the py2c-compiled native interpreter, now compiles
+`tools/rpy_lib/rast.py` to **exactly** the program CPython's `compiler.py`
+produces. Not a summary match — the comparison dumps every field of every
+instruction (`op, ra, b, c, fb, fc`) for all 24 functions plus the whole
+constant table, 3145 lines, and the two md5s are equal:
+
+```
+cpython lines=3145   native lines=3145
+md5 cpython: 57c5b920cc9e6811ea56a3716579fc5e
+md5 native : 57c5b920cc9e6811ea56a3716579fc5e
+```
+
+The driver is `compiler.py` with a `compile_file("tools/rpy_lib/rast.py")` tail
+appended, compiled to bytecode and run under `interp`. Everything it needs --
+the parser (`rast.py`), the `ast` facade (`minast.py`), `re`, `os` -- is linked
+in by `_link_modules` and runs as minipy bytecode. No CPython is involved at run
+time.
+
+Getting there took six bugs, each of which was hiding the next. They are worth
+recording because five of the six were silent: the wrong answer was produced
+without any error.
+
+### 1. `simple_stmt` — semicolon-separated statements (minast.py)
+
+The grammar wraps one source *line* of small statements in a `simple_stmt`
+node, so `a = 1; b = 2` is a single node with two children -- one node has to
+become several body entries. Every statement-list site converted it directly,
+fell through `_conv_stmt`'s final `Expr(_conv(node))`, and raised
+`cannot convert expr node: simple_stmt`.
+
+`_append_stmt` now expands it, and is used at all three collection sites
+(`_suite`, `_flatten_stmt`, `parse`). Not a corner case: `rast.py` uses the form
+12 times and `compiler.py` 84 times, so minast could convert neither, and
+self-hosting could never have worked without it.
+
+### 2. `exec_stmt` — a Python 2 leftover in the grammar (rast.py)
+
+`small_stmt` tried `exec_stmt` before `expr_stmt`, so the Python 3 call
+`exec(compile(src), ns)` matched the py2 statement form -- `"exec"` followed by
+a parenthesised expression -- and produced a node minast has no conversion for.
+Removed from the alternation; the rule itself is kept with a comment so rule
+numbering does not shift. `print_stmt` was already unwired, which is consistent
+with a Python 3 parser.
+
+This was the long-standing `minast_test` failure (`CONVERT-FAIL ... exec_stmt`).
+**`minast_test` now passes: 156 exact, 0 convert-fail.**
+
+Note for anyone editing the grammar: `tools/rpy_lib/rpy_ast.py` is *generated*
+from `rast.py`, and `rast_test.py` fails if it has drifted. Run
+`python3 tools/rpy_lib/build_rpy_ast.py` after any grammar change.
+
+### 3. Node constructor signatures (minast.py)
+
+With those fixed the compiler hit
+`ExceptHandler.__init__() got an unexpected keyword argument 'type'`. Rather
+than fix it singly, every minast node was compared against CPython's
+`ast._fields`: 12 mismatched. Five broke keyword construction --
+`ExceptHandler(type=)`, `For(iter=)`, `Subscript(slice=)`, `arg(arg=)`,
+`comprehension(iter=)` -- all renamed to dodge a Python builtin. The
+*attributes* were already correct; only the parameter names differed, so the
+bug only appeared at keyword call sites. Parameters now match `_fields` exactly,
+shadowing builtins inside those constructors where necessary.
+
+Still absent, and unused by anything today: `type_comment` on
+`For`/`AsyncFor`/`With`/`arg`/`FunctionDef`, and `type_params` on
+`FunctionDef`/`AsyncFunctionDef`/`ClassDef`. The attributes exist and default to
+`None`; only the constructor parameters are missing.
+
+### 4. `@staticmethod` silently ignored (compiler.py)
+
+minipy compiles a class method as a plain function whose first parameter is the
+receiver, and implements no descriptor protocol -- so a `@staticmethod` was
+called with the instance still prepended and every argument landed one position
+to the left. In `compiler.py` this showed up as `self._scope_locals(fnode)`
+binding `fnode` to the `Compiler` instance and then failing on `.args`, which is
+what stopped `compiler.py` from compiling itself.
+
+`_bind_staticmethods` now gives each such method an explicit leading
+`_staticself` parameter and drops the decorator. Adding the parameter at the
+definition rather than stripping the receiver at the call site keeps the change
+local: the call already passes the instance, so arity matches and the body
+ignores it. That covers `self.f(x)` and `obj.f(x)`; it does *not* cover
+`Cls.f(x)`, but minipy has no class-object method-call path at all, so that form
+was already unsupported.
+
+### 5. Container equality was heap identity (interp.py)
+
+`v_eq_bool` compared every container by `x.iv == y.iv`, so two structurally
+equal tuples were unequal. Because `v_hash` returns a constant for containers
+and relies entirely on the equality check to separate them, tuples were useless
+as dict keys -- and `compiler.py` keys its constant table on `(kind, payload)`
+tuples, so the dedup had *never* fired. A self-hosted compile emitted 899
+constants where CPython emits 231.
+
+Lists and tuples now compare element-wise; dicts compare by contents via lookup
+(so insertion order does not matter) and sets by membership. This required
+threading `st` through `v_eq_bool`, `dict_lookup`, `dict_insert` and
+`dict_find`, since element access needs the heap.
+
+### 6. Set difference unimplemented, and `discard`/`remove` missing (interp.py)
+
+`v_bitand` and `v_bitxor` special-cased sets; `-` did not, and fell through to
+subtracting two heap indices. `compiler.py` computes its reclaimable-local set
+as `assigned - escaped - not_fresh - params`, so under minipy that was always
+empty and no local ever got a free hint: the self-hosted compile emitted **zero
+`ACC_ADD_L` fusions where CPython emits fifteen**.
+
+`set.discard` / `set.remove` / `list.remove` were missing from *two* tables --
+`compiler.METHODS` and the interpreter's own `method_id` -- so the calls lowered
+to nothing and silently did nothing. That made `numreg.discard(r)` a no-op
+inside the compiler, leaving stale registers marked numeric, and the self-hosted
+build **over**-specialised arithmetic to `ADD_NN`/`SUB_NN`/`GT_NN`. That is a
+latent wrong-answer bug, not a cosmetic difference: the fast ops assume operands
+are numbers.
+
+`remove` raises on a missing element (`KeyError` from a set, `ValueError` from a
+list) via `raise_named_error`; `discard` stays silent, matching CPython.
+
+### Memory: 1503 MB -> 732 MB on the same workload
+
+Interleaved with the above, and measured on the `rast.py` self-host:
+
+| change | peak RSS |
+|---|---|
+| starting point | 1503 MB |
+| string interning (`v_str`) | 1335 MB |
+| arena-allocated PODs (py2c) | 842 MB |
+| `str_format` builds a list and joins | 755 MB |
+| small-int cache widened to `-1024..65535` | 707 MB |
+| (final, with the self-hosting fixes) | 732 MB |
+
+Two of these are worth calling out. `str_format` appended to its result one
+character at a time -- the same quadratic shape as the earlier `str.join` bug,
+at smaller scale but 13.7M times; it now takes each literal run as one slice and
+`"".join`s once. And the int cache was widened on evidence, not caution:
+profiling `v_int` showed 45% of integers already inside `-8..256` and **every**
+remaining one under 32768 (bytecode offsets, register numbers, constant indices
+-- all bounded by program size), so the wider window turns ~3.4M heap
+allocations into array reads for about 2 MB paid once at startup.
+
+String interning rests on a measurement too: 5,555,888 string values are built
+during the compile and they hold **1,524 distinct contents** (99.97%
+duplicates), 99.8% of them 15 characters or shorter. Interned `V`s are immortal
+by construction -- `_free_v` only recycles tags 1 and 2, so a string `V` can
+never reach the free list, and the `char*` is arena memory that is never handed
+back.
+
+### Where it stops now
+
+The next target is `compiler.py` compiling *itself*, and it does not fit:
+
+| input | functions | instructions | result |
+|---|---|---|---|
+| `rast.py` | 24 | 2,655 | byte-identical, 12.8s, 732 MB |
+| `compiler.py` | 382 | 28,178 | `arena exhausted` at 2 GiB |
+
+Roughly a 10x larger input. The memory work above took the `rast.py` case from
+1503 MB to 732 MB, but closing a 10x gap needs a different order of improvement
+than the incremental wins that remain. The outstanding item is `V` reclamation:
+on this workload `_free_v` fires ~34k times against ~20M allocations with zero
+free-list pops, because the free-hint analysis disqualifies any local passed to
+a non-readonly call and `compiler.py`'s own code is almost entirely user-function
+calls. Making that pay needs interprocedural escape analysis, or the collector
+needs to manage `V`s directly -- which is not free, since `V`s can alias.
