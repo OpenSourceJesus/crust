@@ -1873,12 +1873,14 @@ def file_method(st: "St", nm: "char*", args: "list[V]") -> "V":
         return v_none()
     if nm == "close":
         if c.cursor == 1:
-            joined = ""
+            # Same quadratic shape as str.join had: a file written with many
+            # small write() calls re-copied the whole buffer once per chunk.
+            parts = []
             k = 1
             while k < len(c.items):
-                joined = joined + c.items[k].sv
+                parts.append(c.items[k].sv)
                 k = k + 1
-            _write_file_native(c.items[0].sv, joined)
+            _write_file_native(c.items[0].sv, "".join(parts))
             c.cursor = 2
         return v_none()
     if nm == "__enter__":
@@ -2430,15 +2432,22 @@ def do_method(st: "St", mid: "long", args: "list[V]") -> "V":
                 out.append(v_str(cur))
         return v_container(st, 7, 0, out)
     if mid == 108:             # str.join(iterable)
+        # Build a list of the pieces and let py2c lower `sep.join(...)` to the
+        # runtime's pyjoin, which sums the lengths and fills one allocation.
+        # Accumulating with `out = out + e.sv` instead made join quadratic: each
+        # append copied the whole prefix, so joining n pieces allocated O(n^2)
+        # bytes. On a self-hosted compile this single method was 964 MB of the
+        # 1384 MB arena -- 70% of all memory the interpreter touched.
+        #
+        # `parts` is deliberately an unannotated list literal so it lowers to a
+        # generic obj list; pyjoin indexes it through pystr(). A "list[str]"
+        # annotation would make it a typed _tlist_str and the cast into pyjoin's
+        # obj parameter would be the same struct pun that broke the collector.
         sep = recv.sv
-        out = ""
-        first = 1
+        parts = []
         for e in materialize(st, args[1]):
-            if first == 0:
-                out = out + sep
-            out = out + e.sv
-            first = 0
-        return v_str(out)
+            parts.append(e.sv)
+        return v_str(sep.join(parts))
     if mid == 109:             # str.strip (whitespace, both ends)
         return v_str(_lstrip(_rstrip(recv.sv)))
     if mid == 112:             # str.find(sub)
