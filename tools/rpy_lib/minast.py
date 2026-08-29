@@ -331,6 +331,42 @@ class Starred(AST):
         self.ctx = ctx
 
 
+# --- three nodes the facade owes CPython's `ast`, needed to run compiler.py ---
+#
+# The rast parser never produces Index or Str: Index is the pre-3.9 subscript
+# wrapper and Str the pre-3.8 string constant, both folded into Slice/Constant
+# by modern grammars. They exist here because code written against `ast` still
+# tests for them on the back-compat path (compiler.py does, twice), and an
+# `isinstance` against a name minast does not define resolves to None and
+# crashes rather than returning False. Defining them makes those tests answer
+# False the way they do under CPython 3.12.
+#
+# Expression is the `mode="eval"` module root. rast has no eval mode, but the
+# node is constructed directly by callers that only want somewhere to hang a
+# subtree for fix_missing_locations, which is exactly compiler.py's use.
+class Index(AST):
+    def __init__(self, value=None):
+        self._fields = ("value",)
+        self._typename = "Index"
+        self._init_loc()
+        self.value = value
+
+
+class Str(AST):
+    def __init__(self, s=None):
+        self._fields = ("s",)
+        self._typename = "Str"
+        self._init_loc()
+        self.s = s
+
+
+class Expression(AST):
+    def __init__(self, body=None):
+        self._fields = ("body",)
+        self._typename = "Expression"
+        self.body = body
+
+
 class Slice(AST):
     def __init__(self, lower, upper, step):
         self._fields = ("lower", "upper", "step")
