@@ -1744,20 +1744,41 @@ int f(void) {
 }
 """, "partial_sum_int", "adjacent_difference_int")
 
-    def test_a_class_element_is_reported_against_the_call(self):
-        """Not against `sum = sum + *it`, a line inside a supplied template
-        the author never wrote and cannot act on."""
-        msg = self.refuses("""
+    def test_a_string_element_accumulates(self):
+        """`string` has `operator+` now, so there is a `+` for the supplied
+        body to use. This used to be refused, and the refusal was right at
+        the time: no binary operator was in the subset at all."""
+        self.assertLowers("""
 #include <numeric>
 #include <vector>
 #include <string>
 int f(void) {
     std::vector<std::string> v;
     std::string z("");
-    return std::accumulate(v.begin(), v.end(), z).size();
+    std::string s = std::accumulate(v.begin(), v.end(), z);
+    return s.size();
 }
-""", "combines elements with `+`", "string is a class")
-        self.assertNotIn("sum = sum", msg)
+""", "accumulate_string", "string__augadd")
+
+    def test_a_class_without_the_operator_is_reported_against_the_call(self):
+        """Not against `sum += *it`, a line inside a supplied template the
+        author never wrote and cannot act on."""
+        msg = self.refuses("""
+#include <numeric>
+#include <vector>
+class point {
+public:
+    int x;
+    point() { x = 0; }
+};
+int f(void) {
+    std::vector<point> v;
+    point z;
+    point s = std::accumulate(v.begin(), v.end(), z);
+    return s.x;
+}
+""", "combines elements with `+`", "does not declare `operator+`")
+        self.assertNotIn("sum +=", msg)
 
 
 class TestBinaryArithmeticOperators(Base):

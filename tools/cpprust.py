@@ -2411,6 +2411,42 @@ def _constructed_range(expr, scan, at):
 _NUMERIC_FNS = ("accumulate", "iota", "inner_product", "partial_sum",
                 "adjacent_difference")
 
+#: Which operator each `<numeric>` function combines its elements with,
+#: for the ones whose supplied body a class can actually go through.
+#: Only `accumulate`: it combines elements and nothing else, so a class
+#: with `operator+` works. `inner_product` multiplies as well as adds,
+#: `partial_sum` and `adjacent_difference` write sums into a raw range,
+#: and `iota` counts rather than combines -- those stay scalars-only, and
+#: a class element is reported against the call as before.
+_NUMERIC_OPS = {"accumulate": "+"}
+
+
+def _class_declares_operator(scan, cls, op):
+    """Does `class cls` declare `operator<op>` in its own body?
+
+    Read off the text rather than the class table, because this check runs
+    before classes are collected. The body is brace-matched from the
+    declaration, so an operator on a *different* class does not count.
+    """
+    m = re.search(r"(?<![\w])(?:class|struct)\s+%s(?![\w])[^{;]*\{"
+                  % re.escape(cls), scan)
+    if not m:
+        return False
+    open_at = scan.index("{", m.end() - 1)
+    depth, close = 0, None
+    for k in range(open_at, len(scan)):
+        if scan[k] == "{":
+            depth += 1
+        elif scan[k] == "}":
+            depth -= 1
+            if depth == 0:
+                close = k
+                break
+    if close is None:
+        return False
+    return re.search(r"(?<![\w])operator\s*%s(?![=])" % re.escape(op),
+                     scan[open_at:close]) is not None
+
 
 def _check_numeric_elements(text, scan, path):
     """Refuse a `<numeric>` call over a class element type.
@@ -2440,13 +2476,21 @@ def _check_numeric_elements(text, scan, path):
             if not re.search(r"(?<![\w])(?:class|struct)\s+%s(?![\w])"
                              % re.escape(elem), scan):
                 continue
+            # A class that *declares* the operator is fine: the supplied
+            # template's `sum = sum + *it` resolves to it like any other
+            # use. This used to refuse every class, which was right when no
+            # binary operator was in the subset at all -- `string` now has
+            # `operator+`, and nlohmann's `accumulate` over a string is the
+            # first thing that hits this on a real header.
+            op = _NUMERIC_OPS.get(name)
+            if op is not None and _class_declares_operator(scan, elem, op):
+                continue
             raise CppError(
-                "%s:%d: `%s` combines elements with `+`, and %s is a class. "
-                "Operator overloading is not in this subset, so there is no "
-                "`+` for it to use. Sum a scalar field instead, or write "
-                "the loop."
+                "%s:%d: `%s` combines elements with `%s`, and %s is a class "
+                "that does not declare `operator%s`. Give it one, sum a "
+                "scalar field instead, or write the loop."
                 % (os.path.basename(path), _src_line(scan, u.start()),
-                   name, elem))
+                   name, op or "++", elem, op or "++"))
 
 
 def _check_range_writes(text, scan, path):
@@ -5246,6 +5290,22 @@ def _named_object(expr, scopes, type_info):
     expr = expr.strip()
     # `v[i]` -- a subscript names an element, and `operator[]` returns a
     # reference precisely so that it does. The element type is read off that
+    # `*p` where `p` is a pointer local to a class. The object is the
+    # pointee, and its address is `p` itself -- so this hands back `(*p)`
+    # and the `&` every caller puts on it folds straight back to `p`.
+    #
+    # Without this, the supplied `accumulate` could not write `sum += *it`
+    # over a class element: `*it` named nothing, and the diagnostic pointed
+    # at a line inside a supplied template that the author never wrote.
+    deref_m = re.match(r"^\*\s*(\w+)$", expr)
+    if deref_m is not None:
+        nm = deref_m.group(1)
+        for fr in reversed(scopes):
+            if nm in fr.ptrvals:
+                return ("(*%s)" % nm, fr.ptrvals[nm])
+            if nm in fr.vals:
+                break            # a value local: `*v` is not the object
+        return None
     # return rather than assumed, and the expression is handed back as
     # written: the call pass rewrites `v[i]` to `*v__index(&v, i)` later, so
     # an `&` taken here lands on the element either way.
@@ -9902,7 +9962,12 @@ T accumulate(T *first, T *last, T init) {
     T *it = first;
     T sum = init;
     while (it != last) {
-        sum = sum + *it;
+        /* `sum += *it` rather than `sum = sum + *it`: the second needs an
+           operator result assigned from an operand that is a dereference,
+           and neither has an address to pass. Compound assignment writes
+           into `sum` in place, which is what this wants anyway, and it
+           means a class element only has to supply `operator+=`. */
+        sum += *it;
         it = it + 1;
     }
     return sum;
