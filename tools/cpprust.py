@@ -1214,6 +1214,62 @@ def _check_std_function(scan, path):
             % (os.path.basename(path), _src_line(scan, m.start())))
 
 
+def _check_free_overloads(scan, path):
+    """Two *free* functions with one name is not something C can hold.
+
+    A method overload is resolved by argument count and refused when two
+    share one; a free function has no such machinery at all -- both lower
+    to the same symbol with conflicting types, and the C front end is the
+    first thing to notice. It has now happened three times in coost
+    (`align_up`, `co::alloc`, `milo::dtoa`), each time silently.
+
+    Only definitions at brace depth zero. Depth, not a scan for class
+    bodies: a constructor is spelled exactly like a free function and the
+    span-based version read every second one as a redefinition of the
+    first. A template's body is skipped too -- its instantiations are
+    named apart later.
+    """
+    depth, i, n = 0, 0, len(scan)
+    tops = []
+    while i < n:
+        c = scan[i]
+        if c == "{":
+            if depth == 0:
+                tops.append(i)
+            depth += 1
+        elif c == "}":
+            depth -= 1
+        i += 1
+    if not tops:
+        return
+    seen = {}
+    for b in tops:
+        head = scan[max(0, b - 400):b]
+        m = re.search(r"([\w:]+)\s*\**\s*(\w+)\s*\(([^;{}()]*)\)\s*"
+                       r"(?:const\s*)?(?:noexcept\s*)?$", head)
+        if not m:
+            continue
+        name = m.group(2)
+        if name in ("if", "while", "for", "switch", "catch", "main"):
+            continue
+        # A class body, a namespace, a template -- none is a free function.
+        lead = head[:m.start()].rstrip()
+        if re.search(r"(?<![\w])(?:class|struct|union|enum|namespace|"
+                      r"template|extern)\b[^;{}]*$", lead):
+            continue
+        if "::" in m.group(1) or "::" in name:
+            continue
+        prev = seen.get(name)
+        if prev is None:
+            seen[name] = m.start(2)
+            continue
+        raise CppError(
+            "%s:%d: `%s` is defined twice as a free function. C has no "
+            "overloading for them, so both lower to one symbol and the "
+            "second redefines the first. Give them different names."
+            % (os.path.basename(path), _src_line(scan, b), name))
+
+
 def _check_unsupported(scan, path, rtti=False):
     _check_std_function(_blank_strings(scan), path)
     # A literal is data, not code: `puts("new item")` uses no keyword.
@@ -11555,6 +11611,11 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     # `class __coapi fastring : ..` -- an export macro between the keyword
     # and the name, which every class scan below would read as the name.
     text = _strip_attribute_macros(text)
+    # Before the templates are instantiated: a function template's copies
+    # are named by their arguments and two of them may still share a name,
+    # but that is a *mangling* question with its own answer, not a source
+    # written with two definitions of one free function.
+    _check_free_overloads(_blank_directives(_strip_comments(text)), path)
     # A leading `::` qualifies a name with *global* scope. C has only the
     # one scope, so the marker is dropped -- but it has to go before any
     # pass reads names, because coost's allocator reaches the C library

@@ -1101,6 +1101,49 @@ int f(void) { return is_same<int, int>::value; }
 """, "parameter pack")
 
 
+class TestFreeFunctionOverloads(Base):
+    """Two free functions with one name is not something C can hold.
+
+    A method overload resolves by argument count and is refused when two
+    share one; a free function has no such machinery at all. Both lower to
+    the same symbol with conflicting types, and the C front end was the
+    first thing to notice -- three times in coost (`align_up`, `co::alloc`,
+    `milo::dtoa`), each silently.
+    """
+
+    def test_two_definitions_are_refused(self):
+        self.refuses("""
+int add(int a) { return a; }
+int add(int a, int b) { return a + b; }
+int f(void) { return add(1) + add(2, 3); }
+""", "defined twice as a free function")
+
+    def test_a_constructor_is_not_a_free_function(self):
+        """A constructor is spelled exactly like one, and a class may have
+        several. The check is at brace depth zero for that reason."""
+        out = self.lower("""
+struct pt {
+    int x;
+    pt() { x = 0; }
+    pt(int a) { x = a; }
+};
+int f(void) { pt p(2); return p.x; }
+""")
+        self.assertIn("pt_new", out)
+
+    def test_a_method_may_share_a_name_with_a_free_function(self):
+        out = self.lower("""
+int size(void) { return 1; }
+struct box {
+    int n;
+    box() { n = 2; }
+    int size() { return n; }
+};
+int f(void) { box b; return b.size() + size(); }
+""")
+        self.assertIn("box_size", out)
+
+
 class TestConstructorAssignment(Base):
     """`x = Cls(a, b);` -- construction as the right-hand side of an
     assignment to something already declared. Hoisted into a local and
