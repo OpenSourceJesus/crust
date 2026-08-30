@@ -1101,6 +1101,29 @@ int f(void) { return is_same<int, int>::value; }
 """, "parameter pack")
 
 
+class TestConstructorAssignment(Base):
+    """`x = Cls(a, b);` -- construction as the right-hand side of an
+    assignment to something already declared. Hoisted into a local and
+    assigned from that. A *declaration* with the same shape is left alone:
+    the initialiser lowering already handles it without a copy."""
+
+    def test_an_assignment_is_hoisted(self):
+        out = self.lower("""
+struct pt { int x; int y; pt() { x=0; y=0; } pt(int a, int b) { x=a; y=b; } };
+int f(void) { pt m; m = pt(3, 4); return m.x + m.y; }
+""")
+        self.assertIn("pt_new_2(&__cpp_tmp0, 3, 4)", out)
+        self.assertIn("m = __cpp_tmp0", out)
+
+    def test_a_declaration_is_not_hoisted(self):
+        out = self.lower("""
+struct pt { int x; pt(int a) { x = a; } };
+int f(void) { pt p = pt(3); return p.x; }
+""")
+        self.assertNotIn("__cpp_tmp", out)
+        self.assertIn("pt_new(&p, 3)", out)
+
+
 class TestConstructorTemporaries(Base):
     """`Cls(a, b).method()` -- a construction in expression position.
 

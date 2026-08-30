@@ -8189,6 +8189,29 @@ def _materialise_ctor_temporaries(text, scan, path):
         if close is None:
             continue
         tail = scan[close + 1:close + 3].lstrip()
+        # `x = Cls(a, b);` -- the construction is the whole right-hand side
+        # of an assignment to something already declared. Hoisted into a
+        # local of its own and assigned from that, which is the same move
+        # as the `.method()` case below and reuses the same declaration
+        # lowering. Not a *declaration* (`Cls x = Cls(..)`), which the
+        # initialiser lowering already handles on its own.
+        if tail.startswith(";"):
+            lhs = scan[:m.start()].rstrip()
+            am = re.search(r"(?<![=!<>+\-*/%&|^])=\s*$", lhs)
+            if am:
+                head_txt = lhs[:am.start()].rstrip()
+                # A declaration ends with the declared name preceded by a
+                # type; an assignment's left side is just a name or a
+                # member path. Told apart by whether the class name occurs
+                # as the type immediately before it.
+                if not re.search(r"(?<![\w])%s\s+\w+$" % re.escape(name),
+                                 head_txt):
+                    start, why = _stmt_start(scan, m.start())
+                    if start is not None:
+                        edits.append((start, m.start(), close + 1, name,
+                                      text[op + 1:close], n, True))
+                        n += 1
+                        continue
         if not (tail.startswith(".") or tail.startswith("->")):
             # A construction in a conditional operand is the one other
             # shape seen in practice, and it cannot be hoisted at all: the
@@ -8221,12 +8244,12 @@ def _materialise_ctor_temporaries(text, scan, path):
                 % (os.path.basename(path), _src_line(scan, m.start()),
                    name, why))
         edits.append((start, m.start(), close + 1, name,
-                      text[op + 1:close], n))
+                      text[op + 1:close], n, False))
         n += 1
     if not edits:
         return text
     out, last = [], 0
-    for start, s, e, name, args, idx in edits:
+    for start, s, e, name, args, idx, is_assign in edits:
         if start < last:
             continue                 # two in one statement: one pass each
         tmp = "__cpp_tmp%d" % idx
