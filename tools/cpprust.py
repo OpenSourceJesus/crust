@@ -2114,7 +2114,28 @@ def _eval_conditionals(text, defines):
                             depth -= 1
                     stack.pop()
                     if all(s[0] for s in stack):
-                        out.extend(lines[i:j + 1])
+                        if taken:
+                            # An earlier branch was taken and has already
+                            # been emitted, so the rest of the chain is
+                            # dead. Dropping it is sound and keeps the
+                            # directives balanced.
+                            pass
+                        else:
+                            # No branch taken yet, and the opening `#if`
+                            # was consumed when it evaluated false -- so
+                            # emitting from the `#elif` leaves it with no
+                            # `#if` to belong to. coost's `dtoa_milo.h`
+                            # ends `#if defined(_MSC_VER) / #elif __GNUC__
+                            # .. / #else / #endif` that way, and the C
+                            # front end reported three orphaned
+                            # directives. The `#elif` becomes the opening
+                            # `#if`, which is exactly what the remaining
+                            # chain means once the earlier branches are
+                            # known false.
+                            rest = list(lines[i:j + 1])
+                            rest[0] = re.sub(r"#(\s*)elif", r"#\1if",
+                                             rest[0], count=1)
+                            out.extend(rest)
                     i = j + 1
                     continue
                 stack[-1] = ((not taken) and val, taken or val)
@@ -8076,6 +8097,49 @@ def _drop_global_scope(text):
     return text.replace("__gsq__", "")
 
 
+def _materialise_ctor_returns(text, scan):
+    """`return Cls(a, b);` -> a named local, then return it.
+
+    A constructor call in a return expression is not something C has. For
+    an *owning* class this is refused (there is nothing to move out of),
+    but a class with no destructor slipped straight through and reached the
+    C front end as `return dp__fpt(v, 1);` -- coost's `fast.h` has
+    seventeen of these, one per `dp::_1` .. `dp::_9`.
+
+    Rewritten into the declaration form -- `Cls __cpp_ret0 = Cls(a, b);
+    return __cpp_ret0;` -- which the ordinary initialiser lowering already
+    turns into `Cls __cpp_ret0; Cls_new(&__cpp_ret0, a, b);`. One code path
+    rather than a second that could drift from it.
+    """
+    cls_names = set(re.findall(r"(?<![\w])(?:class|struct)\s+(\w+)", scan))
+    if not cls_names:
+        return text
+    out, last, n = [], 0, 0
+    pat = re.compile(r"(?<![\w.>])return\s+(\w+)\s*\(")
+    for m in pat.finditer(scan):
+        name = m.group(1)
+        if name not in cls_names:
+            continue
+        op = m.end() - 1
+        close = _match_paren(scan, op)
+        if close is None:
+            continue
+        semi = scan.find(";", close)
+        if semi < 0 or scan[close + 1:semi].strip():
+            continue                  # not a bare `return Cls(..);`
+        args = text[op + 1:close]
+        tmp = "__cpp_ret%d" % n
+        n += 1
+        out.append(text[last:m.start()])
+        out.append("%s %s = %s(%s); return %s;"
+                   % (name, tmp, name, args, tmp))
+        last = semi + 1
+    if not out:
+        return text
+    out.append(text[last:])
+    return "".join(out)
+
+
 def _strip_attribute_macros(text):
     """Blank an export/visibility macro sitting between `class` and its name.
 
@@ -11361,6 +11425,9 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     # Lambdas are lowered before anything else looks at the file: what comes
     # out is ordinary subset source with a static function in it.
     text = _lower_lambdas(text, path)
+    # `return Cls(a, b);` becomes a named local before anything reads
+    # declarations, so the ordinary initialiser lowering handles it.
+    text = _materialise_ctor_returns(text, _strip_comments(text))
     # `auto` becomes a written type before anything reads types, because
     # everything downstream -- the class emitter, the scope tracker, the call
     # rewriter -- reads them by their spelling. Lambdas first: `auto f = []..`

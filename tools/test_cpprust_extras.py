@@ -1101,6 +1101,38 @@ int f(void) { return is_same<int, int>::value; }
 """, "parameter pack")
 
 
+class TestConstructorCallReturns(Base):
+    """`return Cls(a, b);` for a class with no destructor.
+
+    An owning class is refused here -- there is nothing to move out of --
+    but a non-owning one slipped through and reached the C front end
+    verbatim. coost's `fast.h` has seventeen, one per `dp::_1` .. `dp::_9`.
+    Rewritten into the declaration form the initialiser lowering already
+    handles, rather than a second path that could drift from it.
+    """
+
+    def test_it_becomes_a_named_local(self):
+        out = self.lower("""
+struct pt { int x; int y; pt(int a, int b) { x = a; y = b; } };
+pt mk(int a) { return pt(a, a * 2); }
+int f(void) { pt p = mk(3); return p.x + p.y; }
+""")
+        self.assertIn("pt_new(&__cpp_ret0, a, a * 2)", out)
+        self.assertIn("return __cpp_ret0;", out)
+        self.assertNotIn("return pt(", out)
+
+    def test_a_plain_call_is_untouched(self):
+        """Only a *class* name is materialised; an ordinary function
+        returning a value is left exactly as written."""
+        out = self.lower("""
+struct pt { int x; };
+int side(int a) { return a; }
+int f(void) { return side(2); }
+""")
+        self.assertIn("return side(2);", out)
+        self.assertNotIn("__cpp_ret", out)
+
+
 class TestStaticConstMembers(Base):
     """`static const int cap = 64;` is a class constant, not a field.
 
