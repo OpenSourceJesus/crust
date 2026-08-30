@@ -1,0 +1,13 @@
+/* type_traits -- stub for compiling cpprust output with a C compiler.
+ *
+ * The lowering supplies its own `std` for the parts of the library it
+ * supports, and translates every use of them, so nothing from this header
+ * survives into the C. What does survive is the `#include` line itself,
+ * passed through with the rest of the directives -- and a C compiler has
+ * no <type_traits> to find.
+ *
+ * Empty is the correct content, not a placeholder: if a declaration from
+ * here were still needed, that would be a translation defect to fix rather
+ * than a header to fill in.
+ */
+#pragma once
