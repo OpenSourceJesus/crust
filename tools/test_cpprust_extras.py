@@ -1101,6 +1101,46 @@ int f(void) { return is_same<int, int>::value; }
 """, "parameter pack")
 
 
+class TestStaticConstMembers(Base):
+    """`static const int cap = 64;` is a class constant, not a field.
+
+    C has no static data member. Treated as one, it put `static const int
+    cap;` inside the struct -- which is not C -- moved the initialiser into
+    the constructor, so every instance re-assigned a constant, and read
+    every use through `this`. coost's vendored `dtoa_milo.h` declares seven
+    of them, one defined in terms of another.
+    """
+
+    def test_it_becomes_a_file_scope_constant(self):
+        out = self.lower("""
+class box {
+public:
+    static const int cap = 64;
+    int n;
+    box() { n = cap; }
+    int room() { return cap - n; }
+};
+int f(void) { box b; return b.room(); }
+""")
+        self.assertIn("static const int box_cap = 64;", out)
+        self.assertNotIn("static const int cap;", out)
+        self.assertIn("this->n = box_cap", out)
+        self.assertNotIn("this->cap", out)
+
+    def test_one_constant_may_use_another(self):
+        out = self.lower("""
+class box {
+public:
+    static const int cap = 64;
+    static const int half = cap / 2;
+    int n;
+    box() { n = half; }
+};
+int f(void) { box b; return b.n; }
+""")
+        self.assertIn("static const int box_half = box_cap / 2;", out)
+
+
 class TestGlobalScopeQualifier(Base):
     """`::free(p)` reaches the C library, not a member named `free`.
 

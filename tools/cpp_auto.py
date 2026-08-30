@@ -1142,7 +1142,7 @@ def _blank_directive_lines(text):
     return "".join(out)
 
 
-def _blank_like(text):
+def _blank_like(text, directives=True):
     """A same-length copy with comment and literal bodies blanked.
 
     `__cpp_ref(T)` is blanked down to just `T` as well. It is a *type* in a
@@ -1183,7 +1183,9 @@ def _blank_like(text):
         if pos <= i:
             pos = i + 1
     out.append(text[last:])
-    blanked = _blank_directive_lines("".join(out))
+    blanked = "".join(out)
+    if directives:
+        blanked = _blank_directive_lines(blanked)
     if "__cpp_ref" not in blanked:
         return blanked
     out, last = [], 0

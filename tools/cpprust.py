@@ -1602,6 +1602,10 @@ def _split_members(body, cname, line0, path="<cpp>"):
 
     body = _ACCESS.sub("", body)
     members = []
+    #: `static const` data members, as (type, name, initialiser). Carried
+    #: on the member list rather than returned separately so every existing
+    #: caller keeps working.
+    statics = []
     i, n = 0, len(body)
     while i < n:
         while i < n and body[i] in " \t\r\n;":
@@ -1627,6 +1631,28 @@ def _split_members(body, cname, line0, path="<cpp>"):
             # no body; the body is attached once the out-of-line definitions
             # have been read.
             if not _has_param_list(decl):
+                # `static const int cap = 64;` -- a class *constant*, not a
+                # field. C has no static data member, and treating it as
+                # one put `static const int cap;` inside the struct (which
+                # is not C) and moved the initialiser into the constructor,
+                # so every instance re-assigned a constant and every use
+                # read it through `this`. Emitted at file scope instead,
+                # named `Class_name`, with uses inside the class rewritten
+                # to that. coost's vendored `dtoa_milo.h` declares seven.
+                sm = re.match(r"^\s*static\s+(?:constexpr\s+)?"
+                              r"(?:const\s+)?(.+)$", decl)
+                if sm is not None:
+                    eq0 = _top_level_eq(decl)
+                    if eq0 >= 0:
+                        cinit = decl[eq0 + 1:].strip()
+                        cdecl = sm.group(1).strip()
+                        cdecl = cdecl[:_top_level_eq(cdecl)].strip() \
+                            if _top_level_eq(cdecl) >= 0 else cdecl
+                        cparts = cdecl.replace("*", " * ").split()
+                        if len(cparts) >= 2:
+                            statics.append((" ".join(cparts[:-1]),
+                                            cparts[-1], cinit))
+                            continue
                 definit = None
                 eq = _top_level_eq(decl)
                 if eq >= 0:
@@ -1880,6 +1906,10 @@ def _split_members(body, cname, line0, path="<cpp>"):
                         params, inner, line0, "", None, virt)
             _m.stat = is_static
             members.append(_m)
+    for _sty, _snm, _sini in statics:
+        _sm = Member("sconst", _sty, _snm, None, None, line0)
+        _sm.definit = _sini
+        members.append(_sm)
     return members
 
 
@@ -4786,6 +4816,19 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
         parts.append(("%s { %s } %s;"
                       % (a.ret, sub(a.body or "").strip(), a.name))
                      .replace(" ;", ";"))
+    # `static const` members, at file scope and qualified. They go *above*
+    # the struct: one may be defined in terms of another, and a method body
+    # refers to them by the qualified name.
+    for _sm in cls.members:
+        if _sm.kind != "sconst":
+            continue
+        _sinit = _sm.definit or "0"
+        for _o in cls.members:
+            if _o.kind == "sconst":
+                _sinit = re.sub(r"(?<![\w.>])%s(?![\w])" % re.escape(_o.name),
+                                "%s_%s" % (cname, _o.name), _sinit)
+        head.append("static const %s %s_%s = %s;"
+                    % (_sm.ret, cname, _sm.name, _sinit))
     head.append("struct %s { %s };" % (cname, " ".join(parts) or
                                        "char _cpp_empty;"))
     # An abstract class gets its descriptor as an object of its own, since it
@@ -5074,6 +5117,15 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
                     re.compile(r"(?<![\w.>])(%s)\b" % _type_alt(visible)),
                     lambda m: "this->" + info["paths"][m.group(1)], inner)
         inner = inner.replace("this->this->", "this->")
+        # `static const` members are file-scope constants, not fields, so a
+        # bare use in a body names `Class_name` rather than going through
+        # `this`. Done after the field qualification above, which never
+        # sees them -- they are not in `info["paths"]`.
+        sconsts = [x.name for x in cls.members if x.kind == "sconst"]
+        if sconsts:
+            inner = _sub_code(
+                re.compile(r"(?<![\w.>])(%s)\b" % _type_alt(sconsts)),
+                lambda m: "%s_%s" % (cname, m.group(1)), inner)
         # `Shape *twin() { return this; }` inside a derived class returns a
         # `Derived *` where a `Shape *` is declared. The base is the first
         # member, so the cast is address-preserving; without it the C
@@ -11375,8 +11427,15 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
         # After `auto`, which deduces *from* a cast's written type, and
         # before anything that reads an expression -- a surviving
         # `static_cast<T>(e)` reads as a comparison to everything below.
+        # Casts are rewritten inside `#define` bodies too, which is why the
+        # blank here keeps directive lines. `static_cast<T>(e)` -> `((T)(e))`
+        # is a token-local rewrite that does not depend on the surrounding
+        # structure, and a macro body is exactly where coost's vendored
+        # `dtoa_milo.h` puts them -- `UINT64_C2(h, l)` expands to two, and
+        # every one of its 181 uses became a `<` comparison in the C.
         text = cpp_auto.resolve_casts(
-            text, os.path.basename(path), blank=cpp_auto._blank_like(text))
+            text, os.path.basename(path),
+            blank=cpp_auto._blank_like(text, directives=False))
     except cpp_auto.AutoError as e:
         raise CppError(e.message)
     scan = _blank_literal_braces(_strip_comments(text))
