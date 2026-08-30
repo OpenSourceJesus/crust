@@ -8157,6 +8157,88 @@ def _lower_functional_casts(text, scan):
     return "".join(out)
 
 
+def _materialise_ctor_temporaries(text, scan, path):
+    """`Cls(a, b).method()` -> a hoisted local, then the call on it.
+
+    A construction in expression position is not something C has. The
+    return-position case is rewritten into a declaration; this one has no
+    statement of its own to become, so the temporary is hoisted to just
+    before the statement that contains it -- the same move, and the same
+    soundness rule, as an inlined lambda body.
+
+    Only where the construction is *evaluated exactly once and
+    unconditionally*: `_stmt_start` refuses an operand of `?:`, `&&` or
+    `||`, and a loop condition that re-evaluates it. Those are reported
+    rather than hoisted, because hoisting there would change when the
+    constructor runs.
+
+    Only the `.`/`->` shape is handled -- coost's `dtoa_milo.h` writes
+    `DiyFp(f, e).NormalizeBoundary()`. A bare `Cls(a, b)` elsewhere in an
+    expression is left for the diagnostics that already cover it.
+    """
+    cls_names = set(re.findall(r"(?<![\w])(?:class|struct)\s+(\w+)", scan))
+    if not cls_names:
+        return text
+    edits, n = [], 0
+    for m in re.finditer(r"(?<![\w.>])(\w+)\s*\(", scan):
+        name = m.group(1)
+        if name not in cls_names:
+            continue
+        op = m.end() - 1
+        close = _match_paren(scan, op)
+        if close is None:
+            continue
+        tail = scan[close + 1:close + 3].lstrip()
+        if not (tail.startswith(".") or tail.startswith("->")):
+            # A construction in a conditional operand is the one other
+            # shape seen in practice, and it cannot be hoisted at all: the
+            # branch may not be evaluated. Reported rather than passed
+            # through, which is what it used to be -- silently, into C
+            # that does not compile.
+            # Only `?`. A leading `:` is far more often a constructor's
+            # initializer list -- `fastring() : fast::stream() {}` -- or a
+            # label or an access specifier, and treating those as ternary
+            # branches refused 140 files in the suite.
+            before = scan[:m.start()].rstrip()[-1:]
+            if before == "?":
+                raise CppError(
+                    "%s:%d: `%s(..)` builds an object in a branch of `?:`, "
+                    "which may not be evaluated. The temporary cannot be "
+                    "hoisted out of it -- assign each branch to a local and "
+                    "choose between them with an `if`."
+                    % (os.path.basename(path),
+                       _src_line(scan, m.start()), name))
+            continue
+        if _prev_word(scan, m.start()) == "new":
+            continue
+        start, why = _stmt_start(scan, m.start())
+        if start is None:
+            raise CppError(
+                "%s:%d: `%s(..)` builds an object inside an expression that "
+                "%s. The temporary has to be hoisted to a statement of its "
+                "own, and hoisting it here would change when the "
+                "constructor runs. Assign it to a local first."
+                % (os.path.basename(path), _src_line(scan, m.start()),
+                   name, why))
+        edits.append((start, m.start(), close + 1, name,
+                      text[op + 1:close], n))
+        n += 1
+    if not edits:
+        return text
+    out, last = [], 0
+    for start, s, e, name, args, idx in edits:
+        if start < last:
+            continue                 # two in one statement: one pass each
+        tmp = "__cpp_tmp%d" % idx
+        out.append(text[last:start])
+        out.append("%s %s = %s(%s); " % (name, tmp, name, args))
+        out.append(text[start:s])
+        out.append(tmp)
+        last = e
+    out.append(text[last:])
+    return "".join(out)
+
+
 def _materialise_ctor_returns(text, scan):
     """`return Cls(a, b);` -> a named local, then return it.
 
@@ -11571,6 +11653,7 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     # pass above could not see it. Idempotent -- an already-lowered
     # `((int)(x))` has its type followed by `)`, not `(`.
     text = _lower_functional_casts(text, _strip_comments(text))
+    text = _materialise_ctor_temporaries(text, _strip_comments(text), path)
     scan = _blank_literal_braces(_strip_comments(text))
     text, _exc_used = _lower_except(text, path)
     if _exc_used:

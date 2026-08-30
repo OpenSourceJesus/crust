@@ -1101,6 +1101,49 @@ int f(void) { return is_same<int, int>::value; }
 """, "parameter pack")
 
 
+class TestConstructorTemporaries(Base):
+    """`Cls(a, b).method()` -- a construction in expression position.
+
+    Hoisted to just before the statement that contains it, which is the
+    same move an inlined lambda body makes and carries the same soundness
+    rule: only where the construction is evaluated exactly once and
+    unconditionally.
+    """
+
+    def test_a_method_on_a_temporary_is_hoisted(self):
+        out = self.lower("""
+struct pt {
+    int x; int y;
+    pt(int a, int b) { x = a; y = b; }
+    int sum() { return x + y; }
+};
+int f(void) { return pt(1, 2).sum(); }
+""")
+        self.assertIn("pt_new(&__cpp_tmp0, 1, 2)", out)
+        self.assertIn("pt_sum(&__cpp_tmp0)", out)
+
+    def test_a_ternary_branch_is_reported(self):
+        """A branch may not be evaluated, so the temporary cannot be
+        hoisted out of it. This used to pass through into C that did not
+        compile."""
+        self.refuses("""
+struct pt { int x; pt(int a) { x = a; } };
+int f(void) { int c = 1; pt q = c ? pt(3) : pt(5); return q.x; }
+""", "may not be evaluated")
+
+    def test_an_initializer_list_is_not_a_ternary(self):
+        """`fastring() : fast::stream() {}` starts with a `:` and is not a
+        conditional branch. Reading it as one refused 140 files."""
+        out = self.lower("""
+struct base { int b; base(int x) { b = x; } };
+struct derived : public base {
+    derived() : base(7) { }
+};
+int f(void) { derived d; return d._base.b; }
+""")
+        self.assertIn("base_new(&this->_base, 7)", out)
+
+
 class TestFunctionalCasts(Base):
     """`uint64_t(1)` and `int(x)` -- a type written like a call.
 
