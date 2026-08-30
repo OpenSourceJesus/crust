@@ -8097,6 +8097,66 @@ def _drop_global_scope(text):
     return text.replace("__gsq__", "")
 
 
+#: The type spellings a functional-style cast may use. Deliberately only
+#: builtins and the fixed-width aliases: a *class* name followed by
+#: parentheses is a constructor call, which is materialised elsewhere, and
+#: confusing the two would turn every construction into a cast.
+_CAST_WORDS = ("char", "short", "int", "long", "unsigned", "signed",
+               "float", "double", "bool", "void")
+_CAST_ALIASES = re.compile(
+    r"^(?:u?int(?:8|16|32|64)_t|size_t|ptrdiff_t|intptr_t|uintptr_t)$")
+
+
+def _lower_functional_casts(text, scan):
+    """`int(x)` and `uint64_t(1)` -> `((int)(x))`.
+
+    C++ lets a type be written like a call to convert to it. C does not,
+    and the spelling survived into the output: coost's `dtoa_milo.h` writes
+    `l & (uint64_t(1) << 63)`, which the C front end read as a call to
+    something named `uint64_t`.
+
+    Only one argument, and only a builtin type spelling -- a run of the
+    keywords above, or one of the fixed-width aliases. Anything else is
+    left alone, because `pt(1, 2)` is a constructor call and rewriting it
+    as a cast would be silently wrong.
+    """
+    alt = "|".join(_CAST_WORDS)
+    pat = re.compile(r"(?<![\w.>])((?:(?:%s)\s+)*(?:%s)|\w+)\s*\(" % (alt, alt))
+    out, last = [], 0
+    for m in pat.finditer(scan):
+        ty = m.group(1).strip()
+        words = ty.split()
+        if not all(w in _CAST_WORDS for w in words) and not (
+                len(words) == 1 and _CAST_ALIASES.match(ty)):
+            continue
+        op = m.end() - 1
+        close = _match_paren(scan, op)
+        if close is None:
+            continue
+        inner = scan[op + 1:close]
+        if not inner.strip() or _split_top(inner)[1:]:
+            continue                 # no argument, or more than one
+        # A *declarator*, not a cast. `int (*g)(int) = ..` declares a
+        # function pointer, and rewriting it as a cast gave
+        # `((int)(*g))(int) = ..`. Two shapes give it away: the parenthesis
+        # holding a `*` or `&`, and another parameter list following it.
+        if inner.lstrip()[:1] in ("*", "&"):
+            continue
+        after = scan[close + 1:close + 2]
+        if after == "(":
+            continue
+        # A declaration, not a cast: `int (x);` at statement start would be
+        # one, but so would a cast used as a statement -- which is dead code
+        # either way. Skipped when what follows is a `;` immediately.
+        out.append(text[last:m.start()])
+        out.append("((%s)(%s))" % (ty, text[op + 1:close]))
+        last = close + 1
+    if not out:
+        return text
+    out.append(text[last:])
+    return "".join(out)
+
+
 def _materialise_ctor_returns(text, scan):
     """`return Cls(a, b);` -> a named local, then return it.
 
@@ -11428,6 +11488,7 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     # `return Cls(a, b);` becomes a named local before anything reads
     # declarations, so the ordinary initialiser lowering handles it.
     text = _materialise_ctor_returns(text, _strip_comments(text))
+    text = _lower_functional_casts(text, _strip_comments(text))
     # `auto` becomes a written type before anything reads types, because
     # everything downstream -- the class emitter, the scope tracker, the call
     # rewriter -- reads them by their spelling. Lambdas first: `auto f = []..`
@@ -11505,6 +11566,11 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
             blank=cpp_auto._blank_like(text, directives=False))
     except cpp_auto.AutoError as e:
         raise CppError(e.message)
+    # Again, after the typedefs have been expanded: `u64(1)` only becomes
+    # a recognisable `unsigned long long(1)` at that point, and the first
+    # pass above could not see it. Idempotent -- an already-lowered
+    # `((int)(x))` has its type followed by `)`, not `(`.
+    text = _lower_functional_casts(text, _strip_comments(text))
     scan = _blank_literal_braces(_strip_comments(text))
     text, _exc_used = _lower_except(text, path)
     if _exc_used:
@@ -11938,6 +12004,11 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
         # the source already has it.
         elif re.search(r"(?<![\w])(?:size_t|ptrdiff_t)(?![\w])", head):
             head = "#include <stddef.h>\n" + head
+        # The fixed-width types are the same story one header along:
+        # coost's `dtoa_milo.h` takes a `uint64_t` in every constructor, so
+        # the hoisted prototypes named a type the C had not been told about.
+        if re.search(r"(?<![\w])u?int(?:8|16|32|64)_t(?![\w])", head):
+            head = "#include <stdint.h>\n" + head
         pieces.insert(0, head)
     out = "".join(pieces)
 

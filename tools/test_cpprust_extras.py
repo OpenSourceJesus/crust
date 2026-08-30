@@ -1101,6 +1101,47 @@ int f(void) { return is_same<int, int>::value; }
 """, "parameter pack")
 
 
+class TestFunctionalCasts(Base):
+    """`uint64_t(1)` and `int(x)` -- a type written like a call.
+
+    C has no such spelling, and it survived into the output: coost's
+    `dtoa_milo.h` writes `l & (uint64_t(1) << 63)`, which the C front end
+    read as a call to something named `uint64_t`.
+    """
+
+    def test_a_builtin_type_call_becomes_a_cast(self):
+        out = self.lower("""
+int f(void) { return int(3.7); }
+""")
+        self.assertIn("((int)(3.7))", out)
+
+    def test_a_multiword_type_works(self):
+        out = self.lower("""
+typedef unsigned long long u64;
+int f(void) { u64 l = 5; return (l & (u64(1) << 2)) != 0; }
+""")
+        self.assertIn("((unsigned long long)(1))", out)
+
+    def test_a_function_pointer_declaration_is_not_a_cast(self):
+        """`int (*g)(int) = ..` declares a function pointer. Read as a
+        cast it became `((int)(*g))(int) = ..`, which broke every lambda
+        binding in the suite."""
+        out = self.lower("""
+static int helper(int y) { return y * 2; }
+void f(void) { int (*g)(int) = helper; (void)g; }
+""")
+        self.assertIn("int (*g)(int) = helper;", out)
+
+    def test_a_constructor_call_is_not_a_cast(self):
+        """A class name followed by parentheses is a construction, and
+        rewriting it as a cast would be silently wrong."""
+        out = self.lower("""
+struct pt { int x; pt(int a) { x = a; } };
+int f(void) { pt p(2); return p.x; }
+""")
+        self.assertNotIn("((pt)", out)
+
+
 class TestConstructorCallReturns(Base):
     """`return Cls(a, b);` for a class with no destructor.
 
