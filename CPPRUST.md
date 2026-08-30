@@ -763,10 +763,46 @@ arities off the file and leaves such a call bare for C to resolve.
 `is_same` trait — rewrite it to fixed arity), a pack that is not the last
 parameter, and a non-type pack.
 
+### Recursive templates and explicit specialisations
+
+A non-type template argument is **evaluated**, so `copy<N - 1>` after
+substitution is the same instantiation as `copy<3>` rather than a different
+spelling that mangles to a symbol nothing defines. Only literal arithmetic
+(`+ - * / %` and parentheses); anything with a name in it is left as
+written, because a name there is a type argument or a constant this pass
+cannot read.
+
+An **explicit specialisation** is collected as a definition, not a template:
+its arguments are spelled after the name, its empty `template<>` head is
+dropped, and it takes the mangled name the general template's
+instantiations use, so a call reaches it by the same symbol. The general
+template is not instantiated for the arguments a specialisation already
+defines -- which is what terminates a recursion.
+
+```cpp
+template<size_t N>
+inline void copy(void* dst, const void* src) {
+    copy<N - 1>(dst, src);
+    ((char*)dst)[N - 1] = ((const char*)src)[N - 1];
+}
+template<>
+inline void copy<0>(void*, const void*) {}
+```
+
+Instantiation follows the chain to a fixpoint, bounded at 256 per template.
+A pack shrinks by one element each round, but arbitrary argument arithmetic
+need not shrink at all, so a recursion whose base case is never reached is
+**reported** rather than spun on.
+
 ### What the collector will not read
 
-Three things that spell `template<..>` or `name(` and are not what they
-look like, each found against coost:
+
+Things that spell `template<..>`, `name(` or `class X {` and are not what
+they look like, each found against coost. The rule underneath them all: a
+pass that reads *structure* must be blind to `#define` bodies, and one that
+reads *tokens* need not be -- `static_cast<T>(e)` is rewritten inside a
+macro body precisely because that rewrite does not depend on anything
+around it.
 
 * **A `#define` body.** `DEF_has_method(f)`'s macro holds a whole template
   whose name pastes with `##f`; read as code, it became a template named
@@ -779,6 +815,11 @@ look like, each found against coost:
   means; those name the class. It is excluded from use-matching, and its
   head is split angle-aware, since a head parameter may itself be a
   template with commas of its own.
+* **A class inside a `#define`.** The same macro holds a whole class, nested
+  struct and all. The class collector read those as real classes and the
+  emitter rewrote *inside the macro*, breaking its backslash continuation
+  chain -- so the tail stopped being a `#define` body and reached the C
+  front end as code.
 * **A plain overload's signature.** `inline bool operator==(const char *a,
   ..)` beside the templated one spells the same `name(` a call does. The
   trailing `;` does not settle it — a call *statement* ends `);` too, and
@@ -1791,7 +1832,77 @@ virtual, where they sit between the parameters and the `= 0`. All of them say
 what the language may do rather than what the lowering must, and the C front
 end checks the body regardless.
 
+### `static const` members
+
+A `static const` data member is a class *constant*, not a field: it is
+emitted at file scope as `Class_name`, above the struct so one may be
+defined in terms of another, and a use inside a method body names it
+directly rather than going through `this`.
+
+```cpp
+class box {
+public:
+    static const int cap  = 64;
+    static const int half = cap / 2;      /* -> box_half = box_cap / 2 */
+};
+```
+
+Treating one as an ordinary field put `static const int cap;` *inside* the
+struct -- which is not C -- and moved the initialiser into the constructor,
+so every instance re-assigned a constant.
+
+### `constexpr`
+
+Dropped, on a member and at file scope alike. It asks for compile-time
+evaluation where the arguments allow it; the lowering emits an ordinary
+definition either way and the C front end is free to fold it.
+
+Worth knowing because a constructor is recognised by its signature being
+exactly the class name -- `constexpr fastring()` is one, and until the
+specifier was dropped it was not recognised as a constructor at all.
+
+### Export and visibility macros
+
+`class __coapi fastring : public fast::stream` -- an object-like macro
+between the keyword and the name, which is how a library marks a type for a
+shared build. The macro is blanked when it is one this translation unit
+`#define`s *and* its body is empty or an attribute (`__declspec(..)`,
+`__attribute__((..))`). A second identifier that is not one of those is
+left where it is, since it is not something this can identify.
+
+Every class scan reads the name as the first word after `class`, so without
+this they collected the *macro* as the class -- and the failure surfaced far
+away, as members that had gone missing from a class that was never really
+there.
+
+### Global scope
+
+A leading `::` means global scope, and C has only the one for it to mean --
+but it is *carried* through every name-resolving pass and removed last,
+rather than stripped where it is found. `co::system_allocator` calls
+`::free(p)` from a static method of a class that has its own `free`:
+stripped early, the bare name resolved against the enclosing class and
+became `this->co_free(p)` in a function with no `this`.
+
+### Functional-style casts
+
+`int(x)` and `uint64_t(1)` -- a type written like a call -- become `((T)(x))`.
+
+Only a builtin type spelling or a fixed-width alias, and only with one
+argument. A *class* name followed by parentheses is a construction, not a
+cast. Two shapes are also excluded because they are declarations rather than
+expressions: a parenthesis holding a `*` or `&`, and one followed by another
+parameter list -- `int (*g)(int) = ..` declares a function pointer.
+
+### Constructor calls in a return
+
+`return Cls(a, b);` becomes a named local and a return of it, which is the
+form the ordinary initialiser lowering already handles. For an *owning*
+class this is still refused -- a returned local is moved out, and an
+expression has nothing to move from.
+
 ### Anonymous unions and structs
+
 
 Both forms are supported, and both are carried through whole -- C has them
 and ShivyCX lowers them, so nothing needs inventing:
