@@ -692,7 +692,99 @@ produced diagnostics about statements in a function the translation unit
 never called.
 
 **Refused:** a call giving the wrong number of arguments. They are
-substituted by position and there are no defaults to fall back on.
+substituted by position and there are no defaults to fall back on. A pack
+template (below) takes *at least* its fixed count rather than exactly.
+
+### Overloaded function templates
+
+Function templates overload, and this pass keys them by name — coost's
+`god.h` has four `align_up`. Two rules keep that from going wrong:
+
+* **A call inside any template's body waits.** Its arguments may name the
+  *enclosing* template's own parameters — `align_up<A>((size_t)x)` inside
+  the pointer overload — so it cannot be instantiated until that template
+  is. Substitution replaces `A` with the real argument, and the pass runs
+  again over the copy. Keyed on every template rather than only the one
+  being matched, because a call in one overload's body is outside the range
+  of the other two, and used to be read as a call to them with too few
+  arguments.
+* **Each call selects one overload**, on argument count and on whether each
+  argument the pass can type is a pointer — which is the whole of overload
+  resolution these need. Without it every overload instantiated every call
+  and two of them lowered to one symbol, the second redefining the first.
+  A call the selection cannot split is refused with the limit named.
+
+### Partial explicit arguments
+
+`align_up<64>(x)` gives one argument to a template that takes two; C++
+deduces the rest. So does this, the same way full deduction already works:
+the call is rewritten the long way — `align_up<64, int>(x)` — and the
+ordinary substitution runs on that, one code path for every form. Explicit
+arguments bind to the *leading* parameters, so only the tail is deduced,
+each from a function parameter written `P name` or `P *name` against the
+argument in that position. A tail that cannot be typed leaves the call
+exactly as written, and the arity check reports it as before.
+
+### Parameter packs
+
+One trailing type pack, in a **free function** template:
+
+```cpp
+int sum() { return 0; }
+template<typename X, typename ...V>
+int sum(X x, V... v) { return x + sum(v...); }
+
+sum<int, int, int>(1, 2, 3);      /* -> 6 */
+```
+
+Unrolled per instantiation, which is the natural fit for a monomorphiser:
+compile-time recursion becomes N ordinary instantiations. `sum<A,B,C>`
+becomes a function whose body calls `sum<B, C>` — a spelling that exists
+only in the substituted copy, so a worklist scans each new copy for further
+calls, to a fixpoint. Bounded, because every derived call has strictly
+fewer template arguments than the one it came from.
+
+Four spellings are expanded: the pack function parameter (`V&&... v`
+becomes one concrete parameter per element), `std::forward<V>(v)...` and
+bare `v...` (the element names — forwarding is pass-through, since every
+element parameter is spelled concretely there is no reference collapsing to
+preserve, and `V&&` becomes by-value), and `V...` in template-argument
+position. An empty pack erases the expansion *and the comma before it*, so
+`f(x, v...)` bottoms out as `f(x)`.
+
+**A plain overload of matching arity wins the recursion.** C++ prefers a
+non-template on a match, and the consume idiom's base overloads exist
+precisely to terminate — `int last(int)` beside the pack template.
+Spelling the template there recursed past the base and emitted a call to a
+nullary `last()` nothing defines; the pass reads each name's plain-overload
+arities off the file and leaves such a call bare for C to resolve.
+
+**Still refused:** a pack on a *class* template (coost's recursive
+`is_same` trait — rewrite it to fixed arity), a pack that is not the last
+parameter, and a non-type pack.
+
+### What the collector will not read
+
+Three things that spell `template<..>` or `name(` and are not what they
+look like, each found against coost:
+
+* **A `#define` body.** `DEF_has_method(f)`'s macro holds a whole template
+  whose name pastes with `##f`; read as code, it became a template named
+  `f` that then refused the author's own `int f()` as a bare call to it.
+  The scan goes through the directive blanking every call pass already
+  uses.
+* **A constructor template.** A member template whose name *is* its
+  enclosing class — the SFINAE shape `template<typename X, god::if_t<..> =
+  0> shared(const shared<X> &)` — is never what a `shared<T>` in the file
+  means; those name the class. It is excluded from use-matching, and its
+  head is split angle-aware, since a head parameter may itself be a
+  template with commas of its own.
+* **A plain overload's signature.** `inline bool operator==(const char *a,
+  ..)` beside the templated one spells the same `name(` a call does. The
+  trailing `;` does not settle it — a call *statement* ends `);` too, and
+  a filter that leaned on it broke every deduction test in the suite. What
+  settles it is a body opening after the close paren, or a *type word*
+  before the name.
 
 ## `operator[]`
 
@@ -1085,11 +1177,19 @@ Points where these diverge from `std`, each for a reason the subset forces:
   destination has to be visibly a container's own range (`begin()`, `ptr()`,
   or one local aliasing one); anything else is reported. A plain-data
   element has nothing to destroy, so the check never fires.
-* **`<numeric>` is scalars only.** These combine elements with `+` and `*`,
-  which a class would need `operator+` for; a class element is reported
-  against the call rather than left to fail inside a template body. `accumulate`
-  answers to its own name as well as to the header, since it lived in
-  `<algorithm>` here before `<numeric>` existed.
+* **`<numeric>` is scalars only, except `accumulate`.** These combine
+  elements with `+` and `*`, which a class needs the operator for.
+  `accumulate` combines and does nothing else, so a class that *declares*
+  `operator+` goes through — its supplied body is `sum += *it`, so the
+  element supplies `operator+=` and `string` folds a range of itself. That
+  used to be refused for every class, which was right when no binary
+  operator was in the subset at all; a class without the operator is still
+  reported against the call rather than left to fail inside a template
+  body. The rest stay scalars-only: `inner_product` multiplies as well as
+  adds, `partial_sum` and `adjacent_difference` write sums into a raw
+  range, and `iota` counts. `accumulate` answers to its own name as well
+  as to the header, since it lived in `<algorithm>` here before
+  `<numeric>` existed.
 
 ### Template arguments are deduced, narrowly
 
