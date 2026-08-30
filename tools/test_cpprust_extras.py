@@ -1018,7 +1018,7 @@ X align_up(X x) { return (x + (A - 1)) & ~(A - 1); }
 template<int A, typename X>
 X* align_up(X* x) { return (X*)align_up<A>((unsigned long)x); }
 int f(void) { int v = 4; return align_up<64>(v); }
-""", "align_up_64_int(int x)")
+""", "align_up_64_int_v(int x)")
 
     def test_value_and_pointer_overloads_do_not_collide(self):
         """Selection is on argument count and pointer-ness -- the whole of
@@ -1033,8 +1033,14 @@ int f(void) { int v = 4; int *p = &v;
     int a = align_up<64>(v); int *b = align_up<64>(p);
     return a + *b; }
 """)
-        self.assertEqual(out.count("int align_up_64_int(int x)"), 1)
-        self.assertEqual(out.count("int* align_up_64_int(int* x)"), 1)
+        # The parameter shape is in the name. Encoding only the template
+        # arguments gave both overloads one symbol with conflicting types
+        # -- which this test used to assert as correct, and which the C
+        # front end rejected.
+        self.assertEqual(out.count("int align_up_64_int_v(int x)"), 1)
+        self.assertEqual(out.count("int* align_up_64_int_p(int* x)"), 1)
+        self.assertIn("align_up_64_int_v(v)", out)
+        self.assertIn("align_up_64_int_p(p)", out)
 
 
 class TestParameterPacks(Base):
@@ -1130,6 +1136,20 @@ struct pt {
 int f(void) { pt p(2); return p.x; }
 """)
         self.assertIn("pt_new", out)
+
+    def test_alternatives_in_a_conditional_are_not_duplicates(self):
+        """coost writes `murmur_hash` twice under `#if __arch64 / #else`.
+        Only one is ever live, so reading both as a redefinition is
+        wrong."""
+        out = self.lower("""
+#if __arch64
+inline int pick(int a) { return a; }
+#else
+inline int pick(int a) { return -a; }
+#endif
+int f(void) { return pick(2); }
+""")
+        self.assertIn("pick", out)
 
     def test_a_method_may_share_a_name_with_a_free_function(self):
         out = self.lower("""

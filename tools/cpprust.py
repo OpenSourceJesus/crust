@@ -1229,6 +1229,26 @@ def _check_free_overloads(scan, path):
     first. A template's body is skipped too -- its instantiations are
     named apart later.
     """
+    # Regions the conditional evaluator could not decide. A definition
+    # inside one has an alternative in the other branch and only ever one
+    # is live -- coost's `murmur_hash` is written twice under `#if
+    # __arch64 / #else`, and reading both as a redefinition is wrong.
+    # Skipped rather than resolved: whichever branch survives is a
+    # question for the C preprocessor, not for this check.
+    cond = []
+    cdepth, at = 0, 0
+    for line in scan.split("\n"):
+        stripped = line.lstrip()
+        if re.match(r"#\s*if", stripped):
+            if cdepth == 0:
+                start_at = at
+            cdepth += 1
+        elif re.match(r"#\s*endif", stripped):
+            cdepth -= 1
+            if cdepth == 0:
+                cond.append((start_at, at + len(line)))
+        at += len(line) + 1
+
     depth, i, n = 0, 0, len(scan)
     tops = []
     while i < n:
@@ -1251,6 +1271,8 @@ def _check_free_overloads(scan, path):
             continue
         name = m.group(2)
         if name in ("if", "while", "for", "switch", "catch", "main"):
+            continue
+        if any(a <= b <= e for a, e in cond):
             continue
         # A class body, a namespace, a template -- none is a free function.
         lead = head[:m.start()].rstrip()
@@ -3412,6 +3434,20 @@ def _monomorphise_function_templates(text, scan, path, _depth=0):
                     r"(?<![\w])(?:class|struct)\s+(\w+)", scan))
                 one = _expand_cpp_ref(_expand_cpp_rref(one, cnames), cnames)
             suffix = "_".join(_mangle_targ(a) for a in got)
+            # Overloaded templates share a name *and* their arguments:
+            # `align_up<64>` names both the value and the pointer overload,
+            # and encoding only the arguments gave the two instantiations
+            # one symbol with conflicting types. The parameter shape goes
+            # into the name as well -- one `p` per pointer parameter -- but
+            # only when this name has more than one template, so an
+            # ordinary template's symbol keeps the spelling it had.
+            if sum(1 for o in tmpl if o["name"] == t["name"]
+                   and not o.get("ctor_of")) > 1:
+                shape = "".join(
+                    "p" if re.search(r"\*\s*\w*$", fp.strip()) else "v"
+                    for fp in t["fparams"] if fp.strip())
+                if shape:
+                    suffix = "%s_%s" % (suffix, shape)
             one = re.sub(r"(?<![\w])%s(?=\s*\()" % re.escape(t["name"]),
                          "%s_%s" % (t["name"], suffix), one, count=1)
             copies.append(one)
@@ -3444,12 +3480,35 @@ def _monomorphise_function_templates(text, scan, path, _depth=0):
     text = "".join(out)
 
     # And the call sites, now that the copies exist to be called.
+    scan_now = _strip_comments(text)
     for t in tmpl:
         def _fix(u, _t=t):
             got = [_eval_int_targ(a.strip())
                    for a in _split_top(u.group(1)) if a.strip()]
-            return "%s_%s(" % (_t["name"],
-                               "_".join(_mangle_targ(a) for a in got))
+            suffix = "_".join(_mangle_targ(a) for a in got)
+            # Which overload does this call select? The definitions encode
+            # their parameter shape in the name when a template family has
+            # more than one, so the call has to pick the same one --
+            # otherwise every call went to whichever sibling `re.sub`
+            # happened to reach first.
+            sibs = [o for o in tmpl if o["name"] == _t["name"]
+                    and not o.get("ctor_of")]
+            if len(sibs) > 1:
+                op_at = u.end() - 1
+                cl = _match_paren(scan_now, op_at) \
+                    if op_at < len(scan_now) else None
+                cargs = ([a.strip()
+                          for a in _split_top(scan_now[op_at + 1:cl])]
+                         if cl is not None else [])
+                fits = [o for o in sibs
+                        if _template_fits_call(o, cargs, scan_now, u.start())]
+                pick = fits[0] if len(fits) == 1 else _t
+                shape = "".join(
+                    "p" if re.search(r"\*\s*\w*$", fp.strip()) else "v"
+                    for fp in pick["fparams"] if fp.strip())
+                if shape:
+                    suffix = "%s_%s" % (suffix, shape)
+            return "%s_%s(" % (_t["name"], suffix)
         text = re.sub(
             r"(?<![\w])%s\s*<([^;{}()]*)>\s*\(" % re.escape(t["name"]),
             _fix, text)
@@ -11615,7 +11674,9 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     # are named by their arguments and two of them may still share a name,
     # but that is a *mangling* question with its own answer, not a source
     # written with two definitions of one free function.
-    _check_free_overloads(_blank_directives(_strip_comments(text)), path)
+    # Comment-stripped but *not* directive-blanked: the check needs to see
+    # `#if` / `#else` to know which definitions are alternatives.
+    _check_free_overloads(_strip_comments(text), path)
     # A leading `::` qualifies a name with *global* scope. C has only the
     # one scope, so the marker is dropped -- but it has to go before any
     # pass reads names, because coost's allocator reaches the C library
