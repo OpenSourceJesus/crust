@@ -2662,6 +2662,34 @@ def _value_type_of(expr, scan, at):
     return None
 
 
+def _eval_int_targ(arg):
+    """`4 - 1` -> `3` for a non-type template argument, else unchanged.
+
+    A recursive template writes its own argument as arithmetic --
+    `copy<N - 1>(..)` in coost's `god.h` -- and substitution turns that
+    into `copy<4 - 1>`, which is a *different* spelling from `copy<3>` and
+    mangles to a symbol nothing defines. C++ evaluates the expression to
+    pick the instantiation; so does this.
+
+    Deliberately narrow: integer literals and `+ - * / %` with parentheses,
+    nothing else. Anything with a name in it is left exactly as written,
+    because a name here is a type argument or a constant this pass cannot
+    read.
+    """
+    s = (arg or "").strip()
+    if not s or not re.match(r"^[\d\s()+*/%-]+$", s):
+        return arg
+    if not re.search(r"\d", s):
+        return arg
+    try:
+        val = eval(s, {"__builtins__": {}}, {})       # digits/operators only
+    except Exception:
+        return arg
+    if isinstance(val, int):
+        return str(val)
+    return arg
+
+
 def _spell_partial_targs(text, scan, tmpl):
     """Fill in the arguments a partially spelled call left out.
 
@@ -2985,7 +3013,14 @@ def _monomorphise_function_templates(text, scan, path, _depth=0):
         # statements as bare calls to it. An operator member template is
         # collected under its own spelling instead; uninstantiated, it is
         # blanked like any other, which is what C++ does with one.
-        nm = re.search(r"((?:operator\s*[-+*/%^&|<>=!\[\]]+|\w+))\s*\(",
+        # The optional `<..>` catches an explicit specialisation, whose
+        # arguments are spelled after the name -- `int sum_to<0>()`. Without
+        # it the name search found no `name(` at all and the whole
+        # definition was skipped, so it passed through, got mangled to the
+        # same symbol the general template produced for those arguments,
+        # and the two collided in the emitted C.
+        nm = re.search(r"((?:operator\s*[-+*/%^&|<>=!\[\]]+|\w+))"
+                       r"\s*(<[^<>()]*>)?\s*\(",
                        scan[after:k + 1])
         if not nm:
             continue
@@ -3018,8 +3053,22 @@ def _monomorphise_function_templates(text, scan, path, _depth=0):
                    if sig_close is not None else [])
         encl = next((cn for a, b, cn in class_spans
                      if a <= m.start() < b), None)
+        # `template<> int sum_to<0>() { .. }` -- an explicit
+        # specialisation. It is a *definition*, not a template to
+        # instantiate: the arguments are spelled after the name and the
+        # head is empty. Recorded so the general template is not
+        # instantiated for those same arguments, which is what terminates
+        # a recursive one -- coost's `god::copy<0>` is exactly this, and
+        # without it the general body was emitted for `0` too, calling
+        # `copy<-1>` and redefining the specialisation's symbol.
+        spec_args = None
+        if not params and nm.group(2):
+            spec_args = [_eval_int_targ(a.strip())
+                         for a in _split_targs(nm.group(2)[1:-1])
+                         if a.strip()]
         tmpl.append({
             "name": nm.group(1), "params": params, "pack": pack,
+            "spec_args": spec_args,
             "ctor_of": encl if encl == nm.group(1) else None,
             "start": m.start(), "end": k + 1,
             "decl_only": body_open is None,
@@ -3072,8 +3121,18 @@ def _monomorphise_function_templates(text, scan, path, _depth=0):
 
     # Which arguments each one is instantiated with. A member call is
     # `c.reg<int>(..)`, so a leading `.` cannot be excluded.
+    # Arguments that an explicit specialisation already defines, per name.
+    specialised = {}
+    for t in tmpl:
+        if t.get("spec_args") is not None:
+            specialised.setdefault(t["name"], []).append(t["spec_args"])
+
     out, last, names = [], 0, []
     for t in sorted(tmpl, key=lambda t: t["start"]):
+        if t.get("spec_args") is not None:
+            # Emitted below with the mangled name the general template's
+            # instantiations use, so a call reaches it by the same symbol.
+            continue
         args = []
         for u in ([] if t.get("ctor_of") else re.finditer(
                 r"(?<![\w])%s\s*<([^;{}()]*)>\s*\(" % re.escape(t["name"]),
@@ -3118,7 +3177,8 @@ def _monomorphise_function_templates(text, scan, path, _depth=0):
                         % (os.path.basename(path),
                            _src_line(text, u.start()), t["name"],
                            u.group(1).strip(), len(fits), t["name"]))
-            got = [a.strip() for a in _split_top(u.group(1)) if a.strip()]
+            got = [_eval_int_targ(a.strip())
+                   for a in _split_top(u.group(1)) if a.strip()]
             # A pack absorbs everything after the fixed parameters, so its
             # template takes *at least* that many rather than exactly.
             bad = (len(got) < len(t["params"]) if t.get("pack")
@@ -3134,6 +3194,8 @@ def _monomorphise_function_templates(text, scan, path, _depth=0):
                        "" if len(got) == 1 else "s",
                        "at least " if t.get("pack") else "",
                        len(t["params"])))
+            if got in specialised.get(t["name"], []):
+                continue           # an explicit specialisation defines it
             if got not in args:
                 args.append(got)
         # Derived instantiations. A pack template's body calls itself with
@@ -3155,6 +3217,8 @@ def _monomorphise_function_templates(text, scan, path, _depth=0):
                         % re.escape(t["name"]), one):
                     got2 = [a.strip() for a in _split_top(u2.group(1))
                             if a.strip()]
+                    if got2 in specialised.get(t["name"], []):
+                        continue
                     if len(got2) >= len(t["params"]) and got2 not in args:
                         args.append(got2)
                         queue.append(got2)
@@ -3221,7 +3285,8 @@ def _monomorphise_function_templates(text, scan, path, _depth=0):
     # And the call sites, now that the copies exist to be called.
     for t in tmpl:
         def _fix(u, _t=t):
-            got = [a.strip() for a in _split_top(u.group(1)) if a.strip()]
+            got = [_eval_int_targ(a.strip())
+                   for a in _split_top(u.group(1)) if a.strip()]
             return "%s_%s(" % (_t["name"],
                                "_".join(_mangle_targ(a) for a in got))
         text = re.sub(
