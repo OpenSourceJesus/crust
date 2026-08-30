@@ -8007,6 +8007,23 @@ def _is_copy_params(params, cname, raw_name, tsub, sub):
 _EXTERN_LINKAGE = re.compile(r'\bextern\s*"C(?:\+\+)?"\s*')
 
 
+def _drop_global_scope(text):
+    """Remove the global-scope marker, once every name-resolving pass is done.
+
+    `::free(p)` is marked rather than stripped where it is found, because
+    the passes in between resolve a bare name against the enclosing class:
+    coost's `system_allocator` calls `::free(p)` from a *static* method,
+    and with the marker gone early that became `this->co_free(p)` -- a
+    member call in a function with no `this`. Marked, the name is not a
+    bare one and no pass claims it.
+
+    Applied at every exit from `translate`, including the early one for a
+    file that defines no classes -- which is exactly the file most likely
+    to call a C library function this way.
+    """
+    return text.replace("__gsq__", "")
+
+
 def _strip_attribute_macros(text):
     """Blank an export/visibility macro sitting between `class` and its name.
 
@@ -11263,7 +11280,7 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     # with `::free(p)` from a class that has its own `free`, and namespace
     # flattening turned that into `::this->co_free(p)`: invalid C, and the
     # wrong function. The lookbehind keeps `a::b` intact.
-    text = re.sub(r"(?<![\w:])::(?=\w)", "", text)
+    text = re.sub(r"(?<![\w:])::(?=\w)", "__gsq__", text)
     # `constexpr` asks for compile-time evaluation; C has no such keyword
     # and the lowering emits an ordinary definition either way. Dropped at
     # file scope as well as on members -- coost's `mem.h` writes
@@ -11466,7 +11483,7 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
                 "`<algorithm>` has nothing to hang that pass off. Use them "
                 "on a container (`<vector>`, `<set>`), which supplies one."
                 % (os.path.basename(path), left.group(1)))
-        return text
+        return _drop_global_scope(text)
 
     tclasses = dict((cls.name, cls) for _s, _e, cls in classes if cls.tparams)
     tnames = set(tclasses)
@@ -11955,7 +11972,7 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     out = _SRC_MARK_RE.sub("", out).replace("typedef int ;\n", "\n")
     if decls_out:
         out = _publish_decls_linkage(out, _publish[0], _publish[1])
-    return out
+    return _drop_global_scope(out)
 
 
 # ==========================================================================

@@ -1101,6 +1101,40 @@ int f(void) { return is_same<int, int>::value; }
 """, "parameter pack")
 
 
+class TestGlobalScopeQualifier(Base):
+    """`::free(p)` reaches the C library, not a member named `free`.
+
+    coost's `system_allocator` has a static `free` whose body calls
+    `::free(p)`. Namespace flattening first turned that into
+    `::this->co_free(p)` -- invalid C *and* the wrong function. Stripping
+    the `::` early fixed that and reintroduced it in another form: the bare
+    name then resolved against the enclosing class, giving
+    `this->co_free(p)` in a static method with no `this`. The marker is
+    therefore carried through every name-resolving pass and removed last.
+    """
+
+    def test_a_global_call_is_not_a_member_call(self):
+        out = self.lower("""
+void *malloc(unsigned long);
+void free(void *);
+struct salloc {
+    static void *alloc(unsigned long n) { return ::malloc(n); }
+    static void free(void *p, unsigned long) { return ::free(p); }
+};
+int f(void) { void *p = salloc::alloc(8); salloc::free(p, 8); return 0; }
+""")
+        self.assertIn("{ return free(p); }", out)
+        self.assertNotIn("this->", out)
+        self.assertNotIn("::", out)
+
+    def test_the_marker_never_reaches_the_output(self):
+        out = self.lower("""
+void free(void *);
+int f(void) { void *p = 0; ::free(p); return 0; }
+""")
+        self.assertNotIn("__gsq__", out)
+
+
 class TestRecursiveNonTypeTemplates(Base):
     """`copy<N>` calling `copy<N - 1>`, terminated by `copy<0>`.
 
