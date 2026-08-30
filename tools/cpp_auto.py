@@ -114,7 +114,7 @@ def _anchored_finditer(pat, text):
     patterns are expensive to fail: a nested quantifier over type names,
     backtracked at every character of a spliced translation unit.
 
-    `\A` matches only at offset 0 and not at a `pos` handed to `match`,
+    `\\A` matches only at offset 0 and not at a `pos` handed to `match`,
     which is why position 0 is tried on its own rather than treated as one
     more boundary.
     """
@@ -1107,6 +1107,41 @@ _BRACE = re.compile(r"[{}]")
 _NOT_NEWLINE = re.compile(r"[^\n]")
 
 
+def _blank_directive_lines(text):
+    """Blank preprocessor directive lines, continuations included.
+
+    A `#define` body is not code, and every resolver here is a regex that
+    cannot know that on its own. coost's `DISALLOW_COPY_AND_ASSIGN(T)`
+    macro spells `T(const T&) = delete;` on a continuation line;
+    `resolve_defaulted` matched it, then cut "back to the start of the
+    member" -- through the `#define` head and twelve unrelated defines, to
+    a typedef's semicolon fourteen lines up. Length and newlines are kept,
+    as everywhere in this file, so positions still index the real text.
+    Mirrors `cpprust._blank_directives`, which this module cannot import
+    without a cycle.
+    """
+    out, i, n = [], 0, len(text)
+    while i < n:
+        j = text.find("\n", i)
+        j = n if j < 0 else j
+        line = text[i:j]
+        if line.lstrip().startswith("#"):
+            out.append(" " * len(line))
+            while line.rstrip().endswith("\\") and j < n:
+                i = j + 1
+                out.append("\n")
+                j = text.find("\n", i)
+                j = n if j < 0 else j
+                line = text[i:j]
+                out.append(" " * len(line))
+        else:
+            out.append(line)
+        if j < n:
+            out.append("\n")
+        i = j + 1
+    return "".join(out)
+
+
 def _blank_like(text):
     """A same-length copy with comment and literal bodies blanked.
 
@@ -1148,7 +1183,7 @@ def _blank_like(text):
         if pos <= i:
             pos = i + 1
     out.append(text[last:])
-    blanked = "".join(out)
+    blanked = _blank_directive_lines("".join(out))
     if "__cpp_ref" not in blanked:
         return blanked
     out, last = [], 0
@@ -1180,8 +1215,8 @@ def _flatten_pattern(names):
     passes below used to do: loop over some hundreds of names and, for each
     one, substitute into the body and re-blank the result. All of that
     collapses into a single scan -- and it is exactly equivalent, because at
-    any one position only a single name can match. `(?![\w])` means a match
-    ends where an identifier ends and `(?<![\w.>])` means it begins where
+    any one position only a single name can match. `(?![\\w])` means a match
+    ends where an identifier ends and `(?<![\\w.>])` means it begins where
     one begins, so the only candidate anywhere is the whole word sitting
     there, and which name is tried first cannot change the answer.
     """

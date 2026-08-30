@@ -2348,7 +2348,7 @@ def _pointee_of(expr, scan, at):
     return None
 
 
-def _bare_call(t, scan):
+def _bare_call(t, scan, tmpl=()):
     """The first call to `t` that spelled no template arguments, or None.
 
     Not one inside the template's own span -- that is its definition, or a
@@ -2363,9 +2363,42 @@ def _bare_call(t, scan):
         b_close = _match_brace(scan, b_open)
         if b_close is not None:
             bodies.append((cm.start(), b_close))
+    def _is_signature(u):
+        # A *definition or declaration* of a plain overload spells the
+        # same `name(` a call does -- `inline bool operator==(const char
+        # *a, ..) {` beside the template of that name -- and fastring.h
+        # keeps a family of plain comparison overloads next to each
+        # templated one, so every signature was read as a bare call to
+        # the template.
+        #
+        # The trailing `;` does not settle it: a call *statement* ends
+        # `);` too, and a first version of this filter read `sort(a, b);`
+        # as a declaration and broke every deduction test in the suite.
+        # What settles it is a body opening after the close paren, or a
+        # *type word* before the name -- a call is preceded by an
+        # operator, a brace, or a statement keyword, never by an
+        # identifier that names a type.
+        cl = _match_paren(scan, u.end() - 1)
+        if cl is None:
+            return False
+        tail = scan[cl + 1:cl + 12].lstrip()
+        if tail[:1] == "{" or tail.startswith(("const", "noexcept")):
+            return True
+        if tail[:1] != ";":
+            return False
+        head = scan[:u.start()].rstrip()
+        pw = re.search(r"([A-Za-z_]\w*|[&*>])$", head)
+        return bool(pw) and pw.group(1) not in (
+            "return", "else", "do", "case", "goto", "throw", "co_return",
+            "co_yield", "and", "or", "not")
     return next((u for u in re.finditer(
         r"(?<![\w.>])%s\s*\(" % re.escape(t["name"]), scan)
-        if not (t["start"] <= u.start() < t["end"])
+        if not _is_signature(u)
+        and not (t["start"] <= u.start() < t["end"])
+        # Nor inside a *sibling overload's* body: function templates
+        # overload, and a call there names the enclosing template's own
+        # parameters rather than anything instantiable yet.
+        and not any(o["start"] <= u.start() < o["end"] for o in tmpl)
         and not any(b0 <= u.start() < b1 for b0, b1 in bodies)), None)
 
 
@@ -2564,7 +2597,7 @@ def _spell_deduced_calls(text, scan, tmpl):
     edits = []
     for t in tmpl:
         while True:
-            u = _bare_call(t, scan)
+            u = _bare_call(t, scan, tmpl)
             if u is None:
                 break
             op = u.end() - 1
@@ -2593,6 +2626,117 @@ def _spell_deduced_calls(text, scan, tmpl):
     return "".join(out)
 
 
+def _value_type_of(expr, scan, at):
+    """`T` for an expression of type `T`, or None if that is not clear.
+
+    The by-value counterpart of `_pointee_of`, and just as narrow: a plain
+    name declared `T name` somewhere visible above the call. Deduction from
+    a by-value parameter is what a *partially* spelled call needs --
+    `align_up<64>(x)` gives the non-type argument and leaves `X` to be read
+    off `x`.
+    """
+    e = (expr or "").strip()
+    while e.startswith("(") and _match_paren(e, 0) == len(e) - 1:
+        e = e[1:-1].strip()
+    if not re.match(r"^\w+$", e):
+        return None
+    lo = _after_origin(scan, at)
+    scan = _visible_view(scan, lo, at)
+    # `T name;`, `T name = ..`, `T name(..)` -- the same shape the `&x`
+    # branch of `_pointee_of` reads, and `*` is excluded ahead of the type
+    # so `T *name` is not mistaken for a value.
+    val_pat = re.compile(
+        r"(?<![\w*])([A-Za-z_]\w*)\s+%s\s*[;=,)(]" % re.escape(e))
+    d = _last_before(val_pat, scan, at, lo)
+    if d and d.group(1) not in _DECL_NOISE:
+        return d.group(1)
+    return None
+
+
+def _spell_partial_targs(text, scan, tmpl):
+    """Fill in the arguments a partially spelled call left out.
+
+    `template<size_t A, typename X> X align_up(X x)` called as
+    `align_up<64>(x)` gives one argument to a template that takes two. C++
+    deduces the rest; this pass substitutes by position, so it used to
+    report the call. coost's `god.h` has three of these and they block
+    `fastring.h` and `fastream.h` at their first include.
+
+    Explicit arguments bind to the *leading* parameters, so only the tail
+    has to be deduced -- each from a function parameter written `P name`
+    or `P *name`, against the argument in that position. If any one of them
+    cannot be typed the call is left exactly as it was, and the arity check
+    reports it as before.
+
+    Returns the rewritten text, or None if nothing was filled in.
+    """
+    edits = []
+    for t in tmpl:
+        if t.get("pack"):
+            continue      # a shorter list than the parameters is the point
+        n = len(t["params"])
+        for u in re.finditer(
+                r"(?<![\w])%s\s*<([^;{}()<>]*)>\s*\(" % re.escape(t["name"]),
+                scan):
+            if any(o["start"] <= u.start() < o["end"] for o in tmpl):
+                # Inside *some* template's body -- this one's (a recursive
+                # use) or a sibling overload's. Either way the call cannot
+                # be instantiated yet: its arguments may name the enclosing
+                # template's own parameters, as `align_up<A>((size_t)x)`
+                # does in coost's `god.h`. Substitution replaces `A` with
+                # the real argument when that enclosing template is
+                # instantiated, and the pass runs again over the copy.
+                #
+                # Keyed on every template rather than only `t` because
+                # function templates overload: `align_up` is three of them,
+                # so a call in one body is outside the range of the other
+                # two and was read as a call to them with too few
+                # arguments.
+                continue
+            given = [a.strip() for a in _split_top(u.group(1)) if a.strip()]
+            if not given or len(given) >= n:
+                continue
+            op = u.end() - 1
+            close = _match_paren(scan, op)
+            if close is None:
+                continue
+            cargs = [a.strip() for a in _split_top(scan[op + 1:close])]
+            rest = []
+            for pname in t["params"][len(given):]:
+                got = None
+                for idx, fp in enumerate(t["fparams"]):
+                    if idx >= len(cargs):
+                        continue
+                    fp = fp.strip()
+                    if re.match(r"^%s\s*\*\s*\w+$" % re.escape(pname), fp):
+                        got = _pointee_of(cargs[idx], scan, u.start())
+                    elif re.match(r"^(?:const\s+)?%s\s+\w+$"
+                                  % re.escape(pname), fp):
+                        got = _value_type_of(cargs[idx], scan, u.start())
+                    if got:
+                        break
+                if not got:
+                    rest = None
+                    break
+                rest.append(got)
+            if not rest:
+                continue
+            edits.append((u.start(), u.end(),
+                          "%s<%s>(" % (t["name"], ", ".join(given + rest))))
+    if not edits:
+        return None
+    edits.sort()
+    out, prev = [], 0
+    for a, b, rep in edits:
+        if a < prev:
+            continue
+        out.append(text[prev:a])
+        out.append(rep)
+        prev = b
+    out.append(text[prev:])
+    return "".join(out)
+
+
 def _deduce_targs(t, callsite_args, scan, at):
     """Template arguments for a call that spelled none, or None.
 
@@ -2602,7 +2746,7 @@ def _deduce_targs(t, callsite_args, scan, at):
     no pointer parameter, an argument that will not type -- returns None,
     and the call is reported.
     """
-    if len(t["params"]) != 1:
+    if len(t["params"]) != 1 or t.get("pack"):
         return None
     tp = t["params"][0]
     for idx, fp in enumerate(t["fparams"]):
@@ -2614,6 +2758,141 @@ def _deduce_targs(t, callsite_args, scan, at):
         if got:
             return [got]
     return None
+
+
+def _template_fits_call(t, cargs, scan, at):
+    """Does this overload of a function template fit this call?
+
+    Function templates overload -- coost's `god.h` has three `align_up` --
+    and this pass keys them by name, so every one of them saw every call
+    and instantiated it. Two overloads then lowered to the same symbol and
+    the second redefined the first.
+
+    Selection is narrow on purpose. Argument *count* first, which separates
+    `align_up(X)` from `align_up(X, A)`. Then pointer-ness of each argument
+    the pass can type, which separates `align_up(X x)` from
+    `align_up(X *x)` -- that is the whole of C++ overload resolution this
+    needs, and anything it cannot type is not held against the candidate.
+    """
+    fps = [f.strip() for f in t["fparams"] if f.strip()]
+    if t.get("pack") and fps and "..." in fps[-1]:
+        # The pack parameter absorbs zero or more arguments, so the fixed
+        # prefix is what has to fit.
+        fps = fps[:-1]
+        if len(cargs) < len(fps):
+            return False
+        cargs = cargs[:len(fps)]
+    elif len(fps) != len(cargs):
+        return False
+    for fp, ca in zip(fps, cargs):
+        wants_ptr = bool(re.match(r"^.*\*\s*\w+$", fp))
+        if _pointee_of(ca, scan, at):
+            is_ptr = True
+        elif _value_type_of(ca, scan, at):
+            is_ptr = False
+        else:
+            continue                 # untypeable: not held against it
+        if is_ptr != wants_ptr:
+            return False
+    return True
+
+
+def _substitute_template(t, got, scan):
+    """One instantiation's body, with template parameters substituted.
+
+    For a pack template, `got` holds the fixed arguments followed by the
+    pack's elements, and four spellings are expanded before the ordinary
+    per-parameter substitution runs:
+
+    * the pack *function parameter* -- `V&& ... v` -- becomes one parameter
+      per element, named `__pk1, __pk2, ..`, each spelled as the pack
+      parameter was but with `V` replaced by that element's type;
+    * `std::forward<V>(v)...` and bare `v...` become `__pk1, __pk2, ..`
+      (forwarding is pass-through here: there is no reference collapsing
+      to preserve, because every element parameter is spelled concretely);
+    * `V...` in template-argument position becomes the element list, which
+      is what turns the recursive `f<V...>(v...)` into a *spelled* call the
+      worklist can instantiate;
+    * a call whose entire argument list is one pack expansion --
+      `f(std::forward<V>(v)...)` -- has its template arguments spelled from
+      the element types, which is what the recursive-consume idiom writes.
+
+    An empty pack erases the expansion and the comma before it, so
+    `f(x, v...)` becomes `f(x)` -- which is how the recursion bottoms out
+    at a plain overload.
+    """
+    body = scan  # caller passes the template's own text slice
+    fixed = t["params"]
+    elems = got[len(fixed):] if t.get("pack") else []
+    one = body
+    if t.get("pack"):
+        pk = t["pack"]
+        vnames = ["__pk%d" % (i + 1) for i in range(len(elems))]
+        # The pack function parameter, e.g. `V&& ... v` or `V... v`.
+        fp_re = re.compile(
+            r"(,\s*)?((?:const\s+)?%s\b[^,()]*?)\.\.\.\s*(\w+)" % re.escape(pk))
+        fm = fp_re.search(one)
+        vname = fm.group(3) if fm else None
+        if fm:
+            spelt = []
+            for e, vn in zip(elems, vnames):
+                sp = re.sub(r"(?<![\w])%s(?![\w])" % re.escape(pk),
+                            e, fm.group(2)).strip()
+                # A forwarding reference becomes a by-value parameter.
+                # Forwarding is pass-through here -- every element is
+                # spelled concretely, so there is no reference collapsing
+                # to preserve, and `T &&` on a scalar is not C.
+                sp = re.sub(r"\s*&&\s*$", "", sp)
+                spelt.append(sp + " " + vn)
+            rep = ((fm.group(1) or "") + ", ".join(spelt)) if spelt else ""
+            one = one[:fm.start()] + rep + one[fm.end():]
+        if vname:
+            # `std::forward<V>(v)...` and bare `v...`, with the comma
+            # before them when the pack is empty.
+            # `std::` may already have been stripped by the time this
+            # runs, so the qualifier is optional.
+            exp_re = re.compile(
+                r"(,\s*)?(?:(?:std\s*::\s*)?forward\s*<\s*%s\s*>"
+                r"\s*\(\s*%s\s*\)"
+                r"|%s)\s*\.\.\." % (re.escape(pk), re.escape(vname),
+                                   re.escape(vname)))
+            joined = ", ".join(vnames)
+            def _exp(mm):
+                if not vnames:
+                    return ""
+                return (mm.group(1) or "") + joined
+            one = exp_re.sub(_exp, one)
+        # `V...` in a template-argument list.
+        one = re.sub(r"(,\s*)?%s\s*\.\.\." % re.escape(pk),
+                     lambda mm: ((mm.group(1) or "") + ", ".join(elems))
+                     if elems else "", one)
+        # A recursive call left bare: `name(__pk1, __pk2)` where `name` is
+        # this template family's own. Spell its arguments from the element
+        # types so the worklist below can instantiate it. Only when the
+        # whole argument list is the expanded pack -- anything mixed is
+        # left for deduction or its diagnostic.
+        if vnames:
+            call_re = re.compile(
+                r"(?<![\w<.>])(\w+)\s*\(\s*%s\s*\)"
+                % r"\s*,\s*".join(re.escape(v) for v in vnames))
+            def _spell(mm):
+                # C++ prefers a non-template overload on a match, and the
+                # consume idiom's base overloads exist precisely to
+                # terminate the recursion -- `int last(int)` beside the
+                # pack template. Spelling the template here recursed past
+                # the base and emitted a call to a nullary `last()` nothing
+                # defines. So a plain overload of this arity wins, and the
+                # call is left bare for C to resolve against it.
+                if len(vnames) in t.get("plain_arities", ()):
+                    return mm.group(0)
+                return "%s<%s>(%s)" % (mm.group(1), ", ".join(elems),
+                                       ", ".join(vnames))
+            one = call_re.sub(
+                lambda mm: _spell(mm) if mm.group(1) == t["name"]
+                else mm.group(0), one)
+    for pname, arg in zip(fixed, got):
+        one = re.sub(r"(?<![\w])%s(?![\w])" % re.escape(pname), arg, one)
+    return one
 
 
 def _monomorphise_function_templates(text, scan, path, _depth=0):
@@ -2638,7 +2917,28 @@ def _monomorphise_function_templates(text, scan, path, _depth=0):
     with one. A template whose parameters cannot be matched to an
     instantiation is reported rather than guessed at.
     """
+    # A `#define` body is not code. coost's `DEF_has_method(f)` macro holds
+    # a whole function template whose name pastes with `##f`, and the
+    # collector below read `##f(` as a template named `f` -- which then
+    # refused the author's own `int f()` as a bare call to it. Blanked in
+    # the scan only (length-preserving), exactly as the call passes do;
+    # the directives themselves still reach the output.
+    scan = _blank_directives(scan)
     tmpl = []
+    # Class bodies, so a member template can know what encloses it. A
+    # template whose *name* is its enclosing class is a constructor
+    # template -- coost's SFINAE `template<typename X, god::if_t<..> = 0>
+    # shared(const shared<X> &x)` -- and every `shared<T>` in the file
+    # names the class, not it. Matching those uses against it gave every
+    # one-argument use an arity error against a member nobody can spell.
+    class_spans = []
+    for cm in re.finditer(r"(?<![\w])(?:class|struct)\s+(\w+)[^{;]*\{",
+                          scan):
+        b_open = scan.index("{", cm.start())
+        b_close = _match_brace(scan, b_open)
+        if b_close is not None:
+            class_spans.append((cm.start(), b_close, cm.group(1)))
+
     for m in re.finditer(r"(?<![\w])template\s*<", scan):
         lt = m.end() - 1
         gt = _match(scan, lt, "<", ">")
@@ -2668,11 +2968,38 @@ def _monomorphise_function_templates(text, scan, path, _depth=0):
             k += 1
         if k >= len(scan):
             continue
-        nm = re.search(r"(\w+)\s*\(", scan[after:k + 1])
+        # `operator=` and friends: the `=` defeats a bare `\w+` name, and
+        # the search then fell through into the *body* and took the first
+        # word before a paren there -- coost's SFINAE `template<..>
+        # unique& operator=(unique<X>&& x)` was collected as a template
+        # named `if`, which then refused the author's own `if (...)`
+        # statements as bare calls to it. An operator member template is
+        # collected under its own spelling instead; uninstantiated, it is
+        # blanked like any other, which is what C++ does with one.
+        nm = re.search(r"((?:operator\s*[-+*/%^&|<>=!\[\]]+|\w+))\s*\(",
+                       scan[after:k + 1])
         if not nm:
             continue
-        params = [p.strip().split()[-1]
-                  for p in _split_top(scan[lt + 1:gt]) if p.strip()]
+        # `_split_targs`, not `_split_top`: a head parameter may itself be
+        # a template -- coost's SFINAE members write `template<typename X,
+        # god::if_t<a(), b(), int> = 0>` -- and the angle-blind split cut
+        # at the commas inside it, giving the class's own constructor
+        # template four "parameters" and every one-argument use an arity
+        # error against it.
+        raw_params = [p.strip() for p in _split_targs(scan[lt + 1:gt])
+                      if p.strip()]
+        # A trailing parameter pack -- `typename ...V`, however spaced.
+        # One pack, last, in a *function* template only: that is the shape
+        # coost's `make`, `print` and the recursive-consume idiom take.
+        # A pack anywhere else keeps the class-template refusal.
+        pack = None
+        if raw_params and "..." in raw_params[-1]:
+            pm = re.match(r"^(?:typename|class)\s*\.\.\.\s*(\w+)$",
+                          raw_params[-1])
+            if pm:
+                pack = pm.group(1)
+                raw_params = raw_params[:-1]
+        params = [p.split()[-1] for p in raw_params]
         # The function's own parameter list, kept so a call with no
         # explicit arguments can be matched against it below.
         sig_open = scan.index("(", after + nm.start())
@@ -2680,14 +3007,38 @@ def _monomorphise_function_templates(text, scan, path, _depth=0):
         fparams = ([q.strip() for q in
                     _split_top(scan[sig_open + 1:sig_close])]
                    if sig_close is not None else [])
+        encl = next((cn for a, b, cn in class_spans
+                     if a <= m.start() < b), None)
         tmpl.append({
-            "name": nm.group(1), "params": params,
+            "name": nm.group(1), "params": params, "pack": pack,
+            "ctor_of": encl if encl == nm.group(1) else None,
             "start": m.start(), "end": k + 1,
             "decl_only": body_open is None,
             "fparams": [q for q in fparams if q],
         })
     if not tmpl:
         return text, scan, []
+
+    # The arities of each name's *non-template* overloads, so a pack
+    # template's recursion can bottom out at one -- read off definitions
+    # and declarations outside every template span.
+    for t in tmpl:
+        if not t.get("pack"):
+            continue
+        arities = set()
+        for pm in re.finditer(r"(?<![\w<.>])%s\s*\(" % re.escape(t["name"]),
+                              scan):
+            if any(o["start"] <= pm.start() < o["end"] for o in tmpl):
+                continue
+            cl = _match_paren(scan, pm.end() - 1)
+            if cl is None:
+                continue
+            after = scan[cl + 1:cl + 3].lstrip()[:1]
+            if after not in ("{", ";"):
+                continue                 # a call, not a signature
+            ps = [q for q in _split_top(scan[pm.end():cl]) if q.strip()]
+            arities.add(len(ps))
+        t["plain_arities"] = arities
 
     # Deduction, before anything is substituted: a call that spelled no
     # template arguments is rewritten to spell them, and the whole pass
@@ -2703,29 +3054,101 @@ def _monomorphise_function_templates(text, scan, path, _depth=0):
         if spelled is not None:
             return _monomorphise_function_templates(
                 spelled, _strip_comments(spelled), path, _depth=1)
+        # The same trick for a call that spelled *some* of its arguments:
+        # rewrite it the long way and let the ordinary substitution run.
+        partial = _spell_partial_targs(text, scan, tmpl)
+        if partial is not None:
+            return _monomorphise_function_templates(
+                partial, _strip_comments(partial), path, _depth=1)
 
     # Which arguments each one is instantiated with. A member call is
     # `c.reg<int>(..)`, so a leading `.` cannot be excluded.
     out, last, names = [], 0, []
     for t in sorted(tmpl, key=lambda t: t["start"]):
         args = []
-        for u in re.finditer(
+        for u in ([] if t.get("ctor_of") else re.finditer(
                 r"(?<![\w])%s\s*<([^;{}()]*)>\s*\(" % re.escape(t["name"]),
-                scan):
-            if t["start"] <= u.start() < t["end"]:
-                continue                  # a recursive use inside the body
+                scan)):
+            if any(o["start"] <= u.start() < o["end"] for o in tmpl):
+                # Inside *some* template's body -- this one's (a recursive
+                # use) or a sibling overload's. Either way the call cannot
+                # be instantiated yet: its arguments may name the enclosing
+                # template's own parameters, as `align_up<A>((size_t)x)`
+                # does in coost's `god.h`. Substitution replaces `A` with
+                # the real argument when that enclosing template is
+                # instantiated, and the pass runs again over the copy.
+                #
+                # Keyed on every template rather than only `t` because
+                # function templates overload: `align_up` is three of them,
+                # so a call in one body is outside the range of the other
+                # two and was read as a call to them with too few
+                # arguments.
+                continue
+            # Only the overload this call actually selects. Without this
+            # every same-named template instantiated every call, and two
+            # of them lowered to one symbol.
+            siblings = [o for o in tmpl if o["name"] == t["name"]
+                        and not o.get("ctor_of")]
+            if len(siblings) > 1:
+                op_at = u.end() - 1
+                cl = _match_paren(scan, op_at)
+                cargs = ([a.strip()
+                          for a in _split_top(scan[op_at + 1:cl])]
+                         if cl is not None else [])
+                fits = [o for o in siblings
+                        if _template_fits_call(o, cargs, scan, u.start())]
+                if len(fits) == 1 and fits[0] is not t:
+                    continue
+                if len(fits) > 1 and t is not fits[0]:
+                    raise CppError(
+                        "%s:%d: `%s<%s>` matches %d overloads of `%s` that "
+                        "this pass cannot tell apart. It selects on argument "
+                        "count and on whether each argument is a pointer; "
+                        "these agree on both. Give the overloads different "
+                        "names."
+                        % (os.path.basename(path),
+                           _src_line(text, u.start()), t["name"],
+                           u.group(1).strip(), len(fits), t["name"]))
             got = [a.strip() for a in _split_top(u.group(1)) if a.strip()]
-            if len(got) != len(t["params"]):
+            # A pack absorbs everything after the fixed parameters, so its
+            # template takes *at least* that many rather than exactly.
+            bad = (len(got) < len(t["params"]) if t.get("pack")
+                   else len(got) != len(t["params"]))
+            if bad:
                 raise CppError(
                     "%s:%d: `%s<%s>` gives %d template argument%s to a "
-                    "template that takes %d. This pass substitutes them by "
-                    "position and has no defaults to fall back on."
+                    "template that takes %s%d. This pass substitutes them "
+                    "by position and has no defaults to fall back on."
                     % (os.path.basename(path),
                        _src_line(text, u.start()), t["name"],
                        u.group(1).strip(), len(got),
-                       "" if len(got) == 1 else "s", len(t["params"])))
+                       "" if len(got) == 1 else "s",
+                       "at least " if t.get("pack") else "",
+                       len(t["params"])))
             if got not in args:
                 args.append(got)
+        # Derived instantiations. A pack template's body calls itself with
+        # one fewer element -- `sum<A,B,C>` writes `sum<B, C>(__pk1, __pk2)`
+        # once substituted -- and that spelling exists only in the copy,
+        # which the scan above never sees. So each new instantiation's
+        # substituted body is scanned for further spelled calls to this
+        # same template, to a fixpoint. Bounded, because every derived call
+        # has strictly fewer template arguments than the one it came from.
+        if t.get("pack"):
+            probe_body0 = text[t["start"]:t["end"]]
+            probe_body0 = probe_body0[
+                _match(probe_body0, probe_body0.index("<"), "<", ">") + 1:]
+            queue = list(args)
+            while queue:
+                one = _substitute_template(t, queue.pop(), probe_body0)
+                for u2 in re.finditer(
+                        r"(?<![\w])%s\s*<([^;{}()]*)>\s*\("
+                        % re.escape(t["name"]), one):
+                    got2 = [a.strip() for a in _split_top(u2.group(1))
+                            if a.strip()]
+                    if len(got2) >= len(t["params"]) and got2 not in args:
+                        args.append(got2)
+                        queue.append(got2)
         body = text[t["start"]:t["end"]]
         # Drop the `template<..>` head; what is left is an ordinary
         # function once the parameters are gone.
@@ -2733,10 +3156,7 @@ def _monomorphise_function_templates(text, scan, path, _depth=0):
         body = body[head_gt + 1:]
         copies = []
         for got in args:
-            one = body
-            for pname, arg in zip(t["params"], got):
-                one = re.sub(r"(?<![\w])%s(?![\w])" % re.escape(pname),
-                             arg, one)
+            one = _substitute_template(t, got, body)
             # `typename X::y` is C++ telling the parser that `y` names a
             # type. With `X` known there is nothing left to tell it.
             one = re.sub(r"(?<![\w])typename\s+", "", one)
@@ -2770,7 +3190,7 @@ def _monomorphise_function_templates(text, scan, path, _depth=0):
             # the call would survive over a definition that just went away
             # and fail at link time naming a symbol the source never wrote.
             # Reported here, against the source, rather than there.
-            bare = _bare_call(t, scan)
+            bare = _bare_call(t, scan, tmpl)
             if bare is not None:
                 raise CppError(
                     "%s:%d: `%s` is a function template called with no "
@@ -3347,8 +3767,17 @@ def _sub_code(pattern, repl, text):
     so neither can contain a match. Both blanking passes preserve length, so
     the match offsets address `text`, which is what gets emitted -- the same
     `look`/`text` discipline `_rewrite_scopes` and `_rewrite_calls` use.
+
+    Directive lines are blanked too, continuations included, and for the
+    same reason: a `#define` body is not code this file evaluates. coost's
+    `DISALLOW_COPY_AND_ASSIGN(T)` macro spells `T(const T&) = delete;`
+    across continuation lines, and the reference-lowering rule matched into
+    it -- consuming the `#define` head and leaving the last continuation
+    orphaned in the output, where the delete handler then read it as a
+    statement. The directives themselves still reach the output untouched;
+    only the *matching* is blind to them.
     """
-    look = _blank_strings(_strip_comments(text))
+    look = _blank_directives(_blank_strings(_strip_comments(text)))
     out, pos = [], 0
     for m in pattern.finditer(look):
         out.append(text[pos:m.start()])
@@ -4351,16 +4780,34 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
                     _ext_ctor(base, known[base]),
                     (", " + bargs) if bargs else "")
             elif known[base]["ctor"]:
-                bar = _arity(bargs) if bargs is not None else 0
-                if bar not in known[base]["ctors"]:
+                # `: base(std::move(s))` in a move constructor -- the C++
+                # idiom for handing the base subobject to the base's own
+                # move constructor. Routed to the base's move symbol with
+                # the *source's* base subobject; the plain path below would
+                # count it as a one-argument constructor call and refuse.
+                mv = re.match(r"^__cpp_move\s*\(\s*(\w+)\s*\)$",
+                              (bargs or "").strip())
+                if mv is not None and known[base].get("move_fn"):
+                    pro += "%s(&this->_base, &%s->_base); " % (
+                        known[base]["move_fn"], mv.group(1))
+                    bargs = None
+                elif mv is not None:
                     raise CppError(
-                        "class %s: base `%s` has no constructor taking %d "
-                        "argument%s; pass them as `%s(..) : %s(..) { }`"
-                        % (cls.name, base, bar, "" if bar == 1 else "s",
-                           cls.name, base))
-                pro += "%s(&this->_base%s); " % (
-                    known[base]["ctors"][bar]["fn"],
-                    (", " + bargs) if bargs else "")
+                        "class %s: `: %s(std::move(%s))` asks for a move "
+                        "constructor `%s` does not declare."
+                        % (cls.name, base, mv.group(1), base))
+                else:
+                    bar = _arity(bargs) if bargs is not None else 0
+                    if bar not in known[base]["ctors"]:
+                        raise CppError(
+                            "class %s: base `%s` has no constructor taking "
+                            "%d argument%s; pass them as `%s(..) : %s(..) "
+                            "{ }`"
+                            % (cls.name, base, bar, "" if bar == 1 else "s",
+                               cls.name, base))
+                    pro += "%s(&this->_base%s); " % (
+                        known[base]["ctors"][bar]["fn"],
+                        (", " + bargs) if bargs else "")
             elif bargs is not None:
                 raise CppError("class %s: base `%s` has no constructor to "
                                "pass arguments to" % (cls.name, base))
@@ -4561,6 +5008,9 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             emit("void", "%s_move" % cname, params,
                  make_prologue(m) + sub(m.body or ""))
             info["move"] = True
+            # The symbol, for a *derived* class whose own move constructor
+            # writes `: base(std::move(s))` -- its prologue routes here.
+            info["move_fn"] = "%s_move" % cname
         elif m.kind == "ctor":
             ar = _arity(params)
             fn = _ctor_name(cname, ar, multi)
@@ -4571,6 +5021,19 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             info["ctor_refs"] = refs
             info["ctor"] = True
         elif m.kind == "index":
+            # A second `operator[]` lowers to the same `T__index` symbol
+            # and the C is invalid -- the same collision `operator=` is
+            # refused for. The usual pair is const/non-const with one body;
+            # this pass tracks no constness, so the two are the same
+            # function here and one of them says everything.
+            if info["index"] is not None:
+                raise CppError(
+                    "class %s: two `operator[]` overloads lower to one "
+                    "symbol (`%s__index`) and the second redefines the "
+                    "first. A const/non-const pair is the same function to "
+                    "this pass, which tracks no constness -- keep the "
+                    "non-const one."
+                    % (cls.name, cname))
             # The declared `T &` becomes `T *`, and every `v[i]` becomes
             # `*T_index(&v, i)`. Returning a reference is what makes
             # `v[i] = x` mean anything; a by-value return would assign to a
@@ -4626,6 +5089,21 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             # second would redefine the first. Which one a statement calls is
             # decided at the call site by whether `std::move` is written
             # there, since that is exactly what decides it in C++.
+            #
+            # `Base::operator=(std::move(s))` in the body -- the delegation
+            # idiom -- is refused rather than half-lowered: without this it
+            # reached the C compiler as a `::`-scoped call on a
+            # materialised temporary, wrong twice over (the base should
+            # receive the *source*, and nothing destroys the temporary).
+            # The base's fields being reachable (they must be, for the
+            # derived move *constructor* to mean anything) the member-wise
+            # steal says the same thing in the subset.
+            if re.search(r"::\s*operator\s*=\s*\(", m.body or ""):
+                raise CppError(
+                    "class %s: a base-scoped `operator=` call is not in the "
+                    "C++ subset. Write the move assignment member-wise -- "
+                    "steal the base's fields and null the source -- as the "
+                    "base's own move constructor does." % cls.name)
             emit("void", "%s__moveassign" % cname, params, sub(m.body or ""))
             info["moveassign"] = True
         elif m.kind == "assign":
@@ -5642,6 +6120,17 @@ def _materialise_moves(expr, scopes, type_info, mvn):
                 if close is not None:
                     inner = expr[om.end():close].strip()
                     found = _named_object(inner, scopes, type_info)
+                    if found is None and re.match(r"^\w+$", inner):
+                        # `std::move(s)` where `s` is a `T &&` parameter --
+                        # a pointer once lowered, and a bare pointer name
+                        # deliberately does not answer as an object. Under
+                        # a move it is exactly the object that is meant:
+                        # the C++ idiom for delegating a derived move to a
+                        # base writes `operator=(std::move(s))` with `s`
+                        # the rvalue-reference parameter. The dereference
+                        # names the pointee, and its address is `s` again.
+                        found = _named_object("*" + inner, scopes,
+                                              type_info)
                     if found is None:
                         raise CppError(
                             "`std::move(%s)`: the operand has to be an object "
@@ -7377,6 +7866,43 @@ def _is_copy_params(params, cname, raw_name, tsub, sub):
 _EXTERN_LINKAGE = re.compile(r'\bextern\s*"C(?:\+\+)?"\s*')
 
 
+def _strip_attribute_macros(text):
+    """Blank an export/visibility macro sitting between `class` and its name.
+
+    `class __coapi fastring : public fast::stream` is the ordinary way a
+    library marks a type for a shared build -- `__declspec(dllexport)`, or
+    `__attribute__((visibility("default")))`, or nothing at all, behind one
+    object-like macro. Every class scan here reads the name with
+    `(?:class|struct)\\s+(\\w+)`, so all of them collected the *macro* as the
+    class: coost's `fastring` was collected as `__coapi`, which is why its
+    members went missing and its constructors' initializer lists never
+    bound. Thirty declarations across fifteen of its headers take this
+    shape, and it is a common C++ idiom, so it is handled here rather than
+    in the fork.
+
+    Only a macro this translation unit actually `#define`s, and only one
+    whose body is empty or an attribute -- `__declspec(..)` or
+    `__attribute__((..))`. A second identifier that is not one of those is
+    left exactly where it is, since it is not something this can identify.
+    Blanked rather than removed, so every offset already taken stays valid.
+    """
+    macros = set()
+    for m in re.finditer(
+            r"^[ \t]*#[ \t]*define[ \t]+(\w+)[ \t]*([^\r\n\\]*)$",
+            text, re.M):
+        body = m.group(2).strip()
+        if body == "" or body.startswith(("__declspec", "__attribute__")):
+            macros.add(m.group(1))
+    if not macros:
+        return text
+    def _blank(mm):
+        if mm.group(2) not in macros:
+            return mm.group(0)
+        return mm.group(1) + " " * len(mm.group(2)) + mm.group(3)
+    return re.sub(
+        r"((?:class|struct)\s+)(\w+)(\s+\w+\s*(?=[:{]))", _blank, text)
+
+
 def _strip_extern_c(text):
     """Remove `extern "C"` / `extern "C++"` linkage specifications.
 
@@ -7888,7 +8414,15 @@ def _rewrite_calls_inner(text, cinfo, free_refs, free_rets, _pos):
     # As in `_rewrite_scopes`: match against comment-blanked text so a `.`
     # or a parenthesis inside prose cannot be read as code. Same length, so
     # the indices address `text`, which is what is emitted.
-    look = _strip_comments(text)
+    #
+    # Directive lines go the same way, continuations included. coost's
+    # `DISALLOW_COPY_AND_ASSIGN` macro body holds `void operator=(const T&)
+    # = delete` with no `;` -- the backslash carries the line on -- and the
+    # delete handler below read it as a *statement*, then ran past the
+    # continuation into the `#if` that follows, quoting a preprocessor line
+    # inside its own diagnostic. The same hazard the function-template
+    # collector already blanks for.
+    look = _blank_directives(_strip_comments(text))
 
     def lookup(scopes, name):
         for s in reversed(scopes):
@@ -10579,6 +11113,9 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     # every pass below, all of which read declarations that one would still
     # be hiding behind a string literal.
     text = _strip_extern_c(text)
+    # `class __coapi fastring : ..` -- an export macro between the keyword
+    # and the name, which every class scan below would read as the name.
+    text = _strip_attribute_macros(text)
     # `std::move` is read here, before `std::` is stripped, because after
     # that it is indistinguishable from a method or function the project
     # named `move` -- and a layout engine moving a box is not a rarity.
@@ -10699,7 +11236,10 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     # Checked here, before the no-class early return: `new int` is not a
     # class allocation at all, and a file with no classes can still contain
     # the keyword.
-    heap = _blank_strings(_strip_comments(text))
+    # Directives blanked for the same reason as everywhere else: coost's
+    # `DISALLOW_COPY_AND_ASSIGN` macro body says `= delete`, and this scan
+    # read it as heap use in a file with no classes and refused it.
+    heap = _blank_directives(_blank_strings(_strip_comments(text)))
     # Which class, at which argument count? An allocator is emitted per
     # constructor the source actually applies `new` to, so an unused arity
     # does not leave an unused function behind.

@@ -972,6 +972,277 @@ int f(void) {
 
 # ------------------------------------------------- argument deduction
 
+class TestPartialExplicitArguments(Base):
+    """`align_up<64>(x)` -- some arguments spelled, the rest deduced.
+
+    Explicit arguments bind to the *leading* parameters, so only the tail
+    is deduced -- from a function parameter written `P name` or `P *name`
+    against the argument in that position. The call is then rewritten the
+    long way and the ordinary substitution runs, the same one code path
+    the fully-bare deduction already takes.
+    """
+
+    def test_trailing_type_is_deduced_from_a_value(self):
+        self.assertLowers("""
+template<int A, typename X>
+X align_up(X x) { return (x + (A - 1)) & ~(A - 1); }
+int f(void) { int v = 123; return align_up<64>(v); }
+""", "align_up_64_int(v)", "align_up_64_int(int x)")
+
+    def test_an_untypeable_tail_keeps_the_arity_refusal(self):
+        """If any missing argument cannot be typed, the call is left
+        exactly as written and the arity check reports it as before."""
+        self.refuses("""
+template<int A, typename X>
+X align_up(X x) { return x; }
+int g(void);
+int f(void) { return align_up<64>(g()); }
+""", "template argument")
+
+
+class TestFunctionTemplateOverloads(Base):
+    """Function templates overload, and this pass keys them by name.
+
+    coost's `god.h` has four `align_up`. Every one of them used to see
+    every call: a call in one overload's body was read as a call to its
+    siblings with too few arguments, and two overloads instantiating the
+    same call lowered to one symbol, the second redefining the first.
+    """
+
+    def test_a_call_in_a_sibling_body_is_not_an_arity_error(self):
+        """`align_up<A>((size_t)x)` names the *enclosing* template's own
+        parameter; it cannot be instantiated until that template is."""
+        self.assertLowers("""
+template<int A, typename X>
+X align_up(X x) { return (x + (A - 1)) & ~(A - 1); }
+template<int A, typename X>
+X* align_up(X* x) { return (X*)align_up<A>((unsigned long)x); }
+int f(void) { int v = 4; return align_up<64>(v); }
+""", "align_up_64_int(int x)")
+
+    def test_value_and_pointer_overloads_do_not_collide(self):
+        """Selection is on argument count and pointer-ness -- the whole of
+        overload resolution these need. Without it both overloads emitted
+        `align_up_64_int` and the second redefined the first."""
+        out = self.lower("""
+template<int A, typename X>
+X align_up(X x) { return x; }
+template<int A, typename X>
+X* align_up(X* x) { return x; }
+int f(void) { int v = 4; int *p = &v;
+    int a = align_up<64>(v); int *b = align_up<64>(p);
+    return a + *b; }
+""")
+        self.assertEqual(out.count("int align_up_64_int(int x)"), 1)
+        self.assertEqual(out.count("int* align_up_64_int(int* x)"), 1)
+
+
+class TestParameterPacks(Base):
+    """A trailing type pack in a *free function* template.
+
+    Unrolled per instantiation: `sum<A,B,C>` becomes an ordinary function
+    whose body calls `sum<B, C>` -- a spelling that exists only in the
+    substituted copy, so a worklist scans each new copy for further calls,
+    to a fixpoint. Bounded, because every derived call has strictly fewer
+    template arguments than the one it came from. A class-template pack
+    (coost's `is_same` struct) stays refused.
+    """
+
+    def test_recursive_consume_unrolls_to_the_base_overload(self):
+        out = self.lower("""
+int sum() { return 0; }
+template<typename X, typename ...V>
+int sum(X x, V... v) { return x + sum(v...); }
+int f(void) { return sum<int, int, int>(1, 2, 3); }
+""")
+        # Three instantiations, each one element shorter, bottoming out at
+        # the plain nullary overload.
+        self.assertIn("sum_int_int_int(1, 2, 3)", out)
+        self.assertIn("sum_int_int(", out)
+        self.assertIn("+ sum()", out)
+
+    def test_forward_is_pass_through(self):
+        """Every element parameter is spelled concretely, so there is no
+        reference collapsing to preserve; `V&&` becomes by-value."""
+        out = self.lower("""
+void emit() { }
+template<typename X, typename ...V>
+void emit(X x, V&& ... v) { (void)x; emit(std::forward<V>(v)...); }
+int f(void) { emit<int, int>(1, 2); return 0; }
+""")
+        self.assertIn("emit_int_int(int x, int __pk1)", out)
+        self.assertIn("emit_int(__pk1)", out)
+        self.assertNotIn("&&", out.split("int f(void)")[0]
+                         .split("emit_int_int")[-1].split(")")[0])
+
+    def test_an_empty_pack_erases_its_comma(self):
+        """`f(x, v...)` with nothing in the pack is `f(x)` -- which is how
+        the recursion reaches a plain overload."""
+        out = self.lower("""
+int last(int x) { return x; }
+template<typename X, typename ...V>
+int last(X x, V... v) { (void)x; return last(v...); }
+int f(void) { return last<int, int>(1, 2); }
+""")
+        self.assertIn("return last(__pk1)", out)
+
+    def test_too_few_arguments_names_at_least(self):
+        self.refuses("""
+template<typename X, typename Y, typename ...V>
+int take(X x, Y y, V... v) { (void)x; (void)y; return 0; }
+int f(void) { return take<int>(1); }
+""", "at least 2")
+
+    def test_a_class_template_pack_is_still_refused(self):
+        self.refuses("""
+template<typename ...T>
+struct is_same { static const bool value = false; };
+int f(void) { return is_same<int, int>::value; }
+""", "parameter pack")
+
+
+class TestExportMacroClassName(Base):
+    """`class __coapi fastring : public fast::stream`.
+
+    An export/visibility macro between the keyword and the name is the
+    ordinary way a library marks a type for a shared build. Every class
+    scan reads the name as the first word after `class`, so all of them
+    collected the *macro*: coost's `fastring` was collected as `__coapi`,
+    its members went missing, and its constructors' initializer lists never
+    bound -- the failure surfaced far away, as a `std::move` operand that
+    could not be named in a scope that was empty because the class holding
+    it was never really there.
+    """
+
+    def test_the_class_is_collected_under_its_real_name(self):
+        self.assertLowers("""
+#define API
+
+class API point {
+public:
+    int x;
+    point() { x = 3; }
+    int get() { return x; }
+};
+int f(void) { point p; return p.get(); }
+""", "point_get", "point_new")
+
+    def test_an_attribute_bodied_macro_counts_too(self):
+        self.assertLowers("""
+#define API __attribute__((visibility("default")))
+
+class API point {
+public:
+    int x;
+    point() { x = 3; }
+    int get() { return x; }
+};
+int f(void) { point p; return p.get(); }
+""", "point_get")
+
+    def test_a_base_clause_still_binds(self):
+        """The shape that actually broke: with the name misread, a derived
+        class's base-init never bound."""
+        out = self.lower("""
+#define API
+
+class base {
+public:
+    int b;
+    base() { b = 1; }
+};
+class API derived : public base {
+public:
+    int d;
+    derived() : base() { d = 2; }
+};
+int f(void) { derived x; return x.d + x._base.b; }
+""")
+        self.assertIn("derived_new", out)
+        self.assertIn("base_new(&this->_base)", out)
+
+    def test_an_unknown_second_word_is_left_alone(self):
+        """Only a macro this unit defines, with an empty or attribute body.
+        Anything else is not something this can identify, so it stays
+        exactly where it was rather than being guessed at."""
+        out = self.lower("""
+class NotAMacro point {
+public:
+    int x;
+};
+int f(void) { point p; return p.x; }
+""")
+        self.assertIn("class NotAMacro point", out)
+
+
+class TestIndexOperatorCollision(Base):
+    """A const/non-const `operator[]` pair lowered to one `T__index` symbol
+    with no diagnostic -- invalid C where `operator=` in the same shape was
+    already refused. coost's `fast::stream` declares exactly this pair."""
+
+    def test_the_pair_is_refused_not_collided(self):
+        self.refuses("""
+class buf {
+public:
+    char _p[16];
+    char& operator[](unsigned long i) { return _p[i]; }
+    const char& operator[](unsigned long i) const { return _p[i]; }
+};
+int f(void) { buf b; b[0] = 'x'; return 0; }
+""", "two `operator[]` overloads", "keep the non-const one")
+
+    def test_one_operator_still_lowers(self):
+        self.assertLowers("""
+class buf {
+public:
+    char _p[16];
+    char& operator[](unsigned long i) { return _p[i]; }
+};
+int f(void) { buf b; b[0] = 'x'; return 0; }
+""", "buf__index")
+
+
+class TestMacroBodyTemplates(Base):
+    """A `#define` body is not code.
+
+    coost's `DEF_has_method(f)` macro holds a whole function template whose
+    name pastes with `##f`; the collector read `##f(` as a template named
+    `f` and then refused the author's own `int f()` as a bare call to it.
+    The monomorphiser's scan now goes through `_blank_directives`, which
+    existed for exactly this hazard but was never applied to this pass.
+    """
+
+    def test_a_template_inside_a_define_is_not_collected(self):
+        self.assertLowers("""
+#define DEF_thing(f) \\
+template<typename _T_> \\
+int has_##f() { return 0; }
+int f(void) { return 1; }
+""", "int f(void) { return 1; }")
+
+    def test_a_deleted_member_inside_a_define_is_not_a_declaration(self):
+        """coost's `DISALLOW_COPY_AND_ASSIGN(T)` spells `T(const T&) =
+        delete;` on a continuation line. `resolve_defaulted` matched it,
+        then cut "back to the start of the member" -- through the `#define`
+        head and twelve unrelated defines, to a typedef's semicolon
+        fourteen lines up. The orphaned last continuation then reached the
+        delete handler as a *statement*."""
+        out = self.lower("""
+typedef unsigned long long u64;
+
+#define MAX_U64 ((u64) ~((u64)0))
+
+#define DISALLOW_COPY(T) \\
+    T(const T&) = delete; \\
+    void operator=(const T&) = delete
+
+int f(void) { u64 x = MAX_U64; return (int)(x & 1); }
+""")
+        self.assertIn("#define DISALLOW_COPY(T)", out)
+        self.assertIn("#define MAX_U64", out)
+        self.assertIn("typedef unsigned long long u64;", out)
+
+
 class TestTemplateArgDeduction(Base):
     """`sort(v.begin(), v.end())` without spelling `<int>`.
 
