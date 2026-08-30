@@ -299,6 +299,7 @@ public:
 | copying a class with a destructor and no copy constructor | two owners, one resource — the Rule of Three, named in the message |
 | assigning to an owning object with no `operator=` | same, at assignment |
 | `a = b = c` | `operator=` is lowered to a `void` call, so there is no result |
+| two `operator=` overloads taking one argument each | both lower to `T__assign`, and overloads here resolve by argument *count* — the move overload escapes this only by having a symbol of its own (`T__moveassign`) |
 | copying from an expression this pass cannot name | guessing is the bug |
 
 A class with **no destructor** owns nothing, and copies bitwise exactly as
@@ -714,8 +715,8 @@ A subscript on a genuine pointer **field** is left as plain C indexing:
 
 ## Binary arithmetic operators
 
-`+ - * / % | & ^` lower to `T__binadd` and so on, in the one case that has
-an honest lowering: **a class that owns nothing**.
+`+ - * / % | & ^` lower to `T__binadd` and so on, for a class that owns
+nothing and, since a returned local is moved out, for one that owns.
 
 ```cpp
 class vec2 {
@@ -729,25 +730,93 @@ public:
 vec2 s = a + b + c;      ->   vec2__binadd_v(vec2__binadd(&a, &b), &c)
 ```
 
-The operator hands back a new object **by value**, and a by-value return of
-an owning class is not in this subset — the local is destroyed on the way out
-and the caller would receive a copy of a released object. So a class with a
-destructor is refused, and pointed at `operator+=`, which writes into an
-object that already exists.
+The operator hands back a new object **by value**. That used to refuse a
+class with a destructor outright, and the refusal was right at the time: a
+by-value return of an owning class was not in this subset at all. It is
+now — a returned bare local is *moved out*, left out of the drops on that
+path — so an owning class gets `operator+` on the same terms as any other
+method returning one:
+
+```cpp
+class buf {
+public:
+    char *p;
+    buf() { p = 0; }
+    ~buf() { free(p); }
+    buf operator+(const buf &o) { buf r; ..; return r; }
+};
+
+buf c = a + b;           ->   buf c = buf__binadd(&a, &b);
+```
+
+`r` is moved out of the operator, `c` receives it, and `c` is dropped once.
+The two spellings had drifted apart for no reason left standing: `buf
+plus(const buf &)` was emitted and `buf operator+(const buf &)` was refused
+with an identical body.
 
 A *run* of them chains, through a variant taking its left operand by value:
 C cannot take the address of a function result, so the result of the first
-call is passed straight into the second as a value. That is sound only
-because the class owns nothing, so the by-value parameter is a struct copy
-with nothing to construct or destroy.
+call is passed straight into the second as a value. That variant is emitted
+only for a class that **owns nothing**, where the by-value parameter is a
+struct copy with nothing to construct or destroy. An owning class has no
+front door, so a chain over one is refused and a single application is not.
+
+A **literal** operand is materialised, on either side:
+
+```cpp
+std::string m1 = "Resource not found: " + uri;
+std::string m2 = uri + " was not found";
+```
+
+C++ builds a temporary through the one-argument constructor and passes
+that; written out, that is exactly what this lowers to — the temporary is
+constructed, the operator runs on it, and it is destroyed before the
+statement ends. The same shape a converting assignment (`str = name;`)
+already took, so it is the pass's existing behaviour rather than a new
+liberty.
+
+That is also what makes `"lit" + s` work at all. In C++ that one is a
+*free* `operator+`, which this subset has no notion of, since an overloaded
+operator is lowered as a member and a literal has nothing to be a member
+of. With the literal materialised, the member operator on the temporary
+means the same thing.
 
 **Refused, rather than mistranslated:**
 
 * **Mixed precedence.** `a + b * c` would chain left to right into
   `(a + b) * c` — the wrong grouping, and silently wrong arithmetic. Assign
   the tighter-binding part to a temporary. Parentheses do not help.
-* **An operand that is not a plain name.** Operands are passed by address,
-  and there is none to take of a parenthesised expression or a call result.
+* **An operand that is an expression.** Operands are passed by address, and
+  there is none to take of a parenthesised expression or a call result.
+  Only a literal is materialised: an expression could be an object of the
+  class this pass simply failed to name, and building a temporary from one
+  would silently make the wrong thing. `a + b.substr(0, 1)` is this shape;
+  assign it to a local first.
+
+Each of these names the operator and the fix rather than the declaration
+that happened to contain it — the generic "right-hand side is neither an
+object of that type nor a call returning one" was true of all of them and
+useful for none.
+
+**Argument position.** A reference parameter is lowered to a pointer, so
+an argument bound to one has to be something with an address — a name, a
+member, or a subscript. `sink(a + b)` is not: an operator's result lives
+nowhere, and neither does a call's, so `sink(&a + b)` and
+`sink(&string_substr(&b, 0, 1))` were emitted and the C front end
+complained about the generated struct rather than the argument written.
+Both are now reported against the argument, naming what has no address.
+Assign to a local and pass that.
+
+A **by-value** parameter has no such limit: nothing needs an address, so
+`sink(a + b)` with `void sink(string)` lowers to
+`sink(string__binadd(&a, &b))` like any other use.
+
+The check names only the shapes it is sure of, because a false refusal
+here fails every caller of the function. Two shapes it must *not* touch,
+both found against real litehtml: a member chain, where the `-` of `->` is
+not an operator; and a prototype's parameter list, which is not an argument
+list at all — a parameter carrying a default argument is what stopped it
+parsing as parameters.
 
 `operator*` is told apart from the dereference by whether it takes an
 operand, which is the only difference between them on the page.
@@ -935,7 +1004,7 @@ one this file declares, so its qualifier is simply removed.
 
 | Type | For | Elements |
 |---|---|---|
-| `string` | text | `size` `empty` `at` `[]` `c_str` `assign` `append` `push_back` `clear` `reserve` `equals` `compare` `substr` `find` `rfind` `erase` |
+| `string` | text | `size` `empty` `at` `[]` `c_str` `assign` `append` `push_back` `clear` `reserve` `equals` `compare` `substr` `find` `rfind` `erase` `+` `+=` |
 | | substrings | `find_str` `find_str_from` `rfind_str` `contains` `starts_with` `ends_with` |
 | `vector<T>` | scalars, pointers, plain data | `size` `empty` `get` `set` `ptr` `[]` `push_back` `pop_back` `clear` `reserve` `insert` `erase` `begin` `end` |
 | `ownvector<T>` | classes that own something | same, minus `get`/`set` |
@@ -1695,16 +1764,29 @@ use of one is a member access and the symbol table already turns `o.x` into
 
 Reported rather than mistranslated: virtual inheritance (refused as a
 design position, not a gap — see [CPPRPY.md](CPPRPY.md) §3), a conversion
-operator, the stream operators, and the rest of the STL. Several entries
-that used to sit in this list have moved out of it: exceptions became the
-checked `except` model above (`throw`/`catch` themselves stay refused,
-with the replacement named in the diagnostic); `dynamic_cast` and
-`typeid` work under `--rtti`; and tier-1 multiple inheritance — one
-layout base plus interface bases — is in, verified against `g++`.
+operator, the stream operators, `std::function`, and the rest of the STL.
+Several entries that used to sit in this list have moved out of it:
+exceptions became the checked `except` model above (`throw`/`catch`
+themselves stay refused, with the replacement named in the diagnostic);
+`dynamic_cast` and `typeid` work under `--rtti`; and tier-1 multiple
+inheritance — one layout base plus interface bases — is in, verified
+against `g++`.
+
+`std::function` is refused where it is **stored** — a field, or a template
+argument such as `map<int, function<void(int)>>`. It holds a callable, and
+the callable this subset can build is a capturing lambda, which is inlined
+at its call sites and so has no value to store; the diagnostic names a
+function pointer with the captured state passed beside it. Taken **by
+reference** it is a borrow rather than a store and passes through, which is
+what keeps a signature like litehtml's `split_text(.., const
+std::function<void(const tchar_t *)> &on_word, ..)` from refusing every
+file that includes its header.
 
 Operator overloading is **partly** in: `=`, the compound assignments, the
-comparisons, `[]`, `->`, `*`, and the binary arithmetic operators (see
-above). What is out is everything else, including `<<` and `>>`.
+comparisons, `[]`, `->`, `*`, and the binary arithmetic operators — the
+last of which now cover a class that **owns** something, not only one that
+owns nothing (see above). What is out is everything else, including `<<`
+and `>>`.
 
 Two shapes are worth calling out because they are legal C++ that this subset
 cannot express, rather than features not yet written:

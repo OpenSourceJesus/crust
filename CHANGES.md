@@ -1,3 +1,133 @@
+# cpprust: binary operators on owning classes, and four silent miscompiles
+
+Six changes to `tools/cpprust.py`, found by translating a real codebase
+(cpp-mcp) and pinned against litehtml. Four of them turn C that does not
+mean anything into a diagnostic; two widen what translates.
+
+## A type-level `(` is not a parameter list
+
+`map<int, pair<string, function<void(const string &)>>> subs` was read as a
+*method* whose return type was everything up to that paren, and the parse
+then failed against its own trailing `>>> subs` -- naming neither the field
+nor the real limit. Four places located a member's parameter list with a
+bare `find("(")`; they now use `_decl_paren`, which counts `<>` and `[]`
+nesting and steps over `operator<`, `<<` and `<=` first. An unbalanced `<`
+falls back to the plain scan, so nothing that parsed before stops.
+
+## `std::function` is refused by name
+
+An unknown template passes through untouched on purpose, so the field above
+reached the C front end spelled `function<void(const string &)>`. It is now
+named, with a function pointer and a context parameter as the replacement.
+
+Refused only where it is **stored** -- a field, or a template argument.
+Taken by reference it is a borrow and passes through, which is what keeps
+litehtml's `split_text(.., const std::function<..> &on_word, ..)` from
+refusing every file that includes `html.h`. The first version of this check
+was not so careful and cost 38 of 43 files.
+
+## Default arguments on a declared-only member
+
+A member *defined* in the file loses its defaults on the way to its
+definition; one only **declared** here did not, so litehtml's `css_length.h`
+emitted `void fromString(.., const string *predefs = _t(""), int defValue =
+0);` -- and C has no default arguments. 70 instances across the tree, in a
+header most of it includes. `_strip_default_args` cuts at the first `=`
+that is not part of `==`, `<=`, `>=` or `!=`.
+
+## Two `operator=` overloads collided
+
+`litehtml::border` declares assignment from `border` and from `css_border`.
+Both lowered to `border__assign` and the second redefined the first.
+Ordinary methods already refuse this -- overloads resolve by argument
+*count* -- and the move overload escapes it only by having a symbol of its
+own. `operator=` skipped the check; it no longer does.
+
+## Binary operators on a class that owns something
+
+`operator+` was refused for a class with a destructor, on the grounds that a
+by-value return of an owning class was not in the subset. It has not been
+for some time: a returned bare local is moved out. The two spellings had
+drifted apart for no reason left standing -- `buf plus(const buf &)` was
+emitted and `buf operator+(const buf &)` refused with an identical body.
+
+What is still owning-specific is the *chain*: `a + b + c` passes the first
+result into the second by value, which for an owning class would make a
+second owner. The by-value front door is therefore emitted only for a class
+that owns nothing, and a chain over one is refused with its own diagnostic.
+
+`string` gains `+` and `+=` on the back of this -- written in the subset,
+like the rest of the supplied `std`. Verified under ASan and LSan: correct
+output, no leaks, no double free.
+
+A **literal** operand is materialised on either side, through the
+one-argument constructor, which is what C++ does and what a converting
+assignment already did here. That is also what makes `"lit" + s` work: in
+C++ that is a *free* `operator+`, which this subset has no notion of, but
+the member operator on the materialised temporary means the same thing. An
+arbitrary expression is not materialised -- it could be an object of the
+class this pass failed to name.
+
+## An argument to a reference parameter needs an address
+
+`fix_args` put an `&` on whatever was there, so `sink(a + b)` came out as
+`sink(&a + b)` and `sink(b.substr(0,1))` as `sink(&string_substr(&b,0,1))`.
+`_unaddressable_arg` names only the shapes it is sure of -- a literal, a
+call result, a top-level operator result -- and leaves anything it cannot
+classify exactly as before, because a false refusal here fails every caller.
+
+Two false positives were caught against real litehtml and are pinned as
+tests: a member chain, where the `-` of `->` is not an operator; and a
+prototype's parameter list, which is not an argument list at all -- a
+parameter carrying a default argument is what stopped it parsing as one.
+
+A by-value parameter is unaffected: nothing needs an address, so
+`sink(a + b)` with `void sink(string)` lowers like any other use.
+
+## Files
+
+* `tools/cpprust.py` -- the six changes above.
+* `tests/test_cpprust.py` -- 22 tests: the refusals, the features, and both
+  false-positive shapes.
+* `tools/test_cpprust_extras.py` -- the owning-`operator+` guardrail
+  repinned. It asserted the refusal that is now a feature; it now pins the
+  single application working and the chain still refused.
+* `CPPRUST.md` -- binary operators, `std::function`, the `operator=`
+  collision, and the reference-argument rule.
+
+## Verification
+
+`tests/test_cpprust.py` 401 tests, `tools/test_cpprust_extras.py` 143,
+`tools/test_std_move_lowering.py` 41. The two failures in the first are
+present on unmodified `master` -- failure sets diffed before and after and
+are identical.
+
+`tools/litehtml_test.py`: baseline `0/43 ok, 1 translate-fail, 42
+gcc-fail`; after the first four changes `0/43 ok, 38 translate-fail, 5
+gcc-fail`. **The passing count did not move.** What moved is the failure
+mode: the 70 default-argument errors are gone, and the `operator=`
+collision that was a gcc `conflicting types` error is now a refusal, which
+is why translate-fail rose. Honest diagnostics rather than invalid C, not
+more files translating. The last two changes have not been run against it.
+
+## Known, not fixed
+
+A binary operator in a **constructor initializer list** is not checked at
+all: `Base_new(&this->_base, "file://" + p)` is emitted with no diagnostic.
+Same family as the argument-position bug above, different code path.
+
+A reference parameter with a **default argument** in a free-function
+declaration is mangled by the `T &r = e;` lowering, which reads it as a
+reference declaration with an initialiser and swallows the following
+parameter: `const string *delims = &("", int keep = 0)`. Identical on
+`master`. Third bug in the default-argument family, which suggests one
+deliberate pass rather than another point fix.
+
+A **literal argument to a reference parameter** is now refused rather than
+mangled, but C++ materialises a temporary there and this could too -- the
+same mechanism the binary operators just got. It is the commonest shape in
+ordinary C++ and the next thing worth building.
+
 # cpprust: translating litehtml to C, in seconds rather than minutes
 
 Fixes brentharts/crust#6. `tools/cpprust.py` hung on
