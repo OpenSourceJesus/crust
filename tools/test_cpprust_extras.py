@@ -1311,6 +1311,25 @@ int has_##f() { return 0; }
 int f(void) { return 1; }
 """, "int f(void) { return 1; }")
 
+    def test_a_class_inside_a_define_is_not_collected(self):
+        """coost's `DEF_has_method(f)` macro holds a whole class, nested
+        struct and all. The class collector read them as real classes and
+        the emitter rewrote *inside the macro*, breaking its backslash
+        continuation chain -- so the tail stopped being a `#define` body
+        and reached the C front end as code."""
+        out = self.lower("""
+#define DEF_has(f) \\
+struct _has_##f { \\
+    struct _R_ { int _[2]; }; \\
+    int value; \\
+}
+
+struct point { int x; };
+int f(void) { struct point p; p.x = 1; return p.x; }
+""")
+        self.assertIn("#define DEF_has(f)", out)
+        self.assertIn("struct _R_ { int _[2]; }; \\", out)
+
     def test_a_deleted_member_inside_a_define_is_not_a_declaration(self):
         """coost's `DISALLOW_COPY_AND_ASSIGN(T)` spells `T(const T&) =
         delete;` on a continuation line. `resolve_defaulted` matched it,

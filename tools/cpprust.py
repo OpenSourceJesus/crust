@@ -11264,6 +11264,13 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     # flattening turned that into `::this->co_free(p)`: invalid C, and the
     # wrong function. The lookbehind keeps `a::b` intact.
     text = re.sub(r"(?<![\w:])::(?=\w)", "", text)
+    # `constexpr` asks for compile-time evaluation; C has no such keyword
+    # and the lowering emits an ordinary definition either way. Dropped at
+    # file scope as well as on members -- coost's `mem.h` writes
+    # `constexpr size_t co_cache_line_size = ..` outside any class, which
+    # the member-level strip never saw and which reached the C front end
+    # verbatim.
+    text = re.sub(r"(?<![\w])constexpr(?![\w])\s*", "", text)
     # `std::move` is read here, before `std::` is stripped, because after
     # that it is indistinguishable from a method or function the project
     # named `move` -- and a layout engine moving a box is not a rarity.
@@ -11359,7 +11366,14 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     text, _exc_used = _lower_except(text, path)
     if _exc_used:
         text = _EXC_PRELUDE + text
-    scan = _strip_comments(text)
+    # Directives blanked before any class is looked for. coost's
+    # `DEF_has_method(f)` macro body holds `struct _has_method_##f { struct
+    # _R_ { .. }; .. }`, and the class collector read those as real classes:
+    # the emitter then rewrote inside the macro, breaking its backslash
+    # continuation chain so the tail stopped being a `#define` body and
+    # reached the C front end as code. The directives themselves still pass
+    # through untouched; only the *finding* is blind to them.
+    scan = _blank_directives(_strip_comments(text))
     _check_unsupported(scan, path, rtti=rtti)
 
     # Out-of-line member definitions come out first, keyed by class. They
@@ -11772,6 +11786,14 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
         # Same reasoning for `offsetof`, which an interface thunk uses to
         # step from a secondary base's vptr back to the whole object.
         if "offsetof" in head or any("offsetof" in p for p in pieces):
+            head = "#include <stddef.h>\n" + head
+        # And for `size_t`, which is the commonest of the three: coost's
+        # allocators take one in every method, so every hoisted prototype
+        # named a type the C had not been told about yet -- the `#include
+        # <stddef.h>` that would have was several lines *below* them.
+        # stddef.h is idempotent, so carrying one along is safe even when
+        # the source already has it.
+        elif re.search(r"(?<![\w])(?:size_t|ptrdiff_t)(?![\w])", head):
             head = "#include <stddef.h>\n" + head
         pieces.insert(0, head)
     out = "".join(pieces)
