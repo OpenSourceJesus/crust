@@ -2662,6 +2662,23 @@ def _value_type_of(expr, scan, at):
     return None
 
 
+#: A recursive template's instantiation chain is bounded here. Deep enough
+#: for the metaprogramming this subset sees (coost's deepest is 8), low
+#: enough that a runaway is reported in well under a second.
+_MAX_INSTANTIATIONS = 256
+
+
+def _recurses(t, text):
+    """Does this template's own body name itself with explicit arguments?
+
+    Only such a template needs the worklist below, and checking first keeps
+    it off the ordinary one-shot instantiation path entirely.
+    """
+    body = text[t["start"]:t["end"]]
+    return re.search(r"(?<![\w])%s\s*<" % re.escape(t["name"]),
+                     body[body.index("(") if "(" in body else 0:]) is not None
+
+
 def _eval_int_targ(arg):
     """`4 - 1` -> `3` for a non-type template argument, else unchanged.
 
@@ -3130,8 +3147,21 @@ def _monomorphise_function_templates(text, scan, path, _depth=0):
     out, last, names = [], 0, []
     for t in sorted(tmpl, key=lambda t: t["start"]):
         if t.get("spec_args") is not None:
-            # Emitted below with the mangled name the general template's
-            # instantiations use, so a call reaches it by the same symbol.
+            # An explicit specialisation is already a definition. Drop the
+            # empty `template<>` head -- C has nothing to do with it, and
+            # left in place it reached the C front end verbatim -- and give
+            # it the mangled name the general template's instantiations
+            # use, so a call reaches it by the same symbol.
+            spec = text[t["start"]:t["end"]]
+            spec = spec[_match(spec, spec.index("<"), "<", ">") + 1:]
+            suffix = "_".join(_mangle_targ(a) for a in t["spec_args"])
+            spec = re.sub(
+                r"(?<![\w])%s\s*<[^<>()]*>\s*(?=\()" % re.escape(t["name"]),
+                "%s_%s" % (t["name"], suffix), spec, count=1)
+            out.append(text[last:t["start"]])
+            out.append(spec)
+            last = t["end"]
+            names.append("%s_%s" % (t["name"], suffix))
             continue
         args = []
         for u in ([] if t.get("ctor_of") else re.finditer(
@@ -3205,7 +3235,11 @@ def _monomorphise_function_templates(text, scan, path, _depth=0):
         # substituted body is scanned for further spelled calls to this
         # same template, to a fixpoint. Bounded, because every derived call
         # has strictly fewer template arguments than the one it came from.
-        if t.get("pack"):
+        # Runs for a *recursive* template of any kind, not only a pack one:
+        # `sum_to<4>`'s substituted body calls `sum_to<3>`, a spelling that
+        # exists only in the copy, so without this the chain stopped after
+        # one instantiation and the middle ones were never emitted.
+        if args and (t.get("pack") or _recurses(t, text)):
             probe_body0 = text[t["start"]:t["end"]]
             probe_body0 = probe_body0[
                 _match(probe_body0, probe_body0.index("<"), "<", ">") + 1:]
@@ -3215,11 +3249,31 @@ def _monomorphise_function_templates(text, scan, path, _depth=0):
                 for u2 in re.finditer(
                         r"(?<![\w])%s\s*<([^;{}()]*)>\s*\("
                         % re.escape(t["name"]), one):
-                    got2 = [a.strip() for a in _split_top(u2.group(1))
-                            if a.strip()]
+                    # Evaluated, not taken literally: `sum_to<4 - 1>` and
+                    # `sum_to<3>` are the same instantiation. Without this
+                    # each round produced a longer spelling -- `4 - 1 - 1`,
+                    # then `4 - 1 - 1 - 1` -- that never matched anything
+                    # already seen, and the loop did not terminate.
+                    got2 = [_eval_int_targ(a.strip())
+                            for a in _split_top(u2.group(1)) if a.strip()]
                     if got2 in specialised.get(t["name"], []):
                         continue
-                    if len(got2) >= len(t["params"]) and got2 not in args:
+                    fits = (len(got2) >= len(t["params"]) if t.get("pack")
+                            else len(got2) == len(t["params"]))
+                    if fits and got2 not in args:
+                        if len(args) >= _MAX_INSTANTIATIONS:
+                            # A pack shrinks by one element each round, but
+                            # arbitrary argument arithmetic need not shrink
+                            # at all -- a recursion whose base case is
+                            # never reached would otherwise spin here.
+                            raise CppError(
+                                "%s: `%s` instantiated more than %d times "
+                                "and kept going. A recursive template needs "
+                                "a base case this pass can reach -- an "
+                                "explicit specialisation, or an argument "
+                                "that shrinks to one."
+                                % (os.path.basename(path), t["name"],
+                                   _MAX_INSTANTIATIONS))
                         args.append(got2)
                         queue.append(got2)
         body = text[t["start"]:t["end"]]

@@ -1101,6 +1101,59 @@ int f(void) { return is_same<int, int>::value; }
 """, "parameter pack")
 
 
+class TestRecursiveNonTypeTemplates(Base):
+    """`copy<N>` calling `copy<N - 1>`, terminated by `copy<0>`.
+
+    Three pieces have to agree: the argument arithmetic is evaluated, so
+    `copy<4 - 1>` and `copy<3>` are one instantiation; the explicit
+    specialisation is collected and emitted under the mangled name the
+    general template's instantiations use; and the general template is not
+    instantiated for the arguments the specialisation defines, which is
+    what stops the recursion.
+    """
+
+    def test_the_whole_chain_is_emitted(self):
+        out = self.lower("""
+template<int N>
+int sum_to() { return N + sum_to<N - 1>(); }
+template<>
+int sum_to<0>() { return 0; }
+int f(void) { return sum_to<4>(); }
+""")
+        for n in ("sum_to_4", "sum_to_3", "sum_to_2", "sum_to_1", "sum_to_0"):
+            self.assertIn(n, out)
+        # The specialisation defines `sum_to_0`; the general template must
+        # not also emit one, or the second redefines the first.
+        self.assertEqual(out.count("int sum_to_0()"), 1)
+        self.assertNotIn("template<>", out)
+        self.assertNotIn("sum_to_-1", out)
+
+    def test_arithmetic_arguments_are_one_instantiation(self):
+        out = self.lower("""
+template<int N>
+int val() { return N; }
+int f(void) { return val<2 + 1>() + val<3>(); }
+""")
+        self.assertIn("val_3", out)
+        self.assertEqual(out.count("int val_3()"), 1)
+
+    def test_a_name_in_the_argument_is_left_alone(self):
+        """Only literal arithmetic is evaluated; a name could be a type."""
+        out = self.lower("""
+template<typename T>
+T pick(T a) { return a; }
+int f(void) { int x = 1; return pick<int>(x); }
+""")
+        self.assertIn("pick_int", out)
+
+    def test_a_recursion_with_no_reachable_base_is_reported(self):
+        self.refuses("""
+template<int N>
+int bad() { return bad<N + 1>(); }
+int f(void) { return bad<1>(); }
+""", "instantiated more than", "base case")
+
+
 class TestConstexprConstructor(Base):
     """`constexpr fastring() noexcept : fast::stream() {}`.
 
