@@ -1228,9 +1228,27 @@ def _flatten_pattern(names):
 
 
 def _sub_flattened(body, body_scan, pat, ns):
-    """Rewrite every name `pat` finds to `ns_name`, guided by the copy."""
+    """Rewrite every name `pat` finds to `ns_name`, guided by the copy.
+
+    A name written `::name` is qualified with *global* scope and is not the
+    namespace's at all -- coost's allocator calls `::free(p)` to reach the
+    C library from a class that has its own `free`. Flattening rewrote that
+    to `::this->co_free(p)`, which is both invalid C and the wrong
+    function. The `::` is dropped on the way out, since C has only the one
+    scope for it to mean.
+    """
     out, last = [], 0
     for m in pat.finditer(body_scan):
+        before = body_scan[:m.start()].rstrip()
+        if before.endswith("::"):
+            # Leading `::`: global scope. Keep the name, drop the marker --
+            # and take the text back to just before it, so the `::` does
+            # not survive into the output.
+            cut = m.start() - (len(body_scan[:m.start()]) - len(before))
+            out.append(body[last:cut - 2])
+            out.append(body[cut:m.end()])
+            last = m.end()
+            continue
         out.append(body[last:m.start()])
         out.append("%s_%s" % (ns, m.group(1)))
         last = m.end()

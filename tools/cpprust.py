@@ -1711,6 +1711,15 @@ def _split_members(body, cname, line0, path="<cpp>"):
         # `final` says a class may not be derived from, and nothing here
         # derives from anything it is not told about.
         head = re.sub(r"(?<![\w])final(?![\w])\s*", "", head)
+        # `constexpr` asks for compile-time evaluation where the arguments
+        # allow it; the lowering emits an ordinary function either way, and
+        # the C front end is free to fold it. Dropped here, beside the
+        # other specifiers, because a *constructor* is recognised by its
+        # signature being exactly the class name -- so `constexpr
+        # fastring()` was not recognised as one at all, and coost's
+        # `fast::stream` appeared to have no default constructor for its
+        # derived classes to call.
+        head = re.sub(r"(?<![\w])constexpr(?![\w])\s*", "", head)
         # An anonymous `union { .. };` (or `struct { .. };`) member. C has
         # them and ShivyCX lowers them, so this is a matter of carrying the
         # group through and registering the names inside it -- a body writing
@@ -5197,6 +5206,19 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
         elif m.kind == "augassign":
             op = m.name[len("operator"):-1]
             fn = "%s__aug%s" % (cname, _AUG_NAMES[op])
+            # Same collision `operator=` is refused for, and it had no
+            # check here: coost's `fastring` declares `operator+=` for
+            # `fastring`, `std::string`, `const char*` and `char`, and all
+            # four lowered to one `fastring__augadd`. The header translated
+            # without complaint and the emitted C would not compile, which
+            # is the one outcome this pass exists to prevent.
+            if op in info["augassign"]:
+                raise CppError(
+                    "class %s: two `operator%s=` overloads take 1 argument. "
+                    "Overloads are resolved by argument count here, so both "
+                    "lower to `%s` and the second would redefine the first. "
+                    "Give one of them a name and call it directly."
+                    % (cls.name, op, fn))
             # The operand's own class, which need not be the class the
             # operator belongs to: litehtml's `position` takes `margins` in
             # `operator+=`. Reading it off the declaration keeps the operand
@@ -11116,6 +11138,13 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     # `class __coapi fastring : ..` -- an export macro between the keyword
     # and the name, which every class scan below would read as the name.
     text = _strip_attribute_macros(text)
+    # A leading `::` qualifies a name with *global* scope. C has only the
+    # one scope, so the marker is dropped -- but it has to go before any
+    # pass reads names, because coost's allocator reaches the C library
+    # with `::free(p)` from a class that has its own `free`, and namespace
+    # flattening turned that into `::this->co_free(p)`: invalid C, and the
+    # wrong function. The lookbehind keeps `a::b` intact.
+    text = re.sub(r"(?<![\w:])::(?=\w)", "", text)
     # `std::move` is read here, before `std::` is stripped, because after
     # that it is indistinguishable from a method or function the project
     # named `move` -- and a layout engine moving a box is not a rarity.

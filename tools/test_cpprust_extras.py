@@ -1101,6 +1101,44 @@ int f(void) { return is_same<int, int>::value; }
 """, "parameter pack")
 
 
+class TestConstexprConstructor(Base):
+    """`constexpr fastring() noexcept : fast::stream() {}`.
+
+    A constructor is recognised by its signature being exactly the class
+    name, and `constexpr` sat in front of it -- so it was not recognised as
+    a constructor at all. coost's `fast::stream` then appeared to have no
+    default constructor, and every derived class's `: fast::stream()` was
+    refused. Dropped beside `explicit` and `final`: the lowering emits an
+    ordinary function either way.
+    """
+
+    def test_a_constexpr_default_constructor_is_a_constructor(self):
+        self.assertLowers("""
+class base {
+public:
+    int a;
+    constexpr base() noexcept : a(0) { }
+};
+class derived : public base {
+public:
+    constexpr derived() noexcept : base() { }
+};
+int f(void) { derived d; return d._base.a; }
+""", "base_new(&this->_base)")
+
+    def test_constexpr_does_not_reach_the_output(self):
+        out = self.lower("""
+class point {
+public:
+    int x;
+    constexpr point() noexcept : x(1) { }
+    constexpr int get() const { return x; }
+};
+int f(void) { point p; return p.get(); }
+""")
+        self.assertNotIn("constexpr", out)
+
+
 class TestExportMacroClassName(Base):
     """`class __coapi fastring : public fast::stream`.
 
