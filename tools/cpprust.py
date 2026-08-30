@@ -1163,7 +1163,59 @@ def _blank_strings(text):
     return "".join(out)
 
 
+_STD_FUNCTION = re.compile(r"\bfunction\s*<")
+
+
+def _skip_angles(text, open_idx):
+    """Index just past the `>` matching the `<` at `open_idx`, or None."""
+    depth = 0
+    for k in range(open_idx, len(text)):
+        if text[k] == "<":
+            depth += 1
+        elif text[k] == ">":
+            depth -= 1
+            if depth == 0:
+                return k + 1
+    return None
+
+
+def _check_std_function(scan, path):
+    """`std::function<..>` is not one of the supplied templates.
+
+    Reported by name rather than left to fall through. An unknown template
+    is passed to the C front end untouched on purpose -- it may be declared
+    somewhere this pass cannot see -- but `function` is a name the author
+    has every reason to expect works, and letting it through emits
+    `function<void(const string &)>` into C, which means nothing there.
+
+    It is also not a gap that closes by adding a template. A `function`
+    holds a *callable*, and the callable this subset can build is a
+    capturing lambda, which is inlined at its call sites and so has no
+    value to store -- the same wall the lambda diagnostic names. So the
+    replacement is a plain function pointer, with any captured state passed
+    beside it.
+    """
+    for m in _STD_FUNCTION.finditer(scan):
+        # A `function` taken *by reference* is a borrow, not a store: it
+        # lowers to the pointer the caller already has, and the callable it
+        # refers to was built somewhere this declaration does not have to
+        # name. litehtml's `html.h` passes two of them to `split_text`, in a
+        # header every file includes -- so refusing the borrow refused
+        # forty-three files over a shape that is not the problem.
+        end = _skip_angles(scan, m.end() - 1)
+        if end is not None and scan[end:end + 2].lstrip().startswith("&"):
+            continue
+        raise CppError(
+            "%s:%d: `std::function` is not in the C++ subset: it stores a "
+            "callable, and a capturing lambda is inlined at its call sites, "
+            "so there is nothing to store. Use a function pointer "
+            "(`void (*f)(const string *)`), passing any captured state as a "
+            "parameter beside it."
+            % (os.path.basename(path), _src_line(scan, m.start())))
+
+
 def _check_unsupported(scan, path, rtti=False):
+    _check_std_function(_blank_strings(scan), path)
     # A literal is data, not code: `puts("new item")` uses no keyword.
     scan = _blank_strings(scan)
     for m in _OPERATOR.finditer(scan):
@@ -1399,7 +1451,7 @@ def _match(text, idx, open_ch, close_ch):
 def _pure_virtual(decl, cname, line0):
     """Parse `virtual int area() = 0;` -- a slot with no implementation."""
     body = decl[len("virtual"):].strip()
-    op = body.find("(")
+    op = _decl_paren(body)
     cp = _match_paren(body, op) if op >= 0 else None
     if op < 0 or cp is None:
         raise CppError("cannot parse virtual member %r in class %s"
@@ -1427,6 +1479,59 @@ def _pure_virtual(decl, cname, line0):
                   line0, "", None, True, True)
 
 
+_OPERATOR_SYMS = re.compile(r"\boperator\s*(?:[-+*/%^&|~!=<>]+|\[\s*\]|\(\s*\))")
+
+
+def _decl_paren(decl):
+    """Index of the `(` that opens a member's parameter list, or -1.
+
+    Not `decl.find("(")`. A parameter type may itself be spelled with
+    parens -- `std::function<void(const std::string &)>` is the shape that
+    matters here -- and the first `(` in
+
+        map<int, pair<string, function<void(const string &)>>> subs
+
+    belongs to the *type*, not to the member. Taking it made this field a
+    method returning `map<int, pair<string, function<void`, which then
+    failed against its own trailing `>>> subs` rather than against
+    anything the author wrote.
+
+    Angle brackets nest here for the same reason `_split_declarators`
+    lets them: this runs over a declaration, where `<` opens a template
+    argument list rather than being a comparison. The one place that is
+    not true is an operator's own name -- `operator<`, `operator<<`,
+    `operator<=` -- so those spellings are stepped over before the count
+    begins.
+
+    An unbalanced `<` means the guess was wrong somewhere above; falling
+    back to the plain scan keeps such a member parsing exactly as it did.
+    """
+    skip = [(m.start(), m.end()) for m in _OPERATOR_SYMS.finditer(decl)]
+    angle = depth = 0
+    i, n = 0, len(decl)
+    while i < n:
+        for a, b in skip:
+            if a <= i < b:
+                i = b
+                break
+        else:
+            c = decl[i]
+            if c == "(" and angle == 0 and depth == 0:
+                return i
+            elif c == "<":
+                angle += 1
+            elif c == ">" and angle > 0:
+                angle -= 1
+            elif c == "[":
+                depth += 1
+            elif c == "]" and depth > 0:
+                depth -= 1
+            i += 1
+    if angle:
+        return decl.find("(")
+    return -1
+
+
 def _drop_trailing_const(head):
     """Remove the qualifiers that follow a member function's parameters.
 
@@ -1435,7 +1540,7 @@ def _drop_trailing_const(head):
     lowered, and the C front end checks the body regardless -- so what is
     left after the parameter list is dropped.
     """
-    op = head.find("(")
+    op = _decl_paren(head)
     if op < 0:
         return head
     cp = _match_paren(head, op)
@@ -1474,7 +1579,7 @@ def _has_param_list(decl):
     *pointer field* and does not either -- the parens belong to the
     declarator, not to the member.
     """
-    op = decl.find("(")
+    op = _decl_paren(decl)
     if op < 0:
         return False
     if decl[op + 1:].lstrip().startswith("*"):
@@ -1658,7 +1763,7 @@ def _split_members(body, cname, line0, path="<cpp>"):
                                   (anon.group(1) + " " + anon.group(2)).strip(),
                                   vname, None, inner, line0))
             continue
-        op = head.find("(")
+        op = _decl_paren(head)
         if op < 0:
             raise CppError("%scannot parse member %r in class %s"
                            % (_at(start), head, cname))
@@ -3370,6 +3475,44 @@ def _check_ref_returns(scan, names, path):
                 % (os.path.basename(path), line, m.group(1), m.group(1)))
 
 
+def _strip_default_args(params):
+    """Drop `= expr` from each parameter of a parameter list.
+
+    C has no default arguments, so one that survives into a prototype is a
+    syntax error there rather than a value nobody passes. A member *defined*
+    in this file loses them on the way to its definition; a member only
+    **declared** here did not, so litehtml's
+
+        void fromString(const tstring &str, const tstring &predefs = _t(""),
+                        int defValue = 0);
+
+    reached the C front end with the defaults intact and stopped it at the
+    first `=`. That declaration is in `css_length.h`, which most of the
+    tree includes.
+
+    Split on top-level commas, since a default may be a call with commas of
+    its own, and cut at the first `=` that is not part of `==`, `<=`, `>=`
+    or `!=` -- a default argument is an expression and may compare.
+    """
+    out = []
+    for part in _split_top(params or ""):
+        depth = 0
+        cut = -1
+        for k, c in enumerate(part):
+            if c in "([{":
+                depth += 1
+            elif c in ")]}":
+                depth -= 1
+            elif c == "=" and depth == 0:
+                if part[k + 1:k + 2] == "=" or part[k - 1:k] in ("=", "!",
+                                                                 "<", ">"):
+                    continue
+                cut = k
+                break
+        out.append(part[:cut] if cut >= 0 else part)
+    return ", ".join(p.strip() for p in out if p.strip())
+
+
 def _lower_refs(text, names):
     """`T &x` -> `T *x`, and `T &r = e;` -> `T *r = &(e);`.
 
@@ -4335,6 +4478,7 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             # here and the definition left to whoever has the body.
             dparams = _lower_refs(_expand_cpp_ref(_expand_cpp_rref(sub(m.params or ""), names), names),
                                   _with_scalars(names))
+            dparams = _strip_default_args(dparams)
             mname = _member_symbol(cname, m)
             if mname is not None:
                 # External linkage, not `static`: the definition is in
@@ -4446,29 +4590,40 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             # owning object leaves two owners, and there is no safe default.
             # `__assign`, not `_assign`: a class may perfectly well declare
             # a method called `assign`, and `string` does.
+            #
+            # A *second* `operator=` taking one argument lands on this same
+            # symbol. The move overload above escapes that by having a
+            # symbol of its own, but two copy-assignments differing only in
+            # their operand type -- litehtml's `border` takes both a
+            # `border` and a `css_border` -- have nothing to tell them
+            # apart, and the emitted C redefined the first. Refused for the
+            # reason any same-arity overload is: resolution here is by
+            # argument count, and both take one.
+            if info["assign"]:
+                raise CppError(
+                    "class %s: two `operator=` overloads take 1 argument. "
+                    "Overloads are resolved by argument count here, so both "
+                    "lower to `%s__assign` and the second would redefine "
+                    "the first. Give one of them a name (`assign_from`) and "
+                    "call it directly."
+                    % (cls.name, cname))
             emit("void", "%s__assign" % cname, params, sub(m.body or ""))
             info["assign"] = True
         elif m.kind == "binop":
             op = m.name[len("operator"):]
-            # A binary operator hands back a new object by value, and this
-            # subset cannot return an owning one that way: the local it
-            # names is destroyed on the way out and the caller would get a
-            # copy of a released object. So the operator is available to a
-            # class that owns nothing, where the struct copy is exactly
-            # what C++ does implicitly.
+            # A binary operator hands back a new object by value. That used
+            # to be refused outright for a class with a destructor, and the
+            # refusal was right at the time: a by-value return of an owning
+            # class was not in the subset at all.
             #
-            # Reported here rather than left to the by-value rules, which
-            # refuse it correctly but describe the *initialiser* rather
-            # than the operator that produced it.
-            if dtor is not None and (m.ret or "").strip() == cname:
-                raise CppError(
-                    "`%s::operator%s` returns %s by value, and %s has a "
-                    "destructor. A by-value return of an owning class is not "
-                    "in this subset -- the local is destroyed on the way out "
-                    "and the caller would receive a copy of a released "
-                    "object. Use `operator%s=`, which writes into an object "
-                    "that already exists."
-                    % (cname, op, cname, cname, op))
+            # It is now. A returned bare local is *moved out* -- left out of
+            # the drops on that path -- so `T operator+(..) { T r; ..;
+            # return r; }` lowers exactly as the same body under an ordinary
+            # method name already did. The two spellings had drifted apart
+            # for no reason left standing: `Buf plus(const Buf &)` was
+            # emitted and `Buf operator+(const Buf &)` was refused.
+            #
+            # What is still owning-specific is the *chain*, handled below.
             fn = "%s__bin%s" % (cname, _BIN_NAMES[op])
             cret = tsub(sub(m.ret or "")).strip()
             info["binop"][op] = {
@@ -4486,13 +4641,15 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             # left operand by value instead, and a call to the ordinary
             # form can be passed straight into it.
             #
-            # Safe precisely because a binary operator is only available to
-            # a class that owns nothing: the by-value parameter is a struct
+            # Safe precisely because this wrapper is only emitted for a
+            # class that owns nothing: the by-value parameter is a struct
             # copy with no constructor or destructor to run, exactly as C++
-            # would pass it. That is the same condition checked above, so
-            # there is no case where this wrapper exists and copying is
-            # wrong.
-            if cret == cname:
+            # would pass it. For an owning class the copy would make a
+            # second owner of one buffer, so no wrapper is emitted and a
+            # chain is refused at the call site instead -- `a + b` on its
+            # own stays available, which is the common case and the one
+            # `string` needs.
+            if cret == cname and dtor is None:
                 vfn = "%s_v" % fn
                 info["binop"][op]["vfn"] = vfn
                 mprotos.append("static %s %s(%s lhs, const %s *o);"
@@ -6031,7 +6188,8 @@ def _rewrite_scopes_inner(text, type_info, _pos):
                 out.append(m.group(0))       # plain data: a bitwise copy is
                 i = m.end()                  # exactly what C++ would do
                 continue
-            if src is None and _is_call_result(rhs):
+            if src is None and (_is_call_result(rhs)
+                                or _is_binop_result(rhs, scopes, type_info)):
                 # `T a = f();` -- the callee returned by value, which is a
                 # move *out* of its local, so this is a move *in*. The plain
                 # struct assignment is exactly right: no constructor to run,
@@ -6057,7 +6215,32 @@ def _rewrite_scopes_inner(text, type_info, _pos):
                 scopes[-1].vals[vname] = ctype
                 i = m.end()
                 continue
+            lit = (_binop_literal_operand(rhs, ctype, scopes, type_info)
+                   if src is None and 1 in info["ctors"] else None)
+            if lit is not None:
+                # `T c = a + "lit";` -- the literal becomes a temporary
+                # through the one-argument constructor, the operator runs on
+                # it, and the temporary is destroyed straight after, so
+                # nothing outlives the statement. `c` itself is a move in
+                # from the call, exactly as `T c = a + b;` is.
+                ent, litexpr, other, lit_left = lit
+                tmpn = "__cpp_op%d" % mvn[0]
+                mvn[0] += 1
+                args = (("&%s, &%s" % (tmpn, other)) if lit_left
+                        else ("&%s, &%s" % (other, tmpn)))
+                out.append("%s %s; %s(&%s, %s); %s %s = %s(%s); %s(&%s);"
+                           % (ctype, tmpn, info["ctors"][1]["fn"], tmpn,
+                              litexpr, ctype, vname, ent["fn"], args,
+                              _dropfn(info, ctype), tmpn))
+                if info["dtor"]:
+                    scopes[-1].live.append((ctype, vname))
+                scopes[-1].vals[vname] = ctype
+                i = m.end()
+                continue
             if src is None:
+                why = _binop_refusal(rhs, scopes, type_info)
+                if why is not None:
+                    raise CppError(why)
                 raise CppError(
                     "`%s %s = %s;`: %s owns a resource, and the right-hand "
                     "side is neither an object of that type this pass can "
@@ -6246,7 +6429,8 @@ def _rewrite_scopes_inner(text, type_info, _pos):
                                   _dropfn(info_a, ctype), tmpn))
                     i = m.end()
                     continue
-                if src is None and _is_call_result(rhs):
+                if src is None and (_is_call_result(rhs)
+                                    or _is_binop_result(rhs, scopes, type_info)):
                     # `a = f();` -- the callee returned by value, which is a
                     # move *out* of its local, so there is no second owner
                     # and nothing to copy. The old value still has to be
@@ -6651,6 +6835,180 @@ def _addr_of_expr(expr):
     if expr.startswith("&"):
         return expr
     return "&(%s)" % expr
+
+
+def _unaddressable_arg(a):
+    """Why `&a` is not a thing, or None if it might be.
+
+    `fix_args` puts an `&` on an argument whose parameter is a reference.
+    That is right for a name, a member chain or a subscript, and meaningless
+    for anything whose value does not live anywhere: a call result, an
+    overloaded operator's result, a literal. Those were emitted anyway --
+    `sink(&a + b)`, `sink(&string_substr(&b, 0, 1))` -- and the C front end
+    then complained about the generated struct rather than the argument that
+    was written.
+
+    Deliberately conservative: it names only the shapes it is *sure* have no
+    address, and leaves anything it cannot classify to the C front end
+    exactly as before. A false refusal here would fail every caller of the
+    function.
+    """
+    a = (a or "").strip()
+    if not a:
+        return None
+    if re.match(r'^(".*"|\'.*\')$', a, re.S):
+        return "a literal has no address"
+    # A trailing `)` that closes a call opening after the first character:
+    # `f(..)`, `o.m(..)`. Not a cast or a parenthesised name, which start
+    # with the paren.
+    if a.endswith(")") and not a.startswith("("):
+        for k, c in enumerate(a):
+            if c == "(" and _match_paren(a, k) == len(a) - 1 and k > 0:
+                return "a call result has no address"
+    # A top-level binary operator: `a + b`, already rewritten to a call by
+    # the time this runs, or left as written when it was not.
+    depth = 0
+    for k, c in enumerate(a):
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif depth == 0 and c in "+-*/%|^" and k > 0 \
+                and a[k + 1:k + 2] != "=" \
+                and not (c == "-" and a[k + 1:k + 2] == ">") \
+                and a[k - 1] not in "+-*/%|^&<>=!":
+            return "the result of an operator has no address"
+    return None
+
+
+def _binop_literal_operand(rhs, ctype, scopes, type_info):
+    """`(entry, literal, other, literal_is_left)` for `a + "lit"`, else None.
+
+    C++ builds a temporary through the one-argument constructor and passes
+    that; written out, that is exactly what this lowers to -- the same shape
+    `str = name;` already takes for a converting assignment, so it is the
+    pass's existing behaviour rather than a new liberty.
+
+    It is also what makes `"lit" + s` work. That one is a *free*
+    `operator+` in C++, which this subset has no notion of, but with the
+    literal materialised the member operator on the temporary means the
+    same thing: `tmp + s`, with `tmp` constructed from the literal.
+
+    Narrow on purpose, like `_converting_operand`: exactly one operand a
+    string or character literal, the other a named object of `ctype`, and
+    `ctype` declaring that operator. A non-literal expression could be an
+    object of the class this pass simply failed to name, and materialising
+    one from it would build the wrong thing silently.
+    """
+    rhs = (rhs or "").strip()
+    m = re.match(r"^(.+?)\s*([-+*/%|&^])\s*(.+)$", rhs, re.S)
+    if not m:
+        return None
+    left, op, right = (m.group(1).strip(), m.group(2), m.group(3).strip())
+    lit_re = re.compile(r'^(".*"|\'.*\')$', re.S)
+    if lit_re.match(left) and re.match(r"^\w+$", right):
+        lit, other, lit_left = left, right, True
+    elif lit_re.match(right) and re.match(r"^\w+$", left):
+        lit, other, lit_left = right, left, False
+    else:
+        return None
+    named = _named_object(other, scopes, type_info)
+    if named is None or named[1] != ctype:
+        return None
+    ent = (type_info.get(ctype) or {}).get("binop", {}).get(op)
+    if not ent or ent.get("ret") != ctype:
+        return None
+    return ent, lit, other, lit_left
+
+
+def _binop_refusal(rhs, scopes, type_info):
+    """Why an overloaded-operator right-hand side cannot be lowered, or None.
+
+    The generic initialiser refusal describes the *declaration* -- "the
+    right-hand side is neither an object of that type nor a call returning
+    one" -- which is true but names neither the operator that produced it
+    nor the fix. A run of overloaded operators is worth its own message,
+    because each shape has a different answer.
+    """
+    rhs = (rhs or "").strip()
+    ops = r"[-+*/%|&^]"
+
+    def _binop_of(name, op):
+        got = _named_object(name, scopes, type_info) if name else None
+        if got is None:
+            return None, None
+        return got[1], (type_info.get(got[1]) or {}).get("binop", {}).get(op)
+
+    # `a + b + c` -- a chain. The by-value front door it needs is emitted
+    # only for a class that owns nothing.
+    m = re.match(r"^(\w+)\s*(%s)\s*(\w+)\s*(%s)\s*(\w+)$" % (ops, ops), rhs)
+    if m:
+        cls, ent = _binop_of(m.group(1), m.group(2))
+        if ent is not None and ent.get("vfn") is None:
+            return ("`%s`: chaining `%s` over %s is not in this subset. A run "
+                    "passes the first result into the second by value, and %s "
+                    "owns a resource, so the copy would make a second owner "
+                    "of it. Use `%s=` into a local instead (`%s t = %s; t %s= "
+                    "%s; t %s= %s;`)."
+                    % (rhs, m.group(2), cls, cls, m.group(2), cls,
+                       m.group(1), m.group(2), m.group(3), m.group(4),
+                       m.group(5)))
+        return None
+
+    # `a + "lit"` -- an operand with no address to take.
+    m = re.match(r"^(\w+)\s*(%s)\s*(.+)$" % ops, rhs, re.S)
+    if m and not re.match(r"^\w+$", m.group(3).strip()):
+        cls, ent = _binop_of(m.group(1), m.group(2))
+        if ent is not None:
+            return ("`%s`: the right-hand side of an overloaded `%s` has to "
+                    "be a plain name of the same class, or a literal. "
+                    "Operands are passed by address and there is none to "
+                    "take of an expression or a call result. Assign it to a "
+                    "%s local first, or use `%s=`."
+                    % (rhs, m.group(2), cls, m.group(2)))
+
+    # `"lit" + a` -- C++ resolves this with a *free* operator, which this
+    # subset has no notion of: an overloaded operator is a member, so its
+    # left operand has to be an object of the class.
+    m = re.match(r"^(.+?)\s*(%s)\s*(\w+)$" % ops, rhs, re.S)
+    if m and not re.match(r"^\w+$", m.group(1).strip()):
+        cls, ent = _binop_of(m.group(3), m.group(2))
+        if ent is not None:
+            return ("`%s`: an overloaded `%s` is a *member* here, so its left "
+                    "operand has to be an object of the class. C++ would pick "
+                    "a free `operator%s` for this, and there are none in this "
+                    "subset. Build the left operand as a %s local first "
+                    "(`%s t(..); t %s= %s;`)."
+                    % (rhs, m.group(2), m.group(2), cls, cls, m.group(2),
+                       m.group(3)))
+    return None
+
+
+def _is_binop_result(rhs, scopes, type_info):
+    """Is `rhs` a single overloaded binary operator over named objects?
+
+    `Buf s = a + b;` becomes `Buf s = Buf__binadd(&a, &b);` -- a call whose
+    value was returned to us, so taking it is a move in, exactly as
+    `Buf s = a.plus(b);` already is. The two spellings lower to the same
+    call, and only the operator one was refused: this check runs before the
+    operator is rewritten, so `a + b` did not yet look like the call it
+    becomes.
+
+    One operator, both operands plain names, and the left one an object of
+    a class declaring that operator with a return of its own type. A *run*
+    (`a + b + c`) deliberately does not match: chaining needs the by-value
+    front door, which an owning class does not get.
+    """
+    rhs = (rhs or "").strip()
+    m = re.match(r"^(\w+)\s*([-+*/%|&^])\s*(\w+)$", rhs)
+    if not m:
+        return False
+    named = _named_object(m.group(1), scopes, type_info)
+    if named is None:
+        return False
+    cls = named[1]
+    ent = (type_info.get(cls) or {}).get("binop", {}).get(m.group(2))
+    return bool(ent) and ent.get("ret") == cls
 
 
 def _is_call_result(rhs):
@@ -7607,11 +7965,28 @@ def _rewrite_calls_inner(text, cinfo, free_refs, free_rets, _pos):
                 continue
             # `void take(Inner *r, int k);` is a declaration, not a call: its
             # "arguments" parse as parameters. Leave the prototype alone.
+            #
+            # A parameter with a *default argument* is one too, and did not
+            # parse as one: `const string &quote = _t(" ")` has an `=` in it
+            # and `_parse_param` returned None, so litehtml's tokenizer
+            # declaration was treated as a call and had an `&` put on the
+            # default. Strip the default before asking.
             if _parse_param(a, names) is not None:
+                continue
+            if _top_level_eq(a) >= 0 and \
+                    _parse_param(_strip_default_args(a), names) is not None:
                 continue
             sym = lookup(scopes, a) if re.match(r"^\w+$", a) else None
             if sym is not None and sym[1]:
                 continue          # already a pointer
+            why = _unaddressable_arg(a)
+            if why is not None:
+                raise CppError(
+                    "`%s` is passed to a reference parameter, and %s. This "
+                    "lowering passes a reference as a pointer, so the "
+                    "argument has to be something with an address -- a name, "
+                    "a member, or a subscript. Assign it to a local first "
+                    "and pass that." % (a, why))
             parts[idx] = " &" + a
         return ",".join(parts).strip()
 
@@ -8394,6 +8769,31 @@ public:
                        sd[sn] = 0; }
     }
     char at(int i) { return sd[i]; }
+    /* Concatenation. `r` is a bare local returned by value, so it is moved
+       out rather than copied -- which is what makes this expressible for a
+       class that owns a buffer. A *run* (`a + b + c`) is refused, since
+       chaining needs a by-value front door and an owning class does not
+       get one; build it with `+=`, which writes into an object that
+       already exists and has no such limit. */
+    string operator+(const string &o) {
+        string r;
+        r.reserve(sn + o.sn);
+        if (r.sd != 0) {
+            if (sn > 0) { memcpy(r.sd, sd, (unsigned long)sn); }
+            if (o.sn > 0) { memcpy(r.sd + sn, o.sd, (unsigned long)o.sn); }
+            r.sn = sn + o.sn;
+            r.sd[r.sn] = 0;
+        }
+        return r;
+    }
+    string &operator+=(const string &o) {
+        reserve(sn + o.sn);
+        if (sd != 0 && o.sn > 0) {
+            memcpy(sd + sn, o.sd, (unsigned long)o.sn);
+            sn = sn + o.sn;
+            sd[sn] = 0;
+        }
+    }
     char &operator[](int i) { return sd[i]; }
     const char *c_str() { if (sd == 0) { return ""; } return sd; }
     int length() { return sn; }

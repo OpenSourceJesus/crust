@@ -1786,8 +1786,16 @@ int f(void) {
 }
 """, "vec2__binadd(&a, &b)")
 
-    def test_an_owning_class_is_reported(self):
-        self.refuses("""
+    def test_an_owning_class_lowers(self):
+        """This used to be refused, and the refusal was right at the time.
+
+        A by-value return of an owning class was not in the subset at all.
+        It is now -- a returned bare local is moved out -- so `buf r; ..;
+        return r;` under `operator+` lowers exactly as the same body under
+        an ordinary method name already did. `r` is left out of the drops
+        on the return path and `c` is dropped once.
+        """
+        self.assertLowers("""
 class buf {
 public:
     char *p;
@@ -1796,7 +1804,23 @@ public:
     buf operator+(const buf &o) { buf r; return r; }
 };
 int f(void) { buf a; buf b; buf c = a + b; return 0; }
-""", "returns buf by value", "Use `operator+=`")
+""", "buf c = buf__binadd(&a, &b)")
+
+    def test_an_owning_chain_is_still_reported(self):
+        """A *run* needs the by-value front door, which an owning class
+        does not get: passing one by value would make a second owner of the
+        same buffer with no copy constructor run.
+        """
+        self.refuses("""
+class buf {
+public:
+    char *p;
+    buf() { p = 0; }
+    ~buf() { free(p); }
+    buf operator+(const buf &o) { buf r; return r; }
+};
+int f(void) { buf a; buf b; buf c; buf d = a + b + c; return 0; }
+""", "owns a resource")
 
     def test_scalars_are_untouched(self):
         """The receiver has to resolve to a class with the operator, so
