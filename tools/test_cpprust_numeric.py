@@ -703,5 +703,64 @@ Vec<float,16> v;
         self.assertIn("la_add_f32_16(r.d, this->d, o->d);", out)
 
 
+class TestContractsWithReferenceParams(Base):
+    """A contract on a method that takes a reference parameter.
+
+    Contracts sit between the parameter list and the body, which is the one
+    place nothing else does -- so every pass that finds a function by
+    looking for `)` immediately before `{` walked back into the tail of
+    `assert not len(o) % 4` and gave up. The cost landed on the *body*: the
+    enclosing function's parameters could not be found, so `o.d` was never
+    rewritten to `o->d` and the C front end reported a member access on
+    something that is not a structure.
+
+    It went unnoticed because the first contract-bearing method took raw
+    pointers. Every operator in a numeric library takes `const Vec &`, so
+    contracts and reference parameters were mutually exclusive -- exactly
+    the combination the library needs.
+    """
+
+    SRC = """
+template<typename T, int N>
+class Vec {
+public:
+    T d[N];
+    Vec() { int i = 0; for (i = 0; i < N; i = i + 1) { d[i] = 0; } }
+    Vec operator+(const Vec &o)
+    assert not len(o) %% 4
+    {
+        Vec r; int i = 0;
+        for (i = 0; i < N; i = i + 1) { r.d[i] = d[i] + o.d[i]; }
+        return r;
+    }
+};
+int main() {
+    Vec<float,16> a; Vec<float,16> b;
+    int i = 0;
+    for (i = 0; i < 16; i = i + 1) { a.d[i] = 1.0f; b.d[i] = 2.0f; }
+    Vec<float,16> c = a + b;
+    return (int)c.d[0];
+}
+""" % ()
+
+    def test_the_body_still_gets_its_reference_lowering(self):
+        out = self.lower(self.SRC)
+        self.assertIn("o->d[i]", out)
+        self.assertNotIn("o.d[i]", out)
+        self.assertIn("assert not len(o) % 4", out)
+
+    def test_the_same_body_without_a_contract_is_unchanged(self):
+        """The two spellings must agree: adding a contract may not change
+        what the body lowers to."""
+        with_c = self.lower(self.SRC)
+        without = self.lower(self.SRC.replace(
+            "    assert not len(o) %% 4\n" % (), "").replace(
+            "    assert not len(o) % 4\n", ""))
+        self.assertIn("o->d[i]", without)
+        self.assertEqual(
+            with_c.replace("\nassert not len(o) % 4\n", ""),
+            without)
+
+
 if __name__ == "__main__":
     unittest.main()

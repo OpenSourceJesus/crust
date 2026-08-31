@@ -8427,7 +8427,13 @@ def _free_ref_funcs(text, names):
         close = _match_paren(text, m.end() - 1)
         if close is None:
             continue
-        tail = text[close + 1:close + 40].lstrip()
+        tail = text[close + 1:close + 200].lstrip()
+        # A contract run may sit between the parameter list and the body.
+        while tail.startswith("assert"):
+            nl = tail.find("\n")
+            if nl < 0:
+                break
+            tail = tail[nl + 1:].lstrip()
         if not (tail.startswith("{") or tail.startswith(";")):
             continue          # a call, not a declaration
         refs = _ref_positions(text[m.end():close], names)
@@ -8436,9 +8442,35 @@ def _free_ref_funcs(text, names):
     return out
 
 
+#: A run of ShivyCX contract clauses sitting between a parameter list and
+#: a body. They are not C, and every pass that finds a function by looking
+#: for `)` immediately before `{` has to step over them.
+_CONTRACT_RUN = re.compile(r"(?:\s*assert\b[^\n{;]*)+\s*$")
+
+
+def _skip_contracts_back(text, j):
+    """Index of the last character before any contract run ending at `j`.
+
+    A contract sits exactly where nothing else does -- after the `)` and
+    before the `{` -- so a pass that walks back from the brace expecting a
+    close paren found the tail of `assert not len(o) % 4` instead and gave
+    up. That silently cost the *body* its reference lowering: the enclosing
+    function's parameters could not be found, so `o.d` was never rewritten
+    to `o->d` and the C front end reported a member access on something
+    that is not a structure. Every operator in a numeric library takes
+    `const Vec &`, so this made contracts and reference parameters mutually
+    exclusive -- which is exactly the combination the library needs.
+    """
+    m = _CONTRACT_RUN.search(text[:j + 1])
+    return (m.start() - 1) if m is not None else j
+
+
 def _params_at(text, brace_idx):
     """The parameter list of the function header ending just before `{`."""
     j = brace_idx - 1
+    while j >= 0 and text[j] in " \t\r\n":
+        j -= 1
+    j = _skip_contracts_back(text, j)
     while j >= 0 and text[j] in " \t\r\n":
         j -= 1
     if j < 0 or text[j] != ")":
