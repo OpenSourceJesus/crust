@@ -1363,7 +1363,7 @@ def _check_unsupported(scan, path, rtti=False):
 class Member(object):
     __slots__ = ("kind", "ret", "name", "params", "body", "line", "dim",
                  "init", "virt", "pure", "outline", "definit",
-                 "declared_only", "stat")
+                 "declared_only", "stat", "contracts")
 
     def __init__(self, kind, ret, name, params, body, line, dim="",
                  init=None, virt=False, pure=False):
@@ -1392,6 +1392,54 @@ class Member(object):
         # Declared with no body and no out-of-line definition here: it lives
         # in another translation unit, so only a prototype is emitted.
         self.declared_only = False
+        # ShivyCX contract clauses written between the parameter list and
+        # the body. Carried through the method-to-free-function rewrite
+        # unchanged: the pointer parameters keep their names, and `this` is
+        # prepended rather than renaming anything.
+        self.contracts = []
+
+
+def _split_contracts(tail):
+    """`(["assert not len(o) % 4"], rest)` -- ShivyCX contract clauses.
+
+    A contract sits between the parameter list and the body, which is
+    exactly where a constructor's initializer list sits, so the tail parser
+    met them first and reported an unparsable member. They already work on
+    a *free* function -- this file does not read one, so the clauses passed
+    through to ShivyCX untouched -- and stopped at the class boundary,
+    which is where a numeric library lives.
+
+    Only the leading run is taken. Anything after it is the ordinary tail
+    (`const`, `override`, a `: a(1)` list) and is left for its own parser.
+    """
+    tail = (tail or "").strip()
+    if not re.match(r"^assert\b", tail):
+        return [], tail
+    parts = re.split(r"(?=\bassert\b)", tail)
+    out, rest = [], ""
+    for idx, part in enumerate(parts):
+        part = part.strip()
+        if not part:
+            continue
+        if not part.startswith("assert"):
+            rest = " ".join(p for p in parts[idx:]).strip()
+            break
+        # A clause runs to the next `assert`, so a trailing `const` or an
+        # initializer list is glued to the last one. Split it back off at
+        # the first thing that cannot be part of a contract expression.
+        cut = re.search(r"\s+(?=(?:const|override|final|noexcept)\b|:)",
+                        part)
+        if cut is not None:
+            out.append(part[:cut.start()].strip())
+            rest = part[cut.start():].strip()
+            break
+        out.append(part)
+    return out, rest
+
+
+def _contract_names(clause):
+    """The identifiers a contract clause constrains, i.e. every `len(x)`."""
+    return set(re.findall(r"\blen\s*\(\s*(\w+)\s*\)", clause))
 
 
 class Class(object):
@@ -1748,7 +1796,8 @@ def _split_members(body, cname, line0, path="<cpp>"):
                 # field, not two.
                 decls = [d.strip() for d in _split_declarators(decl)
                          if d.strip()]
-                first = decls[0].replace("*", " * ").split()
+                head0, dim0 = _split_array_dim(decls[0])
+                first = head0.replace("*", " * ").split()
                 if len(first) < 2:
                     raise CppError("%scannot parse member %r in class %s"
                                    % (_at(start), decl, cname))
@@ -1760,12 +1809,13 @@ def _split_members(body, cname, line0, path="<cpp>"):
                 base = " ".join(t for t in first[:-1] if t != "*")
                 for idx, one in enumerate(decls):
                     if idx == 0:
-                        parts = first
+                        parts, dim = first, dim0
                     else:
                         # A later declarator carries only its own name, and
                         # its own stars: `int *p, q;` makes `p` a pointer
                         # and `q` an int, exactly as C says.
-                        parts = [base] + one.replace("*", " * ").split()
+                        headn, dim = _split_array_dim(one)
+                        parts = [base] + headn.replace("*", " * ").split()
                         if len(parts) < 2:
                             raise CppError(
                                 "%scannot parse member %r in class %s"
@@ -1773,10 +1823,9 @@ def _split_members(body, cname, line0, path="<cpp>"):
                     # `int arr[10];` -- the declarator suffix is not part of
                     # the name. Keeping it there would make field
                     # qualification miss every use of `arr` in a method body.
-                    fname, dim = parts[-1], ""
-                    b = fname.find("[")
-                    if b >= 0:
-                        fname, dim = fname[:b], fname[b:]
+                    # It was split off above rather than here, so a bound
+                    # containing a `*` survives tokenising intact.
+                    fname = parts[-1]
                     fm = Member("field", " ".join(parts[:-1]), fname,
                                 None, None, line0, dim)
                     # An initialiser belongs to the declarator it was
@@ -1891,7 +1940,11 @@ def _split_members(body, cname, line0, path="<cpp>"):
         virt = bool(re.match(r"virtual\b", sig))
         if virt:
             sig = sig[len("virtual"):].strip()
-        init = _parse_init_list(head[cp + 1:], sig, cname)
+        # Contract clauses sit exactly where a constructor's initializer
+        # list does, so they have to come off before that parser runs.
+        contracts, after = _split_contracts(head[cp + 1:])
+        init = _parse_init_list(after, sig, cname)
+        _before = len(members)
         if sig == "~" + cname:
             members.append(Member("dtor", "void", cname, params, inner, line0,
                                   "", None, virt))
@@ -1984,6 +2037,10 @@ def _split_members(body, cname, line0, path="<cpp>"):
                         params, inner, line0, "", None, virt)
             _m.stat = is_static
             members.append(_m)
+        # Whichever branch above produced it, the member carries the
+        # clauses that preceded its body.
+        for _new in members[_before:]:
+            _new.contracts = list(contracts)
     for _sty, _snm, _sini in statics:
         _sm = Member("sconst", _sty, _snm, None, None, line0)
         _sm.definit = _sini
@@ -4081,6 +4138,32 @@ def _sub_code(pattern, repl, text):
     return "".join(out)
 
 
+def _split_array_dim(decl):
+    """`("T d", "[R * C]")` -- the declarator, and its array suffix.
+
+    The suffix is taken off *before* the declarator is tokenised, because
+    tokenising splits on `*` to find pointer stars and an array bound may
+    contain one: `T d[R * C]` split that way gives `["T", "d[R", "*", "C]"]`,
+    whose last token is `C]` and whose type is `T d[R *`. That is how a
+    non-type parameter in a bound came out half-substituted -- `R` was in
+    the type and got substituted, `C` was in the *name* and did not, so
+    `Mat<float,4,3>` emitted `float d[4 * C];` and the C front end reported
+    an undeclared `C` in a struct the source never mentioned.
+
+    Bounds nest (`T d[A][B]`), so everything from the first top-level `[`
+    to the end of the declarator is the suffix.
+    """
+    depth = 0
+    for k, c in enumerate(decl):
+        if c in "(<":
+            depth += 1
+        elif c in ")>":
+            depth = max(0, depth - 1)
+        elif c == "[" and depth == 0:
+            return decl[:k].rstrip(), decl[k:].strip()
+    return decl, ""
+
+
 def _subst_type(text, tparams, concretes):
     """Replace each template parameter with its argument, all in one pass.
 
@@ -4098,6 +4181,121 @@ def _subst_type(text, tparams, concretes):
     return _sub_code(
         re.compile(r"\b(%s)\b" % "|".join(re.escape(p) for p in tparams)),
         lambda m: mapping[m.group(1)], text)
+
+
+def _subst_injected(text, name, mangled):
+    """`Vec` -> `Vec_float_8` inside its own instantiated body.
+
+    C++ calls this the *injected class name*: inside `template<class T, int
+    N> class Vec`, a bare `Vec` means `Vec<T, N>`. Nothing in the parameter
+    substitution covers it -- `Vec` is not a template parameter -- so a
+    class whose own methods name their class came out referring to a type C
+    has never heard of:
+
+        static Vec Vec_float_8__binadd(Vec_float_8 *this, const Vec *o);
+
+    which is `unknown type name 'Vec'`. It bites in return position, in a
+    parameter, and on a local, so every operator on a fixed-size matrix or
+    vector hit it on the first line. The workaround was to spell `Vec<T,N>`
+    at every occurrence, which no realistic header does.
+
+    A use that *is* spelled `Vec<..>` is left alone: by the time this runs
+    the arguments have been substituted, so it reads `Vec<float, 8>` and is
+    the ordinary template use that `_monomorphise_uses` mangles. Rewriting
+    it here would produce `Vec_float_8<float, 8>`.
+    """
+    if not name or name == mangled:
+        return text
+    return _sub_code(
+        re.compile(r"\b%s\b(?!\s*<)" % re.escape(name)),
+        lambda m: mangled, text)
+
+
+#: Bytes per element, for working out how many fit an SSE lane. Only the
+#: spellings a fixed-size array parameter can actually have.
+_ELEM_BYTES = {
+    "char": 1, "signed char": 1, "unsigned char": 1, "bool": 1,
+    "short": 2, "unsigned short": 2,
+    "int": 4, "unsigned": 4, "unsigned int": 4, "float": 4,
+    "long": 8, "unsigned long": 8, "long long": 8,
+    "unsigned long long": 8, "double": 8,
+}
+
+#: `float a[16]` in a parameter list: a scalar element and a literal bound.
+_FIXED_ARRAY_PARAM = re.compile(
+    r"^\s*(?:const\s+)?([A-Za-z_][\w ]*?)\s+(\w+)\s*\[\s*(\d+)\s*\]\s*$")
+
+_DEF_HEAD = re.compile(
+    r"(?<![\w])(?:static\s+)?[A-Za-z_][\w ]*?[\w\s\*]\s*(\w+)\s*\(")
+
+
+def _auto_contracts(text):
+    """Derive ShivyCX contract clauses from fixed-size array parameters.
+
+    This is the whole point of putting the size in the type. `Mat<T,R,C>`
+    monomorphises to a kernel taking `float d[16]`, and 16 is a multiple of
+    the four floats an SSE lane holds -- so the divisibility the contract
+    vectorizer needs to drop its scalar remainder is *already known*, and
+    making the author write it out again as an `assert` would be asking
+    them to restate what they just said in the template argument.
+
+    Ported from `tools/py2c.py::_auto_contracts`, which does the same thing
+    on the rpython side from `x: "f32[256]"`. The two now agree: annotate a
+    fixed size in either language and the asserts disappear.
+
+    Only *definitions* with a body, only scalar elements, and only where
+    the bound divides the lane count -- anything else is left exactly as
+    written. A function that already carries clauses is left alone by the
+    same check -- what follows its parameter list is an `assert`, not a
+    `{` -- and that is the right answer, since the author said something
+    more specific than this pass can infer.
+    """
+    out, pos = [], 0
+    look = _blank_directives(_blank_strings(_strip_comments(text)))
+    for m in _DEF_HEAD.finditer(look):
+        if m.start() < pos:
+            continue
+        op = m.end() - 1
+        cp = _match_paren(look, op)
+        if cp is None:
+            continue
+        # A definition, not a prototype or a call: what follows the
+        # parameter list has to be the body.
+        k = cp + 1
+        while k < len(look) and look[k] in " \t\r\n":
+            k += 1
+        if k >= len(look) or look[k] != "{":
+            continue
+        params = text[op + 1:cp]
+        if "[" not in params:
+            continue
+        clauses = []
+        for part in _split_top(params):
+            pm = _FIXED_ARRAY_PARAM.match(part)
+            if pm is None:
+                continue
+            elem = " ".join(pm.group(1).split())
+            size = int(pm.group(3))
+            width = _ELEM_BYTES.get(elem)
+            if width is None:
+                continue
+            lanes = 16 // width
+            # A bound that does not fill a whole lane has nothing to
+            # promise, and one that is not a multiple of the lane count is
+            # exactly the case the scalar remainder exists for.
+            if lanes < 2 or size < lanes or size % lanes:
+                continue
+            clauses.append("assert not len(%s) %% %d" % (pm.group(2), lanes))
+            clauses.append("assert len(%s) >= %d" % (pm.group(2), lanes))
+        if not clauses:
+            continue
+        out.append(text[pos:cp + 1])
+        out.append("\n" + "\n".join(clauses) + "\n")
+        pos = cp + 1
+    if not out:
+        return text
+    out.append(text[pos:])
+    return "".join(out)
 
 
 def _mangle(name):
@@ -4827,9 +5025,10 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
     nothing more. The vtable pointer sits first in the root of the
     hierarchy, hence at offset zero throughout it.
     """
-    sub = ((lambda s: _subst_type(s, cls.tparams, targs)) if targs
-           else (lambda s: s))
     cname = cls.name if targs is None else _mono_name(cls.name, targs)
+    sub = ((lambda s: _subst_injected(
+                _subst_type(s, cls.tparams, targs), cls.name, cname))
+           if targs else (lambda s: s))
     base = cls.base
     # A base may be a template *instantiation* -- `class D : public Box<int>`,
     # and `enable_shared_from_this<T>` is the shape that matters in practice.
@@ -5192,6 +5391,12 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
     tail = []
     emitting_outline = [False]
 
+    # Contract clauses for the member being emitted. A cell rather than an
+    # argument because every operator kind reaches `emit` by its own path,
+    # and a kernel written as an `operator*` deserves its contracts as much
+    # as one written as a method.
+    cur_contracts = [[]]
+
     def emit(kind, mname, params, raw, static=False):
         # `__cpp_ref(T)` in a parameter: `T` for a scalar, `const T &` for a
         # class. A container cannot pick one spelling for both -- by value it
@@ -5273,11 +5478,32 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             inner = _sub_code(
                 re.compile(r"(?<![\w.>])return\s+this\s*;"),
                 "return (%s *)this;" % rcls[0], inner)
+        # ShivyCX contract clauses go between the parameter list and the
+        # body, which is the same place they occupied in the C++ source --
+        # the method-to-free-function rewrite prepends `this` and renames
+        # nothing, so a clause naming a parameter still names it.
+        cbits = ""
+        if cur_contracts[0]:
+            declared = set(_declared_param_names(params))
+            for cl in cur_contracts[0]:
+                unknown = _contract_names(cl) - declared
+                if unknown:
+                    raise CppError(
+                        "class %s: `%s` on `%s` constrains %s, which is not "
+                        "a parameter of it. A contract is proven at the call "
+                        "site from the argument passed, so it can only speak "
+                        "about parameters -- a field has no call site to be "
+                        "proven at. Pass the array as a parameter, or put "
+                        "the kernel in a free function."
+                        % (cname, cl, mname, ", ".join(sorted(unknown))))
+            cbits = "\n" + "\n".join(cur_contracts[0]) + "\n"
         (tail if emitting_outline[0] else out).append(
-            "%s %s %s(%s) {%s}" % (stor, kind, mname, arglist, inner))
+            "%s %s %s(%s)%s {%s}" % (stor, kind, mname, arglist, cbits,
+                                     inner))
         return refs
 
     for m in cls.members:
+        cur_contracts[0] = list(getattr(m, "contracts", ()) or ())
         if m.kind in ("field", "anon") or m.pure:
             continue
         if m.declared_only:
@@ -5464,8 +5690,22 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             # What is still owning-specific is the *chain*, handled below.
             fn = "%s__bin%s" % (cname, _BIN_NAMES[op])
             cret = tsub(sub(m.ret or "")).strip()
+            # The class of the right operand, which need not be this one.
+            # `Vec<T,R> operator*(const Vec<T,C> &)` on a `Mat` is how a
+            # matrix multiplies a vector, and the rewriter used to require
+            # both operands to be the same class -- so `A * x` matched
+            # nothing and reached the C front end as a raw `*` on two
+            # structs. Recording the declared operand type lets the call be
+            # lowered against it instead of against the receiver.
+            # `tsub` as well as `sub`: the parameter is spelled
+            # `const Vec<T,C> &`, and substitution alone leaves
+            # `Vec<float, 4>` -- a template *use*, which is not the name any
+            # class is known by. Mangling it gives `Vec_float_4`, which is.
+            _bp = _parse_param(
+                _expand_cpp_ref(tsub(sub(m.params or "")), known),
+                _with_scalars(names))
             info["binop"][op] = {
-                "fn": fn, "ret": cret,
+                "fn": fn, "ret": cret, "arg": _bp[0] if _bp else None,
                 "refs": _ref_positions(_expand_cpp_ref(sub(m.params or ""),
                                                        known),
                                        _with_scalars(names))}
@@ -5496,6 +5736,39 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
                     "static %s %s(%s lhs, const %s *o) "
                     "{ return %s(&lhs, o); }"
                     % (cname, vfn, cname, cname, fn))
+            # A *both* by-value door, which is what a tree needs.
+            #
+            # `_v` above lets a chain nest to the left, because that is the
+            # only direction a left-to-right fold ever nests. Precedence
+            # nests to the right as well -- `a + b * c` is
+            # `add(a, mul(b, c))` -- and the right operand of the ordinary
+            # form is `const T *`, which a call result has no address for.
+            # Taking both by value is the one spelling that composes in
+            # either direction, so an operand may be a name or another
+            # application without the rewriter caring which.
+            #
+            # Same ownership guard as `_v`, extended to the operand: a
+            # by-value copy of an owning class would make a second owner,
+            # and here there are two operands that could be one. Without
+            # the wrapper the mixed-precedence refusal stands, which is the
+            # behaviour an owning class had before.
+            # The symmetric operator names its *own* class, which is being
+            # emitted now and so is not in `known` yet -- looking it up
+            # there found nothing and silently withheld the wrapper from
+            # every `T operator+(const T &)` there is.
+            _arg = info["binop"][op]["arg"]
+            _argi = known.get(_arg) if _arg and _arg != cname else None
+            if dtor is None and (_arg is None or _arg == cname
+                                 or (_argi is not None
+                                     and not _argi["dtor"])):
+                _acn = info["binop"][op]["arg"] or cname
+                vvfn = "%s_vv" % fn
+                info["binop"][op]["vvfn"] = vvfn
+                mprotos.append("static %s %s(%s lhs, %s o);"
+                               % (cret, vvfn, cname, _acn))
+                (tail if emitting_outline[0] else out).append(
+                    "static %s %s(%s lhs, %s o) { return %s(&lhs, &o); }"
+                    % (cret, vvfn, cname, _acn, fn))
         elif m.kind == "cmp":
             op = m.name[len("operator"):]
             fn = "%s__cmp%s" % (cname, _CMP_NAMES[op])
@@ -7067,7 +7340,7 @@ def _rewrite_scopes_inner(text, type_info, _pos):
                 i = m.end()                  # exactly what C++ would do
                 continue
             if src is None and (_is_call_result(rhs)
-                                or _is_binop_result(rhs, scopes, type_info)):
+                                or _is_binop_result(rhs, scopes, type_info, ctype)):
                 # `T a = f();` -- the callee returned by value, which is a
                 # move *out* of its local, so this is a move *in*. The plain
                 # struct assignment is exactly right: no constructor to run,
@@ -7308,7 +7581,7 @@ def _rewrite_scopes_inner(text, type_info, _pos):
                     i = m.end()
                     continue
                 if src is None and (_is_call_result(rhs)
-                                    or _is_binop_result(rhs, scopes, type_info)):
+                                    or _is_binop_result(rhs, scopes, type_info, ctype)):
                     # `a = f();` -- the callee returned by value, which is a
                     # move *out* of its local, so there is no second owner
                     # and nothing to copy. The old value still has to be
@@ -7823,6 +8096,23 @@ def _binop_refusal(rhs, scopes, type_info):
     if m:
         cls, ent = _binop_of(m.group(1), m.group(2))
         if ent is not None and ent.get("vfn") is None:
+            if _BIN_PREC[m.group(2)] != _BIN_PREC[m.group(4)]:
+                # Mixed precedence *and* no by-value door. Both facts
+                # matter, and the chain message below names only the
+                # second -- worse, its `t %s= ..; t %s= ..` advice folds
+                # left, which is the grouping this run does not have. It
+                # was telling the reader to write the wrong program.
+                return ("`%s`: mixing `%s` and `%s` in one run of "
+                        "overloaded operators needs each result passed on "
+                        "by value, and %s owns a resource, so the copy "
+                        "would make a second owner of it. Assign the "
+                        "tighter-binding part to a local first (`%s t = "
+                        "%s %s %s;`) and then apply the other -- note that "
+                        "`%s= ..; %s= ..` would group left, which is not "
+                        "what this expression means."
+                        % (rhs, m.group(2), m.group(4), cls, cls,
+                           m.group(3), m.group(4), m.group(5),
+                           m.group(2), m.group(4)))
             return ("`%s`: chaining `%s` over %s is not in this subset. A run "
                     "passes the first result into the second by value, and %s "
                     "owns a resource, so the copy would make a second owner "
@@ -7862,7 +8152,59 @@ def _binop_refusal(rhs, scopes, type_info):
     return None
 
 
-def _is_binop_result(rhs, scopes, type_info):
+def _binop_tree(operands, ops, lookup, scopes, cinfo):
+    """Lower a run of overloaded operators respecting precedence, or None.
+
+    The fold this replaces went strictly left to right, so a run mixing `+`
+    and `*` would have computed `(a + b) * c` and was refused rather than
+    mistranslated. The refusal was correct and it refused `y = A * x + b`,
+    which is the one line every linear algebra program contains.
+
+    Reassociating is safe here for a reason particular to this subset: an
+    operand in such a run is already required to be a plain *name*, so the
+    run is a flat list of names and operators with no sub-expressions to
+    evaluate and therefore no evaluation order to disturb. Shunting-yard
+    over that list is a regrouping of calls, not a change to what runs.
+
+    Every application goes through the `_vv` door, so an operand may be a
+    name or another application indifferently. `None` if any step lacks
+    one -- an owning class has no by-value door, and the caller then
+    reports the refusal it always did.
+    """
+    out, stack = [], []
+    for idx, name in enumerate(operands):
+        out.append(("leaf", name))
+        if idx < len(ops):
+            while stack and _BIN_PREC[stack[-1]] >= _BIN_PREC[ops[idx]]:
+                out.append(("op", stack.pop()))
+            stack.append(ops[idx])
+    while stack:
+        out.append(("op", stack.pop()))
+
+    work = []
+    for kind, val in out:
+        if kind == "leaf":
+            sym = lookup(scopes, val)
+            if sym is None or sym[1]:      # a pointer has no value to pass
+                return None
+            work.append((sym[0], val))
+            continue
+        if len(work) < 2:
+            return None
+        (lcls, ltext), (rcls, rtext) = work[-2], work[-1]
+        del work[-2:]
+        ent = (cinfo.get(lcls) or {}).get("binop", {}).get(val)
+        if ent is None or ent.get("vvfn") is None:
+            return None
+        if rcls != (ent.get("arg") or lcls):
+            return None
+        work.append((ent["ret"], "%s(%s, %s)" % (ent["vvfn"], ltext, rtext)))
+    if len(work) != 1:
+        return None
+    return work[0][1]
+
+
+def _is_binop_result(rhs, scopes, type_info, ctype=None):
     """Is `rhs` a single overloaded binary operator over named objects?
 
     `Buf s = a + b;` becomes `Buf s = Buf__binadd(&a, &b);` -- a call whose
@@ -7886,7 +8228,13 @@ def _is_binop_result(rhs, scopes, type_info):
         return False
     cls = named[1]
     ent = (type_info.get(cls) or {}).get("binop", {}).get(m.group(2))
-    return bool(ent) and ent.get("ret") == cls
+    # What has to match is the *declaration's* type, not the receiver's:
+    # `Vec y = A * x;` is a move-in from a call returning a `Vec`, and the
+    # receiver being a `Mat` says nothing about that. Comparing against the
+    # receiver refused every operator whose result is a different class,
+    # which is matrix-times-vector and matrix-times-scalar -- most of what
+    # a linear algebra type does.
+    return bool(ent) and ent.get("ret") == (ctype or cls)
 
 
 def _is_call_result(rhs):
@@ -9327,7 +9675,34 @@ def _rewrite_calls_inner(text, cinfo, free_refs, free_rets, _pos):
                 ent = cinfo[sym[0]].get("binop", {}).get(m.group(2))
             if ent is not None:
                 rsym = lookup(scopes, m.group(3))
-                if rsym is not None and rsym[0] == sym[0]:
+                # The operand class the operator declares, which is this
+                # class for the symmetric `T operator+(const T &)` and a
+                # different one for `Vec operator*(const Vec &)` on a `Mat`.
+                want = ent.get("arg") or sym[0]
+                if rsym is not None and rsym[0] == want:
+                    # Look the whole run over first. While every operator in
+                    # it binds equally tightly the left-to-right fold below
+                    # is already right, and is kept so that the common case
+                    # emits exactly what it always did. A run that *mixes*
+                    # precedence needs regrouping, and gets it from
+                    # `_binop_tree` -- or, if any step has no by-value door,
+                    # falls through to the refusal that stood before.
+                    _rops, _rnames = [m.group(2)], [m.group(1), m.group(3)]
+                    _scan = m.end()
+                    while True:
+                        _cm = bin_re_cont.match(look, _scan)
+                        if _cm is None:
+                            break
+                        _rops.append(_cm.group(1))
+                        _rnames.append(_cm.group(2))
+                        _scan = _cm.end()
+                    if len(set(_BIN_PREC[o] for o in _rops)) > 1:
+                        built = _binop_tree(_rnames, _rops, lookup, scopes,
+                                            cinfo)
+                        if built is not None:
+                            out.append(built)
+                            i = _scan
+                            continue
                     ldr = "" if sym[1] else "&"
                     rdr = "" if rsym[1] else "&"
                     expr = ("%s(%s%s, %s%s)"
@@ -9359,7 +9734,8 @@ def _rewrite_calls_inner(text, cinfo, free_refs, free_rets, _pos):
                         ent2 = cinfo[sym[0]].get("binop", {}).get(op2)
                         rs2 = lookup(scopes, rhs2)
                         if ent2 is None or ent2.get("vfn") is None \
-                                or rs2 is None or rs2[0] != sym[0]:
+                                or rs2 is None \
+                                or rs2[0] != (ent2.get("arg") or sym[0]):
                             break
                         expr = ("%s(%s, %s%s)"
                                 % (ent2["vfn"], expr,
@@ -11903,7 +12279,12 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
                 "`<algorithm>` has nothing to hang that pass off. Use them "
                 "on a container (`<vector>`, `<set>`), which supplies one."
                 % (os.path.basename(path), left.group(1)))
-        return _drop_global_scope(text)
+        # Same last step as the class path below. A file of free kernels --
+        # which is what a numeric library's bottom layer is -- defines no
+        # classes and takes this exit, so inferring contracts only on the
+        # other side would have skipped exactly the functions the inference
+        # exists for.
+        return _drop_global_scope(_auto_contracts(text))
 
     tclasses = dict((cls.name, cls) for _s, _e, cls in classes if cls.tparams)
     tnames = set(tclasses)
@@ -12397,6 +12778,11 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     out = _SRC_MARK_RE.sub("", out).replace("typedef int ;\n", "\n")
     if decls_out:
         out = _publish_decls_linkage(out, _publish[0], _publish[1])
+    # Last, over the assembled text: a kernel reaches its final parameter
+    # spelling only after monomorphisation, so the bound this reads
+    # (`float d[16]`) is what the substitution produced. Running earlier
+    # would have seen `T d[N]` and been able to infer nothing.
+    out = _auto_contracts(out)
     return _drop_global_scope(out)
 
 
