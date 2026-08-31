@@ -113,7 +113,8 @@ def analyze(il_code, symbol_table, ext_info):
             if p0.get("elem_size") == 1 and not p0.get("elem_signed", True):
                 desc["elem"] = "u8"
         else:
-            desc = _classify_elementwise(cmds, ptrs, layout, name_of)
+            desc = (_classify_matvec(cmds, ptrs, layout)
+                    or _classify_elementwise(cmds, ptrs, layout, name_of))
         if not desc:
             result.reason = "alignment proven but body is not a recognized kernel"
             reports.append(result)
@@ -122,7 +123,7 @@ def analyze(il_code, symbol_table, ext_info):
         # No length argument (fixed-size kernel like vadd256): the trip count is
         # the proven element count, baked in as a literal. Requires all call
         # sites to agree on that size.
-        if len_index is None:
+        if len_index is None and desc["kind"] != "matvec":
             if len(counts) != 1:
                 result.reason = "fixed-size kernel: call sites disagree on length"
                 reports.append(result)
@@ -195,7 +196,17 @@ def _arg_layout(fname, symbol_table):
     # there, which is why a constructing kernel looked like it had inputs
     # and no destination. Modelled as argument 0 so every register
     # assignment below lands where the ABI actually puts things.
-    sret = _member_array(getattr(func_val.ctype, "ret", None))
+    _ret = getattr(func_val.ctype, "ret", None)
+    sret = _member_array(_ret)
+    # System V returns an aggregate of 16 bytes or less in registers, with
+    # no hidden pointer at all -- `Vec<float,4>` is exactly 16. Modelling
+    # one as sret invented an argument that is not there and shifted every
+    # register by one, which assembled fine and jumped into whatever the
+    # caller had left in rdi. Segfault rather than a wrong number, which
+    # was luck: the same mistake on a kernel that happened to be handed a
+    # writable address would have corrupted it silently.
+    if sret is not None and getattr(_ret, "size", 0) <= 16:
+        sret = None
     base_i = 0
     if sret is not None:
         layout.append({
@@ -250,6 +261,12 @@ def _merge_contracts(arg_contracts):
     return merged
 
 
+def _gcd(a, b):
+    while b:
+        a, b = b, a % b
+    return a
+
+
 def _prove_one_call_multi(il_code, name_of, caller, call, ptrs, len_index):
     """Prove a call where the kernel has several pointer arguments and one
     length argument (e.g. saxpy(alpha, x, y, out, n)). Every pointer must trace
@@ -276,11 +293,22 @@ def _prove_one_call_multi(il_code, name_of, caller, call, ptrs, len_index):
         counts.append(byte_size // p["elem_size"])
 
     if len_index is None:
-        # Fixed-size kernel with no length parameter: the processed count is the
-        # allocation itself, so every pointer must allocate the same count.
-        if len(set(counts)) != 1:
-            return None
-        return counts[0]
+        # Fixed-size kernel with no length parameter: the processed count is
+        # the allocation itself.
+        #
+        # Equal counts used to be required, which was right while every
+        # kind made one pass over parallel arrays. A matrix times a vector
+        # does not: its three arrays are `rows * cols`, `cols` and `rows`.
+        # What the contract needs to be checked against is the strongest
+        # divisibility that holds of *all* of them, which is their gcd --
+        # equal counts being the case where the gcd is the count. Weaker
+        # than necessary for a kernel whose arrays legitimately differ (a
+        # 2x8 matvec has 8-wide rows but reports 2), so it can refuse a
+        # kernel it might have allowed; it cannot allow one it should not.
+        acc = counts[0]
+        for c in counts[1:]:
+            acc = _gcd(acc, c)
+        return acc
 
     li = len_index - (1 if any(q.get("sret") for q in ptrs) else 0)
     if li >= len(call.args):
@@ -442,6 +470,81 @@ def _local_struct_array(cmds, defmap, addr, depth=0):
     if isinstance(d, value_cmds.AddrOf):
         return _member_array(getattr(d.var, "ctype", None))
     return None
+
+
+def _classify_matvec(cmds, ptrs, layout):
+    """`out[i] = sum_j M[i*C + j] * x[j]` -- a matrix times a vector.
+
+    Not a variant of the element-wise kinds: those make one pass over the
+    arrays, and this is a *reduction per row*. It is recognised from the
+    shape of the arguments rather than from the loop nest, because the nest
+    is two deep and the existing machinery reads flat loops. The signature
+    is unambiguous on its own: three fixed-size value structs where one has
+    exactly `rows * cols` elements and the other two have `rows` and
+    `cols` -- a `Mat<T,R,C>::operator*(const Vec<T,C> &) -> Vec<T,R>` and
+    essentially nothing else.
+
+    The body is still checked, so a differently-shaped function that
+    happened to have those three sizes is not silently replaced: two loads
+    feeding a multiply that accumulates, and one store of the element type.
+    """
+    if len(ptrs) != 3:
+        return None
+    sretp = next((p for p in ptrs if p.get("sret")), None)
+    if sretp is None:
+        return None
+    others = [p for p in ptrs if not p.get("sret")]
+    rows = sretp.get("member_count")
+    if rows is None or any(p.get("member_count") is None for p in others):
+        return None
+    elem = sretp["elem_size"]
+    if any(p["elem_size"] != elem for p in others):
+        return None
+    # Which of the two inputs is the matrix: the one sized rows * cols.
+    mat = vec = None
+    for a, b in ((others[0], others[1]), (others[1], others[0])):
+        if a["member_count"] == rows * b["member_count"]:
+            mat, vec = a, b
+            break
+    if mat is None:
+        return None
+    cols = vec["member_count"]
+    lanes = 16 // elem
+    # The row is what gets loaded a lane at a time, so it is the row that
+    # has to divide. A row that does not fill whole lanes would need a
+    # masked tail, which is exactly the thing these kernels do not have.
+    if cols < lanes or cols % lanes or rows < 1:
+        return None
+
+    stores = [c for c in cmds if isinstance(c, value_cmds.SetAt)]
+    elem_stores = [c for c in stores if c.val.ctype.is_floating()]
+    reads = [c for c in cmds if isinstance(c, value_cmds.ReadAt)]
+    if len(elem_stores) != 1 or len(reads) != 2:
+        return None
+    defmap = {}
+    for c in cmds:
+        for o in c.outputs():
+            defmap[o] = c
+    read_outs = {r.output for r in reads}
+
+    def is_load(v):
+        d = defmap.get(v)
+        while isinstance(d, value_cmds.Set):
+            v = d.arg
+            d = defmap.get(v)
+        return v in read_outs
+
+    # Somewhere a product of the two loads is accumulated.
+    if not any(isinstance(c, math_cmds.Mult)
+               and is_load(c.arg1) and is_load(c.arg2) for c in cmds):
+        return None
+
+    regs = _sysv_regs(layout)
+    return {"kind": "matvec", "elem_size": elem,
+            "in_regs": [regs[mat["index"]], regs[vec["index"]]],
+            "out_reg": regs[sretp["index"]],
+            "rows": rows, "cols": cols,
+            "scalar_reg": None, "len_reg": None}
 
 
 def _classify_elementwise(cmds, ptrs, layout, name_of=None):
@@ -905,6 +1008,47 @@ def synth_sse_elementwise(asm_code, desc):
             raw += ["movapd xmm1, xmm0", "unpckhpd xmm1, xmm1",
                     "addsd xmm0, xmm1"]
         raw += ["mov rsp, rbp", "pop rbp", "ret"]
+        for line in raw:
+            asm_code.add(asm_cmds.Raw(line))
+        return
+
+    # ---- matrix times vector: a reduction per row -------------------------
+    if desc["kind"] == "matvec":
+        rows, cols = desc["rows"], desc["cols"]
+        mat, vec = ins[0], ins[1]
+        row_bytes = cols * elem
+        # A moving pointer per array rather than `[base + index + offset]`:
+        # three registers in one effective address is not encodable, and the
+        # row offset changes every iteration. r8-r11 are caller-saved, so
+        # there is nothing to preserve.
+        raw = ["push rbp", "mov rbp, rsp",
+               "mov r10, %s" % mat,          # walks one row at a time
+               "mov r11, %s" % out,          # walks one result at a time
+               "mov r9d, %d" % rows]
+        rowl, chunk = asm_code.get_label(), asm_code.get_label()
+        raw += [rowl + ":",
+                ("xorps xmm0, xmm0" if elem == 4 else "xorpd xmm0, xmm0"),   # lane accumulator
+                "xor rax, rax",
+                "mov r8d, %d" % (cols // lanes),
+                chunk + ":",
+                "%s xmm1, [r10 + rax]" % mov,
+                "%s xmm2, [%s + rax]" % (mov, vec),
+                "mul%s xmm1, xmm2" % suf,
+                "add%s xmm0, xmm1" % suf,
+                "add rax, 16", "dec r8d", "jnz " + chunk]
+        # Horizontal sum of the lanes: the row's dot product.
+        if elem == 4:
+            raw += ["movaps xmm1, xmm0", "shufps xmm1, xmm0, 0x0e",
+                    "addps xmm0, xmm1", "movaps xmm1, xmm0",
+                    "shufps xmm1, xmm0, 0x01", "addss xmm0, xmm1",
+                    "movss [r11], xmm0"]
+        else:
+            raw += ["movapd xmm1, xmm0", "unpckhpd xmm1, xmm1",
+                    "addsd xmm0, xmm1", "movsd [r11], xmm0"]
+        raw += ["add r10, %d" % row_bytes,
+                "add r11, %d" % elem,
+                "dec r9d", "jnz " + rowl,
+                "mov rsp, rbp", "pop rbp", "ret"]
         for line in raw:
             asm_code.add(asm_cmds.Raw(line))
         return
