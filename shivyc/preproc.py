@@ -473,6 +473,22 @@ def _string_token(text, r):
     return toks[0] if toks else Token(token_kinds.string, [0], rep='""', r=r)
 
 
+def _retag(tok, r):
+    """Return a copy of `tok` positioned at range `r`.
+
+    Used to move a macro-body token to the invocation site. A copy rather than
+    a mutation because the macro body is shared by every expansion of that
+    macro -- mutating it would make the second call site inherit the first
+    one's position.
+    """
+    if r is None or tok.r is r:
+        return tok
+    new = Token(tok.kind, tok.content, tok.rep, r)
+    new.wide = tok.wide
+    new.logical_line = tok.logical_line
+    return new
+
+
 class _PP:
     """A token paired with the set of macro names it may not be expanded by."""
 
@@ -965,6 +981,19 @@ class _Preprocessor:
                 i += 1
                 continue
 
+            # C99 6.10.8: __LINE__ and __FILE__ denote the position of the
+            # *invocation*, not of the macro definition. A body token carries
+            # the definition's range, so without retagging, every diagnostic
+            # macro defined in a header reports that header's own line -- e.g.
+            # `#define CHECK(p) report(__FILE__, __LINE__)` in a .h blamed the
+            # .h for every call site in every .c.
+            #
+            # The retag also covers body tokens that name another macro, so
+            # the call site propagates through nesting: with `#define A()
+            # __LINE__` and `#define B() A()`, the `A` inside B's body would
+            # otherwise hand A's expansion B's definition range.
+            if nm in ("__LINE__", "__FILE__") or (nm and nm in self.macros):
+                t = _retag(t, r)
             items.append(("tok", _PP(t)))         # body token: fresh hide
             i += 1
 
