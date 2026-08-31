@@ -12007,7 +12007,7 @@ def _lower_lambdas(text, path):
 
 def translate(text, path="<cpp>", owning=None, basedir=None,
               incdirs=(), defines=(), clang=None, rtti=False, decls=(),
-              decls_out=None):
+              decls_out=None, contracts=False):
     """Translate a C++ subset source to C. Raises CppError on anything else.
 
     `owning` maps the name of a type this file does *not* define to the
@@ -12284,7 +12284,8 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
         # classes and takes this exit, so inferring contracts only on the
         # other side would have skipped exactly the functions the inference
         # exists for.
-        return _drop_global_scope(_auto_contracts(text))
+        return _drop_global_scope(
+            _auto_contracts(text) if contracts else text)
 
     tclasses = dict((cls.name, cls) for _s, _e, cls in classes if cls.tparams)
     tnames = set(tclasses)
@@ -12782,7 +12783,8 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     # spelling only after monomorphisation, so the bound this reads
     # (`float d[16]`) is what the substitution produced. Running earlier
     # would have seen `T d[N]` and been able to infer nothing.
-    out = _auto_contracts(out)
+    if contracts:
+        out = _auto_contracts(out)
     return _drop_global_scope(out)
 
 
@@ -12856,6 +12858,10 @@ def main(argv):
             return 2
         decls.append(args[i + 1])
         del args[i:i + 2]
+    want_contracts = False
+    if "--contracts" in args:
+        want_contracts = True
+        args.remove("--contracts")
     if "--rtti" in args:
         rtti = True
         args.remove("--rtti")
@@ -12926,7 +12932,8 @@ def main(argv):
         result = translate(text, path=src, owning=owning,
                            basedir=basedir, incdirs=incdirs,
                            defines=defines, clang=clang, rtti=rtti,
-                           decls=decls, decls_out=decls_out)
+                           decls=decls, decls_out=decls_out,
+                           contracts=want_contracts)
     except CppError as e:
         # The message goes where the output would have gone; the caller
         # reads it back and reports it against the `#include` line.

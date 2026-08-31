@@ -483,7 +483,29 @@ int main() {
 """
 
 
-class TestAutoContracts(Base):
+class TestContractsAreOptIn(Base):
+    """The default path emits none, so gcc still builds."""
+
+    def test_no_clauses_without_the_flag(self):
+        out = cpprust.translate(_AUTO)
+        self.assertNotIn("assert", out)
+
+
+class ContractBase(Base):
+    """Auto-contracts are opt-in, so these lower with the flag on.
+
+    They are a ShivyCX extension and gcc cannot parse one, so inserting
+    them unasked broke every gcc build of a file with a fixed-size array
+    parameter -- code that never asked for contracts at all. Written
+    contracts were always safe because writing one is already a statement
+    that ShivyCX is the target; an *inferred* one is not.
+    """
+
+    def lower(self, src):
+        return cpprust.translate(src, contracts=True)
+
+
+class TestAutoContracts(ContractBase):
     """The size in the type becoming the proof in the compiler.
 
     `Mat<float,4,4>` already says the element count is 16, and 16 is a
@@ -529,7 +551,7 @@ assert len(a) >= 64
         self.assertNotIn("assert not len(a) % 4", out)
 
 
-class TestAutoContractProof(Base):
+class TestAutoContractProof(ContractBase):
     """The inferred clauses proven at the far end, over a *stack* array.
 
     Two things had to give. The prover only resolved `malloc`, so a fixed
