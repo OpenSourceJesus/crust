@@ -156,6 +156,26 @@ def _build_function_names(il_code, symbol_table):
     return names
 
 
+def _member_array(ct):
+    """The fixed-size arithmetic array a struct carries at offset 0, or None.
+
+    `Vec<T,N>` lowers to `struct { T d[N]; }`, so a method's receiver is a
+    pointer to exactly this. Restricted to offset 0 on purpose: a member
+    further in would need its offset folded into every load and store, and
+    the synthesizer addresses straight off the register. One member at zero
+    is what a fixed-size vector or matrix is, and anything else is left
+    alone rather than half-handled.
+    """
+    if ct is None or not ct.is_struct_union():
+        return None
+    for _nm, (_off, _mt) in (getattr(ct, "offsets", None) or {}).items():
+        if _off == 0 and isinstance(_mt, ctypes.ArrayCType) \
+                and isinstance(_mt.n, int) and _mt.n > 0 \
+                and _mt.el.is_arith():
+            return _mt
+    return None
+
+
 def _arg_layout(fname, symbol_table):
     """Per-argument shape for `fname`: index, whether it is a pointer (and its
     element size), or an integer/float scalar. Drives the multi-array proof."""
@@ -179,13 +199,21 @@ def _arg_layout(fname, symbol_table):
         # a struct is not one. Treated as an ordinary opaque argument, it
         # still occupies its System V register, which is what the
         # synthesizer needs to know about it.
-        is_ptr = at.is_pointer() and at.arg.is_arith()
+        # A pointer to a struct whose whole content is a fixed-size
+        # arithmetic array is an array base too. That is what a method's
+        # receiver is -- `Vec_float_16 *this` over `struct { float d[16]; }`
+        # -- and treating it as opaque meant a kernel written as an
+        # operator had no arrays at all and could never be classified.
+        marr = _member_array(at.arg) if at.is_pointer() else None
+        is_ptr = at.is_pointer() and (at.arg.is_arith() or marr is not None)
         layout.append({
             "index": i,
             "is_ptr": is_ptr,
-            "elem_size": (at.arg.size if is_ptr else None),
-            "elem_signed": (getattr(at.arg, "signed", True) if is_ptr
-                            else None),
+            "elem_size": ((marr.el.size if marr is not None else at.arg.size)
+                          if is_ptr else None),
+            "elem_signed": ((getattr(marr.el if marr is not None else at.arg,
+                                     "signed", True)) if is_ptr else None),
+            "member_count": (marr.n if marr is not None else None),
             "is_int": (not at.is_pointer()) and at.is_integral(),
             "is_float": (not at.is_pointer()) and at.is_floating(),
         })
@@ -351,6 +379,10 @@ def _base_arg(cmds, defmap, addr, bases, depth=0):
     d = defmap.get(addr)
     if isinstance(d, value_cmds.Set):
         return _base_arg(cmds, defmap, d.arg, bases, depth + 1)
+    if isinstance(d, value_cmds.AddrRel) and not getattr(d, "chunk", 0):
+        # `this->d` is `AddrRel(this, 0)`, so the array's base is the
+        # struct pointer the parameter holds.
+        return _base_arg(cmds, defmap, d.base, bases, depth + 1)
     if isinstance(d, (math_cmds.Add, math_cmds.Subtr)):
         for side in (d.arg1, d.arg2):
             got = _base_arg(cmds, defmap, side, bases, depth + 1)
@@ -615,6 +647,12 @@ def _trace_malloc_bytes(il_code, name_of, cmds, val, depth=0):
         if at is not None and isinstance(at, ctypes.ArrayCType) \
                 and isinstance(at.n, int) and at.n > 0:
             return at.n * at.el.size
+        marr = _member_array(at)
+        if marr is not None:
+            # `&v` where `v` is a fixed-size vector. Its extent is a fact
+            # of its type rather than of the call, which makes it the
+            # strongest of the three allocations this pass recognises.
+            return marr.n * marr.el.size
         return None
     if isinstance(defn, control_cmds.Call):
         addr_of = {}
