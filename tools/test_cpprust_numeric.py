@@ -595,6 +595,63 @@ class TestAutoContractProof(ContractBase):
         self.assertEqual(subprocess.call([exe]), 3)
 
 
+_STRUCT_FIELD = """
+void la_add_f32_16(float o[16], const float a[16], const float b[16]) {
+    int i = 0;
+    for (i = 0; i < 16; i = i + 1) { o[i] = a[i] + b[i]; }
+}
+template<typename T, int N>
+class Vec {
+public:
+    T d[N];
+    Vec() { int i = 0; for (i = 0; i < N; i = i + 1) { d[i] = 0; } }
+};
+int main() {
+    Vec<float,16> a; Vec<float,16> b; Vec<float,16> c;
+    int i = 0;
+    for (i = 0; i < 16; i = i + 1) { a.d[i] = 1.0f; b.d[i] = 2.0f; }
+    la_add_f32_16(c.d, a.d, b.d);
+    return (int)c.d[0];
+}
+"""
+
+
+class TestStructFieldArrays(ContractBase):
+    """A fixed-size array that is a *member* of a local struct.
+
+    A fixed-size matrix is a struct with an inline array, so `a.d` is the
+    shape every call in such a library has. The prover knew `malloc` and a
+    bare array; a member reaches it as `AddrRel(&a, offset)`, which it read
+    as an unknown pointer and refused. The member is now found by its byte
+    offset in the struct's layout -- by offset rather than by name because
+    the name is not on the command, and the offset is what the address
+    actually is.
+    """
+
+    def _shivyc(self, src, args):
+        d = tempfile.mkdtemp()
+        c = os.path.join(d, "t.c")
+        with open(c, "w") as f:
+            f.write(self.lower(src))
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        target = os.path.join(d, "t")
+        rc = subprocess.call(
+            ["python3", "-m", "shivyc.main", c] + args + ["-o", target],
+            cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        self.assertEqual(rc, 0)
+        return target
+
+    def test_a_member_array_call_site_is_proven(self):
+        s = self._shivyc(_STRUCT_FIELD, ["-S"])
+        with open(s) as f:
+            body = f.read().split("la_add_f32_16:")[1].split("ret")[0]
+        self.assertIn("addps", body)
+        self.assertNotIn("addss", body)
+
+    def test_it_computes_the_right_answer(self):
+        self.assertEqual(subprocess.call([self._shivyc(_STRUCT_FIELD, [])]), 3)
+
+
 class TestKernelDelegationLimit(Base):
     """The library wants a class method delegating to a raw-pointer kernel
     template, and that does not work yet.
