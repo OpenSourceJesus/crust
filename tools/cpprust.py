@@ -3179,6 +3179,13 @@ def _monomorphise_function_templates(text, scan, path, _depth=0):
         if b_close is not None:
             class_spans.append((cm.start(), b_close, cm.group(1)))
 
+    # Class *template* bodies, so a call inside one can be told apart from
+    # a call at file scope. See the refusal below.
+    tclass_spans = []
+    for _cs, _ce, _cn in class_spans:
+        if re.search(r"(?<![\w])template\s*<[^;{}]*>\s*$", scan[:_cs].rstrip()):
+            tclass_spans.append((_cs, _ce, _cn))
+
     for m in re.finditer(r"(?<![\w])template\s*<", scan):
         lt = m.end() - 1
         gt = _match(scan, lt, "<", ">")
@@ -3353,6 +3360,39 @@ def _monomorphise_function_templates(text, scan, path, _depth=0):
         for u in ([] if t.get("ctor_of") else re.finditer(
                 r"(?<![\w])%s\s*<([^;{}()]*)>\s*\(" % re.escape(t["name"]),
                 scan)):
+            _tc = next(((cs, ce, cn) for cs, ce, cn in tclass_spans
+                        if cs <= u.start() < ce), None)
+            if _tc is not None:
+                # A call to a function template from inside a *class*
+                # template's body. Its arguments may name the enclosing
+                # class's parameters -- `la_add<T,N>(..)` inside
+                # `Vec<T,N>::operator+` -- and this pass runs before any
+                # class is monomorphised, so `T` and `N` are still
+                # literally those letters. Instantiating now emitted
+                # `la_add_T_N(T o[N], ..)`: a function whose parameter type
+                # C has never heard of, with no diagnostic, because nothing
+                # downstream knew a template had been involved.
+                #
+                # Deferring it properly means keeping the definition alive
+                # for a second run after the classes substitute, which the
+                # pass is not structured for -- it consumes each template
+                # once and blanks it. Until it is, this is reported rather
+                # than approximated, which is the rule this compiler runs
+                # on. The workaround costs one line at the call.
+                raise CppError(
+                    "%s:%d: `%s<%s>` is called from inside the class "
+                    "template `%s`, whose parameters are not substituted "
+                    "yet -- so the arguments here are still the letters "
+                    "`%s`, not types. Function templates are "
+                    "monomorphised before classes are, and this lowering "
+                    "has no second pass to catch the call afterwards. "
+                    "Give the kernel a concrete instantiation at file "
+                    "scope and call that, or write the loop in the method "
+                    "body."
+                    % (os.path.basename(path), _src_line(scan, u.start()),
+                       t["name"], u.group(1).strip(), _tc[2],
+                       u.group(1).strip()))
+
             if any(o["start"] <= u.start() < o["end"] for o in tmpl):
                 # Inside *some* template's body -- this one's (a recursive
                 # use) or a sibling overload's. Either way the call cannot

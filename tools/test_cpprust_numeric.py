@@ -595,5 +595,56 @@ class TestAutoContractProof(ContractBase):
         self.assertEqual(subprocess.call([exe]), 3)
 
 
+class TestKernelDelegationLimit(Base):
+    """The library wants a class method delegating to a raw-pointer kernel
+    template, and that does not work yet.
+
+    Function templates are monomorphised *before* classes are, so a
+    `la_add<T,N>(..)` inside `Vec<T,N>::operator+` was instantiated while
+    `T` and `N` were still literally those letters -- emitting
+    `la_add_T_N(T o[N], ..)`, a function whose parameter type C has never
+    heard of, with no diagnostic at all. Pinned as a refusal until the pass
+    grows the second run that would let the call wait.
+    """
+
+    def test_kernel_template_called_from_a_class_template_is_refused(self):
+        self.refuses("""
+template<typename T, int N>
+void la_add(T o[N], const T a[N], const T b[N]) {
+    int i = 0;
+    for (i = 0; i < N; i = i + 1) { o[i] = a[i] + b[i]; }
+}
+template<typename T, int N>
+class Vec {
+public:
+    T d[N];
+    Vec() { d[0] = 0; }
+    Vec operator+(const Vec &o) { Vec r; la_add<T,N>(r.d, d, o.d); return r; }
+};
+Vec<float,16> v;
+""", "whose parameters are not substituted yet")
+
+    def test_a_concrete_kernel_still_works(self):
+        """The workaround the diagnostic names: instantiate the kernel at
+        file scope and call that."""
+        out = self.lower("""
+void la_add_f32_16(float o[16], const float a[16], const float b[16]) {
+    int i = 0;
+    for (i = 0; i < 16; i = i + 1) { o[i] = a[i] + b[i]; }
+}
+template<typename T, int N>
+class Vec {
+public:
+    T d[N];
+    Vec() { d[0] = 0; }
+    Vec operator+(const Vec &o) {
+        Vec r; la_add_f32_16(r.d, d, o.d); return r;
+    }
+};
+Vec<float,16> v;
+""")
+        self.assertIn("la_add_f32_16(r.d, this->d, o->d);", out)
+
+
 if __name__ == "__main__":
     unittest.main()
