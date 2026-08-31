@@ -589,6 +589,27 @@ def _trace_malloc_bytes(il_code, name_of, cmds, val, depth=0):
     defn = defs.get(val)
     if isinstance(defn, value_cmds.Set):
         return _trace_malloc_bytes(il_code, name_of, cmds, defn.arg, depth + 1)
+    if isinstance(defn, value_cmds.AddrRel):
+        # `v.d` where `v` is a local struct and `d` a fixed-size array
+        # member. A fixed-size matrix *is* a struct with an inline array,
+        # so this is the shape every method-based kernel call has: the
+        # operator hands `r.d`, `this->d` and `o->d` to the kernel, and
+        # without this none of them could be proven and the whole
+        # class-plus-kernel design got scalar code.
+        #
+        # `AddrRel(out, base, chunk)` is `&base + chunk`, so the member is
+        # the one at that byte offset. Found by offset rather than by name
+        # because the name is not on the command -- and the offset is what
+        # the address actually is, which makes it the honest key.
+        bt = getattr(defn.base, "ctype", None)
+        chunk = getattr(defn, "chunk", 0) or 0
+        if bt is not None and bt.is_struct_union() \
+                and getattr(defn, "count", None) is None:
+            for _nm, (_off, _mt) in (bt.offsets or {}).items():
+                if _off == chunk and isinstance(_mt, ctypes.ArrayCType) \
+                        and isinstance(_mt.n, int) and _mt.n > 0:
+                    return _mt.n * _mt.el.size
+        return None
     if isinstance(defn, value_cmds.AddrOf):
         at = getattr(defn.var, "ctype", None)
         if at is not None and isinstance(at, ctypes.ArrayCType) \
