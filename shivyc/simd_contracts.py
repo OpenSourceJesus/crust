@@ -188,6 +188,23 @@ def _arg_layout(fname, symbol_table):
     if func_val is None:
         return []
     layout = []
+    # A function returning a struct by value takes a hidden destination
+    # pointer as its first argument (System V's sret), so the IL has one
+    # more LoadArg than the source signature has parameters. That hidden
+    # argument is the kernel's *output*: an `operator+` writes its result
+    # there, which is why a constructing kernel looked like it had inputs
+    # and no destination. Modelled as argument 0 so every register
+    # assignment below lands where the ABI actually puts things.
+    sret = _member_array(getattr(func_val.ctype, "ret", None))
+    base_i = 0
+    if sret is not None:
+        layout.append({
+            "index": 0, "is_ptr": True, "elem_size": sret.el.size,
+            "elem_signed": getattr(sret.el, "signed", True),
+            "member_count": sret.n, "is_int": False, "is_float": False,
+            "sret": True,
+        })
+        base_i = 1
     for i, at in enumerate(func_val.ctype.args):
         # A pointer counts as a kernel *array* only when it points at an
         # arithmetic element. A method lowered from the C++ subset takes
@@ -207,7 +224,7 @@ def _arg_layout(fname, symbol_table):
         marr = _member_array(at.arg) if at.is_pointer() else None
         is_ptr = at.is_pointer() and (at.arg.is_arith() or marr is not None)
         layout.append({
-            "index": i,
+            "index": i + base_i,
             "is_ptr": is_ptr,
             "elem_size": ((marr.el.size if marr is not None else at.arg.size)
                           if is_ptr else None),
@@ -242,10 +259,18 @@ def _prove_one_call_multi(il_code, name_of, caller, call, ptrs, len_index):
     # element count of each pointer's allocation (must all be consistent)
     counts = []
     for p in ptrs:
-        if p["index"] >= len(call.args):
+        if p.get("sret"):
+            # The hidden destination. Its extent is the return type's, so
+            # there is nothing at the call site to prove about it -- and
+            # nothing to look for either, since it is not among the
+            # arguments the source wrote.
+            counts.append(p["member_count"])
+            continue
+        idx = p["index"] - (1 if any(q.get("sret") for q in ptrs) else 0)
+        if idx >= len(call.args):
             return None
         byte_size = _trace_malloc_bytes(
-            il_code, name_of, cmds, call.args[p["index"]])
+            il_code, name_of, cmds, call.args[idx])
         if byte_size is None:
             return None
         counts.append(byte_size // p["elem_size"])
@@ -257,9 +282,10 @@ def _prove_one_call_multi(il_code, name_of, caller, call, ptrs, len_index):
             return None
         return counts[0]
 
-    if len_index >= len(call.args):
+    li = len_index - (1 if any(q.get("sret") for q in ptrs) else 0)
+    if li >= len(call.args):
         return None
-    length = _trace_literal(il_code, cmds, call.args[len_index])
+    length = _trace_literal(il_code, cmds, call.args[li])
     if length is None:
         return None
     for cnt in counts:
@@ -391,6 +417,33 @@ def _base_arg(cmds, defmap, addr, bases, depth=0):
     return None
 
 
+def _local_struct_array(cmds, defmap, addr, depth=0):
+    """The fixed-size member array of the local struct an address is
+    computed from, or None. `r.d[i]` where `r` is a local `Vec`."""
+    if addr is None or depth > 16:
+        return None
+    d = defmap.get(addr)
+    if isinstance(d, value_cmds.Set):
+        return _local_struct_array(cmds, defmap, d.arg, depth + 1)
+    if isinstance(d, value_cmds.AddrRel) and not getattr(d, "chunk", 0):
+        # A local struct is not produced by any command -- it *is* the
+        # stack object, so the `AddrRel` names it directly and there is
+        # nothing further back to walk. Its type is the whole answer.
+        got = _member_array(getattr(d.base, "ctype", None))
+        if got is not None:
+            return got
+        return _local_struct_array(cmds, defmap, d.base, depth + 1)
+    if isinstance(d, (math_cmds.Add, math_cmds.Subtr)):
+        for side in (d.arg1, d.arg2):
+            got = _local_struct_array(cmds, defmap, side, depth + 1)
+            if got is not None:
+                return got
+        return None
+    if isinstance(d, value_cmds.AddrOf):
+        return _member_array(getattr(d.var, "ctype", None))
+    return None
+
+
 def _classify_elementwise(cmds, ptrs, layout, name_of=None):
     """Recognize a float element-wise store kernel and return a descriptor with
     the System V registers the synthesizer needs. Supported shapes:
@@ -420,11 +473,14 @@ def _classify_elementwise(cmds, ptrs, layout, name_of=None):
         if dotdesc:
             return dotdesc
 
-    if len(stores) != 1:
+    # A constructing kernel has a second store: the local it builds is
+    # copied into the hidden return slot on the way out. Only the one
+    # writing an element of the array is the loop body, and it is the one
+    # whose value has the element type.
+    elem_stores = [c for c in stores if c.val.ctype.is_floating()]
+    if len(elem_stores) != 1:
         return None
-    store = stores[0]
-    if not store.val.ctype.is_floating():
-        return None
+    store = elem_stores[0]
     elem_size = store.val.ctype.size
     read_outs = {r.output for r in reads}
 
@@ -456,6 +512,20 @@ def _classify_elementwise(cmds, ptrs, layout, name_of=None):
     # produce, so the destination is now read off the store.
     bases = _arg_bases(cmds)
     out_index = _base_arg(cmds, defmap, store.addr, bases)
+    sretp = next((p for p in ptrs if p.get("sret")), None)
+    if out_index is None and sretp is not None:
+        # `Vec operator+(..) { Vec r; ..; return r; }` -- the loop writes a
+        # *local*, which is then copied into the hidden destination. Since
+        # the trip count equals the element count, every element of that
+        # local is assigned before the copy, so writing the destination
+        # directly is the same program with the copy elided. Requiring the
+        # counts to match is what makes that true: a loop covering only
+        # part of the array would leave the rest to the constructor, and
+        # skipping the local would lose it.
+        larr = _local_struct_array(cmds, defmap, store.addr)
+        if larr is not None and larr.n == sretp["member_count"] \
+                and larr.el.size == sretp["elem_size"]:
+            out_index = 0
     if out_index is None or out_index not in [p["index"] for p in ptrs]:
         return None
     in_regs = [regs[p["index"]] for p in ptrs if p["index"] != out_index]
