@@ -762,5 +762,76 @@ int main() {
             without)
 
 
+_CTOR_KERNEL = """
+template<typename T, int N>
+class Vec {
+public:
+    T d[N];
+    Vec() { int i = 0; for (i = 0; i < N; i = i + 1) { d[i] = 0; } }
+    Vec operator+(const Vec &o)
+    assert not len(o) %% 4
+    {
+        Vec r; int i = 0;
+        for (i = 0; i < N; i = i + 1) { r.d[i] = d[i] + o.d[i]; }
+        return r;
+    }
+};
+int main() {
+    Vec<float,16> a; Vec<float,16> b;
+    int i = 0;
+    for (i = 0; i < 16; i = i + 1) { a.d[i] = 1.0f; b.d[i] = 2.0f; }
+    Vec<float,16> c = a + b;
+    return (int)c.d[0];
+}
+""" % ()
+
+
+class TestConstructingKernel(Base):
+    """An `operator+` returning by value *is* the kernel.
+
+    This is the shape the library is built on, and it needed three things
+    that were not there. A function returning a struct takes a hidden
+    destination pointer (System V's sret), so the IL has one more argument
+    than the source signature -- and that hidden argument is the output,
+    which is why the operator looked like inputs with nowhere to write. The
+    loop then writes a *local*, copied out on return; since the trip count
+    equals the element count, every element is assigned before the copy, so
+    writing the destination directly is the same program with the copy
+    elided. And a constructing kernel has two stores, only one of which has
+    the element type.
+
+    What comes out is the whole operator as a fallback-free packed loop:
+    the local, its zeroing constructor and the return copy are all gone.
+    """
+
+    def _shivyc(self, args):
+        d = tempfile.mkdtemp()
+        c = os.path.join(d, "t.c")
+        with open(c, "w") as f:
+            f.write(self.lower(_CTOR_KERNEL))
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        target = os.path.join(d, "t")
+        rc = subprocess.call(
+            ["python3", "-m", "shivyc.main", c] + args + ["-o", target],
+            cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        self.assertEqual(rc, 0)
+        return target
+
+    def test_the_operator_is_synthesized_as_a_packed_loop(self):
+        with open(self._shivyc(["-S"])) as f:
+            body = f.read().split("Vec_float_16__binadd:")[1].split("\n\tret")[0]
+        self.assertIn("addps", body)
+        self.assertNotIn("addss", body)          # no scalar remainder
+        # sret destination in rdi, receiver in rsi, operand in rdx.
+        self.assertIn("[rdi + rax]", body)
+        self.assertIn("[rsi + rax]", body)
+        self.assertIn("[rdx + rax]", body)
+        # The local, its constructor and the return copy are elided.
+        self.assertNotIn("call", body)
+
+    def test_it_computes_the_right_answer(self):
+        self.assertEqual(subprocess.call([self._shivyc([])]), 3)
+
+
 if __name__ == "__main__":
     unittest.main()
