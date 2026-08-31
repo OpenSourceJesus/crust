@@ -833,5 +833,180 @@ class TestConstructingKernel(Base):
         self.assertEqual(subprocess.call([self._shivyc([])]), 3)
 
 
+_SMALL_VALUE = """
+template<typename T, int N>
+class Vec {
+public:
+    T d[N];
+    Vec() { int i = 0; for (i = 0; i < N; i = i + 1) { d[i] = 0; } }
+    Vec operator+(const Vec &o) {
+        Vec r; int i = 0;
+        for (i = 0; i < N; i = i + 1) { r.d[i] = d[i] + o.d[i]; }
+        return r;
+    }
+};
+int main() {
+    Vec<float,4> a; Vec<float,4> b;
+    int i = 0;
+    for (i = 0; i < 4; i = i + 1) { a.d[i] = 1.0f; b.d[i] = 2.0f; }
+    Vec<float,4> c = a + b;
+    return (int)(c.d[0] + c.d[1] + c.d[2] + c.d[3]);
+}
+"""
+
+
+_MATVEC = """
+template<typename T, int N>
+class Vec {
+public:
+    T d[N];
+    Vec() { int i = 0; for (i = 0; i < N; i = i + 1) { d[i] = 0; } }
+};
+template<typename T, int R, int C>
+class Mat {
+public:
+    T d[R * C];
+    Mat() { int i = 0; for (i = 0; i < R * C; i = i + 1) { d[i] = 0; } }
+    Vec<T,R> operator*(const Vec<T,C> &v) {
+        Vec<T,R> r; int i = 0; int j = 0;
+        for (i = 0; i < R; i = i + 1) {
+            T acc = 0;
+            for (j = 0; j < C; j = j + 1) {
+                acc = acc + d[i * C + j] * v.d[j];
+            }
+            r.d[i] = acc;
+        }
+        return r;
+    }
+};
+int main() {
+    Mat<float,8,8> M; Vec<float,8> x;
+    int i = 0;
+    for (i = 0; i < 64; i = i + 1) { M.d[i] = 1.0f; }
+    for (i = 0; i < 8; i = i + 1) { x.d[i] = 2.0f; }
+    Vec<float,8> y = M * x;
+    return (int)(y.d[0] + y.d[7]);
+}
+"""
+
+
+class TestSmallValueReturn(ContractBase):
+    """A value type of 16 bytes or less is returned in *registers*.
+
+    System V hands back an aggregate that size in rax/rdx or xmm0/xmm1,
+    with no hidden destination pointer at all -- and `Vec<float,4>` is
+    exactly 16. The constructing-kernel work modelled every struct return
+    as sret, so for this size it invented an argument that is not there and
+    shifted each register by one. That assembled cleanly and jumped into
+    whatever the caller had left in rdi.
+
+    Segfaulting was luck. The same mistake on a kernel handed a writable
+    address would have corrupted it silently, which is the failure this
+    compiler exists to make impossible -- so the boundary gets its own
+    test rather than riding on the larger sizes the other cases use.
+    """
+
+    #: A matvec whose *result* is exactly 16 bytes. This is the shape that
+    #: actually broke: `Mat<float,4,4> * Vec<float,4>` returns a
+    #: register-returned aggregate, and the synthesized kernel wrote
+    #: through the hidden pointer it assumed was in rdi.
+    SMALL_MATVEC = _MATVEC.replace("8,8", "4,4").replace(
+        "float,8", "float,4").replace("i < 64", "i < 16").replace(
+        "i < 8;", "i < 4;").replace("y.d[7]", "y.d[3]")
+
+    def test_a_sixteen_byte_matvec_result_is_correct(self):
+        """Without the size guard this segfaults: the kernel writes to
+        whatever the caller happened to leave in rdi."""
+        self.assertEqual(self._run(self.SMALL_MATVEC), 16)   # 4*2 + 4*2
+
+    def _run(self, src):
+        d = tempfile.mkdtemp()
+        c = os.path.join(d, "t.c")
+        with open(c, "w") as f:
+            f.write(self.lower(src))
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        exe = os.path.join(d, "t")
+        rc = subprocess.call(["python3", "-m", "shivyc.main", c, "-o", exe],
+                             cwd=root, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT)
+        self.assertEqual(rc, 0)
+        return subprocess.call([exe])
+
+    def test_a_sixteen_byte_result_is_correct(self):
+        d = tempfile.mkdtemp()
+        c = os.path.join(d, "t.c")
+        with open(c, "w") as f:
+            f.write(self.lower(_SMALL_VALUE))
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        exe = os.path.join(d, "t")
+        rc = subprocess.call(["python3", "-m", "shivyc.main", c, "-o", exe],
+                             cwd=root, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT)
+        self.assertEqual(rc, 0)
+        self.assertEqual(subprocess.call([exe]), 12)   # 4 lanes of 3.0
+
+    def test_gcc_agrees(self):
+        d = tempfile.mkdtemp()
+        c = os.path.join(d, "t.c")
+        with open(c, "w") as f:
+            f.write(cpprust.translate(_SMALL_VALUE))
+        exe = os.path.join(d, "t")
+        subprocess.check_output(["gcc", "-std=c11", "-w", "-o", exe, c],
+                                stderr=subprocess.STDOUT)
+        self.assertEqual(subprocess.call([exe]), 12)
+
+
+class TestMatVec(ContractBase):
+    """Matrix times vector -- a reduction per row, not one pass.
+
+    None of the element-wise kinds fit, so it is classified from the shape
+    of the arguments rather than from the loop nest: three fixed-size value
+    structs where one holds exactly `rows * cols` elements and the others
+    hold `rows` and `cols` is a `Mat<T,R,C>::operator*(const Vec<T,C> &)`
+    and essentially nothing else. The body is still checked, so a function
+    that merely had those three sizes is not silently replaced.
+    """
+
+    def _shivyc(self, asm=False):
+        d = tempfile.mkdtemp()
+        c = os.path.join(d, "t.c")
+        with open(c, "w") as f:
+            f.write(self.lower(_MATVEC))
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        target = os.path.join(d, "t.s" if asm else "t")
+        out = subprocess.run(
+            ["python3", "-m", "shivyc.main", c]
+            + (["-S"] if asm else []) + ["-o", target],
+            cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        self.assertEqual(out.returncode, 0, out.stdout.decode()[-1500:])
+        return target, out.stdout.decode()
+
+    def test_it_is_proven_and_packed(self):
+        s, log = self._shivyc(asm=True)
+        self.assertIn("'Mat_float_8_8__binmul': contracts proven", log)
+        with open(s) as f:
+            body = f.read().split("\nMat_float_8_8__binmul:")[1] \
+                           .split("\n\tret")[0]
+        self.assertIn("mulps", body)
+        self.assertIn("addps", body)
+        # The row's lanes are summed horizontally and one scalar stored.
+        self.assertIn("shufps", body)
+        self.assertIn("movss", body)
+
+    def test_it_computes_the_right_answer(self):
+        exe, _ = self._shivyc()
+        self.assertEqual(subprocess.call([exe]), 32)   # 8*2 + 8*2
+
+    def test_gcc_agrees(self):
+        d = tempfile.mkdtemp()
+        c = os.path.join(d, "t.c")
+        with open(c, "w") as f:
+            f.write(cpprust.translate(_MATVEC))
+        exe = os.path.join(d, "t")
+        subprocess.check_output(["gcc", "-std=c11", "-w", "-o", exe, c],
+                                stderr=subprocess.STDOUT)
+        self.assertEqual(subprocess.call([exe]), 32)
+
+
 if __name__ == "__main__":
     unittest.main()
