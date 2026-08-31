@@ -28,6 +28,7 @@ scalar codegen untouched.
 import shivyc.il_cmds.control as control_cmds
 import shivyc.il_cmds.value as value_cmds
 import shivyc.il_cmds.math as math_cmds
+import shivyc.ctypes as ctypes
 import shivyc.asm_cmds as asm_cmds
 import shivyc.spots as spots
 
@@ -168,15 +169,25 @@ def _arg_layout(fname, symbol_table):
         return []
     layout = []
     for i, at in enumerate(func_val.ctype.args):
-        is_ptr = at.is_pointer()
+        # A pointer counts as a kernel *array* only when it points at an
+        # arithmetic element. A method lowered from the C++ subset takes
+        # its receiver first -- `Kern_vadd(Kern *this, float *a, ..)` --
+        # and `this` is a pointer that no `malloc` in the caller produced,
+        # so requiring it to trace to one failed the proof for every
+        # kernel written as a member. It is not part of the loop either:
+        # the vectorized body indexes arrays of scalars, and a pointer to
+        # a struct is not one. Treated as an ordinary opaque argument, it
+        # still occupies its System V register, which is what the
+        # synthesizer needs to know about it.
+        is_ptr = at.is_pointer() and at.arg.is_arith()
         layout.append({
             "index": i,
             "is_ptr": is_ptr,
             "elem_size": (at.arg.size if is_ptr else None),
             "elem_signed": (getattr(at.arg, "signed", True) if is_ptr
                             else None),
-            "is_int": (not is_ptr) and at.is_integral(),
-            "is_float": (not is_ptr) and at.is_floating(),
+            "is_int": (not at.is_pointer()) and at.is_integral(),
+            "is_float": (not at.is_pointer()) and at.is_floating(),
         })
     return layout
 
@@ -316,6 +327,38 @@ def _classify_dot(cmds, ptrs, layout):
     return None
 
 
+def _arg_bases(cmds):
+    """`{ILValue: argument index}` for each parameter, from its LoadArg."""
+    out = {}
+    for c in cmds:
+        if isinstance(c, value_cmds.LoadArg):
+            out[c.output] = c.arg_num
+    return out
+
+
+def _base_arg(cmds, defmap, addr, bases, depth=0):
+    """Which parameter index an address is computed from, or None.
+
+    `out[i]` is `base + i * sizeof(elem)`, so the address reaching a
+    `SetAt` is an `Add` away from the pointer parameter it writes through.
+    Walking back to that parameter is how the output is *found* rather than
+    assumed.
+    """
+    if addr is None or depth > 16:
+        return None
+    if addr in bases:
+        return bases[addr]
+    d = defmap.get(addr)
+    if isinstance(d, value_cmds.Set):
+        return _base_arg(cmds, defmap, d.arg, bases, depth + 1)
+    if isinstance(d, (math_cmds.Add, math_cmds.Subtr)):
+        for side in (d.arg1, d.arg2):
+            got = _base_arg(cmds, defmap, side, bases, depth + 1)
+            if got is not None:
+                return got
+    return None
+
+
 def _classify_elementwise(cmds, ptrs, layout, name_of=None):
     """Recognize a float element-wise store kernel and return a descriptor with
     the System V registers the synthesizer needs. Supported shapes:
@@ -368,8 +411,23 @@ def _classify_elementwise(cmds, ptrs, layout, name_of=None):
         return v in read_outs
 
     regs = _sysv_regs(layout)
-    in_regs = [regs[p["index"]] for p in ptrs[:-1]]
-    out_reg = regs[ptrs[-1]["index"]]
+    # Which pointer the kernel *writes* through, found by walking the
+    # store's address back to the parameter it is computed from.
+    #
+    # This used to be a convention -- "the last pointer argument is the
+    # output" -- which held for every kernel anyone had written by hand
+    # (`vadd(a, b, out, n)`, `saxpy(alpha, x, y, out, n)`) and is not a
+    # property of C. A kernel spelled the other way round, `la_add(out, a,
+    # b)`, was classified with `out` as an input and `b` as the
+    # destination: it compiled, vectorized, and computed `b = out + a`.
+    # Silently wrong output is the one result this compiler must not
+    # produce, so the destination is now read off the store.
+    bases = _arg_bases(cmds)
+    out_index = _base_arg(cmds, defmap, store.addr, bases)
+    if out_index is None or out_index not in [p["index"] for p in ptrs]:
+        return None
+    in_regs = [regs[p["index"]] for p in ptrs if p["index"] != out_index]
+    out_reg = regs[out_index]
     floats = [a for a in layout if a["is_float"]]
     scalar_reg = regs[floats[0]["index"]] if floats else None
     ints = [a for a in layout if a["is_int"]]
@@ -511,13 +569,32 @@ def _trace_literal(il_code, cmds, val, depth=0):
 
 
 def _trace_malloc_bytes(il_code, name_of, cmds, val, depth=0):
-    """Follow Set-copies to a malloc() call; return its literal byte size."""
+    """Follow Set-copies to an allocation; return its literal byte size.
+
+    Two allocations count. A `malloc(..)` whose byte size is a literal, and
+    a **fixed-size array** -- `float x[16]` -- reached through the `AddrOf`
+    that decays it at the call. The array is if anything the easier proof:
+    a malloc's size is a literal this pass has to read back out of the call,
+    while an array's is part of its type and cannot be anything else.
+
+    It was not accepted before because the only shape anyone had needed was
+    the heap one. Fixed-size arrays are what a fixed-size matrix *is*, so
+    without this the contracts inferred from a template argument -- the
+    whole point of putting the size in the type -- could never be proven
+    at a call site that passed one.
+    """
     if val is None or depth > 16:
         return None
     defs = _defs(cmds)
     defn = defs.get(val)
     if isinstance(defn, value_cmds.Set):
         return _trace_malloc_bytes(il_code, name_of, cmds, defn.arg, depth + 1)
+    if isinstance(defn, value_cmds.AddrOf):
+        at = getattr(defn.var, "ctype", None)
+        if at is not None and isinstance(at, ctypes.ArrayCType) \
+                and isinstance(at.n, int) and at.n > 0:
+            return at.n * at.el.size
+        return None
     if isinstance(defn, control_cmds.Call):
         addr_of = {}
         for c in cmds:
