@@ -4269,6 +4269,44 @@ _DEF_HEAD = re.compile(
     r"(?<![\w])(?:static\s+)?[A-Za-z_][\w ]*?[\w\s\*]\s*(\w+)\s*\(")
 
 
+#: `struct Vec_float_16 { float d[16]; };` -- a struct whose whole content
+#: is one fixed-size scalar array, which is what a fixed-size vector or
+#: matrix lowers to.
+_VALUE_STRUCT = re.compile(
+    r"(?<![\w])struct\s+(\w+)\s*\{\s*([A-Za-z_][\w ]*?)\s+\w+\s*"
+    r"\[\s*([\d\s*+]+?)\s*\]\s*;\s*\}")
+
+#: `const Vec_float_16 *o` / `Vec_float_16 *this` in a parameter list.
+_VALUE_STRUCT_PARAM = re.compile(
+    r"^\s*(?:const\s+)?(?:struct\s+)?(\w+)\s*\*\s*(\w+)\s*$")
+
+
+def _value_structs(text):
+    """`{struct name: (element spelling, element count)}` for every struct
+    that is one fixed-size scalar array.
+
+    A `Vec<T,N>` lowers to exactly this, so the element count of a method's
+    receiver and operand is on the page -- which means the contracts can be
+    inferred for an operator the same way they already are for a kernel
+    taking `float a[16]`. That matters more than it looks: contracts are a
+    ShivyCX extension, so a header that *writes* them is not C++ and does
+    not compile under g++. Inferring them instead keeps the library
+    ordinary C++ that happens to vectorize when ShivyCX compiles it.
+    """
+    out = {}
+    for m in _VALUE_STRUCT.finditer(text):
+        elem = " ".join(m.group(2).split())
+        if elem not in _ELEM_BYTES:
+            continue
+        try:
+            count = int(eval(m.group(3), {"__builtins__": {}}, {}))
+        except Exception:
+            continue
+        if count > 0:
+            out[m.group(1)] = (elem, count)
+    return out
+
+
 def _auto_contracts(text):
     """Derive ShivyCX contract clauses from fixed-size array parameters.
 
@@ -4292,6 +4330,7 @@ def _auto_contracts(text):
     """
     out, pos = [], 0
     look = _blank_directives(_blank_strings(_strip_comments(text)))
+    vstructs = _value_structs(look)
     for m in _DEF_HEAD.finditer(look):
         if m.start() < pos:
             continue
@@ -4307,15 +4346,24 @@ def _auto_contracts(text):
         if k >= len(look) or look[k] != "{":
             continue
         params = text[op + 1:cp]
-        if "[" not in params:
+        if "[" not in params and not vstructs:
             continue
         clauses = []
         for part in _split_top(params):
             pm = _FIXED_ARRAY_PARAM.match(part)
-            if pm is None:
-                continue
-            elem = " ".join(pm.group(1).split())
-            size = int(pm.group(3))
+            if pm is not None:
+                elem = " ".join(pm.group(1).split())
+                size = int(pm.group(3))
+                name = pm.group(2)
+            else:
+                # A pointer to a value struct: the receiver or operand of an
+                # operator on a fixed-size vector.
+                sm = _VALUE_STRUCT_PARAM.match(part)
+                got = vstructs.get(sm.group(1)) if sm is not None else None
+                if got is None:
+                    continue
+                elem, size = got
+                name = sm.group(2)
             width = _ELEM_BYTES.get(elem)
             if width is None:
                 continue
@@ -4325,8 +4373,8 @@ def _auto_contracts(text):
             # exactly the case the scalar remainder exists for.
             if lanes < 2 or size < lanes or size % lanes:
                 continue
-            clauses.append("assert not len(%s) %% %d" % (pm.group(2), lanes))
-            clauses.append("assert len(%s) >= %d" % (pm.group(2), lanes))
+            clauses.append("assert not len(%s) %% %d" % (name, lanes))
+            clauses.append("assert len(%s) >= %d" % (name, lanes))
         if not clauses:
             continue
         out.append(text[pos:cp + 1])
