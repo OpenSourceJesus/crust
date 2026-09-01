@@ -125,6 +125,15 @@ void crust_ms_stack(void *base, unsigned long size, int initialized,
                     const char *name, const char *file, int line);
 void crust_ms_stack_end(void *base, const char *file, int line);
 
+/* Global/static object registration. Idempotent, unlike the stack form: a
+ * global has no single point of entry the way a frame does, so the compiler
+ * emits this at the top of whichever functions can reach it and the runtime
+ * discards the repeats. Globals are never retired -- they outlive every frame
+ * and the process ends before they do. Always registered as initialized,
+ * since C zero-initializes anything without an initializer. */
+void crust_ms_global(void *base, unsigned long size, const char *name,
+                     const char *file, int line);
+
 void crust_ms_il_read(const void *p, unsigned long n, const char *file,
                       int line, const char *func);
 void crust_ms_il_write(void *p, unsigned long n, const char *file,

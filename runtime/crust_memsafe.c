@@ -306,6 +306,16 @@ static long ms_bits_first_unset(struct ms_region *r, ms_addr a, size_t n)
 /* ---------------------------------------------------------------------- */
 /* diagnostics                                                              */
 
+static const char *ms_bound_title(int kind, int under)
+{
+    if (kind == CRUST_MS_STACK)
+        return under ? "stack buffer underflow" : "stack buffer overflow";
+    if (kind == CRUST_MS_GLOBAL)
+        return under ? "global buffer underflow" : "global buffer overflow";
+    return under ? "heap buffer underflow" : "heap buffer overflow";
+}
+
+
 static const char *ms_kindname(int kind)
 {
     if (kind == CRUST_MS_HEAP) return "heap";
@@ -361,7 +371,12 @@ static void ms_describe(struct ms_region *r)
     fprintf(stderr, "            spans 0x%lx .. 0x%lx\n",
             (unsigned long)r->base, (unsigned long)(r->base + r->size));
     if (r->afile) {
-        fprintf(stderr, "            allocated at %s:%d", r->afile, r->aline);
+        /* A frame object or a global is declared, not allocated; saying
+         * "allocated" of `int buf[8]` sends the reader looking for a malloc
+         * that does not exist. */
+        fprintf(stderr, "            %s at %s:%d",
+                r->kind == CRUST_MS_HEAP ? "allocated" : "declared",
+                r->afile, r->aline);
         if (r->afunc) fprintf(stderr, " in %s", r->afunc);
         fprintf(stderr, "\n");
     }
@@ -489,12 +504,7 @@ static int ms_check(const void *p, size_t n, int writing, const char *expr,
         struct ms_region *near = ms_find_near(a, &off);
         if (!near) return 1;
         if (ms_dedup_hit(file, line, 2)) return 0;
-        ms_head(near->kind == CRUST_MS_STACK
-                    ? (off < 0 ? "stack buffer underflow"
-                               : "stack buffer overflow")
-                    : (off < 0 ? "heap buffer underflow"
-                               : "heap buffer overflow"),
-                expr, file, line, func);
+        ms_head(ms_bound_title(near->kind, off < 0), expr, file, line, func);
         fprintf(stderr, "    %s of %lu byte%s at 0x%lx\n",
                 verb, (unsigned long)n, n == 1 ? "" : "s", (unsigned long)a);
         ms_describe(near);
@@ -536,9 +546,7 @@ static int ms_check(const void *p, size_t n, int writing, const char *expr,
     if (a + n > r->base + r->size) {
         unsigned long over = (unsigned long)((a + n) - (r->base + r->size));
         if (ms_dedup_hit(file, line, 4)) return 0;
-        ms_head(r->kind == CRUST_MS_STACK
-                    ? "stack buffer overflow" : "heap buffer overflow",
-                expr, file, line, func);
+        ms_head(ms_bound_title(r->kind, 0), expr, file, line, func);
         fprintf(stderr, "    %s of %lu byte%s at 0x%lx\n",
                 verb, (unsigned long)n, n == 1 ? "" : "s", (unsigned long)a);
         ms_describe(r);
@@ -595,6 +603,19 @@ void crust_ms_stack(void *base, unsigned long size, int initialized,
 void crust_ms_stack_end(void *base, const char *file, int line)
 {
     crust_ms_unregister(base, file, line, 0);
+}
+
+void crust_ms_global(void *base, unsigned long size, const char *name,
+                     const char *file, int line)
+{
+    struct ms_region *r;
+    if (!ms_ready) crust_ms_init();
+    if (!base || size == 0) return;
+    r = ms_find((ms_addr)base);
+    if (r && r->base == (ms_addr)base && r->state == MS_LIVE)
+        return;                     /* already known; a repeat, not a new object */
+    crust_ms_register(base, (size_t)size, CRUST_MS_GLOBAL, 1,
+                      name, file, line, 0);
 }
 
 void crust_ms_il_read(const void *p, unsigned long n, const char *file,
