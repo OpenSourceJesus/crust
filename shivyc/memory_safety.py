@@ -21,6 +21,7 @@ aliasing as it actually flows through the generated code.
 
 import sys
 import shivyc.il_cmds.control as control_cmds
+import shivyc.il_cmds.math as math_cmds
 import shivyc.il_cmds.value as value_cmds
 
 # Functions that return a fresh heap allocation owned by the caller.
@@ -343,6 +344,27 @@ def _use_check(ctx, fn, freed, idx, pt, diags, addr: "ILValue", kind, r=None):
                     _alloc_range(ctx.prog, al), ctx.freed_at.get(al)))
 
 
+def _note_live_access(ctx, freed, idx, pt, addr: "ILValue"):
+    """Record that command `idx` dereferences a provably live allocation.
+
+    Only a *single* target counts. If the pointer may refer to either of two
+    allocations, their sizes may differ, and an offset in bounds for one can be
+    out of bounds for the other -- there is nothing to prove.
+
+    State "a" means allocated and not since freed. Anything else ("f", "mf",
+    or absent) leaves the access unproven, and it keeps its runtime check.
+    """
+    als = pt.get(addr)
+    if not als or len(als) != 1:
+        ctx.live_access.pop(idx, None)
+        return
+    for al in als:
+        if freed.get(al) == "a":
+            ctx.live_access[idx] = al
+        else:
+            ctx.live_access.pop(idx, None)
+
+
 class _Ctx:
     """Per-function analysis context shared across the dataflow."""
     def __init__(self, fn, record, prog=None):
@@ -350,6 +372,12 @@ class _Ctx:
         self.record = record
         self.prog = prog
         self.freed_at = {}        # alloc_id -> range of the free that killed it
+        # cmd index -> the single allocation a dereference provably targets,
+        # when that allocation is live at this point. Consumed by --mem-safe's
+        # instrumentation pass to drop checks it does not need. Written on
+        # every visit and read only after the fixpoint settles, so what
+        # survives is the converged answer rather than some intermediate one.
+        self.live_access = {}
         self.seen_diag = set()
         self.owned_local = {}     # alloc_id -> live ILValue holding it
         self.escaped_ever = set()
@@ -367,6 +395,7 @@ class Analyzer:
         self.summaries = {}           # func -> Summary
         self.diags = []
         self.autofree = {}            # func -> list of (cmd_index, ILValue, alloc)
+        self.live_access = {}         # func -> {cmd index: allocation id}
 
     # -- ordering: callees before callers (reverse topological-ish) --------
     def _order(self):
@@ -428,6 +457,7 @@ class Analyzer:
         cmds = self.prog.functions[fn]
         ctx = _Ctx(fn, True, self.prog)
         self._dataflow(fn, cmds, State(), ctx)
+        self.live_access[fn] = ctx.live_access
         for al, val in ctx.owned_local.items():
             if al in ctx.escaped_ever or al in ctx.freed_ever:
                 continue
@@ -565,10 +595,29 @@ class Analyzer:
                 pt[c.output] = frozenset()
             return
 
+        if isinstance(c, math_cmds.Add) or isinstance(c, math_cmds.Subtr):
+            # Pointer arithmetic stays inside the object it started in -- that
+            # is what C guarantees, and computing `p + k` does not make the
+            # result point somewhere else. Carrying the points-to set across
+            # it is what lets this pass see through `p->field` and `a[i]`,
+            # which both lower to an Add before the dereference.
+            #
+            # Without this the analysis lost the allocation at the first
+            # offset computation, so a use-after-free written as `p->key`
+            # went unreported while the same bug written as `*p` was caught.
+            src = pt.get(c.arg1) or frozenset()
+            if isinstance(c, math_cmds.Add) and not src:
+                # `k + p` is the same expression as `p + k`. Subtraction is
+                # not symmetric, so only Add looks at the right operand.
+                src = pt.get(c.arg2) or frozenset()
+            pt[c.output] = src
+            return
+
         if isinstance(c, value_cmds.ReadAt):
             _use_check(
                 ctx, fn, freed, idx, pt, self.diags, c.addr,
                 "dereferences a pointer after its allocation was freed", c.r)
+            _note_live_access(ctx, freed, idx, pt, c.addr)
             pt[c.output] = frozenset()
             return
 
@@ -576,6 +625,7 @@ class Analyzer:
             _use_check(
                 ctx, fn, freed, idx, pt, self.diags, c.addr,
                 "dereferences a pointer after its allocation was freed", c.r)
+            _note_live_access(ctx, freed, idx, pt, c.addr)
             for al in pt.get(c.val, ()):
                 mark_escape(al)
             return

@@ -819,10 +819,18 @@ def process_c_file(file, args):
     if (getattr(args, "mem_safe", None) == "all"
             and not _is_memsafe_runtime(file)):
         import shivyc.memsafe_il as memsafe_il
-        checks, allocs = memsafe_il.instrument(il_code, symbol_table, args)
+        checks, allocs, elided, marked = memsafe_il.instrument(
+            il_code, symbol_table, args)
         if not getattr(args, "quiet", False):
-            print("--mem-safe: instrumented %d access(es) and %d allocator "
-                  "call(s) in %s" % (checks, allocs, file))
+            total = checks + elided + marked
+            share = (100 * (elided + marked) // total) if total else 0
+            # Two distinct outcomes, reported separately because they cost
+            # different amounts: a removed check is gone, a downgraded one
+            # still updates the definedness shadow.
+            print("--mem-safe: %s: %d check(s) emitted, %d removed, "
+                  "%d downgraded to a shadow update (%d%% avoided), "
+                  "%d allocator call(s) redirected"
+                  % (file, checks, elided, marked, share, allocs))
 
     # Cross-TU inlining runs first, before any optimization pass: splicing a
     # small pure leaf (whose body was captured from the whole-program graph)

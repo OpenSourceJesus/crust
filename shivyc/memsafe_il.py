@@ -199,6 +199,20 @@ def _check_call(builder, cmd, func_name, writing, out):
     return True
 
 
+def _mark_init_call(builder, cmd, out):
+    """Emit `crust_ms_mark_init(addr, n)` in place of a proved write check."""
+    size = _access_size(cmd)
+    if size is None:
+        return
+    name = "crust_ms_mark_init"
+    callee = builder.callee(name, [_void_ptr(), ctypes.unsig_longint])
+    call = control_cmds.Call(
+        callee, [cmd.addr, builder.integer(size, ctypes.unsig_longint)], None)
+    call.direct_name = name
+    call.r = cmd.r
+    out.append(call)
+
+
 def _rewrite_alloc(builder, cmd, func_name, out):
     """Redirect an allocator/deallocator call to its tracking wrapper.
 
@@ -275,7 +289,7 @@ def _escape_calls(builder, cmd, local_funcs, out):
 def instrument(il_code, symbol_table, args=None):
     """Insert runtime memory-safety checks into every function's IL.
 
-    Returns (checks inserted, allocator calls redirected).
+    Returns (checks inserted, allocator calls redirected, checks elided).
     """
     import shivyc.stackless as stackless
 
@@ -294,9 +308,35 @@ def instrument(il_code, symbol_table, args=None):
     # so the value passed to the check and the value dereferenced afterwards
     # are different ILValues.
     if _already_macro_instrumented(il_code, symbol_table):
-        return 0, 0
+        return 0, 0, 0, 0
+
+    # Ask the whole-program analysis which accesses need no check. This is the
+    # part Fil-C has no way to do: its capability test is per-pointer at run
+    # time, so it pays for every dereference whether or not the answer was
+    # knowable in advance.
+    elide = {}
+    marks = {}
+    n_elided = 0
+    n_marked = 0
+    if not getattr(args, "mem_safe_no_elide", False):
+        try:
+            import shivyc.memsafe_elide as memsafe_elide
+            elide, marks, n_red, n_bnd = memsafe_elide.safe_accesses(
+                il_code, symbol_table)
+            n_elided = n_red
+            n_marked = n_bnd
+        except Exception:
+            # Elision is an optimization; instrumenting everything is always
+            # a correct answer. Falling back keeps a checked build possible
+            # even if the analysis trips over something.
+            elide = {}
+            marks = {}
+            n_elided = 0
+            n_marked = 0
 
     for fn in list(il_code.commands):
+        skip = elide.get(fn, frozenset())
+        mark_only = marks.get(fn, frozenset())
         # `direct_name` is what identifies a callee by name, and it is set by
         # the stackless pass, which runs after this one -- until it does, a
         # call to malloc is an indirect call through an AddrOf. Resolve names
@@ -307,7 +347,8 @@ def instrument(il_code, symbol_table, args=None):
                                              symbol_table)
         il_code.commands[fn] = cmds
         out = []
-        for cmd in cmds:
+        for idx in range(len(cmds)):
+            cmd = cmds[idx]
             if isinstance(cmd, control_cmds.Call) and cmd.direct_name:
                 if _rewrite_alloc(builder, cmd, fn, out):
                     allocs += 1
@@ -317,7 +358,14 @@ def instrument(il_code, symbol_table, args=None):
                 _escape_calls(builder, cmd, local_funcs, out)
                 continue
 
-            if isinstance(cmd, value_cmds.ReadAt):
+            if idx in skip:
+                pass                       # proved safe; no check emitted
+            elif idx in mark_only:
+                # Proved in bounds, but the shadow still has to learn these
+                # bytes are defined or a later read of them is reported as
+                # uninitialized.
+                _mark_init_call(builder, cmd, out)
+            elif isinstance(cmd, value_cmds.ReadAt):
                 if _check_call(builder, cmd, fn, False, out):
                     checks += 1
             elif isinstance(cmd, value_cmds.SetAt):
@@ -326,4 +374,4 @@ def instrument(il_code, symbol_table, args=None):
             out.append(cmd)
         il_code.commands[fn] = out
 
-    return checks, allocs
+    return checks, allocs, n_elided, n_marked
