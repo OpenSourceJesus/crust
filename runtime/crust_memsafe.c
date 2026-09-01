@@ -154,9 +154,30 @@ static void ms_link(int idx)
     ms_bucket[s] = idx;
 }
 
+/* Last region returned by ms_find. Accesses cluster overwhelmingly: a loop
+ * walks one array, a function works on one object. Once the compiler has
+ * proved bounds and liveness away, what remains at each write is the
+ * definedness update, and its region lookup became the dominant cost -- so the
+ * hit rate here is what decides the overhead of a fully-proved loop.
+ *
+ * Cleared whenever a record could be reused or retired, so a stale pointer
+ * cannot outlive what it describes. */
+static struct ms_region *ms_cache;
+
+static void ms_cache_flush(void)
+{
+    ms_cache = 0;
+}
+
 static struct ms_region *ms_find(ms_addr a)
 {
-    unsigned long page = ms_pageno(a);
+    unsigned long page;
+
+    if (ms_cache && a >= ms_cache->base
+            && a < ms_cache->base + ms_cache->size)
+        return ms_cache;
+
+    page = ms_pageno(a);
     int i;
     unsigned long back;
 
@@ -168,31 +189,50 @@ static struct ms_region *ms_find(ms_addr a)
         idx = ms_bucket[ms_slot(page - back)];
         while (idx != -1) {
             struct ms_region *r = &ms_regions[idx];
-            if (a >= r->base && a < r->base + r->size) return r;
+            if (a >= r->base && a < r->base + r->size) {
+                ms_cache = r;
+                return r;
+            }
             idx = r->next;
         }
     }
     for (i = 0; i < ms_nbigs; i++) {
         struct ms_region *r = &ms_regions[ms_bigs[i]];
-        if (a >= r->base && a < r->base + r->size) return r;
+        if (a >= r->base && a < r->base + r->size) {
+            ms_cache = r;
+            return r;
+        }
     }
     return 0;
 }
 
-/* The object an out-of-range address most plausibly ran off the end of:
- * the live-or-retired region ending closest below it, within a page. */
+/* The object an out-of-range address most plausibly belongs to: the region
+ * ending closest below it, or -- for an underflow -- the one starting closest
+ * above it. `*off` is set to the signed offset from that object's base, so a
+ * negative value means the access is before the start.
+ *
+ * Looking upward matters more than it sounds. `a[-2]` is not merely rarer than
+ * `a[n]`; it is invisible without this, because the address lands in no
+ * tracked region at all and the "unknown address is not an error" rule then
+ * lets it through. It corrupts the allocator's own metadata and the program
+ * dies later inside free() with no location. */
 static struct ms_region *ms_find_near(ms_addr a, long *off)
 {
     struct ms_region *best = 0;
     ms_addr bestend = 0;
+    struct ms_region *above = 0;
+    ms_addr abovebase = 0;
     unsigned long page = ms_pageno(a);
     unsigned long back;
     int i;
 
-    for (back = 0; back < MS_BIG_PAGES; back++) {
+    for (back = 0; back < MS_BIG_PAGES + 1; back++) {
         int idx;
-        if (back > page) break;
-        idx = ms_bucket[ms_slot(page - back)];
+        /* back == 0 is the page above, so a region beginning just after the
+         * address is found too; the rest walk backwards as before. */
+        unsigned long pg = back == 0 ? page + 1 : page - (back - 1);
+        if (back > page + 1) break;
+        idx = ms_bucket[ms_slot(pg)];
         while (idx != -1) {
             struct ms_region *r = &ms_regions[idx];
             ms_addr end = r->base + r->size;
@@ -200,6 +240,11 @@ static struct ms_region *ms_find_near(ms_addr a, long *off)
                     && (end > bestend
                         || (end == bestend && r->state == MS_LIVE))) {
                 best = r; bestend = end;
+            }
+            if (r->base > a && r->base - a < MS_NEAR_SLACK
+                    && (!above || r->base < abovebase
+                        || (r->base == abovebase && r->state == MS_LIVE))) {
+                above = r; abovebase = r->base;
             }
             idx = r->next;
         }
@@ -212,6 +257,15 @@ static struct ms_region *ms_find_near(ms_addr a, long *off)
                     || (end == bestend && r->state == MS_LIVE))) {
             best = r; bestend = end;
         }
+        if (r->base > a && r->base - a < MS_NEAR_SLACK
+                && (!above || r->base < abovebase
+                    || (r->base == abovebase && r->state == MS_LIVE))) {
+            above = r; abovebase = r->base;
+        }
+    }
+    if (!best && above) {
+        *off = -(long)(above->base - a);
+        return above;
     }
     if (best) *off = (long)(a - best->base);
     return best;
@@ -350,6 +404,7 @@ void crust_ms_register(void *base, size_t size, int kind, int initialized,
 
     if (!ms_ready) crust_ms_init();
     if (!base || size == 0) return;
+    ms_cache_flush();
 
     if (ms_nregions >= CRUST_MS_MAX_REGIONS) {
         /* Reuse the oldest retired slot; live objects are never evicted, so
@@ -400,6 +455,7 @@ void crust_ms_unregister(void *base, const char *file, int line,
     if (!r || r->state != MS_LIVE) return;
     r->state = MS_POPPED;
     r->ffile = file; r->fline = line; r->ffunc = func;
+    ms_cache_flush();
 }
 
 /* ---------------------------------------------------------------------- */
@@ -434,12 +490,20 @@ static int ms_check(const void *p, size_t n, int writing, const char *expr,
         if (!near) return 1;
         if (ms_dedup_hit(file, line, 2)) return 0;
         ms_head(near->kind == CRUST_MS_STACK
-                    ? "stack buffer overflow" : "heap buffer overflow",
+                    ? (off < 0 ? "stack buffer underflow"
+                               : "stack buffer overflow")
+                    : (off < 0 ? "heap buffer underflow"
+                               : "heap buffer overflow"),
                 expr, file, line, func);
         fprintf(stderr, "    %s of %lu byte%s at 0x%lx\n",
                 verb, (unsigned long)n, n == 1 ? "" : "s", (unsigned long)a);
         ms_describe(near);
-        {
+        if (off < 0) {
+            fprintf(stderr, "    offset %ld into a %lu-byte object: the %s "
+                            "begins %lu byte%s before the start\n",
+                    off, (unsigned long)near->size, verb,
+                    (unsigned long)(-off), off == -1 ? "" : "s");
+        } else {
             unsigned long past = (unsigned long)(a - (near->base + near->size));
             if (past == 0)
                 fprintf(stderr, "    offset %ld into a %lu-byte object: the "
@@ -621,6 +685,7 @@ void crust_ms_free(void *p, const char *file, int line, const char *func)
     if (r) {
         r->state = MS_FREED;
         r->ffile = file; r->fline = line; r->ffunc = func;
+        ms_cache_flush();
         /* The bytes are gone; clearing the shadow means a later read through
          * a stale alias reports use-after-free rather than reading bits that
          * happen to still look defined. */
@@ -648,7 +713,7 @@ void *crust_ms_realloc(void *p, size_t n, const char *file, int line,
         return 0;
     }
     if (r) { old = r->size; r->state = MS_FREED; r->ffile = file;
-             r->fline = line; r->ffunc = func; }
+             r->fline = line; r->ffunc = func; ms_cache_flush(); }
 
     q = realloc(p, n);
     if (!q) return 0;
