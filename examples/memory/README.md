@@ -200,8 +200,7 @@ Crust sees the whole call graph, so it can prove a share of accesses safe at
 compile time and emit nothing for them. Fil-C cannot: its capability test is
 per-pointer at run time, with no whole-program view to prove anything away.
 
-Two rules, proving different halves of the problem
-(`shivyc/memsafe_elide.py`):
+Three rules (`shivyc/memsafe_elide.py`):
 
 **Rule 1 -- redundancy.** If the identical address was already checked in this
 basic block at least as wide, the second check must reach the same verdict.
@@ -226,13 +225,44 @@ proved write therefore becomes a bare `crust_ms_mark_init`: the bounds and
 liveness work goes, the bookkeeping stays. For the same reason a proved *read*
 is never elided, since consulting definedness is all it has left to do.
 
-Measured on a 2M-iteration array read-modify-write loop: **31x overhead before,
-15x after**. The build reports what it did:
+**Rule 3 -- loop ranges.** `a[i]` inside `for (i = 0; i < N; i++)` is in bounds
+on every iteration when `N * scale` fits the allocation. The two halves of the
+range come from different places, and both are needed:
+
+* the **upper** bound from the loop guard, credited only to blocks the guard
+  actually dominates -- `i < n` on one arm of a branch says nothing on the
+  other;
+* the **lower** bound from how the counter is written. If every assignment to
+  it anywhere in the function is a non-negative constant or an increase by a
+  non-negative constant, it never goes below zero on any path. One unexplained
+  assignment disqualifies the value, which is what makes it safe without any
+  control-flow reasoning.
+
+Rule 3 also needs the base pointer, and the `malloc` that produced it is
+usually *before* the loop, in another block. Values assigned exactly once in
+the whole function hold the same thing wherever they are live, so their origin
+is carried across blocks; anything reassigned (`p = p->next`) is excluded and
+stays block-local.
+
+Measured on a 2M-iteration array read-modify-write loop, overhead went **31x →
+15x → 12x** as rules 1 and 3 landed. The build reports what it did:
 
 ```
---mem-safe: hot.c: 1 check(s) emitted, 1 removed, 0 downgraded to a shadow
-update (50% avoided), 2 allocator call(s) redirected
+--mem-safe: hot.c: 0 check(s) emitted, 1 removed, 1 downgraded to a shadow
+update (100% avoided), 2 allocator call(s) redirected
 ```
+
+Every check in that loop is now proved away. What is left of the 12x is the
+definedness bookkeeping on the proved write, which is why the runtime caches
+its last region lookup: once bounds and liveness are gone, that lookup is the
+dominant cost, and accesses cluster hard enough that a one-entry cache took the
+loop from 15x to 12x on its own. Hoisting a whole loop's shadow update out of
+the loop is the next step and would remove most of the remainder.
+
+Real programs see much less. The repo's own examples avoid 0-14% of their
+checks, because they work through stack objects and pointers whose provenance
+the pass cannot see. The dramatic numbers are for heap arrays walked by counted
+loops, which is what the rules were built for.
 
 Soundness is the whole game here, because a wrong proof is silent: the build
 succeeds, the program runs, and a real bug goes unreported, which looks exactly
@@ -252,6 +282,7 @@ shaped to trigger elision.
 | double free | `double_free` |
 | free of an interior or non-heap pointer | — |
 | read of uninitialized memory | `uninit_read` (tracked per byte, not per object) |
+| heap/stack buffer underflow | an access before an object's base |
 | null dereference | — |
 | leaks still live at exit | `leak` |
 
@@ -285,8 +316,12 @@ The process exit status is forced to 1 when anything was reported. Without that
 
 * An address in **no** tracked object is not an error. Under partial
   instrumentation most pointers point into memory owned by uninstrumented C, and
-  flagging those would drown the report. A far overrun is still caught, because
-  the runtime looks for an object ending just below the address.
+  flagging those would drown the report. An overrun is still caught, because the
+  runtime looks for an object ending just below the address -- and an underflow
+  too, by looking for one starting just above it. (`a[-2]` was invisible until
+  that second search existed: it lands in no region, so the rule above let it
+  through, it corrupted the allocator's metadata, and the program died later
+  inside `free()` with no location.)
 * Freed records are quarantined so use-after-free can name the free site. The
   table is finite (`CRUST_MS_MAX_REGIONS`); when it fills, the oldest retired
   record is recycled and a use-after-free on *that* allocation is no longer
