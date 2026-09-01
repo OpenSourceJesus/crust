@@ -65,7 +65,7 @@ _RUNTIME_FUNCS = frozenset([
     "crust_ms_malloc", "crust_ms_calloc", "crust_ms_realloc", "crust_ms_free",
     "crust_ms_check_read", "crust_ms_check_write", "crust_ms_checked_wr",
     "crust_ms_register", "crust_ms_unregister", "crust_ms_mark_init",
-    "crust_ms_stack", "crust_ms_stack_end",
+    "crust_ms_stack", "crust_ms_stack_end", "crust_ms_global",
 ])
 
 
@@ -250,6 +250,27 @@ def _check_call(builder, cmd, func_name, writing, out):
     return True
 
 
+# Suffixes the C++ tier treats as its own. A `.cpp` is lowered to C by
+# tools/cpprust.py and spliced into the same translation unit as the
+# hand-written C that included it, so the file name on a command's source
+# range is what separates the two -- there is nothing else left by then.
+_CPP_SUFFIXES = (".cpp", ".cc", ".cxx", ".c++", ".hpp", ".hh", ".hxx")
+
+
+def _is_cpp_range(r):
+    """True when this position came from C++ source rather than C."""
+    if r is None or getattr(r, "start", None) is None:
+        return False
+    path = r.start.file
+    if not path:
+        return False
+    low = path.lower()
+    for suf in _CPP_SUFFIXES:
+        if low.endswith(suf):
+            return True
+    return False
+
+
 def _stack_objects(cmds, symbol_table, il_code):
     """Frame objects a checked access can reach, in first-use order.
 
@@ -304,6 +325,64 @@ def _stack_objects(cmds, symbol_table, il_code):
         is_array = ct is not None and ct.is_array()
         seen.append((var, size, names.get(var, "local"), is_array))
     return seen
+
+
+def _global_objects(cmds, symbol_table, il_code):
+    """Static objects in this TU a checked access can reach.
+
+    Same collection as the frame objects, with the storage test inverted.
+    Globals are always registered as defined: C zero-initializes anything
+    without an initializer, so there is no such thing as an uninitialized
+    global to find.
+    """
+    storage = getattr(symbol_table, "storage", {})
+    names = getattr(symbol_table, "names", {})
+    static = getattr(symbol_table, "STATIC", 1)
+    literals = getattr(il_code, "string_literals", {})
+
+    seen = []
+    found = set()
+    for c in cmds:
+        if isinstance(c, value_cmds.AddrOf):
+            var = c.var
+        elif isinstance(c, (value_cmds.ReadRel, value_cmds.SetRel)):
+            var = c.base
+        else:
+            continue
+        if id(var) in found or storage.get(var) != static:
+            continue
+        if var in literals or getattr(var, "literal", None) is not None:
+            continue
+        ct = getattr(var, "ctype", None)
+        size = getattr(ct, "size", None)
+        if not isinstance(size, int) or size <= 0:
+            continue
+        if ct is not None and ct.is_function():
+            continue
+        found.add(id(var))
+        seen.append((var, size, names.get(var, "global")))
+    return seen
+
+
+def _register_global(builder, var, size, name, r, out):
+    """Emit the AddrOf + crust_ms_global pair for one static object."""
+    ptr = ILValue(PointerCType(ctypes.char))
+    addr = value_cmds.AddrOf(ptr, var)
+    addr.r = r
+    out.append(addr)
+    name_ptr = builder.string_ptr(name, out)
+    file_ptr = builder.string_ptr(_site_file(r), out)
+    for c in out[len(out) - 2:]:
+        c.r = r
+    args = [ptr, builder.integer(size, ctypes.unsig_longint), name_ptr,
+            file_ptr, builder.integer(_site_line(r), ctypes.integer)]
+    arg_types = [_void_ptr(), ctypes.unsig_longint, _char_ptr(),
+                 _char_ptr(), ctypes.integer]
+    call = control_cmds.Call(
+        builder.callee("crust_ms_global", arg_types), args, None)
+    call.direct_name = "crust_ms_global"
+    call.r = r
+    out.append(call)
 
 
 def _prologue_end(cmds):
@@ -516,7 +595,30 @@ def instrument(il_code, symbol_table, args=None):
     allocs = 0
     local_funcs = frozenset(il_code.commands)
     n_stack = 0
+    n_global = 0
     track_stack = not getattr(args, "mem_safe_no_stack", False)
+    cpp_only = getattr(args, "mem_safe", None) == "cpp"
+    # A global has no single entry point the way a frame does, so registration
+    # goes wherever it is certain to run before any access. `main` is that
+    # place when this unit defines it; otherwise every function in the unit
+    # gets the call and the runtime discards the repeats. The idempotent path
+    # is a hash lookup per global per call, which is why `main` is preferred
+    # when it is available.
+    has_main = "main" in il_code.commands
+
+    # Collected across the whole unit, not per function. A global is usually
+    # touched somewhere other than where it is registered -- `main` calls the
+    # functions that use it and may never name it itself -- so scanning only
+    # the function being instrumented found nothing at all.
+    all_globals = []
+    if track_stack:
+        seen_g = set()
+        for _fn in list(il_code.commands):
+            for entry in _global_objects(il_code.commands[_fn], symbol_table,
+                                         il_code):
+                if id(entry[0]) not in seen_g:
+                    seen_g.add(id(entry[0]))
+                    all_globals.append(entry)
 
     # A translation unit that already carries macro checks was instrumented by
     # the C++ tier (`cpprust.py --mem-safe`), and re-checking every access here
@@ -528,7 +630,7 @@ def instrument(il_code, symbol_table, args=None):
     # so the value passed to the check and the value dereferenced afterwards
     # are different ILValues.
     if _already_macro_instrumented(il_code, symbol_table):
-        return 0, 0, 0, 0, 0, 0
+        return 0, 0, 0, 0, 0, 0, 0
 
     # Ask the whole-program analysis which accesses need no check. This is the
     # part Fil-C has no way to do: its capability test is per-pointer at run
@@ -582,8 +684,14 @@ def instrument(il_code, symbol_table, args=None):
         # region table for no new information. Retiring at exit is what turns
         # a returned pointer to a local into a reported use-after-scope
         # instead of silence.
+        # Under the C++ tier only C++ frames are registered. Registration is a
+        # call per invocation, and paying it in a C function would break the
+        # promise that verified C keeps running at full speed. The cost is
+        # that a C-owned local passed into C++ is not bounds-checked there.
+        cpp_fn = (not cpp_only) or (cmds and _is_cpp_range(cmds[0].r))
         locals_ = (_stack_objects(cmds, symbol_table, il_code)
-                   if track_stack else [])
+                   if (track_stack and cpp_fn) else [])
+        globals_ = all_globals if (not has_main or fn == "main") else []
         prologue = _prologue_end(cmds)
         entry_r = cmds[0].r if cmds else None
 
@@ -593,6 +701,11 @@ def instrument(il_code, symbol_table, args=None):
             if idx in loop_marks:
                 for base, off, span, r in loop_marks[idx]:
                     _hoisted_mark(builder, base, off, span, r, out)
+
+            if idx == prologue and globals_:
+                for var, size, name in globals_:
+                    _register_global(builder, var, size, name, entry_r, out)
+                    n_global += 1
 
             if idx == prologue and locals_:
                 for var, size, name, track_def in locals_:
@@ -612,6 +725,14 @@ def instrument(il_code, symbol_table, args=None):
                 _escape_calls(builder, cmd, local_funcs, out)
                 continue
 
+            if cpp_only and not _is_cpp_range(cmd.r):
+                # The C++ tier checks only what came from C++. Hand-written C
+                # in the same unit keeps running at full speed, which is the
+                # whole reason the level exists: the C has usually been
+                # audited already and the doubt is about the layer above it.
+                out.append(cmd)
+                continue
+
             if idx in skip:
                 pass                       # proved safe; no check emitted
             elif idx in mark_only:
@@ -628,4 +749,4 @@ def instrument(il_code, symbol_table, args=None):
             out.append(cmd)
         il_code.commands[fn] = out
 
-    return checks, allocs, n_elided, n_marked, n_stack, n_hoisted
+    return (checks, allocs, n_elided, n_marked, n_stack, n_hoisted, n_global)

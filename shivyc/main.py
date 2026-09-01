@@ -816,11 +816,11 @@ def process_c_file(file, args):
     # is not merely wasteful: every check would call back into the shadow
     # table, and the rewritten malloc/free inside crust_ms_malloc would call
     # themselves, so the first allocation recurses until the stack is gone.
-    if (getattr(args, "mem_safe", None) == "all"
+    if (getattr(args, "mem_safe", None) in ("all", "cpp")
             and not _is_memsafe_runtime(file)):
         import shivyc.memsafe_il as memsafe_il
-        (checks, allocs, elided, marked, stack,
-         hoisted) = memsafe_il.instrument(il_code, symbol_table, args)
+        (checks, allocs, elided, marked, stack, hoisted,
+         glob) = memsafe_il.instrument(il_code, symbol_table, args)
         if not getattr(args, "quiet", False):
             total = checks + elided + marked
             share = (100 * (elided + marked) // total) if total else 0
@@ -830,9 +830,10 @@ def process_c_file(file, args):
             print("--mem-safe: %s: %d check(s) emitted, %d removed, "
                   "%d downgraded to a shadow update (%d%% avoided), "
                   "%d allocator call(s) redirected, %d stack object(s) "
-                  "tracked, %d shadow update(s) hoisted out of loops"
-                  % (file, checks, elided, marked, share, allocs, stack,
-                     hoisted))
+                  "and %d global(s) tracked, %d shadow update(s) hoisted "
+                  "out of loops"
+                  % (file, checks, elided, marked, share, allocs,
+                     stack, glob, hoisted))
 
     # Cross-TU inlining runs first, before any optimization pass: splicing a
     # small pure leaf (whose body was captured from the whole-program graph)
