@@ -91,6 +91,10 @@ mem-safe:
 		-o /tmp/crust_memsafe_demo
 	@echo "== running instrumented build (non-zero exit is expected)"
 	@/tmp/crust_memsafe_demo; test $$? -eq 1
+	@echo "== C tier: the same bugs from plain C, no macros"
+	@python3 -m shivyc.main --mem-safe examples/memory/double_free.c \
+		-o /tmp/crust_memsafe_il
+	@/tmp/crust_memsafe_il; test $$? -eq 1
 
 # WebAssembly back end. Unlike the other cross targets there is no cross
 # compiler and no emulator to install: ShivyC emits the .wasm binary itself
