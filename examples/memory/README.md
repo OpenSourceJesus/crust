@@ -2,8 +2,8 @@
 
 Two tiers, over the same corpus. The **static** pass (`--check-memory`) proves
 what it can at compile time and emits nothing, so it costs no runtime and needs
-no test inputs -- but it reasons about the IL, which carries no source line
-numbers, so it reports at function granularity. The **runtime** tier
+no test inputs -- but it only reports what it can prove, and it is deliberately
+conservative. The **runtime** tier
 (`--mem-safe`, below) instruments the build instead: it reports only what a
 given run actually executed, but it reports it exactly, with a line number for
 the access *and* for the allocation it belongs to.
@@ -89,8 +89,11 @@ so it sees aliasing as it actually flows through the generated code.
   through stored pointers is treated conservatively (as escape), which favors
   soundness of auto-free (never free something that might be live) over
   completeness (some real leaks are left alone).
-* Diagnostics are reported at function granularity (the IL carries no source
-  line numbers), naming the function and the kind of error.
+* Diagnostics name the use, the allocation, and the free by `file:line`. (They
+  were function-granularity until IL commands gained source ranges; `ILCode.add`
+  now stamps every command with the position of the construct being lowered.)
+  Positions are exact to the statement, and to the sub-expression wherever a
+  dereference or a call supplies its own.
 * Auto-free **insertion** reuses a `free` reference already present in the
   translation unit; if a unit never frees anything, candidates are still
   reported but not inserted (there is no deallocator symbol to call).
@@ -189,7 +192,7 @@ The process exit status is forced to 1 when anything was reported. Without that
   liveness checks but lose uninitialized-read detection; the report says so.
 * Checks are emitted where the macros appear. Hand-written C only gets them
   where they are written; the automatic path is `cpprust.py --mem-safe` for the
-  C++ tier, and an IL-level pass for the C tier once IL commands carry source
-  ranges (they do not yet -- the same gap that limits `--check-memory` to
-  function-granularity reporting).
+  C++ tier, and an IL-level pass for the C tier. The prerequisite for that pass
+  -- source ranges on IL commands -- is now in place, so an inserted check can
+  report the same `file:line` a hand-written one does.
 * Single-threaded: the region table has no locking.
