@@ -31,6 +31,7 @@ in a unit that never frees anything.
 
 import shivyc.ctypes as ctypes
 import shivyc.il_cmds.control as control_cmds
+import shivyc.il_cmds.math as math_cmds
 import shivyc.il_cmds.value as value_cmds
 
 from shivyc.ctypes import FunctionCType, PointerCType
@@ -64,6 +65,7 @@ _RUNTIME_FUNCS = frozenset([
     "crust_ms_malloc", "crust_ms_calloc", "crust_ms_realloc", "crust_ms_free",
     "crust_ms_check_read", "crust_ms_check_write", "crust_ms_checked_wr",
     "crust_ms_register", "crust_ms_unregister", "crust_ms_mark_init",
+    "crust_ms_stack", "crust_ms_stack_end",
 ])
 
 
@@ -130,6 +132,18 @@ class _Builder:
         return ILValue(PointerCType(ftype))
 
 
+def _site_file(r):
+    if r is not None and getattr(r, "start", None) is not None:
+        return r.start.file
+    return "<generated>"
+
+
+def _site_line(r):
+    if r is not None and getattr(r, "start", None) is not None:
+        return r.start.line
+    return 0
+
+
 def _site_args(builder, cmd, func_name, out):
     """The (file, line, func) triple every runtime entry point ends with.
 
@@ -158,13 +172,13 @@ def _void_ptr():
 
 
 def _access_size(cmd):
-    """Bytes touched by a ReadAt/SetAt, or None when it cannot be determined.
+    """Bytes touched by an access, or None when it cannot be determined.
 
-    ReadAt names the size through its output's type and SetAt through the
+    A read names the size through its output's type and a write through the
     value being stored; the pointer's own pointee type is not reliable, since
     the front end freely casts pointers to char* while lowering.
     """
-    if isinstance(cmd, value_cmds.ReadAt):
+    if isinstance(cmd, (value_cmds.ReadAt, value_cmds.ReadRel)):
         ct = cmd.output.ctype
     else:
         ct = cmd.val.ctype
@@ -172,6 +186,39 @@ def _access_size(cmd):
     if not isinstance(size, int) or size <= 0:
         return None
     return size
+
+
+def _rel_address(builder, cmd, out):
+    """Materialize the address a ReadRel/SetRel touches: `&base + chunk*count`.
+
+    The relative forms never compute their address as a value -- the back end
+    folds base, chunk and count straight into an addressing mode -- so there is
+    no pointer to hand the checker. It has to be built here. This is the shape
+    every access to a local array takes, which is why stack arrays went
+    unchecked while heap ones did not: `p[i]` through a pointer lowers to
+    ReadAt, but `buf[i]` on an array object lowers to ReadRel.
+    """
+    ptr = ILValue(PointerCType(ctypes.char))
+    addr_cmd = value_cmds.AddrOf(ptr, cmd.base)
+    addr_cmd.r = cmd.r
+    out.append(addr_cmd)
+
+    if cmd.count is None:
+        if not cmd.chunk:
+            return ptr
+        off = builder.integer(cmd.chunk, ctypes.unsig_longint)
+    else:
+        off = ILValue(ctypes.unsig_longint)
+        mul = math_cmds.Mult(
+            off, cmd.count, builder.integer(cmd.chunk, ctypes.unsig_longint))
+        mul.r = cmd.r
+        out.append(mul)
+
+    total = ILValue(PointerCType(ctypes.char))
+    add = math_cmds.Add(total, ptr, off)
+    add.r = cmd.r
+    out.append(add)
+    return total
 
 
 def _check_call(builder, cmd, func_name, writing, out):
@@ -186,7 +233,11 @@ def _check_call(builder, cmd, func_name, writing, out):
     arg_types = [_void_ptr(), ctypes.unsig_longint, _char_ptr(),
                  ctypes.integer, _char_ptr()]
     callee = builder.callee(name, arg_types)
-    args = ([cmd.addr, builder.integer(size, ctypes.unsig_longint)]
+    if isinstance(cmd, (value_cmds.ReadRel, value_cmds.SetRel)):
+        addr = _rel_address(builder, cmd, out)
+    else:
+        addr = cmd.addr
+    args = ([addr, builder.integer(size, ctypes.unsig_longint)]
             + _site_args(builder, cmd, func_name, out))
     call = control_cmds.Call(callee, args, None)
     call.direct_name = name
@@ -199,15 +250,182 @@ def _check_call(builder, cmd, func_name, writing, out):
     return True
 
 
+def _stack_objects(cmds, symbol_table, il_code):
+    """Frame objects a checked access can reach, in first-use order.
+
+    Returns (ILValue, size, name, track_definedness) per object.
+
+    Definedness is tracked only for arrays, and the reason is specific: the
+    runtime learns a byte is defined from an instrumented write, and only an
+    array has all its writes go through one. An array element is written by
+    SetRel or SetAt; a scalar or a struct is assigned wholesale by Set, and a
+    parameter arrives via LoadArg -- neither is a memory access, neither is
+    instrumented, and neither ever will be. Registering those as
+    uninitialized reported a false uninitialized read on the first use of
+    every by-value parameter.
+    """
+    storage = getattr(symbol_table, "storage", {})
+    names = getattr(symbol_table, "names", {})
+    static = getattr(symbol_table, "STATIC", 1)
+    literals = getattr(il_code, "string_literals", {})
+
+    seen = []
+    found = set()
+    for c in cmds:
+        # Two ways a local becomes reachable through an address. AddrOf is the
+        # obvious one. The relative forms are the one that matters for arrays:
+        # `buf[i]` names the array object directly as ReadRel's base and never
+        # takes its address at all, so collecting only AddrOf found the format
+        # string and missed the buffer.
+        if isinstance(c, value_cmds.AddrOf):
+            var = c.var
+        elif isinstance(c, (value_cmds.ReadRel, value_cmds.SetRel)):
+            var = c.base
+        else:
+            continue
+        if id(var) in found:
+            continue
+        if storage.get(var) == static:
+            continue          # a global lives for the whole program, not a frame
+        if var in literals or getattr(var, "literal", None) is not None:
+            # String literals live in .rodata and are never declared, so they
+            # are absent from the storage map and slip past the check above.
+            # Registering one as a frame object put a bogus region in the
+            # table, and the underflow search then blamed it for reads of the
+            # genuinely static data sitting next to it.
+            continue
+        ct = getattr(var, "ctype", None)
+        size = getattr(ct, "size", None)
+        if not isinstance(size, int) or size <= 0:
+            continue
+        if ct is not None and ct.is_function():
+            continue
+        found.add(id(var))
+        is_array = ct is not None and ct.is_array()
+        seen.append((var, size, names.get(var, "local"), is_array))
+    return seen
+
+
+def _prologue_end(cmds):
+    """Index just past the prologue.
+
+    Registration cannot be emitted before it. LoadArg reads the argument
+    registers and VaSaveBase reads r11, while a Call clobbers every
+    caller-saved register -- inserting above them hands the callee's own
+    arguments to the runtime and loses the real ones.
+    """
+    # Every command that consumes an incoming argument, not just LoadArg.
+    # LoadStructArg is the one that bit: a function taking a struct by value
+    # begins with it and no LoadArg at all, so a scan that knew only LoadArg
+    # stopped at index 0 and put the registration call *above* the argument
+    # load. The call clobbered the argument registers and the function ran on
+    # garbage.
+    prologue = (value_cmds.LoadArg, value_cmds.LoadStructArg,
+                value_cmds.VaSaveBase)
+    i = 0
+    last = 0
+    while i < len(cmds):
+        c = cmds[i]
+        if isinstance(c, prologue) or hasattr(c, "arg_num"):
+            last = i + 1
+        elif isinstance(c, (control_cmds.Label, control_cmds.Jump,
+                            control_cmds._GeneralJump, control_cmds.Return)):
+            break            # past the entry block; nothing more is prologue
+        i += 1
+        if i - last > 24:
+            break            # far enough in that no argument load remains
+    return last
+
+
+def _register_stack(builder, var, size, name, defined, fn, r, out):
+    """Emit the AddrOf + crust_ms_register pair for one local."""
+    ptr = ILValue(PointerCType(ctypes.char))
+    addr = value_cmds.AddrOf(ptr, var)
+    addr.r = r
+    out.append(addr)
+
+    name_ptr = builder.string_ptr(name, out)
+    file_ptr = builder.string_ptr(_site_file(r), out)
+    for c in out[len(out) - 2:]:
+        c.r = r
+    args = [ptr,
+            builder.integer(size, ctypes.unsig_longint),
+            builder.integer(1 if defined else 0, ctypes.integer),
+            name_ptr,
+            file_ptr,
+            builder.integer(_site_line(r), ctypes.integer)]
+    arg_types = [_void_ptr(), ctypes.unsig_longint, ctypes.integer,
+                 _char_ptr(), _char_ptr(), ctypes.integer]
+    call = control_cmds.Call(
+        builder.callee("crust_ms_stack", arg_types), args, None)
+    call.direct_name = "crust_ms_stack"
+    call.r = r
+    out.append(call)
+    return ptr
+
+
+def _unregister_stack(builder, var, fn, r, out):
+    """Emit the AddrOf + crust_ms_unregister pair for one local.
+
+    A fresh AddrOf rather than reusing the one from entry: the frame slot's
+    address is a constant offset from the frame pointer, so recomputing it is
+    a `lea`, and keeping the entry value live across the whole function would
+    pin a register for nothing.
+    """
+    ptr = ILValue(PointerCType(ctypes.char))
+    addr = value_cmds.AddrOf(ptr, var)
+    addr.r = r
+    out.append(addr)
+    file_ptr = builder.string_ptr(_site_file(r), out)
+    out[len(out) - 1].r = r
+    args = [ptr, file_ptr, builder.integer(_site_line(r), ctypes.integer)]
+    arg_types = [_void_ptr(), _char_ptr(), ctypes.integer]
+    call = control_cmds.Call(
+        builder.callee("crust_ms_stack_end", arg_types), args, None)
+    call.direct_name = "crust_ms_stack_end"
+    call.r = r
+    out.append(call)
+
+
+class _Fake:
+    """Carries a range for _site_args when there is no command to point at."""
+
+    def __init__(self, r):
+        self.r = r
+
+
+def _hoisted_mark(builder, base, off, span, r, out):
+    """One `crust_ms_mark_init` covering everything a proved loop writes."""
+    addr = base
+    if off:
+        shifted = ILValue(PointerCType(ctypes.char))
+        add = math_cmds.Add(shifted, base,
+                            builder.integer(off, ctypes.unsig_longint))
+        add.r = r
+        out.append(add)
+        addr = shifted
+    name = "crust_ms_mark_init"
+    callee = builder.callee(name, [_void_ptr(), ctypes.unsig_longint])
+    call = control_cmds.Call(
+        callee, [addr, builder.integer(span, ctypes.unsig_longint)], None)
+    call.direct_name = name
+    call.r = r
+    out.append(call)
+
+
 def _mark_init_call(builder, cmd, out):
     """Emit `crust_ms_mark_init(addr, n)` in place of a proved write check."""
     size = _access_size(cmd)
     if size is None:
         return
+    if isinstance(cmd, (value_cmds.ReadRel, value_cmds.SetRel)):
+        addr = _rel_address(builder, cmd, out)
+    else:
+        addr = cmd.addr
     name = "crust_ms_mark_init"
     callee = builder.callee(name, [_void_ptr(), ctypes.unsig_longint])
     call = control_cmds.Call(
-        callee, [cmd.addr, builder.integer(size, ctypes.unsig_longint)], None)
+        callee, [addr, builder.integer(size, ctypes.unsig_longint)], None)
     call.direct_name = name
     call.r = cmd.r
     out.append(call)
@@ -297,6 +515,8 @@ def instrument(il_code, symbol_table, args=None):
     checks = 0
     allocs = 0
     local_funcs = frozenset(il_code.commands)
+    n_stack = 0
+    track_stack = not getattr(args, "mem_safe_no_stack", False)
 
     # A translation unit that already carries macro checks was instrumented by
     # the C++ tier (`cpprust.py --mem-safe`), and re-checking every access here
@@ -308,7 +528,7 @@ def instrument(il_code, symbol_table, args=None):
     # so the value passed to the check and the value dereferenced afterwards
     # are different ILValues.
     if _already_macro_instrumented(il_code, symbol_table):
-        return 0, 0, 0, 0
+        return 0, 0, 0, 0, 0, 0
 
     # Ask the whole-program analysis which accesses need no check. This is the
     # part Fil-C has no way to do: its capability test is per-pointer at run
@@ -316,27 +536,36 @@ def instrument(il_code, symbol_table, args=None):
     # knowable in advance.
     elide = {}
     marks = {}
+    hoists = {}
     n_elided = 0
     n_marked = 0
+    n_hoisted = 0
     if not getattr(args, "mem_safe_no_elide", False):
         try:
             import shivyc.memsafe_elide as memsafe_elide
-            elide, marks, n_red, n_bnd, n_rng = memsafe_elide.safe_accesses(
-                il_code, symbol_table)
+            (elide, marks, hoists, n_red, n_bnd, n_rng,
+             n_hoi) = memsafe_elide.safe_accesses(il_code, symbol_table)
             n_elided = n_red
             n_marked = n_bnd
+            n_hoisted = n_hoi
         except Exception:
             # Elision is an optimization; instrumenting everything is always
             # a correct answer. Falling back keeps a checked build possible
             # even if the analysis trips over something.
             elide = {}
             marks = {}
+            hoists = {}
             n_elided = 0
             n_marked = 0
+            n_hoisted = 0
 
     for fn in list(il_code.commands):
         skip = elide.get(fn, frozenset())
         mark_only = marks.get(fn, frozenset())
+        # Insert index -> the whole-loop shadow updates to emit there.
+        loop_marks = {}
+        for at, base, off, span, r in hoists.get(fn, []):
+            loop_marks.setdefault(at, []).append((base, off, span, r))
         # `direct_name` is what identifies a callee by name, and it is set by
         # the stackless pass, which runs after this one -- until it does, a
         # call to malloc is an indirect call through an AddrOf. Resolve names
@@ -347,8 +576,33 @@ def instrument(il_code, symbol_table, args=None):
                                              symbol_table)
         il_code.commands[fn] = cmds
         out = []
+        # Stack objects are registered once at entry and retired at every
+        # exit, rather than at each AddrOf: a frame slot's address is fixed
+        # for the call, and re-registering inside a loop would churn the
+        # region table for no new information. Retiring at exit is what turns
+        # a returned pointer to a local into a reported use-after-scope
+        # instead of silence.
+        locals_ = (_stack_objects(cmds, symbol_table, il_code)
+                   if track_stack else [])
+        prologue = _prologue_end(cmds)
+        entry_r = cmds[0].r if cmds else None
+
         for idx in range(len(cmds)):
             cmd = cmds[idx]
+
+            if idx in loop_marks:
+                for base, off, span, r in loop_marks[idx]:
+                    _hoisted_mark(builder, base, off, span, r, out)
+
+            if idx == prologue and locals_:
+                for var, size, name, track_def in locals_:
+                    _register_stack(builder, var, size, name, not track_def,
+                                    fn, entry_r, out)
+                    n_stack += 1
+
+            if locals_ and isinstance(cmd, control_cmds.Return):
+                for var, _size, _name, _td in locals_:
+                    _unregister_stack(builder, var, fn, cmd.r, out)
             if isinstance(cmd, control_cmds.Call) and cmd.direct_name:
                 if _rewrite_alloc(builder, cmd, fn, out):
                     allocs += 1
@@ -365,13 +619,13 @@ def instrument(il_code, symbol_table, args=None):
                 # bytes are defined or a later read of them is reported as
                 # uninitialized.
                 _mark_init_call(builder, cmd, out)
-            elif isinstance(cmd, value_cmds.ReadAt):
+            elif isinstance(cmd, (value_cmds.ReadAt, value_cmds.ReadRel)):
                 if _check_call(builder, cmd, fn, False, out):
                     checks += 1
-            elif isinstance(cmd, value_cmds.SetAt):
+            elif isinstance(cmd, (value_cmds.SetAt, value_cmds.SetRel)):
                 if _check_call(builder, cmd, fn, True, out):
                     checks += 1
             out.append(cmd)
         il_code.commands[fn] = out
 
-    return checks, allocs, n_elided, n_marked
+    return checks, allocs, n_elided, n_marked, n_stack, n_hoisted

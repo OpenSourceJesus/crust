@@ -94,6 +94,41 @@ def _access_size(cmd):
     return n if isinstance(n, int) and n > 0 else None
 
 
+def _natural_loops(cfg, dom):
+    """Back edges, as (header, latch, body blocks, preheader).
+
+    A back edge is an edge whose target dominates its source. The body is
+    everything the header dominates that can still reach the latch; the
+    preheader is the header's single predecessor from outside the loop, which
+    is the only place a hoisted statement can go and be executed exactly once.
+    """
+    n = len(cfg.blocks)
+    preds = {}
+    for b in range(n):
+        preds[b] = set()
+    for b in range(n):
+        for sc in cfg.succ[b]:
+            preds[sc].add(b)
+
+    loops = []
+    for latch in range(n):
+        for h in cfg.succ[latch]:
+            if h not in dom.get(latch, ()):
+                continue                      # not a back edge
+            body = set([h, latch])
+            stack = [latch]
+            while stack:
+                b = stack.pop()
+                for p in preds[b]:
+                    if p not in body and h in dom.get(p, ()):
+                        body.add(p)
+                        stack.append(p)
+            outside = [p for p in preds[h] if p not in body]
+            pre = outside[0] if len(outside) == 1 else None
+            loops.append((h, latch, body, pre))
+    return loops
+
+
 def _dominators(cfg):
     """Block -> set of blocks that dominate it (itself included).
 
@@ -343,8 +378,10 @@ def safe_accesses(il_code, symbol_table):
     analyzer.run()
     live_access = analyzer.live_access
 
-    # allocation id -> statically known size
+    # allocation id -> statically known size, and the ILValue holding its base
     sizes = {}
+    bases = {}
+    base_at = {}
     for fn in prog.functions:
         cmds = prog.functions[fn]
         for i in range(len(cmds)):
@@ -354,12 +391,16 @@ def safe_accesses(il_code, symbol_table):
                 n = _alloc_size(c)
                 if n is not None:
                     sizes[(fn, i)] = n
+                    bases[(fn, i)] = c.ret
+                    base_at[(fn, i)] = i
 
     out = {}
     marks = {}
+    hoists = {}
     n_redundant = 0
     n_bounds = 0
     n_ranged = 0
+    n_hoisted = 0
 
     for fn in prog.functions:
         cmds = prog.functions[fn]
@@ -374,6 +415,7 @@ def safe_accesses(il_code, symbol_table):
         far_origin = _single_def_origins(cmds, sizes, fn)
 
         mark = set()
+        indexed_at = {}    # cmd index -> (alloc, base offset, index, scale, n)
         vn = _Numbering()
         checked = {}       # value number -> widest size already checked
         # id(ILValue) -> (allocation id, constant offset from its base)
@@ -439,16 +481,137 @@ def safe_accesses(il_code, symbol_table):
                         n_redundant += 1
                     elif len(mark) != before:
                         n_bounds += 1
+                        idx_info = indexed.get(id(c.addr))
+                        if idx_info is not None:
+                            indexed_at[i] = idx_info + (n,)
+                        else:
+                            # A constant-offset proved write inside a loop
+                            # touches the same bytes on every iteration, so one
+                            # update before the loop covers all of them. Same
+                            # hoist, with a fixed span -- this is what a struct
+                            # field assigned in a loop looks like.
+                            ori2 = origin.get(id(c.addr))
+                            if ori2 is None:
+                                ori2 = far_origin.get(id(c.addr))
+                            if ori2 is not None:
+                                indexed_at[i] = (ori2[0], ori2[1], None, 0, n)
                 continue
 
             _propagate(c, vn, origin, scaled, indexed, far_origin)
+
+        # Hoist whole-loop shadow updates. A proved write inside a counted
+        # loop defines one contiguous run of bytes over the whole loop, so a
+        # single update before the loop replaces one per iteration -- which,
+        # once bounds and liveness are proved away, is the entire remaining
+        # cost of the loop. Runs before the results are stored, since a hoisted
+        # write moves from the "downgrade" set into the "skip" set.
+        if mark:
+            done = _hoist_marks(cfg, dom, cmds, fn, mark, indexed_at, bounds,
+                                nonneg, sizes, bases, base_at, hoists)
+            n_hoisted += len(done)
+            n_bounds -= len(done)
+            # A hoisted write needs nothing at all at its own site: bounds and
+            # liveness were proved, and the definedness update now happens once
+            # before the loop.
+            mark = mark - done
+            skip = skip | done
 
         if skip:
             out[fn] = skip
         if mark:
             marks[fn] = mark
 
-    return out, marks, n_redundant, n_bounds, n_ranged
+    return out, marks, hoists, n_redundant, n_bounds, n_ranged, n_hoisted
+
+
+def _hoist_marks(cfg, dom, cmds, fn, mark, indexed_at, bounds, nonneg,
+                 sizes, bases, base_at, hoists):
+    """Replace per-iteration shadow updates with one before the loop.
+
+    Returns the set of write indices the loop-level update covers.
+
+    Three conditions, all necessary:
+
+    * the write runs on **every** iteration -- its block must dominate the
+      latch, or a write under an `if` inside the loop would have bytes marked
+      defined that it never wrote;
+    * the base pointer is computed **before** the loop, so naming it in the
+      preheader is legal;
+    * the loop has a single preheader, which is the only place a statement runs
+      exactly once before the loop.
+
+    Marking the whole run costs precision when a loop exits early: bytes that
+    were never written are treated as defined. That is a missed report rather
+    than a false one, the same direction the escape rule already trades in.
+    """
+    done = set()
+    loops = _natural_loops(cfg, dom)
+
+    def climb(blk, al):
+        """Move an insertion point outward through enclosing loops.
+
+        The preheader of an inner loop still sits inside the outer one, so a
+        nested loop's update would run once per outer iteration -- on the
+        obvious two-level benchmark that left the shadow update executing two
+        thousand times and most of the overhead in place. The update depends
+        only on the base pointer and a constant span, so it is invariant in
+        every enclosing loop whose preheader the allocation precedes.
+        """
+        moved = True
+        while moved:
+            moved = False
+            for _h, _l, body2, pre2 in loops:
+                if blk in body2 and pre2 is not None:
+                    # Against the insertion point, not the block start: the
+                    # outermost preheader is usually the entry block, and the
+                    # allocation lives *inside* it. Comparing with the start
+                    # said "the base is not available yet" and the update
+                    # stayed one loop too deep, still running once per outer
+                    # iteration.
+                    insert_at = cfg.blocks[pre2][1] - 1
+                    if base_at.get(al, len(cmds)) < insert_at:
+                        blk = pre2
+                        moved = True
+                        break
+        return blk
+
+    for h, latch, body, pre in loops:
+        if pre is None:
+            continue
+        for i in sorted(mark):
+            if i in done:
+                continue
+            blk = cfg.block_of.get(i)
+            if blk not in body or latch not in dom or blk not in dom[latch]:
+                continue
+            info = indexed_at.get(i)
+            if info is None:
+                continue
+            al, off, index, scale, n = info
+            size = sizes.get(al)
+            base = bases.get(al)
+            if size is None or base is None:
+                continue
+            if index is None:
+                span = n                    # same bytes every iteration
+            else:
+                limit = bounds.get(blk, {}).get(id(index))
+                if (limit is None or id(index) not in nonneg
+                        or scale <= 0 or limit < 1):
+                    continue
+                span = (limit - 1) * scale + n
+            # The allocation must happen before the preheader, or its base is
+            # not a value that exists where the hoisted update would run.
+            if base_at.get(al, len(cmds)) >= cfg.blocks[pre][1] - 1:
+                continue
+            if off < 0 or off + span > size:
+                continue
+            target = climb(pre, al)
+            _t_start, t_end = cfg.blocks[target]
+            hoists.setdefault(fn, []).append(
+                (t_end - 1, base, off, span, cmds[i].r))
+            done.add(i)
+    return done
 
 
 def _try_elide(c, i, n, writing, vn, checked, origin, live, sizes, skip, mark,
