@@ -12127,7 +12127,7 @@ def _lower_lambdas(text, path):
 
 def translate(text, path="<cpp>", owning=None, basedir=None,
               incdirs=(), defines=(), clang=None, rtti=False, decls=(),
-              decls_out=None, contracts=False):
+              decls_out=None, contracts=False, mem_safe=False):
     """Translate a C++ subset source to C. Raises CppError on anything else.
 
     `owning` maps the name of a type this file does *not* define to the
@@ -12896,6 +12896,38 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
     # each class too, and stripping only the first left the rest in the C
     # as stray typedefs. Blanked to a bare newline rather than cut, so the
     # output keeps the line numbering the diagnostics were counted against.
+    if mem_safe:
+        # --mem-safe: turn the origin anchors into real `#line` directives
+        # instead of blanking them.
+        #
+        # This is what makes the C++ tier work on standalone output. The
+        # compiler tells C++-derived code from hand-written C by the file name
+        # on each position, and it gets that for free when a `.cpp` is
+        # `#include`d, because the lowering happens inside the same compile.
+        # Run separately, `cpprust.py foo.cpp -o foo.c` throws that away: the
+        # C looks like C. The anchors already record which source line each
+        # output line came from -- they are what the diagnostics here are
+        # counted against -- so re-emitting them as `#line` hands the same
+        # information downstream, and puts the right file *and* line on every
+        # report rather than the position in the generated C.
+        #
+        # A blanket `#line 1 "foo.cpp"` would not do: the output is not line
+        # for line with the input (a four-line class body becomes seven lines
+        # of C), so the file would be right and every line wrong.
+        src_name = path.replace("\\", "/")
+
+        def _to_line_directive(m):
+            return '#line %s "%s"' % (m.group(1), src_name)
+
+        out = re.sub(r"typedef int __crust_src_line_(\d+)__;",
+                     _to_line_directive, out)
+        # A leading directive as well, because the anchors are placed per
+        # class rather than per line and the declarations hoisted above the
+        # first one would otherwise still read as generated C -- including
+        # every method body, which is exactly where the checks belong. With
+        # this, file attribution is complete; line numbers are exact from each
+        # anchor onward and approximate in the reordered preamble.
+        out = '#line 1 "%s"\n' % (src_name,) + out
     out = _SRC_MARK_RE.sub("", out).replace("typedef int ;\n", "\n")
     if decls_out:
         out = _publish_decls_linkage(out, _publish[0], _publish[1])
@@ -12982,6 +13014,10 @@ def main(argv):
     if "--contracts" in args:
         want_contracts = True
         args.remove("--contracts")
+    want_mem_safe = False
+    if "--mem-safe" in args:
+        want_mem_safe = True
+        args.remove("--mem-safe")
     if "--rtti" in args:
         rtti = True
         args.remove("--rtti")
@@ -13049,7 +13085,8 @@ def main(argv):
     try:
         if basedir is None:
             basedir = os.path.dirname(os.path.abspath(src))
-        result = translate(text, path=src, owning=owning,
+        result = translate(text, path=src, mem_safe=want_mem_safe,
+                           owning=owning,
                            basedir=basedir, incdirs=incdirs,
                            defines=defines, clang=clang, rtti=rtti,
                            decls=decls, decls_out=decls_out,
