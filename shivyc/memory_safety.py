@@ -270,14 +270,44 @@ class Summary:
 
 
 class Diagnostic:
-    def __init__(self, func, kind, alloc, detail=""):
+    def __init__(self, func, kind, alloc, detail="", r=None, alloc_r=None,
+                 free_r=None):
         self.func = func
         self.kind = kind              # 'use-after-free' | 'double-free' | 'leak'
         self.alloc = alloc
         self.detail = detail
+        # Where the offending access is, where the object was allocated, and
+        # where it was freed. Before IL commands carried source ranges this
+        # pass could only say "in <function>"; all three are now recoverable,
+        # and the allocation site in particular is usually where the fix goes.
+        self.r = r
+        self.alloc_r = alloc_r
+        self.free_r = free_r
 
     def __repr__(self):
         return f"<{self.kind} in {self.func}: {self.detail}>"
+
+
+def _loc(r):
+    """Render a range as `file:line`, or "" when there is none."""
+    if r is None or getattr(r, "start", None) is None:
+        return ""
+    return "%s:%d" % (r.start.file, r.start.line)
+
+
+def _alloc_range(prog, al):
+    """Range of the command that created allocation `al`.
+
+    Allocation ids are (function, command index) pairs, so the site is
+    recoverable from the program itself -- the analysis does not have to carry
+    it along in its dataflow state.
+    """
+    if not isinstance(al, tuple) or len(al) < 2:
+        return None
+    cmds = prog.functions.get(al[0])
+    if not cmds or not isinstance(al[1], int) or al[1] >= len(cmds):
+        return None
+    return cmds[al[1]].r
 
 
 def _param_map(cmds):
@@ -296,7 +326,7 @@ def _alloc_name(alloc):
     return "allocation"
 
 
-def _use_check(ctx, fn, freed, idx, pt, diags, addr: "ILValue", kind):
+def _use_check(ctx, fn, freed, idx, pt, diags, addr: "ILValue", kind, r=None):
     """Record a use-after-free if `addr` still points at a freed allocation.
 
     Module-level (not nested): py2c name-infers bare `addr` as `int`, but
@@ -308,14 +338,18 @@ def _use_check(ctx, fn, freed, idx, pt, diags, addr: "ILValue", kind):
             key = (idx, kind, al)
             if key not in ctx.seen_diag:
                 ctx.seen_diag.add(key)
-                diags.append(Diagnostic(fn, "use-after-free", al, kind))
+                diags.append(Diagnostic(
+                    fn, "use-after-free", al, kind, r,
+                    _alloc_range(ctx.prog, al), ctx.freed_at.get(al)))
 
 
 class _Ctx:
     """Per-function analysis context shared across the dataflow."""
-    def __init__(self, fn, record):
+    def __init__(self, fn, record, prog=None):
         self.fn = fn
         self.record = record
+        self.prog = prog
+        self.freed_at = {}        # alloc_id -> range of the free that killed it
         self.seen_diag = set()
         self.owned_local = {}     # alloc_id -> live ILValue holding it
         self.escaped_ever = set()
@@ -367,7 +401,7 @@ class Analyzer:
         cmds = self.prog.functions[fn]
         params = _param_map(cmds)
         seeds = {}
-        ctx = _Ctx(fn, False)
+        ctx = _Ctx(fn, False, self.prog)
         for idx, val in params.items():
             ct = getattr(val, "ctype", None)
             if ct is not None and ct.is_pointer():
@@ -392,7 +426,7 @@ class Analyzer:
     # -- full check (emit diagnostics + collect auto-free candidates) ------
     def _check(self, fn):
         cmds = self.prog.functions[fn]
-        ctx = _Ctx(fn, True)
+        ctx = _Ctx(fn, True, self.prog)
         self._dataflow(fn, cmds, State(), ctx)
         for al, val in ctx.owned_local.items():
             if al in ctx.escaped_ever or al in ctx.freed_ever:
@@ -440,6 +474,11 @@ class Analyzer:
         def mark_free(al):
             freed[al] = "f"
             ctx.freed_ever.add(al)
+            # First free wins: for a double free the interesting site is the
+            # one that made the pointer dangle, not the one that tripped over
+            # it afterwards.
+            if al not in ctx.freed_at:
+                ctx.freed_at[al] = c.r
 
         if isinstance(c, control_cmds.Call):
             name = c.direct_name
@@ -460,7 +499,9 @@ class Analyzer:
                             self.diags.append(Diagnostic(
                                 fn, "double-free", al,
                                 "free of an %s that was already freed" % (
-                                    _alloc_name(al),)))
+                                    _alloc_name(al),), c.r,
+                                _alloc_range(self.prog, al),
+                                ctx.freed_at.get(al)))
                     mark_free(al)
                 return
             summ = self.summaries.get(name)
@@ -470,7 +511,7 @@ class Analyzer:
                         _use_check(
                             ctx, fn, freed, idx, pt, self.diags, a,
                             "passes a freed pointer to %s(), which "
-                            "dereferences it" % (name,))
+                            "dereferences it" % (name,), c.r)
                     if i in summ.frees_params:
                         for al in pt.get(a, ()):
                             if freed.get(al) in ("f", "mf") and ctx.record:
@@ -480,7 +521,9 @@ class Analyzer:
                                     self.diags.append(Diagnostic(
                                         fn, "double-free", al,
                                         "free of an allocation already freed "
-                                        "(via %s)" % (name,)))
+                                        "(via %s)" % (name,), c.r,
+                                        _alloc_range(self.prog, al),
+                                        ctx.freed_at.get(al)))
                             mark_free(al)
                     if i in summ.escapes_params:
                         for al in pt.get(a, ()):
@@ -497,7 +540,7 @@ class Analyzer:
             # unknown / external call: pointer args may be used and they escape
             for a in args:
                 _use_check(ctx, fn, freed, idx, pt, self.diags, a,
-                           "passes a freed pointer to a function")
+                           "passes a freed pointer to a function", c.r)
                 for al in pt.get(a, ()):
                     mark_escape(al)
             if c.ret is not None:
@@ -525,14 +568,14 @@ class Analyzer:
         if isinstance(c, value_cmds.ReadAt):
             _use_check(
                 ctx, fn, freed, idx, pt, self.diags, c.addr,
-                "dereferences a pointer after its allocation was freed")
+                "dereferences a pointer after its allocation was freed", c.r)
             pt[c.output] = frozenset()
             return
 
         if isinstance(c, value_cmds.SetAt):
             _use_check(
                 ctx, fn, freed, idx, pt, self.diags, c.addr,
-                "dereferences a pointer after its allocation was freed")
+                "dereferences a pointer after its allocation was freed", c.r)
             for al in pt.get(c.val, ()):
                 mark_escape(al)
             return
@@ -651,12 +694,28 @@ def analyze_program(files, args):
     return prog, diags, autofree, ok
 
 
-def format_report(diags, autofree):
+def format_report(diags, autofree, prog=None):
     out = []
     if diags:
         out.append("memory-safety issues:")
         for d in diags:
-            out.append(f"  [{d.kind}] in {d.func}: {d.detail}")
+            # Lead with the location when there is one, the way every other
+            # diagnostic in the compiler does, and keep the function name --
+            # the two answer different questions for a whole-program pass that
+            # can flag a use in one function caused by a free in another.
+            where = _loc(d.r)
+            if where:
+                out.append(f"  {where}: [{d.kind}] in {d.func}: {d.detail}")
+            else:
+                out.append(f"  [{d.kind}] in {d.func}: {d.detail}")
+            # The allocation and the free are where the fix usually goes; the
+            # use is only where it surfaced.
+            aloc = _loc(d.alloc_r)
+            floc = _loc(d.free_r)
+            if aloc:
+                out.append(f"      allocated at {aloc}")
+            if floc:
+                out.append(f"      freed at {floc}")
     else:
         out.append("memory-safety: no use-after-free or double-free found")
     leaks = sum(len(v) for v in autofree.values())
@@ -667,13 +726,21 @@ def format_report(diags, autofree):
         for fn, items in sorted(autofree.items()):
             out.append(f"  in {fn}: {len(items)} allocation(s) the compiler can "
                        "free at function exit")
+            # Naming the allocation lets the programmer check the call rather
+            # than take the analysis on faith -- worth more than the count,
+            # which on its own says only that *something* was found.
+            if prog is not None:
+                for entry in items:
+                    aloc = _loc(_alloc_range(prog, entry[0]))
+                    if aloc:
+                        out.append(f"      allocated at {aloc}")
     return "\n".join(out)
 
 
 def run(files, args):
     """Entry point for --check-memory: analyze and print a report."""
-    _, diags, autofree, ok = analyze_program(files, args)
-    print(format_report(diags, autofree))
+    prog, diags, autofree, ok = analyze_program(files, args)
+    print(format_report(diags, autofree, prog))
     # nonzero exit if real bugs were found
     return 1 if diags else 0
 

@@ -19,6 +19,10 @@ class ILCode:
         """Initialize IL code."""
         self.commands = {}
         self.cur_func = None
+        # Range of the source construct currently being lowered. Every command
+        # added while it is set inherits it, which is how the IL acquires
+        # source positions without each of the ~100 emit sites passing one.
+        self.cur_range = None
         self.long_double_taint = {}
 
         self.label_num = 0
@@ -100,7 +104,38 @@ class ILCode:
         if self.cur_func is None:
             raise CompilerError(
                 "internal: IL command emitted outside of a function")
+        # Stamp the position of whatever the front end is lowering right now.
+        # Only when the command does not already carry one: a pass that
+        # synthesizes a command and gives it a deliberate range (say, the
+        # `free` that --auto-free inserts, which belongs to the allocation, not
+        # to the return it sits before) keeps that choice.
+        if command.r is None:
+            command.r = self.cur_range
         self.commands[self.cur_func].append(command)
+
+    def set_range(self, r):
+        """Begin lowering a construct at range `r`; return the previous range.
+
+        Paired with restore_range, normally in a try/finally so an error raised
+        mid-expression cannot leave a stale position stamped on everything that
+        follows. Kept as an explicit pair rather than a context manager because
+        the callers are base-class funnels in hot recursive descent, and one is
+        a cached accessor that must not pay for a with-block on every hit.
+
+        A None `r` is ignored rather than clearing the current range: many
+        nodes are synthesized during lowering (implicit casts, decay,
+        compiler-generated temporaries) and have no position of their own. The
+        enclosing construct's position is the honest answer for those, and much
+        better than nothing.
+        """
+        prev = self.cur_range
+        if r is not None:
+            self.cur_range = r
+        return prev
+
+    def restore_range(self, prev):
+        """End the construct begun by the matching set_range."""
+        self.cur_range = prev
 
     def always_returns(self):
         """Return true if this function ends in a return command."""
