@@ -135,12 +135,54 @@ to the bare expression, the runtime is not linked at all, and the program runs
 at full speed. That is the intended workflow: find the bugs under test, fix
 them, ship unchecked.
 
-| level | what is instrumented | how |
-|-------|----------------------|-----|
-| `--mem-safe` / `--mem-safe=all` | everything, including hand-written C | an IL pass, automatically |
-| `--mem-safe=cpp` | only code lowered from the C++ subset | the CRUST_MS_* macros in the generated C |
+| level | what is instrumented |
+|-------|----------------------|
+| `--mem-safe` / `--mem-safe=all` | everything, including hand-written C |
+| `--mem-safe=cpp` | only code lowered from the C++ subset |
 
-`cpprust.py --mem-safe` is the `cpp` tier reached from the C++ side.
+Both are the same IL pass; the levels differ in what it is allowed to touch.
+
+## The C++ tier
+
+A project with audited C and a newer C++ layer wants the C++ checked and the C
+left alone. Both end up in the *same* translation unit -- a `.cpp` is lowered by
+`tools/cpprust.py` and spliced in by the preprocessor -- so what separates them
+by the time the IL pass runs is the file name on each command's source range.
+That is all `--mem-safe=cpp` needs: instrument positions whose file is a C++
+source, skip the rest.
+
+```
+$ shivyc --mem-safe=cpp app.c -o app     # app.c does #include "lib.cpp"
+--mem-safe: app.c: 2 check(s) emitted ...   (4 under --mem-safe=all)
+$ ./app
+crust --mem-safe: stack buffer overflow
+  at ./lib.cpp:6 in Buf_get
+    object: 16 bytes, b (stack)
+```
+
+Frame registration follows the same rule: only C++ functions register their
+locals, since registration is a call per invocation and paying it in a C
+function would break the promise. Allocator calls are redirected either way --
+without a tracked region, a check in C++ code touching C-allocated memory would
+have nothing to check against.
+
+`cpprust.py --mem-safe` covers the standalone case. Run separately,
+`cpprust.py foo.cpp -o foo.c` throws the origin away and the generated C looks
+like C, so the tier would find nothing. The flag re-emits cpprust's own origin
+anchors -- which it already keeps, and already counts its diagnostics against --
+as `#line` directives, handing the same information downstream:
+
+```
+cpprust.py --mem-safe lib.cpp -o lib.c
+shivyc --mem-safe=cpp lib.c driver.c -o prog     # driver.c: 0 checks
+```
+
+A blanket `#line 1 "lib.cpp"` would not do on its own, since the output is not
+line for line with the input -- a four-line class body becomes seven lines of C.
+One is emitted anyway, because the anchors are placed per class and the
+declarations hoisted above the first one include every method body. So file
+attribution is complete and line numbers are exact from each anchor onward,
+approximate in the reordered preamble.
 
 ## Stack objects
 
@@ -320,7 +362,7 @@ shaped to trigger elision.
 | double free | `double_free` |
 | free of an interior or non-heap pointer | — |
 | read of uninitialized memory | `uninit_read` (tracked per byte, not per object) |
-| heap/stack buffer underflow | an access before an object's base |
+| heap/stack/global buffer underflow | an access before an object's base |
 | null dereference | — |
 | leaks still live at exit | `leak` |
 
@@ -367,8 +409,11 @@ The process exit status is forced to 1 when anything was reported. Without that
 * Definedness tracking needs a bit per byte from a fixed arena
   (`CRUST_MS_BITMAP_ARENA`, 4 MiB). If it fills, later objects keep bounds and
   liveness checks but lose uninitialized-read detection; the report says so.
-* Globals are not registered, so an overflow of a global array is only caught
-  if it runs into a tracked object. Heap and stack objects are covered.
+* Heap, stack and global objects are all registered. Globals are collected
+  across the whole unit and registered in `main` when the unit defines it,
+  otherwise at the top of every function -- a global has no single entry point
+  the way a frame does, and it is usually touched somewhere other than where it
+  gets registered, so a per-function scan found nothing at all.
 * Definedness is tracked for local **arrays** only. A scalar or struct is
   assigned wholesale by `Set` and a parameter arrives via `LoadArg`; neither is
   a memory access, so neither is instrumented, and registering those as
