@@ -142,6 +142,32 @@ them, ship unchecked.
 
 `cpprust.py --mem-safe` is the `cpp` tier reached from the C++ side.
 
+## Stack objects
+
+Locals are registered once after the prologue and retired at every return, so a
+local array overflow is reported against the variable by name and a pointer to
+a dead frame is reported as a use-after-scope:
+
+```
+crust --mem-safe: stack buffer overflow
+  at s1.c:6 in main
+    object: 32 bytes, buf (stack)
+    offset 36 into a 32-byte object: the write begins 4 bytes past the end
+```
+
+Registration goes *after* the prologue because a call clobbers the argument
+registers; emitting it above the argument loads hands the runtime's own
+arguments to the function and loses the real ones. The prologue is more than
+`LoadArg`: a function taking a struct by value begins with `LoadStructArg` and
+no `LoadArg` at all, and missing that produced a segfaulting binary.
+
+Which objects get registered is not obvious either. `buf[i]` on an array names
+the array object directly as `ReadRel`'s base and never takes its address, so
+collecting only `AddrOf` operands found the format string and missed the
+buffer. String literals need excluding for the opposite reason: they live in
+`.rodata` and are never declared, so they are absent from the storage map that
+filters out globals.
+
 ## The C tier: automatic instrumentation
 
 `--mem-safe=all` needs no macros and no annotation. It rewrites the IL after
@@ -244,20 +270,32 @@ the whole function hold the same thing wherever they are live, so their origin
 is carried across blocks; anything reassigned (`p = p->next`) is excluded and
 stays block-local.
 
+**Hoisting.** A proved write in a counted loop writes one contiguous run over
+the whole loop, so a single shadow update in the preheader replaces one per
+iteration -- and once bounds and liveness are proved away, that update is the
+entire remaining cost. The update has to climb the whole loop nest: an inner
+loop's preheader still sits inside the outer loop, and stopping at one level
+left it running once per outer iteration. It is emitted only when the write
+runs on *every* iteration (its block must dominate the latch), so a write under
+an `if` inside the loop is not covered.
+
+The precision cost is that a loop exiting early leaves bytes marked defined
+that were never written -- a missed report rather than a false one, the same
+direction the escape rule already trades in.
+
 Measured on a 2M-iteration array read-modify-write loop, overhead went **31x →
-15x → 12x** as rules 1 and 3 landed. The build reports what it did:
+15x → 12x → 1.1x**, and a struct-field loop from 29x to 1.0x as the rules and hoisting landed. The build reports what it did:
 
 ```
---mem-safe: hot.c: 0 check(s) emitted, 1 removed, 1 downgraded to a shadow
-update (100% avoided), 2 allocator call(s) redirected
+--mem-safe: hot.c: 0 check(s) emitted, 1 removed, 0 downgraded (100% avoided),
+2 allocator call(s) redirected, 0 stack object(s) tracked, 1 shadow update(s)
+hoisted out of loops
 ```
 
-Every check in that loop is now proved away. What is left of the 12x is the
-definedness bookkeeping on the proved write, which is why the runtime caches
-its last region lookup: once bounds and liveness are gone, that lookup is the
-dominant cost, and accesses cluster hard enough that a one-entry cache took the
-loop from 15x to 12x on its own. Hoisting a whole loop's shadow update out of
-the loop is the next step and would remove most of the remainder.
+The loop body ends up with no runtime calls at all. The runtime also caches its
+last region lookup, which matters for everything that is *not* proved away:
+accesses cluster hard (a loop walks one array, a function works on one object)
+and the one-entry cache was worth 15x → 12x on its own before hoisting landed.
 
 Real programs see much less. The repo's own examples avoid 0-14% of their
 checks, because they work through stack objects and pointers whose provenance
@@ -329,9 +367,13 @@ The process exit status is forced to 1 when anything was reported. Without that
 * Definedness tracking needs a bit per byte from a fixed arena
   (`CRUST_MS_BITMAP_ARENA`, 4 MiB). If it fills, later objects keep bounds and
   liveness checks but lose uninitialized-read detection; the report says so.
-* Stack and global objects are not registered yet, so an overflow of a local
-  array is only caught when it happens to run into a tracked heap object.
-  Heap objects are fully covered.
+* Globals are not registered, so an overflow of a global array is only caught
+  if it runs into a tracked object. Heap and stack objects are covered.
+* Definedness is tracked for local **arrays** only. A scalar or struct is
+  assigned wholesale by `Set` and a parameter arrives via `LoadArg`; neither is
+  a memory access, so neither is instrumented, and registering those as
+  undefined reported a false uninitialized read on the first use of every
+  by-value parameter. Their bounds and scope are still checked.
 * Uninitialized-read detection stops at the boundary with uninstrumented code
   (see the escape rule above).
 * Checks the compiler cannot prove away are still uniform. Expect roughly 15x
