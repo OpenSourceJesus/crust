@@ -1,5 +1,16 @@
 # Memory safety for unannotated C
 
+Two tiers, over the same corpus. The **static** pass (`--check-memory`) proves
+what it can at compile time and emits nothing, so it costs no runtime and needs
+no test inputs -- but it reasons about the IL, which carries no source line
+numbers, so it reports at function granularity. The **runtime** tier
+(`--mem-safe`, below) instruments the build instead: it reports only what a
+given run actually executed, but it reports it exactly, with a line number for
+the access *and* for the allocation it belongs to.
+
+They answer different questions and are meant to be used together: run
+`--check-memory` on every build, `--mem-safe` under the test suite.
+
 C's manual `malloc`/`free` is the classic source of **use-after-free** and
 **double-free** bugs. Because ShivyCX sees the entire call graph, a Python pass
 (`shivyc/memory_safety.py`) tracks every allocation, pointer copy (alias), and
@@ -43,6 +54,7 @@ examples.
 | `double_free.c` | the same allocation freed twice | double-free |
 | `wrapper_uaf.c` | free in one helper, deref in another (whole-program) | use-after-free |
 | `autofree_leak.c` | a leak with no escaping reference | auto-free inserts `free` |
+| `memsafe_runtime.c` | every class the **runtime** tier detects | `--mem-safe`, see below |
 
 ## How it works
 
@@ -85,3 +97,99 @@ so it sees aliasing as it actually flows through the generated code.
 * Conservative by construction: when the analysis cannot prove an allocation is
   dead, it does nothing — it never inserts a free that could create a
   double-free or free an escaping pointer.
+
+---
+
+# `--mem-safe`: runtime checks for test builds
+
+Inspired by Fil-C, minus the ABI change. Fil-C gives every pointer a capability
+(InvisiCaps: bounds plus allocation liveness) carried with the pointer, which is
+why it needs the whole program rebuilt. Crust keeps the same three facts in a
+side table keyed by address (`runtime/crust_memsafe.c`), so an instrumented
+translation unit links against uninstrumented C with no ABI break. The cost is a
+lookup per access instead of a register compare -- the right trade for a flag
+whose entire purpose is to be on under `make test` and off in the release build.
+
+Because the table stores the real size, bounds are **exact**: there are no
+redzones to size, and an overflow is caught at the first byte past the end.
+
+## Usage
+
+```
+shivyc --mem-safe examples/memory/memsafe_runtime.c -o memsafe && ./memsafe
+```
+
+The flag needs nothing else -- no `-I`, no `-D`, no runtime source on the
+command line. It puts `CRUST_MEM_SAFE` on, and compiles and links the checking
+runtime for you.
+
+Rebuild the *identical source* without the flag and every check macro collapses
+to the bare expression, the runtime is not linked at all, and the program runs
+at full speed. That is the intended workflow: find the bugs under test, fix
+them, ship unchecked.
+
+| level | what is instrumented |
+|-------|----------------------|
+| `--mem-safe` / `--mem-safe=all` | everything, including hand-written C |
+| `--mem-safe=cpp` | only code lowered from the C++ subset, leaving already-verified C at full speed |
+
+`cpprust.py --mem-safe` is the same tier reached from the C++ side.
+
+## What it catches
+
+| class | example in the fixture |
+|-------|------------------------|
+| heap/stack buffer overflow | `heap_overflow`, `far_overrun` |
+| use after free | `use_after_free` |
+| use after scope exit | a local whose address outlives its frame |
+| double free | `double_free` |
+| free of an interior or non-heap pointer | — |
+| read of uninitialized memory | `uninit_read` (tracked per byte, not per object) |
+| null dereference | — |
+| leaks still live at exit | `leak` |
+
+## Why the messages look like this
+
+```
+crust --mem-safe: heap buffer overflow
+  at examples/memory/memsafe_runtime.c:22 in heap_overflow
+    while evaluating `a[4]`
+    write of 4 bytes at 0x34f1a2b0
+    object: 16 bytes, malloc (heap)
+            spans 0x34f1a2a0 .. 0x34f1a2b0
+            allocated at examples/memory/memsafe_runtime.c:19 in heap_overflow
+    offset 16 into a 16-byte object: the write begins at the first byte past the end
+```
+
+Unchecked, the same program gets you `free(): double free detected in tcache 2`
+and an abort with no location at all. Naming the allocation site as well as the
+access site is most of the value: the bug is usually at the allocation, and the
+access is only where it surfaced.
+
+A run reports **every** distinct error rather than dying on the first, since one
+test run should surface every bug it can reach. Repeated firings of the same
+site are collapsed into a count, so a bug inside a loop reads as one bug.
+`crust_ms_set_halt_on_error(1)` restores stop-at-first.
+
+The process exit status is forced to 1 when anything was reported. Without that
+`make test` stays green while the report scrolls past.
+
+## Honest limitations
+
+* An address in **no** tracked object is not an error. Under partial
+  instrumentation most pointers point into memory owned by uninstrumented C, and
+  flagging those would drown the report. A far overrun is still caught, because
+  the runtime looks for an object ending just below the address.
+* Freed records are quarantined so use-after-free can name the free site. The
+  table is finite (`CRUST_MS_MAX_REGIONS`); when it fills, the oldest retired
+  record is recycled and a use-after-free on *that* allocation is no longer
+  attributable.
+* Definedness tracking needs a bit per byte from a fixed arena
+  (`CRUST_MS_BITMAP_ARENA`, 4 MiB). If it fills, later objects keep bounds and
+  liveness checks but lose uninitialized-read detection; the report says so.
+* Checks are emitted where the macros appear. Hand-written C only gets them
+  where they are written; the automatic path is `cpprust.py --mem-safe` for the
+  C++ tier, and an IL-level pass for the C tier once IL commands carry source
+  ranges (they do not yet -- the same gap that limits `--check-memory` to
+  function-granularity reporting).
+* Single-threaded: the region table has no locking.
