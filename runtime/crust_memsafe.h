@@ -113,6 +113,18 @@ int crust_ms_check_write(void *p, size_t n, const char *expr,
  * paths land in the same check, so a program instrumented either way reports
  * in the same format.
  */
+/* Frame-object registration for the IL pass. A narrower signature than
+ * crust_ms_register on purpose: that one takes eight arguments, and the two
+ * past the sixth go on the stack under SysV. Emitting a stack-argument call
+ * from the instrumentation pass produced a segfaulting binary, so the IL tier
+ * keeps every inserted call within the six register arguments. The function
+ * name is dropped rather than the variable name -- `buf` plus its declaration
+ * line identifies the object, which is what the diagnostic needs.
+ */
+void crust_ms_stack(void *base, unsigned long size, int initialized,
+                    const char *name, const char *file, int line);
+void crust_ms_stack_end(void *base, const char *file, int line);
+
 void crust_ms_il_read(const void *p, unsigned long n, const char *file,
                       int line, const char *func);
 void crust_ms_il_write(void *p, unsigned long n, const char *file,

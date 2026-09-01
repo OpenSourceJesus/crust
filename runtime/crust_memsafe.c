@@ -585,6 +585,18 @@ int crust_ms_check_write(void *p, size_t n, const char *expr,
     return ms_check(p, n, 1, expr, file, line, func);
 }
 
+void crust_ms_stack(void *base, unsigned long size, int initialized,
+                    const char *name, const char *file, int line)
+{
+    crust_ms_register(base, (size_t)size, CRUST_MS_STACK, initialized,
+                      name, file, line, 0);
+}
+
+void crust_ms_stack_end(void *base, const char *file, int line)
+{
+    crust_ms_unregister(base, file, line, 0);
+}
+
 void crust_ms_il_read(const void *p, unsigned long n, const char *file,
                       int line, const char *func)
 {
