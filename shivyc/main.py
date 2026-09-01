@@ -45,6 +45,17 @@ def memsafe_runtime_source():
     return p if os.path.exists(p) else None
 
 
+def _is_memsafe_runtime(path):
+    """True when `path` is the checking runtime's own source."""
+    src = memsafe_runtime_source()
+    if not src or not path:
+        return False
+    try:
+        return os.path.abspath(path) == os.path.abspath(src)
+    except (OSError, ValueError):        # pragma: no cover
+        return False
+
+
 def _has_define(defines, name):
     for d in defines:
         if d == name or d.startswith(name + "="):
@@ -791,6 +802,27 @@ def process_c_file(file, args):
                       f"allocations in {file}")
         except Exception:
             pass  # never let the analysis break a normal compile
+
+    # --mem-safe (C tier): insert the runtime checks. Placed here, after
+    # make_il and before the optimization passes, so the inserted calls are
+    # ordinary IL that the later passes see and schedule like any other code.
+    #
+    # Unlike auto-free above, a failure here is *not* swallowed. Auto-free is
+    # an optimization and doing nothing is a safe outcome; a checked build that
+    # quietly skipped instrumentation would report no errors and look exactly
+    # like a clean program, which is the one failure mode this flag must not
+    # have.
+    # The runtime is exempt from its own instrumentation. Checking the checker
+    # is not merely wasteful: every check would call back into the shadow
+    # table, and the rewritten malloc/free inside crust_ms_malloc would call
+    # themselves, so the first allocation recurses until the stack is gone.
+    if (getattr(args, "mem_safe", None) == "all"
+            and not _is_memsafe_runtime(file)):
+        import shivyc.memsafe_il as memsafe_il
+        checks, allocs = memsafe_il.instrument(il_code, symbol_table, args)
+        if not getattr(args, "quiet", False):
+            print("--mem-safe: instrumented %d access(es) and %d allocator "
+                  "call(s) in %s" % (checks, allocs, file))
 
     # Cross-TU inlining runs first, before any optimization pass: splicing a
     # small pure leaf (whose body was captured from the whole-program graph)
