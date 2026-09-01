@@ -145,6 +145,102 @@ class TestElisionIsSound(unittest.TestCase):
         self.assertEqual(rc, 0, err)
 
 
+class TestLoopRanges(unittest.TestCase):
+    """Rule 3: `a[i]` inside a counted loop, proved in bounds for every pass.
+
+    The upper bound comes from the loop guard and the lower from how the
+    counter is written. Both halves are needed, and each of these tests removes
+    one of them.
+    """
+
+    def _assert_caught(self, src, phrase):
+        rc, err, info = _run(src)
+        self.assertIsNotNone(rc, info)
+        self.assertIn(phrase, err)
+
+    def test_counted_loop_over_its_own_array_is_proved(self):
+        _, info = _build(
+            "#include <stdlib.h>\n"
+            "int main(void){ int *a = malloc(1000*sizeof(int));\n"
+            "  long i, s = 0;\n"
+            "  for (i = 0; i < 1000; i++) { a[i] = (int)i; s += a[i]; }\n"
+            "  free(a); return (int)(s & 1); }\n")
+        self.assertIn("0 check(s) emitted", info)
+
+    def test_guard_one_past_the_end_is_not_proved(self):
+        # `i <= 10` over ten elements. Off by one in the direction that
+        # matters: the proof arithmetic has to include the boundary iteration.
+        self._assert_caught(
+            "#include <stdlib.h>\n"
+            "int main(void){ int *a = malloc(10*sizeof(int)); int i, s = 0;\n"
+            "  for (i = 0; i <= 10; i++) { a[i] = i; s += a[i]; }\n"
+            "  free(a); return s; }\n",
+            "heap buffer overflow")
+
+    def test_negative_start_is_not_proved(self):
+        # The guard still says i < 10, so an upper bound alone would wave this
+        # through. Only the non-negativity half rejects it.
+        self._assert_caught(
+            "#include <stdlib.h>\n"
+            "int main(void){ int *a = malloc(10*sizeof(int)); int i, s = 0;\n"
+            "  for (i = -2; i < 10; i++) { a[i] = i; s += a[i]; }\n"
+            "  free(a); return s; }\n",
+            "underflow")
+
+    def test_shifted_index_is_not_proved(self):
+        # a[i+1] with i < 10 reaches a[10]. The constant offset has to be
+        # carried into the bound arithmetic, not dropped.
+        self._assert_caught(
+            "#include <stdlib.h>\n"
+            "int main(void){ int *a = malloc(40); int i, s = 0;\n"
+            "  for (i = 0; i < 10; i++) a[i] = i;\n"
+            "  for (i = 0; i < 10; i++) s += a[i+1];\n"
+            "  free(a); return s; }\n",
+            "heap buffer overflow")
+
+    def test_variable_bound_is_not_proved(self):
+        # The guard compares against a variable, so there is no number to do
+        # the arithmetic with.
+        self._assert_caught(
+            "#include <stdlib.h>\n"
+            "int main(void){ int n = 20; int *a = malloc(40); int i, s = 0;\n"
+            "  for (i = 0; i < n; i++) { a[i] = i; s += a[i]; }\n"
+            "  free(a); return s; }\n",
+            "heap buffer overflow")
+
+    def test_loop_longer_than_the_allocation_is_not_proved(self):
+        self._assert_caught(
+            "#include <stdlib.h>\n"
+            "int main(void){ int *a = malloc(4*sizeof(int)); int i, s = 0;\n"
+            "  for (i = 0; i < 6; i++) { a[i] = i; s += a[i]; }\n"
+            "  free(a); return s; }\n",
+            "heap buffer overflow")
+
+    def test_freed_inside_the_loop_is_not_proved(self):
+        # In bounds, but not live on the second pass.
+        self._assert_caught(
+            "#include <stdlib.h>\n"
+            "int main(void){ int *a = malloc(40); int i;\n"
+            "  for (i = 0; i < 2; i++) { a[i] = i; free(a); }\n"
+            "  return 0; }\n",
+            "use after free")
+
+
+class TestUnderflow(unittest.TestCase):
+    """An access before an object's base lands in no tracked region at all,
+    so it is invisible unless the runtime also looks for an object starting
+    just above the address."""
+
+    def test_underflow_is_reported_with_a_negative_offset(self):
+        rc, err, info = _run(
+            "#include <stdlib.h>\n"
+            "int main(void){ int *a = malloc(40); a[-2] = 1;\n"
+            "  return 0; }\n")
+        self.assertIsNotNone(rc, info)
+        self.assertIn("underflow", err)
+        self.assertIn("before the start", err)
+
+
 class TestElisionActuallyFires(unittest.TestCase):
     def test_read_modify_write_drops_a_check(self):
         _, info = _build(
