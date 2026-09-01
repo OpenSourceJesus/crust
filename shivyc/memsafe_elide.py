@@ -54,6 +54,7 @@ dropped check on an access that was not actually safe, which is the one error
 this module must never make.
 """
 
+import shivyc.il_cmds.compare as compare_cmds
 import shivyc.il_cmds.control as control_cmds
 import shivyc.il_cmds.math as math_cmds
 import shivyc.il_cmds.value as value_cmds
@@ -91,6 +92,185 @@ def _access_size(cmd):
           else cmd.val.ctype)
     n = getattr(ct, "size", None)
     return n if isinstance(n, int) and n > 0 else None
+
+
+def _dominators(cfg):
+    """Block -> set of blocks that dominate it (itself included).
+
+    Needed because a loop guard only tells you something about the blocks it
+    actually controls. `i < n` on one arm of a branch says nothing on the
+    other, and an access in a block merely *reachable* from the comparison may
+    also be reachable by a path that skipped it.
+    """
+    n = len(cfg.blocks)
+    if n == 0:
+        return {}
+    preds = {}
+    for b in range(n):
+        preds[b] = set()
+    for b in range(n):
+        for sc in cfg.succ[b]:
+            preds[sc].add(b)
+
+    everything = frozenset(range(n))
+    dom = {0: frozenset([0])}
+    for b in range(1, n):
+        dom[b] = everything
+
+    changed = True
+    while changed:
+        changed = False
+        for b in range(1, n):
+            if not preds[b]:
+                new = frozenset([b])
+            else:
+                acc = None
+                for p in preds[b]:
+                    acc = dom[p] if acc is None else (acc & dom[p])
+                new = (acc or frozenset()) | frozenset([b])
+            if new != dom[b]:
+                dom[b] = new
+                changed = True
+    return dom
+
+
+def _upper_bounds(cfg, cmds, dom):
+    """Block -> {id(ILValue): exclusive upper bound}, from dominating guards.
+
+    Recognizes the shape the front end emits for a counted loop: a comparison
+    into a temporary, then a conditional jump on it. Only the arm on which the
+    comparison held is credited with the fact.
+    """
+    out = {}
+    for b in range(len(cfg.blocks)):
+        out[b] = {}
+
+    for g in range(len(cfg.blocks)):
+        start, end = cfg.blocks[g]
+        if end <= start:
+            continue
+        jump = cmds[end - 1]
+        if not isinstance(jump, control_cmds._GeneralJump):
+            continue
+
+        # The comparison feeding this jump, if it is the obvious one.
+        cmp_cmd = None
+        for i in range(end - 2, start - 1, -1):
+            c = cmds[i]
+            if (isinstance(c, compare_cmds._GeneralCmp)
+                    and getattr(c, "fuse", None) is None
+                    and c.output is jump.cond):
+                cmp_cmd = c
+                break
+            if jump.cond in c.outputs():
+                break            # produced by something else; not a guard
+        if cmp_cmd is None:
+            continue
+
+        bound = _literal(cmp_cmd.arg2)
+        if bound is None:
+            continue
+        if isinstance(cmp_cmd, compare_cmds.LessCmp):
+            limit = bound                      # i < bound
+        elif isinstance(cmp_cmd, compare_cmds.LessOrEqCmp):
+            limit = bound + 1                  # i <= bound
+        else:
+            continue
+
+        # JumpZero branches away when the comparison was false, so the
+        # comparison holds on the fallthrough; JumpNotZero is the mirror.
+        tgt_blk = cfg.block_of.get(cfg.labels.get(jump.label, -1))
+        fall = cfg.block_of.get(end) if end < len(cmds) else None
+        if isinstance(jump, control_cmds.JumpZero):
+            true_blk = fall
+        else:
+            true_blk = tgt_blk
+        if true_blk is None:
+            continue
+
+        key = id(cmp_cmd.arg1)
+        for b in range(len(cfg.blocks)):
+            if true_blk in dom.get(b, ()):
+                prev = out[b].get(key)
+                out[b][key] = limit if prev is None else min(prev, limit)
+    return out
+
+
+def _nonneg(cmds):
+    """ILValues that cannot be negative anywhere in the function.
+
+    A loop guard gives only the upper half of a range. The lower half comes
+    from how the variable is written: if every assignment to it is either a
+    non-negative constant or an increase by a non-negative constant, it never
+    goes below zero, whatever path is taken. Checking every definition in the
+    function means no control-flow reasoning is needed for this half -- and a
+    single unexplained assignment anywhere disqualifies the value, which is
+    what makes it safe.
+    """
+    defs = {}
+    for c in cmds:
+        for o in c.outputs():
+            defs.setdefault(id(o), []).append(c)
+
+    cand = set(defs)
+    changed = True
+    while changed:
+        changed = False
+        for key in list(cand):
+            for c in defs[key]:
+                ok = False
+                if isinstance(c, value_cmds.Set):
+                    lit = _literal(c.arg)
+                    ok = (lit is not None and lit >= 0) or id(c.arg) in cand
+                elif isinstance(c, math_cmds.Add):
+                    for p, q in ((c.arg1, c.arg2), (c.arg2, c.arg1)):
+                        k = _literal(q)
+                        if k is not None and k >= 0 and id(p) in cand:
+                            ok = True
+                            break
+                elif isinstance(c, math_cmds.Mult):
+                    ok = (id(c.arg1) in cand and id(c.arg2) in cand)
+                if not ok:
+                    cand.discard(key)
+                    changed = True
+                    break
+    # Literals are self-evidently in range and have no definition at all.
+    return cand
+
+
+def _single_def_origins(cmds, sizes, fn):
+    """Constant-offset origins for values defined exactly once.
+
+    Block-local tracking cannot see the `malloc` that happens before a loop,
+    which is precisely the base pointer every indexed access inside the loop
+    is built from. A value assigned once in the whole function holds the same
+    thing wherever it is live, so its origin is safe to carry across blocks.
+    Anything reassigned -- `p = p->next` -- is excluded and stays block-local.
+    """
+    count = {}
+    for c in cmds:
+        for o in c.outputs():
+            count[id(o)] = count.get(id(o), 0) + 1
+
+    origin = {}
+    for i in range(len(cmds)):
+        c = cmds[i]
+        if (isinstance(c, control_cmds.Call) and c.direct_name in ALLOCATORS
+                and c.ret is not None and count.get(id(c.ret)) == 1
+                and (fn, i) in sizes):
+            origin[id(c.ret)] = ((fn, i), 0)
+        elif isinstance(c, value_cmds.Set) and count.get(id(c.output)) == 1:
+            if id(c.arg) in origin:
+                origin[id(c.output)] = origin[id(c.arg)]
+        elif isinstance(c, math_cmds.Add) and count.get(id(c.output)) == 1:
+            for p, q in ((c.arg1, c.arg2), (c.arg2, c.arg1)):
+                if id(p) in origin:
+                    k = _literal(q)
+                    if k is not None:
+                        al, off = origin[id(p)]
+                        origin[id(c.output)] = (al, off + k)
+                    break
+    return origin
 
 
 class _Numbering:
@@ -179,20 +359,34 @@ def safe_accesses(il_code, symbol_table):
     marks = {}
     n_redundant = 0
     n_bounds = 0
+    n_ranged = 0
 
     for fn in prog.functions:
         cmds = prog.functions[fn]
         live = live_access.get(fn, {})
         skip = set()
 
+        # Rule 3 machinery: loop-carried ranges.
+        cfg = memory_safety.CFG(cmds)
+        dom = _dominators(cfg)
+        bounds = _upper_bounds(cfg, cmds, dom)
+        nonneg = _nonneg(cmds)
+        far_origin = _single_def_origins(cmds, sizes, fn)
+
         mark = set()
         vn = _Numbering()
         checked = {}       # value number -> widest size already checked
         # id(ILValue) -> (allocation id, constant offset from its base)
         origin = {}
+        # id(ILValue) -> (index ILValue, scale) for `i * k`
+        scaled = {}
+        # id(ILValue) -> (allocation id, base offset, index ILValue, scale)
+        indexed = {}
 
         for i in range(len(cmds)):
             c = cmds[i]
+
+            blk = cfg.block_of.get(i, 0)
 
             if isinstance(c, control_cmds.Label) or _is_block_end(c):
                 # Nothing survives a block boundary: a value number means
@@ -201,6 +395,8 @@ def safe_accesses(il_code, symbol_table):
                 vn = _Numbering()
                 checked = {}
                 origin = {}
+                scaled = {}
+                indexed = {}
                 continue
 
             if isinstance(c, control_cmds.Call):
@@ -216,14 +412,19 @@ def safe_accesses(il_code, symbol_table):
                     if c.ret is not None:
                         vn.define(c.ret)
                     origin = {}
+                    indexed = {}
                 checked = {}
                 continue
 
             if isinstance(c, value_cmds.ReadAt):
                 n = _access_size(c)
-                if n is not None and _try_elide(c, i, n, False, vn, checked,
-                                                origin, live, sizes, skip,
-                                                mark):
+                before_r = len(skip)
+                if n is not None and _try_elide(
+                        c, i, n, False, vn, checked, origin, live, sizes,
+                        skip, mark, indexed, bounds.get(blk, {}), nonneg,
+                        far_origin):
+                    if len(skip) != before_r:
+                        n_ranged += 1
                     n_redundant += 1
                 vn.define(c.output)
                 continue
@@ -233,23 +434,25 @@ def safe_accesses(il_code, symbol_table):
                 if n is not None:
                     before = len(mark)
                     if _try_elide(c, i, n, True, vn, checked, origin,
-                                  live, sizes, skip, mark):
+                                  live, sizes, skip, mark, indexed,
+                                  bounds.get(blk, {}), nonneg, far_origin):
                         n_redundant += 1
                     elif len(mark) != before:
                         n_bounds += 1
                 continue
 
-            _propagate(c, vn, origin)
+            _propagate(c, vn, origin, scaled, indexed, far_origin)
 
         if skip:
             out[fn] = skip
         if mark:
             marks[fn] = mark
 
-    return out, marks, n_redundant, n_bounds
+    return out, marks, n_redundant, n_bounds, n_ranged
 
 
-def _try_elide(c, i, n, writing, vn, checked, origin, live, sizes, skip, mark):
+def _try_elide(c, i, n, writing, vn, checked, origin, live, sizes, skip, mark,
+               indexed, bounds, nonneg, far_origin):
     """Judge command `i`. Returns True when its check is dropped entirely.
 
     A rule-2 write is added to `mark` instead and returns False: it still has
@@ -267,6 +470,28 @@ def _try_elide(c, i, n, writing, vn, checked, origin, live, sizes, skip, mark):
 
     checked[num] = max(prev or 0, n)
 
+    # Rule 3: a variable index whose range is bounded on both sides. The guard
+    # of the enclosing loop supplies the upper bound and the way the counter is
+    # written supplies the lower one, so `a[i]` inside `for (i = 0; i < N; i++)`
+    # is in bounds for every iteration when N * scale fits the allocation.
+    #
+    # Writes are downgraded rather than removed here for exactly the reason
+    # rule 2 is: the check is also what records definedness.
+    idx = indexed.get(id(c.addr))
+    if idx is not None:
+        al, off, index, scale = idx
+        size = sizes.get(al)
+        limit = bounds.get(id(index))
+        if (size is not None and limit is not None and live.get(i) == al
+                and id(index) in nonneg and scale > 0 and off >= 0
+                and limit >= 1
+                and off + (limit - 1) * scale + n <= size):
+            if writing:
+                mark.add(i)
+            else:
+                skip.add(i)
+            return not writing
+
     # Rule 2: constant offset into a live allocation of known size. Applies to
     # writes only -- see the module docstring for why a proved read still has
     # to run.
@@ -282,42 +507,72 @@ def _try_elide(c, i, n, writing, vn, checked, origin, live, sizes, skip, mark):
     return False
 
 
-def _propagate(c, vn, origin):
-    """Number an ordinary command's result and track constant offsets."""
+def _base_origin(val, origin, far_origin):
+    """Origin of `val`, preferring the block-local fact over the global one."""
+    ori = origin.get(id(val))
+    return ori if ori is not None else far_origin.get(id(val))
+
+
+def _propagate(c, vn, origin, scaled, indexed, far_origin):
+    """Number an ordinary command's result and track how addresses are built."""
     if isinstance(c, value_cmds.Set):
         vn.define(c.output, ("set", vn.of(c.arg)))
-        if id(c.arg) in origin:
-            origin[id(c.output)] = origin[id(c.arg)]
+        ori = _base_origin(c.arg, origin, far_origin)
+        if ori is not None:
+            origin[id(c.output)] = ori
         else:
             origin.pop(id(c.output), None)
+        if id(c.arg) in scaled:
+            scaled[id(c.output)] = scaled[id(c.arg)]
+        if id(c.arg) in indexed:
+            indexed[id(c.output)] = indexed[id(c.arg)]
         return
 
     if isinstance(c, math_cmds.Add):
         a, b = c.arg1, c.arg2
         vn.define(c.output, ("add", min(vn.of(a), vn.of(b)),
                              max(vn.of(a), vn.of(b))))
-        # base + literal keeps a known offset; base + anything else does not.
-        for p, q in ((a, b), (b, a)):
-            if id(p) in origin:
-                k = _literal(q)
-                if k is not None:
-                    al, off = origin[id(p)]
-                    origin[id(c.output)] = (al, off + k)
-                    return
         origin.pop(id(c.output), None)
+        indexed.pop(id(c.output), None)
+        for p, q in ((a, b), (b, a)):
+            ori = _base_origin(p, origin, far_origin)
+            if ori is None:
+                continue
+            al, off = ori
+            k = _literal(q)
+            if k is not None:                       # base + constant
+                origin[id(c.output)] = (al, off + k)
+                return
+            sc = scaled.get(id(q))
+            if sc is not None:                      # base + index * scale
+                indexed[id(c.output)] = (al, off, sc[0], sc[1])
+                return
+            # base + an unscaled variable: an index of stride one.
+            indexed[id(c.output)] = (al, off, q, 1)
+            return
         return
 
     if isinstance(c, math_cmds.Mult):
         vn.define(c.output, ("mult", min(vn.of(c.arg1), vn.of(c.arg2)),
                              max(vn.of(c.arg1), vn.of(c.arg2))))
         origin.pop(id(c.output), None)
+        scaled.pop(id(c.output), None)
+        for p, q in ((c.arg1, c.arg2), (c.arg2, c.arg1)):
+            k = _literal(q)
+            if k is not None and k > 0 and _literal(p) is None:
+                scaled[id(c.output)] = (p, k)
+                break
         return
 
     if isinstance(c, math_cmds.Subtr):
         vn.define(c.output, ("sub", vn.of(c.arg1), vn.of(c.arg2)))
         origin.pop(id(c.output), None)
+        indexed.pop(id(c.output), None)
+        scaled.pop(id(c.output), None)
         return
 
     for o in c.outputs():
         vn.define(o)
         origin.pop(id(o), None)
+        indexed.pop(id(o), None)
+        scaled.pop(id(o), None)

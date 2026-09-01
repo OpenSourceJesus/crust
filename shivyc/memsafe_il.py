@@ -321,7 +321,7 @@ def instrument(il_code, symbol_table, args=None):
     if not getattr(args, "mem_safe_no_elide", False):
         try:
             import shivyc.memsafe_elide as memsafe_elide
-            elide, marks, n_red, n_bnd = memsafe_elide.safe_accesses(
+            elide, marks, n_red, n_bnd, n_rng = memsafe_elide.safe_accesses(
                 il_code, symbol_table)
             n_elided = n_red
             n_marked = n_bnd
