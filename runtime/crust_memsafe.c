@@ -259,12 +259,25 @@ static const char *ms_kindname(int kind)
     return "global";
 }
 
+static int ms_same_file(const char *a, const char *b)
+{
+    /* Compared by content, not by pointer. Two tiers can report the same site
+     * through different string literals -- a macro check in the source and a
+     * compiler-inserted check both naming the same file -- and pointer
+     * equality would then see two distinct sites and print the same bug twice.
+     */
+    if (a == b) return 1;
+    if (!a || !b) return 0;
+    return strcmp(a, b) == 0;
+}
+
+
 static int ms_dedup_hit(const char *file, int line, int kind)
 {
     int i;
     for (i = 0; i < ms_ndedup; i++) {
         if (ms_dedup[i].line == line && ms_dedup[i].kind == kind
-                && ms_dedup[i].file == file) {
+                && ms_same_file(ms_dedup[i].file, file)) {
             ms_dedup[i].count++;
             return ms_dedup[i].count > 1;
         }
@@ -506,6 +519,32 @@ int crust_ms_check_write(void *p, size_t n, const char *expr,
                          const char *file, int line, const char *func)
 {
     return ms_check(p, n, 1, expr, file, line, func);
+}
+
+void crust_ms_il_read(const void *p, unsigned long n, const char *file,
+                      int line, const char *func)
+{
+    ms_check(p, (size_t)n, 0, 0, file, line, func);
+}
+
+void crust_ms_il_write(void *p, unsigned long n, const char *file,
+                       int line, const char *func)
+{
+    ms_check(p, (size_t)n, 1, 0, file, line, func);
+}
+
+void crust_ms_il_escape(void *p)
+{
+    struct ms_region *r;
+    ms_addr a = (ms_addr)p;
+    if (!ms_ready) crust_ms_init();
+    if (!p) return;
+    r = ms_find(a);
+    if (!r || r->state != MS_LIVE) return;
+    /* From the pointer forward, not the whole object: `strcpy(buf + 8, ..)`
+     * says nothing about the first eight bytes, and keeping them poisoned
+     * preserves detection for the common partial-fill case. */
+    ms_bits_set(r, a, r->size - (size_t)(a - r->base), 1);
 }
 
 void *crust_ms_checked_wr(void *p, size_t n, const char *expr,

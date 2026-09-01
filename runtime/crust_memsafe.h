@@ -106,6 +106,33 @@ int crust_ms_check_read(const void *p, size_t n, const char *expr,
 int crust_ms_check_write(void *p, size_t n, const char *expr,
                          const char *file, int line, const char *func);
 
+/* Entry points for checks inserted by the compiler's IL pass rather than by
+ * the macros above. The IL has no source text for the access -- it is long
+ * past the point where `a[i]` was a spelling -- so these drop the `expr`
+ * argument instead of inventing one. Everything else is identical, and both
+ * paths land in the same check, so a program instrumented either way reports
+ * in the same format.
+ */
+void crust_ms_il_read(const void *p, unsigned long n, const char *file,
+                      int line, const char *func);
+void crust_ms_il_write(void *p, unsigned long n, const char *file,
+                       int line, const char *func);
+
+/* A pointer is about to be handed to code this build does not instrument
+ * (libc, a .c compiled without the flag, anything across a shared-library
+ * boundary). That callee may write through it, and the shadow will not see
+ * those writes, so every later read of those bytes would be reported as
+ * uninitialized. Conservatively marks from `p` to the end of its object as
+ * defined.
+ *
+ * This trades detection for trustworthiness, deliberately. A missed
+ * uninitialized read costs one bug; a false one on every `strcpy` buffer costs
+ * the user's belief in the whole report. Bounds and liveness are unaffected --
+ * the region stays tracked, so an overflow or a use-after-free through the same
+ * pointer is still caught.
+ */
+void crust_ms_il_escape(void *p);
+
 /* Mark bytes defined without a bounds check -- for memset/memcpy
  * destinations and for the store half of a read-modify-write. */
 void crust_ms_mark_init(void *p, size_t n);
