@@ -177,15 +177,31 @@ class TestTierInteraction(unittest.TestCase):
         p = subprocess.run([out], capture_output=True, text=True)
         self.assertEqual(p.returncode, 0, p.stderr)
 
-    def test_cpp_level_does_not_run_the_il_pass(self):
-        # --mem-safe=cpp is the C++ tier: it defines CRUST_MEM_SAFE for the
-        # macros but must leave hand-written C alone at full speed.
+    def test_cpp_level_checks_no_hand_written_c(self):
+        # --mem-safe=cpp is the C++ tier. The pass runs, but it instruments
+        # only positions that came from C++ source, so a .c file with no C++
+        # in it gets no checks at all -- which is the promise of the level.
+        # Allocator calls are still redirected: without a tracked region the
+        # checks in C++ code that touch this memory would have nothing to
+        # check against.
         out, info = _build(
             "#include <stdlib.h>\n"
             "int main(void){ int *a = malloc(4); a[4] = 1; free(a);\n"
             "  return 0; }\n", ["--mem-safe=cpp"])
         self.assertIsNotNone(out, info)
-        self.assertNotIn("check(s) emitted", info)
+        self.assertIn("0 check(s) emitted", info)
+        p = subprocess.run([out], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_all_level_checks_the_same_file(self):
+        # The contrast: identical source, --mem-safe=all, and the bug is found.
+        out, info = _build(
+            "#include <stdlib.h>\n"
+            "int main(void){ int *a = malloc(4); a[4] = 1; free(a);\n"
+            "  return 0; }\n", ["--mem-safe"])
+        self.assertIsNotNone(out, info)
+        p = subprocess.run([out], capture_output=True, text=True)
+        self.assertIn("heap buffer overflow", p.stderr)
 
 
 if __name__ == "__main__":
@@ -265,3 +281,39 @@ class TestStackObjects(unittest.TestCase):
             "  printf(\"%s\\n\", m); return 0; }\n")
         self.assertIsNotNone(rc, err)
         self.assertEqual(rc, 0, err)
+
+
+class TestGlobals(unittest.TestCase):
+    """Static objects. Collected across the whole unit and registered where
+    they are certain to run before any access -- a global is usually touched
+    somewhere other than where it gets registered."""
+
+    def test_global_array_overflow_is_caught(self):
+        rc, err, _ = _run(
+            "static int table[8];\n"
+            "int main(void){ int i;\n"
+            "  for (i = 0; i < 8; i++) table[i] = i;\n"
+            "  table[9] = 99;\n"
+            "  return table[0]; }\n")
+        self.assertIsNotNone(rc, err)
+        self.assertIn("global buffer overflow", err)
+        self.assertIn("table", err)
+        self.assertIn("declared at", err)      # not "allocated at"
+
+    def test_global_touched_only_from_another_function(self):
+        # Registration is emitted in main, but main never names `shared`.
+        # Scanning only the function being instrumented found nothing.
+        rc, err, _ = _run(
+            "int shared[4];\n"
+            "static void fill(void){ int i; for (i=0;i<4;i++) shared[i]=i; }\n"
+            "static int over(void){ return shared[7]; }\n"
+            "int main(void){ fill(); return over(); }\n")
+        self.assertIsNotNone(rc, err)
+        self.assertIn("global buffer overflow", err)
+
+    def test_correct_global_use_is_clean(self):
+        rc, err, _ = _run(
+            "static char msg[16] = \"hi\";\n"
+            "int main(void){ return msg[0] == 'h' ? 0 : 1; }\n")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("clean", err)
