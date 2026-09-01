@@ -160,7 +160,7 @@ class TestTierInteraction(unittest.TestCase):
             fixture = f.read()
         out, info = _build(fixture, ["--mem-safe"])
         self.assertIsNotNone(out, info)
-        self.assertIn("instrumented 0 access", info)
+        self.assertIn("0 check(s) emitted", info)
         p = subprocess.run([out], capture_output=True, text=True)
         # The fixture has exactly five distinct bugs; a double-instrumented
         # build reported eight.
@@ -185,7 +185,7 @@ class TestTierInteraction(unittest.TestCase):
             "int main(void){ int *a = malloc(4); a[4] = 1; free(a);\n"
             "  return 0; }\n", ["--mem-safe=cpp"])
         self.assertIsNotNone(out, info)
-        self.assertNotIn("instrumented", info)
+        self.assertNotIn("check(s) emitted", info)
 
 
 if __name__ == "__main__":
