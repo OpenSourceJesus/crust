@@ -7,6 +7,18 @@ from shivyc.spots import LiteralSpot
 class ILCommand:
     """Base interface for all IL commands."""
 
+    # Source range (errors.Range) of the construct that produced this command,
+    # or None for commands synthesized by a pass with no source of their own.
+    #
+    # The IL used to carry no positions at all, which is why every whole-program
+    # analysis built on it -- use-after-free, double-free, auto-free -- could
+    # only report "in <function>". Stamped centrally by ILCode.add from the
+    # range the front end is currently lowering, so no command class has to
+    # thread it through its own constructor.
+    #
+    # Obj-typed to match the `r` field on every other class in the compiler.
+    r: "object" = None
+
     def inputs(self):
         """Return list of ILValues used as input for this command."""
         raise NotImplementedError
