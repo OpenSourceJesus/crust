@@ -81,6 +81,16 @@ class _LExprNode(_ExprNode):
         self._cache_lvalue = None
 
     def make_il(self, il_code, symbol_table, c):  # noqa D102
+        # An lvalue node read as a value is where ReadAt is emitted, so this is
+        # the funnel that gives a dereference its own position rather than the
+        # enclosing statement's.
+        prev = il_code.set_range(self.r)
+        try:
+            return self._make_il(il_code, symbol_table, c)
+        finally:
+            il_code.restore_range(prev)
+
+    def _make_il(self, il_code, symbol_table, c):
         lvalue = self.lvalue(il_code, symbol_table, c)
 
         # Decay array
@@ -97,12 +107,20 @@ class _LExprNode(_ExprNode):
             return lvalue.val(il_code)
 
     def make_il_raw(self, il_code, symbol_table, c):  # noqa D102
-        return self.lvalue(il_code, symbol_table, c).val(il_code)
+        prev = il_code.set_range(self.r)
+        try:
+            return self.lvalue(il_code, symbol_table, c).val(il_code)
+        finally:
+            il_code.restore_range(prev)
 
     def lvalue(self, il_code, symbol_table, c):
         """Return an LValue object representing this node."""
         if not self._cache_lvalue:
-            self._cache_lvalue = self._lvalue(il_code, symbol_table, c)
+            prev = il_code.set_range(self.r)
+            try:
+                self._cache_lvalue = self._lvalue(il_code, symbol_table, c)
+            finally:
+                il_code.restore_range(prev)
         return self._cache_lvalue
 
     def _lvalue(self, il_code, symbol_table, c):

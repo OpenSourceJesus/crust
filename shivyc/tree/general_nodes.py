@@ -52,7 +52,12 @@ class Compound(CNode):
         c = c.set_global(False)
         for item in self.items:
             with report_err():
+                # Statement granularity is the baseline: every command emitted
+                # while lowering this item belongs to this statement unless a
+                # sub-expression narrows it further below.
+                _prev = il_code.set_range(item.r)
                 item.make_il(il_code, symbol_table, c)
+                il_code.restore_range(_prev)
 
         if not no_scope:
             symbol_table.end_scope()
@@ -819,6 +824,14 @@ class DeclInfo:
                 else 1 for ct in self.ctype.args)
             c = c.set_vararg_named(named_slots)
         il_code.start_func(self.identifier.content)
+
+        # The prologue -- VaSaveBase, the LoadArgs for each parameter -- runs
+        # before any statement, so nothing in the body has set a position yet.
+        # Point it at the function's own name token, which is where a reader
+        # would look for a complaint about a parameter. Left set for the whole
+        # definition so the epilogue is covered too; each statement narrows it
+        # and restores this on the way out.
+        il_code.set_range(self.identifier.r)
 
         if variadic:
             # The caller passes the base of the argument block in r11; capture
