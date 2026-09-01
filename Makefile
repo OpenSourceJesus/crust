@@ -70,6 +70,28 @@ test_crust:
 test_fast_crust:
 	@python3 tools/crust_examples.py --fast -v
 
+# Memory safety, two tiers over the same examples/memory/ corpus.
+#
+#   make check-memory   the *static* whole-program pass: proves what it can at
+#                       compile time, emits nothing, needs no test inputs.
+#                       (Documented in examples/memory/README.md since that
+#                       pass landed; the target itself was missing until now.)
+#   make mem-safe       the *runtime* tier: instruments the build, runs it, and
+#                       reports what actually happened with exact bounds and a
+#                       source location for both the access and the allocation.
+#                       Expected to exit non-zero -- the fixture is all bugs.
+check-memory:
+	@for f in examples/memory/dangling_alias.c examples/memory/double_free.c \
+		 examples/memory/wrapper_uaf.c examples/memory/autofree_leak.c; do \
+		echo "== $$f"; python3 -m shivyc.main $$f --check-memory || true; \
+	done
+
+mem-safe:
+	@python3 -m shivyc.main --mem-safe examples/memory/memsafe_runtime.c \
+		-o /tmp/crust_memsafe_demo
+	@echo "== running instrumented build (non-zero exit is expected)"
+	@/tmp/crust_memsafe_demo; test $$? -eq 1
+
 # WebAssembly back end. Unlike the other cross targets there is no cross
 # compiler and no emulator to install: ShivyC emits the .wasm binary itself
 # (shivyc/wasm.py) and node both validates and runs it, with gcc as the oracle.
@@ -1046,7 +1068,7 @@ mbos-rpython-test-net:
 self:
 	cd tools && pypy3 py2c.py
 
-.PHONY: default test testfast testminipy testfast_native testpromote testpgo testfuse testtorch shim install install_deps clean baremetal baremetal-arm64 baremetal-arm64-run baremetal-raspi baremetal-raspi-irq baremetal-echo baremetal-echo-raspi baremetal-preempt baremetal-jetson test_baremetal_arm64 baremetal-hello \
+.PHONY: check-memory mem-safe default test testfast testminipy testfast_native testpromote testpgo testfuse testtorch shim install install_deps clean baremetal baremetal-arm64 baremetal-arm64-run baremetal-raspi baremetal-raspi-irq baremetal-echo baremetal-echo-raspi baremetal-preempt baremetal-jetson test_baremetal_arm64 baremetal-hello \
         bootstrap bootstrap2 \
         selfhost selfhost_objcore selfhost_bench selfhost_coverage \
         selfhost_coverage_musl selfhost_link selfhost_build selfhost_compiler \
