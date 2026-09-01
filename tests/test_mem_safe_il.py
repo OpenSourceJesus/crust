@@ -190,3 +190,78 @@ class TestTierInteraction(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestStackObjects(unittest.TestCase):
+    """Frame objects. Local arrays lower to ReadRel/SetRel, not ReadAt/SetAt,
+    so they went unchecked entirely until those forms were instrumented and
+    their base objects registered."""
+
+    def test_local_array_overflow_is_caught(self):
+        rc, err, _ = _run(
+            "int main(void){ int buf[8]; int i;\n"
+            "  for (i = 0; i < 8; i++) buf[i] = i;\n"
+            "  buf[9] = 99;\n"
+            "  return buf[0]; }\n")
+        self.assertIsNotNone(rc, err)
+        self.assertIn("stack buffer overflow", err)
+        self.assertIn("buf", err)          # the variable is named
+        self.assertEqual(rc, 1)
+
+    def test_use_after_scope_exit(self):
+        rc, err, _ = _run(
+            "static int *escape(void){ int local = 42; return &local; }\n"
+            "int main(void){ int *p = escape(); return *p; }\n")
+        self.assertIsNotNone(rc, err)
+        self.assertIn("scope", err)
+
+    def test_uninitialized_local_array(self):
+        rc, err, _ = _run(
+            "int main(void){ int b[4]; int i, s = 0;\n"
+            "  for (i = 0; i < 4; i++) s += b[i];\n"
+            "  return s; }\n")
+        self.assertIsNotNone(rc, err)
+        self.assertIn("uninitialized", err)
+
+    def test_by_value_parameter_is_not_reported_uninitialized(self):
+        # A struct parameter arrives through LoadArg/LoadStructArg, which is
+        # not a memory access and is never instrumented. Registering it as
+        # undefined reported a false uninitialized read on its first use.
+        rc, err, _ = _run(
+            "struct p { int a; int b; };\n"
+            "static int use(struct p v){ return v.a + v.b; }\n"
+            "int main(void){ struct p x; x.a = 1; x.b = 2;\n"
+            "  return use(x) == 3 ? 0 : 1; }\n")
+        self.assertIsNotNone(rc, err)
+        self.assertNotIn("uninitialized", err)
+        self.assertEqual(rc, 0, err)
+
+    def test_struct_by_value_function_is_not_miscompiled(self):
+        # Registration is emitted after the prologue, and a function taking a
+        # struct by value begins with LoadStructArg rather than LoadArg. A
+        # scan that knew only LoadArg inserted the call above the argument
+        # load, clobbering the argument registers.
+        rc, err, out = _run(
+            "#include <stdio.h>\n"
+            "struct s { int a; int b; int c; };\n"
+            "struct s make(struct s in){ struct s o;\n"
+            "  o.a = in.a + 1; o.b = in.b + 1; o.c = in.c + 1; return o; }\n"
+            "int main(void){ struct s x; x.a=1; x.b=2; x.c=3;\n"
+            "  struct s y = make(x);\n"
+            "  printf(\"%d\\n\", y.a + y.b + y.c);\n"
+            "  return y.a + y.b + y.c == 9 ? 0 : 1; }\n")
+        self.assertIsNotNone(rc, err)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out.strip(), "9")
+
+    def test_string_literal_is_not_registered_as_a_frame_object(self):
+        # String literals live in .rodata and are never declared, so they are
+        # absent from the storage map. Registering one put a bogus region in
+        # the table and the underflow search blamed it for reads of the static
+        # data beside it.
+        rc, err, _ = _run(
+            "#include <stdio.h>\n"
+            "int main(void){ const char *m = \"hello\";\n"
+            "  printf(\"%s\\n\", m); return 0; }\n")
+        self.assertIsNotNone(rc, err)
+        self.assertEqual(rc, 0, err)

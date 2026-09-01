@@ -324,3 +324,58 @@ class TestStaticPassSeesPointerArithmetic(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHoisting(unittest.TestCase):
+    """A proved write in a counted loop writes one contiguous run, so a single
+    shadow update before the loop replaces one per iteration. Once bounds and
+    liveness are proved away that update is the entire remaining cost."""
+
+    def test_loop_shadow_update_is_hoisted(self):
+        _, info = _build(
+            "#include <stdlib.h>\n"
+            "int main(void){ int *a = malloc(1000*sizeof(int));\n"
+            "  long i, s = 0;\n"
+            "  for (i = 0; i < 1000; i++) { a[i] = (int)i; s += a[i]; }\n"
+            "  free(a); return (int)(s & 1); }\n")
+        self.assertIn("1 shadow update(s) hoisted", info)
+        self.assertIn("0 check(s) emitted", info)
+
+    def test_hoist_leaves_the_loop_body_empty_in_a_nest(self):
+        # The preheader of an inner loop still sits inside the outer one, so a
+        # single level of hoisting left the update running once per outer
+        # iteration. It has to climb the whole nest.
+        _, info = _build(
+            "#include <stdlib.h>\n"
+            "int main(void){ int *a = malloc(1000*sizeof(int));\n"
+            "  long i, r, s = 0;\n"
+            "  for (r = 0; r < 20; r++)\n"
+            "    for (i = 0; i < 1000; i++) { a[i] = (int)i; s += a[i]; }\n"
+            "  free(a); return (int)(s & 1); }\n")
+        self.assertIn("hoisted", info)
+        self.assertIn("0 check(s) emitted", info)
+
+    def test_hoisting_preserves_results(self):
+        prog = ("#include <stdlib.h>\n#include <stdio.h>\n"
+                "int main(void){ int *a = malloc(100*sizeof(int));\n"
+                "  int i, s = 0;\n"
+                "  for (i = 0; i < 100; i++) { a[i] = i * 2; s += a[i]; }\n"
+                "  printf(\"%d\\n\", s); free(a);\n"
+                "  return s == 9900 ? 0 : 1; }\n")
+        rel, e1 = _build(prog, [])
+        chk, e2 = _build(prog, ["--mem-safe"])
+        self.assertIsNotNone(rel, e1)
+        self.assertIsNotNone(chk, e2)
+        a = subprocess.run([rel], capture_output=True, text=True)
+        b = subprocess.run([chk], capture_output=True, text=True)
+        self.assertEqual(a.stdout, b.stdout)
+        self.assertEqual(a.returncode, b.returncode)
+
+    def test_a_loop_that_can_overflow_is_not_hoisted(self):
+        rc, err, info = _run(
+            "#include <stdlib.h>\n"
+            "int main(void){ int *a = malloc(4*sizeof(int)); int i;\n"
+            "  for (i = 0; i < 6; i++) a[i] = i;\n"
+            "  free(a); return 0; }\n")
+        self.assertIsNotNone(rc, info)
+        self.assertIn("heap buffer overflow", err)
