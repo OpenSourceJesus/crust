@@ -15,6 +15,43 @@ from shivyc.parser.parser import parse
 from shivyc.il_gen import ILCode, SymbolTable, Context
 
 
+# Levels accepted by --mem-safe. 'all' instruments everything, including
+# hand-written C. 'cpp' restricts the checks to code lowered from the C++
+# subset by tools/cpprust.py, for the common case where the C is already
+# verified and the doubt is about the layer above it. A fat-pointer tier
+# ('strict') is deliberately not listed yet: it would change the pointer ABI,
+# so it cannot be mixed with unchecked C the way these two can.
+MEM_SAFE_LEVELS = ("all", "cpp")
+
+
+def memsafe_runtime_dir():
+    """Directory holding the checking runtime, or None if it is missing.
+
+    Host-only: it locates the runtime relative to this source file, which the
+    self-hosted compiler cannot do. Under self-host, pass -I and the runtime
+    .c explicitly.
+    """
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    d = os.path.join(repo, "runtime")
+    return d if os.path.isdir(d) else None
+
+
+def memsafe_runtime_source():
+    """Absolute path of the checking runtime's C source, or None."""
+    d = memsafe_runtime_dir()
+    if not d:
+        return None
+    p = os.path.join(d, "crust_memsafe.c")
+    return p if os.path.exists(p) else None
+
+
+def _has_define(defines, name):
+    for d in defines:
+        if d == name or d.startswith(name + "="):
+            return True
+    return False
+
+
 def _concat_adjacent_strings(tokens):
     """Merge runs of adjacent string-literal tokens into single tokens.
 
@@ -108,6 +145,37 @@ def main():
             _tree = _musl.materialize(getattr(arguments, "musl_dir", None))
             defines = _tree.defines() + defines
             include_dirs = _tree.public_include_dirs() + include_dirs
+
+    # The runtime directory joins the include path unconditionally, appended
+    # last so any user -I still wins. It has to be present in *both* builds:
+    # instrumented code includes crust_memsafe.h, and the whole point of the
+    # flag is that the identical source rebuilds without it. Adding the
+    # directory only under --mem-safe would make the release build -- the one
+    # that ships -- the only one that fails to compile.
+    if sys.implementation.name != "shivyc":
+        ms_dir = memsafe_runtime_dir()
+        if ms_dir and ms_dir not in include_dirs:
+            include_dirs = include_dirs + [ms_dir]
+
+    # With CRUST_MEM_SAFE absent every macro in that header collapses to the
+    # bare expression, so it is the define alone that separates a checked test
+    # build from a release build with no runtime cost.
+    if getattr(arguments, "mem_safe", None) \
+            and sys.implementation.name != "shivyc":
+        if memsafe_runtime_dir() is None:
+            print(CompilerError(
+                "--mem-safe: cannot find the checking runtime (expected "
+                "runtime/crust_memsafe.c beside the compiler)"))
+            return 1
+        if not _has_define(defines, "CRUST_MEM_SAFE"):
+            defines = defines + ["CRUST_MEM_SAFE"]
+        # The C++ tier compiles the same runtime; the extra define lets the
+        # generated C tell which layer asked for the checks, so a diagnostic
+        # can say so and so the two tiers do not double-instrument a shared
+        # header.
+        if arguments.mem_safe == "cpp" \
+                and not _has_define(defines, "CRUST_MEM_SAFE_CPP_ONLY"):
+            defines = defines + ["CRUST_MEM_SAFE_CPP_ONLY"]
 
     # Apply any -I include directories to the preprocessor.
     preproc.set_include_dirs(include_dirs)
@@ -276,6 +344,19 @@ def main():
     else:
         for file in arguments.files:
             objs.append(process_file(file, arguments))
+    # --mem-safe: the emitted checks are calls into the shadow-table runtime,
+    # so it has to be on the link line. Compiled here rather than shipped as a
+    # prebuilt .o so it always matches the target and the header it was built
+    # against. Skipped under -c/-S, where linking is the caller's job.
+    if (getattr(arguments, "mem_safe", None)
+            and sys.implementation.name != "shivyc"
+            and not getattr(arguments, "compile_only", False)
+            and not getattr(arguments, "asm_only", False)):
+        ms_src = memsafe_runtime_source()
+        named = [os.path.abspath(f) for f in arguments.files]
+        if ms_src and os.path.abspath(ms_src) not in named:
+            objs.append(process_file(ms_src, arguments))
+
     objs.extend(arguments._extra_objs)
 
     error_collector.show()
@@ -1033,6 +1114,7 @@ class Arguments:
         self.no_cache = False
         self.check_memory = False
         self.auto_free = False
+        self.mem_safe = None
         self.no_peephole = False
         self.microslice = False
         self.slice_budget = None
@@ -1092,6 +1174,10 @@ def _parse_args_selfhost(argv):
                 args.target = argv[i]
         elif a == '--no-cache':
             args.no_cache = True
+        elif a == '--mem-safe':
+            args.mem_safe = 'all'
+        elif len(a) > 11 and a[:11] == '--mem-safe=':
+            args.mem_safe = a[11:]
         elif a == '--no-peephole':
             args.no_peephole = True
         elif a == '-fsimd-pack-globals':
@@ -1305,6 +1391,23 @@ def get_arguments(argv=None):
                             help="with --check-memory, also report (and where safe, "
                                  "insert) automatic frees for non-escaping allocations")
 
+        # Runtime memory safety (the Fil-C-inspired tier). --check-memory
+        # above is the *static* sibling: it proves what it can at compile time
+        # and emits nothing. This one instruments the build instead, so a test
+        # run reports what actually happened, with exact bounds and a source
+        # location for both the access and the allocation.
+        parser.add_argument("--mem-safe", dest="mem_safe",
+                            default=None, metavar="LEVEL",
+                            help="compile with runtime memory-safety checks "
+                                 "(bounds, use-after-free, double-free, "
+                                 "uninitialized reads) and link the checking "
+                                 "runtime. LEVEL is 'all' (default: check "
+                                 "everything, including hand-written C) or "
+                                 "'cpp' (check only code lowered from the C++ "
+                                 "subset, leaving verified C at full speed). "
+                                 "Intended for test builds: rebuild without "
+                                 "the flag for a release with no overhead")
+
         parser.add_argument("--no-peephole", dest="no_peephole",
                             action="store_true",
                             help="disable the IL peephole optimizer "
@@ -1329,9 +1432,28 @@ def get_arguments(argv=None):
                                  "TikZ call graph, and the run output in an "
                                  "appendix). Output directory defaults to /tmp.")
 
-        return _validate_target(parser.parse_args())
+        return _validate_target(parser.parse_args(_normalize_mem_safe(argv)))
 
     return _validate_target(_parse_args_selfhost(argv))
+
+
+def _normalize_mem_safe(argv):
+    """Turn a bare `--mem-safe` into `--mem-safe=all`.
+
+    The flag takes an optional level, and argparse's nargs="?" is greedy: it
+    reads the next word as the value, so `--mem-safe demo.c` consumed the
+    source file and then failed for want of an input. Rewriting the bare form
+    here keeps `--mem-safe` and `--mem-safe=cpp` both working and leaves the
+    option a plain single-value argument.
+
+    Returns None when there is nothing to rewrite, which tells parse_args to
+    read sys.argv itself, preserving the previous behaviour.
+    """
+    if argv is None:
+        argv = sys.argv[1:]
+        if "--mem-safe" not in argv:
+            return None
+    return ["--mem-safe=all" if a == "--mem-safe" else a for a in argv]
 
 
 def _validate_target(args):
@@ -1351,6 +1473,16 @@ def _validate_target(args):
         error_collector.add(CompilerError(
             "unrecognized target '%s'; known targets are x86_64, arm64, "
             "riscv64, m68k, wasm" % name))
+
+    # Same reasoning for --mem-safe: silently accepting an unknown level would
+    # hand back a binary the user believes is checked and is not, which is a
+    # worse failure than a typo'd target -- the diagnostic that never fires
+    # reads exactly like a program with no bugs.
+    lvl = getattr(args, "mem_safe", None)
+    if lvl is not None and lvl not in MEM_SAFE_LEVELS:
+        error_collector.add(CompilerError(
+            "unrecognized --mem-safe level '%s'; known levels are %s"
+            % (lvl, ", ".join(MEM_SAFE_LEVELS))))
     return args
 
 
