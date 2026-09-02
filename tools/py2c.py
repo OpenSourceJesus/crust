@@ -10251,6 +10251,19 @@ class Transpiler:
                 and node.func.value.id == "re" \
                 and node.func.attr in ("finditer", "findall"):
             return OBJ
+        # `re.sub(...)` at module level lowers to `_cre_sub`, which returns a
+        # C string -- the same type the `pat.sub` method form above reports.
+        # Without this the call reads as obj, so an assignment into an obj
+        # local emitted the raw `char*` with no `OBJ_STR` around it and the
+        # generated C did not compile. Sixteen of `tools/cpprust.py`'s
+        # seventy-six errors were this one rule. `re.escape` is *not*
+        # listed: `_re_escape` returns obj, and claiming char* here would
+        # trade this bug for its mirror image.
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                and isinstance(node.func.value, ast.Name) \
+                and node.func.value.id == "re" \
+                and node.func.attr == "sub":
+            return "char*"
         # `.start()`/`.end()` on a match are byte offsets, so they are long,
         # not obj -- checked before the obj group below.
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
