@@ -2185,6 +2185,12 @@ INT_NAMES = {
 }
 INT_SUFFIXES = ("size", "offset", "count", "index", "len", "num", "idx")
 
+# Integer C types, narrowest first: a conditional with two integer branches
+# unifies to the widest of them. Shared by `ex_IfExp` (which emits the cast)
+# and `value_ctype` (which reports the result), because those two disagreeing
+# is exactly what leaves a raw scalar where an obj is expected.
+_IFEXP_INTS = ("bool", "char", "short", "int", "long")
+
 # Float-by-name: numeric scalars that are conventionally real-valued. Kept
 # narrow and domain-flavoured (stats / signals / geometry) so it does not
 # collide with the integer-heavy names above.
@@ -10406,7 +10412,17 @@ class Transpiler:
             return OBJ
         if isinstance(node, ast.IfExp):
             bt = self.value_ctype(node.body)
-            return bt if bt == self.value_ctype(node.orelse) else OBJ
+            ot = self.value_ctype(node.orelse)
+            if bt == ot:
+                return bt
+            # Must agree with `ex_IfExp`, which unifies two integer branches
+            # to the wider integer rather than boxing them. Reporting obj here
+            # while it emits a `long` is the disagreement that leaves a raw
+            # scalar where an obj was expected.
+            if bt in _IFEXP_INTS and ot in _IFEXP_INTS:
+                return _IFEXP_INTS[max(_IFEXP_INTS.index(bt),
+                                       _IFEXP_INTS.index(ot))]
+            return OBJ
         if isinstance(node, ast.BoolOp):
             types = [self.value_ctype(v) for v in node.values]
             return types[0] if len(set(types)) == 1 and \
@@ -14949,7 +14965,13 @@ class Transpiler:
             ot = self.value_ctype(node.orelse)
             be = self.expr(node.body)
             oe = self.expr(node.orelse)
-            if bt != ot or be.startswith("mp_") or oe.startswith("mp_"):
+            # Two integer branches are unified to a scalar by `ex_IfExp`, so
+            # the result still needs boxing here -- falling through to the
+            # ordinary path below does that. Bailing out returned the raw
+            # `long` where an obj was expected.
+            _both_int = bt in _IFEXP_INTS and ot in _IFEXP_INTS
+            if (bt != ot and not _both_int) or be.startswith("mp_") \
+                    or oe.startswith("mp_"):
                 return self.expr(node)
         if self.is_obj_word(node) or self.value_ctype(node) == OBJ:
             return self.expr(node)
@@ -15843,6 +15865,17 @@ class Transpiler:
             return "(%s ? %s : %s)" % (self.bool_expr(node.test),
                                        self.wrap_obj(node.body),
                                        self.wrap_obj(node.orelse))
+        # Two integer branches unify to the wider integer, not to an obj.
+        # `j = n if j < 0 else j` with `n` an int and `j` a long used to box
+        # both, and the boxed conditional then would not assign back to the
+        # `long j` it came from. C's own conversions would do this anyway;
+        # boxing was throwing away a scalar for no reason. `value_ctype`
+        # applies the same rule over the same order -- they have to agree.
+        _INTS = _IFEXP_INTS
+        if bt != ot and bt in _INTS and ot in _INTS:
+            wide = _INTS[max(_INTS.index(bt), _INTS.index(ot))]
+            return "(%s ? (%s)%s : (%s)%s)" % (
+                self.bool_expr(node.test), wide, be, wide, oe)
         if bt != ot:                        # unify to a common Tier-2 obj
             return "(%s ? %s : %s)" % (self.bool_expr(node.test),
                                        self.wrap_obj(node.body),
