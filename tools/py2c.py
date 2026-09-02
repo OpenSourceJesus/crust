@@ -10029,6 +10029,14 @@ class Transpiler:
                     elif isinstance(el, ast.Subscript):
                         lines.append("subscript_set(%s, %s, %s);" % (
                             self.expr(el.value), self.wrap_obj(el.slice), src))
+                    elif isinstance(el, (ast.Tuple, ast.List)):
+                        # A *nested* target: `(a, b), c = ...`. Falling through
+                        # to the generic branch below asked `expr()` for a
+                        # tuple as an lvalue, which emitted the element names
+                        # without ever declaring them -- gcc then reported
+                        # every one of them undeclared. `bind_target` already
+                        # recurses through Tuple/List, so hand it the element.
+                        lines += self.bind_target(el, src)
                     elif isinstance(el, ast.Attribute):
                         # Unpack the i-th element into this attribute. Must use
                         # `src` (index_obj(tmp, i)), NOT the whole RHS node:

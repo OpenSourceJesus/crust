@@ -478,6 +478,7 @@ rpython:
 	run $(RPY)/ffi/ffi_math.py       35 ""; \
 	run $(RPY)/nbody/nbody.py        11 ""; \
 	run $(RPY)/classes/polymorphism.py 22 ""; \
+	run $(RPY)/closures/lifted_captures.py 31 ""; \
 	run $(RPY)/classes/pod_vs_object.py  48 ""; \
 	run $(RPY)/lists/typed_list.py       65 ""; \
 	run $(RPY)/dicts/typed_dict.py       58 ""; \
