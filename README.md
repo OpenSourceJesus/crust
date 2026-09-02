@@ -208,7 +208,7 @@ They are not redundant. Each brings something the other does not.
 **Rust** brings move semantics and the ownership discipline around them.
 Passing an owning value by value is a move: the source is zeroed, the callee
 takes it, and reading the source afterwards is *rejected* rather than
-silently yielding an empty value.https://github.com/OpenSourceJesus/C-Compiler
+silently yielding an empty value.
 
 **C++** brings a full object lifecycle: constructors chosen by arity, copy
 construction and `operator=`, member and base construction ordering,
