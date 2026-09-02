@@ -12733,6 +12733,17 @@ class Transpiler:
                 return "0"
             if fn == "abs" and node.args:
                 return "pyabs(%s)" % self.as_long(node.args[0])
+            # `eval(expr, {"__builtins__": {}}, {})` -- the sandboxing spelling.
+            # Lowered only when both environments are *literal* dicts binding
+            # no names, because then they provably cannot affect the result:
+            # with nothing bound, an expression either references no name (and
+            # evaluates the same either way) or fails either way. Anything with
+            # a real environment still warns rather than silently losing it.
+            if fn == "eval" and len(node.args) == 3 and not node.keywords \
+                    and self._is_nameless_env(node.args[1]) \
+                    and self._is_nameless_env(node.args[2]):
+                self._uses_eval = True
+                return "rpy_eval(%s)" % self.as_str(node.args[0])
             if fn == "eval" and len(node.args) == 1 and not node.keywords:
                 # Untyped eval: the MicroPython result is boxed into an obj.
                 # `x: T = eval(...)` is special-cased in st_AnnAssign to pull the
@@ -14838,6 +14849,13 @@ class Transpiler:
         # `str_find_from` for an obj target.
         if target == OBJ and self._scalar_helper_ct(rendered) is not None:
             return "OBJ_INT(%s)" % rendered
+        # And the mirror image: coercing a scalar helper *to* a scalar is a
+        # no-op, but `value_ctype` reads it as obj so the int path below wrapped
+        # it in `AS_INT(...)` -- reading the `.u.i` field of something that is
+        # already a long.
+        if target in ("int", "long") and \
+                self._scalar_helper_ct(rendered) is not None:
+            return rendered
         if target == vt:
             return rendered
         if target == OBJ:
@@ -14895,6 +14913,22 @@ class Transpiler:
     # both are plain `obj` parameters in the generated C -- but the helper
     # py2c chose does, exactly.
     _SCALAR_HELPERS = ("str_find_from(", "str_find_range(", "str_count(")
+
+    def _is_nameless_env(self, node):
+        """A literal dict that binds no name an expression could read.
+
+        `{}` and `{"__builtins__": {}}` both qualify: the second binds only
+        the builtins slot, whose whole purpose there is to be empty. Anything
+        else -- a variable, a dict with real entries -- does not.
+        """
+        if not isinstance(node, ast.Dict):
+            return False
+        for k, v in zip(node.keys, node.values):
+            if not (isinstance(k, ast.Constant) and k.value == "__builtins__"):
+                return False
+            if not (isinstance(v, ast.Dict) and not v.keys):
+                return False
+        return True
 
     def _re_endpos(self, node, idx):
         """The `endpos` argument at `idx`, or -1 when it is not given."""
