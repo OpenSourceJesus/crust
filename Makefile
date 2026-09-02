@@ -577,6 +577,7 @@ testminipy:
 	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_varargs_py2c.py >/tmp/varargs_py2c.txt 2>&1; then echo "  ok    *args / **kwargs calls (cpython == py2c native)"; else echo "  FAIL  *args / **kwargs calls (see /tmp/varargs_py2c.txt)"; fail=1; fi; \
 	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_strcount_py2c.py >/tmp/strcount_py2c.txt 2>&1; then echo "  ok    str.count over a window (cpython == py2c native)"; else echo "  FAIL  str.count window (see /tmp/strcount_py2c.txt)"; fail=1; fi; \
 	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_tuple_py2c.py >/tmp/tuple_py2c.txt 2>&1; then echo "  ok    tuple() as key and member (cpython == py2c native)"; else echo "  FAIL  tuple() (see /tmp/tuple_py2c.txt)"; fail=1; fi; \
+	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_subfn_py2c.py >/tmp/subfn_py2c.txt 2>&1; then echo "  ok    re.sub with a function (cpython == py2c native)"; else echo "  FAIL  re.sub function repl (see /tmp/subfn_py2c.txt)"; fail=1; fi; \
 	if [ $$fail = 0 ]; then echo "testminipy: PASS"; \
 	else echo "testminipy: FAIL"; fi; exit $$fail
 

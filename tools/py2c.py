@@ -5158,6 +5158,7 @@ class Transpiler:
         self._regex_parsed = {}     # id -> parsed pattern struct (tier 1)
         self._regex_vm = {}         # id -> pattern string (tier 2: crust_re VM)
         self._regex_dyn = False     # a runtime-valued pattern needs the VM
+        self._regex_used = False    # module does regex at all (see _prescan)
         self._regex_escape = False  # re.escape used (needs no engine)
         self._subproc_used = False  # subprocess.run / tempfile.mkdtemp shim
         self._subproc_vars = set()  # names bound to a subprocess.run result
@@ -5426,8 +5427,36 @@ class Transpiler:
                 "for full rpython support." % ci.name)
         return warns
 
+    _MATCH_METHODS = ("group", "start", "end", "groups")
+
+    def _prescan_regex_use(self, tree):
+        """Does this module use `re` anywhere? Set before anything is emitted.
+
+        `.group()` on a match lowers only when the module is known to do
+        regex, and that was decided by flags set as a *side effect* of
+        lowering a regex call. So a helper defined above the first `re.` call
+        in the file -- which is where a `re.sub` callback naturally lives --
+        was emitted before the flag was set, and `m.group(0)` came out as a
+        bare `group(m, 0)` that C defaulted to returning int.
+
+        Deliberately a separate flag from `_regex_dyn`: that one also pulls
+        in the VM bridge, and a module whose patterns all fit the specialized
+        matchers should still link no engine.
+        """
+        if "re" not in getattr(self, "modules", set()) and \
+                not any(isinstance(n, ast.Import) and
+                        any(a.name == "re" for a in n.names)
+                        for n in ast.walk(tree)):
+            return
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Attribute) and \
+                    n.attr in self._MATCH_METHODS:
+                self._regex_used = True
+                return
+
     def run(self, tree):
         global KNOWN_CLASSES, VTABLE_METHODS
+        self._prescan_regex_use(tree)
         rewrite_class_lambdas(tree)
         self._rewrite_thread_decorators(tree)
         if self.stdlib_root:
@@ -10301,7 +10330,7 @@ class Transpiler:
         # `.start()`/`.end()` on a match are byte offsets, so they are long,
         # not obj -- checked before the obj group below.
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
-                and (self._regex_ids or self._regex_dyn) \
+                and (self._regex_ids or self._regex_dyn or self._regex_used) \
                 and node.func.attr in ("start", "end") \
                 and node.func.attr not in self.method_owners \
                 and node.func.attr not in self.xmethod_owners:
@@ -10313,7 +10342,7 @@ class Transpiler:
             # obj arithmetic on a long.
             return "long"
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
-                and (self._regex_ids or self._regex_dyn) \
+                and (self._regex_ids or self._regex_dyn or self._regex_used) \
                 and node.func.attr in ("search", "match", "group") \
                 and node.func.attr not in self.method_owners \
                 and node.func.attr not in self.xmethod_owners:
@@ -13361,6 +13390,20 @@ class Transpiler:
                                            self.expr(node.args[1])),
                             self.coerce_to("char*", node.args[2],
                                            self.expr(node.args[2])))
+                    # A replacement reached through a value: a function taking
+                    # the match, or a string this pass cannot prove is one.
+                    # `_cre_sub_any` reads the tag and does the right thing,
+                    # which is better than deciding here -- both spellings
+                    # reach this point and only the runtime knows which.
+                    if modname == "re" and func.attr == "sub" \
+                            and len(node.args) == 3:
+                        self._regex_dyn = True
+                        return "_cre_sub_any(%s, %s, %s)" % (
+                            self.coerce_to("char*", node.args[0],
+                                           self.expr(node.args[0])),
+                            self.wrap_obj(node.args[1]),
+                            self.coerce_to("char*", node.args[2],
+                                           self.expr(node.args[2])))
                     # struct.pack/unpack subset (see STRUCT_PRELUDE)
                     if modname == "struct" and func.attr in ("pack", "unpack") \
                             and len(node.args) == 2:
@@ -13668,6 +13711,12 @@ class Transpiler:
                         _pt, _a0,
                         self.coerce_to("char*", node.args[1],
                                        self.expr(node.args[1])))
+                if func.attr == "sub" and len(node.args) == 2:
+                    self._regex_dyn = True
+                    return "_cre_sub_any(%s, %s, %s)" % (
+                        _pt, self.wrap_obj(node.args[0]),
+                        self.coerce_to("char*", node.args[1],
+                                       self.expr(node.args[1])))
             if isinstance(func.value, ast.Name) \
                     and func.value.id in self._regex_dyn_vars:
                 if func.attr in ("search", "match") and 1 <= len(node.args) <= 2:
@@ -13697,15 +13746,23 @@ class Transpiler:
                                        self.expr(node.args[0])),
                         self.coerce_to("char*", node.args[1],
                                        self.expr(node.args[1])))
+                if func.attr == "sub" and len(node.args) == 2:
+                    return "_cre_sub_any(%s, %s, %s)" % (
+                        self.coerce_to("char*", func.value,
+                                       self.expr(func.value)),
+                        self.wrap_obj(node.args[0]),
+                        self.coerce_to("char*", node.args[1],
+                                       self.expr(node.args[1])))
                 if func.attr == "finditer" and len(node.args) == 1:
                     return "_cre_finditer(%s, %s)" % (
                         self.coerce_to("char*", func.value,
                                        self.expr(func.value)),
                         self.coerce_to("char*", node.args[0],
                                        self.expr(node.args[0])))
-            if (self._regex_ids or self._regex_dyn) and (_re_recv or (
-                    func.attr not in self.method_owners
-                    and func.attr not in self.xmethod_owners)):
+            if (self._regex_ids or self._regex_dyn or self._regex_used) and \
+                    (_re_recv or (
+                        func.attr not in self.method_owners
+                        and func.attr not in self.xmethod_owners)):
                 if func.attr in ("search", "match") and len(node.args) == 1:
                     anc = "1" if func.attr == "match" else "0"
                     txt = self.coerce_to("char*", node.args[0],
@@ -14650,6 +14707,41 @@ class Transpiler:
         out.append("            off += caps[1] + 1;")
         out.append("        } else {")
         out.append("            off += caps[1];")
+        out.append("        }")
+        out.append("    }")
+        out.append("    if (off <= len) list_append(parts, _re_slice(t, off, len));")
+        out.append("    return pyjoin(\"\", parts);")
+        out.append("}")
+        out.append("")
+        out.append("/* `re.sub` where the replacement is a *value* rather than a")
+        out.append(" * literal: either a string, or a function taking the match.")
+        out.append(" * Which one is decided here rather than at translation time,")
+        out.append(" * because a repl reached through a variable can be either and")
+        out.append(" * the tag says so exactly. The match handed to the function is")
+        out.append(" * the same list every other frontend builds, so `m.group(1)`")
+        out.append(" * inside it works like anywhere else. */")
+        out.append("static char* _cre_sub_any(char* pat, obj rep, char* t) {")
+        out.append("    obj parts = list_new();")
+        out.append("    long off = 0, len, s, e;")
+        out.append("    if (!pat || !t) return \"\";")
+        out.append("    if (rep.tag == T_STR) return _cre_sub(pat, AS_STR(rep), t);")
+        out.append("    len = (long)strlen(t);")
+        out.append("    while (off <= len) {")
+        out.append("        obj m = _cre_at(pat, t, (int)off, -1, 0);")
+        out.append("        obj r;")
+        out.append("        if (IS_NONE(m)) break;")
+        out.append("        s = _re_span(m, 0, 0);")
+        out.append("        e = _re_span(m, 0, 1);")
+        out.append("        list_append(parts, _re_slice(t, off, s));")
+        out.append("        r = call_obj_a(rep, &m, 1);")
+        out.append("        list_append(parts, OBJ_STR(AS_STR(r)));")
+        out.append("        if (e == s) {")
+        out.append("            /* zero-width: emit the byte stepped over, or the")
+        out.append("             * loop would drop it. */")
+        out.append("            if (e < len) list_append(parts, _re_slice(t, e, e + 1));")
+        out.append("            off = e + 1;")
+        out.append("        } else {")
+        out.append("            off = e;")
         out.append("        }")
         out.append("    }")
         out.append("    if (off <= len) list_append(parts, _re_slice(t, off, len));")
