@@ -1072,7 +1072,12 @@ def _probe_positions(*texts):
     comment-blanked copy but occasionally reads the original; marking both
     keeps the filter a superset of what either could match.
     """
-    hits = bytearray(len(texts[0]))
+    # A list of ints rather than a `bytearray`: the two are interchangeable
+    # for a flag array that is only ever indexed and assigned 0/1, and
+    # `bytearray` has no lowering in the RPython subset -- py2c emitted a
+    # call to a `bytearray` that does not exist, which C then defaulted to
+    # returning int. A list also gets the unboxed fast path there.
+    hits = [0] * len(texts[0])
     for t in texts:
         for m in _PROBE_START.finditer(t):
             hits[m.start()] = 1
