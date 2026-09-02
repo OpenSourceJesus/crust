@@ -14641,6 +14641,12 @@ class Transpiler:
                 target.startswith("_tlist_") and target.endswith("*"):
             return self._typed_list_literal(target, value_node)
         vt = self.value_ctype(value_node)
+        # Checked before the `target == vt` shortcut below: a call that lowers
+        # to a scalar helper is not an obj however `value_ctype` reads it, and
+        # that shortcut would hand back the unwrapped `long` from
+        # `str_find_from` for an obj target.
+        if target == OBJ and self._scalar_helper_ct(rendered) is not None:
+            return "OBJ_INT(%s)" % rendered
         if target == vt:
             return rendered
         if target == OBJ:
@@ -14689,6 +14695,22 @@ class Transpiler:
         if target == OBJ and vt in ("int", "bool", "char*", "double"):
             return self.wrap_obj(value_node)
         return rendered
+
+    # Helpers whose C signature returns a raw scalar rather than an obj.
+    # Keyed on the emitted call rather than on the AST, because the same
+    # Python spelling can lower either way: `s.index(x)` becomes
+    # `str_find_from` (a long) while `xs.index(v)` becomes `list_index` (an
+    # obj already). The receiver's static type does not tell them apart --
+    # both are plain `obj` parameters in the generated C -- but the helper
+    # py2c chose does, exactly.
+    _SCALAR_HELPERS = ("str_find_from(", "str_find_range(")
+
+    def _scalar_helper_ct(self, rendered):
+        """C type of `rendered` when it calls a scalar-returning helper."""
+        if isinstance(rendered, str) and rendered.startswith(
+                self._SCALAR_HELPERS):
+            return "int"
+        return None
 
     def wrap_obj(self, node):
         if isinstance(node, ast.IfExp):
