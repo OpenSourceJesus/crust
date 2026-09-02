@@ -3176,6 +3176,14 @@ def lift_nested_functions(tree):
         # too. Without this, `def alloc(): ... taken(f) ...` (where only
         # `taken` reads `words`) lifted to `alloc(void)` yet emitted
         # `taken(words, f)`, and `words` was undeclared in that scope.
+        #
+        # *Mentioning* a sibling is enough; it need not be called. Handing one
+        # on as a value -- `_emit_class(cls, names, cinfo, tsub, ...)` in
+        # `cpprust.translate` -- lowers to a `make_closure` carrying that
+        # sibling's captured values, emitted right here in the caller's body.
+        # Walking only `ast.Call` missed those, so `translate__emit_one`
+        # built a closure over `tnames` and `wanted` while taking neither as
+        # a parameter: eleven undeclared identifiers across four functions.
         # Iterate to a fixed point so chains of any depth converge.
         changed = True
         while changed:
@@ -3186,9 +3194,10 @@ def lift_nested_functions(tree):
                 mangled, caps = name_map[sub.name]
                 inherited = set(caps)
                 for n in ast.walk(sub):
-                    if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) \
-                            and n.func.id in name_map and n.func.id != sub.name:
-                        inherited |= set(name_map[n.func.id][1])
+                    if isinstance(n, ast.Name) and \
+                            isinstance(n.ctx, ast.Load) and \
+                            n.id in name_map and n.id != sub.name:
+                        inherited |= set(name_map[n.id][1])
                 merged = sorted(inherited)
                 if merged != caps:
                     name_map[sub.name] = (mangled, merged)
