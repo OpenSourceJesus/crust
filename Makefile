@@ -573,6 +573,7 @@ testminipy:
 	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_subprocess_py2c.py >/tmp/subproc_py2c.txt 2>&1; then echo "  ok    subprocess/tempfile shim (cpython == py2c native)"; else echo "  FAIL  subprocess/tempfile shim (see /tmp/subproc_py2c.txt)"; fail=1; fi; \
 	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_re_spans_py2c.py >/tmp/spans_py2c.txt 2>&1; then echo "  ok    match spans .start()/.end() (cpython == py2c native)"; else echo "  FAIL  match spans (see /tmp/spans_py2c.txt)"; fail=1; fi; \
 	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_re_finditer_py2c.py >/tmp/finditer_py2c.txt 2>&1; then echo "  ok    finditer + dynamic compile (cpython == py2c native)"; else echo "  FAIL  finditer/dynamic compile (see /tmp/finditer_py2c.txt)"; fail=1; fi; \
+	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_re_pos_py2c.py >/tmp/re_pos_py2c.txt 2>&1; then echo "  ok    pos/endpos windows (cpython == py2c native)"; else echo "  FAIL  pos/endpos windows (see /tmp/re_pos_py2c.txt)"; fail=1; fi; \
 	if [ $$fail = 0 ]; then echo "testminipy: PASS"; \
 	else echo "testminipy: FAIL"; fi; exit $$fail
 

@@ -75,6 +75,17 @@ const char *crust_re_group_name(const crust_re *re, int g);
 int crust_re_exec(const crust_re *re, const char *text, size_t len,
                   int anchored, int *caps, int ncaps);
 
+/* As `crust_re_exec`, but the search starts at `from` rather than 0 while
+ * the subject stays text[0..len). That distinction is the point: the engine
+ * can still look *behind* `from`, so `(?<=;)x` against ";x" from offset 1
+ * matches, exactly as CPython's `pat.search(s, 1)` does. Handing the engine
+ * `text + from` instead loses the context and silently reports no match.
+ *
+ * `len` doubles as CPython's `endpos`: `$` matches there and no match may
+ * run past it. Offsets in `caps` are relative to text[0]. */
+int crust_re_exec_from(const crust_re *re, const char *text, size_t len,
+                       long from, int anchored, int *caps, int ncaps);
+
 /* Override the default backtracking step budget (default 1000000). Guards
  * against catastrophic backtracking on patterns like (a+)+b. */
 void crust_re_set_limit(crust_re *re, long limit);

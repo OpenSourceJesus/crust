@@ -13586,16 +13586,28 @@ class Transpiler:
                 _a0 = (self.coerce_to("char*", node.args[0],
                                       self.expr(node.args[0]))
                        if node.args else None)
-                if func.attr in ("search", "match") and len(node.args) == 2:
+                # `pat.search(t, pos)` and `pat.search(t, pos, endpos)`.
+                # The endpos form is what lets a caller window a scan without
+                # slicing the subject, which is the only way a lookbehind at
+                # `pos` can still see what precedes it.
+                if func.attr in ("search", "match") and \
+                        2 <= len(node.args) <= 3:
                     self._regex_dyn = True
-                    return "_cre_at(%s, %s, %s, %s)" % (
+                    return "_cre_at(%s, %s, %s, %s, %s)" % (
                         _pt, _a0,
                         self.coerce_to("int", node.args[1],
                                        self.expr(node.args[1])),
+                        self._re_endpos(node, 2),
                         "1" if func.attr == "match" else "0")
-                if func.attr == "finditer" and len(node.args) == 1:
+                if func.attr == "finditer" and 1 <= len(node.args) <= 3:
                     self._regex_dyn = True
-                    return "_cre_finditer(%s, %s)" % (_pt, _a0)
+                    if len(node.args) == 1:
+                        return "_cre_finditer(%s, %s)" % (_pt, _a0)
+                    return "_cre_finditer_at(%s, %s, %s, %s)" % (
+                        _pt, _a0,
+                        self.coerce_to("int", node.args[1],
+                                       self.expr(node.args[1])),
+                        self._re_endpos(node, 2))
                 if func.attr == "findall" and len(node.args) == 1:
                     self._regex_dyn = True
                     return "_cre_findall(%s, %s)" % (_pt, _a0)
@@ -13617,7 +13629,8 @@ class Transpiler:
                     if len(node.args) == 2:
                         pos = self.coerce_to("int", node.args[1],
                                              self.expr(node.args[1]))
-                        return "_cre_at(%s, %s, %s, %s)" % (pat, txt, pos, anc)
+                        return "_cre_at(%s, %s, %s, -1, %s)" % (
+                            pat, txt, pos, anc)
                     return "_cre_dyn(%s, %s, %s)" % (pat, txt, anc)
                 if func.attr == "findall" and len(node.args) == 1:
                     return "_cre_findall(%s, %s)" % (
@@ -14498,7 +14511,8 @@ class Transpiler:
         out.append("/* pat.search(text, pos): match from an offset. Spans are")
         out.append(" * reported relative to the whole subject, as CPython does,")
         out.append(" * so a caller stepping through with .end() keeps working. */")
-        out.append("static obj _cre_at(char* pat, char* t, int pos, int anc) {")
+        out.append("/* `end` is CPython's endpos: -1 means the whole subject. */")
+        out.append("static obj _cre_at(char* pat, char* t, int pos, int end, int anc) {")
         out.append("    int caps[128];")
         out.append("    crust_re* h;")
         out.append("    long len, i;")
@@ -14506,33 +14520,51 @@ class Transpiler:
         out.append("    obj m;")
         out.append("    if (!pat || !t) return OBJ_NONE;")
         out.append("    len = (long)strlen(t);")
+        out.append("    if (end >= 0 && (long)end < len) len = (long)end;")
         out.append("    if (pos < 0) pos = 0;")
         out.append("    if (pos > len) return OBJ_NONE;")
         out.append("    h = _cre_dyn_get(pat);")
         out.append("    ng = crust_re_ngroups(h);")
         out.append("    if (2 * (ng + 1) > 128) return OBJ_NONE;")
-        out.append("    rc = crust_re_exec(h, t + pos, (size_t)(len - pos), anc,")
-        out.append("                       caps, 2 * (ng + 1));")
+        # `crust_re_exec_from`, not `crust_re_exec` over `t + pos`: the
+        # engine has to keep the whole subject so a lookbehind at `pos` can
+        # read what precedes it. Slicing made `(?<=;)x` against ";x" from
+        # offset 1 report no match where CPython matches -- a wrong answer,
+        # not a missing feature, and `tools/cpprust.py` windows its scans
+        # precisely so the lookbehind sees the character before the window.
+        # Offsets now come back absolute, so the `pos +` adjustments go too.
+        out.append("    rc = crust_re_exec_from(h, t, (size_t)len, pos, anc,")
+        out.append("                            caps, 2 * (ng + 1));")
         out.append("    if (rc != CRUST_RE_MATCH) return OBJ_NONE;")
         out.append("    m = list_new();")
         out.append("    for (i = 0; i <= ng; i++)")
-        out.append("        list_append(m, _re_slice(t, pos + caps[2*i], pos + caps[2*i+1]));")
+        out.append("        list_append(m, _re_slice(t, caps[2*i], caps[2*i+1]));")
         out.append("    for (i = 0; i <= ng; i++) {")
-        out.append("        list_append(m, OBJ_INT(caps[2*i] < 0 ? -1 : pos + caps[2*i]));")
-        out.append("        list_append(m, OBJ_INT(caps[2*i+1] < 0 ? -1 : pos + caps[2*i+1]));")
+        out.append("        list_append(m, OBJ_INT(caps[2*i]));")
+        out.append("        list_append(m, OBJ_INT(caps[2*i+1]));")
         out.append("    }")
         out.append("    return m;")
         out.append("}")
         out.append("")
+        out.append("static obj _cre_finditer_at(char* pat, char* t, int pos, int end);")
+        out.append("")
         out.append("/* re.finditer -> a LIST of match values, so `for m in ...`")
         out.append(" * iterates it with no iterator protocol needed. */")
         out.append("static obj _cre_finditer(char* pat, char* t) {")
+        out.append("    return _cre_finditer_at(pat, t, 0, -1);")
+        out.append("}")
+        out.append("")
+        out.append("/* finditer over text[pos..end), with the whole subject")
+        out.append(" * still visible to lookbehind -- see crust_re_exec_from. */")
+        out.append("static obj _cre_finditer_at(char* pat, char* t, int pos, int end) {")
         out.append("    obj res = list_new();")
-        out.append("    long off = 0, len;")
+        out.append("    long off, len;")
         out.append("    if (!pat || !t) return res;")
         out.append("    len = (long)strlen(t);")
+        out.append("    if (end >= 0 && (long)end < len) len = (long)end;")
+        out.append("    off = pos < 0 ? 0 : (long)pos;")
         out.append("    while (off <= len) {")
-        out.append("        obj m = _cre_at(pat, t, (int)off, 0);")
+        out.append("        obj m = _cre_at(pat, t, (int)off, end, 0);")
         out.append("        long e, s;")
         out.append("        if (IS_NONE(m)) break;")
         out.append("        list_append(res, m);")
@@ -14721,6 +14753,12 @@ class Transpiler:
     # both are plain `obj` parameters in the generated C -- but the helper
     # py2c chose does, exactly.
     _SCALAR_HELPERS = ("str_find_from(", "str_find_range(")
+
+    def _re_endpos(self, node, idx):
+        """The `endpos` argument at `idx`, or -1 when it is not given."""
+        if len(node.args) <= idx:
+            return "-1"
+        return self.coerce_to("int", node.args[idx], self.expr(node.args[idx]))
 
     def _scalar_helper_ct(self, rendered):
         """C type of `rendered` when it calls a scalar-returning helper."""
