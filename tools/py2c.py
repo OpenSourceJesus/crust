@@ -12654,6 +12654,15 @@ class Transpiler:
             if fn == "list":
                 return "pylist(%s)" % self.wrap_obj(node.args[0]) if node.args \
                     else "list_new()"
+            # A tuple is a list in this runtime -- `tuple` maps to T_LIST in
+            # the type table already -- so `tuple(xs)` is the same materialise
+            # as `list(xs)`. It had no lowering at all, so py2c emitted a bare
+            # `tuple(...)` that C defaulted to returning int; three of
+            # `tools/cpprust.py`'s errors were that, including a `return
+            # tuple(names)` from an obj-returning function.
+            if fn == "tuple":
+                return "pylist(%s)" % self.wrap_obj(node.args[0]) if node.args \
+                    else "list_new()"
             if fn == "dict":
                 if not node.args:
                     return "dict_new()"
