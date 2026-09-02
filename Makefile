@@ -575,6 +575,7 @@ testminipy:
 	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_re_finditer_py2c.py >/tmp/finditer_py2c.txt 2>&1; then echo "  ok    finditer + dynamic compile (cpython == py2c native)"; else echo "  FAIL  finditer/dynamic compile (see /tmp/finditer_py2c.txt)"; fail=1; fi; \
 	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_re_pos_py2c.py >/tmp/re_pos_py2c.txt 2>&1; then echo "  ok    pos/endpos windows (cpython == py2c native)"; else echo "  FAIL  pos/endpos windows (see /tmp/re_pos_py2c.txt)"; fail=1; fi; \
 	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_varargs_py2c.py >/tmp/varargs_py2c.txt 2>&1; then echo "  ok    *args / **kwargs calls (cpython == py2c native)"; else echo "  FAIL  *args / **kwargs calls (see /tmp/varargs_py2c.txt)"; fail=1; fi; \
+	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_strcount_py2c.py >/tmp/strcount_py2c.txt 2>&1; then echo "  ok    str.count over a window (cpython == py2c native)"; else echo "  FAIL  str.count window (see /tmp/strcount_py2c.txt)"; fail=1; fi; \
 	if [ $$fail = 0 ]; then echo "testminipy: PASS"; \
 	else echo "testminipy: FAIL"; fi; exit $$fail
 

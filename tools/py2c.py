@@ -355,6 +355,7 @@ str  str_replace(str s, str a, str b);
 long str_find(str s, str sub, bool last);
 long str_find_from(str s, str sub, bool last, long start);
 long str_find_range(str s, str sub, bool last, long start, long end);
+long str_count(str s, str sub, long start, long end);
 bool str_isdigit(str s);
 bool str_isalpha(str s);
 bool str_isspace(str s);
@@ -1785,6 +1786,22 @@ str str_replace(str s, str a, str b) {
     char* o = aalloc(ls + (lb > la ? (lb - la) : 0) * cnt + 1); char* w = o; const char* p = s; const char* q;
     while ((q = strstr(p, a))) { memcpy(w, p, q - p); w += q - p; memcpy(w, b, lb); w += lb; p = q + la; }
     strcpy(w, p); return o;
+}
+/* `s.count(sub[, start[, end]])`: non-overlapping occurrences in s[start:end).
+ * `end < 0` means to the end of the string. An empty `sub` counts the gaps,
+ * as Python does, which is len(window)+1 rather than an infinite loop. */
+long str_count(str s, str sub, long start, long end) {
+    long n = (long)strlen(s), ls = (long)strlen(sub), c = 0, i;
+    if (start < 0) start += n;
+    if (start < 0) start = 0;
+    if (end < 0 || end > n) end = n;
+    if (start > end) return 0;
+    if (ls == 0) return end - start + 1;
+    for (i = start; i + ls <= end; ) {
+        if (memcmp(s + i, sub, (size_t)ls) == 0) { c++; i += ls; }
+        else i++;
+    }
+    return c;
 }
 long str_find_from(str s, str sub, bool last, long start) {
     long n = (long)strlen(s);
@@ -13131,6 +13148,22 @@ class Transpiler:
                     func.attr not in self.method_owners:
                 return "list_index(%s, %s)" % (self.wrap_obj(func.value),
                                                self.wrap_obj(node.args[0]))
+            # `s.count(sub, start[, end])` -- a string count over a window.
+            # Only the 2- and 3-argument forms: with one argument the receiver
+            # could equally be a list, and that already lowers below. The
+            # windowed spelling is unambiguous, and had no lowering at all --
+            # py2c emitted a bare `count(...)` that C defaulted to returning
+            # int. `tools/cpprust.py` counts newlines that way to turn an
+            # offset into a line number.
+            if func.attr == "count" and 2 <= len(node.args) <= 3 and \
+                    func.attr not in self.method_owners:
+                return "str_count(%s, %s, %s, %s)" % (
+                    self.coerce_to("char*", func.value, self.expr(func.value)),
+                    self.coerce_to("char*", node.args[0],
+                                   self.expr(node.args[0])),
+                    self.coerce_to("int", node.args[1],
+                                   self.expr(node.args[1])),
+                    self._re_endpos(node, 2))
             if func.attr == "count" and len(node.args) == 1 and \
                     func.attr not in self.method_owners:
                 return "list_count(%s, %s)" % (self.wrap_obj(func.value),
@@ -14760,7 +14793,7 @@ class Transpiler:
     # obj already). The receiver's static type does not tell them apart --
     # both are plain `obj` parameters in the generated C -- but the helper
     # py2c chose does, exactly.
-    _SCALAR_HELPERS = ("str_find_from(", "str_find_range(")
+    _SCALAR_HELPERS = ("str_find_from(", "str_find_range(", "str_count(")
 
     def _re_endpos(self, node, idx):
         """The `endpos` argument at `idx`, or -1 when it is not given."""
@@ -14787,6 +14820,12 @@ class Transpiler:
             return self.expr(node)
         t = self.value_ctype(node)
         s = self.expr(node)
+        # Same rule as in `coerce_to`, for the other half of the problem: a
+        # scalar helper in an *argument* position (`obj_add(line0,
+        # str_count(..))`) needs wrapping just as much as one being assigned,
+        # and `value_ctype` cannot type either of them.
+        if self._scalar_helper_ct(s) is not None:
+            return "OBJ_INT(%s)" % s
         if s.startswith(("mp_call_", "mp_getattr", "mp_hasattr")):
             return s
         if isinstance(node, ast.Call) and self.value_ctype(node) == OBJ:
