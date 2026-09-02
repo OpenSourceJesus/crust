@@ -12111,7 +12111,15 @@ class Transpiler:
         defs = self.defaults_for(fndef, False)
         creg = self.coerce_args(self.func_params[fn][:n_reg], pos, defs)
         wvar = [self.wrap_obj(a) for a in var]
-        parts = list(creg) + [kw, str(len(wvar))] + wvar
+        parts = list(creg)
+        # The kwargs dict only if the callee actually declares `**kwargs`:
+        # `param_list` emits that slot under the same condition, so passing it
+        # unconditionally handed `def probe(*texts)` -- signature
+        # `(int _n_texts, ...)` -- a leading `dict_new()` that the count then
+        # sat behind, and gcc rejected the call.
+        if fndef.args.kwarg:
+            parts.append(kw)
+        parts += [str(len(wvar))] + wvar
         return "%s(%s)" % (self.fnsym(fn), ", ".join(parts))
 
     def _lower_starred_local_call(self, fn, fndef, node):
