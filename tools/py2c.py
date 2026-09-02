@@ -4688,6 +4688,48 @@ static char* _ospath_join(char* a, char* b) {
     for (long i = 0; i < lb; i++) s[k++] = b[i];
     s[k] = 0; return s;
 }
+/* os.path.normpath: collapse '.', '..' and repeated slashes, textually --
+   the same lexical rule CPython uses, with no filesystem lookup, so a
+   symlink is not resolved (that is realpath's job, not this one). A leading
+   '/' is kept; an empty result is '.'. */
+static char* _ospath_normpath(char* p) {
+    long n = (long)strlen(p), i = 0, k = 0, nseg = 0, j;
+    int absolute = (n > 0 && p[0] == '/');
+    char* out;
+    long* starts; long* lens;
+    if (n == 0) return (char*)".";
+    starts = (long*)aalloc(sizeof(long) * (size_t)(n + 1));
+    lens = (long*)aalloc(sizeof(long) * (size_t)(n + 1));
+    while (i < n) {
+        long b;
+        while (i < n && p[i] == '/') i++;
+        b = i;
+        while (i < n && p[i] != '/') i++;
+        if (i == b) break;
+        if (i - b == 1 && p[b] == '.') continue;
+        if (i - b == 2 && p[b] == '.' && p[b + 1] == '.') {
+            /* '..' pops a segment, except past the root or past leading
+               '..' in a relative path, which have nothing to pop. */
+            if (nseg > 0 && !(lens[nseg - 1] == 2 &&
+                              p[starts[nseg - 1]] == '.' &&
+                              p[starts[nseg - 1] + 1] == '.')) {
+                nseg--; continue;
+            }
+            if (absolute) continue;
+        }
+        starts[nseg] = b; lens[nseg] = i - b; nseg++;
+    }
+    out = (char*)aalloc((size_t)n + 2);
+    if (absolute) out[k++] = '/';
+    for (j = 0; j < nseg; j++) {
+        long q;
+        if (j) out[k++] = '/';
+        for (q = 0; q < lens[j]; q++) out[k++] = p[starts[j] + q];
+    }
+    out[k] = 0;
+    if (k == 0) { out[0] = '.'; out[1] = 0; }
+    return out;
+}
 /* os.getcwd(): arena-allocated so the result outlives the call, unlike a
    static buffer that the next call would overwrite. */
 static char* _os_getcwd(void) {
@@ -10362,7 +10404,8 @@ class Transpiler:
             if isinstance(_f.value, ast.Attribute) and \
                     isinstance(_f.value.value, ast.Name) and \
                     _f.value.value.id == "os" and _f.value.attr == "path":
-                if _f.attr in ("dirname", "basename", "abspath", "join"):
+                if _f.attr in ("dirname", "basename", "abspath", "join",
+                               "normpath"):
                     return "char*"       # returns a C string
                 if _f.attr == "exists":
                     return "int"
@@ -12320,6 +12363,9 @@ class Transpiler:
                 if f.attr == "abspath":
                     self._ossys_used = True
                     return "_ospath_abspath(%s)" % self._coerce_str_arg(node, 0)
+                if f.attr == "normpath":
+                    self._ossys_used = True
+                    return "_ospath_normpath(%s)" % self._coerce_str_arg(node, 0)
                 if f.attr == "exists":
                     self._ossys_used = True
                     return "_ospath_exists(%s)" % self._coerce_str_arg(node, 0)
@@ -14973,16 +15019,20 @@ class Transpiler:
             if (bt != ot and not _both_int) or be.startswith("mp_") \
                     or oe.startswith("mp_"):
                 return self.expr(node)
+        # Checked before the obj bail-out below, not after: a scalar helper in
+        # an argument position (`obj_add(i, str_find_from(..))`) needs wrapping
+        # just as much as one being assigned, and `value_ctype` reads it as obj
+        # -- which is exactly the bail-out that used to return it raw. Rendered
+        # once and reused, so `expr` is not run twice for its side effects.
+        _rendered = None
+        if isinstance(node, ast.Call):
+            _rendered = self.expr(node)
+            if self._scalar_helper_ct(_rendered) is not None:
+                return "OBJ_INT(%s)" % _rendered
         if self.is_obj_word(node) or self.value_ctype(node) == OBJ:
-            return self.expr(node)
+            return _rendered if _rendered is not None else self.expr(node)
         t = self.value_ctype(node)
-        s = self.expr(node)
-        # Same rule as in `coerce_to`, for the other half of the problem: a
-        # scalar helper in an *argument* position (`obj_add(line0,
-        # str_count(..))`) needs wrapping just as much as one being assigned,
-        # and `value_ctype` cannot type either of them.
-        if self._scalar_helper_ct(s) is not None:
-            return "OBJ_INT(%s)" % s
+        s = _rendered if _rendered is not None else self.expr(node)
         if s.startswith(("mp_call_", "mp_getattr", "mp_hasattr")):
             return s
         if isinstance(node, ast.Call) and self.value_ctype(node) == OBJ:
