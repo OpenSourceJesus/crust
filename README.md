@@ -208,7 +208,7 @@ They are not redundant. Each brings something the other does not.
 **Rust** brings move semantics and the ownership discipline around them.
 Passing an owning value by value is a move: the source is zeroed, the callee
 takes it, and reading the source afterwards is *rejected* rather than
-silently yielding an empty value.
+silently yielding an empty value.https://github.com/OpenSourceJesus/C-Compiler
 
 **C++** brings a full object lifecycle: constructors chosen by arity, copy
 construction and `operator=`, member and base construction ordering,
@@ -328,6 +328,7 @@ To prevent syntactic ambiguity and parsing complexity, Crust enforces function-l
 ## References
 
 - [ShivC](https://github.com/ShivamSarodia/ShivC) — the original compiler ShivyCX was rewritten from.
+- https://github.com/OpenSourceJesus/C-Compiler — the extended C compiler by Gilead Cosman this work is based on. 
 - C11 Specification — http://www.open-std.org/jtc1/sc22/wg14/www/docs/n1570.pdf
 - x86-64 ABI — https://github.com/hjl-tools/x86-psABI/wiki/x86-64-psABI-1.0.pdf
 - Iterated Register Coalescing (George and Appel) — https://www.cs.purdue.edu/homes/hosking/502/george.pdf
