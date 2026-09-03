@@ -12474,7 +12474,12 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
                     "class %s: it instantiates `%s`, which is declared below "
                     "it. A nested instantiation has to be complete first."
                     % (name, pair[0]))
-            record(*pair)
+            # Spelled out rather than `record(*pair)`: a starred call on a
+            # *lifted* nested function does not lower -- the rewriter
+            # prepends the captured values and leaves the star as one more
+            # argument, so the call arrives short. `pair` is a two-tuple and
+            # the line above already indexes it.
+            record(pair[0], pair[1])
             if pair not in seen:
                 seen.add(pair)
                 pending.append(pair)

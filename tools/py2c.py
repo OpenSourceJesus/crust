@@ -3040,6 +3040,17 @@ class _CallRewriter(ast.NodeTransformer):
         f = node.func
         if isinstance(f, ast.Name) and f.id in self.name_map:
             mangled, captures = self.name_map[f.id]
+            # `g(*seq)` on a lifted function does not lower: the captures are
+            # prepended and the star is left as one more argument, so the call
+            # arrives short. It usually fails at the C compiler, but it only
+            # *usually* does -- if the arities happen to line up it is a wrong
+            # call that compiles. Say so rather than emit it silently.
+            if any(isinstance(a, ast.Starred) for a in node.args):
+                sys.stderr.write(
+                    "py2c: line %s: `%s(*args)` on a nested function is not "
+                    "lowered -- its captured values are prepended, so the "
+                    "starred call arrives short. Spell the arguments out.\n"
+                    % (getattr(node, "lineno", "?"), f.id))
             node.func = ast.Name(id=mangled, ctx=ast.Load())
             node.args = [ast.Name(id=c, ctx=ast.Load()) for c in captures] \
                 + node.args
