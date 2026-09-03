@@ -77,7 +77,7 @@ Hardware:
 - [BAREMETAL_THREADS.md](BAREMETAL_THREADS.md)
 
 Crust Papers:
-- https://doi.org/10.5281/zenodo.22238586 "Memory Safety Where It Is Needed: Proof-Guided Runtime Checking in a Toolchain Small Enough to Read"
+- https://dx.doi.org/10.2139/ssrn.7396160 "Memory Safety Where it is Needed: Proof-guided Runtime Checking in a Toolchain Small Enough to Read"
 - https://dx.doi.org/10.2139/ssrn.7382398 "A Successor Discipline, Not a Successor Language: Safety by Subtraction in a Self-Contained C++ Toolchain"
 - https://dx.doi.org/10.2139/ssrn.7315678 "Interoperation Without an Interface: C++ and Rust in One Translation Unit, and One Toolchain"
 - https://dx.doi.org/10.2139/ssrn.7226482 "Full-stackless Computing: A Multi-language Compiler That Builds and Boots its Own Operating System"
