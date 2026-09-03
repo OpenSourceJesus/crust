@@ -22,12 +22,16 @@ python3 tools/rpy_census.py tools/cpprust.py --errors   # just the count
 
 | | at the start | now |
 |---|---|---|
-| gcc errors in the generated C | 76 | 7 |
-| calls substituted with `None` | 11 | 5 |
+| gcc errors in `cpprust.c` | 76 | **0** |
+| gcc errors in `cpp_auto.c` | 6 | **0** |
+| links into a binary | no | **yes** |
+| runs a translation end to end | no | **yes** |
+| output matches CPython | — | **not yet** |
+| calls substituted with `None` | 11 | 6 |
 | container advisories | 77 | 77 |
 
-The three columns are different kinds of problem and only the first two
-matter. An advisory costs a reader nothing if ignored — the program is
+The three error columns are different kinds of problem and only the first
+two matter. An advisory costs a reader nothing if ignored — the program is
 correct either way, only slower. A substitution *changes what the program
 does*. And a gcc error is invisible to py2c entirely: cpprust transpiled with
 zero complaints from py2c and produced C with seventy-six of them, so "does
@@ -99,6 +103,7 @@ diffs stdout, so a fix that compiles but computes something else fails.
 | `test_eval_env_py2c.py` | the sandboxed 3-argument `eval` |
 | `test_ifexp_int_py2c.py` | integer conditionals in assignment, return and argument position |
 | `test_ospath_py2c.py` | `normpath`, including popping past the root |
+| `test_rsplit_py2c.py` | `s.rsplit(sep, maxsplit)`, which is not `split` reversed |
 
 The edges are deliberate. A hand-written `str.count` gets the empty needle
 wrong (Python counts the gaps: `"abc".count("")` is 4), and a hand-written
@@ -108,42 +113,36 @@ wrong (Python counts the gaps: `"abc".count("")` is 4), and a hand-written
 through `make rpython`, and it is a real regression test rather than a
 demonstration: with the py2c changes stashed it fails to compile.
 
-## What is left: 7 errors in 4 functions
+## What is left
 
-These are the ones that need cpprust to change rather than py2c, which is
-why they are last.
+The compile errors are gone. What remains is that the binary, which now
+runs a whole translation and writes its output file, writes the *wrong*
+thing: asked to translate a three-line class it reported
 
-**`_sub_code` (3).** It takes a *compiled pattern as a parameter* and a
-replacement that may be a string or a callable:
+    cpprust: class Box: base class `<garbage bytes>` is not defined above it
 
-```python
-def _sub_code(pattern, repl, text):
-    for m in pattern.finditer(look):
-        out.append(repl(m) if callable(repl) else m.expand(repl))
-```
+so a string somewhere in the lowered code does not outlive the buffer it was
+built from. Neither the C compiler nor a smoke run reports that, which is
+precisely the argument for building the cpython-vs-native difftest before
+trusting any of this.
 
-py2c cannot type `pattern`, and `callable()` and `m.expand()` have no
-lowering. The fix is on the cpprust side: pass the pattern *string* (so
-`re.finditer(pat, look)` lowers), and split the function in two so the
-callable/string dispatch disappears. That is mechanical but touches all 22
-call sites, which is why it was not done in the same pass as the py2c work.
+Six calls still lower to `None`, and they are now the whole remaining list:
 
-**`_construct_byval_args` (1) and `_inline_lambda` (2).** `.match(text, pos)`
-and `.search(text, pos, endpos)` where the receiver is a matcher id or an
-untracked local. The windowed lowerings exist now; what is missing is
-recovering the pattern text for a receiver py2c tracked only as an id.
-
-**`translate` (1).** A lifted nested function called with fewer arguments
-than its captures give it. Distinct from the transitive-capture fix already
-made, and not yet diagnosed.
+* **The clang oracle** — `json.load`, `_json.dump`, `json.loads`,
+  `subprocess.check_output`. `auto` deduction falls back to clang, and none
+  of that path lowers. It is optional (`--no-clang`), so the first difftest
+  can run without it.
+* **Two `yield`s in `cpp_auto`** — generators have no lowering at all, and
+  the expression is dropped rather than refused, so those two functions
+  silently produce nothing.
 
 ## What has not been measured yet
 
-Nothing here says the result is *faster*, because nothing has run yet — the
-binary does not link until those 7 are gone. The order after that is: build
-it, difftest cpython-cpprust against native-cpprust over the 43-file litehtml
-corpus, then measure. Until that difftest exists, "it lowers" is the only
-claim being made.
+Nothing here says the result is *faster*. The binary runs, but it does not
+yet agree with CPython, so timing it would be timing the wrong program. The
+order is: fix the string lifetime, difftest cpython-cpprust against
+native-cpprust over the 43-file litehtml corpus, then measure. Until that
+difftest passes, "it lowers and runs" is the only claim being made.
 
 Two things worth knowing before that measurement is designed:
 
