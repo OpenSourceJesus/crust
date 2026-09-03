@@ -8236,7 +8236,10 @@ def _binop_refusal(rhs, scopes, type_info):
         return None
 
     # `a + "lit"` -- an operand with no address to take.
-    m = re.match(r"^(\w+)\s*(%s)\s*(.+)$" % ops, rhs, re.S)
+    # `[\s\S]` rather than `.` under `re.S`: the same match without the
+    # flag, which the lowering needs -- a flags argument is not lowered, and
+    # the call fell through to a substituted None.
+    m = re.match(r"^(\w+)\s*(%s)\s*([\s\S]+)$" % ops, rhs)
     if m and not re.match(r"^\w+$", m.group(3).strip()):
         cls, ent = _binop_of(m.group(1), m.group(2))
         if ent is not None:
@@ -8250,7 +8253,7 @@ def _binop_refusal(rhs, scopes, type_info):
     # `"lit" + a` -- C++ resolves this with a *free* operator, which this
     # subset has no notion of: an overloaded operator is a member, so its
     # left operand has to be an object of the class.
-    m = re.match(r"^(.+?)\s*(%s)\s*(\w+)$" % ops, rhs, re.S)
+    m = re.match(r"^([\s\S]+?)\s*(%s)\s*(\w+)$" % ops, rhs)
     if m and not re.match(r"^\w+$", m.group(1).strip()):
         cls, ent = _binop_of(m.group(3), m.group(2))
         if ent is not None:
@@ -8933,9 +8936,12 @@ def _strip_attribute_macros(text):
     Blanked rather than removed, so every offset already taken stays valid.
     """
     macros = set()
+    # The `re.M` anchors written out: `(?<![^\n])` is `^` at a line start
+    # and `(?![^\n])` is `$` at a line end. Same match, no flag.
     for m in re.finditer(
-            r"^[ \t]*#[ \t]*define[ \t]+(\w+)[ \t]*([^\r\n\\]*)$",
-            text, re.M):
+            r"(?<![^\n])[ \t]*#[ \t]*define[ \t]+(\w+)[ \t]*"
+            r"([^\r\n\\]*)(?![^\n])",
+            text):
         body = m.group(2).strip()
         if body == "" or body.startswith(("__declspec", "__attribute__")):
             macros.add(m.group(1))
