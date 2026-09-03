@@ -2423,6 +2423,41 @@ _LOCAL_MODULE_DIRS = []
 _COMPILED_MODULES = set()
 
 
+_BUILD_FILES = []
+
+
+def set_build_files(paths):
+    """Remember the .py files being transpiled together.
+
+    `ambiguous_function_names` only walks `shivyc/`, which is right for the
+    compiler's own package and blind to everything else: two *other* modules
+    compiled into one program -- `tools/cpprust.py` and the
+    `tools/cpp_auto.py` it imports -- each defined `_match` and `_split_top`,
+    and the link failed on the duplicate symbols. Names defined in more than
+    one file of the actual build are ambiguous too, whatever directory they
+    sit in.
+    """
+    global _BUILD_FILES
+    _BUILD_FILES = [p for p in paths if p.endswith(".py")]
+
+
+def ambiguous_function_names_in_build():
+    """Top-level function names defined by more than one file of this build."""
+    seen, dup = {}, set()
+    for p in _BUILD_FILES:
+        try:
+            t = ast.parse(open(p, encoding="utf-8").read())
+        except Exception:
+            continue
+        mod = os.path.basename(p)[:-3]
+        for n in t.body:
+            if isinstance(n, ast.FunctionDef):
+                if seen.get(n.name, mod) != mod:
+                    dup.add(n.name)
+                seen.setdefault(n.name, mod)
+    return dup
+
+
 def set_compiled_modules(paths):
     """Record the module names of the compilation unit's input files."""
     global _COMPILED_MODULES
@@ -5589,7 +5624,8 @@ class Transpiler:
         self.closure_values_needed = set()
         self.classes, self.class_order, vt = collect_classes(tree)
         self.ambiguous = ambiguous_class_names(self.base_dir)
-        self.ambiguous_funcs = ambiguous_function_names(self.base_dir)
+        self.ambiguous_funcs = set(ambiguous_function_names(self.base_dir))
+        self.ambiguous_funcs |= ambiguous_function_names_in_build()
         for ci in self.class_order:     # qualify local colliding class symbols
             ci.csym = class_csym(ci.name, self.modname, self.ambiguous)
         self.class_typedef_names = {ci.csym for ci in self.class_order}
@@ -14670,6 +14706,21 @@ class Transpiler:
         out = []
         out.append("/* ---- crust_re: regex VM for patterns outside the "
                    "specializer's subset ---- */")
+        # The engine is inlined into every module that needs it, so two such
+        # modules in one program define the same symbols twice and the link
+        # fails -- which is exactly what `cpprust.py` plus the `cpp_auto.py`
+        # it imports did. Give this copy module-local names. A #define is
+        # enough because the preprocessor matches whole identifiers, so
+        # `crust_re_exec` is renamed without disturbing the `crust_re` struct
+        # tag, and the header and source below agree because both are
+        # rewritten by the same defines.
+        _pub = sorted(set(re.findall(r"\b(crust_re_[a-z_]+)\s*\(",
+                                     crust_re_src.HEADER)))
+        if _pub:
+            out.append("/* module-local names: one program may inline this "
+                       "engine more than once. */")
+            for _n in _pub:
+                out.append("#define %s %s__%s" % (_n, self.modname, _n))
         out.extend(crust_re_src.HEADER.splitlines())
         out.extend(crust_re_src.SOURCE.splitlines())
         out.append("")
@@ -17231,6 +17282,7 @@ def main(argv):
             print("  pgo: skipped (need .py input(s))")
     set_local_module_dirs(files)
     set_compiled_modules(files)
+    set_build_files(files)
     _, _, stdlib_root = _stdlib_context(files[0] if len(files) == 1 else "", None)
     uses_eval = any(_uses_eval_builtin(p) for p in files)
     # eval() no longer forces the MicroPython core: a standalone program gets the

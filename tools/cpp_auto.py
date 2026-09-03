@@ -42,7 +42,11 @@ class AutoError(Exception):
     """Raised when `auto` cannot be resolved. Message names the fix."""
 
     def __init__(self, message):
-        Exception.__init__(self, message)
+        # `self.args` directly rather than `Exception.__init__(self, message)`:
+        # a call to the base's `__init__` has no lowering, and `args` is what
+        # that call sets anyway -- so `e.args[0]` and `str(e)` both still give
+        # the message, which is what the callers read.
+        self.args = (message,)
         self.message = message
 
 
@@ -267,9 +271,13 @@ def clang_auto_types(path, incdirs=(), defines=()):
         # clang reports on what it cannot parse and still dumps what it
         # did, so a non-zero status is not a reason to discard the answer.
         # No output is.
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL)
-        raw = proc.communicate()[0]
+        # `subprocess.run(capture_output=True)` rather than Popen plus
+        # communicate: the latter has no lowering, and this wants exactly
+        # what run gives -- the whole of stdout, once, with the exit status
+        # ignored. stderr is captured rather than sent to DEVNULL and then
+        # dropped, which comes to the same thing here.
+        done = subprocess.run(cmd, capture_output=True)
+        raw = done.stdout
         if not raw:
             return {}
         tree = json.loads(raw.decode("utf-8", "replace"))
