@@ -9585,8 +9585,17 @@ class Transpiler:
         # unit has no _entry.c to do that, so main runs its own module init
         # first -- otherwise module globals stay zeroed and, e.g., a global
         # list reads back as empty. The init is idempotent.
-        if node.name == "main" and self.mod_globals:
-            self.emit("%s_init();" % self.cmod)
+        if node.name == "main":
+            # Imported modules first: their globals are just as zeroed until
+            # their own init runs, and this module's code reads them. cpprust
+            # clears `cpp_auto.CLANG_USED` at the top of a translation, which
+            # segfaulted on a list that had never been built. Each init is
+            # idempotent, so naming one twice is harmless.
+            for _m in sorted(self.modules):
+                if _m in _COMPILED_MODULES and _m != self.modname:
+                    self.emit("%s_init();" % _m)
+            if self.mod_globals:
+                self.emit("%s_init();" % self.cmod)
         self.emit_hoisted_body(body)
         self.indent -= 1
         self.emit("}")
