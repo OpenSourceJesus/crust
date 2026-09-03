@@ -82,6 +82,17 @@ const char *crust_re_group_name(const crust_re *re, int g);
 int crust_re_exec(const crust_re *re, const char *text, size_t len,
                   int anchored, int *caps, int ncaps);
 
+/* As `crust_re_exec`, but the search starts at `from` rather than 0 while
+ * the subject stays text[0..len). That distinction is the point: the engine
+ * can still look *behind* `from`, so `(?<=;)x` against ";x" from offset 1
+ * matches, exactly as CPython's `pat.search(s, 1)` does. Handing the engine
+ * `text + from` instead loses the context and silently reports no match.
+ *
+ * `len` doubles as CPython's `endpos`: `$` matches there and no match may
+ * run past it. Offsets in `caps` are relative to text[0]. */
+int crust_re_exec_from(const crust_re *re, const char *text, size_t len,
+                       long from, int anchored, int *caps, int ncaps);
+
 /* Override the default backtracking step budget (default 1000000). Guards
  * against catastrophic backtracking on patterns like (a+)+b. */
 void crust_re_set_limit(crust_re *re, long limit);
@@ -1054,6 +1065,12 @@ static int vm_run(VM *vm, int pc, long sp)
 int crust_re_exec(const crust_re *re, const char *text, size_t len,
                   int anchored, int *caps, int ncaps)
 {
+    return crust_re_exec_from(re, text, len, 0, anchored, caps, ncaps);
+}
+
+int crust_re_exec_from(const crust_re *re, const char *text, size_t len,
+                       long from, int anchored, int *caps, int ncaps)
+{
     VM vm;
     long start;
     int i, nslots;
@@ -1063,11 +1080,20 @@ int crust_re_exec(const crust_re *re, const char *text, size_t len,
     if (nslots > MAX_SLOTS) return CRUST_RE_NOMATCH;
     if (re->nmarks > MAX_MARKS) return CRUST_RE_NOMATCH;
 
+    if (from < 0) from = 0;
+    if (from > (long)len) return CRUST_RE_NOMATCH;
+
+    /* `text` is the whole subject and `len` is where matching must stop, so
+     * a lookbehind at `from` still reads the characters before it -- which is
+     * the whole difference between this and handing the engine `text + from`.
+     * CPython's `pat.search(s, pos)` behaves this way, and a caller that
+     * windows a scan (`search(look, lo, at)`) depends on it: the pattern
+     * before the window is exactly what decides whether the match is real. */
     vm.re = re; vm.text = text; vm.len = (long)len; vm.nslots = nslots;
     vm.steps = 0;   /* budget spans the whole call: resetting it per start
                      * position would let a search burn limit*len steps. */
 
-    for (start = 0; start <= (long)len; start++) {
+    for (start = from; start <= (long)len; start++) {
         int r;
         for (i = 0; i < nslots; i++) vm.slots[i] = -1;
         for (i = 0; i < MAX_MARKS; i++) vm.marks[i] = -1;

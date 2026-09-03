@@ -1,3 +1,82 @@
+# Lowering cpprust.py to C — py2c fixes for issue #16
+
+brentharts/crust#16 proposes porting `tools/cpprust.py` to RPython so it can
+be lowered to C and run natively. Measured rather than estimated: **py2c
+already transpiles all 13,120 lines without refusing anything.** The work was
+not rewriting cpprust into a subset -- it was that the C which came out did
+not compile, and the reasons were nearly all in py2c.
+
+`tools/rpy_census.py` (new) is what makes that a number rather than an
+assertion. **76 gcc errors -> 7; 11 calls substituted with None -> 5.**
+
+## The shape of it
+
+One pattern accounted for most: py2c's type oracle and its emitter
+disagreeing. `value_ctype` says a call yields an obj, the emitter emits a raw
+`char*` or `long`, and the assignment between them does not compile --
+`re.sub` (16 errors), `str.index` (7), `str.count` (5), and the mirror
+direction for `AS_INT` over an already-long value.
+
+Each fix belongs where the *disagreement* is. Teaching `value_ctype` that
+`.index` is an int looked right and made it worse: that function also decides
+how a fresh local is declared, so it declared `int` for names that elsewhere
+held an obj -- seven errors traded for seventeen. What tells the two `.index`
+lowerings apart is not the receiver's type (both are plain `obj` in the
+generated C) but the helper py2c itself chose, so that is what the check
+keys on.
+
+## One was a wrong answer, not a missing feature
+
+`pat.search(s, pos)` handed the engine `text + pos`, losing the text before
+`pos`, so a lookbehind there could not see it:
+
+    re.compile(r"(?<=;)x").search(";x", 1)
+        CPython -> match at 1
+        native  -> no match
+
+cpprust windows its scans precisely so the lookbehind sees the character
+before the window, so a self-hosted cpprust would have translated C++ subtly
+wrong rather than failing. `crust_re_exec_from` starts the search at an offset
+while keeping the whole subject visible; `len` doubles as CPython's `endpos`.
+Differential fuzzer: 53,121 comparisons, 0 divergences.
+
+## Files
+
+* **`tools/rpy_census.py`** (new): the census over all three passes.
+* **`RPYTHON_CPPRUST.md`** (new): the state, the method, and the remaining 7.
+* **`runtime/crust_re.{c,h}`**: `crust_re_exec_from`; `crust_re_exec`
+  delegates to it at 0. `tools/rpy_lib/crust_re_src.py` regenerated.
+* **`tools/py2c.py`**: transitive closure captures through *values*, not just
+  calls; nested tuple targets; the kwargs slot only for callees that declare
+  `**kwargs`; `str_count`; `tuple()`; `os.path.normpath`; `_cre_sub_any` for a
+  function replacement; a pre-scan so `.group()` lowers in a helper defined
+  above the first `re.` call; pos/endpos on search/match/finditer; integer
+  conditionals kept scalar across emitter, oracle and boxing.
+* **`tools/cpprust.py`**: a list rather than a `bytearray` for the probe
+  flags -- `bytearray` has no lowering, and the two are interchangeable for a
+  flag array (verified element-for-element, timing a wash).
+* **8 new agreement tests** under `tools/rpy_lib/`, plus
+  `examples/rpython2c/closures/lifted_captures.py` in `make rpython`.
+
+## Verification
+
+Every fix ships a cpython-vs-native test that compiles the same source both
+ways and diffs stdout, so a fix that compiles but computes something else
+fails. All 8 pass. `make testminipy` fails only on `crust_re C++ frontend`,
+which reproduces on a clean master with these changes stashed.
+
+## What is NOT claimed
+
+Nothing here says the result is faster: the binary does not link until the
+last 7 errors are gone, so nothing has run. Also worth knowing before that
+measurement is designed -- translation is already ~15s/file after PR #7, of
+which ~4.5s is a clang subprocess a native build would not speed up; and
+**ShivyCX has two bugs of its own** in code gcc compiles correctly (a
+segfault on `m = pat.search(text, pos)`, and 42 where CPython and gcc get 65
+on a `*args` program).
+
+---
+
 # cpprust: binary operators on owning classes, and four silent miscompiles
 
 Six changes to `tools/cpprust.py`, found by translating a real codebase

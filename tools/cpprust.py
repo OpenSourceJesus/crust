@@ -1072,7 +1072,12 @@ def _probe_positions(*texts):
     comment-blanked copy but occasionally reads the original; marking both
     keeps the filter a superset of what either could match.
     """
-    hits = bytearray(len(texts[0]))
+    # A list of ints rather than a `bytearray`: the two are interchangeable
+    # for a flag array that is only ever indexed and assigned 0/1, and
+    # `bytearray` has no lowering in the RPython subset -- py2c emitted a
+    # call to a `bytearray` that does not exist, which C then defaulted to
+    # returning int. A list also gets the unboxed fast path there.
+    hits = [0] * len(texts[0])
     for t in texts:
         for m in _PROBE_START.finditer(t):
             hits[m.start()] = 1
@@ -4144,8 +4149,15 @@ def _ref_positions(params, names):
     return out
 
 
-def _sub_code(pattern, repl, text):
-    """`pattern.sub(repl, text)`, but only where the match is real code.
+def _sub_code(pat, repl, text):
+    """`re.sub(pat, repl, text)`, but only where the match is real code.
+
+    `pat` is the pattern *text* and `repl` is always a callable. Both are
+    narrower than they were -- it used to take a compiled pattern and accept
+    a string replacement too -- and the narrowing is what lets this lower to
+    C: py2c cannot type a compiled pattern arriving as a parameter, and
+    `callable()` and `m.expand()` have no lowering at all. No call site
+    needed a backreference, so a string replacement is a lambda returning it.
 
     Every rewriting pass in this file that touches a body -- field
     qualification, implicit `this`, template substitution, reference
@@ -4170,9 +4182,9 @@ def _sub_code(pattern, repl, text):
     """
     look = _blank_directives(_blank_strings(_strip_comments(text)))
     out, pos = [], 0
-    for m in pattern.finditer(look):
+    for m in re.finditer(pat, look):
         out.append(text[pos:m.start()])
-        out.append(repl(m) if callable(repl) else m.expand(repl))
+        out.append(repl(m))
         pos = m.end()
     out.append(text[pos:])
     return "".join(out)
@@ -4219,7 +4231,7 @@ def _subst_type(text, tparams, concretes):
     # A parameter name inside a literal is text the program prints, not a
     # type to substitute: `puts("T")` must not become `puts("int")`.
     return _sub_code(
-        re.compile(r"\b(%s)\b" % "|".join(re.escape(p) for p in tparams)),
+        r"\b(%s)\b" % "|".join(re.escape(p) for p in tparams),
         lambda m: mapping[m.group(1)], text)
 
 
@@ -4247,7 +4259,7 @@ def _subst_injected(text, name, mangled):
     if not name or name == mangled:
         return text
     return _sub_code(
-        re.compile(r"\b%s\b(?!\s*<)" % re.escape(name)),
+        r"\b%s\b(?!\s*<)" % re.escape(name),
         lambda m: mangled, text)
 
 
@@ -4412,7 +4424,7 @@ def _expand_cpp_rref(params, names):
     all, so it binds a reference the move constructor then empties.
     """
     return _sub_code(
-        re.compile(r"(?<![\w.>])__cpp_rref\s*\(\s*([\w:]+)\s*\)"),
+        r"(?<![\w.>])__cpp_rref\s*\(\s*([\w:]+)\s*\)",
         lambda mm: ("%s &&" % mm.group(1)
                     if mm.group(1) in names else mm.group(1)),
         params)
@@ -4434,7 +4446,7 @@ def _expand_cpp_ref(params, names):
     beside it.
     """
     return _sub_code(
-        re.compile(r"(?<![\w.>])__cpp_ref\s*\(\s*([\w:]+)\s*\)"),
+        r"(?<![\w.>])__cpp_ref\s*\(\s*([\w:]+)\s*\)",
         lambda mm: ("const %s &" % mm.group(1)
                     if mm.group(1) in names else mm.group(1)),
         params)
@@ -4578,8 +4590,7 @@ def _lower_refs(text, names):
     alt = _type_alt(names)
     # A reference local binds something; take its address.
     text = _sub_code(
-        re.compile(
-            r"(?<![\w.])((?:const\s+)?(?:%s))\s*&\s*(\w+)\s*=\s*([^;]+);" % alt),
+        r"(?<![\w.])((?:const\s+)?(?:%s))\s*&\s*(\w+)\s*=\s*([^;]+);" % alt,
         lambda m: "%s *%s = &(%s);" % (m.group(1), m.group(2),
                                        m.group(3).strip()),
         text)
@@ -4590,11 +4601,11 @@ def _lower_refs(text, names):
     # left operand of a logical `&&` is a value, and a bare type name is not
     # one.
     text = _sub_code(
-        re.compile(r"(?<![\w.&])((?:const\s+)?(?:%s))\s*&&\s*(\w+)" % alt),
+        r"(?<![\w.&])((?:const\s+)?(?:%s))\s*&&\s*(\w+)" % alt,
         lambda m: "%s *%s" % (m.group(1), m.group(2)), text)
     # Everything else: a reference parameter.
     text = _sub_code(
-        re.compile(r"(?<![\w.&])((?:const\s+)?(?:%s))\s*&(?!&)\s*(\w+)" % alt),
+        r"(?<![\w.&])((?:const\s+)?(?:%s))\s*&(?!&)\s*(\w+)" % alt,
         lambda m: "%s *%s" % (m.group(1), m.group(2)), text)
     return text
 
@@ -4609,7 +4620,7 @@ def _implicit_this(body, mnames):
     """
     if not mnames:
         return body
-    return _sub_code(re.compile(r"(?<![\w.>])(%s)\s*\(" % _type_alt(mnames)),
+    return _sub_code(r"(?<![\w.>])(%s)\s*\(" % _type_alt(mnames),
                      lambda m: "this->%s(" % m.group(1), body)
 
 
@@ -5515,8 +5526,8 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
         inner = raw
         for rname in scalar_refs:
             inner = _sub_code(
-                re.compile(r"(?<![\w.>&])%s(?![\w])" % re.escape(rname)),
-                "(*%s)" % rname, inner)
+                r"(?<![\w.>&])%s(?![\w])" % re.escape(rname),
+                lambda _m: "(*%s)" % rname, inner)
         inner = _implicit_this(inner, mnames)
         # Bare member names inside a body refer to fields; qualify them.
         # Inherited ones go through `_base`, so the path is substituted
@@ -5543,7 +5554,7 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
                        if n not in shadowed and n not in names]
             if visible:
                 inner = _sub_code(
-                    re.compile(r"(?<![\w.>])(%s)\b" % _type_alt(visible)),
+                    r"(?<![\w.>])(%s)\b" % _type_alt(visible),
                     lambda m: "this->" + info["paths"][m.group(1)], inner)
         inner = inner.replace("this->this->", "this->")
         # `static const` members are file-scope constants, not fields, so a
@@ -5553,7 +5564,7 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
         sconsts = [x.name for x in cls.members if x.kind == "sconst"]
         if sconsts:
             inner = _sub_code(
-                re.compile(r"(?<![\w.>])(%s)\b" % _type_alt(sconsts)),
+                r"(?<![\w.>])(%s)\b" % _type_alt(sconsts),
                 lambda m: "%s_%s" % (cname, m.group(1)), inner)
         # `Shape *twin() { return this; }` inside a derived class returns a
         # `Derived *` where a `Shape *` is declared. The base is the first
@@ -5564,8 +5575,8 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
                 and base is not None \
                 and (rcls[0] == base or _is_ancestor(rcls[0], base, known)):
             inner = _sub_code(
-                re.compile(r"(?<![\w.>])return\s+this\s*;"),
-                "return (%s *)this;" % rcls[0], inner)
+                r"(?<![\w.>])return\s+this\s*;",
+                lambda _m: "return (%s *)this;" % rcls[0], inner)
         # ShivyCX contract clauses go between the parameter list and the
         # body, which is the same place they occupied in the C++ source --
         # the method-to-free-function rewrite prepends `this` and renames
@@ -5683,7 +5694,7 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             # The body returns the element; the lowered function returns
             # its address, which is what a reference is.
             ibody = _sub_code(
-                re.compile(r"(?<![\w.>])return\s+([^;]+);"),
+                r"(?<![\w.>])return\s+([^;]+);",
                 lambda mm: "return &(%s);" % mm.group(1).strip(),
                 sub(m.body or ""))
             emit(iret.replace("&", "*"), "%s__index" % cname, params, ibody)
@@ -5709,7 +5720,7 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             info["star"] = {"fn": "%s__star" % cname,
                             "ret": tsub(sret.replace("&", "").strip())}
             sbody = _sub_code(
-                re.compile(r"(?<![\w.>])return\s+([^;]+);"),
+                r"(?<![\w.>])return\s+([^;]+);",
                 lambda mm: "return &(%s);" % mm.group(1).strip(),
                 sub(m.body or ""))
             emit(sret.replace("&", "*"), "%s__star" % cname, params, sbody)
@@ -6300,7 +6311,12 @@ def _prev_word(text, idx):
 
 
 _STORAGE = re.compile(r"^(?:static|extern|inline|register|auto)\s+")
-_DIRECTIVE_LINE = re.compile(r"(?m)^[ \t]*#.*$")
+# `(?<![^\n])` rather than `(?m)^`, and `[^\n]*` rather than `.*`: the same
+# match, without the inline flag. This was the single pattern in the tree
+# outside `crust_re`'s subset (REGEX.md counts 284 of 285), so a lowered
+# cpprust aborted at startup naming it -- the engine compiles every pattern
+# up front rather than failing later in some particular file.
+_DIRECTIVE_LINE = re.compile(r"(?<![^\n])[ \t]*#[^\n]*")
 
 
 def _open_paren_before(text, close_idx):
@@ -7979,6 +7995,14 @@ def _check_by_value(text, cinfo, path):
     return byval
 
 
+# Hoisted rather than compiled inside the scan loop below. `re` caches
+# compiled patterns so this was never the cost it looks like, but a compile
+# expression used as a receiver is also the one spelling of `.match(text, i)`
+# that does not lower: the pattern has to be a name py2c can follow back to
+# its text.
+_BYVAL_CALL = re.compile(r"(?<![\w.>])(\w+)\s*\(")
+
+
 def _construct_byval_args(text, byval, cinfo, path):
     """Copy-construct the arguments a by-value owning parameter takes.
 
@@ -8040,7 +8064,7 @@ def _construct_byval_args(text, byval, cinfo, path):
 
     out, i = [], 0
     while i < len(text):
-        m = re.compile(r"(?<![\w.>])(\w+)\s*\(").match(text, i)
+        m = _BYVAL_CALL.match(text, i)
         if m is not None and m.group(1) in byval:
             got = one(m, m.group(1))
             if got is not None:
@@ -8212,7 +8236,10 @@ def _binop_refusal(rhs, scopes, type_info):
         return None
 
     # `a + "lit"` -- an operand with no address to take.
-    m = re.match(r"^(\w+)\s*(%s)\s*(.+)$" % ops, rhs, re.S)
+    # `[\s\S]` rather than `.` under `re.S`: the same match without the
+    # flag, which the lowering needs -- a flags argument is not lowered, and
+    # the call fell through to a substituted None.
+    m = re.match(r"^(\w+)\s*(%s)\s*([\s\S]+)$" % ops, rhs)
     if m and not re.match(r"^\w+$", m.group(3).strip()):
         cls, ent = _binop_of(m.group(1), m.group(2))
         if ent is not None:
@@ -8226,7 +8253,7 @@ def _binop_refusal(rhs, scopes, type_info):
     # `"lit" + a` -- C++ resolves this with a *free* operator, which this
     # subset has no notion of: an overloaded operator is a member, so its
     # left operand has to be an object of the class.
-    m = re.match(r"^(.+?)\s*(%s)\s*(\w+)$" % ops, rhs, re.S)
+    m = re.match(r"^([\s\S]+?)\s*(%s)\s*(\w+)$" % ops, rhs)
     if m and not re.match(r"^\w+$", m.group(1).strip()):
         cls, ent = _binop_of(m.group(3), m.group(2))
         if ent is not None:
@@ -8909,9 +8936,12 @@ def _strip_attribute_macros(text):
     Blanked rather than removed, so every offset already taken stays valid.
     """
     macros = set()
+    # The `re.M` anchors written out: `(?<![^\n])` is `^` at a line start
+    # and `(?![^\n])` is `$` at a line end. Same match, no flag.
     for m in re.finditer(
-            r"^[ \t]*#[ \t]*define[ \t]+(\w+)[ \t]*([^\r\n\\]*)$",
-            text, re.M):
+            r"(?<![^\n])[ \t]*#[ \t]*define[ \t]+(\w+)[ \t]*"
+            r"([^\r\n\\]*)(?![^\n])",
+            text):
         body = m.group(2).strip()
         if body == "" or body.startswith(("__declspec", "__attribute__")):
             macros.add(m.group(1))
@@ -9024,7 +9054,7 @@ def _mark_std_move(text):
     template taking `T &&`, which this subset does not have, so a file naming
     it is refused elsewhere rather than quietly moved from.
     """
-    return _sub_code(re.compile(r"\bstd\s*::\s*move\s*\("), "__cpp_move(",
+    return _sub_code(r"\bstd\s*::\s*move\s*\(", lambda _m: "__cpp_move(",
                      text)
 
 
@@ -11727,8 +11757,8 @@ def _std_prelude(text):
     # so every pass below sees one container rather than two names for it.
     for un, real in _STD_UNORDERED.items():
         if re.search(r"\b(?:std\s*::\s*)?%s\b" % un, probe):
-            text = _sub_code(re.compile(r"(?<![\w])%s(?![\w])" % un),
-                             real, text)
+            text = _sub_code(r"(?<![\w])%s(?![\w])" % un,
+                             lambda _m, _r=real: _r, text)
             wanted.add(real)
     probe = _blank_strings(_strip_comments(text))
     for name in ("string", "vector", "ownvector", "unique_ptr",
@@ -11762,7 +11792,7 @@ def _std_prelude(text):
     # meant -- and the more headers a file used, the further off it got.
     text = _STD_INCLUDE.sub(
         lambda m: "\n" if m.group(0).endswith("\n") else "", text)
-    text = _sub_code(re.compile(r"\bstd\s*::\s*"), "", text)
+    text = _sub_code(r"\bstd\s*::\s*", lambda _m: "", text)
     if "vector" in wanted or "ownvector" in wanted:
         # `vector<string>` needs `string`; supplying it is cheaper than
         # working out whether this source asks for that combination.
@@ -11986,8 +12016,8 @@ def _inline_lambda(text, look, m, close, captures, params, ret, body, n,
         snaps.append((cap, snap, ty))
 
     body = _sub_code(
-        re.compile(r"(?<![\w.>])(%s)(?![\w])"
-                   % "|".join(re.escape(c) for c, _s, _t in snaps)),
+        r"(?<![\w.>])(%s)(?![\w])"
+                   % "|".join(re.escape(c) for c, _s, _t in snaps),
         lambda mm: dict((c, s) for c, s, _t in snaps)[mm.group(1)],
         body) if snaps else body
 
@@ -12047,10 +12077,10 @@ def _inline_lambda(text, look, m, close, captures, params, ret, body, n,
 
     uid = "_cpp_lam%d" % n
     res = "%s_r" % uid
-    inner = _sub_code(re.compile(r"(?<![\w.>])return\s*;"), "break;", body)
+    inner = _sub_code(r"(?<![\w.>])return\s*;", lambda _m: "break;", body)
     if ret != "void":
         inner = _sub_code(
-            re.compile(r"(?<![\w.>])return\s+([^;]+);"),
+            r"(?<![\w.>])return\s+([^;]+);",
             lambda mm: "{ %s = %s; break; }" % (res, mm.group(1).strip()),
             inner)
         head = "%s %s; " % (ret, res)
@@ -12239,7 +12269,7 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
         # here derives from anything it is not told about. Stripped before
         # the class scans rather than inside each of them.
         text = _sub_code(
-            re.compile(r"(?<![\w])(class|struct)\s+(\w+)\s+final(?![\w])"),
+            r"(?<![\w])(class|struct)\s+(\w+)\s+final(?![\w])",
             lambda mm: "%s %s" % (mm.group(1), mm.group(2)), text)
         # Nested classes after namespaces (so the enclosing name is already
         # flattened) and before everything that reads a class.
@@ -12469,7 +12499,12 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
                     "class %s: it instantiates `%s`, which is declared below "
                     "it. A nested instantiation has to be complete first."
                     % (name, pair[0]))
-            record(*pair)
+            # Spelled out rather than `record(*pair)`: a starred call on a
+            # *lifted* nested function does not lower -- the rewriter
+            # prepends the captured values and leaves the star as one more
+            # argument, so the call arrives short. `pair` is a two-tuple and
+            # the line above already indexes it.
+            record(pair[0], pair[1])
             if pair not in seen:
                 seen.add(pair)
                 pending.append(pair)
@@ -12986,8 +13021,14 @@ def _parse_owning(spec):
     return out
 
 
-def main(argv):
-    args = list(argv)
+def main():
+    # Reads `sys.argv` here rather than taking the list as a parameter. Both
+    # spellings are the same under CPython, but only this one lowers: py2c
+    # gives `main` the C `(int argc, char** argv)` signature exactly when it
+    # sees `sys.argv` inside it, and a `main` that took the list instead was
+    # emitted as `obj main(obj argv)` -- reached, but never handed the real
+    # command line, so it printed its own usage and stopped.
+    args = list(sys.argv[1:])
     out_path = None
     owning = {}
     basedir = None
@@ -13117,4 +13158,4 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(main())

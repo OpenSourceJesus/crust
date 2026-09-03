@@ -22,8 +22,11 @@ cp "$src" "$tmp/$base.py"
 python3 "$root/tools/py2c.py" "$tmp/$base.py" > "$tmp/py2c.log" 2>&1 \
     || { cat "$tmp/py2c.log"; exit 1; }
 trap 'rm -rf "$tmp" "/tmp/$base.c"' EXIT
+# -lm: the runtime's expression evaluator (reached by `eval`) calls pow,
+# floor and fmod, so a test that touches it failed to link rather than to
+# compare.
 cc -std=c99 -w -I/tmp "/tmp/$base.c" /tmp/shivyc_rt.c \
-   -o "$tmp/native" 2>"$tmp/cc.log" || { cat "$tmp/cc.log"; exit 1; }
+   -o "$tmp/native" -lm 2>"$tmp/cc.log" || { cat "$tmp/cc.log"; exit 1; }
 "$tmp/native" > "$tmp/native.out"
 
 if ! diff -u "$tmp/cpython.out" "$tmp/native.out"; then

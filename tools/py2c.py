@@ -351,10 +351,12 @@ str  str_strip(str s, int mode);   /* 0 both, 1 left, 2 right                 */
 obj  str_split(str s, str sep);    /* sep NULL -> split on whitespace runs    */
 obj  str_partition(str s, str sep);/* (before, sep_or_'', after) as a 3-list  */
 obj  str_splitlines(str s);
+obj  str_rsplit(str s, str sep, long maxsplit);
 str  str_replace(str s, str a, str b);
 long str_find(str s, str sub, bool last);
 long str_find_from(str s, str sub, bool last, long start);
 long str_find_range(str s, str sub, bool last, long start, long end);
+long str_count(str s, str sub, long start, long end);
 bool str_isdigit(str s);
 bool str_isalpha(str s);
 bool str_isspace(str s);
@@ -1751,6 +1753,51 @@ obj str_split(str s, str sep) {
     list_append(r, OBJ_STR((str)p));
     return r;
 }
+/* `s.rsplit(sep, maxsplit)`: split from the right, at most `maxsplit` times,
+   so the *leftmost* piece keeps whatever separators are left over. A NULL or
+   empty `sep` splits on runs of whitespace, as `str_split` does. `maxsplit`
+   below zero means no limit. The pieces are appended left-to-right, matching
+   what Python returns. */
+obj str_rsplit(str s, str sep, long maxsplit) {
+    obj r = list_new(), tmp = list_new();
+    long n = (long)strlen(s), i, j, sl, k, cnt = 0;
+    if (!sep || !sep[0]) {
+        i = n;
+        while (i > 0 && (maxsplit < 0 || cnt < maxsplit)) {
+            while (i > 0 && isspace((unsigned char)s[i - 1])) i--;
+            if (i == 0) break;
+            j = i;
+            while (i > 0 && !isspace((unsigned char)s[i - 1])) i--;
+            { char* o = aalloc((size_t)(j - i) + 1);
+              memcpy(o, s + i, (size_t)(j - i)); o[j - i] = 0;
+              list_append(tmp, OBJ_STR(o)); cnt++; }
+        }
+        /* whatever is left, with trailing whitespace trimmed as Python does */
+        while (i > 0 && isspace((unsigned char)s[i - 1])) i--;
+        if (i > 0) { char* o = aalloc((size_t)i + 1);
+                     memcpy(o, s, (size_t)i); o[i] = 0;
+                     list_append(r, OBJ_STR(o)); }
+    } else {
+        sl = (long)strlen(sep);
+        i = n;
+        while (i >= sl && (maxsplit < 0 || cnt < maxsplit)) {
+            long hit = -1;
+            for (j = i - sl; j >= 0; j--)
+                if (memcmp(s + j, sep, (size_t)sl) == 0) { hit = j; break; }
+            if (hit < 0) break;
+            { char* o = aalloc((size_t)(i - hit - sl) + 1);
+              memcpy(o, s + hit + sl, (size_t)(i - hit - sl));
+              o[i - hit - sl] = 0;
+              list_append(tmp, OBJ_STR(o)); cnt++; }
+            i = hit;
+        }
+        { char* o = aalloc((size_t)i + 1);
+          memcpy(o, s, (size_t)i); o[i] = 0;
+          list_append(r, OBJ_STR(o)); }
+    }
+    for (k = pylen(tmp) - 1; k >= 0; k--) list_append(r, index_obj(tmp, k));
+    return r;
+}
 obj str_partition(str s, str sep) {
     /* str.partition: (head, sep, tail) at the first occurrence of sep, else
        (s, "", "").  Returned as a 3-element list for tuple unpacking. */
@@ -1785,6 +1832,22 @@ str str_replace(str s, str a, str b) {
     char* o = aalloc(ls + (lb > la ? (lb - la) : 0) * cnt + 1); char* w = o; const char* p = s; const char* q;
     while ((q = strstr(p, a))) { memcpy(w, p, q - p); w += q - p; memcpy(w, b, lb); w += lb; p = q + la; }
     strcpy(w, p); return o;
+}
+/* `s.count(sub[, start[, end]])`: non-overlapping occurrences in s[start:end).
+ * `end < 0` means to the end of the string. An empty `sub` counts the gaps,
+ * as Python does, which is len(window)+1 rather than an infinite loop. */
+long str_count(str s, str sub, long start, long end) {
+    long n = (long)strlen(s), ls = (long)strlen(sub), c = 0, i;
+    if (start < 0) start += n;
+    if (start < 0) start = 0;
+    if (end < 0 || end > n) end = n;
+    if (start > end) return 0;
+    if (ls == 0) return end - start + 1;
+    for (i = start; i + ls <= end; ) {
+        if (memcmp(s + i, sub, (size_t)ls) == 0) { c++; i += ls; }
+        else i++;
+    }
+    return c;
 }
 long str_find_from(str s, str sub, bool last, long start) {
     long n = (long)strlen(s);
@@ -2168,6 +2231,12 @@ INT_NAMES = {
 }
 INT_SUFFIXES = ("size", "offset", "count", "index", "len", "num", "idx")
 
+# Integer C types, narrowest first: a conditional with two integer branches
+# unifies to the widest of them. Shared by `ex_IfExp` (which emits the cast)
+# and `value_ctype` (which reports the result), because those two disagreeing
+# is exactly what leaves a raw scalar where an obj is expected.
+_IFEXP_INTS = ("bool", "char", "short", "int", "long")
+
 # Float-by-name: numeric scalars that are conventionally real-valued. Kept
 # narrow and domain-flavoured (stats / signals / geometry) so it does not
 # collide with the integer-heavy names above.
@@ -2352,6 +2421,41 @@ _LOCAL_MODULE_DIRS = []
 # is NOT in this unit (e.g. rasm_obj, imported only by the stubbed SHIVYC_RASM
 # path) would be an undefined-symbol link error, so such definers are skipped.
 _COMPILED_MODULES = set()
+
+
+_BUILD_FILES = []
+
+
+def set_build_files(paths):
+    """Remember the .py files being transpiled together.
+
+    `ambiguous_function_names` only walks `shivyc/`, which is right for the
+    compiler's own package and blind to everything else: two *other* modules
+    compiled into one program -- `tools/cpprust.py` and the
+    `tools/cpp_auto.py` it imports -- each defined `_match` and `_split_top`,
+    and the link failed on the duplicate symbols. Names defined in more than
+    one file of the actual build are ambiguous too, whatever directory they
+    sit in.
+    """
+    global _BUILD_FILES
+    _BUILD_FILES = [p for p in paths if p.endswith(".py")]
+
+
+def ambiguous_function_names_in_build():
+    """Top-level function names defined by more than one file of this build."""
+    seen, dup = {}, set()
+    for p in _BUILD_FILES:
+        try:
+            t = ast.parse(open(p, encoding="utf-8").read())
+        except Exception:
+            continue
+        mod = os.path.basename(p)[:-3]
+        for n in t.body:
+            if isinstance(n, ast.FunctionDef):
+                if seen.get(n.name, mod) != mod:
+                    dup.add(n.name)
+                seen.setdefault(n.name, mod)
+    return dup
 
 
 def set_compiled_modules(paths):
@@ -2638,7 +2742,8 @@ def _param_used_as_object(fn, name):
     not the scalar string/int its name suggests."""
     KNOWN = {"strip", "lstrip", "rstrip", "upper", "lower", "replace", "split",
              "partition",
-             "splitlines", "startswith", "endswith", "isdigit", "isalpha",
+             "splitlines", "rsplit", "startswith", "endswith", "isdigit",
+             "isalpha",
              "isspace", "isalnum", "find", "rfind", "rindex", "index",
              "join", "encode", "decode",
              "format", "count", "index", "append", "add", "update", "extend",
@@ -3017,6 +3122,17 @@ class _CallRewriter(ast.NodeTransformer):
         f = node.func
         if isinstance(f, ast.Name) and f.id in self.name_map:
             mangled, captures = self.name_map[f.id]
+            # `g(*seq)` on a lifted function does not lower: the captures are
+            # prepended and the star is left as one more argument, so the call
+            # arrives short. It usually fails at the C compiler, but it only
+            # *usually* does -- if the arities happen to line up it is a wrong
+            # call that compiles. Say so rather than emit it silently.
+            if any(isinstance(a, ast.Starred) for a in node.args):
+                sys.stderr.write(
+                    "py2c: line %s: `%s(*args)` on a nested function is not "
+                    "lowered -- its captured values are prepended, so the "
+                    "starred call arrives short. Spell the arguments out.\n"
+                    % (getattr(node, "lineno", "?"), f.id))
             node.func = ast.Name(id=mangled, ctx=ast.Load())
             node.args = [ast.Name(id=c, ctx=ast.Load()) for c in captures] \
                 + node.args
@@ -3176,6 +3292,14 @@ def lift_nested_functions(tree):
         # too. Without this, `def alloc(): ... taken(f) ...` (where only
         # `taken` reads `words`) lifted to `alloc(void)` yet emitted
         # `taken(words, f)`, and `words` was undeclared in that scope.
+        #
+        # *Mentioning* a sibling is enough; it need not be called. Handing one
+        # on as a value -- `_emit_class(cls, names, cinfo, tsub, ...)` in
+        # `cpprust.translate` -- lowers to a `make_closure` carrying that
+        # sibling's captured values, emitted right here in the caller's body.
+        # Walking only `ast.Call` missed those, so `translate__emit_one`
+        # built a closure over `tnames` and `wanted` while taking neither as
+        # a parameter: eleven undeclared identifiers across four functions.
         # Iterate to a fixed point so chains of any depth converge.
         changed = True
         while changed:
@@ -3186,9 +3310,10 @@ def lift_nested_functions(tree):
                 mangled, caps = name_map[sub.name]
                 inherited = set(caps)
                 for n in ast.walk(sub):
-                    if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) \
-                            and n.func.id in name_map and n.func.id != sub.name:
-                        inherited |= set(name_map[n.func.id][1])
+                    if isinstance(n, ast.Name) and \
+                            isinstance(n.ctx, ast.Load) and \
+                            n.id in name_map and n.id != sub.name:
+                        inherited |= set(name_map[n.id][1])
                 merged = sorted(inherited)
                 if merged != caps:
                     name_map[sub.name] = (mangled, merged)
@@ -4656,6 +4781,65 @@ static char* _ospath_join(char* a, char* b) {
     for (long i = 0; i < lb; i++) s[k++] = b[i];
     s[k] = 0; return s;
 }
+/* os.path.normpath: collapse '.', '..' and repeated slashes, textually --
+   the same lexical rule CPython uses, with no filesystem lookup, so a
+   symlink is not resolved (that is realpath's job, not this one). A leading
+   '/' is kept; an empty result is '.'. */
+static char* _ospath_normpath(char* p) {
+    long n = (long)strlen(p), i = 0, k = 0, nseg = 0, j;
+    int absolute = (n > 0 && p[0] == '/');
+    char* out;
+    long* starts; long* lens;
+    if (n == 0) return (char*)".";
+    starts = (long*)aalloc(sizeof(long) * (size_t)(n + 1));
+    lens = (long*)aalloc(sizeof(long) * (size_t)(n + 1));
+    while (i < n) {
+        long b;
+        while (i < n && p[i] == '/') i++;
+        b = i;
+        while (i < n && p[i] != '/') i++;
+        if (i == b) break;
+        if (i - b == 1 && p[b] == '.') continue;
+        if (i - b == 2 && p[b] == '.' && p[b + 1] == '.') {
+            /* '..' pops a segment, except past the root or past leading
+               '..' in a relative path, which have nothing to pop. */
+            if (nseg > 0 && !(lens[nseg - 1] == 2 &&
+                              p[starts[nseg - 1]] == '.' &&
+                              p[starts[nseg - 1] + 1] == '.')) {
+                nseg--; continue;
+            }
+            if (absolute) continue;
+        }
+        starts[nseg] = b; lens[nseg] = i - b; nseg++;
+    }
+    out = (char*)aalloc((size_t)n + 2);
+    if (absolute) out[k++] = '/';
+    for (j = 0; j < nseg; j++) {
+        long q;
+        if (j) out[k++] = '/';
+        for (q = 0; q < lens[j]; q++) out[k++] = p[starts[j] + q];
+    }
+    out[k] = 0;
+    if (k == 0) { out[0] = '.'; out[1] = 0; }
+    return out;
+}
+/* os.path.realpath: resolve symlinks through libc. libc's realpath(3)
+   requires the path to exist and returns NULL otherwise, where CPython's
+   falls back to a purely lexical answer -- so that is what happens here
+   too, via normpath(abspath(p)). Without the fallback a non-existent path
+   would come back NULL and be read as a string. */
+static char* _ospath_abspath(char* p);
+static char* _ospath_normpath(char* p);
+static char* _ospath_realpath(char* p) {
+    char _b[4096];
+    if (realpath(p, _b)) {
+        size_t n = strlen(_b);
+        char* s = (char*)aalloc(n + 1);
+        for (size_t i = 0; i <= n; i++) s[i] = _b[i];
+        return s;
+    }
+    return _ospath_normpath(_ospath_abspath(p));
+}
 /* os.getcwd(): arena-allocated so the result outlives the call, unlike a
    static buffer that the next call would overwrite. */
 static char* _os_getcwd(void) {
@@ -5132,6 +5316,7 @@ class Transpiler:
         self._regex_parsed = {}     # id -> parsed pattern struct (tier 1)
         self._regex_vm = {}         # id -> pattern string (tier 2: crust_re VM)
         self._regex_dyn = False     # a runtime-valued pattern needs the VM
+        self._regex_used = False    # module does regex at all (see _prescan)
         self._regex_escape = False  # re.escape used (needs no engine)
         self._subproc_used = False  # subprocess.run / tempfile.mkdtemp shim
         self._subproc_vars = set()  # names bound to a subprocess.run result
@@ -5400,8 +5585,36 @@ class Transpiler:
                 "for full rpython support." % ci.name)
         return warns
 
+    _MATCH_METHODS = ("group", "start", "end", "groups")
+
+    def _prescan_regex_use(self, tree):
+        """Does this module use `re` anywhere? Set before anything is emitted.
+
+        `.group()` on a match lowers only when the module is known to do
+        regex, and that was decided by flags set as a *side effect* of
+        lowering a regex call. So a helper defined above the first `re.` call
+        in the file -- which is where a `re.sub` callback naturally lives --
+        was emitted before the flag was set, and `m.group(0)` came out as a
+        bare `group(m, 0)` that C defaulted to returning int.
+
+        Deliberately a separate flag from `_regex_dyn`: that one also pulls
+        in the VM bridge, and a module whose patterns all fit the specialized
+        matchers should still link no engine.
+        """
+        if "re" not in getattr(self, "modules", set()) and \
+                not any(isinstance(n, ast.Import) and
+                        any(a.name == "re" for a in n.names)
+                        for n in ast.walk(tree)):
+            return
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Attribute) and \
+                    n.attr in self._MATCH_METHODS:
+                self._regex_used = True
+                return
+
     def run(self, tree):
         global KNOWN_CLASSES, VTABLE_METHODS
+        self._prescan_regex_use(tree)
         rewrite_class_lambdas(tree)
         self._rewrite_thread_decorators(tree)
         if self.stdlib_root:
@@ -5411,7 +5624,8 @@ class Transpiler:
         self.closure_values_needed = set()
         self.classes, self.class_order, vt = collect_classes(tree)
         self.ambiguous = ambiguous_class_names(self.base_dir)
-        self.ambiguous_funcs = ambiguous_function_names(self.base_dir)
+        self.ambiguous_funcs = set(ambiguous_function_names(self.base_dir))
+        self.ambiguous_funcs |= ambiguous_function_names_in_build()
         for ci in self.class_order:     # qualify local colliding class symbols
             ci.csym = class_csym(ci.name, self.modname, self.ambiguous)
         self.class_typedef_names = {ci.csym for ci in self.class_order}
@@ -6602,7 +6816,8 @@ class Transpiler:
 
     _CONTAINER_METHODS = {
         "strip", "lstrip", "rstrip", "upper", "lower", "replace", "split",
-        "partition", "splitlines", "startswith", "endswith", "isdigit",
+        "partition", "splitlines", "rsplit", "startswith", "endswith",
+        "isdigit",
         "isalpha", "isspace", "isalnum", "find", "rfind", "rindex", "index",
         "join", "encode",
         "decode", "format", "count", "index", "append", "add", "update",
@@ -9370,8 +9585,17 @@ class Transpiler:
         # unit has no _entry.c to do that, so main runs its own module init
         # first -- otherwise module globals stay zeroed and, e.g., a global
         # list reads back as empty. The init is idempotent.
-        if node.name == "main" and self.mod_globals:
-            self.emit("%s_init();" % self.cmod)
+        if node.name == "main":
+            # Imported modules first: their globals are just as zeroed until
+            # their own init runs, and this module's code reads them. cpprust
+            # clears `cpp_auto.CLANG_USED` at the top of a translation, which
+            # segfaulted on a list that had never been built. Each init is
+            # idempotent, so naming one twice is harmless.
+            for _m in sorted(self.modules):
+                if _m in _COMPILED_MODULES and _m != self.modname:
+                    self.emit("%s_init();" % _m)
+            if self.mod_globals:
+                self.emit("%s_init();" % self.cmod)
         self.emit_hoisted_body(body)
         self.indent -= 1
         self.emit("}")
@@ -10020,6 +10244,14 @@ class Transpiler:
                     elif isinstance(el, ast.Subscript):
                         lines.append("subscript_set(%s, %s, %s);" % (
                             self.expr(el.value), self.wrap_obj(el.slice), src))
+                    elif isinstance(el, (ast.Tuple, ast.List)):
+                        # A *nested* target: `(a, b), c = ...`. Falling through
+                        # to the generic branch below asked `expr()` for a
+                        # tuple as an lvalue, which emitted the element names
+                        # without ever declaring them -- gcc then reported
+                        # every one of them undeclared. `bind_target` already
+                        # recurses through Tuple/List, so hand it the element.
+                        lines += self.bind_target(el, src)
                     elif isinstance(el, ast.Attribute):
                         # Unpack the i-th element into this attribute. Must use
                         # `src` (index_obj(tmp, i)), NOT the whole RHS node:
@@ -10251,10 +10483,23 @@ class Transpiler:
                 and node.func.value.id == "re" \
                 and node.func.attr in ("finditer", "findall"):
             return OBJ
+        # `re.sub(...)` at module level lowers to `_cre_sub`, which returns a
+        # C string -- the same type the `pat.sub` method form above reports.
+        # Without this the call reads as obj, so an assignment into an obj
+        # local emitted the raw `char*` with no `OBJ_STR` around it and the
+        # generated C did not compile. Sixteen of `tools/cpprust.py`'s
+        # seventy-six errors were this one rule. `re.escape` is *not*
+        # listed: `_re_escape` returns obj, and claiming char* here would
+        # trade this bug for its mirror image.
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                and isinstance(node.func.value, ast.Name) \
+                and node.func.value.id == "re" \
+                and node.func.attr == "sub":
+            return "char*"
         # `.start()`/`.end()` on a match are byte offsets, so they are long,
         # not obj -- checked before the obj group below.
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
-                and (self._regex_ids or self._regex_dyn) \
+                and (self._regex_ids or self._regex_dyn or self._regex_used) \
                 and node.func.attr in ("start", "end") \
                 and node.func.attr not in self.method_owners \
                 and node.func.attr not in self.xmethod_owners:
@@ -10266,7 +10511,7 @@ class Transpiler:
             # obj arithmetic on a long.
             return "long"
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
-                and (self._regex_ids or self._regex_dyn) \
+                and (self._regex_ids or self._regex_dyn or self._regex_used) \
                 and node.func.attr in ("search", "match", "group") \
                 and node.func.attr not in self.method_owners \
                 and node.func.attr not in self.xmethod_owners:
@@ -10280,9 +10525,10 @@ class Transpiler:
             if isinstance(_f.value, ast.Attribute) and \
                     isinstance(_f.value.value, ast.Name) and \
                     _f.value.value.id == "os" and _f.value.attr == "path":
-                if _f.attr in ("dirname", "basename", "abspath", "join"):
+                if _f.attr in ("dirname", "basename", "abspath", "join",
+                               "normpath", "realpath"):
                     return "char*"       # returns a C string
-                if _f.attr == "exists":
+                if _f.attr in ("exists", "isfile", "isdir"):
                     return "int"
             if isinstance(_f.value, ast.Name) and _f.value.id == "os" and \
                     _f.attr == "getcwd":
@@ -10330,14 +10576,26 @@ class Transpiler:
             return OBJ
         if isinstance(node, ast.IfExp):
             bt = self.value_ctype(node.body)
-            return bt if bt == self.value_ctype(node.orelse) else OBJ
+            ot = self.value_ctype(node.orelse)
+            if bt == ot:
+                return bt
+            # Must agree with `ex_IfExp`, which unifies two integer branches
+            # to the wider integer rather than boxing them. Reporting obj here
+            # while it emits a `long` is the disagreement that leaves a raw
+            # scalar where an obj was expected.
+            if bt in _IFEXP_INTS and ot in _IFEXP_INTS:
+                return _IFEXP_INTS[max(_IFEXP_INTS.index(bt),
+                                       _IFEXP_INTS.index(ot))]
+            return OBJ
         if isinstance(node, ast.BoolOp):
             types = [self.value_ctype(v) for v in node.values]
             return types[0] if len(set(types)) == 1 and \
                 types[0] in ("int", "bool", "char*") else OBJ
         if isinstance(node, ast.Subscript):
             if self._is_sys_argv(node.value):
-                return "char*"
+                # One argument is a C string; a *slice* of them is a list.
+                # Reporting char* for both wrapped the list in `OBJ_STR`.
+                return OBJ if isinstance(node.slice, ast.Slice) else "char*"
             if isinstance(node.slice, ast.Slice):
                 return OBJ
             # Typed list/dict element type, resolved via static_type so it works
@@ -10866,6 +11124,21 @@ class Transpiler:
     def st_Delete(self, node):
         out = []
         for t in node.targets:
+            # `del xs[a:b]` is `xs[a:b] = []`, and the helper for that already
+            # exists. It used to fall through to the no-op comment below and
+            # silently do nothing: `tools/cpprust.py` strips a consumed option
+            # with `del args[i:i + 2]`, so every flag stayed in the list and
+            # the program printed its own usage instead of running.
+            if isinstance(t, ast.Subscript) and isinstance(t.slice, ast.Slice) \
+                    and t.slice.step is None:
+                lo = self.as_long(t.slice.lower) \
+                    if t.slice.lower is not None else "0"
+                hi = self.as_long(t.slice.upper) \
+                    if t.slice.upper is not None else \
+                    "pylen(%s)" % self.expr(t.value)
+                out.append("list_set_slice(%s, %s, %s, list_new());"
+                           % (self.expr(t.value), lo, hi))
+                continue
             if isinstance(t, ast.Subscript) and not isinstance(t.slice,
                                                                ast.Slice):
                 out.append("del_item(%s, %s);" % (self.wrap_obj(t.value),
@@ -10926,6 +11199,13 @@ class Transpiler:
                 txt = ast.unparse(t)
             except Exception:
                 txt = "?"
+            # A `del` of a *container element* that reaches here changes what
+            # the program does, and the comment made that invisible. Reclaim
+            # of a plain local is genuinely a no-op here and stays quiet.
+            if isinstance(t, ast.Subscript):
+                self._warn_unsupported(
+                    getattr(node, "lineno", 0), "del %s" % txt, "nothing",
+                    "the element is not removed")
             out.append("/* del %s */" % txt.replace("*/", "* /"))
         return out
 
@@ -12081,7 +12361,15 @@ class Transpiler:
         defs = self.defaults_for(fndef, False)
         creg = self.coerce_args(self.func_params[fn][:n_reg], pos, defs)
         wvar = [self.wrap_obj(a) for a in var]
-        parts = list(creg) + [kw, str(len(wvar))] + wvar
+        parts = list(creg)
+        # The kwargs dict only if the callee actually declares `**kwargs`:
+        # `param_list` emits that slot under the same condition, so passing it
+        # unconditionally handed `def probe(*texts)` -- signature
+        # `(int _n_texts, ...)` -- a leading `dict_new()` that the count then
+        # sat behind, and gcc rejected the call.
+        if fndef.args.kwarg:
+            parts.append(kw)
+        parts += [str(len(wvar))] + wvar
         return "%s(%s)" % (self.fnsym(fn), ", ".join(parts))
 
     def _lower_starred_local_call(self, fn, fndef, node):
@@ -12220,6 +12508,12 @@ class Transpiler:
                 if f.attr == "abspath":
                     self._ossys_used = True
                     return "_ospath_abspath(%s)" % self._coerce_str_arg(node, 0)
+                if f.attr == "normpath":
+                    self._ossys_used = True
+                    return "_ospath_normpath(%s)" % self._coerce_str_arg(node, 0)
+                if f.attr == "realpath":
+                    self._ossys_used = True
+                    return "_ospath_realpath(%s)" % self._coerce_str_arg(node, 0)
                 if f.attr == "exists":
                     self._ossys_used = True
                     return "_ospath_exists(%s)" % self._coerce_str_arg(node, 0)
@@ -12599,6 +12893,15 @@ class Transpiler:
             if fn == "list":
                 return "pylist(%s)" % self.wrap_obj(node.args[0]) if node.args \
                     else "list_new()"
+            # A tuple is a list in this runtime -- `tuple` maps to T_LIST in
+            # the type table already -- so `tuple(xs)` is the same materialise
+            # as `list(xs)`. It had no lowering at all, so py2c emitted a bare
+            # `tuple(...)` that C defaulted to returning int; three of
+            # `tools/cpprust.py`'s errors were that, including a `return
+            # tuple(names)` from an obj-returning function.
+            if fn == "tuple":
+                return "pylist(%s)" % self.wrap_obj(node.args[0]) if node.args \
+                    else "list_new()"
             if fn == "dict":
                 if not node.args:
                     return "dict_new()"
@@ -12640,6 +12943,17 @@ class Transpiler:
                 return "0"
             if fn == "abs" and node.args:
                 return "pyabs(%s)" % self.as_long(node.args[0])
+            # `eval(expr, {"__builtins__": {}}, {})` -- the sandboxing spelling.
+            # Lowered only when both environments are *literal* dicts binding
+            # no names, because then they provably cannot affect the result:
+            # with nothing bound, an expression either references no name (and
+            # evaluates the same either way) or fails either way. Anything with
+            # a real environment still warns rather than silently losing it.
+            if fn == "eval" and len(node.args) == 3 and not node.keywords \
+                    and self._is_nameless_env(node.args[1]) \
+                    and self._is_nameless_env(node.args[2]):
+                self._uses_eval = True
+                return "rpy_eval(%s)" % self.as_str(node.args[0])
             if fn == "eval" and len(node.args) == 1 and not node.keywords:
                 # Untyped eval: the MicroPython result is boxed into an obj.
                 # `x: T = eval(...)` is special-cased in st_AnnAssign to pull the
@@ -13093,6 +13407,22 @@ class Transpiler:
                     func.attr not in self.method_owners:
                 return "list_index(%s, %s)" % (self.wrap_obj(func.value),
                                                self.wrap_obj(node.args[0]))
+            # `s.count(sub, start[, end])` -- a string count over a window.
+            # Only the 2- and 3-argument forms: with one argument the receiver
+            # could equally be a list, and that already lowers below. The
+            # windowed spelling is unambiguous, and had no lowering at all --
+            # py2c emitted a bare `count(...)` that C defaulted to returning
+            # int. `tools/cpprust.py` counts newlines that way to turn an
+            # offset into a line number.
+            if func.attr == "count" and 2 <= len(node.args) <= 3 and \
+                    func.attr not in self.method_owners:
+                return "str_count(%s, %s, %s, %s)" % (
+                    self.coerce_to("char*", func.value, self.expr(func.value)),
+                    self.coerce_to("char*", node.args[0],
+                                   self.expr(node.args[0])),
+                    self.coerce_to("int", node.args[1],
+                                   self.expr(node.args[1])),
+                    self._re_endpos(node, 2))
             if func.attr == "count" and len(node.args) == 1 and \
                     func.attr not in self.method_owners:
                 return "list_count(%s, %s)" % (self.wrap_obj(func.value),
@@ -13279,6 +13609,20 @@ class Transpiler:
                                            self.expr(node.args[0])),
                             self.coerce_to("char*", node.args[1],
                                            self.expr(node.args[1])),
+                            self.coerce_to("char*", node.args[2],
+                                           self.expr(node.args[2])))
+                    # A replacement reached through a value: a function taking
+                    # the match, or a string this pass cannot prove is one.
+                    # `_cre_sub_any` reads the tag and does the right thing,
+                    # which is better than deciding here -- both spellings
+                    # reach this point and only the runtime knows which.
+                    if modname == "re" and func.attr == "sub" \
+                            and len(node.args) == 3:
+                        self._regex_dyn = True
+                        return "_cre_sub_any(%s, %s, %s)" % (
+                            self.coerce_to("char*", node.args[0],
+                                           self.expr(node.args[0])),
+                            self.wrap_obj(node.args[1]),
                             self.coerce_to("char*", node.args[2],
                                            self.expr(node.args[2])))
                     # struct.pack/unpack subset (see STRUCT_PRELUDE)
@@ -13556,16 +13900,28 @@ class Transpiler:
                 _a0 = (self.coerce_to("char*", node.args[0],
                                       self.expr(node.args[0]))
                        if node.args else None)
-                if func.attr in ("search", "match") and len(node.args) == 2:
+                # `pat.search(t, pos)` and `pat.search(t, pos, endpos)`.
+                # The endpos form is what lets a caller window a scan without
+                # slicing the subject, which is the only way a lookbehind at
+                # `pos` can still see what precedes it.
+                if func.attr in ("search", "match") and \
+                        2 <= len(node.args) <= 3:
                     self._regex_dyn = True
-                    return "_cre_at(%s, %s, %s, %s)" % (
+                    return "_cre_at(%s, %s, %s, %s, %s)" % (
                         _pt, _a0,
                         self.coerce_to("int", node.args[1],
                                        self.expr(node.args[1])),
+                        self._re_endpos(node, 2),
                         "1" if func.attr == "match" else "0")
-                if func.attr == "finditer" and len(node.args) == 1:
+                if func.attr == "finditer" and 1 <= len(node.args) <= 3:
                     self._regex_dyn = True
-                    return "_cre_finditer(%s, %s)" % (_pt, _a0)
+                    if len(node.args) == 1:
+                        return "_cre_finditer(%s, %s)" % (_pt, _a0)
+                    return "_cre_finditer_at(%s, %s, %s, %s)" % (
+                        _pt, _a0,
+                        self.coerce_to("int", node.args[1],
+                                       self.expr(node.args[1])),
+                        self._re_endpos(node, 2))
                 if func.attr == "findall" and len(node.args) == 1:
                     self._regex_dyn = True
                     return "_cre_findall(%s, %s)" % (_pt, _a0)
@@ -13576,18 +13932,29 @@ class Transpiler:
                         _pt, _a0,
                         self.coerce_to("char*", node.args[1],
                                        self.expr(node.args[1])))
+                if func.attr == "sub" and len(node.args) == 2:
+                    self._regex_dyn = True
+                    return "_cre_sub_any(%s, %s, %s)" % (
+                        _pt, self.wrap_obj(node.args[0]),
+                        self.coerce_to("char*", node.args[1],
+                                       self.expr(node.args[1])))
             if isinstance(func.value, ast.Name) \
                     and func.value.id in self._regex_dyn_vars:
-                if func.attr in ("search", "match") and 1 <= len(node.args) <= 2:
+                if func.attr in ("search", "match") and 1 <= len(node.args) <= 3:
                     anc = "1" if func.attr == "match" else "0"
                     txt = self.coerce_to("char*", node.args[0],
                                          self.expr(node.args[0]))
                     pat = self.coerce_to("char*", func.value,
                                          self.expr(func.value))
-                    if len(node.args) == 2:
+                    # pos, and optionally endpos -- the same window the
+                    # constant-pattern branch above accepts. A pattern built
+                    # at runtime is no less entitled to it, and cpprust builds
+                    # one per lambda name before scanning a region for it.
+                    if len(node.args) >= 2:
                         pos = self.coerce_to("int", node.args[1],
                                              self.expr(node.args[1]))
-                        return "_cre_at(%s, %s, %s, %s)" % (pat, txt, pos, anc)
+                        return "_cre_at(%s, %s, %s, %s, %s)" % (
+                            pat, txt, pos, self._re_endpos(node, 2), anc)
                     return "_cre_dyn(%s, %s, %s)" % (pat, txt, anc)
                 if func.attr == "findall" and len(node.args) == 1:
                     return "_cre_findall(%s, %s)" % (
@@ -13604,15 +13971,23 @@ class Transpiler:
                                        self.expr(node.args[0])),
                         self.coerce_to("char*", node.args[1],
                                        self.expr(node.args[1])))
+                if func.attr == "sub" and len(node.args) == 2:
+                    return "_cre_sub_any(%s, %s, %s)" % (
+                        self.coerce_to("char*", func.value,
+                                       self.expr(func.value)),
+                        self.wrap_obj(node.args[0]),
+                        self.coerce_to("char*", node.args[1],
+                                       self.expr(node.args[1])))
                 if func.attr == "finditer" and len(node.args) == 1:
                     return "_cre_finditer(%s, %s)" % (
                         self.coerce_to("char*", func.value,
                                        self.expr(func.value)),
                         self.coerce_to("char*", node.args[0],
                                        self.expr(node.args[0])))
-            if (self._regex_ids or self._regex_dyn) and (_re_recv or (
-                    func.attr not in self.method_owners
-                    and func.attr not in self.xmethod_owners)):
+            if (self._regex_ids or self._regex_dyn or self._regex_used) and \
+                    (_re_recv or (
+                        func.attr not in self.method_owners
+                        and func.attr not in self.xmethod_owners)):
                 if func.attr in ("search", "match") and len(node.args) == 1:
                     anc = "1" if func.attr == "match" else "0"
                     txt = self.coerce_to("char*", node.args[0],
@@ -14364,6 +14739,21 @@ class Transpiler:
         out = []
         out.append("/* ---- crust_re: regex VM for patterns outside the "
                    "specializer's subset ---- */")
+        # The engine is inlined into every module that needs it, so two such
+        # modules in one program define the same symbols twice and the link
+        # fails -- which is exactly what `cpprust.py` plus the `cpp_auto.py`
+        # it imports did. Give this copy module-local names. A #define is
+        # enough because the preprocessor matches whole identifiers, so
+        # `crust_re_exec` is renamed without disturbing the `crust_re` struct
+        # tag, and the header and source below agree because both are
+        # rewritten by the same defines.
+        _pub = sorted(set(re.findall(r"\b(crust_re_[a-z_]+)\s*\(",
+                                     crust_re_src.HEADER)))
+        if _pub:
+            out.append("/* module-local names: one program may inline this "
+                       "engine more than once. */")
+            for _n in _pub:
+                out.append("#define %s %s__%s" % (_n, self.modname, _n))
         out.extend(crust_re_src.HEADER.splitlines())
         out.extend(crust_re_src.SOURCE.splitlines())
         out.append("")
@@ -14468,7 +14858,8 @@ class Transpiler:
         out.append("/* pat.search(text, pos): match from an offset. Spans are")
         out.append(" * reported relative to the whole subject, as CPython does,")
         out.append(" * so a caller stepping through with .end() keeps working. */")
-        out.append("static obj _cre_at(char* pat, char* t, int pos, int anc) {")
+        out.append("/* `end` is CPython's endpos: -1 means the whole subject. */")
+        out.append("static obj _cre_at(char* pat, char* t, int pos, int end, int anc) {")
         out.append("    int caps[128];")
         out.append("    crust_re* h;")
         out.append("    long len, i;")
@@ -14476,33 +14867,51 @@ class Transpiler:
         out.append("    obj m;")
         out.append("    if (!pat || !t) return OBJ_NONE;")
         out.append("    len = (long)strlen(t);")
+        out.append("    if (end >= 0 && (long)end < len) len = (long)end;")
         out.append("    if (pos < 0) pos = 0;")
         out.append("    if (pos > len) return OBJ_NONE;")
         out.append("    h = _cre_dyn_get(pat);")
         out.append("    ng = crust_re_ngroups(h);")
         out.append("    if (2 * (ng + 1) > 128) return OBJ_NONE;")
-        out.append("    rc = crust_re_exec(h, t + pos, (size_t)(len - pos), anc,")
-        out.append("                       caps, 2 * (ng + 1));")
+        # `crust_re_exec_from`, not `crust_re_exec` over `t + pos`: the
+        # engine has to keep the whole subject so a lookbehind at `pos` can
+        # read what precedes it. Slicing made `(?<=;)x` against ";x" from
+        # offset 1 report no match where CPython matches -- a wrong answer,
+        # not a missing feature, and `tools/cpprust.py` windows its scans
+        # precisely so the lookbehind sees the character before the window.
+        # Offsets now come back absolute, so the `pos +` adjustments go too.
+        out.append("    rc = crust_re_exec_from(h, t, (size_t)len, pos, anc,")
+        out.append("                            caps, 2 * (ng + 1));")
         out.append("    if (rc != CRUST_RE_MATCH) return OBJ_NONE;")
         out.append("    m = list_new();")
         out.append("    for (i = 0; i <= ng; i++)")
-        out.append("        list_append(m, _re_slice(t, pos + caps[2*i], pos + caps[2*i+1]));")
+        out.append("        list_append(m, _re_slice(t, caps[2*i], caps[2*i+1]));")
         out.append("    for (i = 0; i <= ng; i++) {")
-        out.append("        list_append(m, OBJ_INT(caps[2*i] < 0 ? -1 : pos + caps[2*i]));")
-        out.append("        list_append(m, OBJ_INT(caps[2*i+1] < 0 ? -1 : pos + caps[2*i+1]));")
+        out.append("        list_append(m, OBJ_INT(caps[2*i]));")
+        out.append("        list_append(m, OBJ_INT(caps[2*i+1]));")
         out.append("    }")
         out.append("    return m;")
         out.append("}")
         out.append("")
+        out.append("static obj _cre_finditer_at(char* pat, char* t, int pos, int end);")
+        out.append("")
         out.append("/* re.finditer -> a LIST of match values, so `for m in ...`")
         out.append(" * iterates it with no iterator protocol needed. */")
         out.append("static obj _cre_finditer(char* pat, char* t) {")
+        out.append("    return _cre_finditer_at(pat, t, 0, -1);")
+        out.append("}")
+        out.append("")
+        out.append("/* finditer over text[pos..end), with the whole subject")
+        out.append(" * still visible to lookbehind -- see crust_re_exec_from. */")
+        out.append("static obj _cre_finditer_at(char* pat, char* t, int pos, int end) {")
         out.append("    obj res = list_new();")
-        out.append("    long off = 0, len;")
+        out.append("    long off, len;")
         out.append("    if (!pat || !t) return res;")
         out.append("    len = (long)strlen(t);")
+        out.append("    if (end >= 0 && (long)end < len) len = (long)end;")
+        out.append("    off = pos < 0 ? 0 : (long)pos;")
         out.append("    while (off <= len) {")
-        out.append("        obj m = _cre_at(pat, t, (int)off, 0);")
+        out.append("        obj m = _cre_at(pat, t, (int)off, end, 0);")
         out.append("        long e, s;")
         out.append("        if (IS_NONE(m)) break;")
         out.append("        list_append(res, m);")
@@ -14538,6 +14947,41 @@ class Transpiler:
         out.append("            off += caps[1] + 1;")
         out.append("        } else {")
         out.append("            off += caps[1];")
+        out.append("        }")
+        out.append("    }")
+        out.append("    if (off <= len) list_append(parts, _re_slice(t, off, len));")
+        out.append("    return pyjoin(\"\", parts);")
+        out.append("}")
+        out.append("")
+        out.append("/* `re.sub` where the replacement is a *value* rather than a")
+        out.append(" * literal: either a string, or a function taking the match.")
+        out.append(" * Which one is decided here rather than at translation time,")
+        out.append(" * because a repl reached through a variable can be either and")
+        out.append(" * the tag says so exactly. The match handed to the function is")
+        out.append(" * the same list every other frontend builds, so `m.group(1)`")
+        out.append(" * inside it works like anywhere else. */")
+        out.append("static char* _cre_sub_any(char* pat, obj rep, char* t) {")
+        out.append("    obj parts = list_new();")
+        out.append("    long off = 0, len, s, e;")
+        out.append("    if (!pat || !t) return \"\";")
+        out.append("    if (rep.tag == T_STR) return _cre_sub(pat, AS_STR(rep), t);")
+        out.append("    len = (long)strlen(t);")
+        out.append("    while (off <= len) {")
+        out.append("        obj m = _cre_at(pat, t, (int)off, -1, 0);")
+        out.append("        obj r;")
+        out.append("        if (IS_NONE(m)) break;")
+        out.append("        s = _re_span(m, 0, 0);")
+        out.append("        e = _re_span(m, 0, 1);")
+        out.append("        list_append(parts, _re_slice(t, off, s));")
+        out.append("        r = call_obj_a(rep, &m, 1);")
+        out.append("        list_append(parts, OBJ_STR(AS_STR(r)));")
+        out.append("        if (e == s) {")
+        out.append("            /* zero-width: emit the byte stepped over, or the")
+        out.append("             * loop would drop it. */")
+        out.append("            if (e < len) list_append(parts, _re_slice(t, e, e + 1));")
+        out.append("            off = e + 1;")
+        out.append("        } else {")
+        out.append("            off = e;")
         out.append("        }")
         out.append("    }")
         out.append("    if (off <= len) list_append(parts, _re_slice(t, off, len));")
@@ -14628,6 +15072,19 @@ class Transpiler:
                 target.startswith("_tlist_") and target.endswith("*"):
             return self._typed_list_literal(target, value_node)
         vt = self.value_ctype(value_node)
+        # Checked before the `target == vt` shortcut below: a call that lowers
+        # to a scalar helper is not an obj however `value_ctype` reads it, and
+        # that shortcut would hand back the unwrapped `long` from
+        # `str_find_from` for an obj target.
+        if target == OBJ and self._scalar_helper_ct(rendered) is not None:
+            return "OBJ_INT(%s)" % rendered
+        # And the mirror image: coercing a scalar helper *to* a scalar is a
+        # no-op, but `value_ctype` reads it as obj so the int path below wrapped
+        # it in `AS_INT(...)` -- reading the `.u.i` field of something that is
+        # already a long.
+        if target in ("int", "long") and \
+                self._scalar_helper_ct(rendered) is not None:
+            return rendered
         if target == vt:
             return rendered
         if target == OBJ:
@@ -14677,18 +15134,72 @@ class Transpiler:
             return self.wrap_obj(value_node)
         return rendered
 
+    # Helpers whose C signature returns a raw scalar rather than an obj.
+    # Keyed on the emitted call rather than on the AST, because the same
+    # Python spelling can lower either way: `s.index(x)` becomes
+    # `str_find_from` (a long) while `xs.index(v)` becomes `list_index` (an
+    # obj already). The receiver's static type does not tell them apart --
+    # both are plain `obj` parameters in the generated C -- but the helper
+    # py2c chose does, exactly.
+    _SCALAR_HELPERS = ("str_find_from(", "str_find_range(", "str_count(")
+
+    def _is_nameless_env(self, node):
+        """A literal dict that binds no name an expression could read.
+
+        `{}` and `{"__builtins__": {}}` both qualify: the second binds only
+        the builtins slot, whose whole purpose there is to be empty. Anything
+        else -- a variable, a dict with real entries -- does not.
+        """
+        if not isinstance(node, ast.Dict):
+            return False
+        for k, v in zip(node.keys, node.values):
+            if not (isinstance(k, ast.Constant) and k.value == "__builtins__"):
+                return False
+            if not (isinstance(v, ast.Dict) and not v.keys):
+                return False
+        return True
+
+    def _re_endpos(self, node, idx):
+        """The `endpos` argument at `idx`, or -1 when it is not given."""
+        if len(node.args) <= idx:
+            return "-1"
+        return self.coerce_to("int", node.args[idx], self.expr(node.args[idx]))
+
+    def _scalar_helper_ct(self, rendered):
+        """C type of `rendered` when it calls a scalar-returning helper."""
+        if isinstance(rendered, str) and rendered.startswith(
+                self._SCALAR_HELPERS):
+            return "int"
+        return None
+
     def wrap_obj(self, node):
         if isinstance(node, ast.IfExp):
             bt = self.value_ctype(node.body)
             ot = self.value_ctype(node.orelse)
             be = self.expr(node.body)
             oe = self.expr(node.orelse)
-            if bt != ot or be.startswith("mp_") or oe.startswith("mp_"):
+            # Two integer branches are unified to a scalar by `ex_IfExp`, so
+            # the result still needs boxing here -- falling through to the
+            # ordinary path below does that. Bailing out returned the raw
+            # `long` where an obj was expected.
+            _both_int = bt in _IFEXP_INTS and ot in _IFEXP_INTS
+            if (bt != ot and not _both_int) or be.startswith("mp_") \
+                    or oe.startswith("mp_"):
                 return self.expr(node)
+        # Checked before the obj bail-out below, not after: a scalar helper in
+        # an argument position (`obj_add(i, str_find_from(..))`) needs wrapping
+        # just as much as one being assigned, and `value_ctype` reads it as obj
+        # -- which is exactly the bail-out that used to return it raw. Rendered
+        # once and reused, so `expr` is not run twice for its side effects.
+        _rendered = None
+        if isinstance(node, ast.Call):
+            _rendered = self.expr(node)
+            if self._scalar_helper_ct(_rendered) is not None:
+                return "OBJ_INT(%s)" % _rendered
         if self.is_obj_word(node) or self.value_ctype(node) == OBJ:
-            return self.expr(node)
+            return _rendered if _rendered is not None else self.expr(node)
         t = self.value_ctype(node)
-        s = self.expr(node)
+        s = _rendered if _rendered is not None else self.expr(node)
         if s.startswith(("mp_call_", "mp_getattr", "mp_hasattr")):
             return s
         if isinstance(node, ast.Call) and self.value_ctype(node) == OBJ:
@@ -15156,6 +15667,16 @@ class Transpiler:
         if m == "split":
             sep = self.as_str(a[0]) if a else "NULL"
             return "str_split(%s, %s)" % (self.as_str(func.value), sep)
+        if m == "rsplit":
+            # `sep=None` means whitespace, which the runtime spells as a NULL
+            # separator -- passing the literal None through `as_str` would
+            # hand it a null obj instead and read the tag off it.
+            none_sep = a and isinstance(a[0], ast.Constant) \
+                and a[0].value is None
+            sep = "NULL" if (not a or none_sep) else self.as_str(a[0])
+            mx = self.as_long(a[1]) if len(a) > 1 else "-1"
+            return "str_rsplit(%s, %s, %s)" % (
+                self.as_str(func.value), sep, mx)
         if m == "partition":
             return "str_partition(%s, %s)" % (self.as_str(func.value), self.as_str(a[0]))
         if m == "splitlines":
@@ -15200,7 +15721,8 @@ class Transpiler:
         return None
 
     STR_METHODS = {"startswith", "endswith", "strip", "lstrip", "rstrip",
-                   "split", "partition", "splitlines", "replace", "find",
+                   "split", "rsplit", "partition", "splitlines", "replace",
+                   "find",
                    "rfind", "rindex", "index", "isdigit", "isalpha",
                    "isspace", "isalnum", "lower", "upper", "join", "encode"}
 
@@ -15489,6 +16011,20 @@ class Transpiler:
     def ex_Subscript(self, node):
         if self._is_sys_argv(node.value) and not isinstance(node.slice, ast.Slice):
             return "argv[%s]" % self.as_long(node.slice)   # char* command-line arg
+        # `sys.argv[1:]` -- the whole command line minus the program name,
+        # which is how a program that hands its arguments to a function reads
+        # them. Only indexing was lowered, so this emitted an undeclared
+        # `sys_argv`; `tools/cpprust.py` ends with `main(sys.argv[1:])`.
+        if self._is_sys_argv(node.value) and isinstance(node.slice, ast.Slice) \
+                and node.slice.step is None and node.slice.upper is None:
+            lo = self.as_long(node.slice.lower) \
+                if node.slice.lower is not None else "0"
+            self.loop_n += 1
+            k = "_av%d" % self.loop_n
+            return ("({ obj %s = list_new(); for (int %s_i = (%s); "
+                    "%s_i < argc; %s_i++) "
+                    "list_append(%s, OBJ_STR(argv[%s_i])); %s; })"
+                    % (k, k, lo, k, k, k, k, k))
         # `{Cls1: v1, Cls2: v2, ...}[type(x)]` -- a type->value dispatch table.
         # A dict keyed by classes can't be built and looked up by type() in the
         # obj model (class-as-value is a ctor closure, type() is a TypeInfo*, so
@@ -15571,6 +16107,17 @@ class Transpiler:
             return "(%s ? %s : %s)" % (self.bool_expr(node.test),
                                        self.wrap_obj(node.body),
                                        self.wrap_obj(node.orelse))
+        # Two integer branches unify to the wider integer, not to an obj.
+        # `j = n if j < 0 else j` with `n` an int and `j` a long used to box
+        # both, and the boxed conditional then would not assign back to the
+        # `long j` it came from. C's own conversions would do this anyway;
+        # boxing was throwing away a scalar for no reason. `value_ctype`
+        # applies the same rule over the same order -- they have to agree.
+        _INTS = _IFEXP_INTS
+        if bt != ot and bt in _INTS and ot in _INTS:
+            wide = _INTS[max(_INTS.index(bt), _INTS.index(ot))]
+            return "(%s ? (%s)%s : (%s)%s)" % (
+                self.bool_expr(node.test), wide, be, wide, oe)
         if bt != ot:                        # unify to a common Tier-2 obj
             return "(%s ? %s : %s)" % (self.bool_expr(node.test),
                                        self.wrap_obj(node.body),
@@ -16782,6 +17329,7 @@ def main(argv):
             print("  pgo: skipped (need .py input(s))")
     set_local_module_dirs(files)
     set_compiled_modules(files)
+    set_build_files(files)
     _, _, stdlib_root = _stdlib_context(files[0] if len(files) == 1 else "", None)
     uses_eval = any(_uses_eval_builtin(p) for p in files)
     # eval() no longer forces the MicroPython core: a standalone program gets the

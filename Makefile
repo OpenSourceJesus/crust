@@ -478,6 +478,7 @@ rpython:
 	run $(RPY)/ffi/ffi_math.py       35 ""; \
 	run $(RPY)/nbody/nbody.py        11 ""; \
 	run $(RPY)/classes/polymorphism.py 22 ""; \
+	run $(RPY)/closures/lifted_captures.py 31 ""; \
 	run $(RPY)/classes/pod_vs_object.py  48 ""; \
 	run $(RPY)/lists/typed_list.py       65 ""; \
 	run $(RPY)/dicts/typed_dict.py       58 ""; \
@@ -572,6 +573,15 @@ testminipy:
 	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_subprocess_py2c.py >/tmp/subproc_py2c.txt 2>&1; then echo "  ok    subprocess/tempfile shim (cpython == py2c native)"; else echo "  FAIL  subprocess/tempfile shim (see /tmp/subproc_py2c.txt)"; fail=1; fi; \
 	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_re_spans_py2c.py >/tmp/spans_py2c.txt 2>&1; then echo "  ok    match spans .start()/.end() (cpython == py2c native)"; else echo "  FAIL  match spans (see /tmp/spans_py2c.txt)"; fail=1; fi; \
 	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_re_finditer_py2c.py >/tmp/finditer_py2c.txt 2>&1; then echo "  ok    finditer + dynamic compile (cpython == py2c native)"; else echo "  FAIL  finditer/dynamic compile (see /tmp/finditer_py2c.txt)"; fail=1; fi; \
+	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_re_pos_py2c.py >/tmp/re_pos_py2c.txt 2>&1; then echo "  ok    pos/endpos windows (cpython == py2c native)"; else echo "  FAIL  pos/endpos windows (see /tmp/re_pos_py2c.txt)"; fail=1; fi; \
+	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_varargs_py2c.py >/tmp/varargs_py2c.txt 2>&1; then echo "  ok    *args / **kwargs calls (cpython == py2c native)"; else echo "  FAIL  *args / **kwargs calls (see /tmp/varargs_py2c.txt)"; fail=1; fi; \
+	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_strcount_py2c.py >/tmp/strcount_py2c.txt 2>&1; then echo "  ok    str.count over a window (cpython == py2c native)"; else echo "  FAIL  str.count window (see /tmp/strcount_py2c.txt)"; fail=1; fi; \
+	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_tuple_py2c.py >/tmp/tuple_py2c.txt 2>&1; then echo "  ok    tuple() as key and member (cpython == py2c native)"; else echo "  FAIL  tuple() (see /tmp/tuple_py2c.txt)"; fail=1; fi; \
+	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_subfn_py2c.py >/tmp/subfn_py2c.txt 2>&1; then echo "  ok    re.sub with a function (cpython == py2c native)"; else echo "  FAIL  re.sub function repl (see /tmp/subfn_py2c.txt)"; fail=1; fi; \
+	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_eval_env_py2c.py >/tmp/eval_env_py2c.txt 2>&1; then echo "  ok    sandboxed eval (cpython == py2c native)"; else echo "  FAIL  sandboxed eval (see /tmp/eval_env_py2c.txt)"; fail=1; fi; \
+	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_ifexp_int_py2c.py >/tmp/ifexp_py2c.txt 2>&1; then echo "  ok    int conditional stays scalar (cpython == py2c native)"; else echo "  FAIL  int conditional (see /tmp/ifexp_py2c.txt)"; fail=1; fi; \
+	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_ospath_py2c.py >/tmp/ospath_py2c.txt 2>&1; then echo "  ok    os.path.normpath (cpython == py2c native)"; else echo "  FAIL  os.path.normpath (see /tmp/ospath_py2c.txt)"; fail=1; fi; \
+	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_rsplit_py2c.py >/tmp/rsplit_py2c.txt 2>&1; then echo "  ok    str.rsplit (cpython == py2c native)"; else echo "  FAIL  str.rsplit (see /tmp/rsplit_py2c.txt)"; fail=1; fi; \
 	if [ $$fail = 0 ]; then echo "testminipy: PASS"; \
 	else echo "testminipy: FAIL"; fi; exit $$fail
 
