@@ -10418,7 +10418,7 @@ class Transpiler:
                 if _f.attr in ("dirname", "basename", "abspath", "join",
                                "normpath"):
                     return "char*"       # returns a C string
-                if _f.attr == "exists":
+                if _f.attr in ("exists", "isfile", "isdir"):
                     return "int"
             if isinstance(_f.value, ast.Name) and _f.value.id == "os" and \
                     _f.attr == "getcwd":
@@ -13803,17 +13803,21 @@ class Transpiler:
                                        self.expr(node.args[1])))
             if isinstance(func.value, ast.Name) \
                     and func.value.id in self._regex_dyn_vars:
-                if func.attr in ("search", "match") and 1 <= len(node.args) <= 2:
+                if func.attr in ("search", "match") and 1 <= len(node.args) <= 3:
                     anc = "1" if func.attr == "match" else "0"
                     txt = self.coerce_to("char*", node.args[0],
                                          self.expr(node.args[0]))
                     pat = self.coerce_to("char*", func.value,
                                          self.expr(func.value))
-                    if len(node.args) == 2:
+                    # pos, and optionally endpos -- the same window the
+                    # constant-pattern branch above accepts. A pattern built
+                    # at runtime is no less entitled to it, and cpprust builds
+                    # one per lambda name before scanning a region for it.
+                    if len(node.args) >= 2:
                         pos = self.coerce_to("int", node.args[1],
                                              self.expr(node.args[1]))
-                        return "_cre_at(%s, %s, %s, -1, %s)" % (
-                            pat, txt, pos, anc)
+                        return "_cre_at(%s, %s, %s, %s, %s)" % (
+                            pat, txt, pos, self._re_endpos(node, 2), anc)
                     return "_cre_dyn(%s, %s, %s)" % (pat, txt, anc)
                 if func.attr == "findall" and len(node.args) == 1:
                     return "_cre_findall(%s, %s)" % (

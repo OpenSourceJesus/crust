@@ -7990,6 +7990,14 @@ def _check_by_value(text, cinfo, path):
     return byval
 
 
+# Hoisted rather than compiled inside the scan loop below. `re` caches
+# compiled patterns so this was never the cost it looks like, but a compile
+# expression used as a receiver is also the one spelling of `.match(text, i)`
+# that does not lower: the pattern has to be a name py2c can follow back to
+# its text.
+_BYVAL_CALL = re.compile(r"(?<![\w.>])(\w+)\s*\(")
+
+
 def _construct_byval_args(text, byval, cinfo, path):
     """Copy-construct the arguments a by-value owning parameter takes.
 
@@ -8051,7 +8059,7 @@ def _construct_byval_args(text, byval, cinfo, path):
 
     out, i = [], 0
     while i < len(text):
-        m = re.compile(r"(?<![\w.>])(\w+)\s*\(").match(text, i)
+        m = _BYVAL_CALL.match(text, i)
         if m is not None and m.group(1) in byval:
             got = one(m, m.group(1))
             if got is not None:
