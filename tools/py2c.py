@@ -10584,7 +10584,9 @@ class Transpiler:
                 types[0] in ("int", "bool", "char*") else OBJ
         if isinstance(node, ast.Subscript):
             if self._is_sys_argv(node.value):
-                return "char*"
+                # One argument is a C string; a *slice* of them is a list.
+                # Reporting char* for both wrapped the list in `OBJ_STR`.
+                return OBJ if isinstance(node.slice, ast.Slice) else "char*"
             if isinstance(node.slice, ast.Slice):
                 return OBJ
             # Typed list/dict element type, resolved via static_type so it works
@@ -11113,6 +11115,21 @@ class Transpiler:
     def st_Delete(self, node):
         out = []
         for t in node.targets:
+            # `del xs[a:b]` is `xs[a:b] = []`, and the helper for that already
+            # exists. It used to fall through to the no-op comment below and
+            # silently do nothing: `tools/cpprust.py` strips a consumed option
+            # with `del args[i:i + 2]`, so every flag stayed in the list and
+            # the program printed its own usage instead of running.
+            if isinstance(t, ast.Subscript) and isinstance(t.slice, ast.Slice) \
+                    and t.slice.step is None:
+                lo = self.as_long(t.slice.lower) \
+                    if t.slice.lower is not None else "0"
+                hi = self.as_long(t.slice.upper) \
+                    if t.slice.upper is not None else \
+                    "pylen(%s)" % self.expr(t.value)
+                out.append("list_set_slice(%s, %s, %s, list_new());"
+                           % (self.expr(t.value), lo, hi))
+                continue
             if isinstance(t, ast.Subscript) and not isinstance(t.slice,
                                                                ast.Slice):
                 out.append("del_item(%s, %s);" % (self.wrap_obj(t.value),
@@ -11173,6 +11190,13 @@ class Transpiler:
                 txt = ast.unparse(t)
             except Exception:
                 txt = "?"
+            # A `del` of a *container element* that reaches here changes what
+            # the program does, and the comment made that invisible. Reclaim
+            # of a plain local is genuinely a no-op here and stays quiet.
+            if isinstance(t, ast.Subscript):
+                self._warn_unsupported(
+                    getattr(node, "lineno", 0), "del %s" % txt, "nothing",
+                    "the element is not removed")
             out.append("/* del %s */" % txt.replace("*/", "* /"))
         return out
 
@@ -15978,6 +16002,20 @@ class Transpiler:
     def ex_Subscript(self, node):
         if self._is_sys_argv(node.value) and not isinstance(node.slice, ast.Slice):
             return "argv[%s]" % self.as_long(node.slice)   # char* command-line arg
+        # `sys.argv[1:]` -- the whole command line minus the program name,
+        # which is how a program that hands its arguments to a function reads
+        # them. Only indexing was lowered, so this emitted an undeclared
+        # `sys_argv`; `tools/cpprust.py` ends with `main(sys.argv[1:])`.
+        if self._is_sys_argv(node.value) and isinstance(node.slice, ast.Slice) \
+                and node.slice.step is None and node.slice.upper is None:
+            lo = self.as_long(node.slice.lower) \
+                if node.slice.lower is not None else "0"
+            self.loop_n += 1
+            k = "_av%d" % self.loop_n
+            return ("({ obj %s = list_new(); for (int %s_i = (%s); "
+                    "%s_i < argc; %s_i++) "
+                    "list_append(%s, OBJ_STR(argv[%s_i])); %s; })"
+                    % (k, k, lo, k, k, k, k, k))
         # `{Cls1: v1, Cls2: v2, ...}[type(x)]` -- a type->value dispatch table.
         # A dict keyed by classes can't be built and looked up by type() in the
         # obj model (class-as-value is a ctor closure, type() is a TypeInfo*, so

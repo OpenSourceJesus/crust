@@ -6311,7 +6311,12 @@ def _prev_word(text, idx):
 
 
 _STORAGE = re.compile(r"^(?:static|extern|inline|register|auto)\s+")
-_DIRECTIVE_LINE = re.compile(r"(?m)^[ \t]*#.*$")
+# `(?<![^\n])` rather than `(?m)^`, and `[^\n]*` rather than `.*`: the same
+# match, without the inline flag. This was the single pattern in the tree
+# outside `crust_re`'s subset (REGEX.md counts 284 of 285), so a lowered
+# cpprust aborted at startup naming it -- the engine compiles every pattern
+# up front rather than failing later in some particular file.
+_DIRECTIVE_LINE = re.compile(r"(?<![^\n])[ \t]*#[^\n]*")
 
 
 def _open_paren_before(text, close_idx):
@@ -13010,8 +13015,14 @@ def _parse_owning(spec):
     return out
 
 
-def main(argv):
-    args = list(argv)
+def main():
+    # Reads `sys.argv` here rather than taking the list as a parameter. Both
+    # spellings are the same under CPython, but only this one lowers: py2c
+    # gives `main` the C `(int argc, char** argv)` signature exactly when it
+    # sees `sys.argv` inside it, and a `main` that took the list instead was
+    # emitted as `obj main(obj argv)` -- reached, but never handed the real
+    # command line, so it printed its own usage and stopped.
+    args = list(sys.argv[1:])
     out_path = None
     owning = {}
     basedir = None
@@ -13141,4 +13152,4 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(main())
