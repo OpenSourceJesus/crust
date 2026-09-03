@@ -581,6 +581,7 @@ testminipy:
 	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_eval_env_py2c.py >/tmp/eval_env_py2c.txt 2>&1; then echo "  ok    sandboxed eval (cpython == py2c native)"; else echo "  FAIL  sandboxed eval (see /tmp/eval_env_py2c.txt)"; fail=1; fi; \
 	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_ifexp_int_py2c.py >/tmp/ifexp_py2c.txt 2>&1; then echo "  ok    int conditional stays scalar (cpython == py2c native)"; else echo "  FAIL  int conditional (see /tmp/ifexp_py2c.txt)"; fail=1; fi; \
 	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_ospath_py2c.py >/tmp/ospath_py2c.txt 2>&1; then echo "  ok    os.path.normpath (cpython == py2c native)"; else echo "  FAIL  os.path.normpath (see /tmp/ospath_py2c.txt)"; fail=1; fi; \
+	if sh tools/rpy_lib/run_crust_re_py2c_test.sh test_rsplit_py2c.py >/tmp/rsplit_py2c.txt 2>&1; then echo "  ok    str.rsplit (cpython == py2c native)"; else echo "  FAIL  str.rsplit (see /tmp/rsplit_py2c.txt)"; fail=1; fi; \
 	if [ $$fail = 0 ]; then echo "testminipy: PASS"; \
 	else echo "testminipy: FAIL"; fi; exit $$fail
 

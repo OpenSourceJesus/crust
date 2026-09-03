@@ -351,6 +351,7 @@ str  str_strip(str s, int mode);   /* 0 both, 1 left, 2 right                 */
 obj  str_split(str s, str sep);    /* sep NULL -> split on whitespace runs    */
 obj  str_partition(str s, str sep);/* (before, sep_or_'', after) as a 3-list  */
 obj  str_splitlines(str s);
+obj  str_rsplit(str s, str sep, long maxsplit);
 str  str_replace(str s, str a, str b);
 long str_find(str s, str sub, bool last);
 long str_find_from(str s, str sub, bool last, long start);
@@ -1752,6 +1753,51 @@ obj str_split(str s, str sep) {
     list_append(r, OBJ_STR((str)p));
     return r;
 }
+/* `s.rsplit(sep, maxsplit)`: split from the right, at most `maxsplit` times,
+   so the *leftmost* piece keeps whatever separators are left over. A NULL or
+   empty `sep` splits on runs of whitespace, as `str_split` does. `maxsplit`
+   below zero means no limit. The pieces are appended left-to-right, matching
+   what Python returns. */
+obj str_rsplit(str s, str sep, long maxsplit) {
+    obj r = list_new(), tmp = list_new();
+    long n = (long)strlen(s), i, j, sl, k, cnt = 0;
+    if (!sep || !sep[0]) {
+        i = n;
+        while (i > 0 && (maxsplit < 0 || cnt < maxsplit)) {
+            while (i > 0 && isspace((unsigned char)s[i - 1])) i--;
+            if (i == 0) break;
+            j = i;
+            while (i > 0 && !isspace((unsigned char)s[i - 1])) i--;
+            { char* o = aalloc((size_t)(j - i) + 1);
+              memcpy(o, s + i, (size_t)(j - i)); o[j - i] = 0;
+              list_append(tmp, OBJ_STR(o)); cnt++; }
+        }
+        /* whatever is left, with trailing whitespace trimmed as Python does */
+        while (i > 0 && isspace((unsigned char)s[i - 1])) i--;
+        if (i > 0) { char* o = aalloc((size_t)i + 1);
+                     memcpy(o, s, (size_t)i); o[i] = 0;
+                     list_append(r, OBJ_STR(o)); }
+    } else {
+        sl = (long)strlen(sep);
+        i = n;
+        while (i >= sl && (maxsplit < 0 || cnt < maxsplit)) {
+            long hit = -1;
+            for (j = i - sl; j >= 0; j--)
+                if (memcmp(s + j, sep, (size_t)sl) == 0) { hit = j; break; }
+            if (hit < 0) break;
+            { char* o = aalloc((size_t)(i - hit - sl) + 1);
+              memcpy(o, s + hit + sl, (size_t)(i - hit - sl));
+              o[i - hit - sl] = 0;
+              list_append(tmp, OBJ_STR(o)); cnt++; }
+            i = hit;
+        }
+        { char* o = aalloc((size_t)i + 1);
+          memcpy(o, s, (size_t)i); o[i] = 0;
+          list_append(r, OBJ_STR(o)); }
+    }
+    for (k = pylen(tmp) - 1; k >= 0; k--) list_append(r, index_obj(tmp, k));
+    return r;
+}
 obj str_partition(str s, str sep) {
     /* str.partition: (head, sep, tail) at the first occurrence of sep, else
        (s, "", "").  Returned as a 3-element list for tuple unpacking. */
@@ -2661,7 +2707,8 @@ def _param_used_as_object(fn, name):
     not the scalar string/int its name suggests."""
     KNOWN = {"strip", "lstrip", "rstrip", "upper", "lower", "replace", "split",
              "partition",
-             "splitlines", "startswith", "endswith", "isdigit", "isalpha",
+             "splitlines", "rsplit", "startswith", "endswith", "isdigit",
+             "isalpha",
              "isspace", "isalnum", "find", "rfind", "rindex", "index",
              "join", "encode", "decode",
              "format", "count", "index", "append", "add", "update", "extend",
@@ -4741,6 +4788,23 @@ static char* _ospath_normpath(char* p) {
     if (k == 0) { out[0] = '.'; out[1] = 0; }
     return out;
 }
+/* os.path.realpath: resolve symlinks through libc. libc's realpath(3)
+   requires the path to exist and returns NULL otherwise, where CPython's
+   falls back to a purely lexical answer -- so that is what happens here
+   too, via normpath(abspath(p)). Without the fallback a non-existent path
+   would come back NULL and be read as a string. */
+static char* _ospath_abspath(char* p);
+static char* _ospath_normpath(char* p);
+static char* _ospath_realpath(char* p) {
+    char _b[4096];
+    if (realpath(p, _b)) {
+        size_t n = strlen(_b);
+        char* s = (char*)aalloc(n + 1);
+        for (size_t i = 0; i <= n; i++) s[i] = _b[i];
+        return s;
+    }
+    return _ospath_normpath(_ospath_abspath(p));
+}
 /* os.getcwd(): arena-allocated so the result outlives the call, unlike a
    static buffer that the next call would overwrite. */
 static char* _os_getcwd(void) {
@@ -6716,7 +6780,8 @@ class Transpiler:
 
     _CONTAINER_METHODS = {
         "strip", "lstrip", "rstrip", "upper", "lower", "replace", "split",
-        "partition", "splitlines", "startswith", "endswith", "isdigit",
+        "partition", "splitlines", "rsplit", "startswith", "endswith",
+        "isdigit",
         "isalpha", "isspace", "isalnum", "find", "rfind", "rindex", "index",
         "join", "encode",
         "decode", "format", "count", "index", "append", "add", "update",
@@ -10416,7 +10481,7 @@ class Transpiler:
                     isinstance(_f.value.value, ast.Name) and \
                     _f.value.value.id == "os" and _f.value.attr == "path":
                 if _f.attr in ("dirname", "basename", "abspath", "join",
-                               "normpath"):
+                               "normpath", "realpath"):
                     return "char*"       # returns a C string
                 if _f.attr in ("exists", "isfile", "isdir"):
                     return "int"
@@ -12377,6 +12442,9 @@ class Transpiler:
                 if f.attr == "normpath":
                     self._ossys_used = True
                     return "_ospath_normpath(%s)" % self._coerce_str_arg(node, 0)
+                if f.attr == "realpath":
+                    self._ossys_used = True
+                    return "_ospath_realpath(%s)" % self._coerce_str_arg(node, 0)
                 if f.attr == "exists":
                     self._ossys_used = True
                     return "_ospath_exists(%s)" % self._coerce_str_arg(node, 0)
@@ -15515,6 +15583,16 @@ class Transpiler:
         if m == "split":
             sep = self.as_str(a[0]) if a else "NULL"
             return "str_split(%s, %s)" % (self.as_str(func.value), sep)
+        if m == "rsplit":
+            # `sep=None` means whitespace, which the runtime spells as a NULL
+            # separator -- passing the literal None through `as_str` would
+            # hand it a null obj instead and read the tag off it.
+            none_sep = a and isinstance(a[0], ast.Constant) \
+                and a[0].value is None
+            sep = "NULL" if (not a or none_sep) else self.as_str(a[0])
+            mx = self.as_long(a[1]) if len(a) > 1 else "-1"
+            return "str_rsplit(%s, %s, %s)" % (
+                self.as_str(func.value), sep, mx)
         if m == "partition":
             return "str_partition(%s, %s)" % (self.as_str(func.value), self.as_str(a[0]))
         if m == "splitlines":
@@ -15559,7 +15637,8 @@ class Transpiler:
         return None
 
     STR_METHODS = {"startswith", "endswith", "strip", "lstrip", "rstrip",
-                   "split", "partition", "splitlines", "replace", "find",
+                   "split", "rsplit", "partition", "splitlines", "replace",
+                   "find",
                    "rfind", "rindex", "index", "isdigit", "isalpha",
                    "isspace", "isalnum", "lower", "upper", "join", "encode"}
 
