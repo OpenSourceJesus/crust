@@ -4149,8 +4149,15 @@ def _ref_positions(params, names):
     return out
 
 
-def _sub_code(pattern, repl, text):
-    """`pattern.sub(repl, text)`, but only where the match is real code.
+def _sub_code(pat, repl, text):
+    """`re.sub(pat, repl, text)`, but only where the match is real code.
+
+    `pat` is the pattern *text* and `repl` is always a callable. Both are
+    narrower than they were -- it used to take a compiled pattern and accept
+    a string replacement too -- and the narrowing is what lets this lower to
+    C: py2c cannot type a compiled pattern arriving as a parameter, and
+    `callable()` and `m.expand()` have no lowering at all. No call site
+    needed a backreference, so a string replacement is a lambda returning it.
 
     Every rewriting pass in this file that touches a body -- field
     qualification, implicit `this`, template substitution, reference
@@ -4175,9 +4182,9 @@ def _sub_code(pattern, repl, text):
     """
     look = _blank_directives(_blank_strings(_strip_comments(text)))
     out, pos = [], 0
-    for m in pattern.finditer(look):
+    for m in re.finditer(pat, look):
         out.append(text[pos:m.start()])
-        out.append(repl(m) if callable(repl) else m.expand(repl))
+        out.append(repl(m))
         pos = m.end()
     out.append(text[pos:])
     return "".join(out)
@@ -4224,7 +4231,7 @@ def _subst_type(text, tparams, concretes):
     # A parameter name inside a literal is text the program prints, not a
     # type to substitute: `puts("T")` must not become `puts("int")`.
     return _sub_code(
-        re.compile(r"\b(%s)\b" % "|".join(re.escape(p) for p in tparams)),
+        r"\b(%s)\b" % "|".join(re.escape(p) for p in tparams),
         lambda m: mapping[m.group(1)], text)
 
 
@@ -4252,7 +4259,7 @@ def _subst_injected(text, name, mangled):
     if not name or name == mangled:
         return text
     return _sub_code(
-        re.compile(r"\b%s\b(?!\s*<)" % re.escape(name)),
+        r"\b%s\b(?!\s*<)" % re.escape(name),
         lambda m: mangled, text)
 
 
@@ -4417,7 +4424,7 @@ def _expand_cpp_rref(params, names):
     all, so it binds a reference the move constructor then empties.
     """
     return _sub_code(
-        re.compile(r"(?<![\w.>])__cpp_rref\s*\(\s*([\w:]+)\s*\)"),
+        r"(?<![\w.>])__cpp_rref\s*\(\s*([\w:]+)\s*\)",
         lambda mm: ("%s &&" % mm.group(1)
                     if mm.group(1) in names else mm.group(1)),
         params)
@@ -4439,7 +4446,7 @@ def _expand_cpp_ref(params, names):
     beside it.
     """
     return _sub_code(
-        re.compile(r"(?<![\w.>])__cpp_ref\s*\(\s*([\w:]+)\s*\)"),
+        r"(?<![\w.>])__cpp_ref\s*\(\s*([\w:]+)\s*\)",
         lambda mm: ("const %s &" % mm.group(1)
                     if mm.group(1) in names else mm.group(1)),
         params)
@@ -4583,8 +4590,7 @@ def _lower_refs(text, names):
     alt = _type_alt(names)
     # A reference local binds something; take its address.
     text = _sub_code(
-        re.compile(
-            r"(?<![\w.])((?:const\s+)?(?:%s))\s*&\s*(\w+)\s*=\s*([^;]+);" % alt),
+        r"(?<![\w.])((?:const\s+)?(?:%s))\s*&\s*(\w+)\s*=\s*([^;]+);" % alt,
         lambda m: "%s *%s = &(%s);" % (m.group(1), m.group(2),
                                        m.group(3).strip()),
         text)
@@ -4595,11 +4601,11 @@ def _lower_refs(text, names):
     # left operand of a logical `&&` is a value, and a bare type name is not
     # one.
     text = _sub_code(
-        re.compile(r"(?<![\w.&])((?:const\s+)?(?:%s))\s*&&\s*(\w+)" % alt),
+        r"(?<![\w.&])((?:const\s+)?(?:%s))\s*&&\s*(\w+)" % alt,
         lambda m: "%s *%s" % (m.group(1), m.group(2)), text)
     # Everything else: a reference parameter.
     text = _sub_code(
-        re.compile(r"(?<![\w.&])((?:const\s+)?(?:%s))\s*&(?!&)\s*(\w+)" % alt),
+        r"(?<![\w.&])((?:const\s+)?(?:%s))\s*&(?!&)\s*(\w+)" % alt,
         lambda m: "%s *%s" % (m.group(1), m.group(2)), text)
     return text
 
@@ -4614,7 +4620,7 @@ def _implicit_this(body, mnames):
     """
     if not mnames:
         return body
-    return _sub_code(re.compile(r"(?<![\w.>])(%s)\s*\(" % _type_alt(mnames)),
+    return _sub_code(r"(?<![\w.>])(%s)\s*\(" % _type_alt(mnames),
                      lambda m: "this->%s(" % m.group(1), body)
 
 
@@ -5520,8 +5526,8 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
         inner = raw
         for rname in scalar_refs:
             inner = _sub_code(
-                re.compile(r"(?<![\w.>&])%s(?![\w])" % re.escape(rname)),
-                "(*%s)" % rname, inner)
+                r"(?<![\w.>&])%s(?![\w])" % re.escape(rname),
+                lambda _m: "(*%s)" % rname, inner)
         inner = _implicit_this(inner, mnames)
         # Bare member names inside a body refer to fields; qualify them.
         # Inherited ones go through `_base`, so the path is substituted
@@ -5548,7 +5554,7 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
                        if n not in shadowed and n not in names]
             if visible:
                 inner = _sub_code(
-                    re.compile(r"(?<![\w.>])(%s)\b" % _type_alt(visible)),
+                    r"(?<![\w.>])(%s)\b" % _type_alt(visible),
                     lambda m: "this->" + info["paths"][m.group(1)], inner)
         inner = inner.replace("this->this->", "this->")
         # `static const` members are file-scope constants, not fields, so a
@@ -5558,7 +5564,7 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
         sconsts = [x.name for x in cls.members if x.kind == "sconst"]
         if sconsts:
             inner = _sub_code(
-                re.compile(r"(?<![\w.>])(%s)\b" % _type_alt(sconsts)),
+                r"(?<![\w.>])(%s)\b" % _type_alt(sconsts),
                 lambda m: "%s_%s" % (cname, m.group(1)), inner)
         # `Shape *twin() { return this; }` inside a derived class returns a
         # `Derived *` where a `Shape *` is declared. The base is the first
@@ -5569,8 +5575,8 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
                 and base is not None \
                 and (rcls[0] == base or _is_ancestor(rcls[0], base, known)):
             inner = _sub_code(
-                re.compile(r"(?<![\w.>])return\s+this\s*;"),
-                "return (%s *)this;" % rcls[0], inner)
+                r"(?<![\w.>])return\s+this\s*;",
+                lambda _m: "return (%s *)this;" % rcls[0], inner)
         # ShivyCX contract clauses go between the parameter list and the
         # body, which is the same place they occupied in the C++ source --
         # the method-to-free-function rewrite prepends `this` and renames
@@ -5688,7 +5694,7 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             # The body returns the element; the lowered function returns
             # its address, which is what a reference is.
             ibody = _sub_code(
-                re.compile(r"(?<![\w.>])return\s+([^;]+);"),
+                r"(?<![\w.>])return\s+([^;]+);",
                 lambda mm: "return &(%s);" % mm.group(1).strip(),
                 sub(m.body or ""))
             emit(iret.replace("&", "*"), "%s__index" % cname, params, ibody)
@@ -5714,7 +5720,7 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             info["star"] = {"fn": "%s__star" % cname,
                             "ret": tsub(sret.replace("&", "").strip())}
             sbody = _sub_code(
-                re.compile(r"(?<![\w.>])return\s+([^;]+);"),
+                r"(?<![\w.>])return\s+([^;]+);",
                 lambda mm: "return &(%s);" % mm.group(1).strip(),
                 sub(m.body or ""))
             emit(sret.replace("&", "*"), "%s__star" % cname, params, sbody)
@@ -9029,7 +9035,7 @@ def _mark_std_move(text):
     template taking `T &&`, which this subset does not have, so a file naming
     it is refused elsewhere rather than quietly moved from.
     """
-    return _sub_code(re.compile(r"\bstd\s*::\s*move\s*\("), "__cpp_move(",
+    return _sub_code(r"\bstd\s*::\s*move\s*\(", lambda _m: "__cpp_move(",
                      text)
 
 
@@ -11732,8 +11738,8 @@ def _std_prelude(text):
     # so every pass below sees one container rather than two names for it.
     for un, real in _STD_UNORDERED.items():
         if re.search(r"\b(?:std\s*::\s*)?%s\b" % un, probe):
-            text = _sub_code(re.compile(r"(?<![\w])%s(?![\w])" % un),
-                             real, text)
+            text = _sub_code(r"(?<![\w])%s(?![\w])" % un,
+                             lambda _m, _r=real: _r, text)
             wanted.add(real)
     probe = _blank_strings(_strip_comments(text))
     for name in ("string", "vector", "ownvector", "unique_ptr",
@@ -11767,7 +11773,7 @@ def _std_prelude(text):
     # meant -- and the more headers a file used, the further off it got.
     text = _STD_INCLUDE.sub(
         lambda m: "\n" if m.group(0).endswith("\n") else "", text)
-    text = _sub_code(re.compile(r"\bstd\s*::\s*"), "", text)
+    text = _sub_code(r"\bstd\s*::\s*", lambda _m: "", text)
     if "vector" in wanted or "ownvector" in wanted:
         # `vector<string>` needs `string`; supplying it is cheaper than
         # working out whether this source asks for that combination.
@@ -11991,8 +11997,8 @@ def _inline_lambda(text, look, m, close, captures, params, ret, body, n,
         snaps.append((cap, snap, ty))
 
     body = _sub_code(
-        re.compile(r"(?<![\w.>])(%s)(?![\w])"
-                   % "|".join(re.escape(c) for c, _s, _t in snaps)),
+        r"(?<![\w.>])(%s)(?![\w])"
+                   % "|".join(re.escape(c) for c, _s, _t in snaps),
         lambda mm: dict((c, s) for c, s, _t in snaps)[mm.group(1)],
         body) if snaps else body
 
@@ -12052,10 +12058,10 @@ def _inline_lambda(text, look, m, close, captures, params, ret, body, n,
 
     uid = "_cpp_lam%d" % n
     res = "%s_r" % uid
-    inner = _sub_code(re.compile(r"(?<![\w.>])return\s*;"), "break;", body)
+    inner = _sub_code(r"(?<![\w.>])return\s*;", lambda _m: "break;", body)
     if ret != "void":
         inner = _sub_code(
-            re.compile(r"(?<![\w.>])return\s+([^;]+);"),
+            r"(?<![\w.>])return\s+([^;]+);",
             lambda mm: "{ %s = %s; break; }" % (res, mm.group(1).strip()),
             inner)
         head = "%s %s; " % (ret, res)
@@ -12244,7 +12250,7 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
         # here derives from anything it is not told about. Stripped before
         # the class scans rather than inside each of them.
         text = _sub_code(
-            re.compile(r"(?<![\w])(class|struct)\s+(\w+)\s+final(?![\w])"),
+            r"(?<![\w])(class|struct)\s+(\w+)\s+final(?![\w])",
             lambda mm: "%s %s" % (mm.group(1), mm.group(2)), text)
         # Nested classes after namespaces (so the enclosing name is already
         # flattened) and before everything that reads a class.
