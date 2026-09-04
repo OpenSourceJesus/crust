@@ -3089,3 +3089,9 @@ class TestQualifiedParamInOutOfLine(Base):
     def test_qualified_param_keeps_underscore(self):
         out = self.lower("""
 namespace litehtml {
+
+class TestBraceInCharLiteral(Base):
+    """`'{` in a method body must not break out-of-line brace matching."""
+
+    def test_char_brace_does_not_unterminate(self):
+        out = self.lower("""

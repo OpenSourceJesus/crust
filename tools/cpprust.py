@@ -1126,15 +1126,34 @@ def _blank_directives(text):
 
 
 def _match_brace(text, open_idx):
-    """Index of the `}` closing the `{` at `open_idx`, or None."""
+    """Index of the `}` closing the `{` at `open_idx`, or None.
+
+    String and char literals are skipped, the same way `_match_paren`
+    skips them: a body that writes `'{` or `"}"` -- litehtml's stylesheet
+    parser hunts for both -- must not count those braces, or the
+    definition looks unterminated and the rest of the file is never
+    attached.
+    """
     depth = 0
-    for i in range(open_idx, len(text)):
-        if text[i] == "{":
+    i, n = open_idx, len(text)
+    quote = None
+    while i < n:
+        c = text[i]
+        if quote is not None:
+            if c == "\\":
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+        elif c in "\"'":
+            quote = c
+        elif c == "{":
             depth += 1
-        elif text[i] == "}":
+        elif c == "}":
             depth -= 1
             if depth == 0:
                 return i
+        i += 1
     return None
 
 
