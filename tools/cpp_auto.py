@@ -1251,6 +1251,14 @@ def _sub_flattened(body, body_scan, pat, ns):
     for m in pat.finditer(body_scan):
         before = body_scan[:m.start()].rstrip()
         if before.endswith("::"):
+            # Only a *leading* `::` is global scope. `N::name` is a
+            # qualified name and belongs to `_sub_qualified` -- stripping
+            # the `::` here glued the qualifier onto the name
+            # (`litehtml::style` became `litehtmlstyle`), which then
+            # matched nothing the class table knew.
+            prefix = before[:-2].rstrip()
+            if prefix and (prefix[-1].isalnum() or prefix[-1] == "_"):
+                continue
             # Leading `::`: global scope. Keep the name, drop the marker --
             # and take the text back to just before it, so the `::` does
             # not survive into the output.

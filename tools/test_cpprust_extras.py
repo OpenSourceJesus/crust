@@ -3079,4 +3079,13 @@ int f(void) { document d; return js_get_document(d.n); }
         self.assertIn("document_drop", out)
         self.assertIn("js_get_document", out)
 
+class TestQualifiedParamInOutOfLine(Base):
+    """`void N::T::f(const N::T &)` must keep the underscore in the type.
 
+    `_sub_flattened` used to treat every `::` as global scope and glue
+    `litehtml::style` into `litehtmlstyle`.
+    """
+
+    def test_qualified_param_keeps_underscore(self):
+        out = self.lower("""
+namespace litehtml {
