@@ -8603,8 +8603,20 @@ def _skip_contracts_back(text, j):
     that is not a structure. Every operator in a numeric library takes
     `const Vec &`, so this made contracts and reference parameters mutually
     exclusive -- which is exactly the combination the library needs.
+
+    Only a short tail is searched. Searching `text[:j+1]` with a `$`
+    anchor was correct but allocated and scanned the whole prefix on
+    every brace -- on a spliced litehtml unit that is half a megabyte
+    times a few thousand braces, and rewrite_scopes alone took over a
+    minute. A contract run is a handful of short `assert` lines; 512
+    characters is generous. `search(..., endpos=j+1)` still anchors `$`
+    at that end, so only a run that reaches this brace matches.
     """
-    m = _CONTRACT_RUN.search(text[:j + 1])
+    window = 512
+    start = j + 1 - window
+    if start < 0:
+        start = 0
+    m = _CONTRACT_RUN.search(text, start, j + 1)
     return (m.start() - 1) if m is not None else j
 
 
