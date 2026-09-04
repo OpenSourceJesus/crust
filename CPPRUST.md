@@ -290,7 +290,10 @@ public:
   registered for destruction like any other local.
 - **`operator=`** lowers to `T__assign`, and `b = a;` calls it. This is the
   one operator overload the subset supports besides `operator[]`, because
-  assignment to an owning object has no safe default.
+  assignment to an owning object has no safe default. A *converting*
+  overload — `operator=(const U &)` for a different class `U` — lowers to
+  `T__assign_from_U` instead, so two one-argument assignments that differ
+  only in the operand type do not collide on one C symbol.
 
 **Refused:**
 
@@ -299,7 +302,8 @@ public:
 | copying a class with a destructor and no copy constructor | two owners, one resource — the Rule of Three, named in the message |
 | assigning to an owning object with no `operator=` | same, at assignment |
 | `a = b = c` | `operator=` is lowered to a `void` call, so there is no result |
-| two `operator=` overloads taking one argument each | both lower to `T__assign`, and overloads here resolve by argument *count* — the move overload escapes this only by having a symbol of its own (`T__moveassign`) |
+| two same-type `operator=` overloads taking one argument each | both lower to `T__assign`, and overloads here resolve by argument *count* — the move overload escapes this only by having a symbol of its own (`T__moveassign`) |
+| converting `operator=` from a different class | lowers to `T__assign_from_U`, chosen by the RHS type — the same distinction move assignment uses. litehtml's `border` assigns from both `border` and `css_border` this way |
 | copying from an expression this pass cannot name | guessing is the bug |
 
 A class with **no destructor** owns nothing, and copies bitwise exactly as
