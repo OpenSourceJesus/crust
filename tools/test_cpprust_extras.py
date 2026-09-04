@@ -3052,17 +3052,6 @@ int f(void) { A x; C y; return x.a + y.c; }
         self.assertNotIn("__crust_src_line_", out)
         self.assertNotIn("typedef int ;", out)
 
-
-def _main():
-    argv = [a for a in sys.argv[1:] if a != "--failing"]
-    if "--failing" in sys.argv[1:]:
-        print("(--failing: run the whole file; open gaps are the failures)")
-    unittest.main(argv=[sys.argv[0]] + argv, verbosity=2)
-
-
-if __name__ == "__main__":
-    _main()
-
 class TestConvertingAssign(Base):
     """`operator=` overloaded on operand *type* -- litehtml's `border`.
 
@@ -3170,7 +3159,6 @@ void css::parse(const char *str)
 }
 """)
         self.assertIn("css_parse", out)
-
 
 def _main():
     argv = [a for a in sys.argv[1:] if a != "--failing"]
