@@ -1286,6 +1286,17 @@ def _check_free_overloads(scan, path):
             continue
         if "::" in m.group(1) or "::" in name:
             continue
+        # Return type and name must be separate tokens. Without that,
+        # `~document()` and `js_get_document(..)` both match as a free
+        # function named `t` -- the regex backtracks into one identifier
+        # and splits `document` into `documen` + `t`.
+        between = head[m.start(1) + len(m.group(1)):m.start(2)]
+        if not re.search(r"[\s*&]", between):
+            continue
+        # A destructor is `~Name()`, not a free function returning the
+        # truncated prefix of `Name`.
+        if head[:m.start()].rstrip().endswith("~"):
+            continue
         prev = seen.get(name)
         if prev is None:
             seen[name] = m.start(2)

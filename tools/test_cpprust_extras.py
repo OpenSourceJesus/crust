@@ -3062,3 +3062,21 @@ def _main():
 
 if __name__ == "__main__":
     _main()
+
+class TestFreeFunctionNameSplit(Base):
+    """`~document()` and `js_get_document` must not look like free `t`."""
+
+    def test_destructor_and_get_document_are_not_free_t(self):
+        out = self.lower("""
+struct document {
+    int n;
+    document() { n = 0; }
+    ~document() { n = 0; }
+};
+static int js_get_document(int x) { return x; }
+int f(void) { document d; return js_get_document(d.n); }
+""")
+        self.assertIn("document_drop", out)
+        self.assertIn("js_get_document", out)
+
+
