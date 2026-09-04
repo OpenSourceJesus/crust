@@ -273,10 +273,12 @@ def main(argv=None):
                     help="preprocessor name to define (default: "
                          "LITEHTML_UTF8, as juce_litehtml.h does)")
     ap.add_argument("--clang", dest="clang", action="store_true",
-                    default=None, help="require the clang `auto` fallback")
+                    default=False,
+                    help="require the clang `auto` fallback (off by "
+                         "default: litehtml should translate without a "
+                         "clang subprocess)")
     ap.add_argument("--no-clang", dest="clang", action="store_false",
-                    help="forbid it, to see which `auto`s are genuinely "
-                         "written out rather than answered by a compiler")
+                    help="forbid the clang fallback (the default)")
     ap.add_argument("--no-cache", action="store_true")
     ap.add_argument("--no-shim", action="store_true",
                     help="do not map <cstdint> and friends to their C "

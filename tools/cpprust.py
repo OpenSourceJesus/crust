@@ -1126,15 +1126,34 @@ def _blank_directives(text):
 
 
 def _match_brace(text, open_idx):
-    """Index of the `}` closing the `{` at `open_idx`, or None."""
+    """Index of the `}` closing the `{` at `open_idx`, or None.
+
+    String and char literals are skipped, the same way `_match_paren`
+    skips them: a body that writes `'{` or `"}"` -- litehtml's stylesheet
+    parser hunts for both -- must not count those braces, or the
+    definition looks unterminated and the rest of the file is never
+    attached.
+    """
     depth = 0
-    for i in range(open_idx, len(text)):
-        if text[i] == "{":
+    i, n = open_idx, len(text)
+    quote = None
+    while i < n:
+        c = text[i]
+        if quote is not None:
+            if c == "\\":
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+        elif c in "\"'":
+            quote = c
+        elif c == "{":
             depth += 1
-        elif text[i] == "}":
+        elif c == "}":
             depth -= 1
             if depth == 0:
                 return i
+        i += 1
     return None
 
 
@@ -1285,6 +1304,17 @@ def _check_free_overloads(scan, path):
                       r"template|extern)\b[^;{}]*$", lead):
             continue
         if "::" in m.group(1) or "::" in name:
+            continue
+        # Return type and name must be separate tokens. Without that,
+        # `~document()` and `js_get_document(..)` both match as a free
+        # function named `t` -- the regex backtracks into one identifier
+        # and splits `document` into `documen` + `t`.
+        between = head[m.start(1) + len(m.group(1)):m.start(2)]
+        if not re.search(r"[\s*&]", between):
+            continue
+        # A destructor is `~Name()`, not a free function returning the
+        # truncated prefix of `Name`.
+        if head[:m.start()].rstrip().endswith("~"):
             continue
         prev = seen.get(name)
         if prev is None:
@@ -4717,7 +4747,8 @@ def _external_info(name, dropfn):
             "fields": {}, "base": None, "slots": [], "root": None,
             "abstract": False, "vdtor": False, "vdtor_decl": None,
             "ctor_refs": set(), "paths": {}, "copy": False, "move": False,
-            "assign": False, "moveassign": False, "move_methods": {}, "deleted": {}, "index": None, "arrow": None,
+            "assign": False, "assign_from": {}, "moveassign": False,
+            "move_methods": {}, "deleted": {}, "index": None, "arrow": None,
             "star": None, "augassign": {}, "cmp": {}, "binop": {},
             "conv": None,
             "vcall": {},
@@ -4829,6 +4860,7 @@ def load_decls(paths):
                 "root": c["struct"], "abstract": False,
                 "vdtor": False, "vdtor_decl": None, "ctor_refs": set(),
                 "copy": False, "move": False, "assign": False,
+                "assign_from": {},
                 "moveassign": False, "move_methods": {}, "deleted": {},
                 "index": None, "arrow": None, "ibases": [],
                 "ibases_all": [],
@@ -5291,7 +5323,8 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             "ibases_all": [(bn, bi, pth) for bn, bi, pth in all_extras],
             "abstract": abstract, "vdtor": False, "vdtor_decl": None,
             "ctor_refs": set(), "paths": {}, "copy": False, "move": False,
-            "assign": False, "moveassign": False, "move_methods": {}, "deleted": {}, "index": None, "arrow": None,
+            "assign": False, "assign_from": {}, "moveassign": False,
+            "move_methods": {}, "deleted": {}, "index": None, "arrow": None,
             "star": None, "augassign": {}, "cmp": {}, "binop": {},
             "conv": None,
             "dropfn": "%s_drop" % cname, "external": False}
@@ -5748,30 +5781,50 @@ def _emit_class(cls, names, known, tsub, targs=None, wants_new=False,
             emit("void", "%s__moveassign" % cname, params, sub(m.body or ""))
             info["moveassign"] = True
         elif m.kind == "assign":
-            # Lowered to `T_assign(T *this, const T *o)`. Assignment is the
-            # one place the subset needs a user hook: a struct copy of an
-            # owning object leaves two owners, and there is no safe default.
-            # `__assign`, not `_assign`: a class may perfectly well declare
-            # a method called `assign`, and `string` does.
+            # Lowered to `T__assign(T *this, const T *o)`, or -- when the
+            # operand is a different class -- `T__assign_from_U`. Assignment
+            # is the one place the subset needs a user hook: a struct copy
+            # of an owning object leaves two owners, and there is no safe
+            # default. `__assign`, not `_assign`: a class may perfectly
+            # well declare a method called `assign`, and `string` does.
             #
-            # A *second* `operator=` taking one argument lands on this same
-            # symbol. The move overload above escapes that by having a
-            # symbol of its own, but two copy-assignments differing only in
-            # their operand type -- litehtml's `border` takes both a
-            # `border` and a `css_border` -- have nothing to tell them
-            # apart, and the emitted C redefined the first. Refused for the
-            # reason any same-arity overload is: resolution here is by
-            # argument count, and both take one.
-            if info["assign"]:
-                raise CppError(
-                    "class %s: two `operator=` overloads take 1 argument. "
-                    "Overloads are resolved by argument count here, so both "
-                    "lower to `%s__assign` and the second would redefine "
-                    "the first. Give one of them a name (`assign_from`) and "
-                    "call it directly."
-                    % (cls.name, cname))
-            emit("void", "%s__assign" % cname, params, sub(m.body or ""))
-            info["assign"] = True
+            # Two same-type copy-assignments still collide: resolution here
+            # is by argument count, and both take one. A *converting*
+            # overload escapes that the same way move assignment does --
+            # its own symbol, keyed on the operand type -- which is what
+            # litehtml's `border` needs (`border` and `css_border`).
+            _ap = _parse_param(
+                _expand_cpp_ref(tsub(sub(m.params or "")), known),
+                _with_scalars(names))
+            op_cls = _ap[0] if _ap else None
+            same = (op_cls is None
+                    or op_cls in (cname, cls.name)
+                    or _is_copy_params(m.params or "", cname, cls.name,
+                                       tsub, sub))
+            if same:
+                if info["assign"]:
+                    raise CppError(
+                        "class %s: two `operator=` overloads take 1 "
+                        "argument of the same type. Overloads are resolved "
+                        "by argument count here, so both lower to "
+                        "`%s__assign` and the second would redefine the "
+                        "first. Give one of them a name (`assign_from`) and "
+                        "call it directly."
+                        % (cls.name, cname))
+                emit("void", "%s__assign" % cname, params,
+                     sub(m.body or ""))
+                info["assign"] = True
+            else:
+                if op_cls in info["assign_from"]:
+                    raise CppError(
+                        "class %s: two `operator=` overloads take a "
+                        "`%s`. Both would lower to "
+                        "`%s__assign_from_%s` and the second would "
+                        "redefine the first."
+                        % (cls.name, op_cls, cname, op_cls))
+                fn = "%s__assign_from_%s" % (cname, op_cls)
+                emit("void", fn, params, sub(m.body or ""))
+                info["assign_from"][op_cls] = fn
         elif m.kind == "binop":
             op = m.name[len("operator"):]
             # A binary operator hands back a new object by value. That used
@@ -7605,25 +7658,30 @@ def _rewrite_scopes_inner(text, type_info, _pos):
             if lfound is not None and lfound[1] in type_info:
                 lhs, ctype = lfound
             _rhs = m.group(2).strip()
+            _from = (type_info[ctype].get("assign_from") or {}) \
+                if ctype is not None else {}
+            _rhs_obj = None
+            _rhs_cls = None
+            if ctype is not None and _from:
+                _rhs_obj = _named_object(_rhs, scopes, type_info)
+                _rhs_cls = _rhs_obj[1] if _rhs_obj is not None else None
             _can_lower = ctype is not None and (
                 _rhs in ("nullptr", "NULL")
                 or _move_operand(m.group(2)) is not None
                 or (type_info[ctype]["assign"]
                     and _copy_source(_rhs, ctype, scopes,
-                                     type_info) is not None))
+                                     type_info) is not None)
+                or (_rhs_cls is not None and _rhs_cls in _from))
             if lhs_is_chain and ctype is not None and not _can_lower:
                 # A member assignment whose right-hand side this pass cannot
                 # name as the same class. Before member chains were matched
                 # at all these fell through untouched, and refusing them now
                 # would reject files that have always translated.
                 #
-                # litehtml's `borders` is the case in hand: it assigns a
-                # `css_border` to a `border`, which is `operator=` overloaded
-                # on the parameter *type* at one arity. Overloads here are
-                # told apart by argument count, so the second one cannot be
-                # represented -- and until it can, the honest thing is to
-                # leave the statement exactly as it was rather than claim a
-                # refusal the pass has not earned.
+                # Converting `operator=` overloads are handled above via
+                # `assign_from`; what remains here is a shape the pass
+                # still cannot name, left exactly as written rather than
+                # claimed as a refusal.
                 ctype = None
                 lhs = m.group(1)
             info_a = type_info.get(ctype) if ctype is not None else None
@@ -7657,6 +7715,16 @@ def _rewrite_scopes_inner(text, type_info, _pos):
                 # The source is not dropped from this scope: a moved-from
                 # object is still destroyed in C++.
                 out.append("%s(&%s, &%s);" % (fn, lhs, src))
+                i = m.end()
+                continue
+            if ctype is not None and _rhs_cls is not None \
+                    and _rhs_cls in _from:
+                # Converting assignment: `b = css;` where `b` is a `border`
+                # and `css` is a `css_border`. Own symbol, chosen by the
+                # RHS type -- the same distinction move assignment uses.
+                src = _rhs_obj[0]
+                out.append("%s(&%s, &%s);"
+                           % (_from[_rhs_cls], lhs, src))
                 i = m.end()
                 continue
             if ctype is not None and type_info[ctype]["assign"]:
@@ -8535,8 +8603,20 @@ def _skip_contracts_back(text, j):
     that is not a structure. Every operator in a numeric library takes
     `const Vec &`, so this made contracts and reference parameters mutually
     exclusive -- which is exactly the combination the library needs.
+
+    Only a short tail is searched. Searching `text[:j+1]` with a `$`
+    anchor was correct but allocated and scanned the whole prefix on
+    every brace -- on a spliced litehtml unit that is half a megabyte
+    times a few thousand braces, and rewrite_scopes alone took over a
+    minute. A contract run is a handful of short `assert` lines; 512
+    characters is generous. `search(..., endpos=j+1)` still anchors `$`
+    at that end, so only a run that reaches this brace matches.
     """
-    m = _CONTRACT_RUN.search(text[:j + 1])
+    window = 512
+    start = j + 1 - window
+    if start < 0:
+        start = 0
+    m = _CONTRACT_RUN.search(text, start, j + 1)
     return (m.start() - 1) if m is not None else j
 
 

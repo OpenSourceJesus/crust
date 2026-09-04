@@ -3052,6 +3052,113 @@ int f(void) { A x; C y; return x.a + y.c; }
         self.assertNotIn("__crust_src_line_", out)
         self.assertNotIn("typedef int ;", out)
 
+class TestConvertingAssign(Base):
+    """`operator=` overloaded on operand *type* -- litehtml's `border`.
+
+    Same-type still lowers to `T__assign`. A converting overload gets its
+    own symbol keyed on the operand class, the same escape move assignment
+    already had. Two same-type overloads are still refused.
+    """
+
+    def test_converting_overload_has_its_own_symbol(self):
+        out = self.lower("""
+class css_border {
+public:
+    int w;
+    css_border() { w = 0; }
+};
+class border {
+public:
+    int w;
+    border() { w = 0; }
+    border &operator=(const border &val) { w = val.w; return *this; }
+    border &operator=(const css_border &val) { w = val.w; return *this; }
+};
+void f(void) {
+    border b;
+    css_border c;
+    b = c;
+    border a;
+    b = a;
+}
+""")
+        self.assertIn("border__assign_from_css_border", out)
+        self.assertIn("border__assign_from_css_border(&b, &c)", out)
+        self.assertIn("border__assign(&b, &a)", out)
+
+    def test_two_same_type_overloads_are_still_refused(self):
+        self.refuses("""
+class S {
+public:
+    int v;
+    S() { v = 0; }
+    S &operator=(const S &o) { v = o.v; return *this; }
+    S &operator=(S &o) { v = o.v; return *this; }
+};
+""", "two `operator=` overloads")
+
+
+class TestFreeFunctionNameSplit(Base):
+    """`~document()` and `js_get_document` must not look like free `t`."""
+
+    def test_destructor_and_get_document_are_not_free_t(self):
+        out = self.lower("""
+struct document {
+    int n;
+    document() { n = 0; }
+    ~document() { n = 0; }
+};
+static int js_get_document(int x) { return x; }
+int f(void) { document d; return js_get_document(d.n); }
+""")
+        self.assertIn("document_drop", out)
+        self.assertIn("js_get_document", out)
+
+
+class TestQualifiedParamInOutOfLine(Base):
+    """`void N::T::f(const N::T &)` must keep the underscore in the type.
+
+    `_sub_flattened` used to treat every `::` as global scope and glue
+    `litehtml::style` into `litehtmlstyle`.
+    """
+
+    def test_qualified_param_keeps_underscore(self):
+        out = self.lower("""
+namespace litehtml {
+class style {
+public:
+    int n;
+    style() { n = 0; }
+    void combine(const style &src);
+};
+}
+void litehtml::style::combine(const litehtml::style &src)
+{
+    n = src.n;
+}
+""")
+        self.assertIn("litehtml_style", out)
+        self.assertNotIn("litehtmlstyle", out)
+
+
+class TestBraceInCharLiteral(Base):
+    """`'{` in a method body must not break out-of-line brace matching."""
+
+    def test_char_brace_does_not_unterminate(self):
+        out = self.lower("""
+class css {
+public:
+    int n;
+    css() { n = 0; }
+    void parse(const char *str);
+};
+void css::parse(const char *str)
+{
+    char open = '{';
+    if (str[0] == '{') { n = 1; }
+}
+""")
+        self.assertIn("css_parse", out)
 
 def _main():
     argv = [a for a in sys.argv[1:] if a != "--failing"]
