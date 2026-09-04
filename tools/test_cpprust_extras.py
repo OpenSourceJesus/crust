@@ -3063,6 +3063,17 @@ def _main():
 if __name__ == "__main__":
     _main()
 
+class TestConvertingAssign(Base):
+    """`operator=` overloaded on operand *type* -- litehtml's `border`.
+
+    Same-type still lowers to `T__assign`. A converting overload gets its
+    own symbol keyed on the operand class, the same escape move assignment
+    already had. Two same-type overloads are still refused.
+    """
+
+    def test_converting_overload_has_its_own_symbol(self):
+        out = self.lower("""
+
 class TestFreeFunctionNameSplit(Base):
     """`~document()` and `js_get_document` must not look like free `t`."""
 
