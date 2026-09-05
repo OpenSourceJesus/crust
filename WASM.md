@@ -11,6 +11,23 @@ node -e 'const b=require("fs").readFileSync("prog.wasm");
 
 Aliases: `wasm`, `wasm32`, `webassembly`.
 
+## Dual compile: native backend + wasm frontend
+
+Crust keeps `sizeof(void *) == 8` and the same SysV-style struct layout under
+`--target wasm` as on the native target. The same translation unit can therefore
+be the **backend server** and the **wasm frontend**, and a POD struct is already
+a little-endian binary protocol -- no second IDL.
+
+```sh
+python3 tools/dual_compile.py examples/wireproto/codec.c \
+    -I examples/wireproto -o /tmp/wireproto/codec
+make test_wireproto
+```
+
+See [examples/wireproto/README.md](examples/wireproto/README.md). Anti-tampering
+polymorphic delivery and RPython `with frontend(...):` are later work; this is
+the joint-compile and shared-layout slice only.
+
 ## No external tools
 
 Every other back end hands assembler text to `as` and object files to `ld`.

@@ -69,6 +69,7 @@ Main Crust Documentation:
 - [REGEX.md](REGEX.md) one regex engine, shared by C, C++, RPython and minipy
 - [BUILDTOOLS.md](BUILDTOOLS.md) lowering `tools/` to native binaries
 - [WASM.md](WASM.md) the WebAssembly back end (`--target wasm`)
+- [examples/wireproto/README.md](examples/wireproto/README.md) dual FE/BE compile + binary protocol
 
 Hardware:
 - [BAREMETAL_ARM64.md](BAREMETAL_ARM64.md)
