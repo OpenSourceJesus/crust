@@ -104,6 +104,12 @@ mem-safe:
 test_wasm:
 	python3 tools/wasm_difftest.py
 
+# Dual FE/BE wire protocol (issue #15): same TU -> native + wasm, layout and
+# request/reply bytes must agree both directions.
+#     make test_wireproto
+test_wireproto:
+	python3 tools/wireproto_test.py
+
 SEED  ?= 1
 COUNT ?= 200
 fuzz_wasm:
