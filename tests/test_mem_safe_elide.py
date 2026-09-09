@@ -7,9 +7,11 @@ Every class the checker detects is therefore re-tested here through code shaped
 to trigger elision, so a wrong proof fails a test instead of quietly costing
 someone a bug.
 
-Two rules are under test:
+Three rules are under test:
   1. redundancy -- the identical address was already checked in this block
   2. bounds -- a constant offset into a live allocation of known size
+  4. contract -- a constant offset into a parameter whose `assert len(p) >= N`
+     holds at every call site
 
 Rule 2 is the subtle one. A write check also records which bytes are defined,
 so a proved write is downgraded to a shadow update rather than removed. The
@@ -320,6 +322,90 @@ class TestStaticPassSeesPointerArithmetic(unittest.TestCase):
             "int main(void){ int *a = malloc(40); a[0] = 1; free(a);\n"
             "  return a[2]; }\n")
         self.assertIn("use-after-free", report)
+
+
+
+
+CONTRACT_SRC = """
+extern void *malloc(unsigned long size);
+void fill(int *p)
+assert len(p) >= 4
+{ p[0] = 1; p[1] = 2; p[2] = 3; p[3] = %s }
+int main() { int *p = malloc(%d * sizeof(int)); fill(p); return p[3]; }
+"""
+
+
+def _contract_src(tail="4;", elems=4):
+    return CONTRACT_SRC % (tail, elems)
+
+
+def _downgraded(info):
+    """How many checks the report says were downgraded to a shadow update."""
+    import re
+    m = re.search(r"(\d+) downgraded", info)
+    return int(m.group(1)) if m else 0
+
+
+class TestContractBoundedParameter(unittest.TestCase):
+    """Rule 4: a proven contract is a bound the callee may use.
+
+    `len(p)` counts elements, so `>= 4` on an `int *` is 16 bytes. Every one of
+    these is a soundness test except the first: the rule must fire only where
+    the contract has actually been established, and the checks it leaves behind
+    must still catch a real overflow.
+    """
+
+    def test_a_proven_contract_downgrades_the_writes(self):
+        _, info = _build(_contract_src())
+        self.assertEqual(_downgraded(info), 4, info)
+
+    def test_no_contract_proves_nothing(self):
+        src = _contract_src().replace("assert len(p) >= 4\n", "")
+        _, info = _build(src)
+        self.assertEqual(_downgraded(info), 0, info)
+
+    def test_a_caller_that_allocates_less_proves_nothing(self):
+        _, info = _build(_contract_src(elems=2))
+        self.assertEqual(_downgraded(info), 0, info)
+
+    def test_a_callee_that_calls_anything_proves_nothing(self):
+        """Nothing supplies liveness for a parameter, so a call may have freed
+        it and the bound lapses."""
+        src = ("extern void *malloc(unsigned long size);\n"
+               "extern void other(int *q);\n"
+               "void fill(int *p)\n"
+               "assert len(p) >= 4\n"
+               "{ p[0] = 1; other(p); p[1] = 2; p[2] = 3; p[3] = 4; }\n"
+               "int main() { int *p = malloc(4 * sizeof(int));"
+               " fill(p); return p[3]; }\n")
+        _, info = _build(src)
+        self.assertEqual(_downgraded(info), 0, info)
+
+    def test_one_past_the_bound_keeps_its_check_and_is_caught(self):
+        rc, err, info = _run(_contract_src(tail="4; p[4] = 5;"))
+        self.assertEqual(_downgraded(info), 4, info)
+        self.assertIn("heap buffer overflow", err)
+
+    def test_a_contract_the_caller_breaks_is_still_caught(self):
+        rc, err, _ = _run(_contract_src(elems=2))
+        self.assertIn("heap buffer overflow", err)
+
+    def test_the_program_is_unchanged(self):
+        rc, _, _ = _run(_contract_src())
+        self.assertEqual(rc, 4)
+
+    def test_withdrawing_the_certificate_withdraws_the_elision(self):
+        """The bound is used on evidence. Putting the call site past
+        `CRUST_PROOF_MAX` removes the certificate, and the checks come back."""
+        env = dict(os.environ, CRUST_PROOF_MAX="1")
+        d = tempfile.mkdtemp()
+        c = os.path.join(d, "t.c")
+        with open(c, "w") as f:
+            f.write(_contract_src())
+        p = subprocess.run(["shivyc", "--no-cache", "--mem-safe", c,
+                            "-o", os.path.join(d, "t")],
+                           capture_output=True, text=True, env=env)
+        self.assertEqual(_downgraded(p.stdout), 0, p.stdout)
 
 
 if __name__ == "__main__":
