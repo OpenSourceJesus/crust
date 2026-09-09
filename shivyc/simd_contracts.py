@@ -153,6 +153,68 @@ def analyze(il_code, symbol_table, ext_info):
     return proven, reports
 
 
+def parameter_extents(il_code, symbol_table):
+    r"""How many bytes each contracted pointer parameter is guaranteed.
+
+    `{(function, argument index): bytes}`, and only where the guarantee has
+    actually been established: every visible call site must be traced to an
+    allocation big enough, and -- when a proof kernel is available -- the
+    contract must come with a certificate.  A contract nobody has checked at
+    the call sites says nothing about what the callee may assume, which is the
+    difference between a promise and a proof.
+
+    `len(p)` counts *elements*, as it does everywhere else in this pass, so a
+    `len>= 64` on an `int *` is 256 bytes. Getting that conversion wrong would
+    hand `memsafe_elide` a bound four times too large, so it is done once,
+    here, next to the element size it needs.
+    """
+    from shivyc import contracts as contract_state
+    from shivyc import proofs
+
+    meta = getattr(contract_state, "_meta", None) or {}
+    params = getattr(contract_state, "_params", None) or {}
+    if not meta:
+        return {}
+    name_of = _build_function_names(il_code, symbol_table)
+    extents = {}
+
+    for fname, arg_contracts in meta.items():
+        if fname not in il_code.commands or fname not in params:
+            continue
+        layout = {a["index"]: a for a in _arg_layout(fname, symbol_table)}
+        sites = _find_call_sites(il_code, name_of, fname)
+        if not sites:
+            continue                 # never called here: nothing established
+        for arg_name, contract in arg_contracts.items():
+            least = contract.get("len>=")
+            if least is None or arg_name not in params[fname]:
+                continue
+            index = params[fname].index(arg_name)
+            shape = layout.get(index)
+            if shape is None or not shape["is_ptr"]:
+                continue
+            elem = shape["elem_size"]
+            if not elem:
+                continue
+            ok = True
+            for caller, call in sites:
+                if index >= len(call.args):
+                    ok = False
+                    break
+                byte_size = _trace_malloc_bytes(
+                    il_code, name_of, il_code.commands[caller],
+                    call.args[index])
+                if byte_size is None or byte_size < least * elem:
+                    ok = False
+                    break
+                if not proofs.licenses(byte_size // elem, contract):
+                    ok = False
+                    break
+            if ok:
+                extents[(fname, index)] = least * elem
+    return extents
+
+
 def _satisfies(count, contract):
     """Check a proven element count against a contract dict.
 

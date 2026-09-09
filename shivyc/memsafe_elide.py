@@ -36,6 +36,23 @@ For the same reason rule 2 never elides a *read*. Bounds and liveness are
 provable in advance; definedness is a run-time fact, and consulting it is the
 whole of what a proved read still has to do.
 
+**Rule 4 -- a parameter with a proven contract.** `assert len(p) >= 64` on a
+parameter is a statement about every caller, and Crust can check it against
+every caller. Where it holds at all of them, the callee may treat `p` as an
+allocation of at least that size, and a constant offset into it is in bounds by
+the same arithmetic rule 2 uses. `len` counts elements, so the byte extent is
+`len * sizeof(*p)`; the conversion is done in `simd_contracts` next to the
+element size rather than guessed at here.
+
+Two conditions, and both are about not being wrong rather than about being
+useful. The contract has to have been *established* -- every visible call site
+traced to an allocation large enough, and, when a proof kernel is available, a
+certificate for it -- because an unchecked promise tells the callee nothing.
+And the function must make no calls at all: rule 2 gets its liveness from the
+static pass, and there is no such fact about a parameter, so the only safe
+substitute is a body in which nothing could have freed the buffer. That rules
+out most functions and keeps the ones this is for, which are leaves.
+
 Rule 1 has no such problem. It only fires when the identical address was
 already checked at least as wide in the same block, so the bytes are already
 known defined -- by the earlier write, or by the earlier read having passed.
@@ -69,6 +86,32 @@ def _literal(val):
         return None
     n = getattr(lit, "val", None)
     return n if isinstance(n, int) else None
+
+
+def _is_parameter(alloc):
+    """Whether an allocation id came from a contract rather than a malloc."""
+    return isinstance(alloc, tuple) and len(alloc) == 3 and alloc[0] == "param"
+
+
+def _frees_nothing(cmds):
+    """No calls at all, so nothing in this body can have freed a parameter."""
+    return not any(isinstance(c, control_cmds.Call) for c in cmds)
+
+
+def _parameter_sizes(il_code, symbol_table, prog):
+    """Pseudo-allocations for pointer parameters whose contract is proven."""
+    try:
+        from shivyc import simd_contracts
+        extents = simd_contracts.parameter_extents(il_code, symbol_table)
+    except Exception:
+        return {}
+    sizes = {}
+    for (fname, index), byte_size in extents.items():
+        cmds = prog.functions.get(fname)
+        if cmds is None or not _frees_nothing(cmds):
+            continue
+        sizes[("param", fname, index)] = byte_size
+    return sizes
 
 
 def _alloc_size(cmd):
@@ -273,7 +316,52 @@ def _nonneg(cmds):
     return cand
 
 
-def _single_def_origins(cmds, sizes, fn):
+def _constants(cmds):
+    """Values holding a compile-time constant, folded through `*`, `+`, copies.
+
+    `p[2]` is emitted as `Add(p, Mult(2, 4))`, so the offset is constant but
+    is not a *literal* and the origin tracker walked straight past it. Folding
+    is what makes a constant index look like the constant it is -- which rule 2
+    wanted too, for every `a[3]` into a malloc'd array.
+
+    Only values assigned once in the whole function are folded. IL values are
+    not SSA, and a stale constant would be a wrong offset, which is the one
+    error this module must not make.
+    """
+    count = {}
+    for c in cmds:
+        for o in c.outputs():
+            count[id(o)] = count.get(id(o), 0) + 1
+
+    known = {}
+
+    def value_of(val):
+        lit = _literal(val)
+        return lit if lit is not None else known.get(id(val))
+
+    for c in cmds:
+        outs = c.outputs()
+        if len(outs) != 1 or count.get(id(outs[0])) != 1:
+            continue
+        if isinstance(c, (math_cmds.Mult, math_cmds.Add)):
+            a, b = value_of(c.arg1), value_of(c.arg2)
+            if a is None or b is None:
+                continue
+            known[id(outs[0])] = a * b if isinstance(c, math_cmds.Mult) else a + b
+        elif isinstance(c, value_cmds.Set):
+            a = value_of(c.arg)
+            if a is not None:
+                known[id(outs[0])] = a
+    return known
+
+
+def _offset(val, consts):
+    """The constant `val` holds, literal or folded."""
+    lit = _literal(val)
+    return lit if lit is not None else consts.get(id(val))
+
+
+def _single_def_origins(cmds, sizes, fn, consts):
     """Constant-offset origins for values defined exactly once.
 
     Block-local tracking cannot see the `malloc` that happens before a loop,
@@ -290,7 +378,11 @@ def _single_def_origins(cmds, sizes, fn):
     origin = {}
     for i in range(len(cmds)):
         c = cmds[i]
-        if (isinstance(c, control_cmds.Call) and c.direct_name in ALLOCATORS
+        if isinstance(c, value_cmds.LoadArg) and count.get(id(c.output)) == 1:
+            key = ("param", fn, c.arg_num)
+            if key in sizes:
+                origin[id(c.output)] = (key, 0)
+        elif (isinstance(c, control_cmds.Call) and c.direct_name in ALLOCATORS
                 and c.ret is not None and count.get(id(c.ret)) == 1
                 and (fn, i) in sizes):
             origin[id(c.ret)] = ((fn, i), 0)
@@ -300,7 +392,7 @@ def _single_def_origins(cmds, sizes, fn):
         elif isinstance(c, math_cmds.Add) and count.get(id(c.output)) == 1:
             for p, q in ((c.arg1, c.arg2), (c.arg2, c.arg1)):
                 if id(p) in origin:
-                    k = _literal(q)
+                    k = _offset(q, consts)
                     if k is not None:
                         al, off = origin[id(p)]
                         origin[id(c.output)] = (al, off + k)
@@ -393,6 +485,7 @@ def safe_accesses(il_code, symbol_table):
                     sizes[(fn, i)] = n
                     bases[(fn, i)] = c.ret
                     base_at[(fn, i)] = i
+    sizes.update(_parameter_sizes(il_code, symbol_table, prog))
 
     out = {}
     marks = {}
@@ -412,7 +505,8 @@ def safe_accesses(il_code, symbol_table):
         dom = _dominators(cfg)
         bounds = _upper_bounds(cfg, cmds, dom)
         nonneg = _nonneg(cmds)
-        far_origin = _single_def_origins(cmds, sizes, fn)
+        consts = _constants(cmds)
+        far_origin = _single_def_origins(cmds, sizes, fn, consts)
 
         mark = set()
         indexed_at = {}    # cmd index -> (alloc, base offset, index, scale, n)
@@ -497,7 +591,7 @@ def safe_accesses(il_code, symbol_table):
                                 indexed_at[i] = (ori2[0], ori2[1], None, 0, n)
                 continue
 
-            _propagate(c, vn, origin, scaled, indexed, far_origin)
+            _propagate(c, vn, origin, scaled, indexed, far_origin, consts)
 
         # Hoist whole-loop shadow updates. A proved write inside a counted
         # loop defines one contiguous run of bytes over the whole loop, so a
@@ -664,8 +758,11 @@ def _try_elide(c, i, n, writing, vn, checked, origin, live, sizes, skip, mark,
     if ori is not None:
         al, off = ori
         size = sizes.get(al)
-        if (size is not None and live.get(i) == al
-                and off >= 0 and off + n <= size):
+        # A parameter has no allocation for the static pass to call live, so
+        # rule 4 stands in for that half: the body makes no calls, which is
+        # what registered it in the first place.
+        alive = live.get(i) == al or _is_parameter(al)
+        if size is not None and alive and off >= 0 and off + n <= size:
             mark.add(i)
     return False
 
@@ -676,7 +773,7 @@ def _base_origin(val, origin, far_origin):
     return ori if ori is not None else far_origin.get(id(val))
 
 
-def _propagate(c, vn, origin, scaled, indexed, far_origin):
+def _propagate(c, vn, origin, scaled, indexed, far_origin, consts=None):
     """Number an ordinary command's result and track how addresses are built."""
     if isinstance(c, value_cmds.Set):
         vn.define(c.output, ("set", vn.of(c.arg)))
@@ -702,7 +799,7 @@ def _propagate(c, vn, origin, scaled, indexed, far_origin):
             if ori is None:
                 continue
             al, off = ori
-            k = _literal(q)
+            k = _offset(q, consts or {})
             if k is not None:                       # base + constant
                 origin[id(c.output)] = (al, off + k)
                 return
