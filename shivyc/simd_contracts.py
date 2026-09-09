@@ -25,6 +25,7 @@ reductions whose alignment is *proven*, and otherwise leaves ShivyC's ordinary
 scalar codegen untouched.
 """
 
+from shivyc import proofs
 import shivyc.il_cmds.control as control_cmds
 import shivyc.il_cmds.value as value_cmds
 import shivyc.il_cmds.math as math_cmds
@@ -137,13 +138,15 @@ def analyze(il_code, symbol_table, ext_info):
 
 
 def _satisfies(count, contract):
-    """Check a proven element count against a contract dict."""
-    if "len>=" in contract and count < contract["len>="]:
+    """Check a proven element count against a contract dict.
+
+    Delegated to `shivyc.proofs` so that this pass and `contracts` read one
+    contract the same way; with `CRUST_PROOFS=1` the reading is additionally
+    checked by RosettaMath's kernel, and the certificate is reported.
+    """
+    if not proofs.satisfies(count, contract):
         return False
-    if "len<=" in contract and count > contract["len<="]:
-        return False
-    if "div-by" in contract and count % contract["div-by"] != 0:
-        return False
+    proofs.certified(count, contract)        # raises on a disagreement
     return True
 
 
