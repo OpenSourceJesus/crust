@@ -42,11 +42,13 @@ class ProofResult:
         self.call_sites = 0
         self.proven = False
         self.reason = ""
+        self.evidence = "read by the compiler"
 
     def __str__(self):
         if self.proven:
             return (f"simd-contracts: '{self.name}': contracts proven at all "
-                    f"{self.call_sites} call site(s); scalar fallback omitted")
+                    f"{self.call_sites} call site(s) ({self.evidence}); "
+                    f"scalar fallback omitted")
         return (f"simd-contracts: '{self.name}': not proven "
                 f"({self.reason}); keeping scalar code")
 
@@ -95,10 +97,24 @@ def analyze(il_code, symbol_table, ext_info):
         for caller, call in sites:
             count = _prove_one_call_multi(
                 il_code, name_of, caller, call, ptrs, len_index)
-            if count is None or not _satisfies(count, contract):
+            if count is None:
                 all_ok = False
                 result.reason = "a call site could not be proven aligned"
                 break
+            if not _satisfies(count, contract):
+                all_ok = False
+                result.reason = "a call site could not be proven aligned"
+                break
+            # Satisfying the contract is not on its own a licence to drop the
+            # scalar tail.  Omitting code needs evidence, and when a proof
+            # kernel is available the certificate is the evidence; without one
+            # the tail stays, which costs speed and never correctness.
+            if not proofs.licenses(count, contract):
+                all_ok = False
+                result.reason = (f"a call site is aligned but unproved "
+                                 f"({proofs.evidence(count, contract)})")
+                break
+            result.evidence = proofs.evidence(count, contract)
             counts.add(count)
         if not all_ok:
             reports.append(result)

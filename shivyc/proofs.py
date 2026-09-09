@@ -22,8 +22,8 @@ Beyond agreeing with itself, the reading can be *checked*.  RosettaMath's
 contract into a term of that calculus: `{'len>=': 64, 'div-by': 4}` becomes
 `andb (dvdb 4 n) (leb 64 n)`, which at a known length reduces to `true` or
 `false` under the kernel's own evaluator, and when it reduces to `true` a proof
-term is built and type-checked.  That is off by default and costs nothing when
-off -- see `certified()` for why, and for what it costs when on.
+term is built and type-checked.  Nothing is imported until a contract actually needs certifying, so a program
+without contracts pays nothing; `CRUST_PROOFS=0` turns it off entirely.
 """
 
 import os
@@ -84,13 +84,12 @@ def clause_text(arg_name, key, bounds):
 _KERNEL = None
 _TRIED = False
 
-#: Above this length the kernel is not consulted.  Its numerals are unary, so
-#: settling a contract at length n walks n of them, and the cost grows with the
-#: length rather than with the size of the number: about a second at 64 and
-#: half a minute at 1024.  That is fine for a proof and wrong for a compiler,
-#: so the budget keeps it to lengths where the answer arrives promptly.  The
-#: reading above does not change either way; only whether it comes with a proof.
-MAX_CERTIFIED = int(os.environ.get("CRUST_PROOF_MAX", "128"))
+#: Above this length the kernel is not consulted.  It used to be 128, because
+#: settling a contract meant walking a unary numeral and cost about a second at
+#: length 64.  The kernel now answers on literals by arithmetic, so the same
+#: check is a millisecond and the only cost left is *building* the numeral,
+#: which is linear.  The budget is what that leaves room for.
+MAX_CERTIFIED = int(os.environ.get("CRUST_PROOF_MAX", "65536"))
 
 
 def _kernel():
@@ -99,7 +98,7 @@ def _kernel():
     if _TRIED:
         return _KERNEL
     _TRIED = True
-    if os.environ.get("CRUST_PROOFS", "0") not in ("1", "true", "yes"):
+    if os.environ.get("CRUST_PROOFS", "1") in ("0", "false", "no"):
         return None
     import sys
     here = os.path.dirname(os.path.abspath(__file__))
@@ -144,6 +143,38 @@ def certified(length, bounds):
             "%d: kernel says %s. One of them is wrong and it is not safe to "
             "guess which." % (bounds, length, certificate.holds))
     return certificate
+
+
+def licenses(length, bounds):
+    """May generated code be changed on the strength of this contract?
+
+    Satisfying the contract is necessary and, when a proof kernel is available,
+    not sufficient: the certificate has to be there too.  A length past
+    `MAX_CERTIFIED`, or a bridge that will not load, means no certificate, and
+    then the answer is no -- the check stays, the scalar tail stays.
+
+    That is the same rule the rest of Crust follows: a proof that does not
+    arrive degrades to the conservative path, never to a wrong answer.  With
+    certification switched off there is no proof to wait for and the reading
+    stands on its own, which is what Crust did before any of this.
+    """
+    if not satisfies(length, bounds):
+        return False
+    certificate = certified(length, bounds)
+    if certificate is not None:
+        return certificate.holds
+    return _kernel() is None
+
+
+def evidence(length, bounds):
+    """What licensed it, for a report line."""
+    if not satisfies(length, bounds):
+        return "not satisfied"
+    if certified(length, bounds) is not None:
+        return "kernel-checked"
+    if _kernel() is None:
+        return "read by the compiler"
+    return "no certificate"
 
 
 def backend():
