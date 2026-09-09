@@ -167,5 +167,56 @@ class TestContracts(unittest.TestCase):
         proc, _ = _compile(src, link=False)
         self.assertNotIn("extension region", proc.stdout + proc.stderr)
 
+
+    def test_second_clause_is_checked_too(self):
+        """A length clearing one clause but breaking another is reported.
+
+        `assert len(p) >= 4` and `assert not len(p) % 4` are two clauses of one
+        contract. A seven-character literal clears the first and breaks the
+        second. The reading used to stop at the first clause present, so this
+        compiled; `simd_contracts` meanwhile conjoined every clause and refused
+        to prove the same call, which is how the split was found.
+        """
+        src = PROTO + (
+            "void handle(char *p)\n"
+            "    assert len(p) >= 4\n"
+            "    assert not len(p) % 4\n"
+            "{ char buf[64]; strcpy(buf, p); }\n"
+            "int main(void) { handle(\"abcdefg\"); return 0; }\n")
+        proc, _ = _compile(src)
+        out = proc.stdout + proc.stderr
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("not len(p) % 4", out)
+
+    def test_all_clauses_satisfied_still_compiles(self):
+        """The same contract with a length meeting every clause is fine."""
+        src = PROTO + (
+            "void handle(char *p)\n"
+            "    assert len(p) >= 4\n"
+            "    assert not len(p) % 4\n"
+            "{ char buf[64]; strcpy(buf, p); }\n"
+            "int main(void) { handle(\"abcdefgh\"); return 0; }\n")
+        proc, out = _compile(src)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def test_the_two_passes_read_one_contract(self):
+        """`contracts` and `simd_contracts` agree on every clause set."""
+        from shivyc.contracts import _violates
+        from shivyc.simd_contracts import _satisfies
+        grid = [{"len>=": 64}, {"len<=": 8}, {"div-by": 4},
+                {"len>=": 64, "div-by": 4}, {"len>=": 4, "len<=": 16},
+                {"len>=": 8, "len<=": 64, "div-by": 8}]
+        for bound in grid:
+            for n in range(0, 130):
+                self.assertEqual(_violates(n, bound), not _satisfies(n, bound),
+                                 f"{bound} at length {n}")
+
+    def test_an_unreadable_clause_is_an_error(self):
+        """A clause with no reading is raised, not skipped."""
+        from shivyc import proofs
+        with self.assertRaises(proofs.UnknownBound):
+            proofs.satisfies(64, {"align": 16})
+
+
 if __name__ == "__main__":
     unittest.main()
