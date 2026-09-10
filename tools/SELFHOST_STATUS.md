@@ -25,7 +25,7 @@ Stage 1 -- DONE
 All compiler modules transpile to C and gcc-compile, and the whole thing links
 into a single working native binary:
 
-    built native self-host compiler: .../shivyc_native (60 modules linked)
+    built native self-host compiler: .../shivyc_native (70 modules linked)
 
 `make bootstrap` then runs a 10/10 smoke test (const, arithmetic, if/else,
 while, for, recursion, pointers, arrays, pointer arithmetic, string indexing)
@@ -95,7 +95,38 @@ Debugging tips (carried over, still useful)
 * A recurring py2c bug class: a 64-bit value (ILValue/CType/pointer/list) held
   by a parameter or field whose *name* matches the int/str type heuristic gets
   silently truncated to C int or coerced to char*. Annotate the param/field
-  (`: "object"` or `: "ILValue"`) to override the heuristic. The new
+  (`: "object"` or `: "ILValue"`) to override the heuristic.
+
+  This is worth checking FIRST. It accounted for four separate stage-1
+  blockers, and the tell is always that the name reads as the wrong type while
+  a neighbouring parameter of the same shape is typed correctly:
+    - `FuncBody.code` (wasm.py) -- a list of instruction bytes, typed char*;
+      23 list_append calls failed to compile.
+    - `ValueNumbering.num` (memsafe_elide.py) -- a dict, typed int.
+    - `op(code, ...)` (wasm_simd.py) -- an opcode *number*, typed char*, so
+      every key was boxed OBJ_STR(<int>) and the OPCODES lookup compared a
+      NULL string. This one built and linked fine and then segfaulted in
+      strcmp during module init, before reading a line of input. Note that
+      `seq(start, ...)` on the next line was typed int correctly -- the only
+      difference was the parameter's name.
+    - Symptom to watch for: a crash inside a runtime helper (strcmp, dict_find)
+      rather than in generated code.
+
+* Host-only code guards. Anything the translator cannot lower -- dynamic
+  imports, subprocess, sys.path manipulation -- goes behind
+  `if sys.implementation.name != "shivyc":`, which folds to false at
+  translation time and drops the block. The guard must *contain* the
+  unlowerable call, not merely return early before it: an early return leaves
+  the call as a sibling statement that still has to compile.
+
+* Constructs whose absence is silent rather than loud. `bytes()` used to alias
+  `str()`, which is correct for a string and wrong for a list of ints -- it
+  rendered the list's repr, so wasm's module_bytes() would have written
+  "[0, 97, 115, ...]" to disk. `.decode()` had no lowering at all and was
+  emitted as a bare call that gcc implicitly declared as returning int.
+  `isinstance(x, some_tuple_variable)` resolved only the first class and
+  emitted NULL for the rest. When a lowering looks suspiciously simple, check
+  what it does to a non-string argument. The new
   `python3 tools/py2c.py <file> --show-object-model` dumps exactly how each
   field/param was typed (POD vs object) so these mismatches are visible before
   they crash at runtime.

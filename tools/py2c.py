@@ -267,7 +267,10 @@ void require(const char* name);
 void package(const char* name);
 
 /* ---- small python-ish helpers ---- */
+extern int    rt_argc;             /* the process command line, captured in   */
+extern char** rt_argv;             /* main so sys.argv works outside it too   */
 str  pystr(obj v);                 /* str(x)                                  */
+str  pybytes(obj v);               /* bytes(x)/bytearray(x) over a byte list  */
 str  pyrepr(obj v);                 /* repr() — quotes strings inside containers */
 str  pyfmt(int n, const char* fmt, ...); /* f-strings: "{}..." + obj args     */
 str  pyfmt_a(const char* fmt, obj* args, int n);  /* varargs-free f-strings    */
@@ -1071,6 +1074,34 @@ str fmt_double(double d) {
     }
     sprintf(b, "%s", tmp);
     return b;
+}
+
+/* bytes(x) / bytearray(x). Distinct from pystr: over a list of ints Python
+   builds the byte string itself, while pystr would render the *repr* of the
+   list ("[0, 97, 115]"). The wasm backend's module_bytes() hit exactly that,
+   so an encoded module was written to disk as its own printed list. Strings
+   pass through unchanged; anything else falls back to pystr. */
+/* Captured at the top of main(). `sys.argv` used to lower to the bare names
+   `argc`/`argv`, which only exist inside main -- so reading it from any helper
+   emitted an undeclared identifier (main.py's _rewrite_mem_safe_flag), and a
+   local also named `argv` silently shadowed it. */
+int    rt_argc = 0;
+char** rt_argv = 0;
+
+str pybytes(obj v) {
+    if (v.tag == T_STR) return v.u.s ? v.u.s : "";
+    if (v.tag == T_LIST || v.tag == T_SET) {
+        List* l = (List*)v.u.o;
+        char* b = aalloc((size_t)l->len + 1);
+        for (int i = 0; i < l->len; i++) {
+            obj e = l->data[i];
+            b[i] = (char)(unsigned char)((e.tag == T_INT || e.tag == T_BOOL)
+                                         ? e.u.i : 0);
+        }
+        b[l->len] = 0;
+        return b;
+    }
+    return pystr(v);
 }
 
 str pystr(obj v) {
@@ -3006,6 +3037,23 @@ def _assigned_names(fn):
     return out
 
 
+def _inner_def_names(sub):
+    """Names bound by a `def`/`class` nested *inside* `sub`.
+
+    These are locals of `sub`, so a reference to one is not a free variable and
+    must not be captured. Kept separate from `_assigned_names` on purpose: that
+    set is also used to build the *enclosing* scope for the lift, and a nested
+    def's name does not belong there -- adding it made a self-recursive nested
+    function (pack_args' `walk`) capture itself.
+    """
+    out = set()
+    for n in ast.walk(sub):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
+                          ast.ClassDef)) and n is not sub:
+            out.add(n.name)
+    return out
+
+
 def _cellify_nonlocals(fn):
     """Box variables that nested functions rebind via `nonlocal` into
     one-element list cells, so the ordinary lift can handle them.
@@ -3106,7 +3154,7 @@ def _reads_self_fields(fn):
 def _free_vars(sub, enclosing_names):
     """Enclosing locals that `sub` reads but does not itself bind/param."""
     params = {a.arg for a in sub.args.args}
-    bound = params | _assigned_names(sub)
+    bound = params | _assigned_names(sub) | _inner_def_names(sub)
     used = {n.id for n in ast.walk(sub)
             if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
     return [nm for nm in sorted(used & enclosing_names) if nm not in bound]
@@ -3439,7 +3487,8 @@ def convert_block_closures(tree):
                         real.append(p)
                         real_defs.append(d)
                 # free vars read in the BODY (not in default expressions)
-                bound = {a.arg for a in params} | _assigned_names(sub)
+                bound = {a.arg for a in params} | _assigned_names(sub) \
+                    | _inner_def_names(sub)
                 body_used = set()
                 for st in sub.body:
                     for n in ast.walk(st):
@@ -4969,6 +5018,23 @@ static obj _ospath_splitext(char* p) {
     list_append(l, OBJ_STR(ext));
     return l;
 }
+static char* _ospath_expanduser(char* p) {
+    /* Only the leading "~" / "~/" form, which is all the compiler sources use.
+       With no HOME set, Python leaves the path untouched -- do the same rather
+       than splicing in an empty prefix. */
+    const char* h;
+    char* out;
+    size_t hn, pn;
+    if (!p || p[0] != '~') return p;
+    if (p[1] != 0 && p[1] != '/') return p;
+    h = getenv("HOME");
+    if (!h || !*h) return p;
+    hn = strlen(h); pn = strlen(p + 1);
+    out = aalloc(hn + pn + 1);
+    memcpy(out, h, hn);
+    memcpy(out + hn, p + 1, pn + 1);
+    return out;
+}
 static long _ospath_getmtime(char* p) {
     struct stat _st;
     if (stat(p, &_st) != 0) return -1;
@@ -6479,7 +6545,23 @@ class Transpiler:
                                 for n in reg["consts"]:
                                     self.from_imports.setdefault(n, abs_mod)
                     else:
-                        self.from_imports[a.asname or a.name] = abs_mod
+                        # `from shivyc import proofs` binds a *submodule*, not
+                        # a symbol exported by the package. Filed under
+                        # from_imports it has no xmod registry of its own, so
+                        # `proofs.failing(x)` missed the module-qualified call
+                        # path and fell through to the generic method-call
+                        # heuristic -- emitting `failing(proofs, x)` with the
+                        # module name as a receiver, which is an undeclared
+                        # identifier in C. Detect the submodule and register it
+                        # as a module alias so attribute access resolves
+                        # through xref() to the bare exported symbol.
+                        sub = "%s.%s" % (abs_mod, a.name) if abs_mod else None
+                        if sub and self._find_local_module(sub):
+                            alias = a.asname or a.name
+                            self.modules.add(alias)
+                            self.import_alias[alias] = sub
+                        else:
+                            self.from_imports[a.asname or a.name] = abs_mod
 
     def _scan_ctypes(self, tree):
         """FFI bridge: track `ctypes.CDLL` handles and `lib.symbol` lookups as
@@ -8271,6 +8353,20 @@ class Transpiler:
             return self._resolve_class_default(ci, val.id, seen)
         return val
 
+    def _imported_const_value(self, name):
+        """The raw Python value of a bare Name that is a constant of some
+        imported module, or None. Same search as _lookup_imported_const, but
+        returns the value rather than a rendered literal so callers can put it
+        through the normal expression path."""
+        for mod in (set(self.from_imports.values())
+                    | set(self.import_alias.values())):
+            if not mod:
+                continue
+            reg = self.load_xmod(mod)
+            if reg and name in reg.get("consts", {}):
+                return reg["consts"][name]
+        return None
+
     def _lookup_imported_const(self, name, ci=None):
         """Resolve a bare Name to a C literal from an imported/base module."""
         mods = set(self.from_imports.values()) | set(self.import_alias.values())
@@ -9495,15 +9591,35 @@ class Transpiler:
         return clauses
 
     def _uses_argv(self, node):
-        """True if this is `main` and its body reads `sys.argv` -- then main
+        """True if this is `main` and *the module* reads `sys.argv` -- then main
         takes (int argc, char** argv) instead of (void), so a runtime command
-        line argument can drive the program (and defeat constant folding)."""
+        line argument can drive the program (and defeat constant folding).
+
+        The test is module-wide, not main-only: sys.argv now lowers against the
+        rt_argc/rt_argv globals, which main is the one to populate. A helper
+        that reads the command line (main.py's _rewrite_mem_safe_flag) would
+        otherwise leave them zeroed, and the read would come back empty at
+        runtime rather than failing to build.
+        """
         if node.name != "main":
             return False
-        for sub in ast.walk(node):
-            if self._is_sys_argv(sub):
-                return True
-        return False
+        return self._module_reads_argv()
+
+    def _module_reads_argv(self):
+        """Does any function in this module read `sys.argv`?"""
+        cached = getattr(self, "_argv_seen", None)
+        if cached is not None:
+            return cached
+        found = False
+        for fn in getattr(self, "func_nodes", {}).values():
+            for sub in ast.walk(fn):
+                if self._is_sys_argv(sub):
+                    found = True
+                    break
+            if found:
+                break
+        self._argv_seen = found
+        return found
 
     def _is_sys_argv(self, node):
         return (isinstance(node, ast.Attribute) and node.attr == "argv"
@@ -9585,6 +9701,8 @@ class Transpiler:
         # unit has no _entry.c to do that, so main runs its own module init
         # first -- otherwise module globals stay zeroed and, e.g., a global
         # list reads back as empty. The init is idempotent.
+        if node.name == "main" and self._uses_argv(node):
+            self.emit("rt_argc = argc; rt_argv = argv;")
         if node.name == "main":
             # Imported modules first: their globals are just as zeroed until
             # their own init runs, and this module's code reads them. cpprust
@@ -9694,7 +9812,7 @@ class Transpiler:
             fn = node.func.id
             if fn in ("int", "len", "ord", "abs", "hash"):
                 return "int"
-            if fn in ("str", "chr", "repr", "input", "bytes"):
+            if fn in ("str", "chr", "repr", "input", "bytes", "bytearray"):
                 return "str"
             if fn == "float":
                 return "float"
@@ -10526,7 +10644,7 @@ class Transpiler:
                     isinstance(_f.value.value, ast.Name) and \
                     _f.value.value.id == "os" and _f.value.attr == "path":
                 if _f.attr in ("dirname", "basename", "abspath", "join",
-                               "normpath", "realpath"):
+                               "normpath", "realpath", "expanduser"):
                     return "char*"       # returns a C string
                 if _f.attr in ("exists", "isfile", "isdir"):
                     return "int"
@@ -10699,13 +10817,17 @@ class Transpiler:
                     return "FILE*"
                 if f.id == "input":
                     return "char*"
-                if f.id == "isinstance":
+                if f.id in ("isinstance", "hasattr"):
+                    # hasattr against a declared attribute lowers to an
+                    # OBJ_ISINST test, i.e. a C bool. Untyped, it defaulted to
+                    # obj, so `or` unified its operands to obj and left this
+                    # arm unboxed -- "type mismatch in conditional expression".
                     return "bool"
                 if f.id in ("any", "all"):
                     return "bool"
                 if f.id in ("chr", "repr"):
                     return "char*"
-                if f.id in ("str", "bytes"):
+                if f.id in ("str", "bytes", "bytearray"):
                     if self.stdlib_root and len(node.args) != 1:
                         return OBJ
                     return "char*"
@@ -10846,7 +10968,8 @@ class Transpiler:
                                   "isalpha", "isspace", "isalnum"):
                         return "bool"
                     if f.attr in ("strip", "lstrip", "rstrip", "replace",
-                                  "lower", "upper", "encode", "join"):
+                                  "lower", "upper", "encode", "decode",
+                                  "join"):
                         return "char*"
                     if f.attr in ("split", "splitlines", "keys", "values",
                                   "items", "get", "pop", "setdefault"):
@@ -11483,6 +11606,13 @@ class Transpiler:
                 lines += self.indent_lines(self.suite(node.body))
                 lines.append("}")
                 return lines
+            if decl and self.scope.get(tgt.id) is None:
+                # Record the loop variable's C type. Inside a function the
+                # hoisting pass has already done this, but module-level
+                # statements are lowered straight into <mod>_init() with no
+                # such pass -- so `"x%d" % _n` boxed nothing and emitted
+                # `_sm[0] = _n`, an int assigned into an obj slot.
+                self.scope[tgt.id] = "int"
             lines = ["for (%s%s = %s; %s; %s += %s) {" %
                      (decl, v, lo, cont, v, stp)]
             lines += self.indent_lines(self.suite(node.body))
@@ -12183,6 +12313,18 @@ class Transpiler:
                 self.wrap_obj(node.value), c_string(node.attr))
         if isinstance(node.value, ast.Name):
             base = node.value.id
+            # Bare `os.environ` as a *value* (e.g. `dict(os.environ)`). There
+            # is no live environ dict in the C runtime -- only os.environ.get
+            # is lowered, against getenv. Without this the name fell through to
+            # the module-attribute path and emitted `os_environ`, an undeclared
+            # identifier. Yield an empty dict and say so, rather than a symbol
+            # that does not exist.
+            if base == "os" and node.attr == "environ" \
+                    and "os" not in self.scope:
+                self._warn_unsupported(
+                    node.lineno, "os.environ", "an empty dict",
+                    "only os.environ.get(...) is lowered, against getenv")
+                return "dict_new()"
             # `ClassName.CONST` where CONST is a class-level scalar constant
             # (e.g. `ParserError.AFTER`): resolve to the literal rather than
             # instantiating the class and reading a struct member. Works for a
@@ -12525,6 +12667,12 @@ class Transpiler:
                     self._ossys_used = True
                     return ("_ospath_splitext(%s)"
                             % self._coerce_str_arg(node, 0))
+                if f.attr == "expanduser":
+                    # Previously unlowered, so `os.path` was emitted as a
+                    # receiver -- "'os_path' undeclared" in proofs.
+                    self._ossys_used = True
+                    return ("_ospath_expanduser(%s)"
+                            % self._coerce_str_arg(node, 0))
                 if f.attr == "getmtime":
                     # Unsupported before this: the emitted call treated
                     # `os.path` as a receiver object that does not exist, so
@@ -12797,6 +12945,12 @@ class Transpiler:
                     ("int", "bool") else "AS_INT(%s)" % self.wrap_obj(size)
                 return "float_to_bits(%s, %s)" % (
                     self.wrap_obj(node.args[0]), sz)
+            if fn in ("bytes", "bytearray") and len(node.args) == 1 \
+                    and not self.stdlib_root:
+                # Not the same as str(): see pybytes() in the runtime.
+                # `bytearray` had no lowering at all here and was emitted as a
+                # bare (undeclared) call.
+                return "pybytes(%s)" % self.wrap_obj(node.args[0])
             if fn in ("str", "bytes"):
                 if len(node.args) == 1:
                     return "pystr(%s)" % self.wrap_obj(node.args[0])
@@ -12804,7 +12958,7 @@ class Transpiler:
                     return self._mp_import_call("builtins", "str", node)
             if fn == "len" and len(node.args) == 1:
                 if self._is_sys_argv(node.args[0]):
-                    return "argc"
+                    return "rt_argc"
                 if self._typed_list_ct(node.args[0]) is not None or \
                         self._typed_dict_ct(node.args[0]) is not None:
                     return "%s->len" % self.expr(node.args[0])
@@ -14454,6 +14608,21 @@ class Transpiler:
             elif default_nodes and i < len(default_nodes) and \
                     default_nodes[i] is not None:
                 a = default_nodes[i]
+                # An omitted argument's default is an AST node from the
+                # *defining* module, but it renders here in the caller's
+                # translation unit. A bare Name default that names a constant
+                # of that module (wasm's `def loop(self, blocktype=BLOCK_VOID)`
+                # called from asm_gen) was emitted unqualified and was
+                # undeclared. Resolve it to its literal, as class-attribute
+                # defaults already do.
+                if isinstance(a, ast.Name) and a.id not in self.scope \
+                        and a.id not in self.mod_global_names:
+                    _cv = self._imported_const_value(a.id)
+                    if _cv is not None:
+                        # Substitute a real Constant node rather than a
+                        # pre-rendered literal, so the ordinary typing path
+                        # boxes it correctly for an obj parameter.
+                        a = ast.copy_location(ast.Constant(value=_cv), a)
             else:
                 break                       # no more provided args / defaults
             out.append(self.coerce_to(target, a, self.expr(a)))
@@ -15399,7 +15568,7 @@ class Transpiler:
     def bool_expr(self, node):
         """Render `node` as a C truth test, boxing obj values via truthy()."""
         if self._is_sys_argv(node):         # `if sys.argv:` -> any args present
-            return "(argc > 0)"
+            return "(rt_argc > 0)"
         s = self.expr(node)
         if isinstance(node, (ast.Compare, ast.UnaryOp)):
             return s
@@ -15716,7 +15885,12 @@ class Transpiler:
             return "str_upper(%s)" % self.as_str(func.value)
         if m == "join":
             return "pyjoin(%s, %s)" % (self.as_str(func.value), self.wrap_obj(a[0]))
-        if m == "encode":
+        if m in ("encode", "decode"):
+            # Both are identity in this object model: `bytes` is just char*,
+            # so the codec/errors arguments carry no information. `decode` had
+            # no lowering at all and was emitted as a bare call, which gcc
+            # implicitly declared as returning int -- hence the "assigning to
+            # obj from int" errors in preproc and thread_contracts.
             return self.as_str(func.value)
         return None
 
@@ -15724,7 +15898,8 @@ class Transpiler:
                    "split", "rsplit", "partition", "splitlines", "replace",
                    "find",
                    "rfind", "rindex", "index", "isdigit", "isalpha",
-                   "isspace", "isalnum", "lower", "upper", "join", "encode"}
+                   "isspace", "isalnum", "lower", "upper", "join", "encode",
+                   "decode"}
 
     def truth_test(self, node, rendered):
         """A C truth test for `rendered` (the expr of `node`)."""
@@ -16010,7 +16185,7 @@ class Transpiler:
 
     def ex_Subscript(self, node):
         if self._is_sys_argv(node.value) and not isinstance(node.slice, ast.Slice):
-            return "argv[%s]" % self.as_long(node.slice)   # char* command-line arg
+            return "rt_argv[%s]" % self.as_long(node.slice)  # char* command-line arg
         # `sys.argv[1:]` -- the whole command line minus the program name,
         # which is how a program that hands its arguments to a function reads
         # them. Only indexing was lowered, so this emitted an undeclared
@@ -16022,8 +16197,8 @@ class Transpiler:
             self.loop_n += 1
             k = "_av%d" % self.loop_n
             return ("({ obj %s = list_new(); for (int %s_i = (%s); "
-                    "%s_i < argc; %s_i++) "
-                    "list_append(%s, OBJ_STR(argv[%s_i])); %s; })"
+                    "%s_i < rt_argc; %s_i++) "
+                    "list_append(%s, OBJ_STR(rt_argv[%s_i])); %s; })"
                     % (k, k, lo, k, k, k, k, k))
         # `{Cls1: v1, Cls2: v2, ...}[type(x)]` -- a type->value dispatch table.
         # A dict keyed by classes can't be built and looked up by type() in the

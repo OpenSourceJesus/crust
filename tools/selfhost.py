@@ -727,6 +727,11 @@ def cmd_compiler(build_root, args):
         "fputs(\"SHIVYC_RLINK is unavailable in the bootstrap compiler\\n\", "
         "stderr); abort(); }")
     entry.append("int main(int argc, char** argv) {")
+    # The bootstrap links one _entry.c as the real main, so it -- not any
+    # transpiled main -- is where the command line has to be captured. sys.argv
+    # lowers against these globals; left zeroed they read back empty at runtime
+    # instead of failing to build.
+    entry.append("    rt_argc = argc; rt_argv = argv;")
     entry += ["    %s();" % s for s in inits]
     entry.append("    obj rc = shivyc_pymain(argc, argv);")
     entry.append("    return (rc.tag == T_INT || rc.tag == T_BOOL) "
@@ -739,9 +744,23 @@ def cmd_compiler(build_root, args):
     for c in sorted(f for f in os.listdir(out) if f.endswith(".c")):
         oo = os.path.join(out, c[:-2] + ".o")
         res = compile_c(os.path.join(out, c), oo, inc_dirs=[out], extra=["-O0"])
-        (objs.append(oo) if res.returncode == 0 else fails.append(c[:-2]))
+        if res.returncode == 0:
+            objs.append(oo)
+        else:
+            fails.append((c[:-2], res.stderr))
     if fails:
-        print("compile fails: %s" % ", ".join(fails[:10])); return 1
+        # Print the whole list and the first diagnostic from each module. The
+        # old message truncated to ten names and dropped gcc's output entirely,
+        # so "compile fails: asm_gen, contracts, ..." gave no way to tell a
+        # mistyped field from an unresolved import without rebuilding by hand.
+        print("compile fails (%d): %s"
+              % (len(fails), ", ".join(n for n, _ in fails)))
+        for name, err in fails:
+            first = [ln for ln in err.splitlines() if ": error:" in ln]
+            print("  %s: %s" % (name, first[0] if first else "(see build dir)"))
+            for ln in first[1:3]:
+                print("  %s  %s" % (" " * len(name), ln))
+        return 1
     exe = os.path.join(out, "shivyc_native")
     fl = run(["gcc"] + objs + ["-o", exe, "-lm",
               "-Wl,--allow-multiple-definition"])
