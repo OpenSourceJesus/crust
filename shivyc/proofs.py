@@ -101,20 +101,27 @@ def _kernel():
     if os.environ.get("CRUST_PROOFS", "1") in ("0", "false", "no"):
         return None
     import sys
-    here = os.path.dirname(os.path.abspath(__file__))
-    for path in (os.environ.get("ROSETTAMATH_DIR"),
-                 os.path.join(here, "..", "..", "RosettaMath"),
-                 os.path.expanduser("~/RosettaMath")):
-        if path and os.path.isfile(os.path.join(path, "crustproof.py")):
-            full = os.path.abspath(path)
-            if full not in sys.path:
-                sys.path.insert(0, full)
-            try:
-                import crustproof
-                _KERNEL = crustproof
-            except ImportError:
-                _KERNEL = None
-            break
+    # The bridge is host-only: it locates RosettaMath at runtime and imports
+    # `crustproof` through a mutated sys.path, neither of which the translator
+    # can lower. Under the self-hosted build this condition folds to false and
+    # the whole block is dropped, so `_KERNEL` stays None and `certified()`
+    # reports "not asked" -- which is exactly right, since there is no kernel
+    # to ask. Under CPython it runs normally.
+    if sys.implementation.name != "shivyc":
+        here = os.path.dirname(os.path.abspath(__file__))
+        for path in (os.environ.get("ROSETTAMATH_DIR"),
+                     os.path.join(here, "..", "..", "RosettaMath"),
+                     os.path.expanduser("~/RosettaMath")):
+            if path and os.path.isfile(os.path.join(path, "crustproof.py")):
+                full = os.path.abspath(path)
+                if full not in sys.path:
+                    sys.path.insert(0, full)
+                try:
+                    import crustproof
+                    _KERNEL = crustproof
+                except ImportError:
+                    _KERNEL = None
+                break
     return _KERNEL
 
 
@@ -133,16 +140,26 @@ def certified(length, bounds):
         return None
     if any(bounds.get(key, 0) > MAX_CERTIFIED for key in bounds):
         return None
-    try:
-        certificate = kernel.check(length, bounds)
-    except Exception:                    # a bridge fault is not a compile error
-        return None
-    if certificate.holds != satisfies(length, bounds):
-        raise AssertionError(
-            "the proof kernel and this compiler disagree about %r at length "
-            "%d: kernel says %s. One of them is wrong and it is not safe to "
-            "guess which." % (bounds, length, certificate.holds))
-    return certificate
+    import sys
+    # Host-only for the same reason as `_kernel()`: `kernel` is a dynamically
+    # imported module object, so `kernel.check` has no lowering and was emitted
+    # as a bare `check(...)`. The whole kernel-consulting tail lives inside the
+    # guard so that under the self-hosted build it is *dropped* rather than
+    # left as unreachable code that still has to compile. `_kernel()` is always
+    # None there, so the early return above already covers this path.
+    if sys.implementation.name != "shivyc":
+        try:
+            certificate = kernel.check(length, bounds)
+        except Exception:                # a bridge fault is not a compile error
+            return None
+        if certificate.holds != satisfies(length, bounds):
+            raise AssertionError(
+                "the proof kernel and this compiler disagree about %r at "
+                "length %d: kernel says %s. One of them is wrong and it is "
+                "not safe to guess which."
+                % (bounds, length, certificate.holds))
+        return certificate
+    return None
 
 
 def licenses(length, bounds):

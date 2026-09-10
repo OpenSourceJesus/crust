@@ -1741,16 +1741,18 @@ class ASMGen:
         import shivyc.il_cmds.compare as cmp_cmds
 
         if isinstance(cmd, value_cmds.LoadStructArg):
-            # A struct parameter too big for a register on SysV. Here every
-            # struct parameter arrives the same way -- as the address of the
-            # caller's object -- so this is the aggregate LoadArg case again:
-            # copy it into our own frame to make the parameter by value.
-            pidx = self._wasm_argmap.get(id(cmd), 0)
-            self._wasm_push_addr(cmd.output, body)
-            body.local_get(pidx)
-            body.const_i32(cmd.output.ctype.size)
-            body.memory_copy()
-            return
+            # Struct-by-value parameters are not lowered for AArch64 yet.
+            #
+            # What stood here was a verbatim copy of the *wasm* handler --
+            # local_get/memory_copy against a `body` instruction buffer that
+            # does not exist in this function, and never did: `body` is neither
+            # a parameter nor assigned anywhere in it. Reaching this branch
+            # raised NameError under CPython and would not compile at all under
+            # the self-hosted build. Say what is actually missing instead of
+            # failing on an unbound name.
+            raise NotImplementedError(
+                "struct-by-value parameters (LoadStructArg) are not "
+                "implemented for AArch64")
 
         if isinstance(cmd, value_cmds.VaSaveBase):
             # The caller left the base of the all-argument block in x16. That
@@ -3466,16 +3468,18 @@ class ASMGen:
             return
 
         if isinstance(cmd, value_cmds.LoadStructArg):
-            # A struct parameter too big for a register on SysV. Here every
-            # struct parameter arrives the same way -- as the address of the
-            # caller's object -- so this is the aggregate LoadArg case again:
-            # copy it into our own frame to make the parameter by value.
-            pidx = self._wasm_argmap.get(id(cmd), 0)
-            self._wasm_push_addr(cmd.output, body)
-            body.local_get(pidx)
-            body.const_i32(cmd.output.ctype.size)
-            body.memory_copy()
-            return
+            # Struct-by-value parameters are not lowered for RISC-V yet.
+            #
+            # What stood here was a verbatim copy of the *wasm* handler --
+            # local_get/memory_copy against a `body` instruction buffer that
+            # does not exist in this function, and never did: `body` is neither
+            # a parameter nor assigned anywhere in it. Reaching this branch
+            # raised NameError under CPython and would not compile at all under
+            # the self-hosted build. Say what is actually missing instead of
+            # failing on an unbound name.
+            raise NotImplementedError(
+                "struct-by-value parameters (LoadStructArg) are not "
+                "implemented for RISC-V")
 
         if isinstance(cmd, value_cmds.VaSaveBase):
             rd = self._rv_defreg(cmd.output, 5, reg_of)

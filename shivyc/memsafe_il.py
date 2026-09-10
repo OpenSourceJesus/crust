@@ -399,13 +399,18 @@ def _prologue_end(cmds):
     # stopped at index 0 and put the registration call *above* the argument
     # load. The call clobbered the argument registers and the function ran on
     # garbage.
-    prologue = (value_cmds.LoadArg, value_cmds.LoadStructArg,
-                value_cmds.VaSaveBase)
+    # The class tuple is spelled out at the isinstance() below rather than
+    # bound to a name first: py2c only lowers `isinstance(x, (A, B, C))` from a
+    # literal tuple, and against a *variable* it resolved only the first class
+    # and emitted `OBJ_ISINST(c, NULL)` for the rest -- a type mismatch in the
+    # generated conditional, and a silently wrong test if it had compiled.
     i = 0
     last = 0
     while i < len(cmds):
         c = cmds[i]
-        if isinstance(c, prologue) or hasattr(c, "arg_num"):
+        if isinstance(c, (value_cmds.LoadArg, value_cmds.LoadStructArg,
+                          value_cmds.VaSaveBase)) \
+                or hasattr(c, "arg_num"):
             last = i + 1
         elif isinstance(c, (control_cmds.Label, control_cmds.Jump,
                             control_cmds._GeneralJump, control_cmds.Return)):

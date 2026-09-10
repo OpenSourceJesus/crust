@@ -131,8 +131,15 @@ def _alloc_size(cmd):
 
 
 def _access_size(cmd):
-    ct = (cmd.output.ctype if isinstance(cmd, value_cmds.ReadAt)
-          else cmd.val.ctype)
+    # Spelled as an if/else rather than a conditional expression: the two
+    # arms reach `.ctype` through differently-typed receivers, and py2c's
+    # value_ctype named the same C type for both while actually emitting a
+    # boxed obj on one side -- so the ternary's arms disagreed and gcc
+    # rejected it. Assigning in separate branches lets each be coerced once.
+    if isinstance(cmd, value_cmds.ReadAt):
+        ct = cmd.output.ctype
+    else:
+        ct = cmd.val.ctype
     n = getattr(ct, "size", None)
     return n if isinstance(n, int) and n > 0 else None
 
@@ -410,6 +417,10 @@ class _Numbering:
     never line up, because the front end materializes a separate literal for
     each.
     """
+
+    # `num` is a dict, but the name matches py2c's int heuristic and was being
+    # lowered to a C int -- every subscript_set on it then failed to compile.
+    num: "object"
 
     def __init__(self):
         self.num = {}          # id(ILValue) -> value number

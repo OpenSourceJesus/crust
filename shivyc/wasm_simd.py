@@ -57,8 +57,15 @@ CMP_FLOAT = ["eq", "ne", "lt", "gt", "le", "ge"]
 OPCODES = {}
 
 
-def op(code, name, imm=IMM_NONE):
-    """Register one SIMD opcode."""
+def op(code: int, name, imm=IMM_NONE):
+    """Register one SIMD opcode.
+
+    `code` is annotated because py2c's name heuristic reads a parameter called
+    "code" as a string. Typed char*, every opcode number was boxed with
+    OBJ_STR(<int>), so the OPCODES lookups compared a NULL string and the
+    compiler segfaulted in strcmp during module init before it read a line of
+    input.
+    """
     if code in OPCODES:
         raise ValueError("duplicate SIMD opcode %d (%s and %s)"
                          % (code, OPCODES[code][0], name))
