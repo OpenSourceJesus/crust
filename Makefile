@@ -115,6 +115,12 @@ test_macos:
 test_windows:
 	python3 -m unittest tests.test_windows_target -v
 
+# FreeBSD/amd64 (FREEBSD.md). Dialect and header checks everywhere; with clang
+# the corpus is assembled by LLVM; with CRUST_FREEBSD_SYSROOT a cross link is
+# inspected; with CRUST_FREEBSD_SSH programs run on FreeBSD.
+test_freebsd:
+	python3 -m unittest tests.test_freebsd_target -v
+
 # Dual FE/BE wire protocol (issue #15): same TU -> native + wasm, layout and
 # request/reply bytes must agree both directions.
 #     make test_wireproto
@@ -1099,7 +1105,7 @@ mbos-rpython-test-net:
 self:
 	cd tools && pypy3 py2c.py
 
-.PHONY: check-memory mem-safe default test test_macos test_windows testfast testminipy testfast_native testpromote testpgo testfuse testtorch shim install install_deps clean baremetal baremetal-arm64 baremetal-arm64-run baremetal-raspi baremetal-raspi-irq baremetal-echo baremetal-echo-raspi baremetal-preempt baremetal-jetson test_baremetal_arm64 baremetal-hello \
+.PHONY: check-memory mem-safe default test test_macos test_windows test_freebsd testfast testminipy testfast_native testpromote testpgo testfuse testtorch shim install install_deps clean baremetal baremetal-arm64 baremetal-arm64-run baremetal-raspi baremetal-raspi-irq baremetal-echo baremetal-echo-raspi baremetal-preempt baremetal-jetson test_baremetal_arm64 baremetal-hello \
         bootstrap bootstrap2 \
         selfhost selfhost_objcore selfhost_bench selfhost_coverage \
         selfhost_coverage_musl selfhost_link selfhost_build selfhost_compiler \
