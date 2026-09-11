@@ -682,9 +682,17 @@ class Assembler(object):
                     self._sym(nm).size = rasm._parse_int(val)
             return
         if d == ".comm" or d == ".lcomm":
-            nm = parts[1].strip(",")
+            # `name, size[, align]` or GNU as's older `name size`: split on
+            # commas when there are any (so the tight `name,size` spelling
+            # parses too), otherwise on whitespace.
+            rest = line[len(d):].strip()
+            if "," in rest:
+                fields = [f.strip() for f in rest.split(",")]
+            else:
+                fields = rest.split()
+            nm = fields[0]
             sym = self._sym(nm)
-            sym.size = int(parts[2].strip(","))
+            sym.size = int(fields[1])
             sym.common = True
             sym.is_global = (d == ".comm")
             sym.defined = True
