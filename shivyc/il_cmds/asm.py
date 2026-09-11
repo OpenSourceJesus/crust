@@ -101,6 +101,11 @@ class InlineAsm(ILCommand):
     # having to preserve a callee-saved register (no supported asm needs more
     # than these nine operand registers).
     _POOL = ["rax", "rdi", "rsi", "rdx", "rcx", "r8", "r9", "r10", "r11"]
+    # Win64 makes rsi and rdi callee-saved, so they leave the scratch pool.
+    _POOL_WIN64 = ["rax", "rdx", "rcx", "r8", "r9", "r10", "r11"]
+
+    def _pool(self):
+        return self._POOL_WIN64 if spots.is_win64() else self._POOL
 
     _LETTER = {"a": "rax", "b": "rbx", "c": "rcx", "d": "rdx",
                "S": "rsi", "D": "rdi"}
@@ -126,7 +131,7 @@ class InlineAsm(ILCommand):
             return name
 
         def next_free():
-            for name in self._POOL:
+            for name in self._pool():
                 if name not in used:
                     return claim(name)
             raise NotImplementedError(
@@ -252,7 +257,7 @@ class InlineAsm(ILCommand):
             used = {str(d) for d, _, _ in pending}
             used |= {str(s) for _, s, _ in pending if is_reg(s)}
             temp = None
-            for nm in self._POOL:
+            for nm in self._pool():
                 if str(self._NAME_TO_SPOT[nm]) not in used:
                     temp = self._NAME_TO_SPOT[nm]
                     break
