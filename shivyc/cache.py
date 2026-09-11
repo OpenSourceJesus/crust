@@ -27,7 +27,13 @@ if sys.implementation.name != 'shivyc':
     import hashlib
     import os
     import pickle
-    _CACHE_DIR = os.environ.get("SHIVYC_CACHE_DIR", "/tmp/shivyc-cache")
+    _default_dir = "/tmp/shivyc-cache"
+    if os.name == "nt":
+        # "/tmp" on Windows would mean C:\tmp, in the drive root; use the
+        # per-user temporary directory instead.
+        import tempfile
+        _default_dir = os.path.join(tempfile.gettempdir(), "shivyc-cache")
+    _CACHE_DIR = os.environ.get("SHIVYC_CACHE_DIR", _default_dir)
 
 # Bump when the AST representation or parser changes in a way that would make
 # previously-cached trees invalid.

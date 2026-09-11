@@ -11,6 +11,7 @@ from shivyc.il_cmds.base import ILCommand  # noqa: F401  (polymorphic interface
 # dispatched on the IL commands asm_gen consumes; see command.inputs()/etc.)
 from typing import List
 from shivyc.il_gen import ILValue
+from shivyc.errors import CompilerError
 from shivyc.ctypes import CType  # noqa: F401
 
 
@@ -5339,6 +5340,30 @@ class ASMGen:
 
         return spotmap
 
+    def _emit_win64_stack_probe(self, frame):
+        """Grow the stack by `frame` bytes, touching every page on the way.
+
+        Windows commits a thread's stack lazily: below the committed region
+        sits a single guard page, and touching it commits one more page and
+        moves the guard down. A frame larger than a page that skips straight
+        past the guard lands on reserved, uncommitted memory and faults. So,
+        as MSVC's __chkstk does, step down one page at a time and read each
+        before going further. The last step is at most a page, so the page
+        rsp finally lands on is the new guard page or already committed.
+
+        r11 is the counter: volatile under Win64 and never an argument
+        register, and nothing is live in it at function entry.
+        """
+        loop = self.asm_code.get_label()
+        self.asm_code.add(asm_cmds.Raw("mov r11, %d" % frame))
+        self.asm_code.add(asm_cmds.Raw(loop + ":"))
+        self.asm_code.add(asm_cmds.Raw("sub rsp, 4096"))
+        self.asm_code.add(asm_cmds.Raw("test DWORD PTR [rsp], esp"))
+        self.asm_code.add(asm_cmds.Raw("sub r11, 4096"))
+        self.asm_code.add(asm_cmds.Raw("cmp r11, 4096"))
+        self.asm_code.add(asm_cmds.Raw("ja " + loop))
+        self.asm_code.add(asm_cmds.Raw("sub rsp, r11"))
+
     def _generate_asm(self, commands, live_vars, spotmap, func_spots):
         """Generate assembly code."""
 
@@ -5403,6 +5428,18 @@ class ASMGen:
             if s in callee_saved_set:
                 spotmap_callee_saved = True
                 break
+        # Callee-saved registers a command *declares* it clobbers -- inline
+        # asm naming rbx (or, under Win64, rsi/rdi) as an operand or in its
+        # clobber list. The save scan below reads instruction operands, and
+        # inline asm is opaque text to it, so these would otherwise go
+        # unsaved and the caller's value would be lost.
+        declared_callee_saved = []
+        for cmd in commands:
+            for r in cmd.clobber():
+                if r in callee_saved_set and r not in declared_callee_saved:
+                    declared_callee_saved.append(r)
+        if declared_callee_saved:
+            spotmap_callee_saved = True
         if fn_info is not None:
             frameless = (base_offset == 0
                          and fn_info.get("no_regular_call", False)
@@ -5433,6 +5470,20 @@ class ASMGen:
         def alloc_scratch():
             if self._near_active:
                 return self._alloc_stack_slot(8)
+            if frameless and spots.is_win64():
+                # Windows has no red zone: anything below rsp may be
+                # overwritten at any moment (exception dispatch, APCs, a
+                # debugger). What it has instead is the 32 bytes of home
+                # space every caller reserves just above the return address
+                # -- the callee's to use -- so a frameless leaf parks up to
+                # four scratch values at [rsp+8] .. [rsp+32].
+                k = len(scratch_pool) + 1
+                if k > 4:
+                    raise CompilerError(
+                        "win64: frameless function '%s' needs more than four "
+                        "scratch slots (home space holds four); compile "
+                        "without -fstackless-calls" % self._cur_func_name)
+                return MemSpot(spots.RSP, 8 * k)
             if frameless:
                 return MemSpot(spots.RSP, -8 * (len(scratch_pool) + 1))
             return self._alloc_stack_slot(8)
@@ -5518,7 +5569,11 @@ class ASMGen:
         # and restore it before every epilogue. (Frameless functions are kept
         # off callee-saved registers above, so saved_regs is empty there.)
         saved_slots = []
-        for reg in used_callee_saved(body):
+        to_save = used_callee_saved(body)
+        for reg in declared_callee_saved:
+            if reg not in to_save:
+                to_save.append(reg)
+        for reg in to_save:
             slot = self._alloc_stack_slot(8)
             saved_slots.append((reg, slot))
             max_offset = max(max_offset, slot.rbp_offset())
@@ -5545,8 +5600,11 @@ class ASMGen:
             self.asm_code.add(asm_cmds.Push(spots.RBP, None, 8))
             self.asm_code.add(asm_cmds.Mov(spots.RBP, spots.RSP, 8))
 
-            offset_spot = LiteralSpot(str(max_offset))
-            self.asm_code.add(asm_cmds.Sub(spots.RSP, offset_spot, 8))
+            if spots.is_win64() and max_offset > 4096:
+                self._emit_win64_stack_probe(max_offset)
+            else:
+                offset_spot = LiteralSpot(str(max_offset))
+                self.asm_code.add(asm_cmds.Sub(spots.RSP, offset_spot, 8))
 
         # Save callee-saved registers used by the body (after the frame exists).
         for reg, slot in saved_slots:

@@ -137,7 +137,8 @@ def default_target():
 
 
 def host_os():
-    """Canonical name ("linux" / "macos") of the OS this compiler runs on.
+    """Canonical name ("linux" / "macos" / "windows") of the OS this compiler
+    runs on.
 
     The self-hosted build has no lowering for platform.system(), so there it
     reports "linux"; a self-hosted compiler running on a Mac needs an
@@ -149,6 +150,8 @@ def host_os():
             import platform
             if platform.system() == "Darwin":
                 return "macos"
+            if platform.system() == "Windows":
+                return "windows"
         except Exception:
             pass
     return "linux"
@@ -169,15 +172,37 @@ def resolve_os(target, requested):
     hos = host_os()
     if hos == "macos" and (target == "arm64" or target == "aarch64"):
         return "macos"
+    if hos == "windows" and (target == "x86_64" or target == "amd64"):
+        return "windows"
     return "linux"
+
+
+def apply_target_model(args):
+    """Point the ABI-dependent module state at this compile's target.
+
+    The register lists (spots.set_abi) and the size of `long`
+    (ctypes.set_data_model) are module-level, read throughout the front and
+    back ends, and a single process may compile for several targets (the
+    test suites do), so this runs at the start of every translation unit
+    and before any whole-program pass that runs the front end itself."""
+    t = get_target(getattr(args, "target", "x86_64"),
+                   getattr(args, "target_os", ""))
+    spots.set_abi(t.abi)
+    import shivyc.ctypes as _ct
+    if t.abi == "win64":
+        _ct.set_data_model("llp64")
+    else:
+        _ct.set_data_model("lp64")
+    return t
 
 
 def main():
     """Run the main compiler script."""
 
     if sys.implementation.name != "shivyc":
-        if platform.system() != "Linux" and platform.system() != "Darwin":
-            err = "only Linux and macOS (Apple Silicon) hosts are supported"
+        if platform.system() not in ("Linux", "Darwin", "Windows"):
+            err = ("only Linux, macOS (Apple Silicon) and Windows (x64) "
+                   "hosts are supported")
             print(CompilerError(err))
             return 1
 
@@ -243,8 +268,10 @@ def main():
         import shivyc.ctypes as ctypes
         ctypes.long_double_as_double = getattr(
             arguments, "long_double_as_double", False)
+        # Apple arm64 and Microsoft x64 both define `long double` as
+        # `double`, so neither is an approximation.
         ctypes.long_double_is_double_abi = \
-            getattr(arguments, "target_os", "") == "macos"
+            getattr(arguments, "target_os", "") in ("macos", "windows")
         # 32-bit pointer compression (-f-pointer-compression). Drives
         # PointerCType.size, hence sizeof / struct layout / the size-driven
         # asm backend. It requires the low-4GiB image, so it implies -f-low-mem.
@@ -252,6 +279,8 @@ def main():
             arguments, "pointer_compression", False)
         if ctypes.pointer_compression:
             arguments.low_mem = True
+
+    apply_target_model(arguments)
 
     # Load a per-function register budget (thread partitioning) if supplied;
     # ASMGen consults arguments._thread_alloc to restrict allocation.
@@ -451,6 +480,8 @@ def main():
     if True:
         # set the output ELF name
         out = "out"
+        if getattr(arguments, "target_os", "") == "windows":
+            out = "out.exe"
         if arguments.output_name is not None and \
                 len(arguments.output_name) == 1:
             # set the output ELF name
@@ -460,6 +491,11 @@ def main():
         # writable .data (off the code page), and the function body stays in
         # normal read-execute .text -- so no RWX segment is needed.
         writable_text = getattr(arguments, "opt_level", 0) >= 4
+        # Diagnostics were shown before linking; the in-process linkers
+        # (rlink, including the Windows PE path) report through the
+        # collector too, so remember where theirs will start. Without this
+        # an undefined symbol surfaced only as "linker returned non-zero".
+        n_before_link = len(error_collector.issues)
         if not link_objs(out, objs, writable_text,
                          getattr(arguments, "low_mem", False),
                          libs=getattr(arguments, "libs", []),
@@ -468,6 +504,8 @@ def main():
                                                 False),
                          target=getattr(arguments, "target", "x86_64"),
                          target_os=getattr(arguments, "target_os", "")):
+            for issue in error_collector.issues[n_before_link:]:
+                print(issue)
             err = "linker returned non-zero status"
             print(CompilerError(err))
             return 1
@@ -716,6 +754,7 @@ def process_py_file(file, args):
 
 def process_c_file(file, args):
     """Compile a C file into an object file and return the object file name."""
+    apply_target_model(args)
     code = read_file(file)
     if not error_collector.ok():
         return None
@@ -1588,7 +1627,8 @@ def _validate_target(args):
     req_os = getattr(args, "target_os", "") or ""
     if req_os and not is_known_os(req_os):
         error_collector.add(CompilerError(
-            "unrecognized --os '%s'; known values are linux, macos, none"
+            "unrecognized --os '%s'; known values are linux, macos, "
+            "windows, none"
             % req_os))
     else:
         tos = resolve_os(name or "x86_64", req_os)
@@ -1596,7 +1636,8 @@ def _validate_target(args):
         if not is_supported_os(get_target(name or "x86_64").name, tos):
             error_collector.add(CompilerError(
                 "--os %s is not supported for target '%s'; macOS is "
-                "supported on arm64 (Apple Silicon) only" % (tos, name)))
+                "supported on arm64 (Apple Silicon) only, and Windows on "
+                "x86_64 only" % (tos, name)))
         elif tos == "macos":
             # Options whose whole mechanism is ELF- or Linux-specific. Refuse
             # them by name rather than emit something that cannot work.
@@ -1613,6 +1654,38 @@ def _validate_target(args):
                 error_collector.add(CompilerError(
                     "SHIVYC_RASM / SHIVYC_RLINK produce ELF and cannot target "
                     "macOS; unset them to use the system assembler and linker"))
+        elif tos == "windows":
+            # Mechanisms built on the System V calling convention, the ELF
+            # loader or a Linux libc. Refused by name rather than emitted
+            # wrong; see WINDOWS.md for what each would need.
+            refuse = []
+            if getattr(args, "use_musl", False):
+                refuse.append(("--musl", "musl is a Linux libc; a Windows "
+                               "executable uses msvcrt.dll"))
+            if getattr(args, "pack_args", False):
+                refuse.append(("-f-pack-args", "the packed convention is "
+                               "built on the System V argument registers"))
+            if getattr(args, "metamorphic", False):
+                refuse.append(("-fmetamorphic", "a metamorphic call jumps "
+                               "without the home space a Win64 callee owns"))
+            if getattr(args, "simd_pack_globals", False):
+                refuse.append(("-fsimd-pack-globals", "it reserves xmm15, "
+                               "which Win64 makes callee-saved"))
+            if getattr(args, "opt_level", 0) >= 4:
+                refuse.append(("-O4", "near-function scratch needs a "
+                               "writable text segment"))
+            if getattr(args, "pointer_compression", False):
+                refuse.append(("-f-pointer-compression", "msvcrt's heap is "
+                               "not confined to the low 4 GiB"))
+            if getattr(args, "export_dynamic", False):
+                refuse.append(("-rdynamic", "a PE executable exports "
+                               "nothing"))
+            if getattr(args, "thread_alloc_json", None):
+                refuse.append(("--thread-alloc-json", "register budgets name "
+                               "System V registers"))
+            for flag, why in refuse:
+                error_collector.add(CompilerError(
+                    "%s cannot target Windows: %s" % (flag, why)))
 
     # Same reasoning for --mem-safe: silently accepting an unknown level would
     # hand back a binary the user believes is checked and is not, which is a
@@ -1659,7 +1732,10 @@ def assemble(asm_name, obj_name, target="x86_64", target_os=""):
     step toward a fully self-contained toolchain.
     """
     import os
-    if os.environ.get("SHIVYC_RASM"):
+    # Windows objects only ever travel from rasm to rlink (the PE is written
+    # at link time), so no external assembler is involved even on a Linux
+    # host that has one.
+    if os.environ.get("SHIVYC_RASM") or target_os == "windows":
         try:
             _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             _rlib = os.path.join(_root, "tools", "rpy_lib")
@@ -1726,6 +1802,8 @@ def link_objs(binary_name, obj_names, writable_text=False, low_mem=False,
     if target_os == "macos":
         return link_objs_macos(binary_name, obj_names, writable_text, libs,
                                lib_dirs, export_dynamic)
+    if target_os == "windows":
+        return link_objs_windows(binary_name, obj_names, libs, lib_dirs)
 
     if os.environ.get("SHIVYC_RLINK"):
         # Self-hosted path: link with our own rlink instead of GNU ld. The
@@ -1882,6 +1960,133 @@ def link_objs(binary_name, obj_names, writable_text=False, low_mem=False,
         return True
 
 
+def _rpy_lib_dir():
+    _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _rlib = os.path.join(_root, "tools", "rpy_lib")
+    if _rlib not in sys.path:
+        sys.path.insert(0, _rlib)
+    return _root, _rlib
+
+
+def windows_runtime_obj(target_os="windows"):
+    """Path of the compiled C half of the Windows runtime (rlibc_win64.c),
+    building it first if it is missing or stale. Compiled by this same
+    compiler in a child process, like rlibc.c for the freestanding Linux
+    path, and cached beside the build tree."""
+    _root, _rlib = _rpy_lib_dir()
+    src = os.path.join(_rlib, "rlibc_win64.c")
+    cache = os.environ.get("SHIVYC_RLIBC_WIN64_OBJ",
+                           os.path.join(_rlib, "build", "rlibc-win64.o"))
+    stale = (not os.path.exists(cache)
+             or os.path.getmtime(cache) < os.path.getmtime(src))
+    if stale:
+        os.makedirs(os.path.dirname(cache), exist_ok=True)
+        env = {"PYTHONPATH": _root}
+        for k in ("PATH", "HOME", "TMPDIR", "TEMP", "TMP", "LANG",
+                  "SYSTEMROOT", "USERPROFILE"):
+            v = os.environ.get(k)
+            if v:
+                env[k] = v
+        tmp = cache + ".tmp"
+        # Compile a copy beside the cache: the compiler writes its .s next
+        # to the source, which must not litter (or need write access to)
+        # the runtime's own directory.
+        import shutil
+        work_c = os.path.join(os.path.dirname(cache), "rlibc_win64.c")
+        shutil.copyfile(src, work_c)
+        r = subprocess.run(
+            [sys.executable, "-m", "shivyc.main", "-c", work_c, "-o", tmp,
+             "--target", "x86_64", "--os", "windows"],
+            cwd=_root, env=env, capture_output=True)
+        if not os.path.exists(tmp):
+            # The tail: a traceback's last lines say what actually failed.
+            out = (r.stdout + r.stderr).decode(errors="replace")
+            raise CompilerError("could not build the Windows C runtime: %s"
+                                % out.strip()[-600:])
+        os.replace(tmp, cache)
+    return cache
+
+
+def link_objs_windows(binary_name, obj_names, libs=None, lib_dirs=None):
+    """Link ELF objects into a PE32+ console executable with rlink.
+
+    No external tool is involved: rcrt_win64.s (assembled here by rasm)
+    supplies the entry point, rlibc_win64.c the C99 functions msvcrt lacks,
+    and every symbol still undefined after that is imported by name from
+    msvcrt.dll or kernel32.dll -- which every Windows installation has, so
+    nothing needs installing to run the result either.
+
+    `-lNAME` looks for NAME.dll (then libNAME.dll) in the -L directories
+    and imports from it directly by reading its export table; no import
+    library is needed. `-lm` and `-lc` are accepted and ignored: the math
+    library and libc are both msvcrt.dll.
+    """
+    try:
+        _root, _rlib = _rpy_lib_dir()
+        import rasm_obj as _rasm_obj
+        import rlink as _rlink
+        import rlink_pe as _rlink_pe
+
+        ln = _rlink_pe.new_linker()
+        entry = os.environ.get("SHIVYC_ENTRY")
+        if entry:
+            ln.entry_name = entry
+        if not os.environ.get("SHIVYC_NO_RCRT"):
+            crt_s = os.path.join(_rlib, "rcrt_win64.s")
+            with open(crt_s) as f:
+                crt = _rasm_obj.assemble_to_elf(f.read(), "x86_64")
+            ln.add_object(crt_s, list(crt))
+            rt = windows_runtime_obj()
+            with open(rt, "rb") as f:
+                rt_data = list(f.read())
+            # Linked like an archive member would be: only if something
+            # uses snprintf/vsnprintf, so a program that never does keeps a
+            # smaller import table.
+            ln.archives.append([_rlink.ArMember(rt, rt_data)])
+        for o in obj_names:
+            with open(o, "rb") as f:
+                data = list(f.read())
+            if _rlink._is_archive(data):
+                ln.add_archive(o, data)
+            else:
+                ln.add_object(o, data)
+        for lib in (libs or []):
+            if lib in ("m", "c"):
+                continue
+            found = None
+            for d in (lib_dirs or []) + ["."]:
+                for cand in (lib + ".dll", "lib" + lib + ".dll",
+                             "lib" + lib + ".a"):
+                    pth = os.path.join(d, cand)
+                    if os.path.exists(pth):
+                        found = pth
+                        break
+                if found:
+                    break
+            if found is None:
+                raise CompilerError("cannot find -l%s (looked for %s.dll "
+                                    "in the -L directories)" % (lib, lib))
+            with open(found, "rb") as f:
+                data = list(f.read())
+            if found.endswith(".a"):
+                ln.add_archive(found, data)
+            else:
+                _rlink_pe.add_dll(ln, found, data)
+        image = _rlink_pe.link_pe(ln)
+        with open(binary_name, "wb") as f:
+            f.write(bytes(image))
+        for w in ln.warnings:
+            sys.stderr.write("rlink: warning: %s\n" % w)
+        return True
+    except Exception as e:
+        if os.environ.get("SHIVYC_RLINK_TRACEBACK"):
+            import traceback
+            traceback.print_exc()
+        msg = e.message if hasattr(e, "message") else str(e)
+        error_collector.add(CompilerError("rlink failed: %s" % msg))
+        return False
+
+
 def link_objs_macos(binary_name, obj_names, writable_text=False, libs=None,
                     lib_dirs=None, export_dynamic=False):
     """Link Mach-O objects into an Apple Silicon executable.
@@ -1985,7 +2190,13 @@ if __name__ == "__main__":
     if sys.implementation.name != "shivyc":
         import threading
         sys.setrecursionlimit(200000)
-        threading.stack_size(1024 * 1024 * 1024)
+        try:
+            threading.stack_size(1024 * 1024 * 1024)
+        except ValueError:
+            # CPython on Windows refuses a thread stack of 256 MiB or more
+            # (THREAD_MAX_STACKSIZE in thread_nt.h, an exclusive bound);
+            # take the most it allows.
+            threading.stack_size(255 * 1024 * 1024)
         _result = []
         _t = threading.Thread(target=lambda: _result.append(main()))
         _t.start()
