@@ -109,6 +109,12 @@ test_wasm:
 test_macos:
 	python3 -m unittest tests.test_macos_target -v
 
+# 64-bit Windows (WINDOWS.md). Assembly and PE-image checks everywhere; with
+# Wine the programs run, and with MinGW-w64 gcc as well the ABI is checked
+# against it across a DLL boundary.
+test_windows:
+	python3 -m unittest tests.test_windows_target -v
+
 # Dual FE/BE wire protocol (issue #15): same TU -> native + wasm, layout and
 # request/reply bytes must agree both directions.
 #     make test_wireproto
@@ -1093,7 +1099,7 @@ mbos-rpython-test-net:
 self:
 	cd tools && pypy3 py2c.py
 
-.PHONY: check-memory mem-safe default test test_macos testfast testminipy testfast_native testpromote testpgo testfuse testtorch shim install install_deps clean baremetal baremetal-arm64 baremetal-arm64-run baremetal-raspi baremetal-raspi-irq baremetal-echo baremetal-echo-raspi baremetal-preempt baremetal-jetson test_baremetal_arm64 baremetal-hello \
+.PHONY: check-memory mem-safe default test test_macos test_windows testfast testminipy testfast_native testpromote testpgo testfuse testtorch shim install install_deps clean baremetal baremetal-arm64 baremetal-arm64-run baremetal-raspi baremetal-raspi-irq baremetal-echo baremetal-echo-raspi baremetal-preempt baremetal-jetson test_baremetal_arm64 baremetal-hello \
         bootstrap bootstrap2 \
         selfhost selfhost_objcore selfhost_bench selfhost_coverage \
         selfhost_coverage_musl selfhost_link selfhost_build selfhost_compiler \

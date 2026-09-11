@@ -73,6 +73,7 @@ Main Crust Documentation:
 
 Hardware:
 - [MACOS.md](MACOS.md) macOS on Apple Silicon (`--os macos`)
+- [WINDOWS.md](WINDOWS.md) 64-bit Windows (`--os windows`), with no MinGW or MSVC needed
 - [BAREMETAL_ARM64.md](BAREMETAL_ARM64.md)
 - [RASPI.md](RASPI.md) Raspberry Pi
 - [JETSON_NANO.md](JETSON_NANO.md) Nvidia Jetson Nano
