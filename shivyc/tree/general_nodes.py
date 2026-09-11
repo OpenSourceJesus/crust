@@ -1331,6 +1331,11 @@ class Declaration(CNode):
             "double long": ctypes.longdouble,
         }
 
+        # On an ABI where `long double` *is* `double` (Apple arm64) there is
+        # nothing to approximate and nothing to warn about.
+        if specs_str == "double long" and ctypes.long_double_is_double_abi:
+            return ctypes.dbl
+
         # `long double` (sorted "double long") is normally the unsupported
         # 80-bit sentinel. Under -f-long-double-as-double we alias it to plain
         # double (64-bit) and warn once that 80-bit math is never supported.
