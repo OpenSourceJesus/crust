@@ -16,11 +16,43 @@ _ASM_RESERVED = {
 }
 
 
+# Object-format symbol spelling, set once per compile by set_object_format.
+# ELF (the default) spells a C symbol bare. Mach-O prefixes every C symbol with
+# an underscore (`main` -> `_main`), and treats names starting with `L` as
+# assembler-local: they never reach the object's symbol table. Compiler-made
+# jump labels use that, so they cannot collide with, or be exported beside,
+# real symbols.
+_SYM_PREFIX = ""
+_LOCAL_LABEL_PREFIX = ""
+_COMPILER_LABEL_STEM = "__shivyc_label"
+
+
+def set_object_format(fmt):
+    """Select symbol spelling for object format `fmt` ("elf" or "macho")."""
+    global _SYM_PREFIX
+    global _LOCAL_LABEL_PREFIX
+    if fmt == "macho":
+        _SYM_PREFIX = "_"
+        _LOCAL_LABEL_PREFIX = "L"
+    else:
+        _SYM_PREFIX = ""
+        _LOCAL_LABEL_PREFIX = ""
+
+
 def mangle_symbol(name: str) -> str:
-    """Rename a symbol whose spelling collides with a GNU-as operator."""
+    """Spell C-level symbol `name` as the assembler must see it.
+
+    Renames a symbol whose spelling collides with a GNU-as operator, then
+    applies the object format's prefix. Every definition *and* reference must
+    come through here, or the two spellings will not meet at link time.
+    Not idempotent under Mach-O: pass the C name, never an already-mangled
+    one."""
+    n = name
     if name in _ASM_RESERVED:
-        return "__shivyc_sym_" + name
-    return name
+        n = "__shivyc_sym_" + name
+    if _LOCAL_LABEL_PREFIX and name.startswith(_COMPILER_LABEL_STEM):
+        return _LOCAL_LABEL_PREFIX + n
+    return _SYM_PREFIX + n
 
 
 class Spot:

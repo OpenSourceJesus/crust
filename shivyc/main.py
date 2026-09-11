@@ -9,6 +9,7 @@ import sys
 
 import shivyc.lexer as lexer
 import shivyc.preproc as preproc
+import shivyc.spots as spots
 
 from shivyc.errors import error_collector, CompilerError
 from shivyc.parser.parser import parse
@@ -100,6 +101,7 @@ def _concat_adjacent_strings(tokens):
     return out
 from shivyc.asm_gen import ASMCode, ASMGen
 from shivyc.targets import get_target, is_known_target
+from shivyc.targets import normalize_os, is_known_os, is_supported_os
 
 
 def default_target():
@@ -120,6 +122,11 @@ def default_target():
         m = platform.machine().lower()
     except Exception:
         return "x86_64"
+    # macOS support is Apple Silicon only. Checked before the machine name
+    # because a Python running under Rosetta 2 reports x86_64 on an arm64
+    # Mac, and an x86-64 default there would never link.
+    if host_os() == "macos":
+        return "arm64"
     if m in ("aarch64", "arm64", "armv8b", "armv8l"):
         return "arm64"
     if m in ("riscv64", "rv64"):
@@ -129,12 +136,48 @@ def default_target():
     return "x86_64"
 
 
+def host_os():
+    """Canonical name ("linux" / "macos") of the OS this compiler runs on.
+
+    The self-hosted build has no lowering for platform.system(), so there it
+    reports "linux"; a self-hosted compiler running on a Mac needs an
+    explicit `--os macos` until that probe is lowered."""
+    # Shaped as a bare implementation test so py2c folds it and never sees
+    # the platform probe in the self-hosted build.
+    if sys.implementation.name != "shivyc":
+        try:
+            import platform
+            if platform.system() == "Darwin":
+                return "macos"
+        except Exception:
+            pass
+    return "linux"
+
+
+def resolve_os(target, requested):
+    """The OS to compile for, given --target and an optional --os.
+
+    An explicit --os always wins. Otherwise behave like a native compiler:
+    when the target architecture is the host's own, target the host OS (so a
+    bare `crust hello.c` on an Apple Silicon Mac builds a Mac executable);
+    for any other architecture this is a cross build, which has always meant
+    ELF. Bare-metal flows that run on a Mac host therefore pass `--os none`
+    so they get ELF regardless of the host.
+    """
+    if requested:
+        return normalize_os(requested)
+    hos = host_os()
+    if hos == "macos" and (target == "arm64" or target == "aarch64"):
+        return "macos"
+    return "linux"
+
+
 def main():
     """Run the main compiler script."""
 
     if sys.implementation.name != "shivyc":
-        if platform.system() != "Linux":
-            err = "only x86_64 Linux is supported"
+        if platform.system() != "Linux" and platform.system() != "Darwin":
+            err = "only Linux and macOS (Apple Silicon) hosts are supported"
             print(CompilerError(err))
             return 1
 
@@ -192,6 +235,7 @@ def main():
     preproc.set_include_dirs(include_dirs)
     # Before set_defines: the target selects which macros are predefined.
     preproc.set_target(get_target(getattr(arguments, "target", "x86_64")).name)
+    preproc.set_os(getattr(arguments, "target_os", ""))
     preproc.set_defines(defines)
 
     # Whether to alias long double to double (-f-long-double-as-double).
@@ -199,6 +243,8 @@ def main():
         import shivyc.ctypes as ctypes
         ctypes.long_double_as_double = getattr(
             arguments, "long_double_as_double", False)
+        ctypes.long_double_is_double_abi = \
+            getattr(arguments, "target_os", "") == "macos"
         # 32-bit pointer compression (-f-pointer-compression). Drives
         # PointerCType.size, hence sizeof / struct layout / the size-driven
         # asm backend. It requires the low-4GiB image, so it implies -f-low-mem.
@@ -383,7 +429,8 @@ def main():
     # is done. Multi-file programs for such a target need the front end to
     # merge translation units first -- refuse rather than silently emit only
     # the last module.
-    _tgt = get_target(getattr(arguments, "target", "x86_64"))
+    _tgt = get_target(getattr(arguments, "target", "x86_64"),
+                      getattr(arguments, "target_os", ""))
     if _tgt.is_binary:
         if len(objs) > 1:
             error_collector.add(CompilerError(
@@ -419,7 +466,8 @@ def main():
                          lib_dirs=getattr(arguments, "lib_dirs", []),
                          export_dynamic=getattr(arguments, "export_dynamic",
                                                 False),
-                         target=getattr(arguments, "target", "x86_64")):
+                         target=getattr(arguments, "target", "x86_64"),
+                         target_os=getattr(arguments, "target_os", "")):
             err = "linker returned non-zero status"
             print(CompilerError(err))
             return 1
@@ -1056,7 +1104,12 @@ def process_c_file(file, args):
             fn for fn in il_code.commands
             if fn not in addr_taken and _eligible(fn)}
 
-    asm_code = ASMCode(get_target(getattr(args, "target", "x86_64")))
+    asm_code = ASMCode(get_target(getattr(args, "target", "x86_64"),
+                                  getattr(args, "target_os", "")))
+    # Symbol spelling (Mach-O's `_` prefix, `L` local labels) follows the
+    # target's object format. Set here, beside the ASMCode that uses it, so it
+    # can never disagree with the target this unit is being emitted for.
+    spots.set_object_format(asm_code.target.obj_format)
     try:
         ASMGen(il_code, symbol_table, asm_code, args).make_asm()
     except CompilerError as e:
@@ -1118,7 +1171,8 @@ def process_c_file(file, args):
             return out_names[0]
         return asm_file
 
-    assemble(asm_file, obj_file, getattr(args, "target", "x86_64"))
+    assemble(asm_file, obj_file, getattr(args, "target", "x86_64"),
+             getattr(args, "target_os", ""))
     if not error_collector.ok():
         return None
 
@@ -1146,6 +1200,8 @@ class Arguments:
         self.pointer_compression = False
         self.opt_level = 0
         self.target = default_target()
+        # "" until resolved by _validate_target (see resolve_os).
+        self.target_os = ""
         self.output_name = None
         self.include_dirs = []
         self.defines = []
@@ -1215,6 +1271,10 @@ def _parse_args_selfhost(argv):
             i += 1
             if i < n:
                 args.target = argv[i]
+        elif a == '--os':
+            i += 1
+            if i < n:
+                args.target_os = argv[i]
         elif a == '--no-cache':
             args.no_cache = True
         elif a == '--mem-safe':
@@ -1357,6 +1417,12 @@ def get_arguments(argv=None):
         parser.add_argument("--target", dest="target", default=default_target(),
                             help="back-end architecture: x86_64, arm64, "
                                  "riscv64 (default: this machine's)")
+        parser.add_argument("--os", dest="target_os", default="",
+                            help="operating system: linux, macos (Apple "
+                                 "Silicon, arm64 only), or none (freestanding "
+                                 "ELF). Default: this machine's OS when "
+                                 "--target is this machine's architecture, "
+                                 "else linux")
         # Generate binary file with file name
         parser.add_argument(
             "-o",
@@ -1517,6 +1583,37 @@ def _validate_target(args):
             "unrecognized target '%s'; known targets are x86_64, arm64, "
             "riscv64, m68k, wasm" % name))
 
+    # --os: validate the spelling, then the pairing, then resolve the default
+    # once so every later stage reads a single canonical answer.
+    req_os = getattr(args, "target_os", "") or ""
+    if req_os and not is_known_os(req_os):
+        error_collector.add(CompilerError(
+            "unrecognized --os '%s'; known values are linux, macos, none"
+            % req_os))
+    else:
+        tos = resolve_os(name or "x86_64", req_os)
+        args.target_os = tos
+        if not is_supported_os(get_target(name or "x86_64").name, tos):
+            error_collector.add(CompilerError(
+                "--os %s is not supported for target '%s'; macOS is "
+                "supported on arm64 (Apple Silicon) only" % (tos, name)))
+        elif tos == "macos":
+            # Options whose whole mechanism is ELF- or Linux-specific. Refuse
+            # them by name rather than emit something that cannot work.
+            if getattr(args, "use_musl", False):
+                error_collector.add(CompilerError(
+                    "--musl cannot target macOS: musl is a Linux libc, and a "
+                    "Mac executable must use libSystem's struct layouts"))
+            if getattr(args, "low_mem", False):
+                error_collector.add(CompilerError(
+                    "-f-low-mem cannot target macOS: arm64 macOS requires "
+                    "position-independent executables, so there is no fixed "
+                    "low load address"))
+            if os.environ.get("SHIVYC_RASM") or os.environ.get("SHIVYC_RLINK"):
+                error_collector.add(CompilerError(
+                    "SHIVYC_RASM / SHIVYC_RLINK produce ELF and cannot target "
+                    "macOS; unset them to use the system assembler and linker"))
+
     # Same reasoning for --mem-safe: silently accepting an unknown level would
     # hand back a binary the user believes is checked and is not, which is a
     # worse failure than a typo'd target -- the diagnostic that never fires
@@ -1554,7 +1651,7 @@ def write_asm(asm_source, asm_filename):
         error_collector.add(CompilerError(descrip))
 
 
-def assemble(asm_name, obj_name, target="x86_64"):
+def assemble(asm_name, obj_name, target="x86_64", target_os=""):
     """Assemble the given assembly file into an object file.
 
     With SHIVYC_RASM set, use the self-hosted rasm assembler (written in the
@@ -1577,9 +1674,15 @@ def assemble(asm_name, obj_name, target="x86_64"):
         except Exception as _e:
             error_collector.add(CompilerError("rasm assembler failed: %s" % _e))
             return False
+    # Apple's `as` is a front for clang's integrated assembler; naming the
+    # architecture keeps a Rosetta-launched (x86-64) toolchain from assuming
+    # its own.
+    as_cmd = ["as"]
+    if target_os == "macos":
+        as_cmd = ["as", "-arch", "arm64"]
     if sys.implementation.name != 'shivyc':
         try:
-            subprocess.check_call(["as", "-o", obj_name, asm_name])
+            subprocess.check_call(as_cmd + ["-o", obj_name, asm_name])
             return True
         except subprocess.CalledProcessError:
             err = "assembler returned non-zero status"
@@ -1588,13 +1691,13 @@ def assemble(asm_name, obj_name, target="x86_64"):
     else:
         # Simpler self-hosted path (uses os.system, already supported by the
         # translator). Breaks on paths with spaces, which is acceptable here.
-        os.system("as -o %s %s" % (obj_name, asm_name))
+        os.system("%s -o %s %s" % (" ".join(as_cmd), obj_name, asm_name))
         return True
 
 
 def link_objs(binary_name, obj_names, writable_text=False, low_mem=False,
               libs=None, lib_dirs=None, export_dynamic=False,
-              target="x86_64"):
+              target="x86_64", target_os=""):
     """Assemble the given object files into a binary.
 
     `libs` / `lib_dirs` add `-l<name>` / `-L<dir>` to the ld command (like the C
@@ -1619,6 +1722,10 @@ def link_objs(binary_name, obj_names, writable_text=False, low_mem=False,
     that would additionally map the arena with MAP_32BIT.
     """
     import os
+
+    if target_os == "macos":
+        return link_objs_macos(binary_name, obj_names, writable_text, libs,
+                               lib_dirs, export_dynamic)
 
     if os.environ.get("SHIVYC_RLINK"):
         # Self-hosted path: link with our own rlink instead of GNU ld. The
@@ -1769,6 +1876,45 @@ def link_objs(binary_name, obj_names, writable_text=False, low_mem=False,
             subprocess.check_call(cmd)
             return True
         except subprocess.CalledProcessError:
+            return False
+    else:
+        os.system(" ".join(cmd))
+        return True
+
+
+def link_objs_macos(binary_name, obj_names, writable_text=False, libs=None,
+                    lib_dirs=None, export_dynamic=False):
+    """Link Mach-O objects into an Apple Silicon executable.
+
+    The Linux path hand-assembles the ld command (crt1/crti/crtn, the ELF
+    dynamic loader). None of that exists on macOS: the startup code, the
+    dyld load command, the SDK sysroot and libSystem are all supplied by the
+    compiler driver, so we let `cc` drive ld64 exactly as it would for a
+    clang-compiled program. libm lives inside libSystem; `-lm` is accepted
+    and harmless, and kept so libs lists stay portable.
+    """
+    cmd = ["cc", "-arch", "arm64", "-mmacosx-version-min=11.0"]
+    if writable_text:
+        # Self-modifying text needs a writable __TEXT segment. arm64 macOS
+        # enforces W^X on ordinary pages; -segprot lets the page be mapped
+        # rw+x at load, which is all this opt-in, deliberately unsafe mode
+        # has ever asked of the linker. Hardened-runtime (codesigned) builds
+        # will still refuse it.
+        cmd += ["-Wl,-segprot,__TEXT,rwx,rwx"]
+    if export_dynamic:
+        cmd += ["-Wl,-export_dynamic"]
+    for d in (lib_dirs or []):
+        cmd += ["-L" + d]
+    cmd += obj_names
+    cmd += ["-lm"]
+    for lib in (libs or []):
+        cmd += ["-l" + lib]
+    cmd += ["-o", binary_name]
+    if sys.implementation.name != 'shivyc':
+        try:
+            subprocess.check_call(cmd)
+            return True
+        except (subprocess.CalledProcessError, OSError):
             return False
     else:
         os.system(" ".join(cmd))

@@ -601,6 +601,12 @@ longdouble = FloatCType(8, long_double=True)
 # compiler never implements true 80-bit extended precision.
 long_double_as_double = False
 
+# Set True when the target ABI itself defines `long double` as `double`, as
+# Apple's arm64 ABI does. Unlike the flag above this is not an approximation,
+# so `long double` becomes `double` silently: it is exactly what clang does
+# for that target, and what libSystem's `sinl` etc. expect.
+long_double_is_double_abi = False
+
 
 simple_types = {token_kinds.void_kw: void,
                 token_kinds.bool_kw: bool_t,
