@@ -118,6 +118,24 @@ int         __fpclassifyd(double);
 int         __isnand(double);
 int         __isinfd(double);
 
+#ifdef __APPLE__
+/* C99 makes these macros. Apple's <math.h> expands them to static inline
+ * helpers that libSystem does not export, so a call to a function named
+ * `isnan` would have nothing to bind to. These helpers need no library and,
+ * like Apple's, evaluate their argument exactly once. Widening float to
+ * double preserves NaN, infinity and sign, so one set covers both. */
+static inline int __crust_isnan(double x) { return x != x; }
+static inline int __crust_isinf(double x)
+{ return x == x && (x - x) != (x - x); }
+static inline int __crust_isfinite(double x) { return (x - x) == (x - x); }
+static inline int __crust_signbit(double x)
+{ union { double d; unsigned long u; } v; v.d = x; return (int)(v.u >> 63); }
+#define isnan(x)    __crust_isnan((double)(x))
+#define isinf(x)    __crust_isinf((double)(x))
+#define isfinite(x) __crust_isfinite((double)(x))
+#define signbit(x)  __crust_signbit((double)(x))
+#endif
+
 #define HUGE_VAL  (1e10000)
 #define HUGE_VALF (1e10000f)
 #define INFINITY  (1e10000f)
