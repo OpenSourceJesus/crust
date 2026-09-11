@@ -118,11 +118,13 @@ int         __fpclassifyd(double);
 int         __isnand(double);
 int         __isinfd(double);
 
-#if defined(__APPLE__) || defined(_WIN64)
+#if defined(__APPLE__) || defined(_WIN64) || defined(__FreeBSD__)
 /* C99 makes these macros. Apple's <math.h> expands them to static inline
  * helpers that libSystem does not export, and msvcrt.dll has only the
  * underscored `_isnan` / `_finite`, so a call to a function named
- * `isnan` would have nothing to bind to on either. These helpers need no library and,
+ * `isnan` would have nothing to bind to on either. (FreeBSD's libc does
+ * export `isnan` and `isinf`, but `isfinite` and `signbit` only as
+ * `__isfinite` / `__signbit`, so it takes the same helpers.) These helpers need no library and,
  * like Apple's, evaluate their argument exactly once. Widening float to
  * double preserves NaN, infinity and sign, so one set covers both. */
 static inline int __crust_isnan(double x) { return x != x; }

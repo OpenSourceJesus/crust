@@ -59,10 +59,11 @@ FILE    *tmpfile(void);
 char    *tmpnam(char *);
 int      ungetc(int, FILE*);
 
-#if defined(__APPLE__)
-/* libSystem exports the standard streams as __stdinp / __stdoutp /
- * __stderrp; the SDK's <stdio.h> maps the names with these same macros.
- * A bare `extern stdout` would be an undefined `_stdout` at link time. */
+#if defined(__APPLE__) || defined(__FreeBSD__)
+/* The BSD libcs (Apple's libSystem, FreeBSD's libc.so.7) export the standard
+ * streams as __stdinp / __stdoutp / __stderrp; their <stdio.h> maps the
+ * names with these same macros. A bare `extern stdout` would be an undefined
+ * symbol at link time. */
 extern void* __stdinp;
 extern void* __stdoutp;
 extern void* __stderrp;
