@@ -73,7 +73,7 @@ def compile_asm(src_text, target, workdir):
     env["SHIVYC_RASM"] = "1"
     p = subprocess.run(
         [sys.executable, "-m", "shivyc.main", src, "-S", "-o", out,
-         "--target", target],
+         "--target", target, "--os", "linux"],
         capture_output=True, text=True, cwd=ROOT, env=env)
     if p.returncode != 0 or not os.path.exists(out):
         return None, (p.stdout + p.stderr).strip()

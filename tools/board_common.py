@@ -128,7 +128,7 @@ def compile_sources(board, sources, outdir, cross, opt_level, extra):
         env["SHIVYC_RLINK"] = "1"
         cmd = [sys.executable, "-m", "shivyc.main"]
         cmd.extend(sources)
-        cmd.extend(["-o", binary, "--target", board.target])
+        cmd.extend(["-o", binary, "--target", board.target, "--os", "linux"])
         if opt_level:
             cmd.extend(["-O", str(opt_level)])
         cmd.extend(extra)
@@ -149,7 +149,7 @@ def compile_sources(board, sources, outdir, cross, opt_level, extra):
         base = os.path.splitext(os.path.basename(src))[0]
         spath = os.path.join(outdir, base + ".s")
         cmd = [sys.executable, "-m", "shivyc.main", src, "-S", "-o", spath,
-               "--target", board.target]
+               "--target", board.target, "--os", "linux"]
         if opt_level:
             cmd.extend(["-O", str(opt_level)])
         cmd.extend(extra)

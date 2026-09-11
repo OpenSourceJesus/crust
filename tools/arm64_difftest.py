@@ -479,6 +479,12 @@ VARIADIC = [
     ("a64_bigframe", "int main(){char b[4096]; int i;"
      " for(i=0;i<4096;i++) b[i]=(char)(i&7); return b[4095]+35;}"),
     ("a64_fneg", "int main(){double d=12.5; return (int)(-d + 50);}"),
+    # 2-byte static data. The data emitter used `.word`, which is 4 bytes to
+    # the AArch64 assembler (2 only on x86), so s[1..3] read padding/garbage.
+    ("a64_short_data", "static short s[4]={10,20,30,2};"
+     " int main(){return s[0]+s[1]+s[2]+s[3];}"),
+    ("a64_short_block", "struct P{short a; short b; int c;};"
+     " static struct P p={7,-3,40}; int main(){return p.a+p.b+p.c;}"),
 ]
 
 def _run(cmd):
@@ -509,7 +515,8 @@ def test_one(name, src, workdir):
     # ShivyC arm64 -> .s
     spath = os.path.join(workdir, name + ".s")
     rc, out, err = _run([sys.executable, "-m", "shivyc.main", cpath,
-                         "-S", "-o", spath, "--target", "arm64"])
+                         "-S", "-o", spath, "--target", "arm64",
+                          "--os", "linux"])
     blob = (out + err).lower()
     if "not implemented" in blob or "stage 2" in blob:
         return "SKIP", "arm64 back end does not support this yet"

@@ -186,7 +186,7 @@ def compile_c(src, obj, defines=None):
     if os.path.abspath(work) != os.path.abspath(src):
         shutil.copyfile(src, work)
     cmd = [sys.executable, "-m", "shivyc.main", work, "-c", "-o", obj,
-           "--target", "arm64"]
+           "--target", "arm64", "--os", "none"]
     for d in (defines or []):
         cmd.append("-D" + d)
     rc, out, err = run(cmd, env=env, cwd=ROOT)
