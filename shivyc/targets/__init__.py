@@ -51,6 +51,15 @@ class Target:
         # Prefix the platform C ABI puts on every C-level symbol. Mach-O
         # spells `main` as `_main`; ELF uses the bare name.
         self.sym_prefix = ""
+        # Calling convention: "sysv" (System V / AAPCS64 / lp64 -- every
+        # target until Windows) or "win64" (the Microsoft x64 convention).
+        # The register file and argument passing key on this, not on `os`.
+        self.abi = "sysv"
+        # Format of the final linked executable, as distinct from obj_format
+        # (the intermediate objects). Windows keeps ELF objects internally --
+        # rasm writes them and rlink reads them -- and only the image rlink
+        # writes is a PE. "elf", "macho" or "pe".
+        self.exe_format = "elf"
 
     def set_os(self, os_name):
         """Retarget this instance at operating system `os_name` (already
@@ -74,6 +83,20 @@ class X86_64Target(Target):
         self.triple = "x86_64-linux-gnu"
         self.asm_syntax_prologue = ["\t.intel_syntax noprefix"]
         self.asm_syntax_epilogue = ["\t.att_syntax noprefix"]
+
+    def set_os(self, os_name):
+        """x86-64 additionally supports 64-bit Windows: the Microsoft x64
+        calling convention and a PE32+ executable. The objects stay ELF --
+        they only ever pass between rasm and rlink -- and C symbols are
+        spelled bare on Win64 (only 32-bit Windows prefixes `_`), so the
+        assembler text is the ELF dialect unchanged. See WINDOWS.md."""
+        if os_name == "windows":
+            self.os = "windows"
+            self.abi = "win64"
+            self.exe_format = "pe"
+            self.triple = "x86_64-pc-windows-msvc"
+            return
+        Target.set_os(self, os_name)
 
 
 class Arm64Target(Target):
@@ -99,6 +122,7 @@ class Arm64Target(Target):
             self.obj_format = "macho"
             self.sym_prefix = "_"
             self.triple = "arm64-apple-macos11"
+            self.exe_format = "macho"
             return
         Target.set_os(self, os_name)
 
@@ -209,6 +233,9 @@ def normalize_os(os_name):
         return "macos"
     if o == "linux" or o == "gnu":
         return "linux"
+    if o == "windows" or o == "win" or o == "win64" or o == "win32" \
+            or o == "mingw" or o == "mingw32" or o == "mingw64" or o == "nt":
+        return "windows"
     if o == "none" or o == "baremetal" or o == "bare-metal" \
             or o == "freestanding" or o == "elf":
         return "none"
@@ -218,17 +245,21 @@ def normalize_os(os_name):
 def is_known_os(os_name):
     """True if `os_name` is a recognized OS or alias."""
     o = normalize_os(os_name)
-    return o == "" or o == "linux" or o == "none" or o == "macos"
+    return (o == "" or o == "linux" or o == "none" or o == "macos"
+            or o == "windows")
 
 
 def is_supported_os(target_name, os_name):
     """True if the architecture `target_name` can target `os_name`.
-    macOS is Apple Silicon only, so it pairs with arm64 alone."""
+    macOS is Apple Silicon only, so it pairs with arm64 alone; Windows is
+    x64 only (Windows on Arm would need an arm64 PE and its own ABI work)."""
     o = normalize_os(os_name)
     if o == "" or o == "linux" or o == "none":
         return True
     if o == "macos":
         return target_name == "arm64" or target_name == "aarch64"
+    if o == "windows":
+        return target_name == "x86_64" or target_name == "amd64"
     return False
 
 
