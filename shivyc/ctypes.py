@@ -581,6 +581,23 @@ unsig_longint = IntegerCType(8, False)
 long_max = 9223372036854775807
 long_min = -9223372036854775808
 
+# LLP64 (64-bit Windows): `long` is 4 bytes while `long long` and pointers stay
+# 8. The compiler uses `longint` internally as its pointer-width integer
+# (sizeof, pointer arithmetic, size_t), and `long long` already folds onto it,
+# so only the spelled keyword `long` changes -- onto this distinct 4-byte type.
+# Distinct from `integer` so that `long *` and `int *` stay incompatible, as
+# they are under MSVC; arithmetic is size-driven, so it behaves as int does.
+# Set per compile by set_data_model.
+llp64 = False
+win_long = IntegerCType(4, True)
+unsig_win_long = IntegerCType(4, False)
+
+
+def set_data_model(model):
+    """Select "lp64" (every Unix target) or "llp64" (64-bit Windows)."""
+    global llp64
+    llp64 = model == "llp64"
+
 # Upper bounds for the unsigned integer types, used when choosing the type of
 # an integer literal. These are module-level constants (not function locals) so
 # the self-host translator constant-folds them into correctly-sized literals; a
