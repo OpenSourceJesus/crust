@@ -506,3 +506,50 @@ class TestLongDoubleAsDouble(unittest.TestCase):
             "int main(){ long double x=1.0; return (int)x; }", [])
         self.assertNotEqual(rc, 0)
         self.assertIn("80bit floating point math", out)
+
+
+def _run_stdout(src):
+    d = tempfile.mkdtemp()
+    c = os.path.join(d, "t.c")
+    with open(c, "w") as f:
+        f.write(src)
+    out = os.path.join(d, "t")
+    if subprocess.run(["shivyc", c, "-o", out],
+                      capture_output=True).returncode != 0:
+        return None
+    return subprocess.run([out], capture_output=True, text=True).stdout
+
+
+class TestDefaultArgumentPromotion(unittest.TestCase):
+    """C11 6.5.2.2p7: a `float` passed through `...` arrives as `double`.
+
+    It used to be passed as a bare float, so printf("%f", 1.5f) read a
+    double made of the float's bits and garbage and printed 0.000000.
+    Found while bringing up the Windows target (see WINDOWS.md)."""
+
+    def test_printf_float(self):
+        self.assertEqual(_run_stdout(
+            "int printf(const char *, ...);\n"
+            "int main(void){ float f = 1.5f, g = 2.25f;"
+            " printf(\"%f %.2f\\n\", f, f + g); return 0; }"),
+            "1.500000 3.75\n")
+
+    def test_crust_variadic_callee_reads_double(self):
+        self.assertEqual(_run_stdout(
+            "#include <stdarg.h>\n"
+            "int printf(const char *, ...);\n"
+            "double take(int n, ...) { va_list ap; double s = 0; int i;"
+            " va_start(ap, n); for (i = 0; i < n; i++)"
+            " s += va_arg(ap, double); va_end(ap); return s; }\n"
+            "int main(void){ float f = 1.5f;"
+            " printf(\"%.3f\\n\", take(3, f, 2.25f, 0.125f)); return 0; }"),
+            "3.875\n")
+
+    def test_unprototyped_call_promotes(self):
+        self.assertEqual(_run_stdout(
+            "int printf(const char *, ...);\n"
+            "double twice();\n"
+            "int main(void){ float f = 1.25f;"
+            " printf(\"%.2f\\n\", twice(f)); return 0; }\n"
+            "double twice(double x) { return x * 2; }\n"),
+            "2.50\n")
