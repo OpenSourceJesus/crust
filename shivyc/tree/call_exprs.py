@@ -2,6 +2,7 @@
 
 import shivyc.ctypes as ctypes
 import shivyc.il_cmds.control as control_cmds
+import shivyc.il_cmds.value as value_cmds
 from shivyc.errors import CompilerError
 from shivyc.il_gen import ILValue
 from shivyc.tree.expr_base import _RExprNode
@@ -54,8 +55,28 @@ class FuncCall(_RExprNode):
 
         ret = ILValue(func.ctype.arg.ret)
         ret_ctype = func.ctype.arg.ret
-        sret = (ret_ctype.is_struct_union() and ret_ctype.size > 16
-                and not getattr(func.ctype.arg, "variadic", False))
+        import shivyc.spots as _spots
+        if _spots.is_win64():
+            # Microsoft x64: a struct of any size but 1, 2, 4 or 8 bytes is
+            # returned through a hidden pointer (variadic callees included),
+            # and passed as a pointer to a caller-owned copy -- the callee
+            # may modify its parameter, so the original must not be handed
+            # over. Rewriting such arguments here means the back end only
+            # ever sees registers-sized values for this ABI.
+            from shivyc.tree.general_nodes import win64_passes_by_ref
+            sret = win64_passes_by_ref(ret_ctype)
+            from shivyc.tree.utils import DirectLValue
+            j = 0
+            while j < len(final_args):
+                a = final_args[j]
+                if win64_passes_by_ref(a.ctype):
+                    tmp = ILValue(a.ctype)
+                    il_code.add(value_cmds.Set(tmp, a))
+                    final_args[j] = DirectLValue(tmp).addr(il_code)
+                j += 1
+        else:
+            sret = (ret_ctype.is_struct_union() and ret_ctype.size > 16
+                    and not getattr(func.ctype.arg, "variadic", False))
         if sret:
             # SysV memory-class return: allocate result storage here and pass
             # its address as a hidden first integer argument. The callee writes
@@ -83,9 +104,11 @@ class FuncCall(_RExprNode):
         for arg_given in self.args:
             arg = arg_given.make_il(il_code, symbol_table, c)
 
-            # perform integer promotions
+            # perform the default argument promotions (C11 6.5.2.2p6)
             if arg.ctype.is_arith() and arg.ctype.size < 4:
                 arg = set_type(arg, ctypes.integer, il_code)
+            elif arg.ctype.is_floating() and arg.ctype.size == 4:
+                arg = set_type(arg, ctypes.dbl, il_code)
 
             final_args.append(arg)
         return final_args
@@ -120,9 +143,14 @@ class FuncCall(_RExprNode):
                     set_type(arg, arg_types[i].make_unqual(), il_code))
             else:
                 # Variadic argument: apply the default argument promotions
-                # (integer promotion; small integer types widen to int).
+                # (C11 6.5.2.2p7): small integer types widen to int, and
+                # float widens to double. Without the second, printf("%f",
+                # 1.5f) read a double whose low half was the float's bits
+                # and whose high half was whatever the register held.
                 if arg.ctype.is_arith() and arg.ctype.size < 4:
                     arg = set_type(arg, ctypes.integer, il_code)
+                elif arg.ctype.is_floating() and arg.ctype.size == 4:
+                    arg = set_type(arg, ctypes.dbl, il_code)
                 final_args.append(arg)
         return final_args
 
