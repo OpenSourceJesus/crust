@@ -438,6 +438,70 @@ def set_defines(defines: "list[str]"):
         lines.append("#define __ENVIRONMENT_OS_VERSION_MIN_REQUIRED__ 110000")
         lines.append(
             "#define __ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__ 110000")
+    if _target_os == "windows":
+        # 64-bit Windows is LLP64: `long` is 4 bytes, so every 64-bit type
+        # macro above has to be respelled `long long` (the same 8-byte type
+        # as LP64's `long` -- Crust folds the two). Then what MinGW-w64 gcc
+        # and MSVC predefine for x64 that portable code tests for. Neither
+        # __GNUC__ nor _MSC_VER is claimed: Crust is neither compiler, and
+        # headers that key on those expect extensions it does not have.
+        # __MINGW64__ likewise stays undefined (Crust links msvcrt.dll
+        # directly, with no MinGW runtime underneath).
+        llp = {"__SIZE_TYPE__": "unsigned long long",
+               "__PTRDIFF_TYPE__": "long long",
+               "__INTPTR_TYPE__": "long long",
+               "__UINTPTR_TYPE__": "unsigned long long",
+               "__INT64_TYPE__": "long long",
+               "__UINT64_TYPE__": "unsigned long long",
+               "__WCHAR_TYPE__": "unsigned short"}
+        i = 0
+        while i < len(lines):
+            parts = lines[i].split(" ", 2)
+            if len(parts) == 3 and parts[1] in llp:
+                lines[i] = "#define %s %s" % (parts[1], llp[parts[1]])
+            i += 1
+        lines.append("#define _WIN32 1")
+        lines.append("#define _WIN64 1")
+        lines.append("#define __x86_64__ 1")
+        lines.append("#define __x86_64 1")
+        lines.append("#define __amd64__ 1")
+        lines.append("#define __amd64 1")
+        lines.append("#define _M_X64 100")
+        lines.append("#define _M_AMD64 100")
+        lines.append("#define __LLP64__ 1")
+        lines.append("#define __LITTLE_ENDIAN__ 1")
+        lines.append("#define __SIZEOF_LONG__ 4")
+        lines.append("#define __SIZEOF_LONG_LONG__ 8")
+        lines.append("#define __SIZEOF_POINTER__ 8")
+        lines.append("#define __SIZEOF_WCHAR_T__ 2")
+        # The bit builtins above are written for LP64: the `l` forms hold
+        # their operand in `unsigned long` but test 64-bit masks, and the
+        # `ll` forms alias them. Under LLP64 that is a 32-bit variable
+        # tested against bit 63 -- `__builtin_clzl(1)` never terminated. So
+        # here `l` means 32 bits, as it does for MinGW gcc, and `ll` is
+        # spelled out at 64.
+        for nm in ("__builtin_clzl", "__builtin_ctzl", "__builtin_clzll",
+                   "__builtin_ctzll", "__builtin_popcountll",
+                   "__builtin_umulll_overflow"):
+            lines.append("#undef " + nm)
+        lines.append("#define __builtin_clzl(x) __builtin_clz(x)")
+        lines.append("#define __builtin_ctzl(x) __builtin_ctz(x)")
+        lines.append(
+            "#define __builtin_clzll(x) __extension__({ unsigned long long "
+            "_clzv=(x); int _clzn=0; if(_clzv==0){_clzn=64;}else{while(!("
+            "_clzv & 0x8000000000000000ULL)){_clzv<<=1;_clzn++;}} _clzn; })")
+        lines.append(
+            "#define __builtin_ctzll(x) __extension__({ unsigned long long "
+            "_ctzv=(x); int _ctzn=0; if(_ctzv==0){_ctzn=64;}else{while(!("
+            "_ctzv & 1ULL)){_ctzv>>=1;_ctzn++;}} _ctzn; })")
+        lines.append(
+            "#define __builtin_popcountll(x) __extension__({ unsigned long "
+            "long _pcv=(x); int _pcn=0; while(_pcv){ _pcn += (int)(_pcv & "
+            "1ULL); _pcv>>=1; } _pcn; })")
+        lines.append(
+            "#define __builtin_umulll_overflow(a, b, res) __extension__({ "
+            "unsigned long long _moa=(a),_mob=(b); *(res)=_moa*_mob; "
+            "(_moa!=0 && (*(res)/_moa)!=_mob); })")
     for d in defines or []:
         name, eq, val = d.partition("=")
         lines.append("#define %s %s" % (name, val if eq else "1"))
@@ -1406,11 +1470,22 @@ def set_include_dirs(dirs):
     _extra_include_dirs = list(dirs or [])
 
 
+# On a Windows host paths also separate with '\\' -- `__file__` is
+# `C:\\...\\shivyc\\preproc.py` -- and a lookup that only splits on '/' finds
+# no directory at all, so the bundled headers resolved only when the compiler
+# happened to run from the repo root. Elsewhere a backslash is an ordinary
+# filename character, so it counts as a separator on Windows alone. Shaped as
+# a bare implementation test so the self-hosted build folds it to False.
+_BACKSLASH_SEP = False
+if sys.implementation.name != "shivyc":
+    _BACKSLASH_SEP = os.sep == "\\"
+
+
 def _dirname(p):
     """Directory portion of a '/'-separated path (own impl, no os/pathlib so it
-    transpiles to C)."""
+    transpiles to C). On Windows, '\\' separates too."""
     i = len(p) - 1
-    while i >= 0 and p[i] != '/':
+    while i >= 0 and p[i] != '/' and not (_BACKSLASH_SEP and p[i] == '\\'):
         i = i - 1
     if i < 0:
         return "."
