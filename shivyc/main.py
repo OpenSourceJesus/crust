@@ -137,8 +137,8 @@ def default_target():
 
 
 def host_os():
-    """Canonical name ("linux" / "macos" / "windows") of the OS this compiler
-    runs on.
+    """Canonical name ("linux" / "macos" / "windows" / "freebsd") of the OS
+    this compiler runs on.
 
     The self-hosted build has no lowering for platform.system(), so there it
     reports "linux"; a self-hosted compiler running on a Mac needs an
@@ -152,6 +152,8 @@ def host_os():
                 return "macos"
             if platform.system() == "Windows":
                 return "windows"
+            if platform.system() == "FreeBSD":
+                return "freebsd"
         except Exception:
             pass
     return "linux"
@@ -174,6 +176,8 @@ def resolve_os(target, requested):
         return "macos"
     if hos == "windows" and (target == "x86_64" or target == "amd64"):
         return "windows"
+    if hos == "freebsd" and (target == "x86_64" or target == "amd64"):
+        return "freebsd"
     return "linux"
 
 
@@ -200,9 +204,10 @@ def main():
     """Run the main compiler script."""
 
     if sys.implementation.name != "shivyc":
-        if platform.system() not in ("Linux", "Darwin", "Windows"):
-            err = ("only Linux, macOS (Apple Silicon) and Windows (x64) "
-                   "hosts are supported")
+        if platform.system() not in ("Linux", "Darwin", "Windows",
+                                     "FreeBSD"):
+            err = ("only Linux, macOS (Apple Silicon), Windows (x64) and "
+                   "FreeBSD (amd64) hosts are supported")
             print(CompilerError(err))
             return 1
 
@@ -1628,7 +1633,7 @@ def _validate_target(args):
     if req_os and not is_known_os(req_os):
         error_collector.add(CompilerError(
             "unrecognized --os '%s'; known values are linux, macos, "
-            "windows, none"
+            "windows, freebsd, none"
             % req_os))
     else:
         tos = resolve_os(name or "x86_64", req_os)
@@ -1636,8 +1641,8 @@ def _validate_target(args):
         if not is_supported_os(get_target(name or "x86_64").name, tos):
             error_collector.add(CompilerError(
                 "--os %s is not supported for target '%s'; macOS is "
-                "supported on arm64 (Apple Silicon) only, and Windows on "
-                "x86_64 only" % (tos, name)))
+                "supported on arm64 (Apple Silicon) only, and Windows and "
+                "FreeBSD on x86_64 only" % (tos, name)))
         elif tos == "macos":
             # Options whose whole mechanism is ELF- or Linux-specific. Refuse
             # them by name rather than emit something that cannot work.
@@ -1686,6 +1691,15 @@ def _validate_target(args):
             for flag, why in refuse:
                 error_collector.add(CompilerError(
                     "%s cannot target Windows: %s" % (flag, why)))
+        elif tos == "freebsd":
+            if getattr(args, "use_musl", False):
+                error_collector.add(CompilerError(
+                    "--musl cannot target FreeBSD: musl is a Linux libc, and "
+                    "a FreeBSD executable must use FreeBSD's libc"))
+            if os.environ.get("SHIVYC_RLINK"):
+                error_collector.add(CompilerError(
+                    "SHIVYC_RLINK cannot target FreeBSD yet: its runtime "
+                    "makes Linux system calls; unset it to link with cc"))
 
     # Same reasoning for --mem-safe: silently accepting an unknown level would
     # hand back a binary the user believes is checked and is not, which is a
@@ -1756,6 +1770,11 @@ def assemble(asm_name, obj_name, target="x86_64", target_os=""):
     as_cmd = ["as"]
     if target_os == "macos":
         as_cmd = ["as", "-arch", "arm64"]
+    if host_os() == "freebsd":
+        # FreeBSD's base system has no `as` at all; its cc (clang) assembles
+        # through LLVM's integrated assembler. An object is an object, so
+        # this holds whatever --os the output is for.
+        as_cmd = ["cc", "-c"]
     if sys.implementation.name != 'shivyc':
         try:
             subprocess.check_call(as_cmd + ["-o", obj_name, asm_name])
@@ -1804,6 +1823,9 @@ def link_objs(binary_name, obj_names, writable_text=False, low_mem=False,
                                lib_dirs, export_dynamic)
     if target_os == "windows":
         return link_objs_windows(binary_name, obj_names, libs, lib_dirs)
+    if target_os == "freebsd":
+        return link_objs_freebsd(binary_name, obj_names, libs, lib_dirs,
+                                 export_dynamic)
 
     if os.environ.get("SHIVYC_RLINK"):
         # Self-hosted path: link with our own rlink instead of GNU ld. The
@@ -2085,6 +2107,67 @@ def link_objs_windows(binary_name, obj_names, libs=None, lib_dirs=None):
         msg = e.message if hasattr(e, "message") else str(e)
         error_collector.add(CompilerError("rlink failed: %s" % msg))
         return False
+
+
+def freebsd_link_cmd(binary_name, obj_names, libs=None, lib_dirs=None,
+                     export_dynamic=False):
+    """The command that links FreeBSD objects into an executable, or a
+    string saying why none can be formed on this host.
+
+    On FreeBSD the system `cc` drives the link, as it would for a program it
+    compiled: it knows the crt objects, the dynamic loader
+    (/libexec/ld-elf.so.1), libc and libgcc, which the Linux path otherwise
+    assembles by hand from glibc's layout. The result is branded FreeBSD by
+    the linker, as the kernel requires.
+
+    Elsewhere the same link needs FreeBSD's libraries: CRUST_FREEBSD_SYSROOT
+    names a copy of a FreeBSD root (at least lib/ and usr/lib/), and clang
+    and ld.lld do the link against it -- the same LLVM toolchain FreeBSD
+    itself uses, pointed at its files. Separated from the call so tests can
+    run exactly this command on a FreeBSD machine.
+    """
+    if host_os() == "freebsd":
+        cmd = ["cc"]
+    else:
+        root = os.environ.get("CRUST_FREEBSD_SYSROOT")
+        if not root:
+            return ("linking a FreeBSD executable needs FreeBSD's libc and "
+                    "startup files: run on FreeBSD, set CRUST_FREEBSD_SYSROOT "
+                    "to a copy of a FreeBSD root (with clang and ld.lld "
+                    "installed here), or stop at -c / -S and link on FreeBSD")
+        cmd = ["clang", "--target=x86_64-unknown-freebsd%d"
+               % preproc.FREEBSD_DEFAULT_MAJOR, "--sysroot=" + root,
+               "-fuse-ld=lld"]
+    if export_dynamic:
+        cmd += ["-Wl,--export-dynamic"]
+    for d in (lib_dirs or []):
+        cmd += ["-L" + d]
+    cmd += list(obj_names)
+    cmd += ["-lm"]
+    for lib in (libs or []):
+        cmd += ["-l" + lib]
+    cmd += ["-o", binary_name]
+    return cmd
+
+
+def link_objs_freebsd(binary_name, obj_names, libs=None, lib_dirs=None,
+                      export_dynamic=False):
+    """Link ELF objects into a FreeBSD/amd64 executable (see
+    freebsd_link_cmd)."""
+    cmd = freebsd_link_cmd(binary_name, obj_names, libs, lib_dirs,
+                           export_dynamic)
+    if isinstance(cmd, str):
+        error_collector.add(CompilerError(cmd))
+        return False
+    if sys.implementation.name != 'shivyc':
+        try:
+            subprocess.check_call(cmd)
+            return True
+        except (subprocess.CalledProcessError, OSError):
+            return False
+    else:
+        os.system(" ".join(cmd))
+        return True
 
 
 def link_objs_macos(binary_name, obj_names, writable_text=False, libs=None,

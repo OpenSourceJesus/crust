@@ -367,6 +367,32 @@ def set_os(os_name):
     _target_os = os_name or ""
 
 
+def _defines_name(defines, name):
+    """True if the -D list defines `name` (as NAME or NAME=VALUE)."""
+    for d in defines or []:
+        if d == name or d.startswith(name + "="):
+            return True
+    return False
+
+
+# The FreeBSD release series assumed when not compiling on FreeBSD itself.
+FREEBSD_DEFAULT_MAJOR = 14
+
+
+def _freebsd_major():
+    """Major version of the FreeBSD host, or FREEBSD_DEFAULT_MAJOR when
+    cross-compiling (or when the probe is unavailable, as in the self-hosted
+    build, which folds this to the default)."""
+    if sys.implementation.name != "shivyc":
+        try:
+            import platform
+            if platform.system() == "FreeBSD":
+                return int(platform.release().split(".")[0])
+        except Exception:
+            pass
+    return FREEBSD_DEFAULT_MAJOR
+
+
 def set_defines(defines: "list[str]"):
     """Record command-line ``-D`` macros (each ``NAME`` or ``NAME=VALUE``).
 
@@ -502,6 +528,22 @@ def set_defines(defines: "list[str]"):
             "#define __builtin_umulll_overflow(a, b, res) __extension__({ "
             "unsigned long long _moa=(a),_mob=(b); *(res)=_moa*_mob; "
             "(_moa!=0 && (*(res)/_moa)!=_mob); })")
+    if _target_os == "freebsd":
+        # What FreeBSD's cc predefines for amd64 that portable code tests
+        # for (checked against `cc -dM -E` on FreeBSD 15.1). __FreeBSD__ is
+        # the major release: the host's own when compiling on FreeBSD, else
+        # 14, the oldest series still supported; -D__FreeBSD__=N overrides.
+        if not _defines_name(defines, "__FreeBSD__"):
+            lines.append("#define __FreeBSD__ %d" % _freebsd_major())
+        lines.append("#define __unix__ 1")
+        lines.append("#define __unix 1")
+        lines.append("#define __ELF__ 1")
+        lines.append("#define __LP64__ 1")
+        lines.append("#define _LP64 1")
+        lines.append("#define __x86_64__ 1")
+        lines.append("#define __x86_64 1")
+        lines.append("#define __amd64__ 1")
+        lines.append("#define __amd64 1")
     for d in defines or []:
         name, eq, val = d.partition("=")
         lines.append("#define %s %s" % (name, val if eq else "1"))
