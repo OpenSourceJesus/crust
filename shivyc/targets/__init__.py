@@ -41,8 +41,8 @@ class Target:
         self.output_ext = ".s"
         # Operating system the output runs on, orthogonal to the architecture:
         # "linux" (the historical default), "none" (freestanding / bare-metal
-        # ELF -- the same object-level facts as linux), or "macos". Selected
-        # by --os; see set_os below.
+        # ELF -- the same object-level facts as linux), "macos", "windows" or
+        # "freebsd". Selected by --os; see set_os below.
         self.os = "linux"
         # Object-file format the emitted assembler text targets. "elf" for
         # every Linux / bare-metal target; "macho" for Apple. Drives section
@@ -82,7 +82,11 @@ class X86_64Target(Target):
         self.name = "x86_64"
         self.triple = "x86_64-linux-gnu"
         self.asm_syntax_prologue = ["\t.intel_syntax noprefix"]
-        self.asm_syntax_epilogue = ["\t.att_syntax noprefix"]
+        # Back to the assembler's default at the end of the file. `prefix`,
+        # not `noprefix`: AT&T syntax without `%` register prefixes is a GNU
+        # as extension that LLVM's assembler rejects outright, and this line
+        # is the only reason every file failed under FreeBSD's `cc`.
+        self.asm_syntax_epilogue = ["\t.att_syntax prefix"]
 
     def set_os(self, os_name):
         """x86-64 additionally supports 64-bit Windows: the Microsoft x64
@@ -95,6 +99,14 @@ class X86_64Target(Target):
             self.abi = "win64"
             self.exe_format = "pe"
             self.triple = "x86_64-pc-windows-msvc"
+            return
+        if os_name == "freebsd":
+            # FreeBSD/amd64 is the same System V ABI, LP64 data model and ELF
+            # as Linux, so every code-generation fact stays; what differs is
+            # the system around the program (libc, crt objects, the toolchain
+            # that links it) and the kernel's ELF branding. See FREEBSD.md.
+            self.os = "freebsd"
+            self.triple = "x86_64-unknown-freebsd"
             return
         Target.set_os(self, os_name)
 
@@ -236,6 +248,8 @@ def normalize_os(os_name):
     if o == "windows" or o == "win" or o == "win64" or o == "win32" \
             or o == "mingw" or o == "mingw32" or o == "mingw64" or o == "nt":
         return "windows"
+    if o == "freebsd" or o == "fbsd":
+        return "freebsd"
     if o == "none" or o == "baremetal" or o == "bare-metal" \
             or o == "freestanding" or o == "elf":
         return "none"
@@ -246,19 +260,24 @@ def is_known_os(os_name):
     """True if `os_name` is a recognized OS or alias."""
     o = normalize_os(os_name)
     return (o == "" or o == "linux" or o == "none" or o == "macos"
-            or o == "windows")
+            or o == "windows" or o == "freebsd")
 
 
 def is_supported_os(target_name, os_name):
     """True if the architecture `target_name` can target `os_name`.
     macOS is Apple Silicon only, so it pairs with arm64 alone; Windows is
-    x64 only (Windows on Arm would need an arm64 PE and its own ABI work)."""
+    x64 only (Windows on Arm would need an arm64 PE and its own ABI work);
+    FreeBSD is amd64 only for now."""
     o = normalize_os(os_name)
     if o == "" or o == "linux" or o == "none":
         return True
     if o == "macos":
         return target_name == "arm64" or target_name == "aarch64"
     if o == "windows":
+        return target_name == "x86_64" or target_name == "amd64"
+    if o == "freebsd":
+        # amd64 for now; FreeBSD's arm64 and riscv64 ports would reuse those
+        # back ends with the same system-toolchain driver path.
         return target_name == "x86_64" or target_name == "amd64"
     return False
 
