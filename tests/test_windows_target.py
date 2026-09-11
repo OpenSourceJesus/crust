@@ -175,7 +175,8 @@ class OSSelectionTests(unittest.TestCase):
             f.write("int main(void){return 0;}\n")
         r = _crust(["--target", "arm64", "--os", "windows", "-S", "t.c"], d)
         self.assertNotEqual(r.returncode, 0)
-        self.assertIn("Windows on x86_64 only", r.stdout + r.stderr)
+        self.assertIn("Windows and FreeBSD on x86_64 only",
+                      r.stdout + r.stderr)
 
     def test_system_v_only_options_are_refused_by_name(self):
         d = tempfile.mkdtemp()

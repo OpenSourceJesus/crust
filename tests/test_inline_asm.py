@@ -59,8 +59,11 @@ class TestBareAsm(unittest.TestCase):
             "int main(void){ asm volatile(\"\" ::: \"memory\"); return 8; }")
         self.assertEqual(rc, 8)
         # An empty template must not emit a stray instruction or the per-asm
-        # AT&T wrap (the file footer's `.att_syntax noprefix` is unrelated).
-        self.assertNotIn(".att_syntax prefix", asm)
+        # AT&T wrap. The file footer is now spelled `.att_syntax prefix` too
+        # (FreeBSD's assembler rejects `noprefix`), so look at the body only
+        # rather than the whole file.
+        body = asm[asm.index("main:"):asm.index(".note.GNU-stack")]
+        self.assertNotIn(".att_syntax", body)
 
     def test_plain_nop(self):
         rc, _ = _build(
