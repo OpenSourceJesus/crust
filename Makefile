@@ -104,6 +104,11 @@ mem-safe:
 test_wasm:
 	python3 tools/wasm_difftest.py
 
+# macOS on Apple Silicon (MACOS.md). Assembly checks everywhere; real Mach-O
+# assemble + link with LLVM when installed; build-and-run on a Mac.
+test_macos:
+	python3 -m unittest tests.test_macos_target -v
+
 # Dual FE/BE wire protocol (issue #15): same TU -> native + wasm, layout and
 # request/reply bytes must agree both directions.
 #     make test_wireproto
@@ -1013,7 +1018,7 @@ baremetal-preempt:
 	python3 -m shivyc.main examples/baremetal/kernel_preempt.c \
 		examples/baremetal/preempt_threads.c \
 		--emit-thread-switcher $(BUILD)/sw.s \
-		--target arm64
+		--target arm64 --os none
 	python3 tools/baremetal_arm64.py examples/baremetal/kernel_preempt.c \
 		--extra-asm vectors_preempt_arm64.S --extra-asm $(BUILD)/sw.preempt.s \
 		-o $(BUILD)/kernel_preempt.elf --run
@@ -1088,7 +1093,7 @@ mbos-rpython-test-net:
 self:
 	cd tools && pypy3 py2c.py
 
-.PHONY: check-memory mem-safe default test testfast testminipy testfast_native testpromote testpgo testfuse testtorch shim install install_deps clean baremetal baremetal-arm64 baremetal-arm64-run baremetal-raspi baremetal-raspi-irq baremetal-echo baremetal-echo-raspi baremetal-preempt baremetal-jetson test_baremetal_arm64 baremetal-hello \
+.PHONY: check-memory mem-safe default test test_macos testfast testminipy testfast_native testpromote testpgo testfuse testtorch shim install install_deps clean baremetal baremetal-arm64 baremetal-arm64-run baremetal-raspi baremetal-raspi-irq baremetal-echo baremetal-echo-raspi baremetal-preempt baremetal-jetson test_baremetal_arm64 baremetal-hello \
         bootstrap bootstrap2 \
         selfhost selfhost_objcore selfhost_bench selfhost_coverage \
         selfhost_coverage_musl selfhost_link selfhost_build selfhost_compiler \
