@@ -186,7 +186,9 @@ class ASMCode:
             return
         if local:
             self.comm.append(f"\t.local {mangle_symbol(name)}")
-        self.comm.append(f"\t.comm {mangle_symbol(name)} {size}")
+        # `name, size`: GNU as also takes a bare space, LLVM's assembler
+        # (FreeBSD's only one) requires the comma.
+        self.comm.append(f"\t.comm {mangle_symbol(name)}, {size}")
 
     def add_string_literal(self, name, chars, elem_size=1):
         """Add a string literal to the ASM code.
