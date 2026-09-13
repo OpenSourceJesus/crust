@@ -70,12 +70,16 @@ so it cannot be done quietly.
 
 ### What is not covered
 
-`accepted` agrees behaviourally but not structurally. The kernel writes `for
-url in urls.split(",")` and `out.append(i)`; `hoare.py` has neither, because
-its `for` must be over `range(n)` and a store-passing lowering has no
-mutation. The model hoists the split and rebuilds the list with `snoc`.
-Closing this means teaching `hoare.py` to iterate a list, which is the next
-piece of work.
+Both modelled functions in `crustos/schemes.py` now match the kernel
+statement for statement -- the control-flow skeletons are compared, not just
+the behaviour. Getting there took three additions to `hoare.py`, each a
+rewrite in front of the lowering rather than a change to it: an early
+`return` becomes a first-wins accumulator; `for x in xs` over a list becomes
+the `while` it always was, with the variant supplied; `xs.append(x)` becomes
+`xs = snoc(xs, x)`. What the model still cannot say is `-1`, so `SCHEME_NONE`
+is `len(names)` and the kernel's `idx <= 0` is `idx == 0 or idx == len(url)`,
+and those two paraphrases are the whole remaining distance for the scheme
+layer.
 
 `crustos/kernel.c` is not covered at all, and not for want of trying. It is
 Rust and C, so there is no source for `hoare.py` to read. The modelled
@@ -87,6 +91,54 @@ honest proofs about a state machine and they are not proofs about this
 scheduler, and the distance between those two claims is the whole reason this
 section exists.
 
-Reaching it would mean a Hoare pass over Crust's own IR rather than over
-Python source -- the compiler already has the control-flow graph the prover
-would need. That is a larger project than anything above and is not started.
+## 3. The IR lift
+
+`shivyc/ilproof.py` is the seam between the two. It takes a function *after*
+the front end -- the IL every Crust front end produces, C or Rust or rpython
+-- rebuilds the structured control flow the front end flattened, and writes
+it back out as Python in `hoare.py`'s dialect. The same `read_procedure`
+compiles it, the same proof helpers apply, and the same `leanexport` sends
+the result to Lean.
+
+```sh
+make test_ilproof       # the lift against the binary, and by the kernel
+```
+
+What it reaches today, from `crustos/kernel.c` through the real front end:
+
+```
+def elf_regs_for_class(cls: 'Nat') -> 'Nat':
+    if (cls == 0):
+        return 6
+    if (cls == 1):
+        return 10
+    if (cls == 2):
+        return 15
+    return 23
+```
+
+That is real kernel code -- the scheduler sizes its register save/restore
+from it -- lifted from IL, not transcribed. `by_every_bool` proves
+`∀ cls, elf_regs_for_class cls <= 23` by splitting each guard, and Lean 4
+accepts the export with no axioms. The false bound `<= 15` is refused. A
+counted loop lifts with its invariant and variant derived, and the kernel
+proves it terminates for every bound. Five example shapes are compiled with
+the real compiler, run, and compared against the lifted terms through the
+kernel's evaluator: the same discipline as the scheme layer, applied to
+compiled code.
+
+**What is claimed.** The lift is over Nat: subtraction is truncated where
+C's goes negative, and nothing is said about overflow. A theorem about the
+lifted function is a theorem about that model of the arithmetic. The lift
+refuses rather than approximates: `goto`, `break`, `switch`, pointers,
+structs, calls and `void` all come back as a `LiftError` naming the
+construct.
+
+**What is not reached.** 8 of the kernel's 107 functions lift. The tally of
+refusals is the roadmap, and it is nearly one item: 92 of 99 are `ReadAt`,
+`AddrOf` and `SetAt` -- memory access. The kernel's stateful functions
+(`schedule`, `spawn`, `sys_open`) read and write fields of `Kernel` and
+`Context` through pointers, and lifting those means lifting struct access
+into the record types `hoare.py` already has (`Context.with_ticks`,
+`state_invariant`). That is the step that would connect this to the modelled
+`Context` from the other direction, and it is the next one.

@@ -1038,6 +1038,15 @@ test_model:
 	fi
 	python3 -m unittest tests.test_crustos_model -v
 
+# The IL lift: compiled functions back into the fragment the kernel proves
+# things about, checked against the binary and by the kernel.  Same
+# dependency; a few seconds.  The Lean case is skipped without `lean`.
+test_ilproof:
+	@if [ ! -f "$(ROSETTA_DIR)/hoare.py" ]; then \
+		echo "RosettaMath not found -- run 'make install_proofs'"; exit 1; \
+	fi
+	python3 -m unittest tests.test_ilproof -v
+
 clean_proofs:
 	rm -rf $(ROSETTA_DIR)
 
@@ -1195,4 +1204,5 @@ self:
         test_micropython_modules test_micropython_emitters test_micropython_port \
         install_cpython clean_cpython test_cpython test_cpython_objects \
         install_bsd clean_bsd test_bsd test_bsd_bin test_bsd_usrbin crustos \
-        install_proofs check_proofs install_lean clean_proofs test_model
+        install_proofs check_proofs install_lean clean_proofs test_model \
+        test_ilproof
