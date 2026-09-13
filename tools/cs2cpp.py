@@ -112,9 +112,6 @@ _REFUSED = [
     ("partial", "`partial` splits one type across several files, and this "
                 "pass lowers one file. Put the type in one piece."),
     ("goto", "`goto` is not in the subset."),
-    ("delegate", "`delegate` lowers to a function pointer, which is "
-                 "milestone 6 and not written yet. Use an `interface` with "
-                 "one method."),
     ("char", "C#'s `char` is a 16-bit UTF-16 code unit and C's is an 8-bit "
              "byte, so lowering one to the other would silently change what "
              "every string index means. Use `byte` for ASCII, or `string`."),
@@ -415,6 +412,268 @@ def _lower_literals(text):
                              lambda m: "NULL", text)
 
 
+def _lower_this(text):
+    """`this.x` is C#'s member access; C++ wants `this->x`."""
+    return cpprust._sub_code(r"(?<![\w.])this\.",
+                             lambda m: "this->", text)
+
+
+def _lower_collections(text):
+    """`List<T>` / `Dictionary<K,V>` onto the prelude containers."""
+    text = cpprust._sub_code(r"(?<![\w.])List\s*<",
+                             lambda m: "std::vector<", text)
+    text = cpprust._sub_code(r"(?<![\w.])Dictionary\s*<",
+                             lambda m: "std::map<", text)
+    return text
+
+
+def _lower_generic_classes(text):
+    """`class Box<T>` -> `template<typename T> class Box`.
+
+    C# type-parameter lists are the weak form of C++ templates (no
+    specialisation, no non-type parameters). Spelling them as
+    `template<typename …>` is what lets cpprust's monomorphiser run.
+    """
+    scan = _blank(text)
+    out, pos = [], 0
+    for m in re.finditer(
+            r"(?<![\w])(class|struct)\s+(\w+)\s*<([^>]+)>", scan):
+        kinds = [p.strip() for p in m.group(3).split(",") if p.strip()]
+        if not kinds:
+            continue
+        # Skip if any parameter looks like a value (`int N`), which C# does
+        # not allow and which would be a non-type template parameter.
+        if any(re.match(r"(int|long|bool|uint)\b", k) for k in kinds):
+            continue
+        params = ", ".join("typename %s" % k for k in kinds)
+        out.append(text[pos:m.start()])
+        out.append("template<%s> %s %s"
+                   % (params, m.group(1), m.group(2)))
+        pos = m.end()
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _lower_new(text, shared_names):
+    """`T x = new T(args);` -> `T x(args);` (no temporary to copy).
+
+    Shared types become `shared_ptr` locals constructed with `make_shared`,
+    which is what makes `a = b` alias rather than copy.
+    """
+    def decl(m):
+        typ, name, args = m.group(1), m.group(2), m.group(3).strip()
+        # Generic ctor: `Box<int> b = new Box<int>(7)` -- group 1 is the
+        # full `Box<int>` spelling.
+        if typ.split("<")[0] in shared_names:
+            return ("std::shared_ptr<%s> %s = std::make_shared<%s>(%s);"
+                    % (typ, name, typ, args))
+        if args:
+            return "%s %s(%s);" % (typ, name, args)
+        return "%s %s;" % (typ, name)
+
+    # `Box<int>` needs the angle list in the type.
+    text = cpprust._sub_code(
+        r"(?<![\w.])([\w:]+(?:\s*<[^;<>]*>)?)\s+(\w+)\s*=\s*"
+        r"new\s+\1\s*\(([^)]*)\)\s*;",
+        decl, text)
+
+    def expr(m):
+        typ, args = m.group(1), m.group(2).strip()
+        base = typ.split("<")[0]
+        if base in shared_names:
+            return "std::make_shared<%s>(%s)" % (typ, args)
+        if args:
+            return "%s(%s)" % (typ, args)
+        return "%s()" % typ
+
+    return cpprust._sub_code(
+        r"(?<![\w.])new\s+([\w:]+(?:\s*<[^;<>]*>)?)\s*\(([^)]*)\)",
+        expr, text)
+
+
+def _lower_throw_catch(text):
+    """`throw`/`catch` -> the checked `raise`/`except` model."""
+    text = cpprust._sub_code(r"(?<![\w.])throw(?![\w])",
+                             lambda m: "raise", text)
+    # `catch` is 5 letters, `except` is 6 -- one column shifts on that line.
+    text = cpprust._sub_code(r"(?<![\w.])catch(?=\s*\()",
+                             lambda m: "except", text)
+    return text
+
+
+def _mark_except_functions(text):
+    """A function body that `raise`s must be declared `except`."""
+    scan = _blank(text)
+
+    def maybe(m):
+        head, body = m.group(1), m.group(2)
+        if re.search(r"(?<![\w.])raise(?![\w])", body) and "except" not in head:
+            return head + " except {" + body + "}"
+        return m.group(0)
+
+    # One nesting level of braces in the body is enough for the forms the
+    # tests write; deeper nests still carry `raise` into a later cpprust
+    # diagnostic, which is the escape hatch for a cs2cpp bug.
+    return re.sub(
+        r"((?:[\w:<>,\s\*\&]+)\s+\w+\s*\([^)]*\)\s*)"
+        r"\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}",
+        maybe, text)
+
+
+def _lower_auto_properties(text):
+    """`int Count { get; set; }` -> field + get_Count / set_Count.
+
+    Expression stays on the same line so newline counts are preserved; the
+    line grows, which is the same trade `template<…>` already makes.
+    """
+    prop = re.compile(
+        r"(?<![\w.])([\w:<>,\s\*\&]+?)\s+(\w+)\s*\{\s*get\s*;\s*"
+        r"(?:(?:public|private|protected|internal)\s+)?set\s*;\s*\}")
+    names = []
+
+    def repl(m):
+        typ, name = m.group(1).strip(), m.group(2)
+        names.append(name)
+        field = "_" + name
+        return ("%s %s; %s get_%s() { return this->%s; } "
+                "void set_%s(%s v) { this->%s = v; }"
+                % (typ, field, typ, name, field, name, typ, field))
+
+    text = cpprust._sub_code(prop.pattern, repl, text)
+    for name in sorted(set(names), key=len, reverse=True):
+        text = cpprust._sub_code(
+            r"\." + re.escape(name) + r"\s*=\s*([^;]+);",
+            lambda m, n=name: ".set_%s(%s);" % (n, m.group(1)), text)
+        text = cpprust._sub_code(
+            r"\.(?!get_|set_)" + re.escape(name) + r"\b(?!\s*\()",
+            lambda m, n=name: ".get_%s()" % n, text)
+    return text
+
+
+def _lower_delegates(text):
+    """`delegate int D(int x);` -> `typedef int (*D)(int x);`."""
+    return cpprust._sub_code(
+        r"(?<![\w.])delegate\s+([\w:<>,\s\*\&]+?)\s+(\w+)\s*\(([^)]*)\)\s*;",
+        lambda m: "typedef %s (*%s)(%s);"
+                  % (m.group(1).strip(), m.group(2), m.group(3)),
+        text)
+
+
+def _lower_lambdas(text):
+    """`x => x + 1` / `(int x) => x + 1` -> C++ lambdas cpprust already lowers."""
+    scan = _blank(text)
+    arrows = list(re.finditer(r"=>", scan))
+    for m in reversed(arrows):
+        j = m.start() - 1
+        while j >= 0 and scan[j] in " \t":
+            j -= 1
+        if j < 0:
+            continue
+        if scan[j] == ")":
+            depth, i = 0, j
+            while i >= 0:
+                if scan[i] == ")":
+                    depth += 1
+                elif scan[i] == "(":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                i -= 1
+            if depth != 0:
+                continue
+            args = text[i:j + 1]
+            args_start = i
+        elif scan[j].isalnum() or scan[j] == "_":
+            i = j
+            while i >= 0 and (scan[i].isalnum() or scan[i] == "_"):
+                i -= 1
+            args_start = i + 1
+            args = "(" + text[args_start:j + 1] + ")"
+        else:
+            continue
+        body_start = m.end()
+        while body_start < len(scan) and scan[body_start] in " \t":
+            body_start += 1
+        depth, i, n = 0, body_start, len(scan)
+        while i < n:
+            c = scan[i]
+            if c in "([{":
+                depth += 1
+            elif c in ")]}":
+                if depth == 0:
+                    break
+                depth -= 1
+            elif c in ",;" and depth == 0:
+                break
+            i += 1
+        body = text[body_start:i].strip()
+        inner = args[1:-1].strip()
+        if inner and not re.search(r"\w+\s+\w+", inner):
+            parts = [p.strip() for p in inner.split(",") if p.strip()]
+            args = "(" + ", ".join("auto %s" % p for p in parts) + ")"
+        text = (text[:args_start] + "[]%s { return %s; }" % (args, body)
+                + text[i:])
+        scan = _blank(text)
+    return text
+
+
+def _wrap_shared_locals(text, shared_names):
+    if not shared_names:
+        return text
+    for name in shared_names:
+        text = cpprust._sub_code(
+            r"(?<!shared_ptr<)(?<![\w.])" + re.escape(name)
+            + r"(?!\s*<)\s+(\w+)\s*=",
+            lambda m, n=name: "std::shared_ptr<%s> %s =" % (n, m.group(1)),
+            text)
+        text = cpprust._sub_code(
+            r"(?<!shared_ptr<)(?<![\w.])" + re.escape(name)
+            + r"(?!\s*<)\s+(\w+)\s*;",
+            lambda m, n=name: "std::shared_ptr<%s> %s;" % (n, m.group(1)),
+            text)
+    return text
+
+
+def _shared_calls(text, shared_names):
+    """Method calls on shared_ptr locals: `Type_method(var.get(), …)`."""
+    if not shared_names:
+        return text
+    var_type = {}
+    for name in shared_names:
+        for m in re.finditer(
+                r"std::shared_ptr<\s*" + re.escape(name) + r"\s*>\s+(\w+)",
+                text):
+            var_type[m.group(1)] = name
+    for v, typ in sorted(var_type.items(), key=lambda kv: -len(kv[0])):
+        def meth(m, typ=typ, v=v):
+            method, args = m.group(1), m.group(2).strip()
+            if args:
+                return "%s_%s(%s.get(), %s)" % (typ, method, v, args)
+            return "%s_%s(%s.get())" % (typ, method, v)
+
+        text = re.sub(
+            r"\b" + re.escape(v) + r"\.(\w+)\s*\(([^)]*)\)", meth, text)
+        text = re.sub(
+            r"\b" + re.escape(v) + r"\.(\w+)\b(?!\s*\()",
+            v + r".get()->\1", text)
+    return text
+
+
+def _find_shared_names(text):
+    """Class names marked `[Shared]` on the preceding attribute line."""
+    scan = _blank(text)
+    names = set()
+    for m in re.finditer(
+            r"\[\s*Shared\s*\][ \t]*\n[ \t]*(?:public\s+|private\s+)?"
+            r"class\s+(\w+)", scan):
+        names.add(m.group(1))
+    for m in re.finditer(
+            r"\[\s*Shared\s*\][ \t]+(?:public\s+|private\s+)?class\s+(\w+)",
+            scan):
+        names.add(m.group(1))
+    return names
+
+
 def _type_start(look, end):
     """Where does the type ending at `end` begin? -1 if there is none.
 
@@ -553,15 +812,11 @@ def translate(text, path="<cs>"):
     # construct at a C# line.
     _check_refusals(text, path)
 
+    shared = _find_shared_names(text)
     text, attrs = _strip_attributes(text)
-    for a in attrs:
-        if a == "Shared":
-            raise CsError(
-                "%s: `[Shared]` selects reference semantics backed by a "
-                "refcount, which is CSHARP.md milestone 1's opt-in and is "
-                "not built yet. Without it a class is single-owner: "
-                "assignment moves." % os.path.basename(path))
+    # Attributes other than Shared are dropped; Shared only marks names.
     text = _drop_using_directives(text)
+    text = _lower_delegates(text)
     # Interfaces before modifiers are dropped: an interface member is
     # implicitly public and may say so, and the pure-virtual rewrite reads
     # the declaration whole.
@@ -572,6 +827,8 @@ def translate(text, path="<cs>"):
     # and the rename below sees a member and not a qualifier salad.
     text = _lower_constants(text)
     text = _qualify_bases(text)
+    text = _lower_generic_classes(text)
+    text = _lower_auto_properties(text)
     # *Before* the primitive map, not after. Every C# primitive is one word
     # and several C spellings are two, so mapping first turned `byte[]` into
     # `unsigned char[]` -- where the element pattern matched `char` alone and
@@ -579,10 +836,18 @@ def translate(text, path="<cs>"):
     # map below reaches inside the argument list and rewrites the element
     # there, which is the same work in the order that survives it.
     text = _lower_arrays(text)
+    text = _lower_collections(text)
     text = _map_types(text)
     text = _lower_var(text)
     text = _lower_foreach(text)
+    text = _lower_this(text)
     text = _lower_literals(text)
+    text = _lower_throw_catch(text)
+    text = _lower_lambdas(text)
+    text = _lower_new(text, shared)
+    text = _wrap_shared_locals(text, shared)
+    text = _shared_calls(text, shared)
+    text = _mark_except_functions(text)
     # Last: it inserts characters, and every pass above indexes the text it
     # was handed.
     text = _terminate(text)
