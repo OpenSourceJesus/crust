@@ -101,6 +101,10 @@ _REFUSALS = [
     (r'\bunchecked\s*\(', "unchecked", "overflow checks are not in the subset"),
     (r'\bgoto\s+case\b', "goto case", "use if/else or separate handlers"),
     (r'\bfrom\s+\w+\s+in\b', "LINQ query syntax", "write the loop"),
+    (r'\bstatic\s+class\b', "static class",
+     "use a namespace of free functions"),
+    (r'\bstatic\s+[\w:<>,\s\*\&]+\s+\w+\s*\(\s*this\s+',
+     "extension method", "not phase 1; call a free function"),
 ]
 
 
@@ -252,6 +256,10 @@ def _rewrite_surface(text):
     text = re.sub(
         r'\babstract\s+([\w:<>,\s\*\&]+)\s+(\w+)\s*\(([^)]*)\)\s*;',
         r'virtual \1 \2(\3) = 0;', text)
+    # C# `override int f()` → C++ `int f() override` (specifier is postfix).
+    text = re.sub(
+        r'\boverride\s+([\w:<>,\s\*\&]+)\s+(\w+)\s*\(([^)]*)\)',
+        r'\1 \2(\3) override', text)
     text = re.sub(r'\babstract\s+class\b', 'class', text)
     text = re.sub(r'\bsealed\s+class\b', 'class', text)
     text = re.sub(r'\bsealed\s+', '', text)
@@ -279,11 +287,12 @@ def _mark_except_functions(text):
 
 def _lower_new(text, shared_names):
     # `T a = new T(args);` → `T a(args);` (no copy from temporary; owning
-    # classes delete their copy ctor).
+    # classes delete their copy ctor). Shared types use make_shared so a
+    # later `new T(` pass cannot wrap the constructor argument again.
     def decl(m):
         typ, name, args = m.group(1), m.group(2), m.group(3).strip()
         if typ in shared_names:
-            return ("std::shared_ptr<%s> %s(new %s(%s));"
+            return ("std::shared_ptr<%s> %s = std::make_shared<%s>(%s);"
                     % (typ, name, typ, args))
         if args:
             return "%s %s(%s);" % (typ, name, args)
@@ -296,7 +305,7 @@ def _lower_new(text, shared_names):
     def repl(m):
         typ, args = m.group(1), m.group(2).strip()
         if typ in shared_names:
-            return "std::shared_ptr<%s>(new %s(%s))" % (typ, typ, args)
+            return "std::make_shared<%s>(%s)" % (typ, args)
         return ("%s(%s)" % (typ, args)) if args else ("%s()" % typ)
 
     return re.sub(r'\bnew\s+(\w+)\s*\(([^)]*)\)', repl, text)
@@ -304,12 +313,42 @@ def _lower_new(text, shared_names):
 
 def _wrap_shared_locals(text, shared_names):
     for name in shared_names:
+        # Skip names already rewritten to shared_ptr<T>.
         text = re.sub(
-            r'\b' + re.escape(name) + r'\s+(\w+)\s*=',
+            r'(?<!shared_ptr<)\b' + re.escape(name) + r'\s+(\w+)\s*=',
             'std::shared_ptr<' + name + r'> \1 =', text)
         text = re.sub(
-            r'\b' + re.escape(name) + r'\s+(\w+)\s*;',
+            r'(?<!shared_ptr<)\b' + re.escape(name) + r'\s+(\w+)\s*;',
             'std::shared_ptr<' + name + r'> \1;', text)
+    return text
+
+
+def _shared_calls(text, shared_names):
+    """Rewrite method/field use on shared_ptr locals.
+
+    cpprust rewrites `obj.method` only for class values, not through
+    `shared_ptr::operator->`. Emitting `Type_method(var.get(), args)` matches
+    the form it already accepts, and avoids `var.get()` meaning
+    shared_ptr::get when the C# method is also named get.
+    """
+    var_type = {}
+    for name in shared_names:
+        for m in re.finditer(
+                r'std::shared_ptr<\s*' + re.escape(name) + r'\s*>\s+(\w+)',
+                text):
+            var_type[m.group(1)] = name
+    for v, typ in sorted(var_type.items(), key=lambda kv: -len(kv[0])):
+        def meth(m, typ=typ, v=v):
+            method, args = m.group(1), m.group(2).strip()
+            if args:
+                return "%s_%s(%s.get(), %s)" % (typ, method, v, args)
+            return "%s_%s(%s.get())" % (typ, method, v)
+
+        text = re.sub(
+            r'\b' + re.escape(v) + r'\.(\w+)\s*\(([^)]*)\)', meth, text)
+        text = re.sub(
+            r'\b' + re.escape(v) + r'\.(\w+)\b(?!\s*\()',
+            v + r'.get()->\1', text)
     return text
 
 
@@ -345,6 +384,7 @@ def normalize(text, path="<cs>"):
     text = _rewrite_types(text, shared, structs)
     text = _lower_new(text, shared)
     text = _wrap_shared_locals(text, shared)
+    text = _shared_calls(text, shared)
     text = _mark_except_functions(text)
     text = _includes(text, shared)
     text = re.sub(r'\binternal\b', 'public', text)
