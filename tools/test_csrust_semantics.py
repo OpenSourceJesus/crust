@@ -111,6 +111,10 @@ int f() {
             or ("b = a" in out) or ("shared_ptr_Node" in out),
             out[-800:],
         )
+        # Method calls must go through get()+Type_method, not shared_ptr::get
+        # alone as the C# get() result.
+        self.assertIn("Node_set", out)
+        self.assertIn("Node_get", out)
 
 
 @unittest.skipUnless(cs2cpp is not None, "cs2cpp not available yet")

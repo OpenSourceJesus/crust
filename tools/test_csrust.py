@@ -163,6 +163,46 @@ class Foo : IFoo {
         self.assertIn("public IFoo", cpp)
 
 
+class TestSharedRuns(Base):
+
+    @unittest.skipUnless(_have_gcc(), "gcc required")
+    def test_shared_alias_runs(self):
+        src = """
+[Shared] class Node {
+    public int v;
+    public Node() { v = 0; }
+    public void set(int x) { v = x; }
+    public int get() { return v; }
+}
+int main(void) {
+    Node a = new Node();
+    Node b = a;
+    b.set(7);
+    return a.get() == 7 ? 0 : 1;
+}
+"""
+        self.run_c(src)
+
+
+class TestVirtualRuns(Base):
+
+    @unittest.skipUnless(_have_gcc(), "gcc required")
+    def test_override_dispatch(self):
+        src = """
+class Base {
+    public virtual int f() { return 1; }
+}
+class Child : Base {
+    public override int f() { return 2; }
+}
+int main(void) {
+    Child c = new Child();
+    return c.f() == 2 ? 0 : 1;
+}
+"""
+        self.run_c(src)
+
+
 class TestExcept(Base):
 
     def test_throw_becomes_raise(self):
@@ -192,6 +232,15 @@ class TestCli(Base):
         self.assertIn("A_get", out)
 
 
+class TestMoreRefusals(Base):
+
+    def test_extension_method(self):
+        self.refuses(
+            "static int Len(this string s) { return 0; }",
+            "extension method")
+
+    def test_static_class(self):
+        self.refuses("static class Util { }", "static class")
 
 
 class TestPreprocInclude(unittest.TestCase):
