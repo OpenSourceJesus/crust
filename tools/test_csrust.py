@@ -193,5 +193,38 @@ class TestCli(Base):
 
 
 
+
+class TestPreprocInclude(unittest.TestCase):
+    """`#include \"x.cs\"` goes through csrust in the preprocessor."""
+
+    @unittest.skipUnless(_have_gcc(), "gcc required")
+    def test_c_includes_cs(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        d = tempfile.mkdtemp(prefix="csinc-")
+        try:
+            with open(os.path.join(d, "counter.cs"), "w") as f:
+                f.write(_COUNTER + """
+int entry() {
+    Counter a = new Counter();
+    a.twice(3);
+    return a.get();
+}
+""")
+            with open(os.path.join(d, "prog.c"), "w") as f:
+                f.write('#include "counter.cs"\n'
+                        "int main(void) { return entry() == 6 ? 0 : 1; }\n")
+            out = os.path.join(d, "prog")
+            r = subprocess.run(
+                [sys.executable, "-m", "shivyc.main",
+                 os.path.join(d, "prog.c"), "-o", out],
+                cwd=root, capture_output=True, text=True)
+            self.assertEqual(
+                0, r.returncode, r.stderr[-1000:] or r.stdout[-1000:])
+            run = subprocess.run([out], capture_output=True, text=True)
+            self.assertEqual(0, run.returncode, run.stderr)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
