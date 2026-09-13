@@ -13,19 +13,38 @@ generated C++ still points at the user's `.cs` line.
 
 Crust has no GC. Default `class` is **single ownership**: the lowered
 object is a value with one owner; destruction is at scope exit.
-`[Shared]` is reserved for a future `shared_ptr` opt-in and is **refused**
-today (not silently ignored) — see `tests/test_csrust.py` (`TestSemantics`).
+
+```csharp
+class Node { }              // single owner
+[Shared] class Node { }     // shared_ptr; assignment aliases; cycles may leak
+```
+
+Pinned in `tests/test_csrust.py` (`TestSemantics`).
 
 ## Phase 1 surface
 
-In (see `tools/cs2cpp.py` / `tests/test_csrust.py`): `class`, `interface`,
-fields, methods, constructors, single inheritance, `virtual` / `abstract`,
-`var`, `foreach`, arrays → `vector`, primitive map, `using` aliases.
+**In** (see `tools/cs2cpp.py` / `tests/test_csrust.py`):
 
-Out (refused in C# terms before conversion): `async`/`await`, LINQ,
-`yield`, `dynamic`, multidimensional arrays, `ref` parameters, string
-interpolation, file-scoped namespaces, and more — each with reason and
-replacement in the diagnostic.
+| Area | Lowering |
+|------|----------|
+| `class` / `struct` / `interface` / `enum` | C++ types; interface → pure virtual |
+| fields, methods, constructors, `~T` | cpprust method shape `T_method(T *this, …)` |
+| single inheritance, `virtual` / `abstract` | vtables |
+| `class Box<T>` | `template<typename T> class Box` → monomorphise |
+| `List<T>` / `Dictionary<K,V>` | `std::vector` / `std::map` |
+| `T[]`, jagged `T[][]`, `.Length` | `vector`, `.size()` |
+| `var`, `foreach`, `this.`, `null` | `auto`, range-`for`, `this->`, `NULL` |
+| auto-properties `{ get; set; }` | field + `get_` / `set_` |
+| `delegate` | `typedef` function pointer |
+| `x => …` lambdas | C++ lambdas |
+| `throw` / `catch` | `raise` / `except` (checked model) |
+| `using X = Y;` | kept; `using System;` dropped |
+| `--emit-decls` | same class digest as C++ (CPPRPY.md) |
+
+**Out** (refused in C# terms before conversion): `async`/`await`, LINQ,
+`yield`, `dynamic`, `event`, multidimensional arrays, `ref`/`out`/`in`
+parameters, `$"…"`, file-scoped namespaces, `??` / `?.`, `char`, `lock`,
+`decimal`, `partial`, `goto`, `params`, `stackalloc`, `checked`/`unchecked`.
 
 ## Layout
 
@@ -33,9 +52,12 @@ replacement in the diagnostic.
 |------|------|
 | `tools/cs2cpp.py` | refusals + C# → C++ subset (`translate`) |
 | `tools/csrust.py` | CLI; `cs2cpp.translate` then `cpprust.translate` |
-| `tests/test_csrust.py` | semantics, lowering, interfaces, refusals |
+| `tests/test_csrust.py` | semantics, lowering, Shared, generics, except, digest |
 
-## Not done yet
+## Deliberately later
 
-`[Shared]` refcounting, digest / four-language TU, extracting
-`cpprust_core.py`, `async` / LINQ.
+Extracting `cpprust_core.py` (approach **C**) — issue §5 milestone 9 —
+waits until shared seams are known from real use. Full four-language TU
+demo (C + Rust + C++ + C# in one file) builds on the digest C# already
+emits; C++ cannot yet *inherit from* a foreign digest entry (include the
+header instead).
