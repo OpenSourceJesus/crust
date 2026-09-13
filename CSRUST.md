@@ -54,6 +54,11 @@ parameters, `$"…"`, file-scoped namespaces, `??` / `?.`, `char`, `lock`,
 | `tools/csrust.py` | CLI; `cs2cpp.translate` then `cpprust.translate` |
 | `tests/test_csrust.py` | semantics, lowering, Shared, generics, except, digest |
 
+A Unity *scene* plus these scripts is a different job: see
+[UNITY_PACK.md](UNITY_PACK.md). That packer emits `engine.c` / `data.c`
+with packed instance arrays (`_Coin_inst_array[i]`) instead of Unity
+object headers.
+
 ## Deliberately later
 
 Extracting `cpprust_core.py` (approach **C**) — issue §5 milestone 9 —
