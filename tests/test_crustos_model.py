@@ -321,12 +321,17 @@ def _body_of(source):
 # Structural gaps that remain, with the reason each one is still open.  Same
 # rule as EXPECTED_DIVERGENCES: a test asserts each still differs, so closing
 # one cannot pass unnoticed.
-EXPECTED_SHAPE_GAPS = {
-    "accepted": "the kernel writes `for url in urls.split(',')` and "
-                "`out.append(i)`; hoare.py has neither -- `for` must be over "
-                "`range(n)`, and a store-passing lowering has no mutation, so "
-                "the model hoists the split and rebuilds the list with snoc",
-}
+#
+# Empty as of desugar_for and desugar_append in hoare.py.  It was:
+#
+#   "accepted": the kernel writes `for url in urls.split(',')` and
+#               `out.append(i)`; hoare.py had neither
+#
+# and closing it took no change to the model's claim, only to what the
+# lowering would read: a `for` over a list is now the `while` it always was,
+# with the variant supplied, and `.append` is `snoc` written the way Python
+# writes it.
+EXPECTED_SHAPE_GAPS = {}
 
 
 @unittest.skipUnless(ROSETTAMATH, "RosettaMath not found; run 'make install_proofs'")
@@ -345,12 +350,14 @@ class TestModelShape(unittest.TestCase):
         return (_skeleton(_body_of(inspect.getsource(real))),
                 _skeleton(_body_of(self.sources[name])))
 
-    def test_scheme_of_is_the_same_function_twice(self):
-        real, model = self.shapes("scheme_of")
-        self.assertEqual(real, model,
-                         "scheme_of no longer has the shape of the shipped "
-                         "function; the model has drifted back into being a "
-                         "paraphrase")
+    def test_modelled_functions_are_the_same_function_twice(self):
+        for name in sorted(MODELLED - set(EXPECTED_SHAPE_GAPS)):
+            with self.subTest(name=name):
+                real, model = self.shapes(name)
+                self.assertEqual(real, model,
+                                 "%s no longer has the shape of the shipped "
+                                 "function; the model has drifted back into "
+                                 "being a paraphrase" % name)
 
     def test_known_shape_gaps_are_still_open(self):
         for name, why in EXPECTED_SHAPE_GAPS.items():
