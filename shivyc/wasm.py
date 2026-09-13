@@ -291,6 +291,11 @@ class FuncBody:
     *selection* belongs to asm_gen.
     """
 
+    # `code` is a list of instruction bytes, but the name matches py2c's
+    # str heuristic and was being lowered to `char*` -- every list_append on
+    # it then failed to compile. Annotate to keep it a boxed list.
+    code: "object"
+
     def __init__(self):
         self.local_types = []            # types of locals after the params
         self.code = []

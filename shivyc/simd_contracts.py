@@ -25,6 +25,7 @@ reductions whose alignment is *proven*, and otherwise leaves ShivyC's ordinary
 scalar codegen untouched.
 """
 
+from shivyc import proofs
 import shivyc.il_cmds.control as control_cmds
 import shivyc.il_cmds.value as value_cmds
 import shivyc.il_cmds.math as math_cmds
@@ -41,11 +42,13 @@ class ProofResult:
         self.call_sites = 0
         self.proven = False
         self.reason = ""
+        self.evidence = "read by the compiler"
 
     def __str__(self):
         if self.proven:
             return (f"simd-contracts: '{self.name}': contracts proven at all "
-                    f"{self.call_sites} call site(s); scalar fallback omitted")
+                    f"{self.call_sites} call site(s) ({self.evidence}); "
+                    f"scalar fallback omitted")
         return (f"simd-contracts: '{self.name}': not proven "
                 f"({self.reason}); keeping scalar code")
 
@@ -94,10 +97,24 @@ def analyze(il_code, symbol_table, ext_info):
         for caller, call in sites:
             count = _prove_one_call_multi(
                 il_code, name_of, caller, call, ptrs, len_index)
-            if count is None or not _satisfies(count, contract):
+            if count is None:
                 all_ok = False
                 result.reason = "a call site could not be proven aligned"
                 break
+            if not _satisfies(count, contract):
+                all_ok = False
+                result.reason = "a call site could not be proven aligned"
+                break
+            # Satisfying the contract is not on its own a licence to drop the
+            # scalar tail.  Omitting code needs evidence, and when a proof
+            # kernel is available the certificate is the evidence; without one
+            # the tail stays, which costs speed and never correctness.
+            if not proofs.licenses(count, contract):
+                all_ok = False
+                result.reason = (f"a call site is aligned but unproved "
+                                 f"({proofs.evidence(count, contract)})")
+                break
+            result.evidence = proofs.evidence(count, contract)
             counts.add(count)
         if not all_ok:
             reports.append(result)
@@ -136,14 +153,78 @@ def analyze(il_code, symbol_table, ext_info):
     return proven, reports
 
 
+def parameter_extents(il_code, symbol_table):
+    r"""How many bytes each contracted pointer parameter is guaranteed.
+
+    `{(function, argument index): bytes}`, and only where the guarantee has
+    actually been established: every visible call site must be traced to an
+    allocation big enough, and -- when a proof kernel is available -- the
+    contract must come with a certificate.  A contract nobody has checked at
+    the call sites says nothing about what the callee may assume, which is the
+    difference between a promise and a proof.
+
+    `len(p)` counts *elements*, as it does everywhere else in this pass, so a
+    `len>= 64` on an `int *` is 256 bytes. Getting that conversion wrong would
+    hand `memsafe_elide` a bound four times too large, so it is done once,
+    here, next to the element size it needs.
+    """
+    from shivyc import contracts as contract_state
+    from shivyc import proofs
+
+    meta = getattr(contract_state, "_meta", None) or {}
+    params = getattr(contract_state, "_params", None) or {}
+    if not meta:
+        return {}
+    name_of = _build_function_names(il_code, symbol_table)
+    extents = {}
+
+    for fname, arg_contracts in meta.items():
+        if fname not in il_code.commands or fname not in params:
+            continue
+        layout = {a["index"]: a for a in _arg_layout(fname, symbol_table)}
+        sites = _find_call_sites(il_code, name_of, fname)
+        if not sites:
+            continue                 # never called here: nothing established
+        for arg_name, contract in arg_contracts.items():
+            least = contract.get("len>=")
+            if least is None or arg_name not in params[fname]:
+                continue
+            index = params[fname].index(arg_name)
+            shape = layout.get(index)
+            if shape is None or not shape["is_ptr"]:
+                continue
+            elem = shape["elem_size"]
+            if not elem:
+                continue
+            ok = True
+            for caller, call in sites:
+                if index >= len(call.args):
+                    ok = False
+                    break
+                byte_size = _trace_malloc_bytes(
+                    il_code, name_of, il_code.commands[caller],
+                    call.args[index])
+                if byte_size is None or byte_size < least * elem:
+                    ok = False
+                    break
+                if not proofs.licenses(byte_size // elem, contract):
+                    ok = False
+                    break
+            if ok:
+                extents[(fname, index)] = least * elem
+    return extents
+
+
 def _satisfies(count, contract):
-    """Check a proven element count against a contract dict."""
-    if "len>=" in contract and count < contract["len>="]:
+    """Check a proven element count against a contract dict.
+
+    Delegated to `shivyc.proofs` so that this pass and `contracts` read one
+    contract the same way; with `CRUST_PROOFS=1` the reading is additionally
+    checked by RosettaMath's kernel, and the certificate is reported.
+    """
+    if not proofs.satisfies(count, contract):
         return False
-    if "len<=" in contract and count > contract["len<="]:
-        return False
-    if "div-by" in contract and count % contract["div-by"] != 0:
-        return False
+    proofs.certified(count, contract)        # raises on a disagreement
     return True
 
 

@@ -1,0 +1,199 @@
+"""One reading of a contract, checked by a proof kernel when asked.
+
+`extensions.py` parses a contract into `{'len>=': 64, 'div-by': 4}` and hands
+it downstream, where each pass decides for itself what the dict means.  Two
+passes read it two ways:
+
+    contracts._violates    returns on the first key it finds
+    simd_contracts._satisfies   conjoins every key
+
+For `{'len>=': 64, 'div-by': 4}` -- the contract in `SIMD_CONTRACTS.md` -- a
+length of 70 clears `len>=`, so `_violates` never looks at the `div-by` and the
+call compiles, while `simd_contracts` correctly refuses to prove it and keeps
+the scalar tail.  One contract, two answers, and the one that reports errors
+was the lenient one.
+
+So the reading lives here, once, and both passes ask it.  A contract holds when
+*every* clause holds; a clause nobody can read is an error rather than
+something to skip past.
+
+Beyond agreeing with itself, the reading can be *checked*.  RosettaMath's
+`lean4.py` is a Calculus of Constructions kernel, and `crustproof.py` turns a
+contract into a term of that calculus: `{'len>=': 64, 'div-by': 4}` becomes
+`andb (dvdb 4 n) (leb 64 n)`, which at a known length reduces to `true` or
+`false` under the kernel's own evaluator, and when it reduces to `true` a proof
+term is built and type-checked.  Nothing is imported until a contract actually needs certifying, so a program
+without contracts pays nothing; `CRUST_PROOFS=0` turns it off entirely.
+"""
+
+import os
+
+BOUNDS = ("len>=", "len<=", "div-by")
+
+# Reading a bound: does this length satisfy this clause?
+_CLAUSES = {
+    "len>=": lambda k, n: n >= k,
+    "len<=": lambda k, n: n <= k,
+    "div-by": lambda k, n: (n % k) == 0,
+}
+
+
+class UnknownBound(Exception):
+    """A contract clause with no reading.
+
+    Raised rather than skipped.  A clause quietly dropped is a contract that
+    quietly does not hold, which is the failure this module exists to remove.
+    """
+
+
+def failing(length, bounds):
+    """Every clause this length breaks, in the order they are written."""
+    unknown = set(bounds) - set(_CLAUSES)
+    if unknown:
+        raise UnknownBound(
+            "no reading for contract clause(s) %s; this compiler knows %s"
+            % (", ".join(sorted(unknown)), ", ".join(BOUNDS)))
+    return [key for key in BOUNDS
+            if key in bounds and not _CLAUSES[key](bounds[key], length)]
+
+
+def satisfies(length, bounds):
+    """Does a known length meet the whole contract?"""
+    return not failing(length, bounds)
+
+
+def violates(length, bounds):
+    """Does it break any clause of the contract?"""
+    return bool(failing(length, bounds))
+
+
+def clause_text(arg_name, key, bounds):
+    """The clause as it was written in the source, for a diagnostic."""
+    if key == "len<=":
+        return "len(%s) <= %d" % (arg_name, bounds[key]), "is too large"
+    if key == "len>=":
+        return "len(%s) >= %d" % (arg_name, bounds[key]), "is too small"
+    if key == "div-by":
+        return ("not len(%s) %% %d" % (arg_name, bounds[key]),
+                "has a length that violates the contract")
+    raise UnknownBound("no text for contract clause %r" % (key,))
+
+
+# ------------------------------------------------------------ certification
+
+_KERNEL = None
+_TRIED = False
+
+#: Above this length the kernel is not consulted.  It used to be 128, because
+#: settling a contract meant walking a unary numeral and cost about a second at
+#: length 64.  The kernel now answers on literals by arithmetic, so the same
+#: check is a millisecond and the only cost left is *building* the numeral,
+#: which is linear.  The budget is what that leaves room for.
+MAX_CERTIFIED = int(os.environ.get("CRUST_PROOF_MAX", "65536"))
+
+
+def _kernel():
+    """RosettaMath's proof bridge, if it is available and wanted."""
+    global _KERNEL, _TRIED
+    if _TRIED:
+        return _KERNEL
+    _TRIED = True
+    if os.environ.get("CRUST_PROOFS", "1") in ("0", "false", "no"):
+        return None
+    import sys
+    # The bridge is host-only: it locates RosettaMath at runtime and imports
+    # `crustproof` through a mutated sys.path, neither of which the translator
+    # can lower. Under the self-hosted build this condition folds to false and
+    # the whole block is dropped, so `_KERNEL` stays None and `certified()`
+    # reports "not asked" -- which is exactly right, since there is no kernel
+    # to ask. Under CPython it runs normally.
+    if sys.implementation.name != "shivyc":
+        here = os.path.dirname(os.path.abspath(__file__))
+        for path in (os.environ.get("ROSETTAMATH_DIR"),
+                     os.path.join(here, "..", "..", "RosettaMath"),
+                     os.path.expanduser("~/RosettaMath")):
+            if path and os.path.isfile(os.path.join(path, "crustproof.py")):
+                full = os.path.abspath(path)
+                if full not in sys.path:
+                    sys.path.insert(0, full)
+                try:
+                    import crustproof
+                    _KERNEL = crustproof
+                except ImportError:
+                    _KERNEL = None
+                break
+    return _KERNEL
+
+
+def certified(length, bounds):
+    """A kernel-checked certificate for this contract, or None.
+
+    None means the kernel was not asked -- because certification is off, or
+    RosettaMath is not present, or the length is past `MAX_CERTIFIED`.  It
+    never means the contract failed: that is what `satisfies` is for.  When a
+    certificate does come back its verdict is checked against the reading
+    above, and a disagreement is raised rather than resolved, since exactly one
+    of the two would then be wrong and this module cannot tell which.
+    """
+    kernel = _kernel()
+    if kernel is None or length > MAX_CERTIFIED:
+        return None
+    if any(bounds.get(key, 0) > MAX_CERTIFIED for key in bounds):
+        return None
+    import sys
+    # Host-only for the same reason as `_kernel()`: `kernel` is a dynamically
+    # imported module object, so `kernel.check` has no lowering and was emitted
+    # as a bare `check(...)`. The whole kernel-consulting tail lives inside the
+    # guard so that under the self-hosted build it is *dropped* rather than
+    # left as unreachable code that still has to compile. `_kernel()` is always
+    # None there, so the early return above already covers this path.
+    if sys.implementation.name != "shivyc":
+        try:
+            certificate = kernel.check(length, bounds)
+        except Exception:                # a bridge fault is not a compile error
+            return None
+        if certificate.holds != satisfies(length, bounds):
+            raise AssertionError(
+                "the proof kernel and this compiler disagree about %r at "
+                "length %d: kernel says %s. One of them is wrong and it is "
+                "not safe to guess which."
+                % (bounds, length, certificate.holds))
+        return certificate
+    return None
+
+
+def licenses(length, bounds):
+    """May generated code be changed on the strength of this contract?
+
+    Satisfying the contract is necessary and, when a proof kernel is available,
+    not sufficient: the certificate has to be there too.  A length past
+    `MAX_CERTIFIED`, or a bridge that will not load, means no certificate, and
+    then the answer is no -- the check stays, the scalar tail stays.
+
+    That is the same rule the rest of Crust follows: a proof that does not
+    arrive degrades to the conservative path, never to a wrong answer.  With
+    certification switched off there is no proof to wait for and the reading
+    stands on its own, which is what Crust did before any of this.
+    """
+    if not satisfies(length, bounds):
+        return False
+    certificate = certified(length, bounds)
+    if certificate is not None:
+        return certificate.holds
+    return _kernel() is None
+
+
+def evidence(length, bounds):
+    """What licensed it, for a report line."""
+    if not satisfies(length, bounds):
+        return "not satisfied"
+    if certified(length, bounds) is not None:
+        return "kernel-checked"
+    if _kernel() is None:
+        return "read by the compiler"
+    return "no certificate"
+
+
+def backend():
+    """What settled the last question: for a report line."""
+    return "lean4.py" if _kernel() is not None else "built-in"

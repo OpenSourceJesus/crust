@@ -44,7 +44,8 @@ def emit(src, target, out):
     cmd = [sys.executable, "-m", "shivyc.main", src,
            "--emit-thread-switcher", out]
     if target:
-        cmd += ["--target", target]
+        # A bare-metal switcher: ELF on any host, including a Mac.
+        cmd += ["--target", target, "--os", "none"]
     return run(cmd)
 
 
@@ -147,7 +148,8 @@ def run_booted_preempt():
                     "{ worker_left(); worker_right(); return 0; }\n")
         sw = os.path.join(d, "sw.s")
         rc, out, err = run([sys.executable, "-m", "shivyc.main", app, decl,
-                            "--emit-thread-switcher", sw, "--target", "arm64"])
+                            "--emit-thread-switcher", sw, "--target", "arm64",
+                            "--os", "none"])
         pre = sw[:-2] + ".preempt.s"
         if rc != 0 or not os.path.exists(pre):
             print("  FAIL  preempt boot: generating the switcher failed")

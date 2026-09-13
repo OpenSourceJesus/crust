@@ -1,49 +1,41 @@
 # CSRUST — C# subset for Crust
 
 Approach **D** from [issue #25](https://github.com/brentharts/crust/issues/25):
-normalize a C# subset to the existing C++ subset (`tools/cs2cpp.py`), then
+rewrite a C# subset into the existing C++ subset (`tools/cs2cpp.py`), then
 run `tools/cpprust.py` unchanged. CLI: `tools/csrust.py`. Includes of
 `.cs` files go through the same out-of-process protocol as `.cpp`
 (`shivyc/preproc.py`).
 
+Line numbers are preserved across the rewrite so a diagnostic in the
+generated C++ still points at the user's `.cs` line.
+
 ## What a `class` means (§1)
 
-Crust has no GC. Default `class` is **single ownership** (same as
-`cpprust --owning`): assignment and copy construction are refused.
-Opt in to refcounting per type:
-
-```csharp
-class Node { }              // one owner; moves; scope-exit destruction
-[Shared] class Node { }     // shared_ptr; aliasing OK; cycles may leak
-```
-
-`struct` stays a value type (copy OK). Silent value-copy of a default
-`class` is forbidden — see `tools/test_csrust_semantics.py`.
+Crust has no GC. Default `class` is **single ownership**: the lowered
+object is a value with one owner; destruction is at scope exit.
+`[Shared]` is reserved for a future `shared_ptr` opt-in and is **refused**
+today (not silently ignored) — see `tests/test_csrust.py` (`TestSemantics`).
 
 ## Phase 1 surface
 
-In: `class` / `struct` / `interface`, fields, methods, constructors,
-empty destructor synthesis for owning classes, single inheritance,
-`virtual` / `override` / `abstract`, `var`, `foreach`, auto-properties,
-`List<T>` → `vector`, `Dictionary<K,V>` → `map`, `throw`/`catch` →
-`raise`/`except`, `string`, `null`, `this.`, `new T()`.
+In (see `tools/cs2cpp.py` / `tests/test_csrust.py`): `class`, `interface`,
+fields, methods, constructors, single inheritance, `virtual` / `abstract`,
+`var`, `foreach`, arrays → `vector`, primitive map, `using` aliases.
 
 Out (refused in C# terms before conversion): `async`/`await`, LINQ,
-`yield return`, `dynamic`, `partial class`, `event`, multidimensional
-arrays, `stackalloc`, `params`, `checked`/`unchecked`, `goto case`,
-`static class`, extension methods (`this` first parameter).
+`yield`, `dynamic`, multidimensional arrays, `ref` parameters, string
+interpolation, file-scoped namespaces, and more — each with reason and
+replacement in the diagnostic.
 
 ## Layout
 
 | file | role |
 |------|------|
-| `tools/cs2cpp.py` | refusals + C# → C++ subset normalize |
-| `tools/csrust.py` | CLI; normalize then `cpprust.translate` |
-| `tools/test_csrust_semantics.py` | pins `=` meaning |
-| `tools/test_csrust.py` | Counter, refusals, sugar, Shared/virtual run, `#include` |
+| `tools/cs2cpp.py` | refusals + C# → C++ subset (`translate`) |
+| `tools/csrust.py` | CLI; `cs2cpp.translate` then `cpprust.translate` |
+| `tests/test_csrust.py` | semantics, lowering, interfaces, refusals |
 
-## Not in this PR
+## Not done yet
 
-Digest / four-language TU (`--emit-decls`), extracting `cpprust_core.py`
-(approach C), `async`, LINQ, and open questions in the issue (`string`
-interning, `--shared` CLI list, bounds checks default).
+`[Shared]` refcounting, digest / four-language TU, extracting
+`cpprust_core.py`, `async` / LINQ.

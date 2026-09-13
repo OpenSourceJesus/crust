@@ -339,6 +339,27 @@ def _continues_number(line: list, chunk_start, chunk_end):
     return False
 
 
+# Every character that begins some punctuator. Built on first use, once
+# token_kinds has registered them all. Called twice per input character, the
+# full longest-first scan below dominated compile time on large headers (80%
+# of a macOS SDK <stdio.h> build), though most characters -- letters, digits,
+# spaces -- can begin no punctuator at all. They now return at once; every
+# other character still gets the original scan, so results are unchanged.
+_symbol_first_chars = ""
+
+
+def _symbol_first():
+    global _symbol_first_chars
+    if not _symbol_first_chars:
+        chars = ""
+        for kind in symbol_kinds:
+            c = kind.text_repr[0]
+            if c not in chars:
+                chars = chars + c
+        _symbol_first_chars = chars
+    return _symbol_first_chars
+
+
 def match_symbol_kind_at(content: list, start):
     """Return the longest matching symbol token kind.
 
@@ -348,6 +369,8 @@ def match_symbol_kind_at(content: list, start):
     is found.
 
     """
+    if start >= len(content) or content[start].c not in _symbol_first():
+        return None
     for symbol_kind in symbol_kinds:
         # Match each character of the symbol's spelling against the line.
         # An out-of-range index means the line ends before the symbol could
@@ -366,11 +389,13 @@ def match_symbol_kind_at(content: list, start):
 
 
 def match_include_command(tokens):
-    """Check if end of `tokens` is a `#include` directive."""
+    """Check if end of `tokens` is a `#include` (or `#include_next`)
+    directive: both take a "FILENAME" / <FILENAME> operand."""
     return (len(tokens) == 2
             and tokens[-2].kind == token_kinds.pound
             and tokens[-1].kind == token_kinds.identifier
-            and tokens[-1].content == "include")
+            and (tokens[-1].content == "include"
+                 or tokens[-1].content == "include_next"))
 
 
 def read_string(line: list, start, delim, null):

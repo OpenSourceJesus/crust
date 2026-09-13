@@ -90,7 +90,18 @@ class Number(_RExprNode):
             UL = (ctypes.unsig_longint, 0, ctypes.long_max)
         else:
             UL = (ctypes.unsig_longint, 0, ctypes.ulong_max)
-        if has_u:
+        if ctypes.llp64 and has_l and "ll" not in suffix:
+            # LLP64: a single `l` names the 4-byte `long`, which C tries
+            # before `long long` (C11 6.4.4.1p5).
+            WL = (ctypes.win_long, ctypes.int_min, ctypes.int_max)
+            UWL = (ctypes.unsig_win_long, 0, ctypes.uint_max)
+            if has_u:
+                candidates = [UWL, UL]
+            elif is_decimal:
+                candidates = [WL, L]
+            else:
+                candidates = [WL, UWL, L, UL]
+        elif has_u:
             candidates = [UL] if has_l else [UI, UL]
         elif is_decimal:
             candidates = [L] if has_l else [I, L]

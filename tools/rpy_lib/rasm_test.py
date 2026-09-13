@@ -59,6 +59,12 @@ CASES = [
     "cvttsd2si rax, xmm1", "cvtsd2ss xmm0, xmm1", "cvtss2sd xmm1, xmm0",
     "movq xmm0, rax", "movq rbx, xmm1", "xorps xmm0, xmm0", "pxor xmm2, xmm2",
     "sqrtsd xmm0, xmm1", "movsd xmm8, QWORD PTR [rbp-16]", "addsd xmm9, xmm10",
+    # 128-bit unaligned moves (the Windows runtime's setjmp/longjmp)
+    "movups XMMWORD PTR [rcx+80], xmm6", "movups xmm15, XMMWORD PTR [rcx+224]",
+    "movups XMMWORD PTR [rcx+208], xmm14", "movups xmm7, XMMWORD PTR [rcx+96]",
+    # the Win64 stack probe
+    "test DWORD PTR [rsp], esp", "mov r11, 1052672", "sub rsp, 4096",
+    "sub r11, 4096", "cmp r11, 4096", "sub rsp, r11",
 ]
 
 # Symbolic cases: (instruction, expected_opcode_prefix_bytes, reloc_pcrel).

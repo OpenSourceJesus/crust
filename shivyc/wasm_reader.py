@@ -47,7 +47,11 @@ class WasmDecodeError(Exception):
     """
 
     def __init__(self, message, offset=-1):
-        Exception.__init__(self, message)
+        # `self.args` is set directly rather than through
+        # `Exception.__init__`: py2c cannot call a builtin base's initialiser
+        # (it emitted `__init__(Exception, self, message)`, an undeclared
+        # identifier). Same workaround as crust.CrustError and CompilerError.
+        self.args = (message,)
         self.message = message
         self.offset = offset
 

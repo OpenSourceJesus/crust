@@ -16,11 +16,43 @@ _ASM_RESERVED = {
 }
 
 
+# Object-format symbol spelling, set once per compile by set_object_format.
+# ELF (the default) spells a C symbol bare. Mach-O prefixes every C symbol with
+# an underscore (`main` -> `_main`), and treats names starting with `L` as
+# assembler-local: they never reach the object's symbol table. Compiler-made
+# jump labels use that, so they cannot collide with, or be exported beside,
+# real symbols.
+_SYM_PREFIX = ""
+_LOCAL_LABEL_PREFIX = ""
+_COMPILER_LABEL_STEM = "__shivyc_label"
+
+
+def set_object_format(fmt):
+    """Select symbol spelling for object format `fmt` ("elf" or "macho")."""
+    global _SYM_PREFIX
+    global _LOCAL_LABEL_PREFIX
+    if fmt == "macho":
+        _SYM_PREFIX = "_"
+        _LOCAL_LABEL_PREFIX = "L"
+    else:
+        _SYM_PREFIX = ""
+        _LOCAL_LABEL_PREFIX = ""
+
+
 def mangle_symbol(name: str) -> str:
-    """Rename a symbol whose spelling collides with a GNU-as operator."""
+    """Spell C-level symbol `name` as the assembler must see it.
+
+    Renames a symbol whose spelling collides with a GNU-as operator, then
+    applies the object format's prefix. Every definition *and* reference must
+    come through here, or the two spellings will not meet at link time.
+    Not idempotent under Mach-O: pass the C name, never an already-mangled
+    one."""
+    n = name
     if name in _ASM_RESERVED:
-        return "__shivyc_sym_" + name
-    return name
+        n = "__shivyc_sym_" + name
+    if _LOCAL_LABEL_PREFIX and name.startswith(_COMPILER_LABEL_STEM):
+        return _LOCAL_LABEL_PREFIX + n
+    return _SYM_PREFIX + n
 
 
 class Spot:
@@ -308,6 +340,51 @@ R15 = RegSpot("r15")
 caller_saved_registers = [RAX, RCX, RDX, RSI, RDI, R8, R9, R10, R11]
 callee_saved_registers = [RBX, R12, R13, R14, R15]
 registers = caller_saved_registers + callee_saved_registers
+
+# The calling convention the lists above currently describe: "sysv" or
+# "win64". Selected once per compile by set_abi.
+abi = "sysv"
+
+
+def set_abi(name):
+    """Point the register lists at calling convention `name`.
+
+    The lists are rebuilt *in place*, never rebound: ASMGen.alloc_registers,
+    Call/LoadArg and thread_contracts hold references to these very list
+    objects, so mutating them retargets every user at once, and calling this
+    again (the test harness compiles many programs in one process) switches
+    back cleanly.
+
+    Microsoft x64 differs from System V in exactly the ways these lists
+    carry: four integer argument registers (rcx, rdx, r8, r9) instead of six,
+    four vector argument registers (xmm0-3) instead of eight, and rsi/rdi are
+    callee-saved rather than scratch. (xmm6-15 are callee-saved too, but the
+    x86-64 back end never keeps a value in any xmm register above xmm2, so
+    there is nothing to preserve.)
+    """
+    global abi
+    if name == "win64":
+        abi = "win64"
+        int_args = [RCX, RDX, R8, R9]
+        xmm_args = [XMM0, XMM1, XMM2, XMM3]
+        caller = [RAX, RCX, RDX, R8, R9, R10, R11]
+        callee = [RBX, RSI, RDI, R12, R13, R14, R15]
+    else:
+        abi = "sysv"
+        int_args = [RDI, RSI, RDX, RCX, R8, R9]
+        xmm_args = [XMM0, XMM1, XMM2, XMM3, XMM4, XMM5, XMM6, XMM7]
+        caller = [RAX, RCX, RDX, RSI, RDI, R8, R9, R10, R11]
+        callee = [RBX, R12, R13, R14, R15]
+    int_arg_regs[:] = int_args
+    xmm_arg_regs[:] = xmm_args
+    caller_saved_registers[:] = caller
+    callee_saved_registers[:] = callee
+    registers[:] = caller + callee
+
+
+def is_win64():
+    """True while compiling for the Microsoft x64 calling convention."""
+    return abi == "win64"
 
 RBP = RegSpot("rbp")
 RSP = RegSpot("rsp")

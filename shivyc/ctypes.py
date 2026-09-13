@@ -581,6 +581,23 @@ unsig_longint = IntegerCType(8, False)
 long_max = 9223372036854775807
 long_min = -9223372036854775808
 
+# LLP64 (64-bit Windows): `long` is 4 bytes while `long long` and pointers stay
+# 8. The compiler uses `longint` internally as its pointer-width integer
+# (sizeof, pointer arithmetic, size_t), and `long long` already folds onto it,
+# so only the spelled keyword `long` changes -- onto this distinct 4-byte type.
+# Distinct from `integer` so that `long *` and `int *` stay incompatible, as
+# they are under MSVC; arithmetic is size-driven, so it behaves as int does.
+# Set per compile by set_data_model.
+llp64 = False
+win_long = IntegerCType(4, True)
+unsig_win_long = IntegerCType(4, False)
+
+
+def set_data_model(model):
+    """Select "lp64" (every Unix target) or "llp64" (64-bit Windows)."""
+    global llp64
+    llp64 = model == "llp64"
+
 # Upper bounds for the unsigned integer types, used when choosing the type of
 # an integer literal. These are module-level constants (not function locals) so
 # the self-host translator constant-folds them into correctly-sized literals; a
@@ -600,6 +617,12 @@ longdouble = FloatCType(8, long_double=True)
 # aliased to `double` (64-bit) with a warning instead of being rejected. This
 # compiler never implements true 80-bit extended precision.
 long_double_as_double = False
+
+# Set True when the target ABI itself defines `long double` as `double`, as
+# Apple's arm64 ABI does. Unlike the flag above this is not an approximation,
+# so `long double` becomes `double` silently: it is exactly what clang does
+# for that target, and what libSystem's `sinl` etc. expect.
+long_double_is_double_abi = False
 
 
 simple_types = {token_kinds.void_kw: void,

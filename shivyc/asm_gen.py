@@ -11,6 +11,7 @@ from shivyc.il_cmds.base import ILCommand  # noqa: F401  (polymorphic interface
 # dispatched on the IL commands asm_gen consumes; see command.inputs()/etc.)
 from typing import List
 from shivyc.il_gen import ILValue
+from shivyc.errors import CompilerError
 from shivyc.ctypes import CType  # noqa: F401
 
 
@@ -88,7 +89,11 @@ class ASMCode:
         self.globals.append(f"\t.global {mangle_symbol(name)}")
 
     def add_weak(self, name):
-        """Mark a symbol as having weak linkage (emits `.weak name`)."""
+        """Mark a symbol as having weak linkage (emits `.weak name`; on
+        Mach-O a weak *definition* is spelled `.weak_definition`)."""
+        if self._is_macho():
+            self.globals.append(f"\t.weak_definition {mangle_symbol(name)}")
+            return
         self.globals.append(f"\t.weak {mangle_symbol(name)}")
 
     def add_alias(self, name, target):
@@ -100,9 +105,13 @@ class ASMCode:
 
         init - the value to initialize `name` to
         """
+        self._macho_align(size)
         self.data.append(f"{mangle_symbol(name)}:")
+        # `.short`, not `.word`, for 2 bytes: `.word` means 4 bytes to the
+        # AArch64 and RISC-V assemblers (ELF and Mach-O alike) and 2 only on
+        # x86, so it silently widened every 2-byte datum on those targets.
         size_strs = {1: "byte",
-                     2: "word",
+                     2: "short",
                      4: "int",
                      8: "quad"}
 
@@ -117,8 +126,9 @@ class ASMCode:
         entries - iterable of (byte_offset, size, value) constant scalars
         total - total size in bytes; gaps and the tail are zero-filled
         """
+        self._macho_align(8)
         self.data.append(f"{mangle_symbol(name)}:")
-        size_strs = {1: "byte", 2: "word", 4: "int", 8: "quad"}
+        size_strs = {1: "byte", 2: "short", 4: "int", 8: "quad"}
         pos = 0
         for off, size, val in sorted(entries, key=lambda e: e[0]):
             if off > pos:
@@ -139,11 +149,46 @@ class ASMCode:
         if pos < total:
             self.data.append(f"\t.zero {total - pos}")
 
+    def _is_macho(self):
+        return self.target.obj_format == "macho"
+
+    def _p2align_for(self, size):
+        """Natural alignment (as a power of two, capped at 8 bytes) for an
+        object of `size` bytes."""
+        if size >= 8:
+            return 3
+        if size >= 4:
+            return 2
+        if size >= 2:
+            return 1
+        return 0
+
+    def _macho_align(self, size):
+        """Align the next data label on Mach-O. ELF output is unchanged. The
+        Mach-O linker requires pointer-sized fixups (chained fixups, the
+        default since macOS 12) to be naturally aligned, and without a
+        directive a pointer after an odd-length string would not be."""
+        if self._is_macho():
+            self.data.append("\t.p2align %d" % self._p2align_for(size))
+
     def add_comm(self, name, size, local):
         """Add a common symbol to the code."""
+        if self._is_macho():
+            # Mach-O has no `.local`; a file-local tentative definition is a
+            # zero-filled `.lcomm`. Both take an explicit power-of-two align.
+            a = self._p2align_for(size)
+            if local:
+                self.comm.append(
+                    f"\t.lcomm {mangle_symbol(name)},{size},{a}")
+            else:
+                self.comm.append(
+                    f"\t.comm {mangle_symbol(name)},{size},{a}")
+            return
         if local:
             self.comm.append(f"\t.local {mangle_symbol(name)}")
-        self.comm.append(f"\t.comm {mangle_symbol(name)} {size}")
+        # `name, size`: GNU as also takes a bare space, LLVM's assembler
+        # (FreeBSD's only one) requires the comma.
+        self.comm.append(f"\t.comm {mangle_symbol(name)}, {size}")
 
     def add_string_literal(self, name, chars, elem_size=1):
         """Add a string literal to the ASM code.
@@ -152,7 +197,7 @@ class ASMCode:
         """
         from shivyc.spots import mangle_symbol
         self.string_literals.append(f"{mangle_symbol(name)}:")
-        directive = {1: "byte", 2: "word", 4: "int", 8: "quad"}[elem_size]
+        directive = {1: "byte", 2: "short", 4: "int", 8: "quad"}[elem_size]
         data = ",".join(str(char) for char in chars)
         self.string_literals.append(f"\t.{directive} {data}")
 
@@ -163,19 +208,38 @@ class ASMCode:
         assembling.
 
         """
+        macho = self._is_macho()
+        if macho:
+            data_sec = "\t.section\t__DATA,__data"
+            text_sec = "\t.section\t__TEXT,__text,regular,pure_instructions"
+        else:
+            data_sec = "\t.section .data"
+            text_sec = "\t.section .text"
         header = list(self.target.asm_syntax_prologue)
+        if macho:
+            # Pin the minimum OS in the object itself, so the linker neither
+            # warns about a missing version nor guesses one.
+            header += ["\t.build_version macos, 11, 0"]
         header += self.comm
         if self.string_literals or self.data:
-            header += ["\t.section .data"]
+            header += [data_sec]
             header += self.data
             header += self.string_literals
             header += [""]
 
-        header += ["\t.section .text"] + self.globals
+        header += [text_sec] + self.globals
+        if macho:
+            # Every AArch64 instruction is 4 bytes, so aligning the section
+            # start keeps every function label aligned too.
+            header += ["\t.p2align 2"]
 
         code = [str(line) for line in self.lines]
 
-        footer = ["\t.section\t.note.GNU-stack,\"\",@progbits"]
+        # The GNU-stack note marks the stack non-executable on ELF. Mach-O
+        # has no such section (the stack is never executable there).
+        footer = []
+        if not macho:
+            footer = ["\t.section\t.note.GNU-stack,\"\",@progbits"]
         footer += list(self.target.asm_syntax_epilogue) + [""]
 
         return "\n".join(header + code + footer)
@@ -591,6 +655,9 @@ class ASMGen:
         self._arm64_glob = {}
         self._arm64_gemit = {}
         self._arm64_gaddr = {}
+        # Names of objects referenced here but defined in another unit (or a
+        # dylib, or a linker script). Mach-O must reach these through the GOT.
+        self._arm64_gextern = {}
         self._arm64_freg = {}
         self._arm64_fltlit = {}
         self._arm64_fltlit_n = 0
@@ -716,6 +783,7 @@ class ASMGen:
                 # definition.
                 glob[v] = self.symbol_table.asm_name(v)
                 self._arm64_glob[v] = glob[v]
+                self._arm64_gextern[glob[v]] = 1
 
         # Count how often each global is referenced; frequently-used ones get
         # their (link-time-invariant) address cached in a register for the whole
@@ -757,15 +825,17 @@ class ASMGen:
             if isinstance(c, value_cmds.LoadArg):
                 if c.output.ctype.is_floating():
                     if afp >= 8:
-                        self._arm64_argstk[c.arg_num] = astk
-                        astk += 8
+                        slot, astk = self._arm64_stack_arg_slot(
+                            astk, c.output.ctype)
+                        self._arm64_argstk[c.arg_num] = slot
                     else:
                         self._arm64_argfp[c.arg_num] = afp
                     afp += 1
                 else:
                     if agp >= 8:
-                        self._arm64_argstk[c.arg_num] = astk
-                        astk += 8
+                        slot, astk = self._arm64_stack_arg_slot(
+                            astk, c.output.ctype)
+                        self._arm64_argstk[c.arg_num] = slot
                     else:
                         self._arm64_arggp[c.arg_num] = agp
                     agp += 1
@@ -999,6 +1069,18 @@ class ASMGen:
         self._arm64_fp_save_off = fp_save_off
 
         self.asm_code.add(asm_cmds.AsmLabel(func))
+        if self.asm_code.target.os == "macos":
+            # Apple's arm64 ABI passes every anonymous (variadic) argument on
+            # the stack, 8-byte slots starting exactly at the caller's sp --
+            # i.e. at our sp on entry. So a variadic callee finds its block
+            # without any help from the caller: capture sp in x16 before the
+            # prologue moves it, and VaSaveBase copies it to a home exactly
+            # as on ELF. Because nothing depends on the caller setting x16,
+            # clang-built C can call a Crust variadic function too.
+            for c in cmds:
+                if isinstance(c, value_cmds.VaSaveBase):
+                    self.asm_code.add(asm_cmds.Raw("mov\tx16, sp"))
+                    break
         if frame:
             # stp's pre-index offset is a *scaled 7-bit* field: +/-512 bytes
             # for a pair of 64-bit registers. A larger frame -- easily reached
@@ -1025,9 +1107,7 @@ class ASMGen:
             if v in self._arm64_gaddr:
                 r = self._arm64_gaddr[v]
                 name = glob[v]
-                self.asm_code.add(asm_cmds.Raw("adrp\tx%d, %s" % (r, name)))
-                self.asm_code.add(asm_cmds.Raw(
-                    "add\tx%d, x%d, :lo12:%s" % (r, r, name)))
+                self._arm64_adr("x%d" % r, name)
         addrof_name = {}
         for idx in range(n):
             if idx in skip:
@@ -1273,8 +1353,7 @@ class ASMGen:
         adrp/add to form the address so the `ldr` needs no `:lo12:` relocation
         (which would require the literal to be naturally aligned)."""
         name = self._arm64_float_label(value)
-        self.asm_code.add(asm_cmds.Raw("adrp\tx9, %s" % name))
-        self.asm_code.add(asm_cmds.Raw("add\tx9, x9, :lo12:%s" % name))
+        self._arm64_adr("x9", name)
         self.asm_code.add(asm_cmds.Raw(
             "ldr\t%s, [x9]" % self._arm64_frn(fn, value)))
 
@@ -1368,6 +1447,68 @@ class ASMGen:
         self._arm64_mov_imm(t, off, 8)
         self.asm_code.add(asm_cmds.Raw("add\t%s, x29, %s" % (dest, t)))
 
+    def _arm64_apple_extend(self, value, regnum):
+        """Apple's arm64 ABI makes the *caller* sign- or zero-extend a
+        char / short / _Bool argument to 32 bits in its register, and
+        clang-built callees use the register as-is. A value computed at run
+        time (e.g. `(signed char)(k + 199)`) can sit in its home
+        unextended, so extend it here, after it is placed in w<regnum>.
+        No-op elsewhere: AAPCS64 leaves that to the callee."""
+        t = value.ctype
+        if self.asm_code.target.os != "macos" or not t.is_integral() \
+                or t.size >= 4:
+            return
+        signed = self._arm64_signed(value)
+        if t.size == 1:
+            ext = "sxtb" if signed else "uxtb"
+        else:
+            ext = "sxth" if signed else "uxth"
+        self.asm_code.add(asm_cmds.Raw("%s\tw%d, w%d" % (ext, regnum, regnum)))
+
+    def _arm64_stack_arg_slot(self, cur, ctype):
+        """Place one stack-passed argument of `ctype` at running offset
+        `cur`; returns (offset, next cur). AAPCS64 (ELF) gives every
+        argument an 8-byte slot. Apple's arm64 ABI packs them instead: each
+        at the next offset aligned to its own size, taking only that size
+        (int, char, short at [sp], [sp+4], [sp+6] -- verified against
+        clang's arm64-apple-macos code)."""
+        if self.asm_code.target.os != "macos":
+            return cur, cur + 8
+        size = ctype.size if ctype.size > 0 else 1
+        align = size if size <= 8 else 8
+        off = (cur + align - 1) & ~(align - 1)
+        return off, off + size
+
+    def _arm64_adr(self, reg, cname, got=False):
+        """Materialize the address of C-level symbol `cname` into register
+        `reg` (e.g. "x9"). `cname` is the *unmangled* name; the spelling is
+        applied here, once, so definition and reference cannot diverge.
+
+        ELF: adrp + add :lo12:. Mach-O: @PAGE/@PAGEOFF when the symbol is
+        defined in this translation unit, else a GOT load (@GOTPAGE /
+        @GOTPAGEOFF) -- a symbol that resolves into a dylib (libSystem's
+        `___stderrp`, a libc function whose address is taken) cannot be
+        reached PC-relatively, and ld64 relaxes the GOT load back to a direct
+        address when the symbol turns out to be local after all. `got` forces
+        the GOT form; names recorded in _arm64_gextern get it automatically.
+        """
+        sym = spots.mangle_symbol(cname)
+        if self.asm_code.target.obj_format == "macho":
+            if got or cname in self._arm64_gextern:
+                self.asm_code.add(asm_cmds.Raw(
+                    "adrp\t%s, %s@GOTPAGE" % (reg, sym)))
+                self.asm_code.add(asm_cmds.Raw(
+                    "ldr\t%s, [%s, %s@GOTPAGEOFF]" % (reg, reg, sym)))
+            else:
+                self.asm_code.add(asm_cmds.Raw(
+                    "adrp\t%s, %s@PAGE" % (reg, sym)))
+                self.asm_code.add(asm_cmds.Raw(
+                    "add\t%s, %s, %s@PAGEOFF" % (reg, reg, sym)))
+            return
+        self.asm_code.add(asm_cmds.Raw("adrp\t%s, %s" % (reg, sym)))
+        self.asm_code.add(asm_cmds.Raw(
+            "add\t%s, %s, :lo12:%s" % (reg, reg, sym)))
+
     def _arm64_mem_addr(self, value, areg, slot_of):
         """Addressing operand for a memory-resident `value`. For a local it is
         `[x29, #slot]` (no code emitted). For a global it emits adrp/add of the
@@ -1378,9 +1519,7 @@ class ASMGen:
             if cr >= 0:
                 return "[x%d]" % cr      # address cached in a register
             a = "x%d" % areg
-            self.asm_code.add(asm_cmds.Raw("adrp\t%s, %s" % (a, name)))
-            self.asm_code.add(asm_cmds.Raw(
-                "add\t%s, %s, :lo12:%s" % (a, a, name)))
+            self._arm64_adr(a, name)
             return "[%s]" % a
         return self._arm64_frame_ref(slot_of[value], areg)
 
@@ -1496,6 +1635,12 @@ class ASMGen:
             return "ldrsh" if signed else "ldrh"
         return "ldr"
 
+    def _arm64_ext_op(self, size, signed):
+        """Register sign/zero-extension mnemonic from a 1- or 2-byte width."""
+        if size == 1:
+            return "sxtb" if signed else "uxtb"
+        return "sxth" if signed else "uxth"
+
     def _arm64_str_op(self, size):
         """Store mnemonic for a `size`-byte value."""
         if size == 1:
@@ -1528,9 +1673,7 @@ class ASMGen:
                 return "[x%d, #%d]" % (gcR, const_off)
             if gname is not None:
                 a = "x%d" % an
-                self.asm_code.add(asm_cmds.Raw("adrp\t%s, %s" % (a, gname)))
-                self.asm_code.add(asm_cmds.Raw(
-                    "add\t%s, %s, :lo12:%s" % (a, a, gname)))
+                self._arm64_adr(a, gname)
                 if const_off == 0:
                     return "[%s]" % a
                 return "[%s, #%d]" % (a, const_off)
@@ -1548,9 +1691,7 @@ class ASMGen:
         if gcR >= 0:
             bsrc = "x%d" % gcR
         elif gname is not None:
-            self.asm_code.add(asm_cmds.Raw("adrp\t%s, %s" % (addr, gname)))
-            self.asm_code.add(asm_cmds.Raw(
-                "add\t%s, %s, :lo12:%s" % (addr, addr, gname)))
+            self._arm64_adr(addr, gname)
             bsrc = addr
         elif base_is_mem:
             self._arm64_frame_addr_into(addr, slot_of[base], an)
@@ -1572,9 +1713,7 @@ class ASMGen:
         if gcR >= 0:
             bsrc = "x%d" % gcR
         elif gname is not None:
-            self.asm_code.add(asm_cmds.Raw("adrp\t%s, %s" % (addr, gname)))
-            self.asm_code.add(asm_cmds.Raw(
-                "add\t%s, %s, :lo12:%s" % (addr, addr, gname)))
+            self._arm64_adr(addr, gname)
             bsrc = addr
         elif base.ctype.is_array() or base.ctype.is_struct_union():
             self._arm64_frame_addr_into(addr, slot_of[base], an)
@@ -1610,9 +1749,7 @@ class ASMGen:
         gname = self._arm64_glob.get(value)
         if gname is not None:
             reg = "x%d" % an
-            self.asm_code.add(asm_cmds.Raw("adrp\t%s, %s" % (reg, gname)))
-            self.asm_code.add(asm_cmds.Raw(
-                "add\t%s, %s, :lo12:%s" % (reg, reg, gname)))
+            self._arm64_adr(reg, gname)
             return reg, 0
         return "x29", slot_of[value]
 
@@ -1741,16 +1878,18 @@ class ASMGen:
         import shivyc.il_cmds.compare as cmp_cmds
 
         if isinstance(cmd, value_cmds.LoadStructArg):
-            # A struct parameter too big for a register on SysV. Here every
-            # struct parameter arrives the same way -- as the address of the
-            # caller's object -- so this is the aggregate LoadArg case again:
-            # copy it into our own frame to make the parameter by value.
-            pidx = self._wasm_argmap.get(id(cmd), 0)
-            self._wasm_push_addr(cmd.output, body)
-            body.local_get(pidx)
-            body.const_i32(cmd.output.ctype.size)
-            body.memory_copy()
-            return
+            # Struct-by-value parameters are not lowered for AArch64 yet.
+            #
+            # What stood here was a verbatim copy of the *wasm* handler --
+            # local_get/memory_copy against a `body` instruction buffer that
+            # does not exist in this function, and never did: `body` is neither
+            # a parameter nor assigned anywhere in it. Reaching this branch
+            # raised NameError under CPython and would not compile at all under
+            # the self-hosted build. Say what is actually missing instead of
+            # failing on an unbound name.
+            raise NotImplementedError(
+                "struct-by-value parameters (LoadStructArg) are not "
+                "implemented for AArch64")
 
         if isinstance(cmd, value_cmds.VaSaveBase):
             # The caller left the base of the all-argument block in x16. That
@@ -1774,6 +1913,19 @@ class ASMGen:
             rb = self._arm64_use(cmd.base, 9, reg_of, slot_of)
             rd = self._arm64_defreg(cmd.output, 10, reg_of)
             off = 8 * cmd.named_count
+            if self.asm_code.target.os == "macos":
+                # The base is the caller's sp, where Apple puts the *first
+                # anonymous* argument; named ones travel in registers and are
+                # not in the block at all.
+                if self._arm64_argstk:
+                    # Named parameters past the eighth of their class also go
+                    # on the stack, ahead of the anonymous ones, and Apple
+                    # packs them at natural size rather than 8-byte slots.
+                    raise NotImplementedError(
+                        "arm64 macOS: a variadic function with more than "
+                        "eight named parameters of one class is not "
+                        "implemented")
+                off = 0
             self.asm_code.add(asm_cmds.Raw(
                 "add\t%s, %s, #%d"
                 % (self._arm64_xname(rd), self._arm64_xname(rb), off)))
@@ -1803,6 +1955,18 @@ class ASMGen:
                     self.asm_code.add(asm_cmds.Raw(
                         "ldr\t%s, [%s, #%d]" % (rd, base, off)))
                     self._arm64_fwb(out, 16, slot_of)
+                elif self.asm_code.target.os == "macos" \
+                        and out.ctype.size < 8:
+                    # Apple packs stack arguments at natural size, so read
+                    # exactly this one (sign/zero-extending), not 8 bytes
+                    # that would take in its neighbours.
+                    rd = self._arm64_defreg(out, 9, reg_of)
+                    op = self._arm64_ldr_op(out.ctype.size,
+                                            self._arm64_signed(out))
+                    self.asm_code.add(asm_cmds.Raw(
+                        "%s\t%s, [%s, #%d]"
+                        % (op, self._arm64_wname(rd), base, off)))
+                    self._arm64_wb(out, 9, reg_of, slot_of)
                 else:
                     rd = self._arm64_defreg(out, 9, reg_of)
                     self.asm_code.add(asm_cmds.Raw(
@@ -1843,21 +2007,52 @@ class ASMGen:
             # ABI makes it scratch, so it costs nothing and nothing else wants
             # it across a call boundary.
             variadic = getattr(cmd, "variadic", False)
+            # Apple's arm64 variant of AAPCS64 differs exactly here: named
+            # arguments go in registers as usual, but every *anonymous*
+            # argument goes on the stack, 8-byte slots from [sp], and never
+            # in a register. libSystem's printf reads them only from there.
+            # So on macOS the block holds the anonymous arguments alone,
+            # starting at sp -- which is precisely where a Crust variadic
+            # callee looks for them too (see the macOS prologue).
+            apple_va = variadic and self.asm_code.target.os == "macos"
+            nnamed = 0
+            if apple_va:
+                fct = cmd.func.ctype.arg if cmd.func.ctype.is_pointer() \
+                    else cmd.func.ctype
+                nnamed = len(fct.args or [])
+                ngp = 0
+                nfp = 0
+                for i in range(nnamed):
+                    if cmd.args[i].ctype.is_floating():
+                        nfp += 1
+                    else:
+                        ngp += 1
+                if ngp > 8 or nfp > 8:
+                    raise NotImplementedError(
+                        "arm64 macOS: calling a variadic function with more "
+                        "than eight named arguments of one class is not "
+                        "implemented")
             nstack = 0
             gp = 0
             fp = 0
+            stk_bytes = 0          # outgoing stack area, per the OS's layout
             for a in cmd.args:
                 if a.ctype.is_floating():
                     if fp >= 8:
                         nstack += 1
+                        _o, stk_bytes = self._arm64_stack_arg_slot(
+                            stk_bytes, a.ctype)
                     fp += 1
                 else:
                     if gp >= 8:
                         nstack += 1
+                        _o, stk_bytes = self._arm64_stack_arg_slot(
+                            stk_bytes, a.ctype)
                     gp += 1
             if variadic:
-                nstack = len(cmd.args)
-            outgoing = ((nstack * 8) + 15) & ~15      # keep sp 16-byte aligned
+                nstack = len(cmd.args) - nnamed
+                stk_bytes = nstack * 8
+            outgoing = (stk_bytes + 15) & ~15         # keep sp 16-byte aligned
             if outgoing:
                 self.asm_code.add(asm_cmds.Raw(
                     "sub\tsp, sp, #%d" % outgoing))
@@ -1866,7 +2061,11 @@ class ASMGen:
                 # each. Sub-word integers go in as full 64-bit words so the
                 # callee can read any width from the low end of the slot.
                 voff = 0
+                vidx = 0
                 for a in cmd.args:
+                    vidx += 1
+                    if vidx <= nnamed:
+                        continue          # Apple: named args are not in it
                     if a.ctype.is_floating():
                         src = self._arm64_floatuse(a, 16, slot_of)
                         self.asm_code.add(asm_cmds.Raw(
@@ -1877,7 +2076,8 @@ class ASMGen:
                             "str\t%s, [sp, #%d]"
                             % (self._arm64_xname(src), voff)))
                     voff += 8
-                self.asm_code.add(asm_cmds.Raw("mov\tx16, sp"))
+                if not apple_va:
+                    self.asm_code.add(asm_cmds.Raw("mov\tx16, sp"))
             gp = 0
             fp = 0
             soff = 0
@@ -1893,29 +2093,41 @@ class ASMGen:
                     else:
                         if gp < 8:
                             self._arm64_into(a, gp, reg_of, slot_of)
+                            self._arm64_apple_extend(a, gp)
                         gp += 1
                     continue
                 onstack = (fp >= 8) if a.ctype.is_floating() else (gp >= 8)
                 if onstack:
                     # Stage through a scratch register, then store. x15/d16 are
                     # scratch and never value homes.
+                    aoff, soff = self._arm64_stack_arg_slot(soff, a.ctype)
                     if a.ctype.is_floating():
                         src = self._arm64_floatuse(a, 16, slot_of)
                         self.asm_code.add(asm_cmds.Raw(
-                            "str\t%s, [sp, #%d]" % (src, soff)))
+                            "str\t%s, [sp, #%d]" % (src, aoff)))
                         fp += 1
+                    elif self.asm_code.target.os == "macos" \
+                            and a.ctype.size < 8:
+                        # Apple: exactly the argument's size, at its own
+                        # alignment (strb / strh / str w).
+                        src = self._arm64_use(a, 15, reg_of, slot_of)
+                        self.asm_code.add(asm_cmds.Raw(
+                            "%s\t%s, [sp, #%d]"
+                            % (self._arm64_str_op(a.ctype.size),
+                               self._arm64_wname(src), aoff)))
+                        gp += 1
                     else:
                         src = self._arm64_use(a, 15, reg_of, slot_of)
                         self.asm_code.add(asm_cmds.Raw(
                             "str\t%s, [sp, #%d]"
-                            % (self._arm64_xname(src), soff)))
+                            % (self._arm64_xname(src), aoff)))
                         gp += 1
-                    soff += 8
                 elif a.ctype.is_floating():
                     self._arm64_finto(a, fp, slot_of)        # arg -> v<fp>
                     fp += 1
                 else:
                     self._arm64_into(a, gp, reg_of, slot_of)  # arg -> w/x<gp>
+                    self._arm64_apple_extend(a, gp)
                     gp += 1
             if name is not None:
                 self.asm_code.add(asm_cmds.Raw(
@@ -1946,12 +2158,14 @@ class ASMGen:
                 # and then it has to be a real address rather than a note to
                 # the call site.
                 addrof_name[cmd.output] = name
-                sym = spots.mangle_symbol(name)
                 rd = self._arm64_xname(
                     self._arm64_defreg(cmd.output, 9, reg_of))
-                self.asm_code.add(asm_cmds.Raw("adrp\t%s, %s" % (rd, sym)))
-                self.asm_code.add(asm_cmds.Raw(
-                    "add\t%s, %s, :lo12:%s" % (rd, rd, sym)))
+                # A function defined in another unit may live in a dylib
+                # (e.g. `strcmp` handed to qsort); Mach-O takes its address
+                # through the GOT so it is the real, comparable address.
+                defined_here = self.symbol_table.def_state.get(cmd.var) \
+                    == self.symbol_table.DEFINED
+                self._arm64_adr(rd, name, not defined_here)
                 self._arm64_wb(cmd.output, 9, reg_of, slot_of)
                 return
             gname = self._arm64_glob.get(cmd.var)
@@ -1964,9 +2178,7 @@ class ASMGen:
                 if cr >= 0:
                     self.asm_code.add(asm_cmds.Raw("mov\t%s, x%d" % (rd, cr)))
                 else:
-                    self.asm_code.add(asm_cmds.Raw("adrp\t%s, %s" % (rd, gname)))
-                    self.asm_code.add(asm_cmds.Raw(
-                        "add\t%s, %s, :lo12:%s" % (rd, rd, gname)))
+                    self._arm64_adr(rd, gname)
                 self._arm64_wb(cmd.output, 9, reg_of, slot_of)
                 return
             # Address of a local: x29 + its frame slot. The variable was forced
@@ -2140,6 +2352,69 @@ class ASMGen:
             ds = out.ctype.size
             ss = arg.ctype.size
             widen = ds > 4 and ss <= 4    # 32-bit value into a 64-bit dest
+            # Integer conversion semantics for sub-int types (C11 6.3.1.2-3).
+            # A register holds a char/short/_Bool in 32 bits, so the value
+            # must be made *canonical* -- truncated and sign/zero-extended per
+            # its type -- or a later plain move widens garbage: `(unsigned
+            # short)70000` stayed 70000, `(_Bool)2` stayed 2. Memory homes
+            # were already right (strb/strh truncate; ldrsb/ldrh extend).
+            oint = out.ctype.is_integral()
+            aint = arg.ctype.is_integral()
+            to_bool = oint and out.ctype.is_bool() and not arg.ctype.is_bool()
+            # Narrowing, or same size with a signedness change: per the
+            # destination type.
+            ext_out = None
+            if oint and aint and not to_bool and ds < 4 and (
+                    ds < ss or (ds == ss
+                                and out.ctype.signed != arg.ctype.signed)):
+                ext_out = self._arm64_ext_op(ds, out.ctype.signed)
+            # Widening a sub-int: per the *source* type, which makes it
+            # right even for a value that is not canonical, e.g. a char
+            # returned by code compiled elsewhere (AAPCS64 does not make the
+            # callee extend it).
+            ext_src = None
+            if aint and oint and not to_bool and ss < 4 and ds > ss:
+                ext_src = self._arm64_ext_op(ss, arg.ctype.signed)
+            if to_bool:
+                cmpsrc = src if ss > 4 or arg.ctype.is_pointer() \
+                    else self._arm64_wname(src)
+                self.asm_code.add(asm_cmds.Raw("cmp\t%s, #0" % cmpsrc))
+                dreg = r if r >= 0 else 9
+                self.asm_code.add(asm_cmds.Raw("cset\tw%d, ne" % dreg))
+                if r < 0:
+                    target = self._arm64_mem_addr(out, 15, slot_of)
+                    self.asm_code.add(asm_cmds.Raw(
+                        "strb\tw9, %s" % target))
+                return
+            if ext_src is not None and widen:
+                # char/short straight to a 64-bit type.
+                dreg = r if r >= 0 else 9
+                if arg.ctype.signed:
+                    self.asm_code.add(asm_cmds.Raw(
+                        "%s\tx%d, %s" % (ext_src, dreg,
+                                         self._arm64_wname(src))))
+                else:   # writing the w-form zero-extends into the x-reg
+                    self.asm_code.add(asm_cmds.Raw(
+                        "%s\tw%d, %s" % (ext_src, dreg,
+                                         self._arm64_wname(src))))
+                if r < 0:
+                    target = self._arm64_mem_addr(out, 15, slot_of)
+                    self.asm_code.add(asm_cmds.Raw(
+                        "%s\tx9, %s" % (self._arm64_str_op(ds), target)))
+                return
+            if r >= 0 and (ext_out is not None or ext_src is not None):
+                op = ext_out if ext_out is not None else ext_src
+                self.asm_code.add(asm_cmds.Raw(
+                    "%s\tw%d, %s" % (op, r, self._arm64_wname(src))))
+                return
+            if r < 0 and ext_src is not None:
+                # Widening within 32 bits into a memory home.
+                self.asm_code.add(asm_cmds.Raw(
+                    "%s\tw9, %s" % (ext_src, self._arm64_wname(src))))
+                target = self._arm64_mem_addr(out, 15, slot_of)
+                self.asm_code.add(asm_cmds.Raw(
+                    "%s\tw9, %s" % (self._arm64_str_op(ds), target)))
+                return
             if r >= 0:
                 if widen:
                     if arg.ctype.signed:
@@ -2363,6 +2638,19 @@ class ASMGen:
                     self._arm64_finto(cmd.arg, 0, slot_of)     # retval -> s0/d0
                 else:
                     self._arm64_into(cmd.arg, 0, reg_of, slot_of)  # -> w0/x0
+                    # Apple's ABI makes the callee extend a char/short/_Bool
+                    # result to 32 bits, and clang-built callers rely on it
+                    # (clang emits sxtb / and #0xffff before its own ret).
+                    rt = cmd.arg.ctype
+                    if self.asm_code.target.os == "macos" \
+                            and rt.is_integral() and rt.size < 4:
+                        if rt.size == 1:
+                            ext = "sxtb" if self._arm64_signed(cmd.arg) \
+                                else "uxtb"
+                        else:
+                            ext = "sxth" if self._arm64_signed(cmd.arg) \
+                                else "uxth"
+                        self.asm_code.add(asm_cmds.Raw("%s\tw0, w0" % ext))
             self._arm64_epilogue(nreg, frame)
             return
         raise NotImplementedError(
@@ -3466,16 +3754,18 @@ class ASMGen:
             return
 
         if isinstance(cmd, value_cmds.LoadStructArg):
-            # A struct parameter too big for a register on SysV. Here every
-            # struct parameter arrives the same way -- as the address of the
-            # caller's object -- so this is the aggregate LoadArg case again:
-            # copy it into our own frame to make the parameter by value.
-            pidx = self._wasm_argmap.get(id(cmd), 0)
-            self._wasm_push_addr(cmd.output, body)
-            body.local_get(pidx)
-            body.const_i32(cmd.output.ctype.size)
-            body.memory_copy()
-            return
+            # Struct-by-value parameters are not lowered for RISC-V yet.
+            #
+            # What stood here was a verbatim copy of the *wasm* handler --
+            # local_get/memory_copy against a `body` instruction buffer that
+            # does not exist in this function, and never did: `body` is neither
+            # a parameter nor assigned anywhere in it. Reaching this branch
+            # raised NameError under CPython and would not compile at all under
+            # the self-hosted build. Say what is actually missing instead of
+            # failing on an unbound name.
+            raise NotImplementedError(
+                "struct-by-value parameters (LoadStructArg) are not "
+                "implemented for RISC-V")
 
         if isinstance(cmd, value_cmds.VaSaveBase):
             rd = self._rv_defreg(cmd.output, 5, reg_of)
@@ -5052,6 +5342,30 @@ class ASMGen:
 
         return spotmap
 
+    def _emit_win64_stack_probe(self, frame):
+        """Grow the stack by `frame` bytes, touching every page on the way.
+
+        Windows commits a thread's stack lazily: below the committed region
+        sits a single guard page, and touching it commits one more page and
+        moves the guard down. A frame larger than a page that skips straight
+        past the guard lands on reserved, uncommitted memory and faults. So,
+        as MSVC's __chkstk does, step down one page at a time and read each
+        before going further. The last step is at most a page, so the page
+        rsp finally lands on is the new guard page or already committed.
+
+        r11 is the counter: volatile under Win64 and never an argument
+        register, and nothing is live in it at function entry.
+        """
+        loop = self.asm_code.get_label()
+        self.asm_code.add(asm_cmds.Raw("mov r11, %d" % frame))
+        self.asm_code.add(asm_cmds.Raw(loop + ":"))
+        self.asm_code.add(asm_cmds.Raw("sub rsp, 4096"))
+        self.asm_code.add(asm_cmds.Raw("test DWORD PTR [rsp], esp"))
+        self.asm_code.add(asm_cmds.Raw("sub r11, 4096"))
+        self.asm_code.add(asm_cmds.Raw("cmp r11, 4096"))
+        self.asm_code.add(asm_cmds.Raw("ja " + loop))
+        self.asm_code.add(asm_cmds.Raw("sub rsp, r11"))
+
     def _generate_asm(self, commands, live_vars, spotmap, func_spots):
         """Generate assembly code."""
 
@@ -5116,6 +5430,18 @@ class ASMGen:
             if s in callee_saved_set:
                 spotmap_callee_saved = True
                 break
+        # Callee-saved registers a command *declares* it clobbers -- inline
+        # asm naming rbx (or, under Win64, rsi/rdi) as an operand or in its
+        # clobber list. The save scan below reads instruction operands, and
+        # inline asm is opaque text to it, so these would otherwise go
+        # unsaved and the caller's value would be lost.
+        declared_callee_saved = []
+        for cmd in commands:
+            for r in cmd.clobber():
+                if r in callee_saved_set and r not in declared_callee_saved:
+                    declared_callee_saved.append(r)
+        if declared_callee_saved:
+            spotmap_callee_saved = True
         if fn_info is not None:
             frameless = (base_offset == 0
                          and fn_info.get("no_regular_call", False)
@@ -5146,6 +5472,20 @@ class ASMGen:
         def alloc_scratch():
             if self._near_active:
                 return self._alloc_stack_slot(8)
+            if frameless and spots.is_win64():
+                # Windows has no red zone: anything below rsp may be
+                # overwritten at any moment (exception dispatch, APCs, a
+                # debugger). What it has instead is the 32 bytes of home
+                # space every caller reserves just above the return address
+                # -- the callee's to use -- so a frameless leaf parks up to
+                # four scratch values at [rsp+8] .. [rsp+32].
+                k = len(scratch_pool) + 1
+                if k > 4:
+                    raise CompilerError(
+                        "win64: frameless function '%s' needs more than four "
+                        "scratch slots (home space holds four); compile "
+                        "without -fstackless-calls" % self._cur_func_name)
+                return MemSpot(spots.RSP, 8 * k)
             if frameless:
                 return MemSpot(spots.RSP, -8 * (len(scratch_pool) + 1))
             return self._alloc_stack_slot(8)
@@ -5231,7 +5571,11 @@ class ASMGen:
         # and restore it before every epilogue. (Frameless functions are kept
         # off callee-saved registers above, so saved_regs is empty there.)
         saved_slots = []
-        for reg in used_callee_saved(body):
+        to_save = used_callee_saved(body)
+        for reg in declared_callee_saved:
+            if reg not in to_save:
+                to_save.append(reg)
+        for reg in to_save:
             slot = self._alloc_stack_slot(8)
             saved_slots.append((reg, slot))
             max_offset = max(max_offset, slot.rbp_offset())
@@ -5258,8 +5602,11 @@ class ASMGen:
             self.asm_code.add(asm_cmds.Push(spots.RBP, None, 8))
             self.asm_code.add(asm_cmds.Mov(spots.RBP, spots.RSP, 8))
 
-            offset_spot = LiteralSpot(str(max_offset))
-            self.asm_code.add(asm_cmds.Sub(spots.RSP, offset_spot, 8))
+            if spots.is_win64() and max_offset > 4096:
+                self._emit_win64_stack_probe(max_offset)
+            else:
+                offset_spot = LiteralSpot(str(max_offset))
+                self.asm_code.add(asm_cmds.Sub(spots.RSP, offset_spot, 8))
 
         # Save callee-saved registers used by the body (after the frame exists).
         for reg, slot in saved_slots:

@@ -283,7 +283,8 @@ class Call(ILCommand):
     func: "ILValue"
     ret: "ILValue"
 
-    arg_regs = [spots.RDI, spots.RSI, spots.RDX, spots.RCX, spots.R8, spots.R9]
+    # The very list object spots.set_abi rebuilds, so this follows the ABI.
+    arg_regs = spots.int_arg_regs
 
     def __init__(self, func, args, ret): # noqa D102
         self.func = func
@@ -315,14 +316,23 @@ class Call(ILCommand):
         return [] if self.void_return else [self.ret]
 
     def clobber(self): # noqa D102
-        # All caller-saved registers are clobbered by function call
-        return [spots.RAX, spots.RCX, spots.RDX, spots.RSI, spots.RDI,
-                spots.R8, spots.R9, spots.R10, spots.R11]
+        # All caller-saved registers are clobbered by function call. (Under
+        # Win64 that list omits rsi/rdi, which the callee preserves.)
+        return list(spots.caller_saved_registers)
 
     def abs_spot_pref(self): # noqa D102
         prefs = {}
         if not self.void_return and self.ret.ctype.size <= 8:
             prefs = {self.ret: [spots.RAX]}
+        if spots.is_win64():
+            # Positional: argument p wants the p-th register of its class.
+            p = 0
+            while p < len(self.args) and p < len(self.arg_regs):
+                a = self.args[p]
+                if not a.ctype.is_floating():
+                    prefs[a] = [self.arg_regs[p]]
+                p += 1
+            return prefs
         # For a packed call the arguments are bit-packed into the argument
         # registers from wherever they happen to live, so they get no single
         # argument-register preference (that would only create false pressure).
@@ -345,6 +355,10 @@ class Call(ILCommand):
         # call, so no constraint.)
         if self.direct_name:
             return {}
+        if spots.is_win64():
+            # A variadic call also writes the integer register beside each
+            # floating argument, so keep the pointer out of all four.
+            return {self.func: list(self.arg_regs)}
         return {self.func: self.arg_regs[0:len(self.args)]}
 
     def indir_write(self): # noqa D102
@@ -440,7 +454,136 @@ class Call(ILCommand):
             asm_code.add(asm_cmds.Mov(reg, MemSpot(spots.RSP, 8 * ri), 8))
         asm_code.add(asm_cmds.AsmAdd(spots.RSP, LiteralSpot(str(8 * total)), 8))
 
+    def _make_asm_win64(self, spotmap, get_reg, asm_code):
+        """Emit this call under the Microsoft x64 convention.
+
+        Arguments are assigned by position: the first four go in rcx, rdx,
+        r8, r9 -- or xmm0-3 for a floating one -- and the rest in 8-byte
+        stack slots that the callee finds just above 32 bytes of "home
+        space". The caller reserves that space for every call, whether the
+        callee has four arguments or none; it belongs to the callee, which
+        may spill its register arguments there (a variadic callee does).
+
+        For a variadic callee every floating argument is also copied into
+        the integer register of the same position, because a variadic
+        callee spills the integer registers and reads its arguments back as
+        one array of slots. Unlike System V, nothing more is needed -- no
+        vector count in al, no separate all-stack block -- so Crust-built and
+        Microsoft-built variadic functions are the same thing.
+
+        Structs other than 1, 2, 4 or 8 bytes never reach this point: the
+        tree has already replaced them with pointers to copies (see
+        call_exprs), and struct returns of those sizes with a hidden pointer.
+        """
+        int_regs = self.arg_regs
+        xmm_regs = spots.xmm_arg_regs
+        int_moves = []       # (reg, arg)
+        flt_moves = []       # (xmm, arg)
+        dup_regs = []        # (gpr, xmm): variadic floating duplicates
+        stack_slots = []
+        p = 0
+        for arg in self.args:
+            ct = arg.ctype
+            if ct.is_struct_union() and ct.size not in (1, 2, 4, 8):
+                raise NotImplementedError(
+                    "win64: struct argument of %d bytes reached the back end"
+                    % ct.size)
+            if p < len(int_regs):
+                if ct.is_floating():
+                    flt_moves.append((xmm_regs[p], arg))
+                    if self.variadic:
+                        dup_regs.append((int_regs[p], xmm_regs[p]))
+                else:
+                    int_moves.append((int_regs[p], arg))
+            else:
+                stack_slots.append(spotmap[arg])
+            p += 1
+
+        int_regs_used = [r for r, _ in int_moves] + [g for g, _ in dup_regs]
+
+        def emit_reg_moves():
+            moves = [(reg, spotmap[arg], _arg_move_size(arg))
+                     for reg, arg in int_moves if spotmap[arg] != reg]
+            _emit_parallel_int_moves(moves, asm_code)
+            for xreg, arg in flt_moves:
+                if spotmap[arg] != xreg:
+                    size = arg.ctype.size
+                    fmov = asm_cmds.Movss if size == 4 else asm_cmds.Movsd
+                    asm_code.add(fmov(xreg, spotmap[arg], size))
+            for gpr, xreg in dup_regs:
+                asm_code.add(asm_cmds.Raw(
+                    "movq %s, %s" % (gpr.asm_str(8), xreg.asm_str(8))))
+
+        # Tail call: the incoming home space and stack arguments are our
+        # caller's, and the callee inherits them as they are. Only a call
+        # with no stack arguments can reuse them (stackless.py and the
+        # has_stack_args test mirror the SysV rule).
+        if self.tail and self.direct_name and not stack_slots:
+            emit_reg_moves()
+            if not getattr(asm_code, "frameless", False):
+                asm_code.add(asm_cmds.Mov(spots.RSP, spots.RBP, 8))
+                asm_code.add(asm_cmds.Pop(spots.RBP, None, 8))
+            asm_code.add(asm_cmds.Jmp(self.direct_name))
+            return
+
+        # Stack arguments, right to left, so position 4 ends up lowest. With
+        # the 32 bytes of home space (a multiple of 16) below them, an odd
+        # count still needs 8 bytes of padding to keep rsp 16-byte aligned
+        # at the `call`.
+        pad = 8 if (len(stack_slots) % 2 == 1) else 0
+        if pad:
+            asm_code.add(asm_cmds.Sub(spots.RSP, LiteralSpot(str(pad)), 8))
+        for slot in reversed(stack_slots):
+            if (isinstance(slot, LiteralSpot)
+                    and not (-(2 ** 31) <= int(slot.value) < 2 ** 31)):
+                v = int(slot.value) & 0xFFFFFFFFFFFFFFFF
+                low = v & 0xFFFFFFFF
+                high = (v >> 32) & 0xFFFFFFFF
+                low_s = low - (1 << 32) if low >= (1 << 31) else low
+                high_s = high - (1 << 32) if high >= (1 << 31) else high
+                asm_code.add(asm_cmds.Push(LiteralSpot(str(low_s)), None, 8))
+                asm_code.add(asm_cmds.Raw(
+                    "mov DWORD PTR [rsp+4], %d" % high_s))
+            else:
+                asm_code.add(asm_cmds.Push(slot, None, 8))
+        asm_code.add(asm_cmds.Sub(spots.RSP, LiteralSpot("32"), 8))
+        cleanup = 32 + pad + 8 * len(stack_slots)
+
+        if self.direct_name:
+            emit_reg_moves()
+            asm_code.add(asm_cmds.Raw("call " + self.direct_name))
+        else:
+            func_spot = spotmap[self.func]
+            avoid = list(int_regs_used)
+            for arg in self.args:
+                if isinstance(spotmap[arg], RegSpot):
+                    avoid.append(spotmap[arg])
+            if func_spot in int_regs_used:
+                r = get_reg([], avoid)
+                asm_code.add(asm_cmds.Mov(r, func_spot, self.func.ctype.size))
+                func_spot = r
+            emit_reg_moves()
+            asm_code.add(asm_cmds.AsmCall(func_spot, None, 8))
+        asm_code.add(asm_cmds.AsmAdd(spots.RSP, LiteralSpot(str(cleanup)), 8))
+
+        if self.void_return:
+            return
+        ret_size = self.func.ctype.arg.ret.size
+        if self.func.ctype.arg.ret.is_floating():
+            if spotmap[self.ret] != spots.XMM0:
+                fmov = asm_cmds.Movss if ret_size == 4 else asm_cmds.Movsd
+                asm_code.add(fmov(spotmap[self.ret], spots.XMM0, ret_size))
+        elif spotmap[self.ret] != spots.RAX:
+            asm_code.add(asm_cmds.Mov(spotmap[self.ret], spots.RAX, ret_size))
+
     def make_asm(self, spotmap, home_spots, get_reg, asm_code: "asm_gen.ASMCode"): # noqa D102
+        if spots.is_win64():
+            if self.pack or (self.direct_name and self.direct_name in getattr(
+                    asm_code, "metamorphic_funcs", set())):
+                raise NotImplementedError(
+                    "win64: packed and metamorphic calls are System V only")
+            self._make_asm_win64(spotmap, get_reg, asm_code)
+            return
         ret_size = self.func.ctype.arg.ret.size
         ret_float = self.func.ctype.arg.ret.is_floating()
 

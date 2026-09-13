@@ -75,7 +75,7 @@ class TestWholeProgramFlagPacking(unittest.TestCase):
         # linker merges them into a single shared object.
         for c in (defs, mod):
             asm = _asm_for(c)
-            self.assertIn(".comm __simd_pack_store 8", asm)
+            self.assertIn(".comm __simd_pack_store, 8", asm)
             self.assertNotIn(".local __simd_pack_store", asm)
 
     def test_address_taken_flag_excluded(self):

@@ -1,4 +1,8 @@
+#ifdef _WIN64
+typedef unsigned long long size_t;   /* LLP64: `long` is 4 bytes */
+#else
 typedef unsigned long size_t;
+#endif
 
 void    *memchr(const void *, int, size_t);
 int      memcmp(const void *, const void *, size_t);

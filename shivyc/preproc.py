@@ -370,6 +370,42 @@ def set_target(name):
     _target_name = name
 
 
+_target_os = ""
+
+
+def set_os(os_name):
+    """Record the target OS (canonical name from targets.normalize_os), so
+    OS-conditional macros can be predefined. Call before set_defines."""
+    global _target_os
+    _target_os = os_name or ""
+
+
+def _defines_name(defines, name):
+    """True if the -D list defines `name` (as NAME or NAME=VALUE)."""
+    for d in defines or []:
+        if d == name or d.startswith(name + "="):
+            return True
+    return False
+
+
+# The FreeBSD release series assumed when not compiling on FreeBSD itself.
+FREEBSD_DEFAULT_MAJOR = 14
+
+
+def _freebsd_major():
+    """Major version of the FreeBSD host, or FREEBSD_DEFAULT_MAJOR when
+    cross-compiling (or when the probe is unavailable, as in the self-hosted
+    build, which folds this to the default)."""
+    if sys.implementation.name != "shivyc":
+        try:
+            import platform
+            if platform.system() == "FreeBSD":
+                return int(platform.release().split(".")[0])
+        except Exception:
+            pass
+    return FREEBSD_DEFAULT_MAJOR
+
+
 def set_defines(defines: "list[str]"):
     """Record command-line ``-D`` macros (each ``NAME`` or ``NAME=VALUE``).
 
@@ -377,7 +413,15 @@ def set_defines(defines: "list[str]"):
     for this compiler) can detect it with ``#ifdef __SHIVYC__``.
     """
     global _cmdline_define_prelude
+    # __STDC__ is required of every conforming implementation (C11 6.10.8.1).
+    # Without it, headers that still carry pre-ANSI support -- the macOS
+    # SDK's <sys/cdefs.h> -- take the K&R path and `#define const __const`.
+    # __STDC_VERSION__ is deliberately left undefined for now: headers then
+    # take their most conservative paths (no `restrict`, `_Noreturn`,
+    # `_Static_assert`), and claiming C11 should wait until each is checked.
     lines = ["#define __SHIVYC__ 1",
+             "#define __STDC__ 1",
+             "#define __STDC_HOSTED__ 1",
              "#define __SIZE_TYPE__ unsigned long",
              "#define __PTRDIFF_TYPE__ long",
              "#define __WCHAR_TYPE__ int",
@@ -392,13 +436,127 @@ def set_defines(defines: "list[str]"):
              "#define __builtin_va_start(ap, last) "
              "((ap) = (char *)__builtin_va_start_addr())",
              "#define __builtin_va_end(ap) ((void)((ap) = (char *)0))",
-             "#define __builtin_va_copy(dst, src) ((dst) = (src))"]
+             "#define __builtin_va_copy(dst, src) ((dst) = (src))",
+             # Feature-test operators (clang; GCC 10+; __has_include is C23).
+             # Each answers honestly for this compiler: no clang language
+             # features, attributes or builtins beyond what is predefined
+             # here. Headers written for clang are built to take their
+             # portable fallback when told "no" -- the macOS SDK drops its
+             # nullability qualifiers and availability attributes that way.
+             # Being macros, they also satisfy `#ifdef __has_feature` and
+             # `defined(__has_feature)`. __has_include is a placeholder for
+             # those two tests only: #if evaluates it by searching the
+             # include path (see _has_include).
+             "#define __has_feature(x) 0",
+             "#define __has_extension(x) 0",
+             "#define __has_attribute(x) 0",
+             "#define __has_c_attribute(x) 0",
+             "#define __has_cpp_attribute(x) 0",
+             "#define __has_declspec_attribute(x) 0",
+             "#define __has_builtin(x) 0",
+             "#define __has_include(x) 0",
+             "#define __has_include_next(x) 0"]
     if _target_name == "wasm":
         # Lets a header select the wasm spelling of an intrinsic, exactly as
         # it would under clang. shivyc/include/wasm_simd128.h uses it to pick
         # between the builtins and a portable scalar fallback.
         lines.append("#define __wasm__ 1")
         lines.append("#define __wasm32__ 1")
+    if _target_os == "macos":
+        # What clang predefines for arm64-apple-macos11 that portable code
+        # and the SDK headers test for: the platform, the architecture, the
+        # data model, and the deployment target (as the SDK's Availability
+        # headers expect to find it, 11.0 -> 110000).
+        lines.append("#define __APPLE__ 1")
+        lines.append("#define __MACH__ 1")
+        lines.append("#define __aarch64__ 1")
+        lines.append("#define __arm64__ 1")
+        lines.append("#define __LP64__ 1")
+        lines.append("#define _LP64 1")
+        lines.append("#define __LITTLE_ENDIAN__ 1")
+        lines.append("#define __ENVIRONMENT_OS_VERSION_MIN_REQUIRED__ 110000")
+        lines.append(
+            "#define __ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__ 110000")
+    if _target_os == "windows":
+        # 64-bit Windows is LLP64: `long` is 4 bytes, so every 64-bit type
+        # macro above has to be respelled `long long` (the same 8-byte type
+        # as LP64's `long` -- Crust folds the two). Then what MinGW-w64 gcc
+        # and MSVC predefine for x64 that portable code tests for. Neither
+        # __GNUC__ nor _MSC_VER is claimed: Crust is neither compiler, and
+        # headers that key on those expect extensions it does not have.
+        # __MINGW64__ likewise stays undefined (Crust links msvcrt.dll
+        # directly, with no MinGW runtime underneath).
+        llp = {"__SIZE_TYPE__": "unsigned long long",
+               "__PTRDIFF_TYPE__": "long long",
+               "__INTPTR_TYPE__": "long long",
+               "__UINTPTR_TYPE__": "unsigned long long",
+               "__INT64_TYPE__": "long long",
+               "__UINT64_TYPE__": "unsigned long long",
+               "__WCHAR_TYPE__": "unsigned short"}
+        i = 0
+        while i < len(lines):
+            parts = lines[i].split(" ", 2)
+            if len(parts) == 3 and parts[1] in llp:
+                lines[i] = "#define %s %s" % (parts[1], llp[parts[1]])
+            i += 1
+        lines.append("#define _WIN32 1")
+        lines.append("#define _WIN64 1")
+        lines.append("#define __x86_64__ 1")
+        lines.append("#define __x86_64 1")
+        lines.append("#define __amd64__ 1")
+        lines.append("#define __amd64 1")
+        lines.append("#define _M_X64 100")
+        lines.append("#define _M_AMD64 100")
+        lines.append("#define __LLP64__ 1")
+        lines.append("#define __LITTLE_ENDIAN__ 1")
+        lines.append("#define __SIZEOF_LONG__ 4")
+        lines.append("#define __SIZEOF_LONG_LONG__ 8")
+        lines.append("#define __SIZEOF_POINTER__ 8")
+        lines.append("#define __SIZEOF_WCHAR_T__ 2")
+        # The bit builtins above are written for LP64: the `l` forms hold
+        # their operand in `unsigned long` but test 64-bit masks, and the
+        # `ll` forms alias them. Under LLP64 that is a 32-bit variable
+        # tested against bit 63 -- `__builtin_clzl(1)` never terminated. So
+        # here `l` means 32 bits, as it does for MinGW gcc, and `ll` is
+        # spelled out at 64.
+        for nm in ("__builtin_clzl", "__builtin_ctzl", "__builtin_clzll",
+                   "__builtin_ctzll", "__builtin_popcountll",
+                   "__builtin_umulll_overflow"):
+            lines.append("#undef " + nm)
+        lines.append("#define __builtin_clzl(x) __builtin_clz(x)")
+        lines.append("#define __builtin_ctzl(x) __builtin_ctz(x)")
+        lines.append(
+            "#define __builtin_clzll(x) __extension__({ unsigned long long "
+            "_clzv=(x); int _clzn=0; if(_clzv==0){_clzn=64;}else{while(!("
+            "_clzv & 0x8000000000000000ULL)){_clzv<<=1;_clzn++;}} _clzn; })")
+        lines.append(
+            "#define __builtin_ctzll(x) __extension__({ unsigned long long "
+            "_ctzv=(x); int _ctzn=0; if(_ctzv==0){_ctzn=64;}else{while(!("
+            "_ctzv & 1ULL)){_ctzv>>=1;_ctzn++;}} _ctzn; })")
+        lines.append(
+            "#define __builtin_popcountll(x) __extension__({ unsigned long "
+            "long _pcv=(x); int _pcn=0; while(_pcv){ _pcn += (int)(_pcv & "
+            "1ULL); _pcv>>=1; } _pcn; })")
+        lines.append(
+            "#define __builtin_umulll_overflow(a, b, res) __extension__({ "
+            "unsigned long long _moa=(a),_mob=(b); *(res)=_moa*_mob; "
+            "(_moa!=0 && (*(res)/_moa)!=_mob); })")
+    if _target_os == "freebsd":
+        # What FreeBSD's cc predefines for amd64 that portable code tests
+        # for (checked against `cc -dM -E` on FreeBSD 15.1). __FreeBSD__ is
+        # the major release: the host's own when compiling on FreeBSD, else
+        # 14, the oldest series still supported; -D__FreeBSD__=N overrides.
+        if not _defines_name(defines, "__FreeBSD__"):
+            lines.append("#define __FreeBSD__ %d" % _freebsd_major())
+        lines.append("#define __unix__ 1")
+        lines.append("#define __unix 1")
+        lines.append("#define __ELF__ 1")
+        lines.append("#define __LP64__ 1")
+        lines.append("#define _LP64 1")
+        lines.append("#define __x86_64__ 1")
+        lines.append("#define __x86_64 1")
+        lines.append("#define __amd64__ 1")
+        lines.append("#define __amd64 1")
     for d in defines or []:
         name, eq, val = d.partition("=")
         lines.append("#define %s %s" % (name, val if eq else "1"))
@@ -697,6 +855,13 @@ class _Preprocessor:
         elif name == "include":
             self._do_include(rest, this_file, out)
 
+        elif name == "include_next":
+            # Used to fall through to "unknown directive" and be silently
+            # dropped -- so the header it names was never read, and every
+            # macro it defines was quietly undefined. Libc-style wrapper
+            # headers and the macOS SDK's <arm/limits.h> depend on it.
+            self._do_include(rest, this_file, out, True)
+
         elif name == "error":
             msg = " ".join(spell(t) for t in rest)
             error_collector.add(CompilerError("#error " + msg, line[0].r))
@@ -742,7 +907,52 @@ class _Preprocessor:
         body = rest[body_start:]
         self.macros[name] = _Macro(name, func_like, params, variadic, body)
 
-    def _do_include(self, rest, this_file, out):
+    @staticmethod
+    def _include_guard(lines):
+        """If a file's grouped `lines` are wholly wrapped in an include
+        guard -- first line `#ifndef G` or `#if !defined(G)`, its matching
+        `#endif` the last line, and no `#else`/`#elif` at the top level --
+        return G, else None. Only comments and whitespace (gone after
+        lexing) may lie outside, so once G is defined, re-including the
+        file provably contributes nothing."""
+        if not lines:
+            return None
+        first = lines[0]
+        if not first or first[0].kind is not token_kinds.pound:
+            return None
+        words = [spell(t) for t in first[1:]]
+        guard = None
+        if len(words) == 2 and words[0] == "ifndef":
+            guard = words[1]
+        elif (len(words) == 6 and words[0] == "if" and words[1] == "!"
+              and words[2] == "defined" and words[3] == "("
+              and words[5] == ")"):
+            guard = words[4]
+        elif (len(words) == 4 and words[0] == "if" and words[1] == "!"
+              and words[2] == "defined"):
+            guard = words[3]
+        if guard is None or not guard:
+            return None
+        depth = 0
+        k = 0
+        n = len(lines)
+        while k < n:
+            line = lines[k]
+            if line and line[0].kind is token_kinds.pound and len(line) > 1:
+                d = spell(line[1])
+                if d == "if" or d == "ifdef" or d == "ifndef":
+                    depth += 1
+                elif d == "endif":
+                    depth -= 1
+                    if depth == 0:
+                        return guard if k == n - 1 else None
+                elif depth == 1 and (d == "else" or d == "elif"
+                                     or d == "elifdef" or d == "elifndef"):
+                    return None
+            k += 1
+        return None
+
+    def _do_include(self, rest, this_file, out, is_next=False):
         if not rest:
             return
         if rest[0].kind is token_kinds.include_file:
@@ -761,7 +971,18 @@ class _Preprocessor:
                     rest[0].r))
                 return
         try:
-            text, filename = read_file(header, this_file)
+            text, filename = read_file(header, this_file, is_next)
+            # Multiple-include optimization (as GCC's): a header already seen
+            # to be wholly include-guarded, unchanged, whose guard macro is
+            # now defined, would expand to nothing -- skip lexing it again.
+            # The macOS SDK's <sys/cdefs.h> is otherwise re-lexed on every
+            # one of its many inclusions.
+            plain = filename.endswith(".h")
+            if plain:
+                seen = _include_guards.get(filename)
+                if seen is not None and seen[0] == text \
+                        and seen[1] in self.macros:
+                    return
             if filename.endswith(".rs"):
                 # A Rust header: lower it to C before lexing. Crust preserves
                 # line numbers, so diagnostics still point into the .rs file.
@@ -825,6 +1046,10 @@ class _Preprocessor:
                         "rpython include: " + e.message, rest[0].r))
                     return
             inc = lexer.tokenize(text, filename)
+            if plain:
+                g = self._include_guard(self._group_lines(inc))
+                if g is not None:
+                    _include_guards[filename] = (text, g)
             out.extend(process(inc, filename, self.macros))
         except IOError:
             error_collector.add(CompilerError(
@@ -837,7 +1062,7 @@ class _Preprocessor:
         seq = self._expand(seq)
         return [p.tok for p in seq]
 
-    def _expand(self, seq):
+    def _expand(self, seq, if_mode=False):
         seq = list(seq)
         out = []
         i = 0
@@ -845,6 +1070,26 @@ class _Preprocessor:
             p = seq[i]
             nm = ident_name(p.tok)
             m = self.macros.get(nm) if nm else None
+
+            # In #if, `defined` can also come out of a macro's expansion
+            # (the macOS SDK's pthread.h: `#if !_PTHREAD_..._COMPAT()`, whose
+            # body is `defined(SWIFT_CLASS_EXTRA) && ...`). C leaves that
+            # undefined, but GCC and clang evaluate it, and headers rely on
+            # it. Pass the operand through unexpanded so _eval_cond can
+            # resolve it afterwards, as GCC does.
+            if if_mode and nm == "defined":
+                out.append(p)
+                i += 1
+                if i < len(seq) and is_punct(seq[i].tok, "("):
+                    k = i
+                    while k < len(seq) and not is_punct(seq[k].tok, ")"):
+                        k += 1
+                    out.extend(seq[i:k + 1])
+                    i = k + 1
+                elif i < len(seq):
+                    out.append(seq[i])
+                    i += 1
+                continue
 
             # Dynamic predefined macros: __LINE__ expands to the line number of
             # the token, __FILE__ to the source file name. They are not stored
@@ -1045,12 +1290,65 @@ class _Preprocessor:
 
     # -- #if constant-expression evaluation --------------------------------
 
+    def _has_include(self, tokens, i, r):
+        """Evaluate `__has_include(...)` whose name token is tokens[i].
+        Returns (value, index after the closing paren). The operand is a
+        "quoted" or <angled> header name; outside #include the lexer splits
+        the angled form into pieces, so it is rejoined here and resolved by
+        the same search #include uses."""
+        j = i + 1
+        if j >= len(tokens) or not is_punct(tokens[j], "("):
+            return 0, i + 1
+        j += 1
+        header = ""
+        if j < len(tokens) and is_punct(tokens[j], "<"):
+            j += 1
+            while j < len(tokens) and not is_punct(tokens[j], ">"):
+                header = header + spell(tokens[j])
+                j += 1
+            header = "<" + header + ">"
+            j += 1                                    # past '>'
+        elif j < len(tokens):
+            header = spell(tokens[j]).strip()
+            j += 1
+        while j < len(tokens) and not is_punct(tokens[j], ")"):
+            j += 1
+        j += 1                                        # past ')'
+        if len(header) < 3:
+            return 0, j
+        this_file = r.start.file if r and r.start else ""
+        is_next = ident_name(tokens[i]) == "__has_include_next"
+        try:
+            read_file(header, this_file or "", is_next)
+        except IOError:
+            return 0, j
+        return 1, j
+
     def _eval_cond(self, tokens, r):
-        # 1) Resolve `defined X` / `defined(X)` before macro expansion.
+        # 1) Resolve `defined X` / `defined(X)` and `__has_include(...)`
+        #    before macro expansion (a header name must not be expanded).
+        resolved = self._resolve_defined(tokens, r)
+
+        # 2) Macro-expand the remainder, then resolve any `defined` that the
+        #    expansion itself produced.
+        expanded = [p.tok for p in self._expand([_PP(t) for t in resolved],
+                                                True)]
+        expanded = self._resolve_defined(expanded, r)
+
+        return self._eval_expanded(expanded, r)
+
+    def _resolve_defined(self, tokens, r):
+        """Replace `defined X`, `defined(X)` and `__has_include(...)` in
+        `tokens` with 0/1 number tokens."""
         resolved = []
         i = 0
         while i < len(tokens):
             t = tokens[i]
+            if ident_name(t) == "__has_include" \
+                    or ident_name(t) == "__has_include_next":
+                val, i = self._has_include(tokens, i, r)
+                resolved.append(_num_token(val, t.r))
+                continue
             if ident_name(t) == "defined":
                 j = i + 1
                 paren = j < len(tokens) and is_punct(tokens[j], "(")
@@ -1063,10 +1361,9 @@ class _Preprocessor:
                 continue
             resolved.append(t)
             i += 1
+        return resolved
 
-        # 2) Macro-expand the remainder.
-        expanded = [p.tok for p in self._expand([_PP(t) for t in resolved])]
-
+    def _eval_expanded(self, expanded, r):
         # 3) Map remaining identifiers/keywords to 0; keep numbers/operators.
         spells = []
         for t in expanded:
@@ -1224,6 +1521,11 @@ class _ConstExpr:
 
 _extra_include_dirs = []
 
+# filename -> (text, guard macro) for headers found to be wholly
+# include-guarded; see _Preprocessor._include_guard. The text is kept so a
+# file that changes between compiles in one process is never skipped wrongly.
+_include_guards = {}
+
 
 def set_include_dirs(dirs):
     """Set additional `-I` include directories searched by read_file."""
@@ -1231,11 +1533,22 @@ def set_include_dirs(dirs):
     _extra_include_dirs = list(dirs or [])
 
 
+# On a Windows host paths also separate with '\\' -- `__file__` is
+# `C:\\...\\shivyc\\preproc.py` -- and a lookup that only splits on '/' finds
+# no directory at all, so the bundled headers resolved only when the compiler
+# happened to run from the repo root. Elsewhere a backslash is an ordinary
+# filename character, so it counts as a separator on Windows alone. Shaped as
+# a bare implementation test so the self-hosted build folds it to False.
+_BACKSLASH_SEP = False
+if sys.implementation.name != "shivyc":
+    _BACKSLASH_SEP = os.sep == "\\"
+
+
 def _dirname(p):
     """Directory portion of a '/'-separated path (own impl, no os/pathlib so it
-    transpiles to C)."""
+    transpiles to C). On Windows, '\\' separates too."""
     i = len(p) - 1
-    while i >= 0 and p[i] != '/':
+    while i >= 0 and p[i] != '/' and not (_BACKSLASH_SEP and p[i] == '\\'):
         i = i - 1
     if i < 0:
         return "."
@@ -1288,17 +1601,47 @@ def _bundled_include_dir():
     return _pjoin(here, "include")
 
 
-def read_file(include_file, this_file):
+def _found_in_dir(this_file, dirs):
+    """Index in `dirs` of the search directory `this_file` was found in (the
+    first whose path is a prefix of it), or -1 if it came from none -- e.g.
+    the main source file, or a quoted include beside it."""
+    k = 0
+    while k < len(dirs):
+        d = dirs[k]
+        if d and this_file.startswith(_pjoin(d, "")):
+            return k
+        k += 1
+    return -1
+
+
+def read_file(include_file, this_file, is_next=False):
     """Read the text of the given include file.
 
     include_file - the header name, including opening and closing quotes or
     angle brackets.
     this_file - location of the current file being preprocessed. used for
     locating quoted headers.
+    is_next - `#include_next` / `__has_include_next`: resume the search in
+    the directories *after* the one `this_file` was found in, so a wrapper
+    header can reach the header it wraps. As in GCC and clang, a file not
+    found through the search path makes it an ordinary include.
     """
     name = include_file[1:-1]
     bundled = _pjoin(_bundled_include_dir(), name)
     candidates = []
+    if is_next:
+        dirs = list(_extra_include_dirs) + [_bundled_include_dir()]
+        k = _found_in_dir(this_file, dirs)
+        if k >= 0:
+            k += 1
+            while k < len(dirs):
+                candidates.append(_pjoin(dirs[k], name))
+                k += 1
+            for path in candidates:
+                data = _try_read(path)
+                if data is not None:
+                    return data, path
+            raise IOError(f"could not find include file {include_file}")
     if include_file[0] == '"':
         # Quoted: the including file's directory, then -I dirs, then ShivyC's
         # bundled fallback headers.

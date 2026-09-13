@@ -1,28 +1,49 @@
 #!/usr/bin/env python3
-"""csrust — lower a C# subset file through cs2cpp + cpprust.
+"""csrust -- translate a C# subset source to C.
 
-Same CLI shape as cpprust.py: one input, `-o` output, one exit status.
-On failure the diagnostic is written to the output path (preproc protocol).
+    python3 tools/csrust.py counter.cs -o counter.c
 
-    python3 tools/csrust.py x.cs -o x.c
+Two halves. `tools/cs2cpp.py` rewrites the C# into the C++ subset;
+`tools/cpprust.py` lowers that to C. The split is argued in CSHARP.md: C#
+overlaps this particular C++ subset in exactly the passes that are already
+written -- `var` is `auto`, `foreach` is a range-`for`, `interface` is a
+pure-abstract base, and C# generics are strictly weaker than the templates
+the monomorphiser already handles.
+
+The command line is `cpprust.py`'s, option for option, and so is the
+protocol: **one output file and one exit status**, with the diagnostic
+written to the output path on failure. That is not tidiness. It is what
+lets `shivyc/preproc.py` drive this as a subprocess from the self-hosted
+compiler, where there is no `subprocess` module and no pipe to capture --
+only `os.system` and a return code.
 """
-
-from __future__ import annotations
 
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import tools.cpprust as cpprust  # noqa: E402
-import tools.cs2cpp as cs2cpp  # noqa: E402
+import tools.cpprust as cpprust                              # noqa: E402
+import tools.cs2cpp as cs2cpp                                # noqa: E402
 
 
-def translate(text, path="<cs>", **kw):
-    """Normalize C# → C++ subset, then cpprust.translate."""
-    cpp = cs2cpp.normalize(text, path=path)
-    # Path kept as .cs so diagnostics name the user's file when possible.
-    return cpprust.translate(cpp, path=path, **kw)
+def translate(text, path="<cs>", owning=None, basedir=None, incdirs=(),
+              defines=(), clang=None, rtti=False, decls=(), decls_out=None,
+              contracts=False, mem_safe=False):
+    """C# source in, C out. Raises CsError or CppError.
+
+    `clang` defaults to False here rather than None. The fallback in
+    `cpp_auto` answers an `auto` it cannot read by compiling the *original
+    file* with `clang++` -- and the original file is C#, which clang will
+    not parse. Consulting it could only ever fail slowly, so it is off
+    unless a caller insists.
+    """
+    cpp = cs2cpp.translate(text, path=path)
+    return cpprust.translate(
+        cpp, path=path, owning=owning, basedir=basedir, incdirs=incdirs,
+        defines=defines, clang=False if clang is None else clang,
+        rtti=rtti, decls=decls, decls_out=decls_out,
+        contracts=contracts, mem_safe=mem_safe)
 
 
 def main():
@@ -31,13 +52,20 @@ def main():
     owning = {}
     basedir = None
     incdirs = []
-    clang = None
     rtti = False
     decls = []
     decls_out = None
-    want_contracts = False
-    want_mem_safe = False
+    emit_cpp = None
+    contracts = False
+    mem_safe = False
 
+    if "--emit-cpp" in args:
+        i = args.index("--emit-cpp")
+        if i + 1 >= len(args):
+            sys.stderr.write("csrust: --emit-cpp needs a path\n")
+            return 2
+        emit_cpp = args[i + 1]
+        del args[i:i + 2]
     if "--emit-decls" in args:
         i = args.index("--emit-decls")
         if i + 1 >= len(args):
@@ -53,20 +81,14 @@ def main():
         decls.append(args[i + 1])
         del args[i:i + 2]
     if "--contracts" in args:
-        want_contracts = True
+        contracts = True
         args.remove("--contracts")
     if "--mem-safe" in args:
-        want_mem_safe = True
+        mem_safe = True
         args.remove("--mem-safe")
     if "--rtti" in args:
         rtti = True
         args.remove("--rtti")
-    if "--clang" in args:
-        clang = True
-        args.remove("--clang")
-    if "--no-clang" in args:
-        clang = False
-        args.remove("--no-clang")
     defines = []
     while "-D" in args:
         i = args.index("-D")
@@ -108,11 +130,10 @@ def main():
         out_path = args[i + 1]
         del args[i:i + 2]
     if len(args) != 1 or out_path is None:
-        sys.stderr.write(
-            "usage: csrust.py <source.cs> -o <out.c> "
-            "[--owning Name:dropfn,..] [--basedir DIR] "
-            "[--incdir DIR].. [-D NAME].. [--rtti] "
-            "[--clang|--no-clang]\n")
+        sys.stderr.write("usage: csrust.py <source.cs> -o <out.c> "
+                         "[--owning Name:dropfn,..] [--basedir DIR] "
+                         "[--incdir DIR].. [-D NAME].. [--rtti] "
+                         "[--emit-cpp PATH]\n")
         return 2
 
     src = args[0]
@@ -123,16 +144,12 @@ def main():
         sys.stderr.write("csrust: cannot read %s: %s\n" % (src, e))
         return 2
 
-    try:
-        if basedir is None:
-            basedir = os.path.dirname(os.path.abspath(src))
-        result = translate(
-            text, path=src, mem_safe=want_mem_safe, owning=owning,
-            basedir=basedir, incdirs=incdirs, defines=defines, clang=clang,
-            rtti=rtti, decls=decls, decls_out=decls_out,
-            contracts=want_contracts)
-    except (cs2cpp.CsError, cpprust.CppError) as e:
-        msg = getattr(e, "message", None) or str(e)
+    if basedir is None:
+        basedir = os.path.dirname(os.path.abspath(src))
+
+    def fail(msg):
+        # The message goes where the output would have gone; the caller
+        # reads it back and reports it against the `#include` line.
         try:
             with open(out_path, "w") as f:
                 f.write(msg)
@@ -140,6 +157,35 @@ def main():
             pass
         sys.stderr.write("csrust: %s\n" % msg)
         return 1
+
+    try:
+        cpp = cs2cpp.translate(text, path=src)
+    except cs2cpp.CsError as e:
+        return fail(e.message)
+
+    # Written before the C++ half runs, so it is on disk to read when that
+    # half is what failed -- which is the case this option exists for.
+    if emit_cpp:
+        with open(emit_cpp, "w") as f:
+            f.write(cpp)
+
+    try:
+        result = cpprust.translate(
+            cpp, path=src, owning=owning, basedir=basedir, incdirs=incdirs,
+            defines=defines, clang=False, rtti=rtti, decls=decls,
+            decls_out=decls_out, contracts=contracts, mem_safe=mem_safe)
+    except cpprust.CppError as e:
+        # A C++ diagnostic reaching a C# author names a construct they did
+        # not write. That is a gap in `_check_refusals`, not a user error,
+        # and saying so is the difference between a bug report and an hour
+        # spent looking for a `class` they never wrote.
+        return fail(
+            "%s\n"
+            "  (This is the C++ half of the translation reporting against "
+            "generated source. Every C# construct outside the subset is "
+            "supposed to be refused before that point, so reaching here is "
+            "a cs2cpp bug -- please report it. `--emit-cpp PATH` writes the "
+            "generated C++ for inspection.)" % e.message)
 
     with open(out_path, "w") as f:
         f.write(result)

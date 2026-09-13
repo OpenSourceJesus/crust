@@ -170,5 +170,56 @@ class TestPerFunctionStackless(unittest.TestCase):
         self.assertIn("push rbp", bar)         # bar untouched
 
 
+
+
+class TestProofLicensesCodegen(unittest.TestCase):
+    """A proof, or no SSE2.
+
+    `simd_contracts` drops the scalar tail only when the contract is proven at
+    every call site. Satisfying the contract is not on its own the licence:
+    when a proof kernel is available the certificate is the evidence, and
+    without one the tail stays. Withdrawing the certificate -- by putting the
+    call site's length past `CRUST_PROOF_MAX` -- has to change the code that
+    comes out, or the certificate was decoration.
+    """
+
+    def _asm(self, **env):
+        keep = {}
+        for key, value in env.items():
+            keep[key] = os.environ.get(key)
+            os.environ[key] = value
+        try:
+            import shivyc.proofs as proofs
+            proofs._TRIED = False       # re-read the environment
+            proofs._KERNEL = None
+            proofs.MAX_CERTIFIED = int(os.environ.get("CRUST_PROOF_MAX",
+                                                      "65536"))
+            _, asm = _run(_simd_src(64))
+            return asm.split("calc_sum:")[1].split("run:")[0]
+        finally:
+            for key, value in keep.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+            import shivyc.proofs as proofs
+            proofs._TRIED = False
+            proofs._KERNEL = None
+            proofs.MAX_CERTIFIED = 65536
+
+    def test_certified_call_site_gets_sse2(self):
+        body = self._asm()
+        self.assertIn("paddd", body)
+
+    def test_uncertified_call_site_keeps_scalar_code(self):
+        body = self._asm(CRUST_PROOF_MAX="8")
+        self.assertNotIn("paddd", body)
+        self.assertNotIn("movdqu", body)
+
+    def test_turning_certification_off_restores_the_old_behaviour(self):
+        body = self._asm(CRUST_PROOFS="0")
+        self.assertIn("paddd", body)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -12,8 +12,18 @@ from shivyc.ctypes import (PointerCType, ArrayCType, FunctionCType,
 from shivyc.errors import CompilerError, error_collector
 from shivyc.il_gen import ILCode, ILValue
 from shivyc.tree.base_nodes import CNode
-from shivyc.tree.utils import DirectLValue, report_err
+from shivyc.tree.utils import DirectLValue, IndirectLValue, report_err
 
+
+
+def win64_passes_by_ref(ctype):
+    """True if the Microsoft x64 ABI passes (or returns) a value of `ctype`
+    through a pointer rather than in a register: any struct or union whose
+    size is not exactly 1, 2, 4 or 8 bytes. (Integers, pointers and floating
+    values are never larger than 8 bytes here; `long double` is `double`.)"""
+    if not ctype.is_struct_union():
+        return False
+    return ctype.size not in (1, 2, 4, 8)
 
 class Root(CNode):
     """Root node of the program."""
@@ -812,6 +822,9 @@ class DeclInfo:
 
         c = c.set_return(self.ctype.ret)
         c = c.set_labels({})
+        if spots.is_win64():
+            self._make_il_win64(il_code, symbol_table, c, is_main)
+            return
         # Variadic functions receive all arguments on the stack; record the
         # named-parameter count so va_start can locate the first vararg.
         variadic = getattr(self.ctype, "variadic", False)
@@ -913,6 +926,102 @@ class DeclInfo:
             else:
                 il_code.add(value_cmds.LoadArg(arg, i, False, None, False, stack_i))
                 stack_i += 1
+
+        self.body.make_il(il_code, symbol_table, c, no_scope=True)
+        if not il_code.always_returns() and is_main:
+            zero = ILValue(ctypes.integer)
+            il_code.register_literal_var(zero, 0)
+            il_code.add(control_cmds.Return(zero))
+        elif not il_code.always_returns():
+            il_code.add(control_cmds.Return(None))
+
+        symbol_table.end_scope()
+
+    def _make_il_win64(self, il_code, symbol_table, c, is_main):
+        """The function prologue and body under the Microsoft x64 ABI.
+
+        Win64 assigns arguments by *position*: the first four take rcx, rdx,
+        r8, r9 -- or xmm0-3 for a floating one, the two sequences sharing one
+        counter -- and every later one an 8-byte stack slot. The caller
+        always reserves 32 bytes of "home space" for the first four just
+        above the return address, so position p lives at [rbp + 16 + 8p]
+        whether or not it was passed in a register: one uniform array.
+
+        A struct of 1, 2, 4 or 8 bytes is passed like an integer of that
+        size. Any other struct is passed as a pointer to a copy the caller
+        made; the parameter's own storage is filled from it here. A struct
+        return of any size but 1, 2, 4 or 8 is written through a hidden
+        pointer that arrives as argument 0 and is returned in rax.
+
+        A variadic function spills rcx/rdx/r8/r9 to their home slots first
+        (VaSaveBase), making the named and anonymous arguments one
+        contiguous run of 8-byte slots for va_arg to walk. That is the
+        whole of Win64's variadic convention: the caller duplicates each
+        floating vararg into the matching integer register precisely so the
+        spill captures it.
+        """
+        variadic = getattr(self.ctype, "variadic", False)
+        ret_ctype = self.ctype.ret
+        sret = win64_passes_by_ref(ret_ctype)
+        pos0 = 1 if sret else 0
+        num_params = len(self.ctype.args)
+        if variadic:
+            c = c.set_vararg_named(pos0 + num_params)
+        il_code.start_func(self.identifier.content)
+        il_code.set_range(self.identifier.r)
+
+        va_base = None
+        if variadic:
+            va_base = ILValue(PointerCType(ctypes.char))
+            il_code.add(value_cmds.VaSaveBase(va_base))
+            c = c.set_vararg_base(va_base)
+
+        symbol_table.new_scope()
+        int_regs = spots.int_arg_regs
+        xmm_regs = spots.xmm_arg_regs
+
+        if sret:
+            sret_ptr = ILValue(PointerCType(ret_ctype))
+            if variadic:
+                il_code.add(value_cmds.LoadArg(
+                    sret_ptr, 0, True, None, False, None, va_base))
+            else:
+                il_code.add(value_cmds.LoadArg(sret_ptr, 0, False,
+                                               int_regs[0]))
+            c = c.set_sret_ptr(sret_ptr)
+
+        i = 0
+        while i < num_params:
+            ctype = self.ctype.args[i]
+            param = self.param_names[i]
+            p = pos0 + i
+            arg = symbol_table.add_variable(
+                param, ctype, symbol_table.DEFINED, None,
+                symbol_table.AUTOMATIC)
+            byref = win64_passes_by_ref(ctype)
+            dest = ILValue(PointerCType(ctype)) if byref else arg
+            is_f = ctype.is_floating()
+            # positional: (output, arg_num, all_stack, reg, is_float,
+            #              stack_index, base)
+            if variadic and not (is_f and p < 4):
+                # From the spilled home slots / stack. A named floating
+                # parameter is read from its xmm register instead: the
+                # caller need not have duplicated a *named* argument into
+                # the integer register, only the anonymous ones.
+                il_code.add(value_cmds.LoadArg(
+                    dest, p, True, None, is_f, None, va_base))
+            elif p < 4 and is_f:
+                il_code.add(value_cmds.LoadArg(dest, p, False, xmm_regs[p],
+                                               True))
+            elif p < 4:
+                il_code.add(value_cmds.LoadArg(dest, p, False, int_regs[p]))
+            else:
+                il_code.add(value_cmds.LoadArg(dest, p, False, None, is_f,
+                                               p))
+            if byref:
+                val = IndirectLValue(dest).val(il_code)
+                il_code.add(value_cmds.Set(arg, val))
+            i += 1
 
         self.body.make_il(il_code, symbol_table, c, no_scope=True)
         if not il_code.always_returns() and is_main:
@@ -1295,7 +1404,17 @@ class Declaration(CNode):
         specs_str = " ".join(sorted(our_base_specs))
 
         # replace "long long" with "long" for convenience
+        was_long_long = "long long" in specs_str
         specs_str = specs_str.replace("long long", "long")
+
+        # LLP64 (64-bit Windows): a lone `long` is 4 bytes. Only the
+        # spelled keyword changes; `long long` keeps the 8-byte type.
+        if ctypes.llp64 and not was_long_long:
+            if specs_str in ("long", "long signed", "int long",
+                             "int long signed"):
+                return ctypes.win_long
+            if specs_str in ("long unsigned", "int long unsigned"):
+                return ctypes.unsig_win_long
 
         specs = {
             "void": ctypes.void,
@@ -1330,6 +1449,11 @@ class Declaration(CNode):
             "double": ctypes.dbl,
             "double long": ctypes.longdouble,
         }
+
+        # On an ABI where `long double` *is* `double` (Apple arm64) there is
+        # nothing to approximate and nothing to warn about.
+        if specs_str == "double long" and ctypes.long_double_is_double_abi:
+            return ctypes.dbl
 
         # `long double` (sorted "double long") is normally the unsupported
         # 80-bit sentinel. Under -f-long-double-as-double we alias it to plain

@@ -164,7 +164,8 @@ def main():
         pre = sw[:-2] + ".preempt.s"
         if do_build:
             rc, o, e = run([sys.executable, "-m", "shivyc.main", BENCH, decl,
-                            "--emit-thread-switcher", sw, "--target", "arm64"])
+                            "--emit-thread-switcher", sw, "--target", "arm64",
+                            "--os", "none"])
         else:
             rc, o, e = 0, "", ""
         if rc != 0 or not os.path.exists(pre):

@@ -45,6 +45,31 @@ CPY_DEFS := -D Py_BUILD_CORE -D thread_local=_Thread_local \
 BSD_REPO ?= https://github.com/brentharts/2.11BSD-riscv
 BSD_DIR  ?= $(ROOT)/2.11BSD-riscv
 
+# ---------------------------------------------------------------------------
+# The proof kernel (see LEAN.md, shivyc/proofs.py, SIMD_CONTRACTS.md)
+#
+# Crust certifies SIMD contracts through RosettaMath's `crustproof.py`, which
+# is a Calculus of Constructions kernel written in Python (`lean4.py`).  It is
+# named after Lean 4 and it is not Lean 4: nothing in this repo runs the Lean
+# binary, and there is no .lean file here to run it on.  So what this repo
+# needs installed is a RosettaMath checkout, not a toolchain.
+#
+# It is optional.  Without it `proofs.backend()` reports "built-in", contracts
+# are read by the compiler alone, and every unproven case keeps its scalar
+# tail -- the conservative path, never a wrong answer.
+#
+# Cloned as a sibling rather than into $(ROOT), because that is one of the
+# three places proofs.py already looks, so a plain `python3 -m shivyc` finds
+# it too and not only the targets below.
+ROSETTA_REPO ?= https://github.com/brentharts/RosettaMath
+ROSETTA_DIR  ?= $(ROOT)/../RosettaMath
+
+# proofs.py honours this ahead of the sibling and ~/RosettaMath, so overriding
+# ROSETTA_DIR on the command line points every target at a checkout anywhere.
+# If it names a directory with no crustproof.py, proofs.py moves on down its
+# own list rather than failing -- pointing this at nothing disables nothing.
+export ROSETTAMATH_DIR := $(ROSETTA_DIR)
+
 default:
 	chmod +x ./crust
 	./crust examples/crust/shapes.c -o /tmp/shapes
@@ -103,6 +128,23 @@ mem-safe:
 #     make fuzz_wasm      random programs vs gcc (SEED/COUNT to override)
 test_wasm:
 	python3 tools/wasm_difftest.py
+
+# macOS on Apple Silicon (MACOS.md). Assembly checks everywhere; real Mach-O
+# assemble + link with LLVM when installed; build-and-run on a Mac.
+test_macos:
+	python3 -m unittest tests.test_macos_target -v
+
+# 64-bit Windows (WINDOWS.md). Assembly and PE-image checks everywhere; with
+# Wine the programs run, and with MinGW-w64 gcc as well the ABI is checked
+# against it across a DLL boundary.
+test_windows:
+	python3 -m unittest tests.test_windows_target -v
+
+# FreeBSD/amd64 (FREEBSD.md). Dialect and header checks everywhere; with clang
+# the corpus is assembled by LLVM; with CRUST_FREEBSD_SYSROOT a cross link is
+# inspected; with CRUST_FREEBSD_SSH programs run on FreeBSD.
+test_freebsd:
+	python3 -m unittest tests.test_freebsd_target -v
 
 # Dual FE/BE wire protocol (issue #15): same TU -> native + wasm, layout and
 # request/reply bytes must agree both directions.
@@ -947,6 +989,68 @@ clean_bsd:
 	rm -rf $(BSD_DIR)
 
 # ---------------------------------------------------------------------------
+# The proof kernel.  See the ROSETTA_DIR notes near the top of this file.
+
+install_proofs:
+	@if [ -d "$(ROSETTA_DIR)/.git" ]; then \
+		echo "Updating RosettaMath in $(ROSETTA_DIR)"; \
+		git -C "$(ROSETTA_DIR)" pull --ff-only; \
+	else \
+		echo "Cloning $(ROSETTA_REPO) into $(ROSETTA_DIR)"; \
+		git clone --depth 1 "$(ROSETTA_REPO)" "$(ROSETTA_DIR)"; \
+	fi
+	@$(MAKE) --no-print-directory check_proofs
+
+# Reports rather than fails: an absent kernel is a supported configuration,
+# not a broken one.
+check_proofs:
+	@python3 -c "import sys; sys.path.insert(0, 'shivyc'); import proofs; \
+	  b = proofs.backend(); \
+	  print('proof kernel: %s' % b); \
+	  print('  a contract at length 64 is %s' \
+	        % proofs.evidence(64, {'len>=': 64, 'div-by': 4})); \
+	  sys.stdout.write('' if b != 'built-in' else \
+	    '  RosettaMath not found -- run \"make install_proofs\"\n')"
+
+# Crust never invokes the Lean binary; only RosettaMath does, for its own
+# CrustOS.lean supplement.  This delegates rather than carrying a second copy
+# of that installer, so there is one of it to maintain.
+install_lean: install_proofs
+	@if [ -f "$(ROSETTA_DIR)/Makefile" ] && \
+	   $(MAKE) -C "$(ROSETTA_DIR)" -n install_lean >/dev/null 2>&1; then \
+		echo; \
+		echo 'Note: Crust itself does not run the Lean binary -- its'; \
+		echo 'contract kernel is RosettaMath lean4.py, which is Python and'; \
+		echo 'is already installed by the step above.  Installing a real'; \
+		echo 'toolchain for RosettaMath make crustos_eq:'; \
+		echo; \
+		$(MAKE) -C "$(ROSETTA_DIR)" install_lean; \
+	else \
+		echo "no install_lean in $(ROSETTA_DIR) -- update RosettaMath"; \
+		exit 1; \
+	fi
+
+# The proved model against the shipped scheme layer.  Kept out of `make test`:
+# it needs a RosettaMath checkout and spends ~20s normalising kernel terms.
+test_model:
+	@if [ ! -f "$(ROSETTA_DIR)/crustos_eq.py" ]; then \
+		echo "RosettaMath not found -- run 'make install_proofs'"; exit 1; \
+	fi
+	python3 -m unittest tests.test_crustos_model -v
+
+# The IL lift: compiled functions back into the fragment the kernel proves
+# things about, checked against the binary and by the kernel.  Same
+# dependency; a few seconds.  The Lean case is skipped without `lean`.
+test_ilproof:
+	@if [ ! -f "$(ROSETTA_DIR)/hoare.py" ]; then \
+		echo "RosettaMath not found -- run 'make install_proofs'"; exit 1; \
+	fi
+	python3 -m unittest tests.test_ilproof -v
+
+clean_proofs:
+	rm -rf $(ROSETTA_DIR)
+
+# ---------------------------------------------------------------------------
 # Bare-metal demos
 #
 # Compile a freestanding ShivyCX app and link it against the inlined mini-OS
@@ -1013,7 +1117,7 @@ baremetal-preempt:
 	python3 -m shivyc.main examples/baremetal/kernel_preempt.c \
 		examples/baremetal/preempt_threads.c \
 		--emit-thread-switcher $(BUILD)/sw.s \
-		--target arm64
+		--target arm64 --os none
 	python3 tools/baremetal_arm64.py examples/baremetal/kernel_preempt.c \
 		--extra-asm vectors_preempt_arm64.S --extra-asm $(BUILD)/sw.preempt.s \
 		-o $(BUILD)/kernel_preempt.elf --run
@@ -1088,7 +1192,7 @@ mbos-rpython-test-net:
 self:
 	cd tools && pypy3 py2c.py
 
-.PHONY: check-memory mem-safe default test testfast testminipy testfast_native testpromote testpgo testfuse testtorch shim install install_deps clean baremetal baremetal-arm64 baremetal-arm64-run baremetal-raspi baremetal-raspi-irq baremetal-echo baremetal-echo-raspi baremetal-preempt baremetal-jetson test_baremetal_arm64 baremetal-hello \
+.PHONY: check-memory mem-safe default test test_macos test_windows test_freebsd testfast testminipy testfast_native testpromote testpgo testfuse testtorch shim install install_deps clean baremetal baremetal-arm64 baremetal-arm64-run baremetal-raspi baremetal-raspi-irq baremetal-echo baremetal-echo-raspi baremetal-preempt baremetal-jetson test_baremetal_arm64 baremetal-hello \
         bootstrap bootstrap2 \
         selfhost selfhost_objcore selfhost_bench selfhost_coverage \
         selfhost_coverage_musl selfhost_link selfhost_build selfhost_compiler \
@@ -1099,4 +1203,6 @@ self:
         test_micropython_core test_micropython_objects \
         test_micropython_modules test_micropython_emitters test_micropython_port \
         install_cpython clean_cpython test_cpython test_cpython_objects \
-        install_bsd clean_bsd test_bsd test_bsd_bin test_bsd_usrbin crustos
+        install_bsd clean_bsd test_bsd test_bsd_bin test_bsd_usrbin crustos \
+        install_proofs check_proofs install_lean clean_proofs test_model \
+        test_ilproof

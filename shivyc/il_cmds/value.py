@@ -110,7 +110,8 @@ class LoadArg(ILCommand):
     the second function argument into the variable b.
     """
     output: "ILValue"
-    arg_regs = [spots.RDI, spots.RSI, spots.RDX, spots.RCX, spots.R8, spots.R9]
+    # The very list object spots.set_abi rebuilds, so this follows the ABI.
+    arg_regs = spots.int_arg_regs
 
     def __init__(self, output, arg_num, all_stack=False, reg=None,
                  is_float=False, stack_index=None, base=None):
@@ -940,6 +941,13 @@ class VaSaveBase(ILCommand):
 
     def __init__(self, output):
         self.output = output
+        # Microsoft x64 has no r11 hand-off: the block is the caller's home
+        # space, which this spills into (see make_asm). It is addressed off
+        # rbp, so the function needs a real frame; the frameless test in
+        # asm_gen looks for exactly this attribute.
+        self.stack_spot = None
+        if spots.is_win64():
+            self.stack_spot = MemSpot(spots.RBP, 16)
 
     def inputs(self):
         return []
@@ -948,9 +956,29 @@ class VaSaveBase(ILCommand):
         return [self.output]
 
     def clobber(self):
-        return []
+        # rax stages the address when the output lives in memory.
+        return [spots.RAX] if self.stack_spot is not None else []
 
     def make_asm(self, spotmap, home_spots, get_reg, asm_code: "asm_gen.ASMCode"):
+        if self.stack_spot is not None:
+            # Win64: the caller reserved 32 bytes above the return address
+            # for exactly this. Storing the four argument registers there
+            # joins them to the stack arguments that follow, so every
+            # argument -- named or not, integer or (duplicated) floating --
+            # is an 8-byte slot at [rbp + 16 + 8*position]. The stores come
+            # before the output is written: it may be allocated to rcx.
+            k = 0
+            for reg in spots.int_arg_regs:
+                asm_code.add(asm_cmds.Mov(MemSpot(spots.RBP, 16 + 8 * k),
+                                          reg, 8))
+                k += 1
+            dest = spotmap[self.output]
+            if isinstance(dest, RegSpot):
+                asm_code.add(asm_cmds.Lea(dest, self.stack_spot))
+            else:
+                asm_code.add(asm_cmds.Lea(spots.RAX, self.stack_spot))
+                asm_code.add(asm_cmds.Mov(dest, spots.RAX, 8))
+            return
         asm_code.add(asm_cmds.Mov(spotmap[self.output], spots.R11, 8))
 
 

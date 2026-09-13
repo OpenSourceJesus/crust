@@ -23,6 +23,7 @@ runtime as usual.
 """
 
 from shivyc.errors import CompilerError
+from shivyc import proofs
 
 # func name -> {arg_name -> {'len<=': N, 'len>=': N, 'div-by': N}}
 _meta = {}
@@ -137,27 +138,28 @@ def _describe_arg(arg, symbol_table):
     return "the argument"
 
 
-def _bound_text(arg_name, bound):
-    """Reconstruct readable contract text and a verb from a bound entry."""
-    if "len<=" in bound:
-        return f"len({arg_name}) <= {bound['len<=']}", "is too large"
-    if "len>=" in bound:
-        return f"len({arg_name}) >= {bound['len>=']}", "is too small"
-    if "div-by" in bound:
-        return (f"not len({arg_name}) % {bound['div-by']}",
-                "has a length that violates the contract")
-    return "", "violates the contract"
+def _bound_text(arg_name, bound, length=None):
+    """The clause this length actually breaks, as it was written.
+
+    It used to be the first clause present, which for a contract of several
+    clauses named one the argument might well satisfy while breaking another.
+    """
+    broken = proofs.failing(length, bound) if length is not None else []
+    if not broken:
+        broken = [key for key in proofs.BOUNDS if key in bound]
+    if not broken:
+        return "", "violates the contract"
+    return proofs.clause_text(arg_name, broken[0], bound)
 
 
 def _violates(length, bound):
-    """Whether a known length violates a bound entry."""
-    if "len<=" in bound:
-        return length > bound["len<="]
-    if "len>=" in bound:
-        return length < bound["len>="]
-    if "div-by" in bound:
-        return (length % bound["div-by"]) != 0
-    return False
+    """Whether a known length violates the contract -- any clause of it.
+
+    Delegated to `shivyc.proofs` so that this pass and `simd_contracts` read
+    one contract the same way, and so that the reading can be checked by a
+    proof kernel when `CRUST_PROOFS=1`.
+    """
+    return proofs.violates(length, bound)
 
 
 def check_call(callsite, callee_name, symbol_table):
@@ -180,7 +182,8 @@ def check_call(callsite, callee_name, symbol_table):
         if length is None:
             continue
         if _violates(length, bound):
-            text, verb = _bound_text(arg_name, bound)
+            text, verb = _bound_text(arg_name, bound, length)
+            proofs.certified(length, bound)      # raises on a disagreement
             where = (f"in the function `{current_function}`, "
                      if current_function else "")
             arg_desc = _describe_arg(args[pos], symbol_table)

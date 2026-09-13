@@ -39,6 +39,38 @@ class Target:
         # Filename extension of the back end's output. Only meaningful when
         # is_binary is set; the text targets always produce ".s".
         self.output_ext = ".s"
+        # Operating system the output runs on, orthogonal to the architecture:
+        # "linux" (the historical default), "none" (freestanding / bare-metal
+        # ELF -- the same object-level facts as linux), "macos", "windows" or
+        # "freebsd". Selected by --os; see set_os below.
+        self.os = "linux"
+        # Object-file format the emitted assembler text targets. "elf" for
+        # every Linux / bare-metal target; "macho" for Apple. Drives section
+        # directives, symbol spelling, and address-materialization syntax.
+        self.obj_format = "elf"
+        # Prefix the platform C ABI puts on every C-level symbol. Mach-O
+        # spells `main` as `_main`; ELF uses the bare name.
+        self.sym_prefix = ""
+        # Calling convention: "sysv" (System V / AAPCS64 / lp64 -- every
+        # target until Windows) or "win64" (the Microsoft x64 convention).
+        # The register file and argument passing key on this, not on `os`.
+        self.abi = "sysv"
+        # Format of the final linked executable, as distinct from obj_format
+        # (the intermediate objects). Windows keeps ELF objects internally --
+        # rasm writes them and rlink reads them -- and only the image rlink
+        # writes is a PE. "elf", "macho" or "pe".
+        self.exe_format = "elf"
+
+    def set_os(self, os_name):
+        """Retarget this instance at operating system `os_name` (already
+        normalized by normalize_os). Only the ELF default is accepted here;
+        subclasses that support another OS override this."""
+        if os_name == "" or os_name == "linux" or os_name == "none":
+            if os_name:
+                self.os = os_name
+            return
+        raise ValueError("target %s does not support --os %s"
+                         % (self.name, os_name))
 
 
 class X86_64Target(Target):
@@ -50,7 +82,33 @@ class X86_64Target(Target):
         self.name = "x86_64"
         self.triple = "x86_64-linux-gnu"
         self.asm_syntax_prologue = ["\t.intel_syntax noprefix"]
-        self.asm_syntax_epilogue = ["\t.att_syntax noprefix"]
+        # Back to the assembler's default at the end of the file. `prefix`,
+        # not `noprefix`: AT&T syntax without `%` register prefixes is a GNU
+        # as extension that LLVM's assembler rejects outright, and this line
+        # is the only reason every file failed under FreeBSD's `cc`.
+        self.asm_syntax_epilogue = ["\t.att_syntax prefix"]
+
+    def set_os(self, os_name):
+        """x86-64 additionally supports 64-bit Windows: the Microsoft x64
+        calling convention and a PE32+ executable. The objects stay ELF --
+        they only ever pass between rasm and rlink -- and C symbols are
+        spelled bare on Win64 (only 32-bit Windows prefixes `_`), so the
+        assembler text is the ELF dialect unchanged. See WINDOWS.md."""
+        if os_name == "windows":
+            self.os = "windows"
+            self.abi = "win64"
+            self.exe_format = "pe"
+            self.triple = "x86_64-pc-windows-msvc"
+            return
+        if os_name == "freebsd":
+            # FreeBSD/amd64 is the same System V ABI, LP64 data model and ELF
+            # as Linux, so every code-generation fact stays; what differs is
+            # the system around the program (libc, crt objects, the toolchain
+            # that links it) and the kernel's ELF branding. See FREEBSD.md.
+            self.os = "freebsd"
+            self.triple = "x86_64-unknown-freebsd"
+            return
+        Target.set_os(self, os_name)
 
 
 class Arm64Target(Target):
@@ -65,6 +123,20 @@ class Arm64Target(Target):
         # aarch64 GAS has one native syntax; no intel/att toggle is emitted.
         self.asm_syntax_prologue = []
         self.asm_syntax_epilogue = []
+
+    def set_os(self, os_name):
+        """arm64 additionally supports macOS on Apple Silicon (Mach-O,
+        Apple's arm64 variant of AAPCS64). The architecture name stays
+        "arm64" -- only the OS-facing facts change -- so everything keyed on
+        the architecture (register pools, thread contracts) is unaffected."""
+        if os_name == "macos":
+            self.os = "macos"
+            self.obj_format = "macho"
+            self.sym_prefix = "_"
+            self.triple = "arm64-apple-macos11"
+            self.exe_format = "macho"
+            return
+        Target.set_os(self, os_name)
 
 
 class RiscV64Target(Target):
@@ -128,13 +200,8 @@ class WasmTarget(Target):
         self.output_ext = ".wasm"
 
 
-# Canonical name plus accepted aliases -> constructor.
-def get_target(name):
-    """Return a fresh Target instance for `name` (default x86-64). Aliases:
-    amd64->x86_64, aarch64->arm64, rv64->riscv64, neogeo/68k->m68k. An unknown
-    name falls back to x86-64 so the compiler stays usable; front ends should
-    validate the name explicitly."""
-    n = name if name else "x86_64"
+def _make_target(n):
+    """Construct the architecture target for canonical-or-alias name `n`."""
     if n == "x86_64" or n == "amd64":
         return X86_64Target()
     if n == "arm64" or n == "aarch64":
@@ -146,6 +213,73 @@ def get_target(name):
     if n == "wasm" or n == "wasm32" or n == "webassembly":
         return WasmTarget()
     return X86_64Target()
+
+
+# Canonical name plus accepted aliases -> constructor.
+def get_target(name, os_name=""):
+    """Return a fresh Target instance for `name` (default x86-64). Aliases:
+    amd64->x86_64, aarch64->arm64, rv64->riscv64, neogeo/68k->m68k. An unknown
+    name falls back to x86-64 so the compiler stays usable; front ends should
+    validate the name explicitly.
+
+    `os_name` (optional, any alias accepted by normalize_os) selects the
+    operating system. An unsupported architecture/OS pairing falls back to the
+    architecture's default OS here; the driver validates the pairing with
+    is_supported_os first so the user gets a real diagnostic."""
+    n = name if name else "x86_64"
+    t = _make_target(n)
+    osn = normalize_os(os_name)
+    if osn and is_supported_os(t.name, osn):
+        t.set_os(osn)
+    return t
+
+
+def normalize_os(os_name):
+    """Canonical OS name for `os_name`, "" when unset, or the input unchanged
+    (so is_known_os can reject it) when unrecognized."""
+    if not os_name:
+        return ""
+    o = os_name.lower()
+    if o == "macos" or o == "darwin" or o == "osx" or o == "macosx" \
+            or o == "apple":
+        return "macos"
+    if o == "linux" or o == "gnu":
+        return "linux"
+    if o == "windows" or o == "win" or o == "win64" or o == "win32" \
+            or o == "mingw" or o == "mingw32" or o == "mingw64" or o == "nt":
+        return "windows"
+    if o == "freebsd" or o == "fbsd":
+        return "freebsd"
+    if o == "none" or o == "baremetal" or o == "bare-metal" \
+            or o == "freestanding" or o == "elf":
+        return "none"
+    return os_name
+
+
+def is_known_os(os_name):
+    """True if `os_name` is a recognized OS or alias."""
+    o = normalize_os(os_name)
+    return (o == "" or o == "linux" or o == "none" or o == "macos"
+            or o == "windows" or o == "freebsd")
+
+
+def is_supported_os(target_name, os_name):
+    """True if the architecture `target_name` can target `os_name`.
+    macOS is Apple Silicon only, so it pairs with arm64 alone; Windows is
+    x64 only (Windows on Arm would need an arm64 PE and its own ABI work);
+    FreeBSD is amd64 only for now."""
+    o = normalize_os(os_name)
+    if o == "" or o == "linux" or o == "none":
+        return True
+    if o == "macos":
+        return target_name == "arm64" or target_name == "aarch64"
+    if o == "windows":
+        return target_name == "x86_64" or target_name == "amd64"
+    if o == "freebsd":
+        # amd64 for now; FreeBSD's arm64 and riscv64 ports would reuse those
+        # back ends with the same system-toolchain driver path.
+        return target_name == "x86_64" or target_name == "amd64"
+    return False
 
 
 def is_known_target(name):

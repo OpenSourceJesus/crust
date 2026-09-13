@@ -73,6 +73,9 @@ Main Crust Documentation:
 - [examples/wireproto/README.md](examples/wireproto/README.md) dual FE/BE compile + binary protocol
 
 Hardware:
+- [MACOS.md](MACOS.md) macOS on Apple Silicon (`--os macos`)
+- [WINDOWS.md](WINDOWS.md) 64-bit Windows (`--os windows`), with no MinGW or MSVC needed
+- [FREEBSD.md](FREEBSD.md) FreeBSD/amd64 (`--os freebsd`)
 - [BAREMETAL_ARM64.md](BAREMETAL_ARM64.md)
 - [RASPI.md](RASPI.md) Raspberry Pi
 - [JETSON_NANO.md](JETSON_NANO.md) Nvidia Jetson Nano

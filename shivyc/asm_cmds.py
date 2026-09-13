@@ -147,7 +147,17 @@ class Jbe(_JumpCommand): name = "jbe"  # noqa: D101
 class Jmp(_JumpCommand): name = "jmp"  # noqa: D101
 
 
-class Movsx(_ASMCommandMultiSize): name = "movsx"  # noqa: D101
+class Movsx(_ASMCommandMultiSize):  # noqa: D101
+    name = "movsx"
+
+    def __str__(self):
+        # Intel names the 32-to-64-bit sign extension `movsxd`. GNU as also
+        # accepts `movsx` for it; LLVM's assembler does not. (The inherited
+        # field names are swapped: `source_size` is the destination's width
+        # and `dest_size` the source's -- see value.py's call.)
+        if self.source_size == 8 and self.dest_size == 4:
+            return "\tmovsxd " + self.dest + ", " + self.source
+        return _ASMCommandMultiSize.__str__(self)
 
 
 class Movzx(_ASMCommandMultiSize): name = "movzx"  # noqa: D101

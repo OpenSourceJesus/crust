@@ -712,6 +712,11 @@ def encode(mnem, ops):
         return _encode_sse_mov(0xF2, ops[0], ops[1])
     if mnem == "movss":
         return _encode_sse_mov(0xF3, ops[0], ops[1])
+    if mnem == "movups":
+        # unaligned 128-bit move: 0F 10 (load) / 0F 11 (store), as movss
+        # without its F3 prefix. The Windows runtime's setjmp saves the
+        # callee-saved xmm6-15 with it (a jmp_buf is only 8-byte aligned).
+        return _encode_sse_mov(0x00, ops[0], ops[1])
     if mnem == "movaps":
         return _encode_sse_movalign(0x00, ops[0], ops[1])
     if mnem == "movapd":
@@ -1220,7 +1225,7 @@ def branch_kind(mnem, ops):
 #   immediates: 5, -16, 0x1f
 #   memory:     QWORD PTR [rbp-8], DWORD PTR [sym+4*rcx], [rip+0], [sym]
 
-_PTR_SIZE = {"BYTE": 8, "WORD": 16, "DWORD": 32, "QWORD": 64}
+_PTR_SIZE = {"BYTE": 8, "WORD": 16, "DWORD": 32, "QWORD": 64, "XMMWORD": 128}
 
 
 def _parse_int(tok):
