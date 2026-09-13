@@ -46,7 +46,7 @@ BSD_REPO ?= https://github.com/brentharts/2.11BSD-riscv
 BSD_DIR  ?= $(ROOT)/2.11BSD-riscv
 
 # ---------------------------------------------------------------------------
-# The proof kernel (see shivyc/proofs.py, SIMD_CONTRACTS.md)
+# The proof kernel (see LEAN.md, shivyc/proofs.py, SIMD_CONTRACTS.md)
 #
 # Crust certifies SIMD contracts through RosettaMath's `crustproof.py`, which
 # is a Calculus of Constructions kernel written in Python (`lean4.py`).  It is
@@ -1030,6 +1030,14 @@ install_lean: install_proofs
 		exit 1; \
 	fi
 
+# The proved model against the shipped scheme layer.  Kept out of `make test`:
+# it needs a RosettaMath checkout and spends ~20s normalising kernel terms.
+test_model:
+	@if [ ! -f "$(ROSETTA_DIR)/crustos_eq.py" ]; then \
+		echo "RosettaMath not found -- run 'make install_proofs'"; exit 1; \
+	fi
+	python3 -m unittest tests.test_crustos_model -v
+
 clean_proofs:
 	rm -rf $(ROSETTA_DIR)
 
@@ -1187,4 +1195,4 @@ self:
         test_micropython_modules test_micropython_emitters test_micropython_port \
         install_cpython clean_cpython test_cpython test_cpython_objects \
         install_bsd clean_bsd test_bsd test_bsd_bin test_bsd_usrbin crustos \
-        install_proofs check_proofs install_lean clean_proofs
+        install_proofs check_proofs install_lean clean_proofs test_model
