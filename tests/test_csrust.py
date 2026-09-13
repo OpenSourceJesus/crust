@@ -89,9 +89,9 @@ class TestSemantics(unittest.TestCase):
 
     The point of pinning it in a test rather than a document is that the
     decision determines what `=` means, and every later pass reads
-    assignments. If this is ever changed to refcounted reference semantics
-    (the `[Shared]` opt-in), these are the assertions that should change
-    with it -- and the failure of the rest of the suite is the bill.
+    assignments. `[Shared]` is the documented opt-in for refcounted
+    aliasing (see `test_shared_alias_runs`); default classes stay
+    single-owner values.
     """
 
     def test_class_is_a_value_with_one_owner(self):
@@ -109,13 +109,53 @@ class TestSemantics(unittest.TestCase):
         # The destructor is called, by name, on the ordinary exit path.
         self.assertIn("R_drop", c)
 
-    def test_shared_is_reserved_and_refused_rather_than_ignored(self):
-        # The opt-in named in §1 is not built. It must not silently lower as
-        # if it were absent -- that would be the "silently-wrong stub" this
-        # project's TRANSPILER.md rules out.
-        msg = refusal("[Shared]\npublic class N { public int n; }\n")
-        self.assertIn("Shared", msg)
-        self.assertIn("not built yet", msg)
+    def test_shared_aliases_through_refcount(self):
+        # §1 (c): `[Shared]` is the opt-in for reference semantics. Assignment
+        # aliases; both names see one object. Cycles may leak -- that is the
+        # documented cost of the opt-in.
+        src = ("[Shared]\n"
+               "public class Node {\n"
+               "    public int v;\n"
+               "    public Node() { v = 0; }\n"
+               "    public void set(int x) { v = x; }\n"
+               "    public int get() { return v; }\n"
+               "}\n"
+               "public class Prog {\n"
+               "    public int Run() {\n"
+               "        Node a = new Node();\n"
+               "        Node b = a;\n"
+               "        b.set(7);\n"
+               "        return a.get();\n"
+               "    }\n"
+               "}\n")
+        c = lower(src)
+        self.assertTrue(
+            ("shared_ptr" in c) or ("Node_copy" in c) or ("use_count" in c),
+            c[-600:])
+        self.assertIn("Node_set", c)
+        self.assertIn("Node_get", c)
+
+    @needs_cc
+    def test_shared_alias_runs(self):
+        src = ("[Shared]\n"
+               "public class Node {\n"
+               "    public int v;\n"
+               "    public Node() { v = 0; }\n"
+               "    public void set(int x) { v = x; }\n"
+               "    public int get() { return v; }\n"
+               "}\n"
+               "public class Prog {\n"
+               "    public int Run() {\n"
+               "        Node a = new Node();\n"
+               "        Node b = a;\n"
+               "        b.set(7);\n"
+               "        return a.get();\n"
+               "    }\n"
+               "}\n")
+        c = lower(src)
+        self.assertEqual(
+            run_c(c, "int main(void) { Prog p; return Prog_Run(&p); }"),
+            7)
 
 
 class TestClassLowering(unittest.TestCase):
@@ -336,6 +376,154 @@ class TestRefusals(unittest.TestCase):
                   "    public void F() { }\n"
                   "}\n")
         self.assertIn("A_F(A *this)", c)
+
+
+class TestGenerics(unittest.TestCase):
+    """C# generics are templates with no specialisation -- monomorphise."""
+
+    def test_class_becomes_a_template(self):
+        cpp = cs2cpp.translate(
+            "public class Box<T> { public T v; }\n", "t.cs")
+        self.assertIn("template<typename T> class Box", cpp)
+
+    @needs_cc
+    def test_monomorphised_box_runs(self):
+        src = ("public class Box<T> {\n"
+               "    public T v;\n"
+               "    public Box(T x) { v = x; }\n"
+               "    public T Get() { return v; }\n"
+               "}\n"
+               "public class Prog {\n"
+               "    public int Run() {\n"
+               "        Box<int> b = new Box<int>(7);\n"
+               "        return b.Get();\n"
+               "    }\n"
+               "}\n")
+        self.assertEqual(
+            run_c(lower(src),
+                  "int main(void) { Prog p; return Prog_Run(&p); }"),
+            7)
+
+    def test_list_is_vector(self):
+        cpp = cs2cpp.translate(
+            "public class A { public void F(List<int> xs) { } }\n", "t.cs")
+        self.assertIn("std::vector<int>", cpp)
+
+    def test_dictionary_is_map(self):
+        cpp = cs2cpp.translate(
+            "public class A { public void F(Dictionary<int, int> m) { } }\n",
+            "t.cs")
+        self.assertIn("std::map<", cpp)
+
+
+class TestProperties(unittest.TestCase):
+
+    def test_auto_property_desugars(self):
+        cpp = cs2cpp.translate(
+            "public class A { public int Count { get; set; } }\n", "t.cs")
+        self.assertIn("get_Count", cpp)
+        self.assertIn("set_Count", cpp)
+        self.assertIn("_Count", cpp)
+
+    @needs_cc
+    def test_property_runs(self):
+        src = ("public class Box {\n"
+               "    public int Count { get; set; }\n"
+               "    public Box() { }\n"
+               "    public int Bump() {\n"
+               "        this.Count = this.Count + 1;\n"
+               "        return this.Count;\n"
+               "    }\n"
+               "}\n")
+        c = lower(src)
+        self.assertEqual(
+            run_c(c, "int main(void) { Box b; Box_new(&b);"
+                     " Box_set_Count(&b, 41); return Box_Bump(&b); }"),
+            42)
+
+
+class TestExcept(unittest.TestCase):
+
+    def test_throw_becomes_raise(self):
+        cpp = cs2cpp.translate(
+            "public class A {\n"
+            "    public int F(int x) {\n"
+            "        if (x < 0) { throw 42; }\n"
+            "        return x;\n"
+            "    }\n"
+            "}\n", "t.cs")
+        self.assertIn("raise", cpp)
+        self.assertIn("except", cpp)
+        self.assertNotIn("throw", cpp)
+
+    @needs_cc
+    def test_raise_sets_the_flag(self):
+        src = ("public class A {\n"
+               "    public int F(int x) {\n"
+               "        if (x < 0) { throw 42; }\n"
+               "        return x * 2;\n"
+               "    }\n"
+               "}\n")
+        c = lower(src)
+        # Call through a C driver that checks the except flag after F.
+        main = (
+            "int main(void) {\n"
+            "  A a; int r = A_F(&a, -1);\n"
+            "  if (!_cpp_exc.flag) return 1;\n"
+            "  if (_cpp_exc.val != 42) return 2;\n"
+            "  (void)r; return 0;\n"
+            "}\n")
+        self.assertEqual(run_c(c, main), 0)
+
+
+class TestSugar(unittest.TestCase):
+
+    def test_this_dot_becomes_arrow(self):
+        cpp = cs2cpp.translate(
+            "public class A { public int n; public void F() { this.n = 1; } }\n",
+            "t.cs")
+        self.assertIn("this->n", cpp)
+
+    def test_delegate_is_a_function_pointer(self):
+        cpp = cs2cpp.translate("public delegate int D(int x);\n", "t.cs")
+        self.assertIn("typedef int (*D)(int x);", cpp)
+
+    def test_lambda_becomes_cpp_lambda(self):
+        cpp = cs2cpp.translate(
+            "public class A {\n"
+            "    public int F() { return ((int x) => x + 1)(3); }\n"
+            "}\n", "t.cs")
+        self.assertIn("[](int x) { return x + 1; }", cpp)
+
+
+class TestDigest(unittest.TestCase):
+    """C# joins the same --emit-decls digest as C++ / rpython (CPPRPY.md)."""
+
+    def test_emit_decls_names_the_class(self):
+        import json
+        tmp = tempfile.mkdtemp(prefix="csdecls-")
+        try:
+            src = os.path.join(tmp, "shape.cs")
+            with open(src, "w") as f:
+                f.write("public class Shape {\n"
+                        "    public virtual int Area() { return 0; }\n"
+                        "}\n")
+            out_c = os.path.join(tmp, "shape.c")
+            decls = os.path.join(tmp, "shape.decls.json")
+            proc = subprocess.run(
+                [sys.executable, "tools/csrust.py", src, "-o", out_c,
+                 "--emit-decls", decls],
+                cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(proc.returncode, 0, proc.stderr.decode())
+            self.assertTrue(os.path.isfile(decls))
+            with open(decls) as f:
+                data = json.load(f)
+            # Digest shape matches cpprust: a list/dict of class records.
+            blob = json.dumps(data)
+            self.assertIn("Shape", blob)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":
