@@ -64,6 +64,7 @@ Main Crust Documentation:
 - [CRUST.md](CRUST.md) C+Rust
 - [CPPRUST.md](CPPRUST.md) C+C++Rust
 - [CSRUST.md](CSRUST.md) C# subset → C++ subset → Rust/C (`cs2cpp` + `cpprust`)
+- [UNITY_PACK.md](UNITY_PACK.md) packed `engine.c`/`data.c` from a Unity-subset scene
 - [SHIVYCX.md](SHIVYCX.md) SHIVYC-X (C Compiler)
 - [CPP2RUST.md](CPP2RUST.md) C++ to Rust translator
 - [TRANSPILER.md](TRANSPILER.md) the Python→C transpiler (`py2c.py`)
