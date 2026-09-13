@@ -63,6 +63,7 @@ deliverable.
 Main Crust Documentation: 
 - [CRUST.md](CRUST.md) C+Rust
 - [CPPRUST.md](CPPRUST.md) C+C++Rust
+- [CSRUST.md](CSRUST.md) C# subset → C++ subset → Rust/C (`cs2cpp` + `cpprust`)
 - [SHIVYCX.md](SHIVYCX.md) SHIVYC-X (C Compiler)
 - [CPP2RUST.md](CPP2RUST.md) C++ to Rust translator
 - [TRANSPILER.md](TRANSPILER.md) the Python→C transpiler (`py2c.py`)
