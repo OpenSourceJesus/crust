@@ -28,13 +28,14 @@ from shivyc.tokens import Token, parse_c_int
 from shivyc.errors import error_collector, CompilerError, Position, Range
 
 
-# Where lowered `.cpp` sources are staged. Same convention as the rpython
-# include cache: a fixed root under /tmp, overridable for sandboxed builds.
+# Where lowered `.cpp` / `.cs` sources are staged. Same convention as the
+# rpython include cache: a fixed root under /tmp, overridable for sandboxed
+# builds.
 CPP_CACHE_ROOT = os.environ.get("CRUST_CPP_CACHE", "/tmp/crust-cpp")
 
 
-def _cpprust_script():
-    """Path to tools/cpprust.py, or "" if it cannot be found.
+def _tool_script(basename, env_var):
+    """Path to tools/<basename>.py, or "" if it cannot be found.
 
     Two layouts have to work. On the host, `__file__` is `.../shivyc/
     preproc.py`, so the repo root is two directories up. Self-hosted, py2c
@@ -44,16 +45,24 @@ def _cpprust_script():
     working directory, and an explicit override for installs where the
     compiler does not sit next to its sources.
     """
-    env = os.environ.get("CRUST_CPPRUST")
+    env = os.environ.get(env_var)
     if env:
         return env if os.path.exists(env) else ""
     here = os.path.dirname(os.path.abspath(__file__))
     roots = [os.path.dirname(here), here, os.getcwd()]
     for root in roots:
-        cand = os.path.join(root, "tools", "cpprust.py")
+        cand = os.path.join(root, "tools", basename)
         if os.path.exists(cand):
             return cand
     return ""
+
+
+def _cpprust_script():
+    return _tool_script("cpprust.py", "CRUST_CPPRUST")
+
+
+def _csrust_script():
+    return _tool_script("csrust.py", "CRUST_CSRUST")
 
 
 def _read_or(path, fallback):
@@ -66,8 +75,8 @@ def _read_or(path, fallback):
         return fallback
 
 
-def _run_cpprust(filename, text):
-    """Lower a `.cpp` include out-of-process.
+def _run_transpiler(script, filename, text, tag):
+    """Lower a language-subset include out-of-process.
 
     Returns `(True, lowered_source)` or `(False, diagnostic)`.
 
@@ -77,10 +86,9 @@ def _run_cpprust(filename, text):
     below: it drives the child through `os.system`, where capturing a pipe is
     not available.
     """
-    script = _cpprust_script()
     if not script:
-        return False, ("cannot find tools/cpprust.py; set $CRUST_CPPRUST to "
-                       "its path")
+        return False, ("cannot find tools/%s; set $CRUST_CPPRUST / "
+                       "$CRUST_CSRUST to its path" % tag)
 
     try:
         os.makedirs(CPP_CACHE_ROOT)
@@ -101,8 +109,8 @@ def _run_cpprust(filename, text):
     if os.path.exists(out):
         os.remove(out)
 
-    # Which Crust types own something? A C++ class may hold one by value, and
-    # the child cannot see the unit being compiled to find out for itself.
+    # Which Crust types own something? A C++/C# class may hold one by value,
+    # and the child cannot see the unit being compiled to find out for itself.
     # Read from the module rather than threaded through every caller: the
     # Crust pass runs to completion before the preprocessor starts, so this is
     # a finished fact by the time it is read, not shared mutable state.
@@ -110,7 +118,7 @@ def _run_cpprust(filename, text):
     owned = getattr(_crust, "OWNING_TYPES", None) or {}
     spec = ",".join("%s:%s" % (n, owned[n]) for n in sorted(owned))
 
-    # Where the `.cpp` really lives, not where it was staged: its own
+    # Where the source really lives, not where it was staged: its own
     # `#include "x.h"` are relative to it, and the child expands those itself
     # so that a class declared in a header meets the definitions here.
     basedir = os.path.dirname(os.path.abspath(filename)) or "."
@@ -118,8 +126,6 @@ def _run_cpprust(filename, text):
     if sys.implementation.name != "shivyc":
         import subprocess
         cmd = [sys.executable, script, src, "-o", out, "--basedir", basedir]
-        # The same `-I` directories the C compilation was given: a C++ project
-        # keeps its headers in one and the `.cpp` says `#include "x.h"`.
         for d in _extra_include_dirs:
             cmd += ["--incdir", d]
         if spec:
@@ -131,9 +137,6 @@ def _run_cpprust(filename, text):
         except OSError as e:
             return False, "cannot run %s: %s" % (script, e)
         if proc.returncode != 0:
-            # Prefer the structured message the script writes; fall back to
-            # its stderr, which is where a crash rather than a rejected
-            # program would show up.
             msg = _read_or(out, "")
             if not msg:
                 msg = proc.stderr.decode("utf-8", "replace").strip()
@@ -154,6 +157,16 @@ def _run_cpprust(filename, text):
         return False, "produced no output"
     with open(out) as f:
         return True, f.read()
+
+
+def _run_cpprust(filename, text):
+    """Lower a `.cpp` include out-of-process."""
+    return _run_transpiler(_cpprust_script(), filename, text, "cpprust.py")
+
+
+def _run_csrust(filename, text):
+    """Lower a `.cs` include out-of-process (cs2cpp → cpprust)."""
+    return _run_transpiler(_csrust_script(), filename, text, "csrust.py")
 
 
 def process(tokens, this_file, macros=None):
@@ -1009,6 +1022,14 @@ class _Preprocessor:
                 if not ok:
                     error_collector.add(CompilerError(
                         "cpprust: %s" % text, rest[0].r))
+                    return
+            elif filename.endswith(".cs"):
+                # C# subset (issue #25): cs2cpp → cpprust, same out-of-process
+                # protocol as `.cpp`. Spelled as its own endswith for py2c.
+                ok, text = _run_csrust(filename, text)
+                if not ok:
+                    error_collector.add(CompilerError(
+                        "csrust: %s" % text, rest[0].r))
                     return
             elif filename.endswith(".py"):
                 # An rpython module: transpile it with tools/py2c.py and lex
