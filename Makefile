@@ -45,6 +45,31 @@ CPY_DEFS := -D Py_BUILD_CORE -D thread_local=_Thread_local \
 BSD_REPO ?= https://github.com/brentharts/2.11BSD-riscv
 BSD_DIR  ?= $(ROOT)/2.11BSD-riscv
 
+# ---------------------------------------------------------------------------
+# The proof kernel (see shivyc/proofs.py, SIMD_CONTRACTS.md)
+#
+# Crust certifies SIMD contracts through RosettaMath's `crustproof.py`, which
+# is a Calculus of Constructions kernel written in Python (`lean4.py`).  It is
+# named after Lean 4 and it is not Lean 4: nothing in this repo runs the Lean
+# binary, and there is no .lean file here to run it on.  So what this repo
+# needs installed is a RosettaMath checkout, not a toolchain.
+#
+# It is optional.  Without it `proofs.backend()` reports "built-in", contracts
+# are read by the compiler alone, and every unproven case keeps its scalar
+# tail -- the conservative path, never a wrong answer.
+#
+# Cloned as a sibling rather than into $(ROOT), because that is one of the
+# three places proofs.py already looks, so a plain `python3 -m shivyc` finds
+# it too and not only the targets below.
+ROSETTA_REPO ?= https://github.com/brentharts/RosettaMath
+ROSETTA_DIR  ?= $(ROOT)/../RosettaMath
+
+# proofs.py honours this ahead of the sibling and ~/RosettaMath, so overriding
+# ROSETTA_DIR on the command line points every target at a checkout anywhere.
+# If it names a directory with no crustproof.py, proofs.py moves on down its
+# own list rather than failing -- pointing this at nothing disables nothing.
+export ROSETTAMATH_DIR := $(ROSETTA_DIR)
+
 default:
 	chmod +x ./crust
 	./crust examples/crust/shapes.c -o /tmp/shapes
@@ -964,6 +989,51 @@ clean_bsd:
 	rm -rf $(BSD_DIR)
 
 # ---------------------------------------------------------------------------
+# The proof kernel.  See the ROSETTA_DIR notes near the top of this file.
+
+install_proofs:
+	@if [ -d "$(ROSETTA_DIR)/.git" ]; then \
+		echo "Updating RosettaMath in $(ROSETTA_DIR)"; \
+		git -C "$(ROSETTA_DIR)" pull --ff-only; \
+	else \
+		echo "Cloning $(ROSETTA_REPO) into $(ROSETTA_DIR)"; \
+		git clone --depth 1 "$(ROSETTA_REPO)" "$(ROSETTA_DIR)"; \
+	fi
+	@$(MAKE) --no-print-directory check_proofs
+
+# Reports rather than fails: an absent kernel is a supported configuration,
+# not a broken one.
+check_proofs:
+	@python3 -c "import sys; sys.path.insert(0, 'shivyc'); import proofs; \
+	  b = proofs.backend(); \
+	  print('proof kernel: %s' % b); \
+	  print('  a contract at length 64 is %s' \
+	        % proofs.evidence(64, {'len>=': 64, 'div-by': 4})); \
+	  sys.stdout.write('' if b != 'built-in' else \
+	    '  RosettaMath not found -- run \"make install_proofs\"\n')"
+
+# Crust never invokes the Lean binary; only RosettaMath does, for its own
+# CrustOS.lean supplement.  This delegates rather than carrying a second copy
+# of that installer, so there is one of it to maintain.
+install_lean: install_proofs
+	@if [ -f "$(ROSETTA_DIR)/Makefile" ] && \
+	   $(MAKE) -C "$(ROSETTA_DIR)" -n install_lean >/dev/null 2>&1; then \
+		echo; \
+		echo 'Note: Crust itself does not run the Lean binary -- its'; \
+		echo 'contract kernel is RosettaMath lean4.py, which is Python and'; \
+		echo 'is already installed by the step above.  Installing a real'; \
+		echo 'toolchain for RosettaMath make crustos_eq:'; \
+		echo; \
+		$(MAKE) -C "$(ROSETTA_DIR)" install_lean; \
+	else \
+		echo "no install_lean in $(ROSETTA_DIR) -- update RosettaMath"; \
+		exit 1; \
+	fi
+
+clean_proofs:
+	rm -rf $(ROSETTA_DIR)
+
+# ---------------------------------------------------------------------------
 # Bare-metal demos
 #
 # Compile a freestanding ShivyCX app and link it against the inlined mini-OS
@@ -1116,4 +1186,5 @@ self:
         test_micropython_core test_micropython_objects \
         test_micropython_modules test_micropython_emitters test_micropython_port \
         install_cpython clean_cpython test_cpython test_cpython_objects \
-        install_bsd clean_bsd test_bsd test_bsd_bin test_bsd_usrbin crustos
+        install_bsd clean_bsd test_bsd test_bsd_bin test_bsd_usrbin crustos \
+        install_proofs check_proofs install_lean clean_proofs
