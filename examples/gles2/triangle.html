@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>Crust GLES2 triangle (wasm + WebGL)</title>
+<style>
+  body { font: 14px/1.4 monospace; margin: 1.5rem; background: #111; color: #ddd; }
+  canvas { image-rendering: pixelated; width: 256px; height: 128px;
+           border: 1px solid #444; background: #000; vertical-align: top; }
+  pre { white-space: pre; }
+</style>
+<h1>Crust GLES2 → wasm → WebGL</h1>
+<p>Same <code>examples/gles2/triangle.c</code> as the native surfaceless
+path, compiled with <code>--target wasm</code>. EGL is stubbed in JS; GL
+entry points go to WebGL.</p>
+<p>
+  <button id="run">Load build/gles2_triangle.wasm</button>
+  <input id="file" type="file" accept=".wasm">
+</p>
+<canvas id="view" width="64" height="32"></canvas>
+<pre id="log"></pre>
+<script src="../../tools/gles2_wasm_host.js"></script>
+<script>
+const logEl = document.getElementById('log');
+const canvas = document.getElementById('view');
+function log(s) { logEl.textContent += s; }
+
+async function runBytes(bytes) {
+  logEl.textContent = '';
+  let memory = null;
+  let exitCode = 0;
+  class ExitSignal extends Error {}
+
+  const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+  if (!gl || !globalThis.CrustGLES) {
+    log('Need WebGL and tools/gles2_wasm_host.js.\n'
+      + 'Or run under node with the soft host:\n'
+      + '  node tools/gles2_wasm_run.js build/gles2_triangle.wasm\n');
+    return;
+  }
+
+  const wasi = {
+    fd_write(fd, iovsPtr, iovsLen, nwrittenPtr) {
+      const dv = new DataView(memory.buffer);
+      const u8 = new Uint8Array(memory.buffer);
+      let total = 0, text = '';
+      for (let i = 0; i < iovsLen; i++) {
+        const base = iovsPtr + i * 8;
+        const ptr = dv.getUint32(base, true);
+        const len = dv.getUint32(base + 4, true);
+        text += new TextDecoder().decode(u8.subarray(ptr, ptr + len));
+        total += len;
+      }
+      log(text);
+      dv.setUint32(nwrittenPtr, total, true);
+      return 0;
+    },
+    proc_exit(code) { exitCode = code; throw new ExitSignal(); },
+  };
+
+  const env = CrustGLES.createEnv(() => memory, { gl });
+  const { instance } = await WebAssembly.instantiate(bytes, {
+    wasi_snapshot_preview1: wasi,
+    env,
+  });
+  memory = instance.exports.memory;
+  try {
+    instance.exports._start();
+  } catch (e) {
+    if (!(e instanceof ExitSignal)) throw e;
+  }
+  log('\n(exit ' + (exitCode & 0xff) + ')\n');
+}
+
+document.getElementById('run').onclick = async () => {
+  try {
+    const resp = await fetch('../../build/gles2_triangle.wasm');
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    await runBytes(await resp.arrayBuffer());
+  } catch (e) {
+    log('fetch build/gles2_triangle.wasm failed: ' + e + '\n'
+      + 'Build, then serve the repo root:\n'
+      + '  python3 crust --target wasm examples/gles2/triangle.c '
+      + '-o build/gles2_triangle.wasm\n'
+      + '  python3 -m http.server\n');
+  }
+};
+document.getElementById('file').onchange = async (ev) => {
+  const f = ev.target.files[0];
+  if (f) await runBytes(await f.arrayBuffer());
+};
+</script>
