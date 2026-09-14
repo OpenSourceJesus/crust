@@ -71,6 +71,7 @@ Main Crust Documentation:
 - [REGEX.md](REGEX.md) one regex engine, shared by C, C++, RPython and minipy
 - [BUILDTOOLS.md](BUILDTOOLS.md) lowering `tools/` to native binaries
 - [WASM.md](WASM.md) the WebAssembly back end (`--target wasm`)
+- [GLES2.md](GLES2.md) OpenGL ES 2.0 — native surfaceless and wasm/WebGL
 - [examples/wireproto/README.md](examples/wireproto/README.md) dual FE/BE compile + binary protocol
 
 Hardware:
