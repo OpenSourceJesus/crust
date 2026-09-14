@@ -1,17 +1,57 @@
 # OpenGL ES 2.0
 
-Crust compiles and runs real GLES2 against the system driver. A shader
-pipeline -- vertex and fragment stages, a vertex buffer, a framebuffer object,
-pixel readback -- goes through ShivyCX with no external compiler involved in
-the C.
+Crust compiles and runs real GLES2 against the system driver, and the same
+example under `--target wasm` with GL entry points imported from the host.
+
+## Native
+
+A shader pipeline -- vertex and fragment stages, a vertex buffer, a framebuffer
+object, pixel readback -- goes through ShivyCX with no external compiler
+involved in the C.
 
 ```sh
 python3 crust examples/gles2/triangle.c -o build/gles2_triangle -lEGL -lGLESv2
 EGL_PLATFORM=surfaceless ./build/gles2_triangle out.ppm
 ```
 
-On Mesa 25.2 that prints a Gouraud-shaded triangle and writes a 64x32 PPM,
+On Mesa that prints a Gouraud-shaded triangle and writes a 64x32 PPM,
 with no display, no X server and no `/dev/dri`.
+
+```sh
+make test_gles2          # headers vs Khronos + gcc/ShivyCX pixel match
+```
+
+## WASM
+
+Under `--target wasm` the same translation unit becomes a module whose
+`egl*` / `gl*` calls are `env` imports. A Node host fills them with a small
+software GLES2 (no GPU, no npm deps); a browser page can point the same
+imports at WebGL instead.
+
+```sh
+python3 crust --target wasm examples/gles2/triangle.c -o build/gles2_triangle.wasm
+node tools/gles2_wasm_run.js build/gles2_triangle.wasm
+make test_gles2_wasm
+```
+
+| file | role |
+|---|---|
+| `tools/gles2_wasm_host.js` | soft GLES2 (+ optional WebGL backend) |
+| `tools/gles2_wasm_run.js` | WASI + soft host runner for node |
+| `tools/gles2_wasm_test.py` | compile, validate, require non-blank RGB ASCII |
+| `examples/gles2/triangle.html` | load the `.wasm` and drive WebGL in a browser |
+
+stdio `fprintf` / `fopen` are not used on the wasm path: Crust's wasm
+varargs import ABI does not yet match a hosted `fprintf`, so the example
+selects `<wasi.h>` under `__wasm__` and skips PPM file output (ASCII still
+goes to stdout).
+
+Serve the repo root and open the HTML page after building the module:
+
+```sh
+python3 -m http.server
+# → examples/gles2/triangle.html
+```
 
 ## What was actually needed
 
@@ -46,7 +86,8 @@ it buys nothing. libglvnd's `libGLESv2.so.2` exports all 358 GLES2 entry
 points and `libGL.so.1` exports 3470, so plain `extern` declarations resolve
 at link time like any other library. A loader becomes necessary the moment
 this moves to a platform where that is not true, and that is the point at
-which to write one, not before.
+which to write one, not before. Under wasm the "loader" is the host's
+`env` object: every declared-but-undefined `gl*` becomes an import.
 
 ## Surfaceless, and why
 
@@ -59,13 +100,14 @@ is pixels in memory, so the whole path is checkable by a test rather than by
 looking at it, and it runs in a container with no GPU. The environment
 variable is required because libglvnd's build-time default platform is x11;
 without it `eglInitialize` fails with `EGL_NOT_INITIALIZED` and the example
-says so.
+says so. The wasm soft host stubs EGL and does not need the variable.
 
 ## Testing
 
 ```sh
 python3 tools/gles2_header_test.py
 python3 tools/gles2_header_test.py --mutate
+python3 tools/gles2_wasm_test.py
 ```
 
 Headers declaring somebody else's ABI are not self-checking. A constant with
@@ -100,6 +142,10 @@ The constant and prototype checks need the Khronos headers (`libgles-dev`)
 and the render check needs a software rasteriser; each skips with a stated
 reason rather than passing quietly when its prerequisite is absent.
 
+The wasm check is separate: it does not compare pixels to Mesa (the soft host
+is not the system driver). It requires a validating module, exit status 0, and
+ASCII art that contains R, G and B cells.
+
 ## Limits
 
 State these rather than discover them later.
@@ -127,6 +173,10 @@ State these rather than discover them later.
 
 * **`shivyc/include` has no `dlfcn.h`**, so `dlopen`-based driver loading is
   not available as an alternative route.
+
+* **Wasm soft host is a subset.** It implements what the triangle example
+  calls (FBO, VBO, one draw, readback). It is not a general GLES2
+  implementation; WebGL is the path for a real GPU in the browser.
 
 ## An unrelated defect found on the way
 

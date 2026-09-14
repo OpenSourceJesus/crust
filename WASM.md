@@ -165,6 +165,11 @@ function called `fd_write`) is imported from `wasi_snapshot_preview1`;
 everything else comes from `env`, which is the convention a plain JS host
 expects.
 
+OpenGL ES fits that second bucket: `#include <GLES2/gl2.h>` under
+`--target wasm` turns every `gl*` / `egl*` call into an `env` import. See
+[GLES2.md](GLES2.md) for the soft Node host and the WebGL browser path
+(`make test_gles2_wasm`).
+
 Imports occupy the low end of the function index space, ahead of every defined
 function. That forces a scan for undefined calls *before* the first function is
 declared -- discovering an import while emitting a body would shift every

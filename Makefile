@@ -152,6 +152,16 @@ test_freebsd:
 test_wireproto:
 	python3 tools/wireproto_test.py
 
+# OpenGL ES 2.0: headers vs Khronos + native surfaceless render, then the
+# same example under --target wasm with the soft GLES host (no GPU).
+#     make test_gles2
+#     make test_gles2_wasm
+test_gles2:
+	python3 tools/gles2_header_test.py
+
+test_gles2_wasm:
+	python3 tools/gles2_wasm_test.py
+
 SEED  ?= 1
 COUNT ?= 200
 fuzz_wasm:
