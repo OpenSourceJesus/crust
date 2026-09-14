@@ -60,6 +60,12 @@ _ARITH = {
     ilmath.Add: "+",
     ilmath.Subtr: "-",
     ilmath.Mult: "*",
+    # Nat division floors and `divb n 0` is 0, which is what C leaves
+    # undefined; the model says 0 where the machine says nothing.  The
+    # same distance as truncated subtraction, and stated for the same
+    # reason.
+    ilmath.Div: "//",
+    ilmath.Mod: "%",
 }
 _COMPARE = {
     compare.LessCmp: "<",
@@ -145,6 +151,21 @@ class _Lifter:
             if kind in _ARITH:
                 text = "(%s %s %s)" % (self.expr(cmd.arg1), _ARITH[kind],
                                        self.expr(cmd.arg2))
+                self.record(cmd.output, text, out)
+                continue
+            if kind is ilmath.RBitShift:
+                # On a non-negative value `x >> k` is exactly `x / 2**k`, so
+                # this one is faithful rather than a model: no truncation and
+                # no wrap, because a right shift cannot overflow.  The shift
+                # amount has to be a literal for `2**k` to be a numeral; a
+                # computed one is refused rather than approximated.
+                if cmd.arg2.literal is None:
+                    raise LiftError(
+                        "a right shift by a computed amount has no lifting "
+                        "yet: the shift must be a literal, so that the "
+                        "divisor is a numeral")
+                shift = int(cmd.arg2.literal.val)
+                text = "(%s // %d)" % (self.expr(cmd.arg1), 2 ** shift)
                 self.record(cmd.output, text, out)
                 continue
             if kind in _COMPARE:
