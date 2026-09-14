@@ -98,13 +98,22 @@ int clamp(int x, int hi) { if (x > hi) { x = hi; } else { x = x + 0; } return x;
 int guard(int x) { if (x == 0) return 7; return x; }
 int noelse(int x) { if (x > 3) x = 3; return x; }
 int nested(int n) { int s = 0; for (int i = 0; i < n; i++) { if (i > 2) s = s + i; else s = s + 1; } return s; }
+int shifted(int x) { return x >> 3; }
+int divided(int x, int d) { return x / d; }
+int modded(int x, int d) { return x % d; }
 """
+# Non-negative only, and no zero divisor: the lift is over Nat, and C says
+# nothing about either case.  Exercising them here would be testing the
+# distance rather than the agreement.
 INPUTS = {
     "sum_to": [(0,), (1,), (5,)],
     "clamp": [(3, 9), (9, 3), (4, 4)],
     "guard": [(0,), (5,)],
     "noelse": [(1,), (8,)],
     "nested": [(0,), (3,), (6,)],
+    "shifted": [(0,), (7,), (8,), (100,)],
+    "divided": [(0, 3), (7, 2), (12, 4), (5, 9)],
+    "modded": [(0, 3), (7, 2), (12, 4), (5, 9)],
 }
 
 
