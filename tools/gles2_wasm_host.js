@@ -546,8 +546,9 @@ function createEnv(getMemory, opts) {
   return createSoftBackend(getMemory);
 }
 
-module.exports = { createEnv, createSoftBackend, createWebGLBackend };
-// Browser pages can load this file as a classic script.
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { createEnv, createSoftBackend, createWebGLBackend };
+}
 if (typeof globalThis !== 'undefined') {
   globalThis.CrustGLES = { createEnv, createSoftBackend, createWebGLBackend };
 }
