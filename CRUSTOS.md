@@ -54,9 +54,13 @@ benchmarks; see [benchmarks/README.md](benchmarks/README.md) methodology.
 
 ## Static ELF and Crust-ELF
 
-[crustos/elf.c](crustos/elf.c) parses ELF64, maps `PT_LOAD` into a malloc'd
-image, charges frames on a `Context`, and for **ET_DYN/PIC** guests marks the
-image executable (`mprotect`) and calls the entry. Linux **ET_EXEC** static
+[crustos/elf.c](crustos/elf.c) parses ELF64, asks
+[crustos/elfcheck.py](crustos/elfcheck.py) whether the headers are ones it
+should map -- loads ascending and disjoint, entry inside a load, register
+class the scheduler sizes; `-6` if not, before anything is allocated -- then
+maps `PT_LOAD` into a malloc'd image, charges frames on a `Context`, and for
+**ET_DYN/PIC** guests marks the image executable (`mprotect`) and calls the
+entry. Linux **ET_EXEC** static
 binaries are loaded and described but not jumped to (absolute VAs).
 
 **Crust-ELF register hints** (faster context switches):
@@ -80,6 +84,7 @@ Example guest: [examples/crustos/hello_guest.c](examples/crustos/hello_guest.c).
 |---|---|---|
 | `vendor/kernel`, `vendor/relibc` | Rust (upstream) | genuine Redox source, compiled by Crust |
 | `crustos/schemes.py` | rpython | URL parsing, routing tables, listings (`gpu:` stub included) |
+| `crustos/elfcheck.py` | rpython | what the loader checks before it maps; proved, see [LEAN.md](LEAN.md) |
 | `crustos/kernel.c` + `elf.c` | Rust + C | frames, contexts, scheduler, syscalls, ELF load |
 
 **rpython** gets text and list work. **Rust** gets fixed layouts and hot loops.

@@ -1047,6 +1047,50 @@ test_ilproof:
 	fi
 	python3 -m unittest tests.test_ilproof -v
 
+# The ELF validator: crustos/elfcheck.py against its proved model, compiled
+# by ShivyCX, and wired into elf.c on real and corrupted ELFs.  Same
+# dependency; a few seconds.  The Lean case is skipped without `lean`.
+test_elfcheck:
+	@if [ ! -f "$(ROSETTA_DIR)/elfcheck_eq.py" ]; then \
+		echo "RosettaMath not found or too old -- run 'make install_proofs'"; exit 1; \
+	fi
+	python3 -m unittest tests.test_elfcheck_model -v
+
+# LeanOS's region list against its proved model; see leanos/LEANOS.md.
+test_memmap:
+	@if [ ! -f "$(ROSETTA_DIR)/memmap_eq.py" ]; then \
+		echo "RosettaMath not found or too old -- run 'make install_proofs'"; exit 1; \
+	fi
+	python3 -m unittest tests.test_memmap_model -v
+
+# LeanOS threads as records over the region list; see leanos/LEANOS.md.
+test_threads:
+	@if [ ! -f "$(ROSETTA_DIR)/threads_eq.py" ]; then \
+		echo "RosettaMath not found or too old -- run 'make install_proofs'"; exit 1; \
+	fi
+	python3 -m unittest tests.test_threads_model -v
+
+# LeanOS per-thread bump allocator; see leanos/LEANOS.md.
+test_alloc:
+	@if [ ! -f "$(ROSETTA_DIR)/alloc_eq.py" ]; then \
+		echo "RosettaMath not found or too old -- run 'make install_proofs'"; exit 1; \
+	fi
+	python3 -m unittest tests.test_alloc_model -v
+
+# LeanOS loader: the ELF theorem and the memory theorem as one check.
+test_loader:
+	@if [ ! -f "$(ROSETTA_DIR)/loader_eq.py" ]; then \
+		echo "RosettaMath not found or too old -- run 'make install_proofs'"; exit 1; \
+	fi
+	python3 -m unittest tests.test_loader_model -v
+
+# LeanOS switcher: C, lifted from the compiled IL, proved from the lift.
+test_switch:
+	@if [ ! -f "$(ROSETTA_DIR)/hoare.py" ]; then \
+		echo "RosettaMath not found -- run 'make install_proofs'"; exit 1; \
+	fi
+	python3 -m unittest tests.test_switch_lift -v
+
 clean_proofs:
 	rm -rf $(ROSETTA_DIR)
 
@@ -1204,5 +1248,5 @@ self:
         test_micropython_modules test_micropython_emitters test_micropython_port \
         install_cpython clean_cpython test_cpython test_cpython_objects \
         install_bsd clean_bsd test_bsd test_bsd_bin test_bsd_usrbin crustos \
-        install_proofs check_proofs install_lean clean_proofs test_model \
+        install_proofs check_proofs install_lean clean_proofs test_model test_elfcheck test_memmap test_threads test_alloc test_loader test_switch \
         test_ilproof

@@ -134,11 +134,101 @@ refuses rather than approximates: `goto`, `break`, `switch`, pointers,
 structs, calls and `void` all come back as a `LiftError` naming the
 construct.
 
-**What is not reached.** 8 of the kernel's 107 functions lift. The tally of
-refusals is the roadmap, and it is nearly one item: 92 of 99 are `ReadAt`,
+A right shift by a literal lifts as division by the power of two --
+`addr >> A::PAGE_SHIFT` is `addr // 4096` -- and for once the claim is not a
+model: on an unsigned value the two are the same number, with no truncation
+and no wrap. That reaches the kernel's two `frame_of` functions, the ones the
+heap sizes itself from. `/` and `%` lift with it, with `x // 0` being 0 in the
+model where C leaves it undefined. `divb` in the prelude is `modb`'s counter
+incrementing where `modb` resets, so it needs no well-founded recursion
+either, and Lean accepts it.
+
+What it cannot yet do is *prove* anything about `frame_of`. The lifted
+function is fine; `frame_of(8192) == 2` should be settled by computation and
+is not, because `normalize` opens the definition under its binder, where
+`divb addr 4096` has a free variable and cannot accelerate, and the step
+function's `eqb _ 4096` unfolds `leb` four thousand levels deep. Closed
+evaluation is not the problem -- `divb 131072 65536` is 0.66s -- the
+unfolding order is, and that is a `lean4.py` matter, not a `hoare.py` one.
+
+**What is not reached.** 10 of the kernel's 107 functions lift. The tally of
+refusals is the roadmap, and it is nearly one item: 93 of 97 are `ReadAt`,
 `AddrOf` and `SetAt` -- memory access. The kernel's stateful functions
 (`schedule`, `spawn`, `sys_open`) read and write fields of `Kernel` and
 `Context` through pointers, and lifting those means lifting struct access
 into the record types `hoare.py` already has (`Context.with_ticks`,
 `state_invariant`). That is the step that would connect this to the modelled
 `Context` from the other direction, and it is the next one.
+
+## 4. The loader
+
+`crustos/elfcheck.py` is what `elf.c` asks before it maps an ELF: are the
+`PT_LOAD`s ascending and disjoint, is the entry inside one, is the register
+hint a class the scheduler sizes. It is rpython, it decides rather than
+dereferences, and it is the first thing in the tree written *for* the proof
+side rather than modelled after the fact -- every result is 1 or 0, every
+loop counts up, every list is read only behind a length check, and
+`reg_class_ok`'s guard is `<=` rather than `>` so that the guard is the
+theorem. Linux runs an ELF with no such check; so did this loader until
+`elf_load_path` learned to return `-6`.
+
+```sh
+make test_elfcheck      # the validator, four ways, and the loader on real ELFs
+```
+
+RosettaMath's `elfcheck_eq.py` is the same four functions for the kernel,
+with two theorems Lean 4 accepts with no axioms:
+
+```
+reg_class_sized : ∀ cls, reg_class_ok cls == 1 → cls <= 3
+accept_sized    : ∀ v m e cls, accept_image v m e cls == 1 → cls <= 3
+```
+
+The second composes with `elf_regs_bounded` from section 3: an image the
+loader accepts has a class the scheduler sizes, and that sizing is `<= 23`.
+It is the first theorem here that spans two functions of the shipped kernel.
+
+Both are guard chains and `by_every_bool` settles them, after two changes to
+how it picks a guard. It now splits the innermost open guard first, so a
+guard written in terms of another -- `accept_image` tests
+`eqb (reg_class_ok cls) 0`, and `reg_class_ok` is itself an `ite` on
+`leb cls 3` -- computes once the inner one is decided. And a guard that
+*computes* to a literal after earlier splits is written in, not split:
+splitting it would ask for a proof of the branch computation rules out, and
+there is none. Both are general; `elf_regs_bounded` and `crustos_eq` are
+unchanged under them.
+
+`tests/test_elfcheck_model.py` checks the validator the way
+`test_crustos_model.py` checks the scheme layer -- behaviour over a corpus
+through the kernel's evaluator, shape, coverage, Lean -- and two ways it
+does not. The same file is compiled by ShivyCX through `#include`, as
+`kernel.c` takes it, and compared with itself run as Python. And `elf.c` with
+the validator wired in is run on a ShivyCX-built ELF and on copies with
+corrupted headers: overlapping loads, descending loads, an entry in no load,
+an entry one past the end. Each is refused before anything is mapped. Before
+the validator, every one of them loaded, and for the entry a megabyte past a
+16 KB image `elf_run_guest_fn` would have jumped there.
+
+**What is claimed, and what is not.** The theorems are about the register
+class. The theorems the loader wants -- accepted implies no two loads
+overlap, accepted implies the entry is inside a load -- are facts about the
+loops in `loads_ordered` and `entry_in_load`, and those need the
+loop-invariant machinery `crustos_eq.py` spends sixty lines on for
+`accepted`. Both loops are modelled, with their invariants and variants, and
+are in the Lean export with their `result <= 1` proved -- the first
+postconditions in this tree to go through a loop that `return`s early.
+That took two things in `hoare.py`: the lowering's `_return_value` had been
+reserved against being *read* as well as written, so no invariant could
+bound it; and there was no weak-head step for `fst`/`snd` over `mk`, which
+is the one reduction a post-pass claim needs. `early_return_bound` is the
+recipe -- entry by splitting the pre-loop guards, preservation by splitting
+the body's guards and then `_returned`, exit by splitting the final
+`_returned` -- and `leanos/memmap.py`'s three early-return loops go through
+it unchanged. The overlap theorem is the next step. The
+corpus and the four corrupted ELFs are what stand in for it meanwhile, and
+the tamper that swaps `<` for `<=` on the entry bound -- the loader's
+off-by-one -- is caught by the corpus on three rows.
+
+Addresses are `i64` in the code and Nat in the model, so `vaddr + memsz`
+wraps past 2**63 in one and not the other. A user-space image is nowhere near
+it, and it is the one distance between this file and its model.
