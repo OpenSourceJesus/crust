@@ -2400,7 +2400,13 @@ def _tlist_prelude(et):
     `{ et* data; long len, cap; }` with new/push helpers (get/len are inline
     field accesses). Used to lower rpython `list[T]` for scalar T."""
     tl = _tlist_name(et)
+    # Guarded, so that two rpython files included into one C unit -- as
+    # `kernel.c` takes `schemes.py` and `elfcheck.py`, and LeanOS takes
+    # `memmap.py` and `threads.py` -- can both use `list[i64]` without the
+    # second redefining the struct and its helpers.
     return (
+        "#ifndef %s_DEFINED\n"
+        "#define %s_DEFINED\n"
         "typedef struct %s { %s* data; long len; long cap; } %s;\n"
         "static %s* %s_new(long cap) {\n"
         "    %s* l = malloc(sizeof *l);\n"
@@ -2428,7 +2434,8 @@ def _tlist_prelude(et):
         "    free(l->data); l->data = 0; l->len = 0; l->cap = 0;\n"
         "    free(l);\n"
         "}\n"
-        % (tl, et, tl, tl, tl, tl, et, tl, tl, et, et, et, tl, tl, tl, tl))
+        "#endif\n"
+        % (tl, tl, tl, et, tl, tl, tl, tl, et, tl, tl, et, et, et, tl, tl, tl, tl))
 
 
 KNOWN_CLASSES = {}      # name -> ClassInfo
