@@ -1,12 +1,19 @@
 /* A GLES2 triangle, rendered with no window system.
  *
+ * Native:
  *     python3 crust examples/gles2/triangle.c -o build/gles2_triangle \
  *         -lEGL -lGLESv2
  *     EGL_PLATFORM=surfaceless ./build/gles2_triangle out.ppm
  *
+ * WASM (soft GLES host, no browser):
+ *     python3 crust --target wasm examples/gles2/triangle.c \
+ *         -o build/gles2_triangle.wasm
+ *     node tools/gles2_wasm_run.js build/gles2_triangle.wasm
+ *
  * Everything here goes through Crust's own <EGL/egl.h> and <GLES2/gl2.h>;
  * no system GL header is read, because the compiler has no system include
- * path. The entry points come from libEGL and libGLESv2 at link time.
+ * path. On native the entry points come from libEGL and libGLESv2 at link
+ * time; under --target wasm they become `env` imports filled by the host.
  *
  * Surfaceless means there is no default framebuffer to draw into -- the
  * context is current with EGL_NO_SURFACE, so the program must supply its own
@@ -17,16 +24,23 @@
  *
  * If EGL_PLATFORM is not set, libglvnd uses its build-time default platform
  * (x11 on a typical distribution) and eglInitialize fails with
- * EGL_NOT_INITIALIZED when no display is reachable.
+ * EGL_NOT_INITIALIZED when no display is reachable. The wasm host stubs EGL
+ * and does not need the variable.
  */
 
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
-#include <stdio.h>
-#include <stdlib.h>
 /* C says <stdio.h> defines NULL; Crust's does not yet, so ask for it
  * directly rather than depend on a header that happens to drag it in. */
 #include <stddef.h>
+#ifdef __wasm__
+/* stdio fprintf/fopen become wasm imports with a broken varargs ABI;
+ * wasi.h gives a real printf and putchar inside the module. */
+#include <wasi.h>
+#else
+#include <stdio.h>
+#include <stdlib.h>
+#endif
 
 #define WIDTH  64
 #define HEIGHT 32
@@ -71,7 +85,7 @@ static GLuint compile_stage(GLenum type, const char *src, const char *what)
         char log[1024];
         GLsizei len = 0;
         glGetShaderInfoLog(sh, (GLsizei)sizeof(log), &len, log);
-        fprintf(stderr, "%s shader failed to compile:\n%s\n", what, log);
+        printf("%s shader failed to compile:\n%s\n", what, log);
         return 0;
     }
     return sh;
@@ -101,7 +115,7 @@ static GLuint build_program(void)
         char log[1024];
         GLsizei len = 0;
         glGetProgramInfoLog(prog, (GLsizei)sizeof(log), &len, log);
-        fprintf(stderr, "program failed to link:\n%s\n", log);
+        printf("program failed to link:\n%s\n", log);
         return 0;
     }
     glDeleteShader(vs);
@@ -129,34 +143,34 @@ static int init_egl(void)
 
     dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     if (dpy == EGL_NO_DISPLAY) {
-        fprintf(stderr, "eglGetDisplay failed\n");
+        printf("eglGetDisplay failed\n");
         return 0;
     }
     if (!eglInitialize(dpy, &major, &minor)) {
-        fprintf(stderr, "eglInitialize failed (0x%X) -- "
-                        "is EGL_PLATFORM=surfaceless set?\n", eglGetError());
+        printf("eglInitialize failed (0x%X) -- "
+               "is EGL_PLATFORM=surfaceless set?\n", eglGetError());
         return 0;
     }
     if (!eglBindAPI(EGL_OPENGL_ES_API)) {
-        fprintf(stderr, "eglBindAPI failed (0x%X)\n", eglGetError());
+        printf("eglBindAPI failed (0x%X)\n", eglGetError());
         return 0;
     }
     if (!eglChooseConfig(dpy, cfg_attribs, &cfg, 1, &num_config)
         || num_config < 1) {
-        fprintf(stderr, "no matching EGLConfig\n");
+        printf("no matching EGLConfig\n");
         return 0;
     }
     ctx = eglCreateContext(dpy, cfg, EGL_NO_CONTEXT, ctx_attribs);
     if (ctx == EGL_NO_CONTEXT) {
-        fprintf(stderr, "eglCreateContext failed (0x%X)\n", eglGetError());
+        printf("eglCreateContext failed (0x%X)\n", eglGetError());
         return 0;
     }
     if (!eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx)) {
-        fprintf(stderr, "eglMakeCurrent failed (0x%X)\n", eglGetError());
+        printf("eglMakeCurrent failed (0x%X)\n", eglGetError());
         return 0;
     }
-    fprintf(stderr, "EGL %d.%d, GLES %s\n", (int)major, (int)minor,
-            (const char *)glGetString(GL_VERSION));
+    printf("EGL %d.%d, GLES %s\n", (int)major, (int)minor,
+           (const char *)glGetString(GL_VERSION));
     return 1;
 }
 
@@ -173,7 +187,7 @@ static int init_fbo(void)
     glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                               GL_RENDERBUFFER, rbo);
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
-        fprintf(stderr, "framebuffer incomplete\n");
+        printf("framebuffer incomplete\n");
         return 0;
     }
     return 1;
@@ -210,13 +224,14 @@ static void read_back(void)
     glReadPixels(0, 0, WIDTH, HEIGHT, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
 }
 
+#ifndef __wasm__
 static int write_ppm(const char *path)
 {
     FILE *f = fopen(path, "wb");
     int y, x;
 
     if (!f) {
-        fprintf(stderr, "cannot open %s\n", path);
+        printf("cannot open %s\n", path);
         return 0;
     }
     fprintf(f, "P6\n%d %d\n255\n", WIDTH, HEIGHT);
@@ -232,6 +247,7 @@ static int write_ppm(const char *path)
     fclose(f);
     return 1;
 }
+#endif
 
 static void print_ascii(void)
 {
@@ -269,7 +285,12 @@ int main(int argc, char **argv)
     read_back();
     print_ascii();
 
+#ifndef __wasm__
     if (argc > 1 && !write_ppm(argv[1]))
         return 1;
+#else
+    (void)argc;
+    (void)argv;
+#endif
     return 0;
 }
