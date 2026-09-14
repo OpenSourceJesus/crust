@@ -6,6 +6,8 @@
  *                   allocators, architecture constants. Those objects are on
  *                   the link line; `kernel_heap_offset` below is upstream's.
  *   schemes.py      the scheme layer, in rpython.
+ *   elfcheck.py     what the loader checks before it maps, in rpython;
+ *                   modelled and proved in RosettaMath (see LEAN.md).
  *   this file       the frame allocator, context table, scheduler and
  *                   syscall dispatch, in Rust; boot in C.
  *
@@ -14,6 +16,7 @@
  * an OS you can boot. See CRUSTOS.md.
  */
 #include "schemes.py"
+#include "elfcheck.py"
 #include "elf.c"
 
 int printf(const char *, ...);

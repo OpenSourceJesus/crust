@@ -179,6 +179,38 @@ int elf_load_path(const char *path, struct ElfImage *out) {
         return -3;
     }
 
+    /* Decide before mapping.  The PT_LOADs go to crustos/elfcheck.py as two
+     * lists in file order, with the entry and the register class, and it
+     * answers yes or no: loads ascending and disjoint, entry inside one,
+     * class one the scheduler sizes.  `accept_sized` is the theorem that an
+     * accepted image's class is <= 3, checked by lean4.py and by Lean 4;
+     * tests/test_elfcheck_model.py is the corpus.  Same memsz != 0 filter
+     * as the passes above, so the validator sees exactly what is mapped. */
+    {
+        long *va = malloc(sizeof(long) * (unsigned long)eh->e_phnum);
+        long *ms = malloc(sizeof(long) * (unsigned long)eh->e_phnum);
+        _tlist_long lv, lm;
+        int ok;
+        if (!va || !ms) { free(va); free(ms); free(file); return -4; }
+        lv.data = va; lv.len = 0; lv.cap = eh->e_phnum;
+        lm.data = ms; lm.len = 0; lm.cap = eh->e_phnum;
+        for (i = 0; i < (int)eh->e_phnum; i++) {
+            struct Elf64_Phdr *ph = (struct Elf64_Phdr *)(file + eh->e_phoff
+                + (unsigned long)i * eh->e_phentsize);
+            if (ph->p_type != PT_LOAD || ph->p_memsz == 0)
+                continue;
+            va[lv.len] = (long)ph->p_vaddr;
+            ms[lm.len] = (long)ph->p_memsz;
+            lv.len++; lm.len++;
+        }
+        ok = accept_image(&lv, &lm, (long)eh->e_entry, reg_class);
+        free(va); free(ms);
+        if (!ok) {
+            free(file);
+            return -6;
+        }
+    }
+
     out->load_bias = lo;
     out->size = hi - lo;
     out->base = malloc(out->size);
