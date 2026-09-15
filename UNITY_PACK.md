@@ -96,3 +96,31 @@ with the typedef. Wasm builds one amalgamated TU via
 `tools/unity_pack_amalg_view.py` (the wasm back end does not link multiple
 files). The windowed host (`gles2_window.c`) needs `glfw3` and a display;
 it is not part of the headless test path.
+
+## SoA positions (`--soa`) — faster GPU uploads
+
+Default packing keeps positions inside each instance struct (AoS). That
+matches a compact object, but a frame that uploads every position to the
+GPU must *gather* `pos_x`/`pos_y` out of each struct — the same pattern
+Unity-style engines use.
+
+`--soa` moves positions into contiguous tables:
+
+```c
+float _Player_pos[N][2];   /* or [N][3] in 3D */
+```
+
+Script accessors still go through `Player_get_pos_x(i)` /
+`Player_set_pos_x(i, v)`, so gameplay code is unchanged. `engine_upload_positions`
+fills a flat `float[]` for the GPU: under SoA it streams the tables; under
+AoS it gathers. Opt-in so size-focused packs stay AoS and you can
+benchmark both:
+
+```
+python3 tools/unity_pack.py examples/unity_pack/MiniScene -o /tmp/aos
+python3 tools/unity_pack.py examples/unity_pack/MiniScene -o /tmp/soa --soa
+python3 tools/unity_pack_bench_upload.py
+```
+
+Bit-packed struct fields and GLSL unpacking are a later step; this slice
+is the layout + upload path only.
