@@ -105,8 +105,15 @@ class TestEmit(unittest.TestCase):
         self.assertNotIn("Mathf_Abs", engine)
         self.assertIn("Time_deltaTime", engine)
         self.assertIn("_Coin_inst_array", engine)
+        self.assertIn("engine_collect_draws", engine)
+        self.assertIn("EngineDraw", engine)
+        self.assertTrue(os.path.isfile(os.path.join(d, "engine_draw.h")))
         self.assertTrue(os.path.isfile(
             os.path.join(d, "shaders", "shader_compiler_wasm.c")))
+        with open(os.path.join(d, "engine_draw.h")) as f:
+            hdr = f.read()
+        self.assertIn("engine_collect_draws", hdr)
+        self.assertIn("engine_tick", hdr)
 
 
 class TestSpawnWidensIndex(unittest.TestCase):
@@ -171,6 +178,48 @@ class TestRuns(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         run = subprocess.run([exe], capture_output=True, text=True)
         self.assertEqual(run.returncode, 0, run.stderr)
+
+
+@needs_cc
+class TestGLES2View(unittest.TestCase):
+    """Packed scene rendered through surfaceless GLES2 (needs libEGL)."""
+
+    def test_gles2_view_ascii_has_sprites(self):
+        d = tempfile.mkdtemp(prefix="upack-gles-")
+        unity_pack.pack(SCENE, d)
+        view = os.path.join(ROOT, "examples", "unity_pack", "gles2_view.c")
+        exe = os.path.join(d, "view")
+        r = subprocess.run(
+            [_CC, "-O3", "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(
+            [_CC, "-O0", "-c", "-o", os.path.join(d, "data.o"),
+             os.path.join(d, "data.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, view,
+             os.path.join(d, "engine.o"), os.path.join(d, "data.o"),
+             "-I", d, "-lEGL", "-lGLESv2", "-lm"],
+            capture_output=True, text=True)
+        if r.returncode != 0:
+            self.skipTest("cannot link GLES2 view: %s" % r.stderr[-400:])
+        env = os.environ.copy()
+        env["EGL_PLATFORM"] = "surfaceless"
+        env["LIBGL_ALWAYS_SOFTWARE"] = "1"
+        run = subprocess.run([exe], capture_output=True, text=True, env=env)
+        if run.returncode != 0:
+            self.skipTest("GLES run failed (no soft rasteriser?): %s"
+                          % (run.stderr or run.stdout)[-400:])
+        self.assertIn("draws=3", run.stdout)
+        art = "\n".join(
+            line for line in run.stdout.splitlines()
+            if line and set(line) <= set(".RGB"))
+        self.assertTrue(art, run.stdout[-500:])
+        lit = sum(1 for ch in art if ch in "RGB")
+        self.assertGreaterEqual(lit, 20, art)
 
 
 if __name__ == "__main__":

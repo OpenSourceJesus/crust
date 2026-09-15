@@ -162,6 +162,11 @@ test_gles2:
 test_gles2_wasm:
 	python3 tools/gles2_wasm_test.py
 
+# Packed Unity MiniScene → GLES2 view (native surfaceless).
+#     make test_unity_gles2
+test_unity_gles2:
+	python3 -m unittest tests.test_unity_pack.TestGLES2View -v
+
 SEED  ?= 1
 COUNT ?= 200
 fuzz_wasm:

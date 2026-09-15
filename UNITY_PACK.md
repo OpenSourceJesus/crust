@@ -74,3 +74,25 @@ gcc -O2 -o /tmp/upack/game /tmp/upack/engine.o /tmp/upack/data.o -lm
 
 Godot: pass a directory containing `.tscn`. Blender: a JSON dump
 (`blender_pack.json`) — same packed C, different importer.
+
+## Display via GLES2
+
+`engine_collect_draws()` walks every instance with a packed position and
+fills an `EngineDraw` list (world xy, half-extents, RGB). Colours are a
+stable hash of the class name. The checked-in host
+`examples/unity_pack/gles2_view.c` ticks the engine, draws each sprite as
+a coloured quad through the same surfaceless EGL/FBO path as
+`examples/gles2/triangle.c`, then prints ASCII (and optional PPM).
+
+```
+examples/unity_pack/run_gles2.sh              # native surfaceless → ASCII
+examples/unity_pack/run_gles2.sh out.ppm
+examples/unity_pack/run_gles2_window.sh       # real GLFW / GLES window
+examples/unity_pack/run_gles2_wasm.sh         # soft GLES under node
+```
+
+`engine_draw.h` is written next to `engine.c` so the viewer stays in sync
+with the typedef. Wasm builds one amalgamated TU via
+`tools/unity_pack_amalg_view.py` (the wasm back end does not link multiple
+files). The windowed host (`gles2_window.c`) needs `glfw3` and a display;
+it is not part of the headless test path.
