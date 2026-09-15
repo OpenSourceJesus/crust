@@ -107,12 +107,14 @@ class TestEmit(unittest.TestCase):
         self.assertIn("_Coin_inst_array", engine)
         self.assertIn("engine_collect_draws", engine)
         self.assertIn("EngineDraw", engine)
+        self.assertIn("engine_upload_positions", engine)
         self.assertTrue(os.path.isfile(os.path.join(d, "engine_draw.h")))
         self.assertTrue(os.path.isfile(
             os.path.join(d, "shaders", "shader_compiler_wasm.c")))
         with open(os.path.join(d, "engine_draw.h")) as f:
             hdr = f.read()
         self.assertIn("engine_collect_draws", hdr)
+        self.assertIn("engine_upload_positions", hdr)
         self.assertIn("engine_tick", hdr)
 
 
@@ -174,6 +176,64 @@ class TestRuns(unittest.TestCase):
             [_CC, "-O2", "-o", exe,
              os.path.join(d, "engine.o"), os.path.join(d, "data.o"), host,
              "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+
+
+class TestSoa(unittest.TestCase):
+    """--soa: positions in contiguous float tables for GPU upload."""
+
+    def test_soa_emits_pos_tables_not_struct_fields(self):
+        d = tempfile.mkdtemp(prefix="upack-soa-")
+        plan = unity_pack.pack(SCENE, d, soa=True)
+        self.assertTrue(plan["soa"])
+        self.assertEqual(plan["classes"]["Coin"]["soa_dims"], 2)
+        names = [m[0] for m in plan["classes"]["Coin"]["members"]]
+        self.assertNotIn("pos_x", names)
+        with open(os.path.join(d, "data.c")) as f:
+            data = f.read()
+        self.assertIn("_Coin_pos[", data)
+        self.assertIn("_Player_pos[", data)
+        with open(os.path.join(d, "engine.c")) as f:
+            engine = f.read()
+        self.assertIn("SoA: one contiguous table", engine)
+        self.assertIn("engine_upload_positions", engine)
+
+    @needs_cc
+    def test_soa_tick_still_moves_player(self):
+        d = tempfile.mkdtemp(prefix="upack-soa-run-")
+        unity_pack.pack(SCENE, d, soa=True)
+        host = os.path.join(d, "host.c")
+        with open(host, "w") as f:
+            f.write(
+                "#include \"engine_draw.h\"\n"
+                "extern float _Player_pos[][2];\n"
+                "int main(void) {\n"
+                "  float before = _Player_pos[0][0];\n"
+                "  engine_tick();\n"
+                "  if (_Player_pos[0][0] <= before) return 2;\n"
+                "  float buf[16];\n"
+                "  int n = engine_upload_positions(buf, 16);\n"
+                "  return n == engine_position_floats() ? 0 : 1;\n"
+                "}\n"
+            )
+        r = subprocess.run(
+            [_CC, "-O3", "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(
+            [_CC, "-O0", "-c", "-o", os.path.join(d, "data.o"),
+             os.path.join(d, "data.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        exe = os.path.join(d, "game")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host,
+             os.path.join(d, "engine.o"), os.path.join(d, "data.o"),
+             "-I", d, "-lm"],
             capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
         run = subprocess.run([exe], capture_output=True, text=True)
