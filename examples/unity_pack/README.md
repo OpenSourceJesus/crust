@@ -12,3 +12,19 @@ gcc -O0 -c /tmp/upack/data.c
 Coins should pack to ≤16 bytes (2D, static float16 positions, bitfield
 `hp`/`value`, `uint8_t` index). The player stays larger because it moves
 (`float32` x/y).
+
+## View with GLES2
+
+```
+./examples/unity_pack/run_gles2.sh           # surfaceless FBO → ASCII
+./examples/unity_pack/run_gles2_window.sh    # real GLFW window (animated)
+./examples/unity_pack/run_gles2_wasm.sh      # soft GLES under node
+```
+
+`run_gles2.sh` packs this scene, links `gles2_view.c`, and draws each
+object as a coloured quad (surfaceless FBO → ASCII).
+
+`run_gles2_window.sh` links `gles2_window.c` against the same packed
+engine and opens an OpenGL ES 2.0 window via GLFW. The player keeps
+moving every frame (`Time.deltaTime` from the frame clock). Escape or Q
+closes the window.
