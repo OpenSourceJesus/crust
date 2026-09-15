@@ -21,6 +21,14 @@ Coins should pack to ≤16 bytes (2D, static float16 positions, bitfield
 ./examples/unity_pack/run_gles2_wasm.sh      # soft GLES under node
 ```
 
+Pass `--soa` to any of them to pack contiguous position tables (see
+`UNITY_PACK.md`). The scripts are bash (`#!/usr/bin/env bash`); from fish
+just run the path — do not paste bash `${...}` expansions into fish.
+
+```
+./examples/unity_pack/run_gles2_window.sh --soa
+```
+
 `run_gles2.sh` packs this scene, links `gles2_view.c`, and draws each
 object as a coloured quad (surfaceless FBO → ASCII).
 
