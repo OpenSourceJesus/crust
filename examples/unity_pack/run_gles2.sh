@@ -18,8 +18,9 @@ PPM=""
 for arg in "$@"; do
   case "$arg" in
     --soa) SOA=(--soa); OUT="${OUT}_soa" ;;
+    --soa-vec4) SOA=(--soa-vec4); OUT="${OUT}_soa_vec4" ;;
     -h|--help)
-      echo "usage: $0 [--soa] [out.ppm]"
+      echo "usage: $0 [--soa | --soa-vec4] [out.ppm]"
       exit 0
       ;;
     -*)
