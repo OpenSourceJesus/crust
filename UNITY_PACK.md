@@ -119,8 +119,14 @@ benchmark both:
 ```
 python3 tools/unity_pack.py examples/unity_pack/MiniScene -o /tmp/aos
 python3 tools/unity_pack.py examples/unity_pack/MiniScene -o /tmp/soa --soa
-python3 tools/unity_pack_bench_upload.py
+python3 tools/unity_pack_bench_upload.py      # packed AoS vs SoA (MiniScene)
+python3 tools/unity_pack_bench_csharp.py      # C SoA vs C# class AoS gather
 ```
+
+`unity_pack_bench_csharp.py` times the same CPU-side upload shape the
+design note describes: N objects → contiguous `float[N*3]`. C# uses an
+array of heap classes (Unity-like); C SoA uses a flat `pos[N][3]` table
+and `memcpy`. Needs the `dotnet` SDK for the C# leg.
 
 Bit-packed struct fields and GLSL unpacking are a later step; this slice
 is the layout + upload path only.
