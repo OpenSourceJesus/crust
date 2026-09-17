@@ -7,7 +7,8 @@
  *     SCENE=.../SystemsScene ./examples/unity_pack/run_gles2_window.sh
  *
  * Arrow keys / WASD feed engine_input_axis_* (Input.GetAxis). Escape or Q
- * quits. Time.deltaTime comes from the frame clock.
+ * quits. Time.deltaTime comes from the frame clock. SpriteRenderer quads
+ * sample packed PNG textures (tint × texel).
  */
 
 #define GLFW_INCLUDE_ES2
@@ -36,27 +37,39 @@ float engine_input_axis_Vertical __attribute__((weak)) = 0.f;
 #define WIN_W 800
 #define WIN_H 600
 #define MAX_DRAWS 64
-#define MAX_FLOATS (MAX_DRAWS * 6 * 5)
+#define MAX_TEX 32
+/* xy + rgb + uv */
+#define VERT_STRIDE 7
+#define MAX_FLOATS (6 * VERT_STRIDE)
 
 static const char *VERT_SRC =
     "attribute vec2 a_pos;\n"
     "attribute vec3 a_color;\n"
+    "attribute vec2 a_uv;\n"
     "varying vec3 v_color;\n"
+    "varying vec2 v_uv;\n"
     "void main() {\n"
     "    v_color = a_color;\n"
+    "    v_uv = a_uv;\n"
     "    gl_Position = vec4(a_pos, 0.0, 1.0);\n"
     "}\n";
 
 static const char *FRAG_SRC =
     "precision mediump float;\n"
     "varying vec3 v_color;\n"
+    "varying vec2 v_uv;\n"
+    "uniform sampler2D u_tex;\n"
     "void main() {\n"
-    "    gl_FragColor = vec4(v_color, 1.0);\n"
+    "    vec4 t = texture2D(u_tex, v_uv);\n"
+    "    gl_FragColor = vec4(t.rgb * v_color, t.a);\n"
     "}\n";
 
 static GLfloat vert_buf[MAX_FLOATS];
 static GLuint prog;
 static GLuint vbo;
+static GLuint gl_tex[MAX_TEX];
+static int tex_n;
+static GLint u_tex_loc;
 static int want_close;
 
 static float world_left, world_right, world_bottom, world_top;
@@ -83,17 +96,20 @@ static float world_to_ndc_y(float y)
     return 2.0f * (y - world_bottom) / (world_top - world_bottom) - 1.0f;
 }
 
-static void emit_vert(int *ni, float x, float y, float r, float g, float b)
+static void emit_vert(int *ni, float x, float y, float r, float g, float b,
+                      float u, float v)
 {
     int i = *ni;
-    if (i + 5 > MAX_FLOATS)
+    if (i + VERT_STRIDE > MAX_FLOATS)
         return;
     vert_buf[i] = x;
     vert_buf[i + 1] = y;
     vert_buf[i + 2] = r;
     vert_buf[i + 3] = g;
     vert_buf[i + 4] = b;
-    *ni = i + 5;
+    vert_buf[i + 5] = u;
+    vert_buf[i + 6] = v;
+    *ni = i + VERT_STRIDE;
 }
 
 static void emit_quad(int *ni, const EngineDraw *d)
@@ -104,12 +120,12 @@ static void emit_quad(int *ni, const EngineDraw *d)
     float y1 = world_to_ndc_y(d->y + d->half_h);
     float r = d->r, g = d->g, b = d->b;
 
-    emit_vert(ni, x0, y0, r, g, b);
-    emit_vert(ni, x1, y0, r, g, b);
-    emit_vert(ni, x0, y1, r, g, b);
-    emit_vert(ni, x1, y0, r, g, b);
-    emit_vert(ni, x1, y1, r, g, b);
-    emit_vert(ni, x0, y1, r, g, b);
+    emit_vert(ni, x0, y0, r, g, b, 0.f, 0.f);
+    emit_vert(ni, x1, y0, r, g, b, 1.f, 0.f);
+    emit_vert(ni, x0, y1, r, g, b, 0.f, 1.f);
+    emit_vert(ni, x1, y0, r, g, b, 1.f, 0.f);
+    emit_vert(ni, x1, y1, r, g, b, 1.f, 1.f);
+    emit_vert(ni, x0, y1, r, g, b, 0.f, 1.f);
 }
 
 static GLuint compile_stage(GLenum type, const char *src, const char *what)
@@ -142,6 +158,7 @@ static GLuint build_program(void)
     glAttachShader(p, fs);
     glBindAttribLocation(p, 0, "a_pos");
     glBindAttribLocation(p, 1, "a_color");
+    glBindAttribLocation(p, 2, "a_uv");
     glLinkProgram(p);
     glGetProgramiv(p, GL_LINK_STATUS, &ok);
     glDeleteShader(vs);
@@ -151,6 +168,32 @@ static GLuint build_program(void)
         return 0;
     }
     return p;
+}
+
+static int upload_textures(void)
+{
+    int i;
+    tex_n = engine_texture_count();
+    if (tex_n > MAX_TEX)
+        tex_n = MAX_TEX;
+    if (tex_n < 1)
+        return 1;
+    glGenTextures(tex_n, gl_tex);
+    for (i = 0; i < tex_n; i++) {
+        int w = engine_texture_width(i);
+        int h = engine_texture_height(i);
+        const unsigned char *rgba = engine_texture_rgba(i);
+        if (!rgba || w < 1 || h < 1)
+            return 0;
+        glBindTexture(GL_TEXTURE_2D, gl_tex[i]);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA,
+                     GL_UNSIGNED_BYTE, rgba);
+    }
+    return 1;
 }
 
 static void on_key(GLFWwindow *win, int key, int scancode, int action, int mods)
@@ -182,10 +225,36 @@ static void poll_input_axes(GLFWwindow *win)
     engine_input_axis_Vertical = vy;
 }
 
+static void draw_one(const EngineDraw *d)
+{
+    int nfloats = 0;
+    int tid;
+    GLsizei stride = (GLsizei)(VERT_STRIDE * sizeof(GLfloat));
+
+    emit_quad(&nfloats, d);
+    tid = d->tex;
+    if (tid < 0 || tid >= tex_n)
+        return;
+    glBindTexture(GL_TEXTURE_2D, gl_tex[tid]);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER,
+                 (GLsizeiptr)(nfloats * (int)sizeof(GLfloat)),
+                 vert_buf, GL_DYNAMIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, stride, (const void *)0);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride,
+                          (const void *)(2 * sizeof(GLfloat)));
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, stride,
+                          (const void *)(5 * sizeof(GLfloat)));
+    glDrawArrays(GL_TRIANGLES, 0, nfloats / VERT_STRIDE);
+}
+
 static void frame(GLFWwindow *win)
 {
     EngineDraw draws[MAX_DRAWS];
-    int ndraw, nfloats = 0, i, nverts;
+    int ndraw, i;
     int fbw, fbh;
 
     poll_input_axes(win);
@@ -193,30 +262,19 @@ static void frame(GLFWwindow *win)
     glfwGetFramebufferSize(win, &fbw, &fbh);
     refresh_camera_bounds(fbh > 0 ? (float)fbw / (float)fbh : 1.0f);
     ndraw = engine_collect_draws(draws, MAX_DRAWS);
-    for (i = 0; i < ndraw; i++)
-        emit_quad(&nfloats, &draws[i]);
-    nverts = nfloats / 5;
 
     glViewport(0, 0, fbw, fbh);
     glClearColor(Camera_main_background_r, Camera_main_background_g,
                  Camera_main_background_b, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
-
-    glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    glBufferData(GL_ARRAY_BUFFER,
-                 (GLsizeiptr)(nfloats * (int)sizeof(GLfloat)),
-                 vert_buf, GL_DYNAMIC_DRAW);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
     glUseProgram(prog);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE,
-                          (GLsizei)(5 * sizeof(GLfloat)), (const void *)0);
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE,
-                          (GLsizei)(5 * sizeof(GLfloat)),
-                          (const void *)(2 * sizeof(GLfloat)));
-    if (nverts > 0)
-        glDrawArrays(GL_TRIANGLES, 0, nverts);
+    glActiveTexture(GL_TEXTURE0);
+    glUniform1i(u_tex_loc, 0);
+    for (i = 0; i < ndraw; i++)
+        draw_one(&draws[i]);
 
     glfwSwapBuffers(win);
     glfwPollEvents();
@@ -246,8 +304,8 @@ int main(void)
     glfwSetKeyCallback(win, on_key);
 
     printf("GLES %s\n", (const char *)glGetString(GL_VERSION));
-    printf("draws classes=%d — arrows/WASD move, Escape/Q quit\n",
-           engine_class_count());
+    printf("draws classes=%d textures=%d — arrows/WASD, Escape/Q\n",
+           engine_class_count(), engine_texture_count());
 
     prog = build_program();
     if (!prog) {
@@ -255,7 +313,12 @@ int main(void)
         glfwTerminate();
         return 1;
     }
+    u_tex_loc = glGetUniformLocation(prog, "u_tex");
     glGenBuffers(1, &vbo);
+    if (!upload_textures()) {
+        fprintf(stderr, "texture upload failed\n");
+        return 1;
+    }
 
     prev = glfwGetTime();
     while (!glfwWindowShouldClose(win) && !want_close) {
@@ -269,6 +332,8 @@ int main(void)
         frame(win);
     }
 
+    if (tex_n > 0)
+        glDeleteTextures(tex_n, gl_tex);
     glDeleteBuffers(1, &vbo);
     glDeleteProgram(prog);
     glfwDestroyWindow(win);

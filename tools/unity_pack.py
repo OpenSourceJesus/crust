@@ -179,6 +179,154 @@ def _asset_guid_map(root):
     return out
 
 
+def _paeth(a, b, c):
+    p = a + b - c
+    pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+    if pa <= pb and pa <= pc:
+        return a
+    if pb <= pc:
+        return b
+    return c
+
+
+def _load_png_rgba(path):
+    """Decode an 8-bit non-interlaced PNG to (w, h, rgba_bytes).
+
+    Supports color types 2 (RGB) and 6 (RGBA). Used so editing a referenced
+    sprite asset changes packed visuals — no invented placeholder colors.
+    """
+    import struct
+    import zlib
+
+    with open(path, "rb") as f:
+        data = f.read()
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise PackError("not a PNG: %s" % path)
+    pos = 8
+    w = h = None
+    color_type = None
+    idat = []
+    while pos + 8 <= len(data):
+        length = struct.unpack(">I", data[pos:pos + 4])[0]
+        tag = data[pos + 4:pos + 8]
+        chunk = data[pos + 8:pos + 8 + length]
+        pos = pos + 12 + length
+        if tag == b"IHDR":
+            w, h, bit_depth, color_type, comp, filt, inter = struct.unpack(
+                ">IIBBBBB", chunk)
+            if bit_depth != 8 or inter != 0 or comp != 0 or filt != 0:
+                raise PackError(
+                    "unsupported PNG (need 8-bit non-interlaced): %s" % path)
+            if color_type not in (2, 6):
+                raise PackError(
+                    "unsupported PNG color type %d (need RGB/RGBA): %s"
+                    % (color_type, path))
+        elif tag == b"IDAT":
+            idat.append(chunk)
+        elif tag == b"IEND":
+            break
+    if w is None or not idat:
+        raise PackError("incomplete PNG: %s" % path)
+    bpp = 4 if color_type == 6 else 3
+    raw = zlib.decompress(b"".join(idat))
+    stride = w * bpp
+    expect = (stride + 1) * h
+    if len(raw) < expect:
+        raise PackError("PNG IDAT too short: %s" % path)
+    rows = []
+    prev = bytearray(stride)
+    off = 0
+    for _y in range(h):
+        ftype = raw[off]
+        off += 1
+        row = bytearray(raw[off:off + stride])
+        off += stride
+        if ftype == 0:
+            pass
+        elif ftype == 1:  # Sub
+            for i in range(stride):
+                left = row[i - bpp] if i >= bpp else 0
+                row[i] = (row[i] + left) & 255
+        elif ftype == 2:  # Up
+            for i in range(stride):
+                row[i] = (row[i] + prev[i]) & 255
+        elif ftype == 3:  # Average
+            for i in range(stride):
+                left = row[i - bpp] if i >= bpp else 0
+                row[i] = (row[i] + ((left + prev[i]) // 2)) & 255
+        elif ftype == 4:  # Paeth
+            for i in range(stride):
+                left = row[i - bpp] if i >= bpp else 0
+                up = prev[i]
+                ul = prev[i - bpp] if i >= bpp else 0
+                row[i] = (row[i] + _paeth(left, up, ul)) & 255
+        else:
+            raise PackError("bad PNG filter %d in %s" % (ftype, path))
+        rows.append(bytes(row))
+        prev = row
+    if color_type == 6:
+        rgba = b"".join(rows)
+    else:
+        out = bytearray(w * h * 4)
+        i = 0
+        for row in rows:
+            for x in range(w):
+                o = x * 3
+                out[i] = row[o]
+                out[i + 1] = row[o + 1]
+                out[i + 2] = row[o + 2]
+                out[i + 3] = 255
+                i += 4
+        rgba = bytes(out)
+    return w, h, rgba
+
+
+def _attach_sprite_textures(objects, asset_guids):
+    """Load PNG pixels for each SpriteRenderer that references a project sprite."""
+    for o in objects:
+        sp = o.get("sprite")
+        if not sp:
+            continue
+        path = asset_guids.get(sp.get("sprite_guid") or "")
+        if not path or not path.lower().endswith(".png"):
+            o["sprite"] = None
+            continue
+        try:
+            w, h, rgba = _load_png_rgba(path)
+        except PackError:
+            o["sprite"] = None
+            continue
+        except IOError:
+            o["sprite"] = None
+            continue
+        sp["tex_path"] = path
+        sp["tex_w"] = w
+        sp["tex_h"] = h
+        sp["tex_rgba"] = rgba
+
+
+def _collect_textures(objects):
+    """Deduplicate sprite PNGs → plan texture table; set tex_id on sprites."""
+    textures = []
+    by_guid = {}
+    for o in objects:
+        sp = o.get("sprite")
+        if not sp or "tex_rgba" not in sp:
+            continue
+        g = sp["sprite_guid"]
+        if g not in by_guid:
+            by_guid[g] = len(textures)
+            textures.append({
+                "guid": g,
+                "path": sp["tex_path"],
+                "w": sp["tex_w"],
+                "h": sp["tex_h"],
+                "rgba": sp["tex_rgba"],
+            })
+        sp["tex_id"] = by_guid[g]
+    return textures
+
+
 # ---------------------------------------------------------------------------
 # Scene importers
 # ---------------------------------------------------------------------------
@@ -1006,13 +1154,50 @@ def emit_engine(plan, analyses, used_apis):
     p("int engine_class_count(void) { return %d; }" % len(plan["classes"]))
     p("")
 
-    # Draw list: authored SpriteRenderer only — never invent visuals for
-    # bare GameObjects / MonoBehaviours.
-    p("/* ---- draw list (authored SpriteRenderer only; see engine_draw.h) ---- */")
+    # Draw list: authored SpriteRenderer + project PNG only.
+    p("/* ---- draw list (SpriteRenderer + texture; see engine_draw.h) ---- */")
     p("typedef struct EngineDraw {")
     p("    float x, y, half_w, half_h;")
     p("    float r, g, b;")
+    p("    int tex; /* index into engine_texture_*; -1 = none */")
     p("} EngineDraw;")
+    p("")
+    tex_n = len(plan.get("textures") or [])
+    p("extern const int _engine_tex_count;")
+    if tex_n:
+        p("extern const int _engine_tex_w[%d];" % tex_n)
+        p("extern const int _engine_tex_h[%d];" % tex_n)
+        for ti in range(tex_n):
+            p("extern const unsigned char _engine_tex%d_rgba[];" % ti)
+    p("")
+    p("int engine_texture_count(void) { return _engine_tex_count; }")
+    p("")
+    p("int engine_texture_width(int id) {")
+    if tex_n:
+        p("    if (id < 0 || id >= _engine_tex_count) return 0;")
+        p("    return _engine_tex_w[id];")
+    else:
+        p("    (void)id; return 0;")
+    p("}")
+    p("")
+    p("int engine_texture_height(int id) {")
+    if tex_n:
+        p("    if (id < 0 || id >= _engine_tex_count) return 0;")
+        p("    return _engine_tex_h[id];")
+    else:
+        p("    (void)id; return 0;")
+    p("}")
+    p("")
+    p("const unsigned char *engine_texture_rgba(int id) {")
+    if tex_n:
+        p("    switch (id) {")
+        for ti in range(tex_n):
+            p("    case %d: return _engine_tex%d_rgba;" % (ti, ti))
+        p("    default: return 0;")
+        p("    }")
+    else:
+        p("    (void)id; return 0;")
+    p("}")
     p("")
     p("int engine_collect_draws(EngineDraw *out, int max) {")
     p("    int n = 0;")
@@ -1025,7 +1210,7 @@ def emit_engine(plan, analyses, used_apis):
         spr_idx = []
         for i, o in enumerate(cl["instances"]):
             sp = o.get("sprite")
-            if sp and sp.get("enabled", 1):
+            if sp and sp.get("enabled", 1) and "tex_id" in sp:
                 spr_idx.append((i, sp))
         if not spr_idx:
             continue
@@ -1041,6 +1226,8 @@ def emit_engine(plan, analyses, used_apis):
             "%sf" % repr(float(sp["half_w"])) for _i, sp in spr_idx))
         p("        static const float _spr_hh[] = { %s };" % ", ".join(
             "%sf" % repr(float(sp["half_h"])) for _i, sp in spr_idx))
+        p("        static const int _spr_tex[] = { %s };" % ", ".join(
+            str(int(sp["tex_id"])) for _i, sp in spr_idx))
         p("        static const unsigned _spr_i[] = { %s };" % ", ".join(
             str(i) for i, _sp in spr_idx))
         p("        int k;")
@@ -1053,6 +1240,7 @@ def emit_engine(plan, analyses, used_apis):
         p("            out[n].r = _spr_r[k];")
         p("            out[n].g = _spr_g[k];")
         p("            out[n].b = _spr_b[k];")
+        p("            out[n].tex = _spr_tex[k];")
         p("            n = n + 1;")
         p("        }")
         p("    }")
@@ -1114,11 +1302,16 @@ def emit_engine_draw_h():
         "typedef struct EngineDraw {\n"
         "    float x, y, half_w, half_h;\n"
         "    float r, g, b;\n"
+        "    int tex; /* engine_texture_* index; -1 if none */\n"
         "} EngineDraw;\n"
         "\n"
         "void engine_tick(void);\n"
         "int engine_class_count(void);\n"
         "int engine_collect_draws(EngineDraw *out, int max);\n"
+        "int engine_texture_count(void);\n"
+        "int engine_texture_width(int id);\n"
+        "int engine_texture_height(int id);\n"
+        "const unsigned char *engine_texture_rgba(int id); /* RGBA8888 */\n"
         "/* Contiguous x,y[,z] floats for every positioned instance (class\n"
         " * name order). SoA packs fill this from flat tables; AoS gathers. */\n"
         "int engine_position_floats(void);\n"
@@ -1349,6 +1542,27 @@ def emit_data(plan, used_apis=None):
         p("float _Light_color_b[%d] = { %s };" % (
             len(lights),
             ", ".join("%sf" % repr(float(L["b"])) for L in lights)))
+    textures = plan.get("textures") or []
+    p("const int _engine_tex_count = %d;" % len(textures))
+    if textures:
+        p("const int _engine_tex_w[%d] = { %s };" % (
+            len(textures),
+            ", ".join(str(int(t["w"])) for t in textures)))
+        p("const int _engine_tex_h[%d] = { %s };" % (
+            len(textures),
+            ", ".join(str(int(t["h"])) for t in textures)))
+        for ti, tex in enumerate(textures):
+            rgba = tex["rgba"]
+            p("/* %s %dx%d RGBA */" % (
+                os.path.basename(tex["path"]), tex["w"], tex["h"]))
+            p("const unsigned char _engine_tex%d_rgba[%d] = {" % (
+                ti, len(rgba)))
+            for i in range(0, len(rgba), 16):
+                chunk = rgba[i:i + 16]
+                p("    %s%s" % (
+                    ", ".join(str(b) for b in chunk),
+                    "," if i + 16 < len(rgba) else ""))
+            p("};")
     p("")
     for cname, cl in sorted(plan["classes"].items()):
         idn = _c_ident(cname)
@@ -1528,6 +1742,7 @@ def load_project(root):
         raise PackError(
             "no scene objects found under %s "
             "(looked for .unity / .tscn / blender_pack.json)" % root)
+    _attach_sprite_textures(objects, assets)
     return objects, analyses, lights, cameras
 
 
@@ -1607,6 +1822,7 @@ def pack(root, outdir, soa=False, soa_vec4=False):
         main_cam = cameras[0]
     plan["camera"] = main_cam
     plan["cameras"] = list(cameras)
+    plan["textures"] = _collect_textures(objects)
     os.makedirs(outdir, exist_ok=True)
     engine = emit_engine(plan, analyses, used_apis)
     data = emit_data(plan, used_apis)

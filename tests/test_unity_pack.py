@@ -346,6 +346,8 @@ class TestSystems(unittest.TestCase):
         self.assertIn("Physics2D_gravity_y", data)
         self.assertIn("Camera_main_orthographicSize", data)
         self.assertIn("SpriteRenderer", engine)
+        self.assertIn("_engine_tex0_rgba", data)
+        self.assertIn("engine_texture_rgba", engine)
         self.assertNotIn("ParticleSystem_Emit", engine)
         self.assertNotIn("AnimationCurve_Evaluate", engine)
         self.assertNotIn("_AnimCurve0", data)
@@ -361,6 +363,50 @@ class TestSystems(unittest.TestCase):
         self.assertNotIn("Physics2D_gravity", mini)
         self.assertNotIn("Input_GetAxis", mini)
         self.assertNotIn("_Light_intensity", mini_data)
+
+    def test_sprite_png_pixels_are_packed(self):
+        """Editing the referenced PNG changes packed texture bytes."""
+        d = tempfile.mkdtemp(prefix="upack-tex-")
+        plan = unity_pack.pack(SCENE, d)
+        self.assertGreaterEqual(len(plan.get("textures") or []), 1)
+        tex = plan["textures"][0]
+        self.assertEqual(tex["w"], 8)
+        self.assertEqual(tex["h"], 8)
+        # Default fixture is opaque white.
+        self.assertEqual(tex["rgba"][0:4], b"\xff\xff\xff\xff")
+        with open(os.path.join(d, "data.c")) as f:
+            data = f.read()
+        self.assertIn("255, 255, 255, 255", data)
+
+        # Recolor the project PNG and re-pack — bytes must follow.
+        red = tempfile.mkdtemp(prefix="upack-red-")
+        import shutil
+        shutil.copytree(SCENE, os.path.join(red, "proj"))
+        proj = os.path.join(red, "proj")
+        png = os.path.join(proj, "Assets", "Sprites", "quad.png")
+        # 8x8 opaque red
+        w, h, _old = unity_pack._load_png_rgba(png)
+        import struct, zlib
+
+        def chunk(tag, body):
+            return (struct.pack(">I", len(body)) + tag + body
+                    + struct.pack(">I", zlib.crc32(tag + body) & 0xffffffff))
+
+        raw = b""
+        for _y in range(h):
+            raw += b"\x00" + (b"\xff\x00\x00\xff" * w)
+        open(png, "wb").write(
+            b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 9))
+            + chunk(b"IEND", b"")
+        )
+        d2 = tempfile.mkdtemp(prefix="upack-tex2-")
+        plan2 = unity_pack.pack(proj, d2)
+        self.assertEqual(plan2["textures"][0]["rgba"][0:4], b"\xff\x00\x00\xff")
+        with open(os.path.join(d2, "data.c")) as f:
+            data2 = f.read()
+        self.assertIn("255, 0, 0, 255", data2)
 
     def test_dangling_sprite_guid_does_not_draw(self):
         """Placeholder / missing asset guids are not invent-drawn."""
@@ -606,7 +652,7 @@ class TestSystemsRuns(unittest.TestCase):
                 "extern float RenderSettings_ambient_r;\n"
                 "extern float _Light_intensity[];\n"
                 "typedef struct { float x, y, half_w, half_h;\n"
-                "                 float r, g, b; } EngineDraw;\n"
+                "                 float r, g, b; int tex; } EngineDraw;\n"
                 "int engine_collect_draws(EngineDraw *out, int max);\n"
                 "typedef struct Ball Ball;\n"
                 "struct Ball { float pos_x; float pos_y;\n"

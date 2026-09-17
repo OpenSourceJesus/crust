@@ -11,8 +11,8 @@
  *
  * Or: examples/unity_pack/run_gles2.sh
  *
- * Draws each engine_collect_draws() sprite as a coloured quad. Same FBO
- * readback path as examples/gles2/triangle.c — no window system.
+ * Draws each engine_collect_draws() sprite as a textured quad (PNG × tint).
+ * Same FBO readback path as examples/gles2/triangle.c — no window system.
  */
 
 #include <EGL/egl.h>
@@ -37,29 +37,39 @@ float Camera_main_background_b __attribute__((weak)) = 0.f;
 #define WIDTH  96
 #define HEIGHT 64
 #define MAX_DRAWS 64
-/* Two triangles per quad, 5 floats (xy + rgb) per vertex. */
-#define MAX_FLOATS (MAX_DRAWS * 6 * 5)
+#define MAX_TEX 32
+#define VERT_STRIDE 7
+#define MAX_FLOATS (6 * VERT_STRIDE)
 
 #define TICKS_BEFORE_DRAW 30
 
 static const char *VERT_SRC =
     "attribute vec2 a_pos;\n"
     "attribute vec3 a_color;\n"
+    "attribute vec2 a_uv;\n"
     "varying vec3 v_color;\n"
+    "varying vec2 v_uv;\n"
     "void main() {\n"
     "    v_color = a_color;\n"
+    "    v_uv = a_uv;\n"
     "    gl_Position = vec4(a_pos, 0.0, 1.0);\n"
     "}\n";
 
 static const char *FRAG_SRC =
     "precision mediump float;\n"
     "varying vec3 v_color;\n"
+    "varying vec2 v_uv;\n"
+    "uniform sampler2D u_tex;\n"
     "void main() {\n"
-    "    gl_FragColor = vec4(v_color, 1.0);\n"
+    "    vec4 t = texture2D(u_tex, v_uv);\n"
+    "    gl_FragColor = vec4(t.rgb * v_color, t.a);\n"
     "}\n";
 
 static unsigned char pixels[WIDTH * HEIGHT * 4];
 static GLfloat vert_buf[MAX_FLOATS];
+static GLuint gl_tex[MAX_TEX];
+static int tex_n;
+static GLint u_tex_loc;
 static float world_left, world_right, world_bottom, world_top;
 
 static void refresh_camera_bounds(float aspect)
@@ -84,17 +94,20 @@ static float world_to_ndc_y(float y)
     return 2.0f * (y - world_bottom) / (world_top - world_bottom) - 1.0f;
 }
 
-static void emit_vert(int *ni, float x, float y, float r, float g, float b)
+static void emit_vert(int *ni, float x, float y, float r, float g, float b,
+                      float u, float v)
 {
     int i = *ni;
-    if (i + 5 > MAX_FLOATS)
+    if (i + VERT_STRIDE > MAX_FLOATS)
         return;
     vert_buf[i] = x;
     vert_buf[i + 1] = y;
     vert_buf[i + 2] = r;
     vert_buf[i + 3] = g;
     vert_buf[i + 4] = b;
-    *ni = i + 5;
+    vert_buf[i + 5] = u;
+    vert_buf[i + 6] = v;
+    *ni = i + VERT_STRIDE;
 }
 
 /* Expand one axis-aligned sprite into two triangles in NDC. */
@@ -106,13 +119,13 @@ static void emit_quad(int *ni, const EngineDraw *d)
     float y1 = world_to_ndc_y(d->y + d->half_h);
     float r = d->r, g = d->g, b = d->b;
 
-    emit_vert(ni, x0, y0, r, g, b);
-    emit_vert(ni, x1, y0, r, g, b);
-    emit_vert(ni, x0, y1, r, g, b);
+    emit_vert(ni, x0, y0, r, g, b, 0.f, 0.f);
+    emit_vert(ni, x1, y0, r, g, b, 1.f, 0.f);
+    emit_vert(ni, x0, y1, r, g, b, 0.f, 1.f);
 
-    emit_vert(ni, x1, y0, r, g, b);
-    emit_vert(ni, x1, y1, r, g, b);
-    emit_vert(ni, x0, y1, r, g, b);
+    emit_vert(ni, x1, y0, r, g, b, 1.f, 0.f);
+    emit_vert(ni, x1, y1, r, g, b, 1.f, 1.f);
+    emit_vert(ni, x0, y1, r, g, b, 0.f, 1.f);
 }
 
 static GLuint compile_stage(GLenum type, const char *src, const char *what)
@@ -147,6 +160,7 @@ static GLuint build_program(void)
     glAttachShader(prog, fs);
     glBindAttribLocation(prog, 0, "a_pos");
     glBindAttribLocation(prog, 1, "a_color");
+    glBindAttribLocation(prog, 2, "a_uv");
     glLinkProgram(prog);
     glGetProgramiv(prog, GL_LINK_STATUS, &ok);
     if (!ok) {
@@ -227,47 +241,83 @@ static int init_fbo(void)
     return 1;
 }
 
+static int upload_textures(void)
+{
+    int i;
+    tex_n = engine_texture_count();
+    if (tex_n > MAX_TEX)
+        tex_n = MAX_TEX;
+    if (tex_n < 1)
+        return 1;
+    glGenTextures(tex_n, gl_tex);
+    for (i = 0; i < tex_n; i++) {
+        int w = engine_texture_width(i);
+        int h = engine_texture_height(i);
+        const unsigned char *rgba = engine_texture_rgba(i);
+        if (!rgba || w < 1 || h < 1)
+            return 0;
+        glBindTexture(GL_TEXTURE_2D, gl_tex[i]);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA,
+                     GL_UNSIGNED_BYTE, rgba);
+    }
+    return 1;
+}
+
 static int draw_scene(GLuint prog)
 {
     EngineDraw draws[MAX_DRAWS];
     int ndraw;
-    int nfloats = 0;
     int i;
     GLuint vbo;
-    int nverts;
+    GLsizei stride = (GLsizei)(VERT_STRIDE * sizeof(GLfloat));
 
     ndraw = engine_collect_draws(draws, MAX_DRAWS);
     if (ndraw < 1) {
         printf("engine_collect_draws returned %d\n", ndraw);
         return 0;
     }
-    printf("draws=%d classes=%d\n", ndraw, engine_class_count());
+    printf("draws=%d classes=%d textures=%d\n",
+           ndraw, engine_class_count(), engine_texture_count());
 
     refresh_camera_bounds((float)WIDTH / (float)HEIGHT);
-    for (i = 0; i < ndraw; i++)
-        emit_quad(&nfloats, &draws[i]);
-
-    nverts = nfloats / 5;
     glGenBuffers(1, &vbo);
     glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    glBufferData(GL_ARRAY_BUFFER,
-                 (GLsizeiptr)(nfloats * (int)sizeof(GLfloat)),
-                 vert_buf, GL_STATIC_DRAW);
 
     glViewport(0, 0, WIDTH, HEIGHT);
     glClearColor(Camera_main_background_r, Camera_main_background_g,
                  Camera_main_background_b, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
     glUseProgram(prog);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE,
-                          (GLsizei)(5 * sizeof(GLfloat)), (const void *)0);
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE,
-                          (GLsizei)(5 * sizeof(GLfloat)),
-                          (const void *)(2 * sizeof(GLfloat)));
-    glDrawArrays(GL_TRIANGLES, 0, nverts);
+    glActiveTexture(GL_TEXTURE0);
+    glUniform1i(u_tex_loc, 0);
+    for (i = 0; i < ndraw; i++) {
+        int nfloats = 0;
+        int tid = draws[i].tex;
+        if (tid < 0 || tid >= tex_n)
+            continue;
+        emit_quad(&nfloats, &draws[i]);
+        glBindTexture(GL_TEXTURE_2D, gl_tex[tid]);
+        glBufferData(GL_ARRAY_BUFFER,
+                     (GLsizeiptr)(nfloats * (int)sizeof(GLfloat)),
+                     vert_buf, GL_DYNAMIC_DRAW);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, stride,
+                              (const void *)0);
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride,
+                              (const void *)(2 * sizeof(GLfloat)));
+        glEnableVertexAttribArray(2);
+        glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, stride,
+                              (const void *)(5 * sizeof(GLfloat)));
+        glDrawArrays(GL_TRIANGLES, 0, nfloats / VERT_STRIDE);
+    }
     glFinish();
     return 1;
 }
@@ -333,6 +383,11 @@ int main(int argc, char **argv)
     prog = build_program();
     if (!prog)
         return 1;
+    u_tex_loc = glGetUniformLocation(prog, "u_tex");
+    if (!upload_textures()) {
+        printf("texture upload failed\n");
+        return 1;
+    }
 
     /* Let the player drift so it separates from the origin coin cluster. */
     for (t = 0; t < TICKS_BEFORE_DRAW; t++)

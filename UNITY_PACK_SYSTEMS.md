@@ -53,11 +53,11 @@ No invented lights. `AddComponent<Light>` is a `PackError`.
 |---------------------|---------|
 | Authored `!u!20` Camera (MainCamera) | `Camera_main_pos_*`, `orthographicSize`, background RGB |
 | `Camera.main.orthographicSize` / `.transform.position` | Reads those globals |
-| Authored `!u!212` SpriteRenderer with `m_Sprite` → **project** sprite | Draw list entry (color + scale→size) |
+| Authored `!u!212` SpriteRenderer with `m_Sprite` → **project PNG** | Texture + tinted quad in `engine_collect_draws` |
 
-Empty `m_Sprite: {fileID: 0}`, missing sprite, or a guid that does not
-resolve to a `.meta` under the project does not draw — no invent /
-placeholder refs.
+PNG pixels are packed into `data.c` (`engine_texture_rgba`). Editing the
+referenced sprite and re-packing changes the drawn texels. Tint comes from
+`m_Color`; size from Transform scale.
 
 **No default visuals.** A GameObject with only a Transform / MonoBehaviour
 does **not** appear in `engine_collect_draws`. Hosts clear to the authored
