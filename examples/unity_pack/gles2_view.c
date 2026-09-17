@@ -29,7 +29,10 @@
 
 float Camera_main_pos_x __attribute__((weak)) = 0.f;
 float Camera_main_pos_y __attribute__((weak)) = 0.f;
+float Camera_main_pos_z __attribute__((weak)) = -10.f;
 float Camera_main_orthographicSize __attribute__((weak)) = 3.f;
+float Camera_main_nearClipPlane __attribute__((weak)) = 0.3f;
+float Camera_main_farClipPlane __attribute__((weak)) = 1000.f;
 float Camera_main_background_r __attribute__((weak)) = 0.f;
 float Camera_main_background_g __attribute__((weak)) = 0.f;
 float Camera_main_background_b __attribute__((weak)) = 0.f;

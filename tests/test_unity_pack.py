@@ -342,6 +342,9 @@ class TestSystems(unittest.TestCase):
         self.assertEqual(len(cameras), 1)
         self.assertTrue(cameras[0]["main"])
         self.assertAlmostEqual(cameras[0]["orthographic_size"], 3.0)
+        self.assertAlmostEqual(cameras[0]["pos"][2], -10.0)
+        self.assertAlmostEqual(cameras[0]["near_clip"], 0.3)
+        self.assertAlmostEqual(cameras[0]["far_clip"], 1000.0)
         self.assertNotIn("ParticleSystem.Emit", apis)
         self.assertNotIn("AnimationCurve.Evaluate", apis)
         spr = [o for o in _objs if o.get("sprite")]
@@ -374,7 +377,11 @@ class TestSystems(unittest.TestCase):
         self.assertIn("Physics2D_gravity_y", data)
         self.assertIn("_Rigidbody2D_vel_x", data)
         self.assertIn("Camera_main_orthographicSize", data)
+        self.assertIn("Camera_main_pos_z", data)
+        self.assertIn("Camera_main_nearClipPlane", data)
+        self.assertIn("Camera_main_farClipPlane", data)
         self.assertIn("SpriteRenderer", engine)
+        self.assertIn("oz - Camera_main_pos_z", engine)
         self.assertIn("_engine_tex0_rgba", data)
         self.assertIn("engine_texture_rgba", engine)
         self.assertNotIn("ParticleSystem_Emit", engine)
@@ -1227,6 +1234,49 @@ class TestSystemsRuns(unittest.TestCase):
             capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
         exe = os.path.join(d, "host")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host,
+             os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+
+    def test_camera_positive_z_culls_sprites(self):
+        """Unity looks +Z; camera at +z with sprites at 0 draws nothing."""
+        d = tempfile.mkdtemp(prefix="upack-cam-z-")
+        unity_pack.pack(SYSTEMS, d)
+        host = os.path.join(d, "host_camz.c")
+        with open(host, "w") as f:
+            f.write(
+                "typedef struct { float x, y, half_w, half_h;\n"
+                "                 float r, g, b; int tex; } EngineDraw;\n"
+                "int engine_collect_draws(EngineDraw *out, int max);\n"
+                "extern float Camera_main_pos_z;\n"
+                "int main(void) {\n"
+                "  EngineDraw buf[128];\n"
+                "  int n0 = engine_collect_draws(buf, 128);\n"
+                "  if (n0 != 3) return 1;\n"
+                "  Camera_main_pos_z = 10.f;\n"
+                "  int n1 = engine_collect_draws(buf, 128);\n"
+                "  if (n1 != 0) return 2;\n"
+                "  Camera_main_pos_z = -10.f;\n"
+                "  int n2 = engine_collect_draws(buf, 128);\n"
+                "  if (n2 != 3) return 3;\n"
+                "  return 0;\n"
+                "}\n"
+            )
+        r = subprocess.run(
+            [_CC, "-O3", "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(
+            [_CC, "-O0", "-c", "-o", os.path.join(d, "data.o"),
+             os.path.join(d, "data.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        exe = os.path.join(d, "host_camz")
         r = subprocess.run(
             [_CC, "-O2", "-o", exe, host,
              os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],

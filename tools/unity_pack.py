@@ -600,6 +600,16 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             bg = re.search(
                 r"m_BackGroundColor:\s*\{r:\s*([^,}]+),\s*g:\s*([^,}]+),"
                 r"\s*b:\s*([^,}]+)", block)
+            near = re.search(
+                r"(?m)^\s+near clip plane:\s*([0-9.eE+-]+)", block)
+            if not near:
+                near = re.search(
+                    r"(?m)^\s+m_NearClipPlane:\s*([0-9.eE+-]+)", block)
+            far = re.search(
+                r"(?m)^\s+far clip plane:\s*([0-9.eE+-]+)", block)
+            if not far:
+                far = re.search(
+                    r"(?m)^\s+m_FarClipPlane:\s*([0-9.eE+-]+)", block)
             rec["camera"] = {
                 "orthographic": int(ortho.group(1)) if ortho else 1,
                 "orthographic_size": (
@@ -607,6 +617,9 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "bg_r": float(bg.group(1)) if bg else 0.05,
                 "bg_g": float(bg.group(2)) if bg else 0.05,
                 "bg_b": float(bg.group(3)) if bg else 0.08,
+                # Unity defaults when YAML omits clip planes.
+                "near_clip": float(near.group(1)) if near else 0.3,
+                "far_clip": float(far.group(1)) if far else 1000.0,
             }
         if kind == "Rigidbody2D":
             bt = re.search(r"(?m)^\s+m_BodyType:\s*(\d+)", block)
@@ -702,6 +715,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "bg_r": cam["bg_r"],
                 "bg_g": cam["bg_g"],
                 "bg_b": cam["bg_b"],
+                "near_clip": cam["near_clip"],
+                "far_clip": cam["far_clip"],
             })
         # Camera-only GOs are not packed as scripted instances.
         if cam is not None and script is None and sprite is None and not rb2d and not rb3d:
@@ -1613,7 +1628,10 @@ def emit_engine(plan, analyses, used_apis):
     if plan.get("camera"):
         p("extern float Camera_main_pos_x;")
         p("extern float Camera_main_pos_y;")
+        p("extern float Camera_main_pos_z;")
         p("extern float Camera_main_orthographicSize;")
+        p("extern float Camera_main_nearClipPlane;")
+        p("extern float Camera_main_farClipPlane;")
         p("extern float Camera_main_background_r;")
         p("extern float Camera_main_background_g;")
         p("extern float Camera_main_background_b;")
@@ -2237,6 +2255,7 @@ def emit_engine(plan, analyses, used_apis):
     p("    int n = 0;")
     p("    if (!out || max < 1) return 0;")
     any_sprite = False
+    has_cam = bool(plan.get("camera"))
     for cname, cl in sorted(plan["classes"].items()):
         idn = _c_ident(cname)
         if not _class_has_position(cl):
@@ -2267,6 +2286,18 @@ def emit_engine(plan, analyses, used_apis):
         p("        int k;")
         p("        for (k = 0; k < %d && n < max; k = k + 1) {" % len(spr_idx))
         p("            unsigned i = _spr_i[k];")
+        # Unity cameras look along +Z (identity). Depth = object_z - cam_z.
+        if has_cam:
+            if cl.get("two_d"):
+                p("            float oz = 0.f;")
+            else:
+                p("            float oz = %s_get_pos_z(i);" % idn)
+            p("            {")
+            p("                float depth = oz - Camera_main_pos_z;")
+            p("                if (depth < Camera_main_nearClipPlane"
+              " || depth > Camera_main_farClipPlane)")
+            p("                    continue;")
+            p("            }")
         p("            out[n].x = %s_get_pos_x(i);" % idn)
         p("            out[n].y = %s_get_pos_y(i);" % idn)
         p("            out[n].half_w = _spr_hw[k];")
@@ -2522,6 +2553,12 @@ def _lower_method_body(body, cl, plan):
                         "Camera_main_pos_x")
     text = text.replace("Camera.main.transform.position.y",
                         "Camera_main_pos_y")
+    text = text.replace("Camera.main.transform.position.z",
+                        "Camera_main_pos_z")
+    text = text.replace("Camera.main.nearClipPlane",
+                        "Camera_main_nearClipPlane")
+    text = text.replace("Camera.main.farClipPlane",
+                        "Camera_main_farClipPlane")
     text = re.sub(r"Input\.(GetAxis|GetButton|GetKey)\s*\(",
                   lambda m: "Input_%s(" % m.group(1), text)
     # Keyboard.current.<name>Key.isPressed → helpers (null-safe via connected).
@@ -2664,8 +2701,13 @@ def emit_data(plan, used_apis=None):
     if cam:
         p("float Camera_main_pos_x = %sf;" % repr(float(cam["pos"][0])))
         p("float Camera_main_pos_y = %sf;" % repr(float(cam["pos"][1])))
+        p("float Camera_main_pos_z = %sf;" % repr(float(cam["pos"][2])))
         p("float Camera_main_orthographicSize = %sf;" % repr(
             float(cam["orthographic_size"])))
+        p("float Camera_main_nearClipPlane = %sf;" % repr(
+            float(cam.get("near_clip", 0.3))))
+        p("float Camera_main_farClipPlane = %sf;" % repr(
+            float(cam.get("far_clip", 1000.0))))
         p("float Camera_main_background_r = %sf;" % repr(float(cam["bg_r"])))
         p("float Camera_main_background_g = %sf;" % repr(float(cam["bg_g"])))
         p("float Camera_main_background_b = %sf;" % repr(float(cam["bg_b"])))
