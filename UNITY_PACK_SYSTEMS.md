@@ -149,8 +149,22 @@ Unity project until Canvas import lands.
 | `FixedUpdate` | Once per `engine_tick`, then `engine_physics_fixed` |
 
 Only **authored** Rigidbody components are packed — `AddComponent<Rigidbody>` /
-`AddComponent<Rigidbody2D>` is a `PackError`. No colliders or contacts yet
-(Dynamic bodies fall/slide without collision response).
+`AddComponent<Rigidbody2D>` is a `PackError`.
+
+## Colliders (BoxCollider2D / CircleCollider2D)
+
+| Scene authors | Emitted |
+|---------------|---------|
+| Authored `!u!61` BoxCollider2D | Size/offset → half-extents; contacts in `engine_physics_collide2d` |
+| Authored `!u!58` CircleCollider2D | Radius (× max scale); AABB contacts vs boxes/circles |
+| `m_IsTrigger: 1` | Parsed but skipped for solid resolution |
+| Dynamic Rigidbody2D + collider | Separates along MTV; zeros inward velocity |
+
+Static / kinematic colliders (no Dynamic RB) push Dynamic bodies. Transform-only
+GOs that carry a collider (e.g. Ground) are packed as position instances.
+`AddComponent<BoxCollider2D>` / `CircleCollider2D` is a `PackError`. Rotation
+uses an AABB of the OBB (authored `m_LocalRotation`). No PolygonCollider2D /
+3D colliders yet.
 
 ## Refused (would invent assets / components)
 
@@ -163,6 +177,7 @@ Only **authored** Rigidbody components are packed — `AddComponent<Rigidbody>` 
 | `AddComponent<Light>` | Light must already be on a scene GameObject |
 | `AddComponent<Camera>` / `SpriteRenderer` | Must be authored; no invent-draw |
 | `AddComponent<Rigidbody>` / `Rigidbody2D` | Must be authored on a scene GameObject |
+| `AddComponent<BoxCollider2D>` / `CircleCollider2D` | Must be authored on a scene GameObject |
 | `Camera.main` with no scene Camera | Packer will not invent a default camera |
 
 ## Tick order
