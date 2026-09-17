@@ -166,18 +166,33 @@ def _guid_map(root):
     return out
 
 
+def _asset_guid_map(root):
+    """Any Unity .meta guid → asset path (scripts, textures, …)."""
+    out = {}
+    for meta in _walk_files(root, (".meta",)):
+        text = _read(meta)
+        m = re.search(r"(?m)^guid:\s*([0-9a-fA-F]+)\s*$", text)
+        if not m:
+            continue
+        asset = meta[:-5] if meta.endswith(".meta") else meta
+        out[m.group(1).lower()] = asset
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Scene importers
 # ---------------------------------------------------------------------------
 
-def parse_unity_yaml(text, guid_to_script=None):
+def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
     """A Unity .unity YAML subset: GameObject + Transform + MonoBehaviour.
 
     Also imports authored Camera (!u!20) and SpriteRenderer (!u!212). Does
     not invent either — GameObjects without a SpriteRenderer contribute no
-    draws. Returns (objects, lights, cameras).
+    draws. A SpriteRenderer draws only when m_Sprite points at a real
+    project asset (guid in asset_guids). Returns (objects, lights, cameras).
     """
     guid_to_script = guid_to_script or {}
+    asset_guids = asset_guids or {}
     objects = []
     lights = []
     cameras = []
@@ -253,7 +268,11 @@ def parse_unity_yaml(text, guid_to_script=None):
                 r"m_Sprite:\s*\{fileID:\s*(-?\d+)(?:,\s*guid:\s*"
                 r"([0-9a-fA-F]+))?",
                 block)
-            has_sprite = bool(spr and int(spr.group(1)) != 0)
+            has_sprite = False
+            if spr and int(spr.group(1)) != 0:
+                g = spr.group(2).lower() if spr.group(2) else None
+                # Must resolve to a project asset — no invent / dangling guid.
+                has_sprite = bool(g and g in asset_guids)
             rec["sprite"] = {
                 "r": float(col.group(1)) if col else 1.0,
                 "g": float(col.group(2)) if col else 1.0,
@@ -1465,12 +1484,13 @@ def load_project(root):
     if not os.path.isdir(root):
         raise PackError("not a directory: %s" % root)
     guids = _guid_map(root)
+    assets = _asset_guid_map(root)
     objects = []
     lights = []
     cameras = []
     for path in _walk_files(root, (".unity",)):
         objs, scene_lights, scene_cams = parse_unity_yaml(
-            _read(path), guid_to_script=guids)
+            _read(path), guid_to_script=guids, asset_guids=assets)
         objects.extend(objs)
         lights.extend(scene_lights)
         cameras.extend(scene_cams)

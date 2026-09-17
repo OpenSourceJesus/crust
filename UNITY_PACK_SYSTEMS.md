@@ -53,9 +53,11 @@ No invented lights. `AddComponent<Light>` is a `PackError`.
 |---------------------|---------|
 | Authored `!u!20` Camera (MainCamera) | `Camera_main_pos_*`, `orthographicSize`, background RGB |
 | `Camera.main.orthographicSize` / `.transform.position` | Reads those globals |
-| Authored `!u!212` SpriteRenderer **with** `m_Sprite` | Draw list entry (color + scale→size) |
+| Authored `!u!212` SpriteRenderer with `m_Sprite` → **project** sprite | Draw list entry (color + scale→size) |
 
-Empty `m_Sprite: {fileID: 0}` (or missing) does not draw — same as Unity.
+Empty `m_Sprite: {fileID: 0}`, missing sprite, or a guid that does not
+resolve to a `.meta` under the project does not draw — no invent /
+placeholder refs.
 
 **No default visuals.** A GameObject with only a Transform / MonoBehaviour
 does **not** appear in `engine_collect_draws`. Hosts clear to the authored
