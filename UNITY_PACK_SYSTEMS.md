@@ -7,6 +7,10 @@ InputAction maps, no `AddComponent<Light>`. Scripts that need those Unity
 features keep them in the authored project until the packer can import
 them; calling invent-requiring APIs today is a hard `PackError`.
 
+Emitted `engine.c` / `data.c` / `main.c` are also gated through
+`cpprust.translate` (same subset check as `csrust`'s C++ half). Leaving
+that subset is a `PackError` on the generated file.
+
 What *is* lowered: APIs and methods on the MonoBehaviours / scene
 instances that are already placed.
 
@@ -33,6 +37,7 @@ action maps / device graphs).
 | `Debug.Log(msg)` / `print(msg)` | Unity **Player.log** path + newline |
 | `-logFile path` / `-logFile -` | `engine_apply_argv` → file or **stdout** |
 | `System.Console.WriteLine(msg)` | **stdout** (terminal), not Player.log |
+| `WriteLine` / `Debug.Log` of a `GameObject` | `Object.ToString` → `name (UnityEngine.GameObject)` (missing → `"null"`) |
 
 Default log path matches Unity standalone (from `ProjectSettings`
 `companyName` / `productName`, else `DefaultCompany` / project folder):
@@ -47,6 +52,20 @@ Not the process cwd. Terminal output needs `-logFile -` or
 `System.Console.WriteLine` (`using System;` or FQN). Optional `Debug.Log`
 context arg ignored. `engine_console_log_path()` mirrors
 `Application.consoleLogPath`. `Start` runs once before first `Update`.
+
+## GameObject lookup
+
+| Script uses | Emitted |
+|-------------|---------|
+| `GameObject.Find(name)` | Runtime `strcmp` on authored GO name table → index or **-1** |
+| `Object.ToString` (via printing a Find result) | `name (UnityEngine.GameObject)`; missing → `"null"` |
+| `.GetComponent<T>()` | Instance index of authored `T` on that GO, or **-1** |
+| `Find(...).GetComponent<T>().field` | Runtime Find + GetComponent; missing → default `0` / `0.f` |
+
+Parsed with cpprust `_match_paren` / `_match_angle` (same AST helpers
+csrust uses). Find **does not** fail at pack time for unknown names —
+lookup is runtime only (Unity null). `GetComponent<T>` still requires `T`
+to be an authored packed MonoBehaviour (no invented component types).
 
 ## Animation (script motion)
 
