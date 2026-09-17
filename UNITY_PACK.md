@@ -134,9 +134,10 @@ Bit-packed struct fields and GLSL unpacking are a later step; this slice
 is the layout + upload path only. GPU alignment (std140 / `--soa-vec4`),
 SSBO stubs, and culling order of attack are in [UNITY_PACK_GPU.md](UNITY_PACK_GPU.md).
 
-## Animation, particles, physics
+## Animation and physics
 
-A separate opt-in subset — `Time.time` / `Mathf.Sin` / `AnimationCurve`,
-`ParticleSystem.Emit`, `Physics2D.gravity` + `FixedUpdate` — is documented
-in [UNITY_PACK_SYSTEMS.md](UNITY_PACK_SYSTEMS.md). Fixture:
+Opt-in lowering of `Time.time` / `Mathf.Sin` and `Physics2D.gravity` +
+`FixedUpdate` on **authored** scene objects — see
+[UNITY_PACK_SYSTEMS.md](UNITY_PACK_SYSTEMS.md). The packer does not invent
+ParticleSystem pools or AnimationCurves. Fixture:
 `examples/unity_pack/SystemsScene`.

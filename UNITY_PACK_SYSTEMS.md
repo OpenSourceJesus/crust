@@ -1,58 +1,57 @@
-# UNITY_PACK_SYSTEMS — animation, particles, physics subset
+# UNITY_PACK_SYSTEMS — animation and physics on *authored* objects
 
-`unity_pack` is not Unity. These three systems are **opt-in stubs**: the
-packer emits them only when a script mentions the matching API, keeps
-them packed and GLES-friendly, and refuses the rest of the Unity surface.
+`unity_pack` speeds up what is already in the user's Unity (or Godot)
+project. It **does not invent components**: no synthetic ParticleSystem
+pools, no default AnimationCurves, no Rigidbody graph the scene never
+had. Scripts that need those Unity features keep them in the authored
+project until the packer can import them; calling them today is a hard
+`PackError`.
 
-## Animation
+What *is* lowered: APIs and methods on the MonoBehaviours / scene
+instances that are already placed.
+
+## Animation (script motion)
 
 | Script uses | Emitted |
 |-------------|---------|
 | `Time.time` | `float Time_time` (advanced in `engine_tick`) |
 | `Mathf.Sin` / `Mathf.Cos` | `sinf` / `cosf` wrappers (`-lm`) |
-| `AnimationCurve.Evaluate(t)` | Linear keyframe sampler + default bounce curve in `data.c` |
-| `transform.position = new Vector2(x, y)` | Direct `set_pos_*` |
+| `transform.position = new Vector2(x, y)` | Direct `set_pos_*` on packed instances |
 
-Typical pattern: bob or lerp a packed position from `Time.time` or a
-curve. No Animator state machines, no Mecanim, no skeletal skins.
+Bob or lerp positions from `Time` / `Mathf` on objects that exist in the
+scene. No Animator, Mecanim, or skeletal skins.
 
-## Particles
-
-| Script uses | Emitted |
-|-------------|---------|
-| `ParticleSystem.Emit(x, y)` | Fixed pool (64), spawn at `(x,y)` with a short upward burst |
-
-`ParticleSystem_Tick(dt)` integrates and retires by life.
-`engine_collect_draws` appends live particles as small quads after
-instance draws. No GPU particles, no modules, no trails.
-
-## Physics (2D)
+## Physics (2D globals + FixedUpdate)
 
 | Script uses | Emitted |
 |-------------|---------|
-| `Physics2D.gravity` | `Physics2D_gravity_x/y` (default `(0, -9.81)`) |
+| `Physics2D.gravity` | `Physics2D_gravity_x/y` (Unity default `(0, -9.81)`) |
 | `Time.fixedDeltaTime` | Host-pokeable float (default `1/50`) |
-| `FixedUpdate` | Called once per `engine_tick` before `Update` |
+| `FixedUpdate` | Once per `engine_tick`, before `Update` |
 
-Integrate velocity in `FixedUpdate` and write `transform.position` the
-same way gameplay scripts already do. No colliders, no contacts, no
-Rigidbody2D component graph — velocity is ordinary packed float fields
-(`velX` / `velY` or expanded `Vector2`).
+Velocity stays ordinary packed float fields on the user's script
+(`velX` / `velY`). No colliders, contacts, or invented Rigidbody2D
+components.
+
+## Refused (would invent assets / components)
+
+| Script uses | Why refused |
+|-------------|-------------|
+| `ParticleSystem.Emit` | Needs a ParticleSystem in the project; packer will not invent a pool |
+| `AnimationCurve.Evaluate` | Needs authored curve assets; packer will not invent keyframes |
 
 ## Tick order
 
 ```
-Time_time += Time_deltaTime
-ParticleSystem_Tick(Time_deltaTime)   // if Emit used
-foreach class: FixedUpdate            // if present
+Time_time += Time_deltaTime   // if Time.time used
+foreach class: FixedUpdate    // if present
 foreach class: Update
 ```
 
 ## Fixture
 
-`examples/unity_pack/SystemsScene` — Bouncer (`Mathf.Sin` + `Time.time`),
-CurvePad (`AnimationCurve.Evaluate`), Ball (`FixedUpdate` + gravity),
-Emitter (`ParticleSystem.Emit`). Pack and tick:
+`examples/unity_pack/SystemsScene` — Bouncer (`Mathf.Sin` + `Time.time`)
+and Ball (`FixedUpdate` + gravity), both scene-authored MonoBehaviours:
 
 ```
 python3 tools/unity_pack.py examples/unity_pack/SystemsScene -o /tmp/sys

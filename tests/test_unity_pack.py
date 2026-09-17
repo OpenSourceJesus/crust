@@ -305,7 +305,7 @@ SYSTEMS = os.path.join(ROOT, "examples", "unity_pack", "SystemsScene")
 
 
 class TestSystems(unittest.TestCase):
-    """Animation / particles / physics subset — see UNITY_PACK_SYSTEMS.md."""
+    """Animation / physics on authored objects — see UNITY_PACK_SYSTEMS.md."""
 
     def test_detects_system_apis(self):
         _objs, analyses = unity_pack.load_project(SYSTEMS)
@@ -314,12 +314,12 @@ class TestSystems(unittest.TestCase):
             apis |= a["apis"]
         self.assertIn("Time.time", apis)
         self.assertIn("Mathf.Sin", apis)
-        self.assertIn("AnimationCurve.Evaluate", apis)
         self.assertIn("Physics2D.gravity", apis)
         self.assertIn("Time.fixedDeltaTime", apis)
-        self.assertIn("ParticleSystem.Emit", apis)
+        self.assertNotIn("ParticleSystem.Emit", apis)
+        self.assertNotIn("AnimationCurve.Evaluate", apis)
 
-    def test_emits_opt_in_stubs(self):
+    def test_emits_opt_in_stubs_not_invented_components(self):
         d = tempfile.mkdtemp(prefix="upack-sys-")
         unity_pack.pack(SYSTEMS, d)
         with open(os.path.join(d, "engine.c")) as f:
@@ -327,21 +327,56 @@ class TestSystems(unittest.TestCase):
         with open(os.path.join(d, "data.c")) as f:
             data = f.read()
         self.assertIn("Mathf_Sin", engine)
-        self.assertIn("AnimationCurve_Evaluate", engine)
-        self.assertIn("ParticleSystem_Emit", engine)
-        self.assertIn("ParticleSystem_Tick", engine)
         self.assertIn("Ball_FixedUpdate", engine)
         self.assertIn("Time_time = Time_time + Time_deltaTime", engine)
         self.assertIn("Physics2D_gravity_y", data)
-        self.assertIn("_AnimCurve0", data)
-        # MiniScene must not pull these in.
+        self.assertNotIn("ParticleSystem_Emit", engine)
+        self.assertNotIn("AnimationCurve_Evaluate", engine)
+        self.assertNotIn("_AnimCurve0", data)
+        self.assertNotIn("PARTICLE_MAX", engine)
+        # MiniScene must not pull Sin / physics in.
         d2 = tempfile.mkdtemp(prefix="upack-mini-")
         unity_pack.pack(SCENE, d2)
         with open(os.path.join(d2, "engine.c")) as f:
             mini = f.read()
-        self.assertNotIn("ParticleSystem_Emit", mini)
-        self.assertNotIn("AnimationCurve_Evaluate", mini)
         self.assertNotIn("Mathf_Sin", mini)
+        self.assertNotIn("Physics2D_gravity", mini)
+
+    def test_refuses_invented_particle_system(self):
+        src = (
+            "using UnityEngine;\n"
+            "public class Spark : MonoBehaviour {\n"
+            "    public void Update() {\n"
+            "        ParticleSystem.Emit(0f, 0f);\n"
+            "    }\n"
+            "}\n"
+        )
+        root = tempfile.mkdtemp(prefix="upack-refuse-ps-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Spark.cs"), "w") as f:
+            f.write(src)
+        with open(os.path.join(scripts, "Spark.cs.meta"), "w") as f:
+            f.write("guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Spark\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}\n"
+            )
+        with self.assertRaises(unity_pack.PackError) as cm:
+            unity_pack.pack(root, tempfile.mkdtemp(prefix="upack-out-"))
+        self.assertIn("ParticleSystem", cm.exception.message)
 
 
 @needs_cc
@@ -357,7 +392,7 @@ class TestSystemsRuns(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
         self.assertIn("draws=", run.stdout)
 
-    def test_tick_animates_physics_and_particles(self):
+    def test_tick_animates_and_physics(self):
         d = tempfile.mkdtemp(prefix="upack-sys-run-")
         unity_pack.pack(SYSTEMS, d)
         host = os.path.join(d, "host.c")
@@ -382,7 +417,7 @@ class TestSystemsRuns(unittest.TestCase):
                 "  int n = engine_collect_draws(buf, 128);\n"
                 "  if (Time_time < 0.9f) return 2;\n"
                 "  if (_Ball_inst_array[0].pos_y >= y0) return 3;\n"
-                "  if (n < 5) return 4; /* instances + particles */\n"
+                "  if (n != 2) return 4; /* Bouncer + Ball only */\n"
                 "  return 0;\n"
                 "}\n"
             )
