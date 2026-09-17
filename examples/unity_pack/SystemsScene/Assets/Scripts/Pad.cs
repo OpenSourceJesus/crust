@@ -1,6 +1,6 @@
 using UnityEngine;
 
-/* Input Manager subset: host-fed Horizontal axis. */
+/* Input Manager subset: host-fed Horizontal axis (GLFW arrows/WASD). */
 public class Pad : MonoBehaviour {
     public float speed;
 
