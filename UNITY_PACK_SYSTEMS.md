@@ -33,6 +33,7 @@ action maps / device graphs).
 | `Debug.Log(msg)` / `print(msg)` | Unity **Player.log** path + newline |
 | `-logFile path` / `-logFile -` | `engine_apply_argv` → file or **stdout** |
 | `System.Console.WriteLine(msg)` | **stdout** (terminal), not Player.log |
+| `WriteLine` / `Debug.Log` of a `GameObject` | `Object.ToString` → `name (UnityEngine.GameObject)` (missing → `"null"`) |
 
 Default log path matches Unity standalone (from `ProjectSettings`
 `companyName` / `productName`, else `DefaultCompany` / project folder):
@@ -53,6 +54,7 @@ context arg ignored. `engine_console_log_path()` mirrors
 | Script uses | Emitted |
 |-------------|---------|
 | `GameObject.Find(name)` | Runtime `strcmp` on authored GO name table → index or **-1** |
+| `Object.ToString` (via printing a Find result) | `name (UnityEngine.GameObject)`; missing → `"null"` |
 | `.GetComponent<T>()` | Instance index of authored `T` on that GO, or **-1** |
 | `Find(...).GetComponent<T>().field` | Runtime Find + GetComponent; missing → default `0` / `0.f` |
 

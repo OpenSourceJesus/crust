@@ -1626,6 +1626,20 @@ def emit_engine(plan, analyses, used_apis):
             p("    return -1;")
             p("}")
             p("")
+            # Unity prints "null" for a missing Object (Find miss / destroyed).
+            p("/* UnityEngine.Object.ToString — \"name (Type)\", else \"null\" */")
+            p("static char _object_tostring_buf[256];")
+            p("static const char *Object_ToString(int go) {")
+            p("    int n;")
+            p("    if (go < 0 || go >= _engine_go_count) return \"null\";")
+            p("    n = snprintf(_object_tostring_buf, sizeof _object_tostring_buf,")
+            p("                 \"%s (UnityEngine.GameObject)\",")
+            p("                 _engine_go_name[go]);")
+            p("    if (n < 0 || (size_t)n >= sizeof _object_tostring_buf)")
+            p("        return _engine_go_name[go];")
+            p("    return _object_tostring_buf;")
+            p("}")
+            p("")
         # Emit GetComponent_<T> for every packed class (and requested types).
         for cname in sorted(set(plan["classes"]) | getcomponent_types):
             if cname not in plan["classes"]:
@@ -2006,6 +2020,46 @@ def _strip_debug_log_context_arg(text):
     return "".join(out)
 
 
+def _wrap_log_gameobject_tostring(text):
+    """Console/Debug printing a GameObject uses Object.ToString.
+
+    Packed Find returns an int index; printing that int is not Unity. Wrap
+    `GameObject_Find(...)` so logs get `name (UnityEngine.GameObject)`.
+    """
+    out = []
+    i = 0
+    while True:
+        m = re.search(r"(?:Console_WriteLine|Debug_Log)\s*\(", text[i:])
+        if not m:
+            out.append(text[i:])
+            break
+        out.append(text[i:i + m.start()])
+        call = m.group(0)
+        callee = re.match(r"(Console_WriteLine|Debug_Log)", call).group(1)
+        start = i + m.end()
+        depth = 1
+        j = start
+        while j < len(text) and depth:
+            c = text[j]
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        if depth != 0:
+            out.append(text[i + m.start():])
+            break
+        args = text[start:j].strip()
+        if (re.match(r"GameObject_Find\s*\(", args)
+                and not args.startswith("Object_ToString")):
+            args = "Object_ToString(%s)" % args
+        out.append("%s(%s)" % (callee, args))
+        i = j + 1
+    return "".join(out)
+
+
 def _lower_method_body(body, cl, plan):
     """C# subset method → C against packed arrays.
 
@@ -2052,6 +2106,8 @@ def _lower_method_body(body, cl, plan):
     text = _strip_debug_log_context_arg(text)
     text = re.sub(r"System\.Console\.WriteLine\b", "Console_WriteLine", text)
     text = re.sub(r"(?<![\w.])Console\.WriteLine\b", "Console_WriteLine", text)
+    # Unity Object.ToString when printing a Find result (name, not index).
+    text = _wrap_log_gameobject_tostring(text)
     text = re.sub(r"Mathf\.(Abs|Min|Max|Clamp|Lerp|Sin|Cos)\s*\(",
                   lambda m: "Mathf_%s(" % m.group(1), text)
     text = re.sub(r"transform\.position\.x", idn + "_get_pos_x(i)", text)

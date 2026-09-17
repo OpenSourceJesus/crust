@@ -350,6 +350,7 @@ class TestSystems(unittest.TestCase):
         self.assertIn('GameObject_Find("BouncePad")', engine)
         self.assertIn("GameObject_GetComponent_Bouncer", engine)
         self.assertIn("Bouncer_get_amp", engine)
+        self.assertIn("Object_ToString", engine)
         self.assertIn("engine_keyboard_connected", data)
         self.assertIn("engine_keyboard_leftArrow", data)
         self.assertIn("RenderSettings_ambient_r", data)
@@ -593,6 +594,21 @@ class TestSystems(unittest.TestCase):
         self.assertEqual(chains[0]["component"], "Bouncer")
         self.assertEqual(chains[0]["field"], "amp")
 
+    def test_wrap_log_gameobject_tostring(self):
+        """Printing a Find result uses Object.ToString (name), not the index."""
+        src = 'Console_WriteLine(GameObject_Find("BouncePad"));'
+        out = unity_pack._wrap_log_gameobject_tostring(src)
+        self.assertEqual(
+            out,
+            'Console_WriteLine(Object_ToString(GameObject_Find("BouncePad")));')
+        # Idempotent
+        self.assertEqual(out, unity_pack._wrap_log_gameobject_tostring(out))
+        dbg = 'Debug_Log(GameObject_Find("X"));'
+        self.assertEqual(
+            unity_pack._wrap_log_gameobject_tostring(dbg),
+            'Debug_Log(Object_ToString(GameObject_Find("X")));')
+
+    @needs_cc
     def test_find_unknown_name_returns_minus_one_at_runtime(self):
         """Find name lookup is runtime-only — unknown names pack and yield -1."""
         root = tempfile.mkdtemp(prefix="upack-find-rt-")
@@ -629,14 +645,19 @@ class TestSystems(unittest.TestCase):
         d = tempfile.mkdtemp(prefix="upack-out-")
         unity_pack.pack(root, d)
         with open(os.path.join(d, "engine.c")) as f:
-            self.assertIn('GameObject_Find("Nope")', f.read())
+            eng = f.read()
+            self.assertIn('GameObject_Find("Nope")', eng)
+            self.assertIn("Object_ToString", eng)
         r = subprocess.run(["make", "-C", d], capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr or r.stdout)
         run = subprocess.run([os.path.join(d, "game")],
                              capture_output=True, text=True, cwd=d)
         self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
-        self.assertIn("-1", run.stdout)
+        # Unity prints "null" for a missing Object — not the packed -1 index.
+        self.assertNotIn("-1", run.stdout)
+        self.assertIn("null", run.stdout)
 
+    @needs_cc
     def test_console_writeline_gameobject_prints_name(self):
         """Unity Object.ToString → name (UnityEngine.GameObject) on Console."""
         root = tempfile.mkdtemp(prefix="upack-go-tostring-")
