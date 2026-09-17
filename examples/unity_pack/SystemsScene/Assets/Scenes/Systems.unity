@@ -1,0 +1,67 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1 &1001
+GameObject:
+  m_Name: BouncePad
+  m_Component:
+  - component: {fileID: 1002}
+  - component: {fileID: 1003}
+--- !u!4 &1002
+Transform:
+  m_GameObject: {fileID: 1001}
+  m_LocalPosition: {x: -1.5, y: 0, z: 0}
+--- !u!114 &1003
+MonoBehaviour:
+  m_GameObject: {fileID: 1001}
+  m_Script: {fileID: 11500000, guid: cccccccccccccccccccccccccccccccc}
+  baseY: 0
+  amp: 0.5
+  speed: 3
+--- !u!1 &2001
+GameObject:
+  m_Name: HeavyBall
+  m_Component:
+  - component: {fileID: 2002}
+  - component: {fileID: 2003}
+--- !u!4 &2002
+Transform:
+  m_GameObject: {fileID: 2001}
+  m_LocalPosition: {x: 0, y: 2, z: 0}
+--- !u!114 &2003
+MonoBehaviour:
+  m_GameObject: {fileID: 2001}
+  m_Script: {fileID: 11500000, guid: dddddddddddddddddddddddddddddddd}
+  velX: 0.5
+  velY: 0
+  gravityScale: 1
+--- !u!1 &3001
+GameObject:
+  m_Name: Spark
+  m_Component:
+  - component: {fileID: 3002}
+  - component: {fileID: 3003}
+--- !u!4 &3002
+Transform:
+  m_GameObject: {fileID: 3001}
+  m_LocalPosition: {x: 1.5, y: 0, z: 0}
+--- !u!114 &3003
+MonoBehaviour:
+  m_GameObject: {fileID: 3001}
+  m_Script: {fileID: 11500000, guid: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee}
+  rate: 10
+--- !u!1 &4001
+GameObject:
+  m_Name: CurvePad
+  m_Component:
+  - component: {fileID: 4002}
+  - component: {fileID: 4003}
+--- !u!4 &4002
+Transform:
+  m_GameObject: {fileID: 4001}
+  m_LocalPosition: {x: -0.5, y: -1.5, z: 0}
+--- !u!114 &4003
+MonoBehaviour:
+  m_GameObject: {fileID: 4001}
+  m_Script: {fileID: 11500000, guid: ffffffffffffffffffffffffffffffff}
+  baseY: -1.5
+  amp: 0.4

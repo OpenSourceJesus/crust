@@ -50,8 +50,9 @@ foreach class: Update
 
 ## Fixture
 
-`examples/unity_pack/SystemsScene` — one Bouncer (animation), one Ball
-(physics), one Emitter (particles). Pack and tick:
+`examples/unity_pack/SystemsScene` — Bouncer (`Mathf.Sin` + `Time.time`),
+CurvePad (`AnimationCurve.Evaluate`), Ball (`FixedUpdate` + gravity),
+Emitter (`ParticleSystem.Emit`). Pack and tick:
 
 ```
 python3 tools/unity_pack.py examples/unity_pack/SystemsScene -o /tmp/sys
