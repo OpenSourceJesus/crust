@@ -35,7 +35,7 @@ needs_cc = unittest.skipIf(_CC is None, "no C compiler")
 class TestSceneImport(unittest.TestCase):
 
     def test_unity_yaml_counts(self):
-        objs, analyses, _lights = unity_pack.load_project(SCENE)
+        objs, analyses, _lights, _cams = unity_pack.load_project(SCENE)
         names = sorted(o["name"] for o in objs)
         self.assertEqual(names, ["CoinA", "CoinB", "Hero"])
         coins = [o for o in objs if o["class"] == "Coin"]
@@ -58,7 +58,7 @@ class TestSceneImport(unittest.TestCase):
 class TestLayout(unittest.TestCase):
 
     def setUp(self):
-        self.objs, self.an, _lights = unity_pack.load_project(SCENE)
+        self.objs, self.an, _lights, _cams = unity_pack.load_project(SCENE)
         self.plan = unity_pack.plan_layouts(self.objs, self.an)
 
     def test_two_d_drops_z(self):
@@ -308,7 +308,7 @@ class TestSystems(unittest.TestCase):
     """Authored systems subset — see UNITY_PACK_SYSTEMS.md."""
 
     def test_detects_system_apis(self):
-        _objs, analyses, lights = unity_pack.load_project(SYSTEMS)
+        _objs, analyses, lights, cameras = unity_pack.load_project(SYSTEMS)
         apis = set()
         for a in analyses:
             apis |= a["apis"]
@@ -320,8 +320,13 @@ class TestSystems(unittest.TestCase):
         self.assertIn("RenderSettings.ambientLight", apis)
         self.assertEqual(len(lights), 1)
         self.assertAlmostEqual(lights[0]["intensity"], 1.5)
+        self.assertEqual(len(cameras), 1)
+        self.assertTrue(cameras[0]["main"])
+        self.assertAlmostEqual(cameras[0]["orthographic_size"], 3.0)
         self.assertNotIn("ParticleSystem.Emit", apis)
         self.assertNotIn("AnimationCurve.Evaluate", apis)
+        spr = [o for o in _objs if o.get("sprite")]
+        self.assertEqual(len(spr), 3)  # Bouncer, Ball, Pad — not Shade
 
     def test_emits_opt_in_stubs_not_invented_components(self):
         d = tempfile.mkdtemp(prefix="upack-sys-")
@@ -339,6 +344,8 @@ class TestSystems(unittest.TestCase):
         self.assertIn("_Light_intensity", data)
         self.assertIn("1.5f", data)
         self.assertIn("Physics2D_gravity_y", data)
+        self.assertIn("Camera_main_orthographicSize", data)
+        self.assertIn("SpriteRenderer", engine)
         self.assertNotIn("ParticleSystem_Emit", engine)
         self.assertNotIn("AnimationCurve_Evaluate", engine)
         self.assertNotIn("_AnimCurve0", data)
@@ -354,6 +361,47 @@ class TestSystems(unittest.TestCase):
         self.assertNotIn("Physics2D_gravity", mini)
         self.assertNotIn("Input_GetAxis", mini)
         self.assertNotIn("_Light_intensity", mini_data)
+
+    def test_no_default_draws_without_sprite_renderer(self):
+        """Bare MonoBehaviour GameObjects are not invent-drawn."""
+        root = tempfile.mkdtemp(prefix="upack-nodraw-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Ghost.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Ghost : MonoBehaviour {\n"
+                "    public float speed;\n"
+                "    public void Update() {\n"
+                "        transform.position += new Vector2(speed * Time.deltaTime, 0);\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Ghost.cs.meta"), "w") as f:
+            f.write("guid: cccccccccccccccccccccccccccccccc\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Ghost\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: cccccccccccccccccccccccccccccccc}\n"
+                "  speed: 1\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-nodraw-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            engine = f.read()
+        self.assertIn("no authored SpriteRenderers", engine)
+        self.assertNotIn("out[n].half_w", engine)
 
     def test_refuses_invented_particle_system(self):
         src = (
@@ -496,7 +544,7 @@ class TestSystemsRuns(unittest.TestCase):
                 "  if (_Ball_inst_array[0].pos_y >= y0) return 3;\n"
                 "  if (_Pad_inst_array[0].pos_x <= x0) return 4;\n"
                 "  if (_Light_intensity[0] < 1.4f) return 5;\n"
-                "  if (n != 4) return 6; /* Bouncer+Ball+Pad+AmbientBias */\n"
+                "  if (n != 3) return 6; /* SpriteRenderer on Bouncer+Ball+Pad */\n"
                 "  return 0;\n"
                 "}\n"
             )
