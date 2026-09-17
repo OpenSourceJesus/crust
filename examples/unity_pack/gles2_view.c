@@ -27,17 +27,18 @@
 
 #include "engine_draw.h"
 
+float Camera_main_pos_x __attribute__((weak)) = 0.f;
+float Camera_main_pos_y __attribute__((weak)) = 0.f;
+float Camera_main_orthographicSize __attribute__((weak)) = 3.f;
+float Camera_main_background_r __attribute__((weak)) = 0.f;
+float Camera_main_background_g __attribute__((weak)) = 0.f;
+float Camera_main_background_b __attribute__((weak)) = 0.f;
+
 #define WIDTH  96
 #define HEIGHT 64
 #define MAX_DRAWS 64
 /* Two triangles per quad, 5 floats (xy + rgb) per vertex. */
 #define MAX_FLOATS (MAX_DRAWS * 6 * 5)
-
-/* Ortho covering MiniScene (-1..2) with margin. */
-#define WORLD_LEFT   (-3.0f)
-#define WORLD_RIGHT  ( 3.0f)
-#define WORLD_BOTTOM (-2.0f)
-#define WORLD_TOP    ( 3.0f)
 
 #define TICKS_BEFORE_DRAW 30
 
@@ -59,15 +60,28 @@ static const char *FRAG_SRC =
 
 static unsigned char pixels[WIDTH * HEIGHT * 4];
 static GLfloat vert_buf[MAX_FLOATS];
+static float world_left, world_right, world_bottom, world_top;
+
+static void refresh_camera_bounds(float aspect)
+{
+    float half_h = Camera_main_orthographicSize;
+    float half_w = half_h * aspect;
+    if (half_w < 0.01f)
+        half_w = 0.01f;
+    world_left = Camera_main_pos_x - half_w;
+    world_right = Camera_main_pos_x + half_w;
+    world_bottom = Camera_main_pos_y - half_h;
+    world_top = Camera_main_pos_y + half_h;
+}
 
 static float world_to_ndc_x(float x)
 {
-    return 2.0f * (x - WORLD_LEFT) / (WORLD_RIGHT - WORLD_LEFT) - 1.0f;
+    return 2.0f * (x - world_left) / (world_right - world_left) - 1.0f;
 }
 
 static float world_to_ndc_y(float y)
 {
-    return 2.0f * (y - WORLD_BOTTOM) / (WORLD_TOP - WORLD_BOTTOM) - 1.0f;
+    return 2.0f * (y - world_bottom) / (world_top - world_bottom) - 1.0f;
 }
 
 static void emit_vert(int *ni, float x, float y, float r, float g, float b)
@@ -229,6 +243,7 @@ static int draw_scene(GLuint prog)
     }
     printf("draws=%d classes=%d\n", ndraw, engine_class_count());
 
+    refresh_camera_bounds((float)WIDTH / (float)HEIGHT);
     for (i = 0; i < ndraw; i++)
         emit_quad(&nfloats, &draws[i]);
 
@@ -240,7 +255,8 @@ static int draw_scene(GLuint prog)
                  vert_buf, GL_STATIC_DRAW);
 
     glViewport(0, 0, WIDTH, HEIGHT);
-    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClearColor(Camera_main_background_r, Camera_main_background_g,
+                 Camera_main_background_b, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
     glUseProgram(prog);

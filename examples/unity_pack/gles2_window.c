@@ -21,6 +21,14 @@
 
 extern float Time_deltaTime;
 
+/* Camera globals — strong defs from data.c when a Camera was authored. */
+float Camera_main_pos_x __attribute__((weak)) = 0.f;
+float Camera_main_pos_y __attribute__((weak)) = 0.f;
+float Camera_main_orthographicSize __attribute__((weak)) = 3.f;
+float Camera_main_background_r __attribute__((weak)) = 0.05f;
+float Camera_main_background_g __attribute__((weak)) = 0.05f;
+float Camera_main_background_b __attribute__((weak)) = 0.08f;
+
 /* Weak so MiniScene (no Input) still links; SystemsScene data.c wins. */
 float engine_input_axis_Horizontal __attribute__((weak)) = 0.f;
 float engine_input_axis_Vertical __attribute__((weak)) = 0.f;
@@ -29,11 +37,6 @@ float engine_input_axis_Vertical __attribute__((weak)) = 0.f;
 #define WIN_H 600
 #define MAX_DRAWS 64
 #define MAX_FLOATS (MAX_DRAWS * 6 * 5)
-
-#define WORLD_LEFT   (-3.0f)
-#define WORLD_RIGHT  ( 3.0f)
-#define WORLD_BOTTOM (-2.0f)
-#define WORLD_TOP    ( 3.0f)
 
 static const char *VERT_SRC =
     "attribute vec2 a_pos;\n"
@@ -56,14 +59,28 @@ static GLuint prog;
 static GLuint vbo;
 static int want_close;
 
+static float world_left, world_right, world_bottom, world_top;
+
+static void refresh_camera_bounds(float aspect)
+{
+    float half_h = Camera_main_orthographicSize;
+    float half_w = half_h * aspect;
+    if (half_w < 0.01f)
+        half_w = 0.01f;
+    world_left = Camera_main_pos_x - half_w;
+    world_right = Camera_main_pos_x + half_w;
+    world_bottom = Camera_main_pos_y - half_h;
+    world_top = Camera_main_pos_y + half_h;
+}
+
 static float world_to_ndc_x(float x)
 {
-    return 2.0f * (x - WORLD_LEFT) / (WORLD_RIGHT - WORLD_LEFT) - 1.0f;
+    return 2.0f * (x - world_left) / (world_right - world_left) - 1.0f;
 }
 
 static float world_to_ndc_y(float y)
 {
-    return 2.0f * (y - WORLD_BOTTOM) / (WORLD_TOP - WORLD_BOTTOM) - 1.0f;
+    return 2.0f * (y - world_bottom) / (world_top - world_bottom) - 1.0f;
 }
 
 static void emit_vert(int *ni, float x, float y, float r, float g, float b)
@@ -173,14 +190,16 @@ static void frame(GLFWwindow *win)
 
     poll_input_axes(win);
     engine_tick();
+    glfwGetFramebufferSize(win, &fbw, &fbh);
+    refresh_camera_bounds(fbh > 0 ? (float)fbw / (float)fbh : 1.0f);
     ndraw = engine_collect_draws(draws, MAX_DRAWS);
     for (i = 0; i < ndraw; i++)
         emit_quad(&nfloats, &draws[i]);
     nverts = nfloats / 5;
 
-    glfwGetFramebufferSize(win, &fbw, &fbh);
     glViewport(0, 0, fbw, fbh);
-    glClearColor(0.05f, 0.05f, 0.08f, 1.0f);
+    glClearColor(Camera_main_background_r, Camera_main_background_g,
+                 Camera_main_background_b, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
     glBindBuffer(GL_ARRAY_BUFFER, vbo);
