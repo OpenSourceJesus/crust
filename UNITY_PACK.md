@@ -18,6 +18,12 @@ Unity (and later Godot / Blender) object model, lowered through the
 same discipline as `cs2cpp.py` / `csrust.py`: what is not in the
 subset is refused with a reason.
 
+After emit, `engine.c` / `data.c` / `main.c` are run through
+`cpprust._check_unsupported` and `cpprust.translate` (output discarded).
+If the hand-lowered C leaves the crust subset, pack fails with
+`PackError` naming the file — so you know the generated C stayed
+inside the same gate `csrust` uses for its C++ half.
+
 ## How a 16-byte object happens
 
 Unity's `MonoBehaviour` + `Transform` + `GameObject` is hundreds of

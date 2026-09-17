@@ -2504,6 +2504,25 @@ def emit_soa_positions_glsl(plan):
     return "\n".join(lines) + "\n"
 
 
+def validate_emitted_c(text, path="engine.c"):
+    """Gate generated C through cpprust's subset checks (same as csrust's C++ half).
+
+    unity_pack lowers by hand; this proves the result still sits inside the
+    crust subset that `tools/cpprust.py` accepts — `_check_unsupported` plus
+    a full `translate` pass. The translated text is discarded; only the
+    refusal matters. Raises PackError on subset violations.
+    """
+    import tools.cpprust as cpprust
+    try:
+        scan = cpprust._blank_directives(cpprust._strip_comments(text))
+        cpprust._check_unsupported(scan, path)
+        cpprust.translate(text, path=path)
+    except cpprust.CppError as e:
+        raise PackError(
+            "emitted %s left the crust / cpprust subset: %s"
+            % (path, e.message))
+
+
 def pack(root, outdir, soa=False, soa_vec4=False):
     objects, analyses, lights, cameras = load_project(root)
     used_apis = set()
@@ -2549,6 +2568,9 @@ def pack(root, outdir, soa=False, soa_vec4=False):
     engine = emit_engine(plan, analyses, used_apis)
     data = emit_data(plan, used_apis)
     main_c = emit_main()
+    validate_emitted_c(engine, "engine.c")
+    validate_emitted_c(data, "data.c")
+    validate_emitted_c(main_c, "main.c")
     with open(os.path.join(outdir, "engine.c"), "w") as f:
         f.write(engine)
     with open(os.path.join(outdir, "data.c"), "w") as f:

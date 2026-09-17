@@ -7,6 +7,10 @@ InputAction maps, no `AddComponent<Light>`. Scripts that need those Unity
 features keep them in the authored project until the packer can import
 them; calling invent-requiring APIs today is a hard `PackError`.
 
+Emitted `engine.c` / `data.c` / `main.c` are also gated through
+`cpprust.translate` (same subset check as `csrust`'s C++ half). Leaving
+that subset is a `PackError` on the generated file.
+
 What *is* lowered: APIs and methods on the MonoBehaviours / scene
 instances that are already placed.
 
