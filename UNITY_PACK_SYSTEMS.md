@@ -48,6 +48,19 @@ Not the process cwd. Terminal output needs `-logFile -` or
 context arg ignored. `engine_console_log_path()` mirrors
 `Application.consoleLogPath`. `Start` runs once before first `Update`.
 
+## GameObject lookup
+
+| Script uses | Emitted |
+|-------------|---------|
+| `GameObject.Find(name)` | Runtime `strcmp` on authored GO name table → index or **-1** |
+| `.GetComponent<T>()` | Instance index of authored `T` on that GO, or **-1** |
+| `Find(...).GetComponent<T>().field` | Runtime Find + GetComponent; missing → default `0` / `0.f` |
+
+Parsed with cpprust `_match_paren` / `_match_angle` (same AST helpers
+csrust uses). Find **does not** fail at pack time for unknown names —
+lookup is runtime only (Unity null). `GetComponent<T>` still requires `T`
+to be an authored packed MonoBehaviour (no invented component types).
+
 ## Animation (script motion)
 
 | Script uses | Emitted |

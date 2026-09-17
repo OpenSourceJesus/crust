@@ -9,7 +9,7 @@ public class Pad : MonoBehaviour
 	void Start ()
 	{
 		Debug.Log("Hello World!");
-		System.Console.WriteLine("Game began");
+		System.Console.WriteLine(GameObject.Find("BouncePad").GetComponent<Bouncer>().amp);
 	}
 
 	void Update ()

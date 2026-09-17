@@ -67,6 +67,8 @@ _API = {
     "print": True,
     # Terminal / stdout — System.Console, not Debug.Log.
     "Console.WriteLine": True,
+    "GameObject.Find": True,
+    "GetComponent": True,
 }
 
 # APIs that would require inventing scene components / assets we do not pack.
@@ -139,6 +141,7 @@ _UNITY_API = re.compile(
     r"(?<![.\w])Canvas(?=\s|\.|;)|"
     r"Debug\.Log|(?<![\w.])print(?=\s*\()|"
     r"System\.Console\.WriteLine|(?<![\w.])Console\.WriteLine|"
+    r"GameObject\.Find|GetComponent\s*<|"
     r"Vector2|Vector3|Quaternion)\b)"
 )
 _WANT_INPUT = frozenset({"Input.GetAxis", "Input.GetButton", "Input.GetKey"})
@@ -648,9 +651,182 @@ def _class_name_from_cs(path):
     return None
 
 
-# ---------------------------------------------------------------------------
-# Script analysis
-# ---------------------------------------------------------------------------
+def _string_literal_value(expr):
+    """Return the string inside a C# literal, or None if not a plain literal."""
+    s = (expr or "").strip()
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        return s[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+    return None
+
+
+def _ast_find_getcomponent_chains(text):
+    """Locate `GameObject.Find(...).GetComponent<T>()` chains via cpprust AST.
+
+    Uses `_match_paren` / `_match_angle` (same helpers csrust → cpprust uses)
+    so nested calls and generics are not split by naive regex. Yields dicts
+    with source spans, Find args, component type, and optional `.field`.
+    """
+    import tools.cpprust as cpprust
+    scan = cs2cpp._blank(text)
+    out = []
+    for m in re.finditer(
+            r"(?:UnityEngine\.)?GameObject\.Find\s*\(", scan):
+        open_p = m.end() - 1
+        close_p = cpprust._match_paren(scan, open_p)
+        if close_p is None:
+            continue
+        find_args = text[open_p + 1:close_p]
+        end = close_p + 1
+        comp_ty = None
+        field = None
+        # .GetComponent < T > ( ... )
+        gm = re.match(r"\s*\.\s*GetComponent\s*<", scan[end:])
+        if gm:
+            angle_open = end + gm.end() - 1
+            angle_close = cpprust._match_angle(scan, angle_open)
+            if angle_close is None:
+                continue
+            comp_ty = text[angle_open + 1:angle_close].strip()
+            after_angle = scan[angle_close + 1:]
+            pm = re.match(r"\s*\(", after_angle)
+            if not pm:
+                continue
+            g_open = angle_close + 1 + pm.start()
+            # pm matches optional space then (; open paren index:
+            g_open = angle_close + 1 + after_angle.find("(")
+            g_close = cpprust._match_paren(scan, g_open)
+            if g_close is None:
+                continue
+            end = g_close + 1
+            fm = re.match(r"\s*\.\s*([A-Za-z_]\w*)\b", scan[end:])
+            if fm:
+                field = fm.group(1)
+                end = end + fm.end()
+        out.append({
+            "start": m.start(),
+            "end": end,
+            "find_args": find_args.strip(),
+            "component": comp_ty,
+            "field": field,
+        })
+    # Standalone this.GetComponent<T>() / GetComponent<T>()
+    for m in re.finditer(
+            r"(?:(?<![\w.])this\s*\.\s*)?GetComponent\s*<", scan):
+        # Skip if already covered as part of a Find chain.
+        if any(c["start"] <= m.start() < c["end"] for c in out):
+            continue
+        angle_open = m.end() - 1
+        angle_close = cpprust._match_angle(scan, angle_open)
+        if angle_close is None:
+            continue
+        comp_ty = text[angle_open + 1:angle_close].strip()
+        after_angle = scan[angle_close + 1:]
+        if after_angle.find("(") < 0:
+            continue
+        g_open = angle_close + 1 + after_angle.find("(")
+        g_close = cpprust._match_paren(scan, g_open)
+        if g_close is None:
+            continue
+        end = g_close + 1
+        field = None
+        fm = re.match(r"\s*\.\s*([A-Za-z_]\w*)\b", scan[end:])
+        if fm:
+            field = fm.group(1)
+            end = end + fm.end()
+        out.append({
+            "start": m.start(),
+            "end": end,
+            "find_args": None,  # this GameObject
+            "component": comp_ty,
+            "field": field,
+            "on_this": True,
+        })
+    out.sort(key=lambda c: c["start"], reverse=True)
+    return out
+
+
+def _build_go_tables(plan):
+    """Authored GameObject name → {MonoBehaviour class: instance index}."""
+    names = []
+    seen = set()
+    comps = {}  # name -> {class: idx}
+    for cname, cl in sorted(plan["classes"].items()):
+        for i, o in enumerate(cl.get("instances") or []):
+            n = o.get("name") or "obj"
+            if n not in seen:
+                seen.add(n)
+                names.append(n)
+            comps.setdefault(n, {})[cname] = i
+    return names, comps
+
+
+def _rewrite_find_getcomponent(text, plan, this_class):
+    """Lower Find/GetComponent chains using the authored GO tables.
+
+    `GameObject.Find` name lookup is always runtime (`strcmp` on the packed
+    name table) — missing names yield -1 like Unity null, not a PackError.
+    """
+    chains = _ast_find_getcomponent_chains(text)
+    if not chains:
+        return text
+
+    def _zero_for_field(comp, field):
+        cl = (plan.get("classes") or {}).get(comp) or {}
+        for name, ty, _bits, kind in cl.get("members") or []:
+            if name != field:
+                continue
+            if kind in ("f16", "f32") or ty == "float":
+                return "0.f"
+            return "0"
+        return "0.f"
+
+    def _field_after_get(comp, field, go_expr):
+        idn = _c_ident(comp)
+        zero = _zero_for_field(comp, field)
+        return (
+            "({ int _up_gc = GameObject_GetComponent_%s(%s); "
+            "_up_gc < 0 ? %s : %s_get_%s((unsigned)_up_gc); })"
+            % (idn, go_expr, zero, idn, field)
+        )
+
+    for ch in chains:
+        comp = ch.get("component")
+        field = ch.get("field")
+        if ch.get("on_this"):
+            if not comp:
+                raise PackError("GetComponent requires a type argument")
+            this_idn = _c_ident(this_class)
+            comp_idn = _c_ident(comp)
+            if comp not in (plan.get("classes") or {}):
+                raise PackError(
+                    "GetComponent<%s>: no authored %s in the scene — "
+                    "unity_pack does not invent components" % (comp, comp))
+            go_expr = "_engine_go_of_%s(i)" % this_idn
+            if field:
+                repl = _field_after_get(comp, field, go_expr)
+            else:
+                repl = "GameObject_GetComponent_%s(%s)" % (comp_idn, go_expr)
+            text = text[:ch["start"]] + repl + text[ch["end"]:]
+            continue
+
+        find_args = ch.get("find_args") or ""
+        # Always runtime — do not pack-time require the name to exist.
+        go_expr = "GameObject_Find(%s)" % find_args
+        if not comp:
+            repl = go_expr
+        else:
+            if comp not in (plan.get("classes") or {}):
+                raise PackError(
+                    "GetComponent<%s>: no authored %s in the scene — "
+                    "unity_pack does not invent components" % (comp, comp))
+            if field:
+                repl = _field_after_get(comp, field, go_expr)
+            else:
+                repl = "GameObject_GetComponent_%s(%s)" % (
+                    _c_ident(comp), go_expr)
+        text = text[:ch["start"]] + repl + text[ch["end"]:]
+    return text
+
 
 def analyze_script(path, text=None):
     """Fields, methods, Unity API used, whether the script spawns."""
@@ -667,8 +843,22 @@ def analyze_script(path, text=None):
                 apis.add("AddComponent<Camera>")
             elif "SpriteRenderer" in token:
                 apis.add("AddComponent<SpriteRenderer>")
+        elif token.startswith("GetComponent"):
+            apis.add("GetComponent")
+        elif "GameObject.Find" in token or token == "GameObject.Find":
+            apis.add("GameObject.Find")
         else:
             apis.add(token)
+    # AST pass: precise Find / GetComponent detection (cpprust paren/angle).
+    getcomponent_types = set()
+    for ch in _ast_find_getcomponent_chains(text):
+        if ch.get("find_args") is not None and not ch.get("on_this"):
+            apis.add("GameObject.Find")
+        if ch.get("component"):
+            apis.add("GetComponent")
+            getcomponent_types.add(ch["component"])
+        elif ch.get("on_this"):
+            apis.add("GetComponent")
     if "transform.position" in scan:
         apis.add("transform.position")
     if re.search(r"using\s+UnityEngine\.UI\b", scan):
@@ -741,6 +931,7 @@ def analyze_script(path, text=None):
         "uses_z": uses_z,
         "writes_pos": writes_pos,
         "keyboard_keys": keyboard_keys,
+        "getcomponent_types": getcomponent_types,
         "classes": classes,
         "literals": [int(x) for x in re.findall(r"(?<![\w.])(\d+)", scan)
                      if int(x) < 1 << 20],
@@ -1066,6 +1257,11 @@ def emit_engine(plan, analyses, used_apis):
     want_ambient = "RenderSettings.ambientLight" in used_apis
     want_log = bool(used_apis & {"Debug.Log", "print"})
     want_console = "Console.WriteLine" in used_apis
+    want_find = "GameObject.Find" in used_apis
+    want_getcomponent = "GetComponent" in used_apis
+    getcomponent_types = set()
+    for a in analyses:
+        getcomponent_types |= set(a.get("getcomponent_types") or [])
     light_n = int(plan.get("light_count") or 0)
     p("/* generated by tools/unity_pack.py — do not edit */")
     if soa:
@@ -1073,7 +1269,7 @@ def emit_engine(plan, analyses, used_apis):
     p("#include <stdint.h>")
     if want_math:
         p("#include <math.h>")
-    if want_input or want_log:
+    if want_input or want_log or want_find:
         p("#include <string.h>")
     if want_log or want_console:
         p("#include <stdio.h>")
@@ -1383,6 +1579,63 @@ def emit_engine(plan, analyses, used_apis):
         p("    (void)argc; (void)argv;")
     p("}")
     p("")
+
+    if want_find or want_getcomponent:
+        go_names = plan.get("go_names") or []
+        go_comps = plan.get("go_components") or {}
+        p("/* GameObject.Find / GetComponent — authored scene tables only */")
+        p("static const int _engine_go_count = %d;" % len(go_names))
+        if go_names:
+            p("static const char *_engine_go_name[%d] = {" % len(go_names))
+            for n in go_names:
+                p("    %s," % _c_string(n))
+            p("};")
+        else:
+            p("static const char *_engine_go_name[1] = { \"\" };")
+        # Per MonoBehaviour class: instance index at each GO, or -1.
+        for cname in sorted(plan["classes"]):
+            idn = _c_ident(cname)
+            vals = []
+            for n in go_names:
+                if cname in go_comps.get(n, {}):
+                    vals.append(str(go_comps[n][cname]))
+                else:
+                    vals.append("-1")
+            if not vals:
+                vals = ["-1"]
+            p("static const int _engine_go_%s[%d] = { %s };" % (
+                idn, len(vals), ", ".join(vals)))
+            # this instance i → GO index (for GetComponent on this).
+            rev = ["-1"] * max(1, plan["classes"][cname]["n"])
+            for n, cmap in go_comps.items():
+                if cname in cmap and n in go_names:
+                    gi = go_names.index(n)
+                    rev[cmap[cname]] = str(gi)
+            p("static const int _engine_%s_go_of[%d] = { %s };" % (
+                idn, len(rev), ", ".join(rev)))
+            p("static int _engine_go_of_%s(unsigned i) {" % idn)
+            p("    if (i >= %du) return -1;" % len(rev))
+            p("    return _engine_%s_go_of[i];" % idn)
+            p("}")
+        if want_find:
+            p("static int GameObject_Find(const char *name) {")
+            p("    int i;")
+            p("    if (!name) return -1;")
+            p("    for (i = 0; i < _engine_go_count; i = i + 1)")
+            p("        if (strcmp(_engine_go_name[i], name) == 0) return i;")
+            p("    return -1;")
+            p("}")
+            p("")
+        # Emit GetComponent_<T> for every packed class (and requested types).
+        for cname in sorted(set(plan["classes"]) | getcomponent_types):
+            if cname not in plan["classes"]:
+                continue
+            idn = _c_ident(cname)
+            p("static int GameObject_GetComponent_%s(int go) {" % idn)
+            p("    if (go < 0 || go >= _engine_go_count) return -1;")
+            p("    return _engine_go_%s[go];" % idn)
+            p("}")
+            p("")
 
     p("static float f16_to_f32(uint16_t h) {")
     p("    unsigned s = (h >> 15) & 1u;")
@@ -1763,6 +2016,8 @@ def _lower_method_body(body, cl, plan):
     idn = _c_ident(cl["name"])
     text = body
     text = re.sub(r"\bthis\.", "", text)
+    # Find/GetComponent before field rewrites so `.amp` stays on the target type.
+    text = _rewrite_find_getcomponent(text, plan, cl["name"])
     # API tokens before Vector2 rewrites so nested Mathf.Sin(...) keeps parens.
     text = text.replace("Time.deltaTime", "Time_deltaTime")
     text = text.replace("Time.fixedDeltaTime", "Time_fixedDeltaTime")
@@ -2231,9 +2486,13 @@ def pack(root, outdir, soa=False, soa_vec4=False):
     company, product = player_identity(root)
     plan["company_name"] = company
     plan["product_name"] = product
+    go_names, go_comps = _build_go_tables(plan)
+    plan["go_names"] = go_names
+    plan["go_components"] = go_comps
     os.makedirs(outdir, exist_ok=True)
     engine = emit_engine(plan, analyses, used_apis)
     data = emit_data(plan, used_apis)
+    main_c = emit_main()
     with open(os.path.join(outdir, "engine.c"), "w") as f:
         f.write(engine)
     with open(os.path.join(outdir, "data.c"), "w") as f:
@@ -2241,7 +2500,7 @@ def pack(root, outdir, soa=False, soa_vec4=False):
     with open(os.path.join(outdir, "engine_draw.h"), "w") as f:
         f.write(emit_engine_draw_h())
     with open(os.path.join(outdir, "main.c"), "w") as f:
-        f.write(emit_main())
+        f.write(main_c)
     with open(os.path.join(outdir, "Makefile"), "w") as f:
         f.write(emit_makefile(outdir))
     shdir = os.path.join(outdir, "shaders")

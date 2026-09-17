@@ -319,6 +319,8 @@ class TestSystems(unittest.TestCase):
         self.assertIn("Keyboard.current", apis)
         self.assertIn("Debug.Log", apis)
         self.assertIn("print", apis)
+        self.assertIn("GameObject.Find", apis)
+        self.assertIn("GetComponent", apis)
         self.assertNotIn("Input.GetAxis", apis)
         self.assertIn("RenderSettings.ambientLight", apis)
         self.assertEqual(len(lights), 1)
@@ -345,6 +347,9 @@ class TestSystems(unittest.TestCase):
         self.assertIn("Keyboard_leftArrowKey_isPressed", engine)
         self.assertIn("Debug_Log", engine)
         self.assertIn("Pad_Start", engine)
+        self.assertIn('GameObject_Find("BouncePad")', engine)
+        self.assertIn("GameObject_GetComponent_Bouncer", engine)
+        self.assertIn("Bouncer_get_amp", engine)
         self.assertIn("engine_keyboard_connected", data)
         self.assertIn("engine_keyboard_leftArrow", data)
         self.assertIn("RenderSettings_ambient_r", data)
@@ -576,6 +581,122 @@ class TestSystems(unittest.TestCase):
         with self.assertRaises(unity_pack.PackError) as cm:
             unity_pack.pack(root, tempfile.mkdtemp(prefix="upack-out-"))
         self.assertIn("ParticleSystem", cm.exception.message)
+
+    def test_ast_find_getcomponent_chain(self):
+        """cpprust paren/angle parse of Find().GetComponent<T>().field."""
+        src = (
+            'GameObject.Find("BouncePad").GetComponent<Bouncer>().amp'
+        )
+        chains = unity_pack._ast_find_getcomponent_chains(src)
+        self.assertEqual(len(chains), 1)
+        self.assertEqual(chains[0]["find_args"].strip('"'), "BouncePad")
+        self.assertEqual(chains[0]["component"], "Bouncer")
+        self.assertEqual(chains[0]["field"], "amp")
+
+    def test_find_unknown_name_returns_minus_one_at_runtime(self):
+        """Find name lookup is runtime-only — unknown names pack and yield -1."""
+        root = tempfile.mkdtemp(prefix="upack-find-rt-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "X.cs"), "w") as f:
+            f.write(
+                "using System;\n"
+                "using UnityEngine;\n"
+                "public class X : MonoBehaviour {\n"
+                "    public void Start() {\n"
+                "        Console.WriteLine(GameObject.Find(\"Nope\"));\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "X.cs.meta"), "w") as f:
+            f.write("guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Only\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            self.assertIn('GameObject_Find("Nope")', f.read())
+        r = subprocess.run(["make", "-C", d], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr or r.stdout)
+        run = subprocess.run([os.path.join(d, "game")],
+                             capture_output=True, text=True, cwd=d)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+        self.assertIn("-1", run.stdout)
+
+    def test_console_writeline_gameobject_prints_name(self):
+        """Unity Object.ToString → name (UnityEngine.GameObject) on Console."""
+        root = tempfile.mkdtemp(prefix="upack-go-tostring-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "X.cs"), "w") as f:
+            f.write(
+                "using System;\n"
+                "using UnityEngine;\n"
+                "public class X : MonoBehaviour {\n"
+                "    public void Start() {\n"
+                "        Console.WriteLine(GameObject.Find(\"BouncePad\"));\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "X.cs.meta"), "w") as f:
+            f.write("guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: BouncePad\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-go-tostring-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+            self.assertIn(
+                'Console_WriteLine(Object_ToString(GameObject_Find("BouncePad")))',
+                eng)
+            self.assertIn("%s (UnityEngine.GameObject)", eng)
+        r = subprocess.run(["make", "-C", d], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr or r.stdout)
+        run = subprocess.run([os.path.join(d, "game")],
+                             capture_output=True, text=True, cwd=d)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+        self.assertIn("BouncePad (UnityEngine.GameObject)", run.stdout)
+
+    @needs_cc
+    def test_find_getcomponent_runs(self):
+        d = tempfile.mkdtemp(prefix="upack-find-run-")
+        unity_pack.pack(SYSTEMS, d)
+        r = subprocess.run(["make", "-C", d], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr or r.stdout)
+        run = subprocess.run(
+            [os.path.join(d, "game"), "-logFile", "-"],
+            capture_output=True, text=True, cwd=d)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+        # Pad Start: Find("BouncePad").GetComponent<Bouncer>().amp
+        self.assertIn("0.5", run.stdout)
 
     def test_refuses_keyboard_without_inputsystem_using(self):
         """Bare Keyboard is not a global — needs InputSystem using or FQN."""
