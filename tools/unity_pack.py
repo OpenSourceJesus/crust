@@ -432,10 +432,70 @@ def _quat_rotate_vec(qx, qy, qz, qw, vx, vy, vz):
     )
 
 
+def _quat_mul(a, b):
+    """Hamilton product a*b for Unity quaternions (x,y,z,w)."""
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return (
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    )
+
+
 def _quat_z_rad(qx, qy, qz, qw):
     """Planar angle (radians) of local +X after *rot* — SpriteRenderer Z spin."""
     rx, ry, _rz = _quat_rotate_vec(qx, qy, qz, qw, 1.0, 0.0, 0.0)
     return math.atan2(ry, rx)
+
+
+def _resolve_world_trs(xf_id, by_id, cache=None, stack=None):
+    """Compose local TRS up m_Father / m_TransformParent into world TRS."""
+    if cache is None:
+        cache = {}
+    if stack is None:
+        stack = set()
+    xf_id = str(xf_id)
+    if xf_id in cache:
+        return cache[xf_id]
+    xf = by_id.get(xf_id)
+    if not xf:
+        ident = ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0), (1.0, 1.0, 1.0))
+        cache[xf_id] = ident
+        return ident
+    if xf_id in stack:
+        # Cycle — treat as root local.
+        pos = xf.get("pos") or (0.0, 0.0, 0.0)
+        rot = xf.get("rot") or (0.0, 0.0, 0.0, 1.0)
+        scale = xf.get("scale") or (1.0, 1.0, 1.0)
+        out = (pos, rot, scale)
+        cache[xf_id] = out
+        return out
+    stack.add(xf_id)
+    pos = xf.get("pos") or (0.0, 0.0, 0.0)
+    rot = xf.get("rot") or (0.0, 0.0, 0.0, 1.0)
+    scale = xf.get("scale") or (1.0, 1.0, 1.0)
+    father = xf.get("father_id")
+    if not father or father == "0" or father not in by_id:
+        out = (pos, rot, scale)
+    else:
+        pp, pr, ps = _resolve_world_trs(father, by_id, cache, stack)
+        lx = float(pos[0]) * float(ps[0])
+        ly = float(pos[1]) * float(ps[1])
+        lz = float(pos[2]) * float(ps[2])
+        wx, wy, wz = _quat_rotate_vec(
+            pr[0], pr[1], pr[2], pr[3], lx, ly, lz)
+        out = (
+            (float(pp[0]) + wx, float(pp[1]) + wy, float(pp[2]) + wz),
+            _quat_mul(pr, rot),
+            (float(ps[0]) * float(scale[0]),
+             float(ps[1]) * float(scale[1]),
+             float(ps[2]) * float(scale[2])),
+        )
+    stack.discard(xf_id)
+    cache[xf_id] = out
+    return out
 
 
 def _attach_sprite_textures(objects, asset_guids):
@@ -531,11 +591,14 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         file_id = hm.group(2)
         kind = None
         km = re.search(
-            r"(?m)^(GameObject|Transform|MonoBehaviour|PrefabInstance|"
-            r"Light|Camera|SpriteRenderer|Rigidbody2D|Rigidbody):",
+            r"(?m)^(GameObject|Transform|RectTransform|MonoBehaviour|"
+            r"PrefabInstance|Light|Camera|SpriteRenderer|Rigidbody2D|"
+            r"Rigidbody):",
             block)
         if km:
             kind = km.group(1)
+            if kind == "RectTransform":
+                kind = "Transform"
         elif type_id == "108":
             kind = "Light"
         elif type_id == "20":
@@ -546,6 +609,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             kind = "Rigidbody2D"
         elif type_id == "54":
             kind = "Rigidbody"
+        elif type_id in ("4", "224"):
+            kind = "Transform"
         rec = {"file_id": file_id, "kind": kind, "raw": block, "fields": {}}
         nm = re.search(r"(?m)^\s+m_Name:\s*(.+)$", block)
         if nm:
@@ -571,6 +636,57 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         if rot:
             rec["rot"] = (float(rot.group(1)), float(rot.group(2)),
                           float(rot.group(3)), float(rot.group(4)))
+        # Transform parent: m_Father. PrefabInstance: m_TransformParent.
+        father = re.search(
+            r"(?m)^\s+m_Father:\s*\{fileID:\s*(-?\d+)\}", block)
+        if not father:
+            father = re.search(
+                r"(?m)^\s+m_TransformParent:\s*\{fileID:\s*(-?\d+)\}", block)
+        if father:
+            fid = father.group(1)
+            if fid != "0":
+                rec["father_id"] = fid
+        # PrefabInstance nested form: m_Modification: … m_TransformParent:
+        if kind == "PrefabInstance":
+            tp = re.search(
+                r"(?m)^\s+m_TransformParent:\s*\{fileID:\s*(-?\d+)\}", block)
+            if tp and tp.group(1) != "0":
+                rec["father_id"] = tp.group(1)
+            # Apply common TRS overrides from m_Modifications.
+            def _mod_f(axis_path):
+                m = re.search(
+                    r"propertyPath:\s*%s\s*\n\s*value:\s*([^\n]+)" % axis_path,
+                    block)
+                return float(m.group(1)) if m else None
+            px, py, pz = (_mod_f("m_LocalPosition\\.x"),
+                          _mod_f("m_LocalPosition\\.y"),
+                          _mod_f("m_LocalPosition\\.z"))
+            if px is not None or py is not None or pz is not None:
+                rec["pos"] = (
+                    px if px is not None else 0.0,
+                    py if py is not None else 0.0,
+                    pz if pz is not None else 0.0,
+                )
+            qx, qy, qz, qw = (_mod_f("m_LocalRotation\\.x"),
+                              _mod_f("m_LocalRotation\\.y"),
+                              _mod_f("m_LocalRotation\\.z"),
+                              _mod_f("m_LocalRotation\\.w"))
+            if qw is not None or qx is not None:
+                rec["rot"] = (
+                    qx if qx is not None else 0.0,
+                    qy if qy is not None else 0.0,
+                    qz if qz is not None else 0.0,
+                    qw if qw is not None else 1.0,
+                )
+            sx, sy, sz = (_mod_f("m_LocalScale\\.x"),
+                          _mod_f("m_LocalScale\\.y"),
+                          _mod_f("m_LocalScale\\.z"))
+            if sx is not None or sy is not None or sz is not None:
+                rec["scale"] = (
+                    sx if sx is not None else 1.0,
+                    sy if sy is not None else 1.0,
+                    sz if sz is not None else 1.0,
+                )
         gm = re.search(r"guid:\s*([0-9a-fA-F]+)", block)
         if gm:
             rec["guid"] = gm.group(1).lower()
@@ -687,6 +803,27 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             }
         by_id[file_id] = rec
 
+    # PrefabInstance.m_TransformParent applies to stripped Transforms that
+    # reference the instance (Unity does not repeat m_Father on stripped).
+    for rec in by_id.values():
+        if rec.get("kind") != "Transform" or rec.get("father_id"):
+            continue
+        pm = re.search(
+            r"(?m)^\s+m_PrefabInstance:\s*\{fileID:\s*(\d+)\}",
+            rec.get("raw") or "")
+        if not pm:
+            continue
+        pref = by_id.get(pm.group(1))
+        if not pref or pref.get("kind") != "PrefabInstance":
+            continue
+        if pref.get("father_id"):
+            rec["father_id"] = pref["father_id"]
+        for key in ("pos", "rot", "scale"):
+            if key not in rec and key in pref:
+                rec[key] = pref[key]
+
+    world_cache = {}
+
     # Join MonoBehaviour + Transform + SpriteRenderer onto the GameObject.
     gos = [r for r in by_id.values() if r.get("kind") == "GameObject"]
     for go in gos:
@@ -697,6 +834,10 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         pos = (0.0, 0.0, 0.0)
         scale = (1.0, 1.0, 1.0)
         rot = (0.0, 0.0, 0.0, 1.0)
+        local_pos = pos
+        local_rot = rot
+        local_scale = scale
+        xf = None
         script = None
         fields = {}
         sprite = None
@@ -704,6 +845,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         rb2d = None
         rb3d = None
         for k in kids:
+            if k.get("kind") == "Transform":
+                xf = k
             if k.get("pos"):
                 pos = k["pos"]
             if k.get("scale"):
@@ -723,6 +866,11 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 rb2d = dict(k["rigidbody2d"])
             if k.get("kind") == "Rigidbody" and k.get("rigidbody"):
                 rb3d = dict(k["rigidbody"])
+        local_pos, local_rot, local_scale = pos, rot, scale
+        father_id = xf.get("father_id") if xf else None
+        if xf is not None:
+            pos, rot, scale = _resolve_world_trs(
+                xf["file_id"], by_id, world_cache)
         if sprite and sprite.get("enabled", 1) and sprite.get("has_sprite"):
             # Extent filled after PNG load via pixels / pixelsPerUnit * scale.
             sprite["scale_x"] = abs(float(scale[0]))
@@ -754,10 +902,19 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         # Camera-only GOs are not packed as scripted instances.
         if cam is not None and script is None and sprite is None and not rb2d and not rb3d:
             continue
+        has_mb = any(k.get("kind") == "MonoBehaviour" for k in kids)
+        # Transform-only parents (e.g. Rig) are hierarchy nodes, not instances.
+        if (script is None and sprite is None and not rb2d and not rb3d
+                and cam is None and not has_mb):
+            continue
         objects.append({
             "name": go.get("name") or "obj",
             "pos": pos,
             "rot": rot,
+            "local_pos": local_pos,
+            "local_rot": local_rot,
+            "local_scale": local_scale,
+            "father_id": father_id,
             "fields": fields,
             "script": script,
             "class": class_name or go.get("name") or "Obj",

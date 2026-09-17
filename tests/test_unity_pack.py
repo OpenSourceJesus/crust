@@ -356,6 +356,67 @@ class TestSystems(unittest.TestCase):
                                places=5)
         self.assertAlmostEqual(stick["rot"][2], 0.3826834, places=5)
         self.assertAlmostEqual(stick["rot"][3], 0.9238795, places=5)
+        # Rig at (0, 0.5) + local (1.5, 0) → world (1.5, 0.5)
+        self.assertEqual(stick["father_id"], "6002")
+        self.assertAlmostEqual(stick["local_pos"][0], 1.5)
+        self.assertAlmostEqual(stick["local_pos"][1], 0.0)
+        self.assertAlmostEqual(stick["pos"][0], 1.5)
+        self.assertAlmostEqual(stick["pos"][1], 0.5)
+        self.assertEqual(len([o for o in _objs if o["name"] == "Rig"]), 0)
+
+    def test_prefab_m_transform_parent_composes_world(self):
+        """PrefabInstance.m_TransformParent parents stripped Transforms."""
+        text = (
+            "--- !u!1 &1\n"
+            "GameObject:\n"
+            "  m_Name: Anchor\n"
+            "  m_Component:\n"
+            "  - component: {fileID: 2}\n"
+            "--- !u!4 &2\n"
+            "Transform:\n"
+            "  m_GameObject: {fileID: 1}\n"
+            "  m_LocalPosition: {x: 10, y: 0, z: 0}\n"
+            "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+            "  m_Father: {fileID: 0}\n"
+            "--- !u!1001 &50\n"
+            "PrefabInstance:\n"
+            "  m_Modification:\n"
+            "    m_TransformParent: {fileID: 2}\n"
+            "    m_Modifications:\n"
+            "    - target: {fileID: 99, guid: abcd, type: 3}\n"
+            "      propertyPath: m_LocalPosition.x\n"
+            "      value: 3\n"
+            "      objectReference: {fileID: 0}\n"
+            "    - target: {fileID: 99, guid: abcd, type: 3}\n"
+            "      propertyPath: m_LocalPosition.y\n"
+            "      value: 4\n"
+            "      objectReference: {fileID: 0}\n"
+            "    - target: {fileID: 99, guid: abcd, type: 3}\n"
+            "      propertyPath: m_LocalPosition.z\n"
+            "      value: 0\n"
+            "      objectReference: {fileID: 0}\n"
+            "--- !u!1 &60\n"
+            "GameObject:\n"
+            "  m_Name: Nested\n"
+            "  m_Component:\n"
+            "  - component: {fileID: 61}\n"
+            "  - component: {fileID: 62}\n"
+            "--- !u!4 &61 stripped\n"
+            "Transform:\n"
+            "  m_GameObject: {fileID: 60}\n"
+            "  m_PrefabInstance: {fileID: 50}\n"
+            "--- !u!114 &62\n"
+            "MonoBehaviour:\n"
+            "  m_GameObject: {fileID: 60}\n"
+            "  m_Script: {fileID: 11500000, guid: deadbeefdeadbeefdeadbeefdeadbeef}\n"
+        )
+        objs, _lights, _cams = unity_pack.parse_unity_yaml(text)
+        nested = [o for o in objs if o["name"] == "Nested"][0]
+        self.assertEqual(nested["father_id"], "2")
+        self.assertAlmostEqual(nested["local_pos"][0], 3.0)
+        self.assertAlmostEqual(nested["local_pos"][1], 4.0)
+        self.assertAlmostEqual(nested["pos"][0], 13.0)
+        self.assertAlmostEqual(nested["pos"][1], 4.0)
 
     def test_emits_opt_in_stubs_not_invented_components(self):
         d = tempfile.mkdtemp(prefix="upack-sys-")

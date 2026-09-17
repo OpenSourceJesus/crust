@@ -102,6 +102,7 @@ No invented lights. `AddComponent<Light>` is a `PackError`.
 | `Camera.main.orthographicSize` / `.transform.position` / clip planes | Reads those globals |
 | Authored `!u!212` SpriteRenderer with `m_Sprite` → **project PNG** | Texture + tinted quad in `engine_collect_draws` |
 | Authored `m_LocalRotation` on Transform | Z spin via `EngineDraw.cos_z` / `sin_z` (identity if omitted) |
+| Authored `m_Father` / PrefabInstance `m_TransformParent` | World TRS = parent ∘ local (baked into packed `pos` / sprite spin) |
 
 PNG pixels are packed into `data.c` (`engine_texture_rgba`). Editing the
 referenced sprite and re-packing changes the drawn texels. Tint comes from
@@ -109,7 +110,11 @@ referenced sprite and re-packing changes the drawn texels. Tint comes from
 `(texels / spritePixelsToUnits) * Transform.scale` (half-extents in
 `engine_collect_draws`). `spritePixelsToUnits` is read from the PNG `.meta`
 (default **100**). Sprite quads are rotated in the XY plane from
-`m_LocalRotation` (quaternion → angle of local +X).
+`m_LocalRotation` (quaternion → angle of local +X). Child transforms use
+**world** position/rotation/scale after composing the `m_Father` chain
+(PrefabInstance `m_TransformParent` is applied to stripped instance
+transforms). Runtime parent motion is not re-linked yet — hierarchy is
+baked at pack time.
 
 Unity cameras look along **+Z** (identity rotation). `engine_collect_draws`
 keeps a sprite only when
