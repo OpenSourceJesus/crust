@@ -8,7 +8,8 @@ indices instead of pointers when a class is bounded (hand-placed, never
 spawned, N ≤ 256).
 
 Does not invent scene components (ParticleSystem pools, AnimationCurves,
-Rigidbody graphs). It packs and speeds up what the project already authored.
+unauthored Rigidbodies). It packs and speeds up what the project already
+authored — including authored Rigidbody / Rigidbody2D.
 
     python3 tools/unity_pack.py <project> -o <outdir>
 """
@@ -54,6 +55,9 @@ _API = {
     "Time.time": None,
     "Time.fixedDeltaTime": None,
     "Physics2D.gravity": None,
+    "Physics.gravity": None,
+    "Rigidbody2D": True,
+    "Rigidbody": True,
     "RenderSettings.ambientLight": None,
     "Camera.main": None,
     # Input Manager (legacy): host pokes floats/ints in data.c. Snippets
@@ -121,6 +125,14 @@ _REFUSED_API = {
         "SpriteRenderer must be authored on a scene GameObject — unity_pack "
         "does not invent default visuals for GameObjects."
     ),
+    "AddComponent<Rigidbody2D>": (
+        "Rigidbody2D must be authored on a scene GameObject — unity_pack "
+        "does not AddComponent rigidbodies."
+    ),
+    "AddComponent<Rigidbody>": (
+        "Rigidbody must be authored on a scene GameObject — unity_pack "
+        "does not AddComponent rigidbodies."
+    ),
 }
 
 _SPAWN = re.compile(
@@ -129,12 +141,14 @@ _SPAWN = re.compile(
 )
 _VEC3Z = re.compile(r"\.(z)\b|Vector3|Quaternion")
 _UNITY_API = re.compile(
-    r"(?:AddComponent\s*<\s*(?:Light|Camera|SpriteRenderer)\s*>|"
+    r"(?:AddComponent\s*<\s*(?:Light|Camera|SpriteRenderer|Rigidbody2D|Rigidbody)\s*>|"
     r"(?<![\w])(?:Mathf\.(?:Abs|Min|Max|Clamp|Lerp|Sin|Cos)|"
     r"Time\.(?:deltaTime|time|fixedDeltaTime)|"
     r"Input\.(?:GetAxis|GetButton|GetKey)|"
     r"RenderSettings\.ambientLight|Camera\.main|"
-    r"transform\.position|Physics2D\.gravity|ParticleSystem\.Emit|"
+    r"transform\.position|Physics2D\.gravity|Physics\.gravity|"
+    r"Rigidbody2D|Rigidbody|"
+    r"ParticleSystem\.Emit|"
     r"AnimationCurve\.Evaluate|"
     r"InputAction|Keyboard\.current|Gamepad\.current|"
     r"UnityEngine\.UI|"
@@ -372,7 +386,6 @@ def _pixels_per_unit(asset_path):
     return v if v > 0.0 else 100.0
 
 
-
 def _attach_sprite_textures(objects, asset_guids):
     """Load PNG pixels for each SpriteRenderer that references a project sprite.
 
@@ -435,10 +448,10 @@ def _collect_textures(objects):
 def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
     """A Unity .unity YAML subset: GameObject + Transform + MonoBehaviour.
 
-    Also imports authored Camera (!u!20) and SpriteRenderer (!u!212). Does
-    not invent either — GameObjects without a SpriteRenderer contribute no
-    draws. A SpriteRenderer draws only when m_Sprite points at a real
-    project asset (guid in asset_guids). Returns (objects, lights, cameras).
+    Also imports authored Camera (!u!20), SpriteRenderer (!u!212),
+    Rigidbody2D (!u!50), and Rigidbody (!u!54). Does not invent any of
+    those — missing components stay missing. Returns
+    (objects, lights, cameras).
     """
     guid_to_script = guid_to_script or {}
     asset_guids = asset_guids or {}
@@ -456,7 +469,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         kind = None
         km = re.search(
             r"(?m)^(GameObject|Transform|MonoBehaviour|PrefabInstance|"
-            r"Light|Camera|SpriteRenderer):",
+            r"Light|Camera|SpriteRenderer|Rigidbody2D|Rigidbody):",
             block)
         if km:
             kind = km.group(1)
@@ -466,6 +479,10 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             kind = "Camera"
         elif type_id == "212":
             kind = "SpriteRenderer"
+        elif type_id == "50":
+            kind = "Rigidbody2D"
+        elif type_id == "54":
+            kind = "Rigidbody"
         rec = {"file_id": file_id, "kind": kind, "raw": block, "fields": {}}
         nm = re.search(r"(?m)^\s+m_Name:\s*(.+)$", block)
         if nm:
@@ -547,6 +564,45 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "bg_g": float(bg.group(2)) if bg else 0.05,
                 "bg_b": float(bg.group(3)) if bg else 0.08,
             }
+        if kind == "Rigidbody2D":
+            bt = re.search(r"(?m)^\s+m_BodyType:\s*(\d+)", block)
+            mass = re.search(r"(?m)^\s+m_Mass:\s*([0-9.eE+-]+)", block)
+            gs = re.search(r"(?m)^\s+m_GravityScale:\s*([0-9.eE+-]+)", block)
+            vel = re.search(
+                r"m_LinearVelocity:\s*\{x:\s*([^,}]+),\s*y:\s*([^}]+)\}",
+                block)
+            # Older YAML used m_Velocity
+            if not vel:
+                vel = re.search(
+                    r"m_Velocity:\s*\{x:\s*([^,}]+),\s*y:\s*([^}]+)\}",
+                    block)
+            rec["rigidbody2d"] = {
+                "body_type": int(bt.group(1)) if bt else 0,
+                "mass": float(mass.group(1)) if mass else 1.0,
+                "gravity_scale": float(gs.group(1)) if gs else 1.0,
+                "vel_x": float(vel.group(1)) if vel else 0.0,
+                "vel_y": float(vel.group(2)) if vel else 0.0,
+            }
+        if kind == "Rigidbody":
+            mass = re.search(r"(?m)^\s+m_Mass:\s*([0-9.eE+-]+)", block)
+            ug = re.search(r"(?m)^\s+m_UseGravity:\s*(\d+)", block)
+            vel = re.search(
+                r"m_Velocity:\s*\{x:\s*([^,}]+),\s*y:\s*([^,}]+),"
+                r"\s*z:\s*([^}]+)\}",
+                block)
+            # Newer Unity: m_LinearVelocity
+            if not vel:
+                vel = re.search(
+                    r"m_LinearVelocity:\s*\{x:\s*([^,}]+),\s*y:\s*([^,}]+),"
+                    r"\s*z:\s*([^}]+)\}",
+                    block)
+            rec["rigidbody"] = {
+                "mass": float(mass.group(1)) if mass else 1.0,
+                "use_gravity": int(ug.group(1)) if ug else 1,
+                "vel_x": float(vel.group(1)) if vel else 0.0,
+                "vel_y": float(vel.group(2)) if vel else 0.0,
+                "vel_z": float(vel.group(3)) if vel else 0.0,
+            }
         by_id[file_id] = rec
 
     # Join MonoBehaviour + Transform + SpriteRenderer onto the GameObject.
@@ -562,6 +618,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         fields = {}
         sprite = None
         cam = None
+        rb2d = None
+        rb3d = None
         for k in kids:
             if k.get("pos"):
                 pos = k["pos"]
@@ -576,6 +634,10 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 sprite = dict(k["sprite"])
             if k.get("kind") == "Camera" and k.get("camera"):
                 cam = dict(k["camera"])
+            if k.get("kind") == "Rigidbody2D" and k.get("rigidbody2d"):
+                rb2d = dict(k["rigidbody2d"])
+            if k.get("kind") == "Rigidbody" and k.get("rigidbody"):
+                rb3d = dict(k["rigidbody"])
         if sprite and sprite.get("enabled", 1) and sprite.get("has_sprite"):
             # Extent filled after PNG load via pixels / pixelsPerUnit * scale.
             sprite["scale_x"] = abs(float(scale[0]))
@@ -598,7 +660,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "bg_b": cam["bg_b"],
             })
         # Camera-only GOs are not packed as scripted instances.
-        if cam is not None and script is None and sprite is None:
+        if cam is not None and script is None and sprite is None and not rb2d and not rb3d:
             continue
         objects.append({
             "name": go.get("name") or "obj",
@@ -607,6 +669,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "script": script,
             "class": class_name or go.get("name") or "Obj",
             "sprite": sprite,
+            "rigidbody2d": rb2d,
+            "rigidbody": rb3d,
         })
     return objects, lights, cameras
 
@@ -714,6 +778,8 @@ def _ast_find_getcomponent_chains(text):
             if angle_close is None:
                 continue
             comp_ty = text[angle_open + 1:angle_close].strip()
+            if "." in comp_ty:
+                comp_ty = comp_ty.rsplit(".", 1)[-1]
             after_angle = scan[angle_close + 1:]
             pm = re.match(r"\s*\(", after_angle)
             if not pm:
@@ -725,16 +791,24 @@ def _ast_find_getcomponent_chains(text):
             if g_close is None:
                 continue
             end = g_close + 1
-            fm = re.match(r"\s*\.\s*([A-Za-z_]\w*)\b", scan[end:])
+            fm = re.match(
+                r"\s*\.\s*([A-Za-z_]\w*)\b(?:\s*\.\s*([xyz]))?",
+                scan[end:])
             if fm:
                 field = fm.group(1)
+                axis = fm.group(2)
                 end = end + fm.end()
+            else:
+                axis = None
+        else:
+            axis = None
         out.append({
             "start": m.start(),
             "end": end,
             "find_args": find_args.strip(),
             "component": comp_ty,
             "field": field,
+            "axis": axis,
         })
     # Standalone this.GetComponent<T>() / GetComponent<T>()
     for m in re.finditer(
@@ -747,6 +821,8 @@ def _ast_find_getcomponent_chains(text):
         if angle_close is None:
             continue
         comp_ty = text[angle_open + 1:angle_close].strip()
+        if "." in comp_ty:
+            comp_ty = comp_ty.rsplit(".", 1)[-1]
         after_angle = scan[angle_close + 1:]
         if after_angle.find("(") < 0:
             continue
@@ -756,9 +832,13 @@ def _ast_find_getcomponent_chains(text):
             continue
         end = g_close + 1
         field = None
-        fm = re.match(r"\s*\.\s*([A-Za-z_]\w*)\b", scan[end:])
+        axis = None
+        fm = re.match(
+            r"\s*\.\s*([A-Za-z_]\w*)\b(?:\s*\.\s*([xyz]))?",
+            scan[end:])
         if fm:
             field = fm.group(1)
+            axis = fm.group(2)
             end = end + fm.end()
         out.append({
             "start": m.start(),
@@ -766,6 +846,7 @@ def _ast_find_getcomponent_chains(text):
             "find_args": None,  # this GameObject
             "component": comp_ty,
             "field": field,
+            "axis": axis,
             "on_this": True,
         })
     out.sort(key=lambda c: c["start"], reverse=True)
@@ -787,11 +868,96 @@ def _build_go_tables(plan):
     return names, comps
 
 
+_PHYSICS_COMPONENTS = frozenset(("Rigidbody2D", "Rigidbody"))
+
+
+def _build_rigidbody_tables(plan):
+    """Authored Rigidbody2D / Rigidbody → packed tables linked to MB instances."""
+    rb2d = []
+    rb3d = []
+    go_rb2d = {}  # go_name -> rb2d index
+    go_rb3d = {}
+    for cname, cl in sorted(plan["classes"].items()):
+        for i, o in enumerate(cl.get("instances") or []):
+            n = o.get("name") or "obj"
+            r2 = o.get("rigidbody2d")
+            if r2:
+                go_rb2d[n] = len(rb2d)
+                rb2d.append({
+                    "name": n,
+                    "owner_class": cname,
+                    "owner_inst": i,
+                    "body_type": int(r2.get("body_type") or 0),
+                    "mass": float(r2.get("mass") or 1.0),
+                    "gravity_scale": float(r2.get("gravity_scale") or 1.0),
+                    "vel_x": float(r2.get("vel_x") or 0.0),
+                    "vel_y": float(r2.get("vel_y") or 0.0),
+                })
+            r3 = o.get("rigidbody")
+            if r3:
+                go_rb3d[n] = len(rb3d)
+                rb3d.append({
+                    "name": n,
+                    "owner_class": cname,
+                    "owner_inst": i,
+                    "mass": float(r3.get("mass") or 1.0),
+                    "use_gravity": int(r3.get("use_gravity")
+                                       if r3.get("use_gravity") is not None
+                                       else 1),
+                    "vel_x": float(r3.get("vel_x") or 0.0),
+                    "vel_y": float(r3.get("vel_y") or 0.0),
+                    "vel_z": float(r3.get("vel_z") or 0.0),
+                })
+    return rb2d, rb3d, go_rb2d, go_rb3d
+
+
+def _rewrite_rigidbody_assigns(text, plan, this_class):
+    """Lower GetComponent<Rigidbody*>().velocity = new VectorN(...);"""
+    this_idn = _c_ident(this_class)
+    go_this = "_engine_go_of_%s(i)" % this_idn
+
+    def repl_2d(m):
+        args = _split_call_args(m.group(1))
+        if len(args) < 2:
+            return m.group(0)
+        return (
+            "{ int _up_rb = GameObject_GetComponent_Rigidbody2D(%s); "
+            "if (_up_rb >= 0) { _Rigidbody2D_vel_x[_up_rb] = (%s); "
+            "_Rigidbody2D_vel_y[_up_rb] = (%s); } }"
+            % (go_this, args[0], args[1])
+        )
+
+    def repl_3d(m):
+        args = _split_call_args(m.group(1))
+        if len(args) < 3:
+            return m.group(0)
+        return (
+            "{ int _up_rb = GameObject_GetComponent_Rigidbody(%s); "
+            "if (_up_rb >= 0) { _Rigidbody_vel_x[_up_rb] = (%s); "
+            "_Rigidbody_vel_y[_up_rb] = (%s); "
+            "_Rigidbody_vel_z[_up_rb] = (%s); } }"
+            % (go_this, args[0], args[1], args[2])
+        )
+
+    text = re.sub(
+        r"(?:this\s*\.\s*)?GetComponent\s*<\s*(?:UnityEngine\.)?Rigidbody2D\s*>"
+        r"\s*\(\s*\)\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
+        r"new\s+Vector2\s*\((.*?)\)\s*;",
+        repl_2d, text, flags=re.S)
+    text = re.sub(
+        r"(?:this\s*\.\s*)?GetComponent\s*<\s*(?:UnityEngine\.)?Rigidbody\s*>"
+        r"\s*\(\s*\)\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
+        r"new\s+Vector3\s*\((.*?)\)\s*;",
+        repl_3d, text, flags=re.S)
+    return text
+
+
 def _rewrite_find_getcomponent(text, plan, this_class):
     """Lower Find/GetComponent chains using the authored GO tables.
 
     `GameObject.Find` name lookup is always runtime (`strcmp` on the packed
     name table) — missing names yield -1 like Unity null, not a PackError.
+    Authored Rigidbody / Rigidbody2D are first-class GetComponent targets.
     """
     chains = _ast_find_getcomponent_chains(text)
     if not chains:
@@ -807,7 +973,44 @@ def _rewrite_find_getcomponent(text, plan, this_class):
             return "0"
         return "0.f"
 
-    def _field_after_get(comp, field, go_expr):
+    def _rb_field_expr(comp, field, axis, go_expr):
+        """GetComponent<Rigidbody2D/Rigidbody>().velocity.x / gravityScale."""
+        get = "GameObject_GetComponent_%s(%s)" % (_c_ident(comp), go_expr)
+        fl = (field or "").lower()
+        if comp == "Rigidbody2D":
+            if fl in ("gravityscale",):
+                return ("({ int _up_rb = %s; "
+                        "_up_rb < 0 ? 0.f : _Rigidbody2D_gravity_scale[_up_rb]; })"
+                        % get)
+            if fl in ("velocity", "linearvelocity") and axis in ("x", "y"):
+                return ("({ int _up_rb = %s; "
+                        "_up_rb < 0 ? 0.f : _Rigidbody2D_vel_%s[_up_rb]; })"
+                        % (get, axis))
+            if fl in ("mass",):
+                return ("({ int _up_rb = %s; "
+                        "_up_rb < 0 ? 0.f : _Rigidbody2D_mass[_up_rb]; })"
+                        % get)
+        if comp == "Rigidbody":
+            if fl in ("velocity", "linearvelocity") and axis in ("x", "y", "z"):
+                return ("({ int _up_rb = %s; "
+                        "_up_rb < 0 ? 0.f : _Rigidbody_vel_%s[_up_rb]; })"
+                        % (get, axis))
+            if fl in ("mass",):
+                return ("({ int _up_rb = %s; "
+                        "_up_rb < 0 ? 0.f : _Rigidbody_mass[_up_rb]; })"
+                        % get)
+            if fl in ("usegravity",):
+                return ("({ int _up_rb = %s; "
+                        "_up_rb < 0 ? 0 : _Rigidbody_use_gravity[_up_rb]; })"
+                        % get)
+        raise PackError(
+            "GetComponent<%s>.%s: unsupported Rigidbody field "
+            "(use velocity.x/y, gravityScale, mass)"
+            % (comp, field or "?"))
+
+    def _field_after_get(comp, field, go_expr, axis=None):
+        if comp in _PHYSICS_COMPONENTS:
+            return _rb_field_expr(comp, field, axis, go_expr)
         idn = _c_ident(comp)
         zero = _zero_for_field(comp, field)
         return (
@@ -816,38 +1019,42 @@ def _rewrite_find_getcomponent(text, plan, this_class):
             % (idn, go_expr, zero, idn, field)
         )
 
+    def _known_component(comp):
+        return (comp in (plan.get("classes") or {})
+                or comp in _PHYSICS_COMPONENTS)
+
     for ch in chains:
         comp = ch.get("component")
         field = ch.get("field")
+        axis = ch.get("axis")
         if ch.get("on_this"):
             if not comp:
                 raise PackError("GetComponent requires a type argument")
             this_idn = _c_ident(this_class)
-            comp_idn = _c_ident(comp)
-            if comp not in (plan.get("classes") or {}):
+            if not _known_component(comp):
                 raise PackError(
                     "GetComponent<%s>: no authored %s in the scene — "
                     "unity_pack does not invent components" % (comp, comp))
             go_expr = "_engine_go_of_%s(i)" % this_idn
             if field:
-                repl = _field_after_get(comp, field, go_expr)
+                repl = _field_after_get(comp, field, go_expr, axis)
             else:
-                repl = "GameObject_GetComponent_%s(%s)" % (comp_idn, go_expr)
+                repl = "GameObject_GetComponent_%s(%s)" % (
+                    _c_ident(comp), go_expr)
             text = text[:ch["start"]] + repl + text[ch["end"]:]
             continue
 
         find_args = ch.get("find_args") or ""
-        # Always runtime — do not pack-time require the name to exist.
         go_expr = "GameObject_Find(%s)" % find_args
         if not comp:
             repl = go_expr
         else:
-            if comp not in (plan.get("classes") or {}):
+            if not _known_component(comp):
                 raise PackError(
                     "GetComponent<%s>: no authored %s in the scene — "
                     "unity_pack does not invent components" % (comp, comp))
             if field:
-                repl = _field_after_get(comp, field, go_expr)
+                repl = _field_after_get(comp, field, go_expr, axis)
             else:
                 repl = "GameObject_GetComponent_%s(%s)" % (
                     _c_ident(comp), go_expr)
@@ -870,6 +1077,10 @@ def analyze_script(path, text=None):
                 apis.add("AddComponent<Camera>")
             elif "SpriteRenderer" in token:
                 apis.add("AddComponent<SpriteRenderer>")
+            elif "Rigidbody2D" in token:
+                apis.add("AddComponent<Rigidbody2D>")
+            elif "Rigidbody" in token:
+                apis.add("AddComponent<Rigidbody>")
         elif token.startswith("GetComponent"):
             apis.add("GetComponent")
         elif "GameObject.Find" in token or token == "GameObject.Find":
@@ -884,6 +1095,8 @@ def analyze_script(path, text=None):
         if ch.get("component"):
             apis.add("GetComponent")
             getcomponent_types.add(ch["component"])
+            if ch["component"] in _PHYSICS_COMPONENTS:
+                apis.add(ch["component"])
         elif ch.get("on_this"):
             apis.add("GetComponent")
     if "transform.position" in scan:
@@ -1101,6 +1314,11 @@ def plan_layouts(objects, analyses, two_d=None):
         for c in a["classes"]:
             writes[c["name"]] = writes.get(c["name"], False) or a["writes_pos"]
 
+    for cname, insts in by_class.items():
+        # Authored Rigidbody integrates into transform — positions must be writable.
+        if any(o.get("rigidbody2d") or o.get("rigidbody") for o in insts):
+            writes[cname] = True
+
     plans = {}
     for cname, insts in by_class.items():
         n = len(insts)
@@ -1275,7 +1493,20 @@ def emit_engine(plan, analyses, used_apis):
     p = lines.append
     soa = bool(plan.get("soa"))
     want_math = bool(used_apis & {"Mathf.Sin", "Mathf.Cos"})
-    want_phys = "Physics2D.gravity" in used_apis
+    getcomponent_types = set()
+    for a in analyses:
+        getcomponent_types |= set(a.get("getcomponent_types") or [])
+    rb2d_list = plan.get("rigidbody2d") or []
+    rb3d_list = plan.get("rigidbody") or []
+    want_rb2d = (
+        bool(rb2d_list)
+        or "Rigidbody2D" in getcomponent_types
+        or "Rigidbody2D" in used_apis)
+    want_rb3d = (
+        bool(rb3d_list)
+        or "Rigidbody" in getcomponent_types)
+    want_phys = "Physics2D.gravity" in used_apis or want_rb2d
+    want_phys3 = "Physics.gravity" in used_apis or want_rb3d
     want_input = bool(used_apis & _WANT_INPUT)
     want_keyboard = "Keyboard.current" in used_apis
     keyboard_keys = set()
@@ -1286,10 +1517,10 @@ def emit_engine(plan, analyses, used_apis):
     want_console = "Console.WriteLine" in used_apis
     want_find = "GameObject.Find" in used_apis
     want_getcomponent = "GetComponent" in used_apis
-    getcomponent_types = set()
-    for a in analyses:
-        getcomponent_types |= set(a.get("getcomponent_types") or [])
+    want_go_tables = (
+        want_find or want_getcomponent or want_rb2d or want_rb3d)
     light_n = int(plan.get("light_count") or 0)
+    class_ids = {n: i for i, n in enumerate(sorted(plan["classes"]))}
     p("/* generated by tools/unity_pack.py — do not edit */")
     if soa:
         p("/* layout: SoA positions (contiguous float tables for GPU upload) */")
@@ -1321,11 +1552,16 @@ def emit_engine(plan, analyses, used_apis):
     p("extern float Time_deltaTime;")
     if "Time.time" in used_apis:
         p("extern float Time_time;")
-    if "Time.fixedDeltaTime" in used_apis or want_phys:
+    if ("Time.fixedDeltaTime" in used_apis or want_phys or want_phys3
+            or want_rb2d or want_rb3d):
         p("extern float Time_fixedDeltaTime;")
     if want_phys:
         p("extern float Physics2D_gravity_x;")
         p("extern float Physics2D_gravity_y;")
+    if want_phys3:
+        p("extern float Physics_gravity_x;")
+        p("extern float Physics_gravity_y;")
+        p("extern float Physics_gravity_z;")
     if want_ambient:
         p("extern float RenderSettings_ambient_r;")
         p("extern float RenderSettings_ambient_g;")
@@ -1353,6 +1589,26 @@ def emit_engine(plan, analyses, used_apis):
         p("extern float _Light_color_r[%d];" % light_n)
         p("extern float _Light_color_g[%d];" % light_n)
         p("extern float _Light_color_b[%d];" % light_n)
+    if want_rb2d:
+        n2 = max(1, len(rb2d_list))
+        p("extern const int _Rigidbody2D_count;")
+        p("extern float _Rigidbody2D_vel_x[%d];" % n2)
+        p("extern float _Rigidbody2D_vel_y[%d];" % n2)
+        p("extern float _Rigidbody2D_gravity_scale[%d];" % n2)
+        p("extern float _Rigidbody2D_mass[%d];" % n2)
+        p("extern const int _Rigidbody2D_body_type[%d];" % n2)
+        p("extern const int _Rigidbody2D_owner_class[%d];" % n2)
+        p("extern const int _Rigidbody2D_owner_inst[%d];" % n2)
+    if want_rb3d:
+        n3 = max(1, len(rb3d_list))
+        p("extern const int _Rigidbody_count;")
+        p("extern float _Rigidbody_vel_x[%d];" % n3)
+        p("extern float _Rigidbody_vel_y[%d];" % n3)
+        p("extern float _Rigidbody_vel_z[%d];" % n3)
+        p("extern float _Rigidbody_mass[%d];" % n3)
+        p("extern const int _Rigidbody_use_gravity[%d];" % n3)
+        p("extern const int _Rigidbody_owner_class[%d];" % n3)
+        p("extern const int _Rigidbody_owner_inst[%d];" % n3)
     p("")
 
     # Packed structs (positions omitted when SoA).
@@ -1607,9 +1863,11 @@ def emit_engine(plan, analyses, used_apis):
     p("}")
     p("")
 
-    if want_find or want_getcomponent:
+    if want_go_tables:
         go_names = plan.get("go_names") or []
         go_comps = plan.get("go_components") or {}
+        go_rb2d = plan.get("go_rigidbody2d") or {}
+        go_rb3d = plan.get("go_rigidbody") or {}
         p("/* GameObject.Find / GetComponent — authored scene tables only */")
         p("static const int _engine_go_count = %d;" % len(go_names))
         if go_names:
@@ -1668,13 +1926,40 @@ def emit_engine(plan, analyses, used_apis):
             p("}")
             p("")
         # Emit GetComponent_<T> for every packed class (and requested types).
-        for cname in sorted(set(plan["classes"]) | getcomponent_types):
+        for cname in sorted(set(plan["classes"]) | (
+                getcomponent_types - _PHYSICS_COMPONENTS)):
             if cname not in plan["classes"]:
                 continue
             idn = _c_ident(cname)
             p("static int GameObject_GetComponent_%s(int go) {" % idn)
             p("    if (go < 0 || go >= _engine_go_count) return -1;")
             p("    return _engine_go_%s[go];" % idn)
+            p("}")
+            p("")
+        if want_rb2d:
+            vals = []
+            for n in go_names:
+                vals.append(str(go_rb2d[n]) if n in go_rb2d else "-1")
+            if not vals:
+                vals = ["-1"]
+            p("static const int _engine_go_Rigidbody2D[%d] = { %s };" % (
+                len(vals), ", ".join(vals)))
+            p("static int GameObject_GetComponent_Rigidbody2D(int go) {")
+            p("    if (go < 0 || go >= _engine_go_count) return -1;")
+            p("    return _engine_go_Rigidbody2D[go];")
+            p("}")
+            p("")
+        if want_rb3d:
+            vals = []
+            for n in go_names:
+                vals.append(str(go_rb3d[n]) if n in go_rb3d else "-1")
+            if not vals:
+                vals = ["-1"]
+            p("static const int _engine_go_Rigidbody[%d] = { %s };" % (
+                len(vals), ", ".join(vals)))
+            p("static int GameObject_GetComponent_Rigidbody(int go) {")
+            p("    if (go < 0 || go >= _engine_go_count) return -1;")
+            p("    return _engine_go_Rigidbody[go];")
             p("}")
             p("")
 
@@ -1775,11 +2060,83 @@ def emit_engine(plan, analyses, used_apis):
         p("}")
         p("")
 
+    if want_rb2d or want_rb3d:
+        p("/* Authored Rigidbody / Rigidbody2D — gravity + integrate after FixedUpdate */")
+        p("static void engine_physics_fixed(void) {")
+        p("    int i;")
+        if want_rb2d and rb2d_list:
+            p("    for (i = 0; i < _Rigidbody2D_count; i = i + 1) {")
+            p("        unsigned oi;")
+            p("        float vx, vy;")
+            p("        if (_Rigidbody2D_body_type[i] != 0) continue; /* Dynamic only */")
+            p("        _Rigidbody2D_vel_x[i] = _Rigidbody2D_vel_x[i]")
+            p("            + Physics2D_gravity_x * _Rigidbody2D_gravity_scale[i]")
+            p("              * Time_fixedDeltaTime;")
+            p("        _Rigidbody2D_vel_y[i] = _Rigidbody2D_vel_y[i]")
+            p("            + Physics2D_gravity_y * _Rigidbody2D_gravity_scale[i]")
+            p("              * Time_fixedDeltaTime;")
+            p("        vx = _Rigidbody2D_vel_x[i] * Time_fixedDeltaTime;")
+            p("        vy = _Rigidbody2D_vel_y[i] * Time_fixedDeltaTime;")
+            p("        oi = (unsigned)_Rigidbody2D_owner_inst[i];")
+            p("        switch (_Rigidbody2D_owner_class[i]) {")
+            for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
+                idn = _c_ident(cname)
+                cl = plan["classes"][cname]
+                if not _class_has_position(cl):
+                    continue
+                p("        case %d:" % cid)
+                p("            %s_set_pos_x(oi, %s_get_pos_x(oi) + vx);"
+                  % (idn, idn))
+                p("            %s_set_pos_y(oi, %s_get_pos_y(oi) + vy);"
+                  % (idn, idn))
+                p("            break;")
+            p("        default: break;")
+            p("        }")
+            p("    }")
+        if want_rb3d and rb3d_list:
+            p("    for (i = 0; i < _Rigidbody_count; i = i + 1) {")
+            p("        unsigned oi;")
+            p("        float vx, vy, vz;")
+            p("        if (_Rigidbody_use_gravity[i]) {")
+            p("            _Rigidbody_vel_x[i] = _Rigidbody_vel_x[i]")
+            p("                + Physics_gravity_x * Time_fixedDeltaTime;")
+            p("            _Rigidbody_vel_y[i] = _Rigidbody_vel_y[i]")
+            p("                + Physics_gravity_y * Time_fixedDeltaTime;")
+            p("            _Rigidbody_vel_z[i] = _Rigidbody_vel_z[i]")
+            p("                + Physics_gravity_z * Time_fixedDeltaTime;")
+            p("        }")
+            p("        vx = _Rigidbody_vel_x[i] * Time_fixedDeltaTime;")
+            p("        vy = _Rigidbody_vel_y[i] * Time_fixedDeltaTime;")
+            p("        vz = _Rigidbody_vel_z[i] * Time_fixedDeltaTime;")
+            p("        oi = (unsigned)_Rigidbody_owner_inst[i];")
+            p("        switch (_Rigidbody_owner_class[i]) {")
+            for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
+                idn = _c_ident(cname)
+                cl = plan["classes"][cname]
+                if not _class_has_position(cl):
+                    continue
+                p("        case %d:" % cid)
+                p("            %s_set_pos_x(oi, %s_get_pos_x(oi) + vx);"
+                  % (idn, idn))
+                p("            %s_set_pos_y(oi, %s_get_pos_y(oi) + vy);"
+                  % (idn, idn))
+                if not cl.get("two_d"):
+                    p("            %s_set_pos_z(oi, %s_get_pos_z(oi) + vz);"
+                      % (idn, idn))
+                p("            break;")
+            p("        default: break;")
+            p("        }")
+            p("    }")
+        p("}")
+        p("")
+
     p("void engine_tick(void) {")
     if "Time.time" in used_apis:
         p("    Time_time = Time_time + Time_deltaTime;")
     for cname in sorted(plan["classes"]):
         p("    %s_FixedTick();" % _c_ident(cname))
+    if want_rb2d or want_rb3d:
+        p("    engine_physics_fixed();")
     for cname in sorted(plan["classes"]):
         p("    %s_Tick();" % _c_ident(cname))
     p("}")
@@ -2097,6 +2454,7 @@ def _lower_method_body(body, cl, plan):
     idn = _c_ident(cl["name"])
     text = body
     text = re.sub(r"\bthis\.", "", text)
+    text = _rewrite_rigidbody_assigns(text, plan, cl["name"])
     # Find/GetComponent before field rewrites so `.amp` stays on the target type.
     text = _rewrite_find_getcomponent(text, plan, cl["name"])
     # API tokens before Vector2 rewrites so nested Mathf.Sin(...) keeps parens.
@@ -2105,6 +2463,9 @@ def _lower_method_body(body, cl, plan):
     text = text.replace("Time.time", "Time_time")
     text = text.replace("Physics2D.gravity.x", "Physics2D_gravity_x")
     text = text.replace("Physics2D.gravity.y", "Physics2D_gravity_y")
+    text = text.replace("Physics.gravity.x", "Physics_gravity_x")
+    text = text.replace("Physics.gravity.y", "Physics_gravity_y")
+    text = text.replace("Physics.gravity.z", "Physics_gravity_z")
     text = text.replace("RenderSettings.ambientLight.r",
                         "RenderSettings_ambient_r")
     text = text.replace("RenderSettings.ambientLight.g",
@@ -2203,12 +2564,16 @@ def emit_data(plan, used_apis=None):
     lines = []
     p = lines.append
     used_apis = used_apis or set()
-    want_phys = "Physics2D.gravity" in used_apis
+    rb2d_list = plan.get("rigidbody2d") or []
+    rb3d_list = plan.get("rigidbody") or []
+    want_phys = "Physics2D.gravity" in used_apis or bool(rb2d_list)
+    want_phys3 = "Physics.gravity" in used_apis or bool(rb3d_list)
     want_input = bool(used_apis & _WANT_INPUT)
     want_keyboard = "Keyboard.current" in used_apis
     keyboard_keys = set(plan.get("keyboard_keys") or [])
     want_ambient = "RenderSettings.ambientLight" in used_apis
     lights = plan.get("lights") or []
+    class_ids = {n: i for i, n in enumerate(sorted(plan["classes"]))}
     p("/* generated by tools/unity_pack.py — scene tables, compile -O0 */")
     if plan.get("soa"):
         p("/* SoA: positions live in _Class_pos[N][dims], not in the struct */")
@@ -2236,11 +2601,16 @@ def emit_data(plan, used_apis=None):
     p("float Time_deltaTime = 0.0166667f;")
     if "Time.time" in used_apis:
         p("float Time_time = 0.f;")
-    if "Time.fixedDeltaTime" in used_apis or want_phys:
+    if ("Time.fixedDeltaTime" in used_apis or want_phys or want_phys3
+            or rb2d_list or rb3d_list):
         p("float Time_fixedDeltaTime = 0.02f;")
     if want_phys:
         p("float Physics2D_gravity_x = 0.f;")
         p("float Physics2D_gravity_y = -9.81f;")
+    if want_phys3:
+        p("float Physics_gravity_x = 0.f;")
+        p("float Physics_gravity_y = -9.81f;")
+        p("float Physics_gravity_z = 0.f;")
     if want_ambient:
         # Unity default ambient-ish grey; host may override.
         p("float RenderSettings_ambient_r = 0.2f;")
@@ -2280,6 +2650,41 @@ def emit_data(plan, used_apis=None):
         p("float _Light_color_b[%d] = { %s };" % (
             len(lights),
             ", ".join("%sf" % repr(float(L["b"])) for L in lights)))
+    if rb2d_list:
+        n = len(rb2d_list)
+        p("const int _Rigidbody2D_count = %d;" % n)
+        p("float _Rigidbody2D_vel_x[%d] = { %s };" % (
+            n, ", ".join("%sf" % repr(float(r["vel_x"])) for r in rb2d_list)))
+        p("float _Rigidbody2D_vel_y[%d] = { %s };" % (
+            n, ", ".join("%sf" % repr(float(r["vel_y"])) for r in rb2d_list)))
+        p("float _Rigidbody2D_gravity_scale[%d] = { %s };" % (
+            n, ", ".join("%sf" % repr(float(r["gravity_scale"]))
+                         for r in rb2d_list)))
+        p("float _Rigidbody2D_mass[%d] = { %s };" % (
+            n, ", ".join("%sf" % repr(float(r["mass"])) for r in rb2d_list)))
+        p("const int _Rigidbody2D_body_type[%d] = { %s };" % (
+            n, ", ".join(str(int(r["body_type"])) for r in rb2d_list)))
+        p("const int _Rigidbody2D_owner_class[%d] = { %s };" % (
+            n, ", ".join(str(class_ids[r["owner_class"]]) for r in rb2d_list)))
+        p("const int _Rigidbody2D_owner_inst[%d] = { %s };" % (
+            n, ", ".join(str(int(r["owner_inst"])) for r in rb2d_list)))
+    if rb3d_list:
+        n = len(rb3d_list)
+        p("const int _Rigidbody_count = %d;" % n)
+        p("float _Rigidbody_vel_x[%d] = { %s };" % (
+            n, ", ".join("%sf" % repr(float(r["vel_x"])) for r in rb3d_list)))
+        p("float _Rigidbody_vel_y[%d] = { %s };" % (
+            n, ", ".join("%sf" % repr(float(r["vel_y"])) for r in rb3d_list)))
+        p("float _Rigidbody_vel_z[%d] = { %s };" % (
+            n, ", ".join("%sf" % repr(float(r["vel_z"])) for r in rb3d_list)))
+        p("float _Rigidbody_mass[%d] = { %s };" % (
+            n, ", ".join("%sf" % repr(float(r["mass"])) for r in rb3d_list)))
+        p("const int _Rigidbody_use_gravity[%d] = { %s };" % (
+            n, ", ".join(str(int(r["use_gravity"])) for r in rb3d_list)))
+        p("const int _Rigidbody_owner_class[%d] = { %s };" % (
+            n, ", ".join(str(class_ids[r["owner_class"]]) for r in rb3d_list)))
+        p("const int _Rigidbody_owner_inst[%d] = { %s };" % (
+            n, ", ".join(str(int(r["owner_inst"])) for r in rb3d_list)))
     textures = plan.get("textures") or []
     p("const int _engine_tex_count = %d;" % len(textures))
     if textures:
@@ -2591,6 +2996,11 @@ def pack(root, outdir, soa=False, soa_vec4=False):
     go_names, go_comps = _build_go_tables(plan)
     plan["go_names"] = go_names
     plan["go_components"] = go_comps
+    rb2d, rb3d, go_rb2d, go_rb3d = _build_rigidbody_tables(plan)
+    plan["rigidbody2d"] = rb2d
+    plan["rigidbody"] = rb3d
+    plan["go_rigidbody2d"] = go_rb2d
+    plan["go_rigidbody"] = go_rb3d
     os.makedirs(outdir, exist_ok=True)
     engine = emit_engine(plan, analyses, used_apis)
     data = emit_data(plan, used_apis)
