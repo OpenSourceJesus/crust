@@ -7,6 +7,9 @@ float16 for static backgrounds, bitfields for small ints, and uint8_t
 indices instead of pointers when a class is bounded (hand-placed, never
 spawned, N ≤ 256).
 
+Does not invent scene components (ParticleSystem pools, AnimationCurves,
+Rigidbody graphs). It packs and speeds up what the project already authored.
+
     python3 tools/unity_pack.py <project> -o <outdir>
 """
 
@@ -45,10 +48,56 @@ _API = {
         "    if (t < 0.f) t = 0.f; if (t > 1.f) t = 1.f;\n"
         "    return a + (b - a) * t;\n}"
     ),
-    "Time.deltaTime": None,  # a global float, not a function
-    "Input.GetAxis": (
-        "static float Input_GetAxis(const char *name) {\n"
-        "    (void)name; return 0.f; /* host fills engine_input_axis */\n}"
+    "Mathf.Sin": "static float Mathf_Sin(float f) { return sinf(f); }",
+    "Mathf.Cos": "static float Mathf_Cos(float f) { return cosf(f); }",
+    "Time.deltaTime": None,  # globals in data.c — host can poke
+    "Time.time": None,
+    "Time.fixedDeltaTime": None,
+    "Physics2D.gravity": None,
+    "RenderSettings.ambientLight": None,
+    # Input Manager (legacy): host pokes floats/ints in data.c. Snippets
+    # are emitted in emit_engine once string.h / externs are in place.
+    "Input.GetAxis": True,
+    "Input.GetButton": True,
+    "Input.GetKey": True,
+}
+
+# APIs that would require inventing scene components / assets we do not pack.
+_REFUSED_API = {
+    "ParticleSystem.Emit": (
+        "ParticleSystem is a Unity component — unity_pack does not invent "
+        "particle pools. Keep particles in the authored project, or drive "
+        "motion from packed MonoBehaviour fields only."
+    ),
+    "AnimationCurve.Evaluate": (
+        "AnimationCurve assets are not imported — unity_pack does not invent "
+        "default curves. Animate with Time / Mathf on packed fields, or wait "
+        "for curve import."
+    ),
+    "InputAction": (
+        "Unity Input System InputAction assets are not imported — unity_pack "
+        "does not invent action maps. Use Input.GetAxis / GetButton with a "
+        "host, or wait for action-asset import."
+    ),
+    "Keyboard.current": (
+        "Unity Input System Keyboard.current needs the Input System package "
+        "runtime — unity_pack does not invent device graphs. Use "
+        "Input.GetKey with a host-fed table."
+    ),
+    "Gamepad.current": (
+        "Unity Input System Gamepad.current needs the Input System package "
+        "runtime — unity_pack does not invent device graphs."
+    ),
+    "UnityEngine.UI": (
+        "uGUI (Canvas / Text / Image) is not invented by the packer. Keep UI "
+        "in the authored Unity project, or wait for Canvas import."
+    ),
+    "Canvas": (
+        "Canvas is a Unity component — unity_pack does not invent UI roots."
+    ),
+    "AddComponent<Light>": (
+        "Light must be authored on a scene GameObject — unity_pack does not "
+        "AddComponent lights."
     ),
 }
 
@@ -58,10 +107,19 @@ _SPAWN = re.compile(
 )
 _VEC3Z = re.compile(r"\.(z)\b|Vector3|Quaternion")
 _UNITY_API = re.compile(
-    r"(?<![\w])(Mathf\.(Abs|Min|Max|Clamp|Lerp|Sin|Cos)|"
-    r"Time\.deltaTime|Input\.GetAxis|transform\.position|"
-    r"Vector2|Vector3|Quaternion)\b"
+    r"(?:AddComponent\s*<\s*Light\s*>|"
+    r"(?<![\w])(?:Mathf\.(?:Abs|Min|Max|Clamp|Lerp|Sin|Cos)|"
+    r"Time\.(?:deltaTime|time|fixedDeltaTime)|"
+    r"Input\.(?:GetAxis|GetButton|GetKey)|"
+    r"RenderSettings\.ambientLight|"
+    r"transform\.position|Physics2D\.gravity|ParticleSystem\.Emit|"
+    r"AnimationCurve\.Evaluate|"
+    r"InputAction|Keyboard\.current|Gamepad\.current|"
+    r"UnityEngine\.UI|"
+    r"(?<![.\w])Canvas(?=\s|\.|;)|"
+    r"Vector2|Vector3|Quaternion)\b)"
 )
+_WANT_INPUT = frozenset({"Input.GetAxis", "Input.GetButton", "Input.GetKey"})
 
 
 # ---------------------------------------------------------------------------
@@ -109,21 +167,29 @@ def parse_unity_yaml(text, guid_to_script=None):
     Not a YAML library. Unity's document-per-object form is regular enough
     that a block split on `--- !u!` is enough, and a dependency on PyYAML
     would make the test suite depend on the outside world.
+
+    Returns (objects, lights). lights are authored !u!108 Light components
+    only — never invented.
     """
     guid_to_script = guid_to_script or {}
     objects = []
+    lights = []
     blocks = re.split(r"(?m)^---\s+", text)
     by_id = {}
     for block in blocks:
         hm = re.match(r"!u!(\d+)\s+&(\d+)", block)
         if not hm:
             continue
+        type_id = hm.group(1)
         file_id = hm.group(2)
         kind = None
-        km = re.search(r"(?m)^(GameObject|Transform|MonoBehaviour|PrefabInstance):",
-                       block)
+        km = re.search(
+            r"(?m)^(GameObject|Transform|MonoBehaviour|PrefabInstance|Light):",
+            block)
         if km:
             kind = km.group(1)
+        elif type_id == "108":
+            kind = "Light"
         rec = {"file_id": file_id, "kind": kind, "raw": block, "fields": {}}
         nm = re.search(r"(?m)^\s+m_Name:\s*(.+)$", block)
         if nm:
@@ -144,6 +210,18 @@ def parse_unity_yaml(text, guid_to_script=None):
                 continue
             val = fm.group(2)
             rec["fields"][key] = float(val) if "." in val else int(val)
+        if kind == "Light":
+            inten = re.search(r"(?m)^\s+m_Intensity:\s*([0-9.eE+-]+)", block)
+            col = re.search(
+                r"m_Color:\s*\{r:\s*([^,}]+),\s*g:\s*([^,}]+),"
+                r"\s*b:\s*([^,}]+)", block)
+            lights.append({
+                "file_id": file_id,
+                "intensity": float(inten.group(1)) if inten else 1.0,
+                "r": float(col.group(1)) if col else 1.0,
+                "g": float(col.group(2)) if col else 1.0,
+                "b": float(col.group(3)) if col else 1.0,
+            })
         by_id[file_id] = rec
 
     # Join MonoBehaviour + Transform onto the GameObject.
@@ -174,7 +252,7 @@ def parse_unity_yaml(text, guid_to_script=None):
             "script": script,
             "class": class_name or go.get("name") or "Obj",
         })
-    return objects
+    return objects, lights
 
 
 def parse_godot_tscn(text):
@@ -253,12 +331,17 @@ def analyze_script(path, text=None):
     scan = cs2cpp._blank(text)
     apis = set()
     for m in _UNITY_API.finditer(scan):
-        apis.add(m.group(0) if m.group(0).startswith("Mathf.")
-                 or m.group(0).startswith("Time.")
-                 or m.group(0).startswith("Input.")
-                 else m.group(0))
+        token = m.group(0)
+        if token.startswith("AddComponent"):
+            apis.add("AddComponent<Light>")
+        else:
+            apis.add(token)
     if "transform.position" in scan:
         apis.add("transform.position")
+    if re.search(r"using\s+UnityEngine\.UI\b", scan):
+        apis.add("UnityEngine.UI")
+    if re.search(r"\bInputAction\b", scan):
+        apis.add("InputAction")
     spawns = bool(_SPAWN.search(scan))
     uses_z = bool(re.search(r"(?<![\w.])Vector3\b", scan)
                   or re.search(r"(?<![\w.])Quaternion\b", scan)
@@ -459,8 +542,12 @@ def plan_layouts(objects, analyses, two_d=None):
             members.append(("pos_z", "float", 32, "f32"))
 
         for fname, ty in field_tys.items():
-            if ty in ("Vector2", "Vector3"):
-                continue  # position already from Transform
+            if ty == "Vector2":
+                members.append((fname + "_x", "float", 32, "f32"))
+                members.append((fname + "_y", "float", 32, "f32"))
+                continue
+            if ty == "Vector3":
+                continue  # transform owns position; full Vector3 fields later
             if ty in ("int", "byte", "short", "uint"):
                 vals = [o["fields"][fname] for o in insts if fname in o["fields"]]
                 if not vals:
@@ -487,6 +574,7 @@ def plan_layouts(objects, analyses, two_d=None):
 
         # Size with C bitfield packing (same word until 32 bits).
         size = _packed_size(members)
+        vec2_fields = [f["name"] for f in script_fields if f["ty"] == "Vector2"]
         plans[cname] = {
             "name": cname,
             "n": n,
@@ -499,6 +587,7 @@ def plan_layouts(objects, analyses, two_d=None):
             "size": size,
             "instances": insts,
             "fields": script_fields,
+            "vec2_fields": vec2_fields,
         }
     return {"two_d": two_d, "spawn": spawn, "classes": plans}
 
@@ -584,10 +673,19 @@ def emit_engine(plan, analyses, used_apis):
     lines = []
     p = lines.append
     soa = bool(plan.get("soa"))
+    want_math = bool(used_apis & {"Mathf.Sin", "Mathf.Cos"})
+    want_phys = "Physics2D.gravity" in used_apis
+    want_input = bool(used_apis & _WANT_INPUT)
+    want_ambient = "RenderSettings.ambientLight" in used_apis
+    light_n = int(plan.get("light_count") or 0)
     p("/* generated by tools/unity_pack.py — do not edit */")
     if soa:
         p("/* layout: SoA positions (contiguous float tables for GPU upload) */")
     p("#include <stdint.h>")
+    if want_math:
+        p("#include <math.h>")
+    if want_input:
+        p("#include <string.h>")
     p("")
     p("/* Types first, then every global. C forbids `extern T a[N]` while")
     p("   T is incomplete, so the arrays wait until the structs exist;")
@@ -597,6 +695,28 @@ def emit_engine(plan, analyses, used_apis):
         idn = _c_ident(cname)
         p("typedef struct %s %s;" % (idn, idn))
     p("extern float Time_deltaTime;")
+    if "Time.time" in used_apis:
+        p("extern float Time_time;")
+    if "Time.fixedDeltaTime" in used_apis or want_phys:
+        p("extern float Time_fixedDeltaTime;")
+    if want_phys:
+        p("extern float Physics2D_gravity_x;")
+        p("extern float Physics2D_gravity_y;")
+    if want_ambient:
+        p("extern float RenderSettings_ambient_r;")
+        p("extern float RenderSettings_ambient_g;")
+        p("extern float RenderSettings_ambient_b;")
+    if want_input:
+        p("extern float engine_input_axis_Horizontal;")
+        p("extern float engine_input_axis_Vertical;")
+        p("extern int engine_input_button_Jump;")
+        p("extern unsigned char engine_input_key[256];")
+    if light_n:
+        p("extern const int _Light_count;")
+        p("extern float _Light_intensity[%d];" % light_n)
+        p("extern float _Light_color_r[%d];" % light_n)
+        p("extern float _Light_color_g[%d];" % light_n)
+        p("extern float _Light_color_b[%d];" % light_n)
     p("")
 
     # Packed structs (positions omitted when SoA).
@@ -633,12 +753,38 @@ def emit_engine(plan, analyses, used_apis):
     p("")
 
     # Used Unity API only.
-    if "Time.deltaTime" in used_apis:
-        p("/* Time.deltaTime is defined in data.c so a host can poke it. */")
+    if "Time.deltaTime" in used_apis or "Time.time" in used_apis:
+        p("/* Time_* globals are defined in data.c so a host can poke them. */")
     for key, snippet in _API.items():
-        if key in used_apis and snippet:
+        if key in used_apis and snippet and snippet is not True:
             p(snippet)
             p("")
+    if "Input.GetAxis" in used_apis:
+        p("static float Input_GetAxis(const char *name) {")
+        p("    if (!name) return 0.f;")
+        p("    if (strcmp(name, \"Horizontal\") == 0)")
+        p("        return engine_input_axis_Horizontal;")
+        p("    if (strcmp(name, \"Vertical\") == 0)")
+        p("        return engine_input_axis_Vertical;")
+        p("    return 0.f;")
+        p("}")
+        p("")
+    if "Input.GetButton" in used_apis:
+        p("static int Input_GetButton(const char *name) {")
+        p("    if (name && strcmp(name, \"Jump\") == 0)")
+        p("        return engine_input_button_Jump;")
+        p("    return 0;")
+        p("}")
+        p("")
+    if "Input.GetKey" in used_apis:
+        p("static int Input_GetKey(const char *name) {")
+        p("    unsigned char c;")
+        p("    if (!name || !name[0]) return 0;")
+        p("    c = (unsigned char)name[0];")
+        p("    if (c >= 'A' && c <= 'Z') c = (unsigned char)(c - 'A' + 'a');")
+        p("    return engine_input_key[c] ? 1 : 0;")
+        p("}")
+        p("")
 
     p("static float f16_to_f32(uint16_t h) {")
     p("    unsigned s = (h >> 15) & 1u;")
@@ -702,9 +848,20 @@ def emit_engine(plan, analyses, used_apis):
             p("}")
             p("")
 
-        # Tick: call Update on each instance.
+        # Tick: FixedUpdate then Update on each instance.
+        has_fixed = any(m["name"] == "FixedUpdate"
+                        for _c, m in methods_by.get(cname, []))
         has_update = any(m["name"] == "Update"
                          for _c, m in methods_by.get(cname, []))
+        p("void %s_FixedTick(void) {" % idn)
+        if has_fixed:
+            p("    int n;")
+            p("    for (n = 0; n < _%s_inst_count; n = n + 1)" % idn)
+            p("        %s_FixedUpdate((unsigned)n);" % idn)
+        else:
+            p("    /* no FixedUpdate */")
+        p("}")
+        p("")
         p("void %s_Tick(void) {" % idn)
         if has_update:
             p("    int n;")
@@ -716,6 +873,10 @@ def emit_engine(plan, analyses, used_apis):
         p("")
 
     p("void engine_tick(void) {")
+    if "Time.time" in used_apis:
+        p("    Time_time = Time_time + Time_deltaTime;")
+    for cname in sorted(plan["classes"]):
+        p("    %s_FixedTick();" % _c_ident(cname))
     for cname in sorted(plan["classes"]):
         p("    %s_Tick();" % _c_ident(cname))
     p("}")
@@ -836,6 +997,59 @@ def emit_engine_draw_h():
     )
 
 
+def _split_call_args(argstr):
+    """Split `a, b` or `a, b, c` on commas at paren depth 0."""
+    parts = []
+    depth = 0
+    start = 0
+    for i, c in enumerate(argstr):
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        elif c == "," and depth == 0:
+            parts.append(argstr[start:i].strip())
+            start = i + 1
+    parts.append(argstr[start:].strip())
+    return parts
+
+
+def _rewrite_new_vector_assigns(text, idn):
+    """`transform.position =/+ = new Vector2/3(...)` with nested calls."""
+
+    def repl_eq(m):
+        args = _split_call_args(m.group(1))
+        if len(args) < 2:
+            return m.group(0)
+        return "%s_set_pos_x(i, (%s)); %s_set_pos_y(i, (%s));" % (
+            idn, args[0], idn, args[1])
+
+    def repl_add(m):
+        args = _split_call_args(m.group(1))
+        if len(args) < 2:
+            return m.group(0)
+        return (
+            "%s_set_pos_x(i, %s_get_pos_x(i) + (%s)); "
+            "%s_set_pos_y(i, %s_get_pos_y(i) + (%s));" % (
+                idn, idn, args[0], idn, idn, args[1])
+        )
+
+    flags = re.DOTALL
+    text = re.sub(
+        r"transform\.position\s*=\s*new\s+Vector2\s*\((.*?)\)\s*;",
+        repl_eq, text, flags=flags)
+    text = re.sub(
+        r"transform\.position\s*=\s*new\s+Vector3\s*\((.*?)\)\s*;",
+        repl_eq, text, flags=flags)
+    text = re.sub(
+        r"transform\.position\s*\+=\s*new\s+Vector2\s*\((.*?)\)\s*;",
+        repl_add, text, flags=flags)
+    text = re.sub(
+        r"transform\.position\s*\+=\s*new\s+Vector3\s*\((.*?)\)\s*;",
+        repl_add, text, flags=flags)
+    return text
+
+
 def _lower_method_body(body, cl, plan):
     """C# subset method → C against packed arrays.
 
@@ -846,26 +1060,42 @@ def _lower_method_body(body, cl, plan):
     idn = _c_ident(cl["name"])
     text = body
     text = re.sub(r"\bthis\.", "", text)
+    # API tokens before Vector2 rewrites so nested Mathf.Sin(...) keeps parens.
+    text = text.replace("Time.deltaTime", "Time_deltaTime")
+    text = text.replace("Time.fixedDeltaTime", "Time_fixedDeltaTime")
+    text = text.replace("Time.time", "Time_time")
+    text = text.replace("Physics2D.gravity.x", "Physics2D_gravity_x")
+    text = text.replace("Physics2D.gravity.y", "Physics2D_gravity_y")
+    text = text.replace("RenderSettings.ambientLight.r",
+                        "RenderSettings_ambient_r")
+    text = text.replace("RenderSettings.ambientLight.g",
+                        "RenderSettings_ambient_g")
+    text = text.replace("RenderSettings.ambientLight.b",
+                        "RenderSettings_ambient_b")
+    text = re.sub(r"Input\.(GetAxis|GetButton|GetKey)\s*\(",
+                  lambda m: "Input_%s(" % m.group(1), text)
+    text = re.sub(r"Mathf\.(Abs|Min|Max|Clamp|Lerp|Sin|Cos)\s*\(",
+                  lambda m: "Mathf_%s(" % m.group(1), text)
     text = re.sub(r"transform\.position\.x", idn + "_get_pos_x(i)", text)
     text = re.sub(r"transform\.position\.y", idn + "_get_pos_y(i)", text)
     text = re.sub(r"transform\.position\.z",
                   idn + "_get_pos_z(i)" if not cl["two_d"] else "0.f", text)
-    # `transform.position += new Vector2(dx, dy)`
-    text = re.sub(
-        r"transform\.position\s*\+=\s*new\s+Vector2\s*\(([^,]+),\s*([^)]+)\)",
-        idn + r"_set_pos_x(i, " + idn + r"_get_pos_x(i) + (\1)); "
-        + idn + r"_set_pos_y(i, " + idn + r"_get_pos_y(i) + (\2))",
-        text)
-    text = re.sub(
-        r"transform\.position\s*\+=\s*new\s+Vector3\s*\(([^,]+),\s*([^,]+),\s*([^)]+)\)",
-        idn + r"_set_pos_x(i, " + idn + r"_get_pos_x(i) + (\1)); "
-        + idn + r"_set_pos_y(i, " + idn + r"_get_pos_y(i) + (\2))",
-        text)
-    text = text.replace("Time.deltaTime", "Time_deltaTime")
-    text = re.sub(r"Mathf\.(Abs|Min|Max|Clamp|Lerp)\s*\(",
-                  lambda m: "Mathf_%s(" % m.group(1), text)
+    text = _rewrite_new_vector_assigns(text, idn)
 
     members = {n for n, _t, _b, _k in cl["members"]}
+    for vf in cl.get("vec2_fields") or []:
+        text = re.sub(r"(?<![_\w])%s\.x\b" % vf, "%s_x" % vf, text)
+        text = re.sub(r"(?<![_\w])%s\.y\b" % vf, "%s_y" % vf, text)
+        text = re.sub(
+            r"(?<![_\w])%s\s*\+=\s*new\s+Vector2\s*\((.*)\)" % vf,
+            lambda m, name=vf: (
+                (lambda args: (
+                    "%s_x = %s_x + (%s); %s_y = %s_y + (%s)" % (
+                        name, name, args[0], name, name, args[1])
+                    if len(args) >= 2 else m.group(0)
+                ))(_split_call_args(m.group(1)))
+            ),
+            text)
     for name in sorted(members, key=len, reverse=True):
         text = re.sub(
             r"(?<![_\w])%s\s*\+=" % name,
@@ -908,9 +1138,14 @@ def _lower_method_body(body, cl, plan):
     return text
 
 
-def emit_data(plan):
+def emit_data(plan, used_apis=None):
     lines = []
     p = lines.append
+    used_apis = used_apis or set()
+    want_phys = "Physics2D.gravity" in used_apis
+    want_input = bool(used_apis & _WANT_INPUT)
+    want_ambient = "RenderSettings.ambientLight" in used_apis
+    lights = plan.get("lights") or []
     p("/* generated by tools/unity_pack.py — scene tables, compile -O0 */")
     if plan.get("soa"):
         p("/* SoA: positions live in _Class_pos[N][dims], not in the struct */")
@@ -936,6 +1171,37 @@ def emit_data(plan):
         p("")
 
     p("float Time_deltaTime = 0.0166667f;")
+    if "Time.time" in used_apis:
+        p("float Time_time = 0.f;")
+    if "Time.fixedDeltaTime" in used_apis or want_phys:
+        p("float Time_fixedDeltaTime = 0.02f;")
+    if want_phys:
+        p("float Physics2D_gravity_x = 0.f;")
+        p("float Physics2D_gravity_y = -9.81f;")
+    if want_ambient:
+        # Unity default ambient-ish grey; host may override.
+        p("float RenderSettings_ambient_r = 0.2f;")
+        p("float RenderSettings_ambient_g = 0.2f;")
+        p("float RenderSettings_ambient_b = 0.2f;")
+    if want_input:
+        p("float engine_input_axis_Horizontal = 0.f;")
+        p("float engine_input_axis_Vertical = 0.f;")
+        p("int engine_input_button_Jump = 0;")
+        p("unsigned char engine_input_key[256]; /* host zeros / sets */")
+    if lights:
+        p("const int _Light_count = %d;" % len(lights))
+        p("float _Light_intensity[%d] = { %s };" % (
+            len(lights),
+            ", ".join("%sf" % repr(float(L["intensity"])) for L in lights)))
+        p("float _Light_color_r[%d] = { %s };" % (
+            len(lights),
+            ", ".join("%sf" % repr(float(L["r"])) for L in lights)))
+        p("float _Light_color_g[%d] = { %s };" % (
+            len(lights),
+            ", ".join("%sf" % repr(float(L["g"])) for L in lights)))
+        p("float _Light_color_b[%d] = { %s };" % (
+            len(lights),
+            ", ".join("%sf" % repr(float(L["b"])) for L in lights)))
     p("")
     for cname, cl in sorted(plan["classes"].items()):
         idn = _c_ident(cname)
@@ -992,17 +1258,41 @@ def _init_num(v, kind):
 
 def emit_makefile(outdir):
     return (
-        "# generated — engine at -O3, data at -O0\n"
+        "# generated — engine at -O3, data at -O0; main.c is a headless host\n"
         "CC ?= gcc\n"
         "all: game\n"
         "engine.o: engine.c\n"
         "\t$(CC) -O3 -c -o $@ $<\n"
         "data.o: data.c\n"
         "\t$(CC) -O0 -c -o $@ $<\n"
-        "game: engine.o data.o\n"
-        "\t$(CC) -O2 -o $@ engine.o data.o -lm\n"
+        "main.o: main.c engine_draw.h\n"
+        "\t$(CC) -O2 -c -o $@ $<\n"
+        "game: engine.o data.o main.o\n"
+        "\t$(CC) -O2 -o $@ engine.o data.o main.o -lm\n"
         "clean:\n"
-        "\trm -f engine.o data.o game\n"
+        "\trm -f engine.o data.o main.o game\n"
+    )
+
+
+def emit_main():
+    """Headless host so `make` links: tick a second, print draw count."""
+    return (
+        "/* generated by tools/unity_pack.py — replace for a real host */\n"
+        "#include <stdio.h>\n"
+        "#include \"engine_draw.h\"\n"
+        "\n"
+        "extern float Time_deltaTime;\n"
+        "\n"
+        "int main(void) {\n"
+        "    EngineDraw buf[256];\n"
+        "    int i, n;\n"
+        "    Time_deltaTime = 0.0166667f;\n"
+        "    for (i = 0; i < 60; i = i + 1)\n"
+        "        engine_tick();\n"
+        "    n = engine_collect_draws(buf, 256);\n"
+        "    printf(\"ticks=60 draws=%d\\n\", n);\n"
+        "    return n > 0 ? 0 : 1;\n"
+        "}\n"
     )
 
 
@@ -1048,8 +1338,12 @@ def load_project(root):
         raise PackError("not a directory: %s" % root)
     guids = _guid_map(root)
     objects = []
+    lights = []
     for path in _walk_files(root, (".unity",)):
-        objects.extend(parse_unity_yaml(_read(path), guid_to_script=guids))
+        objs, scene_lights = parse_unity_yaml(
+            _read(path), guid_to_script=guids)
+        objects.extend(objs)
+        lights.extend(scene_lights)
     for path in _walk_files(root, (".tscn",)):
         objects.extend(parse_godot_tscn(_read(path)))
     for path in _walk_files(root, (".json",)):
@@ -1084,7 +1378,7 @@ def load_project(root):
         raise PackError(
             "no scene objects found under %s "
             "(looked for .unity / .tscn / blender_pack.json)" % root)
-    return objects, analyses
+    return objects, analyses, lights
 
 
 def emit_soa_positions_glsl(plan):
@@ -1134,10 +1428,13 @@ def emit_soa_positions_glsl(plan):
 
 
 def pack(root, outdir, soa=False, soa_vec4=False):
-    objects, analyses = load_project(root)
+    objects, analyses, lights = load_project(root)
     used_apis = set()
     for a in analyses:
         used_apis |= a["apis"]
+    for api, reason in sorted(_REFUSED_API.items()):
+        if api in used_apis:
+            raise PackError("%s: %s" % (api, reason))
     plan = plan_layouts(objects, analyses)
     if soa or soa_vec4:
         plan = apply_soa_layout(plan, vec4=bool(soa_vec4))
@@ -1145,15 +1442,19 @@ def pack(root, outdir, soa=False, soa_vec4=False):
         plan = dict(plan)
         plan["soa"] = False
         plan["soa_vec4"] = False
+    plan["lights"] = list(lights)
+    plan["light_count"] = len(lights)
     os.makedirs(outdir, exist_ok=True)
     engine = emit_engine(plan, analyses, used_apis)
-    data = emit_data(plan)
+    data = emit_data(plan, used_apis)
     with open(os.path.join(outdir, "engine.c"), "w") as f:
         f.write(engine)
     with open(os.path.join(outdir, "data.c"), "w") as f:
         f.write(data)
     with open(os.path.join(outdir, "engine_draw.h"), "w") as f:
         f.write(emit_engine_draw_h())
+    with open(os.path.join(outdir, "main.c"), "w") as f:
+        f.write(emit_main())
     with open(os.path.join(outdir, "Makefile"), "w") as f:
         f.write(emit_makefile(outdir))
     shdir = os.path.join(outdir, "shaders")
@@ -1198,7 +1499,7 @@ def main():
         return 1
     sys.stderr.write(
         "unity_pack: %d classes, 2d=%s, soa=%s, soa_vec4=%s, "
-        "wrote %s/{engine.c,data.c,engine_draw.h}\n"
+        "wrote %s/{engine.c,data.c,main.c,engine_draw.h}\n"
         % (len(plan["classes"]), plan["two_d"], plan.get("soa"),
            plan.get("soa_vec4"), outdir))
     for name, cl in sorted(plan["classes"].items()):

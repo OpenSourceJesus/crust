@@ -34,5 +34,12 @@ object as a coloured quad (surfaceless FBO → ASCII).
 
 `run_gles2_window.sh` links `gles2_window.c` against the same packed
 engine and opens an OpenGL ES 2.0 window via GLFW. The player keeps
-moving every frame (`Time.deltaTime` from the frame clock). Escape or Q
-closes the window.
+moving every frame (`Time.deltaTime` from the frame clock). Arrow keys /
+WASD poke `engine_input_axis_*` for `Input.GetAxis`. Escape or Q closes.
+
+SystemsScene (Pad + Ball + …):
+
+```
+SCENE="$(pwd)/examples/unity_pack/SystemsScene" \
+  ./examples/unity_pack/run_gles2_window.sh
+```

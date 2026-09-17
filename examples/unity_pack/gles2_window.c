@@ -4,9 +4,10 @@
  * surfaceless FBO path in gles2_view.c.
  *
  *     examples/unity_pack/run_gles2_window.sh
+ *     SCENE=.../SystemsScene ./examples/unity_pack/run_gles2_window.sh
  *
- * Close the window (or press Escape) to quit. Time.deltaTime is updated
- * from the frame clock so the player keeps moving.
+ * Arrow keys / WASD feed engine_input_axis_* (Input.GetAxis). Escape or Q
+ * quits. Time.deltaTime comes from the frame clock.
  */
 
 #define GLFW_INCLUDE_ES2
@@ -19,6 +20,10 @@
 #include "engine_draw.h"
 
 extern float Time_deltaTime;
+
+/* Weak so MiniScene (no Input) still links; SystemsScene data.c wins. */
+float engine_input_axis_Horizontal __attribute__((weak)) = 0.f;
+float engine_input_axis_Vertical __attribute__((weak)) = 0.f;
 
 #define WIN_W 800
 #define WIN_H 600
@@ -141,12 +146,32 @@ static void on_key(GLFWwindow *win, int key, int scancode, int action, int mods)
     }
 }
 
+static void poll_input_axes(GLFWwindow *win)
+{
+    float hx = 0.f, vy = 0.f;
+    if (glfwGetKey(win, GLFW_KEY_LEFT) == GLFW_PRESS
+        || glfwGetKey(win, GLFW_KEY_A) == GLFW_PRESS)
+        hx -= 1.f;
+    if (glfwGetKey(win, GLFW_KEY_RIGHT) == GLFW_PRESS
+        || glfwGetKey(win, GLFW_KEY_D) == GLFW_PRESS)
+        hx += 1.f;
+    if (glfwGetKey(win, GLFW_KEY_DOWN) == GLFW_PRESS
+        || glfwGetKey(win, GLFW_KEY_S) == GLFW_PRESS)
+        vy -= 1.f;
+    if (glfwGetKey(win, GLFW_KEY_UP) == GLFW_PRESS
+        || glfwGetKey(win, GLFW_KEY_W) == GLFW_PRESS)
+        vy += 1.f;
+    engine_input_axis_Horizontal = hx;
+    engine_input_axis_Vertical = vy;
+}
+
 static void frame(GLFWwindow *win)
 {
     EngineDraw draws[MAX_DRAWS];
     int ndraw, nfloats = 0, i, nverts;
     int fbw, fbh;
 
+    poll_input_axes(win);
     engine_tick();
     ndraw = engine_collect_draws(draws, MAX_DRAWS);
     for (i = 0; i < ndraw; i++)
@@ -190,7 +215,7 @@ int main(void)
     glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_ES_API);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
-    win = glfwCreateWindow(WIN_W, WIN_H, "Crust unity_pack / MiniScene",
+    win = glfwCreateWindow(WIN_W, WIN_H, "Crust unity_pack",
                            NULL, NULL);
     if (!win) {
         fprintf(stderr, "glfwCreateWindow failed (need a display + GLES)\n");
@@ -202,7 +227,8 @@ int main(void)
     glfwSetKeyCallback(win, on_key);
 
     printf("GLES %s\n", (const char *)glGetString(GL_VERSION));
-    printf("draws classes=%d — Escape/Q to quit\n", engine_class_count());
+    printf("draws classes=%d — arrows/WASD move, Escape/Q quit\n",
+           engine_class_count());
 
     prog = build_program();
     if (!prog) {

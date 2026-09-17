@@ -67,10 +67,12 @@ per platform. See the comments in the generated compilers.
 
 ```
 python3 tools/unity_pack.py examples/unity_pack/MiniScene -o /tmp/upack
-gcc -O3 -c /tmp/upack/engine.c
-gcc -O0 -c /tmp/upack/data.c
-gcc -O2 -o /tmp/upack/game /tmp/upack/engine.o /tmp/upack/data.o -lm
+make -C /tmp/upack          # builds game (engine + data + headless main)
+/tmp/upack/game
 ```
+
+`main.c` is a tiny generated host (tick + print draw count). Replace it
+with `gles2_view.c` / `gles2_window.c` for display.
 
 Godot: pass a directory containing `.tscn`. Blender: a JSON dump
 (`blender_pack.json`) — same packed C, different importer.
@@ -131,3 +133,12 @@ and `memcpy`. Needs the `dotnet` SDK for the C# leg.
 Bit-packed struct fields and GLSL unpacking are a later step; this slice
 is the layout + upload path only. GPU alignment (std140 / `--soa-vec4`),
 SSBO stubs, and culling order of attack are in [UNITY_PACK_GPU.md](UNITY_PACK_GPU.md).
+
+## Animation, input, lighting, physics
+
+Opt-in lowering of Input Manager axes, `Time.time` / `Mathf.Sin`,
+`RenderSettings.ambientLight`, authored Lights, and `Physics2D.gravity` +
+`FixedUpdate` on **authored** scene objects — see
+[UNITY_PACK_SYSTEMS.md](UNITY_PACK_SYSTEMS.md). The packer does not invent
+ParticleSystem pools, AnimationCurves, Canvas/UI, InputAction maps, or
+lights. Fixture: `examples/unity_pack/SystemsScene`.

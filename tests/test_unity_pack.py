@@ -35,7 +35,7 @@ needs_cc = unittest.skipIf(_CC is None, "no C compiler")
 class TestSceneImport(unittest.TestCase):
 
     def test_unity_yaml_counts(self):
-        objs, analyses = unity_pack.load_project(SCENE)
+        objs, analyses, _lights = unity_pack.load_project(SCENE)
         names = sorted(o["name"] for o in objs)
         self.assertEqual(names, ["CoinA", "CoinB", "Hero"])
         coins = [o for o in objs if o["class"] == "Coin"]
@@ -58,7 +58,7 @@ class TestSceneImport(unittest.TestCase):
 class TestLayout(unittest.TestCase):
 
     def setUp(self):
-        self.objs, self.an = unity_pack.load_project(SCENE)
+        self.objs, self.an, _lights = unity_pack.load_project(SCENE)
         self.plan = unity_pack.plan_layouts(self.objs, self.an)
 
     def test_two_d_drops_z(self):
@@ -109,6 +109,7 @@ class TestEmit(unittest.TestCase):
         self.assertIn("EngineDraw", engine)
         self.assertIn("engine_upload_positions", engine)
         self.assertTrue(os.path.isfile(os.path.join(d, "engine_draw.h")))
+        self.assertTrue(os.path.isfile(os.path.join(d, "main.c")))
         self.assertTrue(os.path.isfile(
             os.path.join(d, "shaders", "shader_compiler_wasm.c")))
         with open(os.path.join(d, "engine_draw.h")) as f:
@@ -298,6 +299,225 @@ class TestGLES2View(unittest.TestCase):
         self.assertTrue(art, run.stdout[-500:])
         lit = sum(1 for ch in art if ch in "RGB")
         self.assertGreaterEqual(lit, 20, art)
+
+
+SYSTEMS = os.path.join(ROOT, "examples", "unity_pack", "SystemsScene")
+
+
+class TestSystems(unittest.TestCase):
+    """Authored systems subset — see UNITY_PACK_SYSTEMS.md."""
+
+    def test_detects_system_apis(self):
+        _objs, analyses, lights = unity_pack.load_project(SYSTEMS)
+        apis = set()
+        for a in analyses:
+            apis |= a["apis"]
+        self.assertIn("Time.time", apis)
+        self.assertIn("Mathf.Sin", apis)
+        self.assertIn("Physics2D.gravity", apis)
+        self.assertIn("Time.fixedDeltaTime", apis)
+        self.assertIn("Input.GetAxis", apis)
+        self.assertIn("RenderSettings.ambientLight", apis)
+        self.assertEqual(len(lights), 1)
+        self.assertAlmostEqual(lights[0]["intensity"], 1.5)
+        self.assertNotIn("ParticleSystem.Emit", apis)
+        self.assertNotIn("AnimationCurve.Evaluate", apis)
+
+    def test_emits_opt_in_stubs_not_invented_components(self):
+        d = tempfile.mkdtemp(prefix="upack-sys-")
+        unity_pack.pack(SYSTEMS, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            engine = f.read()
+        with open(os.path.join(d, "data.c")) as f:
+            data = f.read()
+        self.assertIn("Mathf_Sin", engine)
+        self.assertIn("Ball_FixedUpdate", engine)
+        self.assertIn("Time_time = Time_time + Time_deltaTime", engine)
+        self.assertIn("Input_GetAxis", engine)
+        self.assertIn("engine_input_axis_Horizontal", data)
+        self.assertIn("RenderSettings_ambient_r", data)
+        self.assertIn("_Light_intensity", data)
+        self.assertIn("1.5f", data)
+        self.assertIn("Physics2D_gravity_y", data)
+        self.assertNotIn("ParticleSystem_Emit", engine)
+        self.assertNotIn("AnimationCurve_Evaluate", engine)
+        self.assertNotIn("_AnimCurve0", data)
+        self.assertNotIn("PARTICLE_MAX", engine)
+        # MiniScene must not pull Sin / physics / input / lights in.
+        d2 = tempfile.mkdtemp(prefix="upack-mini-")
+        unity_pack.pack(SCENE, d2)
+        with open(os.path.join(d2, "engine.c")) as f:
+            mini = f.read()
+        with open(os.path.join(d2, "data.c")) as f:
+            mini_data = f.read()
+        self.assertNotIn("Mathf_Sin", mini)
+        self.assertNotIn("Physics2D_gravity", mini)
+        self.assertNotIn("Input_GetAxis", mini)
+        self.assertNotIn("_Light_intensity", mini_data)
+
+    def test_refuses_invented_particle_system(self):
+        src = (
+            "using UnityEngine;\n"
+            "public class Spark : MonoBehaviour {\n"
+            "    public void Update() {\n"
+            "        ParticleSystem.Emit(0f, 0f);\n"
+            "    }\n"
+            "}\n"
+        )
+        root = tempfile.mkdtemp(prefix="upack-refuse-ps-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Spark.cs"), "w") as f:
+            f.write(src)
+        with open(os.path.join(scripts, "Spark.cs.meta"), "w") as f:
+            f.write("guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Spark\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}\n"
+            )
+        with self.assertRaises(unity_pack.PackError) as cm:
+            unity_pack.pack(root, tempfile.mkdtemp(prefix="upack-out-"))
+        self.assertIn("ParticleSystem", cm.exception.message)
+
+    def test_refuses_input_action_and_ui_invent(self):
+        cases = [
+            (
+                "using UnityEngine;\n"
+                "using UnityEngine.InputSystem;\n"
+                "public class Act : MonoBehaviour {\n"
+                "    public InputAction move;\n"
+                "    public void Update() { move.ReadValue<float>(); }\n"
+                "}\n",
+                "InputAction",
+            ),
+            (
+                "using UnityEngine;\n"
+                "using UnityEngine.UI;\n"
+                "public class Hud : MonoBehaviour {\n"
+                "    public void Update() { }\n"
+                "}\n",
+                "UnityEngine.UI",
+            ),
+            (
+                "using UnityEngine;\n"
+                "public class L : MonoBehaviour {\n"
+                "    public void Start() { gameObject.AddComponent<Light>(); }\n"
+                "}\n",
+                "Light",
+            ),
+        ]
+        for src, needle in cases:
+            root = tempfile.mkdtemp(prefix="upack-refuse-")
+            scripts = os.path.join(root, "Assets", "Scripts")
+            os.makedirs(scripts)
+            with open(os.path.join(scripts, "X.cs"), "w") as f:
+                f.write(src)
+            with open(os.path.join(scripts, "X.cs.meta"), "w") as f:
+                f.write("guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n")
+            scene = os.path.join(root, "Assets", "Scenes")
+            os.makedirs(scene)
+            with open(os.path.join(scene, "S.unity"), "w") as f:
+                f.write(
+                    "%YAML 1.1\n"
+                    "--- !u!1 &1\nGameObject:\n  m_Name: X\n"
+                    "  m_Component:\n  - component: {fileID: 2}\n"
+                    "  - component: {fileID: 3}\n"
+                    "--- !u!4 &2\nTransform:\n"
+                    "  m_GameObject: {fileID: 1}\n"
+                    "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                    "--- !u!114 &3\nMonoBehaviour:\n"
+                    "  m_GameObject: {fileID: 1}\n"
+                    "  m_Script: {fileID: 11500000, "
+                    "guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}\n"
+                )
+            with self.assertRaises(unity_pack.PackError) as cm:
+                unity_pack.pack(root, tempfile.mkdtemp(prefix="upack-out-"))
+            self.assertIn(needle, cm.exception.message)
+
+
+@needs_cc
+class TestSystemsRuns(unittest.TestCase):
+
+    def test_make_game_links(self):
+        d = tempfile.mkdtemp(prefix="upack-sys-make-")
+        unity_pack.pack(SYSTEMS, d)
+        r = subprocess.run(["make", "-C", d], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr or r.stdout)
+        run = subprocess.run([os.path.join(d, "game")],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+        self.assertIn("draws=", run.stdout)
+
+    def test_tick_animates_and_physics(self):
+        d = tempfile.mkdtemp(prefix="upack-sys-run-")
+        unity_pack.pack(SYSTEMS, d)
+        host = os.path.join(d, "host.c")
+        with open(host, "w") as f:
+            f.write(
+                "void engine_tick(void);\n"
+                "extern float Time_deltaTime;\n"
+                "extern float Time_time;\n"
+                "extern float engine_input_axis_Horizontal;\n"
+                "extern float RenderSettings_ambient_r;\n"
+                "extern float _Light_intensity[];\n"
+                "typedef struct { float x, y, half_w, half_h;\n"
+                "                 float r, g, b; } EngineDraw;\n"
+                "int engine_collect_draws(EngineDraw *out, int max);\n"
+                "typedef struct Ball Ball;\n"
+                "struct Ball { float pos_x; float pos_y;\n"
+                "  float velX; float velY; float gravityScale; };\n"
+                "extern Ball _Ball_inst_array[];\n"
+                "typedef struct Pad Pad;\n"
+                "struct Pad { float pos_x; float pos_y; float speed; };\n"
+                "extern Pad _Pad_inst_array[];\n"
+                "int main(void) {\n"
+                "  float y0 = _Ball_inst_array[0].pos_y;\n"
+                "  float x0 = _Pad_inst_array[0].pos_x;\n"
+                "  Time_deltaTime = 0.02f;\n"
+                "  engine_input_axis_Horizontal = 1.f;\n"
+                "  RenderSettings_ambient_r = 0.5f;\n"
+                "  int i;\n"
+                "  for (i = 0; i < 50; i = i + 1) engine_tick();\n"
+                "  EngineDraw buf[128];\n"
+                "  int n = engine_collect_draws(buf, 128);\n"
+                "  if (Time_time < 0.9f) return 2;\n"
+                "  if (_Ball_inst_array[0].pos_y >= y0) return 3;\n"
+                "  if (_Pad_inst_array[0].pos_x <= x0) return 4;\n"
+                "  if (_Light_intensity[0] < 1.4f) return 5;\n"
+                "  if (n != 4) return 6; /* Bouncer+Ball+Pad+AmbientBias */\n"
+                "  return 0;\n"
+                "}\n"
+            )
+        r = subprocess.run(
+            [_CC, "-O3", "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(
+            [_CC, "-O0", "-c", "-o", os.path.join(d, "data.o"),
+             os.path.join(d, "data.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        exe = os.path.join(d, "host")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host,
+             os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
 
 
 if __name__ == "__main__":
