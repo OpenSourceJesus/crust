@@ -56,5 +56,5 @@ Emitter (`ParticleSystem.Emit`). Pack and tick:
 
 ```
 python3 tools/unity_pack.py examples/unity_pack/SystemsScene -o /tmp/sys
-make -C /tmp/sys
+make -C /tmp/sys && /tmp/sys/game
 ```

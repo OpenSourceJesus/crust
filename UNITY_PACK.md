@@ -67,10 +67,12 @@ per platform. See the comments in the generated compilers.
 
 ```
 python3 tools/unity_pack.py examples/unity_pack/MiniScene -o /tmp/upack
-gcc -O3 -c /tmp/upack/engine.c
-gcc -O0 -c /tmp/upack/data.c
-gcc -O2 -o /tmp/upack/game /tmp/upack/engine.o /tmp/upack/data.o -lm
+make -C /tmp/upack          # builds game (engine + data + headless main)
+/tmp/upack/game
 ```
+
+`main.c` is a tiny generated host (tick + print draw count). Replace it
+with `gles2_view.c` / `gles2_window.c` for display.
 
 Godot: pass a directory containing `.tscn`. Blender: a JSON dump
 (`blender_pack.json`) — same packed C, different importer.

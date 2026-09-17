@@ -109,6 +109,7 @@ class TestEmit(unittest.TestCase):
         self.assertIn("EngineDraw", engine)
         self.assertIn("engine_upload_positions", engine)
         self.assertTrue(os.path.isfile(os.path.join(d, "engine_draw.h")))
+        self.assertTrue(os.path.isfile(os.path.join(d, "main.c")))
         self.assertTrue(os.path.isfile(
             os.path.join(d, "shaders", "shader_compiler_wasm.c")))
         with open(os.path.join(d, "engine_draw.h")) as f:
@@ -345,6 +346,16 @@ class TestSystems(unittest.TestCase):
 
 @needs_cc
 class TestSystemsRuns(unittest.TestCase):
+
+    def test_make_game_links(self):
+        d = tempfile.mkdtemp(prefix="upack-sys-make-")
+        unity_pack.pack(SYSTEMS, d)
+        r = subprocess.run(["make", "-C", d], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr or r.stdout)
+        run = subprocess.run([os.path.join(d, "game")],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+        self.assertIn("draws=", run.stdout)
 
     def test_tick_animates_physics_and_particles(self):
         d = tempfile.mkdtemp(prefix="upack-sys-run-")
