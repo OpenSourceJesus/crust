@@ -22,5 +22,7 @@ public class Pad : MonoBehaviour
 		transform.position += new Vector2(move * speed * Time.deltaTime, 0);
 		print(move);
 		System.Console.WriteLine("" + Time.time);
+		Camera cam = gameObject.AddComponent<Camera>();
+		System.Console.WriteLine(cam);
 	}
 }

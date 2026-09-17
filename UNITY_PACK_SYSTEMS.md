@@ -1,13 +1,14 @@
 # UNITY_PACK_SYSTEMS — authored Unity systems only
 
 `unity_pack` speeds up what is already in the user's Unity (or Godot)
-project. It **does not invent components**: no synthetic ParticleSystem
-pools, no default AnimationCurves, no Canvas, no
-InputAction maps, no `AddComponent<Light>`. Authored Rigidbody /
-Rigidbody2D are packed; inventing them with `AddComponent` is refused.
-Scripts that need other Unity
-features keep them in the authored project until the packer can import
-them; calling invent-requiring APIs today is a hard `PackError`.
+project. It **does not invent assets**: no synthetic ParticleSystem
+pools, no default AnimationCurves, no Canvas, no InputAction maps.
+Runtime `AddComponent<T>()` works for packed builtins (Camera, Light,
+SpriteRenderer, Rigidbody/2D, Box/Circle/Sphere colliders) and for
+authored MonoBehaviours — GetOrAdd into a pre-sized pool (one spare slot
+per calling instance). Scripts that need other Unity features keep them
+in the authored project until the packer can import them; calling
+invent-requiring APIs today is a hard `PackError`.
 
 Emitted `engine.c` / `data.c` / `main.c` are also gated through
 `cpprust.translate` (same subset check as `csrust`'s C++ half). Leaving
@@ -92,7 +93,8 @@ the packer will not invent a pool.
 | `RenderSettings.ambientLight.{r,g,b}` | Host-pokeable ambient floats |
 | Authored `!u!108` Light on a GameObject | `_Light_intensity` / `_Light_color_*` tables |
 
-No invented lights. `AddComponent<Light>` is a `PackError`.
+No invented light *assets*. `AddComponent<Light>()` GetOrAdds a default light
+slot (intensity 1, white) into the light table.
 
 ## Camera and rendering
 
@@ -127,8 +129,9 @@ when the YAML omits them.
 does **not** appear in `engine_collect_draws`. Hosts clear to the authored
 camera background; they do not invent class-hash coloured quads.
 
-`Camera.main` without a scene Camera, and `AddComponent<Camera>` /
-`AddComponent<SpriteRenderer>`, are `PackError`s.
+`Camera.main` without a scene Camera is a `PackError`.
+`AddComponent<Camera>` / `AddComponent<SpriteRenderer>` GetOrAdd into pools
+(SpriteRenderer without an authored sprite still does not draw).
 
 ## UI
 
@@ -148,8 +151,9 @@ Unity project until Canvas import lands.
 | `Time.fixedDeltaTime` | Host-pokeable float (default `1/50`) |
 | `FixedUpdate` | Once per `engine_tick`, then `engine_physics_fixed` |
 
-Only **authored** Rigidbody components are packed — `AddComponent<Rigidbody>` /
-`AddComponent<Rigidbody2D>` is a `PackError`.
+Only **authored** Rigidbody components start packed; `AddComponent<Rigidbody>` /
+`AddComponent<Rigidbody2D>` GetOrAdds a Dynamic body with Unity defaults
+(mass 1, gravity on / gravityScale 1).
 
 ## Colliders (BoxCollider2D / CircleCollider2D / BoxCollider / SphereCollider)
 
@@ -174,22 +178,30 @@ Only **authored** Rigidbody components are packed — `AddComponent<Rigidbody>` 
 
 Static / kinematic colliders (no Dynamic RB) push Dynamic bodies. Transform-only
 GOs that carry a collider (e.g. Ground) are packed as position instances.
-`AddComponent<*Collider*>` is a `PackError`. Rotation for 2D uses an AABB of the
-OBB (authored `m_LocalRotation`). No PolygonCollider2D yet.
+`AddComponent<*Collider*>` GetOrAdds into a handle pool. Rotation for 2D uses an
+AABB of the OBB (authored `m_LocalRotation`). No PolygonCollider2D yet.
+
+## AddComponent
+
+| Script uses | Emitted |
+|-------------|---------|
+| `gameObject.AddComponent<T>()` / `AddComponent<T>()` | `GameObject_AddComponent_T(go)` — GetOrAdd |
+| Builtin `T` (Camera, Light, SpriteRenderer, RB, colliders) | Pre-sized pool; returns existing if already on the GO |
+| Authored MonoBehaviour `T` | Spare instance slots (`n` + budget); mutable GO map |
+| `Console.WriteLine(component)` | `T_ToString(index)` → `"name (UnityEngine.T)"` |
+
+Pool budget is one slot per instance of each class that calls `AddComponent<T>`
+(so Update-loop calls reuse the same component). `AddComponent<ParticleSystem>` /
+`Canvas` / etc. remain refused.
 
 ## Refused (would invent assets / components)
 
 | Script uses | Why refused |
 |-------------|-------------|
-| `ParticleSystem.Emit` | Needs a ParticleSystem; packer will not invent a pool |
+| `ParticleSystem.Emit` / `AddComponent<ParticleSystem>` | Needs a ParticleSystem; packer will not invent a pool |
 | `AnimationCurve.Evaluate` | Needs authored curves; packer will not invent keyframes |
 | `InputAction` / `Gamepad.current` | Needs Input System assets / runtime |
 | `UnityEngine.UI` / `Canvas` | Needs authored UI hierarchy |
-| `AddComponent<Light>` | Light must already be on a scene GameObject |
-| `AddComponent<Camera>` / `SpriteRenderer` | Must be authored; no invent-draw |
-| `AddComponent<Rigidbody>` / `Rigidbody2D` | Must be authored on a scene GameObject |
-| `AddComponent<BoxCollider2D>` / `CircleCollider2D` | Must be authored on a scene GameObject |
-| `AddComponent<BoxCollider>` / `SphereCollider` | Must be authored on a scene GameObject |
 | `Camera.main` with no scene Camera | Packer will not invent a default camera |
 
 ## Tick order

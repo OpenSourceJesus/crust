@@ -746,15 +746,28 @@ class TestSystems(unittest.TestCase):
         self.assertIn("no authored SpriteRenderers", engine)
         self.assertNotIn("out[n].half_w", engine)
 
-    def test_refuses_addcomponent_rigidbody(self):
-        root = tempfile.mkdtemp(prefix="upack-refuse-rb-")
+    def test_addcomponent_camera_and_rigidbody2d(self):
+        """AddComponent is GetOrAdd into a pre-sized pool (safe in Update)."""
+        d = tempfile.mkdtemp(prefix="upack-addcomp-")
+        plan = unity_pack.pack(SYSTEMS, d)
+        self.assertIn("Camera", plan.get("addcomponent_types") or [])
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("GameObject_AddComponent_Camera", eng)
+        self.assertIn("Camera_ToString", eng)
+        self.assertIn("GameObject_AddComponent_Camera(_engine_go_of_Pad", eng)
+
+        root = tempfile.mkdtemp(prefix="upack-addrb-")
         scripts = os.path.join(root, "Assets", "Scripts")
         os.makedirs(scripts)
         with open(os.path.join(scripts, "X.cs"), "w") as f:
             f.write(
                 "using UnityEngine;\n"
                 "public class X : MonoBehaviour {\n"
-                "    public void Start() { gameObject.AddComponent<Rigidbody2D>(); }\n"
+                "    public void Start() {\n"
+                "        Rigidbody2D rb = gameObject.AddComponent<Rigidbody2D>();\n"
+                "        System.Console.WriteLine(rb);\n"
+                "    }\n"
                 "}\n"
             )
         with open(os.path.join(scripts, "X.cs.meta"), "w") as f:
@@ -775,9 +788,13 @@ class TestSystems(unittest.TestCase):
                 "  m_Script: {fileID: 11500000, "
                 "guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}\n"
             )
-        with self.assertRaises(unity_pack.PackError) as cm:
-            unity_pack.pack(root, tempfile.mkdtemp())
-        self.assertIn("Rigidbody2D", cm.exception.message)
+        d2 = tempfile.mkdtemp(prefix="upack-addrb-out-")
+        plan2 = unity_pack.pack(root, d2)
+        self.assertIn("Rigidbody2D", plan2.get("addcomponent_types") or [])
+        with open(os.path.join(d2, "engine.c")) as f:
+            eng2 = f.read()
+        self.assertIn("GameObject_AddComponent_Rigidbody2D", eng2)
+        self.assertIn("Rigidbody2D_ToString", eng2)
 
     def test_authored_rigidbody2d_is_packed(self):
         objs, _a, _l, _c = unity_pack.load_project(SYSTEMS)
@@ -1356,13 +1373,6 @@ class TestSystems(unittest.TestCase):
                 "    public void Update() { }\n"
                 "}\n",
                 "UnityEngine.UI",
-            ),
-            (
-                "using UnityEngine;\n"
-                "public class L : MonoBehaviour {\n"
-                "    public void Start() { gameObject.AddComponent<Light>(); }\n"
-                "}\n",
-                "Light",
             ),
         ]
         for src, needle in cases:
