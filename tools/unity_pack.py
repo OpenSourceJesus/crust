@@ -9,7 +9,7 @@ spawned, N ≤ 256).
 
 Does not invent scene components (ParticleSystem pools, AnimationCurves,
 unauthored Rigidbodies). It packs and speeds up what the project already
-authored — including authored Rigidbody / Rigidbody2D.
+authored — including authored Rigidbody / Rigidbody2D and Box/CircleCollider2D.
 
     python3 tools/unity_pack.py <project> -o <outdir>
 """
@@ -140,6 +140,14 @@ _REFUSED_API = {
         "Rigidbody must be authored on a scene GameObject — unity_pack "
         "does not AddComponent rigidbodies."
     ),
+    "AddComponent<BoxCollider2D>": (
+        "BoxCollider2D must be authored on a scene GameObject — unity_pack "
+        "does not AddComponent colliders."
+    ),
+    "AddComponent<CircleCollider2D>": (
+        "CircleCollider2D must be authored on a scene GameObject — unity_pack "
+        "does not AddComponent colliders."
+    ),
 }
 
 _SPAWN = re.compile(
@@ -148,7 +156,8 @@ _SPAWN = re.compile(
 )
 _VEC3Z = re.compile(r"\.(z)\b|Vector3|Quaternion")
 _UNITY_API = re.compile(
-    r"(?:AddComponent\s*<\s*(?:Light|Camera|SpriteRenderer|Rigidbody2D|Rigidbody)\s*>|"
+    r"(?:AddComponent\s*<\s*(?:Light|Camera|SpriteRenderer|Rigidbody2D|Rigidbody|"
+    r"BoxCollider2D|CircleCollider2D)\s*>|"
     r"(?<![\w])(?:Mathf\.(?:Abs|Min|Max|Clamp|Lerp|Sin|Cos)|"
     r"Time\.(?:deltaTime|time|fixedDeltaTime)|"
     r"Input\.(?:GetAxis|GetButton|GetKey)|"
@@ -593,7 +602,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         km = re.search(
             r"(?m)^(GameObject|Transform|RectTransform|MonoBehaviour|"
             r"PrefabInstance|Light|Camera|SpriteRenderer|Rigidbody2D|"
-            r"Rigidbody):",
+            r"Rigidbody|BoxCollider2D|CircleCollider2D):",
             block)
         if km:
             kind = km.group(1)
@@ -609,6 +618,10 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             kind = "Rigidbody2D"
         elif type_id == "54":
             kind = "Rigidbody"
+        elif type_id == "61":
+            kind = "BoxCollider2D"
+        elif type_id == "58":
+            kind = "CircleCollider2D"
         elif type_id in ("4", "224"):
             kind = "Transform"
         rec = {"file_id": file_id, "kind": kind, "raw": block, "fields": {}}
@@ -801,6 +814,36 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "vel_y": float(vel.group(2)) if vel else 0.0,
                 "vel_z": float(vel.group(3)) if vel else 0.0,
             }
+        if kind == "BoxCollider2D":
+            en = re.search(r"(?m)^\s+m_Enabled:\s*(\d+)", block)
+            trig = re.search(r"(?m)^\s+m_IsTrigger:\s*(\d+)", block)
+            off = re.search(
+                r"m_Offset:\s*\{x:\s*([^,}]+),\s*y:\s*([^}]+)\}", block)
+            sz = re.search(
+                r"m_Size:\s*\{x:\s*([^,}]+),\s*y:\s*([^}]+)\}", block)
+            rec["collider2d"] = {
+                "kind": "box",
+                "enabled": int(en.group(1)) if en else 1,
+                "is_trigger": int(trig.group(1)) if trig else 0,
+                "offset_x": float(off.group(1)) if off else 0.0,
+                "offset_y": float(off.group(2)) if off else 0.0,
+                "size_x": float(sz.group(1)) if sz else 1.0,
+                "size_y": float(sz.group(2)) if sz else 1.0,
+            }
+        if kind == "CircleCollider2D":
+            en = re.search(r"(?m)^\s+m_Enabled:\s*(\d+)", block)
+            trig = re.search(r"(?m)^\s+m_IsTrigger:\s*(\d+)", block)
+            off = re.search(
+                r"m_Offset:\s*\{x:\s*([^,}]+),\s*y:\s*([^}]+)\}", block)
+            rad = re.search(r"(?m)^\s+m_Radius:\s*([0-9.eE+-]+)", block)
+            rec["collider2d"] = {
+                "kind": "circle",
+                "enabled": int(en.group(1)) if en else 1,
+                "is_trigger": int(trig.group(1)) if trig else 0,
+                "offset_x": float(off.group(1)) if off else 0.0,
+                "offset_y": float(off.group(2)) if off else 0.0,
+                "radius": float(rad.group(1)) if rad else 0.5,
+            }
         by_id[file_id] = rec
 
     # PrefabInstance.m_TransformParent applies to stripped Transforms that
@@ -844,6 +887,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         cam = None
         rb2d = None
         rb3d = None
+        col2d = None
         for k in kids:
             if k.get("kind") == "Transform":
                 xf = k
@@ -866,11 +910,32 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 rb2d = dict(k["rigidbody2d"])
             if k.get("kind") == "Rigidbody" and k.get("rigidbody"):
                 rb3d = dict(k["rigidbody"])
+            if k.get("kind") in ("BoxCollider2D", "CircleCollider2D") and k.get(
+                    "collider2d"):
+                col2d = dict(k["collider2d"])
         local_pos, local_rot, local_scale = pos, rot, scale
         father_id = xf.get("father_id") if xf else None
         if xf is not None:
             pos, rot, scale = _resolve_world_trs(
                 xf["file_id"], by_id, world_cache)
+        if col2d and col2d.get("enabled", 1):
+            sx = abs(float(scale[0]))
+            sy = abs(float(scale[1]))
+            rz = _quat_z_rad(rot[0], rot[1], rot[2], rot[3])
+            col2d["ox"] = float(col2d.get("offset_x", 0.0)) * sx
+            col2d["oy"] = float(col2d.get("offset_y", 0.0)) * sy
+            col2d["cos_z"] = math.cos(rz)
+            col2d["sin_z"] = math.sin(rz)
+            if col2d.get("kind") == "box":
+                col2d["hw"] = abs(float(col2d.get("size_x", 1.0))) * sx * 0.5
+                col2d["hh"] = abs(float(col2d.get("size_y", 1.0))) * sy * 0.5
+            else:
+                # Unity scales CircleCollider2D radius by max(|sx|,|sy|).
+                mxy = sx if sx > sy else sy
+                col2d["hw"] = float(col2d.get("radius", 0.5)) * mxy
+                col2d["hh"] = col2d["hw"]
+        else:
+            col2d = None
         if sprite and sprite.get("enabled", 1) and sprite.get("has_sprite"):
             # Extent filled after PNG load via pixels / pixelsPerUnit * scale.
             sprite["scale_x"] = abs(float(scale[0]))
@@ -900,12 +965,12 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "far_clip": cam["far_clip"],
             })
         # Camera-only GOs are not packed as scripted instances.
-        if cam is not None and script is None and sprite is None and not rb2d and not rb3d:
+        if cam is not None and script is None and sprite is None and not rb2d and not rb3d and not col2d:
             continue
         has_mb = any(k.get("kind") == "MonoBehaviour" for k in kids)
         # Transform-only parents (e.g. Rig) are hierarchy nodes, not instances.
         if (script is None and sprite is None and not rb2d and not rb3d
-                and cam is None and not has_mb):
+                and cam is None and not has_mb and not col2d):
             continue
         objects.append({
             "name": go.get("name") or "obj",
@@ -921,6 +986,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "sprite": sprite,
             "rigidbody2d": rb2d,
             "rigidbody": rb3d,
+            "collider2d": col2d,
         })
     return objects, lights, cameras
 
@@ -1161,6 +1227,44 @@ def _build_rigidbody_tables(plan):
     return rb2d, rb3d, go_rb2d, go_rb3d
 
 
+def _build_collider2d_tables(plan):
+    """Authored BoxCollider2D / CircleCollider2D → packed contact table."""
+    cols = []
+    class_ids = {n: i for i, n in enumerate(sorted(plan["classes"]))}
+    # Map (class, inst) → rb2d index for dynamic flag.
+    rb_of = {}
+    for ri, r in enumerate(plan.get("rigidbody2d") or []):
+        rb_of[(r["owner_class"], r["owner_inst"])] = ri
+    for cname, cl in sorted(plan["classes"].items()):
+        cid = class_ids[cname]
+        for i, o in enumerate(cl.get("instances") or []):
+            c = o.get("collider2d")
+            if not c or not c.get("enabled", 1):
+                continue
+            rb_i = rb_of.get((cname, i))
+            body = 2  # static (no RB)
+            if rb_i is not None:
+                body = int((plan["rigidbody2d"][rb_i]).get("body_type") or 0)
+            kind = 0 if c.get("kind") == "box" else 1
+            cols.append({
+                "name": o.get("name") or "obj",
+                "owner_class": cname,
+                "owner_class_id": cid,
+                "owner_inst": i,
+                "rb2d": rb_i if rb_i is not None else -1,
+                "body_type": body,  # 0 dynamic, 1 kinematic, 2 static
+                "kind": kind,
+                "is_trigger": int(c.get("is_trigger") or 0),
+                "ox": float(c.get("ox") or 0.0),
+                "oy": float(c.get("oy") or 0.0),
+                "hw": float(c.get("hw") or 0.5),
+                "hh": float(c.get("hh") or 0.5),
+                "cos_z": float(c.get("cos_z") or 1.0),
+                "sin_z": float(c.get("sin_z") or 0.0),
+            })
+    return cols
+
+
 def _rewrite_rigidbody_assigns(text, plan, this_class):
     """Lower GetComponent<Rigidbody*>().velocity = new VectorN(...);"""
     this_idn = _c_ident(this_class)
@@ -1331,6 +1435,10 @@ def analyze_script(path, text=None):
                 apis.add("AddComponent<Rigidbody2D>")
             elif "Rigidbody" in token:
                 apis.add("AddComponent<Rigidbody>")
+            elif "BoxCollider2D" in token:
+                apis.add("AddComponent<BoxCollider2D>")
+            elif "CircleCollider2D" in token:
+                apis.add("AddComponent<CircleCollider2D>")
         elif token.startswith("GetComponent"):
             apis.add("GetComponent")
         elif "GameObject.Find" in token or token == "GameObject.Find":
@@ -1751,6 +1859,7 @@ def emit_engine(plan, analyses, used_apis):
         getcomponent_types |= set(a.get("getcomponent_types") or [])
     rb2d_list = plan.get("rigidbody2d") or []
     rb3d_list = plan.get("rigidbody") or []
+    col2d_list = plan.get("collider2d") or []
     want_rb2d = (
         bool(rb2d_list)
         or "Rigidbody2D" in getcomponent_types
@@ -1758,6 +1867,7 @@ def emit_engine(plan, analyses, used_apis):
     want_rb3d = (
         bool(rb3d_list)
         or "Rigidbody" in getcomponent_types)
+    want_col2d = bool(col2d_list)
     want_phys = "Physics2D.gravity" in used_apis or want_rb2d
     want_phys3 = "Physics.gravity" in used_apis or want_rb3d
     want_input = bool(used_apis & _WANT_INPUT)
@@ -1779,7 +1889,7 @@ def emit_engine(plan, analyses, used_apis):
     if soa:
         p("/* layout: SoA positions (contiguous float tables for GPU upload) */")
     p("#include <stdint.h>")
-    if want_math:
+    if want_math or want_col2d:
         p("#include <math.h>")
     if want_input or want_log or want_find:
         p("#include <string.h>")
@@ -1866,6 +1976,22 @@ def emit_engine(plan, analyses, used_apis):
         p("extern const int _Rigidbody_use_gravity[%d];" % n3)
         p("extern const int _Rigidbody_owner_class[%d];" % n3)
         p("extern const int _Rigidbody_owner_inst[%d];" % n3)
+    if want_col2d:
+        nc = max(1, len(col2d_list))
+        p("extern const int _Collider2D_count;")
+        p("extern const int _Collider2D_kind[%d]; /* 0 box 1 circle */" % nc)
+        p("extern const int _Collider2D_is_trigger[%d];" % nc)
+        p("extern const int _Collider2D_body_type[%d]; /* 0 dyn 1 kin 2 static */"
+          % nc)
+        p("extern const int _Collider2D_owner_class[%d];" % nc)
+        p("extern const int _Collider2D_owner_inst[%d];" % nc)
+        p("extern const int _Collider2D_rb2d[%d]; /* -1 if none */" % nc)
+        p("extern const float _Collider2D_ox[%d];" % nc)
+        p("extern const float _Collider2D_oy[%d];" % nc)
+        p("extern const float _Collider2D_hw[%d];" % nc)
+        p("extern const float _Collider2D_hh[%d];" % nc)
+        p("extern const float _Collider2D_cos[%d];" % nc)
+        p("extern const float _Collider2D_sin[%d];" % nc)
     p("")
 
     # Packed structs (positions omitted when SoA).
@@ -2343,6 +2469,114 @@ def emit_engine(plan, analyses, used_apis):
         p("}")
         p("")
 
+    if want_col2d and col2d_list:
+        p("/* Authored BoxCollider2D / CircleCollider2D — AABB contacts */")
+        p("static void _col2d_center(int ci, float *out_x, float *out_y) {")
+        p("    unsigned oi = (unsigned)_Collider2D_owner_inst[ci];")
+        p("    float px = 0.f, py = 0.f;")
+        p("    float c = _Collider2D_cos[ci], s = _Collider2D_sin[ci];")
+        p("    float ox = _Collider2D_ox[ci], oy = _Collider2D_oy[ci];")
+        p("    switch (_Collider2D_owner_class[ci]) {")
+        for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
+            idn = _c_ident(cname)
+            cl = plan["classes"][cname]
+            if not _class_has_position(cl):
+                continue
+            p("    case %d:" % cid)
+            p("        px = %s_get_pos_x(oi);" % idn)
+            p("        py = %s_get_pos_y(oi);" % idn)
+            p("        break;")
+        p("    default: break;")
+        p("    }")
+        p("    *out_x = px + c * ox - s * oy;")
+        p("    *out_y = py + s * ox + c * oy;")
+        p("}")
+        p("")
+        p("static void _col2d_set_pos(int ci, float nx, float ny) {")
+        p("    unsigned oi = (unsigned)_Collider2D_owner_inst[ci];")
+        p("    switch (_Collider2D_owner_class[ci]) {")
+        for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
+            idn = _c_ident(cname)
+            cl = plan["classes"][cname]
+            if not _class_has_position(cl) or cl.get("static"):
+                continue
+            p("    case %d:" % cid)
+            p("        %s_set_pos_x(oi, nx);" % idn)
+            p("        %s_set_pos_y(oi, ny);" % idn)
+            p("        break;")
+        p("    default: break;")
+        p("    }")
+        p("}")
+        p("")
+        p("static void _col2d_get_pos(int ci, float *ox, float *oy) {")
+        p("    unsigned oi = (unsigned)_Collider2D_owner_inst[ci];")
+        p("    *ox = 0.f; *oy = 0.f;")
+        p("    switch (_Collider2D_owner_class[ci]) {")
+        for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
+            idn = _c_ident(cname)
+            cl = plan["classes"][cname]
+            if not _class_has_position(cl):
+                continue
+            p("    case %d:" % cid)
+            p("        *ox = %s_get_pos_x(oi);" % idn)
+            p("        *oy = %s_get_pos_y(oi);" % idn)
+            p("        break;")
+        p("    default: break;")
+        p("    }")
+        p("}")
+        p("")
+        p("static void engine_physics_collide2d(void) {")
+        p("    int a, b;")
+        p("    for (a = 0; a < _Collider2D_count; a = a + 1) {")
+        p("        float ax, ay, bx, by, dx, dy, px, py, ahw, ahh, bhw, bhh;")
+        p("        float c, s, sep, tx, ty;")
+        p("        int rb;")
+        p("        if (_Collider2D_body_type[a] != 0) continue; /* dynamic only */")
+        p("        if (_Collider2D_is_trigger[a]) continue;")
+        p("        rb = _Collider2D_rb2d[a];")
+        p("        if (rb < 0) continue;")
+        p("        _col2d_center(a, &ax, &ay);")
+        p("        c = _Collider2D_cos[a]; s = _Collider2D_sin[a];")
+        p("        if (_Collider2D_kind[a] == 1) {")
+        p("            ahw = _Collider2D_hw[a]; ahh = ahw;")
+        p("        } else {")
+        p("            ahw = fabsf(c) * _Collider2D_hw[a] + fabsf(s) * _Collider2D_hh[a];")
+        p("            ahh = fabsf(s) * _Collider2D_hw[a] + fabsf(c) * _Collider2D_hh[a];")
+        p("        }")
+        p("        for (b = 0; b < _Collider2D_count; b = b + 1) {")
+        p("            if (a == b) continue;")
+        p("            if (_Collider2D_is_trigger[b]) continue;")
+        p("            _col2d_center(b, &bx, &by);")
+        p("            c = _Collider2D_cos[b]; s = _Collider2D_sin[b];")
+        p("            if (_Collider2D_kind[b] == 1) {")
+        p("                bhw = _Collider2D_hw[b]; bhh = bhw;")
+        p("            } else {")
+        p("                bhw = fabsf(c) * _Collider2D_hw[b] + fabsf(s) * _Collider2D_hh[b];")
+        p("                bhh = fabsf(s) * _Collider2D_hw[b] + fabsf(c) * _Collider2D_hh[b];")
+        p("            }")
+        p("            dx = ax - bx; dy = ay - by;")
+        p("            px = (ahw + bhw) - (dx < 0.f ? -dx : dx);")
+        p("            py = (ahh + bhh) - (dy < 0.f ? -dy : dy);")
+        p("            if (px <= 0.f || py <= 0.f) continue;")
+        p("            _col2d_get_pos(a, &tx, &ty);")
+        p("            if (px < py) {")
+        p("                sep = (dx < 0.f) ? -px : px;")
+        p("                tx = tx + sep;")
+        p("                if (sep * _Rigidbody2D_vel_x[rb] < 0.f)")
+        p("                    _Rigidbody2D_vel_x[rb] = 0.f;")
+        p("            } else {")
+        p("                sep = (dy < 0.f) ? -py : py;")
+        p("                ty = ty + sep;")
+        p("                if (sep * _Rigidbody2D_vel_y[rb] < 0.f)")
+        p("                    _Rigidbody2D_vel_y[rb] = 0.f;")
+        p("            }")
+        p("            _col2d_set_pos(a, tx, ty);")
+        p("            _col2d_center(a, &ax, &ay);")
+        p("        }")
+        p("    }")
+        p("}")
+        p("")
+
     if want_rb2d or want_rb3d:
         p("/* Authored Rigidbody / Rigidbody2D — gravity + integrate after FixedUpdate */")
         p("static void engine_physics_fixed(void) {")
@@ -2365,7 +2599,7 @@ def emit_engine(plan, analyses, used_apis):
             for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
                 idn = _c_ident(cname)
                 cl = plan["classes"][cname]
-                if not _class_has_position(cl):
+                if not _class_has_position(cl) or cl.get("static"):
                     continue
                 p("        case %d:" % cid)
                 p("            %s_set_pos_x(oi, %s_get_pos_x(oi) + vx);"
@@ -2396,7 +2630,7 @@ def emit_engine(plan, analyses, used_apis):
             for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
                 idn = _c_ident(cname)
                 cl = plan["classes"][cname]
-                if not _class_has_position(cl):
+                if not _class_has_position(cl) or cl.get("static"):
                     continue
                 p("        case %d:" % cid)
                 p("            %s_set_pos_x(oi, %s_get_pos_x(oi) + vx);"
@@ -2410,6 +2644,8 @@ def emit_engine(plan, analyses, used_apis):
             p("        default: break;")
             p("        }")
             p("    }")
+        if want_col2d and col2d_list:
+            p("    engine_physics_collide2d();")
         p("}")
         p("")
 
@@ -3100,6 +3336,34 @@ def emit_data(plan, used_apis=None):
             n, ", ".join(str(class_ids[r["owner_class"]]) for r in rb3d_list)))
         p("const int _Rigidbody_owner_inst[%d] = { %s };" % (
             n, ", ".join(str(int(r["owner_inst"])) for r in rb3d_list)))
+    col2d_list = plan.get("collider2d") or []
+    if col2d_list:
+        n = len(col2d_list)
+        p("const int _Collider2D_count = %d;" % n)
+        p("const int _Collider2D_kind[%d] = { %s };" % (
+            n, ", ".join(str(int(c["kind"])) for c in col2d_list)))
+        p("const int _Collider2D_is_trigger[%d] = { %s };" % (
+            n, ", ".join(str(int(c["is_trigger"])) for c in col2d_list)))
+        p("const int _Collider2D_body_type[%d] = { %s };" % (
+            n, ", ".join(str(int(c["body_type"])) for c in col2d_list)))
+        p("const int _Collider2D_owner_class[%d] = { %s };" % (
+            n, ", ".join(str(int(c["owner_class_id"])) for c in col2d_list)))
+        p("const int _Collider2D_owner_inst[%d] = { %s };" % (
+            n, ", ".join(str(int(c["owner_inst"])) for c in col2d_list)))
+        p("const int _Collider2D_rb2d[%d] = { %s };" % (
+            n, ", ".join(str(int(c["rb2d"])) for c in col2d_list)))
+        p("const float _Collider2D_ox[%d] = { %s };" % (
+            n, ", ".join("%sf" % repr(float(c["ox"])) for c in col2d_list)))
+        p("const float _Collider2D_oy[%d] = { %s };" % (
+            n, ", ".join("%sf" % repr(float(c["oy"])) for c in col2d_list)))
+        p("const float _Collider2D_hw[%d] = { %s };" % (
+            n, ", ".join("%sf" % repr(float(c["hw"])) for c in col2d_list)))
+        p("const float _Collider2D_hh[%d] = { %s };" % (
+            n, ", ".join("%sf" % repr(float(c["hh"])) for c in col2d_list)))
+        p("const float _Collider2D_cos[%d] = { %s };" % (
+            n, ", ".join("%sf" % repr(float(c["cos_z"])) for c in col2d_list)))
+        p("const float _Collider2D_sin[%d] = { %s };" % (
+            n, ", ".join("%sf" % repr(float(c["sin_z"])) for c in col2d_list)))
     textures = plan.get("textures") or []
     p("const int _engine_tex_count = %d;" % len(textures))
     if textures:
@@ -3430,6 +3694,7 @@ def pack(root, outdir, soa=False, soa_vec4=False):
     plan["rigidbody"] = rb3d
     plan["go_rigidbody2d"] = go_rb2d
     plan["go_rigidbody"] = go_rb3d
+    plan["collider2d"] = _build_collider2d_tables(plan)
     os.makedirs(outdir, exist_ok=True)
     _progress("emitting engine.c (%d classes)" % len(plan["classes"]))
     engine = emit_engine(plan, analyses, used_apis)

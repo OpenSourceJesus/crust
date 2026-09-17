@@ -444,6 +444,7 @@ class TestSystems(unittest.TestCase):
         self.assertIn("1.5f", data)
         self.assertIn("Physics2D_gravity_y", data)
         self.assertIn("_Rigidbody2D_vel_x", data)
+        self.assertIn("_Collider2D_count", data)
         self.assertIn("Camera_main_orthographicSize", data)
         self.assertIn("Camera_main_pos_z", data)
         self.assertIn("Camera_main_nearClipPlane", data)
@@ -452,6 +453,7 @@ class TestSystems(unittest.TestCase):
         self.assertIn("oz - Camera_main_pos_z", engine)
         self.assertIn("out[n].cos_z", engine)
         self.assertIn("_spr_sin", engine)
+        self.assertIn("engine_physics_collide2d", engine)
         self.assertIn("_engine_tex0_rgba", data)
         self.assertIn("engine_texture_rgba", engine)
         self.assertNotIn("ParticleSystem_Emit", engine)
@@ -789,6 +791,13 @@ class TestSystems(unittest.TestCase):
             eng = f.read()
         self.assertIn("engine_physics_fixed", eng)
         self.assertIn("GameObject_GetComponent_Rigidbody2D", eng)
+        self.assertIn("engine_physics_collide2d", eng)
+        self.assertGreaterEqual(len(plan.get("collider2d") or []), 3)
+        ball_col = [o for o in objs if o["name"] == "HeavyBall"][0]["collider2d"]
+        self.assertEqual(ball_col["kind"], "circle")
+        ground = [o for o in objs if o["name"] == "Ground"][0]
+        self.assertEqual(ground["collider2d"]["kind"], "box")
+        self.assertAlmostEqual(ground["pos"][1], -2.5)
 
     def test_refuses_invented_particle_system(self):
         src = (
@@ -1349,6 +1358,8 @@ class TestSystemsRuns(unittest.TestCase):
                 "    }\n"
                 "    if (!found) return 7; /* Stick m_LocalRotation 45deg */\n"
                 "  }\n"
+                "  /* Ground top ≈ -2.25; ball radius ≈ 0.225 → rest y ≳ -2.05 */\n"
+                "  if (_Ball_inst_array[0].pos_y < -2.1f) return 8;\n"
                 "  return 0;\n"
                 "}\n"
             )
