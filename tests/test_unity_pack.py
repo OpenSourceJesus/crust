@@ -1130,6 +1130,56 @@ class TestSystems(unittest.TestCase):
         with open(log_path) as f:
             self.assertIn("file", f.read())
 
+    @needs_cc
+    def test_string_plus_int_prints_digits_not_pointer_math(self):
+        """C# \"\" + 1 → \"1\"; must not emit C pointer arithmetic."""
+        root = tempfile.mkdtemp(prefix="upack-strcat-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Talker.cs"), "w") as f:
+            f.write(
+                "using System;\n"
+                "using UnityEngine;\n"
+                "public class Talker : MonoBehaviour {\n"
+                "    public void Start() {\n"
+                "        Console.WriteLine(\"\" + 1);\n"
+                "        Console.WriteLine(\"n=\" + 2);\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Talker.cs.meta"), "w") as f:
+            f.write("guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Talker\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-strcat-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            engine = f.read()
+        self.assertIn("_str_plus", engine)
+        self.assertNotIn('Console_WriteLine("" + 1)', engine)
+        r = subprocess.run(["make", "-C", d], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr or r.stdout)
+        run = subprocess.run([os.path.join(d, "game")],
+                             capture_output=True, text=True, cwd=d)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+        lines = [ln for ln in run.stdout.splitlines() if ln.strip()]
+        self.assertTrue(any(ln == "1" for ln in lines), run.stdout)
+        self.assertTrue(any(ln == "n=2" for ln in lines), run.stdout)
+
     def test_player_identity_from_project_settings(self):
         root = tempfile.mkdtemp(prefix="upack-id-")
         ps = os.path.join(root, "ProjectSettings")

@@ -1376,6 +1376,9 @@ def analyze_script(path, text=None):
         apis.add("Debug.Log")
     if re.search(r"(?<![\w.])print\s*\(", scan):
         apis.add("print")
+    # C# string + value must not become C pointer arithmetic.
+    if re.search(r'"\s*\+', scan):
+        apis.add("string.+")
     has_system = bool(re.search(r"using\s+System\b", scan))
     apis.discard("Console.WriteLine")  # may have matched via _UNITY_API
     if re.search(r"System\.Console\.WriteLine\s*\(", scan):
@@ -1765,6 +1768,7 @@ def emit_engine(plan, analyses, used_apis):
     want_ambient = "RenderSettings.ambientLight" in used_apis
     want_log = bool(used_apis & {"Debug.Log", "print"})
     want_console = "Console.WriteLine" in used_apis
+    want_str_plus = "string.+" in used_apis
     want_find = "GameObject.Find" in used_apis
     want_getcomponent = "GetComponent" in used_apis
     want_go_tables = (
@@ -1779,7 +1783,7 @@ def emit_engine(plan, analyses, used_apis):
         p("#include <math.h>")
     if want_input or want_log or want_find:
         p("#include <string.h>")
-    if want_log or want_console:
+    if want_log or want_console or want_str_plus:
         p("#include <stdio.h>")
     if want_log:
         p("#include <stdlib.h>")
@@ -1944,6 +1948,32 @@ def emit_engine(plan, analyses, used_apis):
               % key)
             p("}")
             p("")
+    if want_str_plus:
+        # C# "" + 1 → "1"; C's ""+1 is pointer arithmetic (often prints garbage).
+        p("/* C# string + value (not C pointer arithmetic) */")
+        p("static char _engine_str_buf[128];")
+        p("static const char *_str_plus_i(const char *a, int b) {")
+        p("    snprintf(_engine_str_buf, sizeof _engine_str_buf, \"%s%d\",")
+        p("             a ? a : \"\", b);")
+        p("    return _engine_str_buf;")
+        p("}")
+        p("static const char *_str_plus_f(const char *a, float b) {")
+        p("    snprintf(_engine_str_buf, sizeof _engine_str_buf, \"%s%g\",")
+        p("             a ? a : \"\", (double)b);")
+        p("    return _engine_str_buf;")
+        p("}")
+        p("static const char *_str_plus_s(const char *a, const char *b) {")
+        p("    snprintf(_engine_str_buf, sizeof _engine_str_buf, \"%s%s\",")
+        p("             a ? a : \"\", b ? b : \"\");")
+        p("    return _engine_str_buf;")
+        p("}")
+        p("#define _str_plus(a, b) _Generic((b), \\")
+        p("    int: _str_plus_i, \\")
+        p("    float: _str_plus_f, \\")
+        p("    double: _str_plus_f, \\")
+        p("    default: _str_plus_s \\")
+        p(")((a), (b))")
+        p("")
     if want_log:
         company = plan.get("company_name") or "DefaultCompany"
         product = plan.get("product_name") or "Player"
@@ -2642,6 +2672,105 @@ def _rewrite_new_vector_assigns(text, idn):
     return text
 
 
+def _skip_c_string(text, i):
+    """Index just past a C/C# string literal starting at text[i] == '\"'."""
+    j = i + 1
+    while j < len(text):
+        if text[j] == "\\":
+            j += 2
+            continue
+        if text[j] == '"':
+            return j + 1
+        j += 1
+    return j
+
+
+def _parse_plus_rhs(text, i):
+    """Scan one + operand starting at *i*; stop at top-level + , ) ;."""
+    while i < len(text) and text[i] in " \t\n\r":
+        i += 1
+    start = i
+    depth = 0
+    while i < len(text):
+        c = text[i]
+        if c == '"':
+            i = _skip_c_string(text, i)
+            continue
+        if c == "'":
+            i += 1
+            if i < len(text) and text[i] == "\\":
+                i += 2
+            elif i < len(text):
+                i += 1
+            if i < len(text) and text[i] == "'":
+                i += 1
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            if depth == 0:
+                break
+            depth -= 1
+        elif c in ",;" and depth == 0:
+            break
+        elif c == "+" and depth == 0:
+            break
+        i += 1
+    return start, i
+
+
+def _rewrite_string_concat(text):
+    """Rewrite C# string + value to _str_plus (C pointer + is wrong).
+
+    Handles `"lit" + expr` and chains via repeated `_str_plus(...) + expr`.
+    """
+    changed = True
+    while changed:
+        changed = False
+        out = []
+        i = 0
+        while i < len(text):
+            left = None
+            left_end = None
+            if text.startswith("_str_plus(", i):
+                depth = 0
+                j = i + len("_str_plus")
+                while j < len(text):
+                    if text[j] == '"':
+                        j = _skip_c_string(text, j)
+                        continue
+                    if text[j] == "(":
+                        depth += 1
+                    elif text[j] == ")":
+                        depth -= 1
+                        if depth == 0:
+                            j += 1
+                            break
+                    j += 1
+                left = text[i:j]
+                left_end = j
+            elif text[i] == '"':
+                j = _skip_c_string(text, i)
+                left = text[i:j]
+                left_end = j
+            if left is not None:
+                k = left_end
+                while k < len(text) and text[k] in " \t\n\r":
+                    k += 1
+                if k < len(text) and text[k] == "+":
+                    rhs_start, rhs_end = _parse_plus_rhs(text, k + 1)
+                    rhs = text[rhs_start:rhs_end].strip()
+                    if rhs:
+                        out.append("_str_plus(%s, (%s))" % (left, rhs))
+                        i = rhs_end
+                        changed = True
+                        continue
+            out.append(text[i])
+            i += 1
+        text = "".join(out)
+    return text
+
+
 def _strip_debug_log_context_arg(text):
     """Debug.Log(msg, context) → Debug_Log(msg); packed builds have no Hierarchy."""
     out = []
@@ -2774,6 +2903,7 @@ def _lower_method_body(body, cl, plan):
     text = _strip_debug_log_context_arg(text)
     text = re.sub(r"System\.Console\.WriteLine\b", "Console_WriteLine", text)
     text = re.sub(r"(?<![\w.])Console\.WriteLine\b", "Console_WriteLine", text)
+    text = _rewrite_string_concat(text)
     # Unity Object.ToString when printing a Find result (name, not index).
     text = _wrap_log_gameobject_tostring(text)
     text = re.sub(r"Mathf\.(Abs|Min|Max|Clamp|Lerp|Sin|Cos)\s*\(",
