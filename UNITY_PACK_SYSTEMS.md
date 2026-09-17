@@ -151,20 +151,31 @@ Unity project until Canvas import lands.
 Only **authored** Rigidbody components are packed — `AddComponent<Rigidbody>` /
 `AddComponent<Rigidbody2D>` is a `PackError`.
 
-## Colliders (BoxCollider2D / CircleCollider2D)
+## Colliders (BoxCollider2D / CircleCollider2D / BoxCollider / SphereCollider)
 
 | Scene authors | Emitted |
 |---------------|---------|
 | Authored `!u!61` BoxCollider2D | Size/offset → half-extents; contacts in `engine_physics_collide2d` |
 | Authored `!u!58` CircleCollider2D | Radius (× max scale); AABB contacts vs boxes/circles |
+| Authored `!u!65` BoxCollider | Size/center → half-extents; contacts in `engine_physics_collide3d` |
+| Authored `!u!135` SphereCollider | Radius (× max scale); AABB contacts |
 | `m_IsTrigger: 1` | Parsed but skipped for solid resolution |
-| Dynamic Rigidbody2D + collider | Separates along MTV; zeros inward velocity |
+| Dynamic Rigidbody(2D) + collider | Separates along MTV; friction + bounce from materials |
+
+### Physics materials
+
+| Asset / default | Emitted |
+|-----------------|---------|
+| No `m_Material` (2D) | Friction `0.4`, bounciness `0` (Unity PhysicsMaterial2D defaults) |
+| No `m_Material` (3D) | Static + dynamic friction `0.6`, bounciness `0` |
+| Authored `.physicsMaterial2D` | Collider then Rigidbody2D material, else defaults |
+| Authored `.physicMaterial` | Collider then Rigidbody material, else defaults |
+| Combine modes | Average / Multiply / Minimum / Maximum (max of the two modes) |
 
 Static / kinematic colliders (no Dynamic RB) push Dynamic bodies. Transform-only
 GOs that carry a collider (e.g. Ground) are packed as position instances.
-`AddComponent<BoxCollider2D>` / `CircleCollider2D` is a `PackError`. Rotation
-uses an AABB of the OBB (authored `m_LocalRotation`). No PolygonCollider2D /
-3D colliders yet.
+`AddComponent<*Collider*>` is a `PackError`. Rotation for 2D uses an AABB of the
+OBB (authored `m_LocalRotation`). No PolygonCollider2D yet.
 
 ## Refused (would invent assets / components)
 
@@ -178,6 +189,7 @@ uses an AABB of the OBB (authored `m_LocalRotation`). No PolygonCollider2D /
 | `AddComponent<Camera>` / `SpriteRenderer` | Must be authored; no invent-draw |
 | `AddComponent<Rigidbody>` / `Rigidbody2D` | Must be authored on a scene GameObject |
 | `AddComponent<BoxCollider2D>` / `CircleCollider2D` | Must be authored on a scene GameObject |
+| `AddComponent<BoxCollider>` / `SphereCollider` | Must be authored on a scene GameObject |
 | `Camera.main` with no scene Camera | Packer will not invent a default camera |
 
 ## Tick order
@@ -185,14 +197,15 @@ uses an AABB of the OBB (authored `m_LocalRotation`). No PolygonCollider2D /
 ```
 Time_time += Time_deltaTime   // if Time.time used
 foreach class: FixedUpdate    // if present
-engine_physics_fixed()        // authored Rigidbody / Rigidbody2D
+engine_physics_fixed()        // authored Rigidbody / Rigidbody2D + collide
 foreach class: Update
 ```
 
 ## Fixture
 
 `examples/unity_pack/SystemsScene` — Bouncer / Ball / Pad (each with
-authored SpriteRenderer), Shade (Light only, no invent-draw), Main Camera:
+authored SpriteRenderer), HeavyBall + Ground (`Ice.physicsMaterial2D`), Shade
+(Light only, no invent-draw), Main Camera:
 
 ```
 python3 tools/unity_pack.py examples/unity_pack/SystemsScene -o /tmp/sys

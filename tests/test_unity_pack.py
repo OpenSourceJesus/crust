@@ -798,6 +798,102 @@ class TestSystems(unittest.TestCase):
         ground = [o for o in objs if o["name"] == "Ground"][0]
         self.assertEqual(ground["collider2d"]["kind"], "box")
         self.assertAlmostEqual(ground["pos"][1], -2.5)
+        # Authored Ice on ball/ground; BouncePad keeps Unity 2D default 0.4.
+        self.assertAlmostEqual(ball_col["friction"], 0.05)
+        self.assertAlmostEqual(ground["collider2d"]["friction"], 0.05)
+        pad = [o for o in objs if o["name"] == "BouncePad"][0]
+        self.assertAlmostEqual(pad["collider2d"]["friction"], 0.4)
+        ground_row = [c for c in plan["collider2d"] if c["name"] == "Ground"][0]
+        self.assertAlmostEqual(ground_row["friction"], 0.05)
+        self.assertIn("_Collider2D_friction", eng)
+        self.assertIn("_phys_mat_combine", eng)
+
+    def test_default_and_authored_physics_materials_3d(self):
+        root = tempfile.mkdtemp(prefix="upack-mat3d-")
+        mats = os.path.join(root, "Assets", "Mats")
+        os.makedirs(mats)
+        with open(os.path.join(mats, "Bouncy.physicMaterial"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!134 &13400000\nPhysicMaterial:\n"
+                "  m_Name: Bouncy\n"
+                "  dynamicFriction: 0.3\n"
+                "  staticFriction: 0.4\n"
+                "  bounciness: 0.8\n"
+                "  frictionCombine: 0\n"
+                "  bounceCombine: 3\n"
+            )
+        with open(os.path.join(mats, "Bouncy.physicMaterial.meta"), "w") as f:
+            f.write("guid: b2c3d4e5f60718293a4b5c6d7e8f901a\n")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Cube.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Cube : MonoBehaviour {\n"
+                "    public void Update() { }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Cube.cs.meta"), "w") as f:
+            f.write("guid: cccccccccccccccccccccccccccccccc\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Cube\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "  - component: {fileID: 4}\n"
+                "  - component: {fileID: 5}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 2, z: 1}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: cccccccccccccccccccccccccccccccc}\n"
+                "--- !u!54 &4\nRigidbody:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Mass: 1\n"
+                "  m_UseGravity: 1\n"
+                "--- !u!65 &5\nBoxCollider:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n"
+                "  m_IsTrigger: 0\n"
+                "  m_Material: {fileID: 13400000, "
+                "guid: b2c3d4e5f60718293a4b5c6d7e8f901a, type: 2}\n"
+                "  m_Center: {x: 0, y: 0, z: 0}\n"
+                "  m_Size: {x: 1, y: 1, z: 1}\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Floor\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "--- !u!4 &11\nTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 1}\n"
+                "--- !u!65 &12\nBoxCollider:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Enabled: 1\n"
+                "  m_IsTrigger: 0\n"
+                "  m_Center: {x: 0, y: 0, z: 0}\n"
+                "  m_Size: {x: 10, y: 0.5, z: 10}\n"
+            )
+        objs, _a, _l, _c = unity_pack.load_project(root)
+        cube = [o for o in objs if o["name"] == "Cube"][0]
+        floor = [o for o in objs if o["name"] == "Floor"][0]
+        self.assertAlmostEqual(cube["collider3d"]["dynamic_friction"], 0.3)
+        self.assertAlmostEqual(cube["collider3d"]["static_friction"], 0.4)
+        self.assertAlmostEqual(cube["collider3d"]["bounciness"], 0.8)
+        self.assertAlmostEqual(floor["collider3d"]["dynamic_friction"], 0.6)
+        self.assertAlmostEqual(floor["collider3d"]["static_friction"], 0.6)
+        d = tempfile.mkdtemp(prefix="upack-mat3d-out-")
+        plan = unity_pack.pack(root, d)
+        self.assertEqual(len(plan.get("collider3d") or []), 2)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("engine_physics_collide3d", eng)
+        self.assertIn("_Collider3D_dynamic_friction", eng)
+        self.assertIn("_Collider3D_static_friction", eng)
 
     def test_refuses_invented_particle_system(self):
         src = (
