@@ -248,11 +248,21 @@ def parse_unity_yaml(text, guid_to_script=None):
                 r"m_Color:\s*\{r:\s*([^,}]+),\s*g:\s*([^,}]+),"
                 r"\s*b:\s*([^,}]+)", block)
             en = re.search(r"(?m)^\s+m_Enabled:\s*(\d+)", block)
+            # Unity null sprite is m_Sprite: {fileID: 0} — do not invent a draw.
+            spr = re.search(
+                r"m_Sprite:\s*\{fileID:\s*(-?\d+)(?:,\s*guid:\s*"
+                r"([0-9a-fA-F]+))?",
+                block)
+            has_sprite = bool(spr and int(spr.group(1)) != 0)
             rec["sprite"] = {
                 "r": float(col.group(1)) if col else 1.0,
                 "g": float(col.group(2)) if col else 1.0,
                 "b": float(col.group(3)) if col else 1.0,
                 "enabled": int(en.group(1)) if en else 1,
+                "has_sprite": has_sprite,
+                "sprite_file_id": int(spr.group(1)) if spr else 0,
+                "sprite_guid": (spr.group(2).lower()
+                                if spr and spr.group(2) else None),
             }
         if kind == "Camera":
             ortho = re.search(r"(?m)^\s+orthographic:\s*(\d+)", block)
@@ -298,11 +308,11 @@ def parse_unity_yaml(text, guid_to_script=None):
                 sprite = dict(k["sprite"])
             if k.get("kind") == "Camera" and k.get("camera"):
                 cam = dict(k["camera"])
-        if sprite and sprite.get("enabled", 1):
+        if sprite and sprite.get("enabled", 1) and sprite.get("has_sprite"):
             # Size from authored Transform scale (no invented sprite mesh).
             sprite["half_w"] = 0.5 * abs(float(scale[0]))
             sprite["half_h"] = 0.5 * abs(float(scale[1]))
-        elif sprite:
+        else:
             sprite = None
         class_name = None
         if script:

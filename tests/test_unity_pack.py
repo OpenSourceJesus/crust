@@ -362,6 +362,50 @@ class TestSystems(unittest.TestCase):
         self.assertNotIn("Input_GetAxis", mini)
         self.assertNotIn("_Light_intensity", mini_data)
 
+    def test_sprite_renderer_without_sprite_does_not_draw(self):
+        root = tempfile.mkdtemp(prefix="upack-empty-spr-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Mark.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Mark : MonoBehaviour {\n"
+                "    public void Update() { }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Mark.cs.meta"), "w") as f:
+            f.write("guid: dddddddddddddddddddddddddddddddd\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Mark\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "  - component: {fileID: 4}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: dddddddddddddddddddddddddddddddd}\n"
+                "--- !u!212 &4\nSpriteRenderer:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n"
+                "  m_Sprite: {fileID: 0}\n"
+                "  m_Color: {r: 1, g: 0, b: 0, a: 1}\n"
+            )
+        objs, _a, _l, _c = unity_pack.load_project(root)
+        self.assertIsNone(objs[0].get("sprite"))
+        d = tempfile.mkdtemp(prefix="upack-empty-spr-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            engine = f.read()
+        self.assertIn("no authored SpriteRenderers", engine)
+
     def test_no_default_draws_without_sprite_renderer(self):
         """Bare MonoBehaviour GameObjects are not invent-drawn."""
         root = tempfile.mkdtemp(prefix="upack-nodraw-")

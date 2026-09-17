@@ -23,6 +23,7 @@ MonoBehaviour:
 SpriteRenderer:
   m_GameObject: {fileID: 1001}
   m_Enabled: 1
+  m_Sprite: {fileID: 21300000, guid: 11111111111111111111111111111111, type: 3}
   m_Color: {r: 0.4, g: 0.9, b: 0.5, a: 1}
 --- !u!1 &2001
 GameObject:
@@ -47,6 +48,7 @@ MonoBehaviour:
 SpriteRenderer:
   m_GameObject: {fileID: 2001}
   m_Enabled: 1
+  m_Sprite: {fileID: 21300000, guid: 11111111111111111111111111111111, type: 3}
   m_Color: {r: 0.95, g: 0.4, b: 0.35, a: 1}
 --- !u!1 &3001
 GameObject:
@@ -69,6 +71,7 @@ MonoBehaviour:
 SpriteRenderer:
   m_GameObject: {fileID: 3001}
   m_Enabled: 1
+  m_Sprite: {fileID: 21300000, guid: 11111111111111111111111111111111, type: 3}
   m_Color: {r: 0.35, g: 0.6, b: 1, a: 1}
 --- !u!1 &4001
 GameObject:
