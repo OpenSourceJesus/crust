@@ -1,5 +1,6 @@
 using UnityEngine;
 
+[Shared]
 public class Player : MonoBehaviour {
     public int hp;
     public float speed;
