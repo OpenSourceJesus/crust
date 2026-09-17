@@ -239,6 +239,24 @@ class TestSoa(unittest.TestCase):
         run = subprocess.run([exe], capture_output=True, text=True)
         self.assertEqual(run.returncode, 0, run.stderr)
 
+    def test_soa_vec4_pads_w_with_instance_id(self):
+        d = tempfile.mkdtemp(prefix="upack-soa4-")
+        plan = unity_pack.pack(SCENE, d, soa_vec4=True)
+        self.assertTrue(plan["soa_vec4"])
+        self.assertEqual(plan["classes"]["Coin"]["soa_dims"], 4)
+        self.assertEqual(plan["classes"]["Coin"]["soa_logical"], 2)
+        with open(os.path.join(d, "data.c")) as f:
+            data = f.read()
+        # CoinB is index 1 → { -1, 0, 0, 1 }
+        self.assertIn("{ -1.0f, 0.0f, 0.0f, 1.0f }", data)
+        glsl = os.path.join(d, "shaders", "soa_positions.glsl")
+        self.assertTrue(os.path.isfile(glsl))
+        with open(glsl) as f:
+            text = f.read()
+        self.assertIn("std430", text)
+        self.assertIn("vec4 pos[]", text)
+        self.assertIn("SOA_STRIDE 4", text)
+
 
 @needs_cc
 class TestGLES2View(unittest.TestCase):

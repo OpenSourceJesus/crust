@@ -129,4 +129,5 @@ array of heap classes (Unity-like); C SoA uses a flat `pos[N][3]` table
 and `memcpy`. Needs the `dotnet` SDK for the C# leg.
 
 Bit-packed struct fields and GLSL unpacking are a later step; this slice
-is the layout + upload path only.
+is the layout + upload path only. GPU alignment (std140 / `--soa-vec4`),
+SSBO stubs, and culling order of attack are in [UNITY_PACK_GPU.md](UNITY_PACK_GPU.md).
