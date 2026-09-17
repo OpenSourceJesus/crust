@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import math
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -419,6 +420,24 @@ def _pixels_per_unit(asset_path):
     return v if v > 0.0 else 100.0
 
 
+def _quat_rotate_vec(qx, qy, qz, qw, vx, vy, vz):
+    """Apply Unity quaternion (x,y,z,w) to a vector."""
+    tx = 2.0 * (qy * vz - qz * vy)
+    ty = 2.0 * (qz * vx - qx * vz)
+    tz = 2.0 * (qx * vy - qy * vx)
+    return (
+        vx + qw * tx + (qy * tz - qz * ty),
+        vy + qw * ty + (qz * tx - qx * tz),
+        vz + qw * tz + (qx * ty - qy * tx),
+    )
+
+
+def _quat_z_rad(qx, qy, qz, qw):
+    """Planar angle (radians) of local +X after *rot* — SpriteRenderer Z spin."""
+    rx, ry, _rz = _quat_rotate_vec(qx, qy, qz, qw, 1.0, 0.0, 0.0)
+    return math.atan2(ry, rx)
+
+
 def _attach_sprite_textures(objects, asset_guids):
     """Load PNG pixels for each SpriteRenderer that references a project sprite.
 
@@ -546,6 +565,12 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         if sc:
             rec["scale"] = (float(sc.group(1)), float(sc.group(2)),
                             float(sc.group(3)))
+        rot = re.search(
+            r"m_LocalRotation:\s*\{x:\s*([^,}]+),\s*y:\s*([^,}]+),"
+            r"\s*z:\s*([^,}]+),\s*w:\s*([^}]+)\}", block)
+        if rot:
+            rec["rot"] = (float(rot.group(1)), float(rot.group(2)),
+                          float(rot.group(3)), float(rot.group(4)))
         gm = re.search(r"guid:\s*([0-9a-fA-F]+)", block)
         if gm:
             rec["guid"] = gm.group(1).lower()
@@ -671,6 +696,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 kids.append(by_id[mid])
         pos = (0.0, 0.0, 0.0)
         scale = (1.0, 1.0, 1.0)
+        rot = (0.0, 0.0, 0.0, 1.0)
         script = None
         fields = {}
         sprite = None
@@ -682,6 +708,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 pos = k["pos"]
             if k.get("scale"):
                 scale = k["scale"]
+            if k.get("rot"):
+                rot = k["rot"]
             if k.get("kind") == "MonoBehaviour":
                 fields.update(k.get("fields") or {})
                 g = k.get("guid")
@@ -699,6 +727,10 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             # Extent filled after PNG load via pixels / pixelsPerUnit * scale.
             sprite["scale_x"] = abs(float(scale[0]))
             sprite["scale_y"] = abs(float(scale[1]))
+            rz = _quat_z_rad(rot[0], rot[1], rot[2], rot[3])
+            sprite["rot_z"] = rz
+            sprite["cos_z"] = math.cos(rz)
+            sprite["sin_z"] = math.sin(rz)
         else:
             sprite = None
         class_name = None
@@ -708,6 +740,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             cameras.append({
                 "name": go.get("name") or "Camera",
                 "pos": pos,
+                "rot": rot,
                 "main": (go.get("tag") == "MainCamera"
                          or (go.get("name") or "").lower() == "main camera"),
                 "orthographic": cam["orthographic"],
@@ -724,6 +757,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         objects.append({
             "name": go.get("name") or "obj",
             "pos": pos,
+            "rot": rot,
             "fields": fields,
             "script": script,
             "class": class_name or go.get("name") or "Obj",
@@ -2210,6 +2244,7 @@ def emit_engine(plan, analyses, used_apis):
     p("/* ---- draw list (SpriteRenderer + texture; see engine_draw.h) ---- */")
     p("typedef struct EngineDraw {")
     p("    float x, y, half_w, half_h;")
+    p("    float cos_z, sin_z; /* m_LocalRotation around Z */")
     p("    float r, g, b;")
     p("    int tex; /* index into engine_texture_*; -1 = none */")
     p("} EngineDraw;")
@@ -2279,6 +2314,10 @@ def emit_engine(plan, analyses, used_apis):
             "%sf" % repr(float(sp["half_w"])) for _i, sp in spr_idx))
         p("        static const float _spr_hh[] = { %s };" % ", ".join(
             "%sf" % repr(float(sp["half_h"])) for _i, sp in spr_idx))
+        p("        static const float _spr_cos[] = { %s };" % ", ".join(
+            "%sf" % repr(float(sp.get("cos_z", 1.0))) for _i, sp in spr_idx))
+        p("        static const float _spr_sin[] = { %s };" % ", ".join(
+            "%sf" % repr(float(sp.get("sin_z", 0.0))) for _i, sp in spr_idx))
         p("        static const int _spr_tex[] = { %s };" % ", ".join(
             str(int(sp["tex_id"])) for _i, sp in spr_idx))
         p("        static const unsigned _spr_i[] = { %s };" % ", ".join(
@@ -2302,6 +2341,8 @@ def emit_engine(plan, analyses, used_apis):
         p("            out[n].y = %s_get_pos_y(i);" % idn)
         p("            out[n].half_w = _spr_hw[k];")
         p("            out[n].half_h = _spr_hh[k];")
+        p("            out[n].cos_z = _spr_cos[k];")
+        p("            out[n].sin_z = _spr_sin[k];")
         p("            out[n].r = _spr_r[k];")
         p("            out[n].g = _spr_g[k];")
         p("            out[n].b = _spr_b[k];")
@@ -2366,6 +2407,7 @@ def emit_engine_draw_h():
         "\n"
         "typedef struct EngineDraw {\n"
         "    float x, y, half_w, half_h;\n"
+        "    float cos_z, sin_z; /* m_LocalRotation around Z */\n"
         "    float r, g, b;\n"
         "    int tex; /* engine_texture_* index; -1 if none */\n"
         "} EngineDraw;\n"

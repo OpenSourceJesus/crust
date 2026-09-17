@@ -16,6 +16,7 @@ Pins the claims in UNITY_PACK.md:
 from __future__ import annotations
 
 import os
+import math
 import shutil
 import subprocess
 import sys
@@ -349,6 +350,12 @@ class TestSystems(unittest.TestCase):
         self.assertNotIn("AnimationCurve.Evaluate", apis)
         spr = [o for o in _objs if o.get("sprite")]
         self.assertEqual(len(spr), 3)  # Bouncer, Ball, Pad — not Shade
+        stick = [o for o in _objs if o["name"] == "Stick"][0]
+        self.assertAlmostEqual(stick["sprite"]["rot_z"], math.pi / 4, places=5)
+        self.assertAlmostEqual(stick["sprite"]["cos_z"], math.cos(math.pi / 4),
+                               places=5)
+        self.assertAlmostEqual(stick["rot"][2], 0.3826834, places=5)
+        self.assertAlmostEqual(stick["rot"][3], 0.9238795, places=5)
 
     def test_emits_opt_in_stubs_not_invented_components(self):
         d = tempfile.mkdtemp(prefix="upack-sys-")
@@ -382,6 +389,8 @@ class TestSystems(unittest.TestCase):
         self.assertIn("Camera_main_farClipPlane", data)
         self.assertIn("SpriteRenderer", engine)
         self.assertIn("oz - Camera_main_pos_z", engine)
+        self.assertIn("out[n].cos_z", engine)
+        self.assertIn("_spr_sin", engine)
         self.assertIn("_engine_tex0_rgba", data)
         self.assertIn("engine_texture_rgba", engine)
         self.assertNotIn("ParticleSystem_Emit", engine)
@@ -1196,6 +1205,7 @@ class TestSystemsRuns(unittest.TestCase):
                 "extern float RenderSettings_ambient_r;\n"
                 "extern float _Light_intensity[];\n"
                 "typedef struct { float x, y, half_w, half_h;\n"
+                "                 float cos_z, sin_z;\n"
                 "                 float r, g, b; int tex; } EngineDraw;\n"
                 "int engine_collect_draws(EngineDraw *out, int max);\n"
                 "typedef struct Ball Ball;\n"
@@ -1220,6 +1230,14 @@ class TestSystemsRuns(unittest.TestCase):
                 "  if (_Pad_inst_array[0].pos_x <= x0) return 4;\n"
                 "  if (_Light_intensity[0] < 1.4f) return 5;\n"
                 "  if (n != 3) return 6; /* SpriteRenderer on Bouncer+Ball+Pad */\n"
+                "  { int j; int found = 0;\n"
+                "    for (j = 0; j < n; j = j + 1) {\n"
+                "      if (buf[j].cos_z > 0.7f && buf[j].cos_z < 0.72f\n"
+                "          && buf[j].sin_z > 0.7f && buf[j].sin_z < 0.72f)\n"
+                "        found = 1;\n"
+                "    }\n"
+                "    if (!found) return 7; /* Stick m_LocalRotation 45deg */\n"
+                "  }\n"
                 "  return 0;\n"
                 "}\n"
             )
@@ -1250,6 +1268,7 @@ class TestSystemsRuns(unittest.TestCase):
         with open(host, "w") as f:
             f.write(
                 "typedef struct { float x, y, half_w, half_h;\n"
+                "                 float cos_z, sin_z;\n"
                 "                 float r, g, b; int tex; } EngineDraw;\n"
                 "int engine_collect_draws(EngineDraw *out, int max);\n"
                 "extern float Camera_main_pos_z;\n"

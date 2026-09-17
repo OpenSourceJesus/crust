@@ -101,13 +101,15 @@ No invented lights. `AddComponent<Light>` is a `PackError`.
 | Authored `!u!20` Camera (MainCamera) | `Camera_main_pos_*` (incl. **z**), `orthographicSize`, near/far clip, background RGB |
 | `Camera.main.orthographicSize` / `.transform.position` / clip planes | Reads those globals |
 | Authored `!u!212` SpriteRenderer with `m_Sprite` → **project PNG** | Texture + tinted quad in `engine_collect_draws` |
+| Authored `m_LocalRotation` on Transform | Z spin via `EngineDraw.cos_z` / `sin_z` (identity if omitted) |
 
 PNG pixels are packed into `data.c` (`engine_texture_rgba`). Editing the
 referenced sprite and re-packing changes the drawn texels. Tint comes from
 `m_Color`. World size follows Unity:
 `(texels / spritePixelsToUnits) * Transform.scale` (half-extents in
 `engine_collect_draws`). `spritePixelsToUnits` is read from the PNG `.meta`
-(default **100**).
+(default **100**). Sprite quads are rotated in the XY plane from
+`m_LocalRotation` (quaternion → angle of local +X).
 
 Unity cameras look along **+Z** (identity rotation). `engine_collect_draws`
 keeps a sprite only when
