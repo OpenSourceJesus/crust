@@ -33,6 +33,11 @@ float Camera_main_background_b __attribute__((weak)) = 0.08f;
 /* Weak so MiniScene (no Input) still links; SystemsScene data.c wins. */
 float engine_input_axis_Horizontal __attribute__((weak)) = 0.f;
 float engine_input_axis_Vertical __attribute__((weak)) = 0.f;
+int engine_keyboard_connected __attribute__((weak)) = 0;
+int engine_keyboard_leftArrow __attribute__((weak)) = 0;
+int engine_keyboard_rightArrow __attribute__((weak)) = 0;
+int engine_keyboard_upArrow __attribute__((weak)) = 0;
+int engine_keyboard_downArrow __attribute__((weak)) = 0;
 
 #define WIN_W 800
 #define WIN_H 600
@@ -223,6 +228,21 @@ static void poll_input_axes(GLFWwindow *win)
         vy += 1.f;
     engine_input_axis_Horizontal = hx;
     engine_input_axis_Vertical = vy;
+
+    /* Input System Keyboard.current — this window always has a keyboard. */
+    engine_keyboard_connected = 1;
+    engine_keyboard_leftArrow =
+        glfwGetKey(win, GLFW_KEY_LEFT) == GLFW_PRESS
+        || glfwGetKey(win, GLFW_KEY_A) == GLFW_PRESS;
+    engine_keyboard_rightArrow =
+        glfwGetKey(win, GLFW_KEY_RIGHT) == GLFW_PRESS
+        || glfwGetKey(win, GLFW_KEY_D) == GLFW_PRESS;
+    engine_keyboard_upArrow =
+        glfwGetKey(win, GLFW_KEY_UP) == GLFW_PRESS
+        || glfwGetKey(win, GLFW_KEY_W) == GLFW_PRESS;
+    engine_keyboard_downArrow =
+        glfwGetKey(win, GLFW_KEY_DOWN) == GLFW_PRESS
+        || glfwGetKey(win, GLFW_KEY_S) == GLFW_PRESS;
 }
 
 static void draw_one(const EngineDraw *d)
