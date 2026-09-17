@@ -27,8 +27,11 @@ for arg in "$@"; do
 done
 
 mkdir -p "$OUT"
-python3 "$ROOT/tools/unity_pack.py" "$SCENE" -o "$OUT" "${SOA[@]}"
+echo "== packing $SCENE → $OUT =="
+PYTHONUNBUFFERED=1 python3 -u "$ROOT/tools/unity_pack.py" "$SCENE" -o "$OUT" "${SOA[@]}"
+echo "== amalgamating view =="
 python3 "$ROOT/tools/unity_pack_amalg_view.py" "$OUT" "$VIEW" -o "$OUT/amalg.c"
+echo "== compiling wasm =="
 python3 -m shivyc.main --target wasm "$OUT/amalg.c" -o "$OUT/view.wasm"
 
 echo "== wasm soft GLES${SOA[*]:+ (SoA)} =="

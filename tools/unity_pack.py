@@ -31,6 +31,12 @@ class PackError(Exception):
         self.message = message
 
 
+def _progress(msg):
+    """Incremental status for long packs (large scenes / many PNGs)."""
+    sys.stderr.write("unity_pack: %s\n" % msg)
+    sys.stderr.flush()
+
+
 # ---------------------------------------------------------------------------
 # Unity / Godot API surface we are willing to emit
 # ---------------------------------------------------------------------------
@@ -227,10 +233,17 @@ def _read(path):
 
 def _walk_files(root, exts):
     out = []
+    n_dirs = 0
     for dirpath, dirnames, names in os.walk(root):
         dirnames[:] = [d for d in dirnames
                        if d not in (".git", "Library", "Temp", "obj",
-                                    "graphify-out", "__pycache__")]
+                                    "Builds", "Logs", "Build",
+                                    "graphify-out", "__pycache__",
+                                    "node_modules")]
+        n_dirs += 1
+        if n_dirs % 500 == 0:
+            _progress("  walked %d dir(s), %d match(es) so far"
+                       % (n_dirs, len(out)))
         for n in names:
             if any(n.endswith(e) for e in exts):
                 out.append(os.path.join(dirpath, n))
@@ -238,10 +251,25 @@ def _walk_files(root, exts):
     return out
 
 
-def _guid_map(root):
-    """Unity .meta `guid:` next to a .cs file → script path."""
+def _guid_map(root, asset_guids=None):
+    """Unity .meta `guid:` next to a .cs file → script path.
+
+    If *asset_guids* is provided (full guid→path map), derive script guids
+    from it without a second tree walk.
+    """
     out = {}
-    for meta in _walk_files(root, (".cs.meta",)):
+    if asset_guids is not None:
+        for g, path in asset_guids.items():
+            if path.lower().endswith(".cs"):
+                out[g] = path
+        _progress("script metas from asset map: %d" % len(out))
+        return out
+    _progress("walking project tree for .cs.meta files")
+    metas = list(_walk_files(root, (".cs.meta",)))
+    _progress("indexing %d script .meta file(s)" % len(metas))
+    for i, meta in enumerate(metas):
+        if metas and ((i + 1) % 50 == 0 or i + 1 == len(metas)):
+            _progress("  script metas %d/%d" % (i + 1, len(metas)))
         text = _read(meta)
         m = re.search(r"(?m)^guid:\s*([0-9a-fA-F]+)\s*$", text)
         if not m:
@@ -254,7 +282,12 @@ def _guid_map(root):
 def _asset_guid_map(root):
     """Any Unity .meta guid → asset path (scripts, textures, …)."""
     out = {}
-    for meta in _walk_files(root, (".meta",)):
+    _progress("walking project tree for .meta files")
+    metas = list(_walk_files(root, (".meta",)))
+    _progress("indexing %d .meta file(s)" % len(metas))
+    for i, meta in enumerate(metas):
+        if metas and ((i + 1) % 200 == 0 or i + 1 == len(metas)):
+            _progress("  asset metas %d/%d" % (i + 1, len(metas)))
         text = _read(meta)
         m = re.search(r"(?m)^guid:\s*([0-9a-fA-F]+)\s*$", text)
         if not m:
@@ -390,8 +423,17 @@ def _attach_sprite_textures(objects, asset_guids):
     """Load PNG pixels for each SpriteRenderer that references a project sprite.
 
     World half-extents follow Unity: (pixels / pixelsPerUnit) * scale / 2.
+    PNG decode is cached by path so shared sprites are not re-decoded.
     """
-    for o in objects:
+    todo = [o for o in objects if o.get("sprite")]
+    n = len(todo)
+    cache = {}  # path -> (w, h, rgba, ppu) or None if unloadable
+    if n:
+        _progress("loading sprites for %d SpriteRenderer(s)" % n)
+    for i, o in enumerate(todo):
+        if n >= 8 and ((i + 1) % 100 == 0 or i + 1 == n):
+            _progress("  sprites %d/%d (%d unique PNG(s))" % (
+                i + 1, n, len(cache)))
         sp = o.get("sprite")
         if not sp:
             continue
@@ -399,15 +441,17 @@ def _attach_sprite_textures(objects, asset_guids):
         if not path or not path.lower().endswith(".png"):
             o["sprite"] = None
             continue
-        try:
-            w, h, rgba = _load_png_rgba(path)
-        except PackError:
+        if path not in cache:
+            try:
+                w, h, rgba = _load_png_rgba(path)
+                cache[path] = (w, h, rgba, _pixels_per_unit(path))
+            except (PackError, IOError):
+                cache[path] = None
+        hit = cache[path]
+        if hit is None:
             o["sprite"] = None
             continue
-        except IOError:
-            o["sprite"] = None
-            continue
-        ppu = _pixels_per_unit(path)
+        w, h, rgba, ppu = hit
         sx = abs(float(sp.get("scale_x", 1.0)))
         sy = abs(float(sp.get("scale_y", 1.0)))
         sp["tex_path"] = path
@@ -2841,12 +2885,19 @@ def load_project(root):
     root = os.path.abspath(root)
     if not os.path.isdir(root):
         raise PackError("not a directory: %s" % root)
-    guids = _guid_map(root)
+    _progress("scanning %s" % root)
+    _progress("reading .meta guid maps")
     assets = _asset_guid_map(root)
+    guids = _guid_map(root, asset_guids=assets)
     objects = []
     lights = []
     cameras = []
-    for path in _walk_files(root, (".unity",)):
+    _progress("finding .unity scenes")
+    scenes = list(_walk_files(root, (".unity",)))
+    _progress("parsing %d .unity scene(s)" % len(scenes))
+    for si, path in enumerate(scenes):
+        _progress("  scene %d/%d %s" % (
+            si + 1, len(scenes), os.path.basename(path)))
         objs, scene_lights, scene_cams = parse_unity_yaml(
             _read(path), guid_to_script=guids, asset_guids=assets)
         objects.extend(objs)
@@ -2858,9 +2909,13 @@ def load_project(root):
         if os.path.basename(path) == "blender_pack.json":
             objects.extend(parse_blender_json(_read(path)))
 
-    scripts = _walk_files(root, (".cs",))
-    # Godot / Blender may name a class with no .cs; synthesise an empty one.
-    analyses = [analyze_script(p) for p in scripts]
+    scripts = list(_walk_files(root, (".cs",)))
+    _progress("analyzing %d script(s)" % len(scripts))
+    analyses = []
+    for i, p in enumerate(scripts):
+        if scripts and ((i + 1) % 25 == 0 or i + 1 == len(scripts)):
+            _progress("  scripts %d/%d" % (i + 1, len(scripts)))
+        analyses.append(analyze_script(p))
     have = set()
     for a in analyses:
         for c in a["classes"]:
@@ -2886,6 +2941,8 @@ def load_project(root):
         raise PackError(
             "no scene objects found under %s "
             "(looked for .unity / .tscn / blender_pack.json)" % root)
+    _progress("scene objects=%d lights=%d cameras=%d" % (
+        len(objects), len(lights), len(cameras)))
     _attach_sprite_textures(objects, assets)
     return objects, analyses, lights, cameras
 
@@ -2967,6 +3024,7 @@ def pack(root, outdir, soa=False, soa_vec4=False):
         raise PackError(
             "Camera.main: no Camera in the scene — unity_pack does not invent "
             "a default camera. Add an authored Camera (tag MainCamera).")
+    _progress("planning layouts (%d objects)" % len(objects))
     plan = plan_layouts(objects, analyses)
     if soa or soa_vec4:
         plan = apply_soa_layout(plan, vec4=bool(soa_vec4))
@@ -3002,12 +3060,18 @@ def pack(root, outdir, soa=False, soa_vec4=False):
     plan["go_rigidbody2d"] = go_rb2d
     plan["go_rigidbody"] = go_rb3d
     os.makedirs(outdir, exist_ok=True)
+    _progress("emitting engine.c (%d classes)" % len(plan["classes"]))
     engine = emit_engine(plan, analyses, used_apis)
+    _progress("emitting data.c (%d texture(s))" % len(plan.get("textures") or []))
     data = emit_data(plan, used_apis)
     main_c = emit_main()
+    _progress("validating engine.c through cpprust")
     validate_emitted_c(engine, "engine.c")
+    _progress("validating data.c through cpprust")
     validate_emitted_c(data, "data.c")
+    _progress("validating main.c through cpprust")
     validate_emitted_c(main_c, "main.c")
+    _progress("writing %s" % outdir)
     with open(os.path.join(outdir, "engine.c"), "w") as f:
         f.write(engine)
     with open(os.path.join(outdir, "data.c"), "w") as f:
@@ -3026,6 +3090,7 @@ def pack(root, outdir, soa=False, soa_vec4=False):
             f.write(emit_shader_compiler(plat))
     with open(os.path.join(shdir, "soa_positions.glsl"), "w") as f:
         f.write(emit_soa_positions_glsl(plan))
+    _progress("done")
     return plan
 
 
