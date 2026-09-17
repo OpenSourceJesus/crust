@@ -102,7 +102,10 @@ No invented lights. `AddComponent<Light>` is a `PackError`.
 
 PNG pixels are packed into `data.c` (`engine_texture_rgba`). Editing the
 referenced sprite and re-packing changes the drawn texels. Tint comes from
-`m_Color`; size from Transform scale.
+`m_Color`. World size follows Unity:
+`(texels / spritePixelsToUnits) * Transform.scale` (half-extents in
+`engine_collect_draws`). `spritePixelsToUnits` is read from the PNG `.meta`
+(default **100**).
 
 **No default visuals.** A GameObject with only a Transform / MonoBehaviour
 does **not** appear in `engine_collect_draws`. Hosts clear to the authored

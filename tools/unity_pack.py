@@ -355,8 +355,29 @@ def _load_png_rgba(path):
     return w, h, rgba
 
 
+def _pixels_per_unit(asset_path):
+    """Unity TextureImporter `spritePixelsToUnits` (Sprite.pixelsPerUnit).
+
+    Default 100 matches Unity when the .meta omits the field.
+    """
+    meta = asset_path + ".meta"
+    try:
+        text = _read(meta)
+    except IOError:
+        return 100.0
+    m = re.search(r"(?m)^\s*spritePixelsToUnits:\s*([0-9.]+)\s*$", text)
+    if not m:
+        return 100.0
+    v = float(m.group(1))
+    return v if v > 0.0 else 100.0
+
+
+
 def _attach_sprite_textures(objects, asset_guids):
-    """Load PNG pixels for each SpriteRenderer that references a project sprite."""
+    """Load PNG pixels for each SpriteRenderer that references a project sprite.
+
+    World half-extents follow Unity: (pixels / pixelsPerUnit) * scale / 2.
+    """
     for o in objects:
         sp = o.get("sprite")
         if not sp:
@@ -373,10 +394,16 @@ def _attach_sprite_textures(objects, asset_guids):
         except IOError:
             o["sprite"] = None
             continue
+        ppu = _pixels_per_unit(path)
+        sx = abs(float(sp.get("scale_x", 1.0)))
+        sy = abs(float(sp.get("scale_y", 1.0)))
         sp["tex_path"] = path
         sp["tex_w"] = w
         sp["tex_h"] = h
         sp["tex_rgba"] = rgba
+        sp["pixels_per_unit"] = ppu
+        sp["half_w"] = (float(w) / ppu) * sx * 0.5
+        sp["half_h"] = (float(h) / ppu) * sy * 0.5
 
 
 def _collect_textures(objects):
@@ -550,9 +577,9 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             if k.get("kind") == "Camera" and k.get("camera"):
                 cam = dict(k["camera"])
         if sprite and sprite.get("enabled", 1) and sprite.get("has_sprite"):
-            # Size from authored Transform scale (no invented sprite mesh).
-            sprite["half_w"] = 0.5 * abs(float(scale[0]))
-            sprite["half_h"] = 0.5 * abs(float(scale[1]))
+            # Extent filled after PNG load via pixels / pixelsPerUnit * scale.
+            sprite["scale_x"] = abs(float(scale[0]))
+            sprite["scale_y"] = abs(float(scale[1]))
         else:
             sprite = None
         class_name = None

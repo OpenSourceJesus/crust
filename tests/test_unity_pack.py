@@ -437,6 +437,112 @@ class TestSystems(unittest.TestCase):
             data2 = f.read()
         self.assertIn("255, 0, 0, 255", data2)
 
+    def test_sprite_world_size_uses_pixels_per_unit(self):
+        """Larger PNG at the same PPU/scale draws a larger half-extent."""
+        root = tempfile.mkdtemp(prefix="upack-ppu-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Mark.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Mark : MonoBehaviour {\n"
+                "    public void Update() { }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Mark.cs.meta"), "w") as f:
+            f.write("guid: dddddddddddddddddddddddddddddddd\n")
+        spr = os.path.join(root, "Assets", "Sprites")
+        os.makedirs(spr)
+        import struct, zlib
+
+        def write_png(path, w, h):
+            def chunk(tag, body):
+                return (struct.pack(">I", len(body)) + tag + body
+                        + struct.pack(">I", zlib.crc32(tag + body) & 0xffffffff))
+            raw = b""
+            for _y in range(h):
+                raw += b"\x00" + (b"\xff\xff\xff\xff" * w)
+            open(path, "wb").write(
+                b"\x89PNG\r\n\x1a\n"
+                + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(raw, 9))
+                + chunk(b"IEND", b"")
+            )
+
+        write_png(os.path.join(spr, "small.png"), 8, 8)
+        write_png(os.path.join(spr, "big.png"), 16, 16)
+        with open(os.path.join(spr, "small.png.meta"), "w") as f:
+            f.write(
+                "guid: 11111111111111111111111111111111\n"
+                "TextureImporter:\n"
+                "  spritePixelsToUnits: 8\n"
+            )
+        with open(os.path.join(spr, "big.png.meta"), "w") as f:
+            f.write(
+                "guid: 22222222222222222222222222222222\n"
+                "TextureImporter:\n"
+                "  spritePixelsToUnits: 8\n"
+            )
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Small\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "  - component: {fileID: 4}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: dddddddddddddddddddddddddddddddd}\n"
+                "--- !u!212 &4\nSpriteRenderer:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n"
+                "  m_Sprite: {fileID: 21300000, "
+                "guid: 11111111111111111111111111111111, type: 3}\n"
+                "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Big\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "  - component: {fileID: 13}\n"
+                "--- !u!4 &11\nTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_LocalPosition: {x: 2, y: 0, z: 0}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "--- !u!114 &12\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: dddddddddddddddddddddddddddddddd}\n"
+                "--- !u!212 &13\nSpriteRenderer:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Enabled: 1\n"
+                "  m_Sprite: {fileID: 21300000, "
+                "guid: 22222222222222222222222222222222, type: 3}\n"
+                "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+            )
+        objs, _a, _l, _c = unity_pack.load_project(root)
+        by_name = {o["name"]: o for o in objs}
+        small = by_name["Small"]["sprite"]
+        big = by_name["Big"]["sprite"]
+        # (8/8)*1/2 = 0.5 ; (16/8)*1/2 = 1.0
+        self.assertAlmostEqual(small["half_w"], 0.5)
+        self.assertAlmostEqual(small["half_h"], 0.5)
+        self.assertAlmostEqual(big["half_w"], 1.0)
+        self.assertAlmostEqual(big["half_h"], 1.0)
+        self.assertEqual(small["pixels_per_unit"], 8.0)
+        self.assertEqual(big["pixels_per_unit"], 8.0)
+
+
+    def test_pixels_per_unit_defaults_to_100(self):
+        self.assertEqual(
+            unity_pack._pixels_per_unit("/no/such/sprite.png"), 100.0)
+
+
     def test_dangling_sprite_guid_does_not_draw(self):
         """Placeholder / missing asset guids are not invent-drawn."""
         root = tempfile.mkdtemp(prefix="upack-dang-spr-")
