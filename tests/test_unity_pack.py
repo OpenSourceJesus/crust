@@ -35,7 +35,7 @@ needs_cc = unittest.skipIf(_CC is None, "no C compiler")
 class TestSceneImport(unittest.TestCase):
 
     def test_unity_yaml_counts(self):
-        objs, analyses, _lights = unity_pack.load_project(SCENE)
+        objs, analyses, _lights, _cams = unity_pack.load_project(SCENE)
         names = sorted(o["name"] for o in objs)
         self.assertEqual(names, ["CoinA", "CoinB", "Hero"])
         coins = [o for o in objs if o["class"] == "Coin"]
@@ -58,7 +58,7 @@ class TestSceneImport(unittest.TestCase):
 class TestLayout(unittest.TestCase):
 
     def setUp(self):
-        self.objs, self.an, _lights = unity_pack.load_project(SCENE)
+        self.objs, self.an, _lights, _cams = unity_pack.load_project(SCENE)
         self.plan = unity_pack.plan_layouts(self.objs, self.an)
 
     def test_two_d_drops_z(self):
@@ -308,7 +308,7 @@ class TestSystems(unittest.TestCase):
     """Authored systems subset — see UNITY_PACK_SYSTEMS.md."""
 
     def test_detects_system_apis(self):
-        _objs, analyses, lights = unity_pack.load_project(SYSTEMS)
+        _objs, analyses, lights, cameras = unity_pack.load_project(SYSTEMS)
         apis = set()
         for a in analyses:
             apis |= a["apis"]
@@ -320,8 +320,13 @@ class TestSystems(unittest.TestCase):
         self.assertIn("RenderSettings.ambientLight", apis)
         self.assertEqual(len(lights), 1)
         self.assertAlmostEqual(lights[0]["intensity"], 1.5)
+        self.assertEqual(len(cameras), 1)
+        self.assertTrue(cameras[0]["main"])
+        self.assertAlmostEqual(cameras[0]["orthographic_size"], 3.0)
         self.assertNotIn("ParticleSystem.Emit", apis)
         self.assertNotIn("AnimationCurve.Evaluate", apis)
+        spr = [o for o in _objs if o.get("sprite")]
+        self.assertEqual(len(spr), 3)  # Bouncer, Ball, Pad — not Shade
 
     def test_emits_opt_in_stubs_not_invented_components(self):
         d = tempfile.mkdtemp(prefix="upack-sys-")
@@ -339,6 +344,10 @@ class TestSystems(unittest.TestCase):
         self.assertIn("_Light_intensity", data)
         self.assertIn("1.5f", data)
         self.assertIn("Physics2D_gravity_y", data)
+        self.assertIn("Camera_main_orthographicSize", data)
+        self.assertIn("SpriteRenderer", engine)
+        self.assertIn("_engine_tex0_rgba", data)
+        self.assertIn("engine_texture_rgba", engine)
         self.assertNotIn("ParticleSystem_Emit", engine)
         self.assertNotIn("AnimationCurve_Evaluate", engine)
         self.assertNotIn("_AnimCurve0", data)
@@ -354,6 +363,176 @@ class TestSystems(unittest.TestCase):
         self.assertNotIn("Physics2D_gravity", mini)
         self.assertNotIn("Input_GetAxis", mini)
         self.assertNotIn("_Light_intensity", mini_data)
+
+    def test_sprite_png_pixels_are_packed(self):
+        """Editing the referenced PNG changes packed texture bytes."""
+        d = tempfile.mkdtemp(prefix="upack-tex-")
+        plan = unity_pack.pack(SCENE, d)
+        self.assertGreaterEqual(len(plan.get("textures") or []), 1)
+        tex = plan["textures"][0]
+        self.assertEqual(tex["w"], 8)
+        self.assertEqual(tex["h"], 8)
+        # Default fixture is opaque white.
+        self.assertEqual(tex["rgba"][0:4], b"\xff\xff\xff\xff")
+        with open(os.path.join(d, "data.c")) as f:
+            data = f.read()
+        self.assertIn("255, 255, 255, 255", data)
+
+        # Recolor the project PNG and re-pack — bytes must follow.
+        red = tempfile.mkdtemp(prefix="upack-red-")
+        import shutil
+        shutil.copytree(SCENE, os.path.join(red, "proj"))
+        proj = os.path.join(red, "proj")
+        png = os.path.join(proj, "Assets", "Sprites", "quad.png")
+        # 8x8 opaque red
+        w, h, _old = unity_pack._load_png_rgba(png)
+        import struct, zlib
+
+        def chunk(tag, body):
+            return (struct.pack(">I", len(body)) + tag + body
+                    + struct.pack(">I", zlib.crc32(tag + body) & 0xffffffff))
+
+        raw = b""
+        for _y in range(h):
+            raw += b"\x00" + (b"\xff\x00\x00\xff" * w)
+        open(png, "wb").write(
+            b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 9))
+            + chunk(b"IEND", b"")
+        )
+        d2 = tempfile.mkdtemp(prefix="upack-tex2-")
+        plan2 = unity_pack.pack(proj, d2)
+        self.assertEqual(plan2["textures"][0]["rgba"][0:4], b"\xff\x00\x00\xff")
+        with open(os.path.join(d2, "data.c")) as f:
+            data2 = f.read()
+        self.assertIn("255, 0, 0, 255", data2)
+
+    def test_dangling_sprite_guid_does_not_draw(self):
+        """Placeholder / missing asset guids are not invent-drawn."""
+        root = tempfile.mkdtemp(prefix="upack-dang-spr-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Mark.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Mark : MonoBehaviour {\n"
+                "    public void Update() { }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Mark.cs.meta"), "w") as f:
+            f.write("guid: dddddddddddddddddddddddddddddddd\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Mark\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "  - component: {fileID: 4}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: dddddddddddddddddddddddddddddddd}\n"
+                "--- !u!212 &4\nSpriteRenderer:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n"
+                "  m_Sprite: {fileID: 21300000, "
+                "guid: 11111111111111111111111111111111, type: 3}\n"
+                "  m_Color: {r: 1, g: 0, b: 0, a: 1}\n"
+            )
+        objs, _a, _l, _c = unity_pack.load_project(root)
+        self.assertIsNone(objs[0].get("sprite"))
+
+    def test_sprite_renderer_without_sprite_does_not_draw(self):
+        root = tempfile.mkdtemp(prefix="upack-empty-spr-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Mark.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Mark : MonoBehaviour {\n"
+                "    public void Update() { }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Mark.cs.meta"), "w") as f:
+            f.write("guid: dddddddddddddddddddddddddddddddd\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Mark\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "  - component: {fileID: 4}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: dddddddddddddddddddddddddddddddd}\n"
+                "--- !u!212 &4\nSpriteRenderer:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n"
+                "  m_Sprite: {fileID: 0}\n"
+                "  m_Color: {r: 1, g: 0, b: 0, a: 1}\n"
+            )
+        objs, _a, _l, _c = unity_pack.load_project(root)
+        self.assertIsNone(objs[0].get("sprite"))
+        d = tempfile.mkdtemp(prefix="upack-empty-spr-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            engine = f.read()
+        self.assertIn("no authored SpriteRenderers", engine)
+
+    def test_no_default_draws_without_sprite_renderer(self):
+        """Bare MonoBehaviour GameObjects are not invent-drawn."""
+        root = tempfile.mkdtemp(prefix="upack-nodraw-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Ghost.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Ghost : MonoBehaviour {\n"
+                "    public float speed;\n"
+                "    public void Update() {\n"
+                "        transform.position += new Vector2(speed * Time.deltaTime, 0);\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Ghost.cs.meta"), "w") as f:
+            f.write("guid: cccccccccccccccccccccccccccccccc\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Ghost\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: cccccccccccccccccccccccccccccccc}\n"
+                "  speed: 1\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-nodraw-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            engine = f.read()
+        self.assertIn("no authored SpriteRenderers", engine)
+        self.assertNotIn("out[n].half_w", engine)
 
     def test_refuses_invented_particle_system(self):
         src = (
@@ -473,7 +652,7 @@ class TestSystemsRuns(unittest.TestCase):
                 "extern float RenderSettings_ambient_r;\n"
                 "extern float _Light_intensity[];\n"
                 "typedef struct { float x, y, half_w, half_h;\n"
-                "                 float r, g, b; } EngineDraw;\n"
+                "                 float r, g, b; int tex; } EngineDraw;\n"
                 "int engine_collect_draws(EngineDraw *out, int max);\n"
                 "typedef struct Ball Ball;\n"
                 "struct Ball { float pos_x; float pos_y;\n"
@@ -496,7 +675,7 @@ class TestSystemsRuns(unittest.TestCase):
                 "  if (_Ball_inst_array[0].pos_y >= y0) return 3;\n"
                 "  if (_Pad_inst_array[0].pos_x <= x0) return 4;\n"
                 "  if (_Light_intensity[0] < 1.4f) return 5;\n"
-                "  if (n != 4) return 6; /* Bouncer+Ball+Pad+AmbientBias */\n"
+                "  if (n != 3) return 6; /* SpriteRenderer on Bouncer+Ball+Pad */\n"
                 "  return 0;\n"
                 "}\n"
             )

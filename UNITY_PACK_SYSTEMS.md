@@ -47,6 +47,25 @@ the packer will not invent a pool.
 
 No invented lights. `AddComponent<Light>` is a `PackError`.
 
+## Camera and rendering
+
+| Script / scene uses | Emitted |
+|---------------------|---------|
+| Authored `!u!20` Camera (MainCamera) | `Camera_main_pos_*`, `orthographicSize`, background RGB |
+| `Camera.main.orthographicSize` / `.transform.position` | Reads those globals |
+| Authored `!u!212` SpriteRenderer with `m_Sprite` → **project PNG** | Texture + tinted quad in `engine_collect_draws` |
+
+PNG pixels are packed into `data.c` (`engine_texture_rgba`). Editing the
+referenced sprite and re-packing changes the drawn texels. Tint comes from
+`m_Color`; size from Transform scale.
+
+**No default visuals.** A GameObject with only a Transform / MonoBehaviour
+does **not** appear in `engine_collect_draws`. Hosts clear to the authored
+camera background; they do not invent class-hash coloured quads.
+
+`Camera.main` without a scene Camera, and `AddComponent<Camera>` /
+`AddComponent<SpriteRenderer>`, are `PackError`s.
+
 ## UI
 
 Refused invent. `UnityEngine.UI` / `Canvas` keep UI in the authored
@@ -73,6 +92,8 @@ components.
 | `InputAction` / `Keyboard.current` | Needs Input System assets / runtime |
 | `UnityEngine.UI` / `Canvas` | Needs authored UI hierarchy |
 | `AddComponent<Light>` | Light must already be on a scene GameObject |
+| `AddComponent<Camera>` / `SpriteRenderer` | Must be authored; no invent-draw |
+| `Camera.main` with no scene Camera | Packer will not invent a default camera |
 
 ## Tick order
 
@@ -84,10 +105,12 @@ foreach class: Update
 
 ## Fixture
 
-`examples/unity_pack/SystemsScene` — Bouncer (Sin + Time), Ball
-(FixedUpdate + gravity), Pad (GetAxis), Shade (ambient + authored Light):
+`examples/unity_pack/SystemsScene` — Bouncer / Ball / Pad (each with
+authored SpriteRenderer), Shade (Light only, no invent-draw), Main Camera:
 
 ```
 python3 tools/unity_pack.py examples/unity_pack/SystemsScene -o /tmp/sys
 make -C /tmp/sys && /tmp/sys/game
+SCENE="$(pwd)/examples/unity_pack/SystemsScene" \
+  ./examples/unity_pack/run_gles2_window.sh
 ```
