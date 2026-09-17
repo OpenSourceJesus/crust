@@ -317,6 +317,8 @@ class TestSystems(unittest.TestCase):
         self.assertIn("Physics2D.gravity", apis)
         self.assertIn("Time.fixedDeltaTime", apis)
         self.assertIn("Keyboard.current", apis)
+        self.assertIn("Debug.Log", apis)
+        self.assertIn("print", apis)
         self.assertNotIn("Input.GetAxis", apis)
         self.assertIn("RenderSettings.ambientLight", apis)
         self.assertEqual(len(lights), 1)
@@ -341,6 +343,8 @@ class TestSystems(unittest.TestCase):
         self.assertIn("Time_time = Time_time + Time_deltaTime", engine)
         self.assertIn("Keyboard_current", engine)
         self.assertIn("Keyboard_leftArrowKey_isPressed", engine)
+        self.assertIn("Debug_Log", engine)
+        self.assertIn("Pad_Start", engine)
         self.assertIn("engine_keyboard_connected", data)
         self.assertIn("engine_keyboard_leftArrow", data)
         self.assertIn("RenderSettings_ambient_r", data)
@@ -609,6 +613,151 @@ class TestSystems(unittest.TestCase):
             unity_pack.pack(root, tempfile.mkdtemp(prefix="upack-out-"))
         self.assertIn("Keyboard", cm.exception.message)
         self.assertIn("InputSystem", cm.exception.message)
+
+    @needs_cc
+    def test_debug_log_and_print_go_to_player_log(self):
+        """Debug.Log / print → Unity Player.log path; not stdout unless -logFile -."""
+        root = tempfile.mkdtemp(prefix="upack-log-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        ps = os.path.join(root, "ProjectSettings")
+        os.makedirs(ps)
+        with open(os.path.join(ps, "ProjectSettings.asset"), "w") as f:
+            f.write(
+                "PlayerSettings:\n"
+                "  companyName: CrustTest\n"
+                "  productName: TalkerLog\n"
+            )
+        with open(os.path.join(scripts, "Talker.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Talker : MonoBehaviour {\n"
+                "    public void Start() { Debug.Log(\"Hello World!\"); }\n"
+                "    public void Update() { print(3); }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Talker.cs.meta"), "w") as f:
+            f.write("guid: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Talker\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-log-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            engine = f.read()
+        self.assertIn("unity3d", engine)  # Linux path fragment in #else
+        self.assertIn("CrustTest", engine)
+        self.assertIn("TalkerLog", engine)
+        self.assertIn("Debug_Log_s", engine)
+        self.assertIn("Talker_Start", engine)
+        self.assertIn('Debug_Log("Hello World!")', engine)
+        self.assertIn("Debug_Log(3)", engine)
+        r = subprocess.run(["make", "-C", d], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr or r.stdout)
+        run = subprocess.run([os.path.join(d, "game")],
+                             capture_output=True, text=True, cwd=d)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+        self.assertNotIn("Hello World!", run.stdout)
+        self.assertIn("draws=", run.stdout)
+        self.assertFalse(
+            os.path.isfile(os.path.join(d, "Player.log")),
+            "must not write Player.log in cwd")
+        log_path = unity_pack.unity_player_log_path("CrustTest", "TalkerLog")
+        self.assertTrue(os.path.isfile(log_path), log_path)
+        with open(log_path) as f:
+            log = f.read()
+        self.assertIn("Hello World!", log)
+        self.assertEqual(log.count("Hello World!"), 1)
+        self.assertGreaterEqual(log.count("3\n"), 60)
+
+        # -logFile - mirrors Unity: Debug.Log goes to stdout.
+        run2 = subprocess.run(
+            [os.path.join(d, "game"), "-logFile", "-"],
+            capture_output=True, text=True, cwd=d)
+        self.assertEqual(run2.returncode, 0, run2.stderr or run2.stdout)
+        self.assertIn("Hello World!", run2.stdout)
+
+    @needs_cc
+    def test_console_writeline_goes_to_stdout(self):
+        root = tempfile.mkdtemp(prefix="upack-con-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        ps = os.path.join(root, "ProjectSettings")
+        os.makedirs(ps)
+        with open(os.path.join(ps, "ProjectSettings.asset"), "w") as f:
+            f.write(
+                "PlayerSettings:\n"
+                "  companyName: CrustTest\n"
+                "  productName: ConsoleTalk\n"
+            )
+        with open(os.path.join(scripts, "Talker.cs"), "w") as f:
+            f.write(
+                "using System;\n"
+                "using UnityEngine;\n"
+                "public class Talker : MonoBehaviour {\n"
+                "    public void Start() {\n"
+                "        Console.WriteLine(\"term\");\n"
+                "        Debug.Log(\"file\");\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Talker.cs.meta"), "w") as f:
+            f.write("guid: ffffffffffffffffffffffffffffffff\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Talker\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: ffffffffffffffffffffffffffffffff}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-con-out-")
+        unity_pack.pack(root, d)
+        r = subprocess.run(["make", "-C", d], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr or r.stdout)
+        run = subprocess.run([os.path.join(d, "game")],
+                             capture_output=True, text=True, cwd=d)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+        self.assertIn("term", run.stdout)
+        self.assertNotIn("file", run.stdout)
+        log_path = unity_pack.unity_player_log_path("CrustTest", "ConsoleTalk")
+        with open(log_path) as f:
+            self.assertIn("file", f.read())
+
+    def test_player_identity_from_project_settings(self):
+        root = tempfile.mkdtemp(prefix="upack-id-")
+        ps = os.path.join(root, "ProjectSettings")
+        os.makedirs(ps)
+        with open(os.path.join(ps, "ProjectSettings.asset"), "w") as f:
+            f.write("companyName: Acme\nproductName: Rocket\n")
+        c, p = unity_pack.player_identity(root)
+        self.assertEqual(c, "Acme")
+        self.assertEqual(p, "Rocket")
+        c2, p2 = unity_pack.player_identity(
+            tempfile.mkdtemp(prefix="upack-noid-"))
+        self.assertEqual(c2, "DefaultCompany")
+        self.assertTrue(p2.startswith("upack-noid-"))
 
     def test_keyboard_fqn_without_using_ok(self):
         root = tempfile.mkdtemp(prefix="upack-kb-fqn-")

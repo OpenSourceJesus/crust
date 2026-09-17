@@ -26,6 +26,28 @@ or `UnityEngine.InputSystem.Keyboard` — no invented global alias.
 `InputAction` maps and `Gamepad.current` are still refused (would invent
 action maps / device graphs).
 
+## Logging (player log)
+
+| Script uses | Emitted |
+|-------------|---------|
+| `Debug.Log(msg)` / `print(msg)` | Unity **Player.log** path + newline |
+| `-logFile path` / `-logFile -` | `engine_apply_argv` → file or **stdout** |
+| `System.Console.WriteLine(msg)` | **stdout** (terminal), not Player.log |
+
+Default log path matches Unity standalone (from `ProjectSettings`
+`companyName` / `productName`, else `DefaultCompany` / project folder):
+
+| OS | Path |
+|----|------|
+| Linux | `~/.config/unity3d/<company>/<product>/Player.log` |
+| macOS | `~/Library/Logs/<company>/<product>/Player.log` |
+| Windows | `%USERPROFILE%\AppData\LocalLow\<company>\<product>\Player.log` |
+
+Not the process cwd. Terminal output needs `-logFile -` or
+`System.Console.WriteLine` (`using System;` or FQN). Optional `Debug.Log`
+context arg ignored. `engine_console_log_path()` mirrors
+`Application.consoleLogPath`. `Start` runs once before first `Update`.
+
 ## Animation (script motion)
 
 | Script uses | Emitted |

@@ -1,13 +1,18 @@
 using UnityEngine;
 using UnityEngine.InputSystem;
 
-/* Input Manager subset: host-fed Horizontal axis. */
 [Shared]
 public class Pad : MonoBehaviour
 {
 	public float speed;
 
-	public void Update ()
+	void Start ()
+	{
+		Debug.Log("Hello World!");
+		System.Console.WriteLine("Game began");
+	}
+
+	void Update ()
 	{
 		float move = 0;
 		if (Keyboard.current.leftArrowKey.isPressed)
@@ -15,5 +20,6 @@ public class Pad : MonoBehaviour
 		if (Keyboard.current.rightArrowKey.isPressed)
 			move ++;
 		transform.position += new Vector2(move * speed * Time.deltaTime, 0);
+		print(move);
 	}
 }
