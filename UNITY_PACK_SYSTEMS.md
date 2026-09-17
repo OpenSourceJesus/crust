@@ -21,8 +21,10 @@ instances that are already placed.
 | `Keyboard.current.<name>Key.isPressed` | Host int `engine_keyboard_<name>` |
 
 Legacy Input Manager and Input System `Keyboard.current` (connected
-device + key state). `InputAction` maps and `Gamepad.current` are still
-refused (would invent action maps / device graphs).
+device + key state). Bare `Keyboard` needs `using UnityEngine.InputSystem;`
+or `UnityEngine.InputSystem.Keyboard` — no invented global alias.
+`InputAction` maps and `Gamepad.current` are still refused (would invent
+action maps / device graphs).
 
 ## Animation (script motion)
 

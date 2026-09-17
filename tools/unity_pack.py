@@ -81,6 +81,11 @@ _REFUSED_API = {
         "does not invent action maps. Use Input.GetAxis / GetButton or "
         "Keyboard.current with a host, or wait for action-asset import."
     ),
+    "Keyboard": (
+        "Keyboard is UnityEngine.InputSystem.Keyboard — add "
+        "`using UnityEngine.InputSystem;` or qualify the type. "
+        "unity_pack does not invent a global Keyboard alias."
+    ),
     "Gamepad.current": (
         "Unity Input System Gamepad.current needs the Input System package "
         "runtime — unity_pack does not invent device graphs."
@@ -607,12 +612,24 @@ def analyze_script(path, text=None):
         apis.add("UnityEngine.UI")
     if re.search(r"\bInputAction\b", scan):
         apis.add("InputAction")
+    # Keyboard lives in UnityEngine.InputSystem — only when in scope.
+    has_input_system = bool(
+        re.search(r"using\s+UnityEngine\.InputSystem\b", scan)
+        or re.search(r"UnityEngine\.InputSystem\.Keyboard\b", scan)
+    )
+    apis.discard("Keyboard.current")  # may have matched via _UNITY_API
     keyboard_keys = set()
-    for m in _KEYBOARD_KEY.finditer(scan):
-        apis.add("Keyboard.current")
-        keyboard_keys.add(m.group(1))
-    if re.search(r"Keyboard\.current\b", scan):
-        apis.add("Keyboard.current")
+    if has_input_system:
+        for m in _KEYBOARD_KEY.finditer(scan):
+            apis.add("Keyboard.current")
+            keyboard_keys.add(m.group(1))
+        if re.search(
+                r"(?:UnityEngine\.InputSystem\.)?Keyboard\.current\b", scan):
+            apis.add("Keyboard.current")
+    elif (re.search(r"(?<![\w.])Keyboard\.current\b", scan)
+          or _KEYBOARD_KEY.search(scan)):
+        apis.add("Keyboard")
+
     spawns = bool(_SPAWN.search(scan))
     uses_z = bool(re.search(r"(?<![\w.])Vector3\b", scan)
                   or re.search(r"(?<![\w.])Quaternion\b", scan)
@@ -1456,10 +1473,12 @@ def _lower_method_body(body, cl, plan):
                   lambda m: "Input_%s(" % m.group(1), text)
     # Keyboard.current.<name>Key.isPressed → helpers (null-safe via connected).
     text = re.sub(
-        r"Keyboard\.current\.(\w+)Key\.isPressed\b",
+        r"(?:UnityEngine\.InputSystem\.)?Keyboard\.current\.(\w+)Key\.isPressed\b",
         lambda m: "Keyboard_%sKey_isPressed()" % m.group(1),
         text)
-    text = re.sub(r"Keyboard\.current\b", "Keyboard_current()", text)
+    text = re.sub(
+        r"(?:UnityEngine\.InputSystem\.)?Keyboard\.current\b",
+        "Keyboard_current()", text)
     text = re.sub(r"Mathf\.(Abs|Min|Max|Clamp|Lerp|Sin|Cos)\s*\(",
                   lambda m: "Mathf_%s(" % m.group(1), text)
     text = re.sub(r"transform\.position\.x", idn + "_get_pos_x(i)", text)

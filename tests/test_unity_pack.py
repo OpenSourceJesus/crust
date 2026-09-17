@@ -573,6 +573,82 @@ class TestSystems(unittest.TestCase):
             unity_pack.pack(root, tempfile.mkdtemp(prefix="upack-out-"))
         self.assertIn("ParticleSystem", cm.exception.message)
 
+    def test_refuses_keyboard_without_inputsystem_using(self):
+        """Bare Keyboard is not a global — needs InputSystem using or FQN."""
+        root = tempfile.mkdtemp(prefix="upack-kb-scope-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "PadBare.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class PadBare : MonoBehaviour {\n"
+                "    public void Update() {\n"
+                "        if (Keyboard.current.leftArrowKey.isPressed) {}\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "PadBare.cs.meta"), "w") as f:
+            f.write("guid: cccccccccccccccccccccccccccccccc\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: PadBare\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: cccccccccccccccccccccccccccccccc}\n"
+            )
+        with self.assertRaises(unity_pack.PackError) as cm:
+            unity_pack.pack(root, tempfile.mkdtemp(prefix="upack-out-"))
+        self.assertIn("Keyboard", cm.exception.message)
+        self.assertIn("InputSystem", cm.exception.message)
+
+    def test_keyboard_fqn_without_using_ok(self):
+        root = tempfile.mkdtemp(prefix="upack-kb-fqn-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "PadFqn.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class PadFqn : MonoBehaviour {\n"
+                "    public void Update() {\n"
+                "        if (UnityEngine.InputSystem.Keyboard.current"
+                ".leftArrowKey.isPressed) {}\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "PadFqn.cs.meta"), "w") as f:
+            f.write("guid: dddddddddddddddddddddddddddddddd\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: PadFqn\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: dddddddddddddddddddddddddddddddd}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            engine = f.read()
+        self.assertIn("Keyboard_current", engine)
+        self.assertIn("Keyboard_leftArrowKey_isPressed", engine)
+
     def test_refuses_input_action_and_ui_invent(self):
         cases = [
             (
