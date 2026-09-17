@@ -264,6 +264,9 @@ def _load_png_rgba(path):
             raise PackError("bad PNG filter %d in %s" % (ftype, path))
         rows.append(bytes(row))
         prev = row
+    # PNG stores top row first; OpenGL / Unity sprite UVs treat the first
+    # texel row as the bottom. Flip so authored art is not Y-mirrored.
+    rows.reverse()
     if color_type == 6:
         rgba = b"".join(rows)
     else:
