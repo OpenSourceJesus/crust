@@ -229,20 +229,16 @@ static void poll_input_axes(GLFWwindow *win)
     engine_input_axis_Horizontal = hx;
     engine_input_axis_Vertical = vy;
 
-    /* Input System Keyboard.current — this window always has a keyboard. */
+    /* Input System Keyboard.current — only the named key, no WASD aliases. */
     engine_keyboard_connected = 1;
     engine_keyboard_leftArrow =
-        glfwGetKey(win, GLFW_KEY_LEFT) == GLFW_PRESS
-        || glfwGetKey(win, GLFW_KEY_A) == GLFW_PRESS;
+        glfwGetKey(win, GLFW_KEY_LEFT) == GLFW_PRESS;
     engine_keyboard_rightArrow =
-        glfwGetKey(win, GLFW_KEY_RIGHT) == GLFW_PRESS
-        || glfwGetKey(win, GLFW_KEY_D) == GLFW_PRESS;
+        glfwGetKey(win, GLFW_KEY_RIGHT) == GLFW_PRESS;
     engine_keyboard_upArrow =
-        glfwGetKey(win, GLFW_KEY_UP) == GLFW_PRESS
-        || glfwGetKey(win, GLFW_KEY_W) == GLFW_PRESS;
+        glfwGetKey(win, GLFW_KEY_UP) == GLFW_PRESS;
     engine_keyboard_downArrow =
-        glfwGetKey(win, GLFW_KEY_DOWN) == GLFW_PRESS
-        || glfwGetKey(win, GLFW_KEY_S) == GLFW_PRESS;
+        glfwGetKey(win, GLFW_KEY_DOWN) == GLFW_PRESS;
 }
 
 static void draw_one(const EngineDraw *d)
@@ -324,7 +320,7 @@ int main(void)
     glfwSetKeyCallback(win, on_key);
 
     printf("GLES %s\n", (const char *)glGetString(GL_VERSION));
-    printf("draws classes=%d textures=%d — arrows/WASD, Escape/Q\n",
+    printf("draws classes=%d textures=%d — arrows (Keyboard), Escape/Q\n",
            engine_class_count(), engine_texture_count());
 
     prog = build_program();
