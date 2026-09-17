@@ -55,6 +55,7 @@ _API = {
     "Time.fixedDeltaTime": None,
     "Physics2D.gravity": None,
     "RenderSettings.ambientLight": None,
+    "Camera.main": None,
     # Input Manager (legacy): host pokes floats/ints in data.c. Snippets
     # are emitted in emit_engine once string.h / externs are in place.
     "Input.GetAxis": True,
@@ -99,6 +100,14 @@ _REFUSED_API = {
         "Light must be authored on a scene GameObject — unity_pack does not "
         "AddComponent lights."
     ),
+    "AddComponent<Camera>": (
+        "Camera must be authored on a scene GameObject — unity_pack does not "
+        "AddComponent cameras."
+    ),
+    "AddComponent<SpriteRenderer>": (
+        "SpriteRenderer must be authored on a scene GameObject — unity_pack "
+        "does not invent default visuals for GameObjects."
+    ),
 }
 
 _SPAWN = re.compile(
@@ -107,11 +116,11 @@ _SPAWN = re.compile(
 )
 _VEC3Z = re.compile(r"\.(z)\b|Vector3|Quaternion")
 _UNITY_API = re.compile(
-    r"(?:AddComponent\s*<\s*Light\s*>|"
+    r"(?:AddComponent\s*<\s*(?:Light|Camera|SpriteRenderer)\s*>|"
     r"(?<![\w])(?:Mathf\.(?:Abs|Min|Max|Clamp|Lerp|Sin|Cos)|"
     r"Time\.(?:deltaTime|time|fixedDeltaTime)|"
     r"Input\.(?:GetAxis|GetButton|GetKey)|"
-    r"RenderSettings\.ambientLight|"
+    r"RenderSettings\.ambientLight|Camera\.main|"
     r"transform\.position|Physics2D\.gravity|ParticleSystem\.Emit|"
     r"AnimationCurve\.Evaluate|"
     r"InputAction|Keyboard\.current|Gamepad\.current|"
@@ -164,16 +173,14 @@ def _guid_map(root):
 def parse_unity_yaml(text, guid_to_script=None):
     """A Unity .unity YAML subset: GameObject + Transform + MonoBehaviour.
 
-    Not a YAML library. Unity's document-per-object form is regular enough
-    that a block split on `--- !u!` is enough, and a dependency on PyYAML
-    would make the test suite depend on the outside world.
-
-    Returns (objects, lights). lights are authored !u!108 Light components
-    only — never invented.
+    Also imports authored Camera (!u!20) and SpriteRenderer (!u!212). Does
+    not invent either — GameObjects without a SpriteRenderer contribute no
+    draws. Returns (objects, lights, cameras).
     """
     guid_to_script = guid_to_script or {}
     objects = []
     lights = []
+    cameras = []
     blocks = re.split(r"(?m)^---\s+", text)
     by_id = {}
     for block in blocks:
@@ -184,22 +191,36 @@ def parse_unity_yaml(text, guid_to_script=None):
         file_id = hm.group(2)
         kind = None
         km = re.search(
-            r"(?m)^(GameObject|Transform|MonoBehaviour|PrefabInstance|Light):",
+            r"(?m)^(GameObject|Transform|MonoBehaviour|PrefabInstance|"
+            r"Light|Camera|SpriteRenderer):",
             block)
         if km:
             kind = km.group(1)
         elif type_id == "108":
             kind = "Light"
+        elif type_id == "20":
+            kind = "Camera"
+        elif type_id == "212":
+            kind = "SpriteRenderer"
         rec = {"file_id": file_id, "kind": kind, "raw": block, "fields": {}}
         nm = re.search(r"(?m)^\s+m_Name:\s*(.+)$", block)
         if nm:
             rec["name"] = nm.group(1).strip()
+        tag = re.search(r"(?m)^\s+m_TagString:\s*(.+)$", block)
+        if tag:
+            rec["tag"] = tag.group(1).strip()
         pos = re.search(
             r"m_LocalPosition:\s*\{x:\s*([^,}]+),\s*y:\s*([^,}]+),"
             r"\s*z:\s*([^}]+)\}", block)
         if pos:
             rec["pos"] = (float(pos.group(1)), float(pos.group(2)),
                           float(pos.group(3)))
+        sc = re.search(
+            r"m_LocalScale:\s*\{x:\s*([^,}]+),\s*y:\s*([^,}]+),"
+            r"\s*z:\s*([^}]+)\}", block)
+        if sc:
+            rec["scale"] = (float(sc.group(1)), float(sc.group(2)),
+                            float(sc.group(3)))
         gm = re.search(r"guid:\s*([0-9a-fA-F]+)", block)
         if gm:
             rec["guid"] = gm.group(1).lower()
@@ -222,9 +243,35 @@ def parse_unity_yaml(text, guid_to_script=None):
                 "g": float(col.group(2)) if col else 1.0,
                 "b": float(col.group(3)) if col else 1.0,
             })
+        if kind == "SpriteRenderer":
+            col = re.search(
+                r"m_Color:\s*\{r:\s*([^,}]+),\s*g:\s*([^,}]+),"
+                r"\s*b:\s*([^,}]+)", block)
+            en = re.search(r"(?m)^\s+m_Enabled:\s*(\d+)", block)
+            rec["sprite"] = {
+                "r": float(col.group(1)) if col else 1.0,
+                "g": float(col.group(2)) if col else 1.0,
+                "b": float(col.group(3)) if col else 1.0,
+                "enabled": int(en.group(1)) if en else 1,
+            }
+        if kind == "Camera":
+            ortho = re.search(r"(?m)^\s+orthographic:\s*(\d+)", block)
+            osize = re.search(
+                r"(?m)^\s+orthographic size:\s*([0-9.eE+-]+)", block)
+            bg = re.search(
+                r"m_BackGroundColor:\s*\{r:\s*([^,}]+),\s*g:\s*([^,}]+),"
+                r"\s*b:\s*([^,}]+)", block)
+            rec["camera"] = {
+                "orthographic": int(ortho.group(1)) if ortho else 1,
+                "orthographic_size": (
+                    float(osize.group(1)) if osize else 5.0),
+                "bg_r": float(bg.group(1)) if bg else 0.05,
+                "bg_g": float(bg.group(2)) if bg else 0.05,
+                "bg_b": float(bg.group(3)) if bg else 0.08,
+            }
         by_id[file_id] = rec
 
-    # Join MonoBehaviour + Transform onto the GameObject.
+    # Join MonoBehaviour + Transform + SpriteRenderer onto the GameObject.
     gos = [r for r in by_id.values() if r.get("kind") == "GameObject"]
     for go in gos:
         kids = []
@@ -232,27 +279,58 @@ def parse_unity_yaml(text, guid_to_script=None):
             if mid in by_id and by_id[mid] is not go:
                 kids.append(by_id[mid])
         pos = (0.0, 0.0, 0.0)
+        scale = (1.0, 1.0, 1.0)
         script = None
         fields = {}
+        sprite = None
+        cam = None
         for k in kids:
             if k.get("pos"):
                 pos = k["pos"]
+            if k.get("scale"):
+                scale = k["scale"]
             if k.get("kind") == "MonoBehaviour":
                 fields.update(k.get("fields") or {})
                 g = k.get("guid")
                 if g and g in guid_to_script:
                     script = guid_to_script[g]
+            if k.get("kind") == "SpriteRenderer" and k.get("sprite"):
+                sprite = dict(k["sprite"])
+            if k.get("kind") == "Camera" and k.get("camera"):
+                cam = dict(k["camera"])
+        if sprite and sprite.get("enabled", 1):
+            # Size from authored Transform scale (no invented sprite mesh).
+            sprite["half_w"] = 0.5 * abs(float(scale[0]))
+            sprite["half_h"] = 0.5 * abs(float(scale[1]))
+        elif sprite:
+            sprite = None
         class_name = None
         if script:
             class_name = _class_name_from_cs(script)
+        if cam is not None:
+            cameras.append({
+                "name": go.get("name") or "Camera",
+                "pos": pos,
+                "main": (go.get("tag") == "MainCamera"
+                         or (go.get("name") or "").lower() == "main camera"),
+                "orthographic": cam["orthographic"],
+                "orthographic_size": cam["orthographic_size"],
+                "bg_r": cam["bg_r"],
+                "bg_g": cam["bg_g"],
+                "bg_b": cam["bg_b"],
+            })
+        # Camera-only GOs are not packed as scripted instances.
+        if cam is not None and script is None and sprite is None:
+            continue
         objects.append({
             "name": go.get("name") or "obj",
             "pos": pos,
             "fields": fields,
             "script": script,
             "class": class_name or go.get("name") or "Obj",
+            "sprite": sprite,
         })
-    return objects, lights
+    return objects, lights, cameras
 
 
 def parse_godot_tscn(text):
@@ -286,6 +364,7 @@ def parse_godot_tscn(text):
         objects.append({
             "name": name, "pos": pos, "fields": fields,
             "script": None, "class": class_name,
+            "sprite": None,
         })
     return objects
 
@@ -304,6 +383,7 @@ def parse_blender_json(text):
             "fields": o.get("fields") or {},
             "script": None,
             "class": o.get("class") or o.get("name") or "Obj",
+            "sprite": o.get("sprite"),
         })
     return out
 
@@ -333,7 +413,12 @@ def analyze_script(path, text=None):
     for m in _UNITY_API.finditer(scan):
         token = m.group(0)
         if token.startswith("AddComponent"):
-            apis.add("AddComponent<Light>")
+            if "Light" in token:
+                apis.add("AddComponent<Light>")
+            elif "Camera" in token:
+                apis.add("AddComponent<Camera>")
+            elif "SpriteRenderer" in token:
+                apis.add("AddComponent<SpriteRenderer>")
         else:
             apis.add(token)
     if "transform.position" in scan:
@@ -706,6 +791,14 @@ def emit_engine(plan, analyses, used_apis):
         p("extern float RenderSettings_ambient_r;")
         p("extern float RenderSettings_ambient_g;")
         p("extern float RenderSettings_ambient_b;")
+    if plan.get("camera"):
+        p("extern float Camera_main_pos_x;")
+        p("extern float Camera_main_pos_y;")
+        p("extern float Camera_main_orthographicSize;")
+        p("extern float Camera_main_background_r;")
+        p("extern float Camera_main_background_g;")
+        p("extern float Camera_main_background_b;")
+        p("extern int Camera_main_orthographic;")
     if want_input:
         p("extern float engine_input_axis_Horizontal;")
         p("extern float engine_input_axis_Vertical;")
@@ -884,10 +977,9 @@ def emit_engine(plan, analyses, used_apis):
     p("int engine_class_count(void) { return %d; }" % len(plan["classes"]))
     p("")
 
-    # Draw list for a GLES (or any) host: one coloured quad per instance
-    # that has a packed position. Colours are a stable hash of the class
-    # name so a scene does not need hand-wired materials.
-    p("/* ---- draw list (see engine_draw.h) ---- */")
+    # Draw list: authored SpriteRenderer only — never invent visuals for
+    # bare GameObjects / MonoBehaviours.
+    p("/* ---- draw list (authored SpriteRenderer only; see engine_draw.h) ---- */")
     p("typedef struct EngineDraw {")
     p("    float x, y, half_w, half_h;")
     p("    float r, g, b;")
@@ -896,24 +988,47 @@ def emit_engine(plan, analyses, used_apis):
     p("int engine_collect_draws(EngineDraw *out, int max) {")
     p("    int n = 0;")
     p("    if (!out || max < 1) return 0;")
+    any_sprite = False
     for cname, cl in sorted(plan["classes"].items()):
         idn = _c_ident(cname)
         if not _class_has_position(cl):
             continue
-        r, g, b = _class_rgb(cname)
-        p("    {")
-        p("        int i;")
-        p("        for (i = 0; i < _%s_inst_count && n < max; i = i + 1) {" % idn)
-        p("            out[n].x = %s_get_pos_x((unsigned)i);" % idn)
-        p("            out[n].y = %s_get_pos_y((unsigned)i);" % idn)
-        p("            out[n].half_w = 0.2f;")
-        p("            out[n].half_h = 0.2f;")
-        p("            out[n].r = %sf;" % repr(r))
-        p("            out[n].g = %sf;" % repr(g))
-        p("            out[n].b = %sf;" % repr(b))
+        spr_idx = []
+        for i, o in enumerate(cl["instances"]):
+            sp = o.get("sprite")
+            if sp and sp.get("enabled", 1):
+                spr_idx.append((i, sp))
+        if not spr_idx:
+            continue
+        any_sprite = True
+        p("    { /* %s SpriteRenderer */" % idn)
+        p("        static const float _spr_r[] = { %s };" % ", ".join(
+            "%sf" % repr(float(sp["r"])) for _i, sp in spr_idx))
+        p("        static const float _spr_g[] = { %s };" % ", ".join(
+            "%sf" % repr(float(sp["g"])) for _i, sp in spr_idx))
+        p("        static const float _spr_b[] = { %s };" % ", ".join(
+            "%sf" % repr(float(sp["b"])) for _i, sp in spr_idx))
+        p("        static const float _spr_hw[] = { %s };" % ", ".join(
+            "%sf" % repr(float(sp["half_w"])) for _i, sp in spr_idx))
+        p("        static const float _spr_hh[] = { %s };" % ", ".join(
+            "%sf" % repr(float(sp["half_h"])) for _i, sp in spr_idx))
+        p("        static const unsigned _spr_i[] = { %s };" % ", ".join(
+            str(i) for i, _sp in spr_idx))
+        p("        int k;")
+        p("        for (k = 0; k < %d && n < max; k = k + 1) {" % len(spr_idx))
+        p("            unsigned i = _spr_i[k];")
+        p("            out[n].x = %s_get_pos_x(i);" % idn)
+        p("            out[n].y = %s_get_pos_y(i);" % idn)
+        p("            out[n].half_w = _spr_hw[k];")
+        p("            out[n].half_h = _spr_hh[k];")
+        p("            out[n].r = _spr_r[k];")
+        p("            out[n].g = _spr_g[k];")
+        p("            out[n].b = _spr_b[k];")
         p("            n = n + 1;")
         p("        }")
         p("    }")
+    if not any_sprite:
+        p("    /* no authored SpriteRenderers — nothing to draw */")
     p("    return n;")
     p("}")
     p("")
@@ -958,19 +1073,6 @@ def emit_engine(plan, analyses, used_apis):
     p("}")
     p("")
     return "\n".join(lines) + "\n"
-
-
-def _class_rgb(name):
-    """Deterministic saturated colour from a class name (not MiniScene-specific)."""
-    h = 2166136261
-    for ch in name:
-        h ^= ord(ch)
-        h = (h * 16777619) & 0xffffffff
-    # Map hash bits to hue-ish RGB in [0.25, 1.0] so quads are visible on black.
-    r = 0.25 + ((h >> 0) & 255) / 255.0 * 0.75
-    g = 0.25 + ((h >> 8) & 255) / 255.0 * 0.75
-    b = 0.25 + ((h >> 16) & 255) / 255.0 * 0.75
-    return (round(r, 4), round(g, 4), round(b, 4))
 
 
 def emit_engine_draw_h():
@@ -1072,6 +1174,12 @@ def _lower_method_body(body, cl, plan):
                         "RenderSettings_ambient_g")
     text = text.replace("RenderSettings.ambientLight.b",
                         "RenderSettings_ambient_b")
+    text = text.replace("Camera.main.orthographicSize",
+                        "Camera_main_orthographicSize")
+    text = text.replace("Camera.main.transform.position.x",
+                        "Camera_main_pos_x")
+    text = text.replace("Camera.main.transform.position.y",
+                        "Camera_main_pos_y")
     text = re.sub(r"Input\.(GetAxis|GetButton|GetKey)\s*\(",
                   lambda m: "Input_%s(" % m.group(1), text)
     text = re.sub(r"Mathf\.(Abs|Min|Max|Clamp|Lerp|Sin|Cos)\s*\(",
@@ -1183,6 +1291,16 @@ def emit_data(plan, used_apis=None):
         p("float RenderSettings_ambient_r = 0.2f;")
         p("float RenderSettings_ambient_g = 0.2f;")
         p("float RenderSettings_ambient_b = 0.2f;")
+    cam = plan.get("camera")
+    if cam:
+        p("float Camera_main_pos_x = %sf;" % repr(float(cam["pos"][0])))
+        p("float Camera_main_pos_y = %sf;" % repr(float(cam["pos"][1])))
+        p("float Camera_main_orthographicSize = %sf;" % repr(
+            float(cam["orthographic_size"])))
+        p("float Camera_main_background_r = %sf;" % repr(float(cam["bg_r"])))
+        p("float Camera_main_background_g = %sf;" % repr(float(cam["bg_g"])))
+        p("float Camera_main_background_b = %sf;" % repr(float(cam["bg_b"])))
+        p("int Camera_main_orthographic = %d;" % int(cam["orthographic"]))
     if want_input:
         p("float engine_input_axis_Horizontal = 0.f;")
         p("float engine_input_axis_Vertical = 0.f;")
@@ -1291,7 +1409,7 @@ def emit_main():
         "        engine_tick();\n"
         "    n = engine_collect_draws(buf, 256);\n"
         "    printf(\"ticks=60 draws=%d\\n\", n);\n"
-        "    return n > 0 ? 0 : 1;\n"
+        "    return 0; /* draws may be 0 when no SpriteRenderer */\n"
         "}\n"
     )
 
@@ -1339,11 +1457,13 @@ def load_project(root):
     guids = _guid_map(root)
     objects = []
     lights = []
+    cameras = []
     for path in _walk_files(root, (".unity",)):
-        objs, scene_lights = parse_unity_yaml(
+        objs, scene_lights, scene_cams = parse_unity_yaml(
             _read(path), guid_to_script=guids)
         objects.extend(objs)
         lights.extend(scene_lights)
+        cameras.extend(scene_cams)
     for path in _walk_files(root, (".tscn",)):
         objects.extend(parse_godot_tscn(_read(path)))
     for path in _walk_files(root, (".json",)):
@@ -1378,7 +1498,7 @@ def load_project(root):
         raise PackError(
             "no scene objects found under %s "
             "(looked for .unity / .tscn / blender_pack.json)" % root)
-    return objects, analyses, lights
+    return objects, analyses, lights, cameras
 
 
 def emit_soa_positions_glsl(plan):
@@ -1428,13 +1548,17 @@ def emit_soa_positions_glsl(plan):
 
 
 def pack(root, outdir, soa=False, soa_vec4=False):
-    objects, analyses, lights = load_project(root)
+    objects, analyses, lights, cameras = load_project(root)
     used_apis = set()
     for a in analyses:
         used_apis |= a["apis"]
     for api, reason in sorted(_REFUSED_API.items()):
         if api in used_apis:
             raise PackError("%s: %s" % (api, reason))
+    if "Camera.main" in used_apis and not cameras:
+        raise PackError(
+            "Camera.main: no Camera in the scene — unity_pack does not invent "
+            "a default camera. Add an authored Camera (tag MainCamera).")
     plan = plan_layouts(objects, analyses)
     if soa or soa_vec4:
         plan = apply_soa_layout(plan, vec4=bool(soa_vec4))
@@ -1444,6 +1568,15 @@ def pack(root, outdir, soa=False, soa_vec4=False):
         plan["soa_vec4"] = False
     plan["lights"] = list(lights)
     plan["light_count"] = len(lights)
+    main_cam = None
+    for c in cameras:
+        if c.get("main"):
+            main_cam = c
+            break
+    if main_cam is None and cameras:
+        main_cam = cameras[0]
+    plan["camera"] = main_cam
+    plan["cameras"] = list(cameras)
     os.makedirs(outdir, exist_ok=True)
     engine = emit_engine(plan, analyses, used_apis)
     data = emit_data(plan, used_apis)
