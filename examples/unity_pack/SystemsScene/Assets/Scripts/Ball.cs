@@ -1,6 +1,7 @@
 using UnityEngine;
 
 /* Physics subset: FixedUpdate + Physics2D.gravity on float velocity. */
+[Shared]
 public class Ball : MonoBehaviour {
     public float velX;
     public float velY;

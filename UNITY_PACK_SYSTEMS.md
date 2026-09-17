@@ -10,17 +10,43 @@ them; calling invent-requiring APIs today is a hard `PackError`.
 What *is* lowered: APIs and methods on the MonoBehaviours / scene
 instances that are already placed.
 
-## Input (Input Manager, host-fed)
+## Input (host-fed)
 
 | Script uses | Emitted |
 |-------------|---------|
 | `Input.GetAxis("Horizontal"\|"Vertical")` | Host floats `engine_input_axis_*` |
 | `Input.GetButton("Jump")` | Host int `engine_input_button_Jump` |
 | `Input.GetKey("a")` | Host table `engine_input_key[256]` |
+| `Keyboard.current` | Non-NULL when `engine_keyboard_connected` |
+| `Keyboard.current.<name>Key.isPressed` | Host int `engine_keyboard_<name>` |
 
-Legacy Input Manager only. New Input System `InputAction` /
-`Keyboard.current` / `Gamepad.current` are refused (would invent action
-maps / device graphs).
+Legacy Input Manager and Input System `Keyboard.current` (connected
+device + key state). Bare `Keyboard` needs `using UnityEngine.InputSystem;`
+or `UnityEngine.InputSystem.Keyboard` — no invented global alias.
+`InputAction` maps and `Gamepad.current` are still refused (would invent
+action maps / device graphs).
+
+## Logging (player log)
+
+| Script uses | Emitted |
+|-------------|---------|
+| `Debug.Log(msg)` / `print(msg)` | Unity **Player.log** path + newline |
+| `-logFile path` / `-logFile -` | `engine_apply_argv` → file or **stdout** |
+| `System.Console.WriteLine(msg)` | **stdout** (terminal), not Player.log |
+
+Default log path matches Unity standalone (from `ProjectSettings`
+`companyName` / `productName`, else `DefaultCompany` / project folder):
+
+| OS | Path |
+|----|------|
+| Linux | `~/.config/unity3d/<company>/<product>/Player.log` |
+| macOS | `~/Library/Logs/<company>/<product>/Player.log` |
+| Windows | `%USERPROFILE%\AppData\LocalLow\<company>\<product>\Player.log` |
+
+Not the process cwd. Terminal output needs `-logFile -` or
+`System.Console.WriteLine` (`using System;` or FQN). Optional `Debug.Log`
+context arg ignored. `engine_console_log_path()` mirrors
+`Application.consoleLogPath`. `Start` runs once before first `Update`.
 
 ## Animation (script motion)
 
@@ -89,7 +115,7 @@ components.
 |-------------|-------------|
 | `ParticleSystem.Emit` | Needs a ParticleSystem; packer will not invent a pool |
 | `AnimationCurve.Evaluate` | Needs authored curves; packer will not invent keyframes |
-| `InputAction` / `Keyboard.current` | Needs Input System assets / runtime |
+| `InputAction` / `Gamepad.current` | Needs Input System assets / runtime |
 | `UnityEngine.UI` / `Canvas` | Needs authored UI hierarchy |
 | `AddComponent<Light>` | Light must already be on a scene GameObject |
 | `AddComponent<Camera>` / `SpriteRenderer` | Must be authored; no invent-draw |
