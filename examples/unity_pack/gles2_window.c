@@ -296,10 +296,12 @@ static void frame(GLFWwindow *win)
     glfwPollEvents();
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
     GLFWwindow *win;
     double prev, now;
+
+    engine_apply_argv(argc, argv);
 
     if (!glfwInit()) {
         fprintf(stderr, "glfwInit failed\n");

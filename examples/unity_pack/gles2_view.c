@@ -376,6 +376,8 @@ int main(int argc, char **argv)
     GLuint prog;
     int t;
 
+    engine_apply_argv(argc, argv);
+
     if (!init_egl())
         return 1;
     if (!init_fbo())
