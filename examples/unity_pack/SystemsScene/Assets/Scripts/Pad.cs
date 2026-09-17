@@ -21,5 +21,6 @@ public class Pad : MonoBehaviour
 			move ++;
 		transform.position += new Vector2(move * speed * Time.deltaTime, 0);
 		print(move);
+		System.Console.WriteLine("" + Mathf.Lerp(0, 99, .5f));
 	}
 }

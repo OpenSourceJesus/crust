@@ -29,7 +29,10 @@
 
 float Camera_main_pos_x __attribute__((weak)) = 0.f;
 float Camera_main_pos_y __attribute__((weak)) = 0.f;
+float Camera_main_pos_z __attribute__((weak)) = -10.f;
 float Camera_main_orthographicSize __attribute__((weak)) = 3.f;
+float Camera_main_nearClipPlane __attribute__((weak)) = 0.3f;
+float Camera_main_farClipPlane __attribute__((weak)) = 1000.f;
 float Camera_main_background_r __attribute__((weak)) = 0.f;
 float Camera_main_background_g __attribute__((weak)) = 0.f;
 float Camera_main_background_b __attribute__((weak)) = 0.f;
@@ -110,22 +113,32 @@ static void emit_vert(int *ni, float x, float y, float r, float g, float b,
     *ni = i + VERT_STRIDE;
 }
 
-/* Expand one axis-aligned sprite into two triangles in NDC. */
+/* Expand one sprite into two triangles in NDC (honours m_LocalRotation Z). */
 static void emit_quad(int *ni, const EngineDraw *d)
 {
-    float x0 = world_to_ndc_x(d->x - d->half_w);
-    float x1 = world_to_ndc_x(d->x + d->half_w);
-    float y0 = world_to_ndc_y(d->y - d->half_h);
-    float y1 = world_to_ndc_y(d->y + d->half_h);
+    float hw = d->half_w, hh = d->half_h;
+    float c = d->cos_z, s = d->sin_z;
     float r = d->r, g = d->g, b = d->b;
+    float lx[4] = {-hw, hw, -hw, hw};
+    float ly[4] = {-hh, -hh, hh, hh};
+    float u[4] = {0.f, 1.f, 0.f, 1.f};
+    float v[4] = {0.f, 0.f, 1.f, 1.f};
+    float nx[4], ny[4];
+    int i;
 
-    emit_vert(ni, x0, y0, r, g, b, 0.f, 0.f);
-    emit_vert(ni, x1, y0, r, g, b, 1.f, 0.f);
-    emit_vert(ni, x0, y1, r, g, b, 0.f, 1.f);
+    for (i = 0; i < 4; i = i + 1) {
+        float wx = d->x + c * lx[i] - s * ly[i];
+        float wy = d->y + s * lx[i] + c * ly[i];
+        nx[i] = world_to_ndc_x(wx);
+        ny[i] = world_to_ndc_y(wy);
+    }
+    emit_vert(ni, nx[0], ny[0], r, g, b, u[0], v[0]);
+    emit_vert(ni, nx[1], ny[1], r, g, b, u[1], v[1]);
+    emit_vert(ni, nx[2], ny[2], r, g, b, u[2], v[2]);
 
-    emit_vert(ni, x1, y0, r, g, b, 1.f, 0.f);
-    emit_vert(ni, x1, y1, r, g, b, 1.f, 1.f);
-    emit_vert(ni, x0, y1, r, g, b, 0.f, 1.f);
+    emit_vert(ni, nx[1], ny[1], r, g, b, u[1], v[1]);
+    emit_vert(ni, nx[3], ny[3], r, g, b, u[3], v[3]);
+    emit_vert(ni, nx[2], ny[2], r, g, b, u[2], v[2]);
 }
 
 static GLuint compile_stage(GLenum type, const char *src, const char *what)

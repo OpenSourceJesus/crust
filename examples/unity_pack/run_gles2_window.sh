@@ -3,6 +3,7 @@
 #
 #     ./examples/unity_pack/run_gles2_window.sh
 #     ./examples/unity_pack/run_gles2_window.sh --soa
+#     SCENE=/path/to/project ./examples/unity_pack/run_gles2_window.sh
 #
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -33,9 +34,13 @@ if ! pkg-config --exists glfw3; then
 fi
 
 mkdir -p "$OUT"
-python3 "$ROOT/tools/unity_pack.py" "$SCENE" -o "$OUT" "${SOA[@]}"
+echo "== packing $SCENE → $OUT =="
+PYTHONUNBUFFERED=1 python3 -u "$ROOT/tools/unity_pack.py" "$SCENE" -o "$OUT" "${SOA[@]}"
+echo "== compiling engine.c (-O3) ($(wc -c < "$OUT/engine.c") bytes) =="
 "$CC" -O3 -c -o "$OUT/engine.o" "$OUT/engine.c"
+echo "== compiling data.c (-O0) ($(wc -c < "$OUT/data.c") bytes) =="
 "$CC" -O0 -c -o "$OUT/data.o" "$OUT/data.c"
+echo "== linking window =="
 "$CC" -O2 -o "$OUT/window" "$VIEW" "$OUT/engine.o" "$OUT/data.o" \
     -I "$OUT" $(pkg-config --cflags --libs glfw3) -lGLESv2 -lm
 

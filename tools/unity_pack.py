@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import math
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -29,6 +30,12 @@ class PackError(Exception):
     def __init__(self, message):
         Exception.__init__(self, message)
         self.message = message
+
+
+def _progress(msg):
+    """Incremental status for long packs (large scenes / many PNGs)."""
+    sys.stderr.write("unity_pack: %s\n" % msg)
+    sys.stderr.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -227,10 +234,17 @@ def _read(path):
 
 def _walk_files(root, exts):
     out = []
+    n_dirs = 0
     for dirpath, dirnames, names in os.walk(root):
         dirnames[:] = [d for d in dirnames
                        if d not in (".git", "Library", "Temp", "obj",
-                                    "graphify-out", "__pycache__")]
+                                    "Builds", "Logs", "Build",
+                                    "graphify-out", "__pycache__",
+                                    "node_modules")]
+        n_dirs += 1
+        if n_dirs % 500 == 0:
+            _progress("  walked %d dir(s), %d match(es) so far"
+                       % (n_dirs, len(out)))
         for n in names:
             if any(n.endswith(e) for e in exts):
                 out.append(os.path.join(dirpath, n))
@@ -238,10 +252,25 @@ def _walk_files(root, exts):
     return out
 
 
-def _guid_map(root):
-    """Unity .meta `guid:` next to a .cs file → script path."""
+def _guid_map(root, asset_guids=None):
+    """Unity .meta `guid:` next to a .cs file → script path.
+
+    If *asset_guids* is provided (full guid→path map), derive script guids
+    from it without a second tree walk.
+    """
     out = {}
-    for meta in _walk_files(root, (".cs.meta",)):
+    if asset_guids is not None:
+        for g, path in asset_guids.items():
+            if path.lower().endswith(".cs"):
+                out[g] = path
+        _progress("script metas from asset map: %d" % len(out))
+        return out
+    _progress("walking project tree for .cs.meta files")
+    metas = list(_walk_files(root, (".cs.meta",)))
+    _progress("indexing %d script .meta file(s)" % len(metas))
+    for i, meta in enumerate(metas):
+        if metas and ((i + 1) % 50 == 0 or i + 1 == len(metas)):
+            _progress("  script metas %d/%d" % (i + 1, len(metas)))
         text = _read(meta)
         m = re.search(r"(?m)^guid:\s*([0-9a-fA-F]+)\s*$", text)
         if not m:
@@ -254,7 +283,12 @@ def _guid_map(root):
 def _asset_guid_map(root):
     """Any Unity .meta guid → asset path (scripts, textures, …)."""
     out = {}
-    for meta in _walk_files(root, (".meta",)):
+    _progress("walking project tree for .meta files")
+    metas = list(_walk_files(root, (".meta",)))
+    _progress("indexing %d .meta file(s)" % len(metas))
+    for i, meta in enumerate(metas):
+        if metas and ((i + 1) % 200 == 0 or i + 1 == len(metas)):
+            _progress("  asset metas %d/%d" % (i + 1, len(metas)))
         text = _read(meta)
         m = re.search(r"(?m)^guid:\s*([0-9a-fA-F]+)\s*$", text)
         if not m:
@@ -386,12 +420,99 @@ def _pixels_per_unit(asset_path):
     return v if v > 0.0 else 100.0
 
 
+def _quat_rotate_vec(qx, qy, qz, qw, vx, vy, vz):
+    """Apply Unity quaternion (x,y,z,w) to a vector."""
+    tx = 2.0 * (qy * vz - qz * vy)
+    ty = 2.0 * (qz * vx - qx * vz)
+    tz = 2.0 * (qx * vy - qy * vx)
+    return (
+        vx + qw * tx + (qy * tz - qz * ty),
+        vy + qw * ty + (qz * tx - qx * tz),
+        vz + qw * tz + (qx * ty - qy * tx),
+    )
+
+
+def _quat_mul(a, b):
+    """Hamilton product a*b for Unity quaternions (x,y,z,w)."""
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return (
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    )
+
+
+def _quat_z_rad(qx, qy, qz, qw):
+    """Planar angle (radians) of local +X after *rot* — SpriteRenderer Z spin."""
+    rx, ry, _rz = _quat_rotate_vec(qx, qy, qz, qw, 1.0, 0.0, 0.0)
+    return math.atan2(ry, rx)
+
+
+def _resolve_world_trs(xf_id, by_id, cache=None, stack=None):
+    """Compose local TRS up m_Father / m_TransformParent into world TRS."""
+    if cache is None:
+        cache = {}
+    if stack is None:
+        stack = set()
+    xf_id = str(xf_id)
+    if xf_id in cache:
+        return cache[xf_id]
+    xf = by_id.get(xf_id)
+    if not xf:
+        ident = ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0), (1.0, 1.0, 1.0))
+        cache[xf_id] = ident
+        return ident
+    if xf_id in stack:
+        # Cycle — treat as root local.
+        pos = xf.get("pos") or (0.0, 0.0, 0.0)
+        rot = xf.get("rot") or (0.0, 0.0, 0.0, 1.0)
+        scale = xf.get("scale") or (1.0, 1.0, 1.0)
+        out = (pos, rot, scale)
+        cache[xf_id] = out
+        return out
+    stack.add(xf_id)
+    pos = xf.get("pos") or (0.0, 0.0, 0.0)
+    rot = xf.get("rot") or (0.0, 0.0, 0.0, 1.0)
+    scale = xf.get("scale") or (1.0, 1.0, 1.0)
+    father = xf.get("father_id")
+    if not father or father == "0" or father not in by_id:
+        out = (pos, rot, scale)
+    else:
+        pp, pr, ps = _resolve_world_trs(father, by_id, cache, stack)
+        lx = float(pos[0]) * float(ps[0])
+        ly = float(pos[1]) * float(ps[1])
+        lz = float(pos[2]) * float(ps[2])
+        wx, wy, wz = _quat_rotate_vec(
+            pr[0], pr[1], pr[2], pr[3], lx, ly, lz)
+        out = (
+            (float(pp[0]) + wx, float(pp[1]) + wy, float(pp[2]) + wz),
+            _quat_mul(pr, rot),
+            (float(ps[0]) * float(scale[0]),
+             float(ps[1]) * float(scale[1]),
+             float(ps[2]) * float(scale[2])),
+        )
+    stack.discard(xf_id)
+    cache[xf_id] = out
+    return out
+
+
 def _attach_sprite_textures(objects, asset_guids):
     """Load PNG pixels for each SpriteRenderer that references a project sprite.
 
     World half-extents follow Unity: (pixels / pixelsPerUnit) * scale / 2.
+    PNG decode is cached by path so shared sprites are not re-decoded.
     """
-    for o in objects:
+    todo = [o for o in objects if o.get("sprite")]
+    n = len(todo)
+    cache = {}  # path -> (w, h, rgba, ppu) or None if unloadable
+    if n:
+        _progress("loading sprites for %d SpriteRenderer(s)" % n)
+    for i, o in enumerate(todo):
+        if n >= 8 and ((i + 1) % 100 == 0 or i + 1 == n):
+            _progress("  sprites %d/%d (%d unique PNG(s))" % (
+                i + 1, n, len(cache)))
         sp = o.get("sprite")
         if not sp:
             continue
@@ -399,15 +520,17 @@ def _attach_sprite_textures(objects, asset_guids):
         if not path or not path.lower().endswith(".png"):
             o["sprite"] = None
             continue
-        try:
-            w, h, rgba = _load_png_rgba(path)
-        except PackError:
+        if path not in cache:
+            try:
+                w, h, rgba = _load_png_rgba(path)
+                cache[path] = (w, h, rgba, _pixels_per_unit(path))
+            except (PackError, IOError):
+                cache[path] = None
+        hit = cache[path]
+        if hit is None:
             o["sprite"] = None
             continue
-        except IOError:
-            o["sprite"] = None
-            continue
-        ppu = _pixels_per_unit(path)
+        w, h, rgba, ppu = hit
         sx = abs(float(sp.get("scale_x", 1.0)))
         sy = abs(float(sp.get("scale_y", 1.0)))
         sp["tex_path"] = path
@@ -468,11 +591,14 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         file_id = hm.group(2)
         kind = None
         km = re.search(
-            r"(?m)^(GameObject|Transform|MonoBehaviour|PrefabInstance|"
-            r"Light|Camera|SpriteRenderer|Rigidbody2D|Rigidbody):",
+            r"(?m)^(GameObject|Transform|RectTransform|MonoBehaviour|"
+            r"PrefabInstance|Light|Camera|SpriteRenderer|Rigidbody2D|"
+            r"Rigidbody):",
             block)
         if km:
             kind = km.group(1)
+            if kind == "RectTransform":
+                kind = "Transform"
         elif type_id == "108":
             kind = "Light"
         elif type_id == "20":
@@ -483,6 +609,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             kind = "Rigidbody2D"
         elif type_id == "54":
             kind = "Rigidbody"
+        elif type_id in ("4", "224"):
+            kind = "Transform"
         rec = {"file_id": file_id, "kind": kind, "raw": block, "fields": {}}
         nm = re.search(r"(?m)^\s+m_Name:\s*(.+)$", block)
         if nm:
@@ -502,6 +630,63 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         if sc:
             rec["scale"] = (float(sc.group(1)), float(sc.group(2)),
                             float(sc.group(3)))
+        rot = re.search(
+            r"m_LocalRotation:\s*\{x:\s*([^,}]+),\s*y:\s*([^,}]+),"
+            r"\s*z:\s*([^,}]+),\s*w:\s*([^}]+)\}", block)
+        if rot:
+            rec["rot"] = (float(rot.group(1)), float(rot.group(2)),
+                          float(rot.group(3)), float(rot.group(4)))
+        # Transform parent: m_Father. PrefabInstance: m_TransformParent.
+        father = re.search(
+            r"(?m)^\s+m_Father:\s*\{fileID:\s*(-?\d+)\}", block)
+        if not father:
+            father = re.search(
+                r"(?m)^\s+m_TransformParent:\s*\{fileID:\s*(-?\d+)\}", block)
+        if father:
+            fid = father.group(1)
+            if fid != "0":
+                rec["father_id"] = fid
+        # PrefabInstance nested form: m_Modification: … m_TransformParent:
+        if kind == "PrefabInstance":
+            tp = re.search(
+                r"(?m)^\s+m_TransformParent:\s*\{fileID:\s*(-?\d+)\}", block)
+            if tp and tp.group(1) != "0":
+                rec["father_id"] = tp.group(1)
+            # Apply common TRS overrides from m_Modifications.
+            def _mod_f(axis_path):
+                m = re.search(
+                    r"propertyPath:\s*%s\s*\n\s*value:\s*([^\n]+)" % axis_path,
+                    block)
+                return float(m.group(1)) if m else None
+            px, py, pz = (_mod_f("m_LocalPosition\\.x"),
+                          _mod_f("m_LocalPosition\\.y"),
+                          _mod_f("m_LocalPosition\\.z"))
+            if px is not None or py is not None or pz is not None:
+                rec["pos"] = (
+                    px if px is not None else 0.0,
+                    py if py is not None else 0.0,
+                    pz if pz is not None else 0.0,
+                )
+            qx, qy, qz, qw = (_mod_f("m_LocalRotation\\.x"),
+                              _mod_f("m_LocalRotation\\.y"),
+                              _mod_f("m_LocalRotation\\.z"),
+                              _mod_f("m_LocalRotation\\.w"))
+            if qw is not None or qx is not None:
+                rec["rot"] = (
+                    qx if qx is not None else 0.0,
+                    qy if qy is not None else 0.0,
+                    qz if qz is not None else 0.0,
+                    qw if qw is not None else 1.0,
+                )
+            sx, sy, sz = (_mod_f("m_LocalScale\\.x"),
+                          _mod_f("m_LocalScale\\.y"),
+                          _mod_f("m_LocalScale\\.z"))
+            if sx is not None or sy is not None or sz is not None:
+                rec["scale"] = (
+                    sx if sx is not None else 1.0,
+                    sy if sy is not None else 1.0,
+                    sz if sz is not None else 1.0,
+                )
         gm = re.search(r"guid:\s*([0-9a-fA-F]+)", block)
         if gm:
             rec["guid"] = gm.group(1).lower()
@@ -556,6 +741,16 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             bg = re.search(
                 r"m_BackGroundColor:\s*\{r:\s*([^,}]+),\s*g:\s*([^,}]+),"
                 r"\s*b:\s*([^,}]+)", block)
+            near = re.search(
+                r"(?m)^\s+near clip plane:\s*([0-9.eE+-]+)", block)
+            if not near:
+                near = re.search(
+                    r"(?m)^\s+m_NearClipPlane:\s*([0-9.eE+-]+)", block)
+            far = re.search(
+                r"(?m)^\s+far clip plane:\s*([0-9.eE+-]+)", block)
+            if not far:
+                far = re.search(
+                    r"(?m)^\s+m_FarClipPlane:\s*([0-9.eE+-]+)", block)
             rec["camera"] = {
                 "orthographic": int(ortho.group(1)) if ortho else 1,
                 "orthographic_size": (
@@ -563,6 +758,9 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "bg_r": float(bg.group(1)) if bg else 0.05,
                 "bg_g": float(bg.group(2)) if bg else 0.05,
                 "bg_b": float(bg.group(3)) if bg else 0.08,
+                # Unity defaults when YAML omits clip planes.
+                "near_clip": float(near.group(1)) if near else 0.3,
+                "far_clip": float(far.group(1)) if far else 1000.0,
             }
         if kind == "Rigidbody2D":
             bt = re.search(r"(?m)^\s+m_BodyType:\s*(\d+)", block)
@@ -605,6 +803,27 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             }
         by_id[file_id] = rec
 
+    # PrefabInstance.m_TransformParent applies to stripped Transforms that
+    # reference the instance (Unity does not repeat m_Father on stripped).
+    for rec in by_id.values():
+        if rec.get("kind") != "Transform" or rec.get("father_id"):
+            continue
+        pm = re.search(
+            r"(?m)^\s+m_PrefabInstance:\s*\{fileID:\s*(\d+)\}",
+            rec.get("raw") or "")
+        if not pm:
+            continue
+        pref = by_id.get(pm.group(1))
+        if not pref or pref.get("kind") != "PrefabInstance":
+            continue
+        if pref.get("father_id"):
+            rec["father_id"] = pref["father_id"]
+        for key in ("pos", "rot", "scale"):
+            if key not in rec and key in pref:
+                rec[key] = pref[key]
+
+    world_cache = {}
+
     # Join MonoBehaviour + Transform + SpriteRenderer onto the GameObject.
     gos = [r for r in by_id.values() if r.get("kind") == "GameObject"]
     for go in gos:
@@ -614,6 +833,11 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 kids.append(by_id[mid])
         pos = (0.0, 0.0, 0.0)
         scale = (1.0, 1.0, 1.0)
+        rot = (0.0, 0.0, 0.0, 1.0)
+        local_pos = pos
+        local_rot = rot
+        local_scale = scale
+        xf = None
         script = None
         fields = {}
         sprite = None
@@ -621,10 +845,14 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         rb2d = None
         rb3d = None
         for k in kids:
+            if k.get("kind") == "Transform":
+                xf = k
             if k.get("pos"):
                 pos = k["pos"]
             if k.get("scale"):
                 scale = k["scale"]
+            if k.get("rot"):
+                rot = k["rot"]
             if k.get("kind") == "MonoBehaviour":
                 fields.update(k.get("fields") or {})
                 g = k.get("guid")
@@ -638,10 +866,19 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 rb2d = dict(k["rigidbody2d"])
             if k.get("kind") == "Rigidbody" and k.get("rigidbody"):
                 rb3d = dict(k["rigidbody"])
+        local_pos, local_rot, local_scale = pos, rot, scale
+        father_id = xf.get("father_id") if xf else None
+        if xf is not None:
+            pos, rot, scale = _resolve_world_trs(
+                xf["file_id"], by_id, world_cache)
         if sprite and sprite.get("enabled", 1) and sprite.get("has_sprite"):
             # Extent filled after PNG load via pixels / pixelsPerUnit * scale.
             sprite["scale_x"] = abs(float(scale[0]))
             sprite["scale_y"] = abs(float(scale[1]))
+            rz = _quat_z_rad(rot[0], rot[1], rot[2], rot[3])
+            sprite["rot_z"] = rz
+            sprite["cos_z"] = math.cos(rz)
+            sprite["sin_z"] = math.sin(rz)
         else:
             sprite = None
         class_name = None
@@ -651,6 +888,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             cameras.append({
                 "name": go.get("name") or "Camera",
                 "pos": pos,
+                "rot": rot,
                 "main": (go.get("tag") == "MainCamera"
                          or (go.get("name") or "").lower() == "main camera"),
                 "orthographic": cam["orthographic"],
@@ -658,13 +896,25 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "bg_r": cam["bg_r"],
                 "bg_g": cam["bg_g"],
                 "bg_b": cam["bg_b"],
+                "near_clip": cam["near_clip"],
+                "far_clip": cam["far_clip"],
             })
         # Camera-only GOs are not packed as scripted instances.
         if cam is not None and script is None and sprite is None and not rb2d and not rb3d:
             continue
+        has_mb = any(k.get("kind") == "MonoBehaviour" for k in kids)
+        # Transform-only parents (e.g. Rig) are hierarchy nodes, not instances.
+        if (script is None and sprite is None and not rb2d and not rb3d
+                and cam is None and not has_mb):
+            continue
         objects.append({
             "name": go.get("name") or "obj",
             "pos": pos,
+            "rot": rot,
+            "local_pos": local_pos,
+            "local_rot": local_rot,
+            "local_scale": local_scale,
+            "father_id": father_id,
             "fields": fields,
             "script": script,
             "class": class_name or go.get("name") or "Obj",
@@ -1126,6 +1376,9 @@ def analyze_script(path, text=None):
         apis.add("Debug.Log")
     if re.search(r"(?<![\w.])print\s*\(", scan):
         apis.add("print")
+    # C# string + value must not become C pointer arithmetic.
+    if re.search(r'"\s*\+', scan):
+        apis.add("string.+")
     has_system = bool(re.search(r"using\s+System\b", scan))
     apis.discard("Console.WriteLine")  # may have matched via _UNITY_API
     if re.search(r"System\.Console\.WriteLine\s*\(", scan):
@@ -1515,6 +1768,7 @@ def emit_engine(plan, analyses, used_apis):
     want_ambient = "RenderSettings.ambientLight" in used_apis
     want_log = bool(used_apis & {"Debug.Log", "print"})
     want_console = "Console.WriteLine" in used_apis
+    want_str_plus = "string.+" in used_apis
     want_find = "GameObject.Find" in used_apis
     want_getcomponent = "GetComponent" in used_apis
     want_go_tables = (
@@ -1529,7 +1783,7 @@ def emit_engine(plan, analyses, used_apis):
         p("#include <math.h>")
     if want_input or want_log or want_find:
         p("#include <string.h>")
-    if want_log or want_console:
+    if want_log or want_console or want_str_plus:
         p("#include <stdio.h>")
     if want_log:
         p("#include <stdlib.h>")
@@ -1569,7 +1823,10 @@ def emit_engine(plan, analyses, used_apis):
     if plan.get("camera"):
         p("extern float Camera_main_pos_x;")
         p("extern float Camera_main_pos_y;")
+        p("extern float Camera_main_pos_z;")
         p("extern float Camera_main_orthographicSize;")
+        p("extern float Camera_main_nearClipPlane;")
+        p("extern float Camera_main_farClipPlane;")
         p("extern float Camera_main_background_r;")
         p("extern float Camera_main_background_g;")
         p("extern float Camera_main_background_b;")
@@ -1691,6 +1948,32 @@ def emit_engine(plan, analyses, used_apis):
               % key)
             p("}")
             p("")
+    if want_str_plus:
+        # C# "" + 1 → "1"; C's ""+1 is pointer arithmetic (often prints garbage).
+        p("/* C# string + value (not C pointer arithmetic) */")
+        p("static char _engine_str_buf[128];")
+        p("static const char *_str_plus_i(const char *a, int b) {")
+        p("    snprintf(_engine_str_buf, sizeof _engine_str_buf, \"%s%d\",")
+        p("             a ? a : \"\", b);")
+        p("    return _engine_str_buf;")
+        p("}")
+        p("static const char *_str_plus_f(const char *a, float b) {")
+        p("    snprintf(_engine_str_buf, sizeof _engine_str_buf, \"%s%g\",")
+        p("             a ? a : \"\", (double)b);")
+        p("    return _engine_str_buf;")
+        p("}")
+        p("static const char *_str_plus_s(const char *a, const char *b) {")
+        p("    snprintf(_engine_str_buf, sizeof _engine_str_buf, \"%s%s\",")
+        p("             a ? a : \"\", b ? b : \"\");")
+        p("    return _engine_str_buf;")
+        p("}")
+        p("#define _str_plus(a, b) _Generic((b), \\")
+        p("    int: _str_plus_i, \\")
+        p("    float: _str_plus_f, \\")
+        p("    double: _str_plus_f, \\")
+        p("    default: _str_plus_s \\")
+        p(")((a), (b))")
+        p("")
     if want_log:
         company = plan.get("company_name") or "DefaultCompany"
         product = plan.get("product_name") or "Player"
@@ -2148,6 +2431,7 @@ def emit_engine(plan, analyses, used_apis):
     p("/* ---- draw list (SpriteRenderer + texture; see engine_draw.h) ---- */")
     p("typedef struct EngineDraw {")
     p("    float x, y, half_w, half_h;")
+    p("    float cos_z, sin_z; /* m_LocalRotation around Z */")
     p("    float r, g, b;")
     p("    int tex; /* index into engine_texture_*; -1 = none */")
     p("} EngineDraw;")
@@ -2193,6 +2477,7 @@ def emit_engine(plan, analyses, used_apis):
     p("    int n = 0;")
     p("    if (!out || max < 1) return 0;")
     any_sprite = False
+    has_cam = bool(plan.get("camera"))
     for cname, cl in sorted(plan["classes"].items()):
         idn = _c_ident(cname)
         if not _class_has_position(cl):
@@ -2216,6 +2501,10 @@ def emit_engine(plan, analyses, used_apis):
             "%sf" % repr(float(sp["half_w"])) for _i, sp in spr_idx))
         p("        static const float _spr_hh[] = { %s };" % ", ".join(
             "%sf" % repr(float(sp["half_h"])) for _i, sp in spr_idx))
+        p("        static const float _spr_cos[] = { %s };" % ", ".join(
+            "%sf" % repr(float(sp.get("cos_z", 1.0))) for _i, sp in spr_idx))
+        p("        static const float _spr_sin[] = { %s };" % ", ".join(
+            "%sf" % repr(float(sp.get("sin_z", 0.0))) for _i, sp in spr_idx))
         p("        static const int _spr_tex[] = { %s };" % ", ".join(
             str(int(sp["tex_id"])) for _i, sp in spr_idx))
         p("        static const unsigned _spr_i[] = { %s };" % ", ".join(
@@ -2223,10 +2512,24 @@ def emit_engine(plan, analyses, used_apis):
         p("        int k;")
         p("        for (k = 0; k < %d && n < max; k = k + 1) {" % len(spr_idx))
         p("            unsigned i = _spr_i[k];")
+        # Unity cameras look along +Z (identity). Depth = object_z - cam_z.
+        if has_cam:
+            if cl.get("two_d"):
+                p("            float oz = 0.f;")
+            else:
+                p("            float oz = %s_get_pos_z(i);" % idn)
+            p("            {")
+            p("                float depth = oz - Camera_main_pos_z;")
+            p("                if (depth < Camera_main_nearClipPlane"
+              " || depth > Camera_main_farClipPlane)")
+            p("                    continue;")
+            p("            }")
         p("            out[n].x = %s_get_pos_x(i);" % idn)
         p("            out[n].y = %s_get_pos_y(i);" % idn)
         p("            out[n].half_w = _spr_hw[k];")
         p("            out[n].half_h = _spr_hh[k];")
+        p("            out[n].cos_z = _spr_cos[k];")
+        p("            out[n].sin_z = _spr_sin[k];")
         p("            out[n].r = _spr_r[k];")
         p("            out[n].g = _spr_g[k];")
         p("            out[n].b = _spr_b[k];")
@@ -2291,6 +2594,7 @@ def emit_engine_draw_h():
         "\n"
         "typedef struct EngineDraw {\n"
         "    float x, y, half_w, half_h;\n"
+        "    float cos_z, sin_z; /* m_LocalRotation around Z */\n"
         "    float r, g, b;\n"
         "    int tex; /* engine_texture_* index; -1 if none */\n"
         "} EngineDraw;\n"
@@ -2365,6 +2669,105 @@ def _rewrite_new_vector_assigns(text, idn):
     text = re.sub(
         r"transform\.position\s*\+=\s*new\s+Vector3\s*\((.*?)\)\s*;",
         repl_add, text, flags=flags)
+    return text
+
+
+def _skip_c_string(text, i):
+    """Index just past a C/C# string literal starting at text[i] == '\"'."""
+    j = i + 1
+    while j < len(text):
+        if text[j] == "\\":
+            j += 2
+            continue
+        if text[j] == '"':
+            return j + 1
+        j += 1
+    return j
+
+
+def _parse_plus_rhs(text, i):
+    """Scan one + operand starting at *i*; stop at top-level + , ) ;."""
+    while i < len(text) and text[i] in " \t\n\r":
+        i += 1
+    start = i
+    depth = 0
+    while i < len(text):
+        c = text[i]
+        if c == '"':
+            i = _skip_c_string(text, i)
+            continue
+        if c == "'":
+            i += 1
+            if i < len(text) and text[i] == "\\":
+                i += 2
+            elif i < len(text):
+                i += 1
+            if i < len(text) and text[i] == "'":
+                i += 1
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            if depth == 0:
+                break
+            depth -= 1
+        elif c in ",;" and depth == 0:
+            break
+        elif c == "+" and depth == 0:
+            break
+        i += 1
+    return start, i
+
+
+def _rewrite_string_concat(text):
+    """Rewrite C# string + value to _str_plus (C pointer + is wrong).
+
+    Handles `"lit" + expr` and chains via repeated `_str_plus(...) + expr`.
+    """
+    changed = True
+    while changed:
+        changed = False
+        out = []
+        i = 0
+        while i < len(text):
+            left = None
+            left_end = None
+            if text.startswith("_str_plus(", i):
+                depth = 0
+                j = i + len("_str_plus")
+                while j < len(text):
+                    if text[j] == '"':
+                        j = _skip_c_string(text, j)
+                        continue
+                    if text[j] == "(":
+                        depth += 1
+                    elif text[j] == ")":
+                        depth -= 1
+                        if depth == 0:
+                            j += 1
+                            break
+                    j += 1
+                left = text[i:j]
+                left_end = j
+            elif text[i] == '"':
+                j = _skip_c_string(text, i)
+                left = text[i:j]
+                left_end = j
+            if left is not None:
+                k = left_end
+                while k < len(text) and text[k] in " \t\n\r":
+                    k += 1
+                if k < len(text) and text[k] == "+":
+                    rhs_start, rhs_end = _parse_plus_rhs(text, k + 1)
+                    rhs = text[rhs_start:rhs_end].strip()
+                    if rhs:
+                        out.append("_str_plus(%s, (%s))" % (left, rhs))
+                        i = rhs_end
+                        changed = True
+                        continue
+            out.append(text[i])
+            i += 1
+        text = "".join(out)
     return text
 
 
@@ -2478,6 +2881,12 @@ def _lower_method_body(body, cl, plan):
                         "Camera_main_pos_x")
     text = text.replace("Camera.main.transform.position.y",
                         "Camera_main_pos_y")
+    text = text.replace("Camera.main.transform.position.z",
+                        "Camera_main_pos_z")
+    text = text.replace("Camera.main.nearClipPlane",
+                        "Camera_main_nearClipPlane")
+    text = text.replace("Camera.main.farClipPlane",
+                        "Camera_main_farClipPlane")
     text = re.sub(r"Input\.(GetAxis|GetButton|GetKey)\s*\(",
                   lambda m: "Input_%s(" % m.group(1), text)
     # Keyboard.current.<name>Key.isPressed → helpers (null-safe via connected).
@@ -2494,6 +2903,7 @@ def _lower_method_body(body, cl, plan):
     text = _strip_debug_log_context_arg(text)
     text = re.sub(r"System\.Console\.WriteLine\b", "Console_WriteLine", text)
     text = re.sub(r"(?<![\w.])Console\.WriteLine\b", "Console_WriteLine", text)
+    text = _rewrite_string_concat(text)
     # Unity Object.ToString when printing a Find result (name, not index).
     text = _wrap_log_gameobject_tostring(text)
     text = re.sub(r"Mathf\.(Abs|Min|Max|Clamp|Lerp|Sin|Cos)\s*\(",
@@ -2620,8 +3030,13 @@ def emit_data(plan, used_apis=None):
     if cam:
         p("float Camera_main_pos_x = %sf;" % repr(float(cam["pos"][0])))
         p("float Camera_main_pos_y = %sf;" % repr(float(cam["pos"][1])))
+        p("float Camera_main_pos_z = %sf;" % repr(float(cam["pos"][2])))
         p("float Camera_main_orthographicSize = %sf;" % repr(
             float(cam["orthographic_size"])))
+        p("float Camera_main_nearClipPlane = %sf;" % repr(
+            float(cam.get("near_clip", 0.3))))
+        p("float Camera_main_farClipPlane = %sf;" % repr(
+            float(cam.get("far_clip", 1000.0))))
         p("float Camera_main_background_r = %sf;" % repr(float(cam["bg_r"])))
         p("float Camera_main_background_g = %sf;" % repr(float(cam["bg_g"])))
         p("float Camera_main_background_b = %sf;" % repr(float(cam["bg_b"])))
@@ -2841,12 +3256,19 @@ def load_project(root):
     root = os.path.abspath(root)
     if not os.path.isdir(root):
         raise PackError("not a directory: %s" % root)
-    guids = _guid_map(root)
+    _progress("scanning %s" % root)
+    _progress("reading .meta guid maps")
     assets = _asset_guid_map(root)
+    guids = _guid_map(root, asset_guids=assets)
     objects = []
     lights = []
     cameras = []
-    for path in _walk_files(root, (".unity",)):
+    _progress("finding .unity scenes")
+    scenes = list(_walk_files(root, (".unity",)))
+    _progress("parsing %d .unity scene(s)" % len(scenes))
+    for si, path in enumerate(scenes):
+        _progress("  scene %d/%d %s" % (
+            si + 1, len(scenes), os.path.basename(path)))
         objs, scene_lights, scene_cams = parse_unity_yaml(
             _read(path), guid_to_script=guids, asset_guids=assets)
         objects.extend(objs)
@@ -2858,9 +3280,13 @@ def load_project(root):
         if os.path.basename(path) == "blender_pack.json":
             objects.extend(parse_blender_json(_read(path)))
 
-    scripts = _walk_files(root, (".cs",))
-    # Godot / Blender may name a class with no .cs; synthesise an empty one.
-    analyses = [analyze_script(p) for p in scripts]
+    scripts = list(_walk_files(root, (".cs",)))
+    _progress("analyzing %d script(s)" % len(scripts))
+    analyses = []
+    for i, p in enumerate(scripts):
+        if scripts and ((i + 1) % 25 == 0 or i + 1 == len(scripts)):
+            _progress("  scripts %d/%d" % (i + 1, len(scripts)))
+        analyses.append(analyze_script(p))
     have = set()
     for a in analyses:
         for c in a["classes"]:
@@ -2886,6 +3312,8 @@ def load_project(root):
         raise PackError(
             "no scene objects found under %s "
             "(looked for .unity / .tscn / blender_pack.json)" % root)
+    _progress("scene objects=%d lights=%d cameras=%d" % (
+        len(objects), len(lights), len(cameras)))
     _attach_sprite_textures(objects, assets)
     return objects, analyses, lights, cameras
 
@@ -2967,6 +3395,7 @@ def pack(root, outdir, soa=False, soa_vec4=False):
         raise PackError(
             "Camera.main: no Camera in the scene — unity_pack does not invent "
             "a default camera. Add an authored Camera (tag MainCamera).")
+    _progress("planning layouts (%d objects)" % len(objects))
     plan = plan_layouts(objects, analyses)
     if soa or soa_vec4:
         plan = apply_soa_layout(plan, vec4=bool(soa_vec4))
@@ -3002,12 +3431,18 @@ def pack(root, outdir, soa=False, soa_vec4=False):
     plan["go_rigidbody2d"] = go_rb2d
     plan["go_rigidbody"] = go_rb3d
     os.makedirs(outdir, exist_ok=True)
+    _progress("emitting engine.c (%d classes)" % len(plan["classes"]))
     engine = emit_engine(plan, analyses, used_apis)
+    _progress("emitting data.c (%d texture(s))" % len(plan.get("textures") or []))
     data = emit_data(plan, used_apis)
     main_c = emit_main()
+    _progress("validating engine.c through cpprust")
     validate_emitted_c(engine, "engine.c")
+    _progress("validating data.c through cpprust")
     validate_emitted_c(data, "data.c")
+    _progress("validating main.c through cpprust")
     validate_emitted_c(main_c, "main.c")
+    _progress("writing %s" % outdir)
     with open(os.path.join(outdir, "engine.c"), "w") as f:
         f.write(engine)
     with open(os.path.join(outdir, "data.c"), "w") as f:
@@ -3026,6 +3461,7 @@ def pack(root, outdir, soa=False, soa_vec4=False):
             f.write(emit_shader_compiler(plat))
     with open(os.path.join(shdir, "soa_positions.glsl"), "w") as f:
         f.write(emit_soa_positions_glsl(plan))
+    _progress("done")
     return plan
 
 

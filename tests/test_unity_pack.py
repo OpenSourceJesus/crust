@@ -16,6 +16,7 @@ Pins the claims in UNITY_PACK.md:
 from __future__ import annotations
 
 import os
+import math
 import shutil
 import subprocess
 import sys
@@ -342,10 +343,80 @@ class TestSystems(unittest.TestCase):
         self.assertEqual(len(cameras), 1)
         self.assertTrue(cameras[0]["main"])
         self.assertAlmostEqual(cameras[0]["orthographic_size"], 3.0)
+        self.assertAlmostEqual(cameras[0]["pos"][2], -10.0)
+        self.assertAlmostEqual(cameras[0]["near_clip"], 0.3)
+        self.assertAlmostEqual(cameras[0]["far_clip"], 1000.0)
         self.assertNotIn("ParticleSystem.Emit", apis)
         self.assertNotIn("AnimationCurve.Evaluate", apis)
         spr = [o for o in _objs if o.get("sprite")]
         self.assertEqual(len(spr), 3)  # Bouncer, Ball, Pad — not Shade
+        stick = [o for o in _objs if o["name"] == "Stick"][0]
+        self.assertAlmostEqual(stick["sprite"]["rot_z"], math.pi / 4, places=5)
+        self.assertAlmostEqual(stick["sprite"]["cos_z"], math.cos(math.pi / 4),
+                               places=5)
+        self.assertAlmostEqual(stick["rot"][2], 0.3826834, places=5)
+        self.assertAlmostEqual(stick["rot"][3], 0.9238795, places=5)
+        # Rig at (0, 0.5) + local (1.5, 0) → world (1.5, 0.5)
+        self.assertEqual(stick["father_id"], "6002")
+        self.assertAlmostEqual(stick["local_pos"][0], 1.5)
+        self.assertAlmostEqual(stick["local_pos"][1], 0.0)
+        self.assertAlmostEqual(stick["pos"][0], 1.5)
+        self.assertAlmostEqual(stick["pos"][1], 0.5)
+        self.assertEqual(len([o for o in _objs if o["name"] == "Rig"]), 0)
+
+    def test_prefab_m_transform_parent_composes_world(self):
+        """PrefabInstance.m_TransformParent parents stripped Transforms."""
+        text = (
+            "--- !u!1 &1\n"
+            "GameObject:\n"
+            "  m_Name: Anchor\n"
+            "  m_Component:\n"
+            "  - component: {fileID: 2}\n"
+            "--- !u!4 &2\n"
+            "Transform:\n"
+            "  m_GameObject: {fileID: 1}\n"
+            "  m_LocalPosition: {x: 10, y: 0, z: 0}\n"
+            "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+            "  m_Father: {fileID: 0}\n"
+            "--- !u!1001 &50\n"
+            "PrefabInstance:\n"
+            "  m_Modification:\n"
+            "    m_TransformParent: {fileID: 2}\n"
+            "    m_Modifications:\n"
+            "    - target: {fileID: 99, guid: abcd, type: 3}\n"
+            "      propertyPath: m_LocalPosition.x\n"
+            "      value: 3\n"
+            "      objectReference: {fileID: 0}\n"
+            "    - target: {fileID: 99, guid: abcd, type: 3}\n"
+            "      propertyPath: m_LocalPosition.y\n"
+            "      value: 4\n"
+            "      objectReference: {fileID: 0}\n"
+            "    - target: {fileID: 99, guid: abcd, type: 3}\n"
+            "      propertyPath: m_LocalPosition.z\n"
+            "      value: 0\n"
+            "      objectReference: {fileID: 0}\n"
+            "--- !u!1 &60\n"
+            "GameObject:\n"
+            "  m_Name: Nested\n"
+            "  m_Component:\n"
+            "  - component: {fileID: 61}\n"
+            "  - component: {fileID: 62}\n"
+            "--- !u!4 &61 stripped\n"
+            "Transform:\n"
+            "  m_GameObject: {fileID: 60}\n"
+            "  m_PrefabInstance: {fileID: 50}\n"
+            "--- !u!114 &62\n"
+            "MonoBehaviour:\n"
+            "  m_GameObject: {fileID: 60}\n"
+            "  m_Script: {fileID: 11500000, guid: deadbeefdeadbeefdeadbeefdeadbeef}\n"
+        )
+        objs, _lights, _cams = unity_pack.parse_unity_yaml(text)
+        nested = [o for o in objs if o["name"] == "Nested"][0]
+        self.assertEqual(nested["father_id"], "2")
+        self.assertAlmostEqual(nested["local_pos"][0], 3.0)
+        self.assertAlmostEqual(nested["local_pos"][1], 4.0)
+        self.assertAlmostEqual(nested["pos"][0], 13.0)
+        self.assertAlmostEqual(nested["pos"][1], 4.0)
 
     def test_emits_opt_in_stubs_not_invented_components(self):
         d = tempfile.mkdtemp(prefix="upack-sys-")
@@ -374,7 +445,13 @@ class TestSystems(unittest.TestCase):
         self.assertIn("Physics2D_gravity_y", data)
         self.assertIn("_Rigidbody2D_vel_x", data)
         self.assertIn("Camera_main_orthographicSize", data)
+        self.assertIn("Camera_main_pos_z", data)
+        self.assertIn("Camera_main_nearClipPlane", data)
+        self.assertIn("Camera_main_farClipPlane", data)
         self.assertIn("SpriteRenderer", engine)
+        self.assertIn("oz - Camera_main_pos_z", engine)
+        self.assertIn("out[n].cos_z", engine)
+        self.assertIn("_spr_sin", engine)
         self.assertIn("_engine_tex0_rgba", data)
         self.assertIn("engine_texture_rgba", engine)
         self.assertNotIn("ParticleSystem_Emit", engine)
@@ -1053,6 +1130,56 @@ class TestSystems(unittest.TestCase):
         with open(log_path) as f:
             self.assertIn("file", f.read())
 
+    @needs_cc
+    def test_string_plus_int_prints_digits_not_pointer_math(self):
+        """C# \"\" + 1 → \"1\"; must not emit C pointer arithmetic."""
+        root = tempfile.mkdtemp(prefix="upack-strcat-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Talker.cs"), "w") as f:
+            f.write(
+                "using System;\n"
+                "using UnityEngine;\n"
+                "public class Talker : MonoBehaviour {\n"
+                "    public void Start() {\n"
+                "        Console.WriteLine(\"\" + 1);\n"
+                "        Console.WriteLine(\"n=\" + 2);\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Talker.cs.meta"), "w") as f:
+            f.write("guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Talker\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-strcat-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            engine = f.read()
+        self.assertIn("_str_plus", engine)
+        self.assertNotIn('Console_WriteLine("" + 1)', engine)
+        r = subprocess.run(["make", "-C", d], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr or r.stdout)
+        run = subprocess.run([os.path.join(d, "game")],
+                             capture_output=True, text=True, cwd=d)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+        lines = [ln for ln in run.stdout.splitlines() if ln.strip()]
+        self.assertTrue(any(ln == "1" for ln in lines), run.stdout)
+        self.assertTrue(any(ln == "n=2" for ln in lines), run.stdout)
+
     def test_player_identity_from_project_settings(self):
         root = tempfile.mkdtemp(prefix="upack-id-")
         ps = os.path.join(root, "ProjectSettings")
@@ -1189,6 +1316,7 @@ class TestSystemsRuns(unittest.TestCase):
                 "extern float RenderSettings_ambient_r;\n"
                 "extern float _Light_intensity[];\n"
                 "typedef struct { float x, y, half_w, half_h;\n"
+                "                 float cos_z, sin_z;\n"
                 "                 float r, g, b; int tex; } EngineDraw;\n"
                 "int engine_collect_draws(EngineDraw *out, int max);\n"
                 "typedef struct Ball Ball;\n"
@@ -1213,6 +1341,14 @@ class TestSystemsRuns(unittest.TestCase):
                 "  if (_Pad_inst_array[0].pos_x <= x0) return 4;\n"
                 "  if (_Light_intensity[0] < 1.4f) return 5;\n"
                 "  if (n != 3) return 6; /* SpriteRenderer on Bouncer+Ball+Pad */\n"
+                "  { int j; int found = 0;\n"
+                "    for (j = 0; j < n; j = j + 1) {\n"
+                "      if (buf[j].cos_z > 0.7f && buf[j].cos_z < 0.72f\n"
+                "          && buf[j].sin_z > 0.7f && buf[j].sin_z < 0.72f)\n"
+                "        found = 1;\n"
+                "    }\n"
+                "    if (!found) return 7; /* Stick m_LocalRotation 45deg */\n"
+                "  }\n"
                 "  return 0;\n"
                 "}\n"
             )
@@ -1227,6 +1363,50 @@ class TestSystemsRuns(unittest.TestCase):
             capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
         exe = os.path.join(d, "host")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host,
+             os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+
+    def test_camera_positive_z_culls_sprites(self):
+        """Unity looks +Z; camera at +z with sprites at 0 draws nothing."""
+        d = tempfile.mkdtemp(prefix="upack-cam-z-")
+        unity_pack.pack(SYSTEMS, d)
+        host = os.path.join(d, "host_camz.c")
+        with open(host, "w") as f:
+            f.write(
+                "typedef struct { float x, y, half_w, half_h;\n"
+                "                 float cos_z, sin_z;\n"
+                "                 float r, g, b; int tex; } EngineDraw;\n"
+                "int engine_collect_draws(EngineDraw *out, int max);\n"
+                "extern float Camera_main_pos_z;\n"
+                "int main(void) {\n"
+                "  EngineDraw buf[128];\n"
+                "  int n0 = engine_collect_draws(buf, 128);\n"
+                "  if (n0 != 3) return 1;\n"
+                "  Camera_main_pos_z = 10.f;\n"
+                "  int n1 = engine_collect_draws(buf, 128);\n"
+                "  if (n1 != 0) return 2;\n"
+                "  Camera_main_pos_z = -10.f;\n"
+                "  int n2 = engine_collect_draws(buf, 128);\n"
+                "  if (n2 != 3) return 3;\n"
+                "  return 0;\n"
+                "}\n"
+            )
+        r = subprocess.run(
+            [_CC, "-O3", "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(
+            [_CC, "-O0", "-c", "-o", os.path.join(d, "data.o"),
+             os.path.join(d, "data.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        exe = os.path.join(d, "host_camz")
         r = subprocess.run(
             [_CC, "-O2", "-o", exe, host,
              os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],

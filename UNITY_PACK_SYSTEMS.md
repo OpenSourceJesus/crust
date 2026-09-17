@@ -98,16 +98,30 @@ No invented lights. `AddComponent<Light>` is a `PackError`.
 
 | Script / scene uses | Emitted |
 |---------------------|---------|
-| Authored `!u!20` Camera (MainCamera) | `Camera_main_pos_*`, `orthographicSize`, background RGB |
-| `Camera.main.orthographicSize` / `.transform.position` | Reads those globals |
+| Authored `!u!20` Camera (MainCamera) | `Camera_main_pos_*` (incl. **z**), `orthographicSize`, near/far clip, background RGB |
+| `Camera.main.orthographicSize` / `.transform.position` / clip planes | Reads those globals |
 | Authored `!u!212` SpriteRenderer with `m_Sprite` → **project PNG** | Texture + tinted quad in `engine_collect_draws` |
+| Authored `m_LocalRotation` on Transform | Z spin via `EngineDraw.cos_z` / `sin_z` (identity if omitted) |
+| Authored `m_Father` / PrefabInstance `m_TransformParent` | World TRS = parent ∘ local (baked into packed `pos` / sprite spin) |
 
 PNG pixels are packed into `data.c` (`engine_texture_rgba`). Editing the
 referenced sprite and re-packing changes the drawn texels. Tint comes from
 `m_Color`. World size follows Unity:
 `(texels / spritePixelsToUnits) * Transform.scale` (half-extents in
 `engine_collect_draws`). `spritePixelsToUnits` is read from the PNG `.meta`
-(default **100**).
+(default **100**). Sprite quads are rotated in the XY plane from
+`m_LocalRotation` (quaternion → angle of local +X). Child transforms use
+**world** position/rotation/scale after composing the `m_Father` chain
+(PrefabInstance `m_TransformParent` is applied to stripped instance
+transforms). Runtime parent motion is not re-linked yet — hierarchy is
+baked at pack time.
+
+Unity cameras look along **+Z** (identity rotation). `engine_collect_draws`
+keeps a sprite only when
+`nearClipPlane <= (object_z - Camera_main_pos_z) <= farClipPlane`.
+A camera at positive **z** with sprites at **z = 0** therefore draws nothing
+(objects are behind the camera). Clip planes default to Unity's **0.3 / 1000**
+when the YAML omits them.
 
 **No default visuals.** A GameObject with only a Transform / MonoBehaviour
 does **not** appear in `engine_collect_draws`. Hosts clear to the authored
