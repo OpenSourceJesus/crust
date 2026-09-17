@@ -32,6 +32,7 @@ GameObject:
   - component: {fileID: 2002}
   - component: {fileID: 2003}
   - component: {fileID: 2004}
+  - component: {fileID: 2005}
 --- !u!4 &2002
 Transform:
   m_GameObject: {fileID: 2001}
@@ -41,15 +42,19 @@ Transform:
 MonoBehaviour:
   m_GameObject: {fileID: 2001}
   m_Script: {fileID: 11500000, guid: dddddddddddddddddddddddddddddddd}
-  velX: 0.5
-  velY: 0
-  gravityScale: 1
 --- !u!212 &2004
 SpriteRenderer:
   m_GameObject: {fileID: 2001}
   m_Enabled: 1
   m_Sprite: {fileID: 21300000, guid: 0f1e2d3c4b5a69788796a5b4c3d2e1f0, type: 3}
   m_Color: {r: 0.95, g: 0.4, b: 0.35, a: 1}
+--- !u!50 &2005
+Rigidbody2D:
+  m_GameObject: {fileID: 2001}
+  m_BodyType: 0
+  m_Mass: 1
+  m_GravityScale: 1
+  m_LinearVelocity: {x: 0.5, y: 0}
 --- !u!1 &3001
 GameObject:
   m_Name: Stick

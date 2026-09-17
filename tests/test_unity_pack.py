@@ -330,8 +330,6 @@ class TestSystems(unittest.TestCase):
             apis |= a["apis"]
         self.assertIn("Time.time", apis)
         self.assertIn("Mathf.Sin", apis)
-        self.assertIn("Physics2D.gravity", apis)
-        self.assertIn("Time.fixedDeltaTime", apis)
         self.assertIn("Keyboard.current", apis)
         self.assertIn("Debug.Log", apis)
         self.assertIn("print", apis)
@@ -357,7 +355,7 @@ class TestSystems(unittest.TestCase):
         with open(os.path.join(d, "data.c")) as f:
             data = f.read()
         self.assertIn("Mathf_Sin", engine)
-        self.assertIn("Ball_FixedUpdate", engine)
+        self.assertIn("engine_physics_fixed", engine)
         self.assertIn("Time_time = Time_time + Time_deltaTime", engine)
         self.assertIn("Keyboard_current", engine)
         self.assertIn("Keyboard_leftArrowKey_isPressed", engine)
@@ -367,12 +365,14 @@ class TestSystems(unittest.TestCase):
         self.assertIn("GameObject_GetComponent_Bouncer", engine)
         self.assertIn("Bouncer_get_amp", engine)
         self.assertIn("Object_ToString", engine)
+        self.assertIn("GameObject_GetComponent_Rigidbody2D", engine)
         self.assertIn("engine_keyboard_connected", data)
         self.assertIn("engine_keyboard_leftArrow", data)
         self.assertIn("RenderSettings_ambient_r", data)
         self.assertIn("_Light_intensity", data)
         self.assertIn("1.5f", data)
         self.assertIn("Physics2D_gravity_y", data)
+        self.assertIn("_Rigidbody2D_vel_x", data)
         self.assertIn("Camera_main_orthographicSize", data)
         self.assertIn("SpriteRenderer", engine)
         self.assertIn("_engine_tex0_rgba", data)
@@ -436,6 +436,110 @@ class TestSystems(unittest.TestCase):
         with open(os.path.join(d2, "data.c")) as f:
             data2 = f.read()
         self.assertIn("255, 0, 0, 255", data2)
+
+    def test_sprite_world_size_uses_pixels_per_unit(self):
+        """Larger PNG at the same PPU/scale draws a larger half-extent."""
+        root = tempfile.mkdtemp(prefix="upack-ppu-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Mark.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Mark : MonoBehaviour {\n"
+                "    public void Update() { }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Mark.cs.meta"), "w") as f:
+            f.write("guid: dddddddddddddddddddddddddddddddd\n")
+        spr = os.path.join(root, "Assets", "Sprites")
+        os.makedirs(spr)
+        import struct, zlib
+
+        def write_png(path, w, h):
+            def chunk(tag, body):
+                return (struct.pack(">I", len(body)) + tag + body
+                        + struct.pack(">I", zlib.crc32(tag + body) & 0xffffffff))
+            raw = b""
+            for _y in range(h):
+                raw += b"\x00" + (b"\xff\xff\xff\xff" * w)
+            open(path, "wb").write(
+                b"\x89PNG\r\n\x1a\n"
+                + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(raw, 9))
+                + chunk(b"IEND", b"")
+            )
+
+        write_png(os.path.join(spr, "small.png"), 8, 8)
+        write_png(os.path.join(spr, "big.png"), 16, 16)
+        with open(os.path.join(spr, "small.png.meta"), "w") as f:
+            f.write(
+                "guid: 11111111111111111111111111111111\n"
+                "TextureImporter:\n"
+                "  spritePixelsToUnits: 8\n"
+            )
+        with open(os.path.join(spr, "big.png.meta"), "w") as f:
+            f.write(
+                "guid: 22222222222222222222222222222222\n"
+                "TextureImporter:\n"
+                "  spritePixelsToUnits: 8\n"
+            )
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Small\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "  - component: {fileID: 4}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: dddddddddddddddddddddddddddddddd}\n"
+                "--- !u!212 &4\nSpriteRenderer:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n"
+                "  m_Sprite: {fileID: 21300000, "
+                "guid: 11111111111111111111111111111111, type: 3}\n"
+                "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Big\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "  - component: {fileID: 13}\n"
+                "--- !u!4 &11\nTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_LocalPosition: {x: 2, y: 0, z: 0}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "--- !u!114 &12\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: dddddddddddddddddddddddddddddddd}\n"
+                "--- !u!212 &13\nSpriteRenderer:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Enabled: 1\n"
+                "  m_Sprite: {fileID: 21300000, "
+                "guid: 22222222222222222222222222222222, type: 3}\n"
+                "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+            )
+        objs, _a, _l, _c = unity_pack.load_project(root)
+        by_name = {o["name"]: o for o in objs}
+        small = by_name["Small"]["sprite"]
+        big = by_name["Big"]["sprite"]
+        # (8/8)*1/2 = 0.5 ; (16/8)*1/2 = 1.0
+        self.assertAlmostEqual(small["half_w"], 0.5)
+        self.assertAlmostEqual(small["half_h"], 0.5)
+        self.assertAlmostEqual(big["half_w"], 1.0)
+        self.assertAlmostEqual(big["half_h"], 1.0)
+        self.assertEqual(small["pixels_per_unit"], 8.0)
+        self.assertEqual(big["pixels_per_unit"], 8.0)
+
+    def test_pixels_per_unit_defaults_to_100(self):
+        self.assertEqual(
+            unity_pack._pixels_per_unit("/no/such/sprite.png"), 100.0)
 
     def test_dangling_sprite_guid_does_not_draw(self):
         """Placeholder / missing asset guids are not invent-drawn."""
@@ -562,6 +666,52 @@ class TestSystems(unittest.TestCase):
             engine = f.read()
         self.assertIn("no authored SpriteRenderers", engine)
         self.assertNotIn("out[n].half_w", engine)
+
+    def test_refuses_addcomponent_rigidbody(self):
+        root = tempfile.mkdtemp(prefix="upack-refuse-rb-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "X.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class X : MonoBehaviour {\n"
+                "    public void Start() { gameObject.AddComponent<Rigidbody2D>(); }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "X.cs.meta"), "w") as f:
+            f.write("guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: X\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}\n"
+            )
+        with self.assertRaises(unity_pack.PackError) as cm:
+            unity_pack.pack(root, tempfile.mkdtemp())
+        self.assertIn("Rigidbody2D", cm.exception.message)
+
+    def test_authored_rigidbody2d_is_packed(self):
+        objs, _a, _l, _c = unity_pack.load_project(SYSTEMS)
+        ball = [o for o in objs if o["name"] == "HeavyBall"][0]
+        self.assertIsNotNone(ball.get("rigidbody2d"))
+        self.assertAlmostEqual(ball["rigidbody2d"]["vel_x"], 0.5)
+        d = tempfile.mkdtemp(prefix="upack-rb2d-")
+        plan = unity_pack.pack(SYSTEMS, d)
+        self.assertEqual(len(plan.get("rigidbody2d") or []), 1)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("engine_physics_fixed", eng)
+        self.assertIn("GameObject_GetComponent_Rigidbody2D", eng)
 
     def test_refuses_invented_particle_system(self):
         src = (
@@ -1042,8 +1192,7 @@ class TestSystemsRuns(unittest.TestCase):
                 "                 float r, g, b; int tex; } EngineDraw;\n"
                 "int engine_collect_draws(EngineDraw *out, int max);\n"
                 "typedef struct Ball Ball;\n"
-                "struct Ball { float pos_x; float pos_y;\n"
-                "  float velX; float velY; float gravityScale; };\n"
+                "struct Ball { float pos_x; float pos_y; };\n"
                 "extern Ball _Ball_inst_array[];\n"
                 "typedef struct Pad Pad;\n"
                 "struct Pad { float pos_x; float pos_y; float speed; };\n"

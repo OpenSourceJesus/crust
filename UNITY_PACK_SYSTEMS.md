@@ -2,8 +2,10 @@
 
 `unity_pack` speeds up what is already in the user's Unity (or Godot)
 project. It **does not invent components**: no synthetic ParticleSystem
-pools, no default AnimationCurves, no Rigidbody graph, no Canvas, no
-InputAction maps, no `AddComponent<Light>`. Scripts that need those Unity
+pools, no default AnimationCurves, no Canvas, no
+InputAction maps, no `AddComponent<Light>`. Authored Rigidbody /
+Rigidbody2D are packed; inventing them with `AddComponent` is refused.
+Scripts that need other Unity
 features keep them in the authored project until the packer can import
 them; calling invent-requiring APIs today is a hard `PackError`.
 
@@ -102,7 +104,10 @@ No invented lights. `AddComponent<Light>` is a `PackError`.
 
 PNG pixels are packed into `data.c` (`engine_texture_rgba`). Editing the
 referenced sprite and re-packing changes the drawn texels. Tint comes from
-`m_Color`; size from Transform scale.
+`m_Color`. World size follows Unity:
+`(texels / spritePixelsToUnits) * Transform.scale` (half-extents in
+`engine_collect_draws`). `spritePixelsToUnits` is read from the PNG `.meta`
+(default **100**).
 
 **No default visuals.** A GameObject with only a Transform / MonoBehaviour
 does **not** appear in `engine_collect_draws`. Hosts clear to the authored
@@ -116,17 +121,22 @@ camera background; they do not invent class-hash coloured quads.
 Refused invent. `UnityEngine.UI` / `Canvas` keep UI in the authored
 Unity project until Canvas import lands.
 
-## Physics (2D globals + FixedUpdate)
+## Physics (Rigidbody / Rigidbody2D + FixedUpdate)
 
 | Script uses | Emitted |
 |-------------|---------|
-| `Physics2D.gravity` | `Physics2D_gravity_x/y` (Unity default `(0, -9.81)`) |
+| Authored `!u!50` Rigidbody2D | Velocity / gravityScale / mass tables; Dynamic bodies integrate |
+| Authored `!u!54` Rigidbody | 3D velocity + `useGravity`; integrates under `Physics.gravity` |
+| `Physics2D.gravity` | `Physics2D_gravity_x/y` (default `(0, -9.81)`) |
+| `Physics.gravity` | `Physics_gravity_x/y/z` (default `(0, -9.81, 0)`) |
+| `GetComponent<Rigidbody2D>().velocity` / `.gravityScale` | Reads/writes packed RB2D fields |
+| `GetComponent<Rigidbody>().velocity` | Reads/writes packed RB fields |
 | `Time.fixedDeltaTime` | Host-pokeable float (default `1/50`) |
-| `FixedUpdate` | Once per `engine_tick`, before `Update` |
+| `FixedUpdate` | Once per `engine_tick`, then `engine_physics_fixed` |
 
-Velocity stays ordinary packed float fields on the user's script
-(`velX` / `velY`). No colliders, contacts, or invented Rigidbody2D
-components.
+Only **authored** Rigidbody components are packed — `AddComponent<Rigidbody>` /
+`AddComponent<Rigidbody2D>` is a `PackError`. No colliders or contacts yet
+(Dynamic bodies fall/slide without collision response).
 
 ## Refused (would invent assets / components)
 
@@ -138,6 +148,7 @@ components.
 | `UnityEngine.UI` / `Canvas` | Needs authored UI hierarchy |
 | `AddComponent<Light>` | Light must already be on a scene GameObject |
 | `AddComponent<Camera>` / `SpriteRenderer` | Must be authored; no invent-draw |
+| `AddComponent<Rigidbody>` / `Rigidbody2D` | Must be authored on a scene GameObject |
 | `Camera.main` with no scene Camera | Packer will not invent a default camera |
 
 ## Tick order
@@ -145,6 +156,7 @@ components.
 ```
 Time_time += Time_deltaTime   // if Time.time used
 foreach class: FixedUpdate    // if present
+engine_physics_fixed()        // authored Rigidbody / Rigidbody2D
 foreach class: Update
 ```
 
