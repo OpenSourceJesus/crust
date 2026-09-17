@@ -36,6 +36,7 @@ CircleCollider2D:
   m_GameObject: {fileID: 2001}
   m_Enabled: 1
   m_IsTrigger: 0
+  m_Material: {fileID: 6200000, guid: a1b2c3d4e5f60718293a4b5c6d7e8f90, type: 2}
   m_Offset: {x: 0, y: 0}
   m_Radius: 0.5
 --- !u!1 &1001
@@ -87,6 +88,7 @@ BoxCollider2D:
   m_GameObject: {fileID: 7001}
   m_Enabled: 1
   m_IsTrigger: 0
+  m_Material: {fileID: 6200000, guid: a1b2c3d4e5f60718293a4b5c6d7e8f90, type: 2}
   m_Offset: {x: 0, y: 0}
   m_Size: {x: 10, y: 0.5}
 --- !u!1 &3001

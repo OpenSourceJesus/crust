@@ -148,6 +148,14 @@ _REFUSED_API = {
         "CircleCollider2D must be authored on a scene GameObject — unity_pack "
         "does not AddComponent colliders."
     ),
+    "AddComponent<BoxCollider>": (
+        "BoxCollider must be authored on a scene GameObject — unity_pack "
+        "does not AddComponent colliders."
+    ),
+    "AddComponent<SphereCollider>": (
+        "SphereCollider must be authored on a scene GameObject — unity_pack "
+        "does not AddComponent colliders."
+    ),
 }
 
 _SPAWN = re.compile(
@@ -157,7 +165,7 @@ _SPAWN = re.compile(
 _VEC3Z = re.compile(r"\.(z)\b|Vector3|Quaternion")
 _UNITY_API = re.compile(
     r"(?:AddComponent\s*<\s*(?:Light|Camera|SpriteRenderer|Rigidbody2D|Rigidbody|"
-    r"BoxCollider2D|CircleCollider2D)\s*>|"
+    r"BoxCollider2D|CircleCollider2D|BoxCollider|SphereCollider)\s*>|"
     r"(?<![\w])(?:Mathf\.(?:Abs|Min|Max|Clamp|Lerp|Sin|Cos)|"
     r"Time\.(?:deltaTime|time|fixedDeltaTime)|"
     r"Input\.(?:GetAxis|GetButton|GetKey)|"
@@ -459,6 +467,96 @@ def _quat_z_rad(qx, qy, qz, qw):
     return math.atan2(ry, rx)
 
 
+# Unity defaults when Collider/Rigidbody m_Material is {fileID: 0}.
+_DEFAULT_MAT2D = {
+    "friction": 0.4,
+    "bounciness": 0.0,
+    "friction_combine": 0,  # Average
+    "bounce_combine": 0,
+}
+_DEFAULT_MAT3D = {
+    "dynamic_friction": 0.6,
+    "static_friction": 0.6,
+    "bounciness": 0.0,
+    "friction_combine": 0,
+    "bounce_combine": 0,
+}
+
+
+def _parse_material_guid(block):
+    """m_Material: {fileID: 0} or {fileID: 6200000, guid: …, type: 2}."""
+    m = re.search(
+        r"(?m)^\s+m_Material:\s*\{fileID:\s*(-?\d+)(?:,\s*guid:\s*"
+        r"([0-9a-fA-F]+))?",
+        block)
+    if not m:
+        return None
+    if m.group(1) == "0" or not m.group(2):
+        return None
+    return m.group(2).lower()
+
+
+def _parse_physics_material2d(text):
+    fr = re.search(r"(?m)^\s+friction:\s*([0-9.eE+-]+)", text)
+    bn = re.search(r"(?m)^\s+bounciness:\s*([0-9.eE+-]+)", text)
+    fc = re.search(r"(?m)^\s+m_FrictionCombine:\s*(\d+)", text)
+    bc = re.search(r"(?m)^\s+m_BounceCombine:\s*(\d+)", text)
+    return {
+        "friction": float(fr.group(1)) if fr else 0.4,
+        "bounciness": float(bn.group(1)) if bn else 0.0,
+        "friction_combine": int(fc.group(1)) if fc else 0,
+        "bounce_combine": int(bc.group(1)) if bc else 0,
+    }
+
+
+def _parse_physic_material3d(text):
+    df = re.search(r"(?m)^\s+dynamicFriction:\s*([0-9.eE+-]+)", text)
+    sf = re.search(r"(?m)^\s+staticFriction:\s*([0-9.eE+-]+)", text)
+    bn = re.search(r"(?m)^\s+bounciness:\s*([0-9.eE+-]+)", text)
+    fc = re.search(r"(?m)^\s+frictionCombine:\s*(\d+)", text)
+    bc = re.search(r"(?m)^\s+bounceCombine:\s*(\d+)", text)
+    return {
+        "dynamic_friction": float(df.group(1)) if df else 0.6,
+        "static_friction": float(sf.group(1)) if sf else 0.6,
+        "bounciness": float(bn.group(1)) if bn else 0.0,
+        "friction_combine": int(fc.group(1)) if fc else 0,
+        "bounce_combine": int(bc.group(1)) if bc else 0,
+    }
+
+
+def _load_physics_materials(asset_guids):
+    """guid → PhysicsMaterial2D / PhysicMaterial from project assets."""
+    mats2d = {}
+    mats3d = {}
+    for guid, path in (asset_guids or {}).items():
+        low = path.lower()
+        try:
+            if low.endswith(".physicsmaterial2d"):
+                mats2d[guid.lower()] = _parse_physics_material2d(_read(path))
+            elif low.endswith(".physicmaterial"):
+                mats3d[guid.lower()] = _parse_physic_material3d(_read(path))
+        except (IOError, OSError):
+            continue
+    return mats2d, mats3d
+
+
+def _resolve_mat2d(col_guid, rb_guid, mats2d):
+    """Collider material, else Rigidbody2D material, else Unity 2D defaults."""
+    if col_guid and col_guid in mats2d:
+        return mats2d[col_guid]
+    if rb_guid and rb_guid in mats2d:
+        return mats2d[rb_guid]
+    return dict(_DEFAULT_MAT2D)
+
+
+def _resolve_mat3d(col_guid, rb_guid, mats3d):
+    if col_guid and col_guid in mats3d:
+        return mats3d[col_guid]
+    if rb_guid and rb_guid in mats3d:
+        return mats3d[rb_guid]
+    return dict(_DEFAULT_MAT3D)
+
+
 def _resolve_world_trs(xf_id, by_id, cache=None, stack=None):
     """Compose local TRS up m_Father / m_TransformParent into world TRS."""
     if cache is None:
@@ -581,12 +679,15 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
     """A Unity .unity YAML subset: GameObject + Transform + MonoBehaviour.
 
     Also imports authored Camera (!u!20), SpriteRenderer (!u!212),
-    Rigidbody2D (!u!50), and Rigidbody (!u!54). Does not invent any of
+    Rigidbody2D (!u!50), Rigidbody (!u!54), BoxCollider2D (!u!61),
+    CircleCollider2D (!u!58), BoxCollider (!u!65), SphereCollider (!u!135),
+    and PhysicsMaterial2D / PhysicMaterial assets. Does not invent any of
     those — missing components stay missing. Returns
     (objects, lights, cameras).
     """
     guid_to_script = guid_to_script or {}
     asset_guids = asset_guids or {}
+    mats2d, mats3d = _load_physics_materials(asset_guids)
     objects = []
     lights = []
     cameras = []
@@ -602,7 +703,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         km = re.search(
             r"(?m)^(GameObject|Transform|RectTransform|MonoBehaviour|"
             r"PrefabInstance|Light|Camera|SpriteRenderer|Rigidbody2D|"
-            r"Rigidbody|BoxCollider2D|CircleCollider2D):",
+            r"Rigidbody|BoxCollider2D|CircleCollider2D|BoxCollider|"
+            r"SphereCollider):",
             block)
         if km:
             kind = km.group(1)
@@ -622,6 +724,10 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             kind = "BoxCollider2D"
         elif type_id == "58":
             kind = "CircleCollider2D"
+        elif type_id == "65":
+            kind = "BoxCollider"
+        elif type_id == "135":
+            kind = "SphereCollider"
         elif type_id in ("4", "224"):
             kind = "Transform"
         rec = {"file_id": file_id, "kind": kind, "raw": block, "fields": {}}
@@ -793,6 +899,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "gravity_scale": float(gs.group(1)) if gs else 1.0,
                 "vel_x": float(vel.group(1)) if vel else 0.0,
                 "vel_y": float(vel.group(2)) if vel else 0.0,
+                "material_guid": _parse_material_guid(block),
             }
         if kind == "Rigidbody":
             mass = re.search(r"(?m)^\s+m_Mass:\s*([0-9.eE+-]+)", block)
@@ -813,6 +920,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "vel_x": float(vel.group(1)) if vel else 0.0,
                 "vel_y": float(vel.group(2)) if vel else 0.0,
                 "vel_z": float(vel.group(3)) if vel else 0.0,
+                "material_guid": _parse_material_guid(block),
             }
         if kind == "BoxCollider2D":
             en = re.search(r"(?m)^\s+m_Enabled:\s*(\d+)", block)
@@ -829,6 +937,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "offset_y": float(off.group(2)) if off else 0.0,
                 "size_x": float(sz.group(1)) if sz else 1.0,
                 "size_y": float(sz.group(2)) if sz else 1.0,
+                "material_guid": _parse_material_guid(block),
             }
         if kind == "CircleCollider2D":
             en = re.search(r"(?m)^\s+m_Enabled:\s*(\d+)", block)
@@ -843,6 +952,45 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "offset_x": float(off.group(1)) if off else 0.0,
                 "offset_y": float(off.group(2)) if off else 0.0,
                 "radius": float(rad.group(1)) if rad else 0.5,
+                "material_guid": _parse_material_guid(block),
+            }
+        if kind == "BoxCollider":
+            en = re.search(r"(?m)^\s+m_Enabled:\s*(\d+)", block)
+            trig = re.search(r"(?m)^\s+m_IsTrigger:\s*(\d+)", block)
+            center = re.search(
+                r"m_Center:\s*\{x:\s*([^,}]+),\s*y:\s*([^,}]+),"
+                r"\s*z:\s*([^}]+)\}", block)
+            sz = re.search(
+                r"m_Size:\s*\{x:\s*([^,}]+),\s*y:\s*([^,}]+),"
+                r"\s*z:\s*([^}]+)\}", block)
+            rec["collider3d"] = {
+                "kind": "box",
+                "enabled": int(en.group(1)) if en else 1,
+                "is_trigger": int(trig.group(1)) if trig else 0,
+                "offset_x": float(center.group(1)) if center else 0.0,
+                "offset_y": float(center.group(2)) if center else 0.0,
+                "offset_z": float(center.group(3)) if center else 0.0,
+                "size_x": float(sz.group(1)) if sz else 1.0,
+                "size_y": float(sz.group(2)) if sz else 1.0,
+                "size_z": float(sz.group(3)) if sz else 1.0,
+                "material_guid": _parse_material_guid(block),
+            }
+        if kind == "SphereCollider":
+            en = re.search(r"(?m)^\s+m_Enabled:\s*(\d+)", block)
+            trig = re.search(r"(?m)^\s+m_IsTrigger:\s*(\d+)", block)
+            center = re.search(
+                r"m_Center:\s*\{x:\s*([^,}]+),\s*y:\s*([^,}]+),"
+                r"\s*z:\s*([^}]+)\}", block)
+            rad = re.search(r"(?m)^\s+m_Radius:\s*([0-9.eE+-]+)", block)
+            rec["collider3d"] = {
+                "kind": "sphere",
+                "enabled": int(en.group(1)) if en else 1,
+                "is_trigger": int(trig.group(1)) if trig else 0,
+                "offset_x": float(center.group(1)) if center else 0.0,
+                "offset_y": float(center.group(2)) if center else 0.0,
+                "offset_z": float(center.group(3)) if center else 0.0,
+                "radius": float(rad.group(1)) if rad else 0.5,
+                "material_guid": _parse_material_guid(block),
             }
         by_id[file_id] = rec
 
@@ -888,6 +1036,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         rb2d = None
         rb3d = None
         col2d = None
+        col3d = None
         for k in kids:
             if k.get("kind") == "Transform":
                 xf = k
@@ -913,11 +1062,16 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             if k.get("kind") in ("BoxCollider2D", "CircleCollider2D") and k.get(
                     "collider2d"):
                 col2d = dict(k["collider2d"])
+            if k.get("kind") in ("BoxCollider", "SphereCollider") and k.get(
+                    "collider3d"):
+                col3d = dict(k["collider3d"])
         local_pos, local_rot, local_scale = pos, rot, scale
         father_id = xf.get("father_id") if xf else None
         if xf is not None:
             pos, rot, scale = _resolve_world_trs(
                 xf["file_id"], by_id, world_cache)
+        rb_mat2 = (rb2d or {}).get("material_guid")
+        rb_mat3 = (rb3d or {}).get("material_guid")
         if col2d and col2d.get("enabled", 1):
             sx = abs(float(scale[0]))
             sy = abs(float(scale[1]))
@@ -930,12 +1084,40 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 col2d["hw"] = abs(float(col2d.get("size_x", 1.0))) * sx * 0.5
                 col2d["hh"] = abs(float(col2d.get("size_y", 1.0))) * sy * 0.5
             else:
-                # Unity scales CircleCollider2D radius by max(|sx|,|sy|).
                 mxy = sx if sx > sy else sy
                 col2d["hw"] = float(col2d.get("radius", 0.5)) * mxy
                 col2d["hh"] = col2d["hw"]
+            mat = _resolve_mat2d(col2d.get("material_guid"), rb_mat2, mats2d)
+            col2d["friction"] = float(mat["friction"])
+            col2d["bounciness"] = float(mat["bounciness"])
+            col2d["friction_combine"] = int(mat["friction_combine"])
+            col2d["bounce_combine"] = int(mat["bounce_combine"])
         else:
             col2d = None
+        if col3d and col3d.get("enabled", 1):
+            sx = abs(float(scale[0]))
+            sy = abs(float(scale[1]))
+            sz = abs(float(scale[2]))
+            col3d["ox"] = float(col3d.get("offset_x", 0.0)) * sx
+            col3d["oy"] = float(col3d.get("offset_y", 0.0)) * sy
+            col3d["oz"] = float(col3d.get("offset_z", 0.0)) * sz
+            if col3d.get("kind") == "box":
+                col3d["hw"] = abs(float(col3d.get("size_x", 1.0))) * sx * 0.5
+                col3d["hh"] = abs(float(col3d.get("size_y", 1.0))) * sy * 0.5
+                col3d["hd"] = abs(float(col3d.get("size_z", 1.0))) * sz * 0.5
+            else:
+                mxyz = max(sx, sy, sz)
+                col3d["hw"] = float(col3d.get("radius", 0.5)) * mxyz
+                col3d["hh"] = col3d["hw"]
+                col3d["hd"] = col3d["hw"]
+            mat = _resolve_mat3d(col3d.get("material_guid"), rb_mat3, mats3d)
+            col3d["dynamic_friction"] = float(mat["dynamic_friction"])
+            col3d["static_friction"] = float(mat["static_friction"])
+            col3d["bounciness"] = float(mat["bounciness"])
+            col3d["friction_combine"] = int(mat["friction_combine"])
+            col3d["bounce_combine"] = int(mat["bounce_combine"])
+        else:
+            col3d = None
         if sprite and sprite.get("enabled", 1) and sprite.get("has_sprite"):
             # Extent filled after PNG load via pixels / pixelsPerUnit * scale.
             sprite["scale_x"] = abs(float(scale[0]))
@@ -965,12 +1147,13 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "far_clip": cam["far_clip"],
             })
         # Camera-only GOs are not packed as scripted instances.
-        if cam is not None and script is None and sprite is None and not rb2d and not rb3d and not col2d:
+        if (cam is not None and script is None and sprite is None
+                and not rb2d and not rb3d and not col2d and not col3d):
             continue
         has_mb = any(k.get("kind") == "MonoBehaviour" for k in kids)
         # Transform-only parents (e.g. Rig) are hierarchy nodes, not instances.
         if (script is None and sprite is None and not rb2d and not rb3d
-                and cam is None and not has_mb and not col2d):
+                and cam is None and not has_mb and not col2d and not col3d):
             continue
         objects.append({
             "name": go.get("name") or "obj",
@@ -987,6 +1170,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "rigidbody2d": rb2d,
             "rigidbody": rb3d,
             "collider2d": col2d,
+            "collider3d": col3d,
         })
     return objects, lights, cameras
 
@@ -1261,6 +1445,62 @@ def _build_collider2d_tables(plan):
                 "hh": float(c.get("hh") or 0.5),
                 "cos_z": float(c.get("cos_z") or 1.0),
                 "sin_z": float(c.get("sin_z") or 0.0),
+                "friction": float(c.get("friction")
+                                  if c.get("friction") is not None
+                                  else _DEFAULT_MAT2D["friction"]),
+                "bounciness": float(c.get("bounciness")
+                                    if c.get("bounciness") is not None
+                                    else 0.0),
+                "friction_combine": int(c.get("friction_combine") or 0),
+                "bounce_combine": int(c.get("bounce_combine") or 0),
+            })
+    return cols
+
+
+def _build_collider3d_tables(plan):
+    """Authored BoxCollider / SphereCollider → packed contact table."""
+    cols = []
+    class_ids = {n: i for i, n in enumerate(sorted(plan["classes"]))}
+    rb_of = {}
+    for ri, r in enumerate(plan.get("rigidbody") or []):
+        rb_of[(r["owner_class"], r["owner_inst"])] = ri
+    for cname, cl in sorted(plan["classes"].items()):
+        cid = class_ids[cname]
+        for i, o in enumerate(cl.get("instances") or []):
+            c = o.get("collider3d")
+            if not c or not c.get("enabled", 1):
+                continue
+            rb_i = rb_of.get((cname, i))
+            body = 0 if rb_i is not None else 2  # dynamic if RB else static
+            kind = 0 if c.get("kind") == "box" else 1
+            cols.append({
+                "name": o.get("name") or "obj",
+                "owner_class": cname,
+                "owner_class_id": cid,
+                "owner_inst": i,
+                "rb3d": rb_i if rb_i is not None else -1,
+                "body_type": body,
+                "kind": kind,
+                "is_trigger": int(c.get("is_trigger") or 0),
+                "ox": float(c.get("ox") or 0.0),
+                "oy": float(c.get("oy") or 0.0),
+                "oz": float(c.get("oz") or 0.0),
+                "hw": float(c.get("hw") or 0.5),
+                "hh": float(c.get("hh") or 0.5),
+                "hd": float(c.get("hd") or 0.5),
+                "dynamic_friction": float(
+                    c.get("dynamic_friction")
+                    if c.get("dynamic_friction") is not None
+                    else _DEFAULT_MAT3D["dynamic_friction"]),
+                "static_friction": float(
+                    c.get("static_friction")
+                    if c.get("static_friction") is not None
+                    else _DEFAULT_MAT3D["static_friction"]),
+                "bounciness": float(c.get("bounciness")
+                                    if c.get("bounciness") is not None
+                                    else 0.0),
+                "friction_combine": int(c.get("friction_combine") or 0),
+                "bounce_combine": int(c.get("bounce_combine") or 0),
             })
     return cols
 
@@ -1439,6 +1679,10 @@ def analyze_script(path, text=None):
                 apis.add("AddComponent<BoxCollider2D>")
             elif "CircleCollider2D" in token:
                 apis.add("AddComponent<CircleCollider2D>")
+            elif "BoxCollider" in token:
+                apis.add("AddComponent<BoxCollider>")
+            elif "SphereCollider" in token:
+                apis.add("AddComponent<SphereCollider>")
         elif token.startswith("GetComponent"):
             apis.add("GetComponent")
         elif "GameObject.Find" in token or token == "GameObject.Find":
@@ -1860,6 +2104,7 @@ def emit_engine(plan, analyses, used_apis):
     rb2d_list = plan.get("rigidbody2d") or []
     rb3d_list = plan.get("rigidbody") or []
     col2d_list = plan.get("collider2d") or []
+    col3d_list = plan.get("collider3d") or []
     want_rb2d = (
         bool(rb2d_list)
         or "Rigidbody2D" in getcomponent_types
@@ -1868,6 +2113,7 @@ def emit_engine(plan, analyses, used_apis):
         bool(rb3d_list)
         or "Rigidbody" in getcomponent_types)
     want_col2d = bool(col2d_list)
+    want_col3d = bool(col3d_list)
     want_phys = "Physics2D.gravity" in used_apis or want_rb2d
     want_phys3 = "Physics.gravity" in used_apis or want_rb3d
     want_input = bool(used_apis & _WANT_INPUT)
@@ -1889,7 +2135,7 @@ def emit_engine(plan, analyses, used_apis):
     if soa:
         p("/* layout: SoA positions (contiguous float tables for GPU upload) */")
     p("#include <stdint.h>")
-    if want_math or want_col2d:
+    if want_math or want_col2d or want_col3d:
         p("#include <math.h>")
     if want_input or want_log or want_find:
         p("#include <string.h>")
@@ -1992,6 +2238,31 @@ def emit_engine(plan, analyses, used_apis):
         p("extern const float _Collider2D_hh[%d];" % nc)
         p("extern const float _Collider2D_cos[%d];" % nc)
         p("extern const float _Collider2D_sin[%d];" % nc)
+        p("extern const float _Collider2D_friction[%d];" % nc)
+        p("extern const float _Collider2D_bounciness[%d];" % nc)
+        p("extern const int _Collider2D_friction_combine[%d];" % nc)
+        p("extern const int _Collider2D_bounce_combine[%d];" % nc)
+    if want_col3d:
+        n3c = max(1, len(col3d_list))
+        p("extern const int _Collider3D_count;")
+        p("extern const int _Collider3D_kind[%d]; /* 0 box 1 sphere */" % n3c)
+        p("extern const int _Collider3D_is_trigger[%d];" % n3c)
+        p("extern const int _Collider3D_body_type[%d]; /* 0 dyn 2 static */"
+          % n3c)
+        p("extern const int _Collider3D_owner_class[%d];" % n3c)
+        p("extern const int _Collider3D_owner_inst[%d];" % n3c)
+        p("extern const int _Collider3D_rb3d[%d]; /* -1 if none */" % n3c)
+        p("extern const float _Collider3D_ox[%d];" % n3c)
+        p("extern const float _Collider3D_oy[%d];" % n3c)
+        p("extern const float _Collider3D_oz[%d];" % n3c)
+        p("extern const float _Collider3D_hw[%d];" % n3c)
+        p("extern const float _Collider3D_hh[%d];" % n3c)
+        p("extern const float _Collider3D_hd[%d];" % n3c)
+        p("extern const float _Collider3D_dynamic_friction[%d];" % n3c)
+        p("extern const float _Collider3D_static_friction[%d];" % n3c)
+        p("extern const float _Collider3D_bounciness[%d];" % n3c)
+        p("extern const int _Collider3D_friction_combine[%d];" % n3c)
+        p("extern const int _Collider3D_bounce_combine[%d];" % n3c)
     p("")
 
     # Packed structs (positions omitted when SoA).
@@ -2469,6 +2740,18 @@ def emit_engine(plan, analyses, used_apis):
         p("}")
         p("")
 
+    if want_col2d or want_col3d:
+        p("/* PhysicsMaterialCombine: Average=0 Multiply=1 Minimum=2 Maximum=3 */")
+        p("static float _phys_mat_combine(float a, float b, int ca, int cb) {")
+        p("    int mode = ca > cb ? ca : cb;")
+        p("    if (mode > 3) mode = 0;")
+        p("    if (mode == 1) return a * b;")
+        p("    if (mode == 2) return a < b ? a : b;")
+        p("    if (mode == 3) return a > b ? a : b;")
+        p("    return 0.5f * (a + b);")
+        p("}")
+        p("")
+
     if want_col2d and col2d_list:
         p("/* Authored BoxCollider2D / CircleCollider2D — AABB contacts */")
         p("static void _col2d_center(int ci, float *out_x, float *out_y) {")
@@ -2529,7 +2812,7 @@ def emit_engine(plan, analyses, used_apis):
         p("    int a, b;")
         p("    for (a = 0; a < _Collider2D_count; a = a + 1) {")
         p("        float ax, ay, bx, by, dx, dy, px, py, ahw, ahh, bhw, bhh;")
-        p("        float c, s, sep, tx, ty;")
+        p("        float c, s, sep, tx, ty, nx, ny, vx, vy, vn, vtx, vty, fr, bn, sc;")
         p("        int rb;")
         p("        if (_Collider2D_body_type[a] != 0) continue; /* dynamic only */")
         p("        if (_Collider2D_is_trigger[a]) continue;")
@@ -2562,16 +2845,182 @@ def emit_engine(plan, analyses, used_apis):
         p("            if (px < py) {")
         p("                sep = (dx < 0.f) ? -px : px;")
         p("                tx = tx + sep;")
-        p("                if (sep * _Rigidbody2D_vel_x[rb] < 0.f)")
-        p("                    _Rigidbody2D_vel_x[rb] = 0.f;")
+        p("                nx = (sep < 0.f) ? -1.f : 1.f; ny = 0.f;")
         p("            } else {")
         p("                sep = (dy < 0.f) ? -py : py;")
         p("                ty = ty + sep;")
-        p("                if (sep * _Rigidbody2D_vel_y[rb] < 0.f)")
-        p("                    _Rigidbody2D_vel_y[rb] = 0.f;")
+        p("                nx = 0.f; ny = (sep < 0.f) ? -1.f : 1.f;")
         p("            }")
         p("            _col2d_set_pos(a, tx, ty);")
+        p("            fr = _phys_mat_combine(")
+        p("                _Collider2D_friction[a], _Collider2D_friction[b],")
+        p("                _Collider2D_friction_combine[a],")
+        p("                _Collider2D_friction_combine[b]);")
+        p("            bn = _phys_mat_combine(")
+        p("                _Collider2D_bounciness[a], _Collider2D_bounciness[b],")
+        p("                _Collider2D_bounce_combine[a],")
+        p("                _Collider2D_bounce_combine[b]);")
+        p("            vx = _Rigidbody2D_vel_x[rb];")
+        p("            vy = _Rigidbody2D_vel_y[rb];")
+        p("            vn = vx * nx + vy * ny;")
+        p("            vtx = vx - vn * nx;")
+        p("            vty = vy - vn * ny;")
+        p("            if (vn < 0.f) vn = -bn * vn;")
+        p("            sc = 1.f - fr;")
+        p("            if (sc < 0.f) sc = 0.f;")
+        p("            if (sc > 1.f) sc = 1.f;")
+        p("            _Rigidbody2D_vel_x[rb] = vtx * sc + vn * nx;")
+        p("            _Rigidbody2D_vel_y[rb] = vty * sc + vn * ny;")
         p("            _col2d_center(a, &ax, &ay);")
+        p("        }")
+        p("    }")
+        p("}")
+        p("")
+
+    if want_col3d and col3d_list:
+        p("/* Authored BoxCollider / SphereCollider — AABB contacts */")
+        p("static void _col3d_center(int ci, float *ox, float *oy, float *oz) {")
+        p("    unsigned oi = (unsigned)_Collider3D_owner_inst[ci];")
+        p("    float px = 0.f, py = 0.f, pz = 0.f;")
+        p("    switch (_Collider3D_owner_class[ci]) {")
+        for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
+            idn = _c_ident(cname)
+            cl = plan["classes"][cname]
+            if not _class_has_position(cl):
+                continue
+            p("    case %d:" % cid)
+            p("        px = %s_get_pos_x(oi);" % idn)
+            p("        py = %s_get_pos_y(oi);" % idn)
+            if not cl.get("two_d"):
+                p("        pz = %s_get_pos_z(oi);" % idn)
+            p("        break;")
+        p("    default: break;")
+        p("    }")
+        p("    *ox = px + _Collider3D_ox[ci];")
+        p("    *oy = py + _Collider3D_oy[ci];")
+        p("    *oz = pz + _Collider3D_oz[ci];")
+        p("}")
+        p("")
+        p("static void _col3d_set_pos(int ci, float nx, float ny, float nz) {")
+        p("    unsigned oi = (unsigned)_Collider3D_owner_inst[ci];")
+        p("    switch (_Collider3D_owner_class[ci]) {")
+        for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
+            idn = _c_ident(cname)
+            cl = plan["classes"][cname]
+            if not _class_has_position(cl) or cl.get("static"):
+                continue
+            p("    case %d:" % cid)
+            p("        %s_set_pos_x(oi, nx);" % idn)
+            p("        %s_set_pos_y(oi, ny);" % idn)
+            if not cl.get("two_d"):
+                p("        %s_set_pos_z(oi, nz);" % idn)
+            p("        break;")
+        p("    default: break;")
+        p("    }")
+        p("}")
+        p("")
+        p("static void _col3d_get_pos(int ci, float *ox, float *oy, float *oz) {")
+        p("    unsigned oi = (unsigned)_Collider3D_owner_inst[ci];")
+        p("    *ox = 0.f; *oy = 0.f; *oz = 0.f;")
+        p("    switch (_Collider3D_owner_class[ci]) {")
+        for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
+            idn = _c_ident(cname)
+            cl = plan["classes"][cname]
+            if not _class_has_position(cl):
+                continue
+            p("    case %d:" % cid)
+            p("        *ox = %s_get_pos_x(oi);" % idn)
+            p("        *oy = %s_get_pos_y(oi);" % idn)
+            if not cl.get("two_d"):
+                p("        *oz = %s_get_pos_z(oi);" % idn)
+            p("        break;")
+        p("    default: break;")
+        p("    }")
+        p("}")
+        p("")
+        p("static void engine_physics_collide3d(void) {")
+        p("    int a, b;")
+        p("    for (a = 0; a < _Collider3D_count; a = a + 1) {")
+        p("        float ax, ay, az, bx, by, bz, dx, dy, dz;")
+        p("        float px, py, pz, ahw, ahh, ahd, bhw, bhh, bhd;")
+        p("        float sep, tx, ty, tz, nx, ny, nz;")
+        p("        float vx, vy, vz, vn, vtx, vty, vtz, fr_d, fr_s, fr, bn, sc, vt_len;")
+        p("        int rb;")
+        p("        if (_Collider3D_body_type[a] != 0) continue;")
+        p("        if (_Collider3D_is_trigger[a]) continue;")
+        p("        rb = _Collider3D_rb3d[a];")
+        p("        if (rb < 0) continue;")
+        p("        _col3d_center(a, &ax, &ay, &az);")
+        p("        if (_Collider3D_kind[a] == 1) {")
+        p("            ahw = _Collider3D_hw[a]; ahh = ahw; ahd = ahw;")
+        p("        } else {")
+        p("            ahw = _Collider3D_hw[a];")
+        p("            ahh = _Collider3D_hh[a];")
+        p("            ahd = _Collider3D_hd[a];")
+        p("        }")
+        p("        for (b = 0; b < _Collider3D_count; b = b + 1) {")
+        p("            if (a == b) continue;")
+        p("            if (_Collider3D_is_trigger[b]) continue;")
+        p("            _col3d_center(b, &bx, &by, &bz);")
+        p("            if (_Collider3D_kind[b] == 1) {")
+        p("                bhw = _Collider3D_hw[b]; bhh = bhw; bhd = bhw;")
+        p("            } else {")
+        p("                bhw = _Collider3D_hw[b];")
+        p("                bhh = _Collider3D_hh[b];")
+        p("                bhd = _Collider3D_hd[b];")
+        p("            }")
+        p("            dx = ax - bx; dy = ay - by; dz = az - bz;")
+        p("            px = (ahw + bhw) - (dx < 0.f ? -dx : dx);")
+        p("            py = (ahh + bhh) - (dy < 0.f ? -dy : dy);")
+        p("            pz = (ahd + bhd) - (dz < 0.f ? -dz : dz);")
+        p("            if (px <= 0.f || py <= 0.f || pz <= 0.f) continue;")
+        p("            _col3d_get_pos(a, &tx, &ty, &tz);")
+        p("            nx = 0.f; ny = 0.f; nz = 0.f;")
+        p("            if (px <= py && px <= pz) {")
+        p("                sep = (dx < 0.f) ? -px : px;")
+        p("                tx = tx + sep;")
+        p("                nx = (sep < 0.f) ? -1.f : 1.f;")
+        p("            } else if (py <= px && py <= pz) {")
+        p("                sep = (dy < 0.f) ? -py : py;")
+        p("                ty = ty + sep;")
+        p("                ny = (sep < 0.f) ? -1.f : 1.f;")
+        p("            } else {")
+        p("                sep = (dz < 0.f) ? -pz : pz;")
+        p("                tz = tz + sep;")
+        p("                nz = (sep < 0.f) ? -1.f : 1.f;")
+        p("            }")
+        p("            _col3d_set_pos(a, tx, ty, tz);")
+        p("            fr_d = _phys_mat_combine(")
+        p("                _Collider3D_dynamic_friction[a],")
+        p("                _Collider3D_dynamic_friction[b],")
+        p("                _Collider3D_friction_combine[a],")
+        p("                _Collider3D_friction_combine[b]);")
+        p("            fr_s = _phys_mat_combine(")
+        p("                _Collider3D_static_friction[a],")
+        p("                _Collider3D_static_friction[b],")
+        p("                _Collider3D_friction_combine[a],")
+        p("                _Collider3D_friction_combine[b]);")
+        p("            bn = _phys_mat_combine(")
+        p("                _Collider3D_bounciness[a], _Collider3D_bounciness[b],")
+        p("                _Collider3D_bounce_combine[a],")
+        p("                _Collider3D_bounce_combine[b]);")
+        p("            vx = _Rigidbody_vel_x[rb];")
+        p("            vy = _Rigidbody_vel_y[rb];")
+        p("            vz = _Rigidbody_vel_z[rb];")
+        p("            vn = vx * nx + vy * ny + vz * nz;")
+        p("            vtx = vx - vn * nx;")
+        p("            vty = vy - vn * ny;")
+        p("            vtz = vz - vn * nz;")
+        p("            vt_len = sqrtf(vtx * vtx + vty * vty + vtz * vtz);")
+        p("            fr = (vt_len < 0.01f) ? fr_s : fr_d;")
+        p("            if (vn < 0.f) vn = -bn * vn;")
+        p("            sc = 1.f - fr;")
+        p("            if (sc < 0.f) sc = 0.f;")
+        p("            if (sc > 1.f) sc = 1.f;")
+        p("            _Rigidbody_vel_x[rb] = vtx * sc + vn * nx;")
+        p("            _Rigidbody_vel_y[rb] = vty * sc + vn * ny;")
+        p("            _Rigidbody_vel_z[rb] = vtz * sc + vn * nz;")
+        p("            _col3d_center(a, &ax, &ay, &az);")
         p("        }")
         p("    }")
         p("}")
@@ -2646,6 +3095,8 @@ def emit_engine(plan, analyses, used_apis):
             p("    }")
         if want_col2d and col2d_list:
             p("    engine_physics_collide2d();")
+        if want_col3d and col3d_list:
+            p("    engine_physics_collide3d();")
         p("}")
         p("")
 
@@ -3364,6 +3815,59 @@ def emit_data(plan, used_apis=None):
             n, ", ".join("%sf" % repr(float(c["cos_z"])) for c in col2d_list)))
         p("const float _Collider2D_sin[%d] = { %s };" % (
             n, ", ".join("%sf" % repr(float(c["sin_z"])) for c in col2d_list)))
+        p("const float _Collider2D_friction[%d] = { %s };" % (
+            n, ", ".join("%sf" % repr(float(c["friction"]))
+                         for c in col2d_list)))
+        p("const float _Collider2D_bounciness[%d] = { %s };" % (
+            n, ", ".join("%sf" % repr(float(c["bounciness"]))
+                         for c in col2d_list)))
+        p("const int _Collider2D_friction_combine[%d] = { %s };" % (
+            n, ", ".join(str(int(c["friction_combine"]))
+                         for c in col2d_list)))
+        p("const int _Collider2D_bounce_combine[%d] = { %s };" % (
+            n, ", ".join(str(int(c["bounce_combine"])) for c in col2d_list)))
+    col3d_list = plan.get("collider3d") or []
+    if col3d_list:
+        n = len(col3d_list)
+        p("const int _Collider3D_count = %d;" % n)
+        p("const int _Collider3D_kind[%d] = { %s };" % (
+            n, ", ".join(str(int(c["kind"])) for c in col3d_list)))
+        p("const int _Collider3D_is_trigger[%d] = { %s };" % (
+            n, ", ".join(str(int(c["is_trigger"])) for c in col3d_list)))
+        p("const int _Collider3D_body_type[%d] = { %s };" % (
+            n, ", ".join(str(int(c["body_type"])) for c in col3d_list)))
+        p("const int _Collider3D_owner_class[%d] = { %s };" % (
+            n, ", ".join(str(int(c["owner_class_id"])) for c in col3d_list)))
+        p("const int _Collider3D_owner_inst[%d] = { %s };" % (
+            n, ", ".join(str(int(c["owner_inst"])) for c in col3d_list)))
+        p("const int _Collider3D_rb3d[%d] = { %s };" % (
+            n, ", ".join(str(int(c["rb3d"])) for c in col3d_list)))
+        p("const float _Collider3D_ox[%d] = { %s };" % (
+            n, ", ".join("%sf" % repr(float(c["ox"])) for c in col3d_list)))
+        p("const float _Collider3D_oy[%d] = { %s };" % (
+            n, ", ".join("%sf" % repr(float(c["oy"])) for c in col3d_list)))
+        p("const float _Collider3D_oz[%d] = { %s };" % (
+            n, ", ".join("%sf" % repr(float(c["oz"])) for c in col3d_list)))
+        p("const float _Collider3D_hw[%d] = { %s };" % (
+            n, ", ".join("%sf" % repr(float(c["hw"])) for c in col3d_list)))
+        p("const float _Collider3D_hh[%d] = { %s };" % (
+            n, ", ".join("%sf" % repr(float(c["hh"])) for c in col3d_list)))
+        p("const float _Collider3D_hd[%d] = { %s };" % (
+            n, ", ".join("%sf" % repr(float(c["hd"])) for c in col3d_list)))
+        p("const float _Collider3D_dynamic_friction[%d] = { %s };" % (
+            n, ", ".join("%sf" % repr(float(c["dynamic_friction"]))
+                         for c in col3d_list)))
+        p("const float _Collider3D_static_friction[%d] = { %s };" % (
+            n, ", ".join("%sf" % repr(float(c["static_friction"]))
+                         for c in col3d_list)))
+        p("const float _Collider3D_bounciness[%d] = { %s };" % (
+            n, ", ".join("%sf" % repr(float(c["bounciness"]))
+                         for c in col3d_list)))
+        p("const int _Collider3D_friction_combine[%d] = { %s };" % (
+            n, ", ".join(str(int(c["friction_combine"]))
+                         for c in col3d_list)))
+        p("const int _Collider3D_bounce_combine[%d] = { %s };" % (
+            n, ", ".join(str(int(c["bounce_combine"])) for c in col3d_list)))
     textures = plan.get("textures") or []
     p("const int _engine_tex_count = %d;" % len(textures))
     if textures:
@@ -3695,6 +4199,7 @@ def pack(root, outdir, soa=False, soa_vec4=False):
     plan["go_rigidbody2d"] = go_rb2d
     plan["go_rigidbody"] = go_rb3d
     plan["collider2d"] = _build_collider2d_tables(plan)
+    plan["collider3d"] = _build_collider3d_tables(plan)
     os.makedirs(outdir, exist_ok=True)
     _progress("emitting engine.c (%d classes)" % len(plan["classes"]))
     engine = emit_engine(plan, analyses, used_apis)
