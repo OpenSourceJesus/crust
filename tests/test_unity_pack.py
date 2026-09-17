@@ -300,5 +300,100 @@ class TestGLES2View(unittest.TestCase):
         self.assertGreaterEqual(lit, 20, art)
 
 
+SYSTEMS = os.path.join(ROOT, "examples", "unity_pack", "SystemsScene")
+
+
+class TestSystems(unittest.TestCase):
+    """Animation / particles / physics subset — see UNITY_PACK_SYSTEMS.md."""
+
+    def test_detects_system_apis(self):
+        _objs, analyses = unity_pack.load_project(SYSTEMS)
+        apis = set()
+        for a in analyses:
+            apis |= a["apis"]
+        self.assertIn("Time.time", apis)
+        self.assertIn("Mathf.Sin", apis)
+        self.assertIn("AnimationCurve.Evaluate", apis)
+        self.assertIn("Physics2D.gravity", apis)
+        self.assertIn("Time.fixedDeltaTime", apis)
+        self.assertIn("ParticleSystem.Emit", apis)
+
+    def test_emits_opt_in_stubs(self):
+        d = tempfile.mkdtemp(prefix="upack-sys-")
+        unity_pack.pack(SYSTEMS, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            engine = f.read()
+        with open(os.path.join(d, "data.c")) as f:
+            data = f.read()
+        self.assertIn("Mathf_Sin", engine)
+        self.assertIn("AnimationCurve_Evaluate", engine)
+        self.assertIn("ParticleSystem_Emit", engine)
+        self.assertIn("ParticleSystem_Tick", engine)
+        self.assertIn("Ball_FixedUpdate", engine)
+        self.assertIn("Time_time = Time_time + Time_deltaTime", engine)
+        self.assertIn("Physics2D_gravity_y", data)
+        self.assertIn("_AnimCurve0", data)
+        # MiniScene must not pull these in.
+        d2 = tempfile.mkdtemp(prefix="upack-mini-")
+        unity_pack.pack(SCENE, d2)
+        with open(os.path.join(d2, "engine.c")) as f:
+            mini = f.read()
+        self.assertNotIn("ParticleSystem_Emit", mini)
+        self.assertNotIn("AnimationCurve_Evaluate", mini)
+        self.assertNotIn("Mathf_Sin", mini)
+
+
+@needs_cc
+class TestSystemsRuns(unittest.TestCase):
+
+    def test_tick_animates_physics_and_particles(self):
+        d = tempfile.mkdtemp(prefix="upack-sys-run-")
+        unity_pack.pack(SYSTEMS, d)
+        host = os.path.join(d, "host.c")
+        with open(host, "w") as f:
+            f.write(
+                "void engine_tick(void);\n"
+                "extern float Time_deltaTime;\n"
+                "extern float Time_time;\n"
+                "typedef struct { float x, y, half_w, half_h;\n"
+                "                 float r, g, b; } EngineDraw;\n"
+                "int engine_collect_draws(EngineDraw *out, int max);\n"
+                "typedef struct Ball Ball;\n"
+                "struct Ball { float pos_x; float pos_y;\n"
+                "  float velX; float velY; float gravityScale; };\n"
+                "extern Ball _Ball_inst_array[];\n"
+                "int main(void) {\n"
+                "  float y0 = _Ball_inst_array[0].pos_y;\n"
+                "  Time_deltaTime = 0.02f;\n"
+                "  int i;\n"
+                "  for (i = 0; i < 50; i = i + 1) engine_tick();\n"
+                "  EngineDraw buf[128];\n"
+                "  int n = engine_collect_draws(buf, 128);\n"
+                "  if (Time_time < 0.9f) return 2;\n"
+                "  if (_Ball_inst_array[0].pos_y >= y0) return 3;\n"
+                "  if (n < 5) return 4; /* instances + particles */\n"
+                "  return 0;\n"
+                "}\n"
+            )
+        r = subprocess.run(
+            [_CC, "-O3", "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(
+            [_CC, "-O0", "-c", "-o", os.path.join(d, "data.o"),
+             os.path.join(d, "data.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        exe = os.path.join(d, "host")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host,
+             os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
