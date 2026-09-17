@@ -316,7 +316,8 @@ class TestSystems(unittest.TestCase):
         self.assertIn("Mathf.Sin", apis)
         self.assertIn("Physics2D.gravity", apis)
         self.assertIn("Time.fixedDeltaTime", apis)
-        self.assertIn("Input.GetAxis", apis)
+        self.assertIn("Keyboard.current", apis)
+        self.assertNotIn("Input.GetAxis", apis)
         self.assertIn("RenderSettings.ambientLight", apis)
         self.assertEqual(len(lights), 1)
         self.assertAlmostEqual(lights[0]["intensity"], 1.5)
@@ -338,8 +339,10 @@ class TestSystems(unittest.TestCase):
         self.assertIn("Mathf_Sin", engine)
         self.assertIn("Ball_FixedUpdate", engine)
         self.assertIn("Time_time = Time_time + Time_deltaTime", engine)
-        self.assertIn("Input_GetAxis", engine)
-        self.assertIn("engine_input_axis_Horizontal", data)
+        self.assertIn("Keyboard_current", engine)
+        self.assertIn("Keyboard_leftArrowKey_isPressed", engine)
+        self.assertIn("engine_keyboard_connected", data)
+        self.assertIn("engine_keyboard_leftArrow", data)
         self.assertIn("RenderSettings_ambient_r", data)
         self.assertIn("_Light_intensity", data)
         self.assertIn("1.5f", data)
@@ -361,7 +364,7 @@ class TestSystems(unittest.TestCase):
             mini_data = f.read()
         self.assertNotIn("Mathf_Sin", mini)
         self.assertNotIn("Physics2D_gravity", mini)
-        self.assertNotIn("Input_GetAxis", mini)
+        self.assertNotIn("Keyboard_current", mini)
         self.assertNotIn("_Light_intensity", mini_data)
 
     def test_sprite_png_pixels_are_packed(self):
@@ -648,7 +651,8 @@ class TestSystemsRuns(unittest.TestCase):
                 "void engine_tick(void);\n"
                 "extern float Time_deltaTime;\n"
                 "extern float Time_time;\n"
-                "extern float engine_input_axis_Horizontal;\n"
+                "extern int engine_keyboard_connected;\n"
+                "extern int engine_keyboard_rightArrow;\n"
                 "extern float RenderSettings_ambient_r;\n"
                 "extern float _Light_intensity[];\n"
                 "typedef struct { float x, y, half_w, half_h;\n"
@@ -665,7 +669,8 @@ class TestSystemsRuns(unittest.TestCase):
                 "  float y0 = _Ball_inst_array[0].pos_y;\n"
                 "  float x0 = _Pad_inst_array[0].pos_x;\n"
                 "  Time_deltaTime = 0.02f;\n"
-                "  engine_input_axis_Horizontal = 1.f;\n"
+                "  engine_keyboard_connected = 1;\n"
+                "  engine_keyboard_rightArrow = 1;\n"
                 "  RenderSettings_ambient_r = 0.5f;\n"
                 "  int i;\n"
                 "  for (i = 0; i < 50; i = i + 1) engine_tick();\n"

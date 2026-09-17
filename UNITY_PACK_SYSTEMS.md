@@ -10,17 +10,19 @@ them; calling invent-requiring APIs today is a hard `PackError`.
 What *is* lowered: APIs and methods on the MonoBehaviours / scene
 instances that are already placed.
 
-## Input (Input Manager, host-fed)
+## Input (host-fed)
 
 | Script uses | Emitted |
 |-------------|---------|
 | `Input.GetAxis("Horizontal"\|"Vertical")` | Host floats `engine_input_axis_*` |
 | `Input.GetButton("Jump")` | Host int `engine_input_button_Jump` |
 | `Input.GetKey("a")` | Host table `engine_input_key[256]` |
+| `Keyboard.current` | Non-NULL when `engine_keyboard_connected` |
+| `Keyboard.current.<name>Key.isPressed` | Host int `engine_keyboard_<name>` |
 
-Legacy Input Manager only. New Input System `InputAction` /
-`Keyboard.current` / `Gamepad.current` are refused (would invent action
-maps / device graphs).
+Legacy Input Manager and Input System `Keyboard.current` (connected
+device + key state). `InputAction` maps and `Gamepad.current` are still
+refused (would invent action maps / device graphs).
 
 ## Animation (script motion)
 
@@ -89,7 +91,7 @@ components.
 |-------------|-------------|
 | `ParticleSystem.Emit` | Needs a ParticleSystem; packer will not invent a pool |
 | `AnimationCurve.Evaluate` | Needs authored curves; packer will not invent keyframes |
-| `InputAction` / `Keyboard.current` | Needs Input System assets / runtime |
+| `InputAction` / `Gamepad.current` | Needs Input System assets / runtime |
 | `UnityEngine.UI` / `Canvas` | Needs authored UI hierarchy |
 | `AddComponent<Light>` | Light must already be on a scene GameObject |
 | `AddComponent<Camera>` / `SpriteRenderer` | Must be authored; no invent-draw |
