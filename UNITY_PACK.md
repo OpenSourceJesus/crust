@@ -85,11 +85,12 @@ Godot: pass a directory containing `.tscn`. Blender: a JSON dump
 
 ## Display via GLES2
 
-`engine_collect_draws()` walks every instance with a packed position and
-fills an `EngineDraw` list (world xy, half-extents, RGB). Colours are a
-stable hash of the class name. The checked-in host
+`engine_collect_draws()` walks every authored SpriteRenderer with a project
+PNG and fills an `EngineDraw` list (world xy, half-extents, Z spin, tint,
+tex index), then sorts by TagManager sorting layer and `m_SortingOrder`
+(back-to-front). The checked-in host
 `examples/unity_pack/gles2_view.c` ticks the engine, draws each sprite as
-a coloured quad through the same surfaceless EGL/FBO path as
+a textured quad through the same surfaceless EGL/FBO path as
 `examples/gles2/triangle.c`, then prints ASCII (and optional PPM).
 
 ```
