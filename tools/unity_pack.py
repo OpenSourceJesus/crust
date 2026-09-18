@@ -268,6 +268,57 @@ def player_identity(root):
     return company, product
 
 
+def _load_sorting_layers(root):
+    """TagManager.asset m_SortingLayers → [{name, unique_id}, ...] in draw order.
+
+    Earlier list entries are behind later ones (Unity painter's algorithm).
+    Missing TagManager → single Default layer uniqueID 0.
+    """
+    path = os.path.join(root, "ProjectSettings", "TagManager.asset")
+    layers = []
+    if os.path.isfile(path):
+        text = _read(path)
+        sm = re.search(
+            r"(?ms)^\s*m_SortingLayers:\s*\n(.*?)(?=^\s*m_[A-Za-z]|\Z)",
+            text)
+        if sm:
+            for m in re.finditer(
+                    r"(?ms)^\s*-\s*name:\s*(.*?)\n\s*uniqueID:\s*(\d+)",
+                    sm.group(1)):
+                name = _yaml_scalar(m.group(1)) or m.group(1).strip()
+                layers.append({
+                    "name": name,
+                    "unique_id": int(m.group(2)),
+                })
+    if not layers:
+        layers = [{"name": "Default", "unique_id": 0}]
+    return layers
+
+
+def _apply_sprite_sorting(objects, sorting_layers):
+    """Resolve SpriteRenderer sorting_layer index from TagManager uniqueIDs."""
+    id_to_idx = {}
+    for i, L in enumerate(sorting_layers or []):
+        id_to_idx[int(L["unique_id"])] = i
+    for o in objects:
+        sp = o.get("sprite")
+        if not sp:
+            continue
+        lid = int(sp.get("sorting_layer_id") or 0)
+        if lid in id_to_idx:
+            sp["sorting_layer"] = id_to_idx[lid]
+        else:
+            # Fall back to authored m_SortingLayer index (clamped).
+            idx = int(sp.get("sorting_layer_yaml") or 0)
+            n = len(sorting_layers) if sorting_layers else 1
+            if idx < 0:
+                idx = 0
+            if idx >= n:
+                idx = n - 1
+            sp["sorting_layer"] = idx
+        sp["sorting_order"] = int(sp.get("sorting_order") or 0)
+
+
 def unity_player_log_path(company, product, home=None):
     """Host path matching Unity's Player.log layout for this OS."""
     if home is None:
@@ -636,11 +687,12 @@ def _curve_path_is_root(path_line):
 
 
 def _parse_animation_clip(text):
-    """Authored .anim → length, loop, root position/euler/scale keyframes."""
+    """Authored .anim → length, loop, legacy, root position/euler/scale keys."""
     nm = re.search(r"(?m)^\s+m_Name:\s*(.+)$", text)
     stop = re.search(r"(?m)^\s+m_StopTime:\s*([0-9.eE+-]+)", text)
     loop = re.search(r"(?m)^\s+m_LoopTime:\s*(\d+)", text)
     wrap = re.search(r"(?m)^\s+m_WrapMode:\s*(\d+)", text)
+    legacy = re.search(r"(?m)^\s+m_Legacy:\s*(\d+)", text)
     # WrapMode 2 = Loop; LoopTime 1 also loops.
     do_loop = 1
     if loop:
@@ -653,9 +705,6 @@ def _parse_animation_clip(text):
     def _root_vec3_curves(section_name):
         out = []
         # Each list entry: "- curve:" … "path: …"
-        pat = re.compile(
-            r"(?ms)^  - curve:\n(.*?)(?=^  - curve:|^  m_|\Z)")
-        # Find section body after m_PositionCurves: etc.
         sm = re.search(
             r"(?ms)^  %s:\s*\n(.*?)(?=^  m_[A-Z]|\Z)" % section_name, text)
         if not sm:
@@ -690,6 +739,7 @@ def _parse_animation_clip(text):
         "name": (nm.group(1).strip() if nm else "Clip"),
         "length": length,
         "loop": do_loop,
+        "legacy": int(legacy.group(1)) if legacy else 0,
         "pos_keys": pos,
         "euler_keys": euler,
         "scale_keys": scale,
@@ -1034,6 +1084,9 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 r"m_Sprite:\s*\{fileID:\s*(-?\d+)(?:,\s*guid:\s*"
                 r"([0-9a-fA-F]+))?",
                 block)
+            sid = re.search(r"(?m)^\s+m_SortingLayerID:\s*(-?\d+)", block)
+            sl = re.search(r"(?m)^\s+m_SortingLayer:\s*(-?\d+)", block)
+            so = re.search(r"(?m)^\s+m_SortingOrder:\s*(-?\d+)", block)
             has_sprite = False
             if spr and int(spr.group(1)) != 0:
                 g = spr.group(2).lower() if spr.group(2) else None
@@ -1048,6 +1101,9 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "sprite_file_id": int(spr.group(1)) if spr else 0,
                 "sprite_guid": (spr.group(2).lower()
                                 if spr and spr.group(2) else None),
+                "sorting_layer_id": int(sid.group(1)) if sid else 0,
+                "sorting_layer_yaml": int(sl.group(1)) if sl else 0,
+                "sorting_order": int(so.group(1)) if so else 0,
             }
         if kind == "Camera":
             ortho = re.search(r"(?m)^\s+orthographic:\s*(\d+)", block)
@@ -1289,27 +1345,30 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             pos, rot, scale = _resolve_world_trs(
                 xf["file_id"], by_id, world_cache)
         # Resolve Animation / Animator → clip guid (Animator via controller default).
+        # Legacy clips play only on Animation; Mecanim clips only on Animator.
         player = None
         if anim and anim.get("enabled", 1) and anim.get("clip_guid"):
             cg = anim["clip_guid"]
-            if cg in anim_clips:
+            clip = anim_clips.get(cg)
+            if clip and int(clip.get("legacy") or 0):
                 player = {
                     "kind": "animation",
                     "clip_guid": cg,
                     "playing": int(anim.get("play_automatically") or 0),
                     "speed": 1.0,
-                    "loop": int(anim_clips[cg].get("loop") or 0),
+                    "loop": int(clip.get("loop") or 0),
                 }
         elif animator and animator.get("enabled", 1) and animator.get(
                 "controller_guid"):
             cg = anim_controllers.get(animator["controller_guid"])
-            if cg and cg in anim_clips:
+            clip = anim_clips.get(cg) if cg else None
+            if cg and clip and not int(clip.get("legacy") or 0):
                 player = {
                     "kind": "animator",
                     "clip_guid": cg,
                     "playing": 1,  # Animator plays default state
                     "speed": 1.0,
-                    "loop": int(anim_clips[cg].get("loop") or 0),
+                    "loop": int(clip.get("loop") or 0),
                 }
         rb_mat2 = (rb2d or {}).get("material_guid")
         rb_mat3 = (rb3d or {}).get("material_guid")
@@ -1898,8 +1957,9 @@ def _build_collider3d_tables(plan):
 def _build_animation_tables(plan):
     """Authored Animation / Animator players + shared clip keyframe tables.
 
-    Root position curves apply as deltas from the clip's t=0 sample onto the
-    authored rest pose so one clip can drive multiple GOs.
+    Root position curves write absolute Transform.localPosition values from
+    the clip (Bob.anim x=2 → Spinner/Wave at x=2). Legacy clips bind only to
+    Animation; Mecanim clips only to Animator — see parse_unity_yaml.
     """
     clips_by_guid = {}
     clip_list = []
@@ -1910,10 +1970,7 @@ def _build_animation_tables(plan):
         if guid in clips_by_guid:
             return clips_by_guid[guid]
         pos = list(clip.get("pos_keys") or [])
-        if pos:
-            t0x, t0y, t0z = pos[0][1], pos[0][2], pos[0][3]
-            pos = [(t, x - t0x, y - t0y, z - t0z) for t, x, y, z in pos]
-        else:
+        if not pos:
             pos = [(0.0, 0.0, 0.0, 0.0)]
         idx = len(clip_list)
         entry = {
@@ -1921,6 +1978,7 @@ def _build_animation_tables(plan):
             "name": clip.get("name") or "Clip",
             "length": float(clip.get("length") or 1.0),
             "loop": int(clip.get("loop") or 0),
+            "legacy": int(clip.get("legacy") or 0),
             "pos_keys": pos,
             "key_begin": 0,
             "key_count": len(pos),
@@ -1937,7 +1995,7 @@ def _build_animation_tables(plan):
                 continue
             guid = p["clip_guid"]
             ci = _ensure_clip(guid, p["clip"])
-            rest = o.get("pos") or (0.0, 0.0, 0.0)
+            rest = o.get("local_pos") or o.get("pos") or (0.0, 0.0, 0.0)
             players.append({
                 "name": o.get("name") or "obj",
                 "owner_class": cname,
@@ -1949,6 +2007,7 @@ def _build_animation_tables(plan):
                 "loop": int(p.get("loop")
                             if p.get("loop") is not None
                             else clip_list[ci]["loop"]),
+                # Rest kept for diagnostics; tick writes absolute curve samples.
                 "rest_x": float(rest[0]),
                 "rest_y": float(rest[1]),
                 "rest_z": float(rest[2]) if len(rest) > 2 else 0.0,
@@ -2624,8 +2683,18 @@ def emit_engine(plan, analyses, used_apis):
         p("#include <string.h>")
     if want_log or want_console or want_str_plus or want_add_any:
         p("#include <stdio.h>")
-    if want_log:
+    want_draw_sort = False
+    for cl in plan["classes"].values():
+        for o in cl["instances"]:
+            sp = o.get("sprite")
+            if sp and sp.get("enabled", 1) and "tex_id" in sp:
+                want_draw_sort = True
+                break
+        if want_draw_sort:
+            break
+    if want_log or want_draw_sort:
         p("#include <stdlib.h>")
+    if want_log:
         p("#include <errno.h>")
         p("#ifdef _WIN32")
         p("#include <direct.h>")
@@ -3937,7 +4006,7 @@ def emit_engine(plan, analyses, used_apis):
         p("    int i;")
         p("    for (i = 0; i < _AnimPlayer_count; i = i + 1) {")
         p("        int ci, kb, kc;")
-        p("        float t, len, dx, dy, dz, nx, ny, nz;")
+        p("        float t, len, nx, ny, nz;")
         p("        unsigned oi;")
         p("        if (!_AnimPlayer_playing[i]) continue;")
         p("        ci = _AnimPlayer_clip[i];")
@@ -3957,12 +4026,10 @@ def emit_engine(plan, analyses, used_apis):
         p("        }")
         p("        kb = _AnimClip_key_begin[ci];")
         p("        kc = _AnimClip_key_count[ci];")
-        p("        dx = _anim_sample(_AnimKey_t, _AnimKey_x, kb, kc, t);")
-        p("        dy = _anim_sample(_AnimKey_t, _AnimKey_y, kb, kc, t);")
-        p("        dz = _anim_sample(_AnimKey_t, _AnimKey_z, kb, kc, t);")
-        p("        nx = _AnimPlayer_rest_x[i] + dx;")
-        p("        ny = _AnimPlayer_rest_y[i] + dy;")
-        p("        nz = _AnimPlayer_rest_z[i] + dz;")
+        # Absolute localPosition from the clip curve.
+        p("        nx = _anim_sample(_AnimKey_t, _AnimKey_x, kb, kc, t);")
+        p("        ny = _anim_sample(_AnimKey_t, _AnimKey_y, kb, kc, t);")
+        p("        nz = _anim_sample(_AnimKey_t, _AnimKey_z, kb, kc, t);")
         p("        oi = (unsigned)_AnimPlayer_owner_inst[i];")
         p("        switch (_AnimPlayer_owner_class[i]) {")
         for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
@@ -3999,14 +4066,26 @@ def emit_engine(plan, analyses, used_apis):
     p("")
 
     # Draw list: authored SpriteRenderer + project PNG only.
+    # Painter's order: TagManager sorting layer index, then m_SortingOrder.
     p("/* ---- draw list (SpriteRenderer + texture; see engine_draw.h) ---- */")
     p("typedef struct EngineDraw {")
     p("    float x, y, half_w, half_h;")
     p("    float cos_z, sin_z; /* m_LocalRotation around Z */")
     p("    float r, g, b;")
     p("    int tex; /* index into engine_texture_*; -1 = none */")
+    p("    int sorting_layer; /* TagManager m_SortingLayers index */")
+    p("    int sorting_order; /* SpriteRenderer.m_SortingOrder */")
     p("} EngineDraw;")
     p("")
+    if want_draw_sort:
+        p("static int _engine_draw_cmp(const void *a, const void *b) {")
+        p("    const EngineDraw *da = (const EngineDraw *)a;")
+        p("    const EngineDraw *db = (const EngineDraw *)b;")
+        p("    if (da->sorting_layer != db->sorting_layer)")
+        p("        return da->sorting_layer - db->sorting_layer;")
+        p("    return da->sorting_order - db->sorting_order;")
+        p("}")
+        p("")
     tex_n = len(plan.get("textures") or [])
     p("extern const int _engine_tex_count;")
     if tex_n:
@@ -4078,6 +4157,10 @@ def emit_engine(plan, analyses, used_apis):
             "%sf" % repr(float(sp.get("sin_z", 0.0))) for _i, sp in spr_idx))
         p("        static const int _spr_tex[] = { %s };" % ", ".join(
             str(int(sp["tex_id"])) for _i, sp in spr_idx))
+        p("        static const int _spr_layer[] = { %s };" % ", ".join(
+            str(int(sp.get("sorting_layer") or 0)) for _i, sp in spr_idx))
+        p("        static const int _spr_order[] = { %s };" % ", ".join(
+            str(int(sp.get("sorting_order") or 0)) for _i, sp in spr_idx))
         p("        static const unsigned _spr_i[] = { %s };" % ", ".join(
             str(i) for i, _sp in spr_idx))
         p("        int k;")
@@ -4105,11 +4188,16 @@ def emit_engine(plan, analyses, used_apis):
         p("            out[n].g = _spr_g[k];")
         p("            out[n].b = _spr_b[k];")
         p("            out[n].tex = _spr_tex[k];")
+        p("            out[n].sorting_layer = _spr_layer[k];")
+        p("            out[n].sorting_order = _spr_order[k];")
         p("            n = n + 1;")
         p("        }")
         p("    }")
     if not any_sprite:
         p("    /* no authored SpriteRenderers — nothing to draw */")
+    elif want_draw_sort:
+        p("    if (n > 1)")
+        p("        qsort(out, (size_t)n, sizeof(EngineDraw), _engine_draw_cmp);")
     p("    return n;")
     p("}")
     p("")
@@ -4168,6 +4256,8 @@ def emit_engine_draw_h():
         "    float cos_z, sin_z; /* m_LocalRotation around Z */\n"
         "    float r, g, b;\n"
         "    int tex; /* engine_texture_* index; -1 if none */\n"
+        "    int sorting_layer; /* TagManager m_SortingLayers index */\n"
+        "    int sorting_order; /* SpriteRenderer.m_SortingOrder */\n"
         "} EngineDraw;\n"
         "\n"
         "void engine_tick(void);\n"
@@ -5055,6 +5145,8 @@ def load_project(root):
     for path in _walk_files(root, (".json",)):
         if os.path.basename(path) == "blender_pack.json":
             objects.extend(parse_blender_json(_read(path)))
+    sorting_layers = _load_sorting_layers(root)
+    _apply_sprite_sorting(objects, sorting_layers)
 
     scripts = list(_walk_files(root, (".cs",)))
     _progress("analyzing %d script(s)" % len(scripts))
