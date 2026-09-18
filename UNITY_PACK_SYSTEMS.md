@@ -72,19 +72,18 @@ to be an authored packed MonoBehaviour (no invented component types).
 
 ## Animation (script motion + authored clips)
 
-| Script / scene uses | Emitted |
-|---------------------|---------|
-| `Time.time` | `float Time_time` (advanced in `engine_tick`) |
-| `Mathf.Sin` / `Mathf.Cos` | `sinf` / `cosf` wrappers (`-lm`) |
-| `transform.position = new Vector2(x, y)` | Direct `set_pos_*` on packed instances |
-| Authored `!u!111` Animation + `.anim` clip | Plays root position curves (`engine_animation_tick`) |
-| Authored `!u!95` Animator + `.controller` | Default state motion clip → same sampler |
+| Authored | Packed behaviour |
+|----------|------------------|
+| Authored `!u!111` Animation + **legacy** `.anim` | Plays root position curves (`engine_animation_tick`) |
+| Authored `!u!95` Animator + `.controller` | Default state motion **only if the clip is non-legacy** |
+| `m_Legacy: 1` on `.anim` | Legacy → `Animation` only; Mecanim → `Animator` only (Unity) |
 | `m_PlayAutomatically` / Animator default | Starts playing; loops when `m_LoopTime` / WrapMode Loop |
 
-Root **position** curves apply as **deltas from the clip's t=0 sample** onto the
-authored rest pose (one clip can drive multiple GOs). Child paths, blend trees,
-Animator parameters / transitions, and skeletal skins are not sampled yet.
-`AnimationCurve.Evaluate` without an authored curve asset remains refused.
+Root position keys write absolute `localPosition` from the clip (Bob.anim
+x=2 places Spinner/Wave at x=2 while y bobs). Child-path curves, blend trees,
+Avatar masks, Animator parameters / transitions, and skeletal skins are not
+sampled yet. `AnimationCurve.Evaluate` without an authored curve asset remains
+refused.
 
 ## Particles
 
@@ -108,6 +107,7 @@ slot (intensity 1, white) into the light table.
 | Authored `!u!20` Camera (MainCamera) | `Camera_main_pos_*` (incl. **z**), `orthographicSize`, near/far clip, background RGB |
 | `Camera.main.orthographicSize` / `.transform.position` / clip planes | Reads those globals |
 | Authored `!u!212` SpriteRenderer with `m_Sprite` → **project PNG** | Texture + tinted quad in `engine_collect_draws` |
+| `m_SortingLayerID` / `m_SortingOrder` (+ TagManager layers) | Draws sorted back-to-front (layer index, then order) |
 | Authored `m_LocalRotation` on Transform | Z spin via `EngineDraw.cos_z` / `sin_z` (identity if omitted) |
 | Authored `m_Father` / PrefabInstance `m_TransformParent` | World TRS = parent ∘ local (baked into packed `pos` / sprite spin) |
 
@@ -122,6 +122,11 @@ referenced sprite and re-packing changes the drawn texels. Tint comes from
 (PrefabInstance `m_TransformParent` is applied to stripped instance
 transforms). Runtime parent motion is not re-linked yet — hierarchy is
 baked at pack time.
+
+`engine_collect_draws` sorts by TagManager `m_SortingLayers` index (from
+`m_SortingLayerID`), then `m_SortingOrder` — lower draws first (behind).
+`EngineDraw.sorting_layer` / `sorting_order` expose the resolved keys.
+SystemsScene: BouncePad order **-10**, Stick on **Foreground**.
 
 Unity cameras look along **+Z** (identity rotation). `engine_collect_draws`
 keeps a sprite only when
@@ -222,7 +227,8 @@ foreach class: Update
 
 `examples/unity_pack/SystemsScene` — Bouncer / Ball / Pad (each with
 authored SpriteRenderer), HeavyBall + Ground (`Ice.physicsMaterial2D`), Wave
-(`Animation` + `Bob.anim`), Spinner (`Animator` + `Bob.controller`), Shade
+(`Animation` + legacy `Bob.anim`), Spinner (`Animator` + `Bob.controller`,
+idle — legacy clip is not Mecanim), Shade
 (Light only, no invent-draw), Main Camera:
 
 ```
