@@ -18,9 +18,7 @@ public class Pad : MonoBehaviour
 			move --;
 		if (Keyboard.current.rightArrowKey.isPressed)
 			move ++;
-		transform.position = new Vector2(
-			transform.position.x + move * speed * Time.deltaTime,
-			transform.position.y);
+		transform.position += new Vector3(move * speed * Time.deltaTime, 0);
 		print(move);
 		System.Console.WriteLine("" + Time.time);
 		SpriteRenderer spriteRend = gameObject.AddComponent<SpriteRenderer>();
