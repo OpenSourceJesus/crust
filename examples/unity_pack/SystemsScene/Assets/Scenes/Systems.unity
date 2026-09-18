@@ -170,3 +170,72 @@ Camera:
   orthographic: 1
   orthographic size: 3
   m_BackGroundColor: {r: 0.05, g: 0.05, b: 0.08, a: 1}
+--- !u!1 &8001
+GameObject:
+  m_Name: Wave
+  m_Component:
+  - component: {fileID: 8002}
+  - component: {fileID: 8003}
+  - component: {fileID: 8004}
+--- !u!4 &8002
+Transform:
+  m_GameObject: {fileID: 8001}
+  m_LocalPosition: {x: 2, y: 0, z: 0}
+  m_LocalScale: {x: 0.35, y: 0.35, z: 1}
+--- !u!212 &8003
+SpriteRenderer:
+  m_GameObject: {fileID: 8001}
+  m_Enabled: 1
+  m_Sprite: {fileID: 21300000, guid: 0f1e2d3c4b5a69788796a5b4c3d2e1f0, type: 3}
+  m_Color: {r: 1, g: 0.85, b: 0.2, a: 1}
+--- !u!111 &8004
+Animation:
+  m_GameObject: {fileID: 8001}
+  m_Enabled: 1
+  serializedVersion: 3
+  m_Animation: {fileID: 7400000, guid: c1a55e70000000000000000000000001, type: 2}
+  m_Animations:
+  - {fileID: 7400000, guid: c1a55e70000000000000000000000001, type: 2}
+  m_WrapMode: 2
+  m_PlayAutomatically: 1
+  m_AnimatePhysics: 0
+  m_CullingType: 0
+--- !u!1 &9001
+GameObject:
+  m_Name: Spinner
+  m_Component:
+  - component: {fileID: 9002}
+  - component: {fileID: 9003}
+  - component: {fileID: 9004}
+--- !u!4 &9002
+Transform:
+  m_GameObject: {fileID: 9001}
+  m_LocalPosition: {x: -2.5, y: 1.2, z: 0}
+  m_LocalScale: {x: 0.3, y: 0.3, z: 1}
+--- !u!212 &9003
+SpriteRenderer:
+  m_GameObject: {fileID: 9001}
+  m_Enabled: 1
+  m_Sprite: {fileID: 21300000, guid: 0f1e2d3c4b5a69788796a5b4c3d2e1f0, type: 3}
+  m_Color: {r: 0.9, g: 0.5, b: 1, a: 1}
+--- !u!95 &9004
+Animator:
+  serializedVersion: 5
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 9001}
+  m_Enabled: 1
+  m_Avatar: {fileID: 0}
+  m_Controller: {fileID: 9100000, guid: c0a70100000000000000000000000001, type: 2}
+  m_CullingMode: 0
+  m_UpdateMode: 0
+  m_ApplyRootMotion: 0
+  m_LinearVelocityBlending: 0
+  m_StabilizeFeet: 0
+  m_WarningMessage: 
+  m_HasTransformHierarchy: 1
+  m_AllowConstantClipSamplingOptimization: 1
+  m_KeepAnimatorStateOnDisable: 0
+  m_WriteDefaultValuesOnDisable: 0

@@ -146,6 +146,6 @@ Opt-in lowering of Input Manager axes, `Time.time` / `Mathf.Sin`,
 `RenderSettings.ambientLight`, authored Lights / Cameras /
 SpriteRenderers, and `Physics2D.gravity` + `FixedUpdate` on **authored**
 scene objects — see [UNITY_PACK_SYSTEMS.md](UNITY_PACK_SYSTEMS.md). The
-packer does not invent ParticleSystem pools, AnimationCurves, Canvas/UI,
-InputAction maps, lights, cameras, or default GameObject visuals.
+packer does not invent ParticleSystem pools, Canvas/UI, or InputAction maps.
+Authored AnimationClips / AnimatorControllers and Rigidbodies are packed.
 Fixture: `examples/unity_pack/SystemsScene`.

@@ -6,7 +6,9 @@ public class Player : MonoBehaviour {
     public float speed;
 
     public void Update() {
-        transform.position += new Vector2(speed * Time.deltaTime, 0);
+        transform.position = new Vector2(
+            transform.position.x + speed * Time.deltaTime,
+            transform.position.y);
         hp = hp;
     }
 }
