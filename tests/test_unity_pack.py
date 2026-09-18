@@ -370,6 +370,32 @@ class TestSystems(unittest.TestCase):
         self.assertIn("AmbientBias_get_lift(i) * 0.f", engine)
         self.assertNotIn("AmbientBias_get_lift(i) * 0f", engine)
 
+    def test_sprite_sorting_layers_and_order(self):
+        """TagManager layers + SpriteRenderer order → sorted EngineDraw list."""
+        layers = unity_pack._load_sorting_layers(SYSTEMS)
+        self.assertEqual([L["name"] for L in layers], ["Default", "Foreground"])
+        self.assertEqual(layers[1]["unique_id"], 2081823273)
+        objs, _a, _l, _c = unity_pack.load_project(SYSTEMS)
+        by_name = {o["name"]: o for o in objs}
+        bouncer = by_name["BouncePad"]["sprite"]
+        stick = by_name["Stick"]["sprite"]
+        self.assertEqual(bouncer["sorting_order"], -10)
+        self.assertEqual(bouncer["sorting_layer"], 0)
+        self.assertEqual(stick["sorting_layer_id"], 2081823273)
+        self.assertEqual(stick["sorting_layer"], 1)
+        d = tempfile.mkdtemp(prefix="upack-sort-")
+        unity_pack.pack(SYSTEMS, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            engine = f.read()
+        self.assertIn("sorting_layer", engine)
+        self.assertIn("sorting_order", engine)
+        self.assertIn("qsort", engine)
+        self.assertIn("_engine_draw_cmp", engine)
+        with open(os.path.join(d, "engine_draw.h")) as f:
+            hdr = f.read()
+        self.assertIn("int sorting_layer;", hdr)
+        self.assertIn("int sorting_order;", hdr)
+
     def test_vector3_plus_equals_vector2_is_cs0034(self):
         """transform.position is Vector3; += Vector2 is ambiguous in csc."""
         bad = (
@@ -846,20 +872,119 @@ class TestSystems(unittest.TestCase):
         objs, _a, _l, _c = unity_pack.load_project(SYSTEMS)
         wave = [o for o in objs if o["name"] == "Wave"][0]
         spin = [o for o in objs if o["name"] == "Spinner"][0]
+        # Bob.anim is legacy → Animation on Wave plays; Animator on Spinner idle.
         self.assertEqual(wave["anim_player"]["kind"], "animation")
-        self.assertEqual(spin["anim_player"]["kind"], "animator")
+        self.assertIsNone(spin.get("anim_player"))
         self.assertTrue(wave["anim_player"]["playing"])
+        self.assertTrue(wave["anim_player"]["clip"]["legacy"])
         self.assertAlmostEqual(wave["anim_player"]["clip"]["length"], 1.0)
         self.assertEqual(len(wave["anim_player"]["clip"]["pos_keys"]), 3)
+        self.assertAlmostEqual(wave["anim_player"]["clip"]["pos_keys"][0][1], 2.0)
         d = tempfile.mkdtemp(prefix="upack-anim-")
         plan = unity_pack.pack(SYSTEMS, d)
-        self.assertEqual(len(plan["animation"]["players"]), 2)
+        self.assertEqual(len(plan["animation"]["players"]), 1)
+        self.assertEqual(plan["animation"]["players"][0]["name"], "Wave")
         self.assertEqual(len(plan["animation"]["clips"]), 1)
+        # Packed keys are absolute localPosition (x constantly 2).
+        keys = plan["animation"]["keys"]
+        self.assertAlmostEqual(keys[0]["x"], 2.0)
+        self.assertAlmostEqual(keys[1]["x"], 2.0)
+        self.assertAlmostEqual(keys[1]["y"], 0.5)
+        self.assertAlmostEqual(plan["animation"]["players"][0]["rest_x"], 2.0)
         self.assertFalse(plan["classes"]["Wave"]["static"])
         with open(os.path.join(d, "engine.c")) as f:
             eng = f.read()
         self.assertIn("engine_animation_tick", eng)
         self.assertIn("Wave_set_pos_y", eng)
+        self.assertIn("Wave_set_pos_x", eng)
+
+    def test_mecanim_clip_drives_animator_not_animation(self):
+        """Non-legacy Bob.anim → Spinner Animator plays; Wave Animation idle."""
+        root = tempfile.mkdtemp(prefix="upack-mecanim-")
+        scene = os.path.join(root, "SystemsScene")
+        shutil.copytree(SYSTEMS, scene)
+        anim = os.path.join(scene, "Assets", "Animations", "Bob.anim")
+        text = open(anim).read().replace("m_Legacy: 1", "m_Legacy: 0")
+        with open(anim, "w") as f:
+            f.write(text)
+        objs, _a, _l, _c = unity_pack.load_project(scene)
+        wave = [o for o in objs if o["name"] == "Wave"][0]
+        spin = [o for o in objs if o["name"] == "Spinner"][0]
+        self.assertIsNone(wave.get("anim_player"))
+        self.assertEqual(spin["anim_player"]["kind"], "animator")
+        self.assertFalse(spin["anim_player"]["clip"]["legacy"])
+        d = tempfile.mkdtemp(prefix="upack-mecanim-out-")
+        plan = unity_pack.pack(scene, d)
+        self.assertEqual(len(plan["animation"]["players"]), 1)
+        self.assertEqual(plan["animation"]["players"][0]["name"], "Spinner")
+        self.assertAlmostEqual(plan["animation"]["players"][0]["rest_x"], -2.5)
+        # Runtime: absolute curve → Spinner at x=2 (Bob.anim), Wave idle.
+        if not _CC:
+            return
+        spin_cl = plan["classes"]["Spinner"]
+        wave_cl = plan["classes"]["Wave"]
+        spin_z = "" if spin_cl.get("two_d") else " float pos_z;"
+        wave_z = "" if wave_cl.get("two_d") else " float pos_z;"
+        host = os.path.join(d, "host.c")
+        with open(host, "w") as f:
+            f.write(
+                "#include <stdio.h>\n"
+                "void engine_tick(void);\n"
+                "extern float Time_deltaTime;\n"
+                "typedef struct { float x, y, half_w, half_h;\n"
+                "                 float cos_z, sin_z;\n"
+                "                 float r, g, b; int tex;\n"
+                "                 int sorting_layer; int sorting_order;\n"
+                "               } EngineDraw;\n"
+                "int engine_collect_draws(EngineDraw *out, int max);\n"
+                "typedef struct Spinner Spinner;\n"
+                "struct Spinner { float pos_x; float pos_y;%s };\n"
+                "extern Spinner _Spinner_inst_array[];\n"
+                "typedef struct Wave Wave;\n"
+                "struct Wave { float pos_x; float pos_y;%s };\n"
+                "extern Wave _Wave_inst_array[];\n"
+                "int main(void) {\n"
+                "  float wy0 = _Wave_inst_array[0].pos_y;\n"
+                "  Time_deltaTime = 0.02f;\n"
+                "  int i;\n"
+                "  for (i = 0; i < 25; i = i + 1) engine_tick();\n"
+                "  if (_Wave_inst_array[0].pos_y < wy0 - 0.01f\n"
+                "      || _Wave_inst_array[0].pos_y > wy0 + 0.01f)\n"
+                "    return 2; /* Wave must not bob without legacy clip */\n"
+                "  if (_Spinner_inst_array[0].pos_x < 1.99f\n"
+                "      || _Spinner_inst_array[0].pos_x > 2.01f)\n"
+                "    return 3; /* Bob.anim localPosition.x == 2 */\n"
+                "  if (_Spinner_inst_array[0].pos_y < 0.4f) return 4;\n"
+                "  EngineDraw buf[64];\n"
+                "  int n = engine_collect_draws(buf, 64);\n"
+                "  if (n != 5) return 5;\n"
+                "  { int j; int found = 0;\n"
+                "    for (j = 0; j < n; j = j + 1)\n"
+                "      if (buf[j].x > 1.9f && buf[j].x < 2.1f\n"
+                "          && buf[j].y > 0.3f) found = 1;\n"
+                "    if (!found) return 6; /* Spinner drawn at curve x */\n"
+                "  }\n"
+                "  return 0;\n"
+                "}\n" % (spin_z, wave_z)
+            )
+        r = subprocess.run(
+            [_CC, "-O2", "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(
+            [_CC, "-O0", "-c", "-o", os.path.join(d, "data.o"),
+             os.path.join(d, "data.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        exe = os.path.join(d, "host")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host,
+             os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
 
     def test_addcomponent_camera_and_rigidbody2d(self):
         """AddComponent refuses a second DisallowMultipleComponent with Unity's error."""
@@ -1592,7 +1717,9 @@ class TestSystemsRuns(unittest.TestCase):
                 "extern float _Light_intensity[];\n"
                 "typedef struct { float x, y, half_w, half_h;\n"
                 "                 float cos_z, sin_z;\n"
-                "                 float r, g, b; int tex; } EngineDraw;\n"
+                "                 float r, g, b; int tex;\n"
+                "                 int sorting_layer; int sorting_order;\n"
+                "               } EngineDraw;\n"
                 "int engine_collect_draws(EngineDraw *out, int max);\n"
                 "typedef struct Ball Ball;\n"
                 "struct Ball { float pos_x; float pos_y; };\n"
@@ -1600,6 +1727,9 @@ class TestSystemsRuns(unittest.TestCase):
                 "typedef struct Pad Pad;\n"
                 "struct Pad { float pos_x; float pos_y; float speed; };\n"
                 "extern Pad _Pad_inst_array[];\n"
+                "typedef struct Wave Wave;\n"
+                "struct Wave { float pos_x; float pos_y; };\n"
+                "extern Wave _Wave_inst_array[];\n"
                 "int main(void) {\n"
                 "  float y0 = _Ball_inst_array[0].pos_y;\n"
                 "  float x0 = _Pad_inst_array[0].pos_x;\n"
@@ -1608,7 +1738,12 @@ class TestSystemsRuns(unittest.TestCase):
                 "  engine_keyboard_rightArrow = 1;\n"
                 "  RenderSettings_ambient_r = 0.5f;\n"
                 "  int i;\n"
-                "  for (i = 0; i < 50; i = i + 1) engine_tick();\n"
+                "  for (i = 0; i < 25; i = i + 1) engine_tick();\n"
+                "  /* Bob.anim localPosition.x is constantly 2; y peaks at 0.5. */\n"
+                "  if (_Wave_inst_array[0].pos_x < 1.99f\n"
+                "      || _Wave_inst_array[0].pos_x > 2.01f) return 9;\n"
+                "  if (_Wave_inst_array[0].pos_y < 0.4f) return 10;\n"
+                "  for (i = 0; i < 25; i = i + 1) engine_tick();\n"
                 "  EngineDraw buf[128];\n"
                 "  int n = engine_collect_draws(buf, 128);\n"
                 "  if (Time_time < 0.9f) return 2;\n"
@@ -1626,6 +1761,22 @@ class TestSystemsRuns(unittest.TestCase):
                 "  }\n"
                 "  /* Ground top ≈ -2.25; ball radius ≈ 0.225 → rest y ≳ -2.05 */\n"
                 "  if (_Ball_inst_array[0].pos_y < -2.1f) return 8;\n"
+                "  if (_Wave_inst_array[0].pos_x < 1.99f\n"
+                "      || _Wave_inst_array[0].pos_x > 2.01f) return 12;\n"
+                "  /* Spinner stays at authored (-2.5, 1.2): legacy clip ≠ Animator. */\n"
+                "  { int j; int found = 0;\n"
+                "    for (j = 0; j < n; j = j + 1) {\n"
+                "      if (buf[j].x > -2.6f && buf[j].x < -2.4f\n"
+                "          && buf[j].y > 1.1f && buf[j].y < 1.3f)\n"
+                "        found = 1;\n"
+                "    }\n"
+                "    if (!found) return 11;\n"
+                "  }\n"
+                "  /* Bouncer sortingOrder -10 first; Stick Foreground last. */\n"
+                "  if (buf[0].sorting_order != -10) return 13;\n"
+                "  if (buf[n - 1].sorting_layer != 1) return 14;\n"
+                "  if (buf[n - 1].cos_z < 0.7f || buf[n - 1].cos_z > 0.72f)\n"
+                "    return 15; /* Stick 45deg on Foreground */\n"
                 "  return 0;\n"
                 "}\n"
             )
@@ -1657,19 +1808,21 @@ class TestSystemsRuns(unittest.TestCase):
             f.write(
                 "typedef struct { float x, y, half_w, half_h;\n"
                 "                 float cos_z, sin_z;\n"
-                "                 float r, g, b; int tex; } EngineDraw;\n"
+                "                 float r, g, b; int tex;\n"
+                "                 int sorting_layer; int sorting_order;\n"
+                "               } EngineDraw;\n"
                 "int engine_collect_draws(EngineDraw *out, int max);\n"
                 "extern float Camera_main_pos_z;\n"
                 "int main(void) {\n"
                 "  EngineDraw buf[128];\n"
                 "  int n0 = engine_collect_draws(buf, 128);\n"
-                "  if (n0 != 3) return 1;\n"
+                "  if (n0 != 5) return 1;\n"
                 "  Camera_main_pos_z = 10.f;\n"
                 "  int n1 = engine_collect_draws(buf, 128);\n"
                 "  if (n1 != 0) return 2;\n"
                 "  Camera_main_pos_z = -10.f;\n"
                 "  int n2 = engine_collect_draws(buf, 128);\n"
-                "  if (n2 != 3) return 3;\n"
+                "  if (n2 != 5) return 3;\n"
                 "  return 0;\n"
                 "}\n"
             )
