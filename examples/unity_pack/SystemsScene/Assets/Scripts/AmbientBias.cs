@@ -8,6 +8,6 @@ public class AmbientBias : MonoBehaviour {
         lift = RenderSettings.ambientLight.r;
         transform.position = new Vector2(
             transform.position.x,
-            transform.position.y + lift * 0.f);
+            transform.position.y + lift * 0f);
     }
 }

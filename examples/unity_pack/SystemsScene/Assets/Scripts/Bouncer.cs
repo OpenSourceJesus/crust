@@ -1,7 +1,6 @@
 using UnityEngine;
 
 /* Animation subset: bob Y from Time.time + Mathf.Sin. */
-[Shared]
 public class Bouncer : MonoBehaviour {
     public float baseY;
     public float amp;

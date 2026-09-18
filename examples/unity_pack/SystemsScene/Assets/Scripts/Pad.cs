@@ -1,7 +1,6 @@
 using UnityEngine;
 using UnityEngine.InputSystem;
 
-[Shared]
 public class Pad : MonoBehaviour
 {
 	public float speed;
@@ -19,10 +18,12 @@ public class Pad : MonoBehaviour
 			move --;
 		if (Keyboard.current.rightArrowKey.isPressed)
 			move ++;
-		transform.position += new Vector2(move * speed * Time.deltaTime, 0);
+		transform.position = new Vector2(
+			transform.position.x + move * speed * Time.deltaTime,
+			transform.position.y);
 		print(move);
 		System.Console.WriteLine("" + Time.time);
-		Camera cam = gameObject.AddComponent<Camera>();
-		System.Console.WriteLine(cam);
+		SpriteRenderer spriteRend = gameObject.AddComponent<SpriteRenderer>();
+		System.Console.WriteLine(spriteRend);
 	}
 }
