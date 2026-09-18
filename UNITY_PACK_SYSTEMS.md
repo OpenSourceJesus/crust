@@ -4,10 +4,10 @@
 project. It **does not invent assets**: no synthetic ParticleSystem
 pools, no default AnimationCurves, no Canvas, no InputAction maps.
 Runtime `AddComponent<T>()` works for packed builtins (Camera, Light,
-SpriteRenderer, Rigidbody/2D, Box/Circle/Sphere colliders) and for
-authored MonoBehaviours — GetOrAdd into a pre-sized pool (one spare slot
-per calling instance). Scripts that need other Unity features keep them
-in the authored project until the packer can import them; calling
+SpriteRenderer, Rigidbody/2D, Box/Circle/Sphere colliders, Animation,
+Animator) and for authored MonoBehaviours — GetOrAdd into a pre-sized pool
+(one spare slot per calling instance). Scripts that need other Unity features
+keep them in the authored project until the packer can import them; calling
 invent-requiring APIs today is a hard `PackError`.
 
 Emitted `engine.c` / `data.c` / `main.c` are also gated through
@@ -70,16 +70,21 @@ csrust uses). Find **does not** fail at pack time for unknown names —
 lookup is runtime only (Unity null). `GetComponent<T>` still requires `T`
 to be an authored packed MonoBehaviour (no invented component types).
 
-## Animation (script motion)
+## Animation (script motion + authored clips)
 
-| Script uses | Emitted |
-|-------------|---------|
+| Script / scene uses | Emitted |
+|---------------------|---------|
 | `Time.time` | `float Time_time` (advanced in `engine_tick`) |
 | `Mathf.Sin` / `Mathf.Cos` | `sinf` / `cosf` wrappers (`-lm`) |
 | `transform.position = new Vector2(x, y)` | Direct `set_pos_*` on packed instances |
+| Authored `!u!111` Animation + `.anim` clip | Plays root position curves (`engine_animation_tick`) |
+| Authored `!u!95` Animator + `.controller` | Default state motion clip → same sampler |
+| `m_PlayAutomatically` / Animator default | Starts playing; loops when `m_LoopTime` / WrapMode Loop |
 
-Bob or lerp positions from `Time` / `Mathf` on objects that exist in the
-scene. No Animator, Mecanim, or skeletal skins.
+Root **position** curves apply as **deltas from the clip's t=0 sample** onto the
+authored rest pose (one clip can drive multiple GOs). Child paths, blend trees,
+Animator parameters / transitions, and skeletal skins are not sampled yet.
+`AnimationCurve.Evaluate` without an authored curve asset remains refused.
 
 ## Particles
 
@@ -216,7 +221,8 @@ foreach class: Update
 ## Fixture
 
 `examples/unity_pack/SystemsScene` — Bouncer / Ball / Pad (each with
-authored SpriteRenderer), HeavyBall + Ground (`Ice.physicsMaterial2D`), Shade
+authored SpriteRenderer), HeavyBall + Ground (`Ice.physicsMaterial2D`), Wave
+(`Animation` + `Bob.anim`), Spinner (`Animator` + `Bob.controller`), Shade
 (Light only, no invent-draw), Main Camera:
 
 ```
