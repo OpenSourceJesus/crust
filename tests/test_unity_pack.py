@@ -324,6 +324,97 @@ SYSTEMS = os.path.join(ROOT, "examples", "unity_pack", "SystemsScene")
 class TestSystems(unittest.TestCase):
     """Authored systems subset — see UNITY_PACK_SYSTEMS.md."""
 
+    def test_cpp_style_float_suffix_is_cs1061(self):
+        """C++ `0.f` is not a C# real-literal — csc reports CS1061 on `f`."""
+        src = (
+            "using UnityEngine;\n"
+            "\n"
+            "/* Lighting subset: read authored ambient; no invented Light. */\n"
+            "public class AmbientBias : MonoBehaviour {\n"
+            "    public float lift;\n"
+            "\n"
+            "    public void Update() {\n"
+            "        lift = RenderSettings.ambientLight.r;\n"
+            "        transform.position = new Vector2(\n"
+            "            transform.position.x,\n"
+            "            transform.position.y + lift * 0.f);\n"
+            "    }\n"
+            "}\n"
+        )
+        path = "/proj/Assets/Scripts/AmbientBias.cs"
+        with self.assertRaises(unity_pack.PackError) as cm:
+            unity_pack.analyze_script(path, src)
+        self.assertEqual(
+            cm.exception.message,
+            "Assets/Scripts/AmbientBias.cs(11,45): error CS1061: 'int' does "
+            "not contain a definition for 'f' and no accessible extension "
+            "method 'f' accepting a first argument of type 'int' could be "
+            "found (are you missing a using directive or an assembly "
+            "reference?)")
+        # Valid spellings still analyze.
+        unity_pack.analyze_script(path, src.replace("0.f", "0f"))
+        unity_pack.analyze_script(path, src.replace("0.f", "0.0f"))
+
+    def test_csharp_0f_lowers_to_c_0_dot_f(self):
+        """C# `0f` is valid; emitted C must spell `0.f` (gcc rejects `0f`)."""
+        self.assertEqual(unity_pack._rewrite_csharp_float_literals("x * 0f"),
+                         "x * 0.f")
+        self.assertEqual(unity_pack._rewrite_csharp_float_literals("1.5f + 2F"),
+                         "1.5f + 2.F")
+        self.assertEqual(unity_pack._rewrite_csharp_float_literals('"0f"'),
+                         '"0f"')
+        d = tempfile.mkdtemp(prefix="upack-0f-")
+        unity_pack.pack(SYSTEMS, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            engine = f.read()
+        self.assertIn("AmbientBias_get_lift(i) * 0.f", engine)
+        self.assertNotIn("AmbientBias_get_lift(i) * 0f", engine)
+
+    def test_vector3_plus_equals_vector2_is_cs0034(self):
+        """transform.position is Vector3; += Vector2 is ambiguous in csc."""
+        bad = (
+            "using UnityEngine;\n"
+            "using UnityEngine.InputSystem;\n"
+            "\n"
+            "public class Pad : MonoBehaviour\n"
+            "{\n"
+            "\tpublic float speed;\n"
+            "\n"
+            "\tvoid Start ()\n"
+            "\t{\n"
+            "\t\tDebug.Log(\"Hello World!\");\n"
+            "\t\tSystem.Console.WriteLine(GameObject.Find(\"BouncePad\")"
+            ".GetComponent<Bouncer>().amp);\n"
+            "\t}\n"
+            "\n"
+            "\tvoid Update ()\n"
+            "\t{\n"
+            "\t\tfloat move = 0;\n"
+            "\t\tif (Keyboard.current.leftArrowKey.isPressed)\n"
+            "\t\t\tmove --;\n"
+            "\t\tif (Keyboard.current.rightArrowKey.isPressed)\n"
+            "\t\t\tmove ++;\n"
+            "\t\ttransform.position += "
+            "new Vector2(move * speed * Time.deltaTime, 0);\n"
+            "\t\tprint(move);\n"
+            "\t\tSystem.Console.WriteLine(\"\" + Time.time);\n"
+            "\t\tSpriteRenderer spriteRend = "
+            "gameObject.AddComponent<SpriteRenderer>();\n"
+            "\t\tSystem.Console.WriteLine(spriteRend);\n"
+            "\t}\n"
+            "}\n"
+        )
+        path = "/proj/Assets/Scripts/Pad.cs"
+        with self.assertRaises(unity_pack.PackError) as cm:
+            unity_pack.analyze_script(path, bad)
+        self.assertEqual(
+            cm.exception.message,
+            "Assets/Scripts/Pad.cs(21,3): error CS0034: Operator '+=' is "
+            "ambiguous on operands of type 'Vector3' and 'Vector2'")
+        # Fixture Pad.cs uses assignment (valid Vector2→Vector3).
+        unity_pack.analyze_script(
+            os.path.join(SYSTEMS, "Assets", "Scripts", "Pad.cs"))
+
     def test_detects_system_apis(self):
         _objs, analyses, lights, cameras = unity_pack.load_project(SYSTEMS)
         apis = set()
@@ -349,7 +440,7 @@ class TestSystems(unittest.TestCase):
         self.assertNotIn("ParticleSystem.Emit", apis)
         self.assertNotIn("AnimationCurve.Evaluate", apis)
         spr = [o for o in _objs if o.get("sprite")]
-        self.assertEqual(len(spr), 3)  # Bouncer, Ball, Pad — not Shade
+        self.assertEqual(len(spr), 5)  # Bouncer, Ball, Pad, Wave, Spinner
         stick = [o for o in _objs if o["name"] == "Stick"][0]
         self.assertAlmostEqual(stick["sprite"]["rot_z"], math.pi / 4, places=5)
         self.assertAlmostEqual(stick["sprite"]["cos_z"], math.cos(math.pi / 4),
@@ -454,6 +545,9 @@ class TestSystems(unittest.TestCase):
         self.assertIn("out[n].cos_z", engine)
         self.assertIn("_spr_sin", engine)
         self.assertIn("engine_physics_collide2d", engine)
+        self.assertIn("engine_animation_tick", engine)
+        self.assertIn("_AnimPlayer_count", data)
+        self.assertIn("_AnimKey_y", data)
         self.assertIn("_engine_tex0_rgba", data)
         self.assertIn("engine_texture_rgba", engine)
         self.assertNotIn("ParticleSystem_Emit", engine)
@@ -716,7 +810,9 @@ class TestSystems(unittest.TestCase):
                 "public class Ghost : MonoBehaviour {\n"
                 "    public float speed;\n"
                 "    public void Update() {\n"
-                "        transform.position += new Vector2(speed * Time.deltaTime, 0);\n"
+                "        transform.position = new Vector2(\n"
+                "            transform.position.x + speed * Time.deltaTime,\n"
+                "            transform.position.y);\n"
                 "    }\n"
                 "}\n"
             )
@@ -746,16 +842,41 @@ class TestSystems(unittest.TestCase):
         self.assertIn("no authored SpriteRenderers", engine)
         self.assertNotIn("out[n].half_w", engine)
 
-    def test_addcomponent_camera_and_rigidbody2d(self):
-        """AddComponent is GetOrAdd into a pre-sized pool (safe in Update)."""
-        d = tempfile.mkdtemp(prefix="upack-addcomp-")
+    def test_authored_animation_and_animator(self):
+        objs, _a, _l, _c = unity_pack.load_project(SYSTEMS)
+        wave = [o for o in objs if o["name"] == "Wave"][0]
+        spin = [o for o in objs if o["name"] == "Spinner"][0]
+        self.assertEqual(wave["anim_player"]["kind"], "animation")
+        self.assertEqual(spin["anim_player"]["kind"], "animator")
+        self.assertTrue(wave["anim_player"]["playing"])
+        self.assertAlmostEqual(wave["anim_player"]["clip"]["length"], 1.0)
+        self.assertEqual(len(wave["anim_player"]["clip"]["pos_keys"]), 3)
+        d = tempfile.mkdtemp(prefix="upack-anim-")
         plan = unity_pack.pack(SYSTEMS, d)
-        self.assertIn("Camera", plan.get("addcomponent_types") or [])
+        self.assertEqual(len(plan["animation"]["players"]), 2)
+        self.assertEqual(len(plan["animation"]["clips"]), 1)
+        self.assertFalse(plan["classes"]["Wave"]["static"])
         with open(os.path.join(d, "engine.c")) as f:
             eng = f.read()
-        self.assertIn("GameObject_AddComponent_Camera", eng)
-        self.assertIn("Camera_ToString", eng)
-        self.assertIn("GameObject_AddComponent_Camera(_engine_go_of_Pad", eng)
+        self.assertIn("engine_animation_tick", eng)
+        self.assertIn("Wave_set_pos_y", eng)
+
+    def test_addcomponent_camera_and_rigidbody2d(self):
+        """AddComponent refuses a second DisallowMultipleComponent with Unity's error."""
+        d = tempfile.mkdtemp(prefix="upack-addcomp-")
+        plan = unity_pack.pack(SYSTEMS, d)
+        self.assertIn("SpriteRenderer", plan.get("addcomponent_types") or [])
+        self.assertIn("Stick", plan.get("go_has_sprite") or [])
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("GameObject_AddComponent_SpriteRenderer", eng)
+        self.assertIn("_engine_cant_add_component", eng)
+        self.assertIn(
+            "Can't add component '%s' to %s because such a component is "
+            "already added to the game object!",
+            eng)
+        self.assertIn(
+            "GameObject_AddComponent_SpriteRenderer(_engine_go_of_Pad", eng)
 
         root = tempfile.mkdtemp(prefix="upack-addrb-")
         scripts = os.path.join(root, "Assets", "Scripts")
@@ -795,6 +916,45 @@ class TestSystems(unittest.TestCase):
             eng2 = f.read()
         self.assertIn("GameObject_AddComponent_Rigidbody2D", eng2)
         self.assertIn("Rigidbody2D_ToString", eng2)
+
+    @needs_cc
+    def test_addcomponent_disallow_multiple_prints_unity_error(self):
+        """Stick already has SpriteRenderer — Pad's AddComponent prints Unity's line."""
+        d = tempfile.mkdtemp(prefix="upack-disallow-run-")
+        unity_pack.pack(SYSTEMS, d)
+        host = os.path.join(d, "host.c")
+        with open(host, "w") as f:
+            f.write(
+                "void engine_tick(void);\n"
+                "int main(void) {\n"
+                "  engine_tick();\n"
+                "  return 0;\n"
+                "}\n"
+            )
+        r = subprocess.run(
+            [_CC, "-O2", "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(
+            [_CC, "-O0", "-c", "-o", os.path.join(d, "data.o"),
+             os.path.join(d, "data.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(
+            [_CC, "-O2", "-o", os.path.join(d, "t"),
+             os.path.join(d, "engine.o"), os.path.join(d, "data.o"), host,
+             "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run(
+            [os.path.join(d, "t")], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn(
+            "Can't add component 'SpriteRenderer' to Stick because such a "
+            "component is already added to the game object!",
+            run.stderr)
+        self.assertIn("null", run.stdout)  # AddComponent returned null
 
     def test_authored_rigidbody2d_is_packed(self):
         objs, _a, _l, _c = unity_pack.load_project(SYSTEMS)
@@ -1455,7 +1615,7 @@ class TestSystemsRuns(unittest.TestCase):
                 "  if (_Ball_inst_array[0].pos_y >= y0) return 3;\n"
                 "  if (_Pad_inst_array[0].pos_x <= x0) return 4;\n"
                 "  if (_Light_intensity[0] < 1.4f) return 5;\n"
-                "  if (n != 3) return 6; /* SpriteRenderer on Bouncer+Ball+Pad */\n"
+                "  if (n != 5) return 6; /* SpriteRenderer on BouncePad+Ball+Stick+Wave+Spinner */\n"
                 "  { int j; int found = 0;\n"
                 "    for (j = 0; j < n; j = j + 1) {\n"
                 "      if (buf[j].cos_z > 0.7f && buf[j].cos_z < 0.72f\n"

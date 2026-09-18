@@ -9,7 +9,10 @@ spawned, N ≤ 256).
 
 Does not invent scene assets (ParticleSystem pools, AnimationCurves,
 InputAction maps). Runtime `AddComponent<T>` is supported for packed
-builtins and authored MonoBehaviours (GetOrAdd into a pre-sized pool).
+builtins and authored MonoBehaviours. Types with
+`DisallowMultipleComponent` (all packed builtins; scripts that declare
+the attribute) refuse a second add and print Unity's error; others
+GetOrAdd into a pre-sized pool.
 
     python3 tools/unity_pack.py <project> -o <outdir>
 """
@@ -32,6 +35,52 @@ class PackError(Exception):
         Exception.__init__(self, message)
 
 
+def _assets_rel_path(path):
+    """Unity-style path: `Assets/...` when under an Assets tree."""
+    norm = path.replace("\\", "/")
+    i = norm.find("/Assets/")
+    if i >= 0:
+        return norm[i + 1:]
+    if norm.startswith("Assets/"):
+        return norm
+    return os.path.basename(path) if path else "<cs>"
+
+
+def _check_csharp_lex(path, text):
+    """Refuse spellings Unity/csc reject before any rewrite.
+
+    C# real-literals need digits after `.` (`0.0f`) or a bare suffix (`0f`).
+    C++-style `0.f` lexes as integer `0`, member access `.`, identifier `f`
+    → CS1061. Catch it here so diagnostics stay against C# source.
+    """
+    scan = cs2cpp._blank(text)
+    for m in re.finditer(r"(?<![\w.])\d+\.([fFdDmM])\b", scan):
+        suffix = m.group(1)
+        idx = m.start(1)
+        line = text.count("\n", 0, idx) + 1
+        col = idx - (text.rfind("\n", 0, idx) + 1) + 1
+        raise PackError(
+            "%s(%d,%d): error CS1061: 'int' does not contain a definition "
+            "for '%s' and no accessible extension method '%s' accepting a "
+            "first argument of type 'int' could be found (are you missing a "
+            "using directive or an assembly reference?)"
+            % (_assets_rel_path(path), line, col, suffix, suffix)
+        )
+    # transform.position is Vector3; += Vector2 is ambiguous (CS0034).
+    # Assignment `= new Vector2(...)` is fine via Vector2→Vector3 implicit.
+    for m in re.finditer(
+            r"transform\.position\s*(?:\+=|-=)\s*new\s+Vector2\b", scan):
+        idx = m.start()
+        line = text.count("\n", 0, idx) + 1
+        col = idx - (text.rfind("\n", 0, idx) + 1) + 1
+        raise PackError(
+            "%s(%d,%d): error CS0034: Operator '%s' is ambiguous on "
+            "operands of type 'Vector3' and 'Vector2'"
+            % (_assets_rel_path(path), line, col,
+               "+=" if "+=" in m.group(0) else "-=")
+        )
+
+
 # Built-in Unity components AddComponent may create at runtime.
 _ADDABLE_BUILTINS = frozenset((
     "Camera",
@@ -43,14 +92,19 @@ _ADDABLE_BUILTINS = frozenset((
     "CircleCollider2D",
     "BoxCollider",
     "SphereCollider",
+    "Animation",
+    "Animator",
 ))
+
+# Unity marks these with [DisallowMultipleComponent] — a second AddComponent
+# logs an error and returns null instead of returning the existing instance.
+_DISALLOW_MULTIPLE_BUILTINS = _ADDABLE_BUILTINS
 
 # Types that still require inventing assets / systems — AddComponent refused.
 _REFUSED_ADDCOMPONENT = frozenset((
     "ParticleSystem",
     "Canvas",
     "AudioSource",
-    "Animator",
 ))
 
 
@@ -542,6 +596,157 @@ def _resolve_mat3d(col_guid, rb_guid, mats3d):
     return dict(_DEFAULT_MAT3D)
 
 
+# ---------------------------------------------------------------------------
+# AnimationClip / AnimatorController (authored assets)
+# ---------------------------------------------------------------------------
+
+def _parse_vec3_keyframes(curve_text):
+    """Extract (time, x, y, z) keys from an AnimationClip Vector3 curve."""
+    keys = []
+    for m in re.finditer(
+            r"time:\s*([0-9.eE+-]+)\s*\n\s*value:\s*\{x:\s*([^,}]+),\s*y:\s*"
+            r"([^,}]+),\s*z:\s*([^}]+)\}",
+            curve_text):
+        keys.append((
+            float(m.group(1)),
+            float(m.group(2)),
+            float(m.group(3)),
+            float(m.group(4)),
+        ))
+    keys.sort(key=lambda k: k[0])
+    return keys
+
+
+def _parse_float_keyframes(curve_text):
+    keys = []
+    for m in re.finditer(
+            r"time:\s*([0-9.eE+-]+)\s*\n\s*value:\s*([0-9.eE+-]+)",
+            curve_text):
+        keys.append((float(m.group(1)), float(m.group(2))))
+    keys.sort(key=lambda k: k[0])
+    return keys
+
+
+def _curve_path_is_root(path_line):
+    """Unity root curves use `path:` empty or `path: \"\"`."""
+    if path_line is None:
+        return True
+    v = path_line.strip()
+    return v == "" or v == '""'
+
+
+def _parse_animation_clip(text):
+    """Authored .anim → length, loop, root position/euler/scale keyframes."""
+    nm = re.search(r"(?m)^\s+m_Name:\s*(.+)$", text)
+    stop = re.search(r"(?m)^\s+m_StopTime:\s*([0-9.eE+-]+)", text)
+    loop = re.search(r"(?m)^\s+m_LoopTime:\s*(\d+)", text)
+    wrap = re.search(r"(?m)^\s+m_WrapMode:\s*(\d+)", text)
+    # WrapMode 2 = Loop; LoopTime 1 also loops.
+    do_loop = 1
+    if loop:
+        do_loop = int(loop.group(1))
+    elif wrap and int(wrap.group(1)) == 2:
+        do_loop = 1
+    elif wrap:
+        do_loop = 0
+
+    def _root_vec3_curves(section_name):
+        out = []
+        # Each list entry: "- curve:" … "path: …"
+        pat = re.compile(
+            r"(?ms)^  - curve:\n(.*?)(?=^  - curve:|^  m_|\Z)")
+        # Find section body after m_PositionCurves: etc.
+        sm = re.search(
+            r"(?ms)^  %s:\s*\n(.*?)(?=^  m_[A-Z]|\Z)" % section_name, text)
+        if not sm:
+            # empty list form: m_PositionCurves: []
+            return out
+        body = sm.group(1)
+        if body.strip().startswith("[]"):
+            return out
+        for cm in re.finditer(
+                r"(?ms)^  - curve:\n(.*?)(?=^  - curve:|^  m_|\Z)", body):
+            block = cm.group(1)
+            pm = re.search(r"(?m)^\s+path:\s*(.*)$", block)
+            path = pm.group(1) if pm else ""
+            if not _curve_path_is_root(path):
+                continue
+            keys = _parse_vec3_keyframes(block)
+            if keys:
+                out.extend(keys)
+        return out
+
+    pos = _root_vec3_curves("m_PositionCurves")
+    euler = _root_vec3_curves("m_EulerCurves")
+    scale = _root_vec3_curves("m_ScaleCurves")
+    length = float(stop.group(1)) if stop else 0.0
+    if length <= 0.0:
+        for keys in (pos, euler, scale):
+            if keys:
+                length = max(length, keys[-1][0])
+        if length <= 0.0:
+            length = 1.0
+    return {
+        "name": (nm.group(1).strip() if nm else "Clip"),
+        "length": length,
+        "loop": do_loop,
+        "pos_keys": pos,
+        "euler_keys": euler,
+        "scale_keys": scale,
+    }
+
+
+def _parse_animator_controller_default_clip(text):
+    """Return motion clip guid of the default AnimatorState, or None."""
+    dm = re.search(
+        r"(?m)^\s+m_DefaultState:\s*\{fileID:\s*(-?\d+)\}", text)
+    if not dm:
+        return None
+    default_id = dm.group(1)
+    # Find AnimatorState block with that fileID and its m_Motion guid.
+    for m in re.finditer(
+            r"(?ms)^--- !u!1102 &(-?\d+)\n(.*?)(?=^--- |\Z)", text):
+        if m.group(1) != default_id:
+            continue
+        block = m.group(2)
+        gm = re.search(
+            r"m_Motion:\s*\{fileID:\s*(-?\d+)(?:,\s*guid:\s*"
+            r"([0-9a-fA-F]+))?",
+            block)
+        if gm and gm.group(2):
+            return gm.group(2).lower()
+        return None
+    return None
+
+
+def _load_animation_assets(asset_guids):
+    """guid → AnimationClip dict; guid → default clip guid for controllers."""
+    clips = {}
+    controllers = {}
+    for guid, path in (asset_guids or {}).items():
+        low = path.lower()
+        try:
+            if low.endswith(".anim"):
+                clips[guid.lower()] = _parse_animation_clip(_read(path))
+            elif low.endswith(".controller"):
+                controllers[guid.lower()] = _parse_animator_controller_default_clip(
+                    _read(path))
+        except (IOError, OSError):
+            continue
+    return clips, controllers
+
+
+def _parse_asset_guid_ref(block, field):
+    """m_Field: {fileID: N, guid: …, type: 2} → guid or None."""
+    m = re.search(
+        r"(?m)^\s+%s:\s*\{fileID:\s*(-?\d+)(?:,\s*guid:\s*"
+        r"([0-9a-fA-F]+))?" % re.escape(field),
+        block)
+    if not m or m.group(1) == "0" or not m.group(2):
+        return None
+    return m.group(2).lower()
+
+
 def _resolve_world_trs(xf_id, by_id, cache=None, stack=None):
     """Compose local TRS up m_Father / m_TransformParent into world TRS."""
     if cache is None:
@@ -666,13 +871,15 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
     Also imports authored Camera (!u!20), SpriteRenderer (!u!212),
     Rigidbody2D (!u!50), Rigidbody (!u!54), BoxCollider2D (!u!61),
     CircleCollider2D (!u!58), BoxCollider (!u!65), SphereCollider (!u!135),
-    and PhysicsMaterial2D / PhysicMaterial assets. Does not invent any of
+    Animation (!u!111), Animator (!u!95), PhysicsMaterial2D / PhysicMaterial,
+    and AnimationClip / AnimatorController assets. Does not invent any of
     those — missing components stay missing. Returns
     (objects, lights, cameras).
     """
     guid_to_script = guid_to_script or {}
     asset_guids = asset_guids or {}
     mats2d, mats3d = _load_physics_materials(asset_guids)
+    anim_clips, anim_controllers = _load_animation_assets(asset_guids)
     objects = []
     lights = []
     cameras = []
@@ -689,7 +896,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             r"(?m)^(GameObject|Transform|RectTransform|MonoBehaviour|"
             r"PrefabInstance|Light|Camera|SpriteRenderer|Rigidbody2D|"
             r"Rigidbody|BoxCollider2D|CircleCollider2D|BoxCollider|"
-            r"SphereCollider):",
+            r"SphereCollider|Animation|Animator):",
             block)
         if km:
             kind = km.group(1)
@@ -713,6 +920,10 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             kind = "BoxCollider"
         elif type_id == "135":
             kind = "SphereCollider"
+        elif type_id == "111":
+            kind = "Animation"
+        elif type_id == "95":
+            kind = "Animator"
         elif type_id in ("4", "224"):
             kind = "Transform"
         rec = {"file_id": file_id, "kind": kind, "raw": block, "fields": {}}
@@ -977,6 +1188,22 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "radius": float(rad.group(1)) if rad else 0.5,
                 "material_guid": _parse_material_guid(block),
             }
+        if kind == "Animation":
+            en = re.search(r"(?m)^\s+m_Enabled:\s*(\d+)", block)
+            play = re.search(r"(?m)^\s+m_PlayAutomatically:\s*(\d+)", block)
+            wrap = re.search(r"(?m)^\s+m_WrapMode:\s*(\d+)", block)
+            rec["animation"] = {
+                "enabled": int(en.group(1)) if en else 1,
+                "play_automatically": int(play.group(1)) if play else 1,
+                "wrap_mode": int(wrap.group(1)) if wrap else 0,
+                "clip_guid": _parse_asset_guid_ref(block, "m_Animation"),
+            }
+        if kind == "Animator":
+            en = re.search(r"(?m)^\s+m_Enabled:\s*(\d+)", block)
+            rec["animator"] = {
+                "enabled": int(en.group(1)) if en else 1,
+                "controller_guid": _parse_asset_guid_ref(block, "m_Controller"),
+            }
         by_id[file_id] = rec
 
     # PrefabInstance.m_TransformParent applies to stripped Transforms that
@@ -1022,6 +1249,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         rb3d = None
         col2d = None
         col3d = None
+        anim = None
+        animator = None
         for k in kids:
             if k.get("kind") == "Transform":
                 xf = k
@@ -1050,11 +1279,38 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             if k.get("kind") in ("BoxCollider", "SphereCollider") and k.get(
                     "collider3d"):
                 col3d = dict(k["collider3d"])
+            if k.get("kind") == "Animation" and k.get("animation"):
+                anim = dict(k["animation"])
+            if k.get("kind") == "Animator" and k.get("animator"):
+                animator = dict(k["animator"])
         local_pos, local_rot, local_scale = pos, rot, scale
         father_id = xf.get("father_id") if xf else None
         if xf is not None:
             pos, rot, scale = _resolve_world_trs(
                 xf["file_id"], by_id, world_cache)
+        # Resolve Animation / Animator → clip guid (Animator via controller default).
+        player = None
+        if anim and anim.get("enabled", 1) and anim.get("clip_guid"):
+            cg = anim["clip_guid"]
+            if cg in anim_clips:
+                player = {
+                    "kind": "animation",
+                    "clip_guid": cg,
+                    "playing": int(anim.get("play_automatically") or 0),
+                    "speed": 1.0,
+                    "loop": int(anim_clips[cg].get("loop") or 0),
+                }
+        elif animator and animator.get("enabled", 1) and animator.get(
+                "controller_guid"):
+            cg = anim_controllers.get(animator["controller_guid"])
+            if cg and cg in anim_clips:
+                player = {
+                    "kind": "animator",
+                    "clip_guid": cg,
+                    "playing": 1,  # Animator plays default state
+                    "speed": 1.0,
+                    "loop": int(anim_clips[cg].get("loop") or 0),
+                }
         rb_mat2 = (rb2d or {}).get("material_guid")
         rb_mat3 = (rb3d or {}).get("material_guid")
         if col2d and col2d.get("enabled", 1):
@@ -1133,12 +1389,14 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             })
         # Camera-only GOs are not packed as scripted instances.
         if (cam is not None and script is None and sprite is None
-                and not rb2d and not rb3d and not col2d and not col3d):
+                and not rb2d and not rb3d and not col2d and not col3d
+                and not player):
             continue
         has_mb = any(k.get("kind") == "MonoBehaviour" for k in kids)
         # Transform-only parents (e.g. Rig) are hierarchy nodes, not instances.
         if (script is None and sprite is None and not rb2d and not rb3d
-                and cam is None and not has_mb and not col2d and not col3d):
+                and cam is None and not has_mb and not col2d and not col3d
+                and not player):
             continue
         objects.append({
             "name": go.get("name") or "obj",
@@ -1156,7 +1414,18 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "rigidbody": rb3d,
             "collider2d": col2d,
             "collider3d": col3d,
+            "anim_player": player,
         })
+    # Stash clip assets on a sentinel for pack() — returned via lights? No.
+    # Attach to a module-level isn't clean. Return clips via objects meta:
+    # pack() reloads clips. Store on each player the clip snapshot.
+    for o in objects:
+        p = o.get("anim_player")
+        if not p:
+            continue
+        clip = anim_clips.get(p["clip_guid"])
+        if clip:
+            p["clip"] = clip
     return objects, lights, cameras
 
 
@@ -1363,8 +1632,9 @@ def _collect_addcomponent_types(analyses):
 def _addcomponent_budget(analyses, plan):
     """Extra slots per type: one per instance of each class that calls AddComponent<T>.
 
-    GetOrAdd semantics mean one live add per GO is enough even if Update
-    calls AddComponent every frame.
+    A successful first add needs a pool slot. DisallowMultiple types that
+    already have an authored component never allocate; budget still covers
+    GOs that lack one.
     """
     budget = {}
     class_n = {n: int(cl.get("n") or 0) for n, cl in plan["classes"].items()}
@@ -1378,6 +1648,26 @@ def _addcomponent_budget(analyses, plan):
                 t = m.group(1)
                 budget[t] = budget.get(t, 0) + n
     return budget
+
+
+def _disallow_multiple_types(analyses):
+    """Type names that refuse a second AddComponent (Unity attribute / builtins)."""
+    out = set(_DISALLOW_MULTIPLE_BUILTINS)
+    for a in analyses:
+        for c in a.get("classes") or []:
+            if c.get("disallow_multiple"):
+                out.add(c["name"])
+    return out
+
+
+def _gos_with_sprite(plan):
+    """Authored GameObject names that already have a SpriteRenderer."""
+    names = set()
+    for cl in (plan.get("classes") or {}).values():
+        for o in cl.get("instances") or []:
+            if o.get("sprite"):
+                names.add(o.get("name") or "")
+    return names
 
 
 def _validate_addcomponent_types(types, plan):
@@ -1605,6 +1895,75 @@ def _build_collider3d_tables(plan):
     return cols
 
 
+def _build_animation_tables(plan):
+    """Authored Animation / Animator players + shared clip keyframe tables.
+
+    Root position curves apply as deltas from the clip's t=0 sample onto the
+    authored rest pose so one clip can drive multiple GOs.
+    """
+    clips_by_guid = {}
+    clip_list = []
+    players = []
+    class_ids = {n: i for i, n in enumerate(sorted(plan["classes"]))}
+
+    def _ensure_clip(guid, clip):
+        if guid in clips_by_guid:
+            return clips_by_guid[guid]
+        pos = list(clip.get("pos_keys") or [])
+        if pos:
+            t0x, t0y, t0z = pos[0][1], pos[0][2], pos[0][3]
+            pos = [(t, x - t0x, y - t0y, z - t0z) for t, x, y, z in pos]
+        else:
+            pos = [(0.0, 0.0, 0.0, 0.0)]
+        idx = len(clip_list)
+        entry = {
+            "guid": guid,
+            "name": clip.get("name") or "Clip",
+            "length": float(clip.get("length") or 1.0),
+            "loop": int(clip.get("loop") or 0),
+            "pos_keys": pos,
+            "key_begin": 0,
+            "key_count": len(pos),
+        }
+        clips_by_guid[guid] = idx
+        clip_list.append(entry)
+        return idx
+
+    for cname, cl in sorted(plan["classes"].items()):
+        cid = class_ids[cname]
+        for i, o in enumerate(cl.get("instances") or []):
+            p = o.get("anim_player")
+            if not p or not p.get("clip"):
+                continue
+            guid = p["clip_guid"]
+            ci = _ensure_clip(guid, p["clip"])
+            rest = o.get("pos") or (0.0, 0.0, 0.0)
+            players.append({
+                "name": o.get("name") or "obj",
+                "owner_class": cname,
+                "owner_class_id": cid,
+                "owner_inst": i,
+                "clip": ci,
+                "playing": int(p.get("playing") or 0),
+                "speed": float(p.get("speed") or 1.0),
+                "loop": int(p.get("loop")
+                            if p.get("loop") is not None
+                            else clip_list[ci]["loop"]),
+                "rest_x": float(rest[0]),
+                "rest_y": float(rest[1]),
+                "rest_z": float(rest[2]) if len(rest) > 2 else 0.0,
+                "kind": 0 if p.get("kind") == "animation" else 1,
+            })
+
+    keys = []
+    for c in clip_list:
+        c["key_begin"] = len(keys)
+        for t, x, y, z in c["pos_keys"]:
+            keys.append({"t": t, "x": x, "y": y, "z": z})
+        c["key_count"] = len(c["pos_keys"])
+    return {"clips": clip_list, "keys": keys, "players": players}
+
+
 def _rewrite_rigidbody_assigns(text, plan, this_class):
     """Lower GetComponent<Rigidbody*>().velocity = new VectorN(...);"""
     this_idn = _c_ident(this_class)
@@ -1762,6 +2121,7 @@ def analyze_script(path, text=None):
     """Fields, methods, Unity API used, whether the script spawns."""
     if text is None:
         text = _read(path)
+    _check_csharp_lex(path, text)
     scan = cs2cpp._blank(text)
     apis = set()
     addcomponent_types = set()
@@ -1860,10 +2220,15 @@ def analyze_script(path, text=None):
             if f["ty"] not in _PRIM and f["ty"] not in (
                     "Vector2", "Vector3", "Quaternion", "string"):
                 refs.append(f)
+        # Attributes immediately before the type declaration.
+        pre = scan[max(0, start - 200):start]
+        disallow_multiple = bool(re.search(
+            r"\[DisallowMultipleComponent\]", pre))
         classes.append({
             "name": name, "kind": kind, "fields": fields,
             "methods": methods, "refs": refs,
             "path": path,
+            "disallow_multiple": disallow_multiple,
         })
     return {
         "path": path,
@@ -2017,8 +2382,9 @@ def plan_layouts(objects, analyses, two_d=None):
             writes[c["name"]] = writes.get(c["name"], False) or a["writes_pos"]
 
     for cname, insts in by_class.items():
-        # Authored Rigidbody integrates into transform — positions must be writable.
-        if any(o.get("rigidbody2d") or o.get("rigidbody") for o in insts):
+        # Authored Rigidbody / Animation integrates into transform — writable.
+        if any(o.get("rigidbody2d") or o.get("rigidbody")
+               or o.get("anim_player") for o in insts):
             writes[cname] = True
 
     plans = {}
@@ -2202,8 +2568,15 @@ def emit_engine(plan, analyses, used_apis):
     rb3d_list = plan.get("rigidbody") or []
     col2d_list = plan.get("collider2d") or []
     col3d_list = plan.get("collider3d") or []
+    anim_plan = plan.get("animation") or {}
+    anim_players = anim_plan.get("players") or []
+    anim_clips = anim_plan.get("clips") or []
+    anim_keys = anim_plan.get("keys") or []
     add_types = set(plan.get("addcomponent_types") or [])
     add_budget = plan.get("addcomponent_budget") or {}
+    disallow_multi = set(plan.get("disallow_multiple_types")
+                         or _DISALLOW_MULTIPLE_BUILTINS)
+    go_has_sprite = set(plan.get("go_has_sprite") or [])
     want_rb2d = (
         bool(rb2d_list)
         or "Rigidbody2D" in getcomponent_types
@@ -2217,6 +2590,7 @@ def emit_engine(plan, analyses, used_apis):
         add_types & {"BoxCollider2D", "CircleCollider2D"})
     want_col3d = bool(col3d_list) or bool(
         add_types & {"BoxCollider", "SphereCollider"})
+    want_anim = bool(anim_players)
     want_add_camera = "Camera" in add_types
     want_add_light = "Light" in add_types
     want_add_sprite = "SpriteRenderer" in add_types
@@ -2244,7 +2618,7 @@ def emit_engine(plan, analyses, used_apis):
     if soa:
         p("/* layout: SoA positions (contiguous float tables for GPU upload) */")
     p("#include <stdint.h>")
-    if want_math or want_col2d or want_col3d:
+    if want_math or want_col2d or want_col3d or want_anim:
         p("#include <math.h>")
     if want_input or want_log or want_find or want_add_any:
         p("#include <string.h>")
@@ -2374,6 +2748,30 @@ def emit_engine(plan, analyses, used_apis):
         p("extern const float _Collider3D_bounciness[%d];" % n3c)
         p("extern const int _Collider3D_friction_combine[%d];" % n3c)
         p("extern const int _Collider3D_bounce_combine[%d];" % n3c)
+    if want_anim and anim_players:
+        np = max(1, len(anim_players))
+        nc = max(1, len(anim_clips))
+        nk = max(1, len(anim_keys))
+        p("extern const int _AnimPlayer_count;")
+        p("extern int _AnimPlayer_playing[%d];" % np)
+        p("extern float _AnimPlayer_time[%d];" % np)
+        p("extern const float _AnimPlayer_speed[%d];" % np)
+        p("extern const int _AnimPlayer_loop[%d];" % np)
+        p("extern const int _AnimPlayer_clip[%d];" % np)
+        p("extern const int _AnimPlayer_owner_class[%d];" % np)
+        p("extern const int _AnimPlayer_owner_inst[%d];" % np)
+        p("extern const float _AnimPlayer_rest_x[%d];" % np)
+        p("extern const float _AnimPlayer_rest_y[%d];" % np)
+        p("extern const float _AnimPlayer_rest_z[%d];" % np)
+        p("extern const int _AnimClip_count;")
+        p("extern const float _AnimClip_length[%d];" % nc)
+        p("extern const int _AnimClip_key_begin[%d];" % nc)
+        p("extern const int _AnimClip_key_count[%d];" % nc)
+        p("extern const int _AnimKey_count;")
+        p("extern const float _AnimKey_t[%d];" % nk)
+        p("extern const float _AnimKey_x[%d];" % nk)
+        p("extern const float _AnimKey_y[%d];" % nk)
+        p("extern const float _AnimKey_z[%d];" % nk)
     p("")
 
     # Packed structs (positions omitted when SoA).
@@ -2674,6 +3072,18 @@ def emit_engine(plan, analyses, used_apis):
             p("};")
         else:
             p("static const char *_engine_go_name[1] = { \"\" };")
+        if want_add_any:
+            p("static void _engine_cant_add_component("
+              "const char *comp, int go) {")
+            p("    const char *gon;")
+            p("    if (go < 0 || go >= _engine_go_count) gon = \"\";")
+            p("    else gon = _engine_go_name[go];")
+            p("    fprintf(stderr, \"Can't add component '%s' to %s "
+              "because such a component is already added to the "
+              "game object!\\n\",")
+            p("            comp, gon);")
+            p("}")
+            p("")
         # Per MonoBehaviour class: instance index at each GO, or -1.
         for cname in sorted(plan["classes"]):
             idn = _c_ident(cname)
@@ -2752,7 +3162,14 @@ def emit_engine(plan, analyses, used_apis):
                 p("    int ex;")
                 p("    if (go < 0 || go >= _engine_go_count) return -1;")
                 p("    ex = _engine_go_%s[go];" % idn)
-                p("    if (ex >= 0) return ex;")
+                if cname in disallow_multi:
+                    p("    if (ex >= 0) {")
+                    p("        _engine_cant_add_component(\"%s\", go);"
+                      % cname)
+                    p("        return -1;")
+                    p("    }")
+                else:
+                    p("    if (ex >= 0) return ex;")
                 p("    if (_%s_inst_count >= %d) return -1;" % (idn, cap))
                 p("    ex = _%s_inst_count;" % idn)
                 p("    _%s_inst_count = _%s_inst_count + 1;" % (idn, idn))
@@ -2801,7 +3218,13 @@ def emit_engine(plan, analyses, used_apis):
                 p("    int ex, oi, oc, c;")
                 p("    if (go < 0 || go >= _engine_go_count) return -1;")
                 p("    ex = _engine_go_Rigidbody2D[go];")
-                p("    if (ex >= 0) return ex;")
+                if "Rigidbody2D" in disallow_multi:
+                    p("    if (ex >= 0) {")
+                    p("        _engine_cant_add_component(\"Rigidbody2D\", go);")
+                    p("        return -1;")
+                    p("    }")
+                else:
+                    p("    if (ex >= 0) return ex;")
                 p("    if (_Rigidbody2D_count >= %d) return -1;" % max(1, rb2d_cap))
                 p("    ex = _Rigidbody2D_count;")
                 p("    _Rigidbody2D_count = _Rigidbody2D_count + 1;")
@@ -2860,7 +3283,13 @@ def emit_engine(plan, analyses, used_apis):
                 p("    int ex, oi, oc, c;")
                 p("    if (go < 0 || go >= _engine_go_count) return -1;")
                 p("    ex = _engine_go_Rigidbody[go];")
-                p("    if (ex >= 0) return ex;")
+                if "Rigidbody" in disallow_multi:
+                    p("    if (ex >= 0) {")
+                    p("        _engine_cant_add_component(\"Rigidbody\", go);")
+                    p("        return -1;")
+                    p("    }")
+                else:
+                    p("    if (ex >= 0) return ex;")
                 p("    if (_Rigidbody_count >= %d) return -1;" % max(1, rb3d_cap))
                 p("    ex = _Rigidbody_count;")
                 p("    _Rigidbody_count = _Rigidbody_count + 1;")
@@ -2898,7 +3327,8 @@ def emit_engine(plan, analyses, used_apis):
                 p("")
 
         # Camera / Light / SpriteRenderer / Collider AddComponent pools.
-        def _emit_simple_add(type_name, unity_name, budget_key=None):
+        def _emit_simple_add(type_name, unity_name, budget_key=None,
+                             authored_names=None):
             bk = budget_key or type_name
             bud = int(add_budget.get(bk) or 0)
             if type_name not in add_types and not bud:
@@ -2907,29 +3337,32 @@ def emit_engine(plan, analyses, used_apis):
                 bud = 1
             idn = _c_ident(type_name)
             go_n = max(1, len(go_names))
-            p("static int _engine_go_%s[%d];" % (idn, go_n))
+            authored_names = authored_names or set()
+            init_vals = []
+            for n in (go_names if go_names else [""]):
+                # >=0 marks present (authored sentinel 0).
+                init_vals.append("0" if n in authored_names else "-1")
+            p("static int _engine_go_%s[%d] = { %s };" % (
+                idn, go_n, ", ".join(init_vals)))
             p("static int _%s_live = 0;" % idn)
             p("static const int _%s_cap = %d;" % (idn, bud))
             p("static int _%s_owner_go[%d];" % (idn, bud))
-            p("static int _%s_go_inited = 0;" % idn)
-            p("static void _%s_ensure_go_map(void) {" % idn)
-            p("    int i;")
-            p("    if (_%s_go_inited) return;" % idn)
-            p("    _%s_go_inited = 1;" % idn)
-            p("    for (i = 0; i < _engine_go_count; i = i + 1)")
-            p("        _engine_go_%s[i] = -1;" % idn)
-            p("}")
             p("static int GameObject_GetComponent_%s(int go) {" % idn)
-            p("    _%s_ensure_go_map();" % idn)
             p("    if (go < 0 || go >= _engine_go_count) return -1;")
             p("    return _engine_go_%s[go];" % idn)
             p("}")
             p("static int GameObject_AddComponent_%s(int go) {" % idn)
             p("    int ex;")
-            p("    _%s_ensure_go_map();" % idn)
             p("    if (go < 0 || go >= _engine_go_count) return -1;")
             p("    ex = _engine_go_%s[go];" % idn)
-            p("    if (ex >= 0) return ex;")
+            if type_name in disallow_multi:
+                p("    if (ex >= 0) {")
+                p("        _engine_cant_add_component(\"%s\", go);"
+                  % type_name)
+                p("        return -1;")
+                p("    }")
+            else:
+                p("    if (ex >= 0) return ex;")
             p("    if (_%s_live >= _%s_cap) return -1;" % (idn, idn))
             p("    ex = _%s_live;" % idn)
             p("    _%s_live = _%s_live + 1;" % (idn, idn))
@@ -2956,7 +3389,8 @@ def emit_engine(plan, analyses, used_apis):
         if want_add_camera:
             _emit_simple_add("Camera", "UnityEngine.Camera")
         if want_add_sprite:
-            _emit_simple_add("SpriteRenderer", "UnityEngine.SpriteRenderer")
+            _emit_simple_add("SpriteRenderer", "UnityEngine.SpriteRenderer",
+                             authored_names=go_has_sprite)
         if want_add_light:
             # Light also grows the authored light tables when present.
             bud = int(add_budget.get("Light") or 0) or 1
@@ -2980,7 +3414,13 @@ def emit_engine(plan, analyses, used_apis):
             p("    _Light_ensure_go_map();")
             p("    if (go < 0 || go >= _engine_go_count) return -1;")
             p("    ex = _engine_go_Light[go];")
-            p("    if (ex >= 0) return ex;")
+            if "Light" in disallow_multi:
+                p("    if (ex >= 0) {")
+                p("        _engine_cant_add_component(\"Light\", go);")
+                p("        return -1;")
+                p("    }")
+            else:
+                p("    if (ex >= 0) return ex;")
             p("    if (_Light_count >= %d) return -1;" % max(1, light_cap))
             p("    ex = _Light_count;")
             p("    _Light_count = _Light_count + 1;")
@@ -3470,9 +3910,83 @@ def emit_engine(plan, analyses, used_apis):
         p("}")
         p("")
 
+    if want_anim and anim_players:
+        p("/* Authored Animation / Animator — sample root position curves */")
+        p("static float _anim_sample(const float *times, const float *vals,")
+        p("                         int begin, int count, float t) {")
+        p("    int i;")
+        p("    float t0, t1, u;")
+        p("    if (count <= 0) return 0.f;")
+        p("    if (count == 1) return vals[begin];")
+        p("    if (t <= times[begin]) return vals[begin];")
+        p("    if (t >= times[begin + count - 1])")
+        p("        return vals[begin + count - 1];")
+        p("    for (i = 0; i < count - 1; i = i + 1) {")
+        p("        t0 = times[begin + i];")
+        p("        t1 = times[begin + i + 1];")
+        p("        if (t >= t0 && t <= t1) {")
+        p("            u = (t1 > t0) ? (t - t0) / (t1 - t0) : 0.f;")
+        p("            return vals[begin + i]")
+        p("                + (vals[begin + i + 1] - vals[begin + i]) * u;")
+        p("        }")
+        p("    }")
+        p("    return vals[begin + count - 1];")
+        p("}")
+        p("")
+        p("static void engine_animation_tick(void) {")
+        p("    int i;")
+        p("    for (i = 0; i < _AnimPlayer_count; i = i + 1) {")
+        p("        int ci, kb, kc;")
+        p("        float t, len, dx, dy, dz, nx, ny, nz;")
+        p("        unsigned oi;")
+        p("        if (!_AnimPlayer_playing[i]) continue;")
+        p("        ci = _AnimPlayer_clip[i];")
+        p("        len = _AnimClip_length[ci];")
+        p("        if (len <= 0.f) continue;")
+        p("        _AnimPlayer_time[i] = _AnimPlayer_time[i]")
+        p("            + Time_deltaTime * _AnimPlayer_speed[i];")
+        p("        t = _AnimPlayer_time[i];")
+        p("        if (_AnimPlayer_loop[i]) {")
+        p("            while (t >= len) t = t - len;")
+        p("            while (t < 0.f) t = t + len;")
+        p("            _AnimPlayer_time[i] = t;")
+        p("        } else if (t > len) {")
+        p("            t = len;")
+        p("            _AnimPlayer_time[i] = t;")
+        p("            _AnimPlayer_playing[i] = 0;")
+        p("        }")
+        p("        kb = _AnimClip_key_begin[ci];")
+        p("        kc = _AnimClip_key_count[ci];")
+        p("        dx = _anim_sample(_AnimKey_t, _AnimKey_x, kb, kc, t);")
+        p("        dy = _anim_sample(_AnimKey_t, _AnimKey_y, kb, kc, t);")
+        p("        dz = _anim_sample(_AnimKey_t, _AnimKey_z, kb, kc, t);")
+        p("        nx = _AnimPlayer_rest_x[i] + dx;")
+        p("        ny = _AnimPlayer_rest_y[i] + dy;")
+        p("        nz = _AnimPlayer_rest_z[i] + dz;")
+        p("        oi = (unsigned)_AnimPlayer_owner_inst[i];")
+        p("        switch (_AnimPlayer_owner_class[i]) {")
+        for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
+            idn = _c_ident(cname)
+            cl = plan["classes"][cname]
+            if not _class_has_position(cl) or cl.get("static"):
+                continue
+            p("        case %d:" % cid)
+            p("            %s_set_pos_x(oi, nx);" % idn)
+            p("            %s_set_pos_y(oi, ny);" % idn)
+            if not cl.get("two_d"):
+                p("            %s_set_pos_z(oi, nz);" % idn)
+            p("            break;")
+        p("        default: break;")
+        p("        }")
+        p("    }")
+        p("}")
+        p("")
+
     p("void engine_tick(void) {")
     if "Time.time" in used_apis:
         p("    Time_time = Time_time + Time_deltaTime;")
+    if want_anim and anim_players:
+        p("    engine_animation_tick();")
     for cname in sorted(plan["classes"]):
         p("    %s_FixedTick();" % _c_ident(cname))
     if want_rb2d or want_rb3d:
@@ -3720,9 +4234,7 @@ def _rewrite_new_vector_assigns(text, idn):
     text = re.sub(
         r"transform\.position\s*=\s*new\s+Vector3\s*\((.*?)\)\s*;",
         repl_eq, text, flags=flags)
-    text = re.sub(
-        r"transform\.position\s*\+=\s*new\s+Vector2\s*\((.*?)\)\s*;",
-        repl_add, text, flags=flags)
+    # `+= new Vector2` is CS0034 — refused in _check_csharp_lex.
     text = re.sub(
         r"transform\.position\s*\+=\s*new\s+Vector3\s*\((.*?)\)\s*;",
         repl_add, text, flags=flags)
@@ -3904,6 +4416,25 @@ def _wrap_log_gameobject_tostring(text):
     return "".join(out)
 
 
+def _rewrite_csharp_float_literals(text):
+    """C# `0f` → C `0.f`. C rejects a float suffix on an integer constant.
+
+    C# allows `0f` / `1F` (digits + real-type-suffix). C needs a decimal
+    point (`0.f` / `0.0f`). Literals that already have `.` or an exponent
+    (`1.5f`, `1e2f`) are valid in both and left alone. Runs on a blanked
+    scan so `"0f"` in a string stays put.
+    """
+    scan = cs2cpp._blank(text)
+    out = []
+    pos = 0
+    for m in re.finditer(r"(?<![\w.])(\d+)([fF])\b", scan):
+        out.append(text[pos:m.start(1)])
+        out.append(m.group(1) + "." + m.group(2))
+        pos = m.end()
+    out.append(text[pos:])
+    return "".join(out)
+
+
 def _lower_method_body(body, cl, plan):
     """C# subset method → C against packed arrays.
 
@@ -3912,7 +4443,7 @@ def _lower_method_body(body, cl, plan):
     field is already an index: `other.hp` → `_Other_inst_array[other].hp`.
     """
     idn = _c_ident(cl["name"])
-    text = body
+    text = _rewrite_csharp_float_literals(body)
     text = re.sub(r"\bthis\.", "", text)
     text = _rewrite_rigidbody_assigns(text, plan, cl["name"])
     # Find/GetComponent before field rewrites so `.amp` stays on the target type.
@@ -4273,6 +4804,62 @@ def emit_data(plan, used_apis=None):
                          for c in col3d_list)))
         p("const int _Collider3D_bounce_combine[%d] = { %s };" % (
             n, ", ".join(str(int(c["bounce_combine"])) for c in col3d_list)))
+    anim_plan = plan.get("animation") or {}
+    anim_players = anim_plan.get("players") or []
+    anim_clips = anim_plan.get("clips") or []
+    anim_keys = anim_plan.get("keys") or []
+    if anim_players:
+        n = len(anim_players)
+        p("const int _AnimPlayer_count = %d;" % n)
+        p("int _AnimPlayer_playing[%d] = { %s };" % (
+            n, ", ".join(str(int(pl["playing"])) for pl in anim_players)))
+        p("float _AnimPlayer_time[%d] = { %s };" % (
+            n, ", ".join("0.f" for _ in anim_players)))
+        p("const float _AnimPlayer_speed[%d] = { %s };" % (
+            n, ", ".join("%sf" % repr(float(pl["speed"]))
+                         for pl in anim_players)))
+        p("const int _AnimPlayer_loop[%d] = { %s };" % (
+            n, ", ".join(str(int(pl["loop"])) for pl in anim_players)))
+        p("const int _AnimPlayer_clip[%d] = { %s };" % (
+            n, ", ".join(str(int(pl["clip"])) for pl in anim_players)))
+        p("const int _AnimPlayer_owner_class[%d] = { %s };" % (
+            n, ", ".join(str(int(pl["owner_class_id"]))
+                         for pl in anim_players)))
+        p("const int _AnimPlayer_owner_inst[%d] = { %s };" % (
+            n, ", ".join(str(int(pl["owner_inst"])) for pl in anim_players)))
+        p("const float _AnimPlayer_rest_x[%d] = { %s };" % (
+            n, ", ".join("%sf" % repr(float(pl["rest_x"]))
+                         for pl in anim_players)))
+        p("const float _AnimPlayer_rest_y[%d] = { %s };" % (
+            n, ", ".join("%sf" % repr(float(pl["rest_y"]))
+                         for pl in anim_players)))
+        p("const float _AnimPlayer_rest_z[%d] = { %s };" % (
+            n, ", ".join("%sf" % repr(float(pl["rest_z"]))
+                         for pl in anim_players)))
+        nc = len(anim_clips)
+        p("const int _AnimClip_count = %d;" % nc)
+        p("const float _AnimClip_length[%d] = { %s };" % (
+            nc, ", ".join("%sf" % repr(float(c["length"]))
+                          for c in anim_clips)))
+        p("const int _AnimClip_key_begin[%d] = { %s };" % (
+            nc, ", ".join(str(int(c["key_begin"])) for c in anim_clips)))
+        p("const int _AnimClip_key_count[%d] = { %s };" % (
+            nc, ", ".join(str(int(c["key_count"])) for c in anim_clips)))
+        nk = max(1, len(anim_keys))
+        keys = anim_keys or [{"t": 0.0, "x": 0.0, "y": 0.0, "z": 0.0}]
+        p("const int _AnimKey_count = %d;" % len(keys))
+        p("const float _AnimKey_t[%d] = { %s };" % (
+            len(keys),
+            ", ".join("%sf" % repr(float(k["t"])) for k in keys)))
+        p("const float _AnimKey_x[%d] = { %s };" % (
+            len(keys),
+            ", ".join("%sf" % repr(float(k["x"])) for k in keys)))
+        p("const float _AnimKey_y[%d] = { %s };" % (
+            len(keys),
+            ", ".join("%sf" % repr(float(k["y"])) for k in keys)))
+        p("const float _AnimKey_z[%d] = { %s };" % (
+            len(keys),
+            ", ".join("%sf" % repr(float(k["z"])) for k in keys)))
     textures = plan.get("textures") or []
     p("const int _engine_tex_count = %d;" % len(textures))
     if textures:
@@ -4596,6 +5183,8 @@ def pack(root, outdir, soa=False, soa_vec4=False):
     _validate_addcomponent_types(add_types, plan)
     plan["addcomponent_types"] = sorted(add_types)
     plan["addcomponent_budget"] = _addcomponent_budget(analyses, plan)
+    plan["disallow_multiple_types"] = sorted(_disallow_multiple_types(analyses))
+    plan["go_has_sprite"] = sorted(_gos_with_sprite(plan))
     plan["lights"] = list(lights)
     plan["light_count"] = len(lights)
     main_cam = None
@@ -4625,6 +5214,7 @@ def pack(root, outdir, soa=False, soa_vec4=False):
     plan["go_rigidbody"] = go_rb3d
     plan["collider2d"] = _build_collider2d_tables(plan)
     plan["collider3d"] = _build_collider3d_tables(plan)
+    plan["animation"] = _build_animation_tables(plan)
     os.makedirs(outdir, exist_ok=True)
     _progress("emitting engine.c (%d classes)" % len(plan["classes"]))
     engine = emit_engine(plan, analyses, used_apis)
@@ -4687,7 +5277,11 @@ def main():
     try:
         plan = pack(args[0], outdir, soa=soa, soa_vec4=soa_vec4)
     except PackError as e:
-        sys.stderr.write("unity_pack: %s\n" % e.message)
+        # csc/Unity diagnostics print verbatim; other refusals keep the prefix.
+        if ": error CS" in e.message:
+            sys.stderr.write("%s\n" % e.message)
+        else:
+            sys.stderr.write("unity_pack: %s\n" % e.message)
         return 1
     sys.stderr.write(
         "unity_pack: %d classes, 2d=%s, soa=%s, soa_vec4=%s, "
