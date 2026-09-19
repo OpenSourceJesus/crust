@@ -14,7 +14,11 @@ builtins and authored MonoBehaviours. Types with
 the attribute) refuse a second add and print Unity's error; others
 GetOrAdd into a pre-sized pool.
 
+    python3 tools/unity_pack.py <project>
     python3 tools/unity_pack.py <project> -o <outdir>
+
+Default output is $TMPDIR/<project-folder>/<productName>[.exe], a linked
+player (GLFW window when glfw3 is present, otherwise the headless host).
 """
 
 from __future__ import annotations
@@ -7139,6 +7143,88 @@ def pack(root, outdir, soa=False, soa_vec4=False):
     return plan
 
 
+def project_folder_name(root):
+    """Unity project folder name (not productName)."""
+    return os.path.basename(os.path.abspath(root).rstrip(os.sep)) or "Player"
+
+
+def exe_filename(product):
+    """Player binary name: productName plus the platform executable suffix."""
+    name = (product or "Player").strip() or "Player"
+    name = name.replace("/", "_").replace("\\", "_").replace("\0", "_")
+    if sys.platform.startswith("win"):
+        for ch in '<>:"|?*':
+            name = name.replace(ch, "_")
+        if not name.lower().endswith(".exe"):
+            name += ".exe"
+    return name
+
+
+def default_pack_dir(root):
+    """$TMPDIR/<project folder> — default place for sources and the player."""
+    import tempfile
+    return os.path.join(tempfile.gettempdir(), project_folder_name(root))
+
+
+def build_player_executable(outdir, product):
+    """Compile engine.c + data.c and link a player named after productName.
+
+    Prefers examples/unity_pack/gles2_window.c when pkg-config finds glfw3.
+    Otherwise links the generated headless main.c.
+    """
+    import subprocess
+    cc = os.environ.get("CC") or "gcc"
+    exe = os.path.join(outdir, exe_filename(product))
+    engine_c = os.path.join(outdir, "engine.c")
+    data_c = os.path.join(outdir, "data.c")
+    engine_o = os.path.join(outdir, "engine.o")
+    data_o = os.path.join(outdir, "data.o")
+
+    def _run(cmd):
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            err = (r.stderr or r.stdout or "").strip()
+            raise PackError(
+                "player build failed (%s): %s" % (
+                    " ".join(cmd[:6]), err or ("exit %d" % r.returncode)))
+
+    _progress("compiling engine.c")
+    _run([cc, "-O3", "-c", "-o", engine_o, engine_c])
+    _progress("compiling data.c")
+    _run([cc, "-O0", "-c", "-o", data_o, data_c])
+
+    host = os.path.normpath(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..", "examples", "unity_pack", "gles2_window.c"))
+    use_window = False
+    cflags = []
+    libs = []
+    if os.path.isfile(host):
+        try:
+            chk = subprocess.run(
+                ["pkg-config", "--exists", "glfw3"],
+                capture_output=True)
+            if chk.returncode == 0:
+                cflags = subprocess.check_output(
+                    ["pkg-config", "--cflags", "glfw3"], text=True).split()
+                libs = subprocess.check_output(
+                    ["pkg-config", "--libs", "glfw3"], text=True).split()
+                use_window = True
+        except (OSError, subprocess.CalledProcessError):
+            use_window = False
+    if use_window:
+        _progress("linking window player %s" % exe)
+        _run([cc, "-O2", "-o", exe, host, engine_o, data_o,
+              "-I", outdir] + cflags + libs + ["-lGLESv2", "-lm"])
+    else:
+        main_o = os.path.join(outdir, "main.o")
+        _progress("linking headless player %s" % exe)
+        _run([cc, "-O2", "-c", "-o", main_o,
+              os.path.join(outdir, "main.c")])
+        _run([cc, "-O2", "-o", exe, engine_o, data_o, main_o, "-lm"])
+    return exe
+
+
 def main():
     args = list(sys.argv[1:])
     outdir = None
@@ -7158,13 +7244,19 @@ def main():
             return 2
         outdir = args[i + 1]
         del args[i:i + 2]
-    if len(args) != 1 or outdir is None:
+    if len(args) != 1:
         sys.stderr.write(
-            "usage: unity_pack.py <project-dir> -o <out-dir> "
-            "[--soa | --soa-vec4]\n")
+            "usage: unity_pack.py <project-dir> [-o <out-dir>] "
+            "[--soa | --soa-vec4]\n"
+            "  default out-dir: $TMPDIR/<project folder>\n"
+            "  player binary:   <productName>  (Windows: <productName>.exe)\n")
         return 2
+    if outdir is None:
+        outdir = default_pack_dir(args[0])
     try:
         plan = pack(args[0], outdir, soa=soa, soa_vec4=soa_vec4)
+        exe = build_player_executable(
+            outdir, plan.get("product_name") or "Player")
     except PackError as e:
         # csc/Unity diagnostics print verbatim; other refusals keep the prefix.
         if ": error CS" in e.message:
@@ -7176,8 +7268,9 @@ def main():
         "unity_pack: %d classes, 2d=%s, soa=%s, soa_vec4=%s, "
         "wrote %s/{engine.c,data.c,main.c,engine.cpp,data.cpp,main.cpp,"
         "engine_draw.h}\n"
+        "unity_pack: executable %s\n"
         % (len(plan["classes"]), plan["two_d"], plan.get("soa"),
-           plan.get("soa_vec4"), outdir))
+           plan.get("soa_vec4"), outdir, exe))
     for name, cl in sorted(plan["classes"].items()):
         extra = ""
         if cl.get("soa_dims"):

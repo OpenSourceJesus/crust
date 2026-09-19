@@ -1742,6 +1742,10 @@ class TestSystems(unittest.TestCase):
             tempfile.mkdtemp(prefix="upack-noid-"))
         self.assertEqual(c2, "DefaultCompany")
         self.assertTrue(p2.startswith("upack-noid-"))
+        self.assertEqual(unity_pack.exe_filename("Rocket"), "Rocket")
+        self.assertEqual(
+            os.path.basename(unity_pack.default_pack_dir(root)),
+            os.path.basename(os.path.abspath(root)))
 
     def test_player_screen_from_project_settings(self):
         """defaultScreenWidth/Height → Screen_width/height for the window host."""
