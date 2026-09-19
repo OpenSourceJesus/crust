@@ -10,7 +10,9 @@
  * quits. Time.deltaTime comes from the frame clock. SpriteRenderer quads
  * sample packed PNG textures (tint × texel). Window size is
  * Screen_width × Screen_height from Player Settings
- * (defaultScreenWidth / defaultScreenHeight).
+ * (defaultScreenWidth / defaultScreenHeight). fullscreenMode 0/1 opens a
+ * real monitor fullscreen window (FullScreenWindow / Exclusive); with
+ * defaultIsNativeResolution the desktop video mode size is used.
  */
 
 #define GLFW_INCLUDE_ES2
@@ -47,6 +49,9 @@ int engine_keyboard_downArrow __attribute__((weak)) = 0;
 /* Player Settings defaultScreenWidth/Height (data.c defines). */
 extern int Screen_width;
 extern int Screen_height;
+extern int Screen_fullScreen;
+extern int Screen_fullScreenNative;
+extern int Screen_maximized;
 extern const char engine_product_name[];
 
 #define MAX_DRAWS 64
@@ -319,6 +324,8 @@ static void frame(GLFWwindow *win)
 int main(int argc, char **argv)
 {
     GLFWwindow *win;
+    GLFWmonitor *monitor = NULL;
+    int win_w, win_h;
     double prev, now;
 
     engine_apply_argv(argc, argv);
@@ -330,8 +337,29 @@ int main(int argc, char **argv)
     glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_ES_API);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
-    win = glfwCreateWindow(Screen_width, Screen_height, engine_product_name,
-                           NULL, NULL);
+    win_w = Screen_width;
+    win_h = Screen_height;
+    if (Screen_fullScreen) {
+        /* Unity FullScreenWindow / ExclusiveFullScreen → monitor window. */
+        monitor = glfwGetPrimaryMonitor();
+        if (monitor && Screen_fullScreenNative) {
+            const GLFWvidmode *mode = glfwGetVideoMode(monitor);
+            if (mode) {
+                /* Match desktop bits so borderless FS does not mode-switch. */
+                glfwWindowHint(GLFW_RED_BITS, mode->redBits);
+                glfwWindowHint(GLFW_GREEN_BITS, mode->greenBits);
+                glfwWindowHint(GLFW_BLUE_BITS, mode->blueBits);
+                glfwWindowHint(GLFW_REFRESH_RATE, mode->refreshRate);
+                win_w = mode->width;
+                win_h = mode->height;
+                Screen_width = win_w;
+                Screen_height = win_h;
+            }
+        }
+    } else if (Screen_maximized) {
+        glfwWindowHint(GLFW_MAXIMIZED, GLFW_TRUE);
+    }
+    win = glfwCreateWindow(win_w, win_h, engine_product_name, monitor, NULL);
     if (!win) {
         fprintf(stderr, "glfwCreateWindow failed (need a display + GLES)\n");
         glfwTerminate();

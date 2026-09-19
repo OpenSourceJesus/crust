@@ -281,7 +281,24 @@ def player_screen(root):
     Missing keys → Unity standalone defaults 1024×768. Values ≤0 are clamped
     to 1 so hosts never create a zero-size window.
     """
+    width, height, _fs, _native, _max = player_display(root)
+    return width, height
+
+
+def player_display(root):
+    """Player Settings display tuple.
+
+    Returns (width, height, fullscreen, native_resolution, maximized).
+
+    fullscreenMode (Unity FullScreenMode):
+      0 ExclusiveFullScreen, 1 FullScreenWindow → fullscreen 1
+      2 MaximizedWindow → maximized 1
+      3 Windowed / omitted → windowed (safe default for pack hosts / CI)
+    defaultIsNativeResolution 1 → fullscreen hosts use the monitor video mode.
+    """
     width, height = 1024, 768
+    fullscreen_mode = 3  # Windowed when unset
+    native = 1
     settings = os.path.join(root, "ProjectSettings", "ProjectSettings.asset")
     if os.path.isfile(settings):
         text = _read(settings)
@@ -291,11 +308,20 @@ def player_screen(root):
         m = re.search(r"(?m)^\s*defaultScreenHeight:\s*(-?\d+)\s*$", text)
         if m:
             height = int(m.group(1))
+        m = re.search(r"(?m)^\s*fullscreenMode:\s*(-?\d+)\s*$", text)
+        if m:
+            fullscreen_mode = int(m.group(1))
+        m = re.search(
+            r"(?m)^\s*defaultIsNativeResolution:\s*(-?\d+)\s*$", text)
+        if m:
+            native = int(m.group(1))
     if width < 1:
         width = 1
     if height < 1:
         height = 1
-    return width, height
+    fullscreen = 1 if fullscreen_mode in (0, 1) else 0
+    maximized = 1 if fullscreen_mode == 2 else 0
+    return width, height, fullscreen, (1 if native else 0), maximized
 
 
 def _load_sorting_layers(root):
@@ -3520,6 +3546,9 @@ def emit_engine(plan, analyses, used_apis):
         p("extern float Time_fixedDeltaTime;")
     p("extern int Screen_width;")
     p("extern int Screen_height;")
+    p("extern int Screen_fullScreen;")
+    p("extern int Screen_fullScreenNative;")
+    p("extern int Screen_maximized;")
     if want_phys:
         p("extern float Physics2D_gravity_x;")
         p("extern float Physics2D_gravity_y;")
@@ -5361,6 +5390,9 @@ def emit_engine_draw_h():
         "/* Player Settings defaultScreenWidth/Height → Screen.* */\n"
         "extern int Screen_width;\n"
         "extern int Screen_height;\n"
+        "extern int Screen_fullScreen; /* fullscreenMode 0/1 */\n"
+        "extern int Screen_fullScreenNative; /* defaultIsNativeResolution */\n"
+        "extern int Screen_maximized; /* fullscreenMode MaximizedWindow */\n"
         "extern const char engine_product_name[]; /* productName */\n"
         "/* Unity -logFile: default platform Player.log; \"-\" = stdout. */\n"
         "void engine_set_log_file(const char *path);\n"
@@ -5775,6 +5807,11 @@ def emit_data(plan, used_apis=None):
     # Player Settings → Screen.* (hosts use these for window size).
     p("int Screen_width = %d;" % int(plan.get("screen_width") or 1024))
     p("int Screen_height = %d;" % int(plan.get("screen_height") or 768))
+    p("int Screen_fullScreen = %d;" % int(plan.get("screen_fullscreen") or 0))
+    p("int Screen_fullScreenNative = %d;" % int(
+        plan.get("screen_fullscreen_native") if plan.get(
+            "screen_fullscreen_native") is not None else 1))
+    p("int Screen_maximized = %d;" % int(plan.get("screen_maximized") or 0))
     p("const char engine_product_name[] = %s;" % _c_string(
         plan.get("product_name") or "Player"))
     p("")
@@ -6518,9 +6555,12 @@ def pack(root, outdir, soa=False, soa_vec4=False):
     company, product = player_identity(root)
     plan["company_name"] = company
     plan["product_name"] = product
-    sw, sh = player_screen(root)
+    sw, sh, sfs, snative, smax = player_display(root)
     plan["screen_width"] = sw
     plan["screen_height"] = sh
+    plan["screen_fullscreen"] = sfs
+    plan["screen_fullscreen_native"] = snative
+    plan["screen_maximized"] = smax
     go_names, go_comps = _build_go_tables(plan)
     plan["go_names"] = go_names
     plan["go_components"] = go_comps

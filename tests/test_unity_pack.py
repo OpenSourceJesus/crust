@@ -1734,25 +1734,36 @@ class TestSystems(unittest.TestCase):
                 "defaultScreenHeight: 720\n"
             )
         self.assertEqual(unity_pack.player_screen(root), (1280, 720))
-        # SystemsScene authors 1920×1080.
+        # Missing fullscreenMode → windowed (host-safe default).
+        self.assertEqual(
+            unity_pack.player_display(root)[2:], (0, 1, 0))
+        # SystemsScene authors 1920×1080 FullScreenWindow + native res.
         self.assertEqual(unity_pack.player_screen(SYSTEMS), (1920, 1080))
+        sw, sh, sfs, snative, smax = unity_pack.player_display(SYSTEMS)
+        self.assertEqual((sw, sh, sfs, snative, smax), (1920, 1080, 1, 1, 0))
         d = tempfile.mkdtemp(prefix="upack-scr-pack-")
         plan = unity_pack.pack(SYSTEMS, d)
         self.assertEqual(plan["screen_width"], 1920)
         self.assertEqual(plan["screen_height"], 1080)
+        self.assertEqual(plan["screen_fullscreen"], 1)
+        self.assertEqual(plan["screen_fullscreen_native"], 1)
         with open(os.path.join(d, "data.c")) as f:
             data = f.read()
         self.assertIn("int Screen_width = 1920;", data)
         self.assertIn("int Screen_height = 1080;", data)
+        self.assertIn("int Screen_fullScreen = 1;", data)
+        self.assertIn("int Screen_fullScreenNative = 1;", data)
         with open(os.path.join(d, "engine_draw.h")) as f:
             hdr = f.read()
         self.assertIn("extern int Screen_width;", hdr)
         self.assertIn("extern int Screen_height;", hdr)
+        self.assertIn("extern int Screen_fullScreen;", hdr)
         # MiniScene has no defaultScreen* → Unity 1024×768 defaults.
         d2 = tempfile.mkdtemp(prefix="upack-scr-mini-")
         plan2 = unity_pack.pack(SCENE, d2)
         self.assertEqual(plan2["screen_width"], 1024)
         self.assertEqual(plan2["screen_height"], 768)
+        self.assertEqual(plan2.get("screen_fullscreen"), 0)
 
     def test_keyboard_fqn_without_using_ok(self):
         root = tempfile.mkdtemp(prefix="upack-kb-fqn-")
