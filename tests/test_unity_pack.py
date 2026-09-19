@@ -99,13 +99,18 @@ class TestEmit(unittest.TestCase):
         self.assertIn("Player", plan["classes"])
 
     def test_emitted_c_passes_cpprust_subset_gate(self):
-        """Hand-lowered engine.c must survive cpprust.translate (csrust gate)."""
+        """Hand-lowered engine.cpp must survive cpprust.translate + crust."""
         d = tempfile.mkdtemp(prefix="upack-")
         unity_pack.pack(SCENE, d)
-        with open(os.path.join(d, "engine.c")) as f:
+        with open(os.path.join(d, "engine.cpp")) as f:
             engine = f.read()
         # Explicit re-check (pack already ran validate_emitted_c).
-        unity_pack.validate_emitted_c(engine, "engine.c")
+        unity_pack.validate_emitted_c(engine, "engine.cpp")
+        self.assertTrue(os.path.isfile(os.path.join(d, "engine.c")))
+        self.assertTrue(os.path.isfile(os.path.join(d, "engine.cpp")))
+        self.assertTrue(os.path.isfile(os.path.join(d, "data.cpp")))
+        self.assertTrue(os.path.isfile(os.path.join(d, "main.cpp")))
+        self.assertNotIn("_Generic(", open(os.path.join(d, "engine.c")).read())
 
     def test_validate_emitted_c_refuses_throw(self):
         with self.assertRaises(unity_pack.PackError) as cm:

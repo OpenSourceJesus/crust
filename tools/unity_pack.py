@@ -3522,6 +3522,9 @@ def emit_engine(plan, analyses, used_apis):
     if want_log or want_draw_sort:
         p("#include <stdlib.h>")
     if want_log:
+        # Host gcc creates Player.log dirs; crust/shivyc has no errno/sys/stat,
+        # so CRUST_NO_POSIX_MKDIR skips mkdir and fopen falls back to stdout.
+        p("#ifndef CRUST_NO_POSIX_MKDIR")
         p("#include <errno.h>")
         p("#ifdef _WIN32")
         p("#include <direct.h>")
@@ -6353,9 +6356,15 @@ def _init_num(v, kind):
 
 
 def emit_makefile(outdir):
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    py = sys.executable
+    # Absolute paths so `make crust-check` works from the outdir.
     return (
         "# generated — engine at -O3, data at -O0; main.c is a headless host\n"
         "CC ?= gcc\n"
+        "CRUST_ROOT ?= %s\n"
+        "CRUST_PY ?= %s\n"
+        "CRUST = $(CRUST_PY) -m shivyc.main --no-cache\n"
         "all: game\n"
         "engine.o: engine.c\n"
         "\t$(CC) -O3 -c -o $@ $<\n"
@@ -6365,8 +6374,18 @@ def emit_makefile(outdir):
         "\t$(CC) -O2 -c -o $@ $<\n"
         "game: engine.o data.o main.o\n"
         "\t$(CC) -O2 -o $@ engine.o data.o main.o -lm\n"
+        "# Compile packed C with crust/shivyc (C++ twins gate at pack time).\n"
+        "crust-check: engine.c data.c main.c engine.cpp data.cpp main.cpp\n"
+        "\tcd $(CRUST_ROOT) && $(CRUST) -c -D CRUST_NO_POSIX_MKDIR "
+        "-o $(CURDIR)/engine.crust.o $(CURDIR)/engine.c\n"
+        "\tcd $(CRUST_ROOT) && $(CRUST) -c -D CRUST_NO_POSIX_MKDIR "
+        "-o $(CURDIR)/data.crust.o $(CURDIR)/data.c\n"
+        "\tcd $(CRUST_ROOT) && $(CRUST) -c "
+        "-o $(CURDIR)/main.crust.o $(CURDIR)/main.c\n"
         "clean:\n"
-        "\trm -f engine.o data.o main.o game\n"
+        "\trm -f engine.o data.o main.o game "
+        "engine.crust.o data.crust.o main.crust.o\n"
+        % (repo, py)
     )
 
 
@@ -6547,22 +6566,60 @@ def emit_soa_positions_glsl(plan):
 
 
 def validate_emitted_c(text, path="engine.c"):
-    """Gate generated C through cpprust's subset checks (same as csrust's C++ half).
+    """Gate generated C through cpprust, then compile the result with crust.
 
     unity_pack lowers by hand; this proves the result still sits inside the
     crust subset that `tools/cpprust.py` accepts — `_check_unsupported` plus
-    a full `translate` pass. The translated text is discarded; only the
-    refusal matters. Raises PackError on subset violations.
+    a full `translate` pass (the csrust C++ half). The translated C is then
+    compiled with `shivyc` so pack fails if crust cannot build it. Raises
+    PackError on subset violations or crust compile failure.
     """
     import tools.cpprust as cpprust
     try:
         scan = cpprust._blank_directives(cpprust._strip_comments(text))
         cpprust._check_unsupported(scan, path)
-        cpprust.translate(text, path=path)
+        translated = cpprust.translate(text, path=path)
     except cpprust.CppError as e:
         raise PackError(
             "emitted %s left the crust / cpprust subset: %s"
             % (path, e.message))
+    _crust_compile_c(translated, path)
+    return translated
+
+
+def _crust_compile_c(text, path, defines=None):
+    """Compile *text* with shivyc/crust; raise PackError on failure."""
+    import shutil
+    import subprocess
+    import tempfile
+    defines = list(defines or ())
+    # Player.log mkdir needs errno/sys/stat — crust's include subset has
+    # neither, so always gate those blocks when compiling through shivyc.
+    if "CRUST_NO_POSIX_MKDIR" not in defines:
+        defines.append("CRUST_NO_POSIX_MKDIR")
+    tmpdir = tempfile.mkdtemp(prefix="upack-crust-")
+    src = os.path.join(tmpdir, "tu.c")
+    obj = os.path.join(tmpdir, "tu.o")
+    try:
+        with open(src, "w") as f:
+            f.write(text)
+        if '#include "engine_draw.h"' in text:
+            with open(os.path.join(tmpdir, "engine_draw.h"), "w") as f:
+                f.write(emit_engine_draw_h())
+        cmd = [sys.executable, "-m", "shivyc.main", "--no-cache", "-c",
+               "-I", tmpdir]
+        for d in defines:
+            cmd.extend(["-D", d])
+        cmd.extend(["-o", obj, src])
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        r = subprocess.run(cmd, capture_output=True, text=True, cwd=repo)
+        if r.returncode != 0:
+            err = (r.stderr or r.stdout or "").strip()
+            raise PackError(
+                "emitted %s failed crust/shivyc compile: %s"
+                % (path, err or ("exit %d" % r.returncode)))
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def pack(root, outdir, soa=False, soa_vec4=False):
@@ -6638,17 +6695,35 @@ def pack(root, outdir, soa=False, soa_vec4=False):
     _progress("emitting data.c (%d texture(s))" % len(plan.get("textures") or []))
     data = emit_data(plan, used_apis)
     main_c = emit_main()
-    _progress("validating engine.c through cpprust")
-    validate_emitted_c(engine, "engine.c")
-    _progress("validating data.c through cpprust")
-    validate_emitted_c(data, "data.c")
-    _progress("validating main.c through cpprust")
-    validate_emitted_c(main_c, "main.c")
+    # C++-subset twins: same text, fed through cpprust then crust (csrust pipe).
+    engine_cpp = (
+        "/* generated by tools/unity_pack.py — C++ subset for cpprust */\n"
+        + (engine.split("\n", 1)[1] if engine.startswith("/*") else engine))
+    data_cpp = (
+        "/* generated by tools/unity_pack.py — C++ subset for cpprust */\n"
+        + (data.split("\n", 1)[1] if data.startswith("/*") else data))
+    main_cpp = (
+        "/* generated by tools/unity_pack.py — C++ subset for cpprust */\n"
+        + (main_c.split("\n", 1)[1] if main_c.startswith("/*") else main_c))
+    _progress("validating engine.c through cpprust + crust")
+    validate_emitted_c(engine_cpp, "engine.cpp")
+    _progress("validating data.c through cpprust + crust")
+    validate_emitted_c(data_cpp, "data.cpp")
+    _progress("validating main.c through cpprust + crust")
+    validate_emitted_c(main_cpp, "main.cpp")
     _progress("writing %s" % outdir)
     with open(os.path.join(outdir, "engine.c"), "w") as f:
         f.write(engine)
     with open(os.path.join(outdir, "data.c"), "w") as f:
         f.write(data)
+    with open(os.path.join(outdir, "main.c"), "w") as f:
+        f.write(main_c)
+    with open(os.path.join(outdir, "engine.cpp"), "w") as f:
+        f.write(engine_cpp)
+    with open(os.path.join(outdir, "data.cpp"), "w") as f:
+        f.write(data_cpp)
+    with open(os.path.join(outdir, "main.cpp"), "w") as f:
+        f.write(main_cpp)
     with open(os.path.join(outdir, "engine_draw.h"), "w") as f:
         f.write(emit_engine_draw_h())
     with open(os.path.join(outdir, "Makefile"), "w") as f:
@@ -6700,7 +6775,8 @@ def main():
         return 1
     sys.stderr.write(
         "unity_pack: %d classes, 2d=%s, soa=%s, soa_vec4=%s, "
-        "wrote %s/{engine.c,data.c,main.c,engine_draw.h}\n"
+        "wrote %s/{engine.c,data.c,main.c,engine.cpp,data.cpp,main.cpp,"
+        "engine_draw.h}\n"
         % (len(plan["classes"]), plan["two_d"], plan.get("soa"),
            plan.get("soa_vec4"), outdir))
     for name, cl in sorted(plan["classes"].items()):
