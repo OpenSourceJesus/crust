@@ -2,12 +2,14 @@
 
 `unity_pack` speeds up what is already in the user's Unity (or Godot)
 project. It **does not invent assets**: no synthetic ParticleSystem
-pools, no default AnimationCurves, no Canvas, no InputAction maps.
+pools, no default AnimationCurves, no scripted UI invent, no InputAction maps.
 Runtime `AddComponent<T>()` works for packed builtins (Camera, Light,
 SpriteRenderer, Rigidbody/2D, Box/Circle/Sphere colliders, Animation,
 Animator) and for authored MonoBehaviours — GetOrAdd into a pre-sized pool
-(one spare slot per calling instance). Scripts that need other Unity features
-keep them in the authored project until the packer can import them; calling
+(one spare slot per calling instance). Authored scene Canvas + Image with a
+sprite are drawn; scripted `UnityEngine.UI` stays refused. Scripts that need
+other Unity features keep them in the authored project until the packer can
+import them; calling
 invent-requiring APIs today is a hard `PackError`.
 
 Emitted `engine.c` / `data.c` / `main.c` are also gated through
@@ -74,13 +76,18 @@ to be an authored packed MonoBehaviour (no invented component types).
 
 | Authored | Packed behaviour |
 |----------|------------------|
-| Authored `!u!111` Animation + **legacy** `.anim` | Plays root position curves (`engine_animation_tick`) |
+| Authored `!u!111` Animation + **legacy** `.anim` | Plays authored root `m_PositionCurves` (`engine_animation_tick`) |
 | Authored `!u!95` Animator + `.controller` | Default state motion **only if the clip is non-legacy** |
 | `m_Legacy: 1` on `.anim` | Legacy → `Animation` only; Mecanim → `Animator` only (Unity) |
 | `m_PlayAutomatically` / Animator default | Starts playing; loops when `m_LoopTime` / WrapMode Loop |
+| Empty `m_PositionCurves` (sprite PPtr only) | Advances clip time; **does not** write Transform (no invent) |
+| Authored `m_PPtrCurves` `attribute: m_Sprite` | Discrete hold-sample; swaps path child's SpriteRenderer tex (Idle → Graphics) |
 
 Root position keys write absolute `localPosition` from the clip (Bob.anim
-x=2 places Spinner/Wave at x=2 while y bobs). Child-path curves, blend trees,
+x=2 places Spinner/Wave at x=2 while y bobs). Sprite PPtr keys resolve the
+curve `path` under the Animator/Animation owner (`Graphics` child of Player)
+and pack any referenced PNG even if it is not an initial SpriteRenderer
+sprite. Child-path **transform** curves, blend trees,
 Avatar masks, Animator parameters / transitions, and skeletal skins are not
 sampled yet. `AnimationCurve.Evaluate` without an authored curve asset remains
 refused.
@@ -107,26 +114,36 @@ slot (intensity 1, white) into the light table.
 | Authored `!u!20` Camera (MainCamera) | `Camera_main_pos_*` (incl. **z**), `orthographicSize`, near/far clip, background RGB |
 | `Camera.main.orthographicSize` / `.transform.position` / clip planes | Reads those globals |
 | Authored `!u!212` SpriteRenderer with `m_Sprite` → **project PNG** | Texture + tinted quad in `engine_collect_draws` |
+| Authored `!u!223` Canvas + uGUI Image (`m_Sprite`) | Screen-space quad via RectTransform → world |
 | `m_SortingLayerID` / `m_SortingOrder` (+ TagManager layers) | Draws sorted back-to-front (layer index, then order) |
+| `ProjectSettings` `defaultScreenWidth` / `Height` | `Screen_width` / `Screen_height` (GLFW window size) |
 | Authored `m_LocalRotation` on Transform | Z spin via `EngineDraw.cos_z` / `sin_z` (identity if omitted) |
-| Authored `m_Father` / PrefabInstance `m_TransformParent` | World TRS = parent ∘ local (baked into packed `pos` / sprite spin) |
+| Authored `m_Father` / PrefabInstance `m_TransformParent` | World TRS = parent ∘ local; **live** at draw/collider time |
 
 PNG pixels are packed into `data.c` (`engine_texture_rgba`). Editing the
 referenced sprite and re-packing changes the drawn texels. Tint comes from
-`m_Color`. World size follows Unity:
+`m_Color` (**including alpha**). GLES hosts multiply
+`texture.a × EngineDraw.a` with `GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA`.
+World size follows Unity:
 `(texels / spritePixelsToUnits) * Transform.scale` (half-extents in
 `engine_collect_draws`). `spritePixelsToUnits` is read from the PNG `.meta`
 (default **100**). Sprite quads are rotated in the XY plane from
-`m_LocalRotation` (quaternion → angle of local +X). Child transforms use
-**world** position/rotation/scale after composing the `m_Father` chain
-(PrefabInstance `m_TransformParent` is applied to stripped instance
-transforms). Runtime parent motion is not re-linked yet — hierarchy is
-baked at pack time.
+`m_LocalRotation` (quaternion → angle of local +X). Child transforms keep
+**local** position when parented to another packed body; `engine_collect_draws`
+(and collider centers) compose `parent_world + local` each frame so a parent
+`Rigidbody2D` / scripted motion carries children (Unity hierarchy). Objects with
+their own Rigidbody stay independent. UI Images whose Canvas is not a packed
+body keep baked world `pos`.
 
 `engine_collect_draws` sorts by TagManager `m_SortingLayers` index (from
 `m_SortingLayerID`), then `m_SortingOrder` — lower draws first (behind).
 `EngineDraw.sorting_layer` / `sorting_order` expose the resolved keys.
 SystemsScene: BouncePad order **-10**, Stick on **Foreground**.
+
+`Screen_width` / `Screen_height` come from Player Settings
+`defaultScreenWidth` / `defaultScreenHeight` (Unity default **1024×768** if
+omitted). `gles2_window.c` opens the GLFW window at that size and titles it
+with `productName`. Scripts may read `Screen.width` / `Screen.height`.
 
 Unity cameras look along **+Z** (identity rotation). `engine_collect_draws`
 keeps a sprite only when
@@ -145,21 +162,28 @@ camera background; they do not invent class-hash coloured quads.
 
 ## UI
 
-Refused invent. `UnityEngine.UI` / `Canvas` keep UI in the authored
-Unity project until Canvas import lands.
+Authored `!u!223` Canvas (Screen Space Overlay / Camera) + uGUI `Image`
+with an authored `m_Sprite` draw via RectTransform size mapped into the
+main ortho camera. Canvas sorting layer/order apply to child Images.
+EventSystem / GraphicRaycaster / Text are not imported. Scripted
+`UnityEngine.UI` / `AddComponent<Canvas>` remain refused (no invent).
 
 ## Physics (Rigidbody / Rigidbody2D + FixedUpdate)
 
 | Script uses | Emitted |
 |-------------|---------|
-| Authored `!u!50` Rigidbody2D | Velocity / gravityScale / mass tables; Dynamic bodies integrate |
-| Authored `!u!54` Rigidbody | 3D velocity + `useGravity`; integrates under `Physics.gravity` |
+| Authored `!u!50` Rigidbody2D | Velocity / gravityScale / mass / **linearDamping** tables; Dynamic integrate |
+| Authored `!u!54` Rigidbody | 3D velocity + `useGravity` + **drag**; integrates under `Physics.gravity` |
 | `Physics2D.gravity` | `Physics2D_gravity_x/y` (default `(0, -9.81)`) |
 | `Physics.gravity` | `Physics_gravity_x/y/z` (default `(0, -9.81, 0)`) |
-| `GetComponent<Rigidbody2D>().velocity` / `.gravityScale` | Reads/writes packed RB2D fields |
-| `GetComponent<Rigidbody>().velocity` | Reads/writes packed RB fields |
+| `GetComponent<Rigidbody2D>().velocity` / `.gravityScale` / `.linearDamping` | Reads/writes packed RB2D fields |
+| `GetComponent<Rigidbody>().velocity` / `.drag` | Reads/writes packed RB fields |
 | `Time.fixedDeltaTime` | Host-pokeable float (default `1/50`) |
 | `FixedUpdate` | Once per `engine_tick`, then `engine_physics_fixed` |
+
+Linear damping uses Box2D’s factor `clamp(1 − damping · Δt, 0, 1)` on velocity
+after gravity (same as Unity Physics2D). Authored `m_LinearDamping` /
+`m_LinearDrag` / `m_Drag` on 2D; `m_Drag` on 3D.
 
 Only **authored** Rigidbody components start packed; `AddComponent<Rigidbody>` /
 `AddComponent<Rigidbody2D>` GetOrAdds a Dynamic body with Unity defaults
@@ -211,7 +235,7 @@ Pool budget is one slot per instance of each class that calls `AddComponent<T>`
 | `ParticleSystem.Emit` / `AddComponent<ParticleSystem>` | Needs a ParticleSystem; packer will not invent a pool |
 | `AnimationCurve.Evaluate` | Needs authored curves; packer will not invent keyframes |
 | `InputAction` / `Gamepad.current` | Needs Input System assets / runtime |
-| `UnityEngine.UI` / `Canvas` | Needs authored UI hierarchy |
+| `UnityEngine.UI` / `AddComponent<Canvas>` | Author Canvas+Image in the scene; no script invent |
 | `Camera.main` with no scene Camera | Packer will not invent a default camera |
 
 ## Tick order
