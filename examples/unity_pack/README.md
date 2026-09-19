@@ -32,12 +32,13 @@ just run the path — do not paste bash `${...}` expansions into fish.
 `run_gles2.sh` packs this scene, links `gles2_view.c`, and draws each
 object as a coloured quad (surfaceless FBO → ASCII).
 
-`run_gles2_window.sh` links `gles2_window.c` against the same packed
-engine and opens an OpenGL ES 2.0 window via GLFW. The player keeps
-moving every frame (`Time.deltaTime` from the frame clock). Arrow keys /
-WASD poke `engine_input_axis_*` for `Input.GetAxis`. Escape or Q closes.
+`run_gles2_window.sh` runs `unity_pack.py`, which links `gles2_window.c`
+into `$TMPDIR/<project>/<productName>` (override the directory with
+`OUT=`). The player keeps moving every frame (`Time.deltaTime` from the
+frame clock). Arrow keys / WASD poke `engine_input_axis_*` for
+`Input.GetAxis`. Escape or Q closes.
 
-SystemsScene (Pad + Ball + …):
+SystemsScene (Pad + Ball + … → `/tmp/SystemsScene/SystemsScene`):
 
 ```
 SCENE="$(pwd)/examples/unity_pack/SystemsScene" \

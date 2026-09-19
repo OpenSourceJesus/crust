@@ -78,13 +78,16 @@ per platform. See the comments in the generated compilers.
 ## CLI
 
 ```
+python3 tools/unity_pack.py examples/unity_pack/MiniScene
+# sources + player → $TMPDIR/MiniScene/MiniScene
+# (Windows: MiniScene.exe). -o <dir> overrides the directory only.
+
 python3 tools/unity_pack.py examples/unity_pack/MiniScene -o /tmp/upack
-make -C /tmp/upack          # builds game (engine + data + headless main)
-/tmp/upack/game
+/tmp/upack/MiniScene
 ```
 
-`main.c` is a tiny generated host (tick + print draw count). Replace it
-with `gles2_view.c` / `gles2_window.c` for display.
+The linked player is `gles2_window.c` when `pkg-config glfw3` succeeds,
+otherwise the generated headless `main.c` (tick + print draw count).
 
 Godot: pass a directory containing `.tscn`. Blender: a JSON dump
 (`blender_pack.json`) — same packed C, different importer.

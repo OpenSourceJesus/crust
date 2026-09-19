@@ -14,7 +14,11 @@ builtins and authored MonoBehaviours. Types with
 the attribute) refuse a second add and print Unity's error; others
 GetOrAdd into a pre-sized pool.
 
+    python3 tools/unity_pack.py <project>
     python3 tools/unity_pack.py <project> -o <outdir>
+
+Default output is $TMPDIR/<project-folder>/<productName>[.exe], a linked
+player (GLFW window when glfw3 is present, otherwise the headless host).
 """
 
 from __future__ import annotations
@@ -955,6 +959,10 @@ def _attach_sprite_textures(objects, asset_guids):
         sp = o.get("sprite")
         if not sp:
             continue
+        if sp.get("builtin") or "tex_rgba" in sp:
+            if "a" not in sp:
+                sp["a"] = 1.0
+            continue
         path = asset_guids.get(sp.get("sprite_guid") or "")
         if not path or not path.lower().endswith(".png"):
             o["sprite"] = None
@@ -1079,8 +1087,15 @@ def _resolve_anim_child_path(owner, path, plan):
     return hit
 
 
-# Builtin uGUI Image MonoBehaviour script guid (UnityEngine.UI.dll).
+# Builtin uGUI Image / Button MonoBehaviour script guids (UnityEngine.UI.dll).
 _IMAGE_SCRIPT_GUID = "fe87c0e1cc204ed48ad3b37840f39efc"
+_BUTTON_SCRIPT_GUID = "4e29b1a8efbd4b44bb3f3716e73f07ff"
+# Unity "Resources/unity_builtin_extra" — UISprite, Background, Knob, …
+_UNITY_BUILTIN_GUID = "0000000000000000f000000000000000"
+
+
+def _is_unity_builtin_guid(guid):
+    return (guid or "").lower() == _UNITY_BUILTIN_GUID
 
 
 def _yaml_vec2(block, key, default=(0.0, 0.0)):
@@ -1097,6 +1112,70 @@ def _is_ui_image_mb(block, guid):
         return True
     return bool(re.search(
         r"(?m)^\s+m_EditorClassIdentifier:.*\bImage\s*$", block))
+
+
+def _is_ui_button_mb(block, guid):
+    if (guid or "").lower() == _BUTTON_SCRIPT_GUID:
+        return True
+    return bool(re.search(
+        r"(?m)^\s+m_EditorClassIdentifier:.*\bButton\s*$", block))
+
+
+def _parse_ui_button(block):
+    """Authored uGUI Button → interactable, ColorBlock, persistent onClick."""
+    en = re.search(r"(?m)^\s+m_Interactable:\s*(\d+)", block)
+
+    def _col(key, default):
+        m = re.search(
+            r"%s:\s*\{r:\s*([^,}]+),\s*g:\s*([^,}]+),"
+            r"\s*b:\s*([^,}]+),\s*a:\s*([^}]+)\}" % re.escape(key),
+            block)
+        if not m:
+            return default
+        return (float(m.group(1)), float(m.group(2)),
+                float(m.group(3)), float(m.group(4)))
+
+    mult = re.search(r"(?m)^\s+m_ColorMultiplier:\s*([0-9.eE+-]+)", block)
+    colors = {
+        "normal": _col("m_NormalColor", (1.0, 1.0, 1.0, 1.0)),
+        "highlighted": _col("m_HighlightedColor",
+                            (0.9607843, 0.9607843, 0.9607843, 1.0)),
+        "pressed": _col("m_PressedColor",
+                        (0.78431374, 0.78431374, 0.78431374, 1.0)),
+        "selected": _col("m_SelectedColor",
+                         (0.9607843, 0.9607843, 0.9607843, 1.0)),
+        "disabled": _col("m_DisabledColor",
+                         (0.78431374, 0.78431374, 0.78431374, 0.5019608)),
+        "multiplier": float(mult.group(1)) if mult else 1.0,
+    }
+    calls = []
+    oc = re.search(r"(?m)^\s+m_OnClick:\s*$", block)
+    if oc:
+        chunk = block[oc.end():]
+        # End of this MonoBehaviour document (next ---) or next sibling field.
+        stop = re.search(r"(?m)^---\s", chunk)
+        if stop:
+            chunk = chunk[:stop.start()]
+        for cm in re.finditer(
+                r"m_Target:\s*\{fileID:\s*(-?\d+)\}[\s\S]*?"
+                r"m_MethodName:\s*(\w+)[\s\S]*?"
+                r"m_Mode:\s*(\d+)[\s\S]*?"
+                r"m_BoolArgument:\s*(\d+)",
+                chunk):
+            tid = int(cm.group(1))
+            if tid == 0:
+                continue
+            calls.append({
+                "target_go": str(tid),
+                "method": cm.group(2),
+                "mode": int(cm.group(3)),
+                "bool_arg": int(cm.group(4)),
+            })
+    return {
+        "interactable": int(en.group(1)) if en else 1,
+        "colors": colors,
+        "onclick": calls,
+    }
 
 
 def _rect_pivot_center(parent_w, parent_h, amin, amax, apos, size, pivot):
@@ -1129,7 +1208,8 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h):
 
     Screen Space Overlay (0) and Screen Space Camera (1): map canvas pixels to
     the main ortho camera frustum. World Space (2) is not supported yet.
-    Images without an authored m_Sprite are skipped (no invent).
+    Project PNG sprites and Unity builtin UISprites (solid white tinted by
+    m_Color) draw; empty m_Sprite is skipped (no invent).
     """
     by_xf = {}
     for o in objects:
@@ -1191,6 +1271,16 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h):
         wx = cam_x + (cx / float(sw) - 0.5) * world_w
         wy = cam_y + (cy / float(sh) - 0.5) * world_h
         o["pos"] = (wx, wy, float(o["pos"][2]) if o.get("pos") else 0.0)
+        # Normalized to Screen so hit/draw survive fullscreen / native resize.
+        o["ui_hit"] = {
+            "cx": float(cx), "cy": float(cy),
+            "hw": abs(float(rw)) * 0.5, "hh": abs(float(rh)) * 0.5,
+            "ncx": float(cx) / float(sw),
+            "ncy": float(cy) / float(sh),
+            "nhw": abs(float(rw)) * 0.5 / float(sw),
+            "nhh": abs(float(rh)) * 0.5 / float(sh),
+        }
+        builtin = bool(ui.get("builtin"))
         o["sprite"] = {
             "r": float(ui.get("r", 1.0)),
             "g": float(ui.get("g", 1.0)),
@@ -1198,8 +1288,10 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h):
             "a": float(ui.get("a", 1.0)),
             "enabled": int(ui.get("enabled", 1)),
             "has_sprite": True,
+            "builtin": builtin,
             "sprite_file_id": int(ui.get("sprite_file_id") or 0),
-            "sprite_guid": ui.get("sprite_guid"),
+            "sprite_guid": ("builtin:uisprite" if builtin
+                            else ui.get("sprite_guid")),
             "sorting_layer_id": int(canvas.get("sorting_layer_id") or 0),
             "sorting_layer_yaml": 0,
             "sorting_order": int(canvas.get("sorting_order") or 0),
@@ -1210,7 +1302,18 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h):
             "sin_z": 0.0,
             "half_w": abs(rw) * px_w * 0.5,
             "half_h": abs(rh) * px_h * 0.5,
+            "ncx": float(cx) / float(sw),
+            "ncy": float(cy) / float(sh),
+            "nhw": abs(float(rw)) * 0.5 / float(sw),
+            "nhh": abs(float(rh)) * 0.5 / float(sh),
         }
+        if builtin:
+            # Unity builtin UISprite is a white atlas cell; tint is m_Color.
+            o["sprite"]["tex_path"] = "<builtin:UISprite>"
+            o["sprite"]["tex_w"] = 1
+            o["sprite"]["tex_h"] = 1
+            o["sprite"]["tex_rgba"] = bytes([255, 255, 255, 255])
+            o["sprite"]["pixels_per_unit"] = 100.0
 
 
 # ---------------------------------------------------------------------------
@@ -1221,7 +1324,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
     """A Unity .unity YAML subset: GameObject + Transform + MonoBehaviour.
 
     Also imports authored Camera (!u!20), SpriteRenderer (!u!212), Canvas
-    (!u!223), uGUI Image (builtin MB), RectTransform anchors/size,
+    (!u!223), uGUI Image / Button (builtin MB), RectTransform anchors/size,
     Rigidbody2D (!u!50), Rigidbody (!u!54), BoxCollider2D (!u!61),
     CircleCollider2D (!u!58), BoxCollider (!u!65), SphereCollider (!u!135),
     Animation (!u!111), Animator (!u!95), PhysicsMaterial2D / PhysicMaterial,
@@ -1482,9 +1585,18 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                     r"([0-9a-fA-F]+))?",
                     block)
                 has_sprite = False
+                builtin = False
+                sg = None
+                fid = 0
                 if spr and int(spr.group(1)) != 0:
+                    fid = int(spr.group(1))
                     sg = spr.group(2).lower() if spr.group(2) else None
-                    has_sprite = bool(sg and sg in asset_guids)
+                    if sg and sg in asset_guids:
+                        has_sprite = True
+                    elif _is_unity_builtin_guid(sg):
+                        # Unity builtin UISprite / Background / Knob, …
+                        has_sprite = True
+                        builtin = True
                 rec["ui_image"] = {
                     "r": float(col.group(1)) if col else 1.0,
                     "g": float(col.group(2)) if col else 1.0,
@@ -1493,10 +1605,12 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                           else 1.0),
                     "enabled": int(en.group(1)) if en else 1,
                     "has_sprite": has_sprite,
-                    "sprite_file_id": int(spr.group(1)) if spr else 0,
-                    "sprite_guid": (spr.group(2).lower()
-                                    if spr and spr.group(2) else None),
+                    "builtin": builtin,
+                    "sprite_file_id": fid,
+                    "sprite_guid": sg,
                 }
+            elif _is_ui_button_mb(block, g):
+                rec["ui_button"] = _parse_ui_button(block)
         if kind == "Camera":
             ortho = re.search(r"(?m)^\s+orthographic:\s*(\d+)", block)
             osize = re.search(
@@ -1707,6 +1821,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         vec2_fields = {}
         sprite = None
         ui_image = None
+        ui_button = None
         canvas = None
         cam = None
         rb2d = None
@@ -1736,6 +1851,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                     script = guid_to_script[g]
                 if k.get("ui_image"):
                     ui_image = dict(k["ui_image"])
+                if k.get("ui_button"):
+                    ui_button = dict(k["ui_button"])
             if k.get("kind") == "SpriteRenderer" and k.get("sprite"):
                 sprite = dict(k["sprite"])
             if k.get("kind") == "Canvas" and k.get("canvas"):
@@ -1880,14 +1997,16 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         for k in kids:
             raw = k.get("raw") or ""
             if ("EventSystem" in raw or "InputSystemUIInputModule" in raw
-                    or "GraphicRaycaster" in raw or "CanvasScaler" in raw):
+                    or "GraphicRaycaster" in raw or "CanvasScaler" in raw
+                    or "TextMeshPro" in raw or "TextMeshProUGUI" in raw
+                    or re.search(r"\bUnityEngine\.UI\.Text\b", raw)):
                 ui_scaffold_mb = True
                 break
-        # Image without sprite: drop. EventSystem / raycaster-only: drop.
+        # Image without sprite: drop. EventSystem / raycaster / TMP: drop.
         # Prefab stubs with unresolved MB guids: keep (has_mb).
         if ui_image and not has_ui_draw and script is None and sprite is None:
             if not rb2d and not rb3d and not col2d and not col3d and not player:
-                if not canvas:
+                if not canvas and not ui_button:
                     continue
         if (script is None and sprite is None and not has_ui_draw
                 and not rb2d and not rb3d and cam is None and not col2d
@@ -1905,6 +2024,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "local_scale": local_scale,
                 "father_id": father_id,
                 "xf_id": xf_id,
+                "go_id": go.get("file_id"),
                 "fields": {},
                 "script": None,
                 "class": "_Canvas",
@@ -1912,6 +2032,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "canvas": canvas,
                 "rect": rect,
                 "ui_image": None,
+                "ui_button": None,
                 "rigidbody2d": None,
                 "rigidbody": None,
                 "collider2d": None,
@@ -1929,6 +2050,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "local_scale": local_scale,
             "father_id": father_id,
             "xf_id": xf_id,
+            "go_id": go.get("file_id"),
             "fields": fields,
             "object_refs": object_refs,
             "script": script,
@@ -1937,6 +2059,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "canvas": canvas,
             "rect": rect,
             "ui_image": ui_image,
+            "ui_button": ui_button,
             "rigidbody2d": rb2d,
             "rigidbody": rb3d,
             "collider2d": col2d,
@@ -2147,6 +2270,74 @@ def _build_go_tables(plan):
                 names.append(n)
             comps.setdefault(n, {})[cname] = i
     return names, comps
+
+
+def _build_ui_buttons(plan):
+    """Authored uGUI Buttons: normalized hit, ColorBlock, SetActive onClick."""
+    names = plan.get("go_names") or []
+    go_by_id = {}
+    for cl in plan["classes"].values():
+        for o in cl.get("instances") or []:
+            gid = str(o.get("go_id") or "")
+            n = o.get("name") or "obj"
+            if gid and n in names:
+                go_by_id[gid] = names.index(n)
+    buttons = []
+    for cl in plan["classes"].values():
+        for o in cl.get("instances") or []:
+            ub = o.get("ui_button")
+            hit = o.get("ui_hit")
+            if not ub or not hit:
+                continue
+            if not int(ub.get("interactable", 1)):
+                continue
+            n = o.get("name") or "obj"
+            if n not in names:
+                continue
+            self_go = names.index(n)
+            calls = []
+            for c in ub.get("onclick") or []:
+                if c.get("method") != "SetActive":
+                    continue
+                tgt = go_by_id.get(str(c.get("target_go") or ""))
+                if tgt is None:
+                    continue
+                calls.append({
+                    "target_go": int(tgt),
+                    "bool_arg": int(c.get("bool_arg") or 0),
+                })
+            if not calls:
+                continue
+            cols = ub.get("colors") or {}
+            mult = float(cols.get("multiplier") or 1.0)
+
+            def _scale(key, default):
+                c = cols.get(key) or default
+                return tuple(float(c[i]) * mult for i in range(4))
+
+            buttons.append({
+                "go": self_go,
+                "ncx": float(hit.get("ncx", 0.5)),
+                "ncy": float(hit.get("ncy", 0.5)),
+                "nhw": float(hit.get("nhw", 0.0)),
+                "nhh": float(hit.get("nhh", 0.0)),
+                "normal": _scale("normal", (1, 1, 1, 1)),
+                "highlighted": _scale(
+                    "highlighted", (0.96, 0.96, 0.96, 1)),
+                "pressed": _scale("pressed", (0.78, 0.78, 0.78, 1)),
+                "disabled": _scale(
+                    "disabled", (0.78, 0.78, 0.78, 0.5)),
+                "sorting_layer": int((o.get("sprite") or {}).get(
+                    "sorting_layer") or 0),
+                "sorting_order": int((o.get("sprite") or {}).get(
+                    "sorting_order") or 0),
+                "calls": calls,
+            })
+    buttons.sort(key=lambda b: (
+        -int(b.get("sorting_layer") or 0),
+        -int(b.get("sorting_order") or 0),
+    ))
+    return buttons
 
 
 def _collect_addcomponent_types(analyses):
@@ -3494,9 +3685,11 @@ def emit_engine(plan, analyses, used_apis):
     want_str_plus = "string.+" in used_apis
     want_find = "GameObject.Find" in used_apis
     want_getcomponent = "GetComponent" in used_apis
+    ui_buttons = plan.get("ui_buttons") or []
+    want_ui = bool(ui_buttons)
     want_go_tables = (
         want_find or want_getcomponent or want_rb2d or want_rb3d
-        or want_add_any)
+        or want_add_any or want_ui)
     light_n = int(plan.get("light_count") or 0)
     light_cap = light_n + int(add_budget.get("Light") or 0)
     class_ids = {n: i for i, n in enumerate(sorted(plan["classes"]))}
@@ -3584,6 +3777,10 @@ def emit_engine(plan, analyses, used_apis):
         p("extern int engine_keyboard_connected;")
         for key in sorted(keyboard_keys):
             p("extern int engine_keyboard_%s;" % key)
+    if want_ui:
+        p("extern float engine_pointer_x; /* screen px, origin bottom-left */")
+        p("extern float engine_pointer_y;")
+        p("extern int engine_pointer_down;")
     if light_cap:
         p("extern int _Light_count;")
         p("extern float _Light_intensity[%d];" % max(1, light_cap))
@@ -4401,6 +4598,128 @@ def emit_engine(plan, analyses, used_apis):
             if col_ty in add_types:
                 _emit_simple_add(col_ty, unity_ty)
 
+    if want_ui:
+        go_names = plan.get("go_names") or []
+        go_n = max(1, len(go_names))
+        p("/* GameObject.activeSelf — host pointer + authored Button */")
+        p("static int _engine_go_active[%d];" % go_n)
+        p("static int _engine_go_active_inited;")
+        p("static int _engine_pointer_was_down;")
+        p("static void _engine_go_active_init(void) {")
+        p("    int i;")
+        p("    if (_engine_go_active_inited) return;")
+        p("    _engine_go_active_inited = 1;")
+        p("    for (i = 0; i < %d; i = i + 1)" % go_n)
+        p("        _engine_go_active[i] = 1;")
+        p("}")
+        p("static void GameObject_SetActive(int go, int active) {")
+        p("    _engine_go_active_init();")
+        p("    if (go < 0 || go >= %d) return;" % go_n)
+        p("    _engine_go_active[go] = active ? 1 : 0;")
+        p("}")
+        p("")
+        p("static const int _engine_ui_button_count = %d;" % len(ui_buttons))
+        if ui_buttons:
+            nbtn = len(ui_buttons)
+
+            def _f4(key):
+                return ", ".join(
+                    "%sf" % repr(float(b[key][i]))
+                    for b in ui_buttons for i in range(4))
+
+            p("static const float _engine_ui_btn_ncx[%d] = { %s };" % (
+                nbtn, ", ".join("%sf" % repr(b["ncx"]) for b in ui_buttons)))
+            p("static const float _engine_ui_btn_ncy[%d] = { %s };" % (
+                nbtn, ", ".join("%sf" % repr(b["ncy"]) for b in ui_buttons)))
+            p("static const float _engine_ui_btn_nhw[%d] = { %s };" % (
+                nbtn, ", ".join("%sf" % repr(b["nhw"]) for b in ui_buttons)))
+            p("static const float _engine_ui_btn_nhh[%d] = { %s };" % (
+                nbtn, ", ".join("%sf" % repr(b["nhh"]) for b in ui_buttons)))
+            p("static const int _engine_ui_btn_go[%d] = { %s };" % (
+                nbtn, ", ".join(str(int(b["go"])) for b in ui_buttons)))
+            p("static const int _engine_ui_btn_call_go[%d] = { %s };" % (
+                nbtn, ", ".join(str(int(b["calls"][0]["target_go"]))
+                                for b in ui_buttons)))
+            p("static const int _engine_ui_btn_call_bool[%d] = { %s };" % (
+                nbtn, ", ".join(str(int(b["calls"][0]["bool_arg"]))
+                                for b in ui_buttons)))
+            # ColorBlock (× multiplier) — Normal / Highlighted / Pressed / Disabled
+            p("static const float _engine_ui_btn_col_n[%d] = { %s };" % (
+                nbtn * 4, _f4("normal")))
+            p("static const float _engine_ui_btn_col_h[%d] = { %s };" % (
+                nbtn * 4, _f4("highlighted")))
+            p("static const float _engine_ui_btn_col_p[%d] = { %s };" % (
+                nbtn * 4, _f4("pressed")))
+            p("static const float _engine_ui_btn_col_d[%d] = { %s };" % (
+                nbtn * 4, _f4("disabled")))
+            p("static float _engine_ui_btn_tint[%d];" % (nbtn * 4))
+            p("static int _engine_ui_btn_tint_inited;")
+            p("static void _engine_ui_btn_tint_init(void) {")
+            p("    int i;")
+            p("    if (_engine_ui_btn_tint_inited) return;")
+            p("    _engine_ui_btn_tint_inited = 1;")
+            p("    for (i = 0; i < %d; i = i + 1)" % (nbtn * 4))
+            p("        _engine_ui_btn_tint[i] = _engine_ui_btn_col_n[i];")
+            p("}")
+        p("static void engine_ui_tick(void) {")
+        p("    int pressed, i, hit;")
+        p("    float px, py, sw, sh;")
+        p("    _engine_go_active_init();")
+        if ui_buttons:
+            p("    _engine_ui_btn_tint_init();")
+        p("    pressed = engine_pointer_down && !_engine_pointer_was_down;")
+        p("    sw = (float)Screen_width;")
+        p("    sh = (float)Screen_height;")
+        p("    if (sw < 1.f) sw = 1.f;")
+        p("    if (sh < 1.f) sh = 1.f;")
+        p("    px = engine_pointer_x;")
+        p("    py = engine_pointer_y;")
+        p("    hit = -1;")
+        if ui_buttons:
+            p("    for (i = 0; i < _engine_ui_button_count; i = i + 1) {")
+            p("        int go = _engine_ui_btn_go[i];")
+            p("        float cx, cy, hw, hh, dx, dy;")
+            p("        const float *col;")
+            p("        if (go < 0 || go >= %d) continue;" % go_n)
+            p("        if (!_engine_go_active[go]) {")
+            p("            col = &_engine_ui_btn_col_d[i * 4];")
+            p("            _engine_ui_btn_tint[i * 4 + 0] = col[0];")
+            p("            _engine_ui_btn_tint[i * 4 + 1] = col[1];")
+            p("            _engine_ui_btn_tint[i * 4 + 2] = col[2];")
+            p("            _engine_ui_btn_tint[i * 4 + 3] = col[3];")
+            p("            continue;")
+            p("        }")
+            p("        cx = _engine_ui_btn_ncx[i] * sw;")
+            p("        cy = _engine_ui_btn_ncy[i] * sh;")
+            p("        hw = _engine_ui_btn_nhw[i] * sw;")
+            p("        hh = _engine_ui_btn_nhh[i] * sh;")
+            p("        dx = px - cx; if (dx < 0.f) dx = -dx;")
+            p("        dy = py - cy; if (dy < 0.f) dy = -dy;")
+            p("        if (dx <= hw && dy <= hh) {")
+            p("            if (hit < 0) hit = i;")
+            p("            if (engine_pointer_down)")
+            p("                col = &_engine_ui_btn_col_p[i * 4];")
+            p("            else")
+            p("                col = &_engine_ui_btn_col_h[i * 4];")
+            p("        } else {")
+            p("            col = &_engine_ui_btn_col_n[i * 4];")
+            p("        }")
+            p("        _engine_ui_btn_tint[i * 4 + 0] = col[0];")
+            p("        _engine_ui_btn_tint[i * 4 + 1] = col[1];")
+            p("        _engine_ui_btn_tint[i * 4 + 2] = col[2];")
+            p("        _engine_ui_btn_tint[i * 4 + 3] = col[3];")
+            p("    }")
+            p("    if (pressed && hit >= 0) {")
+            p("        GameObject_SetActive(_engine_ui_btn_call_go[hit],")
+            p("                             _engine_ui_btn_call_bool[hit]);")
+            p("    }")
+        else:
+            p("    (void)i; (void)hit; (void)px; (void)py;")
+            p("    (void)sw; (void)sh; (void)pressed;")
+        p("    _engine_pointer_was_down = engine_pointer_down;")
+        p("}")
+        p("")
+
     p("static float f16_to_f32(uint16_t h) {")
     p("    unsigned s = (h >> 15) & 1u;")
     p("    int e = (int)((h >> 10) & 31u) - 15;")
@@ -5135,6 +5454,8 @@ def emit_engine(plan, analyses, used_apis):
     p("void engine_tick(void) {")
     if "Time.time" in used_apis:
         p("    Time_time = Time_time + Time_deltaTime;")
+    if want_ui:
+        p("    engine_ui_tick();")
     if want_anim and anim_players:
         p("    engine_animation_tick();")
     for cname in sorted(plan["classes"]):
@@ -5213,6 +5534,7 @@ def emit_engine(plan, analyses, used_apis):
     any_sprite = False
     has_cam = bool(plan.get("camera"))
     mutable_spr = set(plan.get("sprite_draw_mutable") or [])
+    go_names = plan.get("go_names") or []
     for cname, cl in sorted(plan["classes"].items()):
         idn = _c_ident(cname)
         if not _class_has_position(cl):
@@ -5253,57 +5575,128 @@ def emit_engine(plan, analyses, used_apis):
             str(int(sp.get("sorting_order") or 0)) for _i, sp in spr_idx))
         p("        static const unsigned _spr_i[] = { %s };" % ", ".join(
             str(i) for i, _sp in spr_idx))
+        any_ui = any(sp.get("source") == "ui" for _i, sp in spr_idx)
+        if any_ui:
+            p("        static const int _spr_ui[] = { %s };" % ", ".join(
+                "1" if sp.get("source") == "ui" else "0"
+                for _i, sp in spr_idx))
+            p("        static const float _spr_ncx[] = { %s };" % ", ".join(
+                "%sf" % repr(float(sp.get("ncx", 0.5))) for _i, sp in spr_idx))
+            p("        static const float _spr_ncy[] = { %s };" % ", ".join(
+                "%sf" % repr(float(sp.get("ncy", 0.5))) for _i, sp in spr_idx))
+            p("        static const float _spr_nhw[] = { %s };" % ", ".join(
+                "%sf" % repr(float(sp.get("nhw", 0.0))) for _i, sp in spr_idx))
+            p("        static const float _spr_nhh[] = { %s };" % ", ".join(
+                "%sf" % repr(float(sp.get("nhh", 0.0))) for _i, sp in spr_idx))
+        if want_ui and go_names:
+            go_vals = []
+            btn_vals = []
+            btn_by_go = {int(b["go"]): bi
+                         for bi, b in enumerate(ui_buttons)}
+            for i, _sp in spr_idx:
+                n = cl["instances"][i].get("name") or "obj"
+                gi = go_names.index(n) if n in go_names else -1
+                go_vals.append(str(gi))
+                btn_vals.append(str(btn_by_go.get(gi, -1)))
+            p("        static const int _spr_go[] = { %s };" % ", ".join(go_vals))
+            p("        static const int _spr_btn[] = { %s };" % ", ".join(
+                btn_vals))
         p("        int k;")
         p("        for (k = 0; k < %d && n < max; k = k + 1) {" % len(spr_idx))
         p("            unsigned i = _spr_i[k];")
+        if want_ui:
+            p("            if (_spr_go[k] >= 0) {")
+            p("                _engine_go_active_init();")
+            p("                if (!_engine_go_active[_spr_go[k]]) continue;")
+            p("            }")
         cid = class_ids[cname]
-        if plan.get("has_transform_parents"):
-            p("            float wx, wy, wz;")
-            p("            _engine_world_pos(%d, i, &wx, &wy, &wz, 0);" % cid)
-            # Unity cameras look along +Z (identity). Depth = object_z - cam_z.
-            if has_cam:
-                p("            {")
-                p("                float depth = wz - Camera_main_pos_z;")
-                p("                if (depth < Camera_main_nearClipPlane"
-                  " || depth > Camera_main_farClipPlane)")
-                p("                    continue;")
-                p("            }")
-            p("            out[n].x = wx;")
-            p("            out[n].y = wy;")
+
+        def _emit_world_draw(ind):
+            """World-space sprite path (non-UI), indented with ``ind``."""
+            if plan.get("has_transform_parents"):
+                p(ind + "float wx, wy, wz;")
+                p(ind + "_engine_world_pos(%d, i, &wx, &wy, &wz, 0);" % cid)
+                if has_cam:
+                    p(ind + "{")
+                    p(ind + "    float depth = wz - Camera_main_pos_z;")
+                    p(ind + "    if (depth < Camera_main_nearClipPlane"
+                      " || depth > Camera_main_farClipPlane)")
+                    p(ind + "        continue;")
+                    p(ind + "}")
+                p(ind + "out[n].x = wx;")
+                p(ind + "out[n].y = wy;")
+            else:
+                if has_cam:
+                    if cl.get("two_d"):
+                        p(ind + "float oz = 0.f;")
+                    else:
+                        p(ind + "float oz = %s_get_pos_z(i);" % idn)
+                    p(ind + "{")
+                    p(ind + "    float depth = oz - Camera_main_pos_z;")
+                    p(ind + "    if (depth < Camera_main_nearClipPlane"
+                      " || depth > Camera_main_farClipPlane)")
+                    p(ind + "        continue;")
+                    p(ind + "}")
+                p(ind + "out[n].x = %s_get_pos_x(i);" % idn)
+                p(ind + "out[n].y = %s_get_pos_y(i);" % idn)
+            if use_mut:
+                p(ind + "out[n].half_w = _%s_draw_hw[i];" % idn)
+                p(ind + "out[n].half_h = _%s_draw_hh[i];" % idn)
+                p(ind + "out[n].tex = _%s_draw_tex[i];" % idn)
+            else:
+                p(ind + "out[n].half_w = _spr_hw[k];")
+                p(ind + "out[n].half_h = _spr_hh[k];")
+                p(ind + "out[n].tex = _spr_tex[k];")
+            if use_scale:
+                p(ind + "out[n].half_w = out[n].half_w * _%s_scale_x[i];"
+                  % idn)
+                p(ind + "out[n].half_h = out[n].half_h * _%s_scale_y[i];"
+                  % idn)
+
+        if any_ui:
+            p("            if (_spr_ui[k]) {")
+            p("                float sw = (float)Screen_width;")
+            p("                float sh = (float)Screen_height;")
+            p("                float aspect, world_h, world_w;")
+            p("                if (sw < 1.f) sw = 1.f;")
+            p("                if (sh < 1.f) sh = 1.f;")
+            p("                aspect = sw / sh;")
+            p("                world_h = 2.f * Camera_main_orthographicSize;")
+            p("                world_w = world_h * aspect;")
+            p("                out[n].x = Camera_main_pos_x")
+            p("                    + (_spr_ncx[k] - 0.5f) * world_w;")
+            p("                out[n].y = Camera_main_pos_y")
+            p("                    + (_spr_ncy[k] - 0.5f) * world_h;")
+            p("                out[n].half_w = _spr_nhw[k] * world_w;")
+            p("                out[n].half_h = _spr_nhh[k] * world_h;")
+            if use_mut:
+                p("                out[n].tex = _%s_draw_tex[i];" % idn)
+            else:
+                p("                out[n].tex = _spr_tex[k];")
+            p("            } else {")
+            _emit_world_draw("                ")
+            p("            }")
         else:
-            # Unity cameras look along +Z (identity). Depth = object_z - cam_z.
-            if has_cam:
-                if cl.get("two_d"):
-                    p("            float oz = 0.f;")
-                else:
-                    p("            float oz = %s_get_pos_z(i);" % idn)
-                p("            {")
-                p("                float depth = oz - Camera_main_pos_z;")
-                p("                if (depth < Camera_main_nearClipPlane"
-                  " || depth > Camera_main_farClipPlane)")
-                p("                    continue;")
-                p("            }")
-            p("            out[n].x = %s_get_pos_x(i);" % idn)
-            p("            out[n].y = %s_get_pos_y(i);" % idn)
-        if use_mut:
-            p("            out[n].half_w = _%s_draw_hw[i];" % idn)
-            p("            out[n].half_h = _%s_draw_hh[i];" % idn)
-            p("            out[n].tex = _%s_draw_tex[i];" % idn)
-        else:
-            p("            out[n].half_w = _spr_hw[k];")
-            p("            out[n].half_h = _spr_hh[k];")
-            p("            out[n].tex = _spr_tex[k];")
-        if use_scale:
-            p("            out[n].half_w = out[n].half_w * _%s_scale_x[i];"
-              % idn)
-            p("            out[n].half_h = out[n].half_h * _%s_scale_y[i];"
-              % idn)
+            _emit_world_draw("            ")
         p("            out[n].cos_z = _spr_cos[k];")
         p("            out[n].sin_z = _spr_sin[k];")
         p("            out[n].r = _spr_r[k];")
         p("            out[n].g = _spr_g[k];")
         p("            out[n].b = _spr_b[k];")
         p("            out[n].a = _spr_a[k];")
+        if want_ui:
+            # ColorBlock multiplies Image.m_Color (Unity Selectable).
+            p("            if (_spr_btn[k] >= 0) {")
+            p("                int bi = _spr_btn[k] * 4;")
+            p("                _engine_ui_btn_tint_init();")
+            p("                out[n].r = out[n].r * _engine_ui_btn_tint[bi];")
+            p("                out[n].g = out[n].g"
+              " * _engine_ui_btn_tint[bi + 1];")
+            p("                out[n].b = out[n].b"
+              " * _engine_ui_btn_tint[bi + 2];")
+            p("                out[n].a = out[n].a"
+              " * _engine_ui_btn_tint[bi + 3];")
+            p("            }")
         p("            out[n].sorting_layer = _spr_layer[k];")
         p("            out[n].sorting_order = _spr_order[k];")
         p("            n = n + 1;")
@@ -5388,6 +5781,10 @@ def emit_engine_draw_h():
         " * name order). SoA packs fill this from flat tables; AoS gathers. */\n"
         "int engine_position_floats(void);\n"
         "int engine_upload_positions(float *dst, int max_floats);\n"
+        "/* Host pointer for uGUI Button (screen px, origin bottom-left). */\n"
+        "extern float engine_pointer_x;\n"
+        "extern float engine_pointer_y;\n"
+        "extern int engine_pointer_down;\n"
         "/* Player Settings defaultScreenWidth/Height → Screen.* */\n"
         "extern int Screen_width;\n"
         "extern int Screen_height;\n"
@@ -5938,6 +6335,11 @@ def emit_data(plan, used_apis=None):
         p("int engine_keyboard_connected = 0;")
         for key in sorted(keyboard_keys):
             p("int engine_keyboard_%s = 0;" % key)
+    if plan.get("ui_buttons"):
+        p("/* Host: screen-space pointer (origin bottom-left, y up). */")
+        p("float engine_pointer_x = 0.f;")
+        p("float engine_pointer_y = 0.f;")
+        p("int engine_pointer_down = 0;")
     if light_cap:
         p("int _Light_count = %d;" % len(lights))
         intens = [float(L["intensity"]) for L in lights] + [1.0] * light_budget
@@ -6679,6 +7081,7 @@ def pack(root, outdir, soa=False, soa_vec4=False):
     go_names, go_comps = _build_go_tables(plan)
     plan["go_names"] = go_names
     plan["go_components"] = go_comps
+    plan["ui_buttons"] = _build_ui_buttons(plan)
     rb2d, rb3d, go_rb2d, go_rb3d = _build_rigidbody_tables(plan)
     plan["rigidbody2d"] = rb2d
     plan["rigidbody"] = rb3d
@@ -6740,6 +7143,88 @@ def pack(root, outdir, soa=False, soa_vec4=False):
     return plan
 
 
+def project_folder_name(root):
+    """Unity project folder name (not productName)."""
+    return os.path.basename(os.path.abspath(root).rstrip(os.sep)) or "Player"
+
+
+def exe_filename(product):
+    """Player binary name: productName plus the platform executable suffix."""
+    name = (product or "Player").strip() or "Player"
+    name = name.replace("/", "_").replace("\\", "_").replace("\0", "_")
+    if sys.platform.startswith("win"):
+        for ch in '<>:"|?*':
+            name = name.replace(ch, "_")
+        if not name.lower().endswith(".exe"):
+            name += ".exe"
+    return name
+
+
+def default_pack_dir(root):
+    """$TMPDIR/<project folder> — default place for sources and the player."""
+    import tempfile
+    return os.path.join(tempfile.gettempdir(), project_folder_name(root))
+
+
+def build_player_executable(outdir, product):
+    """Compile engine.c + data.c and link a player named after productName.
+
+    Prefers examples/unity_pack/gles2_window.c when pkg-config finds glfw3.
+    Otherwise links the generated headless main.c.
+    """
+    import subprocess
+    cc = os.environ.get("CC") or "gcc"
+    exe = os.path.join(outdir, exe_filename(product))
+    engine_c = os.path.join(outdir, "engine.c")
+    data_c = os.path.join(outdir, "data.c")
+    engine_o = os.path.join(outdir, "engine.o")
+    data_o = os.path.join(outdir, "data.o")
+
+    def _run(cmd):
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            err = (r.stderr or r.stdout or "").strip()
+            raise PackError(
+                "player build failed (%s): %s" % (
+                    " ".join(cmd[:6]), err or ("exit %d" % r.returncode)))
+
+    _progress("compiling engine.c")
+    _run([cc, "-O3", "-c", "-o", engine_o, engine_c])
+    _progress("compiling data.c")
+    _run([cc, "-O0", "-c", "-o", data_o, data_c])
+
+    host = os.path.normpath(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..", "examples", "unity_pack", "gles2_window.c"))
+    use_window = False
+    cflags = []
+    libs = []
+    if os.path.isfile(host):
+        try:
+            chk = subprocess.run(
+                ["pkg-config", "--exists", "glfw3"],
+                capture_output=True)
+            if chk.returncode == 0:
+                cflags = subprocess.check_output(
+                    ["pkg-config", "--cflags", "glfw3"], text=True).split()
+                libs = subprocess.check_output(
+                    ["pkg-config", "--libs", "glfw3"], text=True).split()
+                use_window = True
+        except (OSError, subprocess.CalledProcessError):
+            use_window = False
+    if use_window:
+        _progress("linking window player %s" % exe)
+        _run([cc, "-O2", "-o", exe, host, engine_o, data_o,
+              "-I", outdir] + cflags + libs + ["-lGLESv2", "-lm"])
+    else:
+        main_o = os.path.join(outdir, "main.o")
+        _progress("linking headless player %s" % exe)
+        _run([cc, "-O2", "-c", "-o", main_o,
+              os.path.join(outdir, "main.c")])
+        _run([cc, "-O2", "-o", exe, engine_o, data_o, main_o, "-lm"])
+    return exe
+
+
 def main():
     args = list(sys.argv[1:])
     outdir = None
@@ -6759,13 +7244,19 @@ def main():
             return 2
         outdir = args[i + 1]
         del args[i:i + 2]
-    if len(args) != 1 or outdir is None:
+    if len(args) != 1:
         sys.stderr.write(
-            "usage: unity_pack.py <project-dir> -o <out-dir> "
-            "[--soa | --soa-vec4]\n")
+            "usage: unity_pack.py <project-dir> [-o <out-dir>] "
+            "[--soa | --soa-vec4]\n"
+            "  default out-dir: $TMPDIR/<project folder>\n"
+            "  player binary:   <productName>  (Windows: <productName>.exe)\n")
         return 2
+    if outdir is None:
+        outdir = default_pack_dir(args[0])
     try:
         plan = pack(args[0], outdir, soa=soa, soa_vec4=soa_vec4)
+        exe = build_player_executable(
+            outdir, plan.get("product_name") or "Player")
     except PackError as e:
         # csc/Unity diagnostics print verbatim; other refusals keep the prefix.
         if ": error CS" in e.message:
@@ -6777,8 +7268,9 @@ def main():
         "unity_pack: %d classes, 2d=%s, soa=%s, soa_vec4=%s, "
         "wrote %s/{engine.c,data.c,main.c,engine.cpp,data.cpp,main.cpp,"
         "engine_draw.h}\n"
+        "unity_pack: executable %s\n"
         % (len(plan["classes"]), plan["two_d"], plan.get("soa"),
-           plan.get("soa_vec4"), outdir))
+           plan.get("soa_vec4"), outdir, exe))
     for name, cl in sorted(plan["classes"].items()):
         extra = ""
         if cl.get("soa_dims"):
