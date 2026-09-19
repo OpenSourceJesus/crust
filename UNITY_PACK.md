@@ -86,9 +86,13 @@ Godot: pass a directory containing `.tscn`. Blender: a JSON dump
 ## Display via GLES2
 
 `engine_collect_draws()` walks every authored SpriteRenderer with a project
-PNG and fills an `EngineDraw` list (world xy, half-extents, Z spin, tint,
-tex index), then sorts by TagManager sorting layer and `m_SortingOrder`
-(back-to-front). The checked-in host
+PNG and fills an `EngineDraw` list (world xy, half-extents, Z spin, tint
+RGBA, tex index), then sorts by TagManager sorting layer and `m_SortingOrder`
+(back-to-front). Tint alpha (`m_Color.a` on SpriteRenderer / Image) multiplies
+texture alpha in the GLES hosts (`GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA`).
+Windowed hosts (`gles2_window.c`) size the GLFW window from
+Player Settings `defaultScreenWidth` / `defaultScreenHeight` (`Screen_width`
+/ `Screen_height` in `data.c`). The checked-in host
 `examples/unity_pack/gles2_view.c` ticks the engine, draws each sprite as
 a textured quad through the same surfaceless EGL/FBO path as
 `examples/gles2/triangle.c`, then prints ASCII (and optional PPM).

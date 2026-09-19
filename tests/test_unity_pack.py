@@ -378,11 +378,12 @@ class TestSystems(unittest.TestCase):
         objs, _a, _l, _c = unity_pack.load_project(SYSTEMS)
         by_name = {o["name"]: o for o in objs}
         bouncer = by_name["BouncePad"]["sprite"]
-        stick = by_name["Stick"]["sprite"]
+        image = by_name["Image"]["sprite"]
         self.assertEqual(bouncer["sorting_order"], -10)
         self.assertEqual(bouncer["sorting_layer"], 0)
-        self.assertEqual(stick["sorting_layer_id"], 2081823273)
-        self.assertEqual(stick["sorting_layer"], 1)
+        self.assertEqual(image["sorting_layer_id"], 2081823273)
+        self.assertEqual(image["sorting_layer"], 1)
+        self.assertEqual(image["sorting_order"], -1)
         d = tempfile.mkdtemp(prefix="upack-sort-")
         unity_pack.pack(SYSTEMS, d)
         with open(os.path.join(d, "engine.c")) as f:
@@ -395,6 +396,36 @@ class TestSystems(unittest.TestCase):
             hdr = f.read()
         self.assertIn("int sorting_layer;", hdr)
         self.assertIn("int sorting_order;", hdr)
+
+    def test_canvas_image_draws(self):
+        """Authored Canvas + Image with sprite → world-space EngineDraw."""
+        objs, _a, _l, cams = unity_pack.load_project(SYSTEMS)
+        img = [o for o in objs if o["name"] == "Image"]
+        self.assertEqual(len(img), 1)
+        sp = img[0]["sprite"]
+        self.assertIsNotNone(sp)
+        self.assertEqual(sp.get("source"), "ui")
+        self.assertIn("tex_path", sp)
+        self.assertAlmostEqual(sp.get("a", 1.0), 0.5019608, places=4)
+        # Centered 100×100 px → world half-extent from Screen + ortho.
+        ortho = float(cams[0]["orthographic_size"])
+        sw, sh = unity_pack.player_screen(SYSTEMS)
+        expect_hw = 50.0 * (2.0 * ortho) / float(sh)
+        self.assertAlmostEqual(img[0]["pos"][0], 0.0, places=3)
+        self.assertAlmostEqual(img[0]["pos"][1], 0.0, places=3)
+        self.assertAlmostEqual(sp["half_w"], expect_hw, places=5)
+        self.assertEqual(sp["sorting_layer"], 1)  # Foreground
+        d = tempfile.mkdtemp(prefix="upack-ui-")
+        plan = unity_pack.pack(SYSTEMS, d)
+        self.assertTrue(any(
+            o.get("sprite") and o["sprite"].get("source") == "ui"
+            for cl in plan["classes"].values() for o in cl["instances"]))
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("/* Image SpriteRenderer */", eng)
+        self.assertIn("float a;", open(os.path.join(d, "engine_draw.h")).read())
+        # Tint alpha must appear in the draw tables (Image m_Color.a ≈ 0.5).
+        self.assertRegex(eng, r"_spr_a\[\] = \{[^}]*0\.5019608")
 
     def test_vector3_plus_equals_vector2_is_cs0034(self):
         """transform.position is Vector3; += Vector2 is ambiguous in csc."""
@@ -437,9 +468,9 @@ class TestSystems(unittest.TestCase):
             cm.exception.message,
             "Assets/Scripts/Pad.cs(21,3): error CS0034: Operator '+=' is "
             "ambiguous on operands of type 'Vector3' and 'Vector2'")
-        # Fixture Pad.cs uses assignment (valid Vector2→Vector3).
+        # Fixture Player.cs uses Vector3 += (valid).
         unity_pack.analyze_script(
-            os.path.join(SYSTEMS, "Assets", "Scripts", "Pad.cs"))
+            os.path.join(SYSTEMS, "Assets", "Scripts", "Player.cs"))
 
     def test_detects_system_apis(self):
         _objs, analyses, lights, cameras = unity_pack.load_project(SYSTEMS)
@@ -459,27 +490,32 @@ class TestSystems(unittest.TestCase):
         self.assertAlmostEqual(lights[0]["intensity"], 1.5)
         self.assertEqual(len(cameras), 1)
         self.assertTrue(cameras[0]["main"])
-        self.assertAlmostEqual(cameras[0]["orthographic_size"], 3.0)
+        self.assertAlmostEqual(cameras[0]["orthographic_size"], 7.2525)
         self.assertAlmostEqual(cameras[0]["pos"][2], -10.0)
         self.assertAlmostEqual(cameras[0]["near_clip"], 0.3)
         self.assertAlmostEqual(cameras[0]["far_clip"], 1000.0)
         self.assertNotIn("ParticleSystem.Emit", apis)
         self.assertNotIn("AnimationCurve.Evaluate", apis)
         spr = [o for o in _objs if o.get("sprite")]
-        self.assertEqual(len(spr), 5)  # Bouncer, Ball, Pad, Wave, Spinner
-        stick = [o for o in _objs if o["name"] == "Stick"][0]
-        self.assertAlmostEqual(stick["sprite"]["rot_z"], math.pi / 4, places=5)
-        self.assertAlmostEqual(stick["sprite"]["cos_z"], math.cos(math.pi / 4),
-                               places=5)
-        self.assertAlmostEqual(stick["rot"][2], 0.3826834, places=5)
-        self.assertAlmostEqual(stick["rot"][3], 0.9238795, places=5)
-        # Rig at (0, 0.5) + local (1.5, 0) → world (1.5, 0.5)
-        self.assertEqual(stick["father_id"], "6002")
-        self.assertAlmostEqual(stick["local_pos"][0], 1.5)
-        self.assertAlmostEqual(stick["local_pos"][1], 0.0)
-        self.assertAlmostEqual(stick["pos"][0], 1.5)
-        self.assertAlmostEqual(stick["pos"][1], 0.5)
-        self.assertEqual(len([o for o in _objs if o["name"] == "Rig"]), 0)
+        self.assertEqual(len(spr), 8)  # BouncePad×3, HeavyBall, Wave, Spinner, Image, Graphics
+        player = [o for o in _objs if o["name"] == "Player"][0]
+        self.assertIsNone(player.get("sprite"))
+        graphic = [o for o in _objs if o["name"] == "Graphics"][0]
+        self.assertIsNotNone(graphic.get("sprite"))
+        self.assertEqual(graphic["father_id"], "3002")  # child of Player
+        self.assertAlmostEqual(graphic["local_pos"][0], 0.0)
+        self.assertAlmostEqual(graphic["local_pos"][1], 0.0)
+        self.assertAlmostEqual(graphic["pos"][0], 0.0)
+        self.assertAlmostEqual(graphic["pos"][1], 0.0)
+        d = tempfile.mkdtemp(prefix="upack-xf-")
+        plan = unity_pack.pack(SYSTEMS, d)
+        self.assertTrue(plan.get("has_transform_parents"))
+        g_inst = plan["classes"]["Graphics"]["instances"][0]
+        self.assertEqual(g_inst.get("xf_parent_class"), "Player")
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("_engine_world_pos", eng)
+        self.assertIn("_Graphics_xf_parent_class", eng)
 
     def test_prefab_m_transform_parent_composes_world(self):
         """PrefabInstance.m_TransformParent parents stripped Transforms."""
@@ -548,7 +584,7 @@ class TestSystems(unittest.TestCase):
         self.assertIn("Keyboard_current", engine)
         self.assertIn("Keyboard_leftArrowKey_isPressed", engine)
         self.assertIn("Debug_Log", engine)
-        self.assertIn("Pad_Start", engine)
+        self.assertIn("Player_Start", engine)
         self.assertIn('GameObject_Find("BouncePad")', engine)
         self.assertIn("GameObject_GetComponent_Bouncer", engine)
         self.assertIn("Bouncer_get_amp", engine)
@@ -561,13 +597,14 @@ class TestSystems(unittest.TestCase):
         self.assertIn("1.5f", data)
         self.assertIn("Physics2D_gravity_y", data)
         self.assertIn("_Rigidbody2D_vel_x", data)
+        self.assertIn("_Rigidbody2D_linear_damping", data)
         self.assertIn("_Collider2D_count", data)
         self.assertIn("Camera_main_orthographicSize", data)
         self.assertIn("Camera_main_pos_z", data)
         self.assertIn("Camera_main_nearClipPlane", data)
         self.assertIn("Camera_main_farClipPlane", data)
         self.assertIn("SpriteRenderer", engine)
-        self.assertIn("oz - Camera_main_pos_z", engine)
+        self.assertIn("wz - Camera_main_pos_z", engine)
         self.assertIn("out[n].cos_z", engine)
         self.assertIn("_spr_sin", engine)
         self.assertIn("engine_physics_collide2d", engine)
@@ -880,23 +917,57 @@ class TestSystems(unittest.TestCase):
         self.assertAlmostEqual(wave["anim_player"]["clip"]["length"], 1.0)
         self.assertEqual(len(wave["anim_player"]["clip"]["pos_keys"]), 3)
         self.assertAlmostEqual(wave["anim_player"]["clip"]["pos_keys"][0][1], 2.0)
+        player = [o for o in objs if o["name"] == "Player"][0]
+        self.assertEqual(player["anim_player"]["kind"], "animator")
+        idle_clip = player["anim_player"]["clip"]
+        self.assertEqual(idle_clip["name"], "Idle")
+        self.assertEqual(len(idle_clip.get("sprite_curves") or []), 1)
+        self.assertEqual(idle_clip["sprite_curves"][0]["path"], "Graphics")
+        self.assertEqual(len(idle_clip["sprite_curves"][0]["keys"]), 3)
         d = tempfile.mkdtemp(prefix="upack-anim-")
         plan = unity_pack.pack(SYSTEMS, d)
-        self.assertEqual(len(plan["animation"]["players"]), 1)
-        self.assertEqual(plan["animation"]["players"][0]["name"], "Wave")
-        self.assertEqual(len(plan["animation"]["clips"]), 1)
-        # Packed keys are absolute localPosition (x constantly 2).
-        keys = plan["animation"]["keys"]
+        self.assertEqual(len(plan["animation"]["players"]), 2)
+        anim_names = {p["name"] for p in plan["animation"]["players"]}
+        self.assertEqual(anim_names, {"Wave", "Player"})
+        self.assertEqual(len(plan["animation"]["clips"]), 2)
+        idle = [c for c in plan["animation"]["clips"] if c["name"] == "Idle"][0]
+        self.assertEqual(idle["key_count"], 0)  # no root pos; sprite PPtr only
+        skeys = plan["animation"]["sprite_keys"]
+        self.assertEqual(len(skeys), 3)
+        self.assertAlmostEqual(skeys[0]["t"], 0.0)
+        self.assertAlmostEqual(skeys[1]["t"], 2.5)
+        self.assertNotEqual(skeys[0]["tex"], skeys[1]["tex"])
+        self.assertEqual(skeys[0]["tex"], skeys[2]["tex"])
+        binds = plan["animation"]["sprite_binds"]
+        self.assertEqual(len(binds), 1)
+        self.assertEqual(binds[0]["target_class"], "Graphics")
+        self.assertIn("Graphics", plan.get("sprite_draw_mutable") or [])
+        # Eyes Closed PNG is anim-only — still packed into the texture table.
+        tex_paths = [os.path.basename(t["path"]) for t in plan["textures"]]
+        self.assertTrue(any("Eyes Closed" in p for p in tex_paths))
+        self.assertTrue(any(p == "Red Slime.png" for p in tex_paths))
+        # Bob (legacy Wave): absolute localPosition x stays 2 across keys.
+        bob = [c for c in plan["animation"]["clips"] if c["name"] == "Bob"][0]
+        keys = plan["animation"]["keys"][
+            bob["key_begin"]:bob["key_begin"] + bob["key_count"]]
         self.assertAlmostEqual(keys[0]["x"], 2.0)
         self.assertAlmostEqual(keys[1]["x"], 2.0)
         self.assertAlmostEqual(keys[1]["y"], 0.5)
-        self.assertAlmostEqual(plan["animation"]["players"][0]["rest_x"], 2.0)
+        anim_by_name = {p["name"]: p for p in plan["animation"]["players"]}
+        self.assertAlmostEqual(anim_by_name["Wave"]["rest_x"], 2.0)
+        self.assertEqual(anim_by_name["Player"]["sprite_bind_count"], 1)
         self.assertFalse(plan["classes"]["Wave"]["static"])
         with open(os.path.join(d, "engine.c")) as f:
             eng = f.read()
         self.assertIn("engine_animation_tick", eng)
         self.assertIn("Wave_set_pos_y", eng)
         self.assertIn("Wave_set_pos_x", eng)
+        self.assertIn("_anim_sample_hold_i", eng)
+        self.assertIn("_Graphics_draw_tex", eng)
+        with open(os.path.join(d, "data.c")) as f:
+            data = f.read()
+        self.assertIn("_AnimSpriteKey_tex", data)
+        self.assertIn("int _Graphics_draw_tex[", data)
 
     def test_mecanim_clip_drives_animator_not_animation(self):
         """Non-legacy Bob.anim → Spinner Animator plays; Wave Animation idle."""
@@ -915,9 +986,10 @@ class TestSystems(unittest.TestCase):
         self.assertFalse(spin["anim_player"]["clip"]["legacy"])
         d = tempfile.mkdtemp(prefix="upack-mecanim-out-")
         plan = unity_pack.pack(scene, d)
-        self.assertEqual(len(plan["animation"]["players"]), 1)
-        self.assertEqual(plan["animation"]["players"][0]["name"], "Spinner")
-        self.assertAlmostEqual(plan["animation"]["players"][0]["rest_x"], -2.5)
+        self.assertEqual(len(plan["animation"]["players"]), 2)
+        anim_by_name = {p["name"]: p for p in plan["animation"]["players"]}
+        self.assertEqual(set(anim_by_name), {"Spinner", "Player"})
+        self.assertAlmostEqual(anim_by_name["Spinner"]["rest_x"], -2.5)
         # Runtime: absolute curve → Spinner at x=2 (Bob.anim), Wave idle.
         if not _CC:
             return
@@ -933,7 +1005,7 @@ class TestSystems(unittest.TestCase):
                 "extern float Time_deltaTime;\n"
                 "typedef struct { float x, y, half_w, half_h;\n"
                 "                 float cos_z, sin_z;\n"
-                "                 float r, g, b; int tex;\n"
+                "                 float r, g, b; float a; int tex;\n"
                 "                 int sorting_layer; int sorting_order;\n"
                 "               } EngineDraw;\n"
                 "int engine_collect_draws(EngineDraw *out, int max);\n"
@@ -957,7 +1029,7 @@ class TestSystems(unittest.TestCase):
                 "  if (_Spinner_inst_array[0].pos_y < 0.4f) return 4;\n"
                 "  EngineDraw buf[64];\n"
                 "  int n = engine_collect_draws(buf, 64);\n"
-                "  if (n != 5) return 5;\n"
+                "  if (n != 8) return 5;\n"
                 "  { int j; int found = 0;\n"
                 "    for (j = 0; j < n; j = j + 1)\n"
                 "      if (buf[j].x > 1.9f && buf[j].x < 2.1f\n"
@@ -991,7 +1063,8 @@ class TestSystems(unittest.TestCase):
         d = tempfile.mkdtemp(prefix="upack-addcomp-")
         plan = unity_pack.pack(SYSTEMS, d)
         self.assertIn("SpriteRenderer", plan.get("addcomponent_types") or [])
-        self.assertIn("Stick", plan.get("go_has_sprite") or [])
+        self.assertIn("Graphics", plan.get("go_has_sprite") or [])
+        self.assertNotIn("Player", plan.get("go_has_sprite") or [])
         with open(os.path.join(d, "engine.c")) as f:
             eng = f.read()
         self.assertIn("GameObject_AddComponent_SpriteRenderer", eng)
@@ -1001,7 +1074,7 @@ class TestSystems(unittest.TestCase):
             "already added to the game object!",
             eng)
         self.assertIn(
-            "GameObject_AddComponent_SpriteRenderer(_engine_go_of_Pad", eng)
+            "GameObject_AddComponent_SpriteRenderer(_engine_go_of_Player", eng)
 
         root = tempfile.mkdtemp(prefix="upack-addrb-")
         scripts = os.path.join(root, "Assets", "Scripts")
@@ -1044,7 +1117,7 @@ class TestSystems(unittest.TestCase):
 
     @needs_cc
     def test_addcomponent_disallow_multiple_prints_unity_error(self):
-        """Stick already has SpriteRenderer — Pad's AddComponent prints Unity's line."""
+        """Player has no SpriteRenderer — AddComponent succeeds and prints it."""
         d = tempfile.mkdtemp(prefix="upack-disallow-run-")
         unity_pack.pack(SYSTEMS, d)
         host = os.path.join(d, "host.c")
@@ -1075,23 +1148,33 @@ class TestSystems(unittest.TestCase):
         run = subprocess.run(
             [os.path.join(d, "t")], capture_output=True, text=True)
         self.assertEqual(run.returncode, 0, run.stderr)
-        self.assertIn(
-            "Can't add component 'SpriteRenderer' to Stick because such a "
+        self.assertIn("Player (UnityEngine.SpriteRenderer)", run.stdout)
+        self.assertNotIn(
+            "Can't add component 'SpriteRenderer' to Player because such a "
             "component is already added to the game object!",
             run.stderr)
-        self.assertIn("null", run.stdout)  # AddComponent returned null
 
     def test_authored_rigidbody2d_is_packed(self):
         objs, _a, _l, _c = unity_pack.load_project(SYSTEMS)
         ball = [o for o in objs if o["name"] == "HeavyBall"][0]
         self.assertIsNotNone(ball.get("rigidbody2d"))
-        self.assertAlmostEqual(ball["rigidbody2d"]["vel_x"], 0.5)
+        self.assertAlmostEqual(ball["rigidbody2d"]["vel_x"], 0.0)
+        player = [o for o in objs if o["name"] == "Player"][0]
+        self.assertIsNotNone(player.get("rigidbody2d"))
+        self.assertAlmostEqual(player["rigidbody2d"]["mass"], 0.5704784)
+        self.assertAlmostEqual(player["rigidbody2d"]["linear_damping"], 1.0)
+        ball = [o for o in objs if o["name"] == "HeavyBall"][0]
+        self.assertAlmostEqual(ball["rigidbody2d"]["linear_damping"], 0.0)
         d = tempfile.mkdtemp(prefix="upack-rb2d-")
         plan = unity_pack.pack(SYSTEMS, d)
-        self.assertEqual(len(plan.get("rigidbody2d") or []), 1)
+        self.assertEqual(len(plan.get("rigidbody2d") or []), 2)
+        by_rb = {r["name"]: r for r in plan["rigidbody2d"]}
+        self.assertAlmostEqual(by_rb["Player"]["linear_damping"], 1.0)
+        self.assertAlmostEqual(by_rb["HeavyBall"]["linear_damping"], 0.0)
         with open(os.path.join(d, "engine.c")) as f:
             eng = f.read()
         self.assertIn("engine_physics_fixed", eng)
+        self.assertIn("_Rigidbody2D_linear_damping", eng)
         self.assertIn("GameObject_GetComponent_Rigidbody2D", eng)
         self.assertIn("engine_physics_collide2d", eng)
         self.assertGreaterEqual(len(plan.get("collider2d") or []), 3)
@@ -1100,13 +1183,13 @@ class TestSystems(unittest.TestCase):
         ground = [o for o in objs if o["name"] == "Ground"][0]
         self.assertEqual(ground["collider2d"]["kind"], "box")
         self.assertAlmostEqual(ground["pos"][1], -2.5)
-        # Authored Ice on ball/ground; BouncePad keeps Unity 2D default 0.4.
-        self.assertAlmostEqual(ball_col["friction"], 0.05)
-        self.assertAlmostEqual(ground["collider2d"]["friction"], 0.05)
+        # Colliders use Unity 2D default friction (0.4); Ice asset removed.
+        self.assertAlmostEqual(ball_col["friction"], 0.4)
+        self.assertAlmostEqual(ground["collider2d"]["friction"], 0.4)
         pad = [o for o in objs if o["name"] == "BouncePad"][0]
         self.assertAlmostEqual(pad["collider2d"]["friction"], 0.4)
         ground_row = [c for c in plan["collider2d"] if c["name"] == "Ground"][0]
-        self.assertAlmostEqual(ground_row["friction"], 0.05)
+        self.assertAlmostEqual(ground_row["friction"], 0.4)
         self.assertIn("_Collider2D_friction", eng)
         self.assertIn("_phys_mat_combine", eng)
 
@@ -1366,7 +1449,7 @@ class TestSystems(unittest.TestCase):
             [os.path.join(d, "game"), "-logFile", "-"],
             capture_output=True, text=True, cwd=d)
         self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
-        # Pad Start: Find("BouncePad").GetComponent<Bouncer>().amp
+        # Player Start: Find("BouncePad").GetComponent<Bouncer>().amp
         self.assertIn("0.5", run.stdout)
 
     def test_refuses_keyboard_without_inputsystem_using(self):
@@ -1601,6 +1684,40 @@ class TestSystems(unittest.TestCase):
         self.assertEqual(c2, "DefaultCompany")
         self.assertTrue(p2.startswith("upack-noid-"))
 
+    def test_player_screen_from_project_settings(self):
+        """defaultScreenWidth/Height → Screen_width/height for the window host."""
+        self.assertEqual(
+            unity_pack.player_screen(tempfile.mkdtemp(prefix="upack-noscr-")),
+            (1024, 768))
+        root = tempfile.mkdtemp(prefix="upack-scr-")
+        ps = os.path.join(root, "ProjectSettings")
+        os.makedirs(ps)
+        with open(os.path.join(ps, "ProjectSettings.asset"), "w") as f:
+            f.write(
+                "defaultScreenWidth: 1280\n"
+                "defaultScreenHeight: 720\n"
+            )
+        self.assertEqual(unity_pack.player_screen(root), (1280, 720))
+        # SystemsScene authors 1920×1080.
+        self.assertEqual(unity_pack.player_screen(SYSTEMS), (1920, 1080))
+        d = tempfile.mkdtemp(prefix="upack-scr-pack-")
+        plan = unity_pack.pack(SYSTEMS, d)
+        self.assertEqual(plan["screen_width"], 1920)
+        self.assertEqual(plan["screen_height"], 1080)
+        with open(os.path.join(d, "data.c")) as f:
+            data = f.read()
+        self.assertIn("int Screen_width = 1920;", data)
+        self.assertIn("int Screen_height = 1080;", data)
+        with open(os.path.join(d, "engine_draw.h")) as f:
+            hdr = f.read()
+        self.assertIn("extern int Screen_width;", hdr)
+        self.assertIn("extern int Screen_height;", hdr)
+        # MiniScene has no defaultScreen* → Unity 1024×768 defaults.
+        d2 = tempfile.mkdtemp(prefix="upack-scr-mini-")
+        plan2 = unity_pack.pack(SCENE, d2)
+        self.assertEqual(plan2["screen_width"], 1024)
+        self.assertEqual(plan2["screen_height"], 768)
+
     def test_keyboard_fqn_without_using_ok(self):
         root = tempfile.mkdtemp(prefix="upack-kb-fqn-")
         scripts = os.path.join(root, "Assets", "Scripts")
@@ -1717,22 +1834,25 @@ class TestSystemsRuns(unittest.TestCase):
                 "extern float _Light_intensity[];\n"
                 "typedef struct { float x, y, half_w, half_h;\n"
                 "                 float cos_z, sin_z;\n"
-                "                 float r, g, b; int tex;\n"
+                "                 float r, g, b; float a; int tex;\n"
                 "                 int sorting_layer; int sorting_order;\n"
                 "               } EngineDraw;\n"
                 "int engine_collect_draws(EngineDraw *out, int max);\n"
                 "typedef struct Ball Ball;\n"
                 "struct Ball { float pos_x; float pos_y; };\n"
                 "extern Ball _Ball_inst_array[];\n"
-                "typedef struct Pad Pad;\n"
-                "struct Pad { float pos_x; float pos_y; float speed; };\n"
-                "extern Pad _Pad_inst_array[];\n"
+                "typedef struct Player Player;\n"
+                "struct Player { float pos_x; float pos_y; float moveSpeed; };\n"
+                "extern Player _Player_inst_array[];\n"
                 "typedef struct Wave Wave;\n"
                 "struct Wave { float pos_x; float pos_y; };\n"
                 "extern Wave _Wave_inst_array[];\n"
+                "extern float _AnimPlayer_time[];\n"
+                "extern int _Graphics_draw_tex[];\n"
+                "extern const int _AnimSpriteKey_tex[];\n"
                 "int main(void) {\n"
                 "  float y0 = _Ball_inst_array[0].pos_y;\n"
-                "  float x0 = _Pad_inst_array[0].pos_x;\n"
+                "  float x0 = _Player_inst_array[0].pos_x;\n"
                 "  Time_deltaTime = 0.02f;\n"
                 "  engine_keyboard_connected = 1;\n"
                 "  engine_keyboard_rightArrow = 1;\n"
@@ -1748,17 +1868,9 @@ class TestSystemsRuns(unittest.TestCase):
                 "  int n = engine_collect_draws(buf, 128);\n"
                 "  if (Time_time < 0.9f) return 2;\n"
                 "  if (_Ball_inst_array[0].pos_y >= y0) return 3;\n"
-                "  if (_Pad_inst_array[0].pos_x <= x0) return 4;\n"
+                "  if (_Player_inst_array[0].pos_x <= x0) return 4;\n"
                 "  if (_Light_intensity[0] < 1.4f) return 5;\n"
-                "  if (n != 5) return 6; /* SpriteRenderer on BouncePad+Ball+Stick+Wave+Spinner */\n"
-                "  { int j; int found = 0;\n"
-                "    for (j = 0; j < n; j = j + 1) {\n"
-                "      if (buf[j].cos_z > 0.7f && buf[j].cos_z < 0.72f\n"
-                "          && buf[j].sin_z > 0.7f && buf[j].sin_z < 0.72f)\n"
-                "        found = 1;\n"
-                "    }\n"
-                "    if (!found) return 7; /* Stick m_LocalRotation 45deg */\n"
-                "  }\n"
+                "  if (n != 8) return 6; /* SpriteRenderers + uGUI Image */\n"
                 "  /* Ground top ≈ -2.25; ball radius ≈ 0.225 → rest y ≳ -2.05 */\n"
                 "  if (_Ball_inst_array[0].pos_y < -2.1f) return 8;\n"
                 "  if (_Wave_inst_array[0].pos_x < 1.99f\n"
@@ -1772,11 +1884,37 @@ class TestSystemsRuns(unittest.TestCase):
                 "    }\n"
                 "    if (!found) return 11;\n"
                 "  }\n"
-                "  /* Bouncer sortingOrder -10 first; Stick Foreground last. */\n"
+                "  /* BouncePad sortingOrder -10 first; Image Foreground last. */\n"
                 "  if (buf[0].sorting_order != -10) return 13;\n"
                 "  if (buf[n - 1].sorting_layer != 1) return 14;\n"
-                "  if (buf[n - 1].cos_z < 0.7f || buf[n - 1].cos_z > 0.72f)\n"
-                "    return 15; /* Stick 45deg on Foreground */\n"
+                "  if (buf[n - 1].a < 0.49f || buf[n - 1].a > 0.52f)\n"
+                "    return 15; /* Image m_Color.a ≈ 0.5 on Foreground */\n"
+                "  /* Child under Player follows parent world position (m_Father). */\n"
+                "  {\n"
+                "    float px = _Player_inst_array[0].pos_x;\n"
+                "    float py = _Player_inst_array[0].pos_y;\n"
+                "    int j; int found = 0;\n"
+                "    /* Idle.anim has no PositionCurves — must not reset to origin. */\n"
+                "    if (px <= 0.5f) return 16; /* rightArrow move sticks */\n"
+                "    /* Player m_LinearDamping 1 → less fall than undamped (~-5). */\n"
+                "    if (py >= -0.5f || py < -4.5f) return 18;\n"
+                "    for (j = 0; j < n; j = j + 1) {\n"
+                "      if (buf[j].x > px - 0.05f && buf[j].x < px + 0.05f\n"
+                "          && buf[j].y > py - 0.05f && buf[j].y < py + 0.05f)\n"
+                "        found = 1;\n"
+                "    }\n"
+                "    if (!found) return 17; /* child sprite at parent world pos */\n"
+                "  }\n"
+                "  /* Idle.anim m_Sprite at t=2.5 → Eyes Closed on Graphics. */\n"
+                "  {\n"
+                "    int open_tex = _Graphics_draw_tex[0];\n"
+                "    _AnimPlayer_time[0] = 2.55f;\n"
+                "    _AnimPlayer_time[1] = 2.55f;\n"
+                "    engine_tick();\n"
+                "    if (_Graphics_draw_tex[0] == open_tex) return 19;\n"
+                "    if (_Graphics_draw_tex[0] != _AnimSpriteKey_tex[1])\n"
+                "      return 20;\n"
+                "  }\n"
                 "  return 0;\n"
                 "}\n"
             )
@@ -1808,7 +1946,7 @@ class TestSystemsRuns(unittest.TestCase):
             f.write(
                 "typedef struct { float x, y, half_w, half_h;\n"
                 "                 float cos_z, sin_z;\n"
-                "                 float r, g, b; int tex;\n"
+                "                 float r, g, b; float a; int tex;\n"
                 "                 int sorting_layer; int sorting_order;\n"
                 "               } EngineDraw;\n"
                 "int engine_collect_draws(EngineDraw *out, int max);\n"
@@ -1816,13 +1954,13 @@ class TestSystemsRuns(unittest.TestCase):
                 "int main(void) {\n"
                 "  EngineDraw buf[128];\n"
                 "  int n0 = engine_collect_draws(buf, 128);\n"
-                "  if (n0 != 5) return 1;\n"
+                "  if (n0 != 8) return 1;\n"
                 "  Camera_main_pos_z = 10.f;\n"
                 "  int n1 = engine_collect_draws(buf, 128);\n"
                 "  if (n1 != 0) return 2;\n"
                 "  Camera_main_pos_z = -10.f;\n"
                 "  int n2 = engine_collect_draws(buf, 128);\n"
-                "  if (n2 != 5) return 3;\n"
+                "  if (n2 != 8) return 3;\n"
                 "  return 0;\n"
                 "}\n"
             )
