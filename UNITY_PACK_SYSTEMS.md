@@ -6,7 +6,7 @@ pools, no default AnimationCurves, no scripted UI invent, no InputAction maps.
 Runtime `AddComponent<T>()` works for packed builtins (Camera, Light,
 SpriteRenderer, Rigidbody/2D, Box/Circle/Sphere colliders, Animation,
 Animator) and for authored MonoBehaviours — GetOrAdd into a pre-sized pool
-(one spare slot per calling instance). Authored scene Canvas + Image with a
+(one spare slot per calling instance). Authored scene Canvas + Image/Button with a
 sprite are drawn; scripted `UnityEngine.UI` stays refused. Scripts that need
 other Unity features keep them in the authored project until the packer can
 import them; calling
@@ -119,7 +119,7 @@ slot (intensity 1, white) into the light table.
 | Authored `!u!20` Camera (MainCamera) | `Camera_main_pos_*` (incl. **z**), `orthographicSize`, near/far clip, background RGB |
 | `Camera.main.orthographicSize` / `.transform.position` / clip planes | Reads those globals |
 | Authored `!u!212` SpriteRenderer with `m_Sprite` → **project PNG** | Texture + tinted quad in `engine_collect_draws` |
-| Authored `!u!223` Canvas + uGUI Image (`m_Sprite`) | Screen-space quad via RectTransform → world |
+| Authored `!u!223` Canvas + uGUI Image / Button | Screen-space quad; builtin UISprite → white tint |
 | `m_SortingLayerID` / `m_SortingOrder` (+ TagManager layers) | Draws sorted back-to-front (layer index, then order) |
 | `ProjectSettings` `defaultScreenWidth` / `Height` | `Screen_width` / `Screen_height` (GLFW window size) |
 | `ProjectSettings` `fullscreenMode` 0/1 | `Screen_fullScreen` — GLES host uses primary monitor |
@@ -174,9 +174,13 @@ camera background; they do not invent class-hash coloured quads.
 ## UI
 
 Authored `!u!223` Canvas (Screen Space Overlay / Camera) + uGUI `Image`
-with an authored `m_Sprite` draw via RectTransform size mapped into the
-main ortho camera. Canvas sorting layer/order apply to child Images.
-EventSystem / GraphicRaycaster / Text are not imported. Scripted
+or `Button` (with Image) draw via RectTransform size mapped into the
+main ortho camera. Unity builtin UISprites (`guid` in
+`unity_builtin_extra`) become a 1×1 white texel tinted by `m_Color`.
+Button `m_OnClick` persistent `SetActive` calls fire on host pointer
+press (`engine_pointer_x/y/down`, screen space, origin bottom-left).
+Canvas sorting layer/order apply to child Images/Buttons.
+EventSystem / GraphicRaycaster / TextMeshPro are not imported. Scripted
 `UnityEngine.UI` / `AddComponent<Canvas>` remain refused (no invent).
 
 ## Physics (Rigidbody / Rigidbody2D + FixedUpdate)
