@@ -7,9 +7,9 @@ public class Player : MonoBehaviour
     public Rigidbody2D rb;
 	public float moveSpeed;
 	public Transform graphicsTrs;
-	float xSize = 1;
 	[HideInInspector]
 	public Vector2 multSize = new Vector2(1, 1);
+	float xSize = 1;
 
 	void Start ()
 	{
@@ -25,6 +25,9 @@ public class Player : MonoBehaviour
 		if (Keyboard.current.rightArrowKey.isPressed)
 			move ++;
 		transform.position += new Vector3(move * moveSpeed * Time.deltaTime, 0);
+		if (move != 0)
+			xSize = Mathf.Sign(move);
+		graphicsTrs.SetWorldScale (multSize.SetX(multSize.x * xSize).SetZ(1));
 		print(move);
 		System.Console.WriteLine("" + Time.time);
 		SpriteRenderer spriteRend = gameObject.AddComponent<SpriteRenderer>();

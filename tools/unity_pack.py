@@ -1351,6 +1351,25 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 continue
             val = fm.group(2)
             rec["fields"][key] = float(val) if "." in val else int(val)
+        # Vector2 serialized fields: name: {x: A, y: B}
+        for fm in re.finditer(
+                r"(?m)^\s{2}(\w+):\s+\{x:\s*([^,}]+),\s*y:\s*([^}]+)\}\s*$",
+                block):
+            key = fm.group(1)
+            if key.startswith("m_"):
+                continue
+            rec.setdefault("vec2_fields", {})[key] = (
+                float(fm.group(2)), float(fm.group(3)))
+        # Transform / component object refs: name: {fileID: N}
+        for fm in re.finditer(
+                r"(?m)^\s{2}(\w+):\s+\{fileID:\s*(-?\d+)\}\s*$", block):
+            key = fm.group(1)
+            if key.startswith("m_"):
+                continue
+            fid = fm.group(2)
+            if fid == "0":
+                continue
+            rec.setdefault("object_refs", {})[key] = fid
         if kind == "Light":
             inten = re.search(r"(?m)^\s+m_Intensity:\s*([0-9.eE+-]+)", block)
             col = re.search(
@@ -1658,6 +1677,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         xf = None
         script = None
         fields = {}
+        object_refs = {}
+        vec2_fields = {}
         sprite = None
         ui_image = None
         canvas = None
@@ -1682,6 +1703,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 rot = k["rot"]
             if k.get("kind") == "MonoBehaviour":
                 fields.update(k.get("fields") or {})
+                object_refs.update(k.get("object_refs") or {})
+                vec2_fields.update(k.get("vec2_fields") or {})
                 g = k.get("guid")
                 if g and g in guid_to_script:
                     script = guid_to_script[g]
@@ -1881,6 +1904,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "father_id": father_id,
             "xf_id": xf_id,
             "fields": fields,
+            "object_refs": object_refs,
             "script": script,
             "class": class_name or go.get("name") or "Obj",
             "sprite": sprite,
@@ -2567,6 +2591,149 @@ def _build_animation_tables(plan):
     }
 
 
+def _resolve_transform_field_targets(plan):
+    """Authored Transform field refs (fileID) → (class_id, inst) per owner.
+
+    Player.graphicsTrs → Graphics Transform fileID → Graphics instance.
+    """
+    class_ids = {n: i for i, n in enumerate(sorted(plan["classes"]))}
+    xf_to = {}
+    for cname, cl in plan["classes"].items():
+        for i, o in enumerate(cl.get("instances") or []):
+            xid = o.get("xf_id")
+            if xid is not None and str(xid) != "0":
+                xf_to[str(xid)] = (cname, i)
+    targets = {}
+    scale_classes = set()
+    for cname, cl in plan["classes"].items():
+        for f in cl.get("fields") or []:
+            if f.get("ty") != "Transform":
+                continue
+            fname = f["name"]
+            row = []
+            for o in cl.get("instances") or []:
+                refs = o.get("object_refs") or {}
+                fid = refs.get(fname)
+                hit = xf_to.get(str(fid)) if fid else None
+                if hit:
+                    tc, ti = hit
+                    row.append((int(class_ids[tc]), int(ti), tc))
+                    scale_classes.add(tc)
+                else:
+                    row.append(None)
+            targets[(cname, fname)] = row
+    plan["transform_field_targets"] = targets
+    live = set(plan.get("live_scale_classes") or [])
+    live |= scale_classes
+    plan["live_scale_classes"] = sorted(live)
+    mutable = set(plan.get("sprite_draw_mutable") or [])
+    mutable |= scale_classes
+    plan["sprite_draw_mutable"] = sorted(mutable)
+
+
+def _match_call_args(text, open_paren):
+    """Index of '(' → (args_str, index_after_closing_paren) or None."""
+    if open_paren >= len(text) or text[open_paren] != "(":
+        return None
+    depth = 1
+    j = open_paren + 1
+    while j < len(text) and depth:
+        c = text[j]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return text[open_paren + 1:j], j + 1
+        j += 1
+    return None
+
+
+def _rewrite_extensions_set_world_scale(text, cl, plan):
+    """Extensions.SetWorldScale + Vector2.SetX/SetZ → _engine_set_world_scale.
+
+    Authored:
+      graphicsTrs.SetWorldScale(multSize.SetX(multSize.x * xSize).SetZ(1));
+    """
+    idn = _c_ident(cl["name"])
+    transform_fields = [
+        f["name"] for f in (cl.get("fields") or [])
+        if f.get("ty") == "Transform"]
+    vec2_fields = set(cl.get("vec2_fields") or [])
+    if not transform_fields:
+        return text
+
+    out = []
+    i = 0
+    while i < len(text):
+        found = None
+        for fname in transform_fields:
+            pat = (r"(?<![_\w])%s\s*\.\s*SetWorldScale\s*\("
+                   % re.escape(fname))
+            m = re.search(pat, text[i:])
+            if not m:
+                continue
+            if found is None or m.start() < found[0]:
+                found = (m.start(), m.end(), fname)
+        if not found:
+            out.append(text[i:])
+            break
+        start_rel, end_rel, fname = found
+        abs_start = i + start_rel
+        abs_open = i + end_rel - 1
+        out.append(text[i:abs_start])
+        matched = _match_call_args(text, abs_open)
+        if not matched:
+            out.append(text[abs_start:abs_open + 1])
+            i = abs_open + 1
+            continue
+        arg, after = matched
+        arg_s = arg.strip()
+        sx = sy = sz = None
+        sx_m = re.match(r"(?s)^(\w+)\s*\.\s*SetX\s*\(", arg_s)
+        if sx_m and sx_m.group(1) in vec2_fields:
+            vname = sx_m.group(1)
+            open_x = sx_m.end() - 1
+            ax = _match_call_args(arg_s, open_x)
+            if ax:
+                sx_arg, after_x = ax
+                rest = arg_s[after_x:]
+                zm = re.match(r"\s*\.\s*SetZ\s*\(", rest)
+                if zm:
+                    open_z = after_x + zm.end() - 1
+                    az = _match_call_args(arg_s, open_z)
+                    if az:
+                        sx = sx_arg.strip()
+                        sy = "%s_get_%s_y(i)" % (idn, vname)
+                        sz = az[0].strip()
+        if sx is None:
+            nm = re.match(r"(?s)^new\s+Vector3\s*\((.*)\)\s*$", arg_s)
+            if nm:
+                parts = _split_call_args(nm.group(1))
+                if len(parts) >= 3:
+                    sx, sy, sz = parts[0], parts[1], parts[2]
+        if sx is None:
+            out.append(text[abs_start:after])
+            i = after
+            continue
+        for vf in vec2_fields:
+            sx = re.sub(r"(?<![_\w])%s\.x\b" % vf,
+                        "%s_get_%s_x(i)" % (idn, vf), sx)
+            sx = re.sub(r"(?<![_\w])%s\.y\b" % vf,
+                        "%s_get_%s_y(i)" % (idn, vf), sx)
+            sz = re.sub(r"(?<![_\w])%s\.x\b" % vf,
+                        "%s_get_%s_x(i)" % (idn, vf), sz)
+            sz = re.sub(r"(?<![_\w])%s\.y\b" % vf,
+                        "%s_get_%s_y(i)" % (idn, vf), sz)
+        out.append(
+            "_engine_set_world_scale("
+            "_%s_%s_target_class[i], (unsigned)_%s_%s_target_inst[i], "
+            "(%s), (%s), (%s))" % (
+                idn, fname, idn, fname, sx, sy, sz))
+        i = after
+    return "".join(out)
+
+
 def _rewrite_rigidbody_assigns(text, plan, this_class):
     """Lower GetComponent<Rigidbody*>().velocity = new VectorN(...);"""
     this_idn = _c_ident(this_class)
@@ -2929,9 +3096,8 @@ def _fields_in(body, bscan):
     for m in re.finditer(
             r"(?m)^[ \t]*(?:public|private|protected|internal)?"
             r"[ \t]*(?:static[ \t]+)?(?:readonly[ \t]+)?"
-            r"([\w.<>]+)[ \t]+(\w+)[ \t]*(?:=|;)",
+            r"([\w.<>]+)[ \t]+(\w+)[ \t]*(=|;)",
             bscan):
-        after = bscan[m.end(2):m.end(2) + 8]
         # `int F(` is a method.
         tail = body[m.end(2):m.end(2) + 16]
         if "(" in tail.split(";")[0] and "=" not in tail.split(";")[0]:
@@ -3126,6 +3292,9 @@ def plan_layouts(objects, analyses, two_d=None):
                 continue
             if ty == "Vector3":
                 continue  # transform owns position; full Vector3 fields later
+            if ty == "Transform":
+                # Resolved via object_refs → target class/inst (SetWorldScale).
+                continue
             if ty in ("int", "byte", "short", "uint"):
                 vals = [o["fields"][fname] for o in insts if fname in o["fields"]]
                 if not vals:
@@ -3503,6 +3672,22 @@ def emit_engine(plan, analyses, used_apis):
         p("extern int _%s_draw_tex[%d];" % (idn, n))
         p("extern float _%s_draw_hw[%d];" % (idn, n))
         p("extern float _%s_draw_hh[%d];" % (idn, n))
+    for cname in sorted(plan.get("live_scale_classes") or []):
+        if cname not in plan["classes"]:
+            continue
+        idn = _c_ident(cname)
+        n = max(1, plan["classes"][cname]["n"])
+        p("extern float _%s_scale_x[%d];" % (idn, n))
+        p("extern float _%s_scale_y[%d];" % (idn, n))
+    # Transform field → target class/inst (SetWorldScale).
+    for (oc, fname), row in sorted(
+            (plan.get("transform_field_targets") or {}).items()):
+        if oc not in plan["classes"]:
+            continue
+        idn = _c_ident(oc)
+        n = max(1, len(row) or 1)
+        p("extern const int _%s_%s_target_class[%d];" % (idn, fname, n))
+        p("extern const int _%s_%s_target_inst[%d];" % (idn, fname, n))
     p("")
 
     # Packed structs (positions omitted when SoA).
@@ -4198,6 +4383,30 @@ def emit_engine(plan, analyses, used_apis):
     p("    return s ? -f : f;")
     p("}")
     p("")
+
+    # Extensions.SetWorldScale → live localScale on the referenced Transform's GO.
+    if plan.get("transform_field_targets"):
+        live = set(plan.get("live_scale_classes") or [])
+        p("/* Authored TransformExtensions.SetWorldScale (lossy≈parent∘local). */")
+        p("static void _engine_set_world_scale(int tc, unsigned ti,")
+        p("                                   float sx, float sy, float sz) {")
+        p("    (void)sz;")
+        p("    switch (tc) {")
+        for cname in sorted(live):
+            if cname not in class_ids:
+                continue
+            cid = class_ids[cname]
+            idn = _c_ident(cname)
+            p("    case %d:" % cid)
+            p("        if (ti < (unsigned)_%s_inst_count) {" % idn)
+            p("            _%s_scale_x[ti] = sx;" % idn)
+            p("            _%s_scale_y[ti] = sy;" % idn)
+            p("        }")
+            p("        break;")
+        p("    default: break;")
+        p("    }")
+        p("}")
+        p("")
 
     # Group methods by class; array comment sits on the group.
     methods_by = {}
@@ -4987,6 +5196,7 @@ def emit_engine(plan, analyses, used_apis):
             continue
         any_sprite = True
         use_mut = cname in mutable_spr
+        use_scale = cname in set(plan.get("live_scale_classes") or [])
         p("    { /* %s SpriteRenderer */" % idn)
         p("        static const float _spr_r[] = { %s };" % ", ".join(
             "%sf" % repr(float(sp["r"])) for _i, sp in spr_idx))
@@ -5053,6 +5263,11 @@ def emit_engine(plan, analyses, used_apis):
             p("            out[n].half_w = _spr_hw[k];")
             p("            out[n].half_h = _spr_hh[k];")
             p("            out[n].tex = _spr_tex[k];")
+        if use_scale:
+            p("            out[n].half_w = out[n].half_w * _%s_scale_x[i];"
+              % idn)
+            p("            out[n].half_h = out[n].half_h * _%s_scale_y[i];"
+              % idn)
         p("            out[n].cos_z = _spr_cos[k];")
         p("            out[n].sin_z = _spr_sin[k];")
         p("            out[n].r = _spr_r[k];")
@@ -5411,6 +5626,7 @@ def _lower_method_body(body, cl, plan):
     idn = _c_ident(cl["name"])
     text = _rewrite_csharp_float_literals(body)
     text = re.sub(r"\bthis\.", "", text)
+    text = _rewrite_extensions_set_world_scale(text, cl, plan)
     text = _rewrite_rigidbody_assigns(text, plan, cl["name"])
     # Find/GetComponent before field rewrites so `.amp` stays on the target type.
     text = _rewrite_find_getcomponent(text, plan, cl["name"])
@@ -5905,6 +6121,47 @@ def emit_data(plan, used_apis=None):
             idn, n, ", ".join("%sf" % repr(v) for v in hws)))
         p("float _%s_draw_hh[%d] = { %s };" % (
             idn, n, ", ".join("%sf" % repr(v) for v in hhs)))
+    # Live localScale for SetWorldScale targets.
+    for cname in sorted(plan.get("live_scale_classes") or []):
+        cl = plan["classes"].get(cname)
+        if not cl:
+            continue
+        idn = _c_ident(cname)
+        n = max(1, cl["n"])
+        sxs, sys = [], []
+        for o in cl["instances"]:
+            ls = o.get("local_scale") or (1.0, 1.0, 1.0)
+            sxs.append(float(ls[0]))
+            sys.append(float(ls[1]))
+        while len(sxs) < n:
+            sxs.append(1.0)
+            sys.append(1.0)
+        p("float _%s_scale_x[%d] = { %s };" % (
+            idn, n, ", ".join("%sf" % repr(v) for v in sxs)))
+        p("float _%s_scale_y[%d] = { %s };" % (
+            idn, n, ", ".join("%sf" % repr(v) for v in sys)))
+    # Transform field targets (graphicsTrs → Graphics, etc.).
+    for (oc, fname), row in sorted(
+            (plan.get("transform_field_targets") or {}).items()):
+        if oc not in plan["classes"]:
+            continue
+        idn = _c_ident(oc)
+        n = max(1, len(row) or plan["classes"][oc]["n"])
+        classes, insts = [], []
+        for hit in row:
+            if hit:
+                classes.append(int(hit[0]))
+                insts.append(int(hit[1]))
+            else:
+                classes.append(-1)
+                insts.append(0)
+        while len(classes) < n:
+            classes.append(-1)
+            insts.append(0)
+        p("const int _%s_%s_target_class[%d] = { %s };" % (
+            idn, fname, n, ", ".join(str(c) for c in classes)))
+        p("const int _%s_%s_target_inst[%d] = { %s };" % (
+            idn, fname, n, ", ".join(str(c) for c in insts)))
     textures = plan.get("textures") or []
     p("const int _engine_tex_count = %d;" % len(textures))
     if textures:
@@ -6276,6 +6533,7 @@ def pack(root, outdir, soa=False, soa_vec4=False):
     plan["collider2d"] = _build_collider2d_tables(plan)
     plan["collider3d"] = _build_collider3d_tables(plan)
     plan["animation"] = _build_animation_tables(plan)
+    _resolve_transform_field_targets(plan)
     os.makedirs(outdir, exist_ok=True)
     _progress("emitting engine.c (%d classes)" % len(plan["classes"]))
     engine = emit_engine(plan, analyses, used_apis)
@@ -6295,8 +6553,6 @@ def pack(root, outdir, soa=False, soa_vec4=False):
         f.write(data)
     with open(os.path.join(outdir, "engine_draw.h"), "w") as f:
         f.write(emit_engine_draw_h())
-    with open(os.path.join(outdir, "main.c"), "w") as f:
-        f.write(main_c)
     with open(os.path.join(outdir, "Makefile"), "w") as f:
         f.write(emit_makefile(outdir))
     shdir = os.path.join(outdir, "shaders")

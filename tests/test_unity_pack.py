@@ -1058,6 +1058,42 @@ class TestSystems(unittest.TestCase):
         run = subprocess.run([exe], capture_output=True, text=True)
         self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
 
+    def test_mathf_sign_and_set_world_scale_extensions(self):
+        """Mathf.Sign + Extensions SetX/SetZ/SetWorldScale lower for Player."""
+        d = tempfile.mkdtemp(prefix="upack-ext-")
+        plan = unity_pack.pack(SYSTEMS, d)
+        self.assertEqual(plan.get("live_scale_classes"), ["Graphics"])
+        targets = plan.get("transform_field_targets") or {}
+        self.assertIn(("Player", "graphicsTrs"), targets)
+        hit = targets[("Player", "graphicsTrs")][0]
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit[2], "Graphics")
+        player = plan["classes"]["Player"]["instances"][0]
+        self.assertAlmostEqual(float(player["fields"]["multSize_x"]), 1.0)
+        self.assertAlmostEqual(float(player["fields"]["multSize_y"]), 1.0)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("Mathf_Sign", eng)
+        self.assertIn("_engine_set_world_scale", eng)
+        self.assertIn("_Player_graphicsTrs_target_class", eng)
+        self.assertIn("_Graphics_scale_x", eng)
+        self.assertNotIn("Mathf.Sign", eng)
+        self.assertNotIn("graphicsTrs.SetWorldScale", eng)
+        self.assertIn(
+            "_engine_set_world_scale(_Player_graphicsTrs_target_class[i]",
+            eng)
+        with open(os.path.join(d, "data.c")) as f:
+            data = f.read()
+        self.assertIn("float _Graphics_scale_x[", data)
+        self.assertIn("const int _Player_graphicsTrs_target_class[", data)
+        # Script `float xSize = 1;` — not in scene YAML; must still init to 1
+        # so SetWorldScale(multSize.x * xSize) is non-zero before arrows.
+        self.assertRegex(
+            data,
+            r"Player _Player_inst_array\[1\] = \{\s*\{[^}]*1\.0f[^}]*\},")
+        # xSize is last float member after multSize_x/y — trailing 1.0f before }
+        self.assertIn("17.5f, 1.0f, 1.0f, 1.0f", data)
+
     def test_addcomponent_camera_and_rigidbody2d(self):
         """AddComponent refuses a second DisallowMultipleComponent with Unity's error."""
         d = tempfile.mkdtemp(prefix="upack-addcomp-")
