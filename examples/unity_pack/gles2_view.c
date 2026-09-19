@@ -41,16 +41,16 @@ float Camera_main_background_b __attribute__((weak)) = 0.f;
 #define HEIGHT 64
 #define MAX_DRAWS 64
 #define MAX_TEX 32
-#define VERT_STRIDE 7
+#define VERT_STRIDE 8
 #define MAX_FLOATS (6 * VERT_STRIDE)
 
 #define TICKS_BEFORE_DRAW 30
 
 static const char *VERT_SRC =
     "attribute vec2 a_pos;\n"
-    "attribute vec3 a_color;\n"
+    "attribute vec4 a_color;\n"
     "attribute vec2 a_uv;\n"
-    "varying vec3 v_color;\n"
+    "varying vec4 v_color;\n"
     "varying vec2 v_uv;\n"
     "void main() {\n"
     "    v_color = a_color;\n"
@@ -60,12 +60,12 @@ static const char *VERT_SRC =
 
 static const char *FRAG_SRC =
     "precision mediump float;\n"
-    "varying vec3 v_color;\n"
+    "varying vec4 v_color;\n"
     "varying vec2 v_uv;\n"
     "uniform sampler2D u_tex;\n"
     "void main() {\n"
     "    vec4 t = texture2D(u_tex, v_uv);\n"
-    "    gl_FragColor = vec4(t.rgb * v_color, t.a);\n"
+    "    gl_FragColor = vec4(t.rgb * v_color.rgb, t.a * v_color.a);\n"
     "}\n";
 
 static unsigned char pixels[WIDTH * HEIGHT * 4];
@@ -98,7 +98,7 @@ static float world_to_ndc_y(float y)
 }
 
 static void emit_vert(int *ni, float x, float y, float r, float g, float b,
-                      float u, float v)
+                      float a, float u, float v)
 {
     int i = *ni;
     if (i + VERT_STRIDE > MAX_FLOATS)
@@ -108,8 +108,9 @@ static void emit_vert(int *ni, float x, float y, float r, float g, float b,
     vert_buf[i + 2] = r;
     vert_buf[i + 3] = g;
     vert_buf[i + 4] = b;
-    vert_buf[i + 5] = u;
-    vert_buf[i + 6] = v;
+    vert_buf[i + 5] = a;
+    vert_buf[i + 6] = u;
+    vert_buf[i + 7] = v;
     *ni = i + VERT_STRIDE;
 }
 
@@ -118,7 +119,7 @@ static void emit_quad(int *ni, const EngineDraw *d)
 {
     float hw = d->half_w, hh = d->half_h;
     float c = d->cos_z, s = d->sin_z;
-    float r = d->r, g = d->g, b = d->b;
+    float r = d->r, g = d->g, b = d->b, a = d->a;
     float lx[4] = {-hw, hw, -hw, hw};
     float ly[4] = {-hh, -hh, hh, hh};
     float u[4] = {0.f, 1.f, 0.f, 1.f};
@@ -132,13 +133,13 @@ static void emit_quad(int *ni, const EngineDraw *d)
         nx[i] = world_to_ndc_x(wx);
         ny[i] = world_to_ndc_y(wy);
     }
-    emit_vert(ni, nx[0], ny[0], r, g, b, u[0], v[0]);
-    emit_vert(ni, nx[1], ny[1], r, g, b, u[1], v[1]);
-    emit_vert(ni, nx[2], ny[2], r, g, b, u[2], v[2]);
+    emit_vert(ni, nx[0], ny[0], r, g, b, a, u[0], v[0]);
+    emit_vert(ni, nx[1], ny[1], r, g, b, a, u[1], v[1]);
+    emit_vert(ni, nx[2], ny[2], r, g, b, a, u[2], v[2]);
 
-    emit_vert(ni, nx[1], ny[1], r, g, b, u[1], v[1]);
-    emit_vert(ni, nx[3], ny[3], r, g, b, u[3], v[3]);
-    emit_vert(ni, nx[2], ny[2], r, g, b, u[2], v[2]);
+    emit_vert(ni, nx[1], ny[1], r, g, b, a, u[1], v[1]);
+    emit_vert(ni, nx[3], ny[3], r, g, b, a, u[3], v[3]);
+    emit_vert(ni, nx[2], ny[2], r, g, b, a, u[2], v[2]);
 }
 
 static GLuint compile_stage(GLenum type, const char *src, const char *what)
@@ -324,11 +325,11 @@ static int draw_scene(GLuint prog)
         glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, stride,
                               (const void *)0);
         glEnableVertexAttribArray(1);
-        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride,
+        glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, stride,
                               (const void *)(2 * sizeof(GLfloat)));
         glEnableVertexAttribArray(2);
         glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, stride,
-                              (const void *)(5 * sizeof(GLfloat)));
+                              (const void *)(6 * sizeof(GLfloat)));
         glDrawArrays(GL_TRIANGLES, 0, nfloats / VERT_STRIDE);
     }
     glFinish();
