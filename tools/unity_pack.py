@@ -134,6 +134,10 @@ _API = {
     ),
     "Mathf.Sin": "static float Mathf_Sin(float f) { return sinf(f); }",
     "Mathf.Cos": "static float Mathf_Cos(float f) { return cosf(f); }",
+    "Mathf.Sign": (
+        "static float Mathf_Sign(float f) {\n"
+        "    if (f < 0.f) return -1.f; if (f > 0.f) return 1.f; return 0.f;\n}"
+    ),
     "Time.deltaTime": None,  # globals in data.c — host can poke
     "Time.time": None,
     "Time.fixedDeltaTime": None,
@@ -207,7 +211,7 @@ _SPAWN = re.compile(
 _VEC3Z = re.compile(r"\.(z)\b|Vector3|Quaternion")
 _UNITY_API = re.compile(
     r"(?:AddComponent\s*<\s*[\w.]+\s*>|"
-    r"(?<![\w])(?:Mathf\.(?:Abs|Min|Max|Clamp|Lerp|Sin|Cos)|"
+    r"(?<![\w])(?:Mathf\.(?:Abs|Min|Max|Clamp|Lerp|Sin|Cos|Sign)|"
     r"Time\.(?:deltaTime|time|fixedDeltaTime)|"
     r"Screen\.(?:width|height)|"
     r"Input\.(?:GetAxis|GetButton|GetKey)|"
@@ -1703,6 +1707,10 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 anim = dict(k["animation"])
             if k.get("kind") == "Animator" and k.get("animator"):
                 animator = dict(k["animator"])
+        # Flatten authored Vector2 YAML into _x/_y for packed members.
+        for vk, (vx, vy) in vec2_fields.items():
+            fields[vk + "_x"] = vx
+            fields[vk + "_y"] = vy
         local_pos, local_rot, local_scale = pos, rot, scale
         father_id = xf.get("father_id") if xf else None
         xf_id = xf.get("file_id") if xf else None
@@ -2871,6 +2879,49 @@ def _blank_method_bodies(bscan):
     return "".join(out)
 
 
+def _parse_csharp_field_init(ty, raw):
+    """Script field initializer → Python value, or None if unsupported."""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    if ty == "Vector2":
+        m = re.match(
+            r"new\s+Vector2\s*\(\s*(-?\d+(?:\.\d+)?)\s*[fF]?\s*,\s*"
+            r"(-?\d+(?:\.\d+)?)\s*[fF]?\s*\)",
+            raw)
+        if m:
+            return (float(m.group(1)), float(m.group(2)))
+        return None
+    if ty == "Vector3":
+        m = re.match(
+            r"new\s+Vector3\s*\(\s*(-?\d+(?:\.\d+)?)\s*[fF]?\s*,\s*"
+            r"(-?\d+(?:\.\d+)?)\s*[fF]?\s*,\s*"
+            r"(-?\d+(?:\.\d+)?)\s*[fF]?\s*\)",
+            raw)
+        if m:
+            return (float(m.group(1)), float(m.group(2)), float(m.group(3)))
+        return None
+    if ty == "bool":
+        if raw == "true":
+            return 1
+        if raw == "false":
+            return 0
+        return None
+    if ty in ("float", "double"):
+        m = re.match(
+            r"(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*[fFdD]?", raw)
+        if m:
+            return float(m.group(1))
+        return None
+    if ty in ("int", "byte", "short", "uint", "long", "sbyte",
+              "ushort", "ulong"):
+        m = re.match(r"(-?\d+)", raw)
+        if m:
+            return int(m.group(1))
+        return None
+    return None
+
+
 def _fields_in(body, bscan):
     """Instance fields; methods (those with `(`) are skipped."""
     bscan = _blank_method_bodies(bscan)
@@ -2888,8 +2939,39 @@ def _fields_in(body, bscan):
         ty, name = m.group(1).strip(), m.group(2)
         if ty in ("if", "for", "return", "new"):
             continue
-        out.append({"ty": ty, "name": name})
+        entry = {"ty": ty, "name": name}
+        # Authored `float xSize = 1;` / `Vector2 multSize = new Vector2(1, 1);`
+        if m.group(0).rstrip().endswith("="):
+            rest = body[m.end():]
+            semi = rest.find(";")
+            if semi >= 0:
+                default = _parse_csharp_field_init(ty, rest[:semi])
+                if default is not None:
+                    entry["default"] = default
+        out.append(entry)
     return out
+
+
+def _member_init_default(cl, member_name):
+    """Script field initializer for a packed member, or None."""
+    for f in cl.get("fields") or []:
+        if "default" not in f:
+            continue
+        if f["name"] == member_name:
+            return f["default"]
+        if f.get("ty") == "Vector2" and isinstance(f["default"], tuple):
+            if member_name == f["name"] + "_x":
+                return f["default"][0]
+            if member_name == f["name"] + "_y":
+                return f["default"][1]
+        if f.get("ty") == "Vector3" and isinstance(f["default"], tuple):
+            if member_name == f["name"] + "_x":
+                return f["default"][0]
+            if member_name == f["name"] + "_y":
+                return f["default"][1]
+            if member_name == f["name"] + "_z":
+                return f["default"][2]
+    return None
 
 
 def _methods_in(body, bscan):
@@ -3013,6 +3095,12 @@ def plan_layouts(objects, analyses, two_d=None):
             field_tys[f["name"]] = f["ty"]
         for o in insts:
             for k in o["fields"]:
+                # Vector2 components are packed via the Vector2 script field.
+                if k.endswith("_x") or k.endswith("_y"):
+                    base = k[:-2]
+                    if any(f["name"] == base and f.get("ty") == "Vector2"
+                           for f in script_fields):
+                        continue
                 field_tys.setdefault(k, "int")
 
         static = (not writes.get(cname, False)) and (not spawn)
@@ -5376,7 +5464,7 @@ def _lower_method_body(body, cl, plan):
     # Unity Object.ToString when printing a Find result (name, not index).
     text = _wrap_log_gameobject_tostring(text)
     text = _wrap_log_component_tostring(text, add_locals)
-    text = re.sub(r"Mathf\.(Abs|Min|Max|Clamp|Lerp|Sin|Cos)\s*\(",
+    text = re.sub(r"Mathf\.(Abs|Min|Max|Clamp|Lerp|Sin|Cos|Sign)\s*\(",
                   lambda m: "Mathf_%s(" % m.group(1), text)
     text = re.sub(r"transform\.position\.x", idn + "_get_pos_x(i)", text)
     text = re.sub(r"transform\.position\.y", idn + "_get_pos_y(i)", text)
@@ -5883,7 +5971,11 @@ def emit_data(plan, used_apis=None):
                 elif name in o["fields"]:
                     parts.append(_init_num(o["fields"][name], kind))
                 else:
-                    parts.append("0")
+                    dflt = _member_init_default(cl, name)
+                    if dflt is not None:
+                        parts.append(_init_num(dflt, kind))
+                    else:
+                        parts.append("0")
             if not parts:
                 parts = ["0"]
             p("    { %s }, /* %s */" % (", ".join(parts), o["name"]))
