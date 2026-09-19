@@ -1,9 +1,15 @@
+using Extensions;
 using UnityEngine;
 using UnityEngine.InputSystem;
 
-public class Pad : MonoBehaviour
+public class Player : MonoBehaviour
 {
-	public float speed;
+    public Rigidbody2D rb;
+	public float moveSpeed;
+	public Transform graphicsTrs;
+	float xSize = 1;
+	[HideInInspector]
+	public Vector2 multSize = new Vector2(1, 1);
 
 	void Start ()
 	{
@@ -18,7 +24,7 @@ public class Pad : MonoBehaviour
 			move --;
 		if (Keyboard.current.rightArrowKey.isPressed)
 			move ++;
-		transform.position += new Vector3(move * speed * Time.deltaTime, 0);
+		transform.position += new Vector3(move * moveSpeed * Time.deltaTime, 0);
 		print(move);
 		System.Console.WriteLine("" + Time.time);
 		SpriteRenderer spriteRend = gameObject.AddComponent<SpriteRenderer>();
