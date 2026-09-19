@@ -1574,8 +1574,8 @@ class TestSystems(unittest.TestCase):
         self.assertIn("TalkerLog", engine)
         self.assertIn("Debug_Log_s", engine)
         self.assertIn("Talker_Start", engine)
-        self.assertIn('Debug_Log("Hello World!")', engine)
-        self.assertIn("Debug_Log(3)", engine)
+        self.assertIn('Debug_Log_s("Hello World!")', engine)
+        self.assertIn("Debug_Log_i(3)", engine)
         r = subprocess.run(["make", "-C", d], capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr or r.stdout)
         run = subprocess.run([os.path.join(d, "game")],

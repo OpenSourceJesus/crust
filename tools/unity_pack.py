@@ -3530,6 +3530,7 @@ def emit_engine(plan, analyses, used_apis):
         p("#include <sys/stat.h>")
         p("#define ENGINE_MKDIR(p) mkdir((p), 0755)")
         p("#endif")
+        p("#endif")
     p("")
     p("/* Types first, then every global. C forbids `extern T a[N]` while")
     p("   T is incomplete, so the arrays wait until the structs exist;")
@@ -3824,12 +3825,7 @@ def emit_engine(plan, analyses, used_apis):
         p("             a ? a : \"\", b ? b : \"\");")
         p("    return _engine_str_buf;")
         p("}")
-        p("#define _str_plus(a, b) _Generic((b), \\")
-        p("    int: _str_plus_i, \\")
-        p("    float: _str_plus_f, \\")
-        p("    double: _str_plus_f, \\")
-        p("    default: _str_plus_s \\")
-        p(")((a), (b))")
+        p("/* Call sites pick _str_plus_{i,f,s} at rewrite (no C11 generics). */")
         p("")
     if want_log:
         company = plan.get("company_name") or "DefaultCompany"
@@ -3845,6 +3841,7 @@ def emit_engine(plan, analyses, used_apis):
         p("static int _engine_log_opened;")
         p("static char _engine_log_default[1024];")
         p("")
+        p("#ifndef CRUST_NO_POSIX_MKDIR")
         p("static int _engine_mkdir_p(char *path) {")
         p("    char *p;")
         p("    if (!path || !path[0]) return -1;")
@@ -3865,11 +3862,16 @@ def emit_engine(plan, analyses, used_apis):
         p("    if (ENGINE_MKDIR(path) != 0 && errno != EEXIST) return -1;")
         p("    return 0;")
         p("}")
+        p("#endif")
         p("")
         p("static const char *_engine_default_log_path(void) {")
         p("    const char *home;")
+        p("#ifndef CRUST_NO_POSIX_MKDIR")
         p("    char dir[1024];")
         p("    int n, i;")
+        p("#else")
+        p("    int n;")
+        p("#endif")
         p("#ifdef _WIN32")
         p("    home = getenv(\"USERPROFILE\");")
         p("    if (!home || !home[0]) home = \".\";")
@@ -3890,6 +3892,7 @@ def emit_engine(plan, analyses, used_apis):
         p("        home, _engine_company, _engine_product);")
         p("#endif")
         p("    if (n < 0 || (size_t)n >= sizeof _engine_log_default) return 0;")
+        p("#ifndef CRUST_NO_POSIX_MKDIR")
         p("    if ((size_t)n >= sizeof dir) return 0;")
         p("    for (i = 0; i < n; i++) dir[i] = _engine_log_default[i];")
         p("    dir[n] = 0;")
@@ -3901,11 +3904,12 @@ def emit_engine(plan, analyses, used_apis):
         p("#endif")
         p("    }")
         p("    if (dir[0]) _engine_mkdir_p(dir);")
+        p("#endif")
         p("    return _engine_log_default;")
         p("}")
         p("")
         p("void engine_set_log_file(const char *path) {")
-        p("    if (_engine_log_fp && _engine_log_fp != stdout) {")
+        p("    if (_engine_log_fp && !_engine_log_stdout) {")
         p("        fclose(_engine_log_fp);")
         p("        _engine_log_fp = 0;")
         p("    }")
@@ -3936,6 +3940,10 @@ def emit_engine(plan, analyses, used_apis):
         p("        path = _engine_log_override ? _engine_log_override")
         p("                                   : _engine_default_log_path();")
         p("        if (path) _engine_log_fp = fopen(path, \"w\");")
+        p("        if (!_engine_log_fp) {")
+        p("            _engine_log_stdout = 1;")
+        p("            return stdout;")
+        p("        }")
         p("    }")
         p("    return _engine_log_fp;")
         p("}")
@@ -3959,12 +3967,7 @@ def emit_engine(plan, analyses, used_apis):
         p("    fputc('\\n', f);")
         p("    fflush(f);")
         p("}")
-        p("#define Debug_Log(msg) _Generic((msg), \\")
-        p("    float: Debug_Log_f, \\")
-        p("    double: Debug_Log_f, \\")
-        p("    int: Debug_Log_i, \\")
-        p("    default: Debug_Log_s \\")
-        p(")(msg)")
+        p("/* Call sites pick Debug_Log_{i,f,s} at rewrite (no C11 generics). */")
         p("")
     else:
         p("void engine_set_log_file(const char *path) { (void)path; }")
@@ -3979,12 +3982,7 @@ def emit_engine(plan, analyses, used_apis):
         p("static void Console_WriteLine_s(const char *s) {")
         p("    puts(s ? s : \"\");")
         p("}")
-        p("#define Console_WriteLine(msg) _Generic((msg), \\")
-        p("    float: Console_WriteLine_f, \\")
-        p("    double: Console_WriteLine_f, \\")
-        p("    int: Console_WriteLine_i, \\")
-        p("    default: Console_WriteLine_s \\")
-        p(")(msg)")
+        p("/* Call sites pick Console_WriteLine_{i,f,s} at rewrite (no C11 generics). */")
         p("")
     p("void engine_apply_argv(int argc, char **argv) {")
     if want_log:
@@ -5502,9 +5500,9 @@ def _parse_plus_rhs(text, i):
 
 
 def _rewrite_string_concat(text):
-    """Rewrite C# string + value to _str_plus (C pointer + is wrong).
+    """Rewrite C# string + value to typed _str_plus_* (C pointer + is wrong).
 
-    Handles `"lit" + expr` and chains via repeated `_str_plus(...) + expr`.
+    Handles `"lit" + expr` and chains via repeated `_str_plus_*(...) + expr`.
     """
     changed = True
     while changed:
@@ -5514,9 +5512,11 @@ def _rewrite_string_concat(text):
         while i < len(text):
             left = None
             left_end = None
-            if text.startswith("_str_plus(", i):
+            m_plus = re.match(r"_str_plus_[ifs]\(", text[i:])
+            if m_plus or text.startswith("_str_plus(", i):
+                prefix = m_plus.group(0) if m_plus else "_str_plus("
                 depth = 0
-                j = i + len("_str_plus")
+                j = i + len(prefix) - 1
                 while j < len(text):
                     if text[j] == '"':
                         j = _skip_c_string(text, j)
@@ -5543,7 +5543,9 @@ def _rewrite_string_concat(text):
                     rhs_start, rhs_end = _parse_plus_rhs(text, k + 1)
                     rhs = text[rhs_start:rhs_end].strip()
                     if rhs:
-                        out.append("_str_plus(%s, (%s))" % (left, rhs))
+                        kind = _c_expr_scalar_kind(rhs)
+                        out.append("_str_plus_%s(%s, (%s))"
+                                   % (kind, left, rhs))
                         i = rhs_end
                         changed = True
                         continue
@@ -5551,6 +5553,59 @@ def _rewrite_string_concat(text):
             i += 1
         text = "".join(out)
     return text
+
+
+def _c_expr_scalar_kind(expr):
+    """Pick i/f/s suffix for Debug_Log / Console_WriteLine / _str_plus."""
+    e = expr.strip()
+    while (e.startswith("(") and e.endswith(")")
+           and e.count("(") == e.count(")")):
+        inner = e[1:-1].strip()
+        if not inner:
+            break
+        e = inner
+    if (e.startswith('"') or e.startswith("_str_plus")
+            or "ToString" in e or e.startswith("(const char")):
+        return "s"
+    if re.match(r"^-?\d+$", e):
+        return "i"
+    return "f"
+
+
+def _rewrite_typed_call_name(text, name):
+    """Rewrite Name(arg) → Name_{i,f,s}(arg). Skips already-typed Names."""
+    out = []
+    i = 0
+    pat = re.compile(r"(?<![\w])%s(?!_[ifs]\b)\s*\(" % re.escape(name))
+    while True:
+        m = pat.search(text[i:])
+        if not m:
+            out.append(text[i:])
+            break
+        out.append(text[i:i + m.start()])
+        start = i + m.end()
+        depth = 1
+        j = start
+        while j < len(text) and depth:
+            c = text[j]
+            if c == '"':
+                j = _skip_c_string(text, j)
+                continue
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        if depth != 0:
+            out.append(text[i + m.start():])
+            break
+        args = text[start:j]
+        kind = _c_expr_scalar_kind(args)
+        out.append("%s_%s(%s)" % (name, kind, args))
+        i = j + 1
+    return "".join(out)
 
 
 def _strip_debug_log_context_arg(text):
@@ -5773,6 +5828,9 @@ def _lower_method_body(body, cl, plan):
             lambda m: "%s_AT(%s_get_%s(i)).%s" % (
                 oiden, idn, name, m.group(1)),
             text)
+    # Typed Debug_Log / Console_WriteLine — crust has no _Generic.
+    text = _rewrite_typed_call_name(text, "Debug_Log")
+    text = _rewrite_typed_call_name(text, "Console_WriteLine")
     return text
 
 
