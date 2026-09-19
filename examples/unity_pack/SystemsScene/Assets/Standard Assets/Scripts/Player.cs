@@ -6,6 +6,7 @@ public class Player : MonoBehaviour
 {
     public Rigidbody2D rb;
 	public float moveSpeed;
+	public float jumpSpeed;
 	public Transform graphicsTrs;
 	[HideInInspector]
 	public Vector2 multSize = new Vector2(1, 1);
