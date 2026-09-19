@@ -383,12 +383,12 @@ class TestSystems(unittest.TestCase):
         objs, _a, _l, _c = unity_pack.load_project(SYSTEMS)
         by_name = {o["name"]: o for o in objs}
         bouncer = by_name["BouncePad"]["sprite"]
-        image = by_name["Image"]["sprite"]
+        button = by_name["Button"]["sprite"]
         self.assertEqual(bouncer["sorting_order"], -10)
         self.assertEqual(bouncer["sorting_layer"], 0)
-        self.assertEqual(image["sorting_layer_id"], 2081823273)
-        self.assertEqual(image["sorting_layer"], 1)
-        self.assertEqual(image["sorting_order"], -1)
+        self.assertEqual(button["sorting_layer_id"], 2081823273)
+        self.assertEqual(button["sorting_layer"], 1)
+        self.assertEqual(button["sorting_order"], -1)
         d = tempfile.mkdtemp(prefix="upack-sort-")
         unity_pack.pack(SYSTEMS, d)
         with open(os.path.join(d, "engine.c")) as f:
@@ -402,35 +402,53 @@ class TestSystems(unittest.TestCase):
         self.assertIn("int sorting_layer;", hdr)
         self.assertIn("int sorting_order;", hdr)
 
-    def test_canvas_image_draws(self):
-        """Authored Canvas + Image with sprite → world-space EngineDraw."""
+    def test_canvas_button_draws_and_clicks(self):
+        """Authored Canvas + Button (builtin UISprite) → draw + SetActive onClick."""
         objs, _a, _l, cams = unity_pack.load_project(SYSTEMS)
-        img = [o for o in objs if o["name"] == "Image"]
-        self.assertEqual(len(img), 1)
-        sp = img[0]["sprite"]
+        btn = [o for o in objs if o["name"] == "Button"]
+        self.assertEqual(len(btn), 1)
+        sp = btn[0]["sprite"]
         self.assertIsNotNone(sp)
         self.assertEqual(sp.get("source"), "ui")
-        self.assertIn("tex_path", sp)
-        self.assertAlmostEqual(sp.get("a", 1.0), 0.5019608, places=4)
-        # Centered 100×100 px → world half-extent from Screen + ortho.
+        self.assertTrue(sp.get("builtin"))
+        self.assertEqual(sp.get("tex_path"), "<builtin:UISprite>")
+        self.assertIsNotNone(btn[0].get("ui_button"))
+        self.assertEqual(btn[0]["ui_button"]["onclick"][0]["method"], "SetActive")
+        cols = btn[0]["ui_button"]["colors"]
+        self.assertAlmostEqual(cols["highlighted"][0], 0.78431374, places=5)
+        self.assertAlmostEqual(cols["pressed"][0], 0.5882353, places=5)
+        hit = btn[0]["ui_hit"]
+        self.assertAlmostEqual(hit["ncx"], 0.5, places=5)
+        self.assertAlmostEqual(hit["ncy"], 0.5, places=5)
+        # Centered 115×30 px → world half-extent from Screen + ortho.
         ortho = float(cams[0]["orthographic_size"])
         sw, sh = unity_pack.player_screen(SYSTEMS)
-        expect_hw = 50.0 * (2.0 * ortho) / float(sh)
-        self.assertAlmostEqual(img[0]["pos"][0], 0.0, places=3)
-        self.assertAlmostEqual(img[0]["pos"][1], 0.0, places=3)
+        expect_hw = 57.5 * (2.0 * ortho) / float(sh)
+        self.assertAlmostEqual(btn[0]["pos"][0], 0.0, places=3)
+        self.assertAlmostEqual(btn[0]["pos"][1], 0.0, places=3)
         self.assertAlmostEqual(sp["half_w"], expect_hw, places=5)
         self.assertEqual(sp["sorting_layer"], 1)  # Foreground
         d = tempfile.mkdtemp(prefix="upack-ui-")
         plan = unity_pack.pack(SYSTEMS, d)
+        self.assertTrue(plan.get("ui_buttons"))
         self.assertTrue(any(
             o.get("sprite") and o["sprite"].get("source") == "ui"
             for cl in plan["classes"].values() for o in cl["instances"]))
         with open(os.path.join(d, "engine.c")) as f:
             eng = f.read()
-        self.assertIn("/* Image SpriteRenderer */", eng)
+        self.assertIn("/* Button SpriteRenderer */", eng)
+        self.assertIn("engine_ui_tick", eng)
+        self.assertIn("GameObject_SetActive", eng)
+        self.assertIn("engine_pointer_x", eng)
+        self.assertIn("_engine_ui_btn_tint", eng)
+        self.assertIn("_engine_ui_btn_col_h", eng)
+        self.assertIn("_spr_ncx", eng)
+        self.assertIn("_spr_btn", eng)
         self.assertIn("float a;", open(os.path.join(d, "engine_draw.h")).read())
-        # Tint alpha must appear in the draw tables (Image m_Color.a ≈ 0.5).
-        self.assertRegex(eng, r"_spr_a\[\] = \{[^}]*0\.5019608")
+        self.assertRegex(eng, r"_spr_a\[\] = \{[^}]*1\.0")
+        ub = plan["ui_buttons"][0]
+        self.assertAlmostEqual(ub["highlighted"][0], 0.78431374, places=5)
+        self.assertAlmostEqual(ub["pressed"][0], 0.5882353, places=5)
 
     def test_vector3_plus_equals_vector2_is_cs0034(self):
         """transform.position is Vector3; += Vector2 is ambiguous in csc."""
@@ -502,7 +520,7 @@ class TestSystems(unittest.TestCase):
         self.assertNotIn("ParticleSystem.Emit", apis)
         self.assertNotIn("AnimationCurve.Evaluate", apis)
         spr = [o for o in _objs if o.get("sprite")]
-        self.assertEqual(len(spr), 8)  # BouncePad×3, HeavyBall, Wave, Spinner, Image, Graphics
+        self.assertEqual(len(spr), 8)  # BouncePad×3, HeavyBall, Wave, Spinner, Button, Graphics
         player = [o for o in _objs if o["name"] == "Player"][0]
         self.assertIsNone(player.get("sprite"))
         graphic = [o for o in _objs if o["name"] == "Graphics"][0]
@@ -1882,6 +1900,9 @@ class TestSystemsRuns(unittest.TestCase):
                 "extern float Time_time;\n"
                 "extern int engine_keyboard_connected;\n"
                 "extern int engine_keyboard_rightArrow;\n"
+                "extern float engine_pointer_x;\n"
+                "extern float engine_pointer_y;\n"
+                "extern int engine_pointer_down;\n"
                 "extern float RenderSettings_ambient_r;\n"
                 "extern float _Light_intensity[];\n"
                 "typedef struct { float x, y, half_w, half_h;\n"
@@ -1922,7 +1943,7 @@ class TestSystemsRuns(unittest.TestCase):
                 "  if (_Ball_inst_array[0].pos_y >= y0) return 3;\n"
                 "  if (_Player_inst_array[0].pos_x <= x0) return 4;\n"
                 "  if (_Light_intensity[0] < 1.4f) return 5;\n"
-                "  if (n != 8) return 6; /* SpriteRenderers + uGUI Image */\n"
+                "  if (n != 8) return 6; /* SpriteRenderers + uGUI Button */\n"
                 "  /* Ground top ≈ -2.25; ball radius ≈ 0.225 → rest y ≳ -2.05 */\n"
                 "  if (_Ball_inst_array[0].pos_y < -2.1f) return 8;\n"
                 "  if (_Wave_inst_array[0].pos_x < 1.99f\n"
@@ -1936,11 +1957,27 @@ class TestSystemsRuns(unittest.TestCase):
                 "    }\n"
                 "    if (!found) return 11;\n"
                 "  }\n"
-                "  /* BouncePad sortingOrder -10 first; Image Foreground last. */\n"
+                "  /* BouncePad sortingOrder -10 first; Button Foreground last. */\n"
                 "  if (buf[0].sorting_order != -10) return 13;\n"
                 "  if (buf[n - 1].sorting_layer != 1) return 14;\n"
-                "  if (buf[n - 1].a < 0.49f || buf[n - 1].a > 0.52f)\n"
-                "    return 15; /* Image m_Color.a ≈ 0.5 on Foreground */\n"
+                "  if (buf[n - 1].a < 0.99f)\n"
+                "    return 15; /* Button Image m_Color.a = 1 */\n"
+                "  /* Hover center → ColorBlock highlighted (~0.784). */\n"
+                "  engine_pointer_x = 960.f;\n"
+                "  engine_pointer_y = 540.f;\n"
+                "  engine_pointer_down = 0;\n"
+                "  engine_tick();\n"
+                "  n = engine_collect_draws(buf, 128);\n"
+                "  if (n != 8) return 21;\n"
+                "  if (buf[n - 1].r > 0.85f || buf[n - 1].r < 0.7f)\n"
+                "    return 22; /* highlighted tint */\n"
+                "  /* Click Button center → SetActive(false) → one fewer draw. */\n"
+                "  engine_pointer_x = 960.f;\n"
+                "  engine_pointer_y = 540.f;\n"
+                "  engine_pointer_down = 1;\n"
+                "  engine_tick();\n"
+                "  n = engine_collect_draws(buf, 128);\n"
+                "  if (n != 7) return 19; /* Button hidden */\n"
                 "  /* Child under Player follows parent world position (m_Father). */\n"
                 "  {\n"
                 "    float px = _Player_inst_array[0].pos_x;\n"

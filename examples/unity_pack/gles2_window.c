@@ -6,8 +6,9 @@
  *     examples/unity_pack/run_gles2_window.sh
  *     SCENE=.../SystemsScene ./examples/unity_pack/run_gles2_window.sh
  *
- * Arrow keys / WASD feed engine_input_axis_* (Input.GetAxis). Escape or Q
- * quits. Time.deltaTime comes from the frame clock. SpriteRenderer quads
+ * Arrow keys / WASD feed engine_input_axis_* (Input.GetAxis). Left click
+ * feeds engine_pointer_* for authored uGUI Buttons. Escape or Q quits.
+ * Time.deltaTime comes from the frame clock. SpriteRenderer quads
  * sample packed PNG textures (tint × texel). Window size is
  * Screen_width × Screen_height from Player Settings
  * (defaultScreenWidth / defaultScreenHeight). fullscreenMode 0/1 opens a
@@ -45,6 +46,9 @@ int engine_keyboard_leftArrow __attribute__((weak)) = 0;
 int engine_keyboard_rightArrow __attribute__((weak)) = 0;
 int engine_keyboard_upArrow __attribute__((weak)) = 0;
 int engine_keyboard_downArrow __attribute__((weak)) = 0;
+float engine_pointer_x __attribute__((weak)) = 0.f;
+float engine_pointer_y __attribute__((weak)) = 0.f;
+int engine_pointer_down __attribute__((weak)) = 0;
 
 /* Player Settings defaultScreenWidth/Height (data.c defines). */
 extern int Screen_width;
@@ -264,6 +268,23 @@ static void poll_input_axes(GLFWwindow *win)
         glfwGetKey(win, GLFW_KEY_UP) == GLFW_PRESS;
     engine_keyboard_downArrow =
         glfwGetKey(win, GLFW_KEY_DOWN) == GLFW_PRESS;
+
+    /* uGUI Button — screen space, origin bottom-left (Unity).
+     * glfwGetCursorPos is in window coordinates; map via window size, not
+     * framebuffer (HiDPI would stretch hits and miss ColorBlock hover). */
+    {
+        double mx = 0.0, my = 0.0;
+        int ww = 1, wh = 1;
+        glfwGetCursorPos(win, &mx, &my);
+        glfwGetWindowSize(win, &ww, &wh);
+        if (ww < 1) ww = 1;
+        if (wh < 1) wh = 1;
+        engine_pointer_x = (float)(mx * (double)Screen_width / (double)ww);
+        engine_pointer_y = (float)Screen_height
+            - (float)(my * (double)Screen_height / (double)wh);
+        engine_pointer_down =
+            glfwGetMouseButton(win, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+    }
 }
 
 static void draw_one(const EngineDraw *d)
