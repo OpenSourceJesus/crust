@@ -190,11 +190,13 @@ _REFUSED_API = {
         "runtime — unity_pack does not invent device graphs."
     ),
     "UnityEngine.UI": (
-        "uGUI (Canvas / Text / Image) is not invented by the packer. Keep UI "
-        "in the authored Unity project, or wait for Canvas import."
+        "Scripted uGUI (Canvas / Text / Image APIs) is not emitted — use "
+        "authored Canvas + Image in the scene. unity_pack does not invent "
+        "UI from scripts."
     ),
     "Canvas": (
-        "Canvas is a Unity component — unity_pack does not invent UI roots."
+        "Scripted Canvas access is not emitted — author a !u!223 Canvas + "
+        "Image in the scene. AddComponent<Canvas> is refused."
     ),
 }
 
@@ -207,6 +209,7 @@ _UNITY_API = re.compile(
     r"(?:AddComponent\s*<\s*[\w.]+\s*>|"
     r"(?<![\w])(?:Mathf\.(?:Abs|Min|Max|Clamp|Lerp|Sin|Cos)|"
     r"Time\.(?:deltaTime|time|fixedDeltaTime)|"
+    r"Screen\.(?:width|height)|"
     r"Input\.(?:GetAxis|GetButton|GetKey)|"
     r"RenderSettings\.ambientLight|Camera\.main|"
     r"transform\.position|Physics2D\.gravity|Physics\.gravity|"
@@ -266,6 +269,29 @@ def player_identity(root):
         if m and m.group(1).strip():
             product = _yaml_scalar(m.group(1)) or product
     return company, product
+
+
+def player_screen(root):
+    """defaultScreenWidth / Height from ProjectSettings (Unity Player Settings).
+
+    Missing keys → Unity standalone defaults 1024×768. Values ≤0 are clamped
+    to 1 so hosts never create a zero-size window.
+    """
+    width, height = 1024, 768
+    settings = os.path.join(root, "ProjectSettings", "ProjectSettings.asset")
+    if os.path.isfile(settings):
+        text = _read(settings)
+        m = re.search(r"(?m)^\s*defaultScreenWidth:\s*(-?\d+)\s*$", text)
+        if m:
+            width = int(m.group(1))
+        m = re.search(r"(?m)^\s*defaultScreenHeight:\s*(-?\d+)\s*$", text)
+        if m:
+            height = int(m.group(1))
+    if width < 1:
+        width = 1
+    if height < 1:
+        height = 1
+    return width, height
 
 
 def _load_sorting_layers(root):
@@ -686,6 +712,37 @@ def _curve_path_is_root(path_line):
     return v == "" or v == '""'
 
 
+def _parse_pptr_sprite_curves(text):
+    """Authored m_PPtrCurves with attribute m_Sprite → path + (t, guid) keys."""
+    out = []
+    sm = re.search(
+        r"(?ms)^  m_PPtrCurves:\s*\n(.*?)(?=^  m_[A-Z]|\Z)", text)
+    if not sm:
+        return out
+    body = sm.group(1)
+    if body.strip().startswith("[]"):
+        return out
+    for cm in re.finditer(
+            r"(?ms)^  - serializedVersion:.*?"
+            r"(?=^  - serializedVersion:|^  m_|\Z)", body):
+        block = cm.group(0)
+        attr = re.search(r"(?m)^\s+attribute:\s*(.+)$", block)
+        if not attr or attr.group(1).strip() != "m_Sprite":
+            continue
+        path_m = re.search(r"(?m)^\s+path:\s*(.*)$", block)
+        path = path_m.group(1).strip().strip('"') if path_m else ""
+        keys = []
+        for km in re.finditer(
+                r"(?m)^\s+- time:\s*([0-9.eE+-]+)\s*\n"
+                r"\s+value:\s*\{fileID:\s*-?\d+,\s*guid:\s*"
+                r"([0-9a-fA-F]+)",
+                block):
+            keys.append((float(km.group(1)), km.group(2).lower()))
+        if keys:
+            out.append({"path": path, "keys": keys})
+    return out
+
+
 def _parse_animation_clip(text):
     """Authored .anim → length, loop, legacy, root position/euler/scale keys."""
     nm = re.search(r"(?m)^\s+m_Name:\s*(.+)$", text)
@@ -728,11 +785,15 @@ def _parse_animation_clip(text):
     pos = _root_vec3_curves("m_PositionCurves")
     euler = _root_vec3_curves("m_EulerCurves")
     scale = _root_vec3_curves("m_ScaleCurves")
+    sprite_curves = _parse_pptr_sprite_curves(text)
     length = float(stop.group(1)) if stop else 0.0
     if length <= 0.0:
         for keys in (pos, euler, scale):
             if keys:
                 length = max(length, keys[-1][0])
+        for sc in sprite_curves:
+            if sc["keys"]:
+                length = max(length, sc["keys"][-1][0])
         if length <= 0.0:
             length = 1.0
     return {
@@ -743,6 +804,7 @@ def _parse_animation_clip(text):
         "pos_keys": pos,
         "euler_keys": euler,
         "scale_keys": scale,
+        "sprite_curves": sprite_curves,
     }
 
 
@@ -885,8 +947,11 @@ def _attach_sprite_textures(objects, asset_guids):
         sp["tex_h"] = h
         sp["tex_rgba"] = rgba
         sp["pixels_per_unit"] = ppu
-        sp["half_w"] = (float(w) / ppu) * sx * 0.5
-        sp["half_h"] = (float(h) / ppu) * sy * 0.5
+        if sp.get("source") != "ui":
+            sp["half_w"] = (float(w) / ppu) * sx * 0.5
+            sp["half_h"] = (float(h) / ppu) * sy * 0.5
+        if "a" not in sp:
+            sp["a"] = 1.0
 
 
 def _collect_textures(objects):
@@ -906,9 +971,216 @@ def _collect_textures(objects):
                 "w": sp["tex_w"],
                 "h": sp["tex_h"],
                 "rgba": sp["tex_rgba"],
+                "ppu": float(sp.get("pixels_per_unit") or 100.0),
             })
         sp["tex_id"] = by_guid[g]
     return textures
+
+
+def _ensure_texture_guids(textures, guids, asset_guids):
+    """Load PNGs for animation-only sprite guids into the texture table.
+
+    Idle.anim swaps to Eyes Closed which may not be any SpriteRenderer's
+    initial m_Sprite — still must pack those texels.
+    """
+    by_guid = {t["guid"]: i for i, t in enumerate(textures)}
+    cache = {}
+    for raw in guids or []:
+        g = (raw or "").lower()
+        if not g or g in by_guid:
+            continue
+        path = (asset_guids or {}).get(g)
+        if not path or not path.lower().endswith(".png"):
+            continue
+        if path not in cache:
+            try:
+                w, h, rgba = _load_png_rgba(path)
+                cache[path] = (w, h, rgba, _pixels_per_unit(path))
+            except (PackError, IOError):
+                cache[path] = None
+        hit = cache[path]
+        if hit is None:
+            continue
+        w, h, rgba, ppu = hit
+        by_guid[g] = len(textures)
+        textures.append({
+            "guid": g,
+            "path": path,
+            "w": w,
+            "h": h,
+            "rgba": rgba,
+            "ppu": float(ppu),
+        })
+    return by_guid
+
+
+def _anim_sprite_guids(objects):
+    """All sprite PNG guids referenced by authored AnimationClip PPtr curves."""
+    out = []
+    for o in objects or []:
+        p = o.get("anim_player")
+        if not p or not p.get("clip"):
+            continue
+        for sc in p["clip"].get("sprite_curves") or []:
+            for _t, g in sc.get("keys") or []:
+                if g:
+                    out.append(g)
+    return out
+
+
+def _resolve_anim_child_path(owner, path, plan):
+    """Unity curve path under Animator owner → (class, inst, obj) or None."""
+    path = (path or "").strip().strip('"')
+    index = {}
+    for cname, cl in plan["classes"].items():
+        for i, o in enumerate(cl.get("instances") or []):
+            fid = str(o.get("father_id") or "0")
+            index.setdefault((fid, o.get("name")), []).append((cname, i, o))
+    if not path:
+        return None
+    cur_xf = str(owner.get("xf_id") or "0")
+    hit = None
+    for part in path.split("/"):
+        kids = index.get((cur_xf, part))
+        if not kids:
+            return None
+        hit = kids[0]
+        cur_xf = str(hit[2].get("xf_id") or "0")
+    return hit
+
+
+# Builtin uGUI Image MonoBehaviour script guid (UnityEngine.UI.dll).
+_IMAGE_SCRIPT_GUID = "fe87c0e1cc204ed48ad3b37840f39efc"
+
+
+def _yaml_vec2(block, key, default=(0.0, 0.0)):
+    m = re.search(
+        r"(?m)^\s+%s:\s*\{x:\s*([^,}]+),\s*y:\s*([^}]+)\}" % re.escape(key),
+        block)
+    if not m:
+        return default
+    return (float(m.group(1)), float(m.group(2)))
+
+
+def _is_ui_image_mb(block, guid):
+    if (guid or "").lower() == _IMAGE_SCRIPT_GUID:
+        return True
+    return bool(re.search(
+        r"(?m)^\s+m_EditorClassIdentifier:.*\bImage\s*$", block))
+
+
+def _rect_pivot_center(parent_w, parent_h, amin, amax, apos, size, pivot):
+    """Canvas-local rect → (center_x, center_y, width, height) in parent pixels.
+
+    Parent origin is bottom-left. Point anchors use sizeDelta as size; stretch
+    anchors use (anchor span * parent) + sizeDelta.
+    """
+    ax0 = float(amin[0]) * parent_w
+    ax1 = float(amax[0]) * parent_w
+    ay0 = float(amin[1]) * parent_h
+    ay1 = float(amax[1]) * parent_h
+    if abs(ax1 - ax0) < 1e-6 and abs(ay1 - ay0) < 1e-6:
+        w = float(size[0])
+        h = float(size[1])
+        pivot_x = ax0 + float(apos[0])
+        pivot_y = ay0 + float(apos[1])
+        cx = pivot_x + (0.5 - float(pivot[0])) * w
+        cy = pivot_y + (0.5 - float(pivot[1])) * h
+        return cx, cy, w, h
+    w = (ax1 - ax0) + float(size[0])
+    h = (ay1 - ay0) + float(size[1])
+    cx = (ax0 + ax1) * 0.5 + float(apos[0])
+    cy = (ay0 + ay1) * 0.5 + float(apos[1])
+    return cx, cy, w, h
+
+
+def _bake_ui_images(objects, cameras, screen_w, screen_h):
+    """Resolve authored uGUI Image + RectTransform under Canvas → world sprite.
+
+    Screen Space Overlay (0) and Screen Space Camera (1): map canvas pixels to
+    the main ortho camera frustum. World Space (2) is not supported yet.
+    Images without an authored m_Sprite are skipped (no invent).
+    """
+    by_xf = {}
+    for o in objects:
+        xid = o.get("xf_id")
+        if xid:
+            by_xf[str(xid)] = o
+    main = None
+    for c in cameras or []:
+        if c.get("main"):
+            main = c
+            break
+    if main is None and cameras:
+        main = cameras[0]
+    cam_x = float((main or {}).get("pos", (0, 0, 0))[0])
+    cam_y = float((main or {}).get("pos", (0, 0, 0))[1])
+    ortho = float((main or {}).get("orthographic_size") or 5.0)
+    if ortho < 1e-6:
+        ortho = 5.0
+    sw = max(1, int(screen_w))
+    sh = max(1, int(screen_h))
+    aspect = float(sw) / float(sh)
+    world_h = 2.0 * ortho
+    world_w = world_h * aspect
+    px_w = world_w / float(sw)
+    px_h = world_h / float(sh)
+
+    for o in objects:
+        ui = o.get("ui_image")
+        if not ui or not ui.get("has_sprite"):
+            continue
+        canvas = None
+        fid = o.get("father_id")
+        guard = 0
+        while fid and guard < 64:
+            guard += 1
+            parent = by_xf.get(str(fid))
+            if not parent:
+                break
+            if parent.get("canvas"):
+                canvas = parent["canvas"]
+                break
+            fid = parent.get("father_id")
+        if canvas is None:
+            canvas = {"render_mode": 0, "sorting_layer_id": 0,
+                      "sorting_order": 0, "enabled": 1}
+        if not int(canvas.get("enabled", 1)):
+            continue
+        mode = int(canvas.get("render_mode", 0))
+        if mode not in (0, 1):
+            continue
+        rect = o.get("rect") or {}
+        amin = rect.get("anchor_min") or (0.5, 0.5)
+        amax = rect.get("anchor_max") or (0.5, 0.5)
+        apos = rect.get("anchored_position") or (0.0, 0.0)
+        size = rect.get("size_delta") or (100.0, 100.0)
+        pivot = rect.get("pivot") or (0.5, 0.5)
+        cx, cy, rw, rh = _rect_pivot_center(
+            sw, sh, amin, amax, apos, size, pivot)
+        wx = cam_x + (cx / float(sw) - 0.5) * world_w
+        wy = cam_y + (cy / float(sh) - 0.5) * world_h
+        o["pos"] = (wx, wy, float(o["pos"][2]) if o.get("pos") else 0.0)
+        o["sprite"] = {
+            "r": float(ui.get("r", 1.0)),
+            "g": float(ui.get("g", 1.0)),
+            "b": float(ui.get("b", 1.0)),
+            "a": float(ui.get("a", 1.0)),
+            "enabled": int(ui.get("enabled", 1)),
+            "has_sprite": True,
+            "sprite_file_id": int(ui.get("sprite_file_id") or 0),
+            "sprite_guid": ui.get("sprite_guid"),
+            "sorting_layer_id": int(canvas.get("sorting_layer_id") or 0),
+            "sorting_layer_yaml": 0,
+            "sorting_order": int(canvas.get("sorting_order") or 0),
+            "source": "ui",
+            "scale_x": 1.0,
+            "scale_y": 1.0,
+            "cos_z": 1.0,
+            "sin_z": 0.0,
+            "half_w": abs(rw) * px_w * 0.5,
+            "half_h": abs(rh) * px_h * 0.5,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -918,7 +1190,8 @@ def _collect_textures(objects):
 def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
     """A Unity .unity YAML subset: GameObject + Transform + MonoBehaviour.
 
-    Also imports authored Camera (!u!20), SpriteRenderer (!u!212),
+    Also imports authored Camera (!u!20), SpriteRenderer (!u!212), Canvas
+    (!u!223), uGUI Image (builtin MB), RectTransform anchors/size,
     Rigidbody2D (!u!50), Rigidbody (!u!54), BoxCollider2D (!u!61),
     CircleCollider2D (!u!58), BoxCollider (!u!65), SphereCollider (!u!135),
     Animation (!u!111), Animator (!u!95), PhysicsMaterial2D / PhysicMaterial,
@@ -946,7 +1219,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             r"(?m)^(GameObject|Transform|RectTransform|MonoBehaviour|"
             r"PrefabInstance|Light|Camera|SpriteRenderer|Rigidbody2D|"
             r"Rigidbody|BoxCollider2D|CircleCollider2D|BoxCollider|"
-            r"SphereCollider|Animation|Animator):",
+            r"SphereCollider|Animation|Animator|Canvas):",
             block)
         if km:
             kind = km.group(1)
@@ -958,6 +1231,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             kind = "Camera"
         elif type_id == "212":
             kind = "SpriteRenderer"
+        elif type_id == "223":
+            kind = "Canvas"
         elif type_id == "50":
             kind = "Rigidbody2D"
         elif type_id == "54":
@@ -1011,6 +1286,16 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             fid = father.group(1)
             if fid != "0":
                 rec["father_id"] = fid
+        # RectTransform layout (uGUI) — kept even when kind collapses to Transform.
+        if type_id == "224" or "m_AnchorMin:" in block:
+            rec["rect"] = {
+                "anchor_min": _yaml_vec2(block, "m_AnchorMin", (0.0, 0.0)),
+                "anchor_max": _yaml_vec2(block, "m_AnchorMax", (1.0, 1.0)),
+                "anchored_position": _yaml_vec2(
+                    block, "m_AnchoredPosition", (0.0, 0.0)),
+                "size_delta": _yaml_vec2(block, "m_SizeDelta", (0.0, 0.0)),
+                "pivot": _yaml_vec2(block, "m_Pivot", (0.5, 0.5)),
+            }
         # PrefabInstance nested form: m_Modification: … m_TransformParent:
         if kind == "PrefabInstance":
             tp = re.search(
@@ -1077,7 +1362,11 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         if kind == "SpriteRenderer":
             col = re.search(
                 r"m_Color:\s*\{r:\s*([^,}]+),\s*g:\s*([^,}]+),"
-                r"\s*b:\s*([^,}]+)", block)
+                r"\s*b:\s*([^,}]+),\s*a:\s*([^}]+)\}", block)
+            if not col:
+                col = re.search(
+                    r"m_Color:\s*\{r:\s*([^,}]+),\s*g:\s*([^,}]+),"
+                    r"\s*b:\s*([^,}]+)", block)
             en = re.search(r"(?m)^\s+m_Enabled:\s*(\d+)", block)
             # Unity null sprite is m_Sprite: {fileID: 0} — do not invent a draw.
             spr = re.search(
@@ -1096,6 +1385,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "r": float(col.group(1)) if col else 1.0,
                 "g": float(col.group(2)) if col else 1.0,
                 "b": float(col.group(3)) if col else 1.0,
+                "a": (float(col.group(4)) if col and col.lastindex >= 4
+                      else 1.0),
                 "enabled": int(en.group(1)) if en else 1,
                 "has_sprite": has_sprite,
                 "sprite_file_id": int(spr.group(1)) if spr else 0,
@@ -1105,6 +1396,58 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "sorting_layer_yaml": int(sl.group(1)) if sl else 0,
                 "sorting_order": int(so.group(1)) if so else 0,
             }
+        if kind == "Canvas":
+            en = re.search(r"(?m)^\s+m_Enabled:\s*(\d+)", block)
+            rm = re.search(r"(?m)^\s+m_RenderMode:\s*(\d+)", block)
+            cam = re.search(r"(?m)^\s+m_Camera:\s*\{fileID:\s*(-?\d+)\}", block)
+            pd = re.search(r"(?m)^\s+m_PlaneDistance:\s*([0-9.eE+-]+)", block)
+            sid = re.search(r"(?m)^\s+m_SortingLayerID:\s*(-?\d+)", block)
+            so = re.search(r"(?m)^\s+m_SortingOrder:\s*(-?\d+)", block)
+            rec["canvas"] = {
+                "enabled": int(en.group(1)) if en else 1,
+                "render_mode": int(rm.group(1)) if rm else 0,
+                "camera_file_id": int(cam.group(1)) if cam else 0,
+                "plane_distance": float(pd.group(1)) if pd else 100.0,
+                "sorting_layer_id": int(sid.group(1)) if sid else 0,
+                "sorting_order": int(so.group(1)) if so else 0,
+            }
+        if kind == "MonoBehaviour":
+            # Builtin uGUI Image — not a project .cs, but authored scene UI.
+            g = None
+            gm2 = re.search(
+                r"m_Script:\s*\{fileID:\s*\d+,\s*guid:\s*([0-9a-fA-F]+)",
+                block)
+            if gm2:
+                g = gm2.group(1).lower()
+            if _is_ui_image_mb(block, g):
+                col = re.search(
+                    r"m_Color:\s*\{r:\s*([^,}]+),\s*g:\s*([^,}]+),"
+                    r"\s*b:\s*([^,}]+),\s*a:\s*([^}]+)\}", block)
+                if not col:
+                    col = re.search(
+                        r"m_Color:\s*\{r:\s*([^,}]+),\s*g:\s*([^,}]+),"
+                        r"\s*b:\s*([^,}]+)", block)
+                en = re.search(r"(?m)^\s+m_Enabled:\s*(\d+)", block)
+                spr = re.search(
+                    r"m_Sprite:\s*\{fileID:\s*(-?\d+)(?:,\s*guid:\s*"
+                    r"([0-9a-fA-F]+))?",
+                    block)
+                has_sprite = False
+                if spr and int(spr.group(1)) != 0:
+                    sg = spr.group(2).lower() if spr.group(2) else None
+                    has_sprite = bool(sg and sg in asset_guids)
+                rec["ui_image"] = {
+                    "r": float(col.group(1)) if col else 1.0,
+                    "g": float(col.group(2)) if col else 1.0,
+                    "b": float(col.group(3)) if col else 1.0,
+                    "a": (float(col.group(4)) if col and col.lastindex >= 4
+                          else 1.0),
+                    "enabled": int(en.group(1)) if en else 1,
+                    "has_sprite": has_sprite,
+                    "sprite_file_id": int(spr.group(1)) if spr else 0,
+                    "sprite_guid": (spr.group(2).lower()
+                                    if spr and spr.group(2) else None),
+                }
         if kind == "Camera":
             ortho = re.search(r"(?m)^\s+orthographic:\s*(\d+)", block)
             osize = re.search(
@@ -1137,6 +1480,12 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             bt = re.search(r"(?m)^\s+m_BodyType:\s*(\d+)", block)
             mass = re.search(r"(?m)^\s+m_Mass:\s*([0-9.eE+-]+)", block)
             gs = re.search(r"(?m)^\s+m_GravityScale:\s*([0-9.eE+-]+)", block)
+            # Unity 6+: m_LinearDamping; older builds used m_LinearDrag / m_Drag.
+            ld = re.search(r"(?m)^\s+m_LinearDamping:\s*([0-9.eE+-]+)", block)
+            if not ld:
+                ld = re.search(r"(?m)^\s+m_LinearDrag:\s*([0-9.eE+-]+)", block)
+            if not ld:
+                ld = re.search(r"(?m)^\s+m_Drag:\s*([0-9.eE+-]+)", block)
             vel = re.search(
                 r"m_LinearVelocity:\s*\{x:\s*([^,}]+),\s*y:\s*([^}]+)\}",
                 block)
@@ -1149,6 +1498,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "body_type": int(bt.group(1)) if bt else 0,
                 "mass": float(mass.group(1)) if mass else 1.0,
                 "gravity_scale": float(gs.group(1)) if gs else 1.0,
+                "linear_damping": float(ld.group(1)) if ld else 0.0,
                 "vel_x": float(vel.group(1)) if vel else 0.0,
                 "vel_y": float(vel.group(2)) if vel else 0.0,
                 "material_guid": _parse_material_guid(block),
@@ -1156,6 +1506,10 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         if kind == "Rigidbody":
             mass = re.search(r"(?m)^\s+m_Mass:\s*([0-9.eE+-]+)", block)
             ug = re.search(r"(?m)^\s+m_UseGravity:\s*(\d+)", block)
+            drag = re.search(r"(?m)^\s+m_Drag:\s*([0-9.eE+-]+)", block)
+            if not drag:
+                drag = re.search(
+                    r"(?m)^\s+m_LinearDamping:\s*([0-9.eE+-]+)", block)
             vel = re.search(
                 r"m_Velocity:\s*\{x:\s*([^,}]+),\s*y:\s*([^,}]+),"
                 r"\s*z:\s*([^}]+)\}",
@@ -1169,6 +1523,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             rec["rigidbody"] = {
                 "mass": float(mass.group(1)) if mass else 1.0,
                 "use_gravity": int(ug.group(1)) if ug else 1,
+                "drag": float(drag.group(1)) if drag else 0.0,
                 "vel_x": float(vel.group(1)) if vel else 0.0,
                 "vel_y": float(vel.group(2)) if vel else 0.0,
                 "vel_z": float(vel.group(3)) if vel else 0.0,
@@ -1300,6 +1655,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         script = None
         fields = {}
         sprite = None
+        ui_image = None
+        canvas = None
         cam = None
         rb2d = None
         rb3d = None
@@ -1307,9 +1664,12 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         col3d = None
         anim = None
         animator = None
+        rect = None
         for k in kids:
             if k.get("kind") == "Transform":
                 xf = k
+                if k.get("rect"):
+                    rect = dict(k["rect"])
             if k.get("pos"):
                 pos = k["pos"]
             if k.get("scale"):
@@ -1321,8 +1681,12 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 g = k.get("guid")
                 if g and g in guid_to_script:
                     script = guid_to_script[g]
+                if k.get("ui_image"):
+                    ui_image = dict(k["ui_image"])
             if k.get("kind") == "SpriteRenderer" and k.get("sprite"):
                 sprite = dict(k["sprite"])
+            if k.get("kind") == "Canvas" and k.get("canvas"):
+                canvas = dict(k["canvas"])
             if k.get("kind") == "Camera" and k.get("camera"):
                 cam = dict(k["camera"])
             if k.get("kind") == "Rigidbody2D" and k.get("rigidbody2d"):
@@ -1341,7 +1705,9 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 animator = dict(k["animator"])
         local_pos, local_rot, local_scale = pos, rot, scale
         father_id = xf.get("father_id") if xf else None
-        if xf is not None:
+        xf_id = xf.get("file_id") if xf else None
+        # UI Canvas/Image layout is baked later from anchors + Screen size.
+        if xf is not None and not ui_image and not canvas:
             pos, rot, scale = _resolve_world_trs(
                 xf["file_id"], by_id, world_cache)
         # Resolve Animation / Animator → clip guid (Animator via controller default).
@@ -1449,13 +1815,53 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         # Camera-only GOs are not packed as scripted instances.
         if (cam is not None and script is None and sprite is None
                 and not rb2d and not rb3d and not col2d and not col3d
-                and not player):
+                and not player and not canvas and not ui_image):
             continue
+        has_ui_draw = bool(ui_image and ui_image.get("has_sprite"))
         has_mb = any(k.get("kind") == "MonoBehaviour" for k in kids)
-        # Transform-only parents (e.g. Rig) are hierarchy nodes, not instances.
-        if (script is None and sprite is None and not rb2d and not rb3d
-                and cam is None and not has_mb and not col2d and not col3d
-                and not player):
+        ui_scaffold_mb = False
+        for k in kids:
+            raw = k.get("raw") or ""
+            if ("EventSystem" in raw or "InputSystemUIInputModule" in raw
+                    or "GraphicRaycaster" in raw or "CanvasScaler" in raw):
+                ui_scaffold_mb = True
+                break
+        # Image without sprite: drop. EventSystem / raycaster-only: drop.
+        # Prefab stubs with unresolved MB guids: keep (has_mb).
+        if ui_image and not has_ui_draw and script is None and sprite is None:
+            if not rb2d and not rb3d and not col2d and not col3d and not player:
+                if not canvas:
+                    continue
+        if (script is None and sprite is None and not has_ui_draw
+                and not rb2d and not rb3d and cam is None and not col2d
+                and not col3d and not player and not canvas
+                and (not has_mb or ui_scaffold_mb)):
+            continue
+        # Canvas roots (parent Images) — layout walk only, no tick class.
+        if canvas and script is None and sprite is None and not has_ui_draw:
+            objects.append({
+                "name": go.get("name") or "Canvas",
+                "pos": pos,
+                "rot": rot,
+                "local_pos": local_pos,
+                "local_rot": local_rot,
+                "local_scale": local_scale,
+                "father_id": father_id,
+                "xf_id": xf_id,
+                "fields": {},
+                "script": None,
+                "class": "_Canvas",
+                "sprite": None,
+                "canvas": canvas,
+                "rect": rect,
+                "ui_image": None,
+                "rigidbody2d": None,
+                "rigidbody": None,
+                "collider2d": None,
+                "collider3d": None,
+                "anim_player": None,
+                "ui_scaffold": True,
+            })
             continue
         objects.append({
             "name": go.get("name") or "obj",
@@ -1465,10 +1871,14 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "local_rot": local_rot,
             "local_scale": local_scale,
             "father_id": father_id,
+            "xf_id": xf_id,
             "fields": fields,
             "script": script,
             "class": class_name or go.get("name") or "Obj",
             "sprite": sprite,
+            "canvas": canvas,
+            "rect": rect,
+            "ui_image": ui_image,
             "rigidbody2d": rb2d,
             "rigidbody": rb3d,
             "collider2d": col2d,
@@ -1839,6 +2249,7 @@ def _build_rigidbody_tables(plan):
                     "body_type": int(r2.get("body_type") or 0),
                     "mass": float(r2.get("mass") or 1.0),
                     "gravity_scale": float(r2.get("gravity_scale") or 1.0),
+                    "linear_damping": float(r2.get("linear_damping") or 0.0),
                     "vel_x": float(r2.get("vel_x") or 0.0),
                     "vel_y": float(r2.get("vel_y") or 0.0),
                 })
@@ -1853,11 +2264,62 @@ def _build_rigidbody_tables(plan):
                     "use_gravity": int(r3.get("use_gravity")
                                        if r3.get("use_gravity") is not None
                                        else 1),
+                    "drag": float(r3.get("drag") or 0.0),
                     "vel_x": float(r3.get("vel_x") or 0.0),
                     "vel_y": float(r3.get("vel_y") or 0.0),
                     "vel_z": float(r3.get("vel_z") or 0.0),
                 })
     return rb2d, rb3d, go_rb2d, go_rb3d
+
+
+def _attach_transform_parents(plan):
+    """Wire authored m_Father → packed parent for live world composition.
+
+    Unity stores localPosition; world = parent_world ∘ local. Pack keeps
+    local in instance pos when a packed parent exists. Bodies with their own
+    Rigidbody / Rigidbody2D stay independent (Unity simulates them separately).
+    UI Images whose Canvas is not a packed body keep baked world `pos`.
+    """
+    class_ids = {n: i for i, n in enumerate(sorted(plan["classes"]))}
+    xf_to = {}
+    for cname, cl in plan["classes"].items():
+        for i, o in enumerate(cl.get("instances") or []):
+            xid = o.get("xf_id")
+            if xid is not None and str(xid) != "0":
+                xf_to[str(xid)] = (cname, i)
+    any_parent = False
+    for cname, cl in plan["classes"].items():
+        for i, o in enumerate(cl.get("instances") or []):
+            o["xf_parent_class"] = None
+            o["xf_parent_class_id"] = -1
+            o["xf_parent_inst"] = 0
+            if o.get("rigidbody2d") or o.get("rigidbody"):
+                continue
+            fid = o.get("father_id")
+            if not fid or str(fid) == "0":
+                continue
+            hit = xf_to.get(str(fid))
+            if not hit:
+                continue
+            pc, pi = hit
+            if pc == cname and pi == i:
+                continue
+            o["xf_parent_class"] = pc
+            o["xf_parent_class_id"] = int(class_ids[pc])
+            o["xf_parent_inst"] = int(pi)
+            any_parent = True
+    plan["has_transform_parents"] = any_parent
+
+
+def _instance_storage_pos(o):
+    """Coords stored in instance arrays: local under a live parent, else world."""
+    if o.get("xf_parent_class"):
+        lp = o.get("local_pos") or (0.0, 0.0, 0.0)
+        return (float(lp[0]), float(lp[1]),
+                float(lp[2]) if len(lp) > 2 else 0.0)
+    p = o.get("pos") or (0.0, 0.0, 0.0)
+    return (float(p[0]), float(p[1]),
+            float(p[2]) if len(p) > 2 else 0.0)
 
 
 def _build_collider2d_tables(plan):
@@ -1960,18 +2422,23 @@ def _build_animation_tables(plan):
     Root position curves write absolute Transform.localPosition values from
     the clip (Bob.anim x=2 → Spinner/Wave at x=2). Legacy clips bind only to
     Animation; Mecanim clips only to Animator — see parse_unity_yaml.
+
+    m_PPtrCurves attribute m_Sprite swap SpriteRenderer.tex on the path child
+    (Idle.anim → Graphics).
     """
     clips_by_guid = {}
     clip_list = []
     players = []
     class_ids = {n: i for i, n in enumerate(sorted(plan["classes"]))}
+    textures = plan.get("textures") or []
+    guid_to_tex = {t["guid"]: i for i, t in enumerate(textures)}
 
     def _ensure_clip(guid, clip):
         if guid in clips_by_guid:
             return clips_by_guid[guid]
+        # Empty m_PositionCurves → no root motion; do not invent (0,0,0) keys
+        # (that teleports the Transform every tick — Idle.anim is sprite-only).
         pos = list(clip.get("pos_keys") or [])
-        if not pos:
-            pos = [(0.0, 0.0, 0.0, 0.0)]
         idx = len(clip_list)
         entry = {
             "guid": guid,
@@ -1980,6 +2447,7 @@ def _build_animation_tables(plan):
             "loop": int(clip.get("loop") or 0),
             "legacy": int(clip.get("legacy") or 0),
             "pos_keys": pos,
+            "sprite_curves": list(clip.get("sprite_curves") or []),
             "key_begin": 0,
             "key_count": len(pos),
         }
@@ -2001,6 +2469,7 @@ def _build_animation_tables(plan):
                 "owner_class": cname,
                 "owner_class_id": cid,
                 "owner_inst": i,
+                "owner_obj": o,
                 "clip": ci,
                 "playing": int(p.get("playing") or 0),
                 "speed": float(p.get("speed") or 1.0),
@@ -2012,6 +2481,8 @@ def _build_animation_tables(plan):
                 "rest_y": float(rest[1]),
                 "rest_z": float(rest[2]) if len(rest) > 2 else 0.0,
                 "kind": 0 if p.get("kind") == "animation" else 1,
+                "sprite_bind_begin": 0,
+                "sprite_bind_count": 0,
             })
 
     keys = []
@@ -2020,7 +2491,72 @@ def _build_animation_tables(plan):
         for t, x, y, z in c["pos_keys"]:
             keys.append({"t": t, "x": x, "y": y, "z": z})
         c["key_count"] = len(c["pos_keys"])
-    return {"clips": clip_list, "keys": keys, "players": players}
+
+    sprite_keys = []
+    sprite_binds = []
+    mutable = set()
+    for pl in players:
+        clip = clip_list[pl["clip"]]
+        curves = clip.get("sprite_curves") or []
+        if not curves:
+            pl.pop("owner_obj", None)
+            continue
+        owner = pl.get("owner_obj")
+        begin = len(sprite_binds)
+        for sc in curves:
+            path = (sc.get("path") or "").strip().strip('"')
+            hit = _resolve_anim_child_path(owner, path, plan)
+            if hit:
+                tc, ti, to = hit
+            elif not path:
+                tc, ti, to = (
+                    pl["owner_class"], pl["owner_inst"], owner)
+            else:
+                continue
+            if not to:
+                continue
+            sp = to.get("sprite") or {}
+            ls = to.get("local_scale") or (1.0, 1.0, 1.0)
+            sx = abs(float(sp.get("scale_x", ls[0])))
+            sy = abs(float(sp.get("scale_y", ls[1])))
+            skb = len(sprite_keys)
+            for t, g in sc.get("keys") or []:
+                tid = guid_to_tex.get(g)
+                if tid is None:
+                    continue
+                tex = textures[tid]
+                ppu = float(tex.get("ppu") or 100.0)
+                if ppu <= 0.0:
+                    ppu = 100.0
+                hw = (float(tex["w"]) / ppu) * sx * 0.5
+                hh = (float(tex["h"]) / ppu) * sy * 0.5
+                sprite_keys.append({
+                    "t": float(t), "tex": int(tid),
+                    "hw": hw, "hh": hh,
+                })
+            skc = len(sprite_keys) - skb
+            if skc <= 0:
+                continue
+            sprite_binds.append({
+                "target_class": tc,
+                "target_class_id": int(class_ids[tc]),
+                "target_inst": int(ti),
+                "key_begin": skb,
+                "key_count": skc,
+            })
+            mutable.add(tc)
+        pl["sprite_bind_begin"] = begin
+        pl["sprite_bind_count"] = len(sprite_binds) - begin
+        pl.pop("owner_obj", None)
+
+    plan["sprite_draw_mutable"] = sorted(mutable)
+    return {
+        "clips": clip_list,
+        "keys": keys,
+        "players": players,
+        "sprite_keys": sprite_keys,
+        "sprite_binds": sprite_binds,
+    }
 
 
 def _rewrite_rigidbody_assigns(text, plan, this_class):
@@ -2094,6 +2630,10 @@ def _rewrite_find_getcomponent(text, plan, this_class):
                 return ("({ int _up_rb = %s; "
                         "_up_rb < 0 ? 0.f : _Rigidbody2D_gravity_scale[_up_rb]; })"
                         % get)
+            if fl in ("lineardamping", "drag"):
+                return ("({ int _up_rb = %s; "
+                        "_up_rb < 0 ? 0.f : _Rigidbody2D_linear_damping[_up_rb]; })"
+                        % get)
             if fl in ("velocity", "linearvelocity") and axis in ("x", "y"):
                 return ("({ int _up_rb = %s; "
                         "_up_rb < 0 ? 0.f : _Rigidbody2D_vel_%s[_up_rb]; })"
@@ -2103,6 +2643,10 @@ def _rewrite_find_getcomponent(text, plan, this_class):
                         "_up_rb < 0 ? 0.f : _Rigidbody2D_mass[_up_rb]; })"
                         % get)
         if comp == "Rigidbody":
+            if fl in ("drag", "lineardamping"):
+                return ("({ int _up_rb = %s; "
+                        "_up_rb < 0 ? 0.f : _Rigidbody_drag[_up_rb]; })"
+                        % get)
             if fl in ("velocity", "linearvelocity") and axis in ("x", "y", "z"):
                 return ("({ int _up_rb = %s; "
                         "_up_rb < 0 ? 0.f : _Rigidbody_vel_%s[_up_rb]; })"
@@ -2717,6 +3261,8 @@ def emit_engine(plan, analyses, used_apis):
     if ("Time.fixedDeltaTime" in used_apis or want_phys or want_phys3
             or want_rb2d or want_rb3d):
         p("extern float Time_fixedDeltaTime;")
+    p("extern int Screen_width;")
+    p("extern int Screen_height;")
     if want_phys:
         p("extern float Physics2D_gravity_x;")
         p("extern float Physics2D_gravity_y;")
@@ -2762,6 +3308,7 @@ def emit_engine(plan, analyses, used_apis):
         p("extern float _Rigidbody2D_vel_x[%d];" % n2)
         p("extern float _Rigidbody2D_vel_y[%d];" % n2)
         p("extern float _Rigidbody2D_gravity_scale[%d];" % n2)
+        p("extern float _Rigidbody2D_linear_damping[%d];" % n2)
         p("extern float _Rigidbody2D_mass[%d];" % n2)
         p("extern int _Rigidbody2D_body_type[%d];" % n2)
         p("extern int _Rigidbody2D_owner_class[%d];" % n2)
@@ -2773,6 +3320,7 @@ def emit_engine(plan, analyses, used_apis):
         p("extern float _Rigidbody_vel_y[%d];" % n3)
         p("extern float _Rigidbody_vel_z[%d];" % n3)
         p("extern float _Rigidbody_mass[%d];" % n3)
+        p("extern float _Rigidbody_drag[%d];" % n3)
         p("extern int _Rigidbody_use_gravity[%d];" % n3)
         p("extern int _Rigidbody_owner_class[%d];" % n3)
         p("extern int _Rigidbody_owner_inst[%d];" % n3)
@@ -2841,6 +3389,32 @@ def emit_engine(plan, analyses, used_apis):
         p("extern const float _AnimKey_x[%d];" % nk)
         p("extern const float _AnimKey_y[%d];" % nk)
         p("extern const float _AnimKey_z[%d];" % nk)
+        anim_skeys = anim_plan.get("sprite_keys") or []
+        anim_sbinds = anim_plan.get("sprite_binds") or []
+        if anim_skeys or anim_sbinds:
+            nsk = max(1, len(anim_skeys))
+            nsb = max(1, len(anim_sbinds))
+            p("extern const int _AnimPlayer_sprite_bind_begin[%d];" % np)
+            p("extern const int _AnimPlayer_sprite_bind_count[%d];" % np)
+            p("extern const int _AnimSpriteBind_count;")
+            p("extern const int _AnimSpriteBind_target_class[%d];" % nsb)
+            p("extern const int _AnimSpriteBind_target_inst[%d];" % nsb)
+            p("extern const int _AnimSpriteBind_key_begin[%d];" % nsb)
+            p("extern const int _AnimSpriteBind_key_count[%d];" % nsb)
+            p("extern const int _AnimSpriteKey_count;")
+            p("extern const float _AnimSpriteKey_t[%d];" % nsk)
+            p("extern const int _AnimSpriteKey_tex[%d];" % nsk)
+            p("extern const float _AnimSpriteKey_hw[%d];" % nsk)
+            p("extern const float _AnimSpriteKey_hh[%d];" % nsk)
+    mutable_spr = set(plan.get("sprite_draw_mutable") or [])
+    for cname in sorted(mutable_spr):
+        if cname not in plan["classes"]:
+            continue
+        idn = _c_ident(cname)
+        n = max(1, plan["classes"][cname]["n"])
+        p("extern int _%s_draw_tex[%d];" % (idn, n))
+        p("extern float _%s_draw_hw[%d];" % (idn, n))
+        p("extern float _%s_draw_hh[%d];" % (idn, n))
     p("")
 
     # Packed structs (positions omitted when SoA).
@@ -3301,6 +3875,7 @@ def emit_engine(plan, analyses, used_apis):
                 p("    _Rigidbody2D_vel_x[ex] = 0.f;")
                 p("    _Rigidbody2D_vel_y[ex] = 0.f;")
                 p("    _Rigidbody2D_gravity_scale[ex] = 1.f;")
+                p("    _Rigidbody2D_linear_damping[ex] = 0.f;")
                 p("    _Rigidbody2D_mass[ex] = 1.f;")
                 p("    _Rigidbody2D_body_type[ex] = 0;")
                 p("    oc = -1; oi = 0;")
@@ -3367,6 +3942,7 @@ def emit_engine(plan, analyses, used_apis):
                 p("    _Rigidbody_vel_y[ex] = 0.f;")
                 p("    _Rigidbody_vel_z[ex] = 0.f;")
                 p("    _Rigidbody_mass[ex] = 1.f;")
+                p("    _Rigidbody_drag[ex] = 0.f;")
                 p("    _Rigidbody_use_gravity[ex] = 1;")
                 p("    oc = -1; oi = 0;")
                 for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
@@ -3619,6 +4195,68 @@ def emit_engine(plan, analyses, used_apis):
         p("}")
         p("")
 
+    # Live Transform hierarchy (m_Father): world = parent_world + local.
+    if plan.get("has_transform_parents"):
+        for cname, cl in sorted(plan["classes"].items()):
+            idn = _c_ident(cname)
+            if not _class_has_position(cl):
+                continue
+            n = max(1, cl["n"] + int(add_budget.get(cname) or 0))
+            pcs = []
+            pis = []
+            for o in cl["instances"]:
+                pcs.append(str(int(o.get("xf_parent_class_id", -1))))
+                pis.append(str(int(o.get("xf_parent_inst") or 0)))
+            for _pad in range(int(add_budget.get(cname) or 0)):
+                pcs.append("-1")
+                pis.append("0")
+            while len(pcs) < n:
+                pcs.append("-1")
+                pis.append("0")
+            p("static const int _%s_xf_parent_class[%d] = { %s };"
+              % (idn, n, ", ".join(pcs)))
+            p("static const unsigned _%s_xf_parent_inst[%d] = { %s };"
+              % (idn, n, ", ".join(pis)))
+        p("")
+        p("/* Authored m_Father — world position follows parent at runtime. */")
+        p("static void _engine_world_pos(int class_id, unsigned inst,")
+        p("                             float *x, float *y, float *z,")
+        p("                             int depth) {")
+        p("    float lx = 0.f, ly = 0.f, lz = 0.f;")
+        p("    int pc = -1;")
+        p("    unsigned pi = 0u;")
+        p("    if (depth > 64) { *x = 0.f; *y = 0.f; *z = 0.f; return; }")
+        p("    switch (class_id) {")
+        for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
+            idn = _c_ident(cname)
+            cl = plan["classes"][cname]
+            if not _class_has_position(cl):
+                continue
+            p("    case %d:" % cid)
+            p("        lx = %s_get_pos_x(inst);" % idn)
+            p("        ly = %s_get_pos_y(inst);" % idn)
+            if cl.get("two_d"):
+                p("        lz = 0.f;")
+            else:
+                p("        lz = %s_get_pos_z(inst);" % idn)
+            p("        pc = _%s_xf_parent_class[inst];" % idn)
+            p("        pi = _%s_xf_parent_inst[inst];" % idn)
+            p("        break;")
+        p("    default:")
+        p("        *x = 0.f; *y = 0.f; *z = 0.f;")
+        p("        return;")
+        p("    }")
+        p("    if (pc < 0) { *x = lx; *y = ly; *z = lz; return; }")
+        p("    {")
+        p("        float px, py, pz;")
+        p("        _engine_world_pos(pc, pi, &px, &py, &pz, depth + 1);")
+        p("        *x = px + lx;")
+        p("        *y = py + ly;")
+        p("        *z = pz + lz;")
+        p("    }")
+        p("}")
+        p("")
+
     if want_col2d or want_col3d:
         p("/* PhysicsMaterialCombine: Average=0 Multiply=1 Minimum=2 Maximum=3 */")
         p("static float _phys_mat_combine(float a, float b, int ca, int cb) {")
@@ -3645,8 +4283,16 @@ def emit_engine(plan, analyses, used_apis):
             if not _class_has_position(cl):
                 continue
             p("    case %d:" % cid)
-            p("        px = %s_get_pos_x(oi);" % idn)
-            p("        py = %s_get_pos_y(oi);" % idn)
+            if plan.get("has_transform_parents"):
+                p("        {")
+                p("            float wx, wy, wz;")
+                p("            _engine_world_pos(%d, oi, &wx, &wy, &wz, 0);"
+                  % cid)
+                p("            px = wx; py = wy;")
+                p("        }")
+            else:
+                p("        px = %s_get_pos_x(oi);" % idn)
+                p("        py = %s_get_pos_y(oi);" % idn)
             p("        break;")
         p("    default: break;")
         p("    }")
@@ -3680,8 +4326,16 @@ def emit_engine(plan, analyses, used_apis):
             if not _class_has_position(cl):
                 continue
             p("    case %d:" % cid)
-            p("        *ox = %s_get_pos_x(oi);" % idn)
-            p("        *oy = %s_get_pos_y(oi);" % idn)
+            if plan.get("has_transform_parents"):
+                p("        {")
+                p("            float wx, wy, wz;")
+                p("            _engine_world_pos(%d, oi, &wx, &wy, &wz, 0);"
+                  % cid)
+                p("            *ox = wx; *oy = wy;")
+                p("        }")
+            else:
+                p("        *ox = %s_get_pos_x(oi);" % idn)
+                p("        *oy = %s_get_pos_y(oi);" % idn)
             p("        break;")
         p("    default: break;")
         p("    }")
@@ -3768,10 +4422,18 @@ def emit_engine(plan, analyses, used_apis):
             if not _class_has_position(cl):
                 continue
             p("    case %d:" % cid)
-            p("        px = %s_get_pos_x(oi);" % idn)
-            p("        py = %s_get_pos_y(oi);" % idn)
-            if not cl.get("two_d"):
-                p("        pz = %s_get_pos_z(oi);" % idn)
+            if plan.get("has_transform_parents"):
+                p("        {")
+                p("            float wx, wy, wz;")
+                p("            _engine_world_pos(%d, oi, &wx, &wy, &wz, 0);"
+                  % cid)
+                p("            px = wx; py = wy; pz = wz;")
+                p("        }")
+            else:
+                p("        px = %s_get_pos_x(oi);" % idn)
+                p("        py = %s_get_pos_y(oi);" % idn)
+                if not cl.get("two_d"):
+                    p("        pz = %s_get_pos_z(oi);" % idn)
             p("        break;")
         p("    default: break;")
         p("    }")
@@ -3808,10 +4470,13 @@ def emit_engine(plan, analyses, used_apis):
             if not _class_has_position(cl):
                 continue
             p("    case %d:" % cid)
-            p("        *ox = %s_get_pos_x(oi);" % idn)
-            p("        *oy = %s_get_pos_y(oi);" % idn)
-            if not cl.get("two_d"):
-                p("        *oz = %s_get_pos_z(oi);" % idn)
+            if plan.get("has_transform_parents"):
+                p("        _engine_world_pos(%d, oi, ox, oy, oz, 0);" % cid)
+            else:
+                p("        *ox = %s_get_pos_x(oi);" % idn)
+                p("        *oy = %s_get_pos_y(oi);" % idn)
+                if not cl.get("two_d"):
+                    p("        *oz = %s_get_pos_z(oi);" % idn)
             p("        break;")
         p("    default: break;")
         p("    }")
@@ -3920,6 +4585,15 @@ def emit_engine(plan, analyses, used_apis):
             p("        _Rigidbody2D_vel_y[i] = _Rigidbody2D_vel_y[i]")
             p("            + Physics2D_gravity_y * _Rigidbody2D_gravity_scale[i]")
             p("              * Time_fixedDeltaTime;")
+            # Box2D / Unity: v *= clamp(1 - damping * dt, 0, 1)
+            p("        {")
+            p("            float d = 1.f - _Rigidbody2D_linear_damping[i]")
+            p("                * Time_fixedDeltaTime;")
+            p("            if (d < 0.f) d = 0.f;")
+            p("            if (d > 1.f) d = 1.f;")
+            p("            _Rigidbody2D_vel_x[i] = _Rigidbody2D_vel_x[i] * d;")
+            p("            _Rigidbody2D_vel_y[i] = _Rigidbody2D_vel_y[i] * d;")
+            p("        }")
             p("        vx = _Rigidbody2D_vel_x[i] * Time_fixedDeltaTime;")
             p("        vy = _Rigidbody2D_vel_y[i] * Time_fixedDeltaTime;")
             p("        oi = (unsigned)_Rigidbody2D_owner_inst[i];")
@@ -3949,6 +4623,14 @@ def emit_engine(plan, analyses, used_apis):
             p("                + Physics_gravity_y * Time_fixedDeltaTime;")
             p("            _Rigidbody_vel_z[i] = _Rigidbody_vel_z[i]")
             p("                + Physics_gravity_z * Time_fixedDeltaTime;")
+            p("        }")
+            p("        {")
+            p("            float d = 1.f - _Rigidbody_drag[i] * Time_fixedDeltaTime;")
+            p("            if (d < 0.f) d = 0.f;")
+            p("            if (d > 1.f) d = 1.f;")
+            p("            _Rigidbody_vel_x[i] = _Rigidbody_vel_x[i] * d;")
+            p("            _Rigidbody_vel_y[i] = _Rigidbody_vel_y[i] * d;")
+            p("            _Rigidbody_vel_z[i] = _Rigidbody_vel_z[i] * d;")
             p("        }")
             p("        vx = _Rigidbody_vel_x[i] * Time_fixedDeltaTime;")
             p("        vy = _Rigidbody_vel_y[i] * Time_fixedDeltaTime;")
@@ -3980,7 +4662,7 @@ def emit_engine(plan, analyses, used_apis):
         p("")
 
     if want_anim and anim_players:
-        p("/* Authored Animation / Animator — sample root position curves */")
+        p("/* Authored Animation / Animator — root pos + m_Sprite PPtr */")
         p("static float _anim_sample(const float *times, const float *vals,")
         p("                         int begin, int count, float t) {")
         p("    int i;")
@@ -4002,6 +4684,40 @@ def emit_engine(plan, analyses, used_apis):
         p("    return vals[begin + count - 1];")
         p("}")
         p("")
+        anim_skeys = anim_plan.get("sprite_keys") or []
+        anim_sbinds = anim_plan.get("sprite_binds") or []
+        if anim_skeys and anim_sbinds:
+            p("/* Discrete PPtr hold (Unity SpriteRenderer.m_Sprite keys). */")
+            p("static int _anim_sample_hold_i(const float *times,")
+            p("                              const int *vals,")
+            p("                              int begin, int count, float t) {")
+            p("    int i;")
+            p("    if (count <= 0) return 0;")
+            p("    if (count == 1) return vals[begin];")
+            p("    if (t <= times[begin]) return vals[begin];")
+            p("    for (i = 0; i < count - 1; i = i + 1) {")
+            p("        if (t >= times[begin + i]")
+            p("            && t < times[begin + i + 1])")
+            p("            return vals[begin + i];")
+            p("    }")
+            p("    return vals[begin + count - 1];")
+            p("}")
+            p("")
+            p("static float _anim_sample_hold(const float *times,")
+            p("                              const float *vals,")
+            p("                              int begin, int count, float t) {")
+            p("    int i;")
+            p("    if (count <= 0) return 0.f;")
+            p("    if (count == 1) return vals[begin];")
+            p("    if (t <= times[begin]) return vals[begin];")
+            p("    for (i = 0; i < count - 1; i = i + 1) {")
+            p("        if (t >= times[begin + i]")
+            p("            && t < times[begin + i + 1])")
+            p("            return vals[begin + i];")
+            p("    }")
+            p("    return vals[begin + count - 1];")
+            p("}")
+            p("")
         p("static void engine_animation_tick(void) {")
         p("    int i;")
         p("    for (i = 0; i < _AnimPlayer_count; i = i + 1) {")
@@ -4026,25 +4742,65 @@ def emit_engine(plan, analyses, used_apis):
         p("        }")
         p("        kb = _AnimClip_key_begin[ci];")
         p("        kc = _AnimClip_key_count[ci];")
-        # Absolute localPosition from the clip curve.
-        p("        nx = _anim_sample(_AnimKey_t, _AnimKey_x, kb, kc, t);")
-        p("        ny = _anim_sample(_AnimKey_t, _AnimKey_y, kb, kc, t);")
-        p("        nz = _anim_sample(_AnimKey_t, _AnimKey_z, kb, kc, t);")
-        p("        oi = (unsigned)_AnimPlayer_owner_inst[i];")
-        p("        switch (_AnimPlayer_owner_class[i]) {")
+        # Absolute localPosition only when the clip authors root PositionCurves.
+        p("        if (kc > 0) {")
+        p("            nx = _anim_sample(_AnimKey_t, _AnimKey_x, kb, kc, t);")
+        p("            ny = _anim_sample(_AnimKey_t, _AnimKey_y, kb, kc, t);")
+        p("            nz = _anim_sample(_AnimKey_t, _AnimKey_z, kb, kc, t);")
+        p("            oi = (unsigned)_AnimPlayer_owner_inst[i];")
+        p("            switch (_AnimPlayer_owner_class[i]) {")
         for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
             idn = _c_ident(cname)
             cl = plan["classes"][cname]
             if not _class_has_position(cl) or cl.get("static"):
                 continue
-            p("        case %d:" % cid)
-            p("            %s_set_pos_x(oi, nx);" % idn)
-            p("            %s_set_pos_y(oi, ny);" % idn)
+            p("            case %d:" % cid)
+            p("                %s_set_pos_x(oi, nx);" % idn)
+            p("                %s_set_pos_y(oi, ny);" % idn)
             if not cl.get("two_d"):
-                p("            %s_set_pos_z(oi, nz);" % idn)
-            p("            break;")
-        p("        default: break;")
+                p("                %s_set_pos_z(oi, nz);" % idn)
+            p("                break;")
+        p("            default: break;")
+        p("            }")
         p("        }")
+        if anim_skeys and anim_sbinds:
+            mutable = set(plan.get("sprite_draw_mutable") or [])
+            p("        {")
+            p("            int b0 = _AnimPlayer_sprite_bind_begin[i];")
+            p("            int bc = _AnimPlayer_sprite_bind_count[i];")
+            p("            int b;")
+            p("            for (b = 0; b < bc; b = b + 1) {")
+            p("                int bi = b0 + b;")
+            p("                int skb = _AnimSpriteBind_key_begin[bi];")
+            p("                int skc = _AnimSpriteBind_key_count[bi];")
+            p("                int tex; float hw, hh;")
+            p("                unsigned ti;")
+            p("                if (skc <= 0) continue;")
+            p("                tex = _anim_sample_hold_i(")
+            p("                    _AnimSpriteKey_t, _AnimSpriteKey_tex,")
+            p("                    skb, skc, t);")
+            p("                hw = _anim_sample_hold(")
+            p("                    _AnimSpriteKey_t, _AnimSpriteKey_hw,")
+            p("                    skb, skc, t);")
+            p("                hh = _anim_sample_hold(")
+            p("                    _AnimSpriteKey_t, _AnimSpriteKey_hh,")
+            p("                    skb, skc, t);")
+            p("                ti = (unsigned)_AnimSpriteBind_target_inst[bi];")
+            p("                switch (_AnimSpriteBind_target_class[bi]) {")
+            for cname in sorted(mutable):
+                if cname not in class_ids:
+                    continue
+                cid = class_ids[cname]
+                idn = _c_ident(cname)
+                p("                case %d:" % cid)
+                p("                    _%s_draw_tex[ti] = tex;" % idn)
+                p("                    _%s_draw_hw[ti] = hw;" % idn)
+                p("                    _%s_draw_hh[ti] = hh;" % idn)
+                p("                    break;")
+            p("                default: break;")
+            p("                }")
+            p("            }")
+            p("        }")
         p("    }")
         p("}")
         p("")
@@ -4072,6 +4828,7 @@ def emit_engine(plan, analyses, used_apis):
     p("    float x, y, half_w, half_h;")
     p("    float cos_z, sin_z; /* m_LocalRotation around Z */")
     p("    float r, g, b;")
+    p("    float a; /* tint alpha (SpriteRenderer 1; Image m_Color.a) */")
     p("    int tex; /* index into engine_texture_*; -1 = none */")
     p("    int sorting_layer; /* TagManager m_SortingLayers index */")
     p("    int sorting_order; /* SpriteRenderer.m_SortingOrder */")
@@ -4128,6 +4885,7 @@ def emit_engine(plan, analyses, used_apis):
     p("    if (!out || max < 1) return 0;")
     any_sprite = False
     has_cam = bool(plan.get("camera"))
+    mutable_spr = set(plan.get("sprite_draw_mutable") or [])
     for cname, cl in sorted(plan["classes"].items()):
         idn = _c_ident(cname)
         if not _class_has_position(cl):
@@ -4140,6 +4898,7 @@ def emit_engine(plan, analyses, used_apis):
         if not spr_idx:
             continue
         any_sprite = True
+        use_mut = cname in mutable_spr
         p("    { /* %s SpriteRenderer */" % idn)
         p("        static const float _spr_r[] = { %s };" % ", ".join(
             "%sf" % repr(float(sp["r"])) for _i, sp in spr_idx))
@@ -4147,16 +4906,19 @@ def emit_engine(plan, analyses, used_apis):
             "%sf" % repr(float(sp["g"])) for _i, sp in spr_idx))
         p("        static const float _spr_b[] = { %s };" % ", ".join(
             "%sf" % repr(float(sp["b"])) for _i, sp in spr_idx))
-        p("        static const float _spr_hw[] = { %s };" % ", ".join(
-            "%sf" % repr(float(sp["half_w"])) for _i, sp in spr_idx))
-        p("        static const float _spr_hh[] = { %s };" % ", ".join(
-            "%sf" % repr(float(sp["half_h"])) for _i, sp in spr_idx))
+        p("        static const float _spr_a[] = { %s };" % ", ".join(
+            "%sf" % repr(float(sp.get("a", 1.0))) for _i, sp in spr_idx))
+        if not use_mut:
+            p("        static const float _spr_hw[] = { %s };" % ", ".join(
+                "%sf" % repr(float(sp["half_w"])) for _i, sp in spr_idx))
+            p("        static const float _spr_hh[] = { %s };" % ", ".join(
+                "%sf" % repr(float(sp["half_h"])) for _i, sp in spr_idx))
+            p("        static const int _spr_tex[] = { %s };" % ", ".join(
+                str(int(sp["tex_id"])) for _i, sp in spr_idx))
         p("        static const float _spr_cos[] = { %s };" % ", ".join(
             "%sf" % repr(float(sp.get("cos_z", 1.0))) for _i, sp in spr_idx))
         p("        static const float _spr_sin[] = { %s };" % ", ".join(
             "%sf" % repr(float(sp.get("sin_z", 0.0))) for _i, sp in spr_idx))
-        p("        static const int _spr_tex[] = { %s };" % ", ".join(
-            str(int(sp["tex_id"])) for _i, sp in spr_idx))
         p("        static const int _spr_layer[] = { %s };" % ", ".join(
             str(int(sp.get("sorting_layer") or 0)) for _i, sp in spr_idx))
         p("        static const int _spr_order[] = { %s };" % ", ".join(
@@ -4166,28 +4928,49 @@ def emit_engine(plan, analyses, used_apis):
         p("        int k;")
         p("        for (k = 0; k < %d && n < max; k = k + 1) {" % len(spr_idx))
         p("            unsigned i = _spr_i[k];")
-        # Unity cameras look along +Z (identity). Depth = object_z - cam_z.
-        if has_cam:
-            if cl.get("two_d"):
-                p("            float oz = 0.f;")
-            else:
-                p("            float oz = %s_get_pos_z(i);" % idn)
-            p("            {")
-            p("                float depth = oz - Camera_main_pos_z;")
-            p("                if (depth < Camera_main_nearClipPlane"
-              " || depth > Camera_main_farClipPlane)")
-            p("                    continue;")
-            p("            }")
-        p("            out[n].x = %s_get_pos_x(i);" % idn)
-        p("            out[n].y = %s_get_pos_y(i);" % idn)
-        p("            out[n].half_w = _spr_hw[k];")
-        p("            out[n].half_h = _spr_hh[k];")
+        cid = class_ids[cname]
+        if plan.get("has_transform_parents"):
+            p("            float wx, wy, wz;")
+            p("            _engine_world_pos(%d, i, &wx, &wy, &wz, 0);" % cid)
+            # Unity cameras look along +Z (identity). Depth = object_z - cam_z.
+            if has_cam:
+                p("            {")
+                p("                float depth = wz - Camera_main_pos_z;")
+                p("                if (depth < Camera_main_nearClipPlane"
+                  " || depth > Camera_main_farClipPlane)")
+                p("                    continue;")
+                p("            }")
+            p("            out[n].x = wx;")
+            p("            out[n].y = wy;")
+        else:
+            # Unity cameras look along +Z (identity). Depth = object_z - cam_z.
+            if has_cam:
+                if cl.get("two_d"):
+                    p("            float oz = 0.f;")
+                else:
+                    p("            float oz = %s_get_pos_z(i);" % idn)
+                p("            {")
+                p("                float depth = oz - Camera_main_pos_z;")
+                p("                if (depth < Camera_main_nearClipPlane"
+                  " || depth > Camera_main_farClipPlane)")
+                p("                    continue;")
+                p("            }")
+            p("            out[n].x = %s_get_pos_x(i);" % idn)
+            p("            out[n].y = %s_get_pos_y(i);" % idn)
+        if use_mut:
+            p("            out[n].half_w = _%s_draw_hw[i];" % idn)
+            p("            out[n].half_h = _%s_draw_hh[i];" % idn)
+            p("            out[n].tex = _%s_draw_tex[i];" % idn)
+        else:
+            p("            out[n].half_w = _spr_hw[k];")
+            p("            out[n].half_h = _spr_hh[k];")
+            p("            out[n].tex = _spr_tex[k];")
         p("            out[n].cos_z = _spr_cos[k];")
         p("            out[n].sin_z = _spr_sin[k];")
         p("            out[n].r = _spr_r[k];")
         p("            out[n].g = _spr_g[k];")
         p("            out[n].b = _spr_b[k];")
-        p("            out[n].tex = _spr_tex[k];")
+        p("            out[n].a = _spr_a[k];")
         p("            out[n].sorting_layer = _spr_layer[k];")
         p("            out[n].sorting_order = _spr_order[k];")
         p("            n = n + 1;")
@@ -4255,6 +5038,7 @@ def emit_engine_draw_h():
         "    float x, y, half_w, half_h;\n"
         "    float cos_z, sin_z; /* m_LocalRotation around Z */\n"
         "    float r, g, b;\n"
+        "    float a; /* tint alpha */\n"
         "    int tex; /* engine_texture_* index; -1 if none */\n"
         "    int sorting_layer; /* TagManager m_SortingLayers index */\n"
         "    int sorting_order; /* SpriteRenderer.m_SortingOrder */\n"
@@ -4271,6 +5055,10 @@ def emit_engine_draw_h():
         " * name order). SoA packs fill this from flat tables; AoS gathers. */\n"
         "int engine_position_floats(void);\n"
         "int engine_upload_positions(float *dst, int max_floats);\n"
+        "/* Player Settings defaultScreenWidth/Height → Screen.* */\n"
+        "extern int Screen_width;\n"
+        "extern int Screen_height;\n"
+        "extern const char engine_product_name[]; /* productName */\n"
         "/* Unity -logFile: default platform Player.log; \"-\" = stdout. */\n"
         "void engine_set_log_file(const char *path);\n"
         "void engine_apply_argv(int argc, char **argv);\n"
@@ -4543,6 +5331,8 @@ def _lower_method_body(body, cl, plan):
     text = text.replace("Time.deltaTime", "Time_deltaTime")
     text = text.replace("Time.fixedDeltaTime", "Time_fixedDeltaTime")
     text = text.replace("Time.time", "Time_time")
+    text = text.replace("Screen.width", "Screen_width")
+    text = text.replace("Screen.height", "Screen_height")
     text = text.replace("Physics2D.gravity.x", "Physics2D_gravity_x")
     text = text.replace("Physics2D.gravity.y", "Physics2D_gravity_y")
     text = text.replace("Physics.gravity.x", "Physics_gravity_x")
@@ -4678,6 +5468,12 @@ def emit_data(plan, used_apis=None):
         p("/* SoA: positions live in _Class_pos[N][dims], not in the struct */")
     p("#include <stdint.h>")
     p("")
+    # Player Settings → Screen.* (hosts use these for window size).
+    p("int Screen_width = %d;" % int(plan.get("screen_width") or 1024))
+    p("int Screen_height = %d;" % int(plan.get("screen_height") or 768))
+    p("const char engine_product_name[] = %s;" % _c_string(
+        plan.get("product_name") or "Player"))
+    p("")
     for cname, cl in sorted(plan["classes"].items()):
         idn = _c_ident(cname)
         p("typedef struct %s %s;" % (idn, idn))
@@ -4772,6 +5568,9 @@ def emit_data(plan, used_apis=None):
         p("float _Rigidbody2D_gravity_scale[%d] = { %s };" % (
             cap, ", ".join("%sf" % repr(float(v)) for v in _pad_f(
                 [r["gravity_scale"] for r in rb2d_list], 1.0))))
+        p("float _Rigidbody2D_linear_damping[%d] = { %s };" % (
+            cap, ", ".join("%sf" % repr(float(v)) for v in _pad_f(
+                [r.get("linear_damping", 0.0) for r in rb2d_list]))))
         p("float _Rigidbody2D_mass[%d] = { %s };" % (
             cap, ", ".join("%sf" % repr(float(v)) for v in _pad_f(
                 [r["mass"] for r in rb2d_list], 1.0))))
@@ -4804,6 +5603,9 @@ def emit_data(plan, used_apis=None):
         p("float _Rigidbody_mass[%d] = { %s };" % (
             cap, ", ".join("%sf" % repr(float(v)) for v in _pad_f3(
                 [r["mass"] for r in rb3d_list], 1.0))))
+        p("float _Rigidbody_drag[%d] = { %s };" % (
+            cap, ", ".join("%sf" % repr(float(v)) for v in _pad_f3(
+                [r.get("drag", 0.0) for r in rb3d_list]))))
         p("int _Rigidbody_use_gravity[%d] = { %s };" % (
             cap, ", ".join(str(int(v)) for v in _pad_i3(
                 [r["use_gravity"] for r in rb3d_list], 1))))
@@ -4950,6 +5752,71 @@ def emit_data(plan, used_apis=None):
         p("const float _AnimKey_z[%d] = { %s };" % (
             len(keys),
             ", ".join("%sf" % repr(float(k["z"])) for k in keys)))
+        anim_skeys = anim_plan.get("sprite_keys") or []
+        anim_sbinds = anim_plan.get("sprite_binds") or []
+        if anim_skeys or anim_sbinds:
+            p("const int _AnimPlayer_sprite_bind_begin[%d] = { %s };" % (
+                n, ", ".join(str(int(pl.get("sprite_bind_begin") or 0))
+                             for pl in anim_players)))
+            p("const int _AnimPlayer_sprite_bind_count[%d] = { %s };" % (
+                n, ", ".join(str(int(pl.get("sprite_bind_count") or 0))
+                             for pl in anim_players)))
+            binds = anim_sbinds or [{
+                "target_class_id": 0, "target_inst": 0,
+                "key_begin": 0, "key_count": 0,
+            }]
+            p("const int _AnimSpriteBind_count = %d;" % len(binds))
+            p("const int _AnimSpriteBind_target_class[%d] = { %s };" % (
+                len(binds),
+                ", ".join(str(int(b["target_class_id"])) for b in binds)))
+            p("const int _AnimSpriteBind_target_inst[%d] = { %s };" % (
+                len(binds),
+                ", ".join(str(int(b["target_inst"])) for b in binds)))
+            p("const int _AnimSpriteBind_key_begin[%d] = { %s };" % (
+                len(binds),
+                ", ".join(str(int(b["key_begin"])) for b in binds)))
+            p("const int _AnimSpriteBind_key_count[%d] = { %s };" % (
+                len(binds),
+                ", ".join(str(int(b["key_count"])) for b in binds)))
+            skeys = anim_skeys or [{
+                "t": 0.0, "tex": 0, "hw": 0.5, "hh": 0.5,
+            }]
+            p("const int _AnimSpriteKey_count = %d;" % len(skeys))
+            p("const float _AnimSpriteKey_t[%d] = { %s };" % (
+                len(skeys),
+                ", ".join("%sf" % repr(float(k["t"])) for k in skeys)))
+            p("const int _AnimSpriteKey_tex[%d] = { %s };" % (
+                len(skeys),
+                ", ".join(str(int(k["tex"])) for k in skeys)))
+            p("const float _AnimSpriteKey_hw[%d] = { %s };" % (
+                len(skeys),
+                ", ".join("%sf" % repr(float(k["hw"])) for k in skeys)))
+            p("const float _AnimSpriteKey_hh[%d] = { %s };" % (
+                len(skeys),
+                ", ".join("%sf" % repr(float(k["hh"])) for k in skeys)))
+    # Mutable SpriteRenderer draw state for m_Sprite PPtr targets.
+    for cname in sorted(plan.get("sprite_draw_mutable") or []):
+        cl = plan["classes"].get(cname)
+        if not cl:
+            continue
+        idn = _c_ident(cname)
+        n = max(1, cl["n"])
+        texs, hws, hhs = [], [], []
+        for o in cl["instances"]:
+            sp = o.get("sprite") or {}
+            texs.append(int(sp.get("tex_id") or 0))
+            hws.append(float(sp.get("half_w") or 0.5))
+            hhs.append(float(sp.get("half_h") or 0.5))
+        while len(texs) < n:
+            texs.append(0)
+            hws.append(0.5)
+            hhs.append(0.5)
+        p("int _%s_draw_tex[%d] = { %s };" % (
+            idn, n, ", ".join(str(t) for t in texs)))
+        p("float _%s_draw_hw[%d] = { %s };" % (
+            idn, n, ", ".join("%sf" % repr(v) for v in hws)))
+        p("float _%s_draw_hh[%d] = { %s };" % (
+            idn, n, ", ".join("%sf" % repr(v) for v in hhs)))
     textures = plan.get("textures") or []
     p("const int _engine_tex_count = %d;" % len(textures))
     if textures:
@@ -4985,9 +5852,10 @@ def emit_data(plan, used_apis=None):
             logical = _soa_axis_count(cl)
             p("float _%s_pos[%d][%d] = {" % (idn, cap, dims))
             for ii, o in enumerate(cl["instances"]):
-                coords = [float(o["pos"][0]), float(o["pos"][1])]
+                sx, sy, sz = _instance_storage_pos(o)
+                coords = [sx, sy]
                 if logical >= 3:
-                    coords.append(float(o["pos"][2]))
+                    coords.append(sz)
                 elif dims >= 3:
                     coords.append(0.0)  # 2D → vec4: z = 0
                 if dims == 4:
@@ -5004,15 +5872,14 @@ def emit_data(plan, used_apis=None):
         p("%s _%s_inst_array[%d] = {" % (idn, idn, cap))
         for o in cl["instances"]:
             parts = []
+            sx, sy, sz = _instance_storage_pos(o)
             for name, ty, bits, kind in cl["members"]:
                 if name == "pos_x":
-                    v = o["pos"][0]
-                    parts.append(_init_num(v, kind))
+                    parts.append(_init_num(sx, kind))
                 elif name == "pos_y":
-                    v = o["pos"][1]
-                    parts.append(_init_num(v, kind))
+                    parts.append(_init_num(sy, kind))
                 elif name == "pos_z":
-                    parts.append(_init_num(o["pos"][2], kind))
+                    parts.append(_init_num(sz, kind))
                 elif name in o["fields"]:
                     parts.append(_init_num(o["fields"][name], kind))
                 else:
@@ -5146,7 +6013,6 @@ def load_project(root):
         if os.path.basename(path) == "blender_pack.json":
             objects.extend(parse_blender_json(_read(path)))
     sorting_layers = _load_sorting_layers(root)
-    _apply_sprite_sorting(objects, sorting_layers)
 
     scripts = list(_walk_files(root, (".cs",)))
     _progress("analyzing %d script(s)" % len(scripts))
@@ -5182,6 +6048,10 @@ def load_project(root):
             "(looked for .unity / .tscn / blender_pack.json)" % root)
     _progress("scene objects=%d lights=%d cameras=%d" % (
         len(objects), len(lights), len(cameras)))
+    sw, sh = player_screen(root)
+    _bake_ui_images(objects, cameras, sw, sh)
+    objects = [o for o in objects if not o.get("ui_scaffold")]
+    _apply_sprite_sorting(objects, sorting_layers)
     _attach_sprite_textures(objects, assets)
     return objects, analyses, lights, cameras
 
@@ -5289,6 +6159,9 @@ def pack(root, outdir, soa=False, soa_vec4=False):
     plan["camera"] = main_cam
     plan["cameras"] = list(cameras)
     plan["textures"] = _collect_textures(objects)
+    _ensure_texture_guids(
+        plan["textures"], _anim_sprite_guids(objects),
+        _asset_guid_map(root))
     kb_keys = set()
     for a in analyses:
         kb_keys |= set(a.get("keyboard_keys") or [])
@@ -5296,6 +6169,9 @@ def pack(root, outdir, soa=False, soa_vec4=False):
     company, product = player_identity(root)
     plan["company_name"] = company
     plan["product_name"] = product
+    sw, sh = player_screen(root)
+    plan["screen_width"] = sw
+    plan["screen_height"] = sh
     go_names, go_comps = _build_go_tables(plan)
     plan["go_names"] = go_names
     plan["go_components"] = go_comps
@@ -5304,6 +6180,7 @@ def pack(root, outdir, soa=False, soa_vec4=False):
     plan["rigidbody"] = rb3d
     plan["go_rigidbody2d"] = go_rb2d
     plan["go_rigidbody"] = go_rb3d
+    _attach_transform_parents(plan)
     plan["collider2d"] = _build_collider2d_tables(plan)
     plan["collider3d"] = _build_collider3d_tables(plan)
     plan["animation"] = _build_animation_tables(plan)
