@@ -99,13 +99,18 @@ class TestEmit(unittest.TestCase):
         self.assertIn("Player", plan["classes"])
 
     def test_emitted_c_passes_cpprust_subset_gate(self):
-        """Hand-lowered engine.c must survive cpprust.translate (csrust gate)."""
+        """Hand-lowered engine.cpp must survive cpprust.translate + crust."""
         d = tempfile.mkdtemp(prefix="upack-")
         unity_pack.pack(SCENE, d)
-        with open(os.path.join(d, "engine.c")) as f:
+        with open(os.path.join(d, "engine.cpp")) as f:
             engine = f.read()
         # Explicit re-check (pack already ran validate_emitted_c).
-        unity_pack.validate_emitted_c(engine, "engine.c")
+        unity_pack.validate_emitted_c(engine, "engine.cpp")
+        self.assertTrue(os.path.isfile(os.path.join(d, "engine.c")))
+        self.assertTrue(os.path.isfile(os.path.join(d, "engine.cpp")))
+        self.assertTrue(os.path.isfile(os.path.join(d, "data.cpp")))
+        self.assertTrue(os.path.isfile(os.path.join(d, "main.cpp")))
+        self.assertNotIn("_Generic(", open(os.path.join(d, "engine.c")).read())
 
     def test_validate_emitted_c_refuses_throw(self):
         with self.assertRaises(unity_pack.PackError) as cm:
@@ -1058,6 +1063,42 @@ class TestSystems(unittest.TestCase):
         run = subprocess.run([exe], capture_output=True, text=True)
         self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
 
+    def test_mathf_sign_and_set_world_scale_extensions(self):
+        """Mathf.Sign + Extensions SetX/SetZ/SetWorldScale lower for Player."""
+        d = tempfile.mkdtemp(prefix="upack-ext-")
+        plan = unity_pack.pack(SYSTEMS, d)
+        self.assertEqual(plan.get("live_scale_classes"), ["Graphics"])
+        targets = plan.get("transform_field_targets") or {}
+        self.assertIn(("Player", "graphicsTrs"), targets)
+        hit = targets[("Player", "graphicsTrs")][0]
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit[2], "Graphics")
+        player = plan["classes"]["Player"]["instances"][0]
+        self.assertAlmostEqual(float(player["fields"]["multSize_x"]), 1.0)
+        self.assertAlmostEqual(float(player["fields"]["multSize_y"]), 1.0)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("Mathf_Sign", eng)
+        self.assertIn("_engine_set_world_scale", eng)
+        self.assertIn("_Player_graphicsTrs_target_class", eng)
+        self.assertIn("_Graphics_scale_x", eng)
+        self.assertNotIn("Mathf.Sign", eng)
+        self.assertNotIn("graphicsTrs.SetWorldScale", eng)
+        self.assertIn(
+            "_engine_set_world_scale(_Player_graphicsTrs_target_class[i]",
+            eng)
+        with open(os.path.join(d, "data.c")) as f:
+            data = f.read()
+        self.assertIn("float _Graphics_scale_x[", data)
+        self.assertIn("const int _Player_graphicsTrs_target_class[", data)
+        # Script `float xSize = 1;` — not in scene YAML; must still init to 1
+        # so SetWorldScale(multSize.x * xSize) is non-zero before arrows.
+        self.assertRegex(
+            data,
+            r"Player _Player_inst_array\[1\] = \{\s*\{[^}]*1\.0f[^}]*\},")
+        # xSize is last float member after multSize_x/y — trailing 1.0f before }
+        self.assertIn("17.5f, 1.0f, 1.0f, 1.0f", data)
+
     def test_addcomponent_camera_and_rigidbody2d(self):
         """AddComponent refuses a second DisallowMultipleComponent with Unity's error."""
         d = tempfile.mkdtemp(prefix="upack-addcomp-")
@@ -1538,8 +1579,8 @@ class TestSystems(unittest.TestCase):
         self.assertIn("TalkerLog", engine)
         self.assertIn("Debug_Log_s", engine)
         self.assertIn("Talker_Start", engine)
-        self.assertIn('Debug_Log("Hello World!")', engine)
-        self.assertIn("Debug_Log(3)", engine)
+        self.assertIn('Debug_Log_s("Hello World!")', engine)
+        self.assertIn("Debug_Log_i(3)", engine)
         r = subprocess.run(["make", "-C", d], capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr or r.stdout)
         run = subprocess.run([os.path.join(d, "game")],
@@ -1698,25 +1739,36 @@ class TestSystems(unittest.TestCase):
                 "defaultScreenHeight: 720\n"
             )
         self.assertEqual(unity_pack.player_screen(root), (1280, 720))
-        # SystemsScene authors 1920×1080.
+        # Missing fullscreenMode → windowed (host-safe default).
+        self.assertEqual(
+            unity_pack.player_display(root)[2:], (0, 1, 0))
+        # SystemsScene authors 1920×1080 FullScreenWindow + native res.
         self.assertEqual(unity_pack.player_screen(SYSTEMS), (1920, 1080))
+        sw, sh, sfs, snative, smax = unity_pack.player_display(SYSTEMS)
+        self.assertEqual((sw, sh, sfs, snative, smax), (1920, 1080, 1, 1, 0))
         d = tempfile.mkdtemp(prefix="upack-scr-pack-")
         plan = unity_pack.pack(SYSTEMS, d)
         self.assertEqual(plan["screen_width"], 1920)
         self.assertEqual(plan["screen_height"], 1080)
+        self.assertEqual(plan["screen_fullscreen"], 1)
+        self.assertEqual(plan["screen_fullscreen_native"], 1)
         with open(os.path.join(d, "data.c")) as f:
             data = f.read()
         self.assertIn("int Screen_width = 1920;", data)
         self.assertIn("int Screen_height = 1080;", data)
+        self.assertIn("int Screen_fullScreen = 1;", data)
+        self.assertIn("int Screen_fullScreenNative = 1;", data)
         with open(os.path.join(d, "engine_draw.h")) as f:
             hdr = f.read()
         self.assertIn("extern int Screen_width;", hdr)
         self.assertIn("extern int Screen_height;", hdr)
+        self.assertIn("extern int Screen_fullScreen;", hdr)
         # MiniScene has no defaultScreen* → Unity 1024×768 defaults.
         d2 = tempfile.mkdtemp(prefix="upack-scr-mini-")
         plan2 = unity_pack.pack(SCENE, d2)
         self.assertEqual(plan2["screen_width"], 1024)
         self.assertEqual(plan2["screen_height"], 768)
+        self.assertEqual(plan2.get("screen_fullscreen"), 0)
 
     def test_keyboard_fqn_without_using_ok(self):
         root = tempfile.mkdtemp(prefix="upack-kb-fqn-")

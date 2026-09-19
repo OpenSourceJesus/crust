@@ -12,9 +12,11 @@ other Unity features keep them in the authored project until the packer can
 import them; calling
 invent-requiring APIs today is a hard `PackError`.
 
-Emitted `engine.c` / `data.c` / `main.c` are also gated through
-`cpprust.translate` (same subset check as `csrust`'s C++ half). Leaving
-that subset is a `PackError` on the generated file.
+Emitted `engine.cpp` / `data.cpp` / `main.cpp` (C++-subset twins) are
+gated through `cpprust.translate`, then the translated C is compiled with
+crust/`shivyc`. Leaving that subset or failing crust compile is a
+`PackError` on the generated file. Host `Makefile` still uses `gcc`;
+`make crust-check` recompiles the `.c` files with crust.
 
 What *is* lowered: APIs and methods on the MonoBehaviours / scene
 instances that are already placed.
@@ -82,6 +84,9 @@ to be an authored packed MonoBehaviour (no invented component types).
 | `m_PlayAutomatically` / Animator default | Starts playing; loops when `m_LoopTime` / WrapMode Loop |
 | Empty `m_PositionCurves` (sprite PPtr only) | Advances clip time; **does not** write Transform (no invent) |
 | Authored `m_PPtrCurves` `attribute: m_Sprite` | Discrete hold-sample; swaps path child's SpriteRenderer tex (Idle → Graphics) |
+| `Mathf.Sign` | `Mathf_Sign` (−1 / 0 / 1) |
+| Extensions `Vector2.SetX` / `SetZ` + `Transform.SetWorldScale` | Live scale on referenced Transform GO; sprite half-extents × scale |
+| Script field initializers (`float xSize = 1`) | Seed packed instance data when the scene omits the value |
 
 Root position keys write absolute `localPosition` from the clip (Bob.anim
 x=2 places Spinner/Wave at x=2 while y bobs). Sprite PPtr keys resolve the
@@ -117,6 +122,8 @@ slot (intensity 1, white) into the light table.
 | Authored `!u!223` Canvas + uGUI Image (`m_Sprite`) | Screen-space quad via RectTransform → world |
 | `m_SortingLayerID` / `m_SortingOrder` (+ TagManager layers) | Draws sorted back-to-front (layer index, then order) |
 | `ProjectSettings` `defaultScreenWidth` / `Height` | `Screen_width` / `Screen_height` (GLFW window size) |
+| `ProjectSettings` `fullscreenMode` 0/1 | `Screen_fullScreen` — GLES host uses primary monitor |
+| `defaultIsNativeResolution` | `Screen_fullScreenNative` — desktop video mode size when FS |
 | Authored `m_LocalRotation` on Transform | Z spin via `EngineDraw.cos_z` / `sin_z` (identity if omitted) |
 | Authored `m_Father` / PrefabInstance `m_TransformParent` | World TRS = parent ∘ local; **live** at draw/collider time |
 
@@ -142,8 +149,12 @@ SystemsScene: BouncePad order **-10**, Stick on **Foreground**.
 
 `Screen_width` / `Screen_height` come from Player Settings
 `defaultScreenWidth` / `defaultScreenHeight` (Unity default **1024×768** if
-omitted). `gles2_window.c` opens the GLFW window at that size and titles it
-with `productName`. Scripts may read `Screen.width` / `Screen.height`.
+omitted). `fullscreenMode` **0** (Exclusive) / **1** (FullScreenWindow) sets
+`Screen_fullScreen`; `gles2_window.c` then creates a GLFW window on the primary
+monitor (with `defaultIsNativeResolution`, the desktop video mode size — so the
+window is actually fullscreen, not a decorated 1920×1080 frame). Mode **2**
+sets `Screen_maximized`; mode **3** / omitted stays windowed. The window title
+is `productName`. Scripts may read `Screen.width` / `Screen.height`.
 
 Unity cameras look along **+Z** (identity rotation). `engine_collect_draws`
 keeps a sprite only when

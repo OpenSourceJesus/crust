@@ -134,6 +134,10 @@ _API = {
     ),
     "Mathf.Sin": "static float Mathf_Sin(float f) { return sinf(f); }",
     "Mathf.Cos": "static float Mathf_Cos(float f) { return cosf(f); }",
+    "Mathf.Sign": (
+        "static float Mathf_Sign(float f) {\n"
+        "    if (f < 0.f) return -1.f; if (f > 0.f) return 1.f; return 0.f;\n}"
+    ),
     "Time.deltaTime": None,  # globals in data.c — host can poke
     "Time.time": None,
     "Time.fixedDeltaTime": None,
@@ -207,7 +211,7 @@ _SPAWN = re.compile(
 _VEC3Z = re.compile(r"\.(z)\b|Vector3|Quaternion")
 _UNITY_API = re.compile(
     r"(?:AddComponent\s*<\s*[\w.]+\s*>|"
-    r"(?<![\w])(?:Mathf\.(?:Abs|Min|Max|Clamp|Lerp|Sin|Cos)|"
+    r"(?<![\w])(?:Mathf\.(?:Abs|Min|Max|Clamp|Lerp|Sin|Cos|Sign)|"
     r"Time\.(?:deltaTime|time|fixedDeltaTime)|"
     r"Screen\.(?:width|height)|"
     r"Input\.(?:GetAxis|GetButton|GetKey)|"
@@ -277,7 +281,24 @@ def player_screen(root):
     Missing keys → Unity standalone defaults 1024×768. Values ≤0 are clamped
     to 1 so hosts never create a zero-size window.
     """
+    width, height, _fs, _native, _max = player_display(root)
+    return width, height
+
+
+def player_display(root):
+    """Player Settings display tuple.
+
+    Returns (width, height, fullscreen, native_resolution, maximized).
+
+    fullscreenMode (Unity FullScreenMode):
+      0 ExclusiveFullScreen, 1 FullScreenWindow → fullscreen 1
+      2 MaximizedWindow → maximized 1
+      3 Windowed / omitted → windowed (safe default for pack hosts / CI)
+    defaultIsNativeResolution 1 → fullscreen hosts use the monitor video mode.
+    """
     width, height = 1024, 768
+    fullscreen_mode = 3  # Windowed when unset
+    native = 1
     settings = os.path.join(root, "ProjectSettings", "ProjectSettings.asset")
     if os.path.isfile(settings):
         text = _read(settings)
@@ -287,11 +308,20 @@ def player_screen(root):
         m = re.search(r"(?m)^\s*defaultScreenHeight:\s*(-?\d+)\s*$", text)
         if m:
             height = int(m.group(1))
+        m = re.search(r"(?m)^\s*fullscreenMode:\s*(-?\d+)\s*$", text)
+        if m:
+            fullscreen_mode = int(m.group(1))
+        m = re.search(
+            r"(?m)^\s*defaultIsNativeResolution:\s*(-?\d+)\s*$", text)
+        if m:
+            native = int(m.group(1))
     if width < 1:
         width = 1
     if height < 1:
         height = 1
-    return width, height
+    fullscreen = 1 if fullscreen_mode in (0, 1) else 0
+    maximized = 1 if fullscreen_mode == 2 else 0
+    return width, height, fullscreen, (1 if native else 0), maximized
 
 
 def _load_sorting_layers(root):
@@ -1347,6 +1377,25 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 continue
             val = fm.group(2)
             rec["fields"][key] = float(val) if "." in val else int(val)
+        # Vector2 serialized fields: name: {x: A, y: B}
+        for fm in re.finditer(
+                r"(?m)^\s{2}(\w+):\s+\{x:\s*([^,}]+),\s*y:\s*([^}]+)\}\s*$",
+                block):
+            key = fm.group(1)
+            if key.startswith("m_"):
+                continue
+            rec.setdefault("vec2_fields", {})[key] = (
+                float(fm.group(2)), float(fm.group(3)))
+        # Transform / component object refs: name: {fileID: N}
+        for fm in re.finditer(
+                r"(?m)^\s{2}(\w+):\s+\{fileID:\s*(-?\d+)\}\s*$", block):
+            key = fm.group(1)
+            if key.startswith("m_"):
+                continue
+            fid = fm.group(2)
+            if fid == "0":
+                continue
+            rec.setdefault("object_refs", {})[key] = fid
         if kind == "Light":
             inten = re.search(r"(?m)^\s+m_Intensity:\s*([0-9.eE+-]+)", block)
             col = re.search(
@@ -1654,6 +1703,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         xf = None
         script = None
         fields = {}
+        object_refs = {}
+        vec2_fields = {}
         sprite = None
         ui_image = None
         canvas = None
@@ -1678,6 +1729,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 rot = k["rot"]
             if k.get("kind") == "MonoBehaviour":
                 fields.update(k.get("fields") or {})
+                object_refs.update(k.get("object_refs") or {})
+                vec2_fields.update(k.get("vec2_fields") or {})
                 g = k.get("guid")
                 if g and g in guid_to_script:
                     script = guid_to_script[g]
@@ -1703,6 +1756,10 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 anim = dict(k["animation"])
             if k.get("kind") == "Animator" and k.get("animator"):
                 animator = dict(k["animator"])
+        # Flatten authored Vector2 YAML into _x/_y for packed members.
+        for vk, (vx, vy) in vec2_fields.items():
+            fields[vk + "_x"] = vx
+            fields[vk + "_y"] = vy
         local_pos, local_rot, local_scale = pos, rot, scale
         father_id = xf.get("father_id") if xf else None
         xf_id = xf.get("file_id") if xf else None
@@ -1873,6 +1930,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "father_id": father_id,
             "xf_id": xf_id,
             "fields": fields,
+            "object_refs": object_refs,
             "script": script,
             "class": class_name or go.get("name") or "Obj",
             "sprite": sprite,
@@ -2559,6 +2617,149 @@ def _build_animation_tables(plan):
     }
 
 
+def _resolve_transform_field_targets(plan):
+    """Authored Transform field refs (fileID) → (class_id, inst) per owner.
+
+    Player.graphicsTrs → Graphics Transform fileID → Graphics instance.
+    """
+    class_ids = {n: i for i, n in enumerate(sorted(plan["classes"]))}
+    xf_to = {}
+    for cname, cl in plan["classes"].items():
+        for i, o in enumerate(cl.get("instances") or []):
+            xid = o.get("xf_id")
+            if xid is not None and str(xid) != "0":
+                xf_to[str(xid)] = (cname, i)
+    targets = {}
+    scale_classes = set()
+    for cname, cl in plan["classes"].items():
+        for f in cl.get("fields") or []:
+            if f.get("ty") != "Transform":
+                continue
+            fname = f["name"]
+            row = []
+            for o in cl.get("instances") or []:
+                refs = o.get("object_refs") or {}
+                fid = refs.get(fname)
+                hit = xf_to.get(str(fid)) if fid else None
+                if hit:
+                    tc, ti = hit
+                    row.append((int(class_ids[tc]), int(ti), tc))
+                    scale_classes.add(tc)
+                else:
+                    row.append(None)
+            targets[(cname, fname)] = row
+    plan["transform_field_targets"] = targets
+    live = set(plan.get("live_scale_classes") or [])
+    live |= scale_classes
+    plan["live_scale_classes"] = sorted(live)
+    mutable = set(plan.get("sprite_draw_mutable") or [])
+    mutable |= scale_classes
+    plan["sprite_draw_mutable"] = sorted(mutable)
+
+
+def _match_call_args(text, open_paren):
+    """Index of '(' → (args_str, index_after_closing_paren) or None."""
+    if open_paren >= len(text) or text[open_paren] != "(":
+        return None
+    depth = 1
+    j = open_paren + 1
+    while j < len(text) and depth:
+        c = text[j]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return text[open_paren + 1:j], j + 1
+        j += 1
+    return None
+
+
+def _rewrite_extensions_set_world_scale(text, cl, plan):
+    """Extensions.SetWorldScale + Vector2.SetX/SetZ → _engine_set_world_scale.
+
+    Authored:
+      graphicsTrs.SetWorldScale(multSize.SetX(multSize.x * xSize).SetZ(1));
+    """
+    idn = _c_ident(cl["name"])
+    transform_fields = [
+        f["name"] for f in (cl.get("fields") or [])
+        if f.get("ty") == "Transform"]
+    vec2_fields = set(cl.get("vec2_fields") or [])
+    if not transform_fields:
+        return text
+
+    out = []
+    i = 0
+    while i < len(text):
+        found = None
+        for fname in transform_fields:
+            pat = (r"(?<![_\w])%s\s*\.\s*SetWorldScale\s*\("
+                   % re.escape(fname))
+            m = re.search(pat, text[i:])
+            if not m:
+                continue
+            if found is None or m.start() < found[0]:
+                found = (m.start(), m.end(), fname)
+        if not found:
+            out.append(text[i:])
+            break
+        start_rel, end_rel, fname = found
+        abs_start = i + start_rel
+        abs_open = i + end_rel - 1
+        out.append(text[i:abs_start])
+        matched = _match_call_args(text, abs_open)
+        if not matched:
+            out.append(text[abs_start:abs_open + 1])
+            i = abs_open + 1
+            continue
+        arg, after = matched
+        arg_s = arg.strip()
+        sx = sy = sz = None
+        sx_m = re.match(r"(?s)^(\w+)\s*\.\s*SetX\s*\(", arg_s)
+        if sx_m and sx_m.group(1) in vec2_fields:
+            vname = sx_m.group(1)
+            open_x = sx_m.end() - 1
+            ax = _match_call_args(arg_s, open_x)
+            if ax:
+                sx_arg, after_x = ax
+                rest = arg_s[after_x:]
+                zm = re.match(r"\s*\.\s*SetZ\s*\(", rest)
+                if zm:
+                    open_z = after_x + zm.end() - 1
+                    az = _match_call_args(arg_s, open_z)
+                    if az:
+                        sx = sx_arg.strip()
+                        sy = "%s_get_%s_y(i)" % (idn, vname)
+                        sz = az[0].strip()
+        if sx is None:
+            nm = re.match(r"(?s)^new\s+Vector3\s*\((.*)\)\s*$", arg_s)
+            if nm:
+                parts = _split_call_args(nm.group(1))
+                if len(parts) >= 3:
+                    sx, sy, sz = parts[0], parts[1], parts[2]
+        if sx is None:
+            out.append(text[abs_start:after])
+            i = after
+            continue
+        for vf in vec2_fields:
+            sx = re.sub(r"(?<![_\w])%s\.x\b" % vf,
+                        "%s_get_%s_x(i)" % (idn, vf), sx)
+            sx = re.sub(r"(?<![_\w])%s\.y\b" % vf,
+                        "%s_get_%s_y(i)" % (idn, vf), sx)
+            sz = re.sub(r"(?<![_\w])%s\.x\b" % vf,
+                        "%s_get_%s_x(i)" % (idn, vf), sz)
+            sz = re.sub(r"(?<![_\w])%s\.y\b" % vf,
+                        "%s_get_%s_y(i)" % (idn, vf), sz)
+        out.append(
+            "_engine_set_world_scale("
+            "_%s_%s_target_class[i], (unsigned)_%s_%s_target_inst[i], "
+            "(%s), (%s), (%s))" % (
+                idn, fname, idn, fname, sx, sy, sz))
+        i = after
+    return "".join(out)
+
+
 def _rewrite_rigidbody_assigns(text, plan, this_class):
     """Lower GetComponent<Rigidbody*>().velocity = new VectorN(...);"""
     this_idn = _c_ident(this_class)
@@ -2871,6 +3072,49 @@ def _blank_method_bodies(bscan):
     return "".join(out)
 
 
+def _parse_csharp_field_init(ty, raw):
+    """Script field initializer → Python value, or None if unsupported."""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    if ty == "Vector2":
+        m = re.match(
+            r"new\s+Vector2\s*\(\s*(-?\d+(?:\.\d+)?)\s*[fF]?\s*,\s*"
+            r"(-?\d+(?:\.\d+)?)\s*[fF]?\s*\)",
+            raw)
+        if m:
+            return (float(m.group(1)), float(m.group(2)))
+        return None
+    if ty == "Vector3":
+        m = re.match(
+            r"new\s+Vector3\s*\(\s*(-?\d+(?:\.\d+)?)\s*[fF]?\s*,\s*"
+            r"(-?\d+(?:\.\d+)?)\s*[fF]?\s*,\s*"
+            r"(-?\d+(?:\.\d+)?)\s*[fF]?\s*\)",
+            raw)
+        if m:
+            return (float(m.group(1)), float(m.group(2)), float(m.group(3)))
+        return None
+    if ty == "bool":
+        if raw == "true":
+            return 1
+        if raw == "false":
+            return 0
+        return None
+    if ty in ("float", "double"):
+        m = re.match(
+            r"(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*[fFdD]?", raw)
+        if m:
+            return float(m.group(1))
+        return None
+    if ty in ("int", "byte", "short", "uint", "long", "sbyte",
+              "ushort", "ulong"):
+        m = re.match(r"(-?\d+)", raw)
+        if m:
+            return int(m.group(1))
+        return None
+    return None
+
+
 def _fields_in(body, bscan):
     """Instance fields; methods (those with `(`) are skipped."""
     bscan = _blank_method_bodies(bscan)
@@ -2878,9 +3122,8 @@ def _fields_in(body, bscan):
     for m in re.finditer(
             r"(?m)^[ \t]*(?:public|private|protected|internal)?"
             r"[ \t]*(?:static[ \t]+)?(?:readonly[ \t]+)?"
-            r"([\w.<>]+)[ \t]+(\w+)[ \t]*(?:=|;)",
+            r"([\w.<>]+)[ \t]+(\w+)[ \t]*(=|;)",
             bscan):
-        after = bscan[m.end(2):m.end(2) + 8]
         # `int F(` is a method.
         tail = body[m.end(2):m.end(2) + 16]
         if "(" in tail.split(";")[0] and "=" not in tail.split(";")[0]:
@@ -2888,8 +3131,39 @@ def _fields_in(body, bscan):
         ty, name = m.group(1).strip(), m.group(2)
         if ty in ("if", "for", "return", "new"):
             continue
-        out.append({"ty": ty, "name": name})
+        entry = {"ty": ty, "name": name}
+        # Authored `float xSize = 1;` / `Vector2 multSize = new Vector2(1, 1);`
+        if m.group(0).rstrip().endswith("="):
+            rest = body[m.end():]
+            semi = rest.find(";")
+            if semi >= 0:
+                default = _parse_csharp_field_init(ty, rest[:semi])
+                if default is not None:
+                    entry["default"] = default
+        out.append(entry)
     return out
+
+
+def _member_init_default(cl, member_name):
+    """Script field initializer for a packed member, or None."""
+    for f in cl.get("fields") or []:
+        if "default" not in f:
+            continue
+        if f["name"] == member_name:
+            return f["default"]
+        if f.get("ty") == "Vector2" and isinstance(f["default"], tuple):
+            if member_name == f["name"] + "_x":
+                return f["default"][0]
+            if member_name == f["name"] + "_y":
+                return f["default"][1]
+        if f.get("ty") == "Vector3" and isinstance(f["default"], tuple):
+            if member_name == f["name"] + "_x":
+                return f["default"][0]
+            if member_name == f["name"] + "_y":
+                return f["default"][1]
+            if member_name == f["name"] + "_z":
+                return f["default"][2]
+    return None
 
 
 def _methods_in(body, bscan):
@@ -3013,6 +3287,12 @@ def plan_layouts(objects, analyses, two_d=None):
             field_tys[f["name"]] = f["ty"]
         for o in insts:
             for k in o["fields"]:
+                # Vector2 components are packed via the Vector2 script field.
+                if k.endswith("_x") or k.endswith("_y"):
+                    base = k[:-2]
+                    if any(f["name"] == base and f.get("ty") == "Vector2"
+                           for f in script_fields):
+                        continue
                 field_tys.setdefault(k, "int")
 
         static = (not writes.get(cname, False)) and (not spawn)
@@ -3038,6 +3318,9 @@ def plan_layouts(objects, analyses, two_d=None):
                 continue
             if ty == "Vector3":
                 continue  # transform owns position; full Vector3 fields later
+            if ty == "Transform":
+                # Resolved via object_refs → target class/inst (SetWorldScale).
+                continue
             if ty in ("int", "byte", "short", "uint"):
                 vals = [o["fields"][fname] for o in insts if fname in o["fields"]]
                 if not vals:
@@ -3239,6 +3522,9 @@ def emit_engine(plan, analyses, used_apis):
     if want_log or want_draw_sort:
         p("#include <stdlib.h>")
     if want_log:
+        # Host gcc creates Player.log dirs; crust/shivyc has no errno/sys/stat,
+        # so CRUST_NO_POSIX_MKDIR skips mkdir and fopen falls back to stdout.
+        p("#ifndef CRUST_NO_POSIX_MKDIR")
         p("#include <errno.h>")
         p("#ifdef _WIN32")
         p("#include <direct.h>")
@@ -3246,6 +3532,7 @@ def emit_engine(plan, analyses, used_apis):
         p("#else")
         p("#include <sys/stat.h>")
         p("#define ENGINE_MKDIR(p) mkdir((p), 0755)")
+        p("#endif")
         p("#endif")
     p("")
     p("/* Types first, then every global. C forbids `extern T a[N]` while")
@@ -3263,6 +3550,9 @@ def emit_engine(plan, analyses, used_apis):
         p("extern float Time_fixedDeltaTime;")
     p("extern int Screen_width;")
     p("extern int Screen_height;")
+    p("extern int Screen_fullScreen;")
+    p("extern int Screen_fullScreenNative;")
+    p("extern int Screen_maximized;")
     if want_phys:
         p("extern float Physics2D_gravity_x;")
         p("extern float Physics2D_gravity_y;")
@@ -3415,6 +3705,22 @@ def emit_engine(plan, analyses, used_apis):
         p("extern int _%s_draw_tex[%d];" % (idn, n))
         p("extern float _%s_draw_hw[%d];" % (idn, n))
         p("extern float _%s_draw_hh[%d];" % (idn, n))
+    for cname in sorted(plan.get("live_scale_classes") or []):
+        if cname not in plan["classes"]:
+            continue
+        idn = _c_ident(cname)
+        n = max(1, plan["classes"][cname]["n"])
+        p("extern float _%s_scale_x[%d];" % (idn, n))
+        p("extern float _%s_scale_y[%d];" % (idn, n))
+    # Transform field → target class/inst (SetWorldScale).
+    for (oc, fname), row in sorted(
+            (plan.get("transform_field_targets") or {}).items()):
+        if oc not in plan["classes"]:
+            continue
+        idn = _c_ident(oc)
+        n = max(1, len(row) or 1)
+        p("extern const int _%s_%s_target_class[%d];" % (idn, fname, n))
+        p("extern const int _%s_%s_target_inst[%d];" % (idn, fname, n))
     p("")
 
     # Packed structs (positions omitted when SoA).
@@ -3522,12 +3828,7 @@ def emit_engine(plan, analyses, used_apis):
         p("             a ? a : \"\", b ? b : \"\");")
         p("    return _engine_str_buf;")
         p("}")
-        p("#define _str_plus(a, b) _Generic((b), \\")
-        p("    int: _str_plus_i, \\")
-        p("    float: _str_plus_f, \\")
-        p("    double: _str_plus_f, \\")
-        p("    default: _str_plus_s \\")
-        p(")((a), (b))")
+        p("/* Call sites pick _str_plus_{i,f,s} at rewrite (no C11 generics). */")
         p("")
     if want_log:
         company = plan.get("company_name") or "DefaultCompany"
@@ -3543,6 +3844,7 @@ def emit_engine(plan, analyses, used_apis):
         p("static int _engine_log_opened;")
         p("static char _engine_log_default[1024];")
         p("")
+        p("#ifndef CRUST_NO_POSIX_MKDIR")
         p("static int _engine_mkdir_p(char *path) {")
         p("    char *p;")
         p("    if (!path || !path[0]) return -1;")
@@ -3563,11 +3865,16 @@ def emit_engine(plan, analyses, used_apis):
         p("    if (ENGINE_MKDIR(path) != 0 && errno != EEXIST) return -1;")
         p("    return 0;")
         p("}")
+        p("#endif")
         p("")
         p("static const char *_engine_default_log_path(void) {")
         p("    const char *home;")
+        p("#ifndef CRUST_NO_POSIX_MKDIR")
         p("    char dir[1024];")
         p("    int n, i;")
+        p("#else")
+        p("    int n;")
+        p("#endif")
         p("#ifdef _WIN32")
         p("    home = getenv(\"USERPROFILE\");")
         p("    if (!home || !home[0]) home = \".\";")
@@ -3588,6 +3895,7 @@ def emit_engine(plan, analyses, used_apis):
         p("        home, _engine_company, _engine_product);")
         p("#endif")
         p("    if (n < 0 || (size_t)n >= sizeof _engine_log_default) return 0;")
+        p("#ifndef CRUST_NO_POSIX_MKDIR")
         p("    if ((size_t)n >= sizeof dir) return 0;")
         p("    for (i = 0; i < n; i++) dir[i] = _engine_log_default[i];")
         p("    dir[n] = 0;")
@@ -3599,11 +3907,12 @@ def emit_engine(plan, analyses, used_apis):
         p("#endif")
         p("    }")
         p("    if (dir[0]) _engine_mkdir_p(dir);")
+        p("#endif")
         p("    return _engine_log_default;")
         p("}")
         p("")
         p("void engine_set_log_file(const char *path) {")
-        p("    if (_engine_log_fp && _engine_log_fp != stdout) {")
+        p("    if (_engine_log_fp && !_engine_log_stdout) {")
         p("        fclose(_engine_log_fp);")
         p("        _engine_log_fp = 0;")
         p("    }")
@@ -3634,6 +3943,10 @@ def emit_engine(plan, analyses, used_apis):
         p("        path = _engine_log_override ? _engine_log_override")
         p("                                   : _engine_default_log_path();")
         p("        if (path) _engine_log_fp = fopen(path, \"w\");")
+        p("        if (!_engine_log_fp) {")
+        p("            _engine_log_stdout = 1;")
+        p("            return stdout;")
+        p("        }")
         p("    }")
         p("    return _engine_log_fp;")
         p("}")
@@ -3657,12 +3970,7 @@ def emit_engine(plan, analyses, used_apis):
         p("    fputc('\\n', f);")
         p("    fflush(f);")
         p("}")
-        p("#define Debug_Log(msg) _Generic((msg), \\")
-        p("    float: Debug_Log_f, \\")
-        p("    double: Debug_Log_f, \\")
-        p("    int: Debug_Log_i, \\")
-        p("    default: Debug_Log_s \\")
-        p(")(msg)")
+        p("/* Call sites pick Debug_Log_{i,f,s} at rewrite (no C11 generics). */")
         p("")
     else:
         p("void engine_set_log_file(const char *path) { (void)path; }")
@@ -3677,12 +3985,7 @@ def emit_engine(plan, analyses, used_apis):
         p("static void Console_WriteLine_s(const char *s) {")
         p("    puts(s ? s : \"\");")
         p("}")
-        p("#define Console_WriteLine(msg) _Generic((msg), \\")
-        p("    float: Console_WriteLine_f, \\")
-        p("    double: Console_WriteLine_f, \\")
-        p("    int: Console_WriteLine_i, \\")
-        p("    default: Console_WriteLine_s \\")
-        p(")(msg)")
+        p("/* Call sites pick Console_WriteLine_{i,f,s} at rewrite (no C11 generics). */")
         p("")
     p("void engine_apply_argv(int argc, char **argv) {")
     if want_log:
@@ -4110,6 +4413,30 @@ def emit_engine(plan, analyses, used_apis):
     p("    return s ? -f : f;")
     p("}")
     p("")
+
+    # Extensions.SetWorldScale → live localScale on the referenced Transform's GO.
+    if plan.get("transform_field_targets"):
+        live = set(plan.get("live_scale_classes") or [])
+        p("/* Authored TransformExtensions.SetWorldScale (lossy≈parent∘local). */")
+        p("static void _engine_set_world_scale(int tc, unsigned ti,")
+        p("                                   float sx, float sy, float sz) {")
+        p("    (void)sz;")
+        p("    switch (tc) {")
+        for cname in sorted(live):
+            if cname not in class_ids:
+                continue
+            cid = class_ids[cname]
+            idn = _c_ident(cname)
+            p("    case %d:" % cid)
+            p("        if (ti < (unsigned)_%s_inst_count) {" % idn)
+            p("            _%s_scale_x[ti] = sx;" % idn)
+            p("            _%s_scale_y[ti] = sy;" % idn)
+            p("        }")
+            p("        break;")
+        p("    default: break;")
+        p("    }")
+        p("}")
+        p("")
 
     # Group methods by class; array comment sits on the group.
     methods_by = {}
@@ -4899,6 +5226,7 @@ def emit_engine(plan, analyses, used_apis):
             continue
         any_sprite = True
         use_mut = cname in mutable_spr
+        use_scale = cname in set(plan.get("live_scale_classes") or [])
         p("    { /* %s SpriteRenderer */" % idn)
         p("        static const float _spr_r[] = { %s };" % ", ".join(
             "%sf" % repr(float(sp["r"])) for _i, sp in spr_idx))
@@ -4965,6 +5293,11 @@ def emit_engine(plan, analyses, used_apis):
             p("            out[n].half_w = _spr_hw[k];")
             p("            out[n].half_h = _spr_hh[k];")
             p("            out[n].tex = _spr_tex[k];")
+        if use_scale:
+            p("            out[n].half_w = out[n].half_w * _%s_scale_x[i];"
+              % idn)
+            p("            out[n].half_h = out[n].half_h * _%s_scale_y[i];"
+              % idn)
         p("            out[n].cos_z = _spr_cos[k];")
         p("            out[n].sin_z = _spr_sin[k];")
         p("            out[n].r = _spr_r[k];")
@@ -5058,6 +5391,9 @@ def emit_engine_draw_h():
         "/* Player Settings defaultScreenWidth/Height → Screen.* */\n"
         "extern int Screen_width;\n"
         "extern int Screen_height;\n"
+        "extern int Screen_fullScreen; /* fullscreenMode 0/1 */\n"
+        "extern int Screen_fullScreenNative; /* defaultIsNativeResolution */\n"
+        "extern int Screen_maximized; /* fullscreenMode MaximizedWindow */\n"
         "extern const char engine_product_name[]; /* productName */\n"
         "/* Unity -logFile: default platform Player.log; \"-\" = stdout. */\n"
         "void engine_set_log_file(const char *path);\n"
@@ -5167,9 +5503,9 @@ def _parse_plus_rhs(text, i):
 
 
 def _rewrite_string_concat(text):
-    """Rewrite C# string + value to _str_plus (C pointer + is wrong).
+    """Rewrite C# string + value to typed _str_plus_* (C pointer + is wrong).
 
-    Handles `"lit" + expr` and chains via repeated `_str_plus(...) + expr`.
+    Handles `"lit" + expr` and chains via repeated `_str_plus_*(...) + expr`.
     """
     changed = True
     while changed:
@@ -5179,9 +5515,11 @@ def _rewrite_string_concat(text):
         while i < len(text):
             left = None
             left_end = None
-            if text.startswith("_str_plus(", i):
+            m_plus = re.match(r"_str_plus_[ifs]\(", text[i:])
+            if m_plus or text.startswith("_str_plus(", i):
+                prefix = m_plus.group(0) if m_plus else "_str_plus("
                 depth = 0
-                j = i + len("_str_plus")
+                j = i + len(prefix) - 1
                 while j < len(text):
                     if text[j] == '"':
                         j = _skip_c_string(text, j)
@@ -5208,7 +5546,9 @@ def _rewrite_string_concat(text):
                     rhs_start, rhs_end = _parse_plus_rhs(text, k + 1)
                     rhs = text[rhs_start:rhs_end].strip()
                     if rhs:
-                        out.append("_str_plus(%s, (%s))" % (left, rhs))
+                        kind = _c_expr_scalar_kind(rhs)
+                        out.append("_str_plus_%s(%s, (%s))"
+                                   % (kind, left, rhs))
                         i = rhs_end
                         changed = True
                         continue
@@ -5216,6 +5556,59 @@ def _rewrite_string_concat(text):
             i += 1
         text = "".join(out)
     return text
+
+
+def _c_expr_scalar_kind(expr):
+    """Pick i/f/s suffix for Debug_Log / Console_WriteLine / _str_plus."""
+    e = expr.strip()
+    while (e.startswith("(") and e.endswith(")")
+           and e.count("(") == e.count(")")):
+        inner = e[1:-1].strip()
+        if not inner:
+            break
+        e = inner
+    if (e.startswith('"') or e.startswith("_str_plus")
+            or "ToString" in e or e.startswith("(const char")):
+        return "s"
+    if re.match(r"^-?\d+$", e):
+        return "i"
+    return "f"
+
+
+def _rewrite_typed_call_name(text, name):
+    """Rewrite Name(arg) → Name_{i,f,s}(arg). Skips already-typed Names."""
+    out = []
+    i = 0
+    pat = re.compile(r"(?<![\w])%s(?!_[ifs]\b)\s*\(" % re.escape(name))
+    while True:
+        m = pat.search(text[i:])
+        if not m:
+            out.append(text[i:])
+            break
+        out.append(text[i:i + m.start()])
+        start = i + m.end()
+        depth = 1
+        j = start
+        while j < len(text) and depth:
+            c = text[j]
+            if c == '"':
+                j = _skip_c_string(text, j)
+                continue
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        if depth != 0:
+            out.append(text[i + m.start():])
+            break
+        args = text[start:j]
+        kind = _c_expr_scalar_kind(args)
+        out.append("%s_%s(%s)" % (name, kind, args))
+        i = j + 1
+    return "".join(out)
 
 
 def _strip_debug_log_context_arg(text):
@@ -5323,6 +5716,7 @@ def _lower_method_body(body, cl, plan):
     idn = _c_ident(cl["name"])
     text = _rewrite_csharp_float_literals(body)
     text = re.sub(r"\bthis\.", "", text)
+    text = _rewrite_extensions_set_world_scale(text, cl, plan)
     text = _rewrite_rigidbody_assigns(text, plan, cl["name"])
     # Find/GetComponent before field rewrites so `.amp` stays on the target type.
     text = _rewrite_find_getcomponent(text, plan, cl["name"])
@@ -5376,7 +5770,7 @@ def _lower_method_body(body, cl, plan):
     # Unity Object.ToString when printing a Find result (name, not index).
     text = _wrap_log_gameobject_tostring(text)
     text = _wrap_log_component_tostring(text, add_locals)
-    text = re.sub(r"Mathf\.(Abs|Min|Max|Clamp|Lerp|Sin|Cos)\s*\(",
+    text = re.sub(r"Mathf\.(Abs|Min|Max|Clamp|Lerp|Sin|Cos|Sign)\s*\(",
                   lambda m: "Mathf_%s(" % m.group(1), text)
     text = re.sub(r"transform\.position\.x", idn + "_get_pos_x(i)", text)
     text = re.sub(r"transform\.position\.y", idn + "_get_pos_y(i)", text)
@@ -5437,6 +5831,9 @@ def _lower_method_body(body, cl, plan):
             lambda m: "%s_AT(%s_get_%s(i)).%s" % (
                 oiden, idn, name, m.group(1)),
             text)
+    # Typed Debug_Log / Console_WriteLine — crust has no _Generic.
+    text = _rewrite_typed_call_name(text, "Debug_Log")
+    text = _rewrite_typed_call_name(text, "Console_WriteLine")
     return text
 
 
@@ -5471,6 +5868,11 @@ def emit_data(plan, used_apis=None):
     # Player Settings → Screen.* (hosts use these for window size).
     p("int Screen_width = %d;" % int(plan.get("screen_width") or 1024))
     p("int Screen_height = %d;" % int(plan.get("screen_height") or 768))
+    p("int Screen_fullScreen = %d;" % int(plan.get("screen_fullscreen") or 0))
+    p("int Screen_fullScreenNative = %d;" % int(
+        plan.get("screen_fullscreen_native") if plan.get(
+            "screen_fullscreen_native") is not None else 1))
+    p("int Screen_maximized = %d;" % int(plan.get("screen_maximized") or 0))
     p("const char engine_product_name[] = %s;" % _c_string(
         plan.get("product_name") or "Player"))
     p("")
@@ -5817,6 +6219,47 @@ def emit_data(plan, used_apis=None):
             idn, n, ", ".join("%sf" % repr(v) for v in hws)))
         p("float _%s_draw_hh[%d] = { %s };" % (
             idn, n, ", ".join("%sf" % repr(v) for v in hhs)))
+    # Live localScale for SetWorldScale targets.
+    for cname in sorted(plan.get("live_scale_classes") or []):
+        cl = plan["classes"].get(cname)
+        if not cl:
+            continue
+        idn = _c_ident(cname)
+        n = max(1, cl["n"])
+        sxs, sys = [], []
+        for o in cl["instances"]:
+            ls = o.get("local_scale") or (1.0, 1.0, 1.0)
+            sxs.append(float(ls[0]))
+            sys.append(float(ls[1]))
+        while len(sxs) < n:
+            sxs.append(1.0)
+            sys.append(1.0)
+        p("float _%s_scale_x[%d] = { %s };" % (
+            idn, n, ", ".join("%sf" % repr(v) for v in sxs)))
+        p("float _%s_scale_y[%d] = { %s };" % (
+            idn, n, ", ".join("%sf" % repr(v) for v in sys)))
+    # Transform field targets (graphicsTrs → Graphics, etc.).
+    for (oc, fname), row in sorted(
+            (plan.get("transform_field_targets") or {}).items()):
+        if oc not in plan["classes"]:
+            continue
+        idn = _c_ident(oc)
+        n = max(1, len(row) or plan["classes"][oc]["n"])
+        classes, insts = [], []
+        for hit in row:
+            if hit:
+                classes.append(int(hit[0]))
+                insts.append(int(hit[1]))
+            else:
+                classes.append(-1)
+                insts.append(0)
+        while len(classes) < n:
+            classes.append(-1)
+            insts.append(0)
+        p("const int _%s_%s_target_class[%d] = { %s };" % (
+            idn, fname, n, ", ".join(str(c) for c in classes)))
+        p("const int _%s_%s_target_inst[%d] = { %s };" % (
+            idn, fname, n, ", ".join(str(c) for c in insts)))
     textures = plan.get("textures") or []
     p("const int _engine_tex_count = %d;" % len(textures))
     if textures:
@@ -5883,7 +6326,11 @@ def emit_data(plan, used_apis=None):
                 elif name in o["fields"]:
                     parts.append(_init_num(o["fields"][name], kind))
                 else:
-                    parts.append("0")
+                    dflt = _member_init_default(cl, name)
+                    if dflt is not None:
+                        parts.append(_init_num(dflt, kind))
+                    else:
+                        parts.append("0")
             if not parts:
                 parts = ["0"]
             p("    { %s }, /* %s */" % (", ".join(parts), o["name"]))
@@ -5909,9 +6356,15 @@ def _init_num(v, kind):
 
 
 def emit_makefile(outdir):
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    py = sys.executable
+    # Absolute paths so `make crust-check` works from the outdir.
     return (
         "# generated — engine at -O3, data at -O0; main.c is a headless host\n"
         "CC ?= gcc\n"
+        "CRUST_ROOT ?= %s\n"
+        "CRUST_PY ?= %s\n"
+        "CRUST = $(CRUST_PY) -m shivyc.main --no-cache\n"
         "all: game\n"
         "engine.o: engine.c\n"
         "\t$(CC) -O3 -c -o $@ $<\n"
@@ -5921,8 +6374,18 @@ def emit_makefile(outdir):
         "\t$(CC) -O2 -c -o $@ $<\n"
         "game: engine.o data.o main.o\n"
         "\t$(CC) -O2 -o $@ engine.o data.o main.o -lm\n"
+        "# Compile packed C with crust/shivyc (C++ twins gate at pack time).\n"
+        "crust-check: engine.c data.c main.c engine.cpp data.cpp main.cpp\n"
+        "\tcd $(CRUST_ROOT) && $(CRUST) -c -D CRUST_NO_POSIX_MKDIR "
+        "-o $(CURDIR)/engine.crust.o $(CURDIR)/engine.c\n"
+        "\tcd $(CRUST_ROOT) && $(CRUST) -c -D CRUST_NO_POSIX_MKDIR "
+        "-o $(CURDIR)/data.crust.o $(CURDIR)/data.c\n"
+        "\tcd $(CRUST_ROOT) && $(CRUST) -c "
+        "-o $(CURDIR)/main.crust.o $(CURDIR)/main.c\n"
         "clean:\n"
-        "\trm -f engine.o data.o main.o game\n"
+        "\trm -f engine.o data.o main.o game "
+        "engine.crust.o data.crust.o main.crust.o\n"
+        % (repo, py)
     )
 
 
@@ -6103,22 +6566,60 @@ def emit_soa_positions_glsl(plan):
 
 
 def validate_emitted_c(text, path="engine.c"):
-    """Gate generated C through cpprust's subset checks (same as csrust's C++ half).
+    """Gate generated C through cpprust, then compile the result with crust.
 
     unity_pack lowers by hand; this proves the result still sits inside the
     crust subset that `tools/cpprust.py` accepts — `_check_unsupported` plus
-    a full `translate` pass. The translated text is discarded; only the
-    refusal matters. Raises PackError on subset violations.
+    a full `translate` pass (the csrust C++ half). The translated C is then
+    compiled with `shivyc` so pack fails if crust cannot build it. Raises
+    PackError on subset violations or crust compile failure.
     """
     import tools.cpprust as cpprust
     try:
         scan = cpprust._blank_directives(cpprust._strip_comments(text))
         cpprust._check_unsupported(scan, path)
-        cpprust.translate(text, path=path)
+        translated = cpprust.translate(text, path=path)
     except cpprust.CppError as e:
         raise PackError(
             "emitted %s left the crust / cpprust subset: %s"
             % (path, e.message))
+    _crust_compile_c(translated, path)
+    return translated
+
+
+def _crust_compile_c(text, path, defines=None):
+    """Compile *text* with shivyc/crust; raise PackError on failure."""
+    import shutil
+    import subprocess
+    import tempfile
+    defines = list(defines or ())
+    # Player.log mkdir needs errno/sys/stat — crust's include subset has
+    # neither, so always gate those blocks when compiling through shivyc.
+    if "CRUST_NO_POSIX_MKDIR" not in defines:
+        defines.append("CRUST_NO_POSIX_MKDIR")
+    tmpdir = tempfile.mkdtemp(prefix="upack-crust-")
+    src = os.path.join(tmpdir, "tu.c")
+    obj = os.path.join(tmpdir, "tu.o")
+    try:
+        with open(src, "w") as f:
+            f.write(text)
+        if '#include "engine_draw.h"' in text:
+            with open(os.path.join(tmpdir, "engine_draw.h"), "w") as f:
+                f.write(emit_engine_draw_h())
+        cmd = [sys.executable, "-m", "shivyc.main", "--no-cache", "-c",
+               "-I", tmpdir]
+        for d in defines:
+            cmd.extend(["-D", d])
+        cmd.extend(["-o", obj, src])
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        r = subprocess.run(cmd, capture_output=True, text=True, cwd=repo)
+        if r.returncode != 0:
+            err = (r.stderr or r.stdout or "").strip()
+            raise PackError(
+                "emitted %s failed crust/shivyc compile: %s"
+                % (path, err or ("exit %d" % r.returncode)))
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def pack(root, outdir, soa=False, soa_vec4=False):
@@ -6169,9 +6670,12 @@ def pack(root, outdir, soa=False, soa_vec4=False):
     company, product = player_identity(root)
     plan["company_name"] = company
     plan["product_name"] = product
-    sw, sh = player_screen(root)
+    sw, sh, sfs, snative, smax = player_display(root)
     plan["screen_width"] = sw
     plan["screen_height"] = sh
+    plan["screen_fullscreen"] = sfs
+    plan["screen_fullscreen_native"] = snative
+    plan["screen_maximized"] = smax
     go_names, go_comps = _build_go_tables(plan)
     plan["go_names"] = go_names
     plan["go_components"] = go_comps
@@ -6184,27 +6688,44 @@ def pack(root, outdir, soa=False, soa_vec4=False):
     plan["collider2d"] = _build_collider2d_tables(plan)
     plan["collider3d"] = _build_collider3d_tables(plan)
     plan["animation"] = _build_animation_tables(plan)
+    _resolve_transform_field_targets(plan)
     os.makedirs(outdir, exist_ok=True)
     _progress("emitting engine.c (%d classes)" % len(plan["classes"]))
     engine = emit_engine(plan, analyses, used_apis)
     _progress("emitting data.c (%d texture(s))" % len(plan.get("textures") or []))
     data = emit_data(plan, used_apis)
     main_c = emit_main()
-    _progress("validating engine.c through cpprust")
-    validate_emitted_c(engine, "engine.c")
-    _progress("validating data.c through cpprust")
-    validate_emitted_c(data, "data.c")
-    _progress("validating main.c through cpprust")
-    validate_emitted_c(main_c, "main.c")
+    # C++-subset twins: same text, fed through cpprust then crust (csrust pipe).
+    engine_cpp = (
+        "/* generated by tools/unity_pack.py — C++ subset for cpprust */\n"
+        + (engine.split("\n", 1)[1] if engine.startswith("/*") else engine))
+    data_cpp = (
+        "/* generated by tools/unity_pack.py — C++ subset for cpprust */\n"
+        + (data.split("\n", 1)[1] if data.startswith("/*") else data))
+    main_cpp = (
+        "/* generated by tools/unity_pack.py — C++ subset for cpprust */\n"
+        + (main_c.split("\n", 1)[1] if main_c.startswith("/*") else main_c))
+    _progress("validating engine.c through cpprust + crust")
+    validate_emitted_c(engine_cpp, "engine.cpp")
+    _progress("validating data.c through cpprust + crust")
+    validate_emitted_c(data_cpp, "data.cpp")
+    _progress("validating main.c through cpprust + crust")
+    validate_emitted_c(main_cpp, "main.cpp")
     _progress("writing %s" % outdir)
     with open(os.path.join(outdir, "engine.c"), "w") as f:
         f.write(engine)
     with open(os.path.join(outdir, "data.c"), "w") as f:
         f.write(data)
-    with open(os.path.join(outdir, "engine_draw.h"), "w") as f:
-        f.write(emit_engine_draw_h())
     with open(os.path.join(outdir, "main.c"), "w") as f:
         f.write(main_c)
+    with open(os.path.join(outdir, "engine.cpp"), "w") as f:
+        f.write(engine_cpp)
+    with open(os.path.join(outdir, "data.cpp"), "w") as f:
+        f.write(data_cpp)
+    with open(os.path.join(outdir, "main.cpp"), "w") as f:
+        f.write(main_cpp)
+    with open(os.path.join(outdir, "engine_draw.h"), "w") as f:
+        f.write(emit_engine_draw_h())
     with open(os.path.join(outdir, "Makefile"), "w") as f:
         f.write(emit_makefile(outdir))
     shdir = os.path.join(outdir, "shaders")
@@ -6254,7 +6775,8 @@ def main():
         return 1
     sys.stderr.write(
         "unity_pack: %d classes, 2d=%s, soa=%s, soa_vec4=%s, "
-        "wrote %s/{engine.c,data.c,main.c,engine_draw.h}\n"
+        "wrote %s/{engine.c,data.c,main.c,engine.cpp,data.cpp,main.cpp,"
+        "engine_draw.h}\n"
         % (len(plan["classes"]), plan["two_d"], plan.get("soa"),
            plan.get("soa_vec4"), outdir))
     for name, cl in sorted(plan["classes"].items()):

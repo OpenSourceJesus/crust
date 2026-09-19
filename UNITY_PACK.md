@@ -18,11 +18,17 @@ Unity (and later Godot / Blender) object model, lowered through the
 same discipline as `cs2cpp.py` / `csrust.py`: what is not in the
 subset is refused with a reason.
 
-After emit, `engine.c` / `data.c` / `main.c` are run through
-`cpprust._check_unsupported` and `cpprust.translate` (output discarded).
-If the hand-lowered C leaves the crust subset, pack fails with
-`PackError` naming the file — so you know the generated C stayed
-inside the same gate `csrust` uses for its C++ half.
+After emit, `engine.cpp` / `data.cpp` / `main.cpp` (C++ subset twins of
+the `.c` files) are run through `cpprust._check_unsupported` and
+`cpprust.translate`, then the translated C is compiled with
+`python3 -m shivyc.main` (crust). If the hand-lowered code leaves the
+crust subset or fails to compile, pack fails with `PackError` naming the
+file — so you know the generated C++ and C stayed inside the same gate
+`csrust` uses.
+
+Host builds still use `gcc` via the generated `Makefile`. `make crust-check`
+recompiles the `.c` files with crust (`-D CRUST_NO_POSIX_MKDIR` skips
+`errno.h` / `mkdir`, which crust's include subset does not provide).
 
 ## How a 16-byte object happens
 
@@ -92,7 +98,9 @@ RGBA, tex index), then sorts by TagManager sorting layer and `m_SortingOrder`
 texture alpha in the GLES hosts (`GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA`).
 Windowed hosts (`gles2_window.c`) size the GLFW window from
 Player Settings `defaultScreenWidth` / `defaultScreenHeight` (`Screen_width`
-/ `Screen_height` in `data.c`). The checked-in host
+/ `Screen_height` in `data.c`). `fullscreenMode` 0/1 opens a primary-monitor
+fullscreen window (`Screen_fullScreen`); with `defaultIsNativeResolution` the
+desktop video mode is used so the window fills the display. The checked-in host
 `examples/unity_pack/gles2_view.c` ticks the engine, draws each sprite as
 a textured quad through the same surfaceless EGL/FBO path as
 `examples/gles2/triangle.c`, then prints ASCII (and optional PPM).
