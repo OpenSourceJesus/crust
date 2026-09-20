@@ -46,6 +46,8 @@ action maps / device graphs).
 | `System.Console.WriteLine(msg)` | **stdout** (terminal), not Player.log |
 | `WriteLine` / `Debug.Log` of a `GameObject` | `Object.ToString` → `name (UnityEngine.GameObject)` (missing → `"null"`) |
 | `Application.dataPath` | Packed project `Assets/` absolute path |
+| `Application.persistentDataPath` | Unity company/product save dir (same layout as Player.log’s parent) |
+| Other `Application.*` | Pack-time **CS0117** (`Application` in scope via `using UnityEngine`) |
 | `File.WriteAllText(path, text)` | `fopen` write (`"w"`); creates parent dirs when possible |
 | `File.AppendAllText(path, text)` | `fopen` append (`"a"`); creates parent dirs when possible |
 | Other `File.*` | Pack-time **CS0117** (`File` in scope via `using System.IO`) |
@@ -63,7 +65,10 @@ Not the process cwd. Terminal output needs `-logFile -` or
 `System.Console.WriteLine` (`using System;` or FQN). Optional `Debug.Log`
 context arg ignored. `engine_console_log_path()` mirrors
 `Application.consoleLogPath`. `Application.dataPath` is the project's
-`Assets/` folder (Editor semantics). `Start` runs once before first `Update`.
+`Assets/` folder (Editor semantics). `Application.persistentDataPath` matches
+Unity standalone (Linux `~/.config/unity3d/<company>/<product>`, macOS
+`~/Library/Application Support/...`, Windows `%USERPROFILE%\AppData\LocalLow\...`).
+`Start` runs once before first `Update`.
 
 ## GameObject lookup
 

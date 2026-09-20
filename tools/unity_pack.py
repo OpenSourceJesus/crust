@@ -53,6 +53,9 @@ def _assets_rel_path(path):
 # System.IO.File members we emit. Others → CS0117 (File is in scope via using).
 _FILE_SUPPORTED = frozenset({"WriteAllText", "AppendAllText"})
 
+# UnityEngine.Application members we emit. Others → CS0117.
+_APPLICATION_SUPPORTED = frozenset({"dataPath", "persistentDataPath"})
+
 
 def _check_file_api(path, text, scan):
     """Unsupported File.Member with System.IO in scope → Unity CS0117."""
@@ -71,6 +74,26 @@ def _check_file_api(path, text, scan):
             "%s(%d,%d): error CS0117: 'File' does not contain a definition "
             "for '%s'"
             % (_assets_rel_path(path), line, col, method)
+        )
+
+
+def _check_application_api(path, text, scan):
+    """Unsupported Application.Member with UnityEngine in scope → CS0117."""
+    has_ue = bool(re.search(r"using\s+UnityEngine\b", scan))
+    for m in re.finditer(r"(?:UnityEngine\.)?Application\.(\w+)\b", scan):
+        member = m.group(1)
+        if member in _APPLICATION_SUPPORTED:
+            continue
+        is_fqn = m.group(0).startswith("UnityEngine.")
+        if not is_fqn and not has_ue:
+            continue
+        member_idx = m.start(1)
+        line = text.count("\n", 0, member_idx) + 1
+        col = member_idx - (text.rfind("\n", 0, member_idx) + 1) + 1
+        raise PackError(
+            "%s(%d,%d): error CS0117: 'Application' does not contain a "
+            "definition for '%s'"
+            % (_assets_rel_path(path), line, col, member)
         )
 
 
@@ -108,6 +131,7 @@ def _check_csharp_lex(path, text):
                "+=" if "+=" in m.group(0) else "-=")
         )
     _check_file_api(path, text, scan)
+    _check_application_api(path, text, scan)
 
 
 # Built-in Unity components AddComponent may create at runtime.
@@ -191,6 +215,7 @@ _API = {
     "GetComponent": True,
     # Path to Assets/ (Editor) — baked from the packed project root.
     "Application.dataPath": True,
+    "Application.persistentDataPath": True,
     "File.WriteAllText": True,
     "File.AppendAllText": True,
 }
@@ -252,6 +277,7 @@ _UNITY_API = re.compile(
     r"Time\.(?:deltaTime|time|fixedDeltaTime)|"
     r"Screen\.(?:width|height)|"
     r"Application\.dataPath|"
+    r"Application\.persistentDataPath|"
     r"File\.(?:WriteAllText|AppendAllText)|"
     r"Input\.(?:GetAxis|GetButton|GetKey)|"
     r"RenderSettings\.ambientLight|Camera\.main|"
@@ -427,6 +453,19 @@ def unity_player_log_path(company, product, home=None):
                             "Player.log")
     return os.path.join(home, ".config", "unity3d", company, product,
                         "Player.log")
+
+
+def unity_persistent_data_path(company, product, home=None):
+    """Host path matching Unity's Application.persistentDataPath."""
+    if home is None:
+        home = os.path.expanduser("~")
+    if sys.platform == "darwin":
+        return os.path.join(
+            home, "Library", "Application Support", company, product)
+    if sys.platform.startswith("win"):
+        base = os.environ.get("USERPROFILE") or home
+        return os.path.join(base, "AppData", "LocalLow", company, product)
+    return os.path.join(home, ".config", "unity3d", company, product)
 
 
 def _read(path):
@@ -3627,12 +3666,17 @@ def analyze_script(path, text=None):
         apis.add("print")
     if re.search(r"(?:UnityEngine\.)?Application\.dataPath\b", scan):
         apis.add("Application.dataPath")
+    if re.search(r"(?:UnityEngine\.)?Application\.persistentDataPath\b", scan):
+        apis.add("Application.persistentDataPath")
     if re.search(r"(?:System\.IO\.)?File\.WriteAllText\s*\(", scan):
         apis.add("File.WriteAllText")
     if re.search(r"(?:System\.IO\.)?File\.AppendAllText\s*\(", scan):
         apis.add("File.AppendAllText")
     # C# string + value must not become C pointer arithmetic.
-    if re.search(r'"\s*\+|Application\.dataPath\s*\+', scan):
+    if re.search(
+            r'"\s*\+|'
+            r"Application\.(?:dataPath|persistentDataPath)\s*\+",
+            scan):
         apis.add("string.+")
     has_system = bool(re.search(r"using\s+System\b", scan))
     apis.discard("Console.WriteLine")  # may have matched via _UNITY_API
@@ -3726,7 +3770,7 @@ def _parse_csharp_field_init(ty, raw):
         lit = _string_literal_value(raw)
         if lit is not None:
             return lit
-        # Application.dataPath + "/rel" — resolved at pack time.
+        # Application.dataPath / persistentDataPath + "/rel" — pack-time bake.
         m = re.match(
             r"(?:UnityEngine\.)?Application\.dataPath\s*\+\s*"
             r"(\"([^\"\\]|\\.)*\")\s*$",
@@ -3736,6 +3780,17 @@ def _parse_csharp_field_init(ty, raw):
                 m.group(1))}
         if re.match(r"(?:UnityEngine\.)?Application\.dataPath\s*$", raw):
             return {"kind": "dataPath"}
+        m = re.match(
+            r"(?:UnityEngine\.)?Application\.persistentDataPath\s*\+\s*"
+            r"(\"([^\"\\]|\\.)*\")\s*$",
+            raw)
+        if m:
+            return {"kind": "persistentDataPath+", "suffix":
+                    _string_literal_value(m.group(1))}
+        if re.match(
+                r"(?:UnityEngine\.)?Application\.persistentDataPath\s*$",
+                raw):
+            return {"kind": "persistentDataPath"}
         return None
     if ty == "Vector2":
         m = re.match(
@@ -4208,6 +4263,7 @@ def emit_engine(plan, analyses, used_apis):
     want_find = "GameObject.Find" in used_apis
     want_getcomponent = "GetComponent" in used_apis
     want_data_path = "Application.dataPath" in used_apis
+    want_persistent_data_path = "Application.persistentDataPath" in used_apis
     want_file_write = "File.WriteAllText" in used_apis
     want_file_append = "File.AppendAllText" in used_apis
     want_file_io = want_file_write or want_file_append
@@ -4227,7 +4283,7 @@ def emit_engine(plan, analyses, used_apis):
     if want_math or want_col2d or want_col3d or want_anim:
         p("#include <math.h>")
     if (want_input or want_log or want_find or want_add_any
-            or want_data_path or want_file_io):
+            or want_data_path or want_persistent_data_path or want_file_io):
         p("#include <string.h>")
     if (want_log or want_console or want_str_plus or want_add_any
             or want_file_io):
@@ -4241,7 +4297,8 @@ def emit_engine(plan, analyses, used_apis):
                 break
         if want_draw_sort:
             break
-    if want_log or want_draw_sort or want_data_path or want_file_io:
+    if (want_log or want_draw_sort or want_data_path
+            or want_persistent_data_path or want_file_io):
         p("#include <stdlib.h>")
     if want_log or want_file_io:
         # Host gcc creates dirs; crust/shivyc has no errno/sys/stat,
@@ -4577,6 +4634,18 @@ def emit_engine(plan, analyses, used_apis):
         p("}")
         p("const char *engine_data_path(void) { return _engine_data_path; }")
         p("")
+    if want_persistent_data_path:
+        pp = plan.get("persistent_data_path") or ""
+        p("/* Application.persistentDataPath — Unity company/product save dir */")
+        p("static const char _engine_persistent_data_path[] = %s;"
+          % _c_string(pp))
+        p("static const char *Application_persistentDataPath(void) {")
+        p("    return _engine_persistent_data_path;")
+        p("}")
+        p("const char *engine_persistent_data_path(void) {")
+        p("    return _engine_persistent_data_path;")
+        p("}")
+        p("")
     if want_destroy:
         # Destroy(gameObject) — mark GO; Tick skips destroyed instances.
         go_n = max(1, len(plan.get("go_names") or []))
@@ -4734,6 +4803,9 @@ def emit_engine(plan, analyses, used_apis):
         p("")
     if not want_data_path:
         p("const char *engine_data_path(void) { return \"\"; }")
+        p("")
+    if not want_persistent_data_path:
+        p("const char *engine_persistent_data_path(void) { return \"\"; }")
         p("")
     if want_file_io:
         if not want_log:
@@ -5416,6 +5488,7 @@ def emit_engine(plan, analyses, used_apis):
         p("")
         # Class-level const / static fields (FRAME_CNT, LOG_FILE_PATH, …).
         data_path = plan.get("data_path") or ""
+        persistent_path = plan.get("persistent_data_path") or ""
         for f in cl.get("class_consts") or []:
             fname = f["name"]
             default = f.get("default")
@@ -5424,6 +5497,12 @@ def emit_engine(plan, analyses, used_apis):
                     path = data_path + (default.get("suffix") or "")
                 elif isinstance(default, dict) and default.get("kind") == "dataPath":
                     path = data_path
+                elif (isinstance(default, dict)
+                      and default.get("kind") == "persistentDataPath+"):
+                    path = persistent_path + (default.get("suffix") or "")
+                elif (isinstance(default, dict)
+                      and default.get("kind") == "persistentDataPath"):
+                    path = persistent_path
                 elif isinstance(default, str):
                     path = default
                 else:
@@ -6501,6 +6580,8 @@ def emit_engine_draw_h():
         "void engine_apply_argv(int argc, char **argv);\n"
         "const char *engine_console_log_path(void); /* Application.consoleLogPath */\n"
         "const char *engine_data_path(void); /* Application.dataPath */\n"
+        "const char *engine_persistent_data_path(void); "
+        "/* Application.persistentDataPath */\n"
         "\n"
         "#endif\n"
     )
@@ -6834,6 +6915,9 @@ def _lower_method_body(body, cl, plan):
     text = re.sub(
         r"(?:UnityEngine\.)?Application\.dataPath\b",
         "Application_dataPath()", text)
+    text = re.sub(
+        r"(?:UnityEngine\.)?Application\.persistentDataPath\b",
+        "Application_persistentDataPath()", text)
     text = re.sub(
         r"(?:System\.IO\.)?File\.WriteAllText\s*\(",
         "File_WriteAllText(", text)
@@ -7828,6 +7912,7 @@ def pack(root, outdir, soa=False, soa_vec4=False):
     plan["product_name"] = product
     plan["project_root"] = os.path.abspath(root)
     plan["data_path"] = os.path.join(os.path.abspath(root), "Assets")
+    plan["persistent_data_path"] = unity_persistent_data_path(company, product)
     sw, sh, sfs, snative, smax = player_display(root)
     plan["screen_width"] = sw
     plan["screen_height"] = sh

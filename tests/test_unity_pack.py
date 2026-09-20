@@ -329,6 +329,38 @@ SYSTEMS = os.path.join(ROOT, "examples", "unity_pack", "SystemsScene")
 class TestSystems(unittest.TestCase):
     """Authored systems subset — see UNITY_PACK_SYSTEMS.md."""
 
+    def test_application_unsupported_member_is_cs0117(self):
+        """Unsupported Application members → CS0117 (in scope via UnityEngine)."""
+        src = (
+            "using UnityEngine;\n"
+            "\n"
+            "public class LogAverageFPS : MonoBehaviour {\n"
+            "    static string path =\n"
+            "        Application.streamingAssetsPath + \"/Logs/x.txt\";\n"
+            "}\n"
+        )
+        path = "/proj/Assets/Scripts/LogAverageFPS.cs"
+        with self.assertRaises(unity_pack.PackError) as cm:
+            unity_pack.analyze_script(path, src)
+        self.assertEqual(
+            cm.exception.message,
+            "Assets/Scripts/LogAverageFPS.cs(5,21): error CS0117: "
+            "'Application' does not contain a definition for "
+            "'streamingAssetsPath'")
+        # FQN binds without using; still CS0117.
+        fqn = src.replace("using UnityEngine;\n", "").replace(
+            "Application.streamingAssetsPath",
+            "UnityEngine.Application.streamingAssetsPath")
+        with self.assertRaises(unity_pack.PackError) as cm:
+            unity_pack.analyze_script(path, fqn)
+        self.assertIn("CS0117", cm.exception.message)
+        self.assertIn("streamingAssetsPath", cm.exception.message)
+        # Supported dataPath / persistentDataPath still analyze.
+        unity_pack.analyze_script(
+            path, src.replace("streamingAssetsPath", "dataPath"))
+        unity_pack.analyze_script(
+            path, src.replace("streamingAssetsPath", "persistentDataPath"))
+
     def test_file_unsupported_member_is_cs0117(self):
         """Unsupported File members → CS0117 (File is in scope via System.IO)."""
         src = (
@@ -438,12 +470,12 @@ class TestSystems(unittest.TestCase):
 
     @needs_cc
     def test_application_data_path_and_log_average_fps(self):
-        """Application.dataPath + File.AppendAllText for LogAverageFPS."""
+        """Application.persistentDataPath + File.AppendAllText for LogAverageFPS."""
         path = os.path.join(
             SYSTEMS, "Assets", "Standard Assets", "Scripts",
             "Concepts (Scripts)", "LogAverageFPS.cs")
         a = unity_pack.analyze_script(path)
-        self.assertIn("Application.dataPath", a["apis"])
+        self.assertIn("Application.persistentDataPath", a["apis"])
         self.assertIn("File.AppendAllText", a["apis"])
         self.assertFalse(a["spawns"])
         fields = {f["name"]: f for f in a["classes"][0]["fields"]}
@@ -451,25 +483,29 @@ class TestSystems(unittest.TestCase):
         self.assertEqual(fields["FRAME_CNT"]["default"], 100)
         self.assertTrue(fields["LOG_FILE_PATH"].get("static"))
         self.assertEqual(
-            fields["LOG_FILE_PATH"]["default"]["kind"], "dataPath+")
+            fields["LOG_FILE_PATH"]["default"]["kind"], "persistentDataPath+")
         d = tempfile.mkdtemp(prefix="upack-datapath-")
         plan = unity_pack.pack(SYSTEMS, d)
         # Runtime short counter must hold FRAME_CNT (not a 1-bit phantom 0).
         kinds = {m[0]: m[3]
                  for m in plan["classes"]["LogAverageFPS"]["members"]}
         self.assertEqual(kinds.get("framesLeft"), "u8")
-        expect = os.path.join(os.path.abspath(SYSTEMS), "Assets")
-        self.assertEqual(plan["data_path"], expect)
+        expect_persist = unity_pack.unity_persistent_data_path(
+            plan["company_name"], plan["product_name"])
+        self.assertEqual(plan["persistent_data_path"], expect_persist)
+        log_path = expect_persist + "/Logs/AverageFPS.txt"
         with open(os.path.join(d, "engine.c")) as f:
             eng = f.read()
-        self.assertIn("Application_dataPath", eng)
-        self.assertIn("engine_data_path", eng)
-        self.assertIn(expect + "/Logs/AverageFPS.txt", eng)
+        self.assertIn("Application_persistentDataPath", eng)
+        self.assertIn("engine_persistent_data_path", eng)
+        self.assertIn(log_path, eng)
         self.assertIn("File_AppendAllText", eng)
         self.assertIn("_engine_go_destroyed", eng)
         # Host: tick until AppendAllText runs once; Destroy must stop repeats.
         host = os.path.join(d, "host_fps.c")
-        log_path = expect + "/Logs/AverageFPS.txt"
+        log_dir = os.path.dirname(log_path)
+        if not os.path.isdir(log_dir):
+            os.makedirs(log_dir)
         with open(log_path, "w") as f:
             f.write("seed\n")
         with open(host, "w") as f:

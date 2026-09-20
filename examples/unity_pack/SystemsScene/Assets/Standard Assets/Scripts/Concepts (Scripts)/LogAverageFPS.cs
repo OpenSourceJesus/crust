@@ -4,7 +4,7 @@ using UnityEngine;
 public class LogAverageFPS : MonoBehaviour
 {
 	const short FRAME_CNT = 100;
-	static string LOG_FILE_PATH = Application.dataPath + "/Logs/AverageFPS.txt";
+	static string LOG_FILE_PATH = Application.persistentDataPath + "/AverageFPS.txt";
 	short framesLeft;
 
 	void Start ()
