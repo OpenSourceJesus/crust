@@ -25,7 +25,7 @@ public class Player : MonoBehaviour
 			move --;
 		if (Keyboard.current.rightArrowKey.isPressed)
 			move ++;
-		transform.position += new Vector3(move * moveSpeed * Time.deltaTime, 0);
+		rb.linearVelocity = rb.linearVelocity.SetX(move * moveSpeed);
 		if (move != 0)
 			xSize = Mathf.Sign(move);
 		graphicsTrs.SetWorldScale (multSize.SetX(multSize.x * xSize).SetZ(1));

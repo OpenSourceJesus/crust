@@ -1485,6 +1485,89 @@ class TestSystems(unittest.TestCase):
         self.assertIn("_Collider2D_friction", eng)
         self.assertIn("_phys_mat_combine", eng)
 
+    def test_rigidbody_field_linear_velocity_setx(self):
+        """Serialized Rigidbody2D field + linearVelocity.SetX lowers to vel tables."""
+        d = tempfile.mkdtemp(prefix="upack-rb-lv-")
+        plan = unity_pack.pack(SYSTEMS, d)
+        player = plan["classes"]["Player"]["instances"][0]
+        self.assertEqual(player.get("object_refs", {}).get("rb"), "3006")
+        by_fid = plan.get("rb2d_by_file_id") or {}
+        self.assertIn("3006", by_fid)
+        player_rb = by_fid["3006"]
+        heavy_rb = by_fid["2005"]
+        self.assertNotEqual(player_rb, heavy_rb)
+        with open(os.path.join(d, "data.c")) as f:
+            data = f.read()
+        # Player.rb must index Player's Rigidbody2D, not HeavyBall (0).
+        self.assertRegex(
+            data,
+            r"Player _Player_inst_array\[1\] = \{\s*\{[^}]*\b%d\b" % player_rb)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("Player_get_rb(i)", eng)
+        start = eng.find("static void Player_Update")
+        end = eng.find("\nstatic void ", start + 1)
+        if end < 0:
+            end = eng.find("\nvoid ", start + 1)
+        upd = eng[start:end]
+        self.assertIn("_Rigidbody2D_vel_x[_up_rb]", upd)
+        self.assertNotIn("linearVelocity", upd)
+        self.assertNotIn("SetX", upd)
+
+        # Rigidbody (3D) field + SetY
+        root = tempfile.mkdtemp(prefix="upack-rb3-lv-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Mover.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Mover : MonoBehaviour {\n"
+                "    public Rigidbody rb;\n"
+                "    public float speed;\n"
+                "    void Update() {\n"
+                "        rb.linearVelocity = rb.linearVelocity.SetY(speed);\n"
+                "        rb.velocity = new Vector3(1f, 2f, 3f);\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Mover.cs.meta"), "w") as f:
+            f.write("guid: dddddddddddddddddddddddddddddddd\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Mover\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "  - component: {fileID: 4}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!54 &4\nRigidbody:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Mass: 1\n"
+                "  m_Drag: 0\n"
+                "  m_UseGravity: 1\n"
+                "  m_Velocity: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: dddddddddddddddddddddddddddddddd}\n"
+                "  rb: {fileID: 4}\n"
+                "  speed: 5\n"
+            )
+        d3 = tempfile.mkdtemp(prefix="upack-rb3-lv-out-")
+        plan3 = unity_pack.pack(root, d3)
+        self.assertEqual(len(plan3.get("rigidbody") or []), 1)
+        self.assertEqual(plan3.get("rb3d_by_file_id", {}).get("4"), 0)
+        with open(os.path.join(d3, "engine.c")) as f:
+            eng3 = f.read()
+        self.assertIn("_Rigidbody_vel_y[_up_rb]", eng3)
+        self.assertIn("_Rigidbody_vel_x[_up_rb]", eng3)
+        self.assertIn("Mover_get_rb(i)", eng3)
+        self.assertNotIn(".linearVelocity", eng3)
+
     def test_default_and_authored_physics_materials_3d(self):
         root = tempfile.mkdtemp(prefix="upack-mat3d-")
         mats = os.path.join(root, "Assets", "Mats")

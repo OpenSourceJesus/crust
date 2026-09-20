@@ -2291,8 +2291,10 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 cam = dict(k["camera"])
             if k.get("kind") == "Rigidbody2D" and k.get("rigidbody2d"):
                 rb2d = dict(k["rigidbody2d"])
+                rb2d["file_id"] = k.get("file_id")
             if k.get("kind") == "Rigidbody" and k.get("rigidbody"):
                 rb3d = dict(k["rigidbody"])
+                rb3d["file_id"] = k.get("file_id")
             if k.get("kind") in ("BoxCollider2D", "CircleCollider2D") and k.get(
                     "collider2d"):
                 col2d = dict(k["collider2d"])
@@ -2953,16 +2955,22 @@ def _build_rigidbody_tables(plan):
     rb3d = []
     go_rb2d = {}  # go_name -> rb2d index
     go_rb3d = {}
+    rb2d_by_file_id = {}
+    rb3d_by_file_id = {}
     for cname, cl in sorted(plan["classes"].items()):
         for i, o in enumerate(cl.get("instances") or []):
             n = o.get("name") or "obj"
             r2 = o.get("rigidbody2d")
             if r2:
                 go_rb2d[n] = len(rb2d)
+                fid = r2.get("file_id")
+                if fid is not None and str(fid) != "0":
+                    rb2d_by_file_id[str(fid)] = len(rb2d)
                 rb2d.append({
                     "name": n,
                     "owner_class": cname,
                     "owner_inst": i,
+                    "file_id": fid,
                     "body_type": int(r2.get("body_type") or 0),
                     "mass": float(r2.get("mass") or 1.0),
                     "gravity_scale": float(r2.get("gravity_scale") or 1.0),
@@ -2973,10 +2981,14 @@ def _build_rigidbody_tables(plan):
             r3 = o.get("rigidbody")
             if r3:
                 go_rb3d[n] = len(rb3d)
+                fid = r3.get("file_id")
+                if fid is not None and str(fid) != "0":
+                    rb3d_by_file_id[str(fid)] = len(rb3d)
                 rb3d.append({
                     "name": n,
                     "owner_class": cname,
                     "owner_inst": i,
+                    "file_id": fid,
                     "mass": float(r3.get("mass") or 1.0),
                     "use_gravity": int(r3.get("use_gravity")
                                        if r3.get("use_gravity") is not None
@@ -2986,7 +2998,7 @@ def _build_rigidbody_tables(plan):
                     "vel_y": float(r3.get("vel_y") or 0.0),
                     "vel_z": float(r3.get("vel_z") or 0.0),
                 })
-    return rb2d, rb3d, go_rb2d, go_rb3d
+    return (rb2d, rb3d, go_rb2d, go_rb3d, rb2d_by_file_id, rb3d_by_file_id)
 
 
 def _attach_transform_parents(plan):
@@ -3437,11 +3449,25 @@ def _rewrite_extensions_set_world_scale(text, cl, plan):
 
 
 def _rewrite_rigidbody_assigns(text, plan, this_class):
-    """Lower GetComponent<Rigidbody*>().velocity = new VectorN(...);"""
+    """Lower Rigidbody(2D).linearVelocity / .velocity assigns.
+
+    Supports:
+      GetComponent<Rigidbody2D>().linearVelocity = new Vector2(x, y);
+      rb.linearVelocity = rb.linearVelocity.SetX(expr);
+      rb.linearVelocity = new Vector2(x, y);
+    and Rigidbody / SetY / SetZ / velocity aliases.
+    """
     this_idn = _c_ident(this_class)
     go_this = "_engine_go_of_%s(i)" % this_idn
+    cl = (plan.get("classes") or {}).get(this_class) or {}
+    rb2d_fields = [
+        f["name"] for f in (cl.get("fields") or [])
+        if f.get("ty") == "Rigidbody2D"]
+    rb3d_fields = [
+        f["name"] for f in (cl.get("fields") or [])
+        if f.get("ty") == "Rigidbody"]
 
-    def repl_2d(m):
+    def repl_2d_new(m):
         args = _split_call_args(m.group(1))
         if len(args) < 2:
             return m.group(0)
@@ -3452,7 +3478,7 @@ def _rewrite_rigidbody_assigns(text, plan, this_class):
             % (go_this, args[0], args[1])
         )
 
-    def repl_3d(m):
+    def repl_3d_new(m):
         args = _split_call_args(m.group(1))
         if len(args) < 3:
             return m.group(0)
@@ -3468,12 +3494,143 @@ def _rewrite_rigidbody_assigns(text, plan, this_class):
         r"(?:this\s*\.\s*)?GetComponent\s*<\s*(?:UnityEngine\.)?Rigidbody2D\s*>"
         r"\s*\(\s*\)\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
         r"new\s+Vector2\s*\((.*?)\)\s*;",
-        repl_2d, text, flags=re.S)
+        repl_2d_new, text, flags=re.S)
     text = re.sub(
         r"(?:this\s*\.\s*)?GetComponent\s*<\s*(?:UnityEngine\.)?Rigidbody\s*>"
         r"\s*\(\s*\)\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
         r"new\s+Vector3\s*\((.*?)\)\s*;",
-        repl_3d, text, flags=re.S)
+        repl_3d_new, text, flags=re.S)
+
+    def repl_2d_setx(m):
+        return (
+            "{ int _up_rb = GameObject_GetComponent_Rigidbody2D(%s); "
+            "if (_up_rb >= 0) { _Rigidbody2D_vel_x[_up_rb] = (%s); } }"
+            % (go_this, m.group(1).strip())
+        )
+
+    def repl_2d_sety(m):
+        return (
+            "{ int _up_rb = GameObject_GetComponent_Rigidbody2D(%s); "
+            "if (_up_rb >= 0) { _Rigidbody2D_vel_y[_up_rb] = (%s); } }"
+            % (go_this, m.group(1).strip())
+        )
+
+    text = re.sub(
+        r"(?:this\s*\.\s*)?GetComponent\s*<\s*(?:UnityEngine\.)?Rigidbody2D\s*>"
+        r"\s*\(\s*\)\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
+        r"(?:this\s*\.\s*)?GetComponent\s*<\s*(?:UnityEngine\.)?Rigidbody2D\s*>"
+        r"\s*\(\s*\)\s*\.\s*(?:linearVelocity|velocity)\s*\.\s*SetX\s*\((.*?)\)\s*;",
+        repl_2d_setx, text, flags=re.S)
+    text = re.sub(
+        r"(?:this\s*\.\s*)?GetComponent\s*<\s*(?:UnityEngine\.)?Rigidbody2D\s*>"
+        r"\s*\(\s*\)\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
+        r"(?:this\s*\.\s*)?GetComponent\s*<\s*(?:UnityEngine\.)?Rigidbody2D\s*>"
+        r"\s*\(\s*\)\s*\.\s*(?:linearVelocity|velocity)\s*\.\s*SetY\s*\((.*?)\)\s*;",
+        repl_2d_sety, text, flags=re.S)
+
+    def repl_3d_set(axis):
+        def _repl(m):
+            return (
+                "{ int _up_rb = GameObject_GetComponent_Rigidbody(%s); "
+                "if (_up_rb >= 0) { _Rigidbody_vel_%s[_up_rb] = (%s); } }"
+                % (go_this, axis, m.group(1).strip())
+            )
+        return _repl
+
+    for axis in ("X", "Y", "Z"):
+        text = re.sub(
+            r"(?:this\s*\.\s*)?GetComponent\s*<\s*(?:UnityEngine\.)?Rigidbody\s*>"
+            r"\s*\(\s*\)\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
+            r"(?:this\s*\.\s*)?GetComponent\s*<\s*(?:UnityEngine\.)?Rigidbody\s*>"
+            r"\s*\(\s*\)\s*\.\s*(?:linearVelocity|velocity)\s*\.\s*Set%s\s*\((.*?)\)\s*;"
+            % axis,
+            repl_3d_set(axis.lower()), text, flags=re.S)
+
+    # Field-based: rb.linearVelocity = rb.linearVelocity.SetX(expr);
+    for fname in rb2d_fields:
+        get_rb = "(int)%s_get_%s(i)" % (this_idn, fname)
+
+        def _set_xy(x_expr, y_expr, gr=get_rb):
+            return (
+                "{ int _up_rb = %s; if (_up_rb >= 0) { "
+                "_Rigidbody2D_vel_x[_up_rb] = (%s); "
+                "_Rigidbody2D_vel_y[_up_rb] = (%s); } }"
+                % (gr, x_expr, y_expr)
+            )
+
+        def repl_setx(m, fn=fname, gr=get_rb):
+            # Keep y; set x from SetX arg.
+            return (
+                "{ int _up_rb = %s; if (_up_rb >= 0) { "
+                "_Rigidbody2D_vel_x[_up_rb] = (%s); } }"
+                % (gr, m.group(1).strip())
+            )
+
+        def repl_sety(m, fn=fname, gr=get_rb):
+            return (
+                "{ int _up_rb = %s; if (_up_rb >= 0) { "
+                "_Rigidbody2D_vel_y[_up_rb] = (%s); } }"
+                % (gr, m.group(1).strip())
+            )
+
+        def repl_new2(m, gr=get_rb):
+            args = _split_call_args(m.group(1))
+            if len(args) < 2:
+                return m.group(0)
+            return _set_xy(args[0], args[1], gr)
+
+        text = re.sub(
+            r"(?<![_\w])%s\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
+            r"(?:this\s*\.\s*)?%s\s*\.\s*(?:linearVelocity|velocity)\s*"
+            r"\.\s*SetX\s*\((.*?)\)\s*;"
+            % (re.escape(fname), re.escape(fname)),
+            repl_setx, text, flags=re.S)
+        text = re.sub(
+            r"(?<![_\w])%s\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
+            r"(?:this\s*\.\s*)?%s\s*\.\s*(?:linearVelocity|velocity)\s*"
+            r"\.\s*SetY\s*\((.*?)\)\s*;"
+            % (re.escape(fname), re.escape(fname)),
+            repl_sety, text, flags=re.S)
+        text = re.sub(
+            r"(?<![_\w])%s\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
+            r"new\s+Vector2\s*\((.*?)\)\s*;" % re.escape(fname),
+            repl_new2, text, flags=re.S)
+
+    for fname in rb3d_fields:
+        get_rb = "(int)%s_get_%s(i)" % (this_idn, fname)
+
+        def _axis_set(axis, m, gr=get_rb):
+            return (
+                "{ int _up_rb = %s; if (_up_rb >= 0) { "
+                "_Rigidbody_vel_%s[_up_rb] = (%s); } }"
+                % (gr, axis, m.group(1).strip())
+            )
+
+        def repl_new3(m, gr=get_rb):
+            args = _split_call_args(m.group(1))
+            if len(args) < 3:
+                return m.group(0)
+            return (
+                "{ int _up_rb = %s; if (_up_rb >= 0) { "
+                "_Rigidbody_vel_x[_up_rb] = (%s); "
+                "_Rigidbody_vel_y[_up_rb] = (%s); "
+                "_Rigidbody_vel_z[_up_rb] = (%s); } }"
+                % (gr, args[0], args[1], args[2])
+            )
+
+        for axis in ("X", "Y", "Z"):
+            text = re.sub(
+                r"(?<![_\w])%s\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
+                r"(?:this\s*\.\s*)?%s\s*\.\s*(?:linearVelocity|velocity)\s*"
+                r"\.\s*Set%s\s*\((.*?)\)\s*;"
+                % (re.escape(fname), re.escape(fname), axis),
+                lambda m, ax=axis.lower(): _axis_set(ax, m),
+                text, flags=re.S)
+        text = re.sub(
+            r"(?<![_\w])%s\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
+            r"new\s+Vector3\s*\((.*?)\)\s*;" % re.escape(fname),
+            repl_new3, text, flags=re.S)
+
     return text
 
 
@@ -7565,6 +7722,12 @@ def emit_data(plan, used_apis=None):
                     parts.append(_init_num(sz, kind))
                 elif name in o["fields"]:
                     parts.append(_init_num(o["fields"][name], kind))
+                elif kind == "idx:Rigidbody2D":
+                    parts.append(str(_rb_field_init_index(
+                        plan, o, name, "2d")))
+                elif kind == "idx:Rigidbody":
+                    parts.append(str(_rb_field_init_index(
+                        plan, o, name, "3d")))
                 else:
                     dflt = _member_init_default(cl, name)
                     if dflt is not None:
@@ -7585,6 +7748,25 @@ def emit_data(plan, used_apis=None):
         p("};")
         p("")
     return "\n".join(lines) + "\n"
+
+
+def _rb_field_init_index(plan, o, fname, kind):
+    """Serialized Rigidbody(2D) field → packed table index (-1 if missing)."""
+    refs = o.get("object_refs") or {}
+    fid = refs.get(fname)
+    if kind == "2d":
+        by_fid = plan.get("rb2d_by_file_id") or {}
+        by_go = plan.get("go_rigidbody2d") or {}
+    else:
+        by_fid = plan.get("rb3d_by_file_id") or {}
+        by_go = plan.get("go_rigidbody") or {}
+    if fid is not None and str(fid) != "0" and str(fid) in by_fid:
+        return int(by_fid[str(fid)])
+    # Same-GO self ref when YAML omitted the PPtr target.
+    n = o.get("name") or "obj"
+    if n in by_go:
+        return int(by_go[n])
+    return -1
 
 
 def _init_num(v, kind):
@@ -7924,11 +8106,14 @@ def pack(root, outdir, soa=False, soa_vec4=False):
     plan["go_components"] = go_comps
     plan["go_parents"] = _build_go_parents(plan)
     plan["ui_buttons"] = _build_ui_buttons(plan)
-    rb2d, rb3d, go_rb2d, go_rb3d = _build_rigidbody_tables(plan)
+    rb2d, rb3d, go_rb2d, go_rb3d, rb2d_by_fid, rb3d_by_fid = (
+        _build_rigidbody_tables(plan))
     plan["rigidbody2d"] = rb2d
     plan["rigidbody"] = rb3d
     plan["go_rigidbody2d"] = go_rb2d
     plan["go_rigidbody"] = go_rb3d
+    plan["rb2d_by_file_id"] = rb2d_by_fid
+    plan["rb3d_by_file_id"] = rb3d_by_fid
     _attach_transform_parents(plan)
     plan["collider2d"] = _build_collider2d_tables(plan)
     plan["collider3d"] = _build_collider3d_tables(plan)

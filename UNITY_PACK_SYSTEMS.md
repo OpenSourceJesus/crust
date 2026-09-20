@@ -211,8 +211,9 @@ MonoBehaviours — package scripts are for reference resolution only.
 | Authored `!u!54` Rigidbody | 3D velocity + `useGravity` + **drag**; integrates under `Physics.gravity` |
 | `Physics2D.gravity` | `Physics2D_gravity_x/y` (default `(0, -9.81)`) |
 | `Physics.gravity` | `Physics_gravity_x/y/z` (default `(0, -9.81, 0)`) |
-| `GetComponent<Rigidbody2D>().velocity` / `.gravityScale` / `.linearDamping` | Reads/writes packed RB2D fields |
-| `GetComponent<Rigidbody>().velocity` / `.drag` | Reads/writes packed RB fields |
+| `GetComponent<Rigidbody2D>().velocity` / `.linearVelocity` / `.gravityScale` / `.linearDamping` | Reads/writes packed RB2D fields |
+| `GetComponent<Rigidbody>().velocity` / `.linearVelocity` / `.drag` | Reads/writes packed RB fields |
+| Field `Rigidbody2D rb` / `Rigidbody rb` + `.linearVelocity` / `.velocity` | Scene PPtr → packed RB index; `= ….SetX/Y/Z(…)` and `= new Vector2/3(…)` |
 | `Time.fixedDeltaTime` | Host-pokeable float (default `1/50`) |
 | `FixedUpdate` | Once per `engine_tick`, then `engine_physics_fixed` |
 
