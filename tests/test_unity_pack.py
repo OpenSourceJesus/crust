@@ -329,6 +329,40 @@ SYSTEMS = os.path.join(ROOT, "examples", "unity_pack", "SystemsScene")
 class TestSystems(unittest.TestCase):
     """Authored systems subset — see UNITY_PACK_SYSTEMS.md."""
 
+    def test_file_unsupported_member_is_cs0117(self):
+        """Unsupported File members → CS0117 (File is in scope via System.IO)."""
+        src = (
+            "using System.IO;\n"
+            "using UnityEngine;\n"
+            "\n"
+            "public class LogAverageFPS : MonoBehaviour {\n"
+            "    void Update() {\n"
+            "        File.ReadAllText(\"a.txt\");\n"
+            "    }\n"
+            "}\n"
+        )
+        path = "/proj/Assets/Scripts/LogAverageFPS.cs"
+        with self.assertRaises(unity_pack.PackError) as cm:
+            unity_pack.analyze_script(path, src)
+        self.assertEqual(
+            cm.exception.message,
+            "Assets/Scripts/LogAverageFPS.cs(6,14): error CS0117: 'File' "
+            "does not contain a definition for 'ReadAllText'")
+        # FQN binds without using; still CS0117 for unsupported members.
+        fqn = src.replace("using System.IO;\n", "").replace(
+            "File.ReadAllText", "System.IO.File.ReadAllText")
+        with self.assertRaises(unity_pack.PackError) as cm:
+            unity_pack.analyze_script(path, fqn)
+        self.assertIn("CS0117", cm.exception.message)
+        self.assertIn("ReadAllText", cm.exception.message)
+        # Supported WriteAllText / AppendAllText still analyze.
+        unity_pack.analyze_script(
+            path, src.replace("ReadAllText(\"a.txt\")",
+                              "WriteAllText(\"a.txt\", \"x\")"))
+        unity_pack.analyze_script(
+            path, src.replace("ReadAllText(\"a.txt\")",
+                              "AppendAllText(\"a.txt\", \"x\")"))
+
     def test_cpp_style_float_suffix_is_cs1061(self):
         """C++ `0.f` is not a C# real-literal — csc reports CS1061 on `f`."""
         src = (
@@ -402,6 +436,94 @@ class TestSystems(unittest.TestCase):
         self.assertIn("int sorting_layer;", hdr)
         self.assertIn("int sorting_order;", hdr)
 
+    @needs_cc
+    def test_application_data_path_and_log_average_fps(self):
+        """Application.dataPath + File.AppendAllText for LogAverageFPS."""
+        path = os.path.join(
+            SYSTEMS, "Assets", "Standard Assets", "Scripts",
+            "Concepts (Scripts)", "LogAverageFPS.cs")
+        a = unity_pack.analyze_script(path)
+        self.assertIn("Application.dataPath", a["apis"])
+        self.assertIn("File.AppendAllText", a["apis"])
+        self.assertFalse(a["spawns"])
+        fields = {f["name"]: f for f in a["classes"][0]["fields"]}
+        self.assertTrue(fields["FRAME_CNT"].get("const"))
+        self.assertEqual(fields["FRAME_CNT"]["default"], 100)
+        self.assertTrue(fields["LOG_FILE_PATH"].get("static"))
+        self.assertEqual(
+            fields["LOG_FILE_PATH"]["default"]["kind"], "dataPath+")
+        d = tempfile.mkdtemp(prefix="upack-datapath-")
+        plan = unity_pack.pack(SYSTEMS, d)
+        # Runtime short counter must hold FRAME_CNT (not a 1-bit phantom 0).
+        kinds = {m[0]: m[3]
+                 for m in plan["classes"]["LogAverageFPS"]["members"]}
+        self.assertEqual(kinds.get("framesLeft"), "u8")
+        expect = os.path.join(os.path.abspath(SYSTEMS), "Assets")
+        self.assertEqual(plan["data_path"], expect)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("Application_dataPath", eng)
+        self.assertIn("engine_data_path", eng)
+        self.assertIn(expect + "/Logs/AverageFPS.txt", eng)
+        self.assertIn("File_AppendAllText", eng)
+        self.assertIn("_engine_go_destroyed", eng)
+        # Host: tick until AppendAllText runs once; Destroy must stop repeats.
+        host = os.path.join(d, "host_fps.c")
+        log_path = expect + "/Logs/AverageFPS.txt"
+        with open(log_path, "w") as f:
+            f.write("seed\n")
+        with open(host, "w") as f:
+            f.write(
+                "void engine_tick(void);\n"
+                "extern float Time_deltaTime;\n"
+                "int main(void) {\n"
+                "  int i;\n"
+                "  Time_deltaTime = 0.02f;\n"
+                "  for (i = 0; i < 120; i = i + 1) engine_tick();\n"
+                "  for (i = 0; i < 120; i = i + 1) engine_tick();\n"
+                "  return 0;\n"
+                "}\n"
+            )
+        r = subprocess.run(
+            [_CC, "-O2", "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(
+            [_CC, "-O0", "-c", "-o", os.path.join(d, "data.o"),
+             os.path.join(d, "data.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        exe = os.path.join(d, "host_fps")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host,
+             os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr or r.stdout)
+        self.assertTrue(os.path.isfile(log_path), log_path)
+        with open(log_path) as f:
+            body = f.read()
+        self.assertTrue(body.startswith("seed\nAverage FPS: "), body)
+        self.assertEqual(body.count("Average FPS: "), 1, body)
+        os.remove(log_path)
+
+    def test_package_cache_guid_resolves(self):
+        """UPM PackageCache .meta guids resolve; Assets scripts stay exclusive."""
+        assets = unity_pack._asset_guid_map(SYSTEMS)
+        # Builtin uGUI Image lives under Library/PackageCache.
+        img = "fe87c0e1cc204ed48ad3b37840f39efc"
+        self.assertIn(img, assets)
+        self.assertIn("PackageCache", assets[img])
+        self.assertTrue(assets[img].endswith("Image.cs"))
+        scripts = unity_pack._guid_map(SYSTEMS, asset_guids=assets)
+        self.assertNotIn(img, scripts)
+        # TMP font under Assets still wins.
+        font = "8f586378b4e144a9851e7b34d9b748ee"
+        self.assertIn(font, assets)
+        self.assertIn("Assets", assets[font])
+
     def test_canvas_button_draws_and_clicks(self):
         """Authored Canvas + Button (builtin UISprite) → draw + SetActive onClick."""
         objs, _a, _l, cams = unity_pack.load_project(SYSTEMS)
@@ -420,6 +542,15 @@ class TestSystems(unittest.TestCase):
         hit = btn[0]["ui_hit"]
         self.assertAlmostEqual(hit["ncx"], 0.5, places=5)
         self.assertAlmostEqual(hit["ncy"], 0.5, places=5)
+        txt = [o for o in objs if o["name"] == "Button Text"]
+        self.assertEqual(len(txt), 1)
+        self.assertEqual(txt[0]["ui_tmp"]["text"], "Click me")
+        self.assertTrue(txt[0]["ui_tmp"]["has_font"])
+        self.assertEqual(txt[0]["sprite"].get("source"), "ui_tmp")
+        self.assertGreater(
+            sum(1 for i in range(3, len(txt[0]["sprite"]["tex_rgba"]), 4)
+                if txt[0]["sprite"]["tex_rgba"][i] > 10),
+            50)
         # Centered 115×30 px → world half-extent from Screen + ortho.
         ortho = float(cams[0]["orthographic_size"])
         sw, sh = unity_pack.player_screen(SYSTEMS)
@@ -444,6 +575,9 @@ class TestSystems(unittest.TestCase):
         self.assertIn("_engine_ui_btn_col_h", eng)
         self.assertIn("_spr_ncx", eng)
         self.assertIn("_spr_btn", eng)
+        self.assertIn("/* Button_Text SpriteRenderer */", eng)
+        data_c = open(os.path.join(d, "data.c")).read()
+        self.assertIn("<tmp:Click me>", data_c)
         self.assertIn("float a;", open(os.path.join(d, "engine_draw.h")).read())
         self.assertRegex(eng, r"_spr_a\[\] = \{[^}]*1\.0")
         ub = plan["ui_buttons"][0]
@@ -520,7 +654,11 @@ class TestSystems(unittest.TestCase):
         self.assertNotIn("ParticleSystem.Emit", apis)
         self.assertNotIn("AnimationCurve.Evaluate", apis)
         spr = [o for o in _objs if o.get("sprite")]
-        self.assertEqual(len(spr), 8)  # BouncePad×3, HeavyBall, Wave, Spinner, Button, Graphics
+        self.assertEqual(len(spr), 9)  # + Button Text TMP
+        tmp = [o for o in _objs if o["name"] == "Button Text"]
+        self.assertEqual(len(tmp), 1)
+        self.assertEqual(tmp[0]["ui_tmp"]["text"], "Click me")
+        self.assertTrue(tmp[0]["sprite"].get("tex_rgba"))
         player = [o for o in _objs if o["name"] == "Player"][0]
         self.assertIsNone(player.get("sprite"))
         graphic = [o for o in _objs if o["name"] == "Graphics"][0]
@@ -530,15 +668,74 @@ class TestSystems(unittest.TestCase):
         self.assertAlmostEqual(graphic["local_pos"][1], 0.0)
         self.assertAlmostEqual(graphic["pos"][0], 0.0)
         self.assertAlmostEqual(graphic["pos"][1], 0.0)
+        self.assertEqual(cameras[0]["father_id"], "3002")  # under Player
+        self.assertAlmostEqual(cameras[0]["local_pos"][2], -10.0)
         d = tempfile.mkdtemp(prefix="upack-xf-")
         plan = unity_pack.pack(SYSTEMS, d)
         self.assertTrue(plan.get("has_transform_parents"))
+        self.assertTrue(plan.get("camera_follows_parent"))
+        self.assertEqual(plan["camera"].get("xf_parent_class"), "Player")
         g_inst = plan["classes"]["Graphics"]["instances"][0]
         self.assertEqual(g_inst.get("xf_parent_class"), "Player")
         with open(os.path.join(d, "engine.c")) as f:
             eng = f.read()
         self.assertIn("_engine_world_pos", eng)
         self.assertIn("_Graphics_xf_parent_class", eng)
+        self.assertIn("_engine_sync_camera_main", eng)
+        self.assertIn("Camera_main_local_z", eng)
+
+    @needs_cc
+    def test_main_camera_follows_player_parent(self):
+        """Main Camera under Player: Camera_main_pos tracks Player world."""
+        d = tempfile.mkdtemp(prefix="upack-camfollow-")
+        unity_pack.pack(SYSTEMS, d)
+        host = os.path.join(d, "host_cam.c")
+        with open(host, "w") as f:
+            f.write(
+                "typedef struct { float x, y, half_w, half_h;\n"
+                "                 float cos_z, sin_z;\n"
+                "                 float r, g, b; float a; int tex;\n"
+                "                 int sorting_layer; int sorting_order;\n"
+                "               } EngineDraw;\n"
+                "int engine_collect_draws(EngineDraw *out, int max);\n"
+                "typedef struct Player Player;\n"
+                "struct Player { float pos_x; float pos_y; float pos_z; };\n"
+                "extern Player _Player_inst_array[];\n"
+                "extern float Camera_main_pos_x;\n"
+                "extern float Camera_main_pos_y;\n"
+                "extern float Camera_main_pos_z;\n"
+                "int main(void) {\n"
+                "  EngineDraw buf[4];\n"
+                "  _Player_inst_array[0].pos_x = 3.f;\n"
+                "  _Player_inst_array[0].pos_y = 4.f;\n"
+                "  engine_collect_draws(buf, 4);\n"
+                "  if (Camera_main_pos_x < 2.9f || Camera_main_pos_x > 3.1f)\n"
+                "    return 1;\n"
+                "  if (Camera_main_pos_y < 3.9f || Camera_main_pos_y > 4.1f)\n"
+                "    return 2;\n"
+                "  if (Camera_main_pos_z < -10.1f || Camera_main_pos_z > -9.9f)\n"
+                "    return 3;\n"
+                "  return 0;\n"
+                "}\n"
+            )
+        r = subprocess.run(
+            [_CC, "-O2", "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(
+            [_CC, "-O0", "-c", "-o", os.path.join(d, "data.o"),
+             os.path.join(d, "data.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        exe = os.path.join(d, "host_cam")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host,
+             os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr or r.stdout)
 
     def test_prefab_m_transform_parent_composes_world(self):
         """PrefabInstance.m_TransformParent parents stripped Transforms."""
@@ -1052,7 +1249,7 @@ class TestSystems(unittest.TestCase):
                 "  if (_Spinner_inst_array[0].pos_y < 0.4f) return 4;\n"
                 "  EngineDraw buf[64];\n"
                 "  int n = engine_collect_draws(buf, 64);\n"
-                "  if (n != 8) return 5;\n"
+                "  if (n != 9) return 5;\n"
                 "  { int j; int found = 0;\n"
                 "    for (j = 0; j < n; j = j + 1)\n"
                 "      if (buf[j].x > 1.9f && buf[j].x < 2.1f\n"
@@ -1947,7 +2144,7 @@ class TestSystemsRuns(unittest.TestCase):
                 "  if (_Ball_inst_array[0].pos_y >= y0) return 3;\n"
                 "  if (_Player_inst_array[0].pos_x <= x0) return 4;\n"
                 "  if (_Light_intensity[0] < 1.4f) return 5;\n"
-                "  if (n != 8) return 6; /* SpriteRenderers + uGUI Button */\n"
+                "  if (n != 9) return 6; /* SpriteRenderers + Button + TMP */\n"
                 "  /* Ground top ≈ -2.25; ball radius ≈ 0.225 → rest y ≳ -2.05 */\n"
                 "  if (_Ball_inst_array[0].pos_y < -2.1f) return 8;\n"
                 "  if (_Wave_inst_array[0].pos_x < 1.99f\n"
@@ -1965,23 +2162,27 @@ class TestSystemsRuns(unittest.TestCase):
                 "  if (buf[0].sorting_order != -10) return 13;\n"
                 "  if (buf[n - 1].sorting_layer != 1) return 14;\n"
                 "  if (buf[n - 1].a < 0.99f)\n"
-                "    return 15; /* Button Image m_Color.a = 1 */\n"
-                "  /* Hover center → ColorBlock highlighted (~0.784). */\n"
+                "    return 15; /* TMP / Button alpha */\n"
+                "  /* Hover center → ColorBlock highlighted (~0.784) on Image. */\n"
                 "  engine_pointer_x = 960.f;\n"
                 "  engine_pointer_y = 540.f;\n"
                 "  engine_pointer_down = 0;\n"
                 "  engine_tick();\n"
                 "  n = engine_collect_draws(buf, 128);\n"
-                "  if (n != 8) return 21;\n"
-                "  if (buf[n - 1].r > 0.85f || buf[n - 1].r < 0.7f)\n"
-                "    return 22; /* highlighted tint */\n"
-                "  /* Click Button center → SetActive(false) → one fewer draw. */\n"
+                "  if (n != 9) return 21;\n"
+                "  { int j; int found = 0;\n"
+                "    for (j = 0; j < n; j = j + 1)\n"
+                "      if (buf[j].r > 0.7f && buf[j].r < 0.85f\n"
+                "          && buf[j].a > 0.99f) found = 1;\n"
+                "    if (!found) return 22; /* highlighted Image tint */\n"
+                "  }\n"
+                "  /* Click Button → SetActive(false) hides Image + TMP child. */\n"
                 "  engine_pointer_x = 960.f;\n"
                 "  engine_pointer_y = 540.f;\n"
                 "  engine_pointer_down = 1;\n"
                 "  engine_tick();\n"
                 "  n = engine_collect_draws(buf, 128);\n"
-                "  if (n != 7) return 19; /* Button hidden */\n"
+                "  if (n != 7) return 19; /* Button + Text hidden */\n"
                 "  /* Child under Player follows parent world position (m_Father). */\n"
                 "  {\n"
                 "    float px = _Player_inst_array[0].pos_x;\n"
@@ -2047,13 +2248,14 @@ class TestSystemsRuns(unittest.TestCase):
                 "int main(void) {\n"
                 "  EngineDraw buf[128];\n"
                 "  int n0 = engine_collect_draws(buf, 128);\n"
-                "  if (n0 != 8) return 1;\n"
+                "  if (n0 != 9) return 1;\n"
                 "  Camera_main_pos_z = 10.f;\n"
                 "  int n1 = engine_collect_draws(buf, 128);\n"
-                "  if (n1 != 0) return 2;\n"
+                "  /* Screen-space UI ignores world depth cull. */\n"
+                "  if (n1 != 2) return 2;\n"
                 "  Camera_main_pos_z = -10.f;\n"
                 "  int n2 = engine_collect_draws(buf, 128);\n"
-                "  if (n2 != 8) return 3;\n"
+                "  if (n2 != 9) return 3;\n"
                 "  return 0;\n"
                 "}\n"
             )
