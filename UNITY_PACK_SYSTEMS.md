@@ -6,8 +6,8 @@ pools, no default AnimationCurves, no scripted UI invent, no InputAction maps.
 Runtime `AddComponent<T>()` works for packed builtins (Camera, Light,
 SpriteRenderer, Rigidbody/2D, Box/Circle/Sphere colliders, Animation,
 Animator) and for authored MonoBehaviours — GetOrAdd into a pre-sized pool
-(one spare slot per calling instance). Authored scene Canvas + Image/Button with a
-sprite are drawn; scripted `UnityEngine.UI` stays refused. Scripts that need
+(one spare slot per calling instance). Authored scene Canvas + Image/Button/TextMeshProUGUI
+are drawn; scripted `UnityEngine.UI` stays refused. Scripts that need
 other Unity features keep them in the authored project until the packer can
 import them; calling
 invent-requiring APIs today is a hard `PackError`.
@@ -45,6 +45,10 @@ action maps / device graphs).
 | `-logFile path` / `-logFile -` | `engine_apply_argv` → file or **stdout** |
 | `System.Console.WriteLine(msg)` | **stdout** (terminal), not Player.log |
 | `WriteLine` / `Debug.Log` of a `GameObject` | `Object.ToString` → `name (UnityEngine.GameObject)` (missing → `"null"`) |
+| `Application.dataPath` | Packed project `Assets/` absolute path |
+| `File.WriteAllText(path, text)` | `fopen` write (`"w"`); creates parent dirs when possible |
+| `File.AppendAllText(path, text)` | `fopen` append (`"a"`); creates parent dirs when possible |
+| Other `File.*` | Pack-time **CS0117** (`File` in scope via `using System.IO`) |
 
 Default log path matches Unity standalone (from `ProjectSettings`
 `companyName` / `productName`, else `DefaultCompany` / project folder):
@@ -58,7 +62,8 @@ Default log path matches Unity standalone (from `ProjectSettings`
 Not the process cwd. Terminal output needs `-logFile -` or
 `System.Console.WriteLine` (`using System;` or FQN). Optional `Debug.Log`
 context arg ignored. `engine_console_log_path()` mirrors
-`Application.consoleLogPath`. `Start` runs once before first `Update`.
+`Application.consoleLogPath`. `Application.dataPath` is the project's
+`Assets/` folder (Editor semantics). `Start` runs once before first `Update`.
 
 ## GameObject lookup
 
@@ -117,9 +122,10 @@ slot (intensity 1, white) into the light table.
 | Script / scene uses | Emitted |
 |---------------------|---------|
 | Authored `!u!20` Camera (MainCamera) | `Camera_main_pos_*` (incl. **z**), `orthographicSize`, near/far clip, background RGB |
+| Camera `m_Father` under a packed body | Live: `_engine_sync_camera_main` → `parent_world + local` each tick/draw |
 | `Camera.main.orthographicSize` / `.transform.position` / clip planes | Reads those globals |
 | Authored `!u!212` SpriteRenderer with `m_Sprite` → **project PNG** | Texture + tinted quad in `engine_collect_draws` |
-| Authored `!u!223` Canvas + uGUI Image / Button | Screen-space quad; builtin UISprite → white tint |
+| Authored `!u!223` Canvas + uGUI Image / Button / TMP | Screen-space quad; builtin UISprite → white tint; TMP SDF bake |
 | `m_SortingLayerID` / `m_SortingOrder` (+ TagManager layers) | Draws sorted back-to-front (layer index, then order) |
 | `ProjectSettings` `defaultScreenWidth` / `Height` | `Screen_width` / `Screen_height` (GLFW window size) |
 | `ProjectSettings` `fullscreenMode` 0/1 | `Screen_fullScreen` — GLES host uses primary monitor |
@@ -139,8 +145,8 @@ World size follows Unity:
 **local** position when parented to another packed body; `engine_collect_draws`
 (and collider centers) compose `parent_world + local` each frame so a parent
 `Rigidbody2D` / scripted motion carries children (Unity hierarchy). Objects with
-their own Rigidbody stay independent. UI Images whose Canvas is not a packed
-body keep baked world `pos`.
+their own Rigidbody stay independent. UI under a Canvas uses hierarchical
+RectTransform bake (Canvas root = screen).
 
 `engine_collect_draws` sorts by TagManager `m_SortingLayers` index (from
 `m_SortingLayerID`), then `m_SortingOrder` — lower draws first (behind).
@@ -175,13 +181,22 @@ camera background; they do not invent class-hash coloured quads.
 
 Authored `!u!223` Canvas (Screen Space Overlay / Camera) + uGUI `Image`
 or `Button` (with Image) draw via RectTransform size mapped into the
-main ortho camera. Unity builtin UISprites (`guid` in
+main ortho camera. Nested RectTransforms (e.g. Button → label) use the
+parent pixel rect. Unity builtin UISprites (`guid` in
 `unity_builtin_extra`) become a 1×1 white texel tinted by `m_Color`.
-Button `m_OnClick` persistent `SetActive` calls fire on host pointer
-press (`engine_pointer_x/y/down`, screen space, origin bottom-left).
-Canvas sorting layer/order apply to child Images/Buttons.
-EventSystem / GraphicRaycaster / TextMeshPro are not imported. Scripted
+Authored `TextMeshProUGUI` draws when `m_fontAsset` resolves (Assets or
+Packages / PackageCache): SDF atlas + glyph tables bake `m_text` into a
+UI sprite tinted by `m_fontColor`. Button `m_OnClick` persistent
+`SetActive` calls fire on host pointer press (`engine_pointer_x/y/down`,
+screen space, origin bottom-left); inactive parents hide children
+(`activeInHierarchy`). Canvas sorting layer/order apply to child
+Images/Buttons; TMP sorts one order above its Canvas. EventSystem /
+GraphicRaycaster / legacy `UI.Text` are not imported. Scripted
 `UnityEngine.UI` / `AddComponent<Canvas>` remain refused (no invent).
+
+Asset GUIDs resolve under `Assets/`, `Packages/`, and
+`Library/PackageCache/` (UPM). Only `Assets/**/*.cs` become packed
+MonoBehaviours — package scripts are for reference resolution only.
 
 ## Physics (Rigidbody / Rigidbody2D + FixedUpdate)
 
