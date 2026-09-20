@@ -570,6 +570,16 @@ class TestSystems(unittest.TestCase):
         self.assertEqual(sp.get("source"), "ui")
         self.assertTrue(sp.get("builtin"))
         self.assertEqual(sp.get("tex_path"), "<builtin:UISprite>")
+        self.assertEqual(btn[0]["ui_image"].get("image_type"), 1)  # Sliced
+        # Sliced UISprite bakes to the RectTransform size (not 1×1 white).
+        self.assertEqual(sp.get("tex_w"), 115)
+        self.assertEqual(sp.get("tex_h"), 30)
+        self.assertEqual(sp.get("border"), (6, 6, 6, 6))
+        # Outside corner is nearly transparent; center is opaque white.
+        rgba = sp["tex_rgba"]
+        self.assertLess(rgba[3], 32)  # bottom-left outside corner
+        cx = (15 * 115 + 57) * 4
+        self.assertGreater(rgba[cx + 3], 200)
         self.assertIsNotNone(btn[0].get("ui_button"))
         self.assertEqual(btn[0]["ui_button"]["onclick"][0]["method"], "SetActive")
         cols = btn[0]["ui_button"]["colors"]
@@ -583,10 +593,14 @@ class TestSystems(unittest.TestCase):
         self.assertEqual(txt[0]["ui_tmp"]["text"], "Click me")
         self.assertTrue(txt[0]["ui_tmp"]["has_font"])
         self.assertEqual(txt[0]["sprite"].get("source"), "ui_tmp")
+        trgba = txt[0]["sprite"]["tex_rgba"]
         self.assertGreater(
-            sum(1 for i in range(3, len(txt[0]["sprite"]["tex_rgba"]), 4)
-                if txt[0]["sprite"]["tex_rgba"][i] > 10),
-            50)
+            sum(1 for i in range(3, len(trgba), 4) if trgba[i] > 10),
+            200)
+        # Glyph bake must look like text, not atlas scrap: opaque pixels
+        # span most of the label width.
+        xs = [i // 4 % 115 for i in range(3, len(trgba), 4) if trgba[i] > 128]
+        self.assertGreater(max(xs) - min(xs), 60)
         # Centered 115×30 px → world half-extent from Screen + ortho.
         ortho = float(cams[0]["orthographic_size"])
         sw, sh = unity_pack.player_screen(SYSTEMS)

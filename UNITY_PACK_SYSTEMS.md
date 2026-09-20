@@ -130,7 +130,7 @@ slot (intensity 1, white) into the light table.
 | Camera `m_Father` under a packed body | Live: `_engine_sync_camera_main` → `parent_world + local` each tick/draw |
 | `Camera.main.orthographicSize` / `.transform.position` / clip planes | Reads those globals |
 | Authored `!u!212` SpriteRenderer with `m_Sprite` → **project PNG** | Texture + tinted quad in `engine_collect_draws` |
-| Authored `!u!223` Canvas + uGUI Image / Button / TMP | Screen-space quad; builtin UISprite → white tint; TMP SDF bake |
+| Authored `!u!223` Canvas + uGUI Image / Button / TMP | Screen-space quad; UISprite Sliced 9-slice bake; TMP SDF bake |
 | `m_SortingLayerID` / `m_SortingOrder` (+ TagManager layers) | Draws sorted back-to-front (layer index, then order) |
 | `ProjectSettings` `defaultScreenWidth` / `Height` | `Screen_width` / `Screen_height` (GLFW window size) |
 | `ProjectSettings` `fullscreenMode` 0/1 | `Screen_fullScreen` — GLES host uses primary monitor |
@@ -188,16 +188,18 @@ Authored `!u!223` Canvas (Screen Space Overlay / Camera) + uGUI `Image`
 or `Button` (with Image) draw via RectTransform size mapped into the
 main ortho camera. Nested RectTransforms (e.g. Button → label) use the
 parent pixel rect. Unity builtin UISprites (`guid` in
-`unity_builtin_extra`) become a 1×1 white texel tinted by `m_Color`.
-Authored `TextMeshProUGUI` draws when `m_fontAsset` resolves (Assets or
-Packages / PackageCache): SDF atlas + glyph tables bake `m_text` into a
-UI sprite tinted by `m_fontColor`. Button `m_OnClick` persistent
-`SetActive` calls fire on host pointer press (`engine_pointer_x/y/down`,
-screen space, origin bottom-left); inactive parents hide children
-(`activeInHierarchy`). Canvas sorting layer/order apply to child
-Images/Buttons; TMP sorts one order above its Canvas. EventSystem /
-GraphicRaycaster / legacy `UI.Text` are not imported. Scripted
-`UnityEngine.UI` / `AddComponent<Canvas>` remain refused (no invent).
+`unity_builtin_extra`) bake a rounded white sprite; `Image.type = Sliced`
+9-slices with fixed corner borders (Simple stretches). Authored project
+PNG UI sprites use `.meta` `spriteBorder` the same way. Authored
+`TextMeshProUGUI` draws when `m_fontAsset` resolves (Assets or Packages /
+PackageCache): SDF atlas + glyph tables bake `m_text` into a UI sprite
+tinted by `m_fontColor`. Button `m_OnClick` persistent `SetActive` calls
+fire on host pointer press (`engine_pointer_x/y/down`, screen space, origin
+bottom-left); inactive parents hide children (`activeInHierarchy`). Canvas
+sorting layer/order apply to child Images/Buttons; TMP sorts one order
+above its Canvas. EventSystem / GraphicRaycaster / legacy `UI.Text` are
+not imported. Scripted `UnityEngine.UI` / `AddComponent<Canvas>` remain
+refused (no invent).
 
 Asset GUIDs resolve under `Assets/`, `Packages/`, and
 `Library/PackageCache/` (UPM). Only `Assets/**/*.cs` become packed

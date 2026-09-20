@@ -1434,11 +1434,8 @@ def _load_tmp_font_asset(path):
     except ValueError:
         _TMP_FONT_CACHE[abspath] = None
         return None
-    # Unity Texture2D rows are top-first; flip to bottom-first like PNGs.
-    rows = [atlas[y * atlas_w:(y + 1) * atlas_w]
-            for y in range(atlas_h)]
-    rows.reverse()
-    atlas = b"".join(rows)
+    # Keep Texture2D row order (top-first). GlyphRect.y is from the top of
+    # the atlas in TextCore / TMP font assets.
     chars = {}
     for m in re.finditer(
             r"m_Unicode:\s*(\d+)\s*\n\s+m_GlyphIndex:\s*(\d+)", text):
@@ -1540,7 +1537,9 @@ def _rasterize_tmp_text(font, text, font_size, color, box_w, box_h,
         gy1 = baseline + float(g["by"]) * scale  # top
         gy0 = gy1 - gh  # bottom
         rx, ry, rw, rh = int(g["rx"]), int(g["ry"]), int(g["rw"]), int(g["rh"])
-        # GlyphRect Y is from the bottom of the atlas (Unity TextCore).
+        # GlyphRect Y is from the top of the (top-first) atlas. Empirically
+        # TMP SDF glyphs sample with v increasing toward the bottom of the
+        # rect (matches LiberationSans SDF packing).
         for py in range(int(math.floor(gy0)), int(math.ceil(gy1))):
             if py < 0 or py >= bh:
                 continue
@@ -1572,14 +1571,180 @@ def _rasterize_tmp_text(font, text, font_size, color, box_w, box_h,
     return bw, bh, bytes(out)
 
 
+# Unity builtin UISprite (UI/Skin/UISprite.psd): ~32×32 white rounded rect.
+# Border matches the corner radius so Image.type=Sliced keeps fixed corners.
+_UISPRITE_SIZE = 32
+_UISPRITE_RADIUS = 6  # matches Unity UISprite corner / border scale
+
+
+def _builtin_uisprite():
+    """Generate Unity-like UISprite RGBA (y=0 bottom) + 9-slice border LBRT."""
+    s = _UISPRITE_SIZE
+    r = float(_UISPRITE_RADIUS)
+    rgba = bytearray(s * s * 4)
+    for y in range(s):
+        # Atlas math in top-first space, then store bottom-first.
+        yt = (s - 1 - y) + 0.5
+        for x in range(s):
+            xt = x + 0.5
+            # Distance outside rounded rect (0 inside).
+            cx = min(max(xt, r), s - r)
+            cy = min(max(yt, r), s - r)
+            dx = xt - cx
+            dy = yt - cy
+            dist = math.sqrt(dx * dx + dy * dy) - r
+            # 1px AA fringe.
+            if dist <= -0.5:
+                a = 1.0
+            elif dist >= 0.5:
+                a = 0.0
+            else:
+                a = 0.5 - dist
+            if a <= 0.0:
+                continue
+            o = (y * s + x) * 4
+            v = int(min(255, round(a * 255.0)))
+            rgba[o] = rgba[o + 1] = rgba[o + 2] = 255
+            rgba[o + 3] = v
+    border = (_UISPRITE_RADIUS,) * 4  # left, bottom, right, top
+    return s, s, bytes(rgba), border
+
+
+def _sample_rgba(tex, tw, th, u, v):
+    """Bilinear sample RGBA texture (y=0 bottom); u/v in [0,1]."""
+    if tw < 1 or th < 1:
+        return (0, 0, 0, 0)
+    x = max(0.0, min(float(tw) - 1.0, u * (tw - 1)))
+    y = max(0.0, min(float(th) - 1.0, v * (th - 1)))
+    x0 = int(math.floor(x))
+    y0 = int(math.floor(y))
+    x1 = min(x0 + 1, tw - 1)
+    y1 = min(y0 + 1, th - 1)
+    fx = x - x0
+    fy = y - y0
+
+    def _px(ix, iy):
+        o = (iy * tw + ix) * 4
+        return (tex[o], tex[o + 1], tex[o + 2], tex[o + 3])
+
+    c00 = _px(x0, y0)
+    c10 = _px(x1, y0)
+    c01 = _px(x0, y1)
+    c11 = _px(x1, y1)
+    out = []
+    for i in range(4):
+        top = c00[i] * (1 - fx) + c10[i] * fx
+        bot = c01[i] * (1 - fx) + c11[i] * fx
+        out.append(int(round(top * (1 - fy) + bot * fy)))
+    return tuple(out)
+
+
+def _nine_slice_map(pos, size, border0, border1, src0, src1, src_size):
+    """Map destination pixel coordinate → source [0,1] along one axis.
+
+    border0/border1 are dest border sizes; src0/src1 are source border pixels.
+    """
+    if size <= 1e-6:
+        return 0.5
+    # Corners: fixed; edges/center: stretch.
+    if pos < border0 and border0 > 1e-6 and src0 > 0:
+        return (pos / border0) * (src0 / float(src_size))
+    if pos >= size - border1 and border1 > 1e-6 and src1 > 0:
+        t = (pos - (size - border1)) / border1
+        return ((src_size - src1) + t * src1) / float(src_size)
+    # Middle
+    mid_dst = size - border0 - border1
+    mid_src = src_size - src0 - src1
+    if mid_dst <= 1e-6 or mid_src <= 0:
+        return (src0 + mid_src * 0.5) / float(src_size)
+    t = (pos - border0) / mid_dst
+    return (src0 + t * mid_src) / float(src_size)
+
+
+def _bake_sliced_rgba(src, sw, sh, border, dst_w, dst_h, ppu_mul=1.0):
+    """9-slice bake source sprite into dst_w×dst_h (y=0 bottom).
+
+    border is (left, bottom, right, top) in source pixels. ppu_mul is
+    Image.m_PixelsPerUnitMultiplier (Unity shrinks borders when > 1).
+    """
+    dw = max(1, int(round(float(dst_w))))
+    dh = max(1, int(round(float(dst_h))))
+    mul = float(ppu_mul) if ppu_mul and float(ppu_mul) > 1e-6 else 1.0
+    bl = max(0.0, float(border[0]) / mul)
+    bb = max(0.0, float(border[1]) / mul)
+    br = max(0.0, float(border[2]) / mul)
+    bt = max(0.0, float(border[3]) / mul)
+    # Dest borders clamp so corners never exceed half the rect.
+    dbl = min(bl, dw * 0.5)
+    dbr = min(br, dw * 0.5)
+    dbb = min(bb, dh * 0.5)
+    dbt = min(bt, dh * 0.5)
+    if dbl + dbr > dw:
+        s = dw / (dbl + dbr) if (dbl + dbr) > 0 else 0.0
+        dbl *= s
+        dbr *= s
+    if dbb + dbt > dh:
+        s = dh / (dbb + dbt) if (dbb + dbt) > 0 else 0.0
+        dbb *= s
+        dbt *= s
+    out = bytearray(dw * dh * 4)
+    for y in range(dh):
+        # y is bottom-first; map with bottom border first.
+        v = _nine_slice_map(y + 0.5, dh, dbb, dbt, bb, bt, sh)
+        for x in range(dw):
+            u = _nine_slice_map(x + 0.5, dw, dbl, dbr, bl, br, sw)
+            r, g, b, a = _sample_rgba(src, sw, sh, u, v)
+            o = (y * dw + x) * 4
+            out[o] = r
+            out[o + 1] = g
+            out[o + 2] = b
+            out[o + 3] = a
+    return dw, dh, bytes(out)
+
+
+def _bake_stretched_rgba(src, sw, sh, dst_w, dst_h):
+    """Stretch source into dst (Simple Image.type)."""
+    dw = max(1, int(round(float(dst_w))))
+    dh = max(1, int(round(float(dst_h))))
+    out = bytearray(dw * dh * 4)
+    for y in range(dh):
+        v = (y + 0.5) / float(dh)
+        for x in range(dw):
+            u = (x + 0.5) / float(dw)
+            r, g, b, a = _sample_rgba(src, sw, sh, u, v)
+            o = (y * dw + x) * 4
+            out[o] = r
+            out[o + 1] = g
+            out[o + 2] = b
+            out[o + 3] = a
+    return dw, dh, bytes(out)
+
+
+def _sprite_border_from_meta(path):
+    """PNG .meta spriteBorder {x,y,z,w} → (left, bottom, right, top)."""
+    meta = path + ".meta"
+    if not os.path.isfile(meta):
+        return (0.0, 0.0, 0.0, 0.0)
+    text = _read(meta)
+    m = re.search(
+        r"spriteBorder:\s*\{x:\s*([^,}]+),\s*y:\s*([^,}]+),"
+        r"\s*z:\s*([^,}]+),\s*w:\s*([^}]+)\}",
+        text)
+    if not m:
+        return (0.0, 0.0, 0.0, 0.0)
+    return (float(m.group(1)), float(m.group(2)),
+            float(m.group(3)), float(m.group(4)))
+
+
 def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None):
     """Resolve authored uGUI Image / TextMeshProUGUI → world sprites.
 
     Screen Space Overlay (0) and Screen Space Camera (1): map canvas pixels to
     the main ortho camera frustum. World Space (2) is not supported yet.
-    Project PNG sprites and Unity builtin UISprites (solid white tinted by
-    m_Color) draw; empty m_Sprite is skipped (no invent). TMP needs an
-    authored font asset (Assets or Packages) with atlas + glyph tables.
+    Project PNG sprites and Unity builtin UISprites draw; Image.type Sliced
+    9-slices with sprite borders (UISprite corners stay fixed). Empty m_Sprite
+    is skipped (no invent). TMP needs an authored font asset with atlas +
+    glyph tables.
     """
     by_xf = {}
     for o in objects:
@@ -1607,6 +1772,7 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None):
     px_h = world_h / float(sh)
     rect_cache = {}
     asset_guids = asset_guids or {}
+    png_cache = {}
 
     def _find_canvas(o):
         canvas = None
@@ -1679,18 +1845,47 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None):
             continue
         cx, cy, rw, rh = _ui_screen_rect(o, by_xf, sw, sh, rect_cache)
         builtin = bool(ui.get("builtin"))
+        img_type = int(ui.get("image_type") or 0)
+        ppu_mul = float(ui.get("pixels_per_unit_multiplier") or 1.0)
         extra = {
             "builtin": builtin,
             "sprite_file_id": int(ui.get("sprite_file_id") or 0),
             "sprite_guid": ("builtin:uisprite" if builtin
                             else ui.get("sprite_guid")),
+            "image_type": img_type,
         }
         if builtin:
-            extra["tex_path"] = "<builtin:UISprite>"
-            extra["tex_w"] = 1
-            extra["tex_h"] = 1
-            extra["tex_rgba"] = bytes([255, 255, 255, 255])
-            extra["pixels_per_unit"] = 100.0
+            src_w, src_h, src_rgba, border = _builtin_uisprite()
+            tex_path = "<builtin:UISprite>"
+        else:
+            path = asset_guids.get(ui.get("sprite_guid") or "")
+            if not path or not path.lower().endswith(".png"):
+                continue
+            if path not in png_cache:
+                try:
+                    png_cache[path] = _load_png_rgba(path)
+                except Exception:
+                    png_cache[path] = None
+            loaded = png_cache[path]
+            if not loaded:
+                continue
+            src_w, src_h, src_rgba = loaded
+            border = _sprite_border_from_meta(path)
+            tex_path = path
+        # Sliced (1): 9-slice. Simple (0) / other: stretch to rect.
+        # Bake to rect size so one textured quad matches uGUI mesh.
+        if img_type == 1 and any(b > 0 for b in border):
+            tw, th, rgba = _bake_sliced_rgba(
+                src_rgba, src_w, src_h, border, rw, rh, ppu_mul)
+        else:
+            tw, th, rgba = _bake_stretched_rgba(
+                src_rgba, src_w, src_h, rw, rh)
+        extra["tex_path"] = tex_path
+        extra["tex_w"] = tw
+        extra["tex_h"] = th
+        extra["tex_rgba"] = rgba
+        extra["pixels_per_unit"] = 100.0
+        extra["border"] = border
         _apply_layout(
             o, cx, cy, rw, rh, canvas, "ui",
             (ui.get("r", 1.0), ui.get("g", 1.0),
@@ -2009,6 +2204,10 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                     r"m_Sprite:\s*\{fileID:\s*(-?\d+)(?:,\s*guid:\s*"
                     r"([0-9a-fA-F]+))?",
                     block)
+                itype = re.search(r"(?m)^\s+m_Type:\s*(\d+)", block)
+                ppum = re.search(
+                    r"(?m)^\s+m_PixelsPerUnitMultiplier:\s*([0-9.eE+-]+)",
+                    block)
                 has_sprite = False
                 builtin = False
                 sg = None
@@ -2033,6 +2232,10 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                     "builtin": builtin,
                     "sprite_file_id": fid,
                     "sprite_guid": sg,
+                    # 0 Simple, 1 Sliced, 2 Tiled, 3 Filled
+                    "image_type": int(itype.group(1)) if itype else 0,
+                    "pixels_per_unit_multiplier": (
+                        float(ppum.group(1)) if ppum else 1.0),
                 }
             elif _is_ui_button_mb(block, g):
                 rec["ui_button"] = _parse_ui_button(block)
