@@ -257,6 +257,7 @@ Only **authored** Rigidbody components start packed; `AddComponent<Rigidbody>` /
 | Authored `!u!135` SphereCollider | Radius (× max scale); AABB contacts |
 | `m_IsTrigger: 1` | Parsed but skipped for solid resolution |
 | Dynamic Rigidbody(2D) + collider | Separates along MTV; friction + bounce from materials |
+| Dynamic vs dynamic (vertical) | Lower body treated as support so stacks do not drive through static floors |
 | `OnCollisionEnter2D` / `Stay2D` / `Exit2D` | After `engine_physics_collide2d`; `Collision2D` handle; `ToString` → `"UnityEngine.Collision2D"` |
 
 ### Physics materials
