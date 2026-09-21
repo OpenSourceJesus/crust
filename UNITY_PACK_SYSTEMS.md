@@ -45,7 +45,9 @@ action maps / device graphs).
 | `-logFile path` / `-logFile -` | `engine_apply_argv` → file or **stdout** |
 | `System.Console.WriteLine(msg)` | **stdout** (terminal), not Player.log |
 | `WriteLine` / `Debug.Log` of a `GameObject` | `Object.ToString` → `name (UnityEngine.GameObject)` (missing → `"null"`) |
-| `Application.dataPath` | Packed project `Assets/` absolute path |
+| `Application.dataPath` | Packed project `Assets/` absolute path (**Awake/Start only**) |
+| `Application.persistentDataPath` | Unity company/product save dir (**Awake/Start only**) |
+| Other `Application.*` | Pack-time **CS0117** (`Application` in scope via `using UnityEngine`) |
 | `File.WriteAllText(path, text)` | `fopen` write (`"w"`); creates parent dirs when possible |
 | `File.AppendAllText(path, text)` | `fopen` append (`"a"`); creates parent dirs when possible |
 | Other `File.*` | Pack-time **CS0117** (`File` in scope via `using System.IO`) |
@@ -63,7 +65,13 @@ Not the process cwd. Terminal output needs `-logFile -` or
 `System.Console.WriteLine` (`using System;` or FQN). Optional `Debug.Log`
 context arg ignored. `engine_console_log_path()` mirrors
 `Application.consoleLogPath`. `Application.dataPath` is the project's
-`Assets/` folder (Editor semantics). `Start` runs once before first `Update`.
+`Assets/` folder (Editor semantics). `Application.persistentDataPath` matches
+Unity standalone (Linux `~/.config/unity3d/<company>/<product>`, macOS
+`~/Library/Application Support/...`, Windows `%USERPROFILE%\AppData\LocalLow\...`).
+Calling either from a MonoBehaviour field initializer / `.cctor` raises
+Unity's `UnityException` / `TypeInitializationException` every frame and
+**does not** run that script's `Start`/`Update` (same as Unity).
+`Start` runs once before first `Update`.
 
 ## GameObject lookup
 
@@ -71,13 +79,17 @@ context arg ignored. `engine_console_log_path()` mirrors
 |-------------|---------|
 | `GameObject.Find(name)` | Runtime `strcmp` on authored GO name table → index or **-1** |
 | `Object.ToString` (via printing a Find result) | `name (UnityEngine.GameObject)`; missing → `"null"` |
-| `.GetComponent<T>()` | Instance index of authored `T` on that GO, or **-1** |
-| `Find(...).GetComponent<T>().field` | Runtime Find + GetComponent; missing → default `0` / `0.f` |
+| `.GetComponent<T>()` on a null GO | **NullReferenceException** with `Class.Method () (at path:line)`; method exits (Unity) |
+| `.GetComponent<T>()` on a live GO | Instance index of authored `T`, or **-1** if absent |
+| `Find(...).GetComponent<T>().field` | NRE if Find missed or component/field receiver is null |
 
 Parsed with cpprust `_match_paren` / `_match_angle` (same AST helpers
 csrust uses). Find **does not** fail at pack time for unknown names —
-lookup is runtime only (Unity null). `GetComponent<T>` still requires `T`
-to be an authored packed MonoBehaviour (no invented component types).
+lookup is runtime only (Unity null). Calling a method or reading a field on
+that null is a `NullReferenceException` (logged with script site); `setjmp`
+unwinds the current `Start`/`Update` so the player keeps running. `GetComponent<T>`
+still requires `T` to be an authored packed MonoBehaviour (no invented
+component types).
 
 ## Animation (script motion + authored clips)
 
@@ -125,12 +137,13 @@ slot (intensity 1, white) into the light table.
 | Camera `m_Father` under a packed body | Live: `_engine_sync_camera_main` → `parent_world + local` each tick/draw |
 | `Camera.main.orthographicSize` / `.transform.position` / clip planes | Reads those globals |
 | Authored `!u!212` SpriteRenderer with `m_Sprite` → **project PNG** | Texture + tinted quad in `engine_collect_draws` |
-| Authored `!u!223` Canvas + uGUI Image / Button / TMP | Screen-space quad; builtin UISprite → white tint; TMP SDF bake |
+| Authored `!u!223` Canvas + uGUI Image / Button / TMP | Screen-space quad; UISprite Sliced 9-slice bake; TMP SDF bake |
 | `m_SortingLayerID` / `m_SortingOrder` (+ TagManager layers) | Draws sorted back-to-front (layer index, then order) |
 | `ProjectSettings` `defaultScreenWidth` / `Height` | `Screen_width` / `Screen_height` (GLFW window size) |
 | `ProjectSettings` `fullscreenMode` 0/1 | `Screen_fullScreen` — GLES host uses primary monitor |
 | `defaultIsNativeResolution` | `Screen_fullScreenNative` — desktop video mode size when FS |
-| Authored `m_LocalRotation` on Transform | Z spin via `EngineDraw.cos_z` / `sin_z` (identity if omitted) |
+| Authored `m_LocalRotation` on Transform | XY basis `EngineDraw.m00..m11` (ortho drop Z) |
+| `transform.Rotate` (euler / `Vector3.axis * deg`, Space.Self) | Live local quat + `rot_m00..m11` in draws |
 | Authored `m_Father` / PrefabInstance `m_TransformParent` | World TRS = parent ∘ local; **live** at draw/collider time |
 
 PNG pixels are packed into `data.c` (`engine_texture_rgba`). Editing the
@@ -140,8 +153,12 @@ referenced sprite and re-packing changes the drawn texels. Tint comes from
 World size follows Unity:
 `(texels / spritePixelsToUnits) * Transform.scale` (half-extents in
 `engine_collect_draws`). `spritePixelsToUnits` is read from the PNG `.meta`
-(default **100**). Sprite quads are rotated in the XY plane from
-`m_LocalRotation` (quaternion → angle of local +X). Child transforms keep
+(default **100**). Sprite quads use the local XY→world XY basis from
+`m_LocalRotation` (`EngineDraw.m00..m11`; orthographic drop of Z). Pure Z
+spin matches the old cos/sin path; X/Y tilt foreshortens the projected
+extents. Scripts that call `transform.Rotate` keep a live local quaternion
+(`_Class_rot_*`) and refresh that basis each call (Space.Self; degrees).
+Child transforms keep
 **local** position when parented to another packed body; `engine_collect_draws`
 (and collider centers) compose `parent_world + local` each frame so a parent
 `Rigidbody2D` / scripted motion carries children (Unity hierarchy). Objects with
@@ -183,16 +200,18 @@ Authored `!u!223` Canvas (Screen Space Overlay / Camera) + uGUI `Image`
 or `Button` (with Image) draw via RectTransform size mapped into the
 main ortho camera. Nested RectTransforms (e.g. Button → label) use the
 parent pixel rect. Unity builtin UISprites (`guid` in
-`unity_builtin_extra`) become a 1×1 white texel tinted by `m_Color`.
-Authored `TextMeshProUGUI` draws when `m_fontAsset` resolves (Assets or
-Packages / PackageCache): SDF atlas + glyph tables bake `m_text` into a
-UI sprite tinted by `m_fontColor`. Button `m_OnClick` persistent
-`SetActive` calls fire on host pointer press (`engine_pointer_x/y/down`,
-screen space, origin bottom-left); inactive parents hide children
-(`activeInHierarchy`). Canvas sorting layer/order apply to child
-Images/Buttons; TMP sorts one order above its Canvas. EventSystem /
-GraphicRaycaster / legacy `UI.Text` are not imported. Scripted
-`UnityEngine.UI` / `AddComponent<Canvas>` remain refused (no invent).
+`unity_builtin_extra`) bake a rounded white sprite; `Image.type = Sliced`
+9-slices with fixed corner borders (Simple stretches). Authored project
+PNG UI sprites use `.meta` `spriteBorder` the same way. Authored
+`TextMeshProUGUI` draws when `m_fontAsset` resolves (Assets or Packages /
+PackageCache): SDF atlas + glyph tables bake `m_text` into a UI sprite
+tinted by `m_fontColor`. Button `m_OnClick` persistent `SetActive` calls
+fire on host pointer press (`engine_pointer_x/y/down`, screen space, origin
+bottom-left); inactive parents hide children (`activeInHierarchy`). Canvas
+sorting layer/order apply to child Images/Buttons; TMP sorts one order
+above its Canvas. EventSystem / GraphicRaycaster / legacy `UI.Text` are
+not imported. Scripted `UnityEngine.UI` / `AddComponent<Canvas>` remain
+refused (no invent).
 
 Asset GUIDs resolve under `Assets/`, `Packages/`, and
 `Library/PackageCache/` (UPM). Only `Assets/**/*.cs` become packed
@@ -206,10 +225,11 @@ MonoBehaviours — package scripts are for reference resolution only.
 | Authored `!u!54` Rigidbody | 3D velocity + `useGravity` + **drag**; integrates under `Physics.gravity` |
 | `Physics2D.gravity` | `Physics2D_gravity_x/y` (default `(0, -9.81)`) |
 | `Physics.gravity` | `Physics_gravity_x/y/z` (default `(0, -9.81, 0)`) |
-| `GetComponent<Rigidbody2D>().velocity` / `.gravityScale` / `.linearDamping` | Reads/writes packed RB2D fields |
-| `GetComponent<Rigidbody>().velocity` / `.drag` | Reads/writes packed RB fields |
+| `GetComponent<Rigidbody2D>().velocity` / `.linearVelocity` / `.gravityScale` / `.linearDamping` | Reads/writes packed RB2D fields |
+| `GetComponent<Rigidbody>().velocity` / `.linearVelocity` / `.drag` | Reads/writes packed RB fields |
+| Field `Rigidbody2D rb` / `Rigidbody rb` + `.linearVelocity` / `.velocity` | Scene PPtr → packed RB index; `= ….SetX/Y/Z(…)` and `= new Vector2/3(…)` |
 | `Time.fixedDeltaTime` | Host-pokeable float (default `1/50`) |
-| `FixedUpdate` | Once per `engine_tick`, then `engine_physics_fixed` |
+| `FixedUpdate` | Accumulator in `engine_tick`: zero or more steps of `fixedDeltaTime` per frame (Unity), then `engine_physics_fixed` each step |
 
 Linear damping uses Box2D’s factor `clamp(1 − damping · Δt, 0, 1)` on velocity
 after gravity (same as Unity Physics2D). Authored `m_LinearDamping` /
@@ -272,8 +292,11 @@ Pool budget is one slot per instance of each class that calls `AddComponent<T>`
 
 ```
 Time_time += Time_deltaTime   // if Time.time used
-foreach class: FixedUpdate    // if present
-engine_physics_fixed()        // authored Rigidbody / Rigidbody2D + collide
+fixed_accum += min(Time_deltaTime, maximumDeltaTime≈1/3)
+while fixed_accum >= Time_fixedDeltaTime:
+    foreach class: FixedUpdate    // if present
+    engine_physics_fixed()        // authored Rigidbody / Rigidbody2D + collide
+    fixed_accum -= Time_fixedDeltaTime
 foreach class: Update
 ```
 

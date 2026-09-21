@@ -138,7 +138,7 @@ static void emit_vert(int *ni, float x, float y, float r, float g, float b,
 static void emit_quad(int *ni, const EngineDraw *d)
 {
     float hw = d->half_w, hh = d->half_h;
-    float c = d->cos_z, s = d->sin_z;
+    float m00 = d->m00, m01 = d->m01, m10 = d->m10, m11 = d->m11;
     float r = d->r, g = d->g, b = d->b, a = d->a;
     float lx[4] = {-hw, hw, -hw, hw};
     float ly[4] = {-hh, -hh, hh, hh};
@@ -148,8 +148,8 @@ static void emit_quad(int *ni, const EngineDraw *d)
     int i;
 
     for (i = 0; i < 4; i = i + 1) {
-        float wx = d->x + c * lx[i] - s * ly[i];
-        float wy = d->y + s * lx[i] + c * ly[i];
+        float wx = d->x + m00 * lx[i] + m01 * ly[i];
+        float wy = d->y + m10 * lx[i] + m11 * ly[i];
         nx[i] = world_to_ndc_x(wx);
         ny[i] = world_to_ndc_y(wy);
     }

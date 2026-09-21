@@ -15,7 +15,8 @@ public class Player : MonoBehaviour
 	void Start ()
 	{
 		Debug.Log("Hello World!");
-		System.Console.WriteLine(GameObject.Find("BouncePad").GetComponent<Bouncer>().amp);
+		System.Console.WriteLine(GameObject.Find("Bouncer").GetComponent<Bouncer>().amp);
+		print("End of Player.Start()");
 	}
 
 	void Update ()
@@ -25,7 +26,7 @@ public class Player : MonoBehaviour
 			move --;
 		if (Keyboard.current.rightArrowKey.isPressed)
 			move ++;
-		transform.position += new Vector3(move * moveSpeed * Time.deltaTime, 0);
+		rb.linearVelocity = rb.linearVelocity.SetX(move * moveSpeed);
 		if (move != 0)
 			xSize = Mathf.Sign(move);
 		graphicsTrs.SetWorldScale (multSize.SetX(multSize.x * xSize).SetZ(1));

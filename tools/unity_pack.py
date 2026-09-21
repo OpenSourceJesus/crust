@@ -53,6 +53,13 @@ def _assets_rel_path(path):
 # System.IO.File members we emit. Others → CS0117 (File is in scope via using).
 _FILE_SUPPORTED = frozenset({"WriteAllText", "AppendAllText"})
 
+# UnityEngine.Application members we emit. Others → CS0117.
+_APPLICATION_SUPPORTED = frozenset({"dataPath", "persistentDataPath"})
+
+# MonoBehaviour.transform members we lower. Others → CS1061 on Transform
+# (transform itself is always in scope; blame the missing member).
+_TRANSFORM_SUPPORTED = frozenset({"position", "Rotate"})
+
 
 def _check_file_api(path, text, scan):
     """Unsupported File.Member with System.IO in scope → Unity CS0117."""
@@ -71,6 +78,49 @@ def _check_file_api(path, text, scan):
             "%s(%d,%d): error CS0117: 'File' does not contain a definition "
             "for '%s'"
             % (_assets_rel_path(path), line, col, method)
+        )
+
+
+def _check_application_api(path, text, scan):
+    """Unsupported Application.Member with UnityEngine in scope → CS0117."""
+    has_ue = bool(re.search(r"using\s+UnityEngine\b", scan))
+    for m in re.finditer(r"(?:UnityEngine\.)?Application\.(\w+)\b", scan):
+        member = m.group(1)
+        if member in _APPLICATION_SUPPORTED:
+            continue
+        is_fqn = m.group(0).startswith("UnityEngine.")
+        if not is_fqn and not has_ue:
+            continue
+        member_idx = m.start(1)
+        line = text.count("\n", 0, member_idx) + 1
+        col = member_idx - (text.rfind("\n", 0, member_idx) + 1) + 1
+        raise PackError(
+            "%s(%d,%d): error CS0117: 'Application' does not contain a "
+            "definition for '%s'"
+            % (_assets_rel_path(path), line, col, member)
+        )
+
+
+def _check_transform_api(path, text, scan):
+    """Unsupported MonoBehaviour.transform.Member → Unity CS1061.
+
+    `transform` is always a Transform (never an undeclared identifier).
+    Skips `Camera.main.transform` / other `*.transform` (leading `.`).
+    """
+    for m in re.finditer(
+            r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*(\w+)", scan):
+        member = m.group(1)
+        if member in _TRANSFORM_SUPPORTED:
+            continue
+        member_idx = m.start(1)
+        line = text.count("\n", 0, member_idx) + 1
+        col = member_idx - (text.rfind("\n", 0, member_idx) + 1) + 1
+        raise PackError(
+            "%s(%d,%d): error CS1061: 'Transform' does not contain a "
+            "definition for '%s' and no accessible extension method '%s' "
+            "accepting a first argument of type 'Transform' could be found "
+            "(are you missing a using directive or an assembly reference?)"
+            % (_assets_rel_path(path), line, col, member, member)
         )
 
 
@@ -108,6 +158,8 @@ def _check_csharp_lex(path, text):
                "+=" if "+=" in m.group(0) else "-=")
         )
     _check_file_api(path, text, scan)
+    _check_application_api(path, text, scan)
+    _check_transform_api(path, text, scan)
 
 
 # Built-in Unity components AddComponent may create at runtime.
@@ -191,6 +243,7 @@ _API = {
     "GetComponent": True,
     # Path to Assets/ (Editor) — baked from the packed project root.
     "Application.dataPath": True,
+    "Application.persistentDataPath": True,
     "File.WriteAllText": True,
     "File.AppendAllText": True,
 }
@@ -252,6 +305,7 @@ _UNITY_API = re.compile(
     r"Time\.(?:deltaTime|time|fixedDeltaTime)|"
     r"Screen\.(?:width|height)|"
     r"Application\.dataPath|"
+    r"Application\.persistentDataPath|"
     r"File\.(?:WriteAllText|AppendAllText)|"
     r"Input\.(?:GetAxis|GetButton|GetKey)|"
     r"RenderSettings\.ambientLight|Camera\.main|"
@@ -427,6 +481,19 @@ def unity_player_log_path(company, product, home=None):
                             "Player.log")
     return os.path.join(home, ".config", "unity3d", company, product,
                         "Player.log")
+
+
+def unity_persistent_data_path(company, product, home=None):
+    """Host path matching Unity's Application.persistentDataPath."""
+    if home is None:
+        home = os.path.expanduser("~")
+    if sys.platform == "darwin":
+        return os.path.join(
+            home, "Library", "Application Support", company, product)
+    if sys.platform.startswith("win"):
+        base = os.environ.get("USERPROFILE") or home
+        return os.path.join(base, "AppData", "LocalLow", company, product)
+    return os.path.join(home, ".config", "unity3d", company, product)
 
 
 def _read(path):
@@ -689,6 +756,20 @@ def _quat_z_rad(qx, qy, qz, qw):
     """Planar angle (radians) of local +X after *rot* — SpriteRenderer Z spin."""
     rx, ry, _rz = _quat_rotate_vec(qx, qy, qz, qw, 1.0, 0.0, 0.0)
     return math.atan2(ry, rx)
+
+
+def _quat_xy_basis(qx, qy, qz, qw):
+    """Local XY → world XY after *rot* (orthographic drop of Z).
+
+    Sprite quads live in the local XY plane; hosts apply
+    ``(m00,m01; m10,m11) * (lx, ly)``. Pure Z spin matches cos/sin; X/Y
+    tilt foreshortens the projected extents (Unity ortho SpriteRenderer).
+    """
+    m00 = 1.0 - 2.0 * (qy * qy + qz * qz)
+    m01 = 2.0 * (qx * qy - qz * qw)
+    m10 = 2.0 * (qx * qy + qz * qw)
+    m11 = 1.0 - 2.0 * (qx * qx + qz * qz)
+    return m00, m01, m10, m11
 
 
 # Unity defaults when Collider/Rigidbody m_Material is {fileID: 0}.
@@ -1395,11 +1476,8 @@ def _load_tmp_font_asset(path):
     except ValueError:
         _TMP_FONT_CACHE[abspath] = None
         return None
-    # Unity Texture2D rows are top-first; flip to bottom-first like PNGs.
-    rows = [atlas[y * atlas_w:(y + 1) * atlas_w]
-            for y in range(atlas_h)]
-    rows.reverse()
-    atlas = b"".join(rows)
+    # Keep Texture2D row order (top-first). GlyphRect.y is from the top of
+    # the atlas in TextCore / TMP font assets.
     chars = {}
     for m in re.finditer(
             r"m_Unicode:\s*(\d+)\s*\n\s+m_GlyphIndex:\s*(\d+)", text):
@@ -1501,7 +1579,9 @@ def _rasterize_tmp_text(font, text, font_size, color, box_w, box_h,
         gy1 = baseline + float(g["by"]) * scale  # top
         gy0 = gy1 - gh  # bottom
         rx, ry, rw, rh = int(g["rx"]), int(g["ry"]), int(g["rw"]), int(g["rh"])
-        # GlyphRect Y is from the bottom of the atlas (Unity TextCore).
+        # GlyphRect Y is from the top of the (top-first) atlas. Empirically
+        # TMP SDF glyphs sample with v increasing toward the bottom of the
+        # rect (matches LiberationSans SDF packing).
         for py in range(int(math.floor(gy0)), int(math.ceil(gy1))):
             if py < 0 or py >= bh:
                 continue
@@ -1533,14 +1613,180 @@ def _rasterize_tmp_text(font, text, font_size, color, box_w, box_h,
     return bw, bh, bytes(out)
 
 
+# Unity builtin UISprite (UI/Skin/UISprite.psd): ~32×32 white rounded rect.
+# Border matches the corner radius so Image.type=Sliced keeps fixed corners.
+_UISPRITE_SIZE = 32
+_UISPRITE_RADIUS = 6  # matches Unity UISprite corner / border scale
+
+
+def _builtin_uisprite():
+    """Generate Unity-like UISprite RGBA (y=0 bottom) + 9-slice border LBRT."""
+    s = _UISPRITE_SIZE
+    r = float(_UISPRITE_RADIUS)
+    rgba = bytearray(s * s * 4)
+    for y in range(s):
+        # Atlas math in top-first space, then store bottom-first.
+        yt = (s - 1 - y) + 0.5
+        for x in range(s):
+            xt = x + 0.5
+            # Distance outside rounded rect (0 inside).
+            cx = min(max(xt, r), s - r)
+            cy = min(max(yt, r), s - r)
+            dx = xt - cx
+            dy = yt - cy
+            dist = math.sqrt(dx * dx + dy * dy) - r
+            # 1px AA fringe.
+            if dist <= -0.5:
+                a = 1.0
+            elif dist >= 0.5:
+                a = 0.0
+            else:
+                a = 0.5 - dist
+            if a <= 0.0:
+                continue
+            o = (y * s + x) * 4
+            v = int(min(255, round(a * 255.0)))
+            rgba[o] = rgba[o + 1] = rgba[o + 2] = 255
+            rgba[o + 3] = v
+    border = (_UISPRITE_RADIUS,) * 4  # left, bottom, right, top
+    return s, s, bytes(rgba), border
+
+
+def _sample_rgba(tex, tw, th, u, v):
+    """Bilinear sample RGBA texture (y=0 bottom); u/v in [0,1]."""
+    if tw < 1 or th < 1:
+        return (0, 0, 0, 0)
+    x = max(0.0, min(float(tw) - 1.0, u * (tw - 1)))
+    y = max(0.0, min(float(th) - 1.0, v * (th - 1)))
+    x0 = int(math.floor(x))
+    y0 = int(math.floor(y))
+    x1 = min(x0 + 1, tw - 1)
+    y1 = min(y0 + 1, th - 1)
+    fx = x - x0
+    fy = y - y0
+
+    def _px(ix, iy):
+        o = (iy * tw + ix) * 4
+        return (tex[o], tex[o + 1], tex[o + 2], tex[o + 3])
+
+    c00 = _px(x0, y0)
+    c10 = _px(x1, y0)
+    c01 = _px(x0, y1)
+    c11 = _px(x1, y1)
+    out = []
+    for i in range(4):
+        top = c00[i] * (1 - fx) + c10[i] * fx
+        bot = c01[i] * (1 - fx) + c11[i] * fx
+        out.append(int(round(top * (1 - fy) + bot * fy)))
+    return tuple(out)
+
+
+def _nine_slice_map(pos, size, border0, border1, src0, src1, src_size):
+    """Map destination pixel coordinate → source [0,1] along one axis.
+
+    border0/border1 are dest border sizes; src0/src1 are source border pixels.
+    """
+    if size <= 1e-6:
+        return 0.5
+    # Corners: fixed; edges/center: stretch.
+    if pos < border0 and border0 > 1e-6 and src0 > 0:
+        return (pos / border0) * (src0 / float(src_size))
+    if pos >= size - border1 and border1 > 1e-6 and src1 > 0:
+        t = (pos - (size - border1)) / border1
+        return ((src_size - src1) + t * src1) / float(src_size)
+    # Middle
+    mid_dst = size - border0 - border1
+    mid_src = src_size - src0 - src1
+    if mid_dst <= 1e-6 or mid_src <= 0:
+        return (src0 + mid_src * 0.5) / float(src_size)
+    t = (pos - border0) / mid_dst
+    return (src0 + t * mid_src) / float(src_size)
+
+
+def _bake_sliced_rgba(src, sw, sh, border, dst_w, dst_h, ppu_mul=1.0):
+    """9-slice bake source sprite into dst_w×dst_h (y=0 bottom).
+
+    border is (left, bottom, right, top) in source pixels. ppu_mul is
+    Image.m_PixelsPerUnitMultiplier (Unity shrinks borders when > 1).
+    """
+    dw = max(1, int(round(float(dst_w))))
+    dh = max(1, int(round(float(dst_h))))
+    mul = float(ppu_mul) if ppu_mul and float(ppu_mul) > 1e-6 else 1.0
+    bl = max(0.0, float(border[0]) / mul)
+    bb = max(0.0, float(border[1]) / mul)
+    br = max(0.0, float(border[2]) / mul)
+    bt = max(0.0, float(border[3]) / mul)
+    # Dest borders clamp so corners never exceed half the rect.
+    dbl = min(bl, dw * 0.5)
+    dbr = min(br, dw * 0.5)
+    dbb = min(bb, dh * 0.5)
+    dbt = min(bt, dh * 0.5)
+    if dbl + dbr > dw:
+        s = dw / (dbl + dbr) if (dbl + dbr) > 0 else 0.0
+        dbl *= s
+        dbr *= s
+    if dbb + dbt > dh:
+        s = dh / (dbb + dbt) if (dbb + dbt) > 0 else 0.0
+        dbb *= s
+        dbt *= s
+    out = bytearray(dw * dh * 4)
+    for y in range(dh):
+        # y is bottom-first; map with bottom border first.
+        v = _nine_slice_map(y + 0.5, dh, dbb, dbt, bb, bt, sh)
+        for x in range(dw):
+            u = _nine_slice_map(x + 0.5, dw, dbl, dbr, bl, br, sw)
+            r, g, b, a = _sample_rgba(src, sw, sh, u, v)
+            o = (y * dw + x) * 4
+            out[o] = r
+            out[o + 1] = g
+            out[o + 2] = b
+            out[o + 3] = a
+    return dw, dh, bytes(out)
+
+
+def _bake_stretched_rgba(src, sw, sh, dst_w, dst_h):
+    """Stretch source into dst (Simple Image.type)."""
+    dw = max(1, int(round(float(dst_w))))
+    dh = max(1, int(round(float(dst_h))))
+    out = bytearray(dw * dh * 4)
+    for y in range(dh):
+        v = (y + 0.5) / float(dh)
+        for x in range(dw):
+            u = (x + 0.5) / float(dw)
+            r, g, b, a = _sample_rgba(src, sw, sh, u, v)
+            o = (y * dw + x) * 4
+            out[o] = r
+            out[o + 1] = g
+            out[o + 2] = b
+            out[o + 3] = a
+    return dw, dh, bytes(out)
+
+
+def _sprite_border_from_meta(path):
+    """PNG .meta spriteBorder {x,y,z,w} → (left, bottom, right, top)."""
+    meta = path + ".meta"
+    if not os.path.isfile(meta):
+        return (0.0, 0.0, 0.0, 0.0)
+    text = _read(meta)
+    m = re.search(
+        r"spriteBorder:\s*\{x:\s*([^,}]+),\s*y:\s*([^,}]+),"
+        r"\s*z:\s*([^,}]+),\s*w:\s*([^}]+)\}",
+        text)
+    if not m:
+        return (0.0, 0.0, 0.0, 0.0)
+    return (float(m.group(1)), float(m.group(2)),
+            float(m.group(3)), float(m.group(4)))
+
+
 def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None):
     """Resolve authored uGUI Image / TextMeshProUGUI → world sprites.
 
     Screen Space Overlay (0) and Screen Space Camera (1): map canvas pixels to
     the main ortho camera frustum. World Space (2) is not supported yet.
-    Project PNG sprites and Unity builtin UISprites (solid white tinted by
-    m_Color) draw; empty m_Sprite is skipped (no invent). TMP needs an
-    authored font asset (Assets or Packages) with atlas + glyph tables.
+    Project PNG sprites and Unity builtin UISprites draw; Image.type Sliced
+    9-slices with sprite borders (UISprite corners stay fixed). Empty m_Sprite
+    is skipped (no invent). TMP needs an authored font asset with atlas +
+    glyph tables.
     """
     by_xf = {}
     for o in objects:
@@ -1568,6 +1814,7 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None):
     px_h = world_h / float(sh)
     rect_cache = {}
     asset_guids = asset_guids or {}
+    png_cache = {}
 
     def _find_canvas(o):
         canvas = None
@@ -1617,6 +1864,10 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None):
             "scale_y": 1.0,
             "cos_z": 1.0,
             "sin_z": 0.0,
+            "m00": 1.0,
+            "m01": 0.0,
+            "m10": 0.0,
+            "m11": 1.0,
             "half_w": abs(rw) * px_w * 0.5,
             "half_h": abs(rh) * px_h * 0.5,
             "ncx": float(cx) / float(sw),
@@ -1640,18 +1891,47 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None):
             continue
         cx, cy, rw, rh = _ui_screen_rect(o, by_xf, sw, sh, rect_cache)
         builtin = bool(ui.get("builtin"))
+        img_type = int(ui.get("image_type") or 0)
+        ppu_mul = float(ui.get("pixels_per_unit_multiplier") or 1.0)
         extra = {
             "builtin": builtin,
             "sprite_file_id": int(ui.get("sprite_file_id") or 0),
             "sprite_guid": ("builtin:uisprite" if builtin
                             else ui.get("sprite_guid")),
+            "image_type": img_type,
         }
         if builtin:
-            extra["tex_path"] = "<builtin:UISprite>"
-            extra["tex_w"] = 1
-            extra["tex_h"] = 1
-            extra["tex_rgba"] = bytes([255, 255, 255, 255])
-            extra["pixels_per_unit"] = 100.0
+            src_w, src_h, src_rgba, border = _builtin_uisprite()
+            tex_path = "<builtin:UISprite>"
+        else:
+            path = asset_guids.get(ui.get("sprite_guid") or "")
+            if not path or not path.lower().endswith(".png"):
+                continue
+            if path not in png_cache:
+                try:
+                    png_cache[path] = _load_png_rgba(path)
+                except Exception:
+                    png_cache[path] = None
+            loaded = png_cache[path]
+            if not loaded:
+                continue
+            src_w, src_h, src_rgba = loaded
+            border = _sprite_border_from_meta(path)
+            tex_path = path
+        # Sliced (1): 9-slice. Simple (0) / other: stretch to rect.
+        # Bake to rect size so one textured quad matches uGUI mesh.
+        if img_type == 1 and any(b > 0 for b in border):
+            tw, th, rgba = _bake_sliced_rgba(
+                src_rgba, src_w, src_h, border, rw, rh, ppu_mul)
+        else:
+            tw, th, rgba = _bake_stretched_rgba(
+                src_rgba, src_w, src_h, rw, rh)
+        extra["tex_path"] = tex_path
+        extra["tex_w"] = tw
+        extra["tex_h"] = th
+        extra["tex_rgba"] = rgba
+        extra["pixels_per_unit"] = 100.0
+        extra["border"] = border
         _apply_layout(
             o, cx, cy, rw, rh, canvas, "ui",
             (ui.get("r", 1.0), ui.get("g", 1.0),
@@ -1970,6 +2250,10 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                     r"m_Sprite:\s*\{fileID:\s*(-?\d+)(?:,\s*guid:\s*"
                     r"([0-9a-fA-F]+))?",
                     block)
+                itype = re.search(r"(?m)^\s+m_Type:\s*(\d+)", block)
+                ppum = re.search(
+                    r"(?m)^\s+m_PixelsPerUnitMultiplier:\s*([0-9.eE+-]+)",
+                    block)
                 has_sprite = False
                 builtin = False
                 sg = None
@@ -1994,6 +2278,10 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                     "builtin": builtin,
                     "sprite_file_id": fid,
                     "sprite_guid": sg,
+                    # 0 Simple, 1 Sliced, 2 Tiled, 3 Filled
+                    "image_type": int(itype.group(1)) if itype else 0,
+                    "pixels_per_unit_multiplier": (
+                        float(ppum.group(1)) if ppum else 1.0),
                 }
             elif _is_ui_button_mb(block, g):
                 rec["ui_button"] = _parse_ui_button(block)
@@ -2252,8 +2540,10 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 cam = dict(k["camera"])
             if k.get("kind") == "Rigidbody2D" and k.get("rigidbody2d"):
                 rb2d = dict(k["rigidbody2d"])
+                rb2d["file_id"] = k.get("file_id")
             if k.get("kind") == "Rigidbody" and k.get("rigidbody"):
                 rb3d = dict(k["rigidbody"])
+                rb3d["file_id"] = k.get("file_id")
             if k.get("kind") in ("BoxCollider2D", "CircleCollider2D") and k.get(
                     "collider2d"):
                 col2d = dict(k["collider2d"])
@@ -2357,6 +2647,12 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             sprite["rot_z"] = rz
             sprite["cos_z"] = math.cos(rz)
             sprite["sin_z"] = math.sin(rz)
+            m00, m01, m10, m11 = _quat_xy_basis(
+                rot[0], rot[1], rot[2], rot[3])
+            sprite["m00"] = m00
+            sprite["m01"] = m01
+            sprite["m10"] = m10
+            sprite["m11"] = m11
         else:
             sprite = None
         class_name = None
@@ -2914,16 +3210,22 @@ def _build_rigidbody_tables(plan):
     rb3d = []
     go_rb2d = {}  # go_name -> rb2d index
     go_rb3d = {}
+    rb2d_by_file_id = {}
+    rb3d_by_file_id = {}
     for cname, cl in sorted(plan["classes"].items()):
         for i, o in enumerate(cl.get("instances") or []):
             n = o.get("name") or "obj"
             r2 = o.get("rigidbody2d")
             if r2:
                 go_rb2d[n] = len(rb2d)
+                fid = r2.get("file_id")
+                if fid is not None and str(fid) != "0":
+                    rb2d_by_file_id[str(fid)] = len(rb2d)
                 rb2d.append({
                     "name": n,
                     "owner_class": cname,
                     "owner_inst": i,
+                    "file_id": fid,
                     "body_type": int(r2.get("body_type") or 0),
                     "mass": float(r2.get("mass") or 1.0),
                     "gravity_scale": float(r2.get("gravity_scale") or 1.0),
@@ -2934,10 +3236,14 @@ def _build_rigidbody_tables(plan):
             r3 = o.get("rigidbody")
             if r3:
                 go_rb3d[n] = len(rb3d)
+                fid = r3.get("file_id")
+                if fid is not None and str(fid) != "0":
+                    rb3d_by_file_id[str(fid)] = len(rb3d)
                 rb3d.append({
                     "name": n,
                     "owner_class": cname,
                     "owner_inst": i,
+                    "file_id": fid,
                     "mass": float(r3.get("mass") or 1.0),
                     "use_gravity": int(r3.get("use_gravity")
                                        if r3.get("use_gravity") is not None
@@ -2947,7 +3253,7 @@ def _build_rigidbody_tables(plan):
                     "vel_y": float(r3.get("vel_y") or 0.0),
                     "vel_z": float(r3.get("vel_z") or 0.0),
                 })
-    return rb2d, rb3d, go_rb2d, go_rb3d
+    return (rb2d, rb3d, go_rb2d, go_rb3d, rb2d_by_file_id, rb3d_by_file_id)
 
 
 def _attach_transform_parents(plan):
@@ -3398,11 +3704,25 @@ def _rewrite_extensions_set_world_scale(text, cl, plan):
 
 
 def _rewrite_rigidbody_assigns(text, plan, this_class):
-    """Lower GetComponent<Rigidbody*>().velocity = new VectorN(...);"""
+    """Lower Rigidbody(2D).linearVelocity / .velocity assigns.
+
+    Supports:
+      GetComponent<Rigidbody2D>().linearVelocity = new Vector2(x, y);
+      rb.linearVelocity = rb.linearVelocity.SetX(expr);
+      rb.linearVelocity = new Vector2(x, y);
+    and Rigidbody / SetY / SetZ / velocity aliases.
+    """
     this_idn = _c_ident(this_class)
     go_this = "_engine_go_of_%s(i)" % this_idn
+    cl = (plan.get("classes") or {}).get(this_class) or {}
+    rb2d_fields = [
+        f["name"] for f in (cl.get("fields") or [])
+        if f.get("ty") == "Rigidbody2D"]
+    rb3d_fields = [
+        f["name"] for f in (cl.get("fields") or [])
+        if f.get("ty") == "Rigidbody"]
 
-    def repl_2d(m):
+    def repl_2d_new(m):
         args = _split_call_args(m.group(1))
         if len(args) < 2:
             return m.group(0)
@@ -3413,7 +3733,7 @@ def _rewrite_rigidbody_assigns(text, plan, this_class):
             % (go_this, args[0], args[1])
         )
 
-    def repl_3d(m):
+    def repl_3d_new(m):
         args = _split_call_args(m.group(1))
         if len(args) < 3:
             return m.group(0)
@@ -3429,25 +3749,183 @@ def _rewrite_rigidbody_assigns(text, plan, this_class):
         r"(?:this\s*\.\s*)?GetComponent\s*<\s*(?:UnityEngine\.)?Rigidbody2D\s*>"
         r"\s*\(\s*\)\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
         r"new\s+Vector2\s*\((.*?)\)\s*;",
-        repl_2d, text, flags=re.S)
+        repl_2d_new, text, flags=re.S)
     text = re.sub(
         r"(?:this\s*\.\s*)?GetComponent\s*<\s*(?:UnityEngine\.)?Rigidbody\s*>"
         r"\s*\(\s*\)\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
         r"new\s+Vector3\s*\((.*?)\)\s*;",
-        repl_3d, text, flags=re.S)
+        repl_3d_new, text, flags=re.S)
+
+    def repl_2d_setx(m):
+        return (
+            "{ int _up_rb = GameObject_GetComponent_Rigidbody2D(%s); "
+            "if (_up_rb >= 0) { _Rigidbody2D_vel_x[_up_rb] = (%s); } }"
+            % (go_this, m.group(1).strip())
+        )
+
+    def repl_2d_sety(m):
+        return (
+            "{ int _up_rb = GameObject_GetComponent_Rigidbody2D(%s); "
+            "if (_up_rb >= 0) { _Rigidbody2D_vel_y[_up_rb] = (%s); } }"
+            % (go_this, m.group(1).strip())
+        )
+
+    text = re.sub(
+        r"(?:this\s*\.\s*)?GetComponent\s*<\s*(?:UnityEngine\.)?Rigidbody2D\s*>"
+        r"\s*\(\s*\)\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
+        r"(?:this\s*\.\s*)?GetComponent\s*<\s*(?:UnityEngine\.)?Rigidbody2D\s*>"
+        r"\s*\(\s*\)\s*\.\s*(?:linearVelocity|velocity)\s*\.\s*SetX\s*\((.*?)\)\s*;",
+        repl_2d_setx, text, flags=re.S)
+    text = re.sub(
+        r"(?:this\s*\.\s*)?GetComponent\s*<\s*(?:UnityEngine\.)?Rigidbody2D\s*>"
+        r"\s*\(\s*\)\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
+        r"(?:this\s*\.\s*)?GetComponent\s*<\s*(?:UnityEngine\.)?Rigidbody2D\s*>"
+        r"\s*\(\s*\)\s*\.\s*(?:linearVelocity|velocity)\s*\.\s*SetY\s*\((.*?)\)\s*;",
+        repl_2d_sety, text, flags=re.S)
+
+    def repl_3d_set(axis):
+        def _repl(m):
+            return (
+                "{ int _up_rb = GameObject_GetComponent_Rigidbody(%s); "
+                "if (_up_rb >= 0) { _Rigidbody_vel_%s[_up_rb] = (%s); } }"
+                % (go_this, axis, m.group(1).strip())
+            )
+        return _repl
+
+    for axis in ("X", "Y", "Z"):
+        text = re.sub(
+            r"(?:this\s*\.\s*)?GetComponent\s*<\s*(?:UnityEngine\.)?Rigidbody\s*>"
+            r"\s*\(\s*\)\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
+            r"(?:this\s*\.\s*)?GetComponent\s*<\s*(?:UnityEngine\.)?Rigidbody\s*>"
+            r"\s*\(\s*\)\s*\.\s*(?:linearVelocity|velocity)\s*\.\s*Set%s\s*\((.*?)\)\s*;"
+            % axis,
+            repl_3d_set(axis.lower()), text, flags=re.S)
+
+    # Field-based: rb.linearVelocity = rb.linearVelocity.SetX(expr);
+    for fname in rb2d_fields:
+        get_rb = "(int)%s_get_%s(i)" % (this_idn, fname)
+
+        def _set_xy(x_expr, y_expr, gr=get_rb):
+            return (
+                "{ int _up_rb = %s; if (_up_rb >= 0) { "
+                "_Rigidbody2D_vel_x[_up_rb] = (%s); "
+                "_Rigidbody2D_vel_y[_up_rb] = (%s); } }"
+                % (gr, x_expr, y_expr)
+            )
+
+        def repl_setx(m, fn=fname, gr=get_rb):
+            # Keep y; set x from SetX arg.
+            return (
+                "{ int _up_rb = %s; if (_up_rb >= 0) { "
+                "_Rigidbody2D_vel_x[_up_rb] = (%s); } }"
+                % (gr, m.group(1).strip())
+            )
+
+        def repl_sety(m, fn=fname, gr=get_rb):
+            return (
+                "{ int _up_rb = %s; if (_up_rb >= 0) { "
+                "_Rigidbody2D_vel_y[_up_rb] = (%s); } }"
+                % (gr, m.group(1).strip())
+            )
+
+        def repl_new2(m, gr=get_rb):
+            args = _split_call_args(m.group(1))
+            if len(args) < 2:
+                return m.group(0)
+            return _set_xy(args[0], args[1], gr)
+
+        text = re.sub(
+            r"(?<![_\w])%s\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
+            r"(?:this\s*\.\s*)?%s\s*\.\s*(?:linearVelocity|velocity)\s*"
+            r"\.\s*SetX\s*\((.*?)\)\s*;"
+            % (re.escape(fname), re.escape(fname)),
+            repl_setx, text, flags=re.S)
+        text = re.sub(
+            r"(?<![_\w])%s\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
+            r"(?:this\s*\.\s*)?%s\s*\.\s*(?:linearVelocity|velocity)\s*"
+            r"\.\s*SetY\s*\((.*?)\)\s*;"
+            % (re.escape(fname), re.escape(fname)),
+            repl_sety, text, flags=re.S)
+        text = re.sub(
+            r"(?<![_\w])%s\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
+            r"new\s+Vector2\s*\((.*?)\)\s*;" % re.escape(fname),
+            repl_new2, text, flags=re.S)
+
+    for fname in rb3d_fields:
+        get_rb = "(int)%s_get_%s(i)" % (this_idn, fname)
+
+        def _axis_set(axis, m, gr=get_rb):
+            return (
+                "{ int _up_rb = %s; if (_up_rb >= 0) { "
+                "_Rigidbody_vel_%s[_up_rb] = (%s); } }"
+                % (gr, axis, m.group(1).strip())
+            )
+
+        def repl_new3(m, gr=get_rb):
+            args = _split_call_args(m.group(1))
+            if len(args) < 3:
+                return m.group(0)
+            return (
+                "{ int _up_rb = %s; if (_up_rb >= 0) { "
+                "_Rigidbody_vel_x[_up_rb] = (%s); "
+                "_Rigidbody_vel_y[_up_rb] = (%s); "
+                "_Rigidbody_vel_z[_up_rb] = (%s); } }"
+                % (gr, args[0], args[1], args[2])
+            )
+
+        for axis in ("X", "Y", "Z"):
+            text = re.sub(
+                r"(?<![_\w])%s\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
+                r"(?:this\s*\.\s*)?%s\s*\.\s*(?:linearVelocity|velocity)\s*"
+                r"\.\s*Set%s\s*\((.*?)\)\s*;"
+                % (re.escape(fname), re.escape(fname), axis),
+                lambda m, ax=axis.lower(): _axis_set(ax, m),
+                text, flags=re.S)
+        text = re.sub(
+            r"(?<![_\w])%s\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
+            r"new\s+Vector3\s*\((.*?)\)\s*;" % re.escape(fname),
+            repl_new3, text, flags=re.S)
+
     return text
 
 
-def _rewrite_find_getcomponent(text, plan, this_class):
+def _nre_at_expr(site, line):
+    """C expr that raises Unity-style NullReferenceException at *line*."""
+    return (
+        "_engine_null_reference_at(%s, %s, %s, %d)"
+        % (_c_string(site["class"]), _c_string(site["method"]),
+           _c_string(site["path"]), int(line))
+    )
+
+
+def _rewrite_find_getcomponent(text, plan, this_class, site=None):
     """Lower Find/GetComponent chains using the authored GO tables.
 
     `GameObject.Find` name lookup is always runtime (`strcmp` on the packed
     name table) — missing names yield -1 like Unity null, not a PackError.
+    Calling GetComponent / reading a field on that null is a
+    NullReferenceException (`_engine_null_reference_at`), matching Unity.
     Authored Rigidbody / Rigidbody2D are first-class GetComponent targets.
     """
     chains = _ast_find_getcomponent_chains(text)
     if not chains:
         return text
+
+    if site is None:
+        site = {
+            "class": this_class,
+            "method": "?",
+            "path": "?",
+            "body_abs": 0,
+            "file_text": text,
+        }
+
+    def _line_at(offset_in_body):
+        ft = site.get("file_text") or ""
+        abs_i = int(site.get("body_abs") or 0) + int(offset_in_body)
+        if not ft:
+            return 0
+        return ft.count("\n", 0, abs_i) + 1
 
     def _zero_for_field(comp, field):
         cl = (plan.get("classes") or {}).get(comp) or {}
@@ -3459,58 +3937,77 @@ def _rewrite_find_getcomponent(text, plan, this_class):
             return "0"
         return "0.f"
 
-    def _rb_field_expr(comp, field, axis, go_expr):
+    def _rb_field_expr(comp, field, axis, go_expr, line):
         """GetComponent<Rigidbody2D/Rigidbody>().velocity.x / gravityScale."""
         get = "GameObject_GetComponent_%s(%s)" % (_c_ident(comp), go_expr)
+        nre = _nre_at_expr(site, line)
         fl = (field or "").lower()
         if comp == "Rigidbody2D":
             if fl in ("gravityscale",):
                 return ("({ int _up_rb = %s; "
-                        "_up_rb < 0 ? 0.f : _Rigidbody2D_gravity_scale[_up_rb]; })"
-                        % get)
+                        "_up_rb < 0 "
+                        "? (%s, 0.f) "
+                        ": _Rigidbody2D_gravity_scale[_up_rb]; })"
+                        % (get, nre))
             if fl in ("lineardamping", "drag"):
                 return ("({ int _up_rb = %s; "
-                        "_up_rb < 0 ? 0.f : _Rigidbody2D_linear_damping[_up_rb]; })"
-                        % get)
+                        "_up_rb < 0 "
+                        "? (%s, 0.f) "
+                        ": _Rigidbody2D_linear_damping[_up_rb]; })"
+                        % (get, nre))
             if fl in ("velocity", "linearvelocity") and axis in ("x", "y"):
                 return ("({ int _up_rb = %s; "
-                        "_up_rb < 0 ? 0.f : _Rigidbody2D_vel_%s[_up_rb]; })"
-                        % (get, axis))
+                        "_up_rb < 0 "
+                        "? (%s, 0.f) "
+                        ": _Rigidbody2D_vel_%s[_up_rb]; })"
+                        % (get, nre, axis))
             if fl in ("mass",):
                 return ("({ int _up_rb = %s; "
-                        "_up_rb < 0 ? 0.f : _Rigidbody2D_mass[_up_rb]; })"
-                        % get)
+                        "_up_rb < 0 "
+                        "? (%s, 0.f) "
+                        ": _Rigidbody2D_mass[_up_rb]; })"
+                        % (get, nre))
         if comp == "Rigidbody":
             if fl in ("drag", "lineardamping"):
                 return ("({ int _up_rb = %s; "
-                        "_up_rb < 0 ? 0.f : _Rigidbody_drag[_up_rb]; })"
-                        % get)
+                        "_up_rb < 0 "
+                        "? (%s, 0.f) "
+                        ": _Rigidbody_drag[_up_rb]; })"
+                        % (get, nre))
             if fl in ("velocity", "linearvelocity") and axis in ("x", "y", "z"):
                 return ("({ int _up_rb = %s; "
-                        "_up_rb < 0 ? 0.f : _Rigidbody_vel_%s[_up_rb]; })"
-                        % (get, axis))
+                        "_up_rb < 0 "
+                        "? (%s, 0.f) "
+                        ": _Rigidbody_vel_%s[_up_rb]; })"
+                        % (get, nre, axis))
             if fl in ("mass",):
                 return ("({ int _up_rb = %s; "
-                        "_up_rb < 0 ? 0.f : _Rigidbody_mass[_up_rb]; })"
-                        % get)
+                        "_up_rb < 0 "
+                        "? (%s, 0.f) "
+                        ": _Rigidbody_mass[_up_rb]; })"
+                        % (get, nre))
             if fl in ("usegravity",):
                 return ("({ int _up_rb = %s; "
-                        "_up_rb < 0 ? 0 : _Rigidbody_use_gravity[_up_rb]; })"
-                        % get)
+                        "_up_rb < 0 "
+                        "? (%s, 0) "
+                        ": _Rigidbody_use_gravity[_up_rb]; })"
+                        % (get, nre))
         raise PackError(
             "GetComponent<%s>.%s: unsupported Rigidbody field "
             "(use velocity.x/y, gravityScale, mass)"
             % (comp, field or "?"))
 
-    def _field_after_get(comp, field, go_expr, axis=None):
+    def _field_after_get(comp, field, go_expr, line, axis=None):
         if comp in _PHYSICS_COMPONENTS:
-            return _rb_field_expr(comp, field, axis, go_expr)
+            return _rb_field_expr(comp, field, axis, go_expr, line)
         idn = _c_ident(comp)
         zero = _zero_for_field(comp, field)
+        nre = _nre_at_expr(site, line)
         return (
             "({ int _up_gc = GameObject_GetComponent_%s(%s); "
-            "_up_gc < 0 ? %s : %s_get_%s((unsigned)_up_gc); })"
-            % (idn, go_expr, zero, idn, field)
+            "_up_gc < 0 ? (%s, %s) "
+            ": %s_get_%s((unsigned)_up_gc); })"
+            % (idn, go_expr, nre, zero, idn, field)
         )
 
     def _known_component(comp):
@@ -3523,6 +4020,8 @@ def _rewrite_find_getcomponent(text, plan, this_class):
         comp = ch.get("component")
         field = ch.get("field")
         axis = ch.get("axis")
+        line = _line_at(ch["start"])
+        nre = _nre_at_expr(site, line)
         if ch.get("on_this"):
             if not comp:
                 raise PackError("GetComponent requires a type argument")
@@ -3533,7 +4032,7 @@ def _rewrite_find_getcomponent(text, plan, this_class):
                     "unity_pack does not invent components" % (comp, comp))
             go_expr = "_engine_go_of_%s(i)" % this_idn
             if field:
-                repl = _field_after_get(comp, field, go_expr, axis)
+                repl = _field_after_get(comp, field, go_expr, line, axis)
             else:
                 repl = "GameObject_GetComponent_%s(%s)" % (
                     _c_ident(comp), go_expr)
@@ -3550,10 +4049,15 @@ def _rewrite_find_getcomponent(text, plan, this_class):
                     "GetComponent<%s>: no authored %s in the scene — "
                     "unity_pack does not invent components" % (comp, comp))
             if field:
-                repl = _field_after_get(comp, field, go_expr, axis)
+                # null Find or missing component → NRE at this source line.
+                repl = _field_after_get(comp, field, go_expr, line, axis)
             else:
-                repl = "GameObject_GetComponent_%s(%s)" % (
-                    _c_ident(comp), go_expr)
+                # null.GetComponent<T>() throws; missing component returns null.
+                repl = (
+                    "({ int _up_go = %s; "
+                    "_up_go < 0 ? (%s, -1) "
+                    ": GameObject_GetComponent_%s(_up_go); })"
+                    % (go_expr, nre, _c_ident(comp)))
         text = text[:ch["start"]] + repl + text[ch["end"]:]
     return text
 
@@ -3600,6 +4104,9 @@ def analyze_script(path, text=None):
             apis.add("GetComponent")
     if "transform.position" in scan:
         apis.add("transform.position")
+    if re.search(r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*Rotate\s*\(",
+                 scan):
+        apis.add("transform.Rotate")
     if re.search(r"using\s+UnityEngine\.UI\b", scan):
         apis.add("UnityEngine.UI")
     if re.search(r"\bInputAction\b", scan):
@@ -3627,12 +4134,17 @@ def analyze_script(path, text=None):
         apis.add("print")
     if re.search(r"(?:UnityEngine\.)?Application\.dataPath\b", scan):
         apis.add("Application.dataPath")
+    if re.search(r"(?:UnityEngine\.)?Application\.persistentDataPath\b", scan):
+        apis.add("Application.persistentDataPath")
     if re.search(r"(?:System\.IO\.)?File\.WriteAllText\s*\(", scan):
         apis.add("File.WriteAllText")
     if re.search(r"(?:System\.IO\.)?File\.AppendAllText\s*\(", scan):
         apis.add("File.AppendAllText")
     # C# string + value must not become C pointer arithmetic.
-    if re.search(r'"\s*\+|Application\.dataPath\s*\+', scan):
+    if re.search(
+            r'"\s*\+|'
+            r"Application\.(?:dataPath|persistentDataPath)\s*\+",
+            scan):
         apis.add("string.+")
     has_system = bool(re.search(r"using\s+System\b", scan))
     apis.discard("Console.WriteLine")  # may have matched via _UNITY_API
@@ -3654,6 +4166,8 @@ def analyze_script(path, text=None):
         r"transform\.position\s*=|"
         r"transform\.position\s*\+=|"
         r"transform\.Translate", scan))
+    writes_rot = bool(re.search(
+        r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*Rotate\s*\(", scan))
 
     types = cs2cpp._find_types(scan)
     classes = []
@@ -3662,8 +4176,8 @@ def analyze_script(path, text=None):
             continue
         body = text[brace + 1:close]
         bscan = scan[brace + 1:close]
-        fields = _fields_in(body, bscan)
-        methods = _methods_in(body, bscan)
+        fields = _fields_in(body, bscan, body_abs=brace + 1)
+        methods = _methods_in(body, bscan, body_abs=brace + 1)
         refs = []
         for f in fields:
             if f["ty"] not in _PRIM and f["ty"] not in (
@@ -3673,11 +4187,27 @@ def analyze_script(path, text=None):
         pre = scan[max(0, start - 200):start]
         disallow_multiple = bool(re.search(
             r"\[DisallowMultipleComponent\]", pre))
+        ctor_forbidden = []
+        for f in fields:
+            api = f.get("ctor_forbidden_api")
+            if not api:
+                continue
+            abs_i = int(f.get("ctor_forbidden_abs")
+                        or f.get("decl_abs") or 0)
+            line = text.count("\n", 0, abs_i) + 1
+            ctor_forbidden.append({
+                "api": api,
+                "field": f["name"],
+                "line": line,
+                "static": bool(f.get("static") or f.get("const")),
+            })
         classes.append({
             "name": name, "kind": kind, "fields": fields,
             "methods": methods, "refs": refs,
             "path": path,
+            "file_text": text,
             "disallow_multiple": disallow_multiple,
+            "ctor_forbidden": ctor_forbidden,
         })
     return {
         "path": path,
@@ -3685,6 +4215,7 @@ def analyze_script(path, text=None):
         "spawns": spawns,
         "uses_z": uses_z,
         "writes_pos": writes_pos,
+        "writes_rot": writes_rot,
         "keyboard_keys": keyboard_keys,
         "getcomponent_types": getcomponent_types,
         "addcomponent_types": addcomponent_types,
@@ -3726,7 +4257,7 @@ def _parse_csharp_field_init(ty, raw):
         lit = _string_literal_value(raw)
         if lit is not None:
             return lit
-        # Application.dataPath + "/rel" — resolved at pack time.
+        # Application.dataPath / persistentDataPath + "/rel" — pack-time bake.
         m = re.match(
             r"(?:UnityEngine\.)?Application\.dataPath\s*\+\s*"
             r"(\"([^\"\\]|\\.)*\")\s*$",
@@ -3736,6 +4267,17 @@ def _parse_csharp_field_init(ty, raw):
                 m.group(1))}
         if re.match(r"(?:UnityEngine\.)?Application\.dataPath\s*$", raw):
             return {"kind": "dataPath"}
+        m = re.match(
+            r"(?:UnityEngine\.)?Application\.persistentDataPath\s*\+\s*"
+            r"(\"([^\"\\]|\\.)*\")\s*$",
+            raw)
+        if m:
+            return {"kind": "persistentDataPath+", "suffix":
+                    _string_literal_value(m.group(1))}
+        if re.match(
+                r"(?:UnityEngine\.)?Application\.persistentDataPath\s*$",
+                raw):
+            return {"kind": "persistentDataPath"}
         return None
     if ty == "Vector2":
         m = re.match(
@@ -3775,7 +4317,7 @@ def _parse_csharp_field_init(ty, raw):
     return None
 
 
-def _fields_in(body, bscan):
+def _fields_in(body, bscan, body_abs=0):
     """Instance / static / const fields; methods (those with `(`) are skipped."""
     bscan = _blank_method_bodies(bscan)
     out = []
@@ -3797,13 +4339,25 @@ def _fields_in(body, bscan):
             "name": name,
             "static": bool(re.search(r"\bstatic\b", decl)),
             "const": bool(re.search(r"\bconst\b", decl)),
+            "decl_abs": int(body_abs) + int(m.start()),
         }
         # Authored `float xSize = 1;` / `Vector2 multSize = new Vector2(1, 1);`
         if m.group(0).rstrip().endswith("="):
             rest = body[m.end():]
             semi = rest.find(";")
             if semi >= 0:
-                default = _parse_csharp_field_init(ty, rest[:semi])
+                init_src = rest[:semi]
+                # Unity forbids Application.dataPath / persistentDataPath in
+                # MonoBehaviour field initializers / .cctor (not Awake/Start).
+                am = re.search(
+                    r"(?:UnityEngine\.)?Application\."
+                    r"(dataPath|persistentDataPath)\b",
+                    init_src)
+                if am:
+                    entry["ctor_forbidden_api"] = am.group(1)
+                    entry["ctor_forbidden_abs"] = (
+                        int(body_abs) + int(m.end()) + int(am.start()))
+                default = _parse_csharp_field_init(ty, init_src)
                 if default is not None:
                     entry["default"] = default
         out.append(entry)
@@ -3832,7 +4386,7 @@ def _member_init_default(cl, member_name):
     return None
 
 
-def _methods_in(body, bscan):
+def _methods_in(body, bscan, body_abs=0):
     out = []
     for m in re.finditer(
             r"(?m)^[ \t]*(?:public|private|protected|internal)?"
@@ -3852,6 +4406,7 @@ def _methods_in(body, bscan):
             "name": m.group(2),
             "args": m.group(3).strip(),
             "body": impl,
+            "body_abs": int(body_abs) + int(m.end()),
             "src": src,
         })
     return out
@@ -3953,7 +4508,10 @@ def plan_layouts(objects, analyses, two_d=None):
     writes = {}
     for a in analyses:
         for c in a["classes"]:
-            writes[c["name"]] = writes.get(c["name"], False) or a["writes_pos"]
+            writes[c["name"]] = (
+                writes.get(c["name"], False)
+                or a["writes_pos"]
+                or a.get("writes_rot"))
 
     for cname, insts in by_class.items():
         # Authored Rigidbody / Animation integrates into transform — writable.
@@ -3977,11 +4535,15 @@ def plan_layouts(objects, analyses, two_d=None):
         field_tys = {}
         script_fields = []
         script_methods = []
+        ctor_forbidden = []
+        script_path = ""
         for a in analyses:
             for c in a["classes"]:
                 if c["name"] == cname:
                     script_fields = c["fields"]
                     script_methods = c["methods"]
+                    ctor_forbidden = list(c.get("ctor_forbidden") or [])
+                    script_path = c.get("path") or a.get("path") or ""
         for f in script_fields:
             if f.get("static") or f.get("const"):
                 continue  # class-level; emitted separately from instance arrays
@@ -4060,6 +4622,11 @@ def plan_layouts(objects, analyses, two_d=None):
         vec2_fields = [f["name"] for f in script_fields if f["ty"] == "Vector2"]
         class_consts = [f for f in script_fields
                         if f.get("const") or f.get("static")]
+        # Do not bake Application.* paths used in illegal field initializers.
+        if ctor_forbidden:
+            forbid_names = {x["field"] for x in ctor_forbidden}
+            class_consts = [f for f in class_consts
+                            if f["name"] not in forbid_names]
         plans[cname] = {
             "name": cname,
             "n": n,
@@ -4074,8 +4641,21 @@ def plan_layouts(objects, analyses, two_d=None):
             "fields": script_fields,
             "vec2_fields": vec2_fields,
             "class_consts": class_consts,
+            "ctor_forbidden": ctor_forbidden,
+            "script_path": script_path,
         }
-    return {"two_d": two_d, "spawn": spawn, "classes": plans}
+    live_rot = set()
+    for a in analyses:
+        if a.get("writes_rot"):
+            for c in a["classes"]:
+                if c["name"] in plans:
+                    live_rot.add(c["name"])
+    return {
+        "two_d": two_d,
+        "spawn": spawn,
+        "classes": plans,
+        "live_rot_classes": sorted(live_rot),
+    }
 
 
 def _packed_size(members):
@@ -4160,6 +4740,7 @@ def emit_engine(plan, analyses, used_apis):
     p = lines.append
     soa = bool(plan.get("soa"))
     want_math = bool(used_apis & {"Mathf.Sin", "Mathf.Cos"})
+    want_live_rot = bool(plan.get("live_rot_classes"))
     getcomponent_types = set()
     for a in analyses:
         getcomponent_types |= set(a.get("getcomponent_types") or [])
@@ -4208,6 +4789,7 @@ def emit_engine(plan, analyses, used_apis):
     want_find = "GameObject.Find" in used_apis
     want_getcomponent = "GetComponent" in used_apis
     want_data_path = "Application.dataPath" in used_apis
+    want_persistent_data_path = "Application.persistentDataPath" in used_apis
     want_file_write = "File.WriteAllText" in used_apis
     want_file_append = "File.AppendAllText" in used_apis
     want_file_io = want_file_write or want_file_append
@@ -4217,6 +4799,9 @@ def emit_engine(plan, analyses, used_apis):
     want_go_tables = (
         want_find or want_getcomponent or want_rb2d or want_rb3d
         or want_add_any or want_ui or want_destroy)
+    want_ctor_forbidden = any(
+        bool(cl.get("ctor_forbidden"))
+        for cl in plan["classes"].values())
     light_n = int(plan.get("light_count") or 0)
     light_cap = light_n + int(add_budget.get("Light") or 0)
     class_ids = {n: i for i, n in enumerate(sorted(plan["classes"]))}
@@ -4224,13 +4809,13 @@ def emit_engine(plan, analyses, used_apis):
     if soa:
         p("/* layout: SoA positions (contiguous float tables for GPU upload) */")
     p("#include <stdint.h>")
-    if want_math or want_col2d or want_col3d or want_anim:
+    if want_math or want_col2d or want_col3d or want_anim or want_live_rot:
         p("#include <math.h>")
     if (want_input or want_log or want_find or want_add_any
-            or want_data_path or want_file_io):
+            or want_data_path or want_persistent_data_path or want_file_io):
         p("#include <string.h>")
     if (want_log or want_console or want_str_plus or want_add_any
-            or want_file_io):
+            or want_file_io or want_go_tables or want_ctor_forbidden):
         p("#include <stdio.h>")
     want_draw_sort = False
     for cl in plan["classes"].values():
@@ -4241,8 +4826,11 @@ def emit_engine(plan, analyses, used_apis):
                 break
         if want_draw_sort:
             break
-    if want_log or want_draw_sort or want_data_path or want_file_io:
+    if (want_log or want_draw_sort or want_data_path
+            or want_persistent_data_path or want_file_io or want_go_tables):
         p("#include <stdlib.h>")
+    if want_go_tables:
+        p("#include <setjmp.h>")
     if want_log or want_file_io:
         # Host gcc creates dirs; crust/shivyc has no errno/sys/stat,
         # so CRUST_NO_POSIX_MKDIR skips mkdir and fopen falls back.
@@ -4267,9 +4855,7 @@ def emit_engine(plan, analyses, used_apis):
     p("extern float Time_deltaTime;")
     if "Time.time" in used_apis:
         p("extern float Time_time;")
-    if ("Time.fixedDeltaTime" in used_apis or want_phys or want_phys3
-            or want_rb2d or want_rb3d):
-        p("extern float Time_fixedDeltaTime;")
+    p("extern float Time_fixedDeltaTime;")
     p("extern int Screen_width;")
     p("extern int Screen_height;")
     p("extern int Screen_fullScreen;")
@@ -4438,6 +5024,19 @@ def emit_engine(plan, analyses, used_apis):
         n = max(1, plan["classes"][cname]["n"])
         p("extern float _%s_scale_x[%d];" % (idn, n))
         p("extern float _%s_scale_y[%d];" % (idn, n))
+    for cname in sorted(plan.get("live_rot_classes") or []):
+        if cname not in plan["classes"]:
+            continue
+        idn = _c_ident(cname)
+        n = max(1, plan["classes"][cname]["n"])
+        p("extern float _%s_rot_x[%d];" % (idn, n))
+        p("extern float _%s_rot_y[%d];" % (idn, n))
+        p("extern float _%s_rot_z[%d];" % (idn, n))
+        p("extern float _%s_rot_w[%d];" % (idn, n))
+        p("extern float _%s_rot_m00[%d];" % (idn, n))
+        p("extern float _%s_rot_m01[%d];" % (idn, n))
+        p("extern float _%s_rot_m10[%d];" % (idn, n))
+        p("extern float _%s_rot_m11[%d];" % (idn, n))
     # Transform field → target class/inst (SetWorldScale).
     for (oc, fname), row in sorted(
             (plan.get("transform_field_targets") or {}).items()):
@@ -4576,6 +5175,18 @@ def emit_engine(plan, analyses, used_apis):
         p("    return _engine_data_path;")
         p("}")
         p("const char *engine_data_path(void) { return _engine_data_path; }")
+        p("")
+    if want_persistent_data_path:
+        pp = plan.get("persistent_data_path") or ""
+        p("/* Application.persistentDataPath — Unity company/product save dir */")
+        p("static const char _engine_persistent_data_path[] = %s;"
+          % _c_string(pp))
+        p("static const char *Application_persistentDataPath(void) {")
+        p("    return _engine_persistent_data_path;")
+        p("}")
+        p("const char *engine_persistent_data_path(void) {")
+        p("    return _engine_persistent_data_path;")
+        p("}")
         p("")
     if want_destroy:
         # Destroy(gameObject) — mark GO; Tick skips destroyed instances.
@@ -4735,6 +5346,9 @@ def emit_engine(plan, analyses, used_apis):
     if not want_data_path:
         p("const char *engine_data_path(void) { return \"\"; }")
         p("")
+    if not want_persistent_data_path:
+        p("const char *engine_persistent_data_path(void) { return \"\"; }")
+        p("")
     if want_file_io:
         if not want_log:
             p("#ifndef CRUST_NO_POSIX_MKDIR")
@@ -4844,6 +5458,23 @@ def emit_engine(plan, analyses, used_apis):
             p("};")
         else:
             p("static const char *_engine_go_name[1] = { \"\" };")
+        # Unity catches script exceptions: log + unwind the current method.
+        p("static jmp_buf _engine_script_jmp;")
+        p("static int _engine_in_script = 0;")
+        p("static void _engine_null_reference_at(")
+        p("    const char *cls, const char *method,")
+        p("    const char *path, int line) {")
+        p("    fprintf(stderr, \"NullReferenceException: Object reference "
+          "not set to an instance of an object\\n\");")
+        p("    if (cls && method && path && path[0] && line > 0)")
+        p("        fprintf(stderr, \"%s.%s () (at %s:%d)\\n\",")
+        p("                cls, method, path, line);")
+        p("    else if (cls && method)")
+        p("        fprintf(stderr, \"%s.%s ()\\n\", cls, method);")
+        p("    if (_engine_in_script)")
+        p("        longjmp(_engine_script_jmp, 1);")
+        p("}")
+        p("")
         if want_add_any:
             p("static void _engine_cant_add_component("
               "const char *comp, int go) {")
@@ -5377,6 +6008,28 @@ def emit_engine(plan, analyses, used_apis):
     p("}")
     p("")
 
+    if want_ctor_forbidden:
+        p("/* Application.dataPath / persistentDataPath in field/.cctor. */")
+        p("static void _engine_unity_ctor_forbidden(")
+        p("    const char *api, const char *cls, const char *go_name,")
+        p("    const char *path, int line) {")
+        p("    fprintf(stderr,")
+        p("        \"UnityException: get_%s is not allowed to be called from a \"")
+        p("        \"MonoBehaviour constructor (or instance field initializer), \"")
+        p("        \"call it in Awake or Start instead. Called from MonoBehaviour \"")
+        p("        \"'%s' on game object '%s'.\\n\"")
+        p("        \"See \\\"Script Serialization\\\" page in the Unity Manual for \"")
+        p("        \"further details.\\n\"")
+        p("        \"UnityEngine.Application.get_%s () \"")
+        p("        \"(at <00000000000000000000000000000000>:0)\\n\"")
+        p("        \"%s..cctor () (at %s:%d)\\n\"")
+        p("        \"Rethrow as TypeInitializationException: The type \"")
+        p("        \"initializer for '%s' threw an exception.\\n\",")
+        p("        api, cls, go_name ? go_name : \"\", api, cls, path, line,")
+        p("        cls);")
+        p("}")
+        p("")
+
     # Extensions.SetWorldScale → live localScale on the referenced Transform's GO.
     if plan.get("transform_field_targets"):
         live = set(plan.get("live_scale_classes") or [])
@@ -5401,6 +6054,41 @@ def emit_engine(plan, analyses, used_apis):
         p("}")
         p("")
 
+    if want_live_rot:
+        p("/* Transform.Rotate(Space.Self): localRotation *= Euler(deg). */")
+        p("static void _engine_transform_rotate_local(")
+        p("    float *qx, float *qy, float *qz, float *qw,")
+        p("    float *m00, float *m01, float *m10, float *m11,")
+        p("    float ex_deg, float ey_deg, float ez_deg) {")
+        p("    float hx = ex_deg * 0.008726646259971648f;")
+        p("    float hy = ey_deg * 0.008726646259971648f;")
+        p("    float hz = ez_deg * 0.008726646259971648f;")
+        p("    float cx = cosf(hx); float sx = sinf(hx);")
+        p("    float cy = cosf(hy); float sy = sinf(hy);")
+        p("    float cz = cosf(hz); float sz = sinf(hz);")
+        p("    float ex = sx * cy * cz + cx * sy * sz;")
+        p("    float ey = cx * sy * cz - sx * cy * sz;")
+        p("    float ez = cx * cy * sz - sx * sy * cz;")
+        p("    float ew = cx * cy * cz + sx * sy * sz;")
+        p("    float nx = (*qw) * ex + (*qx) * ew + (*qy) * ez - (*qz) * ey;")
+        p("    float ny = (*qw) * ey - (*qx) * ez + (*qy) * ew + (*qz) * ex;")
+        p("    float nz = (*qw) * ez + (*qx) * ey - (*qy) * ex + (*qz) * ew;")
+        p("    float nw = (*qw) * ew - (*qx) * ex - (*qy) * ey - (*qz) * ez;")
+        p("    float m = sqrtf(nx * nx + ny * ny + nz * nz + nw * nw);")
+        p("    if (m > 1e-8f) {")
+        p("        nx = nx / m; ny = ny / m; nz = nz / m; nw = nw / m;")
+        p("    } else {")
+        p("        nx = 0.f; ny = 0.f; nz = 0.f; nw = 1.f;")
+        p("    }")
+        p("    *qx = nx; *qy = ny; *qz = nz; *qw = nw;")
+        p("    /* Ortho XY basis: R * (lx,ly,0) — X/Y tilt foreshortens. */")
+        p("    *m00 = 1.f - 2.f * (ny * ny + nz * nz);")
+        p("    *m01 = 2.f * (nx * ny - nz * nw);")
+        p("    *m10 = 2.f * (nx * ny + nz * nw);")
+        p("    *m11 = 1.f - 2.f * (nx * nx + nz * nz);")
+        p("}")
+        p("")
+
     # Group methods by class; array comment sits on the group.
     methods_by = {}
     for a in analyses:
@@ -5416,6 +6104,7 @@ def emit_engine(plan, analyses, used_apis):
         p("")
         # Class-level const / static fields (FRAME_CNT, LOG_FILE_PATH, …).
         data_path = plan.get("data_path") or ""
+        persistent_path = plan.get("persistent_data_path") or ""
         for f in cl.get("class_consts") or []:
             fname = f["name"]
             default = f.get("default")
@@ -5424,6 +6113,12 @@ def emit_engine(plan, analyses, used_apis):
                     path = data_path + (default.get("suffix") or "")
                 elif isinstance(default, dict) and default.get("kind") == "dataPath":
                     path = data_path
+                elif (isinstance(default, dict)
+                      and default.get("kind") == "persistentDataPath+"):
+                    path = persistent_path + (default.get("suffix") or "")
+                elif (isinstance(default, dict)
+                      and default.get("kind") == "persistentDataPath"):
+                    path = persistent_path
                 elif isinstance(default, str):
                     path = default
                 else:
@@ -5467,7 +6162,17 @@ def emit_engine(plan, analyses, used_apis):
         for c, m in methods_by.get(cname, []):
             if m["name"] in ("Awake", "OnEnable"):
                 continue
-            body = _lower_method_body(m["body"], cl, plan)
+            # TypeInitializer failed — do not lower or run script methods.
+            if cl.get("ctor_forbidden"):
+                continue
+            site = {
+                "class": cname,
+                "method": m["name"],
+                "path": _assets_rel_path(c.get("path") or cl.get("path") or ""),
+                "body_abs": int(m.get("body_abs") or 0),
+                "file_text": c.get("file_text") or "",
+            }
+            body = _lower_method_body(m["body"], cl, plan, site=site)
             p("static void %s_%s(unsigned i) {" % (idn, m["name"]))
             for line in body.split("\n"):
                 if line.strip():
@@ -5476,19 +6181,67 @@ def emit_engine(plan, analyses, used_apis):
             p("")
 
         # Tick: Start once (Unity), then FixedUpdate / Update.
+        # Script exceptions longjmp here — Unity continues the player loop.
+        def _call_script(method, indent="            "):
+            if want_go_tables:
+                p(indent + "_engine_in_script = 1;")
+                p(indent + "if (setjmp(_engine_script_jmp) == 0)")
+                p(indent + "    %s_%s((unsigned)n);" % (idn, method))
+                p(indent + "_engine_in_script = 0;")
+            else:
+                p(indent + "%s_%s((unsigned)n);" % (idn, method))
+
         has_start = any(m["name"] == "Start"
                         for _c, m in methods_by.get(cname, []))
         has_fixed = any(m["name"] == "FixedUpdate"
                         for _c, m in methods_by.get(cname, []))
         has_update = any(m["name"] == "Update"
                          for _c, m in methods_by.get(cname, []))
+        ctor_forbidden = list(cl.get("ctor_forbidden") or [])
+        if ctor_forbidden:
+            # Unity TypeInitializationException — spam each frame, no script.
+            fb = ctor_forbidden[0]
+            api = fb.get("api") or "persistentDataPath"
+            line = int(fb.get("line") or 0)
+            spath = _assets_rel_path(
+                cl.get("script_path") or cl.get("path") or "")
+            p("void %s_FixedTick(void) { /* type init failed */ }" % idn)
+            p("")
+            p("void %s_Tick(void) {" % idn)
+            p("    int n;")
+            p("    for (n = 0; n < _%s_inst_count; n = n + 1) {" % idn)
+            p("        const char *_gon = \"\";")
+            if want_go_tables:
+                p("        {")
+                p("            int _dgo = _engine_go_of_%s((unsigned)n);" % idn)
+                p("            if (_dgo >= 0 && _dgo < _engine_go_count)")
+                p("                _gon = _engine_go_name[_dgo];")
+                p("        }")
+            else:
+                # Fall back to authored instance name.
+                for i, o in enumerate(cl.get("instances") or []):
+                    if i == 0:
+                        p("        if (n == 0) _gon = %s;"
+                          % _c_string(o.get("name") or cname))
+                    else:
+                        p("        else if (n == %d) _gon = %s;"
+                          % (i, _c_string(o.get("name") or cname)))
+            p("        _engine_unity_ctor_forbidden(")
+            p("            %s, %s, _gon, %s, %d);"
+              % (_c_string(api), _c_string(cname), _c_string(spath), line))
+            p("    }")
+            p("}")
+            p("")
+            continue
+
         if has_start:
             p("static int _%s_started = 0;" % idn)
         p("void %s_FixedTick(void) {" % idn)
         if has_fixed:
             p("    int n;")
-            p("    for (n = 0; n < _%s_inst_count; n = n + 1)" % idn)
-            p("        %s_FixedUpdate((unsigned)n);" % idn)
+            p("    for (n = 0; n < _%s_inst_count; n = n + 1) {" % idn)
+            _call_script("FixedUpdate", "        ")
+            p("    }")
         else:
             p("    /* no FixedUpdate */")
         p("}")
@@ -5499,8 +6252,9 @@ def emit_engine(plan, analyses, used_apis):
         if has_start:
             p("    if (!_%s_started) {" % idn)
             p("        _%s_started = 1;" % idn)
-            p("        for (n = 0; n < _%s_inst_count; n = n + 1)" % idn)
-            p("            %s_Start((unsigned)n);" % idn)
+            p("        for (n = 0; n < _%s_inst_count; n = n + 1) {" % idn)
+            _call_script("Start", "            ")
+            p("        }")
             p("    }")
         if has_update:
             p("    for (n = 0; n < _%s_inst_count; n = n + 1) {" % idn)
@@ -5510,7 +6264,7 @@ def emit_engine(plan, analyses, used_apis):
                 p("            if (_dgo >= 0 && _engine_go_destroyed[_dgo])")
                 p("                continue;")
                 p("        }")
-            p("        %s_Update((unsigned)n);" % idn)
+            _call_script("Update", "        ")
             p("    }")
         elif not has_start:
             p("    /* no Update */")
@@ -6151,16 +6905,31 @@ def emit_engine(plan, analyses, used_apis):
         p("")
 
     p("void engine_tick(void) {")
+    p("    /* Unity fixed clock: accumulate frame dt, step at fixedDeltaTime. */")
+    p("    static float _engine_fixed_accum = 0.f;")
+    p("    float _dt = Time_deltaTime;")
+    p("    float _fixed_dt;")
+    p("    int _fixed_guard;")
+    p("    if (_dt > 0.33333334f) _dt = 0.33333334f; /* Time.maximumDeltaTime */")
+    p("    if (_dt < 0.f) _dt = 0.f;")
     if "Time.time" in used_apis:
         p("    Time_time = Time_time + Time_deltaTime;")
     if want_ui:
         p("    engine_ui_tick();")
     if want_anim and anim_players:
         p("    engine_animation_tick();")
+    p("    _engine_fixed_accum = _engine_fixed_accum + _dt;")
+    p("    _fixed_dt = Time_fixedDeltaTime;")
+    p("    if (_fixed_dt < 1e-8f) _fixed_dt = 0.02f;")
+    p("    _fixed_guard = 0;")
+    p("    while (_engine_fixed_accum >= _fixed_dt && _fixed_guard < 50) {")
     for cname in sorted(plan["classes"]):
-        p("    %s_FixedTick();" % _c_ident(cname))
+        p("        %s_FixedTick();" % _c_ident(cname))
     if want_rb2d or want_rb3d:
-        p("    engine_physics_fixed();")
+        p("        engine_physics_fixed();")
+    p("        _engine_fixed_accum = _engine_fixed_accum - _fixed_dt;")
+    p("        _fixed_guard = _fixed_guard + 1;")
+    p("    }")
     for cname in sorted(plan["classes"]):
         p("    %s_Tick();" % _c_ident(cname))
     if plan.get("camera_follows_parent"):
@@ -6175,7 +6944,7 @@ def emit_engine(plan, analyses, used_apis):
     p("/* ---- draw list (SpriteRenderer + texture; see engine_draw.h) ---- */")
     p("typedef struct EngineDraw {")
     p("    float x, y, half_w, half_h;")
-    p("    float cos_z, sin_z; /* m_LocalRotation around Z */")
+    p("    float m00, m01, m10, m11; /* local XY → world XY (full quat) */")
     p("    float r, g, b;")
     p("    float a; /* tint alpha (SpriteRenderer 1; Image m_Color.a) */")
     p("    int tex; /* index into engine_texture_*; -1 = none */")
@@ -6252,6 +7021,7 @@ def emit_engine(plan, analyses, used_apis):
         any_sprite = True
         use_mut = cname in mutable_spr
         use_scale = cname in set(plan.get("live_scale_classes") or [])
+        use_rot = cname in set(plan.get("live_rot_classes") or [])
         p("    { /* %s SpriteRenderer */" % idn)
         p("        static const float _spr_r[] = { %s };" % ", ".join(
             "%sf" % repr(float(sp["r"])) for _i, sp in spr_idx))
@@ -6268,10 +7038,19 @@ def emit_engine(plan, analyses, used_apis):
                 "%sf" % repr(float(sp["half_h"])) for _i, sp in spr_idx))
             p("        static const int _spr_tex[] = { %s };" % ", ".join(
                 str(int(sp["tex_id"])) for _i, sp in spr_idx))
-        p("        static const float _spr_cos[] = { %s };" % ", ".join(
-            "%sf" % repr(float(sp.get("cos_z", 1.0))) for _i, sp in spr_idx))
-        p("        static const float _spr_sin[] = { %s };" % ", ".join(
-            "%sf" % repr(float(sp.get("sin_z", 0.0))) for _i, sp in spr_idx))
+        if not use_rot:
+            p("        static const float _spr_m00[] = { %s };" % ", ".join(
+                "%sf" % repr(float(sp.get("m00", sp.get("cos_z", 1.0))))
+                for _i, sp in spr_idx))
+            p("        static const float _spr_m01[] = { %s };" % ", ".join(
+                "%sf" % repr(float(sp.get("m01", -float(sp.get("sin_z", 0.0)))))
+                for _i, sp in spr_idx))
+            p("        static const float _spr_m10[] = { %s };" % ", ".join(
+                "%sf" % repr(float(sp.get("m10", sp.get("sin_z", 0.0))))
+                for _i, sp in spr_idx))
+            p("        static const float _spr_m11[] = { %s };" % ", ".join(
+                "%sf" % repr(float(sp.get("m11", sp.get("cos_z", 1.0))))
+                for _i, sp in spr_idx))
         p("        static const int _spr_layer[] = { %s };" % ", ".join(
             str(int(sp.get("sorting_layer") or 0)) for _i, sp in spr_idx))
         p("        static const int _spr_order[] = { %s };" % ", ".join(
@@ -6382,8 +7161,16 @@ def emit_engine(plan, analyses, used_apis):
             p("            }")
         else:
             _emit_world_draw("            ")
-        p("            out[n].cos_z = _spr_cos[k];")
-        p("            out[n].sin_z = _spr_sin[k];")
+        if use_rot:
+            p("            out[n].m00 = _%s_rot_m00[i];" % idn)
+            p("            out[n].m01 = _%s_rot_m01[i];" % idn)
+            p("            out[n].m10 = _%s_rot_m10[i];" % idn)
+            p("            out[n].m11 = _%s_rot_m11[i];" % idn)
+        else:
+            p("            out[n].m00 = _spr_m00[k];")
+            p("            out[n].m01 = _spr_m01[k];")
+            p("            out[n].m10 = _spr_m10[k];")
+            p("            out[n].m11 = _spr_m11[k];")
         p("            out[n].r = _spr_r[k];")
         p("            out[n].g = _spr_g[k];")
         p("            out[n].b = _spr_b[k];")
@@ -6466,7 +7253,7 @@ def emit_engine_draw_h():
         "\n"
         "typedef struct EngineDraw {\n"
         "    float x, y, half_w, half_h;\n"
-        "    float cos_z, sin_z; /* m_LocalRotation around Z */\n"
+        "    float m00, m01, m10, m11; /* local XY → world XY (full quat) */\n"
         "    float r, g, b;\n"
         "    float a; /* tint alpha */\n"
         "    int tex; /* engine_texture_* index; -1 if none */\n"
@@ -6501,6 +7288,8 @@ def emit_engine_draw_h():
         "void engine_apply_argv(int argc, char **argv);\n"
         "const char *engine_console_log_path(void); /* Application.consoleLogPath */\n"
         "const char *engine_data_path(void); /* Application.dataPath */\n"
+        "const char *engine_persistent_data_path(void); "
+        "/* Application.persistentDataPath */\n"
         "\n"
         "#endif\n"
     )
@@ -6557,6 +7346,107 @@ def _rewrite_new_vector_assigns(text, idn):
     return text
 
 
+_VECTOR3_AXIS = {
+    "right": (1.0, 0.0, 0.0),
+    "left": (-1.0, 0.0, 0.0),
+    "up": (0.0, 1.0, 0.0),
+    "down": (0.0, -1.0, 0.0),
+    "forward": (0.0, 0.0, 1.0),
+    "back": (0.0, 0.0, -1.0),
+}
+
+
+def _rewrite_transform_rotate(text, cl):
+    """Lower transform.Rotate(...) → _engine_transform_rotate_local on packed quat.
+
+    Supports:
+      transform.Rotate(new Vector3(x, y, z));
+      transform.Rotate(x, y, z);
+      transform.Rotate(Vector3.right * expr);  # and up/forward/left/down/back
+      optional trailing Space.Self / Space.World (World treated as Self for now)
+    Degrees, local composition like Unity Space.Self.
+    """
+    idn = _c_ident(cl["name"])
+    out = []
+    i = 0
+    while i < len(text):
+        m = re.search(
+            r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*Rotate\s*\(",
+            text[i:])
+        if not m:
+            out.append(text[i:])
+            break
+        start = i + m.start()
+        open_paren = i + m.end() - 1
+        parsed = _match_call_args(text, open_paren)
+        if not parsed:
+            out.append(text[i:open_paren + 1])
+            i = open_paren + 1
+            continue
+        args_str, after = parsed
+        # Optional trailing semicolon.
+        j = after
+        while j < len(text) and text[j] in " \t\r\n":
+            j += 1
+        if j < len(text) and text[j] == ";":
+            j += 1
+        out.append(text[i:start])
+        args = _split_call_args(args_str)
+        ex = ey = ez = None
+
+        def _vec_from_arg(a):
+            a = a.strip()
+            nm = re.match(r"new\s+Vector3\s*\((.*)\)$", a, flags=re.S)
+            if nm:
+                vargs = _split_call_args(nm.group(1))
+                if len(vargs) >= 3:
+                    return vargs[0], vargs[1], vargs[2]
+            am = re.match(
+                r"Vector3\.(right|left|up|down|forward|back)\s*\*\s*(.+)$",
+                a, flags=re.S)
+            if am:
+                ax, ay, az = _VECTOR3_AXIS[am.group(1)]
+                expr = am.group(2).strip()
+
+                def _axis_comp(c):
+                    if c == 0.0:
+                        return "0.f"
+                    if c == 1.0:
+                        return "(%s)" % expr
+                    if c == -1.0:
+                        return "-(%s)" % expr
+                    return "(%s) * %sf" % (expr, repr(c))
+
+                return (_axis_comp(ax), _axis_comp(ay), _axis_comp(az))
+            return None
+
+        if len(args) == 3 or (
+                len(args) == 4
+                and re.match(r"Space\.\w+", args[3].strip())):
+            ex, ey, ez = args[0], args[1], args[2]
+        elif len(args) == 1:
+            hit = _vec_from_arg(args[0])
+            if hit:
+                ex, ey, ez = hit
+        elif len(args) == 2 and re.match(r"Space\.\w+", args[1].strip()):
+            hit = _vec_from_arg(args[0])
+            if hit:
+                ex, ey, ez = hit
+        if ex is None:
+            # Unsupported overload — keep source (should be rare).
+            out.append(text[start:j])
+        else:
+            out.append(
+                "_engine_transform_rotate_local("
+                "&_%s_rot_x[i], &_%s_rot_y[i], &_%s_rot_z[i], &_%s_rot_w[i], "
+                "&_%s_rot_m00[i], &_%s_rot_m01[i], &_%s_rot_m10[i], "
+                "&_%s_rot_m11[i], "
+                "(%s), (%s), (%s));"
+                % (idn, idn, idn, idn, idn, idn, idn, idn, ex, ey, ez))
+        i = j
+    return "".join(out)
+
+
 def _skip_c_string(text, i):
     """Index just past a C/C# string literal starting at text[i] == '\"'."""
     j = i + 1
@@ -6604,11 +7494,14 @@ def _parse_plus_rhs(text, i):
     return start, i
 
 
-def _rewrite_string_concat(text):
+def _rewrite_string_concat(text, string_idents=None):
     """Rewrite C# string + value to typed _str_plus_* (C pointer + is wrong).
 
-    Handles `"lit" + expr` and chains via repeated `_str_plus_*(...) + expr`.
+    Handles `"lit" + expr`, `Application_*Path() + expr`, and chains via
+    repeated `_str_plus_*(...) + expr`. `string_idents` are bare names known
+    to be `string` (class static/const fields) so RHS picks `_str_plus_s`.
     """
+    string_idents = frozenset(string_idents or ())
     changed = True
     while changed:
         changed = False
@@ -6618,6 +7511,9 @@ def _rewrite_string_concat(text):
             left = None
             left_end = None
             m_plus = re.match(r"_str_plus_[ifcs]\(", text[i:])
+            m_app = re.match(
+                r"Application_(?:dataPath|persistentDataPath)\(\)",
+                text[i:])
             if m_plus or text.startswith("_str_plus(", i):
                 prefix = m_plus.group(0) if m_plus else "_str_plus("
                 depth = 0
@@ -6636,6 +7532,9 @@ def _rewrite_string_concat(text):
                     j += 1
                 left = text[i:j]
                 left_end = j
+            elif m_app:
+                left = m_app.group(0)
+                left_end = i + len(left)
             elif text[i] == '"':
                 j = _skip_c_string(text, i)
                 left = text[i:j]
@@ -6648,7 +7547,8 @@ def _rewrite_string_concat(text):
                     rhs_start, rhs_end = _parse_plus_rhs(text, k + 1)
                     rhs = text[rhs_start:rhs_end].strip()
                     if rhs:
-                        kind = _c_expr_scalar_kind(rhs)
+                        kind = _c_expr_scalar_kind(
+                            rhs, string_idents=string_idents)
                         out.append("_str_plus_%s(%s, (%s))"
                                    % (kind, left, rhs))
                         i = rhs_end
@@ -6660,8 +7560,9 @@ def _rewrite_string_concat(text):
     return text
 
 
-def _c_expr_scalar_kind(expr):
+def _c_expr_scalar_kind(expr, string_idents=None):
     """Pick i/f/c/s suffix for Debug_Log / Console_WriteLine / _str_plus."""
+    string_idents = frozenset(string_idents or ())
     e = expr.strip()
     while (e.startswith("(") and e.endswith(")")
            and e.count("(") == e.count(")")):
@@ -6670,7 +7571,10 @@ def _c_expr_scalar_kind(expr):
             break
         e = inner
     if (e.startswith('"') or e.startswith("_str_plus")
-            or "ToString" in e or e.startswith("(const char")):
+            or "ToString" in e or e.startswith("(const char")
+            or e in ("Application_dataPath()",
+                     "Application_persistentDataPath()")
+            or (re.match(r"^\w+$", e) and e in string_idents)):
         return "s"
     if re.match(r"^'(?:[^'\\]|\\.)'$", e):
         return "c"
@@ -6810,7 +7714,7 @@ def _rewrite_csharp_float_literals(text):
     return "".join(out)
 
 
-def _lower_method_body(body, cl, plan):
+def _lower_method_body(body, cl, plan, site=None):
     """C# subset method → C against packed arrays.
 
     `this` / implicit fields become `_Class_inst_array[i].field`.
@@ -6822,8 +7726,9 @@ def _lower_method_body(body, cl, plan):
     text = re.sub(r"\bthis\.", "", text)
     text = _rewrite_extensions_set_world_scale(text, cl, plan)
     text = _rewrite_rigidbody_assigns(text, plan, cl["name"])
+    text = _rewrite_transform_rotate(text, cl)
     # Find/GetComponent before field rewrites so `.amp` stays on the target type.
-    text = _rewrite_find_getcomponent(text, plan, cl["name"])
+    text = _rewrite_find_getcomponent(text, plan, cl["name"], site=site)
     text, add_locals = _rewrite_addcomponent(text, plan, cl["name"])
     # API tokens before Vector2 rewrites so nested Mathf.Sin(...) keeps parens.
     text = text.replace("Time.deltaTime", "Time_deltaTime")
@@ -6834,6 +7739,9 @@ def _lower_method_body(body, cl, plan):
     text = re.sub(
         r"(?:UnityEngine\.)?Application\.dataPath\b",
         "Application_dataPath()", text)
+    text = re.sub(
+        r"(?:UnityEngine\.)?Application\.persistentDataPath\b",
+        "Application_persistentDataPath()", text)
     text = re.sub(
         r"(?:System\.IO\.)?File\.WriteAllText\s*\(",
         "File_WriteAllText(", text)
@@ -6889,7 +7797,11 @@ def _lower_method_body(body, cl, plan):
     text = _strip_debug_log_context_arg(text)
     text = re.sub(r"System\.Console\.WriteLine\b", "Console_WriteLine", text)
     text = re.sub(r"(?<![\w.])Console\.WriteLine\b", "Console_WriteLine", text)
-    text = _rewrite_string_concat(text)
+    string_idents = {
+        f["name"] for f in (cl.get("class_consts") or [])
+        if f.get("ty") == "string"
+    }
+    text = _rewrite_string_concat(text, string_idents=string_idents)
     # Unity Object.ToString when printing a Find result (name, not index).
     text = _wrap_log_gameobject_tostring(text)
     text = _wrap_log_component_tostring(text, add_locals)
@@ -7049,9 +7961,7 @@ def emit_data(plan, used_apis=None):
     p("float Time_deltaTime = 0.0166667f;")
     if "Time.time" in used_apis:
         p("float Time_time = 0.f;")
-    if ("Time.fixedDeltaTime" in used_apis or want_phys or want_phys3
-            or rb2d_list or rb3d_list):
-        p("float Time_fixedDeltaTime = 0.02f;")
+    p("float Time_fixedDeltaTime = 0.02f;")
     if want_phys:
         p("float Physics2D_gravity_x = 0.f;")
         p("float Physics2D_gravity_y = -9.81f;")
@@ -7394,6 +8304,53 @@ def emit_data(plan, used_apis=None):
             idn, n, ", ".join("%sf" % repr(v) for v in sxs)))
         p("float _%s_scale_y[%d] = { %s };" % (
             idn, n, ", ".join("%sf" % repr(v) for v in sys)))
+    # Live localRotation for Transform.Rotate targets.
+    for cname in sorted(plan.get("live_rot_classes") or []):
+        cl = plan["classes"].get(cname)
+        if not cl:
+            continue
+        idn = _c_ident(cname)
+        n = max(1, cl["n"])
+        rxs, rys, rzs, rws = [], [], [], []
+        m00s, m01s, m10s, m11s = [], [], [], []
+        for o in cl["instances"]:
+            lr = o.get("local_rot") or o.get("rot") or (0.0, 0.0, 0.0, 1.0)
+            qx, qy, qz, qw = (float(lr[0]), float(lr[1]),
+                              float(lr[2]), float(lr[3]))
+            rxs.append(qx)
+            rys.append(qy)
+            rzs.append(qz)
+            rws.append(qw)
+            m00, m01, m10, m11 = _quat_xy_basis(qx, qy, qz, qw)
+            m00s.append(m00)
+            m01s.append(m01)
+            m10s.append(m10)
+            m11s.append(m11)
+        while len(rxs) < n:
+            rxs.append(0.0)
+            rys.append(0.0)
+            rzs.append(0.0)
+            rws.append(1.0)
+            m00s.append(1.0)
+            m01s.append(0.0)
+            m10s.append(0.0)
+            m11s.append(1.0)
+        p("float _%s_rot_x[%d] = { %s };" % (
+            idn, n, ", ".join("%sf" % repr(v) for v in rxs)))
+        p("float _%s_rot_y[%d] = { %s };" % (
+            idn, n, ", ".join("%sf" % repr(v) for v in rys)))
+        p("float _%s_rot_z[%d] = { %s };" % (
+            idn, n, ", ".join("%sf" % repr(v) for v in rzs)))
+        p("float _%s_rot_w[%d] = { %s };" % (
+            idn, n, ", ".join("%sf" % repr(v) for v in rws)))
+        p("float _%s_rot_m00[%d] = { %s };" % (
+            idn, n, ", ".join("%sf" % repr(v) for v in m00s)))
+        p("float _%s_rot_m01[%d] = { %s };" % (
+            idn, n, ", ".join("%sf" % repr(v) for v in m01s)))
+        p("float _%s_rot_m10[%d] = { %s };" % (
+            idn, n, ", ".join("%sf" % repr(v) for v in m10s)))
+        p("float _%s_rot_m11[%d] = { %s };" % (
+            idn, n, ", ".join("%sf" % repr(v) for v in m11s)))
     # Transform field targets (graphicsTrs → Graphics, etc.).
     for (oc, fname), row in sorted(
             (plan.get("transform_field_targets") or {}).items()):
@@ -7481,6 +8438,12 @@ def emit_data(plan, used_apis=None):
                     parts.append(_init_num(sz, kind))
                 elif name in o["fields"]:
                     parts.append(_init_num(o["fields"][name], kind))
+                elif kind == "idx:Rigidbody2D":
+                    parts.append(str(_rb_field_init_index(
+                        plan, o, name, "2d")))
+                elif kind == "idx:Rigidbody":
+                    parts.append(str(_rb_field_init_index(
+                        plan, o, name, "3d")))
                 else:
                     dflt = _member_init_default(cl, name)
                     if dflt is not None:
@@ -7501,6 +8464,25 @@ def emit_data(plan, used_apis=None):
         p("};")
         p("")
     return "\n".join(lines) + "\n"
+
+
+def _rb_field_init_index(plan, o, fname, kind):
+    """Serialized Rigidbody(2D) field → packed table index (-1 if missing)."""
+    refs = o.get("object_refs") or {}
+    fid = refs.get(fname)
+    if kind == "2d":
+        by_fid = plan.get("rb2d_by_file_id") or {}
+        by_go = plan.get("go_rigidbody2d") or {}
+    else:
+        by_fid = plan.get("rb3d_by_file_id") or {}
+        by_go = plan.get("go_rigidbody") or {}
+    if fid is not None and str(fid) != "0" and str(fid) in by_fid:
+        return int(by_fid[str(fid)])
+    # Same-GO self ref when YAML omitted the PPtr target.
+    n = o.get("name") or "obj"
+    if n in by_go:
+        return int(by_go[n])
+    return -1
 
 
 def _init_num(v, kind):
@@ -7828,6 +8810,7 @@ def pack(root, outdir, soa=False, soa_vec4=False):
     plan["product_name"] = product
     plan["project_root"] = os.path.abspath(root)
     plan["data_path"] = os.path.join(os.path.abspath(root), "Assets")
+    plan["persistent_data_path"] = unity_persistent_data_path(company, product)
     sw, sh, sfs, snative, smax = player_display(root)
     plan["screen_width"] = sw
     plan["screen_height"] = sh
@@ -7839,11 +8822,14 @@ def pack(root, outdir, soa=False, soa_vec4=False):
     plan["go_components"] = go_comps
     plan["go_parents"] = _build_go_parents(plan)
     plan["ui_buttons"] = _build_ui_buttons(plan)
-    rb2d, rb3d, go_rb2d, go_rb3d = _build_rigidbody_tables(plan)
+    rb2d, rb3d, go_rb2d, go_rb3d, rb2d_by_fid, rb3d_by_fid = (
+        _build_rigidbody_tables(plan))
     plan["rigidbody2d"] = rb2d
     plan["rigidbody"] = rb3d
     plan["go_rigidbody2d"] = go_rb2d
     plan["go_rigidbody"] = go_rb3d
+    plan["rb2d_by_file_id"] = rb2d_by_fid
+    plan["rb3d_by_file_id"] = rb3d_by_fid
     _attach_transform_parents(plan)
     plan["collider2d"] = _build_collider2d_tables(plan)
     plan["collider3d"] = _build_collider3d_tables(plan)

@@ -1,11 +1,9 @@
 using UnityEngine;
 
-/* Physics: authored Rigidbody2D integrates under Physics2D.gravity. */
-public class Ball : MonoBehaviour {
-    public Rigidbody2D rb;
-
-    void Start ()
-    {
-        // rb.linearVelocity = Vector2.right / 2;
-    }
+public class Ball : MonoBehaviour
+{
+	void Update ()
+	{
+		transform.Rotate(Vector3.right * 90 * Time.deltaTime);
+	}
 }

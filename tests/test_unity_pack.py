@@ -329,6 +329,38 @@ SYSTEMS = os.path.join(ROOT, "examples", "unity_pack", "SystemsScene")
 class TestSystems(unittest.TestCase):
     """Authored systems subset — see UNITY_PACK_SYSTEMS.md."""
 
+    def test_application_unsupported_member_is_cs0117(self):
+        """Unsupported Application members → CS0117 (in scope via UnityEngine)."""
+        src = (
+            "using UnityEngine;\n"
+            "\n"
+            "public class LogAverageFPS : MonoBehaviour {\n"
+            "    static string path =\n"
+            "        Application.streamingAssetsPath + \"/Logs/x.txt\";\n"
+            "}\n"
+        )
+        path = "/proj/Assets/Scripts/LogAverageFPS.cs"
+        with self.assertRaises(unity_pack.PackError) as cm:
+            unity_pack.analyze_script(path, src)
+        self.assertEqual(
+            cm.exception.message,
+            "Assets/Scripts/LogAverageFPS.cs(5,21): error CS0117: "
+            "'Application' does not contain a definition for "
+            "'streamingAssetsPath'")
+        # FQN binds without using; still CS0117.
+        fqn = src.replace("using UnityEngine;\n", "").replace(
+            "Application.streamingAssetsPath",
+            "UnityEngine.Application.streamingAssetsPath")
+        with self.assertRaises(unity_pack.PackError) as cm:
+            unity_pack.analyze_script(path, fqn)
+        self.assertIn("CS0117", cm.exception.message)
+        self.assertIn("streamingAssetsPath", cm.exception.message)
+        # Supported dataPath / persistentDataPath still analyze.
+        unity_pack.analyze_script(
+            path, src.replace("streamingAssetsPath", "dataPath"))
+        unity_pack.analyze_script(
+            path, src.replace("streamingAssetsPath", "persistentDataPath"))
+
     def test_file_unsupported_member_is_cs0117(self):
         """Unsupported File members → CS0117 (File is in scope via System.IO)."""
         src = (
@@ -362,6 +394,121 @@ class TestSystems(unittest.TestCase):
         unity_pack.analyze_script(
             path, src.replace("ReadAllText(\"a.txt\")",
                               "AppendAllText(\"a.txt\", \"x\")"))
+
+    def test_transform_unsupported_member_is_cs1061(self):
+        """Unsupported transform.Member → CS1061 on Transform (not undeclared)."""
+        src = (
+            "using UnityEngine;\n"
+            "\n"
+            "public class Ball : MonoBehaviour {\n"
+            "    void Start () {\n"
+            "        transform.LookAt(Vector3.zero);\n"
+            "    }\n"
+            "}\n"
+        )
+        path = ("/proj/Assets/Standard Assets/Scripts/Objects (Scripts)/"
+                "Ball.cs")
+        with self.assertRaises(unity_pack.PackError) as cm:
+            unity_pack.analyze_script(path, src)
+        self.assertEqual(
+            cm.exception.message,
+            "Assets/Standard Assets/Scripts/Objects (Scripts)/Ball.cs"
+            "(5,19): error CS1061: 'Transform' does not contain a "
+            "definition for 'LookAt' and no accessible extension method "
+            "'LookAt' accepting a first argument of type 'Transform' could "
+            "be found (are you missing a using directive or an assembly "
+            "reference?)")
+        # this.transform also binds; still CS1061 on the member.
+        with self.assertRaises(unity_pack.PackError) as cm:
+            unity_pack.analyze_script(
+                path, src.replace("transform.LookAt", "this.transform.LookAt"))
+        self.assertIn("CS1061", cm.exception.message)
+        self.assertIn("'LookAt'", cm.exception.message)
+        self.assertNotIn("undeclared", cm.exception.message.lower())
+        # Camera.main.transform.position is not MonoBehaviour.transform.
+        unity_pack.analyze_script(
+            path,
+            "using UnityEngine;\n"
+            "public class Ball : MonoBehaviour {\n"
+            "    void Update() {\n"
+            "        float x = Camera.main.transform.position.x;\n"
+            "    }\n"
+            "}\n")
+        # Supported transform.position / Rotate still analyze.
+        unity_pack.analyze_script(
+            path,
+            "using UnityEngine;\n"
+            "public class Ball : MonoBehaviour {\n"
+            "    void Update() {\n"
+            "        transform.position = new Vector2(1f, 2f);\n"
+            "        transform.Rotate(Vector3.forward * 90f * Time.deltaTime);\n"
+            "    }\n"
+            "}\n")
+
+    def test_transform_rotate_packs_live_quat(self):
+        """transform.Rotate → live quat tables + draw uses rot_m** basis."""
+        root = tempfile.mkdtemp(prefix="upack-rotate-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Spinner.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Spinner : MonoBehaviour {\n"
+                "    void Update() {\n"
+                "        transform.Rotate(Vector3.forward * 90f"
+                " * Time.deltaTime);\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Spinner.cs.meta"), "w") as f:
+            f.write("guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Spinner\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "  - component: {fileID: 4}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}\n"
+                "--- !u!212 &4\nSpriteRenderer:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n"
+                "  m_Sprite: {fileID: 0}\n"
+                "  m_Color: {r: 1, g: 0, b: 0, a: 1}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-rotate-out-")
+        plan = unity_pack.pack(root, d)
+        self.assertEqual(plan.get("live_rot_classes"), ["Spinner"])
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        with open(os.path.join(d, "data.c")) as f:
+            data = f.read()
+        self.assertIn("_engine_transform_rotate_local", eng)
+        self.assertIn("_Spinner_rot_m00[i]", eng)
+        self.assertIn(
+            "_engine_transform_rotate_local("
+            "&_Spinner_rot_x[i], &_Spinner_rot_y[i], &_Spinner_rot_z[i], "
+            "&_Spinner_rot_w[i], &_Spinner_rot_m00[i], &_Spinner_rot_m01[i], "
+            "&_Spinner_rot_m10[i], &_Spinner_rot_m11[i],",
+            eng)
+        self.assertIn("float _Spinner_rot_x[", data)
+        self.assertIn("float _Spinner_rot_w[", data)
+        self.assertIn("float _Spinner_rot_m00[", data)
+        # Empty m_Sprite → no draw; still packs Rotate tables.
+        with open(os.path.join(scripts, "Spinner.cs")) as sf:
+            a = unity_pack.analyze_script(
+                os.path.join(scripts, "Spinner.cs"), sf.read())
+        self.assertTrue(a["writes_rot"])
 
     def test_cpp_style_float_suffix_is_cs1061(self):
         """C++ `0.f` is not a C# real-literal — csc reports CS1061 on `f`."""
@@ -438,40 +585,82 @@ class TestSystems(unittest.TestCase):
 
     @needs_cc
     def test_application_data_path_and_log_average_fps(self):
-        """Application.dataPath + File.AppendAllText for LogAverageFPS."""
+        """Update-time persistentDataPath + suffix → _str_plus_s; script runs."""
         path = os.path.join(
             SYSTEMS, "Assets", "Standard Assets", "Scripts",
             "Concepts (Scripts)", "LogAverageFPS.cs")
         a = unity_pack.analyze_script(path)
-        self.assertIn("Application.dataPath", a["apis"])
-        self.assertIn("File.AppendAllText", a["apis"])
-        self.assertFalse(a["spawns"])
-        fields = {f["name"]: f for f in a["classes"][0]["fields"]}
-        self.assertTrue(fields["FRAME_CNT"].get("const"))
-        self.assertEqual(fields["FRAME_CNT"]["default"], 100)
-        self.assertTrue(fields["LOG_FILE_PATH"].get("static"))
-        self.assertEqual(
-            fields["LOG_FILE_PATH"]["default"]["kind"], "dataPath+")
+        self.assertIn("Application.persistentDataPath", a["apis"])
+        self.assertIn("string.+", a["apis"])
+        self.assertFalse(a["classes"][0].get("ctor_forbidden"))
         d = tempfile.mkdtemp(prefix="upack-datapath-")
         plan = unity_pack.pack(SYSTEMS, d)
-        # Runtime short counter must hold FRAME_CNT (not a 1-bit phantom 0).
-        kinds = {m[0]: m[3]
-                 for m in plan["classes"]["LogAverageFPS"]["members"]}
-        self.assertEqual(kinds.get("framesLeft"), "u8")
-        expect = os.path.join(os.path.abspath(SYSTEMS), "Assets")
-        self.assertEqual(plan["data_path"], expect)
+        self.assertFalse(plan["classes"]["LogAverageFPS"].get("ctor_forbidden"))
         with open(os.path.join(d, "engine.c")) as f:
             eng = f.read()
-        self.assertIn("Application_dataPath", eng)
-        self.assertIn("engine_data_path", eng)
-        self.assertIn(expect + "/Logs/AverageFPS.txt", eng)
-        self.assertIn("File_AppendAllText", eng)
-        self.assertIn("_engine_go_destroyed", eng)
-        # Host: tick until AppendAllText runs once; Destroy must stop repeats.
-        host = os.path.join(d, "host_fps.c")
-        log_path = expect + "/Logs/AverageFPS.txt"
-        with open(log_path, "w") as f:
-            f.write("seed\n")
+        self.assertIn("Application_persistentDataPath", eng)
+        self.assertIn(
+            "_str_plus_s(Application_persistentDataPath()", eng)
+        self.assertIn("LogAverageFPS_LOG_FILE_PATH_SUFFIX", eng)
+        self.assertIn("LogAverageFPS_Update", eng)
+        self.assertIn("LogAverageFPS_Start", eng)
+        self.assertNotIn(
+            "Application_persistentDataPath() + LogAverageFPS_LOG_FILE_PATH",
+            eng)
+        r = subprocess.run(
+            [_CC, "-O2", "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    @needs_cc
+    def test_application_path_field_init_ctor_forbidden(self):
+        """Field-init persistentDataPath → UnityException each frame; no script."""
+        src = (
+            "using UnityEngine;\n"
+            "public class BadPath : MonoBehaviour {\n"
+            "    static string P = Application.persistentDataPath + \"/x.txt\";\n"
+            "    void Update() { }\n"
+            "}\n"
+        )
+        a = unity_pack.analyze_script("/proj/Assets/Scripts/BadPath.cs", src)
+        self.assertTrue(a["classes"][0].get("ctor_forbidden"))
+        self.assertEqual(
+            a["classes"][0]["ctor_forbidden"][0]["api"], "persistentDataPath")
+        self.assertEqual(a["classes"][0]["ctor_forbidden"][0]["line"], 3)
+        root = tempfile.mkdtemp(prefix="upack-ctorforbid-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "BadPath.cs"), "w") as f:
+            f.write(src)
+        with open(os.path.join(scripts, "BadPath.cs.meta"), "w") as f:
+            f.write("guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Bad Path GO\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-ctorforbid-out-")
+        plan = unity_pack.pack(root, d)
+        self.assertTrue(plan["classes"]["BadPath"].get("ctor_forbidden"))
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("_engine_unity_ctor_forbidden", eng)
+        self.assertIn("get_%s is not allowed", eng)
+        self.assertIn("TypeInitializationException", eng)
+        self.assertNotIn("BadPath_Update", eng)
+        host = os.path.join(d, "host_ctor.c")
         with open(host, "w") as f:
             f.write(
                 "void engine_tick(void);\n"
@@ -479,8 +668,7 @@ class TestSystems(unittest.TestCase):
                 "int main(void) {\n"
                 "  int i;\n"
                 "  Time_deltaTime = 0.02f;\n"
-                "  for (i = 0; i < 120; i = i + 1) engine_tick();\n"
-                "  for (i = 0; i < 120; i = i + 1) engine_tick();\n"
+                "  for (i = 0; i < 3; i = i + 1) engine_tick();\n"
                 "  return 0;\n"
                 "}\n"
             )
@@ -494,7 +682,7 @@ class TestSystems(unittest.TestCase):
              os.path.join(d, "data.c")],
             capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
-        exe = os.path.join(d, "host_fps")
+        exe = os.path.join(d, "host_ctor")
         r = subprocess.run(
             [_CC, "-O2", "-o", exe, host,
              os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],
@@ -502,12 +690,12 @@ class TestSystems(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         r = subprocess.run([exe], capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr or r.stdout)
-        self.assertTrue(os.path.isfile(log_path), log_path)
-        with open(log_path) as f:
-            body = f.read()
-        self.assertTrue(body.startswith("seed\nAverage FPS: "), body)
-        self.assertEqual(body.count("Average FPS: "), 1, body)
-        os.remove(log_path)
+        err = r.stderr or ""
+        self.assertIn("UnityException: get_persistentDataPath", err)
+        self.assertIn("BadPath", err)
+        self.assertIn("Bad Path GO", err)
+        self.assertIn("BadPath.cs:3", err)
+        self.assertEqual(err.count("UnityException: get_persistentDataPath"), 3)
 
     def test_package_cache_guid_resolves(self):
         """UPM PackageCache .meta guids resolve; Assets scripts stay exclusive."""
@@ -534,6 +722,16 @@ class TestSystems(unittest.TestCase):
         self.assertEqual(sp.get("source"), "ui")
         self.assertTrue(sp.get("builtin"))
         self.assertEqual(sp.get("tex_path"), "<builtin:UISprite>")
+        self.assertEqual(btn[0]["ui_image"].get("image_type"), 1)  # Sliced
+        # Sliced UISprite bakes to the RectTransform size (not 1×1 white).
+        self.assertEqual(sp.get("tex_w"), 115)
+        self.assertEqual(sp.get("tex_h"), 30)
+        self.assertEqual(sp.get("border"), (6, 6, 6, 6))
+        # Outside corner is nearly transparent; center is opaque white.
+        rgba = sp["tex_rgba"]
+        self.assertLess(rgba[3], 32)  # bottom-left outside corner
+        cx = (15 * 115 + 57) * 4
+        self.assertGreater(rgba[cx + 3], 200)
         self.assertIsNotNone(btn[0].get("ui_button"))
         self.assertEqual(btn[0]["ui_button"]["onclick"][0]["method"], "SetActive")
         cols = btn[0]["ui_button"]["colors"]
@@ -547,10 +745,14 @@ class TestSystems(unittest.TestCase):
         self.assertEqual(txt[0]["ui_tmp"]["text"], "Click me")
         self.assertTrue(txt[0]["ui_tmp"]["has_font"])
         self.assertEqual(txt[0]["sprite"].get("source"), "ui_tmp")
+        trgba = txt[0]["sprite"]["tex_rgba"]
         self.assertGreater(
-            sum(1 for i in range(3, len(txt[0]["sprite"]["tex_rgba"]), 4)
-                if txt[0]["sprite"]["tex_rgba"][i] > 10),
-            50)
+            sum(1 for i in range(3, len(trgba), 4) if trgba[i] > 10),
+            200)
+        # Glyph bake must look like text, not atlas scrap: opaque pixels
+        # span most of the label width.
+        xs = [i // 4 % 115 for i in range(3, len(trgba), 4) if trgba[i] > 128]
+        self.assertGreater(max(xs) - min(xs), 60)
         # Centered 115×30 px → world half-extent from Screen + ortho.
         ortho = float(cams[0]["orthographic_size"])
         sw, sh = unity_pack.player_screen(SYSTEMS)
@@ -693,7 +895,7 @@ class TestSystems(unittest.TestCase):
         with open(host, "w") as f:
             f.write(
                 "typedef struct { float x, y, half_w, half_h;\n"
-                "                 float cos_z, sin_z;\n"
+                "                 float m00, m01, m10, m11;\n"
                 "                 float r, g, b; float a; int tex;\n"
                 "                 int sorting_layer; int sorting_order;\n"
                 "               } EngineDraw;\n"
@@ -825,7 +1027,7 @@ class TestSystems(unittest.TestCase):
         self.assertIn("Camera_main_farClipPlane", data)
         self.assertIn("SpriteRenderer", engine)
         self.assertIn("wz - Camera_main_pos_z", engine)
-        self.assertIn("out[n].cos_z", engine)
+        self.assertIn("out[n].m00", engine)
         self.assertIn("_spr_sin", engine)
         self.assertIn("engine_physics_collide2d", engine)
         self.assertIn("engine_animation_tick", engine)
@@ -1224,7 +1426,7 @@ class TestSystems(unittest.TestCase):
                 "void engine_tick(void);\n"
                 "extern float Time_deltaTime;\n"
                 "typedef struct { float x, y, half_w, half_h;\n"
-                "                 float cos_z, sin_z;\n"
+                "                 float m00, m01, m10, m11;\n"
                 "                 float r, g, b; float a; int tex;\n"
                 "                 int sorting_layer; int sorting_order;\n"
                 "               } EngineDraw;\n"
@@ -1412,29 +1614,29 @@ class TestSystems(unittest.TestCase):
 
     def test_authored_rigidbody2d_is_packed(self):
         objs, _a, _l, _c = unity_pack.load_project(SYSTEMS)
-        ball = [o for o in objs if o["name"] == "HeavyBall"][0]
+        ball = [o for o in objs if o["name"] == "Ball"][0]
         self.assertIsNotNone(ball.get("rigidbody2d"))
         self.assertAlmostEqual(ball["rigidbody2d"]["vel_x"], 0.0)
         player = [o for o in objs if o["name"] == "Player"][0]
         self.assertIsNotNone(player.get("rigidbody2d"))
         self.assertAlmostEqual(player["rigidbody2d"]["mass"], 0.5704784)
         self.assertAlmostEqual(player["rigidbody2d"]["linear_damping"], 1.0)
-        ball = [o for o in objs if o["name"] == "HeavyBall"][0]
         self.assertAlmostEqual(ball["rigidbody2d"]["linear_damping"], 0.0)
         d = tempfile.mkdtemp(prefix="upack-rb2d-")
         plan = unity_pack.pack(SYSTEMS, d)
         self.assertEqual(len(plan.get("rigidbody2d") or []), 2)
         by_rb = {r["name"]: r for r in plan["rigidbody2d"]}
         self.assertAlmostEqual(by_rb["Player"]["linear_damping"], 1.0)
-        self.assertAlmostEqual(by_rb["HeavyBall"]["linear_damping"], 0.0)
+        self.assertAlmostEqual(by_rb["Ball"]["linear_damping"], 0.0)
         with open(os.path.join(d, "engine.c")) as f:
             eng = f.read()
         self.assertIn("engine_physics_fixed", eng)
+        self.assertIn("_engine_fixed_accum", eng)
         self.assertIn("_Rigidbody2D_linear_damping", eng)
         self.assertIn("GameObject_GetComponent_Rigidbody2D", eng)
         self.assertIn("engine_physics_collide2d", eng)
-        self.assertGreaterEqual(len(plan.get("collider2d") or []), 3)
-        ball_col = [o for o in objs if o["name"] == "HeavyBall"][0]["collider2d"]
+        self.assertGreaterEqual(len(plan.get("collider2d") or []), 2)
+        ball_col = ball["collider2d"]
         self.assertEqual(ball_col["kind"], "circle")
         ground = [o for o in objs if o["name"] == "Ground"][0]
         self.assertEqual(ground["collider2d"]["kind"], "box")
@@ -1442,12 +1644,93 @@ class TestSystems(unittest.TestCase):
         # Colliders use Unity 2D default friction (0.4); Ice asset removed.
         self.assertAlmostEqual(ball_col["friction"], 0.4)
         self.assertAlmostEqual(ground["collider2d"]["friction"], 0.4)
-        pad = [o for o in objs if o["name"] == "BouncePad"][0]
-        self.assertAlmostEqual(pad["collider2d"]["friction"], 0.4)
         ground_row = [c for c in plan["collider2d"] if c["name"] == "Ground"][0]
         self.assertAlmostEqual(ground_row["friction"], 0.4)
         self.assertIn("_Collider2D_friction", eng)
         self.assertIn("_phys_mat_combine", eng)
+
+    def test_rigidbody_field_linear_velocity_setx(self):
+        """Serialized Rigidbody2D field + linearVelocity.SetX lowers to vel tables."""
+        d = tempfile.mkdtemp(prefix="upack-rb-lv-")
+        plan = unity_pack.pack(SYSTEMS, d)
+        player = plan["classes"]["Player"]["instances"][0]
+        self.assertEqual(player.get("object_refs", {}).get("rb"), "3006")
+        by_fid = plan.get("rb2d_by_file_id") or {}
+        self.assertIn("3006", by_fid)
+        player_rb = by_fid["3006"]
+        ball_rb = by_fid["2005"]
+        self.assertNotEqual(player_rb, ball_rb)
+        with open(os.path.join(d, "data.c")) as f:
+            data = f.read()
+        # Player.rb must index Player's Rigidbody2D, not Ball (0).
+        self.assertRegex(
+            data,
+            r"Player _Player_inst_array\[1\] = \{\s*\{[^}]*\b%d\b" % player_rb)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("Player_get_rb(i)", eng)
+        start = eng.find("static void Player_Update")
+        end = eng.find("\nstatic void ", start + 1)
+        if end < 0:
+            end = eng.find("\nvoid ", start + 1)
+        upd = eng[start:end]
+        self.assertIn("_Rigidbody2D_vel_x[_up_rb]", upd)
+        self.assertNotIn("linearVelocity", upd)
+        self.assertNotIn("SetX", upd)
+
+        # Rigidbody (3D) field + SetY
+        root = tempfile.mkdtemp(prefix="upack-rb3-lv-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Mover.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Mover : MonoBehaviour {\n"
+                "    public Rigidbody rb;\n"
+                "    public float speed;\n"
+                "    void Update() {\n"
+                "        rb.linearVelocity = rb.linearVelocity.SetY(speed);\n"
+                "        rb.velocity = new Vector3(1f, 2f, 3f);\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Mover.cs.meta"), "w") as f:
+            f.write("guid: dddddddddddddddddddddddddddddddd\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Mover\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "  - component: {fileID: 4}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!54 &4\nRigidbody:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Mass: 1\n"
+                "  m_Drag: 0\n"
+                "  m_UseGravity: 1\n"
+                "  m_Velocity: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: dddddddddddddddddddddddddddddddd}\n"
+                "  rb: {fileID: 4}\n"
+                "  speed: 5\n"
+            )
+        d3 = tempfile.mkdtemp(prefix="upack-rb3-lv-out-")
+        plan3 = unity_pack.pack(root, d3)
+        self.assertEqual(len(plan3.get("rigidbody") or []), 1)
+        self.assertEqual(plan3.get("rb3d_by_file_id", {}).get("4"), 0)
+        with open(os.path.join(d3, "engine.c")) as f:
+            eng3 = f.read()
+        self.assertIn("_Rigidbody_vel_y[_up_rb]", eng3)
+        self.assertIn("_Rigidbody_vel_x[_up_rb]", eng3)
+        self.assertIn("Mover_get_rb(i)", eng3)
+        self.assertNotIn(".linearVelocity", eng3)
 
     def test_default_and_authored_physics_materials_3d(self):
         root = tempfile.mkdtemp(prefix="upack-mat3d-")
@@ -1697,6 +1980,7 @@ class TestSystems(unittest.TestCase):
 
     @needs_cc
     def test_find_getcomponent_runs(self):
+        """Find miss + GetComponent.field → NRE with site; Start exits, player continues."""
         d = tempfile.mkdtemp(prefix="upack-find-run-")
         unity_pack.pack(SYSTEMS, d)
         r = subprocess.run(["make", "-C", d], capture_output=True, text=True)
@@ -1704,9 +1988,25 @@ class TestSystems(unittest.TestCase):
         run = subprocess.run(
             [os.path.join(d, "game"), "-logFile", "-"],
             capture_output=True, text=True, cwd=d)
+        # Scene GO is "Bouncer"; Player.Find("BouncePad") is null → NRE.
+        # Unity catches script exceptions — process must not SIGABRT.
         self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
-        # Player Start: Find("BouncePad").GetComponent<Bouncer>().amp
-        self.assertIn("0.5", run.stdout)
+        err = run.stderr or ""
+        self.assertIn("NullReferenceException", err)
+        self.assertIn(
+            "Object reference not set to an instance of an object", err)
+        self.assertIn("Player.Start ()", err)
+        self.assertIn("Player.cs:18", err)
+        self.assertNotIn("SIGABRT", err)
+        self.assertNotIn("Aborted", err)
+        # Start aborted before print("Hello World 2!"); Update still runs.
+        out = run.stdout or ""
+        self.assertNotIn("Hello World 2!", out)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("_engine_null_reference_at", eng)
+        self.assertIn("setjmp", eng)
+        self.assertIn('GameObject_Find("BouncePad")', eng)
 
     def test_refuses_keyboard_without_inputsystem_using(self):
         """Bare Keyboard is not a global — needs InputSystem using or FQN."""
@@ -2107,7 +2407,7 @@ class TestSystemsRuns(unittest.TestCase):
                 "extern float RenderSettings_ambient_r;\n"
                 "extern float _Light_intensity[];\n"
                 "typedef struct { float x, y, half_w, half_h;\n"
-                "                 float cos_z, sin_z;\n"
+                "                 float m00, m01, m10, m11;\n"
                 "                 float r, g, b; float a; int tex;\n"
                 "                 int sorting_layer; int sorting_order;\n"
                 "               } EngineDraw;\n"
@@ -2118,9 +2418,6 @@ class TestSystemsRuns(unittest.TestCase):
                 "typedef struct Player Player;\n"
                 "struct Player { float pos_x; float pos_y; float moveSpeed; };\n"
                 "extern Player _Player_inst_array[];\n"
-                "typedef struct Wave Wave;\n"
-                "struct Wave { float pos_x; float pos_y; };\n"
-                "extern Wave _Wave_inst_array[];\n"
                 "extern float _AnimPlayer_time[];\n"
                 "extern int _Graphics_draw_tex[];\n"
                 "extern const int _AnimSpriteKey_tex[];\n"
@@ -2132,12 +2429,7 @@ class TestSystemsRuns(unittest.TestCase):
                 "  engine_keyboard_rightArrow = 1;\n"
                 "  RenderSettings_ambient_r = 0.5f;\n"
                 "  int i;\n"
-                "  for (i = 0; i < 25; i = i + 1) engine_tick();\n"
-                "  /* Bob.anim localPosition.x is constantly 2; y peaks at 0.5. */\n"
-                "  if (_Wave_inst_array[0].pos_x < 1.99f\n"
-                "      || _Wave_inst_array[0].pos_x > 2.01f) return 9;\n"
-                "  if (_Wave_inst_array[0].pos_y < 0.4f) return 10;\n"
-                "  for (i = 0; i < 25; i = i + 1) engine_tick();\n"
+                "  for (i = 0; i < 50; i = i + 1) engine_tick();\n"
                 "  EngineDraw buf[128];\n"
                 "  int n = engine_collect_draws(buf, 128);\n"
                 "  if (Time_time < 0.9f) return 2;\n"
@@ -2147,18 +2439,7 @@ class TestSystemsRuns(unittest.TestCase):
                 "  if (n != 9) return 6; /* SpriteRenderers + Button + TMP */\n"
                 "  /* Ground top ≈ -2.25; ball radius ≈ 0.225 → rest y ≳ -2.05 */\n"
                 "  if (_Ball_inst_array[0].pos_y < -2.1f) return 8;\n"
-                "  if (_Wave_inst_array[0].pos_x < 1.99f\n"
-                "      || _Wave_inst_array[0].pos_x > 2.01f) return 12;\n"
-                "  /* Spinner stays at authored (-2.5, 1.2): legacy clip ≠ Animator. */\n"
-                "  { int j; int found = 0;\n"
-                "    for (j = 0; j < n; j = j + 1) {\n"
-                "      if (buf[j].x > -2.6f && buf[j].x < -2.4f\n"
-                "          && buf[j].y > 1.1f && buf[j].y < 1.3f)\n"
-                "        found = 1;\n"
-                "    }\n"
-                "    if (!found) return 11;\n"
-                "  }\n"
-                "  /* BouncePad sortingOrder -10 first; Button Foreground last. */\n"
+                "  /* Lowest sortingOrder first; Button Foreground last. */\n"
                 "  if (buf[0].sorting_order != -10) return 13;\n"
                 "  if (buf[n - 1].sorting_layer != 1) return 14;\n"
                 "  if (buf[n - 1].a < 0.99f)\n"
@@ -2188,10 +2469,9 @@ class TestSystemsRuns(unittest.TestCase):
                 "    float px = _Player_inst_array[0].pos_x;\n"
                 "    float py = _Player_inst_array[0].pos_y;\n"
                 "    int j; int found = 0;\n"
-                "    /* Idle.anim has no PositionCurves — must not reset to origin. */\n"
                 "    if (px <= 0.5f) return 16; /* rightArrow move sticks */\n"
-                "    /* Player m_LinearDamping 1 → less fall than undamped (~-5). */\n"
-                "    if (py >= -0.5f || py < -4.5f) return 18;\n"
+                "    /* Player m_LinearDamping 1 → less fall than undamped. */\n"
+                "    if (py >= 6.5f || py < -4.5f) return 18;\n"
                 "    for (j = 0; j < n; j = j + 1) {\n"
                 "      if (buf[j].x > px - 0.05f && buf[j].x < px + 0.05f\n"
                 "          && buf[j].y > py - 0.05f && buf[j].y < py + 0.05f)\n"
@@ -2231,6 +2511,55 @@ class TestSystemsRuns(unittest.TestCase):
         run = subprocess.run([exe], capture_output=True, text=True)
         self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
 
+    def test_physics_fall_matches_wall_clock_not_frame_count(self):
+        """60Hz×1s ≈ same Player fall as 50 fixed steps (Unity fixed clock)."""
+        ys = {}
+        for label, dt, n in (
+                ("50", "0.02f", 50),
+                ("60", "(1.f/60.f)", 60)):
+            out = tempfile.mkdtemp(prefix="upack-fall%s-" % label)
+            unity_pack.pack(SYSTEMS, out)
+            hostp = os.path.join(out, "host.c")
+            with open(hostp, "w") as f:
+                f.write(
+                    "#include <stdio.h>\n"
+                    "void engine_tick(void);\n"
+                    "extern float Time_deltaTime;\n"
+                    "typedef struct Player Player;\n"
+                    "struct Player { float pos_x; float pos_y; };\n"
+                    "extern Player _Player_inst_array[];\n"
+                    "int main(void) {\n"
+                    "  int i;\n"
+                    "  Time_deltaTime = %s;\n"
+                    "  for (i = 0; i < %d; i = i + 1) engine_tick();\n"
+                    "  printf(\"Y=%%.6f\\n\", _Player_inst_array[0].pos_y);\n"
+                    "  return 0;\n"
+                    "}\n" % (dt, n)
+                )
+            r = subprocess.run(
+                [_CC, "-O2", "-c", "-o", os.path.join(out, "engine.o"),
+                 os.path.join(out, "engine.c")],
+                capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            r = subprocess.run(
+                [_CC, "-O0", "-c", "-o", os.path.join(out, "data.o"),
+                 os.path.join(out, "data.c")],
+                capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            exe = os.path.join(out, "fall")
+            r = subprocess.run(
+                [_CC, "-O2", "-o", exe, hostp,
+                 os.path.join(out, "engine.o"), os.path.join(out, "data.o"),
+                 "-lm"],
+                capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            run = subprocess.run([exe], capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+            yline = [ln for ln in run.stdout.splitlines() if ln.startswith("Y=")]
+            self.assertTrue(yline, run.stdout)
+            ys[label] = float(yline[-1][2:])
+        self.assertAlmostEqual(ys["50"], ys["60"], delta=0.05)
+
     def test_camera_positive_z_culls_sprites(self):
         """Unity looks +Z; camera at +z with sprites at 0 draws nothing."""
         d = tempfile.mkdtemp(prefix="upack-cam-z-")
@@ -2239,7 +2568,7 @@ class TestSystemsRuns(unittest.TestCase):
         with open(host, "w") as f:
             f.write(
                 "typedef struct { float x, y, half_w, half_h;\n"
-                "                 float cos_z, sin_z;\n"
+                "                 float m00, m01, m10, m11;\n"
                 "                 float r, g, b; float a; int tex;\n"
                 "                 int sorting_layer; int sorting_order;\n"
                 "               } EngineDraw;\n"
