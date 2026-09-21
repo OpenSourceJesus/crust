@@ -87,7 +87,9 @@ def _run(source, suffix=".c", extra=None):
     error_collector.clear()
     rc = shivyc.main.main()
     assert rc == 0, "compilation failed"
-    return subprocess.run([out_path]).returncode
+    # A timeout, so a miscompile that loops forever fails the test rather
+    # than hanging the suite.
+    return subprocess.run([out_path], timeout=30).returncode
 
 
 class TestCrustTranslation(unittest.TestCase):
@@ -561,10 +563,12 @@ class TestCrustMatch(unittest.TestCase):
                             "{ E::A => 1, _ => 2 } }")
         self.assertIn("default:", c)
 
-    def test_binding_pattern_is_rejected(self):
-        with self.assertRaises(crust.CrustError):
-            crust.translate("fn f(n: i32) -> i32 { match n "
+    def test_binding_pattern_binds(self):
+        # Once rejected, since the switch lowering had no bindings; a binding
+        # now selects the if/else-chain lowering (see test_crust_extras.py).
+        c = crust.translate("fn f(n: i32) -> i32 { match n "
                             "{ other => other } }")
+        self.assertIn("int other = n;", c)
 
     def test_match_end_to_end(self):
         self.assertEqual(_run("""
@@ -1110,7 +1114,7 @@ class TestCrustTryOperator(unittest.TestCase):
 fn f(n: i32) -> Result<i32, Error> { let v: i32 = nonneg(n)?; Ok(v) }
 """)
         self.assertIn("if (!", c)
-        self.assertIn(".ok) return", c)
+        self.assertIn(".ok) { return", c)
 
     def test_subject_is_evaluated_once(self):
         c = crust.translate(self.BASE + """
@@ -1760,11 +1764,12 @@ fn main() -> i32 { let f = |a: i32, b: i32| a + b; f(40, 2) }
         c = crust.translate("fn f() { let g = |a: i32| a + 1; }")
         self.assertIn("static int _crust_closure1(int a)", c)
 
-    def test_capturing_closure_is_rejected(self):
-        # Crust has no environment; capturing must be an error, not a guess.
-        with self.assertRaises(crust.CrustError) as cm:
-            crust.translate("fn f() { let n: i32 = 1; let g = |a: i32| a + n; }")
-        self.assertIn("captures", str(cm.exception))
+    def test_capturing_closure_gets_an_environment(self):
+        # Once rejected, when Crust had no environment to capture into. A
+        # capturing closure now carries one (see test_crust_extras.py).
+        c = crust.translate("fn f() { let n: i32 = 1; let g = |a: i32| a + n; }")
+        self.assertIn("_env", c)
+        self.assertIn(".n = &n", c)
 
     def test_unannotated_parameter_is_rejected(self):
         with self.assertRaises(crust.CrustError):
@@ -4785,5 +4790,412 @@ fn main() {
         c.push(3);
         unsafe { return (c.len() + n) as i32 + 39; }
     }
+}
+""", suffix=".rs"), 42)
+
+
+# A `Drop` type that counts live instances, so a leak or a double drop shows
+# up in the exit status rather than only in the generated C. A moved-from
+# value is zeroed and still has its destructor called, so `id == 0` is the
+# "nothing to release" state and is skipped.
+_COUNTED = """
+static mut LIVE: i32 = 0;
+struct G { id: i32 }
+impl Drop for G {
+    fn drop(&mut self) { if self.id != 0 { unsafe { LIVE -= 1; } } }
+}
+fn g(id: i32) -> G { unsafe { LIVE += 1; } G { id: id } }
+fn live() -> i32 { unsafe { LIVE } }
+"""
+
+
+class TestCrustMatchesMacro(unittest.TestCase):
+    """`matches!` tests a pattern; it used to lower to `==`.
+
+    `matches!(4, 1 | 4)` became `4 == (1 | 4)`, i.e. `4 == 5`, and returned
+    false with no diagnostic.
+    """
+
+    def test_alternatives_are_not_bitwise_or(self):
+        self.assertEqual(_run("""
+fn main() -> i32 {
+    let x: i32 = 4;
+    if matches!(x, 1 | 4) { 42 } else { 1 }
+}
+""", suffix=".rs"), 42)
+
+    def test_ranges_and_wildcard(self):
+        self.assertEqual(_run("""
+fn main() -> i32 {
+    let x: i32 = 7;
+    let mut t: i32 = 0;
+    if matches!(x, 0..=7) { t += 10; }
+    if matches!(x, 0..7) { t += 100; }
+    if matches!(x, 8..) { t += 100; }
+    if matches!(x, _) { t += 30; }
+    if matches!(x, -3 | 2..=5) { t += 100; }
+    t + 2
+}
+""", suffix=".rs"), 42)
+
+    def test_enum_variants(self):
+        self.assertEqual(_run("""
+enum C { R, G, B }
+enum S { Circle(i32), Empty }
+fn main() -> i32 {
+    let c: C = C::G;
+    let s: S = S::Circle(3);
+    let e: S = S::Empty;
+    let mut t: i32 = 0;
+    if matches!(c, C::R | C::G) { t += 10; }
+    if matches!(c, C::B) { t += 100; }
+    if matches!(s, S::Circle(_)) { t += 20; }
+    if matches!(s, S::Circle(3)) { t += 5; }
+    if matches!(s, S::Circle(4)) { t += 100; }
+    if matches!(e, S::Empty) { t += 7; }
+    t
+}
+""", suffix=".rs"), 42)
+
+    def test_option_and_result(self):
+        self.assertEqual(_run("""
+fn main() -> i32 {
+    let a: Option<i32> = Some(5);
+    let n: Option<i32> = None;
+    let r: Result<i32, i32> = Err(2);
+    let mut t: i32 = 0;
+    if matches!(a, Some(_)) { t += 10; }
+    if matches!(a, Some(1..=5)) { t += 10; }
+    if matches!(n, None) { t += 10; }
+    if matches!(n, Some(_)) { t += 100; }
+    if matches!(r, Err(2)) { t += 12; }
+    if matches!(r, Ok(_)) { t += 100; }
+    t
+}
+""", suffix=".rs"), 42)
+
+    def test_guard_can_read_a_binding(self):
+        self.assertEqual(_run("""
+fn main() -> i32 {
+    let a: Option<i32> = Some(5);
+    let mut t: i32 = 0;
+    if matches!(a, Some(v) if v > 3) { t += 40; }
+    if matches!(a, Some(v) if v > 9) { t += 100; }
+    t + 2
+}
+""", suffix=".rs"), 42)
+
+    def test_scrutinee_is_evaluated_once(self):
+        c = crust.translate("""
+fn f() -> i32 { 3 }
+fn g() -> bool { matches!(f(), 1 | 2 | 3) }
+""")
+        self.assertEqual(c.count("f()"), 1)
+
+
+class TestCrustTryDrops(unittest.TestCase):
+    """`?`'s early return must drop the live owning locals, like `return`."""
+
+    def test_error_path_drops_locals(self):
+        self.assertEqual(_run(_COUNTED + """
+fn half(x: i32) -> Result<i32, i32> {
+    if x % 2 == 0 { Ok(x / 2) } else { Err(x) }
+}
+fn f(x: i32) -> Result<i32, i32> {
+    let a: G = g(1);
+    let h: i32 = half(x)?;
+    Ok(h + a.id)
+}
+fn main() -> i32 {
+    let bad: Result<i32, i32> = f(3);
+    let good: Result<i32, i32> = f(4);
+    if bad.is_ok() { return 1; }
+    if live() != 0 { return 2; }
+    good.unwrap() + 39
+}
+""", suffix=".rs"), 42)
+
+    def test_error_path_frees_a_vec(self):
+        c = crust.translate("""
+fn half(x: i32) -> Result<i32, i32> { if x % 2 == 0 { Ok(x) } else { Err(x) } }
+fn f(x: i32) -> Result<i32, i32> {
+    let mut v: Vec<i32> = Vec::<i32>::new();
+    v.push(1);
+    let h: i32 = half(x)?;
+    Ok(h)
+}
+""")
+        line = [l for l in c.splitlines() if ".ok) " in l and "half" in l][0]
+        early = line[line.index("if (!"):]
+        self.assertIn("Vec_int_free_buf(&v)", early.split("int h")[0])
+
+    def test_match_arm_expression_flushes_pending_and_drops(self):
+        self.assertEqual(_run(_COUNTED + """
+fn half(x: i32) -> Result<i32, i32> {
+    if x % 2 == 0 { Ok(x / 2) } else { Err(x) }
+}
+fn f(k: i32, x: i32) -> Result<i32, i32> {
+    let a: G = g(1);
+    match k {
+        0 => Ok(half(x)? + a.id),
+        _ => Ok(0),
+    }
+}
+fn main() -> i32 {
+    let r: Result<i32, i32> = f(0, 3);
+    let s: Result<i32, i32> = f(0, 82);
+    if r.is_ok() { return 1; }
+    if live() != 0 { return 2; }
+    s.unwrap()
+}
+""", suffix=".rs"), 42)
+
+    def test_if_let_body_drops_its_locals(self):
+        self.assertEqual(_run(_COUNTED + """
+fn upto3(k: i32) -> Option<i32> { if k < 3 { Some(k + 1) } else { None } }
+fn main() -> i32 {
+    let o: Option<i32> = Some(2);
+    if let Some(n) = o {
+        let a: G = g(n);
+    }
+    let mut k: i32 = 0;
+    while let Some(n) = upto3(k) {
+        let b: G = g(n);
+        k += 1;
+    }
+    if live() != 0 { return 1; }
+    42
+}
+""", suffix=".rs"), 42)
+
+
+class TestCrustConditionalPending(unittest.TestCase):
+    """Work hoisted out of an expression must run where the expression does.
+
+    A `while` condition's hoisted work used to be emitted once, above the
+    loop; the right operand of `&&`/`||` and the arms of an `if` expression
+    had theirs run unconditionally.
+    """
+
+    def test_while_condition_is_reevaluated(self):
+        self.assertEqual(_run("""
+fn step(n: i32) -> Result<i32, i32> { if n < 5 { Ok(n + 1) } else { Err(n) } }
+fn run() -> Result<i32, i32> {
+    let mut n: i32 = 0;
+    while step(n)? < 100 { n += 1; }
+    Ok(n)
+}
+fn main() -> i32 {
+    let r: Result<i32, i32> = run();
+    if r.is_ok() { return 1; }
+    37 + r.unwrap_err()
+}
+""", suffix=".rs"), 42)
+
+    def test_short_circuit_skips_the_right_operand(self):
+        self.assertEqual(_run("""
+static mut CALLS: i32 = 0;
+fn probe() -> Option<i32> { unsafe { CALLS += 1; } Some(1) }
+fn f(a: bool) -> Option<i32> {
+    let mut t: i32 = 0;
+    if a && probe()? == 1 { t += 1; }
+    if a || probe()? == 1 { t += 1; }
+    Some(t)
+}
+fn main() -> i32 {
+    let x: i32 = f(false).unwrap();
+    let c: i32 = unsafe { CALLS };
+    x * 10 + c * 31 + 1           // one call: 1 * 10 + 1 * 31 + 1
+}
+""", suffix=".rs"), 42)
+
+    def test_if_expression_arms_are_conditional(self):
+        self.assertEqual(_run("""
+static mut CALLS: i32 = 0;
+fn probe(v: i32) -> Option<i32> { unsafe { CALLS += 1; } Some(v) }
+fn f(a: bool) -> Option<i32> {
+    let v: i32 = if a { probe(40)? } else { probe(2)? };
+    Some(v)
+}
+fn main() -> i32 {
+    let x: i32 = f(true).unwrap();
+    let c: i32 = unsafe { CALLS };
+    x + c + 1
+}
+""", suffix=".rs"), 42)
+
+    def test_unwrap_or_evaluates_receiver_once(self):
+        c = crust.translate("""
+fn f() -> Option<i32> { Some(1) }
+fn h() -> Result<i32, i32> { Ok(1) }
+fn g() -> i32 { f().unwrap_or(0) + h().unwrap_or(0) }
+fn k() -> Option<i32> { h().ok() }
+""")
+        self.assertEqual(c.count("f()"), 1)
+        self.assertEqual(c.count("h()"), 2)      # once in g, once in k
+
+    def test_min_max_evaluate_arguments_once(self):
+        c = crust.translate("""
+fn a() -> i32 { 1 }
+fn b() -> i32 { 2 }
+fn g() -> i32 { core::cmp::min(a(), b()) + core::cmp::max(a(), b()) }
+""")
+        self.assertEqual(c.count("a()"), 2)
+        self.assertEqual(c.count("b()"), 2)
+
+
+class TestCrustMethodArgMoves(unittest.TestCase):
+    """Passing an owning local to a *method* by value is a move too."""
+
+    def test_push_moves_its_argument(self):
+        c = crust.translate("""
+fn main() {
+    let mut v: Vec<String> = Vec::<String>::new();
+    let s: String = String::new();
+    v.push(s);
+}
+""")
+        self.assertIn("memset(&s, 0, sizeof(s))", c)
+
+    def test_use_after_method_move_is_rejected(self):
+        with self.assertRaises(crust.CrustError) as cm:
+            crust.translate("""
+fn main() {
+    let mut v: Vec<String> = Vec::<String>::new();
+    let s: String = String::new();
+    v.push(s);
+    let n: usize = s.len();
+}
+""")
+        self.assertIn("moved", str(cm.exception))
+
+    def test_method_moves_a_drop_type_exactly_once(self):
+        self.assertEqual(_run(_COUNTED + """
+struct Holder { n: i32 }
+impl Holder {
+    fn eat(&mut self, x: G) -> i32 { self.n += x.id; self.n }
+}
+fn main() -> i32 {
+    {
+        let mut h: Holder = Holder { n: 0 };
+        let a: G = g(40);
+        h.eat(a);
+        if live() != 0 { return 1; }
+    }
+    if live() != 0 { return 2; }
+    42
+}
+""", suffix=".rs"), 42)
+
+    def test_method_arguments_see_the_parameter_type(self):
+        self.assertEqual(_run("""
+struct Slot { v: Option<i32> }
+impl Slot {
+    fn put(&mut self, v: Option<i32>) { self.v = v; }
+}
+fn main() -> i32 {
+    let mut s: Slot = Slot { v: Some(1) };
+    s.put(None);
+    if s.v.is_some() { return 1; }
+    s.put(Some(42));
+    s.v.unwrap()
+}
+""", suffix=".rs"), 42)
+
+
+class TestCrustHoistingPlacement(unittest.TestCase):
+    """Further cases of hoisted work landing in the wrong place."""
+
+    def test_range_end_is_evaluated_once(self):
+        # Rust evaluates `0..v.len()` once; C's `for` re-tests every pass,
+        # so a push in the body never let the loop end.
+        self.assertEqual(_run("""
+fn main() -> i32 {
+    let mut v: Vec<i32> = Vec::<i32>::new();
+    v.push(1);
+    v.push(2);
+    for i in 0..v.len() { v.push(i as i32); }
+    v.len() as i32 + 38
+}
+""", suffix=".rs"), 42)
+
+    def test_range_end_call_runs_once(self):
+        self.assertEqual(_run("""
+static mut CALLS: i32 = 0;
+fn n() -> i32 { unsafe { CALLS += 1; } 4 }
+fn main() -> i32 {
+    let mut t: i32 = 0;
+    for i in 0..n() { t += i; }
+    let c: i32 = unsafe { CALLS };
+    t + c * 35 + 1
+}
+""", suffix=".rs"), 42)
+
+    def test_literal_range_end_stays_inline(self):
+        c = crust.translate("fn f() { for i in 0..10 { } }")
+        self.assertIn("i < 10;", c)
+
+    def test_else_if_condition_work_runs_in_its_branch(self):
+        self.assertEqual(_run("""
+static mut CALLS: i32 = 0;
+fn probe(v: i32) -> Option<i32> { unsafe { CALLS += 1; } Some(v) }
+fn f(a: bool) -> Option<i32> {
+    if a { return Some(40); } else if probe(1)? == 1 { return Some(0); }
+    Some(1)
+}
+fn main() -> i32 {
+    let x: i32 = f(true).unwrap();
+    let c: i32 = unsafe { CALLS };
+    x + c + 2
+}
+""", suffix=".rs"), 42)
+
+    def test_break_in_while_let_drops_body_locals(self):
+        self.assertEqual(_run(_COUNTED + """
+fn upto3(k: i32) -> Option<i32> { if k < 3 { Some(k + 1) } else { None } }
+fn main() -> i32 {
+    let mut k: i32 = 0;
+    while let Some(n) = upto3(k) {
+        let b: G = g(n);
+        if n == 2 { break; }
+        k += 1;
+    }
+    if live() != 0 { return 1; }
+    42
+}
+""", suffix=".rs"), 42)
+
+    def test_move_inside_for_each_body_is_caught(self):
+        with self.assertRaises(crust.CrustError) as cm:
+            crust.translate("""
+fn take(v: Vec<i32>) -> usize { v.len() }
+fn f(xs: &[i32]) {
+    let v: Vec<i32> = Vec::<i32>::new();
+    for x in xs { take(v); }
+}
+""")
+        self.assertIn("inside a loop", str(cm.exception))
+
+
+class TestCrustGeneratedStructOrder(unittest.TestCase):
+    """`Option`/`Result`/tuple structs are ordered with user structs."""
+
+    def test_struct_with_an_option_field(self):
+        self.assertEqual(_run("""
+struct Slot { v: Option<i32> }
+fn main() -> i32 {
+    let s: Slot = Slot { v: Some(42) };
+    s.v.unwrap()
+}
+""", suffix=".rs"), 42)
+
+    def test_option_of_a_user_struct(self):
+        self.assertEqual(_run("""
+struct P { x: i32, y: i32 }
+fn find(k: i32) -> Option<P> { if k > 0 { Some(P { x: k, y: 2 }) } else { None } }
+fn main() -> i32 {
+    let p: P = find(40).unwrap();
+    let t: (P, i32) = (p, 0);
+    t.0.x + t.0.y
 }
 """, suffix=".rs"), 42)
