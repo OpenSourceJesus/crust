@@ -576,6 +576,21 @@ def _path_under_assets(root, path):
     return ap == assets or ap.startswith(assets + os.sep)
 
 
+def _is_player_csharp(root, path):
+    """Runtime C# under Assets/ — excludes Unity Editor/ assemblies.
+
+    Matches player builds: only Assets scripts pack as MonoBehaviours;
+    any path segment named exactly ``Editor`` is editor-only (Unity).
+    """
+    if not path.lower().endswith(".cs"):
+        return False
+    if not _path_under_assets(root, path):
+        return False
+    rel = os.path.relpath(os.path.abspath(path), os.path.abspath(root))
+    parts = rel.replace("\\", "/").split("/")
+    return "Editor" not in parts
+
+
 def _guid_map(root, asset_guids=None):
     """Unity .meta `guid:` next to a .cs file → script path.
 
@@ -9327,7 +9342,8 @@ def load_project(root):
             objects.extend(parse_blender_json(_read(path)))
     sorting_layers = _load_sorting_layers(root)
 
-    scripts = list(_walk_files(root, (".cs",)))
+    scripts = [p for p in _walk_files(root, (".cs",))
+               if _is_player_csharp(root, p)]
     _progress("analyzing %d script(s)" % len(scripts))
     analyses = []
     for i, p in enumerate(scripts):

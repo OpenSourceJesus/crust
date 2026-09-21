@@ -322,6 +322,6 @@ idle — legacy clip is not Mecanim), Shade
 ```
 python3 tools/unity_pack.py examples/unity_pack/SystemsScene -o /tmp/sys
 make -C /tmp/sys && /tmp/sys/game
-SCENE="$(pwd)/examples/unity_pack/SystemsScene" \
+PROJECT="$(pwd)/examples/unity_pack/Slime Jump" \
   ./examples/unity_pack/run_gles2_window.sh
 ```

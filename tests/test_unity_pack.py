@@ -28,7 +28,7 @@ sys.path.insert(0, ROOT)
 
 import tools.unity_pack as unity_pack  # noqa: E402
 
-SCENE = os.path.join(ROOT, "examples", "unity_pack", "MiniScene")
+PROJECT = os.path.join(ROOT, "examples", "unity_pack", "MiniScene")
 _CC = shutil.which("gcc") or shutil.which("cc")
 needs_cc = unittest.skipIf(_CC is None, "no C compiler")
 
@@ -36,7 +36,7 @@ needs_cc = unittest.skipIf(_CC is None, "no C compiler")
 class TestSceneImport(unittest.TestCase):
 
     def test_unity_yaml_counts(self):
-        objs, analyses, _lights, _cams = unity_pack.load_project(SCENE)
+        objs, analyses, _lights, _cams, _hier = unity_pack.load_project(PROJECT)
         names = sorted(o["name"] for o in objs)
         self.assertEqual(names, ["CoinA", "CoinB", "Hero"])
         coins = [o for o in objs if o["class"] == "Coin"]
@@ -59,7 +59,7 @@ class TestSceneImport(unittest.TestCase):
 class TestLayout(unittest.TestCase):
 
     def setUp(self):
-        self.objs, self.an, _lights, _cams = unity_pack.load_project(SCENE)
+        self.objs, self.an, _lights, _cams, _hier = unity_pack.load_project(PROJECT)
         self.plan = unity_pack.plan_layouts(self.objs, self.an)
 
     def test_two_d_drops_z(self):
@@ -91,7 +91,7 @@ class TestLayout(unittest.TestCase):
 class TestEmit(unittest.TestCase):
 
     def test_api_subset_only(self):
-        plan = unity_pack.pack(SCENE, tempfile.mkdtemp(prefix="upack-"))
+        plan = unity_pack.pack(PROJECT, tempfile.mkdtemp(prefix="upack-"))
         # pack writes files; re-read engine
         # Mathf was not called — must not appear as a function.
         # Time.deltaTime was.
@@ -101,7 +101,7 @@ class TestEmit(unittest.TestCase):
     def test_emitted_c_passes_cpprust_subset_gate(self):
         """Hand-lowered engine.cpp must survive cpprust.translate + crust."""
         d = tempfile.mkdtemp(prefix="upack-")
-        unity_pack.pack(SCENE, d)
+        unity_pack.pack(PROJECT, d)
         with open(os.path.join(d, "engine.cpp")) as f:
             engine = f.read()
         # Explicit re-check (pack already ran validate_emitted_c).
@@ -121,7 +121,7 @@ class TestEmit(unittest.TestCase):
 
     def test_engine_omits_unused_mathf(self):
         d = tempfile.mkdtemp(prefix="upack-")
-        unity_pack.pack(SCENE, d)
+        unity_pack.pack(PROJECT, d)
         with open(os.path.join(d, "engine.c")) as f:
             engine = f.read()
         self.assertNotIn("Mathf_Abs", engine)
@@ -166,7 +166,7 @@ class TestRuns(unittest.TestCase):
 
     def test_tick_moves_player(self):
         d = tempfile.mkdtemp(prefix="upack-")
-        unity_pack.pack(SCENE, d)
+        unity_pack.pack(PROJECT, d)
         host = os.path.join(d, "host.c")
         with open(host, "w") as f:
             f.write(
@@ -210,7 +210,7 @@ class TestSoa(unittest.TestCase):
 
     def test_soa_emits_pos_tables_not_struct_fields(self):
         d = tempfile.mkdtemp(prefix="upack-soa-")
-        plan = unity_pack.pack(SCENE, d, soa=True)
+        plan = unity_pack.pack(PROJECT, d, soa=True)
         self.assertTrue(plan["soa"])
         self.assertEqual(plan["classes"]["Coin"]["soa_dims"], 2)
         names = [m[0] for m in plan["classes"]["Coin"]["members"]]
@@ -227,7 +227,7 @@ class TestSoa(unittest.TestCase):
     @needs_cc
     def test_soa_tick_still_moves_player(self):
         d = tempfile.mkdtemp(prefix="upack-soa-run-")
-        unity_pack.pack(SCENE, d, soa=True)
+        unity_pack.pack(PROJECT, d, soa=True)
         host = os.path.join(d, "host.c")
         with open(host, "w") as f:
             f.write(
@@ -264,7 +264,7 @@ class TestSoa(unittest.TestCase):
 
     def test_soa_vec4_pads_w_with_instance_id(self):
         d = tempfile.mkdtemp(prefix="upack-soa4-")
-        plan = unity_pack.pack(SCENE, d, soa_vec4=True)
+        plan = unity_pack.pack(PROJECT, d, soa_vec4=True)
         self.assertTrue(plan["soa_vec4"])
         self.assertEqual(plan["classes"]["Coin"]["soa_dims"], 4)
         self.assertEqual(plan["classes"]["Coin"]["soa_logical"], 2)
@@ -287,7 +287,7 @@ class TestGLES2View(unittest.TestCase):
 
     def test_gles2_view_ascii_has_sprites(self):
         d = tempfile.mkdtemp(prefix="upack-gles-")
-        unity_pack.pack(SCENE, d)
+        unity_pack.pack(PROJECT, d)
         view = os.path.join(ROOT, "examples", "unity_pack", "gles2_view.c")
         exe = os.path.join(d, "view")
         r = subprocess.run(
@@ -355,11 +355,22 @@ class TestSystems(unittest.TestCase):
             unity_pack.analyze_script(path, fqn)
         self.assertIn("CS0117", cm.exception.message)
         self.assertIn("streamingAssetsPath", cm.exception.message)
-        # Supported dataPath / persistentDataPath still analyze.
+        # Supported dataPath / persistentDataPath / isEditor / isPlaying /
+        # OpenURL.
         unity_pack.analyze_script(
             path, src.replace("streamingAssetsPath", "dataPath"))
         unity_pack.analyze_script(
             path, src.replace("streamingAssetsPath", "persistentDataPath"))
+        unity_pack.analyze_script(
+            path,
+            "using UnityEngine;\n"
+            "public class Gate : MonoBehaviour {\n"
+            "    void Update() {\n"
+            "        if (!Application.isEditor || Application.isPlaying)\n"
+            "            return;\n"
+            "        Application.OpenURL(\"https://example.com\");\n"
+            "    }\n"
+            "}\n")
 
     def test_quaternion_unsupported_member_is_cs0117(self):
         """Unsupported Quaternion members → CS0117 (in scope via UnityEngine)."""
@@ -368,8 +379,8 @@ class TestSystems(unittest.TestCase):
             "\n"
             "public class Ball : MonoBehaviour {\n"
             "    void Start () {\n"
-            "        transform.rotation = Quaternion.Slerp("
-            "Quaternion.identity, Quaternion.identity, 0.5f);\n"
+            "        transform.rotation = Quaternion.AngleAxis("
+            "45f, Vector3.up);\n"
             "    }\n"
             "}\n"
         )
@@ -381,18 +392,18 @@ class TestSystems(unittest.TestCase):
             cm.exception.message,
             "Assets/Standard Assets/Scripts/Objects (Scripts)/Ball.cs"
             "(5,41): error CS0117: 'Quaternion' does not contain a "
-            "definition for 'Slerp'")
+            "definition for 'AngleAxis'")
         fqn = src.replace("using UnityEngine;\n", "").replace(
-            "Quaternion.Slerp",
-            "UnityEngine.Quaternion.Slerp")
+            "Quaternion.AngleAxis",
+            "UnityEngine.Quaternion.AngleAxis")
         with self.assertRaises(unity_pack.PackError) as cm:
             unity_pack.analyze_script(path, fqn)
         self.assertIn("CS0117", cm.exception.message)
-        self.assertIn("Slerp", cm.exception.message)
-        # Supported Euler / identity / LookRotation still analyze.
+        self.assertIn("AngleAxis", cm.exception.message)
+        # Supported Euler / identity / LookRotation / Slerp still analyze.
         unity_pack.analyze_script(
             path, src.replace(
-                "Slerp(Quaternion.identity, Quaternion.identity, 0.5f)",
+                "AngleAxis(45f, Vector3.up)",
                 "Euler(Vector3.forward * 45f)"))
         unity_pack.analyze_script(
             path,
@@ -411,11 +422,21 @@ class TestSystems(unittest.TestCase):
             "Vector3.forward, Vector3.up);\n"
             "    }\n"
             "}\n")
+        unity_pack.analyze_script(
+            path,
+            "using UnityEngine;\n"
+            "public class Ball : MonoBehaviour {\n"
+            "    void Start() {\n"
+            "        transform.rotation = Quaternion.Slerp("
+            "Quaternion.identity, Quaternion.identity, 0.5f);\n"
+            "    }\n"
+            "}\n")
         ball = os.path.join(
             SYSTEMS, "Assets", "Standard Assets", "Scripts",
             "Objects (Scripts)", "Ball.cs")
         # SystemsScene Ball exercises LookRotation — must analyze clean.
-        unity_pack.analyze_script(ball)
+        if os.path.isfile(ball):
+            unity_pack.analyze_script(ball)
 
     def test_file_unsupported_member_is_cs0117(self):
         """Unsupported File members → CS0117 (File is in scope via System.IO)."""
@@ -443,13 +464,16 @@ class TestSystems(unittest.TestCase):
             unity_pack.analyze_script(path, fqn)
         self.assertIn("CS0117", cm.exception.message)
         self.assertIn("ReadAllText", cm.exception.message)
-        # Supported WriteAllText / AppendAllText still analyze.
+        # Supported WriteAllText / AppendAllText / Exists still analyze.
         unity_pack.analyze_script(
             path, src.replace("ReadAllText(\"a.txt\")",
                               "WriteAllText(\"a.txt\", \"x\")"))
         unity_pack.analyze_script(
             path, src.replace("ReadAllText(\"a.txt\")",
                               "AppendAllText(\"a.txt\", \"x\")"))
+        unity_pack.analyze_script(
+            path, src.replace("ReadAllText(\"a.txt\")",
+                              "Exists(\"a.txt\")"))
 
     def test_transform_unsupported_member_is_cs1061(self):
         """Unsupported transform.Member → CS1061 on Transform (not undeclared)."""
@@ -458,7 +482,7 @@ class TestSystems(unittest.TestCase):
             "\n"
             "public class Ball : MonoBehaviour {\n"
             "    void Start () {\n"
-            "        transform.SetParent(null);\n"
+            "        transform.DetachChildren();\n"
             "    }\n"
             "}\n"
         )
@@ -470,17 +494,17 @@ class TestSystems(unittest.TestCase):
             cm.exception.message,
             "Assets/Standard Assets/Scripts/Objects (Scripts)/Ball.cs"
             "(5,19): error CS1061: 'Transform' does not contain a "
-            "definition for 'SetParent' and no accessible extension method "
-            "'SetParent' accepting a first argument of type 'Transform' could "
-            "be found (are you missing a using directive or an assembly "
-            "reference?)")
+            "definition for 'DetachChildren' and no accessible extension "
+            "method 'DetachChildren' accepting a first argument of type "
+            "'Transform' could be found (are you missing a using directive "
+            "or an assembly reference?)")
         # this.transform also binds; still CS1061 on the member.
         with self.assertRaises(unity_pack.PackError) as cm:
             unity_pack.analyze_script(
-                path, src.replace("transform.SetParent",
-                                  "this.transform.SetParent"))
+                path, src.replace("transform.DetachChildren",
+                                  "this.transform.DetachChildren"))
         self.assertIn("CS1061", cm.exception.message)
-        self.assertIn("'SetParent'", cm.exception.message)
+        self.assertIn("'DetachChildren'", cm.exception.message)
         self.assertNotIn("undeclared", cm.exception.message.lower())
         # Camera.main.transform.position is not MonoBehaviour.transform.
         unity_pack.analyze_script(
@@ -491,7 +515,8 @@ class TestSystems(unittest.TestCase):
             "        float x = Camera.main.transform.position.x;\n"
             "    }\n"
             "}\n")
-        # Supported transform.position / Rotate / LookAt / eulerAngles / rotation.
+        # Supported transform.position / Rotate / LookAt / eulerAngles /
+        # rotation / Find / localScale / SetParent.
         unity_pack.analyze_script(
             path,
             "using UnityEngine;\n"
@@ -505,6 +530,18 @@ class TestSystems(unittest.TestCase):
             "Vector3.forward * 45f);\n"
             "        transform.rotation = Quaternion.LookRotation("
             "Vector3.forward, Vector3.up);\n"
+            "        Transform child = transform.Find(\"Child\");\n"
+            "        Vector3 s = transform.localScale;\n"
+            "        Transform p = transform.parent;\n"
+            "        GameObject go = transform.gameObject;\n"
+            "        transform.SetParent(null);\n"
+            "        transform.SetParent(null, false);\n"
+            "        Matrix4x4 w2l = transform.worldToLocalMatrix;\n"
+            "        Matrix4x4 l2w = transform.localToWorldMatrix;\n"
+            "        Vector3 lp = transform.localPosition;\n"
+            "        Quaternion lr = transform.localRotation;\n"
+            "        Vector3 wp = transform.TransformPoint(Vector3.zero);\n"
+            "        float wpx = transform.TransformPoint(1f, 0f, 0f).x;\n"
             "    }\n"
             "}\n")
 
@@ -1011,7 +1048,7 @@ class TestSystems(unittest.TestCase):
         layers = unity_pack._load_sorting_layers(SYSTEMS)
         self.assertEqual([L["name"] for L in layers], ["Default", "Foreground"])
         self.assertEqual(layers[1]["unique_id"], 2081823273)
-        objs, _a, _l, _c = unity_pack.load_project(SYSTEMS)
+        objs, _a, _l, _c, _hier = unity_pack.load_project(SYSTEMS)
         by_name = {o["name"]: o for o in objs}
         bouncer = by_name["BouncePad"]["sprite"]
         button = by_name["Button"]["sprite"]
@@ -1164,7 +1201,7 @@ class TestSystems(unittest.TestCase):
 
     def test_canvas_button_draws_and_clicks(self):
         """Authored Canvas + Button (builtin UISprite) → draw + SetActive onClick."""
-        objs, _a, _l, cams = unity_pack.load_project(SYSTEMS)
+        objs, _a, _l, cams, _hier = unity_pack.load_project(SYSTEMS)
         btn = [o for o in objs if o["name"] == "Button"]
         self.assertEqual(len(btn), 1)
         sp = btn[0]["sprite"]
@@ -1282,7 +1319,7 @@ class TestSystems(unittest.TestCase):
             os.path.join(SYSTEMS, "Assets", "Scripts", "Player.cs"))
 
     def test_detects_system_apis(self):
-        _objs, analyses, lights, cameras = unity_pack.load_project(SYSTEMS)
+        _objs, analyses, lights, cameras, _hier = unity_pack.load_project(SYSTEMS)
         apis = set()
         for a in analyses:
             apis |= a["apis"]
@@ -1435,13 +1472,73 @@ class TestSystems(unittest.TestCase):
             "  m_GameObject: {fileID: 60}\n"
             "  m_Script: {fileID: 11500000, guid: deadbeefdeadbeefdeadbeefdeadbeef}\n"
         )
-        objs, _lights, _cams = unity_pack.parse_unity_yaml(text)
+        objs, _lights, _cams, _hier = unity_pack.parse_unity_yaml(text)
         nested = [o for o in objs if o["name"] == "Nested"][0]
         self.assertEqual(nested["father_id"], "2")
         self.assertAlmostEqual(nested["local_pos"][0], 3.0)
         self.assertAlmostEqual(nested["local_pos"][1], 4.0)
         self.assertAlmostEqual(nested["pos"][0], 13.0)
         self.assertAlmostEqual(nested["pos"][1], 4.0)
+
+    def test_editor_scripts_are_not_analyzed(self):
+        """Assets/**/Editor/**/*.cs are Unity editor-only — skip for player pack."""
+        root = tempfile.mkdtemp(prefix="upack-editor-")
+        runtime = os.path.join(root, "Assets", "Scripts")
+        editor = os.path.join(root, "Assets", "Scripts", "Editor")
+        os.makedirs(runtime)
+        os.makedirs(editor)
+        with open(os.path.join(runtime, "Player.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Player : MonoBehaviour {\n"
+                "    void Update() { transform.position = "
+                "new Vector2(1f, 2f); }\n"
+                "}\n"
+            )
+        with open(os.path.join(runtime, "Player.cs.meta"), "w") as f:
+            f.write("guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n")
+        with open(os.path.join(editor, "BadWindow.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "using UnityEditor;\n"
+                "public class BadWindow : EditorWindow {\n"
+                "    void OnGUI() {\n"
+                "        if (Application.isPlaying) { }\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(editor, "BadWindow.cs.meta"), "w") as f:
+            f.write("guid: cccccccccccccccccccccccccccccccc\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Player\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}\n"
+            )
+        # Must not raise CS0117 for Application.isPlaying in Editor script.
+        d = tempfile.mkdtemp(prefix="upack-editor-out-")
+        plan = unity_pack.pack(root, d)
+        self.assertIn("Player", plan["classes"])
+        self.assertTrue(unity_pack._is_player_csharp(
+            root, os.path.join(runtime, "Player.cs")))
+        self.assertFalse(unity_pack._is_player_csharp(
+            root, os.path.join(editor, "BadWindow.cs")))
+        # "Editor Helpers" is not the Unity Editor folder.
+        helpers = os.path.join(root, "Assets", "Editor Helpers", "Tool.cs")
+        os.makedirs(os.path.dirname(helpers))
+        with open(helpers, "w") as f:
+            f.write("using UnityEngine;\nclass Tool {}\n")
+        self.assertTrue(unity_pack._is_player_csharp(root, helpers))
 
     def test_emits_opt_in_stubs_not_invented_components(self):
         d = tempfile.mkdtemp(prefix="upack-sys-")
@@ -1491,7 +1588,7 @@ class TestSystems(unittest.TestCase):
         self.assertNotIn("PARTICLE_MAX", engine)
         # MiniScene must not pull Sin / physics / input / lights in.
         d2 = tempfile.mkdtemp(prefix="upack-mini-")
-        unity_pack.pack(SCENE, d2)
+        unity_pack.pack(PROJECT, d2)
         with open(os.path.join(d2, "engine.c")) as f:
             mini = f.read()
         with open(os.path.join(d2, "data.c")) as f:
@@ -1504,7 +1601,7 @@ class TestSystems(unittest.TestCase):
     def test_sprite_png_pixels_are_packed(self):
         """Editing the referenced PNG changes packed texture bytes."""
         d = tempfile.mkdtemp(prefix="upack-tex-")
-        plan = unity_pack.pack(SCENE, d)
+        plan = unity_pack.pack(PROJECT, d)
         self.assertGreaterEqual(len(plan.get("textures") or []), 1)
         tex = plan["textures"][0]
         self.assertEqual(tex["w"], 8)
@@ -1518,7 +1615,7 @@ class TestSystems(unittest.TestCase):
         # Recolor the project PNG and re-pack — bytes must follow.
         red = tempfile.mkdtemp(prefix="upack-red-")
         import shutil
-        shutil.copytree(SCENE, os.path.join(red, "proj"))
+        shutil.copytree(PROJECT, os.path.join(red, "proj"))
         proj = os.path.join(red, "proj")
         png = os.path.join(proj, "Assets", "Sprites", "quad.png")
         # 8x8 opaque red
@@ -1633,7 +1730,7 @@ class TestSystems(unittest.TestCase):
                 "guid: 22222222222222222222222222222222, type: 3}\n"
                 "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
             )
-        objs, _a, _l, _c = unity_pack.load_project(root)
+        objs, _a, _l, _c, _hier = unity_pack.load_project(root)
         by_name = {o["name"]: o for o in objs}
         small = by_name["Small"]["sprite"]
         big = by_name["Big"]["sprite"]
@@ -1687,7 +1784,7 @@ class TestSystems(unittest.TestCase):
                 "guid: 11111111111111111111111111111111, type: 3}\n"
                 "  m_Color: {r: 1, g: 0, b: 0, a: 1}\n"
             )
-        objs, _a, _l, _c = unity_pack.load_project(root)
+        objs, _a, _l, _c, _hier = unity_pack.load_project(root)
         self.assertIsNone(objs[0].get("sprite"))
 
     def test_sprite_renderer_without_sprite_does_not_draw(self):
@@ -1726,7 +1823,7 @@ class TestSystems(unittest.TestCase):
                 "  m_Sprite: {fileID: 0}\n"
                 "  m_Color: {r: 1, g: 0, b: 0, a: 1}\n"
             )
-        objs, _a, _l, _c = unity_pack.load_project(root)
+        objs, _a, _l, _c, _hier = unity_pack.load_project(root)
         self.assertIsNone(objs[0].get("sprite"))
         d = tempfile.mkdtemp(prefix="upack-empty-spr-out-")
         unity_pack.pack(root, d)
@@ -1778,7 +1875,7 @@ class TestSystems(unittest.TestCase):
         self.assertNotIn("out[n].half_w", engine)
 
     def test_authored_animation_and_animator(self):
-        objs, _a, _l, _c = unity_pack.load_project(SYSTEMS)
+        objs, _a, _l, _c, _hier = unity_pack.load_project(SYSTEMS)
         wave = [o for o in objs if o["name"] == "Wave"][0]
         spin = [o for o in objs if o["name"] == "Spinner"][0]
         # Bob.anim is legacy → Animation on Wave plays; Animator on Spinner idle.
@@ -1850,7 +1947,7 @@ class TestSystems(unittest.TestCase):
         text = open(anim).read().replace("m_Legacy: 1", "m_Legacy: 0")
         with open(anim, "w") as f:
             f.write(text)
-        objs, _a, _l, _c = unity_pack.load_project(scene)
+        objs, _a, _l, _c, _hier = unity_pack.load_project(scene)
         wave = [o for o in objs if o["name"] == "Wave"][0]
         spin = [o for o in objs if o["name"] == "Spinner"][0]
         self.assertIsNone(wave.get("anim_player"))
@@ -2063,7 +2160,7 @@ class TestSystems(unittest.TestCase):
             run.stderr)
 
     def test_authored_rigidbody2d_is_packed(self):
-        objs, _a, _l, _c = unity_pack.load_project(SYSTEMS)
+        objs, _a, _l, _c, _hier = unity_pack.load_project(SYSTEMS)
         ball = [o for o in objs if o["name"] == "Ball"][0]
         self.assertIsNotNone(ball.get("rigidbody2d"))
         self.assertAlmostEqual(ball["rigidbody2d"]["vel_x"], 0.0)
@@ -2256,7 +2353,7 @@ class TestSystems(unittest.TestCase):
                 "  m_Center: {x: 0, y: 0, z: 0}\n"
                 "  m_Size: {x: 10, y: 0.5, z: 10}\n"
             )
-        objs, _a, _l, _c = unity_pack.load_project(root)
+        objs, _a, _l, _c, _hier = unity_pack.load_project(root)
         cube = [o for o in objs if o["name"] == "Cube"][0]
         floor = [o for o in objs if o["name"] == "Floor"][0]
         self.assertAlmostEqual(cube["collider3d"]["dynamic_friction"], 0.3)
@@ -2738,7 +2835,7 @@ class TestSystems(unittest.TestCase):
         self.assertIn("extern int Screen_fullScreen;", hdr)
         # MiniScene has no defaultScreen* → Unity 1024×768 defaults.
         d2 = tempfile.mkdtemp(prefix="upack-scr-mini-")
-        plan2 = unity_pack.pack(SCENE, d2)
+        plan2 = unity_pack.pack(PROJECT, d2)
         self.assertEqual(plan2["screen_width"], 1024)
         self.assertEqual(plan2["screen_height"], 768)
         self.assertEqual(plan2.get("screen_fullscreen"), 0)
