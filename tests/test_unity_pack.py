@@ -2966,7 +2966,7 @@ class TestSystemsRuns(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
 
     def test_oncollision_enter2d_fires_on_landing(self):
-        """Player.OnCollisionEnter2D prints Collision2D when hitting Ground."""
+        """Player.OnCollisionEnter2D prints Collision2D when hitting Ground/Ball."""
         d = tempfile.mkdtemp(prefix="upack-col2d-msg-")
         unity_pack.pack(SYSTEMS, d)
         with open(os.path.join(d, "engine.c")) as f:
@@ -2974,6 +2974,7 @@ class TestSystemsRuns(unittest.TestCase):
         self.assertIn("Player_OnCollisionEnter2D(unsigned i, int coll)", eng)
         self.assertIn("Collision2D_ToString", eng)
         self.assertIn("_col2d_add_contact", eng)
+        self.assertIn("inv_a / inv_sum", eng)
         host = os.path.join(d, "host.c")
         with open(host, "w") as f:
             f.write(
@@ -2981,14 +2982,19 @@ class TestSystemsRuns(unittest.TestCase):
                 "extern float Time_deltaTime;\n"
                 "typedef struct Player Player;\n"
                 "struct Player { float pos_x; float pos_y; };\n"
+                "typedef struct Ball Ball;\n"
+                "struct Ball { float pos_x; float pos_y; };\n"
                 "extern Player _Player_inst_array[];\n"
+                "extern Ball _Ball_inst_array[];\n"
                 "int main(void) {\n"
                 "  int i;\n"
                 "  Time_deltaTime = 0.02f;\n"
                 "  for (i = 0; i < 120; i = i + 1) engine_tick();\n"
-                "  /* Ground top -2.25 + half-height 0.5 → rest ≈ -1.75 */\n"
-                "  if (_Player_inst_array[0].pos_y > -1.6f) return 2;\n"
-                "  if (_Player_inst_array[0].pos_y < -1.9f) return 3;\n"
+                "  /* Player lands on Ball above Ground; Ball must stay on floor. */\n"
+                "  if (_Ball_inst_array[0].pos_y < -2.15f) return 2;\n"
+                "  if (_Player_inst_array[0].pos_y"
+                "      <= _Ball_inst_array[0].pos_y) return 3;\n"
+                "  if (_Player_inst_array[0].pos_y > 0.f) return 4;\n"
                 "  return 0;\n"
                 "}\n"
             )
@@ -3011,6 +3017,57 @@ class TestSystemsRuns(unittest.TestCase):
         run = subprocess.run([exe], capture_output=True, text=True)
         self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
         self.assertIn("UnityEngine.Collision2D", run.stdout)
+
+    def test_player_stack_on_ball_does_not_teleport_ball(self):
+        """Player landing on Ball must not drive Ball through Ground."""
+        d = tempfile.mkdtemp(prefix="upack-stack-")
+        unity_pack.pack(SYSTEMS, d)
+        host = os.path.join(d, "host.c")
+        with open(host, "w") as f:
+            f.write(
+                "void engine_tick(void);\n"
+                "extern float Time_deltaTime;\n"
+                "typedef struct { float pos_x; float pos_y; } Ball;\n"
+                "typedef struct { float pos_x; float pos_y; } Player;\n"
+                "extern Ball _Ball_inst_array[];\n"
+                "extern Player _Player_inst_array[];\n"
+                "int main(void) {\n"
+                "  int i;\n"
+                "  float ball_min = 99.f;\n"
+                "  Time_deltaTime = 0.02f;\n"
+                "  for (i = 0; i < 200; i = i + 1) {\n"
+                "    engine_tick();\n"
+                "    if (_Ball_inst_array[0].pos_y < ball_min)\n"
+                "      ball_min = _Ball_inst_array[0].pos_y;\n"
+                "  }\n"
+                "  /* Rest on Ground ≈ -2.025; never sink well below. */\n"
+                "  if (ball_min < -2.2f) return 2;\n"
+                "  if (_Ball_inst_array[0].pos_y < -2.15f) return 3;\n"
+                "  if (_Player_inst_array[0].pos_y"
+                "      <= _Ball_inst_array[0].pos_y + 0.2f) return 4;\n"
+                "  return 0;\n"
+                "}\n"
+            )
+        if not _CC:
+            return
+        r = subprocess.run(
+            [_CC, "-O3", "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(
+            [_CC, "-O0", "-c", "-o", os.path.join(d, "data.o"),
+             os.path.join(d, "data.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        exe = os.path.join(d, "stack")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host,
+             os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
 
     def test_physics_fall_matches_wall_clock_not_frame_count(self):
         """60Hz×1s ≈ same Player fall as 50 fixed steps (Unity fixed clock)."""
