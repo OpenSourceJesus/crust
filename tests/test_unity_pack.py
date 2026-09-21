@@ -2141,9 +2141,11 @@ class TestSystems(unittest.TestCase):
         fields = x.get("fields") or {}
         self.assertAlmostEqual(fields.get("multSize_x"), 1.5)
         self.assertAlmostEqual(fields.get("multSize_y"), 2.25)
-        self.assertNotIn("mCustomOffset_x", fields)
-        self.assertNotIn("mCustomOffset_y", fields)
-        self.assertNotIn("mCustomOffset", fields)
+        # Vector2 must not grow a phantom z; Vector3 keeps z (not truncated).
+        self.assertNotIn("multSize_z", fields)
+        self.assertAlmostEqual(fields.get("mCustomOffset_x"), 0.0)
+        self.assertAlmostEqual(fields.get("mCustomOffset_y"), 0.0)
+        self.assertAlmostEqual(fields.get("mCustomOffset_z"), 0.0)
 
     def test_editor_scripts_are_not_analyzed(self):
         """Assets/**/Editor/**/*.cs are Unity editor-only — skip for player pack."""
