@@ -1480,6 +1480,37 @@ class TestSystems(unittest.TestCase):
         self.assertAlmostEqual(nested["pos"][0], 13.0)
         self.assertAlmostEqual(nested["pos"][1], 4.0)
 
+    def test_vec2_fields_ignore_vector3_yaml(self):
+        """Vector3 `{x,y,z}` must not be parsed as Vector2 (y stops at comma)."""
+        text = (
+            "%YAML 1.1\n"
+            "--- !u!1 &1\n"
+            "GameObject:\n"
+            "  m_Name: X\n"
+            "  m_Component:\n"
+            "  - component: {fileID: 2}\n"
+            "  - component: {fileID: 3}\n"
+            "--- !u!4 &2\n"
+            "Transform:\n"
+            "  m_GameObject: {fileID: 1}\n"
+            "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+            "--- !u!114 &3\n"
+            "MonoBehaviour:\n"
+            "  m_GameObject: {fileID: 1}\n"
+            "  m_Script: {fileID: 11500000, "
+            "guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}\n"
+            "  multSize: {x: 1.5, y: 2.25}\n"
+            "  mCustomOffset: {x: 0, y: 0, z: 0}\n"
+        )
+        objs, _lights, _cams, _hier = unity_pack.parse_unity_yaml(text)
+        x = [o for o in objs if o["name"] == "X"][0]
+        fields = x.get("fields") or {}
+        self.assertAlmostEqual(fields.get("multSize_x"), 1.5)
+        self.assertAlmostEqual(fields.get("multSize_y"), 2.25)
+        self.assertNotIn("mCustomOffset_x", fields)
+        self.assertNotIn("mCustomOffset_y", fields)
+        self.assertNotIn("mCustomOffset", fields)
+
     def test_editor_scripts_are_not_analyzed(self):
         """Assets/**/Editor/**/*.cs are Unity editor-only — skip for player pack."""
         root = tempfile.mkdtemp(prefix="upack-editor-")

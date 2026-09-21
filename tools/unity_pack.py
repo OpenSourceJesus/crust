@@ -2188,14 +2188,25 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             val = fm.group(2)
             rec["fields"][key] = float(val) if "." in val else int(val)
         # Vector2 serialized fields: name: {x: A, y: B}
+        # y stops at ',' so Vector3 `{x,y,z}` does not match as Vector2.
         for fm in re.finditer(
-                r"(?m)^\s{2}(\w+):\s+\{x:\s*([^,}]+),\s*y:\s*([^}]+)\}\s*$",
+                r"(?m)^\s{2}(\w+):\s+\{x:\s*([^,}]+),\s*y:\s*([^,}]+)\}\s*$",
                 block):
             key = fm.group(1)
             if key.startswith("m_"):
                 continue
             rec.setdefault("vec2_fields", {})[key] = (
                 float(fm.group(2)), float(fm.group(3)))
+        # Vector3: name: {x: A, y: B, z: C}
+        for fm in re.finditer(
+                r"(?m)^\s{2}(\w+):\s+\{x:\s*([^,}]+),\s*y:\s*([^,}]+),"
+                r"\s*z:\s*([^,}]+)\}\s*$",
+                block):
+            key = fm.group(1)
+            if key.startswith("m_"):
+                continue
+            rec.setdefault("vec3_fields", {})[key] = (
+                float(fm.group(2)), float(fm.group(3)), float(fm.group(4)))
         # Transform / component object refs: name: {fileID: N}
         for fm in re.finditer(
                 r"(?m)^\s{2}(\w+):\s+\{fileID:\s*(-?\d+)\}\s*$", block):
