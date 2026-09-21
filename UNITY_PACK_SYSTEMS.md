@@ -47,10 +47,14 @@ action maps / device graphs).
 | `WriteLine` / `Debug.Log` of a `GameObject` | `Object.ToString` → `name (UnityEngine.GameObject)` (missing → `"null"`) |
 | `Application.dataPath` | Packed project `Assets/` absolute path (**Awake/Start only**) |
 | `Application.persistentDataPath` | Unity company/product save dir (**Awake/Start only**) |
+| `Application.isEditor` | Always **false** (packed player) |
+| `Application.isPlaying` | Always **true** while the packed player runs |
+| `Application.OpenURL(url)` | No-op in packed player (no OS browser / mailto) |
 | Other `Application.*` | Pack-time **CS0117** (`Application` in scope via `using UnityEngine`) |
-| Other `Quaternion.*` (not Euler / identity / LookRotation) | Pack-time **CS0117** (`Quaternion` in scope via `using UnityEngine`) |
+| Other `Quaternion.*` (not Euler / identity / LookRotation / Slerp) | Pack-time **CS0117** (`Quaternion` in scope via `using UnityEngine`) |
 | `File.WriteAllText(path, text)` | `fopen` write (`"w"`); creates parent dirs when possible |
 | `File.AppendAllText(path, text)` | `fopen` append (`"a"`); creates parent dirs when possible |
+| `File.Exists(path)` | `fopen` probe (`"rb"`) → 1 / 0 (dirs fail like .NET) |
 | Other `File.*` | Pack-time **CS0117** (`File` in scope via `using System.IO`) |
 
 Default log path matches Unity standalone (from `ProjectSettings`

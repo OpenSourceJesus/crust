@@ -51,7 +51,7 @@ def _assets_rel_path(path):
 
 
 # System.IO.File members we emit. Others → CS0117 (File is in scope via using).
-_FILE_SUPPORTED = frozenset({"WriteAllText", "AppendAllText"})
+_FILE_SUPPORTED = frozenset({"WriteAllText", "AppendAllText", "Exists"})
 
 # UnityEngine.Application members we emit. Others → CS0117.
 _APPLICATION_SUPPORTED = frozenset({"dataPath", "persistentDataPath"})
@@ -270,8 +270,12 @@ _API = {
     # Path to Assets/ (Editor) — baked from the packed project root.
     "Application.dataPath": True,
     "Application.persistentDataPath": True,
+    "Application.isEditor": True,
+    "Application.isPlaying": True,
+    "Application.OpenURL": True,
     "File.WriteAllText": True,
     "File.AppendAllText": True,
+    "File.Exists": True,
 }
 
 # APIs that would require inventing scene components / assets we do not pack.
@@ -4251,10 +4255,18 @@ def analyze_script(path, text=None):
         apis.add("Application.dataPath")
     if re.search(r"(?:UnityEngine\.)?Application\.persistentDataPath\b", scan):
         apis.add("Application.persistentDataPath")
+    if re.search(r"(?:UnityEngine\.)?Application\.isEditor\b", scan):
+        apis.add("Application.isEditor")
+    if re.search(r"(?:UnityEngine\.)?Application\.isPlaying\b", scan):
+        apis.add("Application.isPlaying")
+    if re.search(r"(?:UnityEngine\.)?Application\.OpenURL\s*\(", scan):
+        apis.add("Application.OpenURL")
     if re.search(r"(?:System\.IO\.)?File\.WriteAllText\s*\(", scan):
         apis.add("File.WriteAllText")
     if re.search(r"(?:System\.IO\.)?File\.AppendAllText\s*\(", scan):
         apis.add("File.AppendAllText")
+    if re.search(r"(?:System\.IO\.)?File\.Exists\s*\(", scan):
+        apis.add("File.Exists")
     # C# string + value must not become C pointer arithmetic.
     if re.search(
             r'"\s*\+|'
@@ -4906,18 +4918,28 @@ def emit_engine(plan, analyses, used_apis):
     want_console = "Console.WriteLine" in used_apis
     want_str_plus = "string.+" in used_apis
     want_find = "GameObject.Find" in used_apis
+    want_transform_find = "transform.Find" in used_apis
+    want_transform_parent = "transform.parent" in used_apis
+    want_transform_go = "transform.gameObject" in used_apis
+    want_set_parent = "transform.SetParent" in used_apis
     want_getcomponent = "GetComponent" in used_apis
     want_data_path = "Application.dataPath" in used_apis
     want_persistent_data_path = "Application.persistentDataPath" in used_apis
+    want_app_is_editor = "Application.isEditor" in used_apis
+    want_app_is_playing = "Application.isPlaying" in used_apis
+    want_app_open_url = "Application.OpenURL" in used_apis
     want_file_write = "File.WriteAllText" in used_apis
     want_file_append = "File.AppendAllText" in used_apis
-    want_file_io = want_file_write or want_file_append
+    want_file_exists = "File.Exists" in used_apis
+    want_file_write_ops = want_file_write or want_file_append
+    want_file_io = want_file_write_ops or want_file_exists
     want_destroy = "Object.Destroy" in used_apis
     ui_buttons = plan.get("ui_buttons") or []
     want_ui = bool(ui_buttons)
     want_go_tables = (
-        want_find or want_getcomponent or want_rb2d or want_rb3d
-        or want_add_any or want_ui or want_destroy)
+        want_find or want_transform_find or want_transform_parent
+        or want_transform_go or want_set_parent or want_getcomponent
+        or want_rb2d or want_rb3d or want_add_any or want_ui or want_destroy)
     want_ctor_forbidden = any(
         bool(cl.get("ctor_forbidden"))
         for cl in plan["classes"].values())
@@ -5534,6 +5556,18 @@ def emit_engine(plan, analyses, used_apis):
             p("                               const char *contents) {")
             p("    File_WriteContents(path, contents, \"a\");")
             p("}")
+        p("")
+    if want_file_exists:
+        # fopen probe — no unistd/access (crust subset); dirs fail like .NET.
+        p("/* System.IO.File.Exists */")
+        p("static int File_Exists(const char *path) {")
+        p("    FILE *fp;")
+        p("    if (!path || !path[0]) return 0;")
+        p("    fp = fopen(path, \"rb\");")
+        p("    if (!fp) return 0;")
+        p("    fclose(fp);")
+        p("    return 1;")
+        p("}")
         p("")
     if want_console:
         p("/* System.Console.WriteLine → stdout (terminal), not Player.log */")
@@ -8480,11 +8514,23 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         r"(?:UnityEngine\.)?Application\.persistentDataPath\b",
         "Application_persistentDataPath()", text)
     text = re.sub(
+        r"(?:UnityEngine\.)?Application\.isEditor\b",
+        "Application_isEditor()", text)
+    text = re.sub(
+        r"(?:UnityEngine\.)?Application\.isPlaying\b",
+        "Application_isPlaying()", text)
+    text = re.sub(
+        r"(?:UnityEngine\.)?Application\.OpenURL\s*\(",
+        "Application_OpenURL(", text)
+    text = re.sub(
         r"(?:System\.IO\.)?File\.WriteAllText\s*\(",
         "File_WriteAllText(", text)
     text = re.sub(
         r"(?:System\.IO\.)?File\.AppendAllText\s*\(",
         "File_AppendAllText(", text)
+    text = re.sub(
+        r"(?:System\.IO\.)?File\.Exists\s*\(",
+        "File_Exists(", text)
     text = re.sub(
         r"(?<![\w.])(?:Object\.)?Destroy\s*\(\s*gameObject\s*\)",
         "Object_Destroy(_engine_go_of_%s(i))" % idn
