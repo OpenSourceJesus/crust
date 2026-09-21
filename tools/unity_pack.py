@@ -7378,11 +7378,14 @@ def _parse_plus_rhs(text, i):
     return start, i
 
 
-def _rewrite_string_concat(text):
+def _rewrite_string_concat(text, string_idents=None):
     """Rewrite C# string + value to typed _str_plus_* (C pointer + is wrong).
 
-    Handles `"lit" + expr` and chains via repeated `_str_plus_*(...) + expr`.
+    Handles `"lit" + expr`, `Application_*Path() + expr`, and chains via
+    repeated `_str_plus_*(...) + expr`. `string_idents` are bare names known
+    to be `string` (class static/const fields) so RHS picks `_str_plus_s`.
     """
+    string_idents = frozenset(string_idents or ())
     changed = True
     while changed:
         changed = False
@@ -7392,6 +7395,9 @@ def _rewrite_string_concat(text):
             left = None
             left_end = None
             m_plus = re.match(r"_str_plus_[ifcs]\(", text[i:])
+            m_app = re.match(
+                r"Application_(?:dataPath|persistentDataPath)\(\)",
+                text[i:])
             if m_plus or text.startswith("_str_plus(", i):
                 prefix = m_plus.group(0) if m_plus else "_str_plus("
                 depth = 0
@@ -7410,6 +7416,9 @@ def _rewrite_string_concat(text):
                     j += 1
                 left = text[i:j]
                 left_end = j
+            elif m_app:
+                left = m_app.group(0)
+                left_end = i + len(left)
             elif text[i] == '"':
                 j = _skip_c_string(text, i)
                 left = text[i:j]
@@ -7422,7 +7431,8 @@ def _rewrite_string_concat(text):
                     rhs_start, rhs_end = _parse_plus_rhs(text, k + 1)
                     rhs = text[rhs_start:rhs_end].strip()
                     if rhs:
-                        kind = _c_expr_scalar_kind(rhs)
+                        kind = _c_expr_scalar_kind(
+                            rhs, string_idents=string_idents)
                         out.append("_str_plus_%s(%s, (%s))"
                                    % (kind, left, rhs))
                         i = rhs_end
@@ -7434,8 +7444,9 @@ def _rewrite_string_concat(text):
     return text
 
 
-def _c_expr_scalar_kind(expr):
+def _c_expr_scalar_kind(expr, string_idents=None):
     """Pick i/f/c/s suffix for Debug_Log / Console_WriteLine / _str_plus."""
+    string_idents = frozenset(string_idents or ())
     e = expr.strip()
     while (e.startswith("(") and e.endswith(")")
            and e.count("(") == e.count(")")):
@@ -7444,7 +7455,10 @@ def _c_expr_scalar_kind(expr):
             break
         e = inner
     if (e.startswith('"') or e.startswith("_str_plus")
-            or "ToString" in e or e.startswith("(const char")):
+            or "ToString" in e or e.startswith("(const char")
+            or e in ("Application_dataPath()",
+                     "Application_persistentDataPath()")
+            or (re.match(r"^\w+$", e) and e in string_idents)):
         return "s"
     if re.match(r"^'(?:[^'\\]|\\.)'$", e):
         return "c"
@@ -7667,7 +7681,11 @@ def _lower_method_body(body, cl, plan, site=None):
     text = _strip_debug_log_context_arg(text)
     text = re.sub(r"System\.Console\.WriteLine\b", "Console_WriteLine", text)
     text = re.sub(r"(?<![\w.])Console\.WriteLine\b", "Console_WriteLine", text)
-    text = _rewrite_string_concat(text)
+    string_idents = {
+        f["name"] for f in (cl.get("class_consts") or [])
+        if f.get("ty") == "string"
+    }
+    text = _rewrite_string_concat(text, string_idents=string_idents)
     # Unity Object.ToString when printing a Find result (name, not index).
     text = _wrap_log_gameobject_tostring(text)
     text = _wrap_log_component_tostring(text, add_locals)
