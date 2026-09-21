@@ -62,6 +62,7 @@ _TRANSFORM_SUPPORTED = frozenset({
     "position",
     "Rotate",
     "LookAt",
+    "eulerAngles",
 })
 
 
@@ -4114,6 +4115,9 @@ def analyze_script(path, text=None):
     if re.search(r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*LookAt\s*\(",
                  scan):
         apis.add("transform.LookAt")
+    if re.search(r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*eulerAngles\b",
+                 scan):
+        apis.add("transform.eulerAngles")
     if re.search(r"using\s+UnityEngine\.UI\b", scan):
         apis.add("UnityEngine.UI")
     if re.search(r"\bInputAction\b", scan):
@@ -4175,7 +4179,10 @@ def analyze_script(path, text=None):
         r"transform\.Translate", scan))
     writes_rot = bool(re.search(
         r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*"
-        r"(?:Rotate|LookAt)\s*\(", scan))
+        r"(?:Rotate|LookAt)\s*\(", scan) or re.search(
+        r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*"
+        r"eulerAngles\b",
+        scan))
 
     types = cs2cpp._find_types(scan)
     classes = []
@@ -6166,6 +6173,56 @@ def emit_engine(plan, analyses, used_apis):
         p("    *m11 = 1.f - 2.f * (nx * nx + nz * nz);")
         p("}")
         p("")
+        p("/* Transform.eulerAngles get: quat → degrees (Unity ZXY). */")
+        p("static void _engine_quat_to_euler_deg(")
+        p("    float qx, float qy, float qz, float qw,")
+        p("    float *ex, float *ey, float *ez) {")
+        p("    float sqx = qx * qx;")
+        p("    float sqy = qy * qy;")
+        p("    float sqz = qz * qz;")
+        p("    float sqw = qw * qw;")
+        p("    float unit = sqx + sqy + sqz + sqw;")
+        p("    float test = qx * qy + qz * qw;")
+        p("    float rad2deg = 57.29577951308232f;")
+        p("    if (test > 0.499f * unit) {")
+        p("        *ey = 2.f * atan2f(qx, qw) * rad2deg;")
+        p("        *ex = 90.f;")
+        p("        *ez = 0.f;")
+        p("    } else if (test < -0.499f * unit) {")
+        p("        *ey = -2.f * atan2f(qx, qw) * rad2deg;")
+        p("        *ex = -90.f;")
+        p("        *ez = 0.f;")
+        p("    } else {")
+        p("        *ey = atan2f(2.f * qy * qw - 2.f * qx * qz,")
+        p("                    sqx - sqy - sqz + sqw) * rad2deg;")
+        p("        *ex = asinf(2.f * test / unit) * rad2deg;")
+        p("        *ez = atan2f(2.f * qx * qw - 2.f * qy * qz,")
+        p("                    -sqx + sqy - sqz + sqw) * rad2deg;")
+        p("    }")
+        p("}")
+        p("")
+        p("/* Transform.eulerAngles set: localRotation = Euler(deg). */")
+        p("static void _engine_transform_set_euler(")
+        p("    float *qx, float *qy, float *qz, float *qw,")
+        p("    float *m00, float *m01, float *m10, float *m11,")
+        p("    float ex_deg, float ey_deg, float ez_deg) {")
+        p("    float hx = ex_deg * 0.008726646259971648f;")
+        p("    float hy = ey_deg * 0.008726646259971648f;")
+        p("    float hz = ez_deg * 0.008726646259971648f;")
+        p("    float cx = cosf(hx); float sx = sinf(hx);")
+        p("    float cy = cosf(hy); float sy = sinf(hy);")
+        p("    float cz = cosf(hz); float sz = sinf(hz);")
+        p("    float nx = sx * cy * cz + cx * sy * sz;")
+        p("    float ny = cx * sy * cz - sx * cy * sz;")
+        p("    float nz = cx * cy * sz - sx * sy * cz;")
+        p("    float nw = cx * cy * cz + sx * sy * sz;")
+        p("    *qx = nx; *qy = ny; *qz = nz; *qw = nw;")
+        p("    *m00 = 1.f - 2.f * (ny * ny + nz * nz);")
+        p("    *m01 = 2.f * (nx * ny - nz * nw);")
+        p("    *m10 = 2.f * (nx * ny + nz * nw);")
+        p("    *m11 = 1.f - 2.f * (nx * nx + nz * nz);")
+        p("}")
+        p("")
     # Group methods by class; array comment sits on the group.
     methods_by = {}
     for a in analyses:
@@ -7626,6 +7683,74 @@ def _rewrite_transform_look_at(text, cl):
     return "".join(out)
 
 
+def _rewrite_transform_euler_angles(text, cl):
+    """Lower transform.eulerAngles = / += → get euler + set_euler on packed quat.
+
+    Supports:
+      transform.eulerAngles = new Vector3(...);
+      transform.eulerAngles = Vector3.forward * expr;
+      transform.eulerAngles += …;
+    Degrees; matches Unity Quaternion.Euler / eulerAngles for unparented bodies.
+    """
+    idn = _c_ident(cl["name"])
+    rot_args = (
+        "&_%s_rot_x[i], &_%s_rot_y[i], &_%s_rot_z[i], &_%s_rot_w[i], "
+        "&_%s_rot_m00[i], &_%s_rot_m01[i], &_%s_rot_m10[i], "
+        "&_%s_rot_m11[i]" % ((idn,) * 8)
+    )
+    out = []
+    i = 0
+    while i < len(text):
+        m = re.search(
+            r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*eulerAngles\s*"
+            r"(\+=|=)(?!=)",
+            text[i:])
+        if not m:
+            out.append(text[i:])
+            break
+        start = i + m.start()
+        op = m.group(1)
+        rhs_start = i + m.end()
+        # Scan RHS to terminating `;`.
+        j = rhs_start
+        depth = 0
+        while j < len(text):
+            c = text[j]
+            if c == '"':
+                j = _skip_c_string(text, j)
+                continue
+            if c in "([{":
+                depth += 1
+            elif c in ")]}":
+                depth -= 1
+            elif c == ";" and depth == 0:
+                break
+            j += 1
+        rhs = text[rhs_start:j].strip()
+        end = j + 1 if j < len(text) and text[j] == ";" else j
+        out.append(text[i:start])
+        hit = _parse_vector3_expr(rhs)
+        if hit is None:
+            out.append(text[start:end])
+        else:
+            ex, ey, ez = hit
+            if op == "=":
+                out.append(
+                    "_engine_transform_set_euler(%s, (%s), (%s), (%s));"
+                    % (rot_args, ex, ey, ez))
+            else:
+                out.append(
+                    "{ float _eex, _eey, _eez; "
+                    "_engine_quat_to_euler_deg("
+                    "_%s_rot_x[i], _%s_rot_y[i], _%s_rot_z[i], _%s_rot_w[i], "
+                    "&_eex, &_eey, &_eez); "
+                    "_engine_transform_set_euler(%s, "
+                    "_eex + (%s), _eey + (%s), _eez + (%s)); }"
+                    % (idn, idn, idn, idn, rot_args, ex, ey, ez))
+        i = end
+    return "".join(out)
+
+
 def _skip_c_string(text, i):
     """Index just past a C/C# string literal starting at text[i] == '\"'."""
     j = i + 1
@@ -7907,6 +8032,7 @@ def _lower_method_body(body, cl, plan, site=None):
     text = _rewrite_rigidbody_assigns(text, plan, cl["name"])
     text = _rewrite_transform_rotate(text, cl)
     text = _rewrite_transform_look_at(text, cl)
+    text = _rewrite_transform_euler_angles(text, cl)
     # Find/GetComponent before field rewrites so `.amp` stays on the target type.
     text = _rewrite_find_getcomponent(text, plan, cl["name"], site=site)
     text, add_locals = _rewrite_addcomponent(text, plan, cl["name"])
@@ -8484,7 +8610,7 @@ def emit_data(plan, used_apis=None):
             idn, n, ", ".join("%sf" % repr(v) for v in sxs)))
         p("float _%s_scale_y[%d] = { %s };" % (
             idn, n, ", ".join("%sf" % repr(v) for v in sys)))
-    # Live localRotation for Transform.Rotate / LookAt targets.
+    # Live localRotation for Transform.Rotate / LookAt / eulerAngles targets.
     for cname in sorted(plan.get("live_rot_classes") or []):
         cl = plan["classes"].get(cname)
         if not cl:
