@@ -402,7 +402,7 @@ class TestSystems(unittest.TestCase):
             "\n"
             "public class Ball : MonoBehaviour {\n"
             "    void Start () {\n"
-            "        transform.LookAt(Vector3.zero);\n"
+            "        transform.SetParent(null);\n"
             "    }\n"
             "}\n"
         )
@@ -414,16 +414,17 @@ class TestSystems(unittest.TestCase):
             cm.exception.message,
             "Assets/Standard Assets/Scripts/Objects (Scripts)/Ball.cs"
             "(5,19): error CS1061: 'Transform' does not contain a "
-            "definition for 'LookAt' and no accessible extension method "
-            "'LookAt' accepting a first argument of type 'Transform' could "
+            "definition for 'SetParent' and no accessible extension method "
+            "'SetParent' accepting a first argument of type 'Transform' could "
             "be found (are you missing a using directive or an assembly "
             "reference?)")
         # this.transform also binds; still CS1061 on the member.
         with self.assertRaises(unity_pack.PackError) as cm:
             unity_pack.analyze_script(
-                path, src.replace("transform.LookAt", "this.transform.LookAt"))
+                path, src.replace("transform.SetParent",
+                                  "this.transform.SetParent"))
         self.assertIn("CS1061", cm.exception.message)
-        self.assertIn("'LookAt'", cm.exception.message)
+        self.assertIn("'SetParent'", cm.exception.message)
         self.assertNotIn("undeclared", cm.exception.message.lower())
         # Camera.main.transform.position is not MonoBehaviour.transform.
         unity_pack.analyze_script(
@@ -434,7 +435,7 @@ class TestSystems(unittest.TestCase):
             "        float x = Camera.main.transform.position.x;\n"
             "    }\n"
             "}\n")
-        # Supported transform.position / Rotate still analyze.
+        # Supported transform.position / Rotate / LookAt / eulerAngles / rotation.
         unity_pack.analyze_script(
             path,
             "using UnityEngine;\n"
@@ -442,6 +443,10 @@ class TestSystems(unittest.TestCase):
             "    void Update() {\n"
             "        transform.position = new Vector2(1f, 2f);\n"
             "        transform.Rotate(Vector3.forward * 90f * Time.deltaTime);\n"
+            "        transform.LookAt(Camera.main.transform);\n"
+            "        transform.eulerAngles += Vector3.forward * 45f;\n"
+            "        transform.rotation = Quaternion.Euler("
+            "Vector3.forward * 45f);\n"
             "    }\n"
             "}\n")
 
@@ -509,6 +514,298 @@ class TestSystems(unittest.TestCase):
             a = unity_pack.analyze_script(
                 os.path.join(scripts, "Spinner.cs"), sf.read())
         self.assertTrue(a["writes_rot"])
+
+    def test_transform_look_at_packs_live_quat(self):
+        """transform.LookAt(Camera.main.transform) → look_at helper + rot tables."""
+        root = tempfile.mkdtemp(prefix="upack-lookat-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Ball.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Ball : MonoBehaviour {\n"
+                "    void Update() {\n"
+                "        transform.LookAt(Camera.main.transform);\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Ball.cs.meta"), "w") as f:
+            f.write("guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Ball\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "  - component: {fileID: 4}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}\n"
+                "--- !u!212 &4\nSpriteRenderer:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n"
+                "  m_Sprite: {fileID: 0}\n"
+                "  m_Color: {r: 1, g: 0, b: 0, a: 1}\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Main Camera\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "--- !u!4 &11\nTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: -10}\n"
+                "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "--- !u!20 &12\nCamera:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Enabled: 1\n"
+                "  orthographic: 1\n"
+                "  orthographic size: 5\n"
+                "  near clip plane: 0.3\n"
+                "  far clip plane: 1000\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-lookat-out-")
+        plan = unity_pack.pack(root, d)
+        self.assertEqual(plan.get("live_rot_classes"), ["Ball"])
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("_engine_transform_look_at", eng)
+        self.assertIn("Camera_main_pos_x", eng)
+        self.assertIn(
+            "_engine_transform_look_at("
+            "&_Ball_rot_x[i], &_Ball_rot_y[i], &_Ball_rot_z[i], "
+            "&_Ball_rot_w[i], &_Ball_rot_m00[i], &_Ball_rot_m01[i], "
+            "&_Ball_rot_m10[i], &_Ball_rot_m11[i],",
+            eng)
+        self.assertIn("Ball_get_pos_x(i)", eng)
+        # Identity → look at camera (0,0,-10) should tilt (non-identity m).
+        if not _CC:
+            return
+        host = os.path.join(d, "host.c")
+        with open(host, "w") as f:
+            f.write(
+                "void engine_tick(void);\n"
+                "extern float Time_deltaTime;\n"
+                "extern float _Ball_rot_m00[];\n"
+                "extern float _Ball_rot_m11[];\n"
+                "int main(void) {\n"
+                "  Time_deltaTime = 0.02f;\n"
+                "  engine_tick();\n"
+                "  /* Looking toward -Z from origin → not identity XY basis. */\n"
+                "  if (_Ball_rot_m00[0] > 0.99f && _Ball_rot_m11[0] > 0.99f)\n"
+                "    return 2;\n"
+                "  return 0;\n"
+                "}\n"
+            )
+        r = subprocess.run(
+            [_CC, "-O2", "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(
+            [_CC, "-O0", "-c", "-o", os.path.join(d, "data.o"),
+             os.path.join(d, "data.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        exe = os.path.join(d, "look")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host,
+             os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+
+    def test_transform_euler_angles_packs_live_quat(self):
+        """transform.eulerAngles += Vector3.forward * deg → set_euler helper."""
+        root = tempfile.mkdtemp(prefix="upack-euler-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Ball.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Ball : MonoBehaviour {\n"
+                "    void Start() {\n"
+                "        transform.eulerAngles = Vector3.zero;\n"
+                "        transform.eulerAngles += Vector3.forward * 90f;\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Ball.cs.meta"), "w") as f:
+            f.write("guid: cccccccccccccccccccccccccccccccc\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Ball\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "  - component: {fileID: 4}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: cccccccccccccccccccccccccccccccc}\n"
+                "--- !u!212 &4\nSpriteRenderer:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n"
+                "  m_Sprite: {fileID: 0}\n"
+                "  m_Color: {r: 1, g: 0, b: 0, a: 1}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-euler-out-")
+        plan = unity_pack.pack(root, d)
+        self.assertEqual(plan.get("live_rot_classes"), ["Ball"])
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("_engine_transform_set_euler", eng)
+        self.assertIn("_engine_quat_to_euler_deg", eng)
+        self.assertNotIn("transform.eulerAngles", eng)
+        self.assertNotIn("Vector3.forward", eng)
+        if not _CC:
+            return
+        host = os.path.join(d, "host.c")
+        with open(host, "w") as f:
+            f.write(
+                "void engine_tick(void);\n"
+                "extern float Time_deltaTime;\n"
+                "extern float _Ball_rot_m00[];\n"
+                "extern float _Ball_rot_m01[];\n"
+                "extern float _Ball_rot_m10[];\n"
+                "extern float _Ball_rot_m11[];\n"
+                "int main(void) {\n"
+                "  Time_deltaTime = 0.02f;\n"
+                "  engine_tick();\n"
+                "  /* 90° about Z: m ≈ [[0,-1],[1,0]] (cos90=0, sin90=1). */\n"
+                "  if (_Ball_rot_m00[0] > 0.1f || _Ball_rot_m00[0] < -0.1f)\n"
+                "    return 2;\n"
+                "  if (_Ball_rot_m01[0] > -0.9f) return 3;\n"
+                "  if (_Ball_rot_m10[0] < 0.9f) return 4;\n"
+                "  if (_Ball_rot_m11[0] > 0.1f || _Ball_rot_m11[0] < -0.1f)\n"
+                "    return 5;\n"
+                "  return 0;\n"
+                "}\n"
+            )
+        r = subprocess.run(
+            [_CC, "-O2", "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(
+            [_CC, "-O0", "-c", "-o", os.path.join(d, "data.o"),
+             os.path.join(d, "data.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        exe = os.path.join(d, "euler")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host,
+             os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+
+    def test_transform_rotation_quaternion_euler_packs(self):
+        """transform.rotation = Quaternion.Euler(...) → set_euler on live quat."""
+        root = tempfile.mkdtemp(prefix="upack-rotq-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Ball.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Ball : MonoBehaviour {\n"
+                "    void Start() {\n"
+                "        transform.rotation = Quaternion.Euler("
+                "Vector3.forward * 90f);\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Ball.cs.meta"), "w") as f:
+            f.write("guid: dddddddddddddddddddddddddddddddd\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Ball\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "  - component: {fileID: 4}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: dddddddddddddddddddddddddddddddd}\n"
+                "--- !u!212 &4\nSpriteRenderer:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n"
+                "  m_Sprite: {fileID: 0}\n"
+                "  m_Color: {r: 1, g: 0, b: 0, a: 1}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-rotq-out-")
+        plan = unity_pack.pack(root, d)
+        self.assertEqual(plan.get("live_rot_classes"), ["Ball"])
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("_engine_transform_set_euler", eng)
+        self.assertIn("_engine_transform_set_quat", eng)
+        self.assertNotIn("transform.rotation", eng)
+        self.assertNotIn("Quaternion.Euler", eng)
+        if not _CC:
+            return
+        host = os.path.join(d, "host.c")
+        with open(host, "w") as f:
+            f.write(
+                "void engine_tick(void);\n"
+                "extern float Time_deltaTime;\n"
+                "extern float _Ball_rot_m00[];\n"
+                "extern float _Ball_rot_m01[];\n"
+                "extern float _Ball_rot_m10[];\n"
+                "extern float _Ball_rot_m11[];\n"
+                "int main(void) {\n"
+                "  Time_deltaTime = 0.02f;\n"
+                "  engine_tick();\n"
+                "  if (_Ball_rot_m00[0] > 0.1f || _Ball_rot_m00[0] < -0.1f)\n"
+                "    return 2;\n"
+                "  if (_Ball_rot_m01[0] > -0.9f) return 3;\n"
+                "  if (_Ball_rot_m10[0] < 0.9f) return 4;\n"
+                "  if (_Ball_rot_m11[0] > 0.1f || _Ball_rot_m11[0] < -0.1f)\n"
+                "    return 5;\n"
+                "  return 0;\n"
+                "}\n"
+            )
+        r = subprocess.run(
+            [_CC, "-O2", "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(
+            [_CC, "-O0", "-c", "-o", os.path.join(d, "data.o"),
+             os.path.join(d, "data.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        exe = os.path.join(d, "rotq")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host,
+             os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
 
     def test_cpp_style_float_suffix_is_cs1061(self):
         """C++ `0.f` is not a C# real-literal — csc reports CS1061 on `f`."""
