@@ -54,7 +54,9 @@ def _assets_rel_path(path):
 _FILE_SUPPORTED = frozenset({"WriteAllText", "AppendAllText", "Exists"})
 
 # UnityEngine.Application members we emit. Others → CS0117.
-_APPLICATION_SUPPORTED = frozenset({"dataPath", "persistentDataPath"})
+_APPLICATION_SUPPORTED = frozenset({
+    "dataPath", "persistentDataPath", "isEditor", "isPlaying", "OpenURL",
+})
 
 # UnityEngine.Quaternion members we emit. Others → CS0117 (in scope via UnityEngine).
 _QUATERNION_SUPPORTED = frozenset({"Euler", "identity", "LookRotation"})
@@ -5327,6 +5329,22 @@ def emit_engine(plan, analyses, used_apis):
         p("}")
         p("const char *engine_persistent_data_path(void) {")
         p("    return _engine_persistent_data_path;")
+        p("}")
+        p("")
+    if want_app_is_editor:
+        p("/* Application.isEditor — packed player is never the Unity Editor */")
+        p("static int Application_isEditor(void) { return 0; }")
+        p("")
+    if want_app_is_playing:
+        p("/* Application.isPlaying — true while the packed player runs */")
+        p("static int Application_isPlaying(void) { return 1; }")
+        p("")
+    if want_app_open_url:
+        # Packed player has no browser / mailto host — Unity still accepts
+        # the call; editor inspector buttons are the usual callers.
+        p("/* Application.OpenURL — no-op in packed player (no OS shell) */")
+        p("static void Application_OpenURL(const char *url) {")
+        p("    (void)url;")
         p("}")
         p("")
     if want_destroy:

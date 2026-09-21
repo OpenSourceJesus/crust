@@ -1181,6 +1181,57 @@ class TestSystems(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
 
     @needs_cc
+    def test_application_open_url_packs(self):
+        """Application.OpenURL → Application_OpenURL no-op; compiles."""
+        root = tempfile.mkdtemp(prefix="upack-openurl-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Link.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Link : MonoBehaviour {\n"
+                "    void Start() {\n"
+                "        Application.OpenURL(\"https://example.com\");\n"
+                "        Application.OpenURL("
+                "\"http://x/\" + \"docs\");\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Link.cs.meta"), "w") as f:
+            f.write("guid: a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Link\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1}\n"
+            )
+        a = unity_pack.analyze_script(os.path.join(scripts, "Link.cs"))
+        self.assertIn("Application.OpenURL", a["apis"])
+        d = tempfile.mkdtemp(prefix="upack-openurl-out-")
+        plan = unity_pack.pack(root, d)
+        self.assertIn("Link", plan["classes"])
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("Application_OpenURL", eng)
+        self.assertIn("/* Application.OpenURL", eng)
+        self.assertNotIn("Application.OpenURL(", eng)
+        r = subprocess.run(
+            [_CC, "-O2", "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    @needs_cc
     def test_application_path_field_init_ctor_forbidden(self):
         """Field-init persistentDataPath → UnityException each frame; no script."""
         src = (
