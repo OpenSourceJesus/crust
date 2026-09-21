@@ -146,6 +146,7 @@ slot (intensity 1, white) into the light table.
 | `transform.Rotate` (euler / `Vector3.axis * deg`, Space.Self) | Live local quat + `rot_m00..m11` in draws |
 | `transform.LookAt` (Transform / `Vector3`, default up) | Live local quat = LookRotation(to−from); refreshes draw basis |
 | `transform.eulerAngles` (`=` / `+=`, degrees) | Get/set live quat via Unity Euler; refreshes draw basis |
+| `transform.rotation` (`=` `Quaternion.Euler` / `identity` / `new`) | Set live quat (unparented ≈ world); refreshes draw basis |
 | Authored `m_Father` / PrefabInstance `m_TransformParent` | World TRS = parent ∘ local; **live** at draw/collider time |
 
 PNG pixels are packed into `data.c` (`engine_texture_rgba`). Editing the
@@ -158,11 +159,11 @@ World size follows Unity:
 (default **100**). Sprite quads use the local XY→world XY basis from
 `m_LocalRotation` (`EngineDraw.m00..m11`; orthographic drop of Z). Pure Z
 spin matches the old cos/sin path; X/Y tilt foreshortens the projected
-extents. Scripts that call `transform.Rotate`, `transform.LookAt`, or
-`transform.eulerAngles` keep a live local quaternion (`_Class_rot_*`) and
-refresh that basis each call (`Rotate` = Space.Self degrees; `LookAt` =
-LookRotation toward target, default world up; `eulerAngles` = get/set
-Quaternion.Euler degrees).
+extents. Scripts that call `transform.Rotate`, `transform.LookAt`,
+`transform.eulerAngles`, or `transform.rotation` keep a live local
+quaternion (`_Class_rot_*`) and refresh that basis each call (`Rotate` =
+Space.Self degrees; `LookAt` = LookRotation toward target, default world
+up; `eulerAngles` / `rotation = Quaternion.Euler` = absolute Euler degrees).
 Child transforms keep
 **local** position when parented to another packed body; `engine_collect_draws`
 (and collider centers) compose `parent_world + local` each frame so a parent

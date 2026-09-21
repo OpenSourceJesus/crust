@@ -59,10 +59,7 @@ _APPLICATION_SUPPORTED = frozenset({"dataPath", "persistentDataPath"})
 # MonoBehaviour.transform members we lower. Others → CS1061 on Transform
 # (transform itself is always in scope; blame the missing member).
 _TRANSFORM_SUPPORTED = frozenset({
-    "position",
-    "Rotate",
-    "LookAt",
-    "eulerAngles",
+    "position", "Rotate", "LookAt", "eulerAngles", "rotation",
 })
 
 
@@ -4118,6 +4115,9 @@ def analyze_script(path, text=None):
     if re.search(r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*eulerAngles\b",
                  scan):
         apis.add("transform.eulerAngles")
+    if re.search(r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*rotation\b",
+                 scan):
+        apis.add("transform.rotation")
     if re.search(r"using\s+UnityEngine\.UI\b", scan):
         apis.add("UnityEngine.UI")
     if re.search(r"\bInputAction\b", scan):
@@ -4181,7 +4181,7 @@ def analyze_script(path, text=None):
         r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*"
         r"(?:Rotate|LookAt)\s*\(", scan) or re.search(
         r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*"
-        r"eulerAngles\b",
+        r"(?:eulerAngles|rotation)\b",
         scan))
 
     types = cs2cpp._find_types(scan)
@@ -6223,6 +6223,25 @@ def emit_engine(plan, analyses, used_apis):
         p("    *m11 = 1.f - 2.f * (nx * nx + nz * nz);")
         p("}")
         p("")
+        p("/* Transform.rotation set: localRotation = quat (unparented≈world). */")
+        p("static void _engine_transform_set_quat(")
+        p("    float *qx, float *qy, float *qz, float *qw,")
+        p("    float *m00, float *m01, float *m10, float *m11,")
+        p("    float nx, float ny, float nz, float nw) {")
+        p("    float m = sqrtf(nx * nx + ny * ny + nz * nz + nw * nw);")
+        p("    if (m > 1e-8f) {")
+        p("        nx = nx / m; ny = ny / m; nz = nz / m; nw = nw / m;")
+        p("    } else {")
+        p("        nx = 0.f; ny = 0.f; nz = 0.f; nw = 1.f;")
+        p("    }")
+        p("    *qx = nx; *qy = ny; *qz = nz; *qw = nw;")
+        p("    *m00 = 1.f - 2.f * (ny * ny + nz * nz);")
+        p("    *m01 = 2.f * (nx * ny - nz * nw);")
+        p("    *m10 = 2.f * (nx * ny + nz * nw);")
+        p("    *m11 = 1.f - 2.f * (nx * nx + nz * nz);")
+        p("}")
+        p("")
+
     # Group methods by class; array comment sits on the group.
     methods_by = {}
     for a in analyses:
@@ -7751,6 +7770,91 @@ def _rewrite_transform_euler_angles(text, cl):
     return "".join(out)
 
 
+def _parse_quaternion_expr(rhs):
+    """Parse Quaternion.Euler / identity / new Quaternion → ('euler',xyz)|('quat',xyzw)."""
+    rhs = rhs.strip()
+    if re.match(r"Quaternion\.identity\s*$", rhs):
+        return ("quat", ("0.f", "0.f", "0.f", "1.f"))
+    em = re.match(r"Quaternion\.Euler\s*\((.*)\)$", rhs, flags=re.S)
+    if em:
+        args = _split_call_args(em.group(1))
+        if len(args) == 3:
+            return ("euler", (args[0], args[1], args[2]))
+        if len(args) == 1:
+            hit = _parse_vector3_expr(args[0])
+            if hit:
+                return ("euler", hit)
+        return None
+    nm = re.match(r"new\s+Quaternion\s*\((.*)\)$", rhs, flags=re.S)
+    if nm:
+        args = _split_call_args(nm.group(1))
+        if len(args) >= 4:
+            return ("quat", (args[0], args[1], args[2], args[3]))
+    return None
+
+
+def _rewrite_transform_rotation(text, cl):
+    """Lower transform.rotation = Quaternion… → set_euler / set_quat.
+
+    Supports:
+      transform.rotation = Quaternion.Euler(x, y, z);
+      transform.rotation = Quaternion.Euler(Vector3.forward * deg);
+      transform.rotation = Quaternion.identity;
+      transform.rotation = new Quaternion(x, y, z, w);
+    Unparented bodies: world rotation ≈ local (packed live quat).
+    """
+    idn = _c_ident(cl["name"])
+    rot_args = (
+        "&_%s_rot_x[i], &_%s_rot_y[i], &_%s_rot_z[i], &_%s_rot_w[i], "
+        "&_%s_rot_m00[i], &_%s_rot_m01[i], &_%s_rot_m10[i], "
+        "&_%s_rot_m11[i]" % ((idn,) * 8)
+    )
+    out = []
+    i = 0
+    while i < len(text):
+        m = re.search(
+            r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*rotation\s*"
+            r"=(?!=)",
+            text[i:])
+        if not m:
+            out.append(text[i:])
+            break
+        start = i + m.start()
+        rhs_start = i + m.end()
+        j = rhs_start
+        depth = 0
+        while j < len(text):
+            c = text[j]
+            if c == '"':
+                j = _skip_c_string(text, j)
+                continue
+            if c in "([{":
+                depth += 1
+            elif c in ")]}":
+                depth -= 1
+            elif c == ";" and depth == 0:
+                break
+            j += 1
+        rhs = text[rhs_start:j].strip()
+        end = j + 1 if j < len(text) and text[j] == ";" else j
+        out.append(text[i:start])
+        parsed = _parse_quaternion_expr(rhs)
+        if parsed is None:
+            out.append(text[start:end])
+        elif parsed[0] == "euler":
+            ex, ey, ez = parsed[1]
+            out.append(
+                "_engine_transform_set_euler(%s, (%s), (%s), (%s));"
+                % (rot_args, ex, ey, ez))
+        else:
+            qx, qy, qz, qw = parsed[1]
+            out.append(
+                "_engine_transform_set_quat(%s, (%s), (%s), (%s), (%s));"
+                % (rot_args, qx, qy, qz, qw))
+        i = end
+    return "".join(out)
+
+
 def _skip_c_string(text, i):
     """Index just past a C/C# string literal starting at text[i] == '\"'."""
     j = i + 1
@@ -8033,6 +8137,7 @@ def _lower_method_body(body, cl, plan, site=None):
     text = _rewrite_transform_rotate(text, cl)
     text = _rewrite_transform_look_at(text, cl)
     text = _rewrite_transform_euler_angles(text, cl)
+    text = _rewrite_transform_rotation(text, cl)
     # Find/GetComponent before field rewrites so `.amp` stays on the target type.
     text = _rewrite_find_getcomponent(text, plan, cl["name"], site=site)
     text, add_locals = _rewrite_addcomponent(text, plan, cl["name"])
@@ -8610,7 +8715,7 @@ def emit_data(plan, used_apis=None):
             idn, n, ", ".join("%sf" % repr(v) for v in sxs)))
         p("float _%s_scale_y[%d] = { %s };" % (
             idn, n, ", ".join("%sf" % repr(v) for v in sys)))
-    # Live localRotation for Transform.Rotate / LookAt / eulerAngles targets.
+    # Live localRotation for Transform.Rotate / LookAt / eulerAngles / rotation.
     for cname in sorted(plan.get("live_rot_classes") or []):
         cl = plan["classes"].get(cname)
         if not cl:
