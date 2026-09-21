@@ -1005,6 +1005,107 @@ class TestSystems(unittest.TestCase):
         self.assertIn("nope_ok", run.stdout)
         self.assertIn("nest_ok", run.stdout)
 
+    def test_transform_matrices_local_trs_use_live_values(self):
+        """localToWorld/worldToLocal/localPosition/localRotation use live TRS."""
+        root = tempfile.mkdtemp(prefix="upack-mtrx-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Probe.cs"), "w") as f:
+            f.write(
+                "using System;\n"
+                "using UnityEngine;\n"
+                "public class Probe : MonoBehaviour {\n"
+                "    Vector3 savedPos;\n"
+                "    void Start() {\n"
+                "        transform.localPosition = new Vector3(2f, 3f, 0f);\n"
+                "        savedPos = transform.localPosition;\n"
+                "        transform.localRotation = Quaternion.Euler("
+                "Vector3.forward * 90f);\n"
+                "        Matrix4x4 l2w = transform.localToWorldMatrix;\n"
+                "        Matrix4x4 w2l = transform.worldToLocalMatrix;\n"
+                "        /* 90° Z: local (1,0) → world ≈ (2,4) at (2,3) */\n"
+                "        float wx = l2w.m00 * 1f + l2w.m01 * 0f + l2w.m03;\n"
+                "        float wy = l2w.m10 * 1f + l2w.m11 * 0f + l2w.m13;\n"
+                "        float lx = w2l.m00 * wx + w2l.m01 * wy + w2l.m03;\n"
+                "        float ly = w2l.m10 * wx + w2l.m11 * wy + w2l.m13;\n"
+                "        float lr_z = transform.localRotation.z;\n"
+                "        if (savedPos.x > 1.9f && savedPos.y > 2.9f\n"
+                "            && wx > 1.9f && wx < 2.1f\n"
+                "            && wy > 3.9f && wy < 4.1f\n"
+                "            && lx > 0.9f && lx < 1.1f\n"
+                "            && ly > -0.1f && ly < 0.1f\n"
+                "            && lr_z > 0.7f)\n"
+                "            Console.WriteLine(\"trs_ok\");\n"
+                "        else\n"
+                "            Console.WriteLine(\"trs_bad\");\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Probe.cs.meta"), "w") as f:
+            f.write("guid: b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Probe\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-mtrx-out-")
+        plan = unity_pack.pack(root, d)
+        self.assertIn("Probe", plan.get("transform_matrix_classes") or [])
+        self.assertIn("Probe", plan.get("live_rot_classes") or [])
+        self.assertIn("Probe", plan.get("live_scale_classes") or [])
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("Probe_localToWorldMatrix", eng)
+        self.assertIn("Probe_worldToLocalMatrix", eng)
+        self.assertIn("_engine_local_to_world_matrix", eng)
+        self.assertIn("_Probe_rot_m00", eng)
+        self.assertIn("_Probe_scale_x", eng)
+        if not _CC:
+            return
+        host = os.path.join(d, "host.c")
+        with open(host, "w") as f:
+            f.write(
+                "void engine_tick(void);\n"
+                "extern float Time_deltaTime;\n"
+                "int main(void) {\n"
+                "  Time_deltaTime = 0.02f;\n"
+                "  engine_tick();\n"
+                "  return 0;\n"
+                "}\n"
+            )
+        r = subprocess.run(
+            [_CC, "-O2", "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(
+            [_CC, "-O0", "-c", "-o", os.path.join(d, "data.o"),
+             os.path.join(d, "data.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        exe = os.path.join(d, "run")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host,
+             os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+        self.assertIn("trs_ok", run.stdout)
+
     def test_transform_rotation_quaternion_euler_packs(self):
         """transform.rotation = Quaternion.Euler(...) → set_euler on live quat."""
         root = tempfile.mkdtemp(prefix="upack-rotq-")

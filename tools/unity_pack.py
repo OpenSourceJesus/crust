@@ -65,7 +65,7 @@ _QUATERNION_SUPPORTED = frozenset({"Euler", "identity", "LookRotation"})
 # (transform itself is always in scope; blame the missing member).
 _TRANSFORM_SUPPORTED = frozenset({
     "position", "Rotate", "LookAt", "eulerAngles", "rotation", "Find",
-    "localScale", "parent", "gameObject",
+    "localScale", "parent", "gameObject", "worldToLocalMatrix", "localToWorldMatrix", "localPosition", "localRotation",
 })
 
 
@@ -4279,6 +4279,37 @@ def analyze_script(path, text=None):
     if re.search(r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*rotation\b",
                  scan):
         apis.add("transform.rotation")
+    if re.search(r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*Find\s*\(",
+                 scan):
+        apis.add("transform.Find")
+    if re.search(r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*localScale\b",
+                 scan):
+        apis.add("transform.localScale")
+    if re.search(r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*parent\b",
+                 scan):
+        apis.add("transform.parent")
+    if re.search(r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*gameObject\b",
+                 scan):
+        apis.add("transform.gameObject")
+    if re.search(
+            r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*SetParent\s*\(",
+            scan):
+        apis.add("transform.SetParent")
+    # foo.transform.SetParent / trs.SetParent (Transform receiver).
+    if re.search(r"\.\s*transform\s*\.\s*SetParent\s*\(", scan):
+        apis.add("transform.SetParent")
+    if re.search(r"(?<![.\w])\w+\s*\.\s*SetParent\s*\(", scan):
+        apis.add("transform.SetParent")
+    if re.search(
+            r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*"
+            r"worldToLocalMatrix\b",
+            scan):
+        apis.add("transform.worldToLocalMatrix")
+    if re.search(
+            r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*"
+            r"localToWorldMatrix\b",
+            scan):
+        apis.add("transform.localToWorldMatrix")
     if re.search(r"using\s+UnityEngine\.UI\b", scan):
         apis.add("UnityEngine.UI")
     if re.search(r"\bInputAction\b", scan):
@@ -4932,6 +4963,7 @@ def emit_engine(plan, analyses, used_apis):
     soa = bool(plan.get("soa"))
     want_math = bool(used_apis & {"Mathf.Sin", "Mathf.Cos"})
     want_live_rot = bool(plan.get("live_rot_classes"))
+    want_transform_matrix = bool(plan.get("transform_matrix_classes"))
     getcomponent_types = set()
     for a in analyses:
         getcomponent_types |= set(a.get("getcomponent_types") or [])
@@ -5010,10 +5042,13 @@ def emit_engine(plan, analyses, used_apis):
     if soa:
         p("/* layout: SoA positions (contiguous float tables for GPU upload) */")
     p("#include <stdint.h>")
-    if want_math or want_col2d or want_col3d or want_anim or want_live_rot:
+    if (want_math or want_col2d or want_col3d or want_anim or want_live_rot
+            or want_transform_matrix):
         p("#include <math.h>")
-    if (want_input or want_log or want_find or want_add_any
-            or want_data_path or want_persistent_data_path or want_file_io):
+    if (want_input or want_log or want_find or want_transform_find
+            or want_set_parent
+            or want_add_any or want_data_path or want_persistent_data_path
+            or want_file_io):
         p("#include <string.h>")
     if (want_log or want_console or want_str_plus or want_add_any
             or want_file_io or want_go_tables or want_ctor_forbidden):
@@ -5050,6 +5085,15 @@ def emit_engine(plan, analyses, used_apis):
     p("   T is incomplete, so the arrays wait until the structs exist;")
     p("   the names are all listed here as comments so data.c and any")
     p("   group can find them. */")
+    if want_transform_matrix:
+        p("/* Unity Matrix4x4 — column-major; TRS from live Transform. */")
+        p("typedef struct Matrix4x4 {")
+        p("    float m00, m01, m02, m03;")
+        p("    float m10, m11, m12, m13;")
+        p("    float m20, m21, m22, m23;")
+        p("    float m30, m31, m32, m33;")
+        p("} Matrix4x4;")
+        p("")
     for cname, cl in sorted(plan["classes"].items()):
         idn = _c_ident(cname)
         p("typedef struct %s %s;" % (idn, idn))
@@ -7940,37 +7984,105 @@ def _split_call_args(argstr):
     return parts
 
 
-def _rewrite_new_vector_assigns(text, idn):
-    """`transform.position =/+ = new Vector2/3(...)` with nested calls."""
+def _rewrite_new_vector_assigns(text, idn, two_d=True):
+    """`transform.position|localPosition =/+ = new Vector2/3(...)` / Vector3.zero."""
 
     def repl_eq(m):
         args = _split_call_args(m.group(1))
         if len(args) < 2:
             return m.group(0)
-        return "%s_set_pos_x(i, (%s)); %s_set_pos_y(i, (%s));" % (
-            idn, args[0], idn, args[1])
+        zset = ""
+        if (not two_d) and len(args) >= 3:
+            zset = " %s_set_pos_z(i, (%s));" % (idn, args[2])
+        return ("%s_set_pos_x(i, (%s)); %s_set_pos_y(i, (%s));%s" % (
+            idn, args[0], idn, args[1], zset))
 
     def repl_add(m):
         args = _split_call_args(m.group(1))
         if len(args) < 2:
             return m.group(0)
+        zadd = ""
+        if (not two_d) and len(args) >= 3:
+            zadd = (
+                " %s_set_pos_z(i, %s_get_pos_z(i) + (%s));"
+                % (idn, idn, args[2]))
         return (
             "%s_set_pos_x(i, %s_get_pos_x(i) + (%s)); "
-            "%s_set_pos_y(i, %s_get_pos_y(i) + (%s));" % (
-                idn, idn, args[0], idn, idn, args[1])
+            "%s_set_pos_y(i, %s_get_pos_y(i) + (%s));%s" % (
+                idn, idn, args[0], idn, idn, args[1], zadd)
         )
 
+    def repl_zero(m):
+        if two_d:
+            return "%s_set_pos_x(i, 0.f); %s_set_pos_y(i, 0.f);" % (idn, idn)
+        return ("%s_set_pos_x(i, 0.f); %s_set_pos_y(i, 0.f); "
+                "%s_set_pos_z(i, 0.f);" % (idn, idn, idn))
+
     flags = re.DOTALL
+    for prop in ("position", "localPosition"):
+        text = re.sub(
+            r"transform\.%s\s*=\s*new\s+Vector2\s*\((.*?)\)\s*;" % prop,
+            repl_eq, text, flags=flags)
+        text = re.sub(
+            r"transform\.%s\s*=\s*new\s+Vector3\s*\((.*?)\)\s*;" % prop,
+            repl_eq, text, flags=flags)
+        text = re.sub(
+            r"transform\.%s\s*=\s*Vector3\.zero\s*;" % prop,
+            repl_zero, text)
+        text = re.sub(
+            r"transform\.%s\s*\+=\s*new\s+Vector3\s*\((.*?)\)\s*;" % prop,
+            repl_add, text, flags=flags)
+    return text
+
+
+def _rewrite_local_position_vec3_fields(text, cl):
+    """Round-trip Vector3 fields ↔ live localPosition (packed pos tables)."""
+    idn = _c_ident(cl["name"])
+    has_z = not cl.get("two_d")
+    for vf in cl.get("vec3_fields") or []:
+        if has_z:
+            load = (
+                "%s_x = %s_get_pos_x(i);\n"
+                "%s_y = %s_get_pos_y(i);\n"
+                "%s_z = %s_get_pos_z(i);"
+                % (vf, idn, vf, idn, vf, idn))
+            store = (
+                "%s_set_pos_x(i, %s_x);\n"
+                "%s_set_pos_y(i, %s_y);\n"
+                "%s_set_pos_z(i, %s_z);"
+                % (idn, vf, idn, vf, idn, vf))
+        else:
+            load = (
+                "%s_x = %s_get_pos_x(i);\n"
+                "%s_y = %s_get_pos_y(i);\n"
+                "%s_z = 0.f;"
+                % (vf, idn, vf, idn, vf))
+            store = (
+                "%s_set_pos_x(i, %s_x);\n"
+                "%s_set_pos_y(i, %s_y);"
+                % (idn, vf, idn, vf))
+        text = re.sub(
+            r"(?<![_\w])%s\s*=\s*(?:this\s*\.\s*)?transform\s*\.\s*"
+            r"localPosition\s*;" % vf,
+            load, text)
+        text = re.sub(
+            r"(?:this\s*\.\s*)?transform\s*\.\s*localPosition\s*=\s*"
+            r"(?<![_\w])%s\s*;" % vf,
+            store, text)
+    return text
+
+
+def _rewrite_transform_matrices(text, cl, plan):
+    """Lower transform.localToWorldMatrix / worldToLocalMatrix → live TRS."""
+    if cl["name"] not in set(plan.get("transform_matrix_classes") or []):
+        return text
+    idn = _c_ident(cl["name"])
     text = re.sub(
-        r"transform\.position\s*=\s*new\s+Vector2\s*\((.*?)\)\s*;",
-        repl_eq, text, flags=flags)
+        r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*localToWorldMatrix\b",
+        "%s_localToWorldMatrix(i)" % idn, text)
     text = re.sub(
-        r"transform\.position\s*=\s*new\s+Vector3\s*\((.*?)\)\s*;",
-        repl_eq, text, flags=flags)
-    # `+= new Vector2` is CS0034 — refused in _check_csharp_lex.
-    text = re.sub(
-        r"transform\.position\s*\+=\s*new\s+Vector3\s*\((.*?)\)\s*;",
-        repl_add, text, flags=flags)
+        r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*worldToLocalMatrix\b",
+        "%s_worldToLocalMatrix(i)" % idn, text)
     return text
 
 
@@ -8350,6 +8462,20 @@ def _rewrite_transform_rotation(text, cl):
                 % (rot_args, qx, qy, qz, qw))
         i = end
     return "".join(out)
+
+
+def _rewrite_local_rotation_reads(text, cl, plan):
+    """Lower transform.localRotation.x|y|z|w → live quat tables."""
+    if cl["name"] not in set(plan.get("live_rot_classes") or []):
+        return text
+    idn = _c_ident(cl["name"])
+    for axis in ("x", "y", "z", "w"):
+        text = re.sub(
+            r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*localRotation\s*\.\s*"
+            + axis + r"\b",
+            "_%s_rot_%s[i]" % (idn, axis),
+            text)
+    return text
 
 
 def _skip_c_string(text, i):
