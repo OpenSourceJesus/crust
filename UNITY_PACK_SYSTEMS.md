@@ -47,10 +47,14 @@ action maps / device graphs).
 | `WriteLine` / `Debug.Log` of a `GameObject` | `Object.ToString` → `name (UnityEngine.GameObject)` (missing → `"null"`) |
 | `Application.dataPath` | Packed project `Assets/` absolute path (**Awake/Start only**) |
 | `Application.persistentDataPath` | Unity company/product save dir (**Awake/Start only**) |
+| `Application.isEditor` | Always **false** (packed player) |
+| `Application.isPlaying` | Always **true** while the packed player runs |
+| `Application.OpenURL(url)` | No-op in packed player (no OS browser / mailto) |
 | Other `Application.*` | Pack-time **CS0117** (`Application` in scope via `using UnityEngine`) |
-| Other `Quaternion.*` (not Euler / identity / LookRotation) | Pack-time **CS0117** (`Quaternion` in scope via `using UnityEngine`) |
+| Other `Quaternion.*` (not Euler / identity / LookRotation / Slerp) | Pack-time **CS0117** (`Quaternion` in scope via `using UnityEngine`) |
 | `File.WriteAllText(path, text)` | `fopen` write (`"w"`); creates parent dirs when possible |
 | `File.AppendAllText(path, text)` | `fopen` append (`"a"`); creates parent dirs when possible |
+| `File.Exists(path)` | `fopen` probe (`"rb"`) → 1 / 0 (dirs fail like .NET) |
 | Other `File.*` | Pack-time **CS0117** (`File` in scope via `using System.IO`) |
 
 Default log path matches Unity standalone (from `ProjectSettings`
@@ -83,6 +87,7 @@ Unity's `UnityException` / `TypeInitializationException` every frame and
 | `.GetComponent<T>()` on a null GO | **NullReferenceException** with `Class.Method () (at path:line)`; method exits (Unity) |
 | `.GetComponent<T>()` on a live GO | Instance index of authored `T`, or **-1** if absent |
 | `Find(...).GetComponent<T>().field` | NRE if Find missed or component/field receiver is null |
+| `transform.Find(name)` / nested `"A/B"` | Child GO via authored `m_Father` parents table → index or **-1** |
 
 Parsed with cpprust `_match_paren` / `_match_angle` (same AST helpers
 csrust uses). Find **does not** fail at pack time for unknown names —
@@ -90,7 +95,8 @@ lookup is runtime only (Unity null). Calling a method or reading a field on
 that null is a `NullReferenceException` (logged with script site); `setjmp`
 unwinds the current `Start`/`Update` so the player keeps running. `GetComponent<T>`
 still requires `T` to be an authored packed MonoBehaviour (no invented
-component types).
+component types). `transform.Find` walks authored parent links only (no
+invented hierarchy).
 
 ## Animation (script motion + authored clips)
 
@@ -147,7 +153,16 @@ slot (intensity 1, white) into the light table.
 | `transform.Rotate` (euler / `Vector3.axis * deg`, Space.Self) | Live local quat + `rot_m00..m11` in draws |
 | `transform.LookAt` (Transform / `Vector3`, default up) | Live local quat = LookRotation(to−from); refreshes draw basis |
 | `transform.eulerAngles` (`=` / `+=`, degrees) | Get/set live quat via Unity Euler; refreshes draw basis |
-| `transform.rotation` (`=` `Quaternion.Euler` / `LookRotation` / `identity` / `new`) | Set live quat (unparented ≈ world); refreshes draw basis |
+| `transform.rotation` (`=` `Quaternion.Euler` / `LookRotation` / `Slerp` / `identity` / `new`) | Set live quat (unparented ≈ world); refreshes draw basis |
+| `transform.Find` (child name or `"A/B"` path) | Authored `m_Father` child lookup → GO index or **-1** |
+| `transform.parent` | Authored `m_Father` → parent GO index or **-1** |
+| `transform.SetParent` (Transform / null, optional `worldPositionStays`) | Live `_engine_go_parent` + xf parent; stays=true keeps world T |
+| `transform.gameObject` | Same GO index as this Transform (packed Transform ≡ GameObject) |
+| `transform.worldToLocalMatrix` / `localToWorldMatrix` | Live TRS → `Matrix4x4` (same affine as TransformPoint) |
+| `transform.localScale` | Allowed (CS1061 cleared); live scale tables when SetWorldScale / scale draws / matrices need them |
+| `transform.localPosition` | Live packed pos tables (local under parent); Vector3 field round-trip |
+| `transform.localRotation` | Live local quat (`_Class_rot_*`); set via Quaternion expr like `rotation` |
+| `transform.TransformPoint` | Live local→world: `T + R*(S*p)` using current pos / rot basis / scale |
 | Authored `m_Father` / PrefabInstance `m_TransformParent` | World TRS = parent ∘ local; **live** at draw/collider time |
 
 PNG pixels are packed into `data.c` (`engine_texture_rgba`). Editing the
@@ -224,6 +239,7 @@ refused (no invent).
 Asset GUIDs resolve under `Assets/`, `Packages/`, and
 `Library/PackageCache/` (UPM). Only `Assets/**/*.cs` become packed
 MonoBehaviours — package scripts are for reference resolution only.
+`Assets/**/Editor/**/*.cs` are skipped (Unity editor-only assemblies).
 
 ## Physics (Rigidbody / Rigidbody2D + FixedUpdate)
 
@@ -322,6 +338,6 @@ idle — legacy clip is not Mecanim), Shade
 ```
 python3 tools/unity_pack.py examples/unity_pack/SystemsScene -o /tmp/sys
 make -C /tmp/sys && /tmp/sys/game
-SCENE="$(pwd)/examples/unity_pack/SystemsScene" \
+PROJECT="$(pwd)/examples/unity_pack/Slime Jump" \
   ./examples/unity_pack/run_gles2_window.sh
 ```
