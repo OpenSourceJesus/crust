@@ -88,7 +88,12 @@ impl<T> Vec<T> {
         self.ptr[i]
     }
 
+    // The replaced element is dropped first, as `v[i] = x` does in Rust.
+    // `drop_at` and `drop_elems` are not written here: they have to name
+    // `T`'s destructor, which a generic body cannot, so the compiler
+    // generates them per instantiation (empty when `T` owns nothing).
     fn set(&mut self, i: usize, value: T) {
+        self.drop_at(i);
         self.ptr[i] = value;
     }
 
@@ -102,6 +107,7 @@ impl<T> Vec<T> {
     }
 
     fn clear(&mut self) {
+        self.drop_elems();
         self.len = 0;
     }
 
@@ -109,8 +115,10 @@ impl<T> Vec<T> {
         self.ptr
     }
 
-    // Also invoked automatically at scope exit for by-value locals.
+    // Also invoked automatically at scope exit for by-value locals. The
+    // elements are dropped first: the Vec owns them.
     fn free_buf(&mut self) {
+        self.drop_elems();
         free(self.ptr as *mut u8);
         self.ptr = 0 as *mut T;
         self.len = 0;
@@ -214,6 +222,7 @@ impl<T> Box<T> {
     }
 
     fn free_box(&mut self) {
+        self.drop_elems();
         free(self.ptr as *mut u8);
         self.ptr = 0 as *mut T;
     }
@@ -778,11 +787,13 @@ impl<T> VecDeque<T> {
     }
 
     fn clear(&mut self) {
+        self.drop_elems();
         self.head = 0;
         self.len = 0;
     }
 
     fn free_buf(&mut self) {
+        self.drop_elems();
         free(self.ptr as *mut u8);
         self.ptr = 0 as *mut T;
         self.head = 0;
@@ -810,6 +821,16 @@ struct String {
 }
 
 impl String {
+    // A deep copy: its own buffer. The buffer is always NUL-terminated, so
+    // `push_str` copies exactly the contents.
+    fn clone(&self) -> String {
+        let mut s: String = String::new();
+        if self.len > 0 {
+            s.push_str(self.buf as *const c_char);
+        }
+        s
+    }
+
     fn new() -> String {
         String { buf: 0 as *mut c_char, len: 0, cap: 0 }
     }
@@ -854,7 +875,28 @@ impl String {
         self.buf[self.len] = 0 as c_char;
     }
 
-    fn push(&mut self, c: c_char) {
+    // Rust's `String::push` takes a `char` -- a Unicode scalar -- and appends
+    // its UTF-8 encoding. `push_byte` appends one raw byte.
+    fn push(&mut self, c: char) {
+        let v: u32 = c as u32;
+        if v < 128 {
+            self.push_byte(v as c_char);
+        } else if v < 2048 {
+            self.push_byte((192 | (v >> 6)) as c_char);
+            self.push_byte((128 | (v & 63)) as c_char);
+        } else if v < 65536 {
+            self.push_byte((224 | (v >> 12)) as c_char);
+            self.push_byte((128 | ((v >> 6) & 63)) as c_char);
+            self.push_byte((128 | (v & 63)) as c_char);
+        } else {
+            self.push_byte((240 | (v >> 18)) as c_char);
+            self.push_byte((128 | ((v >> 12) & 63)) as c_char);
+            self.push_byte((128 | ((v >> 6) & 63)) as c_char);
+            self.push_byte((128 | (v & 63)) as c_char);
+        }
+    }
+
+    fn push_byte(&mut self, c: c_char) {
         self.reserve(self.len + 1);
         self.buf[self.len] = c;
         self.len += 1;
@@ -864,7 +906,7 @@ impl String {
     fn push_str(&mut self, s: *const c_char) {
         let mut i: i64 = 0;
         while s[i] != 0 as c_char {
-            self.push(s[i]);
+            self.push_byte(s[i]);
             i += 1;
         }
     }
