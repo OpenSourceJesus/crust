@@ -16,6 +16,7 @@ public class Player : MonoBehaviour
 	{
 		Debug.Log("Hello World!");
 		System.Console.WriteLine(GameObject.Find("BouncePad").GetComponent<Bouncer>().amp);
+		print("Player.Start() reached end");
 	}
 
 	void Update ()

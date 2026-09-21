@@ -76,13 +76,17 @@ Unity standalone (Linux `~/.config/unity3d/<company>/<product>`, macOS
 |-------------|---------|
 | `GameObject.Find(name)` | Runtime `strcmp` on authored GO name table → index or **-1** |
 | `Object.ToString` (via printing a Find result) | `name (UnityEngine.GameObject)`; missing → `"null"` |
-| `.GetComponent<T>()` | Instance index of authored `T` on that GO, or **-1** |
-| `Find(...).GetComponent<T>().field` | Runtime Find + GetComponent; missing → default `0` / `0.f` |
+| `.GetComponent<T>()` on a null GO | **NullReferenceException** with `Class.Method () (at path:line)`; method exits (Unity) |
+| `.GetComponent<T>()` on a live GO | Instance index of authored `T`, or **-1** if absent |
+| `Find(...).GetComponent<T>().field` | NRE if Find missed or component/field receiver is null |
 
 Parsed with cpprust `_match_paren` / `_match_angle` (same AST helpers
 csrust uses). Find **does not** fail at pack time for unknown names —
-lookup is runtime only (Unity null). `GetComponent<T>` still requires `T`
-to be an authored packed MonoBehaviour (no invented component types).
+lookup is runtime only (Unity null). Calling a method or reading a field on
+that null is a `NullReferenceException` (logged with script site); `setjmp`
+unwinds the current `Start`/`Update` so the player keeps running. `GetComponent<T>`
+still requires `T` to be an authored packed MonoBehaviour (no invented
+component types).
 
 ## Animation (script motion + authored clips)
 
@@ -135,7 +139,8 @@ slot (intensity 1, white) into the light table.
 | `ProjectSettings` `defaultScreenWidth` / `Height` | `Screen_width` / `Screen_height` (GLFW window size) |
 | `ProjectSettings` `fullscreenMode` 0/1 | `Screen_fullScreen` — GLES host uses primary monitor |
 | `defaultIsNativeResolution` | `Screen_fullScreenNative` — desktop video mode size when FS |
-| Authored `m_LocalRotation` on Transform | Z spin via `EngineDraw.cos_z` / `sin_z` (identity if omitted) |
+| Authored `m_LocalRotation` on Transform | XY basis `EngineDraw.m00..m11` (ortho drop Z) |
+| `transform.Rotate` (euler / `Vector3.axis * deg`, Space.Self) | Live local quat + `rot_m00..m11` in draws |
 | Authored `m_Father` / PrefabInstance `m_TransformParent` | World TRS = parent ∘ local; **live** at draw/collider time |
 
 PNG pixels are packed into `data.c` (`engine_texture_rgba`). Editing the
@@ -145,8 +150,12 @@ referenced sprite and re-packing changes the drawn texels. Tint comes from
 World size follows Unity:
 `(texels / spritePixelsToUnits) * Transform.scale` (half-extents in
 `engine_collect_draws`). `spritePixelsToUnits` is read from the PNG `.meta`
-(default **100**). Sprite quads are rotated in the XY plane from
-`m_LocalRotation` (quaternion → angle of local +X). Child transforms keep
+(default **100**). Sprite quads use the local XY→world XY basis from
+`m_LocalRotation` (`EngineDraw.m00..m11`; orthographic drop of Z). Pure Z
+spin matches the old cos/sin path; X/Y tilt foreshortens the projected
+extents. Scripts that call `transform.Rotate` keep a live local quaternion
+(`_Class_rot_*`) and refresh that basis each call (Space.Self; degrees).
+Child transforms keep
 **local** position when parented to another packed body; `engine_collect_draws`
 (and collider centers) compose `parent_world + local` each frame so a parent
 `Rigidbody2D` / scripted motion carries children (Unity hierarchy). Objects with

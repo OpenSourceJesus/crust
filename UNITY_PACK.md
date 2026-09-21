@@ -95,7 +95,7 @@ Godot: pass a directory containing `.tscn`. Blender: a JSON dump
 ## Display via GLES2
 
 `engine_collect_draws()` walks every authored SpriteRenderer with a project
-PNG and fills an `EngineDraw` list (world xy, half-extents, Z spin, tint
+PNG and fills an `EngineDraw` list (world xy, half-extents, XY rotation basis, tint
 RGBA, tex index), then sorts by TagManager sorting layer and `m_SortingOrder`
 (back-to-front). Tint alpha (`m_Color.a` on SpriteRenderer / Image) multiplies
 texture alpha in the GLES hosts (`GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA`).
