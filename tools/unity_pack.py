@@ -58,7 +58,11 @@ _APPLICATION_SUPPORTED = frozenset({"dataPath", "persistentDataPath"})
 
 # MonoBehaviour.transform members we lower. Others → CS1061 on Transform
 # (transform itself is always in scope; blame the missing member).
-_TRANSFORM_SUPPORTED = frozenset({"position", "Rotate"})
+_TRANSFORM_SUPPORTED = frozenset({
+    "position",
+    "Rotate",
+    "LookAt",
+})
 
 
 def _check_file_api(path, text, scan):
@@ -4107,6 +4111,9 @@ def analyze_script(path, text=None):
     if re.search(r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*Rotate\s*\(",
                  scan):
         apis.add("transform.Rotate")
+    if re.search(r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*LookAt\s*\(",
+                 scan):
+        apis.add("transform.LookAt")
     if re.search(r"using\s+UnityEngine\.UI\b", scan):
         apis.add("UnityEngine.UI")
     if re.search(r"\bInputAction\b", scan):
@@ -4167,7 +4174,8 @@ def analyze_script(path, text=None):
         r"transform\.position\s*\+=|"
         r"transform\.Translate", scan))
     writes_rot = bool(re.search(
-        r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*Rotate\s*\(", scan))
+        r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*"
+        r"(?:Rotate|LookAt)\s*\(", scan))
 
     types = cs2cpp._find_types(scan)
     classes = []
@@ -6088,7 +6096,76 @@ def emit_engine(plan, analyses, used_apis):
         p("    *m11 = 1.f - 2.f * (nx * nx + nz * nz);")
         p("}")
         p("")
-
+        p("/* Transform.LookAt: localRotation = LookRotation(to-from, up). */")
+        p("static void _engine_transform_look_at(")
+        p("    float *qx, float *qy, float *qz, float *qw,")
+        p("    float *m00, float *m01, float *m10, float *m11,")
+        p("    float fx, float fy, float fz,")
+        p("    float tx, float ty, float tz) {")
+        p("    float dx = tx - fx;")
+        p("    float dy = ty - fy;")
+        p("    float dz = tz - fz;")
+        p("    float len = sqrtf(dx * dx + dy * dy + dz * dz);")
+        p("    float rx, ry, rz, rlen;")
+        p("    float ux, uy, uz;")
+        p("    float m00r, m01r, m02r, m10r, m11r, m12r, m20r, m21r, m22r;")
+        p("    float trace, s, nx, ny, nz, nw;")
+        p("    if (len < 1e-8f) return;")
+        p("    dx = dx / len; dy = dy / len; dz = dz / len;")
+        p("    ux = 0.f; uy = 1.f; uz = 0.f;")
+        p("    rx = uy * dz - uz * dy;")
+        p("    ry = uz * dx - ux * dz;")
+        p("    rz = ux * dy - uy * dx;")
+        p("    rlen = sqrtf(rx * rx + ry * ry + rz * rz);")
+        p("    if (rlen < 1e-6f) {")
+        p("        ux = 0.f; uy = 0.f; uz = 1.f;")
+        p("        rx = uy * dz - uz * dy;")
+        p("        ry = uz * dx - ux * dz;")
+        p("        rz = ux * dy - uy * dx;")
+        p("        rlen = sqrtf(rx * rx + ry * ry + rz * rz);")
+        p("        if (rlen < 1e-8f) return;")
+        p("    }")
+        p("    rx = rx / rlen; ry = ry / rlen; rz = rz / rlen;")
+        p("    ux = dy * rz - dz * ry;")
+        p("    uy = dz * rx - dx * rz;")
+        p("    uz = dx * ry - dy * rx;")
+        p("    /* Columns = right, up, forward (Unity LookRotation). */")
+        p("    m00r = rx; m01r = ux; m02r = dx;")
+        p("    m10r = ry; m11r = uy; m12r = dy;")
+        p("    m20r = rz; m21r = uz; m22r = dz;")
+        p("    trace = m00r + m11r + m22r;")
+        p("    if (trace > 0.f) {")
+        p("        s = 0.5f / sqrtf(trace + 1.f);")
+        p("        nw = 0.25f / s;")
+        p("        nx = (m21r - m12r) * s;")
+        p("        ny = (m02r - m20r) * s;")
+        p("        nz = (m10r - m01r) * s;")
+        p("    } else if (m00r > m11r && m00r > m22r) {")
+        p("        s = 2.f * sqrtf(1.f + m00r - m11r - m22r);")
+        p("        nw = (m21r - m12r) / s;")
+        p("        nx = 0.25f * s;")
+        p("        ny = (m01r + m10r) / s;")
+        p("        nz = (m02r + m20r) / s;")
+        p("    } else if (m11r > m22r) {")
+        p("        s = 2.f * sqrtf(1.f + m11r - m00r - m22r);")
+        p("        nw = (m02r - m20r) / s;")
+        p("        nx = (m01r + m10r) / s;")
+        p("        ny = 0.25f * s;")
+        p("        nz = (m12r + m21r) / s;")
+        p("    } else {")
+        p("        s = 2.f * sqrtf(1.f + m22r - m00r - m11r);")
+        p("        nw = (m10r - m01r) / s;")
+        p("        nx = (m02r + m20r) / s;")
+        p("        ny = (m12r + m21r) / s;")
+        p("        nz = 0.25f * s;")
+        p("    }")
+        p("    *qx = nx; *qy = ny; *qz = nz; *qw = nw;")
+        p("    *m00 = 1.f - 2.f * (ny * ny + nz * nz);")
+        p("    *m01 = 2.f * (nx * ny - nz * nw);")
+        p("    *m10 = 2.f * (nx * ny + nz * nw);")
+        p("    *m11 = 1.f - 2.f * (nx * nx + nz * nz);")
+        p("}")
+        p("")
     # Group methods by class; array comment sits on the group.
     methods_by = {}
     for a in analyses:
@@ -7356,6 +7433,47 @@ _VECTOR3_AXIS = {
 }
 
 
+def _parse_vector3_expr(a):
+    """Parse `new Vector3(...)` or `Vector3.axis * expr` → (ex, ey, ez) C exprs."""
+    a = a.strip()
+    nm = re.match(r"new\s+Vector3\s*\((.*)\)$", a, flags=re.S)
+    if nm:
+        vargs = _split_call_args(nm.group(1))
+        if len(vargs) >= 3:
+            return vargs[0], vargs[1], vargs[2]
+        return None
+    am = re.match(
+        r"Vector3\.(right|left|up|down|forward|back|zero|one)\s*$", a)
+    if am:
+        name = am.group(1)
+        if name == "zero":
+            return "0.f", "0.f", "0.f"
+        if name == "one":
+            return "1.f", "1.f", "1.f"
+        ax, ay, az = _VECTOR3_AXIS[name]
+        return ("%sf" % repr(float(ax)),
+                "%sf" % repr(float(ay)),
+                "%sf" % repr(float(az)))
+    am = re.match(
+        r"Vector3\.(right|left|up|down|forward|back)\s*\*\s*(.+)$",
+        a, flags=re.S)
+    if am:
+        ax, ay, az = _VECTOR3_AXIS[am.group(1)]
+        expr = am.group(2).strip()
+
+        def _axis_comp(c):
+            if c == 0.0:
+                return "0.f"
+            if c == 1.0:
+                return "(%s)" % expr
+            if c == -1.0:
+                return "-(%s)" % expr
+            return "(%s) * %sf" % (expr, repr(c))
+
+        return (_axis_comp(ax), _axis_comp(ay), _axis_comp(az))
+    return None
+
+
 def _rewrite_transform_rotate(text, cl):
     """Lower transform.Rotate(...) → _engine_transform_rotate_local on packed quat.
 
@@ -7393,43 +7511,16 @@ def _rewrite_transform_rotate(text, cl):
         out.append(text[i:start])
         args = _split_call_args(args_str)
         ex = ey = ez = None
-
-        def _vec_from_arg(a):
-            a = a.strip()
-            nm = re.match(r"new\s+Vector3\s*\((.*)\)$", a, flags=re.S)
-            if nm:
-                vargs = _split_call_args(nm.group(1))
-                if len(vargs) >= 3:
-                    return vargs[0], vargs[1], vargs[2]
-            am = re.match(
-                r"Vector3\.(right|left|up|down|forward|back)\s*\*\s*(.+)$",
-                a, flags=re.S)
-            if am:
-                ax, ay, az = _VECTOR3_AXIS[am.group(1)]
-                expr = am.group(2).strip()
-
-                def _axis_comp(c):
-                    if c == 0.0:
-                        return "0.f"
-                    if c == 1.0:
-                        return "(%s)" % expr
-                    if c == -1.0:
-                        return "-(%s)" % expr
-                    return "(%s) * %sf" % (expr, repr(c))
-
-                return (_axis_comp(ax), _axis_comp(ay), _axis_comp(az))
-            return None
-
         if len(args) == 3 or (
                 len(args) == 4
                 and re.match(r"Space\.\w+", args[3].strip())):
             ex, ey, ez = args[0], args[1], args[2]
         elif len(args) == 1:
-            hit = _vec_from_arg(args[0])
+            hit = _parse_vector3_expr(args[0])
             if hit:
                 ex, ey, ez = hit
         elif len(args) == 2 and re.match(r"Space\.\w+", args[1].strip()):
-            hit = _vec_from_arg(args[0])
+            hit = _parse_vector3_expr(args[0])
             if hit:
                 ex, ey, ez = hit
         if ex is None:
@@ -7443,6 +7534,94 @@ def _rewrite_transform_rotate(text, cl):
                 "&_%s_rot_m11[i], "
                 "(%s), (%s), (%s));"
                 % (idn, idn, idn, idn, idn, idn, idn, idn, ex, ey, ez))
+        i = j
+    return "".join(out)
+
+
+def _rewrite_transform_look_at(text, cl):
+    """Lower transform.LookAt(...) → _engine_transform_look_at on packed quat.
+
+    Supports:
+      transform.LookAt(Camera.main.transform);
+      transform.LookAt(Camera.main.transform.position);
+      transform.LookAt(new Vector3(x, y, z));
+      transform.LookAt(Vector3.zero / .one / .up / .forward / …);
+    Optional trailing worldUp arg ignored (Unity default Vector3.up).
+    """
+    idn = _c_ident(cl["name"])
+    from_x = "%s_get_pos_x(i)" % idn
+    from_y = "%s_get_pos_y(i)" % idn
+    if cl.get("two_d"):
+        from_z = "0.f"
+    else:
+        from_z = "%s_get_pos_z(i)" % idn
+    out = []
+    i = 0
+    while i < len(text):
+        m = re.search(
+            r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*LookAt\s*\(",
+            text[i:])
+        if not m:
+            out.append(text[i:])
+            break
+        start = i + m.start()
+        open_paren = i + m.end() - 1
+        parsed = _match_call_args(text, open_paren)
+        if not parsed:
+            out.append(text[i:open_paren + 1])
+            i = open_paren + 1
+            continue
+        args_str, after = parsed
+        j = after
+        while j < len(text) and text[j] in " \t\r\n":
+            j += 1
+        if j < len(text) and text[j] == ";":
+            j += 1
+        out.append(text[i:start])
+        args = _split_call_args(args_str)
+        tx = ty = tz = None
+        if not args:
+            out.append(text[start:j])
+            i = j
+            continue
+        a0 = args[0].strip()
+        if re.match(
+                r"(?:UnityEngine\.)?Camera\.main\.transform"
+                r"(?:\.position)?\s*$", a0):
+            tx, ty, tz = ("Camera_main_pos_x", "Camera_main_pos_y",
+                          "Camera_main_pos_z")
+        else:
+            nm = re.match(r"new\s+Vector3\s*\((.*)\)$", a0, flags=re.S)
+            if nm:
+                vargs = _split_call_args(nm.group(1))
+                if len(vargs) >= 3:
+                    tx, ty, tz = vargs[0], vargs[1], vargs[2]
+            else:
+                am = re.match(
+                    r"Vector3\.(zero|one|right|left|up|down|forward|back)\s*$",
+                    a0)
+                if am:
+                    name = am.group(1)
+                    if name == "zero":
+                        tx = ty = tz = "0.f"
+                    elif name == "one":
+                        tx = ty = tz = "1.f"
+                    else:
+                        ax, ay, az = _VECTOR3_AXIS[name]
+                        tx = "%sf" % repr(float(ax))
+                        ty = "%sf" % repr(float(ay))
+                        tz = "%sf" % repr(float(az))
+        if tx is None:
+            out.append(text[start:j])
+        else:
+            out.append(
+                "_engine_transform_look_at("
+                "&_%s_rot_x[i], &_%s_rot_y[i], &_%s_rot_z[i], &_%s_rot_w[i], "
+                "&_%s_rot_m00[i], &_%s_rot_m01[i], &_%s_rot_m10[i], "
+                "&_%s_rot_m11[i], "
+                "%s, %s, %s, (%s), (%s), (%s));"
+                % (idn, idn, idn, idn, idn, idn, idn, idn,
+                   from_x, from_y, from_z, tx, ty, tz))
         i = j
     return "".join(out)
 
@@ -7727,6 +7906,7 @@ def _lower_method_body(body, cl, plan, site=None):
     text = _rewrite_extensions_set_world_scale(text, cl, plan)
     text = _rewrite_rigidbody_assigns(text, plan, cl["name"])
     text = _rewrite_transform_rotate(text, cl)
+    text = _rewrite_transform_look_at(text, cl)
     # Find/GetComponent before field rewrites so `.amp` stays on the target type.
     text = _rewrite_find_getcomponent(text, plan, cl["name"], site=site)
     text, add_locals = _rewrite_addcomponent(text, plan, cl["name"])
@@ -8304,7 +8484,7 @@ def emit_data(plan, used_apis=None):
             idn, n, ", ".join("%sf" % repr(v) for v in sxs)))
         p("float _%s_scale_y[%d] = { %s };" % (
             idn, n, ", ".join("%sf" % repr(v) for v in sys)))
-    # Live localRotation for Transform.Rotate targets.
+    # Live localRotation for Transform.Rotate / LookAt targets.
     for cname in sorted(plan.get("live_rot_classes") or []):
         cl = plan["classes"].get(cname)
         if not cl:
