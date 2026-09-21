@@ -48,6 +48,7 @@ action maps / device graphs).
 | `Application.dataPath` | Packed project `Assets/` absolute path (**Awake/Start only**) |
 | `Application.persistentDataPath` | Unity company/product save dir (**Awake/Start only**) |
 | Other `Application.*` | Pack-time **CS0117** (`Application` in scope via `using UnityEngine`) |
+| Other `Quaternion.*` (not Euler / identity / LookRotation) | Pack-time **CS0117** (`Quaternion` in scope via `using UnityEngine`) |
 | `File.WriteAllText(path, text)` | `fopen` write (`"w"`); creates parent dirs when possible |
 | `File.AppendAllText(path, text)` | `fopen` append (`"a"`); creates parent dirs when possible |
 | Other `File.*` | Pack-time **CS0117** (`File` in scope via `using System.IO`) |
@@ -146,7 +147,7 @@ slot (intensity 1, white) into the light table.
 | `transform.Rotate` (euler / `Vector3.axis * deg`, Space.Self) | Live local quat + `rot_m00..m11` in draws |
 | `transform.LookAt` (Transform / `Vector3`, default up) | Live local quat = LookRotation(to−from); refreshes draw basis |
 | `transform.eulerAngles` (`=` / `+=`, degrees) | Get/set live quat via Unity Euler; refreshes draw basis |
-| `transform.rotation` (`=` `Quaternion.Euler` / `identity` / `new`) | Set live quat (unparented ≈ world); refreshes draw basis |
+| `transform.rotation` (`=` `Quaternion.Euler` / `LookRotation` / `identity` / `new`) | Set live quat (unparented ≈ world); refreshes draw basis |
 | Authored `m_Father` / PrefabInstance `m_TransformParent` | World TRS = parent ∘ local; **live** at draw/collider time |
 
 PNG pixels are packed into `data.c` (`engine_texture_rgba`). Editing the
@@ -163,7 +164,8 @@ extents. Scripts that call `transform.Rotate`, `transform.LookAt`,
 `transform.eulerAngles`, or `transform.rotation` keep a live local
 quaternion (`_Class_rot_*`) and refresh that basis each call (`Rotate` =
 Space.Self degrees; `LookAt` = LookRotation toward target, default world
-up; `eulerAngles` / `rotation = Quaternion.Euler` = absolute Euler degrees).
+up; `eulerAngles` / `rotation = Quaternion.Euler` / `LookRotation` =
+absolute orientation).
 Child transforms keep
 **local** position when parented to another packed body; `engine_collect_draws`
 (and collider centers) compose `parent_world + local` each frame so a parent

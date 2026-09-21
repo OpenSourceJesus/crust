@@ -361,6 +361,62 @@ class TestSystems(unittest.TestCase):
         unity_pack.analyze_script(
             path, src.replace("streamingAssetsPath", "persistentDataPath"))
 
+    def test_quaternion_unsupported_member_is_cs0117(self):
+        """Unsupported Quaternion members → CS0117 (in scope via UnityEngine)."""
+        src = (
+            "using UnityEngine;\n"
+            "\n"
+            "public class Ball : MonoBehaviour {\n"
+            "    void Start () {\n"
+            "        transform.rotation = Quaternion.Slerp("
+            "Quaternion.identity, Quaternion.identity, 0.5f);\n"
+            "    }\n"
+            "}\n"
+        )
+        path = ("/proj/Assets/Standard Assets/Scripts/Objects (Scripts)/"
+                "Ball.cs")
+        with self.assertRaises(unity_pack.PackError) as cm:
+            unity_pack.analyze_script(path, src)
+        self.assertEqual(
+            cm.exception.message,
+            "Assets/Standard Assets/Scripts/Objects (Scripts)/Ball.cs"
+            "(5,41): error CS0117: 'Quaternion' does not contain a "
+            "definition for 'Slerp'")
+        fqn = src.replace("using UnityEngine;\n", "").replace(
+            "Quaternion.Slerp",
+            "UnityEngine.Quaternion.Slerp")
+        with self.assertRaises(unity_pack.PackError) as cm:
+            unity_pack.analyze_script(path, fqn)
+        self.assertIn("CS0117", cm.exception.message)
+        self.assertIn("Slerp", cm.exception.message)
+        # Supported Euler / identity / LookRotation still analyze.
+        unity_pack.analyze_script(
+            path, src.replace(
+                "Slerp(Quaternion.identity, Quaternion.identity, 0.5f)",
+                "Euler(Vector3.forward * 45f)"))
+        unity_pack.analyze_script(
+            path,
+            "using UnityEngine;\n"
+            "public class Ball : MonoBehaviour {\n"
+            "    void Start() {\n"
+            "        transform.rotation = Quaternion.identity;\n"
+            "    }\n"
+            "}\n")
+        unity_pack.analyze_script(
+            path,
+            "using UnityEngine;\n"
+            "public class Ball : MonoBehaviour {\n"
+            "    void Start() {\n"
+            "        transform.rotation = Quaternion.LookRotation("
+            "Vector3.forward, Vector3.up);\n"
+            "    }\n"
+            "}\n")
+        ball = os.path.join(
+            SYSTEMS, "Assets", "Standard Assets", "Scripts",
+            "Objects (Scripts)", "Ball.cs")
+        # SystemsScene Ball exercises LookRotation — must analyze clean.
+        unity_pack.analyze_script(ball)
+
     def test_file_unsupported_member_is_cs0117(self):
         """Unsupported File members → CS0117 (File is in scope via System.IO)."""
         src = (
@@ -447,6 +503,8 @@ class TestSystems(unittest.TestCase):
             "        transform.eulerAngles += Vector3.forward * 45f;\n"
             "        transform.rotation = Quaternion.Euler("
             "Vector3.forward * 45f);\n"
+            "        transform.rotation = Quaternion.LookRotation("
+            "Vector3.forward, Vector3.up);\n"
             "    }\n"
             "}\n")
 
@@ -799,6 +857,101 @@ class TestSystems(unittest.TestCase):
             capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
         exe = os.path.join(d, "rotq")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host,
+             os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+
+    def test_transform_rotation_lookrotation_packs(self):
+        """transform.rotation = Quaternion.LookRotation → look_rotation helper."""
+        root = tempfile.mkdtemp(prefix="upack-lookrot-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Ball.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Ball : MonoBehaviour {\n"
+                "    void Start() {\n"
+                "        transform.rotation = Quaternion.LookRotation("
+                "Vector3.forward, Vector3.up);\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Ball.cs.meta"), "w") as f:
+            f.write("guid: dddddddddddddddddddddddddddddddd\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Ball\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "  - component: {fileID: 4}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: dddddddddddddddddddddddddddddddd}\n"
+                "--- !u!212 &4\nSpriteRenderer:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n"
+                "  m_Sprite: {fileID: 0}\n"
+                "  m_Color: {r: 1, g: 0, b: 0, a: 1}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-lookrot-out-")
+        plan = unity_pack.pack(root, d)
+        self.assertEqual(plan.get("live_rot_classes"), ["Ball"])
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("_engine_quat_look_rotation", eng)
+        self.assertIn("Ball_Start", eng)
+        start = eng.find("static void Ball_Start")
+        end = eng.find("\nstatic void ", start + 1)
+        if end < 0:
+            end = eng.find("\nvoid ", start + 1)
+        body = eng[start:end]
+        self.assertIn("_engine_quat_look_rotation", body)
+        self.assertNotIn("Quaternion.LookRotation", body)
+        self.assertNotIn("transform.rotation", body)
+        if not _CC:
+            return
+        host = os.path.join(d, "host.c")
+        with open(host, "w") as f:
+            f.write(
+                "void engine_tick(void);\n"
+                "extern float Time_deltaTime;\n"
+                "extern float _Ball_rot_m00[];\n"
+                "extern float _Ball_rot_m11[];\n"
+                "extern float _Ball_rot_w[];\n"
+                "int main(void) {\n"
+                "  Time_deltaTime = 0.02f;\n"
+                "  engine_tick();\n"
+                "  /* LookRotation(+Z, +Y) ≈ identity. */\n"
+                "  if (_Ball_rot_m00[0] < 0.99f) return 2;\n"
+                "  if (_Ball_rot_m11[0] < 0.99f) return 3;\n"
+                "  if (_Ball_rot_w[0] < 0.99f) return 4;\n"
+                "  return 0;\n"
+                "}\n"
+            )
+        r = subprocess.run(
+            [_CC, "-O2", "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(
+            [_CC, "-O0", "-c", "-o", os.path.join(d, "data.o"),
+             os.path.join(d, "data.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        exe = os.path.join(d, "lookrot")
         r = subprocess.run(
             [_CC, "-O2", "-o", exe, host,
              os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],

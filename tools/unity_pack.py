@@ -56,6 +56,9 @@ _FILE_SUPPORTED = frozenset({"WriteAllText", "AppendAllText"})
 # UnityEngine.Application members we emit. Others → CS0117.
 _APPLICATION_SUPPORTED = frozenset({"dataPath", "persistentDataPath"})
 
+# UnityEngine.Quaternion members we emit. Others → CS0117 (in scope via UnityEngine).
+_QUATERNION_SUPPORTED = frozenset({"Euler", "identity", "LookRotation"})
+
 # MonoBehaviour.transform members we lower. Others → CS1061 on Transform
 # (transform itself is always in scope; blame the missing member).
 _TRANSFORM_SUPPORTED = frozenset({
@@ -98,6 +101,26 @@ def _check_application_api(path, text, scan):
         col = member_idx - (text.rfind("\n", 0, member_idx) + 1) + 1
         raise PackError(
             "%s(%d,%d): error CS0117: 'Application' does not contain a "
+            "definition for '%s'"
+            % (_assets_rel_path(path), line, col, member)
+        )
+
+
+def _check_quaternion_api(path, text, scan):
+    """Unsupported Quaternion.Member with UnityEngine in scope → Unity CS0117."""
+    has_ue = bool(re.search(r"using\s+UnityEngine\b", scan))
+    for m in re.finditer(r"(?:UnityEngine\.)?Quaternion\.(\w+)\b", scan):
+        member = m.group(1)
+        if member in _QUATERNION_SUPPORTED:
+            continue
+        is_fqn = m.group(0).startswith("UnityEngine.")
+        if not is_fqn and not has_ue:
+            continue
+        member_idx = m.start(1)
+        line = text.count("\n", 0, member_idx) + 1
+        col = member_idx - (text.rfind("\n", 0, member_idx) + 1) + 1
+        raise PackError(
+            "%s(%d,%d): error CS0117: 'Quaternion' does not contain a "
             "definition for '%s'"
             % (_assets_rel_path(path), line, col, member)
         )
@@ -161,6 +184,7 @@ def _check_csharp_lex(path, text):
         )
     _check_file_api(path, text, scan)
     _check_application_api(path, text, scan)
+    _check_quaternion_api(path, text, scan)
     _check_transform_api(path, text, scan)
 
 
@@ -6157,34 +6181,38 @@ def emit_engine(plan, analyses, used_apis):
         p("    *m11 = 1.f - 2.f * (nx * nx + nz * nz);")
         p("}")
         p("")
-        p("/* Transform.LookAt: localRotation = LookRotation(to-from, up). */")
-        p("static void _engine_transform_look_at(")
+        p("/* Quaternion.LookRotation(forward, up) → local quat + XY basis. */")
+        p("static void _engine_quat_look_rotation(")
         p("    float *qx, float *qy, float *qz, float *qw,")
         p("    float *m00, float *m01, float *m10, float *m11,")
-        p("    float fx, float fy, float fz,")
-        p("    float tx, float ty, float tz) {")
-        p("    float dx = tx - fx;")
-        p("    float dy = ty - fy;")
-        p("    float dz = tz - fz;")
+        p("    float dx, float dy, float dz,")
+        p("    float ux, float uy, float uz) {")
         p("    float len = sqrtf(dx * dx + dy * dy + dz * dz);")
         p("    float rx, ry, rz, rlen;")
-        p("    float ux, uy, uz;")
         p("    float m00r, m01r, m02r, m10r, m11r, m12r, m20r, m21r, m22r;")
         p("    float trace, s, nx, ny, nz, nw;")
-        p("    if (len < 1e-8f) return;")
+        p("    float uxi = ux, uyi = uy, uzi = uz;")
+        p("    if (len < 1e-8f) {")
+        p("        *qx = 0.f; *qy = 0.f; *qz = 0.f; *qw = 1.f;")
+        p("        *m00 = 1.f; *m01 = 0.f; *m10 = 0.f; *m11 = 1.f;")
+        p("        return;")
+        p("    }")
         p("    dx = dx / len; dy = dy / len; dz = dz / len;")
-        p("    ux = 0.f; uy = 1.f; uz = 0.f;")
-        p("    rx = uy * dz - uz * dy;")
-        p("    ry = uz * dx - ux * dz;")
-        p("    rz = ux * dy - uy * dx;")
+        p("    rx = uyi * dz - uzi * dy;")
+        p("    ry = uzi * dx - uxi * dz;")
+        p("    rz = uxi * dy - uyi * dx;")
         p("    rlen = sqrtf(rx * rx + ry * ry + rz * rz);")
         p("    if (rlen < 1e-6f) {")
-        p("        ux = 0.f; uy = 0.f; uz = 1.f;")
-        p("        rx = uy * dz - uz * dy;")
-        p("        ry = uz * dx - ux * dz;")
-        p("        rz = ux * dy - uy * dx;")
+        p("        uxi = 0.f; uyi = 0.f; uzi = 1.f;")
+        p("        rx = uyi * dz - uzi * dy;")
+        p("        ry = uzi * dx - uxi * dz;")
+        p("        rz = uxi * dy - uyi * dx;")
         p("        rlen = sqrtf(rx * rx + ry * ry + rz * rz);")
-        p("        if (rlen < 1e-8f) return;")
+        p("        if (rlen < 1e-8f) {")
+        p("            *qx = 0.f; *qy = 0.f; *qz = 0.f; *qw = 1.f;")
+        p("            *m00 = 1.f; *m01 = 0.f; *m10 = 0.f; *m11 = 1.f;")
+        p("            return;")
+        p("        }")
         p("    }")
         p("    rx = rx / rlen; ry = ry / rlen; rz = rz / rlen;")
         p("    ux = dy * rz - dz * ry;")
@@ -6225,6 +6253,20 @@ def emit_engine(plan, analyses, used_apis):
         p("    *m01 = 2.f * (nx * ny - nz * nw);")
         p("    *m10 = 2.f * (nx * ny + nz * nw);")
         p("    *m11 = 1.f - 2.f * (nx * nx + nz * nz);")
+        p("}")
+        p("")
+        p("/* Transform.LookAt: localRotation = LookRotation(to-from, up). */")
+        p("static void _engine_transform_look_at(")
+        p("    float *qx, float *qy, float *qz, float *qw,")
+        p("    float *m00, float *m01, float *m10, float *m11,")
+        p("    float fx, float fy, float fz,")
+        p("    float tx, float ty, float tz) {")
+        p("    float dx = tx - fx;")
+        p("    float dy = ty - fy;")
+        p("    float dz = tz - fz;")
+        p("    _engine_quat_look_rotation(")
+        p("        qx, qy, qz, qw, m00, m01, m10, m11,")
+        p("        dx, dy, dz, 0.f, 1.f, 0.f);")
         p("}")
         p("")
         p("/* Transform.eulerAngles get: quat → degrees (Unity ZXY). */")
@@ -7960,7 +8002,7 @@ def _rewrite_transform_euler_angles(text, cl):
 
 
 def _parse_quaternion_expr(rhs):
-    """Parse Quaternion.Euler / identity / new Quaternion → ('euler',xyz)|('quat',xyzw)."""
+    """Parse Quaternion.Euler / LookRotation / identity / new → kind + args."""
     rhs = rhs.strip()
     if re.match(r"Quaternion\.identity\s*$", rhs):
         return ("quat", ("0.f", "0.f", "0.f", "1.f"))
@@ -7974,6 +8016,19 @@ def _parse_quaternion_expr(rhs):
             if hit:
                 return ("euler", hit)
         return None
+    lm = re.match(r"Quaternion\.LookRotation\s*\((.*)\)$", rhs, flags=re.S)
+    if lm:
+        args = _split_call_args(lm.group(1))
+        if len(args) == 1:
+            fwd = _parse_vector3_expr(args[0])
+            if fwd:
+                return ("look", (fwd, ("0.f", "1.f", "0.f")))
+        elif len(args) == 2:
+            fwd = _parse_vector3_expr(args[0])
+            up = _parse_vector3_expr(args[1])
+            if fwd and up:
+                return ("look", (fwd, up))
+        return None
     nm = re.match(r"new\s+Quaternion\s*\((.*)\)$", rhs, flags=re.S)
     if nm:
         args = _split_call_args(nm.group(1))
@@ -7983,11 +8038,12 @@ def _parse_quaternion_expr(rhs):
 
 
 def _rewrite_transform_rotation(text, cl):
-    """Lower transform.rotation = Quaternion… → set_euler / set_quat.
+    """Lower transform.rotation = Quaternion… → set_euler / set_quat / look.
 
     Supports:
       transform.rotation = Quaternion.Euler(x, y, z);
       transform.rotation = Quaternion.Euler(Vector3.forward * deg);
+      transform.rotation = Quaternion.LookRotation(forward[, up]);
       transform.rotation = Quaternion.identity;
       transform.rotation = new Quaternion(x, y, z, w);
     Unparented bodies: world rotation ≈ local (packed live quat).
@@ -8035,6 +8091,12 @@ def _rewrite_transform_rotation(text, cl):
             out.append(
                 "_engine_transform_set_euler(%s, (%s), (%s), (%s));"
                 % (rot_args, ex, ey, ez))
+        elif parsed[0] == "look":
+            (fx, fy, fz), (ux, uy, uz) = parsed[1]
+            out.append(
+                "_engine_quat_look_rotation(%s, (%s), (%s), (%s), "
+                "(%s), (%s), (%s));"
+                % (rot_args, fx, fy, fz, ux, uy, uz))
         else:
             qx, qy, qz, qw = parsed[1]
             out.append(
