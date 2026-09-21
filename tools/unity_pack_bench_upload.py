@@ -17,7 +17,7 @@ import tempfile
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SCENE = os.path.join(ROOT, "examples", "unity_pack", "MiniScene")
+PROJECT = os.path.join(ROOT, "examples", "unity_pack", "MiniScene")
 _CC = shutil.which("gcc") or shutil.which("cc")
 
 HOST = r"""
@@ -55,7 +55,7 @@ def build_and_run(soa: bool) -> str:
         raise SystemExit("need gcc/cc")
     d = tempfile.mkdtemp(prefix="upack-bench-")
     cmd = [sys.executable, os.path.join(ROOT, "tools", "unity_pack.py"),
-           SCENE, "-o", d]
+           PROJECT, "-o", d]
     if soa:
         cmd.append("--soa")
     subprocess.check_call(cmd)

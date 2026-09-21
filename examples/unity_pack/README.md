@@ -41,6 +41,6 @@ frame clock). Arrow keys / WASD poke `engine_input_axis_*` for
 SystemsScene (Pad + Ball + … → `/tmp/SystemsScene/SystemsScene`):
 
 ```
-SCENE="$(pwd)/examples/unity_pack/SystemsScene" \
+PROJECT="$(pwd)/examples/unity_pack/SystemsScene" \
   ./examples/unity_pack/run_gles2_window.sh
 ```

@@ -9,7 +9,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 OUT="${OUT:-$ROOT/build/unity_gles2}"
-SCENE="${SCENE:-$ROOT/examples/unity_pack/MiniScene}"
+PROJECT="${PROJECT:-$ROOT/examples/unity_pack/MiniScene}"
 VIEW="$ROOT/examples/unity_pack/gles2_view.c"
 CC="${CC:-gcc}"
 SOA=()
@@ -34,8 +34,8 @@ for arg in "$@"; do
 done
 
 mkdir -p "$OUT"
-echo "== packing $SCENE → $OUT =="
-PYTHONUNBUFFERED=1 python3 -u "$ROOT/tools/unity_pack.py" "$SCENE" -o "$OUT" "${SOA[@]}"
+echo "== packing $PROJECT → $OUT =="
+PYTHONUNBUFFERED=1 python3 -u "$ROOT/tools/unity_pack.py" "$PROJECT" -o "$OUT" "${SOA[@]}"
 echo "== compiling engine.c (-O3) ($(wc -c < "$OUT/engine.c") bytes) =="
 "$CC" -O3 -c -o "$OUT/engine.o" "$OUT/engine.c"
 echo "== compiling data.c (-O0) ($(wc -c < "$OUT/data.c") bytes) =="

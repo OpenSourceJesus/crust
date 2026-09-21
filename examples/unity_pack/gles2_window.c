@@ -4,7 +4,7 @@
  * surfaceless FBO path in gles2_view.c.
  *
  *     examples/unity_pack/run_gles2_window.sh
- *     SCENE=.../SystemsScene ./examples/unity_pack/run_gles2_window.sh
+ *     PROJECT=.../SystemsScene ./examples/unity_pack/run_gles2_window.sh
  *
  * Arrow keys / WASD feed engine_input_axis_* (Input.GetAxis). Left click
  * feeds engine_pointer_* for authored uGUI Buttons. Escape or Q quits.
