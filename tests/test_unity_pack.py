@@ -395,6 +395,121 @@ class TestSystems(unittest.TestCase):
             path, src.replace("ReadAllText(\"a.txt\")",
                               "AppendAllText(\"a.txt\", \"x\")"))
 
+    def test_transform_unsupported_member_is_cs1061(self):
+        """Unsupported transform.Member → CS1061 on Transform (not undeclared)."""
+        src = (
+            "using UnityEngine;\n"
+            "\n"
+            "public class Ball : MonoBehaviour {\n"
+            "    void Start () {\n"
+            "        transform.LookAt(Vector3.zero);\n"
+            "    }\n"
+            "}\n"
+        )
+        path = ("/proj/Assets/Standard Assets/Scripts/Objects (Scripts)/"
+                "Ball.cs")
+        with self.assertRaises(unity_pack.PackError) as cm:
+            unity_pack.analyze_script(path, src)
+        self.assertEqual(
+            cm.exception.message,
+            "Assets/Standard Assets/Scripts/Objects (Scripts)/Ball.cs"
+            "(5,19): error CS1061: 'Transform' does not contain a "
+            "definition for 'LookAt' and no accessible extension method "
+            "'LookAt' accepting a first argument of type 'Transform' could "
+            "be found (are you missing a using directive or an assembly "
+            "reference?)")
+        # this.transform also binds; still CS1061 on the member.
+        with self.assertRaises(unity_pack.PackError) as cm:
+            unity_pack.analyze_script(
+                path, src.replace("transform.LookAt", "this.transform.LookAt"))
+        self.assertIn("CS1061", cm.exception.message)
+        self.assertIn("'LookAt'", cm.exception.message)
+        self.assertNotIn("undeclared", cm.exception.message.lower())
+        # Camera.main.transform.position is not MonoBehaviour.transform.
+        unity_pack.analyze_script(
+            path,
+            "using UnityEngine;\n"
+            "public class Ball : MonoBehaviour {\n"
+            "    void Update() {\n"
+            "        float x = Camera.main.transform.position.x;\n"
+            "    }\n"
+            "}\n")
+        # Supported transform.position / Rotate still analyze.
+        unity_pack.analyze_script(
+            path,
+            "using UnityEngine;\n"
+            "public class Ball : MonoBehaviour {\n"
+            "    void Update() {\n"
+            "        transform.position = new Vector2(1f, 2f);\n"
+            "        transform.Rotate(Vector3.forward * 90f * Time.deltaTime);\n"
+            "    }\n"
+            "}\n")
+
+    def test_transform_rotate_packs_live_quat(self):
+        """transform.Rotate → live quat tables + draw uses rot_m** basis."""
+        root = tempfile.mkdtemp(prefix="upack-rotate-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Spinner.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Spinner : MonoBehaviour {\n"
+                "    void Update() {\n"
+                "        transform.Rotate(Vector3.forward * 90f"
+                " * Time.deltaTime);\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Spinner.cs.meta"), "w") as f:
+            f.write("guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Spinner\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "  - component: {fileID: 4}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}\n"
+                "--- !u!212 &4\nSpriteRenderer:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n"
+                "  m_Sprite: {fileID: 0}\n"
+                "  m_Color: {r: 1, g: 0, b: 0, a: 1}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-rotate-out-")
+        plan = unity_pack.pack(root, d)
+        self.assertEqual(plan.get("live_rot_classes"), ["Spinner"])
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        with open(os.path.join(d, "data.c")) as f:
+            data = f.read()
+        self.assertIn("_engine_transform_rotate_local", eng)
+        self.assertIn("_Spinner_rot_m00[i]", eng)
+        self.assertIn(
+            "_engine_transform_rotate_local("
+            "&_Spinner_rot_x[i], &_Spinner_rot_y[i], &_Spinner_rot_z[i], "
+            "&_Spinner_rot_w[i], &_Spinner_rot_m00[i], &_Spinner_rot_m01[i], "
+            "&_Spinner_rot_m10[i], &_Spinner_rot_m11[i],",
+            eng)
+        self.assertIn("float _Spinner_rot_x[", data)
+        self.assertIn("float _Spinner_rot_w[", data)
+        self.assertIn("float _Spinner_rot_m00[", data)
+        # Empty m_Sprite → no draw; still packs Rotate tables.
+        with open(os.path.join(scripts, "Spinner.cs")) as sf:
+            a = unity_pack.analyze_script(
+                os.path.join(scripts, "Spinner.cs"), sf.read())
+        self.assertTrue(a["writes_rot"])
+
     def test_cpp_style_float_suffix_is_cs1061(self):
         """C++ `0.f` is not a C# real-literal — csc reports CS1061 on `f`."""
         src = (
@@ -743,7 +858,7 @@ class TestSystems(unittest.TestCase):
         with open(host, "w") as f:
             f.write(
                 "typedef struct { float x, y, half_w, half_h;\n"
-                "                 float cos_z, sin_z;\n"
+                "                 float m00, m01, m10, m11;\n"
                 "                 float r, g, b; float a; int tex;\n"
                 "                 int sorting_layer; int sorting_order;\n"
                 "               } EngineDraw;\n"
@@ -875,7 +990,7 @@ class TestSystems(unittest.TestCase):
         self.assertIn("Camera_main_farClipPlane", data)
         self.assertIn("SpriteRenderer", engine)
         self.assertIn("wz - Camera_main_pos_z", engine)
-        self.assertIn("out[n].cos_z", engine)
+        self.assertIn("out[n].m00", engine)
         self.assertIn("_spr_sin", engine)
         self.assertIn("engine_physics_collide2d", engine)
         self.assertIn("engine_animation_tick", engine)
@@ -1274,7 +1389,7 @@ class TestSystems(unittest.TestCase):
                 "void engine_tick(void);\n"
                 "extern float Time_deltaTime;\n"
                 "typedef struct { float x, y, half_w, half_h;\n"
-                "                 float cos_z, sin_z;\n"
+                "                 float m00, m01, m10, m11;\n"
                 "                 float r, g, b; float a; int tex;\n"
                 "                 int sorting_layer; int sorting_order;\n"
                 "               } EngineDraw;\n"
@@ -2240,7 +2355,7 @@ class TestSystemsRuns(unittest.TestCase):
                 "extern float RenderSettings_ambient_r;\n"
                 "extern float _Light_intensity[];\n"
                 "typedef struct { float x, y, half_w, half_h;\n"
-                "                 float cos_z, sin_z;\n"
+                "                 float m00, m01, m10, m11;\n"
                 "                 float r, g, b; float a; int tex;\n"
                 "                 int sorting_layer; int sorting_order;\n"
                 "               } EngineDraw;\n"
@@ -2372,7 +2487,7 @@ class TestSystemsRuns(unittest.TestCase):
         with open(host, "w") as f:
             f.write(
                 "typedef struct { float x, y, half_w, half_h;\n"
-                "                 float cos_z, sin_z;\n"
+                "                 float m00, m01, m10, m11;\n"
                 "                 float r, g, b; float a; int tex;\n"
                 "                 int sorting_layer; int sorting_order;\n"
                 "               } EngineDraw;\n"

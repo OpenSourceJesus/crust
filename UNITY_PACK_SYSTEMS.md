@@ -135,7 +135,8 @@ slot (intensity 1, white) into the light table.
 | `ProjectSettings` `defaultScreenWidth` / `Height` | `Screen_width` / `Screen_height` (GLFW window size) |
 | `ProjectSettings` `fullscreenMode` 0/1 | `Screen_fullScreen` — GLES host uses primary monitor |
 | `defaultIsNativeResolution` | `Screen_fullScreenNative` — desktop video mode size when FS |
-| Authored `m_LocalRotation` on Transform | Z spin via `EngineDraw.cos_z` / `sin_z` (identity if omitted) |
+| Authored `m_LocalRotation` on Transform | XY basis `EngineDraw.m00..m11` (ortho drop Z) |
+| `transform.Rotate` (euler / `Vector3.axis * deg`, Space.Self) | Live local quat + `rot_m00..m11` in draws |
 | Authored `m_Father` / PrefabInstance `m_TransformParent` | World TRS = parent ∘ local; **live** at draw/collider time |
 
 PNG pixels are packed into `data.c` (`engine_texture_rgba`). Editing the
@@ -145,8 +146,12 @@ referenced sprite and re-packing changes the drawn texels. Tint comes from
 World size follows Unity:
 `(texels / spritePixelsToUnits) * Transform.scale` (half-extents in
 `engine_collect_draws`). `spritePixelsToUnits` is read from the PNG `.meta`
-(default **100**). Sprite quads are rotated in the XY plane from
-`m_LocalRotation` (quaternion → angle of local +X). Child transforms keep
+(default **100**). Sprite quads use the local XY→world XY basis from
+`m_LocalRotation` (`EngineDraw.m00..m11`; orthographic drop of Z). Pure Z
+spin matches the old cos/sin path; X/Y tilt foreshortens the projected
+extents. Scripts that call `transform.Rotate` keep a live local quaternion
+(`_Class_rot_*`) and refresh that basis each call (Space.Self; degrees).
+Child transforms keep
 **local** position when parented to another packed body; `engine_collect_draws`
 (and collider centers) compose `parent_world + local` each frame so a parent
 `Rigidbody2D` / scripted motion carries children (Unity hierarchy). Objects with

@@ -56,6 +56,10 @@ _FILE_SUPPORTED = frozenset({"WriteAllText", "AppendAllText"})
 # UnityEngine.Application members we emit. Others → CS0117.
 _APPLICATION_SUPPORTED = frozenset({"dataPath", "persistentDataPath"})
 
+# MonoBehaviour.transform members we lower. Others → CS1061 on Transform
+# (transform itself is always in scope; blame the missing member).
+_TRANSFORM_SUPPORTED = frozenset({"position", "Rotate"})
+
 
 def _check_file_api(path, text, scan):
     """Unsupported File.Member with System.IO in scope → Unity CS0117."""
@@ -97,6 +101,29 @@ def _check_application_api(path, text, scan):
         )
 
 
+def _check_transform_api(path, text, scan):
+    """Unsupported MonoBehaviour.transform.Member → Unity CS1061.
+
+    `transform` is always a Transform (never an undeclared identifier).
+    Skips `Camera.main.transform` / other `*.transform` (leading `.`).
+    """
+    for m in re.finditer(
+            r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*(\w+)", scan):
+        member = m.group(1)
+        if member in _TRANSFORM_SUPPORTED:
+            continue
+        member_idx = m.start(1)
+        line = text.count("\n", 0, member_idx) + 1
+        col = member_idx - (text.rfind("\n", 0, member_idx) + 1) + 1
+        raise PackError(
+            "%s(%d,%d): error CS1061: 'Transform' does not contain a "
+            "definition for '%s' and no accessible extension method '%s' "
+            "accepting a first argument of type 'Transform' could be found "
+            "(are you missing a using directive or an assembly reference?)"
+            % (_assets_rel_path(path), line, col, member, member)
+        )
+
+
 def _check_csharp_lex(path, text):
     """Refuse spellings Unity/csc reject before any rewrite.
 
@@ -132,6 +159,7 @@ def _check_csharp_lex(path, text):
         )
     _check_file_api(path, text, scan)
     _check_application_api(path, text, scan)
+    _check_transform_api(path, text, scan)
 
 
 # Built-in Unity components AddComponent may create at runtime.
@@ -728,6 +756,20 @@ def _quat_z_rad(qx, qy, qz, qw):
     """Planar angle (radians) of local +X after *rot* — SpriteRenderer Z spin."""
     rx, ry, _rz = _quat_rotate_vec(qx, qy, qz, qw, 1.0, 0.0, 0.0)
     return math.atan2(ry, rx)
+
+
+def _quat_xy_basis(qx, qy, qz, qw):
+    """Local XY → world XY after *rot* (orthographic drop of Z).
+
+    Sprite quads live in the local XY plane; hosts apply
+    ``(m00,m01; m10,m11) * (lx, ly)``. Pure Z spin matches cos/sin; X/Y
+    tilt foreshortens the projected extents (Unity ortho SpriteRenderer).
+    """
+    m00 = 1.0 - 2.0 * (qy * qy + qz * qz)
+    m01 = 2.0 * (qx * qy - qz * qw)
+    m10 = 2.0 * (qx * qy + qz * qw)
+    m11 = 1.0 - 2.0 * (qx * qx + qz * qz)
+    return m00, m01, m10, m11
 
 
 # Unity defaults when Collider/Rigidbody m_Material is {fileID: 0}.
@@ -1822,6 +1864,10 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None):
             "scale_y": 1.0,
             "cos_z": 1.0,
             "sin_z": 0.0,
+            "m00": 1.0,
+            "m01": 0.0,
+            "m10": 0.0,
+            "m11": 1.0,
             "half_w": abs(rw) * px_w * 0.5,
             "half_h": abs(rh) * px_h * 0.5,
             "ncx": float(cx) / float(sw),
@@ -2601,6 +2647,12 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             sprite["rot_z"] = rz
             sprite["cos_z"] = math.cos(rz)
             sprite["sin_z"] = math.sin(rz)
+            m00, m01, m10, m11 = _quat_xy_basis(
+                rot[0], rot[1], rot[2], rot[3])
+            sprite["m00"] = m00
+            sprite["m01"] = m01
+            sprite["m10"] = m10
+            sprite["m11"] = m11
         else:
             sprite = None
         class_name = None
@@ -3932,7 +3984,7 @@ def _rewrite_find_getcomponent(text, plan, this_class):
                     "unity_pack does not invent components" % (comp, comp))
             go_expr = "_engine_go_of_%s(i)" % this_idn
             if field:
-                repl = _field_after_get(comp, field, go_expr, axis)
+                repl = _field_after_get(comp, field, go_expr, line, axis)
             else:
                 repl = "GameObject_GetComponent_%s(%s)" % (
                     _c_ident(comp), go_expr)
@@ -3999,6 +4051,9 @@ def analyze_script(path, text=None):
             apis.add("GetComponent")
     if "transform.position" in scan:
         apis.add("transform.position")
+    if re.search(r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*Rotate\s*\(",
+                 scan):
+        apis.add("transform.Rotate")
     if re.search(r"using\s+UnityEngine\.UI\b", scan):
         apis.add("UnityEngine.UI")
     if re.search(r"\bInputAction\b", scan):
@@ -4058,6 +4113,8 @@ def analyze_script(path, text=None):
         r"transform\.position\s*=|"
         r"transform\.position\s*\+=|"
         r"transform\.Translate", scan))
+    writes_rot = bool(re.search(
+        r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*Rotate\s*\(", scan))
 
     types = cs2cpp._find_types(scan)
     classes = []
@@ -4089,6 +4146,7 @@ def analyze_script(path, text=None):
         "spawns": spawns,
         "uses_z": uses_z,
         "writes_pos": writes_pos,
+        "writes_rot": writes_rot,
         "keyboard_keys": keyboard_keys,
         "getcomponent_types": getcomponent_types,
         "addcomponent_types": addcomponent_types,
@@ -4368,7 +4426,10 @@ def plan_layouts(objects, analyses, two_d=None):
     writes = {}
     for a in analyses:
         for c in a["classes"]:
-            writes[c["name"]] = writes.get(c["name"], False) or a["writes_pos"]
+            writes[c["name"]] = (
+                writes.get(c["name"], False)
+                or a["writes_pos"]
+                or a.get("writes_rot"))
 
     for cname, insts in by_class.items():
         # Authored Rigidbody / Animation integrates into transform — writable.
@@ -4490,7 +4551,18 @@ def plan_layouts(objects, analyses, two_d=None):
             "vec2_fields": vec2_fields,
             "class_consts": class_consts,
         }
-    return {"two_d": two_d, "spawn": spawn, "classes": plans}
+    live_rot = set()
+    for a in analyses:
+        if a.get("writes_rot"):
+            for c in a["classes"]:
+                if c["name"] in plans:
+                    live_rot.add(c["name"])
+    return {
+        "two_d": two_d,
+        "spawn": spawn,
+        "classes": plans,
+        "live_rot_classes": sorted(live_rot),
+    }
 
 
 def _packed_size(members):
@@ -4575,6 +4647,7 @@ def emit_engine(plan, analyses, used_apis):
     p = lines.append
     soa = bool(plan.get("soa"))
     want_math = bool(used_apis & {"Mathf.Sin", "Mathf.Cos"})
+    want_live_rot = bool(plan.get("live_rot_classes"))
     getcomponent_types = set()
     for a in analyses:
         getcomponent_types |= set(a.get("getcomponent_types") or [])
@@ -4640,13 +4713,13 @@ def emit_engine(plan, analyses, used_apis):
     if soa:
         p("/* layout: SoA positions (contiguous float tables for GPU upload) */")
     p("#include <stdint.h>")
-    if want_math or want_col2d or want_col3d or want_anim:
+    if want_math or want_col2d or want_col3d or want_anim or want_live_rot:
         p("#include <math.h>")
     if (want_input or want_log or want_find or want_add_any
             or want_data_path or want_persistent_data_path or want_file_io):
         p("#include <string.h>")
     if (want_log or want_console or want_str_plus or want_add_any
-            or want_file_io):
+            or want_file_io or want_go_tables):
         p("#include <stdio.h>")
     want_draw_sort = False
     for cl in plan["classes"].values():
@@ -4855,6 +4928,19 @@ def emit_engine(plan, analyses, used_apis):
         n = max(1, plan["classes"][cname]["n"])
         p("extern float _%s_scale_x[%d];" % (idn, n))
         p("extern float _%s_scale_y[%d];" % (idn, n))
+    for cname in sorted(plan.get("live_rot_classes") or []):
+        if cname not in plan["classes"]:
+            continue
+        idn = _c_ident(cname)
+        n = max(1, plan["classes"][cname]["n"])
+        p("extern float _%s_rot_x[%d];" % (idn, n))
+        p("extern float _%s_rot_y[%d];" % (idn, n))
+        p("extern float _%s_rot_z[%d];" % (idn, n))
+        p("extern float _%s_rot_w[%d];" % (idn, n))
+        p("extern float _%s_rot_m00[%d];" % (idn, n))
+        p("extern float _%s_rot_m01[%d];" % (idn, n))
+        p("extern float _%s_rot_m10[%d];" % (idn, n))
+        p("extern float _%s_rot_m11[%d];" % (idn, n))
     # Transform field → target class/inst (SetWorldScale).
     for (oc, fname), row in sorted(
             (plan.get("transform_field_targets") or {}).items()):
@@ -5833,6 +5919,41 @@ def emit_engine(plan, analyses, used_apis):
         p("}")
         p("")
 
+    if want_live_rot:
+        p("/* Transform.Rotate(Space.Self): localRotation *= Euler(deg). */")
+        p("static void _engine_transform_rotate_local(")
+        p("    float *qx, float *qy, float *qz, float *qw,")
+        p("    float *m00, float *m01, float *m10, float *m11,")
+        p("    float ex_deg, float ey_deg, float ez_deg) {")
+        p("    float hx = ex_deg * 0.008726646259971648f;")
+        p("    float hy = ey_deg * 0.008726646259971648f;")
+        p("    float hz = ez_deg * 0.008726646259971648f;")
+        p("    float cx = cosf(hx); float sx = sinf(hx);")
+        p("    float cy = cosf(hy); float sy = sinf(hy);")
+        p("    float cz = cosf(hz); float sz = sinf(hz);")
+        p("    float ex = sx * cy * cz + cx * sy * sz;")
+        p("    float ey = cx * sy * cz - sx * cy * sz;")
+        p("    float ez = cx * cy * sz - sx * sy * cz;")
+        p("    float ew = cx * cy * cz + sx * sy * sz;")
+        p("    float nx = (*qw) * ex + (*qx) * ew + (*qy) * ez - (*qz) * ey;")
+        p("    float ny = (*qw) * ey - (*qx) * ez + (*qy) * ew + (*qz) * ex;")
+        p("    float nz = (*qw) * ez + (*qx) * ey - (*qy) * ex + (*qz) * ew;")
+        p("    float nw = (*qw) * ew - (*qx) * ex - (*qy) * ey - (*qz) * ez;")
+        p("    float m = sqrtf(nx * nx + ny * ny + nz * nz + nw * nw);")
+        p("    if (m > 1e-8f) {")
+        p("        nx = nx / m; ny = ny / m; nz = nz / m; nw = nw / m;")
+        p("    } else {")
+        p("        nx = 0.f; ny = 0.f; nz = 0.f; nw = 1.f;")
+        p("    }")
+        p("    *qx = nx; *qy = ny; *qz = nz; *qw = nw;")
+        p("    /* Ortho XY basis: R * (lx,ly,0) — X/Y tilt foreshortens. */")
+        p("    *m00 = 1.f - 2.f * (ny * ny + nz * nz);")
+        p("    *m01 = 2.f * (nx * ny - nz * nw);")
+        p("    *m10 = 2.f * (nx * ny + nz * nw);")
+        p("    *m11 = 1.f - 2.f * (nx * nx + nz * nz);")
+        p("}")
+        p("")
+
     # Group methods by class; array comment sits on the group.
     methods_by = {}
     for a in analyses:
@@ -6614,7 +6735,7 @@ def emit_engine(plan, analyses, used_apis):
     p("/* ---- draw list (SpriteRenderer + texture; see engine_draw.h) ---- */")
     p("typedef struct EngineDraw {")
     p("    float x, y, half_w, half_h;")
-    p("    float cos_z, sin_z; /* m_LocalRotation around Z */")
+    p("    float m00, m01, m10, m11; /* local XY → world XY (full quat) */")
     p("    float r, g, b;")
     p("    float a; /* tint alpha (SpriteRenderer 1; Image m_Color.a) */")
     p("    int tex; /* index into engine_texture_*; -1 = none */")
@@ -6691,6 +6812,7 @@ def emit_engine(plan, analyses, used_apis):
         any_sprite = True
         use_mut = cname in mutable_spr
         use_scale = cname in set(plan.get("live_scale_classes") or [])
+        use_rot = cname in set(plan.get("live_rot_classes") or [])
         p("    { /* %s SpriteRenderer */" % idn)
         p("        static const float _spr_r[] = { %s };" % ", ".join(
             "%sf" % repr(float(sp["r"])) for _i, sp in spr_idx))
@@ -6707,10 +6829,19 @@ def emit_engine(plan, analyses, used_apis):
                 "%sf" % repr(float(sp["half_h"])) for _i, sp in spr_idx))
             p("        static const int _spr_tex[] = { %s };" % ", ".join(
                 str(int(sp["tex_id"])) for _i, sp in spr_idx))
-        p("        static const float _spr_cos[] = { %s };" % ", ".join(
-            "%sf" % repr(float(sp.get("cos_z", 1.0))) for _i, sp in spr_idx))
-        p("        static const float _spr_sin[] = { %s };" % ", ".join(
-            "%sf" % repr(float(sp.get("sin_z", 0.0))) for _i, sp in spr_idx))
+        if not use_rot:
+            p("        static const float _spr_m00[] = { %s };" % ", ".join(
+                "%sf" % repr(float(sp.get("m00", sp.get("cos_z", 1.0))))
+                for _i, sp in spr_idx))
+            p("        static const float _spr_m01[] = { %s };" % ", ".join(
+                "%sf" % repr(float(sp.get("m01", -float(sp.get("sin_z", 0.0)))))
+                for _i, sp in spr_idx))
+            p("        static const float _spr_m10[] = { %s };" % ", ".join(
+                "%sf" % repr(float(sp.get("m10", sp.get("sin_z", 0.0))))
+                for _i, sp in spr_idx))
+            p("        static const float _spr_m11[] = { %s };" % ", ".join(
+                "%sf" % repr(float(sp.get("m11", sp.get("cos_z", 1.0))))
+                for _i, sp in spr_idx))
         p("        static const int _spr_layer[] = { %s };" % ", ".join(
             str(int(sp.get("sorting_layer") or 0)) for _i, sp in spr_idx))
         p("        static const int _spr_order[] = { %s };" % ", ".join(
@@ -6821,8 +6952,16 @@ def emit_engine(plan, analyses, used_apis):
             p("            }")
         else:
             _emit_world_draw("            ")
-        p("            out[n].cos_z = _spr_cos[k];")
-        p("            out[n].sin_z = _spr_sin[k];")
+        if use_rot:
+            p("            out[n].m00 = _%s_rot_m00[i];" % idn)
+            p("            out[n].m01 = _%s_rot_m01[i];" % idn)
+            p("            out[n].m10 = _%s_rot_m10[i];" % idn)
+            p("            out[n].m11 = _%s_rot_m11[i];" % idn)
+        else:
+            p("            out[n].m00 = _spr_m00[k];")
+            p("            out[n].m01 = _spr_m01[k];")
+            p("            out[n].m10 = _spr_m10[k];")
+            p("            out[n].m11 = _spr_m11[k];")
         p("            out[n].r = _spr_r[k];")
         p("            out[n].g = _spr_g[k];")
         p("            out[n].b = _spr_b[k];")
@@ -6905,7 +7044,7 @@ def emit_engine_draw_h():
         "\n"
         "typedef struct EngineDraw {\n"
         "    float x, y, half_w, half_h;\n"
-        "    float cos_z, sin_z; /* m_LocalRotation around Z */\n"
+        "    float m00, m01, m10, m11; /* local XY → world XY (full quat) */\n"
         "    float r, g, b;\n"
         "    float a; /* tint alpha */\n"
         "    int tex; /* engine_texture_* index; -1 if none */\n"
@@ -6996,6 +7135,107 @@ def _rewrite_new_vector_assigns(text, idn):
         r"transform\.position\s*\+=\s*new\s+Vector3\s*\((.*?)\)\s*;",
         repl_add, text, flags=flags)
     return text
+
+
+_VECTOR3_AXIS = {
+    "right": (1.0, 0.0, 0.0),
+    "left": (-1.0, 0.0, 0.0),
+    "up": (0.0, 1.0, 0.0),
+    "down": (0.0, -1.0, 0.0),
+    "forward": (0.0, 0.0, 1.0),
+    "back": (0.0, 0.0, -1.0),
+}
+
+
+def _rewrite_transform_rotate(text, cl):
+    """Lower transform.Rotate(...) → _engine_transform_rotate_local on packed quat.
+
+    Supports:
+      transform.Rotate(new Vector3(x, y, z));
+      transform.Rotate(x, y, z);
+      transform.Rotate(Vector3.right * expr);  # and up/forward/left/down/back
+      optional trailing Space.Self / Space.World (World treated as Self for now)
+    Degrees, local composition like Unity Space.Self.
+    """
+    idn = _c_ident(cl["name"])
+    out = []
+    i = 0
+    while i < len(text):
+        m = re.search(
+            r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*Rotate\s*\(",
+            text[i:])
+        if not m:
+            out.append(text[i:])
+            break
+        start = i + m.start()
+        open_paren = i + m.end() - 1
+        parsed = _match_call_args(text, open_paren)
+        if not parsed:
+            out.append(text[i:open_paren + 1])
+            i = open_paren + 1
+            continue
+        args_str, after = parsed
+        # Optional trailing semicolon.
+        j = after
+        while j < len(text) and text[j] in " \t\r\n":
+            j += 1
+        if j < len(text) and text[j] == ";":
+            j += 1
+        out.append(text[i:start])
+        args = _split_call_args(args_str)
+        ex = ey = ez = None
+
+        def _vec_from_arg(a):
+            a = a.strip()
+            nm = re.match(r"new\s+Vector3\s*\((.*)\)$", a, flags=re.S)
+            if nm:
+                vargs = _split_call_args(nm.group(1))
+                if len(vargs) >= 3:
+                    return vargs[0], vargs[1], vargs[2]
+            am = re.match(
+                r"Vector3\.(right|left|up|down|forward|back)\s*\*\s*(.+)$",
+                a, flags=re.S)
+            if am:
+                ax, ay, az = _VECTOR3_AXIS[am.group(1)]
+                expr = am.group(2).strip()
+
+                def _axis_comp(c):
+                    if c == 0.0:
+                        return "0.f"
+                    if c == 1.0:
+                        return "(%s)" % expr
+                    if c == -1.0:
+                        return "-(%s)" % expr
+                    return "(%s) * %sf" % (expr, repr(c))
+
+                return (_axis_comp(ax), _axis_comp(ay), _axis_comp(az))
+            return None
+
+        if len(args) == 3 or (
+                len(args) == 4
+                and re.match(r"Space\.\w+", args[3].strip())):
+            ex, ey, ez = args[0], args[1], args[2]
+        elif len(args) == 1:
+            hit = _vec_from_arg(args[0])
+            if hit:
+                ex, ey, ez = hit
+        elif len(args) == 2 and re.match(r"Space\.\w+", args[1].strip()):
+            hit = _vec_from_arg(args[0])
+            if hit:
+                ex, ey, ez = hit
+        if ex is None:
+            # Unsupported overload — keep source (should be rare).
+            out.append(text[start:j])
+        else:
+            out.append(
+                "_engine_transform_rotate_local("
+                "&_%s_rot_x[i], &_%s_rot_y[i], &_%s_rot_z[i], &_%s_rot_w[i], "
+                "&_%s_rot_m00[i], &_%s_rot_m01[i], &_%s_rot_m10[i], "
+                "&_%s_rot_m11[i], "
+                "(%s), (%s), (%s));"
+                % (idn, idn, idn, idn, idn, idn, idn, idn, ex, ey, ez))
+        i = j
+    return "".join(out)
 
 
 def _skip_c_string(text, i):
@@ -7263,8 +7503,9 @@ def _lower_method_body(body, cl, plan):
     text = re.sub(r"\bthis\.", "", text)
     text = _rewrite_extensions_set_world_scale(text, cl, plan)
     text = _rewrite_rigidbody_assigns(text, plan, cl["name"])
+    text = _rewrite_transform_rotate(text, cl)
     # Find/GetComponent before field rewrites so `.amp` stays on the target type.
-    text = _rewrite_find_getcomponent(text, plan, cl["name"])
+    text = _rewrite_find_getcomponent(text, plan, cl["name"], site=site)
     text, add_locals = _rewrite_addcomponent(text, plan, cl["name"])
     # API tokens before Vector2 rewrites so nested Mathf.Sin(...) keeps parens.
     text = text.replace("Time.deltaTime", "Time_deltaTime")
@@ -7838,6 +8079,53 @@ def emit_data(plan, used_apis=None):
             idn, n, ", ".join("%sf" % repr(v) for v in sxs)))
         p("float _%s_scale_y[%d] = { %s };" % (
             idn, n, ", ".join("%sf" % repr(v) for v in sys)))
+    # Live localRotation for Transform.Rotate targets.
+    for cname in sorted(plan.get("live_rot_classes") or []):
+        cl = plan["classes"].get(cname)
+        if not cl:
+            continue
+        idn = _c_ident(cname)
+        n = max(1, cl["n"])
+        rxs, rys, rzs, rws = [], [], [], []
+        m00s, m01s, m10s, m11s = [], [], [], []
+        for o in cl["instances"]:
+            lr = o.get("local_rot") or o.get("rot") or (0.0, 0.0, 0.0, 1.0)
+            qx, qy, qz, qw = (float(lr[0]), float(lr[1]),
+                              float(lr[2]), float(lr[3]))
+            rxs.append(qx)
+            rys.append(qy)
+            rzs.append(qz)
+            rws.append(qw)
+            m00, m01, m10, m11 = _quat_xy_basis(qx, qy, qz, qw)
+            m00s.append(m00)
+            m01s.append(m01)
+            m10s.append(m10)
+            m11s.append(m11)
+        while len(rxs) < n:
+            rxs.append(0.0)
+            rys.append(0.0)
+            rzs.append(0.0)
+            rws.append(1.0)
+            m00s.append(1.0)
+            m01s.append(0.0)
+            m10s.append(0.0)
+            m11s.append(1.0)
+        p("float _%s_rot_x[%d] = { %s };" % (
+            idn, n, ", ".join("%sf" % repr(v) for v in rxs)))
+        p("float _%s_rot_y[%d] = { %s };" % (
+            idn, n, ", ".join("%sf" % repr(v) for v in rys)))
+        p("float _%s_rot_z[%d] = { %s };" % (
+            idn, n, ", ".join("%sf" % repr(v) for v in rzs)))
+        p("float _%s_rot_w[%d] = { %s };" % (
+            idn, n, ", ".join("%sf" % repr(v) for v in rws)))
+        p("float _%s_rot_m00[%d] = { %s };" % (
+            idn, n, ", ".join("%sf" % repr(v) for v in m00s)))
+        p("float _%s_rot_m01[%d] = { %s };" % (
+            idn, n, ", ".join("%sf" % repr(v) for v in m01s)))
+        p("float _%s_rot_m10[%d] = { %s };" % (
+            idn, n, ", ".join("%sf" % repr(v) for v in m10s)))
+        p("float _%s_rot_m11[%d] = { %s };" % (
+            idn, n, ", ".join("%sf" % repr(v) for v in m11s)))
     # Transform field targets (graphicsTrs → Graphics, etc.).
     for (oc, fname), row in sorted(
             (plan.get("transform_field_targets") or {}).items()):
