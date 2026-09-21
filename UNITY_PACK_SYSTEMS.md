@@ -153,7 +153,16 @@ slot (intensity 1, white) into the light table.
 | `transform.Rotate` (euler / `Vector3.axis * deg`, Space.Self) | Live local quat + `rot_m00..m11` in draws |
 | `transform.LookAt` (Transform / `Vector3`, default up) | Live local quat = LookRotation(to−from); refreshes draw basis |
 | `transform.eulerAngles` (`=` / `+=`, degrees) | Get/set live quat via Unity Euler; refreshes draw basis |
-| `transform.rotation` (`=` `Quaternion.Euler` / `LookRotation` / `identity` / `new`) | Set live quat (unparented ≈ world); refreshes draw basis |
+| `transform.rotation` (`=` `Quaternion.Euler` / `LookRotation` / `Slerp` / `identity` / `new`) | Set live quat (unparented ≈ world); refreshes draw basis |
+| `transform.Find` (child name or `"A/B"` path) | Authored `m_Father` child lookup → GO index or **-1** |
+| `transform.parent` | Authored `m_Father` → parent GO index or **-1** |
+| `transform.SetParent` (Transform / null, optional `worldPositionStays`) | Live `_engine_go_parent` + xf parent; stays=true keeps world T |
+| `transform.gameObject` | Same GO index as this Transform (packed Transform ≡ GameObject) |
+| `transform.worldToLocalMatrix` / `localToWorldMatrix` | Live TRS → `Matrix4x4` (same affine as TransformPoint) |
+| `transform.localScale` | Allowed (CS1061 cleared); live scale tables when SetWorldScale / scale draws / matrices need them |
+| `transform.localPosition` | Live packed pos tables (local under parent); Vector3 field round-trip |
+| `transform.localRotation` | Live local quat (`_Class_rot_*`); set via Quaternion expr like `rotation` |
+| `transform.TransformPoint` | Live local→world: `T + R*(S*p)` using current pos / rot basis / scale |
 | Authored `m_Father` / PrefabInstance `m_TransformParent` | World TRS = parent ∘ local; **live** at draw/collider time |
 
 PNG pixels are packed into `data.c` (`engine_texture_rgba`). Editing the

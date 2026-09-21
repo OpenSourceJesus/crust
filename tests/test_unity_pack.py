@@ -1192,6 +1192,118 @@ class TestSystems(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
         self.assertIn("trs_ok", run.stdout)
 
+    def test_transform_set_parent_live_hierarchy(self):
+        """SetParent updates live parent; worldPositionStays keeps world T."""
+        root = tempfile.mkdtemp(prefix="upack-setp-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Parent.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Parent : MonoBehaviour {\n"
+                "    void Start() {}\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Parent.cs.meta"), "w") as f:
+            f.write("guid: c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3\n")
+        with open(os.path.join(scripts, "Child.cs"), "w") as f:
+            f.write(
+                "using System;\n"
+                "using UnityEngine;\n"
+                "public class Child : MonoBehaviour {\n"
+                "    void Start() {\n"
+                "        Transform p = GameObject.Find(\"Parent\").transform;\n"
+                "        /* world stays: local becomes world - parent */\n"
+                "        transform.SetParent(p, true);\n"
+                "        float lx = transform.localPosition.x;\n"
+                "        float ly = transform.localPosition.y;\n"
+                "        Transform got = transform.parent;\n"
+                "        transform.SetParent(null, false);\n"
+                "        Transform gone = transform.parent;\n"
+                "        if (lx > 4.9f && lx < 5.1f && ly > -0.1f && ly < 0.1f\n"
+                "            && got >= 0 && gone < 0)\n"
+                "            Console.WriteLine(\"setp_ok\");\n"
+                "        else\n"
+                "            Console.WriteLine(\"setp_bad\");\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Child.cs.meta"), "w") as f:
+            f.write("guid: d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Parent\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 5, y: 0, z: 0}\n"
+                "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "  m_Father: {fileID: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3}\n"
+                "--- !u!1 &4\nGameObject:\n  m_Name: Child\n"
+                "  m_Component:\n  - component: {fileID: 5}\n"
+                "  - component: {fileID: 6}\n"
+                "--- !u!4 &5\nTransform:\n"
+                "  m_GameObject: {fileID: 4}\n"
+                "  m_LocalPosition: {x: 10, y: 0, z: 0}\n"
+                "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "  m_Father: {fileID: 0}\n"
+                "--- !u!114 &6\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 4}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-setp-out-")
+        plan = unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("Transform_SetParent", eng)
+        self.assertIn("static int _engine_go_parent", eng)
+        self.assertIn("static int _Child_xf_parent_class", eng)
+        self.assertIn(
+            "Transform_SetParent(_engine_go_of_Child(i)", eng)
+        if not _CC:
+            return
+        host = os.path.join(d, "host.c")
+        with open(host, "w") as f:
+            f.write(
+                "void engine_tick(void);\n"
+                "extern float Time_deltaTime;\n"
+                "int main(void) {\n"
+                "  Time_deltaTime = 0.02f;\n"
+                "  engine_tick();\n"
+                "  return 0;\n"
+                "}\n"
+            )
+        r = subprocess.run(
+            [_CC, "-O2", "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(
+            [_CC, "-O0", "-c", "-o", os.path.join(d, "data.o"),
+             os.path.join(d, "data.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        exe = os.path.join(d, "run")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host,
+             os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+        self.assertIn("setp_ok", run.stdout)
+
     def test_transform_rotation_quaternion_euler_packs(self):
         """transform.rotation = Quaternion.Euler(...) → set_euler on live quat."""
         root = tempfile.mkdtemp(prefix="upack-rotq-")

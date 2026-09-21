@@ -65,7 +65,7 @@ _QUATERNION_SUPPORTED = frozenset({"Euler", "identity", "LookRotation"})
 # (transform itself is always in scope; blame the missing member).
 _TRANSFORM_SUPPORTED = frozenset({
     "position", "Rotate", "LookAt", "eulerAngles", "rotation", "Find",
-    "localScale", "parent", "gameObject", "worldToLocalMatrix", "localToWorldMatrix", "localPosition", "localRotation", "TransformPoint",
+    "localScale", "parent", "gameObject", "SetParent", "worldToLocalMatrix", "localToWorldMatrix", "localPosition", "localRotation", "TransformPoint",
 })
 
 
@@ -6649,6 +6649,38 @@ def emit_engine(plan, analyses, used_apis):
         p("}")
         p("")
 
+    tp_classes = set(plan.get("transform_point_classes") or [])
+    if tp_classes:
+        p("/* Transform.TransformPoint — defined after live TRS / world pos. */")
+        for cname in sorted(tp_classes):
+            if cname not in plan["classes"]:
+                continue
+            idn = _c_ident(cname)
+            p("static float %s_TransformPoint_x(unsigned i,"
+              " float lx, float ly, float lz);" % idn)
+            p("static float %s_TransformPoint_y(unsigned i,"
+              " float lx, float ly, float lz);" % idn)
+            p("static float %s_TransformPoint_z(unsigned i,"
+              " float lx, float ly, float lz);" % idn)
+        p("")
+
+    matrix_classes = set(plan.get("transform_matrix_classes") or [])
+    if matrix_classes:
+        p("/* Transform localToWorld / worldToLocal — after live TRS. */")
+        for cname in sorted(matrix_classes):
+            if cname not in plan["classes"]:
+                continue
+            idn = _c_ident(cname)
+            p("static Matrix4x4 %s_localToWorldMatrix(unsigned i);" % idn)
+            p("static Matrix4x4 %s_worldToLocalMatrix(unsigned i);" % idn)
+        p("")
+
+    if want_set_parent:
+        p("/* Transform.SetParent — defined after live parent tables. */")
+        p("static void Transform_SetParent(int child, int parent,")
+        p("                               int world_stays);")
+        p("")
+
     for cname, cl in sorted(plan["classes"].items()):
         idn = _c_ident(cname)
         p("/* ---- %s group: instance array is defined in data.c ---- */" % idn)
@@ -6903,6 +6935,239 @@ def emit_engine(plan, analyses, used_apis):
         p("    }")
         p("}")
         p("")
+
+        if want_set_parent and want_go_tables:
+            go_n = max(1, len(plan.get("go_names") or []))
+            pos_classes = [
+                (cname, class_ids[cname], _c_ident(cname))
+                for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1])
+                if _class_has_position(plan["classes"][cname])
+            ]
+            p("/* GO → packed (class, inst) for SetParent / world composition. */")
+            p("static int _engine_go_xf(int go, int *oc, unsigned *oi) {")
+            p("    int inst;")
+            p("    if (go < 0 || go >= %d) return 0;" % go_n)
+            for cname, cid, idn in pos_classes:
+                p("    inst = _engine_go_%s[go];" % idn)
+                p("    if (inst >= 0) { *oc = %d; *oi = (unsigned)inst; return 1; }"
+                  % cid)
+            p("    return 0;")
+            p("}")
+            p("static void _engine_set_xf_parent(int child_go, int parent_go) {")
+            p("    int pc = -1;")
+            p("    unsigned pi = 0u;")
+            p("    int inst;")
+            p("    if (parent_go >= 0)")
+            p("        _engine_go_xf(parent_go, &pc, &pi);")
+            for cname, cid, idn in pos_classes:
+                p("    inst = _engine_go_%s[child_go];" % idn)
+                p("    if (inst >= 0) {")
+                p("        _%s_xf_parent_class[inst] = pc;" % idn)
+                p("        _%s_xf_parent_inst[inst] = pi;" % idn)
+                p("    }")
+            p("}")
+            p("static void _engine_set_local_pos_go(int go,")
+            p("    float lx, float ly, float lz) {")
+            p("    int inst;")
+            for cname, cid, idn in pos_classes:
+                cl = plan["classes"][cname]
+                if cl.get("static"):
+                    continue  # f16 pack — no setters
+                p("    inst = _engine_go_%s[go];" % idn)
+                p("    if (inst >= 0) {")
+                p("        %s_set_pos_x((unsigned)inst, lx);" % idn)
+                p("        %s_set_pos_y((unsigned)inst, ly);" % idn)
+                if not cl.get("two_d"):
+                    p("        %s_set_pos_z((unsigned)inst, lz);" % idn)
+                p("    }")
+            p("}")
+            p("/* Transform.SetParent(parent, worldPositionStays=true). */")
+            p("static void Transform_SetParent(int child, int parent,")
+            p("                               int world_stays) {")
+            p("    int guard = 0;")
+            p("    int g;")
+            p("    int cc = -1;")
+            p("    unsigned ci = 0u;")
+            p("    float wx = 0.f, wy = 0.f, wz = 0.f;")
+            p("    float px = 0.f, py = 0.f, pz = 0.f;")
+            p("    if (child < 0 || child >= %d) return;" % go_n)
+            p("    if (parent == child) return;")
+            p("    if (parent >= %d) parent = -1;" % go_n)
+            p("    g = parent;")
+            p("    while (g >= 0 && guard < %d) {" % (go_n + 2))
+            p("        if (g == child) return;")
+            p("        g = _engine_go_parent[g];")
+            p("        guard = guard + 1;")
+            p("    }")
+            p("    if (world_stays && _engine_go_xf(child, &cc, &ci))")
+            p("        _engine_world_pos(cc, ci, &wx, &wy, &wz, 0);")
+            p("    _engine_go_parent[child] = parent;")
+            p("    _engine_set_xf_parent(child, parent);")
+            p("    if (world_stays && _engine_go_xf(child, &cc, &ci)) {")
+            p("        if (parent >= 0) {")
+            p("            int pc = -1;")
+            p("            unsigned pi = 0u;")
+            p("            if (_engine_go_xf(parent, &pc, &pi))")
+            p("                _engine_world_pos(pc, pi, &px, &py, &pz, 0);")
+            p("        }")
+            p("        _engine_set_local_pos_go(child,")
+            p("            wx - px, wy - py, wz - pz);")
+            p("    }")
+            p("}")
+            p("")
+
+    tp_classes = set(plan.get("transform_point_classes") or [])
+    if tp_classes:
+        # Unity Transform.TransformPoint: world = T + R * (S * local).
+        # T is live world position; R/S are this transform's live local basis.
+        # Parent chain translation matches _engine_world_pos (pack TRS subset).
+        p("/* Transform.TransformPoint — live local→world (current TRS). */")
+        p("static void _engine_transform_point(")
+        p("    float wx, float wy, float wz,")
+        p("    float m00, float m01, float m10, float m11,")
+        p("    float sx, float sy,")
+        p("    float lx, float ly, float lz,")
+        p("    float *ox, float *oy, float *oz) {")
+        p("    float px = lx * sx;")
+        p("    float py = ly * sy;")
+        p("    *ox = wx + m00 * px + m01 * py;")
+        p("    *oy = wy + m10 * px + m11 * py;")
+        p("    *oz = wz + lz;")
+        p("}")
+        p("")
+        has_parents = bool(plan.get("has_transform_parents"))
+        for cname in sorted(tp_classes):
+            if cname not in plan["classes"]:
+                continue
+            cl = plan["classes"][cname]
+            idn = _c_ident(cname)
+            cid = class_ids[cname]
+            p("static void %s_TransformPoint(unsigned i," % idn)
+            p("    float lx, float ly, float lz,")
+            p("    float *ox, float *oy, float *oz) {")
+            p("    float wx, wy, wz;")
+            if has_parents and _class_has_position(cl):
+                p("    _engine_world_pos(%d, i, &wx, &wy, &wz, 0);" % cid)
+            elif _class_has_position(cl):
+                p("    wx = %s_get_pos_x(i);" % idn)
+                p("    wy = %s_get_pos_y(i);" % idn)
+                if cl.get("two_d"):
+                    p("    wz = 0.f;")
+                else:
+                    p("    wz = %s_get_pos_z(i);" % idn)
+            else:
+                p("    wx = 0.f; wy = 0.f; wz = 0.f;")
+            p("    _engine_transform_point(")
+            p("        wx, wy, wz,")
+            p("        _%s_rot_m00[i], _%s_rot_m01[i]," % (idn, idn))
+            p("        _%s_rot_m10[i], _%s_rot_m11[i]," % (idn, idn))
+            p("        _%s_scale_x[i], _%s_scale_y[i]," % (idn, idn))
+            p("        lx, ly, lz, ox, oy, oz);")
+            p("}")
+            p("static float %s_TransformPoint_x(unsigned i," % idn)
+            p("    float lx, float ly, float lz) {")
+            p("    float ox, oy, oz;")
+            p("    %s_TransformPoint(i, lx, ly, lz, &ox, &oy, &oz);" % idn)
+            p("    return ox;")
+            p("}")
+            p("static float %s_TransformPoint_y(unsigned i," % idn)
+            p("    float lx, float ly, float lz) {")
+            p("    float ox, oy, oz;")
+            p("    %s_TransformPoint(i, lx, ly, lz, &ox, &oy, &oz);" % idn)
+            p("    return oy;")
+            p("}")
+            p("static float %s_TransformPoint_z(unsigned i," % idn)
+            p("    float lx, float ly, float lz) {")
+            p("    float ox, oy, oz;")
+            p("    %s_TransformPoint(i, lx, ly, lz, &ox, &oy, &oz);" % idn)
+            p("    return oz;")
+            p("}")
+            p("")
+
+    matrix_classes = set(plan.get("transform_matrix_classes") or [])
+    if matrix_classes:
+        # Same affine subset as TransformPoint: T + R_xy * (S * p).
+        p("/* Live localToWorld / worldToLocal from current pos / rot / scale. */")
+        p("static Matrix4x4 _engine_matrix_identity(void) {")
+        p("    Matrix4x4 m;")
+        p("    m.m00 = 1.f; m.m01 = 0.f; m.m02 = 0.f; m.m03 = 0.f;")
+        p("    m.m10 = 0.f; m.m11 = 1.f; m.m12 = 0.f; m.m13 = 0.f;")
+        p("    m.m20 = 0.f; m.m21 = 0.f; m.m22 = 1.f; m.m23 = 0.f;")
+        p("    m.m30 = 0.f; m.m31 = 0.f; m.m32 = 0.f; m.m33 = 1.f;")
+        p("    return m;")
+        p("}")
+        p("static Matrix4x4 _engine_local_to_world_matrix(")
+        p("    float wx, float wy, float wz,")
+        p("    float r00, float r01, float r10, float r11,")
+        p("    float sx, float sy) {")
+        p("    Matrix4x4 m = _engine_matrix_identity();")
+        p("    m.m00 = r00 * sx; m.m01 = r01 * sy; m.m03 = wx;")
+        p("    m.m10 = r10 * sx; m.m11 = r11 * sy; m.m13 = wy;")
+        p("    m.m23 = wz;")
+        p("    return m;")
+        p("}")
+        p("static Matrix4x4 _engine_world_to_local_matrix(")
+        p("    float wx, float wy, float wz,")
+        p("    float r00, float r01, float r10, float r11,")
+        p("    float sx, float sy) {")
+        p("    Matrix4x4 m = _engine_matrix_identity();")
+        p("    float a00 = r00 * sx; float a01 = r01 * sy;")
+        p("    float a10 = r10 * sx; float a11 = r11 * sy;")
+        p("    float det = a00 * a11 - a01 * a10;")
+        p("    float inv00, inv01, inv10, inv11;")
+        p("    if (det > -1e-12f && det < 1e-12f) {")
+        p("        return m;")
+        p("    }")
+        p("    inv00 = a11 / det; inv01 = -a01 / det;")
+        p("    inv10 = -a10 / det; inv11 = a00 / det;")
+        p("    m.m00 = inv00; m.m01 = inv01;")
+        p("    m.m10 = inv10; m.m11 = inv11;")
+        p("    m.m03 = -(inv00 * wx + inv01 * wy);")
+        p("    m.m13 = -(inv10 * wx + inv11 * wy);")
+        p("    m.m23 = -wz;")
+        p("    return m;")
+        p("}")
+        p("")
+        has_parents = bool(plan.get("has_transform_parents"))
+        for cname in sorted(matrix_classes):
+            if cname not in plan["classes"]:
+                continue
+            cl = plan["classes"][cname]
+            idn = _c_ident(cname)
+            cid = class_ids[cname]
+
+            def _emit_world_xyz():
+                if has_parents and _class_has_position(cl):
+                    p("    _engine_world_pos(%d, i, &wx, &wy, &wz, 0);" % cid)
+                elif _class_has_position(cl):
+                    p("    wx = %s_get_pos_x(i);" % idn)
+                    p("    wy = %s_get_pos_y(i);" % idn)
+                    if cl.get("two_d"):
+                        p("    wz = 0.f;")
+                    else:
+                        p("    wz = %s_get_pos_z(i);" % idn)
+                else:
+                    p("    wx = 0.f; wy = 0.f; wz = 0.f;")
+
+            p("static Matrix4x4 %s_localToWorldMatrix(unsigned i) {" % idn)
+            p("    float wx, wy, wz;")
+            _emit_world_xyz()
+            p("    return _engine_local_to_world_matrix(")
+            p("        wx, wy, wz,")
+            p("        _%s_rot_m00[i], _%s_rot_m01[i]," % (idn, idn))
+            p("        _%s_rot_m10[i], _%s_rot_m11[i]," % (idn, idn))
+            p("        _%s_scale_x[i], _%s_scale_y[i]);" % (idn, idn))
+            p("}")
+            p("static Matrix4x4 %s_worldToLocalMatrix(unsigned i) {" % idn)
+            p("    float wx, wy, wz;")
+            _emit_world_xyz()
+            p("    return _engine_world_to_local_matrix(")
+            p("        wx, wy, wz,")
+            p("        _%s_rot_m00[i], _%s_rot_m01[i]," % (idn, idn))
+            p("        _%s_rot_m10[i], _%s_rot_m11[i]," % (idn, idn))
+            p("        _%s_scale_x[i], _%s_scale_y[i]);" % (idn, idn))
+            p("}")
+            p("")
 
     if plan.get("camera_follows_parent"):
         cam = plan["camera"]
@@ -8186,6 +8451,256 @@ def _parse_vector3_expr(a):
     return None
 
 
+def _rewrite_transform_parent(text, cl, plan):
+    """Lower transform.parent → Transform_get_parent(this_go)."""
+    if not plan.get("go_names"):
+        return text
+    idn = _c_ident(cl["name"])
+    go_expr = "_engine_go_of_%s(i)" % idn
+    return re.sub(
+        r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*parent\b",
+        "Transform_get_parent(%s)" % go_expr,
+        text)
+
+
+def _setparent_go_expr(recv, cl):
+    """Receiver of SetParent → child GO C expr (Transform ≡ GO index)."""
+    idn = _c_ident(cl["name"])
+    this_go = "_engine_go_of_%s(i)" % idn
+    if not recv:
+        return this_go
+    recv = recv.strip()
+    if recv in ("transform", "this"):
+        return this_go
+    for name, _ty, _bits, kind in cl.get("members") or []:
+        if name != recv:
+            continue
+        if str(kind).startswith("idx:"):
+            oty = kind.split(":", 1)[1]
+            return "_engine_go_of_%s(%s)" % (_c_ident(oty), recv)
+        break
+    for f in cl.get("fields") or []:
+        if f.get("name") != recv:
+            continue
+        ty = f.get("ty") or ""
+        if ty in ("Transform", "GameObject"):
+            return recv
+        if ty and ty[0].isupper() and ty not in (
+                "Vector2", "Vector3", "Quaternion", "string", "Color"):
+            return "_engine_go_of_%s(%s)" % (_c_ident(ty), recv)
+        break
+    return recv
+
+
+def _setparent_parent_expr(arg, cl):
+    """SetParent first arg → parent GO C expr (-1 = null)."""
+    a = arg.strip()
+    if a == "null":
+        return "-1"
+    if re.match(r"(?:this\s*\.\s*)?transform\s*$", a):
+        return "_engine_go_of_%s(i)" % _c_ident(cl["name"])
+    # X.transform → GO of X
+    m = re.match(r"(.+?)\s*\.\s*transform\s*$", a)
+    if m:
+        return _setparent_go_expr(m.group(1).strip(), cl)
+    # Already Transform_get_parent(...) / GO index / field
+    return a
+
+
+def _rewrite_transform_set_parent(text, cl, plan):
+    """Lower Transform.SetParent(parent[, worldStays]) → Transform_SetParent.
+
+    Supports:
+      transform.SetParent(null);
+      transform.SetParent(null, false);
+      transform.SetParent(other.transform, false);
+      trs.SetParent(parent);
+      cosmetic.transform.SetParent(graphicsTrs);
+    Default worldPositionStays = true (Unity).
+    """
+    if not plan.get("go_names"):
+        return text
+    out = []
+    i = 0
+    # recv.transform.SetParent | (this.)transform.SetParent | recv.SetParent
+    pat = re.compile(
+        r"(?:(?<![.\w])(?P<tr>\w+)\s*\.\s*transform\s*\.\s*"
+        r"|(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*"
+        r"|(?<![.\w])(?P<trecv>\w+)\s*\.\s*)"
+        r"SetParent\s*\(")
+    while i < len(text):
+        m = pat.search(text, i)
+        if not m:
+            out.append(text[i:])
+            break
+        # Bare Ident.SetParent only when Ident is a Transform/GameObject field.
+        if m.group("trecv") and not m.group("tr"):
+            trecv = m.group("trecv")
+            is_trs = False
+            for f in cl.get("fields") or []:
+                if f.get("name") == trecv and f.get("ty") in (
+                        "Transform", "GameObject"):
+                    is_trs = True
+                    break
+            if not is_trs:
+                out.append(text[i:m.end()])
+                i = m.end()
+                continue
+        open_paren = m.end() - 1
+        parsed = _match_call_args(text, open_paren)
+        if not parsed:
+            out.append(text[i:open_paren + 1])
+            i = open_paren + 1
+            continue
+        args_str, after = parsed
+        args = _split_call_args(args_str)
+        out.append(text[i:m.start()])
+        if not args:
+            out.append(text[m.start():after])
+            i = after
+            continue
+        recv = m.group("tr") or m.group("trecv")
+        child = _setparent_go_expr(recv, cl)
+        parent = _setparent_parent_expr(args[0], cl)
+        stays = "1"
+        if len(args) >= 2:
+            a1 = args[1].strip()
+            if a1 in ("false", "False", "0"):
+                stays = "0"
+            elif a1 in ("true", "True", "1"):
+                stays = "1"
+            else:
+                stays = "(%s) ? 1 : 0" % a1
+        out.append("Transform_SetParent(%s, %s, %s)" % (child, parent, stays))
+        i = after
+    return "".join(out)
+
+
+def _rewrite_transform_game_object(text, cl, plan):
+    """Lower transform.gameObject → this GO index (Transform ≡ GameObject)."""
+    if not plan.get("go_names"):
+        return text
+    idn = _c_ident(cl["name"])
+    go_expr = "_engine_go_of_%s(i)" % idn
+    return re.sub(
+        r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*gameObject\b",
+        go_expr,
+        text)
+
+
+def _parse_transform_point_args(args_str, cl):
+    """TransformPoint args → (lx, ly, lz) C exprs, or None."""
+    args = _split_call_args(args_str)
+    if len(args) == 3:
+        return args[0], args[1], args[2]
+    if len(args) != 1:
+        return None
+    a = args[0].strip()
+    hit = _parse_vector3_expr(a)
+    if hit:
+        return hit
+    # Field / property → packed _x/_y/_z (Offset → offset).
+    name = a
+    members = {n for n, _t, _b, _k in cl.get("members") or []}
+    for cand in (name, name[:1].lower() + name[1:] if name else name):
+        if not cand:
+            continue
+        if (cand + "_x") in members or cand in (cl.get("vec3_fields") or []):
+            return (cand + "_x", cand + "_y",
+                    cand + "_z" if (cand + "_z") in members else "0.f")
+    return None
+
+
+def _rewrite_transform_point(text, cl, plan):
+    """Lower transform.TransformPoint → live local→world using current TRS.
+
+    Supports:
+      transform.TransformPoint(x, y, z).x/.y/.z
+      transform.TransformPoint(new Vector3(...)).axis
+      transform.TransformPoint(Offset).axis  # Vector3 field / property
+    """
+    if cl["name"] not in set(plan.get("transform_point_classes") or []):
+        return text
+    idn = _c_ident(cl["name"])
+    out = []
+    i = 0
+    while i < len(text):
+        m = re.search(
+            r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*TransformPoint\s*\(",
+            text[i:])
+        if not m:
+            out.append(text[i:])
+            break
+        start = i + m.start()
+        open_paren = i + m.end() - 1
+        parsed = _match_call_args(text, open_paren)
+        if not parsed:
+            out.append(text[i:open_paren + 1])
+            i = open_paren + 1
+            continue
+        args_str, after = parsed
+        comps = _parse_transform_point_args(args_str, cl)
+        axis = None
+        j = after
+        am = re.match(r"\s*\.\s*([xyz])\b", text[j:])
+        if am:
+            axis = am.group(1)
+            j = j + am.end()
+        out.append(text[i:start])
+        if comps is None:
+            out.append(text[start:j])
+        elif axis:
+            lx, ly, lz = comps
+            # After field rewrite, bare offset_x becomes Class_get_offset_x(i).
+            # Emit getters when members exist so order is safe either way.
+            def _comp(expr):
+                mem = {n for n, _t, _b, _k in cl.get("members") or []}
+                if expr in mem:
+                    return "%s_get_%s(i)" % (idn, expr)
+                return "(%s)" % expr
+            out.append(
+                "%s_TransformPoint_%s(i, %s, %s, %s)"
+                % (idn, axis, _comp(lx), _comp(ly), _comp(lz)))
+        else:
+            # Bare Vector3 result — leave call for assign expand (rare).
+            out.append(text[start:j])
+        i = j
+    return "".join(out)
+
+
+def _rewrite_transform_find(text, cl, plan):
+    """Lower transform.Find(path) → Transform_Find(this_go, path).
+
+    Unity: direct child name or nested path with '/'; missing → null (-1).
+    Requires authored go_names / go_parents tables.
+    """
+    if not plan.get("go_names"):
+        return text
+    idn = _c_ident(cl["name"])
+    go_expr = "_engine_go_of_%s(i)" % idn
+    out = []
+    i = 0
+    while i < len(text):
+        m = re.search(
+            r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*Find\s*\(",
+            text[i:])
+        if not m:
+            out.append(text[i:])
+            break
+        start = i + m.start()
+        open_paren = i + m.end() - 1
+        parsed = _match_call_args(text, open_paren)
+        if not parsed:
+            out.append(text[i:open_paren + 1])
+            i = open_paren + 1
+            continue
+        args_str, after = parsed
+        out.append(text[i:start])
+        out.append("Transform_Find(%s, %s)" % (go_expr, args_str.strip()))
+        i = after
+    return "".join(out)
+
+
 def _rewrite_transform_rotate(text, cl):
     """Lower transform.Rotate(...) → _engine_transform_rotate_local on packed quat.
 
@@ -8810,6 +9325,27 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = _rewrite_transform_look_at(text, cl)
     text = _rewrite_transform_euler_angles(text, cl)
     text = _rewrite_transform_rotation(text, cl)
+    text = _rewrite_local_rotation_reads(text, cl, plan)
+    text = _rewrite_transform_parent(text, cl, plan)
+    text = _rewrite_transform_set_parent(text, cl, plan)
+    text = _rewrite_transform_game_object(text, cl, plan)
+    text = _rewrite_transform_point(text, cl, plan)
+    text = _rewrite_transform_matrices(text, cl, plan)
+    text = _rewrite_transform_find(text, cl, plan)
+    text = _rewrite_local_position_vec3_fields(text, cl)
+    # GameObject ≡ Transform index: drop redundant .transform on Find / GO.
+    if plan.get("go_names"):
+        text = re.sub(
+            r"((?:GameObject\s*\.\s*Find|GameObject_Find)\s*\(\s*[^)]*\s*\))"
+            r"\s*\.\s*transform\b",
+            r"\1", text)
+    # Unity Object null checks → packed index sentinel (-1).
+    if plan.get("go_names"):
+        text = re.sub(r"==\s*null\b", "== -1", text)
+        text = re.sub(r"!=\s*null\b", "!= -1", text)
+        # Transform / GameObject locals are GO indices.
+        text = re.sub(r"\bTransform\b(?=\s+\w)", "int", text)
+        text = re.sub(r"\bGameObject\b(?=\s+\w)", "int", text)
     # Find/GetComponent before field rewrites so `.amp` stays on the target type.
     text = _rewrite_find_getcomponent(text, plan, cl["name"], site=site)
     text, add_locals = _rewrite_addcomponent(text, plan, cl["name"])
