@@ -1396,6 +1396,95 @@ class TestSystems(unittest.TestCase):
         run = subprocess.run([exe], capture_output=True, text=True)
         self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
 
+    def test_quaternion_slerp_packs(self):
+        """transform.rotation = Quaternion.Slerp(a, b, t) → live quat slerp."""
+        root = tempfile.mkdtemp(prefix="upack-slerp-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Ball.cs"), "w") as f:
+            f.write(
+                "using System;\n"
+                "using UnityEngine;\n"
+                "public class Ball : MonoBehaviour {\n"
+                "    void Start() {\n"
+                "        transform.rotation = Quaternion.Euler("
+                "Vector3.forward * 90f);\n"
+                "        transform.rotation = Quaternion.Slerp("
+                "transform.rotation, Quaternion.identity, 1f);\n"
+                "        float z = transform.localRotation.z;\n"
+                "        float w = transform.localRotation.w;\n"
+                "        if (z > -0.1f && z < 0.1f && w > 0.9f)\n"
+                "            Console.WriteLine(\"slerp_ok\");\n"
+                "        else\n"
+                "            Console.WriteLine(\"slerp_bad\");\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Ball.cs.meta"), "w") as f:
+            f.write("guid: e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Ball\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-slerp-out-")
+        plan = unity_pack.pack(root, d)
+        self.assertIn("Ball", plan.get("live_rot_classes") or [])
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("_engine_quat_slerp", eng)
+        self.assertIn("_engine_transform_set_quat", eng)
+        # Call site lowered; helper comment may still mention Quaternion.Slerp.
+        start = eng.split("static void Ball_Start", 1)[1].split(
+            "static int _Ball_started", 1)[0]
+        self.assertNotIn("Quaternion.Slerp(", start)
+        self.assertIn("_engine_quat_slerp(", start)
+        if not _CC:
+            return
+        host = os.path.join(d, "host.c")
+        with open(host, "w") as f:
+            f.write(
+                "void engine_tick(void);\n"
+                "extern float Time_deltaTime;\n"
+                "int main(void) {\n"
+                "  Time_deltaTime = 0.02f;\n"
+                "  engine_tick();\n"
+                "  return 0;\n"
+                "}\n"
+            )
+        r = subprocess.run(
+            [_CC, "-O2", "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(
+            [_CC, "-O0", "-c", "-o", os.path.join(d, "data.o"),
+             os.path.join(d, "data.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        exe = os.path.join(d, "run")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host,
+             os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+        self.assertIn("slerp_ok", run.stdout)
+
     def test_transform_rotation_lookrotation_packs(self):
         """transform.rotation = Quaternion.LookRotation → look_rotation helper."""
         root = tempfile.mkdtemp(prefix="upack-lookrot-")

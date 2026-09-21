@@ -59,13 +59,16 @@ _APPLICATION_SUPPORTED = frozenset({
 })
 
 # UnityEngine.Quaternion members we emit. Others → CS0117 (in scope via UnityEngine).
-_QUATERNION_SUPPORTED = frozenset({"Euler", "identity", "LookRotation"})
+_QUATERNION_SUPPORTED = frozenset({"Euler", "identity", "LookRotation", "Slerp"})
 
 # MonoBehaviour.transform members we lower. Others → CS1061 on Transform
 # (transform itself is always in scope; blame the missing member).
 _TRANSFORM_SUPPORTED = frozenset({
     "position", "Rotate", "LookAt", "eulerAngles", "rotation", "Find",
-    "localScale", "parent", "gameObject", "SetParent", "worldToLocalMatrix", "localToWorldMatrix", "localPosition", "localRotation", "TransformPoint",
+    "localScale", "parent", "gameObject", "SetParent",
+    "worldToLocalMatrix", "localToWorldMatrix",
+    "localPosition", "localRotation",
+    "TransformPoint",
 })
 
 
@@ -6617,6 +6620,54 @@ def emit_engine(plan, analyses, used_apis):
         p("    *m11 = 1.f - 2.f * (nx * nx + nz * nz);")
         p("}")
         p("")
+        p("/* Quaternion.Slerp(a, b, t) — shortest-path spherical lerp. */")
+        p("static void _engine_quat_slerp(")
+        p("    float ax, float ay, float az, float aw,")
+        p("    float bx, float by, float bz, float bw,")
+        p("    float t,")
+        p("    float *ox, float *oy, float *oz, float *ow) {")
+        p("    float dot = ax * bx + ay * by + az * bz + aw * bw;")
+        p("    float theta, st, wa, wb, nx, ny, nz, nw, m;")
+        p("    if (t <= 0.f) {")
+        p("        *ox = ax; *oy = ay; *oz = az; *ow = aw;")
+        p("        return;")
+        p("    }")
+        p("    if (t >= 1.f) {")
+        p("        *ox = bx; *oy = by; *oz = bz; *ow = bw;")
+        p("        return;")
+        p("    }")
+        p("    if (dot < 0.f) {")
+        p("        bx = -bx; by = -by; bz = -bz; bw = -bw;")
+        p("        dot = -dot;")
+        p("    }")
+        p("    if (dot > 0.9995f) {")
+        p("        nx = ax + t * (bx - ax);")
+        p("        ny = ay + t * (by - ay);")
+        p("        nz = az + t * (bz - az);")
+        p("        nw = aw + t * (bw - aw);")
+        p("    } else {")
+        p("        if (dot > 1.f) dot = 1.f;")
+        p("        theta = acosf(dot);")
+        p("        st = sinf(theta);")
+        p("        if (st < 1e-8f) {")
+        p("            *ox = ax; *oy = ay; *oz = az; *ow = aw;")
+        p("            return;")
+        p("        }")
+        p("        wa = sinf((1.f - t) * theta) / st;")
+        p("        wb = sinf(t * theta) / st;")
+        p("        nx = wa * ax + wb * bx;")
+        p("        ny = wa * ay + wb * by;")
+        p("        nz = wa * az + wb * bz;")
+        p("        nw = wa * aw + wb * bw;")
+        p("    }")
+        p("    m = sqrtf(nx * nx + ny * ny + nz * nz + nw * nw);")
+        p("    if (m > 1e-8f) {")
+        p("        *ox = nx / m; *oy = ny / m; *oz = nz / m; *ow = nw / m;")
+        p("    } else {")
+        p("        *ox = 0.f; *oy = 0.f; *oz = 0.f; *ow = 1.f;")
+        p("    }")
+        p("}")
+        p("")
 
     # Group methods by class; array comment sits on the group.
     methods_by = {}
@@ -8921,12 +8972,38 @@ def _rewrite_transform_euler_angles(text, cl):
     return "".join(out)
 
 
-def _parse_quaternion_expr(rhs):
-    """Parse Quaternion.Euler / LookRotation / identity / new → kind + args."""
+def _parse_quat_components(a, cl):
+    """Quaternion value expr → (qx, qy, qz, qw) C exprs, or None."""
+    a = a.strip()
+    if re.match(r"(?:UnityEngine\.)?Quaternion\.identity\s*$", a):
+        return ("0.f", "0.f", "0.f", "1.f")
+    if re.match(
+            r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*"
+            r"(?:rotation|localRotation)\s*$", a):
+        idn = _c_ident(cl["name"])
+        return ("_%s_rot_x[i]" % idn, "_%s_rot_y[i]" % idn,
+                "_%s_rot_z[i]" % idn, "_%s_rot_w[i]" % idn)
+    nm = re.match(r"new\s+Quaternion\s*\((.*)\)$", a, flags=re.S)
+    if nm:
+        args = _split_call_args(nm.group(1))
+        if len(args) >= 4:
+            return (args[0], args[1], args[2], args[3])
+    # Nested Euler / LookRotation / identity via existing parser (non-slerp).
+    if re.match(r"(?:UnityEngine\.)?Quaternion\.Slerp\s*\(", a):
+        return None
+    parsed = _parse_quaternion_expr(a, cl)
+    if parsed and parsed[0] == "quat":
+        return parsed[1]
+    return None
+
+
+def _parse_quaternion_expr(rhs, cl=None):
+    """Parse Quaternion.Euler / LookRotation / Slerp / identity / new."""
     rhs = rhs.strip()
-    if re.match(r"Quaternion\.identity\s*$", rhs):
+    if re.match(r"(?:UnityEngine\.)?Quaternion\.identity\s*$", rhs):
         return ("quat", ("0.f", "0.f", "0.f", "1.f"))
-    em = re.match(r"Quaternion\.Euler\s*\((.*)\)$", rhs, flags=re.S)
+    em = re.match(r"(?:UnityEngine\.)?Quaternion\.Euler\s*\((.*)\)$",
+                  rhs, flags=re.S)
     if em:
         args = _split_call_args(em.group(1))
         if len(args) == 3:
@@ -8950,6 +9027,18 @@ def _parse_quaternion_expr(rhs):
             if fwd and up:
                 return ("look", (fwd, up))
         return None
+    sm = re.match(r"(?:UnityEngine\.)?Quaternion\.Slerp\s*\((.*)\)$",
+                  rhs, flags=re.S)
+    if sm:
+        if cl is None:
+            return None
+        args = _split_call_args(sm.group(1))
+        if len(args) == 3:
+            a = _parse_quat_components(args[0], cl)
+            b = _parse_quat_components(args[1], cl)
+            if a and b:
+                return ("slerp", (a, b, args[2]))
+        return None
     nm = re.match(r"new\s+Quaternion\s*\((.*)\)$", rhs, flags=re.S)
     if nm:
         args = _split_call_args(nm.group(1))
@@ -8959,14 +9048,16 @@ def _parse_quaternion_expr(rhs):
 
 
 def _rewrite_transform_rotation(text, cl):
-    """Lower transform.rotation = Quaternion… → set_euler / set_quat / look.
+    """Lower transform.rotation|localRotation = Quaternion… → live quat.
 
     Supports:
       transform.rotation = Quaternion.Euler(x, y, z);
       transform.rotation = Quaternion.Euler(Vector3.forward * deg);
       transform.rotation = Quaternion.LookRotation(forward[, up]);
+      transform.rotation = Quaternion.Slerp(a, b, t);
       transform.rotation = Quaternion.identity;
       transform.rotation = new Quaternion(x, y, z, w);
+      transform.localRotation = … (same forms);
     Unparented bodies: world rotation ≈ local (packed live quat).
     """
     idn = _c_ident(cl["name"])
@@ -9019,6 +9110,15 @@ def _rewrite_transform_rotation(text, cl):
                 "_engine_quat_look_rotation(%s, (%s), (%s), (%s), "
                 "(%s), (%s), (%s));"
                 % (rot_args, fx, fy, fz, ux, uy, uz))
+        elif parsed[0] == "slerp":
+            (ax, ay, az, aw), (bx, by, bz, bw), t = parsed[1]
+            out.append(
+                "{ float _sqx, _sqy, _sqz, _sqw; "
+                "_engine_quat_slerp((%s), (%s), (%s), (%s), "
+                "(%s), (%s), (%s), (%s), (%s), "
+                "&_sqx, &_sqy, &_sqz, &_sqw); "
+                "_engine_transform_set_quat(%s, _sqx, _sqy, _sqz, _sqw); }"
+                % (ax, ay, az, aw, bx, by, bz, bw, t, rot_args))
         else:
             qx, qy, qz, qw = parsed[1]
             out.append(
