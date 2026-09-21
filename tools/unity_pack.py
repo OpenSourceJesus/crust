@@ -3165,6 +3165,43 @@ def _rewrite_addcomponent(text, plan, this_class):
     return text, locals_ty
 
 
+def _wrap_log_collision2d_tostring(text, param):
+    """Console/Debug of a Collision2D param → Collision2D_ToString(handle)."""
+    if not param:
+        return text
+    out = []
+    i = 0
+    while True:
+        m = re.search(r"(?:Console_WriteLine|Debug_Log)\s*\(", text[i:])
+        if not m:
+            out.append(text[i:])
+            break
+        out.append(text[i:i + m.start()])
+        call = m.group(0)
+        callee = re.match(r"(Console_WriteLine|Debug_Log)", call).group(1)
+        start = i + m.end()
+        depth = 1
+        j = start
+        while j < len(text) and depth:
+            c = text[j]
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        if depth != 0:
+            out.append(text[i + m.start():])
+            break
+        args = text[start:j].strip()
+        if args == param:
+            args = "Collision2D_ToString(%s)" % param
+        out.append("%s(%s)" % (callee, args))
+        i = j + 1
+    return "".join(out)
+
+
 def _wrap_log_component_tostring(text, locals_ty):
     """Console/Debug of an AddComponent local → Type_ToString(index)."""
     if not locals_ty:
@@ -3204,6 +3241,23 @@ def _wrap_log_component_tostring(text, locals_ty):
 
 
 _PHYSICS_COMPONENTS = frozenset(("Rigidbody2D", "Rigidbody"))
+
+# MonoBehaviour 2D collision messages (Unity Physics2D).
+_COLLISION2D_MSGS = (
+    "OnCollisionEnter2D",
+    "OnCollisionStay2D",
+    "OnCollisionExit2D",
+)
+
+
+def _collision2d_arg_name(args):
+    """Param name from `OnCollisionEnter2D(Collision2D coll)`, or None."""
+    if not args:
+        return None
+    m = re.match(
+        r"(?:UnityEngine\.)?Collision2D\s+(\w+)\s*$",
+        args.strip())
+    return m.group(1) if m else None
 
 
 def _build_rigidbody_tables(plan):
@@ -6250,6 +6304,29 @@ def emit_engine(plan, analyses, used_apis):
                 [(c, m) for m in c["methods"]
                  if m["name"] not in ("Start",) or True])
 
+    # MonoBehaviour OnCollision*2D(Collision2D) → dispatch after collide2d.
+    collision2d_handlers = {}
+    for cname, pairs in methods_by.items():
+        msgs = {}
+        for _c, m in pairs:
+            if m["name"] not in _COLLISION2D_MSGS:
+                continue
+            arg = _collision2d_arg_name(m.get("args") or "")
+            if not arg:
+                continue
+            msgs[m["name"]] = arg
+        if msgs:
+            collision2d_handlers[cname] = msgs
+    want_collision2d_msgs = bool(collision2d_handlers) and want_col2d
+
+    if want_collision2d_msgs:
+        p("/* Collision2D.ToString — Unity object type name. */")
+        p("static const char *Collision2D_ToString(int coll) {")
+        p("    (void)coll;")
+        p("    return \"UnityEngine.Collision2D\";")
+        p("}")
+        p("")
+
     for cname, cl in sorted(plan["classes"].items()):
         idn = _c_ident(cname)
         p("/* ---- %s group: instance array is defined in data.c ---- */" % idn)
@@ -6318,6 +6395,11 @@ def emit_engine(plan, analyses, used_apis):
             # TypeInitializer failed — do not lower or run script methods.
             if cl.get("ctor_forbidden"):
                 continue
+            coll_param = None
+            if m["name"] in _COLLISION2D_MSGS:
+                coll_param = _collision2d_arg_name(m.get("args") or "")
+                if not coll_param:
+                    continue
             site = {
                 "class": cname,
                 "method": m["name"],
@@ -6325,8 +6407,14 @@ def emit_engine(plan, analyses, used_apis):
                 "body_abs": int(m.get("body_abs") or 0),
                 "file_text": c.get("file_text") or "",
             }
-            body = _lower_method_body(m["body"], cl, plan, site=site)
-            p("static void %s_%s(unsigned i) {" % (idn, m["name"]))
+            body = _lower_method_body(
+                m["body"], cl, plan, site=site,
+                collision2d_param=coll_param)
+            if coll_param:
+                p("static void %s_%s(unsigned i, int %s) {"
+                  % (idn, m["name"], coll_param))
+            else:
+                p("static void %s_%s(unsigned i) {" % (idn, m["name"]))
             for line in body.split("\n"):
                 if line.strip():
                     p("    " + line.rstrip())
@@ -6593,8 +6681,105 @@ def emit_engine(plan, analyses, used_apis):
         p("    }")
         p("}")
         p("")
+        if want_collision2d_msgs:
+            nc = max(1, len(col2d_list))
+            max_pairs = max(1, nc * (nc - 1) // 2)
+            p("/* MonoBehaviour OnCollisionEnter/Stay/Exit2D after contacts */")
+            p("static int _col2d_contact_a[%d];" % max_pairs)
+            p("static int _col2d_contact_b[%d];" % max_pairs)
+            p("static int _col2d_contact_n;")
+            p("static int _col2d_prev_a[%d];" % max_pairs)
+            p("static int _col2d_prev_b[%d];" % max_pairs)
+            p("static int _col2d_prev_n;")
+            p("")
+            p("static void _col2d_add_contact(int a, int b) {")
+            p("    int lo, hi, i;")
+            p("    lo = (a < b) ? a : b;")
+            p("    hi = (a < b) ? b : a;")
+            p("    for (i = 0; i < _col2d_contact_n; i = i + 1)")
+            p("        if (_col2d_contact_a[i] == lo && _col2d_contact_b[i] == hi)")
+            p("            return;")
+            p("    if (_col2d_contact_n >= %d) return;" % max_pairs)
+            p("    _col2d_contact_a[_col2d_contact_n] = lo;")
+            p("    _col2d_contact_b[_col2d_contact_n] = hi;")
+            p("    _col2d_contact_n = _col2d_contact_n + 1;")
+            p("}")
+            p("")
+            p("static int _col2d_pair_in(int lo, int hi,")
+            p("    const int *pa, const int *pb, int n) {")
+            p("    int i;")
+            p("    for (i = 0; i < n; i = i + 1)")
+            p("        if (pa[i] == lo && pb[i] == hi) return 1;")
+            p("    return 0;")
+            p("}")
+            p("")
+            p("static void _col2d_send_msg(int ci_self, int ci_other, int kind) {")
+            p("    /* kind: 0 Enter, 1 Stay, 2 Exit */")
+            p("    int oc = _Collider2D_owner_class[ci_self];")
+            p("    unsigned oi = (unsigned)_Collider2D_owner_inst[ci_self];")
+            p("    switch (oc) {")
+            for cname in sorted(collision2d_handlers.keys()):
+                cid = class_ids.get(cname)
+                if cid is None:
+                    continue
+                idn = _c_ident(cname)
+                msgs = collision2d_handlers[cname]
+                p("    case %d:" % cid)
+                for kind_i, msg in enumerate(
+                        ("OnCollisionEnter2D",
+                         "OnCollisionStay2D",
+                         "OnCollisionExit2D")):
+                    if msg not in msgs:
+                        continue
+                    p("        if (kind == %d) {" % kind_i)
+                    if want_go_tables:
+                        p("            _engine_in_script = 1;")
+                        p("            if (setjmp(_engine_script_jmp) == 0)")
+                        p("                %s_%s(oi, ci_other);"
+                          % (idn, msg))
+                        p("            _engine_in_script = 0;")
+                    else:
+                        p("            %s_%s(oi, ci_other);" % (idn, msg))
+                    p("        }")
+                p("        break;")
+            p("    default: break;")
+            p("    }")
+            p("}")
+            p("")
+            p("static void engine_physics_collide2d_messages(void) {")
+            p("    int i, lo, hi;")
+            p("    for (i = 0; i < _col2d_contact_n; i = i + 1) {")
+            p("        lo = _col2d_contact_a[i];")
+            p("        hi = _col2d_contact_b[i];")
+            p("        if (_col2d_pair_in(lo, hi, _col2d_prev_a, _col2d_prev_b,")
+            p("                           _col2d_prev_n)) {")
+            p("            _col2d_send_msg(lo, hi, 1);")
+            p("            _col2d_send_msg(hi, lo, 1);")
+            p("        } else {")
+            p("            _col2d_send_msg(lo, hi, 0);")
+            p("            _col2d_send_msg(hi, lo, 0);")
+            p("        }")
+            p("    }")
+            p("    for (i = 0; i < _col2d_prev_n; i = i + 1) {")
+            p("        lo = _col2d_prev_a[i];")
+            p("        hi = _col2d_prev_b[i];")
+            p("        if (!_col2d_pair_in(lo, hi, _col2d_contact_a,")
+            p("                            _col2d_contact_b, _col2d_contact_n)) {")
+            p("            _col2d_send_msg(lo, hi, 2);")
+            p("            _col2d_send_msg(hi, lo, 2);")
+            p("        }")
+            p("    }")
+            p("    _col2d_prev_n = _col2d_contact_n;")
+            p("    for (i = 0; i < _col2d_contact_n; i = i + 1) {")
+            p("        _col2d_prev_a[i] = _col2d_contact_a[i];")
+            p("        _col2d_prev_b[i] = _col2d_contact_b[i];")
+            p("    }")
+            p("}")
+            p("")
         p("static void engine_physics_collide2d(void) {")
         p("    int a, b;")
+        if want_collision2d_msgs:
+            p("    _col2d_contact_n = 0;")
         p("    for (a = 0; a < _Collider2D_count; a = a + 1) {")
         p("        float ax, ay, bx, by, dx, dy, px, py, ahw, ahh, bhw, bhh;")
         p("        float c, s, sep, tx, ty, nx, ny, vx, vy, vn, vtx, vty, fr, bn, sc;")
@@ -6626,6 +6811,8 @@ def emit_engine(plan, analyses, used_apis):
         p("            px = (ahw + bhw) - (dx < 0.f ? -dx : dx);")
         p("            py = (ahh + bhh) - (dy < 0.f ? -dy : dy);")
         p("            if (px <= 0.f || py <= 0.f) continue;")
+        if want_collision2d_msgs:
+            p("            _col2d_add_contact(a, b);")
         p("            _col2d_get_pos(a, &tx, &ty);")
         p("            if (px < py) {")
         p("                sep = (dx < 0.f) ? -px : px;")
@@ -6659,6 +6846,8 @@ def emit_engine(plan, analyses, used_apis):
         p("            _col2d_center(a, &ax, &ay);")
         p("        }")
         p("    }")
+        if want_collision2d_msgs:
+            p("    engine_physics_collide2d_messages();")
         p("}")
         p("")
 
@@ -8122,7 +8311,7 @@ def _rewrite_csharp_float_literals(text):
     return "".join(out)
 
 
-def _lower_method_body(body, cl, plan, site=None):
+def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     """C# subset method → C against packed arrays.
 
     `this` / implicit fields become `_Class_inst_array[i].field`.
@@ -8216,6 +8405,7 @@ def _lower_method_body(body, cl, plan, site=None):
     # Unity Object.ToString when printing a Find result (name, not index).
     text = _wrap_log_gameobject_tostring(text)
     text = _wrap_log_component_tostring(text, add_locals)
+    text = _wrap_log_collision2d_tostring(text, collision2d_param)
     text = re.sub(r"Mathf\.(Abs|Min|Max|Clamp|Lerp|Sin|Cos|Sign)\s*\(",
                   lambda m: "Mathf_%s(" % m.group(1), text)
     text = re.sub(r"transform\.position\.x", idn + "_get_pos_x(i)", text)

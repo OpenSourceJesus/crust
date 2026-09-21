@@ -1932,11 +1932,15 @@ class TestSystems(unittest.TestCase):
         self.assertIn("_Rigidbody2D_linear_damping", eng)
         self.assertIn("GameObject_GetComponent_Rigidbody2D", eng)
         self.assertIn("engine_physics_collide2d", eng)
-        self.assertGreaterEqual(len(plan.get("collider2d") or []), 2)
+        self.assertIn("Player_OnCollisionEnter2D", eng)
+        self.assertIn("Collision2D_ToString", eng)
+        self.assertIn("engine_physics_collide2d_messages", eng)
+        self.assertGreaterEqual(len(plan.get("collider2d") or []), 3)
         ball_col = ball["collider2d"]
         self.assertEqual(ball_col["kind"], "circle")
         ground = [o for o in objs if o["name"] == "Ground"][0]
         self.assertEqual(ground["collider2d"]["kind"], "box")
+        self.assertEqual(player["collider2d"]["kind"], "box")
         self.assertAlmostEqual(ground["pos"][1], -2.5)
         # Colliders use Unity 2D default friction (0.4); Ice asset removed.
         self.assertAlmostEqual(ball_col["friction"], 0.4)
@@ -2807,6 +2811,53 @@ class TestSystemsRuns(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         run = subprocess.run([exe], capture_output=True, text=True)
         self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+
+    def test_oncollision_enter2d_fires_on_landing(self):
+        """Player.OnCollisionEnter2D prints Collision2D when hitting Ground."""
+        d = tempfile.mkdtemp(prefix="upack-col2d-msg-")
+        unity_pack.pack(SYSTEMS, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("Player_OnCollisionEnter2D(unsigned i, int coll)", eng)
+        self.assertIn("Collision2D_ToString", eng)
+        self.assertIn("_col2d_add_contact", eng)
+        host = os.path.join(d, "host.c")
+        with open(host, "w") as f:
+            f.write(
+                "void engine_tick(void);\n"
+                "extern float Time_deltaTime;\n"
+                "typedef struct Player Player;\n"
+                "struct Player { float pos_x; float pos_y; };\n"
+                "extern Player _Player_inst_array[];\n"
+                "int main(void) {\n"
+                "  int i;\n"
+                "  Time_deltaTime = 0.02f;\n"
+                "  for (i = 0; i < 120; i = i + 1) engine_tick();\n"
+                "  /* Ground top -2.25 + half-height 0.5 → rest ≈ -1.75 */\n"
+                "  if (_Player_inst_array[0].pos_y > -1.6f) return 2;\n"
+                "  if (_Player_inst_array[0].pos_y < -1.9f) return 3;\n"
+                "  return 0;\n"
+                "}\n"
+            )
+        r = subprocess.run(
+            [_CC, "-O3", "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(
+            [_CC, "-O0", "-c", "-o", os.path.join(d, "data.o"),
+             os.path.join(d, "data.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        exe = os.path.join(d, "host")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host,
+             os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+        self.assertIn("UnityEngine.Collision2D", run.stdout)
 
     def test_physics_fall_matches_wall_clock_not_frame_count(self):
         """60Hz×1s ≈ same Player fall as 50 fixed steps (Unity fixed clock)."""

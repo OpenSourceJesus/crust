@@ -255,6 +255,7 @@ Only **authored** Rigidbody components start packed; `AddComponent<Rigidbody>` /
 | Authored `!u!135` SphereCollider | Radius (× max scale); AABB contacts |
 | `m_IsTrigger: 1` | Parsed but skipped for solid resolution |
 | Dynamic Rigidbody(2D) + collider | Separates along MTV; friction + bounce from materials |
+| `OnCollisionEnter2D` / `Stay2D` / `Exit2D` | After `engine_physics_collide2d`; `Collision2D` handle; `ToString` → `"UnityEngine.Collision2D"` |
 
 ### Physics materials
 
@@ -302,6 +303,7 @@ fixed_accum += min(Time_deltaTime, maximumDeltaTime≈1/3)
 while fixed_accum >= Time_fixedDeltaTime:
     foreach class: FixedUpdate    // if present
     engine_physics_fixed()        // authored Rigidbody / Rigidbody2D + collide
+                                  // then OnCollisionEnter/Stay/Exit2D
     fixed_accum -= Time_fixedDeltaTime
 foreach class: Update
 ```
