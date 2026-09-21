@@ -45,8 +45,8 @@ action maps / device graphs).
 | `-logFile path` / `-logFile -` | `engine_apply_argv` → file or **stdout** |
 | `System.Console.WriteLine(msg)` | **stdout** (terminal), not Player.log |
 | `WriteLine` / `Debug.Log` of a `GameObject` | `Object.ToString` → `name (UnityEngine.GameObject)` (missing → `"null"`) |
-| `Application.dataPath` | Packed project `Assets/` absolute path |
-| `Application.persistentDataPath` | Unity company/product save dir (same layout as Player.log’s parent) |
+| `Application.dataPath` | Packed project `Assets/` absolute path (**Awake/Start only**) |
+| `Application.persistentDataPath` | Unity company/product save dir (**Awake/Start only**) |
 | Other `Application.*` | Pack-time **CS0117** (`Application` in scope via `using UnityEngine`) |
 | `File.WriteAllText(path, text)` | `fopen` write (`"w"`); creates parent dirs when possible |
 | `File.AppendAllText(path, text)` | `fopen` append (`"a"`); creates parent dirs when possible |
@@ -68,6 +68,9 @@ context arg ignored. `engine_console_log_path()` mirrors
 `Assets/` folder (Editor semantics). `Application.persistentDataPath` matches
 Unity standalone (Linux `~/.config/unity3d/<company>/<product>`, macOS
 `~/Library/Application Support/...`, Windows `%USERPROFILE%\AppData\LocalLow\...`).
+Calling either from a MonoBehaviour field initializer / `.cctor` raises
+Unity's `UnityException` / `TypeInitializationException` every frame and
+**does not** run that script's `Start`/`Update` (same as Unity).
 `Start` runs once before first `Update`.
 
 ## GameObject lookup

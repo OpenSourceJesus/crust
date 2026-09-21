@@ -614,6 +614,89 @@ class TestSystems(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
 
     @needs_cc
+    def test_application_path_field_init_ctor_forbidden(self):
+        """Field-init persistentDataPath → UnityException each frame; no script."""
+        src = (
+            "using UnityEngine;\n"
+            "public class BadPath : MonoBehaviour {\n"
+            "    static string P = Application.persistentDataPath + \"/x.txt\";\n"
+            "    void Update() { }\n"
+            "}\n"
+        )
+        a = unity_pack.analyze_script("/proj/Assets/Scripts/BadPath.cs", src)
+        self.assertTrue(a["classes"][0].get("ctor_forbidden"))
+        self.assertEqual(
+            a["classes"][0]["ctor_forbidden"][0]["api"], "persistentDataPath")
+        self.assertEqual(a["classes"][0]["ctor_forbidden"][0]["line"], 3)
+        root = tempfile.mkdtemp(prefix="upack-ctorforbid-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "BadPath.cs"), "w") as f:
+            f.write(src)
+        with open(os.path.join(scripts, "BadPath.cs.meta"), "w") as f:
+            f.write("guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Bad Path GO\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-ctorforbid-out-")
+        plan = unity_pack.pack(root, d)
+        self.assertTrue(plan["classes"]["BadPath"].get("ctor_forbidden"))
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("_engine_unity_ctor_forbidden", eng)
+        self.assertIn("get_%s is not allowed", eng)
+        self.assertIn("TypeInitializationException", eng)
+        self.assertNotIn("BadPath_Update", eng)
+        host = os.path.join(d, "host_ctor.c")
+        with open(host, "w") as f:
+            f.write(
+                "void engine_tick(void);\n"
+                "extern float Time_deltaTime;\n"
+                "int main(void) {\n"
+                "  int i;\n"
+                "  Time_deltaTime = 0.02f;\n"
+                "  for (i = 0; i < 3; i = i + 1) engine_tick();\n"
+                "  return 0;\n"
+                "}\n"
+            )
+        r = subprocess.run(
+            [_CC, "-O2", "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(
+            [_CC, "-O0", "-c", "-o", os.path.join(d, "data.o"),
+             os.path.join(d, "data.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        exe = os.path.join(d, "host_ctor")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host,
+             os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr or r.stdout)
+        err = r.stderr or ""
+        self.assertIn("UnityException: get_persistentDataPath", err)
+        self.assertIn("BadPath", err)
+        self.assertIn("Bad Path GO", err)
+        self.assertIn("BadPath.cs:3", err)
+        self.assertEqual(err.count("UnityException: get_persistentDataPath"), 3)
+
     def test_package_cache_guid_resolves(self):
         """UPM PackageCache .meta guids resolve; Assets scripts stay exclusive."""
         assets = unity_pack._asset_guid_map(SYSTEMS)

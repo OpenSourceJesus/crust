@@ -4176,7 +4176,7 @@ def analyze_script(path, text=None):
             continue
         body = text[brace + 1:close]
         bscan = scan[brace + 1:close]
-        fields = _fields_in(body, bscan)
+        fields = _fields_in(body, bscan, body_abs=brace + 1)
         methods = _methods_in(body, bscan, body_abs=brace + 1)
         refs = []
         for f in fields:
@@ -4187,12 +4187,27 @@ def analyze_script(path, text=None):
         pre = scan[max(0, start - 200):start]
         disallow_multiple = bool(re.search(
             r"\[DisallowMultipleComponent\]", pre))
+        ctor_forbidden = []
+        for f in fields:
+            api = f.get("ctor_forbidden_api")
+            if not api:
+                continue
+            abs_i = int(f.get("ctor_forbidden_abs")
+                        or f.get("decl_abs") or 0)
+            line = text.count("\n", 0, abs_i) + 1
+            ctor_forbidden.append({
+                "api": api,
+                "field": f["name"],
+                "line": line,
+                "static": bool(f.get("static") or f.get("const")),
+            })
         classes.append({
             "name": name, "kind": kind, "fields": fields,
             "methods": methods, "refs": refs,
             "path": path,
             "file_text": text,
             "disallow_multiple": disallow_multiple,
+            "ctor_forbidden": ctor_forbidden,
         })
     return {
         "path": path,
@@ -4302,7 +4317,7 @@ def _parse_csharp_field_init(ty, raw):
     return None
 
 
-def _fields_in(body, bscan):
+def _fields_in(body, bscan, body_abs=0):
     """Instance / static / const fields; methods (those with `(`) are skipped."""
     bscan = _blank_method_bodies(bscan)
     out = []
@@ -4324,13 +4339,25 @@ def _fields_in(body, bscan):
             "name": name,
             "static": bool(re.search(r"\bstatic\b", decl)),
             "const": bool(re.search(r"\bconst\b", decl)),
+            "decl_abs": int(body_abs) + int(m.start()),
         }
         # Authored `float xSize = 1;` / `Vector2 multSize = new Vector2(1, 1);`
         if m.group(0).rstrip().endswith("="):
             rest = body[m.end():]
             semi = rest.find(";")
             if semi >= 0:
-                default = _parse_csharp_field_init(ty, rest[:semi])
+                init_src = rest[:semi]
+                # Unity forbids Application.dataPath / persistentDataPath in
+                # MonoBehaviour field initializers / .cctor (not Awake/Start).
+                am = re.search(
+                    r"(?:UnityEngine\.)?Application\."
+                    r"(dataPath|persistentDataPath)\b",
+                    init_src)
+                if am:
+                    entry["ctor_forbidden_api"] = am.group(1)
+                    entry["ctor_forbidden_abs"] = (
+                        int(body_abs) + int(m.end()) + int(am.start()))
+                default = _parse_csharp_field_init(ty, init_src)
                 if default is not None:
                     entry["default"] = default
         out.append(entry)
@@ -4508,11 +4535,15 @@ def plan_layouts(objects, analyses, two_d=None):
         field_tys = {}
         script_fields = []
         script_methods = []
+        ctor_forbidden = []
+        script_path = ""
         for a in analyses:
             for c in a["classes"]:
                 if c["name"] == cname:
                     script_fields = c["fields"]
                     script_methods = c["methods"]
+                    ctor_forbidden = list(c.get("ctor_forbidden") or [])
+                    script_path = c.get("path") or a.get("path") or ""
         for f in script_fields:
             if f.get("static") or f.get("const"):
                 continue  # class-level; emitted separately from instance arrays
@@ -4591,6 +4622,11 @@ def plan_layouts(objects, analyses, two_d=None):
         vec2_fields = [f["name"] for f in script_fields if f["ty"] == "Vector2"]
         class_consts = [f for f in script_fields
                         if f.get("const") or f.get("static")]
+        # Do not bake Application.* paths used in illegal field initializers.
+        if ctor_forbidden:
+            forbid_names = {x["field"] for x in ctor_forbidden}
+            class_consts = [f for f in class_consts
+                            if f["name"] not in forbid_names]
         plans[cname] = {
             "name": cname,
             "n": n,
@@ -4605,6 +4641,8 @@ def plan_layouts(objects, analyses, two_d=None):
             "fields": script_fields,
             "vec2_fields": vec2_fields,
             "class_consts": class_consts,
+            "ctor_forbidden": ctor_forbidden,
+            "script_path": script_path,
         }
     live_rot = set()
     for a in analyses:
@@ -4761,6 +4799,9 @@ def emit_engine(plan, analyses, used_apis):
     want_go_tables = (
         want_find or want_getcomponent or want_rb2d or want_rb3d
         or want_add_any or want_ui or want_destroy)
+    want_ctor_forbidden = any(
+        bool(cl.get("ctor_forbidden"))
+        for cl in plan["classes"].values())
     light_n = int(plan.get("light_count") or 0)
     light_cap = light_n + int(add_budget.get("Light") or 0)
     class_ids = {n: i for i, n in enumerate(sorted(plan["classes"]))}
@@ -4774,7 +4815,7 @@ def emit_engine(plan, analyses, used_apis):
             or want_data_path or want_persistent_data_path or want_file_io):
         p("#include <string.h>")
     if (want_log or want_console or want_str_plus or want_add_any
-            or want_file_io or want_go_tables):
+            or want_file_io or want_go_tables or want_ctor_forbidden):
         p("#include <stdio.h>")
     want_draw_sort = False
     for cl in plan["classes"].values():
@@ -5969,6 +6010,28 @@ def emit_engine(plan, analyses, used_apis):
     p("}")
     p("")
 
+    if want_ctor_forbidden:
+        p("/* Application.dataPath / persistentDataPath in field/.cctor. */")
+        p("static void _engine_unity_ctor_forbidden(")
+        p("    const char *api, const char *cls, const char *go_name,")
+        p("    const char *path, int line) {")
+        p("    fprintf(stderr,")
+        p("        \"UnityException: get_%s is not allowed to be called from a \"")
+        p("        \"MonoBehaviour constructor (or instance field initializer), \"")
+        p("        \"call it in Awake or Start instead. Called from MonoBehaviour \"")
+        p("        \"'%s' on game object '%s'.\\n\"")
+        p("        \"See \\\"Script Serialization\\\" page in the Unity Manual for \"")
+        p("        \"further details.\\n\"")
+        p("        \"UnityEngine.Application.get_%s () \"")
+        p("        \"(at <00000000000000000000000000000000>:0)\\n\"")
+        p("        \"%s..cctor () (at %s:%d)\\n\"")
+        p("        \"Rethrow as TypeInitializationException: The type \"")
+        p("        \"initializer for '%s' threw an exception.\\n\",")
+        p("        api, cls, go_name ? go_name : \"\", api, cls, path, line,")
+        p("        cls);")
+        p("}")
+        p("")
+
     # Extensions.SetWorldScale → live localScale on the referenced Transform's GO.
     if plan.get("transform_field_targets"):
         live = set(plan.get("live_scale_classes") or [])
@@ -6101,6 +6164,9 @@ def emit_engine(plan, analyses, used_apis):
         for c, m in methods_by.get(cname, []):
             if m["name"] in ("Awake", "OnEnable"):
                 continue
+            # TypeInitializer failed — do not lower or run script methods.
+            if cl.get("ctor_forbidden"):
+                continue
             site = {
                 "class": cname,
                 "method": m["name"],
@@ -6133,6 +6199,43 @@ def emit_engine(plan, analyses, used_apis):
                         for _c, m in methods_by.get(cname, []))
         has_update = any(m["name"] == "Update"
                          for _c, m in methods_by.get(cname, []))
+        ctor_forbidden = list(cl.get("ctor_forbidden") or [])
+        if ctor_forbidden:
+            # Unity TypeInitializationException — spam each frame, no script.
+            fb = ctor_forbidden[0]
+            api = fb.get("api") or "persistentDataPath"
+            line = int(fb.get("line") or 0)
+            spath = _assets_rel_path(
+                cl.get("script_path") or cl.get("path") or "")
+            p("void %s_FixedTick(void) { /* type init failed */ }" % idn)
+            p("")
+            p("void %s_Tick(void) {" % idn)
+            p("    int n;")
+            p("    for (n = 0; n < _%s_inst_count; n = n + 1) {" % idn)
+            p("        const char *_gon = \"\";")
+            if want_go_tables:
+                p("        {")
+                p("            int _dgo = _engine_go_of_%s((unsigned)n);" % idn)
+                p("            if (_dgo >= 0 && _dgo < _engine_go_count)")
+                p("                _gon = _engine_go_name[_dgo];")
+                p("        }")
+            else:
+                # Fall back to authored instance name.
+                for i, o in enumerate(cl.get("instances") or []):
+                    if i == 0:
+                        p("        if (n == 0) _gon = %s;"
+                          % _c_string(o.get("name") or cname))
+                    else:
+                        p("        else if (n == %d) _gon = %s;"
+                          % (i, _c_string(o.get("name") or cname)))
+            p("        _engine_unity_ctor_forbidden(")
+            p("            %s, %s, _gon, %s, %d);"
+              % (_c_string(api), _c_string(cname), _c_string(spath), line))
+            p("    }")
+            p("}")
+            p("")
+            continue
+
         if has_start:
             p("static int _%s_started = 0;" % idn)
         p("void %s_FixedTick(void) {" % idn)
