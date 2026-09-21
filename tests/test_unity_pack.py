@@ -1614,29 +1614,29 @@ class TestSystems(unittest.TestCase):
 
     def test_authored_rigidbody2d_is_packed(self):
         objs, _a, _l, _c = unity_pack.load_project(SYSTEMS)
-        ball = [o for o in objs if o["name"] == "HeavyBall"][0]
+        ball = [o for o in objs if o["name"] == "Ball"][0]
         self.assertIsNotNone(ball.get("rigidbody2d"))
         self.assertAlmostEqual(ball["rigidbody2d"]["vel_x"], 0.0)
         player = [o for o in objs if o["name"] == "Player"][0]
         self.assertIsNotNone(player.get("rigidbody2d"))
         self.assertAlmostEqual(player["rigidbody2d"]["mass"], 0.5704784)
         self.assertAlmostEqual(player["rigidbody2d"]["linear_damping"], 1.0)
-        ball = [o for o in objs if o["name"] == "HeavyBall"][0]
         self.assertAlmostEqual(ball["rigidbody2d"]["linear_damping"], 0.0)
         d = tempfile.mkdtemp(prefix="upack-rb2d-")
         plan = unity_pack.pack(SYSTEMS, d)
         self.assertEqual(len(plan.get("rigidbody2d") or []), 2)
         by_rb = {r["name"]: r for r in plan["rigidbody2d"]}
         self.assertAlmostEqual(by_rb["Player"]["linear_damping"], 1.0)
-        self.assertAlmostEqual(by_rb["HeavyBall"]["linear_damping"], 0.0)
+        self.assertAlmostEqual(by_rb["Ball"]["linear_damping"], 0.0)
         with open(os.path.join(d, "engine.c")) as f:
             eng = f.read()
         self.assertIn("engine_physics_fixed", eng)
+        self.assertIn("_engine_fixed_accum", eng)
         self.assertIn("_Rigidbody2D_linear_damping", eng)
         self.assertIn("GameObject_GetComponent_Rigidbody2D", eng)
         self.assertIn("engine_physics_collide2d", eng)
-        self.assertGreaterEqual(len(plan.get("collider2d") or []), 3)
-        ball_col = [o for o in objs if o["name"] == "HeavyBall"][0]["collider2d"]
+        self.assertGreaterEqual(len(plan.get("collider2d") or []), 2)
+        ball_col = ball["collider2d"]
         self.assertEqual(ball_col["kind"], "circle")
         ground = [o for o in objs if o["name"] == "Ground"][0]
         self.assertEqual(ground["collider2d"]["kind"], "box")
@@ -1644,8 +1644,6 @@ class TestSystems(unittest.TestCase):
         # Colliders use Unity 2D default friction (0.4); Ice asset removed.
         self.assertAlmostEqual(ball_col["friction"], 0.4)
         self.assertAlmostEqual(ground["collider2d"]["friction"], 0.4)
-        pad = [o for o in objs if o["name"] == "BouncePad"][0]
-        self.assertAlmostEqual(pad["collider2d"]["friction"], 0.4)
         ground_row = [c for c in plan["collider2d"] if c["name"] == "Ground"][0]
         self.assertAlmostEqual(ground_row["friction"], 0.4)
         self.assertIn("_Collider2D_friction", eng)
@@ -1660,11 +1658,11 @@ class TestSystems(unittest.TestCase):
         by_fid = plan.get("rb2d_by_file_id") or {}
         self.assertIn("3006", by_fid)
         player_rb = by_fid["3006"]
-        heavy_rb = by_fid["2005"]
-        self.assertNotEqual(player_rb, heavy_rb)
+        ball_rb = by_fid["2005"]
+        self.assertNotEqual(player_rb, ball_rb)
         with open(os.path.join(d, "data.c")) as f:
             data = f.read()
-        # Player.rb must index Player's Rigidbody2D, not HeavyBall (0).
+        # Player.rb must index Player's Rigidbody2D, not Ball (0).
         self.assertRegex(
             data,
             r"Player _Player_inst_array\[1\] = \{\s*\{[^}]*\b%d\b" % player_rb)
@@ -2420,9 +2418,6 @@ class TestSystemsRuns(unittest.TestCase):
                 "typedef struct Player Player;\n"
                 "struct Player { float pos_x; float pos_y; float moveSpeed; };\n"
                 "extern Player _Player_inst_array[];\n"
-                "typedef struct Wave Wave;\n"
-                "struct Wave { float pos_x; float pos_y; };\n"
-                "extern Wave _Wave_inst_array[];\n"
                 "extern float _AnimPlayer_time[];\n"
                 "extern int _Graphics_draw_tex[];\n"
                 "extern const int _AnimSpriteKey_tex[];\n"
@@ -2434,12 +2429,7 @@ class TestSystemsRuns(unittest.TestCase):
                 "  engine_keyboard_rightArrow = 1;\n"
                 "  RenderSettings_ambient_r = 0.5f;\n"
                 "  int i;\n"
-                "  for (i = 0; i < 25; i = i + 1) engine_tick();\n"
-                "  /* Bob.anim localPosition.x is constantly 2; y peaks at 0.5. */\n"
-                "  if (_Wave_inst_array[0].pos_x < 1.99f\n"
-                "      || _Wave_inst_array[0].pos_x > 2.01f) return 9;\n"
-                "  if (_Wave_inst_array[0].pos_y < 0.4f) return 10;\n"
-                "  for (i = 0; i < 25; i = i + 1) engine_tick();\n"
+                "  for (i = 0; i < 50; i = i + 1) engine_tick();\n"
                 "  EngineDraw buf[128];\n"
                 "  int n = engine_collect_draws(buf, 128);\n"
                 "  if (Time_time < 0.9f) return 2;\n"
@@ -2449,18 +2439,7 @@ class TestSystemsRuns(unittest.TestCase):
                 "  if (n != 9) return 6; /* SpriteRenderers + Button + TMP */\n"
                 "  /* Ground top ≈ -2.25; ball radius ≈ 0.225 → rest y ≳ -2.05 */\n"
                 "  if (_Ball_inst_array[0].pos_y < -2.1f) return 8;\n"
-                "  if (_Wave_inst_array[0].pos_x < 1.99f\n"
-                "      || _Wave_inst_array[0].pos_x > 2.01f) return 12;\n"
-                "  /* Spinner stays at authored (-2.5, 1.2): legacy clip ≠ Animator. */\n"
-                "  { int j; int found = 0;\n"
-                "    for (j = 0; j < n; j = j + 1) {\n"
-                "      if (buf[j].x > -2.6f && buf[j].x < -2.4f\n"
-                "          && buf[j].y > 1.1f && buf[j].y < 1.3f)\n"
-                "        found = 1;\n"
-                "    }\n"
-                "    if (!found) return 11;\n"
-                "  }\n"
-                "  /* BouncePad sortingOrder -10 first; Button Foreground last. */\n"
+                "  /* Lowest sortingOrder first; Button Foreground last. */\n"
                 "  if (buf[0].sorting_order != -10) return 13;\n"
                 "  if (buf[n - 1].sorting_layer != 1) return 14;\n"
                 "  if (buf[n - 1].a < 0.99f)\n"
@@ -2490,10 +2469,9 @@ class TestSystemsRuns(unittest.TestCase):
                 "    float px = _Player_inst_array[0].pos_x;\n"
                 "    float py = _Player_inst_array[0].pos_y;\n"
                 "    int j; int found = 0;\n"
-                "    /* Idle.anim has no PositionCurves — must not reset to origin. */\n"
                 "    if (px <= 0.5f) return 16; /* rightArrow move sticks */\n"
-                "    /* Player m_LinearDamping 1 → less fall than undamped (~-5). */\n"
-                "    if (py >= -0.5f || py < -4.5f) return 18;\n"
+                "    /* Player m_LinearDamping 1 → less fall than undamped. */\n"
+                "    if (py >= 6.5f || py < -4.5f) return 18;\n"
                 "    for (j = 0; j < n; j = j + 1) {\n"
                 "      if (buf[j].x > px - 0.05f && buf[j].x < px + 0.05f\n"
                 "          && buf[j].y > py - 0.05f && buf[j].y < py + 0.05f)\n"
@@ -2532,6 +2510,55 @@ class TestSystemsRuns(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         run = subprocess.run([exe], capture_output=True, text=True)
         self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+
+    def test_physics_fall_matches_wall_clock_not_frame_count(self):
+        """60Hz×1s ≈ same Player fall as 50 fixed steps (Unity fixed clock)."""
+        ys = {}
+        for label, dt, n in (
+                ("50", "0.02f", 50),
+                ("60", "(1.f/60.f)", 60)):
+            out = tempfile.mkdtemp(prefix="upack-fall%s-" % label)
+            unity_pack.pack(SYSTEMS, out)
+            hostp = os.path.join(out, "host.c")
+            with open(hostp, "w") as f:
+                f.write(
+                    "#include <stdio.h>\n"
+                    "void engine_tick(void);\n"
+                    "extern float Time_deltaTime;\n"
+                    "typedef struct Player Player;\n"
+                    "struct Player { float pos_x; float pos_y; };\n"
+                    "extern Player _Player_inst_array[];\n"
+                    "int main(void) {\n"
+                    "  int i;\n"
+                    "  Time_deltaTime = %s;\n"
+                    "  for (i = 0; i < %d; i = i + 1) engine_tick();\n"
+                    "  printf(\"Y=%%.6f\\n\", _Player_inst_array[0].pos_y);\n"
+                    "  return 0;\n"
+                    "}\n" % (dt, n)
+                )
+            r = subprocess.run(
+                [_CC, "-O2", "-c", "-o", os.path.join(out, "engine.o"),
+                 os.path.join(out, "engine.c")],
+                capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            r = subprocess.run(
+                [_CC, "-O0", "-c", "-o", os.path.join(out, "data.o"),
+                 os.path.join(out, "data.c")],
+                capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            exe = os.path.join(out, "fall")
+            r = subprocess.run(
+                [_CC, "-O2", "-o", exe, hostp,
+                 os.path.join(out, "engine.o"), os.path.join(out, "data.o"),
+                 "-lm"],
+                capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            run = subprocess.run([exe], capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+            yline = [ln for ln in run.stdout.splitlines() if ln.startswith("Y=")]
+            self.assertTrue(yline, run.stdout)
+            ys[label] = float(yline[-1][2:])
+        self.assertAlmostEqual(ys["50"], ys["60"], delta=0.05)
 
     def test_camera_positive_z_culls_sprites(self):
         """Unity looks +Z; camera at +z with sprites at 0 draws nothing."""

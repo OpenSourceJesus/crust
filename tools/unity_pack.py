@@ -4855,9 +4855,7 @@ def emit_engine(plan, analyses, used_apis):
     p("extern float Time_deltaTime;")
     if "Time.time" in used_apis:
         p("extern float Time_time;")
-    if ("Time.fixedDeltaTime" in used_apis or want_phys or want_phys3
-            or want_rb2d or want_rb3d):
-        p("extern float Time_fixedDeltaTime;")
+    p("extern float Time_fixedDeltaTime;")
     p("extern int Screen_width;")
     p("extern int Screen_height;")
     p("extern int Screen_fullScreen;")
@@ -6907,16 +6905,31 @@ def emit_engine(plan, analyses, used_apis):
         p("")
 
     p("void engine_tick(void) {")
+    p("    /* Unity fixed clock: accumulate frame dt, step at fixedDeltaTime. */")
+    p("    static float _engine_fixed_accum = 0.f;")
+    p("    float _dt = Time_deltaTime;")
+    p("    float _fixed_dt;")
+    p("    int _fixed_guard;")
+    p("    if (_dt > 0.33333334f) _dt = 0.33333334f; /* Time.maximumDeltaTime */")
+    p("    if (_dt < 0.f) _dt = 0.f;")
     if "Time.time" in used_apis:
         p("    Time_time = Time_time + Time_deltaTime;")
     if want_ui:
         p("    engine_ui_tick();")
     if want_anim and anim_players:
         p("    engine_animation_tick();")
+    p("    _engine_fixed_accum = _engine_fixed_accum + _dt;")
+    p("    _fixed_dt = Time_fixedDeltaTime;")
+    p("    if (_fixed_dt < 1e-8f) _fixed_dt = 0.02f;")
+    p("    _fixed_guard = 0;")
+    p("    while (_engine_fixed_accum >= _fixed_dt && _fixed_guard < 50) {")
     for cname in sorted(plan["classes"]):
-        p("    %s_FixedTick();" % _c_ident(cname))
+        p("        %s_FixedTick();" % _c_ident(cname))
     if want_rb2d or want_rb3d:
-        p("    engine_physics_fixed();")
+        p("        engine_physics_fixed();")
+    p("        _engine_fixed_accum = _engine_fixed_accum - _fixed_dt;")
+    p("        _fixed_guard = _fixed_guard + 1;")
+    p("    }")
     for cname in sorted(plan["classes"]):
         p("    %s_Tick();" % _c_ident(cname))
     if plan.get("camera_follows_parent"):
@@ -7948,9 +7961,7 @@ def emit_data(plan, used_apis=None):
     p("float Time_deltaTime = 0.0166667f;")
     if "Time.time" in used_apis:
         p("float Time_time = 0.f;")
-    if ("Time.fixedDeltaTime" in used_apis or want_phys or want_phys3
-            or rb2d_list or rb3d_list):
-        p("float Time_fixedDeltaTime = 0.02f;")
+    p("float Time_fixedDeltaTime = 0.02f;")
     if want_phys:
         p("float Physics2D_gravity_x = 0.f;")
         p("float Physics2D_gravity_y = -9.81f;")
