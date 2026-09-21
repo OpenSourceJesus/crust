@@ -65,7 +65,7 @@ _QUATERNION_SUPPORTED = frozenset({"Euler", "identity", "LookRotation"})
 # (transform itself is always in scope; blame the missing member).
 _TRANSFORM_SUPPORTED = frozenset({
     "position", "Rotate", "LookAt", "eulerAngles", "rotation", "Find",
-    "localScale", "parent", "gameObject", "worldToLocalMatrix", "localToWorldMatrix", "localPosition", "localRotation",
+    "localScale", "parent", "gameObject", "worldToLocalMatrix", "localToWorldMatrix", "localPosition", "localRotation", "TransformPoint",
 })
 
 
@@ -4267,6 +4267,16 @@ def analyze_script(path, text=None):
             apis.add("GetComponent")
     if "transform.position" in scan:
         apis.add("transform.position")
+    if re.search(r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*localPosition\b",
+                 scan):
+        apis.add("transform.localPosition")
+    if re.search(r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*localRotation\b",
+                 scan):
+        apis.add("transform.localRotation")
+    if re.search(
+            r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*TransformPoint\s*\(",
+            scan):
+        apis.add("transform.TransformPoint")
     if re.search(r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*Rotate\s*\(",
                  scan):
         apis.add("transform.Rotate")
@@ -4739,6 +4749,31 @@ def plan_layouts(objects, analyses, two_d=None):
                or o.get("anim_player") for o in insts):
             writes[cname] = True
 
+    # Live TRS consumers: TransformPoint / matrices / localPosition Vector3 fields.
+    tp_classes = set()
+    matrix_classes = set()
+    local_pos_classes = set()
+    for a in analyses:
+        apis = a.get("apis") or ()
+        for c in a["classes"]:
+            if c["name"] not in by_class:
+                continue
+            if "transform.TransformPoint" in apis:
+                tp_classes.add(c["name"])
+                writes[c["name"]] = True
+            if ("transform.worldToLocalMatrix" in apis
+                    or "transform.localToWorldMatrix" in apis):
+                matrix_classes.add(c["name"])
+                writes[c["name"]] = True
+            if "transform.localPosition" in apis:
+                local_pos_classes.add(c["name"])
+                writes[c["name"]] = True
+            if "transform.localRotation" in apis:
+                writes[c["name"]] = True
+
+    # Vector3 field packing when localPosition round-trips a Vector3 member.
+    vec3_pack_classes = tp_classes | local_pos_classes
+
     plans = {}
     for cname, insts in by_class.items():
         n = len(insts)
@@ -4803,7 +4838,12 @@ def plan_layouts(objects, analyses, two_d=None):
                 members.append((fname + "_y", "float", 32, "f32"))
                 continue
             if ty == "Vector3":
-                continue  # transform owns position; full Vector3 fields later
+                # Pack when TransformPoint / localPosition needs field points.
+                if cname in vec3_pack_classes:
+                    members.append((fname + "_x", "float", 32, "f32"))
+                    members.append((fname + "_y", "float", 32, "f32"))
+                    members.append((fname + "_z", "float", 32, "f32"))
+                continue  # otherwise transform owns position; full Vector3 later
             if ty == "Transform":
                 # Resolved via object_refs → target class/inst (SetWorldScale).
                 continue
@@ -4862,13 +4902,19 @@ def plan_layouts(objects, analyses, two_d=None):
             "instances": insts,
             "fields": script_fields,
             "vec2_fields": vec2_fields,
+            "vec3_fields": vec3_fields,
             "class_consts": class_consts,
             "ctor_forbidden": ctor_forbidden,
             "script_path": script_path,
         }
-    live_rot = set()
+    live_rot = set(tp_classes) | set(matrix_classes)
     for a in analyses:
         if a.get("writes_rot"):
+            for c in a["classes"]:
+                if c["name"] in plans:
+                    live_rot.add(c["name"])
+        apis = a.get("apis") or ()
+        if "transform.localRotation" in apis:
             for c in a["classes"]:
                 if c["name"] in plans:
                     live_rot.add(c["name"])
@@ -4877,6 +4923,9 @@ def plan_layouts(objects, analyses, two_d=None):
         "spawn": spawn,
         "classes": plans,
         "live_rot_classes": sorted(live_rot),
+        "transform_point_classes": sorted(tp_classes),
+        "transform_matrix_classes": sorted(matrix_classes),
+        "local_position_classes": sorted(local_pos_classes),
     }
 
 
@@ -8884,6 +8933,19 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
                 ))(_split_call_args(m.group(1)))
             ),
             text)
+    for vf in cl.get("vec3_fields") or []:
+        text = re.sub(r"(?<![_\w])%s\.x\b" % vf, "%s_x" % vf, text)
+        text = re.sub(r"(?<![_\w])%s\.y\b" % vf, "%s_y" % vf, text)
+        text = re.sub(r"(?<![_\w])%s\.z\b" % vf, "%s_z" % vf, text)
+        # Property PascalCase → field (Offset → offset) for TransformPoint args.
+        prop = vf[:1].upper() + vf[1:] if vf else vf
+        if prop != vf:
+            text = re.sub(r"(?<![_\w])%s\.x\b" % prop, "%s_x" % vf, text)
+            text = re.sub(r"(?<![_\w])%s\.y\b" % prop, "%s_y" % vf, text)
+            text = re.sub(r"(?<![_\w])%s\.z\b" % prop, "%s_z" % vf, text)
+            text = re.sub(
+                r"(?<![_\w])%s(?![\w])" % prop,
+                vf, text)
     # Const/static class fields before instance member rewrites.
     for name in sorted(class_const_names, key=len, reverse=True):
         text = re.sub(
@@ -9892,10 +9954,17 @@ def pack(root, outdir, soa=False, soa_vec4=False):
     plan["rb2d_by_file_id"] = rb2d_by_fid
     plan["rb3d_by_file_id"] = rb3d_by_fid
     _attach_transform_parents(plan)
+    if "transform.SetParent" in used_apis:
+        plan["has_transform_parents"] = True
     plan["collider2d"] = _build_collider2d_tables(plan)
     plan["collider3d"] = _build_collider3d_tables(plan)
     plan["animation"] = _build_animation_tables(plan)
     _resolve_transform_field_targets(plan)
+    # Transform.TransformPoint / matrices need live localScale (seeded authored).
+    live_scale = set(plan.get("live_scale_classes") or [])
+    live_scale |= set(plan.get("transform_point_classes") or [])
+    live_scale |= set(plan.get("transform_matrix_classes") or [])
+    plan["live_scale_classes"] = sorted(live_scale)
     os.makedirs(outdir, exist_ok=True)
     _progress("emitting engine.c (%d classes)" % len(plan["classes"]))
     engine = emit_engine(plan, analyses, used_apis)
