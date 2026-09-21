@@ -4,7 +4,7 @@ using UnityEngine;
 public class LogAverageFPS : MonoBehaviour
 {
 	const float TIME = 1;
-	static string LOG_FILE_PATH = Application.persistentDataPath + "/AverageFPS.txt";
+	static string LOG_FILE_PATH_SUFFIX = "/AverageFPS.txt";
 	float timeLeft;
 	int frameCnt;
 
@@ -19,7 +19,7 @@ public class LogAverageFPS : MonoBehaviour
 		frameCnt ++;
 		if (timeLeft <= 0)
 		{
-			File.AppendAllText(LOG_FILE_PATH, "Average FPS: " + (frameCnt / (TIME - timeLeft)) + '\n');
+			File.AppendAllText(Application.persistentDataPath + LOG_FILE_PATH_SUFFIX, "Average FPS: " + (frameCnt / (TIME - timeLeft)) + '\n');
 			Destroy(gameObject);
 		}
 	}

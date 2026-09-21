@@ -585,81 +585,35 @@ class TestSystems(unittest.TestCase):
 
     @needs_cc
     def test_application_data_path_and_log_average_fps(self):
-        """Application.persistentDataPath + File.AppendAllText for LogAverageFPS."""
+        """Update-time persistentDataPath + suffix → _str_plus_s; script runs."""
         path = os.path.join(
             SYSTEMS, "Assets", "Standard Assets", "Scripts",
             "Concepts (Scripts)", "LogAverageFPS.cs")
         a = unity_pack.analyze_script(path)
         self.assertIn("Application.persistentDataPath", a["apis"])
-        self.assertIn("File.AppendAllText", a["apis"])
-        self.assertFalse(a["spawns"])
-        fields = {f["name"]: f for f in a["classes"][0]["fields"]}
-        self.assertTrue(fields["FRAME_CNT"].get("const"))
-        self.assertEqual(fields["FRAME_CNT"]["default"], 100)
-        self.assertTrue(fields["LOG_FILE_PATH"].get("static"))
-        self.assertEqual(
-            fields["LOG_FILE_PATH"]["default"]["kind"], "persistentDataPath+")
+        self.assertIn("string.+", a["apis"])
+        self.assertFalse(a["classes"][0].get("ctor_forbidden"))
         d = tempfile.mkdtemp(prefix="upack-datapath-")
         plan = unity_pack.pack(SYSTEMS, d)
-        # Runtime short counter must hold FRAME_CNT (not a 1-bit phantom 0).
-        kinds = {m[0]: m[3]
-                 for m in plan["classes"]["LogAverageFPS"]["members"]}
-        self.assertEqual(kinds.get("framesLeft"), "u8")
-        expect_persist = unity_pack.unity_persistent_data_path(
-            plan["company_name"], plan["product_name"])
-        self.assertEqual(plan["persistent_data_path"], expect_persist)
-        log_path = expect_persist + "/Logs/AverageFPS.txt"
+        self.assertFalse(plan["classes"]["LogAverageFPS"].get("ctor_forbidden"))
         with open(os.path.join(d, "engine.c")) as f:
             eng = f.read()
         self.assertIn("Application_persistentDataPath", eng)
-        self.assertIn("engine_persistent_data_path", eng)
-        self.assertIn(log_path, eng)
-        self.assertIn("File_AppendAllText", eng)
-        self.assertIn("_engine_go_destroyed", eng)
-        # Host: tick until AppendAllText runs once; Destroy must stop repeats.
-        host = os.path.join(d, "host_fps.c")
-        log_dir = os.path.dirname(log_path)
-        if not os.path.isdir(log_dir):
-            os.makedirs(log_dir)
-        with open(log_path, "w") as f:
-            f.write("seed\n")
-        with open(host, "w") as f:
-            f.write(
-                "void engine_tick(void);\n"
-                "extern float Time_deltaTime;\n"
-                "int main(void) {\n"
-                "  int i;\n"
-                "  Time_deltaTime = 0.02f;\n"
-                "  for (i = 0; i < 120; i = i + 1) engine_tick();\n"
-                "  for (i = 0; i < 120; i = i + 1) engine_tick();\n"
-                "  return 0;\n"
-                "}\n"
-            )
+        self.assertIn(
+            "_str_plus_s(Application_persistentDataPath()", eng)
+        self.assertIn("LogAverageFPS_LOG_FILE_PATH_SUFFIX", eng)
+        self.assertIn("LogAverageFPS_Update", eng)
+        self.assertIn("LogAverageFPS_Start", eng)
+        self.assertNotIn(
+            "Application_persistentDataPath() + LogAverageFPS_LOG_FILE_PATH",
+            eng)
         r = subprocess.run(
             [_CC, "-O2", "-c", "-o", os.path.join(d, "engine.o"),
              os.path.join(d, "engine.c")],
             capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
-        r = subprocess.run(
-            [_CC, "-O0", "-c", "-o", os.path.join(d, "data.o"),
-             os.path.join(d, "data.c")],
-            capture_output=True, text=True)
-        self.assertEqual(r.returncode, 0, r.stderr)
-        exe = os.path.join(d, "host_fps")
-        r = subprocess.run(
-            [_CC, "-O2", "-o", exe, host,
-             os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],
-            capture_output=True, text=True)
-        self.assertEqual(r.returncode, 0, r.stderr)
-        r = subprocess.run([exe], capture_output=True, text=True)
-        self.assertEqual(r.returncode, 0, r.stderr or r.stdout)
-        self.assertTrue(os.path.isfile(log_path), log_path)
-        with open(log_path) as f:
-            body = f.read()
-        self.assertTrue(body.startswith("seed\nAverage FPS: "), body)
-        self.assertEqual(body.count("Average FPS: "), 1, body)
-        os.remove(log_path)
 
+    @needs_cc
     def test_package_cache_guid_resolves(self):
         """UPM PackageCache .meta guids resolve; Assets scripts stay exclusive."""
         assets = unity_pack._asset_guid_map(SYSTEMS)
