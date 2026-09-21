@@ -229,7 +229,7 @@ MonoBehaviours — package scripts are for reference resolution only.
 | `GetComponent<Rigidbody>().velocity` / `.linearVelocity` / `.drag` | Reads/writes packed RB fields |
 | Field `Rigidbody2D rb` / `Rigidbody rb` + `.linearVelocity` / `.velocity` | Scene PPtr → packed RB index; `= ….SetX/Y/Z(…)` and `= new Vector2/3(…)` |
 | `Time.fixedDeltaTime` | Host-pokeable float (default `1/50`) |
-| `FixedUpdate` | Once per `engine_tick`, then `engine_physics_fixed` |
+| `FixedUpdate` | Accumulator in `engine_tick`: zero or more steps of `fixedDeltaTime` per frame (Unity), then `engine_physics_fixed` each step |
 
 Linear damping uses Box2D’s factor `clamp(1 − damping · Δt, 0, 1)` on velocity
 after gravity (same as Unity Physics2D). Authored `m_LinearDamping` /
@@ -292,8 +292,11 @@ Pool budget is one slot per instance of each class that calls `AddComponent<T>`
 
 ```
 Time_time += Time_deltaTime   // if Time.time used
-foreach class: FixedUpdate    // if present
-engine_physics_fixed()        // authored Rigidbody / Rigidbody2D + collide
+fixed_accum += min(Time_deltaTime, maximumDeltaTime≈1/3)
+while fixed_accum >= Time_fixedDeltaTime:
+    foreach class: FixedUpdate    // if present
+    engine_physics_fixed()        // authored Rigidbody / Rigidbody2D + collide
+    fixed_accum -= Time_fixedDeltaTime
 foreach class: Update
 ```
 
