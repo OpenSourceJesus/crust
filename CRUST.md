@@ -62,22 +62,22 @@ its definition.
 | Generics | `fn f<T>`, `struct S<T>`, `impl<T> S<T>`, turbofish `f::<T>()`, monomorphised per instantiation |
 | Core | bundled `String`, `Vec<T>`, `Box<T>`, `Cell<T>`, `PhantomData<T>`, and `size_of::<T>()` |
 | Traits | `trait`, `impl Trait for Type`, default methods, supertraits, bounds `<T: Trait>`, associated consts through a type parameter (`T::CONST`) and with inherited defaults, associated types (`T::Item`, `Self::Target`); static dispatch |
-| Macros | `println!`/`print!`/`eprintln!`, `assert!`/`assert_eq!`/`assert_ne!`, `panic!`/`unreachable!`/`todo!`, `debug_assert*!`, `cfg!`, `matches!`, and `macro_rules!` |
+| Macros | `println!`/`print!`/`eprintln!`, `assert!`/`assert_eq!`/`assert_ne!`, `panic!`/`unreachable!`/`todo!`, `debug_assert*!`, `cfg!`, `matches!` (full patterns and guards), and `macro_rules!` |
 | Tuples | tuple types `(A, B)`, tuple expressions, positional access `t.0` |
 | Data enums | `enum E { A(T), B { x: T }, C }` as a tagged union, with `match` bindings |
 | Derive | `#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]` on structs |
-| Closures | non-capturing `|a: T| expr`, lifted to a plain function |
+| Closures | `|a: T| expr` and `move` closures, capturing or not; stored, called, and passed as `F: Fn(..)` / `impl Fn(..)` |
 | Paths | `a::b::C` in type position |
 | Misc | `unsafe impl`, `const fn`, the never type `!`, `fn(A) -> R` pointer types, `let (a, b) = ..`, `pub(crate)` fields, block expressions |
 | Module items | `use` and `extern crate` are erased; `mod X;` is erased but sibling `X.rs` / `X/mod.rs` are read for type definitions; `core::ffi::c_*` map to their C types |
 | Type aliases | `type Name = T;` (optional `pub`), emitted as a C `typedef` |
 | Visibility | `pub`, `pub(crate)`, `pub(in path)`, `pub unsafe extern "C"` |
 | Lifetimes | `'a` is accepted and dropped |
-| Types | `i8 i16 i32 i64 isize`, `u8 u16 u32 u64 usize`, `f32 f64`, `bool`, `char`, `()`, `&str` |
+| Types | `i8 i16 i32 i64 isize`, `u8 u16 u32 u64 usize`, `f32 f64`, `bool`, `char` (as `crust_char`), `()`, `&str` |
 | Pointers | `*const T`, `*mut T`, `&T`, `&mut T` (all lower to `T *`) |
 | Arrays | `[T; N]`, and slices `&[T]` / `&mut [T]` |
-| Option | `Option<T>`, `Some(x)`, `None`, `is_some`, `is_none`, `unwrap`, `unwrap_or`, `if let`, `while let` |
-| Result | `Result<T, E>`, `Ok(x)`, `Err(e)`, `is_ok`, `is_err`, `unwrap`, `unwrap_err`, `unwrap_or`, `ok`, and the `?` operator |
+| Option | `Option<T>`, `Some(x)`, `None`, `if let`, `while let`, `match`, and the methods in "Option and Result methods" |
+| Result | `Result<T, E>`, `Ok(x)`, `Ok(())`, `Err(e)`, `match`, the `?` operator, and the methods in "Option and Result methods" |
 | Statements | `let` (with `mut` and optional annotation), `return`, `if`/`else if`/`else`, `while`, `loop`, `for x in a..b` and `a..=b`, `for x in slice_or_array`, `match`, `break`, `continue`, local `const`, blocks |
 | Expressions | literals, array literals `[a, b, c]` and repeats `[v; N]`, calls, indexing, field access, unary and binary operators, compound assignment, `as` casts, `if`/`else` as an expression |
 | Tail expressions | a trailing expression in a function body becomes its return value |
@@ -145,9 +145,78 @@ Crust checks exhaustiveness and names the variants that are missing:
 line 2: non-exhaustive match on `E`: `C` not covered; add an arm or `_`
 ```
 
-Patterns are limited to literals, enum variants, constants and `_`. A bare
-identifier would be a *binding* in Rust, and Crust has no bindings, so it is
-rejected instead of being silently treated as a comparison.
+That `switch` is used when every arm is a constant label: literals,
+constants, C-like variants, and data-enum variants that only bind their
+payload. Any other pattern selects the second lowering, below.
+
+### General patterns: the if/else chain
+
+A match with guards, ranges, bindings, nested payload patterns, tuples, or an
+`Option`/`Result` scrutinee lowers to an if/else chain. Each arm's pattern goes
+through `Parser.pattern_test`, the same function `matches!` uses:
+
+```rust
+match o {
+    Some(0) => 1,
+    Some(1..=9) => 10,
+    Some(n) if n > 100 => 0,
+    Some(n) => n,
+    None => 0,
+}
+```
+
+The scrutinee is held in a temporary unless it is already a place.
+Bindings are declared as copies at the top of their arm. A guard reads them as
+aliases for places in the scrutinee, because it runs before the arm is chosen.
+If a guard hoists work of its own, that work goes in the previous arm's
+`else`, so it runs only when this arm is reached. A `&Enum` scrutinee is seen
+through (`match self` in a method), as Rust's match ergonomics do.
+
+Exhaustiveness is checked for enums, `Option`, `Result` and `bool`. An arm
+counts as covering a case only if it has no guard and its payload patterns
+are all irrefutable, so `Some(v) if v > 0` or `Ok(0)` covers nothing.
+Coverage of integers and tuples by ranges is not something Crust can prove;
+rustc already has, for any program it accepts. So instead of falling off the
+end, which would leave a value `match` unassigned, the chain ends in
+`abort()`.
+
+A bare name is a binding and matches anything (`other => other + 1`), as is
+`name @ pattern`. A binding inside `|` alternatives is rejected, since each
+alternative would bind from a different place.
+
+### `match` as a value
+
+`let y = match x { .. };` works, as does a `match` anywhere in an expression.
+It shares its lowering with blocks in value position (`Parser.value_of`). The
+construct is parsed as ordinary statements into its own buffer, and every
+*tail* expression assigns one temporary instead of returning. Tails already
+flow through every construct that can end a block (`if`, nested `match`,
+blocks, `if let`), so an arm like `0 => if b { 1 } else { 2 }` yields its
+value with no extra code. The finished text is hoisted into the enclosing
+statement's pending list.
+
+The temporary's type is the widest of the arms' integer types, or the first
+arm's type otherwise. This is because Crust types an untyped literal as
+`int`, and `match k { 0 => 1, _ => big_i64 }` must not truncate. An arm
+that diverges (`panic!`, `unreachable!`) is emitted as a statement. `return`,
+`break` and `continue` work as arm bodies (`None => return 0,`) and drop
+live locals exactly as the statements do.
+
+Blocks used as values moved onto the same path. They used to parse each
+statement tentatively as an expression and re-parse it as a statement when
+that failed. The first attempt's side effects could not be undone: a `?` in
+it ran twice, and a move in it made the re-parse report a use after move
+that never happened. Owning locals declared in the block were also never
+dropped.
+
+### Only the last statement is the tail
+
+`parse_stmt` used to hand every `match` and `if` statement the function's
+tail flag, wherever it stood. So in a function returning a value, a
+mid-body `match x { 1 => t += 1, _ => t += 2 }` or `if c { f() }` *returned*.
+A braced statement is now the block's value only if the block's `}` follows
+it, found by scanning to the end of its last brace group (following `else`
+chains).
 
 ## Constants
 
@@ -185,33 +254,153 @@ Because the representation is an ordinary C struct, **C can build and pass
 slices too** — `(crust_slice_int){data, 6}` is exactly what Crust emits — so
 the boundary stays free of conversion shims.
 
-## Iteration
+## Iteration and iterator expressions
 
-`for x in xs` walks a slice or an array directly, lowering to the index loop
-you would otherwise write by hand:
+Iterator chains work both as `for` subjects and as expressions:
 
 ```rust
-for x in xs { total += x; }
+let s: i32 = v.iter().filter(|x| **x > 3).map(|x| x * x).sum();
+let evens: Vec<i32> = (0..n).step_by(2).collect();
+let d: i32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+for (i, x) in v.iter().enumerate().skip(1) { .. }
 ```
+
+| kind | methods |
+|---|---|
+| sources | ranges (`(a..b)`, `(a..=b)`), slices, arrays, `Vec` (by value, `&v`, `&mut v`, through a pointer), `PyList`, and on a `&str` or `String`: `bytes()`, `chars()`, `char_indices()` |
+| on the source | `iter`, `iter_mut`, `into_iter`, `copied`, `cloned`, `rev`, `skip`, `take`, `step_by`, `zip`, `chain` |
+| per element | `map`, `filter`, `filter_map`, `enumerate`, `take_while`, `skip_while`, `inspect`, `copied`, `cloned`, and `skip`/`take`/`step_by` after any of these |
+| consumers | `sum`, `product`, `count`, `min`, `max`, `min_by_key`, `max_by_key`, `any`, `all`, `find`, `position`, `fold`, `last`, `nth`, `for_each`, `collect` (into a `Vec`, or a `String` from `char`s or `&str`s), and `Range::contains` |
+
+### How it lowers
+
+There are no iterator objects. `v.iter()` produces an *iterator value*: the
+source and the adaptors applied so far, with nothing emitted yet. A consumer,
+or a `for` loop, lowers the whole chain into **one counted loop** hoisted
+before the statement:
 
 ```c
-{ crust_slice_int _crust_opt1 = xs;
-  for (unsigned long _crust_i2 = 0; _crust_i2 < _crust_opt1.len; _crust_i2++)
-  { int x = _crust_opt1.ptr[_crust_i2]; total += x; } }
+int _crust_opt3 = 0;
+for (unsigned long _crust_i1 = 0; _crust_i1 < v->len; _crust_i1++) {
+  int _crust_opt2 = v->ptr[_crust_i1];
+  { int x = _crust_opt2; if (!((x > 3))) continue;
+    { int x = _crust_opt2; int _crust_opt4 = (x * x); _crust_opt3 += _crust_opt4; } } }
 ```
 
-The subject is held in a temporary, so a call in that position is evaluated
-once per loop rather than once per iteration, and the whole construct is
-wrapped in a block to scope both the temporary and the induction variable. An
-array takes its length from its own type; a raw pointer is rejected, since its
-length is not known — slice it first (`&p[0..n]`) or use a range.
+The chain has two phases:
 
-The binding is a **copy** of the element, which is `for x in xs.iter().copied()`
-rather than Rust's reference binding. Crust has no borrow checker to make the
-difference observable, and a copy is what the C on the other side of the
-boundary would do. `.iter()` and `.iter_mut()` are accepted as no-ops so the
-idiomatic spelling reads the same; there is no iterator protocol behind them,
-so adaptors like `.map` are not available.
+- **Source adaptors** (`rev`, `skip`, `take`, `step_by`, `zip`) are
+  arithmetic on positions. Every such chain is an arithmetic progression (a
+  start, a count, a stride), and each adaptor updates those three numbers,
+  so any combination is exact and costs nothing per element. `zip` gives
+  each source its own start and stride over a shared counter, and later
+  adaptors move them together.
+- **Stages** (`map`, `filter`, ..) are statements in the loop body, each in
+  its own C block, so a closure parameter named `x` in two stages is two
+  variables. `skip`/`take`/`step_by` after a stage count the elements that
+  reach them, since a filter changes which ones those are. `rev` and `zip`
+  after a stage are rejected: they would need the elements a stage produces
+  to be known in advance.
+
+The chain is **lazy**, as in Rust. `(0..100).map(f).take(3)` calls `f`
+three times. `take`'s limit is checked at the top of each pass, before any
+upstream stage runs, which is exactly when Rust's `Take` stops asking.
+`any`, `all`, `find`, `position` and `nth` break out as soon as they know.
+
+Closures are inlined, as for `Option` and `Result`: captures are names in
+scope, and `for_each(|x| t += x)` mutates `t`. A closure parameter can
+destructure a pair (`|(i, x)|`, `|&(a, b)|`). A named function works too
+(`.and_then(half)`, `.map(inc)`). A consumer inside a closure
+(`.map(|r| r.iter().sum::<i32>())`) nests its loop inside the stage.
+`sum::<T>()` and `collect::<Vec<T>>()` take a turbofish, and `Vec<_>` means
+"infer".
+
+An iterator that is never consumed (`let it = v.iter();`) is an error rather
+than a value, since there is nothing it could lower to.
+
+### Bindings
+
+Bindings follow Rust:
+
+- `iter_mut()` and `&mut v` bind a **pointer**, so `*x += 1` writes the
+  element.
+- `iter()`, `&v` and a slice bind a **copy** marked as standing for Rust's
+  `&T`. On it `*x` is the value itself, because real code writes both
+  `t += x` and `t += *x` there.
+- More generally, `*` on a scalar value is accepted as the value: that is
+  never valid Rust on a real scalar, so the operand always stood for a
+  reference Crust holds by value, as in `*a.iter().max().unwrap()`.
+- `for &x in ..` and `|&x|` bind the value; `(i, x)` destructures a pair or
+  a tuple element.
+
+`for x in v` and `v.into_iter()` over an owning `Vec` **consume** it, as in
+Rust, and reading `v` afterwards is rejected. In a `for` loop with no stages,
+each element is dropped at the end of its pass. A `Vec` that a call returned
+is held in a temporary and freed after the loop, however the loop is left.
+
+### Not supported
+
+`flat_map`, `flatten` on iterators, `peekable`, `windows`, `chunks`,
+`rev`/`zip`/`chain` after a stage, `zip` of a `zip`, and `chain` or `zip`
+mixed with `chars()`. Each is named in the diagnostic rather than
+mistranslated.
+
+`chain` fits the position arithmetic: a chained source yields
+`pos < n1 ? first[pos] : second[pos - n1]`, so `rev`, `skip` and `take` keep
+working across the seam, and chains nest. Both sides must yield the same
+type.
+
+### Two bugs found on the way
+
+Indexing an **array of slices** (`rows[0]` on `[&[i32]; 2]`) compiled to
+`rows.ptr[0]`, because the element type was checked before the array-ness.
+Iterating one had the same mistake.
+
+Iterator sources were first written as a list mixing strings and a type,
+which py2c typed from its first use as a string. The self-hosted build then
+failed to compile `crust.py`. A slotted class (`_Source`) gives each field
+its own type, the same reason `_Item` and `IterChain` are classes.
+
+## `char` and strings
+
+`char` lowers to `crust_char`, a typedef of `unsigned int`. It is the same
+representation as before, but now a type of its own. That matters in three
+places:
+
+- `println!("{}", c)` prints the character. It used to print its number,
+  `97` for `'a'`, because a `char` and a `u32` were one C type and formatting
+  could not tell them apart. `{:?}` prints it quoted (`'a'`). The argument
+  goes through `crust_char_utf8`, which encodes it into one of a few
+  rotating static buffers, so several chars can appear in one `printf`.
+- `collect()` can target a `String`.
+- `Vec<char>` and `Vec<u32>` no longer share a mangled name.
+
+A char literal lowers to its code point (`'\u{e9}'` is `233u`). A string
+literal's `\u{..}` escapes become UTF-8 octal escapes. C has no `\u{..}`,
+and `\x` would swallow any hex digits that follow.
+
+`String::push` takes a `char` and appends its UTF-8 encoding, as Rust's does.
+It used to take a byte. `push_byte` appends one raw byte. `String::clone` is
+a deep copy.
+
+`chars()` and `char_indices()` decode UTF-8. A character's position depends
+on the width of every one before it, so this cannot be position arithmetic.
+The loop walks byte offsets and decodes one code point per pass, and after
+`.rev()` it walks backwards over continuation bytes. `skip`/`take`/`step_by`
+on it are per-element counters. `bytes()` is still plain indexing.
+
+`char` methods:
+
+- The ASCII ones (`is_ascii_digit`, `is_ascii_alphabetic`, `is_ascii_uppercase`,
+  `is_ascii_whitespace`, `is_ascii_punctuation`, .., `to_ascii_uppercase`,
+  `to_ascii_lowercase`) also work on `u8`.
+- `is_whitespace` is exact, since Unicode's White_Space set is a short fixed
+  list.
+- `to_digit(radix)` gives an `Option<u32>`, and `len_utf8()` the encoded width.
+- `is_alphabetic`, `is_numeric`, `to_uppercase` and the other Unicode-table
+  classifications are **refused**, naming the ASCII method to use instead.
+  Crust carries no Unicode tables, and an ASCII approximation would be
+  silently wrong on `'é'`.
 
 ## Unit structs
 
@@ -272,9 +461,9 @@ instead of returning garbage. `unwrap_or(d)` is inlined as a ternary, and
 
 `if let Some(x) = e { .. } else { .. }` and `while let Some(x) = e { .. }`
 lower to a temporary plus a test, so the subject is evaluated exactly once
-and the binding is scoped to the arm that owns it. Only the `Some(x)` pattern
-is supported — `match` on an `Option` needs pattern bindings, which Crust
-does not have.
+and the binding is scoped to the arm that owns it. `if let` takes only the
+`Some(x)` pattern; for anything richer, `match` on an `Option` works (see
+"General patterns").
 
 ## Result and `?`
 
@@ -313,6 +502,67 @@ int x = _crust_opt1.value;
 `?` also works on `Option` inside a function returning `Option`. Crust has no
 `From` conversions, so the error types must match exactly; a mismatch is a
 diagnostic naming both types rather than a silent reinterpretation.
+
+## Option and Result methods
+
+| type | methods |
+|---|---|
+| `Option<T>` | `is_some`, `is_none`, `is_some_and`, `is_none_or`, `unwrap`, `expect`, `unwrap_or`, `unwrap_or_else`, `unwrap_or_default`, `unwrap_unchecked`, `map`, `map_or`, `map_or_else`, `and_then`, `or`, `or_else`, `xor`, `filter`, `inspect`, `ok_or`, `ok_or_else`, `as_ref`, `as_mut`, `copied`, `cloned`, `flatten`, `take`, `replace`, `insert`, `get_or_insert`, `get_or_insert_with` |
+| `Result<T, E>` | `is_ok`, `is_err`, `is_ok_and`, `is_err_and`, `unwrap`, `unwrap_err`, `expect`, `expect_err`, `unwrap_or`, `unwrap_or_else`, `unwrap_or_default`, `ok`, `err`, `map`, `map_err`, `map_or`, `map_or_else`, `and_then`, `or_else`, `inspect`, `inspect_err` |
+
+A method called through `&Option<T>` / `&mut Option<T>` sees through the
+reference, as field access does. The mutators (`take`, `replace`,
+`get_or_insert`, ..) need a place to write to: a local, a field or a
+dereferenced pointer.
+
+### Closures are inlined, not lifted
+
+The closure-taking methods are where idiomatic Rust passes *capturing*
+closures, as in `.map(|x| x + offset)`. Crust's general closure lowering lifts
+a closure to a top-level function and rejects captures, so going through it
+would have rejected most real uses. A closure *literal* passed to one of
+these methods is instead inlined at the call site:
+
+```rust
+let off: i32 = 10;
+let a: Option<i32> = get(5).map(|x| x + off);
+```
+
+```c
+crust_option_int _crust_opt1 = get(5); crust_option_int _crust_opt2;
+if (_crust_opt1.some) { int x = _crust_opt1.value;
+    _crust_opt2 = (crust_option_int){1, (x + off)}; }
+else { _crust_opt2 = (crust_option_int){0}; }
+```
+
+The parameters are bound in a scope nested inside the current one, so a
+capture is just a name in scope. The body goes in the branch where it runs,
+so `unwrap_or_else(|| slow())` calls `slow` only on `None`, as Rust does. A
+parameter of a method that passes `&T` (`filter`, `inspect`) is bound as a
+pointer, or as the value under a `|&x|` pattern. A named function or a
+function pointer (`.and_then(half)`) is called.
+
+`return` and `?` inside such a closure are rejected. Inlined, they would leave
+the *enclosing* function rather than the closure, which is silently
+different.
+
+### `expect` and `panic!` say why
+
+`expect(msg)` and `panic!("..", ..)` print their message to stderr before
+aborting. `panic!` used to abort silently.
+
+### Pointer arguments had no name of their own
+
+`_mangle`, which names every monomorphised type, dropped the `*` along with
+the other punctuation. So `Option<*mut i32>` and `Option<i32>` were both
+`crust_option_int`: one struct for two types, with a pointer silently read as
+an integer. `Vec<*mut u8>` and `Vec<u8>` collided the same way. Pointer depth
+is now spelled as a `_p` per level (`crust_option_int_p`).
+
+### `Ok(())`
+
+`Ok(())`, which is how nearly every `Result<(), E>` function spells success,
+did not parse: the unit form of `Ok` expected its `)` immediately.
 
 ## Rust modules by `#include`
 
@@ -860,10 +1110,62 @@ crust_fn_int_int twice = _crust_closure1;
 ```
 
 Each distinct signature gets a typedef, generated on demand like everything
-else. **A closure that reads a local is rejected**, because Crust has no
-environment to capture into and compiling it against the wrong binding would
-be silent and wrong. Parameter types must be annotated; Crust does not infer
-them.
+else. Parameter types must be annotated; Crust does not infer them.
+
+### Capturing closures
+
+A closure that uses the enclosing function's locals gets an **environment**,
+as it does in Rust: a struct of its own holding what it captures, and a lifted
+function taking a pointer to it.
+
+```rust
+let off: i32 = 10;
+let add = |x: i32| x + off;
+add(5)
+```
+
+```c
+struct _crust_closure1_env { int *off; };
+static int _crust_closure1(_crust_closure1_env *_env, int x) { return (x + (*_env->off)); }
+..
+_crust_closure1_env add = (_crust_closure1_env){.off = &off};
+_crust_closure1(&add, 5)
+```
+
+Capture modes follow Rust:
+
+- A plain closure captures by **reference**, so
+  `let mut inc = || count += 1;` changes `count` itself.
+- A `move` closure captures by **value**. A `move` of an owning value makes
+  the closure its owner: the source is moved out of (zeroed, and rejected if
+  used again), and the closure's environment gets a destructor that drops it
+  at the closure's scope exit.
+- Inside the body, a captured owning value is a **borrow**, and moving it out
+  is rejected, because the environment still owns it.
+- An array is captured as a pointer to its first element, which indexes and
+  iterates the same way.
+
+A call `f(x)` is a direct call, `_crust_closure1(&f, x)`, with no indirection.
+Every closure has its own environment type, so passing one to a generic
+function monomorphises it. `fn apply<F: Fn(i32) -> i32>(f: F, ..)`, a `where
+F: FnMut()` clause, `f: &mut F`, and `impl Fn(i32) -> i32` in parameter
+position (an anonymous type parameter) all work. A stored closure can also be
+passed where a method takes one, as in `.filter(pred)` or `.map(f)`. Arguments
+are adapted to the parameter types, so a closure written `|x: &i32|` receives
+an address where the iterator has a value.
+
+Closures without captures still lower to plain functions and function
+pointers, exactly as before.
+
+A closure's body is a function of its own, so an explicit `return` or a `?`
+in it returns from the closure, and its locals are dropped on the way out.
+Closures inlined into `Option`/`Result`/iterator methods reject both, since
+there they would leave the enclosing function.
+
+**Not supported:** returning a closure (`-> impl Fn(..)`), reported rather
+than lowered, and `dyn Fn` / `Box<dyn Fn>`, which would need a vtable. The
+borrow checker's guarantee that a by-reference closure does not outlive what
+it captured is not checked; Crust relies on the program being valid Rust.
 
 ### C keyword collisions
 
@@ -1222,7 +1524,7 @@ itself** (`shivyc/crust_core/core.rs`) and seeds every unit with them.
 
 | type | what it is |
 |---|---|
-| `Vec<T>` | growable array: `new`, `with_capacity`, `push`, `pop`, `get`, `set`, `len`, `capacity`, `last`, `clear`, `as_ptr`, `free_buf` |
+| `Vec<T>` | growable array that owns its elements: `new`, `with_capacity`, `push`, `pop`, `get`, `set`, `len`, `capacity`, `last`, `clear`, `as_ptr`, `free_buf` |
 | `Box<T>` | one heap value: `new`, `get`, `set`, `as_ptr`, `free_box` |
 | `Cell<T>` | a named holder for a value |
 | `PhantomData<T>` | zero-sized marker |
@@ -1468,6 +1770,183 @@ C++ RAII (`#include "owned.cpp"`) remains available for guards that wrap
 Crust types from the other side, and is still the right tool where the guard
 should borrow rather than own.
 
+## Loops: values, labels, and `break` inside a `switch`
+
+`loop` is an expression. `break v` assigns its temporary and leaves, and a
+`loop` ending a function body is that function's value:
+
+```rust
+fn find(xs: &[i32], want: i32) -> i32 {
+    let mut i: usize = 0;
+    loop {
+        if i == xs.len() { break -1; }
+        if xs[i] == want { break i as i32; }
+        i += 1;
+    }
+}
+```
+
+It is lowered like a value `match`: emitted as a statement into its own
+buffer and hoisted into the enclosing statement's pending list. The type is
+joined across the `break` values the same way arm types are, and a `break`
+value reads the loop's target, so `break None` resolves. A `break w` that
+moves an owning local out zeroes it, so the body's drop of `w` is a no-op. A
+loop with no `break` value is `!` and is emitted as a plain statement. A
+`break` with a value from `while` or `for` is rejected, as in Rust.
+
+Loops take labels: `'outer: for .. { .. break 'outer; .. continue 'outer; }`,
+on `loop`, `while`, `while let` and `for x in xs`. The lexer used to drop
+`'outer` as a lifetime, leaving a stray `:` and a confusing error. It now
+emits a label token when the name is followed by `:` and a loop keyword, or
+follows `break`/`continue`. A lifetime bound (`'b: 'a`) is told apart by what
+follows the colon. Labelled blocks (`'a: { .. }`) are reported rather than
+supported.
+
+Every `break` and `continue` resolves its target on a stack of enclosing
+loops and drops live locals out to that loop's body frame. It then uses C's
+own `break`/`continue` when that reaches the right loop, and otherwise a
+`goto`. For `break` the label goes just after the loop. For `continue` it
+goes at the end of the target body, after that body's drops (the jump site
+already ran them) and before the `}`, so a `for` still runs its increment.
+Labels are only created when a `goto` needs one.
+
+The `goto` also fixes a bug that had nothing to do with labels. A match
+whose arms are all constants lowers to a C `switch`, and in C `break` inside a
+`switch` leaves the *switch*. A Rust `break` in such an arm left only the
+match, and the loop carried on:
+
+```rust
+loop {
+    i += 1;
+    match i { 5 => { break; } _ => {} }   // kept looping to 41
+    if i > 40 { break; }
+}
+```
+
+Each loop records how many `switch`es were open when it began. A `break`
+from inside a deeper one goes by `goto`. `continue` is unaffected, because C's
+`continue` ignores a `switch`.
+
+## Containers own their elements
+
+A `Vec`, `VecDeque` or `Box` drops what it holds when it is freed, at scope
+exit or by `free_buf`/`free_box`. `clear` drops the elements, and `set(i, x)`
+drops the one it replaces, as `v[i] = x` does in Rust. They used to free only
+their buffer, so every owning element leaked: a `Vec<String>`'s strings, a
+`Vec<Vec<T>>`'s inner buffers, anything with an `impl Drop`.
+
+The bundled `Vec<T>` is written in the Crust subset and is generic. It cannot
+name `T`'s destructor, so `free_buf`, `clear` and `set` call two hooks the
+source never defines, `drop_elems()` and `drop_at(i)`. The compiler writes
+those per instantiation after every body has been translated. Only then is it
+settled what owns something, because a `Vec<G>` can be instantiated before the
+drop analysis has seen `impl Drop for G`. For `Vec<i32>` the hooks are empty.
+
+### Borrows
+
+Once the container owns its elements, every copy that leaves it is a second
+owner. Rust never lets that happen: `v.get(i)` and `v.iter()` give `&T`.
+Crust gives the bits, so those copies are tracked as **borrows**. That covers
+results of `get`, `last`, `front` and `back`, bindings from `iter()` or `&v`,
+closure parameters over them, and anything initialised from a borrow
+(`let c = a;`). A borrow is never dropped. Handing one to something that
+would drop it is rejected:
+
+```rust
+let a: G = v.get(0);   // fine: a borrow
+take(a);               // rejected: `take` would drop what `v` still owns
+```
+
+The same check covers a by-value argument (including `push`), `return`, an
+assignment into an owning place, a struct field, and `collect` over borrowed
+elements. Each diagnostic suggests `.clone()` or a reference.
+
+`.cloned()` over owning elements calls the element's `clone`, a deep copy.
+`String` now has one. `.copied()` over an owning element is refused, since
+such a type is never `Copy` in Rust.
+
+A consuming loop, `for x in v` or `v.into_iter()`, moves each element out
+as it visits it and zeroes the slot. The container's own free then finds
+nothing there. An early `break` leaves the rest in place, and they are
+dropped with the container. That happens later than Rust would drop them (at
+the container's scope exit rather than at the loop's end), but each is
+dropped exactly once.
+
+Remaining gaps. An iterator expression that consumes an owning source but
+keeps nothing (`v.into_iter().count()`) leaks the elements rather than
+dropping them. `Rc`/`Arc` still need an explicit `release`.
+
+## Hoisted work, and where it has to run
+
+Several constructs cannot be a C expression and are lowered by hoisting
+statements into the enclosing statement's *pending* list: `?`, a block used as
+a value, a method call on a temporary, a spilled operand. The list is emitted
+just before the statement. That is only right when the hoisted work runs
+exactly when, and as often as, the expression it came from. Several positions
+broke that, all silently:
+
+| position | what went wrong |
+|---|---|
+| `while` condition | emitted once above the loop, so the loop re-tested a stale value forever |
+| right of `&&` / `\|\|` | ran even when the operator short-circuited, so a `?` there could return early |
+| arms of an `if` expression | both arms' work ran, whichever was taken |
+| `else if` condition | emitted *after* the whole chain, after the code that reads it |
+| `for` headers | never emitted before the loop |
+| match arm written as an expression | never emitted at all |
+
+Each is now lowered to control flow that runs the work in its own branch:
+`for (;;) { work; if (!(cond)) break; .. }` for `while`, and a `_Bool` or typed
+temporary assigned under an `if` for the operators and the `if` expression.
+
+Two related evaluation-count bugs are fixed alongside. `for i in 0..n()` called
+`n()` on every iteration, and `for i in 0..v.len()` with a `push` in the body
+never ended, because Rust evaluates a range once and C's `for` re-tests its
+condition. A bound that is not a literal or a constant is now held in a
+temporary. And lowerings that name an operand twice (`unwrap_or`, `.ok()`,
+`cmp::min`/`max`, pattern tests) spill a call first, through `Parser.once`.
+
+## Drops on every exit
+
+`?` is an early return and owes the same drops `return` does. It returned
+bare, so every owning local in scope leaked on the error path, which is the
+path `?` exists for. Match arms written as an expression had the same defect,
+and so did `if let` / `while let` bodies, which opened a scope and closed it
+without dropping anything declared in it. A `while let` body was also not
+marked as a loop, so a `break` in it unwound to the wrong frame.
+
+## Moves into methods
+
+Passing an owning local to a *method* by value is a move, exactly as for a
+free function. `v.push(s)` used to copy `s` into the `Vec` and then drop `s`
+at scope exit, leaving the `Vec` holding a freed buffer; a by-value `impl
+Drop` argument was dropped twice. Method arguments now also read the
+parameter types, so `slot.put(None)` can type its `None`.
+
+The `Vec` then owns the element, and drops it when it is freed; see
+"Containers own their elements".
+
+## `matches!` and pattern tests
+
+`matches!` parsed its pattern as an expression and compared with `==`, so
+`matches!(4, 1 | 4)` compiled to `4 == (1 | 4)` and was false. It now goes
+through `Parser.pattern_test`, which lowers a pattern to a C condition over a
+place plus the bindings it introduces. It handles `|` alternatives, ranges
+(`a..=b`, `a..b`, `a..`, `..=b`), `_`, literals and constants, enum variants
+with nested payload patterns, `Some`/`None`, `Ok`/`Err`, tuples, and `name @
+pat`. A guard may read the bindings: they are declared as *aliases* for places
+in the tested value (`Some(v) if v > 3` reads `tmp.value`), so nothing is
+copied. The guard's own hoisted work runs only after the pattern has matched.
+A binding inside `|` alternatives is rejected, since each alternative would
+bind from a different place.
+
+## Generated structs are ordered with user structs
+
+`Option`, `Result` and tuple instantiations were defined in the prelude before
+any user struct. So `Option<Point>` saw an incomplete `Point`, and a struct
+with an `Option<i32>` field reached the option struct again through the
+dependency sort and defined it twice. They now go through the same sort as
+every other struct.
+
 ## Finding crashes: `tools/crustfuzz.py`
 
 A compiler has two acceptable outcomes for any input: compile it, or reject it
@@ -1583,10 +2062,9 @@ there is no shortcut left that avoids them.
 
 ## Not yet supported
 
-The iterator protocol proper (`.map`, `.filter`, `.zip`, chained adaptors),
-`From`/`Into` conversions, `dyn Trait` and trait objects, capturing closures,
-and the borrow checker. `match` has no guards or range patterns, and outside a
-data enum no pattern bindings. Slices carry no bounds checking. A repeat
+`From`/`Into` conversions, `dyn Trait` and trait objects, returning closures
+(`impl Fn`), and the borrow checker. `match` has no slice patterns, struct patterns on
+plain structs, or bindings inside `|` alternatives. Slices carry no bounds checking. A repeat
 initializer whose length is not a literal or `const` is rejected, since C has
 no repeat syntax to lower it to. Lifetimes are accepted and dropped rather
 than checked. Paths (`a::b`) are flattened to `a_b`. `Rc`/`Arc` do not

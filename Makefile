@@ -90,6 +90,7 @@ default:
 # example so a silent miscompile that still exits 0 is caught.
 test_crust:
 	python3 -m unittest tests.test_crust -v 2>&1 | tail -5
+	python3 -m unittest tests.test_crust_extras -v 2>&1 | tail -5
 	python3 tools/crust_examples.py -v
 
 test_fast_crust:
