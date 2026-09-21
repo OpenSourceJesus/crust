@@ -6,7 +6,7 @@ public class Ball : MonoBehaviour
 	{
 		transform.LookAt(Camera.main.transform);
 		transform.eulerAngles += Vector3.forward * 45;
-		transform.rotation = Quaternion.Euler(Vector3.forward * 45);
+		transform.rotation = Quaternion.LookRotation(Vector3.forward, Vector3.up);
 	}
 	
 	void Update ()
