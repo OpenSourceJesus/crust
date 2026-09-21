@@ -87,6 +87,7 @@ Unity's `UnityException` / `TypeInitializationException` every frame and
 | `.GetComponent<T>()` on a null GO | **NullReferenceException** with `Class.Method () (at path:line)`; method exits (Unity) |
 | `.GetComponent<T>()` on a live GO | Instance index of authored `T`, or **-1** if absent |
 | `Find(...).GetComponent<T>().field` | NRE if Find missed or component/field receiver is null |
+| `transform.Find(name)` / nested `"A/B"` | Child GO via authored `m_Father` parents table → index or **-1** |
 
 Parsed with cpprust `_match_paren` / `_match_angle` (same AST helpers
 csrust uses). Find **does not** fail at pack time for unknown names —
@@ -94,7 +95,8 @@ lookup is runtime only (Unity null). Calling a method or reading a field on
 that null is a `NullReferenceException` (logged with script site); `setjmp`
 unwinds the current `Start`/`Update` so the player keeps running. `GetComponent<T>`
 still requires `T` to be an authored packed MonoBehaviour (no invented
-component types).
+component types). `transform.Find` walks authored parent links only (no
+invented hierarchy).
 
 ## Animation (script motion + authored clips)
 
@@ -228,6 +230,7 @@ refused (no invent).
 Asset GUIDs resolve under `Assets/`, `Packages/`, and
 `Library/PackageCache/` (UPM). Only `Assets/**/*.cs` become packed
 MonoBehaviours — package scripts are for reference resolution only.
+`Assets/**/Editor/**/*.cs` are skipped (Unity editor-only assemblies).
 
 ## Physics (Rigidbody / Rigidbody2D + FixedUpdate)
 

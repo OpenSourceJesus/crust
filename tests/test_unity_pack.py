@@ -890,6 +890,121 @@ class TestSystems(unittest.TestCase):
         run = subprocess.run([exe], capture_output=True, text=True)
         self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
 
+    def test_transform_find_child_by_authored_hierarchy(self):
+        """transform.Find(name) → child GO index via authored m_Father."""
+        root = tempfile.mkdtemp(prefix="upack-tfind-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Parent.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "using System;\n"
+                "public class Parent : MonoBehaviour {\n"
+                "    void Start() {\n"
+                "        if (transform.Find(\"Child\") != null)\n"
+                "            Console.WriteLine(\"child_ok\");\n"
+                "        if (transform.Find(\"Nope\") == null)\n"
+                "            Console.WriteLine(\"nope_ok\");\n"
+                "        if (transform.Find(\"Child/Grand\") != null)\n"
+                "            Console.WriteLine(\"nest_ok\");\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Parent.cs.meta"), "w") as f:
+            f.write("guid: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Parent\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_Children:\n  - {fileID: 5}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee}\n"
+                "--- !u!1 &4\nGameObject:\n  m_Name: Child\n"
+                "  m_Component:\n  - component: {fileID: 5}\n"
+                "--- !u!4 &5\nTransform:\n"
+                "  m_GameObject: {fileID: 4}\n"
+                "  m_LocalPosition: {x: 1, y: 0, z: 0}\n"
+                "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "  m_Father: {fileID: 2}\n"
+                "  m_Children:\n  - {fileID: 7}\n"
+                "--- !u!1 &6\nGameObject:\n  m_Name: Grand\n"
+                "  m_Component:\n  - component: {fileID: 7}\n"
+                "--- !u!4 &7\nTransform:\n"
+                "  m_GameObject: {fileID: 6}\n"
+                "  m_LocalPosition: {x: 0, y: 1, z: 0}\n"
+                "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "  m_Father: {fileID: 5}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-tfind-out-")
+        plan = unity_pack.pack(root, d)
+        self.assertIn("Parent", plan["classes"])
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("Transform_Find", eng)
+        self.assertIn("_engine_go_parent", eng)
+        self.assertIn('Transform_Find(_engine_go_of_Parent(i), "Child")', eng)
+        self.assertIn('Transform_Find(_engine_go_of_Parent(i), "Nope")', eng)
+        self.assertIn(
+            'Transform_Find(_engine_go_of_Parent(i), "Child/Grand")', eng)
+        self.assertNotIn("transform.Find", eng)
+        parents = plan.get("go_parents") or []
+        names = plan.get("go_names") or []
+        self.assertIn("Parent", names)
+        self.assertIn("Child", names)
+        self.assertIn("Grand", names)
+        pi, ci, gi = names.index("Parent"), names.index("Child"), names.index(
+            "Grand")
+        self.assertEqual(parents[ci], pi)
+        self.assertEqual(parents[gi], ci)
+        if not _CC:
+            return
+        host = os.path.join(d, "host.c")
+        with open(host, "w") as f:
+            f.write(
+                "void engine_tick(void);\n"
+                "extern float Time_deltaTime;\n"
+                "int main(void) {\n"
+                "  Time_deltaTime = 0.02f;\n"
+                "  engine_tick();\n"
+                "  return 0;\n"
+                "}\n"
+            )
+        r = subprocess.run(
+            [_CC, "-O2", "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(
+            [_CC, "-O0", "-c", "-o", os.path.join(d, "data.o"),
+             os.path.join(d, "data.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        exe = os.path.join(d, "run")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host,
+             os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+        self.assertIn("child_ok", run.stdout)
+        self.assertIn("nope_ok", run.stdout)
+        self.assertIn("nest_ok", run.stdout)
+
     def test_transform_rotation_quaternion_euler_packs(self):
         """transform.rotation = Quaternion.Euler(...) → set_euler on live quat."""
         root = tempfile.mkdtemp(prefix="upack-rotq-")
