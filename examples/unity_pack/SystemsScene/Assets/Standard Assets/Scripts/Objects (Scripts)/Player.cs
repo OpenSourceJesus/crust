@@ -35,4 +35,9 @@ public class Player : MonoBehaviour
 		SpriteRenderer spriteRend = gameObject.AddComponent<SpriteRenderer>();
 		System.Console.WriteLine(spriteRend);
 	}
+
+	void OnCollisionEnter2D (Collision2D coll)
+	{
+		System.Console.WriteLine(coll);
+	}
 }

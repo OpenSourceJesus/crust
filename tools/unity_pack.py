@@ -56,6 +56,9 @@ _FILE_SUPPORTED = frozenset({"WriteAllText", "AppendAllText"})
 # UnityEngine.Application members we emit. Others → CS0117.
 _APPLICATION_SUPPORTED = frozenset({"dataPath", "persistentDataPath"})
 
+# UnityEngine.Quaternion members we emit. Others → CS0117 (in scope via UnityEngine).
+_QUATERNION_SUPPORTED = frozenset({"Euler", "identity", "LookRotation"})
+
 # MonoBehaviour.transform members we lower. Others → CS1061 on Transform
 # (transform itself is always in scope; blame the missing member).
 _TRANSFORM_SUPPORTED = frozenset({
@@ -98,6 +101,26 @@ def _check_application_api(path, text, scan):
         col = member_idx - (text.rfind("\n", 0, member_idx) + 1) + 1
         raise PackError(
             "%s(%d,%d): error CS0117: 'Application' does not contain a "
+            "definition for '%s'"
+            % (_assets_rel_path(path), line, col, member)
+        )
+
+
+def _check_quaternion_api(path, text, scan):
+    """Unsupported Quaternion.Member with UnityEngine in scope → Unity CS0117."""
+    has_ue = bool(re.search(r"using\s+UnityEngine\b", scan))
+    for m in re.finditer(r"(?:UnityEngine\.)?Quaternion\.(\w+)\b", scan):
+        member = m.group(1)
+        if member in _QUATERNION_SUPPORTED:
+            continue
+        is_fqn = m.group(0).startswith("UnityEngine.")
+        if not is_fqn and not has_ue:
+            continue
+        member_idx = m.start(1)
+        line = text.count("\n", 0, member_idx) + 1
+        col = member_idx - (text.rfind("\n", 0, member_idx) + 1) + 1
+        raise PackError(
+            "%s(%d,%d): error CS0117: 'Quaternion' does not contain a "
             "definition for '%s'"
             % (_assets_rel_path(path), line, col, member)
         )
@@ -161,6 +184,7 @@ def _check_csharp_lex(path, text):
         )
     _check_file_api(path, text, scan)
     _check_application_api(path, text, scan)
+    _check_quaternion_api(path, text, scan)
     _check_transform_api(path, text, scan)
 
 
@@ -3165,6 +3189,43 @@ def _rewrite_addcomponent(text, plan, this_class):
     return text, locals_ty
 
 
+def _wrap_log_collision2d_tostring(text, param):
+    """Console/Debug of a Collision2D param → Collision2D_ToString(handle)."""
+    if not param:
+        return text
+    out = []
+    i = 0
+    while True:
+        m = re.search(r"(?:Console_WriteLine|Debug_Log)\s*\(", text[i:])
+        if not m:
+            out.append(text[i:])
+            break
+        out.append(text[i:i + m.start()])
+        call = m.group(0)
+        callee = re.match(r"(Console_WriteLine|Debug_Log)", call).group(1)
+        start = i + m.end()
+        depth = 1
+        j = start
+        while j < len(text) and depth:
+            c = text[j]
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        if depth != 0:
+            out.append(text[i + m.start():])
+            break
+        args = text[start:j].strip()
+        if args == param:
+            args = "Collision2D_ToString(%s)" % param
+        out.append("%s(%s)" % (callee, args))
+        i = j + 1
+    return "".join(out)
+
+
 def _wrap_log_component_tostring(text, locals_ty):
     """Console/Debug of an AddComponent local → Type_ToString(index)."""
     if not locals_ty:
@@ -3204,6 +3265,23 @@ def _wrap_log_component_tostring(text, locals_ty):
 
 
 _PHYSICS_COMPONENTS = frozenset(("Rigidbody2D", "Rigidbody"))
+
+# MonoBehaviour 2D collision messages (Unity Physics2D).
+_COLLISION2D_MSGS = (
+    "OnCollisionEnter2D",
+    "OnCollisionStay2D",
+    "OnCollisionExit2D",
+)
+
+
+def _collision2d_arg_name(args):
+    """Param name from `OnCollisionEnter2D(Collision2D coll)`, or None."""
+    if not args:
+        return None
+    m = re.match(
+        r"(?:UnityEngine\.)?Collision2D\s+(\w+)\s*$",
+        args.strip())
+    return m.group(1) if m else None
 
 
 def _build_rigidbody_tables(plan):
@@ -6103,34 +6181,38 @@ def emit_engine(plan, analyses, used_apis):
         p("    *m11 = 1.f - 2.f * (nx * nx + nz * nz);")
         p("}")
         p("")
-        p("/* Transform.LookAt: localRotation = LookRotation(to-from, up). */")
-        p("static void _engine_transform_look_at(")
+        p("/* Quaternion.LookRotation(forward, up) → local quat + XY basis. */")
+        p("static void _engine_quat_look_rotation(")
         p("    float *qx, float *qy, float *qz, float *qw,")
         p("    float *m00, float *m01, float *m10, float *m11,")
-        p("    float fx, float fy, float fz,")
-        p("    float tx, float ty, float tz) {")
-        p("    float dx = tx - fx;")
-        p("    float dy = ty - fy;")
-        p("    float dz = tz - fz;")
+        p("    float dx, float dy, float dz,")
+        p("    float ux, float uy, float uz) {")
         p("    float len = sqrtf(dx * dx + dy * dy + dz * dz);")
         p("    float rx, ry, rz, rlen;")
-        p("    float ux, uy, uz;")
         p("    float m00r, m01r, m02r, m10r, m11r, m12r, m20r, m21r, m22r;")
         p("    float trace, s, nx, ny, nz, nw;")
-        p("    if (len < 1e-8f) return;")
+        p("    float uxi = ux, uyi = uy, uzi = uz;")
+        p("    if (len < 1e-8f) {")
+        p("        *qx = 0.f; *qy = 0.f; *qz = 0.f; *qw = 1.f;")
+        p("        *m00 = 1.f; *m01 = 0.f; *m10 = 0.f; *m11 = 1.f;")
+        p("        return;")
+        p("    }")
         p("    dx = dx / len; dy = dy / len; dz = dz / len;")
-        p("    ux = 0.f; uy = 1.f; uz = 0.f;")
-        p("    rx = uy * dz - uz * dy;")
-        p("    ry = uz * dx - ux * dz;")
-        p("    rz = ux * dy - uy * dx;")
+        p("    rx = uyi * dz - uzi * dy;")
+        p("    ry = uzi * dx - uxi * dz;")
+        p("    rz = uxi * dy - uyi * dx;")
         p("    rlen = sqrtf(rx * rx + ry * ry + rz * rz);")
         p("    if (rlen < 1e-6f) {")
-        p("        ux = 0.f; uy = 0.f; uz = 1.f;")
-        p("        rx = uy * dz - uz * dy;")
-        p("        ry = uz * dx - ux * dz;")
-        p("        rz = ux * dy - uy * dx;")
+        p("        uxi = 0.f; uyi = 0.f; uzi = 1.f;")
+        p("        rx = uyi * dz - uzi * dy;")
+        p("        ry = uzi * dx - uxi * dz;")
+        p("        rz = uxi * dy - uyi * dx;")
         p("        rlen = sqrtf(rx * rx + ry * ry + rz * rz);")
-        p("        if (rlen < 1e-8f) return;")
+        p("        if (rlen < 1e-8f) {")
+        p("            *qx = 0.f; *qy = 0.f; *qz = 0.f; *qw = 1.f;")
+        p("            *m00 = 1.f; *m01 = 0.f; *m10 = 0.f; *m11 = 1.f;")
+        p("            return;")
+        p("        }")
         p("    }")
         p("    rx = rx / rlen; ry = ry / rlen; rz = rz / rlen;")
         p("    ux = dy * rz - dz * ry;")
@@ -6171,6 +6253,20 @@ def emit_engine(plan, analyses, used_apis):
         p("    *m01 = 2.f * (nx * ny - nz * nw);")
         p("    *m10 = 2.f * (nx * ny + nz * nw);")
         p("    *m11 = 1.f - 2.f * (nx * nx + nz * nz);")
+        p("}")
+        p("")
+        p("/* Transform.LookAt: localRotation = LookRotation(to-from, up). */")
+        p("static void _engine_transform_look_at(")
+        p("    float *qx, float *qy, float *qz, float *qw,")
+        p("    float *m00, float *m01, float *m10, float *m11,")
+        p("    float fx, float fy, float fz,")
+        p("    float tx, float ty, float tz) {")
+        p("    float dx = tx - fx;")
+        p("    float dy = ty - fy;")
+        p("    float dz = tz - fz;")
+        p("    _engine_quat_look_rotation(")
+        p("        qx, qy, qz, qw, m00, m01, m10, m11,")
+        p("        dx, dy, dz, 0.f, 1.f, 0.f);")
         p("}")
         p("")
         p("/* Transform.eulerAngles get: quat → degrees (Unity ZXY). */")
@@ -6250,6 +6346,29 @@ def emit_engine(plan, analyses, used_apis):
                 [(c, m) for m in c["methods"]
                  if m["name"] not in ("Start",) or True])
 
+    # MonoBehaviour OnCollision*2D(Collision2D) → dispatch after collide2d.
+    collision2d_handlers = {}
+    for cname, pairs in methods_by.items():
+        msgs = {}
+        for _c, m in pairs:
+            if m["name"] not in _COLLISION2D_MSGS:
+                continue
+            arg = _collision2d_arg_name(m.get("args") or "")
+            if not arg:
+                continue
+            msgs[m["name"]] = arg
+        if msgs:
+            collision2d_handlers[cname] = msgs
+    want_collision2d_msgs = bool(collision2d_handlers) and want_col2d
+
+    if want_collision2d_msgs:
+        p("/* Collision2D.ToString — Unity object type name. */")
+        p("static const char *Collision2D_ToString(int coll) {")
+        p("    (void)coll;")
+        p("    return \"UnityEngine.Collision2D\";")
+        p("}")
+        p("")
+
     for cname, cl in sorted(plan["classes"].items()):
         idn = _c_ident(cname)
         p("/* ---- %s group: instance array is defined in data.c ---- */" % idn)
@@ -6318,6 +6437,11 @@ def emit_engine(plan, analyses, used_apis):
             # TypeInitializer failed — do not lower or run script methods.
             if cl.get("ctor_forbidden"):
                 continue
+            coll_param = None
+            if m["name"] in _COLLISION2D_MSGS:
+                coll_param = _collision2d_arg_name(m.get("args") or "")
+                if not coll_param:
+                    continue
             site = {
                 "class": cname,
                 "method": m["name"],
@@ -6325,8 +6449,14 @@ def emit_engine(plan, analyses, used_apis):
                 "body_abs": int(m.get("body_abs") or 0),
                 "file_text": c.get("file_text") or "",
             }
-            body = _lower_method_body(m["body"], cl, plan, site=site)
-            p("static void %s_%s(unsigned i) {" % (idn, m["name"]))
+            body = _lower_method_body(
+                m["body"], cl, plan, site=site,
+                collision2d_param=coll_param)
+            if coll_param:
+                p("static void %s_%s(unsigned i, int %s) {"
+                  % (idn, m["name"], coll_param))
+            else:
+                p("static void %s_%s(unsigned i) {" % (idn, m["name"]))
             for line in body.split("\n"):
                 if line.strip():
                     p("    " + line.rstrip())
@@ -6593,8 +6723,105 @@ def emit_engine(plan, analyses, used_apis):
         p("    }")
         p("}")
         p("")
+        if want_collision2d_msgs:
+            nc = max(1, len(col2d_list))
+            max_pairs = max(1, nc * (nc - 1) // 2)
+            p("/* MonoBehaviour OnCollisionEnter/Stay/Exit2D after contacts */")
+            p("static int _col2d_contact_a[%d];" % max_pairs)
+            p("static int _col2d_contact_b[%d];" % max_pairs)
+            p("static int _col2d_contact_n;")
+            p("static int _col2d_prev_a[%d];" % max_pairs)
+            p("static int _col2d_prev_b[%d];" % max_pairs)
+            p("static int _col2d_prev_n;")
+            p("")
+            p("static void _col2d_add_contact(int a, int b) {")
+            p("    int lo, hi, i;")
+            p("    lo = (a < b) ? a : b;")
+            p("    hi = (a < b) ? b : a;")
+            p("    for (i = 0; i < _col2d_contact_n; i = i + 1)")
+            p("        if (_col2d_contact_a[i] == lo && _col2d_contact_b[i] == hi)")
+            p("            return;")
+            p("    if (_col2d_contact_n >= %d) return;" % max_pairs)
+            p("    _col2d_contact_a[_col2d_contact_n] = lo;")
+            p("    _col2d_contact_b[_col2d_contact_n] = hi;")
+            p("    _col2d_contact_n = _col2d_contact_n + 1;")
+            p("}")
+            p("")
+            p("static int _col2d_pair_in(int lo, int hi,")
+            p("    const int *pa, const int *pb, int n) {")
+            p("    int i;")
+            p("    for (i = 0; i < n; i = i + 1)")
+            p("        if (pa[i] == lo && pb[i] == hi) return 1;")
+            p("    return 0;")
+            p("}")
+            p("")
+            p("static void _col2d_send_msg(int ci_self, int ci_other, int kind) {")
+            p("    /* kind: 0 Enter, 1 Stay, 2 Exit */")
+            p("    int oc = _Collider2D_owner_class[ci_self];")
+            p("    unsigned oi = (unsigned)_Collider2D_owner_inst[ci_self];")
+            p("    switch (oc) {")
+            for cname in sorted(collision2d_handlers.keys()):
+                cid = class_ids.get(cname)
+                if cid is None:
+                    continue
+                idn = _c_ident(cname)
+                msgs = collision2d_handlers[cname]
+                p("    case %d:" % cid)
+                for kind_i, msg in enumerate(
+                        ("OnCollisionEnter2D",
+                         "OnCollisionStay2D",
+                         "OnCollisionExit2D")):
+                    if msg not in msgs:
+                        continue
+                    p("        if (kind == %d) {" % kind_i)
+                    if want_go_tables:
+                        p("            _engine_in_script = 1;")
+                        p("            if (setjmp(_engine_script_jmp) == 0)")
+                        p("                %s_%s(oi, ci_other);"
+                          % (idn, msg))
+                        p("            _engine_in_script = 0;")
+                    else:
+                        p("            %s_%s(oi, ci_other);" % (idn, msg))
+                    p("        }")
+                p("        break;")
+            p("    default: break;")
+            p("    }")
+            p("}")
+            p("")
+            p("static void engine_physics_collide2d_messages(void) {")
+            p("    int i, lo, hi;")
+            p("    for (i = 0; i < _col2d_contact_n; i = i + 1) {")
+            p("        lo = _col2d_contact_a[i];")
+            p("        hi = _col2d_contact_b[i];")
+            p("        if (_col2d_pair_in(lo, hi, _col2d_prev_a, _col2d_prev_b,")
+            p("                           _col2d_prev_n)) {")
+            p("            _col2d_send_msg(lo, hi, 1);")
+            p("            _col2d_send_msg(hi, lo, 1);")
+            p("        } else {")
+            p("            _col2d_send_msg(lo, hi, 0);")
+            p("            _col2d_send_msg(hi, lo, 0);")
+            p("        }")
+            p("    }")
+            p("    for (i = 0; i < _col2d_prev_n; i = i + 1) {")
+            p("        lo = _col2d_prev_a[i];")
+            p("        hi = _col2d_prev_b[i];")
+            p("        if (!_col2d_pair_in(lo, hi, _col2d_contact_a,")
+            p("                            _col2d_contact_b, _col2d_contact_n)) {")
+            p("            _col2d_send_msg(lo, hi, 2);")
+            p("            _col2d_send_msg(hi, lo, 2);")
+            p("        }")
+            p("    }")
+            p("    _col2d_prev_n = _col2d_contact_n;")
+            p("    for (i = 0; i < _col2d_contact_n; i = i + 1) {")
+            p("        _col2d_prev_a[i] = _col2d_contact_a[i];")
+            p("        _col2d_prev_b[i] = _col2d_contact_b[i];")
+            p("    }")
+            p("}")
+            p("")
         p("static void engine_physics_collide2d(void) {")
         p("    int a, b;")
+        if want_collision2d_msgs:
+            p("    _col2d_contact_n = 0;")
         p("    for (a = 0; a < _Collider2D_count; a = a + 1) {")
         p("        float ax, ay, bx, by, dx, dy, px, py, ahw, ahh, bhw, bhh;")
         p("        float c, s, sep, tx, ty, nx, ny, vx, vy, vn, vtx, vty, fr, bn, sc;")
@@ -6626,6 +6853,8 @@ def emit_engine(plan, analyses, used_apis):
         p("            px = (ahw + bhw) - (dx < 0.f ? -dx : dx);")
         p("            py = (ahh + bhh) - (dy < 0.f ? -dy : dy);")
         p("            if (px <= 0.f || py <= 0.f) continue;")
+        if want_collision2d_msgs:
+            p("            _col2d_add_contact(a, b);")
         p("            _col2d_get_pos(a, &tx, &ty);")
         p("            if (px < py) {")
         p("                sep = (dx < 0.f) ? -px : px;")
@@ -6659,6 +6888,8 @@ def emit_engine(plan, analyses, used_apis):
         p("            _col2d_center(a, &ax, &ay);")
         p("        }")
         p("    }")
+        if want_collision2d_msgs:
+            p("    engine_physics_collide2d_messages();")
         p("}")
         p("")
 
@@ -7771,7 +8002,7 @@ def _rewrite_transform_euler_angles(text, cl):
 
 
 def _parse_quaternion_expr(rhs):
-    """Parse Quaternion.Euler / identity / new Quaternion → ('euler',xyz)|('quat',xyzw)."""
+    """Parse Quaternion.Euler / LookRotation / identity / new → kind + args."""
     rhs = rhs.strip()
     if re.match(r"Quaternion\.identity\s*$", rhs):
         return ("quat", ("0.f", "0.f", "0.f", "1.f"))
@@ -7785,6 +8016,19 @@ def _parse_quaternion_expr(rhs):
             if hit:
                 return ("euler", hit)
         return None
+    lm = re.match(r"Quaternion\.LookRotation\s*\((.*)\)$", rhs, flags=re.S)
+    if lm:
+        args = _split_call_args(lm.group(1))
+        if len(args) == 1:
+            fwd = _parse_vector3_expr(args[0])
+            if fwd:
+                return ("look", (fwd, ("0.f", "1.f", "0.f")))
+        elif len(args) == 2:
+            fwd = _parse_vector3_expr(args[0])
+            up = _parse_vector3_expr(args[1])
+            if fwd and up:
+                return ("look", (fwd, up))
+        return None
     nm = re.match(r"new\s+Quaternion\s*\((.*)\)$", rhs, flags=re.S)
     if nm:
         args = _split_call_args(nm.group(1))
@@ -7794,11 +8038,12 @@ def _parse_quaternion_expr(rhs):
 
 
 def _rewrite_transform_rotation(text, cl):
-    """Lower transform.rotation = Quaternion… → set_euler / set_quat.
+    """Lower transform.rotation = Quaternion… → set_euler / set_quat / look.
 
     Supports:
       transform.rotation = Quaternion.Euler(x, y, z);
       transform.rotation = Quaternion.Euler(Vector3.forward * deg);
+      transform.rotation = Quaternion.LookRotation(forward[, up]);
       transform.rotation = Quaternion.identity;
       transform.rotation = new Quaternion(x, y, z, w);
     Unparented bodies: world rotation ≈ local (packed live quat).
@@ -7846,6 +8091,12 @@ def _rewrite_transform_rotation(text, cl):
             out.append(
                 "_engine_transform_set_euler(%s, (%s), (%s), (%s));"
                 % (rot_args, ex, ey, ez))
+        elif parsed[0] == "look":
+            (fx, fy, fz), (ux, uy, uz) = parsed[1]
+            out.append(
+                "_engine_quat_look_rotation(%s, (%s), (%s), (%s), "
+                "(%s), (%s), (%s));"
+                % (rot_args, fx, fy, fz, ux, uy, uz))
         else:
             qx, qy, qz, qw = parsed[1]
             out.append(
@@ -8122,7 +8373,7 @@ def _rewrite_csharp_float_literals(text):
     return "".join(out)
 
 
-def _lower_method_body(body, cl, plan, site=None):
+def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     """C# subset method → C against packed arrays.
 
     `this` / implicit fields become `_Class_inst_array[i].field`.
@@ -8216,6 +8467,7 @@ def _lower_method_body(body, cl, plan, site=None):
     # Unity Object.ToString when printing a Find result (name, not index).
     text = _wrap_log_gameobject_tostring(text)
     text = _wrap_log_component_tostring(text, add_locals)
+    text = _wrap_log_collision2d_tostring(text, collision2d_param)
     text = re.sub(r"Mathf\.(Abs|Min|Max|Clamp|Lerp|Sin|Cos|Sign)\s*\(",
                   lambda m: "Mathf_%s(" % m.group(1), text)
     text = re.sub(r"transform\.position\.x", idn + "_get_pos_x(i)", text)
