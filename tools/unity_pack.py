@@ -3889,16 +3889,43 @@ def _rewrite_rigidbody_assigns(text, plan, this_class):
     return text
 
 
-def _rewrite_find_getcomponent(text, plan, this_class):
+def _nre_at_expr(site, line):
+    """C expr that raises Unity-style NullReferenceException at *line*."""
+    return (
+        "_engine_null_reference_at(%s, %s, %s, %d)"
+        % (_c_string(site["class"]), _c_string(site["method"]),
+           _c_string(site["path"]), int(line))
+    )
+
+
+def _rewrite_find_getcomponent(text, plan, this_class, site=None):
     """Lower Find/GetComponent chains using the authored GO tables.
 
     `GameObject.Find` name lookup is always runtime (`strcmp` on the packed
     name table) — missing names yield -1 like Unity null, not a PackError.
+    Calling GetComponent / reading a field on that null is a
+    NullReferenceException (`_engine_null_reference_at`), matching Unity.
     Authored Rigidbody / Rigidbody2D are first-class GetComponent targets.
     """
     chains = _ast_find_getcomponent_chains(text)
     if not chains:
         return text
+
+    if site is None:
+        site = {
+            "class": this_class,
+            "method": "?",
+            "path": "?",
+            "body_abs": 0,
+            "file_text": text,
+        }
+
+    def _line_at(offset_in_body):
+        ft = site.get("file_text") or ""
+        abs_i = int(site.get("body_abs") or 0) + int(offset_in_body)
+        if not ft:
+            return 0
+        return ft.count("\n", 0, abs_i) + 1
 
     def _zero_for_field(comp, field):
         cl = (plan.get("classes") or {}).get(comp) or {}
@@ -3910,58 +3937,77 @@ def _rewrite_find_getcomponent(text, plan, this_class):
             return "0"
         return "0.f"
 
-    def _rb_field_expr(comp, field, axis, go_expr):
+    def _rb_field_expr(comp, field, axis, go_expr, line):
         """GetComponent<Rigidbody2D/Rigidbody>().velocity.x / gravityScale."""
         get = "GameObject_GetComponent_%s(%s)" % (_c_ident(comp), go_expr)
+        nre = _nre_at_expr(site, line)
         fl = (field or "").lower()
         if comp == "Rigidbody2D":
             if fl in ("gravityscale",):
                 return ("({ int _up_rb = %s; "
-                        "_up_rb < 0 ? 0.f : _Rigidbody2D_gravity_scale[_up_rb]; })"
-                        % get)
+                        "_up_rb < 0 "
+                        "? (%s, 0.f) "
+                        ": _Rigidbody2D_gravity_scale[_up_rb]; })"
+                        % (get, nre))
             if fl in ("lineardamping", "drag"):
                 return ("({ int _up_rb = %s; "
-                        "_up_rb < 0 ? 0.f : _Rigidbody2D_linear_damping[_up_rb]; })"
-                        % get)
+                        "_up_rb < 0 "
+                        "? (%s, 0.f) "
+                        ": _Rigidbody2D_linear_damping[_up_rb]; })"
+                        % (get, nre))
             if fl in ("velocity", "linearvelocity") and axis in ("x", "y"):
                 return ("({ int _up_rb = %s; "
-                        "_up_rb < 0 ? 0.f : _Rigidbody2D_vel_%s[_up_rb]; })"
-                        % (get, axis))
+                        "_up_rb < 0 "
+                        "? (%s, 0.f) "
+                        ": _Rigidbody2D_vel_%s[_up_rb]; })"
+                        % (get, nre, axis))
             if fl in ("mass",):
                 return ("({ int _up_rb = %s; "
-                        "_up_rb < 0 ? 0.f : _Rigidbody2D_mass[_up_rb]; })"
-                        % get)
+                        "_up_rb < 0 "
+                        "? (%s, 0.f) "
+                        ": _Rigidbody2D_mass[_up_rb]; })"
+                        % (get, nre))
         if comp == "Rigidbody":
             if fl in ("drag", "lineardamping"):
                 return ("({ int _up_rb = %s; "
-                        "_up_rb < 0 ? 0.f : _Rigidbody_drag[_up_rb]; })"
-                        % get)
+                        "_up_rb < 0 "
+                        "? (%s, 0.f) "
+                        ": _Rigidbody_drag[_up_rb]; })"
+                        % (get, nre))
             if fl in ("velocity", "linearvelocity") and axis in ("x", "y", "z"):
                 return ("({ int _up_rb = %s; "
-                        "_up_rb < 0 ? 0.f : _Rigidbody_vel_%s[_up_rb]; })"
-                        % (get, axis))
+                        "_up_rb < 0 "
+                        "? (%s, 0.f) "
+                        ": _Rigidbody_vel_%s[_up_rb]; })"
+                        % (get, nre, axis))
             if fl in ("mass",):
                 return ("({ int _up_rb = %s; "
-                        "_up_rb < 0 ? 0.f : _Rigidbody_mass[_up_rb]; })"
-                        % get)
+                        "_up_rb < 0 "
+                        "? (%s, 0.f) "
+                        ": _Rigidbody_mass[_up_rb]; })"
+                        % (get, nre))
             if fl in ("usegravity",):
                 return ("({ int _up_rb = %s; "
-                        "_up_rb < 0 ? 0 : _Rigidbody_use_gravity[_up_rb]; })"
-                        % get)
+                        "_up_rb < 0 "
+                        "? (%s, 0) "
+                        ": _Rigidbody_use_gravity[_up_rb]; })"
+                        % (get, nre))
         raise PackError(
             "GetComponent<%s>.%s: unsupported Rigidbody field "
             "(use velocity.x/y, gravityScale, mass)"
             % (comp, field or "?"))
 
-    def _field_after_get(comp, field, go_expr, axis=None):
+    def _field_after_get(comp, field, go_expr, line, axis=None):
         if comp in _PHYSICS_COMPONENTS:
-            return _rb_field_expr(comp, field, axis, go_expr)
+            return _rb_field_expr(comp, field, axis, go_expr, line)
         idn = _c_ident(comp)
         zero = _zero_for_field(comp, field)
+        nre = _nre_at_expr(site, line)
         return (
             "({ int _up_gc = GameObject_GetComponent_%s(%s); "
-            "_up_gc < 0 ? %s : %s_get_%s((unsigned)_up_gc); })"
-            % (idn, go_expr, zero, idn, field)
+            "_up_gc < 0 ? (%s, %s) "
+            ": %s_get_%s((unsigned)_up_gc); })"
+            % (idn, go_expr, nre, zero, idn, field)
         )
 
     def _known_component(comp):
@@ -3974,6 +4020,8 @@ def _rewrite_find_getcomponent(text, plan, this_class):
         comp = ch.get("component")
         field = ch.get("field")
         axis = ch.get("axis")
+        line = _line_at(ch["start"])
+        nre = _nre_at_expr(site, line)
         if ch.get("on_this"):
             if not comp:
                 raise PackError("GetComponent requires a type argument")
@@ -4001,10 +4049,15 @@ def _rewrite_find_getcomponent(text, plan, this_class):
                     "GetComponent<%s>: no authored %s in the scene — "
                     "unity_pack does not invent components" % (comp, comp))
             if field:
-                repl = _field_after_get(comp, field, go_expr, axis)
+                # null Find or missing component → NRE at this source line.
+                repl = _field_after_get(comp, field, go_expr, line, axis)
             else:
-                repl = "GameObject_GetComponent_%s(%s)" % (
-                    _c_ident(comp), go_expr)
+                # null.GetComponent<T>() throws; missing component returns null.
+                repl = (
+                    "({ int _up_go = %s; "
+                    "_up_go < 0 ? (%s, -1) "
+                    ": GameObject_GetComponent_%s(_up_go); })"
+                    % (go_expr, nre, _c_ident(comp)))
         text = text[:ch["start"]] + repl + text[ch["end"]:]
     return text
 
@@ -4124,7 +4177,7 @@ def analyze_script(path, text=None):
         body = text[brace + 1:close]
         bscan = scan[brace + 1:close]
         fields = _fields_in(body, bscan)
-        methods = _methods_in(body, bscan)
+        methods = _methods_in(body, bscan, body_abs=brace + 1)
         refs = []
         for f in fields:
             if f["ty"] not in _PRIM and f["ty"] not in (
@@ -4138,6 +4191,7 @@ def analyze_script(path, text=None):
             "name": name, "kind": kind, "fields": fields,
             "methods": methods, "refs": refs,
             "path": path,
+            "file_text": text,
             "disallow_multiple": disallow_multiple,
         })
     return {
@@ -4305,7 +4359,7 @@ def _member_init_default(cl, member_name):
     return None
 
 
-def _methods_in(body, bscan):
+def _methods_in(body, bscan, body_abs=0):
     out = []
     for m in re.finditer(
             r"(?m)^[ \t]*(?:public|private|protected|internal)?"
@@ -4325,6 +4379,7 @@ def _methods_in(body, bscan):
             "name": m.group(2),
             "args": m.group(3).strip(),
             "body": impl,
+            "body_abs": int(body_abs) + int(m.end()),
             "src": src,
         })
     return out
@@ -4731,8 +4786,10 @@ def emit_engine(plan, analyses, used_apis):
         if want_draw_sort:
             break
     if (want_log or want_draw_sort or want_data_path
-            or want_persistent_data_path or want_file_io):
+            or want_persistent_data_path or want_file_io or want_go_tables):
         p("#include <stdlib.h>")
+    if want_go_tables:
+        p("#include <setjmp.h>")
     if want_log or want_file_io:
         # Host gcc creates dirs; crust/shivyc has no errno/sys/stat,
         # so CRUST_NO_POSIX_MKDIR skips mkdir and fopen falls back.
@@ -5362,6 +5419,23 @@ def emit_engine(plan, analyses, used_apis):
             p("};")
         else:
             p("static const char *_engine_go_name[1] = { \"\" };")
+        # Unity catches script exceptions: log + unwind the current method.
+        p("static jmp_buf _engine_script_jmp;")
+        p("static int _engine_in_script = 0;")
+        p("static void _engine_null_reference_at(")
+        p("    const char *cls, const char *method,")
+        p("    const char *path, int line) {")
+        p("    fprintf(stderr, \"NullReferenceException: Object reference "
+          "not set to an instance of an object\\n\");")
+        p("    if (cls && method && path && path[0] && line > 0)")
+        p("        fprintf(stderr, \"%s.%s () (at %s:%d)\\n\",")
+        p("                cls, method, path, line);")
+        p("    else if (cls && method)")
+        p("        fprintf(stderr, \"%s.%s ()\\n\", cls, method);")
+        p("    if (_engine_in_script)")
+        p("        longjmp(_engine_script_jmp, 1);")
+        p("}")
+        p("")
         if want_add_any:
             p("static void _engine_cant_add_component("
               "const char *comp, int go) {")
@@ -6027,7 +6101,14 @@ def emit_engine(plan, analyses, used_apis):
         for c, m in methods_by.get(cname, []):
             if m["name"] in ("Awake", "OnEnable"):
                 continue
-            body = _lower_method_body(m["body"], cl, plan)
+            site = {
+                "class": cname,
+                "method": m["name"],
+                "path": _assets_rel_path(c.get("path") or cl.get("path") or ""),
+                "body_abs": int(m.get("body_abs") or 0),
+                "file_text": c.get("file_text") or "",
+            }
+            body = _lower_method_body(m["body"], cl, plan, site=site)
             p("static void %s_%s(unsigned i) {" % (idn, m["name"]))
             for line in body.split("\n"):
                 if line.strip():
@@ -6036,6 +6117,16 @@ def emit_engine(plan, analyses, used_apis):
             p("")
 
         # Tick: Start once (Unity), then FixedUpdate / Update.
+        # Script exceptions longjmp here — Unity continues the player loop.
+        def _call_script(method, indent="            "):
+            if want_go_tables:
+                p(indent + "_engine_in_script = 1;")
+                p(indent + "if (setjmp(_engine_script_jmp) == 0)")
+                p(indent + "    %s_%s((unsigned)n);" % (idn, method))
+                p(indent + "_engine_in_script = 0;")
+            else:
+                p(indent + "%s_%s((unsigned)n);" % (idn, method))
+
         has_start = any(m["name"] == "Start"
                         for _c, m in methods_by.get(cname, []))
         has_fixed = any(m["name"] == "FixedUpdate"
@@ -6047,8 +6138,9 @@ def emit_engine(plan, analyses, used_apis):
         p("void %s_FixedTick(void) {" % idn)
         if has_fixed:
             p("    int n;")
-            p("    for (n = 0; n < _%s_inst_count; n = n + 1)" % idn)
-            p("        %s_FixedUpdate((unsigned)n);" % idn)
+            p("    for (n = 0; n < _%s_inst_count; n = n + 1) {" % idn)
+            _call_script("FixedUpdate", "        ")
+            p("    }")
         else:
             p("    /* no FixedUpdate */")
         p("}")
@@ -6059,8 +6151,9 @@ def emit_engine(plan, analyses, used_apis):
         if has_start:
             p("    if (!_%s_started) {" % idn)
             p("        _%s_started = 1;" % idn)
-            p("        for (n = 0; n < _%s_inst_count; n = n + 1)" % idn)
-            p("            %s_Start((unsigned)n);" % idn)
+            p("        for (n = 0; n < _%s_inst_count; n = n + 1) {" % idn)
+            _call_script("Start", "            ")
+            p("        }")
             p("    }")
         if has_update:
             p("    for (n = 0; n < _%s_inst_count; n = n + 1) {" % idn)
@@ -6070,7 +6163,7 @@ def emit_engine(plan, analyses, used_apis):
                 p("            if (_dgo >= 0 && _engine_go_destroyed[_dgo])")
                 p("                continue;")
                 p("        }")
-            p("        %s_Update((unsigned)n);" % idn)
+            _call_script("Update", "        ")
             p("    }")
         elif not has_start:
             p("    /* no Update */")
@@ -7491,7 +7584,7 @@ def _rewrite_csharp_float_literals(text):
     return "".join(out)
 
 
-def _lower_method_body(body, cl, plan):
+def _lower_method_body(body, cl, plan, site=None):
     """C# subset method → C against packed arrays.
 
     `this` / implicit fields become `_Class_inst_array[i].field`.

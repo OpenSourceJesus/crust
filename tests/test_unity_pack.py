@@ -1945,6 +1945,7 @@ class TestSystems(unittest.TestCase):
 
     @needs_cc
     def test_find_getcomponent_runs(self):
+        """Find miss + GetComponent.field → NRE with site; Start exits, player continues."""
         d = tempfile.mkdtemp(prefix="upack-find-run-")
         unity_pack.pack(SYSTEMS, d)
         r = subprocess.run(["make", "-C", d], capture_output=True, text=True)
@@ -1952,9 +1953,25 @@ class TestSystems(unittest.TestCase):
         run = subprocess.run(
             [os.path.join(d, "game"), "-logFile", "-"],
             capture_output=True, text=True, cwd=d)
+        # Scene GO is "Bouncer"; Player.Find("BouncePad") is null → NRE.
+        # Unity catches script exceptions — process must not SIGABRT.
         self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
-        # Player Start: Find("BouncePad").GetComponent<Bouncer>().amp
-        self.assertIn("0.5", run.stdout)
+        err = run.stderr or ""
+        self.assertIn("NullReferenceException", err)
+        self.assertIn(
+            "Object reference not set to an instance of an object", err)
+        self.assertIn("Player.Start ()", err)
+        self.assertIn("Player.cs:18", err)
+        self.assertNotIn("SIGABRT", err)
+        self.assertNotIn("Aborted", err)
+        # Start aborted before print("Hello World 2!"); Update still runs.
+        out = run.stdout or ""
+        self.assertNotIn("Hello World 2!", out)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("_engine_null_reference_at", eng)
+        self.assertIn("setjmp", eng)
+        self.assertIn('GameObject_Find("BouncePad")', eng)
 
     def test_refuses_keyboard_without_inputsystem_using(self):
         """Bare Keyboard is not a global — needs InputSystem using or FQN."""
