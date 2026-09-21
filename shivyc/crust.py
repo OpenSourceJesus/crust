@@ -78,7 +78,10 @@ PRIMITIVES = {
     "f64": "double",
     "bool": "_Bool",
     "str": "const char",
-    "char": "unsigned int",
+    # Its own typedef of `unsigned int`, not `unsigned int` itself: a `u32`
+    # and a `char` must format differently (`{}` prints the character), and
+    # `Vec<char>` and `Vec<u32>` must not share a mangled name.
+    "char": "crust_char",
     "()": "void",
 }
 
@@ -297,6 +300,14 @@ def tokenize(src, line0=1):
             j = i + 1
             while j < n and (src[j].isalnum() or src[j] == "_"):
                 j += 1
+            # ...unless it is a loop *label*: `'outer: loop`, or the target
+            # of `break 'outer` / `continue 'outer`. Those carry control flow
+            # and become a token of their own. A lifetime bound (`'a: 'b`)
+            # is told apart by what follows the colon.
+            if _is_label_at(src, j, toks):
+                toks.append(RustToken("label", src[i + 1:j], line))
+                i = j
+                continue
             k = j
             while k < n and src[k] in " \t":
                 k += 1
@@ -328,6 +339,30 @@ def tokenize(src, line0=1):
             raise CrustError("line %d: unexpected character %r" % (line, c))
     toks.append(RustToken("eof", "", line))
     return toks
+
+
+def _is_label_at(src, j, toks):
+    """True if the `'name` ending at `src[j]` is a loop label, not a lifetime."""
+    if toks and toks[-1].kind == "kw" and toks[-1].val in ("break",
+                                                           "continue"):
+        return True
+    n = len(src)
+    k = j
+    while k < n and src[k] in " \t":
+        k += 1
+    if k >= n or src[k] != ":" or (k + 1 < n and src[k + 1] == ":"):
+        return False
+    k += 1
+    while k < n and src[k] in " \t\r\n":
+        k += 1
+    if k < n and src[k] == "{":
+        return True                     # a labelled block; reported later
+    for word in ("loop", "while", "for"):
+        end = k + len(word)
+        if src.startswith(word, k) and (end >= n or not (
+                src[end].isalnum() or src[end] == "_")):
+            return True
+    return False
 
 
 # --------------------------------------------------------------------------
@@ -391,11 +426,23 @@ ASSIGN_OPS = {"=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=",
 class Expr:
     """A translated expression: C text plus its inferred C type."""
 
-    __slots__ = ("code", "type", "targs", "from_path")
+    __slots__ = ("code", "type", "targs", "from_path", "never", "iter",
+                 "borrowed")
 
     def __init__(self, code, type_):
         self.targs = None            # turbofish type arguments, if any
         self.from_path = False       # name came from a `a::b` path
+        # The expression diverges (`panic!`, `unreachable!`): it has Rust's
+        # type `!`, so it fits wherever a value is wanted, and is emitted as
+        # a statement rather than assigned or returned.
+        self.never = False
+        # An iterator value: the chain not yet consumed (see `iter_value`).
+        self.iter = None
+        # A copy of a value something else still owns: `v.get(i)`, a loop
+        # binding from `v.iter()`. Rust would hand out `&T`; Crust hands out
+        # the bits, so the copy must never be dropped or moved into an owner
+        # -- that would free the element twice.
+        self.borrowed = False
         self.code = code
         self.type = type_
 
@@ -410,6 +457,8 @@ def _c_spec_for(ty):
     """
     if ty is None:
         return "%d"
+    if ty.base == "crust_char" and not ty.ptr:
+        return "%s"                   # the argument is encoded to UTF-8
     if ty.ptr and ty.base == "const char":
         return "%s"
     if ty.ptr:
@@ -461,6 +510,9 @@ def _rust_format_to_c(fmt, types, newline):
             hint = hint.lstrip("0123456789.<>^+#")
             ty = types[argi] if argi < len(types) else None
             spec = _FMT_HINTS.get(hint) if hint in _FMT_HINTS else None
+            if hint == "?" and ty is not None and not ty.ptr \
+                    and ty.base == "crust_char":
+                spec = "'%s'"             # `{:?}` quotes a char
             out.append(spec or _c_spec_for(ty))
             argi += 1
             i = j + 1
@@ -487,8 +539,14 @@ def _mangle(ty):
     """Turn a C type into an identifier fragment for a generated struct."""
     # Hand-written for the same reason as the item scanners: py2c has no
     # regex engine. `\W+` collapses each run of non-word characters to one
-    # underscore, so `unsigned long *` becomes `unsigned_long`.
-    text = ty.decl()
+    # underscore, so `unsigned long` becomes `unsigned_long`.
+    #
+    # Pointer depth is spelled out as a `_p` per level. It used to be dropped
+    # with the other punctuation, so `Option<*mut i32>` and `Option<i32>`
+    # were both `crust_option_int` -- one struct for two types, and a pointer
+    # silently read as an integer. `Vec<*mut u8>` and `Vec<u8>` collided the
+    # same way.
+    text = RustCType(ty.base, 0, ty.array).decl()
     out = []
     prev_us = False
     for ch in text:
@@ -498,7 +556,71 @@ def _mangle(ty):
         elif not prev_us:
             out.append("_")
             prev_us = True
-    return "".join(out).strip("_")
+    name = "".join(out).strip("_")
+    if ty.ptr:
+        name += "_" + "p" * ty.ptr
+    return name
+
+
+class IterChain:
+    """An iterator not yet consumed: its source and the adaptors so far.
+
+    `kind` is "range" (`lo`, `hi`, `inclusive`) or "expr" (`subj`, the
+    collection, and `ref`, "" / "shared" / "mut" for a `&` / `&mut` in front
+    of it). `ops` is [(method name, raw argument tokens)].
+    """
+
+    __slots__ = ("kind", "lo", "hi", "inclusive", "subj", "ref", "ops")
+
+    def __init__(self):
+        self.kind = "expr"
+        self.lo = None
+        self.hi = None
+        self.inclusive = False
+        self.subj = None
+        self.ref = ""
+        self.ops = []
+
+
+class _Source:
+    """One source an iterator reads: position `k` is element `f + k*d`.
+
+    `kind` is "range" (`base` is its low bound) or "coll" (`base` indexes the
+    elements); `mode` is "copy", "refcopy" or "ptr". A class rather than a
+    list because its fields have different types, which py2c needs to see.
+    """
+
+    __slots__ = ("kind", "base", "elem", "mode", "f", "d", "left", "right",
+                 "split")
+
+    def __init__(self, kind, base, elem, mode, f, d):
+        self.kind = kind
+        self.base = base
+        self.elem = elem
+        self.mode = mode
+        self.f = f
+        self.d = d
+        # A "chain": `left` for positions below `split`, `right` after it.
+        self.left = None
+        self.right = None
+        self.split = ""
+
+
+class _Item:
+    """What an iterator yields per pass: C code for it and its type.
+
+    `rc` marks a value Rust types as `&T` but Crust holds by copy, on which
+    `*x` is accepted. `parts` is set for a pair from `zip`/`enumerate`: the
+    parts' own items, so a `(a, b)` pattern binds each with its own flags.
+    """
+
+    __slots__ = ("code", "ty", "rc", "parts")
+
+    def __init__(self, code, ty, rc, parts):
+        self.code = code
+        self.ty = ty
+        self.rc = rc
+        self.parts = parts
 
 
 class MethodInfo:
@@ -598,7 +720,14 @@ class Unit:
         self.inherited_consts = []  # trait const defaults, for the prelude
         self.macros = {}            # macro_rules! name -> [(pattern, body)]
         self.closure_n = 0          # lifted-closure counter
+        # A capturing closure's environment struct -> (its function, return
+        # type, parameter types); a call through a value of that type is a
+        # direct call to the function.
+        self.closures = {}
         self.statics = set()        # fns with internal linkage
+        # Container instantiations whose `drop_elems` / `drop_at` the
+        # compiler writes at the end: (template, mangled, element type).
+        self.elem_drop_insts = []
         self.static_prefixes = set()  # core type method prefixes
 
     def result_type(self, ok, err):
@@ -708,6 +837,14 @@ class Parser:
         self.unit = unit or Unit()
         self.fn_sigs = self.unit.fn_sigs
         self.scopes = [{}]              # name -> RustCType
+        # Parallel to `scopes`: a name that stands for a C *place* rather
+        # than a C local of its own -- a pattern binding read straight out of
+        # the value being tested (`Some(v) if v > 3` reads `tmp.value`).
+        self.aliases = [{}]             # name -> C code
+        # Parallel to `scopes`: loop bindings Rust types as `&T` but Crust
+        # binds as a copy of `T` (`for x in v.iter()`), on which `*x` is
+        # accepted as a no-op -- real code writes both `t += x` and `*x`.
+        self.refcopies = [{}]           # name -> True
         # Parallel to `scopes`: each frame holds owning by-value locals that
         # need a free call on exit. Kept separate from the typing dict so
         # py2c does not see a new shape on every `.scopes[-1][name] = ...`.
@@ -734,12 +871,45 @@ class Parser:
         self.loop_depth = 0
         self.decl_depth = {}
         self.ret_type = VOID
+        self.impl_n = 0                 # `impl Trait` params seen so far
         self.impl_type = None           # enclosing `impl` type name, if any
         self.no_struct_lit = 0          # >0 while parsing a condition
         self.behind_ref = 0             # >0 while parsing the pointee of `&`
         self.expected = []              # target types, for inferring `None`
         self.tmp_n = 0                  # counter for generated temporaries
         self.pending = []               # statements hoisted out of `?`
+        # While a `match` in value position is being lowered, a tail
+        # expression assigns to this temporary instead of returning. Every
+        # construct that already threads `tail_returns` (blocks, `if`,
+        # nested `match`, `if let`) then yields its value into the match with
+        # no code of its own. `tail_type` is None until the target or the
+        # first arm fixes it.
+        self.method_targs = None        # a method call's turbofish
+        self.tail_name = None
+        self.tail_type = None
+        self.tail_hint = None           # the target, for arms like `None`
+        self.tail_types = []            # every value arm's type
+        self.tail_last = None           # the last tail value's code
+        self.tail_borrowed = False      # some tail value was a borrow
+        # The alternatives of the last top-level `pattern_test`, one C
+        # condition each; exhaustiveness reads them.
+        self.alt_conds = []
+        # The enclosing loops, innermost last, as parallel lists (py2c wants
+        # each list to hold one type). A `break`/`continue` resolves its
+        # target here, drops out to that loop's body frame, and either uses
+        # C's own statement or -- when that would land somewhere else: an
+        # outer loop, or a `switch` in between -- a `goto` to a label placed
+        # after the loop (`loop_brk`) or at the end of its body
+        # (`loop_cont`). Labels are allocated only when a goto needs one.
+        self.loop_labels = []           # Rust label, or ""
+        self.loop_frames = []           # live-frame index of the body
+        self.loop_switch = []           # `switch_depth` at the loop
+        self.loop_values = []           # value temporary of a `loop` expr
+        self.loop_hints = []            # its target type, or None
+        self.loop_brk = []              # C label after the loop, or ""
+        self.loop_cont = []             # C label ending the body, or ""
+        self.break_types = {}           # value temporary -> [RustCType]
+        self.switch_depth = 0           # C `switch`es open around here
 
     # -- token helpers ----------------------------------------------------
 
@@ -802,14 +972,22 @@ class Parser:
     # the self-hosted compiler on every `fn` item it parsed.
     def scope_push(self, kind="block"):
         self.scopes.append({})
+        self.aliases.append({})
+        self.refcopies.append({})
         self.live.append({"kind": kind, "items": []})
 
     def scope_pop(self):
         self.scopes.pop()
+        self.aliases.pop()
+        self.refcopies.pop()
         self.live.pop()
 
     def declare(self, name, type_):
         self.scopes[-1][name] = type_
+        if name in self.aliases[-1]:
+            del self.aliases[-1][name]
+        if name in self.refcopies[-1]:
+            del self.refcopies[-1][name]
         self.decl_depth[name] = self.loop_depth
         # A fresh binding, so any move recorded against the old one is spent:
         # `let c = ..;  take(c);  let c = ..;` shadows rather than reuses, and
@@ -820,6 +998,25 @@ class Parser:
         for s in reversed(self.scopes):
             if name in s:
                 return s[name]
+        return None
+
+    def declare_alias(self, name, type_, code):
+        """Declare `name` as another spelling of the C place `code`."""
+        self.declare(name, type_)
+        self.aliases[-1][name] = code
+
+    def is_refcopy(self, code):
+        """True if `code` names a binding declared as a `&T` held by copy."""
+        for k in range(len(self.scopes) - 1, -1, -1):
+            if code in self.scopes[k]:
+                return code in self.refcopies[k]
+        return False
+
+    def alias_of(self, name):
+        """The C place `name` aliases in its innermost scope, or None."""
+        for k in range(len(self.scopes) - 1, -1, -1):
+            if name in self.scopes[k]:
+                return self.aliases[k].get(name)
         return None
 
     def owning_free(self, ty):
@@ -882,14 +1079,25 @@ class Parser:
         which is likewise per-path: `if c { return v; }` moves `v` on that
         path only, and the fall-through must still drop it.
         """
+        for stmt in self.drop_stmts(upto, skip):
+            out.line_at(line, stmt, indent)
+
+    def drop_stmts(self, upto, skip=None):
+        """The free calls `emit_drops` would emit, as a list of C statements.
+
+        Separate so that an exit built as *text* -- the early return `?`
+        queues as a pending statement -- drops exactly what a `return` written
+        at the same point would.
+        """
+        stmts = []
         if upto is None:
-            return
+            return stmts
         for fr in reversed(self.live[upto:]):
             for name, mangled, _ty in reversed(fr["items"]):
                 if skip is not None and name in skip:
                     continue
-                out.line_at(line, "%s(&%s);" % (mangled, _c_name(name)),
-                            indent)
+                stmts.append("%s(&%s);" % (mangled, _c_name(name)))
+        return stmts
 
     def emit_move_zero(self, out, line, indent, src_name, src_ty):
         """After copying an owning local, zero the source so Drop is a no-op."""
@@ -933,6 +1141,8 @@ class Parser:
         """If `expr` is a bare owning local name, return (name, type), else None."""
         if expr is None or expr.type is None or expr.code is None:
             return None
+        if expr.borrowed:
+            return None                 # a borrow owns nothing to move
         if self.owning_free(expr.type) is None:
             return None
         text = expr.code.strip()
@@ -985,6 +1195,31 @@ class Parser:
             self.expect(")")
             ret = self.parse_type() if self.accept("->") else VOID
             return self.unit.fn_ptr_type(ret, params)
+        if t.val == "impl" and t.kind == "kw":
+            # `impl Fn(i32) -> i32` in a parameter: an anonymous type
+            # parameter, which `_generic_params_of` numbered `_impl0`,
+            # `_impl1`, .. in order. Its bound is skipped like any other.
+            self.next()
+            depth = 0
+            while self.cur.kind != "eof":
+                v = self.cur.val
+                if v in ("(", "[", "<"):
+                    depth += 1
+                elif v in (")", "]", ">"):
+                    if depth == 0:
+                        break
+                    depth -= 1
+                elif v == ">>":
+                    depth -= 2
+                elif depth == 0 and v in (",", "{", "=", ";"):
+                    break
+                self.next()
+            pname = "_impl%d" % self.impl_n
+            self.impl_n += 1
+            if pname not in self.tysubst:
+                self.err("`impl Trait` is supported only as a function's "
+                         "parameter type")
+            return self.tysubst[pname]
         if t.val == "!" and t.kind == "punc":
             # The never type. A function returning `!` diverges, and C's way
             # of saying that is a function that returns nothing and is never
@@ -1375,6 +1610,16 @@ class Parser:
                 self.unit.fn_sigs[info.mangled] = (
                     info.ret, selfp + [t for _, t in info.params])
                 p.skip_to_body_end()
+        if name in _ELEM_OWNERS and name in self.unit.core_names \
+                and (mangled, "drop_elems") not in self.unit.methods:
+            # The bundled containers free what they hold through two hooks
+            # a generic body cannot write, since they name `T`'s destructor;
+            # see `emit_elem_drops`. Registered before any body is parsed.
+            _register(self.unit, mangled, "drop_elems", VOID, [],
+                      self_kind="ref")
+            _register(self.unit, mangled, "drop_at", VOID,
+                      [("i", RustCType("unsigned long"))], self_kind="ref")
+            self.unit.elem_drop_insts.append((name, mangled, args[0]))
         for params, toks in matching:                 # pass 2: bodies
             sub = dict(zip(params, args))
             p = Parser(list(toks), self.unit, sub)
@@ -1458,6 +1703,7 @@ class Parser:
         self.skip_generic_params()
         self.expect("(")
         decls = []
+        impls = 0
         while not self.at(")", "punc") and self.cur.kind != "eof":
             self.expect_ident()
             self.expect(":")
@@ -1469,6 +1715,9 @@ class Parser:
                     self.accept("mut")
                 depth += 1
             nm = self.cur.val if self.cur.kind in ("ident", "kw") else None
+            if nm == "impl":
+                nm = "_impl%d" % impls
+                impls += 1
             decls.append((nm, depth))
             d = 0
             while self.cur.kind != "eof":
@@ -1528,13 +1777,15 @@ class Parser:
             parts.append(cur)
         return parts
 
-    def sub_expr(self, toks):
+    def sub_expr(self, toks, want=None):
         """Translate one raw token slice as an expression."""
         if not toks:
             return Expr("", None)
         p = Parser(list(toks) + [RustToken("eof", "", toks[-1].line)],
                    self.unit, self.tysubst)
         p.scopes = self.scopes
+        p.aliases = self.aliases
+        p.refcopies = self.refcopies
         p.live = self.live
         # Shared, not copied: a macro argument reads the same locals as the
         # code around it, so a local moved out of before the macro is just as
@@ -1543,7 +1794,11 @@ class Parser:
         p.moved = self.moved
         p.impl_type = self.impl_type
         p.ret_type = self.ret_type
-        e = p.parse_expr()
+        p.tmp_n = self.tmp_n
+        e = p.parse_expr_as(want)
+        # Temporaries are numbered per parser; carry the count back so a
+        # name the sub-parser used is never handed out again out here.
+        self.tmp_n = p.tmp_n
         self.pending.extend(p.pending)
         return e
 
@@ -1562,9 +1817,20 @@ class Parser:
     # -- the built-in macros ----------------------------------------------
 
     def m_abort(self, args, line, _msg=None):
-        """`panic!` / `unreachable!` / `todo!` -- diverge immediately."""
+        """`panic!` / `unreachable!` / `todo!` -- diverge immediately.
+
+        A message is printed to stderr first, formatted like `eprintln!`,
+        so a panic says why -- it used to abort silently.
+        """
         self.unit.needs.add("abort")
-        return Expr("(abort(), 0)", INT)
+        if args and len(args[0]) == 1 and args[0][0].kind == "str":
+            msg = self.m_print(args, line, True, "stderr")
+            e = Expr("(%s, abort(), 0)" % msg.code, INT)
+            e.never = True
+            return e
+        e = Expr("(abort(), 0)", INT)
+        e.never = True
+        return e
 
     def m_assert(self, args, line):
         if not args:
@@ -1596,8 +1862,16 @@ class Parser:
             self.unit.needs.add("printf")
             call = "printf(%s" % spec
         for v in vals:
-            call += ", " + v.code
+            call += ", " + self.fmt_arg(v)
         return Expr(call + ")", INT)
+
+    def fmt_arg(self, v):
+        """The printf argument for value `v`: a `char` becomes its UTF-8."""
+        if v.type is not None and not v.type.ptr \
+                and v.type.base == "crust_char":
+            self.unit.needs.add("charfmt")
+            return "crust_char_utf8(%s)" % v.code
+        return v.code
 
     def _format_string(self, toks, line):
         if len(toks) != 1 or toks[0].kind != "str":
@@ -1647,7 +1921,7 @@ class Parser:
         room = "(%s > %s ? %s - %s : 0)" % (cap, ln, cap, ln)
         call = "snprintf(%s + %s, %s, %s" % (buf, ln, room, spec)
         for v in vals:
-            call += ", " + v.code
+            call += ", " + self.fmt_arg(v)
         call += ")"
         # snprintf returns what it *would* have written, so a return at or
         # above the room given means the text was truncated.
@@ -1677,7 +1951,7 @@ class Parser:
         spec = _rust_format_to_c(fmt, [v.type for v in vals], False)
         self.unit.needs.add("snprintf")
         ensure_core_concrete(self.unit, "String")
-        arglist = "".join(", " + v.code for v in vals)
+        arglist = "".join(", " + self.fmt_arg(v) for v in vals)
         out = self.new_temp()
         n = self.new_temp()
         self.pending.append(
@@ -1721,11 +1995,63 @@ class Parser:
         return Expr("0", RustCType("_Bool"))
 
     def m_matches(self, args, line):
-        if len(args) < 2:
+        """`matches!(value, pattern [if guard])` -- a pattern test.
+
+        This used to parse the pattern as an *expression* and compare with
+        `==`, so `matches!(4, 1 | 4)` became `4 == (1 | 4)` -- `4 == 5` --
+        and was quietly false. A pattern is not an expression: `|` separates
+        alternatives, `a..=b` is a range, `_` matches anything and
+        `Some(v)` tests a tag and binds. It now goes through `pattern_test`,
+        the same lowering a `match` arm uses.
+        """
+        if len(args) != 2:
             self.err("`matches!` needs a value and a pattern")
-        v = self.sub_expr(args[0])
-        pat = self.sub_expr(args[1])
-        return Expr("((%s) == (%s))" % (v.code, pat.code), RustCType("_Bool"))
+        v = self.deref_scrutinee(self.sub_expr(args[0]))
+        if v.type is None:
+            self.err("cannot infer the type of the value `matches!` tests; "
+                     "annotate it")
+        subj = self.once(v)
+        pat, guard = _split_guard(args[1])
+        if not pat:
+            self.err("`matches!` needs a pattern")
+        p = Parser(list(pat) + [RustToken("eof", "", pat[-1].line)],
+                   self.unit, self.tysubst)
+        p.scopes = self.scopes
+        p.aliases = self.aliases
+        p.impl_type = self.impl_type
+        cond, binds = p.pattern_test(subj, v.type)
+        if p.cur.kind != "eof":
+            p.err("unexpected %r in pattern", p.cur.val)
+        if guard is None:
+            return Expr(cond, RustCType("_Bool"))
+        return Expr(self.guarded(cond, binds, guard), RustCType("_Bool"))
+
+    def guarded(self, cond, binds, guard):
+        """`cond && guard`, with the pattern's bindings in scope for the guard.
+
+        The bindings are aliases for places in the tested value, so nothing
+        is copied. The guard's own hoisted work runs only once the pattern
+        has matched -- the same rule `&&` follows -- because before that the
+        payload a binding names is not valid to read.
+        """
+        self.scope_push()
+        try:
+            for bname, bty, bcode in binds:
+                self.declare_alias(bname, bty, bcode)
+            mark = len(self.pending)
+            if guard is None:
+                g = self.parse_expr()        # in the token stream: an arm
+            else:
+                g = self.sub_expr(guard)     # a slice: `matches!`
+            work = self.take_pending(mark)
+        finally:
+            self.scope_pop()
+        if not work:
+            return "(%s && (%s))" % (cond, g.code)
+        tmp = self.new_temp()
+        self.pending.append("_Bool %s = %s; if (%s) { %s %s = %s; }"
+                            % (tmp, cond, tmp, " ".join(work), tmp, g.code))
+        return tmp
 
     def m_dbg_noop(self, args, line):
         """`debug_assert*!` -- compiled out, as in a release build."""
@@ -1796,7 +2122,15 @@ class Parser:
     # -- expressions ------------------------------------------------------
 
     def parse_expr(self):
-        return self.parse_assign()
+        e = self.parse_assign()
+        if e.iter is not None:
+            self.unconsumed()
+        return e
+
+    def unconsumed(self):
+        self.err("this iterator is never consumed; end it with a consumer "
+                 "such as `.sum()`, `.count()` or `.collect()`, or make it "
+                 "the subject of a `for` loop")
 
     def parse_expr_as(self, ty):
         """Parse an expression whose target type is known.
@@ -1825,6 +2159,31 @@ class Parser:
         self.tmp_n += 1
         return "_crust_opt%d" % self.tmp_n
 
+    def once(self, e):
+        """Code for `e` that is safe to write more than once.
+
+        A lowering that mentions its operand twice -- `unwrap_or`'s
+        `o.some ? o.value : d`, `min`'s ternary, a pattern test -- must not
+        evaluate a call twice. A place or a literal is returned as is; anything
+        else is spilled to a temporary through the pending list, which is
+        also where the rest of the statement's hoisted work goes, so ordering
+        is unchanged. With no type there is nothing to declare the temporary
+        as, and the code is returned unchanged.
+        """
+        code = e.code.strip()
+        if _is_lvalue(code) or _is_simple_literal(code) or e.type is None \
+                or e.type.is_void() or e.type.array:
+            return code
+        tmp = self.new_temp()
+        self.pending.append("%s = %s;" % (e.type.decl(tmp), code))
+        return tmp
+
+    def take_pending(self, mark):
+        """Remove and return the pending statements queued since `mark`."""
+        taken = self.pending[mark:]
+        self.pending = self.pending[:mark]
+        return taken
+
     def parse_cond(self):
         """Parse an expression in condition position.
 
@@ -1833,9 +2192,12 @@ class Parser:
         """
         self.no_struct_lit += 1
         try:
-            return self.parse_assign()
+            e = self.parse_assign()
         finally:
             self.no_struct_lit -= 1
+        if e.iter is not None:
+            self.unconsumed()
+        return e
 
     def parse_assign(self):
         lhs = self.parse_binary(0)
@@ -1845,6 +2207,8 @@ class Parser:
             # Simple `dst = src` of owning locals: free the old destination
             # (if live), copy, then zero the source so Drop does not
             # double-free. Compound assigns (`+=`, …) are left alone.
+            if op == "=":
+                self.reject_borrow(rhs, lhs.type, "this assignment")
             if op == "=" and lhs.type is not None \
                     and self.owning_free(lhs.type) is not None:
                 src = self.simple_owning_local(rhs)
@@ -1899,7 +2263,23 @@ class Parser:
         left = self.parse_binary(level + 1)
         while self.cur.kind == "punc" and self.cur.val in ops:
             op = self.next().val
+            mark = len(self.pending)
             right = self.parse_binary(level + 1)
+            if op in ("&&", "||") and len(self.pending) > mark:
+                # The right operand hoisted work -- a `?`, a block, a spilled
+                # temporary -- and that work is only allowed to run when the
+                # operand itself would. Emitting it with the rest of the
+                # statement's pending list ran it unconditionally: a `?` on
+                # the right of `false && ..` could still return early. So the
+                # short circuit is spelled out as a statement.
+                work = self.take_pending(mark)
+                tmp = self.new_temp()
+                test = tmp if op == "&&" else "!" + tmp
+                self.pending.append(
+                    "_Bool %s = %s; if (%s) { %s %s = %s; }"
+                    % (tmp, left.code, test, " ".join(work), tmp, right.code))
+                left = Expr(tmp, RustCType("_Bool"))
+                continue
             if op in ("||", "&&", "==", "!=", "<", ">", "<=", ">="):
                 type_ = RustCType("_Bool")
             elif left.type is not None and not left.type.is_void():
@@ -1930,6 +2310,17 @@ class Parser:
                             if e.type else None)
             e = self.parse_unary()
             if t.val == "*":
+                if e.type is not None and not e.type.ptr \
+                        and self.is_refcopy(e.code.strip()):
+                    return e          # `*x` on a `&T` bound as a copy
+                if e.type is not None and not e.type.ptr \
+                        and not e.type.array and (
+                            e.type.base in _RANK
+                            or e.type.base in ("float", "double", "_Bool")):
+                    # Dereferencing a scalar is never valid Rust, so the
+                    # operand stood for a `&T` that Crust holds as a value --
+                    # `*v.iter().max().unwrap()`. The value is the answer.
+                    return e
                 ty = RustCType(e.type.base, max(e.type.ptr - 1, 0)) \
                     if e.type else None
                 return Expr("(*%s)" % e.code, ty)
@@ -1952,6 +2343,23 @@ class Parser:
                     continue
                 if e.code in ("Ok", "Err"):
                     e = self.parse_result_ctor(e.code)
+                    continue
+                if e.type is not None and e.type.ptr <= 1 \
+                        and e.type.base in self.unit.closures:
+                    fname, _r, cps = self.unit.closures[e.type.base]
+                    cargs, catys, caexprs = [], [], []
+                    while not self.at(")", "punc"):
+                        want = cps[len(cargs)] if len(cargs) < len(cps) \
+                            else None
+                        a = self.parse_expr_as(want)
+                        cargs.append(a.code)
+                        catys.append(a.type)
+                        caexprs.append(a)
+                        if not self.accept(","):
+                            break
+                    self.expect(")")
+                    self._move_by_value_args(cps, cargs, caexprs)
+                    e = self.call_closure(e, cargs, catys)
                     continue
                 generic = e.code in self.unit.generic_fns
                 targs = e.targs
@@ -2059,12 +2467,39 @@ class Parser:
                     e = self.field_access(e, "_" + self.next().val)
                     continue
                 name = self.expect_ident()
+                self.method_targs = None
+                if self.at("::", "punc") and self.peek().val == "<":
+                    # `sum::<i64>()`, `collect::<Vec<i32>>()`. A `_` in the
+                    # arguments (`Vec<_>`) asks for inference, which is what
+                    # happens without a turbofish, so it is dropped.
+                    self.next()
+                    if self._turbofish_has_infer():
+                        self.skip_generic_params()
+                        self.method_targs = []
+                    else:
+                        self.method_targs = self.parse_type_args()
                 if self.at("(", "punc"):
                     e = self.parse_method_call(e, name)
                 else:
                     e = self.field_access(e, name)
             else:
                 return e
+
+    def _turbofish_has_infer(self):
+        """True if the `<..>` at the cursor mentions `_`."""
+        depth, j = 0, self.i
+        while self.toks[j].kind != "eof":
+            v = self.toks[j].val
+            if v == "<":
+                depth += 1
+            elif v in (">", ">>"):
+                depth -= 1 if v == ">" else 2
+                if depth <= 0:
+                    return False
+            elif v == "_" and self.toks[j].kind == "ident":
+                return True
+            j += 1
+        return False
 
     def parse_some(self):
         """Lower `Some(x)` to a filled-in Option struct."""
@@ -2109,8 +2544,8 @@ class Parser:
                          "has no `From` conversions", err.decl(),
                          ret_err.decl())
             self.pending.append(
-                "if (!%s.ok) return (%s){.ok = 0, .error = %s.error};"
-                % (tmp, ret.base, tmp))
+                "if (!%s.ok) { %sreturn (%s){.ok = 0, .error = %s.error}; }"
+                % (tmp, self._early_exit_drops(), ret.base, tmp))
             if ok.is_void():
                 return Expr("(void)0", VOID)
             return Expr("%s.value" % tmp, ok)
@@ -2119,12 +2554,35 @@ class Parser:
             if ret.base not in self.unit.options:
                 self.err("`?` on an `Option` needs the enclosing function to "
                          "return an `Option`")
-            self.pending.append("if (!%s.some) return (%s){0};"
-                                % (tmp, ret.base))
+            self.pending.append("if (!%s.some) { %sreturn (%s){0}; }"
+                                % (tmp, self._early_exit_drops(), ret.base))
             return Expr("%s.value" % tmp, self.unit.options[src])
 
         self.err("`?` applies to `Result` and `Option`, not `%s`",
                  e.type.decl())
+
+    def _early_exit_drops(self):
+        """Drops for a `return` queued as text by `?`, space-terminated.
+
+        `?` is an early return, so it owes the same frees `return` does: every
+        live owning local, out to the function frame. It used to return bare,
+        so every `Vec` or `impl Drop` local in scope leaked on the error path
+        -- which is the path `?` exists for. The live set is read now, at the
+        `?`, which is the program point the queued statement will run at: a
+        `let` being initialised by the `?` is not registered yet, so it is
+        correctly not dropped.
+        """
+        stmts = self.drop_stmts(self.live_frame_index(("func",)))
+        return "".join(st + " " for st in stmts)
+
+    def reject_borrow(self, e, ty, what):
+        """Refuse to hand a borrowed copy to something that will drop it."""
+        if e is not None and e.borrowed and ty is not None \
+                and self.owning_free(ty) is not None:
+            self.err("%s takes ownership of `%s`, but this value is a borrow "
+                     "-- a copy of an element its container still owns, from "
+                     "`get`, `last` or `iter()` -- so both would drop it. "
+                     "`.clone()` it, or pass a reference", what, ty.decl())
 
     def _move_by_value_args(self, params, args, aexprs):
         """Passing an owning local by value is a *move*, as it is in Rust.
@@ -2158,6 +2616,7 @@ class Parser:
                 continue
             if self.owning_free(want) is None:
                 continue
+            self.reject_borrow(a, want, "this call")
             moved = self.simple_owning_local(a)
             if moved is None:
                 continue                # not a name this pass can move from
@@ -2190,6 +2649,10 @@ class Parser:
                      "type", which)
         ok, err = self.unit.results[want.base]
         if which == "Ok" and ok.is_void():
+            # `Ok(())` -- the unit value, which is how nearly every
+            # `Result<(), E>` function spells success -- or a bare `Ok()`.
+            if self.accept("("):
+                self.expect(")")
             self.expect(")")
             return Expr("(%s){.ok = 1}" % want.base, want)
         inner = self.parse_expr_as(ok if which == "Ok" else err)
@@ -2199,31 +2662,6 @@ class Parser:
         return Expr("(%s){.ok = %d, .%s = %s}"
                     % (want.base, flag, field, inner.code), want)
 
-    def result_method(self, recv, name, args):
-        """Lower the supported `Result` methods."""
-        ok, err = self.unit.results[recv.type.base]
-        if name == "is_ok" and not args:
-            return Expr("%s.ok" % recv.code, RustCType("_Bool"))
-        if name == "is_err" and not args:
-            return Expr("(!%s.ok)" % recv.code, RustCType("_Bool"))
-        if name in ("unwrap", "unwrap_err") and not args:
-            if name == "unwrap" and ok.is_void():
-                self.err("`unwrap` on `Result<(), _>` yields nothing; "
-                         "test `is_ok` instead")
-            self.unit.unwraps.add(recv.type.base)
-            self.unit.needs.add("abort")
-            return Expr("%s_%s(%s)" % (recv.type.base, name, recv.code),
-                        ok if name == "unwrap" else err)
-        if name == "unwrap_or" and len(args) == 1:
-            return Expr("(%s.ok ? %s.value : %s)"
-                        % (recv.code, recv.code, args[0]), ok)
-        if name == "ok" and not args:
-            opt = self.unit.option_type(ok)
-            return Expr("(%s){%s.ok, %s.value}"
-                        % (opt.base, recv.code, recv.code), opt)
-        self.err("no method `%s` on `Result`; supported: is_ok, is_err, "
-                 "unwrap, unwrap_err, unwrap_or, ok", name)
-
     def none_expr(self):
         """Lower `None`, whose type comes from the surrounding context."""
         want = self.target
@@ -2232,27 +2670,612 @@ class Parser:
                      "(`let x: Option<i32> = None`)")
         return Expr("(%s){0}" % want.base, want)
 
+    # -- Option and Result methods ----------------------------------------
+    #
+    # The closure-taking methods (`map`, `and_then`, `unwrap_or_else`, ..) are
+    # where idiomatic Rust passes *capturing* closures -- `.map(|x| x + off)`.
+    # A closure literal in argument position is therefore not lifted to a
+    # function (which cannot capture) but inlined: its parameters are bound in
+    # a scope nested in the current one, so captures are simply names in
+    # scope, and its body is emitted in the branch where it runs, so
+    # `unwrap_or_else(|| slow())` calls `slow` only on `None`. A named
+    # function or a function pointer is called instead.
+
+    def char_method(self, recv, name, args):
+        """A method on a `char` (or the ASCII ones on a `u8`)."""
+        ty = recv.type
+        is_char = ty.base == "crust_char"
+        BOOL = RustCType("_Bool")
+        c = self.once(recv)
+        if name in _ASCII_TESTS:
+            self._arity(name, args, 0)
+            return Expr("(%s)" % (_ASCII_TESTS[name] % {"c": c}), BOOL)
+        if name in ("to_ascii_uppercase", "to_ascii_lowercase"):
+            self._arity(name, args, 0)
+            lo, hi, delta = (97, 122, "- 32") if name.endswith("uppercase") \
+                else (65, 90, "+ 32")
+            return Expr("((%s >= %d && %s <= %d) ? (%s)(%s %s) : %s)"
+                        % (c, lo, c, hi, ty.decl(), c, delta, c), ty)
+        if is_char and name == "is_whitespace":
+            # Unicode's White_Space property is a short fixed list, so this
+            # one is exact beyond ASCII.
+            self._arity(name, args, 0)
+            return Expr("((%s >= 9 && %s <= 13) || %s == 32 || %s == 0x85 || "
+                        "%s == 0xA0 || %s == 0x1680 || (%s >= 0x2000 && "
+                        "%s <= 0x200A) || %s == 0x2028 || %s == 0x2029 || "
+                        "%s == 0x202F || %s == 0x205F || %s == 0x3000)"
+                        % ((c,) * 13), BOOL)
+        if is_char and name == "to_digit":
+            self._arity(name, args, 1)
+            radix = self.once(self.sub_expr(args[0]))
+            d = self.new_temp()
+            self.pending.append(
+                "unsigned int %s = (%s >= 48 && %s <= 57) ? %s - 48 : "
+                "(%s >= 97 && %s <= 122) ? %s - 87 : "
+                "(%s >= 65 && %s <= 90) ? %s - 55 : 99;"
+                % (d, c, c, c, c, c, c, c, c, c))
+            opt = self.unit.option_type(RustCType("unsigned int"))
+            return Expr("(%s){%s < (unsigned int)(%s), %s}"
+                        % (opt.base, d, radix, d), opt)
+        if is_char and name == "len_utf8":
+            self._arity(name, args, 0)
+            return Expr("(%s < 0x80 ? 1ul : %s < 0x800 ? 2ul : %s < 0x10000 "
+                        "? 3ul : 4ul)" % (c, c, c), RustCType("unsigned long"))
+        if is_char and name in _UNICODE_CLASSES:
+            self.err("`char::%s` needs Unicode tables Crust does not carry; "
+                     "use `%s` for ASCII text", name, _UNICODE_CLASSES[name])
+        self.err("no method `%s` on `%s`", name,
+                 "char" if is_char else "u8")
+
+    def raw_call_args(self):
+        """The argument token slices of a call; the cursor is past its `(`.
+
+        Split on top-level commas, except inside a closure's parameter list
+        (`|a, b| ..`), whose commas belong to the closure.
+        """
+        parts, cur, depth, in_params = [], [], 0, False
+        while True:
+            t = self.cur
+            if t.kind == "eof":
+                self.err("unterminated argument list")
+            if t.kind == "punc" and t.val in ("(", "[", "{"):
+                depth += 1
+            elif t.kind == "punc" and t.val in (")", "]", "}"):
+                if depth == 0:
+                    self.next()
+                    break
+                depth -= 1
+            elif t.kind == "punc" and t.val == "|" and depth == 0:
+                if in_params:
+                    in_params = False
+                elif not cur or (len(cur) == 1 and cur[0].val == "move"):
+                    in_params = True
+            elif depth == 0 and not in_params and t.kind == "punc" \
+                    and t.val == ",":
+                parts.append(cur)
+                cur = []
+                self.next()
+                continue
+            cur.append(t)
+            self.next()
+        if cur:
+            parts.append(cur)
+        return parts
+
+    def closure_parts(self, toks):
+        """([(name, type|None, by_ref_pattern)], body) of a closure literal.
+
+        None if `toks` is not a closure literal. `by_ref_pattern` marks
+        `|&x|`, which binds the pointee of a `&T` argument.
+        """
+        if not toks:
+            return None
+        p = Parser(list(toks) + [RustToken("eof", "", toks[-1].line)],
+                   self.unit, self.tysubst)
+        p.impl_type = self.impl_type
+        if p.cur.kind == "ident" and p.cur.val == "move":
+            p.next()
+        params = []
+        if p.accept("||"):
+            pass
+        elif p.accept("|"):
+            while not p.at("|", "punc"):
+                by_ref = p._accept_refs()
+                p.accept("mut")
+                subs = []
+                if p.accept("("):
+                    # `|(i, x)|` -- destructure a pair.
+                    while not p.at(")", "punc"):
+                        sb = p._accept_refs()
+                        p.accept("mut")
+                        subs.append((p.expect_ident(), sb))
+                        if not p.accept(","):
+                            break
+                    p.expect(")")
+                    name = "_"
+                else:
+                    name = p.expect_ident()
+                ty = p.parse_type() if p.accept(":") else None
+                params.append((name, ty, by_ref, subs))
+                if not p.accept(","):
+                    break
+            p.expect("|")
+        else:
+            return None
+        if p.accept("->"):
+            p.parse_type()
+        return params, p.toks[p.i:-1]
+
+    def _accept_refs(self):
+        """Consume `&`s (and `&&`) before a pattern; True if there were any."""
+        seen = False
+        while self.at("&", "punc") or self.at("&&", "punc"):
+            self.next()
+            seen = True
+        return seen
+
+    def apply_fn(self, toks, args, want=None, arg_parts=None):
+        """Apply a function argument to `args`, a list of (code, type, mode).
+
+        `mode` is "val" for an argument Rust passes as `T` and "ref" for one
+        it passes as `&T` (`filter`, `inspect`): a `&x` parameter pattern then
+        binds the value, and a plain one binds a pointer to it. The body's
+        hoisted work is left in the pending list for the caller to place.
+        """
+        parts = self.closure_parts(toks)
+        if parts is None:
+            f = self.sub_expr(toks)
+            codes, atys = [], []
+            for c, t, m in args:
+                if m == "ref":
+                    codes.append("&" + _addressable(c))
+                    atys.append(RustCType(t.base, t.ptr + 1, t.array)
+                                if t is not None else None)
+                else:
+                    codes.append(c)
+                    atys.append(t)
+            if f.type is not None and f.type.ptr <= 1 \
+                    and f.type.base in self.unit.closures:
+                return self.call_closure(f, codes, atys)
+            sig = self.fn_sigs.get(f.code)
+            if sig is None and f.type is not None \
+                    and f.type.base in self.unit.fn_ptrs:
+                sig = self.unit.fn_ptrs[f.type.base]
+            ret = sig[0] if sig else None
+            if sig:
+                codes = _adapt_args(codes, atys, sig[1])
+            return Expr("%s(%s)" % (f.code, ", ".join(codes)), ret)
+        params, body = parts
+        if len(params) != len(args):
+            self.err("this closure takes %d argument%s, but %d %s passed",
+                     len(params), "" if len(params) == 1 else "s", len(args),
+                     "is" if len(args) == 1 else "are")
+        for tok in body:
+            if (tok.kind == "kw" and tok.val == "return") or \
+                    (tok.kind == "punc" and tok.val == "?"):
+                self.err("`%s` inside a closure passed to this method is not "
+                         "supported: the closure is inlined, so it would "
+                         "leave the enclosing function instead of the "
+                         "closure", tok.val)
+        self.scope_push()
+        try:
+            for idx in range(len(params)):
+                pname, pty, by_ref, subs = params[idx]
+                code, aty, mode = args[idx]
+                ap = arg_parts[idx] if arg_parts else None
+                if not subs:
+                    self._bind_param(pname, pty, by_ref, code, aty, mode)
+                    continue
+                if ap is not None:
+                    if len(ap) != len(subs):
+                        self.err("this pattern binds %d names, but the value "
+                                 "has %d parts", len(subs), len(ap))
+                    for k in range(len(subs)):
+                        pc, pt, prc = ap[k]
+                        self._bind_param(subs[k][0], None, subs[k][1], pc, pt,
+                                         "refcopy" if prc else "val")
+                elif aty is not None and not aty.ptr \
+                        and aty.base in self.unit.tuples:
+                    fields = self.unit.tuples[aty.base]
+                    if len(fields) != len(subs):
+                        self.err("this pattern binds %d names, but the tuple "
+                                 "has %d elements", len(subs), len(fields))
+                    for k in range(len(subs)):
+                        self._bind_param(subs[k][0], None, subs[k][1],
+                                         "%s._%d" % (code, k), fields[k],
+                                         mode)
+                else:
+                    self.err("a tuple pattern needs a tuple argument")
+            return self.sub_expr(body, want)
+        finally:
+            self.scope_pop()
+
+    def _bind_param(self, pname, pty, by_ref, code, aty, mode):
+        """Bind one inlined-closure parameter to the C value `code`."""
+        if pname == "_" or (aty is not None and aty.is_void()):
+            return
+        if mode == "ref" and not by_ref:
+            ty = pty
+            if ty is None and aty is not None:
+                ty = RustCType(aty.base, aty.ptr + 1, aty.array)
+            val = "&" + _addressable(code)
+        else:
+            ty = pty or aty
+            val = code
+        if ty is None:
+            self.err("closure parameter `%s` needs a type annotation", pname)
+        self.declare(pname, ty)
+        if mode == "refcopy" and not by_ref:
+            self.refcopies[-1][pname] = True
+        self.pending.append("%s = %s;" % (ty.decl(_c_name(pname)), val))
+
+    def _branch_arm(self, tmp, work, e):
+        if e.never:
+            return " ".join(work + [e.code + ";"])
+        return " ".join(work + ["%s = %s;" % (tmp, e.code)])
+
+    def branch_value(self, ty, cond, then_work, then_e, else_work, else_e):
+        """`cond ? then : else` where either arm may carry statements."""
+        if ty is None or ty.is_void():
+            self.err("cannot infer the type this method produces; annotate "
+                     "the target")
+        tmp = self.new_temp()
+        self.pending.append("%s; if (%s) { %s } else { %s }"
+                            % (ty.decl(tmp), cond,
+                               self._branch_arm(tmp, then_work, then_e),
+                               self._branch_arm(tmp, else_work, else_e)))
+        return Expr(tmp, ty)
+
+    def _apply_in_branch(self, toks, args, want=None):
+        """`apply_fn`, returning (result, the work its body hoisted)."""
+        mark = len(self.pending)
+        e = self.apply_fn(toks, args, want)
+        return e, self.take_pending(mark)
+
+    def _target_in(self, table):
+        """The current target type if it is in `table`, else None."""
+        t = self.target
+        if t is not None and not t.ptr and t.base in table:
+            return t
+        return None
+
+    def _expect_msg(self, test, toks):
+        """Hoist `if (test) { print msg; abort(); }` for `expect`."""
+        msg = self.sub_expr(toks)
+        self.unit.needs.add("fprintf")
+        self.unit.needs.add("abort")
+        self.pending.append('if (%s) { fprintf(stderr, "%%s\\n", %s); '
+                            'abort(); }' % (test, msg.code))
+
+    def result_ctor(self, rty, which, code):
+        """`Ok(code)` / `Err(code)` of the Result type `rty`."""
+        ok, _err = self.unit.results[rty.base]
+        if which == "Ok":
+            if ok.is_void():
+                return "(%s){.ok = 1}" % rty.base
+            return "(%s){.ok = 1, .value = %s}" % (rty.base, code)
+        return "(%s){.ok = 0, .error = %s}" % (rty.base, code)
+
+    def _arity(self, name, args, n):
+        if len(args) != n:
+            self.err("`%s` takes %d argument%s, got %d", name, n,
+                     "" if n == 1 else "s", len(args))
+
     def option_method(self, recv, name, args):
-        """Lower the supported `Option` methods."""
-        elem = self.unit.options[recv.type.base]
-        if name == "is_some" and not args:
-            return Expr("%s.some" % recv.code, RustCType("_Bool"))
-        if name == "is_none" and not args:
-            return Expr("(!%s.some)" % recv.code, RustCType("_Bool"))
-        if name == "unwrap" and not args:
-            self.unit.unwraps.add(recv.type.base)
+        """Lower an `Option` method; `args` are raw token slices."""
+        oty = recv.type
+        elem = self.unit.options[oty.base]
+        code = recv.code.strip()
+        place = code if _is_place(code) else None
+        s = self.once(recv)
+        BOOL = RustCType("_Bool")
+        val = ("%s.value" % s, elem, "val")
+        if name == "is_some":
+            self._arity(name, args, 0)
+            return Expr("%s.some" % s, BOOL)
+        if name == "is_none":
+            self._arity(name, args, 0)
+            return Expr("(!%s.some)" % s, BOOL)
+        if name == "unwrap_unchecked":
+            self._arity(name, args, 0)
+            return Expr("%s.value" % s, elem)
+        if name == "unwrap":
+            self._arity(name, args, 0)
+            self.unit.unwraps.add(oty.base)
             self.unit.needs.add("abort")
-            return Expr("%s_unwrap(%s)" % (recv.type.base, recv.code), elem)
-        if name == "unwrap_or" and len(args) == 1:
+            return Expr("%s_unwrap(%s)" % (oty.base, s), elem)
+        if name == "expect":
+            self._arity(name, args, 1)
+            self._expect_msg("!%s.some" % s, args[0])
+            return Expr("%s.value" % s, elem)
+        if name == "unwrap_or":
+            self._arity(name, args, 1)
+            d = self.sub_expr(args[0], elem)
+            return Expr("(%s.some ? %s.value : %s)" % (s, s, d.code), elem)
+        if name == "unwrap_or_default":
+            self._arity(name, args, 0)
             return Expr("(%s.some ? %s.value : %s)"
-                        % (recv.code, recv.code, args[0]), elem)
-        self.err("no method `%s` on `Option`; supported: is_some, is_none, "
-                 "unwrap, unwrap_or", name)
+                        % (s, s, _zero_value(elem)), elem)
+        if name == "unwrap_or_else":
+            self._arity(name, args, 1)
+            e, w = self._apply_in_branch(args[0], [], elem)
+            return self.branch_value(elem, "%s.some" % s, [],
+                                     Expr("%s.value" % s, elem), w, e)
+        if name in ("is_some_and", "is_none_or"):
+            self._arity(name, args, 1)
+            e, w = self._apply_in_branch(args[0], [val])
+            other = Expr("0" if name == "is_some_and" else "1", BOOL)
+            return self.branch_value(BOOL, "%s.some" % s, w, e, [], other)
+        if name == "map":
+            self._arity(name, args, 1)
+            want = self._target_in(self.unit.options)
+            e, w = self._apply_in_branch(
+                args[0], [val],
+                self.unit.options[want.base] if want is not None else None)
+            if e.type is None or e.type.is_void():
+                self.err("cannot infer what this `map` produces")
+            rty = self.unit.option_type(e.type)
+            some = Expr("(%s){1, %s}" % (rty.base, e.code), rty)
+            some.never = e.never
+            return self.branch_value(rty, "%s.some" % s, w, some, [],
+                                     Expr("(%s){0}" % rty.base, rty))
+        if name in ("map_or", "map_or_else"):
+            self._arity(name, args, 2)
+            if name == "map_or":
+                d, dw = self.sub_expr(args[0]), []
+            else:
+                d, dw = self._apply_in_branch(args[0], [])
+            e, w = self._apply_in_branch(args[1], [val], d.type)
+            ty = d.type if d.type is not None else e.type
+            return self.branch_value(ty, "%s.some" % s, w, e, dw, d)
+        if name == "and_then":
+            self._arity(name, args, 1)
+            want = self._target_in(self.unit.options)
+            e, w = self._apply_in_branch(args[0], [val], want)
+            rty = e.type if e.type is not None else want
+            if rty is None or rty.base not in self.unit.options:
+                self.err("the closure passed to `and_then` must return an "
+                         "`Option`")
+            return self.branch_value(rty, "%s.some" % s, w, e, [],
+                                     Expr("(%s){0}" % rty.base, rty))
+        if name == "or":
+            self._arity(name, args, 1)
+            o = self.sub_expr(args[0], oty)
+            return Expr("(%s.some ? %s : %s)" % (s, s, o.code), oty)
+        if name == "or_else":
+            self._arity(name, args, 1)
+            e, w = self._apply_in_branch(args[0], [], oty)
+            return self.branch_value(oty, "%s.some" % s, [], Expr(s, oty),
+                                     w, e)
+        if name == "xor":
+            self._arity(name, args, 1)
+            o = self.once(self.sub_expr(args[0], oty))
+            return Expr("((%s.some && !%s.some) ? %s : ((!%s.some && %s.some)"
+                        " ? %s : (%s){0}))" % (s, o, s, s, o, o, oty.base),
+                        oty)
+        if name == "filter":
+            self._arity(name, args, 1)
+            e, w = self._apply_in_branch(args[0],
+                                         [("%s.value" % s, elem, "ref")])
+            tmp = self.new_temp()
+            self.pending.append("%s = %s; if (%s.some) { %s if (!(%s)) "
+                                "%s.some = 0; }"
+                                % (oty.decl(tmp), s, s, " ".join(w), e.code,
+                                   tmp))
+            return Expr(tmp, oty)
+        if name == "inspect":
+            self._arity(name, args, 1)
+            e, w = self._apply_in_branch(args[0],
+                                         [("%s.value" % s, elem, "ref")])
+            self.pending.append("if (%s.some) { %s }"
+                                % (s, " ".join(w + [e.code + ";"])))
+            return Expr(s, oty)
+        if name in ("ok_or", "ok_or_else"):
+            self._arity(name, args, 1)
+            want = self._target_in(self.unit.results)
+            werr = self.unit.results[want.base][1] if want is not None \
+                else None
+            if name == "ok_or":
+                e, w = self.sub_expr(args[0], werr), []
+            else:
+                e, w = self._apply_in_branch(args[0], [], werr)
+            rty = want
+            if rty is None:
+                if e.type is None:
+                    self.err("cannot infer the error type of this `%s`",
+                             name)
+                rty = self.unit.result_type(elem, e.type)
+            bad = e
+            if not e.never:
+                bad = Expr(self.result_ctor(rty, "Err", e.code), rty)
+            return self.branch_value(
+                rty, "%s.some" % s, [],
+                Expr(self.result_ctor(rty, "Ok", "%s.value" % s), rty),
+                w, bad)
+        if name in ("as_ref", "as_mut"):
+            self._arity(name, args, 0)
+            base = place if place is not None else s
+            pty = self.unit.option_type(RustCType(elem.base, elem.ptr + 1,
+                                                  elem.array))
+            return Expr("(%s){%s.some, &%s.value}"
+                        % (pty.base, base, _addressable(base)), pty)
+        if name in ("copied", "cloned"):
+            self._arity(name, args, 0)
+            if not elem.ptr:
+                return Expr(s, oty)
+            inner = RustCType(elem.base, elem.ptr - 1, elem.array)
+            rty = self.unit.option_type(inner)
+            return Expr("(%s.some ? (%s){1, *%s.value} : (%s){0})"
+                        % (s, rty.base, s, rty.base), rty)
+        if name == "flatten":
+            self._arity(name, args, 0)
+            if elem.base not in self.unit.options or elem.ptr:
+                self.err("`flatten` needs an `Option<Option<T>>`")
+            return Expr("(%s.some ? %s.value : (%s){0})"
+                        % (s, s, elem.base), elem)
+        if name in ("take", "replace", "insert", "get_or_insert",
+                    "get_or_insert_with"):
+            return self._option_mutator(place, oty, elem, name, args)
+        self.err("no method `%s` on `Option`", name)
+
+    def _option_mutator(self, place, oty, elem, name, args):
+        """`take`, `replace`, `insert` and `get_or_insert[_with]`."""
+        if place is None:
+            self.err("`%s` needs an `Option` it can modify -- a local, a "
+                     "field or a dereferenced pointer", name)
+        ref = Expr("&%s.value" % _addressable(place),
+                   RustCType(elem.base, elem.ptr + 1))
+        if name == "take":
+            self._arity(name, args, 0)
+            tmp = self.new_temp()
+            self.pending.append("%s = %s; %s.some = 0;"
+                                % (oty.decl(tmp), place, place))
+            return Expr(tmp, oty)
+        self._arity(name, args, 1)
+        if name in ("replace", "insert"):
+            v = self.sub_expr(args[0], elem)
+            tmp = self.new_temp()
+            self.pending.append("%s = %s; %s = (%s){1, %s};"
+                                % (oty.decl(tmp), place, place, oty.base,
+                                   v.code))
+            return ref if name == "insert" else Expr(tmp, oty)
+        if name == "get_or_insert":
+            v, w = self.sub_expr(args[0], elem), []
+        else:
+            v, w = self._apply_in_branch(args[0], [], elem)
+        self.pending.append("if (!%s.some) { %s %s = (%s){1, %s}; }"
+                            % (place, " ".join(w), place, oty.base, v.code))
+        return ref
+
+    def result_method(self, recv, name, args):
+        """Lower a `Result` method; `args` are raw token slices."""
+        rty = recv.type
+        ok, err = self.unit.results[rty.base]
+        s = self.once(recv)
+        BOOL = RustCType("_Bool")
+        if ok.is_void():
+            okv = ("0", ok, "val")
+        else:
+            okv = ("%s.value" % s, ok, "val")
+        errv = ("%s.error" % s, err, "val")
+        value = Expr("%s.value" % s, ok)
+        if name == "is_ok":
+            self._arity(name, args, 0)
+            return Expr("%s.ok" % s, BOOL)
+        if name == "is_err":
+            self._arity(name, args, 0)
+            return Expr("(!%s.ok)" % s, BOOL)
+        if name in ("is_ok_and", "is_err_and"):
+            self._arity(name, args, 1)
+            is_ok = name == "is_ok_and"
+            e, w = self._apply_in_branch(args[0], [okv if is_ok else errv])
+            cond = ("%s.ok" if is_ok else "!%s.ok") % s
+            return self.branch_value(BOOL, cond, w, e, [], Expr("0", BOOL))
+        if name in ("unwrap", "unwrap_err"):
+            self._arity(name, args, 0)
+            if name == "unwrap" and ok.is_void():
+                self.err("`unwrap` on `Result<(), _>` yields nothing; "
+                         "test `is_ok` instead")
+            self.unit.unwraps.add(rty.base)
+            self.unit.needs.add("abort")
+            return Expr("%s_%s(%s)" % (rty.base, name, s),
+                        ok if name == "unwrap" else err)
+        if name == "expect":
+            self._arity(name, args, 1)
+            self._expect_msg("!%s.ok" % s, args[0])
+            return Expr("0", VOID) if ok.is_void() else value
+        if name == "expect_err":
+            self._arity(name, args, 1)
+            self._expect_msg("%s.ok" % s, args[0])
+            return Expr("%s.error" % s, err)
+        if name in ("unwrap_or", "unwrap_or_default", "unwrap_or_else"):
+            if ok.is_void():
+                self.err("`%s` on `Result<(), _>` yields nothing", name)
+            if name == "unwrap_or":
+                self._arity(name, args, 1)
+                d = self.sub_expr(args[0], ok)
+                return Expr("(%s.ok ? %s.value : %s)" % (s, s, d.code), ok)
+            if name == "unwrap_or_default":
+                self._arity(name, args, 0)
+                return Expr("(%s.ok ? %s.value : %s)"
+                            % (s, s, _zero_value(ok)), ok)
+            self._arity(name, args, 1)
+            e, w = self._apply_in_branch(args[0], [errv], ok)
+            return self.branch_value(ok, "%s.ok" % s, [], value, w, e)
+        if name in ("ok", "err"):
+            self._arity(name, args, 0)
+            inner = ok if name == "ok" else err
+            if inner.is_void():
+                self.err("`%s` on a `Result` whose payload there is `()` is "
+                         "not supported", name)
+            opt = self.unit.option_type(inner)
+            if name == "ok":
+                return Expr("(%s){%s.ok, %s.value}" % (opt.base, s, s), opt)
+            return Expr("(%s){!%s.ok, %s.error}" % (opt.base, s, s), opt)
+        if name in ("map", "map_err"):
+            self._arity(name, args, 1)
+            is_map = name == "map"
+            e, w = self._apply_in_branch(args[0], [okv if is_map else errv])
+            if e.type is None or e.type.is_void():
+                self.err("cannot infer what this `%s` produces", name)
+            if is_map:
+                out = self.unit.result_type(e.type, err)
+            else:
+                out = self.unit.result_type(ok, e.type)
+            mapped = Expr(self.result_ctor(out, "Ok" if is_map else "Err",
+                                           e.code), out)
+            mapped.never = e.never
+            if is_map:
+                keep = Expr(self.result_ctor(out, "Err", "%s.error" % s), out)
+                return self.branch_value(out, "%s.ok" % s, w, mapped, [],
+                                         keep)
+            keep = Expr(self.result_ctor(out, "Ok", "%s.value" % s), out)
+            return self.branch_value(out, "%s.ok" % s, [], keep, w, mapped)
+        if name in ("and_then", "or_else"):
+            self._arity(name, args, 1)
+            want = self._target_in(self.unit.results)
+            is_and = name == "and_then"
+            e, w = self._apply_in_branch(args[0], [okv if is_and else errv],
+                                         want)
+            out = e.type if e.type is not None else want
+            if out is None or out.base not in self.unit.results:
+                self.err("the closure passed to `%s` must return a `Result`",
+                         name)
+            if is_and:
+                keep = Expr(self.result_ctor(out, "Err", "%s.error" % s), out)
+                return self.branch_value(out, "%s.ok" % s, w, e, [], keep)
+            keep = Expr(self.result_ctor(out, "Ok", "%s.value" % s), out)
+            return self.branch_value(out, "%s.ok" % s, [], keep, w, e)
+        if name in ("map_or", "map_or_else"):
+            self._arity(name, args, 2)
+            if name == "map_or":
+                d, dw = self.sub_expr(args[0]), []
+            else:
+                d, dw = self._apply_in_branch(args[0], [errv])
+            e, w = self._apply_in_branch(args[1], [okv], d.type)
+            ty = d.type if d.type is not None else e.type
+            return self.branch_value(ty, "%s.ok" % s, w, e, dw, d)
+        if name in ("inspect", "inspect_err"):
+            self._arity(name, args, 1)
+            if name == "inspect":
+                arg = ("%s.value" % s, ok, "ref")
+            else:
+                arg = ("%s.error" % s, err, "ref")
+            e, w = self._apply_in_branch(args[0], [arg])
+            cond = ("%s.ok" if name == "inspect" else "!%s.ok") % s
+            self.pending.append("if (%s) { %s }"
+                                % (cond, " ".join(w + [e.code + ";"])))
+            return Expr(s, rty)
+        self.err("no method `%s` on `Result`", name)
 
     def index(self, recv, idx):
         """Lower `recv[idx]`, reaching through a slice's data pointer."""
         ty = recv.type
-        if ty is not None and ty.base in self.unit.slices:
+        # A slice value, not an array *of* slices: `rows[0]` on
+        # `[&[i32]; 2]` indexes the array. Checking the element type first
+        # read it as `rows.ptr[0]`.
+        if ty is not None and ty.base in self.unit.slices and not ty.array \
+                and not ty.ptr:
             elem = self.unit.slices[ty.base]
             return Expr("%s.ptr[%s]" % (recv.code, idx.code), elem)
         if ty is not None:
@@ -2321,17 +3344,61 @@ class Parser:
     def parse_method_call(self, recv, name):
         """Lower `recv.method(args)` to the free function `Type_method`."""
         self.expect("(")
-        args = []
+        if recv.iter is not None:
+            return self.iter_method(recv, name)
+        if name in ("iter", "iter_mut", "into_iter") + _STR_SOURCES \
+                and recv.type is not None \
+                and (recv.type.base, name) not in self.unit.methods \
+                and self.iterable(recv.type, name):
+            if self.raw_call_args():
+                self.err("`%s` takes no arguments", name)
+            ch = IterChain()
+            ch.subj = recv
+            ch.ops = [(name, [])]
+            return self.iter_value(ch)
+        self.method_targs = None
+        if recv.type is not None and not recv.type.ptr \
+                and not recv.type.array \
+                and recv.type.base in ("crust_char", "unsigned char") \
+                and (recv.type.base, name) not in self.unit.methods:
+            return self.char_method(recv, name, self.raw_call_args())
+        if recv.type is not None and recv.type.ptr == 1 and \
+                not recv.type.array and (recv.type.base in self.unit.options
+                                         or recv.type.base in
+                                         self.unit.results):
+            # `o: &mut Option<T>` -- auto-deref, as for a field access.
+            recv = Expr("(*%s)" % recv.code, RustCType(recv.type.base))
+        if recv.type is not None and not recv.type.ptr and (
+                recv.type.base in self.unit.options
+                or recv.type.base in self.unit.results):
+            # Raw token slices, so a closure argument can be inlined rather
+            # than lifted.
+            args = self.raw_call_args()
+            if recv.type.base in self.unit.options:
+                return self.option_method(recv, name, args)
+            return self.result_method(recv, name, args)
+        # When the method is known up front, its parameter types are the
+        # arguments' targets -- `s.put(None)` needs one to type its `None`
+        # -- and passing an owning local by value is a move, exactly as it is
+        # for a free function. Without the move, `v.push(s)` copied `s` into
+        # the Vec and then dropped `s` at scope exit: the Vec held a freed
+        # buffer, and a by-value `impl Drop` argument was dropped twice.
+        info = None
+        if recv.type is not None:
+            info = self.unit.methods.get((recv.type.base, name))
+        params = [t for _, t in info.params] if info is not None else []
+        args, aexprs = [], []
         while not self.at(")", "punc"):
-            args.append(self.parse_expr().code)
+            want = params[len(args)] if len(args) < len(params) else None
+            a = self.parse_expr_as(want)
+            args.append(a.code)
+            aexprs.append(a)
             if not self.accept(","):
                 break
         self.expect(")")
+        if info is not None:
+            self._move_by_value_args(params, args, aexprs)
 
-        if recv.type is not None and recv.type.base in self.unit.results:
-            return self.result_method(recv, name, args)
-        if recv.type is not None and recv.type.base in self.unit.options:
-            return self.option_method(recv, name, args)
         # `PyList<T>` is py2c's own list, so its mutating methods are py2c's
         # own helpers. They are `static`, which is fine: an `#include "x.py"`
         # puts the generated C in *this* translation unit, so they are
@@ -2388,6 +3455,10 @@ class Parser:
                      "annotate it", name)
         owner = recv.type.base
         info = self.unit.methods.get((owner, name))
+        if info is None and name in _ITERATOR_METHODS:
+            self.err("`.%s()` is supported only in the subject of a `for` "
+                     "loop -- `for x in v.iter().rev()` -- since Crust has no "
+                     "iterator protocol; write the loop out", name)
         if info is None:
             self.err("no method `%s` on type `%s`", name, owner)
         if info.self_kind == "none":
@@ -2412,8 +3483,13 @@ class Parser:
                 recv_code = "&" + tmp
         else:
             recv_code = ("(*%s)" % recv.code) if recv.type.ptr else recv.code
-        return Expr("%s(%s)" % (info.mangled,
+        out = Expr("%s(%s)" % (info.mangled,
                                 ", ".join([recv_code] + args)), info.ret)
+        inst = self.unit.instances.get(owner, (None,))[0]
+        if inst in _ELEM_OWNERS and name in _BORROWING_GETTERS \
+                and self.owning_free(info.ret) is not None:
+            out.borrowed = True
+        return out
 
     def parse_struct_literal(self, name, line):
         """Lower `Name { f: e, .. }` to a C compound literal."""
@@ -2424,6 +3500,8 @@ class Parser:
             field = self.expect_ident()
             self.expect(":")
             val = self.parse_expr()
+            self.reject_borrow(val, self.unit.field_type(name, field),
+                               "the field `%s`" % field)
             known = self.unit.structs.get(name) is not None
             if known and self.unit.field_type(name, field) is None:
                 raise CrustError("line %d: struct `%s` has no field `%s`"
@@ -2464,7 +3542,7 @@ class Parser:
         return Expr("(%s){.tag = %s, .u.%s = {%s}}"
                     % (owner, flat, vname, inits), RustCType(owner))
 
-    def parse_closure(self):
+    def parse_closure(self, is_move=False):
         """Lower `|a, b| expr` to a lifted top-level function.
 
         Crust has no closure environment, so only a *non-capturing* closure
@@ -2515,46 +3593,27 @@ class Parser:
             end = self.i
         body = self.toks[body_start:end]
 
-        bound = {n for n, _ in params}
-        for tok in body:
-            if tok.kind != "ident" or tok.val in bound:
-                continue
-            if self.lookup(tok.val) is not None:
-                self.err("closure captures `%s` from its environment; Crust "
-                         "lowers a closure to a plain function and has no "
-                         "environment to capture into", tok.val)
+        bound = set()
+        for pname, _pty in params:
+            bound.add(pname)
+        caps = self._closure_captures(body, bound)
 
         self.unit.closure_n += 1
         name = "_crust_closure%d" % self.unit.closure_n
-        sub = Parser(list(body) + [RustToken("eof", "", start.line)],
-                     self.unit, self.tysubst)
-        sub.impl_type = self.impl_type
-        sub.scope_push()
-        for pname, pty in params:
-            sub.declare(pname, pty)
+        if caps:
+            return self._capturing_closure(start, name, params, ret, body,
+                                           caps, is_move)
         if ret is None:
-            probe = Parser(list(body) + [RustToken("eof", "", start.line)],
-                           self.unit, self.tysubst)
-            probe.scope_push()
-            for pname, pty in params:
-                probe.declare(pname, pty)
+            probe = self._closure_body_parser(body, start, params, [], "", "")
             try:
                 ret = probe.parse_expr().type or VOID
             except CrustError:
                 ret = VOID
-        sub.ret_type = ret
         out = Out(start.line)
         out.line_at(start.line, "static %s(%s)"
                     % (ret.decl(name), render_params(params) if params
                        else "void"), 0)
-        if self.at("{", "punc"):
-            pass
-        out.write(" {")
-        e = sub.parse_expr()
-        for stmt in sub.pending:
-            out.write(" " + stmt)
-        out.write(" return %s; }" % e.code if not ret.is_void()
-                  else " %s; }" % e.code)
+        self._closure_body(out, body, start, params, [], "", "", ret)
         self.unit.emitted.append(out.text())
         self.unit.fn_sigs[name] = (ret, [t for _, t in params])
         self.unit.statics.add(name)
@@ -2565,6 +3624,167 @@ class Parser:
         ptr = self.unit.fn_ptr_type(ret, [t for _, t in params])
         return Expr(name, ptr)
 
+    def _closure_captures(self, body, bound):
+        """The enclosing locals a closure body names, in first-use order.
+
+        A name counts as a use unless it is a field (`p.x`), a path segment
+        (`E::V`), a struct literal's field name (`P { x: .. }`), a macro name,
+        or one of the closure's own parameters.
+        """
+        caps = []
+        for k in range(len(body)):
+            tok = body[k]
+            if tok.kind != "ident" or tok.val in bound or tok.val in caps:
+                continue
+            prev = body[k - 1].val if k > 0 else ""
+            nxt = body[k + 1].val if k + 1 < len(body) else ""
+            if prev in (".", "::") or nxt in ("::", "!"):
+                continue
+            if nxt == ":" and prev in ("{", ","):
+                continue
+            if self.lookup(tok.val) is not None:
+                caps.append(tok.val)
+        return caps
+
+    def _closure_body_parser(self, body, start, params, caps, env, how):
+        """A parser for a lifted closure body, with its names in scope.
+
+        Captures are aliases for places in the environment. A captured owning
+        value is a borrow inside the body: the environment, not the body,
+        owns it, so moving it out would drop it twice.
+        """
+        sub = Parser(list(body) + [RustToken("eof", "", start.line)],
+                     self.unit, self.tysubst)
+        sub.impl_type = self.impl_type
+        # A function frame, so an explicit `return` in a block body drops
+        # the body's locals on the way out.
+        sub.scope_push("func")
+        for cname, cty, code, borrowed in caps:
+            sub.declare_alias(cname, cty, code)
+            if borrowed:
+                sub.refcopies[-1][cname] = True
+        for pname, pty in params:
+            sub.declare(pname, pty)
+        return sub
+
+    def _closure_body(self, out, body, start, params, caps, env, how, ret):
+        """Emit ` { ..; return e; }` for a lifted closure."""
+        sub = self._closure_body_parser(body, start, params, caps, env, how)
+        sub.ret_type = ret
+        out.write(" {")
+        # The return type is the body's target, so a tail `Ok(..)` or
+        # `None` knows what it builds.
+        e = sub.parse_expr_as(None if ret.is_void() else ret)
+        for stmt in sub.pending:
+            out.write(" " + stmt)
+        if e.never or ret.is_void():
+            out.write(" %s; }" % e.code)
+        else:
+            out.write(" return %s; }" % e.code)
+
+    def _capturing_closure(self, start, name, params, ret, body, caps,
+                           is_move):
+        """Lower a closure that captures: an environment struct and a function.
+
+        Rust gives every closure its own type; so does this. The value is a
+        struct holding the captures -- pointers to them, or with `move`
+        copies of them -- and the body becomes `name(env *, params..)`. A
+        call `f(x)` is `name(&f, x)`, statically, so a closure passed to a
+        generic `F: Fn(..)` monomorphises into a direct call.
+
+        A `move` closure that takes an owning value owns it from then on: the
+        source is moved out of (zeroed, and not valid to use again), and the
+        closure's own destructor drops it.
+        """
+        env = name + "_env"
+        fields, inits, capinfo, owned = [], [], [], []
+        for cap in caps:
+            ty = self.lookup(cap)
+            cn = _c_name(cap)
+            outer = self.alias_of(cap)
+            if outer is None:
+                outer = cn
+            if self.is_refcopy(cap):
+                self.check_moved(cap, start.line)
+            owns = self.owning_free(ty) is not None
+            borrowed = owns or self.is_refcopy(cap)
+            if is_move:
+                fields.append((cn, ty))
+                inits.append(".%s = %s" % (cn, outer))
+                capinfo.append((cap, ty, "_env->%s" % cn, borrowed))
+                if owns and not self.is_refcopy(cap):
+                    owned.append((cap, ty, cn))
+            elif ty.array:
+                # An array is captured as a pointer to its first element,
+                # which indexes and iterates the same way.
+                fields.append((cn, RustCType(ty.base, ty.ptr + 1)))
+                inits.append(".%s = %s" % (cn, outer))
+                capinfo.append((cap, ty, "_env->%s" % cn, borrowed))
+            else:
+                fields.append((cn, RustCType(ty.base, ty.ptr + 1)))
+                inits.append(".%s = &%s" % (cn, _addressable(outer)))
+                capinfo.append((cap, ty, "(*_env->%s)" % cn, borrowed))
+        self.unit.structs[env] = fields
+        self.unit.struct_order.append(env)
+        if ret is None:
+            probe = self._closure_body_parser(body, start, params, capinfo,
+                                              env, "")
+            try:
+                ret = probe.parse_expr().type or VOID
+            except CrustError:
+                ret = VOID
+        ptypes = [t for _, t in params]
+        self.unit.closures[env] = (name, ret, ptypes)
+        self.unit.fn_sigs[name] = (ret, [RustCType(env, 1)] + ptypes)
+        self.unit.statics.add(name)
+        out = Out(start.line)
+        rest = "".join(", " + t.decl(_c_name(n)) for n, t in params)
+        out.line_at(start.line, "static %s(%s *_env%s)"
+                    % (ret.decl(name), env, rest), 0)
+        self._closure_body(out, body, start, params, capinfo, env, "", ret)
+        self.unit.emitted.append(out.text())
+        lit = "(%s){%s}" % (env, ", ".join(inits))
+        if not owned:
+            return Expr(lit, RustCType(env))
+        # The environment owns what was moved in: build it, then zero the
+        # sources, and give the environment a destructor for scope exit.
+        tmp = self.new_temp()
+        self.pending.append("%s %s = %s;" % (env, tmp, lit))
+        glue = []
+        for cap, ty, cn in owned:
+            self.unit.needs.add("memset")
+            src = _c_name(cap)
+            self.pending.append("memset(&%s, 0, sizeof(%s));" % (src, src))
+            self.live_unregister(cap)
+            self.mark_moved(cap, start.line)
+            info = self.unit.methods.get((ty.base, self.owning_free(ty)))
+            glue.append("%s(&self->%s);" % (info.mangled, cn))
+        self.unit.drop_types.add(env)
+        _register(self.unit, env, "drop", VOID, [], self_kind="ref")
+        self.unit.statics.add(env + "_drop")
+        self.unit.emitted.append("static void %s_drop(%s *self) { %s }"
+                                 % (env, env, " ".join(glue)))
+        return Expr(tmp, RustCType(env))
+
+    def call_closure(self, fe, codes, atys):
+        """`fe(args)` where `fe` is a capturing closure (or a pointer to one).
+
+        Arguments are adapted to the parameter types, so a closure declared
+        `|x: &i32|` receives an address where the caller has a value.
+        """
+        fname, ret, ptypes = self.unit.closures[fe.type.base]
+        codes = _adapt_args(codes, atys, ptypes)
+        code = fe.code.strip()
+        if fe.type.ptr:
+            envp = code
+        elif _is_lvalue(code):
+            envp = "&" + _addressable(code)
+        else:
+            tmp = self.new_temp()
+            self.pending.append("%s = %s;" % (fe.type.decl(tmp), fe.code))
+            envp = "&" + tmp
+        return Expr("%s(%s)" % (fname, ", ".join([envp] + codes)), ret)
+
     def parse_if_expr(self):
         """Lower `if c { a } else { b }` in expression position to `c ? a : b`.
 
@@ -2573,71 +3793,126 @@ class Parser:
         """
         self.expect("if")
         cond = self.parse_cond()
+        mark = len(self.pending)
         then = self.parse_block_expr()
+        then_work = self.take_pending(mark)
         if not self.accept("else"):
             self.err("`if` used as an expression needs an `else` arm")
-        if self.at("if", "kw"):
-            other = self.parse_if_expr()
-        else:
-            other = self.parse_block_expr()
+        # The first arm's type is the second's target, so
+        # `if c { Some(1) } else { None }` can type its `None`.
+        self.expected.append(self.target or then.type)
+        try:
+            if self.at("if", "kw"):
+                other = self.parse_if_expr()
+            else:
+                other = self.parse_block_expr()
+        finally:
+            self.expected.pop()
+        other_work = self.take_pending(mark)
         ty = then.type if then.type is not None else other.type
-        return Expr("(%s ? %s : %s)" % (cond.code, then.code, other.code), ty)
+        if not then_work and not other_work:
+            return Expr("(%s ? %s : %s)" % (cond.code, then.code, other.code),
+                        ty)
+        # An arm hoisted work of its own, which must run only if that arm is
+        # taken; a ternary cannot hold statements, so this becomes an `if`
+        # assigning one temporary. The condition's own work stays where it
+        # was, since the condition is always evaluated.
+        if ty is None or ty.is_void():
+            self.err("cannot infer the type of this `if` expression; "
+                     "annotate it")
+        tmp = self.new_temp()
+        self.pending.append(
+            "%s; if (%s) { %s %s = %s; } else { %s %s = %s; }"
+            % (ty.decl(tmp), cond.code, " ".join(then_work), tmp, then.code,
+               " ".join(other_work), tmp, other.code))
+        return Expr(tmp, ty)
 
     def parse_block_expr(self):
         """Parse `{ stmt; ..; expr }` used as a value.
 
         A block in expression position may run statements before producing its
         tail expression, and Rust code does that constantly -- an `assert!`
-        before the value, a `let` for a temporary. C has no expression that
-        does the same portably, so the statements are hoisted into the
-        enclosing statement's *pending* list, where the existing `?` and
-        match-scrutinee machinery already puts work that must happen first.
+        before the value, a `let` for a temporary. It is lowered by
+        `value_of`: the block is parsed as an ordinary block whose tail
+        expression assigns a temporary, and the whole thing is hoisted into
+        the enclosing statement's pending list.
 
-        This only reads correctly because the pending list is emitted
-        immediately before the statement containing the block, which is
-        exactly when the block's own statements should run.
+        This used to parse each statement *tentatively* as an expression and
+        re-parse it as a statement when that failed. The first attempt's side
+        effects could not be undone: a `?` in it left hoisted work behind, so
+        the call ran twice, and a move in it made the re-parse report a use
+        after move that never happened. Owning locals declared in the block
+        were also never dropped. Going through `parse_block` fixes all three,
+        and a tail that is itself an `if`, a `match` or a nested block now
+        yields its value too.
         """
-        open_tok = self.expect("{")
-        out = Out(open_tok.line)
-        self.scope_push()
+        return self.value_of("block", self.cur.line)
+
+    def parse_match_expr(self):
+        """Parse a `match` in value position; see `value_of`."""
+        return self.value_of("match", self.cur.line)
+
+    def value_of(self, kind, line):
+        """Lower a block or `match` in value position to a temporary.
+
+        The construct is emitted as *statements* into its own buffer, with
+        every tail expression assigning one temporary (see `emit_tail`), and
+        the result is hoisted into the enclosing statement's pending list.
+        The statement's earlier hoisted work is set aside meanwhile: the
+        construct flushes the pending list into its own text, which sits
+        inside braces, and a temporary declared out there would be out of
+        scope at the statement that reads it.
+        """
+        out = Out(line)
+        outer = self.pending
+        self.pending = []
+        prev_name, prev_type = self.tail_name, self.tail_type
+        prev_hint, prev_types = self.tail_hint, self.tail_types
+        prev_last, prev_term = self.tail_last, self.terminated
+        prev_borrowed = self.tail_borrowed
+        self.tail_borrowed = False
+        tmp = self.new_temp()
+        self.tail_name, self.tail_type = tmp, None
+        self.tail_hint, self.tail_types = self.target, []
+        self.tail_last = None
+        # The construct's own sub-expressions (a scrutinee) are not the
+        # value, so they must not read the outer target.
+        self.expected.append(None)
         try:
-            while True:
-                if self.cur.kind == "eof":
-                    self.err("unterminated block")
-                if self.at("}", "punc"):
-                    # A block with no tail expression has no value to give.
-                    self.err("this block ends without a value; a block used "
-                             "as an expression must finish with one")
-                save = self.i
-                try:
-                    e = self.parse_expr()
-                except CrustError:
-                    self.i = save
-                    e = None
-                if e is not None and self.at("}", "punc"):
-                    self.next()
-                    body = " ".join(l.strip()
-                                    for l in out.text().splitlines()
-                                    if l.strip())
-                    if not body:
-                        return e
-                    if e.type is None:
-                        self.err("cannot infer the type of this block's "
-                                 "value; annotate it")
-                    # The hoisted statements keep their own C scope, and the
-                    # value is passed out through one temporary. Emitting them
-                    # bare would put every block-local at function scope, so
-                    # two blocks that each declare `a` would collide -- which
-                    # they did.
-                    tmp = self.new_temp()
-                    self.pending.append("%s;" % e.type.decl(tmp))
-                    self.pending.append("{ %s %s = %s; }"
-                                        % (body, tmp, e.code))
-                    return Expr(tmp, e.type)
-                self.i = save
-                self.parse_stmt(out, 0, False)
+            if kind == "match":
+                self.parse_match(out, 0, True)
+            else:
+                self.parse_block(out, 0, True)
+            types = self.tail_types
+            last = self.tail_last
+            borrowed = self.tail_borrowed
         finally:
-            self.scope_pop()
+            self.tail_borrowed = prev_borrowed
+            self.expected.pop()
+            self.tail_name, self.tail_type = prev_name, prev_type
+            self.tail_hint, self.tail_types = prev_hint, prev_types
+            self.tail_last, self.terminated = prev_last, prev_term
+            leftover = self.pending
+            self.pending = outer
+            self.pending.extend(leftover)
+        ty = _join_types(types)
+        if ty is None or ty.is_void():
+            if kind == "match":
+                self.err("cannot infer the type of this `match`; annotate "
+                         "the target, or make an arm produce a typed value")
+            self.err("this block ends without a value; a block used as an "
+                     "expression must finish with one")
+        text = " ".join(l.strip() for l in out.text().splitlines()
+                        if l.strip())
+        if last is not None and text == "{ %s = %s; }" % (tmp, last):
+            out_e = Expr(last, ty)       # `{ e }` is just `e`
+        else:
+            self.pending.append("%s;" % ty.decl(tmp))
+            self.pending.append(text if text.startswith("{") else
+                                "{ %s }" % text)
+            out_e = Expr(tmp, ty)
+        out_e.borrowed = borrowed
+        return out_e
 
     def parse_array_literal(self, open_tok):
         """Lower `[a, b, c]` and the `[v; N]` repeat form to a C initializer.
@@ -2698,9 +3973,9 @@ class Parser:
             return Expr(normalize_number_code(t),
                         normalize_number_type(t))
         if t.kind == "str":
-            return Expr(t.val, RustCType("const char", 1))
+            return Expr(_c_string(t.val, self), RustCType("const char", 1))
         if t.kind == "chr":
-            return Expr(t.val, RustCType("int"))
+            return Expr(_char_code(t.val, self), RustCType("crust_char"))
         if t.val == "true":
             return Expr("1", RustCType("_Bool"))
         if t.val == "false":
@@ -2710,6 +3985,16 @@ class Parser:
                 self.next()
                 return Expr("0", VOID)              # the unit value
             first = self.parse_expr()
+            if self.at("..", "punc") or self.at("..=", "punc"):
+                # `(lo..hi)` -- a range, as an iterator's source.
+                ch = IterChain()
+                ch.kind = "range"
+                ch.lo = first
+                ch.inclusive = self.next().val == "..="
+                if not self.at(")", "punc"):
+                    ch.hi = self.parse_expr()
+                self.expect(")")
+                return self.iter_value(ch)
             if not self.at(",", "punc"):
                 self.expect(")")
                 return Expr("(%s)" % first.code, first.type)
@@ -2731,14 +4016,25 @@ class Parser:
         if t.val == "if" and t.kind == "kw":
             self.i -= 1
             return self.parse_if_expr()
+        if t.val == "match" and t.kind == "kw":
+            self.i -= 1
+            return self.parse_match_expr()
+        if t.val == "loop" and t.kind == "kw":
+            self.i -= 1
+            return self.parse_loop_expr(None)
+        if t.kind == "label":
+            self.expect(":")
+            if not self.at("loop", "kw"):
+                self.err("only a labelled `loop` has a value; labelled "
+                         "blocks are not supported")
+            return self.parse_loop_expr(t.val)
         if (t.val == "|" and t.kind == "punc") or \
                 (t.val == "||" and t.kind == "punc"):
             self.i -= 1
             return self.parse_closure()
         if t.val == "move" and t.kind == "ident" and \
                 self.cur.val in ("|", "||"):
-            self.next() if False else None
-            return self.parse_closure()
+            return self.parse_closure(True)
         if t.val == "{" and t.kind == "punc":
             # A block in expression position: `{ self.x }`, which Rust code
             # writes to force a copy out of a packed field before formatting
@@ -2855,7 +4151,16 @@ class Parser:
                         self.check_moved(name, t.line)
                 else:
                     self.check_moved(name, t.line)
-                name = _c_name(name)
+                alias = self.alias_of(name)
+                borrowed = self.is_refcopy(name) and \
+                    self.owning_free(ty) is not None
+                name = _c_name(name) if alias is None else alias
+                out = Expr(name, ty)
+                out.borrowed = borrowed
+                out.from_path = saw_path
+                if targs is not None:
+                    out.targs = targs
+                return out
             out = Expr(name, ty)
             out.from_path = saw_path
             if targs is not None:
@@ -2878,6 +4183,7 @@ class Parser:
         self.scope_push(kind)
         if kind == "loop":
             self.loop_depth += 1
+            self.loop_frames[-1] = len(self.live) - 1
         while not self.at("}", "punc"):
             if self.cur.kind == "eof":
                 raise CrustError("line %d: unterminated block" % self.cur.line)
@@ -2891,6 +4197,11 @@ class Parser:
         # objects the `return` just emitted.
         if not self.terminated:
             self.emit_drops(out, close.line, indent + 1, len(self.live) - 1)
+        if kind == "loop" and self.loop_cont[-1]:
+            # A labelled `continue` from an inner loop lands here: after this
+            # body's drops (the goto site already ran them), before the `}`
+            # that leads to the next iteration.
+            out.line_at(close.line, "%s: ;" % self.loop_cont[-1], indent + 1)
         self.scope_pop()
         # A block never marks its *parent* terminated: `if c { return; }`
         # leaves the fall-through path live, and treating it as dead is how
@@ -2900,6 +4211,14 @@ class Parser:
 
     def parse_stmt(self, out, indent, tail_returns):
         t = self.cur
+        if tail_returns and ((t.kind == "kw" and t.val in ("match", "if"))
+                             or (t.val == "{" and t.kind == "punc")
+                             or (t.val == "unsafe" and self.peek().val == "{")):
+            # A braced statement is the block's value only if it is the last
+            # thing in the block. Passing `tail_returns` into every one made
+            # a mid-body `match x { 1 => t += 1, .. }` or `if c { f() }`
+            # *return* from the function.
+            tail_returns = self._stmt_is_last()
 
         if t.val == "match" and t.kind == "kw":
             self.parse_match(out, indent, tail_returns)
@@ -2941,49 +4260,19 @@ class Parser:
                 code += " = " + init.code
             self.emit_pending(out, t.line, indent)
             out.line_at(t.line, code + ";", indent)
+            if init is not None and init.borrowed:
+                # `let a = v.get(0);` -- a copy of an element `v` still owns.
+                # It is a borrow: never dropped, never moved into an owner.
+                self.refcopies[-1][name] = True
+                return
             if moved is not None:
                 self.emit_move_zero(out, t.line, indent, moved[0], moved[1])
             self.live_register(name, ty)
             return
 
-        if t.val == "return" and t.kind == "kw":
-            if self.drop_owner is not None:
-                raise CrustError(
-                    "line %d: `return` inside `impl Drop for %s` would skip "
-                    "the field drops appended after the body, silently "
-                    "leaking them. Restructure with `if`/`else`."
-                    % (t.line, self.drop_owner))
-            self.next()
-            if self.accept(";"):
-                self.emit_pending(out, t.line, indent)
-                self.emit_drops(out, t.line, indent,
-                                self.live_frame_index(("func",)))
-                out.line_at(t.line, "return;", indent)
-                self.terminated = True
-                return
-            e = self.parse_expr_as(self.ret_type)
+        if t.val in ("return", "break", "continue") and t.kind == "kw":
+            self.parse_jump(out, indent, (";",))
             self.expect(";")
-            self.emit_pending(out, t.line, indent)
-            self._emit_return_value(out, t.line, indent, e)
-            self.terminated = True
-            return
-
-        if t.val == "break" and t.kind == "kw":
-            self.next()
-            self.expect(";")
-            self.emit_drops(out, t.line, indent,
-                            self.live_frame_index(("loop",)))
-            out.line_at(t.line, "break;", indent)
-            self.terminated = True
-            return
-
-        if t.val == "continue" and t.kind == "kw":
-            self.next()
-            self.expect(";")
-            self.emit_drops(out, t.line, indent,
-                            self.live_frame_index(("loop",)))
-            out.line_at(t.line, "continue;", indent)
-            self.terminated = True
             return
 
         if t.val == "if" and t.kind == "kw":
@@ -2993,47 +4282,14 @@ class Parser:
                 self.parse_if(out, indent, tail_returns)
             return
 
-        if t.val == "while" and t.kind == "kw":
-            if self.peek().val == "let":
-                self.parse_while_let(out, indent)
-                return
-            self.next()
-            cond = self.parse_cond()
-            self.emit_pending(out, t.line, indent)
-            out.line_at(t.line, "while (%s)" % cond.code, indent)
-            self.parse_block(out, indent, False, kind="loop")
+        if t.kind == "label":
+            label = self.next().val
+            self.expect(":")
+            self.parse_loop_stmt(out, indent, tail_returns, label)
             return
 
-        if t.val == "loop" and t.kind == "kw":
-            self.next()
-            out.line_at(t.line, "while (1)", indent)
-            self.parse_block(out, indent, False, kind="loop")
-            return
-
-        if t.val == "for" and t.kind == "kw":
-            self.next()
-            var = self.expect_ident()
-            self.expect("in")
-            lo = self.parse_cond()
-            if not self.at("..", "punc") and not self.at("..=", "punc"):
-                # `for x in xs` over a slice or an array, rather than a range.
-                self.parse_for_each(out, indent, t, var, lo)
-                return
-            if self.accept("..="):
-                cmp_op = "<="
-            else:
-                self.expect("..")
-                cmp_op = "<"
-            hi = self.parse_cond()
-            ity = wider(lo.type, hi.type)
-            cvar = _c_name(var)
-            out.line_at(t.line, "for (%s = %s; %s %s %s; %s++)"
-                        % (ity.decl(cvar), lo.code, cvar, cmp_op, hi.code,
-                           cvar), indent)
-            self.scope_push("block")
-            self.declare(var, ity)
-            self.parse_block(out, indent, False, kind="loop")
-            self.scope_pop()
+        if t.kind == "kw" and t.val in ("loop", "while", "for"):
+            self.parse_loop_stmt(out, indent, tail_returns, None)
             return
 
         if t.val == "{" and t.kind == "punc":
@@ -3051,7 +4307,7 @@ class Parser:
             return
 
         # expression statement, or a trailing expression
-        e = self.parse_expr_as(self.ret_type if tail_returns else None)
+        e = self.parse_expr_as(self.tail_expect() if tail_returns else None)
         if self.accept(";"):
             self.emit_pending(out, t.line, indent)
             out.line_at(t.line, e.code + ";", indent)
@@ -3060,14 +4316,309 @@ class Parser:
             raise CrustError("line %d: expected `;` after expression"
                              % self.cur.line)
         self.emit_pending(out, t.line, indent)
-        if tail_returns and not self.ret_type.is_void():
+        if tail_returns and self.tail_wants_value():
             # A tail expression *is* the return, so it terminates the block
             # exactly as `return e;` does -- without this the epilogue emits
-            # an unreachable second drop of everything it just freed.
-            self._emit_return_value(out, t.line, indent, e)
-            self.terminated = True
+            # an unreachable second drop of everything it just freed. (Inside
+            # a value `match` it is an assignment, and does not.)
+            if self.emit_tail(out, t.line, indent, e):
+                self.terminated = True
         else:
             out.line_at(t.line, e.code + ";", indent)
+
+    def loop_enter(self, label, value="", hint=None):
+        self.loop_labels.append(label or "")
+        self.loop_frames.append(-1)
+        self.loop_switch.append(self.switch_depth)
+        self.loop_values.append(value)
+        self.loop_hints.append(hint)
+        self.loop_brk.append("")
+        self.loop_cont.append("")
+
+    def loop_exit(self, out):
+        """Pop the innermost loop; place its break label if a goto used it."""
+        brk = self.loop_brk[-1]
+        for lst in (self.loop_labels, self.loop_frames, self.loop_switch,
+                    self.loop_values, self.loop_hints, self.loop_brk,
+                    self.loop_cont):
+            del lst[-1]
+        if brk:
+            out.write(" %s: ;" % brk)
+
+    def loop_target(self, label, kw):
+        """Index of the loop a `break`/`continue` refers to."""
+        if not self.loop_labels:
+            self.err("`%s` outside of a loop", kw)
+        if not label:
+            return len(self.loop_labels) - 1
+        for k in range(len(self.loop_labels) - 1, -1, -1):
+            if self.loop_labels[k] == label:
+                return k
+        self.err("no enclosing loop is labelled `'%s`", label)
+
+    def break_expect(self, k):
+        """The type a `break` value for loop `k` should have."""
+        tmp = self.loop_values[k]
+        if tmp and self.break_types.get(tmp):
+            return self.break_types[tmp][0]
+        return self.loop_hints[k]
+
+    def parse_loop_stmt(self, out, indent, tail_returns, label):
+        """`loop`, `while`, `while let` or `for`, optionally labelled."""
+        t = self.cur
+        if t.val == "loop" and tail_returns and self.tail_wants_value() \
+                and self._stmt_is_last():
+            # A `loop` ending a block is its value: `fn f() -> i32 { loop {
+            # .. break v; } }`.
+            e = self.parse_loop_expr(label)
+            self.emit_pending(out, t.line, indent)
+            if self.emit_tail(out, t.line, indent, e):
+                self.terminated = True
+            return
+        self.parse_loop(out, indent, label, "", None)
+
+    def parse_loop(self, out, indent, label, value, hint):
+        """Emit one loop; `value` names a `loop` expression's temporary."""
+        t = self.cur
+        if t.val == "loop" and t.kind == "kw":
+            self.next()
+            self.loop_enter(label, value, hint)
+            out.line_at(t.line, "while (1)", indent)
+            self.parse_block(out, indent, False, kind="loop")
+            self.loop_exit(out)
+            return
+        if t.val == "while" and t.kind == "kw":
+            if self.peek().val == "let":
+                self.parse_while_let(out, indent, label)
+                return
+            self.next()
+            cond = self.parse_cond()
+            self.loop_enter(label)
+            if self.pending:
+                # The condition hoisted work, which has to run before *every*
+                # test, not once above the loop -- emitted there, a `?` or a
+                # method on a temporary in the condition was evaluated a
+                # single time and the loop tested a stale value forever.
+                work = self.pending
+                self.pending = []
+                out.line_at(t.line, "for (;;) { %s if (!(%s)) break;"
+                            % (" ".join(work), cond.code), indent)
+                self.parse_block(out, indent, False, kind="loop")
+                out.write(" }")
+            else:
+                out.line_at(t.line, "while (%s)" % cond.code, indent)
+                self.parse_block(out, indent, False, kind="loop")
+            self.loop_exit(out)
+            return
+        if t.val == "for" and t.kind == "kw":
+            self.parse_for(out, indent, t, label)
+            return
+        self.err("a label must be followed by `loop`, `while` or `for`; "
+                 "labelled blocks are not supported")
+
+    def parse_loop_expr(self, label):
+        """A `loop` in value position: `break v` assigns its temporary.
+
+        Lowered like a value `match` (`value_of`): the loop is emitted as a
+        statement into its own buffer and hoisted into the enclosing
+        statement's pending list, with the statement's earlier work set
+        aside. A loop with no `break` value never produces one -- it is `!`
+        in Rust -- and is returned as a diverging expression.
+        """
+        line = self.cur.line
+        out = Out(line)
+        outer = self.pending
+        self.pending = []
+        tmp = self.new_temp()
+        self.break_types[tmp] = []
+        hint = self.target
+        self.expected.append(None)
+        try:
+            self.parse_loop(out, 0, label, tmp, hint)
+        finally:
+            self.expected.pop()
+            leftover = self.pending
+            self.pending = outer
+            self.pending.extend(leftover)
+        types = self.break_types[tmp]
+        del self.break_types[tmp]
+        text = " ".join(l.strip() for l in out.text().splitlines()
+                        if l.strip())
+        ty = _join_types(types)
+        if ty is None:
+            self.pending.append(text)
+            e = Expr("((void)0)", VOID)
+            e.never = True
+            return e
+        self.pending.append("%s;" % ty.decl(tmp))
+        self.pending.append(text)
+        return Expr(tmp, ty)
+
+    def _stmt_is_last(self):
+        """True if the braced statement at the cursor ends its block.
+
+        Scans to the `}` that closes the statement's last brace group --
+        following `else` chains -- and checks that the enclosing block's `}`
+        comes next.
+        """
+        toks, j, depth = self.toks, self.i, 0
+        while toks[j].kind != "eof":
+            tk = toks[j]
+            if tk.kind == "punc" and tk.val == "{":
+                depth += 1
+            elif tk.kind == "punc" and tk.val == "}":
+                depth -= 1
+                if depth == 0:
+                    nxt = toks[j + 1]
+                    if nxt.kind == "kw" and nxt.val == "else":
+                        j += 1
+                        continue
+                    k = j + 1
+                    while toks[k].kind == "punc" and toks[k].val == ";":
+                        k += 1
+                    return toks[k].kind == "punc" and toks[k].val == "}"
+            j += 1
+        return False
+
+    def parse_jump(self, out, indent, ends):
+        """Parse `return [e]` / `break` / `continue` up to one of `ends`.
+
+        The terminator is left for the caller: `;` for a statement, `,` or
+        the match's `}` for an arm.
+        """
+        t = self.next()
+        label = None
+        if t.val != "return" and self.cur.kind == "label":
+            label = self.next().val
+        value = None
+        if self.cur.val not in ends and self.cur.kind != "eof":
+            if t.val == "return":
+                value = self.parse_expr_as(self.ret_type)
+            elif t.val == "break":
+                k = self.loop_target(label, "break")
+                if not self.loop_values[k]:
+                    self.err("`break` with a value is only allowed in `loop`")
+                value = self.parse_expr_as(self.break_expect(k))
+            else:
+                self.err("`continue` takes no value")
+        self.emit_pending(out, t.line, indent)
+        self.emit_jump(out, t.line, indent, t.val, value, label)
+
+    def tail_expect(self):
+        """The type a tail expression should produce here."""
+        if self.tail_name is not None:
+            if self.tail_type is not None:
+                return self.tail_type
+            return self.tail_hint
+        return self.ret_type
+
+    def tail_wants_value(self):
+        """True if a tail expression here is a value rather than a statement."""
+        return self.tail_name is not None or not self.ret_type.is_void()
+
+    def emit_tail(self, out, line, indent, e):
+        """Deliver a tail expression; return True if it leaves the block.
+
+        In a function body it is the return value; inside a `match` being
+        lowered as a value it is assigned to that match's temporary, and
+        control carries on to the end of the match. A diverging expression
+        (`panic!`) is neither -- it is emitted as the statement it is.
+        """
+        if e.never:
+            out.line_at(line, e.code + ";", indent)
+            return True
+        if self.tail_name is not None:
+            if e.borrowed:
+                self.tail_borrowed = True
+            ty = e.type if e.type is not None else self.tail_hint
+            if ty is None or ty.is_void():
+                self.err("cannot infer the type of this value; annotate "
+                         "the target")
+            if self.tail_type is None:
+                self.tail_type = ty          # the later arms' target
+            self.tail_types.append(ty)
+            self.tail_last = e.code
+            out.line_at(line, "%s = %s;" % (self.tail_name, e.code), indent)
+            # `{ let v = ..; v }` moves `v` out: zero it so the block's own
+            # drop of `v` does not free what the value now owns.
+            moved = self.simple_owning_local(e)
+            if moved is not None:
+                self.emit_move_zero(out, line, indent, moved[0], moved[1])
+            return False
+        self._emit_return_value(out, line, indent, e)
+        return True
+
+    def emit_jump(self, out, line, indent, kw, value, label=None):
+        """Emit `return [value]`, `break` or `continue`, dropping as it goes.
+
+        Shared by the statement forms and by a match arm written as
+        `None => return 0,` or `_ => continue,`, which is an expression in
+        Rust and needs the same drops a statement would.
+        """
+        if kw == "return":
+            if self.drop_owner is not None:
+                self.err("`return` inside `impl Drop for %s` would skip the "
+                         "field drops appended after the body, silently "
+                         "leaking them. Restructure with `if`/`else`.",
+                         self.drop_owner)
+            if value is None:
+                self.emit_drops(out, line, indent,
+                                self.live_frame_index(("func",)))
+                out.line_at(line, "return;", indent)
+            else:
+                self._emit_return_value(out, line, indent, value)
+        else:
+            self._emit_loop_jump(out, line, indent, kw, value, label)
+        self.terminated = True
+
+    def _emit_loop_jump(self, out, line, indent, kw, value, label):
+        """`break [value]` / `continue`, to the innermost or a labelled loop."""
+        k = self.loop_target(label, kw)
+        if value is not None:
+            tmp = self.loop_values[k]
+            if value.never:
+                out.line_at(line, value.code + ";", indent)
+            else:
+                ty = value.type if value.type is not None \
+                    else self.loop_hints[k]
+                if ty is None or ty.is_void():
+                    self.err("cannot infer the type of this `break` value; "
+                             "annotate the target")
+                self.break_types[tmp].append(ty)
+                out.line_at(line, "%s = %s;" % (tmp, value.code), indent)
+                moved = self.simple_owning_local(value)
+                if moved is not None:
+                    # `break w` moves `w` out of the body, whose drop of it
+                    # must then be a no-op.
+                    self.unit.needs.add("memset")
+                    csrc = _c_name(moved[0])
+                    out.line_at(line, "memset(&%s, 0, sizeof(%s));"
+                                % (csrc, csrc), indent)
+        self.emit_drops(out, line, indent, self.loop_frames[k])
+        innermost = k == len(self.loop_labels) - 1
+        if kw == "break":
+            # C's `break` also means "leave the switch", and a constant-arm
+            # `match` is a switch: a Rust `break` in one used to exit only
+            # the match, and the loop kept going.
+            direct = innermost and self.switch_depth == self.loop_switch[k]
+        else:
+            direct = innermost       # C's `continue` ignores a switch
+        if direct:
+            out.line_at(line, kw + ";", indent)
+            return
+        if kw == "break":
+            if not self.loop_brk[k]:
+                self.loop_brk[k] = "_crust_brk%d" % self._next_n()
+            target = self.loop_brk[k]
+        else:
+            if not self.loop_cont[k]:
+                self.loop_cont[k] = "_crust_cont%d" % self._next_n()
+            target = self.loop_cont[k]
+        out.line_at(line, "goto %s;" % target, indent)
+
+    def _next_n(self):
+        self.tmp_n += 1
+        return self.tmp_n
 
     def _live_pending(self, upto, skip=None):
         """True if any owning local would be dropped from `upto` upward.
@@ -3086,6 +4637,7 @@ class Parser:
 
     def _emit_return_value(self, out, line, indent, e):
         """Drop live locals, then `return` -- spilling when Drop must run first."""
+        self.reject_borrow(e, self.ret_type, "returning it")
         fidx = self.live_frame_index(("func",))
         # Returning a bare owning local moves it out, so it is not freed on
         # *this* path. Passed as `skip` rather than unregistered: the move
@@ -3140,87 +4692,945 @@ class Parser:
             parts.append("%s = %s._%d;" % (ety.decl(_c_name(nm)), tmp, i))
         out.line_at(t.line, " ".join(parts), indent)
 
-    def parse_for_each(self, out, indent, t, var, subject):
-        """Lower `for x in xs { .. }` over a slice or an array.
+    def _parse_for_pattern(self):
+        """`x`, `mut x`, `&x`, `_` or `(a, b)`; returns (kind, [(name, &)])."""
+        if self.accept("("):
+            names = []
+            while not self.at(")", "punc"):
+                by_ref = self.accept("&") is not None
+                self.accept("mut")
+                names.append((self.expect_ident(), by_ref))
+                if not self.accept(","):
+                    break
+            self.expect(")")
+            return "tuple", names
+        by_ref = self.accept("&") is not None
+        self.accept("mut")
+        return "one", [(self.expect_ident(), by_ref)]
 
-        Rust's `for` drives an iterator; Crust has none, so the loop is
-        lowered to the index loop the user would otherwise have written by
-        hand -- `for i in 0..xs.len()` plus `let x = xs[i]`. The subject is
-        held in a temporary so it is evaluated exactly once even when it is a
-        call, and the whole thing is wrapped in a block to scope both the
-        temporary and the induction variable.
+    def _for_subject_tokens(self):
+        """The tokens between `in` and the loop body's `{`."""
+        start, depth = self.i, 0
+        while True:
+            tk = self.cur
+            if tk.kind == "eof":
+                self.err("expected the body of this `for` loop")
+            if tk.kind == "punc" and tk.val in ("(", "["):
+                depth += 1
+            elif tk.kind == "punc" and tk.val in (")", "]"):
+                depth -= 1
+            elif tk.kind == "punc" and tk.val == "{":
+                if depth == 0:
+                    break
+                depth += 1
+            elif tk.kind == "punc" and tk.val == "}":
+                depth -= 1
+            self.next()
+        return self.toks[start:self.i]
 
-        The binding is a *copy* of the element, matching
-        `for x in xs.iter().copied()` rather than Rust's reference binding.
-        Crust has no borrow checker to make the difference observable, and a
-        copy is what the C the user is mixing with would do.
-        """
-        ty = subject.type
-        if ty is None:
-            self.err("cannot infer the type of the iterated expression; "
-                     "annotate it")
-        if ty.ptr and self.unit.instances.get(ty.base, (None,))[0] == "PyList":
-            pass                       # handled below, unlike other pointers
-
-        idx = self.new_index()
-        if ty.base in self.unit.slices:
-            elem = self.unit.slices[ty.base]
-            tmp = self.new_temp()
-            out.line_at(t.line, "{ %s = %s;" % (ty.decl(tmp), subject.code),
+    def _emit_range_for(self, out, indent, t, var, lo, hi, cmp_op, label):
+        """`for i in lo..hi` as a direct C `for`."""
+        ity = wider(lo.type, hi.type)
+        cvar = _c_name(var)
+        self.emit_pending(out, t.line, indent)
+        # Rust evaluates a range once, before the first iteration. C's
+        # `for` re-tests its condition every time, so `for i in 0..v.len()`
+        # with a `push` in the body never ended, and a call in the bound
+        # ran once per iteration. Anything but a literal or a constant is
+        # held in a temporary, in a block that scopes it.
+        end = hi.code.strip()
+        spilled = not (_is_simple_literal(end) or end in self.unit.consts)
+        if spilled:
+            end = self.new_temp()
+            out.line_at(t.line, "{ %s = %s;" % (ity.decl(end), hi.code),
                         indent)
-            base, count = tmp + ".ptr", tmp + ".len"
-        elif ty.array:
-            elem = RustCType(ty.base, ty.ptr, ty.array[1:] or None)
-            if elem.array:
-                self.err("iterating a multi-dimensional array is not "
-                         "supported; index the outer dimension")
-            out.line_at(t.line, "{", indent)
-            base, count = subject.code, ty.array[0]
-        elif self.unit.instances.get(ty.base, (None,))[0] == "PyList":
-            # The list an included rpython module built. It carries its own
-            # length, so it can be walked exactly like a slice -- which is how
-            # Crust gets iteration over a built-up collection without owning
-            # an iterator protocol. A pointer to one is accepted too, since
-            # that is how py2c hands it back.
-            elem = self.unit.instances[ty.base][1][0]
-            tmp = self.new_temp()
-            arrow = "->" if ty.ptr else "."
-            out.line_at(t.line, "{ %s = %s;" % (ty.decl(tmp), subject.code),
-                        indent)
-            base = "%s%sdata" % (tmp, arrow)
-            count = "%s%slen" % (tmp, arrow)
-        elif ty.ptr:
-            self.err("cannot iterate a raw pointer, as its length is not "
-                     "known; slice it first (`&p[0..n]`) or use a range")
-        else:
-            self.err("`%s` cannot be iterated", ty.decl())
-
-        out.write(" for (unsigned long %s = 0; %s < %s; %s++)"
-                  % (idx, idx, count, idx))
+        out.line_at(t.line, "for (%s = %s; %s %s %s; %s++)"
+                    % (ity.decl(cvar), lo.code, cvar, cmp_op, end, cvar),
+                    indent)
         self.scope_push("block")
-        self.declare(var, elem)
-        self.emit_bound_block(out, indent, "%s = %s[%s];"
-                              % (elem.decl(_c_name(var)), base, idx),
-                              kind="loop")
+        self.declare(var, ity)
+        self.loop_enter(label)
+        self.parse_block(out, indent, False, kind="loop")
+        self.scope_pop()
+        if spilled:
+            out.write(" }")
+        self.loop_exit(out)
+
+    # -- iterators ----------------------------------------------------------
+    #
+    # An iterator chain is not lowered as it is parsed. `v.iter()` produces an
+    # *iterator value* -- an `Expr` carrying an `IterChain`: the source and
+    # the adaptors applied so far -- and each adaptor method appends to it. A
+    # consumer (`sum`, `count`, `collect`, ..) or a `for` loop then lowers the
+    # whole chain at once into one counted loop, hoisted before the
+    # statement. There are no iterator objects and no calls: the adaptors
+    # become arithmetic and statements inside that loop.
+    #
+    # Two phases. Adaptors applied to the source itself -- `rev`, `skip`,
+    # `take`, `step_by`, `zip`, and the binding modes -- are arithmetic on
+    # positions (start, count, stride), so any combination is exact and
+    # free. Per-element stages -- `map`, `filter`, `filter_map`, `enumerate`,
+    # `take_while`, `skip_while`, `inspect`, and `skip`/`take`/`step_by` once
+    # a stage has run -- become statements in the loop body, each in its own
+    # C block so the names its closure binds cannot collide with another's.
+
+    def iter_value(self, ch):
+        e = Expr("", None)
+        e.iter = ch
+        return e
+
+    def iterable(self, ty, name):
+        """True if a value of type `ty` can start an iterator via `.name()`."""
+        if ty is None:
+            return False
+        if name in _STR_SOURCES:
+            return (ty.ptr == 1 and ty.base == "const char") or \
+                (ty.base == "String" and ty.ptr <= 1)
+        if ty.base in self.unit.slices and not ty.ptr and not ty.array:
+            return True
+        if ty.array and not ty.ptr:
+            return True
+        inst = self.unit.instances.get(ty.base, (None, None))
+        return inst[0] in ("Vec", "PyList") and ty.ptr <= 1
+
+    def chain_from_tokens(self, core, rng, ops):
+        """An `IterChain` for a `for` subject or a `zip` argument."""
+        ch = IterChain()
+        ch.ops = ops
+        if rng is not None:
+            lo_t, hi_t, inclusive = rng
+            ch.kind = "range"
+            ch.lo = self.sub_expr(lo_t)
+            ch.hi = self.sub_expr(hi_t) if hi_t is not None else None
+            ch.inclusive = inclusive
+            return ch
+        ref = ""
+        body = core
+        if body and body[0].kind == "punc" and body[0].val == "&":
+            ref = "shared"
+            body = body[1:]
+            if body and body[0].val == "mut":
+                ref = "mut"
+                body = body[1:]
+        if not body:
+            self.err("expected something to iterate over")
+        ch.kind = "expr"
+        ch.subj = self.sub_expr(body)
+        ch.ref = ref
+        return ch
+
+    def _iter_hold(self, e, held):
+        """Evaluate a non-place source once into a temporary.
+
+        An owning temporary (a `Vec` a call returned) is recorded in `held`,
+        so whoever emits the loop can free it afterwards.
+        """
+        tmp = self.new_temp()
+        self.pending.append("%s = %s;" % (e.type.decl(tmp), e.code))
+        if self.owning_free(e.type) is not None:
+            held.append((tmp, e.type))
+        return tmp
+
+    def _iter_fixed(self, e, ty):
+        """A range bound evaluated once, as C code."""
+        code = e.code.strip()
+        if _is_simple_literal(code) or code in self.unit.consts:
+            return code
+        tmp = self.new_temp()
+        self.pending.append("%s = %s;" % (ty.decl(tmp), e.code))
+        return tmp
+
+    def _iter_setup(self, ch, source_ops, held):
+        """The source phase: (count, F, D, sources, consumed).
+
+        The loop visits `count` positions; position `j` of source `s` is
+        `s.f + (F + j*D) * s.d` (see `_Source`).
+        """
+        mode = "copy"
+        consumed = False
+        moved = None
+        if ch.kind == "range":
+            if ch.hi is None:
+                self.err("an open range `a..` never ends; give it an end")
+            elem = wider(ch.lo.type, ch.hi.type)
+            lo_code = self._iter_fixed(ch.lo, elem)
+            hi_code = self._iter_fixed(ch.hi, elem)
+            if ch.inclusive:
+                count = "((%s) >= (%s) ? (unsigned long)((%s) - (%s)) + 1 : 0)"
+            else:
+                count = "((%s) > (%s) ? (unsigned long)((%s) - (%s)) : 0)"
+            count = count % (hi_code, lo_code, hi_code, lo_code)
+            kind, base = "range", lo_code
+        else:
+            subj, ref = ch.subj, ch.ref
+            ty = subj.type
+            if ty is None:
+                self.err("cannot infer the type of the iterated expression; "
+                         "annotate it")
+            code = subj.code.strip()
+            place = _is_place(code)
+            inst = self.unit.instances.get(ty.base, (None, None))
+            kind = "coll"
+            if source_ops and source_ops[0][0] in _STR_SOURCES:
+                base, count = self._str_bytes(subj, held,
+                                              source_ops[0][0])
+                elem = RustCType("unsigned char")
+            elif ty.base in self.unit.slices and not ty.ptr and not ty.array:
+                src = code if place else self._iter_hold(subj, held)
+                base, count = src + ".ptr", src + ".len"
+                elem = self.unit.slices[ty.base]
+                mode = "ptr" if ref == "mut" else "refcopy"
+            elif ty.array and not ty.ptr:
+                elem = RustCType(ty.base, ty.ptr, ty.array[1:] or None)
+                if elem.array:
+                    self.err("iterating a multi-dimensional array is not "
+                             "supported; index the outer dimension")
+                base, count = code, ty.array[0]
+                if ref == "mut":
+                    mode = "ptr"
+                elif ref:
+                    mode = "refcopy"
+            elif inst[0] in ("Vec", "PyList") and ty.ptr <= 1:
+                elem = inst[1][0]
+                src = code if place else self._iter_hold(subj, held)
+                arrow = "->" if ty.ptr else "."
+                if ty.ptr:
+                    mode = "refcopy"
+                elif ref:
+                    mode = "ptr" if ref == "mut" else "refcopy"
+                else:
+                    consumed = inst[0] == "Vec"
+                    if consumed:
+                        moved = self.simple_owning_local(subj)
+                field = "data" if inst[0] == "PyList" else "ptr"
+                base = "%s%s%s" % (src, arrow, field)
+                count = "%s%slen" % (src, arrow)
+                if inst[0] == "PyList":
+                    mode, consumed = "copy", False
+            elif ty.ptr:
+                self.err("cannot iterate a raw pointer, as its length is not "
+                         "known; slice it first (`&p[0..n]`) or use a range")
+            else:
+                self.err("`%s` cannot be iterated", ty.decl())
+
+        for name, args in source_ops:
+            if name not in ("rev", "skip", "take", "step_by", "zip",
+                            "chain") and args:
+                self.err("`%s` takes no arguments", name)
+            if name == "iter":
+                consumed = False
+                if kind != "range" and mode == "copy":
+                    mode = "refcopy"
+            elif name == "iter_mut":
+                if kind == "range":
+                    self.err("a range has no `iter_mut`")
+                consumed = False
+                mode = "ptr"
+            elif name in ("copied", "cloned"):
+                mode = "copy"
+            elif name in _STR_SOURCES and source_ops[0][0] != name:
+                self.err("`%s()` must come first, directly on a string",
+                         name)
+        if consumed and moved is not None:
+            # `for x in v` / `v.into_iter()` consumes `v`: its buffer is still
+            # freed at scope exit, but it is not valid to use.
+            self.mark_moved(moved[0], self.toks[max(self.i - 1, 0)].line)
+
+        C, F, D = count, "0", "1"
+        srcs = [_Source(kind, base, elem, mode, "0", "1")]
+        for name, args in source_ops:
+            if name in ("rev", "skip", "take", "step_by"):
+                if F == "0" and D == "1" and not _is_identifier(C):
+                    c = self.new_temp()
+                    self.pending.append("unsigned long %s = %s;" % (c, C))
+                    C = c
+                if F == "0" and D == "1":
+                    f, d = self.new_temp(), self.new_temp()
+                    self.pending.append("long %s = 0; long %s = 1;" % (f, d))
+                    F, D = f, d
+                if name == "rev":
+                    self.pending.append("if (%s) %s += (long)(%s - 1) * %s; "
+                                        "%s = -%s;" % (C, F, C, D, D, D))
+                    continue
+                if not args:
+                    self.err("`%s` needs an argument", name)
+                a = self.sub_expr(args)
+                n = self.new_temp()
+                self.pending.append("unsigned long %s = (unsigned long)(%s);"
+                                    % (n, a.code))
+                if name == "skip":
+                    self.pending.append(
+                        "if (%s > %s) %s = %s; %s += (long)%s * %s; %s -= %s;"
+                        % (n, C, n, C, F, n, D, C, n))
+                elif name == "take":
+                    self.pending.append("if (%s < %s) %s = %s;"
+                                        % (n, C, C, n))
+                else:
+                    # Rust panics on a zero step rather than looping forever.
+                    self.unit.needs.add("abort")
+                    self.pending.append(
+                        "if (%s == 0) abort(); %s = (%s + %s - 1) / %s; "
+                        "%s *= (long)%s;" % (n, C, C, n, n, D, n))
+            elif name == "chain":
+                sub = self._zip_chain(args, "chain")
+                c2, f2, d2, srcs2, _c = self._iter_setup(sub, sub.ops, held)
+                if len(srcs) > 1 or len(srcs2) > 1:
+                    self.err("`chain` with a `zip` on either side is not "
+                             "supported")
+                a, b = srcs[0], srcs2[0]
+                # "copy" and "refcopy" differ only in whether `*x` is
+                # accepted; a pointer on one side and a value on the other
+                # is the real mismatch.
+                if a.elem.decl() != b.elem.decl() or \
+                        (a.mode == "ptr") != (b.mode == "ptr"):
+                    self.err("`chain` needs both sides to yield the same "
+                             "type, `%s` and `%s`", a.elem.decl(),
+                             b.elem.decl())
+                split = self.new_temp()
+                total = self.new_temp()
+                self.pending.append("unsigned long %s = %s; unsigned long %s "
+                                    "= %s + (%s);" % (split, C, total, split,
+                                                      c2))
+                joined = _Source("chain", None, a.elem, a.mode, "0", "1")
+                joined.left = self._rebase(a, F, D)
+                joined.right = self._rebase(b, f2, d2)
+                joined.split = split
+                srcs = [joined]
+                C, F, D = total, "0", "1"
+            elif name == "zip":
+                if len(srcs) > 1:
+                    self.err("`zip` of a `zip` is not supported")
+                sub = self._zip_chain(args)
+                c2, f2, d2, srcs2, _c = self._iter_setup(sub, sub.ops, held)
+                # Re-express every source over a fresh shared progression, so
+                # later `rev`/`skip`/.. move them together.
+                srcs = [self._rebase(s, F, D) for s in srcs] + \
+                    [self._rebase(s, f2, d2) for s in srcs2]
+                c = self.new_temp()
+                self.pending.append("unsigned long %s = (%s) < (%s) ? (%s) : "
+                                    "(%s);" % (c, C, c2, C, c2))
+                C, F, D = c, "0", "1"
+        return C, F, D, srcs, consumed
+
+    def _zip_chain(self, args, what="zip"):
+        """The chain a `zip`/`chain` argument denotes: `b.iter()`, `&b`, .."""
+        if not args:
+            self.err("`%s` needs an argument", what)
+        core, ops = _peel_adaptors(args)
+        for name, _a in ops:
+            if name not in _SOURCE_OPS or name in ("zip", "chars",
+                                                   "char_indices"):
+                self.err("`%s`'s argument may only use `iter`, `rev`, "
+                         "`skip`, `take`, `step_by` and `chain`, not `%s`",
+                         what, name)
+        return self.chain_from_tokens(core, _split_range(core), ops)
+
+    def _rebase(self, s, F, D):
+        """Source `s` re-expressed so that its position `k` is `f + k*d`."""
+        if F == "0" and D == "1":
+            return s
+        f, d = self.new_temp(), self.new_temp()
+        self.pending.append("long %s = (%s) + (%s) * (%s); long %s = (%s) * "
+                            "(%s);" % (f, s.f, F, s.d, d, D, s.d))
+        out = _Source(s.kind, s.base, s.elem, s.mode, f, d)
+        out.left, out.right, out.split = s.left, s.right, s.split
+        return out
+
+    def _src_item(self, s, pos):
+        kind, base, elem, mode = s.kind, s.base, s.elem, s.mode
+        if not (s.f == "0" and s.d == "1"):
+            pos = "(%s + (long)(%s) * %s)" % (s.f, pos, s.d)
+        if kind == "chain":
+            li = self._src_item(s.left, pos)
+            ri = self._src_item(s.right, "((long)(%s) - (long)%s)"
+                                % (pos, s.split))
+            return _Item("((unsigned long)(%s) < %s ? %s : %s)"
+                         % (pos, s.split, li.code, ri.code), li.ty,
+                         li.rc or ri.rc, None)
+        if kind == "range":
+            return _Item("(%s)((long)(%s) + (long)(%s))"
+                         % (elem.decl(), base, pos), elem, False, None)
+        if mode == "ptr":
+            return _Item("&%s[%s]" % (base, pos),
+                         RustCType(elem.base, elem.ptr + 1, elem.array),
+                         False, None)
+        return _Item("%s[%s]" % (base, pos), elem, mode == "refcopy", None)
+
+    def _pair(self, items):
+        """An item made of several parts (`zip`, `enumerate`)."""
+        tty = self.unit.tuple_type([it.ty for it in items])
+        code = "(%s){%s}" % (tty.base, ", ".join(
+            "._%d = %s" % (k, it.code) for k, it in enumerate(items)))
+        return _Item(code, tty, False, items)
+
+    def _materialize(self, item, body):
+        """Bind an item's value to fresh C variables, once per element."""
+        if item.parts is not None:
+            return self._pair([self._materialize(p, body)
+                               for p in item.parts])
+        v = self.new_temp()
+        body.append("%s = %s;" % (item.ty.decl(v), item.code))
+        return _Item(v, item.ty, item.rc, None)
+
+    def _iter_apply(self, toks, items, want=None):
+        """Apply a closure to iterator items: [(item, by_ref)]; (e, work)."""
+        args, parts = [], []
+        for item, by_ref in items:
+            mode = "refcopy" if (item.rc or by_ref) else "val"
+            args.append((item.code, item.ty, mode))
+            if item.parts is None:
+                parts.append(None)
+            else:
+                parts.append([(p.code, p.ty, p.rc or by_ref)
+                              for p in item.parts])
+        mark = len(self.pending)
+        e = self.apply_fn(toks, args, want, parts)
+        return e, self.take_pending(mark)
+
+    def iter_plan(self, ch):
+        """Lower a chain to (count, j, top, body, closers, item, held, owns).
+
+        The source phase's statements go to the pending list. `top` runs
+        first in each pass (a `take` limit, checked before any upstream stage
+        does work for an element it will not use -- as Rust's `Take` does);
+        `body` holds the stages, opening `closers` C blocks; `item` is what
+        the chain yields. `owns` is True when the chain consumes an owning
+        source with no stage in between, so each element is the loop's to
+        drop.
+        """
+        ops = ch.ops
+        k = 0
+        while k < len(ops) and ops[k][0] in _SOURCE_OPS:
+            k += 1
+        source_ops, stage_ops = ops[:k], ops[k:]
+        held = []
+        top, body, closers = [], [], 0
+        if source_ops and source_ops[0][0] in ("chars", "char_indices"):
+            head, item, stage_ops = self._decode_source(ch, source_ops,
+                                                        stage_ops, held, body)
+            consumed = False
+        else:
+            C, F, D, srcs, consumed = self._iter_setup(ch, source_ops, held)
+            j = self.new_index()
+            head = "for (unsigned long %s = 0; %s < %s; %s++)" % (j, j, C, j)
+            P = j
+            if not (F == "0" and D == "1"):
+                P = "(%s + (long)%s * %s)" % (F, j, D)
+            items = [self._src_item(s, P) for s in srcs]
+            item = items[0] if len(items) == 1 else self._pair(items)
+        cloning = False
+        for name, _a in source_ops:
+            if name in ("copied", "cloned"):
+                cloning = True
+        if cloning and item.parts is None:
+            item = self._clone_item(item, source_ops)
+        owned = (consumed or cloning) and item.parts is None \
+            and self.owning_free(item.ty) is not None
+        if consumed and owned:
+            # Each element is moved out of the container as it is visited:
+            # zero its slot, so the container's own free -- which now drops
+            # what it holds -- finds nothing there. An early `break` leaves
+            # the rest in place, and they are dropped with the container.
+            slot = item.code
+            item = self._materialize(item, body)
+            self.unit.needs.add("memset")
+            body.append("memset(&%s, 0, sizeof(%s));" % (slot, slot))
+        if stage_ops:
+            item = self._materialize(item, body)
+        for name, args in stage_ops:
+            if name in _SOURCE_ONLY:
+                self.err("`%s` must come before `map`, `filter` and the "
+                         "other per-element adaptors", name)
+            if name in ("map", "filter_map"):
+                e, w = self._iter_apply(args, [(item, False)])
+                if e.type is None or e.type.is_void():
+                    self.err("cannot infer what this `%s` produces", name)
+                v = self.new_temp()
+                if name == "map":
+                    body.append("{ %s %s = %s;" % (" ".join(w),
+                                                   e.type.decl(v), e.code))
+                    item = _Item(v, e.type, False, None)
+                else:
+                    if e.type.ptr or e.type.base not in self.unit.options:
+                        self.err("the closure passed to `filter_map` must "
+                                 "return an `Option`")
+                    inner = self.unit.options[e.type.base]
+                    o = self.new_temp()
+                    body.append("{ %s %s = %s; if (!%s.some) continue; "
+                                "%s = %s.value;"
+                                % (" ".join(w), e.type.decl(o), e.code, o,
+                                   inner.decl(v), o))
+                    item = _Item(v, inner, False, None)
+                closers += 1
+            elif name in ("filter", "take_while", "inspect"):
+                e, w = self._iter_apply(args, [(item, True)])
+                if name == "filter":
+                    body.append("{ %s if (!(%s)) continue;"
+                                % (" ".join(w), e.code))
+                elif name == "take_while":
+                    body.append("{ %s if (!(%s)) break;"
+                                % (" ".join(w), e.code))
+                else:
+                    body.append("{ %s %s;" % (" ".join(w), e.code))
+                closers += 1
+            elif name == "skip_while":
+                done = self.new_temp()
+                self.pending.append("_Bool %s = 0;" % done)
+                e, w = self._iter_apply(args, [(item, True)])
+                body.append("if (!%s) { %s if (%s) continue; %s = 1; }"
+                            % (done, " ".join(w), e.code, done))
+            elif name == "enumerate":
+                if args:
+                    self.err("`enumerate` takes no arguments")
+                cnt, iv = self.new_temp(), self.new_temp()
+                self.pending.append("unsigned long %s = 0;" % cnt)
+                body.append("unsigned long %s = %s++;" % (iv, cnt))
+                item = self._pair([_Item(iv, RustCType("unsigned long"),
+                                         False, None), item])
+            elif name in ("copied", "cloned"):
+                if item.parts is None and item.ty.ptr:
+                    item = _Item("(*%s)" % item.code,
+                                 RustCType(item.ty.base, item.ty.ptr - 1,
+                                           item.ty.array), False, None)
+                elif item.parts is None:
+                    item = self._clone_item(item, [(name, [])])
+                else:
+                    item = _Item(item.code, item.ty, False, item.parts)
+            elif name in ("skip", "take", "step_by"):
+                if not args:
+                    self.err("`%s` needs an argument", name)
+                a = self.sub_expr(args)
+                n, c = self.new_temp(), self.new_temp()
+                self.pending.append("unsigned long %s = (unsigned long)(%s); "
+                                    "unsigned long %s = 0;" % (n, a.code, c))
+                if name == "skip":
+                    body.append("if (%s < %s) { %s++; continue; }"
+                                % (c, n, c))
+                elif name == "take":
+                    top.append("if (%s >= %s) break;" % (c, n))
+                    body.append("%s++;" % c)
+                else:
+                    self.unit.needs.add("abort")
+                    self.pending.append("if (%s == 0) abort();" % n)
+                    body.append("if (%s++ %% %s != 0) continue;" % (c, n))
+            else:
+                self.err("`.%s()` is not supported on an iterator", name)
+        owns = owned and not stage_ops
+        return head, top, body, closers, item, held, owns
+
+    def _str_bytes(self, subj, held, what):
+        """(byte pointer, byte count) of a `&str` or `String` subject."""
+        ty = subj.type
+        code = subj.code.strip()
+        if ty.ptr == 1 and ty.base == "const char":
+            src = code if _is_place(code) else self._iter_hold(subj, held)
+            n = self.new_temp()
+            self.unit.needs.add("strlen")
+            self.pending.append("unsigned long %s = strlen(%s);" % (n, src))
+            return "((const unsigned char *)%s)" % src, n
+        if ty.base == "String" and ty.ptr <= 1:
+            src = code if _is_place(code) else self._iter_hold(subj, held)
+            arrow = "->" if ty.ptr else "."
+            return ("((const unsigned char *)%s%sbuf)" % (src, arrow),
+                    "(unsigned long)%s%slen" % (src, arrow))
+        self.err("`%s()` needs a `&str` or a `String`", what)
+
+    def _decode_source(self, ch, source_ops, stage_ops, held, body):
+        """A `chars()`/`char_indices()` source: (loop head, item, stages).
+
+        A character's position depends on the width of every one before it,
+        so this cannot be position arithmetic. The loop walks byte offsets
+        and decodes one code point per pass -- forwards, or backwards over
+        continuation bytes after `.rev()`. `skip`/`take`/`step_by` become
+        per-element counters, which is exact here too.
+        """
+        what = source_ops[0][0]
+        if ch.kind != "expr":
+            self.err("`%s()` needs a string", what)
+        p, n = self._str_bytes(ch.subj, held, what)
+        rev = False
+        moved = []
+        for name, args in source_ops[1:]:
+            if name == "rev" and not moved and not rev:
+                rev = True
+            elif name in ("skip", "take", "step_by"):
+                moved.append((name, args))
+            elif name in ("copied", "cloned", "iter"):
+                continue
+            else:
+                self.err("`%s` after `%s()` is not supported; `rev` must come "
+                         "directly after it", name, what)
+        self.unit.needs.add("utf8")
+        b, w, c, at = (self.new_temp(), self.new_temp(), self.new_temp(),
+                       self.new_temp())
+        if rev:
+            head = "for (unsigned long %s = %s; %s > 0; )" % (b, n, b)
+            body.append("%s--; while (%s > 0 && (%s[%s] & 0xC0) == 0x80) %s--;"
+                        % (b, b, p, b, b))
+            body.append("unsigned long %s; crust_char %s = crust_utf8_decode("
+                        "%s + %s, &%s); unsigned long %s = %s;"
+                        % (w, c, p, b, w, at, b))
+        else:
+            head = "for (unsigned long %s = 0; %s < %s; )" % (b, b, n)
+            body.append("unsigned long %s; crust_char %s = crust_utf8_decode("
+                        "%s + %s, &%s); unsigned long %s = %s; %s += %s;"
+                        % (w, c, p, b, w, at, b, b, w))
+        item = _Item(c, RustCType("crust_char"), False, None)
+        if what == "char_indices":
+            item = self._pair([_Item(at, RustCType("unsigned long"), False,
+                                     None), item])
+        return head, item, moved + stage_ops
+
+    def _clone_item(self, item, ops):
+        """`copied`/`cloned` over an item: a deep copy if it owns something.
+
+        A bitwise copy of an owning element is a second owner of its buffer.
+        `cloned` calls the element's own `clone`; `copied` is refused, since
+        in Rust an owning type is never `Copy`.
+        """
+        if self.owning_free(item.ty) is None:
+            return _Item(item.code, item.ty, False, None)
+        for name, _a in ops:
+            if name == "copied":
+                self.err("`copied` needs a `Copy` element, and `%s` owns "
+                         "something; use `cloned`", item.ty.decl())
+        info = self.unit.methods.get((item.ty.base, "clone"))
+        if info is None:
+            self.err("`cloned` needs `%s` to have a `clone` method",
+                     item.ty.decl())
+        return _Item("%s(&%s)" % (info.mangled, _addressable(item.code)),
+                     item.ty, False, None)
+
+    def _free_held(self, held):
+        """The statements that free a plan's owning temporaries."""
+        out = []
+        for tmp, ty in held:
+            info = self.unit.methods.get((ty.base, self.owning_free(ty)))
+            if info is not None:
+                out.append("%s(&%s);" % (info.mangled, tmp))
+        return out
+
+    def iter_method(self, recv, name):
+        """A method called on an iterator value; the cursor is past `(`."""
+        ch = recv.iter
+        targs = self.method_targs
+        self.method_targs = None
+        args = self.raw_call_args()
+        if name in _SOURCE_OPS or name in _STAGE_OPS:
+            # An adaptor takes at most one argument; it is kept as one token
+            # run, the same shape a `for` subject's peeled adaptors have.
+            if len(args) > 1:
+                self.err("`%s` takes at most one argument", name)
+            nxt = IterChain()
+            nxt.kind, nxt.lo, nxt.hi = ch.kind, ch.lo, ch.hi
+            nxt.inclusive, nxt.subj, nxt.ref = ch.inclusive, ch.subj, ch.ref
+            nxt.ops = ch.ops + [(name, args[0] if args else [])]
+            return self.iter_value(nxt)
+        if name == "contains" and ch.kind == "range" and not ch.ops:
+            self._arity(name, args, 1)
+            x = self.sub_expr(args[0])
+            code, xty = x.code, x.type
+            if xty is not None and xty.ptr:
+                code = "(*%s)" % code
+                xty = RustCType(xty.base, xty.ptr - 1, xty.array)
+            v = self.once(Expr(code, xty))
+            hi = "<=" if ch.inclusive else "<"
+            cond = "(%s >= %s" % (v, ch.lo.code)
+            if ch.hi is not None:
+                cond += " && %s %s %s" % (v, hi, ch.hi.code)
+            return Expr(cond + ")", RustCType("_Bool"))
+        if name in _CONSUMERS:
+            return self.iter_consume(ch, name, args, targs)
+        self.err("`.%s()` is not supported on an iterator; Crust lowers "
+                 "`map`, `filter`, `filter_map`, `enumerate`, `zip`, "
+                 "`rev`, `skip`, `take`, `step_by`, `take_while`, "
+                 "`skip_while`, `inspect`, `copied`, and the consumers %s",
+                 name, ", ".join("`%s`" % c for c in sorted(_CONSUMERS)))
+
+    def _collects_string(self, targs):
+        """True if a `collect` here is asked for a `String`."""
+        for cand in [self.target] + (targs or []):
+            if cand is not None and not cand.ptr and cand.base == "String":
+                return True
+        return False
+
+    def iter_consume(self, ch, name, args, targs):
+        """Lower a chain ending in consumer `name` to one hoisted loop."""
+        head, top, body, closers, item, held, _owns = self.iter_plan(ch)
+        v, vty = item.code, item.ty
+        R = self.new_temp()
+        step = []
+        BOOL = RustCType("_Bool")
+        ULONG = RustCType("unsigned long")
+        if name in ("sum", "product"):
+            self._arity(name, args, 0)
+            rty = vty
+            if targs:
+                rty = targs[0]
+            elif self.target is not None and not self.target.ptr \
+                    and (self.target.base in _RANK
+                         or self.target.base in ("float", "double")):
+                rty = self.target
+            self.pending.append("%s = %s;" % (rty.decl(R),
+                                              "0" if name == "sum" else "1"))
+            step.append("%s %s= %s;" % (R, "+" if name == "sum" else "*", v))
+        elif name == "count":
+            self._arity(name, args, 0)
+            rty = ULONG
+            self.pending.append("unsigned long %s = 0;" % R)
+            step.append("%s++;" % R)
+        elif name in ("min", "max", "last"):
+            self._arity(name, args, 0)
+            rty = self.unit.option_type(vty)
+            self.pending.append("%s = (%s){0};" % (rty.decl(R), rty.base))
+            if name == "last":
+                step.append("%s = (%s){1, %s};" % (R, rty.base, v))
+            else:
+                op = "<" if name == "min" else ">="
+                step.append("if (!%s.some || %s %s %s.value) %s = (%s){1, %s};"
+                            % (R, v, op, R, R, rty.base, v))
+        elif name in ("min_by_key", "max_by_key"):
+            self._arity(name, args, 1)
+            rty = self.unit.option_type(vty)
+            e, w = self._iter_apply(args[0], [(item, True)])
+            if e.type is None or e.type.is_void():
+                self.err("cannot infer the key type of this `%s`", name)
+            key, kv = self.new_temp(), self.new_temp()
+            self.pending.append("%s = (%s){0}; %s;"
+                                % (rty.decl(R), rty.base, e.type.decl(key)))
+            op = "<" if name == "min_by_key" else ">="
+            step.append("{ %s %s = %s; if (!%s.some || %s %s %s) { %s = "
+                        "(%s){1, %s}; %s = %s; } }"
+                        % (" ".join(w), e.type.decl(kv), e.code, R, kv, op,
+                           key, R, rty.base, v, key, kv))
+        elif name in ("any", "all"):
+            self._arity(name, args, 1)
+            rty = BOOL
+            e, w = self._iter_apply(args[0], [(item, False)])
+            if name == "any":
+                self.pending.append("_Bool %s = 0;" % R)
+                step.append("{ %s if (%s) { %s = 1; break; } }"
+                            % (" ".join(w), e.code, R))
+            else:
+                self.pending.append("_Bool %s = 1;" % R)
+                step.append("{ %s if (!(%s)) { %s = 0; break; } }"
+                            % (" ".join(w), e.code, R))
+        elif name == "find":
+            self._arity(name, args, 1)
+            rty = self.unit.option_type(vty)
+            e, w = self._iter_apply(args[0], [(item, True)])
+            self.pending.append("%s = (%s){0};" % (rty.decl(R), rty.base))
+            step.append("{ %s if (%s) { %s = (%s){1, %s}; break; } }"
+                        % (" ".join(w), e.code, R, rty.base, v))
+        elif name == "position":
+            self._arity(name, args, 1)
+            rty = self.unit.option_type(ULONG)
+            e, w = self._iter_apply(args[0], [(item, False)])
+            n = self.new_temp()
+            self.pending.append("%s = (%s){0}; unsigned long %s = 0;"
+                                % (rty.decl(R), rty.base, n))
+            step.append("{ %s if (%s) { %s = (%s){1, %s}; break; } %s++; }"
+                        % (" ".join(w), e.code, R, rty.base, n, n))
+        elif name == "nth":
+            self._arity(name, args, 1)
+            rty = self.unit.option_type(vty)
+            a = self.sub_expr(args[0])
+            n, c = self.new_temp(), self.new_temp()
+            self.pending.append("%s = (%s){0}; unsigned long %s = (unsigned "
+                                "long)(%s); unsigned long %s = 0;"
+                                % (rty.decl(R), rty.base, n, a.code, c))
+            step.append("if (%s++ == %s) { %s = (%s){1, %s}; break; }"
+                        % (c, n, R, rty.base, v))
+        elif name == "fold":
+            self._arity(name, args, 2)
+            init = self.sub_expr(args[0], self.target)
+            rty = init.type
+            if rty is None or rty.is_void():
+                self.err("cannot infer the type of `fold`'s initial value; "
+                         "annotate it")
+            self.pending.append("%s = %s;" % (rty.decl(R), init.code))
+            acc = _Item(R, rty, False, None)
+            e, w = self._iter_apply(args[1], [(acc, False), (item, False)],
+                                    rty)
+            step.append("{ %s %s = %s; }" % (" ".join(w), R, e.code))
+        elif name == "for_each":
+            self._arity(name, args, 1)
+            rty = VOID
+            e, w = self._iter_apply(args[0], [(item, False)])
+            step.append("{ %s %s; }" % (" ".join(w), e.code))
+        elif name == "collect" and self._collects_string(targs):
+            self._arity(name, args, 0)
+            ensure_core_concrete(self.unit, "String")
+            rty = RustCType("String")
+            self.pending.append("String %s = String_new();" % R)
+            if vty.base == "crust_char" and not vty.ptr:
+                step.append("String_push(&%s, %s);" % (R, v))
+            elif vty.base == "const char" and vty.ptr == 1:
+                step.append("String_push_str(&%s, %s);" % (R, v))
+            else:
+                self.err("`collect` into a `String` needs `char` or `&str` "
+                         "items, not `%s`", vty.decl())
+        elif name == "collect":
+            self._arity(name, args, 0)
+            rty = None
+            for cand in ([self.target] + (targs or [])):
+                if cand is not None and not cand.ptr and \
+                        self.unit.instances.get(cand.base,
+                                                (None,))[0] == "Vec":
+                    rty = cand
+            if rty is None:
+                rty = self.instantiate_struct("Vec", [vty])
+            if item.rc and self.owning_free(vty) is not None:
+                self.err("`collect` would store copies of elements their "
+                         "container still owns -- these are borrows -- so "
+                         "both would drop them; add `.cloned()`")
+            self.pending.append("%s = %s_new();" % (rty.decl(R), rty.base))
+            step.append("%s_push(&%s, %s);" % (rty.base, R, v))
+        else:                                        # pragma: no cover
+            self.err("`%s` is not an iterator consumer", name)
+        self.pending.append(
+            "%s { %s }%s"
+            % (head, " ".join(top + body + step) + " }" * closers,
+               "".join(" " + s for s in self._free_held(held))))
+        if rty.is_void():
+            return Expr("((void)0)", VOID)
+        return Expr(R, rty)
+
+    def parse_for(self, out, indent, t, label):
+        """Lower `for PAT in SUBJECT { .. }`.
+
+        A plain range with a name for its pattern keeps the direct C `for`
+        it always had. Everything else is an iterator chain, lowered by
+        `iter_plan` exactly as a consumer lowers one, with the loop body as
+        the consumer's step.
+        """
+        self.next()                                   # `for`
+        kind, names = self._parse_for_pattern()
+        self.expect("in")
+        toks = self._for_subject_tokens()
+        if not toks:
+            self.err("expected something to iterate over")
+        core, ops = _peel_adaptors(toks)
+        rng = _split_range(core)
+        if rng is not None and not ops and kind == "one" \
+                and not names[0][1]:
+            lo_t, hi_t, inclusive = rng
+            if hi_t is None:
+                self.err("an open range `a..` never ends; give it an end or "
+                         "a `.take(n)`")
+            lo = self.sub_expr(lo_t)
+            hi = self.sub_expr(hi_t)
+            self._emit_range_for(out, indent, t, names[0][0], lo, hi,
+                                 "<=" if inclusive else "<", label)
+            return
+        ch = self.chain_from_tokens(core, rng, ops)
+        self._emit_chain_for(out, indent, t, kind, names, ch, label)
+
+    def _emit_chain_for(self, out, indent, t, kind, names, ch, label):
+        line = t.line
+        self.scope_push("block")          # the loop's own temporaries
+        out.line_at(line, "{", indent)
+        head, top, body, closers, item, held, owns = self.iter_plan(ch)
+        for tmp, ty in held:
+            # Freed however the loop is left: a `break` to an outer label,
+            # a `return`, or falling off the end.
+            self.live_register(tmp, ty)
+        decls, binds = [], []
+        if kind == "one":
+            self._bind_item(decls, binds, names[0], item, owns)
+        else:
+            parts = item.parts
+            if parts is None and not item.ty.ptr \
+                    and item.ty.base in self.unit.tuples:
+                fields = self.unit.tuples[item.ty.base]
+                parts = [_Item("%s._%d" % (item.code, k), fields[k], item.rc,
+                               None) for k in range(len(fields))]
+            if parts is None:
+                self.err("a tuple pattern needs tuple elements")
+            if len(parts) != len(names):
+                self.err("this pattern binds %d name%s, but each element has "
+                         "%d part%s", len(names),
+                         "" if len(names) == 1 else "s", len(parts),
+                         "" if len(parts) == 1 else "s")
+            for k in range(len(names)):
+                self._bind_item(decls, binds, names[k], parts[k], False)
+        if closers:
+            # The loop's own bindings get a block of their own, after the
+            # stages': a closure parameter named like the loop variable
+            # (`.map(|x| ..)` with `for x in ..`) would otherwise be declared
+            # twice in one C block.
+            decls = ["{"] + decls
+            closers += 1
+        self.emit_pending(out, line, indent)
+        out.line_at(line, head, indent)
+        self.loop_enter(label)
+        self.emit_bound_block(out, indent, " ".join(top + body + decls),
+                              kind="loop", binds=binds, closers=closers)
+        self.loop_exit(out)
+        for stmt in self.drop_stmts(len(self.live) - 1):
+            out.write(" " + stmt)
         self.scope_pop()
         out.write(" }")
+
+    def _bind_item(self, decls, binds, name_ref, item, owns):
+        """Declare one `for` binding for an item."""
+        name, by_ref = name_ref
+        if name == "_":
+            return
+        cn = _c_name(name)
+        if item.parts is not None:
+            decls.append("%s = %s;" % (item.ty.decl(cn), item.code))
+            binds.append((name, item.ty, False, False))
+            return
+        if by_ref and item.ty.ptr and not item.rc:
+            # `for &x in v.iter_mut()`-style: the pointee, by value.
+            ty = RustCType(item.ty.base, item.ty.ptr - 1, item.ty.array)
+            decls.append("%s = *%s;" % (ty.decl(cn), item.code))
+            binds.append((name, ty, False, False))
+            return
+        decls.append("%s = %s;" % (item.ty.decl(cn), item.code))
+        binds.append((name, item.ty, owns, item.rc and not by_ref))
 
     def new_index(self):
         self.tmp_n += 1
         return "_crust_i%d" % self.tmp_n
 
-    def emit_bound_block(self, out, indent, decl, kind="block"):
-        """Emit `{ <decl> <body> }` for a loop or pattern binding."""
+    def emit_bound_block(self, out, indent, decl, kind="block",
+                         tail_returns=False, binds=None, closers=0):
+        """Emit `{ <decl> <body> }` for a loop or pattern binding.
+
+        `binds` -- (name, type, owns, refcopy) -- are declared in the block's
+        own frame, so an owning one is dropped at the end of each pass.
+        """
         open_tok = self.expect("{")
         out.line_at(open_tok.line, "{ " + decl, indent)
         self.scope_push(kind)
+        for bname, bty, owns, refcopy in (binds or []):
+            self.declare(bname, bty)
+            if refcopy:
+                self.refcopies[-1][bname] = True
+            if owns:
+                self.live_register(bname, bty)
+        # A loop body, so a move of something declared outside it is a move
+        # on every iteration -- `parse_block` counts this, and the `for x in
+        # xs` and `while let` bodies that come through here did not.
+        if kind == "loop":
+            self.loop_depth += 1
+            self.loop_frames[-1] = len(self.live) - 1
         while not self.at("}", "punc"):
             if self.cur.kind == "eof":
                 self.err("unterminated block")
-            self.parse_stmt(out, indent + 1, False)
+            self.parse_stmt(out, indent + 1, tail_returns)
         close = self.expect("}")
+        if kind == "loop":
+            self.loop_depth -= 1
         if not self.terminated:
             self.emit_drops(out, close.line, indent + 1, len(self.live) - 1)
+        if kind == "loop" and self.loop_cont[-1]:
+            out.line_at(close.line, "%s: ;" % self.loop_cont[-1], indent + 1)
+        if closers:
+            # The blocks an iterator's stages opened in `decl`.
+            out.write(" }" * closers)
         self.scope_pop()
         self.terminated = False
         out.line_at(close.line, "}", indent)
@@ -3253,6 +5663,15 @@ class Parser:
     def parse_if_tail(self, out, indent, tail_returns):
         self.expect("if")
         cond = self.parse_cond()
+        # An `else if` condition runs only when the earlier tests failed, so
+        # its hoisted work cannot go before the whole chain. It used to be
+        # left in the pending list and emitted after the chain instead --
+        # after the code that reads it. It goes in a block opened here, inside
+        # the `else` the caller already wrote.
+        work = self.pending
+        self.pending = []
+        if work:
+            out.write("{ %s " % " ".join(work))
         out.write("if (%s)" % cond.code)
         self.parse_block(out, indent, tail_returns)
         if self.accept("else"):
@@ -3262,6 +5681,8 @@ class Parser:
             else:
                 out.write(" else")
                 self.parse_block(out, indent, tail_returns)
+        if work:
+            out.write(" }")
 
     # -- items ------------------------------------------------------------
 
@@ -3309,45 +5730,273 @@ class Parser:
                 self.parse_block(out, indent, tail_returns)
         out.write(" }")
 
-    def parse_while_let(self, out, indent):
+    def parse_while_let(self, out, indent, label=None):
         """Lower `while let Some(x) = e { .. }` to a loop with a break."""
         t = self.expect("while")
         binding, subject, elem = self.parse_let_pattern()
         tmp = self.new_temp()
         out.line_at(t.line, "for (;;) {", indent)
+        # The subject's hoisted work runs before every test, like a `while`
+        # condition's.
+        work = self.pending
+        self.pending = []
+        for stmt in work:
+            out.write(" " + stmt)
         out.write(" %s = %s;" % (subject.type.decl(tmp), subject.code))
         out.write(" if (!%s.some) break;" % tmp)
         self.scope_push()
         self.declare(binding, elem)
-        self.emit_binding_block(out, indent, False, binding, elem, tmp)
+        self.loop_enter(label)
+        self.emit_binding_block(out, indent, False, binding, elem, tmp,
+                                kind="loop")
         self.scope_pop()
         out.write(" }")
+        self.loop_exit(out)
 
     def emit_binding_block(self, out, indent, tail_returns, binding, elem,
-                           tmp):
-        """Emit `{ elem binding = tmp.value; <body> }` for a `let` pattern."""
-        open_tok = self.expect("{")
-        out.line_at(open_tok.line, "{ %s = %s.value;"
-                    % (elem.decl(binding), tmp), indent)
-        self.scope_push()
-        while not self.at("}", "punc"):
-            if self.cur.kind == "eof":
-                self.err("unterminated block")
-            self.parse_stmt(out, indent + 1, tail_returns)
-        close = self.expect("}")
-        self.scope_pop()
-        out.line_at(close.line, "}", indent)
+                           tmp, kind="block"):
+        """Emit `{ elem binding = tmp.value; <body> }` for a `let` pattern.
+
+        Goes through `emit_bound_block`, so locals declared in the body are
+        dropped at its closing brace. This used to open its own scope and
+        close it without emitting anything, leaking every owning local in an
+        `if let` or `while let` body on every pass.
+        """
+        self.emit_bound_block(out, indent, "%s = %s.value;"
+                              % (elem.decl(_c_name(binding)), tmp),
+                              kind=kind, tail_returns=tail_returns)
 
     def parse_match(self, out, indent, tail_returns):
-        """Lower `match` to a C `switch`.
+        """Lower a `match` statement.
 
-        Rust arms do not fall through, so each arm ends in an explicit
-        `break`. When the scrutinee is an enum and no `_` arm is present, the
-        arms must cover every variant -- Crust reports the missing ones
-        instead of silently falling through.
+        Two lowerings. A match whose arms are all constant labels -- literals,
+        constants, C-like variants, data-enum variants that only bind their
+        payload -- becomes a C `switch`, which is what gives a dense match a
+        jump table. Anything else (guards, ranges, `Option`/`Result`, nested
+        payload patterns, bindings, tuples) becomes an if/else chain over
+        `pattern_test`. Both check exhaustiveness where it can be decided.
+
+        With `tail_returns`, each arm's value is the function's return --
+        or, inside a value `match` (`value_of`), an assignment to its
+        temporary.
         """
         t = self.expect("match")
-        scrutinee = self.parse_cond()
+        self.expected.append(None)
+        try:
+            scrutinee = self.parse_cond()
+        finally:
+            self.expected.pop()
+        scrutinee = self.deref_scrutinee(scrutinee)
+        if self._match_is_simple(scrutinee.type):
+            self._switch_match(out, indent, tail_returns, t, scrutinee)
+        else:
+            self._chain_match(out, indent, tail_returns, t, scrutinee)
+
+    def deref_scrutinee(self, e):
+        """Look through one reference to a matchable type.
+
+        `match self` on `&Enum` -- Rust's match ergonomics see through the
+        reference, and the bindings are then copies here.
+        """
+        ty = e.type
+        if ty is not None and ty.ptr == 1 and not ty.array and (
+                ty.base in self.unit.enums
+                or ty.base in self.unit.options
+                or ty.base in self.unit.results
+                or ty.base in self.unit.tuples):
+            return Expr("(*%s)" % e.code, RustCType(ty.base))
+        return e
+
+    def _match_is_simple(self, ty):
+        """True if every arm of the match at the cursor is a `switch` label.
+
+        A read-only scan of the arm patterns, done before anything is emitted
+        so the lowering can be chosen. Anything it is unsure about answers
+        False: the chain handles every pattern the switch does.
+        """
+        if ty is not None and (ty.ptr or ty.base in self.unit.options
+                               or ty.base in self.unit.results
+                               or ty.base in self.unit.tuples):
+            return False
+        enum_name = ty.base if ty is not None else None
+        toks, j = self.toks, self.i
+        if toks[j].val != "{":
+            return True                     # let the switch path report it
+        j += 1
+        while toks[j].kind != "eof":
+            if toks[j].val == "}" and toks[j].kind == "punc":
+                return True
+            depth = 0
+            while True:                     # the pattern, up to `=>`
+                tk = toks[j]
+                v, kind = tk.val, tk.kind
+                if kind == "eof":
+                    return True
+                if kind == "punc" and v in ("(", "[", "{"):
+                    depth += 1
+                    if depth > 1:
+                        return False        # a nested payload pattern
+                elif kind == "punc" and v in (")", "]", "}"):
+                    depth -= 1
+                elif depth == 0 and kind == "punc" and v == "=>":
+                    break
+                elif depth == 0 and kind == "kw" and v == "if":
+                    return False            # a guard
+                elif kind == "punc" and v == "..=":
+                    return False
+                elif kind == "punc" and v == ".." and depth == 0:
+                    return False            # a range
+                elif kind == "punc" and v == "@":
+                    return False
+                elif depth > 0 and kind in ("num", "chr", "str"):
+                    return False            # a literal inside a payload
+                elif depth > 0 and kind == "kw" and v in ("true", "false"):
+                    return False
+                elif depth > 0 and kind == "punc" and v in ("::", "-", "&",
+                                                            "|"):
+                    return False
+                elif depth == 0 and kind == "ident" and v != "_" \
+                        and toks[j + 1].val != "::" \
+                        and toks[j - 1].val != "::":
+                    # A lone name: a constant or a variant is a label, any
+                    # other name is a binding.
+                    if v not in self.unit.consts and v not in \
+                            self.unit.variants and not (
+                                enum_name is not None
+                                and "%s_%s" % (enum_name, v)
+                                in self.unit.variants):
+                        return False
+                j += 1
+            j += 1                          # past `=>`
+            depth = 0
+            if toks[j].val == "{" and toks[j].kind == "punc":
+                while toks[j].kind != "eof":    # a block body
+                    if toks[j].val == "{" and toks[j].kind == "punc":
+                        depth += 1
+                    elif toks[j].val == "}" and toks[j].kind == "punc":
+                        depth -= 1
+                        if depth == 0:
+                            j += 1
+                            break
+                    j += 1
+                if toks[j].val == ",":
+                    j += 1
+                continue
+            while toks[j].kind != "eof":        # an expression body
+                v = toks[j].val
+                if toks[j].kind == "punc" and v in ("(", "[", "{"):
+                    depth += 1
+                elif toks[j].kind == "punc" and v in (")", "]", "}"):
+                    if depth == 0:
+                        break               # the match's own `}`
+                    depth -= 1
+                elif depth == 0 and v == ",":
+                    j += 1
+                    break
+                j += 1
+        return True
+
+    def _variant_tests(self, subj, ty):
+        """[(C test, name)] for each case of an enumerable type, or None.
+
+        The tests are spelled exactly as `pattern_one` spells a variant
+        whose payload patterns are all irrefutable, so an unguarded arm
+        covers a case precisely when one of its alternatives produced that
+        string.
+        """
+        if ty is None or ty.ptr or ty.array:
+            return None
+        b = ty.base
+        if b in self.unit.options:
+            return [("%s.some" % subj, "Some(_)"),
+                    ("(!%s.some)" % subj, "None")]
+        if b in self.unit.results:
+            return [("%s.ok" % subj, "Ok(_)"), ("(!%s.ok)" % subj, "Err(_)")]
+        if b in self.unit.data_enums:
+            return [("(%s.tag == %s_%s)" % (subj, b, v), v)
+                    for v, _ in self.unit.enums[b]]
+        if b in self.unit.enums:
+            return [("(%s == %s_%s)" % (subj, b, v), v)
+                    for v, _ in self.unit.enums[b]]
+        if b == "_Bool":
+            return [("(%s == 1)" % subj, "true"), ("(%s == 0)" % subj, "false")]
+        return None
+
+    def _chain_match(self, out, indent, tail_returns, t, scrutinee):
+        """Lower a `match` to an if/else chain over `pattern_test`.
+
+        Each arm tests its pattern (and guard) against the scrutinee, held in
+        a temporary unless it is already a place. Bindings are declared as
+        copies at the top of the arm's block; a guard reads them as aliases,
+        before the copy exists. A guard's hoisted work goes in a block opened
+        in the `else` of the arm before, so it runs only if that arm is
+        reached -- which is why the chain can close with several braces.
+        """
+        ty = scrutinee.type
+        if ty is None:
+            self.err("cannot infer the type of this `match`'s scrutinee; "
+                     "annotate it")
+        subj = self.once(scrutinee)
+        self.emit_pending(out, t.line, indent)
+        out.line_at(t.line, "{", indent)
+        self.expect("{")
+        tests = self._variant_tests(subj, ty)
+        covered, catch_all, first, closers = set(), False, True, 0
+        while not self.at("}", "punc"):
+            if self.cur.kind == "eof":
+                self.err("unterminated match")
+            arm = self.cur
+            mark = len(self.pending)
+            cond, binds = self.pattern_test(subj, ty)
+            alts = self.alt_conds
+            guarded = self.accept("if") is not None
+            if guarded:
+                cond = self.guarded(cond, binds, None)
+            work = self.take_pending(mark)
+            self.expect("=>")
+            if not guarded:
+                for a in alts:
+                    if a == "1":
+                        catch_all = True
+                    else:
+                        covered.add(a)
+            text = "" if first else "else "
+            if work:
+                text += "{ %s " % " ".join(work)
+                closers += 1
+            text += "if (%s)" % cond
+            out.line_at(arm.line, text, indent + 1)
+            out.write(" {")
+            self.scope_push()
+            for bname, bty, place in binds:
+                self.declare(bname, bty)
+                out.write(" %s = %s;" % (bty.decl(_c_name(bname)), place))
+            self.parse_arm_body(out, indent + 2, tail_returns)
+            out.write(" }")
+            self.scope_pop()
+            self.terminated = False
+            self.accept(",")
+            first = False
+        close = self.expect("}")
+        if not catch_all:
+            if tests is not None:
+                missing = [name for c, name in tests if c not in covered]
+                if missing:
+                    self.err("non-exhaustive match on `%s`: %s not covered; "
+                             "add an arm or `_`", ty.decl(),
+                             ", ".join("`%s`" % m for m in missing))
+            else:
+                # Integers and tuples: coverage by ranges is not something
+                # Crust can prove, but rustc already has for any program it
+                # accepts. Falling off the chain would leave a value match
+                # unassigned, so the impossible case traps instead.
+                self.unit.needs.add("abort")
+                out.write(" abort();" if first else " else { abort(); }")
+        out.write(" }" * closers)
+        out.line_at(close.line, "}", indent)
+
+    def _switch_match(self, out, indent, tail_returns, t, scrutinee):
+        """The `switch` lowering; see `parse_match`."""
         self.emit_pending(out, t.line, indent)
         sty0 = scrutinee.type
         data_enum = (sty0 is not None and not sty0.ptr
@@ -3371,8 +6020,18 @@ class Parser:
         sty = scrutinee.type
         if sty is not None and not sty.ptr and sty.base in self.unit.enums:
             enum_name = sty.base
-        covered, has_default = set(), False
+        covered = set()
+        self.switch_depth += 1
+        try:
+            self._switch_arms(out, indent, tail_returns, enum_name, covered,
+                              subject, data_enum)
+        finally:
+            self.switch_depth -= 1
 
+    def _switch_arms(self, out, indent, tail_returns, enum_name, covered,
+                     subject, data_enum):
+        """The arms of `_switch_match`, parsed with the switch open."""
+        has_default = False
         while not self.at("}", "punc"):
             if self.cur.kind == "eof":
                 self.err("unterminated match")
@@ -3389,18 +6048,18 @@ class Parser:
             binds = self.binds
             self.binds = []
             self.scope_push()
-            if binds:
-                # Bindings are declared inside a block so their names cannot
-                # leak into a later arm, which C's fall-through-free `case`
-                # labels would otherwise allow.
-                out.write(" {")
-                for bname, bty, path in binds:
-                    self.declare(bname, bty)
-                    out.write(" %s = %s.u.%s;"
-                              % (bty.decl(_c_name(bname)), subject, path))
+            # Every arm gets its own block. Bindings are declared in it so
+            # their names cannot leak into a later arm, which C's `case`
+            # labels would otherwise allow; and C forbids a declaration
+            # directly after a label, which is exactly what an arm's hoisted
+            # temporaries (from `?`, a block, a method on a temporary) are.
+            out.write(" {")
+            for bname, bty, path in binds:
+                self.declare(bname, bty)
+                out.write(" %s = %s.u.%s;"
+                          % (bty.decl(_c_name(bname)), subject, path))
             self.parse_arm_body(out, indent + 2, tail_returns)
-            if binds:
-                out.write(" }")
+            out.write(" }")
             self.scope_pop()
             out.write(" break;")
             self.accept(",")
@@ -3435,7 +6094,7 @@ class Parser:
         if t.kind == "num":
             return normalize_number_code(t)
         if t.kind == "chr":
-            return t.val
+            return _char_code(t.val, self)
         if t.val == "true":
             return "1"
         if t.val == "false":
@@ -3444,6 +6103,8 @@ class Parser:
             return "-" + normalize_number_code(self.next())
         if t.kind == "ident":
             name = t.val
+            if name == "Self" and self.impl_type is not None:
+                name = self.impl_type
             while self.at("::", "punc"):
                 self.next()
                 name += "_" + self.expect_ident()
@@ -3507,15 +6168,261 @@ class Parser:
                 break
         self.expect("}")
 
+    # -- pattern tests ----------------------------------------------------
+    #
+    # A pattern lowered to a C boolean over a *place* (`subj`), plus the
+    # bindings it introduces as (name, type, C place). Used by `matches!`;
+    # written for `match` too, which needs exactly the same thing.
+
+    def pattern_test(self, subj, ty):
+        """Parse `P | Q | ..` at the cursor; return (C condition, bindings)."""
+        self.accept("|")                       # a leading `|` is allowed
+        conds, binds = [], []
+        while True:
+            c, b = self.pattern_one(subj, ty)
+            conds.append(c)
+            binds.extend(b)
+            if not self.accept("|"):
+                break
+        self.alt_conds = conds
+        if len(conds) > 1 and binds:
+            # Each alternative binds from a different place, so one alias
+            # cannot stand for all of them.
+            self.err("a binding inside `|` alternatives is not supported; "
+                     "split the alternatives into separate arms")
+        if len(conds) == 1:
+            return conds[0], binds
+        return "(%s)" % " || ".join(conds), binds
+
+    def _pattern_value(self):
+        """A literal or constant in a pattern, as C, or None if not one."""
+        t = self.cur
+        if t.kind == "num":
+            self.next()
+            return normalize_number_code(t)
+        if t.kind == "chr":
+            self.next()
+            return _char_code(t.val, self)
+        if t.val == "-" and self.peek().kind == "num":
+            self.next()
+            return "-" + normalize_number_code(self.next())
+        if t.kind == "kw" and t.val in ("true", "false"):
+            self.next()
+            return "1" if t.val == "true" else "0"
+        if t.kind == "str":
+            self.err("string patterns are not supported; compare with "
+                     "`==` in a guard instead")
+        return None
+
+    def _range_test(self, subj, lo):
+        """Finish `lo..hi` / `lo..=hi` / `lo..` after `lo` (None for `..hi`)."""
+        inclusive = self.accept("..=") is not None
+        if not inclusive:
+            self.expect("..")
+        hi = None
+        if self.cur.kind != "eof" and not self.at("|", "punc") \
+                and not self.at(")", "punc") and not self.at(",", "punc") \
+                and not self.at("}", "punc") and not self.at("=>", "punc") \
+                and not self.at("if", "kw"):
+            hi = self._pattern_value()
+            if hi is None:
+                hi = self._pattern_const()
+        parts = []
+        if lo is not None:
+            parts.append("%s >= %s" % (subj, lo))
+        if hi is not None:
+            parts.append("%s %s %s" % (subj, "<=" if inclusive else "<", hi))
+        if not parts:
+            self.err("a range pattern needs at least one bound")
+        return "(%s)" % " && ".join(parts)
+
+    def _pattern_const(self):
+        """A `const` named in a pattern, flattened, or None."""
+        if self.cur.kind != "ident":
+            return None
+        save = self.i
+        name = self.next().val
+        while self.at("::", "punc"):
+            self.next()
+            name += "_" + self.expect_ident()
+        if name in self.unit.consts:
+            return name
+        self.i = save
+        return None
+
+    def pattern_one(self, subj, ty):
+        """One alternative of a pattern; see `pattern_test`."""
+        t = self.cur
+        if t.kind == "ident" and t.val == "_":
+            self.next()
+            return "1", []
+        if t.val == "&" and t.kind == "punc":
+            # `&x` in a pattern: Crust's bindings are copies already.
+            self.next()
+            return self.pattern_one(subj, ty)
+        if self.at("..=", "punc") or self.at("..", "punc"):
+            return self._range_test(subj, None), []
+        val = self._pattern_value()
+        if val is None:
+            val = self._pattern_const()
+        if val is not None:
+            if self.at("..=", "punc") or self.at("..", "punc"):
+                return self._range_test(subj, val), []
+            return "(%s == %s)" % (subj, val), []
+        if t.val == "(" and t.kind == "punc":
+            return self._tuple_pattern(subj, ty)
+        if t.kind not in ("ident", "kw"):
+            self.err("unsupported pattern %r", t.val or "<eof>")
+        # A path, possibly with a payload: a variant, `Some`/`None`,
+        # `Ok`/`Err`; or else a lone name, which is a binding.
+        while self.cur.val in ("ref", "mut") and self.peek().kind == "ident":
+            self.next()
+        name = self.next().val
+        if name == "Self" and self.impl_type is not None:
+            name = self.impl_type
+        path = False
+        while self.at("::", "punc"):
+            self.next()
+            path = True
+            name += "_" + self.expect_ident()
+        base = ty.base if (ty is not None and not ty.ptr) else None
+        if base in self.unit.options and name in ("Some", "None"):
+            if name == "None":
+                return "(!%s.some)" % subj, []
+            self.expect("(")
+            c, b = self.pattern_test("%s.value" % subj,
+                                     self.unit.options[base])
+            self.expect(")")
+            return _and_cond("%s.some" % subj, c), b
+        if base in self.unit.results and name in ("Ok", "Err"):
+            ok, err = self.unit.results[base]
+            self.expect("(")
+            if name == "Ok":
+                c, b = self.pattern_test("%s.value" % subj, ok)
+                tag = "%s.ok" % subj
+            else:
+                c, b = self.pattern_test("%s.error" % subj, err)
+                tag = "(!%s.ok)" % subj
+            self.expect(")")
+            return _and_cond(tag, c), b
+        flat = name
+        if flat not in self.unit.variants and base is not None \
+                and "%s_%s" % (base, name) in self.unit.variants:
+            flat = "%s_%s" % (base, name)          # a `use Enum::*` spelling
+        if flat in self.unit.variants:
+            owner = self.unit.variants[flat]
+            if owner in self.unit.data_enums:
+                test = "(%s.tag == %s)" % (subj, flat)
+                fields = self._payload_of(flat)
+                if self.at("(", "punc") or self.at("{", "punc"):
+                    if fields is None:
+                        self.err("`%s` carries no data to destructure", flat)
+                    c, b = self._payload_test(subj, flat, fields)
+                    return _and_cond(test, c), b
+                return test, []
+            if self.at("(", "punc") or self.at("{", "punc"):
+                self.err("`%s` carries no data to destructure", flat)
+            return "(%s == %s)" % (subj, flat), []
+        if path or self.at("(", "punc") or self.at("{", "punc"):
+            self.err("`%s` is not a variant of `%s`", name,
+                     ty.decl() if ty is not None else "this value")
+        # A binding, optionally `name @ subpattern`.
+        if self.accept("@"):
+            c, b = self.pattern_one(subj, ty)
+            return c, [(name, ty, subj)] + b
+        return "1", [(name, ty, subj)]
+
+    def _payload_test(self, subj, flat, fields):
+        """Test and bind the payload of `Variant(..)` / `Variant { .. }`."""
+        owner = self.unit.variants[flat]
+        vname = flat[len(owner) + 1:]
+        conds, binds = [], []
+        if self.accept("("):
+            i = 0
+            while not self.at(")", "punc"):
+                if self.accept(".."):
+                    break
+                if i >= len(fields):
+                    self.err("`%s` has only %d field%s", flat, len(fields),
+                             "" if len(fields) == 1 else "s")
+                fname, fty = fields[i]
+                c, b = self.pattern_test(
+                    "%s.u.%s.%s" % (subj, vname, fname or "_%d" % i), fty)
+                conds.append(c)
+                binds.extend(b)
+                i += 1
+                if not self.accept(","):
+                    break
+            self.expect(")")
+        else:
+            self.expect("{")
+            by_name = {}
+            for f, fty in fields:
+                if f:
+                    by_name[f] = fty
+            while not self.at("}", "punc"):
+                if self.accept(".."):
+                    break
+                fname = self.expect_ident()
+                if fname not in by_name:
+                    self.err("`%s` has no field `%s`", flat, fname)
+                place = "%s.u.%s.%s" % (subj, vname, fname)
+                if self.accept(":"):
+                    c, b = self.pattern_test(place, by_name[fname])
+                else:
+                    c, b = "1", [(fname, by_name[fname], place)]
+                conds.append(c)
+                binds.extend(b)
+                if not self.accept(","):
+                    break
+            self.expect("}")
+        cond = "1"
+        for c in conds:
+            cond = _and_cond(cond, c)
+        return cond, binds
+
+    def _tuple_pattern(self, subj, ty):
+        """`(p, q, ..)` against a tuple value."""
+        self.expect("(")
+        if ty is None or ty.base not in self.unit.tuples:
+            self.err("a tuple pattern needs a tuple to match against")
+        elems = self.unit.tuples[ty.base]
+        cond, binds, i = "1", [], 0
+        while not self.at(")", "punc"):
+            if i >= len(elems):
+                self.err("this tuple has only %d element%s", len(elems),
+                         "" if len(elems) == 1 else "s")
+            c, b = self.pattern_test("%s._%d" % (subj, i), elems[i])
+            cond = _and_cond(cond, c)
+            binds.extend(b)
+            i += 1
+            if not self.accept(","):
+                break
+        self.expect(")")
+        return cond, binds
+
     def parse_arm_body(self, out, indent, tail_returns):
         """Parse the body of a match arm: a block or a single expression."""
         if self.at("{", "punc"):
             self.parse_block(out, indent, tail_returns)
             return
         t = self.cur
-        e = self.parse_expr()
-        if tail_returns and not self.ret_type.is_void():
-            out.line_at(t.line, "return %s;" % e.code, indent)
+        if t.kind == "kw" and t.val in ("return", "break", "continue"):
+            # `None => return 0,` -- a jump written as an arm's expression.
+            self.parse_jump(out, indent, (",", "}"))
+            self.terminated = False      # only this arm left; the match goes on
+            return
+        # A tail arm is the function's (or the value match's) value, so it
+        # reads that type -- `0 => Ok(v)` cannot otherwise tell which
+        # `Result` it builds. Its hoisted work (a `?`, a block) must be
+        # emitted first, and a return owes the live locals their drops,
+        # exactly as a `return` statement does.
+        tail = tail_returns and self.tail_wants_value()
+        e = self.parse_expr_as(self.tail_expect() if tail else None)
+        self.emit_pending(out, t.line, indent)
+        if tail:
+            self.emit_tail(out, t.line, indent, e)
+            self.terminated = False
         else:
             out.line_at(t.line, e.code + ";", indent)
 
@@ -3909,6 +6816,7 @@ class Parser:
         ret = VOID
         if self.accept("->"):
             ret = self.parse_type()
+        self.skip_where()
         return start, MethodInfo(owner, name, ret, self_kind, params)
 
     def skip_to_body_end(self):
@@ -3975,6 +6883,7 @@ class Parser:
         name = self.expect_ident()
         self.skip_generic_params()
         self.expect("(")
+        self.impl_n = 0
         params = []
         while not self.at(")", "punc"):
             self.accept("mut")
@@ -3987,8 +6896,31 @@ class Parser:
         self.expect(")")
         ret = VOID
         if self.accept("->"):
+            if self.at("impl", "kw"):
+                self.err("returning `impl Trait` (such as a closure) is not "
+                         "supported; pass the closure in as a generic "
+                         "`F: Fn(..)` parameter instead")
             ret = self.parse_type()
+        self.skip_where()
         return start, name, params, ret
+
+    def skip_where(self):
+        """Skip a `where` clause before a body: its bounds are not checked,
+        exactly as inline bounds are not."""
+        if not self.at("where", "kw"):
+            return
+        depth = 0
+        while self.cur.kind != "eof":
+            v = self.cur.val
+            if v in ("(", "["):
+                depth += 1
+            elif v in (")", "]"):
+                depth -= 1
+            elif v == "{" and depth == 0:
+                return
+            elif v == ";" and depth == 0:
+                return
+            self.next()
 
     def parse_fn(self, out, name_override=None):
         start, name, params, ret = self.parse_fn_signature()
@@ -4060,7 +6992,8 @@ class Parser:
 
 
 _RANK = {"signed char": 1, "unsigned char": 1, "short": 2, "unsigned short": 2,
-         "int": 3, "unsigned int": 4, "long": 5, "unsigned long": 6}
+         "int": 3, "unsigned int": 4, "crust_char": 4, "long": 5,
+         "unsigned long": 6}
 
 
 def wider(a, b):
@@ -4255,15 +7188,19 @@ def _ci_copy(p, args, atys, targs):
 def _ci_min(p, args, atys, targs):
     if len(args) < 2:
         p.err("`cmp::min` needs two operands")
-    return Expr("((%s) < (%s) ? (%s) : (%s))"
-                % (args[0], args[1], args[0], args[1]), atys[0])
+    # Each operand is named twice in the ternary, so a call is spilled first
+    # -- `min(next(), next())` must not advance four times.
+    a = p.once(Expr(args[0], atys[0]))
+    b = p.once(Expr(args[1], atys[1]))
+    return Expr("((%s) < (%s) ? (%s) : (%s))" % (a, b, a, b), atys[0])
 
 
 def _ci_max(p, args, atys, targs):
     if len(args) < 2:
         p.err("`cmp::max` needs two operands")
-    return Expr("((%s) > (%s) ? (%s) : (%s))"
-                % (args[0], args[1], args[0], args[1]), atys[0])
+    a = p.once(Expr(args[0], atys[0]))
+    b = p.once(Expr(args[1], atys[1]))
+    return Expr("((%s) > (%s) ? (%s) : (%s))" % (a, b, a, b), atys[0])
 
 
 def _ci_nop(p, args, atys, targs):
@@ -4386,6 +7323,310 @@ def _is_lvalue(code):
     if "(" in text or "{" in text:
         return False
     return bool(text) and all(c.isalnum() or c in "_.->[] " for c in text)
+
+
+def _join_types(types):
+    """The C type of a value several arms produce, or None if none did.
+
+    Rust gives every arm one type; Crust types an untyped literal as `int`,
+    so `match k { 0 => 1, _ => big }` with an `i64` `big` must not truncate
+    to `int`. Integer arms take the widest, a float arm makes it `double`,
+    and otherwise the first arm's type is the answer.
+    """
+    if not types:
+        return None
+    first = types[0]
+    if all(not t.ptr and not t.array and t.base in _RANK for t in types):
+        best = first
+        for t in types[1:]:
+            best = wider(best, t)
+        return best
+    if all(not t.ptr and not t.array
+           and (t.base in _RANK or t.base in ("float", "double"))
+           for t in types) and any(t.base in ("float", "double")
+                                   for t in types):
+        return RustCType("double")
+    return first
+
+
+# Iterator adaptors; see `Parser.iter_plan`. The source ops are arithmetic
+# on positions and must come before any stage; `copied`/`cloned` and
+# `skip`/`take`/`step_by` are also valid as stages, lowered differently.
+_SOURCE_OPS = {"iter", "iter_mut", "into_iter", "bytes", "chars",
+               "char_indices", "copied", "cloned", "rev", "skip", "take",
+               "step_by", "zip", "chain"}
+_SOURCE_ONLY = {"iter", "iter_mut", "into_iter", "bytes", "chars",
+                "char_indices", "rev", "zip", "chain"}
+_STR_SOURCES = ("bytes", "chars", "char_indices")
+_STAGE_OPS = {"map", "filter", "filter_map", "enumerate", "take_while",
+              "skip_while", "inspect", "copied", "cloned", "skip", "take",
+              "step_by"}
+_CONSUMERS = {"sum", "product", "count", "min", "max", "min_by_key",
+              "max_by_key", "any", "all", "find", "position", "fold", "last",
+              "nth", "for_each", "collect"}
+# A `for` subject's trailing `.name(..)` calls peeled off as adaptors.
+_FOR_ADAPTORS = _SOURCE_OPS | _STAGE_OPS
+
+# Iterator methods, named in the diagnostic when one is used outside `for`.
+_ITERATOR_METHODS = _FOR_ADAPTORS | {
+    "map", "filter", "filter_map", "fold", "sum", "product", "count",
+    "collect", "zip", "chain", "any", "all", "find", "position", "max",
+    "min", "last", "nth", "for_each", "flat_map", "take_while",
+    "skip_while", "peekable", "windows", "chunks", "chars"}
+
+
+def _peel_adaptors(toks):
+    """Split `core .a(..) .b(..)` into (core tokens, [(name, arg tokens)])."""
+    adaptors = []
+    while len(toks) >= 4 and toks[-1].kind == "punc" and toks[-1].val == ")":
+        depth, j = 0, len(toks) - 1
+        while j >= 0:
+            if toks[j].kind == "punc" and toks[j].val == ")":
+                depth += 1
+            elif toks[j].kind == "punc" and toks[j].val == "(":
+                depth -= 1
+                if depth == 0:
+                    break
+            j -= 1
+        if j < 2 or toks[j - 1].kind != "ident" or toks[j - 2].val != ".":
+            break
+        name = toks[j - 1].val
+        if name not in _FOR_ADAPTORS:
+            break
+        adaptors.insert(0, (name, toks[j + 1:len(toks) - 1]))
+        toks = toks[:j - 2]
+    return toks, adaptors
+
+
+def _split_range(toks):
+    """(lo, hi or None, inclusive) if `toks` is a range, else None.
+
+    Accepts `a..b`, `a..=b`, `a..` and the same wrapped in parentheses.
+    """
+    if len(toks) >= 2 and toks[0].val == "(" and toks[-1].val == ")":
+        depth, whole = 0, True
+        for k, t in enumerate(toks):
+            if t.kind == "punc" and t.val in ("(", "[", "{"):
+                depth += 1
+            elif t.kind == "punc" and t.val in (")", "]", "}"):
+                depth -= 1
+                if depth == 0 and k != len(toks) - 1:
+                    whole = False
+                    break
+        if whole:
+            inner = _split_range(toks[1:-1])
+            if inner is not None:
+                return inner
+    depth = 0
+    for k, t in enumerate(toks):
+        if t.kind == "punc" and t.val in ("(", "[", "{"):
+            depth += 1
+        elif t.kind == "punc" and t.val in (")", "]", "}"):
+            depth -= 1
+        elif depth == 0 and t.kind == "punc" and t.val in ("..", "..="):
+            if k == 0:
+                return None
+            hi = toks[k + 1:] or None
+            return toks[:k], hi, t.val == "..="
+    return None
+
+
+_CHAR_UTF8 = (
+    "static char *crust_char_utf8(crust_char c) { static char b[8][5]; "
+    "static int k; char *p = b[k++ & 7]; "
+    "if (c < 0x80) { p[0] = c; p[1] = 0; } "
+    "else if (c < 0x800) { p[0] = 0xC0 | (c >> 6); p[1] = 0x80 | (c & 0x3F); "
+    "p[2] = 0; } "
+    "else if (c < 0x10000) { p[0] = 0xE0 | (c >> 12); "
+    "p[1] = 0x80 | ((c >> 6) & 0x3F); p[2] = 0x80 | (c & 0x3F); p[3] = 0; } "
+    "else { p[0] = 0xF0 | (c >> 18); p[1] = 0x80 | ((c >> 12) & 0x3F); "
+    "p[2] = 0x80 | ((c >> 6) & 0x3F); p[3] = 0x80 | (c & 0x3F); p[4] = 0; } "
+    "return p; }")
+
+_UTF8_DECODE = (
+    "static crust_char crust_utf8_decode(const unsigned char *p, "
+    "unsigned long *w) { unsigned int c = p[0]; "
+    "if (c < 0x80) { *w = 1; return c; } "
+    "if (c < 0xE0) { *w = 2; return ((c & 0x1F) << 6) | (p[1] & 0x3F); } "
+    "if (c < 0xF0) { *w = 3; return ((c & 0x0F) << 12) | "
+    "((p[1] & 0x3F) << 6) | (p[2] & 0x3F); } "
+    "*w = 4; return ((c & 0x07) << 18) | ((p[1] & 0x3F) << 12) | "
+    "((p[2] & 0x3F) << 6) | (p[3] & 0x3F); }")
+
+_SIMPLE_ESCAPES = {"n": 10, "t": 9, "r": 13, "0": 0, "\\": 92, "'": 39,
+                   '"': 34}
+
+
+def _char_code(val, p):
+    """A Rust char literal's code point, as C: `'\\u{e9}'` -> `233u`."""
+    body = val[1:-1]
+    if body.startswith("\\"):
+        esc = body[1:]
+        if esc.startswith("u{") and esc.endswith("}"):
+            cp = int(esc[2:-1].replace("_", ""), 16)
+        elif esc.startswith("x"):
+            cp = int(esc[1:], 16)
+        elif esc in _SIMPLE_ESCAPES:
+            cp = _SIMPLE_ESCAPES[esc]
+        else:
+            p.err("unknown escape in char literal %s", val)
+    elif len(body) == 1:
+        cp = ord(body)
+    else:
+        p.err("a char literal holds one character: %s", val)
+    return "%du" % cp
+
+
+def _utf8_octal(cp):
+    """UTF-8 bytes of a code point as C octal escapes (never greedy)."""
+    if cp < 0x80:
+        bs = [cp]
+    elif cp < 0x800:
+        bs = [0xC0 | (cp >> 6), 0x80 | (cp & 0x3F)]
+    elif cp < 0x10000:
+        bs = [0xE0 | (cp >> 12), 0x80 | ((cp >> 6) & 0x3F),
+              0x80 | (cp & 0x3F)]
+    else:
+        bs = [0xF0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3F),
+              0x80 | ((cp >> 6) & 0x3F), 0x80 | (cp & 0x3F)]
+    return "".join("\\%03o" % b for b in bs)
+
+
+def _c_string(val, p):
+    """A Rust string literal as C: `\\u{..}` becomes UTF-8 octal escapes.
+
+    C has no `\\u{..}`, and `\\x` would swallow any hex digits that follow,
+    so each byte is written as a three-digit octal escape. Raw non-ASCII
+    characters are already UTF-8 in the source and pass through.
+    """
+    if "\\u{" not in val:
+        return val
+    out, i, n = [], 0, len(val)
+    while i < n:
+        if val.startswith("\\u{", i):
+            j = val.find("}", i)
+            if j < 0:
+                p.err("unterminated `\\u{` escape in a string")
+            out.append(_utf8_octal(int(val[i + 3:j].replace("_", ""), 16)))
+            i = j + 1
+            continue
+        if val[i] == "\\" and i + 1 < n:
+            out.append(val[i:i + 2])
+            i += 2
+            continue
+        out.append(val[i])
+        i += 1
+    return "".join(out)
+
+
+# ASCII classification, shared by `char` and `u8`, as C over `%(c)s`.
+_ASCII_TESTS = {
+    "is_ascii": "%(c)s < 128",
+    "is_ascii_digit": "%(c)s >= 48 && %(c)s <= 57",
+    "is_ascii_uppercase": "%(c)s >= 65 && %(c)s <= 90",
+    "is_ascii_lowercase": "%(c)s >= 97 && %(c)s <= 122",
+    "is_ascii_alphabetic": "(%(c)s >= 65 && %(c)s <= 90) || "
+                           "(%(c)s >= 97 && %(c)s <= 122)",
+    "is_ascii_alphanumeric": "(%(c)s >= 48 && %(c)s <= 57) || "
+                             "(%(c)s >= 65 && %(c)s <= 90) || "
+                             "(%(c)s >= 97 && %(c)s <= 122)",
+    "is_ascii_hexdigit": "(%(c)s >= 48 && %(c)s <= 57) || "
+                         "(%(c)s >= 65 && %(c)s <= 70) || "
+                         "(%(c)s >= 97 && %(c)s <= 102)",
+    "is_ascii_whitespace": "%(c)s == 32 || %(c)s == 9 || %(c)s == 10 || "
+                           "%(c)s == 12 || %(c)s == 13",
+    "is_ascii_punctuation": "(%(c)s >= 33 && %(c)s <= 47) || "
+                            "(%(c)s >= 58 && %(c)s <= 64) || "
+                            "(%(c)s >= 91 && %(c)s <= 96) || "
+                            "(%(c)s >= 123 && %(c)s <= 126)",
+    "is_ascii_graphic": "%(c)s >= 33 && %(c)s <= 126",
+    "is_ascii_control": "%(c)s < 32 || %(c)s == 127",
+}
+
+# Unicode classifications Crust refuses rather than approximates.
+_UNICODE_CLASSES = {
+    "is_alphabetic": "is_ascii_alphabetic",
+    "is_alphanumeric": "is_ascii_alphanumeric",
+    "is_numeric": "is_ascii_digit",
+    "is_lowercase": "is_ascii_lowercase",
+    "is_uppercase": "is_ascii_uppercase",
+    "is_control": "is_ascii_control",
+    "to_uppercase": "to_ascii_uppercase",
+    "to_lowercase": "to_ascii_lowercase",
+}
+
+
+def _adapt_args(codes, atys, ptypes):
+    """Take an argument's address where the parameter wants a pointer to it.
+
+    An iterator hands a closure its item by value (Crust's copy of Rust's
+    `&T`); a closure written `|x: &i32|` wants the address.
+    """
+    out = []
+    for k in range(len(codes)):
+        code = codes[k]
+        want = ptypes[k] if k < len(ptypes) else None
+        have = atys[k] if k < len(atys) else None
+        if want is not None and have is not None and want.ptr == have.ptr + 1 \
+                and want.base == have.base:
+            code = "&" + _addressable(code)
+        out.append(code)
+    return out
+
+
+def _zero_value(ty):
+    """A zero value of C type `ty`: Rust's `Default` for the bundled types."""
+    if ty.ptr:
+        return "((%s)0)" % ty.decl()
+    if ty.base in _RANK or ty.base in ("float", "double", "_Bool", "char"):
+        return "((%s)0)" % ty.decl()
+    return "(%s){0}" % ty.decl()
+
+
+def _is_place(code):
+    """True if `code` is something a method may assign through."""
+    text = code.strip()
+    if _is_lvalue(text):
+        return True
+    if text.startswith("(*") and text.endswith(")"):
+        return _is_lvalue(text[2:-1])
+    return False
+
+
+def _and_cond(a, b):
+    """`a && b`, dropping a side that is the constant `1`."""
+    if a == "1":
+        return b
+    if b == "1":
+        return a
+    return "(%s && %s)" % (a, b)
+
+
+def _split_guard(toks):
+    """Split pattern tokens at a top-level `if`: (pattern, guard or None)."""
+    depth = 0
+    for k, t in enumerate(toks):
+        if t.kind == "punc" and t.val in ("(", "[", "{"):
+            depth += 1
+        elif t.kind == "punc" and t.val in (")", "]", "}"):
+            depth -= 1
+        elif depth == 0 and t.kind == "kw" and t.val == "if":
+            return toks[:k], toks[k + 1:]
+    return toks, None
+
+
+def _is_simple_literal(code):
+    """True for a numeric, char or string literal, or `true`/`false` (as C)."""
+    text = code.strip()
+    while text.startswith("(") and text.endswith(")"):
+        text = text[1:-1].strip()
+    if text.startswith("-"):
+        text = text[1:].strip()
+    if not text:
+        return False
+    if text[0] in "\"'":
+        return True
+    return text[0].isdigit() and all(c.isalnum() or c in "._" for c in text)
 
 
 def _addressable(code):
@@ -5753,6 +8994,21 @@ def _generic_params_of(toks, kind):
             return None
         name = p.expect_ident()
         params = p.parse_generic_params()
+        if kind == "fn" and p.at("(", "punc"):
+            # Each `impl Trait` parameter is an anonymous type parameter.
+            depth, j, k = 0, p.i, 0
+            while j < len(p.toks):
+                v = p.toks[j].val
+                if v == "(":
+                    depth += 1
+                elif v == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                elif v == "impl" and p.toks[j].kind == "kw":
+                    params = params + ["_impl%d" % k]
+                    k += 1
+                j += 1
         # Const-only `struct Foo<const N: ty>` lowers as a plain struct.
         return (params, name) if params else None
     except CrustError:
@@ -6265,7 +9521,11 @@ def _derive_debug(unit, name, fields):
             parts.append("%s: ..." % fname)
             continue
         parts.append("%s: %s" % (fname, _c_spec_for(fty)))
-        args.append("self->%s" % fname)
+        if fty.base == "crust_char" and not fty.ptr:
+            unit.needs.add("charfmt")
+            args.append("crust_char_utf8(self->%s)" % fname)
+        else:
+            args.append("self->%s" % fname)
     body = 'printf("%s { %s }", %s);' % (
         name, ", ".join(parts).replace('"', ""),
         ", ".join(args)) if args else 'printf("%s { %s }");' % (
@@ -6381,6 +9641,51 @@ def compute_drop_glue(unit):
         _register(unit, name, "drop", VOID, [], self_kind="ref")
         unit.emitted.append("void %s_drop(%s *self) { %s }"
                             % (name, name, " ".join(glue) or "(void)self;"))
+
+
+# Bundled containers that own their elements; see `emit_elem_drops`.
+_ELEM_OWNERS = ("Vec", "VecDeque", "Box")
+
+# Methods of those that hand out a bitwise copy of an element they still own.
+_BORROWING_GETTERS = {"get", "last", "front", "back"}
+
+
+def emit_elem_drops(unit):
+    """Write `drop_elems` / `drop_at` for every bundled container instance.
+
+    Runs after every body is translated, because only then is it settled
+    which types own something -- a `Vec<G>` can be instantiated before the
+    drop analysis has seen `impl Drop for G`. For an element that owns
+    nothing the hooks are empty and cost a call the optimiser can drop.
+    """
+    probe = Parser([RustToken("eof", "", 0)], unit)
+    for tmpl, mangled, elem in unit.elem_drop_insts:
+        free = None
+        method = probe.owning_free(elem)
+        if method is not None:
+            info = unit.methods.get((elem.base, method))
+            if info is not None:
+                free = info.mangled
+        if tmpl == "VecDeque":
+            slot = "self->ptr[(self->head + %s) %% self->cap]"
+        elif tmpl == "Box":
+            slot = "(*self->ptr)"
+        else:
+            slot = "self->ptr[%s]"
+        if free is None:
+            each = "(void)self;"
+            one = "(void)self; (void)i;"
+        elif tmpl == "Box":
+            each = "if (self->ptr) %s(self->ptr);" % free
+            one = "(void)i; if (self->ptr) %s(self->ptr);" % free
+        else:
+            each = ("for (unsigned long k = 0; k < self->len; k++) %s(&%s);"
+                    % (free, slot % "k"))
+            one = "%s(&%s);" % (free, slot % "i")
+        unit.emitted.append(
+            "static void %s_drop_elems(%s *self) { %s }\n"
+            "static void %s_drop_at(%s *self, unsigned long i) { %s }"
+            % (mangled, mangled, each, mangled, mangled, one))
 
 
 def _register(unit, owner, mname, ret, params, self_kind):
@@ -6778,12 +10083,16 @@ def _prelude_offset(code):
     return offset
 
 
-def _toposort_structs(unit, order):
-    """Order struct definitions so a by-value field precedes its user."""
+def _toposort_structs(unit, order, skip=()):
+    """Order struct definitions so a by-value field precedes its user.
+
+    `skip` names structs defined elsewhere -- an included `.rs` module's
+    `Option` and `Result` instantiations -- which must not be defined again.
+    """
     emitted, result = set(), []
 
     def visit(name, stack):
-        if name in emitted or name not in unit.structs:
+        if name in emitted or name in skip or name not in unit.structs:
             return
         if name in stack:
             raise CrustError("recursive struct `%s` (use a pointer field)"
@@ -7409,6 +10718,10 @@ def translate(code, path=None):
                        "unsigned long hi; } crust_u128;")
         prelude.append("typedef struct crust_i128 { unsigned long lo; "
                        "long hi; } crust_i128;")
+    if "charfmt" in unit.needs:
+        prelude.append(_CHAR_UTF8)
+    if "utf8" in unit.needs:
+        prelude.append(_UTF8_DECODE)
     if "memcpy" in unit.needs:
         prelude.append("void *memcpy(void *, const void *, unsigned long);")
     if "memset" in unit.needs:
@@ -7451,24 +10764,23 @@ def translate(code, path=None):
                        % (name, name, name))
     # Slice structs hold only a pointer to their element, so the forward
     # declarations above are enough even for a slice of a user struct.
-    for name in unit.results:
-        if name not in included_results:
-            prelude.append("struct %s; typedef struct %s %s; %s"
-                           % (name, name, name,
-                              _render_struct(name, unit.structs[name])))
-    for name in unit.options:
-        if name not in included_options:
-            prelude.append("struct %s; typedef struct %s %s; %s"
-                           % (name, name, name,
-                              _render_struct(name, unit.structs[name])))
+    # `Option`, `Result` and tuple structs are only *declared* here; their
+    # definitions go through the same dependency sort as every other struct
+    # below. Rendering them up front put `Option<Point>` before `Point` was
+    # complete, and the sort then reached them again through a user struct's
+    # field and defined them twice -- a struct with an `Option<i32>` field
+    # was a "redefinition" error.
+    generated = []
+    for name in list(unit.results) + list(unit.options):
+        if name not in included_results and name not in included_options:
+            generated.append(name)
+    generated.extend(unit.tuples)
+    for name in generated:
+        prelude.append("struct %s; typedef struct %s %s;" % (name, name, name))
     for name, (fret, fparams) in unit.fn_ptrs.items():
         prelude.append("typedef %s (*%s)(%s);"
                        % (fret.decl(), name,
                           ", ".join(t.decl() for t in fparams) or "void"))
-    for name in unit.tuples:
-        prelude.append("struct %s; typedef struct %s %s; %s"
-                       % (name, name, name,
-                          _render_struct(name, unit.structs[name])))
     for name in unit.slices:
         if name not in included_slices:
             prelude.append("struct %s; typedef struct %s %s; %s"
@@ -7481,7 +10793,8 @@ def translate(code, path=None):
     for name in _toposort_structs(
             unit, core_structs + mod_structs + demand_structs
             + local["structs"]
-            + unit.struct_order):
+            + unit.struct_order + generated,
+            skip=included_options | included_results):
         prelude.append(_render_struct(name, unit.structs[name]))
     # Aliases after structs so `type Handle = Foo` can name a local struct.
     demand_aliases = [n for n in unit.demand_aliases
@@ -7542,11 +10855,18 @@ def translate(code, path=None):
                        % ("static " if is_static else "",
                           ret.decl(name),
                           ", ".join(t.decl() for t in ps) if ps else "void"))
+    emit_elem_drops(unit)
     if unit.emitted:
         # Monomorphised bodies go after all original text, so no line number
         # in the user's own source moves. Their prototypes are in the prelude,
         # so definition order does not matter.
         body = body.rstrip("\n") + "\n\n" + "\n".join(unit.emitted) + "\n"
+    if _has_word(body, "crust_char") or any(_has_word(x, "crust_char")
+                                            for x in prelude):
+        # First, since any declaration below may name it. A repeated
+        # identical typedef is valid C11, so an included module declaring it
+        # too is harmless.
+        prelude.insert(0, "typedef unsigned int crust_char;")
     if not prelude:
         return body
     return _emit_prelude(body, prelude, path)
