@@ -337,6 +337,9 @@ Pool budget is one slot per instance of each class that calls `AddComponent<T>`
 | `UnityEngine.UI` using / Image·Button·Canvas fields | Allowed (authored wiring) |
 | `GetComponent<Canvas\|Image\|RectTransform\|…>` | Authored UI lookup (GO handle); not invent |
 | `AddComponent<Canvas>` / `typeof(Canvas)` / `ForceUpdateCanvases` | Refused invent — author `!u!223` in the scene |
+| `List<T>` | ``std::vector`` (MB/component elems → ``int`` indices); ``Add``/``Count`` |
+| `Dictionary<K,V>` / `SortedList<K,V>` | ``std::map`` (``Add``→``[]=``, ``Clear``/``Count``/indexer); string keys via helper |
+| `HashSet` / … | BCL collections not lowered — CS0246 at the type token |
 | `Camera.main` with no scene Camera | Packer will not invent a default camera |
 
 Pack / crust / cpprust failures report as Unity/csc diagnostics

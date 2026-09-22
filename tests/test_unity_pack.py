@@ -554,6 +554,196 @@ class TestSystems(unittest.TestCase):
         self.assertNotIn("left the crust", msg)
         self.assertNotIn("malloc", msg)
 
+    def test_sortedlist_lowers_to_std_map(self):
+        """SortedList<string,T> field + indexer → std::map with string keys."""
+        root = tempfile.mkdtemp(prefix="upack-slist-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Entry.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Entry : MonoBehaviour {\n"
+                "    void Update() {}\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Entry.cs.meta"), "w") as f:
+            f.write("guid: entryentryentryentryentryentry01\n")
+        with open(os.path.join(scripts, "Player.cs"), "w") as f:
+            f.write(
+                "using System.Collections.Generic;\n"
+                "using UnityEngine;\n"
+                "public class Player : MonoBehaviour {\n"
+                "    public Entry entry;\n"
+                "    public SortedList<string, Entry> bulletPatternEntriesSortedList ="
+                " new SortedList<string, Entry>();\n"
+                "    void Start() {\n"
+                "        bulletPatternEntriesSortedList[\"Blaster Shoot\"] = entry;\n"
+                "        Entry e = bulletPatternEntriesSortedList[\"Blaster Shoot\"];\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Player.cs.meta"), "w") as f:
+            f.write("guid: playerplayerplayerplayerplayer01\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Player\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Entry\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: playerplayerplayerplayerplayer01}\n"
+                "  entry: {fileID: 12}\n"
+                "--- !u!4 &11\nTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &12\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: entryentryentryentryentryentry01}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-slist-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.cpp")) as f:
+            eng = f.read()
+        self.assertIn("#include <map>", eng)
+        self.assertIn("#include <string>", eng)
+        self.assertIn("_engine_map_at_si", eng)
+        self.assertIn(
+            "std::map<std::string, int> Player_bulletPatternEntriesSortedList",
+            eng)
+        self.assertNotIn("new SortedList", eng)
+
+    def test_dictionary_lowers_to_std_map(self):
+        """Dictionary<K,V> / Add / Clear → std::map; Vector2Int keys compare."""
+        root = tempfile.mkdtemp(prefix="upack-dict-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Piece.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Piece : MonoBehaviour {\n"
+                "    public Vector2Int location;\n"
+                "    void Update() {}\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Piece.cs.meta"), "w") as f:
+            f.write("guid: piecepiecepiecepiecepiecepiece01\n")
+        with open(os.path.join(scripts, "World.cs"), "w") as f:
+            f.write(
+                "using System.Collections.Generic;\n"
+                "using UnityEngine;\n"
+                "public class World : MonoBehaviour {\n"
+                "    public Piece piece;\n"
+                "    public Dictionary<Vector2Int, Piece> piecesDict ="
+                " new Dictionary<Vector2Int, Piece>();\n"
+                "    void Start() {\n"
+                "        piecesDict.Clear();\n"
+                "        piecesDict.Add(piece.location, piece);\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "World.cs.meta"), "w") as f:
+            f.write("guid: worldworldworldworldworldworld01\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: World\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Piece\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: worldworldworldworldworldworld01}\n"
+                "  piece: {fileID: 12}\n"
+                "--- !u!4 &11\nTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &12\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: piecepiecepiecepiecepiecepiece01}\n"
+                "  location: {x: 1, y: 2}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-dict-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.cpp")) as f:
+            eng = f.read()
+        self.assertIn("#include <map>", eng)
+        self.assertIn("struct Vector2Int", eng)
+        self.assertIn("int compare(const Vector2Int", eng)
+        self.assertIn("std::map<Vector2Int, int> World_piecesDict", eng)
+        self.assertIn(".clear()", eng)
+        self.assertNotIn("new Dictionary", eng)
+        self.assertNotIn("error CS0246", eng)
+
+    def test_list_lowers_to_std_vector(self):
+        """List<T> / new List / Add / Count → std::vector in engine.cpp."""
+        root = tempfile.mkdtemp(prefix="upack-list-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "P.cs"), "w") as f:
+            f.write(
+                "using System.Collections.Generic;\n"
+                "using UnityEngine;\n"
+                "public class P : MonoBehaviour {\n"
+                "    public static List<P> equipped = new List<P>();\n"
+                "    void Start() {\n"
+                "        List<int> xs = new List<int>();\n"
+                "        xs.Add(3);\n"
+                "        int n = xs.Count;\n"
+                "        equipped.Add(this);\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "P.cs.meta"), "w") as f:
+            f.write("guid: listlistlistlistlistlistlistli01\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: P\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: listlistlistlistlistlistlistli01}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-list-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.cpp")) as f:
+            eng = f.read()
+        self.assertIn("#include <vector>", eng)
+        self.assertIn("std::vector<int> xs", eng)
+        self.assertIn("xs.push_back(", eng)
+        self.assertIn("xs.size()", eng)
+        self.assertIn("static std::vector<int> P_equipped", eng)
+        self.assertIn("P_equipped.push_back(", eng)
+        self.assertNotIn("new List", eng)
+        self.assertNotIn("error CS0246", eng)
+
     def test_quaternion_unsupported_member_is_cs0117(self):
         """Unsupported Quaternion members → CS0117 (in scope via UnityEngine)."""
         src = (
