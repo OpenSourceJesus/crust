@@ -58,6 +58,7 @@ action maps / device graphs).
 | `Application.persistentDataPath` | Unity company/product save dir (**Awake/Start only**) |
 | `Application.isEditor` | Always **false** (packed player) |
 | `Application.isPlaying` | Always **true** while the packed player runs |
+| `#if UNITY_EDITOR` / `UNITY_ANDROID` / `UNITY_IOS` | Inactive for pack (desktop standalone defines); `#else` kept |
 | `Application.productName` | Baked `ProjectSettings` `productName` (else project folder name) |
 | `Application.OpenURL(url)` | `system("python3 -c \"import webbrowser; webbrowser.open('…')\"")` |
 | `Application.Quit()` / `Quit(code)` | Sets flag; host polls `engine_wants_quit()` (no Escape/Q shortcut) |
@@ -337,7 +338,13 @@ Pool budget is one slot per instance of each class that calls `AddComponent<T>`
 | `GetComponent<Canvas\|Image\|RectTransform\|…>` | Live `_engine_go_*` maps (RectTransform ≡ GO); seeded authored |
 | `GetComponent<T>` for prefab/scene MBs | Live maps; prefab instances loaded when scene scripts reference `T` |
 | `AddComponent<Canvas>` / `typeof(Canvas)` / `ForceUpdateCanvases` | Refused invent — author `!u!223` in the scene |
+| `List<T>` | ``std::vector`` (MB/component elems → ``int`` indices); ``Add``/``Count`` |
+| `Dictionary<K,V>` / `SortedList<K,V>` | ``std::map`` (``Add``→``[]=``, ``Clear``/``Count``/indexer); string keys via helper |
+| `HashSet` / … | BCL collections not lowered — CS0246 at the type token |
 | `Camera.main` with no scene Camera | Packer will not invent a default camera |
+
+Pack / crust / cpprust failures report as Unity/csc diagnostics
+(`Assets/…(line,col): error CSxxxx: …`), not raw `engine.cpp` subset prose.
 
 ## Tick order
 
