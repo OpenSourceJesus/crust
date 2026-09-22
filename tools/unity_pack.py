@@ -49,6 +49,16 @@ def _assets_rel_path(path):
         return norm
     return os.path.basename(path) if path else "<cs>"
 
+def _cs_diag(path, text, idx, code, message):
+    """Unity/csc diagnostic: `Assets/.../File.cs(line,col): error CSxxxx: …`."""
+    line = text.count("\n", 0, idx) + 1
+    col = idx - (text.rfind("\n", 0, idx) + 1) + 1
+    return "%s(%d,%d): error %s: %s" % (
+        _assets_rel_path(path), line, col, code, message)
+
+
+def _raise_cs(path, text, idx, code, message):
+    raise PackError(_cs_diag(path, text, idx, code, message))
 
 # System.IO.File members we emit. Others → CS0117 (File is in scope via using).
 _FILE_SUPPORTED = frozenset({
@@ -95,14 +105,9 @@ def _check_file_api(path, text, scan):
         if not is_fqn and not has_io:
             continue  # bare File without using — not CS0117
         method_idx = m.start(1) if is_fqn else m.start(2)
-        line = text.count("\n", 0, method_idx) + 1
-        col = method_idx - (text.rfind("\n", 0, method_idx) + 1) + 1
-        raise PackError(
-            "%s(%d,%d): error CS0117: 'File' does not contain a definition "
-            "for '%s'"
-            % (_assets_rel_path(path), line, col, method)
-        )
-
+        _raise_cs(
+            path, text, method_idx, "CS0117",
+            "'File' does not contain a definition for '%s'" % method)
 
 def _check_application_api(path, text, scan):
     """Unsupported Application.Member with UnityEngine in scope → CS0117.
@@ -119,14 +124,9 @@ def _check_application_api(path, text, scan):
         if not is_fqn and not has_ue:
             continue
         member_idx = m.start(1)
-        line = text.count("\n", 0, member_idx) + 1
-        col = member_idx - (text.rfind("\n", 0, member_idx) + 1) + 1
-        raise PackError(
-            "%s(%d,%d): error CS0117: 'Application' does not contain a "
-            "definition for '%s'"
-            % (_assets_rel_path(path), line, col, member)
-        )
-
+        _raise_cs(
+            path, text, member_idx, "CS0117",
+            "'Application' does not contain a definition for '%s'" % member)
 
 def _check_quaternion_api(path, text, scan):
     """Unsupported Quaternion.Member with UnityEngine in scope → Unity CS0117."""
@@ -139,14 +139,9 @@ def _check_quaternion_api(path, text, scan):
         if not is_fqn and not has_ue:
             continue
         member_idx = m.start(1)
-        line = text.count("\n", 0, member_idx) + 1
-        col = member_idx - (text.rfind("\n", 0, member_idx) + 1) + 1
-        raise PackError(
-            "%s(%d,%d): error CS0117: 'Quaternion' does not contain a "
-            "definition for '%s'"
-            % (_assets_rel_path(path), line, col, member)
-        )
-
+        _raise_cs(
+            path, text, member_idx, "CS0117",
+            "'Quaternion' does not contain a definition for '%s'" % member)
 
 def _check_transform_api(path, text, scan):
     """Unsupported MonoBehaviour.transform.Member → Unity CS1061.
@@ -160,16 +155,116 @@ def _check_transform_api(path, text, scan):
         if member in _TRANSFORM_SUPPORTED:
             continue
         member_idx = m.start(1)
-        line = text.count("\n", 0, member_idx) + 1
-        col = member_idx - (text.rfind("\n", 0, member_idx) + 1) + 1
-        raise PackError(
-            "%s(%d,%d): error CS1061: 'Transform' does not contain a "
-            "definition for '%s' and no accessible extension method '%s' "
-            "accepting a first argument of type 'Transform' could be found "
-            "(are you missing a using directive or an assembly reference?)"
-            % (_assets_rel_path(path), line, col, member, member)
-        )
+        _raise_cs(
+            path, text, member_idx, "CS1061",
+            "'Transform' does not contain a definition for '%s' and no "
+            "accessible extension method '%s' accepting a first argument of "
+            "type 'Transform' could be found (are you missing a using "
+            "directive or an assembly reference?)"
+            % (member, member))
 
+_CS0246 = (
+    "The type or namespace name '%s' could not be found (are you missing a "
+    "using directive or an assembly reference?)"
+)
+
+def _blank_unity_editor_regions(text):
+    """Blank ``#if UNITY_EDITOR`` … ``#endif`` bodies (player pack ignores them).
+
+    Nested ``#if`` depth inside an editor region is tracked so OnValidate and
+    other editor-only APIs never reach refuse checks or method lowering.
+    """
+    lines = text.split("\n")
+    out = []
+    depth = 0
+    for line in lines:
+        s = line.lstrip()
+        if s.startswith("#"):
+            low = s.lower()
+            if re.match(r"#if\b", low) and re.search(r"\bunity_editor\b", low):
+                depth += 1
+                out.append(" " * len(line))
+                continue
+            if depth > 0:
+                if low.startswith("#endif"):
+                    depth -= 1
+                elif low.startswith("#if"):
+                    depth += 1
+                out.append(" " * len(line))
+                continue
+            out.append(line)
+            continue
+        if depth > 0:
+            out.append(" " * len(line))
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
+def _check_refused_api(path, text, scan):
+    """Packed-subset refusals → Unity/csc diagnostics at the use site.
+
+    ``using UnityEngine.UI`` is allowed (authored Image/Button fields). Invent
+    (AddComponent&lt;Canvas&gt;, ForceUpdateCanvases, typeof(Canvas) spawn) is not.
+    """
+    # Scripted Canvas invent — not authored !u!223.
+    m = re.search(
+            r"AddComponent\s*<\s*(?:UnityEngine\.)?(Canvas)\s*>", scan)
+    if m:
+        _raise_cs(path, text, m.start(1), "CS0246", _CS0246 % "Canvas")
+    m = re.search(r"typeof\s*\(\s*(Canvas)\s*\)", scan)
+    if m:
+        _raise_cs(path, text, m.start(1), "CS0246", _CS0246 % "Canvas")
+    m = re.search(r"Canvas\.(ForceUpdateCanvases)\b", scan)
+    if m:
+        _raise_cs(
+            path, text, m.start(1), "CS0117",
+            "'Canvas' does not contain a definition for 'ForceUpdateCanvases'")
+    m = re.search(r"(?<![\w.])InputAction\b", scan)
+    if m:
+        _raise_cs(path, text, m.start(), "CS0246", _CS0246 % "InputAction")
+    # Member forms analyze maps to refused keys (Emit / Evaluate / current).
+    m = re.search(r"ParticleSystem\.(Emit)\b", scan)
+    if m:
+        _raise_cs(
+            path, text, m.start(1), "CS0117",
+            "'ParticleSystem' does not contain a definition for 'Emit'")
+    m = re.search(r"AnimationCurve\.(Evaluate)\b", scan)
+    if m:
+        _raise_cs(
+            path, text, m.start(1), "CS0117",
+            "'AnimationCurve' does not contain a definition for 'Evaluate'")
+    m = re.search(r"(?<![\w.])Gamepad\.(current)\b", scan)
+    if m:
+        _raise_cs(
+            path, text, m.start(1), "CS0117",
+            "'Gamepad' does not contain a definition for 'current'")
+    # Keyboard.current without UnityEngine.InputSystem in scope.
+    has_input_system = bool(
+        re.search(r"using\s+UnityEngine\.InputSystem\b", scan)
+        or re.search(r"UnityEngine\.InputSystem\.Keyboard\b", scan)
+    )
+    if (not has_input_system
+            and (re.search(r"(?<![\w.])Keyboard\.current\b", scan)
+                 or _KEYBOARD_KEY.search(scan))):
+        km = re.search(r"(?<![\w.])Keyboard\b", scan)
+        if km:
+            _raise_cs(path, text, km.start(), "CS0246",
+                      _CS0246 % "Keyboard")
+    # Bare Console.WriteLine without using System / FQN.
+    has_system = bool(re.search(r"using\s+System\b", scan))
+    if (not has_system
+            and not re.search(r"System\.Console\.WriteLine\s*\(", scan)
+            and re.search(r"(?<![\w.])Console\.WriteLine\s*\(", scan)):
+        m = re.search(r"(?<![\w.])Console\b", scan)
+        if m:
+            _raise_cs(path, text, m.start(), "CS0246", _CS0246 % "Console")
+    # AddComponent<T> for invent-refused builtins (Canvas / …).
+    for m in re.finditer(
+            r"AddComponent\s*<\s*(?:UnityEngine\.)?(\w+)\s*>", scan):
+        t = m.group(1)
+        if t in _REFUSED_ADDCOMPONENT:
+            _raise_cs(path, text, m.start(1), "CS0246", _CS0246 % t)
 
 def _check_csharp_lex(path, text):
     """Refuse spellings Unity/csc reject before any rewrite.
@@ -178,37 +273,31 @@ def _check_csharp_lex(path, text):
     C++-style `0.f` lexes as integer `0`, member access `.`, identifier `f`
     → CS1061. Catch it here so diagnostics stay against C# source.
     """
+    text = _blank_unity_editor_regions(text)
     scan = cs2cpp._blank(text)
     for m in re.finditer(r"(?<![\w.])\d+\.([fFdDmM])\b", scan):
         suffix = m.group(1)
-        idx = m.start(1)
-        line = text.count("\n", 0, idx) + 1
-        col = idx - (text.rfind("\n", 0, idx) + 1) + 1
-        raise PackError(
-            "%s(%d,%d): error CS1061: 'int' does not contain a definition "
-            "for '%s' and no accessible extension method '%s' accepting a "
-            "first argument of type 'int' could be found (are you missing a "
-            "using directive or an assembly reference?)"
-            % (_assets_rel_path(path), line, col, suffix, suffix)
-        )
+        _raise_cs(
+            path, text, m.start(1), "CS1061",
+            "'int' does not contain a definition for '%s' and no accessible "
+            "extension method '%s' accepting a first argument of type 'int' "
+            "could be found (are you missing a using directive or an "
+            "assembly reference?)"
+            % (suffix, suffix))
     # transform.position is Vector3; += Vector2 is ambiguous (CS0034).
     # Assignment `= new Vector2(...)` is fine via Vector2→Vector3 implicit.
     for m in re.finditer(
             r"transform\.position\s*(?:\+=|-=)\s*new\s+Vector2\b", scan):
-        idx = m.start()
-        line = text.count("\n", 0, idx) + 1
-        col = idx - (text.rfind("\n", 0, idx) + 1) + 1
-        raise PackError(
-            "%s(%d,%d): error CS0034: Operator '%s' is ambiguous on "
-            "operands of type 'Vector3' and 'Vector2'"
-            % (_assets_rel_path(path), line, col,
-               "+=" if "+=" in m.group(0) else "-=")
-        )
+        _raise_cs(
+            path, text, m.start(), "CS0034",
+            "Operator '%s' is ambiguous on operands of type 'Vector3' and "
+            "'Vector2'"
+            % ("+=" if "+=" in m.group(0) else "-="))
     _check_file_api(path, text, scan)
     _check_application_api(path, text, scan)
     _check_quaternion_api(path, text, scan)
     _check_transform_api(path, text, scan)
-
+    _check_refused_api(path, text, scan)
 
 # Built-in Unity components AddComponent may create at runtime.
 _ADDABLE_BUILTINS = frozenset((
@@ -345,8 +434,8 @@ _REFUSED_API = {
         "UI from scripts."
     ),
     "Canvas": (
-        "Scripted Canvas access is not emitted — author a !u!223 Canvas + "
-        "Image in the scene. AddComponent<Canvas> is refused."
+        "Scripted Canvas invent (AddComponent / typeof / ForceUpdateCanvases) "
+        "is refused — author a !u!223 Canvas + Image in the scene."
     ),
 }
 
@@ -3269,21 +3358,39 @@ def _gos_with_sprite(plan):
     return names
 
 
-def _validate_addcomponent_types(types, plan):
+def _validate_addcomponent_types(types, plan, analyses=None):
     known = set(plan.get("classes") or {}) | _ADDABLE_BUILTINS
+    analyses = analyses or []
     for t in sorted(types):
-        if t in _REFUSED_ADDCOMPONENT:
-            raise PackError(
-                "AddComponent<%s>: unity_pack does not invent %s assets / "
-                "systems. Keep that component in the authored Unity project."
-                % (t, t))
-        if t not in known:
+        if t in _REFUSED_ADDCOMPONENT or t not in known:
+            # Prefer Unity-style site from AddComponent<T> in scripts.
+            for a in analyses:
+                path = a.get("path") or ""
+                text = None
+                for c in a.get("classes") or []:
+                    if c.get("file_text") is not None:
+                        text = c["file_text"]
+                        break
+                if text is None and path and os.path.isfile(path):
+                    text = _read(path)
+                if not text:
+                    continue
+                scan = cs2cpp._blank(text)
+                m = re.search(
+                    r"AddComponent\s*<\s*(?:UnityEngine\.)?(%s)\s*>" % re.escape(t),
+                    scan)
+                if m:
+                    _raise_cs(path, text, m.start(1), "CS0246", _CS0246 % t)
+            if t in _REFUSED_ADDCOMPONENT:
+                raise PackError(
+                    "AddComponent<%s>: unity_pack does not invent %s assets / "
+                    "systems. Keep that component in the authored Unity project."
+                    % (t, t))
             raise PackError(
                 "AddComponent<%s>: no packed %s — add an authored scene "
                 "instance of that MonoBehaviour, or use a supported builtin "
                 "(%s)."
                 % (t, t, ", ".join(sorted(_ADDABLE_BUILTINS))))
-
 
 def _rewrite_addcomponent(text, plan, this_class):
     """Lower gameObject.AddComponent<T>() / AddComponent<T>() to C helpers.
@@ -4276,6 +4383,8 @@ def analyze_script(path, text=None):
     """Fields, methods, Unity API used, whether the script spawns."""
     if text is None:
         text = _read(path)
+    # Player pack: editor-only regions are not code.
+    text = _blank_unity_editor_regions(text)
     _check_csharp_lex(path, text)
     scan = cs2cpp._blank(text)
     apis = set()
@@ -4542,7 +4651,6 @@ def analyze_script(path, text=None):
         "literals": [int(x) for x in re.findall(r"(?<![\w.])(\d+)", scan)
                      if int(x) < 1 << 20],
     }
-
 
 _PRIM = ("int", "float", "bool", "byte", "short", "uint", "long",
          "double", "sbyte", "ushort", "ulong")
@@ -11421,6 +11529,45 @@ def _crust_compile_c(text, path, defines=None):
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
+def _refused_api_site(analyses, api):
+    """First (path, text, idx) for a refused API token, or None."""
+    patterns = {
+        "Canvas": (
+            r"AddComponent\s*<\s*(?:UnityEngine\.)?(Canvas)\s*>|"
+            r"typeof\s*\(\s*(Canvas)\s*\)|"
+            r"Canvas\.(ForceUpdateCanvases)\b"
+        ),
+        "InputAction": r"(?<![\w.])InputAction\b",
+        "ParticleSystem.Emit": r"ParticleSystem\.(Emit)\b",
+        "AnimationCurve.Evaluate": r"AnimationCurve\.(Evaluate)\b",
+        "Gamepad.current": r"(?<![\w.])Gamepad\.(current)\b",
+        "Keyboard": r"(?<![\w.])Keyboard\b",
+        "Console": r"(?<![\w.])Console\b",
+    }
+    pat = patterns.get(api)
+    if not pat:
+        return None
+    for a in analyses:
+        path = a.get("path") or ""
+        text = None
+        for c in a.get("classes") or []:
+            if c.get("file_text") is not None:
+                text = c["file_text"]
+                break
+        if text is None and path and os.path.isfile(path):
+            text = _read(path)
+        if not text:
+            continue
+        scan = cs2cpp._blank(text)
+        m = re.search(pat, scan)
+        if m:
+            idx = m.start()
+            for g in range(1, (m.lastindex or 0) + 1):
+                if m.start(g) >= 0:
+                    idx = m.start(g)
+                    break
+            return path, text, idx
+    return None
 
 def pack(root, outdir, soa=False, soa_vec4=False):
     objects, analyses, lights, cameras, hierarchy = load_project(root)
@@ -11428,8 +11575,21 @@ def pack(root, outdir, soa=False, soa_vec4=False):
     for a in analyses:
         used_apis |= a["apis"]
     for api, reason in sorted(_REFUSED_API.items()):
-        if api in used_apis:
-            raise PackError("%s: %s" % (api, reason))
+        if api not in used_apis:
+            continue
+        site = _refused_api_site(analyses, api)
+        if site:
+            path, text, idx = site
+            if "." in api and api != "UnityEngine.UI":
+                ty, member = api.split(".", 1)
+                _raise_cs(
+                    path, text, idx, "CS0117",
+                    "'%s' does not contain a definition for '%s'"
+                    % (ty, member))
+            else:
+                _raise_cs(path, text, idx, "CS0246", _CS0246 % (
+                    api if api != "Canvas" else "Canvas"))
+        raise PackError("%s: %s" % (api, reason))
     add_types = _collect_addcomponent_types(analyses)
     if "Camera.main" in used_apis and not cameras:
         raise PackError(
@@ -11443,7 +11603,7 @@ def pack(root, outdir, soa=False, soa_vec4=False):
         plan = dict(plan)
         plan["soa"] = False
         plan["soa_vec4"] = False
-    _validate_addcomponent_types(add_types, plan)
+    _validate_addcomponent_types(add_types, plan, analyses)
     plan["addcomponent_types"] = sorted(add_types)
     plan["addcomponent_budget"] = _addcomponent_budget(analyses, plan)
     plan["disallow_multiple_types"] = sorted(_disallow_multiple_types(analyses))

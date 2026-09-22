@@ -4393,7 +4393,27 @@ class TestSystems(unittest.TestCase):
             )
         with self.assertRaises(unity_pack.PackError) as cm:
             unity_pack.pack(root, tempfile.mkdtemp(prefix="upack-out-"))
-        self.assertIn("ParticleSystem", cm.exception.message)
+        msg = cm.exception.message
+        self.assertIn("Assets/Scripts/Spark.cs(", msg)
+        self.assertIn("error CS0117", msg)
+        self.assertIn("ParticleSystem", msg)
+        self.assertIn("Emit", msg)
+
+    def test_refuses_canvas_is_cs0246_with_site(self):
+        """AddComponent<Canvas> invent → CS0246 at the type token."""
+        src = (
+            "using UnityEngine;\n"
+            "public class Sel : MonoBehaviour {\n"
+            "    void Start() { gameObject.AddComponent<Canvas>(); }\n"
+            "}\n"
+        )
+        path = "/proj/Assets/Scripts/Unity Overrides/_Selectable.cs"
+        with self.assertRaises(unity_pack.PackError) as cm:
+            unity_pack.analyze_script(path, src)
+        self.assertIn("error CS0246", cm.exception.message)
+        self.assertIn("Canvas", cm.exception.message)
+        self.assertIn("Assets/Scripts/Unity Overrides/_Selectable.cs(",
+                      cm.exception.message)
 
     def test_ast_find_getcomponent_chain(self):
         """cpprust paren/angle parse of Find().GetComponent<T>().field."""
@@ -4582,10 +4602,13 @@ class TestSystems(unittest.TestCase):
             )
         with self.assertRaises(unity_pack.PackError) as cm:
             unity_pack.pack(root, tempfile.mkdtemp(prefix="upack-out-"))
-        self.assertIn("Keyboard", cm.exception.message)
-        self.assertIn("InputSystem", cm.exception.message)
+        msg = cm.exception.message
+        self.assertIn("Assets/Scripts/PadBare.cs(", msg)
+        self.assertIn("error CS0246", msg)
+        self.assertIn("Keyboard", msg)
 
     @needs_cc
+
     def test_debug_log_and_print_go_to_player_log(self):
         """Debug.Log / print → Unity Player.log path; not stdout unless -logFile -."""
         root = tempfile.mkdtemp(prefix="upack-log-")
@@ -4877,18 +4900,19 @@ class TestSystems(unittest.TestCase):
                 "    public InputAction move;\n"
                 "    public void Update() { move.ReadValue<float>(); }\n"
                 "}\n",
-                "InputAction",
+                ("CS0246", "InputAction"),
             ),
             (
                 "using UnityEngine;\n"
-                "using UnityEngine.UI;\n"
                 "public class Hud : MonoBehaviour {\n"
-                "    public void Update() { }\n"
+                "    void Start() {\n"
+                "        gameObject.AddComponent<Canvas>();\n"
+                "    }\n"
                 "}\n",
-                "UnityEngine.UI",
+                ("CS0246", "Canvas"),
             ),
         ]
-        for src, needle in cases:
+        for src, needles in cases:
             root = tempfile.mkdtemp(prefix="upack-refuse-")
             scripts = os.path.join(root, "Assets", "Scripts")
             os.makedirs(scripts)
@@ -4914,8 +4938,11 @@ class TestSystems(unittest.TestCase):
                 )
             with self.assertRaises(unity_pack.PackError) as cm:
                 unity_pack.pack(root, tempfile.mkdtemp(prefix="upack-out-"))
-            self.assertIn(needle, cm.exception.message)
-
+            msg = cm.exception.message
+            self.assertIn("Assets/Scripts/X.cs(", msg)
+            self.assertIn(": error ", msg)
+            for needle in needles:
+                self.assertIn(needle, msg)
 
 @needs_cc
 class TestSystemsRuns(unittest.TestCase):
