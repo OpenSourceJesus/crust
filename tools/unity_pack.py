@@ -3210,9 +3210,9 @@ def _ast_find_getcomponent_chains(text):
             "field": field,
             "axis": axis,
         })
-    # Standalone this.GetComponent<T>() / GetComponent<T>()
+    # Standalone this.GetComponent<T>() / GetComponent<T>() — not recv.GetComponent.
     for m in re.finditer(
-            r"(?:(?<![\w.])this\s*\.\s*)?GetComponent\s*<", scan):
+            r"(?:(?<![\w.])this\s*\.\s*)?(?<![\w.])GetComponent\s*<", scan):
         # Skip if already covered as part of a Find chain.
         if any(c["start"] <= m.start() < c["end"] for c in out):
             continue
@@ -3247,6 +3247,46 @@ def _ast_find_getcomponent_chains(text):
             "field": field,
             "axis": axis,
             "on_this": True,
+        })
+    # recv.GetComponent<T>() — GO / component handle is already an index.
+    for m in re.finditer(r"(?<![\w.])(\w+)\s*\.\s*GetComponent\s*<", scan):
+        recv = m.group(1)
+        if recv == "this":
+            continue
+        if any(c["start"] <= m.start() < c["end"] for c in out):
+            continue
+        angle_open = m.end() - 1
+        angle_close = cpprust._match_angle(scan, angle_open)
+        if angle_close is None:
+            continue
+        comp_ty, type_idx = _comp_type_span(angle_open, angle_close)
+        after_angle = scan[angle_close + 1:]
+        if after_angle.find("(") < 0:
+            continue
+        g_open = angle_close + 1 + after_angle.find("(")
+        g_close = cpprust._match_paren(scan, g_open)
+        if g_close is None:
+            continue
+        end = g_close + 1
+        field = None
+        axis = None
+        fm = re.match(
+            r"\s*\.\s*([A-Za-z_]\w*)\b(?:\s*\.\s*([xyz]))?",
+            scan[end:])
+        if fm:
+            field = fm.group(1)
+            axis = fm.group(2)
+            end = end + fm.end()
+        out.append({
+            "start": m.start(),
+            "end": end,
+            "find_args": None,
+            "component": comp_ty,
+            "type_idx": type_idx,
+            "field": field,
+            "axis": axis,
+            "recv": recv,
+            "on_this": False,
         })
     out.sort(key=lambda c: c["start"], reverse=True)
     return out
@@ -4702,6 +4742,26 @@ def _rewrite_find_getcomponent(text, plan, this_class, site=None):
 
         find_args = ch.get("find_args") or ""
         go_expr = "GameObject_Find(%s)" % find_args
+        if ch.get("recv"):
+            # newGo.GetComponent<T>() — recv is a GO / component index.
+            recv = ch["recv"]
+            if recv in ("gameObject", "this"):
+                go_expr = "_engine_go_of_%s(i)" % _c_ident(this_class)
+            else:
+                go_expr = recv
+            if not comp:
+                repl = go_expr
+            else:
+                if not _known_component(comp):
+                    _raise_unknown_comp(ch, comp)
+                if field:
+                    repl = _field_after_get(
+                        comp, field, go_expr, line, axis, body_idx)
+                else:
+                    repl = "GameObject_GetComponent_%s(%s)" % (
+                        _c_ident(comp), go_expr)
+            text = text[:ch["start"]] + repl + text[ch["end"]:]
+            continue
         if not comp:
             repl = go_expr
         else:
@@ -4722,12 +4782,19 @@ def _rewrite_find_getcomponent(text, plan, this_class, site=None):
     return text
 
 
-def analyze_script(path, text=None):
-    """Fields, methods, Unity API used, whether the script spawns."""
+def analyze_script(path, text=None, shallow=False):
+    """Fields, methods, Unity API used, whether the script spawns.
+
+    *shallow*: fields / type only (no method bodies). Used for GetComponent
+    targets pulled in by reference so vendor APIs inside Fracture() etc. do
+    not refuse the pack — instances and live GO maps still pack.
+    """
     if text is None:
         text = _read(path)
     # Player pack: editor-only regions are not code.
     text = _blank_unity_editor_regions(text)
+    if shallow:
+        text = _blank_method_bodies(text)
     _check_csharp_lex(path, text)
     scan = cs2cpp._blank(text)
     apis = set()
@@ -5162,12 +5229,27 @@ def _member_init_default(cl, member_name):
 
 
 def _methods_in(body, bscan, body_abs=0):
+    # Control-flow / type keywords must not look like `ret Name(...) {`.
+    _NOT_METHOD = frozenset((
+        "if", "else", "for", "foreach", "while", "do", "switch", "case",
+        "catch", "using", "lock", "fixed", "return", "new", "typeof",
+        "sizeof", "checked", "unchecked", "await", "throw", "goto",
+        "break", "continue", "default", "in", "out", "ref", "is", "as",
+        "true", "false", "null", "this", "base", "get", "set", "add",
+        "remove", "where", "select", "from", "when",
+    ))
     out = []
     for m in re.finditer(
             r"(?m)^[ \t]*(?:public|private|protected|internal)?"
             r"[ \t]*(?:static[ \t]+)?(?:override[ \t]+)?(?:virtual[ \t]+)?"
             r"([\w.<>]+)[ \t]+(\w+)[ \t]*\(([^)]*)\)\s*\{",
             bscan):
+        ret, name = m.group(1).strip(), m.group(2)
+        # `else if (...) {` → ret=else, name=if — not a method.
+        if ret in _NOT_METHOD or name in _NOT_METHOD:
+            continue
+        if "." in ret and ret.split(".")[-1] in _NOT_METHOD:
+            continue
         open_i = m.end() - 1
         # _match_brace lives on cpprust; cs2cpp uses it via import.
         import tools.cpprust as cpprust
@@ -5178,8 +5260,8 @@ def _methods_in(body, bscan, body_abs=0):
         impl = body[m.end():m.start() + (close - m.start())]
         decl = m.group(0)
         out.append({
-            "ret": m.group(1).strip(),
-            "name": m.group(2),
+            "ret": ret,
+            "name": name,
             "args": m.group(3).strip(),
             "body": impl,
             "body_abs": int(body_abs) + int(m.end()),
@@ -6677,7 +6759,7 @@ def emit_engine(plan, analyses, used_apis):
         go_comps = plan.get("go_components") or {}
         go_rb2d = plan.get("go_rigidbody2d") or {}
         go_rb3d = plan.get("go_rigidbody") or {}
-        p("/* GameObject.Find / GetComponent — authored scene tables only */")
+        p("/* GameObject.Find / GetComponent — live GO tables (seeded authored) */")
         p("static const int _engine_go_count = %d;" % len(go_names))
         if go_names:
             p("static const char *_engine_go_name[%d] = {" % len(go_names))
@@ -6727,7 +6809,12 @@ def emit_engine(plan, analyses, used_apis):
             if not vals:
                 vals = ["-1"]
             mb_budget = int(add_budget.get(cname) or 0)
-            if mb_budget:
+            # Live GO→component map whenever GetComponent/AddComponent can run.
+            live_go = (
+                mb_budget
+                or cname in getcomponent_types
+                or "GetComponent" in used_apis)
+            if live_go:
                 p("static int _engine_go_%s[%d] = { %s };" % (
                     idn, len(vals), ", ".join(vals)))
             else:
@@ -6741,7 +6828,7 @@ def emit_engine(plan, analyses, used_apis):
                 if cname in cmap and n in go_names:
                     gi = go_names.index(n)
                     rev[cmap[cname]] = str(gi)
-            if mb_budget:
+            if live_go:
                 p("static int _engine_%s_go_of[%d] = { %s };" % (
                     idn, len(rev), ", ".join(rev)))
             else:
@@ -6774,8 +6861,17 @@ def emit_engine(plan, analyses, used_apis):
             p("    return _object_tostring_buf;")
             p("}")
             p("")
-        # Authored uGUI GetComponent<T> — opaque GO handles (not AddComponent invent).
-        ui_gc = sorted(getcomponent_types & _UI_GETCOMPONENT_TYPES)
+        # RectTransform ≡ Transform ≡ GO index (live handle, no side table).
+        if "RectTransform" in getcomponent_types and want_go_tables:
+            p("static int GameObject_GetComponent_RectTransform(int go) {")
+            p("    if (go < 0 || go >= _engine_go_count) return -1;")
+            p("    return go;")
+            p("}")
+            p("")
+        # Live uGUI GetComponent maps (mutable; seeded from authored presence).
+        ui_gc = sorted(
+            (getcomponent_types & _UI_GETCOMPONENT_TYPES)
+            - {"RectTransform"})
         if ui_gc and want_go_tables:
             ui_maps = plan.get("go_ui_components") or {}
             go_n = max(1, len(go_names))
@@ -6784,14 +6880,12 @@ def emit_engine(plan, analyses, used_apis):
                 present = set(ui_maps.get(ty) or [])
                 vals = []
                 for i, n in enumerate(go_names if go_names else [""]):
-                    if ty == "RectTransform":
-                        vals.append(str(i))
-                    elif n in present:
+                    if n in present:
                         vals.append(str(i))
                     else:
                         vals.append("-1")
-                p("/* GetComponent<%s> — authored UI; handle is GO index */" % ty)
-                p("static const int _engine_go_%s[%d] = { %s };" % (
+                p("/* GetComponent<%s> — live GO map */" % ty)
+                p("static int _engine_go_%s[%d] = { %s };" % (
                     idn, go_n, ", ".join(vals)))
                 p("static int GameObject_GetComponent_%s(int go) {" % idn)
                 p("    if (go < 0 || go >= _engine_go_count) return -1;")
@@ -7405,6 +7499,26 @@ def emit_engine(plan, analyses, used_apis):
     p("    return s ? -f : f;")
     p("}")
     p("")
+    p("static uint16_t f32_to_f16(float f) {")
+    p("    unsigned s = 0;")
+    p("    int e = 0;")
+    p("    unsigned m;")
+    p("    float a;")
+    p("    if (f < 0.f) { s = 1u; f = -f; }")
+    p("    if (f == 0.f) return (uint16_t)(s << 15);")
+    p("    a = f;")
+    p("    while (a >= 2.f && e < 15) { a = a * 0.5f; e = e + 1; }")
+    p("    while (a < 1.f && e > -14) { a = a * 2.f; e = e - 1; }")
+    p("    if (e > -14)")
+    p("        m = (unsigned)((a - 1.f) * 1024.f + 0.5f);")
+    p("    else")
+    p("        m = (unsigned)(a * 1024.f + 0.5f);")
+    p("    if (m >= 1024u) { m = 0; e = e + 1; }")
+    p("    if (e > 15) return (uint16_t)((s << 15) | 0x7c00u);")
+    p("    if (e < -14) return (uint16_t)(s << 15);")
+    p("    return (uint16_t)((s << 15) | ((unsigned)(e + 15) << 10) | (m & 1023u));")
+    p("}")
+    p("")
 
     if want_ctor_forbidden:
         p("/* Application.dataPath / persistentDataPath in field/.cctor. */")
@@ -7856,6 +7970,8 @@ def emit_engine(plan, analyses, used_apis):
             if kind == "f16":
                 p("static float %s_get_%s(unsigned i) { return f16_to_f32(%s_AT(i).%s); }"
                   % (idn, name, idn, name))
+                p("static void %s_set_%s(unsigned i, float v) { %s_AT(i).%s = f32_to_f16(v); }"
+                  % (idn, name, idn, name))
             elif kind == "f32":
                 p("static float %s_get_%s(unsigned i) { return %s_AT(i).%s; }"
                   % (idn, name, idn, name))
@@ -7892,6 +8008,13 @@ def emit_engine(plan, analyses, used_apis):
             body = _lower_method_body(
                 m["body"], cl, plan, site=site,
                 collision2d_param=coll_param)
+            # Site marker so crust/shivyc failures map back to C#.
+            cs_line = 1
+            ft = site.get("file_text") or ""
+            if ft and site.get("body_abs"):
+                cs_line = ft.count("\n", 0, int(site["body_abs"])) + 1
+            p("/* unity_pack:site %s:%d */" % (
+                site.get("path") or "<cs>", cs_line))
             if coll_param:
                 p("static void %s_%s(unsigned i, int %s) {"
                   % (idn, m["name"], coll_param))
@@ -11915,6 +12038,58 @@ def emit_shader_compiler(platform):
 # Drive
 # ---------------------------------------------------------------------------
 
+def _mb_typename_to_script(root, guids):
+    """MonoBehaviour class name → authored .cs path under Assets/."""
+    out = {}
+    for _g, path in (guids or {}).items():
+        if not path or not _is_player_csharp(root, path):
+            continue
+        name = _class_name_from_cs(path)
+        if name:
+            out.setdefault(name, os.path.abspath(path))
+    return out
+
+
+def _script_guid_for_path(guids, script_path):
+    want = os.path.abspath(script_path)
+    for g, path in (guids or {}).items():
+        if path and os.path.abspath(path) == want:
+            return g
+    return None
+
+
+def _load_prefab_objects_for_types(root, type_names, guids, assets, typename_map):
+    """Parse .prefab assets that author *type_names* MonoBehaviours."""
+    if not type_names:
+        return []
+    want_guids = set()
+    for t in type_names:
+        sp = typename_map.get(t)
+        if not sp:
+            continue
+        g = _script_guid_for_path(guids, sp)
+        if g:
+            want_guids.add(g.lower())
+    if not want_guids:
+        return []
+    out = []
+    prefabs = list(_walk_files(root, (".prefab",)))
+    for pi, path in enumerate(prefabs):
+        raw = _read(path)
+        low = raw.lower()
+        if not any(g in low for g in want_guids):
+            continue
+        if prefabs and ((pi + 1) % 25 == 0 or pi + 1 == len(prefabs)):
+            _progress("  prefab %d/%d %s" % (
+                pi + 1, len(prefabs), os.path.basename(path)))
+        objs, _l, _c, _h = parse_unity_yaml(
+            raw, guid_to_script=guids, asset_guids=assets)
+        for o in objs:
+            if o.get("class") in type_names:
+                out.append(o)
+    return out
+
+
 def load_project(root):
     root = os.path.abspath(root)
     if not os.path.isdir(root):
@@ -11923,6 +12098,7 @@ def load_project(root):
     _progress("reading .meta guid maps")
     assets = _asset_guid_map(root)
     guids = _guid_map(root, asset_guids=assets)
+    typename_map = _mb_typename_to_script(root, guids)
     objects = []
     lights = []
     cameras = []
@@ -11964,6 +12140,43 @@ def load_project(root):
         if scripts and ((i + 1) % 25 == 0 or i + 1 == len(scripts)):
             _progress("  scripts %d/%d" % (i + 1, len(scripts)))
         analyses.append(analyze_script(p))
+
+    # GetComponent / field refs to other authored MBs — pull instances from
+    # prefabs and shallow-analyze those scripts (live GO maps, no vendor emit).
+    needed = set()
+    for a in analyses:
+        needed |= set(a.get("getcomponent_types") or [])
+        needed |= set(a.get("addcomponent_types") or [])
+        for c in a.get("classes") or []:
+            for f in c.get("fields") or []:
+                ty = f.get("ty") or ""
+                if ty in typename_map:
+                    needed.add(ty)
+    have_classes = {o.get("class") for o in objects}
+    missing = sorted(
+        t for t in needed
+        if t not in have_classes
+        and t not in _ADDABLE_BUILTINS
+        and t not in _PHYSICS_COMPONENTS
+        and t not in _UI_GETCOMPONENT_TYPES
+        and t in typename_map)
+    if missing:
+        _progress("loading prefab components for %s" % ", ".join(missing))
+        prefab_objs = _load_prefab_objects_for_types(
+            root, set(missing), guids, assets, typename_map)
+        objects.extend(prefab_objs)
+        for t in missing:
+            sp = typename_map[t]
+            if any(os.path.abspath(a.get("path") or "") == sp for a in analyses):
+                continue
+            a = analyze_script(sp, shallow=True)
+            for c in a.get("classes") or []:
+                c["methods"] = []  # pack type + instances; don't lower Fracture
+            a["apis"] = set()
+            a["getcomponent_types"] = set()
+            a["addcomponent_types"] = set()
+            analyses.append(a)
+
     have = set()
     for a in analyses:
         for c in a["classes"]:
@@ -12045,14 +12258,15 @@ def emit_soa_positions_glsl(plan):
     return "\n".join(lines) + "\n"
 
 
-def validate_emitted_c(text, path="engine.c"):
+def validate_emitted_c(text, path="engine.c", analyses=None):
     """Gate generated C through cpprust, then compile the result with crust.
 
     unity_pack lowers by hand; this proves the result still sits inside the
     crust subset that `tools/cpprust.py` accepts — `_check_unsupported` plus
     a full `translate` pass (the csrust C++ half). The translated C is then
     compiled with `shivyc` so pack fails if crust cannot build it. Raises
-    PackError on subset violations or crust compile failure.
+    PackError on subset violations or crust compile failure (Unity-style site
+    when a ``unity_pack:site`` marker or field accessor maps to authored C#).
     """
     import tools.cpprust as cpprust
     try:
@@ -12063,11 +12277,86 @@ def validate_emitted_c(text, path="engine.c"):
         raise PackError(
             "emitted %s left the crust / cpprust subset: %s"
             % (path, e.message))
-    _crust_compile_c(translated, path)
+    _crust_compile_c(translated, path, analyses=analyses, source_text=translated)
     return translated
 
 
-def _crust_compile_c(text, path, defines=None):
+def _strip_ansi(s):
+    return re.sub(r"\x1b\[[0-9;]*m", "", s or "")
+
+
+def _crust_error_to_unity(err, source_text=None, analyses=None):
+    """Map shivyc/clang diagnostics to Unity ``Assets/…(line,col): error …``."""
+    err = _strip_ansi(err)
+    # Undeclared Class_set_field / Class_get_field → field token in C#.
+    m = re.search(r"undeclared identifier ['\"](\w+)['\"]", err)
+    if m and analyses:
+        ident = m.group(1)
+        am = re.match(r"^(\w+)_(set|get)_(\w+)$", ident)
+        if am:
+            cls_idn, _op, field = am.group(1), am.group(2), am.group(3)
+            site = _csharp_field_site(analyses, cls_idn, field)
+            if site:
+                path, text, idx = site
+                return _cs_diag(
+                    path, text, idx, "CS0103",
+                    "The name '%s' does not exist in the current context"
+                    % field)
+    # tu.c:LINE:COL: error: … → nearest unity_pack:site marker above LINE.
+    lm = re.search(
+        r"(?:^|\n)(?:.*?[/\\])?tu\.c:(\d+)(?::(\d+))?:\s*error:\s*(.+)",
+        err)
+    if lm and source_text:
+        line_no = int(lm.group(1))
+        msg = lm.group(3).strip()
+        lines = source_text.split("\n")
+        site_path, site_line = None, 1
+        for i in range(min(line_no, len(lines)) - 1, -1, -1):
+            sm = re.match(
+                r"\s*/\*\s*unity_pack:site\s+(\S+):(\d+)\s*\*/",
+                lines[i])
+            if sm:
+                site_path, site_line = sm.group(1), int(sm.group(2))
+                break
+        if site_path:
+            return "%s(%d,1): error CS0000: %s" % (
+                _assets_rel_path(site_path), site_line, msg)
+    # Last resort: still Unity-shaped, not a raw /tmp path dump.
+    first = err.split("\n")[0].strip() if err else "crust compile failed"
+    first = re.sub(r"^.*?tu\.c:\d+(?::\d+)?:\s*", "", first)
+    first = re.sub(r"^error:\s*", "", first)
+    return "<generated>(1,1): error CS0000: %s" % (first or "crust compile failed")
+
+
+def _csharp_field_site(analyses, class_idn, field):
+    """(path, text, idx) of field name in class *class_idn*, or None."""
+    for a in analyses or []:
+        path = a.get("path") or ""
+        text = None
+        for c in a.get("classes") or []:
+            cname = c.get("name") or ""
+            if _c_ident(cname) != class_idn and cname != class_idn:
+                continue
+            if c.get("file_text") is not None:
+                text = c["file_text"]
+            break
+        if text is None and path and os.path.isfile(path):
+            text = _read(path)
+        if not text:
+            continue
+        scan = cs2cpp._blank(text)
+        # Prefer assignment / compound assign of the field.
+        m = re.search(
+            r"(?<![_\w])(%s)\s*(?:\+=|-=|\*=|/=|=(?!=))" % re.escape(field),
+            scan)
+        if not m:
+            m = re.search(r"(?<![_\w])(%s)(?![\w])" % re.escape(field), scan)
+        if m:
+            return path, text, m.start(1)
+    return None
+
+
+def _crust_compile_c(text, path, defines=None, analyses=None, source_text=None):
     """Compile *text* with shivyc/crust; raise PackError on failure."""
     import shutil
     import subprocess
@@ -12095,9 +12384,10 @@ def _crust_compile_c(text, path, defines=None):
         r = subprocess.run(cmd, capture_output=True, text=True, cwd=repo)
         if r.returncode != 0:
             err = (r.stderr or r.stdout or "").strip()
-            raise PackError(
-                "emitted %s failed crust/shivyc compile: %s"
-                % (path, err or ("exit %d" % r.returncode)))
+            raise PackError(_crust_error_to_unity(
+                err or ("exit %d" % r.returncode),
+                source_text=source_text or text,
+                analyses=analyses))
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -12290,11 +12580,11 @@ def pack(root, outdir, soa=False, soa_vec4=False):
         "/* generated by tools/unity_pack.py — C++ subset for cpprust */\n"
         + (main_c.split("\n", 1)[1] if main_c.startswith("/*") else main_c))
     _progress("validating engine.c through cpprust + crust")
-    validate_emitted_c(engine_cpp, "engine.cpp")
+    validate_emitted_c(engine_cpp, "engine.cpp", analyses=analyses)
     _progress("validating data.c through cpprust + crust")
-    validate_emitted_c(data_cpp, "data.cpp")
+    validate_emitted_c(data_cpp, "data.cpp", analyses=analyses)
     _progress("validating main.c through cpprust + crust")
-    validate_emitted_c(main_cpp, "main.cpp")
+    validate_emitted_c(main_cpp, "main.cpp", analyses=analyses)
     _progress("writing %s" % outdir)
     with open(os.path.join(outdir, "engine.c"), "w") as f:
         f.write(engine)

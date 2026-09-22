@@ -1,3 +1,4 @@
+using System;
 using Extensions;
 using UnityEngine;
 using UnityEngine.InputSystem;
@@ -15,8 +16,8 @@ public class Player : MonoBehaviour
 	void Start ()
 	{
 		Debug.Log("Hello World!");
-		System.Console.WriteLine(GameObject.Find("Bouncer").GetComponent<Bouncer>().amp);
-		print("End of Player.Start()");
+		print(GameObject.Find("Bouncer").GetComponent<Bouncer>().amp);
+		Console.WriteLine("End of Player.Start()");
 	}
 
 	void Update ()
@@ -31,13 +32,13 @@ public class Player : MonoBehaviour
 			xSize = Mathf.Sign(move);
 		graphicsTrs.SetWorldScale (multSize.SetX(multSize.x * xSize).SetZ(1));
 		print(move);
-		System.Console.WriteLine("" + Time.time);
+		print("" + Time.time);
 		SpriteRenderer spriteRend = gameObject.AddComponent<SpriteRenderer>();
-		System.Console.WriteLine(spriteRend);
+		print(spriteRend);
 	}
 
 	void OnCollisionEnter2D (Collision2D coll)
 	{
-		System.Console.WriteLine(coll);
+		print(coll);
 	}
 }
