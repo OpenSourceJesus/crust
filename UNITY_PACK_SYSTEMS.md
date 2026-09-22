@@ -171,11 +171,10 @@ slot (intensity 1, white) into the light table.
 | `transform.rotation` (`=` `Quaternion.Euler` / `LookRotation` / `Slerp` / `Inverse` / `RotateTowards` / `identity` / `new`) | Set live quat (unparented ≈ world); refreshes draw basis |
 | `Quaternion.Angle(a, b)` | Degrees between two rotations (`acos(|dot|)×2` in degrees) |
 | `Quaternion.RotateTowards(from, to, maxDegreesDelta)` | Step toward `to` by at most `maxDegreesDelta` degrees |
-| `transform.Find` (child name or `"A/B"` path) | Authored `m_Father` child lookup → GO index or **-1** |
-| `transform.parent` | Authored `m_Father` → parent GO index or **-1** |
-| `transform.SetParent` (Transform / null, optional `worldPositionStays`) | Live `_engine_go_parent` + xf parent; stays=true keeps world T |
 | `transform.Find` (child name or `"A/B"` path) | Live parent table child lookup → GO index or **-1** |
 | `transform.parent` | Live `_engine_go_parent` (seeded `m_Father`) → parent GO index or **-1** |
+| `transform.SetParent` (Transform / null, optional `worldPositionStays`) | Live `_engine_go_parent` + xf parent; stays=true keeps world T; appends as last sibling |
+| `transform.GetSiblingIndex` | Live `_engine_go_sib` (seeded GO order under parent; updated by `SetParent`) |
 | `transform.gameObject` | Same GO index as this Transform (packed Transform ≡ GameObject) |
 | `transform.worldToLocalMatrix` / `localToWorldMatrix` | Live TRS → `Matrix4x4` (same affine as TransformPoint) |
 | `transform.localScale` | Allowed (CS1061 cleared); live scale tables when SetWorldScale / scale draws / matrices need them |

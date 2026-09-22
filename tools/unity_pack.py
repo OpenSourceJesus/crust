@@ -72,7 +72,7 @@ _QUATERNION_SUPPORTED = frozenset({
 # (transform itself is always in scope; blame the missing member).
 _TRANSFORM_SUPPORTED = frozenset({
     "position", "Rotate", "LookAt", "eulerAngles", "rotation", "Find",
-    "localScale", "parent", "gameObject", "SetParent",
+    "localScale", "parent", "gameObject", "SetParent", "GetSiblingIndex",
     "worldToLocalMatrix", "localToWorldMatrix",
     "localPosition", "localRotation",
     "TransformPoint",
@@ -3136,8 +3136,11 @@ def _build_go_parents(plan):
     return parents
 
 
+def _build_go_sibling_indices(go_parents):
     """Sibling index among children of the same parent (authored seed order).
 
+    Unity GetSiblingIndex: position in the parent's child list. Seed by GO
+    table order under each parent; SetParent appends as last sibling.
     """
     n = len(go_parents or [])
     sib = [0] * n
@@ -4367,7 +4370,13 @@ def analyze_script(path, text=None):
     if re.search(r"(?<![.\w])\w+\s*\.\s*SetParent\s*\(", scan):
         apis.add("transform.SetParent")
     if re.search(
+            r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*GetSiblingIndex\s*\(",
             scan):
+        apis.add("transform.GetSiblingIndex")
+    if re.search(r"\.\s*transform\s*\.\s*GetSiblingIndex\s*\(", scan):
+        apis.add("transform.GetSiblingIndex")
+    if re.search(r"(?<![.\w])\w+\s*\.\s*GetSiblingIndex\s*\(", scan):
+        apis.add("transform.GetSiblingIndex")
     if re.search(
             r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*"
             r"worldToLocalMatrix\b",
@@ -5156,6 +5165,7 @@ def emit_engine(plan, analyses, used_apis):
     want_transform_parent = "transform.parent" in used_apis
     want_transform_go = "transform.gameObject" in used_apis
     want_set_parent = "transform.SetParent" in used_apis
+    want_get_sibling = "transform.GetSiblingIndex" in used_apis
     want_getcomponent = "GetComponent" in used_apis
     want_data_path = "Application.dataPath" in used_apis
     want_persistent_data_path = "Application.persistentDataPath" in used_apis
@@ -5186,7 +5196,7 @@ def emit_engine(plan, analyses, used_apis):
     want_ui = bool(ui_buttons)
     want_go_tables = (
         want_find or want_transform_find or want_transform_parent
-        or want_transform_go or want_set_parent or want_getcomponent
+        or want_transform_go or want_set_parent or want_get_sibling
         or want_getcomponent
         or want_rb2d or want_rb3d or want_add_any or want_ui or want_destroy)
     want_ctor_forbidden = any(
@@ -5203,7 +5213,7 @@ def emit_engine(plan, analyses, used_apis):
             or want_transform_matrix or want_quat_angle):
         p("#include <math.h>")
     if (want_input or want_log or want_find or want_transform_find
-            or want_set_parent
+            or want_set_parent or want_get_sibling
             or want_add_any or want_data_path or want_persistent_data_path
             or want_file_io or soa):
         p("#include <string.h>")
@@ -6573,22 +6583,16 @@ def emit_engine(plan, analyses, used_apis):
                 _emit_simple_add(col_ty, unity_ty)
 
     if (want_ui or want_transform_find or want_transform_parent
-            or want_set_parent):
+            or want_set_parent or want_get_sibling):
         go_names = plan.get("go_names") or []
         go_n = max(1, len(go_names))
         go_parents = plan.get("go_parents") or ([-1] * go_n)
         if len(go_parents) < go_n:
             go_parents = list(go_parents) + [-1] * (go_n - len(go_parents))
-        p("/* Transform hierarchy (live GO parents; seeded from m_Father) */"
-          if (want_set_parent or want_transform_find) else
-          "/* Authored Transform hierarchy (m_Father → GO index) */")
-        # Mutable whenever Find or SetParent runs — Find walks live parents.
-        if want_set_parent or want_transform_find:
-            p("static int _engine_go_parent[%d] = { %s };" % (
-                go_n, ", ".join(str(int(x)) for x in go_parents[:go_n])))
-        else:
-            p("static const int _engine_go_parent[%d] = { %s };" % (
-                go_n, ", ".join(str(int(x)) for x in go_parents[:go_n])))
+        go_sib = plan.get("go_siblings") or (
+            _build_go_sibling_indices(go_parents[:go_n]))
+        if len(go_sib) < go_n:
+            go_sib = list(go_sib) + [0] * (go_n - len(go_sib))
         want_go_parent_table = (
             want_ui or want_transform_find or want_transform_parent
             or want_set_parent)
@@ -6603,11 +6607,19 @@ def emit_engine(plan, analyses, used_apis):
             else:
                 p("static const int _engine_go_parent[%d] = { %s };" % (
                     go_n, ", ".join(str(int(x)) for x in go_parents[:go_n])))
+        if want_get_sibling:
             # Sibling order among children of the same parent (Unity).
             # Mutable when SetParent can change order; else authored seed.
+            p("/* Live sibling indices (seeded from GO order under parent) */")
             if want_set_parent:
+                p("static int _engine_go_sib[%d] = { %s };" % (
+                    go_n, ", ".join(str(int(x)) for x in go_sib[:go_n])))
             else:
+                p("static const int _engine_go_sib[%d] = { %s };" % (
+                    go_n, ", ".join(str(int(x)) for x in go_sib[:go_n])))
+            p("static int Transform_GetSiblingIndex(int go) {")
             p("    if (go < 0 || go >= %d) return 0;" % go_n)
+            p("    return _engine_go_sib[go];")
             p("}")
             p("")
         if want_transform_parent:
@@ -7504,6 +7516,8 @@ def emit_engine(plan, analyses, used_apis):
             p("    unsigned ci = 0u;")
             p("    float wx = 0.f, wy = 0.f, wz = 0.f;")
             p("    float px = 0.f, py = 0.f, pz = 0.f;")
+            if want_get_sibling:
+                p("    int old_parent, old_sib, i, max_sib;")
             p("    if (child < 0 || child >= %d) return;" % go_n)
             p("    if (parent == child) return;")
             p("    if (parent >= %d) parent = -1;" % go_n)
@@ -7515,17 +7529,26 @@ def emit_engine(plan, analyses, used_apis):
             p("    }")
             p("    if (world_stays && _engine_go_xf(child, &cc, &ci))")
             p("        _engine_world_pos(cc, ci, &wx, &wy, &wz, 0);")
+            if want_get_sibling:
                 # Detach: close gap among old siblings; attach as last child.
                 p("    old_parent = _engine_go_parent[child];")
+                p("    old_sib = _engine_go_sib[child];")
                 p("    for (i = 0; i < %d; i = i + 1) {" % go_n)
                 p("        if (i == child) continue;")
                 p("        if (_engine_go_parent[i] == old_parent")
+                p("            && _engine_go_sib[i] > old_sib)")
+                p("            _engine_go_sib[i] = _engine_go_sib[i] - 1;")
                 p("    }")
             p("    _engine_go_parent[child] = parent;")
+            if want_get_sibling:
+                p("    max_sib = -1;")
                 p("    for (i = 0; i < %d; i = i + 1) {" % go_n)
                 p("        if (i == child) continue;")
                 p("        if (_engine_go_parent[i] == parent")
+                p("            && _engine_go_sib[i] > max_sib)")
+                p("            max_sib = _engine_go_sib[i];")
                 p("    }")
+                p("    _engine_go_sib[child] = max_sib + 1;")
             p("    _engine_set_xf_parent(child, parent);")
             p("    if (world_stays && _engine_go_xf(child, &cc, &ci)) {")
             p("        if (parent >= 0) {")
@@ -9115,8 +9138,12 @@ def _rewrite_transform_set_parent(text, cl, plan):
 
 
 def _rewrite_transform_get_sibling_index(text, cl, plan):
+    """Lower Transform.GetSiblingIndex() → Transform_GetSiblingIndex(go).
 
     Supports:
+      transform.GetSiblingIndex();
+      cosmetic.transform.GetSiblingIndex();
+      trs.GetSiblingIndex();
     Reads the live sibling table (seeded authored; updated by SetParent).
     """
     if not plan.get("go_names"):
@@ -9131,6 +9158,7 @@ def _rewrite_transform_get_sibling_index(text, cl, plan):
         r"(?:(?<![.\w])(?P<tr>\w+)\s*\.\s*transform\s*\.\s*"
         r"|(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*"
         r"|(?<![.\w])(?P<trecv>\w+)\s*\.\s*)"
+        r"GetSiblingIndex\s*\(")
     while i < len(text):
         m = pat.search(text, i)
         if not m:
@@ -9159,6 +9187,7 @@ def _rewrite_transform_get_sibling_index(text, cl, plan):
         out.append(text[i:m.start()])
         recv = m.group("tr") or m.group("trecv")
         go = _setparent_go_expr(recv, cl)
+        out.append("Transform_GetSiblingIndex(%s)" % go)
         i = after
     return "".join(out)
 
@@ -11453,13 +11482,14 @@ def pack(root, outdir, soa=False, soa_vec4=False):
     plan["screen_maximized"] = smax
     go_names, go_comps = _build_go_tables(plan)
     if ("transform.Find" in used_apis or "transform.parent" in used_apis
-            or "transform.SetParent" in used_apis):
             or "transform.SetParent" in used_apis
+            or "transform.GetSiblingIndex" in used_apis):
         go_names, go_comps = _extend_go_tables_for_find(
             plan, go_names, go_comps)
     plan["go_names"] = go_names
     plan["go_components"] = go_comps
     plan["go_parents"] = _build_go_parents(plan)
+    plan["go_siblings"] = _build_go_sibling_indices(plan["go_parents"])
     plan["ui_buttons"] = _build_ui_buttons(plan)
     rb2d, rb3d, go_rb2d, go_rb3d, rb2d_by_fid, rb3d_by_fid = (
         _build_rigidbody_tables(plan))

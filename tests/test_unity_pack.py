@@ -1248,7 +1248,7 @@ class TestSystems(unittest.TestCase):
             "    }\n"
             "}\n")
         # Supported transform.position / Rotate / LookAt / eulerAngles /
-        # rotation / Find / localScale / SetParent.
+        # rotation / Find / localScale / SetParent / GetSiblingIndex.
         unity_pack.analyze_script(
             path,
             "using UnityEngine;\n"
@@ -1268,6 +1268,7 @@ class TestSystems(unittest.TestCase):
             "        GameObject go = transform.gameObject;\n"
             "        transform.SetParent(null);\n"
             "        transform.SetParent(null, false);\n"
+            "        int sib = transform.GetSiblingIndex();\n"
             "        Matrix4x4 w2l = transform.worldToLocalMatrix;\n"
             "        Matrix4x4 l2w = transform.localToWorldMatrix;\n"
             "        Vector3 lp = transform.localPosition;\n"
@@ -2071,6 +2072,110 @@ class TestSystems(unittest.TestCase):
         run = subprocess.run([exe], capture_output=True, text=True)
         self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
         self.assertIn("setp_ok", run.stdout)
+
+    def test_transform_get_sibling_index_live(self):
+        """GetSiblingIndex reads live sibling order; SetParent appends last."""
+        root = tempfile.mkdtemp(prefix="upack-sib-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Kid.cs"), "w") as f:
+            f.write(
+                "using System;\n"
+                "using UnityEngine;\n"
+                "public class Kid : MonoBehaviour {\n"
+                "    void Start() {\n"
+                "        int a = transform.GetSiblingIndex();\n"
+                "        Transform bTr = GameObject.Find(\"B\").transform;\n"
+                "        int b = bTr.GetSiblingIndex();\n"
+                "        Transform p = GameObject.Find(\"Root\").transform;\n"
+                "        transform.SetParent(p, false);\n"
+                "        int after = transform.GetSiblingIndex();\n"
+                "        /* A then B under Root at pack; A reparented last. */\n"
+                "        if (a == 0 && b == 1 && after == 1)\n"
+                "            Console.WriteLine(\"sib_ok\");\n"
+                "        else\n"
+                "            Console.WriteLine(\"sib_bad\");\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Kid.cs.meta"), "w") as f:
+            f.write("guid: e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Root\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "  m_Father: {fileID: 0}\n"
+                "--- !u!1 &3\nGameObject:\n  m_Name: A\n"
+                "  m_Component:\n  - component: {fileID: 4}\n"
+                "  - component: {fileID: 5}\n"
+                "--- !u!4 &4\nTransform:\n"
+                "  m_GameObject: {fileID: 3}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "  m_Father: {fileID: 2}\n"
+                "--- !u!114 &5\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 3}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5}\n"
+                "--- !u!1 &6\nGameObject:\n  m_Name: B\n"
+                "  m_Component:\n  - component: {fileID: 7}\n"
+                "--- !u!4 &7\nTransform:\n"
+                "  m_GameObject: {fileID: 6}\n"
+                "  m_LocalPosition: {x: 1, y: 0, z: 0}\n"
+                "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "  m_Father: {fileID: 2}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-sib-out-")
+        plan = unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("Transform_GetSiblingIndex", eng)
+        self.assertIn("static int _engine_go_sib", eng)
+        self.assertIn(
+            "Transform_GetSiblingIndex(_engine_go_of_Kid(i))", eng)
+        self.assertIn("Transform_SetParent", eng)
+        if not _CC:
+            return
+        host = os.path.join(d, "host.c")
+        with open(host, "w") as f:
+            f.write(
+                "void engine_tick(void);\n"
+                "extern float Time_deltaTime;\n"
+                "int main(void) {\n"
+                "  Time_deltaTime = 0.02f;\n"
+                "  engine_tick();\n"
+                "  return 0;\n"
+                "}\n"
+            )
+        r = subprocess.run(
+            [_CC, "-O2", "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(
+            [_CC, "-O0", "-c", "-o", os.path.join(d, "data.o"),
+             os.path.join(d, "data.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        exe = os.path.join(d, "run")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host,
+             os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+        self.assertIn("sib_ok", run.stdout)
 
     def test_transform_rotation_quaternion_euler_packs(self):
         """transform.rotation = Quaternion.Euler(...) → set_euler on live quat."""
