@@ -833,6 +833,17 @@ class Parser:
         self.tysubst = tysubst or {}
         self.binds = []              # match-arm payload bindings
         self.derives = []            # traits from the last `#[..]` run
+        self.contracts = []          # contract clauses from that run
+        self.fn_contracts = []       # the ones on the fn being parsed
+        self.olds = {}               # `old(..)` text -> its entry snapshot
+        self.loop_contracts = None   # clauses for the next loop statement
+        # In force for the fn being emitted: (kind, tokens, line, fn name,
+        # the tokens as written -- `old(..)` is rewritten in the first).
+        self.cur_contracts = []
+        self.body_checks = None      # loop-head checks for the next body
+        self.body_checks_next = None # ... handed from a `for` to its body
+        self.for_clauses = None      # ... and held until the body starts
+        self.variant_state = {}      # variant clause id -> (prev, first)
         self.item_derives = []       # traits on the item being parsed
         self.unit = unit or Unit()
         self.fn_sigs = self.unit.fn_sigs
@@ -1994,6 +2005,15 @@ class Parser:
         # configured in.
         return Expr("0", RustCType("_Bool"))
 
+    def m_body_invariant(self, args, line):
+        """Prusti's `body_invariant!(e)`: an invariant checked where it is."""
+        if len(args) != 1:
+            self.err("`body_invariant!` takes one condition")
+        stmt = self._clause_check("invariant", args[0], line, None)
+        if stmt and self.checking_contracts():
+            self.pending.append(stmt)
+        return Expr("((void)0)", VOID)
+
     def m_matches(self, args, line):
         """`matches!(value, pattern [if guard])` -- a pattern test.
 
@@ -2179,9 +2199,14 @@ class Parser:
         return tmp
 
     def take_pending(self, mark):
-        """Remove and return the pending statements queued since `mark`."""
+        """Remove and return the pending statements queued since `mark`.
+
+        The list is truncated in place, never replaced: a caller may already
+        hold it -- `self.pending.append(f())` binds `append` to the list
+        before `f` runs -- and replacing it lost that statement.
+        """
         taken = self.pending[mark:]
-        self.pending = self.pending[:mark]
+        del self.pending[mark:]
         return taken
 
     def parse_cond(self):
@@ -2543,9 +2568,15 @@ class Parser:
                 self.err("`?` cannot convert error type `%s` to `%s`; Crust "
                          "has no `From` conversions", err.decl(),
                          ret_err.decl())
-            self.pending.append(
-                "if (!%s.ok) { %sreturn (%s){.ok = 0, .error = %s.error}; }"
-                % (tmp, self._early_exit_drops(), ret.base, tmp))
+            # Built before it is appended: checking an `ensures` parses the
+            # clause, which rebinds `self.pending`, and `self.pending.append`
+            # would already be bound to the list that replaced.
+            stmt = ("if (!%s.ok) { %s%sreturn (%s){.ok = 0, .error = "
+                    "%s.error}; }"
+                    % (tmp, self._early_ensures("(%s){.ok = 0, .error = "
+                                                "%s.error}" % (ret.base, tmp)),
+                       self._early_exit_drops(), ret.base, tmp))
+            self.pending.append(stmt)
             if ok.is_void():
                 return Expr("(void)0", VOID)
             return Expr("%s.value" % tmp, ok)
@@ -2554,12 +2585,201 @@ class Parser:
             if ret.base not in self.unit.options:
                 self.err("`?` on an `Option` needs the enclosing function to "
                          "return an `Option`")
-            self.pending.append("if (!%s.some) { %sreturn (%s){0}; }"
-                                % (tmp, self._early_exit_drops(), ret.base))
+            stmt = ("if (!%s.some) { %s%sreturn (%s){0}; }"
+                    % (tmp, self._early_ensures("(%s){0}" % ret.base),
+                       self._early_exit_drops(), ret.base))
+            self.pending.append(stmt)
             return Expr("%s.value" % tmp, self.unit.options[src])
 
         self.err("`?` applies to `Result` and `Option`, not `%s`",
                  e.type.decl())
+
+    # -- contracts ----------------------------------------------------------
+    #
+    # `#[requires]`, `#[ensures]`, `#[invariant]` and `#[variant]` as Creusot
+    # and Prusti write them, so a file stays valid Rust for those tools. Crust
+    # checks them at runtime; the clauses are also what the proof side will
+    # read. A violation prints the clause and where it is, then aborts.
+
+    def checking_contracts(self):
+        """False under `CRUST_CONTRACTS=0`: clauses are then parsed and
+        type-checked, but emit nothing."""
+        return os.environ.get("CRUST_CONTRACTS", "1") != "0"
+
+    def _fn_clauses(self, name):
+        out = []
+        for kind, toks, line in self.fn_contracts:
+            if kind in ("invariant", "variant"):
+                self.err("`#[%s]` belongs on a loop, not a function", kind)
+            if kind in ("requires", "ensures"):
+                out.append((kind, toks, line, name, toks))
+        self.fn_contracts = []
+        return out
+
+    def has_ensures(self):
+        for c in self.cur_contracts:
+            if c[0] == "ensures":
+                return True
+        return False
+
+    def _violation(self, kind, toks, line, where):
+        """The C that reports a broken clause and aborts."""
+        self.unit.needs.add("fprintf")
+        self.unit.needs.add("abort")
+        msg = "contract violated: %s `%s`%s (line %d)" % (
+            kind, _clause_text(toks), " of `%s`" % where if where else "",
+            line)
+        return 'fprintf(stderr, "%%s\\n", "%s"); abort();' % _c_escape(msg)
+
+    def _clause_check(self, kind, toks, line, where):
+        """One clause as a C statement, or None if it is not runnable."""
+        if _is_quantified(toks):
+            return None       # for the prover; nothing finite to evaluate
+        mark = len(self.pending)
+        e = self.sub_expr(_implication_tokens(toks))
+        work = self.take_pending(mark)
+        return "{ %s if (!(%s)) { %s } }" % (" ".join(work), e.code,
+                                              self._violation(kind, toks,
+                                                              line, where))
+
+    def _emit_entry_checks(self, out, line):
+        """`requires` checks, then the `old(..)` snapshots `ensures` reads."""
+        on = self.checking_contracts()
+        for kind, toks, cline, where, _orig in self.cur_contracts:
+            if kind != "requires":
+                continue
+            stmt = self._clause_check(kind, toks, cline, where)
+            if on and stmt:
+                out.line_at(line, stmt, 1)
+        rewritten = []
+        for kind, toks, cline, where, orig in self.cur_contracts:
+            if kind == "ensures":
+                toks = self._snapshot_olds(out, line, toks, on)
+            rewritten.append((kind, toks, cline, where, orig))
+        self.cur_contracts = rewritten
+        # An `ensures` must also be valid where it will be checked; parse it
+        # once now, with `result` in scope, so an error is reported even
+        # when the function never returns a value or checks are off.
+        for kind, toks, cline, where, _orig in self.cur_contracts:
+            if kind == "ensures":
+                mark = len(self.pending)
+                self._with_result(None, toks)
+                self.pending = self.pending[:mark]
+
+    def _snapshot_olds(self, out, line, toks, on):
+        """Replace each `old(e)` with a name for `e`'s value at entry."""
+        res, k = [], 0
+        while k < len(toks):
+            t = toks[k]
+            if t.kind == "ident" and t.val == "old" and k + 1 < len(toks) \
+                    and toks[k + 1].val == "(":
+                depth, j = 0, k + 1
+                while j < len(toks):
+                    if toks[j].val == "(":
+                        depth += 1
+                    elif toks[j].val == ")":
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    j += 1
+                inner = toks[k + 2:j]
+                key = _clause_text(inner)
+                if key not in self.olds:
+                    name = "_crust_old%d" % (len(self.olds) + 1)
+                    mark = len(self.pending)
+                    e = self.sub_expr(inner)
+                    work = self.take_pending(mark)
+                    if e.type is None or e.type.is_void():
+                        self.err("cannot infer the type of `old(%s)`", key)
+                    # Declared in the function frame, visible at every exit.
+                    self.declare(name, e.type)
+                    if on:
+                        for stmt in work:
+                            out.line_at(line, stmt, 1)
+                        out.line_at(line, "%s = %s;" % (e.type.decl(name),
+                                                        e.code), 1)
+                    self.olds[key] = name
+                res.append(RustToken("ident", self.olds[key], t.line))
+                k = j + 1
+                continue
+            res.append(t)
+            k += 1
+        return res
+
+    def _with_result(self, value, toks):
+        """Parse an `ensures` clause with `result` bound to `value`."""
+        self.scope_push()
+        try:
+            if not self.ret_type.is_void():
+                self.declare_alias("result", self.ret_type,
+                                   value if value is not None else "0")
+                self.refcopies[-1]["result"] = True
+            return self.sub_expr(_implication_tokens(toks))
+        finally:
+            self.scope_pop()
+
+    def ensures_checks(self, value):
+        """C statements checking every `ensures` against `value`."""
+        if not self.checking_contracts():
+            return []
+        out = []
+        for kind, toks, line, where, orig in self.cur_contracts:
+            if kind != "ensures" or _is_quantified(toks):
+                continue
+            mark = len(self.pending)
+            e = self._with_result(value, toks)
+            work = self.take_pending(mark)
+            out.append("{ %s if (!(%s)) { %s } }"
+                       % (" ".join(work), e.code,
+                          self._violation(kind, orig, line, where)))
+        return out
+
+    def _early_ensures(self, value_code):
+        """Checks for a `?` early return, as one space-terminated string."""
+        if not self.has_ensures() or not self.checking_contracts():
+            return ""
+        tmp = self.new_temp()
+        stmts = ["%s = %s;" % (self.ret_type.decl(tmp), value_code)]
+        stmts += self.ensures_checks(tmp)
+        return " ".join(stmts) + " "
+
+    def loop_checks(self, clauses):
+        """Checks for one loop head: every invariant, and each variant's
+        strict decrease (and, for a signed type, that it stays >= 0)."""
+        out = []
+        for kind, toks, line in clauses:
+            if kind == "invariant":
+                stmt = self._clause_check("invariant", toks, line, None)
+                if stmt:
+                    out.append(stmt)
+                continue
+            mark = len(self.pending)
+            e = self.sub_expr(toks)
+            work = self.take_pending(mark)
+            if e.type is None or e.type.ptr or e.type.base not in _RANK:
+                self.err("a `#[variant]` must be an integer expression")
+            prev, first = self.variant_state[_clause_key(toks, line)]
+            cur = self.new_temp()
+            fail = self._violation("variant", toks, line, None)
+            test = "!%s && !(%s < %s)" % (first, cur, prev)
+            if not e.type.base.startswith("unsigned"):
+                test = "(%s) || %s < 0" % (test, cur)
+            out.append("{ %s %s = %s; if (%s) { %s } %s = %s; %s = 0; }"
+                       % (" ".join(work), e.type.decl(cur), e.code, test,
+                          fail, prev, cur, first))
+        if not self.checking_contracts():
+            return []
+        return out
+
+    def _declare_variant_state(self, out, line, indent, clauses):
+        """The previous value of each variant, and whether there is one."""
+        for kind, toks, cline in clauses:
+            if kind != "variant":
+                continue
+            prev, first = self.new_temp(), self.new_temp()
+            self.variant_state[_clause_key(toks, cline)] = (prev, first)
+            out.line_at(line, "long %s = 0; _Bool %s = 1;" % (prev, first),
+                        indent)
 
     def _early_exit_drops(self):
         """Drops for a `return` queued as text by `?`, space-terminated.
@@ -4184,6 +4404,11 @@ class Parser:
         if kind == "loop":
             self.loop_depth += 1
             self.loop_frames[-1] = len(self.live) - 1
+            if self.body_checks:
+                clauses = self.body_checks
+                self.body_checks = None
+                for stmt in self.loop_checks(clauses):
+                    out.write(" " + stmt)
         while not self.at("}", "punc"):
             if self.cur.kind == "eof":
                 raise CrustError("line %d: unterminated block" % self.cur.line)
@@ -4210,6 +4435,28 @@ class Parser:
         out.line_at(close.line, "}", indent)
 
     def parse_stmt(self, out, indent, tail_returns):
+        if self.at("#", "punc"):
+            # Attributes on a statement: `#[allow(..)]` and friends are
+            # ignored as they are on items; `#[invariant]`/`#[variant]`
+            # belong to the loop that must follow.
+            self.skip_attributes()
+            clauses = [c for c in self.contracts
+                       if c[0] in ("invariant", "variant")]
+            others = [c for c in self.contracts
+                      if c[0] not in ("invariant", "variant")]
+            if others:
+                self.err("`#[%s]` belongs on a function, not a statement",
+                         others[0][0])
+            if clauses:
+                t = self.cur
+                nxt = self.peek()
+                is_loop = (t.kind == "kw" and t.val in ("loop", "while",
+                                                        "for")) \
+                    or (t.kind == "label" and nxt.val == ":")
+                if not is_loop:
+                    self.err("`#[%s]` must be placed on a loop: `loop`, "
+                             "`while`, `while let` or `for`", clauses[0][0])
+                self.loop_contracts = clauses
         t = self.cur
         if tail_returns and ((t.kind == "kw" and t.val in ("match", "if"))
                              or (t.val == "{" and t.kind == "punc")
@@ -4380,8 +4627,17 @@ class Parser:
     def parse_loop(self, out, indent, label, value, hint):
         """Emit one loop; `value` names a `loop` expression's temporary."""
         t = self.cur
+        clauses = self.loop_contracts
+        self.loop_contracts = None
+        if clauses:
+            if self.checking_contracts():
+                self._declare_variant_state(out, t.line, indent, clauses)
+            else:
+                for kind, toks, cline in clauses:
+                    self.variant_state[_clause_key(toks, cline)] = ("0", "1")
         if t.val == "loop" and t.kind == "kw":
             self.next()
+            self.body_checks = clauses
             self.loop_enter(label, value, hint)
             out.line_at(t.line, "while (1)", indent)
             self.parse_block(out, indent, False, kind="loop")
@@ -4389,12 +4645,22 @@ class Parser:
             return
         if t.val == "while" and t.kind == "kw":
             if self.peek().val == "let":
-                self.parse_while_let(out, indent, label)
+                self.parse_while_let(out, indent, label, clauses)
                 return
             self.next()
             cond = self.parse_cond()
             self.loop_enter(label)
-            if self.pending:
+            if clauses:
+                # Checked at every head -- including the one whose test
+                # fails, since an invariant holds when the loop ends too.
+                head = self.loop_checks(clauses)
+                work = head + self.pending
+                self.pending = []
+                out.line_at(t.line, "for (;;) { %s if (!(%s)) break;"
+                            % (" ".join(work), cond.code), indent)
+                self.parse_block(out, indent, False, kind="loop")
+                out.write(" }")
+            elif self.pending:
                 # The condition hoisted work, which has to run before *every*
                 # test, not once above the loop -- emitted there, a `?` or a
                 # method on a temporary in the condition was evaluated a
@@ -4411,6 +4677,7 @@ class Parser:
             self.loop_exit(out)
             return
         if t.val == "for" and t.kind == "kw":
+            self.body_checks_next = clauses
             self.parse_for(out, indent, t, label)
             return
         self.err("a label must be followed by `loop`, `while` or `for`; "
@@ -4562,6 +4829,8 @@ class Parser:
                          "leaking them. Restructure with `if`/`else`.",
                          self.drop_owner)
             if value is None:
+                for stmt in self.ensures_checks(None):
+                    out.line_at(line, stmt, indent)
                 self.emit_drops(out, line, indent,
                                 self.live_frame_index(("func",)))
                 out.line_at(line, "return;", indent)
@@ -4638,6 +4907,16 @@ class Parser:
     def _emit_return_value(self, out, line, indent, e):
         """Drop live locals, then `return` -- spilling when Drop must run first."""
         self.reject_borrow(e, self.ret_type, "returning it")
+        if self.has_ensures() and not self.ret_type.is_void() \
+                and not e.never:
+            # `result` in an `ensures` is this value: evaluate it once, check
+            # the postconditions against it, then return it.
+            tmp = self.new_temp()
+            out.line_at(line, "%s = %s;" % (self.ret_type.decl(tmp), e.code),
+                        indent)
+            for stmt in self.ensures_checks(tmp):
+                out.line_at(line, stmt, indent)
+            e = Expr(tmp, self.ret_type)
         fidx = self.live_frame_index(("func",))
         # Returning a bare owning local moves it out, so it is not freed on
         # *this* path. Passed as `skip` rather than unregistered: the move
@@ -4750,6 +5029,7 @@ class Parser:
         self.scope_push("block")
         self.declare(var, ity)
         self.loop_enter(label)
+        self.body_checks, self.for_clauses = self.for_clauses, None
         self.parse_block(out, indent, False, kind="loop")
         self.scope_pop()
         if spilled:
@@ -5505,6 +5785,8 @@ class Parser:
         the consumer's step.
         """
         self.next()                                   # `for`
+        self.for_clauses = self.body_checks_next
+        self.body_checks_next = None
         kind, names = self._parse_for_pattern()
         self.expect("in")
         toks = self._for_subject_tokens()
@@ -5564,6 +5846,7 @@ class Parser:
         self.emit_pending(out, line, indent)
         out.line_at(line, head, indent)
         self.loop_enter(label)
+        self.body_checks, self.for_clauses = self.for_clauses, None
         self.emit_bound_block(out, indent, " ".join(top + body + decls),
                               kind="loop", binds=binds, closers=closers)
         self.loop_exit(out)
@@ -5611,6 +5894,11 @@ class Parser:
                 self.refcopies[-1][bname] = True
             if owns:
                 self.live_register(bname, bty)
+        if kind == "loop" and self.body_checks:
+            clauses = self.body_checks
+            self.body_checks = None
+            for stmt in self.loop_checks(clauses):
+                out.write(" " + stmt)
         # A loop body, so a move of something declared outside it is a move
         # on every iteration -- `parse_block` counts this, and the `for x in
         # xs` and `while let` bodies that come through here did not.
@@ -5730,12 +6018,15 @@ class Parser:
                 self.parse_block(out, indent, tail_returns)
         out.write(" }")
 
-    def parse_while_let(self, out, indent, label=None):
+    def parse_while_let(self, out, indent, label=None, clauses=None):
         """Lower `while let Some(x) = e { .. }` to a loop with a break."""
         t = self.expect("while")
+        head = self.loop_checks(clauses) if clauses else []
         binding, subject, elem = self.parse_let_pattern()
         tmp = self.new_temp()
         out.line_at(t.line, "for (;;) {", indent)
+        for stmt in head:
+            out.write(" " + stmt)
         # The subject's hoisted work runs before every test, like a `while`
         # condition's.
         work = self.pending
@@ -6530,11 +6821,16 @@ class Parser:
         `self.derives` for the caller that is about to parse the item.
         """
         self.derives = []
+        self.contracts = []
         while self.at("#", "punc"):
             self.next()
             if not self.at("[", "punc"):
                 raise CrustError("line %d: expected `[` after `#`"
                                  % self.cur.line)
+            clause = self._contract_attr()
+            if clause is not None:
+                self.contracts.append(clause)
+                continue
             depth = 0
             while True:
                 t = self.next()
@@ -6553,6 +6849,48 @@ class Parser:
                         if self.toks[d].kind == "ident":
                             self.derives.append(self.toks[d].val)
                         d += 1
+
+    def _contract_attr(self):
+        """Read `[requires(..)]`-style contents at the cursor, or None.
+
+        The cursor is on the attribute's `[`. A contract attribute -- written
+        as Creusot and Prusti spell it, optionally with a crate path such as
+        `prusti_contracts::requires` -- is consumed and returned as
+        (kind, clause tokens, line); anything else is left for the caller.
+        """
+        j = self.i + 1
+        while j + 2 < len(self.toks) and self.toks[j].kind == "ident" \
+                and self.toks[j + 1].val == "::":
+            j += 2                                   # a crate path
+        head = self.toks[j]
+        if head.kind != "ident" or head.val not in _CONTRACT_ATTRS:
+            return None
+        after = self.toks[j + 1]
+        if head.val in _CONTRACT_MARKERS:
+            if after.val != "]":
+                return None               # `#[trusted(..)]`: not ours
+            self.i = j + 2
+            return (head.val, [], head.line)
+        if after.val != "(":
+            self.err("`#[%s]` needs a condition: `#[%s(..)]`", head.val,
+                     head.val)
+        depth, k = 0, j + 1
+        while k < len(self.toks):
+            v = self.toks[k].val
+            if v in ("(", "[", "{"):
+                depth += 1
+            elif v in (")", "]", "}"):
+                depth -= 1
+                if depth == 0:
+                    break
+            k += 1
+        if k + 1 >= len(self.toks) or self.toks[k + 1].val != "]":
+            self.err("unterminated `#[%s(..)]`", head.val)
+        clause = self.toks[j + 2:k]
+        if not clause:
+            self.err("`#[%s()]` is empty", head.val)
+        self.i = k + 2
+        return (head.val, clause, head.line)
 
     def parse_struct(self):
         """Parse `struct Name { f: T, ... }`, returning (name, fields)."""
@@ -6789,6 +7127,7 @@ class Parser:
     def parse_method_signature(self, owner):
         """Parse an `impl` method header into a MethodInfo."""
         self.skip_attributes()
+        self.fn_contracts = self.contracts
         self.skip_visibility()
         while self.cur.val == "unsafe":
             self.next()
@@ -6873,6 +7212,7 @@ class Parser:
     def parse_fn_signature(self):
         """Parse `[pub] [unsafe] [extern "C"] fn name(params) [-> T]`."""
         self.skip_attributes()
+        self.fn_contracts = self.contracts
         self.skip_visibility()
         while self.cur.val == "unsafe":
             self.next()
@@ -6965,6 +7305,10 @@ class Parser:
             raise CrustError("line %d: expected function body" % open_tok.line)
         self.expect("{")
         out.line_at(open_tok.line, "{", 0)
+        prev_contracts, prev_olds = self.cur_contracts, self.olds
+        self.cur_contracts = self._fn_clauses(name)
+        self.olds = {}
+        self._emit_entry_checks(out, open_tok.line)
         self.scope_push("block")
         while not self.at("}", "punc"):
             if self.cur.kind == "eof":
@@ -6972,6 +7316,10 @@ class Parser:
                                  % self.cur.line)
             self.parse_stmt(out, 1, True)
         close = self.expect("}")
+        if not self.terminated and self.ret_type.is_void():
+            # Falling off the end is a return too.
+            for stmt in self.ensures_checks(None):
+                out.line_at(close.line, stmt, 1)
         # Drop body locals, then by-value owning params (func frame).
         fidx = self.live_frame_index(("func",))
         if not self.terminated:
@@ -6982,6 +7330,7 @@ class Parser:
             for stmt in self.unit.drop_glue[self.drop_owner]:
                 out.line_at(close.line, stmt, 1)
         self.drop_owner = prev_glue
+        self.cur_contracts, self.olds = prev_contracts, prev_olds
         self.terminated = False
         self.scope_pop()
         if synth_main_ret:
@@ -7012,6 +7361,7 @@ def wider(a, b):
 
 _BUILTIN_MACROS = {
     "assert": Parser.m_assert,
+    "body_invariant": Parser.m_body_invariant,
     "debug_assert": Parser.m_dbg_noop,
     "debug_assert_eq": Parser.m_dbg_noop,
     "debug_assert_ne": Parser.m_dbg_noop,
@@ -7572,6 +7922,96 @@ def _adapt_args(codes, atys, ptypes):
             code = "&" + _addressable(code)
         out.append(code)
     return out
+
+
+# Contract attributes, as Creusot and Prusti spell them. The markers carry no
+# condition and have no runtime effect: they say what a function is *for* the
+# prover (`#[pure]`, `#[trusted]`, Creusot's `#[logic]`), and Crust compiles
+# the function either way.
+_CONTRACT_CLAUSES = ("requires", "ensures", "invariant", "variant")
+_CONTRACT_MARKERS = ("pure", "trusted", "logic", "predicate", "law", "open",
+                     "check", "terminates")
+_CONTRACT_ATTRS = _CONTRACT_CLAUSES + _CONTRACT_MARKERS
+
+
+def _clause_key(toks, line):
+    return "%d:%s" % (line, _clause_text(toks))
+
+
+# Tokens after which `*`, `&`, `!` and `-` are unary, not binary.
+_OPERAND_ENDS = ("ident", "num", "str", "chr")
+
+
+def _clause_text(toks):
+    """A clause's tokens as readable source: `x > 0`, `old(*v) + 1`."""
+    out = ""
+    prev = None
+    unary = False
+    for t in toks:
+        v = t.val
+        if prev is None:
+            out = v
+        elif v == ">" and prev.val == "==":
+            out += ">"                              # `==>`
+        elif v in (")", "]", ",", ".", "?", "::") or unary:
+            out += v
+        elif v in ("(", "[") and (prev.kind in _OPERAND_ENDS
+                                  or prev.val in (")", "]", "!")):
+            out += v                                # a call or an index
+        elif prev.val in ("(", "[", ".", "::"):
+            out += v
+        else:
+            out += " " + v
+        unary = v in ("*", "&", "!", "-") and t.kind == "punc" and (
+            prev is None or not (prev.kind in _OPERAND_ENDS
+                                 or prev.val in (")", "]")))
+        prev = t
+    return out
+
+
+def _c_escape(text):
+    return text.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _is_quantified(toks):
+    """True if a clause uses `forall`/`exists`, which only a prover reads."""
+    for k in range(len(toks) - 1):
+        if toks[k].kind == "ident" and toks[k].val in ("forall", "exists") \
+                and toks[k + 1].val == "(":
+            return True
+    return False
+
+
+def _implication_tokens(toks):
+    """Rewrite a top-level `a ==> b` as `!(a) || (b)`, right-associative.
+
+    The lexer reads `==>` as `==` then `>`. Only the top level is rewritten;
+    an implication nested in parentheses is reported.
+    """
+    depth = 0
+    for k in range(len(toks) - 1):
+        v = toks[k].val
+        if v in ("(", "[", "{"):
+            depth += 1
+        elif v in (")", "]", "}"):
+            depth -= 1
+        elif v == "==" and toks[k + 1].val == ">":
+            if depth != 0:
+                raise CrustError("line %d: `==>` inside parentheses is not "
+                                 "supported; write the implication at the "
+                                 "top of the clause" % toks[k].line)
+            line = toks[k].line
+            left, right = toks[:k], _implication_tokens(toks[k + 2:])
+            return ([RustToken("punc", "!", line), RustToken("punc", "(", line)]
+                    + left + [RustToken("punc", ")", line),
+                              RustToken("punc", "||", line),
+                              RustToken("punc", "(", line)]
+                    + right + [RustToken("punc", ")", line)])
+    for k in range(len(toks) - 1):
+        if toks[k].val == "==" and toks[k + 1].val == ">":
+            raise CrustError("line %d: `==>` inside parentheses is not "
+                             "supported" % toks[k].line)
+    return toks
 
 
 def _zero_value(ty):
