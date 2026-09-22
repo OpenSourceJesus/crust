@@ -820,6 +820,344 @@ class TestSystems(unittest.TestCase):
         self.assertNotIn("new List", eng)
         self.assertNotIn("error CS0246", eng)
 
+    def test_cross_class_static_list_rewrites(self):
+        """OtherClass.staticList.Count / [i] → OtherClass_staticList."""
+        root = tempfile.mkdtemp(prefix="upack-xlist-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Cosmetic.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Cosmetic : MonoBehaviour {\n"
+                "    public Vector2 initLocalPosition;\n"
+                "    void Update() {}\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Cosmetic.cs.meta"), "w") as f:
+            f.write("guid: cosmeticosmeticosmeticosmeti01\n")
+        with open(os.path.join(scripts, "CosmeticsMenu.cs"), "w") as f:
+            f.write(
+                "using System.Collections.Generic;\n"
+                "using UnityEngine;\n"
+                "public class CosmeticsMenu : MonoBehaviour {\n"
+                "    public static List<Cosmetic> equipped ="
+                " new List<Cosmetic>();\n"
+                "    void Update() {}\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "CosmeticsMenu.cs.meta"), "w") as f:
+            f.write("guid: cosmeticsmenucosmeticsmenu01\n")
+        with open(os.path.join(scripts, "Player.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Player : MonoBehaviour {\n"
+                "    void Update() {\n"
+                "        for (int n = 0;"
+                " n < CosmeticsMenu.equipped.Count; n++) {\n"
+                "            Cosmetic c = CosmeticsMenu.equipped[n];\n"
+                "            if (c != null)\n"
+                "                c.transform.localPosition ="
+                " c.initLocalPosition;\n"
+                "        }\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Player.cs.meta"), "w") as f:
+            f.write("guid: playerplayerplayerplayerplayer01\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Player\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Cosmetic\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "--- !u!1 &20\nGameObject:\n  m_Name: CosmeticsMenu\n"
+                "  m_Component:\n  - component: {fileID: 21}\n"
+                "  - component: {fileID: 22}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: playerplayerplayerplayerplayer01}\n"
+                "--- !u!4 &11\nTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_LocalPosition: {x: 1, y: 2, z: 0}\n"
+                "--- !u!114 &12\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: cosmeticosmeticosmeticosmeti01}\n"
+                "  initLocalPosition: {x: 3, y: 4}\n"
+                "--- !u!4 &21\nTransform:\n"
+                "  m_GameObject: {fileID: 20}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &22\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 20}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: cosmeticsmenucosmeticsmenu01}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-xlist-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.cpp")) as f:
+            eng = f.read()
+        self.assertIn("static std::vector<int> CosmeticsMenu_equipped", eng)
+        self.assertIn("CosmeticsMenu_equipped.size()", eng)
+        self.assertIn("CosmeticsMenu_equipped[n]", eng)
+        self.assertNotIn("CosmeticsMenu.equipped", eng)
+
+    def test_static_method_and_singleton_instance(self):
+        """Other.StaticMethod(Other.Instance.field) → Class_Method(get(Instance()))."""
+        root = tempfile.mkdtemp(prefix="upack-static-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "CosmeticsMenu.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class CosmeticsMenu : MonoBehaviour {\n"
+                "    public byte pointsPerGem;\n"
+                "    public static void AddPoints(byte amount) {\n"
+                "        pointsPerGem = amount;\n"
+                "    }\n"
+                "    void Update() {}\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "CosmeticsMenu.cs.meta"), "w") as f:
+            f.write("guid: cosmeticsmenucosmeticsmenu01\n")
+        with open(os.path.join(scripts, "SavePoint.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class SavePoint : MonoBehaviour {\n"
+                "    void Update() {\n"
+                "        CosmeticsMenu.AddPoints("
+                "CosmeticsMenu.Instance.pointsPerGem);\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "SavePoint.cs.meta"), "w") as f:
+            f.write("guid: savepointsavepointsavepoint01\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: SavePoint\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: CosmeticsMenu\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: savepointsavepointsavepoint01}\n"
+                "--- !u!4 &11\nTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &12\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: cosmeticsmenucosmeticsmenu01}\n"
+                "  pointsPerGem: 1\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-static-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.cpp")) as f:
+            eng = f.read()
+        self.assertIn("static void CosmeticsMenu_AddPoints(int amount)", eng)
+        self.assertIn("Object_FindObjectOfType_CosmeticsMenu", eng)
+        self.assertIn("static int CosmeticsMenu_Instance(void)", eng)
+        self.assertIn(
+            "CosmeticsMenu_AddPoints(CosmeticsMenu_get_pointsPerGem("
+            "CosmeticsMenu_Instance()))", eng)
+        self.assertNotIn(
+            "CosmeticsMenu_get_pointsPerGem(0)", eng)
+        self.assertNotIn("CosmeticsMenu.AddPoints", eng)
+        self.assertNotIn("CosmeticsMenu.Instance.pointsPerGem", eng)
+        self.assertNotIn("CosmeticsMenu.Instance)", eng)
+
+    @needs_cc
+    def test_findobject_and_instance_live_not_slot_zero(self):
+        """FindObjectOfType / Instance scan live maps; survive Destroy + AddComponent."""
+        root = tempfile.mkdtemp(prefix="upack-fot-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Marker.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Marker : MonoBehaviour {\n"
+                "    public int id;\n"
+                "    void Start() {\n"
+                "        if (id == 1 || id == 99)\n"
+                "            Destroy(gameObject);\n"
+                "    }\n"
+                "    void Update() {}\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Marker.cs.meta"), "w") as f:
+            f.write("guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n")
+        with open(os.path.join(scripts, "AHost.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class AHost : MonoBehaviour {\n"
+                "    void Start() {\n"
+                "        gameObject.AddComponent<Marker>();\n"
+                "    }\n"
+                "    void Update() {}\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "AHost.cs.meta"), "w") as f:
+            f.write("guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n")
+        with open(os.path.join(scripts, "ZClient.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class ZClient : MonoBehaviour {\n"
+                "    void Update() {\n"
+                "        print(FindObjectOfType<Marker>());\n"
+                "        print(Marker.Instance);\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "ZClient.cs.meta"), "w") as f:
+            f.write("guid: cccccccccccccccccccccccccccccccc\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: MarkerOld\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!1 &5\nGameObject:\n  m_Name: MarkerKeep\n"
+                "  m_Component:\n  - component: {fileID: 6}\n"
+                "  - component: {fileID: 7}\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Host\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "--- !u!1 &20\nGameObject:\n  m_Name: Client\n"
+                "  m_Component:\n  - component: {fileID: 21}\n"
+                "  - component: {fileID: 22}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}\n"
+                "  id: 1\n"
+                "--- !u!4 &6\nTransform:\n"
+                "  m_GameObject: {fileID: 5}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &7\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 5}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}\n"
+                "  id: 99\n"
+                "--- !u!4 &11\nTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &12\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}\n"
+                "--- !u!4 &21\nTransform:\n"
+                "  m_GameObject: {fileID: 20}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &22\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 20}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: cccccccccccccccccccccccccccccccc}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-fot-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("Object_FindObjectOfType_Marker", eng)
+        self.assertIn("static int Marker_Instance(void)", eng)
+        self.assertIn("GameObject_AddComponent_Marker", eng)
+        self.assertIn("Object_Destroy", eng)
+        self.assertIn("Object_FindObjectOfType_Marker(0)", eng)
+        self.assertIn("Marker_Instance()", eng)
+        r = subprocess.run(["make", "-C", d], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr or r.stdout)
+        run = subprocess.run(
+            [os.path.join(d, "game"), "-logFile", "-"],
+            capture_output=True, text=True, cwd=d)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+        # Authored Markers are indices 0 and 1; live AddComponent is index 2.
+        # Hardcoded Instance→0 would keep printing 0 after Destroy.
+        self.assertGreaterEqual(run.stdout.count("2\n"), 2, run.stdout)
+        self.assertNotIn("\n0\n", "\n" + run.stdout)
+        self.assertNotIn("\n1\n", "\n" + run.stdout)
+    def test_singleton_toggle_array_is_on(self):
+        """Other.instance.toggles[i].isOn → Toggle_set_isOn(Other_toggles[i], …)."""
+        root = tempfile.mkdtemp(prefix="upack-toggle-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Cosmetic.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Cosmetic : MonoBehaviour {\n"
+                "    void Update() {\n"
+                "        CosmeticsMenu.instance.toggles[0].isOn = false;\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Cosmetic.cs.meta"), "w") as f:
+            f.write("guid: cosmeticosmeticosmeticosmeti01\n")
+        with open(os.path.join(scripts, "CosmeticsMenu.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "using UnityEngine.UI;\n"
+                "public class CosmeticsMenu : MonoBehaviour {\n"
+                "    public Toggle[] toggles = new Toggle[0];\n"
+                "    void Update() {}\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "CosmeticsMenu.cs.meta"), "w") as f:
+            f.write("guid: cosmeticsmenucosmeticsmenu01\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Cosmetic\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: CosmeticsMenu\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: cosmeticosmeticosmeticosmeti01}\n"
+                "--- !u!4 &11\nTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &12\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: cosmeticsmenucosmeticsmenu01}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-toggle-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.cpp")) as f:
+            eng = f.read()
+        self.assertIn("static std::vector<int> CosmeticsMenu_toggles", eng)
+        self.assertIn("Toggle_set_isOn(CosmeticsMenu_toggles[0], (0))", eng)
+        self.assertNotIn("0.toggles", eng)
+        self.assertNotIn("CosmeticsMenu.instance", eng)
+
     def test_quaternion_unsupported_member_is_cs0117(self):
         """Unsupported Quaternion members → CS0117 (in scope via UnityEngine)."""
         src = (
