@@ -1312,6 +1312,32 @@ void f(void) { std::vector<int> v; v.push_back(1); v[0] = 2; }
 """)
         self.assertIn("(*vector_int__index(&v, 0)) = 2;", out)
 
+    def test_vector_int_copy_assigns_element_values(self):
+        # Scalar copy must assign values, not `&o.vd[i]` pointers.
+        out = cpprust.translate("""
+void f(void) {
+    std::vector<int> a;
+    a.push_back(1);
+    std::vector<int> b = a;
+    b = a;
+}
+""")
+        self.assertIn("(this->vd[i]) = ((o->vd[i]));", out)
+        self.assertNotIn("= (&o->vd[i])", out)
+
+    def test_typedef_struct_left_alone(self):
+        # Already-C `typedef struct X { } X;` must not be torn apart.
+        out = cpprust.translate("""
+typedef struct EngineDraw {
+    float x;
+    float y;
+} EngineDraw;
+int f(EngineDraw *o) { return 0; }
+""")
+        self.assertIn("typedef struct EngineDraw {", out)
+        self.assertIn("} EngineDraw;", out)
+        self.assertNotIn("\n EngineDraw;", out)
+
     def test_subscript_result_can_be_a_receiver(self):
         out = cpprust.translate("""
 int f(void) { std::vector<std::string*> v; return v[0]->size(); }
