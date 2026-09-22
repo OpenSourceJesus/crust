@@ -1634,6 +1634,8 @@ _TMP_UGUI_SCRIPT_GUID = "f4688fdb7df04437aeb418b961361dc5"
 _VLAYOUT_SCRIPT_GUID = "59f8146938fff824cb5fd77236b75775"
 _HLAYOUT_SCRIPT_GUID = "30649d3a9faa99c48a7b1166b86bf2a0"
 _LAYOUT_ELEMENT_GUID = "306cc8c2b49d7114eaa3623786fc2126"
+_CONTENT_SIZE_FITTER_GUID = "3245ec927659c4140ac4f8d17403cc18"
+_ASPECT_RATIO_FITTER_GUID = "86710e43de46f6f4bac7c8e50813a599"
 # Unity "Resources/unity_builtin_extra" — UISprite, Background, Knob, …
 _UNITY_BUILTIN_GUID = "0000000000000000f000000000000000"
 
@@ -1697,6 +1699,22 @@ def _is_layout_element_mb(block, guid):
         r"(?m)^\s+m_EditorClassIdentifier:.*\bLayoutElement\s*$", block))
 
 
+def _is_content_size_fitter_mb(block, guid):
+    g = (guid or "").lower()
+    if g == _CONTENT_SIZE_FITTER_GUID:
+        return True
+    return bool(re.search(
+        r"(?m)^\s+m_EditorClassIdentifier:.*\bContentSizeFitter\s*$", block))
+
+
+def _is_aspect_ratio_fitter_mb(block, guid):
+    g = (guid or "").lower()
+    if g == _ASPECT_RATIO_FITTER_GUID:
+        return True
+    return bool(re.search(
+        r"(?m)^\s+m_EditorClassIdentifier:.*\bAspectRatioFitter\s*$", block))
+
+
 def _parse_pad_int(block, key, default=0):
     m = re.search(r"(?m)^\s+%s:\s*(-?\d+)" % re.escape(key), block)
     return int(m.group(1)) if m else default
@@ -1739,6 +1757,30 @@ def _parse_layout_element(block):
         "min": (_f("m_MinWidth"), _f("m_MinHeight")),
         "preferred": (_f("m_PreferredWidth"), _f("m_PreferredHeight")),
         "flexible": (_f("m_FlexibleWidth"), _f("m_FlexibleHeight")),
+        "max": (_f("m_MaxWidth"), _f("m_MaxHeight")),
+        "priority": _parse_pad_int(block, "m_LayoutPriority", 1),
+    }
+
+
+def _parse_content_size_fitter(block):
+    """Authored ContentSizeFitter — FitMode per axis (0 Unconstrained … 3 Clamped)."""
+    return {
+        "horizontal": _parse_pad_int(block, "m_HorizontalFit", 0),
+        "vertical": _parse_pad_int(block, "m_VerticalFit", 0),
+    }
+
+
+def _parse_aspect_ratio_fitter(block):
+    """Authored AspectRatioFitter — AspectMode + width/height ratio."""
+    ar = re.search(r"(?m)^\s+m_AspectRatio:\s*([0-9.eE+-]+)", block)
+    ratio = float(ar.group(1)) if ar else 1.0
+    if ratio < 0.001:
+        ratio = 0.001
+    if ratio > 1000.0:
+        ratio = 1000.0
+    return {
+        "mode": _parse_pad_int(block, "m_AspectMode", 0),
+        "ratio": ratio,
     }
 
 
@@ -1921,15 +1963,242 @@ def _layout_child_sizes(child, axis, control, force_expand):
     mn = float((le.get("min") or (-1.0, -1.0))[axis])
     pref = float((le.get("preferred") or (-1.0, -1.0))[axis])
     flex = float((le.get("flexible") or (-1.0, -1.0))[axis])
+    mx = float((le.get("max") or (-1.0, -1.0))[axis])
     if mn < 0.0:
         mn = 0.0
     if pref < 0.0:
         pref = cur
     if flex < 0.0:
         flex = 0.0
+    if mx >= 0.0 and pref > mx:
+        pref = mx
+    if mx >= 0.0 and mn > mx:
+        mn = mx
     if force_expand:
         flex = max(flex, 1.0)
     return mn, pref, flex
+
+
+def _layout_set_size_with_current_anchors(obj, axis, size, parent_size):
+    """Unity RectTransform.SetSizeWithCurrentAnchors — sizeDelta from target size."""
+    rect = obj.get("rect")
+    if not rect:
+        return
+    amin = rect.get("anchor_min") or (0.5, 0.5)
+    amax = rect.get("anchor_max") or (0.5, 0.5)
+    sd = list(rect.get("size_delta") or (0.0, 0.0))
+    span = float(amax[axis]) - float(amin[axis])
+    sd[axis] = float(size) - float(parent_size[axis]) * span
+    rect["size_delta"] = (sd[0], sd[1])
+
+
+def _layout_le_axis(le, axis, cur):
+    """LayoutElement → (min, preferred, max, flexible); negatives → defaults."""
+    mn = float((le.get("min") or (-1.0, -1.0))[axis])
+    pref = float((le.get("preferred") or (-1.0, -1.0))[axis])
+    flex = float((le.get("flexible") or (-1.0, -1.0))[axis])
+    mx = float((le.get("max") or (-1.0, -1.0))[axis])
+    if mn < 0.0:
+        mn = 0.0
+    if pref < 0.0:
+        pref = cur
+    if flex < 0.0:
+        flex = 0.0
+    if mx < 0.0:
+        mx = float("inf")
+    if pref > mx:
+        pref = mx
+    if mn > mx:
+        mn = mx
+    return mn, pref, mx, flex
+
+
+def _layout_group_calc_along_axis(parent, kids, axis):
+    """Unity HorizontalOrVerticalLayoutGroup.CalcAlongAxis totals."""
+    lg = parent.get("layout_group") or {}
+    is_vert = bool(lg.get("vertical"))
+    control = bool(lg.get(
+        "child_control_width" if axis == 0 else "child_control_height", 1))
+    force = bool(lg.get(
+        "child_force_expand_width" if axis == 0
+        else "child_force_expand_height", 1))
+    use_scale = bool(lg.get(
+        "child_scale_width" if axis == 0 else "child_scale_height", 0))
+    spacing = float(lg.get("spacing") or 0.0)
+    pad = ((float(lg.get("pad_left") or 0.0) + float(lg.get("pad_right") or 0.0))
+           if axis == 0 else
+           (float(lg.get("pad_top") or 0.0) + float(lg.get("pad_bottom") or 0.0)))
+    along_other = bool(is_vert) ^ (axis == 1)
+    total_min = pad
+    total_pref = pad
+    total_max = pad if not along_other else float("inf")
+    total_flex = 0.0
+    n = 0
+    for ch in kids:
+        sc = _layout_child_sizes(ch, axis, control, force)
+        if sc is None:
+            continue
+        mn, pref, flex = sc
+        le = ch.get("layout_element") or {}
+        mx = float((le.get("max") or (-1.0, -1.0))[axis])
+        if mx < 0.0:
+            mx = float("inf")
+        scale = 1.0
+        if use_scale:
+            ls = ch.get("local_scale") or (1.0, 1.0, 1.0)
+            scale = abs(float(ls[axis]))
+            if scale < 1e-8:
+                scale = 1.0
+        mn *= scale
+        pref *= scale
+        mx = mx * scale if mx < float("inf") else mx
+        flex *= scale
+        if along_other:
+            total_min = max(mn + pad, total_min)
+            if mx < float("inf"):
+                total_max = min(mx + pad, total_max)
+            total_pref = max(pref + pad, total_pref)
+            total_flex = max(flex, total_flex)
+        else:
+            total_min += mn + spacing
+            total_pref += pref + spacing
+            if mx < float("inf"):
+                total_max += mx + spacing
+            else:
+                total_max = float("inf")
+            total_flex += flex
+        n += 1
+    if not along_other and n > 0:
+        total_min -= spacing
+        total_pref -= spacing
+        if total_max < float("inf"):
+            total_max -= spacing
+    if total_max < float("inf"):
+        if total_pref > total_max:
+            total_pref = total_max
+        if total_pref < total_min:
+            total_pref = total_min
+    return total_min, total_pref, total_max, total_flex
+
+
+def _layout_query_sizes(obj, axis, children_map):
+    """Aggregate ILayoutElement sizes (LayoutElement + LayoutGroup) for one axis.
+
+    Higher ``layoutPriority`` wins; same priority takes the max of each field
+    (Unity LayoutUtility). LayoutGroup priority is 0; LayoutElement default 1.
+    """
+    cur = abs(float(((obj.get("rect") or {}).get("size_delta") or (0.0, 0.0))[axis]))
+    entries = []  # (priority, min, pref, max, flex)
+    le = obj.get("layout_element")
+    if le and not le.get("ignore"):
+        mn, pref, mx, flex = _layout_le_axis(le, axis, cur)
+        entries.append((int(le.get("priority") or 1), mn, pref, mx, flex))
+    if obj.get("layout_group"):
+        kids = [c for c in children_map.get(str(obj.get("xf_id") or ""), [])
+                if c.get("rect") is not None]
+        mn, pref, mx, flex = _layout_group_calc_along_axis(obj, kids, axis)
+        entries.append((0, mn, pref, mx, flex))
+    if not entries:
+        return cur, cur, float("inf"), 0.0
+    best_p = max(e[0] for e in entries)
+    top = [e for e in entries if e[0] == best_p]
+    mn = max(e[1] for e in top)
+    pref = max(e[2] for e in top)
+    # Max: LayoutUtility uses the *minimum* positive max among same-priority
+    # sources when comparing (GetMaxLayoutProperty). Prefer finite mins.
+    maxes = [e[3] for e in top if e[3] < float("inf")]
+    mx = min(maxes) if maxes else float("inf")
+    flex = max(e[4] for e in top)
+    if pref > mx:
+        pref = mx
+    if mn > mx:
+        mn = mx
+    if pref < mn:
+        pref = mn
+    return mn, pref, mx, flex
+
+
+def _layout_parent_pixel_size(obj, by_xf, screen_w, screen_h):
+    """Parent rect size in pixels (screen/canvas space)."""
+    fid = obj.get("father_id")
+    parent = by_xf.get(str(fid)) if fid else None
+    if parent is None:
+        return (float(screen_w), float(screen_h))
+    cache = {}
+    _cx, _cy, pw, ph = _ui_screen_rect(
+        parent, by_xf, screen_w, screen_h, cache)
+    return (abs(pw), abs(ph))
+
+
+def _apply_content_size_fitter(obj, children_map, by_xf, screen_w, screen_h):
+    """Bake ContentSizeFitter into sizeDelta (Unity HandleSelfFittingAlongAxis)."""
+    csf = obj.get("content_size_fitter") or {}
+    parent_size = _layout_parent_pixel_size(obj, by_xf, screen_w, screen_h)
+    cache = {}
+    _cx, _cy, cur_w, cur_h = _ui_screen_rect(
+        obj, by_xf, screen_w, screen_h, cache)
+    cur = (abs(cur_w), abs(cur_h))
+    for axis, fit_key in ((0, "horizontal"), (1, "vertical")):
+        fit = int(csf.get(fit_key) or 0)
+        if fit == 0:  # Unconstrained
+            continue
+        mn, pref, mx, _flex = _layout_query_sizes(obj, axis, children_map)
+        if fit == 1:  # MinSize
+            size = mn
+        elif fit == 2:  # PreferredSize
+            size = pref
+        elif fit == 3:  # Clamped
+            size = cur[axis]
+            if size < mn:
+                size = mn
+            if size > mx:
+                size = mx
+        else:
+            continue
+        _layout_set_size_with_current_anchors(obj, axis, size, parent_size)
+
+
+def _apply_aspect_ratio_fitter(obj, by_xf, screen_w, screen_h):
+    """Bake AspectRatioFitter into anchors / sizeDelta (Unity UpdateRect)."""
+    arf = obj.get("aspect_ratio_fitter") or {}
+    mode = int(arf.get("mode") or 0)
+    if mode == 0:
+        return
+    ratio = float(arf.get("ratio") or 1.0)
+    if ratio < 0.001:
+        ratio = 0.001
+    rect = obj.get("rect")
+    if not rect:
+        return
+    parent_size = _layout_parent_pixel_size(obj, by_xf, screen_w, screen_h)
+    cache = {}
+    _cx, _cy, cur_w, cur_h = _ui_screen_rect(
+        obj, by_xf, screen_w, screen_h, cache)
+    cur_w, cur_h = abs(cur_w), abs(cur_h)
+    if mode == 2:  # HeightControlsWidth
+        _layout_set_size_with_current_anchors(
+            obj, 0, cur_h * ratio, parent_size)
+    elif mode == 1:  # WidthControlsHeight
+        _layout_set_size_with_current_anchors(
+            obj, 1, cur_w / ratio, parent_size)
+    elif mode in (3, 4):  # FitInParent / EnvelopeParent
+        if obj.get("father_id") is None:
+            return
+        rect["anchor_min"] = (0.0, 0.0)
+        rect["anchor_max"] = (1.0, 1.0)
+        rect["anchored_position"] = (0.0, 0.0)
+        pw, ph = parent_size
+        # sizeDelta to produce size: size - parent * (amax-amin) = size - parent
+        # when anchors are 0..1.
+        fit = (mode == 3)
+        # (parent.y * ratio < parent.x) XOR FitInParent
+        if (ph * ratio < pw) ^ fit:
+            # Drive height from parent width / ratio
+            target_h = pw / ratio
+            rect["size_delta"] = (0.0, target_h - ph)
+        else:
+            target_w = ph * ratio
+            rect["size_delta"] = (target_w - pw, 0.0)
 
 
 def _layout_set_child_axis(child, axis, pos, size, scale, control):
@@ -2068,11 +2337,16 @@ def _layout_set_children_along_axis(parent, children, axis, is_vertical,
 
 
 def _apply_layout_groups(objects, screen_w, screen_h):
-    """Bake authored Vertical/HorizontalLayoutGroup into child RectTransforms.
+    """Bake uGUI layout controllers into RectTransforms.
 
-    Mutates ``rect`` (anchors / anchoredPosition / sizeDelta) so
-    ``_ui_screen_rect`` / ``_bake_ui_images`` see Unity's laid-out positions.
-    Top-down: parents first so nested groups see updated parent sizes.
+    Order mirrors Unity LayoutRebuilder for authored-only cases:
+    1. ContentSizeFitter (deepest first) — preferred/min from LayoutElement
+       and Vertical/HorizontalLayoutGroup child totals.
+    2. Vertical/HorizontalLayoutGroup (shallow first) — child positions/sizes.
+    3. AspectRatioFitter (shallow first) — aspect against parent size.
+
+    Mutates ``rect`` so ``_ui_screen_rect`` / ``_bake_ui_images`` see Unity's
+    laid-out positions.
     """
     by_xf = {}
     children = {}
@@ -2085,7 +2359,6 @@ def _apply_layout_groups(objects, screen_w, screen_h):
         if fid:
             children.setdefault(str(fid), []).append(o)
 
-    # Depth of each node (Canvas roots = 0).
     depth = {}
 
     def _depth(o, guard=0):
@@ -2104,6 +2377,12 @@ def _apply_layout_groups(objects, screen_w, screen_h):
         depth[xid] = d
         return d
 
+    fitters = [o for o in objects
+               if o.get("content_size_fitter") and o.get("rect") and o.get("xf_id")]
+    fitters.sort(key=lambda o: -_depth(o))
+    for o in fitters:
+        _apply_content_size_fitter(o, children, by_xf, screen_w, screen_h)
+
     groups = [o for o in objects if o.get("layout_group") and o.get("xf_id")]
     groups.sort(key=lambda o: _depth(o))
     for parent in groups:
@@ -2111,17 +2390,21 @@ def _apply_layout_groups(objects, screen_w, screen_h):
                 if c.get("rect") is not None]
         if not kids:
             continue
-        # Parent pixel size from current (pre-child-layout) rects.
         cache = {}
         _cx, _cy, pw, ph = _ui_screen_rect(
             parent, by_xf, screen_w, screen_h, cache)
         parent_size = (abs(pw), abs(ph))
         is_vert = bool(parent["layout_group"].get("vertical"))
-        # Horizontal pass then vertical (Unity LayoutRebuilder order).
         _layout_set_children_along_axis(
             parent, kids, 0, is_vert, parent_size)
         _layout_set_children_along_axis(
             parent, kids, 1, is_vert, parent_size)
+
+    arfs = [o for o in objects
+            if o.get("aspect_ratio_fitter") and o.get("rect") and o.get("xf_id")]
+    arfs.sort(key=lambda o: _depth(o))
+    for o in arfs:
+        _apply_aspect_ratio_fitter(o, by_xf, screen_w, screen_h)
 
 
 _TMP_FONT_CACHE = {}
@@ -2988,6 +3271,10 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 rec["layout_group"] = _parse_hv_layout_group(block, False)
             elif _is_layout_element_mb(block, g):
                 rec["layout_element"] = _parse_layout_element(block)
+            elif _is_content_size_fitter_mb(block, g):
+                rec["content_size_fitter"] = _parse_content_size_fitter(block)
+            elif _is_aspect_ratio_fitter_mb(block, g):
+                rec["aspect_ratio_fitter"] = _parse_aspect_ratio_fitter(block)
         if kind == "Camera":
             ortho = re.search(r"(?m)^\s+orthographic:\s*(\d+)", block)
             osize = re.search(
@@ -3222,6 +3509,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         ui_tmp = None
         layout_group = None
         layout_element = None
+        content_size_fitter = None
+        aspect_ratio_fitter = None
         canvas = None
         cam = None
         rb2d = None
@@ -3261,6 +3550,10 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                     layout_group = dict(k["layout_group"])
                 if k.get("layout_element"):
                     layout_element = dict(k["layout_element"])
+                if k.get("content_size_fitter"):
+                    content_size_fitter = dict(k["content_size_fitter"])
+                if k.get("aspect_ratio_fitter"):
+                    aspect_ratio_fitter = dict(k["aspect_ratio_fitter"])
             if k.get("kind") == "SpriteRenderer" and k.get("sprite"):
                 sprite = dict(k["sprite"])
             if k.get("kind") == "Canvas" and k.get("canvas"):
@@ -3457,6 +3750,40 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 and not rb2d and not rb3d and cam is None and not col2d
                 and not col3d and not player and not canvas
                 and (not has_mb or ui_scaffold_mb)):
+            # Plain RectTransform parents (layout containers without a
+            # MonoBehaviour) must stay so ContentSizeFitter /
+            # AspectRatioFitter / layout groups can read parent size.
+            if rect is not None and not ui_scaffold_mb:
+                objects.append({
+                    "name": go.get("name") or "Rect",
+                    "pos": pos,
+                    "rot": rot,
+                    "local_pos": local_pos,
+                    "local_rot": local_rot,
+                    "local_scale": local_scale,
+                    "father_id": father_id,
+                    "xf_id": xf_id,
+                    "go_id": go.get("file_id"),
+                    "fields": {},
+                    "script": None,
+                    "class": "_Rect",
+                    "sprite": None,
+                    "canvas": None,
+                    "rect": rect,
+                    "ui_image": None,
+                    "ui_button": None,
+                    "ui_tmp": None,
+                    "layout_group": layout_group,
+                    "layout_element": layout_element,
+                    "content_size_fitter": content_size_fitter,
+                    "aspect_ratio_fitter": aspect_ratio_fitter,
+                    "rigidbody2d": None,
+                    "rigidbody": None,
+                    "collider2d": None,
+                    "collider3d": None,
+                    "anim_player": None,
+                    "ui_scaffold": True,
+                })
             continue
         # Canvas roots (parent Images) — layout walk only, no tick class.
         if canvas and script is None and sprite is None and not has_ui_draw:
@@ -3481,6 +3808,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "ui_tmp": None,
                 "layout_group": layout_group,
                 "layout_element": layout_element,
+                "content_size_fitter": content_size_fitter,
+                "aspect_ratio_fitter": aspect_ratio_fitter,
                 "rigidbody2d": None,
                 "rigidbody": None,
                 "collider2d": None,
@@ -3511,6 +3840,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "ui_tmp": ui_tmp,
             "layout_group": layout_group,
             "layout_element": layout_element,
+            "content_size_fitter": content_size_fitter,
+            "aspect_ratio_fitter": aspect_ratio_fitter,
             "rigidbody2d": rb2d,
             "rigidbody": rb3d,
             "collider2d": col2d,
