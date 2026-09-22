@@ -246,7 +246,10 @@ camera background; they do not invent class-hash coloured quads.
 Authored `!u!223` Canvas (Screen Space Overlay / Camera) + uGUI `Image`
 or `Button` (with Image) draw via RectTransform size mapped into the
 main ortho camera. Nested RectTransforms (e.g. Button → label) use the
-parent pixel rect. Unity builtin UISprites (`guid` in
+parent pixel rect. Authored `VerticalLayoutGroup` /
+`HorizontalLayoutGroup` (+ optional `LayoutElement`) are baked into child
+`anchoredPosition` / `sizeDelta` / top-left anchors before that bake (same
+stacking Unity's layout pass applies). Unity builtin UISprites (`guid` in
 `unity_builtin_extra`) bake a rounded white sprite; `Image.type = Sliced`
 9-slices with fixed corner borders (Simple stretches). Authored project
 PNG UI sprites use `.meta` `spriteBorder` the same way. Authored
@@ -254,10 +257,13 @@ PNG UI sprites use `.meta` `spriteBorder` the same way. Authored
 PackageCache): SDF atlas + glyph tables bake `m_text` into a UI sprite
 tinted by `m_fontColor`. Button `m_OnClick` persistent `SetActive` calls
 fire on host pointer press (`engine_pointer_x/y/down`, screen space, origin
-bottom-left); inactive parents hide children (`activeInHierarchy`). Canvas
+bottom-left); inactive parents hide children (`activeInHierarchy`).
+`Awake` runs once before `Start` so authored `gameObject.SetActive(false)`
+(e.g. SettingsMenu) hides UI before the first draw. Canvas
 sorting layer/order apply to child Images/Buttons; TMP sorts one order
-above its Canvas. EventSystem / GraphicRaycaster / legacy `UI.Text` are
-not imported. `AddComponent<Canvas>` / `typeof(Canvas)` / `ForceUpdateCanvases`
+above its Canvas. EventSystem / GraphicRaycaster / legacy `UI.Text` /
+`ContentSizeFitter` / `GridLayoutGroup` are not imported.
+`AddComponent<Canvas>` / `typeof(Canvas)` / `ForceUpdateCanvases`
 remain refused (no invent); `using UnityEngine.UI` and Image fields are fine.
 
 Asset GUIDs resolve under `Assets/`, `Packages/`, and

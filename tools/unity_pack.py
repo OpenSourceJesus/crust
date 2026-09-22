@@ -1630,6 +1630,10 @@ _IMAGE_SCRIPT_GUID = "fe87c0e1cc204ed48ad3b37840f39efc"
 _BUTTON_SCRIPT_GUID = "4e29b1a8efbd4b44bb3f3716e73f07ff"
 # TextMeshProUGUI (com.unity.ugui / Unity.TextMeshPro).
 _TMP_UGUI_SCRIPT_GUID = "f4688fdb7df04437aeb418b961361dc5"
+# uGUI layout controllers (authored Vertical/HorizontalLayoutGroup).
+_VLAYOUT_SCRIPT_GUID = "59f8146938fff824cb5fd77236b75775"
+_HLAYOUT_SCRIPT_GUID = "30649d3a9faa99c48a7b1166b86bf2a0"
+_LAYOUT_ELEMENT_GUID = "306cc8c2b49d7114eaa3623786fc2126"
 # Unity "Resources/unity_builtin_extra" — UISprite, Background, Knob, …
 _UNITY_BUILTIN_GUID = "0000000000000000f000000000000000"
 
@@ -1666,6 +1670,76 @@ def _is_ui_tmp_mb(block, guid):
         return True
     return bool(re.search(
         r"(?m)^\s+m_EditorClassIdentifier:.*\bTextMeshProUGUI\s*$", block))
+
+
+def _is_vlayout_mb(block, guid):
+    g = (guid or "").lower()
+    if g == _VLAYOUT_SCRIPT_GUID:
+        return True
+    return bool(re.search(
+        r"(?m)^\s+m_EditorClassIdentifier:.*\bVerticalLayoutGroup\s*$", block))
+
+
+def _is_hlayout_mb(block, guid):
+    g = (guid or "").lower()
+    if g == _HLAYOUT_SCRIPT_GUID:
+        return True
+    return bool(re.search(
+        r"(?m)^\s+m_EditorClassIdentifier:.*\bHorizontalLayoutGroup\s*$",
+        block))
+
+
+def _is_layout_element_mb(block, guid):
+    g = (guid or "").lower()
+    if g == _LAYOUT_ELEMENT_GUID:
+        return True
+    return bool(re.search(
+        r"(?m)^\s+m_EditorClassIdentifier:.*\bLayoutElement\s*$", block))
+
+
+def _parse_pad_int(block, key, default=0):
+    m = re.search(r"(?m)^\s+%s:\s*(-?\d+)" % re.escape(key), block)
+    return int(m.group(1)) if m else default
+
+
+def _parse_hv_layout_group(block, vertical):
+    """Authored Vertical/HorizontalLayoutGroup → bake dict."""
+    sp = re.search(r"(?m)^\s+m_Spacing:\s*([0-9.eE+-]+)", block)
+    return {
+        "vertical": bool(vertical),
+        "pad_left": _parse_pad_int(block, "m_Left", 0),
+        "pad_right": _parse_pad_int(block, "m_Right", 0),
+        "pad_top": _parse_pad_int(block, "m_Top", 0),
+        "pad_bottom": _parse_pad_int(block, "m_Bottom", 0),
+        "spacing": float(sp.group(1)) if sp else 0.0,
+        "child_alignment": _parse_pad_int(block, "m_ChildAlignment", 0),
+        "child_force_expand_width": _parse_pad_int(
+            block, "m_ChildForceExpandWidth", 1),
+        "child_force_expand_height": _parse_pad_int(
+            block, "m_ChildForceExpandHeight", 1),
+        "child_control_width": _parse_pad_int(
+            block, "m_ChildControlWidth", 1),
+        "child_control_height": _parse_pad_int(
+            block, "m_ChildControlHeight", 1),
+        "child_scale_width": _parse_pad_int(
+            block, "m_ChildScaleWidth", 0),
+        "child_scale_height": _parse_pad_int(
+            block, "m_ChildScaleHeight", 0),
+        "reverse": _parse_pad_int(block, "m_ReverseArrangement", 0),
+    }
+
+
+def _parse_layout_element(block):
+    def _f(key):
+        m = re.search(
+            r"(?m)^\s+%s:\s*([0-9.eE+-]+)" % re.escape(key), block)
+        return float(m.group(1)) if m else -1.0
+    return {
+        "ignore": _parse_pad_int(block, "m_IgnoreLayout", 0),
+        "min": (_f("m_MinWidth"), _f("m_MinHeight")),
+        "preferred": (_f("m_PreferredWidth"), _f("m_PreferredHeight")),
+        "flexible": (_f("m_FlexibleWidth"), _f("m_FlexibleHeight")),
+    }
 
 
 def _parse_ui_tmp(block, asset_guids):
@@ -1824,6 +1898,230 @@ def _ui_screen_rect(o, by_xf, screen_w, screen_h, cache):
     cy = ply + lcy
     cache[key] = (cx, cy, abs(rw), abs(rh))
     return cache[key]
+
+
+def _layout_alignment_on_axis(child_alignment, axis):
+    """TextAnchor → 0 left/top, 0.5 middle, 1 right/bottom (Unity LayoutGroup)."""
+    a = int(child_alignment)
+    if axis == 0:
+        return (a % 3) * 0.5
+    return (a // 3) * 0.5
+
+
+def _layout_child_sizes(child, axis, control, force_expand):
+    """(min, preferred, flexible) along *axis* — authored LayoutElement or sizeDelta."""
+    le = child.get("layout_element") or {}
+    if le.get("ignore"):
+        return None
+    rect = child.get("rect") or {}
+    sd = rect.get("size_delta") or (0.0, 0.0)
+    cur = abs(float(sd[axis]))
+    if not control:
+        return cur, cur, 0.0
+    mn = float((le.get("min") or (-1.0, -1.0))[axis])
+    pref = float((le.get("preferred") or (-1.0, -1.0))[axis])
+    flex = float((le.get("flexible") or (-1.0, -1.0))[axis])
+    if mn < 0.0:
+        mn = 0.0
+    if pref < 0.0:
+        pref = cur
+    if flex < 0.0:
+        flex = 0.0
+    if force_expand:
+        flex = max(flex, 1.0)
+    return mn, pref, flex
+
+
+def _layout_set_child_axis(child, axis, pos, size, scale, control):
+    """Mirror Unity LayoutGroup.SetChildAlongAxisWithScale (anchors → top-left)."""
+    rect = child.get("rect")
+    if not rect:
+        return
+    amin = list(rect.get("anchor_min") or (0.5, 0.5))
+    amax = list(rect.get("anchor_max") or (0.5, 0.5))
+    # Vector2.up — top-left driven anchors.
+    amin[0], amin[1] = 0.0, 1.0
+    amax[0], amax[1] = 0.0, 1.0
+    sd = list(rect.get("size_delta") or (0.0, 0.0))
+    apos = list(rect.get("anchored_position") or (0.0, 0.0))
+    pivot = rect.get("pivot") or (0.5, 0.5)
+    sc = float(scale) if scale else 1.0
+    if control:
+        sd[axis] = float(size)
+        use_size = float(size)
+    else:
+        use_size = abs(float(sd[axis]))
+    if axis == 0:
+        apos[0] = float(pos) + use_size * float(pivot[0]) * sc
+    else:
+        apos[1] = -float(pos) - use_size * (1.0 - float(pivot[1])) * sc
+    rect["anchor_min"] = (amin[0], amin[1])
+    rect["anchor_max"] = (amax[0], amax[1])
+    rect["size_delta"] = (sd[0], sd[1])
+    rect["anchored_position"] = (apos[0], apos[1])
+
+
+def _layout_set_children_along_axis(parent, children, axis, is_vertical,
+                                     parent_size):
+    """Unity HorizontalOrVerticalLayoutGroup.SetChildrenAlongAxis (authored)."""
+    lg = parent.get("layout_group") or {}
+    control = bool(lg.get(
+        "child_control_width" if axis == 0 else "child_control_height", 1))
+    force = bool(lg.get(
+        "child_force_expand_width" if axis == 0
+        else "child_force_expand_height", 1))
+    use_scale = bool(lg.get(
+        "child_scale_width" if axis == 0 else "child_scale_height", 0))
+    spacing = float(lg.get("spacing") or 0.0)
+    pad_l = float(lg.get("pad_left") or 0.0)
+    pad_r = float(lg.get("pad_right") or 0.0)
+    pad_t = float(lg.get("pad_top") or 0.0)
+    pad_b = float(lg.get("pad_bottom") or 0.0)
+    pad_cross = (pad_l + pad_r) if axis == 0 else (pad_t + pad_b)
+    align = _layout_alignment_on_axis(lg.get("child_alignment") or 0, axis)
+    along_other = bool(is_vertical) ^ (axis == 1)
+    size = float(parent_size[axis])
+    kids = list(children)
+    if lg.get("reverse"):
+        kids = list(reversed(kids))
+
+    sizes = []
+    for ch in kids:
+        sc = _layout_child_sizes(ch, axis, control, force)
+        if sc is None:
+            sizes.append(None)
+            continue
+        mn, pref, flex = sc
+        scale = 1.0
+        if use_scale:
+            ls = ch.get("local_scale") or (1.0, 1.0, 1.0)
+            scale = abs(float(ls[axis]))
+            if scale < 1e-8:
+                scale = 1.0
+        sizes.append((mn, pref, flex, scale))
+
+    if along_other:
+        inner = size - pad_cross
+        for i, ch in enumerate(kids):
+            if sizes[i] is None:
+                continue
+            mn, pref, flex, scale = sizes[i]
+            required = max(mn, min(inner, pref if flex <= 0 else size))
+            start = ((pad_l if axis == 0 else pad_t)
+                     + (inner - required * scale) * align)
+            if control:
+                _layout_set_child_axis(ch, axis, start, required, scale, True)
+            else:
+                sd = abs(float(((ch.get("rect") or {}).get(
+                    "size_delta") or (0, 0))[axis]))
+                offset = (required - sd) * align
+                _layout_set_child_axis(
+                    ch, axis, start + offset, sd, scale, False)
+        return
+
+    # Primary axis: stack with spacing + flexible surplus.
+    total_min = pad_cross
+    total_pref = pad_cross
+    total_flex = 0.0
+    n_count = 0
+    for sc in sizes:
+        if sc is None:
+            continue
+        mn, pref, flex, scale = sc
+        total_min += mn * scale + spacing
+        total_pref += pref * scale + spacing
+        total_flex += flex
+        n_count += 1
+    if n_count > 0:
+        total_min -= spacing
+        total_pref -= spacing
+    pos = pad_l if axis == 0 else pad_t
+    surplus = size - total_pref
+    item_flex_mul = 0.0
+    if surplus > 0.0:
+        if total_flex <= 0.0:
+            # No flexible: align the block as a whole.
+            needed = total_pref - pad_cross
+            pos = ((pad_l if axis == 0 else pad_t)
+                   + (size - pad_cross - needed) * align)
+        else:
+            item_flex_mul = surplus / total_flex
+    min_max_lerp = 0.0
+    if abs(total_pref - total_min) > 1e-6:
+        min_max_lerp = max(0.0, min(1.0,
+            (size - total_min) / (total_pref - total_min)))
+    for i, ch in enumerate(kids):
+        if sizes[i] is None:
+            continue
+        mn, pref, flex, scale = sizes[i]
+        child_size = mn + (pref - mn) * min_max_lerp
+        child_size = child_size + flex * item_flex_mul
+        if control:
+            _layout_set_child_axis(ch, axis, pos, child_size, scale, True)
+        else:
+            sd = abs(float(((ch.get("rect") or {}).get(
+                "size_delta") or (0, 0))[axis]))
+            offset = (child_size - sd) * align
+            _layout_set_child_axis(
+                ch, axis, pos + offset, sd, scale, False)
+        pos = pos + child_size * scale + spacing
+
+
+def _apply_layout_groups(objects, screen_w, screen_h):
+    """Bake authored Vertical/HorizontalLayoutGroup into child RectTransforms.
+
+    Mutates ``rect`` (anchors / anchoredPosition / sizeDelta) so
+    ``_ui_screen_rect`` / ``_bake_ui_images`` see Unity's laid-out positions.
+    Top-down: parents first so nested groups see updated parent sizes.
+    """
+    by_xf = {}
+    children = {}
+    for o in objects:
+        xid = o.get("xf_id")
+        if not xid:
+            continue
+        by_xf[str(xid)] = o
+        fid = o.get("father_id")
+        if fid:
+            children.setdefault(str(fid), []).append(o)
+
+    # Depth of each node (Canvas roots = 0).
+    depth = {}
+
+    def _depth(o, guard=0):
+        xid = str(o.get("xf_id") or "")
+        if xid in depth:
+            return depth[xid]
+        if guard > 64 or o.get("canvas"):
+            depth[xid] = 0
+            return 0
+        fid = o.get("father_id")
+        parent = by_xf.get(str(fid)) if fid else None
+        if parent is None:
+            depth[xid] = 0
+            return 0
+        d = _depth(parent, guard + 1) + 1
+        depth[xid] = d
+        return d
+
+    groups = [o for o in objects if o.get("layout_group") and o.get("xf_id")]
+    groups.sort(key=lambda o: _depth(o))
+    for parent in groups:
+        kids = [c for c in children.get(str(parent["xf_id"]), [])
+                if c.get("rect") is not None]
+        if not kids:
+            continue
+        # Parent pixel size from current (pre-child-layout) rects.
+        cache = {}
+        _cx, _cy, pw, ph = _ui_screen_rect(
+            parent, by_xf, screen_w, screen_h, cache)
+        parent_size = (abs(pw), abs(ph))
+        is_vert = bool(parent["layout_group"].get("vertical"))
+        # Horizontal pass then vertical (Unity LayoutRebuilder order).
+        _layout_set_children_along_axis(
+            parent, kids, 0, is_vert, parent_size)
+        _layout_set_children_along_axis(
+            parent, kids, 1, is_vert, parent_size)
 
 
 _TMP_FONT_CACHE = {}
@@ -2684,6 +2982,12 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 rec["ui_button"] = _parse_ui_button(block)
             elif _is_ui_tmp_mb(block, g):
                 rec["ui_tmp"] = _parse_ui_tmp(block, asset_guids)
+            elif _is_vlayout_mb(block, g):
+                rec["layout_group"] = _parse_hv_layout_group(block, True)
+            elif _is_hlayout_mb(block, g):
+                rec["layout_group"] = _parse_hv_layout_group(block, False)
+            elif _is_layout_element_mb(block, g):
+                rec["layout_element"] = _parse_layout_element(block)
         if kind == "Camera":
             ortho = re.search(r"(?m)^\s+orthographic:\s*(\d+)", block)
             osize = re.search(
@@ -2916,6 +3220,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         ui_image = None
         ui_button = None
         ui_tmp = None
+        layout_group = None
+        layout_element = None
         canvas = None
         cam = None
         rb2d = None
@@ -2951,6 +3257,10 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                     ui_button = dict(k["ui_button"])
                 if k.get("ui_tmp"):
                     ui_tmp = dict(k["ui_tmp"])
+                if k.get("layout_group"):
+                    layout_group = dict(k["layout_group"])
+                if k.get("layout_element"):
+                    layout_element = dict(k["layout_element"])
             if k.get("kind") == "SpriteRenderer" and k.get("sprite"):
                 sprite = dict(k["sprite"])
             if k.get("kind") == "Canvas" and k.get("canvas"):
@@ -3169,6 +3479,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "ui_image": None,
                 "ui_button": None,
                 "ui_tmp": None,
+                "layout_group": layout_group,
+                "layout_element": layout_element,
                 "rigidbody2d": None,
                 "rigidbody": None,
                 "collider2d": None,
@@ -3197,6 +3509,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "ui_image": ui_image,
             "ui_button": ui_button,
             "ui_tmp": ui_tmp,
+            "layout_group": layout_group,
+            "layout_element": layout_element,
             "rigidbody2d": rb2d,
             "rigidbody": rb3d,
             "collider2d": col2d,
@@ -5333,6 +5647,9 @@ def analyze_script(path, text=None, shallow=False):
             r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*SetParent\s*\(",
             scan):
         apis.add("transform.SetParent")
+    if re.search(r"(?<![\w.])(?:this\s*\.\s*)?gameObject\s*\.\s*SetActive\s*\(",
+                 scan):
+        apis.add("GameObject.SetActive")
     # foo.transform.SetParent / trs.SetParent (Transform receiver).
     if re.search(r"\.\s*transform\s*\.\s*SetParent\s*\(", scan):
         apis.add("transform.SetParent")
@@ -5765,9 +6082,9 @@ def _methods_in(body, bscan, body_abs=0):
     return out
 
 
-# Unity messages we emit (Awake / OnEnable are skipped — run before first tick).
+# Unity messages we emit. Awake runs once before Start (SettingsMenu.SetActive…).
 _UNITY_EMIT_MESSAGES = frozenset({
-    "Start", "Update", "FixedUpdate", "LateUpdate",
+    "Awake", "Start", "Update", "FixedUpdate", "LateUpdate",
     "OnDisable", "OnDestroy",
     "OnCollisionEnter2D", "OnCollisionStay2D", "OnCollisionExit2D",
     "OnTriggerEnter2D", "OnTriggerStay2D", "OnTriggerExit2D",
@@ -5942,7 +6259,7 @@ def _reachable_emit_methods(methods):
         by[m["name"]] = m
     roots = set()
     for name, m in by.items():
-        if name in ("Awake", "OnEnable", "OnValidate"):
+        if name in ("OnEnable", "OnValidate"):
             continue
         if name in _UNITY_EMIT_MESSAGES or m.get("public"):
             roots.add(name)
@@ -6002,11 +6319,14 @@ def _lowered_body_still_csharp(body, args_str=None, emitted_params=None):
             r"(?<![\w.])(?!(?:%s)\b)[A-Z][a-zA-Z0-9]*\s*\(" % _ctor_ok,
             body):
         return True
-    # Unlowered static call: ``EventManager.AddEvent(...)`` (not ``Type_Method``).
-    if re.search(r"(?<![\w_])[A-Z]\w*\.[A-Za-z_]\w*\s*\(", body):
+    # Unlowered static call: ``EventManager.AddEvent(...)`` (Pascal Type.Method).
+    # Not ``P_equipped.push_back`` (underscored C ident).
+    if re.search(
+            r"(?<![\w_])[A-Z][a-zA-Z0-9]*\.[A-Z][a-zA-Z0-9]*\s*\(",
+            body):
         return True
     # Unlowered static field: ``Vector3.zero`` / ``Random.value``.
-    if re.search(r"(?<![\w_])[A-Z]\w*\.[a-z]\w*\b", body):
+    if re.search(r"(?<![\w_])[A-Z][a-zA-Z0-9]*\.[a-z]\w*\b", body):
         return True
     # Chained call/property on a call result: ``AudioManager_Instance().MakeSoundEffect``.
     if re.search(r"\)\s*\.\s*[A-Za-z_]", body):
@@ -6581,7 +6901,7 @@ def emit_engine(plan, analyses, used_apis):
         or want_file_delete or want_file_text_stream or want_file_copy)
     want_destroy = "Object.Destroy" in used_apis
     ui_buttons = plan.get("ui_buttons") or []
-    want_ui = bool(ui_buttons)
+    want_ui = bool(ui_buttons) or ("GameObject.SetActive" in used_apis)
     want_go_tables = (
         want_find or want_transform_find or want_transform_parent
         or want_transform_go or want_set_parent or want_get_sibling
@@ -9160,7 +9480,7 @@ def emit_engine(plan, analyses, used_apis):
         emit_names = _reachable_emit_methods(
             [m for _c, m in methods_by.get(cname, [])])
         for c, m in methods_by.get(cname, []):
-            if m["name"] in ("Awake", "OnEnable"):
+            if m["name"] == "OnEnable":
                 continue
             if m["name"] not in emit_names:
                 continue
@@ -9219,6 +9539,12 @@ def emit_engine(plan, analyses, used_apis):
                     p("    (void)i;")
                 if coll_param:
                     p("    (void)%s;" % coll_param)
+                # Keep lowered SetActive even when the rest of Awake stubs —
+                # SettingsMenu.Awake → gameObject.SetActive(false).
+                for line in body.split("\n"):
+                    s = line.strip()
+                    if "GameObject_SetActive(" in s:
+                        p("    " + s.rstrip(";").rstrip() + ";")
                 p("    /* unlowered C# (GetComponentsInChildren / T[] / "
                   "leftover Instantiate / lambda / Type.Method) — stub */")
             else:
@@ -9239,6 +9565,8 @@ def emit_engine(plan, analyses, used_apis):
             else:
                 p(indent + "%s_%s((unsigned)n);" % (idn, method))
 
+        has_awake = any(m["name"] == "Awake"
+                        for _c, m in methods_by.get(cname, []))
         has_start = any(m["name"] == "Start"
                         for _c, m in methods_by.get(cname, []))
         has_fixed = any(m["name"] == "FixedUpdate"
@@ -9282,7 +9610,7 @@ def emit_engine(plan, analyses, used_apis):
             p("")
             continue
 
-        if has_start:
+        if has_awake or has_start:
             p("static int _%s_started = 0;" % idn)
         p("void %s_FixedTick(void) {" % idn)
         if has_fixed:
@@ -9295,14 +9623,21 @@ def emit_engine(plan, analyses, used_apis):
         p("}")
         p("")
         p("void %s_Tick(void) {" % idn)
-        if has_start or has_update:
+        if has_awake or has_start or has_update:
             p("    int n;")
-        if has_start:
+        if has_awake or has_start:
             p("    if (!_%s_started) {" % idn)
             p("        _%s_started = 1;" % idn)
-            p("        for (n = 0; n < _%s_inst_count; n = n + 1) {" % idn)
-            _call_script("Start", "            ")
-            p("        }")
+            if has_awake:
+                p("        for (n = 0; n < _%s_inst_count; n = n + 1) {"
+                  % idn)
+                _call_script("Awake", "            ")
+                p("        }")
+            if has_start:
+                p("        for (n = 0; n < _%s_inst_count; n = n + 1) {"
+                  % idn)
+                _call_script("Start", "            ")
+                p("        }")
             p("    }")
         if has_update:
             p("    for (n = 0; n < _%s_inst_count; n = n + 1) {" % idn)
@@ -9314,7 +9649,7 @@ def emit_engine(plan, analyses, used_apis):
                 p("        }")
             _call_script("Update", "        ")
             p("    }")
-        elif not has_start:
+        elif not has_awake and not has_start:
             p("    /* no Update */")
         p("}")
         p("")
@@ -12584,6 +12919,16 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = re.sub(r"\bthis\.", "", text)
     # Bare `this` is the packed instance index (Add(this), == this, …).
     text = re.sub(r"(?<![\w.])this(?![\w])", "i", text)
+    # base.Awake() / base.OnEnable() — no C equivalent; drop.
+    text = re.sub(
+        r"(?<![\w.])base\s*\.\s*(?:Awake|OnEnable)\s*\(\s*\)\s*;?",
+        "/* base.Awake */", text)
+    # gameObject.SetActive(x) → GameObject_SetActive(this GO, x).
+    if plan.get("go_names"):
+        text = re.sub(
+            r"(?<![\w.])gameObject\s*\.\s*SetActive\s*\(\s*([^)]+)\s*\)",
+            r"GameObject_SetActive(_engine_go_of_%s(i), (\1))" % idn,
+            text)
     # Dictionary before List so 2-arg Add is not eaten by List.push_back.
     text = _rewrite_dictionary(text, plan, cl)
     text = _rewrite_list(text, plan, cl)
@@ -13952,6 +14297,7 @@ def load_project(root):
     _progress("scene objects=%d lights=%d cameras=%d hierarchy=%d" % (
         len(objects), len(lights), len(cameras), len(hierarchy)))
     sw, sh = player_screen(root)
+    _apply_layout_groups(objects, sw, sh)
     _bake_ui_images(objects, cameras, sw, sh, asset_guids=assets)
     objects = [o for o in objects if not o.get("ui_scaffold")]
     _apply_sprite_sorting(objects, sorting_layers)
@@ -14418,7 +14764,7 @@ def pack(root, outdir, soa=False, soa_vec4=False):
     validate_emitted_c(main_cpp, "main.cpp", analyses=analyses)
     _progress("writing %s" % outdir)
     with open(os.path.join(outdir, "engine.c"), "w") as f:
-        f.write(engine)
+        f.write(engine_c)
     with open(os.path.join(outdir, "data.c"), "w") as f:
         f.write(data)
     with open(os.path.join(outdir, "main.c"), "w") as f:
