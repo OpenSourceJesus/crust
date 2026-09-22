@@ -62,6 +62,45 @@ def _raise_cs(path, text, idx, code, message):
     raise PackError(_cs_diag(path, text, idx, code, message))
 
 
+def _raise_cs_at_site(site, body_idx, code, message):
+    """CS diagnostic using method-body offset + emit site (path / file_text)."""
+    path = site.get("path") or "<cs>"
+    ft = site.get("file_text") or ""
+    if not ft:
+        raise PackError("%s(1,1): error %s: %s" % (
+            _assets_rel_path(path), code, message))
+    abs_i = int(site.get("body_abs") or 0) + int(body_idx or 0)
+    _raise_cs(path, ft, abs_i, code, message)
+
+
+def _raise_unknown_component_type(t, analyses, ops=("AddComponent", "GetComponent")):
+    """Unknown / refused component type → Unity CS0246 at the type token."""
+    analyses = analyses or []
+    for a in analyses:
+        path = a.get("path") or ""
+        text = None
+        for c in a.get("classes") or []:
+            if c.get("file_text") is not None:
+                text = c["file_text"]
+                break
+        if text is None and path and os.path.isfile(path):
+            text = _read(path)
+        if not text:
+            continue
+        scan = cs2cpp._blank(text)
+        for op in ops:
+            m = re.search(
+                r"%s\s*<\s*(?:[\w.]*\.)?(%s)\s*>" % (op, re.escape(t)),
+                scan)
+            if m:
+                _raise_cs(path, text, m.start(1), "CS0246", _CS0246 % t)
+    if analyses:
+        path = analyses[0].get("path") or "<cs>"
+        raise PackError("%s(1,1): error CS0246: %s" % (
+            _assets_rel_path(path), _CS0246 % t))
+    raise PackError("<cs>(1,1): error CS0246: %s" % (_CS0246 % t))
+
+
 # System.IO.File members we emit. Others → CS0117 (File is in scope via using).
 _FILE_SUPPORTED = frozenset({
     "WriteAllText", "AppendAllText", "WriteAllBytes", "ReadAllBytes",
@@ -216,7 +255,7 @@ def _check_refused_api(path, text, scan):
     """Packed-subset refusals → Unity/csc diagnostics at the use site.
 
     ``using UnityEngine.UI`` is allowed (authored Image/Button fields). Invent
-    (AddComponent&lt;Canvas&gt;, ForceUpdateCanvases, typeof(Canvas) spawn) is not.
+    (AddComponent<Canvas>, ForceUpdateCanvases, typeof(Canvas) spawn) is not.
     """
     # Scripted Canvas invent — not authored !u!223.
     m = re.search(
@@ -345,9 +384,13 @@ _UI_COMPONENT_FIELD_TYPES = frozenset((
     "Image", "RawImage", "Button", "Text", "Toggle", "Slider", "Scrollbar",
     "ScrollRect", "Dropdown", "InputField", "Mask", "RectMask2D",
     "Canvas", "CanvasGroup", "CanvasScaler", "GraphicRaycaster",
-    "RectTransform", "TMP_Text", "TextMeshProUGUI", "TextMeshPro",
+    "RectTransform", "Selectable",
+    "TMP_Text", "TextMeshProUGUI", "TextMeshPro",
     "TMP_InputField", "TMP_Dropdown",
 ))
+
+# GetComponent<T> for authored UI — opaque GO handles, not AddComponent invent.
+_UI_GETCOMPONENT_TYPES = _UI_COMPONENT_FIELD_TYPES
 
 
 def _progress(msg):
@@ -2896,6 +2939,10 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "xf_id": xf_id,
                 "father_id": father_id,
                 "go_id": go.get("file_id"),
+                "has_canvas": bool(canvas),
+                "has_image": bool(ui_image),
+                "has_button": bool(ui_button),
+                "has_tmp": bool(ui_tmp),
             })
         if cam is not None:
             cameras.append({
@@ -3102,6 +3149,23 @@ def _ast_find_getcomponent_chains(text):
     import tools.cpprust as cpprust
     scan = cs2cpp._blank(text)
     out = []
+
+    def _comp_type_span(angle_open, angle_close):
+        """Return (simple_name, type_idx) for text inside `<…>`."""
+        inner = text[angle_open + 1:angle_close]
+        stripped = inner.strip()
+        lead = len(inner) - len(inner.lstrip())
+        base = angle_open + 1 + lead
+        if "." in stripped:
+            mty = re.search(r"(\w+)\s*$", stripped)
+            if mty:
+                return mty.group(1), base + mty.start(1)
+            return stripped.rsplit(".", 1)[-1], base
+        mty = re.match(r"(\w+)", stripped)
+        if mty:
+            return mty.group(1), base + mty.start(1)
+        return stripped, base
+
     for m in re.finditer(
             r"(?:UnityEngine\.)?GameObject\.Find\s*\(", scan):
         open_p = m.end() - 1
@@ -3111,7 +3175,9 @@ def _ast_find_getcomponent_chains(text):
         find_args = text[open_p + 1:close_p]
         end = close_p + 1
         comp_ty = None
+        type_idx = None
         field = None
+        axis = None
         # .GetComponent < T > ( ... )
         gm = re.match(r"\s*\.\s*GetComponent\s*<", scan[end:])
         if gm:
@@ -3119,15 +3185,10 @@ def _ast_find_getcomponent_chains(text):
             angle_close = cpprust._match_angle(scan, angle_open)
             if angle_close is None:
                 continue
-            comp_ty = text[angle_open + 1:angle_close].strip()
-            if "." in comp_ty:
-                comp_ty = comp_ty.rsplit(".", 1)[-1]
+            comp_ty, type_idx = _comp_type_span(angle_open, angle_close)
             after_angle = scan[angle_close + 1:]
-            pm = re.match(r"\s*\(", after_angle)
-            if not pm:
+            if after_angle.find("(") < 0:
                 continue
-            g_open = angle_close + 1 + pm.start()
-            # pm matches optional space then (; open paren index:
             g_open = angle_close + 1 + after_angle.find("(")
             g_close = cpprust._match_paren(scan, g_open)
             if g_close is None:
@@ -3140,15 +3201,12 @@ def _ast_find_getcomponent_chains(text):
                 field = fm.group(1)
                 axis = fm.group(2)
                 end = end + fm.end()
-            else:
-                axis = None
-        else:
-            axis = None
         out.append({
             "start": m.start(),
             "end": end,
             "find_args": find_args.strip(),
             "component": comp_ty,
+            "type_idx": type_idx,
             "field": field,
             "axis": axis,
         })
@@ -3162,9 +3220,7 @@ def _ast_find_getcomponent_chains(text):
         angle_close = cpprust._match_angle(scan, angle_open)
         if angle_close is None:
             continue
-        comp_ty = text[angle_open + 1:angle_close].strip()
-        if "." in comp_ty:
-            comp_ty = comp_ty.rsplit(".", 1)[-1]
+        comp_ty, type_idx = _comp_type_span(angle_open, angle_close)
         after_angle = scan[angle_close + 1:]
         if after_angle.find("(") < 0:
             continue
@@ -3187,6 +3243,7 @@ def _ast_find_getcomponent_chains(text):
             "end": end,
             "find_args": None,  # this GameObject
             "component": comp_ty,
+            "type_idx": type_idx,
             "field": field,
             "axis": axis,
             "on_this": True,
@@ -3208,6 +3265,43 @@ def _build_go_tables(plan):
                 names.append(n)
             comps.setdefault(n, {})[cname] = i
     return names, comps
+
+
+def _build_go_ui_component_maps(plan):
+    """Authored UI component presence: type → set of GO names."""
+    maps = {t: set() for t in _UI_GETCOMPONENT_TYPES}
+    def mark(n, *tys):
+        if not n:
+            return
+        for t in tys:
+            if t in maps:
+                maps[t].add(n)
+
+    for cl in (plan.get("classes") or {}).values():
+        for o in cl.get("instances") or []:
+            n = o.get("name") or "obj"
+            mark(n, "RectTransform")
+            if o.get("canvas"):
+                mark(n, "Canvas")
+            if o.get("ui_image"):
+                mark(n, "Image", "RawImage", "Selectable")
+            if o.get("ui_button"):
+                mark(n, "Button", "Selectable")
+            if o.get("ui_tmp"):
+                mark(n, "TMP_Text", "TextMeshProUGUI", "TextMeshPro",
+                     "Selectable")
+    for h in plan.get("scene_hierarchy") or []:
+        n = h.get("name") or "obj"
+        mark(n, "RectTransform")
+        if h.get("has_canvas"):
+            mark(n, "Canvas")
+        if h.get("has_image"):
+            mark(n, "Image", "RawImage", "Selectable")
+        if h.get("has_button"):
+            mark(n, "Button", "Selectable")
+        if h.get("has_tmp"):
+            mark(n, "TMP_Text", "TextMeshProUGUI", "TextMeshPro")
+    return {t: sorted(s) for t, s in maps.items() if s}
 
 
 def _extend_go_tables_for_find(plan, names, comps):
@@ -3407,34 +3501,25 @@ def _validate_addcomponent_types(types, plan, analyses=None):
     analyses = analyses or []
     for t in sorted(types):
         if t in _REFUSED_ADDCOMPONENT or t not in known:
-            # Prefer Unity-style site from AddComponent<T> in scripts.
-            for a in analyses:
-                path = a.get("path") or ""
-                text = None
-                for c in a.get("classes") or []:
-                    if c.get("file_text") is not None:
-                        text = c["file_text"]
-                        break
-                if text is None and path and os.path.isfile(path):
-                    text = _read(path)
-                if not text:
-                    continue
-                scan = cs2cpp._blank(text)
-                m = re.search(
-                    r"AddComponent\s*<\s*(?:UnityEngine\.)?(%s)\s*>" % re.escape(t),
-                    scan)
-                if m:
-                    _raise_cs(path, text, m.start(1), "CS0246", _CS0246 % t)
-            if t in _REFUSED_ADDCOMPONENT:
-                raise PackError(
-                    "AddComponent<%s>: unity_pack does not invent %s assets / "
-                    "systems. Keep that component in the authored Unity project."
-                    % (t, t))
-            raise PackError(
-                "AddComponent<%s>: no packed %s — add an authored scene "
-                "instance of that MonoBehaviour, or use a supported builtin "
-                "(%s)."
-                % (t, t, ", ".join(sorted(_ADDABLE_BUILTINS))))
+            _raise_unknown_component_type(
+                t, analyses, ops=("AddComponent",))
+
+
+def _validate_getcomponent_types(types, plan, analyses=None):
+    """GetComponent<T> for unknown T → CS0246 (same as missing type).
+
+    Authored uGUI types (Canvas, Image, RectTransform, …) are allowed —
+    GetComponent looks them up; AddComponent<Canvas> invent stays refused.
+    """
+    known = (set(plan.get("classes") or {})
+             | _ADDABLE_BUILTINS
+             | _PHYSICS_COMPONENTS
+             | _UI_GETCOMPONENT_TYPES)
+    analyses = analyses or []
+    for t in sorted(types):
+        if t not in known:
+            _raise_unknown_component_type(
+                t, analyses, ops=("GetComponent", "AddComponent"))
 
 
 def _rewrite_audiosource_api(text, cl, add_locals=None):
@@ -4497,7 +4582,7 @@ def _rewrite_find_getcomponent(text, plan, this_class, site=None):
             return "0"
         return "0.f"
 
-    def _rb_field_expr(comp, field, axis, go_expr, line):
+    def _rb_field_expr(comp, field, axis, go_expr, line, body_idx=0):
         """GetComponent<Rigidbody2D/Rigidbody>().velocity.x / gravityScale."""
         get = "GameObject_GetComponent_%s(%s)" % (_c_ident(comp), go_expr)
         nre = _nre_at_expr(site, line)
@@ -4552,14 +4637,18 @@ def _rewrite_find_getcomponent(text, plan, this_class, site=None):
                         "? (%s, 0) "
                         ": _Rigidbody_use_gravity[_up_rb]; })"
                         % (get, nre))
-        raise PackError(
-            "GetComponent<%s>.%s: unsupported Rigidbody field "
-            "(use velocity.x/y, gravityScale, mass)"
-            % (comp, field or "?"))
+        _raise_cs_at_site(
+            site, body_idx, "CS1061",
+            "'%s' does not contain a definition for '%s' and no "
+            "accessible extension method '%s' accepting a first argument of "
+            "type '%s' could be found (are you missing a using "
+            "directive or an assembly reference?)"
+            % (comp, field or "?", field or "?", comp))
 
-    def _field_after_get(comp, field, go_expr, line, axis=None):
+    def _field_after_get(comp, field, go_expr, line, axis=None, body_idx=0):
         if comp in _PHYSICS_COMPONENTS:
-            return _rb_field_expr(comp, field, axis, go_expr, line)
+            return _rb_field_expr(
+                comp, field, axis, go_expr, line, body_idx)
         idn = _c_ident(comp)
         zero = _zero_for_field(comp, field)
         nre = _nre_at_expr(site, line)
@@ -4574,7 +4663,14 @@ def _rewrite_find_getcomponent(text, plan, this_class, site=None):
         return (comp in (plan.get("classes") or {})
                 or comp in _PHYSICS_COMPONENTS
                 or comp in _ADDABLE_BUILTINS
+                or comp in _UI_GETCOMPONENT_TYPES
                 or comp in set(plan.get("addcomponent_types") or []))
+
+    def _raise_unknown_comp(ch, comp):
+        idx = ch.get("type_idx")
+        if idx is None:
+            idx = ch.get("start") or 0
+        _raise_cs_at_site(site, idx, "CS0246", _CS0246 % comp)
 
     for ch in chains:
         comp = ch.get("component")
@@ -4582,17 +4678,22 @@ def _rewrite_find_getcomponent(text, plan, this_class, site=None):
         axis = ch.get("axis")
         line = _line_at(ch["start"])
         nre = _nre_at_expr(site, line)
+        body_idx = ch.get("type_idx")
+        if body_idx is None:
+            body_idx = ch.get("start") or 0
         if ch.get("on_this"):
             if not comp:
-                raise PackError("GetComponent requires a type argument")
+                _raise_cs_at_site(
+                    site, ch.get("start") or 0, "CS0305",
+                    "Using the generic method 'GameObject.GetComponent<T>()' "
+                    "requires 1 type arguments")
             this_idn = _c_ident(this_class)
             if not _known_component(comp):
-                raise PackError(
-                    "GetComponent<%s>: no authored %s in the scene — "
-                    "unity_pack does not invent components" % (comp, comp))
+                _raise_unknown_comp(ch, comp)
             go_expr = "_engine_go_of_%s(i)" % this_idn
             if field:
-                repl = _field_after_get(comp, field, go_expr, line, axis)
+                repl = _field_after_get(
+                    comp, field, go_expr, line, axis, body_idx)
             else:
                 repl = "GameObject_GetComponent_%s(%s)" % (
                     _c_ident(comp), go_expr)
@@ -4605,12 +4706,11 @@ def _rewrite_find_getcomponent(text, plan, this_class, site=None):
             repl = go_expr
         else:
             if not _known_component(comp):
-                raise PackError(
-                    "GetComponent<%s>: no authored %s in the scene — "
-                    "unity_pack does not invent components" % (comp, comp))
+                _raise_unknown_comp(ch, comp)
             if field:
                 # null Find or missing component → NRE at this source line.
-                repl = _field_after_get(comp, field, go_expr, line, axis)
+                repl = _field_after_get(
+                    comp, field, go_expr, line, axis, body_idx)
             else:
                 # null.GetComponent<T>() throws; missing component returns null.
                 repl = (
@@ -5076,6 +5176,7 @@ def _methods_in(body, bscan, body_abs=0):
             continue
         src = body[m.start():m.start() + (close - m.start()) + 1]
         impl = body[m.end():m.start() + (close - m.start())]
+        decl = m.group(0)
         out.append({
             "ret": m.group(1).strip(),
             "name": m.group(2),
@@ -5083,8 +5184,46 @@ def _methods_in(body, bscan, body_abs=0):
             "body": impl,
             "body_abs": int(body_abs) + int(m.end()),
             "src": src,
+            "public": bool(re.search(r"\bpublic\b", decl)),
         })
     return out
+
+
+# Unity messages we emit (Awake / OnEnable are skipped — run before first tick).
+_UNITY_EMIT_MESSAGES = frozenset({
+    "Start", "Update", "FixedUpdate", "LateUpdate",
+    "OnDisable", "OnDestroy",
+    "OnCollisionEnter2D", "OnCollisionStay2D", "OnCollisionExit2D",
+    "OnTriggerEnter2D", "OnTriggerStay2D", "OnTriggerExit2D",
+})
+
+
+def _reachable_emit_methods(methods):
+    """Methods to lower: Unity messages, public API, and private callees.
+
+    Editor-only helpers (e.g. UpdateCanvas only called from OnValidate) stay out.
+    """
+    by = {}
+    for m in methods or []:
+        by[m["name"]] = m
+    roots = set()
+    for name, m in by.items():
+        if name in ("Awake", "OnEnable", "OnValidate"):
+            continue
+        if name in _UNITY_EMIT_MESSAGES or m.get("public"):
+            roots.add(name)
+    reach = set(roots)
+    queue = list(roots)
+    while queue:
+        name = queue.pop()
+        body = (by.get(name) or {}).get("body") or ""
+        for other in by:
+            if other in reach:
+                continue
+            if re.search(r"(?<![\w.])%s\s*\(" % re.escape(other), body):
+                reach.add(other)
+                queue.append(other)
+    return reach
 
 
 # ---------------------------------------------------------------------------
@@ -6635,9 +6774,34 @@ def emit_engine(plan, analyses, used_apis):
             p("    return _object_tostring_buf;")
             p("}")
             p("")
+        # Authored uGUI GetComponent<T> — opaque GO handles (not AddComponent invent).
+        ui_gc = sorted(getcomponent_types & _UI_GETCOMPONENT_TYPES)
+        if ui_gc and want_go_tables:
+            ui_maps = plan.get("go_ui_components") or {}
+            go_n = max(1, len(go_names))
+            for ty in ui_gc:
+                idn = _c_ident(ty)
+                present = set(ui_maps.get(ty) or [])
+                vals = []
+                for i, n in enumerate(go_names if go_names else [""]):
+                    if ty == "RectTransform":
+                        vals.append(str(i))
+                    elif n in present:
+                        vals.append(str(i))
+                    else:
+                        vals.append("-1")
+                p("/* GetComponent<%s> — authored UI; handle is GO index */" % ty)
+                p("static const int _engine_go_%s[%d] = { %s };" % (
+                    idn, go_n, ", ".join(vals)))
+                p("static int GameObject_GetComponent_%s(int go) {" % idn)
+                p("    if (go < 0 || go >= _engine_go_count) return -1;")
+                p("    return _engine_go_%s[go];" % idn)
+                p("}")
+                p("")
         # Emit GetComponent_<T> for every packed class (and requested types).
         for cname in sorted(set(plan["classes"]) | (
-                getcomponent_types - _PHYSICS_COMPONENTS) | (
+                getcomponent_types - _PHYSICS_COMPONENTS
+                - _UI_GETCOMPONENT_TYPES) | (
                 add_types - _ADDABLE_BUILTINS)):
             if cname not in plan["classes"]:
                 continue
@@ -7703,8 +7867,12 @@ def emit_engine(plan, analyses, used_apis):
                 p("static void %s_set_%s(unsigned i, unsigned v) { %s_AT(i).%s = v; }"
                   % (idn, name, idn, name))
         p("")
+        emit_names = _reachable_emit_methods(
+            [m for _c, m in methods_by.get(cname, [])])
         for c, m in methods_by.get(cname, []):
             if m["name"] in ("Awake", "OnEnable"):
+                continue
+            if m["name"] not in emit_names:
                 continue
             # TypeInitializer failed — do not lower or run script methods.
             if cl.get("ctor_forbidden"):
@@ -10752,8 +10920,11 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = _rewrite_find_getcomponent(text, plan, cl["name"], site=site)
     text, add_locals = _rewrite_addcomponent(text, plan, cl["name"])
     text = _rewrite_audiosource_api(text, cl, add_locals=add_locals)
-    # AudioSource locals / params are packed indices (like Transform / GO).
+    # AudioSource / authored UI component locals are packed indices.
     text = re.sub(r"\bAudioSource\b(?=\s+\w)", "int", text)
+    for ui_ty in sorted(_UI_GETCOMPONENT_TYPES, key=len, reverse=True):
+        text = re.sub(
+            r"\b%s\b(?=\s+\w)" % re.escape(ui_ty), "int", text)
     # API tokens before Vector2 rewrites so nested Mathf.Sin(...) keeps parens.
     text = text.replace("Time.deltaTime", "Time_deltaTime")
     text = text.replace("Time.fixedDeltaTime", "Time_fixedDeltaTime")
@@ -11992,12 +12163,25 @@ def pack(root, outdir, soa=False, soa_vec4=False):
             else:
                 _raise_cs(path, text, idx, "CS0246", _CS0246 % (
                     api if api != "Canvas" else "Canvas"))
-        raise PackError("%s: %s" % (api, reason))
+        # No precise site — still Unity-shaped.
+        if "." in api and api != "UnityEngine.UI":
+            ty, member = api.split(".", 1)
+            raise PackError(
+                "<cs>(1,1): error CS0117: '%s' does not contain a "
+                "definition for '%s'" % (ty, member))
+        raise PackError(
+            "<cs>(1,1): error CS0246: %s" % (_CS0246 % api))
     add_types = _collect_addcomponent_types(analyses)
     if "Camera.main" in used_apis and not cameras:
+        site = _refused_api_site(analyses, "Camera.main")
+        if site:
+            path, text, idx = site
+            _raise_cs(
+                path, text, idx, "CS0117",
+                "'Camera' does not contain a definition for 'main'")
         raise PackError(
-            "Camera.main: no Camera in the scene — unity_pack does not invent "
-            "a default camera. Add an authored Camera (tag MainCamera).")
+            "<cs>(1,1): error CS0117: 'Camera' does not contain a "
+            "definition for 'main'")
     _progress("planning layouts (%d objects)" % len(objects))
     plan = plan_layouts(objects, analyses)
     if soa or soa_vec4:
@@ -12007,6 +12191,10 @@ def pack(root, outdir, soa=False, soa_vec4=False):
         plan["soa"] = False
         plan["soa_vec4"] = False
     _validate_addcomponent_types(add_types, plan, analyses)
+    gc_types = set()
+    for a in analyses:
+        gc_types |= set(a.get("getcomponent_types") or [])
+    _validate_getcomponent_types(gc_types, plan, analyses)
     plan["addcomponent_types"] = sorted(add_types)
     plan["addcomponent_budget"] = _addcomponent_budget(analyses, plan)
     plan["disallow_multiple_types"] = sorted(_disallow_multiple_types(analyses))
@@ -12044,13 +12232,19 @@ def pack(root, outdir, soa=False, soa_vec4=False):
     plan["screen_fullscreen_native"] = snative
     plan["screen_maximized"] = smax
     go_names, go_comps = _build_go_tables(plan)
+    ui_gc = set()
+    for a in analyses:
+        ui_gc |= set(a.get("getcomponent_types") or [])
+    ui_gc &= _UI_GETCOMPONENT_TYPES
     if ("transform.Find" in used_apis or "transform.parent" in used_apis
             or "transform.SetParent" in used_apis
-            or "transform.GetSiblingIndex" in used_apis):
+            or "transform.GetSiblingIndex" in used_apis
+            or ui_gc):
         go_names, go_comps = _extend_go_tables_for_find(
             plan, go_names, go_comps)
     plan["go_names"] = go_names
     plan["go_components"] = go_comps
+    plan["go_ui_components"] = _build_go_ui_component_maps(plan)
     plan["go_parents"] = _build_go_parents(plan)
     plan["go_siblings"] = _build_go_sibling_indices(plan["go_parents"])
     plan["ui_buttons"] = _build_ui_buttons(plan)

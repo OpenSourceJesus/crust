@@ -4492,6 +4492,93 @@ class TestSystems(unittest.TestCase):
         self.assertIn("Assets/Scripts/Unity Overrides/_Selectable.cs(",
                       cm.exception.message)
 
+    def test_getcomponent_unknown_is_cs0246_with_site(self):
+        """GetComponent of a non-packed type → CS0246 at the type token."""
+        root = tempfile.mkdtemp(prefix="upack-gc-miss-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Hud.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Hud : MonoBehaviour {\n"
+                "    void Start() {\n"
+                "        NoSuchComp c = GetComponent<NoSuchComp>();\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Hud.cs.meta"), "w") as f:
+            f.write("guid: cccccccccccccccccccccccccccccccc\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Hud\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: cccccccccccccccccccccccccccccccc}\n"
+            )
+        with self.assertRaises(unity_pack.PackError) as cm:
+            unity_pack.pack(root, tempfile.mkdtemp(prefix="upack-out-"))
+        msg = cm.exception.message
+        self.assertIn("error CS0246", msg)
+        self.assertIn("NoSuchComp", msg)
+        self.assertIn("Assets/Scripts/Hud.cs(", msg)
+        self.assertNotIn("does not invent", msg)
+        self.assertNotIn("no authored", msg)
+
+    def test_getcomponent_canvas_is_authored_ui(self):
+        """GetComponent<Canvas> on authored UI packs (not CS0246 invent)."""
+        root = tempfile.mkdtemp(prefix="upack-gc-canvas-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Hud.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "using UnityEngine.UI;\n"
+                "public class Hud : MonoBehaviour {\n"
+                "    void Start() {\n"
+                "        Canvas c = GetComponent<Canvas>();\n"
+                "        RectTransform rt = GetComponent<RectTransform>();\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Hud.cs.meta"), "w") as f:
+            f.write("guid: dddddddddddddddddddddddddddddddd\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Hud\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "  - component: {fileID: 4}\n"
+                "--- !u!224 &2\nRectTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!223 &3\nCanvas:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n"
+                "--- !u!114 &4\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: dddddddddddddddddddddddddddddddd}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-out-")
+        plan = unity_pack.pack(root, d)
+        self.assertIn("Canvas", plan.get("go_ui_components") or {})
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("GameObject_GetComponent_Canvas", eng)
+        self.assertIn("GameObject_GetComponent_RectTransform", eng)
+
     def test_ast_find_getcomponent_chain(self):
         """cpprust paren/angle parse of Find().GetComponent<T>().field."""
         src = (
