@@ -18,14 +18,17 @@ invent-requiring APIs today is a hard `PackError`.
 Emitted `engine.cpp` / `data.cpp` / `main.cpp` (C++-subset twins) are
 gated through `cpprust.translate`, then the translated C is compiled with
 crust/`shivyc`. Leaving that subset or failing crust compile is a
-`PackError` on the generated file. Host `Makefile` defaults to `gcc`
-(`CC=clang` for clang). Engine objects use `-O3 -fno-math-errno` (math loops
-can autovec). `make vectorize-report` compiles `engine.c` with those flags plus
-`clang -Rpass-missed=loop-vectorize,slp-vectorize` so missed auto-vectorization
-remarks print on stderr. `make crust-check` recompiles the `.c` files with
-crust. Microbenches `tools/unity_pack_bench_upload.py` and
-`tools/unity_pack_bench_csharp.py` time C under both gcc and clang when both
-are on PATH (`--cc` to restrict).
+`PackError` on the generated file. Pack writes the translated C as
+`engine.c` / `main.c` (and `data.c` when not skipped for size) so the host
+`Makefile` / player build compile with `gcc` (`CC=clang` for clang) —
+`List` / `GetComponentsInChildren` become crust `vector_int` rather than
+linking `libstdc++`. Engine objects use `-O3 -fno-math-errno` (math loops
+can autovec). `make vectorize-report` compiles `engine.c` with those flags
+plus `clang -Rpass-missed=loop-vectorize,slp-vectorize` so missed
+auto-vectorization remarks print on stderr. `make crust-check` recompiles
+the lowered `.c` files with crust. Microbenches
+`tools/unity_pack_bench_upload.py` and `tools/unity_pack_bench_csharp.py`
+time C under both gcc and clang when both are on PATH (`--cc` to restrict).
 
 What *is* lowered: APIs and methods on the MonoBehaviours / scene
 instances that are already placed.

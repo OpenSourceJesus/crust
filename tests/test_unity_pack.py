@@ -820,6 +820,60 @@ class TestSystems(unittest.TestCase):
         self.assertNotIn("new List", eng)
         self.assertNotIn("error CS0246", eng)
 
+    @needs_cc
+    def test_player_build_uses_cpprust_lowered_engine_c(self):
+        """Player compiles engine.c (cpprust-lowered), not g++ on engine.cpp."""
+        root = tempfile.mkdtemp(prefix="upack-player-c-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "P.cs"), "w") as f:
+            f.write(
+                "using System.Collections.Generic;\n"
+                "using UnityEngine;\n"
+                "public class P : MonoBehaviour {\n"
+                "    void Start() {\n"
+                "        List<int> xs = new List<int>();\n"
+                "        xs.Add(1);\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "P.cs.meta"), "w") as f:
+            f.write("guid: playecxplayecxplayecxplayecx01\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: P\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: playecxplayecxplayecxplayecx01}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-player-c-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.cpp")) as f:
+            cpp = f.read()
+        with open(os.path.join(d, "engine.c")) as f:
+            c = f.read()
+        self.assertIn("#include <vector>", cpp)
+        self.assertIn("std::vector", cpp)
+        self.assertNotIn("#include <vector>", c)
+        self.assertNotIn("std::vector", c)
+        self.assertIn("vector_int", c)
+        with open(os.path.join(d, "Makefile")) as f:
+            mk = f.read()
+        self.assertIn("engine.o: engine.c", mk)
+        self.assertIn("$(CC)", mk)
+        self.assertNotIn("engine.o: engine.cpp", mk)
+        exe = unity_pack.build_player_executable(d, "VectorPlayer")
+        self.assertTrue(os.path.isfile(exe), exe)
+
     def test_cross_class_static_list_rewrites(self):
         """OtherClass.staticList.Count / [i] → OtherClass_staticList."""
         root = tempfile.mkdtemp(prefix="upack-xlist-")
@@ -1272,12 +1326,16 @@ class TestSystems(unittest.TestCase):
         unity_pack.pack(root, d)
         with open(os.path.join(d, "engine.c")) as f:
             eng = f.read()
+        with open(os.path.join(d, "engine.cpp")) as f:
+            cpp = f.read()
         self.assertIn("GameObject_GetComponentsInChildren_Part", eng)
         self.assertIn("_engine_go_is_child_of", eng)
         self.assertIn(
             "std::vector<int> parts = "
-            "GameObject_GetComponentsInChildren_Part(", eng)
-        self.assertIn("parts.size()", eng)
+            "GameObject_GetComponentsInChildren_Part(", cpp)
+        self.assertIn("vector_int", eng)
+        self.assertNotIn("std::vector", eng)
+        self.assertIn("vector_int_size(&parts)", eng)
         self.assertNotIn("GetComponentsInChildren<Part>", eng)
         self.assertNotIn("unlowered C#", eng)
         self.assertNotIn("Part[]", eng)
@@ -1349,12 +1407,15 @@ class TestSystems(unittest.TestCase):
         unity_pack.pack(root, d)
         with open(os.path.join(d, "engine.c")) as f:
             eng = f.read()
+        with open(os.path.join(d, "engine.cpp")) as f:
+            cpp = f.read()
         self.assertIn("GameObject_GetComponentsInChildren_Weapon", eng)
         self.assertIn("GameObject_GetComponent_Blaster(go)", eng)
         self.assertIn(
             "std::vector<int> ws = "
             "GameObject_GetComponentsInChildren_Weapon(", cpp)
         self.assertNotIn("Weapon could not be found", eng)
+        self.assertNotIn("std::vector", eng)
 
     def test_getcomponentsinchildren_on_instantiated(self):
         """clone.GetComponentsInChildren after Instantiate uses clone GO."""
