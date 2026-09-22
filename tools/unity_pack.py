@@ -59,7 +59,10 @@ _APPLICATION_SUPPORTED = frozenset({
 })
 
 # UnityEngine.Quaternion members we emit. Others → CS0117 (in scope via UnityEngine).
-_QUATERNION_SUPPORTED = frozenset({"Euler", "identity", "LookRotation", "Slerp"})
+_QUATERNION_SUPPORTED = frozenset({
+    "Euler", "identity", "LookRotation", "Slerp", "Inverse", "Angle",
+    "RotateTowards",
+})
 
 # MonoBehaviour.transform members we lower. Others → CS1061 on Transform
 # (transform itself is always in scope; blame the missing member).
@@ -79,10 +82,10 @@ def _check_file_api(path, text, scan):
         method = m.group(1)
         if method in _FILE_SUPPORTED:
             continue
-        is_fqn = m.group(0).startswith("System.IO.")
+        is_fqn = m.group(1) is not None
         if not is_fqn and not has_io:
             continue  # bare File without using — not CS0117
-        method_idx = m.start(1)
+        method_idx = m.start(1) if is_fqn else m.start(2)
         line = text.count("\n", 0, method_idx) + 1
         col = method_idx - (text.rfind("\n", 0, method_idx) + 1) + 1
         raise PackError(
@@ -93,9 +96,13 @@ def _check_file_api(path, text, scan):
 
 
 def _check_application_api(path, text, scan):
-    """Unsupported Application.Member with UnityEngine in scope → CS0117."""
+    """Unsupported Application.Member with UnityEngine in scope → CS0117.
+
+    Must not match inside ``EditorApplication`` / other *Application types.
+    """
     has_ue = bool(re.search(r"using\s+UnityEngine\b", scan))
-    for m in re.finditer(r"(?:UnityEngine\.)?Application\.(\w+)\b", scan):
+    for m in re.finditer(
+            r"(?<![\w])(?:UnityEngine\.)?Application\.(\w+)\b", scan):
         member = m.group(1)
         if member in _APPLICATION_SUPPORTED:
             continue
@@ -4295,6 +4302,18 @@ def analyze_script(path, text=None):
     if re.search(r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*Find\s*\(",
                  scan):
         apis.add("transform.Find")
+    # foo.transform.Find / trs.Find (Transform receiver — live GO index).
+    if re.search(r"\.\s*transform\s*\.\s*Find\s*\(", scan):
+        apis.add("transform.Find")
+    if re.search(r"(?<![.\w])\w+\s*\.\s*Find\s*\(", scan):
+        # May be List.Find etc.; rewrite only when receiver is Transform/GO.
+        # Still record so parent tables emit when a Transform.Find exists.
+        if re.search(
+                r"(?:Transform|GameObject)\s+\w+\s*=|"
+                r"\.\s*transform\s*\.\s*Find\s*\(|"
+                r"(?:this\s*\.\s*)?transform\s*\.\s*Find\s*\(",
+                scan):
+            apis.add("transform.Find")
     if re.search(r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*localScale\b",
                  scan):
         apis.add("transform.localScale")
@@ -4348,15 +4367,18 @@ def analyze_script(path, text=None):
         apis.add("Debug.Log")
     if re.search(r"(?<![\w.])print\s*\(", scan):
         apis.add("print")
-    if re.search(r"(?:UnityEngine\.)?Application\.dataPath\b", scan):
+    if re.search(r"(?<![\w])(?:UnityEngine\.)?Application\.dataPath\b", scan):
         apis.add("Application.dataPath")
-    if re.search(r"(?:UnityEngine\.)?Application\.persistentDataPath\b", scan):
+    if re.search(
+            r"(?<![\w])(?:UnityEngine\.)?Application\.persistentDataPath\b",
+            scan):
         apis.add("Application.persistentDataPath")
-    if re.search(r"(?:UnityEngine\.)?Application\.isEditor\b", scan):
+    if re.search(r"(?<![\w])(?:UnityEngine\.)?Application\.isEditor\b", scan):
         apis.add("Application.isEditor")
-    if re.search(r"(?:UnityEngine\.)?Application\.isPlaying\b", scan):
+    if re.search(r"(?<![\w])(?:UnityEngine\.)?Application\.isPlaying\b", scan):
         apis.add("Application.isPlaying")
-    if re.search(r"(?:UnityEngine\.)?Application\.OpenURL\s*\(", scan):
+    if re.search(
+            r"(?<![\w])(?:UnityEngine\.)?Application\.OpenURL\s*\(", scan):
         apis.add("Application.OpenURL")
     if re.search(r"(?:System\.IO\.)?File\.WriteAllText\s*\(", scan):
         apis.add("File.WriteAllText")
@@ -4492,23 +4514,24 @@ def _parse_csharp_field_init(ty, raw):
             return lit
         # Application.dataPath / persistentDataPath + "/rel" — pack-time bake.
         m = re.match(
-            r"(?:UnityEngine\.)?Application\.dataPath\s*\+\s*"
+            r"(?<![\w])(?:UnityEngine\.)?Application\.dataPath\s*\+\s*"
             r"(\"([^\"\\]|\\.)*\")\s*$",
             raw)
         if m:
             return {"kind": "dataPath+", "suffix": _string_literal_value(
                 m.group(1))}
-        if re.match(r"(?:UnityEngine\.)?Application\.dataPath\s*$", raw):
+        if re.match(
+                r"(?<![\w])(?:UnityEngine\.)?Application\.dataPath\s*$", raw):
             return {"kind": "dataPath"}
         m = re.match(
-            r"(?:UnityEngine\.)?Application\.persistentDataPath\s*\+\s*"
+            r"(?<![\w])(?:UnityEngine\.)?Application\.persistentDataPath\s*\+\s*"
             r"(\"([^\"\\]|\\.)*\")\s*$",
             raw)
         if m:
             return {"kind": "persistentDataPath+", "suffix":
                     _string_literal_value(m.group(1))}
         if re.match(
-                r"(?:UnityEngine\.)?Application\.persistentDataPath\s*$",
+                r"(?<![\w])(?:UnityEngine\.)?Application\.persistentDataPath\s*$",
                 raw):
             return {"kind": "persistentDataPath"}
         return None
@@ -4583,7 +4606,7 @@ def _fields_in(body, bscan, body_abs=0):
                 # Unity forbids Application.dataPath / persistentDataPath in
                 # MonoBehaviour field initializers / .cctor (not Awake/Start).
                 am = re.search(
-                    r"(?:UnityEngine\.)?Application\."
+                    r"(?<![\w])(?:UnityEngine\.)?Application\."
                     r"(dataPath|persistentDataPath)\b",
                     init_src)
                 if am:
@@ -5095,7 +5118,7 @@ def emit_engine(plan, analyses, used_apis):
         p("/* layout: SoA positions (contiguous float tables for GPU upload) */")
     p("#include <stdint.h>")
     if (want_math or want_col2d or want_col3d or want_anim or want_live_rot
-            or want_transform_matrix):
+            or want_transform_matrix or want_quat_angle):
         p("#include <math.h>")
     if (want_input or want_log or want_find or want_transform_find
             or want_set_parent
@@ -5103,7 +5126,8 @@ def emit_engine(plan, analyses, used_apis):
             or want_file_io):
         p("#include <string.h>")
     if (want_log or want_console or want_str_plus or want_add_any
-            or want_file_io or want_go_tables or want_ctor_forbidden):
+            or want_file_io or want_go_tables or want_ctor_forbidden
+            or want_app_open_url):
         p("#include <stdio.h>")
     want_draw_sort = False
     for cl in plan["classes"].values():
@@ -5115,7 +5139,8 @@ def emit_engine(plan, analyses, used_apis):
         if want_draw_sort:
             break
     if (want_log or want_draw_sort or want_data_path
-            or want_persistent_data_path or want_file_io or want_go_tables):
+            or want_persistent_data_path or want_file_io or want_go_tables
+            or want_app_open_url):
         p("#include <stdlib.h>")
     if want_go_tables:
         p("#include <setjmp.h>")
@@ -5665,25 +5690,30 @@ def emit_engine(plan, analyses, used_apis):
     if want_file_write_ops:
         if not want_log:
             p("#ifndef CRUST_NO_POSIX_MKDIR")
-            p("static int _engine_mkdir_p(char *path) {")
-            p("    char *p;")
-            p("    if (!path || !path[0]) return -1;")
-            p("    for (p = path + 1; *p; p++) {")
+            p("    char dir[1024];")
+            p("    int n, i;")
+            p("    if (path && path[0]) {")
+            p("        n = (int)strlen(path);")
+            p("        if (n > 0 && (size_t)n < sizeof dir) {")
+            p("            for (i = 0; i < n; i++) dir[i] = path[i];")
+            p("            dir[n] = 0;")
+            p("            for (i = n - 1; i >= 0; i--) {")
             p("#ifdef _WIN32")
-            p("        if (*p == '/' || *p == '\\\\') {")
+            p("                if (dir[i] == '/' || dir[i] == '\\\\') {")
+            p("                    dir[i] = 0; break;")
+            p("                }")
             p("#else")
-            p("        if (*p == '/') {")
+            p("                if (dir[i] == '/') { dir[i] = 0; break; }")
             p("#endif")
-            p("            char sep = *p;")
-            p("            *p = 0;")
-            p("            if (ENGINE_MKDIR(path) != 0 && errno != EEXIST) {")
-            p("                *p = sep; return -1;")
             p("            }")
-            p("            *p = sep;")
+            p("            if (dir[0]) _engine_mkdir_p(dir);")
             p("        }")
             p("    }")
-            p("    if (ENGINE_MKDIR(path) != 0 && errno != EEXIST) return -1;")
-            p("    return 0;")
+            p("#endif")
+            p("    fp = fopen(path ? path : \"\", mode ? mode : \"w\");")
+            p("    if (!fp) return;")
+            p("    if (contents) fputs(contents, fp);")
+            p("    fclose(fp);")
             p("}")
             p("#endif")
             p("")
@@ -6190,10 +6220,11 @@ def emit_engine(plan, analyses, used_apis):
         go_parents = plan.get("go_parents") or ([-1] * go_n)
         if len(go_parents) < go_n:
             go_parents = list(go_parents) + [-1] * (go_n - len(go_parents))
-        p("/* Transform hierarchy (m_Father → GO index); mutable for SetParent */"
-          if want_set_parent else
+        p("/* Transform hierarchy (live GO parents; seeded from m_Father) */"
+          if (want_set_parent or want_transform_find) else
           "/* Authored Transform hierarchy (m_Father → GO index) */")
-        if want_set_parent:
+        # Mutable whenever Find or SetParent runs — Find walks live parents.
+        if want_set_parent or want_transform_find:
             p("static int _engine_go_parent[%d] = { %s };" % (
                 go_n, ", ".join(str(int(x)) for x in go_parents[:go_n])))
         else:
@@ -6207,6 +6238,7 @@ def emit_engine(plan, analyses, used_apis):
             p("")
         if want_transform_find:
             # Unity Transform.Find: direct child or path with '/'; -1 = null.
+            # Walks the live parent table (updated by SetParent).
             p("static int Transform_Find(int parent, const char *path) {")
             p("    char seg[256];")
             p("    const char *p;")
@@ -6666,6 +6698,55 @@ def emit_engine(plan, analyses, used_apis):
         p("    } else {")
         p("        *ox = 0.f; *oy = 0.f; *oz = 0.f; *ow = 1.f;")
         p("    }")
+        p("}")
+        p("")
+        p("/* Quaternion.Inverse(q) — conjugate / |q|^2 (Unity). */")
+        p("static void _engine_quat_inverse(")
+        p("    float x, float y, float z, float w,")
+        p("    float *ox, float *oy, float *oz, float *ow) {")
+        p("    float n2 = x * x + y * y + z * z + w * w;")
+        p("    float inv;")
+        p("    if (n2 < 1e-20f) {")
+        p("        *ox = 0.f; *oy = 0.f; *oz = 0.f; *ow = 1.f;")
+        p("        return;")
+        p("    }")
+        p("    inv = 1.f / n2;")
+        p("    *ox = -x * inv;")
+        p("    *oy = -y * inv;")
+        p("    *oz = -z * inv;")
+        p("    *ow = w * inv;")
+        p("}")
+        p("")
+
+    if want_live_rot or want_quat_angle:
+        p("/* Quaternion.Angle(a, b) — degrees between rotations (Unity). */")
+        p("static float _engine_quat_angle(")
+        p("    float ax, float ay, float az, float aw,")
+        p("    float bx, float by, float bz, float bw) {")
+        p("    float dot = ax * bx + ay * by + az * bz + aw * bw;")
+        p("    if (dot < 0.f) dot = -dot;")
+        p("    if (dot > 1.f) dot = 1.f;")
+        p("    return acosf(dot) * 114.59155902616465f;")
+        p("}")
+        p("")
+
+    if want_live_rot:
+        p("/* Quaternion.RotateTowards(from, to, maxDegreesDelta) — Unity. */")
+        p("static void _engine_quat_rotate_towards(")
+        p("    float ax, float ay, float az, float aw,")
+        p("    float bx, float by, float bz, float bw,")
+        p("    float max_deg,")
+        p("    float *ox, float *oy, float *oz, float *ow) {")
+        p("    float ang = _engine_quat_angle("
+           "ax, ay, az, aw, bx, by, bz, bw);")
+        p("    float t;")
+        p("    if (ang < 1e-6f) {")
+        p("        *ox = bx; *oy = by; *oz = bz; *ow = bw;")
+        p("        return;")
+        p("    }")
+        p("    t = max_deg / ang;")
+        p("    _engine_quat_slerp("
+           "ax, ay, az, aw, bx, by, bz, bw, t, ox, oy, oz, ow);")
         p("}")
         p("")
 
@@ -8571,6 +8652,10 @@ def _rewrite_transform_set_parent(text, cl, plan):
     """
     if not plan.get("go_names"):
         return text
+    trs_locals = set()
+    for lm in re.finditer(
+            r"\b(?:Transform|GameObject)\s+(\w+)\b", text):
+        trs_locals.add(lm.group(1))
     out = []
     i = 0
     # recv.transform.SetParent | (this.)transform.SetParent | recv.SetParent
@@ -8584,15 +8669,17 @@ def _rewrite_transform_set_parent(text, cl, plan):
         if not m:
             out.append(text[i:])
             break
-        # Bare Ident.SetParent only when Ident is a Transform/GameObject field.
+        # Bare Ident.SetParent only when Ident is a Transform/GameObject
+        # field or local.
         if m.group("trecv") and not m.group("tr"):
             trecv = m.group("trecv")
-            is_trs = False
-            for f in cl.get("fields") or []:
-                if f.get("name") == trecv and f.get("ty") in (
-                        "Transform", "GameObject"):
-                    is_trs = True
-                    break
+            is_trs = trecv in trs_locals
+            if not is_trs:
+                for f in cl.get("fields") or []:
+                    if f.get("name") == trecv and f.get("ty") in (
+                            "Transform", "GameObject"):
+                        is_trs = True
+                        break
             if not is_trs:
                 out.append(text[i:m.end()])
                 i = m.end()
@@ -8720,34 +8807,72 @@ def _rewrite_transform_point(text, cl, plan):
 
 
 def _rewrite_transform_find(text, cl, plan):
-    """Lower transform.Find(path) → Transform_Find(this_go, path).
+    """Lower Transform.Find(path) → Transform_Find(parent_go, path).
 
+    Supports:
+      transform.Find("Child");
+      other.transform.Find("Child");
+      trs.Find("Child");           # Transform / GameObject field or local
+      GameObject.Find("P").transform.Find("C");
+      GameObject_Find("P").Find("C");  # after .transform strip
     Unity: direct child name or nested path with '/'; missing → null (-1).
-    Requires authored go_names / go_parents tables.
+    Walks the live parent table (updated by SetParent).
     """
     if not plan.get("go_names"):
         return text
-    idn = _c_ident(cl["name"])
-    go_expr = "_engine_go_of_%s(i)" % idn
+    # Locals declared as Transform / GameObject in this method body.
+    trs_locals = set()
+    for lm in re.finditer(
+            r"\b(?:Transform|GameObject)\s+(\w+)\b", text):
+        trs_locals.add(lm.group(1))
     out = []
     i = 0
+    # GameObject.Find(...).transform.Find | GameObject_Find(...).Find |
+    # recv.transform.Find | (this.)transform.Find | recv.Find
+    pat = re.compile(
+        r"(?:"
+        r"(?P<gofind>(?:GameObject\s*\.\s*Find|GameObject_Find)\s*\([^)]*\))"
+        r"(?:\s*\.\s*transform)?\s*\.\s*"
+        r"|(?<![.\w])(?P<tr>\w+)\s*\.\s*transform\s*\.\s*"
+        r"|(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*"
+        r"|(?<![.\w])(?P<trecv>\w+)\s*\.\s*"
+        r")"
+        r"Find\s*\(")
     while i < len(text):
-        m = re.search(
-            r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*Find\s*\(",
-            text[i:])
+        m = pat.search(text, i)
         if not m:
             out.append(text[i:])
             break
-        start = i + m.start()
-        open_paren = i + m.end() - 1
+        # Bare Ident.Find only when Ident is a Transform/GameObject field/local.
+        if m.group("trecv") and not m.group("tr") and not m.group("gofind"):
+            trecv = m.group("trecv")
+            is_trs = trecv in trs_locals
+            if not is_trs:
+                for f in cl.get("fields") or []:
+                    if f.get("name") == trecv and f.get("ty") in (
+                            "Transform", "GameObject"):
+                        is_trs = True
+                        break
+            if not is_trs:
+                out.append(text[i:m.end()])
+                i = m.end()
+                continue
+        open_paren = m.end() - 1
         parsed = _match_call_args(text, open_paren)
         if not parsed:
             out.append(text[i:open_paren + 1])
             i = open_paren + 1
             continue
         args_str, after = parsed
-        out.append(text[i:start])
-        out.append("Transform_Find(%s, %s)" % (go_expr, args_str.strip()))
+        out.append(text[i:m.start()])
+        if m.group("gofind"):
+            parent = m.group("gofind")
+            parent = re.sub(
+                r"GameObject\s*\.\s*Find\s*\(", "GameObject_Find(", parent)
+        else:
+            recv = m.group("tr") or m.group("trecv")
+            parent = _setparent_go_expr(recv, cl)
+        out.append("Transform_Find(%s, %s)" % (parent, args_str.strip()))
         i = after
     return "".join(out)
 
@@ -8991,6 +9116,10 @@ def _parse_quat_components(a, cl):
     # Nested Euler / LookRotation / identity via existing parser (non-slerp).
     if re.match(r"(?:UnityEngine\.)?Quaternion\.Slerp\s*\(", a):
         return None
+    if re.match(r"(?:UnityEngine\.)?Quaternion\.Inverse\s*\(", a):
+        return None
+    if re.match(r"(?:UnityEngine\.)?Quaternion\.RotateTowards\s*\(", a):
+        return None
     parsed = _parse_quaternion_expr(a, cl)
     if parsed and parsed[0] == "quat":
         return parsed[1]
@@ -8998,7 +9127,8 @@ def _parse_quat_components(a, cl):
 
 
 def _parse_quaternion_expr(rhs, cl=None):
-    """Parse Quaternion.Euler / LookRotation / Slerp / identity / new."""
+    """Parse Quaternion.Euler / LookRotation / Slerp / Inverse /
+    RotateTowards / identity / new."""
     rhs = rhs.strip()
     if re.match(r"(?:UnityEngine\.)?Quaternion\.identity\s*$", rhs):
         return ("quat", ("0.f", "0.f", "0.f", "1.f"))
@@ -9039,12 +9169,79 @@ def _parse_quaternion_expr(rhs, cl=None):
             if a and b:
                 return ("slerp", (a, b, args[2]))
         return None
+    im = re.match(r"(?:UnityEngine\.)?Quaternion\.Inverse\s*\((.*)\)$",
+                  rhs, flags=re.S)
+    if im:
+        if cl is None:
+            return None
+        args = _split_call_args(im.group(1))
+        if len(args) == 1:
+            q = _parse_quat_components(args[0], cl)
+            if q:
+                return ("inverse", q)
+        return None
+    rm = re.match(
+        r"(?:UnityEngine\.)?Quaternion\.RotateTowards\s*\((.*)\)$",
+        rhs, flags=re.S)
+    if rm:
+        if cl is None:
+            return None
+        args = _split_call_args(rm.group(1))
+        if len(args) == 3:
+            a = _parse_quat_components(args[0], cl)
+            b = _parse_quat_components(args[1], cl)
+            if a and b:
+                return ("rotate_towards", (a, b, args[2]))
+        return None
     nm = re.match(r"new\s+Quaternion\s*\((.*)\)$", rhs, flags=re.S)
     if nm:
         args = _split_call_args(nm.group(1))
         if len(args) >= 4:
             return ("quat", (args[0], args[1], args[2], args[3]))
     return None
+
+
+def _rewrite_quaternion_angle(text, cl):
+    """Lower Quaternion.Angle(a, b) → _engine_quat_angle(...components...).
+
+    Returns degrees between two rotations (Unity). Args must lower via
+    ``_parse_quat_components`` (identity / transform.rotation / new / …).
+    """
+    out = []
+    i = 0
+    pat = re.compile(r"(?<![\w.])(?:UnityEngine\.)?Quaternion\.Angle\s*\(")
+    while i < len(text):
+        m = pat.search(text, i)
+        if not m:
+            out.append(text[i:])
+            break
+        open_paren = m.end() - 1
+        parsed = _match_call_args(text, open_paren)
+        if not parsed:
+            out.append(text[i:open_paren + 1])
+            i = open_paren + 1
+            continue
+        args_str, after = parsed
+        args = _split_call_args(args_str)
+        out.append(text[i:m.start()])
+        if len(args) != 2:
+            out.append(text[m.start():after])
+            i = after
+            continue
+        a = _parse_quat_components(args[0], cl)
+        b = _parse_quat_components(args[1], cl)
+        if not a or not b:
+            out.append(text[m.start():after])
+            i = after
+            continue
+        ax, ay, az, aw = a
+        bx, by, bz, bw = b
+        out.append(
+            "_engine_quat_angle((%s), (%s), (%s), (%s), "
+            "(%s), (%s), (%s), (%s))"
+            % (ax, ay, az, aw, bx, by, bz, bw))
+        i = after
+    return "".join(out)
 
 
 def _rewrite_transform_rotation(text, cl):
@@ -9055,6 +9252,8 @@ def _rewrite_transform_rotation(text, cl):
       transform.rotation = Quaternion.Euler(Vector3.forward * deg);
       transform.rotation = Quaternion.LookRotation(forward[, up]);
       transform.rotation = Quaternion.Slerp(a, b, t);
+      transform.rotation = Quaternion.Inverse(q);
+      transform.rotation = Quaternion.RotateTowards(a, b, maxDegreesDelta);
       transform.rotation = Quaternion.identity;
       transform.rotation = new Quaternion(x, y, z, w);
       transform.localRotation = … (same forms);
@@ -9119,6 +9318,23 @@ def _rewrite_transform_rotation(text, cl):
                 "&_sqx, &_sqy, &_sqz, &_sqw); "
                 "_engine_transform_set_quat(%s, _sqx, _sqy, _sqz, _sqw); }"
                 % (ax, ay, az, aw, bx, by, bz, bw, t, rot_args))
+        elif parsed[0] == "inverse":
+            qx, qy, qz, qw = parsed[1]
+            out.append(
+                "{ float _iqx, _iqy, _iqz, _iqw; "
+                "_engine_quat_inverse((%s), (%s), (%s), (%s), "
+                "&_iqx, &_iqy, &_iqz, &_iqw); "
+                "_engine_transform_set_quat(%s, _iqx, _iqy, _iqz, _iqw); }"
+                % (qx, qy, qz, qw, rot_args))
+        elif parsed[0] == "rotate_towards":
+            (ax, ay, az, aw), (bx, by, bz, bw), md = parsed[1]
+            out.append(
+                "{ float _rtx, _rty, _rtz, _rtw; "
+                "_engine_quat_rotate_towards((%s), (%s), (%s), (%s), "
+                "(%s), (%s), (%s), (%s), (%s), "
+                "&_rtx, &_rty, &_rtz, &_rtw); "
+                "_engine_transform_set_quat(%s, _rtx, _rty, _rtz, _rtw); }"
+                % (ax, ay, az, aw, bx, by, bz, bw, md, rot_args))
         else:
             qx, qy, qz, qw = parsed[1]
             out.append(
@@ -9425,6 +9641,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = _rewrite_transform_look_at(text, cl)
     text = _rewrite_transform_euler_angles(text, cl)
     text = _rewrite_transform_rotation(text, cl)
+    text = _rewrite_quaternion_angle(text, cl)
     text = _rewrite_local_rotation_reads(text, cl, plan)
     text = _rewrite_transform_parent(text, cl, plan)
     text = _rewrite_transform_set_parent(text, cl, plan)
@@ -9456,16 +9673,16 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = text.replace("Screen.width", "Screen_width")
     text = text.replace("Screen.height", "Screen_height")
     text = re.sub(
-        r"(?:UnityEngine\.)?Application\.dataPath\b",
+        r"(?<![\w])(?:UnityEngine\.)?Application\.dataPath\b",
         "Application_dataPath()", text)
     text = re.sub(
-        r"(?:UnityEngine\.)?Application\.persistentDataPath\b",
+        r"(?<![\w])(?:UnityEngine\.)?Application\.persistentDataPath\b",
         "Application_persistentDataPath()", text)
     text = re.sub(
-        r"(?:UnityEngine\.)?Application\.isEditor\b",
+        r"(?<![\w])(?:UnityEngine\.)?Application\.isEditor\b",
         "Application_isEditor()", text)
     text = re.sub(
-        r"(?:UnityEngine\.)?Application\.isPlaying\b",
+        r"(?<![\w])(?:UnityEngine\.)?Application\.isPlaying\b",
         "Application_isPlaying()", text)
     text = re.sub(
         r"(?:UnityEngine\.)?Application\.OpenURL\s*\(",

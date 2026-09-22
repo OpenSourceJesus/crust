@@ -371,6 +371,16 @@ class TestSystems(unittest.TestCase):
             "        Application.OpenURL(\"https://example.com\");\n"
             "    }\n"
             "}\n")
+        # EditorApplication.* must not be blamed as Application.* (CS0117).
+        unity_pack.analyze_script(
+            path,
+            "using UnityEngine;\n"
+            "using UnityEditor;\n"
+            "public class Ed : MonoBehaviour {\n"
+            "    void Start() {\n"
+            "        EditorApplication.delayCall += () => { };\n"
+            "    }\n"
+            "}\n")
 
     def test_quaternion_unsupported_member_is_cs0117(self):
         """Unsupported Quaternion members → CS0117 (in scope via UnityEngine)."""
@@ -400,7 +410,8 @@ class TestSystems(unittest.TestCase):
             unity_pack.analyze_script(path, fqn)
         self.assertIn("CS0117", cm.exception.message)
         self.assertIn("AngleAxis", cm.exception.message)
-        # Supported Euler / identity / LookRotation / Slerp still analyze.
+        # Supported Euler / identity / LookRotation / Slerp / Inverse /
+        # Angle / RotateTowards still analyze.
         unity_pack.analyze_script(
             path, src.replace(
                 "AngleAxis(45f, Vector3.up)",
@@ -431,6 +442,37 @@ class TestSystems(unittest.TestCase):
             "Quaternion.identity, Quaternion.identity, 0.5f);\n"
             "    }\n"
             "}\n")
+        unity_pack.analyze_script(
+            path,
+            "using UnityEngine;\n"
+            "public class Ball : MonoBehaviour {\n"
+            "    void Start() {\n"
+            "        transform.rotation = Quaternion.Inverse("
+            "transform.rotation);\n"
+            "    }\n"
+            "}\n")
+        unity_pack.analyze_script(
+            path,
+            "using UnityEngine;\n"
+            "public class Ball : MonoBehaviour {\n"
+            "    void Start() {\n"
+            "        float a = Quaternion.Angle("
+            "Quaternion.identity, transform.rotation);\n"
+            "    }\n"
+            "}\n")
+        unity_pack.analyze_script(
+            path,
+            "using UnityEngine;\n"
+            "public class Ball : MonoBehaviour {\n"
+            "    void Start() {\n"
+            "        transform.rotation = Quaternion.RotateTowards("
+            "Quaternion.identity, transform.rotation, 10f);\n"
+            "    }\n"
+            "}\n")
+        # AngleAxis remains unsupported (distinct from Angle).
+        with self.assertRaises(unity_pack.PackError) as cm:
+            unity_pack.analyze_script(path, src)
+        self.assertIn("AngleAxis", cm.exception.message)
         ball = os.path.join(
             SYSTEMS, "Assets", "Standard Assets", "Scripts",
             "Objects (Scripts)", "Ball.cs")
@@ -891,7 +933,7 @@ class TestSystems(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
 
     def test_transform_find_child_by_authored_hierarchy(self):
-        """transform.Find(name) → child GO index via authored m_Father."""
+        """transform.Find(name) → child GO via live parent table (authored seed)."""
         root = tempfile.mkdtemp(prefix="upack-tfind-")
         scripts = os.path.join(root, "Assets", "Scripts")
         os.makedirs(scripts)
@@ -1004,6 +1046,122 @@ class TestSystems(unittest.TestCase):
         self.assertIn("child_ok", run.stdout)
         self.assertIn("nope_ok", run.stdout)
         self.assertIn("nest_ok", run.stdout)
+
+    def test_transform_find_uses_live_hierarchy(self):
+        """Find walks live parents after SetParent; works on Transform receivers."""
+        root = tempfile.mkdtemp(prefix="upack-tfind-live-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Probe.cs"), "w") as f:
+            f.write(
+                "using System;\n"
+                "using UnityEngine;\n"
+                "public class Probe : MonoBehaviour {\n"
+                "    void Start() {\n"
+                "        Transform child = GameObject.Find(\"Child\").transform;\n"
+                "        Transform oldP = GameObject.Find(\"OldParent\").transform;\n"
+                "        /* Authored: Child under OldParent */\n"
+                "        if (oldP.Find(\"Child\") != null)\n"
+                "            Console.WriteLine(\"authored_ok\");\n"
+                "        if (transform.Find(\"Child\") == null)\n"
+                "            Console.WriteLine(\"empty_ok\");\n"
+                "        child.SetParent(transform, false);\n"
+                "        if (transform.Find(\"Child\") != null)\n"
+                "            Console.WriteLine(\"live_ok\");\n"
+                "        if (oldP.Find(\"Child\") == null)\n"
+                "            Console.WriteLine(\"moved_ok\");\n"
+                "        if (GameObject.Find(\"Probe\").transform.Find("
+                "\"Child\") != null)\n"
+                "            Console.WriteLine(\"recv_ok\");\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Probe.cs.meta"), "w") as f:
+            f.write("guid: f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Probe\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "  m_Father: {fileID: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1}\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: OldParent\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "--- !u!4 &11\nTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_Children:\n  - {fileID: 21}\n"
+                "--- !u!1 &20\nGameObject:\n  m_Name: Child\n"
+                "  m_Component:\n  - component: {fileID: 21}\n"
+                "--- !u!4 &21\nTransform:\n"
+                "  m_GameObject: {fileID: 20}\n"
+                "  m_LocalPosition: {x: 1, y: 0, z: 0}\n"
+                "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "  m_Father: {fileID: 11}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-tfind-live-out-")
+        plan = unity_pack.pack(root, d)
+        self.assertIn("Probe", plan["classes"])
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("Transform_Find", eng)
+        self.assertIn("Transform_SetParent", eng)
+        # Live parent table (not const) so SetParent updates are visible.
+        self.assertRegex(eng, r"static int _engine_go_parent\[")
+        self.assertNotRegex(eng, r"static const int _engine_go_parent\[")
+        self.assertIn("Transform_Find(", eng)
+        self.assertNotIn(".Find(", eng.replace("Transform_Find(", "TF("))
+        if not _CC:
+            return
+        host = os.path.join(d, "host.c")
+        with open(host, "w") as f:
+            f.write(
+                "void engine_tick(void);\n"
+                "extern float Time_deltaTime;\n"
+                "int main(void) {\n"
+                "  Time_deltaTime = 0.02f;\n"
+                "  engine_tick();\n"
+                "  return 0;\n"
+                "}\n"
+            )
+        r = subprocess.run(
+            [_CC, "-O2", "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(
+            [_CC, "-O0", "-c", "-o", os.path.join(d, "data.o"),
+             os.path.join(d, "data.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        exe = os.path.join(d, "run")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host,
+             os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+        self.assertIn("authored_ok", run.stdout)
+        self.assertIn("empty_ok", run.stdout)
+        self.assertIn("live_ok", run.stdout)
+        self.assertIn("moved_ok", run.stdout)
+        self.assertIn("recv_ok", run.stdout)
 
     def test_transform_point_uses_live_trs(self):
         """TransformPoint uses current rot/scale/pos, not pack-time bake."""
@@ -1484,6 +1642,268 @@ class TestSystems(unittest.TestCase):
         run = subprocess.run([exe], capture_output=True, text=True)
         self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
         self.assertIn("slerp_ok", run.stdout)
+
+    def test_quaternion_inverse_packs(self):
+        """transform.rotation = Quaternion.Inverse(...) → live quat inverse."""
+        root = tempfile.mkdtemp(prefix="upack-qinv-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Ball.cs"), "w") as f:
+            f.write(
+                "using System;\n"
+                "using UnityEngine;\n"
+                "public class Ball : MonoBehaviour {\n"
+                "    void Start() {\n"
+                "        transform.rotation = Quaternion.Euler("
+                "0f, 0f, 90f);\n"
+                "        transform.rotation = Quaternion.Inverse("
+                "transform.rotation);\n"
+                "        float z = transform.localRotation.z;\n"
+                "        float w = transform.localRotation.w;\n"
+                "        /* Inverse of 90° Z ≈ -90° Z: z≈-0.707, w≈0.707 */\n"
+                "        if (z < -0.6f && z > -0.8f && w > 0.6f && w < 0.8f)\n"
+                "            Console.WriteLine(\"inv_ok\");\n"
+                "        else\n"
+                "            Console.WriteLine(\"inv_bad\");\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Ball.cs.meta"), "w") as f:
+            f.write("guid: b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Ball\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-qinv-out-")
+        plan = unity_pack.pack(root, d)
+        self.assertIn("Ball", plan["classes"])
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("_engine_quat_inverse", eng)
+        start = eng.split("static void Ball_Start", 1)[1].split(
+            "static int _Ball_started", 1)[0]
+        self.assertNotIn("Quaternion.Inverse(", start)
+        self.assertIn("_engine_quat_inverse(", start)
+        if not _CC:
+            return
+        host = os.path.join(d, "host.c")
+        with open(host, "w") as f:
+            f.write(
+                "void engine_tick(void);\n"
+                "extern float Time_deltaTime;\n"
+                "int main(void) {\n"
+                "  Time_deltaTime = 0.02f;\n"
+                "  engine_tick();\n"
+                "  return 0;\n"
+                "}\n"
+            )
+        r = subprocess.run(
+            [_CC, "-O2", "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(
+            [_CC, "-O0", "-c", "-o", os.path.join(d, "data.o"),
+             os.path.join(d, "data.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        exe = os.path.join(d, "run")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host,
+             os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+        self.assertIn("inv_ok", run.stdout)
+
+    def test_quaternion_angle_packs(self):
+        """Quaternion.Angle(a, b) → degrees between live rotations."""
+        root = tempfile.mkdtemp(prefix="upack-qang-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Ball.cs"), "w") as f:
+            f.write(
+                "using System;\n"
+                "using UnityEngine;\n"
+                "public class Ball : MonoBehaviour {\n"
+                "    void Start() {\n"
+                "        transform.rotation = Quaternion.Euler("
+                "0f, 0f, 90f);\n"
+                "        float a = Quaternion.Angle("
+                "Quaternion.identity, transform.rotation);\n"
+                "        float z = Quaternion.Angle("
+                "transform.rotation, transform.rotation);\n"
+                "        if (a > 89f && a < 91f && z > -0.1f && z < 0.1f)\n"
+                "            Console.WriteLine(\"ang_ok\");\n"
+                "        else\n"
+                "            Console.WriteLine(\"ang_bad\");\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Ball.cs.meta"), "w") as f:
+            f.write("guid: c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Ball\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-qang-out-")
+        plan = unity_pack.pack(root, d)
+        self.assertIn("Ball", plan["classes"])
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("_engine_quat_angle", eng)
+        start = eng.split("static void Ball_Start", 1)[1].split(
+            "static int _Ball_started", 1)[0]
+        self.assertNotIn("Quaternion.Angle(", start)
+        self.assertIn("_engine_quat_angle(", start)
+        if not _CC:
+            return
+        host = os.path.join(d, "host.c")
+        with open(host, "w") as f:
+            f.write(
+                "void engine_tick(void);\n"
+                "extern float Time_deltaTime;\n"
+                "int main(void) {\n"
+                "  Time_deltaTime = 0.02f;\n"
+                "  engine_tick();\n"
+                "  return 0;\n"
+                "}\n"
+            )
+        r = subprocess.run(
+            [_CC, "-O2", "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(
+            [_CC, "-O0", "-c", "-o", os.path.join(d, "data.o"),
+             os.path.join(d, "data.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        exe = os.path.join(d, "run")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host,
+             os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+        self.assertIn("ang_ok", run.stdout)
+
+    def test_quaternion_rotate_towards_packs(self):
+        """transform.rotation = Quaternion.RotateTowards → live quat step."""
+        root = tempfile.mkdtemp(prefix="upack-qrotto-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Ball.cs"), "w") as f:
+            f.write(
+                "using System;\n"
+                "using UnityEngine;\n"
+                "public class Ball : MonoBehaviour {\n"
+                "    void Start() {\n"
+                "        transform.rotation = Quaternion.Euler("
+                "0f, 0f, 90f);\n"
+                "        transform.rotation = Quaternion.RotateTowards("
+                "Quaternion.identity, transform.rotation, 45f);\n"
+                "        float a = Quaternion.Angle("
+                "Quaternion.identity, transform.rotation);\n"
+                "        if (a > 44f && a < 46f)\n"
+                "            Console.WriteLine(\"rt_ok\");\n"
+                "        else\n"
+                "            Console.WriteLine(\"rt_bad\");\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Ball.cs.meta"), "w") as f:
+            f.write("guid: d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Ball\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-qrotto-out-")
+        plan = unity_pack.pack(root, d)
+        self.assertIn("Ball", plan["classes"])
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("_engine_quat_rotate_towards", eng)
+        start = eng.split("static void Ball_Start", 1)[1].split(
+            "static int _Ball_started", 1)[0]
+        self.assertNotIn("Quaternion.RotateTowards(", start)
+        self.assertIn("_engine_quat_rotate_towards(", start)
+        if not _CC:
+            return
+        host = os.path.join(d, "host.c")
+        with open(host, "w") as f:
+            f.write(
+                "void engine_tick(void);\n"
+                "extern float Time_deltaTime;\n"
+                "int main(void) {\n"
+                "  Time_deltaTime = 0.02f;\n"
+                "  engine_tick();\n"
+                "  return 0;\n"
+                "}\n"
+            )
+        r = subprocess.run(
+            [_CC, "-O2", "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(
+            [_CC, "-O0", "-c", "-o", os.path.join(d, "data.o"),
+             os.path.join(d, "data.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        exe = os.path.join(d, "run")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host,
+             os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+        self.assertIn("rt_ok", run.stdout)
 
     def test_transform_rotation_lookrotation_packs(self):
         """transform.rotation = Quaternion.LookRotation → look_rotation helper."""
