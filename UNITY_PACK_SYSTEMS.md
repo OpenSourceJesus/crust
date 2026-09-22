@@ -103,7 +103,9 @@ Unity's `UnityException` / `TypeInitializationException` every frame and
 | `GameObject.Find(name)` | Runtime `strcmp` on authored GO name table → index or **-1** |
 | `Object.ToString` (via printing a Find result) | `name (UnityEngine.GameObject)`; missing → `"null"` |
 | `.GetComponent<T>()` on a null GO | **NullReferenceException** with `Class.Method () (at path:line)`; method exits (Unity) |
-| `.GetComponent<T>()` on a live GO | Instance index of authored `T`, or **-1** if absent |
+| `.GetComponent<T>()` on a live GO | Instance index of authored/`AddComponent` `T`, or **-1** if absent |
+| `FindObjectOfType<T>(includeInactive?)` | Scan live `_engine_go_T[]` (skip Destroyed; optional inactive) → first index or **-1** |
+| `T.Instance` / `T.instance` | ``T_Instance()`` — cache until destroyed/missing, then ``FindObjectOfType<T>(true)`` |
 | `Find(...).GetComponent<T>().field` | NRE if Find missed or component/field receiver is null |
 | `transform.Find(name)` / nested `"A/B"` | Child GO via **live** parent table (seeded from authored `m_Father`; updated by `SetParent`) → index or **-1** |
 | `go.transform.Find` / `Transform` local `.Find` | Same — receiver is the live GO index |
@@ -338,9 +340,11 @@ Pool budget is one slot per instance of each class that calls `AddComponent<T>`
 | `GetComponent<Canvas\|Image\|RectTransform\|…>` | Live `_engine_go_*` maps (RectTransform ≡ GO); seeded authored |
 | `GetComponent<T>` for prefab/scene MBs | Live maps; prefab instances loaded when scene scripts reference `T` |
 | `AddComponent<Canvas>` / `typeof(Canvas)` / `ForceUpdateCanvases` | Refused invent — author `!u!223` in the scene |
-| `List<T>` | ``std::vector`` (MB/component elems → ``int`` indices); ``Add``/``Count`` |
+| `List<T>` | ``std::vector`` (MB/component elems → ``int`` indices); ``Add``/``Count``; cross-class static ``Other.list`` → ``Other_list`` |
 | `Dictionary<K,V>` / `SortedList<K,V>` | ``std::map`` (``Add``→``[]=``, ``Clear``/``Count``/indexer); string keys via helper |
 | `Vector2` | C ``typedef struct`` + ``Vector2_make``; packed fields stay ``_x``/``_y`` |
+| `T.StaticMethod` / `T.Instance` / `FindObjectOfType<T>` | ``T_StaticMethod(args)``; ``T_Instance()`` caches ``Object_FindObjectOfType_T(1)`` (live GO map scan, skips Destroyed; re-finds when null); explicit ``FindObjectOfType<T>()`` → ``Object_FindObjectOfType_T(0)`` |
+| `Toggle[]` / ``.isOn`` | ``std::vector<int>`` GO idxs; ``Toggle_set/get_isOn`` |
 | `HashSet` / … | BCL collections not lowered — CS0246 at the type token |
 | `Camera.main` with no scene Camera | Packer will not invent a default camera |
 
