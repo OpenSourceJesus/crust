@@ -49,7 +49,8 @@ action maps / device graphs).
 | `Application.persistentDataPath` | Unity company/product save dir (**Awake/Start only**) |
 | `Application.isEditor` | Always **false** (packed player) |
 | `Application.isPlaying` | Always **true** while the packed player runs |
-| `Application.OpenURL(url)` | No-op in packed player (no OS browser / mailto) |
+| `Application.productName` | Baked `ProjectSettings` `productName` (else project folder name) |
+| `Application.OpenURL(url)` | `system("python3 -c \"import webbrowser; webbrowser.open('…')\"")` |
 | Other `Application.*` | Pack-time **CS0117** (`Application` in scope via `using UnityEngine`) |
 | Other `Quaternion.*` (not Euler / identity / LookRotation / Slerp / Inverse / Angle) | Pack-time **CS0117** (`Quaternion` in scope via `using UnityEngine`) |
 | `File.WriteAllText(path, text)` | `fopen` write (`"w"`); creates parent dirs when possible |

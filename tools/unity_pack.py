@@ -59,6 +59,7 @@ _FILE_SUPPORTED = frozenset({
 # UnityEngine.Application members we emit. Others → CS0117.
 _APPLICATION_SUPPORTED = frozenset({
     "dataPath", "persistentDataPath", "isEditor", "isPlaying", "OpenURL",
+    "productName",
 })
 
 # UnityEngine.Quaternion members we emit. Others → CS0117 (in scope via UnityEngine).
@@ -294,6 +295,7 @@ _API = {
     "Application.isEditor": True,
     "Application.isPlaying": True,
     "Application.OpenURL": True,
+    "Application.productName": True,
     "File.WriteAllText": True,
     "File.AppendAllText": True,
     "File.WriteAllBytes": True,
@@ -358,12 +360,14 @@ _UNITY_API = re.compile(
     r"(?<![\w])(?:Mathf\.(?:Abs|Min|Max|Clamp|Lerp|Sin|Cos|Sign)|"
     r"Time\.(?:deltaTime|time|fixedDeltaTime)|"
     r"Screen\.(?:width|height)|"
-    r"Application\.dataPath|"
-    r"Application\.persistentDataPath|"
-    r"Application\.isEditor|"
-    r"Application\.isPlaying|"
-    r"Application\.OpenURL|"
-    r"File\.(?:WriteAllText|AppendAllText|Exists)|"
+    r"(?<![\w])Application\.dataPath|"
+    r"(?<![\w])Application\.persistentDataPath|"
+    r"(?<![\w])Application\.isEditor|"
+    r"(?<![\w])Application\.isPlaying|"
+    r"(?<![\w])Application\.OpenURL|"
+    r"(?<![\w])Application\.productName|"
+    r"File\.(?:WriteAllText|AppendAllText|WriteAllBytes|ReadAllBytes|"
+    r"Exists|Delete)|"
     r"Input\.(?:GetAxis|GetButton|GetKey)|"
     r"RenderSettings\.ambientLight|Camera\.main|"
     r"transform\.position|Physics2D\.gravity|Physics\.gravity|"
@@ -4391,6 +4395,9 @@ def analyze_script(path, text=None):
     if re.search(
             r"(?<![\w])(?:UnityEngine\.)?Application\.OpenURL\s*\(", scan):
         apis.add("Application.OpenURL")
+    if re.search(
+            r"(?<![\w])(?:UnityEngine\.)?Application\.productName\b", scan):
+        apis.add("Application.productName")
     if re.search(r"(?:System\.IO\.)?File\.WriteAllText\s*\(", scan):
         apis.add("File.WriteAllText")
     if re.search(r"(?:System\.IO\.)?File\.AppendAllText\s*\(", scan):
@@ -4406,7 +4413,8 @@ def analyze_script(path, text=None):
     # C# string + value must not become C pointer arithmetic.
     if re.search(
             r'"\s*\+|'
-            r"Application\.(?:dataPath|persistentDataPath)\s*\+",
+            r"(?<![\w])Application\.(?:dataPath|persistentDataPath|"
+            r"productName)\s*\+",
             scan):
         apis.add("string.+")
     has_system = bool(re.search(r"using\s+System\b", scan))
@@ -5121,6 +5129,7 @@ def emit_engine(plan, analyses, used_apis):
     want_app_is_editor = "Application.isEditor" in used_apis
     want_app_is_playing = "Application.isPlaying" in used_apis
     want_app_open_url = "Application.OpenURL" in used_apis
+    want_app_product_name = "Application.productName" in used_apis
     want_file_write = "File.WriteAllText" in used_apis
     want_file_append = "File.AppendAllText" in used_apis
     want_file_write_bytes = "File.WriteAllBytes" in used_apis
@@ -5550,6 +5559,15 @@ def emit_engine(plan, analyses, used_apis):
     if want_app_is_playing:
         p("/* Application.isPlaying — true while the packed player runs */")
         p("static int Application_isPlaying(void) { return 1; }")
+        p("")
+    if want_app_product_name:
+        product = plan.get("product_name") or "Player"
+        p("/* Application.productName — ProjectSettings productName */")
+        p("static const char _engine_app_product_name[] = %s;"
+          % _c_string(product))
+        p("static const char *Application_productName(void) {")
+        p("    return _engine_app_product_name;")
+        p("}")
         p("")
     if want_app_open_url:
         p("/* Application.OpenURL — python3 webbrowser via system(3) */")
@@ -9571,7 +9589,7 @@ def _rewrite_string_concat(text, string_idents=None):
             left_end = None
             m_plus = re.match(r"_str_plus_[ifcs]\(", text[i:])
             m_app = re.match(
-                r"Application_(?:dataPath|persistentDataPath)\(\)",
+                r"Application_(?:dataPath|persistentDataPath|productName)\(\)",
                 text[i:])
             if m_plus or text.startswith("_str_plus(", i):
                 prefix = m_plus.group(0) if m_plus else "_str_plus("
@@ -9632,7 +9650,8 @@ def _c_expr_scalar_kind(expr, string_idents=None):
     if (e.startswith('"') or e.startswith("_str_plus")
             or "ToString" in e or e.startswith("(const char")
             or e in ("Application_dataPath()",
-                     "Application_persistentDataPath()")
+                     "Application_persistentDataPath()",
+                     "Application_productName()")
             or (re.match(r"^\w+$", e) and e in string_idents)):
         return "s"
     if re.match(r"^'(?:[^'\\]|\\.)'$", e):
@@ -9908,7 +9927,10 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         r"(?<![\w])(?:UnityEngine\.)?Application\.isPlaying\b",
         "Application_isPlaying()", text)
     text = re.sub(
-        r"(?:UnityEngine\.)?Application\.OpenURL\s*\(",
+        r"(?<![\w])(?:UnityEngine\.)?Application\.productName\b",
+        "Application_productName()", text)
+    text = re.sub(
+        r"(?<![\w])(?:UnityEngine\.)?Application\.OpenURL\s*\(",
         "Application_OpenURL(", text)
     text = re.sub(
         r"(?:System\.IO\.)?File\.WriteAllText\s*\(",

@@ -356,11 +356,13 @@ class TestSystems(unittest.TestCase):
         self.assertIn("CS0117", cm.exception.message)
         self.assertIn("streamingAssetsPath", cm.exception.message)
         # Supported dataPath / persistentDataPath / isEditor / isPlaying /
-        # OpenURL.
+        # OpenURL / productName.
         unity_pack.analyze_script(
             path, src.replace("streamingAssetsPath", "dataPath"))
         unity_pack.analyze_script(
             path, src.replace("streamingAssetsPath", "persistentDataPath"))
+        unity_pack.analyze_script(
+            path, src.replace("streamingAssetsPath", "productName"))
         unity_pack.analyze_script(
             path,
             "using UnityEngine;\n"
@@ -2454,6 +2456,97 @@ class TestSystems(unittest.TestCase):
              os.path.join(d, "engine.c")],
             capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
+
+    @needs_cc
+    def test_application_product_name_packs(self):
+        """Application.productName → baked ProjectSettings productName string."""
+        root = tempfile.mkdtemp(prefix="upack-prodname-")
+        os.makedirs(os.path.join(root, "ProjectSettings"))
+        with open(os.path.join(root, "ProjectSettings",
+                               "ProjectSettings.asset"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "PlayerSettings:\n"
+                "  companyName: Acme\n"
+                "  productName: Slime Jump\n"
+            )
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Brand.cs"), "w") as f:
+            f.write(
+                "using System;\n"
+                "using UnityEngine;\n"
+                "public class Brand : MonoBehaviour {\n"
+                "    void Start() {\n"
+                "        Console.WriteLine(Application.productName);\n"
+                "        Console.WriteLine("
+                "Application.productName + \"!\");\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Brand.cs.meta"), "w") as f:
+            f.write("guid: f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Brand\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6}\n"
+            )
+        a = unity_pack.analyze_script(os.path.join(scripts, "Brand.cs"))
+        self.assertIn("Application.productName", a["apis"])
+        d = tempfile.mkdtemp(prefix="upack-prodname-out-")
+        plan = unity_pack.pack(root, d)
+        self.assertEqual(plan.get("product_name"), "Slime Jump")
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("Application_productName", eng)
+        self.assertIn("Slime Jump", eng)
+        self.assertNotIn("Application.productName", eng.split(
+            "static void Brand_Start", 1)[1].split(
+            "static int _Brand_started", 1)[0])
+        self.assertIn("Application_productName()", eng)
+        self.assertIn("_str_plus_s(Application_productName()", eng)
+        r = subprocess.run(
+            [_CC, "-O2", "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(
+            [_CC, "-O0", "-c", "-o", os.path.join(d, "data.o"),
+             os.path.join(d, "data.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        host = os.path.join(d, "host.c")
+        with open(host, "w") as f:
+            f.write(
+                "void engine_tick(void);\n"
+                "extern float Time_deltaTime;\n"
+                "int main(void) {\n"
+                "  Time_deltaTime = 0.02f;\n"
+                "  engine_tick();\n"
+                "  return 0;\n"
+                "}\n"
+            )
+        exe = os.path.join(d, "run")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host,
+             os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+        self.assertIn("Slime Jump", run.stdout)
+        self.assertIn("Slime Jump!", run.stdout)
 
     @needs_cc
     def test_application_path_field_init_ctor_forbidden(self):
