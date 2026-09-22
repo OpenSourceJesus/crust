@@ -197,11 +197,17 @@ class Prover:
         if hyps:
             proof = H.bound_by_ites_or_guards(env, opened, L.Var("h"), claim,
                                               others=others)
-            proof = L.Lambda("h", hyps[0].var_type, proof)
         else:
             proof = H.bound_by_ites_or_guards(env, opened, None,
                                               H.app("Holds", L.Var("false")),
                                               others=others)
+        if not _complete(proof, L):
+            # The tactic answers None -- or a term with a None where a
+            # branch's proof should be -- rather than raising, when no guard
+            # settles the goal.  That is what a false claim looks like.
+            raise H.TheoremError("no guard settles the obligation")
+        if hyps:
+            proof = L.Lambda("h", hyps[0].var_type, proof)
         for b in reversed(params):
             proof = L.Lambda(b.var_name, b.var_type, proof)
         return H.prove(goal, proof, env, verbose=False)
@@ -247,6 +253,22 @@ class Prover:
                 self.by_every_bool(env, proc.obligation, unfolding)
             out.append((label, in_big_stack(lambda: self.settles(work))))
         return out
+
+
+def _complete(term, L):
+    """True if `term` is a term all the way down (no None for a branch)."""
+    stack = [term]
+    while stack:
+        t = stack.pop()
+        if t is None:
+            return False
+        if isinstance(t, L.App):
+            stack.append(t.func)
+            stack.append(t.arg)
+        elif isinstance(t, (L.Lambda, L.Pi)):
+            stack.append(t.var_type)
+            stack.append(t.body)
+    return True
 
 
 def _binary_terms(term, L):
