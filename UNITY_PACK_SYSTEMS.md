@@ -250,9 +250,14 @@ Authored `!u!223` Canvas (Screen Space Overlay / Camera) + uGUI `Image`
 or `Button` (with Image) draw via RectTransform size mapped into the
 main ortho camera. Nested RectTransforms (e.g. Button → label) use the
 parent pixel rect. Authored `VerticalLayoutGroup` /
-`HorizontalLayoutGroup` (+ optional `LayoutElement`) are baked into child
-`anchoredPosition` / `sizeDelta` / top-left anchors before that bake (same
-stacking Unity's layout pass applies). Unity builtin UISprites (`guid` in
+`HorizontalLayoutGroup` (+ optional `LayoutElement` with min / preferred /
+flexible / max) are baked into child `anchoredPosition` / `sizeDelta` / top-left
+anchors before that bake (same stacking Unity's layout pass applies).
+`ContentSizeFitter` (Unconstrained / MinSize / PreferredSize / Clamped) resizes
+the fitter's own RectTransform from those preferred/min sizes (including a
+layout group's child totals). `AspectRatioFitter` (WidthControlsHeight /
+HeightControlsWidth / FitInParent / EnvelopeParent) adjusts size or stretch
+anchors to enforce `m_AspectRatio`. Unity builtin UISprites (`guid` in
 `unity_builtin_extra`) bake a rounded white sprite; `Image.type = Sliced`
 9-slices with fixed corner borders (Simple stretches). Authored project
 PNG UI sprites use `.meta` `spriteBorder` the same way. Authored
@@ -265,7 +270,7 @@ bottom-left); inactive parents hide children (`activeInHierarchy`).
 (e.g. SettingsMenu) hides UI before the first draw. Canvas
 sorting layer/order apply to child Images/Buttons; TMP sorts one order
 above its Canvas. EventSystem / GraphicRaycaster / legacy `UI.Text` /
-`ContentSizeFitter` / `GridLayoutGroup` are not imported.
+`GridLayoutGroup` are not imported.
 `AddComponent<Canvas>` / `typeof(Canvas)` / `ForceUpdateCanvases`
 remain refused (no invent); `using UnityEngine.UI` and Image fields are fine.
 
