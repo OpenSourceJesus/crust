@@ -2050,5 +2050,21 @@ fn f(xs: &[u32]) -> u32 { 0 }
         self.assertIn("loop", str(cm.exception))
 
 
+class TestSlicingAnArrayLiteral(unittest.TestCase):
+    """`&[a, b][..]` slices a temporary; it used to point at address `a`.
+
+    The brace list went into the slice's pointer field, so C read the first
+    element as the pointer, and the program segfaulted.
+    """
+
+    def test_slice_of_a_literal_array_in_a_call(self):
+        self.assertEqual(_rs("""
+fn total(xs: &[u64]) -> u64 { let mut t: u64 = 0; for x in xs { t += x; } t }
+fn main() -> i32 {
+    (total(&[10u64, 20u64, 12u64][..]) + total(&[1u64][..]) - 1) as i32
+}
+"""), 42)
+
+
 if __name__ == "__main__":
     unittest.main()

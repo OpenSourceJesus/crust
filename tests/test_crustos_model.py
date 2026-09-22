@@ -113,6 +113,12 @@ def _nat(term, env, lean4):
         current = lean4.normalize(args[0], env)
     if isinstance(current, lean4.Var) and current.name == "zero":
         return count
+    # A kernel with native Nat literals normalises a closed numeral above
+    # zero to one node, possibly under the `succ`s already counted. Read
+    # through `getattr` so this works against a kernel without them too.
+    lit = getattr(lean4, "NatLit", None)
+    if lit is not None and isinstance(current, lit):
+        return count + current.value
     return None
 
 
