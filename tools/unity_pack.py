@@ -8733,17 +8733,17 @@ def emit_engine(plan, analyses, used_apis):
         p("        int need = _%s_inst_count * %d;" % (idn, dims))
         p("        if (n + need > max_floats) return n;")
         if cl.get("soa_dims"):
-            p("        /* SoA: one contiguous table, no AoS gather */")
-            p("        for (i = 0; i < _%s_inst_count; i = i + 1)" % idn)
-            p("            for (d = 0; d < %d; d = d + 1)" % dims)
-            p("                dst[n + i * %d + d] = _%s_pos[i][d];" % (dims, idn))
+            # Contiguous float[N][dims] → one memcpy (libc / SIMD). Nested
+            # element copies miss autovec for small N and lose big-N memcpy.
+            p("        /* SoA: one contiguous table → memcpy (no gather) */")
             p("        if (need > 0)")
+            p("            memcpy(dst + n, &_%s_pos[0][0]," % idn)
             p("                   (size_t)need * sizeof(float));")
         else:
             axes = ("pos_x", "pos_y", "pos_z")[:dims]
-            p("        /* AoS gather (Unity-style) */")
             kind_by = {m[0]: m[3] for m in cl["members"]}
             p("        int i;")
+            p("        /* AoS gather (Unity-style); direct fields for autovec */")
             p("        for (i = 0; i < _%s_inst_count; i = i + 1) {" % idn)
             for axis_i, axis in enumerate(axes):
                 if kind_by.get(axis) == "f32":

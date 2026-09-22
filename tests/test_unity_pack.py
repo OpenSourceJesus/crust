@@ -221,7 +221,8 @@ class TestSoa(unittest.TestCase):
         self.assertIn("_Player_pos[", data)
         with open(os.path.join(d, "engine.c")) as f:
             engine = f.read()
-        self.assertIn("SoA: one contiguous table", engine)
+        self.assertIn("SoA: one contiguous table → memcpy", engine)
+        self.assertIn("memcpy(dst + n, &_Coin_pos[0][0]", engine)
         self.assertIn("engine_upload_positions", engine)
 
     @needs_cc

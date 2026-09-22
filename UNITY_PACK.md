@@ -136,6 +136,7 @@ float _Player_pos[N][2];   /* or [N][3] in 3D */
 
 Script accessors still go through `Player_get_pos_x(i)` /
 `Player_set_pos_x(i, v)`, so gameplay code is unchanged. `engine_upload_positions`
+fills a flat `float[]` for the GPU: under SoA it `memcpy`s the tables (clang
 autovec remarks showed nested element copies were not beneficial); under
 AoS it gathers from struct fields. Host `Makefile` compiles `engine.c` with
 `-O3 -fno-math-errno` so `sinf`/`cosf`/`sqrtf` loops can autovec. Opt-in so
