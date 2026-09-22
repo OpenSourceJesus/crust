@@ -35,9 +35,18 @@ What is claimed, and what is not
   * Unsigned integers are Nat.  That is exact for `+`, `*`, `/`, `%` and
     comparison until a value passes the type's maximum, and Rust's `-` on
     an unsigned value panics where Nat's truncates at zero.  A theorem about
-    the lifted function is a theorem about that model of the arithmetic;
-    overflow and underflow are the next step, as obligations of their own.
-    Signed integers are refused.
+    the lifted function is a theorem about that model of the arithmetic --
+    and what closes the distance is the *safety* lift (`Lifted.safety`):
+    every place the Rust would panic becomes a claim of its own, with the
+    type's width still in hand.  `a + b` owes `a + b <= u32::MAX`, `a - b`
+    owes `b <= a`, `a / b` owes `b != 0`, `xs[i]` owes `i < len(xs)`, and a
+    call owes its callee's `#[requires]`.  Signed integers are refused.
+
+  * Slices (`&[u64]`, `&Vec<u32>`) are the fragment's `Array`, and a struct
+    declared in the file is a record.  A function taking one `&mut` struct
+    and returning `()` lifts to one *returning* the struct -- the state
+    threading `hoare.py` does for a syscall -- and in its `ensures` the
+    parameter is the final value, `old(..)` the one it came in with.
 
   * `#[requires]` becomes the fragment's leading `assert`s, `#[ensures]` its
     postconditions, and `#[invariant]`/`#[variant]` on a `while` its loop
@@ -86,7 +95,8 @@ _RESERVED = {"and", "or", "not", "if", "elif", "else", "while", "for", "in",
              "from", "as", "with", "try", "except", "finally", "raise",
              "global", "nonlocal", "del", "assert", "yield", "await",
              "async", "break", "continue", "None", "True", "False",
-             "result", "len", "range", "invariant", "variant"}
+             "result", "len", "range", "invariant", "variant", "_ok",
+             "max_u8", "max_u16", "max_u32", "max_u64", "max_u128"}
 
 # Binary operators by precedence, lowest first, as Rust groups them.
 _LEVELS = [("||",), ("&&",), ("==", "!=", "<", ">", "<=", ">="),
@@ -101,9 +111,22 @@ class Lifted:
         self.name = name
         self.source = source            # `def name(..)` in hoare's dialect
         self.ensures = ensures          # postconditions over `result`
-        self.params = params            # [(name, 'Nat' | 'Bool')]
-        self.ret = ret                  # 'Nat' | 'Bool'
+        self.params = params            # [(name, fragment type name)]
+        self.ret = ret                  # fragment type name
         self.callees = callees          # lifted functions it calls
+        self.records = []               # [(struct, [(field, type name)])]
+        self.pre_source = None          # `name__pre`, if it has `requires`
+        self.obligations = []           # labels, in the order they arise
+        self.unit = None
+
+    def safety(self, only=None):
+        """The safety lift: `name__safe`, returning whether no panic is
+        reachable -- every obligation, or just obligation `only`.  None if
+        the function owes nothing."""
+        if not self.obligations:
+            return None
+        lifter = _FnLifter(self.unit, self.name, True, only)
+        return lifter.run().source
 
     def __repr__(self):
         return "Lifted(%s)" % self.name
@@ -122,6 +145,43 @@ def functions(source):
                 and toks[k + 1].kind == "ident":
             found[toks[k + 1].val] = k
     return found
+
+
+def _structs(toks):
+    """`struct Name { field: T, .. }` at the top level: {name: [(field, _Ty)]}.
+    A struct with a field the fragment has no type for is left out, and
+    reported when a function uses it."""
+    out, depth, k = {}, 0, 0
+    while k < len(toks):
+        t = toks[k]
+        if t.kind == "punc" and t.val == "{":
+            depth += 1
+        elif t.kind == "punc" and t.val == "}":
+            depth -= 1
+        elif depth == 0 and t.val == "struct" and toks[k + 1].kind == "ident" \
+                and toks[k + 2].val == "{":
+            name, j, fields, ok = toks[k + 1].val, k + 3, [], True
+            while toks[j].val != "}":
+                if toks[j].val == "pub":
+                    j += 1
+                fname, ftype = toks[j].val, toks[j + 2].val
+                if ftype in _UNSIGNED:
+                    fields.append((fname, _Ty("nat", _UNSIGNED[ftype])))
+                elif ftype == "bool":
+                    fields.append((fname, _BOOL))
+                else:
+                    ok = False
+                j += 3
+                while toks[j].val not in (",", "}"):
+                    j += 1
+                if toks[j].val == ",":
+                    j += 1
+            if ok:
+                out[name] = fields
+            k = j
+            continue
+        k += 1
+    return out
 
 
 def lift(source, name):
@@ -149,6 +209,9 @@ def signatures(lifted):
     for callee in _closure(lifted):
         if callee is not lifted:
             out[callee.name] = ([t for _, t in callee.params], callee.ret)
+            if callee.pre_source is not None:
+                out[callee.name + "__pre"] = (
+                    [t for _, t in callee.params], "Bool")
     return out
 
 
@@ -180,6 +243,7 @@ class _Unit:
         self.fn_index = functions(source)
         self.lifted_fns = {}
         self.in_progress = []
+        self.structs = _structs(self.toks)
 
     def lift(self, name):
         if name in self.lifted_fns:
@@ -195,19 +259,38 @@ class _Unit:
             lifted = _FnLifter(self, name).run()
         finally:
             del self.in_progress[-1]
+        lifted.unit = self
         self.lifted_fns[name] = lifted
         return lifted
 
 
 class _Ty:
-    """A value's type in the lift: Nat with a width, or Bool."""
+    """A value's type in the lift: Nat with a width, Bool, an Array of Nat
+    with its elements' width, or a record by name."""
 
-    def __init__(self, kind, width=0):
-        self.kind = kind                # "nat" | "bool"
-        self.width = width              # bits, for a nat
+    def __init__(self, kind, width=0, name=""):
+        self.kind = kind                # "nat" | "bool" | "arr" | "rec"
+        self.width = width              # bits, for a nat or an array's elements
+        self.name = name                # the struct, for a record
 
     def frag(self):
-        return "Nat" if self.kind == "nat" else "Bool"
+        if self.kind == "nat":
+            return "Nat"
+        if self.kind == "bool":
+            return "Bool"
+        if self.kind == "arr":
+            return "Array"
+        return self.name
+
+
+def _max(width):
+    """The largest `uN`, *symbolically*.  The kernel's numerals are unary --
+    `3` is `succ (succ (succ zero))` -- so `u32::MAX` written out is four
+    billion nested terms, and `u64::MAX` is not writable at all.  An
+    overflow obligation instead names `max_u32`, a parameter of the safety
+    function, with each `u32` parameter assumed `<= max_u32`: exact, and
+    small."""
+    return "max_u%d" % width
 
 
 _BOOL = _Ty("bool")
@@ -218,10 +301,22 @@ class _FnLifter:
     """Lift one function.  A recursive descent over its tokens that writes
     fragment statements as it goes, as `crust.py` writes C."""
 
-    def __init__(self, unit, name):
+    def __init__(self, unit, name, safety=False, only=None):
         self.unit = unit
         self.toks = unit.toks
         self.name = name
+        # The safety lift: the same control flow, with `_ok` conjoined with
+        # each obligation where the Rust evaluates it, and every `return`
+        # returning `_ok`.  `only` keeps a single obligation, so one that
+        # fails can be named.
+        self.safety = safety
+        self.only = only
+        self.cond_n = 0
+        self.cond_labels = []
+        self.pending_conds = []
+        self.guards = []
+        self.maxes = []                 # widths whose `max_uN` is named
+        self.state = None               # (rust name, fragment, _Ty) of `&mut`
         self.i = self._attrs_start(unit.fn_index[name])
         self.lines = []
         self.indent = 1
@@ -293,7 +388,41 @@ class _FnLifter:
     # -- output -------------------------------------------------------------
 
     def emit(self, line):
+        if self.safety:
+            if self.pending_conds and line not in ("else:", "pass"):
+                self.flush()
+            if line.startswith("return "):
+                line = "return _ok"
         self.lines.append("    " * self.indent + line)
+
+    def flush(self):
+        """Conjoin the obligations evaluated so far onto `_ok`, here -- so
+        each reads the variables as they are when the Rust evaluates it."""
+        conds = self.pending_conds
+        self.pending_conds = []
+        self.lines.append("    " * self.indent + "_ok = (_ok and %s)"
+                          % " and ".join(conds))
+
+    def overflow(self, value, width, what):
+        if self.safety and width not in self.maxes:
+            self.maxes.append(width)
+        self.side("(%s <= %s)" % (value, _max(width)),
+                  "%s may overflow u%d" % (what, width))
+
+    def side(self, cond, label):
+        """Record an obligation: `cond` must hold where it is evaluated.  A
+        guard in force (the right of `&&`, a match arm) conditions it."""
+        index = self.cond_n
+        self.cond_n += 1
+        self.cond_labels.append("%s (line %d)" % (label, self.cur.line))
+        if not self.safety or (self.only is not None and index != self.only):
+            return
+        # As a conditional rather than `(not g) or c`: the kernel's
+        # `by_every_bool` splits on an `if`, and the guard is then decided
+        # in the branch that needs it.
+        for g in reversed(self.guards):
+            cond = "(%s if %s else True)" % (cond, g)
+        self.pending_conds.append(cond)
 
     def fresh(self, hint):
         base = hint if hint not in _RESERVED else hint + "_"
@@ -345,23 +474,49 @@ class _FnLifter:
                 self.fail("a parameter must be a plain name, not a pattern")
             pname = self.next().val
             self.expect(":")
-            ty = self.read_type("parameter `%s`" % pname)
-            params.append((self.bind(pname, ty), ty))
+            ty, by_mut = self.read_param_type("parameter `%s`" % pname)
+            frag = self.bind(pname, ty)
+            if by_mut:
+                if self.state is not None:
+                    self.fail("only one `&mut` parameter is lifted")
+                self.state = (pname, frag, ty)
+            params.append((frag, ty))
             if not self.accept(","):
                 break
         self.expect(")")
-        if not self.accept("->"):
+        if self.state is not None:
+            if self.accept("->"):
+                self.fail("a function with a `&mut` parameter lifts to one "
+                          "returning the updated struct, so it cannot also "
+                          "return a value")
+            ret = self.state[2]
+        elif not self.accept("->"):
             self.fail("a function returning `()` has nothing to claim a "
                       "postcondition about")
-        ret = self.read_type("the return type")
+        else:
+            ret = self.read_type("the return type")
         if self.at("where"):
             self.fail("`where` clauses are not lifted")
 
         # Preconditions first: the fragment reads leading `assert`s as the
         # precondition, which is what `#[requires]` is.
+        requires = []
         for kind, toks, line in clauses:
             if kind == "requires":
-                self.emit("assert %s" % self.clause(toks, line, None))
+                requires.append(self.clause(toks, line, None))
+                if not self.safety:
+                    self.emit("assert %s" % requires[-1])
+        range_at = len(self.lines)
+        if self.safety:
+            self.emit("_ok = True")
+            # In the safety lift a precondition is a guard around the body,
+            # not a hypothesis: `safe(args)` for every `args` is then exactly
+            # "if `requires` holds, nothing panics", and the kernel's split
+            # decides the precondition like any other guard -- in the
+            # spelling the obligations use, since it is the same text.
+            for req in requires:
+                self.emit("if %s:" % req)
+                self.indent += 1
         ensures = []
         for kind, toks, line in clauses:
             if kind == "ensures":
@@ -369,19 +524,50 @@ class _FnLifter:
 
         self.expect("{")
         n_asserts = len(self.lines)
-        self.block_body("ret", ret)
+        self.block_body("ret" if self.state is None else None, ret)
+        if self.state is not None:
+            self.emit("return %s" % self.state[1])
+        if self.safety:
+            self.indent -= len(requires)
+            self.emit("return _ok")
         # A fresh name is never reused, so a starting value cannot be read by
         # anything but the code that then assigns it.
         inits = ["    %s = %s" % (n, "False" if t.kind == "bool" else "0")
                  for n, t in self.nested_locals]
         self.lines[n_asserts:n_asserts] = inits
+        extra = []
+        if self.safety and self.maxes:
+            # A value of a Rust integer type is inside its range: a fact the
+            # obligations may use, stated against the symbolic maximum.
+            ranges = []
+            for frag, ty in params:
+                if ty.kind == "nat" and ty.width in self.maxes:
+                    ranges.append("    assert (%s <= %s)"
+                                  % (frag, _max(ty.width)))
+            self.lines[range_at:range_at] = ranges
+            extra = [(_max(w), _Ty("nat", w)) for w in sorted(self.maxes)]
+        name = self.name + ("__safe" if self.safety else "")
         head = "def %s(%s) -> '%s':" % (
-            self.name, ", ".join("%s: '%s'" % (n, t.frag())
-                                 for n, t in params), ret.frag())
+            name, ", ".join("%s: '%s'" % (n, t.frag())
+                            for n, t in params + extra),
+            "Bool" if self.safety else ret.frag())
         source = "\n".join([head] + self.lines) + "\n"
-        return Lifted(self.name, source, ensures,
-                      [(n, t.frag()) for n, t in params], ret.frag(),
-                      self.callees)
+        out = Lifted(self.name, source, ensures,
+                     [(n, t.frag()) for n, t in params], ret.frag(),
+                     self.callees)
+        out.obligations = self.cond_labels
+        used = []
+        for _n, t in params + [(None, ret)]:
+            if t.kind == "rec" and t.name not in used:
+                used.append(t.name)
+        out.records = [(r, [(f, ft.frag()) for f, ft in
+                            self.unit.structs[r]]) for r in used]
+        if requires:
+            out.pre_source = "def %s__pre(%s) -> 'Bool':\n    return %s\n" % (
+                self.name, ", ".join("%s: '%s'" % (n, t.frag())
+                                     for n, t in params),
+                " and ".join(requires))
+        return out
 
     def attributes(self):
         """The `#[..]` run at the cursor: [(kind, tokens, line)] for the
@@ -413,8 +599,41 @@ class _FnLifter:
                             head.line))
         return out
 
+    def read_param_type(self, where):
+        """A parameter's type: (_Ty, is it `&mut`).  A slice, a `&Vec`, a
+        struct by value or by reference, or a scalar."""
+        if not self.accept("&"):
+            return self.read_type(where), False
+        by_mut = self.accept("mut") is not None
+        if self.accept("["):
+            elem = self.read_type(where)
+            self.expect("]")
+            if elem.kind != "nat":
+                self.fail("%s is a slice of `%s`; only slices of unsigned "
+                          "integers are lifted" % (where, elem.frag()))
+            if by_mut:
+                self.fail("%s is `&mut [..]`; writing through a slice is "
+                          "not lifted" % where)
+            return _Ty("arr", elem.width), False
+        if self.at("Vec"):
+            self.next()
+            self.expect("<")
+            elem = self.read_type(where)
+            self.expect(">")
+            if elem.kind != "nat" or by_mut:
+                self.fail("%s: only `&Vec<uN>` is lifted" % where)
+            return _Ty("arr", elem.width), False
+        ty = self.read_type(where)
+        if ty.kind != "rec":
+            self.fail("%s is a reference to `%s`; only structs and slices "
+                      "are lifted by reference" % (where, ty.frag()))
+        return ty, by_mut
+
     def read_type(self, where):
         t = self.cur
+        if t.kind == "ident" and t.val in self.unit.structs:
+            self.next()
+            return _Ty("rec", 0, t.val)
         if t.val in _UNSIGNED:
             self.next()
             return _Ty("nat", _UNSIGNED[t.val])
@@ -439,7 +658,8 @@ class _FnLifter:
         sub = _FnLifter(self.unit, self.name)
         sub.used, sub.callees, sub.lines = self.used, self.callees, self.lines
         sub.indent = self.indent
-        sub.toks = list(_strip_old(toks, mutable, self)) + \
+        state = self.state if ret is not None else None
+        sub.toks = list(_strip_old(toks, mutable, self, state)) + \
             [RustToken("eof", "", line)]
         sub.i = 0
         merged = {}
@@ -448,6 +668,11 @@ class _FnLifter:
         sub.scopes = [merged]
         if ret is not None:
             sub.scopes[0]["result"] = ("result", ret)
+        if state is not None:
+            # In an `ensures`, the `&mut` parameter is its final value -- the
+            # result -- and `old(..)` of it is the value it came in with.
+            sub.scopes[0][state[0]] = ("result", state[2])
+            sub.scopes[0]["__old_state"] = (state[1], state[2])
         expr, _ty = sub.expr_pure()
         if sub.cur.kind != "eof":
             sub.fail("unexpected `%s` in a contract clause" % sub.cur.val)
@@ -485,6 +710,10 @@ class _FnLifter:
             return False
         if t.kind == "kw" and t.val == "return":
             self.next()
+            if (self.at(";") or self.at("}")) and self.state is not None:
+                self.accept(";")
+                self.emit("return %s" % self.state[1])
+                return False
             if self.at(";") or self.at("}"):
                 self.fail("a `return` with no value")
             e, _ = self.expr()
@@ -511,6 +740,11 @@ class _FnLifter:
         if t.kind == "ident" and self.peek().val in ("=", "+=", "-=", "*=",
                                                      "/=", "%="):
             self.assign_stmt()
+            return False
+        if t.kind == "ident" and self.peek().val == "." \
+                and self.peek(2).kind == "ident" \
+                and self.peek(3).val in ("=", "+=", "-=", "*=", "/=", "%="):
+            self.field_assign_stmt()
             return False
         # A tail expression, or an expression statement with no effect.
         e, ty = self.expr()
@@ -588,8 +822,33 @@ class _FnLifter:
         if op == "=":
             self.emit("%s = %s" % (found[0], e))
             return
-        py = {"+=": "+", "-=": "-", "*=": "*", "/=": "//", "%=": "%"}[op]
-        self.emit("%s = (%s %s %s)" % (found[0], found[0], py, e))
+        value, _ty = self.combine(op[:-1], found[0], found[1], e, ty)
+        self.emit("%s = %s" % (found[0], value))
+
+    def field_assign_stmt(self):
+        """`s.f = e` / `s.f += e` on the `&mut` struct: a functional update
+        of the record the lifted function returns."""
+        name = self.next().val
+        self.expect(".")
+        field = self.next().val
+        if self.state is None or name != self.state[0]:
+            self.fail("assignment to a field of `%s`; only the `&mut` "
+                      "parameter's fields are assigned" % name)
+        fty = self._field(self.state[2], field)
+        op = self.next().val
+        e, ty = self.expr()
+        self.expect(";")
+        self._check_ty(fty, ty)
+        target = "%s.%s" % (self.state[1], field)
+        if op != "=":
+            e, _ty = self.combine(op[:-1], target, fty, e, ty)
+        self.emit("%s = %s" % (target, e))
+
+    def _field(self, rty, field):
+        for f, fty in self.unit.structs[rty.name]:
+            if f == field:
+                return fty
+        self.fail("`%s` has no field `%s`" % (rty.name, field))
 
     def while_stmt(self):
         attrs = self.loop_attrs
@@ -602,12 +861,17 @@ class _FnLifter:
         if not variants:
             self.fail("a `while` needs `#[variant(..)]`: a Nat that "
                       "strictly decreases, which is what makes it a fold")
+        head_conds = list(self.pending_conds)
         self.emit("while %s:" % cond)
         self.indent += 1
         for kind, toks, line in attrs:
             self.emit("assert %s(%s)" % (kind, self.clause(toks, line, None)))
         self.expect("{")
         self.block_body(None, None)
+        if head_conds:
+            # The condition is evaluated again before the next pass.
+            self.pending_conds = head_conds
+            self.flush()
         self.indent -= 1
 
     def for_stmt(self):
@@ -616,6 +880,11 @@ class _FnLifter:
             self.fail("the loop variable must be a plain name")
         var = self.next().val
         self.expect("in")
+        if self.cur.kind == "ident" and self.lookup(self.cur.val) is not None \
+                and self.lookup(self.cur.val)[1].kind == "arr" \
+                or self.at("&"):
+            self.for_each(var)
+            return
         lo, lty = self.expr(no_struct=True)
         if self.accept("..="):
             inclusive = True
@@ -649,6 +918,31 @@ class _FnLifter:
         self.indent -= 1
         self.scopes.pop()
 
+    def for_each(self, var):
+        """`for x in xs` / `xs.iter()` / `&xs` over a slice: the fold over
+        `range(len(xs))`, reading `xs[k]` -- in bounds by construction, so
+        it owes nothing."""
+        self.accept("&")
+        name = self.next().val
+        found = self.lookup(name)
+        if found is None or found[1].kind != "arr":
+            self.fail("`%s` is not a slice" % name)
+        if self.accept("."):
+            if not self.accept("iter"):
+                self.fail("only `.iter()` is lifted on a slice in a `for`")
+            self.expect("(")
+            self.expect(")")
+        k = self.fresh("k")
+        self.emit("for %s in range(len(%s)):" % (k, found[0]))
+        self.indent += 1
+        self.scopes.append({})
+        x = self.bind(var, _Ty("nat", found[1].width))
+        self.emit("%s = %s[%s]" % (x, found[0], k))
+        self.expect("{")
+        self.block_body(None, None)
+        self.scopes.pop()
+        self.indent -= 1
+
     # -- values of braced expressions -------------------------------------------
 
     def value_into(self, mode, want):
@@ -668,15 +962,28 @@ class _FnLifter:
         self.expect("if")
         if self.at("let"):
             self.fail("`if let` is not lifted")
+        if self._splittable_conjunction():
+            self._nested_if(mode, want)
+            return
         cond, ty = self.expr(no_struct=True)
         self._check_ty(_BOOL, ty)
         self.emit("if %s:" % cond)
         self._arm_block(mode, want)
+        nested = 0
         while self.accept("else"):
             if self.accept("if"):
                 cond, ty = self.expr(no_struct=True)
                 self._check_ty(_BOOL, ty)
-                self.emit("elif %s:" % cond)
+                if self.pending_conds:
+                    # The condition owes something, which can only be paid
+                    # where it is evaluated: inside the `else`, before an
+                    # `if` -- there is no statement between `elif`s.
+                    self.emit("else:")
+                    self.indent += 1
+                    nested += 1
+                    self.emit("if %s:" % cond)
+                else:
+                    self.emit("elif %s:" % cond)
                 self._arm_block(mode, want)
                 continue
             if mode == "ret":
@@ -685,11 +992,66 @@ class _FnLifter:
                 # `return`, not one whose last statement is an `if`.
                 self.expect("{")
                 self.block_body(mode, want)
+                self.indent -= nested
                 return
             self.emit("else:")
             self._arm_block(mode, want)
+            self.indent -= nested
             return
+        self.indent -= nested
         if mode is not None:
+            self.fail("an `if` used as a value needs an `else`")
+
+    def _splittable_conjunction(self):
+        """Is the condition at the cursor `a && b && ..`, with no `||` at the
+        top level, on an `if` with no `else`?  Then it is the same program as
+        nested `if`s -- and nested, each conjunct is a guard of its own that
+        the kernel's split decides, where `a && b` true decides neither."""
+        depth, j, conj = 0, self.i, False
+        while self.toks[j].kind != "eof":
+            v = self.toks[j].val
+            if v in ("(", "["):
+                depth += 1
+            elif v in (")", "]"):
+                depth -= 1
+            elif depth == 0 and v == "||":
+                return False
+            elif depth == 0 and v == "&&":
+                conj = True
+            elif depth == 0 and v == "{":
+                break
+            j += 1
+        if not conj:
+            return False
+        depth = 0
+        while self.toks[j].kind != "eof":                  # the body
+            v = self.toks[j].val
+            if v == "{":
+                depth += 1
+            elif v == "}":
+                depth -= 1
+                if depth == 0:
+                    return self.toks[j + 1].val != "else"
+            j += 1
+        return False
+
+    def _nested_if(self, mode, want):
+        levels = 0
+        while True:
+            cond, ty = self.binary(2)               # one conjunct
+            self._check_ty(_BOOL, ty)
+            self.emit("if %s:" % cond)
+            self.indent += 1
+            levels += 1
+            if not self.accept("&&"):
+                break
+        self.expect("{")
+        before = len(self.lines)
+        self.block_body(mode, want)
+        if len(self.lines) == before:
+            self.emit("pass")
+        self.indent -= levels
+        if mode is not None and mode != "ret":
             self.fail("an `if` used as a value needs an `else`")
 
     def _arm_block(self, mode, want):
@@ -719,6 +1081,7 @@ class _FnLifter:
             s = tmp
         self.expect("{")
         arms = []
+        before = []                     # the tests of the arms above
         while not self.at("}"):
             if self.cur.kind == "eof":
                 self.fail("unterminated `match`")
@@ -728,8 +1091,19 @@ class _FnLifter:
             for bname in binds:
                 self.alias(bname, s, sty)
             if self.accept("if"):
-                guard, gty = self.expr()
+                # A guard is evaluated only when its pattern matched and no
+                # arm above did; what it owes is conditioned on exactly that.
+                path = cond
+                for prior in before:
+                    path = "((not %s) and %s)" % (prior, path)
+                self.guards.append(path)
+                try:
+                    guard, gty = self.expr()
+                finally:
+                    del self.guards[-1]
                 self._check_ty(_BOOL, gty)
+            before.append(cond if guard is None else
+                          "(%s and %s)" % (cond, guard))
             self.expect("=>")
             arms.append((cond, guard, self.i, dict(self.scopes[-1])))
             self.scopes.pop()
@@ -871,7 +1245,16 @@ class _FnLifter:
             if self.cur.val == "==" and self.peek().val == ">":
                 break                           # `==>`, handled below
             op = self.next().val
-            right, rty = self.binary(level + 1)
+            if op in ("&&", "||"):
+                # The right side is evaluated only if the left did not settle
+                # it, and what it owes is owed only then.
+                self.guards.append(left if op == "&&" else "(not %s)" % left)
+                try:
+                    right, rty = self.binary(level + 1)
+                finally:
+                    del self.guards[-1]
+            else:
+                right, rty = self.binary(level + 1)
             left, lty = self.combine(op, left, lty, right, rty)
         # `==>` is how Creusot and Prusti write implication; it lexes as `==`
         # and `>`, so it is caught here, at the lowest level.
@@ -897,12 +1280,18 @@ class _FnLifter:
             if not _is_int(right):
                 self.fail("a shift by a non-literal amount is not lifted")
             k = 2 ** int(right)
+            if lty.width and int(right) >= lty.width:
+                self.fail("a shift by %s on a u%d always panics"
+                          % (right, lty.width))
             # On an unsigned value `>> k` is division by 2**k exactly, with
             # no truncation and no wrap; `<< k` is multiplication, exact
             # until it overflows -- the same claim as `*`.
             if op == ">>":
                 return "(%s // %d)" % (left, k), lty
-            return "(%s * %d)" % (left, k), lty
+            out = "(%s * %d)" % (left, k)
+            if lty.width:
+                self.overflow(out, lty.width, "`<<`")
+            return out, lty
         if op in ("==", "!=", "<", ">", "<=", ">="):
             if lty.kind != rty.kind:
                 self.fail("comparing a `%s` with a `%s`" % (lty.frag(),
@@ -916,7 +1305,20 @@ class _FnLifter:
         self._check_ty(_LIT, lty)
         self._check_ty(_LIT, rty)
         py = {"+": "+", "-": "-", "*": "*", "/": "//", "%": "%"}[op]
-        return "(%s %s %s)" % (left, py, right), _wider(lty, rty)
+        out = "(%s %s %s)" % (left, py, right)
+        ty = _wider(lty, rty)
+        if op in ("+", "*") and ty.width:
+            self.overflow(out, ty.width, "`%s`" % op)
+        elif op == "-":
+            self.side(_either(["(%s <= %s)" % (right, left),
+                               "(%s < %s)" % (right, left)],
+                              "(not (%s < %s))" % (left, right)),
+                      "`-` may underflow")
+        elif op in ("/", "%"):
+            self.side(_either(["(0 < %s)" % right],
+                              "(not (%s == 0))" % right),
+                      "`%s` by zero" % op)
+        return out, ty
 
     def cast(self):
         e, ty = self.unary()
@@ -947,19 +1349,55 @@ class _FnLifter:
         if t.kind == "punc" and t.val == "-":
             self.fail("negation has no meaning on an unsigned value")
         if t.kind == "punc" and t.val in ("&", "*"):
-            self.fail("references are not lifted yet")
+            # Borrowing or dereferencing a slice or a struct changes nothing
+            # the model sees; a reference to a scalar is not lifted.
+            self.next()
+            e, ty = self.unary()
+            if ty.kind not in ("arr", "rec"):
+                self.fail("references to `%s` are not lifted" % ty.frag())
+            return e, ty
         return self.postfix()
 
     def postfix(self):
         e, ty = self.primary()
-        t = self.cur
-        if t.val == ".":
-            self.fail("fields and methods are not lifted yet")
-        if t.val == "[":
-            self.fail("indexing is not lifted yet")
-        if t.val == "?":
-            self.fail("`?` is not lifted")
-        return e, ty
+        while True:
+            t = self.cur
+            if t.val == "." and ty.kind == "rec":
+                self.next()
+                field = self.next().val
+                if self.at("("):
+                    self.fail("methods are not lifted")
+                e, ty = "%s.%s" % (e, field), self._field(ty, field)
+                continue
+            if t.val == "." and ty.kind == "arr":
+                self.next()
+                method = self.next().val
+                self.expect("(")
+                self.expect(")")
+                if method == "len":
+                    e, ty = "len(%s)" % e, _Ty("nat", 64)
+                elif method == "is_empty":
+                    e, ty = "(len(%s) == 0)" % e, _BOOL
+                else:
+                    self.fail("`.%s()` on a slice is not lifted" % method)
+                continue
+            if t.val == "[" and ty.kind == "arr":
+                self.next()
+                i, ity = self.binary(0)
+                self.expect("]")
+                self._check_ty(_LIT, ity)
+                self.side(_either(["(%s < len(%s))" % (i, e)],
+                                  "(not (len(%s) <= %s))" % (e, i)),
+                          "index out of bounds")
+                e, ty = "%s[%s]" % (e, i), _Ty("nat", ty.width)
+                continue
+            if t.val == ".":
+                self.fail("methods on `%s` are not lifted" % ty.frag())
+            if t.val == "[":
+                self.fail("indexing `%s` is not lifted" % ty.frag())
+            if t.val == "?":
+                self.fail("`?` is not lifted")
+            return e, ty
 
     def primary(self):
         t = self.cur
@@ -1011,6 +1449,8 @@ class _FnLifter:
         save_used, save_callees = set(self.used), list(self.callees)
         save_indent, save_depth = self.indent, len(self.scopes)
         save_nested = len(self.nested_locals)
+        save_safety = (self.cond_n, list(self.cond_labels),
+                       list(self.pending_conds), list(self.guards))
         try:
             self.value_into(_PROBE, None)
             ty = None
@@ -1024,6 +1464,8 @@ class _FnLifter:
         del self.nested_locals[save_nested:]
         self.indent = save_indent
         self.used, self.callees = save_used, save_callees
+        self.cond_n, self.cond_labels, self.pending_conds, self.guards = \
+            save_safety
         if ty is None:
             self.fail("cannot tell the type of this value; bind it with "
                       "`let x: T = ..` first")
@@ -1052,14 +1494,25 @@ class _FnLifter:
                           % (ty.frag(), fname, want))
         if callee not in self.callees:
             self.callees.append(callee)
-        ret = _BOOL if callee.ret == "Bool" else _Ty("nat", 64)
-        return "%s(%s)" % (fname, ", ".join(e for e, _ in args)), ret
+        text = ", ".join(e for e, _ in args)
+        if callee.pre_source is not None:
+            # A call owes its callee's `#[requires]`.
+            self.side("%s__pre(%s)" % (fname, text),
+                      "`%s`'s `#[requires]`" % fname)
+        if callee.ret == "Bool":
+            ret = _BOOL
+        elif callee.ret == "Nat":
+            ret = _Ty("nat", 64)
+        else:
+            ret = _Ty("rec", 0, callee.ret)
+        return "%s(%s)" % (fname, text), ret
 
 
-def _strip_old(toks, mutable, lifter):
+def _strip_old(toks, mutable, lifter, state=None):
     """`old(e)` is `e`: a parameter already means its value at entry.  A
     `mut` parameter named outside `old` is refused -- read at the end or at
-    entry, the clause would say two different things."""
+    entry, the clause would say two different things.  With a `&mut`
+    parameter, its name inside `old(..)` becomes the entry value."""
     out, k = [], 0
     while k < len(toks):
         t = toks[k]
@@ -1075,7 +1528,11 @@ def _strip_old(toks, mutable, lifter):
                         break
                 j += 1
             out.append(RustToken("punc", "(", t.line))
-            out.extend(toks[k + 2:j])
+            for inner in toks[k + 2:j]:
+                if state is not None and inner.kind == "ident" \
+                        and inner.val == state[0]:
+                    inner = RustToken("ident", "__old_state", inner.line)
+                out.append(inner)
             out.append(RustToken("punc", ")", t.line))
             k = j + 1
             continue
@@ -1109,6 +1566,19 @@ def _int_literal(tok, lifter):
     except ValueError:
         lifter.fail("`%s` is not an integer literal the lift reads"
                     % tok.val)
+
+
+def _either(sufficient, exact):
+    """An obligation as a chain: `True` if any sufficient spelling holds,
+    else the exact one.  Over Nat they all say the same thing, but as
+    booleans they are different terms, and the kernel's split-then-compute
+    decides only the spelling a guard used -- `i >= len` early-returned
+    decides `len <= i`, not `i < len`.  Each premise implies the claim, so
+    the chain is the claim; it just lets the proof find the guard."""
+    out = exact
+    for cond in reversed(sufficient):
+        out = "(True if %s else %s)" % (cond, out)
+    return out
 
 
 def _is_name(text):
