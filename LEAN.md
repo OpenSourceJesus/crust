@@ -250,3 +250,82 @@ and Prusti's syntax, are checked at runtime today (see "Contracts" in
 `read_procedure` as `ensures` and loop annotations. The runtime check keeps
 the corpus discipline available before any proof exists: a contract the
 tests break is a contract no proof will establish.
+
+The second step is in too: `shivyc/rustproof.py` lifts a Rust function from
+its source, contracts included, into `hoare.py`'s fragment.
+
+```sh
+make test_rustproof     # the lift, the model against the binary, the proofs
+```
+
+`leanos/regs.rs` is `elf_regs_for_class` as Rust writes it: a `match`, with
+the bound stated on the function.
+
+```rust
+#[ensures(result <= 23)]
+#[ensures(result >= 6)]
+pub fn elf_regs_for_class(cls: u32) -> u32 {
+    match cls { 0 => 6, 1 => 10, 2 => 15, _ => 23 }
+}
+```
+
+It lifts to what a person would write, the same fragment the IL lift
+produces from the C, with its postconditions beside it:
+
+```
+def elf_regs_for_class(cls: 'Nat') -> 'Nat':
+    if (cls == 0):
+        return 6
+    elif (cls == 1):
+        return 10
+    elif (cls == 2):
+        return 15
+    return 23
+```
+
+`by_every_bool` proves both postconditions for every `cls`, and refuses the
+false bound `<= 15`. Lean 4 accepts the export with no axioms. The Rust model
+and the C model lifted from `crustos/kernel.c` agree on every class. This is
+the first function in the tree whose model and theorem are both read off the
+file that ships, so there is no transcription for a shape test to guard.
+
+**What the lift reaches.**
+- Unsigned integers (as Nat) and `bool`.
+- `let`, assignment and compound assignment.
+- `if` and `match` as statements, values or tails. `match` covers literals,
+  `|`, ranges, `_`, bindings and guards, lowered to an `if`/`elif` chain.
+- Early `return`.
+- `for i in a..b` and `a..=b`, as a fold over `range(b - a)` shifted by `a`.
+  Here Nat's truncating `-` is exact: an empty range runs no times.
+- `while` with `#[invariant]` and `#[variant]`, which become the fragment's
+  loop annotations.
+- Calls to other functions in the file, lifted with it and handed over as
+  signatures.
+- `>>`/`<<` by a literal, widening `as`, `&&`, `||`, `!`, and `==>` in
+  contracts.
+
+**What is claimed.**
+- Unsigned arithmetic is Nat, the same model as the IL lift's. The difference
+  is that the Rust type's width is still known here, which is what will let
+  overflow and underflow become obligations of their own. That is the next
+  step.
+- `#[requires]` becomes the fragment's leading `assert`s and `#[ensures]` its
+  postconditions. These are the clauses Crust checks at runtime, so a
+  contract the tests break is one no proof will establish.
+- In an `ensures`, a parameter means its value at entry, which is `old(x)`. A
+  clause naming a `mut` parameter outside `old` is refused rather than read
+  one way or the other.
+
+**What is refused, by name:** signed integers, references, fields, methods,
+indexing, `loop`/`break`, macros, recursion, bitwise `&`/`|`/`^`, narrowing
+`as`, and quantified clauses. The refusals are the roadmap, as the IL lift's
+tally is.
+
+**A known gap.** `class_covers` in `regs.rs` composes the two functions: the
+class `class_for_regs(n)` picks is sized for at least `n` registers, for
+every `n <= 23`. It lifts, but `by_every_bool` cannot prove it. The
+postcondition needs `n <= 6` to give `6 >= n`, which is reasoning about the
+range a guard establishes, and splitting then computing does not do that.
+`tests/test_rustproof.py` asserts the proof still fails, so closing the gap
+cannot happen quietly. Meanwhile the compiled function, with its `ensures`
+checked at runtime, runs over every `n` its `requires` admits.

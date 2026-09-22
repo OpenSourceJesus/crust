@@ -1063,6 +1063,14 @@ test_ilproof:
 	fi
 	python3 -m unittest tests.test_ilproof -v
 
+# The Rust source lift: `leanos/regs.rs`'s contracts, proved by the kernel
+# and, when `lean` is installed, accepted by Lean 4.  Needs RosettaMath.
+test_rustproof:
+	@if [ ! -f "$(ROSETTA_DIR)/hoare.py" ]; then \
+		echo "RosettaMath not found -- run 'make install_proofs'"; exit 1; \
+	fi
+	python3 -m unittest tests.test_rustproof -v
+
 # The ELF validator: crustos/elfcheck.py against its proved model, compiled
 # by ShivyCX, and wired into elf.c on real and corrupted ELFs.  Same
 # dependency; a few seconds.  The Lean case is skipped without `lean`.
@@ -1265,4 +1273,4 @@ self:
         install_cpython clean_cpython test_cpython test_cpython_objects \
         install_bsd clean_bsd test_bsd test_bsd_bin test_bsd_usrbin crustos \
         install_proofs check_proofs install_lean clean_proofs test_model test_elfcheck test_memmap test_threads test_alloc test_loader test_switch \
-        test_ilproof
+        test_ilproof test_rustproof
