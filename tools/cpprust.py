@@ -3813,6 +3813,11 @@ def _find_classes(scan, text, path="<cpp>"):
     """Locate `class`/`struct` definitions with bodies, template-aware."""
     classes = []
     for m in re.finditer(r"\b(class|struct)\s+(\w+)\s*(:[^{;]*)?\{", scan):
+        # `typedef struct X { .. } X;` is already C. Rewriting just the
+        # `struct X { .. }` span leaves a stray `typedef` and a dangling
+        # trailing name (same trap as typedef enums further down).
+        if _prev_word(scan, m.start()) == "typedef":
+            continue
         open_idx = scan.index("{", m.start())
         close = _match_brace(scan, open_idx)
         if close is None:
@@ -10687,7 +10692,12 @@ public:
         vd = 0; vn = 0; vcap = 0;
         reserve(o.vn);
         int i = 0;
-        while (i < o.vn) { __cpp_copy(T, vd[i], &o.vd[i]); i = i + 1; }
+        /* `__cpp_addr`: class → &elem (copy ctor), scalar → value (assign).
+           A bare `&o.vd[i]` forced a pointer into every scalar slot. */
+        while (i < o.vn) {
+            __cpp_copy(T, vd[i], __cpp_addr(T, o.vd[i]));
+            i = i + 1;
+        }
         vn = o.vn;
     }
     vector<T> &operator=(const vector<T> &o) {
@@ -10695,7 +10705,10 @@ public:
             vn = 0;
             reserve(o.vn);
             int i = 0;
-            while (i < o.vn) { __cpp_copy(T, vd[i], &o.vd[i]); i = i + 1; }
+            while (i < o.vn) {
+                __cpp_copy(T, vd[i], __cpp_addr(T, o.vd[i]));
+                i = i + 1;
+            }
             vn = o.vn;
         }
     }

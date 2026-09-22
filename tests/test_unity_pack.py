@@ -820,6 +820,60 @@ class TestSystems(unittest.TestCase):
         self.assertNotIn("new List", eng)
         self.assertNotIn("error CS0246", eng)
 
+    @needs_cc
+    def test_player_build_uses_cpprust_lowered_engine_c(self):
+        """Player compiles engine.c (cpprust-lowered), not g++ on engine.cpp."""
+        root = tempfile.mkdtemp(prefix="upack-player-c-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "P.cs"), "w") as f:
+            f.write(
+                "using System.Collections.Generic;\n"
+                "using UnityEngine;\n"
+                "public class P : MonoBehaviour {\n"
+                "    void Start() {\n"
+                "        List<int> xs = new List<int>();\n"
+                "        xs.Add(1);\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "P.cs.meta"), "w") as f:
+            f.write("guid: playecxplayecxplayecxplayecx01\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: P\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: playecxplayecxplayecxplayecx01}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-player-c-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.cpp")) as f:
+            cpp = f.read()
+        with open(os.path.join(d, "engine.c")) as f:
+            c = f.read()
+        self.assertIn("#include <vector>", cpp)
+        self.assertIn("std::vector", cpp)
+        self.assertNotIn("#include <vector>", c)
+        self.assertNotIn("std::vector", c)
+        self.assertIn("vector_int", c)
+        with open(os.path.join(d, "Makefile")) as f:
+            mk = f.read()
+        self.assertIn("engine.o: engine.c", mk)
+        self.assertIn("$(CC)", mk)
+        self.assertNotIn("engine.o: engine.cpp", mk)
+        exe = unity_pack.build_player_executable(d, "VectorPlayer")
+        self.assertTrue(os.path.isfile(exe), exe)
+
     def test_cross_class_static_list_rewrites(self):
         """OtherClass.staticList.Count / [i] → OtherClass_staticList."""
         root = tempfile.mkdtemp(prefix="upack-xlist-")
@@ -1272,12 +1326,16 @@ class TestSystems(unittest.TestCase):
         unity_pack.pack(root, d)
         with open(os.path.join(d, "engine.c")) as f:
             eng = f.read()
+        with open(os.path.join(d, "engine.cpp")) as f:
+            cpp = f.read()
         self.assertIn("GameObject_GetComponentsInChildren_Part", eng)
         self.assertIn("_engine_go_is_child_of", eng)
         self.assertIn(
             "std::vector<int> parts = "
-            "GameObject_GetComponentsInChildren_Part(", eng)
-        self.assertIn("parts.size()", eng)
+            "GameObject_GetComponentsInChildren_Part(", cpp)
+        self.assertIn("vector_int", eng)
+        self.assertNotIn("std::vector", eng)
+        self.assertIn("vector_int_size(&parts)", eng)
         self.assertNotIn("GetComponentsInChildren<Part>", eng)
         self.assertNotIn("unlowered C#", eng)
         self.assertNotIn("Part[]", eng)
@@ -1349,12 +1407,15 @@ class TestSystems(unittest.TestCase):
         unity_pack.pack(root, d)
         with open(os.path.join(d, "engine.c")) as f:
             eng = f.read()
+        with open(os.path.join(d, "engine.cpp")) as f:
+            cpp = f.read()
         self.assertIn("GameObject_GetComponentsInChildren_Weapon", eng)
         self.assertIn("GameObject_GetComponent_Blaster(go)", eng)
         self.assertIn(
             "std::vector<int> ws = "
-            "GameObject_GetComponentsInChildren_Weapon(", eng)
+            "GameObject_GetComponentsInChildren_Weapon(", cpp)
         self.assertNotIn("Weapon could not be found", eng)
+        self.assertNotIn("std::vector", eng)
 
     def test_getcomponentsinchildren_on_instantiated(self):
         """clone.GetComponentsInChildren after Instantiate uses clone GO."""
@@ -4311,6 +4372,156 @@ class TestSystems(unittest.TestCase):
         ub = plan["ui_buttons"][0]
         self.assertAlmostEqual(ub["highlighted"][0], 0.78431374, places=5)
         self.assertAlmostEqual(ub["pressed"][0], 0.5882353, places=5)
+
+    def test_vertical_layout_group_stacks_children(self):
+        """Authored VerticalLayoutGroup bakes child RectTransforms top→bottom."""
+        root = tempfile.mkdtemp(prefix="upack-vlg-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Host.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Host : MonoBehaviour { void Update() {} }\n"
+            )
+        with open(os.path.join(scripts, "Host.cs.meta"), "w") as f:
+            f.write("guid: vlghostvlghostvlghostvlghost01\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        img = "fe87c0e1cc204ed48ad3b37840f39efc"
+        vlg = "59f8146938fff824cb5fd77236b75775"
+        builtin = "0000000000000000f000000000000000"
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Canvas\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!224 &2\nRectTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 0, y: 0}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!223 &3\nCanvas:\n  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n  m_RenderMode: 0\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Panel\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "  - component: {fileID: 13}\n"
+                "--- !u!224 &11\nRectTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Father: {fileID: 2}\n"
+                "  m_AnchorMin: {x: 0.5, y: 0.5}\n"
+                "  m_AnchorMax: {x: 0.5, y: 0.5}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 200, y: 300}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!114 &12\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, guid: " + vlg + "}\n"
+                "  m_Padding:\n    m_Left: 0\n    m_Right: 0\n"
+                "    m_Top: 0\n    m_Bottom: 0\n"
+                "  m_ChildAlignment: 0\n  m_Spacing: 10\n"
+                "  m_ChildForceExpandWidth: 1\n"
+                "  m_ChildForceExpandHeight: 0\n"
+                "  m_ChildControlWidth: 1\n"
+                "  m_ChildControlHeight: 0\n"
+                "  m_ChildScaleWidth: 0\n  m_ChildScaleHeight: 0\n"
+                "  m_ReverseArrangement: 0\n"
+                "--- !u!114 &13\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: vlghostvlghostvlghostvlghost01}\n"
+            )
+            for i, fid in enumerate((20, 30, 40)):
+                xf, img_id = fid + 1, fid + 2
+                f.write(
+                    "--- !u!1 &%d\nGameObject:\n  m_Name: B%d\n"
+                    "  m_Component:\n  - component: {fileID: %d}\n"
+                    "  - component: {fileID: %d}\n"
+                    "--- !u!224 &%d\nRectTransform:\n"
+                    "  m_GameObject: {fileID: %d}\n"
+                    "  m_Father: {fileID: 11}\n"
+                    "  m_AnchorMin: {x: 0.5, y: 0.5}\n"
+                    "  m_AnchorMax: {x: 0.5, y: 0.5}\n"
+                    "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                    "  m_SizeDelta: {x: 100, y: 40}\n"
+                    "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                    "--- !u!114 &%d\nMonoBehaviour:\n"
+                    "  m_GameObject: {fileID: %d}\n"
+                    "  m_Script: {fileID: 11500000, guid: %s}\n"
+                    "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+                    "  m_Enabled: 1\n  m_Type: 0\n"
+                    "  m_Sprite: {fileID: 10905, guid: %s, type: 0}\n"
+                    % (fid, i, xf, img_id, xf, fid, img_id, fid, img, builtin)
+                )
+        objs, _a, _l, _c, _h = unity_pack.load_project(root)
+        panel = [o for o in objs if o["name"] == "Panel"][0]
+        self.assertTrue(panel.get("layout_group", {}).get("vertical"))
+        kids = sorted(
+            [o for o in objs if o["name"].startswith("B")],
+            key=lambda o: o["name"])
+        self.assertEqual(len(kids), 3)
+        # Stacked from top with spacing 10; width driven to panel 200.
+        ys = [o["rect"]["anchored_position"][1] for o in kids]
+        self.assertAlmostEqual(ys[0], -20.0, places=3)
+        self.assertAlmostEqual(ys[1], -70.0, places=3)
+        self.assertAlmostEqual(ys[2], -120.0, places=3)
+        for o in kids:
+            self.assertAlmostEqual(o["rect"]["size_delta"][0], 200.0, places=3)
+            # Distinct world Y after bake (not all piled at center).
+        wy = [o["pos"][1] for o in kids]
+        self.assertGreater(wy[0], wy[1])
+        self.assertGreater(wy[1], wy[2])
+
+    def test_awake_setactive_false_emitted(self):
+        """Awake gameObject.SetActive(false) runs before Start (SettingsMenu)."""
+        root = tempfile.mkdtemp(prefix="upack-awake-sa-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Menu.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Menu : MonoBehaviour {\n"
+                "    void Awake() {\n"
+                "        gameObject.SetActive(false);\n"
+                "        Unknown.DoThing();\n"
+                "    }\n"
+                "    void Update() {}\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Menu.cs.meta"), "w") as f:
+            f.write("guid: awakeasaawakeasaawakeasaawake01\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Menu\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: awakeasaawakeasaawakeasaawake01}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-awake-sa-out-")
+        # Pack may fail validate if no UI SetActive helper — force go tables
+        # via a minimal Image is heavy; call emit path through pack and accept
+        # need for GameObject_SetActive (want_ui). Add a Canvas button-less
+        # go table by using Find in script... Use load + emit only if pack
+        # fails. Prefer pack with sprite so go_names exist.
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("static void Menu_Awake(unsigned i)", eng)
+        self.assertIn("GameObject_SetActive(_engine_go_of_Menu(i), (0))", eng)
+        self.assertIn("Menu_Awake((unsigned)n)", eng)
 
     def test_vector3_plus_equals_vector2_is_cs0034(self):
         """transform.position is Vector3; += Vector2 is ambiguous in csc."""
