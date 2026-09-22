@@ -526,6 +526,34 @@ class TestSystems(unittest.TestCase):
         self.assertIn("PlayerAwake", blanked)
         self.assertIn("playerOnly", blanked)
 
+    def test_emitted_new_list_subset_maps_to_csharp_cs0246(self):
+        """cpprust `new List` subset error remaps to authored List site."""
+        analyses = [{
+            "path": "/proj/Assets/Scripts/P.cs",
+            "classes": [{
+                "name": "P",
+                "file_text": (
+                    "using System.Collections.Generic;\n"
+                    "using UnityEngine;\n"
+                    "public class P : MonoBehaviour {\n"
+                    "    void Start() { var xs = new List<int>(); }\n"
+                    "}\n"
+                ),
+            }],
+        }]
+        err = (
+            "engine.cpp: `new List` is not in the C++ subset -- List is not "
+            "a class defined in this file, and the lowering has to know the "
+            "constructor to call. Use `malloc` directly."
+        )
+        msg = unity_pack._emitted_subset_error_to_unity(
+            err, emitted_path="engine.cpp", analyses=analyses)
+        self.assertIn("Assets/Scripts/P.cs(", msg)
+        self.assertIn("error CS0246", msg)
+        self.assertIn("'List'", msg)
+        self.assertNotIn("left the crust", msg)
+        self.assertNotIn("malloc", msg)
+
     def test_quaternion_unsupported_member_is_cs0117(self):
         """Unsupported Quaternion members → CS0117 (in scope via UnityEngine)."""
         src = (

@@ -339,6 +339,9 @@ Pool budget is one slot per instance of each class that calls `AddComponent<T>`
 | `AddComponent<Canvas>` / `typeof(Canvas)` / `ForceUpdateCanvases` | Refused invent — author `!u!223` in the scene |
 | `Camera.main` with no scene Camera | Packer will not invent a default camera |
 
+Pack / crust / cpprust failures report as Unity/csc diagnostics
+(`Assets/…(line,col): error CSxxxx: …`), not raw `engine.cpp` subset prose.
+
 ## Tick order
 
 ```
