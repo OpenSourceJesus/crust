@@ -554,6 +554,82 @@ class TestSystems(unittest.TestCase):
         self.assertNotIn("left the crust", msg)
         self.assertNotIn("malloc", msg)
 
+    def test_vector2_struct_for_locals_and_fields(self):
+        """Vector2 locals / new Vector2 → struct; packed field R/W via _x/_y."""
+        root = tempfile.mkdtemp(prefix="upack-v2-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Cosmetic.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Cosmetic : MonoBehaviour {\n"
+                "    public Vector2 initLocalPosition;\n"
+                "    void Awake() {\n"
+                "        initLocalPosition = transform.localPosition;\n"
+                "    }\n"
+                "    void Update() {}\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Cosmetic.cs.meta"), "w") as f:
+            f.write("guid: cosmeticosmeticosmeticosmeti01\n")
+        with open(os.path.join(scripts, "Player.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Player : MonoBehaviour {\n"
+                "    public Cosmetic cosmetic;\n"
+                "    void Update() {\n"
+                "        Vector2 topPoint = new Vector2(1f, 2f);\n"
+                "        cosmetic.initLocalPosition = topPoint;\n"
+                "        cosmetic.transform.localPosition ="
+                " cosmetic.initLocalPosition;\n"
+                "        last = Vector2.zero;\n"
+                "    }\n"
+                "    Vector2 last;\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Player.cs.meta"), "w") as f:
+            f.write("guid: playerplayerplayerplayerplayer01\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Player\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Cosmetic\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: playerplayerplayerplayerplayer01}\n"
+                "  cosmetic: {fileID: 12}\n"
+                "--- !u!4 &11\nTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_LocalPosition: {x: 1, y: 2, z: 0}\n"
+                "--- !u!114 &12\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: cosmeticosmeticosmeticosmeti01}\n"
+                "  initLocalPosition: {x: 3, y: 4}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-v2-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.cpp")) as f:
+            eng = f.read()
+        self.assertIn("typedef struct Vector2", eng)
+        self.assertIn("Vector2_make(1.f, 2.f)", eng)
+        self.assertIn("Player_set_last_x(i, (0.f))", eng)
+        self.assertIn("Player_set_last_y(i, (0.f))", eng)
+        self.assertNotIn("new Vector2", eng)
+        self.assertNotIn("error CS0246", eng)
+        self.assertIn("Cosmetic_set_initLocalPosition_x", eng)
+        self.assertIn("Cosmetic_set_pos_x", eng)
+
     def test_sortedlist_lowers_to_std_map(self):
         """SortedList<string,T> field + indexer → std::map with string keys."""
         root = tempfile.mkdtemp(prefix="upack-slist-")

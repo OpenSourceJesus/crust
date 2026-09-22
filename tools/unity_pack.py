@@ -5996,6 +5996,8 @@ def emit_engine(plan, analyses, used_apis):
     p("   T is incomplete, so the arrays wait until the structs exist;")
     p("   the names are all listed here as comments so data.c and any")
     p("   group can find them. */")
+    if _plan_needs_vector2(plan, used_apis):
+        _emit_vector2_struct(p)
     if _plan_needs_vector2int(plan, used_apis):
         _emit_vector2int_struct(p)
     if want_map_string:
@@ -9822,6 +9824,29 @@ def _rewrite_new_vector_assigns(text, idn, two_d=True):
     return text
 
 
+def _rewrite_local_position_vec2_fields(text, cl):
+    """Round-trip Vector2 fields ↔ live localPosition (packed pos tables)."""
+    idn = _c_ident(cl["name"])
+    for vf in cl.get("vec2_fields") or []:
+        load = (
+            "%s_set_%s_x(i, %s_get_pos_x(i)); "
+            "%s_set_%s_y(i, %s_get_pos_y(i));"
+            % (idn, vf, idn, idn, vf, idn))
+        store = (
+            "%s_set_pos_x(i, %s_get_%s_x(i)); "
+            "%s_set_pos_y(i, %s_get_%s_y(i));"
+            % (idn, idn, vf, idn, idn, vf))
+        text = re.sub(
+            r"(?<![_\w])%s\s*=\s*(?:this\s*\.\s*)?transform\s*\.\s*"
+            r"localPosition\s*;" % re.escape(vf),
+            load, text)
+        text = re.sub(
+            r"(?:this\s*\.\s*)?transform\s*\.\s*localPosition\s*=\s*"
+            r"(?<![_\w])%s\s*;" % re.escape(vf),
+            store, text)
+    return text
+
+
 def _rewrite_local_position_vec3_fields(text, cl):
     """Round-trip Vector3 fields ↔ live localPosition (packed pos tables)."""
     idn = _c_ident(cl["name"])
@@ -11118,6 +11143,16 @@ def _collection_elem_c_ty(elem, plan=None):
     return "int"
 
 
+def _plan_needs_vector2(plan, used_apis=None):
+    """Emit Vector2 when scripts use the type or pack Vector2 fields."""
+    if used_apis and "Vector2" in used_apis:
+        return True
+    for cl in (plan or {}).get("classes", {}).values():
+        if cl.get("vec2_fields"):
+            return True
+    return False
+
+
 def _plan_needs_vector2int(plan, used_apis=None):
     if used_apis and "Dictionary" in used_apis:
         pass  # may still need scan of tys
@@ -11132,6 +11167,21 @@ def _plan_needs_vector2int(plan, used_apis=None):
             if _list_elem_name(f.get("ty") or "") in _UNITY_INT_VECTOR_TYPES:
                 return True
     return False
+
+
+def _emit_vector2_struct(p):
+    """UnityEngine.Vector2 — C-compatible value type for locals / ctor calls."""
+    p("/* UnityEngine.Vector2 — packed fields still use _x/_y slots. */")
+    p("typedef struct Vector2 {")
+    p("    float x;")
+    p("    float y;")
+    p("} Vector2;")
+    p("static Vector2 Vector2_make(float ax, float ay) {")
+    p("    Vector2 v; v.x = ax; v.y = ay; return v;")
+    p("}")
+    p("static float Vector2_x(Vector2 v) { return v.x; }")
+    p("static float Vector2_y(Vector2 v) { return v.y; }")
+    p("")
 
 
 def _emit_vector2int_struct(p):
@@ -11518,6 +11568,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = _rewrite_transform_point(text, cl, plan)
     text = _rewrite_transform_matrices(text, cl, plan)
     text = _rewrite_transform_find(text, cl, plan)
+    text = _rewrite_local_position_vec2_fields(text, cl)
     text = _rewrite_local_position_vec3_fields(text, cl)
     # GameObject ≡ Transform index: drop redundant .transform on Find / GO.
     if plan.get("go_names"):
@@ -11550,6 +11601,9 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         text = re.sub(
             r"\b%s\b(?=\s+\w)" % re.escape(cname), "int", text)
     # API tokens before Vector2 rewrites so nested Mathf.Sin(...) keeps parens.
+    text = re.sub(
+        r"(?:UnityEngine\.)?GameObject\s*\.\s*Find\s*\(",
+        "GameObject_Find(", text)
     text = text.replace("Time.deltaTime", "Time_deltaTime")
     text = text.replace("Time.fixedDeltaTime", "Time_fixedDeltaTime")
     text = text.replace("Time.time", "Time_time")
@@ -11683,6 +11737,13 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         f["name"]: f for f in (cl.get("class_consts") or [])
     }
     for vf in cl.get("vec2_fields") or []:
+        # Whole-field write before .x/.y / bare-read rewrites.
+        text = re.sub(
+            r"(?<![_\w])%s\s*=\s*(.+?)\s*;" % re.escape(vf),
+            lambda m, name=vf: (
+                "%s_set_%s_x(i, Vector2_x(%s)); %s_set_%s_y(i, Vector2_y(%s));"
+                % (idn, name, m.group(1), idn, name, m.group(1))),
+            text)
         text = re.sub(r"(?<![_\w])%s\.x\b" % vf, "%s_x" % vf, text)
         text = re.sub(r"(?<![_\w])%s\.y\b" % vf, "%s_y" % vf, text)
         text = re.sub(
@@ -11695,6 +11756,100 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
                 ))(_split_call_args(m.group(1)))
             ),
             text)
+        # Remaining bare field reads → stack Vector2 from packed slots.
+        text = re.sub(
+            r"(?<![_\w])%s\b(?!\s*\.)" % re.escape(vf),
+            "Vector2_make(%s_get_%s_x(i), %s_get_%s_y(i))" % (
+                idn, vf, idn, vf),
+            text)
+    # Other classes' Vector2 fields: recv.initLocalPosition → Vector2 / sets.
+    for ocname, ocl in (plan.get("classes") or {}).items():
+        if ocname == cl.get("name"):
+            continue
+        oidn = _c_ident(ocname)
+        for vf in ocl.get("vec2_fields") or []:
+            text = re.sub(
+                r"(?<![_\w])(\w+)\.%s\s*=\s*(.+?)\s*;" % re.escape(vf),
+                lambda m, o=oidn, f=vf: (
+                    "%s_set_%s_x(%s, Vector2_x(%s)); "
+                    "%s_set_%s_y(%s, Vector2_y(%s));"
+                    % (o, f, m.group(1), m.group(2),
+                       o, f, m.group(1), m.group(2))),
+                text)
+            # recv.transform.localPosition = recv.vf (before bare-field read).
+            text = re.sub(
+                r"(?<![_\w])(\w+)\s*\.\s*transform\s*\.\s*localPosition\s*=\s*"
+                r"(?<![_\w])\1\s*\.\s*%s\s*;" % re.escape(vf),
+                lambda m, o=oidn, f=vf: (
+                    "%s_set_pos_x(%s, %s_get_%s_x(%s)); "
+                    "%s_set_pos_y(%s, %s_get_%s_y(%s));"
+                    % (o, m.group(1), o, f, m.group(1),
+                       o, m.group(1), o, f, m.group(1))),
+                text)
+            text = re.sub(
+                r"(?<![_\w])(\w+)\.%s\.x\b" % re.escape(vf),
+                r"%s_get_%s_x(\1)" % (oidn, vf),
+                text)
+            text = re.sub(
+                r"(?<![_\w])(\w+)\.%s\.y\b" % re.escape(vf),
+                r"%s_get_%s_y(\1)" % (oidn, vf),
+                text)
+            text = re.sub(
+                r"(?<![_\w])(\w+)\.%s\b(?!\s*\.)" % re.escape(vf),
+                lambda m, o=oidn, f=vf: (
+                    "Vector2_make(%s_get_%s_x(%s), %s_get_%s_y(%s))"
+                    % (o, f, m.group(1), o, f, m.group(1))),
+                text)
+    # new Vector2(a, b) / Vector2(a, b) → Vector2_make; static presets.
+    text = re.sub(
+        r"(?<![\w.])new\s+Vector2\s*\(",
+        "Vector2_make(", text)
+    text = re.sub(
+        r"(?<![\w.])Vector2\s*\(",
+        "Vector2_make(", text)
+    text = re.sub(
+        r"(?<![\w.])Vector2\.zero\b", "Vector2_make(0.f, 0.f)", text)
+    text = re.sub(
+        r"(?<![\w.])Vector2\.one\b", "Vector2_make(1.f, 1.f)", text)
+    text = re.sub(
+        r"(?<![\w.])Vector2\.up\b", "Vector2_make(0.f, 1.f)", text)
+    text = re.sub(
+        r"(?<![\w.])Vector2\.down\b", "Vector2_make(0.f, -1.f)", text)
+    text = re.sub(
+        r"(?<![\w.])Vector2\.right\b", "Vector2_make(1.f, 0.f)", text)
+    text = re.sub(
+        r"(?<![\w.])Vector2\.left\b", "Vector2_make(-1.f, 0.f)", text)
+    # Temps like Vector2_x(Vector2_make(a,b)) — fold to components.
+    def _fold_v2_axis_ctors(src, axis_fn, axis):
+        out = []
+        i = 0
+        needle = axis_fn + "(Vector2_make("
+        while True:
+            j = src.find(needle, i)
+            if j < 0:
+                out.append(src[i:])
+                break
+            out.append(src[i:j])
+            start_args = j + len(needle)
+            depth = 1
+            k = start_args
+            while k < len(src) and depth:
+                if src[k] == "(":
+                    depth += 1
+                elif src[k] == ")":
+                    depth -= 1
+                k += 1
+            if k < len(src) and src[k] == ")":
+                args = _split_call_args(src[start_args:k - 1])
+                if len(args) >= 2:
+                    out.append("(%s)" % args[axis])
+                    i = k + 1
+                    continue
+            out.append(src[j:k])
+            i = k
+        return "".join(out)
+    text = _fold_v2_axis_ctors(text, "Vector2_x", 0)
+    text = _fold_v2_axis_ctors(text, "Vector2_y", 1)
     for vf in cl.get("vec2int_fields") or []:
         text = re.sub(r"(?<![_\w])%s\.x\b" % vf, "%s_x" % vf, text)
         text = re.sub(r"(?<![_\w])%s\.y\b" % vf, "%s_y" % vf, text)
