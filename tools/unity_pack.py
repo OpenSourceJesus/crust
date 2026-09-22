@@ -5540,9 +5540,9 @@ def emit_engine(plan, analyses, used_apis):
             p("")
     if want_str_plus:
         # C# "" + 1 → "1"; C's ""+1 is pointer arithmetic (often prints garbage).
-        # Alternate two buffers so nested _str_plus_*(...) + x does not
-        # snprintf into the same buffer it reads (undefined).
+        # Ring of buffers: nested _str_plus_*(prev, x) must not snprintf into
         # the same slot it reads, and sibling args (path + contents) must stay
+        # live until the callee returns — two slots are not enough for
         # AppendAllText(pathExpr, contentExpr) where both are concatenations.
         p("/* C# string + value (not C pointer arithmetic) */")
         p("static char _engine_str_buf[8][512];")
@@ -6110,6 +6110,7 @@ def emit_engine(plan, analyses, used_apis):
             p("}")
             p("")
         if want_file_open_text:
+            # Alternate two buffers so consecutive ReadLine() keep both lines.
             p("static char _engine_readline_buf[2][4096];")
             p("static int _engine_readline_i;")
             p("static const char *StreamReader_ReadLine(StreamReader fp) {")

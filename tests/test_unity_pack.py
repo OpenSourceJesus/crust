@@ -2713,6 +2713,98 @@ class TestSystems(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
 
     @needs_cc
+    def test_append_all_text_path_and_content_concat_live(self):
+        """Sibling path+content string concats must not share one str buf.
+
+        LogAverageFPS: AppendAllText(persistentDataPath + suffix,
+        \"Average FPS: \" + fps + '\\n'). Two-slot ring overwritten the path
+        with the line → mkdir made a folder named \"Average FPS: …\".
+        """
+        root = tempfile.mkdtemp(prefix="upack-fpsline-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "LogAverageFPS.cs"), "w") as f:
+            f.write(
+                "using System.IO;\n"
+                "using UnityEngine;\n"
+                "public class LogAverageFPS : MonoBehaviour {\n"
+                "    static string LOG_FILE_PATH_SUFFIX = \"/AverageFPS.txt\";\n"
+                "    void Start() {\n"
+                "        File.AppendAllText("
+                "Application.persistentDataPath + LOG_FILE_PATH_SUFFIX, "
+                "\"Average FPS: \" + 60f + '\\n');\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "LogAverageFPS.cs.meta"), "w") as f:
+            f.write("guid: f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: LogAverageFPS\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-fpsline-out-")
+        # Overwrite is layout-independent; avoid solo --soa f16 (no float setters).
+        plan = unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("_engine_str_buf[8]", eng)
+        pp = plan.get("persistent_data_path") or ""
+        self.assertTrue(pp, "expected baked persistentDataPath")
+        want_file = os.path.join(pp, "AverageFPS.txt")
+        # Isolate cwd so a wrong relative mkdir is visible.
+        cwd = tempfile.mkdtemp(prefix="upack-fpsline-cwd-")
+        host = os.path.join(d, "host.c")
+        with open(host, "w") as f:
+            f.write(
+                "void engine_tick(void);\n"
+                "extern float Time_deltaTime;\n"
+                "int main(void) {\n"
+                "  Time_deltaTime = 0.02f;\n"
+                "  engine_tick();\n"
+                "  return 0;\n"
+                "}\n"
+            )
+        r = subprocess.run(
+            [_CC, "-O2", "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(
+            [_CC, "-O0", "-c", "-o", os.path.join(d, "data.o"),
+             os.path.join(d, "data.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        exe = os.path.join(d, "run")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host,
+             os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], cwd=cwd, capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+        self.assertTrue(
+            os.path.isfile(want_file),
+            "expected file %r; cwd entries=%r" % (want_file, os.listdir(cwd)))
+        with open(want_file) as f:
+            body = f.read()
+        self.assertIn("Average FPS:", body)
+        # Must not mkdir the FPS line as a directory (cwd or elsewhere).
+        for name in os.listdir(cwd):
+            self.assertFalse(
+                name.startswith("Average FPS"),
+                "bogus dir/file in cwd: %r" % name)
 
     @needs_cc
     def test_application_open_url_packs(self):
