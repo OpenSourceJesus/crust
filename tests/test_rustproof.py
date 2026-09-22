@@ -540,6 +540,11 @@ class TestRecordsProofs(unittest.TestCase):
         import rustprove
         cls.prover = rustprove.Prover(RECORDS)
 
+    def test_a_false_contract_is_open_not_a_crash(self):
+        # The fallback tactic answers None for a claim no guard settles;
+        # the driver used to crash on it instead of reporting the claim open.
+        self.assertFalse(self.prover.contract("room", ["result == 7"]))
+
     def test_room_contract_and_safety(self):
         self.assertTrue(self.prover.contract("room"))
         self.assertTrue(all(ok for _, ok in self.prover.safety("room")))
