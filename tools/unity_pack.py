@@ -325,6 +325,13 @@ _REFUSED_ADDCOMPONENT = frozenset((
     "AudioSource",
 ))
 
+_UI_COMPONENT_FIELD_TYPES = frozenset((
+    "Image", "RawImage", "Button", "Text", "Toggle", "Slider", "Scrollbar",
+    "ScrollRect", "Dropdown", "InputField", "Mask", "RectMask2D",
+    "Canvas", "CanvasGroup", "CanvasScaler", "GraphicRaycaster",
+    "RectTransform", "TMP_Text", "TextMeshProUGUI", "TextMeshPro",
+    "TMP_InputField", "TMP_Dropdown",
+))
 
 def _progress(msg):
     """Incremental status for long packs (large scenes / many PNGs)."""
@@ -428,11 +435,6 @@ _REFUSED_API = {
         "Unity Input System Gamepad.current needs the Input System package "
         "runtime — unity_pack does not invent device graphs."
     ),
-    "UnityEngine.UI": (
-        "Scripted uGUI (Canvas / Text / Image APIs) is not emitted — use "
-        "authored Canvas + Image in the scene. unity_pack does not invent "
-        "UI from scripts."
-    ),
     "Canvas": (
         "Scripted Canvas invent (AddComponent / typeof / ForceUpdateCanvases) "
         "is refused — author a !u!223 Canvas + Image in the scene."
@@ -469,8 +471,6 @@ _UNITY_API = re.compile(
     r"ParticleSystem\.Emit|"
     r"AnimationCurve\.Evaluate|"
     r"InputAction|Keyboard\.current|Gamepad\.current|"
-    r"UnityEngine\.UI|"
-    r"(?<![.\w])Canvas(?=\s|\.|;)|"
     r"Debug\.Log|(?<![\w.])print(?=\s*\()|"
     r"System\.Console\.WriteLine|(?<![\w.])Console\.WriteLine|"
     r"GameObject\.Find|GetComponent\s*<|"
@@ -2163,10 +2163,10 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
     (!u!223), uGUI Image / Button (builtin MB), RectTransform anchors/size,
     Rigidbody2D (!u!50), Rigidbody (!u!54), BoxCollider2D (!u!61),
     CircleCollider2D (!u!58), BoxCollider (!u!65), SphereCollider (!u!135),
-    Animation (!u!111), Animator (!u!95), PhysicsMaterial2D / PhysicMaterial,
-    and AnimationClip / AnimatorController assets. Does not invent any of
-    those — missing components stay missing. Returns
-    (objects, lights, cameras, hierarchy).
+    AudioSource (!u!82), Animation (!u!111), Animator (!u!95),
+    PhysicsMaterial2D / PhysicMaterial, and AnimationClip / AnimatorController
+    assets. Does not invent any of those — missing components stay missing.
+    Returns (objects, lights, cameras, hierarchy).
     """
     guid_to_script = guid_to_script or {}
     asset_guids = asset_guids or {}
@@ -2189,7 +2189,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             r"(?m)^(GameObject|Transform|RectTransform|MonoBehaviour|"
             r"PrefabInstance|Light|Camera|SpriteRenderer|Rigidbody2D|"
             r"Rigidbody|BoxCollider2D|CircleCollider2D|BoxCollider|"
-            r"SphereCollider|Animation|Animator|Canvas):",
+            r"SphereCollider|Animation|Animator|Canvas|AudioSource):",
             block)
         if km:
             kind = km.group(1)
@@ -2219,6 +2219,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             kind = "Animation"
         elif type_id == "95":
             kind = "Animator"
+        elif type_id == "82":
+            kind = "AudioSource"
         elif type_id in ("4", "224"):
             kind = "Transform"
         rec = {"file_id": file_id, "kind": kind, "raw": block, "fields": {}}
@@ -2636,6 +2638,25 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "enabled": int(en.group(1)) if en else 1,
                 "controller_guid": _parse_asset_guid_ref(block, "m_Controller"),
             }
+        if kind == "AudioSource":
+            en = re.search(r"(?m)^\s+m_Enabled:\s*(\d+)", block)
+            poa = re.search(r"(?m)^\s+m_PlayOnAwake:\s*(\d+)", block)
+            vol = re.search(r"(?m)^\s+m_Volume:\s*([0-9.eE+-]+)", block)
+            pitch = re.search(r"(?m)^\s+m_Pitch:\s*([0-9.eE+-]+)", block)
+            loop = re.search(r"(?m)^\s+Loop:\s*(\d+)", block)
+            mute = re.search(r"(?m)^\s+Mute:\s*(\d+)", block)
+            clip_g = _parse_asset_guid_ref(block, "m_audioClip")
+            if not clip_g:
+                clip_g = _parse_asset_guid_ref(block, "m_Resource")
+            rec["audiosource"] = {
+                "enabled": int(en.group(1)) if en else 1,
+                "play_on_awake": int(poa.group(1)) if poa else 1,
+                "volume": float(vol.group(1)) if vol else 1.0,
+                "pitch": float(pitch.group(1)) if pitch else 1.0,
+                "loop": int(loop.group(1)) if loop else 0,
+                "mute": int(mute.group(1)) if mute else 0,
+                "clip_guid": clip_g or "",
+            }
         by_id[file_id] = rec
 
     # PrefabInstance.m_TransformParent applies to stripped Transforms that
@@ -2690,6 +2711,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         col3d = None
         anim = None
         animator = None
+        audiosources = []
         rect = None
         for k in kids:
             if k.get("kind") == "Transform":
@@ -2738,6 +2760,10 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 anim = dict(k["animation"])
             if k.get("kind") == "Animator" and k.get("animator"):
                 animator = dict(k["animator"])
+            if k.get("kind") == "AudioSource" and k.get("audiosource"):
+                a = dict(k["audiosource"])
+                a["file_id"] = k.get("file_id")
+                audiosources.append(a)
         # Flatten authored Vector2 YAML into _x/_y for packed members.
         for vk, (vx, vy) in vec2_fields.items():
             fields[vk + "_x"] = vx
@@ -2959,6 +2985,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "collider2d": col2d,
             "collider3d": col3d,
             "anim_player": player,
+            "audiosources": audiosources,
         })
     # Stash clip assets on a sentinel for pack() — returned via lights? No.
     # Attach to a module-level isn't clean. Return clips via objects meta:
@@ -4496,8 +4523,11 @@ def analyze_script(path, text=None):
             r"localToWorldMatrix\b",
             scan):
         apis.add("transform.localToWorldMatrix")
-    if re.search(r"using\s+UnityEngine\.UI\b", scan):
-        apis.add("UnityEngine.UI")
+    # Canvas invent only — using UnityEngine.UI / Image fields are authored OK.
+    if (re.search(r"AddComponent\s*<\s*(?:UnityEngine\.)?Canvas\s*>", scan)
+            or re.search(r"typeof\s*\(\s*Canvas\s*\)", scan)
+            or re.search(r"Canvas\.ForceUpdateCanvases\b", scan)):
+        apis.add("Canvas")
     if re.search(r"\bInputAction\b", scan):
         apis.add("InputAction")
     # Keyboard lives in UnityEngine.InputSystem — only when in scope.
@@ -5048,6 +5078,12 @@ def plan_layouts(objects, analyses, two_d=None):
             if ty == "Transform":
                 # Resolved via object_refs → target class/inst (SetWorldScale).
                 continue
+            if ty in _UI_COMPONENT_FIELD_TYPES:
+                # Authored uGUI / TMP refs — drawn from scene, not packed MB idx.
+                continue
+            if "[" in ty or ty == "AudioClip":
+                # Arrays / AudioClip assets — opaque handles later; skip pack.
+                continue
             if ty in ("int", "byte", "short", "uint"):
                 vals = [o["fields"][fname] for o in insts if fname in o["fields"]]
                 vals.extend(_assigned_int_seeds(
@@ -5128,7 +5164,6 @@ def plan_layouts(objects, analyses, two_d=None):
         "transform_matrix_classes": sorted(matrix_classes),
         "local_position_classes": sorted(local_pos_classes),
     }
-
 
 def _packed_size(members):
     """Byte size of a C struct with the bitfields packed as gcc does."""
@@ -11384,8 +11419,18 @@ def load_project(root):
             objects.extend(parse_blender_json(_read(path)))
     sorting_layers = _load_sorting_layers(root)
 
+    # Only analyze MonoBehaviour scripts authored on scene objects — vendor
+    # helpers (e.g. CwHelper) must not refuse the pack via unused usings.
+    scene_scripts = set()
+    for o in objects:
+        sp = o.get("script")
+        if sp:
+            scene_scripts.add(os.path.abspath(sp))
     scripts = [p for p in _walk_files(root, (".cs",))
                if _is_player_csharp(root, p)]
+    if scene_scripts:
+        scripts = [p for p in scripts
+                   if os.path.abspath(p) in scene_scripts]
     _progress("analyzing %d script(s)" % len(scripts))
     analyses = []
     for i, p in enumerate(scripts):
@@ -11425,7 +11470,6 @@ def load_project(root):
     _apply_sprite_sorting(objects, sorting_layers)
     _attach_sprite_textures(objects, assets)
     return objects, analyses, lights, cameras, hierarchy
-
 
 def emit_soa_positions_glsl(plan):
     """GLSL ES stub: std430 SSBO matching SoA tables (ES 3.1+ / desktop).

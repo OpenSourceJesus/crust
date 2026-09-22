@@ -5,9 +5,11 @@ project. It **does not invent assets**: no synthetic ParticleSystem
 pools, no default AnimationCurves, no scripted UI invent, no InputAction maps.
 Runtime `AddComponent<T>()` works for packed builtins (Camera, Light,
 SpriteRenderer, Rigidbody/2D, Box/Circle/Sphere colliders, Animation,
-Animator) and for authored MonoBehaviours — GetOrAdd into a pre-sized pool
-(one spare slot per calling instance). Authored scene Canvas + Image/Button/TextMeshProUGUI
-are drawn; scripted `UnityEngine.UI` stays refused. Scripts that need
+Animator) and for authored MonoBehaviours — GetOrAdd into a
+pre-sized pool (one spare slot per calling instance). Authored scene
+Canvas + Image/Button/TextMeshProUGUI
+are drawn; `using UnityEngine.UI` and Image/Button fields are allowed. Scripted invent
+(`AddComponent<Canvas>`, `typeof(Canvas)`, `ForceUpdateCanvases`) stays refused. Scripts that need
 other Unity features keep them in the authored project until the packer can
 import them; calling
 invent-requiring APIs today is a hard `PackError`.
@@ -251,8 +253,8 @@ fire on host pointer press (`engine_pointer_x/y/down`, screen space, origin
 bottom-left); inactive parents hide children (`activeInHierarchy`). Canvas
 sorting layer/order apply to child Images/Buttons; TMP sorts one order
 above its Canvas. EventSystem / GraphicRaycaster / legacy `UI.Text` are
-not imported. Scripted `UnityEngine.UI` / `AddComponent<Canvas>` remain
-refused (no invent).
+not imported. `AddComponent<Canvas>` / `typeof(Canvas)` / `ForceUpdateCanvases`
+remain refused (no invent); `using UnityEngine.UI` and Image fields are fine.
 
 Asset GUIDs resolve under `Assets/`, `Packages/`, and
 `Library/PackageCache/` (UPM). Only `Assets/**/*.cs` become packed
@@ -329,7 +331,8 @@ Pool budget is one slot per instance of each class that calls `AddComponent<T>`
 | `ParticleSystem.Emit` / `AddComponent<ParticleSystem>` | Needs a ParticleSystem; packer will not invent a pool |
 | `AnimationCurve.Evaluate` | Needs authored curves; packer will not invent keyframes |
 | `InputAction` / `Gamepad.current` | Needs Input System assets / runtime |
-| `UnityEngine.UI` / `AddComponent<Canvas>` | Author Canvas+Image in the scene; no script invent |
+| `UnityEngine.UI` using / Image·Button fields | Allowed (authored wiring); invent via `AddComponent<Canvas>` / `typeof(Canvas)` refused |
+| `AddComponent<Canvas>` / `Canvas.ForceUpdateCanvases` | Author Canvas+Image in the scene; no script invent |
 | `Camera.main` with no scene Camera | Packer will not invent a default camera |
 
 ## Tick order

@@ -4944,6 +4944,21 @@ class TestSystems(unittest.TestCase):
             for needle in needles:
                 self.assertIn(needle, msg)
 
+    def test_using_unityengine_ui_allowed_for_image_field(self):
+        """using UnityEngine.UI + Image field is authored wiring, not invent."""
+        src = (
+            "using UnityEngine;\n"
+            "using UnityEngine.UI;\n"
+            "public class Hud : MonoBehaviour {\n"
+            "    public Image preview;\n"
+            "    void Update() { }\n"
+            "}\n"
+        )
+        path = "/proj/Assets/Scripts/Hud.cs"
+        a = unity_pack.analyze_script(path, src)
+        self.assertNotIn("UnityEngine.UI", a["apis"])
+        self.assertNotIn("Canvas", a["apis"])
+
 @needs_cc
 class TestSystemsRuns(unittest.TestCase):
 
