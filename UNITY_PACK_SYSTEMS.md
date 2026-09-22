@@ -333,8 +333,9 @@ Pool budget is one slot per instance of each class that calls `AddComponent<T>`
 | `ParticleSystem.Emit` / `AddComponent<ParticleSystem>` | Needs a ParticleSystem; packer will not invent a pool |
 | `AnimationCurve.Evaluate` | Needs authored curves; packer will not invent keyframes |
 | `InputAction` / `Gamepad.current` | Needs Input System assets / runtime |
-| `UnityEngine.UI` using / Image·Button fields | Allowed (authored wiring); invent via `AddComponent<Canvas>` / `typeof(Canvas)` refused |
-| `AddComponent<Canvas>` / `Canvas.ForceUpdateCanvases` | Author Canvas+Image in the scene; no script invent |
+| `UnityEngine.UI` using / Image·Button·Canvas fields | Allowed (authored wiring) |
+| `GetComponent<Canvas\|Image\|RectTransform\|…>` | Authored UI lookup (GO handle); not invent |
+| `AddComponent<Canvas>` / `typeof(Canvas)` / `ForceUpdateCanvases` | Refused invent — author `!u!223` in the scene |
 | `Camera.main` with no scene Camera | Packer will not invent a default camera |
 
 ## Tick order
