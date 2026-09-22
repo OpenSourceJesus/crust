@@ -101,6 +101,73 @@ def _raise_unknown_component_type(t, analyses, ops=("AddComponent", "GetComponen
     raise PackError("<cs>(1,1): error CS0246: %s" % (_CS0246 % t))
 
 
+def _mb_bases_from_header(scan, name_end, brace):
+    """C# ``class Foo : Bar, IBaz`` → ``[\"Bar\", \"IBaz\"]`` (simple names)."""
+    header = scan[name_end:brace]
+    if ":" not in header:
+        return []
+    clause = header.split(":", 1)[1]
+    out = []
+    for part in clause.split(","):
+        tok = part.strip().split("<")[0].strip()
+        tok = tok.split(".")[-1].strip()
+        if tok and tok[:1].isupper() and re.match(r"^\w+$", tok):
+            out.append(tok)
+    return out
+
+
+def _collect_mb_bases(analyses):
+    """Packed/analyzed MB name → immediate base type names."""
+    bases = {}
+    for a in analyses or []:
+        for c in a.get("classes") or []:
+            name = c.get("name")
+            if not name:
+                continue
+            b = list(c.get("bases") or [])
+            if b:
+                bases[name] = b
+    return bases
+
+
+def _mb_is_a(cname, ancestor, bases_map, stack=None):
+    """True if *cname* is *ancestor* or inherits it (authored bases)."""
+    if cname == ancestor:
+        return True
+    stack = stack or set()
+    if cname in stack:
+        return False
+    stack.add(cname)
+    for b in bases_map.get(cname) or []:
+        if _mb_is_a(b, ancestor, bases_map, stack):
+            return True
+    return False
+
+
+def _gcic_collector_types(tname, plan, bases_map=None):
+    """Packed types whose instances count as GetComponentsInChildren<T>.
+
+    Includes ``T`` when packed, plus every packed subclass of ``T``.
+    """
+    bases_map = bases_map or plan.get("mb_bases") or {}
+    classes = plan.get("classes") or {}
+    out = []
+    if tname in classes:
+        out.append(tname)
+    for cname in sorted(classes):
+        if cname == tname:
+            continue
+        if _mb_is_a(cname, tname, bases_map):
+            out.append(cname)
+    return out
+
+
+def _analyzed_mb_typenames(analyses):
+    """MonoBehaviour / script class names seen in analyses."""
+    return {c["name"] for a in (analyses or [])
+            for c in a.get("classes") or [] if c.get("name")}
+
+
 # System.IO.File members we emit. Others → CS0117 (File is in scope via using).
 _FILE_SUPPORTED = frozenset({
     "WriteAllText", "AppendAllText", "WriteAllBytes", "ReadAllBytes",
@@ -3602,6 +3669,37 @@ def _addcomponent_budget(analyses, plan):
     return budget
 
 
+def _instantiate_budget(analyses, plan):
+    """Extra MB + GO slots for ``Instantiate(this[, parent])`` of packed types.
+
+    Budget is one spare per authored instance of each class that calls
+    ``Instantiate(this…)`` (Update-loop reuse). Only the enclosing class is
+    cloned — prefab / multi-arg overloads stay unlowered.
+    """
+    budget = {}
+    class_n = {n: int(cl.get("n") or 0) for n, cl in plan["classes"].items()}
+    for a in analyses:
+        for c in a.get("classes") or []:
+            cname = c["name"]
+            if cname not in (plan.get("classes") or {}):
+                continue
+            n = class_n.get(cname, 1) or 1
+            bodies = "\n".join(m.get("body") or "" for m in c.get("methods") or [])
+            for _m in re.finditer(
+                    r"(?<![\w.])(?:(?:UnityEngine\.)?Object\.)?Instantiate\s*"
+                    r"\(\s*this\b",
+                    bodies):
+                budget[cname] = budget.get(cname, 0) + n
+    return budget
+
+
+def _mb_pool_extra(plan, cname):
+    """Spare instance slots: AddComponent budget + Instantiate budget."""
+    add = int((plan.get("addcomponent_budget") or {}).get(cname) or 0)
+    inst = int((plan.get("instantiate_budget") or {}).get(cname) or 0)
+    return add + inst
+
+
 def _disallow_multiple_types(analyses):
     """Type names that refuse a second AddComponent (Unity attribute / builtins)."""
     out = set(_DISALLOW_MULTIPLE_BUILTINS)
@@ -3632,20 +3730,33 @@ def _validate_addcomponent_types(types, plan, analyses=None):
 
 
 def _validate_getcomponent_types(types, plan, analyses=None):
-    """GetComponent<T> for unknown T → CS0246 (same as missing type).
+    """GetComponent / GetComponentsInChildren<T> for unknown T → CS0246.
 
     Authored uGUI types (Canvas, Image, RectTransform, …) are allowed —
     GetComponent looks them up; AddComponent<Canvas> invent stays refused.
+    Analyzed MonoBehaviour scripts (even with no scene instances) and packed
+    subclasses count as known so ``GetComponentsInChildren<Weapon>`` works
+    when only ``Blaster : Weapon`` is authored.
     """
+    analyses = analyses or []
+    bases_map = plan.get("mb_bases") or _collect_mb_bases(analyses)
     known = (set(plan.get("classes") or {})
              | _ADDABLE_BUILTINS
              | _PHYSICS_COMPONENTS
-             | _UI_GETCOMPONENT_TYPES)
-    analyses = analyses or []
+             | _UI_GETCOMPONENT_TYPES
+             | _analyzed_mb_typenames(analyses))
+    # Base type with at least one packed subclass is known for GCIC.
+    for t in types:
+        if t in known:
+            continue
+        if _gcic_collector_types(t, plan, bases_map):
+            known.add(t)
     for t in sorted(types):
         if t not in known:
             _raise_unknown_component_type(
-                t, analyses, ops=("GetComponent", "AddComponent"))
+                t, analyses,
+                ops=("GetComponent", "GetComponentsInChildren",
+                     "AddComponent"))
 
 
 def _rewrite_audiosource_api(text, cl, add_locals=None):
@@ -3761,6 +3872,238 @@ def _rewrite_audiosource_api(text, cl, add_locals=None):
     text = re.sub(
         r"(?<![.\w])(\w+)\s*\.\s*clip\b",
         repl_read_clip, text)
+    return text
+
+
+def _rewrite_instantiate(text, plan, this_class):
+    """Lower ``Instantiate(this[, parent])`` → ``Object_Instantiate_T(src, go)``.
+
+    Runs after ``this`` → ``i``. Only 1-arg and 2-arg (parent Transform/GO)
+    forms of packed types with instantiate budget. Position/rotation overloads
+    stay for the stub detector.
+    """
+    inst_budget = plan.get("instantiate_budget") or {}
+    if not inst_budget:
+        return text
+    classes = plan.get("classes") or {}
+    cl = classes.get(this_class) or {
+        "name": this_class, "fields": [], "members": []}
+    out = []
+    i = 0
+    pat = re.compile(
+        r"(?<![\w.])(?:(?:UnityEngine\.)?Object\.)?Instantiate\s*\(")
+    while i < len(text):
+        m = pat.search(text, i)
+        if not m:
+            out.append(text[i:])
+            break
+        open_paren = m.end() - 1
+        parsed = _match_call_args(text, open_paren)
+        if not parsed:
+            out.append(text[i:open_paren + 1])
+            i = open_paren + 1
+            continue
+        args_str, after = parsed
+        args = _split_call_args(args_str)
+        before = text[i:m.start()]
+        tm = re.search(
+            r"((?:(?:UnityEngine\.)?\w+))\s+(\w+)\s*=\s*$", before)
+        if len(args) == 1:
+            src = args[0].strip()
+            parent = "-1"
+        elif len(args) == 2:
+            src = args[0].strip()
+            parent = _setparent_parent_expr(args[1], cl)
+        else:
+            out.append(text[i:after])
+            i = after
+            continue
+        ty = None
+        if tm:
+            ty = tm.group(1).split(".")[-1]
+        if src in ("i", "this"):
+            ty = this_class
+        elif ty is None:
+            out.append(text[i:after])
+            i = after
+            continue
+        if ty not in classes or not int(inst_budget.get(ty) or 0):
+            out.append(text[i:after])
+            i = after
+            continue
+        if src == "this":
+            src = "i"
+        helper = "Object_Instantiate_%s" % _c_ident(ty)
+        call = "%s(%s, %s)" % (helper, src, parent)
+        if tm:
+            out.append(before[:tm.start()])
+            out.append("int %s = %s" % (tm.group(2), call))
+        else:
+            out.append(before)
+            out.append(call)
+        i = after
+    return "".join(out)
+
+
+def _gcic_go_expr(recv, cl, plan, locals_ty):
+    """Receiver of GetComponentsInChildren → root GO C expr."""
+    this_idn = _c_ident(cl.get("name") or "")
+    this_go = "_engine_go_of_%s(i)" % this_idn
+    if not recv or recv in ("this", "gameObject", "transform", "i"):
+        return this_go
+    recv = recv.strip()
+    # foo.transform → GO of foo
+    m = re.match(r"(.+?)\s*\.\s*transform\s*$", recv)
+    if m:
+        return _gcic_go_expr(m.group(1).strip(), cl, plan, locals_ty)
+    ty = locals_ty.get(recv)
+    if not ty:
+        for f in cl.get("fields") or []:
+            if f.get("name") == recv:
+                ty = f.get("ty") or ""
+                break
+        if not ty:
+            for name, _t, _b, kind in cl.get("members") or []:
+                if name == recv and str(kind).startswith("idx:"):
+                    ty = kind.split(":", 1)[1]
+                    break
+    if ty in ("Transform", "GameObject", "RectTransform"):
+        return recv
+    if ty and ty in (plan.get("classes") or {}):
+        return "_engine_go_of_%s(%s)" % (_c_ident(ty), recv)
+    # Unknown — treat as GO index (Transform/GO local after rewrite).
+    return recv
+
+
+def _rewrite_getcomponentsinchildren(text, plan, this_class):
+    """Lower ``GetComponentsInChildren<T>()`` → ``std::vector`` + helper.
+
+    Supports:
+      T[] xs = GetComponentsInChildren<T>();
+      T[] xs = GetComponentsInChildren<T>(true);
+      xs = recv.GetComponentsInChildren<T>();
+      recv.GetComponentsInChildren<T>()  (bare call)
+    ``Renderer`` resolves to ``SpriteRenderer``. ``.Length`` → ``.size()``.
+    """
+    gcic = set(plan.get("getcomponentsinchildren_types") or [])
+    if not re.search(r"GetComponentsInChildren\s*<", text):
+        return text
+    classes = plan.get("classes") or {}
+    cl = classes.get(this_class) or {
+        "name": this_class, "fields": [], "members": []}
+    # Typed locals: Cosmetic cosmetic = … / int c = Object_Instantiate_Cosmetic(
+    locals_ty = {}
+    for m in re.finditer(
+            r"(?:(?:UnityEngine\.)?(\w+)|int)\s+(\w+)\s*=", text):
+        ty, name = m.group(1), m.group(2)
+        if ty and ty[0].isupper():
+            locals_ty[name] = ty
+    for m in re.finditer(
+            r"int\s+(\w+)\s*=\s*Object_Instantiate_(\w+)\s*\(", text):
+        locals_ty[m.group(1)] = m.group(2)
+    for m in re.finditer(
+            r"int\s+(\w+)\s*=\s*GameObject_GetComponent_(\w+)\s*\(", text):
+        locals_ty[m.group(1)] = m.group(2)
+    for f in cl.get("fields") or []:
+        locals_ty.setdefault(f["name"], f.get("ty") or "")
+    for f in cl.get("ref_array_fields") or []:
+        locals_ty.setdefault(f["name"], f.get("ty") or "")
+    for name, _t, _b, kind in cl.get("members") or []:
+        if str(kind).startswith("idx:"):
+            locals_ty.setdefault(name, kind.split(":", 1)[1])
+
+    vector_names = set()
+    out = []
+    i = 0
+    # Optional recv. before GetComponentsInChildren (no lookbehind after '.')
+    pat = re.compile(
+        r"(?:(?<![.\w])(?P<recv>\w+)\s*\.\s*|(?<![.\w]))"
+        r"GetComponentsInChildren\s*<\s*"
+        r"(?:UnityEngine\.)?(?P<ty>\w+)\s*>\s*\(")
+    while i < len(text):
+        m = pat.search(text, i)
+        if not m:
+            out.append(text[i:])
+            break
+        open_paren = m.end() - 1
+        parsed = _match_call_args(text, open_paren)
+        if not parsed:
+            out.append(text[i:open_paren + 1])
+            i = open_paren + 1
+            continue
+        args_str, after = parsed
+        args = _split_call_args(args_str) if args_str.strip() else []
+        raw_ty = m.group("ty")
+        resolved = _gcic_resolve_type(raw_ty)
+        known = (
+            resolved in classes
+            or resolved in _PHYSICS_COMPONENTS
+            or resolved in _ADDABLE_BUILTINS
+            or resolved in _UI_GETCOMPONENT_TYPES
+            or resolved in set(plan.get("addcomponent_types") or [])
+            or resolved in gcic
+            or bool(_gcic_collector_types(
+                resolved, plan, plan.get("mb_bases") or {})))
+        if not known:
+            out.append(text[i:after])
+            i = after
+            continue
+        include = "0"
+        if args:
+            a0 = args[0].strip()
+            if a0 in ("true", "True", "1"):
+                include = "1"
+            elif a0 in ("false", "False", "0"):
+                include = "0"
+            else:
+                include = "((%s) ? 1 : 0)" % a0
+        recv = m.group("recv")
+        go_expr = _gcic_go_expr(recv, cl, plan, locals_ty)
+        helper = "GameObject_GetComponentsInChildren_%s" % _c_ident(resolved)
+        call = "%s(%s, %s)" % (helper, go_expr, include)
+        before = text[i:m.start()]
+        # T[] name =  OR  name =
+        tm = re.search(
+            r"(?:(?:(?:UnityEngine\.)?\w+)\s*\[\s*\]\s*)?(\w+)\s*=\s*$",
+            before)
+        if tm:
+            var = tm.group(1)
+            # Drop T[] type if present in the match span
+            decl = re.search(
+                r"((?:(?:UnityEngine\.)?\w+)\s*\[\s*\]\s*)?(\w+)\s*=\s*$",
+                before)
+            if decl and decl.group(1):
+                out.append(before[:decl.start()])
+                out.append("std::vector<int> %s = %s" % (var, call))
+            else:
+                out.append(before[:tm.start()])
+                out.append("%s = %s" % (var, call))
+            vector_names.add(var)
+            locals_ty[var] = resolved + "[]"
+        else:
+            out.append(before)
+            out.append(call)
+        i = after
+    text = "".join(out)
+    # Also catch ref-array fields assigned earlier as Class_field names.
+    for f in cl.get("ref_array_fields") or []:
+        vector_names.add(f["name"])
+        vector_names.add("%s_%s" % (_c_ident(this_class), f["name"]))
+    vector_names |= set(re.findall(r"\bstd::vector<int>\s+(\w+)\b", text))
+    for name in sorted(vector_names, key=len, reverse=True):
+        text = re.sub(
+            r"(?<![.\w])%s\.Length\b" % re.escape(name),
+            "%s.size()" % name, text)
+    # T elem = vec[i] → int elem = vec[i]
+    elem_tys = set(gcic) | set(_GCIC_TYPE_ALIAS.keys()) | set(
+        _GCIC_TYPE_ALIAS.values())
+    elem_tys |= set(classes) | set(_ADDABLE_BUILTINS) | set(
+        _PHYSICS_COMPONENTS) | set(_UI_GETCOMPONENT_TYPES)
+    for ty in sorted(elem_tys, key=len, reverse=True):
+        text = re.sub(
+            r"(?<![\w.])(?:UnityEngine\.)?%s\s+(\w+)\s*=" % re.escape(ty),
+            r"int \1 =",
+            text)
     return text
 
 
@@ -3913,6 +4256,16 @@ def _wrap_log_component_tostring(text, locals_ty):
 
 
 _PHYSICS_COMPONENTS = frozenset(("Rigidbody2D", "Rigidbody"))
+
+# GetComponentsInChildren<Renderer> → SpriteRenderer map (2D authored packs).
+_GCIC_TYPE_ALIAS = {
+    "Renderer": "SpriteRenderer",
+}
+
+
+def _gcic_resolve_type(tname):
+    """Map polymorphic GetComponentsInChildren type → packed GO-map type."""
+    return _GCIC_TYPE_ALIAS.get(tname, tname)
 
 # MonoBehaviour 2D collision messages (Unity Physics2D).
 _COLLISION2D_MSGS = (
@@ -4907,6 +5260,7 @@ def analyze_script(path, text=None, shallow=False):
         apis.add("AddComponent<%s>" % m.group(1))
     # AST pass: precise Find / GetComponent detection (cpprust paren/angle).
     getcomponent_types = set()
+    getcomponentsinchildren_types = set()
     for ch in _ast_find_getcomponent_chains(text):
         if ch.get("find_args") is not None and not ch.get("on_this"):
             apis.add("GameObject.Find")
@@ -4917,6 +5271,16 @@ def analyze_script(path, text=None, shallow=False):
                 apis.add(ch["component"])
         elif ch.get("on_this"):
             apis.add("GetComponent")
+    for m in re.finditer(
+            r"GetComponentsInChildren\s*<\s*(?:UnityEngine\.)?(\w+)\s*>",
+            scan):
+        raw = m.group(1)
+        resolved = _gcic_resolve_type(raw)
+        getcomponentsinchildren_types.add(resolved)
+        getcomponent_types.add(resolved)
+        apis.add("GetComponentsInChildren")
+        # Need live parent walk for the subtree.
+        apis.add("transform.parent")
     if "transform.position" in scan:
         apis.add("transform.position")
     if re.search(r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*localPosition\b",
@@ -5066,6 +5430,11 @@ def analyze_script(path, text=None, shallow=False):
     if re.search(
             r"(?<![\w])(?:UnityEngine\.)?Application\.Quit\s*\(", scan):
         apis.add("Application.Quit")
+    if re.search(
+            r"(?<![\w.])(?:(?:UnityEngine\.)?Object\.)?Instantiate\s*"
+            r"\(\s*this\s*,",
+            scan):
+        apis.add("Instantiate.parent")
     if re.search(r"(?:System\.IO\.)?File\.WriteAllText\s*\(", scan):
         apis.add("File.WriteAllText")
     if re.search(r"(?:System\.IO\.)?File\.AppendAllText\s*\(", scan):
@@ -5128,6 +5497,12 @@ def analyze_script(path, text=None, shallow=False):
     for kind, name, start, brace, close in types:
         if kind not in ("class", "struct"):
             continue
+        # Name ends at first non-word after ``class Name`` / ``struct Name``.
+        nm = re.search(
+            r"(?:class|struct)\s+%s\b" % re.escape(name),
+            scan[start:brace])
+        name_end = start + nm.end() if nm else start
+        bases = _mb_bases_from_header(scan, name_end, brace)
         body = text[brace + 1:close]
         bscan = scan[brace + 1:close]
         fields = _fields_in(body, bscan, body_abs=brace + 1)
@@ -5158,6 +5533,7 @@ def analyze_script(path, text=None, shallow=False):
         classes.append({
             "name": name, "kind": kind, "fields": fields,
             "methods": methods, "refs": refs,
+            "bases": bases,
             "path": path,
             "file_text": text,
             "disallow_multiple": disallow_multiple,
@@ -5172,6 +5548,7 @@ def analyze_script(path, text=None, shallow=False):
         "writes_rot": writes_rot,
         "keyboard_keys": keyboard_keys,
         "getcomponent_types": getcomponent_types,
+        "getcomponentsinchildren_types": getcomponentsinchildren_types,
         "addcomponent_types": addcomponent_types,
         "findobject_types": findobject_types,
         "singleton_instance_types": singleton_instance_types,
@@ -5483,10 +5860,12 @@ def _rewrite_mb_static_and_singleton(text, plan, cl):
                     r"(?<![\w.])%s\b" % re.escape(fname),
                     "%s_%s" % (oidn, fname),
                     text)
-        # Other.Instance / Other.instance as a value
+        # Other.Instance / Other.instance — including Other.Instance.unknownField
+        # (known .field patterns already rewritten above). Always emit the
+        # live finder call; do not leave `Type.instance.` for crust.
         if use_inst or ocname in (plan.get("classes") or {}):
             text = re.sub(
-                r"(?<![\w.])%s\s*\.\s*(?:Instance|instance)\b(?!\s*\.)"
+                r"(?<![\w.])%s\s*\.\s*(?:Instance|instance)\b"
                 % re.escape(ocname),
                 inst, text)
     # FindObjectOfType<T>() / FindObjectOfType<T>(bool)
@@ -5528,20 +5907,24 @@ def _rewrite_toggle_is_on(text):
     """``arr[i].isOn = v`` / ``toggle.isOn`` → ``Toggle_set/get_isOn``.
 
     Runs after singleton/ref-array rewrites so ``Instance.toggles[i].isOn``
-    is already ``Class_toggles[i].isOn``.
+    is already ``Class_toggles[i].isOn``. Index expr must stay on one
+    bracket pair (no DOTALL) so ``equipped[i]; … toggles[x].isOn`` cannot
+    merge into one match.
     """
+    # Allow calls inside the index (IndexOf(x)) but not `;` / newlines / `]`.
+    idx = r"([^\]\n;]*)"
     text = re.sub(
-        r"(\w+)\s*\[(.*?)\]\s*\.\s*isOn\s*=\s*([^;]+);",
+        r"(\w+)\s*\[%s\]\s*\.\s*isOn\s*=\s*([^;]+);" % idx,
         r"Toggle_set_isOn(\1[\2], (\3));",
-        text, flags=re.DOTALL)
+        text)
     text = re.sub(
         r"(?<![\w.])(\w+)\s*\.\s*isOn\s*=\s*([^;]+);",
         r"Toggle_set_isOn(\1, (\2));",
         text)
     text = re.sub(
-        r"(\w+)\s*\[(.*?)\]\s*\.\s*isOn\b",
+        r"(\w+)\s*\[%s\]\s*\.\s*isOn\b" % idx,
         r"Toggle_get_isOn(\1[\2])",
-        text, flags=re.DOTALL)
+        text)
     text = re.sub(
         r"(?<![\w.])(\w+)\s*\.\s*isOn\b",
         r"Toggle_get_isOn(\1)",
@@ -5575,6 +5958,100 @@ def _reachable_emit_methods(methods):
                 reach.add(other)
                 queue.append(other)
     return reach
+
+
+def _lowered_body_still_csharp(body, args_str=None, emitted_params=None):
+    """True if *body* still has C# the C subset cannot parse.
+
+    Methods that still use GetComponents / leftover ``T[]`` locals /
+    ``Type.instances`` / unlowered Instantiate overloads / lambdas /
+    ``Type.Method(`` static calls / ``recv.Method(`` chains / C# typed
+    locals / C# member access / unbound method parameters are emitted as
+    empty stubs instead of failing crust (e.g. ``expected ';' after
+    'SoundEffect'`` / ``undeclared identifier 'cosmetic'``).
+    """
+    if not body or not str(body).strip():
+        return False
+    # Instantiate(this[, parent]) is rewritten; leftover overloads still stub.
+    if re.search(r"(?<![\w.])(?:Object\.)?Instantiate\s*\(", body):
+        return True
+    # GetComponentsInChildren is rewritten; bare GetComponents (no InChildren) stubs.
+    if re.search(r"GetComponentsInChildren\s*<", body):
+        return True
+    if re.search(r"GetComponents\s*<", body):
+        return True
+    # C# array locals / fields left after rewrite: ``Renderer[] renderers``.
+    if re.search(r"(?<![\w.])\w+\s*\[\s*\]\s*\w+", body):
+        return True
+    # Leftover generics not rewritten to C helpers.
+    if re.search(r"\w+\s*<\s*\w+\s*>\s*\(", body):
+        return True
+    # Static array not lowered: ``Cosmetic.instances.Length`` / ``[i]``.
+    if re.search(r"(?<![\w._])[A-Z]\w*\.instances\b", body):
+        return True
+    # C# lambda / expression-bodied leftovers (Action, LINQ, etc.).
+    if "=>" in body:
+        return True
+    # Bare C# instance/static method call not rewritten: ``End()`` (no ``_``).
+    # Allow value-type ctors kept as ``Vector2Int(`` / ``Color(``.
+    _ctor_ok = (
+        r"Vector2Int|Vector3Int|Vector4|Vector3|Vector2|"
+        r"Color|Quaternion|RectInt|Rect|Bounds"
+    )
+    if re.search(
+            r"(?<![\w.])(?!(?:%s)\b)[A-Z][a-zA-Z0-9]*\s*\(" % _ctor_ok,
+            body):
+        return True
+    # Unlowered static call: ``EventManager.AddEvent(...)`` (not ``Type_Method``).
+    if re.search(r"(?<![\w_])[A-Z]\w*\.[A-Za-z_]\w*\s*\(", body):
+        return True
+    # Unlowered static field: ``Vector3.zero`` / ``Random.value``.
+    if re.search(r"(?<![\w_])[A-Z]\w*\.[a-z]\w*\b", body):
+        return True
+    # Chained call/property on a call result: ``AudioManager_Instance().MakeSoundEffect``.
+    if re.search(r"\)\s*\.\s*[A-Za-z_]", body):
+        return True
+    # C# typed local of a reference type: ``SoundEffect soundEffect =``.
+    if re.search(
+            r"(?<![\w.])[A-Z]\w*(?:\s*\.\s*[A-Z]\w*)*\s+[a-z_]\w*\s*=",
+            body):
+        return True
+    # Unity component handle still using ``recv.gameObject``.
+    if re.search(r"\w+\.gameObject\b", body):
+        return True
+    # Leftover C# / Unity member access (allow std::vector / string APIs).
+    _cxx_mem = (
+        r"size|push_back|pop_back|clear|empty|begin|end|insert|erase|"
+        r"find|count|at|resize|reserve|data|front|back|append|"
+        r"c_str|length|substr|compare"
+    )
+    if re.search(
+            r"(?<![:\w])\b[A-Za-z_]\w*\.(?!(?:%s)\b)[A-Za-z_]\w*" % _cxx_mem,
+            body):
+        return True
+    # C# property / field on a typed local still using ``recv.Name``.
+    if re.search(r"\b\w+\.(?:Length|Count|activeSelf)\b", body):
+        # Allow vector/map helpers already lowered (``foo.size()`` etc.).
+        if re.search(r"(?<!_)\w+\.(?:Length|Count)\b", body):
+            return True
+        if re.search(r"\w+\.activeSelf\b", body):
+            return True
+    # Instance method C# params not emitted as C formals (only ``i`` / coll).
+    emitted = set(emitted_params or ()) | {"i"}
+    for part in (args_str or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        part = re.sub(r"\b(?:ref|out|in|params)\s+", "", part)
+        pm = re.match(r"([\w.<>]+)\s+(\w+)\s*$", part)
+        if not pm:
+            continue
+        pname = pm.group(2)
+        if pname in emitted:
+            continue
+        if re.search(r"(?<![\w.])%s\b" % re.escape(pname), body):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -6004,16 +6481,23 @@ def emit_engine(plan, analyses, used_apis):
     getcomponent_types = set()
     findobject_types = set()
     singleton_instance_types = set()
+    getcomponentsinchildren_types = set()
     for a in analyses:
         getcomponent_types |= set(a.get("getcomponent_types") or [])
         findobject_types |= set(a.get("findobject_types") or [])
         singleton_instance_types |= set(a.get("singleton_instance_types") or [])
+        getcomponentsinchildren_types |= set(
+            a.get("getcomponentsinchildren_types") or [])
+    getcomponentsinchildren_types |= set(
+        plan.get("getcomponentsinchildren_types") or [])
     findobject_types |= singleton_instance_types
     findobject_packed = sorted(
         t for t in findobject_types if t in plan["classes"])
     want_findobject = bool(findobject_packed) or (
         "FindObjectOfType" in used_apis
         or "Singleton.Instance" in used_apis)
+    want_gcic = bool(getcomponentsinchildren_types) or (
+        "GetComponentsInChildren" in used_apis)
     rb2d_list = plan.get("rigidbody2d") or []
     rb3d_list = plan.get("rigidbody") or []
     col2d_list = plan.get("collider2d") or []
@@ -6024,6 +6508,10 @@ def emit_engine(plan, analyses, used_apis):
     anim_keys = anim_plan.get("keys") or []
     add_types = set(plan.get("addcomponent_types") or [])
     add_budget = plan.get("addcomponent_budget") or {}
+    inst_budget = plan.get("instantiate_budget") or {}
+    go_spawn_budget = int(plan.get("instantiate_go_budget") or 0)
+    want_instantiate = bool(inst_budget)
+    want_inst_parent = "Instantiate.parent" in used_apis
     disallow_multi = set(plan.get("disallow_multiple_types")
                          or _DISALLOW_MULTIPLE_BUILTINS)
     go_has_sprite = set(plan.get("go_has_sprite") or [])
@@ -6098,7 +6586,13 @@ def emit_engine(plan, analyses, used_apis):
         want_find or want_transform_find or want_transform_parent
         or want_transform_go or want_set_parent or want_get_sibling
         or want_getcomponent or want_findobject
-        or want_rb2d or want_rb3d or want_add_any or want_ui or want_destroy)
+        or want_rb2d or want_rb3d or want_add_any or want_ui or want_destroy
+        or want_instantiate or want_gcic)
+    # Instantiate(this, parent) / GetComponentsInChildren need live parents.
+    if want_inst_parent or want_gcic:
+        want_set_parent = True
+        want_transform_parent = True
+        want_go_tables = True
     want_ctor_forbidden = any(
         bool(cl.get("ctor_forbidden"))
         for cl in plan["classes"].values())
@@ -6115,7 +6609,7 @@ def emit_engine(plan, analyses, used_apis):
     if (want_input or want_log or want_find or want_transform_find
             or want_set_parent or want_get_sibling
             or want_add_any or want_data_path or want_persistent_data_path
-            or want_file_io or soa):
+            or want_file_io or soa or want_instantiate):
         p("#include <string.h>")
     if (want_log or want_console or want_str_plus or want_add_any
             or want_file_io or want_go_tables or want_ctor_forbidden
@@ -6143,6 +6637,8 @@ def emit_engine(plan, analyses, used_apis):
                     want_toggle_is_on = True
     if want_ref_array:
         want_list = True  # std::vector for Toggle[] / MB[] tables
+    if want_gcic:
+        want_list = True  # std::vector for GetComponentsInChildren results
     if not want_map_string and want_dict:
         for cl in plan["classes"].values():
             for f in (cl.get("class_consts") or []) + (cl.get("dict_fields") or []):
@@ -6438,7 +6934,7 @@ def emit_engine(plan, analyses, used_apis):
 
     for cname, cl in sorted(plan["classes"].items()):
         idn = _c_ident(cname)
-        mb_budget = int((plan.get("addcomponent_budget") or {}).get(cname) or 0)
+        mb_budget = _mb_pool_extra(plan, cname)
         cap = cl["n"] + mb_budget
         p("extern %s _%s_inst_array[%d];" % (idn, idn, max(1, cap)))
         if mb_budget:
@@ -6609,11 +7105,13 @@ def emit_engine(plan, analyses, used_apis):
         p("")
     if want_destroy:
         # Destroy(gameObject) — mark GO; Tick skips destroyed instances.
-        go_n = max(1, len(plan.get("go_names") or []))
+        go_names_d = plan.get("go_names") or []
+        go_cap_d = max(1, len(go_names_d) + go_spawn_budget)
         p("/* Destroy(gameObject) — stop Update; no pool free */")
-        p("static int _engine_go_destroyed[%d];" % go_n)
+        p("static int _engine_go_destroyed[%d];" % go_cap_d)
         p("static void Object_Destroy(int go) {")
-        p("    if (go >= 0 && go < %d) _engine_go_destroyed[go] = 1;" % go_n)
+        p("    if (go >= 0 && go < %d) _engine_go_destroyed[go] = 1;"
+          % go_cap_d)
         p("}")
         p("")
     if want_log:
@@ -7122,12 +7620,22 @@ def emit_engine(plan, analyses, used_apis):
         go_comps = plan.get("go_components") or {}
         go_rb2d = plan.get("go_rigidbody2d") or {}
         go_rb3d = plan.get("go_rigidbody") or {}
+        go_authored = len(go_names)
+        go_cap = max(1, go_authored + go_spawn_budget)
         p("/* GameObject.Find / GetComponent — live GO tables (seeded authored) */")
-        p("static const int _engine_go_count = %d;" % len(go_names))
-        if go_names:
-            p("static const char *_engine_go_name[%d] = {" % len(go_names))
+        if go_spawn_budget:
+            p("static int _engine_go_count = %d;" % go_authored)
+            p("static const int _engine_go_cap = %d;" % go_cap)
+        else:
+            p("static const int _engine_go_count = %d;" % go_authored)
+        if go_names or go_spawn_budget:
+            p("static const char *_engine_go_name[%d] = {" % go_cap)
             for n in go_names:
                 p("    %s," % _c_string(n))
+            for _pad in range(go_spawn_budget):
+                p("    \"\", /* instantiate spare */")
+            if not go_names and not go_spawn_budget:
+                p("    \"\",")
             p("};")
         else:
             p("static const char *_engine_go_name[1] = { \"\" };")
@@ -7169,17 +7677,22 @@ def emit_engine(plan, analyses, used_apis):
                     vals.append(str(go_comps[n][cname]))
                 else:
                     vals.append("-1")
+            for _pad in range(go_spawn_budget):
+                vals.append("-1")
             if not vals:
                 vals = ["-1"]
-            mb_budget = int(add_budget.get(cname) or 0)
+            mb_extra = _mb_pool_extra(plan, cname)
+            mb_add = int(add_budget.get(cname) or 0)
+            mb_inst = int(inst_budget.get(cname) or 0)
             # Live GO→component map whenever GetComponent/AddComponent/
-            # FindObjectOfType can see runtime changes.
+            # Instantiate/FindObjectOfType can see runtime changes.
             live_go = (
-                mb_budget
+                mb_extra
                 or cname in getcomponent_types
                 or cname in findobject_types
                 or "GetComponent" in used_apis
-                or want_findobject)
+                or want_findobject
+                or want_instantiate)
             if live_go:
                 p("static int _engine_go_%s[%d] = { %s };" % (
                     idn, len(vals), ", ".join(vals)))
@@ -7188,7 +7701,7 @@ def emit_engine(plan, analyses, used_apis):
                     idn, len(vals), ", ".join(vals)))
             # this instance i → GO index (for GetComponent on this).
             authored_n = int(plan["classes"][cname]["n"])
-            cap_n = authored_n + mb_budget
+            cap_n = authored_n + mb_extra
             rev = ["-1"] * max(1, cap_n)
             for n, cmap in go_comps.items():
                 if cname in cmap and n in go_names:
@@ -7240,19 +7753,22 @@ def emit_engine(plan, analyses, used_apis):
             - {"RectTransform"})
         if ui_gc and want_go_tables:
             ui_maps = plan.get("go_ui_components") or {}
-            go_n = max(1, len(go_names))
             for ty in ui_gc:
                 idn = _c_ident(ty)
                 present = set(ui_maps.get(ty) or [])
                 vals = []
-                for i, n in enumerate(go_names if go_names else [""]):
+                for i, n in enumerate(go_names if go_names else []):
                     if n in present:
                         vals.append(str(i))
                     else:
                         vals.append("-1")
+                for _pad in range(go_spawn_budget):
+                    vals.append("-1")
+                if not vals:
+                    vals = ["-1"]
                 p("/* GetComponent<%s> — live GO map */" % ty)
                 p("static int _engine_go_%s[%d] = { %s };" % (
-                    idn, go_n, ", ".join(vals)))
+                    idn, len(vals), ", ".join(vals)))
                 p("static int GameObject_GetComponent_%s(int go) {" % idn)
                 p("    if (go < 0 || go >= _engine_go_count) return -1;")
                 p("    return _engine_go_%s[go];" % idn)
@@ -7266,14 +7782,15 @@ def emit_engine(plan, analyses, used_apis):
             if cname not in plan["classes"]:
                 continue
             idn = _c_ident(cname)
-            mb_budget = int(add_budget.get(cname) or 0)
+            mb_extra = _mb_pool_extra(plan, cname)
+            mb_add = int(add_budget.get(cname) or 0)
             p("static int GameObject_GetComponent_%s(int go) {" % idn)
             p("    if (go < 0 || go >= _engine_go_count) return -1;")
             p("    return _engine_go_%s[go];" % idn)
             p("}")
             p("")
-            if mb_budget:
-                cap = int(plan["classes"][cname]["n"]) + mb_budget
+            if mb_add:
+                cap = int(plan["classes"][cname]["n"]) + mb_extra
                 p("static int GameObject_AddComponent_%s(int go) {" % idn)
                 p("    int ex;")
                 p("    if (go < 0 || go >= _engine_go_count) return -1;")
@@ -7315,6 +7832,8 @@ def emit_engine(plan, analyses, used_apis):
             vals = []
             for n in go_names:
                 vals.append(str(go_rb2d[n]) if n in go_rb2d else "-1")
+            for _pad in range(go_spawn_budget):
+                vals.append("-1")
             if not vals:
                 vals = ["-1"]
             rb2d_add = int(add_budget.get("Rigidbody2D") or 0)
@@ -7381,6 +7900,8 @@ def emit_engine(plan, analyses, used_apis):
             vals = []
             for n in go_names:
                 vals.append(str(go_rb3d[n]) if n in go_rb3d else "-1")
+            for _pad in range(go_spawn_budget):
+                vals.append("-1")
             if not vals:
                 vals = ["-1"]
             rb3d_add = int(add_budget.get("Rigidbody") or 0)
@@ -7509,6 +8030,27 @@ def emit_engine(plan, analyses, used_apis):
         if want_add_sprite:
             _emit_simple_add("SpriteRenderer", "UnityEngine.SpriteRenderer",
                              authored_names=go_has_sprite)
+        elif ("SpriteRenderer" in getcomponent_types
+              or "SpriteRenderer" in getcomponentsinchildren_types):
+            # GetComponent / GetComponentsInChildren without AddComponent pool.
+            idn = "SpriteRenderer"
+            go_n_sr = max(1, len(go_names) + go_spawn_budget)
+            init_vals = []
+            for n in (go_names if go_names else []):
+                init_vals.append("0" if n in go_has_sprite else "-1")
+            for _pad in range(go_spawn_budget):
+                init_vals.append("-1")
+            if not init_vals:
+                init_vals = ["-1"]
+            p("/* SpriteRenderer — authored presence (GetComponent / "
+              "GetComponentsInChildren) */")
+            p("static int _engine_go_%s[%d] = { %s };" % (
+                idn, len(init_vals), ", ".join(init_vals)))
+            p("static int GameObject_GetComponent_%s(int go) {" % idn)
+            p("    if (go < 0 || go >= _engine_go_count) return -1;")
+            p("    return _engine_go_%s[go];" % idn)
+            p("}")
+            p("")
         if want_add_light:
             # Light also grows the authored light tables when present.
             bud = int(add_budget.get("Light") or 0) or 1
@@ -7657,14 +8199,22 @@ def emit_engine(plan, analyses, used_apis):
     if (want_ui or want_transform_find or want_transform_parent
             or want_set_parent or want_get_sibling):
         go_names = plan.get("go_names") or []
-        go_n = max(1, len(go_names))
-        go_parents = plan.get("go_parents") or ([-1] * go_n)
-        if len(go_parents) < go_n:
-            go_parents = list(go_parents) + [-1] * (go_n - len(go_parents))
+        go_authored_n = len(go_names)
+        go_n = max(1, go_authored_n + go_spawn_budget)
+        go_parents = plan.get("go_parents") or ([-1] * max(1, go_authored_n))
+        if len(go_parents) < go_authored_n:
+            go_parents = list(go_parents) + [-1] * (
+                go_authored_n - len(go_parents))
+        go_parents = list(go_parents[:go_authored_n]) + [-1] * go_spawn_budget
+        if not go_parents:
+            go_parents = [-1]
         go_sib = plan.get("go_siblings") or (
-            _build_go_sibling_indices(go_parents[:go_n]))
-        if len(go_sib) < go_n:
-            go_sib = list(go_sib) + [0] * (go_n - len(go_sib))
+            _build_go_sibling_indices(go_parents[:max(1, go_authored_n)]))
+        if len(go_sib) < go_authored_n:
+            go_sib = list(go_sib) + [0] * (go_authored_n - len(go_sib))
+        go_sib = list(go_sib[:go_authored_n]) + [0] * go_spawn_budget
+        if not go_sib:
+            go_sib = [0]
         want_go_parent_table = (
             want_ui or want_transform_find or want_transform_parent
             or want_set_parent)
@@ -7672,8 +8222,9 @@ def emit_engine(plan, analyses, used_apis):
             p("/* Transform hierarchy (live GO parents; seeded from m_Father) */"
               if (want_set_parent or want_transform_find) else
               "/* Authored Transform hierarchy (m_Father → GO index) */")
-            # Mutable whenever Find or SetParent runs — Find walks live parents.
-            if want_set_parent or want_transform_find:
+            # Mutable whenever Find, SetParent, Instantiate, or GCIC runs.
+            if (want_set_parent or want_transform_find or want_instantiate
+                    or want_gcic):
                 p("static int _engine_go_parent[%d] = { %s };" % (
                     go_n, ", ".join(str(int(x)) for x in go_parents[:go_n])))
             else:
@@ -7864,6 +8415,152 @@ def emit_engine(plan, analyses, used_apis):
                 p("    (void)i; (void)hit; (void)px; (void)py;")
                 p("    (void)sw; (void)sh; (void)pressed;")
             p("    _engine_pointer_was_down = engine_pointer_down;")
+            p("}")
+            p("")
+
+    # Object.Instantiate(this[, parent]) — after GO + parent tables.
+    if want_instantiate and want_go_tables:
+        go_names_i = plan.get("go_names") or []
+        go_cap_i = max(1, len(go_names_i) + go_spawn_budget)
+        for cname in sorted(inst_budget.keys()):
+            if cname not in plan["classes"]:
+                continue
+            if not int(inst_budget.get(cname) or 0):
+                continue
+            cl = plan["classes"][cname]
+            idn = _c_ident(cname)
+            mb_extra = _mb_pool_extra(plan, cname)
+            mb_add = int(add_budget.get(cname) or 0)
+            cap = int(cl["n"]) + mb_extra
+            p("/* Object.Instantiate(%s[, parent]) — clone + optional parent */"
+              % cname)
+            p("static int Object_Instantiate_%s(int src, int parent_go) {"
+              % idn)
+            p("    int ex, go;")
+            p("    if (src < 0 || src >= _%s_inst_count) return -1;" % idn)
+            p("    if (_%s_inst_count >= %d) return -1;" % (idn, cap))
+            if go_spawn_budget:
+                p("    if (_engine_go_count >= _engine_go_cap) return -1;")
+            else:
+                p("    if (_engine_go_count >= %d) return -1;" % go_cap_i)
+            p("    go = _engine_go_count;")
+            p("    _engine_go_count = _engine_go_count + 1;")
+            p("    _engine_go_name[go] = \"(Clone)\";")
+            if want_destroy:
+                p("    if (go >= 0 && go < %d)" % go_cap_i)
+                p("        _engine_go_destroyed[go] = 0;")
+            p("    ex = _%s_inst_count;" % idn)
+            p("    _%s_inst_count = _%s_inst_count + 1;" % (idn, idn))
+            p("    _%s_inst_array[ex] = _%s_inst_array[src];" % (idn, idn))
+            if cl.get("soa_dims"):
+                dims = int(cl["soa_dims"])
+                p("    {")
+                p("        int _a;")
+                p("        for (_a = 0; _a < %d; _a = _a + 1)" % dims)
+                p("            _%s_pos[ex][_a] = _%s_pos[src][_a];"
+                  % (idn, idn))
+                p("    }")
+            p("    _engine_go_%s[go] = ex;" % idn)
+            p("    if (ex >= 0 && ex < %d)" % cap)
+            p("        _engine_%s_go_of[ex] = go;" % idn)
+            if want_set_parent or want_inst_parent or want_transform_parent:
+                p("    if (parent_go >= 0 && parent_go < go)")
+                p("        _engine_go_parent[go] = parent_go;")
+                p("    else")
+                p("        _engine_go_parent[go] = -1;")
+                if want_get_sibling:
+                    p("    {")
+                    p("        int _i, _max = -1;")
+                    p("        for (_i = 0; _i < go; _i = _i + 1)")
+                    p("            if (_engine_go_parent[_i] == "
+                      "_engine_go_parent[go]")
+                    p("                && _engine_go_sib[_i] > _max)")
+                    p("                _max = _engine_go_sib[_i];")
+                    p("        _engine_go_sib[go] = _max + 1;")
+                    p("    }")
+            else:
+                p("    (void)parent_go;")
+            p("    return ex;")
+            p("}")
+            p("")
+            if not mb_add:
+                p("static char _%s_tostring_buf[256];" % idn)
+                p("static const char *%s_ToString(int ci) {" % idn)
+                p("    int n, go;")
+                p("    if (ci < 0 || ci >= _%s_inst_count) return \"null\";"
+                  % idn)
+                p("    go = _engine_%s_go_of[ci];" % idn)
+                p("    if (go < 0 || go >= _engine_go_count) return \"null\";")
+                p("    n = snprintf(_%s_tostring_buf, sizeof _%s_tostring_buf,"
+                  % (idn, idn))
+                p("                 \"%%s (%s)\", _engine_go_name[go]);" % cname)
+                p("    if (n < 0 || (size_t)n >= sizeof _%s_tostring_buf)"
+                  % idn)
+                p("        return _engine_go_name[go];")
+                p("    return _%s_tostring_buf;" % idn)
+                p("}")
+                p("")
+
+    # GameObject.GetComponentsInChildren<T> — after parent tables + GO maps.
+    if want_gcic and want_go_tables:
+        p("/* GetComponentsInChildren<T> — live subtree walk → std::vector */")
+        p("static int _engine_go_is_child_of(int go, int root) {")
+        p("    int cur, guard;")
+        p("    if (go < 0 || root < 0) return 0;")
+        p("    if (go == root) return 1;")
+        p("    cur = go;")
+        p("    guard = 0;")
+        p("    while (cur >= 0 && guard < _engine_go_count + 2) {")
+        p("        cur = _engine_go_parent[cur];")
+        p("        if (cur == root) return 1;")
+        p("        guard = guard + 1;")
+        p("    }")
+        p("    return 0;")
+        p("}")
+        p("")
+        for tname in sorted(getcomponentsinchildren_types):
+            idn = _c_ident(tname)
+            collectors = _gcic_collector_types(
+                tname, plan, plan.get("mb_bases") or {})
+            # Need a GetComponent map / packed class / subclass / RectTransform.
+            has_map = (
+                bool(collectors)
+                or tname in _PHYSICS_COMPONENTS
+                or tname in _ADDABLE_BUILTINS
+                or tname in _UI_GETCOMPONENT_TYPES
+                or tname in add_types
+                or tname == "SpriteRenderer")
+            if not has_map and tname != "RectTransform":
+                continue
+            p("static std::vector<int> GameObject_GetComponentsInChildren_%s("
+              % idn)
+            p("    int root, int includeInactive) {")
+            p("    std::vector<int> out;")
+            p("    int go, ci;")
+            if not want_ui:
+                p("    (void)includeInactive;")
+            p("    if (root < 0 || root >= _engine_go_count) return out;")
+            p("    for (go = 0; go < _engine_go_count; go = go + 1) {")
+            p("        if (!_engine_go_is_child_of(go, root)) continue;")
+            if want_destroy:
+                p("        if (_engine_go_destroyed[go]) continue;")
+            if want_ui:
+                p("        if (!includeInactive")
+                p("            && !_engine_go_active_in_hierarchy(go))")
+                p("            continue;")
+            if tname == "RectTransform":
+                p("        out.push_back(go);")
+            elif collectors:
+                # Unity polymorphism: Weapon finds Blaster : Weapon, etc.
+                for cname in collectors:
+                    cidn = _c_ident(cname)
+                    p("        ci = GameObject_GetComponent_%s(go);" % cidn)
+                    p("        if (ci >= 0) out.push_back(ci);")
+            else:
+                p("        ci = GameObject_GetComponent_%s(go);" % idn)
+                p("        if (ci >= 0) out.push_back(ci);")
+            p("    }")
+            p("    return out;")
             p("}")
             p("")
 
@@ -8503,9 +9200,31 @@ def emit_engine(plan, analyses, used_apis):
                 p("    unsigned i = 0;")
             else:
                 p("static void %s_%s(unsigned i) {" % (idn, m["name"]))
-            for line in body.split("\n"):
-                if line.strip():
-                    p("    " + line.rstrip())
+            # Methods that still contain unlowered C# become stubs (Unity
+            # messages included — empty body beats crust parse failures).
+            emitted = set()
+            if coll_param:
+                emitted.add(coll_param)
+            if m.get("static"):
+                for part in (m.get("args") or "").split(","):
+                    part = part.strip()
+                    part = re.sub(r"\b(?:ref|out|in|params)\s+", "", part)
+                    pm = re.match(r"([\w.<>]+)\s+(\w+)\s*$", part)
+                    if pm:
+                        emitted.add(pm.group(2))
+            if _lowered_body_still_csharp(
+                    body, args_str=m.get("args") or "",
+                    emitted_params=emitted):
+                if not m.get("static"):
+                    p("    (void)i;")
+                if coll_param:
+                    p("    (void)%s;" % coll_param)
+                p("    /* unlowered C# (GetComponentsInChildren / T[] / "
+                  "leftover Instantiate / lambda / Type.Method) — stub */")
+            else:
+                for line in body.split("\n"):
+                    if line.strip():
+                        p("    " + line.rstrip())
             p("}")
             p("")
 
@@ -8608,13 +9327,13 @@ def emit_engine(plan, analyses, used_apis):
             idn = _c_ident(cname)
             if not _class_has_position(cl):
                 continue
-            n = max(1, cl["n"] + int(add_budget.get(cname) or 0))
+            n = max(1, cl["n"] + _mb_pool_extra(plan, cname))
             pcs = []
             pis = []
             for o in cl["instances"]:
                 pcs.append(str(int(o.get("xf_parent_class_id", -1))))
                 pis.append(str(int(o.get("xf_parent_inst") or 0)))
-            for _pad in range(int(add_budget.get(cname) or 0)):
+            for _pad in range(_mb_pool_extra(plan, cname)):
                 pcs.append("-1")
                 pis.append("0")
             while len(pcs) < n:
@@ -11908,6 +12627,8 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     # Find/GetComponent before field rewrites so `.amp` stays on the target type.
     text = _rewrite_find_getcomponent(text, plan, cl["name"], site=site)
     text, add_locals = _rewrite_addcomponent(text, plan, cl["name"])
+    text = _rewrite_instantiate(text, plan, cl["name"])
+    text = _rewrite_getcomponentsinchildren(text, plan, cl["name"])
     text = _rewrite_audiosource_api(text, cl, add_locals=add_locals)
     # AudioSource / authored UI component locals are packed indices.
     text = re.sub(r"\bAudioSource\b(?=\s+\w)", "int", text)
@@ -12834,7 +13555,7 @@ def emit_data(plan, used_apis=None):
     p("")
     for cname, cl in sorted(plan["classes"].items()):
         idn = _c_ident(cname)
-        mb_budget = int(add_budget.get(cname) or 0)
+        mb_budget = _mb_pool_extra(plan, cname)
         cap = max(1, cl["n"] + mb_budget)
         if mb_budget:
             p("int _%s_inst_count = %d;" % (idn, cl["n"]))
@@ -13160,6 +13881,7 @@ def load_project(root):
     needed = set()
     for a in analyses:
         needed |= set(a.get("getcomponent_types") or [])
+        needed |= set(a.get("getcomponentsinchildren_types") or [])
         needed |= set(a.get("addcomponent_types") or [])
         needed |= set(a.get("findobject_types") or [])
         needed |= set(a.get("singleton_instance_types") or [])
@@ -13168,6 +13890,14 @@ def load_project(root):
                 ty = f.get("ty") or ""
                 if ty in typename_map:
                     needed.add(ty)
+            # Base scripts (Weapon for Blaster : Weapon) so GCIC polymorphism
+            # and CS0246 known-set see the authored hierarchy.
+            for b in c.get("bases") or []:
+                if b in ("MonoBehaviour", "ScriptableObject", "object",
+                         "Object", "System"):
+                    continue
+                if b in typename_map:
+                    needed.add(b)
     have_classes = {o.get("class") for o in objects}
     missing = sorted(
         t for t in needed
@@ -13190,6 +13920,7 @@ def load_project(root):
                 c["methods"] = []  # pack type + instances; don't lower Fracture
             a["apis"] = set()
             a["getcomponent_types"] = set()
+            a["getcomponentsinchildren_types"] = set()
             a["addcomponent_types"] = set()
             analyses.append(a)
 
@@ -13284,7 +14015,17 @@ def validate_emitted_c(text, path="engine.c", analyses=None):
     PackError on subset violations or crust compile failure (Unity-style site
     when a ``unity_pack:site`` marker, field accessor, or subset type error
     maps to authored C#).
+
+    Large ``data.c`` (texture byte arrays) skips full validate — hundreds of
+    MB through cpprust/crust is pathological; layout risk is covered by
+    ``engine.c``.
     """
+    if (path.startswith("data")
+            and text is not None
+            and len(text) > 8 * 1024 * 1024):
+        _progress("skipping full validate for large %s (%d bytes)"
+                  % (path, len(text)))
+        return text
     import tools.cpprust as cpprust
     try:
         scan = cpprust._blank_directives(cpprust._strip_comments(text))
@@ -13557,8 +14298,18 @@ def pack(root, outdir, soa=False, soa_vec4=False):
     for a in analyses:
         gc_types |= set(a.get("getcomponent_types") or [])
     _validate_getcomponent_types(gc_types, plan, analyses)
+    gcic_types = set()
+    for a in analyses:
+        gcic_types |= set(a.get("getcomponentsinchildren_types") or [])
+    _validate_getcomponent_types(gcic_types, plan, analyses)
+    plan["getcomponentsinchildren_types"] = sorted(gcic_types)
+    plan["mb_bases"] = _collect_mb_bases(analyses)
     plan["addcomponent_types"] = sorted(add_types)
     plan["addcomponent_budget"] = _addcomponent_budget(analyses, plan)
+    plan["instantiate_budget"] = _instantiate_budget(analyses, plan)
+    plan["instantiate_go_budget"] = sum(
+        int(v) for v in (plan["instantiate_budget"] or {}).values())
+    plan["instantiate_types"] = sorted(plan["instantiate_budget"] or {})
     plan["disallow_multiple_types"] = sorted(_disallow_multiple_types(analyses))
     fot_types = set()
     sing_types = set()
