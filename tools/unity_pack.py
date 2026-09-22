@@ -5162,12 +5162,27 @@ def _member_init_default(cl, member_name):
 
 
 def _methods_in(body, bscan, body_abs=0):
+    # Control-flow / type keywords must not look like `ret Name(...) {`.
+    _NOT_METHOD = frozenset((
+        "if", "else", "for", "foreach", "while", "do", "switch", "case",
+        "catch", "using", "lock", "fixed", "return", "new", "typeof",
+        "sizeof", "checked", "unchecked", "await", "throw", "goto",
+        "break", "continue", "default", "in", "out", "ref", "is", "as",
+        "true", "false", "null", "this", "base", "get", "set", "add",
+        "remove", "where", "select", "from", "when",
+    ))
     out = []
     for m in re.finditer(
             r"(?m)^[ \t]*(?:public|private|protected|internal)?"
             r"[ \t]*(?:static[ \t]+)?(?:override[ \t]+)?(?:virtual[ \t]+)?"
             r"([\w.<>]+)[ \t]+(\w+)[ \t]*\(([^)]*)\)\s*\{",
             bscan):
+        ret, name = m.group(1).strip(), m.group(2)
+        # `else if (...) {` → ret=else, name=if — not a method.
+        if ret in _NOT_METHOD or name in _NOT_METHOD:
+            continue
+        if "." in ret and ret.split(".")[-1] in _NOT_METHOD:
+            continue
         open_i = m.end() - 1
         # _match_brace lives on cpprust; cs2cpp uses it via import.
         import tools.cpprust as cpprust
@@ -5178,8 +5193,8 @@ def _methods_in(body, bscan, body_abs=0):
         impl = body[m.end():m.start() + (close - m.start())]
         decl = m.group(0)
         out.append({
-            "ret": m.group(1).strip(),
-            "name": m.group(2),
+            "ret": ret,
+            "name": name,
             "args": m.group(3).strip(),
             "body": impl,
             "body_abs": int(body_abs) + int(m.end()),

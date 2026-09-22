@@ -4579,6 +4579,24 @@ class TestSystems(unittest.TestCase):
         self.assertIn("GameObject_GetComponent_Canvas", eng)
         self.assertIn("GameObject_GetComponent_RectTransform", eng)
 
+    def test_methods_in_skips_else_if(self):
+        """`else if (...) {` must not become a method named if."""
+        src = (
+            "using UnityEngine;\n"
+            "public class P : MonoBehaviour {\n"
+            "    int x, y;\n"
+            "    void Update() {\n"
+            "        else if (x) { y = 1; }\n"
+            "        if (y) { x = 0; }\n"
+            "    }\n"
+            "}\n"
+        )
+        a = unity_pack.analyze_script("/proj/Assets/P.cs", src)
+        names = [m["name"] for m in a["classes"][0]["methods"]]
+        self.assertEqual(names, ["Update"])
+        self.assertNotIn("if", names)
+
+
     def test_ast_find_getcomponent_chain(self):
         """cpprust paren/angle parse of Find().GetComponent<T>().field."""
         src = (
