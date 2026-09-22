@@ -291,6 +291,12 @@ file that ships, so there is no transcription for a shape test to guard.
 
 **What the lift reaches.**
 - Unsigned integers (as Nat) and `bool`.
+- Slices, `&[uN]` and `&Vec<uN>`, as the fragment's `Array`, with `.len()`,
+  indexing and `for x in xs`.
+- Structs declared in the file, as records. A function taking one `&mut`
+  struct and returning `()` lifts to one *returning* the struct, the state
+  threading `hoare.py` does for a syscall. In its `ensures` the parameter is
+  the final value, and `old(..)` the one it came in with.
 - `let`, assignment and compound assignment.
 - `if` and `match` as statements, values or tails. `match` covers literals,
   `|`, ranges, `_`, bindings and guards, lowered to an `if`/`elif` chain.
@@ -305,10 +311,8 @@ file that ships, so there is no transcription for a shape test to guard.
   contracts.
 
 **What is claimed.**
-- Unsigned arithmetic is Nat, the same model as the IL lift's. The difference
-  is that the Rust type's width is still known here, which is what will let
-  overflow and underflow become obligations of their own. That is the next
-  step.
+- Unsigned arithmetic is Nat, the same model as the IL lift's. What closes
+  the distance is the *safety lift*, below.
 - `#[requires]` becomes the fragment's leading `assert`s and `#[ensures]` its
   postconditions. These are the clauses Crust checks at runtime, so a
   contract the tests break is one no proof will establish.
@@ -316,10 +320,10 @@ file that ships, so there is no transcription for a shape test to guard.
   clause naming a `mut` parameter outside `old` is refused rather than read
   one way or the other.
 
-**What is refused, by name:** signed integers, references, fields, methods,
-indexing, `loop`/`break`, macros, recursion, bitwise `&`/`|`/`^`, narrowing
-`as`, and quantified clauses. The refusals are the roadmap, as the IL lift's
-tally is.
+**What is refused, by name:** signed integers, references to scalars,
+methods, writing through a slice, struct literals, `loop`/`break`, macros,
+recursion, bitwise `&`/`|`/`^`, narrowing `as`, and quantified clauses. The
+refusals are the roadmap, as the IL lift's tally is.
 
 **A known gap.** `class_covers` in `regs.rs` composes the two functions: the
 class `class_for_regs(n)` picks is sized for at least `n` registers, for
@@ -329,3 +333,119 @@ range a guard establishes, and splitting then computing does not do that.
 `tests/test_rustproof.py` asserts the proof still fails, so closing the gap
 cannot happen quietly. Meanwhile the compiled function, with its `ensures`
 checked at runtime, runs over every `n` its `requires` admits.
+
+### Overflow, underflow, and every other panic
+
+`Lifted.safety()` is a second lift of the same function, `f__safe`. It has the
+same control flow, and `_ok` is conjoined with an obligation at each place
+the Rust would panic. Each `return` returns `_ok`, so the theorem
+"`f__safe(args)` for every `args`" is "no input reaches a panic".
+
+| Rust | owes |
+|---|---|
+| `a + b`, `a * b`, `a << k` in a `uN` | the value `<= max_uN` |
+| `a - b` | `b <= a` |
+| `a / b`, `a % b` | `b != 0` |
+| `xs[i]` | `i < xs.len()` |
+| `f(args)` | `f`'s `#[requires]` of `args` |
+
+Each obligation is paid before the statement that evaluates it, so it reads
+the variables as they are then (`x = x - 1` owes `1 <= x` of the old `x`).
+One the Rust evaluates only on some paths is conditioned on the path: the
+right of `&&`, a `match` guard, an `else if` condition, which becomes an
+`else` holding an `if` because there is nowhere to pay between two `elif`s.
+In the safety lift a `#[requires]` guards the body rather than being a
+hypothesis. For every `args`, "if it holds, nothing panics" is the same
+statement, and the kernel's split then decides it like any other guard.
+
+**The maximum is symbolic.** The kernel's numerals are unary: `3` is
+`succ (succ (succ zero))`. So `u32::MAX` written out is about four billion
+nested terms, and the first attempt at stating one ran out of memory.
+`u64::MAX` is not writable at all. An overflow obligation names `max_u32`
+instead, a parameter of `f__safe`, and each `u32` parameter is assumed
+`<= max_u32`. That is exact, and small. Unbounded quantification over the
+maximum is also why an overflow obligation that holds only *because the
+maximum is large* (`a < 1000 && b < 1000` so `a + b` fits) stays open: it is
+false for a small enough maximum. Closing those needs arithmetic about a
+concrete bound, which in turn needs compact numerals.
+
+`tools/rustprove.py` proves each obligation on its own and reports it, as
+does `make prove_rust`:
+
+```
+bump: index out of bounds (line 57) -- proved
+bump: `+` may overflow u64 (line 58) -- open
+contains: `-` may underflow (line 43) -- proved
+```
+
+*Open* means the automation did not settle it, and says nothing about
+whether it holds. The automation is `by_every_bool`, split then compute, with
+three adjustments found on the way. Each is checked by the kernel, not
+trusted:
+
+- **Hypotheses are weakened away.** `by_every_bool` does not bind an
+  obligation's hypotheses, and its proof term failed to type-check whenever
+  there were any. The conclusion is proved on its own, the proof is wrapped
+  in lambdas that take the hypotheses and ignore them, and `hoare.prove`
+  checks the result against the original statement. The binders are de
+  Bruijn, so dropping them is a renumbering of the body.
+- **An obligation is stated in every spelling a guard might use.**
+  `if i >= len { return }` decides `len <= i`, not `i < len`. Over Nat those
+  say the same thing, but as booleans they are different terms, and splitting
+  decides only the one written. `i < len` is therefore stated as
+  `True if i < len else not (len <= i)`. Each premise implies the claim, so
+  the chain is the claim; it just lets the proof find the guard. `x > 5`
+  discharging `5 <= x` comes the same way.
+- **`if a && b` with no `else` is nested `if`s.** It is the same program,
+  and nested, each conjunct is a guard the split decides, where `a && b`
+  true decides neither.
+
+For a contract the split does not close, the tool falls back to
+`bound_by_ites_or_guards`, as `alloc_eq.py` uses it, with at most one
+precondition threaded as a hypothesis. It offers the prelude's own lemmas
+about the terms present: `le_add_right` for each sum, `sub_le` for each
+difference, `eqb_refl` for each self-comparison.
+
+### `leanos/alloc.rs`
+
+`alloc.rs` is `leanos/alloc.py` ported to Rust. Where it differs, it is so
+that no input panics, and each difference gives the Python's result on every
+input; `tests/test_rustproof.py` checks them row for row on the model test's
+corpus.
+- Every array is read behind its own length check.
+- `owners[heap] == tid + 1` becomes `owners[heap] >= 1 && owners[heap] - 1 ==
+  tid`, since `tid + 1` overflows at `u32::MAX`.
+- `contains` tests `addr - base < size` instead of `addr < base + size`: the
+  same comparison once `base <= addr`, and one that cannot overflow.
+
+From the lifted source, not a hand copy:
+- `bump`'s `ensures(used <= result)` (`alloc_eq.py`'s `bump_monotone`) and
+  `slot_ok`'s `ensures(result <= 1)` are proved by the tool.
+- `bump_bounded` is proved by `alloc_eq.py`'s own recipe, about the generated
+  model.
+- All ten index and underflow obligations are proved, including
+  `slot_addr`'s, which only its `#[requires]` establishes.
+- Four obligations are open, all `u64` additions: `bump`'s `used + n` twice,
+  and `bases[heap] + used` in `slot_addr` and `slot_ok`. Each fits whenever
+  the code admits it, but saying so is arithmetic about the maximum. A test
+  pins the set, so a new open obligation fails it, and so does closing one of
+  these.
+
+`test_alloc_model.py` notes that the Python's model answers 0 past the end
+of an array where the compiled C reads out of bounds. The port has no such
+read, and the obligations are the proof of that.
+
+### Known gaps
+
+- **Arithmetic.** An obligation or contract that needs `a < 1000 && b < 1000`
+  to give `a + b < 2000`, or `n <= s - u && u <= s` to give `u + n <= s`,
+  is out of reach of split-and-compute. The lemmas an interval tactic would
+  build on are not in the prelude: `add_comm`, two-sided monotonicity of
+  `+` and `*`, and `sub_add` cancellation. They belong in RosettaMath beside
+  `add_le_add_left`, and `add m n` recurses on `n`, which decides the
+  induction.
+- **Record contracts through an update.** `step(c: &mut Counter)` with
+  `requires(c.n < c.cap)` and `ensures(c.n <= c.cap)` is not proved: the
+  hypothesis is not carried across `Counter.n (with_n c v)` reducing to `v`.
+  A test asserts it is still open, and Crust checks both clauses at runtime.
+- **`class_covers`**, from the first step, as before.
