@@ -59,6 +59,9 @@ action maps / device graphs).
 | `File.ReadAllBytes(path)` | `fopen` read (`"rb"`) + chunked `fread` → malloc'd `ByteArray` (`.Length` / `[i]` lowered) |
 | `File.Exists(path)` | `fopen` probe (`"rb"`) → 1 / 0 (dirs fail like .NET) |
 | `File.Delete(path)` | `remove(3)`; missing path is a no-op (no throw) |
+| `File.Copy(src, dest)` / `Copy(src, dest, overwrite)` | `fread`/`fwrite`; mkdir dest parent; no overwrite → no-op if dest exists |
+| `File.CreateText(path)` | `fopen` `"w"` (+ mkdir) → `StreamWriter` (`FILE*`); `.WriteLine` / `.Close` |
+| `File.OpenText(path)` | `fopen` `"r"` → `StreamReader` (`FILE*`); `.ReadLine` / `.Close` |
 | Other `File.*` | Pack-time **CS0117** (`File` in scope via `using System.IO`) |
 
 Default log path matches Unity standalone (from `ProjectSettings`

@@ -368,7 +368,7 @@ class TestSystems(unittest.TestCase):
             "using UnityEngine;\n"
             "public class Gate : MonoBehaviour {\n"
             "    void Update() {\n"
-            "        if (!Application.isEditor || Application.isPlaying)\n"
+                "        if (!Application.isEditor || Application.isPlaying)\n"
             "            return;\n"
             "        Application.OpenURL(\"https://example.com\");\n"
             "    }\n"
@@ -383,6 +383,8 @@ class TestSystems(unittest.TestCase):
             "        EditorApplication.delayCall += () => { };\n"
             "    }\n"
             "}\n")
+
+    @needs_cc
 
     def test_quaternion_unsupported_member_is_cs0117(self):
         """Unsupported Quaternion members → CS0117 (in scope via UnityEngine)."""
@@ -509,7 +511,7 @@ class TestSystems(unittest.TestCase):
         self.assertIn("CS0117", cm.exception.message)
         self.assertIn("ReadAllText", cm.exception.message)
         # Supported WriteAllText / AppendAllText / WriteAllBytes /
-        # ReadAllBytes / Exists / Delete.
+        # ReadAllBytes / Exists / Delete / CreateText / OpenText / Copy.
         unity_pack.analyze_script(
             path, src.replace("ReadAllText(\"a.txt\")",
                               "WriteAllText(\"a.txt\", \"x\")"))
@@ -528,6 +530,18 @@ class TestSystems(unittest.TestCase):
         unity_pack.analyze_script(
             path, src.replace("ReadAllText(\"a.txt\")",
                               "Delete(\"a.txt\")"))
+        unity_pack.analyze_script(
+            path, src.replace("ReadAllText(\"a.txt\")",
+                              "CreateText(\"a.txt\")"))
+        unity_pack.analyze_script(
+            path, src.replace("ReadAllText(\"a.txt\")",
+                              "OpenText(\"a.txt\")"))
+        unity_pack.analyze_script(
+            path, src.replace("ReadAllText(\"a.txt\")",
+                              "Copy(\"a.txt\", \"b.txt\")"))
+        unity_pack.analyze_script(
+            path, src.replace("ReadAllText(\"a.txt\")",
+                              "Copy(\"a.txt\", \"b.txt\", true)"))
 
     def test_filestream_write_not_file_cs0117(self):
         """outFile.Write must not match System.IO.File (substring false positive)."""
@@ -897,6 +911,209 @@ class TestSystems(unittest.TestCase):
         run = subprocess.run([exe], capture_output=True, text=True)
         self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
         self.assertIn("del_ok", run.stdout)
+
+    def test_file_copy_packs(self):
+        """File.Copy → fread/fwrite; 2-arg and overwrite=true round-trip."""
+        root = tempfile.mkdtemp(prefix="upack-fcopy-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Copier.cs"), "w") as f:
+            f.write(
+                "using System;\n"
+                "using System.IO;\n"
+                "using UnityEngine;\n"
+                "public class Copier : MonoBehaviour {\n"
+                "    void Start() {\n"
+                "        string src = Application.persistentDataPath + "
+                "\"/unity_pack_copy_src.bin\";\n"
+                "        string dst = Application.persistentDataPath + "
+                "\"/unity_pack_copy_dst.bin\";\n"
+                "        File.WriteAllBytes(src, new byte[] { 9, 8, 7 });\n"
+                "        File.Copy(src, dst);\n"
+                "        byte[] a = File.ReadAllBytes(dst);\n"
+                "        File.WriteAllBytes(src, new byte[] { 1, 2 });\n"
+                "        File.Copy(src, dst, false);\n"
+                "        byte[] b = File.ReadAllBytes(dst);\n"
+                "        File.Copy(src, dst, true);\n"
+                "        byte[] c = File.ReadAllBytes(dst);\n"
+                "        if (a.Length == 3 && a[0] == 9 && a[2] == 7 && "
+                "b.Length == 3 && b[0] == 9 && "
+                "c.Length == 2 && c[0] == 1 && c[1] == 2)\n"
+                "            Console.WriteLine(\"copy_ok\");\n"
+                "        else\n"
+                "            Console.WriteLine(\"copy_bad\");\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Copier.cs.meta"), "w") as f:
+            f.write("guid: c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Copier\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0}\n"
+            )
+        a = unity_pack.analyze_script(os.path.join(scripts, "Copier.cs"))
+        self.assertIn("File.Copy", a["apis"])
+        d = tempfile.mkdtemp(prefix="upack-fcopy-out-")
+        plan = unity_pack.pack(root, d)
+        self.assertIn("Copier", plan["classes"])
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("File_Copy", eng)
+        self.assertIn("/* System.IO.File.Copy", eng)
+        start = eng.split("static void Copier_Start", 1)[1].split(
+            "static int _Copier_started", 1)[0]
+        self.assertNotIn("File.Copy(", start)
+        self.assertIn("File_Copy(", start)
+        self.assertIn("File_Copy(", start)
+        # 2-arg → overwrite 0; true → 1; false → 0
+        self.assertRegex(start, r"File_Copy\([^)]+,\s*0\s*\)")
+        self.assertIn(", 1)", start)
+        if not _CC:
+            return
+        host = os.path.join(d, "host.c")
+        with open(host, "w") as f:
+            f.write(
+                "void engine_tick(void);\n"
+                "extern float Time_deltaTime;\n"
+                "int main(void) {\n"
+                "  Time_deltaTime = 0.02f;\n"
+                "  engine_tick();\n"
+                "  return 0;\n"
+                "}\n"
+            )
+        r = subprocess.run(
+            [_CC, "-O2", "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(
+            [_CC, "-O0", "-c", "-o", os.path.join(d, "data.o"),
+             os.path.join(d, "data.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        exe = os.path.join(d, "run")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host,
+             os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+        self.assertIn("copy_ok", run.stdout)
+
+    def test_file_create_open_text_packs(self):
+        """File.CreateText/OpenText → StreamWriter/Reader WriteLine/ReadLine."""
+        root = tempfile.mkdtemp(prefix="upack-ftext-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "TextIO.cs"), "w") as f:
+            f.write(
+                "using System;\n"
+                "using System.IO;\n"
+                "using UnityEngine;\n"
+                "public class TextIO : MonoBehaviour {\n"
+                "    void Start() {\n"
+                "        string path = Application.persistentDataPath + "
+                "\"/unity_pack_text.txt\";\n"
+                "        StreamWriter w = File.CreateText(path);\n"
+                "        w.WriteLine(\"hello\");\n"
+                "        w.WriteLine(\"world\");\n"
+                "        w.Close();\n"
+                "        StreamReader r = File.OpenText(path);\n"
+                "        string a = r.ReadLine();\n"
+                "        string b = r.ReadLine();\n"
+                "        r.Close();\n"
+                "        Console.WriteLine(a);\n"
+                "        Console.WriteLine(b);\n"
+                "        Console.WriteLine(\"text_ok\");\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "TextIO.cs.meta"), "w") as f:
+            f.write("guid: a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: TextIO\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7}\n"
+            )
+        a = unity_pack.analyze_script(os.path.join(scripts, "TextIO.cs"))
+        self.assertIn("File.CreateText", a["apis"])
+        self.assertIn("File.OpenText", a["apis"])
+        d = tempfile.mkdtemp(prefix="upack-ftext-out-")
+        plan = unity_pack.pack(root, d)
+        self.assertIn("TextIO", plan["classes"])
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("File_CreateText", eng)
+        self.assertIn("File_OpenText", eng)
+        self.assertIn("StreamWriter_WriteLine", eng)
+        self.assertIn("StreamReader_ReadLine", eng)
+        start = eng.split("static void TextIO_Start", 1)[1].split(
+            "static int _TextIO_started", 1)[0]
+        self.assertNotIn("File.CreateText(", start)
+        self.assertNotIn("File.OpenText(", start)
+        self.assertIn("File_CreateText(", start)
+        self.assertIn("File_OpenText(", start)
+        self.assertIn("StreamWriter_WriteLine(", start)
+        self.assertIn("StreamReader_ReadLine(", start)
+        self.assertIn("Stream_Close(", start)
+        if not _CC:
+            return
+        host = os.path.join(d, "host.c")
+        with open(host, "w") as f:
+            f.write(
+                "void engine_tick(void);\n"
+                "extern float Time_deltaTime;\n"
+                "int main(void) {\n"
+                "  Time_deltaTime = 0.02f;\n"
+                "  engine_tick();\n"
+                "  return 0;\n"
+                "}\n"
+            )
+        r = subprocess.run(
+            [_CC, "-O2", "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(
+            [_CC, "-O0", "-c", "-o", os.path.join(d, "data.o"),
+             os.path.join(d, "data.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        exe = os.path.join(d, "run")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host,
+             os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+        self.assertIn("text_ok", run.stdout)
+        self.assertIn("hello", run.stdout)
+        self.assertIn("world", run.stdout)
 
     def test_transform_unsupported_member_is_cs1061(self):
         """Unsupported transform.Member → CS1061 on Transform (not undeclared)."""
@@ -2403,6 +2620,8 @@ class TestSystems(unittest.TestCase):
              os.path.join(d, "engine.c")],
             capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
+
+    @needs_cc
 
     @needs_cc
     def test_application_open_url_packs(self):
