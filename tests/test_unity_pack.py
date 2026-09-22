@@ -2809,6 +2809,8 @@ class TestSystems(unittest.TestCase):
         self.assertIn("LogAverageFPS_LOG_FILE_PATH_SUFFIX", eng)
         self.assertIn("LogAverageFPS_Update", eng)
         self.assertIn("LogAverageFPS_Start", eng)
+        self.assertIn("LogAverageFPS_set_timeLeft", eng)
+        self.assertIn("f32_to_f16", eng)
         self.assertNotIn(
             "Application_persistentDataPath() + LogAverageFPS_LOG_FILE_PATH",
             eng)
@@ -2861,7 +2863,6 @@ class TestSystems(unittest.TestCase):
                 "guid: f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1}\n"
             )
         d = tempfile.mkdtemp(prefix="upack-fpsline-out-")
-        # Overwrite is layout-independent; avoid solo --soa f16 (no float setters).
         plan = unity_pack.pack(root, d)
         with open(os.path.join(d, "engine.c")) as f:
             eng = f.read()

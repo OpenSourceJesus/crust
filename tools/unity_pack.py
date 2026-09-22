@@ -7420,6 +7420,26 @@ def emit_engine(plan, analyses, used_apis):
     p("    return s ? -f : f;")
     p("}")
     p("")
+    p("static uint16_t f32_to_f16(float f) {")
+    p("    unsigned s = 0;")
+    p("    int e = 0;")
+    p("    unsigned m;")
+    p("    float a;")
+    p("    if (f < 0.f) { s = 1u; f = -f; }")
+    p("    if (f == 0.f) return (uint16_t)(s << 15);")
+    p("    a = f;")
+    p("    while (a >= 2.f && e < 15) { a = a * 0.5f; e = e + 1; }")
+    p("    while (a < 1.f && e > -14) { a = a * 2.f; e = e - 1; }")
+    p("    if (e > -14)")
+    p("        m = (unsigned)((a - 1.f) * 1024.f + 0.5f);")
+    p("    else")
+    p("        m = (unsigned)(a * 1024.f + 0.5f);")
+    p("    if (m >= 1024u) { m = 0; e = e + 1; }")
+    p("    if (e > 15) return (uint16_t)((s << 15) | 0x7c00u);")
+    p("    if (e < -14) return (uint16_t)(s << 15);")
+    p("    return (uint16_t)((s << 15) | ((unsigned)(e + 15) << 10) | (m & 1023u));")
+    p("}")
+    p("")
 
     if want_ctor_forbidden:
         p("/* Application.dataPath / persistentDataPath in field/.cctor. */")
@@ -7870,6 +7890,8 @@ def emit_engine(plan, analyses, used_apis):
         for name, ty, bits, kind in cl["members"]:
             if kind == "f16":
                 p("static float %s_get_%s(unsigned i) { return f16_to_f32(%s_AT(i).%s); }"
+                  % (idn, name, idn, name))
+                p("static void %s_set_%s(unsigned i, float v) { %s_AT(i).%s = f32_to_f16(v); }"
                   % (idn, name, idn, name))
             elif kind == "f32":
                 p("static float %s_get_%s(unsigned i) { return %s_AT(i).%s; }"
