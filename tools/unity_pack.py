@@ -296,6 +296,7 @@ _API = {
     "Application.isPlaying": True,
     "Application.OpenURL": True,
     "Application.productName": True,
+    "Application.Quit": True,
     "File.WriteAllText": True,
     "File.AppendAllText": True,
     "File.WriteAllBytes": True,
@@ -4420,6 +4421,7 @@ def analyze_script(path, text=None):
         apis.add("Application.productName")
     if re.search(
             r"(?<![\w])(?:UnityEngine\.)?Application\.Quit\s*\(", scan):
+        apis.add("Application.Quit")
     if re.search(r"(?:System\.IO\.)?File\.WriteAllText\s*\(", scan):
         apis.add("File.WriteAllText")
     if re.search(r"(?:System\.IO\.)?File\.AppendAllText\s*\(", scan):
@@ -5161,6 +5163,7 @@ def emit_engine(plan, analyses, used_apis):
     want_app_is_playing = "Application.isPlaying" in used_apis
     want_app_open_url = "Application.OpenURL" in used_apis
     want_app_product_name = "Application.productName" in used_apis
+    want_app_quit = "Application.Quit" in used_apis
     want_file_write = "File.WriteAllText" in used_apis
     want_file_append = "File.AppendAllText" in used_apis
     want_file_write_bytes = "File.WriteAllBytes" in used_apis
@@ -5633,10 +5636,17 @@ def emit_engine(plan, analyses, used_apis):
         p("    (void)system(cmd);")
         p("}")
         p("")
+    if want_app_quit:
+        p("/* Application.Quit — host polls engine_wants_quit() */")
+        p("static int _engine_quit;")
+        p("static void Application_Quit(int exit_code) {")
         p("    (void)exit_code;")
+        p("    _engine_quit = 1;")
         p("}")
+        p("int engine_wants_quit(void) { return _engine_quit; }")
         p("")
     else:
+        p("int engine_wants_quit(void) { return 0; }")
         p("")
     if want_destroy:
         # Destroy(gameObject) — mark GO; Tick skips destroyed instances.
@@ -8796,6 +8806,7 @@ def emit_engine_draw_h():
         "const char *engine_data_path(void); /* Application.dataPath */\n"
         "const char *engine_persistent_data_path(void); "
         "/* Application.persistentDataPath */\n"
+        "int engine_wants_quit(void); /* Application.Quit requested */\n"
         "\n"
         "#endif\n"
     )
@@ -10303,8 +10314,10 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     # Quit() → Quit(0); Quit(code) keeps the arg.
     text = re.sub(
         r"(?<![\w])(?:UnityEngine\.)?Application\.Quit\s*\(\s*\)",
+        "Application_Quit(0)", text)
     text = re.sub(
         r"(?<![\w])(?:UnityEngine\.)?Application\.Quit\s*\(",
+        "Application_Quit(", text)
     text = re.sub(
         r"(?:System\.IO\.)?File\.WriteAllText\s*\(",
         "File_WriteAllText(", text)
@@ -11149,6 +11162,7 @@ def emit_main():
         "    Time_deltaTime = 0.0166667f;\n"
         "    for (i = 0; i < 60; i = i + 1) {\n"
         "        engine_tick();\n"
+        "        if (engine_wants_quit()) break;\n"
         "    }\n"
         "    n = engine_collect_draws(buf, 256);\n"
         "    printf(\"ticks=60 draws=%d\\n\", n);\n"

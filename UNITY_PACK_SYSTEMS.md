@@ -51,6 +51,7 @@ action maps / device graphs).
 | `Application.isPlaying` | Always **true** while the packed player runs |
 | `Application.productName` | Baked `ProjectSettings` `productName` (else project folder name) |
 | `Application.OpenURL(url)` | `system("python3 -c \"import webbrowser; webbrowser.open('…')\"")` |
+| `Application.Quit()` / `Quit(code)` | Sets flag; host polls `engine_wants_quit()` (no Escape/Q shortcut) |
 | Other `Application.*` | Pack-time **CS0117** (`Application` in scope via `using UnityEngine`) |
 | Other `Quaternion.*` (not Euler / identity / LookRotation / Slerp / Inverse / Angle) | Pack-time **CS0117** (`Quaternion` in scope via `using UnityEngine`) |
 | `File.WriteAllText(path, text)` | `fopen` write (`"w"`); creates parent dirs when possible |

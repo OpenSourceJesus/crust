@@ -36,7 +36,8 @@ object as a coloured quad (surfaceless FBO → ASCII).
 into `$TMPDIR/<project>/<productName>` (override the directory with
 `OUT=`). The player keeps moving every frame (`Time.deltaTime` from the
 frame clock). Arrow keys / WASD poke `engine_input_axis_*` for
-`Input.GetAxis`. Escape or Q closes.
+`Input.GetAxis`. Quit via authored `Application.Quit` or the window
+close control (no Escape/Q host shortcut).
 
 SystemsScene (Pad + Ball + … → `/tmp/SystemsScene/SystemsScene`):
 

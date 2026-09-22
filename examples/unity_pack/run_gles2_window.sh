@@ -60,5 +60,5 @@ if [[ ! -x "$EXE" ]]; then
   exit 1
 fi
 
-echo "== GLFW window${SOA[*]:+ (SoA)}: $EXE (Escape/Q to quit) =="
+echo "== GLFW window${SOA[*]:+ (SoA)}: $EXE (Application.Quit or window close) =="
 exec "$EXE"

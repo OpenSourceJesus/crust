@@ -356,7 +356,7 @@ class TestSystems(unittest.TestCase):
         self.assertIn("CS0117", cm.exception.message)
         self.assertIn("streamingAssetsPath", cm.exception.message)
         # Supported dataPath / persistentDataPath / isEditor / isPlaying /
-        # OpenURL / productName.
+        # OpenURL / productName / Quit.
         unity_pack.analyze_script(
             path, src.replace("streamingAssetsPath", "dataPath"))
         unity_pack.analyze_script(
@@ -371,6 +371,8 @@ class TestSystems(unittest.TestCase):
                 "        if (!Application.isEditor || Application.isPlaying)\n"
             "            return;\n"
             "        Application.OpenURL(\"https://example.com\");\n"
+            "        Application.Quit();\n"
+            "        Application.Quit(0);\n"
             "    }\n"
             "}\n")
         # EditorApplication.* must not be blamed as Application.* (CS0117).
@@ -385,6 +387,95 @@ class TestSystems(unittest.TestCase):
             "}\n")
 
     @needs_cc
+    def test_application_quit_packs(self):
+        """Application.Quit → engine_wants_quit; host loop stops."""
+        root = tempfile.mkdtemp(prefix="upack-quit-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Quilter.cs"), "w") as f:
+            f.write(
+                "using System;\n"
+                "using UnityEngine;\n"
+                "public class Quilter : MonoBehaviour {\n"
+                "    void Start() {\n"
+                "        Console.WriteLine(\"before_quit\");\n"
+                "        Application.Quit();\n"
+                "    }\n"
+                "    void Update() {\n"
+                "        Console.WriteLine(\"after_quit\");\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Quilter.cs.meta"), "w") as f:
+            f.write("guid: q1q1q1q1q1q1q1q1q1q1q1q1q1q1q1q1\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Quilter\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: q1q1q1q1q1q1q1q1q1q1q1q1q1q1q1q1}\n"
+            )
+        a = unity_pack.analyze_script(os.path.join(scripts, "Quilter.cs"))
+        self.assertIn("Application.Quit", a["apis"])
+        d = tempfile.mkdtemp(prefix="upack-quit-out-")
+        plan = unity_pack.pack(root, d)
+        self.assertIn("Quilter", plan["classes"])
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("Application_Quit", eng)
+        self.assertIn("engine_wants_quit", eng)
+        self.assertIn("/* Application.Quit", eng)
+        with open(os.path.join(d, "engine_draw.h")) as f:
+            hdr = f.read()
+        self.assertIn("engine_wants_quit", hdr)
+        start = eng.split("static void Quilter_Start", 1)[1].split(
+            "static void Quilter_Update", 1)[0]
+        self.assertIn("Application_Quit(0)", start)
+        self.assertNotIn("Application.Quit(", start)
+        host = os.path.join(d, "host.c")
+        with open(host, "w") as f:
+            f.write(
+                "#include \"engine_draw.h\"\n"
+                "extern float Time_deltaTime;\n"
+                "int main(void) {\n"
+                "  int i;\n"
+                "  Time_deltaTime = 0.02f;\n"
+                "  for (i = 0; i < 10; i++) {\n"
+                "    engine_tick();\n"
+                "    if (engine_wants_quit()) break;\n"
+                "  }\n"
+                "  return engine_wants_quit() ? 0 : 1;\n"
+                "}\n"
+            )
+        r = subprocess.run(
+            [_CC, "-O2", "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(
+            [_CC, "-O0", "-c", "-o", os.path.join(d, "data.o"),
+             os.path.join(d, "data.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        exe = os.path.join(d, "run")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host,
+             os.path.join(d, "engine.o"), os.path.join(d, "data.o"),
+             "-I", d, "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+        self.assertIn("before_quit", run.stdout)
 
     def test_quaternion_unsupported_member_is_cs0117(self):
         """Unsupported Quaternion members → CS0117 (in scope via UnityEngine)."""
