@@ -478,6 +478,54 @@ class TestSystems(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
         self.assertIn("before_quit", run.stdout)
 
+    def test_blank_mobile_if_skips_new_nested_class(self):
+        """UNITY_ANDROID||IOS regions blank so new NestedClass never emits."""
+        src = (
+            "using UnityEngine;\n"
+            "public class SettingsMenu : MonoBehaviour {\n"
+            "#if UNITY_ANDROID || UNITY_IOS\n"
+            "    public void StartDragControl(RectTransform rectTrs) {\n"
+            "        var u = new DragControlUpdater(rectTrs);\n"
+            "    }\n"
+            "    class DragControlUpdater {\n"
+            "        public DragControlUpdater(RectTransform rectTrs) {}\n"
+            "    }\n"
+            "#endif\n"
+            "#if !UNITY_ANDROID && !UNITY_IOS\n"
+            "    public void DesktopOnly() { int kept = 1; }\n"
+            "#endif\n"
+            "    void Update() {}\n"
+            "}\n"
+        )
+        blanked = unity_pack._blank_unity_editor_regions(src)
+        self.assertNotIn("new DragControlUpdater", blanked)
+        self.assertNotIn("StartDragControl", blanked)
+        self.assertIn("DesktopOnly", blanked)
+        self.assertIn("kept = 1", blanked)
+        a = unity_pack.analyze_script("/proj/Assets/SettingsMenu.cs", src)
+        names = [m["name"] for m in a["classes"][0]["methods"]]
+        self.assertIn("DesktopOnly", names)
+        self.assertIn("Update", names)
+        self.assertNotIn("StartDragControl", names)
+
+    def test_blank_editor_keeps_else_branch(self):
+        """#if UNITY_EDITOR … #else … keeps the player #else body."""
+        src = (
+            "using UnityEngine;\n"
+            "public class G : MonoBehaviour {\n"
+            "#if UNITY_EDITOR\n"
+            "    void OnValidate() { int editorOnly = 1; }\n"
+            "#else\n"
+            "    void PlayerAwake() { int playerOnly = 1; }\n"
+            "#endif\n"
+            "}\n"
+        )
+        blanked = unity_pack._blank_unity_editor_regions(src)
+        self.assertNotIn("OnValidate", blanked)
+        self.assertNotIn("editorOnly", blanked)
+        self.assertIn("PlayerAwake", blanked)
+        self.assertIn("playerOnly", blanked)
+
     def test_quaternion_unsupported_member_is_cs0117(self):
         """Unsupported Quaternion members → CS0117 (in scope via UnityEngine)."""
         src = (

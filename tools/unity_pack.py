@@ -217,37 +217,104 @@ _CS0234 = (
     "(are you missing an assembly reference?)"
 )
 
+# Symbols true for the packed desktop player (GLES host). Undefined UNITY_*
+# symbols evaluate false — matches a non-Editor standalone Linux build.
+_PACK_PP_DEFINES = frozenset((
+    "UNITY_STANDALONE",
+    "UNITY_STANDALONE_LINUX",
+))
+
+
+def _eval_unity_pp_expr(expr, defined=_PACK_PP_DEFINES):
+    """Evaluate a Unity ``#if`` / ``#elif`` expression for the packed player."""
+    tokens = re.findall(
+        r"\b[A-Za-z_][A-Za-z0-9_]*\b|\b\d+\b|&&|\|\||!|\(|\)", expr)
+    if not tokens:
+        return False
+    out = []
+    for t in tokens:
+        if t == "&&":
+            out.append("and")
+        elif t == "||":
+            out.append("or")
+        elif t == "!":
+            out.append("not")
+        elif t in ("(", ")"):
+            out.append(t)
+        elif t.isdigit():
+            out.append(t)
+        elif t in defined:
+            out.append("True")
+        else:
+            out.append("False")
+    try:
+        return bool(eval(" ".join(out), {"__builtins__": {}}, {}))
+    except Exception:
+        return False
+
 
 def _blank_unity_editor_regions(text):
-    """Blank ``#if UNITY_EDITOR`` … ``#endif`` bodies (player pack ignores them).
+    """Blank inactive Unity ``#if`` regions for the packed desktop player.
 
-    Nested ``#if`` depth inside an editor region is tracked so OnValidate and
-    other editor-only APIs never reach refuse checks or method lowering.
+    ``UNITY_EDITOR`` / ``UNITY_ANDROID`` / ``UNITY_IOS`` (and other undefined
+    pack symbols) are false; ``UNITY_STANDALONE`` / ``UNITY_STANDALONE_LINUX``
+    are true. ``#else`` / ``#elif`` follow C# preprocessor rules so mobile-only
+    ``new NestedClass`` and editor OnValidate never reach method lowering.
     """
     lines = text.split("\n")
     out = []
-    depth = 0
+    # Each frame: parent_active, any_branch_taken, current_active
+    stack = []
+
+    def emitting():
+        return stack[-1][2] if stack else True
+
+    def blank(line):
+        return " " * len(line)
+
     for line in lines:
         s = line.lstrip()
         if s.startswith("#"):
             low = s.lower()
-            if re.match(r"#if\b", low) and re.search(r"\bunity_editor\b", low):
-                depth += 1
-                out.append(" " * len(line))
+            if re.match(r"#if\b", low):
+                expr = s[3:].strip()
+                expr = re.split(r"//|/\*", expr, maxsplit=1)[0].strip()
+                parent = emitting()
+                val = _eval_unity_pp_expr(expr) if parent else False
+                stack.append([parent, val, parent and val])
+                out.append(blank(line))
                 continue
-            if depth > 0:
-                if low.startswith("#endif"):
-                    depth -= 1
-                elif low.startswith("#if"):
-                    depth += 1
-                out.append(" " * len(line))
+            if re.match(r"#elif\b", low) and stack:
+                expr = s[5:].strip()
+                expr = re.split(r"//|/\*", expr, maxsplit=1)[0].strip()
+                parent, taken, _cur = stack[-1]
+                if not parent or taken:
+                    stack[-1][2] = False
+                else:
+                    val = _eval_unity_pp_expr(expr)
+                    stack[-1][1] = taken or val
+                    stack[-1][2] = val
+                out.append(blank(line))
                 continue
-            out.append(line)
+            if re.match(r"#else\b", low) and stack:
+                parent, taken, _cur = stack[-1]
+                stack[-1][2] = bool(parent and not taken)
+                stack[-1][1] = True
+                out.append(blank(line))
+                continue
+            if re.match(r"#endif\b", low) and stack:
+                stack.pop()
+                out.append(blank(line))
+                continue
+            if not emitting():
+                out.append(blank(line))
+            else:
+                out.append(line)
             continue
-        if depth > 0:
-            out.append(" " * len(line))
-        else:
+        if emitting():
             out.append(line)
+        else:
+            out.append(blank(line))
     return "\n".join(out)
 
 

@@ -58,6 +58,7 @@ action maps / device graphs).
 | `Application.persistentDataPath` | Unity company/product save dir (**Awake/Start only**) |
 | `Application.isEditor` | Always **false** (packed player) |
 | `Application.isPlaying` | Always **true** while the packed player runs |
+| `#if UNITY_EDITOR` / `UNITY_ANDROID` / `UNITY_IOS` | Inactive for pack (desktop standalone defines); `#else` kept |
 | `Application.productName` | Baked `ProjectSettings` `productName` (else project folder name) |
 | `Application.OpenURL(url)` | `system("python3 -c \"import webbrowser; webbrowser.open('…')\"")` |
 | `Application.Quit()` / `Quit(code)` | Sets flag; host polls `engine_wants_quit()` (no Escape/Q shortcut) |
