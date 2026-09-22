@@ -166,7 +166,7 @@ fn pick(x: u32) -> u32 {
     def test_refusals_name_the_construct(self):
         cases = {
             "fn f(x: i32) -> i32 { x }": "signed",
-            "fn f(x: &u32) -> u32 { *x }": "not lifted",
+            "fn f(x: &u32) -> u32 { *x }": "by reference",
             "fn f(x: u32) -> u32 { x.count_ones() }": "methods",
             "fn f(x: u32) -> u32 { loop { return x; } }": "`loop`",
             "fn f(n: u32) -> u32 { if n == 0 { 1 } else { f(n - 1) } }":
@@ -408,6 +408,291 @@ class TestRegsContracts(unittest.TestCase):
                              timeout=600)
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         self.assertIn("does not depend on any axioms", run.stdout)
+
+
+# --------------------------------------------------------------------------
+# 4. The safety lift: every place the Rust could panic, as a claim.
+# --------------------------------------------------------------------------
+
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+ALLOC = os.path.join(ROOT, "leanos", "alloc.rs")
+
+SAFETY = """
+fn guarded_sub(x: u32) -> u32 { if x >= 5 { x - 5 } else { 0 } }
+fn strict_sub(x: u32) -> u32 { if x > 5 { x - 5 } else { 0 } }
+fn early_sub(x: u32, y: u32) -> u32 { if x < y { return 0; } x - y }
+fn raw_sub(x: u32, y: u32) -> u32 { x - y }
+fn div(a: u32, b: u32) -> u32 { if b == 0 { return 0; } a / b }
+fn first(xs: &[u32]) -> u32 { if xs.len() > 0 { xs[0] } else { 0 } }
+fn at(xs: &[u32], i: usize) -> u32 { if i >= xs.len() { return 0; } xs[i] }
+fn short(xs: &[u32], i: usize) -> bool { i < xs.len() && xs[i] > 3 }
+fn add(a: u32, b: u32) -> u32 { a + b }
+fn raw_index(xs: &[u32], i: usize) -> u32 { xs[i] }
+#[requires(n > 0)]
+fn pos(n: u32) -> u32 { n }
+fn call_ok(n: u32) -> u32 { if n > 0 { pos(n) } else { 0 } }
+fn call_bad(n: u32) -> u32 { pos(n) }
+#[requires(i < xs.len())]
+fn behind_requires(xs: &[u32], i: usize) -> u32 { xs[i] }
+"""
+
+# Whether each function's every obligation is proved.  The `False` rows are
+# genuinely unsafe -- each has an input that panics -- except `add`, which
+# overflows at u32::MAX and is stated against the symbolic maximum.
+SAFE = {
+    "guarded_sub": True, "strict_sub": True, "early_sub": True,
+    "raw_sub": False, "div": True, "first": True, "at": True,
+    "short": True, "add": False, "raw_index": False, "call_ok": True,
+    "call_bad": False, "behind_requires": True,
+}
+
+
+class TestSafetyLift(unittest.TestCase):
+    """The shape of the safety lift, which needs no kernel."""
+
+    def test_obligations_are_named_where_they_arise(self):
+        f = lift(SAFETY, "early_sub")
+        self.assertEqual(f.obligations, ["`-` may underflow (line 4)"])
+        self.assertEqual(lift(SAFETY, "add").obligations,
+                         ["`+` may overflow u32 (line 10)"])
+        self.assertEqual(lift(SAFETY, "call_bad").obligations,
+                         ["`pos`'s `#[requires]` (line 15)"])
+        self.assertIsNone(lift(_source(REGS), "elf_regs_for_class").safety())
+
+    def test_an_obligation_is_paid_before_its_statement(self):
+        src = lift(SAFETY, "early_sub").safety()
+        lines = [ln.strip() for ln in src.splitlines()]
+        at = lines.index("if (x < y):")
+        self.assertTrue(lines[at + 2].startswith("_ok = (_ok and"))
+        self.assertEqual(lines[at + 3], "return _ok")
+
+    def test_overflow_is_stated_against_a_symbolic_maximum(self):
+        # The kernel's numerals are unary: u32::MAX written out would be four
+        # billion terms.  The maximum is a parameter, and each value of the
+        # type is assumed to be at most it.
+        src = lift(SAFETY, "add").safety()
+        self.assertIn("max_u32: 'Nat'", src.splitlines()[0])
+        self.assertIn("assert (a <= max_u32)", src)
+        self.assertIn("((a + b) <= max_u32)", src)
+        self.assertNotIn("4294967295", src)
+
+    def test_requires_guards_the_body(self):
+        src = lift(SAFETY, "behind_requires").safety()
+        self.assertIn("if (i < len(xs)):", src)
+        self.assertNotIn("assert (i < len(xs))", src)
+
+    def test_a_guarded_obligation_is_conditioned_on_its_path(self):
+        src = lift(SAFETY, "short").safety()
+        self.assertIn("if (i < len(xs)) else True)", src)
+
+
+@unittest.skipUnless(ROSETTAMATH, "RosettaMath not found; run 'make install_proofs'")
+class TestSafetyProofs(unittest.TestCase):
+
+    def test_each_function_is_safe_exactly_when_expected(self):
+        import rustprove
+        prover = rustprove.Prover(SAFETY)
+        for name, expected in SAFE.items():
+            with self.subTest(fn=name):
+                verdicts = prover.safety(name)
+                self.assertTrue(verdicts)
+                self.assertEqual(all(ok for _, ok in verdicts), expected,
+                                 verdicts)
+
+
+# --------------------------------------------------------------------------
+# 5. Records, and a `&mut` parameter as state.
+# --------------------------------------------------------------------------
+
+RECORDS = """
+struct Counter { n: u32, cap: u32 }
+
+#[requires(c.n < c.cap)]
+#[ensures(c.n <= c.cap)]
+#[ensures(c.cap == old(c.cap))]
+fn step(c: &mut Counter) { c.n += 1; }
+
+#[ensures(result <= c.cap)]
+fn room(c: &Counter) -> u32 { if c.n <= c.cap { c.cap - c.n } else { 0 } }
+"""
+
+
+class TestRecordsLift(unittest.TestCase):
+
+    def test_a_mut_parameter_is_threaded_state(self):
+        f = lift(RECORDS, "step")
+        self.assertEqual(f.source.splitlines()[0],
+                         "def step(c: 'Counter') -> 'Counter':")
+        self.assertIn("c.n = (c.n + 1)", f.source)
+        self.assertTrue(f.source.rstrip().endswith("return c"))
+        # the parameter is its final value; `old` is the one it came in with
+        self.assertEqual(f.ensures, ["(result.n <= result.cap)",
+                                     "(result.cap == c.cap)"])
+        self.assertEqual(f.records, [("Counter", [("n", "Nat"),
+                                                  ("cap", "Nat")])])
+
+
+@unittest.skipUnless(ROSETTAMATH, "RosettaMath not found; run 'make install_proofs'")
+class TestRecordsProofs(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        import rustprove
+        cls.prover = rustprove.Prover(RECORDS)
+
+    def test_room_contract_and_safety(self):
+        self.assertTrue(self.prover.contract("room"))
+        self.assertTrue(all(ok for _, ok in self.prover.safety("room")))
+
+    def test_the_model_agrees_with_the_binary(self):
+        cases = [(3, 9), (9, 9), (12, 9), (0, 0)]
+        calls = []
+        for n, cap in cases:
+            calls.append("room(&Counter { n: %d, cap: %d })" % (n, cap))
+        binary = _compile_and_print(RECORDS, calls)
+        H, L, p = self.prover.H, self.prover.L, self.prover
+
+        def work():
+            env, _ = p.fresh_env(p.lifted["room"])
+            proc = H.read_procedure(p.lifted["room"].source, env, None,
+                                    ["result == result"])
+            return [_nat(H.app(proc.fn_term,
+                               H.app("Counter.mk", L.numeral(n),
+                                     L.numeral(cap))), env, L)
+                    for n, cap in cases]
+        self.assertEqual(_in_big_stack(work), binary)
+
+    def test_step_contract_is_not_yet_proved(self):
+        """A known gap, asserted so that closing it cannot go unnoticed.
+
+        `step`'s postconditions follow from its precondition through a record
+        update read back through a projection -- `Counter.n (with_n c v)` is
+        `v` -- and the automation does not yet carry the hypothesis across
+        that reduction.  The runtime check stands in: Crust checks both
+        `ensures` on every call."""
+        self.assertFalse(self.prover.contract("step"))
+
+
+# --------------------------------------------------------------------------
+# 6. leanos/alloc.rs: the allocator, ported, and proved from its source.
+# --------------------------------------------------------------------------
+
+# The Python allocator's region layout and corpus, reused so the port is
+# checked against the original row for row.
+from tests.test_alloc_model import CORPUS, _python, B, S, O  # noqa: E402
+
+# The obligations of alloc.rs the kernel does not settle.  Every one is a
+# `u64` addition: it fits whenever the surrounding code admits it, but
+# saying so is arithmetic about the maximum, which splitting and computing
+# does not do.  A new open obligation fails this test, and so does closing
+# one of these, so neither can happen quietly.
+ALLOC_OPEN = {
+    ("bump", "`+` may overflow u64 (line 58)"),
+    ("bump", "`+` may overflow u64 (line 59)"),
+    ("slot_addr", "`+` may overflow u64 (line 70)"),
+    ("slot_ok", "`+` may overflow u64 (line 78)"),
+}
+
+
+def _alloc_calls(row):
+    _, tid, heap, used, n = row
+    arrays = "&[%s][..], &[%s][..]" % (", ".join("%du64" % b for b in B),
+                                       ", ".join("%du64" % s for s in S))
+    owners = "&[%s][..]" % ", ".join("%du32" % o for o in O)
+    return [
+        "bump(%s, %s, %d, %d, %d, %d)" % (arrays, owners, tid, heap, used, n),
+        "if %d < %d { slot_addr(&[%s][..], %d, %d) } else { 0 }"
+        % (heap, len(B), ", ".join("%du64" % b for b in B), heap, used),
+        "slot_ok(%s, %d, %d)" % (arrays, heap, used),
+    ]
+
+
+class TestAllocLift(unittest.TestCase):
+
+    def test_every_function_lifts(self):
+        ok, refused = lift_all(_source(ALLOC))
+        self.assertEqual(refused, {})
+        self.assertEqual(sorted(ok), ["bump", "contains", "slot_addr",
+                                      "slot_ok"])
+
+    def test_the_port_agrees_with_the_python(self):
+        calls = []
+        for row in CORPUS:
+            calls.extend(_alloc_calls(row))
+        got = _compile_and_print(_source(ALLOC), calls)
+        for k, row in enumerate(CORPUS):
+            with self.subTest(case=row[0]):
+                self.assertEqual(tuple(got[3 * k:3 * k + 3]), _python(row))
+
+
+@unittest.skipUnless(ROSETTAMATH, "RosettaMath not found; run 'make install_proofs'")
+class TestAllocProofs(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        import rustprove
+        cls.prover = rustprove.Prover(_source(ALLOC))
+
+    def test_the_model_agrees_with_the_binary(self):
+        calls = []
+        for row in CORPUS:
+            calls.extend(_alloc_calls(row)[:1])
+        binary = _compile_and_print(_source(ALLOC), calls)
+        H, L, p = self.prover.H, self.prover.L, self.prover
+
+        def work():
+            env, _ = p.fresh_env(p.lifted["bump"])
+            proc = H.read_procedure(p.lifted["bump"].source, env, None,
+                                    ["result == result"])
+            out = []
+            for _, tid, heap, used, n in CORPUS:
+                term = H.app(proc.fn_term, H.array(B), H.array(S), H.array(O),
+                             L.numeral(tid), L.numeral(heap),
+                             L.numeral(used), L.numeral(n))
+                out.append(_nat(term, env, L))
+            return out
+        self.assertEqual(_in_big_stack(work), binary)
+
+    def test_contracts_are_proved(self):
+        # `bump`'s `used <= result` is alloc_eq.py's `bump_monotone`
+        self.assertTrue(self.prover.contract("bump"))
+        self.assertTrue(self.prover.contract("slot_ok"))
+
+    def test_bump_bounded(self):
+        """alloc_eq.py's `bump_bounded`, proved the way alloc_eq.py proves
+        it -- but about the model lifted from alloc.rs, not a hand copy."""
+        H, L, p = self.prover.H, self.prover.L, self.prover
+        lifted = p.lifted["bump"]
+
+        def work():
+            env, sig = p.fresh_env(lifted)
+            H.read_procedure(lifted.source, env, sig, ["result == result"])
+            V = L.Var
+            size = H.app("nth", H.NAT, L.numeral(0), V("sizes"), V("heap"))
+            bumped = H.app("bump", V("bases"), V("sizes"), V("owners"),
+                           V("tid"), V("heap"), V("used"), V("n"))
+            opened = H.unfold(bumped, env, {"bump"})
+            hyp = H.app("Holds", H.app("leb", V("used"), size))
+            goal = H.app("Holds", H.app("leb", opened, size))
+            proof = H.bound_by_ites_or_guards(env, goal, V("h"), hyp)
+            stmt = H.arrow(hyp, H.app("Holds", H.app("leb", bumped, size)))
+            term = L.Lambda("h", hyp, proof)
+            params = [("bases", H.BYTES), ("sizes", H.BYTES),
+                      ("owners", H.BYTES), ("tid", H.NAT), ("heap", H.NAT),
+                      ("used", H.NAT), ("n", H.NAT)]
+            for name, ty in reversed(params):
+                stmt, term = L.Pi(name, ty, stmt), L.Lambda(name, ty, term)
+            H.prove(stmt, term, env, verbose=False)
+            return True
+        self.assertTrue(_in_big_stack(work))
+
+    def test_only_the_overflow_obligations_are_open(self):
+        open_now = set()
+        for name in self.prover.lifted:
+            for label, ok in self.prover.safety(name):
+                if not ok:
+                    open_now.add((name, label))
+        self.assertEqual(open_now, ALLOC_OPEN)
 
 
 if __name__ == "__main__":
