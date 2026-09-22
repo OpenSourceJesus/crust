@@ -54,6 +54,8 @@ action maps / device graphs).
 | Other `Quaternion.*` (not Euler / identity / LookRotation / Slerp / Inverse / Angle) | Pack-time **CS0117** (`Quaternion` in scope via `using UnityEngine`) |
 | `File.WriteAllText(path, text)` | `fopen` write (`"w"`); creates parent dirs when possible |
 | `File.AppendAllText(path, text)` | `fopen` append (`"a"`); creates parent dirs when possible |
+| `File.WriteAllBytes(path, bytes)` | `fopen` write (`"wb"`) + `fwrite`; `byte[]` → `ByteArray`; `new byte[]{…}` → static buffer helper |
+| `File.ReadAllBytes(path)` | `fopen` read (`"rb"`) + chunked `fread` → malloc'd `ByteArray` (`.Length` / `[i]` lowered) |
 | `File.Exists(path)` | `fopen` probe (`"rb"`) → 1 / 0 (dirs fail like .NET) |
 | Other `File.*` | Pack-time **CS0117** (`File` in scope via `using System.IO`) |
 

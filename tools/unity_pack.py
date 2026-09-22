@@ -51,7 +51,10 @@ def _assets_rel_path(path):
 
 
 # System.IO.File members we emit. Others → CS0117 (File is in scope via using).
-_FILE_SUPPORTED = frozenset({"WriteAllText", "AppendAllText", "Exists"})
+_FILE_SUPPORTED = frozenset({
+    "WriteAllText", "AppendAllText", "WriteAllBytes", "ReadAllBytes",
+    "Exists", "Delete",
+})
 
 # UnityEngine.Application members we emit. Others → CS0117.
 _APPLICATION_SUPPORTED = frozenset({
@@ -288,6 +291,8 @@ _API = {
     "Application.OpenURL": True,
     "File.WriteAllText": True,
     "File.AppendAllText": True,
+    "File.WriteAllBytes": True,
+    "File.ReadAllBytes": True,
     "File.Exists": True,
 }
 
@@ -4384,6 +4389,10 @@ def analyze_script(path, text=None):
         apis.add("File.WriteAllText")
     if re.search(r"(?:System\.IO\.)?File\.AppendAllText\s*\(", scan):
         apis.add("File.AppendAllText")
+    if re.search(r"(?:System\.IO\.)?File\.WriteAllBytes\s*\(", scan):
+        apis.add("File.WriteAllBytes")
+    if re.search(r"(?:System\.IO\.)?File\.ReadAllBytes\s*\(", scan):
+        apis.add("File.ReadAllBytes")
     if re.search(r"(?:System\.IO\.)?File\.Exists\s*\(", scan):
         apis.add("File.Exists")
     # C# string + value must not become C pointer arithmetic.
@@ -5039,6 +5048,15 @@ def emit_engine(plan, analyses, used_apis):
     want_math = bool(used_apis & {"Mathf.Sin", "Mathf.Cos"})
     want_live_rot = bool(plan.get("live_rot_classes"))
     want_transform_matrix = bool(plan.get("transform_matrix_classes"))
+    want_quat_angle = "Quaternion.Angle" in used_apis
+    if ("File.WriteAllBytes" in used_apis
+            or "File.ReadAllBytes" in used_apis):
+        if "File.WriteAllBytes" in used_apis:
+            plan["byte_array_lits"] = _collect_byte_array_lits(
+                plan, analyses)
+        else:
+            plan["byte_array_lits"] = []
+        plan["_byte_array_lit_i"] = [0]
     getcomponent_types = set()
     for a in analyses:
         getcomponent_types |= set(a.get("getcomponent_types") or [])
@@ -5097,6 +5115,9 @@ def emit_engine(plan, analyses, used_apis):
     want_app_open_url = "Application.OpenURL" in used_apis
     want_file_write = "File.WriteAllText" in used_apis
     want_file_append = "File.AppendAllText" in used_apis
+    want_file_write_bytes = "File.WriteAllBytes" in used_apis
+    want_file_read_bytes = "File.ReadAllBytes" in used_apis
+    want_file_bytes = want_file_write_bytes or want_file_read_bytes
     want_file_exists = "File.Exists" in used_apis
     want_file_write_ops = want_file_write or want_file_append
     want_file_io = want_file_write_ops or want_file_exists
@@ -5687,8 +5708,44 @@ def emit_engine(plan, analyses, used_apis):
     if not want_persistent_data_path:
         p("const char *engine_persistent_data_path(void) { return \"\"; }")
         p("")
-    if want_file_write_ops:
-        if not want_log:
+    if want_file_write_ops or want_file_read_bytes:
+        if want_file_bytes:
+            p("/* System.IO byte[] → ByteArray (WriteAllBytes / ReadAllBytes) */")
+            p("typedef struct {")
+            p("    const unsigned char *data;")
+            p("    int length;")
+            p("} ByteArray;")
+            p("")
+        if want_file_write_ops:
+            p("/* System.IO.File.WriteAllText / AppendAllText / WriteAllBytes */")
+            if not want_log:
+                p("#ifndef CRUST_NO_POSIX_MKDIR")
+                p("static int _engine_mkdir_p(char *path) {")
+                p("    char *p;")
+                p("    if (!path || !path[0]) return -1;")
+                p("    for (p = path + 1; *p; p++) {")
+                p("#ifdef _WIN32")
+                p("        if (*p == '/' || *p == '\\\\') {")
+                p("#else")
+                p("        if (*p == '/') {")
+                p("#endif")
+                p("            char sep = *p;")
+                p("            *p = 0;")
+                p("            if (ENGINE_MKDIR(path) != 0 && errno != EEXIST) {")
+                p("                *p = sep; return -1;")
+                p("            }")
+                p("            *p = sep;")
+                p("        }")
+                p("    }")
+                p("    if (ENGINE_MKDIR(path) != 0 && errno != EEXIST) return -1;")
+                p("    return 0;")
+                p("}")
+                p("#endif")
+                p("")
+            p("static void File_WriteContents(const char *path,")
+            p("                               const char *contents,")
+            p("                               const char *mode) {")
+            p("    FILE *fp;")
             p("#ifndef CRUST_NO_POSIX_MKDIR")
             p("    char dir[1024];")
             p("    int n, i;")
@@ -5715,48 +5772,102 @@ def emit_engine(plan, analyses, used_apis):
             p("    if (contents) fputs(contents, fp);")
             p("    fclose(fp);")
             p("}")
-            p("#endif")
-            p("")
-        p("/* System.IO.File.WriteAllText / AppendAllText */")
-        p("static void File_WriteContents(const char *path,")
-        p("                               const char *contents,")
-        p("                               const char *mode) {")
-        p("    FILE *fp;")
-        p("#ifndef CRUST_NO_POSIX_MKDIR")
-        p("    char dir[1024];")
-        p("    int n, i;")
-        p("    if (path && path[0]) {")
-        p("        n = (int)strlen(path);")
-        p("        if (n > 0 && (size_t)n < sizeof dir) {")
-        p("            for (i = 0; i < n; i++) dir[i] = path[i];")
-        p("            dir[n] = 0;")
-        p("            for (i = n - 1; i >= 0; i--) {")
-        p("#ifdef _WIN32")
-        p("                if (dir[i] == '/' || dir[i] == '\\\\') {")
-        p("                    dir[i] = 0; break;")
-        p("                }")
-        p("#else")
-        p("                if (dir[i] == '/') { dir[i] = 0; break; }")
-        p("#endif")
-        p("            }")
-        p("            if (dir[0]) _engine_mkdir_p(dir);")
-        p("        }")
-        p("    }")
-        p("#endif")
-        p("    fp = fopen(path ? path : \"\", mode ? mode : \"w\");")
-        p("    if (!fp) return;")
-        p("    if (contents) fputs(contents, fp);")
-        p("    fclose(fp);")
-        p("}")
-        if want_file_write:
-            p("static void File_WriteAllText(const char *path,")
-            p("                              const char *contents) {")
-            p("    File_WriteContents(path, contents, \"w\");")
-            p("}")
-        if want_file_append:
-            p("static void File_AppendAllText(const char *path,")
-            p("                               const char *contents) {")
-            p("    File_WriteContents(path, contents, \"a\");")
+            if want_file_write:
+                p("static void File_WriteAllText(const char *path,")
+                p("                              const char *contents) {")
+                p("    File_WriteContents(path, contents, \"w\");")
+                p("}")
+            if want_file_append:
+                p("static void File_AppendAllText(const char *path,")
+                p("                               const char *contents) {")
+                p("    File_WriteContents(path, contents, \"a\");")
+                p("}")
+            if want_file_write_bytes:
+                p("static void File_WriteAllBytes(const char *path, ByteArray bytes) {")
+                p("    FILE *fp;")
+                p("#ifndef CRUST_NO_POSIX_MKDIR")
+                p("    char dir[1024];")
+                p("    int n, i;")
+                p("    if (path && path[0]) {")
+                p("        n = (int)strlen(path);")
+                p("        if (n > 0 && (size_t)n < sizeof dir) {")
+                p("            for (i = 0; i < n; i++) dir[i] = path[i];")
+                p("            dir[n] = 0;")
+                p("            for (i = n - 1; i >= 0; i--) {")
+                p("#ifdef _WIN32")
+                p("                if (dir[i] == '/' || dir[i] == '\\\\') {")
+                p("                    dir[i] = 0; break;")
+                p("                }")
+                p("#else")
+                p("                if (dir[i] == '/') { dir[i] = 0; break; }")
+                p("#endif")
+                p("            }")
+                p("            if (dir[0]) _engine_mkdir_p(dir);")
+                p("        }")
+                p("    }")
+                p("#endif")
+                p("    fp = fopen(path ? path : \"\", \"wb\");")
+                p("    if (!fp) return;")
+                p("    if (bytes.data && bytes.length > 0)")
+                p("        fwrite(bytes.data, 1, (size_t)bytes.length, fp);")
+                p("    fclose(fp);")
+                p("}")
+                # Literal helpers collected while lowering method bodies.
+                for bi, nums in enumerate(plan.get("byte_array_lits") or []):
+                    if not nums:
+                        p("static unsigned char _engine_ba_%d_data[1] = { 0 };"
+                          % bi)
+                        p("static ByteArray _engine_ba_%d(void) {" % bi)
+                        p("    ByteArray b;")
+                        p("    b.data = _engine_ba_%d_data;" % bi)
+                        p("    b.length = 0;")
+                        p("    return b;")
+                        p("}")
+                    else:
+                        p("static unsigned char _engine_ba_%d_data[%d] = { %s };"
+                          % (bi, len(nums),
+                             ", ".join(str(int(x) & 0xFF) for x in nums)))
+                        p("static ByteArray _engine_ba_%d(void) {" % bi)
+                        p("    ByteArray b;")
+                        p("    b.data = _engine_ba_%d_data;" % bi)
+                        p("    b.length = %d;" % len(nums))
+                        p("    return b;")
+                        p("}")
+        if want_file_read_bytes:
+            p("/* System.IO.File.ReadAllBytes — malloc buffer (no free). */")
+            p("static ByteArray File_ReadAllBytes(const char *path) {")
+            p("    ByteArray out;")
+            p("    FILE *fp;")
+            p("    unsigned char chunk[4096];")
+            p("    unsigned char *buf;")
+            p("    size_t cap, len, n;")
+            p("    out.data = 0;")
+            p("    out.length = 0;")
+            p("    if (!path || !path[0]) return out;")
+            p("    fp = fopen(path, \"rb\");")
+            p("    if (!fp) return out;")
+            p("    cap = 4096;")
+            p("    len = 0;")
+            p("    buf = (unsigned char *)malloc(cap);")
+            p("    if (!buf) { fclose(fp); return out; }")
+            p("    for (;;) {")
+            p("        n = fread(chunk, 1, sizeof chunk, fp);")
+            p("        if (n == 0) break;")
+            p("        if (len + n > cap) {")
+            p("            cap = cap + n + 4096;")
+            p("            {")
+            p("                unsigned char *nb = (unsigned char *)realloc(buf, cap);")
+            p("                if (!nb) { free(buf); fclose(fp); return out; }")
+            p("                buf = nb;")
+            p("            }")
+            p("        }")
+            p("        memcpy(buf + len, chunk, n);")
+            p("        len += n;")
+            p("    }")
+            p("    fclose(fp);")
+            p("    out.data = buf;")
+            p("    out.length = (int)len;")
+            p("    return out;")
             p("}")
         p("")
     if want_file_exists:
@@ -9625,6 +9736,80 @@ def _rewrite_csharp_float_literals(text):
     return "".join(out)
 
 
+def _parse_byte_array_lit_inner(inner):
+    """Parse `1, 2, 0xFF` inside `new byte[] { ... }` → list of 0..255 ints."""
+    nums = []
+    for part in (inner or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        part = re.sub(r"[fFdDmMuUlL]+$", "", part)
+        if re.match(r"0[xX][0-9a-fA-F]+$", part):
+            nums.append(int(part, 16) & 0xFF)
+        elif re.match(r"0[bB][01]+$", part):
+            nums.append(int(part, 2) & 0xFF)
+        elif "." in part:
+            nums.append(int(float(part)) & 0xFF)
+        else:
+            nums.append(int(part, 10) & 0xFF)
+    return nums
+
+
+_NEW_BYTE_ARRAY_LIT = re.compile(
+    r"new\s+byte\s*\[\s*\]\s*\{([^}]*)\}", re.S)
+
+
+def _collect_byte_array_lits(plan, analyses):
+    """All `new byte[] { ... }` literals in emitted method bodies (stable order).
+
+    Order matches emit_engine: sorted class names, then methods_by pairs,
+    skipping Awake/OnEnable and ctor_forbidden scripts (same as lowering).
+    """
+    methods_by = {}
+    for a in analyses or []:
+        for c in a.get("classes") or []:
+            methods_by.setdefault(c["name"], []).extend(
+                [(c, m) for m in c.get("methods") or []])
+    lits = []
+    for cname, cl in sorted((plan.get("classes") or {}).items()):
+        if cl.get("ctor_forbidden"):
+            continue
+        for _c, m in methods_by.get(cname, []):
+            if m.get("name") in ("Awake", "OnEnable"):
+                continue
+            body = m.get("body") or ""
+            for match in _NEW_BYTE_ARRAY_LIT.finditer(body):
+                lits.append(_parse_byte_array_lit_inner(match.group(1)))
+    return lits
+
+
+def _rewrite_byte_array_lits(text, plan):
+    """new byte[] { a, b } → _engine_ba_N() (helpers emitted in engine.c)."""
+    counter = plan.get("_byte_array_lit_i")
+    if counter is None:
+        return text
+
+    def repl(_m):
+        i = counter[0]
+        counter[0] = i + 1
+        return "_engine_ba_%d()" % i
+
+    return _NEW_BYTE_ARRAY_LIT.sub(repl, text)
+
+
+def _rewrite_bytearray_member_access(text):
+    """ByteArray locals: .Length → .length; [i] → .data[i]."""
+    names = set(re.findall(r"\bByteArray\s+(\w+)\b", text))
+    for name in names:
+        text = re.sub(
+            r"(?<![.\w])%s\.Length\b" % re.escape(name),
+            "%s.length" % name, text)
+        text = re.sub(
+            r"(?<![.\w])%s\s*\[(.*?)\]" % re.escape(name),
+            r"%s.data[\1]" % name, text)
+    return text
+
+
 def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     """C# subset method → C against packed arrays.
 
@@ -9635,6 +9820,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     idn = _c_ident(cl["name"])
     text = _rewrite_csharp_float_literals(body)
     text = re.sub(r"\bthis\.", "", text)
+    text = _rewrite_byte_array_lits(text, plan)
     text = _rewrite_extensions_set_world_scale(text, cl, plan)
     text = _rewrite_rigidbody_assigns(text, plan, cl["name"])
     text = _rewrite_transform_rotate(text, cl)
@@ -9693,6 +9879,12 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = re.sub(
         r"(?:System\.IO\.)?File\.AppendAllText\s*\(",
         "File_AppendAllText(", text)
+    text = re.sub(
+        r"(?:System\.IO\.)?File\.WriteAllBytes\s*\(",
+        "File_WriteAllBytes(", text)
+    text = re.sub(
+        r"(?:System\.IO\.)?File\.ReadAllBytes\s*\(",
+        "File_ReadAllBytes(", text)
     text = re.sub(
         r"(?:System\.IO\.)?File\.Exists\s*\(",
         "File_Exists(", text)

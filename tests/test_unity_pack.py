@@ -506,13 +506,20 @@ class TestSystems(unittest.TestCase):
             unity_pack.analyze_script(path, fqn)
         self.assertIn("CS0117", cm.exception.message)
         self.assertIn("ReadAllText", cm.exception.message)
-        # Supported WriteAllText / AppendAllText / Exists still analyze.
+        # Supported WriteAllText / AppendAllText / WriteAllBytes /
+        # ReadAllBytes / Exists / Delete.
         unity_pack.analyze_script(
             path, src.replace("ReadAllText(\"a.txt\")",
                               "WriteAllText(\"a.txt\", \"x\")"))
         unity_pack.analyze_script(
             path, src.replace("ReadAllText(\"a.txt\")",
                               "AppendAllText(\"a.txt\", \"x\")"))
+        unity_pack.analyze_script(
+            path, src.replace("ReadAllText(\"a.txt\")",
+                              "WriteAllBytes(\"a.bin\", new byte[] { 1 })"))
+        unity_pack.analyze_script(
+            path, src.replace("ReadAllText(\"a.txt\")",
+                              "ReadAllBytes(\"a.bin\")"))
         unity_pack.analyze_script(
             path, src.replace("ReadAllText(\"a.txt\")",
                               "Exists(\"a.txt\")"))
