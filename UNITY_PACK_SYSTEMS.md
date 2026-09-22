@@ -5,8 +5,9 @@ project. It **does not invent assets**: no synthetic ParticleSystem
 pools, no default AnimationCurves, no scripted UI invent, no InputAction maps.
 Runtime `AddComponent<T>()` works for packed builtins (Camera, Light,
 SpriteRenderer, Rigidbody/2D, Box/Circle/Sphere colliders, Animation,
-Animator) and for authored MonoBehaviours — GetOrAdd into a
-pre-sized pool (one spare slot per calling instance). Authored scene
+Animator, AudioSource) and for authored MonoBehaviours — GetOrAdd into a
+pre-sized pool (one spare slot per calling instance). AudioSource allows
+multiple sources on one GO (Unity does not DisallowMultiple). Authored scene
 Canvas + Image/Button/TextMeshProUGUI
 are drawn; `using UnityEngine.UI` and Image/Button fields are allowed. Scripted invent
 (`AddComponent<Canvas>`, `typeof(Canvas)`, `ForceUpdateCanvases`) stays refused. Scripts that need
@@ -316,9 +317,10 @@ AABB of the OBB (authored `m_LocalRotation`). No PolygonCollider2D yet.
 | Script uses | Emitted |
 |-------------|---------|
 | `gameObject.AddComponent<T>()` / `AddComponent<T>()` | `GameObject_AddComponent_T(go)` — GetOrAdd |
-| Builtin `T` (Camera, Light, SpriteRenderer, RB, colliders) | Pre-sized pool; returns existing if already on the GO |
+| Builtin `T` (Camera, Light, SpriteRenderer, RB, colliders, AudioSource) | Pre-sized pool; returns existing if already on the GO (AudioSource always adds) |
 | Authored MonoBehaviour `T` | Spare instance slots (`n` + budget); mutable GO map |
 | `Console.WriteLine(component)` | `T_ToString(index)` → `"name (UnityEngine.T)"` |
+| `audio.Play` / `Stop` / `volume` / `loop` / `clip` | Host-observable `_AudioSource_*` tables (clip = opaque index; `null` → `-1`) |
 
 Pool budget is one slot per instance of each class that calls `AddComponent<T>`
 (so Update-loop calls reuse the same component). `AddComponent<ParticleSystem>` /
