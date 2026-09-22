@@ -329,6 +329,32 @@ Pool budget is one slot per instance of each class that calls `AddComponent<T>`
 (so Update-loop calls reuse the same component). `AddComponent<ParticleSystem>` /
 `Canvas` / etc. remain refused.
 
+## Instantiate
+
+| Script uses | Emitted |
+|-------------|---------|
+| `Instantiate(this)` | `Object_Instantiate_T(i, -1)` — new GO + cloned MB fields |
+| `Instantiate(this, parent)` | `Object_Instantiate_T(i, parent_go)` — parent Transform ≡ GO index |
+| Typed `T x = Instantiate(this…)` | `int x = Object_Instantiate_T(…)` |
+
+Pool + GO spare budget is one slot per authored instance of each class that
+calls `Instantiate(this…)`. Clones copy packed struct fields (and SoA pos),
+name `"(Clone)"`, and wire live `_engine_go_T` / parent tables. Prefab /
+position / rotation overloads stay unlowered (public helpers that still
+contain them are stubbed).
+
+## GetComponentsInChildren
+
+| Script uses | Emitted |
+|-------------|---------|
+| `GetComponentsInChildren<T>()` / `(true\|false)` | `std::vector<int> = GameObject_GetComponentsInChildren_T(go, incl)` |
+| `recv.GetComponentsInChildren<T>()` | Same; `recv` is this / Transform / packed MB → owner GO |
+| `arr.Length` | `arr.size()` |
+| `Renderer` | Aliased to authored `SpriteRenderer` GO map |
+
+Walks live `_engine_go_parent` (self + descendants). Packed MonoBehaviours and
+known builtins (`SpriteRenderer`, RB, uGUI, …) only — unknown `T` → CS0246.
+
 ## Refused (would invent assets / components)
 
 | Script uses | Why refused |
