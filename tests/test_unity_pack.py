@@ -3075,6 +3075,8 @@ class TestSystems(unittest.TestCase):
         self.assertIn("LogAverageFPS_LOG_FILE_PATH_SUFFIX", eng)
         self.assertIn("LogAverageFPS_Update", eng)
         self.assertIn("LogAverageFPS_Start", eng)
+        self.assertIn("LogAverageFPS_set_timeLeft", eng)
+        self.assertIn("f32_to_f16", eng)
         self.assertNotIn(
             "Application_persistentDataPath() + LogAverageFPS_LOG_FILE_PATH",
             eng)
@@ -3127,7 +3129,6 @@ class TestSystems(unittest.TestCase):
                 "guid: f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1}\n"
             )
         d = tempfile.mkdtemp(prefix="upack-fpsline-out-")
-        # Overwrite is layout-independent; avoid solo --soa f16 (no float setters).
         plan = unity_pack.pack(root, d)
         with open(os.path.join(d, "engine.c")) as f:
             eng = f.read()
@@ -4844,6 +4845,133 @@ class TestSystems(unittest.TestCase):
             eng = f.read()
         self.assertIn("GameObject_GetComponent_Canvas", eng)
         self.assertIn("GameObject_GetComponent_RectTransform", eng)
+        self.assertIn("static int _engine_go_Canvas[", eng)
+        self.assertNotIn("static const int _engine_go_Canvas[", eng)
+
+    def test_getcomponent_prefab_mb_is_live(self):
+        """GetComponent<T> for a prefab-authored MB uses a live GO map."""
+        root = tempfile.mkdtemp(prefix="upack-gc-prefab-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "D2dFracturer.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class D2dFracturer : MonoBehaviour {\n"
+                "    public float damageRequired = 100f;\n"
+                "    public void Fracture() { damageRequired = 0f; }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "D2dFracturer.cs.meta"), "w") as f:
+            f.write("guid: 98209ab08e5ab0e4bb6d18d7bc0ad690\n")
+        with open(os.path.join(scripts, "Player.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Player : MonoBehaviour {\n"
+                "    public D2dFracturer fracturer;\n"
+                "    public void Death() {\n"
+                "        fracturer = GetComponent<D2dFracturer>();\n"
+                "        int go = 0;\n"
+                "        fracturer = go.GetComponent<D2dFracturer>();\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Player.cs.meta"), "w") as f:
+            f.write("guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n")
+        prefabs = os.path.join(root, "Assets", "Prefabs")
+        os.makedirs(prefabs)
+        with open(os.path.join(prefabs, "Chunk.prefab"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Chunk\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "--- !u!4 &11\nTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_LocalPosition: {x: 1, y: 2, z: 0}\n"
+                "--- !u!114 &12\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: 98209ab08e5ab0e4bb6d18d7bc0ad690}\n"
+                "  damageRequired: 100\n"
+            )
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Player\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-out-")
+        plan = unity_pack.pack(root, d)
+        self.assertIn("D2dFracturer", plan["classes"])
+        self.assertGreaterEqual(plan["classes"]["D2dFracturer"]["n"], 1)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("GameObject_GetComponent_D2dFracturer", eng)
+        self.assertIn("static int _engine_go_D2dFracturer[", eng)
+        self.assertNotIn("static const int _engine_go_D2dFracturer[", eng)
+        self.assertIn(
+            "GameObject_GetComponent_D2dFracturer(_engine_go_of_Player(i))",
+            eng)
+        self.assertIn("GameObject_GetComponent_D2dFracturer(go)", eng)
+        # Shallow: Fracture body not lowered from the vendor-style target.
+        self.assertNotIn("D2dFracturer_Fracture", eng)
+
+
+    def test_crust_undeclared_setter_maps_to_csharp_site(self):
+        """Missing Class_set_field in crust output → CS0103 at the C# field."""
+        src = (
+            "using UnityEngine;\n"
+            "public class LogAverageFPS : MonoBehaviour {\n"
+            "    float timeLeft;\n"
+            "    void Update() { timeLeft -= Time.deltaTime; }\n"
+            "}\n"
+        )
+        analyses = [{
+            "path": "/proj/Assets/Scripts/LogAverageFPS.cs",
+            "classes": [{
+                "name": "LogAverageFPS",
+                "file_text": src,
+            }],
+        }]
+        err = (
+            "\x1b[1m/tmp/upack-crust-x/tu.c:1492:7: \x1b[31merror:\x1b[0m "
+            "use of undeclared identifier 'LogAverageFPS_set_timeLeft'\n"
+        )
+        msg = unity_pack._crust_error_to_unity(err, analyses=analyses)
+        self.assertIn("error CS0103", msg)
+        self.assertIn("timeLeft", msg)
+        self.assertIn("Assets/Scripts/LogAverageFPS.cs(", msg)
+        self.assertNotIn("/tmp/", msg)
+        self.assertNotIn("tu.c", msg)
+
+
+    def test_methods_in_skips_else_if(self):
+        """`else if (...) {` must not become a method named if."""
+        src = (
+            "using UnityEngine;\n"
+            "public class P : MonoBehaviour {\n"
+            "    int x, y;\n"
+            "    void Update() {\n"
+            "        else if (x) { y = 1; }\n"
+            "        if (y) { x = 0; }\n"
+            "    }\n"
+            "}\n"
+        )
+        a = unity_pack.analyze_script("/proj/Assets/P.cs", src)
+        names = [m["name"] for m in a["classes"][0]["methods"]]
+        self.assertEqual(names, ["Update"])
+        self.assertNotIn("if", names)
+
 
     def test_ast_find_getcomponent_chain(self):
         """cpprust paren/angle parse of Find().GetComponent<T>().field."""
