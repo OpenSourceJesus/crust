@@ -30,3 +30,13 @@ tools/drm_shim/auto/
 .litehtml_cache/
 # built by runtime/crust_re_difftest.py
 runtime/crust_re_difftest.bin
+# Unity pack example projects: C# scripts only (assets/scenes/etc. stay local)
+examples/unity_pack/MiniScene/**
+examples/unity_pack/SystemsScene/**
+examples/unity_pack/Slime Jump/**
+!examples/unity_pack/MiniScene/**/
+!examples/unity_pack/SystemsScene/**/
+!examples/unity_pack/Slime Jump/**/
+!examples/unity_pack/MiniScene/**/*.cs
+!examples/unity_pack/SystemsScene/**/*.cs
+!examples/unity_pack/Slime Jump/**/*.cs
