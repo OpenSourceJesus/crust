@@ -5011,6 +5011,21 @@ def analyze_script(path, text=None, shallow=False):
             r"(?<![\w.])(?:System\.Collections\.Generic\.)?SortedList\s*<",
             scan):
         apis.add("SortedList")
+    findobject_types = set()
+    singleton_instance_types = set()
+    for m in re.finditer(
+            r"(?:UnityEngine\.)?(?:Object\.)?FindObjectOfType\s*<\s*(\w+)\s*>",
+            scan):
+        apis.add("FindObjectOfType")
+        findobject_types.add(m.group(1))
+    for m in re.finditer(
+            r"(?<![\w.])(\w+)\s*\.\s*(?:Instance|instance)\b", scan):
+        # CosmeticsMenu.Instance — not foo.instance unless type-like name.
+        tname = m.group(1)
+        if tname[:1].isupper():
+            apis.add("Singleton.Instance")
+            singleton_instance_types.add(tname)
+            findobject_types.add(tname)  # Instance getter needs FindObjectOfType
     # Keyboard lives in UnityEngine.InputSystem — only when in scope.
     has_input_system = bool(
         re.search(r"using\s+UnityEngine\.InputSystem\b", scan)
@@ -5158,6 +5173,8 @@ def analyze_script(path, text=None, shallow=False):
         "keyboard_keys": keyboard_keys,
         "getcomponent_types": getcomponent_types,
         "addcomponent_types": addcomponent_types,
+        "findobject_types": findobject_types,
+        "singleton_instance_types": singleton_instance_types,
         "classes": classes,
         "literals": [int(x) for x in re.findall(r"(?<![\w.])(\d+)", scan)
                      if int(x) < 1 << 20],
@@ -5264,8 +5281,8 @@ def _fields_in(body, bscan, body_abs=0):
     for m in re.finditer(
             r"(?m)^[ \t]*(?:public|private|protected|internal)?"
             r"[ \t]*(?:static[ \t]+)?(?:const[ \t]+)?(?:readonly[ \t]+)?"
-            # Types may be generics: Dictionary<int, int> / List<Foo>.
-            r"([\w.]+(?:\s*<[^>;{\n]+>)?)[ \t]+(\w+)[ \t]*(=|;)",
+            # Types may be generics: Dictionary<int, int> / List<Foo>, or T[].
+            r"([\w.]+(?:\s*<[^>;{\n]+>)?(?:\s*\[\s*\])?)[ \t]+(\w+)[ \t]*(=|;)",
             bscan):
         # `int F(` is a method.
         tail = body[m.end(2):m.end(2) + 16]
@@ -5366,6 +5383,7 @@ def _methods_in(body, bscan, body_abs=0):
             "body_abs": int(body_abs) + int(m.end()),
             "src": src,
             "public": bool(re.search(r"\bpublic\b", decl)),
+            "static": bool(re.search(r"\bstatic\b", decl)),
         })
     return out
 
@@ -5377,6 +5395,158 @@ _UNITY_EMIT_MESSAGES = frozenset({
     "OnCollisionEnter2D", "OnCollisionStay2D", "OnCollisionExit2D",
     "OnTriggerEnter2D", "OnTriggerStay2D", "OnTriggerExit2D",
 })
+
+
+def _param_c_ty(ty):
+    """C type for a C# method parameter."""
+    ty = (ty or "").split(".")[-1].strip()
+    if ty in ("float", "double"):
+        return "float"
+    if ty == "string":
+        return "const char *"
+    if ty in ("byte", "sbyte", "short", "ushort", "int", "uint", "long",
+              "ulong", "bool", "char"):
+        return "int"
+    # MonoBehaviour / component / enum handles → packed index.
+    return "int"
+
+
+def _method_c_params(args_str):
+    """C param list string from C# ``(byte amount, Cosmetic c)``."""
+    args_str = (args_str or "").strip()
+    if not args_str:
+        return ""
+    parts = []
+    for part in args_str.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        part = re.sub(r"\b(?:ref|out|in|params)\s+", "", part)
+        m = re.match(r"([\w.<>]+)\s+(\w+)\s*$", part)
+        if not m:
+            continue
+        parts.append("%s %s" % (_param_c_ty(m.group(1)), m.group(2)))
+    return ", ".join(parts)
+
+
+def _array_elem_name(ty):
+    """Element type from ``T[]``, or None."""
+    if not ty:
+        return None
+    m = re.match(r"^([\w.]+)\s*\[\s*\]\s*$", str(ty).strip())
+    return m.group(1).split(".")[-1] if m else None
+
+
+def _rewrite_mb_static_and_singleton(text, plan, cl):
+    """``Other.StaticMethod(`` / ``Other.Instance`` → packed C.
+
+    ``Instance`` / ``instance`` → ``Class_Instance()`` (live FindObjectOfType
+    cache), not a hardcoded slot. ``Instance.field`` uses that index.
+    """
+    this = cl.get("name")
+    methods_by = plan.get("_methods_by") or {}
+    singleton_types = set(plan.get("singleton_instance_types") or ())
+    for ocname, ocl in sorted((plan.get("classes") or {}).items(),
+                              key=lambda kv: -len(kv[0])):
+        oidn = _c_ident(ocname)
+        inst = "%s_Instance()" % oidn
+        use_inst = ocname in singleton_types or ocname in (
+            plan.get("findobject_types") or ())
+        # Other.Instance.field / Other.instance.field
+        for vf in ocl.get("vec2_fields") or []:
+            text = re.sub(
+                r"(?<![\w.])%s\s*\.\s*(?:Instance|instance)\s*\.\s*%s\b"
+                % (re.escape(ocname), re.escape(vf)),
+                "Vector2_make(%s_get_%s_x(%s), %s_get_%s_y(%s))"
+                % (oidn, vf, inst, oidn, vf, inst),
+                text)
+        member_names = {n for n, _t, _b, _k in (ocl.get("members") or [])}
+        for mem in sorted(member_names, key=len, reverse=True):
+            if mem.endswith("_x") or mem.endswith("_y") or mem.endswith("_z"):
+                continue
+            if mem.startswith("pos_"):
+                continue
+            text = re.sub(
+                r"(?<![\w.])%s\s*\.\s*(?:Instance|instance)\s*\.\s*%s\b"
+                % (re.escape(ocname), re.escape(mem)),
+                "%s_get_%s(%s)" % (oidn, mem, inst),
+                text)
+        for f in ocl.get("ref_array_fields") or []:
+            fname = f["name"]
+            text = re.sub(
+                r"(?<![\w.])%s\s*\.\s*(?:Instance|instance)\s*\.\s*%s\b"
+                % (re.escape(ocname), re.escape(fname)),
+                "%s_%s" % (oidn, fname),
+                text)
+            if ocname == this:
+                text = re.sub(
+                    r"(?<![\w.])%s\b" % re.escape(fname),
+                    "%s_%s" % (oidn, fname),
+                    text)
+        # Other.Instance / Other.instance as a value
+        if use_inst or ocname in (plan.get("classes") or {}):
+            text = re.sub(
+                r"(?<![\w.])%s\s*\.\s*(?:Instance|instance)\b(?!\s*\.)"
+                % re.escape(ocname),
+                inst, text)
+    # FindObjectOfType<T>() / FindObjectOfType<T>(bool)
+    for tname in sorted(plan.get("findobject_types") or (),
+                        key=len, reverse=True):
+        if tname not in (plan.get("classes") or {}):
+            continue
+        oidn = _c_ident(tname)
+        text = re.sub(
+            r"(?:UnityEngine\.)?(?:Object\.)?FindObjectOfType\s*<\s*%s\s*>"
+            r"\s*\(\s*\)" % re.escape(tname),
+            "Object_FindObjectOfType_%s(0)" % oidn, text)
+        text = re.sub(
+            r"(?:UnityEngine\.)?(?:Object\.)?FindObjectOfType\s*<\s*%s\s*>"
+            r"\s*\(\s*true\s*\)" % re.escape(tname),
+            "Object_FindObjectOfType_%s(1)" % oidn, text)
+        text = re.sub(
+            r"(?:UnityEngine\.)?(?:Object\.)?FindObjectOfType\s*<\s*%s\s*>"
+            r"\s*\(\s*false\s*\)" % re.escape(tname),
+            "Object_FindObjectOfType_%s(0)" % oidn, text)
+    for ocname, pairs in methods_by.items():
+        oidn = _c_ident(ocname)
+        for _c, m in pairs:
+            if not m.get("static"):
+                continue
+            mname = m["name"]
+            text = re.sub(
+                r"(?<![\w.])%s\s*\.\s*%s\s*\(" % (
+                    re.escape(ocname), re.escape(mname)),
+                "%s_%s(" % (oidn, mname), text)
+            if ocname == this:
+                text = re.sub(
+                    r"(?<![\w.])%s\s*\(" % re.escape(mname),
+                    "%s_%s(" % (oidn, mname), text)
+    return text
+
+
+def _rewrite_toggle_is_on(text):
+    """``arr[i].isOn = v`` / ``toggle.isOn`` → ``Toggle_set/get_isOn``.
+
+    Runs after singleton/ref-array rewrites so ``Instance.toggles[i].isOn``
+    is already ``Class_toggles[i].isOn``.
+    """
+    text = re.sub(
+        r"(\w+)\s*\[(.*?)\]\s*\.\s*isOn\s*=\s*([^;]+);",
+        r"Toggle_set_isOn(\1[\2], (\3));",
+        text, flags=re.DOTALL)
+    text = re.sub(
+        r"(?<![\w.])(\w+)\s*\.\s*isOn\s*=\s*([^;]+);",
+        r"Toggle_set_isOn(\1, (\2));",
+        text)
+    text = re.sub(
+        r"(\w+)\s*\[(.*?)\]\s*\.\s*isOn\b",
+        r"Toggle_get_isOn(\1[\2])",
+        text, flags=re.DOTALL)
+    text = re.sub(
+        r"(?<![\w.])(\w+)\s*\.\s*isOn\b",
+        r"Toggle_get_isOn(\1)",
+        text)
+    return text
 
 
 def _reachable_emit_methods(methods):
@@ -5623,8 +5793,11 @@ def plan_layouts(objects, analyses, two_d=None):
             if ty in _UI_COMPONENT_FIELD_TYPES:
                 # Authored uGUI / TMP refs — drawn from scene, not packed MB idx.
                 continue
-            if "[" in ty or ty == "AudioClip":
-                # Arrays / AudioClip assets — opaque handles later; skip pack.
+            if _array_elem_name(ty):
+                # Toggle[] / MB[] — parallel std::vector<int> of GO / inst idxs.
+                continue
+            if ty == "AudioClip":
+                # AudioClip assets — opaque handles later; skip pack.
                 continue
             if _list_elem_name(ty):
                 # Instance List<T> not packed in AoS; static Lists are class_consts.
@@ -5681,6 +5854,11 @@ def plan_layouts(objects, analyses, two_d=None):
             if not f.get("static") and not f.get("const")
             and _list_elem_name(f.get("ty") or "")
         ]
+        ref_array_fields = [
+            f for f in script_fields
+            if not f.get("static") and not f.get("const")
+            and _array_elem_name(f.get("ty") or "")
+        ]
         # Do not bake Application.* paths used in illegal field initializers.
         if ctor_forbidden:
             forbid_names = {x["field"] for x in ctor_forbidden}
@@ -5704,6 +5882,7 @@ def plan_layouts(objects, analyses, two_d=None):
             "class_consts": class_consts,
             "dict_fields": dict_fields,
             "list_fields": list_fields,
+            "ref_array_fields": ref_array_fields,
             "ctor_forbidden": ctor_forbidden,
             "script_path": script_path,
         }
@@ -5823,8 +6002,18 @@ def emit_engine(plan, analyses, used_apis):
             plan["byte_array_lits"] = []
         plan["_byte_array_lit_i"] = [0]
     getcomponent_types = set()
+    findobject_types = set()
+    singleton_instance_types = set()
     for a in analyses:
         getcomponent_types |= set(a.get("getcomponent_types") or [])
+        findobject_types |= set(a.get("findobject_types") or [])
+        singleton_instance_types |= set(a.get("singleton_instance_types") or [])
+    findobject_types |= singleton_instance_types
+    findobject_packed = sorted(
+        t for t in findobject_types if t in plan["classes"])
+    want_findobject = bool(findobject_packed) or (
+        "FindObjectOfType" in used_apis
+        or "Singleton.Instance" in used_apis)
     rb2d_list = plan.get("rigidbody2d") or []
     rb3d_list = plan.get("rigidbody") or []
     col2d_list = plan.get("collider2d") or []
@@ -5908,7 +6097,7 @@ def emit_engine(plan, analyses, used_apis):
     want_go_tables = (
         want_find or want_transform_find or want_transform_parent
         or want_transform_go or want_set_parent or want_get_sibling
-        or want_getcomponent
+        or want_getcomponent or want_findobject
         or want_rb2d or want_rb3d or want_add_any or want_ui or want_destroy)
     want_ctor_forbidden = any(
         bool(cl.get("ctor_forbidden"))
@@ -5934,20 +6123,26 @@ def emit_engine(plan, analyses, used_apis):
         p("#include <stdio.h>")
     want_list = "List" in used_apis
     want_dict = "Dictionary" in used_apis or "SortedList" in used_apis
+    want_ref_array = False
+    want_toggle_is_on = False
     want_map_string = False
-    if not want_list or not want_dict:
-        for cl in plan["classes"].values():
-            for f in (cl.get("class_consts") or []) + (cl.get("dict_fields") or []) + (
-                    cl.get("list_fields") or []):
-                if not want_list and _list_elem_name(f.get("ty") or ""):
-                    want_list = True
-                kv = _dict_kv_names(f.get("ty") or "")
-                if kv:
-                    want_dict = True
-                    if kv[0].split(".")[-1] == "string":
-                        want_map_string = True
-            if want_list and want_dict:
-                break
+    for cl in plan["classes"].values():
+        for f in (cl.get("class_consts") or []) + (cl.get("dict_fields") or []) + (
+                cl.get("list_fields") or []):
+            if not want_list and _list_elem_name(f.get("ty") or ""):
+                want_list = True
+            kv = _dict_kv_names(f.get("ty") or "")
+            if kv:
+                want_dict = True
+                if kv[0].split(".")[-1] == "string":
+                    want_map_string = True
+        if cl.get("ref_array_fields"):
+            want_ref_array = True
+            for f in cl["ref_array_fields"]:
+                if _array_elem_name(f.get("ty") or "") == "Toggle":
+                    want_toggle_is_on = True
+    if want_ref_array:
+        want_list = True  # std::vector for Toggle[] / MB[] tables
     if not want_map_string and want_dict:
         for cl in plan["classes"].values():
             for f in (cl.get("class_consts") or []) + (cl.get("dict_fields") or []):
@@ -5996,6 +6191,8 @@ def emit_engine(plan, analyses, used_apis):
     p("   T is incomplete, so the arrays wait until the structs exist;")
     p("   the names are all listed here as comments so data.c and any")
     p("   group can find them. */")
+    if _plan_needs_vector2(plan, used_apis):
+        _emit_vector2_struct(p)
     if _plan_needs_vector2int(plan, used_apis):
         _emit_vector2int_struct(p)
     if want_map_string:
@@ -6975,11 +7172,14 @@ def emit_engine(plan, analyses, used_apis):
             if not vals:
                 vals = ["-1"]
             mb_budget = int(add_budget.get(cname) or 0)
-            # Live GO→component map whenever GetComponent/AddComponent can run.
+            # Live GO→component map whenever GetComponent/AddComponent/
+            # FindObjectOfType can see runtime changes.
             live_go = (
                 mb_budget
                 or cname in getcomponent_types
-                or "GetComponent" in used_apis)
+                or cname in findobject_types
+                or "GetComponent" in used_apis
+                or want_findobject)
             if live_go:
                 p("static int _engine_go_%s[%d] = { %s };" % (
                     idn, len(vals), ", ".join(vals)))
@@ -7440,6 +7640,20 @@ def emit_engine(plan, analyses, used_apis):
             if col_ty in add_types:
                 _emit_simple_add(col_ty, unity_ty)
 
+    if want_toggle_is_on:
+        go_n = max(1, len(plan.get("go_names") or []) or 1)
+        p("/* UnityEngine.UI.Toggle.isOn — host-visible per GO index. */")
+        p("static int _Toggle_isOn[%d];" % go_n)
+        p("static void Toggle_set_isOn(int go, int v) {")
+        p("    if (go < 0 || go >= %d) return;" % go_n)
+        p("    _Toggle_isOn[go] = v ? 1 : 0;")
+        p("}")
+        p("static int Toggle_get_isOn(int go) {")
+        p("    if (go < 0 || go >= %d) return 0;" % go_n)
+        p("    return _Toggle_isOn[go];")
+        p("}")
+        p("")
+
     if (want_ui or want_transform_find or want_transform_parent
             or want_set_parent or want_get_sibling):
         go_names = plan.get("go_names") or []
@@ -7650,6 +7864,56 @@ def emit_engine(plan, analyses, used_apis):
                 p("    (void)i; (void)hit; (void)px; (void)py;")
                 p("    (void)sw; (void)sh; (void)pressed;")
             p("    _engine_pointer_was_down = engine_pointer_down;")
+            p("}")
+            p("")
+
+    # Object.FindObjectOfType / Type.Instance — after GO maps (and optional
+    # active-hierarchy helpers when want_ui).
+    if want_findobject and findobject_packed:
+        p("/* Object.FindObjectOfType<T> — first live component index */")
+        for cname in findobject_packed:
+            idn = _c_ident(cname)
+            p("static int Object_FindObjectOfType_%s(int includeInactive) {"
+              % idn)
+            p("    int go, ci;")
+            if not want_ui:
+                p("    (void)includeInactive;")
+            p("    for (go = 0; go < _engine_go_count; go = go + 1) {")
+            if want_destroy:
+                p("        if (_engine_go_destroyed[go]) continue;")
+            p("        ci = _engine_go_%s[go];" % idn)
+            p("        if (ci < 0) continue;")
+            if want_ui:
+                p("        if (!includeInactive")
+                p("            && !_engine_go_active_in_hierarchy(go))")
+                p("            continue;")
+            p("        return ci;")
+            p("    }")
+            p("    return -1;")
+            p("}")
+            p("")
+        for cname in sorted(singleton_instance_types):
+            if cname not in plan["classes"]:
+                continue
+            idn = _c_ident(cname)
+            p("/* %s.Instance — cache until destroyed / missing */"
+              % cname)
+            p("static int %s_instance = -1;" % idn)
+            p("static int %s_Instance(void) {" % idn)
+            p("    int go;")
+            p("    if (%s_instance >= 0) {" % idn)
+            p("        go = _engine_%s_go_of[%s_instance];" % (idn, idn))
+            p("        if (go >= 0 && go < _engine_go_count")
+            if want_destroy:
+                p("            && !_engine_go_destroyed[go]")
+            p("            && _engine_go_%s[go] == %s_instance)"
+              % (idn, idn))
+            p("            return %s_instance;" % idn)
+            p("        %s_instance = -1;" % idn)
+            p("    }")
+            p("    %s_instance = Object_FindObjectOfType_%s(1);"
+              % (idn, idn))
+            p("    return %s_instance;" % idn)
             p("}")
             p("")
 
@@ -8027,6 +8291,7 @@ def emit_engine(plan, analyses, used_apis):
             methods_by.setdefault(c["name"], []).extend(
                 [(c, m) for m in c["methods"]
                  if m["name"] not in ("Start",) or True])
+    plan["_methods_by"] = methods_by
 
     # MonoBehaviour OnCollision*2D(Collision2D) → dispatch after collide2d.
     collision2d_handlers = {}
@@ -8083,6 +8348,47 @@ def emit_engine(plan, analyses, used_apis):
         p("                               int world_stays);")
         p("")
 
+    # Collection / ref-array tables before any method body (cross-class use).
+    _emitted_coll = False
+    for cname, cl in sorted(plan["classes"].items()):
+        idn = _c_ident(cname)
+        cap = max(1, int(cl.get("n") or 0))
+        for f in cl.get("class_consts") or []:
+            if _list_elem_name(f.get("ty") or ""):
+                elem = _list_elem_name(f["ty"])
+                p("static std::vector<%s> %s_%s;" % (
+                    _list_elem_c_ty(elem, plan), idn, f["name"]))
+                _emitted_coll = True
+            elif _dict_kv_names(f.get("ty") or ""):
+                k, v = _dict_kv_names(f["ty"])
+                p("static std::map<%s, %s> %s_%s;" % (
+                    _collection_elem_c_ty(k, plan),
+                    _collection_elem_c_ty(v, plan),
+                    idn, f["name"]))
+                _emitted_coll = True
+        for f in cl.get("list_fields") or []:
+            elem = _list_elem_name(f.get("ty") or "")
+            if not elem:
+                continue
+            p("static std::vector<%s> %s_%s[%d];" % (
+                _list_elem_c_ty(elem, plan), idn, f["name"], cap))
+            _emitted_coll = True
+        for f in cl.get("ref_array_fields") or []:
+            p("static std::vector<int> %s_%s;" % (idn, f["name"]))
+            _emitted_coll = True
+        for f in cl.get("dict_fields") or []:
+            kv = _dict_kv_names(f.get("ty") or "")
+            if not kv:
+                continue
+            k, v = kv
+            p("static std::map<%s, %s> %s_%s[%d];" % (
+                _collection_elem_c_ty(k, plan),
+                _collection_elem_c_ty(v, plan),
+                idn, f["name"], cap))
+            _emitted_coll = True
+    if _emitted_coll:
+        p("")
+
     for cname, cl in sorted(plan["classes"].items()):
         idn = _c_ident(cname)
         p("/* ---- %s group: instance array is defined in data.c ---- */" % idn)
@@ -8120,34 +8426,12 @@ def emit_engine(plan, analyses, used_apis):
                         idn, fname, int(default)))
             elif f.get("ty") in ("StreamWriter", "StreamReader"):
                 p("static FILE *%s_%s;" % (idn, fname))
-            elif _list_elem_name(f.get("ty") or ""):
-                elem = _list_elem_name(f["ty"])
-                p("static std::vector<%s> %s_%s;" % (
-                    _list_elem_c_ty(elem, plan), idn, fname))
-            elif _dict_kv_names(f.get("ty") or ""):
-                k, v = _dict_kv_names(f["ty"])
-                p("static std::map<%s, %s> %s_%s;" % (
-                    _collection_elem_c_ty(k, plan),
-                    _collection_elem_c_ty(v, plan),
-                    idn, fname))
-        cap = max(1, int(cl.get("n") or 0))
-        for f in cl.get("list_fields") or []:
-            elem = _list_elem_name(f.get("ty") or "")
-            if not elem:
-                continue
-            p("static std::vector<%s> %s_%s[%d];" % (
-                _list_elem_c_ty(elem, plan), idn, f["name"], cap))
-        for f in cl.get("dict_fields") or []:
-            kv = _dict_kv_names(f.get("ty") or "")
-            if not kv:
-                continue
-            k, v = kv
-            p("static std::map<%s, %s> %s_%s[%d];" % (
-                _collection_elem_c_ty(k, plan),
-                _collection_elem_c_ty(v, plan),
-                idn, f["name"], cap))
-        if (cl.get("class_consts") or cl.get("list_fields")
-                or cl.get("dict_fields")):
+            # List / Dictionary / SortedList / ref arrays: preamble above.
+        if any(
+                f.get("ty") == "string"
+                or isinstance(f.get("default"), (int, float))
+                or f.get("ty") in ("StreamWriter", "StreamReader")
+                for f in (cl.get("class_consts") or [])):
             p("")
         # Position accessors: SoA table or AoS fields.
         if cl.get("soa_dims"):
@@ -8211,6 +8495,12 @@ def emit_engine(plan, analyses, used_apis):
             if coll_param:
                 p("static void %s_%s(unsigned i, int %s) {"
                   % (idn, m["name"], coll_param))
+            elif m.get("static"):
+                plist = _method_c_params(m.get("args") or "")
+                p("static void %s_%s(%s) {" % (
+                    idn, m["name"], plist if plist else "void"))
+                # Static bodies may still touch instance fields via bare names.
+                p("    unsigned i = 0;")
             else:
                 p("static void %s_%s(unsigned i) {" % (idn, m["name"]))
             for line in body.split("\n"):
@@ -9822,6 +10112,29 @@ def _rewrite_new_vector_assigns(text, idn, two_d=True):
     return text
 
 
+def _rewrite_local_position_vec2_fields(text, cl):
+    """Round-trip Vector2 fields ↔ live localPosition (packed pos tables)."""
+    idn = _c_ident(cl["name"])
+    for vf in cl.get("vec2_fields") or []:
+        load = (
+            "%s_set_%s_x(i, %s_get_pos_x(i)); "
+            "%s_set_%s_y(i, %s_get_pos_y(i));"
+            % (idn, vf, idn, idn, vf, idn))
+        store = (
+            "%s_set_pos_x(i, %s_get_%s_x(i)); "
+            "%s_set_pos_y(i, %s_get_%s_y(i));"
+            % (idn, idn, vf, idn, idn, vf))
+        text = re.sub(
+            r"(?<![_\w])%s\s*=\s*(?:this\s*\.\s*)?transform\s*\.\s*"
+            r"localPosition\s*;" % re.escape(vf),
+            load, text)
+        text = re.sub(
+            r"(?:this\s*\.\s*)?transform\s*\.\s*localPosition\s*=\s*"
+            r"(?<![_\w])%s\s*;" % re.escape(vf),
+            store, text)
+    return text
+
+
 def _rewrite_local_position_vec3_fields(text, cl):
     """Round-trip Vector3 fields ↔ live localPosition (packed pos tables)."""
     idn = _c_ident(cl["name"])
@@ -11118,6 +11431,16 @@ def _collection_elem_c_ty(elem, plan=None):
     return "int"
 
 
+def _plan_needs_vector2(plan, used_apis=None):
+    """Emit Vector2 when scripts use the type or pack Vector2 fields."""
+    if used_apis and "Vector2" in used_apis:
+        return True
+    for cl in (plan or {}).get("classes", {}).values():
+        if cl.get("vec2_fields"):
+            return True
+    return False
+
+
 def _plan_needs_vector2int(plan, used_apis=None):
     if used_apis and "Dictionary" in used_apis:
         pass  # may still need scan of tys
@@ -11132,6 +11455,21 @@ def _plan_needs_vector2int(plan, used_apis=None):
             if _list_elem_name(f.get("ty") or "") in _UNITY_INT_VECTOR_TYPES:
                 return True
     return False
+
+
+def _emit_vector2_struct(p):
+    """UnityEngine.Vector2 — C-compatible value type for locals / ctor calls."""
+    p("/* UnityEngine.Vector2 — packed fields still use _x/_y slots. */")
+    p("typedef struct Vector2 {")
+    p("    float x;")
+    p("    float y;")
+    p("} Vector2;")
+    p("static Vector2 Vector2_make(float ax, float ay) {")
+    p("    Vector2 v; v.x = ax; v.y = ay; return v;")
+    p("}")
+    p("static float Vector2_x(Vector2 v) { return v.x; }")
+    p("static float Vector2_y(Vector2 v) { return v.y; }")
+    p("")
 
 
 def _emit_vector2int_struct(p):
@@ -11340,6 +11678,34 @@ def _rewrite_list(text, plan, cl):
         r"(?<![\w.])(?:System\.Collections\.Generic\.)?List\s*<\s*([\w.]+)\s*>",
         repl_ty, text)
 
+    # OtherClass.staticList → OtherClass_staticList (before .Count / .Add).
+    for ocname, ocl in (plan.get("classes") or {}).items():
+        if ocname == cl.get("name"):
+            continue
+        oidn = _c_ident(ocname)
+        for f in ocl.get("class_consts") or []:
+            if not _list_elem_name(f.get("ty") or ""):
+                continue
+            fname = f["name"]
+            mangled = "%s_%s" % (oidn, fname)
+            text = re.sub(
+                r"(?<![\w.])%s\s*\.\s*%s\.Add\s*\(" % (
+                    re.escape(ocname), re.escape(fname)),
+                "%s.push_back(" % mangled, text)
+            text = re.sub(
+                r"(?<![\w.])%s\s*\.\s*%s\.Clear\s*\(\s*\)" % (
+                    re.escape(ocname), re.escape(fname)),
+                "%s.clear()" % mangled, text)
+            text = re.sub(
+                r"(?<![\w.])%s\s*\.\s*%s\.Count\b" % (
+                    re.escape(ocname), re.escape(fname)),
+                "%s.size()" % mangled, text)
+            text = re.sub(
+                r"(?<![\w.])%s\s*\.\s*%s\b" % (
+                    re.escape(ocname), re.escape(fname)),
+                mangled, text)
+            list_names.add(mangled)
+
     list_names |= set(re.findall(r"\bstd::vector<\w+>\s+(\w+)\b", text))
     for name in sorted(list_names, key=len, reverse=True):
         text = re.sub(
@@ -11494,12 +11860,16 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     """
     idn = _c_ident(cl["name"])
     text = _rewrite_csharp_float_literals(body)
+    text = re.sub(r"(?<![\w.])true\b", "1", text)
+    text = re.sub(r"(?<![\w.])false\b", "0", text)
     text = re.sub(r"\bthis\.", "", text)
     # Bare `this` is the packed instance index (Add(this), == this, …).
     text = re.sub(r"(?<![\w.])this(?![\w])", "i", text)
     # Dictionary before List so 2-arg Add is not eaten by List.push_back.
     text = _rewrite_dictionary(text, plan, cl)
     text = _rewrite_list(text, plan, cl)
+    text = _rewrite_mb_static_and_singleton(text, plan, cl)
+    text = _rewrite_toggle_is_on(text)
     text = _rewrite_byte_array_lits(text, plan)
     text = _rewrite_file_copy(text)
     text = _rewrite_file_text_streams(text, cl)
@@ -11518,6 +11888,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = _rewrite_transform_point(text, cl, plan)
     text = _rewrite_transform_matrices(text, cl, plan)
     text = _rewrite_transform_find(text, cl, plan)
+    text = _rewrite_local_position_vec2_fields(text, cl)
     text = _rewrite_local_position_vec3_fields(text, cl)
     # GameObject ≡ Transform index: drop redundant .transform on Find / GO.
     if plan.get("go_names"):
@@ -11550,6 +11921,9 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         text = re.sub(
             r"\b%s\b(?=\s+\w)" % re.escape(cname), "int", text)
     # API tokens before Vector2 rewrites so nested Mathf.Sin(...) keeps parens.
+    text = re.sub(
+        r"(?:UnityEngine\.)?GameObject\s*\.\s*Find\s*\(",
+        "GameObject_Find(", text)
     text = text.replace("Time.deltaTime", "Time_deltaTime")
     text = text.replace("Time.fixedDeltaTime", "Time_fixedDeltaTime")
     text = text.replace("Time.time", "Time_time")
@@ -11611,6 +11985,11 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         r"(?<![\w.])(?:Object\.)?Destroy\s*\(\s*this\s*\)",
         "Object_Destroy(_engine_go_of_%s(i))" % idn
         if plan.get("go_names") else "Object_Destroy(-1)",
+        text)
+    # Destroy(goExpr) — Find result / GO local (already an index).
+    text = re.sub(
+        r"(?<![\w.])(?:Object\.)?Destroy\s*\(",
+        "Object_Destroy(",
         text)
     text = text.replace("Physics2D.gravity.x", "Physics2D_gravity_x")
     text = text.replace("Physics2D.gravity.y", "Physics2D_gravity_y")
@@ -11683,6 +12062,13 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         f["name"]: f for f in (cl.get("class_consts") or [])
     }
     for vf in cl.get("vec2_fields") or []:
+        # Whole-field write before .x/.y / bare-read rewrites.
+        text = re.sub(
+            r"(?<![_\w])%s\s*=\s*(.+?)\s*;" % re.escape(vf),
+            lambda m, name=vf: (
+                "%s_set_%s_x(i, Vector2_x(%s)); %s_set_%s_y(i, Vector2_y(%s));"
+                % (idn, name, m.group(1), idn, name, m.group(1))),
+            text)
         text = re.sub(r"(?<![_\w])%s\.x\b" % vf, "%s_x" % vf, text)
         text = re.sub(r"(?<![_\w])%s\.y\b" % vf, "%s_y" % vf, text)
         text = re.sub(
@@ -11695,6 +12081,100 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
                 ))(_split_call_args(m.group(1)))
             ),
             text)
+        # Remaining bare field reads → stack Vector2 from packed slots.
+        text = re.sub(
+            r"(?<![_\w])%s\b(?!\s*\.)" % re.escape(vf),
+            "Vector2_make(%s_get_%s_x(i), %s_get_%s_y(i))" % (
+                idn, vf, idn, vf),
+            text)
+    # Other classes' Vector2 fields: recv.initLocalPosition → Vector2 / sets.
+    for ocname, ocl in (plan.get("classes") or {}).items():
+        if ocname == cl.get("name"):
+            continue
+        oidn = _c_ident(ocname)
+        for vf in ocl.get("vec2_fields") or []:
+            text = re.sub(
+                r"(?<![_\w])(\w+)\.%s\s*=\s*(.+?)\s*;" % re.escape(vf),
+                lambda m, o=oidn, f=vf: (
+                    "%s_set_%s_x(%s, Vector2_x(%s)); "
+                    "%s_set_%s_y(%s, Vector2_y(%s));"
+                    % (o, f, m.group(1), m.group(2),
+                       o, f, m.group(1), m.group(2))),
+                text)
+            # recv.transform.localPosition = recv.vf (before bare-field read).
+            text = re.sub(
+                r"(?<![_\w])(\w+)\s*\.\s*transform\s*\.\s*localPosition\s*=\s*"
+                r"(?<![_\w])\1\s*\.\s*%s\s*;" % re.escape(vf),
+                lambda m, o=oidn, f=vf: (
+                    "%s_set_pos_x(%s, %s_get_%s_x(%s)); "
+                    "%s_set_pos_y(%s, %s_get_%s_y(%s));"
+                    % (o, m.group(1), o, f, m.group(1),
+                       o, m.group(1), o, f, m.group(1))),
+                text)
+            text = re.sub(
+                r"(?<![_\w])(\w+)\.%s\.x\b" % re.escape(vf),
+                r"%s_get_%s_x(\1)" % (oidn, vf),
+                text)
+            text = re.sub(
+                r"(?<![_\w])(\w+)\.%s\.y\b" % re.escape(vf),
+                r"%s_get_%s_y(\1)" % (oidn, vf),
+                text)
+            text = re.sub(
+                r"(?<![_\w])(\w+)\.%s\b(?!\s*\.)" % re.escape(vf),
+                lambda m, o=oidn, f=vf: (
+                    "Vector2_make(%s_get_%s_x(%s), %s_get_%s_y(%s))"
+                    % (o, f, m.group(1), o, f, m.group(1))),
+                text)
+    # new Vector2(a, b) / Vector2(a, b) → Vector2_make; static presets.
+    text = re.sub(
+        r"(?<![\w.])new\s+Vector2\s*\(",
+        "Vector2_make(", text)
+    text = re.sub(
+        r"(?<![\w.])Vector2\s*\(",
+        "Vector2_make(", text)
+    text = re.sub(
+        r"(?<![\w.])Vector2\.zero\b", "Vector2_make(0.f, 0.f)", text)
+    text = re.sub(
+        r"(?<![\w.])Vector2\.one\b", "Vector2_make(1.f, 1.f)", text)
+    text = re.sub(
+        r"(?<![\w.])Vector2\.up\b", "Vector2_make(0.f, 1.f)", text)
+    text = re.sub(
+        r"(?<![\w.])Vector2\.down\b", "Vector2_make(0.f, -1.f)", text)
+    text = re.sub(
+        r"(?<![\w.])Vector2\.right\b", "Vector2_make(1.f, 0.f)", text)
+    text = re.sub(
+        r"(?<![\w.])Vector2\.left\b", "Vector2_make(-1.f, 0.f)", text)
+    # Temps like Vector2_x(Vector2_make(a,b)) — fold to components.
+    def _fold_v2_axis_ctors(src, axis_fn, axis):
+        out = []
+        i = 0
+        needle = axis_fn + "(Vector2_make("
+        while True:
+            j = src.find(needle, i)
+            if j < 0:
+                out.append(src[i:])
+                break
+            out.append(src[i:j])
+            start_args = j + len(needle)
+            depth = 1
+            k = start_args
+            while k < len(src) and depth:
+                if src[k] == "(":
+                    depth += 1
+                elif src[k] == ")":
+                    depth -= 1
+                k += 1
+            if k < len(src) and src[k] == ")":
+                args = _split_call_args(src[start_args:k - 1])
+                if len(args) >= 2:
+                    out.append("(%s)" % args[axis])
+                    i = k + 1
+                    continue
+            out.append(src[j:k])
+            i = k
+        return "".join(out)
+    text = _fold_v2_axis_ctors(text, "Vector2_x", 0)
+    text = _fold_v2_axis_ctors(text, "Vector2_y", 1)
     for vf in cl.get("vec2int_fields") or []:
         text = re.sub(r"(?<![_\w])%s\.x\b" % vf, "%s_x" % vf, text)
         text = re.sub(r"(?<![_\w])%s\.y\b" % vf, "%s_y" % vf, text)
@@ -12681,6 +13161,8 @@ def load_project(root):
     for a in analyses:
         needed |= set(a.get("getcomponent_types") or [])
         needed |= set(a.get("addcomponent_types") or [])
+        needed |= set(a.get("findobject_types") or [])
+        needed |= set(a.get("singleton_instance_types") or [])
         for c in a.get("classes") or []:
             for f in c.get("fields") or []:
                 ty = f.get("ty") or ""
@@ -13078,6 +13560,14 @@ def pack(root, outdir, soa=False, soa_vec4=False):
     plan["addcomponent_types"] = sorted(add_types)
     plan["addcomponent_budget"] = _addcomponent_budget(analyses, plan)
     plan["disallow_multiple_types"] = sorted(_disallow_multiple_types(analyses))
+    fot_types = set()
+    sing_types = set()
+    for a in analyses:
+        fot_types |= set(a.get("findobject_types") or [])
+        sing_types |= set(a.get("singleton_instance_types") or [])
+    fot_types |= sing_types
+    plan["findobject_types"] = sorted(fot_types)
+    plan["singleton_instance_types"] = sorted(sing_types)
     plan["go_has_sprite"] = sorted(_gos_with_sprite(plan))
     plan["lights"] = list(lights)
     plan["light_count"] = len(lights)
