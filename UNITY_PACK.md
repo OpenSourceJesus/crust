@@ -16,7 +16,8 @@ and does not fight the optimiser over initialisers.
 This is not Unity. It is a **subset** of C# plus a **subset** of the
 Unity (and later Godot / Blender) object model, lowered through the
 same discipline as `cs2cpp.py` / `csrust.py`: what is not in the
-subset is refused with a reason.
+subset is refused with a Unity/csc-style diagnostic
+(`Assets/.../File.cs(line,col): error CSxxxx: …`) at the use site.
 
 After emit, `engine.cpp` / `data.cpp` / `main.cpp` (C++ subset twins of
 the `.c` files) are run through `cpprust._check_unsupported` and

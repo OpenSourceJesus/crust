@@ -50,6 +50,18 @@ def _assets_rel_path(path):
     return os.path.basename(path) if path else "<cs>"
 
 
+def _cs_diag(path, text, idx, code, message):
+    """Unity/csc diagnostic: `Assets/.../File.cs(line,col): error CSxxxx: …`."""
+    line = text.count("\n", 0, idx) + 1
+    col = idx - (text.rfind("\n", 0, idx) + 1) + 1
+    return "%s(%d,%d): error %s: %s" % (
+        _assets_rel_path(path), line, col, code, message)
+
+
+def _raise_cs(path, text, idx, code, message):
+    raise PackError(_cs_diag(path, text, idx, code, message))
+
+
 # System.IO.File members we emit. Others → CS0117 (File is in scope via using).
 _FILE_SUPPORTED = frozenset({
     "WriteAllText", "AppendAllText", "WriteAllBytes", "ReadAllBytes",
@@ -95,13 +107,9 @@ def _check_file_api(path, text, scan):
         if not is_fqn and not has_io:
             continue  # bare File without using — not CS0117
         method_idx = m.start(1) if is_fqn else m.start(2)
-        line = text.count("\n", 0, method_idx) + 1
-        col = method_idx - (text.rfind("\n", 0, method_idx) + 1) + 1
-        raise PackError(
-            "%s(%d,%d): error CS0117: 'File' does not contain a definition "
-            "for '%s'"
-            % (_assets_rel_path(path), line, col, method)
-        )
+        _raise_cs(
+            path, text, method_idx, "CS0117",
+            "'File' does not contain a definition for '%s'" % method)
 
 
 def _check_application_api(path, text, scan):
@@ -119,13 +127,9 @@ def _check_application_api(path, text, scan):
         if not is_fqn and not has_ue:
             continue
         member_idx = m.start(1)
-        line = text.count("\n", 0, member_idx) + 1
-        col = member_idx - (text.rfind("\n", 0, member_idx) + 1) + 1
-        raise PackError(
-            "%s(%d,%d): error CS0117: 'Application' does not contain a "
-            "definition for '%s'"
-            % (_assets_rel_path(path), line, col, member)
-        )
+        _raise_cs(
+            path, text, member_idx, "CS0117",
+            "'Application' does not contain a definition for '%s'" % member)
 
 
 def _check_quaternion_api(path, text, scan):
@@ -139,13 +143,9 @@ def _check_quaternion_api(path, text, scan):
         if not is_fqn and not has_ue:
             continue
         member_idx = m.start(1)
-        line = text.count("\n", 0, member_idx) + 1
-        col = member_idx - (text.rfind("\n", 0, member_idx) + 1) + 1
-        raise PackError(
-            "%s(%d,%d): error CS0117: 'Quaternion' does not contain a "
-            "definition for '%s'"
-            % (_assets_rel_path(path), line, col, member)
-        )
+        _raise_cs(
+            path, text, member_idx, "CS0117",
+            "'Quaternion' does not contain a definition for '%s'" % member)
 
 
 def _check_transform_api(path, text, scan):
@@ -160,15 +160,122 @@ def _check_transform_api(path, text, scan):
         if member in _TRANSFORM_SUPPORTED:
             continue
         member_idx = m.start(1)
-        line = text.count("\n", 0, member_idx) + 1
-        col = member_idx - (text.rfind("\n", 0, member_idx) + 1) + 1
-        raise PackError(
-            "%s(%d,%d): error CS1061: 'Transform' does not contain a "
-            "definition for '%s' and no accessible extension method '%s' "
-            "accepting a first argument of type 'Transform' could be found "
-            "(are you missing a using directive or an assembly reference?)"
-            % (_assets_rel_path(path), line, col, member, member)
-        )
+        _raise_cs(
+            path, text, member_idx, "CS1061",
+            "'Transform' does not contain a definition for '%s' and no "
+            "accessible extension method '%s' accepting a first argument of "
+            "type 'Transform' could be found (are you missing a using "
+            "directive or an assembly reference?)"
+            % (member, member))
+
+
+_CS0246 = (
+    "The type or namespace name '%s' could not be found (are you missing a "
+    "using directive or an assembly reference?)"
+)
+_CS0234 = (
+    "The type or namespace name '%s' does not exist in the namespace '%s' "
+    "(are you missing an assembly reference?)"
+)
+
+
+def _blank_unity_editor_regions(text):
+    """Blank ``#if UNITY_EDITOR`` … ``#endif`` bodies (player pack ignores them).
+
+    Nested ``#if`` depth inside an editor region is tracked so OnValidate and
+    other editor-only APIs never reach refuse checks or method lowering.
+    """
+    lines = text.split("\n")
+    out = []
+    depth = 0
+    for line in lines:
+        s = line.lstrip()
+        if s.startswith("#"):
+            low = s.lower()
+            if re.match(r"#if\b", low) and re.search(r"\bunity_editor\b", low):
+                depth += 1
+                out.append(" " * len(line))
+                continue
+            if depth > 0:
+                if low.startswith("#endif"):
+                    depth -= 1
+                elif low.startswith("#if"):
+                    depth += 1
+                out.append(" " * len(line))
+                continue
+            out.append(line)
+            continue
+        if depth > 0:
+            out.append(" " * len(line))
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
+def _check_refused_api(path, text, scan):
+    """Packed-subset refusals → Unity/csc diagnostics at the use site.
+
+    ``using UnityEngine.UI`` is allowed (authored Image/Button fields). Invent
+    (AddComponent&lt;Canvas&gt;, ForceUpdateCanvases, typeof(Canvas) spawn) is not.
+    """
+    # Scripted Canvas invent — not authored !u!223.
+    m = re.search(
+            r"AddComponent\s*<\s*(?:UnityEngine\.)?(Canvas)\s*>", scan)
+    if m:
+        _raise_cs(path, text, m.start(1), "CS0246", _CS0246 % "Canvas")
+    m = re.search(r"typeof\s*\(\s*(Canvas)\s*\)", scan)
+    if m:
+        _raise_cs(path, text, m.start(1), "CS0246", _CS0246 % "Canvas")
+    m = re.search(r"Canvas\.(ForceUpdateCanvases)\b", scan)
+    if m:
+        _raise_cs(
+            path, text, m.start(1), "CS0117",
+            "'Canvas' does not contain a definition for 'ForceUpdateCanvases'")
+    m = re.search(r"(?<![\w.])InputAction\b", scan)
+    if m:
+        _raise_cs(path, text, m.start(), "CS0246", _CS0246 % "InputAction")
+    # Member forms analyze maps to refused keys (Emit / Evaluate / current).
+    m = re.search(r"ParticleSystem\.(Emit)\b", scan)
+    if m:
+        _raise_cs(
+            path, text, m.start(1), "CS0117",
+            "'ParticleSystem' does not contain a definition for 'Emit'")
+    m = re.search(r"AnimationCurve\.(Evaluate)\b", scan)
+    if m:
+        _raise_cs(
+            path, text, m.start(1), "CS0117",
+            "'AnimationCurve' does not contain a definition for 'Evaluate'")
+    m = re.search(r"(?<![\w.])Gamepad\.(current)\b", scan)
+    if m:
+        _raise_cs(
+            path, text, m.start(1), "CS0117",
+            "'Gamepad' does not contain a definition for 'current'")
+    # Keyboard.current without UnityEngine.InputSystem in scope.
+    has_input_system = bool(
+        re.search(r"using\s+UnityEngine\.InputSystem\b", scan)
+        or re.search(r"UnityEngine\.InputSystem\.Keyboard\b", scan)
+    )
+    if (not has_input_system
+            and (re.search(r"(?<![\w.])Keyboard\.current\b", scan)
+                 or _KEYBOARD_KEY.search(scan))):
+        km = re.search(r"(?<![\w.])Keyboard\b", scan)
+        if km:
+            _raise_cs(path, text, km.start(), "CS0246",
+                      _CS0246 % "Keyboard")
+    # Bare Console.WriteLine without using System / FQN.
+    has_system = bool(re.search(r"using\s+System\b", scan))
+    if (not has_system
+            and not re.search(r"System\.Console\.WriteLine\s*\(", scan)
+            and re.search(r"(?<![\w.])Console\.WriteLine\s*\(", scan)):
+        m = re.search(r"(?<![\w.])Console\b", scan)
+        if m:
+            _raise_cs(path, text, m.start(), "CS0246", _CS0246 % "Console")
+    # AddComponent<T> for invent-refused builtins (Canvas / …).
+    for m in re.finditer(
+            r"AddComponent\s*<\s*(?:UnityEngine\.)?(\w+)\s*>", scan):
+        t = m.group(1)
+        if t in _REFUSED_ADDCOMPONENT:
+            _raise_cs(path, text, m.start(1), "CS0246", _CS0246 % t)
 
 
 def _check_csharp_lex(path, text):
@@ -178,36 +285,31 @@ def _check_csharp_lex(path, text):
     C++-style `0.f` lexes as integer `0`, member access `.`, identifier `f`
     → CS1061. Catch it here so diagnostics stay against C# source.
     """
+    text = _blank_unity_editor_regions(text)
     scan = cs2cpp._blank(text)
     for m in re.finditer(r"(?<![\w.])\d+\.([fFdDmM])\b", scan):
         suffix = m.group(1)
-        idx = m.start(1)
-        line = text.count("\n", 0, idx) + 1
-        col = idx - (text.rfind("\n", 0, idx) + 1) + 1
-        raise PackError(
-            "%s(%d,%d): error CS1061: 'int' does not contain a definition "
-            "for '%s' and no accessible extension method '%s' accepting a "
-            "first argument of type 'int' could be found (are you missing a "
-            "using directive or an assembly reference?)"
-            % (_assets_rel_path(path), line, col, suffix, suffix)
-        )
+        _raise_cs(
+            path, text, m.start(1), "CS1061",
+            "'int' does not contain a definition for '%s' and no accessible "
+            "extension method '%s' accepting a first argument of type 'int' "
+            "could be found (are you missing a using directive or an "
+            "assembly reference?)"
+            % (suffix, suffix))
     # transform.position is Vector3; += Vector2 is ambiguous (CS0034).
     # Assignment `= new Vector2(...)` is fine via Vector2→Vector3 implicit.
     for m in re.finditer(
             r"transform\.position\s*(?:\+=|-=)\s*new\s+Vector2\b", scan):
-        idx = m.start()
-        line = text.count("\n", 0, idx) + 1
-        col = idx - (text.rfind("\n", 0, idx) + 1) + 1
-        raise PackError(
-            "%s(%d,%d): error CS0034: Operator '%s' is ambiguous on "
-            "operands of type 'Vector3' and 'Vector2'"
-            % (_assets_rel_path(path), line, col,
-               "+=" if "+=" in m.group(0) else "-=")
-        )
+        _raise_cs(
+            path, text, m.start(), "CS0034",
+            "Operator '%s' is ambiguous on operands of type 'Vector3' and "
+            "'Vector2'"
+            % ("+=" if "+=" in m.group(0) else "-="))
     _check_file_api(path, text, scan)
     _check_application_api(path, text, scan)
     _check_quaternion_api(path, text, scan)
     _check_transform_api(path, text, scan)
+    _check_refused_api(path, text, scan)
 
 
 # Built-in Unity components AddComponent may create at runtime.
@@ -223,17 +325,28 @@ _ADDABLE_BUILTINS = frozenset((
     "SphereCollider",
     "Animation",
     "Animator",
+    "AudioSource",
 ))
 
 # Unity marks these with [DisallowMultipleComponent] — a second AddComponent
 # logs an error and returns null instead of returning the existing instance.
-_DISALLOW_MULTIPLE_BUILTINS = _ADDABLE_BUILTINS
+# AudioSource is omitted: Unity allows several AudioSources on one GameObject.
+_DISALLOW_MULTIPLE_BUILTINS = frozenset(
+    t for t in _ADDABLE_BUILTINS if t != "AudioSource")
 
 # Types that still require inventing assets / systems — AddComponent refused.
 _REFUSED_ADDCOMPONENT = frozenset((
     "ParticleSystem",
     "Canvas",
-    "AudioSource",
+))
+
+# Authored uGUI / TMP component field types — scene-drawn, not packed MB arrays.
+_UI_COMPONENT_FIELD_TYPES = frozenset((
+    "Image", "RawImage", "Button", "Text", "Toggle", "Slider", "Scrollbar",
+    "ScrollRect", "Dropdown", "InputField", "Mask", "RectMask2D",
+    "Canvas", "CanvasGroup", "CanvasScaler", "GraphicRaycaster",
+    "RectTransform", "TMP_Text", "TextMeshProUGUI", "TextMeshPro",
+    "TMP_InputField", "TMP_Dropdown",
 ))
 
 
@@ -339,14 +452,9 @@ _REFUSED_API = {
         "Unity Input System Gamepad.current needs the Input System package "
         "runtime — unity_pack does not invent device graphs."
     ),
-    "UnityEngine.UI": (
-        "Scripted uGUI (Canvas / Text / Image APIs) is not emitted — use "
-        "authored Canvas + Image in the scene. unity_pack does not invent "
-        "UI from scripts."
-    ),
     "Canvas": (
-        "Scripted Canvas access is not emitted — author a !u!223 Canvas + "
-        "Image in the scene. AddComponent<Canvas> is refused."
+        "Scripted Canvas invent (AddComponent / typeof / ForceUpdateCanvases) "
+        "is refused — author a !u!223 Canvas + Image in the scene."
     ),
 }
 
@@ -380,8 +488,6 @@ _UNITY_API = re.compile(
     r"ParticleSystem\.Emit|"
     r"AnimationCurve\.Evaluate|"
     r"InputAction|Keyboard\.current|Gamepad\.current|"
-    r"UnityEngine\.UI|"
-    r"(?<![.\w])Canvas(?=\s|\.|;)|"
     r"Debug\.Log|(?<![\w.])print(?=\s*\()|"
     r"System\.Console\.WriteLine|(?<![\w.])Console\.WriteLine|"
     r"GameObject\.Find|GetComponent\s*<|"
@@ -2074,10 +2180,10 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
     (!u!223), uGUI Image / Button (builtin MB), RectTransform anchors/size,
     Rigidbody2D (!u!50), Rigidbody (!u!54), BoxCollider2D (!u!61),
     CircleCollider2D (!u!58), BoxCollider (!u!65), SphereCollider (!u!135),
-    Animation (!u!111), Animator (!u!95), PhysicsMaterial2D / PhysicMaterial,
-    and AnimationClip / AnimatorController assets. Does not invent any of
-    those — missing components stay missing. Returns
-    (objects, lights, cameras, hierarchy).
+    AudioSource (!u!82), Animation (!u!111), Animator (!u!95),
+    PhysicsMaterial2D / PhysicMaterial, and AnimationClip / AnimatorController
+    assets. Does not invent any of those — missing components stay missing.
+    Returns (objects, lights, cameras, hierarchy).
     """
     guid_to_script = guid_to_script or {}
     asset_guids = asset_guids or {}
@@ -2100,7 +2206,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             r"(?m)^(GameObject|Transform|RectTransform|MonoBehaviour|"
             r"PrefabInstance|Light|Camera|SpriteRenderer|Rigidbody2D|"
             r"Rigidbody|BoxCollider2D|CircleCollider2D|BoxCollider|"
-            r"SphereCollider|Animation|Animator|Canvas):",
+            r"SphereCollider|Animation|Animator|Canvas|AudioSource):",
             block)
         if km:
             kind = km.group(1)
@@ -2130,6 +2236,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             kind = "Animation"
         elif type_id == "95":
             kind = "Animator"
+        elif type_id == "82":
+            kind = "AudioSource"
         elif type_id in ("4", "224"):
             kind = "Transform"
         rec = {"file_id": file_id, "kind": kind, "raw": block, "fields": {}}
@@ -2547,6 +2655,25 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "enabled": int(en.group(1)) if en else 1,
                 "controller_guid": _parse_asset_guid_ref(block, "m_Controller"),
             }
+        if kind == "AudioSource":
+            en = re.search(r"(?m)^\s+m_Enabled:\s*(\d+)", block)
+            poa = re.search(r"(?m)^\s+m_PlayOnAwake:\s*(\d+)", block)
+            vol = re.search(r"(?m)^\s+m_Volume:\s*([0-9.eE+-]+)", block)
+            pitch = re.search(r"(?m)^\s+m_Pitch:\s*([0-9.eE+-]+)", block)
+            loop = re.search(r"(?m)^\s+Loop:\s*(\d+)", block)
+            mute = re.search(r"(?m)^\s+Mute:\s*(\d+)", block)
+            clip_g = _parse_asset_guid_ref(block, "m_audioClip")
+            if not clip_g:
+                clip_g = _parse_asset_guid_ref(block, "m_Resource")
+            rec["audiosource"] = {
+                "enabled": int(en.group(1)) if en else 1,
+                "play_on_awake": int(poa.group(1)) if poa else 1,
+                "volume": float(vol.group(1)) if vol else 1.0,
+                "pitch": float(pitch.group(1)) if pitch else 1.0,
+                "loop": int(loop.group(1)) if loop else 0,
+                "mute": int(mute.group(1)) if mute else 0,
+                "clip_guid": clip_g or "",
+            }
         by_id[file_id] = rec
 
     # PrefabInstance.m_TransformParent applies to stripped Transforms that
@@ -2601,6 +2728,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         col3d = None
         anim = None
         animator = None
+        audiosources = []
         rect = None
         for k in kids:
             if k.get("kind") == "Transform":
@@ -2649,6 +2777,10 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 anim = dict(k["animation"])
             if k.get("kind") == "Animator" and k.get("animator"):
                 animator = dict(k["animator"])
+            if k.get("kind") == "AudioSource" and k.get("audiosource"):
+                a = dict(k["audiosource"])
+                a["file_id"] = k.get("file_id")
+                audiosources.append(a)
         # Flatten authored Vector2 YAML into _x/_y for packed members.
         for vk, (vx, vy) in vec2_fields.items():
             fields[vk + "_x"] = vx
@@ -2870,6 +3002,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "collider2d": col2d,
             "collider3d": col3d,
             "anim_player": player,
+            "audiosources": audiosources,
         })
     # Stash clip assets on a sentinel for pack() — returned via lights? No.
     # Attach to a module-level isn't clean. Return clips via objects meta:
@@ -3269,15 +3402,34 @@ def _gos_with_sprite(plan):
     return names
 
 
-def _validate_addcomponent_types(types, plan):
+def _validate_addcomponent_types(types, plan, analyses=None):
     known = set(plan.get("classes") or {}) | _ADDABLE_BUILTINS
+    analyses = analyses or []
     for t in sorted(types):
-        if t in _REFUSED_ADDCOMPONENT:
-            raise PackError(
-                "AddComponent<%s>: unity_pack does not invent %s assets / "
-                "systems. Keep that component in the authored Unity project."
-                % (t, t))
-        if t not in known:
+        if t in _REFUSED_ADDCOMPONENT or t not in known:
+            # Prefer Unity-style site from AddComponent<T> in scripts.
+            for a in analyses:
+                path = a.get("path") or ""
+                text = None
+                for c in a.get("classes") or []:
+                    if c.get("file_text") is not None:
+                        text = c["file_text"]
+                        break
+                if text is None and path and os.path.isfile(path):
+                    text = _read(path)
+                if not text:
+                    continue
+                scan = cs2cpp._blank(text)
+                m = re.search(
+                    r"AddComponent\s*<\s*(?:UnityEngine\.)?(%s)\s*>" % re.escape(t),
+                    scan)
+                if m:
+                    _raise_cs(path, text, m.start(1), "CS0246", _CS0246 % t)
+            if t in _REFUSED_ADDCOMPONENT:
+                raise PackError(
+                    "AddComponent<%s>: unity_pack does not invent %s assets / "
+                    "systems. Keep that component in the authored Unity project."
+                    % (t, t))
             raise PackError(
                 "AddComponent<%s>: no packed %s — add an authored scene "
                 "instance of that MonoBehaviour, or use a supported builtin "
@@ -3285,15 +3437,170 @@ def _validate_addcomponent_types(types, plan):
                 % (t, t, ", ".join(sorted(_ADDABLE_BUILTINS))))
 
 
+def _rewrite_audiosource_api(text, cl, add_locals=None):
+    """Lower AudioSource playOnAwake/loop/volume/clip/Play/Stop / .gameObject."""
+    as_recvs = set()
+    for f in cl.get("fields") or []:
+        if f.get("ty") == "AudioSource":
+            as_recvs.add(f["name"])
+    for name, _ty, _bits, kind in cl.get("members") or []:
+        if str(kind) == "idx:AudioSource":
+            as_recvs.add(name)
+    for lm in re.finditer(r"\bAudioSource\s+(\w+)\b", text):
+        as_recvs.add(lm.group(1))
+    for name, ty in (add_locals or {}).items():
+        if ty == "AudioSource":
+            as_recvs.add(name)
+    if not as_recvs:
+        return text
+
+    def repl_go(m):
+        recv = m.group(1)
+        if recv not in as_recvs:
+            return m.group(0)
+        return "_AudioSource_owner_go[%s]" % recv
+
+    text = re.sub(
+        r"(?<![.\w])(\w+)\s*\.\s*gameObject\b",
+        repl_go, text)
+
+    bool_map = {
+        "playOnAwake": "play_on_awake",
+        "loop": "loop",
+        "mute": "mute",
+    }
+
+    def repl_bool(m):
+        recv, prop, rhs = m.group(1), m.group(2), m.group(3).strip()
+        if recv not in as_recvs:
+            return m.group(0)
+        field = bool_map[prop]
+        if rhs in ("false", "False", "0"):
+            val = "0"
+        elif rhs in ("true", "True", "1"):
+            val = "1"
+        else:
+            val = "(%s) ? 1 : 0" % rhs
+        return "_AudioSource_%s[%s] = %s;" % (field, recv, val)
+
+    text = re.sub(
+        r"(?<![.\w])(\w+)\s*\.\s*(playOnAwake|loop|mute)\s*=\s*([^;]+);",
+        repl_bool, text)
+
+    def repl_float(m):
+        recv, prop, rhs = m.group(1), m.group(2), m.group(3).strip()
+        if recv not in as_recvs:
+            return m.group(0)
+        return "_AudioSource_%s[%s] = %s;" % (prop, recv, rhs)
+
+    text = re.sub(
+        r"(?<![.\w])(\w+)\s*\.\s*(volume|pitch)\s*=\s*([^;]+);",
+        repl_float, text)
+
+    def repl_clip(m):
+        recv, rhs = m.group(1), m.group(2).strip()
+        if recv not in as_recvs:
+            return m.group(0)
+        if rhs == "null":
+            rhs = "-1"
+        return "_AudioSource_clip[%s] = %s;" % (recv, rhs)
+
+    text = re.sub(
+        r"(?<![.\w])(\w+)\s*\.\s*clip\s*=\s*([^;]+);",
+        repl_clip, text)
+
+    def repl_call(m):
+        recv, meth = m.group(1), m.group(2)
+        if recv not in as_recvs:
+            return m.group(0)
+        return "AudioSource_%s(%s)" % (meth, recv)
+
+    text = re.sub(
+        r"(?<![.\w])(\w+)\s*\.\s*(Play|Stop)\s*\(\s*\)",
+        repl_call, text)
+
+    # Bool/float reads: recv.volume / recv.loop
+    def repl_read_float(m):
+        recv, prop = m.group(1), m.group(2)
+        if recv not in as_recvs:
+            return m.group(0)
+        return "_AudioSource_%s[%s]" % (prop, recv)
+
+    text = re.sub(
+        r"(?<![.\w])(\w+)\s*\.\s*(volume|pitch)\b",
+        repl_read_float, text)
+
+    def repl_read_bool(m):
+        recv, prop = m.group(1), m.group(2)
+        if recv not in as_recvs:
+            return m.group(0)
+        field = bool_map[prop]
+        return "_AudioSource_%s[%s]" % (field, recv)
+
+    text = re.sub(
+        r"(?<![.\w])(\w+)\s*\.\s*(playOnAwake|loop|mute)\b",
+        repl_read_bool, text)
+
+    def repl_read_clip(m):
+        recv = m.group(1)
+        if recv not in as_recvs:
+            return m.group(0)
+        return "_AudioSource_clip[%s]" % recv
+
+    text = re.sub(
+        r"(?<![.\w])(\w+)\s*\.\s*clip\b",
+        repl_read_clip, text)
+    return text
+
+
 def _rewrite_addcomponent(text, plan, this_class):
     """Lower gameObject.AddComponent<T>() / AddComponent<T>() to C helpers.
 
+    Also ``audioSource.gameObject.AddComponent<T>()`` (component → owner GO).
     Returns (text, locals_ty) where locals_ty maps local name → component type
     for Console/Debug ToString wrapping.
     """
     this_idn = _c_ident(this_class)
     go_expr = "_engine_go_of_%s(i)" % this_idn
     locals_ty = {}
+    as_fields = set()
+    cl = (plan.get("classes") or {}).get(this_class) or {}
+    for f in cl.get("fields") or []:
+        if f.get("ty") == "AudioSource":
+            as_fields.add(f["name"])
+    for name, _ty, _bits, kind in cl.get("members") or []:
+        if str(kind) == "idx:AudioSource":
+            as_fields.add(name)
+
+    def _go_of_recv(recv):
+        if not recv or recv in ("this", "gameObject"):
+            return go_expr
+        if recv in as_fields or locals_ty.get(recv) == "AudioSource":
+            return "_AudioSource_owner_go[%s]" % recv
+        return go_expr
+
+    # AudioSource asrc = musicSource.gameObject.AddComponent<AudioSource>();
+    def repl_typed_go(m):
+        var, recv, comp = m.group(1), m.group(2), m.group(3)
+        locals_ty[var] = comp
+        return "int %s = GameObject_AddComponent_%s(%s)" % (
+            var, _c_ident(comp), _go_of_recv(recv))
+
+    text = re.sub(
+        r"(?:(?:UnityEngine\.)?\w+)\s+(\w+)\s*=\s*"
+        r"(\w+)\s*\.\s*gameObject\s*\.\s*AddComponent\s*<\s*"
+        r"(?:UnityEngine\.)?(\w+)\s*>\s*\(\s*\)",
+        repl_typed_go, text)
+
+    def repl_bare_go(m):
+        recv, comp = m.group(1), m.group(2)
+        return "GameObject_AddComponent_%s(%s)" % (
+            _c_ident(comp), _go_of_recv(recv))
+
+    text = re.sub(
+        r"(\w+)\s*\.\s*gameObject\s*\.\s*AddComponent\s*<\s*"
+        r"(?:UnityEngine\.)?(\w+)\s*>\s*\(\s*\)",
+        repl_bare_go, text)
 
     def repl_typed(m):
         var, comp = m.group(1), m.group(2)
@@ -3464,6 +3771,49 @@ def _build_rigidbody_tables(plan):
                     "vel_z": float(r3.get("vel_z") or 0.0),
                 })
     return (rb2d, rb3d, go_rb2d, go_rb3d, rb2d_by_file_id, rb3d_by_file_id)
+
+
+def _build_audiosource_tables(plan):
+    """Authored AudioSource (!u!82) → packed pool; clip guids → opaque indices."""
+    sources = []
+    go_first = {}  # go_name → first AudioSource index (GetComponent)
+    by_file_id = {}
+    clip_guids = []
+    clip_i = {}
+
+    def _clip_idx(guid):
+        g = (guid or "").lower()
+        if not g:
+            return -1
+        if g not in clip_i:
+            clip_i[g] = len(clip_guids)
+            clip_guids.append(g)
+        return clip_i[g]
+
+    for cname, cl in sorted(plan["classes"].items()):
+        for i, o in enumerate(cl.get("instances") or []):
+            n = o.get("name") or "obj"
+            for a in o.get("audiosources") or []:
+                fid = a.get("file_id")
+                idx = len(sources)
+                if n not in go_first:
+                    go_first[n] = idx
+                if fid is not None and str(fid) != "0":
+                    by_file_id[str(fid)] = idx
+                sources.append({
+                    "name": n,
+                    "owner_class": cname,
+                    "owner_inst": i,
+                    "file_id": fid,
+                    "play_on_awake": int(a.get("play_on_awake") or 0),
+                    "volume": float(a.get("volume") or 1.0),
+                    "pitch": float(a.get("pitch") or 1.0),
+                    "loop": int(a.get("loop") or 0),
+                    "mute": int(a.get("mute") or 0),
+                    "clip": _clip_idx(a.get("clip_guid")),
+                    "playing": 0,
+                })
+    return sources, go_first, by_file_id, clip_guids
 
 
 def _attach_transform_parents(plan):
@@ -4276,6 +4626,8 @@ def analyze_script(path, text=None):
     """Fields, methods, Unity API used, whether the script spawns."""
     if text is None:
         text = _read(path)
+    # Player pack: editor-only regions are not code.
+    text = _blank_unity_editor_regions(text)
     _check_csharp_lex(path, text)
     scan = cs2cpp._blank(text)
     apis = set()
@@ -4387,8 +4739,11 @@ def analyze_script(path, text=None):
             r"localToWorldMatrix\b",
             scan):
         apis.add("transform.localToWorldMatrix")
-    if re.search(r"using\s+UnityEngine\.UI\b", scan):
-        apis.add("UnityEngine.UI")
+    # Canvas invent only — using UnityEngine.UI / Image fields are authored OK.
+    if (re.search(r"AddComponent\s*<\s*(?:UnityEngine\.)?Canvas\s*>", scan)
+            or re.search(r"typeof\s*\(\s*Canvas\s*\)", scan)
+            or re.search(r"Canvas\.ForceUpdateCanvases\b", scan)):
+        apis.add("Canvas")
     if re.search(r"\bInputAction\b", scan):
         apis.add("InputAction")
     # Keyboard lives in UnityEngine.InputSystem — only when in scope.
@@ -4940,6 +5295,12 @@ def plan_layouts(objects, analyses, two_d=None):
             if ty == "Transform":
                 # Resolved via object_refs → target class/inst (SetWorldScale).
                 continue
+            if ty in _UI_COMPONENT_FIELD_TYPES:
+                # Authored uGUI / TMP refs — drawn from scene, not packed MB idx.
+                continue
+            if "[" in ty or ty == "AudioClip":
+                # Arrays / AudioClip assets — opaque handles later; skip pack.
+                continue
             if ty in ("int", "byte", "short", "uint"):
                 vals = [o["fields"][fname] for o in insts if fname in o["fields"]]
                 vals.extend(_assigned_int_seeds(
@@ -5148,6 +5509,10 @@ def emit_engine(plan, analyses, used_apis):
     want_add_camera = "Camera" in add_types
     want_add_light = "Light" in add_types
     want_add_sprite = "SpriteRenderer" in add_types
+    want_add_audio = (
+        "AudioSource" in add_types
+        or "AudioSource" in getcomponent_types
+        or bool(plan.get("audiosources")))
     want_add_any = bool(add_types)
     want_phys = "Physics2D.gravity" in used_apis or want_rb2d
     want_phys3 = "Physics.gravity" in used_apis or want_rb3d
@@ -6572,6 +6937,75 @@ def emit_engine(plan, analyses, used_apis):
             p("    if (n < 0 || (size_t)n >= sizeof _Light_tostring_buf)")
             p("        return _engine_go_name[go];")
             p("    return _Light_tostring_buf;")
+            p("}")
+            p("")
+        if want_add_audio:
+            asrc = plan.get("audiosources") or []
+            as_budget = int(add_budget.get("AudioSource") or 0)
+            as_cap = max(1, len(asrc) + as_budget)
+            go_n = max(1, len(go_names))
+            go_as = plan.get("go_audiosource") or {}
+            vals = []
+            for n in (go_names if go_names else [""]):
+                vals.append(str(int(go_as[n])) if n in go_as else "-1")
+            p("/* AudioSource — authored !u!82 + AddComponent pool (multi OK). */")
+            p("extern int _AudioSource_count;")
+            p("extern int _AudioSource_owner_go[%d];" % as_cap)
+            p("extern int _AudioSource_play_on_awake[%d];" % as_cap)
+            p("extern int _AudioSource_loop[%d];" % as_cap)
+            p("extern int _AudioSource_mute[%d];" % as_cap)
+            p("extern float _AudioSource_volume[%d];" % as_cap)
+            p("extern float _AudioSource_pitch[%d];" % as_cap)
+            p("extern int _AudioSource_clip[%d];" % as_cap)
+            p("extern int _AudioSource_playing[%d];" % as_cap)
+            p("static int _engine_go_AudioSource[%d] = { %s };" % (
+                go_n, ", ".join(vals)))
+            p("static int GameObject_GetComponent_AudioSource(int go) {")
+            p("    if (go < 0 || go >= _engine_go_count) return -1;")
+            p("    return _engine_go_AudioSource[go];")
+            p("}")
+            p("static int GameObject_AddComponent_AudioSource(int go) {")
+            p("    int ex, first;")
+            p("    if (go < 0 || go >= _engine_go_count) return -1;")
+            p("    first = _engine_go_AudioSource[go];")
+            p("    if (_AudioSource_count >= %d) return -1;" % as_cap)
+            p("    ex = _AudioSource_count;")
+            p("    _AudioSource_count = _AudioSource_count + 1;")
+            p("    if (first < 0)")
+            p("        _engine_go_AudioSource[go] = ex;")
+            p("    _AudioSource_owner_go[ex] = go;")
+            p("    _AudioSource_play_on_awake[ex] = 1;")
+            p("    _AudioSource_loop[ex] = 0;")
+            p("    _AudioSource_mute[ex] = 0;")
+            p("    _AudioSource_volume[ex] = 1.f;")
+            p("    _AudioSource_pitch[ex] = 1.f;")
+            p("    _AudioSource_clip[ex] = -1;")
+            p("    _AudioSource_playing[ex] = 0;")
+            p("    return ex;")
+            p("}")
+            p("static void AudioSource_Play(int ci) {")
+            p("    if (ci < 0 || ci >= _AudioSource_count) return;")
+            p("    if (_AudioSource_mute[ci]) return;")
+            p("    _AudioSource_playing[ci] = 1;")
+            p("    /* host may observe _AudioSource_playing / clip */")
+            p("}")
+            p("static void AudioSource_Stop(int ci) {")
+            p("    if (ci < 0 || ci >= _AudioSource_count) return;")
+            p("    _AudioSource_playing[ci] = 0;")
+            p("}")
+            p("static char _AudioSource_tostring_buf[256];")
+            p("static const char *AudioSource_ToString(int ci) {")
+            p("    int n, go;")
+            p("    if (ci < 0 || ci >= _AudioSource_count) return \"null\";")
+            p("    go = _AudioSource_owner_go[ci];")
+            p("    if (go < 0 || go >= _engine_go_count) return \"null\";")
+            p("    n = snprintf(_AudioSource_tostring_buf,")
+            p("                 sizeof _AudioSource_tostring_buf,")
+            p("                 \"%s (UnityEngine.AudioSource)\",")
+            p("                 _engine_go_name[go]);")
+            p("    if (n < 0 || (size_t)n >= sizeof _AudioSource_tostring_buf)")
+            p("        return _engine_go_name[go];")
+            p("    return _AudioSource_tostring_buf;")
             p("}")
             p("")
         for col_ty, unity_ty in (
@@ -10317,6 +10751,9 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     # Find/GetComponent before field rewrites so `.amp` stays on the target type.
     text = _rewrite_find_getcomponent(text, plan, cl["name"], site=site)
     text, add_locals = _rewrite_addcomponent(text, plan, cl["name"])
+    text = _rewrite_audiosource_api(text, cl, add_locals=add_locals)
+    # AudioSource locals / params are packed indices (like Transform / GO).
+    text = re.sub(r"\bAudioSource\b(?=\s+\w)", "int", text)
     # API tokens before Vector2 rewrites so nested Mathf.Sin(...) keeps parens.
     text = text.replace("Time.deltaTime", "Time_deltaTime")
     text = text.replace("Time.fixedDeltaTime", "Time_fixedDeltaTime")
@@ -10529,10 +10966,13 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = "\n".join(fixed)
 
     # Pointer-style `other.hp` where other is an idx member.
+    # Skip builtins (AudioSource / Rigidbody*) — their props lower earlier.
     for name, _ty, _bits, kind in cl["members"]:
         if not str(kind).startswith("idx:"):
             continue
         other = kind.split(":", 1)[1]
+        if (other in _ADDABLE_BUILTINS or other in _PHYSICS_COMPONENTS):
+            continue
         oiden = _c_ident(other)
         text = re.sub(
             r"\b%s\.(\w+)" % name,
@@ -10698,6 +11138,48 @@ def emit_data(plan, used_apis=None):
         p("int _Rigidbody2D_owner_inst[%d] = { %s };" % (
             cap, ", ".join(str(int(v)) for v in _pad_i(
                 [r["owner_inst"] for r in rb2d_list]))))
+    asrc_list = plan.get("audiosources") or []
+    as_add = int((plan.get("addcomponent_budget") or {}).get("AudioSource") or 0)
+    as_cap = len(asrc_list) + as_add
+    if as_cap or "AudioSource" in (plan.get("addcomponent_types") or []):
+        as_cap = max(1, as_cap)
+        n = len(asrc_list)
+
+        def _pad_as(vals, fill=0):
+            return list(vals) + [fill] * (as_cap - len(vals))
+
+        def _pad_asf(vals, fill=0.0):
+            return list(vals) + [fill] * (as_cap - len(vals))
+
+        p("int _AudioSource_count = %d;" % n)
+        go_names = plan.get("go_names") or []
+        name_i = {nm: i for i, nm in enumerate(go_names)}
+        owner_gos = []
+        for r in asrc_list:
+            owner_gos.append(int(name_i.get(r.get("name") or "", -1)))
+        p("int _AudioSource_owner_go[%d] = { %s };" % (
+            as_cap, ", ".join(str(int(v)) for v in _pad_as(owner_gos, -1))))
+        p("int _AudioSource_play_on_awake[%d] = { %s };" % (
+            as_cap, ", ".join(str(int(v)) for v in _pad_as(
+                [r["play_on_awake"] for r in asrc_list], 1))))
+        p("int _AudioSource_loop[%d] = { %s };" % (
+            as_cap, ", ".join(str(int(v)) for v in _pad_as(
+                [r["loop"] for r in asrc_list]))))
+        p("int _AudioSource_mute[%d] = { %s };" % (
+            as_cap, ", ".join(str(int(v)) for v in _pad_as(
+                [r.get("mute", 0) for r in asrc_list]))))
+        p("float _AudioSource_volume[%d] = { %s };" % (
+            as_cap, ", ".join("%sf" % repr(float(v)) for v in _pad_asf(
+                [r["volume"] for r in asrc_list], 1.0))))
+        p("float _AudioSource_pitch[%d] = { %s };" % (
+            as_cap, ", ".join("%sf" % repr(float(v)) for v in _pad_asf(
+                [r["pitch"] for r in asrc_list], 1.0))))
+        p("int _AudioSource_clip[%d] = { %s };" % (
+            as_cap, ", ".join(str(int(v)) for v in _pad_as(
+                [r["clip"] for r in asrc_list], -1))))
+        p("int _AudioSource_playing[%d] = { %s };" % (
+            as_cap, ", ".join(str(int(v)) for v in _pad_as(
+                [r.get("playing", 0) for r in asrc_list]))))
     if rb3d_cap:
         n = len(rb3d_list)
         cap = rb3d_cap
@@ -11091,6 +11573,9 @@ def emit_data(plan, used_apis=None):
                 elif kind == "idx:Rigidbody":
                     parts.append(str(_rb_field_init_index(
                         plan, o, name, "3d")))
+                elif kind == "idx:AudioSource":
+                    parts.append(str(_audiosource_field_init_index(
+                        plan, o, name)))
                 else:
                     dflt = _member_init_default(cl, name)
                     if dflt is not None:
@@ -11126,6 +11611,20 @@ def _rb_field_init_index(plan, o, fname, kind):
     if fid is not None and str(fid) != "0" and str(fid) in by_fid:
         return int(by_fid[str(fid)])
     # Same-GO self ref when YAML omitted the PPtr target.
+    n = o.get("name") or "obj"
+    if n in by_go:
+        return int(by_go[n])
+    return -1
+
+
+def _audiosource_field_init_index(plan, o, fname):
+    """Serialized AudioSource field → packed table index (-1 if missing)."""
+    refs = o.get("object_refs") or {}
+    fid = refs.get(fname)
+    by_fid = plan.get("audiosource_by_file_id") or {}
+    by_go = plan.get("go_audiosource") or {}
+    if fid is not None and str(fid) != "0" and str(fid) in by_fid:
+        return int(by_fid[str(fid)])
     n = o.get("name") or "obj"
     if n in by_go:
         return int(by_go[n])
@@ -11276,8 +11775,18 @@ def load_project(root):
             objects.extend(parse_blender_json(_read(path)))
     sorting_layers = _load_sorting_layers(root)
 
+    # Only analyze MonoBehaviour scripts authored on scene objects — vendor
+    # helpers (e.g. CwHelper) must not refuse the pack via unused usings.
+    scene_scripts = set()
+    for o in objects:
+        sp = o.get("script")
+        if sp:
+            scene_scripts.add(os.path.abspath(sp))
     scripts = [p for p in _walk_files(root, (".cs",))
                if _is_player_csharp(root, p)]
+    if scene_scripts:
+        scripts = [p for p in scripts
+                   if os.path.abspath(p) in scene_scripts]
     _progress("analyzing %d script(s)" % len(scripts))
     analyses = []
     for i, p in enumerate(scripts):
@@ -11422,14 +11931,68 @@ def _crust_compile_c(text, path, defines=None):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def _refused_api_site(analyses, api):
+    """First (path, text, idx) for a refused API token, or None."""
+    patterns = {
+        "Canvas": (
+            r"AddComponent\s*<\s*(?:UnityEngine\.)?(Canvas)\s*>|"
+            r"typeof\s*\(\s*(Canvas)\s*\)|"
+            r"Canvas\.(ForceUpdateCanvases)\b"
+        ),
+        "InputAction": r"(?<![\w.])InputAction\b",
+        "ParticleSystem.Emit": r"ParticleSystem\.(Emit)\b",
+        "AnimationCurve.Evaluate": r"AnimationCurve\.(Evaluate)\b",
+        "Gamepad.current": r"(?<![\w.])Gamepad\.(current)\b",
+        "Keyboard": r"(?<![\w.])Keyboard\b",
+        "Console": r"(?<![\w.])Console\b",
+    }
+    pat = patterns.get(api)
+    if not pat:
+        return None
+    for a in analyses:
+        path = a.get("path") or ""
+        text = None
+        for c in a.get("classes") or []:
+            if c.get("file_text") is not None:
+                text = c["file_text"]
+                break
+        if text is None and path and os.path.isfile(path):
+            text = _read(path)
+        if not text:
+            continue
+        scan = cs2cpp._blank(text)
+        m = re.search(pat, scan)
+        if m:
+            idx = m.start()
+            for g in range(1, (m.lastindex or 0) + 1):
+                if m.start(g) >= 0:
+                    idx = m.start(g)
+                    break
+            return path, text, idx
+    return None
+
+
 def pack(root, outdir, soa=False, soa_vec4=False):
     objects, analyses, lights, cameras, hierarchy = load_project(root)
     used_apis = set()
     for a in analyses:
         used_apis |= a["apis"]
     for api, reason in sorted(_REFUSED_API.items()):
-        if api in used_apis:
-            raise PackError("%s: %s" % (api, reason))
+        if api not in used_apis:
+            continue
+        site = _refused_api_site(analyses, api)
+        if site:
+            path, text, idx = site
+            if "." in api and api != "UnityEngine.UI":
+                ty, member = api.split(".", 1)
+                _raise_cs(
+                    path, text, idx, "CS0117",
+                    "'%s' does not contain a definition for '%s'"
+                    % (ty, member))
+            else:
+                _raise_cs(path, text, idx, "CS0246", _CS0246 % (
+                    api if api != "Canvas" else "Canvas"))
+        raise PackError("%s: %s" % (api, reason))
     add_types = _collect_addcomponent_types(analyses)
     if "Camera.main" in used_apis and not cameras:
         raise PackError(
@@ -11443,7 +12006,7 @@ def pack(root, outdir, soa=False, soa_vec4=False):
         plan = dict(plan)
         plan["soa"] = False
         plan["soa_vec4"] = False
-    _validate_addcomponent_types(add_types, plan)
+    _validate_addcomponent_types(add_types, plan, analyses)
     plan["addcomponent_types"] = sorted(add_types)
     plan["addcomponent_budget"] = _addcomponent_budget(analyses, plan)
     plan["disallow_multiple_types"] = sorted(_disallow_multiple_types(analyses))
@@ -11499,6 +12062,11 @@ def pack(root, outdir, soa=False, soa_vec4=False):
     plan["go_rigidbody"] = go_rb3d
     plan["rb2d_by_file_id"] = rb2d_by_fid
     plan["rb3d_by_file_id"] = rb3d_by_fid
+    asrc, go_as, as_by_fid, clip_guids = _build_audiosource_tables(plan)
+    plan["audiosources"] = asrc
+    plan["go_audiosource"] = go_as
+    plan["audiosource_by_file_id"] = as_by_fid
+    plan["audioclip_guids"] = clip_guids
     _attach_transform_parents(plan)
     if "transform.SetParent" in used_apis:
         plan["has_transform_parents"] = True

@@ -4109,6 +4109,83 @@ class TestSystems(unittest.TestCase):
         self.assertIn("GameObject_AddComponent_Rigidbody2D", eng2)
         self.assertIn("Rigidbody2D_ToString", eng2)
 
+    def test_audiosource_addcomponent_play_stop(self):
+        """Authored !u!82 + AddComponent second source; Play/Stop/volume lower."""
+        root = tempfile.mkdtemp(prefix="upack-audio-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Music.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Music : MonoBehaviour {\n"
+                "    public AudioSource musicSource;\n"
+                "    public void Start() {\n"
+                "        AudioSource other = musicSource.gameObject"
+                ".AddComponent<AudioSource>();\n"
+                "        other.playOnAwake = false;\n"
+                "        other.loop = true;\n"
+                "        other.volume = 0.5f;\n"
+                "        other.clip = null;\n"
+                "        musicSource.Stop();\n"
+                "        musicSource.Play();\n"
+                "        System.Console.WriteLine(other);\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Music.cs.meta"), "w") as f:
+            f.write("guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Music\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "  - component: {fileID: 4}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!82 &3\nAudioSource:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n"
+                "  m_PlayOnAwake: 1\n"
+                "  m_Volume: 1\n"
+                "  m_Pitch: 1\n"
+                "  Loop: 0\n"
+                "  Mute: 0\n"
+                "--- !u!114 &4\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}\n"
+                "  musicSource: {fileID: 3}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-audio-out-")
+        plan = unity_pack.pack(root, d)
+        self.assertIn("AudioSource", plan.get("addcomponent_types") or [])
+        self.assertEqual(len(plan.get("audiosources") or []), 1)
+        self.assertIn("3", plan.get("audiosource_by_file_id") or {})
+        music = plan["classes"]["Music"]["instances"][0]
+        self.assertEqual(music.get("object_refs", {}).get("musicSource"), "3")
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("GameObject_AddComponent_AudioSource", eng)
+        self.assertIn("AudioSource_Play", eng)
+        self.assertIn("AudioSource_Stop", eng)
+        self.assertIn("AudioSource_ToString", eng)
+        self.assertIn("_AudioSource_volume", eng)
+        self.assertIn("_AudioSource_playing", eng)
+        # Method body lowers props / Play against packed indices.
+        self.assertIn("GameObject_AddComponent_AudioSource", eng)
+        self.assertIn("_AudioSource_play_on_awake[", eng)
+        self.assertIn("_AudioSource_loop[", eng)
+        self.assertIn("AudioSource_Play(", eng)
+        self.assertIn("AudioSource_Stop(", eng)
+        with open(os.path.join(d, "data.c")) as f:
+            data = f.read()
+        self.assertIn("int _AudioSource_count = 1;", data)
+        self.assertIn("_AudioSource_owner_go", data)
+
     @needs_cc
     def test_addcomponent_disallow_multiple_prints_unity_error(self):
         """Player has no SpriteRenderer — AddComponent succeeds and prints it."""
@@ -4393,7 +4470,27 @@ class TestSystems(unittest.TestCase):
             )
         with self.assertRaises(unity_pack.PackError) as cm:
             unity_pack.pack(root, tempfile.mkdtemp(prefix="upack-out-"))
-        self.assertIn("ParticleSystem", cm.exception.message)
+        msg = cm.exception.message
+        self.assertIn("Assets/Scripts/Spark.cs(", msg)
+        self.assertIn("error CS0117", msg)
+        self.assertIn("ParticleSystem", msg)
+        self.assertIn("Emit", msg)
+
+    def test_refuses_canvas_is_cs0246_with_site(self):
+        """AddComponent<Canvas> invent → CS0246 at the type token."""
+        src = (
+            "using UnityEngine;\n"
+            "public class Sel : MonoBehaviour {\n"
+            "    void Start() { gameObject.AddComponent<Canvas>(); }\n"
+            "}\n"
+        )
+        path = "/proj/Assets/Scripts/Unity Overrides/_Selectable.cs"
+        with self.assertRaises(unity_pack.PackError) as cm:
+            unity_pack.analyze_script(path, src)
+        self.assertIn("error CS0246", cm.exception.message)
+        self.assertIn("Canvas", cm.exception.message)
+        self.assertIn("Assets/Scripts/Unity Overrides/_Selectable.cs(",
+                      cm.exception.message)
 
     def test_ast_find_getcomponent_chain(self):
         """cpprust paren/angle parse of Find().GetComponent<T>().field."""
@@ -4582,8 +4679,10 @@ class TestSystems(unittest.TestCase):
             )
         with self.assertRaises(unity_pack.PackError) as cm:
             unity_pack.pack(root, tempfile.mkdtemp(prefix="upack-out-"))
-        self.assertIn("Keyboard", cm.exception.message)
-        self.assertIn("InputSystem", cm.exception.message)
+        msg = cm.exception.message
+        self.assertIn("Assets/Scripts/PadBare.cs(", msg)
+        self.assertIn("error CS0246", msg)
+        self.assertIn("Keyboard", msg)
 
     @needs_cc
     def test_debug_log_and_print_go_to_player_log(self):
@@ -4877,18 +4976,19 @@ class TestSystems(unittest.TestCase):
                 "    public InputAction move;\n"
                 "    public void Update() { move.ReadValue<float>(); }\n"
                 "}\n",
-                "InputAction",
+                ("CS0246", "InputAction"),
             ),
             (
                 "using UnityEngine;\n"
-                "using UnityEngine.UI;\n"
                 "public class Hud : MonoBehaviour {\n"
-                "    public void Update() { }\n"
+                "    void Start() {\n"
+                "        gameObject.AddComponent<Canvas>();\n"
+                "    }\n"
                 "}\n",
-                "UnityEngine.UI",
+                ("CS0246", "Canvas"),
             ),
         ]
-        for src, needle in cases:
+        for src, needles in cases:
             root = tempfile.mkdtemp(prefix="upack-refuse-")
             scripts = os.path.join(root, "Assets", "Scripts")
             os.makedirs(scripts)
@@ -4914,7 +5014,26 @@ class TestSystems(unittest.TestCase):
                 )
             with self.assertRaises(unity_pack.PackError) as cm:
                 unity_pack.pack(root, tempfile.mkdtemp(prefix="upack-out-"))
-            self.assertIn(needle, cm.exception.message)
+            msg = cm.exception.message
+            self.assertIn("Assets/Scripts/X.cs(", msg)
+            self.assertIn(": error ", msg)
+            for needle in needles:
+                self.assertIn(needle, msg)
+
+    def test_using_unityengine_ui_allowed_for_image_field(self):
+        """using UnityEngine.UI + Image field is authored wiring, not invent."""
+        src = (
+            "using UnityEngine;\n"
+            "using UnityEngine.UI;\n"
+            "public class Hud : MonoBehaviour {\n"
+            "    public Image preview;\n"
+            "    void Update() { }\n"
+            "}\n"
+        )
+        path = "/proj/Assets/Scripts/Hud.cs"
+        a = unity_pack.analyze_script(path, src)
+        self.assertNotIn("UnityEngine.UI", a["apis"])
+        self.assertNotIn("Canvas", a["apis"])
 
 
 @needs_cc

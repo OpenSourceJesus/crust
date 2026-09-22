@@ -5,9 +5,12 @@ project. It **does not invent assets**: no synthetic ParticleSystem
 pools, no default AnimationCurves, no scripted UI invent, no InputAction maps.
 Runtime `AddComponent<T>()` works for packed builtins (Camera, Light,
 SpriteRenderer, Rigidbody/2D, Box/Circle/Sphere colliders, Animation,
-Animator) and for authored MonoBehaviours — GetOrAdd into a pre-sized pool
-(one spare slot per calling instance). Authored scene Canvas + Image/Button/TextMeshProUGUI
-are drawn; scripted `UnityEngine.UI` stays refused. Scripts that need
+Animator, AudioSource) and for authored MonoBehaviours — GetOrAdd into a
+pre-sized pool (one spare slot per calling instance). AudioSource allows
+multiple sources on one GO (Unity does not DisallowMultiple). Authored scene
+Canvas + Image/Button/TextMeshProUGUI
+are drawn; `using UnityEngine.UI` and Image/Button fields are allowed. Scripted invent
+(`AddComponent<Canvas>`, `typeof(Canvas)`, `ForceUpdateCanvases`) stays refused. Scripts that need
 other Unity features keep them in the authored project until the packer can
 import them; calling
 invent-requiring APIs today is a hard `PackError`.
@@ -251,8 +254,8 @@ fire on host pointer press (`engine_pointer_x/y/down`, screen space, origin
 bottom-left); inactive parents hide children (`activeInHierarchy`). Canvas
 sorting layer/order apply to child Images/Buttons; TMP sorts one order
 above its Canvas. EventSystem / GraphicRaycaster / legacy `UI.Text` are
-not imported. Scripted `UnityEngine.UI` / `AddComponent<Canvas>` remain
-refused (no invent).
+not imported. `AddComponent<Canvas>` / `typeof(Canvas)` / `ForceUpdateCanvases`
+remain refused (no invent); `using UnityEngine.UI` and Image fields are fine.
 
 Asset GUIDs resolve under `Assets/`, `Packages/`, and
 `Library/PackageCache/` (UPM). Only `Assets/**/*.cs` become packed
@@ -314,9 +317,10 @@ AABB of the OBB (authored `m_LocalRotation`). No PolygonCollider2D yet.
 | Script uses | Emitted |
 |-------------|---------|
 | `gameObject.AddComponent<T>()` / `AddComponent<T>()` | `GameObject_AddComponent_T(go)` — GetOrAdd |
-| Builtin `T` (Camera, Light, SpriteRenderer, RB, colliders) | Pre-sized pool; returns existing if already on the GO |
+| Builtin `T` (Camera, Light, SpriteRenderer, RB, colliders, AudioSource) | Pre-sized pool; returns existing if already on the GO (AudioSource always adds) |
 | Authored MonoBehaviour `T` | Spare instance slots (`n` + budget); mutable GO map |
 | `Console.WriteLine(component)` | `T_ToString(index)` → `"name (UnityEngine.T)"` |
+| `audio.Play` / `Stop` / `volume` / `loop` / `clip` | Host-observable `_AudioSource_*` tables (clip = opaque index; `null` → `-1`) |
 
 Pool budget is one slot per instance of each class that calls `AddComponent<T>`
 (so Update-loop calls reuse the same component). `AddComponent<ParticleSystem>` /
@@ -329,7 +333,8 @@ Pool budget is one slot per instance of each class that calls `AddComponent<T>`
 | `ParticleSystem.Emit` / `AddComponent<ParticleSystem>` | Needs a ParticleSystem; packer will not invent a pool |
 | `AnimationCurve.Evaluate` | Needs authored curves; packer will not invent keyframes |
 | `InputAction` / `Gamepad.current` | Needs Input System assets / runtime |
-| `UnityEngine.UI` / `AddComponent<Canvas>` | Author Canvas+Image in the scene; no script invent |
+| `UnityEngine.UI` using / Image·Button fields | Allowed (authored wiring); invent via `AddComponent<Canvas>` / `typeof(Canvas)` refused |
+| `AddComponent<Canvas>` / `Canvas.ForceUpdateCanvases` | Author Canvas+Image in the scene; no script invent |
 | `Camera.main` with no scene Camera | Packer will not invent a default camera |
 
 ## Tick order
