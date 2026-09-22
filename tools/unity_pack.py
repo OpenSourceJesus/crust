@@ -11966,6 +11966,58 @@ def emit_shader_compiler(platform):
 # Drive
 # ---------------------------------------------------------------------------
 
+def _mb_typename_to_script(root, guids):
+    """MonoBehaviour class name → authored .cs path under Assets/."""
+    out = {}
+    for _g, path in (guids or {}).items():
+        if not path or not _is_player_csharp(root, path):
+            continue
+        name = _class_name_from_cs(path)
+        if name:
+            out.setdefault(name, os.path.abspath(path))
+    return out
+
+
+def _script_guid_for_path(guids, script_path):
+    want = os.path.abspath(script_path)
+    for g, path in (guids or {}).items():
+        if path and os.path.abspath(path) == want:
+            return g
+    return None
+
+
+def _load_prefab_objects_for_types(root, type_names, guids, assets, typename_map):
+    """Parse .prefab assets that author *type_names* MonoBehaviours."""
+    if not type_names:
+        return []
+    want_guids = set()
+    for t in type_names:
+        sp = typename_map.get(t)
+        if not sp:
+            continue
+        g = _script_guid_for_path(guids, sp)
+        if g:
+            want_guids.add(g.lower())
+    if not want_guids:
+        return []
+    out = []
+    prefabs = list(_walk_files(root, (".prefab",)))
+    for pi, path in enumerate(prefabs):
+        raw = _read(path)
+        low = raw.lower()
+        if not any(g in low for g in want_guids):
+            continue
+        if prefabs and ((pi + 1) % 25 == 0 or pi + 1 == len(prefabs)):
+            _progress("  prefab %d/%d %s" % (
+                pi + 1, len(prefabs), os.path.basename(path)))
+        objs, _l, _c, _h = parse_unity_yaml(
+            raw, guid_to_script=guids, asset_guids=assets)
+        for o in objs:
+            if o.get("class") in type_names:
+                out.append(o)
+    return out
+
+
 def load_project(root):
     root = os.path.abspath(root)
     if not os.path.isdir(root):
@@ -11974,6 +12026,7 @@ def load_project(root):
     _progress("reading .meta guid maps")
     assets = _asset_guid_map(root)
     guids = _guid_map(root, asset_guids=assets)
+    typename_map = _mb_typename_to_script(root, guids)
     objects = []
     lights = []
     cameras = []
@@ -12015,6 +12068,43 @@ def load_project(root):
         if scripts and ((i + 1) % 25 == 0 or i + 1 == len(scripts)):
             _progress("  scripts %d/%d" % (i + 1, len(scripts)))
         analyses.append(analyze_script(p))
+
+    # GetComponent / field refs to other authored MBs — pull instances from
+    # prefabs and shallow-analyze those scripts (live GO maps, no vendor emit).
+    needed = set()
+    for a in analyses:
+        needed |= set(a.get("getcomponent_types") or [])
+        needed |= set(a.get("addcomponent_types") or [])
+        for c in a.get("classes") or []:
+            for f in c.get("fields") or []:
+                ty = f.get("ty") or ""
+                if ty in typename_map:
+                    needed.add(ty)
+    have_classes = {o.get("class") for o in objects}
+    missing = sorted(
+        t for t in needed
+        if t not in have_classes
+        and t not in _ADDABLE_BUILTINS
+        and t not in _PHYSICS_COMPONENTS
+        and t not in _UI_GETCOMPONENT_TYPES
+        and t in typename_map)
+    if missing:
+        _progress("loading prefab components for %s" % ", ".join(missing))
+        prefab_objs = _load_prefab_objects_for_types(
+            root, set(missing), guids, assets, typename_map)
+        objects.extend(prefab_objs)
+        for t in missing:
+            sp = typename_map[t]
+            if any(os.path.abspath(a.get("path") or "") == sp for a in analyses):
+                continue
+            a = analyze_script(sp, shallow=True)
+            for c in a.get("classes") or []:
+                c["methods"] = []  # pack type + instances; don't lower Fracture
+            a["apis"] = set()
+            a["getcomponent_types"] = set()
+            a["addcomponent_types"] = set()
+            analyses.append(a)
+
     have = set()
     for a in analyses:
         for c in a["classes"]:
