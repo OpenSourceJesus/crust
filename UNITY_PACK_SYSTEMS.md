@@ -15,8 +15,14 @@ invent-requiring APIs today is a hard `PackError`.
 Emitted `engine.cpp` / `data.cpp` / `main.cpp` (C++-subset twins) are
 gated through `cpprust.translate`, then the translated C is compiled with
 crust/`shivyc`. Leaving that subset or failing crust compile is a
-`PackError` on the generated file. Host `Makefile` still uses `gcc`;
-`make crust-check` recompiles the `.c` files with crust.
+`PackError` on the generated file. Host `Makefile` defaults to `gcc`
+(`CC=clang` for clang). Engine objects use `-O3 -fno-math-errno` (math loops
+can autovec). `make vectorize-report` compiles `engine.c` with those flags plus
+`clang -Rpass-missed=loop-vectorize,slp-vectorize` so missed auto-vectorization
+remarks print on stderr. `make crust-check` recompiles the `.c` files with
+crust. Microbenches `tools/unity_pack_bench_upload.py` and
+`tools/unity_pack_bench_csharp.py` time C under both gcc and clang when both
+are on PATH (`--cc` to restrict).
 
 What *is* lowered: APIs and methods on the MonoBehaviours / scene
 instances that are already placed.
@@ -168,6 +174,8 @@ slot (intensity 1, white) into the light table.
 | `transform.Find` (child name or `"A/B"` path) | Authored `m_Father` child lookup → GO index or **-1** |
 | `transform.parent` | Authored `m_Father` → parent GO index or **-1** |
 | `transform.SetParent` (Transform / null, optional `worldPositionStays`) | Live `_engine_go_parent` + xf parent; stays=true keeps world T |
+| `transform.Find` (child name or `"A/B"` path) | Live parent table child lookup → GO index or **-1** |
+| `transform.parent` | Live `_engine_go_parent` (seeded `m_Father`) → parent GO index or **-1** |
 | `transform.gameObject` | Same GO index as this Transform (packed Transform ≡ GameObject) |
 | `transform.worldToLocalMatrix` / `localToWorldMatrix` | Live TRS → `Matrix4x4` (same affine as TransformPoint) |
 | `transform.localScale` | Allowed (CS1061 cleared); live scale tables when SetWorldScale / scale draws / matrices need them |

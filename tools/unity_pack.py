@@ -11116,15 +11116,19 @@ def emit_makefile(outdir):
     py = sys.executable
     # Absolute paths so `make crust-check` works from the outdir.
     return (
-        "# generated — engine at -O3, data at -O0; main.c is a headless host\n"
+        "# generated — engine at -O3 -fno-math-errno, data at -O0; "
         "main.c is a headless host\n"
+        "# CC=clang for clang builds; make vectorize-report for loop/SLP miss remarks\n"
         "CC ?= gcc\n"
+        "CLANG ?= clang\n"
+        "CFLAGS_ENGINE ?= -O3 -fno-math-errno\n"
         "CRUST_ROOT ?= %s\n"
         "CRUST_PY ?= %s\n"
         "CRUST = $(CRUST_PY) -m shivyc.main --no-cache\n"
+        ".PHONY: all crust-check vectorize-report clean\n"
         "all: game\n"
         "engine.o: engine.c\n"
-        "\t$(CC) -O3 -c -o $@ $<\n"
+        "\t$(CC) $(CFLAGS_ENGINE) -c -o $@ $<\n"
         "data.o: data.c\n"
         "\t$(CC) -O0 -c -o $@ $<\n"
         "main.o: main.c engine_draw.h\n"
@@ -11132,6 +11136,10 @@ def emit_makefile(outdir):
         "game: engine.o data.o main.o\n"
         "\t$(CC) -O2 -o $@ engine.o data.o main.o -lm\n"
         "# Clang remarks: which loops miss auto-vectorization (stderr).\n"
+        "vectorize-report: engine.c\n"
+        "\t$(CLANG) $(CFLAGS_ENGINE) "
+        "-Rpass-missed=loop-vectorize,slp-vectorize "
+        "-c -o engine.vectorize.o engine.c\n"
         "# Compile packed C with crust/shivyc (C++ twins gate at pack time).\n"
         "crust-check: engine.c data.c main.c engine.cpp data.cpp main.cpp\n"
         "\tcd $(CRUST_ROOT) && $(CRUST) -c -D CRUST_NO_POSIX_MKDIR "
@@ -11141,7 +11149,7 @@ def emit_makefile(outdir):
         "\tcd $(CRUST_ROOT) && $(CRUST) -c "
         "-o $(CURDIR)/main.crust.o $(CURDIR)/main.c\n"
         "clean:\n"
-        "\trm -f engine.o data.o main.o game "
+        "\trm -f engine.o data.o main.o game engine.vectorize.o "
         "engine.crust.o data.crust.o main.crust.o\n"
         % (repo, py)
     )
@@ -11570,7 +11578,7 @@ def build_player_executable(outdir, product):
                     " ".join(cmd[:6]), err or ("exit %d" % r.returncode)))
 
     _progress("compiling engine.c")
-    _run([cc, "-O3", "-c", "-o", engine_o, engine_c])
+    _run([cc, "-O3", "-fno-math-errno", "-c", "-o", engine_o, engine_c])
     _progress("compiling data.c")
     _run([cc, "-O0", "-c", "-o", data_o, data_c])
 

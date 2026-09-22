@@ -8,11 +8,14 @@ contiguous float buffer (the CPU side of a GPU upload).
   C AoS — array of structs; gather (Unity/engine default shape)
   C SoA — float pos[N][3] table; contiguous memcpy (unity_pack --soa)
 
+C legs run under gcc and clang when both are installed (label cc=...).
+
     python3 tools/unity_pack_bench_csharp.py
     python3 tools/unity_pack_bench_csharp.py --n 50000 --iters 5000
+    python3 tools/unity_pack_bench_csharp.py --cc clang
 
-Needs: gcc/cc, and `dotnet` (SDK) for the C# leg. Skips C# with a clear
-reason if dotnet is missing.
+Needs: gcc and/or clang (or cc), and `dotnet` (SDK) for the C# leg. Skips
+C# with a clear reason if dotnet is missing.
 """
 
 from __future__ import annotations
@@ -26,8 +29,23 @@ import sys
 import tempfile
 import textwrap
 
-_CC = shutil.which("gcc") or shutil.which("cc")
 _DOTNET = shutil.which("dotnet")
+
+
+def _host_ccs(restrict: str | None = None):
+    """[(name, path), ...] — gcc and clang when present; else cc."""
+    out = []
+    for name in ("gcc", "clang"):
+        if restrict and name != restrict:
+            continue
+        path = shutil.which(name)
+        if path:
+            out.append((name, path))
+    if not out and not restrict:
+        cc = shutil.which("cc")
+        if cc:
+            out.append(("cc", cc))
+    return out
 
 
 CS_PROGRAM = r"""
@@ -237,18 +255,18 @@ def _parse_ns(line: str) -> float:
     return float(m.group(1))
 
 
-def run_c(src: str, n: int, iters: int, tag: str) -> str:
-    if not _CC:
-        raise SystemExit("need gcc/cc")
+def run_c(src: str, n: int, iters: int, tag: str,
+          cc_name: str, cc_path: str) -> str:
     d = tempfile.mkdtemp(prefix="soa-vs-cs-%s-" % tag)
     path = os.path.join(d, "bench.c")
     with open(path, "w") as f:
         f.write(_sub(src, n, iters))
     exe = os.path.join(d, "bench")
     subprocess.check_call(
-        [_CC, "-O3", "-o", exe, path],
+        [cc_path, "-O3", "-fno-math-errno", "-o", exe, path],
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    return subprocess.check_output([exe], text=True).strip()
+    out = subprocess.check_output([exe], text=True).strip()
+    return "cc=%s %s" % (cc_name, out)
 
 
 def run_csharp(n: int, iters: int) -> str:
@@ -284,24 +302,38 @@ def main() -> int:
                     help="instance count (default 10000)")
     ap.add_argument("--iters", type=int, default=10000,
                     help="timed iterations (default 10000)")
+    ap.add_argument("--cc", choices=("gcc", "clang"), default=None,
+                    help="restrict C legs to one compiler (default: all found)")
     args = ap.parse_args()
     n, iters = args.n, args.iters
     if n < 1 or n > 65535:
         sys.stderr.write("--n must be 1..65535 (index-friendly bound)\n")
         return 2
 
+    ccs = _host_ccs(args.cc)
+    if not ccs:
+        if args.cc:
+            raise SystemExit("need %s on PATH" % args.cc)
+        raise SystemExit("need gcc, clang, or cc")
+
     print("position upload bench: N=%d iters=%d" % (n, iters))
     print("(gather/copy into contiguous float[N*3] — CPU side of a GPU upload)")
     print("")
 
     rows = []
-    line = run_c(C_AOS, n, iters, "caos")
-    print(line)
-    rows.append(("C AoS struct gather", _parse_ns(line)))
+    for cc_name, cc_path in ccs:
+        line = run_c(C_AOS, n, iters, "caos-%s" % cc_name, cc_name, cc_path)
+        print(line)
+        rows.append(("%s C AoS struct gather" % cc_name, _parse_ns(line)))
 
-    line = run_c(C_SOA, n, iters, "csoa")
-    print(line)
-    rows.append(("C SoA table memcpy", _parse_ns(line)))
+        line = run_c(C_SOA, n, iters, "csoa-%s" % cc_name, cc_name, cc_path)
+        print(line)
+        rows.append(("%s C SoA table memcpy" % cc_name, _parse_ns(line)))
+
+    if not shutil.which("clang") and args.cc is None:
+        print("clang skipped: not on PATH", file=sys.stderr)
+    if not shutil.which("gcc") and args.cc is None and shutil.which("clang"):
+        print("gcc skipped: not on PATH", file=sys.stderr)
 
     if _DOTNET:
         try:
@@ -315,14 +347,18 @@ def main() -> int:
 
     print("")
     base = next((ns for name, ns in rows if "C# class" in name), None)
-    soa = next((ns for name, ns in rows if "SoA" in name), None)
-    aos = next((ns for name, ns in rows if "AoS struct" in name), None)
-    if base and soa and soa > 0:
-        print("SoA vs C# class: %.2fx faster (%.2f ns vs %.2f ns per upload)"
-              % (base / soa, soa, base))
-    if aos and soa and soa > 0:
-        print("SoA vs C AoS:   %.2fx faster (%.2f ns vs %.2f ns per upload)"
-              % (aos / soa, soa, aos))
+    for cc_name, _path in ccs:
+        soa = next((ns for name, ns in rows
+                    if name.startswith(cc_name + " ") and "SoA" in name), None)
+        aos = next((ns for name, ns in rows
+                    if name.startswith(cc_name + " ") and "AoS struct" in name),
+                   None)
+        if base and soa and soa > 0:
+            print("%s SoA vs C# class: %.2fx faster (%.2f ns vs %.2f ns)"
+                  % (cc_name, base / soa, soa, base))
+        if aos and soa and soa > 0:
+            print("%s SoA vs C AoS:   %.2fx faster (%.2f ns vs %.2f ns)"
+                  % (cc_name, aos / soa, soa, aos))
     return 0
 
 

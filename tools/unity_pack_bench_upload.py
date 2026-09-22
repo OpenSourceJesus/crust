@@ -4,21 +4,23 @@
 Packs MiniScene twice (default AoS and --soa), links a tiny host that
 calls engine_upload_positions many times, and prints ns/call.
 
+Runs under gcc and clang when both are installed (label cc=...).
+
     python3 tools/unity_pack_bench_upload.py
+    python3 tools/unity_pack_bench_upload.py --cc clang
 """
 
 from __future__ import annotations
 
+import argparse
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
-import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROJECT = os.path.join(ROOT, "examples", "unity_pack", "MiniScene")
-_CC = shutil.which("gcc") or shutil.which("cc")
 
 HOST = r"""
 #include "engine_draw.h"
@@ -50,9 +52,23 @@ int main(void) {
 """
 
 
-def build_and_run(soa: bool) -> str:
-    if not _CC:
-        raise SystemExit("need gcc/cc")
+def _host_ccs(restrict: str | None = None):
+    """[(name, path), ...] — gcc and clang when present; else cc."""
+    out = []
+    for name in ("gcc", "clang"):
+        if restrict and name != restrict:
+            continue
+        path = shutil.which(name)
+        if path:
+            out.append((name, path))
+    if not out and not restrict:
+        cc = shutil.which("cc")
+        if cc:
+            out.append(("cc", cc))
+    return out
+
+
+def build_and_run(soa: bool, cc_name: str, cc_path: str) -> str:
     d = tempfile.mkdtemp(prefix="upack-bench-")
     cmd = [sys.executable, os.path.join(ROOT, "tools", "unity_pack.py"),
            PROJECT, "-o", d]
@@ -64,23 +80,38 @@ def build_and_run(soa: bool) -> str:
         f.write("#include <time.h>\n")
         f.write(HOST)
     subprocess.check_call(
-        [_CC, "-O3", "-c", "-o", os.path.join(d, "engine.o"),
+        [cc_path, "-O3", "-fno-math-errno", "-c", "-o",
+         os.path.join(d, "engine.o"),
          os.path.join(d, "engine.c")])
     subprocess.check_call(
-        [_CC, "-O0", "-c", "-o", os.path.join(d, "data.o"),
+        [cc_path, "-O0", "-c", "-o", os.path.join(d, "data.o"),
          os.path.join(d, "data.c")])
     exe = os.path.join(d, "bench")
     subprocess.check_call(
-        [_CC, "-O3", "-o", exe, host,
+        [cc_path, "-O3", "-fno-math-errno", "-o", exe, host,
          os.path.join(d, "engine.o"), os.path.join(d, "data.o"),
          "-I", d, "-lm"])
-    out = subprocess.check_output([exe], text=True)
-    return out.strip()
+    out = subprocess.check_output([exe], text=True).strip()
+    return "cc=%s %s" % (cc_name, out)
 
 
 def main() -> int:
-    print("AoS ", build_and_run(False))
-    print("SoA ", build_and_run(True))
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--cc", choices=("gcc", "clang"), default=None,
+                    help="restrict to one compiler (default: all found)")
+    args = ap.parse_args()
+    ccs = _host_ccs(args.cc)
+    if not ccs:
+        if args.cc:
+            raise SystemExit("need %s on PATH" % args.cc)
+        raise SystemExit("need gcc, clang, or cc")
+    for name, path in ccs:
+        print("AoS ", build_and_run(False, name, path))
+        print("SoA ", build_and_run(True, name, path))
+    if not shutil.which("clang") and args.cc is None:
+        print("clang skipped: not on PATH", file=sys.stderr)
+    if not shutil.which("gcc") and args.cc is None and shutil.which("clang"):
+        print("gcc skipped: not on PATH", file=sys.stderr)
     return 0
 
 
