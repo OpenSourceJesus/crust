@@ -10877,8 +10877,10 @@ def emit_engine(plan, analyses, used_apis):
                 go_vals.append(str(gi))
                 btn_vals.append(str(btn_by_go.get(gi, -1)))
             p("        static const int _spr_go[] = { %s };" % ", ".join(go_vals))
-            p("        static const int _spr_btn[] = { %s };" % ", ".join(
-                btn_vals))
+            # ColorBlock tint table only exists when authored Buttons do.
+            if ui_buttons:
+                p("        static const int _spr_btn[] = { %s };" % ", ".join(
+                    btn_vals))
         p("        int k;")
         p("        for (k = 0; k < %d && n < max; k = k + 1) {" % len(spr_idx))
         p("            unsigned i = _spr_i[k];")
@@ -10970,8 +10972,10 @@ def emit_engine(plan, analyses, used_apis):
         p("            out[n].g = _spr_g[k];")
         p("            out[n].b = _spr_b[k];")
         p("            out[n].a = _spr_a[k];")
-        if want_ui:
+        if want_ui and ui_buttons:
             # ColorBlock multiplies Image.m_Color (Unity Selectable).
+            # Tint helpers are only emitted when ui_buttons is non-empty;
+            # want_ui alone can be SetActive without any Button.
             p("            if (_spr_btn[k] >= 0) {")
             p("                int bi = _spr_btn[k] * 4;")
             p("                _engine_ui_btn_tint_init();")

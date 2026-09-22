@@ -4522,6 +4522,83 @@ class TestSystems(unittest.TestCase):
         self.assertIn("static void Menu_Awake(unsigned i)", eng)
         self.assertIn("GameObject_SetActive(_engine_go_of_Menu(i), (0))", eng)
         self.assertIn("Menu_Awake((unsigned)n)", eng)
+        # SetActive alone sets want_ui; ColorBlock tint must not be referenced
+        # without authored Buttons (would be undeclared).
+        self.assertNotIn("_engine_ui_btn_tint_init", eng)
+
+    def test_setactive_with_sprite_omits_btn_tint(self):
+        """want_ui from SetActive + SpriteRenderer, no Button → no tint refs."""
+        root = tempfile.mkdtemp(prefix="upack-sa-spr-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        spr = os.path.join(root, "Assets", "Sprites")
+        os.makedirs(spr)
+        import struct, zlib
+
+        def write_png(path, w, h):
+            def chunk(tag, body):
+                return (struct.pack(">I", len(body)) + tag + body
+                        + struct.pack(">I", zlib.crc32(tag + body) & 0xffffffff))
+            raw = b""
+            for _y in range(h):
+                raw += b"\x00" + (b"\xff\xff\xff\xff" * w)
+            open(path, "wb").write(
+                b"\x89PNG\r\n\x1a\n"
+                + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(raw, 9))
+                + chunk(b"IEND", b""))
+
+        write_png(os.path.join(spr, "q.png"), 8, 8)
+        with open(os.path.join(spr, "q.png.meta"), "w") as f:
+            f.write(
+                "guid: 33333333333333333333333333333333\n"
+                "TextureImporter:\n"
+                "  spritePixelsToUnits: 8\n"
+            )
+        with open(os.path.join(scripts, "Menu.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Menu : MonoBehaviour {\n"
+                "    void Awake() { gameObject.SetActive(false); }\n"
+                "    void Update() {}\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Menu.cs.meta"), "w") as f:
+            f.write("guid: menusprmenusprmenusprmenuspr01\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Menu\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "  - component: {fileID: 4}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: menusprmenusprmenusprmenuspr01}\n"
+                "--- !u!212 &4\nSpriteRenderer:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n"
+                "  m_Sprite: {fileID: 21300000, "
+                "guid: 33333333333333333333333333333333, type: 3}\n"
+                "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-sa-spr-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("GameObject_SetActive", eng)
+        self.assertIn("_spr_go", eng)
+        # Draw must not call ColorBlock helpers that were never emitted.
+        self.assertNotIn("_engine_ui_btn_tint_init", eng)
+        self.assertNotIn("_engine_ui_btn_tint[", eng)
+        self.assertNotIn("_spr_btn", eng)
 
     def test_vector3_plus_equals_vector2_is_cs0034(self):
         """transform.position is Vector3; += Vector2 is ambiguous in csc."""
