@@ -3210,9 +3210,9 @@ def _ast_find_getcomponent_chains(text):
             "field": field,
             "axis": axis,
         })
-    # Standalone this.GetComponent<T>() / GetComponent<T>()
+    # Standalone this.GetComponent<T>() / GetComponent<T>() — not recv.GetComponent.
     for m in re.finditer(
-            r"(?:(?<![\w.])this\s*\.\s*)?GetComponent\s*<", scan):
+            r"(?:(?<![\w.])this\s*\.\s*)?(?<![\w.])GetComponent\s*<", scan):
         # Skip if already covered as part of a Find chain.
         if any(c["start"] <= m.start() < c["end"] for c in out):
             continue
@@ -3247,6 +3247,46 @@ def _ast_find_getcomponent_chains(text):
             "field": field,
             "axis": axis,
             "on_this": True,
+        })
+    # recv.GetComponent<T>() — GO / component handle is already an index.
+    for m in re.finditer(r"(?<![\w.])(\w+)\s*\.\s*GetComponent\s*<", scan):
+        recv = m.group(1)
+        if recv == "this":
+            continue
+        if any(c["start"] <= m.start() < c["end"] for c in out):
+            continue
+        angle_open = m.end() - 1
+        angle_close = cpprust._match_angle(scan, angle_open)
+        if angle_close is None:
+            continue
+        comp_ty, type_idx = _comp_type_span(angle_open, angle_close)
+        after_angle = scan[angle_close + 1:]
+        if after_angle.find("(") < 0:
+            continue
+        g_open = angle_close + 1 + after_angle.find("(")
+        g_close = cpprust._match_paren(scan, g_open)
+        if g_close is None:
+            continue
+        end = g_close + 1
+        field = None
+        axis = None
+        fm = re.match(
+            r"\s*\.\s*([A-Za-z_]\w*)\b(?:\s*\.\s*([xyz]))?",
+            scan[end:])
+        if fm:
+            field = fm.group(1)
+            axis = fm.group(2)
+            end = end + fm.end()
+        out.append({
+            "start": m.start(),
+            "end": end,
+            "find_args": None,
+            "component": comp_ty,
+            "type_idx": type_idx,
+            "field": field,
+            "axis": axis,
+            "recv": recv,
+            "on_this": False,
         })
     out.sort(key=lambda c: c["start"], reverse=True)
     return out
@@ -4702,6 +4742,26 @@ def _rewrite_find_getcomponent(text, plan, this_class, site=None):
 
         find_args = ch.get("find_args") or ""
         go_expr = "GameObject_Find(%s)" % find_args
+        if ch.get("recv"):
+            # newGo.GetComponent<T>() — recv is a GO / component index.
+            recv = ch["recv"]
+            if recv in ("gameObject", "this"):
+                go_expr = "_engine_go_of_%s(i)" % _c_ident(this_class)
+            else:
+                go_expr = recv
+            if not comp:
+                repl = go_expr
+            else:
+                if not _known_component(comp):
+                    _raise_unknown_comp(ch, comp)
+                if field:
+                    repl = _field_after_get(
+                        comp, field, go_expr, line, axis, body_idx)
+                else:
+                    repl = "GameObject_GetComponent_%s(%s)" % (
+                        _c_ident(comp), go_expr)
+            text = text[:ch["start"]] + repl + text[ch["end"]:]
+            continue
         if not comp:
             repl = go_expr
         else:
@@ -6699,7 +6759,7 @@ def emit_engine(plan, analyses, used_apis):
         go_comps = plan.get("go_components") or {}
         go_rb2d = plan.get("go_rigidbody2d") or {}
         go_rb3d = plan.get("go_rigidbody") or {}
-        p("/* GameObject.Find / GetComponent — authored scene tables only */")
+        p("/* GameObject.Find / GetComponent — live GO tables (seeded authored) */")
         p("static const int _engine_go_count = %d;" % len(go_names))
         if go_names:
             p("static const char *_engine_go_name[%d] = {" % len(go_names))
@@ -6749,7 +6809,12 @@ def emit_engine(plan, analyses, used_apis):
             if not vals:
                 vals = ["-1"]
             mb_budget = int(add_budget.get(cname) or 0)
-            if mb_budget:
+            # Live GO→component map whenever GetComponent/AddComponent can run.
+            live_go = (
+                mb_budget
+                or cname in getcomponent_types
+                or "GetComponent" in used_apis)
+            if live_go:
                 p("static int _engine_go_%s[%d] = { %s };" % (
                     idn, len(vals), ", ".join(vals)))
             else:
@@ -6763,7 +6828,7 @@ def emit_engine(plan, analyses, used_apis):
                 if cname in cmap and n in go_names:
                     gi = go_names.index(n)
                     rev[cmap[cname]] = str(gi)
-            if mb_budget:
+            if live_go:
                 p("static int _engine_%s_go_of[%d] = { %s };" % (
                     idn, len(rev), ", ".join(rev)))
             else:
@@ -6796,8 +6861,17 @@ def emit_engine(plan, analyses, used_apis):
             p("    return _object_tostring_buf;")
             p("}")
             p("")
-        # Authored uGUI GetComponent<T> — opaque GO handles (not AddComponent invent).
-        ui_gc = sorted(getcomponent_types & _UI_GETCOMPONENT_TYPES)
+        # RectTransform ≡ Transform ≡ GO index (live handle, no side table).
+        if "RectTransform" in getcomponent_types and want_go_tables:
+            p("static int GameObject_GetComponent_RectTransform(int go) {")
+            p("    if (go < 0 || go >= _engine_go_count) return -1;")
+            p("    return go;")
+            p("}")
+            p("")
+        # Live uGUI GetComponent maps (mutable; seeded from authored presence).
+        ui_gc = sorted(
+            (getcomponent_types & _UI_GETCOMPONENT_TYPES)
+            - {"RectTransform"})
         if ui_gc and want_go_tables:
             ui_maps = plan.get("go_ui_components") or {}
             go_n = max(1, len(go_names))
@@ -6806,14 +6880,12 @@ def emit_engine(plan, analyses, used_apis):
                 present = set(ui_maps.get(ty) or [])
                 vals = []
                 for i, n in enumerate(go_names if go_names else [""]):
-                    if ty == "RectTransform":
-                        vals.append(str(i))
-                    elif n in present:
+                    if n in present:
                         vals.append(str(i))
                     else:
                         vals.append("-1")
-                p("/* GetComponent<%s> — authored UI; handle is GO index */" % ty)
-                p("static const int _engine_go_%s[%d] = { %s };" % (
+                p("/* GetComponent<%s> — live GO map */" % ty)
+                p("static int _engine_go_%s[%d] = { %s };" % (
                     idn, go_n, ", ".join(vals)))
                 p("static int GameObject_GetComponent_%s(int go) {" % idn)
                 p("    if (go < 0 || go >= _engine_go_count) return -1;")

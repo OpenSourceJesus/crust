@@ -334,7 +334,8 @@ Pool budget is one slot per instance of each class that calls `AddComponent<T>`
 | `AnimationCurve.Evaluate` | Needs authored curves; packer will not invent keyframes |
 | `InputAction` / `Gamepad.current` | Needs Input System assets / runtime |
 | `UnityEngine.UI` using / Image·Button·Canvas fields | Allowed (authored wiring) |
-| `GetComponent<Canvas\|Image\|RectTransform\|…>` | Authored UI lookup (GO handle); not invent |
+| `GetComponent<Canvas\|Image\|RectTransform\|…>` | Live `_engine_go_*` maps (RectTransform ≡ GO); seeded authored |
+| `GetComponent<T>` for prefab/scene MBs | Live maps; prefab instances loaded when scene scripts reference `T` |
 | `AddComponent<Canvas>` / `typeof(Canvas)` / `ForceUpdateCanvases` | Refused invent — author `!u!223` in the scene |
 | `Camera.main` with no scene Camera | Packer will not invent a default camera |
 
