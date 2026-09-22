@@ -15,8 +15,14 @@ invent-requiring APIs today is a hard `PackError`.
 Emitted `engine.cpp` / `data.cpp` / `main.cpp` (C++-subset twins) are
 gated through `cpprust.translate`, then the translated C is compiled with
 crust/`shivyc`. Leaving that subset or failing crust compile is a
-`PackError` on the generated file. Host `Makefile` still uses `gcc`;
-`make crust-check` recompiles the `.c` files with crust.
+`PackError` on the generated file. Host `Makefile` defaults to `gcc`
+(`CC=clang` for clang). Engine objects use `-O3 -fno-math-errno` (math loops
+can autovec). `make vectorize-report` compiles `engine.c` with those flags plus
+`clang -Rpass-missed=loop-vectorize,slp-vectorize` so missed auto-vectorization
+remarks print on stderr. `make crust-check` recompiles the `.c` files with
+crust. Microbenches `tools/unity_pack_bench_upload.py` and
+`tools/unity_pack_bench_csharp.py` time C under both gcc and clang when both
+are on PATH (`--cc` to restrict).
 
 What *is* lowered: APIs and methods on the MonoBehaviours / scene
 instances that are already placed.
@@ -51,6 +57,7 @@ action maps / device graphs).
 | `Application.isPlaying` | Always **true** while the packed player runs |
 | `Application.productName` | Baked `ProjectSettings` `productName` (else project folder name) |
 | `Application.OpenURL(url)` | `system("python3 -c \"import webbrowser; webbrowser.open('…')\"")` |
+| `Application.Quit()` / `Quit(code)` | Sets flag; host polls `engine_wants_quit()` (no Escape/Q shortcut) |
 | Other `Application.*` | Pack-time **CS0117** (`Application` in scope via `using UnityEngine`) |
 | Other `Quaternion.*` (not Euler / identity / LookRotation / Slerp / Inverse / Angle) | Pack-time **CS0117** (`Quaternion` in scope via `using UnityEngine`) |
 | `File.WriteAllText(path, text)` | `fopen` write (`"w"`); creates parent dirs when possible |
@@ -59,6 +66,9 @@ action maps / device graphs).
 | `File.ReadAllBytes(path)` | `fopen` read (`"rb"`) + chunked `fread` → malloc'd `ByteArray` (`.Length` / `[i]` lowered) |
 | `File.Exists(path)` | `fopen` probe (`"rb"`) → 1 / 0 (dirs fail like .NET) |
 | `File.Delete(path)` | `remove(3)`; missing path is a no-op (no throw) |
+| `File.Copy(src, dest)` / `Copy(src, dest, overwrite)` | `fread`/`fwrite`; mkdir dest parent; no overwrite → no-op if dest exists |
+| `File.CreateText(path)` | `fopen` `"w"` (+ mkdir) → `StreamWriter` (`FILE*`); `.WriteLine` / `.Close` |
+| `File.OpenText(path)` | `fopen` `"r"` → `StreamReader` (`FILE*`); `.ReadLine` / `.Close` |
 | Other `File.*` | Pack-time **CS0117** (`File` in scope via `using System.IO`) |
 
 Default log path matches Unity standalone (from `ProjectSettings`
@@ -161,9 +171,10 @@ slot (intensity 1, white) into the light table.
 | `transform.rotation` (`=` `Quaternion.Euler` / `LookRotation` / `Slerp` / `Inverse` / `RotateTowards` / `identity` / `new`) | Set live quat (unparented ≈ world); refreshes draw basis |
 | `Quaternion.Angle(a, b)` | Degrees between two rotations (`acos(|dot|)×2` in degrees) |
 | `Quaternion.RotateTowards(from, to, maxDegreesDelta)` | Step toward `to` by at most `maxDegreesDelta` degrees |
-| `transform.Find` (child name or `"A/B"` path) | Authored `m_Father` child lookup → GO index or **-1** |
-| `transform.parent` | Authored `m_Father` → parent GO index or **-1** |
-| `transform.SetParent` (Transform / null, optional `worldPositionStays`) | Live `_engine_go_parent` + xf parent; stays=true keeps world T |
+| `transform.Find` (child name or `"A/B"` path) | Live parent table child lookup → GO index or **-1** |
+| `transform.parent` | Live `_engine_go_parent` (seeded `m_Father`) → parent GO index or **-1** |
+| `transform.SetParent` (Transform / null, optional `worldPositionStays`) | Live `_engine_go_parent` + xf parent; stays=true keeps world T; appends as last sibling |
+| `transform.GetSiblingIndex` | Live `_engine_go_sib` (seeded GO order under parent; updated by `SetParent`) |
 | `transform.gameObject` | Same GO index as this Transform (packed Transform ≡ GameObject) |
 | `transform.worldToLocalMatrix` / `localToWorldMatrix` | Live TRS → `Matrix4x4` (same affine as TransformPoint) |
 | `transform.localScale` | Allowed (CS1061 cleared); live scale tables when SetWorldScale / scale draws / matrices need them |

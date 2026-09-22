@@ -53,13 +53,13 @@ def _assets_rel_path(path):
 # System.IO.File members we emit. Others → CS0117 (File is in scope via using).
 _FILE_SUPPORTED = frozenset({
     "WriteAllText", "AppendAllText", "WriteAllBytes", "ReadAllBytes",
-    "Exists", "Delete",
+    "Exists", "Delete", "CreateText", "OpenText", "Copy",
 })
 
 # UnityEngine.Application members we emit. Others → CS0117.
 _APPLICATION_SUPPORTED = frozenset({
     "dataPath", "persistentDataPath", "isEditor", "isPlaying", "OpenURL",
-    "productName",
+    "productName", "Quit",
 })
 
 # UnityEngine.Quaternion members we emit. Others → CS0117 (in scope via UnityEngine).
@@ -72,7 +72,7 @@ _QUATERNION_SUPPORTED = frozenset({
 # (transform itself is always in scope; blame the missing member).
 _TRANSFORM_SUPPORTED = frozenset({
     "position", "Rotate", "LookAt", "eulerAngles", "rotation", "Find",
-    "localScale", "parent", "gameObject", "SetParent",
+    "localScale", "parent", "gameObject", "SetParent", "GetSiblingIndex",
     "worldToLocalMatrix", "localToWorldMatrix",
     "localPosition", "localRotation",
     "TransformPoint",
@@ -296,12 +296,16 @@ _API = {
     "Application.isPlaying": True,
     "Application.OpenURL": True,
     "Application.productName": True,
+    "Application.Quit": True,
     "File.WriteAllText": True,
     "File.AppendAllText": True,
     "File.WriteAllBytes": True,
     "File.ReadAllBytes": True,
     "File.Exists": True,
     "File.Delete": True,
+    "File.CreateText": True,
+    "File.OpenText": True,
+    "File.Copy": True,
 }
 
 # APIs that would require inventing scene components / assets we do not pack.
@@ -366,8 +370,9 @@ _UNITY_API = re.compile(
     r"(?<![\w])Application\.isPlaying|"
     r"(?<![\w])Application\.OpenURL|"
     r"(?<![\w])Application\.productName|"
+    r"(?<![\w])Application\.Quit|"
     r"File\.(?:WriteAllText|AppendAllText|WriteAllBytes|ReadAllBytes|"
-    r"Exists|Delete)|"
+    r"Exists|Delete|CreateText|OpenText|Copy)|"
     r"Input\.(?:GetAxis|GetButton|GetKey)|"
     r"RenderSettings\.ambientLight|Camera\.main|"
     r"transform\.position|Physics2D\.gravity|Physics\.gravity|"
@@ -3131,6 +3136,23 @@ def _build_go_parents(plan):
     return parents
 
 
+def _build_go_sibling_indices(go_parents):
+    """Sibling index among children of the same parent (authored seed order).
+
+    Unity GetSiblingIndex: position in the parent's child list. Seed by GO
+    table order under each parent; SetParent appends as last sibling.
+    """
+    n = len(go_parents or [])
+    sib = [0] * n
+    by_parent = {}
+    for i, p in enumerate(go_parents or []):
+        by_parent.setdefault(int(p), []).append(i)
+    for kids in by_parent.values():
+        for idx, go in enumerate(kids):
+            sib[go] = idx
+    return sib
+
+
 def _build_ui_buttons(plan):
     """Authored uGUI Buttons: normalized hit, ColorBlock, SetActive onClick."""
     names = plan.get("go_names") or []
@@ -4348,6 +4370,14 @@ def analyze_script(path, text=None):
     if re.search(r"(?<![.\w])\w+\s*\.\s*SetParent\s*\(", scan):
         apis.add("transform.SetParent")
     if re.search(
+            r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*GetSiblingIndex\s*\(",
+            scan):
+        apis.add("transform.GetSiblingIndex")
+    if re.search(r"\.\s*transform\s*\.\s*GetSiblingIndex\s*\(", scan):
+        apis.add("transform.GetSiblingIndex")
+    if re.search(r"(?<![.\w])\w+\s*\.\s*GetSiblingIndex\s*\(", scan):
+        apis.add("transform.GetSiblingIndex")
+    if re.search(
             r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*"
             r"worldToLocalMatrix\b",
             scan):
@@ -4398,6 +4428,9 @@ def analyze_script(path, text=None):
     if re.search(
             r"(?<![\w])(?:UnityEngine\.)?Application\.productName\b", scan):
         apis.add("Application.productName")
+    if re.search(
+            r"(?<![\w])(?:UnityEngine\.)?Application\.Quit\s*\(", scan):
+        apis.add("Application.Quit")
     if re.search(r"(?:System\.IO\.)?File\.WriteAllText\s*\(", scan):
         apis.add("File.WriteAllText")
     if re.search(r"(?:System\.IO\.)?File\.AppendAllText\s*\(", scan):
@@ -4410,6 +4443,12 @@ def analyze_script(path, text=None):
         apis.add("File.Exists")
     if re.search(r"(?:System\.IO\.)?File\.Delete\s*\(", scan):
         apis.add("File.Delete")
+    if re.search(r"(?:System\.IO\.)?File\.CreateText\s*\(", scan):
+        apis.add("File.CreateText")
+    if re.search(r"(?:System\.IO\.)?File\.OpenText\s*\(", scan):
+        apis.add("File.OpenText")
+    if re.search(r"(?:System\.IO\.)?File\.Copy\s*\(", scan):
+        apis.add("File.Copy")
     # C# string + value must not become C pointer arithmetic.
     if re.search(
             r'"\s*\+|'
@@ -4884,6 +4923,9 @@ def plan_layouts(objects, analyses, two_d=None):
             if ty == "string":
                 # Instance strings are not packed yet (static strings are).
                 continue
+            if ty in ("StreamWriter", "StreamReader"):
+                # Text streams are FILE* class/static fields, not instance slots.
+                continue
             if ty == "Vector2":
                 members.append((fname + "_x", "float", 32, "f32"))
                 members.append((fname + "_y", "float", 32, "f32"))
@@ -5123,6 +5165,7 @@ def emit_engine(plan, analyses, used_apis):
     want_transform_parent = "transform.parent" in used_apis
     want_transform_go = "transform.gameObject" in used_apis
     want_set_parent = "transform.SetParent" in used_apis
+    want_get_sibling = "transform.GetSiblingIndex" in used_apis
     want_getcomponent = "GetComponent" in used_apis
     want_data_path = "Application.dataPath" in used_apis
     want_persistent_data_path = "Application.persistentDataPath" in used_apis
@@ -5130,6 +5173,7 @@ def emit_engine(plan, analyses, used_apis):
     want_app_is_playing = "Application.isPlaying" in used_apis
     want_app_open_url = "Application.OpenURL" in used_apis
     want_app_product_name = "Application.productName" in used_apis
+    want_app_quit = "Application.Quit" in used_apis
     want_file_write = "File.WriteAllText" in used_apis
     want_file_append = "File.AppendAllText" in used_apis
     want_file_write_bytes = "File.WriteAllBytes" in used_apis
@@ -5137,17 +5181,23 @@ def emit_engine(plan, analyses, used_apis):
     want_file_bytes = want_file_write_bytes or want_file_read_bytes
     want_file_exists = "File.Exists" in used_apis
     want_file_delete = "File.Delete" in used_apis
+    want_file_create_text = "File.CreateText" in used_apis
+    want_file_open_text = "File.OpenText" in used_apis
+    want_file_copy = "File.Copy" in used_apis
+    want_file_text_stream = want_file_create_text or want_file_open_text
     want_file_write_ops = (
-        want_file_write or want_file_append or want_file_write_bytes)
+        want_file_write or want_file_append or want_file_write_bytes
+        or want_file_create_text or want_file_copy)
     want_file_io = (
         want_file_write_ops or want_file_exists or want_file_read_bytes
-        or want_file_delete)
+        or want_file_delete or want_file_text_stream or want_file_copy)
     want_destroy = "Object.Destroy" in used_apis
     ui_buttons = plan.get("ui_buttons") or []
     want_ui = bool(ui_buttons)
     want_go_tables = (
         want_find or want_transform_find or want_transform_parent
-        or want_transform_go or want_set_parent or want_getcomponent
+        or want_transform_go or want_set_parent or want_get_sibling
+        or want_getcomponent
         or want_rb2d or want_rb3d or want_add_any or want_ui or want_destroy)
     want_ctor_forbidden = any(
         bool(cl.get("ctor_forbidden"))
@@ -5163,9 +5213,9 @@ def emit_engine(plan, analyses, used_apis):
             or want_transform_matrix or want_quat_angle):
         p("#include <math.h>")
     if (want_input or want_log or want_find or want_transform_find
-            or want_set_parent
+            or want_set_parent or want_get_sibling
             or want_add_any or want_data_path or want_persistent_data_path
-            or want_file_io):
+            or want_file_io or soa):
         p("#include <string.h>")
     if (want_log or want_console or want_str_plus or want_add_any
             or want_file_io or want_go_tables or want_ctor_forbidden
@@ -5500,31 +5550,33 @@ def emit_engine(plan, analyses, used_apis):
             p("")
     if want_str_plus:
         # C# "" + 1 → "1"; C's ""+1 is pointer arithmetic (often prints garbage).
-        # Alternate two buffers so nested _str_plus_*(...) + x does not
-        # snprintf into the same buffer it reads (undefined).
+        # Ring of buffers: nested _str_plus_*(prev, x) must not snprintf into
+        # the same slot it reads, and sibling args (path + contents) must stay
+        # live until the callee returns — two slots are not enough for
+        # AppendAllText(pathExpr, contentExpr) where both are concatenations.
         p("/* C# string + value (not C pointer arithmetic) */")
-        p("static char _engine_str_buf[2][128];")
+        p("static char _engine_str_buf[8][512];")
         p("static int _engine_str_which;")
         p("static const char *_str_plus_i(const char *a, int b) {")
-        p("    char *out = _engine_str_buf[_engine_str_which ^= 1];")
+        p("    char *out = _engine_str_buf[_engine_str_which++ & 7];")
         p("    snprintf(out, sizeof _engine_str_buf[0], \"%s%d\",")
         p("             a ? a : \"\", b);")
         p("    return out;")
         p("}")
         p("static const char *_str_plus_f(const char *a, float b) {")
-        p("    char *out = _engine_str_buf[_engine_str_which ^= 1];")
+        p("    char *out = _engine_str_buf[_engine_str_which++ & 7];")
         p("    snprintf(out, sizeof _engine_str_buf[0], \"%s%g\",")
         p("             a ? a : \"\", (double)b);")
         p("    return out;")
         p("}")
         p("static const char *_str_plus_c(const char *a, char b) {")
-        p("    char *out = _engine_str_buf[_engine_str_which ^= 1];")
+        p("    char *out = _engine_str_buf[_engine_str_which++ & 7];")
         p("    snprintf(out, sizeof _engine_str_buf[0], \"%s%c\",")
         p("             a ? a : \"\", b);")
         p("    return out;")
         p("}")
         p("static const char *_str_plus_s(const char *a, const char *b) {")
-        p("    char *out = _engine_str_buf[_engine_str_which ^= 1];")
+        p("    char *out = _engine_str_buf[_engine_str_which++ & 7];")
         p("    snprintf(out, sizeof _engine_str_buf[0], \"%s%s\",")
         p("             a ? a : \"\", b ? b : \"\");")
         p("    return out;")
@@ -5593,6 +5645,18 @@ def emit_engine(plan, analyses, used_apis):
         p("        py);")
         p("    (void)system(cmd);")
         p("}")
+        p("")
+    if want_app_quit:
+        p("/* Application.Quit — host polls engine_wants_quit() */")
+        p("static int _engine_quit;")
+        p("static void Application_Quit(int exit_code) {")
+        p("    (void)exit_code;")
+        p("    _engine_quit = 1;")
+        p("}")
+        p("int engine_wants_quit(void) { return _engine_quit; }")
+        p("")
+    else:
+        p("int engine_wants_quit(void) { return 0; }")
         p("")
     if want_destroy:
         # Destroy(gameObject) — mark GO; Tick skips destroyed instances.
@@ -5804,13 +5868,18 @@ def emit_engine(plan, analyses, used_apis):
             p("            for (i = n - 1; i >= 0; i--) {")
             p("#ifdef _WIN32")
             p("                if (dir[i] == '/' || dir[i] == '\\\\') {")
-            p("                    dir[i] = 0; break;")
+            p("                    dir[i] = 0;")
+            p("                    if (dir[0]) _engine_mkdir_p(dir);")
+            p("                    break;")
             p("                }")
             p("#else")
-            p("                if (dir[i] == '/') { dir[i] = 0; break; }")
+            p("                if (dir[i] == '/') {")
+            p("                    dir[i] = 0;")
+            p("                    if (dir[0]) _engine_mkdir_p(dir);")
+            p("                    break;")
+            p("                }")
             p("#endif")
             p("            }")
-            p("            if (dir[0]) _engine_mkdir_p(dir);")
             p("        }")
             p("    }")
             p("#endif")
@@ -5843,13 +5912,18 @@ def emit_engine(plan, analyses, used_apis):
                 p("            for (i = n - 1; i >= 0; i--) {")
                 p("#ifdef _WIN32")
                 p("                if (dir[i] == '/' || dir[i] == '\\\\') {")
-                p("                    dir[i] = 0; break;")
+                p("                    dir[i] = 0;")
+                p("                    if (dir[0]) _engine_mkdir_p(dir);")
+                p("                    break;")
                 p("                }")
                 p("#else")
-                p("                if (dir[i] == '/') { dir[i] = 0; break; }")
+                p("                if (dir[i] == '/') {")
+                p("                    dir[i] = 0;")
+                p("                    if (dir[0]) _engine_mkdir_p(dir);")
+                p("                    break;")
+                p("                }")
                 p("#endif")
                 p("            }")
-                p("            if (dir[0]) _engine_mkdir_p(dir);")
                 p("        }")
                 p("    }")
                 p("#endif")
@@ -5935,6 +6009,135 @@ def emit_engine(plan, analyses, used_apis):
         p("static void File_Delete(const char *path) {")
         p("    if (!path || !path[0]) return;")
         p("    (void)remove(path);")
+        p("}")
+        p("")
+    if want_file_copy:
+        # Copy(src, dest[, overwrite]) — fread/fwrite; no throw.
+        p("/* System.IO.File.Copy — fread/fwrite (+ mkdir dest parent) */")
+        p("static void File_Copy(const char *src, const char *dst,")
+        p("                      int overwrite) {")
+        p("    FILE *in;")
+        p("    FILE *out;")
+        p("    unsigned char buf[4096];")
+        p("    size_t n;")
+        p("    if (!src || !src[0] || !dst || !dst[0]) return;")
+        p("    if (!overwrite) {")
+        p("        out = fopen(dst, \"rb\");")
+        p("        if (out) { fclose(out); return; }")
+        p("    }")
+        p("#ifndef CRUST_NO_POSIX_MKDIR")
+        p("    {")
+        p("        char dir[1024];")
+        p("        int dn, i;")
+        p("        dn = (int)strlen(dst);")
+        p("        if (dn > 0 && (size_t)dn < sizeof dir) {")
+        p("            for (i = 0; i < dn; i++) dir[i] = dst[i];")
+        p("            dir[dn] = 0;")
+        p("            for (i = dn - 1; i >= 0; i--) {")
+        p("#ifdef _WIN32")
+        p("                if (dir[i] == '/' || dir[i] == '\\\\') {")
+        p("                    dir[i] = 0;")
+        p("                    if (dir[0]) _engine_mkdir_p(dir);")
+        p("                    break;")
+        p("                }")
+        p("#else")
+        p("                if (dir[i] == '/') {")
+        p("                    dir[i] = 0;")
+        p("                    if (dir[0]) _engine_mkdir_p(dir);")
+        p("                    break;")
+        p("                }")
+        p("#endif")
+        p("            }")
+        p("        }")
+        p("    }")
+        p("#endif")
+        p("    in = fopen(src, \"rb\");")
+        p("    if (!in) return;")
+        p("    out = fopen(dst, \"wb\");")
+        p("    if (!out) { fclose(in); return; }")
+        p("    for (;;) {")
+        p("        n = fread(buf, 1, sizeof buf, in);")
+        p("        if (n == 0) break;")
+        p("        if (fwrite(buf, 1, n, out) != n) break;")
+        p("    }")
+        p("    fclose(in);")
+        p("    fclose(out);")
+        p("}")
+        p("")
+    if want_file_text_stream:
+        p("/* System.IO.StreamWriter / StreamReader — FILE* text streams */")
+        p("typedef FILE *StreamWriter;")
+        p("typedef FILE *StreamReader;")
+        p("")
+        if want_file_create_text:
+            p("/* System.IO.File.CreateText — fopen \"w\" (+ mkdir). */")
+            p("static StreamWriter File_CreateText(const char *path) {")
+            p("    FILE *fp;")
+            p("#ifndef CRUST_NO_POSIX_MKDIR")
+            p("    char dir[1024];")
+            p("    int n, i;")
+            p("    if (path && path[0]) {")
+            p("        n = (int)strlen(path);")
+            p("        if (n > 0 && (size_t)n < sizeof dir) {")
+            p("            for (i = 0; i < n; i++) dir[i] = path[i];")
+            p("            dir[n] = 0;")
+            p("            for (i = n - 1; i >= 0; i--) {")
+            p("#ifdef _WIN32")
+            p("                if (dir[i] == '/' || dir[i] == '\\\\') {")
+            p("                    dir[i] = 0;")
+            p("                    if (dir[0]) _engine_mkdir_p(dir);")
+            p("                    break;")
+            p("                }")
+            p("#else")
+            p("                if (dir[i] == '/') {")
+            p("                    dir[i] = 0;")
+            p("                    if (dir[0]) _engine_mkdir_p(dir);")
+            p("                    break;")
+            p("                }")
+            p("#endif")
+            p("            }")
+            p("        }")
+            p("    }")
+            p("#endif")
+            p("    fp = fopen(path ? path : \"\", \"w\");")
+            p("    return fp;")
+            p("}")
+            p("")
+        if want_file_open_text:
+            p("/* System.IO.File.OpenText — fopen \"r\". */")
+            p("static StreamReader File_OpenText(const char *path) {")
+            p("    if (!path || !path[0]) return 0;")
+            p("    return fopen(path, \"r\");")
+            p("}")
+            p("")
+        if want_file_create_text:
+            p("static void StreamWriter_WriteLine(StreamWriter fp,")
+            p("                                   const char *s) {")
+            p("    if (!fp) return;")
+            p("    fputs(s ? s : \"\", fp);")
+            p("    fputc('\\n', fp);")
+            p("    fflush(fp);")
+            p("}")
+            p("")
+        if want_file_open_text:
+            # Alternate two buffers so consecutive ReadLine() keep both lines.
+            p("static char _engine_readline_buf[2][4096];")
+            p("static int _engine_readline_i;")
+            p("static const char *StreamReader_ReadLine(StreamReader fp) {")
+            p("    char *buf;")
+            p("    size_t n;")
+            p("    if (!fp) return \"\";")
+            p("    buf = _engine_readline_buf[_engine_readline_i++ & 1];")
+            p("    if (!fgets(buf, (int)sizeof _engine_readline_buf[0], fp))")
+            p("        return \"\";")
+            p("    n = strlen(buf);")
+            p("    if (n > 0 && buf[n - 1] == '\\n') buf[n - 1] = 0;")
+            p("    if (n > 1 && buf[n - 2] == '\\r') buf[n - 2] = 0;")
+            p("    return buf;")
+            p("}")
+            p("")
+        p("static void Stream_Close(FILE *fp) {")
+        p("    if (fp) fclose(fp);")
         p("}")
         p("")
     if want_console:
@@ -6380,22 +6583,45 @@ def emit_engine(plan, analyses, used_apis):
                 _emit_simple_add(col_ty, unity_ty)
 
     if (want_ui or want_transform_find or want_transform_parent
-            or want_set_parent):
+            or want_set_parent or want_get_sibling):
         go_names = plan.get("go_names") or []
         go_n = max(1, len(go_names))
         go_parents = plan.get("go_parents") or ([-1] * go_n)
         if len(go_parents) < go_n:
             go_parents = list(go_parents) + [-1] * (go_n - len(go_parents))
-        p("/* Transform hierarchy (live GO parents; seeded from m_Father) */"
-          if (want_set_parent or want_transform_find) else
-          "/* Authored Transform hierarchy (m_Father → GO index) */")
-        # Mutable whenever Find or SetParent runs — Find walks live parents.
-        if want_set_parent or want_transform_find:
-            p("static int _engine_go_parent[%d] = { %s };" % (
-                go_n, ", ".join(str(int(x)) for x in go_parents[:go_n])))
-        else:
-            p("static const int _engine_go_parent[%d] = { %s };" % (
-                go_n, ", ".join(str(int(x)) for x in go_parents[:go_n])))
+        go_sib = plan.get("go_siblings") or (
+            _build_go_sibling_indices(go_parents[:go_n]))
+        if len(go_sib) < go_n:
+            go_sib = list(go_sib) + [0] * (go_n - len(go_sib))
+        want_go_parent_table = (
+            want_ui or want_transform_find or want_transform_parent
+            or want_set_parent)
+        if want_go_parent_table:
+            p("/* Transform hierarchy (live GO parents; seeded from m_Father) */"
+              if (want_set_parent or want_transform_find) else
+              "/* Authored Transform hierarchy (m_Father → GO index) */")
+            # Mutable whenever Find or SetParent runs — Find walks live parents.
+            if want_set_parent or want_transform_find:
+                p("static int _engine_go_parent[%d] = { %s };" % (
+                    go_n, ", ".join(str(int(x)) for x in go_parents[:go_n])))
+            else:
+                p("static const int _engine_go_parent[%d] = { %s };" % (
+                    go_n, ", ".join(str(int(x)) for x in go_parents[:go_n])))
+        if want_get_sibling:
+            # Sibling order among children of the same parent (Unity).
+            # Mutable when SetParent can change order; else authored seed.
+            p("/* Live sibling indices (seeded from GO order under parent) */")
+            if want_set_parent:
+                p("static int _engine_go_sib[%d] = { %s };" % (
+                    go_n, ", ".join(str(int(x)) for x in go_sib[:go_n])))
+            else:
+                p("static const int _engine_go_sib[%d] = { %s };" % (
+                    go_n, ", ".join(str(int(x)) for x in go_sib[:go_n])))
+            p("static int Transform_GetSiblingIndex(int go) {")
+            p("    if (go < 0 || go >= %d) return 0;" % go_n)
+            p("    return _engine_go_sib[go];")
+            p("}")
+            p("")
         if want_transform_parent:
             p("static int Transform_get_parent(int go) {")
             p("    if (go < 0 || go >= %d) return -1;" % go_n)
@@ -7014,6 +7240,8 @@ def emit_engine(plan, analyses, used_apis):
                 else:
                     p("static const int %s_%s = %d;" % (
                         idn, fname, int(default)))
+            elif f.get("ty") in ("StreamWriter", "StreamReader"):
+                p("static FILE *%s_%s;" % (idn, fname))
         if cl.get("class_consts"):
             p("")
         # Position accessors: SoA table or AoS fields.
@@ -7288,6 +7516,8 @@ def emit_engine(plan, analyses, used_apis):
             p("    unsigned ci = 0u;")
             p("    float wx = 0.f, wy = 0.f, wz = 0.f;")
             p("    float px = 0.f, py = 0.f, pz = 0.f;")
+            if want_get_sibling:
+                p("    int old_parent, old_sib, i, max_sib;")
             p("    if (child < 0 || child >= %d) return;" % go_n)
             p("    if (parent == child) return;")
             p("    if (parent >= %d) parent = -1;" % go_n)
@@ -7299,7 +7529,26 @@ def emit_engine(plan, analyses, used_apis):
             p("    }")
             p("    if (world_stays && _engine_go_xf(child, &cc, &ci))")
             p("        _engine_world_pos(cc, ci, &wx, &wy, &wz, 0);")
+            if want_get_sibling:
+                # Detach: close gap among old siblings; attach as last child.
+                p("    old_parent = _engine_go_parent[child];")
+                p("    old_sib = _engine_go_sib[child];")
+                p("    for (i = 0; i < %d; i = i + 1) {" % go_n)
+                p("        if (i == child) continue;")
+                p("        if (_engine_go_parent[i] == old_parent")
+                p("            && _engine_go_sib[i] > old_sib)")
+                p("            _engine_go_sib[i] = _engine_go_sib[i] - 1;")
+                p("    }")
             p("    _engine_go_parent[child] = parent;")
+            if want_get_sibling:
+                p("    max_sib = -1;")
+                p("    for (i = 0; i < %d; i = i + 1) {" % go_n)
+                p("        if (i == child) continue;")
+                p("        if (_engine_go_parent[i] == parent")
+                p("            && _engine_go_sib[i] > max_sib)")
+                p("            max_sib = _engine_go_sib[i];")
+                p("    }")
+                p("    _engine_go_sib[child] = max_sib + 1;")
             p("    _engine_set_xf_parent(child, parent);")
             p("    if (world_stays && _engine_go_xf(child, &cc, &ci)) {")
             p("        if (parent >= 0) {")
@@ -8504,21 +8753,28 @@ def emit_engine(plan, analyses, used_apis):
             continue
         dims = cl.get("soa_dims") or (2 if cl["two_d"] else 3)
         p("    {")
-        p("        int i, d;")
         p("        int need = _%s_inst_count * %d;" % (idn, dims))
         p("        if (n + need > max_floats) return n;")
         if cl.get("soa_dims"):
-            p("        /* SoA: one contiguous table, no AoS gather */")
-            p("        for (i = 0; i < _%s_inst_count; i = i + 1)" % idn)
-            p("            for (d = 0; d < %d; d = d + 1)" % dims)
-            p("                dst[n + i * %d + d] = _%s_pos[i][d];" % (dims, idn))
+            # Contiguous float[N][dims] → one memcpy (libc / SIMD). Nested
+            # element copies miss autovec for small N and lose big-N memcpy.
+            p("        /* SoA: one contiguous table → memcpy (no gather) */")
+            p("        if (need > 0)")
+            p("            memcpy(dst + n, &_%s_pos[0][0]," % idn)
+            p("                   (size_t)need * sizeof(float));")
         else:
             axes = ("pos_x", "pos_y", "pos_z")[:dims]
-            p("        /* AoS gather (Unity-style) */")
+            kind_by = {m[0]: m[3] for m in cl["members"]}
+            p("        int i;")
+            p("        /* AoS gather (Unity-style); direct fields for autovec */")
             p("        for (i = 0; i < _%s_inst_count; i = i + 1) {" % idn)
             for axis_i, axis in enumerate(axes):
-                p("            dst[n + i * %d + %d] = %s_get_%s((unsigned)i);"
-                  % (dims, axis_i, idn, axis))
+                if kind_by.get(axis) == "f32":
+                    p("            dst[n + i * %d + %d] = %s_AT(i).%s;"
+                      % (dims, axis_i, idn, axis))
+                else:
+                    p("            dst[n + i * %d + %d] = %s_get_%s((unsigned)i);"
+                      % (dims, axis_i, idn, axis))
             p("        }")
         p("        n = n + need;")
         p("    }")
@@ -8574,6 +8830,7 @@ def emit_engine_draw_h():
         "const char *engine_data_path(void); /* Application.dataPath */\n"
         "const char *engine_persistent_data_path(void); "
         "/* Application.persistentDataPath */\n"
+        "int engine_wants_quit(void); /* Application.Quit requested */\n"
         "\n"
         "#endif\n"
     )
@@ -8876,6 +9133,61 @@ def _rewrite_transform_set_parent(text, cl, plan):
             else:
                 stays = "(%s) ? 1 : 0" % a1
         out.append("Transform_SetParent(%s, %s, %s)" % (child, parent, stays))
+        i = after
+    return "".join(out)
+
+
+def _rewrite_transform_get_sibling_index(text, cl, plan):
+    """Lower Transform.GetSiblingIndex() → Transform_GetSiblingIndex(go).
+
+    Supports:
+      transform.GetSiblingIndex();
+      cosmetic.transform.GetSiblingIndex();
+      trs.GetSiblingIndex();
+    Reads the live sibling table (seeded authored; updated by SetParent).
+    """
+    if not plan.get("go_names"):
+        return text
+    trs_locals = set()
+    for lm in re.finditer(
+            r"\b(?:Transform|GameObject)\s+(\w+)\b", text):
+        trs_locals.add(lm.group(1))
+    out = []
+    i = 0
+    pat = re.compile(
+        r"(?:(?<![.\w])(?P<tr>\w+)\s*\.\s*transform\s*\.\s*"
+        r"|(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*"
+        r"|(?<![.\w])(?P<trecv>\w+)\s*\.\s*)"
+        r"GetSiblingIndex\s*\(")
+    while i < len(text):
+        m = pat.search(text, i)
+        if not m:
+            out.append(text[i:])
+            break
+        if m.group("trecv") and not m.group("tr"):
+            trecv = m.group("trecv")
+            is_trs = trecv in trs_locals
+            if not is_trs:
+                for f in cl.get("fields") or []:
+                    if f.get("name") == trecv and f.get("ty") in (
+                            "Transform", "GameObject"):
+                        is_trs = True
+                        break
+            if not is_trs:
+                out.append(text[i:m.end()])
+                i = m.end()
+                continue
+        open_paren = m.end() - 1
+        parsed = _match_call_args(text, open_paren)
+        if not parsed:
+            out.append(text[i:open_paren + 1])
+            i = open_paren + 1
+            continue
+        _args_str, after = parsed
+        out.append(text[i:m.start()])
+        recv = m.group("tr") or m.group("trecv")
+        go = _setparent_go_expr(recv, cl)
+        out.append("Transform_GetSiblingIndex(%s)" % go)
         i = after
     return "".join(out)
 
@@ -9652,6 +9964,7 @@ def _c_expr_scalar_kind(expr, string_idents=None):
             or e in ("Application_dataPath()",
                      "Application_persistentDataPath()",
                      "Application_productName()")
+            or e.startswith("StreamReader_ReadLine(")
             or (re.match(r"^\w+$", e) and e in string_idents)):
         return "s"
     if re.match(r"^'(?:[^'\\]|\\.)'$", e):
@@ -9661,7 +9974,7 @@ def _c_expr_scalar_kind(expr, string_idents=None):
     return "f"
 
 
-def _rewrite_typed_call_name(text, name):
+def _rewrite_typed_call_name(text, name, string_idents=None):
     """Rewrite Name(arg) → Name_{i,f,s}(arg). Skips already-typed Names."""
     out = []
     i = 0
@@ -9691,7 +10004,7 @@ def _rewrite_typed_call_name(text, name):
             out.append(text[i + m.start():])
             break
         args = text[start:j]
-        kind = _c_expr_scalar_kind(args)
+        kind = _c_expr_scalar_kind(args, string_idents=string_idents)
         out.append("%s_%s(%s)" % (name, kind, args))
         i = j + 1
     return "".join(out)
@@ -9866,6 +10179,97 @@ def _rewrite_bytearray_member_access(text):
     return text
 
 
+def _rewrite_file_copy(text):
+    """File.Copy(src, dest) / Copy(src, dest, overwrite) → File_Copy(..., int)."""
+    if not re.search(r"(?:System\.IO\.)?File\.Copy\s*\(", text):
+        return text
+    out = []
+    i = 0
+    pat = re.compile(r"(?:System\.IO\.)?File\.Copy\s*\(")
+    while True:
+        m = pat.search(text, i)
+        if not m:
+            out.append(text[i:])
+            break
+        out.append(text[i:m.start()])
+        start = m.end()
+        depth = 1
+        j = start
+        while j < len(text) and depth:
+            c = text[j]
+            if c == '"':
+                j = _skip_c_string(text, j)
+                continue
+            if c == "'":
+                j += 1
+                if j < len(text) and text[j] == "\\":
+                    j += 2
+                elif j < len(text):
+                    j += 1
+                if j < len(text) and text[j] == "'":
+                    j += 1
+                continue
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        if depth != 0:
+            out.append(text[m.start():])
+            break
+        args = _split_call_args(text[start:j])
+        if len(args) == 2:
+            args.append("0")
+        elif len(args) >= 3:
+            ov = args[2].strip()
+            if ov == "true":
+                args[2] = "1"
+            elif ov == "false":
+                args[2] = "0"
+        out.append("File_Copy(%s)" % ", ".join(args[:3]))
+        i = j + 1
+    return "".join(out)
+
+
+def _rewrite_file_text_streams(text, cl):
+    """File.CreateText/OpenText + StreamWriter/Reader WriteLine/ReadLine/Close."""
+    if not re.search(
+            r"(?:System\.IO\.)?File\.(?:CreateText|OpenText)\s*\("
+            r"|\b(?:StreamWriter|StreamReader)\b"
+            r"|File_CreateText\(|File_OpenText\(",
+            text):
+        return text
+
+    stream_names = set(re.findall(
+        r"\b(?:StreamWriter|StreamReader)\s+(\w+)\b", text))
+    for f in cl.get("class_consts") or []:
+        if f.get("ty") in ("StreamWriter", "StreamReader"):
+            stream_names.add(f["name"])
+
+    text = re.sub(
+        r"(?:System\.IO\.)?File\.CreateText\s*\(",
+        "File_CreateText(", text)
+    text = re.sub(
+        r"(?:System\.IO\.)?File\.OpenText\s*\(",
+        "File_OpenText(", text)
+    text = re.sub(r"\bStreamWriter\b", "FILE *", text)
+    text = re.sub(r"\bStreamReader\b", "FILE *", text)
+
+    for name in sorted(stream_names, key=len, reverse=True):
+        text = re.sub(
+            r"(?<![.\w])%s\s*\.\s*WriteLine\s*\(" % re.escape(name),
+            "StreamWriter_WriteLine(%s, " % name, text)
+        text = re.sub(
+            r"(?<![.\w])%s\s*\.\s*ReadLine\s*\(\s*\)" % re.escape(name),
+            "StreamReader_ReadLine(%s)" % name, text)
+        text = re.sub(
+            r"(?<![.\w])%s\s*\.\s*Close\s*\(\s*\)" % re.escape(name),
+            "Stream_Close(%s)" % name, text)
+    return text
+
+
 def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     """C# subset method → C against packed arrays.
 
@@ -9877,6 +10281,8 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = _rewrite_csharp_float_literals(body)
     text = re.sub(r"\bthis\.", "", text)
     text = _rewrite_byte_array_lits(text, plan)
+    text = _rewrite_file_copy(text)
+    text = _rewrite_file_text_streams(text, cl)
     text = _rewrite_extensions_set_world_scale(text, cl, plan)
     text = _rewrite_rigidbody_assigns(text, plan, cl["name"])
     text = _rewrite_transform_rotate(text, cl)
@@ -9887,6 +10293,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = _rewrite_local_rotation_reads(text, cl, plan)
     text = _rewrite_transform_parent(text, cl, plan)
     text = _rewrite_transform_set_parent(text, cl, plan)
+    text = _rewrite_transform_get_sibling_index(text, cl, plan)
     text = _rewrite_transform_game_object(text, cl, plan)
     text = _rewrite_transform_point(text, cl, plan)
     text = _rewrite_transform_matrices(text, cl, plan)
@@ -9905,6 +10312,8 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         # Transform / GameObject locals are GO indices.
         text = re.sub(r"\bTransform\b(?=\s+\w)", "int", text)
         text = re.sub(r"\bGameObject\b(?=\s+\w)", "int", text)
+    # C# string locals → const char * (ReadLine / path vars).
+    text = re.sub(r"\bstring\b(?=\s+\w)", "const char *", text)
     # Find/GetComponent before field rewrites so `.amp` stays on the target type.
     text = _rewrite_find_getcomponent(text, plan, cl["name"], site=site)
     text, add_locals = _rewrite_addcomponent(text, plan, cl["name"])
@@ -9932,6 +10341,13 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = re.sub(
         r"(?<![\w])(?:UnityEngine\.)?Application\.OpenURL\s*\(",
         "Application_OpenURL(", text)
+    # Quit() → Quit(0); Quit(code) keeps the arg.
+    text = re.sub(
+        r"(?<![\w])(?:UnityEngine\.)?Application\.Quit\s*\(\s*\)",
+        "Application_Quit(0)", text)
+    text = re.sub(
+        r"(?<![\w])(?:UnityEngine\.)?Application\.Quit\s*\(",
+        "Application_Quit(", text)
     text = re.sub(
         r"(?:System\.IO\.)?File\.WriteAllText\s*\(",
         "File_WriteAllText(", text)
@@ -10007,6 +10423,9 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         f["name"] for f in (cl.get("class_consts") or [])
         if f.get("ty") == "string"
     }
+    # Locals: `string x` / `const char *x` (after string→const char * rewrite).
+    string_idents |= set(re.findall(
+        r"\b(?:string|const char \*)\s+(\w+)\b", text))
     text = _rewrite_string_concat(text, string_idents=string_idents)
     # Unity Object.ToString when printing a Find result (name, not index).
     text = _wrap_log_gameobject_tostring(text)
@@ -10121,8 +10540,10 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
                 oiden, idn, name, m.group(1)),
             text)
     # Typed Debug_Log / Console_WriteLine — crust has no _Generic.
-    text = _rewrite_typed_call_name(text, "Debug_Log")
-    text = _rewrite_typed_call_name(text, "Console_WriteLine")
+    text = _rewrite_typed_call_name(
+        text, "Debug_Log", string_idents=string_idents)
+    text = _rewrite_typed_call_name(
+        text, "Console_WriteLine", string_idents=string_idents)
     return text
 
 
@@ -10724,20 +11145,30 @@ def emit_makefile(outdir):
     py = sys.executable
     # Absolute paths so `make crust-check` works from the outdir.
     return (
-        "# generated — engine at -O3, data at -O0; main.c is a headless host\n"
+        "# generated — engine at -O3 -fno-math-errno, data at -O0; "
+        "main.c is a headless host\n"
+        "# CC=clang for clang builds; make vectorize-report for loop/SLP miss remarks\n"
         "CC ?= gcc\n"
+        "CLANG ?= clang\n"
+        "CFLAGS_ENGINE ?= -O3 -fno-math-errno\n"
         "CRUST_ROOT ?= %s\n"
         "CRUST_PY ?= %s\n"
         "CRUST = $(CRUST_PY) -m shivyc.main --no-cache\n"
+        ".PHONY: all crust-check vectorize-report clean\n"
         "all: game\n"
         "engine.o: engine.c\n"
-        "\t$(CC) -O3 -c -o $@ $<\n"
+        "\t$(CC) $(CFLAGS_ENGINE) -c -o $@ $<\n"
         "data.o: data.c\n"
         "\t$(CC) -O0 -c -o $@ $<\n"
         "main.o: main.c engine_draw.h\n"
         "\t$(CC) -O2 -c -o $@ $<\n"
         "game: engine.o data.o main.o\n"
         "\t$(CC) -O2 -o $@ engine.o data.o main.o -lm\n"
+        "# Clang remarks: which loops miss auto-vectorization (stderr).\n"
+        "vectorize-report: engine.c\n"
+        "\t$(CLANG) $(CFLAGS_ENGINE) "
+        "-Rpass-missed=loop-vectorize,slp-vectorize "
+        "-c -o engine.vectorize.o engine.c\n"
         "# Compile packed C with crust/shivyc (C++ twins gate at pack time).\n"
         "crust-check: engine.c data.c main.c engine.cpp data.cpp main.cpp\n"
         "\tcd $(CRUST_ROOT) && $(CRUST) -c -D CRUST_NO_POSIX_MKDIR "
@@ -10747,7 +11178,7 @@ def emit_makefile(outdir):
         "\tcd $(CRUST_ROOT) && $(CRUST) -c "
         "-o $(CURDIR)/main.crust.o $(CURDIR)/main.c\n"
         "clean:\n"
-        "\trm -f engine.o data.o main.o game "
+        "\trm -f engine.o data.o main.o game engine.vectorize.o "
         "engine.crust.o data.crust.o main.crust.o\n"
         % (repo, py)
     )
@@ -10767,8 +11198,10 @@ def emit_main():
         "    int i, n;\n"
         "    engine_apply_argv(argc, argv);\n"
         "    Time_deltaTime = 0.0166667f;\n"
-        "    for (i = 0; i < 60; i = i + 1)\n"
+        "    for (i = 0; i < 60; i = i + 1) {\n"
         "        engine_tick();\n"
+        "        if (engine_wants_quit()) break;\n"
+        "    }\n"
         "    n = engine_collect_draws(buf, 256);\n"
         "    printf(\"ticks=60 draws=%d\\n\", n);\n"
         "    return 0; /* draws may be 0 when no SpriteRenderer */\n"
@@ -11049,12 +11482,14 @@ def pack(root, outdir, soa=False, soa_vec4=False):
     plan["screen_maximized"] = smax
     go_names, go_comps = _build_go_tables(plan)
     if ("transform.Find" in used_apis or "transform.parent" in used_apis
-            or "transform.SetParent" in used_apis):
+            or "transform.SetParent" in used_apis
+            or "transform.GetSiblingIndex" in used_apis):
         go_names, go_comps = _extend_go_tables_for_find(
             plan, go_names, go_comps)
     plan["go_names"] = go_names
     plan["go_components"] = go_comps
     plan["go_parents"] = _build_go_parents(plan)
+    plan["go_siblings"] = _build_go_sibling_indices(plan["go_parents"])
     plan["ui_buttons"] = _build_ui_buttons(plan)
     rb2d, rb3d, go_rb2d, go_rb3d, rb2d_by_fid, rb3d_by_fid = (
         _build_rigidbody_tables(plan))
@@ -11173,7 +11608,7 @@ def build_player_executable(outdir, product):
                     " ".join(cmd[:6]), err or ("exit %d" % r.returncode)))
 
     _progress("compiling engine.c")
-    _run([cc, "-O3", "-c", "-o", engine_o, engine_c])
+    _run([cc, "-O3", "-fno-math-errno", "-c", "-o", engine_o, engine_c])
     _progress("compiling data.c")
     _run([cc, "-O0", "-c", "-o", data_o, data_c])
 

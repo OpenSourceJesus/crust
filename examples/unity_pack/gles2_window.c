@@ -7,10 +7,11 @@
  *     PROJECT=.../SystemsScene ./examples/unity_pack/run_gles2_window.sh
  *
  * Arrow keys / WASD feed engine_input_axis_* (Input.GetAxis). Left click
- * feeds engine_pointer_* for authored uGUI Buttons. Escape or Q quits.
- * Time.deltaTime comes from the frame clock. SpriteRenderer quads
- * sample packed PNG textures (tint × texel). Window size is
- * Screen_width × Screen_height from Player Settings
+ * feeds engine_pointer_* for authored uGUI Buttons. Quit only via
+ * Application.Quit (engine_wants_quit) or the window close control — no
+ * Escape/Q host shortcut. Time.deltaTime comes from the frame clock.
+ * SpriteRenderer quads sample packed PNG textures (tint × texel). Window
+ * size is Screen_width × Screen_height from Player Settings
  * (defaultScreenWidth / defaultScreenHeight). fullscreenMode 0/1 opens a
  * real monitor fullscreen window (FullScreenWindow / Exclusive); with
  * defaultIsNativeResolution the desktop video mode size is used.
@@ -92,8 +93,6 @@ static GLuint vbo;
 static GLuint gl_tex[MAX_TEX];
 static int tex_n;
 static GLint u_tex_loc;
-static int want_close;
-
 static float world_left, world_right, world_bottom, world_top;
 
 static void refresh_camera_bounds(float aspect)
@@ -228,16 +227,6 @@ static int upload_textures(void)
                      GL_UNSIGNED_BYTE, rgba);
     }
     return 1;
-}
-
-static void on_key(GLFWwindow *win, int key, int scancode, int action, int mods)
-{
-    (void)scancode;
-    (void)mods;
-    if (action == GLFW_PRESS && (key == GLFW_KEY_ESCAPE || key == GLFW_KEY_Q)) {
-        want_close = 1;
-        glfwSetWindowShouldClose(win, GLFW_TRUE);
-    }
 }
 
 static void poll_input_axes(GLFWwindow *win)
@@ -388,10 +377,10 @@ int main(int argc, char **argv)
     }
     glfwMakeContextCurrent(win);
     glfwSwapInterval(1);
-    glfwSetKeyCallback(win, on_key);
 
     printf("GLES %s\n", (const char *)glGetString(GL_VERSION));
-    printf("draws classes=%d textures=%d — arrows (Keyboard), Escape/Q\n",
+    printf("draws classes=%d textures=%d — arrows (Keyboard); "
+           "quit via Application.Quit or window close\n",
            engine_class_count(), engine_texture_count());
 
     prog = build_program();
@@ -408,7 +397,7 @@ int main(int argc, char **argv)
     }
 
     prev = glfwGetTime();
-    while (!glfwWindowShouldClose(win) && !want_close) {
+    while (!glfwWindowShouldClose(win) && !engine_wants_quit()) {
         now = glfwGetTime();
         Time_deltaTime = (float)(now - prev);
         if (Time_deltaTime > 0.05f)
