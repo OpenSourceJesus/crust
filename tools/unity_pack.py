@@ -4722,12 +4722,19 @@ def _rewrite_find_getcomponent(text, plan, this_class, site=None):
     return text
 
 
-def analyze_script(path, text=None):
-    """Fields, methods, Unity API used, whether the script spawns."""
+def analyze_script(path, text=None, shallow=False):
+    """Fields, methods, Unity API used, whether the script spawns.
+
+    *shallow*: fields / type only (no method bodies). Used for GetComponent
+    targets pulled in by reference so vendor APIs inside Fracture() etc. do
+    not refuse the pack — instances and live GO maps still pack.
+    """
     if text is None:
         text = _read(path)
     # Player pack: editor-only regions are not code.
     text = _blank_unity_editor_regions(text)
+    if shallow:
+        text = _blank_method_bodies(text)
     _check_csharp_lex(path, text)
     scan = cs2cpp._blank(text)
     apis = set()
