@@ -232,3 +232,21 @@ off-by-one -- is caught by the corpus on three rows.
 Addresses are `i64` in the code and Nat in the model, so `vaddr + memsz`
 wraps past 2**63 in one and not the other. A user-space image is nowhere near
 it, and it is the one distance between this file and its model.
+
+## 5. Rust as a proof source
+
+The IL lift in section 3 reaches Rust only as far as the IL keeps what a
+proof needs, and for idiomatic Rust that is not far. A `match` is lowered to a
+`switch` the lift sees as `goto`s, a tail `if` expression leaves a dangling
+return, `&&` becomes jumps, and a `u32`'s width is gone. Crust has the Rust
+structure at parse time, so the plan is a *source-level* lift from Rust into
+`hoare.py`'s dialect, with the model generated from the file that ships. That
+removes the transcription this document spends so long guarding against.
+
+The first step is in: Crust reads contracts. `#[requires]`, `#[ensures]`
+(with `result` and `old(..)`), `#[invariant]` and `#[variant]`, in Creusot's
+and Prusti's syntax, are checked at runtime today (see "Contracts" in
+`CRUST.md`). The same clauses are what the lift will hand to
+`read_procedure` as `ensures` and loop annotations. The runtime check keeps
+the corpus discipline available before any proof exists: a contract the
+tests break is a contract no proof will establish.

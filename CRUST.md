@@ -361,6 +361,60 @@ which py2c typed from its first use as a string. The self-hosted build then
 failed to compile `crust.py`. A slotted class (`_Source`) gives each field
 its own type, the same reason `_Item` and `IterChain` are classes.
 
+## Contracts: `#[requires]`, `#[ensures]`, `#[invariant]`, `#[variant]`
+
+Contracts are written as Creusot and Prusti write them, so a file stays valid
+Rust for those tools (with `use prusti_contracts::*;` or
+`use creusot_contracts::*;`, which Crust accepts). Crust checks them at
+runtime. They are also the input the proof side will read (see `LEAN.md`).
+
+```rust
+#[requires(x < 100)]
+#[ensures(result <= 23)]
+fn regs(c: u32) -> u32 { match c { 0 => 6, 1 => 10, 2 => 15, _ => 23 } }
+
+#[ensures(*v == old(*v) + 1)]
+fn inc(v: &mut u32) { *v += 1; }
+
+#[invariant(i <= n)]
+#[variant(n - i)]
+while i < n { s += i; i += 1; }
+```
+
+| attribute | where | checked |
+|---|---|---|
+| `#[requires(e)]` | fn, method | at entry |
+| `#[ensures(e)]` | fn, method | at every exit: `return`, tail expression, `match` arm, `?`, and falling off the end of a function that returns nothing |
+| `#[invariant(e)]` | `loop`, `while`, `while let`, `for` | at every loop head; for `while`, including the head whose test fails |
+| `#[variant(e)]` | the same loops | strictly decreases at every head, and stays `>= 0` if signed |
+| `body_invariant!(e)` | inside a loop (Prusti) | where it is written |
+| `#[pure]`, `#[trusted]`, `#[logic]`, `#[predicate]`, .. | fn | accepted; they speak to the prover, and have no runtime effect |
+
+Inside a clause:
+
+- `result` is the return value, and `old(e)` is `e`'s value at entry,
+  snapshotted once there.
+- `a ==> b` is implication, written at the top level of the clause.
+- `self` and the parameters are in scope. A captured owning value, `result`
+  included, is a borrow and cannot be moved out.
+
+A violation prints the clause as written, the function and the line, then
+aborts:
+
+```
+contract violated: ensures `result <= 23` of `regs` (line 2)
+```
+
+Clauses with `forall`/`exists` are kept for the prover and not run, since
+there is nothing finite to evaluate. `CRUST_CONTRACTS=0` turns the checks
+off. Clauses are then still parsed, so a malformed one is an error either
+way.
+
+Before this, `#[requires]` and every other attribute on a function was
+silently dropped, and any attribute on a statement (`#[allow(..)]` on a
+`let`) was a parse error. Statement attributes other than the loop contracts
+are now ignored, as item attributes are.
+
 ## `char` and strings
 
 `char` lowers to `crust_char`, a typedef of `unsigned int`. It is the same
