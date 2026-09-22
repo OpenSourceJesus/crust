@@ -1096,6 +1096,408 @@ class TestSystems(unittest.TestCase):
         self.assertGreaterEqual(run.stdout.count("2\n"), 2, run.stdout)
         self.assertNotIn("\n0\n", "\n" + run.stdout)
         self.assertNotIn("\n1\n", "\n" + run.stdout)
+
+    def test_toggle_is_on_does_not_span_prior_index_expr(self):
+        """equipped[i]; … toggles[x].isOn must not merge (DOTALL bug → CS0000)."""
+        src = (
+            "Cosmetic cosmetic = CosmeticsMenu_equipped[i];\n"
+            "if (type == cosmetic.type) {\n"
+            "    cosmetic.Preview = false;\n"
+            "    CosmeticsMenu_toggles[instances.IndexOf(cosmetic)].isOn = false;\n"
+            "}\n"
+        )
+        out = unity_pack._rewrite_toggle_is_on(src)
+        self.assertIn("Cosmetic cosmetic = CosmeticsMenu_equipped[i];", out)
+        self.assertIn(
+            "Toggle_set_isOn(CosmeticsMenu_toggles[instances.IndexOf(cosmetic)], "
+            "(false));",
+            out)
+        self.assertNotIn("Toggle_set_isOn(CosmeticsMenu_equipped[i]", out)
+
+    def test_unlowered_public_method_emits_stub(self):
+        """Public GetComponents (no InChildren) helpers → empty stub."""
+        root = tempfile.mkdtemp(prefix="upack-stub-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Notify.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Notify : MonoBehaviour {\n"
+                "    public void Show() {\n"
+                "        Renderer[] rs = GetComponents<Renderer>();\n"
+                "    }\n"
+                "    void Update() {}\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Notify.cs.meta"), "w") as f:
+            f.write("guid: dddddddddddddddddddddddddddddddd\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Notify\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: dddddddddddddddddddddddddddddddd}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-stub-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("static void Notify_Show(unsigned i)", eng)
+        self.assertIn("unlowered C#", eng)
+        self.assertNotIn("GetComponents<", eng)
+
+    def test_unlowered_lambda_static_call_emits_stub(self):
+        """Public helper with Type.Method + lambda → stub (not crust fail)."""
+        root = tempfile.mkdtemp(prefix="upack-lambda-stub-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Notify.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "using System;\n"
+                "public class Notify : MonoBehaviour {\n"
+                "    public static void AddEvent(Action a, float t) {}\n"
+                "    public void Show() {\n"
+                "        Notify.AddEvent(() => { gameObject.SetActive(true); }, "
+                "Time.time + 0.1f);\n"
+                "    }\n"
+                "    void Update() {}\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Notify.cs.meta"), "w") as f:
+            f.write("guid: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Notify\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-lambda-stub-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("static void Notify_Show(unsigned i)", eng)
+        self.assertIn("unlowered C#", eng)
+        self.assertNotIn("Notify.AddEvent", eng)
+        self.assertNotIn("=>", eng)
+
+    def test_getcomponentsinchildren_collects_subtree(self):
+        """GetComponentsInChildren<T> walks parent table into std::vector."""
+        root = tempfile.mkdtemp(prefix="upack-gcic-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Part.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Part : MonoBehaviour {\n"
+                "    public int tagId;\n"
+                "    void Update() {}\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Part.cs.meta"), "w") as f:
+            f.write("guid: a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\n")
+        with open(os.path.join(scripts, "Root.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Root : MonoBehaviour {\n"
+                "    void Update() {\n"
+                "        Part[] parts = GetComponentsInChildren<Part>();\n"
+                "        int n = parts.Length;\n"
+                "        if (n > 1) n = n - 1;\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Root.cs.meta"), "w") as f:
+            f.write("guid: b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Root\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2}\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: ChildA\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "--- !u!4 &11\nTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Father: {fileID: 2}\n"
+                "  m_LocalPosition: {x: 1, y: 0, z: 0}\n"
+                "--- !u!114 &12\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1}\n"
+                "  tagId: 1\n"
+                "--- !u!1 &20\nGameObject:\n  m_Name: ChildB\n"
+                "  m_Component:\n  - component: {fileID: 21}\n"
+                "  - component: {fileID: 22}\n"
+                "--- !u!4 &21\nTransform:\n"
+                "  m_GameObject: {fileID: 20}\n"
+                "  m_Father: {fileID: 2}\n"
+                "  m_LocalPosition: {x: 2, y: 0, z: 0}\n"
+                "--- !u!114 &22\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 20}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1}\n"
+                "  tagId: 2\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-gcic-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("GameObject_GetComponentsInChildren_Part", eng)
+        self.assertIn("_engine_go_is_child_of", eng)
+        self.assertIn(
+            "std::vector<int> parts = "
+            "GameObject_GetComponentsInChildren_Part(", eng)
+        self.assertIn("parts.size()", eng)
+        self.assertNotIn("GetComponentsInChildren<Part>", eng)
+        self.assertNotIn("unlowered C#", eng)
+        self.assertNotIn("Part[]", eng)
+
+    def test_getcomponentsinchildren_base_type_finds_subclass(self):
+        """GetComponentsInChildren<Weapon> collects Blaster : Weapon instances."""
+        root = tempfile.mkdtemp(prefix="upack-gcic-base-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Weapon.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Weapon : MonoBehaviour {\n"
+                "    public int dmg;\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Weapon.cs.meta"), "w") as f:
+            f.write("guid: d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4\n")
+        with open(os.path.join(scripts, "Blaster.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Blaster : Weapon {\n"
+                "    void Update() {}\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Blaster.cs.meta"), "w") as f:
+            f.write("guid: e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5\n")
+        with open(os.path.join(scripts, "Hero.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Hero : MonoBehaviour {\n"
+                "    void Update() {\n"
+                "        Weapon[] ws = GetComponentsInChildren<Weapon>();\n"
+                "        int n = ws.Length;\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Hero.cs.meta"), "w") as f:
+            f.write("guid: f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Hero\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6}\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Gun\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "--- !u!4 &11\nTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Father: {fileID: 2}\n"
+                "  m_LocalPosition: {x: 1, y: 0, z: 0}\n"
+                "--- !u!114 &12\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5}\n"
+                "  dmg: 3\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-gcic-base-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("GameObject_GetComponentsInChildren_Weapon", eng)
+        self.assertIn("GameObject_GetComponent_Blaster(go)", eng)
+        self.assertIn(
+            "std::vector<int> ws = "
+            "GameObject_GetComponentsInChildren_Weapon(", eng)
+        self.assertNotIn("Weapon could not be found", eng)
+
+    def test_getcomponentsinchildren_on_instantiated(self):
+        """clone.GetComponentsInChildren after Instantiate uses clone GO."""
+        root = tempfile.mkdtemp(prefix="upack-gcic-inst-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Gem.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Gem : MonoBehaviour {\n"
+                "    void Update() {\n"
+                "        Gem g = Instantiate(this);\n"
+                "        Gem[] kids = g.GetComponentsInChildren<Gem>();\n"
+                "        int n = kids.Length;\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Gem.cs.meta"), "w") as f:
+            f.write("guid: c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Gem\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-gcic-inst-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("Object_Instantiate_Gem(i, -1)", eng)
+        self.assertIn(
+            "GameObject_GetComponentsInChildren_Gem("
+            "_engine_go_of_Gem(g)", eng)
+        self.assertNotIn("unlowered C#", eng)
+
+    def test_instantiate_this_clones_live(self):
+        """Instantiate(this) → Object_Instantiate_T; spare GO + MB pool."""
+        root = tempfile.mkdtemp(prefix="upack-inst-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Mob.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Mob : MonoBehaviour {\n"
+                "    public int hp = 3;\n"
+                "    void Update() {\n"
+                "        Mob m = Instantiate(this);\n"
+                "        print(m);\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Mob.cs.meta"), "w") as f:
+            f.write("guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Mob\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 1, y: 2, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}\n"
+                "  hp: 3\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-inst-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        with open(os.path.join(d, "data.c")) as f:
+            data = f.read()
+        self.assertIn("Object_Instantiate_Mob", eng)
+        self.assertIn("Object_Instantiate_Mob(i, -1)", eng)
+        self.assertNotIn("unlowered C#", eng)
+        self.assertIn("int _Mob_inst_count = 1;", data)
+        self.assertIn("_Mob_inst_array[2]", data)
+        self.assertIn("static int _engine_go_count = 1;", eng)
+        self.assertIn("_engine_go_cap = 2", eng)
+        self.assertIn("_engine_go_name[go] = \"(Clone)\";", eng)
+
+    def test_instantiate_this_with_parent(self):
+        """Instantiate(this, transform.parent) wires live parent table."""
+        root = tempfile.mkdtemp(prefix="upack-instp-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Kid.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Kid : MonoBehaviour {\n"
+                "    void Update() {\n"
+                "        Kid k = Instantiate(this, transform.parent);\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Kid.cs.meta"), "w") as f:
+            f.write("guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Nest\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "--- !u!4 &11\nTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Kid\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Father: {fileID: 11}\n"
+                "  m_LocalPosition: {x: 0, y: 1, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-instp-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("Object_Instantiate_Kid", eng)
+        self.assertIn(
+            "Object_Instantiate_Kid(i, Transform_get_parent(", eng)
+        self.assertIn("_engine_go_parent[go] = parent_go;", eng)
+        self.assertNotIn("unlowered C#", eng)
+
     def test_singleton_toggle_array_is_on(self):
         """Other.instance.toggles[i].isOn → Toggle_set_isOn(Other_toggles[i], …)."""
         root = tempfile.mkdtemp(prefix="upack-toggle-")
