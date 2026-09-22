@@ -1865,5 +1865,190 @@ fn make(k: i32) -> impl Fn(i32) -> i32 { move |x: i32| x + k }
         self.assertIn("impl", str(cm.exception))
 
 
+class TestContracts(unittest.TestCase):
+    """`#[requires]`/`#[ensures]`/`#[invariant]`/`#[variant]`, Creusot- and
+    Prusti-style, checked at runtime."""
+
+    def assertViolates(self, source, *fragments):
+        rc, err = _rs_stderr(source)
+        self.assertNotEqual(rc, 0, "the contract was not checked")
+        self.assertIn("contract violated", err)
+        for frag in fragments:
+            self.assertIn(frag, err)
+
+    def test_requires_holds_and_fails(self):
+        src = """
+use prusti_contracts::*;
+#[requires(x > 0)]
+#[requires(x < 100)]
+fn half(x: u32) -> u32 { x / 2 }
+fn main() -> i32 { half(ARG) as i32 }
+"""
+        self.assertEqual(_rs(src.replace("ARG", "84")), 42)
+        self.assertViolates(src.replace("ARG", "0"), "requires", "x > 0",
+                            "half")
+        self.assertViolates(src.replace("ARG", "200"), "x < 100")
+
+    def test_ensures_checks_every_return_path(self):
+        src = """
+#[ensures(result <= 23)]
+fn regs(c: u32) -> u32 {
+    if c == 9 { return BAD; }
+    match c { 0 => 6, 1 => 10, 2 => 15, _ => 23 }
+}
+fn main() -> i32 {
+    (regs(0) + regs(1) + regs(2) + regs(7) + regs(9)) as i32 - 40
+}
+"""
+        self.assertEqual(_rs(src.replace("BAD", "0")), 14)
+        self.assertViolates(src.replace("BAD", "99"), "ensures",
+                            "result <= 23", "regs")
+
+    def test_ensures_after_a_try_early_return(self):
+        src = """
+fn half(x: i32) -> Result<i32, i32> { if x % 2 == 0 { Ok(x / 2) } else { Err(x) } }
+#[ensures(result.is_ok() || LIMIT)]
+fn f(x: i32) -> Result<i32, i32> {
+    let h: i32 = half(x)?;
+    Ok(h)
+}
+fn main() -> i32 { let r: Result<i32, i32> = f(3); if r.is_ok() { 1 } else { 42 } }
+"""
+        self.assertEqual(_rs(src.replace("LIMIT", "x < 10")), 42)
+        self.assertViolates(src.replace("LIMIT", "x > 10"), "ensures")
+
+    def test_old_and_a_void_function(self):
+        src = """
+#[ensures(*v == old(*v) + STEP)]
+fn inc(v: &mut u32) { *v += 1; }
+fn main() -> i32 { let mut a: u32 = 41; inc(&mut a); a as i32 }
+"""
+        self.assertEqual(_rs(src.replace("STEP", "1")), 42)
+        self.assertViolates(src.replace("STEP", "2"), "old(*v)")
+
+    def test_implication(self):
+        src = """
+#[requires(flag ==> x > 5)]
+fn f(flag: bool, x: u32) -> u32 { x }
+fn main() -> i32 { (f(false, 0) + f(true, X)) as i32 }
+"""
+        self.assertEqual(_rs(src.replace("X", "42")), 42)
+        self.assertViolates(src.replace("X", "3"), "flag ==> x > 5")
+
+    def test_methods_see_self(self):
+        src = """
+struct Counter { n: u32, cap: u32 }
+impl Counter {
+    #[requires(self.n < self.cap)]
+    #[ensures(self.n == old(self.n) + 1)]
+    fn bump(&mut self) { self.n += 1; }
+}
+fn main() -> i32 {
+    let mut c: Counter = Counter { n: 40, cap: CAP };
+    c.bump(); c.bump();
+    c.n as i32
+}
+"""
+        self.assertEqual(_rs(src.replace("CAP", "50")), 42)
+        self.assertViolates(src.replace("CAP", "41"), "self.n < self.cap")
+
+    def test_loop_invariant_and_variant(self):
+        src = """
+fn sum_to(n: u32) -> u32 {
+    let mut i: u32 = 0;
+    let mut s: u32 = 0;
+    #[invariant(i <= n)]
+    #[variant(n - i)]
+    while i < n { s += i; i += STEP; }
+    s
+}
+fn main() -> i32 { sum_to(9) as i32 + 6 }
+"""
+        self.assertEqual(_rs(src.replace("STEP", "1")), 42)
+        # A step of 0 never decreases the variant.
+        self.assertViolates(src.replace("STEP", "0"), "variant", "n - i")
+
+    def test_invariant_on_for_loop_and_while_let(self):
+        src = """
+fn next(k: u32) -> Option<u32> { if k < 5 { Some(k + 1) } else { None } }
+fn main() -> i32 {
+    let mut t: u32 = 0;
+    #[invariant(t <= 100)]
+    for i in 0..LIM { t += i; }
+    let mut k: u32 = 0;
+    #[invariant(k <= 5)]
+    while let Some(n) = next(k) { k = n; }
+    (t + k) as i32
+}
+"""
+        self.assertEqual(_rs(src.replace("LIM", "9")), 41)
+        self.assertViolates(src.replace("LIM", "20"), "invariant", "t <= 100")
+
+    def test_invariant_is_checked_at_every_head_of_a_while(self):
+        # Including the head whose test fails: `i <= 2` breaks when i is 3.
+        self.assertViolates("""
+fn main() -> i32 {
+    let mut i: u32 = 0;
+    #[invariant(i <= 2)]
+    while i < 3 { i += 1; }
+    i as i32
+}
+""", "i <= 2")
+
+    def test_prusti_body_invariant(self):
+        src = """
+fn main() -> i32 {
+    let mut i: i32 = 0;
+    while i < 42 {
+        body_invariant!(i < LIM);
+        i += 1;
+    }
+    i
+}
+"""
+        self.assertEqual(_rs(src.replace("LIM", "42")), 42)
+        self.assertViolates(src.replace("LIM", "10"), "i < 10")
+
+    def test_marker_attributes_and_statement_attributes(self):
+        self.assertEqual(_rs("""
+use creusot_contracts::*;
+#[pure]
+#[trusted]
+fn sq(x: u32) -> u32 { x * x }
+#[logic]
+fn cube(x: u32) -> u32 { x * x * x }
+fn main() -> i32 {
+    #[allow(unused_variables)]
+    let unused: i32 = 0;
+    (sq(3) + cube(3) + 6) as i32
+}
+"""), 42)
+
+    def test_quantified_clauses_are_kept_but_not_run(self):
+        c = crust.translate("""
+#[requires(forall(|i: usize| i < xs.len() ==> xs[i] > 0))]
+fn f(xs: &[u32]) -> u32 { 0 }
+""")
+        self.assertNotIn("contract violated", c)
+
+    def test_contracts_can_be_turned_off_but_are_still_parsed(self):
+        src = "#[requires(x > 0)]\nfn f(x: u32) -> u32 { x }\n"
+        os.environ["CRUST_CONTRACTS"] = "0"
+        try:
+            self.assertNotIn("contract violated", crust.translate(src))
+            # A malformed clause is still an error with checks off.
+            with self.assertRaises(crust.CrustError):
+                crust.translate("#[requires(x >)]\n"
+                                "fn f(x: u32) -> u32 { x }\n")
+        finally:
+            del os.environ["CRUST_CONTRACTS"]
+        self.assertIn("contract violated", crust.translate(src))
+
+    def test_misplaced_loop_contract_is_reported(self):
+        with self.assertRaises(crust.CrustError) as cm:
+            crust.translate("fn f() { #[invariant(true)] let x: i32 = 1; }")
+        self.assertIn("loop", str(cm.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
