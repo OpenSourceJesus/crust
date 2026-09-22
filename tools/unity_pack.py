@@ -51,15 +51,22 @@ def _assets_rel_path(path):
 
 
 # System.IO.File members we emit. Others → CS0117 (File is in scope via using).
-_FILE_SUPPORTED = frozenset({"WriteAllText", "AppendAllText", "Exists"})
+_FILE_SUPPORTED = frozenset({
+    "WriteAllText", "AppendAllText", "WriteAllBytes", "ReadAllBytes",
+    "Exists", "Delete",
+})
 
 # UnityEngine.Application members we emit. Others → CS0117.
 _APPLICATION_SUPPORTED = frozenset({
     "dataPath", "persistentDataPath", "isEditor", "isPlaying", "OpenURL",
+    "productName",
 })
 
 # UnityEngine.Quaternion members we emit. Others → CS0117 (in scope via UnityEngine).
-_QUATERNION_SUPPORTED = frozenset({"Euler", "identity", "LookRotation", "Slerp"})
+_QUATERNION_SUPPORTED = frozenset({
+    "Euler", "identity", "LookRotation", "Slerp", "Inverse", "Angle",
+    "RotateTowards",
+})
 
 # MonoBehaviour.transform members we lower. Others → CS1061 on Transform
 # (transform itself is always in scope; blame the missing member).
@@ -72,17 +79,22 @@ _TRANSFORM_SUPPORTED = frozenset({
 })
 
 
+_FILE_MEMBER_CALL = re.compile(
+    r"System\.IO\.File\.(\w+)\s*\("
+    r"|(?<![\w.])File\.(\w+)\s*\(")
+
+
 def _check_file_api(path, text, scan):
     """Unsupported File.Member with System.IO in scope → Unity CS0117."""
     has_io = bool(re.search(r"using\s+System\.IO\b", scan))
-    for m in re.finditer(r"(?:System\.IO\.)?File\.(\w+)\s*\(", scan):
-        method = m.group(1)
+    for m in _FILE_MEMBER_CALL.finditer(scan):
+        method = m.group(1) or m.group(2)
         if method in _FILE_SUPPORTED:
             continue
-        is_fqn = m.group(0).startswith("System.IO.")
+        is_fqn = m.group(1) is not None
         if not is_fqn and not has_io:
             continue  # bare File without using — not CS0117
-        method_idx = m.start(1)
+        method_idx = m.start(1) if is_fqn else m.start(2)
         line = text.count("\n", 0, method_idx) + 1
         col = method_idx - (text.rfind("\n", 0, method_idx) + 1) + 1
         raise PackError(
@@ -93,9 +105,13 @@ def _check_file_api(path, text, scan):
 
 
 def _check_application_api(path, text, scan):
-    """Unsupported Application.Member with UnityEngine in scope → CS0117."""
+    """Unsupported Application.Member with UnityEngine in scope → CS0117.
+
+    Must not match inside ``EditorApplication`` / other *Application types.
+    """
     has_ue = bool(re.search(r"using\s+UnityEngine\b", scan))
-    for m in re.finditer(r"(?:UnityEngine\.)?Application\.(\w+)\b", scan):
+    for m in re.finditer(
+            r"(?<![\w])(?:UnityEngine\.)?Application\.(\w+)\b", scan):
         member = m.group(1)
         if member in _APPLICATION_SUPPORTED:
             continue
@@ -279,9 +295,13 @@ _API = {
     "Application.isEditor": True,
     "Application.isPlaying": True,
     "Application.OpenURL": True,
+    "Application.productName": True,
     "File.WriteAllText": True,
     "File.AppendAllText": True,
+    "File.WriteAllBytes": True,
+    "File.ReadAllBytes": True,
     "File.Exists": True,
+    "File.Delete": True,
 }
 
 # APIs that would require inventing scene components / assets we do not pack.
@@ -340,12 +360,14 @@ _UNITY_API = re.compile(
     r"(?<![\w])(?:Mathf\.(?:Abs|Min|Max|Clamp|Lerp|Sin|Cos|Sign)|"
     r"Time\.(?:deltaTime|time|fixedDeltaTime)|"
     r"Screen\.(?:width|height)|"
-    r"Application\.dataPath|"
-    r"Application\.persistentDataPath|"
-    r"Application\.isEditor|"
-    r"Application\.isPlaying|"
-    r"Application\.OpenURL|"
-    r"File\.(?:WriteAllText|AppendAllText|Exists)|"
+    r"(?<![\w])Application\.dataPath|"
+    r"(?<![\w])Application\.persistentDataPath|"
+    r"(?<![\w])Application\.isEditor|"
+    r"(?<![\w])Application\.isPlaying|"
+    r"(?<![\w])Application\.OpenURL|"
+    r"(?<![\w])Application\.productName|"
+    r"File\.(?:WriteAllText|AppendAllText|WriteAllBytes|ReadAllBytes|"
+    r"Exists|Delete)|"
     r"Input\.(?:GetAxis|GetButton|GetKey)|"
     r"RenderSettings\.ambientLight|Camera\.main|"
     r"transform\.position|Physics2D\.gravity|Physics\.gravity|"
@@ -4295,6 +4317,18 @@ def analyze_script(path, text=None):
     if re.search(r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*Find\s*\(",
                  scan):
         apis.add("transform.Find")
+    # foo.transform.Find / trs.Find (Transform receiver — live GO index).
+    if re.search(r"\.\s*transform\s*\.\s*Find\s*\(", scan):
+        apis.add("transform.Find")
+    if re.search(r"(?<![.\w])\w+\s*\.\s*Find\s*\(", scan):
+        # May be List.Find etc.; rewrite only when receiver is Transform/GO.
+        # Still record so parent tables emit when a Transform.Find exists.
+        if re.search(
+                r"(?:Transform|GameObject)\s+\w+\s*=|"
+                r"\.\s*transform\s*\.\s*Find\s*\(|"
+                r"(?:this\s*\.\s*)?transform\s*\.\s*Find\s*\(",
+                scan):
+            apis.add("transform.Find")
     if re.search(r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*localScale\b",
                  scan):
         apis.add("transform.localScale")
@@ -4348,26 +4382,39 @@ def analyze_script(path, text=None):
         apis.add("Debug.Log")
     if re.search(r"(?<![\w.])print\s*\(", scan):
         apis.add("print")
-    if re.search(r"(?:UnityEngine\.)?Application\.dataPath\b", scan):
+    if re.search(r"(?<![\w])(?:UnityEngine\.)?Application\.dataPath\b", scan):
         apis.add("Application.dataPath")
-    if re.search(r"(?:UnityEngine\.)?Application\.persistentDataPath\b", scan):
+    if re.search(
+            r"(?<![\w])(?:UnityEngine\.)?Application\.persistentDataPath\b",
+            scan):
         apis.add("Application.persistentDataPath")
-    if re.search(r"(?:UnityEngine\.)?Application\.isEditor\b", scan):
+    if re.search(r"(?<![\w])(?:UnityEngine\.)?Application\.isEditor\b", scan):
         apis.add("Application.isEditor")
-    if re.search(r"(?:UnityEngine\.)?Application\.isPlaying\b", scan):
+    if re.search(r"(?<![\w])(?:UnityEngine\.)?Application\.isPlaying\b", scan):
         apis.add("Application.isPlaying")
-    if re.search(r"(?:UnityEngine\.)?Application\.OpenURL\s*\(", scan):
+    if re.search(
+            r"(?<![\w])(?:UnityEngine\.)?Application\.OpenURL\s*\(", scan):
         apis.add("Application.OpenURL")
+    if re.search(
+            r"(?<![\w])(?:UnityEngine\.)?Application\.productName\b", scan):
+        apis.add("Application.productName")
     if re.search(r"(?:System\.IO\.)?File\.WriteAllText\s*\(", scan):
         apis.add("File.WriteAllText")
     if re.search(r"(?:System\.IO\.)?File\.AppendAllText\s*\(", scan):
         apis.add("File.AppendAllText")
+    if re.search(r"(?:System\.IO\.)?File\.WriteAllBytes\s*\(", scan):
+        apis.add("File.WriteAllBytes")
+    if re.search(r"(?:System\.IO\.)?File\.ReadAllBytes\s*\(", scan):
+        apis.add("File.ReadAllBytes")
     if re.search(r"(?:System\.IO\.)?File\.Exists\s*\(", scan):
         apis.add("File.Exists")
+    if re.search(r"(?:System\.IO\.)?File\.Delete\s*\(", scan):
+        apis.add("File.Delete")
     # C# string + value must not become C pointer arithmetic.
     if re.search(
             r'"\s*\+|'
-            r"Application\.(?:dataPath|persistentDataPath)\s*\+",
+            r"(?<![\w])Application\.(?:dataPath|persistentDataPath|"
+            r"productName)\s*\+",
             scan):
         apis.add("string.+")
     has_system = bool(re.search(r"using\s+System\b", scan))
@@ -4492,23 +4539,24 @@ def _parse_csharp_field_init(ty, raw):
             return lit
         # Application.dataPath / persistentDataPath + "/rel" — pack-time bake.
         m = re.match(
-            r"(?:UnityEngine\.)?Application\.dataPath\s*\+\s*"
+            r"(?<![\w])(?:UnityEngine\.)?Application\.dataPath\s*\+\s*"
             r"(\"([^\"\\]|\\.)*\")\s*$",
             raw)
         if m:
             return {"kind": "dataPath+", "suffix": _string_literal_value(
                 m.group(1))}
-        if re.match(r"(?:UnityEngine\.)?Application\.dataPath\s*$", raw):
+        if re.match(
+                r"(?<![\w])(?:UnityEngine\.)?Application\.dataPath\s*$", raw):
             return {"kind": "dataPath"}
         m = re.match(
-            r"(?:UnityEngine\.)?Application\.persistentDataPath\s*\+\s*"
+            r"(?<![\w])(?:UnityEngine\.)?Application\.persistentDataPath\s*\+\s*"
             r"(\"([^\"\\]|\\.)*\")\s*$",
             raw)
         if m:
             return {"kind": "persistentDataPath+", "suffix":
                     _string_literal_value(m.group(1))}
         if re.match(
-                r"(?:UnityEngine\.)?Application\.persistentDataPath\s*$",
+                r"(?<![\w])(?:UnityEngine\.)?Application\.persistentDataPath\s*$",
                 raw):
             return {"kind": "persistentDataPath"}
         return None
@@ -4583,7 +4631,7 @@ def _fields_in(body, bscan, body_abs=0):
                 # Unity forbids Application.dataPath / persistentDataPath in
                 # MonoBehaviour field initializers / .cctor (not Awake/Start).
                 am = re.search(
-                    r"(?:UnityEngine\.)?Application\."
+                    r"(?<![\w])(?:UnityEngine\.)?Application\."
                     r"(dataPath|persistentDataPath)\b",
                     init_src)
                 if am:
@@ -5016,6 +5064,15 @@ def emit_engine(plan, analyses, used_apis):
     want_math = bool(used_apis & {"Mathf.Sin", "Mathf.Cos"})
     want_live_rot = bool(plan.get("live_rot_classes"))
     want_transform_matrix = bool(plan.get("transform_matrix_classes"))
+    want_quat_angle = "Quaternion.Angle" in used_apis
+    if ("File.WriteAllBytes" in used_apis
+            or "File.ReadAllBytes" in used_apis):
+        if "File.WriteAllBytes" in used_apis:
+            plan["byte_array_lits"] = _collect_byte_array_lits(
+                plan, analyses)
+        else:
+            plan["byte_array_lits"] = []
+        plan["_byte_array_lit_i"] = [0]
     getcomponent_types = set()
     for a in analyses:
         getcomponent_types |= set(a.get("getcomponent_types") or [])
@@ -5072,11 +5129,19 @@ def emit_engine(plan, analyses, used_apis):
     want_app_is_editor = "Application.isEditor" in used_apis
     want_app_is_playing = "Application.isPlaying" in used_apis
     want_app_open_url = "Application.OpenURL" in used_apis
+    want_app_product_name = "Application.productName" in used_apis
     want_file_write = "File.WriteAllText" in used_apis
     want_file_append = "File.AppendAllText" in used_apis
+    want_file_write_bytes = "File.WriteAllBytes" in used_apis
+    want_file_read_bytes = "File.ReadAllBytes" in used_apis
+    want_file_bytes = want_file_write_bytes or want_file_read_bytes
     want_file_exists = "File.Exists" in used_apis
-    want_file_write_ops = want_file_write or want_file_append
-    want_file_io = want_file_write_ops or want_file_exists
+    want_file_delete = "File.Delete" in used_apis
+    want_file_write_ops = (
+        want_file_write or want_file_append or want_file_write_bytes)
+    want_file_io = (
+        want_file_write_ops or want_file_exists or want_file_read_bytes
+        or want_file_delete)
     want_destroy = "Object.Destroy" in used_apis
     ui_buttons = plan.get("ui_buttons") or []
     want_ui = bool(ui_buttons)
@@ -5095,7 +5160,7 @@ def emit_engine(plan, analyses, used_apis):
         p("/* layout: SoA positions (contiguous float tables for GPU upload) */")
     p("#include <stdint.h>")
     if (want_math or want_col2d or want_col3d or want_anim or want_live_rot
-            or want_transform_matrix):
+            or want_transform_matrix or want_quat_angle):
         p("#include <math.h>")
     if (want_input or want_log or want_find or want_transform_find
             or want_set_parent
@@ -5103,7 +5168,8 @@ def emit_engine(plan, analyses, used_apis):
             or want_file_io):
         p("#include <string.h>")
     if (want_log or want_console or want_str_plus or want_add_any
-            or want_file_io or want_go_tables or want_ctor_forbidden):
+            or want_file_io or want_go_tables or want_ctor_forbidden
+            or want_app_open_url):
         p("#include <stdio.h>")
     want_draw_sort = False
     for cl in plan["classes"].values():
@@ -5115,7 +5181,8 @@ def emit_engine(plan, analyses, used_apis):
         if want_draw_sort:
             break
     if (want_log or want_draw_sort or want_data_path
-            or want_persistent_data_path or want_file_io or want_go_tables):
+            or want_persistent_data_path or want_file_io or want_go_tables
+            or want_app_open_url):
         p("#include <stdlib.h>")
     if want_go_tables:
         p("#include <setjmp.h>")
@@ -5493,12 +5560,38 @@ def emit_engine(plan, analyses, used_apis):
         p("/* Application.isPlaying — true while the packed player runs */")
         p("static int Application_isPlaying(void) { return 1; }")
         p("")
+    if want_app_product_name:
+        product = plan.get("product_name") or "Player"
+        p("/* Application.productName — ProjectSettings productName */")
+        p("static const char _engine_app_product_name[] = %s;"
+          % _c_string(product))
+        p("static const char *Application_productName(void) {")
+        p("    return _engine_app_product_name;")
+        p("}")
+        p("")
     if want_app_open_url:
-        # Packed player has no browser / mailto host — Unity still accepts
-        # the call; editor inspector buttons are the usual callers.
-        p("/* Application.OpenURL — no-op in packed player (no OS shell) */")
+        p("/* Application.OpenURL — python3 webbrowser via system(3) */")
         p("static void Application_OpenURL(const char *url) {")
-        p("    (void)url;")
+        p("    char cmd[4096];")
+        p("    char py[2048];")
+        p("    int i, j;")
+        p("    if (!url || !url[0]) return;")
+        p("    j = 0;")
+        p("    py[j++] = '\\'';")
+        p("    for (i = 0; url[i] && j + 2 < (int)sizeof py; i++) {")
+        p("        if (url[i] == '\\'' || url[i] == '\\\\') {")
+        p("            py[j++] = '\\\\';")
+        p("            py[j++] = url[i];")
+        p("        } else {")
+        p("            py[j++] = url[i];")
+        p("        }")
+        p("    }")
+        p("    py[j++] = '\\'';")
+        p("    py[j] = 0;")
+        p("    snprintf(cmd, sizeof cmd,")
+        p("        \"python3 -c \\\"import webbrowser; webbrowser.open(%s)\\\"\",")
+        p("        py);")
+        p("    (void)system(cmd);")
         p("}")
         p("")
     if want_destroy:
@@ -5662,71 +5755,166 @@ def emit_engine(plan, analyses, used_apis):
     if not want_persistent_data_path:
         p("const char *engine_persistent_data_path(void) { return \"\"; }")
         p("")
-    if want_file_write_ops:
-        if not want_log:
+    if want_file_write_ops or want_file_read_bytes:
+        if want_file_bytes:
+            p("/* System.IO byte[] → ByteArray (WriteAllBytes / ReadAllBytes) */")
+            p("typedef struct {")
+            p("    const unsigned char *data;")
+            p("    int length;")
+            p("} ByteArray;")
+            p("")
+        if want_file_write_ops:
+            p("/* System.IO.File.WriteAllText / AppendAllText / WriteAllBytes */")
+            if not want_log:
+                p("#ifndef CRUST_NO_POSIX_MKDIR")
+                p("static int _engine_mkdir_p(char *path) {")
+                p("    char *p;")
+                p("    if (!path || !path[0]) return -1;")
+                p("    for (p = path + 1; *p; p++) {")
+                p("#ifdef _WIN32")
+                p("        if (*p == '/' || *p == '\\\\') {")
+                p("#else")
+                p("        if (*p == '/') {")
+                p("#endif")
+                p("            char sep = *p;")
+                p("            *p = 0;")
+                p("            if (ENGINE_MKDIR(path) != 0 && errno != EEXIST) {")
+                p("                *p = sep; return -1;")
+                p("            }")
+                p("            *p = sep;")
+                p("        }")
+                p("    }")
+                p("    if (ENGINE_MKDIR(path) != 0 && errno != EEXIST) return -1;")
+                p("    return 0;")
+                p("}")
+                p("#endif")
+                p("")
+            p("static void File_WriteContents(const char *path,")
+            p("                               const char *contents,")
+            p("                               const char *mode) {")
+            p("    FILE *fp;")
             p("#ifndef CRUST_NO_POSIX_MKDIR")
-            p("static int _engine_mkdir_p(char *path) {")
-            p("    char *p;")
-            p("    if (!path || !path[0]) return -1;")
-            p("    for (p = path + 1; *p; p++) {")
+            p("    char dir[1024];")
+            p("    int n, i;")
+            p("    if (path && path[0]) {")
+            p("        n = (int)strlen(path);")
+            p("        if (n > 0 && (size_t)n < sizeof dir) {")
+            p("            for (i = 0; i < n; i++) dir[i] = path[i];")
+            p("            dir[n] = 0;")
+            p("            for (i = n - 1; i >= 0; i--) {")
             p("#ifdef _WIN32")
-            p("        if (*p == '/' || *p == '\\\\') {")
+            p("                if (dir[i] == '/' || dir[i] == '\\\\') {")
+            p("                    dir[i] = 0; break;")
+            p("                }")
             p("#else")
-            p("        if (*p == '/') {")
+            p("                if (dir[i] == '/') { dir[i] = 0; break; }")
             p("#endif")
-            p("            char sep = *p;")
-            p("            *p = 0;")
-            p("            if (ENGINE_MKDIR(path) != 0 && errno != EEXIST) {")
-            p("                *p = sep; return -1;")
             p("            }")
-            p("            *p = sep;")
+            p("            if (dir[0]) _engine_mkdir_p(dir);")
             p("        }")
             p("    }")
-            p("    if (ENGINE_MKDIR(path) != 0 && errno != EEXIST) return -1;")
-            p("    return 0;")
-            p("}")
             p("#endif")
-            p("")
-        p("/* System.IO.File.WriteAllText / AppendAllText */")
-        p("static void File_WriteContents(const char *path,")
-        p("                               const char *contents,")
-        p("                               const char *mode) {")
-        p("    FILE *fp;")
-        p("#ifndef CRUST_NO_POSIX_MKDIR")
-        p("    char dir[1024];")
-        p("    int n, i;")
-        p("    if (path && path[0]) {")
-        p("        n = (int)strlen(path);")
-        p("        if (n > 0 && (size_t)n < sizeof dir) {")
-        p("            for (i = 0; i < n; i++) dir[i] = path[i];")
-        p("            dir[n] = 0;")
-        p("            for (i = n - 1; i >= 0; i--) {")
-        p("#ifdef _WIN32")
-        p("                if (dir[i] == '/' || dir[i] == '\\\\') {")
-        p("                    dir[i] = 0; break;")
-        p("                }")
-        p("#else")
-        p("                if (dir[i] == '/') { dir[i] = 0; break; }")
-        p("#endif")
-        p("            }")
-        p("            if (dir[0]) _engine_mkdir_p(dir);")
-        p("        }")
-        p("    }")
-        p("#endif")
-        p("    fp = fopen(path ? path : \"\", mode ? mode : \"w\");")
-        p("    if (!fp) return;")
-        p("    if (contents) fputs(contents, fp);")
-        p("    fclose(fp);")
-        p("}")
-        if want_file_write:
-            p("static void File_WriteAllText(const char *path,")
-            p("                              const char *contents) {")
-            p("    File_WriteContents(path, contents, \"w\");")
+            p("    fp = fopen(path ? path : \"\", mode ? mode : \"w\");")
+            p("    if (!fp) return;")
+            p("    if (contents) fputs(contents, fp);")
+            p("    fclose(fp);")
             p("}")
-        if want_file_append:
-            p("static void File_AppendAllText(const char *path,")
-            p("                               const char *contents) {")
-            p("    File_WriteContents(path, contents, \"a\");")
+            if want_file_write:
+                p("static void File_WriteAllText(const char *path,")
+                p("                              const char *contents) {")
+                p("    File_WriteContents(path, contents, \"w\");")
+                p("}")
+            if want_file_append:
+                p("static void File_AppendAllText(const char *path,")
+                p("                               const char *contents) {")
+                p("    File_WriteContents(path, contents, \"a\");")
+                p("}")
+            if want_file_write_bytes:
+                p("static void File_WriteAllBytes(const char *path, ByteArray bytes) {")
+                p("    FILE *fp;")
+                p("#ifndef CRUST_NO_POSIX_MKDIR")
+                p("    char dir[1024];")
+                p("    int n, i;")
+                p("    if (path && path[0]) {")
+                p("        n = (int)strlen(path);")
+                p("        if (n > 0 && (size_t)n < sizeof dir) {")
+                p("            for (i = 0; i < n; i++) dir[i] = path[i];")
+                p("            dir[n] = 0;")
+                p("            for (i = n - 1; i >= 0; i--) {")
+                p("#ifdef _WIN32")
+                p("                if (dir[i] == '/' || dir[i] == '\\\\') {")
+                p("                    dir[i] = 0; break;")
+                p("                }")
+                p("#else")
+                p("                if (dir[i] == '/') { dir[i] = 0; break; }")
+                p("#endif")
+                p("            }")
+                p("            if (dir[0]) _engine_mkdir_p(dir);")
+                p("        }")
+                p("    }")
+                p("#endif")
+                p("    fp = fopen(path ? path : \"\", \"wb\");")
+                p("    if (!fp) return;")
+                p("    if (bytes.data && bytes.length > 0)")
+                p("        fwrite(bytes.data, 1, (size_t)bytes.length, fp);")
+                p("    fclose(fp);")
+                p("}")
+                # Literal helpers collected while lowering method bodies.
+                for bi, nums in enumerate(plan.get("byte_array_lits") or []):
+                    if not nums:
+                        p("static unsigned char _engine_ba_%d_data[1] = { 0 };"
+                          % bi)
+                        p("static ByteArray _engine_ba_%d(void) {" % bi)
+                        p("    ByteArray b;")
+                        p("    b.data = _engine_ba_%d_data;" % bi)
+                        p("    b.length = 0;")
+                        p("    return b;")
+                        p("}")
+                    else:
+                        p("static unsigned char _engine_ba_%d_data[%d] = { %s };"
+                          % (bi, len(nums),
+                             ", ".join(str(int(x) & 0xFF) for x in nums)))
+                        p("static ByteArray _engine_ba_%d(void) {" % bi)
+                        p("    ByteArray b;")
+                        p("    b.data = _engine_ba_%d_data;" % bi)
+                        p("    b.length = %d;" % len(nums))
+                        p("    return b;")
+                        p("}")
+        if want_file_read_bytes:
+            p("/* System.IO.File.ReadAllBytes — malloc buffer (no free). */")
+            p("static ByteArray File_ReadAllBytes(const char *path) {")
+            p("    ByteArray out;")
+            p("    FILE *fp;")
+            p("    unsigned char chunk[4096];")
+            p("    unsigned char *buf;")
+            p("    size_t cap, len, n;")
+            p("    out.data = 0;")
+            p("    out.length = 0;")
+            p("    if (!path || !path[0]) return out;")
+            p("    fp = fopen(path, \"rb\");")
+            p("    if (!fp) return out;")
+            p("    cap = 4096;")
+            p("    len = 0;")
+            p("    buf = (unsigned char *)malloc(cap);")
+            p("    if (!buf) { fclose(fp); return out; }")
+            p("    for (;;) {")
+            p("        n = fread(chunk, 1, sizeof chunk, fp);")
+            p("        if (n == 0) break;")
+            p("        if (len + n > cap) {")
+            p("            cap = cap + n + 4096;")
+            p("            {")
+            p("                unsigned char *nb = (unsigned char *)realloc(buf, cap);")
+            p("                if (!nb) { free(buf); fclose(fp); return out; }")
+            p("                buf = nb;")
+            p("            }")
+            p("        }")
+            p("        memcpy(buf + len, chunk, n);")
+            p("        len += n;")
+            p("    }")
+            p("    fclose(fp);")
+            p("    out.data = buf;")
+            p("    out.length = (int)len;")
+            p("    return out;")
             p("}")
         p("")
     if want_file_exists:
@@ -5739,6 +5927,14 @@ def emit_engine(plan, analyses, used_apis):
         p("    if (!fp) return 0;")
         p("    fclose(fp);")
         p("    return 1;")
+        p("}")
+        p("")
+    if want_file_delete:
+        # remove(3) — missing path is a no-op (packed player; no throw).
+        p("/* System.IO.File.Delete */")
+        p("static void File_Delete(const char *path) {")
+        p("    if (!path || !path[0]) return;")
+        p("    (void)remove(path);")
         p("}")
         p("")
     if want_console:
@@ -6190,10 +6386,11 @@ def emit_engine(plan, analyses, used_apis):
         go_parents = plan.get("go_parents") or ([-1] * go_n)
         if len(go_parents) < go_n:
             go_parents = list(go_parents) + [-1] * (go_n - len(go_parents))
-        p("/* Transform hierarchy (m_Father → GO index); mutable for SetParent */"
-          if want_set_parent else
+        p("/* Transform hierarchy (live GO parents; seeded from m_Father) */"
+          if (want_set_parent or want_transform_find) else
           "/* Authored Transform hierarchy (m_Father → GO index) */")
-        if want_set_parent:
+        # Mutable whenever Find or SetParent runs — Find walks live parents.
+        if want_set_parent or want_transform_find:
             p("static int _engine_go_parent[%d] = { %s };" % (
                 go_n, ", ".join(str(int(x)) for x in go_parents[:go_n])))
         else:
@@ -6207,6 +6404,7 @@ def emit_engine(plan, analyses, used_apis):
             p("")
         if want_transform_find:
             # Unity Transform.Find: direct child or path with '/'; -1 = null.
+            # Walks the live parent table (updated by SetParent).
             p("static int Transform_Find(int parent, const char *path) {")
             p("    char seg[256];")
             p("    const char *p;")
@@ -6666,6 +6864,55 @@ def emit_engine(plan, analyses, used_apis):
         p("    } else {")
         p("        *ox = 0.f; *oy = 0.f; *oz = 0.f; *ow = 1.f;")
         p("    }")
+        p("}")
+        p("")
+        p("/* Quaternion.Inverse(q) — conjugate / |q|^2 (Unity). */")
+        p("static void _engine_quat_inverse(")
+        p("    float x, float y, float z, float w,")
+        p("    float *ox, float *oy, float *oz, float *ow) {")
+        p("    float n2 = x * x + y * y + z * z + w * w;")
+        p("    float inv;")
+        p("    if (n2 < 1e-20f) {")
+        p("        *ox = 0.f; *oy = 0.f; *oz = 0.f; *ow = 1.f;")
+        p("        return;")
+        p("    }")
+        p("    inv = 1.f / n2;")
+        p("    *ox = -x * inv;")
+        p("    *oy = -y * inv;")
+        p("    *oz = -z * inv;")
+        p("    *ow = w * inv;")
+        p("}")
+        p("")
+
+    if want_live_rot or want_quat_angle:
+        p("/* Quaternion.Angle(a, b) — degrees between rotations (Unity). */")
+        p("static float _engine_quat_angle(")
+        p("    float ax, float ay, float az, float aw,")
+        p("    float bx, float by, float bz, float bw) {")
+        p("    float dot = ax * bx + ay * by + az * bz + aw * bw;")
+        p("    if (dot < 0.f) dot = -dot;")
+        p("    if (dot > 1.f) dot = 1.f;")
+        p("    return acosf(dot) * 114.59155902616465f;")
+        p("}")
+        p("")
+
+    if want_live_rot:
+        p("/* Quaternion.RotateTowards(from, to, maxDegreesDelta) — Unity. */")
+        p("static void _engine_quat_rotate_towards(")
+        p("    float ax, float ay, float az, float aw,")
+        p("    float bx, float by, float bz, float bw,")
+        p("    float max_deg,")
+        p("    float *ox, float *oy, float *oz, float *ow) {")
+        p("    float ang = _engine_quat_angle("
+           "ax, ay, az, aw, bx, by, bz, bw);")
+        p("    float t;")
+        p("    if (ang < 1e-6f) {")
+        p("        *ox = bx; *oy = by; *oz = bz; *ow = bw;")
+        p("        return;")
+        p("    }")
+        p("    t = max_deg / ang;")
+        p("    _engine_quat_slerp("
+           "ax, ay, az, aw, bx, by, bz, bw, t, ox, oy, oz, ow);")
         p("}")
         p("")
 
@@ -8571,6 +8818,10 @@ def _rewrite_transform_set_parent(text, cl, plan):
     """
     if not plan.get("go_names"):
         return text
+    trs_locals = set()
+    for lm in re.finditer(
+            r"\b(?:Transform|GameObject)\s+(\w+)\b", text):
+        trs_locals.add(lm.group(1))
     out = []
     i = 0
     # recv.transform.SetParent | (this.)transform.SetParent | recv.SetParent
@@ -8584,15 +8835,17 @@ def _rewrite_transform_set_parent(text, cl, plan):
         if not m:
             out.append(text[i:])
             break
-        # Bare Ident.SetParent only when Ident is a Transform/GameObject field.
+        # Bare Ident.SetParent only when Ident is a Transform/GameObject
+        # field or local.
         if m.group("trecv") and not m.group("tr"):
             trecv = m.group("trecv")
-            is_trs = False
-            for f in cl.get("fields") or []:
-                if f.get("name") == trecv and f.get("ty") in (
-                        "Transform", "GameObject"):
-                    is_trs = True
-                    break
+            is_trs = trecv in trs_locals
+            if not is_trs:
+                for f in cl.get("fields") or []:
+                    if f.get("name") == trecv and f.get("ty") in (
+                            "Transform", "GameObject"):
+                        is_trs = True
+                        break
             if not is_trs:
                 out.append(text[i:m.end()])
                 i = m.end()
@@ -8720,34 +8973,72 @@ def _rewrite_transform_point(text, cl, plan):
 
 
 def _rewrite_transform_find(text, cl, plan):
-    """Lower transform.Find(path) → Transform_Find(this_go, path).
+    """Lower Transform.Find(path) → Transform_Find(parent_go, path).
 
+    Supports:
+      transform.Find("Child");
+      other.transform.Find("Child");
+      trs.Find("Child");           # Transform / GameObject field or local
+      GameObject.Find("P").transform.Find("C");
+      GameObject_Find("P").Find("C");  # after .transform strip
     Unity: direct child name or nested path with '/'; missing → null (-1).
-    Requires authored go_names / go_parents tables.
+    Walks the live parent table (updated by SetParent).
     """
     if not plan.get("go_names"):
         return text
-    idn = _c_ident(cl["name"])
-    go_expr = "_engine_go_of_%s(i)" % idn
+    # Locals declared as Transform / GameObject in this method body.
+    trs_locals = set()
+    for lm in re.finditer(
+            r"\b(?:Transform|GameObject)\s+(\w+)\b", text):
+        trs_locals.add(lm.group(1))
     out = []
     i = 0
+    # GameObject.Find(...).transform.Find | GameObject_Find(...).Find |
+    # recv.transform.Find | (this.)transform.Find | recv.Find
+    pat = re.compile(
+        r"(?:"
+        r"(?P<gofind>(?:GameObject\s*\.\s*Find|GameObject_Find)\s*\([^)]*\))"
+        r"(?:\s*\.\s*transform)?\s*\.\s*"
+        r"|(?<![.\w])(?P<tr>\w+)\s*\.\s*transform\s*\.\s*"
+        r"|(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*"
+        r"|(?<![.\w])(?P<trecv>\w+)\s*\.\s*"
+        r")"
+        r"Find\s*\(")
     while i < len(text):
-        m = re.search(
-            r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*Find\s*\(",
-            text[i:])
+        m = pat.search(text, i)
         if not m:
             out.append(text[i:])
             break
-        start = i + m.start()
-        open_paren = i + m.end() - 1
+        # Bare Ident.Find only when Ident is a Transform/GameObject field/local.
+        if m.group("trecv") and not m.group("tr") and not m.group("gofind"):
+            trecv = m.group("trecv")
+            is_trs = trecv in trs_locals
+            if not is_trs:
+                for f in cl.get("fields") or []:
+                    if f.get("name") == trecv and f.get("ty") in (
+                            "Transform", "GameObject"):
+                        is_trs = True
+                        break
+            if not is_trs:
+                out.append(text[i:m.end()])
+                i = m.end()
+                continue
+        open_paren = m.end() - 1
         parsed = _match_call_args(text, open_paren)
         if not parsed:
             out.append(text[i:open_paren + 1])
             i = open_paren + 1
             continue
         args_str, after = parsed
-        out.append(text[i:start])
-        out.append("Transform_Find(%s, %s)" % (go_expr, args_str.strip()))
+        out.append(text[i:m.start()])
+        if m.group("gofind"):
+            parent = m.group("gofind")
+            parent = re.sub(
+                r"GameObject\s*\.\s*Find\s*\(", "GameObject_Find(", parent)
+        else:
+            recv = m.group("tr") or m.group("trecv")
+            parent = _setparent_go_expr(recv, cl)
+        out.append("Transform_Find(%s, %s)" % (parent, args_str.strip()))
         i = after
     return "".join(out)
 
@@ -8991,6 +9282,10 @@ def _parse_quat_components(a, cl):
     # Nested Euler / LookRotation / identity via existing parser (non-slerp).
     if re.match(r"(?:UnityEngine\.)?Quaternion\.Slerp\s*\(", a):
         return None
+    if re.match(r"(?:UnityEngine\.)?Quaternion\.Inverse\s*\(", a):
+        return None
+    if re.match(r"(?:UnityEngine\.)?Quaternion\.RotateTowards\s*\(", a):
+        return None
     parsed = _parse_quaternion_expr(a, cl)
     if parsed and parsed[0] == "quat":
         return parsed[1]
@@ -8998,7 +9293,8 @@ def _parse_quat_components(a, cl):
 
 
 def _parse_quaternion_expr(rhs, cl=None):
-    """Parse Quaternion.Euler / LookRotation / Slerp / identity / new."""
+    """Parse Quaternion.Euler / LookRotation / Slerp / Inverse /
+    RotateTowards / identity / new."""
     rhs = rhs.strip()
     if re.match(r"(?:UnityEngine\.)?Quaternion\.identity\s*$", rhs):
         return ("quat", ("0.f", "0.f", "0.f", "1.f"))
@@ -9039,12 +9335,79 @@ def _parse_quaternion_expr(rhs, cl=None):
             if a and b:
                 return ("slerp", (a, b, args[2]))
         return None
+    im = re.match(r"(?:UnityEngine\.)?Quaternion\.Inverse\s*\((.*)\)$",
+                  rhs, flags=re.S)
+    if im:
+        if cl is None:
+            return None
+        args = _split_call_args(im.group(1))
+        if len(args) == 1:
+            q = _parse_quat_components(args[0], cl)
+            if q:
+                return ("inverse", q)
+        return None
+    rm = re.match(
+        r"(?:UnityEngine\.)?Quaternion\.RotateTowards\s*\((.*)\)$",
+        rhs, flags=re.S)
+    if rm:
+        if cl is None:
+            return None
+        args = _split_call_args(rm.group(1))
+        if len(args) == 3:
+            a = _parse_quat_components(args[0], cl)
+            b = _parse_quat_components(args[1], cl)
+            if a and b:
+                return ("rotate_towards", (a, b, args[2]))
+        return None
     nm = re.match(r"new\s+Quaternion\s*\((.*)\)$", rhs, flags=re.S)
     if nm:
         args = _split_call_args(nm.group(1))
         if len(args) >= 4:
             return ("quat", (args[0], args[1], args[2], args[3]))
     return None
+
+
+def _rewrite_quaternion_angle(text, cl):
+    """Lower Quaternion.Angle(a, b) → _engine_quat_angle(...components...).
+
+    Returns degrees between two rotations (Unity). Args must lower via
+    ``_parse_quat_components`` (identity / transform.rotation / new / …).
+    """
+    out = []
+    i = 0
+    pat = re.compile(r"(?<![\w.])(?:UnityEngine\.)?Quaternion\.Angle\s*\(")
+    while i < len(text):
+        m = pat.search(text, i)
+        if not m:
+            out.append(text[i:])
+            break
+        open_paren = m.end() - 1
+        parsed = _match_call_args(text, open_paren)
+        if not parsed:
+            out.append(text[i:open_paren + 1])
+            i = open_paren + 1
+            continue
+        args_str, after = parsed
+        args = _split_call_args(args_str)
+        out.append(text[i:m.start()])
+        if len(args) != 2:
+            out.append(text[m.start():after])
+            i = after
+            continue
+        a = _parse_quat_components(args[0], cl)
+        b = _parse_quat_components(args[1], cl)
+        if not a or not b:
+            out.append(text[m.start():after])
+            i = after
+            continue
+        ax, ay, az, aw = a
+        bx, by, bz, bw = b
+        out.append(
+            "_engine_quat_angle((%s), (%s), (%s), (%s), "
+            "(%s), (%s), (%s), (%s))"
+            % (ax, ay, az, aw, bx, by, bz, bw))
+        i = after
+    return "".join(out)
 
 
 def _rewrite_transform_rotation(text, cl):
@@ -9055,6 +9418,8 @@ def _rewrite_transform_rotation(text, cl):
       transform.rotation = Quaternion.Euler(Vector3.forward * deg);
       transform.rotation = Quaternion.LookRotation(forward[, up]);
       transform.rotation = Quaternion.Slerp(a, b, t);
+      transform.rotation = Quaternion.Inverse(q);
+      transform.rotation = Quaternion.RotateTowards(a, b, maxDegreesDelta);
       transform.rotation = Quaternion.identity;
       transform.rotation = new Quaternion(x, y, z, w);
       transform.localRotation = … (same forms);
@@ -9119,6 +9484,23 @@ def _rewrite_transform_rotation(text, cl):
                 "&_sqx, &_sqy, &_sqz, &_sqw); "
                 "_engine_transform_set_quat(%s, _sqx, _sqy, _sqz, _sqw); }"
                 % (ax, ay, az, aw, bx, by, bz, bw, t, rot_args))
+        elif parsed[0] == "inverse":
+            qx, qy, qz, qw = parsed[1]
+            out.append(
+                "{ float _iqx, _iqy, _iqz, _iqw; "
+                "_engine_quat_inverse((%s), (%s), (%s), (%s), "
+                "&_iqx, &_iqy, &_iqz, &_iqw); "
+                "_engine_transform_set_quat(%s, _iqx, _iqy, _iqz, _iqw); }"
+                % (qx, qy, qz, qw, rot_args))
+        elif parsed[0] == "rotate_towards":
+            (ax, ay, az, aw), (bx, by, bz, bw), md = parsed[1]
+            out.append(
+                "{ float _rtx, _rty, _rtz, _rtw; "
+                "_engine_quat_rotate_towards((%s), (%s), (%s), (%s), "
+                "(%s), (%s), (%s), (%s), (%s), "
+                "&_rtx, &_rty, &_rtz, &_rtw); "
+                "_engine_transform_set_quat(%s, _rtx, _rty, _rtz, _rtw); }"
+                % (ax, ay, az, aw, bx, by, bz, bw, md, rot_args))
         else:
             qx, qy, qz, qw = parsed[1]
             out.append(
@@ -9207,7 +9589,7 @@ def _rewrite_string_concat(text, string_idents=None):
             left_end = None
             m_plus = re.match(r"_str_plus_[ifcs]\(", text[i:])
             m_app = re.match(
-                r"Application_(?:dataPath|persistentDataPath)\(\)",
+                r"Application_(?:dataPath|persistentDataPath|productName)\(\)",
                 text[i:])
             if m_plus or text.startswith("_str_plus(", i):
                 prefix = m_plus.group(0) if m_plus else "_str_plus("
@@ -9268,7 +9650,8 @@ def _c_expr_scalar_kind(expr, string_idents=None):
     if (e.startswith('"') or e.startswith("_str_plus")
             or "ToString" in e or e.startswith("(const char")
             or e in ("Application_dataPath()",
-                     "Application_persistentDataPath()")
+                     "Application_persistentDataPath()",
+                     "Application_productName()")
             or (re.match(r"^\w+$", e) and e in string_idents)):
         return "s"
     if re.match(r"^'(?:[^'\\]|\\.)'$", e):
@@ -9409,6 +9792,80 @@ def _rewrite_csharp_float_literals(text):
     return "".join(out)
 
 
+def _parse_byte_array_lit_inner(inner):
+    """Parse `1, 2, 0xFF` inside `new byte[] { ... }` → list of 0..255 ints."""
+    nums = []
+    for part in (inner or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        part = re.sub(r"[fFdDmMuUlL]+$", "", part)
+        if re.match(r"0[xX][0-9a-fA-F]+$", part):
+            nums.append(int(part, 16) & 0xFF)
+        elif re.match(r"0[bB][01]+$", part):
+            nums.append(int(part, 2) & 0xFF)
+        elif "." in part:
+            nums.append(int(float(part)) & 0xFF)
+        else:
+            nums.append(int(part, 10) & 0xFF)
+    return nums
+
+
+_NEW_BYTE_ARRAY_LIT = re.compile(
+    r"new\s+byte\s*\[\s*\]\s*\{([^}]*)\}", re.S)
+
+
+def _collect_byte_array_lits(plan, analyses):
+    """All `new byte[] { ... }` literals in emitted method bodies (stable order).
+
+    Order matches emit_engine: sorted class names, then methods_by pairs,
+    skipping Awake/OnEnable and ctor_forbidden scripts (same as lowering).
+    """
+    methods_by = {}
+    for a in analyses or []:
+        for c in a.get("classes") or []:
+            methods_by.setdefault(c["name"], []).extend(
+                [(c, m) for m in c.get("methods") or []])
+    lits = []
+    for cname, cl in sorted((plan.get("classes") or {}).items()):
+        if cl.get("ctor_forbidden"):
+            continue
+        for _c, m in methods_by.get(cname, []):
+            if m.get("name") in ("Awake", "OnEnable"):
+                continue
+            body = m.get("body") or ""
+            for match in _NEW_BYTE_ARRAY_LIT.finditer(body):
+                lits.append(_parse_byte_array_lit_inner(match.group(1)))
+    return lits
+
+
+def _rewrite_byte_array_lits(text, plan):
+    """new byte[] { a, b } → _engine_ba_N() (helpers emitted in engine.c)."""
+    counter = plan.get("_byte_array_lit_i")
+    if counter is None:
+        return text
+
+    def repl(_m):
+        i = counter[0]
+        counter[0] = i + 1
+        return "_engine_ba_%d()" % i
+
+    return _NEW_BYTE_ARRAY_LIT.sub(repl, text)
+
+
+def _rewrite_bytearray_member_access(text):
+    """ByteArray locals: .Length → .length; [i] → .data[i]."""
+    names = set(re.findall(r"\bByteArray\s+(\w+)\b", text))
+    for name in names:
+        text = re.sub(
+            r"(?<![.\w])%s\.Length\b" % re.escape(name),
+            "%s.length" % name, text)
+        text = re.sub(
+            r"(?<![.\w])%s\s*\[(.*?)\]" % re.escape(name),
+            r"%s.data[\1]" % name, text)
+    return text
+
+
 def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     """C# subset method → C against packed arrays.
 
@@ -9419,12 +9876,14 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     idn = _c_ident(cl["name"])
     text = _rewrite_csharp_float_literals(body)
     text = re.sub(r"\bthis\.", "", text)
+    text = _rewrite_byte_array_lits(text, plan)
     text = _rewrite_extensions_set_world_scale(text, cl, plan)
     text = _rewrite_rigidbody_assigns(text, plan, cl["name"])
     text = _rewrite_transform_rotate(text, cl)
     text = _rewrite_transform_look_at(text, cl)
     text = _rewrite_transform_euler_angles(text, cl)
     text = _rewrite_transform_rotation(text, cl)
+    text = _rewrite_quaternion_angle(text, cl)
     text = _rewrite_local_rotation_reads(text, cl, plan)
     text = _rewrite_transform_parent(text, cl, plan)
     text = _rewrite_transform_set_parent(text, cl, plan)
@@ -9456,19 +9915,22 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = text.replace("Screen.width", "Screen_width")
     text = text.replace("Screen.height", "Screen_height")
     text = re.sub(
-        r"(?:UnityEngine\.)?Application\.dataPath\b",
+        r"(?<![\w])(?:UnityEngine\.)?Application\.dataPath\b",
         "Application_dataPath()", text)
     text = re.sub(
-        r"(?:UnityEngine\.)?Application\.persistentDataPath\b",
+        r"(?<![\w])(?:UnityEngine\.)?Application\.persistentDataPath\b",
         "Application_persistentDataPath()", text)
     text = re.sub(
-        r"(?:UnityEngine\.)?Application\.isEditor\b",
+        r"(?<![\w])(?:UnityEngine\.)?Application\.isEditor\b",
         "Application_isEditor()", text)
     text = re.sub(
-        r"(?:UnityEngine\.)?Application\.isPlaying\b",
+        r"(?<![\w])(?:UnityEngine\.)?Application\.isPlaying\b",
         "Application_isPlaying()", text)
     text = re.sub(
-        r"(?:UnityEngine\.)?Application\.OpenURL\s*\(",
+        r"(?<![\w])(?:UnityEngine\.)?Application\.productName\b",
+        "Application_productName()", text)
+    text = re.sub(
+        r"(?<![\w])(?:UnityEngine\.)?Application\.OpenURL\s*\(",
         "Application_OpenURL(", text)
     text = re.sub(
         r"(?:System\.IO\.)?File\.WriteAllText\s*\(",
@@ -9477,8 +9939,21 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         r"(?:System\.IO\.)?File\.AppendAllText\s*\(",
         "File_AppendAllText(", text)
     text = re.sub(
+        r"(?:System\.IO\.)?File\.WriteAllBytes\s*\(",
+        "File_WriteAllBytes(", text)
+    text = re.sub(
+        r"(?:System\.IO\.)?File\.ReadAllBytes\s*\(",
+        "File_ReadAllBytes(", text)
+    text = re.sub(
         r"(?:System\.IO\.)?File\.Exists\s*\(",
         "File_Exists(", text)
+    text = re.sub(
+        r"(?:System\.IO\.)?File\.Delete\s*\(",
+        "File_Delete(", text)
+    # byte[] locals / params → ByteArray (File WriteAllBytes / ReadAllBytes).
+    if plan.get("_byte_array_lit_i") is not None:
+        text = re.sub(r"\bbyte\s*\[\s*\]", "ByteArray", text)
+        text = _rewrite_bytearray_member_access(text)
     text = re.sub(
         r"(?<![\w.])(?:Object\.)?Destroy\s*\(\s*gameObject\s*\)",
         "Object_Destroy(_engine_go_of_%s(i))" % idn

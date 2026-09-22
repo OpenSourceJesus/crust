@@ -49,12 +49,16 @@ action maps / device graphs).
 | `Application.persistentDataPath` | Unity company/product save dir (**Awake/Start only**) |
 | `Application.isEditor` | Always **false** (packed player) |
 | `Application.isPlaying` | Always **true** while the packed player runs |
-| `Application.OpenURL(url)` | No-op in packed player (no OS browser / mailto) |
+| `Application.productName` | Baked `ProjectSettings` `productName` (else project folder name) |
+| `Application.OpenURL(url)` | `system("python3 -c \"import webbrowser; webbrowser.open('…')\"")` |
 | Other `Application.*` | Pack-time **CS0117** (`Application` in scope via `using UnityEngine`) |
-| Other `Quaternion.*` (not Euler / identity / LookRotation / Slerp) | Pack-time **CS0117** (`Quaternion` in scope via `using UnityEngine`) |
+| Other `Quaternion.*` (not Euler / identity / LookRotation / Slerp / Inverse / Angle) | Pack-time **CS0117** (`Quaternion` in scope via `using UnityEngine`) |
 | `File.WriteAllText(path, text)` | `fopen` write (`"w"`); creates parent dirs when possible |
 | `File.AppendAllText(path, text)` | `fopen` append (`"a"`); creates parent dirs when possible |
+| `File.WriteAllBytes(path, bytes)` | `fopen` write (`"wb"`) + `fwrite`; `byte[]` → `ByteArray`; `new byte[]{…}` → static buffer helper |
+| `File.ReadAllBytes(path)` | `fopen` read (`"rb"`) + chunked `fread` → malloc'd `ByteArray` (`.Length` / `[i]` lowered) |
 | `File.Exists(path)` | `fopen` probe (`"rb"`) → 1 / 0 (dirs fail like .NET) |
+| `File.Delete(path)` | `remove(3)`; missing path is a no-op (no throw) |
 | Other `File.*` | Pack-time **CS0117** (`File` in scope via `using System.IO`) |
 
 Default log path matches Unity standalone (from `ProjectSettings`
@@ -87,7 +91,8 @@ Unity's `UnityException` / `TypeInitializationException` every frame and
 | `.GetComponent<T>()` on a null GO | **NullReferenceException** with `Class.Method () (at path:line)`; method exits (Unity) |
 | `.GetComponent<T>()` on a live GO | Instance index of authored `T`, or **-1** if absent |
 | `Find(...).GetComponent<T>().field` | NRE if Find missed or component/field receiver is null |
-| `transform.Find(name)` / nested `"A/B"` | Child GO via authored `m_Father` parents table → index or **-1** |
+| `transform.Find(name)` / nested `"A/B"` | Child GO via **live** parent table (seeded from authored `m_Father`; updated by `SetParent`) → index or **-1** |
+| `go.transform.Find` / `Transform` local `.Find` | Same — receiver is the live GO index |
 
 Parsed with cpprust `_match_paren` / `_match_angle` (same AST helpers
 csrust uses). Find **does not** fail at pack time for unknown names —
@@ -95,8 +100,8 @@ lookup is runtime only (Unity null). Calling a method or reading a field on
 that null is a `NullReferenceException` (logged with script site); `setjmp`
 unwinds the current `Start`/`Update` so the player keeps running. `GetComponent<T>`
 still requires `T` to be an authored packed MonoBehaviour (no invented
-component types). `transform.Find` walks authored parent links only (no
-invented hierarchy).
+component types). `transform.Find` walks the **live** parent table (seeded
+from authored `m_Father`, updated by `SetParent`) — not a pack-time bake.
 
 ## Animation (script motion + authored clips)
 
@@ -153,7 +158,9 @@ slot (intensity 1, white) into the light table.
 | `transform.Rotate` (euler / `Vector3.axis * deg`, Space.Self) | Live local quat + `rot_m00..m11` in draws |
 | `transform.LookAt` (Transform / `Vector3`, default up) | Live local quat = LookRotation(to−from); refreshes draw basis |
 | `transform.eulerAngles` (`=` / `+=`, degrees) | Get/set live quat via Unity Euler; refreshes draw basis |
-| `transform.rotation` (`=` `Quaternion.Euler` / `LookRotation` / `Slerp` / `identity` / `new`) | Set live quat (unparented ≈ world); refreshes draw basis |
+| `transform.rotation` (`=` `Quaternion.Euler` / `LookRotation` / `Slerp` / `Inverse` / `RotateTowards` / `identity` / `new`) | Set live quat (unparented ≈ world); refreshes draw basis |
+| `Quaternion.Angle(a, b)` | Degrees between two rotations (`acos(|dot|)×2` in degrees) |
+| `Quaternion.RotateTowards(from, to, maxDegreesDelta)` | Step toward `to` by at most `maxDegreesDelta` degrees |
 | `transform.Find` (child name or `"A/B"` path) | Authored `m_Father` child lookup → GO index or **-1** |
 | `transform.parent` | Authored `m_Father` → parent GO index or **-1** |
 | `transform.SetParent` (Transform / null, optional `worldPositionStays`) | Live `_engine_go_parent` + xf parent; stays=true keeps world T |
