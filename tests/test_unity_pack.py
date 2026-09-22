@@ -2404,7 +2404,7 @@ class TestSystems(unittest.TestCase):
 
     @needs_cc
     def test_application_open_url_packs(self):
-        """Application.OpenURL → Application_OpenURL no-op; compiles."""
+        """Application.OpenURL → system(python3 webbrowser.open); compiles."""
         root = tempfile.mkdtemp(prefix="upack-openurl-")
         scripts = os.path.join(root, "Assets", "Scripts")
         os.makedirs(scripts)
@@ -2446,6 +2446,8 @@ class TestSystems(unittest.TestCase):
             eng = f.read()
         self.assertIn("Application_OpenURL", eng)
         self.assertIn("/* Application.OpenURL", eng)
+        self.assertIn("webbrowser.open", eng)
+        self.assertIn("system(cmd)", eng)
         self.assertNotIn("Application.OpenURL(", eng)
         r = subprocess.run(
             [_CC, "-O2", "-c", "-o", os.path.join(d, "engine.o"),
