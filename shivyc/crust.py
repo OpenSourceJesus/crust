@@ -3522,6 +3522,14 @@ class Parser:
         elif ty.array:
             elem = RustCType(ty.base, ty.ptr)
             base, total = recv.code, ty.array[0]
+            if not _is_lvalue(base.strip()):
+                # An array literal has no storage to point into: sliced in
+                # place, `&[1, 2][..]` put the brace list in the slice's
+                # pointer field, and C took the first element as the
+                # address. It is given a temporary to live in.
+                tmp = self.new_temp()
+                self.pending.append("%s = %s;" % (ty.decl(tmp), base))
+                base = tmp
         elif ty.ptr:
             elem = RustCType(ty.base, ty.ptr - 1)
             base, total = recv.code, None
