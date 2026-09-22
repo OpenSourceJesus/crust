@@ -4580,6 +4580,34 @@ class TestSystems(unittest.TestCase):
         self.assertIn("GameObject_GetComponent_Canvas", eng)
         self.assertIn("GameObject_GetComponent_RectTransform", eng)
 
+    def test_crust_undeclared_setter_maps_to_csharp_site(self):
+        """Missing Class_set_field in crust output → CS0103 at the C# field."""
+        src = (
+            "using UnityEngine;\n"
+            "public class LogAverageFPS : MonoBehaviour {\n"
+            "    float timeLeft;\n"
+            "    void Update() { timeLeft -= Time.deltaTime; }\n"
+            "}\n"
+        )
+        analyses = [{
+            "path": "/proj/Assets/Scripts/LogAverageFPS.cs",
+            "classes": [{
+                "name": "LogAverageFPS",
+                "file_text": src,
+            }],
+        }]
+        err = (
+            "\x1b[1m/tmp/upack-crust-x/tu.c:1492:7: \x1b[31merror:\x1b[0m "
+            "use of undeclared identifier 'LogAverageFPS_set_timeLeft'\n"
+        )
+        msg = unity_pack._crust_error_to_unity(err, analyses=analyses)
+        self.assertIn("error CS0103", msg)
+        self.assertIn("timeLeft", msg)
+        self.assertIn("Assets/Scripts/LogAverageFPS.cs(", msg)
+        self.assertNotIn("/tmp/", msg)
+        self.assertNotIn("tu.c", msg)
+
+
     def test_methods_in_skips_else_if(self):
         """`else if (...) {` must not become a method named if."""
         src = (

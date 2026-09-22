@@ -7929,6 +7929,13 @@ def emit_engine(plan, analyses, used_apis):
             body = _lower_method_body(
                 m["body"], cl, plan, site=site,
                 collision2d_param=coll_param)
+            # Site marker so crust/shivyc failures map back to C#.
+            cs_line = 1
+            ft = site.get("file_text") or ""
+            if ft and site.get("body_abs"):
+                cs_line = ft.count("\n", 0, int(site["body_abs"])) + 1
+            p("/* unity_pack:site %s:%d */" % (
+                site.get("path") or "<cs>", cs_line))
             if coll_param:
                 p("static void %s_%s(unsigned i, int %s) {"
                   % (idn, m["name"], coll_param))
@@ -12082,14 +12089,15 @@ def emit_soa_positions_glsl(plan):
     return "\n".join(lines) + "\n"
 
 
-def validate_emitted_c(text, path="engine.c"):
+def validate_emitted_c(text, path="engine.c", analyses=None):
     """Gate generated C through cpprust, then compile the result with crust.
 
     unity_pack lowers by hand; this proves the result still sits inside the
     crust subset that `tools/cpprust.py` accepts — `_check_unsupported` plus
     a full `translate` pass (the csrust C++ half). The translated C is then
     compiled with `shivyc` so pack fails if crust cannot build it. Raises
-    PackError on subset violations or crust compile failure.
+    PackError on subset violations or crust compile failure (Unity-style site
+    when a ``unity_pack:site`` marker or field accessor maps to authored C#).
     """
     import tools.cpprust as cpprust
     try:
@@ -12100,11 +12108,86 @@ def validate_emitted_c(text, path="engine.c"):
         raise PackError(
             "emitted %s left the crust / cpprust subset: %s"
             % (path, e.message))
-    _crust_compile_c(translated, path)
+    _crust_compile_c(translated, path, analyses=analyses, source_text=translated)
     return translated
 
 
-def _crust_compile_c(text, path, defines=None):
+def _strip_ansi(s):
+    return re.sub(r"\x1b\[[0-9;]*m", "", s or "")
+
+
+def _crust_error_to_unity(err, source_text=None, analyses=None):
+    """Map shivyc/clang diagnostics to Unity ``Assets/…(line,col): error …``."""
+    err = _strip_ansi(err)
+    # Undeclared Class_set_field / Class_get_field → field token in C#.
+    m = re.search(r"undeclared identifier ['\"](\w+)['\"]", err)
+    if m and analyses:
+        ident = m.group(1)
+        am = re.match(r"^(\w+)_(set|get)_(\w+)$", ident)
+        if am:
+            cls_idn, _op, field = am.group(1), am.group(2), am.group(3)
+            site = _csharp_field_site(analyses, cls_idn, field)
+            if site:
+                path, text, idx = site
+                return _cs_diag(
+                    path, text, idx, "CS0103",
+                    "The name '%s' does not exist in the current context"
+                    % field)
+    # tu.c:LINE:COL: error: … → nearest unity_pack:site marker above LINE.
+    lm = re.search(
+        r"(?:^|\n)(?:.*?[/\\])?tu\.c:(\d+)(?::(\d+))?:\s*error:\s*(.+)",
+        err)
+    if lm and source_text:
+        line_no = int(lm.group(1))
+        msg = lm.group(3).strip()
+        lines = source_text.split("\n")
+        site_path, site_line = None, 1
+        for i in range(min(line_no, len(lines)) - 1, -1, -1):
+            sm = re.match(
+                r"\s*/\*\s*unity_pack:site\s+(\S+):(\d+)\s*\*/",
+                lines[i])
+            if sm:
+                site_path, site_line = sm.group(1), int(sm.group(2))
+                break
+        if site_path:
+            return "%s(%d,1): error CS0000: %s" % (
+                _assets_rel_path(site_path), site_line, msg)
+    # Last resort: still Unity-shaped, not a raw /tmp path dump.
+    first = err.split("\n")[0].strip() if err else "crust compile failed"
+    first = re.sub(r"^.*?tu\.c:\d+(?::\d+)?:\s*", "", first)
+    first = re.sub(r"^error:\s*", "", first)
+    return "<generated>(1,1): error CS0000: %s" % (first or "crust compile failed")
+
+
+def _csharp_field_site(analyses, class_idn, field):
+    """(path, text, idx) of field name in class *class_idn*, or None."""
+    for a in analyses or []:
+        path = a.get("path") or ""
+        text = None
+        for c in a.get("classes") or []:
+            cname = c.get("name") or ""
+            if _c_ident(cname) != class_idn and cname != class_idn:
+                continue
+            if c.get("file_text") is not None:
+                text = c["file_text"]
+            break
+        if text is None and path and os.path.isfile(path):
+            text = _read(path)
+        if not text:
+            continue
+        scan = cs2cpp._blank(text)
+        # Prefer assignment / compound assign of the field.
+        m = re.search(
+            r"(?<![_\w])(%s)\s*(?:\+=|-=|\*=|/=|=(?!=))" % re.escape(field),
+            scan)
+        if not m:
+            m = re.search(r"(?<![_\w])(%s)(?![\w])" % re.escape(field), scan)
+        if m:
+            return path, text, m.start(1)
+    return None
+
+
+def _crust_compile_c(text, path, defines=None, analyses=None, source_text=None):
     """Compile *text* with shivyc/crust; raise PackError on failure."""
     import shutil
     import subprocess
@@ -12132,9 +12215,10 @@ def _crust_compile_c(text, path, defines=None):
         r = subprocess.run(cmd, capture_output=True, text=True, cwd=repo)
         if r.returncode != 0:
             err = (r.stderr or r.stdout or "").strip()
-            raise PackError(
-                "emitted %s failed crust/shivyc compile: %s"
-                % (path, err or ("exit %d" % r.returncode)))
+            raise PackError(_crust_error_to_unity(
+                err or ("exit %d" % r.returncode),
+                source_text=source_text or text,
+                analyses=analyses))
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -12327,11 +12411,11 @@ def pack(root, outdir, soa=False, soa_vec4=False):
         "/* generated by tools/unity_pack.py — C++ subset for cpprust */\n"
         + (main_c.split("\n", 1)[1] if main_c.startswith("/*") else main_c))
     _progress("validating engine.c through cpprust + crust")
-    validate_emitted_c(engine_cpp, "engine.cpp")
+    validate_emitted_c(engine_cpp, "engine.cpp", analyses=analyses)
     _progress("validating data.c through cpprust + crust")
-    validate_emitted_c(data_cpp, "data.cpp")
+    validate_emitted_c(data_cpp, "data.cpp", analyses=analyses)
     _progress("validating main.c through cpprust + crust")
-    validate_emitted_c(main_cpp, "main.cpp")
+    validate_emitted_c(main_cpp, "main.cpp", analyses=analyses)
     _progress("writing %s" % outdir)
     with open(os.path.join(outdir, "engine.c"), "w") as f:
         f.write(engine)
