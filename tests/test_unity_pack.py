@@ -523,6 +523,211 @@ class TestSystems(unittest.TestCase):
         unity_pack.analyze_script(
             path, src.replace("ReadAllText(\"a.txt\")",
                               "Exists(\"a.txt\")"))
+        unity_pack.analyze_script(
+            path, src.replace("ReadAllText(\"a.txt\")",
+                              "Delete(\"a.txt\")"))
+
+    def test_filestream_write_not_file_cs0117(self):
+        """outFile.Write must not match System.IO.File (substring false positive)."""
+        src = (
+            "using System;\n"
+            "using System.IO;\n"
+            "using UnityEngine;\n"
+            "public class W : MonoBehaviour {\n"
+            "    void Start() {\n"
+            "        using (FileStream outFile = new FileStream("
+            "\"x\", FileMode.Create, FileAccess.Write, FileShare.None)) {\n"
+            "            byte[] bytes = new byte[] { 1 };\n"
+            "            outFile.Write(bytes, 0, bytes.Length);\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        path = "/proj/Assets/Scripts/W.cs"
+        # Must not misread outFile.Write as System.IO.File.Write.
+        unity_pack.analyze_script(path, src)
+
+    def test_file_write_all_bytes_packs(self):
+        """File.WriteAllBytes → fwrite of ByteArray; new byte[] {…} helper."""
+        root = tempfile.mkdtemp(prefix="upack-wab-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Writer.cs"), "w") as f:
+            f.write(
+                "using System;\n"
+                "using System.IO;\n"
+                "using UnityEngine;\n"
+                "public class Writer : MonoBehaviour {\n"
+                "    void Start() {\n"
+                "        File.WriteAllBytes("
+                "Application.persistentDataPath + \"/unity_pack_wab.bin\", "
+                "new byte[] { 10, 20, 30 });\n"
+                "        if (File.Exists("
+                "Application.persistentDataPath + \"/unity_pack_wab.bin\"))\n"
+                "            Console.WriteLine(\"wab_ok\");\n"
+                "        else\n"
+                "            Console.WriteLine(\"wab_bad\");\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Writer.cs.meta"), "w") as f:
+            f.write("guid: a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Writer\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2}\n"
+            )
+        a = unity_pack.analyze_script(os.path.join(scripts, "Writer.cs"))
+        self.assertIn("File.WriteAllBytes", a["apis"])
+        d = tempfile.mkdtemp(prefix="upack-wab-out-")
+        plan = unity_pack.pack(root, d)
+        self.assertIn("Writer", plan["classes"])
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("File_WriteAllBytes", eng)
+        self.assertIn("ByteArray", eng)
+        self.assertIn("_engine_ba_0", eng)
+        self.assertIn("10, 20, 30", eng)
+        self.assertIn('File_WriteAllBytes(', eng)
+        self.assertNotIn("File.WriteAllBytes(", eng)
+        self.assertNotIn("new byte[]", eng)
+        if not _CC:
+            return
+        host = os.path.join(d, "host.c")
+        with open(host, "w") as f:
+            f.write(
+                "void engine_tick(void);\n"
+                "extern float Time_deltaTime;\n"
+                "int main(void) {\n"
+                "  Time_deltaTime = 0.02f;\n"
+                "  engine_tick();\n"
+                "  return 0;\n"
+                "}\n"
+            )
+        r = subprocess.run(
+            [_CC, "-O2", "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(
+            [_CC, "-O0", "-c", "-o", os.path.join(d, "data.o"),
+             os.path.join(d, "data.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        exe = os.path.join(d, "run")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host,
+             os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+        self.assertIn("wab_ok", run.stdout)
+        # Contents on disk.
+        # persistentDataPath is under the process home; probe via eng path helper
+        # is hard — Exists already checked in-game. Spot-check fwrite path present.
+        self.assertIn("fwrite", eng)
+
+    def test_file_read_all_bytes_packs(self):
+        """File.ReadAllBytes → malloc ByteArray; round-trip with WriteAllBytes."""
+        root = tempfile.mkdtemp(prefix="upack-rab-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Reader.cs"), "w") as f:
+            f.write(
+                "using System;\n"
+                "using System.IO;\n"
+                "using UnityEngine;\n"
+                "public class Reader : MonoBehaviour {\n"
+                "    void Start() {\n"
+                "        File.WriteAllBytes("
+                "Application.persistentDataPath + \"/unity_pack_rab.bin\", "
+                "new byte[] { 7, 8, 9 });\n"
+                "        byte[] bytes = File.ReadAllBytes("
+                "Application.persistentDataPath + \"/unity_pack_rab.bin\");\n"
+                "        if (bytes.Length == 3 && bytes[0] == 7 && "
+                "bytes[2] == 9)\n"
+                "            Console.WriteLine(\"rab_ok\");\n"
+                "        else\n"
+                "            Console.WriteLine(\"rab_bad\");\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Reader.cs.meta"), "w") as f:
+            f.write("guid: b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Reader\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3}\n"
+            )
+        a = unity_pack.analyze_script(os.path.join(scripts, "Reader.cs"))
+        self.assertIn("File.ReadAllBytes", a["apis"])
+        d = tempfile.mkdtemp(prefix="upack-rab-out-")
+        plan = unity_pack.pack(root, d)
+        self.assertIn("Reader", plan["classes"])
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("File_ReadAllBytes", eng)
+        self.assertIn("ByteArray", eng)
+        self.assertIn("File_ReadAllBytes(", eng)
+        self.assertNotIn("File.ReadAllBytes(", eng)
+        start = eng.split("static void Reader_Start", 1)[1].split(
+            "static int _Reader_started", 1)[0]
+        self.assertIn("File_ReadAllBytes(", start)
+        if not _CC:
+            return
+        host = os.path.join(d, "host.c")
+        with open(host, "w") as f:
+            f.write(
+                "void engine_tick(void);\n"
+                "extern float Time_deltaTime;\n"
+                "int main(void) {\n"
+                "  Time_deltaTime = 0.02f;\n"
+                "  engine_tick();\n"
+                "  return 0;\n"
+                "}\n"
+            )
+        r = subprocess.run(
+            [_CC, "-O2", "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(
+            [_CC, "-O0", "-c", "-o", os.path.join(d, "data.o"),
+             os.path.join(d, "data.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        exe = os.path.join(d, "run")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host,
+             os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+        self.assertIn("rab_ok", run.stdout)
 
     def test_file_exists_packs_fopen_probe(self):
         """File.Exists → File_Exists fopen probe; missing path is false."""
@@ -603,6 +808,93 @@ class TestSystems(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
         self.assertIn("missing_ok", run.stdout)
         self.assertNotIn("exists_bad", run.stdout)
+
+    def test_file_delete_packs(self):
+        """File.Delete → remove(3); round-trip with WriteAllBytes + Exists."""
+        root = tempfile.mkdtemp(prefix="upack-fdel-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Deleter.cs"), "w") as f:
+            f.write(
+                "using System;\n"
+                "using System.IO;\n"
+                "using UnityEngine;\n"
+                "public class Deleter : MonoBehaviour {\n"
+                "    void Start() {\n"
+                "        File.WriteAllBytes("
+                "Application.persistentDataPath + \"/unity_pack_del.bin\", "
+                "new byte[] { 1, 2 });\n"
+                "        File.Delete("
+                "Application.persistentDataPath + \"/unity_pack_del.bin\");\n"
+                "        if (File.Exists("
+                "Application.persistentDataPath + \"/unity_pack_del.bin\"))\n"
+                "            Console.WriteLine(\"del_bad\");\n"
+                "        else\n"
+                "            Console.WriteLine(\"del_ok\");\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Deleter.cs.meta"), "w") as f:
+            f.write("guid: e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Deleter\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5}\n"
+            )
+        a = unity_pack.analyze_script(os.path.join(scripts, "Deleter.cs"))
+        self.assertIn("File.Delete", a["apis"])
+        d = tempfile.mkdtemp(prefix="upack-fdel-out-")
+        plan = unity_pack.pack(root, d)
+        self.assertIn("Deleter", plan["classes"])
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("File_Delete", eng)
+        self.assertIn("remove(path)", eng)
+        self.assertIn("File_Delete(", eng)
+        self.assertNotIn("File.Delete(", eng)
+        if not _CC:
+            return
+        host = os.path.join(d, "host.c")
+        with open(host, "w") as f:
+            f.write(
+                "void engine_tick(void);\n"
+                "extern float Time_deltaTime;\n"
+                "int main(void) {\n"
+                "  Time_deltaTime = 0.02f;\n"
+                "  engine_tick();\n"
+                "  return 0;\n"
+                "}\n"
+            )
+        r = subprocess.run(
+            [_CC, "-O2", "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(
+            [_CC, "-O0", "-c", "-o", os.path.join(d, "data.o"),
+             os.path.join(d, "data.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        exe = os.path.join(d, "run")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host,
+             os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+        self.assertIn("del_ok", run.stdout)
 
     def test_transform_unsupported_member_is_cs1061(self):
         """Unsupported transform.Member → CS1061 on Transform (not undeclared)."""

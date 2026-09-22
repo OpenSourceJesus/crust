@@ -57,6 +57,7 @@ action maps / device graphs).
 | `File.WriteAllBytes(path, bytes)` | `fopen` write (`"wb"`) + `fwrite`; `byte[]` → `ByteArray`; `new byte[]{…}` → static buffer helper |
 | `File.ReadAllBytes(path)` | `fopen` read (`"rb"`) + chunked `fread` → malloc'd `ByteArray` (`.Length` / `[i]` lowered) |
 | `File.Exists(path)` | `fopen` probe (`"rb"`) → 1 / 0 (dirs fail like .NET) |
+| `File.Delete(path)` | `remove(3)`; missing path is a no-op (no throw) |
 | Other `File.*` | Pack-time **CS0117** (`File` in scope via `using System.IO`) |
 
 Default log path matches Unity standalone (from `ProjectSettings`

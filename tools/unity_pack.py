@@ -78,11 +78,16 @@ _TRANSFORM_SUPPORTED = frozenset({
 })
 
 
+_FILE_MEMBER_CALL = re.compile(
+    r"System\.IO\.File\.(\w+)\s*\("
+    r"|(?<![\w.])File\.(\w+)\s*\(")
+
+
 def _check_file_api(path, text, scan):
     """Unsupported File.Member with System.IO in scope → Unity CS0117."""
     has_io = bool(re.search(r"using\s+System\.IO\b", scan))
-    for m in re.finditer(r"(?:System\.IO\.)?File\.(\w+)\s*\(", scan):
-        method = m.group(1)
+    for m in _FILE_MEMBER_CALL.finditer(scan):
+        method = m.group(1) or m.group(2)
         if method in _FILE_SUPPORTED:
             continue
         is_fqn = m.group(1) is not None
@@ -294,6 +299,7 @@ _API = {
     "File.WriteAllBytes": True,
     "File.ReadAllBytes": True,
     "File.Exists": True,
+    "File.Delete": True,
 }
 
 # APIs that would require inventing scene components / assets we do not pack.
@@ -4395,6 +4401,8 @@ def analyze_script(path, text=None):
         apis.add("File.ReadAllBytes")
     if re.search(r"(?:System\.IO\.)?File\.Exists\s*\(", scan):
         apis.add("File.Exists")
+    if re.search(r"(?:System\.IO\.)?File\.Delete\s*\(", scan):
+        apis.add("File.Delete")
     # C# string + value must not become C pointer arithmetic.
     if re.search(
             r'"\s*\+|'
@@ -5119,8 +5127,12 @@ def emit_engine(plan, analyses, used_apis):
     want_file_read_bytes = "File.ReadAllBytes" in used_apis
     want_file_bytes = want_file_write_bytes or want_file_read_bytes
     want_file_exists = "File.Exists" in used_apis
-    want_file_write_ops = want_file_write or want_file_append
-    want_file_io = want_file_write_ops or want_file_exists
+    want_file_delete = "File.Delete" in used_apis
+    want_file_write_ops = (
+        want_file_write or want_file_append or want_file_write_bytes)
+    want_file_io = (
+        want_file_write_ops or want_file_exists or want_file_read_bytes
+        or want_file_delete)
     want_destroy = "Object.Destroy" in used_apis
     ui_buttons = plan.get("ui_buttons") or []
     want_ui = bool(ui_buttons)
@@ -5880,6 +5892,14 @@ def emit_engine(plan, analyses, used_apis):
         p("    if (!fp) return 0;")
         p("    fclose(fp);")
         p("    return 1;")
+        p("}")
+        p("")
+    if want_file_delete:
+        # remove(3) — missing path is a no-op (packed player; no throw).
+        p("/* System.IO.File.Delete */")
+        p("static void File_Delete(const char *path) {")
+        p("    if (!path || !path[0]) return;")
+        p("    (void)remove(path);")
         p("}")
         p("")
     if want_console:
@@ -9888,6 +9908,13 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = re.sub(
         r"(?:System\.IO\.)?File\.Exists\s*\(",
         "File_Exists(", text)
+    text = re.sub(
+        r"(?:System\.IO\.)?File\.Delete\s*\(",
+        "File_Delete(", text)
+    # byte[] locals / params → ByteArray (File WriteAllBytes / ReadAllBytes).
+    if plan.get("_byte_array_lit_i") is not None:
+        text = re.sub(r"\bbyte\s*\[\s*\]", "ByteArray", text)
+        text = _rewrite_bytearray_member_access(text)
     text = re.sub(
         r"(?<![\w.])(?:Object\.)?Destroy\s*\(\s*gameObject\s*\)",
         "Object_Destroy(_engine_go_of_%s(i))" % idn
