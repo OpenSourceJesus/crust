@@ -325,14 +325,13 @@ methods, writing through a slice, struct literals, `loop`/`break`, macros,
 recursion, bitwise `&`/`|`/`^`, narrowing `as`, and quantified clauses. The
 refusals are the roadmap, as the IL lift's tally is.
 
-**A known gap.** `class_covers` in `regs.rs` composes the two functions: the
-class `class_for_regs(n)` picks is sized for at least `n` registers, for
-every `n <= 23`. It lifts, but `by_every_bool` cannot prove it. The
-postcondition needs `n <= 6` to give `6 >= n`, which is reasoning about the
-range a guard establishes, and splitting then computing does not do that.
-`tests/test_rustproof.py` asserts the proof still fails, so closing the gap
-cannot happen quietly. Meanwhile the compiled function, with its `ensures`
-checked at runtime, runs over every `n` its `requires` admits.
+**A gap, closed.** `class_covers` in `regs.rs` composes the two functions:
+the class `class_for_regs(n)` picks is sized for at least `n` registers, for
+every `n <= 23`. `by_every_bool` cannot prove it -- the postcondition needs
+`n <= 6` to give `6 >= n`, the range a guard establishes, and splitting then
+computing forgets what a guard said. `by_bounds` (below) keeps it, and proves
+it; `tests/test_rustproof.py` asserts both, and the compiled function still
+runs over every `n` its `requires` admits.
 
 ### Overflow, underflow, and every other panic
 
@@ -358,24 +357,24 @@ In the safety lift a `#[requires]` guards the body rather than being a
 hypothesis. For every `args`, "if it holds, nothing panics" is the same
 statement, and the kernel's split then decides it like any other guard.
 
-**The maximum is symbolic.** The kernel's numerals are unary: `3` is
-`succ (succ (succ zero))`. So `u32::MAX` written out is about four billion
-nested terms, and the first attempt at stating one ran out of memory.
-`u64::MAX` is not writable at all. An overflow obligation names `max_u32`
-instead, a parameter of `f__safe`, and each `u32` parameter is assumed
-`<= max_u32`. That is exact, and small. Unbounded quantification over the
-maximum is also why an overflow obligation that holds only *because the
-maximum is large* (`a < 1000 && b < 1000` so `a + b` fits) stays open: it is
-false for a small enough maximum. Closing those needs arithmetic about a
-concrete bound, which in turn needs compact numerals.
+**The maximum is symbolic.** An overflow obligation names `max_u32`, a
+parameter of `f__safe`; each `u32` parameter is assumed `<= max_u32`, and
+each `&[u32]` is assumed `all_le(xs, max_u32)`. This began as a workaround --
+the kernel's numerals were unary, and `u32::MAX` written out was four
+billion terms -- and stays because it is the stronger statement: a proof for
+every maximum is a proof for the real one. `u32::MAX` in the source lifts to
+the same symbol in the safety lift, and to the literal in the model. The
+cost: an addition that fits only *because the maximum is large* (`a < 1000
+&& b < 1000`, so `a + b` fits) stays open, since it is false for a small
+enough maximum.
 
 `tools/rustprove.py` proves each obligation on its own and reports it, as
 does `make prove_rust`:
 
 ```
-bump: index out of bounds (line 57) -- proved
-bump: `+` may overflow u64 (line 58) -- open
-contains: `-` may underflow (line 43) -- proved
+bump: `-` may underflow (line 67) -- proved
+bump: `+` may overflow u64 (line 68) -- proved
+contains: `-` may underflow (line 52) -- proved
 ```
 
 *Open* means the automation did not settle it, and says nothing about
@@ -406,6 +405,17 @@ precondition threaded as a hypothesis. It offers the prelude's own lemmas
 about the terms present: `le_add_right` for each sum, `sub_le` for each
 difference, `eqb_refl` for each self-comparison.
 
+The last resort, for contracts and panic obligations alike, is
+`hoare.by_bounds`. It splits as `by_every_bool` does, but dependently: the
+branch where `g` went true gets `Holds g`, the other `Eq Bool g false`. It
+keeps the obligation's hypotheses instead of weakening them away, closes a
+branch whose facts contradict each other, and at a leaf that does not
+compute, chains `<=` facts by `leb_trans`. The steps are prelude lemmas,
+each proved: `add_le_add_right`, `add_le_add`, `add_le_of_le_sub` (`n <= s`
+and `u <= s - n` give `u + n <= s`), `lt_le`, `not_lt_le`, `not_le_lt`, and
+`nth_all_le` (an element read from a slice is within its type). The search
+is depth-bounded, so *open* still means only "not found".
+
 ### `leanos/alloc.rs`
 
 `alloc.rs` is `leanos/alloc.py` ported to Rust. Where it differs, it is so
@@ -421,15 +431,27 @@ corpus.
 From the lifted source, not a hand copy:
 - `bump`'s `ensures(used <= result)` (`alloc_eq.py`'s `bump_monotone`) and
   `slot_ok`'s `ensures(result <= 1)` are proved by the tool.
-- `bump_bounded` is proved by `alloc_eq.py`'s own recipe, about the generated
-  model.
-- All ten index and underflow obligations are proved, including
-  `slot_addr`'s, which only its `#[requires]` establishes.
-- Four obligations are open, all `u64` additions: `bump`'s `used + n` twice,
-  and `bases[heap] + used` in `slot_addr` and `slot_ok`. Each fits whenever
-  the code admits it, but saying so is arithmetic about the maximum. A test
-  pins the set, so a new open obligation fails it, and so does closing one of
-  these.
+- `bump_bounded` is proved about the generated model, by `by_bounds`.
+- Every panic obligation is proved: indices, underflows, and the `u64`
+  additions.
+
+The additions were not always proved, and three were not true. The first
+port tested `used + n <= sizes[heap]`, evaluating `used + n` in order to
+decide whether it fitted: at `used = n = 2^63` the sum wrapped to 0, passed,
+and `bump` returned 0, which Crust's runtime check caught as
+`ensures used <= result` violated. `slot_addr` and `slot_ok` formed
+`bases[heap] + used` with nothing bounding either. The prover had left all
+three open; `by_bounds` refuses them and proves the fourth, the `return used
++ n` behind the guard. The fixes:
+
+- `bump` tests `n <= sizes[heap] && used <= sizes[heap] - n`, the same
+  answer wherever `used + n` fits.
+- `slot_ok` answers 0 for an address past `u64::MAX`, which is in no region.
+- `slot_addr` asks its caller: `#[requires(bases[heap] <= u64::MAX - used)]`.
+
+`u64::MAX` and the other integer limits compile now; they had flattened to
+an undefined `u64_MAX`. A test pins the open set, now empty, so a new open
+obligation fails it.
 
 `test_alloc_model.py` notes that the Python's model answers 0 past the end
 of an array where the compiled C reads out of bounds. The port has no such
@@ -437,15 +459,15 @@ read, and the obligations are the proof of that.
 
 ### Known gaps
 
-- **Arithmetic.** An obligation or contract that needs `a < 1000 && b < 1000`
-  to give `a + b < 2000`, or `n <= s - u && u <= s` to give `u + n <= s`,
-  is out of reach of split-and-compute. The lemmas an interval tactic would
-  build on are not in the prelude: `add_comm`, two-sided monotonicity of
-  `+` and `*`, and `sub_add` cancellation. They belong in RosettaMath beside
-  `add_le_add_left`, and `add m n` recurses on `n`, which decides the
-  induction.
+- **Arithmetic beyond chains.** `by_bounds` chains `<=` through addition, a
+  checked subtraction and a slice's range. Nothing about `*` is proved, and
+  an addition that fits only because the maximum is large stays open (see
+  *The maximum is symbolic*).
 - **Record contracts through an update.** `step(c: &mut Counter)` with
   `requires(c.n < c.cap)` and `ensures(c.n <= c.cap)` is not proved: the
   hypothesis is not carried across `Counter.n (with_n c v)` reducing to `v`.
   A test asserts it is still open, and Crust checks both clauses at runtime.
-- **`class_covers`**, from the first step, as before.
+- **A callee's `requires` naming `u64::MAX`** reaches its callers through
+  `name__pre`, which is lifted as the model is, with the literal, not the
+  symbol. A caller's obligation to meet it is therefore not provable yet;
+  none in `leanos/` has one.
