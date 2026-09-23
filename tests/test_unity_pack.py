@@ -4476,6 +4476,317 @@ class TestSystems(unittest.TestCase):
         self.assertGreater(wy[0], wy[1])
         self.assertGreater(wy[1], wy[2])
 
+    def test_content_size_fitter_preferred_from_vlayout(self):
+        """ContentSizeFitter PreferredSize height = VLG preferred (children+spacing)."""
+        root = tempfile.mkdtemp(prefix="upack-csf-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Host.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Host : MonoBehaviour { void Update() {} }\n"
+            )
+        with open(os.path.join(scripts, "Host.cs.meta"), "w") as f:
+            f.write("guid: csfhostcsfhostcsfhostcsfhost01\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        img = "fe87c0e1cc204ed48ad3b37840f39efc"
+        vlg = "59f8146938fff824cb5fd77236b75775"
+        csf = "3245ec927659c4140ac4f8d17403cc18"
+        builtin = "0000000000000000f000000000000000"
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Canvas\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!224 &2\nRectTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 0, y: 0}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!223 &3\nCanvas:\n  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n  m_RenderMode: 0\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Panel\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "  - component: {fileID: 13}\n"
+                "  - component: {fileID: 14}\n"
+                "--- !u!224 &11\nRectTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Father: {fileID: 2}\n"
+                "  m_AnchorMin: {x: 0.5, y: 0.5}\n"
+                "  m_AnchorMax: {x: 0.5, y: 0.5}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 200, y: 50}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!114 &12\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, guid: " + vlg + "}\n"
+                "  m_Padding:\n    m_Left: 0\n    m_Right: 0\n"
+                "    m_Top: 0\n    m_Bottom: 0\n"
+                "  m_ChildAlignment: 0\n  m_Spacing: 10\n"
+                "  m_ChildForceExpandWidth: 0\n"
+                "  m_ChildForceExpandHeight: 0\n"
+                "  m_ChildControlWidth: 0\n"
+                "  m_ChildControlHeight: 0\n"
+                "  m_ChildScaleWidth: 0\n  m_ChildScaleHeight: 0\n"
+                "  m_ReverseArrangement: 0\n"
+                "--- !u!114 &13\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, guid: " + csf + "}\n"
+                "  m_HorizontalFit: 0\n"
+                "  m_VerticalFit: 2\n"
+                "--- !u!114 &14\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: csfhostcsfhostcsfhostcsfhost01}\n"
+            )
+            for i, fid in enumerate((20, 30, 40)):
+                xf, img_id = fid + 1, fid + 2
+                f.write(
+                    "--- !u!1 &%d\nGameObject:\n  m_Name: B%d\n"
+                    "  m_Component:\n  - component: {fileID: %d}\n"
+                    "  - component: {fileID: %d}\n"
+                    "--- !u!224 &%d\nRectTransform:\n"
+                    "  m_GameObject: {fileID: %d}\n"
+                    "  m_Father: {fileID: 11}\n"
+                    "  m_AnchorMin: {x: 0.5, y: 0.5}\n"
+                    "  m_AnchorMax: {x: 0.5, y: 0.5}\n"
+                    "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                    "  m_SizeDelta: {x: 100, y: 40}\n"
+                    "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                    "--- !u!114 &%d\nMonoBehaviour:\n"
+                    "  m_GameObject: {fileID: %d}\n"
+                    "  m_Script: {fileID: 11500000, guid: %s}\n"
+                    "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+                    "  m_Enabled: 1\n  m_Type: 0\n"
+                    "  m_Sprite: {fileID: 10905, guid: %s, type: 0}\n"
+                    % (fid, i, xf, img_id, xf, fid, img_id, fid, img, builtin)
+                )
+        objs, _a, _l, _c, _h = unity_pack.load_project(root)
+        panel = [o for o in objs if o["name"] == "Panel"][0]
+        self.assertEqual(panel.get("content_size_fitter", {}).get("vertical"), 2)
+        # 3×40 + 2×10 spacing = 140
+        self.assertAlmostEqual(panel["rect"]["size_delta"][1], 140.0, places=3)
+        self.assertAlmostEqual(panel["rect"]["size_delta"][0], 200.0, places=3)
+
+    def test_layout_element_preferred_and_max(self):
+        """LayoutElement preferred height drives VLG; max clamps preferred."""
+        root = tempfile.mkdtemp(prefix="upack-le-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Host.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Host : MonoBehaviour { void Update() {} }\n"
+            )
+        with open(os.path.join(scripts, "Host.cs.meta"), "w") as f:
+            f.write("guid: lehostlehostlehostlehostleho01\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        vlg = "59f8146938fff824cb5fd77236b75775"
+        le = "306cc8c2b49d7114eaa3623786fc2126"
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Canvas\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!224 &2\nRectTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 0, y: 0}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!223 &3\nCanvas:\n  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n  m_RenderMode: 0\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Panel\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "--- !u!224 &11\nRectTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Father: {fileID: 2}\n"
+                "  m_AnchorMin: {x: 0.5, y: 0.5}\n"
+                "  m_AnchorMax: {x: 0.5, y: 0.5}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 200, y: 300}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!114 &12\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, guid: " + vlg + "}\n"
+                "  m_Padding:\n    m_Left: 0\n    m_Right: 0\n"
+                "    m_Top: 0\n    m_Bottom: 0\n"
+                "  m_ChildAlignment: 0\n  m_Spacing: 0\n"
+                "  m_ChildForceExpandWidth: 0\n"
+                "  m_ChildForceExpandHeight: 0\n"
+                "  m_ChildControlWidth: 1\n"
+                "  m_ChildControlHeight: 1\n"
+                "  m_ChildScaleWidth: 0\n  m_ChildScaleHeight: 0\n"
+                "  m_ReverseArrangement: 0\n"
+                "--- !u!1 &20\nGameObject:\n  m_Name: Child\n"
+                "  m_Component:\n  - component: {fileID: 21}\n"
+                "  - component: {fileID: 22}\n"
+                "--- !u!224 &21\nRectTransform:\n"
+                "  m_GameObject: {fileID: 20}\n"
+                "  m_Father: {fileID: 11}\n"
+                "  m_AnchorMin: {x: 0.5, y: 0.5}\n"
+                "  m_AnchorMax: {x: 0.5, y: 0.5}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 50, y: 50}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!114 &22\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 20}\n"
+                "  m_Script: {fileID: 11500000, guid: " + le + "}\n"
+                "  m_IgnoreLayout: 0\n"
+                "  m_MinWidth: -1\n  m_MinHeight: -1\n"
+                "  m_PreferredWidth: 80\n  m_PreferredHeight: 120\n"
+                "  m_FlexibleWidth: -1\n  m_FlexibleHeight: -1\n"
+                "  m_LayoutPriority: 1\n"
+                "  m_MaxWidth: -1\n  m_MaxHeight: 60\n"
+            )
+        objs, _a, _l, _c, _h = unity_pack.load_project(root)
+        child = [o for o in objs if o["name"] == "Child"][0]
+        self.assertIsNotNone(child.get("layout_element"))
+        self.assertAlmostEqual(child["layout_element"]["max"][1], 60.0)
+        # preferred 120 clamped by max 60; control height → sizeDelta.y = 60
+        self.assertAlmostEqual(child["rect"]["size_delta"][1], 60.0, places=3)
+        self.assertAlmostEqual(child["rect"]["size_delta"][0], 80.0, places=3)
+
+    def test_aspect_ratio_fitter_width_controls_height(self):
+        """AspectRatioFitter WidthControlsHeight sets height = width / ratio."""
+        root = tempfile.mkdtemp(prefix="upack-arf-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Host.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Host : MonoBehaviour { void Update() {} }\n"
+            )
+        with open(os.path.join(scripts, "Host.cs.meta"), "w") as f:
+            f.write("guid: arfhostarfhostarfhostarfhost01\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        arf = "86710e43de46f6f4bac7c8e50813a599"
+        img = "fe87c0e1cc204ed48ad3b37840f39efc"
+        builtin = "0000000000000000f000000000000000"
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Canvas\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!224 &2\nRectTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 0, y: 0}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!223 &3\nCanvas:\n  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n  m_RenderMode: 0\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Pic\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "  - component: {fileID: 13}\n"
+                "--- !u!224 &11\nRectTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Father: {fileID: 2}\n"
+                "  m_AnchorMin: {x: 0.5, y: 0.5}\n"
+                "  m_AnchorMax: {x: 0.5, y: 0.5}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 200, y: 50}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!114 &12\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, guid: " + arf + "}\n"
+                "  m_AspectMode: 1\n"
+                "  m_AspectRatio: 2\n"
+                "--- !u!114 &13\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, guid: " + img + "}\n"
+                "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+                "  m_Enabled: 1\n  m_Type: 0\n"
+                "  m_Sprite: {fileID: 10905, guid: " + builtin + ", type: 0}\n"
+            )
+        objs, _a, _l, _c, _h = unity_pack.load_project(root)
+        pic = [o for o in objs if o["name"] == "Pic"][0]
+        self.assertEqual(pic.get("aspect_ratio_fitter", {}).get("mode"), 1)
+        self.assertAlmostEqual(pic["rect"]["size_delta"][0], 200.0, places=3)
+        self.assertAlmostEqual(pic["rect"]["size_delta"][1], 100.0, places=3)
+
+    def test_aspect_ratio_fitter_fit_in_parent(self):
+        """AspectRatioFitter FitInParent stretches anchors and letterboxes."""
+        root = tempfile.mkdtemp(prefix="upack-arf-fit-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Host.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Host : MonoBehaviour { void Update() {} }\n"
+            )
+        with open(os.path.join(scripts, "Host.cs.meta"), "w") as f:
+            f.write("guid: arffitarffitarffitarffitarffi01\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        arf = "86710e43de46f6f4bac7c8e50813a599"
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Canvas\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!224 &2\nRectTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 0, y: 0}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!223 &3\nCanvas:\n  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n  m_RenderMode: 0\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Frame\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "--- !u!224 &11\nRectTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Father: {fileID: 2}\n"
+                "  m_AnchorMin: {x: 0.5, y: 0.5}\n"
+                "  m_AnchorMax: {x: 0.5, y: 0.5}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 400, y: 200}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!1 &20\nGameObject:\n  m_Name: Inner\n"
+                "  m_Component:\n  - component: {fileID: 21}\n"
+                "  - component: {fileID: 22}\n"
+                "--- !u!224 &21\nRectTransform:\n"
+                "  m_GameObject: {fileID: 20}\n"
+                "  m_Father: {fileID: 11}\n"
+                "  m_AnchorMin: {x: 0.5, y: 0.5}\n"
+                "  m_AnchorMax: {x: 0.5, y: 0.5}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 100, y: 100}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!114 &22\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 20}\n"
+                "  m_Script: {fileID: 11500000, guid: " + arf + "}\n"
+                "  m_AspectMode: 3\n"
+                "  m_AspectRatio: 1\n"
+            )
+        objs, _a, _l, _c, _h = unity_pack.load_project(root)
+        inner = [o for o in objs if o["name"] == "Inner"][0]
+        self.assertEqual(inner["rect"]["anchor_min"], (0.0, 0.0))
+        self.assertEqual(inner["rect"]["anchor_max"], (1.0, 1.0))
+        # Parent 400×200, ratio 1 → fit height = 200, sizeDelta.x = 200-400 = -200
+        self.assertAlmostEqual(inner["rect"]["size_delta"][0], -200.0, places=3)
+        self.assertAlmostEqual(inner["rect"]["size_delta"][1], 0.0, places=3)
+
     def test_awake_setactive_false_emitted(self):
         """Awake gameObject.SetActive(false) runs before Start (SettingsMenu)."""
         root = tempfile.mkdtemp(prefix="upack-awake-sa-")
@@ -4522,6 +4833,83 @@ class TestSystems(unittest.TestCase):
         self.assertIn("static void Menu_Awake(unsigned i)", eng)
         self.assertIn("GameObject_SetActive(_engine_go_of_Menu(i), (0))", eng)
         self.assertIn("Menu_Awake((unsigned)n)", eng)
+        # SetActive alone sets want_ui; ColorBlock tint must not be referenced
+        # without authored Buttons (would be undeclared).
+        self.assertNotIn("_engine_ui_btn_tint_init", eng)
+
+    def test_setactive_with_sprite_omits_btn_tint(self):
+        """want_ui from SetActive + SpriteRenderer, no Button → no tint refs."""
+        root = tempfile.mkdtemp(prefix="upack-sa-spr-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        spr = os.path.join(root, "Assets", "Sprites")
+        os.makedirs(spr)
+        import struct, zlib
+
+        def write_png(path, w, h):
+            def chunk(tag, body):
+                return (struct.pack(">I", len(body)) + tag + body
+                        + struct.pack(">I", zlib.crc32(tag + body) & 0xffffffff))
+            raw = b""
+            for _y in range(h):
+                raw += b"\x00" + (b"\xff\xff\xff\xff" * w)
+            open(path, "wb").write(
+                b"\x89PNG\r\n\x1a\n"
+                + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(raw, 9))
+                + chunk(b"IEND", b""))
+
+        write_png(os.path.join(spr, "q.png"), 8, 8)
+        with open(os.path.join(spr, "q.png.meta"), "w") as f:
+            f.write(
+                "guid: 33333333333333333333333333333333\n"
+                "TextureImporter:\n"
+                "  spritePixelsToUnits: 8\n"
+            )
+        with open(os.path.join(scripts, "Menu.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Menu : MonoBehaviour {\n"
+                "    void Awake() { gameObject.SetActive(false); }\n"
+                "    void Update() {}\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Menu.cs.meta"), "w") as f:
+            f.write("guid: menusprmenusprmenusprmenuspr01\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Menu\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "  - component: {fileID: 4}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: menusprmenusprmenusprmenuspr01}\n"
+                "--- !u!212 &4\nSpriteRenderer:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n"
+                "  m_Sprite: {fileID: 21300000, "
+                "guid: 33333333333333333333333333333333, type: 3}\n"
+                "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-sa-spr-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("GameObject_SetActive", eng)
+        self.assertIn("_spr_go", eng)
+        # Draw must not call ColorBlock helpers that were never emitted.
+        self.assertNotIn("_engine_ui_btn_tint_init", eng)
+        self.assertNotIn("_engine_ui_btn_tint[", eng)
+        self.assertNotIn("_spr_btn", eng)
 
     def test_vector3_plus_equals_vector2_is_cs0034(self):
         """transform.position is Vector3; += Vector2 is ambiguous in csc."""
