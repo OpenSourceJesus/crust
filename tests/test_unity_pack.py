@@ -4452,6 +4452,112 @@ class TestSystems(unittest.TestCase):
         self.assertEqual(crgba[0:4], b"\x00\xff\x00\xff")
 
 
+    def test_authored_m_isactive_zero_seeds_go_active(self):
+        """Scene m_IsActive: 0 → _engine_go_active seed 0 (not forced on)."""
+        root = tempfile.mkdtemp(prefix="upack-isactive-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        spr = os.path.join(root, "Assets", "Sprites")
+        os.makedirs(spr)
+        import struct, zlib
+
+        def write_png(path, w, h):
+            def chunk(tag, body):
+                return (struct.pack(">I", len(body)) + tag + body
+                        + struct.pack(">I", zlib.crc32(tag + body) & 0xffffffff))
+            raw = b""
+            for _y in range(h):
+                raw += b"\x00" + (b"\xff\xff\xff\xff" * w)
+            open(path, "wb").write(
+                b"\x89PNG\r\n\x1a\n"
+                + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(raw, 9))
+                + chunk(b"IEND", b""))
+
+        write_png(os.path.join(spr, "q.png"), 8, 8)
+        with open(os.path.join(spr, "q.png.meta"), "w") as f:
+            f.write(
+                "guid: 44444444444444444444444444444444\n"
+                "TextureImporter:\n"
+                "  spritePixelsToUnits: 8\n"
+            )
+        with open(os.path.join(scripts, "Host.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Host : MonoBehaviour {\n"
+                "    void Update() { gameObject.SetActive(true); }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Host.cs.meta"), "w") as f:
+            f.write("guid: isactivhostisactivhostisactiv01\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Hidden\n"
+                "  m_IsActive: 0\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "  - component: {fileID: 4}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: isactivhostisactivhostisactiv01}\n"
+                "--- !u!212 &4\nSpriteRenderer:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n"
+                "  m_Sprite: {fileID: 21300000, "
+                "guid: 44444444444444444444444444444444, type: 3}\n"
+                "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Shown\n"
+                "  m_IsActive: 1\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "  - component: {fileID: 13}\n"
+                "--- !u!4 &11\nTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_LocalPosition: {x: 1, y: 0, z: 0}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "--- !u!114 &12\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: isactivhostisactivhostisactiv01}\n"
+                "--- !u!212 &13\nSpriteRenderer:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Enabled: 1\n"
+                "  m_Sprite: {fileID: 21300000, "
+                "guid: 44444444444444444444444444444444, type: 3}\n"
+                "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-isactive-out-")
+        plan = unity_pack.pack(root, d)
+        names = plan.get("go_names") or []
+        actives = plan.get("go_active") or []
+        self.assertIn("Hidden", names)
+        self.assertIn("Shown", names)
+        hi = names.index("Hidden")
+        si = names.index("Shown")
+        self.assertEqual(actives[hi], 0)
+        self.assertEqual(actives[si], 1)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("_engine_go_active_init", eng)
+        # Seed array must include a 0 for the authored inactive GO.
+        self.assertRegex(
+            eng,
+            r"static const int _seed\[\d+\] = \{[^}]*0[^}]*\}")
+        # Must not force every slot to 1 (old bug).
+        self.assertNotRegex(
+            eng,
+            r"_engine_go_active_init\(void\) \{[^}]*"
+            r"_engine_go_active\[i\] = 1;")
+
+
     def test_canvas_button_draws_and_clicks(self):
         """Authored Canvas + Button (builtin UISprite) → draw + SetActive onClick."""
         objs, _a, _l, cams, _hier = unity_pack.load_project(SYSTEMS)

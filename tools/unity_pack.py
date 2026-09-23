@@ -3114,6 +3114,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
     hierarchy = []  # all authored GOs (name + xf) for Transform.Find
     blocks = re.split(r"(?m)^---\s+", text)
     by_id = {}
+    # Nested prefab parses fill this; do not clear mid-scene (cache by path).
+    # Callers that mutate .prefab files across packs should restart the process.
     for block in blocks:
         hm = re.match(r"!u!(\d+)\s+&(\d+)", block)
         if not hm:
@@ -3166,6 +3168,10 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         tag = re.search(r"(?m)^\s+m_TagString:\s*(.+)$", block)
         if tag:
             rec["tag"] = tag.group(1).strip()
+        # GameObject.activeSelf — authored m_IsActive (default active).
+        if kind == "GameObject":
+            ia = re.search(r"(?m)^\s+m_IsActive:\s*(\d+)", block)
+            rec["active"] = int(ia.group(1)) if ia else 1
         pos = re.search(
             r"m_LocalPosition:\s*\{x:\s*([^,}]+),\s*y:\s*([^,}]+),"
             r"\s*z:\s*([^}]+)\}", block)
@@ -3398,6 +3404,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                     "builtin": builtin,
                     "sprite_file_id": fid,
                     "sprite_guid": sg,
+                    # PrefabInstance m_Sprite mods target this MB fileID.
+                    "mb_file_id": file_id,
                     # 0 Simple, 1 Sliced, 2 Tiled, 3 Filled
                     "image_type": int(itype.group(1)) if itype else 0,
                     "pixels_per_unit_multiplier": (
@@ -3837,6 +3845,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "xf_id": xf_id,
                 "father_id": father_id,
                 "go_id": go.get("file_id"),
+                "active": 1 if int(go.get("active", 1)) else 0,
                 "has_canvas": bool(canvas),
                 "has_image": bool(ui_image),
                 "has_button": bool(ui_button),
@@ -3878,11 +3887,49 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                     or re.search(r"\bUnityEngine\.UI\.Text\b", raw)):
                 ui_scaffold_mb = True
                 break
-        # Image without sprite / TMP without font: drop. EventSystem: drop.
+        # Image without sprite / TMP without font: keep as _Rect when a
+        # RectTransform exists (PrefabInstance UI Button roots often have
+        # Image with m_Sprite: {fileID: 0} but still parent TMP children).
+        # EventSystem / legacy UI.Text: drop via ui_scaffold_mb below.
         # Prefab stubs with unresolved MB guids: keep (has_mb).
         if ui_image and not has_ui_draw and script is None and sprite is None:
             if not rb2d and not rb3d and not col2d and not col3d and not player:
                 if not canvas and not ui_button and not ui_tmp:
+                    if rect is not None:
+                        objects.append({
+                            "name": go.get("name") or "Rect",
+                            "pos": pos,
+                            "rot": rot,
+                            "local_pos": local_pos,
+                            "local_rot": local_rot,
+                            "local_scale": local_scale,
+                            "father_id": father_id,
+                            "xf_id": xf_id,
+                            "go_id": go.get("file_id"),
+                            "active": 1 if int(go.get("active", 1)) else 0,
+                            "fields": {},
+                            "script": None,
+                            "class": "_Rect",
+                            "sprite": None,
+                            "canvas": None,
+                            "rect": rect,
+                            "ui_image": ui_image,
+                            "ui_button": None,
+                            "ui_tmp": None,
+                            "layout_group": layout_group,
+                            "layout_element": layout_element,
+                            "content_size_fitter": content_size_fitter,
+                            "aspect_ratio_fitter": aspect_ratio_fitter,
+                            "rigidbody2d": None,
+                            "rigidbody": None,
+                            "collider2d": None,
+                            "collider3d": None,
+                            "anim_player": None,
+                            "ui_scaffold": True,
+                        })
+                        if xf is not None:
+                            # hierarchy already appended above when xf set
+                            pass
                     continue
         if ui_tmp and not has_ui_draw and script is None and sprite is None:
             if (not rb2d and not rb3d and not col2d and not col3d and not player
@@ -3906,6 +3953,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                     "father_id": father_id,
                     "xf_id": xf_id,
                     "go_id": go.get("file_id"),
+                    "active": 1 if int(go.get("active", 1)) else 0,
                     "fields": {},
                     "script": None,
                     "class": "_Rect",
@@ -3939,6 +3987,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "father_id": father_id,
                 "xf_id": xf_id,
                 "go_id": go.get("file_id"),
+                "active": 1 if int(go.get("active", 1)) else 0,
                 "fields": {},
                 "script": None,
                 "class": "_Canvas",
@@ -3970,6 +4019,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "father_id": father_id,
             "xf_id": xf_id,
             "go_id": go.get("file_id"),
+            "active": 1 if int(go.get("active", 1)) else 0,
             "fields": fields,
             "object_refs": object_refs,
             "script": script,
@@ -4002,7 +4052,6 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         if clip:
             p["clip"] = clip
     return objects, lights, cameras, hierarchy
-
 
 def parse_godot_tscn(text):
     """Godot .tscn nodes with a script class name and exported numbers."""
@@ -4233,8 +4282,12 @@ def _ast_find_getcomponent_chains(text):
 
 
 def _build_go_tables(plan):
-    """Authored GameObject name → {MonoBehaviour class: instance index}."""
+    """Authored GameObject name → {MonoBehaviour class: instance index}.
+
+    Also returns parallel activeSelf flags from authored m_IsActive.
+    """
     names = []
+    actives = []
     seen = set()
     comps = {}  # name -> {class: idx}
     for cname, cl in sorted(plan["classes"].items()):
@@ -4243,8 +4296,9 @@ def _build_go_tables(plan):
             if n not in seen:
                 seen.add(n)
                 names.append(n)
+                actives.append(1 if int(o.get("active", 1)) else 0)
             comps.setdefault(n, {})[cname] = i
-    return names, comps
+    return names, comps, actives
 
 
 def _build_go_ui_component_maps(plan):
@@ -4284,9 +4338,10 @@ def _build_go_ui_component_maps(plan):
     return {t: sorted(s) for t, s in maps.items() if s}
 
 
-def _extend_go_tables_for_find(plan, names, comps):
+def _extend_go_tables_for_find(plan, names, comps, actives):
     """Add authored hierarchy-only GOs so Transform.Find can see children."""
     names = list(names)
+    actives = list(actives)
     comps = {k: dict(v) for k, v in comps.items()}
     seen = set(names)
     for h in plan.get("scene_hierarchy") or []:
@@ -4295,8 +4350,9 @@ def _extend_go_tables_for_find(plan, names, comps):
             continue
         seen.add(n)
         names.append(n)
+        actives.append(1 if int(h.get("active", 1)) else 0)
         comps.setdefault(n, {})
-    return names, comps
+    return names, comps, actives
 
 
 def _build_go_parents(plan):
@@ -9081,6 +9137,15 @@ def emit_engine(plan, analyses, used_apis):
             p("}")
             p("")
         if want_ui:
+            go_active = plan.get("go_active") or [1] * go_authored_n
+            if len(go_active) < go_authored_n:
+                go_active = list(go_active) + [1] * (
+                    go_authored_n - len(go_active))
+            go_active = [
+                1 if int(a) else 0 for a in go_active[:go_authored_n]
+            ] + [1] * go_spawn_budget
+            if not go_active:
+                go_active = [1]
             p("/* GameObject.activeSelf — host pointer + authored Button */")
             p("static int _engine_go_active[%d];" % go_n)
             p("static int _engine_go_active_inited;")
@@ -9089,8 +9154,11 @@ def emit_engine(plan, analyses, used_apis):
             p("    int i;")
             p("    if (_engine_go_active_inited) return;")
             p("    _engine_go_active_inited = 1;")
+            # Seed authored m_IsActive; spawn slots default active.
+            p("    static const int _seed[%d] = { %s };" % (
+                go_n, ", ".join(str(int(a)) for a in go_active[:go_n])))
             p("    for (i = 0; i < %d; i = i + 1)" % go_n)
-            p("        _engine_go_active[i] = 1;")
+            p("        _engine_go_active[i] = _seed[i];")
             p("}")
             p("static int _engine_go_active_in_hierarchy(int go) {")
             p("    int guard = 0;")
@@ -9239,6 +9307,16 @@ def emit_engine(plan, analyses, used_apis):
             p("    go = _engine_go_count;")
             p("    _engine_go_count = _engine_go_count + 1;")
             p("    _engine_go_name[go] = \"(Clone)\";")
+            if want_ui:
+                # Instantiate copies activeSelf from the source GO.
+                p("    _engine_go_active_init();")
+                p("    {")
+                p("        int _sgo = _engine_%s_go_of[src];" % idn)
+                p("        if (_sgo >= 0 && _sgo < %d)" % go_cap_i)
+                p("            _engine_go_active[go] = _engine_go_active[_sgo];")
+                p("        else")
+                p("            _engine_go_active[go] = 1;")
+                p("    }")
             if want_destroy:
                 p("    if (go >= 0 && go < %d)" % go_cap_i)
                 p("        _engine_go_destroyed[go] = 0;")
@@ -15175,7 +15253,7 @@ def pack(root, outdir, soa=False, soa_vec4=False):
     plan["screen_fullscreen"] = sfs
     plan["screen_fullscreen_native"] = snative
     plan["screen_maximized"] = smax
-    go_names, go_comps = _build_go_tables(plan)
+    go_names, go_comps, go_active = _build_go_tables(plan)
     ui_gc = set()
     for a in analyses:
         ui_gc |= set(a.get("getcomponent_types") or [])
@@ -15184,9 +15262,10 @@ def pack(root, outdir, soa=False, soa_vec4=False):
             or "transform.SetParent" in used_apis
             or "transform.GetSiblingIndex" in used_apis
             or ui_gc):
-        go_names, go_comps = _extend_go_tables_for_find(
-            plan, go_names, go_comps)
+        go_names, go_comps, go_active = _extend_go_tables_for_find(
+            plan, go_names, go_comps, go_active)
     plan["go_names"] = go_names
+    plan["go_active"] = go_active
     plan["go_components"] = go_comps
     plan["go_ui_components"] = _build_go_ui_component_maps(plan)
     plan["go_parents"] = _build_go_parents(plan)
