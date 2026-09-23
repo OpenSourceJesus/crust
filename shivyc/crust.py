@@ -103,6 +103,26 @@ PRIMITIVES["i128"] = "crust_i128"
 PRIMITIVES.update(_FFI_PRIMITIVES)
 
 
+# `u64::MAX`, `i32::MIN` and the rest, as the path flattens them, with the C
+# literal each stands for.  A literal needs its suffix: `18446744073709551615`
+# alone does not fit a C `long`, and `-2147483648` is the negation of an int
+# that is too large, so the minima are written as one less than a negation.
+_INT_LIMITS = {}
+for _prim, _bits, _signed, _suffix in (
+        ("u8", 8, False, "U"), ("u16", 16, False, "U"), ("u32", 32, False, "U"),
+        ("u64", 64, False, "UL"), ("usize", 64, False, "UL"),
+        ("i8", 8, True, ""), ("i16", 16, True, ""), ("i32", 32, True, ""),
+        ("i64", 64, True, "L"), ("isize", 64, True, "L")):
+    if _signed:
+        _hi = (1 << (_bits - 1)) - 1
+        _INT_LIMITS[_prim + "_MAX"] = (_prim, "%d%s" % (_hi, _suffix))
+        _INT_LIMITS[_prim + "_MIN"] = (_prim, "(-%d%s - 1)" % (_hi, _suffix))
+    else:
+        _INT_LIMITS[_prim + "_MAX"] = (_prim, "%d%s" % ((1 << _bits) - 1,
+                                                        _suffix))
+        _INT_LIMITS[_prim + "_MIN"] = (_prim, "0%s" % _suffix)
+
+
 class RustCType:
     """A C type split into a base specifier and a declarator shape."""
 
@@ -4303,6 +4323,13 @@ class Parser:
                         targs = args
                     continue
                 name += "_" + self.expect_ident()
+            if saw_path and name in _INT_LIMITS \
+                    and name not in self.unit.consts \
+                    and self.lookup(name) is None:
+                # `u64::MAX`: a typed literal.  Flattened to `u64_MAX` it
+                # named nothing, and the C front end refused it.
+                prim, code = _INT_LIMITS[name]
+                return Expr(code, RustCType(PRIMITIVES[prim]))
             # `Name { ... }` is a struct literal, except in a condition
             # position, where Rust also treats the brace as a block.
             if (self.at("{", "punc") and not self.no_struct_lit

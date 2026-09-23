@@ -284,12 +284,16 @@ class _Ty:
 
 
 def _max(width):
-    """The largest `uN`, *symbolically*.  The kernel's numerals are unary --
-    `3` is `succ (succ (succ zero))` -- so `u32::MAX` written out is four
-    billion nested terms, and `u64::MAX` is not writable at all.  An
-    overflow obligation instead names `max_u32`, a parameter of the safety
-    function, with each `u32` parameter assumed `<= max_u32`: exact, and
-    small."""
+    """The largest `uN`, *symbolically*.  An overflow obligation names
+    `max_u32`, a parameter of the safety function, with each `u32`
+    parameter and each element of a `&[u32]` assumed `<= max_u32`.
+
+    This began as a workaround: the kernel's numerals were unary, and
+    `u32::MAX` written out was four billion nested terms.  Numerals are one
+    node now, and the symbolic maximum stays because it is the stronger
+    statement: a proof that holds for every `max_u32` holds for 2^32 - 1,
+    and a proof that needed the particular value would be arithmetic about
+    the width, which no obligation here should depend on."""
     return "max_u%d" % width
 
 
@@ -316,6 +320,10 @@ class _FnLifter:
         self.pending_conds = []
         self.guards = []
         self.maxes = []                 # widths whose `max_uN` is named
+        # `uN::MAX` as the symbol rather than the number: in the safety lift,
+        # and in a clause lifted for it, so a `requires` guarding the body
+        # speaks of the bound the obligations name.
+        self.symbolic_max = safety
         self.state = None               # (rust name, fragment, _Ty) of `&mut`
         self.i = self._attrs_start(unit.fn_index[name])
         self.lines = []
@@ -544,6 +552,12 @@ class _FnLifter:
                 if ty.kind == "nat" and ty.width in self.maxes:
                     ranges.append("    assert (%s <= %s)"
                                   % (frag, _max(ty.width)))
+                elif ty.kind == "arr" and ty.width in self.maxes:
+                    # and so is every element of a slice of them: without
+                    # this, `xs[i] + 1` could not be bounded even behind a
+                    # guard that compares it with another element.
+                    ranges.append("    assert (all_le(%s, %s))"
+                                  % (frag, _max(ty.width)))
             self.lines[range_at:range_at] = ranges
             extra = [(_max(w), _Ty("nat", w)) for w in sorted(self.maxes)]
         name = self.name + ("__safe" if self.safety else "")
@@ -657,6 +671,7 @@ class _FnLifter:
         # and output so a clause reads the function's bindings.
         sub = _FnLifter(self.unit, self.name)
         sub.used, sub.callees, sub.lines = self.used, self.callees, self.lines
+        sub.symbolic_max, sub.maxes = self.symbolic_max, self.maxes
         sub.indent = self.indent
         state = self.state if ret is not None else None
         sub.toks = list(_strip_old(toks, mutable, self, state)) + \
@@ -1420,6 +1435,8 @@ class _FnLifter:
             self.next()
             if self.at("!"):
                 self.fail("the macro `%s!` is not lifted" % t.val)
+            if self.at("::") and t.val in _UNSIGNED:
+                return self.int_limit(t.val)
             if self.at("::"):
                 self.fail("paths (`%s::..`) are not lifted" % t.val)
             if self.at("("):
@@ -1432,6 +1449,27 @@ class _FnLifter:
         if t.kind == "str" or t.kind == "chr":
             self.fail("string and character values are not lifted")
         self.fail("`%s` is not lifted" % t.val)
+
+    def int_limit(self, prim):
+        """`u64::MAX` or `u64::MIN`.  The safety lift writes the maximum as
+        `max_u64`, the same symbol every range fact is stated against, so
+        `x <= u64::MAX - y` in the source is a fact about the bound the
+        obligations name; the model writes the number, which is one node.
+        Both are the same statement: the safety theorem is proved for every
+        `max_u64`, the true one included."""
+        self.expect("::")
+        which = self.cur.val
+        self.next()
+        width = _UNSIGNED[prim]
+        if which == "MIN":
+            return "0", _Ty("nat", width)
+        if which != "MAX":
+            self.fail("`%s::%s` is not lifted" % (prim, which))
+        if not self.symbolic_max:
+            return str((1 << width) - 1), _Ty("nat", width)
+        if width not in self.maxes:
+            self.maxes.append(width)
+        return _max(width), _Ty("nat", width)
 
     def braced_value(self):
         """An `if`, `match` or block inside an expression: its value goes to a
