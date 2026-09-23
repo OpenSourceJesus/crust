@@ -12,8 +12,10 @@ not settle is reported *open*, which says nothing about whether it holds.
 
 The automation is `hoare.by_every_bool`: split on every guard, then compute.
 That settles an obligation the code's own branches decide -- an index
-behind its length check, a subtraction behind its comparison -- and nothing
-that needs arithmetic.  `by_every_bool` does not bind an obligation's
+behind its length check, a subtraction behind its comparison.  What it
+leaves goes to `hoare.by_bounds`, which splits the same way but keeps what
+each guard said, and chains `<=` facts: `used + n <= max` behind
+`used + n <= sizes[heap]`, given that every element of `sizes` is a `u64`.  `by_every_bool` does not bind an obligation's
 hypotheses, so an obligation with preconditions is first *weakened*: its
 conclusion is proved on its own, and the proof is wrapped in lambdas that
 take the hypotheses and ignore them.  The kernel checks the wrapped term
@@ -75,6 +77,9 @@ class Prover:
         self.lifted, self.refused = lift_all(source)
         self.types = {"Nat": hoare.NAT, "Bool": hoare.BOOL,
                       "Array": hoare.BYTES}
+        # Every obligation the kernel settles, kept with the environment it
+        # was proved in, so a second kernel can be asked the same question.
+        self.certificates = []
         # How many guards `by_every_bool` may split.  Its default, 16, is
         # sized for a guard chain; a lifted body with nested guards, early
         # returns and obligations stated as chains of spellings has more.
@@ -212,14 +217,47 @@ class Prover:
             proof = L.Lambda(b.var_name, b.var_type, proof)
         return H.prove(goal, proof, env, verbose=False)
 
-    def settles(self, work):
-        """True if `work` proves; False if the automation does not."""
+    def by_bounds(self, env, goal, unfolding):
+        """`hoare.by_bounds`: split dependently, keep every hypothesis, and
+        chain `<=` facts at a leaf that does not compute -- a guard, a
+        `requires`, an integer's range, `n <= s && u <= s - n`."""
+        return self.H.by_bounds(env, goal, unfolding=unfolding,
+                                limit=self.limit)
+
+    def first_of(self, env, goal, unfolding, tactics):
+        """The first tactic's proof that the kernel accepts."""
+        failed = (self.H.TheoremError, self.H.ContractError,
+                  self.L.KernelError)
+        for k, tactic in enumerate(tactics):
+            try:
+                return tactic(env, goal, unfolding)
+            except failed:
+                if k == len(tactics) - 1:
+                    raise
+
+    def settles(self, work, function=None, label=None, index=None):
+        """True if `work` proves; False if the automation does not.
+
+        `work` returns (env, statement, proof).  A settled obligation is
+        kept as a `Certificate`, which is what `RosettaMath/rustlean.py`
+        hands to Lean."""
         try:
-            work()
-            return True
+            env, goal, proof = work()
         except (self.H.TheoremError, self.H.ContractError,
                 self.L.KernelError):
             return False
+        # Asking again about an obligation already settled proves it again
+        # but keeps one certificate, so a count of them counts theorems.
+        # Labels are not identities -- two index checks on one line read
+        # the same -- so an obligation is keyed by its position too.
+        if function is not None and not any(
+                c.key == (function, label, index)
+                for c in self.certificates):
+            self.certificates.append(Certificate(
+                theorem_name(function, label,
+                             [c.name for c in self.certificates]),
+                function, label, env, goal, proof, index))
+        return True
 
     def contract(self, name, ensures=None):
         """Does the kernel prove `name`'s `#[ensures]` (or `ensures`)?"""
@@ -230,12 +268,12 @@ class Prover:
             env, sig = self.fresh_env(fn)
             proc = self.H.read_procedure(fn.source, env, sig, post)
             unfolding = {c.name for c in in_dependency_order(fn)}
-            try:
-                self.by_every_bool(env, proc.obligation, unfolding)
-            except (self.H.TheoremError, self.H.ContractError,
-                    self.L.KernelError):
-                self.by_guards(env, proc.obligation, unfolding)
-        return in_big_stack(lambda: self.settles(work))
+            proof = self.first_of(
+                env, proc.obligation, unfolding,
+                (self.by_every_bool, self.by_guards, self.by_bounds))
+            return env, proc.obligation, proof
+        label = "ensures " + " and ".join(post)
+        return in_big_stack(lambda: self.settles(work, name, label))
 
     def safety(self, name):
         """[(obligation, proved?)] for each place `name` could panic."""
@@ -250,9 +288,48 @@ class Prover:
                 for c in in_dependency_order(fn):
                     if c.pre_source is not None:
                         unfolding.add(c.name + "__pre")
-                self.by_every_bool(env, proc.obligation, unfolding)
-            out.append((label, in_big_stack(lambda: self.settles(work))))
+                proof = self.first_of(env, proc.obligation, unfolding,
+                                      (self.by_every_bool, self.by_bounds))
+                return env, proc.obligation, proof
+            out.append((label, in_big_stack(
+                lambda: self.settles(work, name, label, k))))
         return out
+
+
+class Certificate:
+    """One settled obligation: the statement, the term the kernel accepted
+    for it, and the environment both live in."""
+
+    def __init__(self, name, function, label, env, statement, proof,
+                 index=None):
+        self.name = name                # a Lean-safe theorem name
+        self.function = function
+        self.label = label
+        self.index = index              # which panic obligation; None: ensures
+        self.key = (function, label, index)
+        self.env = env
+        self.statement = statement
+        self.proof = proof
+
+    def __repr__(self):
+        return "Certificate(%s: %s %s)" % (self.name, self.function,
+                                            self.label)
+
+
+def theorem_name(function, label, taken):
+    """`rust_bump_ensures`, `rust_bump_safe_line57` -- unique in `taken`."""
+    if label and label.startswith("ensures"):
+        kind = "ensures"
+    elif label and "(line " in label:
+        kind = "safe_line" + label.rsplit("(line ", 1)[1].rstrip(")")
+    else:
+        kind = "safe"
+    base = "rust_%s_%s" % (function, kind)
+    name, n = base, 1
+    while name in taken:
+        n += 1
+        name = "%s_%d" % (base, n)
+    return name
 
 
 def _complete(term, L):
