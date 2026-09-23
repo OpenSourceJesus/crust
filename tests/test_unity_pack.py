@@ -4558,6 +4558,193 @@ class TestSystems(unittest.TestCase):
             r"_engine_go_active\[i\] = 1;")
 
 
+    def test_prefab_instance_ui_parents_tmp_not_fullscreen(self):
+        """Stripped UI Button PrefabInstance → TMP child uses button rect."""
+        root = tempfile.mkdtemp(prefix="upack-prefab-ui-")
+        assets = os.path.join(root, "Assets")
+        pref_dir = os.path.join(assets, "Prefabs")
+        scripts = os.path.join(assets, "Scripts")
+        scene = os.path.join(assets, "Scenes")
+        os.makedirs(pref_dir)
+        os.makedirs(scripts)
+        os.makedirs(scene)
+        img = "fe87c0e1cc204ed48ad3b37840f39efc"
+        pref_guid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        spr_guid = "cccccccccccccccccccccccccccccccc"
+        spr_dir = os.path.join(assets, "Sprites")
+        os.makedirs(spr_dir)
+        import struct, zlib
+
+        def write_png(path, w, h):
+            def chunk(tag, body):
+                return (struct.pack(">I", len(body)) + tag + body
+                        + struct.pack(">I", zlib.crc32(tag + body) & 0xffffffff))
+            raw = b""
+            for _y in range(h):
+                raw += b"\x00" + (b"\xff\x00\x00\xff" * w)
+            open(path, "wb").write(
+                b"\x89PNG\r\n\x1a\n"
+                + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(raw, 9))
+                + chunk(b"IEND", b""))
+
+        write_png(os.path.join(spr_dir, "btn.png"), 8, 8)
+        with open(os.path.join(spr_dir, "btn.png.meta"), "w") as f:
+            f.write(
+                "guid: %s\n"
+                "TextureImporter:\n"
+                "  spritePixelsToUnits: 8\n" % spr_guid
+            )
+        with open(os.path.join(pref_dir, "UIButton.prefab"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &100\nGameObject:\n  m_Name: UI Button\n"
+                "  m_IsActive: 1\n"
+                "  m_Component:\n  - component: {fileID: 200}\n"
+                "  - component: {fileID: 300}\n"
+                "--- !u!224 &200\nRectTransform:\n"
+                "  m_GameObject: {fileID: 100}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 0, y: 0}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "--- !u!114 &300\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 100}\n"
+                "  m_Script: {fileID: 11500000, guid: " + img + "}\n"
+                "  m_Sprite: {fileID: 0}\n"
+                "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+            )
+        with open(os.path.join(pref_dir, "UIButton.prefab.meta"), "w") as f:
+            f.write("guid: %s\n" % pref_guid)
+        # Minimal TMP font stub so bake can skip or succeed — use empty text skip;
+        # we only need parent rect for hit/layout. Use a Host + Image-less TMP
+        # with has_font false → no sprite; still check objects' screen parents.
+        with open(os.path.join(scripts, "Host.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Host : MonoBehaviour { void Update() {} }\n"
+            )
+        with open(os.path.join(scripts, "Host.cs.meta"), "w") as f:
+            f.write("guid: prefabuihostprefabuihostpref01\n")
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Canvas\n"
+                "  m_IsActive: 1\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "  - component: {fileID: 4}\n"
+                "--- !u!224 &2\nRectTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 0, y: 0}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!223 &3\nCanvas:\n  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n  m_RenderMode: 0\n"
+                "--- !u!114 &4\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: prefabuihostprefabuihostpref01}\n"
+                "--- !u!1001 &50\nPrefabInstance:\n"
+                "  m_Modification:\n"
+                "    m_TransformParent: {fileID: 2}\n"
+                "    m_Modifications:\n"
+                "    - target: {fileID: 200, guid: " + pref_guid + ", type: 3}\n"
+                "      propertyPath: m_AnchorMin.x\n"
+                "      value: 0.25\n"
+                "      objectReference: {fileID: 0}\n"
+                "    - target: {fileID: 200, guid: " + pref_guid + ", type: 3}\n"
+                "      propertyPath: m_AnchorMin.y\n"
+                "      value: 0.25\n"
+                "      objectReference: {fileID: 0}\n"
+                "    - target: {fileID: 200, guid: " + pref_guid + ", type: 3}\n"
+                "      propertyPath: m_AnchorMax.x\n"
+                "      value: 0.75\n"
+                "      objectReference: {fileID: 0}\n"
+                "    - target: {fileID: 200, guid: " + pref_guid + ", type: 3}\n"
+                "      propertyPath: m_AnchorMax.y\n"
+                "      value: 0.75\n"
+                "      objectReference: {fileID: 0}\n"
+                "    - target: {fileID: 200, guid: " + pref_guid + ", type: 3}\n"
+                "      propertyPath: m_SizeDelta.x\n"
+                "      value: 0\n"
+                "      objectReference: {fileID: 0}\n"
+                "    - target: {fileID: 200, guid: " + pref_guid + ", type: 3}\n"
+                "      propertyPath: m_SizeDelta.y\n"
+                "      value: 0\n"
+                "      objectReference: {fileID: 0}\n"
+                "    - target: {fileID: 300, guid: " + pref_guid + ", type: 3}\n"
+                "      propertyPath: m_Sprite\n"
+                "      value: \n"
+                "      objectReference: {fileID: 21300000, guid: "
+                + spr_guid + ", type: 3}\n"
+                "  m_SourcePrefab: {fileID: 100100000, guid: " + pref_guid
+                + ", type: 3}\n"
+                "--- !u!224 &60 stripped\nRectTransform:\n"
+                "  m_CorrespondingSourceObject: {fileID: 200, guid: "
+                + pref_guid + ", type: 3}\n"
+                "  m_PrefabInstance: {fileID: 50}\n"
+                "--- !u!1 &70\nGameObject:\n  m_Name: Label\n"
+                "  m_IsActive: 1\n"
+                "  m_Component:\n  - component: {fileID: 71}\n"
+                "  - component: {fileID: 72}\n"
+                "--- !u!224 &71\nRectTransform:\n"
+                "  m_GameObject: {fileID: 70}\n"
+                "  m_Father: {fileID: 60}\n"
+                "  m_AnchorMin: {x: 0.5, y: 0.5}\n"
+                "  m_AnchorMax: {x: 0.5, y: 0.5}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 200, y: 50}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "  m_LocalScale: {x: 0.5, y: 0.5, z: 1}\n"
+                "--- !u!114 &72\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 70}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: prefabuihostprefabuihostpref01}\n"
+            )
+        objs, _a, _l, _c, hier = unity_pack.load_project(root)
+        buttons = [o for o in objs if "UI Button" in (o.get("name") or "")]
+        if not buttons:
+            buttons = [h for h in hier if "UI Button" in (h.get("name") or "")]
+            self.fail("hydrated PrefabInstance root missing; hier=%r objs=%r" % (
+                [h.get("name") for h in hier],
+                [o.get("name") for o in objs]))
+        btn = buttons[0]
+        self.assertEqual(str(btn.get("xf_id")), "60")
+        self.assertEqual(str(btn.get("father_id")), "2")
+        self.assertAlmostEqual(btn["rect"]["anchor_min"][0], 0.25, places=5)
+        self.assertAlmostEqual(btn["rect"]["anchor_max"][0], 0.75, places=5)
+        # Prefab root Image has m_Sprite: {fileID: 0}; instance override wins.
+        ui = btn.get("ui_image") or {}
+        self.assertTrue(ui.get("has_sprite"), "m_Sprite objectReference not applied")
+        self.assertEqual(ui.get("sprite_guid"), spr_guid)
+        sp = btn.get("sprite") or {}
+        self.assertTrue(sp.get("tex_rgba"), "prefab Image sprite not baked")
+        label = [o for o in objs if o.get("name") == "Label"][0]
+        self.assertEqual(str(label.get("father_id")), "60")
+        # Parent in by_xf → label not full-screen.
+        sw, sh = 1920, 1080
+        by_xf = {str(o["xf_id"]): o for o in objs if o.get("xf_id")}
+        self.assertIn("60", by_xf)
+        cache = {}
+        cx, cy, rw, rh = unity_pack._ui_screen_rect(
+            label, by_xf, sw, sh, cache)
+        # Centered in the 50%×50% button (screen center).
+        # sizeDelta 200×50 (localScale applied in a later change).
+        self.assertAlmostEqual(cx, sw * 0.5, places=1)
+        self.assertAlmostEqual(cy, sh * 0.5, places=1)
+        self.assertAlmostEqual(rw, 200.0, places=1)
+        self.assertAlmostEqual(rh, 50.0, places=1)
+        # Must not be the old full-screen fallback for a 200×50 rect.
+        self.assertLess(rw, sw * 0.2)
+
+
     def test_canvas_button_draws_and_clicks(self):
         """Authored Canvas + Button (builtin UISprite) → draw + SetActive onClick."""
         objs, _a, _l, cams, _hier = unity_pack.load_project(SYSTEMS)

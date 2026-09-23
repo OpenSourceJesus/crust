@@ -4051,7 +4051,292 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         clip = anim_clips.get(p["clip_guid"])
         if clip:
             p["clip"] = clip
+    _append_prefab_instance_ui_objects(
+        by_id, objects, hierarchy, asset_guids, guid_to_script)
     return objects, lights, cameras, hierarchy
+
+
+_prefab_parse_cache = {}
+
+
+def _parsed_prefab_objects(path, guid_to_script, asset_guids):
+    """Parse a .prefab once (cached) into packed-style objects."""
+    key = os.path.abspath(path)
+    if key not in _prefab_parse_cache:
+        _prefab_parse_cache[key] = parse_unity_yaml(
+            _read(path), guid_to_script=guid_to_script,
+            asset_guids=asset_guids)
+    return _prefab_parse_cache[key]
+
+
+def _prefab_mod_values(inst_raw, src_file_id):
+    """propertyPath → value string for modifications targeting *src_file_id*."""
+    out = {}
+    if not inst_raw or not src_file_id:
+        return out
+    for m in re.finditer(
+            r"target:\s*\{fileID:\s*%s,[^}]*\}\s*\n"
+            r"\s*propertyPath:\s*([^\n]+)\s*\n"
+            r"\s*value:\s*([^\n]*)" % re.escape(str(src_file_id)),
+            inst_raw):
+        out[m.group(1).strip()] = m.group(2).strip()
+    return out
+
+
+def _prefab_sprite_object_refs(inst_raw):
+    """(target_mb_file_id, sprite_file_id, sprite_guid) for m_Sprite mods."""
+    out = []
+    if not inst_raw:
+        return out
+    for m in re.finditer(
+            r"target:\s*\{fileID:\s*(-?\d+),[^}]*\}\s*\n"
+            r"\s*propertyPath:\s*m_Sprite\s*\n"
+            r"\s*value:\s*[^\n]*\s*\n"
+            r"\s*objectReference:\s*\{fileID:\s*(-?\d+)"
+            r"(?:,\s*guid:\s*([0-9a-fA-F]+))?",
+            inst_raw):
+        spr_fid = int(m.group(2))
+        if spr_fid == 0:
+            continue
+        sg = m.group(3).lower() if m.group(3) else None
+        out.append((m.group(1), spr_fid, sg))
+    return out
+
+
+def _apply_ui_image_sprite_mod(ui_image, inst_raw, asset_guids):
+    """Apply authored PrefabInstance m_Sprite objectReference to *ui_image*."""
+    if ui_image is None:
+        ui_image = {
+            "r": 1.0, "g": 1.0, "b": 1.0, "a": 1.0,
+            "enabled": 1, "has_sprite": False, "builtin": False,
+            "sprite_file_id": 0, "sprite_guid": None,
+            "image_type": 0, "pixels_per_unit_multiplier": 1.0,
+        }
+    else:
+        ui_image = dict(ui_image)
+    mb_id = str(ui_image.get("mb_file_id") or "")
+    refs = _prefab_sprite_object_refs(inst_raw)
+    chosen = None
+    for target, spr_fid, sg in refs:
+        if mb_id and str(target) == mb_id:
+            chosen = (spr_fid, sg)
+            break
+    # Root Image often has empty m_Sprite; take the first override for this
+    # instance when mb_file_id is unknown (still authored, not invented).
+    if chosen is None and refs and not ui_image.get("has_sprite"):
+        chosen = (refs[0][1], refs[0][2])
+    if not chosen:
+        return ui_image
+    spr_fid, sg = chosen
+    builtin = False
+    has_sprite = False
+    if sg and sg in (asset_guids or {}):
+        has_sprite = True
+    elif _is_unity_builtin_guid(sg):
+        has_sprite = True
+        builtin = True
+    if not has_sprite:
+        return ui_image
+    ui_image["has_sprite"] = True
+    ui_image["builtin"] = builtin
+    ui_image["sprite_file_id"] = int(spr_fid)
+    ui_image["sprite_guid"] = sg
+    return ui_image
+
+
+def _apply_rect_property_mods(rect, scale, mods):
+    """Mutate rect/scale from PrefabInstance propertyPath overrides."""
+    rect = dict(rect or {})
+    amin = list(rect.get("anchor_min") or (0.5, 0.5))
+    amax = list(rect.get("anchor_max") or (0.5, 0.5))
+    apos = list(rect.get("anchored_position") or (0.0, 0.0))
+    size = list(rect.get("size_delta") or (0.0, 0.0))
+    pivot = list(rect.get("pivot") or (0.5, 0.5))
+    sc = list(scale or (1.0, 1.0, 1.0))
+    while len(sc) < 3:
+        sc.append(1.0)
+
+    def _f(key, default=None):
+        if key not in mods:
+            return default
+        try:
+            return float(mods[key])
+        except ValueError:
+            return default
+
+    for axis, idx in (("x", 0), ("y", 1)):
+        v = _f("m_AnchorMin.%s" % axis)
+        if v is not None:
+            amin[idx] = v
+        v = _f("m_AnchorMax.%s" % axis)
+        if v is not None:
+            amax[idx] = v
+        v = _f("m_AnchoredPosition.%s" % axis)
+        if v is not None:
+            apos[idx] = v
+        v = _f("m_SizeDelta.%s" % axis)
+        if v is not None:
+            size[idx] = v
+        v = _f("m_Pivot.%s" % axis)
+        if v is not None:
+            pivot[idx] = v
+        v = _f("m_LocalScale.%s" % axis)
+        if v is not None:
+            sc[idx] = v
+    v = _f("m_LocalScale.z")
+    if v is not None:
+        sc[2] = v
+    rect["anchor_min"] = (float(amin[0]), float(amin[1]))
+    rect["anchor_max"] = (float(amax[0]), float(amax[1]))
+    rect["anchored_position"] = (float(apos[0]), float(apos[1]))
+    rect["size_delta"] = (float(size[0]), float(size[1]))
+    rect["pivot"] = (float(pivot[0]), float(pivot[1]))
+    return rect, (float(sc[0]), float(sc[1]), float(sc[2]))
+
+
+def _append_prefab_instance_ui_objects(
+        by_id, objects, hierarchy, asset_guids, guid_to_script):
+    """Materialize stripped PrefabInstance roots as UI layout parents.
+
+    Scene YAML often keeps only a stripped RectTransform stub for a UI Button
+    prefab; added TMP children parent to that fileID. Without a real object
+    (rect + father), ``_ui_screen_rect`` falls back to full-screen center and
+    VerticalLayoutGroup cannot stack the buttons.
+    """
+    if not asset_guids:
+        return
+    existing_xf = {str(o.get("xf_id")) for o in objects if o.get("xf_id")}
+    # PrefabInstance id → stripped Transform records that reference it.
+    stripped_by_inst = {}
+    for fid, rec in by_id.items():
+        if rec.get("kind") != "Transform":
+            continue
+        raw = rec.get("raw") or ""
+        cso = re.search(
+            r"m_CorrespondingSourceObject:\s*\{fileID:\s*(-?\d+),\s*"
+            r"guid:\s*([0-9a-fA-F]+)", raw)
+        pim = re.search(
+            r"(?m)^\s+m_PrefabInstance:\s*\{fileID:\s*(\d+)\}", raw)
+        if not cso or not pim:
+            continue
+        stripped_by_inst.setdefault(pim.group(1), []).append({
+            "scene_xf": str(fid),
+            "src_xf": cso.group(1),
+            "guid": cso.group(2).lower(),
+            "rec": rec,
+        })
+
+    for inst_id, stubs in stripped_by_inst.items():
+        inst = by_id.get(inst_id)
+        if not inst or inst.get("kind") != "PrefabInstance":
+            continue
+        inst_raw = inst.get("raw") or ""
+        father_id = inst.get("father_id")
+        for stub in stubs:
+            xf_id = stub["scene_xf"]
+            if xf_id in existing_xf:
+                continue
+            path = asset_guids.get(stub["guid"])
+            if not path or not str(path).lower().endswith(".prefab"):
+                continue
+            if not os.path.isfile(path):
+                continue
+            try:
+                pref_objs, _l, _c, _h = _parsed_prefab_objects(
+                    path, guid_to_script, asset_guids)
+            except Exception:
+                continue
+            src = next(
+                (o for o in pref_objs
+                 if str(o.get("xf_id")) == stub["src_xf"]),
+                None)
+            if src is None:
+                # Prefab root often matches first object with a rect.
+                src = next((o for o in pref_objs if o.get("rect")), None)
+            if src is None:
+                continue
+            mods = _prefab_mod_values(inst_raw, stub["src_xf"])
+            # m_IsActive targets the prefab GameObject fileID, not the RT.
+            go_mods = {}
+            go_src = src.get("go_id")
+            if go_src:
+                go_mods = _prefab_mod_values(inst_raw, go_src)
+            rect, scale = _apply_rect_property_mods(
+                src.get("rect"),
+                src.get("local_scale") or src.get("scale") or (1, 1, 1),
+                mods)
+            active = int(src.get("active", 1))
+            if "m_IsActive" in go_mods:
+                try:
+                    active = int(float(go_mods["m_IsActive"]))
+                except ValueError:
+                    pass
+            name = src.get("name") or "Prefab"
+            # Prefer authored GO name overrides if present.
+            if "m_Name" in go_mods and go_mods["m_Name"]:
+                name = go_mods["m_Name"]
+            # Disambiguate duplicate prefab roots (many "UI Button") so
+            # go_names / go_parents stay 1:1 with xf_id.
+            base = name.split("<", 1)[0]
+            name = "%s<%s>" % (base, xf_id)
+            ui_image = dict(src["ui_image"]) if src.get("ui_image") else None
+            ui_image = _apply_ui_image_sprite_mod(
+                ui_image, inst_raw, asset_guids)
+            ui_button = dict(src["ui_button"]) if src.get("ui_button") else None
+            obj = {
+                "name": name,
+                "pos": src.get("pos") or (0.0, 0.0, 0.0),
+                "rot": src.get("rot") or (0.0, 0.0, 0.0, 1.0),
+                "local_pos": src.get("local_pos") or (0.0, 0.0, 0.0),
+                "local_rot": src.get("local_rot") or (0.0, 0.0, 0.0, 1.0),
+                "local_scale": scale,
+                "scale": scale,
+                "father_id": father_id,
+                "xf_id": xf_id,
+                "go_id": "prefabinst:%s:%s" % (inst_id, xf_id),
+                "active": 1 if active else 0,
+                "fields": {},
+                "script": None,
+                "class": "_Rect",
+                "sprite": None,
+                "canvas": None,
+                "rect": rect,
+                "ui_image": ui_image,
+                "ui_button": ui_button,
+                "ui_tmp": None,
+                "layout_group": None,
+                "layout_element": (
+                    dict(src["layout_element"])
+                    if src.get("layout_element") else None),
+                "content_size_fitter": None,
+                "aspect_ratio_fitter": None,
+                "rigidbody2d": None,
+                "rigidbody": None,
+                "collider2d": None,
+                "collider3d": None,
+                "anim_player": None,
+                "ui_scaffold": False,
+                "prefab_instance": True,
+            }
+            objects.append(obj)
+            hierarchy.append({
+                "name": name,
+                "xf_id": xf_id,
+                "father_id": father_id,
+                "go_id": obj["go_id"],
+                "active": 1 if active else 0,
+                "has_canvas": False,
+                "has_image": bool(ui_image),
+                "has_button": bool(ui_button),
+                "has_tmp": False,
+            })
+            existing_xf.add(xf_id)
+            # Also stash rect onto the stripped Transform for any other walks.
+            stub["rec"]["rect"] = dict(rect)
+            stub["rec"]["scale"] = scale
+            if father_id:
+                stub["rec"]["father_id"] = father_id
+
 
 def parse_godot_tscn(text):
     """Godot .tscn nodes with a script class name and exported numbers."""
