@@ -23,11 +23,20 @@
 //     owners[heap] - 1 == tid`: `tid + 1` overflows at `u32::MAX`.
 //   * In `contains`, `addr < base + size` is `addr - base < size`, which
 //     is the same comparison once `base <= addr`, and cannot overflow.
+//   * In `bump`, the test `used + n <= size` is `n <= size && used <=
+//     size - n`: the same answer wherever `used + n` fits, and the only
+//     honest one where it does not.  The first port evaluated `used + n`
+//     to decide whether it fitted, so `used = n = 2^63` wrapped to 0,
+//     passed, and returned 0 -- which Crust's runtime check caught as
+//     `ensures used <= result` violated.  The safety lift had named the
+//     same addition as an open obligation; it was open because it was
+//     false.
+//   * In `slot_ok`, an address past `u64::MAX` is in no region, so it
+//     answers 0 before forming one.  `slot_addr` cannot answer anything
+//     but an address, so it asks its caller for that fact instead.
 //
-// What is still owed: `bump`'s `used + n`. It fits whenever the guard
-// admits it -- `used + n <= size`, and a size is a `u64` -- but saying so
-// takes arithmetic the proof kernel's tactics do not yet do. The safety
-// lift names it, and the test records it as the one open obligation.
+// Nothing is owed: every obligation the safety lift states is proved, and
+// the proofs are checked again by Lean 4.
 
 pub fn contains(bases: &[u64], sizes: &[u64], i: usize, addr: u64) -> u32 {
     if i >= bases.len() {
@@ -55,7 +64,7 @@ pub fn bump(bases: &[u64], sizes: &[u64], owners: &[u32], tid: u32,
             heap: usize, used: u64, n: u64) -> u64 {
     if heap < bases.len() && heap < owners.len() && heap < sizes.len() {
         if owners[heap] >= 1 && owners[heap] - 1 == tid {
-            if used + n <= sizes[heap] {
+            if n <= sizes[heap] && used <= sizes[heap] - n {
                 return used + n;
             }
         }
@@ -63,8 +72,11 @@ pub fn bump(bases: &[u64], sizes: &[u64], owners: &[u32], tid: u32,
     used
 }
 
-// The address `used` bytes into region `heap`.
+// The address `used` bytes into region `heap`.  The caller knows the slot
+// is inside the region, and the memory map places every region below
+// `u64::MAX`; that is what the second clause asks.
 #[requires(heap < bases.len())]
+#[requires(bases[heap] <= u64::MAX - used)]
 pub fn slot_addr(bases: &[u64], heap: usize, used: u64) -> u64 {
     bases[heap] + used
 }
@@ -73,6 +85,9 @@ pub fn slot_addr(bases: &[u64], heap: usize, used: u64) -> u64 {
 #[ensures(result <= 1)]
 pub fn slot_ok(bases: &[u64], sizes: &[u64], heap: usize, used: u64) -> u32 {
     if heap >= bases.len() {
+        return 0;
+    }
+    if bases[heap] > u64::MAX - used {
         return 0;
     }
     if contains(bases, sizes, heap, bases[heap] + used) == 1 {
