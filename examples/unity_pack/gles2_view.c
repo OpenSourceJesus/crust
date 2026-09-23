@@ -39,8 +39,12 @@ float Camera_main_background_b __attribute__((weak)) = 0.f;
 
 #define WIDTH  96
 #define HEIGHT 64
-#define MAX_DRAWS 64
-#define MAX_TEX 32
+#ifndef MAX_DRAWS
+#define MAX_DRAWS 512
+#endif
+#ifndef MAX_TEX
+#define MAX_TEX 512
+#endif
 #define VERT_STRIDE 8
 #define MAX_FLOATS (6 * VERT_STRIDE)
 
