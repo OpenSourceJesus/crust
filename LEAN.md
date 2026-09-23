@@ -457,8 +457,76 @@ obligation fails it.
 of an array where the compiled C reads out of bounds. The port has no such
 read, and the obligations are the proof of that.
 
+### Loops
+
+A loop's four obligations -- the invariant holds on entry, a guarded pass
+keeps it, the variant comes down, the loop finishes -- are the ones
+`read_procedure` has always stated. `hoare.by_loop` discharges them: each by
+`by_bounds`, the pass and the variant after `by_state` splits the loop's
+state tuple into named fields. The invariant at exit and the failed loop
+condition are then two facts, and the postcondition is proved with them.
+
+The invariant is the one written on the `while`, with one change
+`rustprove` makes for the proof, not the theorem. An early `return` is
+lowered as state (`_returned`, `_return_value`), and the lowered loop keeps
+iterating with the returned value frozen, so the written `X` is used as
+`_returned or X`, with `not _returned or post(_return_value)` for a contract
+and `_returned or _ok` for a panic obligation. The function's definition
+and the theorem's statement never mention the invariant. An invariant too
+weak for the goal is not strengthened beyond that: the goal stays open.
+
+Inside a loop, only the invariant and the loop condition are known, so an
+invariant restates what was checked before the loop:
+
+```rust
+if sizes.len() < bases.len() { return 0; }
+let mut i: usize = 0;
+#[invariant(i <= bases.len() && bases.len() <= sizes.len())]
+#[variant(bases.len() - i)]
+while i < bases.len() { ... sizes[i] ... }
+```
+
+### The rest of LeanOS
+
+`leanos/memmap.rs`, `elfcheck.rs`, `threads.rs` and `loader.rs` are ports
+of the rpython files of the same names, held to them as `alloc.rs` is:
+every function lifts, every obligation is proved (none open), every
+certificate is accepted by Lean 4, and compiled by Crust each answers as
+its Python does over the Python model test's own corpus
+(`tests/test_leanos_rust.py`).
+
+A file that calls into another says so: `// uses: memmap.rs`.
+`rustprove.load_unit` appends the used files *after* the file, so its own
+line numbers -- the ones obligations name -- stay exact, and only its own
+functions are reported and certified.
+
+Where the ports differ from the Python, it is where the Python's integers
+pass 2^64: every `base + size` and `vaddr + memsz` there can wrap in a
+`u64`, and each is the checked form here (`bases[i] - bases[i - 1] <
+sizes[i - 1]` behind `bases[i - 1] <= bases[i]`). A load running past the
+top of the address space is refused, where the Python accepts it. Owners
+are `usize` (a thread id is also an index; `alloc.rs` keeps `u32`), and
+`loader.rs` reads `bases ++ vaddrs` in place rather than building it.
+
+These contracts are the theorems RosettaMath had proved only about
+hand-typed models, now about the lifted source: `reg_class_sized` and
+`accept_sized` (`elfcheck.rs`), `push_keeps_sp_ok` (`sp_after_push`),
+`admit_accepts` and `admit_disjoint` (`admit`).
+
+A limit a clause names reaches every place it must. `requires(tid <
+usize::MAX)` is lifted into `thread_owner__pre` with `max_u64` as a
+parameter, and each caller passes its own. A function whose clause names a
+limit (`invariant(n <= usize::MAX)`) has its model state the Rust ranges
+for that width, as the safety lift does; its theorems gain hypotheses every
+Rust call meets. Functions whose clauses name no limit are unchanged.
+
 ### Known gaps
 
+- **The theorems about pairs.** That a disjoint region list has no two
+  overlapping regions (`regions_pairwise_disjoint`), and that an address
+  belongs to at most one owner (`region_of_unique`), are quantified over
+  positions; RosettaMath proves them about hand-typed models, and the
+  ports' contracts do not reach them yet.
 - **Arithmetic beyond chains.** `by_bounds` chains `<=` through addition, a
   checked subtraction and a slice's range. Nothing about `*` is proved, and
   an addition that fits only because the maximum is large stays open (see
@@ -467,7 +535,5 @@ read, and the obligations are the proof of that.
   `requires(c.n < c.cap)` and `ensures(c.n <= c.cap)` is not proved: the
   hypothesis is not carried across `Counter.n (with_n c v)` reducing to `v`.
   A test asserts it is still open, and Crust checks both clauses at runtime.
-- **A callee's `requires` naming `u64::MAX`** reaches its callers through
-  `name__pre`, which is lifted as the model is, with the literal, not the
-  symbol. A caller's obligation to meet it is therefore not provable yet;
-  none in `leanos/` has one.
+- **Functions returning a list** (`extended`, `claimed` in `loader.py`) are
+  refused by the lift; `loader.rs` does without them.
