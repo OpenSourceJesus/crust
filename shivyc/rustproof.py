@@ -86,6 +86,7 @@ _PROBE = "__probe__"
 # Rust's unsigned integers and their widths; all are Nat in the fragment.
 _UNSIGNED = {"u8": 8, "u16": 16, "u32": 32, "u64": 64, "u128": 128,
              "usize": 64}
+_USIZE = _UNSIGNED["usize"]
 _SIGNED = ("i8", "i16", "i32", "i64", "i128", "isize")
 
 # Names a lifted variable must not take: Python's keywords, and the names
@@ -116,6 +117,7 @@ class Lifted:
         self.callees = callees          # lifted functions it calls
         self.records = []               # [(struct, [(field, type name)])]
         self.pre_source = None          # `name__pre`, if it has `requires`
+        self.pre_maxes = []             # the `max_uN` `name__pre` takes
         self.obligations = []           # labels, in the order they arise
         self.unit = None
 
@@ -211,7 +213,8 @@ def signatures(lifted):
             out[callee.name] = ([t for _, t in callee.params], callee.ret)
             if callee.pre_source is not None:
                 out[callee.name + "__pre"] = (
-                    [t for _, t in callee.params], "Bool")
+                    [t for _, t in callee.params]
+                    + ["Nat"] * len(callee.pre_maxes), "Bool")
     return out
 
 
@@ -324,6 +327,11 @@ class _FnLifter:
         # and in a clause lifted for it, so a `requires` guarding the body
         # speaks of the bound the obligations name.
         self.symbolic_max = safety
+        # Widths whose `uN::MAX` a contract clause names in the model lift:
+        # the model then states the Rust ranges for that width too, so a
+        # clause like `n <= usize::MAX` is about values that are in range.
+        self.clause_limits = []
+        self.in_clause = False
         self.state = None               # (rust name, fragment, _Ty) of `&mut`
         self.i = self._attrs_start(unit.fn_index[name])
         self.lines = []
@@ -509,11 +517,20 @@ class _FnLifter:
         # Preconditions first: the fragment reads leading `assert`s as the
         # precondition, which is what `#[requires]` is.
         requires = []
+        # `name__pre`, which a caller's safety lift calls, reads each clause
+        # again with `uN::MAX` as the symbol, taken as a parameter: the caller
+        # passes its own `max_uN`, so a `requires(tid < usize::MAX)` means the
+        # bound the caller's range facts are stated against.
+        pre_requires, pre_maxes = [], []
         for kind, toks, line in clauses:
             if kind == "requires":
                 requires.append(self.clause(toks, line, None))
                 if not self.safety:
                     self.emit("assert %s" % requires[-1])
+                    saved = self.symbolic_max, self.maxes
+                    self.symbolic_max, self.maxes = True, pre_maxes
+                    pre_requires.append(self.clause(toks, line, None))
+                    self.symbolic_max, self.maxes = saved
         range_at = len(self.lines)
         if self.safety:
             self.emit("_ok = True")
@@ -552,14 +569,36 @@ class _FnLifter:
                 if ty.kind == "nat" and ty.width in self.maxes:
                     ranges.append("    assert (%s <= %s)"
                                   % (frag, _max(ty.width)))
-                elif ty.kind == "arr" and ty.width in self.maxes:
+                if ty.kind == "arr" and ty.width in self.maxes:
                     # and so is every element of a slice of them: without
                     # this, `xs[i] + 1` could not be bounded even behind a
                     # guard that compares it with another element.
                     ranges.append("    assert (all_le(%s, %s))"
                                   % (frag, _max(ty.width)))
+                if ty.kind == "arr" and _USIZE in self.maxes:
+                    # and a slice's length is a `usize`: what bounds a
+                    # counter `i + 1` behind `i < xs.len()`
+                    ranges.append("    assert (len(%s) <= %s)"
+                                  % (frag, _max(_USIZE)))
             self.lines[range_at:range_at] = ranges
             extra = [(_max(w), _Ty("nat", w)) for w in sorted(self.maxes)]
+        elif not self.safety and self.clause_limits:
+            # A clause named `uN::MAX`: the model states the same ranges the
+            # safety lift does, against the number.  They are hypotheses of
+            # every theorem about this function, and true of every Rust call.
+            lit = lambda w: str((1 << w) - 1)
+            ranges = []
+            for frag, ty in params:
+                if ty.kind == "nat" and ty.width in self.clause_limits:
+                    ranges.append("    assert (%s <= %s)" % (frag,
+                                                            lit(ty.width)))
+                if ty.kind == "arr" and ty.width in self.clause_limits:
+                    ranges.append("    assert (all_le(%s, %s))"
+                                  % (frag, lit(ty.width)))
+                if ty.kind == "arr" and _USIZE in self.clause_limits:
+                    ranges.append("    assert (len(%s) <= %s)"
+                                  % (frag, lit(_USIZE)))
+            self.lines[range_at:range_at] = ranges
         name = self.name + ("__safe" if self.safety else "")
         head = "def %s(%s) -> '%s':" % (
             name, ", ".join("%s: '%s'" % (n, t.frag())
@@ -576,11 +615,13 @@ class _FnLifter:
                 used.append(t.name)
         out.records = [(r, [(f, ft.frag()) for f, ft in
                             self.unit.structs[r]]) for r in used]
-        if requires:
+        if requires and not self.safety:
+            out.pre_maxes = list(pre_maxes)
             out.pre_source = "def %s__pre(%s) -> 'Bool':\n    return %s\n" % (
-                self.name, ", ".join("%s: '%s'" % (n, t.frag())
-                                     for n, t in params),
-                " and ".join(requires))
+                self.name, ", ".join(
+                    ["%s: '%s'" % (n, t.frag()) for n, t in params] +
+                    ["%s: 'Nat'" % _max(w) for w in pre_maxes]),
+                " and ".join(pre_requires))
         return out
 
     def attributes(self):
@@ -672,6 +713,7 @@ class _FnLifter:
         sub = _FnLifter(self.unit, self.name)
         sub.used, sub.callees, sub.lines = self.used, self.callees, self.lines
         sub.symbolic_max, sub.maxes = self.symbolic_max, self.maxes
+        sub.clause_limits, sub.in_clause = self.clause_limits, True
         sub.indent = self.indent
         state = self.state if ret is not None else None
         sub.toks = list(_strip_old(toks, mutable, self, state)) + \
@@ -1466,6 +1508,8 @@ class _FnLifter:
         if which != "MAX":
             self.fail("`%s::%s` is not lifted" % (prim, which))
         if not self.symbolic_max:
+            if self.in_clause and width not in self.clause_limits:
+                self.clause_limits.append(width)
             return str((1 << width) - 1), _Ty("nat", width)
         if width not in self.maxes:
             self.maxes.append(width)
@@ -1534,8 +1578,15 @@ class _FnLifter:
             self.callees.append(callee)
         text = ", ".join(e for e, _ in args)
         if callee.pre_source is not None:
-            # A call owes its callee's `#[requires]`.
-            self.side("%s__pre(%s)" % (fname, text),
+            # A call owes its callee's `#[requires]`, at the caller's own
+            # `max_uN` for each limit the clause names.
+            limits = []
+            for w in callee.pre_maxes:
+                if self.safety and w not in self.maxes:
+                    self.maxes.append(w)
+                limits.append(_max(w))
+            self.side("%s__pre(%s)" % (fname, ", ".join(
+                          ([text] if text else []) + limits)),
                       "`%s`'s `#[requires]`" % fname)
         if callee.ret == "Bool":
             ret = _BOOL
