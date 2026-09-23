@@ -300,7 +300,7 @@ class TestRegsContracts(unittest.TestCase):
         sys.path.insert(0, ROSETTAMATH)
         cls.ok, _ = lift_all(_source(REGS))
 
-    def _prove(self, name, ensures=None):
+    def _prove(self, name, ensures=None, tactic="by_every_bool"):
         import hoare
         lifted = self.ok[name]
 
@@ -314,8 +314,8 @@ class TestRegsContracts(unittest.TestCase):
                        for k, v in signatures(lifted).items()}
                 proc = hoare.read_procedure(lifted.source, env, sig, ensures)
             try:
-                hoare.by_every_bool(env, proc.obligation,
-                                    unfolding=set(procs))
+                getattr(hoare, tactic)(env, proc.obligation,
+                                       unfolding=set(procs))
                 return True
             except hoare.TheoremError:
                 return False
@@ -326,21 +326,28 @@ class TestRegsContracts(unittest.TestCase):
 
     def test_a_false_bound_is_refused(self):
         self.assertFalse(self._prove("elf_regs_for_class", ["result <= 15"]))
+        self.assertFalse(self._prove("elf_regs_for_class", ["result <= 15"],
+                                     tactic="by_bounds"))
+        self.assertFalse(self._prove("class_for_regs", ["result <= 2"],
+                                     tactic="by_bounds"))
 
     def test_class_for_regs_ensures_is_proved(self):
         self.assertTrue(self._prove("class_for_regs"))
 
-    def test_class_covers_is_not_yet_proved(self):
-        """A known gap, asserted so that closing it cannot go unnoticed.
+    def test_class_covers_is_proved_by_bounds(self):
+        """Once a known gap, pinned so that closing it could not go
+        unnoticed; it closed on purpose.
 
         `class_covers` composes the two functions, and its postcondition
-        needs `n <= 6` to give `6 >= n` -- reasoning about the range a guard
-        establishes, which `by_every_bool` (split, then compute) does not
-        do.  Until it does, the corpus below stands in: the compiled
-        function, with its `ensures` checked at runtime, over every `n` its
-        `requires` admits.
+        needs `n <= 6` to give `6 >= n` -- the range a guard establishes.
+        `by_every_bool` (split, then compute) forgets what a guard said, and
+        still cannot; `by_bounds` keeps it, and the `requires` `n <= 23`
+        covers the last arm.  The corpus stays as a second witness: the
+        compiled function, its `ensures` checked at runtime, over every `n`
+        its `requires` admits.
         """
         self.assertFalse(self._prove("class_covers"))
+        self.assertTrue(self._prove("class_covers", tactic="by_bounds"))
         got = _compile_and_print(_source(REGS),
                                  ["class_covers(%d) as u32" % n
                                   for n in range(24)])
@@ -586,17 +593,13 @@ class TestRecordsProofs(unittest.TestCase):
 # checked against the original row for row.
 from tests.test_alloc_model import CORPUS, _python, B, S, O  # noqa: E402
 
-# The obligations of alloc.rs the kernel does not settle.  Every one is a
-# `u64` addition: it fits whenever the surrounding code admits it, but
-# saying so is arithmetic about the maximum, which splitting and computing
-# does not do.  A new open obligation fails this test, and so does closing
-# one of these, so neither can happen quietly.
-ALLOC_OPEN = {
-    ("bump", "`+` may overflow u64 (line 58)"),
-    ("bump", "`+` may overflow u64 (line 59)"),
-    ("slot_addr", "`+` may overflow u64 (line 70)"),
-    ("slot_ok", "`+` may overflow u64 (line 78)"),
-}
+# The obligations of alloc.rs the kernel does not settle: none.  There were
+# four, all `u64` additions.  One (`return used + n`) held and needed
+# `by_bounds`; the other three were false -- `used + n` evaluated in order to
+# test whether it fitted, and `bases[heap] + used` twice with nothing
+# bounding it -- and the source was fixed.  A new open obligation fails this
+# test, so one cannot appear quietly.
+ALLOC_OPEN = set()
 
 
 def _alloc_calls(row):
@@ -664,8 +667,10 @@ class TestAllocProofs(unittest.TestCase):
         self.assertTrue(self.prover.contract("slot_ok"))
 
     def test_bump_bounded(self):
-        """alloc_eq.py's `bump_bounded`, proved the way alloc_eq.py proves
-        it -- but about the model lifted from alloc.rs, not a hand copy."""
+        """alloc_eq.py's `bump_bounded` -- `used <= size` gives `bump <=
+        size` -- about the model lifted from alloc.rs, not a hand copy.
+        The checked guard `n <= size && used <= size - n` is what makes the
+        bumped value fit, so `by_bounds` chains `add_le_of_le_sub`."""
         H, L, p = self.prover.H, self.prover.L, self.prover
         lifted = p.lifted["bump"]
 
@@ -676,20 +681,27 @@ class TestAllocProofs(unittest.TestCase):
             size = H.app("nth", H.NAT, L.numeral(0), V("sizes"), V("heap"))
             bumped = H.app("bump", V("bases"), V("sizes"), V("owners"),
                            V("tid"), V("heap"), V("used"), V("n"))
-            opened = H.unfold(bumped, env, {"bump"})
             hyp = H.app("Holds", H.app("leb", V("used"), size))
-            goal = H.app("Holds", H.app("leb", opened, size))
-            proof = H.bound_by_ites_or_guards(env, goal, V("h"), hyp)
             stmt = H.arrow(hyp, H.app("Holds", H.app("leb", bumped, size)))
-            term = L.Lambda("h", hyp, proof)
             params = [("bases", H.BYTES), ("sizes", H.BYTES),
                       ("owners", H.BYTES), ("tid", H.NAT), ("heap", H.NAT),
                       ("used", H.NAT), ("n", H.NAT)]
             for name, ty in reversed(params):
-                stmt, term = L.Pi(name, ty, stmt), L.Lambda(name, ty, term)
-            H.prove(stmt, term, env, verbose=False)
+                stmt = L.Pi(name, ty, stmt)
+            H.by_bounds(env, stmt, unfolding={"bump"})
             return True
         self.assertTrue(_in_big_stack(work))
+
+    def test_the_overflow_that_was_a_bug(self):
+        """The input that broke the first port: `used + n` wrapped to 0,
+        passed the guard, and `ensures used <= result` failed at runtime.
+        The checked guard refuses it and hands back `used`."""
+        half = 1 << 63
+        got = _compile_and_print(_source(ALLOC), [
+            "bump(&[0u64][..], &[100u64][..], &[1u32][..], 0, 0, %du64, %du64)"
+            % (half, half),
+            "slot_ok(&[18446744073709551615u64][..], &[4u64][..], 0, 1)"])
+        self.assertEqual(got, [half, 0])
 
     def test_only_the_overflow_obligations_are_open(self):
         open_now = set()
@@ -698,6 +710,68 @@ class TestAllocProofs(unittest.TestCase):
                 if not ok:
                     open_now.add((name, label))
         self.assertEqual(open_now, ALLOC_OPEN)
+
+
+@unittest.skipUnless(ROSETTAMATH, "RosettaMath not found; run 'make install_proofs'")
+class TestCertificates(unittest.TestCase):
+    """Every obligation the prover settles is kept, so that a second kernel
+    can be asked about it; nothing it does not settle is."""
+
+    @classmethod
+    def setUpClass(cls):
+        import rustprove
+        cls.prover = rustprove.Prover(_source(ALLOC))
+        cls.open = set()
+        for name in sorted(cls.prover.lifted):
+            fn = cls.prover.lifted[name]
+            if fn.ensures and not cls.prover.contract(name):
+                cls.open.add((name, "ensures"))
+            for label, ok in cls.prover.safety(name):
+                if not ok:
+                    cls.open.add((name, label))
+
+    def test_one_certificate_per_settled_obligation(self):
+        total = sum(len(f.obligations) + bool(f.ensures)
+                    for f in self.prover.lifted.values())
+        self.assertEqual(len(self.prover.certificates),
+                         total - len(self.open))
+        kept = {(c.function, c.label) for c in self.prover.certificates}
+        self.assertFalse(kept & self.open)
+        keys = [c.key for c in self.prover.certificates]
+        self.assertEqual(len(keys), len(set(keys)))
+
+    def test_asking_twice_keeps_one(self):
+        before = len(self.prover.certificates)
+        self.assertTrue(self.prover.contract("bump"))
+        self.assertEqual(len(self.prover.certificates), before)
+
+    def test_names_are_unique(self):
+        names = [c.name for c in self.prover.certificates]
+        self.assertEqual(len(names), len(set(names)))
+
+    def test_each_certificate_rechecks_in_its_own_environment(self):
+        """The kept term is the checked one: type_check it again, from
+        scratch, against the kept statement."""
+        L = self.prover.L
+
+        def work():
+            for c in self.prover.certificates:
+                got = L.type_check(c.env, c.proof)
+                self.assertTrue(L.definitionally_equal(got, c.statement,
+                                                       c.env), c.name)
+            return True
+        self.assertTrue(_in_big_stack(work))
+
+    @unittest.skipUnless(LEAN, "lean not on PATH")
+    def test_lean_agrees_with_every_certificate(self):
+        import rustlean
+        out = tempfile.mkdtemp()
+        verdicts = _in_big_stack(
+            lambda: rustlean.check(self.prover.certificates, out, lean=LEAN))
+        refused = [(v.name, v.output[-500:]) for v in verdicts
+                   if not v.agreed]
+        self.assertEqual(refused, [])
+        self.assertEqual(len(verdicts), len(self.prover.certificates))
 
 
 if __name__ == "__main__":
