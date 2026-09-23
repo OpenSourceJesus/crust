@@ -260,19 +260,37 @@ HeightControlsWidth / FitInParent / EnvelopeParent) adjusts size or stretch
 anchors to enforce `m_AspectRatio`. Unity builtin UISprites (`guid` in
 `unity_builtin_extra`) bake a rounded white sprite; `Image.type = Sliced`
 9-slices with fixed corner borders (Simple stretches). Authored project
-PNG UI sprites use `.meta` `spriteBorder` the same way. Authored
+PNG UI sprites use `.meta` `spriteBorder` the same way. When
+`TextureImporter.spriteMode` is Multiple, each Image/SpriteRenderer
+`m_Sprite` fileID selects a `spriteSheet` rect (`internalID`) and only that
+crop is packed — otherwise every slice would stretch the whole atlas (e.g.
+Settings Menu Full appearing many times on Main Menu). Authored
+`Image.preserveAspect` (Simple type) fits the sprite inside the RectTransform
+instead of stretching to fill (Unity GenerateSimpleSprite). RectTransform
+`localScale` on an object and its ancestors accumulates into baked UI screen
+rects (e.g. a VerticalLayoutGroup scaled to 0.59 shrinks children and TMP
+like Unity Canvas space). Authored
 `TextMeshProUGUI` draws when `m_fontAsset` resolves (Assets or Packages /
 PackageCache): SDF atlas + glyph tables bake `m_text` into a UI sprite
 tinted by `m_fontColor`. Button `m_OnClick` persistent `SetActive` calls
 fire on host pointer press (`engine_pointer_x/y/down`, screen space, origin
-bottom-left); inactive parents hide children (`activeInHierarchy`).
-`Awake` runs once before `Start` so authored `gameObject.SetActive(false)`
-(e.g. SettingsMenu) hides UI before the first draw. Canvas
-sorting layer/order apply to child Images/Buttons; TMP sorts one order
-above its Canvas. EventSystem / GraphicRaycaster / legacy `UI.Text` /
-`GridLayoutGroup` are not imported.
+bottom-left); inactive parents hide children (`activeInHierarchy`). Authored
+`m_IsActive: 0` seeds `_engine_go_active` at load (not forced on).
+Stripped `PrefabInstance` roots (e.g. UI Button prefabs) are hydrated from
+the source `.prefab` + modifications so TMP children and layout groups see
+real RectTransforms instead of full-screen fallbacks. Authored `m_Sprite`
+`objectReference` overrides on those instances supply Image sprites when the
+prefab default is null. `Awake` runs once before `Start` so
+authored `gameObject.SetActive(false)` (e.g. SettingsMenu) hides UI before
+the first draw. Canvas sorting layer/order apply to child Images/Buttons;
+TMP sorts one order above its Canvas. EventSystem / GraphicRaycaster /
+legacy `UI.Text` / `GridLayoutGroup` are not imported.
 `AddComponent<Canvas>` / `typeof(Canvas)` / `ForceUpdateCanvases`
 remain refused (no invent); `using UnityEngine.UI` and Image fields are fine.
+
+The GLES hosts (`gles2_window.c` / `gles2_view.c`) accept up to 512 draws and
+512 textures by default (`MAX_DRAWS` / `MAX_TEX`) so large UI menus are not
+silently truncated.
 
 Asset GUIDs resolve under `Assets/`, `Packages/`, and
 `Library/PackageCache/` (UPM). Only `Assets/**/*.cs` become packed

@@ -2919,6 +2919,24 @@ def _bake_stretched_rgba(src, sw, sh, dst_w, dst_h):
     return dw, dh, bytes(out)
 
 
+def _fit_preserve_aspect(rw, rh, src_w, src_h):
+    """Fit sprite into rect keeping aspect (Unity Image.preserveAspect).
+
+    Returns (fit_w, fit_h) in the same units as *rw*/*rh*. The fitted quad is
+    centered in the RectTransform (Unity GenerateSimpleSprite).
+    """
+    rw = abs(float(rw))
+    rh = abs(float(rh))
+    sw = float(src_w)
+    sh = float(src_h)
+    if rw < 1e-6 or rh < 1e-6 or sw < 1e-6 or sh < 1e-6:
+        return rw, rh
+    if rw / rh > sw / sh:
+        # Rect wider than sprite → height-limited.
+        return rh * (sw / sh), rh
+    return rw, rw * (sh / sw)
+
+
 def _sprite_border_from_meta(path):
     """PNG .meta spriteBorder {x,y,z,w} → (left, bottom, right, top)."""
     meta = path + ".meta"
@@ -2942,6 +2960,8 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None):
     the main ortho camera frustum. World Space (2) is not supported yet.
     Project PNG sprites and Unity builtin UISprites draw; Image.type Sliced
     9-slices with sprite borders (UISprite corners stay fixed). Authored
+    ``m_PreserveAspect`` on Simple Images fits the sprite inside the
+    RectTransform (Unity GenerateSimpleSprite) instead of stretching.
     Empty m_Sprite is skipped (no invent). TMP needs an authored font asset
     with atlas + glyph tables.
     """
@@ -3077,8 +3097,14 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None):
                 continue
             src_w, src_h, src_rgba, border = loaded
             tex_path = path
-        # Sliced (1): 9-slice fills the rect. Simple (0): stretch to fill.
+        # Sliced (1): 9-slice fills the rect. Simple (0): stretch, or
+        # preserveAspect-fit inside the rect (Unity Image.preserveAspect).
         draw_w, draw_h = abs(float(rw)), abs(float(rh))
+        preserve = bool(int(ui.get("preserve_aspect") or 0))
+        if (img_type != 1 and preserve
+                and src_w > 0 and src_h > 0 and draw_w > 1e-6 and draw_h > 1e-6):
+            draw_w, draw_h = _fit_preserve_aspect(
+                draw_w, draw_h, src_w, src_h)
         if img_type == 1 and any(b > 0 for b in border):
             tw, th, rgba = _bake_sliced_rgba(
                 src_rgba, src_w, src_h, border, rw, rh, ppu_mul)
@@ -3092,6 +3118,7 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None):
         extra["tex_rgba"] = rgba
         extra["pixels_per_unit"] = 100.0
         extra["border"] = border
+        extra["preserve_aspect"] = 1 if preserve else 0
         _apply_layout(
             o, cx, cy, draw_w, draw_h, canvas, "ui",
             (ui.get("r", 1.0), ui.get("g", 1.0),
@@ -3450,6 +3477,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 ppum = re.search(
                     r"(?m)^\s+m_PixelsPerUnitMultiplier:\s*([0-9.eE+-]+)",
                     block)
+                preserv = re.search(
+                    r"(?m)^\s+m_PreserveAspect:\s*(\d+)", block)
                 has_sprite = False
                 builtin = False
                 sg = None
@@ -3478,6 +3507,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                     "mb_file_id": file_id,
                     # 0 Simple, 1 Sliced, 2 Tiled, 3 Filled
                     "image_type": int(itype.group(1)) if itype else 0,
+                    "preserve_aspect": int(preserv.group(1)) if preserv else 0,
                     "pixels_per_unit_multiplier": (
                         float(ppum.group(1)) if ppum else 1.0),
                 }

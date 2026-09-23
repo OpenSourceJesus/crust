@@ -4786,6 +4786,113 @@ class TestSystems(unittest.TestCase):
         self.assertAlmostEqual(rh, 25.0, places=5)
 
 
+    def test_image_preserve_aspect_fits_inside_rect(self):
+        """m_PreserveAspect: 1 → Simple Image fits sprite aspect in the rect."""
+        # Square rect, 2:1 sprite → width fills, height halves.
+        fw, fh = unity_pack._fit_preserve_aspect(100, 100, 200, 100)
+        self.assertAlmostEqual(fw, 100.0, places=5)
+        self.assertAlmostEqual(fh, 50.0, places=5)
+        # Wide rect, tall sprite → height fills, width shrinks.
+        fw, fh = unity_pack._fit_preserve_aspect(100, 50, 50, 100)
+        self.assertAlmostEqual(fh, 50.0, places=5)
+        self.assertAlmostEqual(fw, 25.0, places=5)
+
+        root = tempfile.mkdtemp(prefix="upack-presasp-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        spr = os.path.join(root, "Assets", "Sprites")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scripts)
+        os.makedirs(spr)
+        os.makedirs(scene)
+        import struct, zlib
+
+        def write_png(path, w, h):
+            def chunk(tag, body):
+                return (struct.pack(">I", len(body)) + tag + body
+                        + struct.pack(">I", zlib.crc32(tag + body) & 0xffffffff))
+            raw = b""
+            for _y in range(h):
+                raw += b"\x00" + (b"\xff\xff\xff\xff" * w)
+            with open(path, "wb") as out:
+                out.write(
+                    b"\x89PNG\r\n\x1a\n"
+                    + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+                    + chunk(b"IDAT", zlib.compress(raw, 9))
+                    + chunk(b"IEND", b""))
+
+        # 64×32 sprite (2:1) into a 200×200 rect with preserveAspect.
+        # Guids must be hex — _asset_guid_map / _guid_map only index [0-9a-f].
+        spr_guid = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+        host_guid = "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"
+        write_png(os.path.join(spr, "wide.png"), 64, 32)
+        with open(os.path.join(spr, "wide.png.meta"), "w") as f:
+            f.write(
+                "guid: " + spr_guid + "\n"
+                "TextureImporter:\n"
+                "  spritePixelsToUnits: 32\n"
+            )
+        with open(os.path.join(scripts, "Host.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Host : MonoBehaviour { void Update() {} }\n"
+            )
+        with open(os.path.join(scripts, "Host.cs.meta"), "w") as f:
+            f.write("guid: " + host_guid + "\n")
+        img = "fe87c0e1cc204ed48ad3b37840f39efc"
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Canvas\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!224 &2\nRectTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_SizeDelta: {x: 0, y: 0}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!223 &3\nCanvas:\n  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n  m_RenderMode: 0\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Icon\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "  - component: {fileID: 13}\n"
+                "--- !u!224 &11\nRectTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Father: {fileID: 2}\n"
+                "  m_AnchorMin: {x: 0.5, y: 0.5}\n"
+                "  m_AnchorMax: {x: 0.5, y: 0.5}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 200, y: 200}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!114 &12\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, guid: " + img + "}\n"
+                "  m_Sprite: {fileID: 21300000, "
+                "guid: " + spr_guid + ", type: 3}\n"
+                "  m_Type: 0\n"
+                "  m_PreserveAspect: 1\n"
+                "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+                "--- !u!114 &13\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: " + host_guid + "}\n"
+            )
+        objs, _a, _l, _c, _h = unity_pack.load_project(root)
+        icon = [o for o in objs if o.get("name") == "Icon"][0]
+        self.assertEqual(icon["ui_image"].get("preserve_aspect"), 1)
+        sp = icon.get("sprite") or {}
+        sw, sh = unity_pack.player_screen(root)
+        # 200×200 rect, 2:1 sprite → draw 200×100.
+        self.assertAlmostEqual(sp["nhw"] * float(sw) * 2.0, 200.0, places=3)
+        self.assertAlmostEqual(sp["nhh"] * float(sh) * 2.0, 100.0, places=3)
+        hit = icon.get("ui_hit") or {}
+        # Hit stays the full RectTransform.
+        self.assertAlmostEqual(hit.get("hw", 0) * 2, 200.0, places=3)
+        self.assertAlmostEqual(hit.get("hh", 0) * 2, 200.0, places=3)
+
+
     def test_canvas_button_draws_and_clicks(self):
         """Authored Canvas + Button (builtin UISprite) → draw + SetActive onClick."""
         objs, _a, _l, cams, _hier = unity_pack.load_project(SYSTEMS)
