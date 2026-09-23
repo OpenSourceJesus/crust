@@ -16,17 +16,25 @@ GetOrAdd into a pre-sized pool.
 
     python3 tools/unity_pack.py <project>
     python3 tools/unity_pack.py <project> -o <outdir>
+    python3 tools/unity_pack.py <project> -o <outdir> --force
 
 Default output is $TMPDIR/<project-folder>/<productName>[.exe], a linked
 player (GLFW window when glfw3 is present, otherwise the headless host).
+Unchanged projects reuse ``outdir/.unity_pack_stamp.json`` (skip emit /
+transpile). Script-only edits reuse ``.unity_pack_scene_cache`` (skip meta /
+scene / sprite reload). ``--force`` always rebuilds.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+import pickle
 import re
 import sys
 import math
+import copy
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -8367,11 +8375,14 @@ def emit_engine(plan, analyses, used_apis):
         p("    char *p;")
         p("    if (!path || !path[0]) return -1;")
         p("    for (p = path + 1; *p; p++) {")
+        # Brace after #endif so both #ifdef arms share one `{` — duplicate
+        # opens across #else break raw brace walks (cpprust _toplevel_start).
         p("#ifdef _WIN32")
-        p("        if (*p == '/' || *p == '\\\\') {")
+        p("        if (*p == '/' || *p == '\\\\')")
         p("#else")
-        p("        if (*p == '/') {")
+        p("        if (*p == '/')")
         p("#endif")
+        p("        {")
         p("            char sep = *p;")
         p("            *p = 0;")
         p("            if (ENGINE_MKDIR(path) != 0 && errno != EEXIST) {")
@@ -8419,10 +8430,11 @@ def emit_engine(plan, analyses, used_apis):
         p("    dir[n] = 0;")
         p("    for (i = n - 1; i >= 0; i--) {")
         p("#ifdef _WIN32")
-        p("        if (dir[i] == '/' || dir[i] == '\\\\') { dir[i] = 0; break; }")
+        p("        if (dir[i] == '/' || dir[i] == '\\\\')")
         p("#else")
-        p("        if (dir[i] == '/') { dir[i] = 0; break; }")
+        p("        if (dir[i] == '/')")
         p("#endif")
+        p("        { dir[i] = 0; break; }")
         p("    }")
         p("    if (dir[0]) _engine_mkdir_p(dir);")
         p("#endif")
@@ -8517,10 +8529,11 @@ def emit_engine(plan, analyses, used_apis):
                 p("    if (!path || !path[0]) return -1;")
                 p("    for (p = path + 1; *p; p++) {")
                 p("#ifdef _WIN32")
-                p("        if (*p == '/' || *p == '\\\\') {")
+                p("        if (*p == '/' || *p == '\\\\')")
                 p("#else")
-                p("        if (*p == '/') {")
+                p("        if (*p == '/')")
                 p("#endif")
+                p("        {")
                 p("            char sep = *p;")
                 p("            *p = 0;")
                 p("            if (ENGINE_MKDIR(path) != 0 && errno != EEXIST) {")
@@ -8548,18 +8561,15 @@ def emit_engine(plan, analyses, used_apis):
             p("            dir[n] = 0;")
             p("            for (i = n - 1; i >= 0; i--) {")
             p("#ifdef _WIN32")
-            p("                if (dir[i] == '/' || dir[i] == '\\\\') {")
-            p("                    dir[i] = 0;")
-            p("                    if (dir[0]) _engine_mkdir_p(dir);")
-            p("                    break;")
-            p("                }")
+            p("                if (dir[i] == '/' || dir[i] == '\\\\')")
             p("#else")
-            p("                if (dir[i] == '/') {")
+            p("                if (dir[i] == '/')")
+            p("#endif")
+            p("                {")
             p("                    dir[i] = 0;")
             p("                    if (dir[0]) _engine_mkdir_p(dir);")
             p("                    break;")
             p("                }")
-            p("#endif")
             p("            }")
             p("        }")
             p("    }")
@@ -8592,18 +8602,15 @@ def emit_engine(plan, analyses, used_apis):
                 p("            dir[n] = 0;")
                 p("            for (i = n - 1; i >= 0; i--) {")
                 p("#ifdef _WIN32")
-                p("                if (dir[i] == '/' || dir[i] == '\\\\') {")
-                p("                    dir[i] = 0;")
-                p("                    if (dir[0]) _engine_mkdir_p(dir);")
-                p("                    break;")
-                p("                }")
+                p("                if (dir[i] == '/' || dir[i] == '\\\\')")
                 p("#else")
-                p("                if (dir[i] == '/') {")
+                p("                if (dir[i] == '/')")
+                p("#endif")
+                p("                {")
                 p("                    dir[i] = 0;")
                 p("                    if (dir[0]) _engine_mkdir_p(dir);")
                 p("                    break;")
                 p("                }")
-                p("#endif")
                 p("            }")
                 p("        }")
                 p("    }")
@@ -8716,18 +8723,15 @@ def emit_engine(plan, analyses, used_apis):
         p("            dir[dn] = 0;")
         p("            for (i = dn - 1; i >= 0; i--) {")
         p("#ifdef _WIN32")
-        p("                if (dir[i] == '/' || dir[i] == '\\\\') {")
-        p("                    dir[i] = 0;")
-        p("                    if (dir[0]) _engine_mkdir_p(dir);")
-        p("                    break;")
-        p("                }")
+        p("                if (dir[i] == '/' || dir[i] == '\\\\')")
         p("#else")
-        p("                if (dir[i] == '/') {")
+        p("                if (dir[i] == '/')")
+        p("#endif")
+        p("                {")
         p("                    dir[i] = 0;")
         p("                    if (dir[0]) _engine_mkdir_p(dir);")
         p("                    break;")
         p("                }")
-        p("#endif")
         p("            }")
         p("        }")
         p("    }")
@@ -8764,18 +8768,15 @@ def emit_engine(plan, analyses, used_apis):
             p("            dir[n] = 0;")
             p("            for (i = n - 1; i >= 0; i--) {")
             p("#ifdef _WIN32")
-            p("                if (dir[i] == '/' || dir[i] == '\\\\') {")
-            p("                    dir[i] = 0;")
-            p("                    if (dir[0]) _engine_mkdir_p(dir);")
-            p("                    break;")
-            p("                }")
+            p("                if (dir[i] == '/' || dir[i] == '\\\\')")
             p("#else")
-            p("                if (dir[i] == '/') {")
+            p("                if (dir[i] == '/')")
+            p("#endif")
+            p("                {")
             p("                    dir[i] = 0;")
             p("                    if (dir[0]) _engine_mkdir_p(dir);")
             p("                    break;")
             p("                }")
-            p("#endif")
             p("            }")
             p("        }")
             p("    }")
@@ -15110,15 +15111,12 @@ def _load_prefab_objects_for_types(root, type_names, guids, assets, typename_map
     return out
 
 
-def load_project(root):
-    root = os.path.abspath(root)
-    if not os.path.isdir(root):
-        raise PackError("not a directory: %s" % root)
-    _progress("scanning %s" % root)
-    _progress("reading .meta guid maps")
-    assets = _asset_guid_map(root)
+def _load_scenes_lights_cameras(root, assets):
+    """Parse scenes / tscn / blender JSON → objects, lights, cameras, hierarchy.
+
+    Does not analyze scripts or load prefab extras. Sprite pixels are attached.
+    """
     guids = _guid_map(root, asset_guids=assets)
-    typename_map = _mb_typename_to_script(root, guids)
     objects = []
     lights = []
     cameras = []
@@ -15141,9 +15139,28 @@ def load_project(root):
         if os.path.basename(path) == "blender_pack.json":
             objects.extend(parse_blender_json(_read(path)))
     sorting_layers = _load_sorting_layers(root)
+    if not objects:
+        raise PackError(
+            "no scene objects found under %s "
+            "(looked for .unity / .tscn / blender_pack.json)" % root)
+    _progress("scene objects=%d lights=%d cameras=%d hierarchy=%d" % (
+        len(objects), len(lights), len(cameras), len(hierarchy)))
+    sw, sh = player_screen(root)
+    _apply_layout_groups(objects, sw, sh)
+    _bake_ui_images(objects, cameras, sw, sh, asset_guids=assets)
+    objects = [o for o in objects if not o.get("ui_scaffold")]
+    _apply_sprite_sorting(objects, sorting_layers)
+    _attach_sprite_textures(objects, assets)
+    return objects, lights, cameras, hierarchy
 
-    # Only analyze MonoBehaviour scripts authored on scene objects — vendor
-    # helpers (e.g. CwHelper) must not refuse the pack via unused usings.
+
+def _analyze_scripts_and_prefabs(root, objects, assets):
+    """Analyze scene scripts; pull missing MB types from prefabs.
+
+    *objects* is extended in place with prefab instances. Returns analyses.
+    """
+    guids = _guid_map(root, asset_guids=assets)
+    typename_map = _mb_typename_to_script(root, guids)
     scene_scripts = set()
     for o in objects:
         sp = o.get("script")
@@ -15161,8 +15178,6 @@ def load_project(root):
             _progress("  scripts %d/%d" % (i + 1, len(scripts)))
         analyses.append(analyze_script(p))
 
-    # GetComponent / field refs to other authored MBs — pull instances from
-    # prefabs and shallow-analyze those scripts (live GO maps, no vendor emit).
     needed = set()
     for a in analyses:
         needed |= set(a.get("getcomponent_types") or [])
@@ -15175,8 +15190,6 @@ def load_project(root):
                 ty = f.get("ty") or ""
                 if ty in typename_map:
                     needed.add(ty)
-            # Base scripts (Weapon for Blaster : Weapon) so GCIC polymorphism
-            # and CS0246 known-set see the authored hierarchy.
             for b in c.get("bases") or []:
                 if b in ("MonoBehaviour", "ScriptableObject", "object",
                          "Object", "System"):
@@ -15196,13 +15209,14 @@ def load_project(root):
         prefab_objs = _load_prefab_objects_for_types(
             root, set(missing), guids, assets, typename_map)
         objects.extend(prefab_objs)
+        _attach_sprite_textures(prefab_objs, assets)
         for t in missing:
             sp = typename_map[t]
             if any(os.path.abspath(a.get("path") or "") == sp for a in analyses):
                 continue
             a = analyze_script(sp, shallow=True)
             for c in a.get("classes") or []:
-                c["methods"] = []  # pack type + instances; don't lower Fracture
+                c["methods"] = []
             a["apis"] = set()
             a["getcomponent_types"] = set()
             a["getcomponentsinchildren_types"] = set()
@@ -15230,18 +15244,25 @@ def load_project(root):
                 "literals": [],
             })
             have.add(o["class"])
-    if not objects:
-        raise PackError(
-            "no scene objects found under %s "
-            "(looked for .unity / .tscn / blender_pack.json)" % root)
-    _progress("scene objects=%d lights=%d cameras=%d hierarchy=%d" % (
-        len(objects), len(lights), len(cameras), len(hierarchy)))
-    sw, sh = player_screen(root)
-    _apply_layout_groups(objects, sw, sh)
-    _bake_ui_images(objects, cameras, sw, sh, asset_guids=assets)
-    objects = [o for o in objects if not o.get("ui_scaffold")]
-    _apply_sprite_sorting(objects, sorting_layers)
-    _attach_sprite_textures(objects, assets)
+    return analyses
+
+
+def load_project(root, asset_guids=None):
+    """Load authored scenes + analyze scripts.
+
+    *asset_guids* reuses a prior ``_asset_guid_map`` (avoids a second PackageCache
+    walk). The map used is also stored on ``load_project.asset_guids``.
+    """
+    root = os.path.abspath(root)
+    if not os.path.isdir(root):
+        raise PackError("not a directory: %s" % root)
+    _progress("scanning %s" % root)
+    _progress("reading .meta guid maps")
+    assets = asset_guids if asset_guids is not None else _asset_guid_map(root)
+    load_project.asset_guids = assets
+    objects, lights, cameras, hierarchy = _load_scenes_lights_cameras(
+        root, assets)
+    analyses = _analyze_scripts_and_prefabs(root, objects, assets)
     return objects, analyses, lights, cameras, hierarchy
 
 
@@ -15532,8 +15553,339 @@ def _refused_api_site(analyses, api):
     return None
 
 
-def pack(root, outdir, soa=False, soa_vec4=False):
-    objects, analyses, lights, cameras, hierarchy = load_project(root)
+# ---------------------------------------------------------------------------
+# Incremental pack: input fingerprint + per-output transpile skip
+# ---------------------------------------------------------------------------
+
+_STAMP_NAME = ".unity_pack_stamp.json"
+_STAMP_VERSION = 3
+_SCENE_CACHE_NAME = ".unity_pack_scene_cache"
+# Authored inputs under Assets/ that affect emit (skip Library / PackageCache).
+_FINGERPRINT_EXTS = (
+    ".cs", ".unity", ".prefab", ".meta",
+    ".png", ".jpg", ".jpeg", ".tga", ".psd",
+    ".wav", ".mp3", ".ogg",
+    ".asset", ".controller", ".anim",
+    ".ttf", ".otf", ".fontsettings",
+    ".mat", ".physicMaterial", ".physicsMaterial2D",
+    ".shader", ".cginc", ".hlsl",
+    ".mixer",
+)
+_PACK_OUTPUTS = (
+    "engine.c", "data.c", "main.c",
+    "engine.cpp", "data.cpp", "main.cpp",
+    "engine_draw.h",
+)
+
+
+def _sha256_text(s):
+    """SHA-256 hex digest of a unicode string (UTF-8)."""
+    return hashlib.sha256((s or "").encode("utf-8")).hexdigest()
+
+
+def _file_fingerprint_entry(path, root):
+    """(relpath, size, mtime_ns) for one file; None if unreadable."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    rel = os.path.relpath(path, root).replace("\\", "/")
+    mtime_ns = getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))
+    return (rel, int(st.st_size), int(mtime_ns))
+
+
+def _fingerprint_entries(root):
+    """Sorted (relpath, size, mtime_ns) for packer + project inputs."""
+    root = os.path.abspath(root)
+    entries = []
+    tools_dir = os.path.dirname(os.path.abspath(__file__))
+    for name in ("unity_pack.py", "cpprust.py"):
+        p = os.path.join(tools_dir, name)
+        if os.path.isfile(p):
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            mtime_ns = getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))
+            entries.append(("tools/%s" % name, int(st.st_size), int(mtime_ns)))
+    ps = os.path.join(root, "ProjectSettings")
+    if os.path.isdir(ps):
+        for dirpath, _dns, names in os.walk(ps):
+            for n in sorted(names):
+                if n.startswith("."):
+                    continue
+                e = _file_fingerprint_entry(os.path.join(dirpath, n), root)
+                if e:
+                    entries.append(e)
+    assets = os.path.join(root, "Assets")
+    if os.path.isdir(assets):
+        for path in _walk_files(assets, _FINGERPRINT_EXTS):
+            e = _file_fingerprint_entry(path, root)
+            if e:
+                entries.append(e)
+    entries.sort()
+    return entries
+
+
+def _hash_fingerprint_entries(entries, soa=False, soa_vec4=False):
+    h = hashlib.sha256()
+    h.update(b"soa=%d\n" % (1 if soa else 0))
+    h.update(b"soa_vec4=%d\n" % (1 if soa_vec4 else 0))
+    for rel, size, mtime_ns in entries:
+        h.update(("%s\0%d\0%d\n" % (rel, size, mtime_ns)).encode("utf-8"))
+    return h.hexdigest()
+
+
+def _input_fingerprints(root, soa=False, soa_vec4=False):
+    """(full, assets, scripts) fingerprints.
+
+    *assets* covers tools, ProjectSettings, and non-``.cs`` Assets inputs.
+    *scripts* covers ``Assets/**/*.cs`` only. *full* is the early-exit key.
+    """
+    entries = _fingerprint_entries(root)
+    script_entries = [e for e in entries if e[0].endswith(".cs")]
+    asset_entries = [e for e in entries if not e[0].endswith(".cs")]
+    full = _hash_fingerprint_entries(entries, soa=soa, soa_vec4=soa_vec4)
+    assets = _hash_fingerprint_entries(
+        asset_entries, soa=soa, soa_vec4=soa_vec4)
+    scripts = _hash_fingerprint_entries(script_entries, soa=False, soa_vec4=False)
+    return full, assets, scripts
+
+
+def _input_fingerprint(root, soa=False, soa_vec4=False):
+    """Cheap fingerprint of packer + project inputs (not PackageCache)."""
+    return _input_fingerprints(root, soa=soa, soa_vec4=soa_vec4)[0]
+
+
+def _scene_cache_path(outdir):
+    return os.path.join(outdir, _SCENE_CACHE_NAME)
+
+
+def _write_scene_cache(outdir, assets_fp, objects, lights, cameras, hierarchy,
+                       asset_guids):
+    """Persist scene graph for scripts-only incremental packs."""
+    # Drop reloadable PNG pixels so deepcopy stays small; keep baked UI /
+    # builtin rgba (no sprite_guid path to reload from).
+    saved = []
+    for o in objects:
+        sp = o.get("sprite")
+        if not isinstance(sp, dict) or "tex_rgba" not in sp:
+            continue
+        if sp.get("builtin") or sp.get("source") in ("ui", "ui_tmp"):
+            continue
+        if not sp.get("sprite_guid"):
+            continue
+        saved.append((sp, sp.pop("tex_rgba")))
+    try:
+        objs = copy.deepcopy(objects)
+    finally:
+        for sp, rgba in saved:
+            sp["tex_rgba"] = rgba
+    payload = {
+        "assets_fingerprint": assets_fp,
+        "objects": objs,
+        "lights": copy.deepcopy(lights),
+        "cameras": copy.deepcopy(cameras),
+        "hierarchy": copy.deepcopy(hierarchy),
+        "asset_guids": dict(asset_guids),
+    }
+    path = _scene_cache_path(outdir)
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp, path)
+
+
+def _read_scene_cache(outdir, assets_fp):
+    """Return cached scene tuple or None when missing/stale/corrupt."""
+    path = _scene_cache_path(outdir)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "rb") as f:
+            payload = pickle.load(f)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("assets_fingerprint") != assets_fp:
+        return None
+    objects = payload.get("objects")
+    asset_guids = payload.get("asset_guids")
+    if not isinstance(objects, list) or not isinstance(asset_guids, dict):
+        return None
+    return (
+        objects,
+        list(payload.get("lights") or []),
+        list(payload.get("cameras") or []),
+        list(payload.get("hierarchy") or []),
+        asset_guids,
+    )
+
+
+def _stamp_path(outdir):
+    return os.path.join(outdir, _STAMP_NAME)
+
+
+def _read_stamp(outdir):
+    path = _stamp_path(outdir)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path) as f:
+            stamp = json.load(f)
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(stamp, dict):
+        return None
+    if int(stamp.get("version") or 0) != _STAMP_VERSION:
+        return None
+    return stamp
+
+
+def _write_stamp(outdir, stamp):
+    path = _stamp_path(outdir)
+    with open(path, "w") as f:
+        json.dump(stamp, f, indent=2, sort_keys=True)
+        f.write("\n")
+
+
+def _outputs_complete(outdir):
+    """True when required pack artifacts exist under *outdir*."""
+    for name in _PACK_OUTPUTS:
+        if not os.path.isfile(os.path.join(outdir, name)):
+            return False
+    return True
+
+
+def _class_stamp_entries(plan):
+    """Light per-class rows for the stamp (enough for CLI summary)."""
+    rows = []
+    for name, cl in sorted((plan.get("classes") or {}).items()):
+        row = {
+            "name": name,
+            "n": int(cl.get("n") or 0),
+            "size": int(cl.get("size") or 0),
+            "idx_ty": cl.get("idx_ty") or "int",
+        }
+        if cl.get("soa_dims"):
+            row["soa_dims"] = int(cl["soa_dims"])
+            if cl.get("soa_logical"):
+                row["soa_logical"] = int(cl["soa_logical"])
+        rows.append(row)
+    return rows
+
+
+def _plan_from_stamp(stamp):
+    """Minimal plan dict for CLI / early-exit from stamp class rows."""
+    classes = {}
+    for entry in stamp.get("classes") or []:
+        if isinstance(entry, str):
+            # v1 stamps stored bare names only.
+            classes[entry] = {
+                "n": 0, "size": 0, "idx_ty": "int",
+            }
+            continue
+        name = entry.get("name")
+        if not name:
+            continue
+        cl = {
+            "n": int(entry.get("n") or 0),
+            "size": int(entry.get("size") or 0),
+            "idx_ty": entry.get("idx_ty") or "int",
+        }
+        if entry.get("soa_dims"):
+            cl["soa_dims"] = int(entry["soa_dims"])
+            if entry.get("soa_logical"):
+                cl["soa_logical"] = int(entry["soa_logical"])
+        classes[name] = cl
+    return {
+        "classes": classes,
+        "product_name": stamp.get("product_name") or "Player",
+        "two_d": bool(stamp.get("two_d")),
+        "soa": bool(stamp.get("soa")),
+        "soa_vec4": bool(stamp.get("soa_vec4")),
+    }
+
+
+def _write_if_different(path, text):
+    """Write *text* only when missing or content differs. Returns True if wrote."""
+    text = text if text is not None else ""
+    if os.path.isfile(path):
+        try:
+            with open(path) as f:
+                old = f.read()
+            if old == text:
+                return False
+        except OSError:
+            pass
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w") as f:
+        f.write(text)
+    return True
+
+
+def _cpp_twin(c_text):
+    """C emit → C++-subset twin header for cpprust (same as pack())."""
+    body = (c_text.split("\n", 1)[1] if c_text.startswith("/*") else c_text)
+    return (
+        "/* generated by tools/unity_pack.py — C++ subset for cpprust */\n"
+        + body)
+
+
+def _emit_artifact_unchanged(outdir, cpp_name, c_name, cpp_text, force):
+    """True when on-disk twin matches *cpp_text* and lowered .c exists."""
+    if force:
+        return False
+    cpp_path = os.path.join(outdir, cpp_name)
+    c_path = os.path.join(outdir, c_name)
+    if not os.path.isfile(cpp_path) or not os.path.isfile(c_path):
+        return False
+    try:
+        with open(cpp_path) as f:
+            old = f.read()
+    except OSError:
+        return False
+    return old == cpp_text
+
+
+def pack(root, outdir, soa=False, soa_vec4=False, force=False):
+    os.makedirs(outdir, exist_ok=True)
+    fp, assets_fp, scripts_fp = _input_fingerprints(
+        root, soa=soa, soa_vec4=soa_vec4)
+    if not force:
+        stamp = _read_stamp(outdir)
+        if (stamp
+                and stamp.get("input_fingerprint") == fp
+                and bool(stamp.get("soa")) == bool(soa)
+                and bool(stamp.get("soa_vec4")) == bool(soa_vec4)
+                and _outputs_complete(outdir)):
+            _progress("unchanged; skipping pack (stamp match)")
+            return _plan_from_stamp(stamp)
+
+    cached = None if force else _read_scene_cache(outdir, assets_fp)
+    if cached is not None:
+        _progress("assets unchanged; reusing scenes (scripts-only rebuild)")
+        objects, lights, cameras, hierarchy, asset_guids = cached
+        _attach_sprite_textures(objects, asset_guids)
+        load_project.asset_guids = asset_guids
+        analyses = _analyze_scripts_and_prefabs(root, objects, asset_guids)
+    else:
+        _progress("scanning %s" % os.path.abspath(root))
+        _progress("reading .meta guid maps")
+        asset_guids = _asset_guid_map(root)
+        load_project.asset_guids = asset_guids
+        objects, lights, cameras, hierarchy = _load_scenes_lights_cameras(
+            root, asset_guids)
+        try:
+            _write_scene_cache(
+                outdir, assets_fp,
+                objects, lights, cameras, hierarchy, asset_guids)
+        except OSError:
+            pass
+        analyses = _analyze_scripts_and_prefabs(root, objects, asset_guids)
     used_apis = set()
     for a in analyses:
         used_apis |= a["apis"]
@@ -15621,7 +15973,7 @@ def pack(root, outdir, soa=False, soa_vec4=False):
     plan["textures"] = _collect_textures(objects)
     _ensure_texture_guids(
         plan["textures"], _anim_sprite_guids(objects),
-        _asset_guid_map(root))
+        asset_guids)
     kb_keys = set()
     for a in analyses:
         kb_keys |= set(a.get("keyboard_keys") or [])
@@ -15688,49 +16040,66 @@ def pack(root, outdir, soa=False, soa_vec4=False):
     data = emit_data(plan, used_apis)
     main_c = emit_main()
     # C++-subset twins: same text, fed through cpprust then crust (csrust pipe).
-    engine_cpp = (
-        "/* generated by tools/unity_pack.py — C++ subset for cpprust */\n"
-        + (engine.split("\n", 1)[1] if engine.startswith("/*") else engine))
-    data_cpp = (
-        "/* generated by tools/unity_pack.py — C++ subset for cpprust */\n"
-        + (data.split("\n", 1)[1] if data.startswith("/*") else data))
-    main_cpp = (
-        "/* generated by tools/unity_pack.py — C++ subset for cpprust */\n"
-        + (main_c.split("\n", 1)[1] if main_c.startswith("/*") else main_c))
-    _progress("validating engine.c through cpprust + crust")
-    engine_c = validate_emitted_c(engine_cpp, "engine.cpp", analyses=analyses)
-    _progress("validating data.c through cpprust + crust")
-    data_c_out = validate_emitted_c(data_cpp, "data.cpp", analyses=analyses)
-    _progress("validating main.c through cpprust + crust")
-    main_c_out = validate_emitted_c(main_cpp, "main.cpp", analyses=analyses)
+    engine_cpp = _cpp_twin(engine)
+    data_cpp = _cpp_twin(data)
+    main_cpp = _cpp_twin(main_c)
+
+    def _validate_or_reuse(cpp_text, cpp_name, c_name, c_fallback):
+        """Transpile when *cpp_text* changed; else reuse on-disk lowered .c."""
+        if _emit_artifact_unchanged(outdir, cpp_name, c_name, cpp_text, force):
+            _progress("unchanged %s; skipping cpprust + crust" % cpp_name)
+            with open(os.path.join(outdir, c_name)) as f:
+                return f.read()
+        _progress("validating %s through cpprust + crust" % cpp_name)
+        out = validate_emitted_c(cpp_text, cpp_name, analyses=analyses)
+        if out is None:
+            out = c_fallback
+        _write_if_different(os.path.join(outdir, cpp_name), cpp_text)
+        _write_if_different(os.path.join(outdir, c_name), out)
+        return out
+
+    engine_c = _validate_or_reuse(engine_cpp, "engine.cpp", "engine.c", engine)
+    data_c_out = _validate_or_reuse(data_cpp, "data.cpp", "data.c", data)
+    main_c_out = _validate_or_reuse(main_cpp, "main.cpp", "main.c", main_c)
     _progress("writing %s" % outdir)
-    # engine.c / main.c are cpprust-lowered C for gcc / host link.
-    # engine.cpp keeps the C++ subset (std::vector) that cpprust consumed.
-    with open(os.path.join(outdir, "engine.c"), "w") as f:
-        f.write(engine_c)
-    with open(os.path.join(outdir, "data.c"), "w") as f:
-        # Large texture data skips translate — write authored C emit.
-        f.write(data_c_out if data_c_out is not None else data)
-    with open(os.path.join(outdir, "main.c"), "w") as f:
-        f.write(main_c_out)
-    with open(os.path.join(outdir, "engine.cpp"), "w") as f:
-        f.write(engine_cpp)
-    with open(os.path.join(outdir, "data.cpp"), "w") as f:
-        f.write(data_cpp)
-    with open(os.path.join(outdir, "main.cpp"), "w") as f:
-        f.write(main_cpp)
-    with open(os.path.join(outdir, "engine_draw.h"), "w") as f:
-        f.write(emit_engine_draw_h())
-    with open(os.path.join(outdir, "Makefile"), "w") as f:
-        f.write(emit_makefile(outdir))
+    # Ensure .c present even if reuse path already had them (no-op write).
+    _write_if_different(os.path.join(outdir, "engine.c"), engine_c)
+    _write_if_different(
+        os.path.join(outdir, "data.c"),
+        data_c_out if data_c_out is not None else data)
+    _write_if_different(os.path.join(outdir, "main.c"), main_c_out)
+    _write_if_different(os.path.join(outdir, "engine.cpp"), engine_cpp)
+    _write_if_different(os.path.join(outdir, "data.cpp"), data_cpp)
+    _write_if_different(os.path.join(outdir, "main.cpp"), main_cpp)
+    _write_if_different(
+        os.path.join(outdir, "engine_draw.h"), emit_engine_draw_h())
+    _write_if_different(
+        os.path.join(outdir, "Makefile"), emit_makefile(outdir))
     shdir = os.path.join(outdir, "shaders")
     os.makedirs(shdir, exist_ok=True)
     for plat in ("linux", "apple", "windows", "wasm"):
-        with open(os.path.join(shdir, "shader_compiler_%s.c" % plat),
-                  "w") as f:
-            f.write(emit_shader_compiler(plat))
-    with open(os.path.join(shdir, "soa_positions.glsl"), "w") as f:
-        f.write(emit_soa_positions_glsl(plan))
+        _write_if_different(
+            os.path.join(shdir, "shader_compiler_%s.c" % plat),
+            emit_shader_compiler(plat))
+    _write_if_different(
+        os.path.join(shdir, "soa_positions.glsl"),
+        emit_soa_positions_glsl(plan))
+    _write_stamp(outdir, {
+        "version": _STAMP_VERSION,
+        "input_fingerprint": fp,
+        "assets_fingerprint": assets_fp,
+        "scripts_fingerprint": scripts_fp,
+        "soa": bool(soa),
+        "soa_vec4": bool(soa_vec4),
+        "product_name": plan.get("product_name") or "Player",
+        "two_d": bool(plan.get("two_d")),
+        "classes": _class_stamp_entries(plan),
+        "outputs": {
+            "engine.cpp": _sha256_text(engine_cpp),
+            "data.cpp": _sha256_text(data_cpp),
+            "main.cpp": _sha256_text(main_cpp),
+        },
+    })
     _progress("done")
     return plan
 
@@ -15767,6 +16136,10 @@ def build_player_executable(outdir, product):
     ``engine.c`` is the cpprust-lowered C from the ``engine.cpp`` subset
     (``std::vector`` → crust ``vector_int``, …). ``data.c`` / ``main.c`` are
     already C. The host player builds with ``gcc`` (``CC``).
+
+    Object files and the exe are rebuilt only when their inputs are newer
+    (or missing), so an incremental pack that left ``.c`` untouched does not
+    force a full recompile.
     """
     import subprocess
     cc = os.environ.get("CC") or "gcc"
@@ -15784,10 +16157,33 @@ def build_player_executable(outdir, product):
                 "player build failed (%s): %s" % (
                     " ".join(cmd[:6]), err or ("exit %d" % r.returncode)))
 
-    _progress("compiling engine.c")
-    _run([cc, "-O3", "-fno-math-errno", "-c", "-o", engine_o, engine_c])
-    _progress("compiling data.c")
-    _run([cc, "-O0", "-c", "-o", data_o, data_c])
+    def _needs_rebuild(target, *inputs):
+        if not os.path.isfile(target):
+            return True
+        try:
+            t_m = os.path.getmtime(target)
+        except OSError:
+            return True
+        for inp in inputs:
+            if not inp or not os.path.isfile(inp):
+                return True
+            try:
+                if os.path.getmtime(inp) > t_m:
+                    return True
+            except OSError:
+                return True
+        return False
+
+    if _needs_rebuild(engine_o, engine_c):
+        _progress("compiling engine.c")
+        _run([cc, "-O3", "-fno-math-errno", "-c", "-o", engine_o, engine_c])
+    else:
+        _progress("engine.o up to date")
+    if _needs_rebuild(data_o, data_c):
+        _progress("compiling data.c")
+        _run([cc, "-O0", "-c", "-o", data_o, data_c])
+    else:
+        _progress("data.o up to date")
 
     host = os.path.normpath(os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
@@ -15809,15 +16205,25 @@ def build_player_executable(outdir, product):
         except (OSError, subprocess.CalledProcessError):
             use_window = False
     if use_window:
-        _progress("linking window player %s" % exe)
-        _run([cc, "-O2", "-o", exe, host, engine_o, data_o,
-              "-I", outdir] + cflags + libs + ["-lGLESv2", "-lm"])
+        if _needs_rebuild(exe, host, engine_o, data_o):
+            _progress("linking window player %s" % exe)
+            _run([cc, "-O2", "-o", exe, host, engine_o, data_o,
+                  "-I", outdir] + cflags + libs + ["-lGLESv2", "-lm"])
+        else:
+            _progress("player up to date")
     else:
+        main_c = os.path.join(outdir, "main.c")
         main_o = os.path.join(outdir, "main.o")
-        _progress("linking headless player %s" % exe)
-        _run([cc, "-O2", "-c", "-o", main_o,
-              os.path.join(outdir, "main.c")])
-        _run([cc, "-O2", "-o", exe, engine_o, data_o, main_o, "-lm"])
+        if _needs_rebuild(main_o, main_c):
+            _progress("compiling main.c")
+            _run([cc, "-O2", "-c", "-o", main_o, main_c])
+        else:
+            _progress("main.o up to date")
+        if _needs_rebuild(exe, engine_o, data_o, main_o):
+            _progress("linking headless player %s" % exe)
+            _run([cc, "-O2", "-o", exe, engine_o, data_o, main_o, "-lm"])
+        else:
+            _progress("player up to date")
     return exe
 
 
@@ -15826,6 +16232,10 @@ def main():
     outdir = None
     soa = False
     soa_vec4 = False
+    force = False
+    if "--force" in args:
+        force = True
+        args.remove("--force")
     if "--soa-vec4" in args:
         soa_vec4 = True
         soa = True
@@ -15843,14 +16253,15 @@ def main():
     if len(args) != 1:
         sys.stderr.write(
             "usage: unity_pack.py <project-dir> [-o <out-dir>] "
-            "[--soa | --soa-vec4]\n"
+            "[--soa | --soa-vec4] [--force]\n"
             "  default out-dir: $TMPDIR/<project folder>\n"
-            "  player binary:   <productName>  (Windows: <productName>.exe)\n")
+            "  player binary:   <productName>  (Windows: <productName>.exe)\n"
+            "  --force:         ignore stamp; always re-emit and transpile\n")
         return 2
     if outdir is None:
         outdir = default_pack_dir(args[0])
     try:
-        plan = pack(args[0], outdir, soa=soa, soa_vec4=soa_vec4)
+        plan = pack(args[0], outdir, soa=soa, soa_vec4=soa_vec4, force=force)
         exe = build_player_executable(
             outdir, plan.get("product_name") or "Player")
     except PackError as e:
@@ -15874,7 +16285,8 @@ def main():
             if cl.get("soa_logical"):
                 extra += " xyz=%d" % cl["soa_logical"]
         sys.stderr.write("  %s n=%d size=%d idx=%s%s\n"
-                         % (name, cl["n"], cl["size"], cl["idx_ty"], extra))
+                         % (name, cl.get("n", 0), cl.get("size", 0),
+                            cl.get("idx_ty", "int"), extra))
     return 0
 
 

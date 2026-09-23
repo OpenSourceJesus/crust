@@ -141,6 +141,194 @@ class TestEmit(unittest.TestCase):
         self.assertIn("engine_tick", hdr)
 
 
+class TestIncrementalPack(unittest.TestCase):
+    """Stamp early-exit + per-file transpile skip."""
+
+    def _mini_project(self):
+        root = tempfile.mkdtemp(prefix="upack-incr-proj-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        scenes = os.path.join(root, "Assets", "Scenes")
+        ps = os.path.join(root, "ProjectSettings")
+        os.makedirs(scripts)
+        os.makedirs(scenes)
+        os.makedirs(ps)
+        with open(os.path.join(scripts, "Host.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Host : MonoBehaviour {\n"
+                "    void Update() { transform.position = "
+                "transform.position; }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Host.cs.meta"), "w") as f:
+            f.write("guid: a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\n")
+        with open(os.path.join(ps, "ProjectSettings.asset"), "w") as f:
+            f.write(
+                "PlayerSettings:\n"
+                "  companyName: TestCo\n"
+                "  productName: IncrPack\n"
+                "  defaultScreenWidth: 800\n"
+                "  defaultScreenHeight: 600\n"
+            )
+        with open(os.path.join(scenes, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Host\n"
+                "  m_IsActive: 1\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "  m_Father: {fileID: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1}\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Main Camera\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "  m_TagString: MainCamera\n"
+                "--- !u!4 &11\nTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: -10}\n"
+                "  m_Father: {fileID: 0}\n"
+                "--- !u!20 &12\nCamera:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Orthographic: 1\n"
+                "  m_OrthographicSize: 5\n"
+            )
+        return root
+
+    def test_pack_skips_when_inputs_unchanged(self):
+        root = self._mini_project()
+        d = tempfile.mkdtemp(prefix="upack-incr-out-")
+        calls = []
+        real = unity_pack.validate_emitted_c
+
+        def counting(text, path="engine.c", analyses=None):
+            calls.append(path)
+            return real(text, path, analyses=analyses)
+
+        unity_pack.validate_emitted_c = counting
+        try:
+            unity_pack.pack(root, d)
+            n_first = len(calls)
+            self.assertGreaterEqual(n_first, 1)
+            calls.clear()
+            plan = unity_pack.pack(root, d)
+            self.assertEqual(calls, [], "second pack must not re-validate")
+            self.assertIn("Host", plan["classes"])
+            host = plan["classes"]["Host"]
+            self.assertIn("n", host)
+            self.assertIn("size", host)
+            self.assertIn("idx_ty", host)
+            stamp = unity_pack._read_stamp(d)
+            self.assertIsNotNone(stamp)
+            self.assertTrue(any(
+                isinstance(e, dict) and e.get("name") == "Host" and "n" in e
+                for e in stamp.get("classes") or []))
+            self.assertTrue(os.path.isfile(
+                os.path.join(d, unity_pack._STAMP_NAME)))
+        finally:
+            unity_pack.validate_emitted_c = real
+
+    def test_pack_force_revalidates(self):
+        root = self._mini_project()
+        d = tempfile.mkdtemp(prefix="upack-incr-force-")
+        unity_pack.pack(root, d)
+        calls = []
+        real = unity_pack.validate_emitted_c
+
+        def counting(text, path="engine.c", analyses=None):
+            calls.append(path)
+            return real(text, path, analyses=analyses)
+
+        unity_pack.validate_emitted_c = counting
+        try:
+            unity_pack.pack(root, d, force=True)
+            self.assertGreaterEqual(len(calls), 1)
+        finally:
+            unity_pack.validate_emitted_c = real
+
+    def test_pack_reruns_when_script_changes(self):
+        root = self._mini_project()
+        d = tempfile.mkdtemp(prefix="upack-incr-chg-")
+        unity_pack.pack(root, d)
+        calls = []
+        real = unity_pack.validate_emitted_c
+
+        def counting(text, path="engine.c", analyses=None):
+            calls.append(path)
+            return real(text, path, analyses=analyses)
+
+        host = os.path.join(root, "Assets", "Scripts", "Host.cs")
+        # Change authored logic so emit text differs (comment-only is not enough).
+        with open(host, "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Host : MonoBehaviour {\n"
+                "    void Update() {\n"
+                "        transform.position = transform.position "
+                "* Time.deltaTime;\n"
+                "    }\n"
+                "}\n"
+            )
+        os.utime(host, None)
+        unity_pack.validate_emitted_c = counting
+        try:
+            unity_pack.pack(root, d)
+            self.assertGreaterEqual(len(calls), 1)
+        finally:
+            unity_pack.validate_emitted_c = real
+
+    def test_script_only_change_reuses_scene_cache(self):
+        """Editing .cs must not re-index PackageCache metas when assets match."""
+        root = self._mini_project()
+        d = tempfile.mkdtemp(prefix="upack-incr-script-")
+        unity_pack.pack(root, d)
+        self.assertTrue(os.path.isfile(
+            os.path.join(d, unity_pack._SCENE_CACHE_NAME)))
+        meta_calls = []
+        real_map = unity_pack._asset_guid_map
+
+        def counting(root_):
+            meta_calls.append(root_)
+            return real_map(root_)
+
+        host = os.path.join(root, "Assets", "Scripts", "Host.cs")
+        with open(host, "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Host : MonoBehaviour {\n"
+                "    void Update() {\n"
+                "        transform.position = transform.position "
+                "* Time.deltaTime;\n"
+                "    }\n"
+                "}\n"
+            )
+        os.utime(host, None)
+        unity_pack._asset_guid_map = counting
+        try:
+            unity_pack.pack(root, d)
+            self.assertEqual(
+                meta_calls, [],
+                "scripts-only pack must reuse scene cache, not re-walk metas")
+        finally:
+            unity_pack._asset_guid_map = real_map
+
+    def test_write_if_different_skips_identical(self):
+        d = tempfile.mkdtemp(prefix="upack-wid-")
+        path = os.path.join(d, "x.txt")
+        self.assertTrue(unity_pack._write_if_different(path, "hello\n"))
+        m0 = os.path.getmtime(path)
+        self.assertFalse(unity_pack._write_if_different(path, "hello\n"))
+        self.assertEqual(os.path.getmtime(path), m0)
+        self.assertTrue(unity_pack._write_if_different(path, "bye\n"))
+
+
 class TestSpawnWidensIndex(unittest.TestCase):
 
     def test_instantiate_refuses_uint8_bound(self):
@@ -7223,6 +7411,53 @@ class TestSystems(unittest.TestCase):
         self.assertIn("TalkerLog", engine)
         self.assertIn("Debug_Log_s", engine)
         self.assertIn("Talker_Start", engine)
+        # #ifdef arms must share one `{` — duplicate opens across #else leave
+        # cpprust _toplevel_start stuck and false-flag qsort(out) as vector_int.
+        self.assertIn(
+            "#ifdef _WIN32\n"
+            "        if (*p == '/' || *p == '\\\\')\n"
+            "#else\n"
+            "        if (*p == '/')\n"
+            "#endif\n"
+            "        {",
+            engine)
+        # Braces must balance for the owning-arg walk (ignore strings).
+        depth = 0
+        i = 0
+        in_s = None
+        while i < len(engine):
+            c = engine[i]
+            if in_s:
+                if c == "\\" and i + 1 < len(engine):
+                    i += 2
+                    continue
+                if c == in_s:
+                    in_s = None
+                i += 1
+                continue
+            if c in ("\"", "'"):
+                in_s = c
+                i += 1
+                continue
+            if c == "/" and i + 1 < len(engine) and engine[i + 1] == "/":
+                while i < len(engine) and engine[i] != "\n":
+                    i += 1
+                continue
+            if c == "/" and i + 1 < len(engine) and engine[i + 1] == "*":
+                i += 2
+                while i + 1 < len(engine) and not (
+                        engine[i] == "*" and engine[i + 1] == "/"):
+                    i += 1
+                i += 2
+                continue
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                self.assertGreaterEqual(depth, 0, "extra } in engine.c")
+            i += 1
+        self.assertEqual(depth, 0, "unbalanced braces in engine.c with print")
+
         self.assertIn('Debug_Log_s("Hello World!")', engine)
         self.assertIn("Debug_Log_i(3)", engine)
         r = subprocess.run(["make", "-C", d], capture_output=True, text=True)

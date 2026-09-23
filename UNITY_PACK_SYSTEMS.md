@@ -409,6 +409,38 @@ known builtins (`SpriteRenderer`, RB, uGUI, …) only — unknown `T` → CS0246
 Pack / crust / cpprust failures report as Unity/csc diagnostics
 (`Assets/…(line,col): error CSxxxx: …`), not raw `engine.cpp` subset prose.
 
+## Incremental pack
+
+`pack()` writes `outdir/.unity_pack_stamp.json` with an input fingerprint,
+sha256s of `engine.cpp` / `data.cpp` / `main.cpp`, and light per-class rows
+(`name`, `n`, `size`, `idx_ty`, optional SoA dims) for the CLI summary on
+early exit. Fingerprints split into **assets** (tools, ProjectSettings,
+non-`.cs` Assets) and **scripts** (`Assets/**/*.cs`). A later pack of the
+same project into the same outdir:
+
+- **Early exit** when the full fingerprint matches and outputs are complete
+  (no `load_project` / emit / transpile).
+- **Scripts-only** when assets match but scripts differ: reuse
+  `.unity_pack_scene_cache` (scenes + guid map), re-analyze `.cs`, then
+  emit with per-file transpile skip.
+- Otherwise re-emits, then **skips cpprust+crust** for any twin whose on-disk
+  `.cpp` is byte-identical (and the lowered `.c` exists). Other outputs use
+  write-if-different so mtimes stay put for `gcc`.
+
+Fingerprint covers `tools/unity_pack.py`, `tools/cpprust.py`,
+`ProjectSettings/`, and authored `Assets/` extensions (`.cs`, scenes,
+prefabs, metas, common textures/audio, etc.). It does **not** walk
+`Library/PackageCache` — after a UPM-only change, pass `--force`.
+
+```
+python3 tools/unity_pack.py <project> -o /tmp/out
+python3 tools/unity_pack.py <project> -o /tmp/out          # stamp hit
+python3 tools/unity_pack.py <project> -o /tmp/out --force  # always re-emit
+```
+
+`build_player_executable` also skips compiling/linking when `.o` / the exe
+are newer than their inputs.
+
 ## Tick order
 
 ```
