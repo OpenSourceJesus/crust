@@ -1111,6 +1111,118 @@ def _pixels_per_unit(asset_path):
     return v if v > 0.0 else 100.0
 
 
+_SPRITE_SHEET_CACHE = {}
+
+
+def _parse_sprite_sheet(asset_path):
+    """TextureImporter.spriteSheet → {internalID: rect dict}.
+
+    ``spriteMode: 2`` (Multiple) packs several sprites in one PNG; Image /
+    SpriteRenderer ``m_Sprite: {fileID, guid}`` names a sheet entry by
+    ``internalID``. Rect ``y`` is from the texture bottom (Unity).
+    """
+    meta = asset_path + ".meta"
+    abspath = os.path.abspath(meta)
+    if abspath in _SPRITE_SHEET_CACHE:
+        return _SPRITE_SHEET_CACHE[abspath]
+    out = {}
+    try:
+        text = _read(meta)
+    except IOError:
+        _SPRITE_SHEET_CACHE[abspath] = out
+        return out
+    mode_m = re.search(r"(?m)^\s*spriteMode:\s*(\d+)\s*$", text)
+    mode = int(mode_m.group(1)) if mode_m else 1
+    # Always index sheet entries when present — Single-mode metas may still
+    # list one sprite; Multiple requires them. fileID lookup is opt-in.
+    sheet = re.search(r"(?m)^\s*spriteSheet:\s*$", text)
+    if not sheet:
+        _SPRITE_SHEET_CACHE[abspath] = out
+        return out
+    body = text[sheet.end():]
+    # Stop before mipmapLimit / userData / next top-level key at column 0–2.
+    stop = re.search(r"(?m)^(mipmapLimitGroupName|userData|assetBundleName):",
+                     body)
+    if stop:
+        body = body[:stop.start()]
+    for m in re.finditer(
+            r"(?ms)^\s{4}-\s+serializedVersion:\s*\d+\s*\n"
+            r"\s+name:\s*(.*?)\n"
+            r"\s+rect:\s*\n"
+            r"\s+serializedVersion:\s*\d+\s*\n"
+            r"\s+x:\s*([^\n]+)\s*\n"
+            r"\s+y:\s*([^\n]+)\s*\n"
+            r"\s+width:\s*([^\n]+)\s*\n"
+            r"\s+height:\s*([^\n]+)\s*\n"
+            r".*?"
+            r"\s+border:\s*\{x:\s*([^,}]+),\s*y:\s*([^,}]+),"
+            r"\s*z:\s*([^,}]+),\s*w:\s*([^}]+)\}"
+            r".*?"
+            r"\s+internalID:\s*(-?\d+)",
+            body):
+        iid = int(m.group(10))
+        out[iid] = {
+            "name": m.group(1).strip(),
+            "x": float(m.group(2)),
+            "y": float(m.group(3)),
+            "w": float(m.group(4)),
+            "h": float(m.group(5)),
+            "border": (float(m.group(6)), float(m.group(7)),
+                       float(m.group(8)), float(m.group(9))),
+            "sprite_mode": mode,
+        }
+    _SPRITE_SHEET_CACHE[abspath] = out
+    return out
+
+
+def _crop_rgba(rgba, tw, th, x, y, cw, ch):
+    """Crop RGBA bytes; Unity sprite rect ``y`` is from the texture bottom."""
+    tw, th = int(tw), int(th)
+    x0 = max(0, min(tw, int(round(x))))
+    # Unity: y from bottom → PNG row from top.
+    y_bottom = int(round(y))
+    ch_i = max(0, int(round(ch)))
+    cw_i = max(0, int(round(cw)))
+    y0 = th - y_bottom - ch_i
+    if y0 < 0:
+        ch_i += y0
+        y0 = 0
+    if x0 + cw_i > tw:
+        cw_i = tw - x0
+    if y0 + ch_i > th:
+        ch_i = th - y0
+    if cw_i < 1 or ch_i < 1:
+        return 0, 0, b""
+    rows = []
+    for row in range(ch_i):
+        o = ((y0 + row) * tw + x0) * 4
+        rows.append(rgba[o:o + cw_i * 4])
+    return cw_i, ch_i, b"".join(rows)
+
+
+def _load_sprite_rgba(path, file_id=None):
+    """Load PNG and crop to the spriteSheet entry for ``file_id`` when set.
+
+    ``spriteMode: Multiple`` textures share one guid; each Image/SpriteRenderer
+    names a sub-rect via ``m_Sprite`` fileID (= sheet ``internalID``). Without
+    the crop, every reference draws the whole atlas (e.g. Settings Menu Full
+    appearing inside every small button that used a sheet slice).
+    """
+    w, h, rgba = _load_png_rgba(path)
+    fid = int(file_id or 0)
+    if fid == 0 or fid == 21300000:
+        return w, h, rgba, _sprite_border_from_meta(path)
+    sheet = _parse_sprite_sheet(path)
+    entry = sheet.get(fid)
+    if not entry:
+        return w, h, rgba, _sprite_border_from_meta(path)
+    cw, ch, cropped = _crop_rgba(
+        rgba, w, h, entry["x"], entry["y"], entry["w"], entry["h"])
+    if cw < 1 or ch < 1:
+        return w, h, rgba, entry.get("border") or (0.0, 0.0, 0.0, 0.0)
+    return cw, ch, cropped, entry.get("border") or (0.0, 0.0, 0.0, 0.0)
+
+
 def _quat_rotate_vec(qx, qy, qz, qw, vx, vy, vz):
     """Apply Unity quaternion (x,y,z,w) to a vector."""
     tx = 2.0 * (qy * vz - qz * vy)
@@ -1483,11 +1595,11 @@ def _attach_sprite_textures(objects, asset_guids):
     """Load PNG pixels for each SpriteRenderer that references a project sprite.
 
     World half-extents follow Unity: (pixels / pixelsPerUnit) * scale / 2.
-    PNG decode is cached by path so shared sprites are not re-decoded.
+    Multiple-mode sheet slices are cropped by ``sprite_file_id`` (internalID).
     """
     todo = [o for o in objects if o.get("sprite")]
     n = len(todo)
-    cache = {}  # path -> (w, h, rgba, ppu) or None if unloadable
+    cache = {}  # (path, file_id) -> (w, h, rgba, ppu, border) or None
     if n:
         _progress("loading sprites for %d SpriteRenderer(s)" % n)
     for i, o in enumerate(todo):
@@ -1505,17 +1617,19 @@ def _attach_sprite_textures(objects, asset_guids):
         if not path or not path.lower().endswith(".png"):
             o["sprite"] = None
             continue
-        if path not in cache:
+        fid = int(sp.get("sprite_file_id") or 0)
+        key = (path, fid)
+        if key not in cache:
             try:
-                w, h, rgba = _load_png_rgba(path)
-                cache[path] = (w, h, rgba, _pixels_per_unit(path))
+                w, h, rgba, border = _load_sprite_rgba(path, fid)
+                cache[key] = (w, h, rgba, _pixels_per_unit(path), border)
             except (PackError, IOError):
-                cache[path] = None
-        hit = cache[path]
+                cache[key] = None
+        hit = cache[key]
         if hit is None:
             o["sprite"] = None
             continue
-        w, h, rgba, ppu = hit
+        w, h, rgba, ppu, border = hit
         sx = abs(float(sp.get("scale_x", 1.0)))
         sy = abs(float(sp.get("scale_y", 1.0)))
         sp["tex_path"] = path
@@ -1523,6 +1637,7 @@ def _attach_sprite_textures(objects, asset_guids):
         sp["tex_h"] = h
         sp["tex_rgba"] = rgba
         sp["pixels_per_unit"] = ppu
+        sp["border"] = border
         if sp.get("source") not in ("ui", "ui_tmp"):
             sp["half_w"] = (float(w) / ppu) * sx * 0.5
             sp["half_h"] = (float(h) / ppu) * sy * 0.5
@@ -1531,25 +1646,31 @@ def _attach_sprite_textures(objects, asset_guids):
 
 
 def _collect_textures(objects):
-    """Deduplicate sprite PNGs → plan texture table; set tex_id on sprites."""
+    """Deduplicate sprite PNGs → plan texture table; set tex_id on sprites.
+
+    Key is (guid, sprite_file_id) so Multiple-mode sheet slices stay distinct.
+    """
     textures = []
-    by_guid = {}
+    by_key = {}
     for o in objects:
         sp = o.get("sprite")
         if not sp or "tex_rgba" not in sp:
             continue
         g = sp["sprite_guid"]
-        if g not in by_guid:
-            by_guid[g] = len(textures)
+        fid = int(sp.get("sprite_file_id") or 0)
+        key = (g, fid)
+        if key not in by_key:
+            by_key[key] = len(textures)
             textures.append({
                 "guid": g,
+                "file_id": fid,
                 "path": sp["tex_path"],
                 "w": sp["tex_w"],
                 "h": sp["tex_h"],
                 "rgba": sp["tex_rgba"],
                 "ppu": float(sp.get("pixels_per_unit") or 100.0),
             })
-        sp["tex_id"] = by_guid[g]
+        sp["tex_id"] = by_key[key]
     return textures
 
 
@@ -1559,7 +1680,12 @@ def _ensure_texture_guids(textures, guids, asset_guids):
     Idle.anim swaps to Eyes Closed which may not be any SpriteRenderer's
     initial m_Sprite — still must pack those texels.
     """
-    by_guid = {t["guid"]: i for i, t in enumerate(textures)}
+    by_key = {(t["guid"], int(t.get("file_id") or 0)): i
+              for i, t in enumerate(textures)}
+    # Also index plain guid → first tex for anim lookups that omit fileID.
+    by_guid = {}
+    for i, t in enumerate(textures):
+        by_guid.setdefault(t["guid"], i)
     cache = {}
     for raw in guids or []:
         g = (raw or "").lower()
@@ -1570,7 +1696,7 @@ def _ensure_texture_guids(textures, guids, asset_guids):
             continue
         if path not in cache:
             try:
-                w, h, rgba = _load_png_rgba(path)
+                w, h, rgba, _border = _load_sprite_rgba(path, 0)
                 cache[path] = (w, h, rgba, _pixels_per_unit(path))
             except (PackError, IOError):
                 cache[path] = None
@@ -1578,9 +1704,12 @@ def _ensure_texture_guids(textures, guids, asset_guids):
         if hit is None:
             continue
         w, h, rgba, ppu = hit
-        by_guid[g] = len(textures)
+        idx = len(textures)
+        by_key[(g, 0)] = idx
+        by_guid[g] = idx
         textures.append({
             "guid": g,
+            "file_id": 0,
             "path": path,
             "w": w,
             "h": h,
@@ -1905,8 +2034,55 @@ def _rect_pivot_center(parent_w, parent_h, amin, amax, apos, size, pivot):
     return cx, cy, w, h
 
 
+def _ui_own_scale(o):
+    """Abs RectTransform.localScale xy (Unity UI); zero → 1."""
+    sc = o.get("local_scale") or o.get("scale") or (1.0, 1.0, 1.0)
+    sx = abs(float(sc[0])) if len(sc) > 0 else 1.0
+    sy = abs(float(sc[1])) if len(sc) > 1 else 1.0
+    if sx < 1e-8:
+        sx = 1.0
+    if sy < 1e-8:
+        sy = 1.0
+    return sx, sy
+
+
+def _ui_local_rect_wh(o, by_xf, screen_w, screen_h, cache):
+    """RectTransform.rect width/height before localScale (Unity layout space)."""
+    key = "L:" + str(o.get("xf_id") or id(o))
+    if key in cache:
+        return cache[key]
+    sw = float(screen_w)
+    sh = float(screen_h)
+    if o.get("canvas"):
+        cache[key] = (sw, sh)
+        return cache[key]
+    fid = o.get("father_id")
+    parent = by_xf.get(str(fid)) if fid else None
+    if parent is not None and (
+            parent.get("rect") is not None or parent.get("canvas")):
+        pw, ph = _ui_local_rect_wh(
+            parent, by_xf, screen_w, screen_h, cache)
+    else:
+        pw, ph = sw, sh
+    rect = o.get("rect") or {}
+    amin = rect.get("anchor_min") or (0.5, 0.5)
+    amax = rect.get("anchor_max") or (0.5, 0.5)
+    apos = rect.get("anchored_position") or (0.0, 0.0)
+    size = rect.get("size_delta") or (100.0, 100.0)
+    pivot = rect.get("pivot") or (0.5, 0.5)
+    _lcx, _lcy, rw, rh = _rect_pivot_center(
+        pw, ph, amin, amax, apos, size, pivot)
+    cache[key] = (abs(float(rw)), abs(float(rh)))
+    return cache[key]
+
+
 def _ui_screen_rect(o, by_xf, screen_w, screen_h, cache):
-    """Pixel rect (cx, cy, w, h) in screen space for a RectTransform object."""
+    """Pixel rect (cx, cy, w, h) in screen space for a RectTransform object.
+
+    Layout math uses parent ``rect`` (pre-localScale). Ancestor
+    ``localScale`` accumulates into screen size — Unity Canvas space —
+    so a VerticalLayoutGroup scaled to 0.59 shrinks children and TMP.
+    """
     key = str(o.get("xf_id") or id(o))
     if key in cache:
         return cache[key]
@@ -1923,22 +2099,37 @@ def _ui_screen_rect(o, by_xf, screen_w, screen_h, cache):
             parent.get("rect") is not None or parent.get("canvas")):
         pcx, pcy, pw, ph = _ui_screen_rect(
             parent, by_xf, screen_w, screen_h, cache)
-        plx = pcx - pw * 0.5
-        ply = pcy - ph * 0.5
+        plw, plh = _ui_local_rect_wh(
+            parent, by_xf, screen_w, screen_h, cache)
+        if plw < 1e-8:
+            plw = 1e-8
+        if plh < 1e-8:
+            plh = 1e-8
+        # parent.rect → screen (includes parent localScale + ancestors).
+        fsx = abs(float(pw)) / plw
+        fsy = abs(float(ph)) / plh
+        plx = pcx - abs(float(pw)) * 0.5
+        ply = pcy - abs(float(ph)) * 0.5
     else:
         # Root under Canvas / missing parent → full screen.
-        plx, ply, pw, ph = 0.0, 0.0, sw, sh
+        plw, plh = sw, sh
+        fsx, fsy = 1.0, 1.0
+        plx, ply = 0.0, 0.0
     rect = o.get("rect") or {}
     amin = rect.get("anchor_min") or (0.5, 0.5)
     amax = rect.get("anchor_max") or (0.5, 0.5)
     apos = rect.get("anchored_position") or (0.0, 0.0)
     size = rect.get("size_delta") or (100.0, 100.0)
     pivot = rect.get("pivot") or (0.5, 0.5)
+    # Child rect in parent.rect space (Unity LayoutGroup / anchors).
     lcx, lcy, rw, rh = _rect_pivot_center(
-        pw, ph, amin, amax, apos, size, pivot)
-    cx = plx + lcx
-    cy = ply + lcy
-    cache[key] = (cx, cy, abs(rw), abs(rh))
+        plw, plh, amin, amax, apos, size, pivot)
+    sx, sy = _ui_own_scale(o)
+    rw = abs(float(rw)) * sx
+    rh = abs(float(rh)) * sy
+    cx = plx + float(lcx) * fsx
+    cy = ply + float(lcy) * fsy
+    cache[key] = (cx, cy, rw * fsx, rh * fsy)
     return cache[key]
 
 
@@ -2119,13 +2310,13 @@ def _layout_query_sizes(obj, axis, children_map):
 
 
 def _layout_parent_pixel_size(obj, by_xf, screen_w, screen_h):
-    """Parent rect size in pixels (screen/canvas space)."""
+    """Parent RectTransform.rect size (pre-localScale) for layout fitters."""
     fid = obj.get("father_id")
     parent = by_xf.get(str(fid)) if fid else None
     if parent is None:
         return (float(screen_w), float(screen_h))
     cache = {}
-    _cx, _cy, pw, ph = _ui_screen_rect(
+    pw, ph = _ui_local_rect_wh(
         parent, by_xf, screen_w, screen_h, cache)
     return (abs(pw), abs(ph))
 
@@ -2135,7 +2326,7 @@ def _apply_content_size_fitter(obj, children_map, by_xf, screen_w, screen_h):
     csf = obj.get("content_size_fitter") or {}
     parent_size = _layout_parent_pixel_size(obj, by_xf, screen_w, screen_h)
     cache = {}
-    _cx, _cy, cur_w, cur_h = _ui_screen_rect(
+    cur_w, cur_h = _ui_local_rect_wh(
         obj, by_xf, screen_w, screen_h, cache)
     cur = (abs(cur_w), abs(cur_h))
     for axis, fit_key in ((0, "horizontal"), (1, "vertical")):
@@ -2172,7 +2363,7 @@ def _apply_aspect_ratio_fitter(obj, by_xf, screen_w, screen_h):
         return
     parent_size = _layout_parent_pixel_size(obj, by_xf, screen_w, screen_h)
     cache = {}
-    _cx, _cy, cur_w, cur_h = _ui_screen_rect(
+    cur_w, cur_h = _ui_local_rect_wh(
         obj, by_xf, screen_w, screen_h, cache)
     cur_w, cur_h = abs(cur_w), abs(cur_h)
     if mode == 2:  # HeightControlsWidth
@@ -2390,8 +2581,10 @@ def _apply_layout_groups(objects, screen_w, screen_h):
                 if c.get("rect") is not None]
         if not kids:
             continue
+        # LayoutGroup uses parent.rect (pre-localScale); screen mapping
+        # applies ancestor scales in _ui_screen_rect.
         cache = {}
-        _cx, _cy, pw, ph = _ui_screen_rect(
+        pw, ph = _ui_local_rect_wh(
             parent, by_xf, screen_w, screen_h, cache)
         parent_size = (abs(pw), abs(ph))
         is_vert = bool(parent["layout_group"].get("vertical"))
@@ -2726,6 +2919,24 @@ def _bake_stretched_rgba(src, sw, sh, dst_w, dst_h):
     return dw, dh, bytes(out)
 
 
+def _fit_preserve_aspect(rw, rh, src_w, src_h):
+    """Fit sprite into rect keeping aspect (Unity Image.preserveAspect).
+
+    Returns (fit_w, fit_h) in the same units as *rw*/*rh*. The fitted quad is
+    centered in the RectTransform (Unity GenerateSimpleSprite).
+    """
+    rw = abs(float(rw))
+    rh = abs(float(rh))
+    sw = float(src_w)
+    sh = float(src_h)
+    if rw < 1e-6 or rh < 1e-6 or sw < 1e-6 or sh < 1e-6:
+        return rw, rh
+    if rw / rh > sw / sh:
+        # Rect wider than sprite → height-limited.
+        return rh * (sw / sh), rh
+    return rw, rw * (sh / sw)
+
+
 def _sprite_border_from_meta(path):
     """PNG .meta spriteBorder {x,y,z,w} → (left, bottom, right, top)."""
     meta = path + ".meta"
@@ -2748,9 +2959,11 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None):
     Screen Space Overlay (0) and Screen Space Camera (1): map canvas pixels to
     the main ortho camera frustum. World Space (2) is not supported yet.
     Project PNG sprites and Unity builtin UISprites draw; Image.type Sliced
-    9-slices with sprite borders (UISprite corners stay fixed). Empty m_Sprite
-    is skipped (no invent). TMP needs an authored font asset with atlas +
-    glyph tables.
+    9-slices with sprite borders (UISprite corners stay fixed). Authored
+    ``m_PreserveAspect`` on Simple Images fits the sprite inside the
+    RectTransform (Unity GenerateSimpleSprite) instead of stretching.
+    Empty m_Sprite is skipped (no invent). TMP needs an authored font asset
+    with atlas + glyph tables.
     """
     by_xf = {}
     for o in objects:
@@ -2871,36 +3084,56 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None):
             path = asset_guids.get(ui.get("sprite_guid") or "")
             if not path or not path.lower().endswith(".png"):
                 continue
-            if path not in png_cache:
+            fid = int(ui.get("sprite_file_id") or 0)
+            cache_key = (path, fid)
+            if cache_key not in png_cache:
                 try:
-                    png_cache[path] = _load_png_rgba(path)
+                    cw, ch, crgba, cborder = _load_sprite_rgba(path, fid)
+                    png_cache[cache_key] = (cw, ch, crgba, cborder)
                 except Exception:
-                    png_cache[path] = None
-            loaded = png_cache[path]
+                    png_cache[cache_key] = None
+            loaded = png_cache[cache_key]
             if not loaded:
                 continue
-            src_w, src_h, src_rgba = loaded
-            border = _sprite_border_from_meta(path)
+            src_w, src_h, src_rgba, border = loaded
             tex_path = path
-        # Sliced (1): 9-slice. Simple (0) / other: stretch to rect.
-        # Bake to rect size so one textured quad matches uGUI mesh.
+        # Sliced (1): 9-slice fills the rect. Simple (0): stretch, or
+        # preserveAspect-fit inside the rect (Unity Image.preserveAspect).
+        draw_w, draw_h = abs(float(rw)), abs(float(rh))
+        preserve = bool(int(ui.get("preserve_aspect") or 0))
+        if (img_type != 1 and preserve
+                and src_w > 0 and src_h > 0 and draw_w > 1e-6 and draw_h > 1e-6):
+            draw_w, draw_h = _fit_preserve_aspect(
+                draw_w, draw_h, src_w, src_h)
         if img_type == 1 and any(b > 0 for b in border):
             tw, th, rgba = _bake_sliced_rgba(
                 src_rgba, src_w, src_h, border, rw, rh, ppu_mul)
+            draw_w, draw_h = abs(float(rw)), abs(float(rh))
         else:
             tw, th, rgba = _bake_stretched_rgba(
-                src_rgba, src_w, src_h, rw, rh)
+                src_rgba, src_w, src_h, draw_w, draw_h)
         extra["tex_path"] = tex_path
         extra["tex_w"] = tw
         extra["tex_h"] = th
         extra["tex_rgba"] = rgba
         extra["pixels_per_unit"] = 100.0
         extra["border"] = border
+        extra["preserve_aspect"] = 1 if preserve else 0
         _apply_layout(
-            o, cx, cy, rw, rh, canvas, "ui",
+            o, cx, cy, draw_w, draw_h, canvas, "ui",
             (ui.get("r", 1.0), ui.get("g", 1.0),
              ui.get("b", 1.0), ui.get("a", 1.0)),
             extra)
+        # Raycast / Button hit uses the full RectTransform (Unity Graphic).
+        if o.get("ui_hit") is not None:
+            o["ui_hit"] = {
+                "cx": float(cx), "cy": float(cy),
+                "hw": abs(float(rw)) * 0.5, "hh": abs(float(rh)) * 0.5,
+                "ncx": float(cx) / float(sw),
+                "ncy": float(cy) / float(sh),
+                "nhw": abs(float(rw)) * 0.5 / float(sw),
+                "nhh": abs(float(rh)) * 0.5 / float(sh),
+            }
 
     for o in objects:
         tmp = o.get("ui_tmp")
@@ -2921,8 +3154,14 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None):
         if not font:
             continue
         cx, cy, rw, rh = _ui_screen_rect(o, by_xf, sw, sh, rect_cache)
+        # m_fontSize is in local (pre-canvas) units; scale to screen pixels
+        # so glyphs match RectTransform lossyScale (e.g. VLG localScale 0.59).
+        lw, lh = _ui_local_rect_wh(o, by_xf, sw, sh, rect_cache)
+        fs = float(tmp.get("font_size") or 14.0)
+        if lh > 1e-6:
+            fs = fs * (abs(float(rh)) / float(lh))
         tw, th, rgba = _rasterize_tmp_text(
-            font, tmp["text"], float(tmp.get("font_size") or 14.0),
+            font, tmp["text"], fs,
             (1.0, 1.0, 1.0, 1.0),  # color via sprite tint (m_fontColor)
             rw, rh,
             int(tmp.get("h_align") or 1),
@@ -2972,6 +3211,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
     hierarchy = []  # all authored GOs (name + xf) for Transform.Find
     blocks = re.split(r"(?m)^---\s+", text)
     by_id = {}
+    # Nested prefab parses fill this; do not clear mid-scene (cache by path).
+    # Callers that mutate .prefab files across packs should restart the process.
     for block in blocks:
         hm = re.match(r"!u!(\d+)\s+&(\d+)", block)
         if not hm:
@@ -3024,6 +3265,10 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         tag = re.search(r"(?m)^\s+m_TagString:\s*(.+)$", block)
         if tag:
             rec["tag"] = tag.group(1).strip()
+        # GameObject.activeSelf — authored m_IsActive (default active).
+        if kind == "GameObject":
+            ia = re.search(r"(?m)^\s+m_IsActive:\s*(\d+)", block)
+            rec["active"] = int(ia.group(1)) if ia else 1
         pos = re.search(
             r"m_LocalPosition:\s*\{x:\s*([^,}]+),\s*y:\s*([^,}]+),"
             r"\s*z:\s*([^}]+)\}", block)
@@ -3232,6 +3477,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 ppum = re.search(
                     r"(?m)^\s+m_PixelsPerUnitMultiplier:\s*([0-9.eE+-]+)",
                     block)
+                preserv = re.search(
+                    r"(?m)^\s+m_PreserveAspect:\s*(\d+)", block)
                 has_sprite = False
                 builtin = False
                 sg = None
@@ -3256,8 +3503,11 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                     "builtin": builtin,
                     "sprite_file_id": fid,
                     "sprite_guid": sg,
+                    # PrefabInstance m_Sprite mods target this MB fileID.
+                    "mb_file_id": file_id,
                     # 0 Simple, 1 Sliced, 2 Tiled, 3 Filled
                     "image_type": int(itype.group(1)) if itype else 0,
+                    "preserve_aspect": int(preserv.group(1)) if preserv else 0,
                     "pixels_per_unit_multiplier": (
                         float(ppum.group(1)) if ppum else 1.0),
                 }
@@ -3695,6 +3945,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "xf_id": xf_id,
                 "father_id": father_id,
                 "go_id": go.get("file_id"),
+                "active": 1 if int(go.get("active", 1)) else 0,
                 "has_canvas": bool(canvas),
                 "has_image": bool(ui_image),
                 "has_button": bool(ui_button),
@@ -3736,11 +3987,49 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                     or re.search(r"\bUnityEngine\.UI\.Text\b", raw)):
                 ui_scaffold_mb = True
                 break
-        # Image without sprite / TMP without font: drop. EventSystem: drop.
+        # Image without sprite / TMP without font: keep as _Rect when a
+        # RectTransform exists (PrefabInstance UI Button roots often have
+        # Image with m_Sprite: {fileID: 0} but still parent TMP children).
+        # EventSystem / legacy UI.Text: drop via ui_scaffold_mb below.
         # Prefab stubs with unresolved MB guids: keep (has_mb).
         if ui_image and not has_ui_draw and script is None and sprite is None:
             if not rb2d and not rb3d and not col2d and not col3d and not player:
                 if not canvas and not ui_button and not ui_tmp:
+                    if rect is not None:
+                        objects.append({
+                            "name": go.get("name") or "Rect",
+                            "pos": pos,
+                            "rot": rot,
+                            "local_pos": local_pos,
+                            "local_rot": local_rot,
+                            "local_scale": local_scale,
+                            "father_id": father_id,
+                            "xf_id": xf_id,
+                            "go_id": go.get("file_id"),
+                            "active": 1 if int(go.get("active", 1)) else 0,
+                            "fields": {},
+                            "script": None,
+                            "class": "_Rect",
+                            "sprite": None,
+                            "canvas": None,
+                            "rect": rect,
+                            "ui_image": ui_image,
+                            "ui_button": None,
+                            "ui_tmp": None,
+                            "layout_group": layout_group,
+                            "layout_element": layout_element,
+                            "content_size_fitter": content_size_fitter,
+                            "aspect_ratio_fitter": aspect_ratio_fitter,
+                            "rigidbody2d": None,
+                            "rigidbody": None,
+                            "collider2d": None,
+                            "collider3d": None,
+                            "anim_player": None,
+                            "ui_scaffold": True,
+                        })
+                        if xf is not None:
+                            # hierarchy already appended above when xf set
+                            pass
                     continue
         if ui_tmp and not has_ui_draw and script is None and sprite is None:
             if (not rb2d and not rb3d and not col2d and not col3d and not player
@@ -3764,6 +4053,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                     "father_id": father_id,
                     "xf_id": xf_id,
                     "go_id": go.get("file_id"),
+                    "active": 1 if int(go.get("active", 1)) else 0,
                     "fields": {},
                     "script": None,
                     "class": "_Rect",
@@ -3797,6 +4087,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "father_id": father_id,
                 "xf_id": xf_id,
                 "go_id": go.get("file_id"),
+                "active": 1 if int(go.get("active", 1)) else 0,
                 "fields": {},
                 "script": None,
                 "class": "_Canvas",
@@ -3828,6 +4119,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "father_id": father_id,
             "xf_id": xf_id,
             "go_id": go.get("file_id"),
+            "active": 1 if int(go.get("active", 1)) else 0,
             "fields": fields,
             "object_refs": object_refs,
             "script": script,
@@ -3859,7 +4151,291 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         clip = anim_clips.get(p["clip_guid"])
         if clip:
             p["clip"] = clip
+    _append_prefab_instance_ui_objects(
+        by_id, objects, hierarchy, asset_guids, guid_to_script)
     return objects, lights, cameras, hierarchy
+
+
+_prefab_parse_cache = {}
+
+
+def _parsed_prefab_objects(path, guid_to_script, asset_guids):
+    """Parse a .prefab once (cached) into packed-style objects."""
+    key = os.path.abspath(path)
+    if key not in _prefab_parse_cache:
+        _prefab_parse_cache[key] = parse_unity_yaml(
+            _read(path), guid_to_script=guid_to_script,
+            asset_guids=asset_guids)
+    return _prefab_parse_cache[key]
+
+
+def _prefab_mod_values(inst_raw, src_file_id):
+    """propertyPath → value string for modifications targeting *src_file_id*."""
+    out = {}
+    if not inst_raw or not src_file_id:
+        return out
+    for m in re.finditer(
+            r"target:\s*\{fileID:\s*%s,[^}]*\}\s*\n"
+            r"\s*propertyPath:\s*([^\n]+)\s*\n"
+            r"\s*value:\s*([^\n]*)" % re.escape(str(src_file_id)),
+            inst_raw):
+        out[m.group(1).strip()] = m.group(2).strip()
+    return out
+
+
+def _prefab_sprite_object_refs(inst_raw):
+    """(target_mb_file_id, sprite_file_id, sprite_guid) for m_Sprite mods."""
+    out = []
+    if not inst_raw:
+        return out
+    for m in re.finditer(
+            r"target:\s*\{fileID:\s*(-?\d+),[^}]*\}\s*\n"
+            r"\s*propertyPath:\s*m_Sprite\s*\n"
+            r"\s*value:\s*[^\n]*\s*\n"
+            r"\s*objectReference:\s*\{fileID:\s*(-?\d+)"
+            r"(?:,\s*guid:\s*([0-9a-fA-F]+))?",
+            inst_raw):
+        spr_fid = int(m.group(2))
+        if spr_fid == 0:
+            continue
+        sg = m.group(3).lower() if m.group(3) else None
+        out.append((m.group(1), spr_fid, sg))
+    return out
+
+
+def _apply_ui_image_sprite_mod(ui_image, inst_raw, asset_guids):
+    """Apply authored PrefabInstance m_Sprite objectReference to *ui_image*."""
+    if ui_image is None:
+        ui_image = {
+            "r": 1.0, "g": 1.0, "b": 1.0, "a": 1.0,
+            "enabled": 1, "has_sprite": False, "builtin": False,
+            "sprite_file_id": 0, "sprite_guid": None,
+            "image_type": 0, "pixels_per_unit_multiplier": 1.0,
+        }
+    else:
+        ui_image = dict(ui_image)
+    mb_id = str(ui_image.get("mb_file_id") or "")
+    refs = _prefab_sprite_object_refs(inst_raw)
+    chosen = None
+    for target, spr_fid, sg in refs:
+        if mb_id and str(target) == mb_id:
+            chosen = (spr_fid, sg)
+            break
+    # Root Image often has empty m_Sprite; take the first override for this
+    # instance when mb_file_id is unknown (still authored, not invented).
+    if chosen is None and refs and not ui_image.get("has_sprite"):
+        chosen = (refs[0][1], refs[0][2])
+    if not chosen:
+        return ui_image
+    spr_fid, sg = chosen
+    builtin = False
+    has_sprite = False
+    if sg and sg in (asset_guids or {}):
+        has_sprite = True
+    elif _is_unity_builtin_guid(sg):
+        has_sprite = True
+        builtin = True
+    if not has_sprite:
+        return ui_image
+    ui_image["has_sprite"] = True
+    ui_image["builtin"] = builtin
+    ui_image["sprite_file_id"] = int(spr_fid)
+    ui_image["sprite_guid"] = sg
+    return ui_image
+
+
+def _apply_rect_property_mods(rect, scale, mods):
+    """Mutate rect/scale from PrefabInstance propertyPath overrides."""
+    rect = dict(rect or {})
+    amin = list(rect.get("anchor_min") or (0.5, 0.5))
+    amax = list(rect.get("anchor_max") or (0.5, 0.5))
+    apos = list(rect.get("anchored_position") or (0.0, 0.0))
+    size = list(rect.get("size_delta") or (0.0, 0.0))
+    pivot = list(rect.get("pivot") or (0.5, 0.5))
+    sc = list(scale or (1.0, 1.0, 1.0))
+    while len(sc) < 3:
+        sc.append(1.0)
+
+    def _f(key, default=None):
+        if key not in mods:
+            return default
+        try:
+            return float(mods[key])
+        except ValueError:
+            return default
+
+    for axis, idx in (("x", 0), ("y", 1)):
+        v = _f("m_AnchorMin.%s" % axis)
+        if v is not None:
+            amin[idx] = v
+        v = _f("m_AnchorMax.%s" % axis)
+        if v is not None:
+            amax[idx] = v
+        v = _f("m_AnchoredPosition.%s" % axis)
+        if v is not None:
+            apos[idx] = v
+        v = _f("m_SizeDelta.%s" % axis)
+        if v is not None:
+            size[idx] = v
+        v = _f("m_Pivot.%s" % axis)
+        if v is not None:
+            pivot[idx] = v
+        v = _f("m_LocalScale.%s" % axis)
+        if v is not None:
+            sc[idx] = v
+    v = _f("m_LocalScale.z")
+    if v is not None:
+        sc[2] = v
+    rect["anchor_min"] = (float(amin[0]), float(amin[1]))
+    rect["anchor_max"] = (float(amax[0]), float(amax[1]))
+    rect["anchored_position"] = (float(apos[0]), float(apos[1]))
+    rect["size_delta"] = (float(size[0]), float(size[1]))
+    rect["pivot"] = (float(pivot[0]), float(pivot[1]))
+    return rect, (float(sc[0]), float(sc[1]), float(sc[2]))
+
+
+def _append_prefab_instance_ui_objects(
+        by_id, objects, hierarchy, asset_guids, guid_to_script):
+    """Materialize stripped PrefabInstance roots as UI layout parents.
+
+    Scene YAML often keeps only a stripped RectTransform stub for a UI Button
+    prefab; added TMP children parent to that fileID. Without a real object
+    (rect + father), ``_ui_screen_rect`` falls back to full-screen center and
+    VerticalLayoutGroup cannot stack the buttons.
+    """
+    if not asset_guids:
+        return
+    existing_xf = {str(o.get("xf_id")) for o in objects if o.get("xf_id")}
+    # PrefabInstance id → stripped Transform records that reference it.
+    stripped_by_inst = {}
+    for fid, rec in by_id.items():
+        if rec.get("kind") != "Transform":
+            continue
+        raw = rec.get("raw") or ""
+        cso = re.search(
+            r"m_CorrespondingSourceObject:\s*\{fileID:\s*(-?\d+),\s*"
+            r"guid:\s*([0-9a-fA-F]+)", raw)
+        pim = re.search(
+            r"(?m)^\s+m_PrefabInstance:\s*\{fileID:\s*(\d+)\}", raw)
+        if not cso or not pim:
+            continue
+        stripped_by_inst.setdefault(pim.group(1), []).append({
+            "scene_xf": str(fid),
+            "src_xf": cso.group(1),
+            "guid": cso.group(2).lower(),
+            "rec": rec,
+        })
+
+    for inst_id, stubs in stripped_by_inst.items():
+        inst = by_id.get(inst_id)
+        if not inst or inst.get("kind") != "PrefabInstance":
+            continue
+        inst_raw = inst.get("raw") or ""
+        father_id = inst.get("father_id")
+        for stub in stubs:
+            xf_id = stub["scene_xf"]
+            if xf_id in existing_xf:
+                continue
+            path = asset_guids.get(stub["guid"])
+            if not path or not str(path).lower().endswith(".prefab"):
+                continue
+            if not os.path.isfile(path):
+                continue
+            try:
+                pref_objs, _l, _c, _h = _parsed_prefab_objects(
+                    path, guid_to_script, asset_guids)
+            except Exception:
+                continue
+            src = next(
+                (o for o in pref_objs
+                 if str(o.get("xf_id")) == stub["src_xf"]),
+                None)
+            if src is None:
+                # Prefab root often matches first object with a rect.
+                src = next((o for o in pref_objs if o.get("rect")), None)
+            if src is None:
+                continue
+            mods = _prefab_mod_values(inst_raw, stub["src_xf"])
+            # m_IsActive targets the prefab GameObject fileID, not the RT.
+            go_mods = {}
+            go_src = src.get("go_id")
+            if go_src:
+                go_mods = _prefab_mod_values(inst_raw, go_src)
+            rect, scale = _apply_rect_property_mods(
+                src.get("rect"),
+                src.get("local_scale") or src.get("scale") or (1, 1, 1),
+                mods)
+            active = int(src.get("active", 1))
+            if "m_IsActive" in go_mods:
+                try:
+                    active = int(float(go_mods["m_IsActive"]))
+                except ValueError:
+                    pass
+            name = src.get("name") or "Prefab"
+            # Prefer authored GO name overrides if present.
+            if "m_Name" in go_mods and go_mods["m_Name"]:
+                name = go_mods["m_Name"]
+            # Disambiguate duplicate prefab roots (many "UI Button") so
+            # go_names / go_parents stay 1:1 with xf_id.
+            base = name.split("<", 1)[0]
+            name = "%s<%s>" % (base, xf_id)
+            ui_image = dict(src["ui_image"]) if src.get("ui_image") else None
+            ui_image = _apply_ui_image_sprite_mod(
+                ui_image, inst_raw, asset_guids)
+            ui_button = dict(src["ui_button"]) if src.get("ui_button") else None
+            obj = {
+                "name": name,
+                "pos": src.get("pos") or (0.0, 0.0, 0.0),
+                "rot": src.get("rot") or (0.0, 0.0, 0.0, 1.0),
+                "local_pos": src.get("local_pos") or (0.0, 0.0, 0.0),
+                "local_rot": src.get("local_rot") or (0.0, 0.0, 0.0, 1.0),
+                "local_scale": scale,
+                "scale": scale,
+                "father_id": father_id,
+                "xf_id": xf_id,
+                "go_id": "prefabinst:%s:%s" % (inst_id, xf_id),
+                "active": 1 if active else 0,
+                "fields": {},
+                "script": None,
+                "class": "_Rect",
+                "sprite": None,
+                "canvas": None,
+                "rect": rect,
+                "ui_image": ui_image,
+                "ui_button": ui_button,
+                "ui_tmp": None,
+                "layout_group": None,
+                "layout_element": (
+                    dict(src["layout_element"])
+                    if src.get("layout_element") else None),
+                "content_size_fitter": None,
+                "aspect_ratio_fitter": None,
+                "rigidbody2d": None,
+                "rigidbody": None,
+                "collider2d": None,
+                "collider3d": None,
+                "anim_player": None,
+                "ui_scaffold": False,
+                "prefab_instance": True,
+            }
+            objects.append(obj)
+            hierarchy.append({
+                "name": name,
+                "xf_id": xf_id,
+                "father_id": father_id,
+                "go_id": obj["go_id"],
+                "active": 1 if active else 0,
+                "has_canvas": False,
+                "has_image": bool(ui_image),
+                "has_button": bool(ui_button),
+                "has_tmp": False,
+            })
+            existing_xf.add(xf_id)
+            # Also stash rect onto the stripped Transform for any other walks.
+            stub["rec"]["rect"] = dict(rect)
+            stub["rec"]["scale"] = scale
+            if father_id:
+                stub["rec"]["father_id"] = father_id
 
 
 def parse_godot_tscn(text):
@@ -4091,8 +4667,12 @@ def _ast_find_getcomponent_chains(text):
 
 
 def _build_go_tables(plan):
-    """Authored GameObject name → {MonoBehaviour class: instance index}."""
+    """Authored GameObject name → {MonoBehaviour class: instance index}.
+
+    Also returns parallel activeSelf flags from authored m_IsActive.
+    """
     names = []
+    actives = []
     seen = set()
     comps = {}  # name -> {class: idx}
     for cname, cl in sorted(plan["classes"].items()):
@@ -4101,8 +4681,9 @@ def _build_go_tables(plan):
             if n not in seen:
                 seen.add(n)
                 names.append(n)
+                actives.append(1 if int(o.get("active", 1)) else 0)
             comps.setdefault(n, {})[cname] = i
-    return names, comps
+    return names, comps, actives
 
 
 def _build_go_ui_component_maps(plan):
@@ -4142,9 +4723,10 @@ def _build_go_ui_component_maps(plan):
     return {t: sorted(s) for t, s in maps.items() if s}
 
 
-def _extend_go_tables_for_find(plan, names, comps):
+def _extend_go_tables_for_find(plan, names, comps, actives):
     """Add authored hierarchy-only GOs so Transform.Find can see children."""
     names = list(names)
+    actives = list(actives)
     comps = {k: dict(v) for k, v in comps.items()}
     seen = set(names)
     for h in plan.get("scene_hierarchy") or []:
@@ -4153,8 +4735,9 @@ def _extend_go_tables_for_find(plan, names, comps):
             continue
         seen.add(n)
         names.append(n)
+        actives.append(1 if int(h.get("active", 1)) else 0)
         comps.setdefault(n, {})
-    return names, comps
+    return names, comps, actives
 
 
 def _build_go_parents(plan):
@@ -8939,6 +9522,15 @@ def emit_engine(plan, analyses, used_apis):
             p("}")
             p("")
         if want_ui:
+            go_active = plan.get("go_active") or [1] * go_authored_n
+            if len(go_active) < go_authored_n:
+                go_active = list(go_active) + [1] * (
+                    go_authored_n - len(go_active))
+            go_active = [
+                1 if int(a) else 0 for a in go_active[:go_authored_n]
+            ] + [1] * go_spawn_budget
+            if not go_active:
+                go_active = [1]
             p("/* GameObject.activeSelf — host pointer + authored Button */")
             p("static int _engine_go_active[%d];" % go_n)
             p("static int _engine_go_active_inited;")
@@ -8947,8 +9539,11 @@ def emit_engine(plan, analyses, used_apis):
             p("    int i;")
             p("    if (_engine_go_active_inited) return;")
             p("    _engine_go_active_inited = 1;")
+            # Seed authored m_IsActive; spawn slots default active.
+            p("    static const int _seed[%d] = { %s };" % (
+                go_n, ", ".join(str(int(a)) for a in go_active[:go_n])))
             p("    for (i = 0; i < %d; i = i + 1)" % go_n)
-            p("        _engine_go_active[i] = 1;")
+            p("        _engine_go_active[i] = _seed[i];")
             p("}")
             p("static int _engine_go_active_in_hierarchy(int go) {")
             p("    int guard = 0;")
@@ -9097,6 +9692,16 @@ def emit_engine(plan, analyses, used_apis):
             p("    go = _engine_go_count;")
             p("    _engine_go_count = _engine_go_count + 1;")
             p("    _engine_go_name[go] = \"(Clone)\";")
+            if want_ui:
+                # Instantiate copies activeSelf from the source GO.
+                p("    _engine_go_active_init();")
+                p("    {")
+                p("        int _sgo = _engine_%s_go_of[src];" % idn)
+                p("        if (_sgo >= 0 && _sgo < %d)" % go_cap_i)
+                p("            _engine_go_active[go] = _engine_go_active[_sgo];")
+                p("        else")
+                p("            _engine_go_active[go] = 1;")
+                p("    }")
             if want_destroy:
                 p("    if (go >= 0 && go < %d)" % go_cap_i)
                 p("        _engine_go_destroyed[go] = 0;")
@@ -15033,7 +15638,7 @@ def pack(root, outdir, soa=False, soa_vec4=False):
     plan["screen_fullscreen"] = sfs
     plan["screen_fullscreen_native"] = snative
     plan["screen_maximized"] = smax
-    go_names, go_comps = _build_go_tables(plan)
+    go_names, go_comps, go_active = _build_go_tables(plan)
     ui_gc = set()
     for a in analyses:
         ui_gc |= set(a.get("getcomponent_types") or [])
@@ -15042,9 +15647,10 @@ def pack(root, outdir, soa=False, soa_vec4=False):
             or "transform.SetParent" in used_apis
             or "transform.GetSiblingIndex" in used_apis
             or ui_gc):
-        go_names, go_comps = _extend_go_tables_for_find(
-            plan, go_names, go_comps)
+        go_names, go_comps, go_active = _extend_go_tables_for_find(
+            plan, go_names, go_comps, go_active)
     plan["go_names"] = go_names
+    plan["go_active"] = go_active
     plan["go_components"] = go_comps
     plan["go_ui_components"] = _build_go_ui_component_maps(plan)
     plan["go_parents"] = _build_go_parents(plan)

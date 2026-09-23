@@ -59,8 +59,16 @@ extern int Screen_fullScreenNative;
 extern int Screen_maximized;
 extern const char engine_product_name[];
 
-#define MAX_DRAWS 64
-#define MAX_TEX 32
+/* Unity scenes can emit far more than a handful of SpriteRenderers / uGUI
+ * Images (Slime Jump Main Menu alone is ~160). Truncating here drops later
+ * draws — e.g. Main Menu background never appears while early TMP labels do.
+ */
+#ifndef MAX_DRAWS
+#define MAX_DRAWS 512
+#endif
+#ifndef MAX_TEX
+#define MAX_TEX 512
+#endif
 /* xy + rgba + uv */
 #define VERT_STRIDE 8
 #define MAX_FLOATS (6 * VERT_STRIDE)
