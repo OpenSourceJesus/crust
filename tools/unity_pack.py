@@ -1111,6 +1111,118 @@ def _pixels_per_unit(asset_path):
     return v if v > 0.0 else 100.0
 
 
+_SPRITE_SHEET_CACHE = {}
+
+
+def _parse_sprite_sheet(asset_path):
+    """TextureImporter.spriteSheet → {internalID: rect dict}.
+
+    ``spriteMode: 2`` (Multiple) packs several sprites in one PNG; Image /
+    SpriteRenderer ``m_Sprite: {fileID, guid}`` names a sheet entry by
+    ``internalID``. Rect ``y`` is from the texture bottom (Unity).
+    """
+    meta = asset_path + ".meta"
+    abspath = os.path.abspath(meta)
+    if abspath in _SPRITE_SHEET_CACHE:
+        return _SPRITE_SHEET_CACHE[abspath]
+    out = {}
+    try:
+        text = _read(meta)
+    except IOError:
+        _SPRITE_SHEET_CACHE[abspath] = out
+        return out
+    mode_m = re.search(r"(?m)^\s*spriteMode:\s*(\d+)\s*$", text)
+    mode = int(mode_m.group(1)) if mode_m else 1
+    # Always index sheet entries when present — Single-mode metas may still
+    # list one sprite; Multiple requires them. fileID lookup is opt-in.
+    sheet = re.search(r"(?m)^\s*spriteSheet:\s*$", text)
+    if not sheet:
+        _SPRITE_SHEET_CACHE[abspath] = out
+        return out
+    body = text[sheet.end():]
+    # Stop before mipmapLimit / userData / next top-level key at column 0–2.
+    stop = re.search(r"(?m)^(mipmapLimitGroupName|userData|assetBundleName):",
+                     body)
+    if stop:
+        body = body[:stop.start()]
+    for m in re.finditer(
+            r"(?ms)^\s{4}-\s+serializedVersion:\s*\d+\s*\n"
+            r"\s+name:\s*(.*?)\n"
+            r"\s+rect:\s*\n"
+            r"\s+serializedVersion:\s*\d+\s*\n"
+            r"\s+x:\s*([^\n]+)\s*\n"
+            r"\s+y:\s*([^\n]+)\s*\n"
+            r"\s+width:\s*([^\n]+)\s*\n"
+            r"\s+height:\s*([^\n]+)\s*\n"
+            r".*?"
+            r"\s+border:\s*\{x:\s*([^,}]+),\s*y:\s*([^,}]+),"
+            r"\s*z:\s*([^,}]+),\s*w:\s*([^}]+)\}"
+            r".*?"
+            r"\s+internalID:\s*(-?\d+)",
+            body):
+        iid = int(m.group(10))
+        out[iid] = {
+            "name": m.group(1).strip(),
+            "x": float(m.group(2)),
+            "y": float(m.group(3)),
+            "w": float(m.group(4)),
+            "h": float(m.group(5)),
+            "border": (float(m.group(6)), float(m.group(7)),
+                       float(m.group(8)), float(m.group(9))),
+            "sprite_mode": mode,
+        }
+    _SPRITE_SHEET_CACHE[abspath] = out
+    return out
+
+
+def _crop_rgba(rgba, tw, th, x, y, cw, ch):
+    """Crop RGBA bytes; Unity sprite rect ``y`` is from the texture bottom."""
+    tw, th = int(tw), int(th)
+    x0 = max(0, min(tw, int(round(x))))
+    # Unity: y from bottom → PNG row from top.
+    y_bottom = int(round(y))
+    ch_i = max(0, int(round(ch)))
+    cw_i = max(0, int(round(cw)))
+    y0 = th - y_bottom - ch_i
+    if y0 < 0:
+        ch_i += y0
+        y0 = 0
+    if x0 + cw_i > tw:
+        cw_i = tw - x0
+    if y0 + ch_i > th:
+        ch_i = th - y0
+    if cw_i < 1 or ch_i < 1:
+        return 0, 0, b""
+    rows = []
+    for row in range(ch_i):
+        o = ((y0 + row) * tw + x0) * 4
+        rows.append(rgba[o:o + cw_i * 4])
+    return cw_i, ch_i, b"".join(rows)
+
+
+def _load_sprite_rgba(path, file_id=None):
+    """Load PNG and crop to the spriteSheet entry for ``file_id`` when set.
+
+    ``spriteMode: Multiple`` textures share one guid; each Image/SpriteRenderer
+    names a sub-rect via ``m_Sprite`` fileID (= sheet ``internalID``). Without
+    the crop, every reference draws the whole atlas (e.g. Settings Menu Full
+    appearing inside every small button that used a sheet slice).
+    """
+    w, h, rgba = _load_png_rgba(path)
+    fid = int(file_id or 0)
+    if fid == 0 or fid == 21300000:
+        return w, h, rgba, _sprite_border_from_meta(path)
+    sheet = _parse_sprite_sheet(path)
+    entry = sheet.get(fid)
+    if not entry:
+        return w, h, rgba, _sprite_border_from_meta(path)
+    cw, ch, cropped = _crop_rgba(
+        rgba, w, h, entry["x"], entry["y"], entry["w"], entry["h"])
+    if cw < 1 or ch < 1:
+        return w, h, rgba, entry.get("border") or (0.0, 0.0, 0.0, 0.0)
+    return cw, ch, cropped, entry.get("border") or (0.0, 0.0, 0.0, 0.0)
+
+
 def _quat_rotate_vec(qx, qy, qz, qw, vx, vy, vz):
     """Apply Unity quaternion (x,y,z,w) to a vector."""
     tx = 2.0 * (qy * vz - qz * vy)
@@ -1483,11 +1595,11 @@ def _attach_sprite_textures(objects, asset_guids):
     """Load PNG pixels for each SpriteRenderer that references a project sprite.
 
     World half-extents follow Unity: (pixels / pixelsPerUnit) * scale / 2.
-    PNG decode is cached by path so shared sprites are not re-decoded.
+    Multiple-mode sheet slices are cropped by ``sprite_file_id`` (internalID).
     """
     todo = [o for o in objects if o.get("sprite")]
     n = len(todo)
-    cache = {}  # path -> (w, h, rgba, ppu) or None if unloadable
+    cache = {}  # (path, file_id) -> (w, h, rgba, ppu, border) or None
     if n:
         _progress("loading sprites for %d SpriteRenderer(s)" % n)
     for i, o in enumerate(todo):
@@ -1505,17 +1617,19 @@ def _attach_sprite_textures(objects, asset_guids):
         if not path or not path.lower().endswith(".png"):
             o["sprite"] = None
             continue
-        if path not in cache:
+        fid = int(sp.get("sprite_file_id") or 0)
+        key = (path, fid)
+        if key not in cache:
             try:
-                w, h, rgba = _load_png_rgba(path)
-                cache[path] = (w, h, rgba, _pixels_per_unit(path))
+                w, h, rgba, border = _load_sprite_rgba(path, fid)
+                cache[key] = (w, h, rgba, _pixels_per_unit(path), border)
             except (PackError, IOError):
-                cache[path] = None
-        hit = cache[path]
+                cache[key] = None
+        hit = cache[key]
         if hit is None:
             o["sprite"] = None
             continue
-        w, h, rgba, ppu = hit
+        w, h, rgba, ppu, border = hit
         sx = abs(float(sp.get("scale_x", 1.0)))
         sy = abs(float(sp.get("scale_y", 1.0)))
         sp["tex_path"] = path
@@ -1523,6 +1637,7 @@ def _attach_sprite_textures(objects, asset_guids):
         sp["tex_h"] = h
         sp["tex_rgba"] = rgba
         sp["pixels_per_unit"] = ppu
+        sp["border"] = border
         if sp.get("source") not in ("ui", "ui_tmp"):
             sp["half_w"] = (float(w) / ppu) * sx * 0.5
             sp["half_h"] = (float(h) / ppu) * sy * 0.5
@@ -1531,25 +1646,31 @@ def _attach_sprite_textures(objects, asset_guids):
 
 
 def _collect_textures(objects):
-    """Deduplicate sprite PNGs → plan texture table; set tex_id on sprites."""
+    """Deduplicate sprite PNGs → plan texture table; set tex_id on sprites.
+
+    Key is (guid, sprite_file_id) so Multiple-mode sheet slices stay distinct.
+    """
     textures = []
-    by_guid = {}
+    by_key = {}
     for o in objects:
         sp = o.get("sprite")
         if not sp or "tex_rgba" not in sp:
             continue
         g = sp["sprite_guid"]
-        if g not in by_guid:
-            by_guid[g] = len(textures)
+        fid = int(sp.get("sprite_file_id") or 0)
+        key = (g, fid)
+        if key not in by_key:
+            by_key[key] = len(textures)
             textures.append({
                 "guid": g,
+                "file_id": fid,
                 "path": sp["tex_path"],
                 "w": sp["tex_w"],
                 "h": sp["tex_h"],
                 "rgba": sp["tex_rgba"],
                 "ppu": float(sp.get("pixels_per_unit") or 100.0),
             })
-        sp["tex_id"] = by_guid[g]
+        sp["tex_id"] = by_key[key]
     return textures
 
 
@@ -1559,7 +1680,12 @@ def _ensure_texture_guids(textures, guids, asset_guids):
     Idle.anim swaps to Eyes Closed which may not be any SpriteRenderer's
     initial m_Sprite — still must pack those texels.
     """
-    by_guid = {t["guid"]: i for i, t in enumerate(textures)}
+    by_key = {(t["guid"], int(t.get("file_id") or 0)): i
+              for i, t in enumerate(textures)}
+    # Also index plain guid → first tex for anim lookups that omit fileID.
+    by_guid = {}
+    for i, t in enumerate(textures):
+        by_guid.setdefault(t["guid"], i)
     cache = {}
     for raw in guids or []:
         g = (raw or "").lower()
@@ -1570,7 +1696,7 @@ def _ensure_texture_guids(textures, guids, asset_guids):
             continue
         if path not in cache:
             try:
-                w, h, rgba = _load_png_rgba(path)
+                w, h, rgba, _border = _load_sprite_rgba(path, 0)
                 cache[path] = (w, h, rgba, _pixels_per_unit(path))
             except (PackError, IOError):
                 cache[path] = None
@@ -1578,9 +1704,12 @@ def _ensure_texture_guids(textures, guids, asset_guids):
         if hit is None:
             continue
         w, h, rgba, ppu = hit
-        by_guid[g] = len(textures)
+        idx = len(textures)
+        by_key[(g, 0)] = idx
+        by_guid[g] = idx
         textures.append({
             "guid": g,
+            "file_id": 0,
             "path": path,
             "w": w,
             "h": h,
@@ -2748,9 +2877,9 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None):
     Screen Space Overlay (0) and Screen Space Camera (1): map canvas pixels to
     the main ortho camera frustum. World Space (2) is not supported yet.
     Project PNG sprites and Unity builtin UISprites draw; Image.type Sliced
-    9-slices with sprite borders (UISprite corners stay fixed). Empty m_Sprite
-    is skipped (no invent). TMP needs an authored font asset with atlas +
-    glyph tables.
+    9-slices with sprite borders (UISprite corners stay fixed). Authored
+    Empty m_Sprite is skipped (no invent). TMP needs an authored font asset
+    with atlas + glyph tables.
     """
     by_xf = {}
     for o in objects:
@@ -2871,25 +3000,28 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None):
             path = asset_guids.get(ui.get("sprite_guid") or "")
             if not path or not path.lower().endswith(".png"):
                 continue
-            if path not in png_cache:
+            fid = int(ui.get("sprite_file_id") or 0)
+            cache_key = (path, fid)
+            if cache_key not in png_cache:
                 try:
-                    png_cache[path] = _load_png_rgba(path)
+                    cw, ch, crgba, cborder = _load_sprite_rgba(path, fid)
+                    png_cache[cache_key] = (cw, ch, crgba, cborder)
                 except Exception:
-                    png_cache[path] = None
-            loaded = png_cache[path]
+                    png_cache[cache_key] = None
+            loaded = png_cache[cache_key]
             if not loaded:
                 continue
-            src_w, src_h, src_rgba = loaded
-            border = _sprite_border_from_meta(path)
+            src_w, src_h, src_rgba, border = loaded
             tex_path = path
-        # Sliced (1): 9-slice. Simple (0) / other: stretch to rect.
-        # Bake to rect size so one textured quad matches uGUI mesh.
+        # Sliced (1): 9-slice fills the rect. Simple (0): stretch to fill.
+        draw_w, draw_h = abs(float(rw)), abs(float(rh))
         if img_type == 1 and any(b > 0 for b in border):
             tw, th, rgba = _bake_sliced_rgba(
                 src_rgba, src_w, src_h, border, rw, rh, ppu_mul)
+            draw_w, draw_h = abs(float(rw)), abs(float(rh))
         else:
             tw, th, rgba = _bake_stretched_rgba(
-                src_rgba, src_w, src_h, rw, rh)
+                src_rgba, src_w, src_h, draw_w, draw_h)
         extra["tex_path"] = tex_path
         extra["tex_w"] = tw
         extra["tex_h"] = th
@@ -2897,10 +3029,20 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None):
         extra["pixels_per_unit"] = 100.0
         extra["border"] = border
         _apply_layout(
-            o, cx, cy, rw, rh, canvas, "ui",
+            o, cx, cy, draw_w, draw_h, canvas, "ui",
             (ui.get("r", 1.0), ui.get("g", 1.0),
              ui.get("b", 1.0), ui.get("a", 1.0)),
             extra)
+        # Raycast / Button hit uses the full RectTransform (Unity Graphic).
+        if o.get("ui_hit") is not None:
+            o["ui_hit"] = {
+                "cx": float(cx), "cy": float(cy),
+                "hw": abs(float(rw)) * 0.5, "hh": abs(float(rh)) * 0.5,
+                "ncx": float(cx) / float(sw),
+                "ncy": float(cy) / float(sh),
+                "nhw": abs(float(rw)) * 0.5 / float(sw),
+                "nhh": abs(float(rh)) * 0.5 / float(sh),
+            }
 
     for o in objects:
         tmp = o.get("ui_tmp")

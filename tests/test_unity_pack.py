@@ -4299,6 +4299,159 @@ class TestSystems(unittest.TestCase):
         self.assertIn(font, assets)
         self.assertIn("Assets", assets[font])
 
+    def test_gles_host_draw_tex_limits_cover_large_ui(self):
+        """Host MAX_DRAWS/MAX_TEX must fit menus with 100+ UI sprites/textures."""
+        for name in ("gles2_window.c", "gles2_view.c"):
+            path = os.path.join(ROOT, "examples", "unity_pack", name)
+            with open(path) as f:
+                src = f.read()
+            self.assertRegex(src, r"#define MAX_DRAWS\s+512")
+            self.assertRegex(src, r"#define MAX_TEX\s+512")
+
+    def test_sprite_mode_multiple_crops_by_file_id(self):
+        """Multiple spriteMode: Image fileID selects spriteSheet rect, not full PNG."""
+        root = tempfile.mkdtemp(prefix="upack-sheet-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Mark.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Mark : MonoBehaviour { void Update() {} }\n"
+            )
+        with open(os.path.join(scripts, "Mark.cs.meta"), "w") as f:
+            f.write("guid: sheetmarksheetmarksheetmarkshee01\n")
+        spr = os.path.join(root, "Assets", "Sprites")
+        os.makedirs(spr)
+        import struct, zlib
+
+        def chunk(tag, body):
+            return (struct.pack(">I", len(body)) + tag + body
+                    + struct.pack(">I", zlib.crc32(tag + body) & 0xffffffff))
+
+        # 8x4 atlas: left 4x4 red, right 4x4 green.
+        w, h = 8, 4
+        raw = b""
+        for y in range(h):
+            row = b""
+            for x in range(w):
+                if x < 4:
+                    row += b"\xff\x00\x00\xff"
+                else:
+                    row += b"\x00\xff\x00\xff"
+            raw += b"\x00" + row
+        png = os.path.join(spr, "atlas.png")
+        open(png, "wb").write(
+            b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 9))
+            + chunk(b"IEND", b""))
+        slice_id = 424242
+        with open(png + ".meta", "w") as f:
+            f.write(
+                "guid: a11a11a11a11a11a11a11a11a11a11a1\n"
+                "TextureImporter:\n"
+                "  spriteMode: 2\n"
+                "  spritePixelsToUnits: 100\n"
+                "  spriteBorder: {x: 0, y: 0, z: 0, w: 0}\n"
+                "  spriteSheet:\n"
+                "    serializedVersion: 2\n"
+                "    sprites:\n"
+                "    - serializedVersion: 2\n"
+                "      name: left\n"
+                "      rect:\n"
+                "        serializedVersion: 2\n"
+                "        x: 0\n"
+                "        y: 0\n"
+                "        width: 4\n"
+                "        height: 4\n"
+                "      alignment: 0\n"
+                "      pivot: {x: 0.5, y: 0.5}\n"
+                "      border: {x: 0, y: 0, z: 0, w: 0}\n"
+                "      outline: []\n"
+                "      physicsShape: []\n"
+                "      tessellationDetail: -1\n"
+                "      bones: []\n"
+                "      spriteID: a\n"
+                "      internalID: 111\n"
+                "      vertices: []\n"
+                "      indices: \n"
+                "      edges: []\n"
+                "      weights: []\n"
+                "    - serializedVersion: 2\n"
+                "      name: right\n"
+                "      rect:\n"
+                "        serializedVersion: 2\n"
+                "        x: 4\n"
+                "        y: 0\n"
+                "        width: 4\n"
+                "        height: 4\n"
+                "      alignment: 0\n"
+                "      pivot: {x: 0.5, y: 0.5}\n"
+                "      border: {x: 0, y: 0, z: 0, w: 0}\n"
+                "      outline: []\n"
+                "      physicsShape: []\n"
+                "      tessellationDetail: -1\n"
+                "      bones: []\n"
+                "      spriteID: b\n"
+                "      internalID: %d\n"
+                "      vertices: []\n"
+                "      indices: \n"
+                "      edges: []\n"
+                "      weights: []\n"
+                "    nameFileIdTable:\n"
+                "      left: 111\n"
+                "      right: %d\n"
+                % (slice_id, slice_id)
+            )
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        img = "fe87c0e1cc204ed48ad3b37840f39efc"
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Canvas\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!224 &2\nRectTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 0, y: 0}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!223 &3\nCanvas:\n  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n  m_RenderMode: 0\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Slice\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "--- !u!224 &11\nRectTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Father: {fileID: 2}\n"
+                "  m_AnchorMin: {x: 0.5, y: 0.5}\n"
+                "  m_AnchorMax: {x: 0.5, y: 0.5}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 4, y: 4}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!114 &12\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, guid: " + img + "}\n"
+                "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+                "  m_Enabled: 1\n  m_Type: 0\n"
+                "  m_Sprite: {fileID: %d, "
+                "guid: a11a11a11a11a11a11a11a11a11a11a1, type: 3}\n"
+                % slice_id
+            )
+        objs, _a, _l, _c, _h = unity_pack.load_project(root)
+        slice_o = [o for o in objs if o["name"] == "Slice"][0]
+        sp = slice_o["sprite"]
+        self.assertEqual(sp["sprite_file_id"], slice_id)
+        self.assertEqual(sp["tex_rgba"][0:4], b"\x00\xff\x00\xff")
+        cw, ch, crgba, _b = unity_pack._load_sprite_rgba(png, slice_id)
+        self.assertEqual((cw, ch), (4, 4))
+        self.assertEqual(crgba[0:4], b"\x00\xff\x00\xff")
+
+
     def test_canvas_button_draws_and_clicks(self):
         """Authored Canvas + Button (builtin UISprite) → draw + SetActive onClick."""
         objs, _a, _l, cams, _hier = unity_pack.load_project(SYSTEMS)
