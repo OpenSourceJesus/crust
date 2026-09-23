@@ -65,7 +65,10 @@ def in_big_stack(work):
 class Prover:
     """One source's lifted functions, read into one kernel environment."""
 
-    def __init__(self, source):
+    def __init__(self, source, own=None):
+        """`source` is one unit; `own` names the functions to report and
+        certify -- a file's own, when its `// uses:` files were appended
+        (see `load_unit`).  None: every function in the source."""
         path = rosettamath()
         if path is None:
             raise RuntimeError("RosettaMath not found; run "
@@ -75,6 +78,8 @@ class Prover:
         import lean4
         self.H, self.L = hoare, lean4
         self.lifted, self.refused = lift_all(source)
+        self.own = set(self.lifted) | set(self.refused) if own is None \
+            else set(own)
         self.types = {"Nat": hoare.NAT, "Bool": hoare.BOOL,
                       "Array": hoare.BYTES}
         # Every obligation the kernel settles, kept with the environment it
@@ -224,6 +229,38 @@ class Prover:
         return self.H.by_bounds(env, goal, unfolding=unfolding,
                                 limit=self.limit)
 
+    def through_loops(self, fn, text, post, if_returns, always, unfolding):
+        """`hoare.by_loop`, with each loop's invariant strengthened.
+
+        The invariant written on a `while` speaks of the Rust's variables;
+        what a postcondition needs of the loop is also what an early
+        `return` inside it left behind -- `_returned` and `_return_value`,
+        the state the lowering carries -- and, for a safety obligation, that
+        `_ok` is still true.  So each invariant is conjoined with `always`,
+        and with `if_returns` when the loop can return; if that does not read
+        (the loop never returns, so there is no `_returned`), without it.
+        This changes the proof, not the theorem: the function and its
+        statement do not mention the invariant."""
+        H = self.H
+        failed = (H.TheoremError, H.ContractError, self.L.KernelError)
+        last = None
+        # With a `return` anywhere before or in the loop, the lowering keeps
+        # iterating after it with the returned value frozen, so what the
+        # loop keeps need only hold while nothing has returned.
+        returning = (["(_returned) or (%s)" % e for e in always]
+                     + if_returns, True)
+        for extra, guarded in (returning, (always, False)):
+            source = _strengthened(text, extra, guarded)
+            env, sig = self.fresh_env(fn)
+            try:
+                proc = H.read_procedure(source, env, sig, post)
+            except failed as exc:
+                last = exc
+                continue
+            proof = H.by_loop(env, proc, unfolding=unfolding)
+            return env, proc.obligation, proof
+        raise last
+
     def first_of(self, env, goal, unfolding, tactics):
         """The first tactic's proof that the kernel accepts."""
         failed = (self.H.TheoremError, self.H.ContractError,
@@ -265,9 +302,15 @@ class Prover:
         post = fn.ensures if ensures is None else ensures
 
         def work():
+            unfolding = {c.name for c in in_dependency_order(fn)}
+            if _has_loop(fn.source):
+                extra = ["(not _returned) or (%s)"
+                         % _renamed(p, "result", "_return_value")
+                         for p in post]
+                return self.through_loops(fn, fn.source, post, extra, [],
+                                          unfolding)
             env, sig = self.fresh_env(fn)
             proc = self.H.read_procedure(fn.source, env, sig, post)
-            unfolding = {c.name for c in in_dependency_order(fn)}
             proof = self.first_of(
                 env, proc.obligation, unfolding,
                 (self.by_every_bool, self.by_guards, self.by_bounds))
@@ -281,19 +324,56 @@ class Prover:
         out = []
         for k, label in enumerate(fn.obligations):
             def work(k=k):
-                env, sig = self.fresh_env(fn)
-                proc = self.H.read_procedure(fn.safety(only=k), env, sig,
-                                             ["result"])
                 unfolding = {name + "__safe"}
                 for c in in_dependency_order(fn):
                     if c.pre_source is not None:
                         unfolding.add(c.name + "__pre")
+                text = fn.safety(only=k)
+                if _has_loop(text):
+                    return self.through_loops(
+                        fn, text, ["result"],
+                        ["(not _returned) or _return_value"], ["_ok"],
+                        unfolding)
+                env, sig = self.fresh_env(fn)
+                proc = self.H.read_procedure(text, env, sig, ["result"])
                 proof = self.first_of(env, proc.obligation, unfolding,
                                       (self.by_every_bool, self.by_bounds))
                 return env, proc.obligation, proof
             out.append((label, in_big_stack(
                 lambda: self.settles(work, name, label, k))))
         return out
+
+
+def _has_loop(source):
+    return any(line.lstrip().startswith("while ")
+               for line in source.splitlines())
+
+
+def _renamed(text, old, new):
+    import re
+    return re.sub(r"\b%s\b" % re.escape(old), new, text)
+
+
+def _strengthened(source, extra, guarded=False):
+    """Every `assert invariant(X)` in a lifted source as
+    `assert invariant((X) and (e1) and ..)` -- or, `guarded`, with
+    `(_returned) or (X)` for X, the written invariant needing to hold only
+    until something returns."""
+    if not extra and not guarded:
+        return source
+    out = []
+    for line in source.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("assert invariant(") and \
+                stripped.endswith(")"):
+            inner = stripped[len("assert invariant("):-1]
+            if guarded:
+                inner = "(_returned) or (%s)" % inner
+            parts = ["(%s)" % inner] + ["(%s)" % e for e in extra]
+            line = line[:len(line) - len(stripped)] + \
+                "assert invariant(%s)" % " and ".join(parts)
+        out.append(line)
+    return "\n".join(out) + "\n"
 
 
 class Certificate:
@@ -375,12 +455,47 @@ def _is_hypothesis(binder, L):
     return isinstance(head, L.Var) and head.name in ("Holds", "Eq")
 
 
+def load_unit(path):
+    """(source, own function names) for a Rust file and what it uses.
+
+    A LeanOS file that calls into another says so on a line of its own,
+
+        // uses: memmap.rs elfcheck.rs
+
+    and is one unit with them, as rpython's files were one translation
+    unit.  The used files, and theirs, are appended *after* the file itself,
+    so its own line numbers -- the ones every obligation names -- are
+    exact.  Rust does not care in what order functions are defined."""
+    import re
+    order, seen = [], set()
+
+    def visit(p):
+        p = os.path.normpath(p)
+        if p in seen:
+            return
+        seen.add(p)
+        order.append(p)
+        with open(p) as fh:
+            text = fh.read()
+        for m in re.finditer(r"^//\s*uses:\s*(.+)$", text, re.M):
+            for dep in m.group(1).split():
+                visit(os.path.join(os.path.dirname(p), dep))
+    visit(path)
+    texts = []
+    for p in order:
+        with open(p) as fh:
+            texts.append(fh.read())
+    own = set(re.findall(r"\bfn\s+([A-Za-z_]\w*)", texts[0]))
+    return "\n".join(texts), own
+
+
 def report(path):
-    with open(path) as fh:
-        prover = Prover(fh.read())
+    source, own = load_unit(path)
+    prover = Prover(source, own)
     for name, why in sorted(prover.refused.items()):
-        print("%s: not lifted -- %s" % (name, why))
-    for name in sorted(prover.lifted):
+        if name in own:
+            print("%s: not lifted -- %s" % (name, why))
+    for name in sorted(n for n in prover.lifted if n in own):
         fn = prover.lifted[name]
         if fn.ensures:
             print("%s: ensures %s -- %s" % (
