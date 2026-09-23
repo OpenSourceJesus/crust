@@ -4735,14 +4735,55 @@ class TestSystems(unittest.TestCase):
         cache = {}
         cx, cy, rw, rh = unity_pack._ui_screen_rect(
             label, by_xf, sw, sh, cache)
-        # Centered in the 50%×50% button (screen center).
-        # sizeDelta 200×50 (localScale applied in a later change).
+        # Centered in the 50%×50% button (screen center), size 200×50 * scale 0.5.
         self.assertAlmostEqual(cx, sw * 0.5, places=1)
         self.assertAlmostEqual(cy, sh * 0.5, places=1)
-        self.assertAlmostEqual(rw, 200.0, places=1)
-        self.assertAlmostEqual(rh, 50.0, places=1)
+        self.assertAlmostEqual(rw, 100.0, places=1)
+        self.assertAlmostEqual(rh, 25.0, places=1)
         # Must not be the old full-screen fallback for a 200×50 rect.
         self.assertLess(rw, sw * 0.2)
+
+
+    def test_ui_ancestor_local_scale_shrinks_screen_rect(self):
+        """Parent RectTransform.localScale accumulates into child screen size."""
+        by_xf = {
+            "1": {
+                "xf_id": "1",
+                "canvas": {"render_mode": 0, "enabled": 1},
+                "rect": {
+                    "anchor_min": (0.0, 0.0), "anchor_max": (1.0, 1.0),
+                    "anchored_position": (0.0, 0.0), "size_delta": (0.0, 0.0),
+                    "pivot": (0.5, 0.5),
+                },
+                "local_scale": (1.0, 1.0, 1.0),
+            },
+            "2": {
+                "xf_id": "2",
+                "father_id": "1",
+                "rect": {
+                    "anchor_min": (0.5, 0.5), "anchor_max": (0.5, 0.5),
+                    "anchored_position": (0.0, 0.0), "size_delta": (200.0, 100.0),
+                    "pivot": (0.5, 0.5),
+                },
+                "local_scale": (0.5, 0.5, 1.0),
+            },
+            "3": {
+                "xf_id": "3",
+                "father_id": "2",
+                "rect": {
+                    "anchor_min": (0.5, 0.5), "anchor_max": (0.5, 0.5),
+                    "anchored_position": (0.0, 0.0), "size_delta": (100.0, 50.0),
+                    "pivot": (0.5, 0.5),
+                },
+                "local_scale": (1.0, 1.0, 1.0),
+            },
+        }
+        cache = {}
+        _cx, _cy, rw, rh = unity_pack._ui_screen_rect(
+            by_xf["3"], by_xf, 800, 600, cache)
+        # Child 100×50 under parent scaled 0.5 → 50×25 screen pixels.
+        self.assertAlmostEqual(rw, 50.0, places=5)
+        self.assertAlmostEqual(rh, 25.0, places=5)
 
 
     def test_canvas_button_draws_and_clicks(self):

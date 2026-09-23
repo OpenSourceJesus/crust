@@ -2034,8 +2034,55 @@ def _rect_pivot_center(parent_w, parent_h, amin, amax, apos, size, pivot):
     return cx, cy, w, h
 
 
+def _ui_own_scale(o):
+    """Abs RectTransform.localScale xy (Unity UI); zero → 1."""
+    sc = o.get("local_scale") or o.get("scale") or (1.0, 1.0, 1.0)
+    sx = abs(float(sc[0])) if len(sc) > 0 else 1.0
+    sy = abs(float(sc[1])) if len(sc) > 1 else 1.0
+    if sx < 1e-8:
+        sx = 1.0
+    if sy < 1e-8:
+        sy = 1.0
+    return sx, sy
+
+
+def _ui_local_rect_wh(o, by_xf, screen_w, screen_h, cache):
+    """RectTransform.rect width/height before localScale (Unity layout space)."""
+    key = "L:" + str(o.get("xf_id") or id(o))
+    if key in cache:
+        return cache[key]
+    sw = float(screen_w)
+    sh = float(screen_h)
+    if o.get("canvas"):
+        cache[key] = (sw, sh)
+        return cache[key]
+    fid = o.get("father_id")
+    parent = by_xf.get(str(fid)) if fid else None
+    if parent is not None and (
+            parent.get("rect") is not None or parent.get("canvas")):
+        pw, ph = _ui_local_rect_wh(
+            parent, by_xf, screen_w, screen_h, cache)
+    else:
+        pw, ph = sw, sh
+    rect = o.get("rect") or {}
+    amin = rect.get("anchor_min") or (0.5, 0.5)
+    amax = rect.get("anchor_max") or (0.5, 0.5)
+    apos = rect.get("anchored_position") or (0.0, 0.0)
+    size = rect.get("size_delta") or (100.0, 100.0)
+    pivot = rect.get("pivot") or (0.5, 0.5)
+    _lcx, _lcy, rw, rh = _rect_pivot_center(
+        pw, ph, amin, amax, apos, size, pivot)
+    cache[key] = (abs(float(rw)), abs(float(rh)))
+    return cache[key]
+
+
 def _ui_screen_rect(o, by_xf, screen_w, screen_h, cache):
-    """Pixel rect (cx, cy, w, h) in screen space for a RectTransform object."""
+    """Pixel rect (cx, cy, w, h) in screen space for a RectTransform object.
+
+    Layout math uses parent ``rect`` (pre-localScale). Ancestor
+    ``localScale`` accumulates into screen size — Unity Canvas space —
+    so a VerticalLayoutGroup scaled to 0.59 shrinks children and TMP.
+    """
     key = str(o.get("xf_id") or id(o))
     if key in cache:
         return cache[key]
@@ -2052,22 +2099,37 @@ def _ui_screen_rect(o, by_xf, screen_w, screen_h, cache):
             parent.get("rect") is not None or parent.get("canvas")):
         pcx, pcy, pw, ph = _ui_screen_rect(
             parent, by_xf, screen_w, screen_h, cache)
-        plx = pcx - pw * 0.5
-        ply = pcy - ph * 0.5
+        plw, plh = _ui_local_rect_wh(
+            parent, by_xf, screen_w, screen_h, cache)
+        if plw < 1e-8:
+            plw = 1e-8
+        if plh < 1e-8:
+            plh = 1e-8
+        # parent.rect → screen (includes parent localScale + ancestors).
+        fsx = abs(float(pw)) / plw
+        fsy = abs(float(ph)) / plh
+        plx = pcx - abs(float(pw)) * 0.5
+        ply = pcy - abs(float(ph)) * 0.5
     else:
         # Root under Canvas / missing parent → full screen.
-        plx, ply, pw, ph = 0.0, 0.0, sw, sh
+        plw, plh = sw, sh
+        fsx, fsy = 1.0, 1.0
+        plx, ply = 0.0, 0.0
     rect = o.get("rect") or {}
     amin = rect.get("anchor_min") or (0.5, 0.5)
     amax = rect.get("anchor_max") or (0.5, 0.5)
     apos = rect.get("anchored_position") or (0.0, 0.0)
     size = rect.get("size_delta") or (100.0, 100.0)
     pivot = rect.get("pivot") or (0.5, 0.5)
+    # Child rect in parent.rect space (Unity LayoutGroup / anchors).
     lcx, lcy, rw, rh = _rect_pivot_center(
-        pw, ph, amin, amax, apos, size, pivot)
-    cx = plx + lcx
-    cy = ply + lcy
-    cache[key] = (cx, cy, abs(rw), abs(rh))
+        plw, plh, amin, amax, apos, size, pivot)
+    sx, sy = _ui_own_scale(o)
+    rw = abs(float(rw)) * sx
+    rh = abs(float(rh)) * sy
+    cx = plx + float(lcx) * fsx
+    cy = ply + float(lcy) * fsy
+    cache[key] = (cx, cy, rw * fsx, rh * fsy)
     return cache[key]
 
 
@@ -2248,13 +2310,13 @@ def _layout_query_sizes(obj, axis, children_map):
 
 
 def _layout_parent_pixel_size(obj, by_xf, screen_w, screen_h):
-    """Parent rect size in pixels (screen/canvas space)."""
+    """Parent RectTransform.rect size (pre-localScale) for layout fitters."""
     fid = obj.get("father_id")
     parent = by_xf.get(str(fid)) if fid else None
     if parent is None:
         return (float(screen_w), float(screen_h))
     cache = {}
-    _cx, _cy, pw, ph = _ui_screen_rect(
+    pw, ph = _ui_local_rect_wh(
         parent, by_xf, screen_w, screen_h, cache)
     return (abs(pw), abs(ph))
 
@@ -2264,7 +2326,7 @@ def _apply_content_size_fitter(obj, children_map, by_xf, screen_w, screen_h):
     csf = obj.get("content_size_fitter") or {}
     parent_size = _layout_parent_pixel_size(obj, by_xf, screen_w, screen_h)
     cache = {}
-    _cx, _cy, cur_w, cur_h = _ui_screen_rect(
+    cur_w, cur_h = _ui_local_rect_wh(
         obj, by_xf, screen_w, screen_h, cache)
     cur = (abs(cur_w), abs(cur_h))
     for axis, fit_key in ((0, "horizontal"), (1, "vertical")):
@@ -2301,7 +2363,7 @@ def _apply_aspect_ratio_fitter(obj, by_xf, screen_w, screen_h):
         return
     parent_size = _layout_parent_pixel_size(obj, by_xf, screen_w, screen_h)
     cache = {}
-    _cx, _cy, cur_w, cur_h = _ui_screen_rect(
+    cur_w, cur_h = _ui_local_rect_wh(
         obj, by_xf, screen_w, screen_h, cache)
     cur_w, cur_h = abs(cur_w), abs(cur_h)
     if mode == 2:  # HeightControlsWidth
@@ -2519,8 +2581,10 @@ def _apply_layout_groups(objects, screen_w, screen_h):
                 if c.get("rect") is not None]
         if not kids:
             continue
+        # LayoutGroup uses parent.rect (pre-localScale); screen mapping
+        # applies ancestor scales in _ui_screen_rect.
         cache = {}
-        _cx, _cy, pw, ph = _ui_screen_rect(
+        pw, ph = _ui_local_rect_wh(
             parent, by_xf, screen_w, screen_h, cache)
         parent_size = (abs(pw), abs(ph))
         is_vert = bool(parent["layout_group"].get("vertical"))
@@ -3063,8 +3127,14 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None):
         if not font:
             continue
         cx, cy, rw, rh = _ui_screen_rect(o, by_xf, sw, sh, rect_cache)
+        # m_fontSize is in local (pre-canvas) units; scale to screen pixels
+        # so glyphs match RectTransform lossyScale (e.g. VLG localScale 0.59).
+        lw, lh = _ui_local_rect_wh(o, by_xf, sw, sh, rect_cache)
+        fs = float(tmp.get("font_size") or 14.0)
+        if lh > 1e-6:
+            fs = fs * (abs(float(rh)) / float(lh))
         tw, th, rgba = _rasterize_tmp_text(
-            font, tmp["text"], float(tmp.get("font_size") or 14.0),
+            font, tmp["text"], fs,
             (1.0, 1.0, 1.0, 1.0),  # color via sprite tint (m_fontColor)
             rw, rh,
             int(tmp.get("h_align") or 1),
