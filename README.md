@@ -1,5 +1,5 @@
 # Crust
-## A Unified C/C++/Rust Compiler Environment for Systems Programming
+## A Unified C/C#/C++/Rust Compiler Environment for Systems Programming
 
 ## A new C++, from a self-contained system
 
@@ -85,6 +85,7 @@ Hardware:
 - [BAREMETAL_THREADS.md](BAREMETAL_THREADS.md)
 
 Crust Papers:
+- https://doi.org/10.5281/zenodo.22907133 "Proof-Carrying Rust: Logic safety on top of memory safety, in a toolchain small enough to read"
 - https://dx.doi.org/10.2139/ssrn.7396160 "Memory Safety Where it is Needed: Proof-guided Runtime Checking in a Toolchain Small Enough to Read"
 - https://dx.doi.org/10.2139/ssrn.7382398 "A Successor Discipline, Not a Successor Language: Safety by Subtraction in a Self-Contained C++ Toolchain"
 - https://dx.doi.org/10.2139/ssrn.7315678 "Interoperation Without an Interface: C++ and Rust in One Translation Unit, and One Toolchain"
