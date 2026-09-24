@@ -12258,10 +12258,196 @@ def _lower_lambdas(text, path):
     return text
 
 
+_PACK_OP = re.compile(r'(?:_Pragma\s*\(\s*"\s*pack\s*\(([^)"]*)\)\s*"\s*\)'
+                      r'|^[ \t]*#[ \t]*pragma[ \t]+pack[ \t]*\(([^)]*)\))',
+                      re.M)
+
+
+def _pack_state_at(text, pos):
+    """The `#pragma pack` value in force at `pos`: 0 for natural.
+
+    Replays every `#pragma pack(..)` and `_Pragma("pack(..)")` above `pos`
+    -- `push`, `pop`, `N`, `()` -- the way gcc and shivyc do. A struct
+    definition moved up by `any_order` has to keep the packing it was
+    written under, and must not pick up the packing of wherever it lands.
+    """
+    cur, stack = 0, []
+    for m in _PACK_OP.finditer(text, 0, pos):
+        args = [a.strip() for a in (m.group(1) if m.group(1) is not None
+                                    else m.group(2)).split(",")]
+        if args == [""]:
+            cur = 0
+        elif args[0] == "push":
+            stack.append(cur)
+            for a in args[1:]:
+                if a.isdigit():
+                    cur = int(a)
+        elif args[0] == "pop":
+            cur = stack.pop() if stack else 0
+        elif args[0].isdigit():
+            cur = int(args[0])
+    return cur
+
+
+def _by_value_names(ret):
+    """The type a field holds by value, or None for a pointer/reference."""
+    t = ret.strip()
+    if "*" in t or "&" in t:
+        return None
+    t = re.sub(r"^(?:(?:const|volatile|mutable|struct|class)\s+)+", "", t)
+    # Normalised, not deleted: `unsigned char` is two words, and
+    # `vector<unsignedchar>` names nothing.
+    t = re.sub(r"\s*([<>,])\s*", r"\1", re.sub(r"\s+", " ", t))
+    return t or None
+
+
+def _unit_name(tsub, name):
+    """`name` as the unit it would be emitted as, or None if it is not one.
+
+    Only a lookup: a spelling the monomorphiser cannot place is simply not
+    a unit here, and the translation proper reports it if it is wrong."""
+    if name is None or "<" not in name:
+        return name
+    try:
+        return tsub(name).strip()
+    except CppError:
+        return None
+
+
+def _order_plan(classes, insts_all, slot, tsub, path):
+    """For `any_order`: the units each class needs moved above it.
+
+    A *unit* is what a struct definition belongs to: a class, by name, or a
+    template instantiation, by its monomorphised name (`vector_Item`). Each
+    is emitted in one iteration of the class loop: a class in its own, an
+    instantiation in `slot[nm]` (its template's, or a later one it was
+    deferred to). So a unit is complete before class `idx` exactly when that
+    iteration is earlier: `pos < idx`.
+
+    A class holding an incomplete unit by value gets it moved: the unit's
+    struct definition -- only that, not its method bodies -- is emitted in a
+    slot just above the class, with its own by-value dependencies ahead of
+    it. The bodies stay where they were, where everything they read is
+    already complete.
+
+    Returns `{class_index: [unit, ..]}` in emission order, and `{unit:
+    (cls, targs)}` for every unit that moves.
+    """
+    at, origin = {}, {}
+    for k, (_s, _e, c) in enumerate(classes):
+        if not c.tparams:
+            at[c.name] = k
+            origin[c.name] = (c, None)
+    for _idx, cls, targs, nm in insts_all:
+        at[nm] = slot[nm]
+        origin[nm] = (cls, targs)
+
+    def deps(cls, targs):
+        """Units `cls` (instantiated over `targs`) holds by value."""
+        sub = dict(zip(cls.tparams or (), targs or ()))
+        out = []
+        for m in cls.members:
+            if m.kind != "field":
+                continue
+            ret = m.ret
+            for tp, ta in sub.items():
+                ret = re.sub(r"(?<![\w])%s(?![\w])" % re.escape(tp), ta, ret)
+            name = _unit_name(tsub, _by_value_names(ret))
+            if name in at:
+                out.append(name)
+        return out
+
+    def method_deps(cls):
+        """Units `cls`'s methods need complete: by-value returns, parameters,
+        locals, `sizeof` and value construction. Declarations, not every
+        mention -- `Row::make()` needs only a prototype, which is hoisted
+        already, and counting it would move (or refuse) for nothing."""
+        names = sorted(at, key=len, reverse=True)
+        if not names:
+            return []
+        alt = "|".join(re.escape(n) for n in names)
+        uses = re.compile(
+            r"(?<![\w.:>])(%s)(?:\s+[A-Za-z_]\w*\s*(?=[=;,)\[(])"
+            r"|\s*\()" % alt)
+        sizes = re.compile(r"sizeof\s*\(\s*(%s)\s*\)" % alt)
+        out = []
+        for m in cls.members:
+            if m.kind not in ("method", "ctor", "dtor"):
+                continue
+            for piece in [m.ret or ""] + _split_top(m.params or ""):
+                piece = piece.split("=", 1)[0].strip()
+                words = piece.rsplit(None, 1)
+                typ = words[0] if len(words) == 2 else piece
+                name = _unit_name(tsub, _by_value_names(typ))
+                if name in at:
+                    out.append(name)
+            try:
+                body = tsub(m.body or "")
+            except CppError:
+                body = m.body or ""
+            out.extend(mm.group(1) for mm in uses.finditer(body))
+            out.extend(mm.group(1) for mm in sizes.finditer(body))
+        return out
+
+    plan, moved = {}, {}
+
+    def place(unit, idx, trail, out):
+        if at[unit] < idx or unit in moved:
+            return
+        if unit in trail:
+            chain = trail[trail.index(unit):] + [unit]
+            raise CppError(
+                "%s: %s: each holds the next by value, so the first would "
+                "contain itself. Hold one of them by pointer."
+                % (os.path.basename(path),
+                   " -> ".join("`%s`" % c for c in chain)))
+        cls, targs = origin[unit]
+        if cls.base or cls.extra_bases or \
+                any(m.virt or m.pure for m in cls.members):
+            raise CppError(
+                "%s: `%s` holds `%s` by value, and `%s` is declared below "
+                "it. Its definition would have to move above `%s`, and a "
+                "class with a base or virtual members is tied to its "
+                "vtables where it stands. Declare `%s` first."
+                % (os.path.basename(path), trail[-1], unit, unit,
+                   trail[-1], unit))
+        for dep in deps(cls, targs):
+            place(dep, idx, trail + [unit], out)
+        out.append(unit)
+        moved[unit] = (cls, targs)
+
+    for idx, (_s, _e, cls) in enumerate(classes):
+        if cls.tparams:
+            continue
+        out = []
+        for dep in deps(cls, None):
+            if dep == cls.name:
+                raise CppError(
+                    "%s: `%s` holds itself by value: a struct cannot "
+                    "contain itself. Hold it by pointer."
+                    % (os.path.basename(path), cls.name))
+            place(dep, idx, [cls.name], out)
+        # Method bodies are emitted with the class, so a later unit they
+        # use by value is needed complete here too -- `Program` written
+        # first, declaring a `Row` declared below it, is the usual C# file.
+        for dep in method_deps(cls):
+            if dep != cls.name:
+                place(dep, idx, [cls.name], out)
+        if out:
+            plan[idx] = out
+    return plan, moved
+
+
 def translate(text, path="<cpp>", owning=None, basedir=None,
               incdirs=(), defines=(), clang=None, rtti=False, decls=(),
-              decls_out=None, contracts=False, mem_safe=False):
+              decls_out=None, contracts=False, mem_safe=False,
+              any_order=False):
     """Translate a C++ subset source to C. Raises CppError on anything else.
+
+    `any_order` lets a class hold, by value, a class or container declared
+    *below* it -- which C# allows and C++ does not. The struct definitions
+    it needs are moved up in the C output; see `_order_plan`. Off by
+    default, so C++ keeps C++'s rule; `csrust` turns it on.
 
     `owning` maps the name of a type this file does *not* define to the
     function that destroys one -- the types Crust lowered that own a buffer,
@@ -12740,10 +12926,30 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
             # construction. Held back to just after the class it needs.
             deferred.setdefault(slot[nm], []).append((cls, targs))
 
+    # `any_order`: struct definitions moved above the class that holds them
+    # by value. Planned from the same slots the instantiations use.
+    plan, moved = {}, {}
+    if any_order:
+        plan, moved = _order_plan(classes, insts_all, slot, tsub, path)
+    hoist_text, hoist_slots = {}, []
+    starts = dict((c.name, s0) for (s0, _e, c) in classes)
+
     def emit_one(cls, targs):
         (names_, protos, defs, tails), cname, info = _emit_class(
             cls, names, cinfo, tsub, targs, new_used.get(cls.name),
             chained, cls.name in std_classes, rtti=rtti)
+        unit = _mono_name(cls.name, targs) if targs else cls.name
+        if unit in moved:
+            # Emitted here, in order, so every class its methods read is
+            # already in `cinfo`; only the struct definition (and any
+            # `static const` members above it) goes up to the slot.
+            k = [j for j, d in enumerate(defs)
+                 if d.startswith("struct %s {" % cname)]
+            if not k:
+                raise CppError("cannot find the definition of `%s` to move "
+                               "it (a cpprust bug)" % cname)
+            hoist_text[unit] = "\n".join(defs[:k[0] + 1]) + "\n"
+            defs = defs[k[0] + 1:]
         # Trailing newline: two instantiations of the same template are
         # emitted back to back, and without it the last line of one runs
         # into the first line of the next.
@@ -12759,6 +12965,10 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
         head = text[prev:start]
         head = _TEMPLATE.sub("", head)
         pieces.append(head)
+        if idx in plan:
+            # Filled once the units are emitted, further down.
+            hoist_slots.append((len(pieces), plan[idx], start))
+            pieces.append("")
         insts = wanted.get(cls.name, []) if cls.tparams else [None]
         for targs in insts:
             # Compared on the *template* as well as the arguments: two
@@ -12785,6 +12995,32 @@ def translate(text, path="<cpp>", owning=None, basedir=None,
         # other.
         pieces.append(_src_mark(_src_line(text, end)))
     pieces.append(text[prev:])
+    for pi, units, start in hoist_slots:
+        # Each moved definition carries an anchor naming the line its class
+        # was written on, and the slot ends with one naming the line of the
+        # class below it -- so a diagnostic on either side of the slot still
+        # counts from the right place.
+        parts = ["\n"]
+        here = _pack_state_at(text, start)
+        for u in units:
+            if u not in hoist_text:
+                raise CppError("`%s` was planned to move but never emitted "
+                               "(a cpprust bug)" % u)
+            cls_u = moved[u][0]
+            parts.append(_src_mark(_src_line(text, starts[cls_u.name])))
+            # The packing it was written under, not the packing where it
+            # lands: a `_Pragma("pack(..)")` pair around the original stays
+            # behind, and without this the moved struct silently loses it
+            # (or gains the holder's).
+            own = _pack_state_at(text, starts[cls_u.name])
+            if own != here:
+                parts.append('_Pragma("pack(push, %d)")\n' % own if own
+                             else '_Pragma("pack(push)") _Pragma("pack()")\n')
+            parts.append(hoist_text[u])
+            if own != here:
+                parts.append('_Pragma("pack(pop)")\n')
+        parts.append(_src_mark(_src_line(text, start)))
+        pieces[pi] = "".join(parts)
     # Bodies defined out of line go after everything, not at the class: the
     # author wrote them below whatever file-scope names they read, and a
     # header spliced in at the top would otherwise put them above.

@@ -392,7 +392,17 @@ def _map_types(text):
 
 
 def _lower_var(text):
-    """`var` is `auto`, and `cpp_auto.resolve` already deduces one."""
+    """`var` is `auto`, and `cpp_auto.resolve` already deduces one.
+
+    Except where the type is written on the right: `var xs = new List<int>()`
+    is `List<int> xs = ...`, and spelling it matters. An `auto` there hid
+    the container from the C++ half's range-for, so `foreach` over a list
+    declared with `var` did not translate at all.
+    """
+    text = cpprust._sub_code(
+        r"(?<![\w.])var(\s+\w+\s*=\s*new\s+([\w:.]+(?:\s*<[^;{}()=]*>)?)"
+        r"\s*\()",
+        lambda m: m.group(2) + m.group(1), text)
     return cpprust._sub_code(r"(?<![\w.])var(?=\s+\w)",
                              lambda m: "auto", text)
 
@@ -838,7 +848,7 @@ def _split_depth(text, sep=","):
 
 
 def _instance_fields(body, name):
-    """([(type, field)], [ctor arity]) for a blanked struct/class body.
+    """([(type, field)], [ctor arity], [auto-property]) for a class body.
 
     Every brace group at depth zero is a method, accessor or nested type
     body -- except an auto-property's `{ get; set; }`, which *is* storage
@@ -851,14 +861,18 @@ def _instance_fields(body, name):
             j = cpprust._match_brace(body, i)
             if j is None:
                 break
-            flat.append(";" if _AUTO_PROP_BODY.match(body[i:j + 1])
+            # `\x01` marks the piece as an auto-property: storage like a
+            # field, but renamed `_Name` by `_lower_auto_properties`.
+            flat.append("\x01;" if _AUTO_PROP_BODY.match(body[i:j + 1])
                         else " @;")
             i = j + 1
             continue
         flat.append(c)
         i += 1
-    fields, ctors = [], []
+    fields, ctors, props = [], [], []
     for piece in "".join(flat).split(";"):
+        is_prop = piece.endswith("\x01")
+        piece = piece.replace("\x01", " ")
         piece = re.sub(r"\[[^\]]*\]", " ", piece)
         decl = piece.split("=", 1)[0] if "=>" not in piece else piece
         cm = re.search(r"(?<![\w.~])%s\s*\(([^()]*)\)" % re.escape(name),
@@ -879,10 +893,12 @@ def _instance_fields(body, name):
             continue
         typ = re.sub(r"\s+", "", first[0]) if "<" in first[0] else first[0]
         fields.append((typ, first[1]))
+        if is_prop:
+            props.append(first[1])
         for extra in parts[1:]:
             if extra:
                 fields.append((typ, extra))
-    return fields, ctors
+    return fields, ctors, props
 
 
 def _type_table(text):
@@ -893,11 +909,12 @@ def _type_table(text):
         head = scan[start:brace]
         colon = head.find(":")
         info = {"kind": kind, "base": "", "fields": [], "ctors": [],
+                "props": [],
                 "generic": "<" in (head[:colon] if colon >= 0 else head)}
         if colon >= 0:
             info["base"] = head[colon + 1:].strip()
         if kind in ("struct", "class"):
-            info["fields"], info["ctors"] = _instance_fields(
+            info["fields"], info["ctors"], info["props"] = _instance_fields(
                 scan[brace + 1:close], name)
         table[name] = info
     return table
@@ -943,11 +960,22 @@ def _unmanaged_reason(typ, table, seen=()):
 
 
 def _is_plain_struct(name, table):
-    """A struct that is nothing but its bytes, so zero bytes are `new T()`."""
+    """A type that is nothing but its bytes, so zero bytes are `new T()`.
+
+    A struct of unmanaged fields with no constructor -- or a class of the
+    same shape: C# zeroes a new object's fields before any constructor
+    runs, and a class with none has nothing else to run. No base class,
+    which would bring a vtable pointer the zeroing must not clear.
+    """
     info = table.get(name)
-    return (info is not None and info["kind"] == "struct"
-            and not info["ctors"]
-            and _unmanaged_reason(name, table) is None)
+    if info is None or info["ctors"]:
+        return False
+    if info["kind"] == "struct":
+        return _unmanaged_reason(name, table) is None
+    if info["kind"] != "class" or info["base"] or info["generic"]:
+        return False
+    return all(_unmanaged_reason(t, table) is None
+               for t, _f in info["fields"])
 
 
 def _layout(typ, table, pack=None):
@@ -1236,11 +1264,26 @@ def _lower_object_initializers(text, table, path, need):
         if dtype == "var":
             edits.append((tstart, tstart + 3, typ))
     # `T x = new T();` for a plain struct: the same zeroing, no initializer.
+    # And `x = new T();`, assigned rather than declared: C# zeroes that too,
+    # and the expression form `T()` has no C spelling for a struct with no
+    # constructor.
     for m in re.finditer(r"(?<![\w.])new\s+(\w+)\s*\(\s*\)\s*;", scan):
         if not _is_plain_struct(m.group(1), table):
             continue
         decl = _decl_before(scan, m.start())
         if decl is None:
+            am = re.search(r"(?:^|[;{}])\s*((?:this\s*\.\s*)?[A-Za-z_]\w*"
+                           r"(?:\s*\.\s*[A-Za-z_]\w*)*)\s*=\s*$",
+                           scan[max(0, m.start() - 300):m.start()])
+            if am is None or am.group(1) in _NOT_A_TYPE:
+                continue
+            lhs_start = m.start() - (len(scan[max(0, m.start() - 300):
+                                            m.start()]) - am.start(1))
+            lhs = text[lhs_start:lhs_start + len(am.group(1))]
+            need.add(("zero", ""))
+            edits.append((lhs_start, m.end(),
+                          "_cs_zero((unsigned char *)&%s, (int)sizeof(%s));"
+                          % (lhs, m.group(1))))
             continue
         need.add(("zero", ""))
         edits.append((scan.rfind("=", 0, m.start()), m.end(),
@@ -1250,6 +1293,15 @@ def _lower_object_initializers(text, table, path, need):
     for start, end, repl in sorted(edits, reverse=True):
         text = text[:start] + repl + text[end:]
     return text
+
+
+def _owns_storage(typ, table):
+    """Whether an element of C# type `typ` is more than plain bytes here."""
+    t = _norm_type(typ)
+    if t == "string" or _list_element(t) is not None or t.endswith("[]"):
+        return True
+    info = table.get(t)
+    return info is not None and info["kind"] in ("class", "struct")
 
 
 def _lower_new_arrays(text, table, path, need):
@@ -1293,6 +1345,14 @@ def _lower_new_arrays(text, table, path, need):
                 % (_at(path, text, m.start()), elem, elem))
         need.add(("array", elem))
         out.append(text[pos:m.start()])
+        # `var a = new int[n]`: the call about to replace `new` hides the
+        # type from `var`, so it is spelled, as `_lower_var` does for
+        # `new T(..)`.
+        joined = "".join(out)
+        dm = re.search(r"(?<![\w.])var(\s+\w+\s*=\s*)$", joined)
+        if dm:
+            out = [joined[:dm.start()] + elem + "[]"
+                   + joined[dm.start() + 3:]]
         out.append("_cs_new_array_%s(%s)" % (elem, text[m.start(2):m.end(2)]))
         pos = m.end()
     out.append(text[pos:])
@@ -1488,6 +1548,15 @@ def _helper_text(kind, typ):
                 "std::vector<%s> v(n); int i = 0; if (n < 0) { abort(); } "
                 "while (i < n) { v.push_back(0); i = i + 1; } return v; } "
                 % (ctype, typ, ctype))
+    if kind == "listidx":
+        ctype = dict(_TYPES).get(typ, typ)
+        return ("static int _cs_list_index_%s(std::vector<%s> &v, %s x) { "
+                "int i = 0; while (i < v.size()) { if (v[i] == x) { "
+                "return i; } i = i + 1; } return -1; } "
+                "static bool _cs_list_remove_%s(std::vector<%s> &v, %s x) { "
+                "int i = _cs_list_index_%s(v, x); if (i < 0) { return false; } "
+                "v.erase(v.ptr(i)); return true; } "
+                % (typ, ctype, ctype, typ, ctype, ctype, typ))
     if kind == "bytes":
         return ("static std::vector<unsigned char> _cs_blit_bytes_%s(%s *p) { "
                 "std::vector<unsigned char> out(%s); unsigned char *s = (unsigned char *)p; int i = 0; "
@@ -1524,8 +1593,15 @@ def _emit_plain_helpers(text, need):
     if ("zero", "") in need:
         head.append("static void _cs_zero(unsigned char *p, int n) { "
                     "int i = 0; while (i < n) { p[i] = 0; i = i + 1; } } ")
+    if ("check", "") in need:
+        head.append("static int _cs_check_index(int i, int n) { "
+                    "if (i < 0 || i >= n) { abort(); } return i; } "
+                    "static int _cs_check_insert(int i, int n) { "
+                    "if (i < 0 || i > n) { abort(); } return i; } ")
     head.extend(_helper_text("array", t)
                 for t in sorted(t for k, t in need if k == "array"))
+    head.extend(_helper_text("listidx", t)
+                for t in sorted(t for k, t in need if k == "listidx"))
     first = re.search(r"\S", _blank(text))
     at = first.start() if first else len(text)
     edits.append((text.rfind("\n", 0, at) + 1, "".join(head)))
@@ -1798,6 +1874,565 @@ def _lower_enums(text, path):
     return text
 
 
+def _check_declaration_order(text, table, shared, path):
+    """What `any_order` in the C++ half cannot do, refused in C# terms.
+
+    C# lets a type hold one declared below it; C needs the held struct
+    complete first. The C++ half moves the struct definitions it needs up
+    (`cpprust._order_plan`), which covers plain classes, structs and
+    containers. Two shapes it cannot, and they are said here, in the terms
+    the author wrote:
+
+    * the held type has a base class or implements an interface -- its
+      lowered struct is tied to its vtables where it is declared;
+    * a cycle. In C# a class field is a reference, so `A` holding a `B`
+      holding an `A` is ordinary; here a class is owned by value, and the
+      two would contain each other. `[Shared]` makes one of them a
+      reference again.
+    """
+    order = {}
+    for k, (_kind, name, start, _b, _c) in enumerate(_find_types(text)):
+        order.setdefault(name, (k, start))
+
+    def held(name):
+        info = table.get(name)
+        if info is None or info["kind"] not in ("struct", "class"):
+            return []
+        out = []
+        for ftype, fname in info["fields"]:
+            t = ftype.strip()
+            other = table.get(t)
+            if other is None or other["kind"] not in ("struct", "class") \
+                    or t in shared:
+                continue
+            out.append((fname, t))
+        return out
+
+    for name in order:
+        for fname, t in held(name):
+            if order[t][0] > order[name][0] and table[t]["base"]:
+                raise CsError(
+                    "%s`%s.%s` holds a `%s`, which is declared below `%s` and "
+                    "has a base (`%s`). A class is stored by value here, so "
+                    "`%s` has to be complete first, and a type with a base "
+                    "is lowered with vtables that tie it to where it is "
+                    "declared. Declare `%s` above `%s`, or mark it "
+                    "`[Shared]`."
+                    % (_at(path, text, order[name][1]), name, fname, t,
+                       name, table[t]["base"], t, t, name))
+
+    # Locals and parameters of a later type need it complete as well --
+    # method bodies are emitted with their class -- so the same holds for
+    # one written in a body or a signature.
+    types = _find_types(text)
+    scan = _blank(text)
+    for kind, name, _start, brace, close in types:
+        if kind not in ("struct", "class"):
+            continue
+        body = scan[brace + 1:close]
+        for t, info in table.items():
+            if info["kind"] not in ("struct", "class") or not info["base"] \
+                    or t in shared or order[t][0] <= order[name][0]:
+                continue
+            um = re.search(r"(?<![\w.])%s\s+[A-Za-z_]\w*\s*(?=[=;,)])"
+                           % re.escape(t), body)
+            if um:
+                raise CsError(
+                    "%s`%s` declares a `%s` here, and `%s` is declared below "
+                    "`%s` and has a base (`%s`). A class is stored by value, "
+                    "so `%s` has to be complete first, and a type with a "
+                    "base is lowered with vtables that tie it to where it is "
+                    "declared. Declare `%s` above `%s`, or mark it "
+                    "`[Shared]`."
+                    % (_at(path, text, brace + 1 + um.start()), name, t, t,
+                       name, info["base"], t, t, name))
+
+    state = {}
+
+    def visit(name, trail):
+        if state.get(name) == "done":
+            return
+        if name in trail:
+            chain = trail[trail.index(name):] + [name]
+            raise CsError(
+                "%s%s: each holds the next as a field. In C# those are "
+                "references, but a class here has a single owner and is "
+                "stored by value, so `%s` would contain itself. Mark one of "
+                "them `[Shared]`: a field of a `[Shared]` type is a reference."
+                % (_at(path, text, order[chain[0]][1]),
+                   " -> ".join("`%s`" % c for c in chain), chain[0]))
+        for _f, t in held(name):
+            visit(t, trail + [name])
+        state[name] = "done"
+
+    for name in order:
+        visit(name, [])
+
+
+# ---------------------------------------------------------------------------
+# What an expression is: enough type resolution for `List<T>` members
+# ---------------------------------------------------------------------------
+#
+# `.Add(` and `.Count` are ordinary names -- a user class may have its own
+# `Add`, and `Dictionary` has one of a different shape -- so a `List` member
+# is only lowered when the receiver is *known* to be a `List`. The receiver
+# is resolved the way a reader would: a local or parameter declared above
+# it in the same method, a `foreach` variable, else a field of the class it
+# is in; then field by field, and element by element for `[..]`.
+
+#: A receiver: `xs`, `this.items`, `inv.items`, `grid[i]`, `a.b[i].c`.
+_CHAIN = re.compile(r"(?<![\w.])(?:this|[A-Za-z_]\w*)"
+                    r"(?:\s*\.\s*[A-Za-z_]\w*|\s*\[[^\[\]]*\])*$")
+
+
+def _norm_type(t):
+    return re.sub(r"\s+", "", t or "")
+
+
+def _element_type(t):
+    """Element of `List<E>` / `E[]`, or None."""
+    t = _norm_type(t)
+    if t.endswith("[]"):
+        return t[:-2]
+    m = re.match(r"^(?:System\.Collections\.Generic\.)?List<(.+)>$", t)
+    return m.group(1) if m else None
+
+
+def _list_element(t):
+    t = _norm_type(t)
+    m = re.match(r"^(?:System\.Collections\.Generic\.)?List<(.+)>$", t)
+    return m.group(1) if m else None
+
+
+def _enclosing(types, pos, kinds=("class", "struct")):
+    """Innermost type span containing `pos`: (name, brace, close) or None."""
+    best = None
+    for kind, name, _start, brace, close in types:
+        if kind in kinds and brace < pos < close:
+            if best is None or brace > best[1]:
+                best = (name, brace, close)
+    return best
+
+
+def _method_span(scan, brace, close, pos):
+    """(signature_start, body_open) of the member body holding `pos`."""
+    depth, i, open_at = 0, brace + 1, None
+    while i < close:
+        c = scan[i]
+        if c == "{":
+            if depth == 0:
+                open_at = i
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0 and open_at is not None and open_at < pos <= i:
+                sig = max(scan.rfind(";", brace, open_at),
+                          scan.rfind("}", brace, open_at),
+                          brace) + 1
+                return sig, open_at
+        i += 1
+    return None
+
+
+def _declared_in(scan, lo, hi, name):
+    """The declared type of `name` between `lo` and `hi`, or None."""
+    found = None
+    pat = (r"(?<![\w.])([A-Za-z_][\w.]*(?:\s*<[^;{}()=]*>)?(?:\s*\[\s*\])*)"
+           r"\s+%s\s*(?=[=;,)]|in\b)" % re.escape(name))
+    for m in re.finditer(pat, scan[lo:hi]):
+        if m.group(1) in _NOT_A_TYPE:
+            continue
+        found = m
+    if found is None:
+        return None
+    typ = found.group(1)
+    tail = scan[lo + found.end():hi]
+    if typ == "var":
+        nm = re.match(r"\s*=\s*new\s+([\w.]+(?:\s*<[^;{}()=]*>)?)", tail)
+        if nm:
+            return _norm_type(nm.group(1))
+        fm = re.match(r"\s*in\s+([^)]+)\)", tail)
+        if fm:
+            return ("foreach", fm.group(1).strip(), lo + found.end())
+        return None
+    fm = re.match(r"\s*in\s+", tail)
+    if fm and re.search(r"foreach\s*\(\s*$", scan[lo:lo + found.start()]):
+        return _norm_type(typ)
+    return _norm_type(typ)
+
+
+def _field_type(table, cls, name):
+    info = table.get(cls)
+    if info is None:
+        return None
+    for ftype, fname in info["fields"]:
+        if fname == name:
+            return _norm_type(ftype)
+    return None
+
+
+def _expr_type(chain, pos, scan, table, types, depth=0):
+    """C# type of the receiver `chain` written at `pos`, or None."""
+    if depth > 4:
+        return None
+    parts = re.findall(r"\[[^\[\]]*\]|[A-Za-z_]\w*", chain)
+    if not parts:
+        return None
+    here = _enclosing(types, pos)
+    head = parts[0]
+    if head == "this":
+        typ = here[0] if here else None
+    else:
+        typ = None
+        if here is not None:
+            span = _method_span(scan, here[1], here[2], pos)
+            if span is not None:
+                typ = _declared_in(scan, span[0], pos, head)
+                if isinstance(typ, tuple):
+                    # `foreach (var x in xs)`: the element of `xs`.
+                    src = _expr_type(typ[1], typ[2], scan, table, types,
+                                     depth + 1)
+                    typ = _element_type(src)
+            if typ is None:
+                typ = _field_type(table, here[0], head)
+    for part in parts[1:]:
+        if typ is None:
+            return None
+        if part.startswith("["):
+            typ = _element_type(typ)
+        else:
+            typ = _field_type(table, typ, part)
+    return typ
+
+
+def _storage_chain(chain, pos, scan, table, types):
+    """`chain` with a final auto-property replaced by its backing field.
+
+    `get_Items()` returns the list *by value*, so `x.Items.Add(1)` through
+    it would add to a copy and lose the element. In C# the getter hands
+    back the same list, so the mutation reaches the object; here that is
+    the storage, `_Items`.
+    """
+    m = re.search(r"(?:^|\.\s*)([A-Za-z_]\w*)\s*$", chain)
+    if m is None:
+        return chain
+    name = m.group(1)
+    owner_chain = chain[:m.start(1)].rstrip().rstrip(".").rstrip()
+    if owner_chain:
+        owner = _expr_type(owner_chain, pos, scan, table, types)
+    else:
+        here = _enclosing(types, pos)
+        owner = here[0] if here else None
+    info = table.get(owner) if owner else None
+    if info is not None and name in info.get("props", ()):
+        return chain[:m.start(1)] + "_" + name
+    return chain
+
+
+#: `List<T>` members and their lowering. `{r}` is the receiver, `{0}`..
+#: the arguments. Index checks abort, as the unhandled
+#: `ArgumentOutOfRangeException` does; the prelude's own `insert` would
+#: clamp a bad index and `erase` ignore one, silently.
+_LIST_MEMBERS = {
+    "Add": (1, "{r}.push_back({0})"),
+    "Clear": (0, "{r}.clear()"),
+    "Insert": (2, "{r}.insert({r}.ptr(_cs_check_insert({0}, {r}.size())), {1})"),
+    "RemoveAt": (1, "{r}.erase({r}.ptr(_cs_check_index({0}, {r}.size())))"),
+    "Contains": (1, "(_cs_list_index_{e}({r}, {0}) >= 0)"),
+    "IndexOf": (1, "_cs_list_index_{e}({r}, {0})"),
+    "Remove": (1, "_cs_list_remove_{e}({r}, {0})"),
+}
+
+
+def _list_property_storage(text, table):
+    """Reads of a `List`-typed auto-property go to its storage, `_Items`.
+
+    The getter returns the list by value. In C# it returns the same list,
+    so `b.Items[1] = 5` and `foreach (.. in b.Items)` see the object's own;
+    through a copy the first would write to a temporary and be lost.
+    Assignments to the property are left to its setter.
+    """
+    props = {}
+    for cname, info in table.items():
+        for ftype, fname in info.get("fields", ()):
+            if fname in info.get("props", ()) and _list_element(ftype):
+                props.setdefault(fname, set()).add(cname)
+    if not props:
+        return text
+    scan = _blank(text)
+    types = _find_types(text)
+    edits = []
+    pat = r"(?<![\w])(%s)(?![\w])" % "|".join(
+        re.escape(n) for n in sorted(props, key=len, reverse=True))
+    for m in re.finditer(pat, scan):
+        name = m.group(1)
+        after = scan[m.end():]
+        if re.match(r"\s*(?:=(?!=)|\{|\()", after):
+            continue                    # assigned, declared, or a call
+        before = scan[:m.start()].rstrip()
+        if before.endswith("."):
+            dot = len(before) - 1
+            k = dot
+            while k > 0 and (scan[k - 1].isalnum() or scan[k - 1] in "_.[] \t"):
+                k -= 1
+            cm = _CHAIN.search(scan[k:dot].rstrip())
+            if cm is None:
+                continue
+            owner = _expr_type(cm.group(0), k + cm.start(), scan, table, types)
+        else:
+            if re.search(r"[\w>\]]\s*$", before):
+                continue                # a declaration: `List<int> Items`
+            here = _enclosing(types, m.start())
+            owner = here[0] if here else None
+            if owner is not None:
+                span = _method_span(scan, here[1], here[2], m.start())
+                if span is None or _declared_in(scan, span[0], m.start(),
+                                                name) is not None:
+                    continue            # not in a body, or a local shadows it
+        if owner in props[name]:
+            edits.append((m.start(), m.end(), "_" + name))
+    for start, end, repl in sorted(edits, reverse=True):
+        text = text[:start] + repl + text[end:]
+    return text
+
+
+def _lower_list_members(text, table, path, need):
+    """`xs.Add(x)`, `xs.Count`, .. for an `xs` known to be a `List<T>`.
+
+    `Contains`, `IndexOf` and `Remove` compare elements with `==`, which is
+    C#'s `Equals` for a primitive or an enum; for anything else C# would call
+    an `Equals` this lowering does not have, so those are refused rather
+    than compared some other way.
+    """
+    scan = _blank(text)
+    types = _find_types(text)
+    edits = []
+    names = "|".join(sorted(list(_LIST_MEMBERS) + ["Count"], key=len,
+                            reverse=True))
+    for m in re.finditer(r"\.\s*(%s|[A-Z]\w*)\b" % names, scan):
+        member = m.group(1)
+        start = m.start()
+        # Walk back over the receiver: identifiers, dots and `[..]`.
+        j = start
+        while j > 0:
+            c = scan[j - 1]
+            if c.isalnum() or c in "_. \t":
+                j -= 1
+            elif c == "]":
+                k, depth = j - 1, 0
+                while k >= 0:
+                    if scan[k] == "]":
+                        depth += 1
+                    elif scan[k] == "[":
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    k -= 1
+                j = k
+            else:
+                break
+        # The walk also crosses spaces, so it can take in a word before the
+        # receiver (`return xs.Count`); the receiver is the chain that
+        # ends at the dot.
+        seg = scan[j:start].rstrip()
+        cm = _CHAIN.search(seg)
+        if cm is None:
+            continue
+        chain = cm.group(0)
+        rstart = j + cm.start()
+        if rstart > 0 and scan[rstart - 1] in ".>":
+            continue                      # part of a longer chain
+        typ = _expr_type(chain, rstart, scan, table, types)
+        elem = _list_element(typ)
+        if elem is None:
+            continue
+        recv = _storage_chain(text[rstart:start].strip(), rstart, scan,
+                              table, types)
+        after = scan[m.end():]
+        if member == "Count":
+            if re.match(r"\s*\(", after):
+                raise CsError(
+                    "%s`Count()` is the LINQ method; on a `List` the count "
+                    "is the property, `Count`." % _at(path, text, start))
+            edits.append((rstart, m.end(), "%s.size()" % recv))
+            continue
+        if member not in _LIST_MEMBERS:
+            if re.match(r"\s*\(", after) or member in ("Capacity",):
+                raise CsError(
+                    "%s`List.%s` is not in the C# subset yet. The `List<T>` "
+                    "members that are: `Add`, `Insert`, `RemoveAt`, "
+                    "`Remove`, `Clear`, `Contains`, `IndexOf`, `Count`, and "
+                    "indexing." % (_at(path, text, start), member))
+            continue
+        arity, form = _LIST_MEMBERS[member]
+        om = re.match(r"\s*\(", after)
+        if om is None:
+            continue
+        op = m.end() + om.end() - 1
+        close = cpprust._match_paren(scan, op)
+        args = [(o, a) for o, a in _split_depth(scan[op + 1:close])
+                if a.strip()]
+        if len(args) != arity:
+            raise CsError("%s`List.%s` takes %d argument%s here."
+                          % (_at(path, text, start), member, arity,
+                             "" if arity == 1 else "s"))
+        argv = [text[op + 1 + o:op + 1 + o + len(a)].strip() for o, a in args]
+        e = ""
+        if "{e}" in form:
+            info = table.get(elem)
+            if info is not None and info["kind"] == "enum":
+                e = info["base"].strip() or "int"
+            elif elem in _PRIM_UNMANAGED:
+                e = elem
+            else:
+                raise CsError(
+                    "%s`List<%s>.%s` compares elements with `Equals`. For a "
+                    "primitive or an enum that is `==`, which is what the "
+                    "lowering has; for `%s` it would be an `Equals` this "
+                    "subset does not have. Compare the field you mean in a "
+                    "loop." % (_at(path, text, start), elem, member, elem))
+            need.add(("listidx", e))
+        if "_cs_check_" in form:
+            need.add(("check", ""))
+        if member == "Add" and not _CHAIN.match(argv[0]) \
+                and _owns_storage(elem, table):
+            # `xs.Add(new Row())`: the object is a temporary, and the C++
+            # half passes an element by address, which a temporary does
+            # not have. Named, then moved in -- a move, because a class
+            # here has one owner and copying one that owns a resource is
+            # refused. A statement, which `Add` always is (it is `void`);
+            # and a declaration, so an object initializer in the argument
+            # becomes the declaration form `_lower_object_initializers`
+            # already takes.
+            semi = re.match(r"\s*;", scan[close + 1:])
+            if semi:
+                tmp = "_cs_add%d" % len(edits)
+                edits.append((rstart, close + 1 + semi.end(),
+                              "{ %s %s = %s; %s.push_back(std::move(%s)); }"
+                              % (elem, tmp, argv[0], recv, tmp)))
+                continue
+        edits.append((rstart, close + 1,
+                      form.replace("{r}", recv).replace("{e}", e)
+                      .format(*argv)))
+    # `foreach (var x in b.items)`: the C++ half deduces a loop variable from
+    # a local's declared type, not through a member chain, so the element
+    # type is spelled wherever it is known here.
+    for m in re.finditer(r"(?<![\w])foreach\s*\(\s*(var)\s+\w+\s+in\s+([^)]*)\)",
+                         scan):
+        chain = m.group(2).strip()
+        if not _CHAIN.match(chain) or not re.search(r"[.\[]", chain):
+            continue
+        elem = _element_type(_expr_type(chain, m.start(2), scan, table,
+                                        types))
+        if elem:
+            edits.append((m.start(1), m.end(1), elem))
+    for start, end, repl in sorted(edits, reverse=True):
+        text = text[:start] + repl + text[end:]
+    return text
+
+
+def _static_member(scan, types, tname, member):
+    """Whether `member` is declared `static` in type `tname`."""
+    for _kind, name, _start, brace, close in types:
+        if name == tname:
+            body = scan[brace + 1:close]
+            return re.search(r"(?<![\w])static\b[^;{}()]*(?<![\w.])%s\s*[(;={]"
+                             % re.escape(member), body) is not None
+    return False
+
+
+def _lower_static_calls(text, table):
+    """`Type.Method(..)` -> `Type::Method(..)` for a `static` method.
+
+    C# names a static member through its type with a dot; C++ with `::`,
+    which is what the C++ half recognises as a call with no receiver.
+    Only for a method declared `static` in a type of this file, so an
+    instance call through a variable that happens to share a type's name
+    -- a field `In In`, qualified to `this.In` just before this -- is not
+    touched.
+    """
+    tnames = [n for n, i in table.items() if i["kind"] in ("struct", "class")]
+    if not tnames:
+        return text
+    scan = _blank(text)
+    types = _find_types(text)
+    edits = []
+    pat = r"(?<![\w.])(%s)\s*\.\s*([A-Za-z_]\w*)\s*\(" % "|".join(
+        re.escape(n) for n in sorted(tnames, key=len, reverse=True))
+    for m in re.finditer(pat, scan):
+        if _static_member(scan, types, m.group(1), m.group(2)):
+            dot = scan.index(".", m.end(1))
+            edits.append((dot, dot + 1, "::"))
+    for start, end, repl in sorted(edits, reverse=True):
+        text = text[:start] + repl + text[end:]
+    return text
+
+
+def _qualify_type_named_fields(text, table):
+    """`In.Get()` for a field `public In In;` -> `this.In.Get()`.
+
+    C# allows a member named after a type, most often its own (`public
+    Color Color;`), and resolves each use by context -- the "Color Color"
+    rule: in `In.X`, an instance member `X` means the field and a static
+    one the type. C++ has no such rule (a member named like a type it uses
+    is ill-formed there), and the C++ half, seeing a type name, never
+    qualified it with `this`, so `In.Get()` reached C as `In.Get()`.
+
+    Inside the owning class's methods every use that means the field gets
+    an explicit `this.`, which the ordinary `this.` lowering then takes.
+    The uses that mean the type are left as they are: `new In(..)`, a
+    declaration `In x`, a cast `(In)x`, a generic argument, `typeof`/
+    `sizeof`/`nameof`, `In[]`, and `In.X` with a static `X`. A local or
+    parameter named `In` shadows the field, as in C#.
+    """
+    tnames = set(n for n, i in table.items() if i["kind"] in ("struct", "class"))
+    scan = _blank(text)
+    types = _find_types(text)
+    edits = []
+    for kind, cname, _start, brace, close in types:
+        info = table.get(cname)
+        if kind not in ("struct", "class") or info is None:
+            continue
+        clash = sorted(set(f for _t, f in info["fields"]
+                           if f in tnames and f not in info.get("props", ())))
+        if not clash:
+            continue
+        nested = [(b, c) for _k, _n, _s, b, c in types if brace < b < close]
+        pat = r"(?<![\w.])(%s)(?![\w])" % "|".join(re.escape(n) for n in clash)
+        for m in re.finditer(pat, scan[brace + 1:close]):
+            pos = brace + 1 + m.start()
+            if any(b < pos < c for b, c in nested):
+                continue
+            name = m.group(1)
+            span = _method_span(scan, brace, close, pos)
+            if span is None or pos < span[1]:
+                continue                    # not in a body: a declaration
+            if _declared_in(scan, span[0], pos, name) is not None:
+                continue                    # a local or parameter shadows it
+            before = scan[:pos].rstrip()
+            after = scan[pos + len(name):]
+            if re.search(r"(?<![\w])(?:new|typeof|sizeof|nameof|is|as)\s*\(?$",
+                         before) or before.endswith("<") or \
+                    re.match(r"\s*>", after):
+                continue                    # the type
+            if re.match(r"\s*\[\s*\]", after) or \
+                    re.match(r"\s+(?!is\b|as\b)[A-Za-z_]", after):
+                continue                    # `In[]`, a declaration `In x`
+            pw = re.search(r"([A-Za-z_]\w*|[>\]])\s*$", before)
+            if pw and pw.group(1) not in _NOT_A_TYPE and \
+                    pw.group(1) not in ("this", "base"):
+                continue                    # the name being declared: `In In`
+            if before.endswith("(") and re.match(r"\s*\)\s*[\w(]", after):
+                continue                    # a cast `(In)x`
+            dm = re.match(r"\s*\.\s*([A-Za-z_]\w*)", after)
+            if dm and _static_member(scan, types, name, dm.group(1)):
+                continue                    # `In.Static` is the type's
+            edits.append((pos, pos, "this."))
+    for start, end, repl in sorted(edits, reverse=True):
+        text = text[:start] + repl + text[end:]
+    return text
+
+
 def _drop_using_directives(text):
     """`using System;` goes; `using X = Y;` stays.
 
@@ -1851,6 +2486,7 @@ def translate(text, path="<cs>"):
     shared = _find_shared_names(text)
     # Read from the source as written, before any pass renames a type.
     table = _type_table(text)
+    _check_declaration_order(text, table, shared, path)
     need = set()
     # Before the generic attribute pass, which would drop a whole-line
     # `[StructLayout]` without reading its `Pack`.
@@ -1876,6 +2512,11 @@ def translate(text, path="<cs>"):
     # pass, so an initializer's `P = 1` becomes `x.P = 1` in time to be
     # turned into `x.set_P(1)` like any other.
     text = _lower_memory_marshal(text, table, path, need)
+    # Before initializers: `xs.Add(new T { .. })` becomes a declaration.
+    text = _lower_list_members(text, table, path, need)
+    text = _list_property_storage(text, table)
+    text = _qualify_type_named_fields(text, table)
+    text = _lower_static_calls(text, table)
     text = _lower_object_initializers(text, table, path, need)
     text = _lower_new_arrays(text, table, path, need)
     text = _qualify_bases(text)
