@@ -23,6 +23,7 @@ import os
 import sys
 
 import shivyc.lexer as lexer
+import shivyc.pack as pack
 import shivyc.token_kinds as token_kinds
 from shivyc.tokens import Token, parse_c_int
 from shivyc.errors import error_collector, CompilerError, Position, Range
@@ -868,6 +869,15 @@ class _Preprocessor:
 
         elif name == "line":
             self._do_line(rest, line[0])
+
+        elif name == "pragma" and rest and ident_name(rest[0]) == "pack":
+            # Not ignored: it changes struct layout, and dropping it gave a
+            # different layout from gcc's with nothing to say so. A directive
+            # leaves no tokens behind, so it becomes a marker that
+            # `shivyc.pack` reads in stream order, between the definitions
+            # it applies to.
+            out.extend(_relex(pack.PACK_MARKER, line[0].r))
+            out.extend(rest[1:])
 
         elif name in ("pragma", "ident", "sccs", "warning"):
             pass  # ignored

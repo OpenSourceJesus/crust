@@ -832,6 +832,10 @@ def process_c_file(file, args):
     # Extract GCC alias/weak attributes (and strip other attributes) at the
     # token level; the recorded aliases become .weak/.set directives below.
     import shivyc.weak_alias as weak_alias
+    # Packing first: it reads `__attribute__((packed))`, which
+    # extract_aliases strips with every other attribute it does not act on.
+    import shivyc.pack as pack
+    token_list = pack.apply_packing(token_list)
     token_list, aliases = weak_alias.extract_aliases(token_list)
 
     # Translation phase 6: concatenate adjacent string literals

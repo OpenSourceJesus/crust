@@ -77,6 +77,7 @@ def load_program(files, args):
     import shivyc.lexer as lexer
     import shivyc.preproc as preproc
     import shivyc.weak_alias as weak_alias
+    import shivyc.pack as pack
     import shivyc.cache as cache
     import shivyc.stackless as stackless
     import shivyc.main as main_mod
@@ -111,6 +112,8 @@ def load_program(files, args):
 
         error_collector.clear()
         tokens = preproc.process(lexer.tokenize(code, src_path), src_path)
+        # Before extract_aliases, which strips `packed` (see shivyc.pack).
+        tokens = pack.apply_packing(tokens)
         tokens, _ = weak_alias.extract_aliases(tokens)
         tokens = main_mod._concat_adjacent_strings(tokens)
         key = cache.token_key(tokens)

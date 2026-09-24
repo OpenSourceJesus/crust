@@ -8611,6 +8611,13 @@ def find_rust_items(code, rust_file=False):
             spans.append((_extend_head(scan, start), close + 1, "const"))
             continue
 
+        # `struct __attribute__((packed)) S { .. }` is C: the attribute sits
+        # where the name would, and its `((..))` then read as a Rust tuple
+        # struct's field list. Rust has no `__attribute__`, so an item
+        # "named" that is never Rust.
+        if _iname in ("__attribute__", "__attribute", "__declspec"):
+            continue
+
         after = scan[_iend:]
         if kw == "type":
             # `type Name = Type;` — no braces; ends at the semicolon.

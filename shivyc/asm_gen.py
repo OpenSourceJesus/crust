@@ -28,6 +28,24 @@ def _float_to_bits(val, size):
     return val
 
 
+
+def _contains_packing(ctype):
+    """Whether `ctype` is, holds, or is an array of, a packed struct/union.
+
+    Packing is what lets an aggregate sit below its members' natural
+    alignment, so it is what a back end copying the aggregate in wide
+    chunks has to know about."""
+    while ctype.is_array():
+        ctype = ctype.el
+    if not ctype.is_struct_union() or not ctype.members:
+        return False
+    if getattr(ctype, "pack", 0):
+        return True
+    for _name, mct in ctype.members:
+        if _contains_packing(mct):
+            return True
+    return False
+
 class ASMCode:
     """Stores the ASM code generated from the IL code.
 
@@ -2317,19 +2335,28 @@ class ASMGen:
                 abase, ao = self._arm64_agg_base(arg, 11, slot_of)
                 sz = out.ctype.size
                 done = 0
-                while sz - done >= 8:
+                # A packed aggregate may start at any multiple of its own
+                # alignment -- `arr[1]` of a 5-byte struct is at an odd
+                # address -- and with the MMU off a misaligned `ldr` faults.
+                # So no chunk is wider than that alignment. Only for types
+                # with packing in them: `struct { char a[16]; }` also has
+                # alignment 1, and its 8-byte copies are left as they were.
+                step = 8
+                if _contains_packing(out.ctype):
+                    step = out.ctype.alignment()
+                while sz - done >= 8 and step >= 8:
                     self.asm_code.add(asm_cmds.Raw(
                         "ldr\tx9, [%s, #%d]" % (abase, ao + done)))
                     self.asm_code.add(asm_cmds.Raw(
                         "str\tx9, [%s, #%d]" % (obase, oo + done)))
                     done += 8
-                while sz - done >= 4:
+                while sz - done >= 4 and step >= 4:
                     self.asm_code.add(asm_cmds.Raw(
                         "ldr\tw9, [%s, #%d]" % (abase, ao + done)))
                     self.asm_code.add(asm_cmds.Raw(
                         "str\tw9, [%s, #%d]" % (obase, oo + done)))
                     done += 4
-                while sz - done >= 2:
+                while sz - done >= 2 and step >= 2:
                     self.asm_code.add(asm_cmds.Raw(
                         "ldrh\tw9, [%s, #%d]" % (abase, ao + done)))
                     self.asm_code.add(asm_cmds.Raw(

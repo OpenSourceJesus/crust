@@ -70,6 +70,15 @@ def token_key(tokens):
             # every diagnostic against the wrong line. `#line` makes this
             # reachable on purpose: it changes positions and nothing else, so
             # without this the resync is silently undone by a cache hit.
+            # Packing lives on the `struct`/`union` keyword, not in any
+            # spelling: `#pragma pack` markers and `packed` attributes are
+            # gone by now. Without it, `__attribute__((packed))` and a
+            # same-length `__attribute__((unused))` hash alike and the one
+            # replays the other's layout. Only when set, so every key that
+            # was valid before still is.
+            pk = getattr(t, "pack", 0)
+            if pk:
+                h.update(("\x03%d" % pk).encode())
             h.update(b"\x02")
             r = getattr(t, "r", None)
             if r is not None and r.start is not None:

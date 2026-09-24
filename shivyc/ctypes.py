@@ -382,14 +382,38 @@ class _UnionStructCType(CType):
         # Map from member name to (bit_width, signed) for any member declared
         # as a bitfield. Members not in this map are ordinary members.
         self.bitfields = {}
+        # Maximum member alignment from `#pragma pack(N)` or
+        # `__attribute__((packed))` (which is 1); 0 lays out naturally.
+        self.pack = 0
         super().__init__(1)
 
     def alignment(self):
-        """A struct/union's alignment is the max alignment of its members
-        (regardless of ShivyC's packed layout). Used by `_Alignof`."""
+        """The max alignment of the members, capped at `pack` if set.
+
+        The cap is what makes a packed struct packable in its turn: nested
+        in another struct or placed in an array, it may start at any
+        multiple of `pack`, and gcc gives it exactly this alignment."""
         if not self.members:
             return 1
-        return max((c.alignment() for _, c in self.members), default=1)
+        al = max((c.alignment() for _, c in self.members), default=1)
+        if self.pack and al > self.pack:
+            return self.pack
+        return al
+
+    def member_align(self, ctype):
+        """Alignment a member of `ctype` gets in this struct/union."""
+        al = ctype.alignment()
+        if self.pack and al > self.pack:
+            return self.pack
+        return al
+
+    def maybe_misaligned(self, ctype):
+        """Whether a member of `ctype` can sit at an address its natural
+        alignment does not divide. Only when packing lowered the alignment:
+        the struct itself is then only `pack`-aligned, so even a member at
+        an offset that is a multiple of its size may be misaligned in
+        memory. Such a member is read and written a byte at a time."""
+        return self.pack > 0 and ctype.alignment() > self.pack
 
     def weak_compat(self, other):
         """Return True if other is a compatible type to self.
@@ -425,7 +449,7 @@ class _UnionStructCType(CType):
         """Return (bit_width, signed) if member is a bitfield, else None."""
         return self.bitfields.get(member)
 
-    def set_members(self, members, bitfields=None):
+    def set_members(self, members, bitfields=None, pack=0):
         """Add the given members to this type.
 
         The members list is given in the format as described in the class
@@ -459,7 +483,7 @@ class _UnionStructCType(CType):
 class StructCType(_UnionStructCType):
     """Represents a struct ctype."""
 
-    def set_members(self, members, bitfields=None):
+    def set_members(self, members, bitfields=None, pack=0):
         import shivyc.member_elim as member_elim
         has_anon = any(isinstance(m, str) and m.startswith("<")
                        for m, _ in members)
@@ -495,6 +519,7 @@ class StructCType(_UnionStructCType):
 
         self.members = members
         self.bitfields = bitfields or {}
+        self.pack = pack
 
         # Lay members out at their natural alignment (standard C / SysV), and
         # pad the whole struct up to its own alignment. ShivyC previously packed
@@ -503,9 +528,10 @@ class StructCType(_UnionStructCType):
         # offset -- straddling the SysV eightbyte boundary, so passing such a
         # struct by value in registers cross-TU or to/from gcc-compiled code
         # dropped half its bytes. Aligned layout matches the platform ABI.
+        # `pack` caps each member's alignment, as gcc's `#pragma pack` does.
         cur_offset = 0
         for member, ctype in members:
-            al = ctype.alignment()
+            al = self.member_align(ctype)
             if al > 1:
                 cur_offset = (cur_offset + al - 1) // al * al
             self.offsets[member] = cur_offset, ctype
@@ -528,7 +554,7 @@ class UnionCType(_UnionStructCType):
     Similar to struct type, but different offset is used.
     """
 
-    def set_members(self, members, bitfields=None):
+    def set_members(self, members, bitfields=None, pack=0):
         import shivyc.member_elim as member_elim
         if member_elim.collecting():
             # A struct sharing storage with other union members has its layout
@@ -541,6 +567,7 @@ class UnionCType(_UnionStructCType):
                     member_elim.mark_ineligible(getattr(inner, "tag", None))
         self.members = members
         self.bitfields = bitfields or {}
+        self.pack = pack
         raw = max([ctype.size for _, ctype in members], default=0)
         al = self.alignment()
         if al > 1:
