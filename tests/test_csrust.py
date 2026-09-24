@@ -33,6 +33,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import tools.cpprust as cpprust                              # noqa: E402
 import tools.cs2cpp as cs2cpp                                # noqa: E402
 import tools.csrust as csrust                                # noqa: E402
 
@@ -849,8 +850,8 @@ class TestStructLayout(unittest.TestCase):
     @needs_cc
     def test_a_packed_struct_inside_a_natural_one(self):
         # `In` is 5 bytes with alignment 1; `W` still aligns to 8: 16.
-        # `In` comes first because C needs a field's struct complete before
-        # it: the pipeline does not reorder definitions, packed or not.
+        # `In` is declared below `Q`, so its definition is moved up -- and
+        # has to keep its `Pack` when it is (`TestDeclarationOrder`).
         src = _program(
             "        Q q = new Q { A = 1, W = 5 };\n"
             "        q.In.V = 300;\n"
@@ -859,9 +860,9 @@ class TestStructLayout(unittest.TestCase):
             "        Q r = MemoryMarshal.Read<Q>(b);\n"
             "        if (r.In.V != 300 || r.W != 5) { return 99; }\n"
             "        return b.Length;",
+            "public struct Q { public byte A; public In In; public long W; }\n"
             "[StructLayout(LayoutKind.Sequential, Pack = 1)]\n"
-            "public struct In { public byte T; public int V; }\n"
-            "public struct Q { public byte A; public In In; public long W; }\n")
+            "public struct In { public byte T; public int V; }\n")
         self.assert_both(src, 16)
 
     @needs_cc
@@ -1195,6 +1196,448 @@ class TestEnums(unittest.TestCase):
     def test_a_non_integral_base_is_refused(self):
         self.assert_refuses("public enum Kind : float { A }\n",
                             "integral")
+
+
+class TestDeclarationOrder(unittest.TestCase):
+    """A type may hold one declared below it, as in C#.
+
+    C needs a by-value field's struct complete first, so the C++ half moves
+    the struct definitions a holder needs above it (`any_order`, which
+    `csrust` turns on): classes, structs, and container instantiations like
+    `vector_Item`. Only the definition moves; method bodies stay where they
+    were written. Each case runs under gcc and shivyc.
+    """
+
+    def assert_refuses(self, src, *needles):
+        TestRefusals.assert_refuses(self, src, *needles)
+
+    def assert_both(self, src, want):
+        TestStructLayout.assert_both(self, src, want)
+
+    @needs_cc
+    def test_a_struct_holding_a_later_struct(self):
+        self.assert_both(
+            "public struct Q { public byte A; public In inner; }\n"
+            "public struct In { public int V; }\n" + _program(
+                "        Q q = new Q();\n"
+                "        q.inner.V = 7;\n"
+                "        return q.inner.V;"), 7)
+
+    @needs_cc
+    def test_a_class_holding_a_later_class(self):
+        # A class field is owned, so stored by value: the same need.
+        self.assert_both(
+            "public class A { public B b; public int Get() { return b.x; } }\n"
+            "public class B { public int x; }\n" + _program(
+                "        A a = new A();\n"
+                "        a.b.x = 5;\n"
+                "        return a.Get();"), 5)
+
+    @needs_cc
+    def test_a_list_of_a_later_class(self):
+        # `vector_Item` is held back until `Item` is complete, and `Inv`
+        # holds it by value: its struct definition moves above `Inv`.
+        self.assert_both(
+            "using System.Collections.Generic;\n"
+            "public class Inv { public List<Item> items = new List<Item>();"
+            " public int K() { return 3; } }\n"
+            "public class Item { public int w; }\n" + _program(
+                "        Inv i = new Inv();\n"
+                "        return i.K();"), 3)
+
+    @needs_cc
+    def test_a_chain_declared_out_of_order(self):
+        # A needs B needs C, with C in the middle: dependencies first.
+        self.assert_both(
+            "public struct A { public B b; }\n"
+            "public struct C { public int v; }\n"
+            "public struct B { public C c; }\n" + _program(
+                "        A a = new A();\n"
+                "        a.b.c.v = 6;\n"
+                "        return a.b.c.v;"), 6)
+
+    @needs_cc
+    def test_a_later_generic_holding_its_argument(self):
+        self.assert_both(
+            "public class Holder { public Box<Item> b;"
+            " public int Get() { return b.v.w; } }\n"
+            "public class Box<T> { public T v; }\n"
+            "public class Item { public int w; }\n" + _program(
+                "        Holder h = new Holder();\n"
+                "        h.b.v.w = 9;\n"
+                "        return h.Get();"), 9)
+
+    def test_methods_stay_where_they_were_written(self):
+        src = ("public struct Q\n"
+               "{\n"
+               "    public In inner;\n"
+               "    public int Twice() { return inner.Get() * 2; }\n"
+               "}\n"
+               "public struct In\n"
+               "{\n"
+               "    public int V;\n"
+               "    public int Get() { return V; }\n"
+               "}\n" + _program("        Q q = new Q();\n"
+                                "        q.inner.V = 4;\n"
+                                "        return q.Twice();"))
+        self.assertEqual(cs2cpp.translate(src, "t.cs").count("\n"),
+                         src.count("\n"))
+        if _CC is not None:
+            self.assert_both(src, 8)
+
+    @needs_cc
+    def test_a_moved_struct_keeps_its_pack(self):
+        # The `_Pragma` pair around `In` stays where `In` was written; the
+        # moved definition carries its own. Without that it silently came
+        # out 8 bytes under gcc -- the failure packing exists to prevent.
+        self.assert_both(
+            "public struct Q { public byte A; public In inner;"
+            " public long W; }\n"
+            "[StructLayout(LayoutKind.Sequential, Pack = 1)]\n"
+            "public struct In { public byte T; public int V; }\n" + _program(
+                "        return Marshal.SizeOf<In>() * 10"
+                " + Marshal.SizeOf<Q>();"), 66)
+
+    @needs_cc
+    def test_a_moved_struct_does_not_take_the_holders_pack(self):
+        self.assert_both(
+            "[StructLayout(LayoutKind.Sequential, Pack = 1)]\n"
+            "public struct Q { public byte A; public In inner; }\n"
+            "public struct In { public byte T; public int V; }\n" + _program(
+                "        return Marshal.SizeOf<In>() * 10"
+                " + Marshal.SizeOf<Q>();"), 89)
+
+    @needs_cc
+    def test_shared_breaks_a_cycle(self):
+        self.assert_both(
+            "public class A { public B b; }\n"
+            "[Shared]\n"
+            "public class B { public int v; public A a; }\n" + _program(
+                "        A x = new A();\n"
+                "        return 1;"), 1)
+
+    @needs_cc
+    def test_a_method_local_of_a_later_class(self):
+        # `Program` first is the usual C# file. Method bodies are emitted
+        # with their class, so a later type they declare by value is moved
+        # up as a field's would be.
+        self.assert_both(
+            "public class Program {\n"
+            "    int Get(Row r) { return r.w; }\n"
+            "    public int Run() {\n"
+            "        Row r = new Row();\n"
+            "        r.w = 4;\n"
+            "        return Get(r);\n"
+            "    }\n"
+            "}\n"
+            "public struct Row { public int w; }\n", 4)
+
+    def test_a_later_local_with_a_base_is_refused(self):
+        self.assert_refuses(
+            "public class Program {\n"
+            "    public int Run() { D d = new D(); return d.v; }\n"
+            "}\n"
+            "public class Base { public int k; }\n"
+            "public class D : Base { public int v; }\n",
+            "`Program` declares a `D`", "Declare `D` above `Program`")
+
+    def test_in_order_code_is_unchanged(self):
+        # Nothing to move, nothing moved: the output is what it was.
+        cpp = cs2cpp.translate(PACKET, "t.cs")
+        self.assertEqual(
+            cpprust.translate(cpp, path="t.cs", clang=False),
+            cpprust.translate(cpp, path="t.cs", clang=False, any_order=True))
+
+    def test_a_later_type_with_a_base_is_refused(self):
+        self.assert_refuses(
+            "public class A { public D d; }\n"
+            "public class Base { public int k; }\n"
+            "public class D : Base { public int v; }\n",
+            "`A.d`", "has a base", "Declare `D` above `A`")
+
+    def test_a_cycle_is_refused(self):
+        self.assert_refuses(
+            "public class A { public B b; }\n"
+            "public class B { public A a; }\n",
+            "`A` -> `B` -> `A`", "[Shared]")
+
+    def test_holding_itself_is_refused(self):
+        self.assert_refuses("public struct A { public A a; }\n",
+                            "`A` -> `A`")
+
+
+_LIST_HEAD = "using System.Collections.Generic;\n"
+
+
+class TestLists(unittest.TestCase):
+    """`List<T>` members, lowered only where the receiver is a `List`.
+
+    `Add` and `Count` are ordinary names -- a user class may have its own --
+    so the receiver's type is resolved first: a local or parameter above it
+    in the method, a `foreach` variable, else a field; then field by field
+    and element by element. Each case runs under gcc and shivyc.
+    """
+
+    def assert_refuses(self, src, *needles):
+        TestRefusals.assert_refuses(self, src, *needles)
+
+    def assert_both(self, src, want, main=None):
+        c = lower(src)
+        self.assertEqual(run_c(c, main or _RUN_PROGRAM), want, "gcc")
+        self.assertEqual(run_shivyc(c, main or _RUN_PROGRAM), want, "shivyc")
+
+    def run_list(self, body, want, types=""):
+        self.assert_both(_LIST_HEAD + types + _program(body), want)
+
+    @needs_cc
+    def test_add_count_and_index(self):
+        self.run_list("        List<int> xs = new List<int>();\n"
+                      "        xs.Add(3); xs.Add(4); xs.Add(5);\n"
+                      "        return xs.Count * 20 + xs[0] * 10 + xs[2];", 95)
+
+    @needs_cc
+    def test_foreach_over_a_var_list(self):
+        # Did not translate before: `var` became `auto`, which hid the
+        # container from the C++ half's range-for.
+        self.run_list("        var xs = new List<int>();\n"
+                      "        xs.Add(2); xs.Add(3);\n"
+                      "        int t = 0;\n"
+                      "        foreach (var x in xs) { t += x; }\n"
+                      "        return t;", 5)
+
+    @needs_cc
+    def test_clear_insert_and_remove_at(self):
+        # `Insert` at `Count` appends, as in C#.
+        self.run_list("        var xs = new List<int>();\n"
+                      "        xs.Add(9); xs.Clear();\n"
+                      "        xs.Add(1); xs.Add(3);\n"
+                      "        xs.Insert(1, 2); xs.Insert(3, 4);\n"
+                      "        xs.RemoveAt(0);\n"
+                      "        return xs[0] * 100 + xs[1] * 10 + xs[2]"
+                      " + xs.Count - 3;", 234)
+
+    @needs_cc
+    def test_contains_index_of_and_remove(self):
+        self.run_list("        var xs = new List<int>();\n"
+                      "        xs.Add(5); xs.Add(6); xs.Add(7);\n"
+                      "        bool r = xs.Remove(6);\n"
+                      "        int a = xs.Contains(7) ? 1 : 0;\n"
+                      "        int b = xs.Contains(6) ? 1 : 0;\n"
+                      "        return (r ? 100 : 0) + a * 10 + b"
+                      " + xs.IndexOf(7) * 20;", 130)
+
+    @needs_cc
+    def test_enum_elements(self):
+        self.run_list("        var ks = new List<Kind>();\n"
+                      "        ks.Add(Kind.C); ks.Add(Kind.A);\n"
+                      "        return ks.IndexOf(Kind.A) * 10"
+                      " + (ks.Contains(Kind.B) ? 1 : 0);", 10,
+                      "public enum Kind { A, B, C }\n")
+
+    @needs_cc
+    def test_a_field_this_and_another_object(self):
+        self.run_list(
+            "        Bag b = new Bag();\n"
+            "        b.Put(1); b.Put(5);\n"
+            "        b.items.Add(8);\n"
+            "        return b.N() * 10 + b.items[3] + b.items[4];", 64,
+            "public class Bag {\n"
+            "    public List<int> items = new List<int>();\n"
+            "    public void Put(int v) { items.Add(v); this.items.Add(v + 1); }\n"
+            "    public int N() { return items.Count; }\n"
+            "}\n")
+
+    @needs_cc
+    def test_an_auto_property_list_is_the_objects_own(self):
+        # The getter returns the list by value; through it, `Add` and an
+        # index write would change a copy and be lost. They reach the
+        # storage instead, as C#'s reference does.
+        self.run_list(
+            "        Bag b = new Bag();\n"
+            "        b.Items.Add(1); b.Items.Add(2);\n"
+            "        b.Items[1] = 9;\n"
+            "        b.Put(20);\n"
+            "        int t = 0;\n"
+            "        foreach (var x in b.Items) { t += x; }\n"
+            "        return t + b.Items.Count;", 33,
+            "public class Bag {\n"
+            "    public List<int> Items { get; set; }\n"
+            "    public void Put(int v) { Items.Add(v); }\n"
+            "}\n")
+
+    @needs_cc
+    def test_adding_a_new_object(self):
+        # A temporary has no address to pass; it is named, then moved in.
+        # With an initializer, the name makes it a declaration, which the
+        # initializer lowering takes.
+        self.run_list("        var rows = new List<Row>();\n"
+                      "        rows.Add(new Row { w = 4 });\n"
+                      "        rows.Add(new Row());\n"
+                      "        int t = 0;\n"
+                      "        foreach (var r in rows) { t += r.w; }\n"
+                      "        return rows.Count * 10 + t;", 24,
+                      "public class Row { public int w; }\n")
+
+    @needs_cc
+    def test_adding_a_call_result_with_program_first(self):
+        self.assert_both(
+            _LIST_HEAD +
+            "public class Program {\n"
+            "    Row Make(int v) { Row r = new Row(); r.w = v; return r; }\n"
+            "    public int Run() {\n"
+            "        var rows = new List<Row>();\n"
+            "        rows.Add(Make(6));\n"
+            "        return rows[0].w;\n"
+            "    }\n"
+            "}\n"
+            "public class Row { public int w; }\n", 6)
+
+    @needs_cc
+    def test_foreach_through_a_member(self):
+        self.run_list(
+            "        var rows = new List<Row>();\n"
+            "        rows.Add(new Row()); rows.Add(new Row());\n"
+            "        int t = 0;\n"
+            "        foreach (var r in rows) { r.cells.Add(1); t += r.cells.Count; }\n"
+            "        return t;", 2,
+            "public class Row { public List<int> cells = new List<int>(); }\n")
+
+    @needs_cc
+    def test_a_user_add_and_count_are_not_a_lists(self):
+        self.run_list("        Calc c = new Calc();\n"
+                      "        int v = c.Add(2, 3);\n"
+                      "        return v * 10 + c.Count;", 51,
+                      "public class Calc {\n"
+                      "    public int Count;\n"
+                      "    public int Add(int a, int b) { Count += 1; return a + b; }\n"
+                      "}\n")
+
+    @needs_cc
+    def test_a_bad_index_aborts(self):
+        # `ArgumentOutOfRangeException`, unhandled. The vector's own
+        # `erase` would ignore it silently.
+        c = lower(_LIST_HEAD + _program("        var xs = new List<int>();\n"
+                                        "        xs.Add(1);\n"
+                                        "        xs.RemoveAt(5);\n"
+                                        "        return 0;"))
+        self.assertNotEqual(run_c(c, _RUN_PROGRAM), 0)
+
+    @needs_cc
+    def test_a_var_array_is_walkable(self):
+        self.assert_both(_program("        var a = new int[3];\n"
+                                  "        a[1] = 4;\n"
+                                  "        int t = 0;\n"
+                                  "        foreach (var x in a) { t += x; }\n"
+                                  "        return t + a.Length;"), 7)
+
+    def test_other_members_are_refused(self):
+        self.assert_refuses(_LIST_HEAD + _program(
+            "        var xs = new List<int>();\n        xs.Sort();\n"
+            "        return 0;"), "`List.Sort`", "`Add`, `Insert`")
+
+    def test_contains_on_a_class_is_refused(self):
+        self.assert_refuses(
+            _LIST_HEAD + "public class Item { public int w; }\n" + _program(
+                "        var xs = new List<Item>();\n"
+                "        Item it = new Item();\n"
+                "        return xs.Contains(it) ? 1 : 0;"),
+            "`List<Item>.Contains`", "`Equals`")
+
+    def test_linq_count_is_refused(self):
+        self.assert_refuses(_LIST_HEAD + _program(
+            "        var xs = new List<int>();\n        return xs.Count();"),
+            "`Count()`", "property")
+
+
+_IN = ("public struct In {\n"
+       "    public int V;\n"
+       "    public int Get() { return V; }\n"
+       "    public static int Zero() { return 0; }\n"
+       "}\n")
+
+
+class TestTypeNamedFields(unittest.TestCase):
+    """`public In In;` -- a member named after a type, resolved as C# does.
+
+    In `In.X`, an instance `X` means the field and a static one the type
+    (the "Color Color" rule). The C++ half, seeing a type name, never
+    qualified such a field with `this`, so `In.Get()` reached C unchanged.
+    Each case runs under gcc and shivyc -- whose parser also had to learn
+    that a member named like a typedef does not hide it
+    (`feature_tests/struct_member_typedef_name.c`).
+    """
+
+    def assert_both(self, src, want, main=None):
+        TestLists.assert_both(self, src, want, main)
+
+    def run_q(self, q, want):
+        self.assert_both(_IN + q + _program("        Q q = new Q();\n"
+                                            "        return q.F();"), want)
+
+    @needs_cc
+    def test_a_call_through_the_field(self):
+        self.run_q("public class Q {\n"
+                   "    public In In;\n"
+                   "    public int F() { In.V = 4; return In.Get() * 2; }\n"
+                   "}\n", 8)
+
+    @needs_cc
+    def test_read_write_and_assign(self):
+        self.run_q("public class Q {\n"
+                   "    public In In;\n"
+                   "    public int F() {\n"
+                   "        In.V = 5;\n"
+                   "        In other = new In();\n"
+                   "        other.V = 1;\n"
+                   "        In = other;\n"
+                   "        return In.V + In.Get();\n"
+                   "    }\n"
+                   "}\n", 2)
+
+    @needs_cc
+    def test_a_static_member_means_the_type(self):
+        self.run_q("public class Q {\n"
+                   "    public In In;\n"
+                   "    public int F() { In.V = 3; return In.Zero() + In.V; }\n"
+                   "}\n", 3)
+
+    @needs_cc
+    def test_a_local_of_the_same_name_shadows_the_field(self):
+        self.run_q("public class Q {\n"
+                   "    public In In;\n"
+                   "    public int F() { In.V = 1; return G() + In.V; }\n"
+                   "    int G() { In In = new In(); In.V = 9; return In.V; }\n"
+                   "}\n", 10)
+
+    @needs_cc
+    def test_a_field_named_after_another_class(self):
+        self.assert_both(
+            "public class Node {\n"
+            "    public int v;\n"
+            "    public Node Next() { Node n = new Node(); n.v = v + 1; return n; }\n"
+            "}\n"
+            "public class Chain {\n"
+            "    public Node Node;\n"
+            "    public int F() { Node.v = 2; Node x = Node.Next(); return x.v; }\n"
+            "}\n" + _program("        Chain c = new Chain();\n"
+                             "        return c.F();"), 3)
+
+    @needs_cc
+    def test_a_static_call_through_a_type(self):
+        # Not lowered at all before: `Type.Method()` reached C as written.
+        self.assert_both(_IN + _program("        return In.Zero() + 3;"), 3)
+
+    @needs_cc
+    def test_assigning_new_to_a_plain_struct_zeroes_it(self):
+        # `x = new T()`, assigned rather than declared: C# zeroes it, and
+        # the expression form `T()` is not C for a struct with no
+        # constructor.
+        c = lower(_IN + _program("        In a = new In();\n"
+                                 "        a.V = 5;\n"
+                                 "        a = new In();\n"
+                                 "        return a.V + 2;"))
+        self.assertEqual(run_c(c, _RUN_ON_DIRTY_STACK), 2)
+        self.assertEqual(run_shivyc(c, _RUN_PROGRAM), 2)
 
 
 class TestDigest(unittest.TestCase):
