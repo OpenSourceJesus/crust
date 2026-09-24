@@ -659,6 +659,7 @@ def _parse_struct_union_spec(index, node_type):
     node_type - either decl_nodes.Struct or decl_nodes.Union.
     """
     start_r = p.tokens[index - 1].r
+    start_index = index
 
     name = None
     if token_is(index, token_kinds.identifier):
@@ -674,7 +675,10 @@ def _parse_struct_union_spec(index, node_type):
         raise_error(err, index, ParserError.AFTER)
 
     r = start_r + p.tokens[index - 1].r
-    return node_type(name, members, r), index
+    node = node_type(name, members, r)
+    # `shivyc.pack` left the packing on the keyword token, in stream order.
+    node.pack = p.tokens[start_index - 1].pack
+    return node, index
 
 
 def parse_initializer(index):
