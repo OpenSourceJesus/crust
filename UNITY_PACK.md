@@ -143,8 +143,9 @@ uint Player_last(uint i) { return bitfieldExtract(handles[5u + i / 4u], int((i %
 with `bitfieldExtract`'s definition, and — where a headless GL is
 available (`moderngl` over Mesa's EGL/llvmpipe) — runs a compute shader
 built from `handles.glsl` and compares every slot the GPU reads with the
-scene. GLES2 hosts (the default viewer) have no SSBOs; the flag is for a
-GLES 3.1 / GL 4.3 renderer.
+scene. The default viewer is OpenGL ES 3.1 (see "Display") and binds
+these handles at SSBO binding 1 every frame; the GLES2 viewer, kept for
+hardware without ES 3.1, has no SSBOs.
 
 ## Function grouping
 
@@ -179,13 +180,29 @@ python3 tools/unity_pack.py <project> --strict   # a stub is an error
 python3 tools/unity_pack.py <project> --gpu-handles  # handles for a GLES 3.1 SSBO
 ```
 
-The linked player is `gles2_window.c` when `pkg-config glfw3` succeeds,
-otherwise the generated headless `main.c` (tick + print draw count).
+The linked player is `gles3_window.c` (OpenGL ES 3.1) when `pkg-config
+glfw3` succeeds — `gles2_window.c` with `UNITY_PACK_GLES2=1`, for hardware
+without ES 3.1 — otherwise the generated headless `main.c` (tick + print
+draw count).
 
 Godot: pass a directory containing `.tscn`. Blender: a JSON dump
 (`blender_pack.json`) — same packed C, different importer.
 
-## Display via GLES2
+## Display: OpenGL ES 3.1 (and GLES2)
+
+The default viewer is **OpenGL ES 3.1** — desktop GL 4.3+ drivers provide
+it, and Mesa does in software — because ES 3.1 is what has shader storage
+buffers: a `--gpu-handles` pack's handles are uploaded every frame to SSBO
+binding 1, where `shaders/handles.glsl` reads them. `gles3_render.h` is the
+renderer, shared by `gles3_window.c` (GLFW) and `gles3_view.c` (headless
+EGL + FBO); crust's own `GLES3/gl31.h` declares what it uses, and
+`tools/gles3_header_test.py` checks every constant and prototype there
+against Khronos's header. It draws exactly what the GLES2 viewer draws:
+`TestGLES3View` renders MiniScene with both and requires identical frames,
+compared at 8 bits a channel (`-DFBO_FORMAT=0x8058`; the default RGBA4
+target would round a small difference away). The GLES2 viewers stay, for
+hardware without ES 3.1. The wasm viewer is next: WebGPU, with the handle
+accessors in WGSL.
 
 `engine_collect_draws()` walks every authored SpriteRenderer with a project
 PNG and fills an `EngineDraw` list (world xy, half-extents, XY rotation basis, tint
@@ -202,17 +219,22 @@ a textured quad through the same surfaceless EGL/FBO path as
 `examples/gles2/triangle.c`, then prints ASCII (and optional PPM).
 
 ```
-examples/unity_pack/run_gles2.sh              # native surfaceless → ASCII
-examples/unity_pack/run_gles2.sh out.ppm
-examples/unity_pack/run_gles2_window.sh       # real GLFW / GLES window
+examples/unity_pack/run_gles3.sh              # ES 3.1 surfaceless → ASCII
+examples/unity_pack/run_gles3.sh --gpu-handles out.ppm
+examples/unity_pack/run_gles3_window.sh       # real GLFW / ES 3.1 window
+examples/unity_pack/run_gles2.sh              # the GLES2 twins
+examples/unity_pack/run_gles2_window.sh
 examples/unity_pack/run_gles2_wasm.sh         # soft GLES under node
 ```
 
 `engine_draw.h` is written next to `engine.c` so the viewer stays in sync
 with the typedef. Wasm builds one amalgamated TU via
 `tools/unity_pack_amalg_view.py` (the wasm back end does not link multiple
-files). The windowed host (`gles2_window.c`) needs `glfw3` and a display;
-it is not part of the headless test path.
+files). The windowed hosts need `glfw3` and a display; they are not part
+of the headless test path. Building a viewer *with crust* fails today for
+any scene with a Camera: crust ignores `__attribute__((weak))` on
+variables, so the viewers' default camera globals collide with `data.c`'s
+(the GLES2 viewer the same) — gcc builds are unaffected.
 
 ## SoA positions (`--soa`) — faster GPU uploads
 
