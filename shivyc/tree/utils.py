@@ -500,6 +500,64 @@ def shift_into_range(val, ctype):
     return val
 
 
+class UnalignedLValue(LValue):
+    """A struct member that may sit at an address its alignment does not
+    divide -- a member of a packed struct -- read and written a byte at a time.
+
+    x86-64, hosted arm64 and wasm load such a value without complaint; the
+    68000 traps on an odd-address word access, and so does arm64 with the
+    MMU off. Byte accesses are aligned everywhere, so the value is copied
+    through an ordinary, naturally aligned temporary, one byte at a time.
+    That is what gcc does for a packed member on a strict-alignment target,
+    and it keeps every back end correct without any of them knowing.
+
+    `base` is the member's lvalue as it would otherwise be used; only its
+    address is taken, never a wide load or store through it.
+    """
+
+    def __init__(self, base):
+        self.base = base
+
+    def ctype(self):  # noqa D102
+        return self.base.ctype()
+
+    def addr(self, il_code):  # noqa D102
+        return self.base.addr(il_code)
+
+    def _copy(self, il_code, dst, src, size):
+        """Emit `size` byte copies from address `src` to address `dst`."""
+        byte_ptr = PointerCType(ctypes.unsig_char)
+        for i in range(size):
+            off = ILValue(ctypes.longint)
+            il_code.register_literal_var(off, str(i))
+            s = ILValue(byte_ptr)
+            il_code.add(math_cmds.Add(s, src, off))
+            b = ILValue(ctypes.unsig_char)
+            il_code.add(value_cmds.ReadAt(b, s))
+            d = ILValue(byte_ptr)
+            il_code.add(math_cmds.Add(d, dst, off))
+            il_code.add(value_cmds.SetAt(d, b))
+
+    def val(self, il_code):  # noqa D102
+        ctype = self.ctype()
+        tmp = ILValue(ctype)
+        tmp_addr = ILValue(PointerCType(ctype))
+        il_code.add(value_cmds.AddrOf(tmp_addr, tmp))
+        self._copy(il_code, tmp_addr, self.base.addr(il_code), ctype.size)
+        return tmp
+
+    def set_to(self, rvalue, il_code, r):  # noqa D102
+        ctype = self.ctype()
+        check_cast(rvalue, ctype, r)
+        right = set_type(rvalue, ctype, il_code)
+        tmp = ILValue(ctype)
+        il_code.add(value_cmds.Set(tmp, right))
+        tmp_addr = ILValue(PointerCType(ctype))
+        il_code.add(value_cmds.AddrOf(tmp_addr, tmp))
+        self._copy(il_code, self.base.addr(il_code), tmp_addr, ctype.size)
+        return right
+
+
 class BitFieldLValue(LValue):
     """LValue for a bitfield struct/union member.
 
