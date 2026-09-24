@@ -7888,6 +7888,52 @@ def _param_c_ty(ty):
     return "int"
 
 
+def _method_arg_type_suffix(args_str):
+    """C# param list → type suffix for overload mangling.
+
+    ``SpawnedEntry spawnedEntry`` → ``SpawnedEntry``;
+    ``GameObject clone, Transform trs`` → ``GameObject_Transform``;
+    empty args → ``void``.
+    """
+    types = []
+    for part in (args_str or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        part = re.sub(r"\b(?:ref|out|in|params)\s+", "", part)
+        m = re.match(r"([\w.<>]+)\s+(\w+)\s*$", part)
+        if not m:
+            continue
+        ty = m.group(1).split(".")[-1]
+        ty = re.sub(r"[<>\[\],\s]+", "_", ty).strip("_")
+        if ty:
+            types.append(_c_ident(ty))
+    return "_".join(types) if types else "void"
+
+
+def _method_c_symbol(class_idn, method_name, args_str, overloaded):
+    """C free-function name for a MonoBehaviour method.
+
+    C has no overloading — when *overloaded* is true, append a param-type
+    suffix so ``RemoveSpawnedEntry(SpawnedEntry)`` and
+    ``RemoveSpawnedEntry(GameObject, Transform)`` become distinct symbols.
+    """
+    base = "%s_%s" % (class_idn, method_name)
+    if not overloaded:
+        return base
+    return "%s_%s" % (base, _method_arg_type_suffix(args_str))
+
+
+def _overload_method_names(methods):
+    """Method names that appear more than once (C# overloads)."""
+    counts = {}
+    for m in methods or []:
+        n = m.get("name") or ""
+        if n:
+            counts[n] = counts.get(n, 0) + 1
+    return {n for n, c in counts.items() if c > 1}
+
+
 def _method_c_params(args_str):
     """C param list string from C# ``(byte amount, Cosmetic c)``."""
     args_str = (args_str or "").strip()
@@ -7988,18 +8034,24 @@ def _rewrite_mb_static_and_singleton(text, plan, cl):
             "Object_FindObjectOfType_%s(0)" % oidn, text)
     for ocname, pairs in methods_by.items():
         oidn = _c_ident(ocname)
+        overloaded = _overload_method_names([m for _c, m in pairs])
         for _c, m in pairs:
             if not m.get("static"):
                 continue
             mname = m["name"]
-            text = cs2cpp.code_sub(
+            # Overloads need arg-type dispatch; leave unlowered → stub.
+            if mname in overloaded:
+                continue
+            sym = _method_c_symbol(
+                oidn, mname, m.get("args") or "", False)
+            text = re.sub(
                 r"(?<![\w.])%s\s*\.\s*%s\s*\(" % (
                     re.escape(ocname), re.escape(mname)),
-                "%s_%s(" % (oidn, mname), text)
+                "%s(" % sym, text)
             if ocname == this:
-                text = cs2cpp.code_sub(
+                text = re.sub(
                     r"(?<![\w.])%s\s*\(" % re.escape(mname),
-                    "%s_%s(" % (oidn, mname), text)
+                    "%s(" % sym, text)
     return text
 
 
@@ -8036,27 +8088,29 @@ def _reachable_emit_methods(methods):
     """Methods to lower: Unity messages, public API, and private callees.
 
     Editor-only helpers (e.g. UpdateCanvas only called from OnValidate) stay out.
+    Overloads share a name — all of them are kept when the name is reachable.
     """
-    by = {}
+    by_name = {}
     for m in methods or []:
-        by[m["name"]] = m
+        by_name.setdefault(m["name"], []).append(m)
     roots = set()
-    for name, m in by.items():
+    for name, ms in by_name.items():
         if name in ("OnEnable", "OnValidate"):
             continue
-        if name in _UNITY_EMIT_MESSAGES or m.get("public"):
+        if name in _UNITY_EMIT_MESSAGES or any(m.get("public") for m in ms):
             roots.add(name)
     reach = set(roots)
     queue = list(roots)
     while queue:
         name = queue.pop()
-        body = (by.get(name) or {}).get("body") or ""
-        for other in by:
-            if other in reach:
-                continue
-            if re.search(r"(?<![\w.])%s\s*\(" % re.escape(other), body):
-                reach.add(other)
-                queue.append(other)
+        for m in by_name.get(name) or []:
+            body = m.get("body") or ""
+            for other in by_name:
+                if other in reach:
+                    continue
+                if re.search(r"(?<![\w.])%s\s*\(" % re.escape(other), body):
+                    reach.add(other)
+                    queue.append(other)
     return reach
 
 
@@ -11431,6 +11485,10 @@ def emit_engine(plan, analyses, used_apis):
         p("")
         emit_names = _reachable_emit_methods(
             [m for _c, m in methods_by.get(cname, [])])
+        overloaded = _overload_method_names(
+            [m for _c, m in methods_by.get(cname, [])
+             if m["name"] in emit_names and m["name"] != "OnEnable"])
+        used_syms = set()
         for c, m in methods_by.get(cname, []):
             if m["name"] == "OnEnable":
                 continue
@@ -11461,17 +11519,27 @@ def emit_engine(plan, analyses, used_apis):
                 cs_line = ft.count("\n", 0, int(site["body_abs"])) + 1
             p("/* unity_pack:site %s:%d */" % (
                 site.get("path") or "<cs>", cs_line))
+            sym = _method_c_symbol(
+                idn, m["name"], m.get("args") or "",
+                m["name"] in overloaded)
+            # Same name+args twice (nested leak / duplicate analysis) → unique.
+            if sym in used_syms:
+                n = 2
+                while ("%s_%d" % (sym, n)) in used_syms:
+                    n += 1
+                sym = "%s_%d" % (sym, n)
+            used_syms.add(sym)
             if coll_param:
-                p("static void %s_%s(unsigned i, int %s) {"
-                  % (idn, m["name"], coll_param))
+                p("static void %s(unsigned i, int %s) {"
+                  % (sym, coll_param))
             elif m.get("static"):
                 plist = _method_c_params(m.get("args") or "")
-                p("static void %s_%s(%s) {" % (
-                    idn, m["name"], plist if plist else "void"))
+                p("static void %s(%s) {" % (
+                    sym, plist if plist else "void"))
                 # Static bodies may still touch instance fields via bare names.
                 p("    unsigned i = 0;")
             else:
-                p("static void %s_%s(unsigned i) {" % (idn, m["name"]))
+                p("static void %s(unsigned i) {" % sym)
             # Methods that still contain unlowered C# become stubs (Unity
             # messages included — empty body beats crust parse failures).
             emitted = set()

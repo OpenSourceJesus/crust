@@ -650,6 +650,108 @@ class TestLayout(unittest.TestCase):
         self.assertEqual(kinds["speed"], "f32")
 
 
+class TestMethodOverloads(unittest.TestCase):
+    """C# overloads must lower to distinct C free-function symbols."""
+
+    def test_overload_method_c_symbols_are_unique(self):
+        self.assertEqual(
+            unity_pack._method_arg_type_suffix("SpawnedEntry spawnedEntry"),
+            "SpawnedEntry")
+        self.assertEqual(
+            unity_pack._method_arg_type_suffix(
+                "GameObject clone, Transform trs"),
+            "GameObject_Transform")
+        self.assertEqual(
+            unity_pack._method_c_symbol(
+                "ObjectPool", "RemoveSpawnedEntry",
+                "SpawnedEntry spawnedEntry", True),
+            "ObjectPool_RemoveSpawnedEntry_SpawnedEntry")
+        self.assertEqual(
+            unity_pack._method_c_symbol(
+                "ObjectPool", "RemoveSpawnedEntry",
+                "GameObject clone, Transform trs", True),
+            "ObjectPool_RemoveSpawnedEntry_GameObject_Transform")
+        self.assertEqual(
+            unity_pack._method_c_symbol("ObjectPool", "Awake", "", False),
+            "ObjectPool_Awake")
+        root = tempfile.mkdtemp(prefix="upack-overload-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Pool.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Pool : MonoBehaviour {\n"
+                "    public void RemoveSpawnedEntry(int a) {}\n"
+                "    public void RemoveSpawnedEntry("
+                "GameObject go, Transform trs) {}\n"
+                "    void Update() { RemoveSpawnedEntry(1); }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Pool.cs.meta"), "w") as f:
+            f.write("guid: ccccccccccccccccdddddddddddddddd\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Pool\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "  m_Father: {fileID: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: ccccccccccccccccdddddddddddddddd, type: 3}\n"
+            )
+        ps = os.path.join(root, "ProjectSettings")
+        os.makedirs(ps)
+        with open(os.path.join(ps, "EditorBuildSettings.asset"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1045 &1\nEditorBuildSettings:\n"
+                "  m_Scenes:\n"
+                "  - enabled: 1\n"
+                "    path: Assets/Scenes/S.unity\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-overload-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("Pool_RemoveSpawnedEntry_int", eng)
+        self.assertIn("Pool_RemoveSpawnedEntry_GameObject_Transform", eng)
+        self.assertEqual(eng.count("static void Pool_RemoveSpawnedEntry("), 0)
+
+    def test_nested_class_methods_not_on_outer(self):
+        """Nested DoUpdate must not be attributed to the outer MonoBehaviour."""
+        root = tempfile.mkdtemp(prefix="upack-nested-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        path = os.path.join(scripts, "Host.cs")
+        with open(path, "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Host : MonoBehaviour {\n"
+                "    public void DoUpdate() {}\n"
+                "    class Nested {\n"
+                "        public void DoUpdate() {}\n"
+                "    }\n"
+                "}\n"
+            )
+        a = unity_pack.analyze_script(path)
+        by = {c["name"]: c for c in a["classes"]}
+        self.assertIn("Host", by)
+        self.assertIn("Nested", by)
+        host_names = [m["name"] for m in by["Host"].get("methods") or []]
+        self.assertEqual(host_names.count("DoUpdate"), 1)
+        nest_names = [m["name"] for m in by["Nested"].get("methods") or []]
+        self.assertEqual(nest_names.count("DoUpdate"), 1)
+
+
 class TestEmit(unittest.TestCase):
 
     def test_api_subset_only(self):
@@ -2802,6 +2904,75 @@ class TestSystems(unittest.TestCase):
         self.assertNotIn("GetComponentsInChildren<Part>", eng)
         self.assertNotIn("unlowered C#", eng)
         self.assertNotIn("Part[]", eng)
+
+    def test_getcomponent_type_with_zero_instances_packs(self):
+        """GetComponent<T> when T.cs exists but no authored instance → n=0 class.
+
+        Trimming unused prefabs must not CS0246 on GetComponent for a type that
+        is still referenced from a packed script.
+        """
+        root = tempfile.mkdtemp(prefix="upack-gc-zero-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Part.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Part : MonoBehaviour {\n"
+                "    public int hp;\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Part.cs.meta"), "w") as f:
+            f.write("guid: a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\n")
+        with open(os.path.join(scripts, "Host.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Host : MonoBehaviour {\n"
+                "    public Part part;\n"
+                "    void Update() {\n"
+                "        part = GetComponent<Part>();\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Host.cs.meta"), "w") as f:
+            f.write("guid: b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Host\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, guid: b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2, type: 3}\n"
+                "  part: {fileID: 0}\n"
+            )
+        ps = os.path.join(root, "ProjectSettings")
+        os.makedirs(ps)
+        with open(os.path.join(ps, "EditorBuildSettings.asset"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1045 &1\nEditorBuildSettings:\n"
+                "  m_Scenes:\n"
+                "  - enabled: 1\n"
+                "    path: Assets/Scenes/S.unity\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-gc-zero-out-")
+        plan = unity_pack.pack(root, d)
+        self.assertIn("Part", plan["classes"])
+        self.assertEqual(plan["classes"]["Part"]["n"], 0)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("GameObject_GetComponent_Part", eng)
+        self.assertIn("GetComponent_Part", eng)
+        self.assertNotIn("error CS0246", eng)
 
     def test_getcomponentsinchildren_base_type_finds_subclass(self):
         """GetComponentsInChildren<Weapon> collects Blaster : Weapon instances."""
@@ -7376,6 +7547,104 @@ class TestSystems(unittest.TestCase):
             f.write("using UnityEngine;\nclass Tool {}\n")
         self.assertTrue(unity_pack._is_player_csharp(root, helpers))
 
+    def test_scene_mscript_guids_limit_analyzed_scripts(self):
+        """Stripped UI scenes must not full-analyze every Assets .cs.
+
+        When GO join leaves script=None, scan m_Script / m_SourcePrefab so
+        vendor files (e.g. Destructible2D Stack) stay out of full analyze.
+        """
+        root = tempfile.mkdtemp(prefix="upack-mscript-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        vendor = os.path.join(root, "Assets", "Vendor")
+        scenes = os.path.join(root, "Assets", "Scenes")
+        prefabs = os.path.join(root, "Assets", "Prefabs")
+        ps = os.path.join(root, "ProjectSettings")
+        for d in (scripts, vendor, scenes, prefabs, ps):
+            os.makedirs(d)
+        with open(os.path.join(scripts, "Host.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Host : MonoBehaviour {\n"
+                "    void Update() {}\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Host.cs.meta"), "w") as f:
+            f.write("guid: a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\n")
+        with open(os.path.join(vendor, "UsesStack.cs"), "w") as f:
+            f.write(
+                "using System.Collections.Generic;\n"
+                "using UnityEngine;\n"
+                "public class UsesStack : MonoBehaviour {\n"
+                "    static Stack<int> pool = new Stack<int>();\n"
+                "    void Update() { pool.Push(1); }\n"
+                "}\n"
+            )
+        with open(os.path.join(vendor, "UsesStack.cs.meta"), "w") as f:
+            f.write("guid: c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3\n")
+        with open(os.path.join(prefabs, "Host.prefab"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Host\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n  m_GameObject: {fileID: 1}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1, type: 3}\n"
+            )
+        with open(os.path.join(prefabs, "Host.prefab.meta"), "w") as f:
+            f.write("guid: d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4\n")
+        # UI-only scene GO (no joined project script) + PrefabInstance source.
+        with open(os.path.join(scenes, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Sprite\n"
+                "  m_IsActive: 1\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "--- !u!4 &11\nTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!212 &12\nSpriteRenderer:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Enabled: 1\n"
+                "  m_Sprite: {fileID: 0}\n"
+                "--- !u!1001 &20\nPrefabInstance:\n"
+                "  m_SourcePrefab: {fileID: 100100000, "
+                "guid: d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4, type: 3}\n"
+                # Also an authored Host m_Script that does not join a packed GO.
+                "--- !u!114 &30\nMonoBehaviour:\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1, type: 3}\n"
+            )
+        with open(os.path.join(ps, "EditorBuildSettings.asset"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1045 &1\nEditorBuildSettings:\n"
+                "  m_Scenes:\n"
+                "  - enabled: 1\n"
+                "    path: Assets/Scenes/S.unity\n"
+                "    guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+            )
+        assets = unity_pack._asset_guid_map(root)
+        guids = unity_pack._guid_map(root, asset_guids=assets)
+        refs = unity_pack._scripts_referenced_in_startup_scenes(
+            root, assets, guids)
+        self.assertTrue(any(p.endswith("Host.cs") for p in refs))
+        self.assertFalse(any(p.endswith("UsesStack.cs") for p in refs))
+        # Objects with script=None (SpriteRenderer only) + YAML refs → Host only.
+        objects = [{
+            "name": "Sprite", "script": None, "class": "Sprite",
+            "fields": {}, "pos": (0, 0, 0), "rot": (0, 0, 0, 1),
+        }]
+        analyses = unity_pack._analyze_scripts_and_prefabs(
+            root, objects, assets)
+        names = {c["name"] for a in analyses for c in a.get("classes") or []}
+        self.assertIn("Host", names)
+        self.assertNotIn("UsesStack", names)
+
     @needs_systems
     def test_emits_opt_in_stubs_not_invented_components(self):
         d = tempfile.mkdtemp(prefix="upack-sys-")
@@ -8439,6 +8708,51 @@ class TestSystems(unittest.TestCase):
         self.assertIn("GameObject_GetComponent_RectTransform", eng)
         self.assertIn("static int _engine_go_Canvas[", eng)
         self.assertNotIn("static const int _engine_go_Canvas[", eng)
+
+    def test_getcomponent_transform_is_go_index(self):
+        """GetComponent<Transform>() ≡ GO handle (same as .transform)."""
+        root = tempfile.mkdtemp(prefix="upack-gc-trs-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Pool.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Pool : MonoBehaviour {\n"
+                "    public GameObject prefab;\n"
+                "    void Start() {\n"
+                "        GameObject clone = Instantiate(prefab);\n"
+                "        Transform trs = clone.GetComponent<Transform>();\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Pool.cs.meta"), "w") as f:
+            f.write("guid: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Pool\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("GameObject_GetComponent_Transform", eng)
+        self.assertRegex(
+            eng,
+            r"static int GameObject_GetComponent_Transform\(int go\) \{\s*"
+            r"if \(go < 0 \|\| go >= _engine_go_count\) return -1;\s*"
+            r"return go;")
 
     def test_getcomponent_prefab_mb_is_live(self):
         """GetComponent<T> for a prefab-authored MB uses a live GO map."""
