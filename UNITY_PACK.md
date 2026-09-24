@@ -210,15 +210,31 @@ cs2cpp's families before its own Unity API rewrites:
 | `string` locals | `lower_local_types` | `const char *` |
 | `byte[]`, `.Length`, `[i]` | `lower_byte_arrays` | `ByteArray`, `.length`, `.data[i]` |
 | `"s" + x` | `lower_string_concat`, `scalar_kind` | `_str_plus_i/f/c/s(..)` |
-| `List<T>`, `Dictionary<K,V>`, `SortedList` | `lower_list_types`, `lower_map_types`, `lower_*_members_named` | `std::vector` / `std::map`; `Add`, `Clear`, `Count`, `ContainsKey`, `Remove` |
+| `List<T>`, `Dictionary<K,V>`, `SortedList` | `lower_packed_collections`, from a `PackedClass` per class | `std::vector` / `std::map`; `Add`, `Clear`, `Count`, `ContainsKey`, `Remove`; `Other.list` as `Other_list`; an instance field aliased to its slot, `&items = Owner_items[i]` |
+| `Time.deltaTime`, `Application.*`, `File.*`, `Mathf.*`, `Debug.Log`, `Input.GetAxis`, … | `lower_bindings`, over this file's tables | `Time_deltaTime`, `Application_dataPath()`, … |
 | statics, fields, `other.hp` | `lower_packed_fields` | `Owner_name`, `Owner_get_x(i)` / `Owner_set_x(i, v)`, `Other_AT(..).hp` |
 
+The plan still decides everything it decided: this file describes each
+class to cs2cpp as a `PackedClass` (its static and per-instance lists and
+maps, and what its other fields hold), and cs2cpp does the lowering.
 Collection element types are this file's (`_collection_elem_c_ty`, passed
-to cs2cpp as the model's `elem_type`) and are lossy: `double` is `float`,
-and `long`, `uint` and `ulong` are `int`. They were so before the move and
-are unchanged; widening them would change every packed collection.
-Which names are collections, the `Other_list` statics and the instance
-aliases (`&items = Owner_items[i]`) stay here with the plan that knows them.
+as the model's `elem_type`) and are lossy: `double` is `float`, and
+`long`, `uint` and `ulong` are `int`. They were so before the move and are
+unchanged; widening them would change every packed collection. `x.field`
+for another class's instance map was matched on the field's name whatever
+`x` was; now an `x` visibly of another type is left alone.
+
+**The Unity API is a table.** A UnityEngine member that is one engine name
+— `Time.deltaTime`, `Application.dataPath`, `File.Exists`, `Mathf.Sin`,
+`Debug.Log`, `Input.GetAxis`, `Camera.main.orthographicSize` — is a
+`cs2cpp.Binding` in one of this file's tables (`_UNITY_API_CORE`, `_SCENE`,
+`_LOG`, `_CONSOLE`, `_MATHF`), and `cs2cpp.lower_bindings` applies it.
+Adding API is adding a row. The knowledge is this file's, the rewriting
+cs2cpp's, and every entry gets the same boundaries: the one-off patterns
+each got them right or wrong on their own (`Time.time` by text replace
+took the front of `Time.timeScale`; `File.Exists` took the back of
+`MyFile.Exists`). What is not one name — Transform, GetComponent,
+`Destroy(gameObject)`, `Keyboard.current.<k>Key` — is still rewritten here.
 
 Each moved as the same code, so the packed output did not change — the
 golden check is byte-identical after every step — except that cs2cpp

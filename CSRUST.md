@@ -298,7 +298,14 @@ cs2cpp.lower_string_concat(text, model, string_idents)  # "s" + x
 cs2cpp.lower_list_types(text, model)   # List<T>; lower_list_members_named
 cs2cpp.lower_map_types(text, model)    # Dictionary<K,V>; lower_map_members_named
 cs2cpp.lower_packed_fields(text, owner, members, statics, handles, model)
+cs2cpp.lower_packed_collections(text, owner, others, model)  # PackedClass each
+cs2cpp.lower_bindings(text, table)     # a library's API: Binding(path, c, form)
 ```
+
+A `Binding` table is how a caller says what its library is — unity_pack's
+UnityEngine tables are the first; `System.Math` for csrust would be the
+same shape — and `lower_bindings` applies it outside strings and comments
+with one set of boundaries.
 
 `LIST_METHODS` is the one table of collection method spellings, used by
 csrust's type-resolved `List` lowering and by the named lowering alike.
