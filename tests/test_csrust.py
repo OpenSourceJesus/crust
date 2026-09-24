@@ -589,6 +589,31 @@ _RUN_ON_DIRTY_STACK = (
 _MM_HEAD = "using System.Runtime.InteropServices;\n"
 
 
+def run_shivyc(c_src, main):
+    """Build `c_src` + `main` with Crust's own compiler and run it.
+
+    Beside `run_c` (the host compiler) because the claims that matter for
+    struct layout are about agreement: gcc and shivyc must give one source
+    one layout, or serialised bytes depend on which of them built it."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    tmp = tempfile.mkdtemp(prefix="csrust-shivyc-")
+    try:
+        path = os.path.join(tmp, "t.c")
+        with open(path, "w") as f:
+            f.write(c_src + "\n" + main + "\n")
+        exe = os.path.join(tmp, "t")
+        proc = subprocess.run(
+            [sys.executable, "-m", "shivyc.main", "--no-cache", path,
+             "-o", exe],
+            cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if proc.returncode != 0:
+            raise AssertionError("shivyc: %s" % (proc.stdout + proc.stderr)
+                                 .decode("utf-8", "replace")[-2000:])
+        return subprocess.run([exe]).returncode
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def _program(body, types=""):
     return (_MM_HEAD + types + "public class Program {\n"
             "    public int Run() {\n" + body + "\n    }\n}\n")
@@ -615,25 +640,8 @@ class TestBlittableSerialization(unittest.TestCase):
     @unittest.skipIf(sys.byteorder != "little", "little-endian bytes")
     def test_the_example_runs_under_shivyc(self):
         # gcc and shivyc must agree on the layout, or one source has two
-        # byte formats. That agreement is why `Pack` is checked rather than
-        # emitted (`TestStructLayout`), so it is pinned on Crust's own
-        # compiler as well as the host's.
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        tmp = tempfile.mkdtemp(prefix="csrust-shivyc-")
-        try:
-            path = os.path.join(tmp, "t.c")
-            with open(path, "w") as f:
-                f.write(lower(PACKET) + "\n" + _RUN_PROGRAM + "\n")
-            exe = os.path.join(tmp, "t")
-            proc = subprocess.run(
-                [sys.executable, "-m", "shivyc.main", path, "-o", exe],
-                cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            if proc.returncode != 0:
-                raise AssertionError("shivyc: %s" % (proc.stdout + proc.stderr)
-                                     .decode("utf-8", "replace")[-2000:])
-            self.assertEqual(subprocess.run([exe]).returncode, 0)
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
+        # byte formats. Pinned on Crust's own compiler as well as the host's.
+        self.assertEqual(run_shivyc(lower(PACKET), _RUN_PROGRAM), 0)
 
     @needs_cc
     def test_write_into_an_allocated_buffer(self):
@@ -773,13 +781,13 @@ class TestObjectInitializers(unittest.TestCase):
 
 
 class TestStructLayout(unittest.TestCase):
-    """`[StructLayout]` is checked against the fields, then dropped.
+    """`[StructLayout]`: checked against the fields, and `Pack` carried over.
 
-    `Sequential` is what a C struct already is. `Pack` is not emitted as
-    `#pragma pack`, because shivyc parses that pragma and lays the struct out
-    naturally anyway: one source would get two layouts, and nothing would
-    say so. A `Pack` that changes nothing is dropped; one that would move a
-    field is refused.
+    `Sequential` is what a C struct already is. A `Pack` that changes the
+    layout becomes `_Pragma("pack(push, N)")` .. `_Pragma("pack(pop)")`
+    around the struct, on its own lines. That is only sound because shivyc
+    honours packing as gcc does -- before it did, one source had two
+    layouts -- so each layout claim here is run under both compilers.
     """
 
     def assert_refuses(self, src, *needles):
@@ -793,17 +801,93 @@ class TestStructLayout(unittest.TestCase):
         self.assertNotIn("StructLayout", c)
         self.assertNotIn("pragma", c)
 
-    def test_pack_that_moves_a_field_is_refused(self):
-        self.assert_refuses(
+    def _packed_q(self, fields, body):
+        return _program(
+            "        Q q = new Q { " + body[0] + " };\n"
+            "        byte[] b = MemoryMarshal.AsBytes("
+            "MemoryMarshal.CreateSpan(ref q, 1)).ToArray();\n"
+            "        Q r = MemoryMarshal.Read<Q>(b);\n" + body[1],
             "[StructLayout(LayoutKind.Sequential, Pack = 1)]\n"
-            "public struct Q { public byte Tag; public int Id; }\n",
-            "`Pack = 1`", "`Id` at 1 instead of 4", "largest-first")
+            "public struct Q\n"
+            "{\n" + fields + "}\n")
 
-    def test_pack_that_removes_tail_padding_is_refused(self):
+    def assert_both(self, src, want):
+        c = lower(src)
+        self.assertEqual(run_c(c, _RUN_PROGRAM), want, "gcc")
+        self.assertEqual(run_shivyc(c, _RUN_PROGRAM), want, "shivyc")
+
+    def test_pack_that_moves_a_field_is_emitted(self):
+        # `Id` at 1, not 4: five bytes, the ones .NET gives.
+        src = self._packed_q(
+            "    public byte Tag;\n    public int Id;\n",
+            ("Tag = 7, Id = 0x01020304",
+             "        if (b.Length != 5) { return 1; }\n"
+             "        if (b[0] != 7 || b[1] != 4 || b[4] != 1) { return 2; }\n"
+             "        return r.Id == 0x01020304 && r.Tag == 7 ? 0 : 3;"))
+        cpp = cs2cpp.translate(src, "t.cs")
+        self.assertEqual(cpp.count("\n"), src.count("\n"))
+        self.assertIn('_Pragma("pack(push, 1)")', cpp)
+        self.assertIn('_Pragma("pack(pop)")', cpp)
+        if _CC is not None and sys.byteorder == "little":
+            self.assert_both(src, 0)
+
+    @needs_cc
+    def test_pack_that_removes_tail_padding_is_emitted(self):
+        src = self._packed_q(
+            "    public int Id;\n    public byte Tag;\n",
+            ("Id = 9, Tag = 3", "        return b.Length * 10 + b[4];"))
+        self.assert_both(src, 53)
+
+    @needs_cc
+    def test_pack_two(self):
+        src = _program("        return Marshal.SizeOf<Q>();",
+                       "[StructLayout(LayoutKind.Sequential, Pack = 2)]\n"
+                       "public struct Q { public byte Tag; public int Id;"
+                       " public double D; }\n")
+        self.assert_both(src, 14)
+
+    @needs_cc
+    def test_a_packed_struct_inside_a_natural_one(self):
+        # `In` is 5 bytes with alignment 1; `W` still aligns to 8: 16.
+        # `In` comes first because C needs a field's struct complete before
+        # it: the pipeline does not reorder definitions, packed or not.
+        src = _program(
+            "        Q q = new Q { A = 1, W = 5 };\n"
+            "        q.In.V = 300;\n"
+            "        byte[] b = MemoryMarshal.AsBytes("
+            "MemoryMarshal.CreateSpan(ref q, 1)).ToArray();\n"
+            "        Q r = MemoryMarshal.Read<Q>(b);\n"
+            "        if (r.In.V != 300 || r.W != 5) { return 99; }\n"
+            "        return b.Length;",
+            "[StructLayout(LayoutKind.Sequential, Pack = 1)]\n"
+            "public struct In { public byte T; public int V; }\n"
+            "public struct Q { public byte A; public In In; public long W; }\n")
+        self.assert_both(src, 16)
+
+    @needs_cc
+    def test_size_is_checked_against_the_packed_layout(self):
+        src = _program("        return Marshal.SizeOf<Q>();",
+                       "[StructLayout(LayoutKind.Sequential, Pack = 1,"
+                       " Size = 5)]\n"
+                       "public struct Q { public byte T; public int V; }\n")
+        self.assert_both(src, 5)
+        self.assert_refuses(
+            "[StructLayout(LayoutKind.Sequential, Pack = 1, Size = 8)]\n"
+            "public struct Q { public byte T; public int V; }\n",
+            "`Size = 8`", "(5)")
+
+    def test_a_packed_struct_nested_in_a_class_is_refused(self):
+        self.assert_refuses(
+            "public class Outer {\n"
+            "    [StructLayout(LayoutKind.Sequential, Pack = 1)]\n"
+            "    public struct Q { public byte T; public int V; }\n"
+            "}\n", "nested in `Outer`", "outside the class")
+
+    def test_packing_an_owner_is_refused(self):
         self.assert_refuses(
             "[StructLayout(LayoutKind.Sequential, Pack = 1)]\n"
-            "public struct Q { public int Id; public byte Tag; }\n",
-            "size 5 instead of 8")
+            "public struct Q { public byte T; public string S; }\n",
+            "`Q.S`", "plain data")
 
     def test_explicit_layout_is_refused(self):
         self.assert_refuses(
