@@ -1640,6 +1640,192 @@ class TestTypeNamedFields(unittest.TestCase):
         self.assertEqual(run_shivyc(c, _RUN_PROGRAM), 2)
 
 
+class TestLiterals(unittest.TestCase):
+    """C# literal spellings that are not C's."""
+
+    @needs_cc
+    def test_a_float_suffix_on_an_integer(self):
+        # `2f` is a C# float; in C it is an invalid suffix on an integer
+        # constant. `cs2cpp.lower_float_literals`, which unity_pack uses
+        # for script bodies as well, gives it a decimal point.
+        src = _program("        float a = 2f;\n"
+                       "        float b = 1.5f;\n"
+                       "        return (int)(a * 10 + b * 2 + 0F);")
+        self.assertIn("2.f", cs2cpp.translate(src, "t.cs"))
+        c = lower(src)
+        self.assertEqual(run_c(c, _RUN_PROGRAM), 23)
+        self.assertEqual(run_shivyc(c, _RUN_PROGRAM), 23)
+
+    def test_strings_comments_and_real_literals_are_left_alone(self):
+        self.assertEqual(
+            cs2cpp.lower_float_literals(
+                'a = 2f + 1.5f + 1e2f; s = "2f"; // 3f\n'),
+            'a = 2.f + 1.5f + 1e2f; s = "2f"; // 3f\n')
+
+
+class TestLowerBody(unittest.TestCase):
+    """`cs2cpp.lower_body`: the C# language families, under an object model.
+
+    unity_pack lowers each script method body with it before its Unity API
+    rewrites, under `packed_model` (a reference is an instance index);
+    `translate` runs it under `OWNED`. The golden corpus
+    (`tools/unity_pack_golden.py`) checks the packed output end to end, but
+    only for what its projects happen to use -- the packed `this` appears in
+    one case -- so the families are pinned here directly.
+    """
+
+    PACKED = cs2cpp.packed_model(True)
+
+    def test_packed_null_is_the_index_sentinel(self):
+        self.assertEqual(
+            cs2cpp.lower_body("if (c != null && d == null) {}", self.PACKED),
+            "if (c != -1 && d == -1) {}")
+
+    def test_without_objects_null_is_left_alone(self):
+        self.assertEqual(
+            cs2cpp.lower_body("if (c != null) {}", cs2cpp.packed_model(False)),
+            "if (c != null) {}")
+
+    def test_packed_booleans_and_this(self):
+        self.assertEqual(
+            cs2cpp.lower_body("hp = this.max; ok = true; Add(this); f = false;",
+                              self.PACKED),
+            "hp = max; ok = 1; Add(i); f = 0;")
+
+    def test_owned_keeps_booleans_this_and_null(self):
+        # csrust has `bool`, lowers `this.` to `this->`, and `null` to NULL,
+        # each elsewhere in `translate`.
+        text = "hp = this.max; ok = true; if (c == null) {} x = 2f;"
+        self.assertEqual(cs2cpp.lower_body(text, cs2cpp.OWNED),
+                         "hp = this.max; ok = true; if (c == null) {} x = 2.f;")
+
+    def test_packed_string_locals(self):
+        # `lower_local_types`: unity_pack runs it after its Unity rewrites,
+        # which read some declarations as C# wrote them.
+        self.assertEqual(
+            cs2cpp.lower_local_types('string p = "string s";', self.PACKED),
+            'const char * p = "string s";')
+        self.assertEqual(
+            cs2cpp.lower_local_types("string p = q;", cs2cpp.OWNED),
+            "string p = q;")
+
+    def test_packed_byte_arrays(self):
+        model = cs2cpp.packed_model(True, byte_arrays=True)
+        self.assertEqual(
+            cs2cpp.lower_byte_arrays(
+                "byte[] b = f(); n = b.Length + b[2];", model),
+            "ByteArray b = f(); n = b.length + b.data[2];")
+        # Without the engine's struct, `byte[]` stays the subset's array.
+        self.assertEqual(
+            cs2cpp.lower_byte_arrays("byte[] b = f();", self.PACKED),
+            "byte[] b = f();")
+
+    def test_packed_string_concatenation(self):
+        # Each `+` with a string on its left becomes the engine's typed
+        # helper, the operand's kind from `scalar_kind`. A literal further
+        # along starts a concatenation of its own in the same pass, and a
+        # later pass joins the pieces -- nested differently from a strict
+        # left fold, and the same string, since concatenation associates.
+        self.assertEqual(
+            cs2cpp.lower_string_concat(
+                'p = "hp=" + 3 + " x=" + x + " c=" + \'c\';', self.PACKED),
+            'p = _str_plus_s(_str_plus_s(_str_plus_i("hp=", (3)), '
+            '(_str_plus_f(" x=", (x)))), (_str_plus_c(" c=", (\'c\'))));')
+        self.assertEqual(
+            cs2cpp.lower_string_concat(
+                "p = Application_dataPath() + name;", self.PACKED,
+                string_idents={"name"}),
+            "p = _str_plus_s(Application_dataPath(), (name));")
+        # No helper, no rewrite: csrust's `+` is its own business.
+        self.assertEqual(
+            cs2cpp.lower_string_concat('p = "a" + 1;', cs2cpp.OWNED),
+            'p = "a" + 1;')
+
+    def test_scalar_kind(self):
+        kind = lambda e, ids=None: cs2cpp.scalar_kind(e, self.PACKED, ids)
+        self.assertEqual([kind('"s"'), kind("'c'"), kind("-12"), kind("x"),
+                          kind("StreamReader_ReadLine(r)"), kind("(n)", {"n"})],
+                         ["s", "c", "i", "f", "s", "s"])
+
+    def test_packed_collections(self):
+        model = cs2cpp.packed_model(True, elem_type=lambda t: {
+            "Enemy": "int", "double": "float"}.get(t, t))
+        text, names = cs2cpp.lower_list_types(
+            "List<Enemy> es = new List<Enemy>(); var ds = new List<double>();",
+            model)
+        self.assertEqual(text, "std::vector<int> es; var ds = std::vector<float>();")
+        self.assertEqual(names, {"es"})
+        self.assertEqual(
+            cs2cpp.lower_list_members_named(
+                "es.Add(e); n = es.Count; es.Clear();", names),
+            "es.push_back(e); n = es.size(); es.clear();")
+        text, names = cs2cpp.lower_map_types(
+            "Dictionary<string, int> hp = new Dictionary<string, int>();",
+            cs2cpp.packed_model(True))
+        self.assertEqual(text, "std::map<string, int> hp;")
+
+    def test_string_keys_survive(self):
+        # A replacement that copies an operand reads it from the text, not
+        # the blanked scan it matched on: a string key used to come out as
+        # spaces (`"Blaster Shoot"` -> `"             "`).
+        out = cs2cpp.lower_map_members_named(
+            'hp.Add("Blaster Shoot", 3); ok = hp.ContainsKey("a b");',
+            {"hp"}, {"hp": "std::string"})
+        self.assertEqual(
+            out, '{ std::string __dk = "Blaster Shoot"; hp[__dk] = 3; }; '
+                 'ok = (hp.count("a b") != 0);')
+        self.assertEqual(
+            cs2cpp.lower_map_string_index(
+                'x = hp["Blaster Shoot"];', r"(?<![.\w])hp", self.PACKED),
+            'x = (*_engine_map_at_si(hp, "Blaster Shoot"));')
+
+    def test_csrust_and_unity_share_list_spellings(self):
+        self.assertEqual(cs2cpp.LIST_METHODS,
+                         {"Add": "push_back", "Clear": "clear", "Count": "size"})
+        self.assertIn(cs2cpp.LIST_METHODS["Add"], cs2cpp._LIST_MEMBERS["Add"][1])
+
+    def _fields(self, text, handles=None):
+        return cs2cpp.lower_packed_fields(
+            text, "Coin", {"hp", "speed", "target"}, {"MAX"},
+            handles or {}, self.PACKED)
+
+    def test_packed_field_reads_and_writes(self):
+        self.assertEqual(
+            self._fields("hp = hp + MAX; speed += 2.f; hp++; --hp;"),
+            "Coin_set_hp(i, Coin_get_hp(i) + Coin_MAX); "
+            "Coin_set_speed(i, Coin_get_speed(i) + 2.f); "
+            "Coin_set_hp(i, Coin_get_hp(i) + 1); "
+            "Coin_set_hp(i, Coin_get_hp(i) - 1);")
+
+    def test_two_writes_on_one_line(self):
+        # unity_pack rewrote a write's prefix and closed the paren at the end
+        # of the line: one `)` for two writes, and C that did not compile.
+        self.assertEqual(self._fields("hp = 1; speed = f(2, 3);"),
+                         "Coin_set_hp(i, 1); Coin_set_speed(i, f(2, 3));")
+
+    def test_comparisons_are_reads(self):
+        self.assertEqual(self._fields("if (hp == 0 || hp <= MAX) {}"),
+                         "if (Coin_get_hp(i) == 0 || Coin_get_hp(i) <= Coin_MAX) {}")
+
+    def test_a_handle_field(self):
+        # `target` indexes another class's instances: reached through that
+        # class's slot. (No golden case uses one yet.)
+        self.assertEqual(
+            self._fields("d = target.hp;", {"target": "Enemy"}),
+            "d = Enemy_AT(Coin_get_target(i)).hp;")
+
+    def test_field_names_in_strings_stay(self):
+        self.assertEqual(self._fields('Debug_Log_s("hp is low");'),
+                         'Debug_Log_s("hp is low");')
+
+    def test_strings_and_comments_are_not_code(self):
+        # unity_pack's regexes rewrote these too: `"is this true"` came out
+        # `"is i 1"`. Matched on a blanked scan, they are left as written.
+        text = 's = "is this true == null"; // this false\nok = true;'
+        self.assertEqual(cs2cpp.lower_body(text, self.PACKED),
+                         's = "is this true == null"; // this false\nok = 1;')
+
+
 class TestDigest(unittest.TestCase):
     """C# joins the same --emit-decls digest as C++ / rpython (CPPRPY.md)."""
 

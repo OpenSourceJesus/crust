@@ -16,6 +16,9 @@ Pins the claims in UNITY_PACK.md:
 from __future__ import annotations
 
 import os
+import re
+import contextlib
+import io
 import math
 import shutil
 import subprocess
@@ -26,6 +29,7 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
+import tools.cs2cpp as cs2cpp  # noqa: E402
 import tools.unity_pack as unity_pack  # noqa: E402
 
 PROJECT = os.path.join(ROOT, "examples", "unity_pack", "MiniScene")
@@ -513,6 +517,214 @@ class TestGLES2View(unittest.TestCase):
 
 
 SYSTEMS = os.path.join(ROOT, "examples", "unity_pack", "SystemsScene")
+# SystemsScene's scene, art and animations are not in the repository -- only
+# its C# scripts are (see .gitignore) -- so the tests that pack the whole
+# project skip unless a local copy has been dropped in. The rest of these
+# classes author their own small projects and always run.
+_SYSTEMS_SCENE = os.path.join(SYSTEMS, "Assets", "Scenes", "Systems.unity")
+needs_systems = unittest.skipUnless(
+    os.path.isfile(_SYSTEMS_SCENE),
+    "SystemsScene is scripts-only in the repository; put its Assets/Scenes, "
+    "art and ProjectSettings in examples/unity_pack/SystemsScene to run this")
+
+
+class TestStubDiagnostics(unittest.TestCase):
+    """A method the translator cannot lower is reported, not silently emptied.
+
+    It used to become an empty function with nothing said. Now it is a
+    csc-style warning at the method (an error under `strict`), recorded in
+    `plan["stubs"]` -- and the detector deciding it no longer fires on
+    string contents or on the engine's own C types, which had been emptying
+    methods that were lowered completely.
+    """
+
+    def test_a_string_literal_is_not_leftover_csharp(self):
+        body = ('Debug_Log_s("see Objects (Scripts)/Player.cs");\n'
+                'Application_OpenURL("http://x/");\n')
+        self.assertIsNone(unity_pack._unlowered_csharp(body))
+
+    def test_leftover_csharp_is_still_found_and_named(self):
+        what, text = unity_pack._unlowered_csharp(
+            "Foo_bar(); Unknown.DoThing(1);\n")
+        self.assertIn("Unknown.DoThing(", text)
+
+    def test_an_engine_type_local_is_not_leftover_csharp(self):
+        body = "ByteArray b = File_ReadAllBytes(p);\n"
+        self.assertIsNotNone(unity_pack._unlowered_csharp(body))
+        self.assertIsNone(unity_pack._unlowered_csharp(
+            body, known_types={"ByteArray"}))
+
+    def test_a_field_of_an_engine_type_local_is_not_leftover_csharp(self):
+        body = "Matrix4x4 l2w = Transform_l2w(i);\nfloat a = l2w.m00;\n"
+        self.assertIsNone(unity_pack._unlowered_csharp(
+            body, known_types={"Matrix4x4"}))
+
+    def test_a_lambda_is_reported_by_its_line(self):
+        what, text = unity_pack._unlowered_csharp(
+            "int k = 1;\nNotify_AddEvent(() => { go(); }, 0.1f);\n")
+        self.assertIn("Notify_AddEvent(() =>", text)
+
+    def _project(self):
+        root = tempfile.mkdtemp(prefix="upack-stubdiag-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        scenes = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scripts)
+        os.makedirs(scenes)
+        with open(os.path.join(scripts, "Menu.cs"), "w") as f:
+            f.write("using UnityEngine;\n"
+                    "public class Menu : MonoBehaviour {\n"
+                    "    void Start() { Unknown.DoThing(); }\n"
+                    "    void Update() {}\n"
+                    "}\n")
+        with open(os.path.join(scripts, "Menu.cs.meta"), "w") as f:
+            f.write("guid: 5d1a95d1a95d1a95d1a95d1a95d1a95d\n")
+        with open(os.path.join(scenes, "S.unity"), "w") as f:
+            f.write("%YAML 1.1\n"
+                    "--- !u!1 &1\nGameObject:\n  m_Name: Menu\n"
+                    "  m_Component:\n  - component: {fileID: 2}\n"
+                    "  - component: {fileID: 3}\n"
+                    "--- !u!4 &2\nTransform:\n  m_GameObject: {fileID: 1}\n"
+                    "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                    "--- !u!114 &3\nMonoBehaviour:\n  m_GameObject: {fileID: 1}\n"
+                    "  m_Script: {fileID: 11500000, "
+                    "guid: 5d1a95d1a95d1a95d1a95d1a95d1a95d}\n")
+        return root
+
+    def test_a_stub_is_a_warning_at_the_method(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            plan = unity_pack.pack(self._project(),
+                                   tempfile.mkdtemp(prefix="upack-sd-out-"))
+        self.assertIn("Assets/Scripts/Menu.cs(3,", err.getvalue())
+        self.assertIn("warning CS8000: `Menu.Start` is not lowered yet",
+                      err.getvalue())
+        self.assertIn("Unknown.DoThing(", err.getvalue())
+        self.assertEqual([(st["class"], st["method"])
+                          for st in plan["stubs"]], [("Menu", "Start")])
+
+    def test_strict_makes_a_stub_an_error(self):
+        with self.assertRaises(unity_pack.PackError) as cm:
+            with contextlib.redirect_stderr(io.StringIO()):
+                unity_pack.pack(self._project(),
+                                tempfile.mkdtemp(prefix="upack-sd-out-"),
+                                strict=True)
+        self.assertIn("error CS8000: `Menu.Start` is not lowered yet",
+                      cm.exception.message)
+
+
+class TestPackedFields(unittest.TestCase):
+    """Fields read and written through the instance slot (cs2cpp's packed
+    model), and the widths the packer picks for them.
+
+    `other.hp` through a field of another class's type is documented and
+    had never worked: it came out `Coin_get_other(i).Coin_get_hp(i)`, which
+    the stub check then emptied, silently. And a bitfield is only sound if
+    every write is known: `seen = target.hp` stored 1 of a 5 in the 1-bit
+    field the scene's 0 had chosen.
+    """
+
+    def _project(self, coin_body, extra_field=""):
+        root = tempfile.mkdtemp(prefix="upack-fields-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        scenes = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scripts)
+        os.makedirs(scenes)
+        with open(os.path.join(scripts, "Enemy.cs"), "w") as f:
+            f.write("using UnityEngine;\n"
+                    "public class Enemy : MonoBehaviour {\n"
+                    "    public int hp;\n"
+                    "    void Update() {}\n"
+                    "}\n")
+        with open(os.path.join(scripts, "Coin.cs"), "w") as f:
+            f.write("using UnityEngine;\n"
+                    "public class Coin : MonoBehaviour {\n"
+                    "    public Enemy target;\n"
+                    "    public int seen;\n" + extra_field +
+                    "    void Update() {\n" + coin_body + "    }\n"
+                    "}\n")
+        for name, guid in (("Enemy", "e1" * 16), ("Coin", "c1" * 16)):
+            with open(os.path.join(scripts, name + ".cs.meta"), "w") as f:
+                f.write("guid: %s\n" % guid)
+        with open(os.path.join(scenes, "S.unity"), "w") as f:
+            f.write("%%YAML 1.1\n"
+                    "--- !u!1 &1\nGameObject:\n  m_Name: Foe\n"
+                    "  m_Component:\n  - component: {fileID: 2}\n"
+                    "  - component: {fileID: 3}\n"
+                    "--- !u!4 &2\nTransform:\n  m_GameObject: {fileID: 1}\n"
+                    "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                    "--- !u!114 &3\nMonoBehaviour:\n  m_GameObject: {fileID: 1}\n"
+                    "  m_Script: {fileID: 11500000, guid: %s}\n"
+                    "  hp: 5\n"
+                    "--- !u!1 &10\nGameObject:\n  m_Name: Pickup\n"
+                    "  m_Component:\n  - component: {fileID: 11}\n"
+                    "  - component: {fileID: 12}\n"
+                    "--- !u!4 &11\nTransform:\n  m_GameObject: {fileID: 10}\n"
+                    "  m_LocalPosition: {x: 1, y: 0, z: 0}\n"
+                    "--- !u!114 &12\nMonoBehaviour:\n  m_GameObject: {fileID: 10}\n"
+                    "  m_Script: {fileID: 11500000, guid: %s}\n"
+                    "  target: {fileID: 3}\n"
+                    "  seen: 0\n" % ("e1" * 16, "c1" * 16))
+        return root
+
+    def _struct(self, eng, name):
+        m = re.search(r"struct %s \{(.*?)\};" % name, eng, re.S)
+        return m.group(1) if m else ""
+
+    @needs_cc
+    def test_a_handle_field_reads_the_other_instance(self):
+        d = tempfile.mkdtemp(prefix="upack-fields-out-")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            plan = unity_pack.pack(self._project(
+                "        seen = target.hp;\n"
+                "        Debug.Log(seen);\n"), d)
+        self.assertEqual(plan.get("stubs", []), [], err.getvalue())
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("Enemy_AT(Coin_get_target(i)).hp", eng)
+        r = subprocess.run(["make", "-C", d], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr or r.stdout)
+        run = subprocess.run([os.path.join(d, "game"), "-logFile", "-"],
+                             capture_output=True, text=True, cwd=d, timeout=60)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+        logged = [l for l in run.stdout.splitlines() if not l.startswith("ticks")]
+        self.assertTrue(logged)
+        self.assertEqual(set(logged), {"5"})
+
+    def test_a_non_literal_write_keeps_the_csharp_width(self):
+        d = tempfile.mkdtemp(prefix="upack-fields-out-")
+        with contextlib.redirect_stderr(io.StringIO()):
+            unity_pack.pack(self._project("        seen = target.hp;\n"), d)
+        with open(os.path.join(d, "engine.cpp")) as f:
+            coin = self._struct(f.read(), "Coin")
+        self.assertIn("int seen;", coin)
+
+    def test_increments_keep_the_csharp_width(self):
+        d = tempfile.mkdtemp(prefix="upack-fields-out-")
+        with contextlib.redirect_stderr(io.StringIO()):
+            unity_pack.pack(self._project("        seen++;\n"), d)
+        with open(os.path.join(d, "engine.cpp")) as f:
+            coin = self._struct(f.read(), "Coin")
+        self.assertNotIn("seen :", coin)
+
+    def test_a_write_through_another_object_widens_its_field(self):
+        # `target.hp = n` is Enemy's field, written from Coin: Enemy's own
+        # scripts never assign it, and its scene value alone chose 3 bits.
+        d = tempfile.mkdtemp(prefix="upack-fields-out-")
+        with contextlib.redirect_stderr(io.StringIO()):
+            unity_pack.pack(self._project("        target.hp = seen;\n"), d)
+        with open(os.path.join(d, "engine.cpp")) as f:
+            enemy = self._struct(f.read(), "Enemy")
+        self.assertIn("int hp;", enemy)
+
+    def test_literal_writes_still_pack(self):
+        # The point of the rule: literals and scene values bound the field.
+        d = tempfile.mkdtemp(prefix="upack-fields-out-")
+        with contextlib.redirect_stderr(io.StringIO()):
+            unity_pack.pack(self._project("        seen = 3;\n"), d)
+        with open(os.path.join(d, "engine.cpp")) as f:
+            coin = self._struct(f.read(), "Coin")
+        self.assertRegex(coin, r"unsigned seen : [1-7];")
 
 
 class TestSystems(unittest.TestCase):
@@ -1809,6 +2021,7 @@ class TestSystems(unittest.TestCase):
         self.assertNotIn("0.toggles", eng)
         self.assertNotIn("CosmeticsMenu.instance", eng)
 
+    @needs_systems
     def test_quaternion_unsupported_member_is_cs0117(self):
         """Unsupported Quaternion members → CS0117 (in scope via UnityEngine)."""
         src = (
@@ -4077,13 +4290,14 @@ class TestSystems(unittest.TestCase):
         unity_pack.analyze_script(path, src.replace("0.f", "0f"))
         unity_pack.analyze_script(path, src.replace("0.f", "0.0f"))
 
+    @needs_systems
     def test_csharp_0f_lowers_to_c_0_dot_f(self):
         """C# `0f` is valid; emitted C must spell `0.f` (gcc rejects `0f`)."""
-        self.assertEqual(unity_pack._rewrite_csharp_float_literals("x * 0f"),
+        self.assertEqual(cs2cpp.lower_float_literals("x * 0f"),
                          "x * 0.f")
-        self.assertEqual(unity_pack._rewrite_csharp_float_literals("1.5f + 2F"),
+        self.assertEqual(cs2cpp.lower_float_literals("1.5f + 2F"),
                          "1.5f + 2.F")
-        self.assertEqual(unity_pack._rewrite_csharp_float_literals('"0f"'),
+        self.assertEqual(cs2cpp.lower_float_literals('"0f"'),
                          '"0f"')
         d = tempfile.mkdtemp(prefix="upack-0f-")
         unity_pack.pack(SYSTEMS, d)
@@ -4092,6 +4306,7 @@ class TestSystems(unittest.TestCase):
         self.assertIn("AmbientBias_get_lift(i) * 0.f", engine)
         self.assertNotIn("AmbientBias_get_lift(i) * 0f", engine)
 
+    @needs_systems
     def test_sprite_sorting_layers_and_order(self):
         """TagManager layers + SpriteRenderer order → sorted EngineDraw list."""
         layers = unity_pack._load_sorting_layers(SYSTEMS)
@@ -4120,6 +4335,7 @@ class TestSystems(unittest.TestCase):
         self.assertIn("int sorting_order;", hdr)
 
     @needs_cc
+    @needs_systems
     def test_application_data_path_and_log_average_fps(self):
         """Update-time persistentDataPath + suffix → _str_plus_s; script runs."""
         path = os.path.join(
@@ -4472,6 +4688,7 @@ class TestSystems(unittest.TestCase):
         self.assertIn("BadPath.cs:3", err)
         self.assertEqual(err.count("UnityException: get_persistentDataPath"), 3)
 
+    @needs_systems
     def test_package_cache_guid_resolves(self):
         """UPM PackageCache .meta guids resolve; Assets scripts stay exclusive."""
         assets = unity_pack._asset_guid_map(SYSTEMS)
@@ -5081,6 +5298,7 @@ class TestSystems(unittest.TestCase):
         self.assertAlmostEqual(hit.get("hh", 0) * 2, 200.0, places=3)
 
 
+    @needs_systems
     def test_canvas_button_draws_and_clicks(self):
         """Authored Canvas + Button (builtin UISprite) → draw + SetActive onClick."""
         objs, _a, _l, cams, _hier = unity_pack.load_project(SYSTEMS)
@@ -5693,6 +5911,7 @@ class TestSystems(unittest.TestCase):
         self.assertNotIn("_engine_ui_btn_tint[", eng)
         self.assertNotIn("_spr_btn", eng)
 
+    @needs_systems
     def test_vector3_plus_equals_vector2_is_cs0034(self):
         """transform.position is Vector3; += Vector2 is ambiguous in csc."""
         bad = (
@@ -5738,6 +5957,7 @@ class TestSystems(unittest.TestCase):
         unity_pack.analyze_script(
             os.path.join(SYSTEMS, "Assets", "Scripts", "Player.cs"))
 
+    @needs_systems
     def test_detects_system_apis(self):
         _objs, analyses, lights, cameras, _hier = unity_pack.load_project(SYSTEMS)
         apis = set()
@@ -5794,6 +6014,7 @@ class TestSystems(unittest.TestCase):
         self.assertIn("Camera_main_local_z", eng)
 
     @needs_cc
+    @needs_systems
     def test_main_camera_follows_player_parent(self):
         """Main Camera under Player: Camera_main_pos tracks Player world."""
         d = tempfile.mkdtemp(prefix="upack-camfollow-")
@@ -5993,6 +6214,7 @@ class TestSystems(unittest.TestCase):
             f.write("using UnityEngine;\nclass Tool {}\n")
         self.assertTrue(unity_pack._is_player_csharp(root, helpers))
 
+    @needs_systems
     def test_emits_opt_in_stubs_not_invented_components(self):
         d = tempfile.mkdtemp(prefix="upack-sys-")
         unity_pack.pack(SYSTEMS, d)
@@ -6327,6 +6549,7 @@ class TestSystems(unittest.TestCase):
         self.assertIn("no authored SpriteRenderers", engine)
         self.assertNotIn("out[n].half_w", engine)
 
+    @needs_systems
     def test_authored_animation_and_animator(self):
         objs, _a, _l, _c, _hier = unity_pack.load_project(SYSTEMS)
         wave = [o for o in objs if o["name"] == "Wave"][0]
@@ -6391,6 +6614,7 @@ class TestSystems(unittest.TestCase):
         self.assertIn("_AnimSpriteKey_tex", data)
         self.assertIn("int _Graphics_draw_tex[", data)
 
+    @needs_systems
     def test_mecanim_clip_drives_animator_not_animation(self):
         """Non-legacy Bob.anim → Spinner Animator plays; Wave Animation idle."""
         root = tempfile.mkdtemp(prefix="upack-mecanim-")
@@ -6480,6 +6704,7 @@ class TestSystems(unittest.TestCase):
         run = subprocess.run([exe], capture_output=True, text=True)
         self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
 
+    @needs_systems
     def test_mathf_sign_and_set_world_scale_extensions(self):
         """Mathf.Sign + Extensions SetX/SetZ/SetWorldScale lower for Player."""
         d = tempfile.mkdtemp(prefix="upack-ext-")
@@ -6516,6 +6741,7 @@ class TestSystems(unittest.TestCase):
         # xSize is last float member after multSize_x/y — trailing 1.0f before }
         self.assertIn("17.5f, 1.0f, 1.0f, 1.0f", data)
 
+    @needs_systems
     def test_addcomponent_camera_and_rigidbody2d(self):
         """AddComponent refuses a second DisallowMultipleComponent with Unity's error."""
         d = tempfile.mkdtemp(prefix="upack-addcomp-")
@@ -6651,6 +6877,7 @@ class TestSystems(unittest.TestCase):
         self.assertIn("_AudioSource_owner_go", data)
 
     @needs_cc
+    @needs_systems
     def test_addcomponent_disallow_multiple_prints_unity_error(self):
         """Player has no SpriteRenderer — AddComponent succeeds and prints it."""
         d = tempfile.mkdtemp(prefix="upack-disallow-run-")
@@ -6689,6 +6916,7 @@ class TestSystems(unittest.TestCase):
             "component is already added to the game object!",
             run.stderr)
 
+    @needs_systems
     def test_authored_rigidbody2d_is_packed(self):
         objs, _a, _l, _c, _hier = unity_pack.load_project(SYSTEMS)
         ball = [o for o in objs if o["name"] == "Ball"][0]
@@ -6730,6 +6958,7 @@ class TestSystems(unittest.TestCase):
         self.assertIn("_Collider2D_friction", eng)
         self.assertIn("_phys_mat_combine", eng)
 
+    @needs_systems
     def test_rigidbody_field_linear_velocity_setx(self):
         """Serialized Rigidbody2D field + linearVelocity.SetX lowers to vel tables."""
         d = tempfile.mkdtemp(prefix="upack-rb-lv-")
@@ -7283,7 +7512,9 @@ class TestSystems(unittest.TestCase):
         with open(os.path.join(d, "engine.c")) as f:
             eng = f.read()
             self.assertIn(
-                'Console_WriteLine(Object_ToString(GameObject_Find("BouncePad")))',
+                # The string overload: `Console.WriteLine` of a non-string
+                # goes through `Object_ToString`, then `_s`.
+                'Console_WriteLine_s(Object_ToString(GameObject_Find("BouncePad")))',
                 eng)
             self.assertIn("%s (UnityEngine.GameObject)", eng)
         r = subprocess.run(["make", "-C", d], capture_output=True, text=True)
@@ -7294,6 +7525,7 @@ class TestSystems(unittest.TestCase):
         self.assertIn("BouncePad (UnityEngine.GameObject)", run.stdout)
 
     @needs_cc
+    @needs_systems
     def test_find_getcomponent_runs(self):
         """Find miss + GetComponent.field → NRE with site; Start exits, player continues."""
         d = tempfile.mkdtemp(prefix="upack-find-run-")
@@ -7608,6 +7840,7 @@ class TestSystems(unittest.TestCase):
             os.path.basename(unity_pack.default_pack_dir(root)),
             os.path.basename(os.path.abspath(root)))
 
+    @needs_systems
     def test_player_screen_from_project_settings(self):
         """defaultScreenWidth/Height → Screen_width/height for the window host."""
         self.assertEqual(
@@ -7764,6 +7997,7 @@ class TestSystems(unittest.TestCase):
 @needs_cc
 class TestSystemsRuns(unittest.TestCase):
 
+    @needs_systems
     def test_make_game_links(self):
         d = tempfile.mkdtemp(prefix="upack-sys-make-")
         unity_pack.pack(SYSTEMS, d)
@@ -7774,6 +8008,7 @@ class TestSystemsRuns(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
         self.assertIn("draws=", run.stdout)
 
+    @needs_systems
     def test_tick_animates_and_physics(self):
         d = tempfile.mkdtemp(prefix="upack-sys-run-")
         unity_pack.pack(SYSTEMS, d)
@@ -7895,6 +8130,7 @@ class TestSystemsRuns(unittest.TestCase):
         run = subprocess.run([exe], capture_output=True, text=True)
         self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
 
+    @needs_systems
     def test_oncollision_enter2d_fires_on_landing(self):
         """Player.OnCollisionEnter2D prints Collision2D when hitting Ground/Ball."""
         d = tempfile.mkdtemp(prefix="upack-col2d-msg-")
@@ -7948,6 +8184,7 @@ class TestSystemsRuns(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
         self.assertIn("UnityEngine.Collision2D", run.stdout)
 
+    @needs_systems
     def test_player_stack_on_ball_does_not_teleport_ball(self):
         """Player landing on Ball must not drive Ball through Ground."""
         d = tempfile.mkdtemp(prefix="upack-stack-")
@@ -7999,6 +8236,7 @@ class TestSystemsRuns(unittest.TestCase):
         run = subprocess.run([exe], capture_output=True, text=True)
         self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
 
+    @needs_systems
     def test_physics_fall_matches_wall_clock_not_frame_count(self):
         """60Hz×1s ≈ same Player fall as 50 fixed steps (Unity fixed clock)."""
         ys = {}
@@ -8048,6 +8286,7 @@ class TestSystemsRuns(unittest.TestCase):
             ys[label] = float(yline[-1][2:])
         self.assertAlmostEqual(ys["50"], ys["60"], delta=0.05)
 
+    @needs_systems
     def test_camera_positive_z_culls_sprites(self):
         """Unity looks +Z; camera at +z with sprites at 0 draws nothing."""
         d = tempfile.mkdtemp(prefix="upack-cam-z-")
