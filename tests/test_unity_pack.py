@@ -698,6 +698,54 @@ class TestPackedFields(unittest.TestCase):
                     "  seen: 0\n" % ("e1" * 16, "c1" * 16))
         return root
 
+    def _two_enemies(self, coin_body, target_file_id):
+        """Two Enemies (hp 3, hp 7) and a Coin whose `target` is given by
+        the fileID of an Enemy's script component (0: none)."""
+        root = self._project(coin_body)
+        scene = os.path.join(root, "Assets", "Scenes", "S.unity")
+        text = open(scene).read()
+        text = text.replace("  hp: 5\n", "  hp: 3\n")
+        text = text.replace("  target: {fileID: 3}\n",
+                            "  target: {fileID: %d}\n" % target_file_id)
+        text += ("--- !u!1 &20\nGameObject:\n  m_Name: Foe2\n"
+                 "  m_Component:\n  - component: {fileID: 21}\n"
+                 "  - component: {fileID: 22}\n"
+                 "--- !u!4 &21\nTransform:\n  m_GameObject: {fileID: 20}\n"
+                 "  m_LocalPosition: {x: 2, y: 0, z: 0}\n"
+                 "--- !u!114 &22\nMonoBehaviour:\n  m_GameObject: {fileID: 20}\n"
+                 "  m_Script: {fileID: 11500000, guid: %s}\n"
+                 "  hp: 7\n" % ("e1" * 16))
+        open(scene, "w").write(text)
+        return root
+
+    def _run_log(self, root):
+        d = tempfile.mkdtemp(prefix="upack-fields-out-")
+        with contextlib.redirect_stderr(io.StringIO()):
+            unity_pack.pack(root, d)
+        r = subprocess.run(["make", "-C", d], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr or r.stdout)
+        run = subprocess.run([os.path.join(d, "game"), "-logFile", "-"],
+                             capture_output=True, text=True, cwd=d, timeout=60)
+        return set(l for l in run.stdout.splitlines()
+                   if not l.startswith("ticks"))
+
+    @needs_cc
+    def test_a_scene_reference_is_resolved_to_its_instance(self):
+        # The second Enemy: index 1. References between scripts were never
+        # resolved -- every one held 0, the first instance, which is what
+        # the single-Enemy test above happened to want.
+        self.assertEqual(self._run_log(self._two_enemies(
+            "        seen = target.hp;\n        Debug.Log(seen);\n", 22)),
+            {"7"})
+
+    @needs_cc
+    def test_an_empty_reference_is_null(self):
+        # `{fileID: 0}`: null in C#. It was stored as 0, another object, and
+        # a narrow index could not hold -1 to compare with anyway.
+        self.assertEqual(self._run_log(self._two_enemies(
+            "        if (target != null) { seen = 1; } else { seen = 2; }\n"
+            "        Debug.Log(seen);\n", 0)), {"2"})
+
     def _struct(self, eng, name):
         m = re.search(r"struct %s \{(.*?)\};" % name, eng, re.S)
         return m.group(1) if m else ""
@@ -757,6 +805,153 @@ class TestPackedFields(unittest.TestCase):
         with open(os.path.join(d, "engine.cpp")) as f:
             coin = self._struct(f.read(), "Coin")
         self.assertRegex(coin, r"unsigned seen : [1-7];")
+
+
+class TestMaxInstances(unittest.TestCase):
+    """`[MaxInstances(N)]`: the author caps a class's live instances.
+
+    The index into the class is then as narrow as N allows -- uint8_t up
+    to 255, uint16_t up to 65535 -- whatever else spawns, and `Instantiate`
+    returns null once N are live: dropping the N+1st bullet is the point.
+    """
+
+    _ATTR = ("public class MaxInstancesAttribute : System.Attribute {\n"
+             "    public MaxInstancesAttribute(int n) {}\n"
+             "}\n\n")
+
+    def _project(self, cap, coin_extra=""):
+        root = tempfile.mkdtemp(prefix="upack-maxinst-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        scenes = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scripts)
+        os.makedirs(scenes)
+        # The attribute class comes first in the file, as a user would
+        # write it: the component is still the class named after the file.
+        with open(os.path.join(scripts, "Bullet.cs"), "w") as f:
+            f.write("using UnityEngine;\n\n" + self._ATTR +
+                    "[MaxInstances(%d)]\n"
+                    "public class Bullet : MonoBehaviour {\n"
+                    "    public int speed;\n"
+                    "    void Update() { Instantiate(this); }\n"
+                    "}\n" % cap)
+        with open(os.path.join(scripts, "Coin.cs"), "w") as f:
+            f.write("using UnityEngine;\n"
+                    "public class Coin : MonoBehaviour {\n"
+                    "    public int value;\n" + coin_extra +
+                    "    void Update() {}\n"
+                    "}\n")
+        for name, guid in (("Bullet", "b4" * 16), ("Coin", "c4" * 16)):
+            with open(os.path.join(scripts, name + ".cs.meta"), "w") as f:
+                f.write("guid: %s\n" % guid)
+
+        def obj(fid, name, guid, fields):
+            return ("--- !u!1 &%d\nGameObject:\n  m_Name: %s\n"
+                    "  m_Component:\n  - component: {fileID: %d}\n"
+                    "  - component: {fileID: %d}\n"
+                    "--- !u!4 &%d\nTransform:\n  m_GameObject: {fileID: %d}\n"
+                    "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                    "--- !u!114 &%d\nMonoBehaviour:\n  m_GameObject: {fileID: %d}\n"
+                    "  m_Script: {fileID: 11500000, guid: %s}\n%s"
+                    % (fid, name, fid + 1, fid + 2, fid + 1, fid, fid + 2, fid,
+                       guid, fields))
+        with open(os.path.join(scenes, "S.unity"), "w") as f:
+            f.write("%YAML 1.1\n" + obj(1, "Shot", "b4" * 16, "  speed: 1\n")
+                    + obj(10, "CoinA", "c4" * 16, "  value: 1\n")
+                    + obj(20, "CoinB", "c4" * 16, "  value: 2\n"))
+        return root
+
+    def _pack(self, root):
+        d = tempfile.mkdtemp(prefix="upack-maxinst-out-")
+        with contextlib.redirect_stderr(io.StringIO()):
+            plan = unity_pack.pack(root, d)
+        return plan, d
+
+    @needs_cc
+    def test_a_capped_class_clips_at_its_cap(self):
+        # A bullet that clones itself every frame doubles without end; the
+        # cap holds it at 4, and its index is a byte although the project
+        # spawns (which makes every unannotated class uint32_t).
+        plan, d = self._pack(self._project(4))
+        self.assertEqual(plan["classes"]["Bullet"]["idx_ty"], "uint8_t")
+        self.assertEqual(plan["classes"]["Coin"]["idx_ty"], "uint32_t")
+        r = subprocess.run(["make", "-C", d], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr or r.stdout)
+        main = os.path.join(d, "count_main.c")
+        with open(main, "w") as f:
+            f.write("#include <stdio.h>\n"
+                    "void engine_tick(void);\n"
+                    "extern int _Bullet_inst_count;\n"
+                    "int main(void) { int t, most = 0;\n"
+                    "  for (t = 0; t < 20; t = t + 1) { engine_tick();\n"
+                    "    if (_Bullet_inst_count > most) most = _Bullet_inst_count; }\n"
+                    "  printf(\"%d %d\\n\", _Bullet_inst_count, most); return 0; }\n")
+        exe = os.path.join(d, "count_game")
+        r = subprocess.run([_CC, "-O2", "-o", exe, main,
+                            os.path.join(d, "engine.o"),
+                            os.path.join(d, "data.o"), "-lm"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True, timeout=60)
+        self.assertEqual(run.stdout.split(), ["4", "4"])
+
+    @needs_cc
+    def test_the_cap_counts_live_instances(self):
+        # Each bullet fires one and is destroyed. `Destroy` never freed a
+        # slot, so after 4 spawns in all there were none: the population
+        # died out. A destroyed bullet's slot is now reused, and firing goes
+        # on for all 60 frames of the headless run.
+        root = self._project(4)
+        path = os.path.join(root, "Assets", "Scripts", "Bullet.cs")
+        text = open(path).read().replace(
+            "    void Update() { Instantiate(this); }\n",
+            "    void Update() {\n"
+            "        Instantiate(this);\n"
+            "        Debug.Log(speed);\n"
+            "        Destroy(gameObject);\n"
+            "    }\n")
+        open(path, "w").write(text)
+        _plan, d = self._pack(root)
+        r = subprocess.run(["make", "-C", d], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr or r.stdout)
+        run = subprocess.run([os.path.join(d, "game"), "-logFile", "-"],
+                             capture_output=True, text=True, cwd=d, timeout=60)
+        fired = [l for l in run.stdout.splitlines() if l == "1"]
+        self.assertGreaterEqual(len(fired), 60)
+
+    def test_a_larger_cap_is_uint16_and_lists_no_zero_rows(self):
+        plan, d = self._pack(self._project(1000))
+        self.assertEqual(plan["classes"]["Bullet"]["idx_ty"], "uint16_t")
+        with open(os.path.join(d, "data.cpp")) as f:
+            data = f.read()
+        self.assertIn("_Bullet_inst_array[1000] = {", data)
+        # 999 spares are zeros C fills in; none is written out.
+        self.assertNotIn("addcomponent spare", data.split(
+            "_Bullet_inst_array[1000]", 1)[1].split("};", 1)[0])
+
+    def test_a_handle_is_as_wide_as_its_target(self):
+        # Coin's own index is uint32_t (the project spawns); a field that
+        # points at a Bullet is Bullet's width, a byte.
+        plan, d = self._pack(self._project(4, "    public Bullet shot;\n"))
+        members = dict((m[0], m[1]) for m in plan["classes"]["Coin"]["members"])
+        self.assertEqual(members["shot"], "uint8_t")
+
+    def test_a_scene_over_the_cap_is_an_error(self):
+        root = self._project(1)
+        scene = os.path.join(root, "Assets", "Scenes", "S.unity")
+        text = open(scene).read()
+        text += ("--- !u!1 &30\nGameObject:\n  m_Name: Shot2\n"
+                 "  m_Component:\n  - component: {fileID: 31}\n"
+                 "  - component: {fileID: 32}\n"
+                 "--- !u!4 &31\nTransform:\n  m_GameObject: {fileID: 30}\n"
+                 "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                 "--- !u!114 &32\nMonoBehaviour:\n  m_GameObject: {fileID: 30}\n"
+                 "  m_Script: {fileID: 11500000, guid: %s}\n  speed: 2\n"
+                 % ("b4" * 16))
+        open(scene, "w").write(text)
+        with self.assertRaises(unity_pack.PackError) as cm:
+            self._pack(root)
+        self.assertIn("[MaxInstances(1)] on `Bullet`", cm.exception.message)
+        self.assertIn("Bullet.cs(", cm.exception.message)
 
 
 class TestSystems(unittest.TestCase):
