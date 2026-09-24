@@ -7330,7 +7330,22 @@ def _unlowered_csharp(body, args_str=None, emitted_params=None,
     if _rec(r"(?<![\w_])[A-Z][a-zA-Z0-9]*\.[a-z]\w*\b", body):
         return ('Unlowered static field: `Vector3.zero` / `Random.value`.', _seen[-1] if _seen else '')
     # Chained call/property on a call result: ``AudioManager_Instance().MakeSoundEffect``.
-    if _rec(r"\)\s*\.\s*[A-Za-z_]", body):
+    # Not the engine's own instance accessor, `Other_AT(idx).field`: a
+    # handle field's member reads through it (`cs2cpp.lower_packed_fields`),
+    # and it is C -- the struct in its slot.
+    for cm in re.finditer(r"\)\s*\.\s*[A-Za-z_]", body):
+        depth, j = 0, cm.start()
+        while j >= 0:
+            if body[j] == ")":
+                depth += 1
+            elif body[j] == "(":
+                depth -= 1
+                if depth == 0:
+                    break
+            j -= 1
+        if re.search(r"(?<![\w])[A-Za-z_]\w*_AT\s*$", body[:max(j, 0)]):
+            continue
+        _seen.append(raw[cm.start():cm.end()])
         return ('Chained call/property on a call result: `AudioManager_Instance().MakeSoundEffect`.', _seen[-1] if _seen else '')
     # C# typed local of a reference type: ``SoundEffect soundEffect =``.
     # Not one of the engine's own C types, which the translator declares
@@ -7450,6 +7465,40 @@ _CS_INT_BITS = {
     "int": 32, "uint": 32,
     "long": 64, "ulong": 64,
 }
+
+
+_INT_WRITE_OPS = r"(?:\+\+|--|[-+*/%&|^]=|<<=|>>=|=(?!=))"
+
+
+def _int_field_writes_unbounded(fname, methods, all_methods=()):
+    """Whether any write to `fname` is not a literal or a const.
+
+    A bitfield is only sound when every value it will hold is known: the
+    scene's and the literals the scripts assign (`_assigned_int_seeds`).
+    `seen = target.hp`, `hp++` and `hp += n` bound nothing, and the field
+    silently truncated or wrapped -- `seen = target.hp` with hp 5 stored 1
+    in the 1-bit field the scene's 0 had chosen. So a field written that
+    way keeps its C# width. `all_methods` adds every script's methods, for
+    writes through another object (`other.fname = ..`, via a handle field).
+    """
+    own = r"(?<![\w.])%s" % re.escape(fname)
+    other = r"\.\s*%s" % re.escape(fname)
+    for pat, bodies in ((own, methods), (other, all_methods)):
+        for m in bodies or ():
+            body = cs2cpp._blank(m.get("body") or "")
+            if re.search(r"(?:\+\+|--)\s*%s(?![\w])" % pat, body):
+                return True
+            for wm in re.finditer(r"%s\s*(%s)" % (pat, _INT_WRITE_OPS), body):
+                op = wm.group(1)
+                if op != "=":
+                    return True
+                rhs = body[wm.end():].split(";", 1)[0].strip()
+                if rhs == fname or re.match(r"-?\d+$", rhs):
+                    continue
+                if re.match(r"[A-Z_][A-Z0-9_]*$", rhs):
+                    continue        # a const: `_assigned_int_seeds` seeds it
+                return True
+    return False
 
 
 def _assigned_int_seeds(fname, methods, fields):
@@ -7626,7 +7675,11 @@ def plan_layouts(objects, analyses, two_d=None):
                 type_bits = _CS_INT_BITS.get(ty, 32)
                 # No scene/seed values → C# width (not phantom [0] → 1 bit).
                 # Seeds from `framesLeft = FRAME_CNT` widen counters correctly.
-                if not vals:
+                # A write that is not a literal bounds nothing: C# width.
+                if not vals or _int_field_writes_unbounded(
+                        fname, script_methods,
+                        [mm for a in analyses for c in a.get("classes") or []
+                         for mm in c.get("methods") or []]):
                     w = type_bits
                 else:
                     w = _bitwidth(min(vals), max(vals))
@@ -10438,6 +10491,26 @@ def emit_engine(plan, analyses, used_apis):
     if _emitted_coll:
         p("")
 
+    # A class reached through another's handle field (`other.hp` ->
+    # `Other_AT(..).hp`) is read from that class's group, which may come
+    # first: define its accessor up front. Its own group repeats the define,
+    # which C allows for an identical definition; projects without handle
+    # fields emit exactly what they did.
+    _handle_targets = set()
+    for _cl in plan["classes"].values():
+        for _n, _t, _b, _kind in _cl["members"]:
+            if str(_kind).startswith("idx:"):
+                _other = _kind.split(":", 1)[1]
+                if (_other in plan["classes"]
+                        and _other not in _ADDABLE_BUILTINS
+                        and _other not in _PHYSICS_COMPONENTS):
+                    _handle_targets.add(_other)
+    for _other in sorted(_handle_targets):
+        _oidn = _c_ident(_other)
+        p("#define %s_AT(i) (_%s_inst_array[(i)])" % (_oidn, _oidn))
+    if _handle_targets:
+        p("")
+
     for cname, cl in sorted(plan["classes"].items()):
         idn = _c_ident(cname)
         p("/* ---- %s group: instance array is defined in data.c ---- */" % idn)
@@ -12870,7 +12943,7 @@ def _rewrite_transform_euler_angles(text, cl):
         while j < len(text):
             c = text[j]
             if c == '"':
-                j = _skip_c_string(text, j)
+                j = cs2cpp.skip_string_literal(text, j)
                 continue
             if c in "([{":
                 depth += 1
@@ -13090,7 +13163,7 @@ def _rewrite_transform_rotation(text, cl):
         while j < len(text):
             c = text[j]
             if c == '"':
-                j = _skip_c_string(text, j)
+                j = cs2cpp.skip_string_literal(text, j)
                 continue
             if c in "([{":
                 depth += 1
@@ -13165,142 +13238,10 @@ def _rewrite_local_rotation_reads(text, cl, plan):
     return text
 
 
-def _skip_c_string(text, i):
-    """Index just past a C/C# string literal starting at text[i] == '\"'."""
-    j = i + 1
-    while j < len(text):
-        if text[j] == "\\":
-            j += 2
-            continue
-        if text[j] == '"':
-            return j + 1
-        j += 1
-    return j
-
-
-def _parse_plus_rhs(text, i):
-    """Scan one + operand starting at *i*; stop at top-level + , ) ;."""
-    while i < len(text) and text[i] in " \t\n\r":
-        i += 1
-    start = i
-    depth = 0
-    while i < len(text):
-        c = text[i]
-        if c == '"':
-            i = _skip_c_string(text, i)
-            continue
-        if c == "'":
-            i += 1
-            if i < len(text) and text[i] == "\\":
-                i += 2
-            elif i < len(text):
-                i += 1
-            if i < len(text) and text[i] == "'":
-                i += 1
-            continue
-        if c == "(":
-            depth += 1
-        elif c == ")":
-            if depth == 0:
-                break
-            depth -= 1
-        elif c in ",;" and depth == 0:
-            break
-        elif c == "+" and depth == 0:
-            break
-        i += 1
-    return start, i
-
-
-def _rewrite_string_concat(text, string_idents=None):
-    """Rewrite C# string + value to typed _str_plus_* (C pointer + is wrong).
-
-    Handles `"lit" + expr`, `Application_*Path() + expr`, and chains via
-    repeated `_str_plus_*(...) + expr`. `string_idents` are bare names known
-    to be `string` (class static/const fields) so RHS picks `_str_plus_s`.
-    """
-    string_idents = frozenset(string_idents or ())
-    changed = True
-    while changed:
-        changed = False
-        out = []
-        i = 0
-        while i < len(text):
-            left = None
-            left_end = None
-            m_plus = re.match(r"_str_plus_[ifcs]\(", text[i:])
-            m_app = re.match(
-                r"Application_(?:dataPath|persistentDataPath|productName)\(\)",
-                text[i:])
-            if m_plus or text.startswith("_str_plus(", i):
-                prefix = m_plus.group(0) if m_plus else "_str_plus("
-                depth = 0
-                j = i + len(prefix) - 1
-                while j < len(text):
-                    if text[j] == '"':
-                        j = _skip_c_string(text, j)
-                        continue
-                    if text[j] == "(":
-                        depth += 1
-                    elif text[j] == ")":
-                        depth -= 1
-                        if depth == 0:
-                            j += 1
-                            break
-                    j += 1
-                left = text[i:j]
-                left_end = j
-            elif m_app:
-                left = m_app.group(0)
-                left_end = i + len(left)
-            elif text[i] == '"':
-                j = _skip_c_string(text, i)
-                left = text[i:j]
-                left_end = j
-            if left is not None:
-                k = left_end
-                while k < len(text) and text[k] in " \t\n\r":
-                    k += 1
-                if k < len(text) and text[k] == "+":
-                    rhs_start, rhs_end = _parse_plus_rhs(text, k + 1)
-                    rhs = text[rhs_start:rhs_end].strip()
-                    if rhs:
-                        kind = _c_expr_scalar_kind(
-                            rhs, string_idents=string_idents)
-                        out.append("_str_plus_%s(%s, (%s))"
-                                   % (kind, left, rhs))
-                        i = rhs_end
-                        changed = True
-                        continue
-            out.append(text[i])
-            i += 1
-        text = "".join(out)
-    return text
-
-
 def _c_expr_scalar_kind(expr, string_idents=None):
-    """Pick i/f/c/s suffix for Debug_Log / Console_WriteLine / _str_plus."""
-    string_idents = frozenset(string_idents or ())
-    e = expr.strip()
-    while (e.startswith("(") and e.endswith(")")
-           and e.count("(") == e.count(")")):
-        inner = e[1:-1].strip()
-        if not inner:
-            break
-        e = inner
-    if (e.startswith('"') or e.startswith("_str_plus")
-            or "ToString" in e or e.startswith("(const char")
-            or e in ("Application_dataPath()",
-                     "Application_persistentDataPath()",
-                     "Application_productName()")
-            or e.startswith("StreamReader_ReadLine(")
-            or (re.match(r"^\w+$", e) and e in string_idents)):
-        return "s"
-    if re.match(r"^'(?:[^'\\]|\\.)'$", e):
-        return "c"
-    if re.match(r"^-?\d+$", e):
-        return "i"
-    return "f"
+    """Pick i/f/c/s for Debug_Log / Console_WriteLine: cs2cpp's classifier,
+    under the packed model (whose engine defines what returns a string)."""
+    return cs2cpp.scalar_kind(expr, _PACKED_STRINGS, string_idents)
 
 
 def _rewrite_typed_call_name(text, name, string_idents=None):
@@ -13320,7 +13261,7 @@ def _rewrite_typed_call_name(text, name, string_idents=None):
         while j < len(text) and depth:
             c = text[j]
             if c == '"':
-                j = _skip_c_string(text, j)
+                j = cs2cpp.skip_string_literal(text, j)
                 continue
             if c == "(":
                 depth += 1
@@ -13583,42 +13524,10 @@ def _rewrite_dictionary(text, plan, cl):
     }
     dict_names |= set(inst_dict)
 
-    def map_ty(k, v):
-        return "std::map<%s, %s>" % (
-            _collection_elem_c_ty(k, plan),
-            _collection_elem_c_ty(v, plan))
-
-    _map_kw = r"(?:Dictionary|SortedList)"
-
-    def repl_decl(m):
-        k, v, name = m.group(1), m.group(2), m.group(3)
-        dict_names.add(name)
-        return "%s %s" % (map_ty(k, v), name)
-
-    text = re.sub(
-        r"(?<![\w.])(?:System\.Collections\.Generic\.)?%s\s*"
-        r"<\s*([\w.]+)\s*,\s*([\w.]+)\s*>\s+(\w+)\s*=\s*new\s+"
-        r"(?:System\.Collections\.Generic\.)?%s\s*"
-        r"<\s*\1\s*,\s*\2\s*>\s*\(\s*\)\s*;" % (_map_kw, _map_kw),
-        lambda m: repl_decl(m) + ";",
-        text)
-
-    def repl_new(m):
-        return "%s()" % map_ty(m.group(1), m.group(2))
-
-    text = re.sub(
-        r"(?<![\w.])new\s+(?:System\.Collections\.Generic\.)?%s\s*"
-        r"<\s*([\w.]+)\s*,\s*([\w.]+)\s*>\s*\(\s*\)" % _map_kw,
-        repl_new, text)
-
-    def repl_ty(m):
-        return map_ty(m.group(1), m.group(2))
-
-    text = re.sub(
-        r"(?<![\w.])(?:System\.Collections\.Generic\.)?%s\s*"
-        r"<\s*([\w.]+)\s*,\s*([\w.]+)\s*>" % _map_kw,
-        repl_ty, text)
-
+    # The collection itself -- types, declarations, temporaries -- is
+    # cs2cpp's, under the packed model (its element typing is this file's).
+    text, declared = cs2cpp.lower_map_types(text, _packed_model(plan))
+    dict_names |= declared
     # Other classes' instance maps: recv.field → Class_field[recv].
     for ocname, ocl in (plan.get("classes") or {}).items():
         if ocname == cl.get("name"):
@@ -13668,28 +13577,7 @@ def _rewrite_dictionary(text, plan, cl):
     if aliases:
         text = "\n".join(aliases) + "\n" + text
 
-    for name in sorted(dict_names, key=len, reverse=True):
-        kt = key_cty.get(name, "int")
-
-        def repl_add(m, n=name, kty=kt):
-            return ("{ %s __dk = %s; %s[__dk] = %s; }"
-                    % (kty, m.group(1).strip(), n, m.group(2).strip()))
-
-        text = re.sub(
-            r"(?<![.\w])%s\.Add\s*\(([^,]+),\s*([^)]+)\)" % re.escape(name),
-            repl_add, text)
-        text = re.sub(
-            r"(?<![.\w])%s\.Clear\s*\(\s*\)" % re.escape(name),
-            "%s.clear()" % name, text)
-        text = re.sub(
-            r"(?<![.\w])%s\.Count\b" % re.escape(name),
-            "%s.size()" % name, text)
-        text = re.sub(
-            r"(?<![.\w])%s\.ContainsKey\s*\(([^)]+)\)" % re.escape(name),
-            r"(%s.count(\1) != 0)" % name, text)
-        text = re.sub(
-            r"(?<![.\w])%s\.Remove\s*\(([^)]+)\)" % re.escape(name),
-            r"%s.erase(\1)" % name, text)
+    text = cs2cpp.lower_map_members_named(text, dict_names, key_cty)
 
     # String-key indexer → helper (literals / const char* need an address).
     for ocname, ocl in (plan.get("classes") or {}).items():
@@ -13698,16 +13586,15 @@ def _rewrite_dictionary(text, plan, cl):
             kv = _dict_kv_names(f.get("ty") or "")
             if not kv or _collection_elem_c_ty(kv[0], plan) != "std::string":
                 continue
-            pat = r"(%s_%s\s*\[[^\]]+\])\s*\[(.*?)\]" % (
-                re.escape(oidn), re.escape(f["name"]))
-            text = re.sub(pat, r"(*_engine_map_at_si(\1, \2))", text)
+            text = cs2cpp.lower_map_string_index(
+                text, r"%s_%s\s*\[[^\]]+\]" % (
+                    re.escape(oidn), re.escape(f["name"])),
+                _packed_model(plan))
     for name in sorted(
             [n for n in dict_names if key_cty.get(n) == "std::string"],
             key=len, reverse=True):
-        text = re.sub(
-            r"(?<![.\w])%s\s*\[(.*?)\]" % re.escape(name),
-            r"(*_engine_map_at_si(%s, \1))" % name,
-            text)
+        text = cs2cpp.lower_map_string_index(
+            text, r"(?<![.\w])%s" % re.escape(name), _packed_model(plan))
     return text
 
 
@@ -13729,33 +13616,9 @@ def _rewrite_list(text, plan, cl):
     }
     list_names |= set(inst_list)
 
-    def repl_decl(m):
-        elem, name = m.group(1), m.group(2)
-        list_names.add(name)
-        return "std::vector<%s> %s" % (_list_elem_c_ty(elem, plan), name)
-
-    # List<T> name = new List<T>();  →  std::vector<C> name;
-    text = re.sub(
-        r"(?<![\w.])(?:System\.Collections\.Generic\.)?List\s*<\s*([\w.]+)\s*>"
-        r"\s+(\w+)\s*=\s*new\s+(?:System\.Collections\.Generic\.)?List\s*"
-        r"<\s*\1\s*>\s*\(\s*\)\s*;",
-        lambda m: repl_decl(m) + ";",
-        text)
-
-    def repl_new(m):
-        return "std::vector<%s>()" % _list_elem_c_ty(m.group(1), plan)
-
-    text = re.sub(
-        r"(?<![\w.])new\s+(?:System\.Collections\.Generic\.)?List\s*"
-        r"<\s*([\w.]+)\s*>\s*\(\s*\)",
-        repl_new, text)
-
-    def repl_ty(m):
-        return "std::vector<%s>" % _list_elem_c_ty(m.group(1), plan)
-
-    text = re.sub(
-        r"(?<![\w.])(?:System\.Collections\.Generic\.)?List\s*<\s*([\w.]+)\s*>",
-        repl_ty, text)
+    # The collection itself is cs2cpp's, under the packed model.
+    text, declared = cs2cpp.lower_list_types(text, _packed_model(plan))
+    list_names |= declared
 
     # OtherClass.staticList → OtherClass_staticList (before .Count / .Add).
     for ocname, ocl in (plan.get("classes") or {}).items():
@@ -13770,15 +13633,15 @@ def _rewrite_list(text, plan, cl):
             text = re.sub(
                 r"(?<![\w.])%s\s*\.\s*%s\.Add\s*\(" % (
                     re.escape(ocname), re.escape(fname)),
-                "%s.push_back(" % mangled, text)
+                "%s.%s(" % (mangled, cs2cpp.LIST_METHODS["Add"]), text)
             text = re.sub(
                 r"(?<![\w.])%s\s*\.\s*%s\.Clear\s*\(\s*\)" % (
                     re.escape(ocname), re.escape(fname)),
-                "%s.clear()" % mangled, text)
+                "%s.%s()" % (mangled, cs2cpp.LIST_METHODS["Clear"]), text)
             text = re.sub(
                 r"(?<![\w.])%s\s*\.\s*%s\.Count\b" % (
                     re.escape(ocname), re.escape(fname)),
-                "%s.size()" % mangled, text)
+                "%s.%s()" % (mangled, cs2cpp.LIST_METHODS["Count"]), text)
             text = re.sub(
                 r"(?<![\w.])%s\s*\.\s*%s\b" % (
                     re.escape(ocname), re.escape(fname)),
@@ -13786,16 +13649,7 @@ def _rewrite_list(text, plan, cl):
             list_names.add(mangled)
 
     list_names |= set(re.findall(r"\bstd::vector<\w+>\s+(\w+)\b", text))
-    for name in sorted(list_names, key=len, reverse=True):
-        text = re.sub(
-            r"(?<![.\w])%s\.Add\s*\(" % re.escape(name),
-            "%s.push_back(" % name, text)
-        text = re.sub(
-            r"(?<![.\w])%s\.Clear\s*\(\s*\)" % re.escape(name),
-            "%s.clear()" % name, text)
-        text = re.sub(
-            r"(?<![.\w])%s\.Count\b" % re.escape(name),
-            "%s.size()" % name, text)
+    text = cs2cpp.lower_list_members_named(text, list_names)
     # Instance lists: bind a ref so `.push_back` / `.clear` lower.
     aliases = []
     for name, f in sorted(inst_list.items()):
@@ -13845,7 +13699,7 @@ def _rewrite_file_copy(text):
         while j < len(text) and depth:
             c = text[j]
             if c == '"':
-                j = _skip_c_string(text, j)
+                j = cs2cpp.skip_string_literal(text, j)
                 continue
             if c == "'":
                 j += 1
@@ -13917,11 +13771,21 @@ def _rewrite_file_text_streams(text, cl):
     return text
 
 
+#: The packed model's string knowledge does not depend on the plan.
+_PACKED_STRINGS = cs2cpp.packed_model(False)
+
+
+def _lower_string_concat(text, string_idents=None):
+    """cs2cpp's typed concatenation under the packed model."""
+    return cs2cpp.lower_string_concat(text, _PACKED_STRINGS, string_idents)
+
+
 def _packed_model(plan):
     """cs2cpp's packed object model for this plan's engine."""
     return cs2cpp.packed_model(
         bool(plan.get("go_names")),
-        byte_arrays=plan.get("_byte_array_lit_i") is not None)
+        byte_arrays=plan.get("_byte_array_lit_i") is not None,
+        elem_type=lambda t: _collection_elem_c_ty(t, plan))
 
 
 def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
@@ -14119,7 +13983,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     # Locals: `string x` / `const char *x` (after string→const char * rewrite).
     string_idents |= set(re.findall(
         r"\b(?:string|const char \*)\s+(\w+)\b", text))
-    text = _rewrite_string_concat(text, string_idents=string_idents)
+    text = _lower_string_concat(text, string_idents=string_idents)
     # Unity Object.ToString when printing a Find result (name, not index).
     text = _wrap_log_gameobject_tostring(text)
     text = _wrap_log_component_tostring(text, add_locals)
@@ -14303,59 +14167,10 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
             text = re.sub(
                 r"(?<![_\w])%s(?![\w])" % prop,
                 vf, text)
-    # Const/static class fields before instance member rewrites.
-    for name in sorted(class_const_names, key=len, reverse=True):
-        text = re.sub(
-            r"(?<![_\w])%s(?![\w])" % name,
-            "%s_%s" % (idn, name),
-            text)
-    for name in sorted(members, key=len, reverse=True):
-        # ++ / -- before assignment rewrites.
-        text = re.sub(
-            r"(?<![_\w])%s\s*\+\+" % name,
-            "%s_set_%s(i, %s_get_%s(i) + 1)" % (idn, name, idn, name),
-            text)
-        text = re.sub(
-            r"(?<![_\w])%s\s*--" % name,
-            "%s_set_%s(i, %s_get_%s(i) - 1)" % (idn, name, idn, name),
-            text)
-        text = re.sub(
-            r"\+\+\s*(?<![_\w])%s(?![\w])" % name,
-            "%s_set_%s(i, %s_get_%s(i) + 1)" % (idn, name, idn, name),
-            text)
-        text = re.sub(
-            r"--\s*(?<![_\w])%s(?![\w])" % name,
-            "%s_set_%s(i, %s_get_%s(i) - 1)" % (idn, name, idn, name),
-            text)
-        text = re.sub(
-            r"(?<![_\w])%s\s*\+=" % name,
-            "%s_set_%s(i, %s_get_%s(i) +" % (idn, name, idn, name),
-            text)
-        text = re.sub(
-            r"(?<![_\w])%s\s*-=" % name,
-            "%s_set_%s(i, %s_get_%s(i) -" % (idn, name, idn, name),
-            text)
-        # Assignment: `=` but not `==` / `!=` / `<=` / `>=`.
-        text = re.sub(
-            r"(?<![_\w])%s\s*=(?!=)" % name,
-            "%s_set_%s(i," % (idn, name),
-            text)
-    # Bare remaining field reads. `(?<![_\w])` skips `Coin_get_hp`.
-    for name in sorted(members, key=len, reverse=True):
-        text = re.sub(
-            r"(?<![_\w])%s(?![\w])" % name,
-            "%s_get_%s(i)" % (idn, name),
-            text)
-
-    fixed = []
-    for line in text.split("\n"):
-        if "_set_" in line and line.rstrip().endswith(";"):
-            if line.count("(") > line.count(")"):
-                line = line.rstrip()[:-1] + ");"
-        fixed.append(line)
-    text = "\n".join(fixed)
-
-    # Pointer-style `other.hp` where other is an idx member.
+    # The packed receiver: statics, field writes and reads through the
+    # instance slot `i`, and fields that are indices into another class --
+    # cs2cpp's, under the packed model.
+    handle_fields = {}
     # Skip builtins (AudioSource / Rigidbody*) — their props lower earlier.
     for name, _ty, _bits, kind in cl["members"]:
         if not str(kind).startswith("idx:"):
@@ -14363,12 +14178,18 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         other = kind.split(":", 1)[1]
         if (other in _ADDABLE_BUILTINS or other in _PHYSICS_COMPONENTS):
             continue
-        oiden = _c_ident(other)
-        text = re.sub(
-            r"\b%s\.(\w+)" % name,
-            lambda m: "%s_AT(%s_get_%s(i)).%s" % (
-                oiden, idn, name, m.group(1)),
-            text)
+        handle_fields[name] = _c_ident(other)
+    text = cs2cpp.lower_packed_fields(
+        text, idn, members, class_const_names, handle_fields,
+        _packed_model(plan))
+    # A `_set_(` another rewrite left open at the end of its line.
+    fixed = []
+    for line in text.split("\n"):
+        if "_set_" in line and line.rstrip().endswith(";"):
+            if line.count("(") > line.count(")"):
+                line = line.rstrip()[:-1] + ");"
+        fixed.append(line)
+    text = "\n".join(fixed)
     # Typed Debug_Log / Console_WriteLine — crust has no _Generic.
     text = _rewrite_typed_call_name(
         text, "Debug_Log", string_idents=string_idents)

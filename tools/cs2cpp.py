@@ -456,31 +456,75 @@ class ObjectModel(object):
                    leave `string` to the type map (csrust: its `string`).
     byte_array  -- the C struct a `byte[]` is (`ByteArray`, with `.data` and
                    `.length`), or None for the C# subset's own arrays.
+    string_plus -- the prefix of the engine's typed concatenation helpers
+                   (`_str_plus` -> `_str_plus_i` / `_f` / `_c` / `_s`), or
+                   None: `+` on a C string would add to a pointer.
+    string_calls -- lowered calls the engine knows return a string: whole
+                   calls (`Application_dataPath()`) and call prefixes
+                   (`StreamReader_ReadLine(`), for classifying an operand.
+    elem_type   -- C# element type -> C++ element type, for `List<T>` and
+                   `Dictionary<K, V>`; None keeps the type as written. The
+                   packed engine's is unity_pack's (it knows Unity's types),
+                   and is lossy: `double` is `float`, every integer `int`.
+    map_at_string -- the engine's helper for indexing a map by a string key
+                   (a literal or `const char *` has no address to bind), or
+                   None.
+    field_get, field_set, static_field, at -- how the packed engine spells a
+                   field read, a field write, a class's static, and an
+                   instance by index: format strings over `cls`, `f`, `r`
+                   (the receiver, an index), `v` (a value), `x` (an index).
+                   None where fields are C++ members (csrust).
     """
 
     def __init__(self, null_handle=None, bool_ints=False, this_index=False,
-                 string_type=None, byte_array=None):
+                 string_type=None, byte_array=None, string_plus=None,
+                 string_calls=(), elem_type=None, map_at_string=None,
+                 field_get=None, field_set=None, static_field=None, at=None):
         self.null_handle = null_handle
         self.bool_ints = bool_ints
         self.this_index = this_index
         self.string_type = string_type
         self.byte_array = byte_array
+        self.string_plus = string_plus
+        self.string_calls = tuple(string_calls)
+        self.elem_type = elem_type
+        self.map_at_string = map_at_string
+        self.field_get = field_get
+        self.field_set = field_set
+        self.static_field = static_field
+        self.at = at
 
 
 #: csrust: owned values; `null` is handled as a literal.
 OWNED = ObjectModel()
 
 
-def packed_model(has_objects, byte_arrays=False):
+#: What the packed engine's API returns as a string, once lowered.
+_PACKED_STRING_CALLS = ("Application_dataPath()",
+                        "Application_persistentDataPath()",
+                        "Application_productName()",
+                        "StreamReader_ReadLine(")
+
+
+def packed_model(has_objects, byte_arrays=False, elem_type=None):
     """unity_pack's: a reference is an index, null is -1.
 
     `has_objects`: the project has objects to index; without them there is
     nothing a comparison with null could mean. `byte_arrays`: the engine
-    emits its `ByteArray` struct, which a `byte[]` then is."""
+    emits its `ByteArray` struct, which a `byte[]` then is. `elem_type`:
+    the engine's collection element typing (see `ObjectModel`)."""
     return ObjectModel(null_handle="-1" if has_objects else None,
                        bool_ints=True, this_index=True,
                        string_type="const char *",
-                       byte_array="ByteArray" if byte_arrays else None)
+                       byte_array="ByteArray" if byte_arrays else None,
+                       string_plus="_str_plus",
+                       string_calls=_PACKED_STRING_CALLS,
+                       elem_type=elem_type,
+                       map_at_string="_engine_map_at_si",
+                       field_get="{cls}_get_{f}({r})",
+                       field_set="{cls}_set_{f}({r}, {v})",
+                       static_field="{cls}_{f}",
+                       at="{cls}_AT({x})")
 
 
 def lower_body(text, model):
@@ -534,9 +578,401 @@ def lower_byte_arrays(text, model):
         text = cpprust._sub_code(
             r"(?<![.\w])%s\.Length\b" % re.escape(name),
             lambda m, n=name: "%s.length" % n, text)
-        text = cpprust._sub_code(
+        text = _sub_orig(
             r"(?<![.\w])%s\s*\[(.*?)\]" % re.escape(name),
-            lambda m, n=name: "%s.data[%s]" % (n, m.group(1)), text)
+            lambda g, n=name: "%s.data[%s]" % (n, g(1)), text)
+    return text
+
+
+def skip_string_literal(text, i):
+    """Index just past a C/C# string literal starting at text[i] == '"'."""
+    j = i + 1
+    while j < len(text):
+        if text[j] == "\\":
+            j += 2
+            continue
+        if text[j] == '"':
+            return j + 1
+        j += 1
+    return j
+
+
+def _parse_plus_rhs(text, i):
+    """Scan one + operand starting at *i*; stop at top-level + , ) ;."""
+    while i < len(text) and text[i] in " \t\n\r":
+        i += 1
+    start = i
+    depth = 0
+    while i < len(text):
+        c = text[i]
+        if c == '"':
+            i = skip_string_literal(text, i)
+            continue
+        if c == "'":
+            i += 1
+            if i < len(text) and text[i] == "\\":
+                i += 2
+            elif i < len(text):
+                i += 1
+            if i < len(text) and text[i] == "'":
+                i += 1
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            if depth == 0:
+                break
+            depth -= 1
+        elif c in ",;" and depth == 0:
+            break
+        elif c == "+" and depth == 0:
+            break
+        i += 1
+    return start, i
+
+
+def scalar_kind(expr, model, string_idents=None):
+    """`s` / `c` / `i` / `f`: what an operand is, for a typed C call.
+
+    Strings are what the model's engine says are strings (`string_calls`),
+    literals, earlier concatenations, `ToString`, `(const char *)` casts,
+    and names known to be `string` (`string_idents`); a character literal
+    is `c`, an integer literal `i`, and anything else `f`. The typed
+    concatenation below uses it, and so do the engine's typed log calls
+    (`Debug_Log_s` ..).
+    """
+    string_idents = frozenset(string_idents or ())
+    e = expr.strip()
+    while (e.startswith("(") and e.endswith(")")
+           and e.count("(") == e.count(")")):
+        inner = e[1:-1].strip()
+        if not inner:
+            break
+        e = inner
+    whole = [c for c in model.string_calls if c.endswith(")")]
+    prefixes = [c for c in model.string_calls if not c.endswith(")")]
+    if (e.startswith('"') or (model.string_plus and
+                              e.startswith(model.string_plus))
+            or "ToString" in e or e.startswith("(const char")
+            or e in whole
+            or any(e.startswith(pre) for pre in prefixes)
+            or (re.match(r"^\w+$", e) and e in string_idents)):
+        return "s"
+    if re.match(r"^'(?:[^'\\]|\\.)'$", e):
+        return "c"
+    if re.match(r"^-?\d+$", e):
+        return "i"
+    return "f"
+
+
+def lower_string_concat(text, model, string_idents=None):
+    """C# `string + value` as the engine's typed concatenation.
+
+    `+` on a C string adds to the pointer. From a left operand known to be
+    a string -- a literal, a call the engine says returns one, or an earlier
+    concatenation -- each `+ rhs` becomes `<string_plus>_<kind>(left,
+    (rhs))`, `kind` from `scalar_kind`; chains fold left to right. A string
+    on the left is what C# requires of a string `+` too, so a chain that
+    starts elsewhere is not a string concatenation this can see.
+    """
+    if model.string_plus is None:
+        return text
+    helper = model.string_plus
+    whole = [c for c in model.string_calls if c.endswith(")")]
+    changed = True
+    while changed:
+        changed = False
+        out = []
+        i = 0
+        while i < len(text):
+            left = None
+            left_end = None
+            m_plus = re.match(r"%s_[ifcs]\(" % re.escape(helper), text[i:])
+            m_call = None
+            for call in whole:
+                if text.startswith(call, i):
+                    m_call = call
+                    break
+            if m_plus or text.startswith(helper + "(", i):
+                prefix = m_plus.group(0) if m_plus else helper + "("
+                depth = 0
+                j = i + len(prefix) - 1
+                while j < len(text):
+                    if text[j] == '"':
+                        j = skip_string_literal(text, j)
+                        continue
+                    if text[j] == "(":
+                        depth += 1
+                    elif text[j] == ")":
+                        depth -= 1
+                        if depth == 0:
+                            j += 1
+                            break
+                    j += 1
+                left = text[i:j]
+                left_end = j
+            elif m_call:
+                left = m_call
+                left_end = i + len(left)
+            elif text[i] == '"':
+                j = skip_string_literal(text, i)
+                left = text[i:j]
+                left_end = j
+            if left is not None:
+                k = left_end
+                while k < len(text) and text[k] in " \t\n\r":
+                    k += 1
+                if k < len(text) and text[k] == "+":
+                    rhs_start, rhs_end = _parse_plus_rhs(text, k + 1)
+                    rhs = text[rhs_start:rhs_end].strip()
+                    if rhs:
+                        kind = scalar_kind(rhs, model,
+                                           string_idents=string_idents)
+                        out.append("%s_%s(%s, (%s))"
+                                   % (helper, kind, left, rhs))
+                        i = rhs_end
+                        changed = True
+                        continue
+            out.append(text[i])
+            i += 1
+        text = "".join(out)
+    return text
+
+
+def _sub_orig(pat, fn, text):
+    """`cpprust._sub_code`, handing `fn` the groups as `text` has them.
+
+    `_sub_code` matches on a copy with string and comment bodies blanked, and
+    its match object is that copy's: a group spanning a literal reads as
+    spaces. `fn(g)` gets `g(i)`, group `i` sliced from `text` at the same
+    offsets (blanking keeps the length) -- for a replacement that copies an
+    operand, a map key say, which may well be a string.
+    """
+    def repl(m):
+        return fn(lambda i: text[m.start(i):m.end(i)])
+    return cpprust._sub_code(pat, repl, text)
+
+
+_GENERIC_NS = r"(?:System\.Collections\.Generic\.)?"
+_MAP_KW = r"(?:Dictionary|SortedList)"
+
+
+def _elem(model, t):
+    return model.elem_type(t) if model.elem_type else t
+
+
+def lower_list_types(text, model):
+    """`List<T>` as `std::vector<C>`, C from the model's element typing.
+
+    `List<T> x = new List<T>();` is a declaration, `new List<T>()` a
+    temporary, and a bare `List<T>` a type. Returns (text, names): the
+    locals the declarations introduced, whose members
+    `lower_list_members_named` then lowers.
+    """
+    names = set()
+
+    def decl(m):
+        names.add(m.group(2))
+        return "std::vector<%s> %s;" % (_elem(model, m.group(1)), m.group(2))
+
+    text = cpprust._sub_code(
+        r"(?<![\w.])%sList\s*<\s*([\w.]+)\s*>\s+(\w+)\s*=\s*new\s+%sList"
+        r"\s*<\s*\1\s*>\s*\(\s*\)\s*;" % (_GENERIC_NS, _GENERIC_NS), decl, text)
+    text = cpprust._sub_code(
+        r"(?<![\w.])new\s+%sList\s*<\s*([\w.]+)\s*>\s*\(\s*\)" % _GENERIC_NS,
+        lambda m: "std::vector<%s>()" % _elem(model, m.group(1)), text)
+    text = cpprust._sub_code(
+        r"(?<![\w.])%sList\s*<\s*([\w.]+)\s*>" % _GENERIC_NS,
+        lambda m: "std::vector<%s>" % _elem(model, m.group(1)), text)
+    return text, names
+
+
+def lower_list_members_named(text, names):
+    """`Add` / `Clear` / `Count` on receivers known by name to be lists.
+
+    The named form of csrust's `_lower_list_members`, for a caller that
+    knows its lists without this file's type resolution -- unity_pack, from
+    its plan. Same spellings (`LIST_METHODS`).
+    """
+    for name in sorted(names, key=len, reverse=True):
+        n = re.escape(name)
+        text = cpprust._sub_code(
+            r"(?<![.\w])%s\.Add\s*\(" % n,
+            lambda m, nm=name: "%s.%s(" % (nm, LIST_METHODS["Add"]), text)
+        text = cpprust._sub_code(
+            r"(?<![.\w])%s\.Clear\s*\(\s*\)" % n,
+            lambda m, nm=name: "%s.%s()" % (nm, LIST_METHODS["Clear"]), text)
+        text = cpprust._sub_code(
+            r"(?<![.\w])%s\.Count\b" % n,
+            lambda m, nm=name: "%s.%s()" % (nm, LIST_METHODS["Count"]), text)
+    return text
+
+
+def lower_map_types(text, model):
+    """`Dictionary<K, V>` / `SortedList<K, V>` as `std::map<K', V'>`.
+
+    As `lower_list_types`: declaration, temporary, type; returns (text,
+    names) with the declared locals."""
+    names = set()
+
+    def ty(k, v):
+        return "std::map<%s, %s>" % (_elem(model, k), _elem(model, v))
+
+    def decl(m):
+        names.add(m.group(3))
+        return "%s %s;" % (ty(m.group(1), m.group(2)), m.group(3))
+
+    text = cpprust._sub_code(
+        r"(?<![\w.])%s%s\s*<\s*([\w.]+)\s*,\s*([\w.]+)\s*>\s+(\w+)\s*=\s*"
+        r"new\s+%s%s\s*<\s*\1\s*,\s*\2\s*>\s*\(\s*\)\s*;"
+        % (_GENERIC_NS, _MAP_KW, _GENERIC_NS, _MAP_KW), decl, text)
+    text = cpprust._sub_code(
+        r"(?<![\w.])new\s+%s%s\s*<\s*([\w.]+)\s*,\s*([\w.]+)\s*>\s*\(\s*\)"
+        % (_GENERIC_NS, _MAP_KW),
+        lambda m: "%s()" % ty(m.group(1), m.group(2)), text)
+    text = cpprust._sub_code(
+        r"(?<![\w.])%s%s\s*<\s*([\w.]+)\s*,\s*([\w.]+)\s*>"
+        % (_GENERIC_NS, _MAP_KW),
+        lambda m: ty(m.group(1), m.group(2)), text)
+    return text, names
+
+
+def lower_map_members_named(text, names, key_types):
+    """Map members on receivers known by name: `Add`, `Clear`, `Count`,
+    `ContainsKey`, `Remove`. `Add(k, v)` binds the key to a local of its
+    type first (`key_types[name]`, default `int`), then assigns through the
+    indexer -- a temporary key has no address to pass."""
+    for name in sorted(names, key=len, reverse=True):
+        n = re.escape(name)
+        kt = key_types.get(name, "int")
+        text = _sub_orig(
+            r"(?<![.\w])%s\.Add\s*\(([^,]+),\s*([^)]+)\)" % n,
+            lambda g, nm=name, k=kt: "{ %s __dk = %s; %s[__dk] = %s; }"
+            % (k, g(1).strip(), nm, g(2).strip()), text)
+        text = cpprust._sub_code(
+            r"(?<![.\w])%s\.Clear\s*\(\s*\)" % n,
+            lambda m, nm=name: "%s.%s()" % (nm, LIST_METHODS["Clear"]), text)
+        text = cpprust._sub_code(
+            r"(?<![.\w])%s\.Count\b" % n,
+            lambda m, nm=name: "%s.%s()" % (nm, LIST_METHODS["Count"]), text)
+        text = _sub_orig(
+            r"(?<![.\w])%s\.ContainsKey\s*\(([^)]+)\)" % n,
+            lambda g, nm=name: "(%s.count(%s) != 0)" % (nm, g(1)), text)
+        text = _sub_orig(
+            r"(?<![.\w])%s\.Remove\s*\(([^)]+)\)" % n,
+            lambda g, nm=name: "%s.erase(%s)" % (nm, g(1)), text)
+    return text
+
+
+def lower_map_string_index(text, target_pattern, model):
+    """`map[key]` for a string-keyed map, through the model's helper.
+
+    `target_pattern` matches the map expression (a name, or unity_pack's
+    `Class_field[recv]`); the key is whatever the brackets hold."""
+    if model.map_at_string is None:
+        return text
+    return _sub_orig(
+        r"(%s)\s*\[(.*?)\]" % target_pattern,
+        lambda g: "(*%s(%s, %s))" % (model.map_at_string, g(1), g(2)), text)
+
+
+def _assignment_end(text, i):
+    """End of the expression assigned from `i`: the `;` or `,` that ends it
+    at depth 0, or the `)` that closes a paren opened before it."""
+    depth = 0
+    while i < len(text):
+        c = text[i]
+        if c == '"':
+            i = skip_string_literal(text, i)
+            continue
+        if c == "'":
+            j = text.find("'", i + 2 if text[i + 1:i + 2] == "\\" else i + 1)
+            i = (j + 1) if j >= 0 else i + 1
+            continue
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            if depth == 0:
+                return i
+            depth -= 1
+        elif c in ";," and depth == 0:
+            return i
+        i += 1
+    return i
+
+
+def lower_packed_fields(text, owner, members, statics, handle_fields, model,
+                        receiver="i"):
+    """A packed class's fields, read and written through its instance slot.
+
+    Inside a method of class `owner` (its C identifier), whose instance is
+    the index `receiver`:
+
+      statics            `name`      -> `Owner_name`
+      field writes       `x = v`     -> `Owner_set_x(i, v)`
+                         `x += v`    -> `Owner_set_x(i, Owner_get_x(i) + v)`
+                         `x++`, `--x` and the rest likewise
+      field reads        `x`         -> `Owner_get_x(i)`
+      handle fields      `other.hp`  -> `Other_AT(Owner_get_other(i)).hp`,
+                          (`handle_fields`: field name -> the class it indexes)
+
+    (spellings from the model). A name after `.` is another object's
+    member, never this object's field; unity_pack's patterns matched it,
+    and rewrote handle fields only after their reads -- so `other.hp` came
+    out `Coin_get_other(i).Coin_get_hp(i)` and the handle rewrite never
+    ran. A write is parsed to the end of its expression; unity_pack used to rewrite only its prefix and let a later
+    pass close the paren at the end of the line, which works for one
+    statement per line and not for two. Matched outside strings and
+    comments.
+    """
+    def get(f):
+        return model.field_get.format(cls=owner, f=f, r=receiver)
+
+    def set_(f, v):
+        return model.field_set.format(cls=owner, f=f, r=receiver, v=v)
+
+    for name in sorted(statics, key=len, reverse=True):
+        text = cpprust._sub_code(
+            r"(?<![_\w.])%s(?![\w])" % re.escape(name),
+            lambda m, n=name: model.static_field.format(cls=owner, f=n), text)
+    # Handle fields before this object's own: once `other` is read as
+    # `Owner_get_other(i)` there is nothing left to see `other.hp` in.
+    for name, other in sorted(handle_fields.items()):
+        text = _sub_orig(
+            r"\b%s\.(\w+)" % re.escape(name),
+            lambda g, nm=name, o=other: "%s.%s" % (
+                model.at.format(cls=o, x=get(nm)), g(1)), text)
+    for name in sorted(members, key=len, reverse=True):
+        n = re.escape(name)
+        for pat, sign in ((r"(?<![_\w.])%s\s*\+\+" % n, "+"),
+                          (r"(?<![_\w.])%s\s*--" % n, "-"),
+                          (r"\+\+\s*(?<![_\w.])%s(?![\w])" % n, "+"),
+                          (r"--\s*(?<![_\w.])%s(?![\w])" % n, "-")):
+            text = cpprust._sub_code(
+                pat, lambda m, nm=name, sg=sign:
+                set_(nm, "%s %s 1" % (get(nm), sg)), text)
+        # Compound and plain assignment: the value runs to the end of the
+        # assigned expression, found on the text as it stands.
+        for pat, op in ((r"(?<![_\w.])%s\s*\+=" % n, "+"),
+                        (r"(?<![_\w.])%s\s*-=" % n, "-"),
+                        (r"(?<![_\w.])%s\s*=(?!=)" % n, None)):
+            while True:
+                scan = _blank(text)
+                m = re.search(pat, scan)
+                if m is None:
+                    break
+                end = _assignment_end(text, m.end())
+                value = text[m.end():end]
+                lead = len(value) - len(value.lstrip())
+                value = value.strip()
+                if op is not None:
+                    value = "%s %s %s" % (get(name), op, value)
+                text = (text[:m.start()] + set_(name, value)
+                        + text[end:])
+    for name in sorted(members, key=len, reverse=True):
+        text = cpprust._sub_code(
+            r"(?<![_\w.])%s(?![\w])" % re.escape(name),
+            lambda m, nm=name: get(nm), text)
     return text
 
 
@@ -2278,9 +2714,15 @@ def _storage_chain(chain, pos, scan, table, types):
 #: the arguments. Index checks abort, as the unhandled
 #: `ArgumentOutOfRangeException` does; the prelude's own `insert` would
 #: clamp a bad index and `erase` ignore one, silently.
+#: C# collection members that are one vector/map method, by name. Shared by
+#: csrust's type-resolved lowering (`_lower_list_members`) and the named
+#: lowering unity_pack uses (`lower_list_members_named`), so the two cannot
+#: disagree on a spelling.
+LIST_METHODS = {"Add": "push_back", "Clear": "clear", "Count": "size"}
+
 _LIST_MEMBERS = {
-    "Add": (1, "{r}.push_back({0})"),
-    "Clear": (0, "{r}.clear()"),
+    "Add": (1, "{r}.%s({0})" % LIST_METHODS["Add"]),
+    "Clear": (0, "{r}.%s()" % LIST_METHODS["Clear"]),
     "Insert": (2, "{r}.insert({r}.ptr(_cs_check_insert({0}, {r}.size())), {1})"),
     "RemoveAt": (1, "{r}.erase({r}.ptr(_cs_check_index({0}, {r}.size())))"),
     "Contains": (1, "(_cs_list_index_{e}({r}, {0}) >= 0)"),
@@ -2399,7 +2841,8 @@ def _lower_list_members(text, table, path, need):
                 raise CsError(
                     "%s`Count()` is the LINQ method; on a `List` the count "
                     "is the property, `Count`." % _at(path, text, start))
-            edits.append((rstart, m.end(), "%s.size()" % recv))
+            edits.append((rstart, m.end(), "%s.%s()"
+                          % (recv, LIST_METHODS["Count"])))
             continue
         if member not in _LIST_MEMBERS:
             if re.match(r"\s*\(", after) or member in ("Capacity",):

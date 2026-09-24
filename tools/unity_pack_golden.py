@@ -200,8 +200,20 @@ def record():
         json.dump(kept, f, indent=1, sort_keys=True)
         f.write("\n")
     os.makedirs(CACHE, exist_ok=True)
-    with open(LOCAL, "w") as f:
-        json.dump(local, f, indent=1, sort_keys=True)
+    # Without the local projects (SystemsScene's scene is not in the
+    # repository) their tests skip and record nothing: keep what an earlier
+    # recording stored rather than wiping it. And say that the committed
+    # cases those tests make after packing SystemsScene are missing too.
+    have_local = any(os.path.isfile(os.path.join(r, "Assets", "Scenes",
+                                                 "Systems.unity"))
+                     for r in _LOCAL_ROOTS)
+    if have_local:
+        with open(LOCAL, "w") as f:
+            json.dump(local, f, indent=1, sort_keys=True)
+    else:
+        print("note: SystemsScene is not present; its local cases were kept "
+              "as recorded, and the tests that pack it did not run -- record "
+              "with it present for a complete corpus")
     print("recorded %d cases (%d local-only), dropped %d that do not replay"
           % (len(kept), len(local), len(dropped)))
     for cid in dropped:
