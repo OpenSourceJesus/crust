@@ -1818,12 +1818,101 @@ class TestLowerBody(unittest.TestCase):
         self.assertEqual(self._fields('Debug_Log_s("hp is low");'),
                          'Debug_Log_s("hp is low");')
 
+    def _collections(self, text):
+        owner = cs2cpp.PackedClass(
+            "Bag", "Bag", static_lists=[("all", "int")],
+            inst_lists=[("items", "int")], inst_maps=[("tags", "string", "int")],
+            field_types={"board": "Board", "hp": ""})
+        board = cs2cpp.PackedClass(
+            "Board", "Board", static_lists=[("pieces", "int")],
+            inst_maps=[("cells", "int", "int")])
+        model = cs2cpp.packed_model(True, elem_type=lambda t: {
+            "string": "std::string"}.get(t, t))
+        return cs2cpp.lower_packed_collections(text, owner, [owner, board], model)
+
+    def test_packed_instance_collections_alias_their_slot(self):
+        self.assertEqual(
+            self._collections("items.Add(1); n = items.Count;"),
+            "std::vector<int> &items = Bag_items[i];\n"
+            "items.push_back(1); n = items.size();")
+
+    def test_another_class_static_list(self):
+        self.assertEqual(self._collections("Board.pieces.Add(3); k = Board.pieces.Count;"),
+                         "Board_pieces.push_back(3); k = Board_pieces.size();")
+
+    def test_another_class_instance_map(self):
+        # A field the plan says holds a Board, and an unknown receiver: taken.
+        self.assertEqual(self._collections("c = board.cells[2];"),
+                         "c = Board_cells[board][2];")
+        self.assertEqual(self._collections("c = b.cells[2];"),
+                         "c = Board_cells[b][2];")
+
+    def test_a_receiver_of_another_type_is_left_alone(self):
+        # unity_pack rewrote any `x.cells`, whatever `x` was.
+        self.assertEqual(
+            self._collections("Grid g = MakeGrid(); c = g.cells[2];"),
+            "Grid g = MakeGrid(); c = g.cells[2];")
+
+    def test_a_string_keyed_instance_map(self):
+        self.assertEqual(
+            self._collections('tags.Add("a", 1); t = tags["a"];'),
+            "std::map<std::string, int> &tags = Bag_tags[i];\n"
+            # The `Add` expansion's own indexer goes through the helper
+            # too: it returns the slot's address, so the write lands.
+            '{ std::string __dk = "a"; (*_engine_map_at_si(tags, __dk)) = 1; }; '
+            't = (*_engine_map_at_si(tags, "a"));')
+
     def test_strings_and_comments_are_not_code(self):
         # unity_pack's regexes rewrote these too: `"is this true"` came out
         # `"is i 1"`. Matched on a blanked scan, they are left as written.
         text = 's = "is this true == null"; // this false\nok = true;'
         self.assertEqual(cs2cpp.lower_body(text, self.PACKED),
                          's = "is this true == null"; // this false\nok = 1;')
+
+
+class TestBindings(unittest.TestCase):
+    """`cs2cpp.lower_bindings`: a library's API as a table, applied here.
+
+    unity_pack declares UnityEngine's this way; the table is its knowledge,
+    the rewriting is cs2cpp's, with the same boundaries for every entry.
+    """
+
+    B = cs2cpp.Binding
+
+    def test_forms(self):
+        B = self.B
+        table = [B("File.Exists", "File_Exists", namespaces=("System.IO",)),
+                 B("Application.dataPath", "Application_dataPath", "getter"),
+                 B("Time.time", "Time_time", "value"),
+                 B("print", "Debug_Log", "callee"),
+                 B("Application.Quit", "Application_Quit",
+                   no_args="Application_Quit(0)")]
+        self.assertEqual(
+            cs2cpp.lower_bindings(
+                "a = System.IO.File.Exists(p); b = Application.dataPath; "
+                "c = Time.time; print (c); Application.Quit(); "
+                "Application.Quit(2);", table),
+            "a = File_Exists(p); b = Application_dataPath(); "
+            "c = Time_time; Debug_Log (c); Application_Quit(0); "
+            "Application_Quit(2);")
+
+    def test_boundaries(self):
+        # unity_pack's one-off patterns: `Time.time` by plain text replace
+        # took the front of `Time.timeScale`, and `File\\.Exists` had no left
+        # boundary, so it took the back of `MyFile.Exists`.
+        B = self.B
+        self.assertEqual(
+            cs2cpp.lower_bindings(
+                's = Time.timeScale; t = MyFile.Exists(p); u = "Time.time";',
+                [B("Time.time", "Time_time", "value"),
+                 B("File.Exists", "File_Exists")]),
+            's = Time.timeScale; t = MyFile.Exists(p); u = "Time.time";')
+
+    def test_callee_needs_a_call(self):
+        self.assertEqual(
+            cs2cpp.lower_bindings("int print = 1; print(2);",
+                                  [self.B("print", "Debug_Log", "callee")]),
+            "int print = 1; Debug_Log(2);")
 
 
 class TestDigest(unittest.TestCase):
