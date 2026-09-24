@@ -110,9 +110,41 @@ script's component is the class named after its file, as in Unity — the
 first class in the file used to be taken, so an attribute class declared
 above the component became the scene object's class.
 
-Not done yet: the GPU side. Instance ids go to shaders as floats today
-(`--soa-vec4`'s `w`); a u8/u16 index could travel as `GL_UNSIGNED_BYTE` /
-`GL_UNSIGNED_SHORT` vertex data.
+### `--gpu-handles`: handles in a GLES 3.1 SSBO
+
+The stored references — a `Bullet`'s `owner`, a `Player`'s `last` — go
+to the GPU at their packed width: four byte handles, two 16-bit handles
+or one 32-bit handle per `uint`, read in the shader with
+`bitfieldExtract`. A handle is as wide as its *target* class's index, so
+with `[MaxInstances(10)] Bullet` and `[MaxInstances(1000)] Player` a
+Bullet's `owner` is 16 bits and a Player's `last` is 8.
+
+`--gpu-handles` (`pack(gpu_handles=True)`) adds, and changes nothing
+else:
+
+* `engine_upload_handles(uint32_t *dst, int max_words)` in the engine —
+  every handle field as one stream of its class's capacity, packed from
+  bit 0 and word-aligned; a slot past the live count holds the field's
+  null;
+* `engine_handles.h` — `ENGINE_HANDLE_WORDS`, and per stream
+  `<Class>_<field>_OFF` / `_LEN` / `_BITS` / `_NULL`;
+* `shaders/handles.glsl` — for inclusion after `#version 310 es`: the
+  SSBO at binding 1 and an accessor per stream, returning an index into
+  the target class or its `_NULL`:
+
+```glsl
+const uint Bullet_owner_NULL = 65535u;
+uint Bullet_owner(uint i) { return bitfieldExtract(handles[0u + i / 2u], int((i % 2u) * 16u), 16); }
+const uint Player_last_NULL = 255u;
+uint Player_last(uint i) { return bitfieldExtract(handles[5u + i / 4u], int((i % 4u) * 8u), 8); }
+```
+
+`TestGpuHandles` packs that scene, decodes the words the C side writes
+with `bitfieldExtract`'s definition, and — where a headless GL is
+available (`moderngl` over Mesa's EGL/llvmpipe) — runs a compute shader
+built from `handles.glsl` and compares every slot the GPU reads with the
+scene. GLES2 hosts (the default viewer) have no SSBOs; the flag is for a
+GLES 3.1 / GL 4.3 renderer.
 
 ## Function grouping
 
@@ -144,6 +176,7 @@ python3 tools/unity_pack.py examples/unity_pack/MiniScene -o /tmp/upack
 /tmp/upack/MiniScene
 
 python3 tools/unity_pack.py <project> --strict   # a stub is an error
+python3 tools/unity_pack.py <project> --gpu-handles  # handles for a GLES 3.1 SSBO
 ```
 
 The linked player is `gles2_window.c` when `pkg-config glfw3` succeeds,
