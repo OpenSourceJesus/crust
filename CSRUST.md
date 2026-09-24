@@ -300,6 +300,8 @@ cs2cpp.lower_map_types(text, model)    # Dictionary<K,V>; lower_map_members_name
 cs2cpp.lower_packed_fields(text, owner, members, statics, handles, model)
 cs2cpp.lower_packed_collections(text, owner, others, model)  # PackedClass each
 cs2cpp.lower_bindings(text, table)     # a library's API: Binding(path, c, form)
+cs2cpp.residual_csharp(text, model, known_types, value_ctors)  # C# still left
+cs2cpp.code_sub(pattern, repl, text)   # re.sub over code only
 ```
 
 A `Binding` table is how a caller says what its library is — unity_pack's

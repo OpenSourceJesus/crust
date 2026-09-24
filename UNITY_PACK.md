@@ -236,6 +236,18 @@ took the front of `Time.timeScale`; `File.Exists` took the back of
 `MyFile.Exists`). What is not one name — Transform, GetComponent,
 `Destroy(gameObject)`, `Keyboard.current.<k>Key` — is still rewritten here.
 
+**The rewrites here match code, not what it prints.** They were `re.sub`
+over the body, strings and comments included:
+`Debug.Log("transform.position.x moved")` printed `Player_get_pos_x(i)
+moved`. Every `re.sub` in the lowering (115, in 20 functions) is now
+`cs2cpp.code_sub`, the same call matched on a copy with string and comment
+bodies blanked, its replacement given the original's groups — so a rewrite
+that reads a literal (`GameObject.Find("Enemy")`) still reads it. The
+packed output of every golden case was unchanged; `TestStubDiagnostics`
+runs the player and checks the printed line. Still to convert: 27 scans
+in 19 functions that walk `re.finditer` / `re.search` and splice by hand
+(most are guards, some rewrite).
+
 Each moved as the same code, so the packed output did not change — the
 golden check is byte-identical after every step — except that cs2cpp
 matches outside strings and comments, where unity_pack's regexes did not,
@@ -260,7 +272,19 @@ Assets/Scripts/Menu.cs(3,19): warning CS8000: `Menu.Start` is not lowered yet
 ```
 
 With `pack(strict=True)` / `--strict` it is an error, and every stub is
-recorded in `plan["stubs"]`. (CS8000 is csc's "not yet implemented".)
+recorded in `plan["stubs"]`.
+
+Deciding what is left is split the same way as the lowering. This file
+asks the Unity questions — an `Instantiate` overload or `GetComponents<T>`
+nothing lowered, `Type.instances`, a component's `.gameObject` or
+`.activeSelf`, a parameter the emitter did not make a C formal — and
+`cs2cpp.residual_csharp` the C# ones: array types, generic calls, lambdas,
+calls, statics, member access and typed locals nothing lowered. This file
+tells it only what is the engine's own C: the types it declares
+(`ByteArray`, `Matrix4x4`), the value types kept as constructor calls
+(`Vector2Int(..)`), and — from the model — the instance accessor
+(`Other_AT(i).hp`). A stub is the OR of all of them, so the split changed
+no stub; it can change only which reason a warning names first. (CS8000 is csc's "not yet implemented".)
 Once the move to cs2cpp is done, strict becomes the default.
 
 Reporting them showed that the detector itself was emptying methods that
