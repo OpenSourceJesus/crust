@@ -239,5 +239,49 @@ class TestProved(unittest.TestCase):
                 self.assertEqual(len(verdicts), len(certs))
 
 
+@unittest.skipUnless(ROSETTAMATH, "RosettaMath not found; run 'make install_proofs'")
+class TestFoundingTheorems(unittest.TestCase):
+    """What LeanOS rests on, proved about `memmap.rs` as lifted.
+
+    `regions_pairwise_disjoint` -- if `regions_disjoint` says 1, for every
+    j < k region j ends at or before region k begins -- and
+    `region_of_unique` -- `region_of` says 1 for at most one owner.
+    RosettaMath's `memmap_rs.py` proves them, stated as `memmap_eq.py`
+    states them about its hand-typed model, over the functions lifted from
+    this tree.  Editing `memmap.rs` so that they stop holding fails here.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, ROSETTAMATH)
+        import memmap_rs
+        memmap_rs.CRUST = ROOT
+        cls.M = memmap_rs
+        cls.env = _in_big_stack(memmap_rs.build)
+
+    def test_every_theorem_is_proved(self):
+        for name in self.M.THEOREMS:
+            with self.subTest(theorem=name):
+                self.assertIn(name, self.env)
+
+    def test_stated_as_the_hand_model_states_them_and_about_the_rust(self):
+        for label, ok in _in_big_stack(lambda: self.M.checks(self.env)):
+            with self.subTest(check=label):
+                self.assertTrue(ok)
+
+    @unittest.skipUnless(LEAN, "lean not on PATH")
+    def test_lean_agrees(self):
+        import subprocess
+        path = os.path.join(tempfile.mkdtemp(), "MemMapRs.lean")
+        with open(path, "w") as fh:
+            fh.write(_in_big_stack(lambda: self.M.lean_source(self.env)))
+        run = subprocess.run([LEAN, path], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stdout[-2000:])
+        for name in self.M.THEOREMS:
+            with self.subTest(theorem=name):
+                self.assertIn("'RM.%s' does not depend on any axioms" % name,
+                              run.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
