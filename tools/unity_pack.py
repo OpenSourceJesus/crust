@@ -15124,6 +15124,7 @@ def emit_handles_h(plan):
         lines.append("#define %s_BITS %d" % (pre, st["bits"]))
         lines.append("#define %s_NULL %du" % (pre, st["null"]))
     lines += ["",
+              "int engine_handle_words(void); /* ENGINE_HANDLE_WORDS */",
               "int engine_upload_handles(uint32_t *dst, int max_words);",
               "",
               "#endif"]
@@ -15140,6 +15141,8 @@ def emit_handles_c(plan):
     p("/* Packed handles for a GLES 3.1 SSBO (engine_handles.h,")
     p("   shaders/handles.glsl): each stream packed from bit 0, a slot past")
     p("   the live count holding the field's null. */")
+    p("int engine_handle_words(void) { return %d; }" % total)
+    p("")
     p("int engine_upload_handles(uint32_t *dst, int max_words) {")
     p("    int w;")
     p("    int k;")
@@ -16084,7 +16087,8 @@ def default_pack_dir(root):
 def build_player_executable(outdir, product):
     """Compile packed C sources and link a player named after productName.
 
-    Prefers examples/unity_pack/gles2_window.c when pkg-config finds glfw3.
+    Prefers examples/unity_pack/gles3_window.c (OpenGL ES 3.1; gles2_window.c
+    with UNITY_PACK_GLES2=1) when pkg-config finds glfw3.
     Otherwise links the generated headless main.c.
 
     ``engine.c`` is the cpprust-lowered C from the ``engine.cpp`` subset
@@ -16139,9 +16143,13 @@ def build_player_executable(outdir, product):
     else:
         _progress("data.o up to date")
 
+    # OpenGL ES 3.1 by default -- what has SSBOs, for `--gpu-handles` --
+    # and ES 2.0 for hardware without it (UNITY_PACK_GLES2=1).
     host = os.path.normpath(os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
-        "..", "examples", "unity_pack", "gles2_window.c"))
+        "..", "examples", "unity_pack",
+        "gles2_window.c" if os.environ.get("UNITY_PACK_GLES2")
+        else "gles3_window.c"))
     use_window = False
     cflags = []
     libs = []
@@ -16159,10 +16167,15 @@ def build_player_executable(outdir, product):
         except (OSError, subprocess.CalledProcessError):
             use_window = False
     if use_window:
-        if _needs_rebuild(exe, host, engine_o, data_o):
+        deps = [host, engine_o, data_o]
+        render_h = os.path.join(os.path.dirname(host), "gles3_render.h")
+        if os.path.isfile(render_h):
+            deps.append(render_h)
+        if _needs_rebuild(exe, *deps):
             _progress("linking window player %s" % exe)
             _run([cc, "-O2", "-o", exe, host, engine_o, data_o,
                   "-I", outdir] + cflags + libs + ["-lGLESv2", "-lm"])
+            # (gles3_window.c includes gles3_render.h beside it.)
         else:
             _progress("player up to date")
     else:
