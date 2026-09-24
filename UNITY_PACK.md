@@ -67,9 +67,52 @@ shrinks those:
 A hand-placed 2D coin with `hp` and a `Vector2` position is typically
 **8–16 bytes**, not a Unity object header.
 
-The bound “≤256” is not guessed. For a scene of hand-placed objects
-whose C# never spawns, the count **is** the scene count. If a script
-spawns, the index widens (or the packer refuses a 8-bit handle).
+The bound is not guessed. For a scene of hand-placed objects whose C#
+never spawns, the count **is** the scene count. If a script spawns, an
+unannotated class's index widens to 32 bits. The top value of an index is
+null (255 for a `uint8_t`, read back as -1), so a byte indexes 255
+instances, and an empty scene reference is null — it used to be stored as
+0, another object, and references between scripts were never resolved at
+all: every one held 0. They are resolved by the referenced component's
+fileID now (`TestPackedFields`).
+
+### `[MaxInstances(N)]`: the author sets the cap
+
+```csharp
+public class MaxInstancesAttribute : System.Attribute {
+    public MaxInstancesAttribute(int n) {}
+}
+
+[MaxInstances(255)]   public class Player : MonoBehaviour { … }   // uint8_t
+[MaxInstances(20000)] public class BulletTypeA : MonoBehaviour { … } // uint16_t
+```
+
+The attribute class is the project's own (Unity needs it to compile the
+script; the packer reads the name and ignores the class). With it:
+
+* the index into the class is as narrow as N allows — `uint8_t` up to
+  255, `uint16_t` up to 65535 — whatever else in the project spawns, and
+  every field that holds one is that width (a handle is as wide as its
+  *target*, not its owner);
+* the instance array and the GameObject pool hold exactly N, and
+  `Instantiate` returns null once N are live: the N+1st bullet is not
+  fired. Clipping is the behaviour asked for, not an error;
+* N counts **live** instances: a destroyed one's slot is reused (it was
+  not — `Destroy` never freed anything, so a pool emptied after N spawns
+  in all);
+* a scene that already places more than N is an error at the attribute;
+* the spare slots are zeros C fills in, so `data.c` does not list 20000
+  empty rows.
+
+`TestMaxInstances` runs a bullet that clones itself every frame (held at
+N) and one that fires and is destroyed (firing for all 60 frames). A
+script's component is the class named after its file, as in Unity — the
+first class in the file used to be taken, so an attribute class declared
+above the component became the scene object's class.
+
+Not done yet: the GPU side. Instance ids go to shaders as floats today
+(`--soa-vec4`'s `w`); a u8/u16 index could travel as `GL_UNSIGNED_BYTE` /
+`GL_UNSIGNED_SHORT` vertex data.
 
 ## Function grouping
 
