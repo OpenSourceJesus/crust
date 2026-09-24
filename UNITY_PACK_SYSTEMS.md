@@ -94,15 +94,13 @@ Unity's `UnityException` / `TypeInitializationException` every frame and
 `Start` runs once before first `Update`.
 
 ## GameObject lookup
-
-| Script uses | Emitted |
-|-------------|---------|
 | `GameObject.Find(name)` | Runtime `strcmp` on authored GO name table → index or **-1** |
 | `Object.ToString` (via printing a Find result) | `name (UnityEngine.GameObject)`; missing → `"null"` |
 | `.GetComponent<T>()` on a null GO | **NullReferenceException** with `Class.Method () (at path:line)`; method exits (Unity) |
 | `.GetComponent<T>()` on a live GO | Instance index of authored/`AddComponent` `T`, or **-1** if absent |
 | `FindObjectOfType<T>(includeInactive?)` | Scan live `_engine_go_T[]` (skip Destroyed; optional inactive) → first index or **-1** |
 | `T.Instance` / `T.instance` | ``T_Instance()`` — cache until destroyed/missing, then ``FindObjectOfType<T>(true)`` |
+| Bare `instance = this` (singleton Awake) | ``T_instance = i`` (sets the same cache field ``T_Instance()`` reads) |
 | `Find(...).GetComponent<T>().field` | NRE if Find missed or component/field receiver is null |
 | `transform.Find(name)` / nested `"A/B"` | Child GO via **live** parent table (seeded from authored `m_Father`; updated by `SetParent`) → index or **-1** |
 | `go.transform.Find` / `Transform` local `.Find` | Same — receiver is the live GO index |

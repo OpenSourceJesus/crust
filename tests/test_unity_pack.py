@@ -2716,6 +2716,78 @@ class TestSystems(unittest.TestCase):
         self.assertNotIn("\n0\n", "\n" + run.stdout)
         self.assertNotIn("\n1\n", "\n" + run.stdout)
 
+    def test_bare_singleton_instance_assign_this(self):
+        """Awake `instance = this` → Class_instance = i (not undeclared `instance`)."""
+        root = tempfile.mkdtemp(prefix="upack-inst-assign-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Cam.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Cam : MonoBehaviour {\n"
+                "    public static Cam instance;\n"
+                "    public static Cam Instance {\n"
+                "        get {\n"
+                "            if (instance == null)\n"
+                "                instance = FindObjectOfType<Cam>(true);\n"
+                "            return instance;\n"
+                "        }\n"
+                "    }\n"
+                "    void Awake() {\n"
+                "        instance = this;\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Cam.cs.meta"), "w") as f:
+            f.write("guid: camcamcamcamcamcamcamcamcamcam01\n")
+        with open(os.path.join(scripts, "Host.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Host : MonoBehaviour {\n"
+                "    void Start() {\n"
+                "        Debug.Log(Cam.Instance);\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Host.cs.meta"), "w") as f:
+            f.write("guid: hosthosthosthosthosthosthosthost01\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Cam\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Host\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: camcamcamcamcamcamcamcamcamcam01}\n"
+                "--- !u!4 &11\nTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &12\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: hosthosthosthosthosthosthosthost01}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-inst-assign-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.cpp")) as f:
+            eng = f.read()
+        self.assertIn("Cam_instance = i;", eng)
+        self.assertNotRegex(eng, r"(?<![\w.])instance\s*=\s*i")
+        self.assertIn("static int Cam_Instance(void)", eng)
+        awake = eng.split("static void Cam_Awake(", 1)[1].split("\n}", 1)[0]
+        self.assertNotIn("not lowered yet", awake)
+        self.assertIn("Cam_instance = i", awake)
+
     def test_toggle_is_on_does_not_span_prior_index_expr(self):
         """equipped[i]; … toggles[x].isOn must not merge (DOTALL bug → CS0000)."""
         src = (

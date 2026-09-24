@@ -7963,8 +7963,11 @@ def _array_elem_name(ty):
 def _rewrite_mb_static_and_singleton(text, plan, cl):
     """``Other.StaticMethod(`` / ``Other.Instance`` → packed C.
 
-    ``Instance`` / ``instance`` → ``Class_Instance()`` (live FindObjectOfType
-    cache), not a hardcoded slot. ``Instance.field`` uses that index.
+    ``Type.Instance`` / ``Type.instance`` → ``Type_Instance()`` (live
+    FindObjectOfType cache), not a hardcoded slot. ``Instance.field`` uses
+    that index. Inside a singleton type, bare ``instance = this`` →
+    ``Type_instance = i`` (static cache field); bare ``Instance`` →
+    ``Type_Instance()``; bare ``instance`` reads → ``Type_instance``.
     """
     this = cl.get("name")
     methods_by = plan.get("_methods_by") or {}
@@ -8014,6 +8017,19 @@ def _rewrite_mb_static_and_singleton(text, plan, cl):
                 r"(?<![\w.])%s\s*\.\s*(?:Instance|instance)\b"
                 % re.escape(ocname),
                 inst, text)
+    # Bare singleton field on *this* class (GameCamera Awake: instance = this).
+    # Only when Type_instance / Type_Instance() are emitted.
+    if this and this in singleton_types:
+        oidn = _c_ident(this)
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])instance\s*=",
+            "%s_instance =" % oidn, text)
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])Instance\b(?!\s*\()",
+            "%s_Instance()" % oidn, text)
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])instance\b",
+            "%s_instance" % oidn, text)
     # FindObjectOfType<T>() / FindObjectOfType<T>(bool)
     for tname in sorted(plan.get("findobject_types") or (),
                         key=len, reverse=True):
