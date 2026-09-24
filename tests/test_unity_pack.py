@@ -954,6 +954,159 @@ class TestMaxInstances(unittest.TestCase):
         self.assertIn("Bullet.cs(", cm.exception.message)
 
 
+def _gl_context():
+    """A headless GL context (Mesa llvmpipe over EGL), or None."""
+    try:
+        import moderngl
+        return moderngl.create_standalone_context(backend="egl", require=430)
+    except Exception:
+        return None
+
+
+class TestGpuHandles(unittest.TestCase):
+    """`--gpu-handles`: handle fields packed for a GLES 3.1 SSBO.
+
+    Each handle field is a stream of its class's capacity at its width --
+    the target class's index width -- four bytes, two shorts or one word
+    per uint, read in the shader with `bitfieldExtract`. The scene: a
+    Player (`[MaxInstances(1000)]`, 16-bit) whose `last` is the third of
+    three Bullets (`[MaxInstances(10)]`, 8-bit), each of whose `owner` is
+    the Player -- so an 8-bit class holds 16-bit handles and the reverse.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        root = tempfile.mkdtemp(prefix="upack-gpuh-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        scenes = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scripts)
+        os.makedirs(scenes)
+        files = {
+            "MaxInstancesAttribute.cs":
+                "public class MaxInstancesAttribute : System.Attribute {\n"
+                "    public MaxInstancesAttribute(int n) {}\n}\n",
+            "Player.cs":
+                "using UnityEngine;\n[MaxInstances(1000)]\n"
+                "public class Player : MonoBehaviour {\n"
+                "    public Bullet last;\n    public int hp;\n"
+                "    void Update() {}\n}\n",
+            "Bullet.cs":
+                "using UnityEngine;\n[MaxInstances(10)]\n"
+                "public class Bullet : MonoBehaviour {\n"
+                "    public Player owner;\n    public int speed;\n"
+                "    void Update() {}\n}\n",
+        }
+        for name, text in files.items():
+            with open(os.path.join(scripts, name), "w") as f:
+                f.write(text)
+        for name, guid in (("Player", "91" * 16), ("Bullet", "b1" * 16)):
+            with open(os.path.join(scripts, name + ".cs.meta"), "w") as f:
+                f.write("guid: %s\n" % guid)
+
+        def obj(fid, name, guid, fields):
+            return ("--- !u!1 &%d\nGameObject:\n  m_Name: %s\n"
+                    "  m_Component:\n  - component: {fileID: %d}\n"
+                    "  - component: {fileID: %d}\n"
+                    "--- !u!4 &%d\nTransform:\n  m_GameObject: {fileID: %d}\n"
+                    "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                    "--- !u!114 &%d\nMonoBehaviour:\n  m_GameObject: {fileID: %d}\n"
+                    "  m_Script: {fileID: 11500000, guid: %s}\n%s"
+                    % (fid, name, fid + 1, fid + 2, fid + 1, fid, fid + 2, fid,
+                       guid, fields))
+        scene = "%YAML 1.1\n" + obj(1, "Hero", "91" * 16,
+                                    "  last: {fileID: 42}\n  hp: 3\n")
+        for k, fid in enumerate((20, 30, 40)):
+            scene += obj(fid, "Shot%d" % k, "b1" * 16,
+                         "  owner: {fileID: 3}\n  speed: %d\n" % (k + 1))
+        with open(os.path.join(scenes, "S.unity"), "w") as f:
+            f.write(scene)
+        cls.root = root
+        cls.out = tempfile.mkdtemp(prefix="upack-gpuh-out-")
+        with contextlib.redirect_stderr(io.StringIO()):
+            unity_pack.pack(root, cls.out, gpu_handles=True)
+        with open(os.path.join(cls.out, "engine_handles.h")) as f:
+            cls.header = f.read()
+        with open(os.path.join(cls.out, "shaders", "handles.glsl")) as f:
+            cls.glsl = f.read()
+        cls.want = {"Bullet_owner": [0, 0, 0] + [65535] * 7,
+                    "Player_last": [2] + [255] * 999}
+
+    def _define(self, name):
+        m = re.search(r"#define %s (\d+)" % name, self.header)
+        return int(m.group(1))
+
+    def test_a_handle_is_its_targets_width(self):
+        self.assertEqual(self._define("Bullet_owner_BITS"), 16)
+        self.assertEqual(self._define("Player_last_BITS"), 8)
+        self.assertEqual(self._define("Bullet_owner_LEN"), 10)
+        self.assertEqual(self._define("Player_last_LEN"), 1000)
+        # 10 shorts in 5 words, then 1000 bytes in 250.
+        self.assertEqual(self._define("Player_last_OFF"), 5)
+        self.assertEqual(self._define("ENGINE_HANDLE_WORDS"), 255)
+
+    def _words(self):
+        d = self.out
+        r = subprocess.run(["make", "-C", d], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr or r.stdout)
+        dump = os.path.join(d, "dump.c")
+        with open(dump, "w") as f:
+            f.write('#include <stdio.h>\n#include "engine_handles.h"\n'
+                    "int main(void) { static uint32_t b[ENGINE_HANDLE_WORDS];\n"
+                    "  int n = engine_upload_handles(b, ENGINE_HANDLE_WORDS);\n"
+                    "  fwrite(b, 4, (size_t)n, stdout); return 0; }\n")
+        exe = os.path.join(d, "dump")
+        r = subprocess.run([_CC, "-O2", "-I", d, "-o", exe, dump,
+                            os.path.join(d, "engine.o"),
+                            os.path.join(d, "data.o"), "-lm"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return subprocess.run([exe], capture_output=True, timeout=60).stdout
+
+    @needs_cc
+    def test_the_c_side_packs_what_bitfieldExtract_reads(self):
+        # Decoded here with bitfieldExtract's definition:
+        # (word >> offset) & ((1 << bits) - 1).
+        import struct
+        raw = self._words()
+        words = struct.unpack("<%dI" % (len(raw) // 4), raw)
+        for name, want in self.want.items():
+            off = self._define(name + "_OFF")
+            bits = self._define(name + "_BITS")
+            per = 32 // bits
+            got = [(words[off + i // per] >> ((i % per) * bits))
+                   & ((1 << bits) - 1) for i in range(len(want))]
+            self.assertEqual(got, want, name)
+
+    @needs_cc
+    def test_the_shader_reads_what_the_c_side_packed(self):
+        ctx = _gl_context()
+        if ctx is None:
+            self.skipTest("no headless GL (moderngl + EGL) here")
+        import struct
+        raw = self._words()
+        for name, want in self.want.items():
+            cs = ctx.compute_shader(
+                "#version 310 es\nlayout(local_size_x = 1) in;\n" + self.glsl +
+                "layout(std430, binding = 2) writeonly buffer Out { uint o[]; };\n"
+                "void main() { uint i = gl_GlobalInvocationID.x;"
+                " o[i] = %s(i); }\n" % name)
+            src = ctx.buffer(raw)
+            dst = ctx.buffer(reserve=4 * len(want))
+            src.bind_to_storage_buffer(1)
+            dst.bind_to_storage_buffer(2)
+            cs.run(group_x=len(want))
+            got = list(struct.unpack("<%dI" % len(want), dst.read()))
+            self.assertEqual(got, want, name)
+
+    def test_off_by_default(self):
+        d = tempfile.mkdtemp(prefix="upack-gpuh-off-")
+        with contextlib.redirect_stderr(io.StringIO()):
+            unity_pack.pack(self.root, d)
+        self.assertFalse(os.path.exists(os.path.join(d, "engine_handles.h")))
+        with open(os.path.join(d, "engine.cpp")) as f:
+            self.assertNotIn("engine_upload_handles", f.read())
+
+
 class TestSystems(unittest.TestCase):
     """Authored systems subset — see UNITY_PACK_SYSTEMS.md."""
 
