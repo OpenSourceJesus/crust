@@ -158,7 +158,10 @@ slot (intensity 1, white) into the light table.
 
 | Script / scene uses | Emitted |
 |---------------------|---------|
-| Authored `!u!20` Camera (MainCamera) | `Camera_main_pos_*` (incl. **z**), `orthographicSize`, near/far clip, background RGB |
+| Authored `!u!1` GameObject `m_TagString: EditorOnly` | Omitted from pack (and transform descendants), matching Unity player builds |
+| Authored CameraScript / GameCamera `viewSize` | Pack-time seed of `Camera_main_aspect`, `Camera_main_rect_*`, updated `orthographicSize` (HandleViewSize); GLES letterboxes; uGUI bake starts from the camera pixel rect |
+| Authored uGUI `CanvasScaler` (`m_Enabled`) | Pack-time canvas units = pixelRect / scaleFactor (Constant Pixel Size / Scale With Screen Size Match·Expand·Shrink); disabled → raw pixel rect |
+| Authored uGUI layout / Image / TMP / Button `m_Enabled` | Disabled LayoutGroup / ContentSizeFitter / AspectRatioFitter skipped at bake; disabled Image/TMP not drawn; disabled Button not clickable |
 | Camera `m_Father` under a packed body | Live: `_engine_sync_camera_main` → `parent_world + local` each tick/draw |
 | `Camera.main.orthographicSize` / `.transform.position` / clip planes | Reads those globals |
 | Authored `!u!212` SpriteRenderer with `m_Sprite` → **project PNG** | Texture + tinted quad in `engine_collect_draws` |

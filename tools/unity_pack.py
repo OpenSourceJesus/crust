@@ -792,6 +792,176 @@ def player_screen(root):
     return width, height
 
 
+def _camera_script_view_pixels(screen_w, screen_h, view_w, view_h):
+    """Pixel size of ``Camera.rect`` after CameraScript.HandleViewSize.
+
+    Letterboxes / pillarboxes so the camera aspect (viewSize) fits inside the
+    player screen. Matches Unity's normalized viewport when clamped to [0,1].
+    """
+    sw = max(1, int(screen_w))
+    sh = max(1, int(screen_h))
+    vw = float(view_w)
+    vh = float(view_h)
+    if vw < 1e-6 or vh < 1e-6:
+        return sw, sh
+    cam_aspect = vw / vh
+    screen_aspect = float(sw) / float(sh)
+    # CameraScript: size = (cam/screen, min(1, screen/cam)); then clamp.
+    rw = min(1.0, cam_aspect / screen_aspect)
+    rh = min(1.0, screen_aspect / cam_aspect)
+    return (max(1, int(round(sw * rw))), max(1, int(round(sh * rh))))
+
+
+def _authored_camera_view_size(objects):
+    """GameCamera / CameraScript ``viewSize`` (world units), or None."""
+    for o in objects or []:
+        fields = o.get("fields") or {}
+        if "viewSize_x" in fields and "viewSize_y" in fields:
+            return float(fields["viewSize_x"]), float(fields["viewSize_y"])
+    return None
+
+
+def _apply_camera_script_view_to_cameras(cameras, objects):
+    """Match CameraScript.HandleViewSize orthographicSize on the main camera."""
+    view = _authored_camera_view_size(objects)
+    if view is None or not cameras:
+        return
+    vw, vh = view
+    if vh < 1e-6:
+        return
+    aspect = vw / vh
+    ortho = max(vw * 0.5 / aspect, vh * 0.5) if aspect > 1e-6 else vh * 0.5
+    main = None
+    for c in cameras:
+        if c.get("main"):
+            main = c
+            break
+    if main is None:
+        main = cameras[0]
+    main["orthographic_size"] = ortho
+
+
+def _find_canvas_scaler(objects):
+    """Authored CanvasScaler on a Canvas GO, else any object, else None."""
+    fallback = None
+    for o in objects or []:
+        cs = o.get("canvas_scaler")
+        if not cs:
+            continue
+        if o.get("canvas"):
+            return cs
+        if fallback is None:
+            fallback = cs
+    return fallback
+
+
+def _canvas_scaler_scale_factor(pixel_w, pixel_h, scaler):
+    """Unity CanvasScaler.scaleFactor for the given pixel rect.
+
+    Disabled / missing scaler → 1. Constant Physical Size is not modeled
+    (returns 1). Scale With Screen Size matches Unity's log2 lerp /
+    Expand / Shrink screen-match modes.
+    """
+    if not scaler or not int(scaler.get("enabled", 1)):
+        return 1.0
+    mode = int(scaler.get("ui_scale_mode") or 0)
+    if mode == 0:  # Constant Pixel Size
+        sf = float(scaler.get("scale_factor") or 1.0)
+        return sf if sf > 1e-6 else 1.0
+    if mode == 1:  # Scale With Screen Size
+        rw = float(scaler.get("ref_x") or 800.0)
+        rh = float(scaler.get("ref_y") or 600.0)
+        if rw < 1e-6:
+            rw = 1.0
+        if rh < 1e-6:
+            rh = 1.0
+        pw, ph = float(pixel_w), float(pixel_h)
+        if pw < 1e-6:
+            pw = 1.0
+        if ph < 1e-6:
+            ph = 1.0
+        smm = int(scaler.get("screen_match_mode") or 0)
+        if smm == 1:  # Expand
+            return min(pw / rw, ph / rh)
+        if smm == 2:  # Shrink
+            return max(pw / rw, ph / rh)
+        # Match Width Or Height
+        match = max(0.0, min(1.0, float(scaler.get("match") or 0.0)))
+        log_w = math.log(pw / rw) / math.log(2.0)
+        log_h = math.log(ph / rh) / math.log(2.0)
+        return 2.0 ** (log_w * (1.0 - match) + log_h * match)
+    return 1.0
+
+
+def _canvas_scaler_layout_pixels(pixel_w, pixel_h, scaler):
+    """Canvas root size in canvas units: pixelRect / scaleFactor."""
+    sf = _canvas_scaler_scale_factor(pixel_w, pixel_h, scaler)
+    if sf < 1e-6:
+        sf = 1.0
+    return (max(1, int(round(float(pixel_w) / sf))),
+            max(1, int(round(float(pixel_h) / sf))))
+
+
+def _ui_layout_screen(root, objects):
+    """Screen size used for uGUI bake (Canvas Scaler / Camera.rect pixel size).
+
+    When an authored CameraScript ``viewSize`` is present, start from the
+    letterboxed camera pixel rect (e.g. 1920×960 for view 2:1 on 1920×1080).
+    An enabled CanvasScaler then converts that pixel rect to canvas units
+    (pixelRect / scaleFactor), matching Screen Space Camera + scaler.
+    """
+    sw, sh = player_screen(root)
+    view = _authored_camera_view_size(objects)
+    if view is not None:
+        sw, sh = _camera_script_view_pixels(sw, sh, view[0], view[1])
+    scaler = _find_canvas_scaler(objects)
+    if scaler and int(scaler.get("enabled", 1)):
+        return _canvas_scaler_layout_pixels(sw, sh, scaler)
+    return sw, sh
+
+
+def _camera_script_rect(screen_w, screen_h, view_w, view_h):
+    """Normalized Camera.rect (x, y, w, h) for CameraScript.HandleViewSize."""
+    sw = max(1, float(screen_w))
+    sh = max(1, float(screen_h))
+    vw = float(view_w)
+    vh = float(view_h)
+    if vw < 1e-6 or vh < 1e-6:
+        return 0.0, 0.0, 1.0, 1.0
+    cam_aspect = vw / vh
+    screen_aspect = sw / sh
+    rw = min(1.0, cam_aspect / screen_aspect)
+    rh = min(1.0, screen_aspect / cam_aspect)
+    return (0.5 - rw * 0.5), (0.5 - rh * 0.5), rw, rh
+
+
+def _seed_camera_script_view(plan, objects):
+    """Bake CameraScript.HandleViewSize into plan camera globals.
+
+    ``camera.aspect`` / ``camera.rect`` / updated ``orthographicSize`` are not
+    lowered from C# (Rect / Camera setters). When an authored ``viewSize`` is
+    present, seed the same values HandleViewSize would assign so Screen Space
+    Camera UI and the GLES host letterbox match Unity.
+    """
+    cam = plan.get("camera")
+    if not cam:
+        return
+    sw = max(1, int(plan.get("screen_width") or 1024))
+    sh = max(1, int(plan.get("screen_height") or 768))
+    view = _authored_camera_view_size(objects)
+    if view is None:
+        plan["camera_aspect"] = float(sw) / float(sh)
+        plan["camera_rect"] = (0.0, 0.0, 1.0, 1.0)
+        return
+    vw, vh = view
+    aspect = vw / vh if vh > 1e-6 else float(sw) / float(sh)
+    # HandleViewSize: orthographicSize = max(view.x/2/aspect, view.y/2)
+    ortho = max(vw * 0.5 / aspect, vh * 0.5) if aspect > 1e-6 else vh * 0.5
+    cam["orthographic_size"] = ortho
+    plan["camera_aspect"] = aspect
+    plan["camera_rect"] = _camera_script_rect(sw, sh, vw, vh)
+
+
 def player_display(root):
     """Player Settings display tuple.
 
@@ -1889,6 +2059,8 @@ _HLAYOUT_SCRIPT_GUID = "30649d3a9faa99c48a7b1166b86bf2a0"
 _LAYOUT_ELEMENT_GUID = "306cc8c2b49d7114eaa3623786fc2126"
 _CONTENT_SIZE_FITTER_GUID = "3245ec927659c4140ac4f8d17403cc18"
 _ASPECT_RATIO_FITTER_GUID = "86710e43de46f6f4bac7c8e50813a599"
+# uGUI CanvasScaler (UnityEngine.UI.dll).
+_CANVAS_SCALER_GUID = "0cd44c1031e13a943bb63640046fad76"
 # Unity "Resources/unity_builtin_extra" — UISprite, Background, Knob, …
 _UNITY_BUILTIN_GUID = "0000000000000000f000000000000000"
 
@@ -1968,6 +2140,20 @@ def _is_aspect_ratio_fitter_mb(block, guid):
         r"(?m)^\s+m_EditorClassIdentifier:.*\bAspectRatioFitter\s*$", block))
 
 
+def _is_canvas_scaler_mb(block, guid):
+    g = (guid or "").lower()
+    if g == _CANVAS_SCALER_GUID:
+        return True
+    return bool(re.search(
+        r"(?m)^\s+m_EditorClassIdentifier:.*\bCanvasScaler\s*$", block))
+
+
+def _mb_enabled(block, default=1):
+    """Authored Behaviour.m_Enabled (1 when YAML omits the field)."""
+    en = re.search(r"(?m)^\s+m_Enabled:\s*(\d+)", block)
+    return int(en.group(1)) if en else default
+
+
 def _parse_pad_int(block, key, default=0):
     m = re.search(r"(?m)^\s+%s:\s*(-?\d+)" % re.escape(key), block)
     return int(m.group(1)) if m else default
@@ -1977,6 +2163,7 @@ def _parse_hv_layout_group(block, vertical):
     """Authored Vertical/HorizontalLayoutGroup → bake dict."""
     sp = re.search(r"(?m)^\s+m_Spacing:\s*([0-9.eE+-]+)", block)
     return {
+        "enabled": _mb_enabled(block),
         "vertical": bool(vertical),
         "pad_left": _parse_pad_int(block, "m_Left", 0),
         "pad_right": _parse_pad_int(block, "m_Right", 0),
@@ -2006,6 +2193,7 @@ def _parse_layout_element(block):
             r"(?m)^\s+%s:\s*([0-9.eE+-]+)" % re.escape(key), block)
         return float(m.group(1)) if m else -1.0
     return {
+        "enabled": _mb_enabled(block),
         "ignore": _parse_pad_int(block, "m_IgnoreLayout", 0),
         "min": (_f("m_MinWidth"), _f("m_MinHeight")),
         "preferred": (_f("m_PreferredWidth"), _f("m_PreferredHeight")),
@@ -2018,6 +2206,7 @@ def _parse_layout_element(block):
 def _parse_content_size_fitter(block):
     """Authored ContentSizeFitter — FitMode per axis (0 Unconstrained … 3 Clamped)."""
     return {
+        "enabled": _mb_enabled(block),
         "horizontal": _parse_pad_int(block, "m_HorizontalFit", 0),
         "vertical": _parse_pad_int(block, "m_VerticalFit", 0),
     }
@@ -2032,8 +2221,28 @@ def _parse_aspect_ratio_fitter(block):
     if ratio > 1000.0:
         ratio = 1000.0
     return {
+        "enabled": _mb_enabled(block),
         "mode": _parse_pad_int(block, "m_AspectMode", 0),
         "ratio": ratio,
+    }
+
+
+def _parse_canvas_scaler(block):
+    """Authored CanvasScaler → ui scale mode, reference resolution, match."""
+    ref = _yaml_vec2(block, "m_ReferenceResolution", (800.0, 600.0))
+    sf = re.search(r"(?m)^\s+m_ScaleFactor:\s*([0-9.eE+-]+)", block)
+    match = re.search(
+        r"(?m)^\s+m_MatchWidthOrHeight:\s*([0-9.eE+-]+)", block)
+    return {
+        "enabled": _mb_enabled(block),
+        # 0 Constant Pixel Size, 1 Scale With Screen Size, 2 Constant Physical
+        "ui_scale_mode": _parse_pad_int(block, "m_UiScaleMode", 0),
+        "scale_factor": float(sf.group(1)) if sf else 1.0,
+        "ref_x": float(ref[0]),
+        "ref_y": float(ref[1]),
+        # 0 Match Width Or Height, 1 Expand, 2 Shrink
+        "screen_match_mode": _parse_pad_int(block, "m_ScreenMatchMode", 0),
+        "match": float(match.group(1)) if match else 0.0,
     }
 
 
@@ -2079,6 +2288,7 @@ def _parse_ui_tmp(block, asset_guids):
 def _parse_ui_button(block):
     """Authored uGUI Button → interactable, ColorBlock, persistent onClick."""
     en = re.search(r"(?m)^\s+m_Interactable:\s*(\d+)", block)
+    mb_en = _mb_enabled(block)
 
     def _col(key, default):
         m = re.search(
@@ -3786,6 +3996,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 rec["content_size_fitter"] = _parse_content_size_fitter(block)
             elif _is_aspect_ratio_fitter_mb(block, g):
                 rec["aspect_ratio_fitter"] = _parse_aspect_ratio_fitter(block)
+            elif _is_canvas_scaler_mb(block, g):
+                rec["canvas_scaler"] = _parse_canvas_scaler(block)
         if kind == "Camera":
             ortho = re.search(r"(?m)^\s+orthographic:\s*(\d+)", block)
             osize = re.search(
@@ -4024,6 +4236,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         layout_element = None
         content_size_fitter = None
         aspect_ratio_fitter = None
+        canvas_scaler = None
         canvas = None
         cam = None
         rb2d = None
@@ -4070,6 +4283,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                     content_size_fitter = dict(k["content_size_fitter"])
                 if k.get("aspect_ratio_fitter"):
                     aspect_ratio_fitter = dict(k["aspect_ratio_fitter"])
+                if k.get("canvas_scaler"):
+                    canvas_scaler = dict(k["canvas_scaler"])
             if k.get("kind") == "SpriteRenderer" and k.get("sprite"):
                 sprite = dict(k["sprite"])
             if k.get("kind") == "Canvas" and k.get("canvas"):
@@ -4341,6 +4556,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                     "layout_element": layout_element,
                     "content_size_fitter": content_size_fitter,
                     "aspect_ratio_fitter": aspect_ratio_fitter,
+                    "canvas_scaler": canvas_scaler,
                     "rigidbody2d": None,
                     "rigidbody": None,
                     "collider2d": None,
@@ -4375,6 +4591,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "layout_element": layout_element,
                 "content_size_fitter": content_size_fitter,
                 "aspect_ratio_fitter": aspect_ratio_fitter,
+                "canvas_scaler": canvas_scaler,
                 "rigidbody2d": None,
                 "rigidbody": None,
                 "collider2d": None,
@@ -4409,6 +4626,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "layout_element": layout_element,
             "content_size_fitter": content_size_fitter,
             "aspect_ratio_fitter": aspect_ratio_fitter,
+            "canvas_scaler": canvas_scaler,
             "rigidbody2d": rb2d,
             "rigidbody": rb3d,
             "collider2d": col2d,
@@ -4502,7 +4720,162 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
     return objects, lights, cameras, hierarchy
 
 
-_prefab_parse_cache = {}
+def _prefab_mod_float(raw, path, default=None):
+    """Last matching PrefabInstance modification float (root overrides win)."""
+    matches = re.findall(
+        r"propertyPath:\s*%s\s*\n\s*value:\s*([^\n]+)" % path, raw or "")
+    if not matches:
+        return default
+    try:
+        return float(matches[-1].strip())
+    except ValueError:
+        return default
+
+
+
+def _prefab_mod_rect(raw):
+    """RectTransform fields from PrefabInstance m_Modifications."""
+    def f(path, d):
+        v = _prefab_mod_float(raw, path, None)
+        return d if v is None else v
+
+    return {
+        "anchor_min": (f(r"m_AnchorMin\.x", 0.5), f(r"m_AnchorMin\.y", 0.5)),
+        "anchor_max": (f(r"m_AnchorMax\.x", 0.5), f(r"m_AnchorMax\.y", 0.5)),
+        "anchored_position": (
+            f(r"m_AnchoredPosition\.x", 0.0),
+            f(r"m_AnchoredPosition\.y", 0.0)),
+        "size_delta": (
+            f(r"m_SizeDelta\.x", 100.0), f(r"m_SizeDelta\.y", 100.0)),
+        "pivot": (f(r"m_Pivot\.x", 0.5), f(r"m_Pivot\.y", 0.5)),
+    }
+
+
+
+def _materialize_prefab_instance_ui(by_id, objects, asset_guids,
+                                    editor_only_xfs=None):
+    """Create drawable Image objects for PrefabInstance roots with sprite mods.
+
+    Scene UI buttons are often PrefabInstances (stripped root Transform +
+    m_Sprite overrides). Without a packed object, layout/bake skip them and
+    only scene-added labels exist — and those inherit the wrong Canvas sort
+    when the parent walk stops at the stripped root.
+    """
+    asset_guids = asset_guids or {}
+    editor_only_xfs = editor_only_xfs or set()
+    have_xf = {str(o.get("xf_id")) for o in objects if o.get("xf_id")}
+    # PrefabInstance id → root stripped Transform (father == PI TransformParent).
+    roots = {}
+    for rec in by_id.values():
+        if rec.get("kind") != "Transform":
+            continue
+        raw = rec.get("raw") or ""
+        pm = re.search(
+            r"(?m)^\s+m_PrefabInstance:\s*\{fileID:\s*(\d+)\}", raw)
+        if not pm:
+            continue
+        pi = by_id.get(pm.group(1))
+        if not pi or pi.get("kind") != "PrefabInstance":
+            continue
+        pi_father = str(pi.get("father_id") or "")
+        xf_father = str(rec.get("father_id") or "")
+        if pi_father and xf_father == pi_father:
+            roots[pm.group(1)] = rec
+    for pi_id, xf_rec in roots.items():
+        xf_id = str(xf_rec.get("file_id") or "")
+        if not xf_id or xf_id in have_xf or xf_id in editor_only_xfs:
+            continue
+        pi = by_id.get(pi_id)
+        if not pi:
+            continue
+        raw = pi.get("raw") or ""
+        # Last resolving m_Sprite override (root Image after child removals).
+        sprite_guid = None
+        sprite_fid = 0
+        for m in re.finditer(
+                r"propertyPath:\s*m_Sprite\s*\n\s*value:[^\n]*\n\s+"
+                r"objectReference:\s*\{fileID:\s*(-?\d+)"
+                r"(?:,\s*guid:\s*([0-9a-fA-F]+))?",
+                raw):
+            fid = int(m.group(1))
+            sg = m.group(2).lower() if m.group(2) else None
+            if fid == 0 and not sg:
+                continue
+            if sg and (sg in asset_guids or _is_unity_builtin_guid(sg)):
+                sprite_guid = sg
+                sprite_fid = fid
+        if not sprite_guid:
+            continue
+        names = re.findall(
+            r"propertyPath:\s*m_Name\s*\n\s*value:\s*(.+)", raw)
+        name = names[-1].strip() if names else (xf_rec.get("name") or "Prefab")
+        acts = re.findall(
+            r"propertyPath:\s*m_IsActive\s*\n\s*value:\s*(\d+)", raw)
+        # Prefer last m_IsActive on the root GO (often after child toggles).
+        active = int(acts[-1]) if acts else int(pi.get("active", 1))
+        builtin = bool(_is_unity_builtin_guid(sprite_guid))
+        has_sprite = builtin or sprite_guid in asset_guids
+        go_id = None
+        for g in by_id.values():
+            if g.get("kind") != "GameObject":
+                continue
+            graw = g.get("raw") or ""
+            if re.search(
+                    r"(?m)^\s+m_PrefabInstance:\s*\{fileID:\s*%s\}"
+                    % re.escape(pi_id), graw):
+                go_id = g.get("file_id")
+                break
+        presc = re.search(
+            r"propertyPath:\s*m_PreserveAspect\s*\n\s*value:\s*(\d+)", raw)
+        # Prefab default for UI Button Image is preserveAspect: 1.
+        preserve = int(presc.group(1)) if presc else 1
+        itype = re.search(
+            r"propertyPath:\s*m_Type\s*\n\s*value:\s*(\d+)", raw)
+        objects.append({
+            "name": name,
+            "pos": pi.get("pos") or (0.0, 0.0, 0.0),
+            "rot": pi.get("rot") or (0.0, 0.0, 0.0, 1.0),
+            "local_pos": pi.get("pos") or (0.0, 0.0, 0.0),
+            "local_rot": pi.get("rot") or (0.0, 0.0, 0.0, 1.0),
+            "local_scale": pi.get("scale") or (1.0, 1.0, 1.0),
+            "father_id": xf_rec.get("father_id"),
+            "xf_id": xf_id,
+            "go_id": go_id,
+            "active": active,
+            "fields": {},
+            "object_refs": {},
+            "script": None,
+            "class": name,
+            "sprite": None,
+            "canvas": None,
+            "rect": _prefab_mod_rect(raw),
+            "ui_image": {
+                "r": 1.0, "g": 1.0, "b": 1.0, "a": 1.0,
+                "enabled": 1,
+                "has_sprite": has_sprite,
+                "builtin": builtin,
+                "sprite_file_id": sprite_fid,
+                "sprite_guid": sprite_guid,
+                "image_type": int(itype.group(1)) if itype else 0,
+                "pixels_per_unit_multiplier": 1.0,
+                "preserve_aspect": preserve,
+            },
+            "ui_button": None,
+            "ui_tmp": None,
+            "layout_group": None,
+            "layout_element": None,
+            "content_size_fitter": None,
+            "aspect_ratio_fitter": None,
+            "canvas_scaler": None,
+            "rigidbody2d": None,
+            "rigidbody": None,
+            "collider2d": None,
+            "collider3d": None,
+            "anim_player": None,
+            "audiosources": [],
+        })
+        have_xf.add(xf_id)
+
 
 
 def _parsed_prefab_objects(path, guid_to_script, asset_guids):
@@ -15436,13 +15809,55 @@ def _load_scenes_lights_cameras(root, assets):
             "(looked for .unity / .tscn / blender_pack.json)" % root)
     _progress("scene objects=%d lights=%d cameras=%d hierarchy=%d" % (
         len(objects), len(lights), len(cameras), len(hierarchy)))
-    sw, sh = player_screen(root)
+    _apply_camera_script_view_to_cameras(cameras, objects)
+    sw, sh = _ui_layout_screen(root, objects)
     _apply_layout_groups(objects, sw, sh)
-    _bake_ui_images(objects, cameras, sw, sh, asset_guids=assets)
+    _bake_ui_images(
+        objects, cameras, sw, sh, asset_guids=assets, hierarchy=hierarchy)
     objects = [o for o in objects if not o.get("ui_scaffold")]
     _apply_sprite_sorting(objects, sorting_layers)
     _attach_sprite_textures(objects, assets)
     return objects, lights, cameras, hierarchy
+
+
+_MSCRIPT_GUID_RE = re.compile(
+    r"m_Script:\s*\{fileID:\s*\d+,\s*guid:\s*([0-9a-fA-F]+)")
+_SOURCE_PREFAB_GUID_RE = re.compile(
+    r"m_SourcePrefab:\s*\{fileID:\s*\d+,\s*guid:\s*([0-9a-fA-F]+)")
+
+
+def _add_mscript_paths_from_text(text, root, guids, out):
+    """Add Assets/ .cs paths for each ``m_Script`` guid in *text*."""
+    for m in _MSCRIPT_GUID_RE.finditer(text):
+        sp = guids.get(m.group(1).lower())
+        if sp and _is_player_csharp(root, sp):
+            out.add(os.path.abspath(sp))
+
+
+def _scripts_referenced_in_startup_scenes(root, assets, guids):
+    """Project scripts authored on startup scenes + their source prefabs.
+
+    Packed UI / stripped PrefabInstances often leave ``object["script"]``
+    unset (scaffold Image/Button keep the GO, project MBs do not join).
+    Falling back to every Assets ``.cs`` then full-analyzes vendor code
+    (Destructible2D ``Stack<T>``, …) and refuses the pack. Scan YAML
+    ``m_Script`` / ``m_SourcePrefab`` guids instead.
+    """
+    out = set()
+    prefab_guids = set()
+    for path in _unity_scenes_to_pack(root, asset_guids=assets):
+        text = _read(path)
+        _add_mscript_paths_from_text(text, root, guids, out)
+        for m in _SOURCE_PREFAB_GUID_RE.finditer(text):
+            prefab_guids.add(m.group(1).lower())
+    for g in prefab_guids:
+        ppath = (assets or {}).get(g)
+        if not ppath or not ppath.lower().endswith(".prefab"):
+            continue
+        if not os.path.isfile(ppath):
+            continue
+        _add_mscript_paths_from_text(_read(ppath), root, guids, out)
+    return out
 
 
 def _analyze_scripts_and_prefabs(root, objects, assets):
