@@ -19,7 +19,8 @@ like musl needs far more than `#include`.
   (ternary, `||`, `&&`, bitwise, equality/relational, shifts, additive,
   multiplicative, unary `+ - ! ~`, parentheses, C truncating division) and the
   **`defined`** operator (`defined X` and `defined(X)`).
-* **`#error`** (reported); `#pragma`, `#line`, etc. ignored.
+* **`#error`** (reported); `#pragma pack` read (see *Struct packing* at the
+  end); other `#pragma`s, `#line`, etc. ignored.
 * **Backslash-newline line continuation** in directives (e.g. a `#if` spanning
   several physical lines, as in musl's `features.h`).
 
@@ -85,6 +86,8 @@ The *next* blockers are downstream and are **not** about macros:
    * **GCC/C extension spellings** -- `__attribute__((...))`, `__restrict` /
      `restrict`, `__inline` / `inline`, `__extension__`, `_Noreturn`, etc. are
      accepted and ignored via a preprocessor prelude, so library headers parse.
+     (Two attributes are now read rather than ignored: `weak`/`alias`, below,
+     and `packed` -- see *Struct packing* at the end.)
 
    With these, **6 of 14 sampled musl `src/string/*.c` files now pass the full
    front-end** (tokenize -> preprocess -> parse -> IL): strlen, strcmp, strncmp,
@@ -1368,3 +1371,67 @@ Groundwork for a future source-to-C transpiler (and a direct speed win):
    transpiler can assign one C type per variable). mypy validates the
    annotations. This is incremental groundwork; the same pattern extends to the
    remaining modules.
+
+## Struct packing: `#pragma pack`, `_Pragma("pack(..)")`, `packed`
+
+ShivyC used to lay every struct out naturally whatever the source asked for:
+`#pragma pack` was an ignored directive and `packed` one more attribute the
+generic stripper threw away. gcc honours both, so one C file had one layout
+under gcc and another here -- silently, which is the dangerous part for a
+struct that is serialised to bytes or shared with gcc-built code. All three
+spellings are now honoured, with gcc's semantics: `pack(N)` caps every
+member's alignment, and the struct's own, at N; `packed` is `pack(1)` for
+that one type.
+
+1. **Front end.** The preprocessor turns a `#pragma pack(..)` line into a
+   `__shivyc_pragma_pack ( .. )` marker, because a directive leaves no tokens
+   behind and the pragma has to be read in stream order, between the
+   definitions it applies to. `shivyc/pack.py` (`apply_packing`) then runs
+   over the token stream -- in the compile, call-graph and memory-safety
+   pipelines alike, directly before `weak_alias.extract_aliases`, which
+   strips attributes. It tracks the `push`/`pop` stack, reads `_Pragma`
+   operands and `__attribute__((packed))` (after `struct`/`union`, or after
+   the closing `}`), and records the result on the keyword token
+   (`Token.pack`). The parser copies it onto the struct node. A `pack(..)`
+   it cannot read is an error, not a no-op.
+2. **Layout.** `set_members` takes the pack value; `member_align` caps each
+   member, and `alignment()` caps the struct, so a packed struct nested in
+   another, or in an array, is placed as gcc places it.
+3. **Access.** A member whose natural alignment exceeds the pack value may
+   sit at an address its alignment does not divide (the struct itself is
+   only `pack`-aligned). `UnalignedLValue` (`tree/utils.py`) reads and
+   writes such a member one byte at a time through an aligned temporary, and
+   the property carries into nested members (`p->inner.x`). Byte accesses
+   are aligned on every target, so no back end needed to change: the 68000,
+   and arm64 with the MMU off, trap on a misaligned word access. x86-64,
+   hosted arm64 and wasm would tolerate a direct load, so this costs speed
+   there; a per-target choice is a possible refinement.
+4. **Aggregate copies on arm64** (`_arm64` whole-aggregate `Set`) copy in
+   chunks no wider than the struct's alignment -- only for types that
+   contain packing, so every other struct copies exactly as before.
+5. **AST cache.** The cache key hashes token spellings, and packing lives on
+   a field, not a spelling: `packed` and a same-length `unused` would have
+   collided. The pack value is part of the key when non-zero, so no existing
+   key changed.
+6. **Crust front end.** `struct __attribute__((packed)) S { .. }` was read
+   as a Rust tuple struct named `__attribute__` and refused (it was before
+   this work too). An item "named" `__attribute__` is now left to C.
+
+Verified: `tests/feature_tests/struct_pack.c` (sizes, offsets, `_Alignof`,
+nested and array members, compound assignment) agrees with gcc on x86-64
+and on wasm; assembly for all feature tests is unchanged on arm64, and on
+x86-64 up to the ordering that already varies run to run; `selfhost test`
+passes and every changed module transpiles with py2c as before.
+
+Not covered yet:
+
+* An array of wide elements *inside* a packed struct (`short a[4]` after a
+  `char`) is indexed with ordinary loads.
+* `aligned(N)` is still ignored, packed or not.
+* A packed struct passed *by value* to gcc-built code may be classified
+  differently by the calling convention.
+* Found while checking the arm64 copies, and independent of packing: an
+  indexed load or store of a struct larger than 8 bytes (`arr[i] = s`,
+  `SetRel`/`ReadRel`) moves only 8 bytes on arm64. Present before this work;
+  not fixed here because arm64 code could not be run to test a fix.
+

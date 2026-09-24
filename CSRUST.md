@@ -27,16 +27,17 @@ Pinned in `tests/test_csrust.py` (`TestSemantics`).
 
 | Area | Lowering |
 |------|----------|
-| `class` / `struct` / `interface` / `enum` | C++ types; interface → pure virtual |
+| `class` / `struct` / `interface` | C++ types; interface → pure virtual |
+| `enum Kind : byte { A, B }`, `Kind.A` | `enum Kind_values { Kind_A, .. }; typedef unsigned char Kind;` (§3) |
 | fields, methods, constructors, `~T` | cpprust method shape `T_method(T *this, …)` |
 | single inheritance, `virtual` / `abstract` | vtables |
 | `class Box<T>` | `template<typename T> class Box` → monomorphise |
 | `List<T>` / `Dictionary<K,V>` | `std::vector` / `std::map` |
 | `T[]`, jagged `T[][]`, `.Length` | `vector`, `.size()` |
-| `new T[n]` (primitive `T`) | zero-filled `vector` of length `n` |
+| `new T[n]` (primitive or enum `T`) | zero-filled `vector` of length `n` |
 | `new T { A = 1 }` in a declaration | `new T()` then `x.A = 1;` |
 | `new T()` on a plain struct | declared, then zeroed byte by byte |
-| `[StructLayout(Sequential/Auto, Pack, Size)]` | checked, then dropped (§2) |
+| `[StructLayout(Sequential/Auto, Pack, Size)]` | checked; a layout-changing `Pack` → `_Pragma("pack(..)")` pair (§2) |
 | `MemoryMarshal` over an unmanaged struct | byte-copy helpers (§2) |
 | `var`, `foreach`, `this.`, `null` | `auto`, range-`for`, `this->`, `NULL` |
 | auto-properties `{ get; set; }` | field + `get_` / `set_` |
@@ -52,7 +53,8 @@ parameters, `$"…"`, file-scoped namespaces, `??` / `?.`, `char`, `lock`,
 `decimal`, `partial`, `goto`, `params`, `stackalloc`, `checked`/`unchecked`,
 top-level statements, `Span<T>` / `ReadOnlySpan<T>`, array initializers
 (`new T[] { … }`), collection initializers, object initializers outside a
-declaration, `new T[n]` for a non-primitive `T`, `LayoutKind.Explicit`.
+declaration, `new T[n]` for a non-primitive `T`, `LayoutKind.Explicit`,
+enum methods (`ToString`, `Parse`, `HasFlag` …).
 
 Top-level statements are refused rather than lowered because C# requires
 them *before* every type declaration (CS8803) and C needs them after: a
@@ -115,18 +117,68 @@ uninitialised — otherwise stack garbage ends up in the serialised bytes.
 Not `T x = {0};`: cpprust refuses a brace list as the source of a struct
 that contains a struct.
 
-**`Pack`.** Not emitted as `#pragma pack`. gcc honours that pragma; shivyc
-parses it and lays the struct out naturally anyway, so one source would get
-two layouts with nothing to say so. Instead cs2cpp computes the packed and
-the natural layout. Equal — the usual case, fields already in size order —
-means `Pack` changes nothing and is dropped. Different is refused, naming
-the field that would move (`Id` at 1 instead of 4). Packing support in
-shivyc is what would lift this. `Size` is accepted when it equals the
-field size.
+**`Pack`.** cs2cpp computes the struct's layout with and without `Pack`.
+Equal — the usual case, fields already in size order — means `Pack` changes
+nothing, and it is dropped. Different emits a pragma pair around the
+struct — the push where the attribute was, the pop after the `};`. The
+C++ that cs2cpp hands on, for a `byte Tag; int Id;` struct:
 
-Known gaps: C# enum member access (`Kind.C`) is not lowered, so an enum
-field is set by cast (`(Kind)2`) for now; pointer-sized `nint`/`nuint`
-fields are accepted, but not under `Pack`, whose check needs a fixed size.
+```cpp
+_Pragma("pack(push, 1)")
+struct Q { unsigned char Tag; int Id; }; _Pragma("pack(pop)")
+```
+
+The `_Pragma` operator, not `#pragma`: a directive needs a line of its own,
+and this file never adds a line. gcc honours it, and so does shivyc (see
+*Struct packing* in [PREPROCESSOR.md](PREPROCESSOR.md)) — which is what
+makes emitting it sound. Before shivyc read packing, the same source had one
+layout under gcc and another under shivyc, so a layout-changing `Pack` was
+refused instead. Each `Pack` is recorded before any layout is computed, so
+a natural struct containing a packed one is laid out correctly. `Size` is
+accepted when it equals the (packed) field size.
+
+`Pack` is still refused, in C# terms, in two places. On a struct nested in
+a class: the C++ half moves nested types out of their class, which would
+leave the pragmas behind. And on a struct with a field that is not plain
+data: packing misaligns an owner (a `string`, an array) that the generated
+code works through by address.
+
+Known gaps: pointer-sized `nint`/`nuint` fields are accepted, but not under
+`Pack`, whose check needs a fixed size. A struct used as a field must be
+declared before the struct using it — C# allows either order, C does not,
+and the pipeline does not reorder definitions (packed or not).
+
+## Enums (§3)
+
+C puts every enum member in one namespace per file and leaves an enum's
+size and signedness to the compiler; C# scopes members to their type and
+fixes the size. So each member is renamed after its type, and the type is a
+typedef of its C# underlying type:
+
+```csharp
+public enum Kind : byte { A, B = A + 4 }     // C#
+```
+```c
+enum Kind_values { Kind_A, Kind_B = Kind_A + 4 }; typedef unsigned char Kind;
+```
+
+`Kind.A` becomes `Kind_A` at every use, including qualified forms
+(`Outer.Kind.A`, `Net.Kind.A`) and siblings named bare in an initializer.
+The typedef is load-bearing for plain data: a `: byte` enum field is one
+byte, as in C#, where a C enum would be four and move every field after it.
+`[Flags]` enums combine with `|` and `&` as integers.
+
+An enum nested in a class is hoisted in front of the outermost type that
+contains it — cpprust has no nested enum — collapsed onto that line, with
+its own lines left blank, so every line keeps its number.
+
+Refused, in C# terms: two enums with the same name in one file (both would
+declare `Kind_…`); enum methods (`ToString`, `Parse`, `HasFlag`, …), which
+need the member names in the binary; a value outside the `int` range; a
+non-integral underlying type; and a field, parameter or local named the
+same as an enum type (`public Color Color;`) — cpprust resolves a typedef by
+substituting its name wherever it appears as a word. The property form
+`public Color Color { get; set; }` works, since its storage is renamed.
 
 ## Layout
 
@@ -134,7 +186,7 @@ fields are accepted, but not under `Pack`, whose check needs a fixed size.
 |------|------|
 | `tools/cs2cpp.py` | refusals + C# → C++ subset (`translate`) |
 | `tools/csrust.py` | CLI; `cs2cpp.translate` then `cpprust.translate` |
-| `tests/test_csrust.py` | semantics, lowering, Shared, generics, except, digest, plain data |
+| `tests/test_csrust.py` | semantics, lowering, Shared, generics, except, digest, plain data, enums |
 
 A Unity *scene* plus these scripts is a different job: see
 [UNITY_PACK.md](UNITY_PACK.md). That packer emits `engine.c` / `data.c`
