@@ -520,13 +520,30 @@ limit (`invariant(n <= usize::MAX)`) has its model state the Rust ranges
 for that width, as the safety lift does; its theorems gain hypotheses every
 Rust call meets. Functions whose clauses name no limit are unchanged.
 
+### The founding theorems
+
+`regions_pairwise_disjoint` -- if `regions_disjoint` says 1, for every
+j < k region j ends at or before region k begins -- and `region_of_unique`
+-- `region_of` says 1 for at most one owner -- are proved about
+`memmap.rs` as lifted, by RosettaMath's `memmap_rs.py`, stated term for
+term as `memmap_eq.py` states them about its hand-typed model.
+`region_index`'s second contract, the witness in checked form
+(`addr - bases[result] < sizes[result]`), is what `region_of_unique` needs
+of it; `rustprove` proves it like any other.
+`tests/test_leanos_rust.py` (`TestFoundingTheorems`) runs the proofs, the
+checks that they are about this Rust -- including that deleting the size
+check from `regions_disjoint` makes the bridge fail, and only there -- and
+Lean.
+
 ### Known gaps
 
-- **The theorems about pairs.** That a disjoint region list has no two
-  overlapping regions (`regions_pairwise_disjoint`), and that an address
-  belongs to at most one owner (`region_of_unique`), are quantified over
-  positions; RosettaMath proves them about hand-typed models, and the
-  ports' contracts do not reach them yet.
+- **Two theorems built on the founding pair.** `sp_no_cross`
+  (`threads_eq.py`: two threads whose stack pointers coincide, each in its
+  own region, are one thread) and `admit_ordered` (`loader_eq.py`: an
+  admitted image leaves the grown region list ordered) are proved about
+  hand-typed models, not yet about the Rust. The first is
+  `region_of_unique` through `sp_ok`; the second is the bridge again, over
+  the concatenation `loader.rs` reads in place.
 - **Arithmetic beyond chains.** `by_bounds` chains `<=` through addition, a
   checked subtraction and a slice's range. Nothing about `*` is proved, and
   an addition that fits only because the maximum is large stays open (see
