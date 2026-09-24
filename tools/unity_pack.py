@@ -3797,6 +3797,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         script = None
         fields = {}
         object_refs = {}
+        mb_ids = []
         vec2_fields = {}
         vec3_fields = {}
         sprite = None
@@ -3829,6 +3830,9 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             if k.get("rot"):
                 rot = k["rot"]
             if k.get("kind") == "MonoBehaviour":
+                # A field typed as this script's class, on another object,
+                # holds this block's fileID: keep it to resolve that.
+                mb_ids.append(str(k.get("file_id")))
                 fields.update(k.get("fields") or {})
                 object_refs.update(k.get("object_refs") or {})
                 vec2_fields.update(k.get("vec2_fields") or {})
@@ -4168,6 +4172,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "active": 1 if int(go.get("active", 1)) else 0,
             "fields": fields,
             "object_refs": object_refs,
+            "mb_ids": mb_ids,
             "script": script,
             "class": class_name or go.get("name") or "Obj",
             "sprite": sprite,
@@ -4540,15 +4545,28 @@ def parse_blender_json(text):
 
 
 def _class_name_from_cs(path):
+    """The component a script file defines: the class named after the file.
+
+    That is Unity's rule for a MonoBehaviour (`Bullet.cs` holds `Bullet`).
+    The first class in the file used to be taken instead, so a helper
+    declared above the component -- an attribute class for
+    `[MaxInstances(N)]`, a small struct -- became the scene object's class.
+    Without a class of the file's name, the first class, as before.
+    """
     try:
         text = _read(path)
     except IOError:
         return None
     scan = cs2cpp._blank(text)
+    stem = os.path.splitext(os.path.basename(path))[0]
+    first = None
     for kind, name, _s, _b, _c in cs2cpp._find_types(scan):
         if kind in ("class", "struct"):
-            return name
-    return None
+            if name == stem:
+                return name
+            if first is None:
+                first = name
+    return first
 
 
 def _string_literal_value(expr):
@@ -4967,8 +4985,47 @@ def _instantiate_budget(analyses, plan):
     return budget
 
 
+def _class_index_width(cname, n, spawn, annotated=None):
+    """(C type, bits, bounded) of an index into `cname`'s instance array.
+
+    `[MaxInstances(N)]` on the class is the author's promise that at most N
+    are ever live -- the array holds N and `Instantiate` returns null when
+    it is full: dropping the N+1st is the behaviour asked for, a bullet
+    that is never fired rather than a heap that grows. With it the index
+    is as narrow as N allows, whatever else in the project spawns. Without
+    it, the scene's count bounds the index only when nothing spawns.
+
+    An index's top value is its null (`_idx_null`), so a uint8_t indexes
+    255 instances and a uint16_t 65535.
+    """
+    if annotated is not None:
+        cap = int(annotated["max_instances"])
+        if n > cap:
+            _raise_cs(annotated.get("path") or "<cs>",
+                      annotated.get("file_text") or "",
+                      int(annotated.get("max_instances_at") or 0), "CS8000",
+                      "[MaxInstances(%d)] on `%s`, and the scene already places "
+                      "%d of them. Raise the cap, or place fewer."
+                      % (cap, cname, n))
+        if cap <= 255:
+            return "uint8_t", 8, True
+        if cap <= 65535:
+            return "uint16_t", 16, True
+        return "uint32_t", 32, True
+    bounded = (not spawn) and n > 0
+    if bounded and n <= 255:
+        return "uint8_t", 8, True
+    if bounded and n <= 65535:
+        return "uint16_t", 16, True
+    return "uint32_t", 32, False
+
+
 def _mb_pool_extra(plan, cname):
-    """Spare instance slots: AddComponent budget + Instantiate budget."""
+    """Spare instance slots: AddComponent budget + Instantiate budget -- or,
+    under `[MaxInstances(N)]`, exactly what fills the class to N."""
+    cl = (plan.get("classes") or {}).get(cname) or {}
+    if cl.get("max_instances") is not None:
+        return max(0, int(cl["max_instances"]) - int(cl.get("n") or 0))
     add = int((plan.get("addcomponent_budget") or {}).get(cname) or 0)
     inst = int((plan.get("instantiate_budget") or {}).get(cname) or 0)
     return add + inst
@@ -6793,6 +6850,12 @@ def analyze_script(path, text=None, shallow=False):
         pre = scan[max(0, start - 200):start]
         disallow_multiple = bool(re.search(
             r"\[DisallowMultipleComponent\]", pre))
+        # [MaxInstances(N)]: the author's cap on live instances (see
+        # `_class_index_width`). Its position, for a diagnostic.
+        mi = re.search(r"(?<![\w.])MaxInstances(?:Attribute)?\s*\(\s*(\d+)"
+                       r"\s*\)", pre)
+        max_instances = int(mi.group(1)) if mi else None
+        max_instances_at = (max(0, start - 200) + mi.start()) if mi else None
         ctor_forbidden = []
         for f in fields:
             api = f.get("ctor_forbidden_api")
@@ -6814,6 +6877,8 @@ def analyze_script(path, text=None, shallow=False):
             "path": path,
             "file_text": text,
             "disallow_multiple": disallow_multiple,
+            "max_instances": max_instances,
+            "max_instances_at": max_instances_at,
             "ctor_forbidden": ctor_forbidden,
         })
     return {
@@ -7482,17 +7547,19 @@ def plan_layouts(objects, analyses, two_d=None):
     # Vector3 field packing when localPosition round-trips a Vector3 member.
     vec3_pack_classes = tp_classes | local_pos_classes
 
+    max_inst = {}
+    for a in analyses:
+        for c in a.get("classes") or []:
+            if c.get("max_instances") is not None:
+                max_inst[c["name"]] = c
+    widths = dict((cname, _class_index_width(cname, len(insts), spawn,
+                                              max_inst.get(cname)))
+                  for cname, insts in by_class.items())
+
     plans = {}
     for cname, insts in by_class.items():
         n = len(insts)
-        bounded = (not spawn) and n > 0
-        if bounded and n <= 256:
-            idx_ty, idx_bits = "uint8_t", 8
-        elif bounded and n <= 65536:
-            idx_ty, idx_bits = "uint16_t", 16
-        else:
-            idx_ty, idx_bits = "uint32_t", 32
-            bounded = False
+        idx_ty, idx_bits, bounded = widths[cname]
 
         # Used user fields: union of script fields and scene-serialized names.
         field_tys = {}
@@ -7609,8 +7676,11 @@ def plan_layouts(objects, analyses, two_d=None):
                 else:
                     members.append((fname, "float", 32, "f32"))
             else:
-                # Foreign MonoBehaviour → index into that class's array.
-                members.append((fname, idx_ty, idx_bits, "idx:" + ty))
+                # Foreign MonoBehaviour → index into that class's array, as
+                # wide as *that* class's index: the owner's could be
+                # narrower and truncate it.
+                t_ty, t_bits, _tb = widths.get(ty, (idx_ty, idx_bits, bounded))
+                members.append((fname, t_ty, t_bits, "idx:" + ty))
 
         # Size with C bitfield packing (same word until 32 bits).
         size = _packed_size(members)
@@ -7644,6 +7714,8 @@ def plan_layouts(objects, analyses, two_d=None):
         plans[cname] = {
             "name": cname,
             "n": n,
+            "max_instances": (max_inst[cname]["max_instances"]
+                              if cname in max_inst else None),
             "idx_ty": idx_ty,
             "idx_bits": idx_bits,
             "bounded": bounded,
@@ -9743,13 +9815,41 @@ def emit_engine(plan, analyses, used_apis):
               % idn)
             p("    int ex, go;")
             p("    if (src < 0 || src >= _%s_inst_count) return -1;" % idn)
-            p("    if (_%s_inst_count >= %d) return -1;" % (idn, cap))
-            if go_spawn_budget:
-                p("    if (_engine_go_count >= _engine_go_cap) return -1;")
+            reuse = (cl.get("max_instances") is not None and want_destroy)
+            if reuse:
+                # `[MaxInstances(N)]` caps *live* instances: once the array
+                # is full, a destroyed one's slot -- instance and GameObject
+                # -- is taken over (everything below rewrites it for the
+                # clone). Only when none is free does the spawn clip.
+                go_full = ("_engine_go_count >= _engine_go_cap"
+                           if go_spawn_budget
+                           else "_engine_go_count >= %d" % go_cap_i)
+                p("    ex = -1;")
+                p("    go = -1;")
+                p("    if (_%s_inst_count >= %d || %s) {" % (idn, cap, go_full))
+                p("        int _k;")
+                p("        for (_k = 0; _k < _%s_inst_count; _k = _k + 1) {" % idn)
+                p("            int _g = _engine_%s_go_of[_k];" % idn)
+                p("            if (_g >= 0 && _g < %d && _engine_go_destroyed[_g]) {"
+                  % go_cap_i)
+                p("                ex = _k;")
+                p("                go = _g;")
+                p("                break;")
+                p("            }")
+                p("        }")
+                p("        if (ex < 0) return -1;")
+                p("    } else {")
+                p("        go = _engine_go_count;")
+                p("        _engine_go_count = _engine_go_count + 1;")
+                p("    }")
             else:
-                p("    if (_engine_go_count >= %d) return -1;" % go_cap_i)
-            p("    go = _engine_go_count;")
-            p("    _engine_go_count = _engine_go_count + 1;")
+                p("    if (_%s_inst_count >= %d) return -1;" % (idn, cap))
+                if go_spawn_budget:
+                    p("    if (_engine_go_count >= _engine_go_cap) return -1;")
+                else:
+                    p("    if (_engine_go_count >= %d) return -1;" % go_cap_i)
+                p("    go = _engine_go_count;")
+                p("    _engine_go_count = _engine_go_count + 1;")
             p("    _engine_go_name[go] = \"(Clone)\";")
             if want_ui:
                 # Instantiate copies activeSelf from the source GO.
@@ -9764,8 +9864,14 @@ def emit_engine(plan, analyses, used_apis):
             if want_destroy:
                 p("    if (go >= 0 && go < %d)" % go_cap_i)
                 p("        _engine_go_destroyed[go] = 0;")
-            p("    ex = _%s_inst_count;" % idn)
-            p("    _%s_inst_count = _%s_inst_count + 1;" % (idn, idn))
+            if reuse:
+                p("    if (ex < 0) {")
+                p("        ex = _%s_inst_count;" % idn)
+                p("        _%s_inst_count = _%s_inst_count + 1;" % (idn, idn))
+                p("    }")
+            else:
+                p("    ex = _%s_inst_count;" % idn)
+                p("    _%s_inst_count = _%s_inst_count + 1;" % (idn, idn))
             p("    _%s_inst_array[ex] = _%s_inst_array[src];" % (idn, idn))
             if cl.get("soa_dims"):
                 dims = int(cl["soa_dims"])
@@ -10486,6 +10592,18 @@ def emit_engine(plan, analyses, used_apis):
                   % (idn, name, idn, name))
                 p("static void %s_set_%s(unsigned i, float v) { %s_AT(i).%s = v; }"
                   % (idn, name, idn, name))
+            elif str(kind).startswith("idx:"):
+                # A handle: an index into another class's array, or null.
+                # Null is the field's all-ones value -- an index can be 0,
+                # and a narrow unsigned field cannot hold -1 -- read back as
+                # -1, so `x != null` (`!= -1`) compares signed with signed.
+                sent = _idx_null(bits)
+                p("static int %s_get_%s(unsigned i) { unsigned v = %s_AT(i).%s;"
+                  " return v == %su ? -1 : (int)v; }"
+                  % (idn, name, idn, name, sent))
+                p("static void %s_set_%s(unsigned i, int v) {"
+                  " %s_AT(i).%s = v < 0 ? %su : (unsigned)v; }"
+                  % (idn, name, idn, name, sent))
             else:
                 p("static unsigned %s_get_%s(unsigned i) { return (unsigned)%s_AT(i).%s; }"
                   % (idn, name, idn, name))
@@ -14529,6 +14647,7 @@ def emit_data(plan, used_apis=None):
             p("};")
             p("")
         p("%s _%s_inst_array[%d] = {" % (idn, idn, cap))
+        mb_index = _mb_index(plan)
         for o in cl["instances"]:
             parts = []
             sx, sy, sz = _instance_storage_pos(o)
@@ -14550,6 +14669,17 @@ def emit_data(plan, used_apis=None):
                 elif kind == "idx:AudioSource":
                     parts.append(str(_audiosource_field_init_index(
                         plan, o, name)))
+                elif str(kind).startswith("idx:"):
+                    # The scene's reference, by the referenced script
+                    # component's fileID; one the scene leaves empty (or that
+                    # names something else) is null -- not index 0, which
+                    # is another object, and which is what it used to get.
+                    hit = mb_index.get(str((o.get("object_refs") or {})
+                                           .get(name)))
+                    if hit and hit[0] == kind.split(":", 1)[1]:
+                        parts.append(str(hit[1]))
+                    else:
+                        parts.append("%du" % _idx_null(bits))
                 else:
                     dflt = _member_init_default(cl, name)
                     if dflt is not None:
@@ -14559,7 +14689,10 @@ def emit_data(plan, used_apis=None):
             if not parts:
                 parts = ["0"]
             p("    { %s }, /* %s */" % (", ".join(parts), o["name"]))
-        for _pad in range(mb_budget):
+        # Spare slots are zeros; C fills an array's unlisted tail with them,
+        # so a `[MaxInstances]` class (65535 bullets, say) lists none.
+        for _pad in range(0 if cl.get("max_instances") is not None
+                          else mb_budget):
             parts = []
             for name, ty, bits, kind in cl["members"]:
                 parts.append(_init_num(0, kind) if kind in ("f16", "f32")
@@ -14603,6 +14736,21 @@ def _audiosource_field_init_index(plan, o, fname):
     if n in by_go:
         return int(by_go[n])
     return -1
+
+
+def _mb_index(plan):
+    """A script component's fileID -> (class, instance index)."""
+    out = {}
+    for cname, cl in (plan.get("classes") or {}).items():
+        for i, o in enumerate(cl.get("instances") or []):
+            for mb in o.get("mb_ids") or []:
+                out[str(mb)] = (cname, i)
+    return out
+
+
+def _idx_null(bits):
+    """A handle field's null: its all-ones value (255 for a uint8_t)."""
+    return (1 << int(bits)) - 1
 
 
 def _init_num(v, kind):
@@ -15604,8 +15752,13 @@ def pack(root, outdir, soa=False, soa_vec4=False, force=False, strict=False):
     plan["addcomponent_types"] = sorted(add_types)
     plan["addcomponent_budget"] = _addcomponent_budget(analyses, plan)
     plan["instantiate_budget"] = _instantiate_budget(analyses, plan)
+    # Each clone takes a GameObject too: a `[MaxInstances(N)]` class's share
+    # of the pool is what fills it to N, not the one spare per call site.
     plan["instantiate_go_budget"] = sum(
-        int(v) for v in (plan["instantiate_budget"] or {}).values())
+        (_mb_pool_extra(plan, cname)
+         if (plan["classes"].get(cname) or {}).get("max_instances") is not None
+         else int(v))
+        for cname, v in (plan["instantiate_budget"] or {}).items())
     plan["instantiate_types"] = sorted(plan["instantiate_budget"] or {})
     plan["disallow_multiple_types"] = sorted(_disallow_multiple_types(analyses))
     fot_types = set()
