@@ -950,13 +950,19 @@ def _is_plain_struct(name, table):
             and _unmanaged_reason(name, table) is None)
 
 
-def _layout(typ, table, pack):
-    """(size, align, [(field, offset)]) with member alignment capped at
-    `pack` (0: natural), or (None, reason) when it has no fixed layout."""
+def _layout(typ, table, pack=None):
+    """(size, align, [(field, offset)]), or (None, reason) with no fixed layout.
+
+    `pack` caps the alignment of this struct's own members; None means the
+    struct's own `[StructLayout(Pack = N)]`, as recorded in the table by
+    `_lower_struct_layout` (0: natural). A nested struct always lays out by
+    its own `Pack`, and then counts as a member with the capped alignment --
+    which is what `#pragma pack` does in gcc and shivyc alike.
+    """
     t = typ.strip()
     if t in _PRIM_SIZE:
         size = _PRIM_SIZE[t]
-        return size, (min(size, pack) if pack else size), []
+        return size, size, []
     info = table.get(t)
     if t in _PRIM_UNMANAGED:
         return None, ("`%s` is pointer-sized, so its offset depends on the "
@@ -964,15 +970,16 @@ def _layout(typ, table, pack):
     if info is None or info["kind"] not in ("struct", "enum"):
         return None, _unmanaged_reason(t, table) or "`%s` is unknown" % t
     if info["kind"] == "enum":
-        base = info["base"].strip()
-        size = _PRIM_SIZE.get(base, 4)
-        return size, (min(size, pack) if pack else size), []
+        size = _PRIM_SIZE.get(info["base"].strip(), 4)
+        return size, size, []
     why = _unmanaged_reason(t, table)
     if why:
         return None, why
+    if pack is None:
+        pack = info.get("pack", 0)
     off, align, offsets = 0, 1, []
     for ftype, fname in info["fields"]:
-        size, fal, _sub = _layout(ftype, table, 0)
+        size, fal, _sub = _layout(ftype, table)
         if size is None:
             return None, fal
         if pack:
@@ -989,104 +996,132 @@ _STRUCT_LAYOUT = re.compile(
     r"\[\s*(?:[\w.]+\.)?StructLayout(?:Attribute)?\s*\(([^\]]*)\)\s*\]")
 
 
+def _parse_struct_layout(m, text, path):
+    """(name, pack, size) from one `[StructLayout(..)]` match."""
+    scan = _blank(text)
+    target = _KIND.search(scan, m.end())
+    if target is None or target.group(1) not in ("struct", "class"):
+        raise CsError("%s`[StructLayout]` must be on a struct."
+                      % _at(path, text, m.start()))
+    name = target.group(2)
+    parts = [p.strip() for p in cpprust._split_top(m.group(1))]
+    kind = parts[0] if parts else ""
+    if re.search(r"(?<![\w])Explicit$", kind):
+        raise CsError(
+            "%s`LayoutKind.Explicit` on `%s` places each field at a "
+            "written `[FieldOffset]`, which can overlap fields -- a "
+            "union. The lowering has no union yet. Use "
+            "`LayoutKind.Sequential`." % (_at(path, text, m.start()), name))
+    if not re.match(r"^(?:[\w.]+\.)?LayoutKind\s*\.\s*(Sequential|Auto)$",
+                    kind):
+        raise CsError(
+            "%s`[StructLayout(%s)]` on `%s`: the layout kind must be "
+            "written as `LayoutKind.Sequential` or `LayoutKind.Auto`."
+            % (_at(path, text, m.start()), kind, name))
+    named = {}
+    for p in parts[1:]:
+        kv = re.match(r"^(\w+)\s*=\s*(.+)$", p)
+        if kv is None:
+            raise CsError("%s`[StructLayout]` argument `%s` on `%s` is "
+                          "not `Name = value`."
+                          % (_at(path, text, m.start()), p, name))
+        named[kv.group(1)] = kv.group(2).strip()
+    for key in named:
+        if key not in ("Pack", "Size", "CharSet"):
+            raise CsError("%s`[StructLayout]` field `%s` on `%s` is not "
+                          "in the subset; `Pack` and `Size` are."
+                          % (_at(path, text, m.start()), key, name))
+    pack = 0
+    if "Pack" in named:
+        if not re.match(r"^\d+$", named["Pack"]) or int(named["Pack"]) \
+                not in (0, 1, 2, 4, 8, 16, 32, 64, 128):
+            raise CsError("%s`Pack = %s` on `%s` must be 0 or a power "
+                          "of two up to 128."
+                          % (_at(path, text, m.start()), named["Pack"],
+                             name))
+        pack = int(named["Pack"])
+    want = None
+    if "Size" in named:
+        if not re.match(r"^\d+$", named["Size"]):
+            raise CsError("%s`Size = %s` on `%s` must be a number."
+                          % (_at(path, text, m.start()), named["Size"],
+                             name))
+        want = int(named["Size"])
+    return target, name, pack, want
+
+
 def _lower_struct_layout(text, table, path):
-    """`[StructLayout(..)]` is checked, then dropped.
+    """`[StructLayout(..)]`: checked, and `Pack` carried into the C.
 
     `Sequential` (and `Auto`, which lets the runtime choose and may as well
-    choose this) is what a C struct already is, so there is nothing to emit.
-    `Pack` is the hard part. gcc honours `#pragma pack`; shivyc parses it
-    and lays the struct out naturally anyway -- so emitting the pragma would
-    give one source two layouts depending on which compiler built it, and
-    nothing would say so. Instead the packed layout is computed here and
-    compared with the natural one. Equal (the usual case: fields already
-    in size order) means `Pack` changes nothing and dropping it is exact.
-    Different is refused, naming the field that would move.
+    choose this) is what a C struct already is, so it leaves nothing behind.
+
+    A `Pack` that changes the layout becomes a `#pragma pack` pair around
+    the struct, spelled `_Pragma("pack(push, N)")` .. `_Pragma("pack(pop)")`
+    -- the operator form, because a directive needs a line of its own and
+    this file never adds a line. The push replaces the attribute; the pop
+    follows the struct's `};` on the same line. gcc honours both, and so
+    does shivyc (`shivyc/pack.py`), which is what makes this sound: before
+    shivyc read them, one source would have had two layouts.
+
+    A `Pack` that changes nothing -- fields already in size order, the
+    usual case -- is dropped, and the output is what it was without it.
+
+    Two places refuse. A struct nested in a class: the C++ half hoists it
+    out, and the pragmas would stay behind inside the class. And a struct
+    with a field that owns memory (a `string`, an array, a class): packing
+    misaligns the owner, and the generated code takes its address and works
+    through it with the wide loads a strict-alignment target traps on.
     """
     scan = _blank(text)
-    out, pos = [], 0
+    found = []
     for m in _STRUCT_LAYOUT.finditer(scan):
-        target = _KIND.search(scan, m.end())
-        if target is None or target.group(1) not in ("struct", "class"):
-            raise CsError("%s`[StructLayout]` must be on a struct."
-                          % _at(path, text, m.start()))
-        name = target.group(2)
-        parts = [p.strip() for p in cpprust._split_top(m.group(1))]
-        kind = parts[0] if parts else ""
-        if re.search(r"(?<![\w])Explicit$", kind):
-            raise CsError(
-                "%s`LayoutKind.Explicit` on `%s` places each field at a "
-                "written `[FieldOffset]`, which can overlap fields -- a "
-                "union. The lowering has no union yet. Use "
-                "`LayoutKind.Sequential`." % (_at(path, text, m.start()), name))
-        if not re.match(r"^(?:[\w.]+\.)?LayoutKind\s*\.\s*(Sequential|Auto)$",
-                        kind):
-            raise CsError(
-                "%s`[StructLayout(%s)]` on `%s`: the layout kind must be "
-                "written as `LayoutKind.Sequential` or `LayoutKind.Auto`."
-                % (_at(path, text, m.start()), kind, name))
-        named = {}
-        for p in parts[1:]:
-            kv = re.match(r"^(\w+)\s*=\s*(.+)$", p)
-            if kv is None:
-                raise CsError("%s`[StructLayout]` argument `%s` on `%s` is "
-                              "not `Name = value`."
-                              % (_at(path, text, m.start()), p, name))
-            named[kv.group(1)] = kv.group(2).strip()
-        for key in named:
-            if key not in ("Pack", "Size", "CharSet"):
-                raise CsError("%s`[StructLayout]` field `%s` on `%s` is not "
-                              "in the subset; `Pack` and `Size` are."
-                              % (_at(path, text, m.start()), key, name))
-        pack = 0
-        if "Pack" in named:
-            if not re.match(r"^\d+$", named["Pack"]) or int(named["Pack"]) \
-                    not in (0, 1, 2, 4, 8, 16, 32, 64, 128):
-                raise CsError("%s`Pack = %s` on `%s` must be 0 or a power "
-                              "of two up to 128."
-                              % (_at(path, text, m.start()), named["Pack"],
-                                 name))
-            pack = int(named["Pack"])
-        want = None
-        if "Size" in named:
-            if not re.match(r"^\d+$", named["Size"]):
-                raise CsError("%s`Size = %s` on `%s` must be a number."
-                              % (_at(path, text, m.start()), named["Size"],
-                                 name))
-            want = int(named["Size"])
+        target, name, pack, want = _parse_struct_layout(m, text, path)
+        found.append((m, target, name, pack, want))
+        if name in table:
+            table[name]["pack"] = pack
+    types = _find_types(text)
+    edits = []
+    for m, target, name, pack, want in found:
+        at = _at(path, text, m.start())
+        packed = None
         if pack or want:
             nat = _layout(name, table, 0)
             if nat[0] is None:
                 raise CsError(
-                    "%s`[StructLayout]` on `%s` fixes its layout, and that "
-                    "layout cannot be checked here: %s."
-                    % (_at(path, text, m.start()), name, nat[1]))
-            if pack:
-                packed = _layout(name, table, pack)
-                if packed[0] != nat[0] or packed[2] != nat[2]:
-                    moved = ["`%s` at %d instead of %d" % (f, po, no)
-                             for (f, no), (_, po) in zip(nat[2], packed[2])
-                             if po != no]
-                    what = (", ".join(moved) if moved else
-                            "size %d instead of %d" % (packed[0], nat[0]))
-                    raise CsError(
-                        "%s`Pack = %d` on `%s` would change its layout "
-                        "(%s). Not every compiler Crust uses honours "
-                        "`#pragma pack`, so the lowered struct cannot "
-                        "promise the packed layout, and silently giving it "
-                        "a different one would change its bytes. Order the "
-                        "fields largest-first so there is no padding to "
-                        "remove, or split a wide field into `byte`s."
-                        % (_at(path, text, m.start()), pack, name, what))
-            if want is not None and want != 0 and want != nat[0]:
+                    "%s`[StructLayout]` on `%s` fixes its layout, and "
+                    "packing a field that is not plain data would misalign "
+                    "an owner the generated code works through by address: "
+                    "%s. Keep `Pack` to structs of primitives, enums and "
+                    "other such structs." % (at, name, nat[1]))
+            packed = _layout(name, table, pack) if pack else nat
+            if want is not None and want != 0 and want != packed[0]:
                 raise CsError(
-                    "%s`Size = %d` on `%s` differs from its field size (%d). "
-                    "Add an explicit padding field instead."
-                    % (_at(path, text, m.start()), want, name, nat[0]))
-        out.append(text[pos:m.start()])
-        out.append(" " * (m.end() - m.start()))
-        pos = m.end()
-    out.append(text[pos:])
-    text = "".join(out)
+                    "%s`Size = %d` on `%s` differs from its field size "
+                    "(%d). Add an explicit padding field instead."
+                    % (at, want, name, packed[0]))
+        repl = " " * (m.end() - m.start())
+        if pack and (packed[0] != nat[0] or packed[2] != nat[2]):
+            brace = scan.index("{", target.end())
+            close = cpprust._match_brace(scan, brace)
+            outer = [t for t in types if t[3] < target.start() < t[4]]
+            if outer:
+                raise CsError(
+                    "%s`Pack = %d` on `%s`, which is nested in `%s`. A "
+                    "packed struct is emitted with `#pragma pack` around it, "
+                    "and the C++ half moves nested types out of their class "
+                    "-- leaving the pragmas behind. Declare `%s` outside "
+                    "the class." % (at, pack, name, outer[0][1], name))
+            repl = '_Pragma("pack(push, %d)")' % pack
+            semi = re.match(r"[ \t]*;", scan[close + 1:])
+            if semi:
+                pop_at, pop = close + 1 + semi.end(), ' _Pragma("pack(pop)")'
+            else:
+                pop_at, pop = close + 1, '; _Pragma("pack(pop)")'
+            edits.append((pop_at, pop_at, pop))
+        edits.append((m.start(), m.end(), repl))
+    for start, end, repl in sorted(edits, reverse=True):
+        text = text[:start] + repl + text[end:]
     left = re.search(r"(?<![\w])StructLayout(?![\w])", _blank(text))
     if left:
         raise CsError("%s`[StructLayout(..)]` is only read in its own "
