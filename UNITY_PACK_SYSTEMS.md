@@ -395,6 +395,42 @@ known builtins (`SpriteRenderer`, RB, uGUI, …) only — unknown `T` → CS0246
 Pack / crust / cpprust failures report as Unity/csc diagnostics
 (`Assets/…(line,col): error CSxxxx: …`), not raw `engine.cpp` subset prose.
 
+## Startup scene (EditorBuildSettings)
+
+Pack loads **only the first enabled** scene in
+`ProjectSettings/EditorBuildSettings.asset`. Other enabled scenes are not
+merged into the startup world (no invent of `SceneManager.LoadScene` yet).
+Scenes absent from build settings (and disabled build entries) are not
+packed — vendor demo `.unity` files under `Assets/` stay out.
+
+When `EditorBuildSettings.asset` is missing (tiny fixtures), every `.unity`
+under `Assets/` is used.
+
+Full script analyze is limited to project `.cs` files referenced by
+startup-scene / source-prefab `m_Script` guids (and joined `object["script"]`
+paths). When UI / stripped PrefabInstances leave `script` unset, that YAML
+scan still applies — the packer does **not** fall back to every Assets
+script (which would full-analyze unused vendor code such as Destructible2D
+`Stack<T>`).
+
+Authored GameObject `m_IsActive` seeds `_engine_go_active` (activeSelf);
+inactive objects stay out of draws / `FindObjectOfType` until `SetActive`.
+GO table slots are unique per authored fileID / Transform (display names may
+repeat — UI trees reuse `Text`, `Sliding Area`, …). Parent and activeSelf
+tables key by `go_index` so an inactive menu (e.g. Settings Menu) still hides
+its children when a deactivated Player subtree shares those names.
+
+Stripped `PrefabInstance` Transforms (no scene `m_Component` join) are still
+registered in the hierarchy when referenced as `m_Father`, so button labels
+parented under prefab roots inherit inactive layout groups. PrefabInstance
+roots with authored `m_Sprite` overrides become drawable Image objects (UI
+Button prefabs). Canvas sorting walks hierarchy past those stripped roots so
+labels share the Canvas `sorting_layer_id` (otherwise the Main Menu Image can
+paint over them).
+
+The GLES host uploads up to 256 packed textures / draw sprites per frame
+(`MAX_TEX` / `MAX_DRAWS` in `gles2_window.c`).
+
 ## Incremental pack
 
 `pack()` writes `outdir/.unity_pack_stamp.json` with an input fingerprint,

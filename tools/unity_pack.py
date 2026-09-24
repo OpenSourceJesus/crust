@@ -8528,6 +8528,11 @@ def emit_engine(plan, analyses, used_apis):
         p("extern float Camera_main_pos_y;")
         p("extern float Camera_main_pos_z;")
         p("extern float Camera_main_orthographicSize;")
+        p("extern float Camera_main_aspect;")
+        p("extern float Camera_main_rect_x;")
+        p("extern float Camera_main_rect_y;")
+        p("extern float Camera_main_rect_w;")
+        p("extern float Camera_main_rect_h;")
         p("extern float Camera_main_nearClipPlane;")
         p("extern float Camera_main_farClipPlane;")
         p("extern float Camera_main_background_r;")
@@ -10172,8 +10177,23 @@ def emit_engine(plan, analyses, used_apis):
             p("    sh = (float)Screen_height;")
             p("    if (sw < 1.f) sw = 1.f;")
             p("    if (sh < 1.f) sh = 1.f;")
-            p("    px = engine_pointer_x;")
-            p("    py = engine_pointer_y;")
+            # UI bake / hits are relative to Camera.rect pixel rect (HandleViewSize).
+            if plan.get("camera"):
+                p("    {")
+                p("        float vx = Camera_main_rect_x * sw;")
+                p("        float vy = Camera_main_rect_y * sh;")
+                p("        float vw = Camera_main_rect_w * sw;")
+                p("        float vh = Camera_main_rect_h * sh;")
+                p("        if (vw < 1.f) vw = 1.f;")
+                p("        if (vh < 1.f) vh = 1.f;")
+                p("        sw = vw;")
+                p("        sh = vh;")
+                p("        px = engine_pointer_x - vx;")
+                p("        py = engine_pointer_y - vy;")
+                p("    }")
+            else:
+                p("    px = engine_pointer_x;")
+                p("    py = engine_pointer_y;")
             p("    hit = -1;")
             if ui_buttons:
                 p("    for (i = 0; i < _engine_ui_button_count; i = i + 1) {")
@@ -12506,12 +12526,16 @@ def emit_engine(plan, analyses, used_apis):
 
         if any_ui:
             p("            if (_spr_ui[k]) {")
-            p("                float sw = (float)Screen_width;")
-            p("                float sh = (float)Screen_height;")
             p("                float aspect, world_h, world_w;")
-            p("                if (sw < 1.f) sw = 1.f;")
-            p("                if (sh < 1.f) sh = 1.f;")
-            p("                aspect = sw / sh;")
+            if plan.get("camera"):
+                p("                aspect = Camera_main_aspect;")
+                p("                if (aspect < 1e-6f) aspect = 1.f;")
+            else:
+                p("                float sw = (float)Screen_width;")
+                p("                float sh = (float)Screen_height;")
+                p("                if (sw < 1.f) sw = 1.f;")
+                p("                if (sh < 1.f) sh = 1.f;")
+                p("                aspect = sw / sh;")
             p("                world_h = 2.f * Camera_main_orthographicSize;")
             p("                world_w = world_h * aspect;")
             p("                out[n].x = Camera_main_pos_x")
@@ -14611,6 +14635,17 @@ def emit_data(plan, used_apis=None):
         p("float Camera_main_pos_z = %sf;" % repr(float(cam["pos"][2])))
         p("float Camera_main_orthographicSize = %sf;" % repr(
             float(cam["orthographic_size"])))
+        aspect = plan.get("camera_aspect")
+        if aspect is None:
+            sw = max(1, int(plan.get("screen_width") or 1024))
+            sh = max(1, int(plan.get("screen_height") or 768))
+            aspect = float(sw) / float(sh)
+        p("float Camera_main_aspect = %sf;" % repr(float(aspect)))
+        rect = plan.get("camera_rect") or (0.0, 0.0, 1.0, 1.0)
+        p("float Camera_main_rect_x = %sf;" % repr(float(rect[0])))
+        p("float Camera_main_rect_y = %sf;" % repr(float(rect[1])))
+        p("float Camera_main_rect_w = %sf;" % repr(float(rect[2])))
+        p("float Camera_main_rect_h = %sf;" % repr(float(rect[3])))
         p("float Camera_main_nearClipPlane = %sf;" % repr(
             float(cam.get("near_clip", 0.3))))
         p("float Camera_main_farClipPlane = %sf;" % repr(
@@ -16391,7 +16426,8 @@ def pack(root, outdir, soa=False, soa_vec4=False, force=False, strict=False,
     plan["screen_fullscreen"] = sfs
     plan["screen_fullscreen_native"] = snative
     plan["screen_maximized"] = smax
-    go_names, go_comps, go_active = _build_go_tables(plan)
+    _seed_camera_script_view(plan, objects)
+    go_names, go_comps = _build_go_tables(plan)
     ui_gc = set()
     for a in analyses:
         ui_gc |= set(a.get("getcomponent_types") or [])
