@@ -92,8 +92,13 @@ pub fn owned_by(owners: &[usize], who: usize) -> usize {
 
 // The index of the region `who` owns that holds `addr`, or `bases.len()`.
 // The witness, not a yes or no: a proof about which region was found cannot
-// be written against a Bool.  `region_of` is the decision.
+// be written against a Bool.  `region_of` is the decision.  The second
+// contract is RosettaMath's `region_index_found`: an index it returns is one
+// it vouches for -- owned by `who`, and holding `addr`.
 #[ensures(result <= bases.len())]
+#[ensures(result == bases.len()
+          || (owners[result] == who && bases[result] <= addr
+              && addr - bases[result] < sizes[result]))]
 pub fn region_index(bases: &[u64], sizes: &[u64], owners: &[usize], who: usize,
                     addr: u64) -> usize {
     if sizes.len() < bases.len() {
