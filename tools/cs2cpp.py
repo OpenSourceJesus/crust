@@ -759,6 +759,86 @@ def _sub_orig(pat, fn, text):
     return cpprust._sub_code(pat, repl, text)
 
 
+class _CodeMatch(object):
+    """A match on the blanked scan, answering with the original's text."""
+
+    def __init__(self, m, text):
+        self._m = m
+        self._text = text
+        self.re = m.re
+        self.pos = m.pos
+        self.endpos = m.endpos
+        self.lastindex = m.lastindex
+        self.lastgroup = m.lastgroup
+
+    def _one(self, i):
+        start, end = self._m.span(i)
+        return None if start < 0 else self._text[start:end]
+
+    def group(self, *idx):
+        if not idx:
+            return self._one(0)
+        vals = [self._one(i) for i in idx]
+        return vals[0] if len(vals) == 1 else tuple(vals)
+
+    def __getitem__(self, i):
+        return self._one(i)
+
+    def groups(self, default=None):
+        return tuple(default if v is None else v
+                     for v in (self._one(i)
+                               for i in range(1, self._m.re.groups + 1)))
+
+    def groupdict(self, default=None):
+        return dict((k, default if self._one(k) is None else self._one(k))
+                    for k in self._m.re.groupindex)
+
+    def start(self, i=0):
+        return self._m.start(i)
+
+    def end(self, i=0):
+        return self._m.end(i)
+
+    def span(self, i=0):
+        return self._m.span(i)
+
+    def expand(self, template):
+        def one(t):
+            if t.group(1) is not None:
+                key = t.group(1)
+                v = self._one(int(key) if key.isdigit() else key)
+                return v or ""
+            if t.group(2) is not None:
+                return self._one(int(t.group(2))) or ""
+            return {"n": "\n", "t": "\t", "\\": "\\", "r": "\r"}.get(
+                t.group(3), "\\" + t.group(3))
+        return re.sub(r"\\g<(\w+)>|\\(\d{1,2})|\\(.)", one, template)
+
+
+def code_sub(pattern, repl, string, count=0, flags=0):
+    r"""`re.sub`, matching only real code -- not string or comment bodies.
+
+    A drop-in for a rewrite that should never touch what a program prints
+    or what a comment says: the pattern is matched on a copy with string,
+    character and comment bodies blanked (the same length, so offsets carry
+    over), and the replacement -- a template with `\1` / `\g<name>`, or a
+    callable -- sees the original text's groups. A rewrite that reads a
+    literal's contents (`GameObject.Find("Enemy")`) still gets them.
+    """
+    scan = _blank(string)
+    out, pos, n = [], 0, 0
+    for m in re.finditer(pattern, scan, flags):
+        if count and n >= count:
+            break
+        cm = _CodeMatch(m, string)
+        out.append(string[pos:m.start()])
+        out.append(repl(cm) if callable(repl) else cm.expand(repl))
+        pos = m.end()
+        n += 1
+    out.append(string[pos:])
+    return "".join(out)
+
+
 _GENERIC_NS = r"(?:System\.Collections\.Generic\.)?"
 _MAP_KW = r"(?:Dictionary|SortedList)"
 
@@ -1187,6 +1267,115 @@ def lower_bindings(text, bindings):
             text = cpprust._sub_code(pat + r"(?![\w])",
                                      lambda m, c=b.c: c, text)
     return text
+
+
+#: The C++ subset's own container and string members: `recv.size()` in a
+#: lowered body is C++, not a C# member left behind.
+_CXX_MEMBERS = ("size|push_back|pop_back|clear|empty|begin|end|insert|erase|"
+                "find|count|at|resize|reserve|data|front|back|append|"
+                "c_str|length|substr|compare")
+
+
+def residual_csharp(text, model, known_types=(), value_ctors=()):
+    """What C# is left in a lowered body, as (what, text), or None.
+
+    unity_pack lowers a script method with its own Unity rewrites on top of
+    this file's families; whatever C# neither touched is here, and the
+    method becomes a reported stub (a warning, or an error under strict).
+    These are the language's questions -- is there an array type, a generic
+    call, a lambda, a call or member access or typed local nothing lowered
+    -- and the engine only supplies what counts as its own C: `known_types`
+    (C types its engine declares: `ByteArray b = ..`, `m.m00` of a
+    `Matrix4x4` local), `value_ctors` (value types kept as constructor calls,
+    `Vector2Int(..)`), and the model's instance accessor (`Other_AT(i).hp`).
+
+    Matched with strings and comments blanked; the text reported is the
+    original's.
+    """
+    raw = text
+    body = _blank(text)
+    seen = []
+
+    def rec(pattern):
+        m = re.search(pattern, body)
+        if m:
+            seen.append(raw[m.start():m.end()])
+        return m
+
+    def found(what):
+        return (what, seen[-1] if seen else "")
+
+    known_types = set(known_types)
+    if rec(r"(?<![\w.])\w+\s*\[\s*\]\s*\w+"):
+        return found("C# array locals / fields left after rewrite: "
+                     "`Renderer[] renderers`.")
+    if rec(r"\w+\s*<\s*\w+\s*>\s*\("):
+        return found("Leftover generics not rewritten to C helpers.")
+    if "=>" in body:
+        at = body.index("=>")
+        lo = raw.rfind("\n", 0, at) + 1
+        hi = raw.find("\n", at)
+        seen.append(raw[lo:hi if hi >= 0 else len(raw)].strip())
+        return found("C# lambda / expression-bodied leftovers (Action, LINQ, "
+                     "etc.).")
+    ctors = "|".join(re.escape(c) for c in value_ctors) or r"(?!)"
+    if rec(r"(?<![\w.])(?!(?:%s)\b)[A-Z][a-zA-Z0-9]*\s*\(" % ctors):
+        return found("Bare C# instance/static method call not rewritten: "
+                     "`End()` (no `_`). Allow value-type ctors kept as "
+                     "`Vector2Int(` / `Color(`.")
+    if rec(r"(?<![\w_])[A-Z][a-zA-Z0-9]*\.[A-Z][a-zA-Z0-9]*\s*\("):
+        return found("Unlowered static call: `EventManager.AddEvent(...)` "
+                     "(Pascal Type.Method). Not `P_equipped.push_back` "
+                     "(underscored C ident).")
+    if rec(r"(?<![\w_])[A-Z][a-zA-Z0-9]*\.[a-z]\w*\b"):
+        return found("Unlowered static field: `Vector3.zero` / `Random.value`.")
+    # A member of a call's result -- unless the call is the model's
+    # instance accessor, `Other_AT(idx).field`: C, the struct in its slot.
+    at_suffix = None
+    if model.at:
+        at_suffix = model.at.split("{cls}", 1)[1].split("(", 1)[0]
+    for cm in re.finditer(r"\)\s*\.\s*[A-Za-z_]", body):
+        depth, j = 0, cm.start()
+        while j >= 0:
+            if body[j] == ")":
+                depth += 1
+            elif body[j] == "(":
+                depth -= 1
+                if depth == 0:
+                    break
+            j -= 1
+        if at_suffix and re.search(r"(?<![\w])[A-Za-z_]\w*%s\s*$"
+                                   % re.escape(at_suffix), body[:max(j, 0)]):
+            continue
+        seen.append(raw[cm.start():cm.end()])
+        return found("Chained call/property on a call result: "
+                     "`AudioManager_Instance().MakeSoundEffect`.")
+    # A local of a reference type -- not one of the engine's own C types.
+    for tm in re.finditer(
+            r"(?<![\w.])[A-Z]\w*(?:\s*\.\s*[A-Z]\w*)*\s+[a-z_]\w*\s*=", body):
+        if re.match(r"[A-Z]\w*", tm.group(0)).group(0) in known_types:
+            continue
+        seen.append(raw[tm.start():tm.end()])
+        return found("C# typed local of a reference type: "
+                     "`SoundEffect soundEffect =`.")
+    # Member access that is neither the C++ subset's container API nor a
+    # field of a local of an engine type (`Matrix4x4 l2w; l2w.m00`).
+    engine_locals = set(re.findall(
+        r"(?<![\w.])(?:%s)\s+([A-Za-z_]\w*)\s*[=;]"
+        % "|".join(re.escape(t) for t in sorted(known_types)), body)
+    ) if known_types else set()
+    for mm in re.finditer(
+            r"(?<![:\w])\b([A-Za-z_]\w*)\.(?!(?:%s)\b)[A-Za-z_]\w*"
+            % _CXX_MEMBERS, body):
+        if mm.group(1) in engine_locals:
+            continue
+        seen.append(raw[mm.start():mm.end()])
+        return found("Leftover C# / Unity member access (allow std::vector / "
+                     "string APIs).")
+    if rec(r"(?<!_)\w+\.(?:Length|Count)\b"):
+        return found("C# `Length` / `Count` left on a receiver nothing "
+                     "lowered.")
+    return None
 
 
 def _lower_null_compares(text, value):

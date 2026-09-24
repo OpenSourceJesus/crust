@@ -5056,7 +5056,7 @@ def _rewrite_audiosource_api(text, cl, add_locals=None):
             return m.group(0)
         return "_AudioSource_owner_go[%s]" % recv
 
-    text = re.sub(
+    text = cs2cpp.code_sub(
         r"(?<![.\w])(\w+)\s*\.\s*gameObject\b",
         repl_go, text)
 
@@ -5079,7 +5079,7 @@ def _rewrite_audiosource_api(text, cl, add_locals=None):
             val = "(%s) ? 1 : 0" % rhs
         return "_AudioSource_%s[%s] = %s;" % (field, recv, val)
 
-    text = re.sub(
+    text = cs2cpp.code_sub(
         r"(?<![.\w])(\w+)\s*\.\s*(playOnAwake|loop|mute)\s*=\s*([^;]+);",
         repl_bool, text)
 
@@ -5089,7 +5089,7 @@ def _rewrite_audiosource_api(text, cl, add_locals=None):
             return m.group(0)
         return "_AudioSource_%s[%s] = %s;" % (prop, recv, rhs)
 
-    text = re.sub(
+    text = cs2cpp.code_sub(
         r"(?<![.\w])(\w+)\s*\.\s*(volume|pitch)\s*=\s*([^;]+);",
         repl_float, text)
 
@@ -5101,7 +5101,7 @@ def _rewrite_audiosource_api(text, cl, add_locals=None):
             rhs = "-1"
         return "_AudioSource_clip[%s] = %s;" % (recv, rhs)
 
-    text = re.sub(
+    text = cs2cpp.code_sub(
         r"(?<![.\w])(\w+)\s*\.\s*clip\s*=\s*([^;]+);",
         repl_clip, text)
 
@@ -5111,7 +5111,7 @@ def _rewrite_audiosource_api(text, cl, add_locals=None):
             return m.group(0)
         return "AudioSource_%s(%s)" % (meth, recv)
 
-    text = re.sub(
+    text = cs2cpp.code_sub(
         r"(?<![.\w])(\w+)\s*\.\s*(Play|Stop)\s*\(\s*\)",
         repl_call, text)
 
@@ -5122,7 +5122,7 @@ def _rewrite_audiosource_api(text, cl, add_locals=None):
             return m.group(0)
         return "_AudioSource_%s[%s]" % (prop, recv)
 
-    text = re.sub(
+    text = cs2cpp.code_sub(
         r"(?<![.\w])(\w+)\s*\.\s*(volume|pitch)\b",
         repl_read_float, text)
 
@@ -5133,7 +5133,7 @@ def _rewrite_audiosource_api(text, cl, add_locals=None):
         field = bool_map[prop]
         return "_AudioSource_%s[%s]" % (field, recv)
 
-    text = re.sub(
+    text = cs2cpp.code_sub(
         r"(?<![.\w])(\w+)\s*\.\s*(playOnAwake|loop|mute)\b",
         repl_read_bool, text)
 
@@ -5143,7 +5143,7 @@ def _rewrite_audiosource_api(text, cl, add_locals=None):
             return m.group(0)
         return "_AudioSource_clip[%s]" % recv
 
-    text = re.sub(
+    text = cs2cpp.code_sub(
         r"(?<![.\w])(\w+)\s*\.\s*clip\b",
         repl_read_clip, text)
     return text
@@ -5365,7 +5365,7 @@ def _rewrite_getcomponentsinchildren(text, plan, this_class):
         vector_names.add("%s_%s" % (_c_ident(this_class), f["name"]))
     vector_names |= set(re.findall(r"\bstd::vector<int>\s+(\w+)\b", text))
     for name in sorted(vector_names, key=len, reverse=True):
-        text = re.sub(
+        text = cs2cpp.code_sub(
             r"(?<![.\w])%s\.Length\b" % re.escape(name),
             "%s.size()" % name, text)
     # T elem = vec[i] → int elem = vec[i]
@@ -5374,7 +5374,7 @@ def _rewrite_getcomponentsinchildren(text, plan, this_class):
     elem_tys |= set(classes) | set(_ADDABLE_BUILTINS) | set(
         _PHYSICS_COMPONENTS) | set(_UI_GETCOMPONENT_TYPES)
     for ty in sorted(elem_tys, key=len, reverse=True):
-        text = re.sub(
+        text = cs2cpp.code_sub(
             r"(?<![\w.])(?:UnityEngine\.)?%s\s+(\w+)\s*=" % re.escape(ty),
             r"int \1 =",
             text)
@@ -5414,7 +5414,7 @@ def _rewrite_addcomponent(text, plan, this_class):
         return "int %s = GameObject_AddComponent_%s(%s)" % (
             var, _c_ident(comp), _go_of_recv(recv))
 
-    text = re.sub(
+    text = cs2cpp.code_sub(
         r"(?:(?:UnityEngine\.)?\w+)\s+(\w+)\s*=\s*"
         r"(\w+)\s*\.\s*gameObject\s*\.\s*AddComponent\s*<\s*"
         r"(?:UnityEngine\.)?(\w+)\s*>\s*\(\s*\)",
@@ -5425,7 +5425,7 @@ def _rewrite_addcomponent(text, plan, this_class):
         return "GameObject_AddComponent_%s(%s)" % (
             _c_ident(comp), _go_of_recv(recv))
 
-    text = re.sub(
+    text = cs2cpp.code_sub(
         r"(\w+)\s*\.\s*gameObject\s*\.\s*AddComponent\s*<\s*"
         r"(?:UnityEngine\.)?(\w+)\s*>\s*\(\s*\)",
         repl_bare_go, text)
@@ -5437,7 +5437,7 @@ def _rewrite_addcomponent(text, plan, this_class):
             var, _c_ident(comp), go_expr)
 
     # Camera cam = gameObject.AddComponent<Camera>();
-    text = re.sub(
+    text = cs2cpp.code_sub(
         r"(?:(?:UnityEngine\.)?\w+)\s+(\w+)\s*=\s*"
         r"(?:(?:this|gameObject)\s*\.\s*)?AddComponent\s*<\s*"
         r"(?:UnityEngine\.)?(\w+)\s*>\s*\(\s*\)",
@@ -5447,7 +5447,7 @@ def _rewrite_addcomponent(text, plan, this_class):
         return "GameObject_AddComponent_%s(%s)" % (
             _c_ident(m.group(1)), go_expr)
 
-    text = re.sub(
+    text = cs2cpp.code_sub(
         r"(?:(?:this|gameObject)\s*\.\s*)?AddComponent\s*<\s*"
         r"(?:UnityEngine\.)?(\w+)\s*>\s*\(\s*\)",
         repl_bare, text)
@@ -6084,13 +6084,13 @@ def _rewrite_extensions_set_world_scale(text, cl, plan):
             i = after
             continue
         for vf in vec2_fields:
-            sx = re.sub(r"(?<![_\w])%s\.x\b" % vf,
+            sx = cs2cpp.code_sub(r"(?<![_\w])%s\.x\b" % vf,
                         "%s_get_%s_x(i)" % (idn, vf), sx)
-            sx = re.sub(r"(?<![_\w])%s\.y\b" % vf,
+            sx = cs2cpp.code_sub(r"(?<![_\w])%s\.y\b" % vf,
                         "%s_get_%s_y(i)" % (idn, vf), sx)
-            sz = re.sub(r"(?<![_\w])%s\.x\b" % vf,
+            sz = cs2cpp.code_sub(r"(?<![_\w])%s\.x\b" % vf,
                         "%s_get_%s_x(i)" % (idn, vf), sz)
-            sz = re.sub(r"(?<![_\w])%s\.y\b" % vf,
+            sz = cs2cpp.code_sub(r"(?<![_\w])%s\.y\b" % vf,
                         "%s_get_%s_y(i)" % (idn, vf), sz)
         out.append(
             "_engine_set_world_scale("
@@ -6143,12 +6143,12 @@ def _rewrite_rigidbody_assigns(text, plan, this_class):
             % (go_this, args[0], args[1], args[2])
         )
 
-    text = re.sub(
+    text = cs2cpp.code_sub(
         r"(?:this\s*\.\s*)?GetComponent\s*<\s*(?:UnityEngine\.)?Rigidbody2D\s*>"
         r"\s*\(\s*\)\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
         r"new\s+Vector2\s*\((.*?)\)\s*;",
         repl_2d_new, text, flags=re.S)
-    text = re.sub(
+    text = cs2cpp.code_sub(
         r"(?:this\s*\.\s*)?GetComponent\s*<\s*(?:UnityEngine\.)?Rigidbody\s*>"
         r"\s*\(\s*\)\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
         r"new\s+Vector3\s*\((.*?)\)\s*;",
@@ -6168,13 +6168,13 @@ def _rewrite_rigidbody_assigns(text, plan, this_class):
             % (go_this, m.group(1).strip())
         )
 
-    text = re.sub(
+    text = cs2cpp.code_sub(
         r"(?:this\s*\.\s*)?GetComponent\s*<\s*(?:UnityEngine\.)?Rigidbody2D\s*>"
         r"\s*\(\s*\)\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
         r"(?:this\s*\.\s*)?GetComponent\s*<\s*(?:UnityEngine\.)?Rigidbody2D\s*>"
         r"\s*\(\s*\)\s*\.\s*(?:linearVelocity|velocity)\s*\.\s*SetX\s*\((.*?)\)\s*;",
         repl_2d_setx, text, flags=re.S)
-    text = re.sub(
+    text = cs2cpp.code_sub(
         r"(?:this\s*\.\s*)?GetComponent\s*<\s*(?:UnityEngine\.)?Rigidbody2D\s*>"
         r"\s*\(\s*\)\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
         r"(?:this\s*\.\s*)?GetComponent\s*<\s*(?:UnityEngine\.)?Rigidbody2D\s*>"
@@ -6191,7 +6191,7 @@ def _rewrite_rigidbody_assigns(text, plan, this_class):
         return _repl
 
     for axis in ("X", "Y", "Z"):
-        text = re.sub(
+        text = cs2cpp.code_sub(
             r"(?:this\s*\.\s*)?GetComponent\s*<\s*(?:UnityEngine\.)?Rigidbody\s*>"
             r"\s*\(\s*\)\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
             r"(?:this\s*\.\s*)?GetComponent\s*<\s*(?:UnityEngine\.)?Rigidbody\s*>"
@@ -6232,19 +6232,19 @@ def _rewrite_rigidbody_assigns(text, plan, this_class):
                 return m.group(0)
             return _set_xy(args[0], args[1], gr)
 
-        text = re.sub(
+        text = cs2cpp.code_sub(
             r"(?<![_\w])%s\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
             r"(?:this\s*\.\s*)?%s\s*\.\s*(?:linearVelocity|velocity)\s*"
             r"\.\s*SetX\s*\((.*?)\)\s*;"
             % (re.escape(fname), re.escape(fname)),
             repl_setx, text, flags=re.S)
-        text = re.sub(
+        text = cs2cpp.code_sub(
             r"(?<![_\w])%s\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
             r"(?:this\s*\.\s*)?%s\s*\.\s*(?:linearVelocity|velocity)\s*"
             r"\.\s*SetY\s*\((.*?)\)\s*;"
             % (re.escape(fname), re.escape(fname)),
             repl_sety, text, flags=re.S)
-        text = re.sub(
+        text = cs2cpp.code_sub(
             r"(?<![_\w])%s\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
             r"new\s+Vector2\s*\((.*?)\)\s*;" % re.escape(fname),
             repl_new2, text, flags=re.S)
@@ -6272,14 +6272,14 @@ def _rewrite_rigidbody_assigns(text, plan, this_class):
             )
 
         for axis in ("X", "Y", "Z"):
-            text = re.sub(
+            text = cs2cpp.code_sub(
                 r"(?<![_\w])%s\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
                 r"(?:this\s*\.\s*)?%s\s*\.\s*(?:linearVelocity|velocity)\s*"
                 r"\.\s*Set%s\s*\((.*?)\)\s*;"
                 % (re.escape(fname), re.escape(fname), axis),
                 lambda m, ax=axis.lower(): _axis_set(ax, m),
                 text, flags=re.S)
-        text = re.sub(
+        text = cs2cpp.code_sub(
             r"(?<![_\w])%s\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
             r"new\s+Vector3\s*\((.*?)\)\s*;" % re.escape(fname),
             repl_new3, text, flags=re.S)
@@ -7108,7 +7108,7 @@ def _rewrite_mb_static_and_singleton(text, plan, cl):
             plan.get("findobject_types") or ())
         # Other.Instance.field / Other.instance.field
         for vf in ocl.get("vec2_fields") or []:
-            text = re.sub(
+            text = cs2cpp.code_sub(
                 r"(?<![\w.])%s\s*\.\s*(?:Instance|instance)\s*\.\s*%s\b"
                 % (re.escape(ocname), re.escape(vf)),
                 "Vector2_make(%s_get_%s_x(%s), %s_get_%s_y(%s))"
@@ -7120,20 +7120,20 @@ def _rewrite_mb_static_and_singleton(text, plan, cl):
                 continue
             if mem.startswith("pos_"):
                 continue
-            text = re.sub(
+            text = cs2cpp.code_sub(
                 r"(?<![\w.])%s\s*\.\s*(?:Instance|instance)\s*\.\s*%s\b"
                 % (re.escape(ocname), re.escape(mem)),
                 "%s_get_%s(%s)" % (oidn, mem, inst),
                 text)
         for f in ocl.get("ref_array_fields") or []:
             fname = f["name"]
-            text = re.sub(
+            text = cs2cpp.code_sub(
                 r"(?<![\w.])%s\s*\.\s*(?:Instance|instance)\s*\.\s*%s\b"
                 % (re.escape(ocname), re.escape(fname)),
                 "%s_%s" % (oidn, fname),
                 text)
             if ocname == this:
-                text = re.sub(
+                text = cs2cpp.code_sub(
                     r"(?<![\w.])%s\b" % re.escape(fname),
                     "%s_%s" % (oidn, fname),
                     text)
@@ -7141,7 +7141,7 @@ def _rewrite_mb_static_and_singleton(text, plan, cl):
         # (known .field patterns already rewritten above). Always emit the
         # live finder call; do not leave `Type.instance.` for crust.
         if use_inst or ocname in (plan.get("classes") or {}):
-            text = re.sub(
+            text = cs2cpp.code_sub(
                 r"(?<![\w.])%s\s*\.\s*(?:Instance|instance)\b"
                 % re.escape(ocname),
                 inst, text)
@@ -7151,15 +7151,15 @@ def _rewrite_mb_static_and_singleton(text, plan, cl):
         if tname not in (plan.get("classes") or {}):
             continue
         oidn = _c_ident(tname)
-        text = re.sub(
+        text = cs2cpp.code_sub(
             r"(?:UnityEngine\.)?(?:Object\.)?FindObjectOfType\s*<\s*%s\s*>"
             r"\s*\(\s*\)" % re.escape(tname),
             "Object_FindObjectOfType_%s(0)" % oidn, text)
-        text = re.sub(
+        text = cs2cpp.code_sub(
             r"(?:UnityEngine\.)?(?:Object\.)?FindObjectOfType\s*<\s*%s\s*>"
             r"\s*\(\s*true\s*\)" % re.escape(tname),
             "Object_FindObjectOfType_%s(1)" % oidn, text)
-        text = re.sub(
+        text = cs2cpp.code_sub(
             r"(?:UnityEngine\.)?(?:Object\.)?FindObjectOfType\s*<\s*%s\s*>"
             r"\s*\(\s*false\s*\)" % re.escape(tname),
             "Object_FindObjectOfType_%s(0)" % oidn, text)
@@ -7169,12 +7169,12 @@ def _rewrite_mb_static_and_singleton(text, plan, cl):
             if not m.get("static"):
                 continue
             mname = m["name"]
-            text = re.sub(
+            text = cs2cpp.code_sub(
                 r"(?<![\w.])%s\s*\.\s*%s\s*\(" % (
                     re.escape(ocname), re.escape(mname)),
                 "%s_%s(" % (oidn, mname), text)
             if ocname == this:
-                text = re.sub(
+                text = cs2cpp.code_sub(
                     r"(?<![\w.])%s\s*\(" % re.escape(mname),
                     "%s_%s(" % (oidn, mname), text)
     return text
@@ -7190,19 +7190,19 @@ def _rewrite_toggle_is_on(text):
     """
     # Allow calls inside the index (IndexOf(x)) but not `;` / newlines / `]`.
     idx = r"([^\]\n;]*)"
-    text = re.sub(
+    text = cs2cpp.code_sub(
         r"(\w+)\s*\[%s\]\s*\.\s*isOn\s*=\s*([^;]+);" % idx,
         r"Toggle_set_isOn(\1[\2], (\3));",
         text)
-    text = re.sub(
+    text = cs2cpp.code_sub(
         r"(?<![\w.])(\w+)\s*\.\s*isOn\s*=\s*([^;]+);",
         r"Toggle_set_isOn(\1, (\2));",
         text)
-    text = re.sub(
+    text = cs2cpp.code_sub(
         r"(\w+)\s*\[%s\]\s*\.\s*isOn\b" % idx,
         r"Toggle_get_isOn(\1[\2])",
         text)
-    text = re.sub(
+    text = cs2cpp.code_sub(
         r"(?<![\w.])(\w+)\s*\.\s*isOn\b",
         r"Toggle_get_isOn(\1)",
         text)
@@ -7255,139 +7255,46 @@ def _engine_types_declared(lines):
 
 def _unlowered_csharp(body, args_str=None, emitted_params=None,
                       known_types=()):
-    """What C# is left in *body* that the C subset cannot parse, or None.
+    """What is left in a lowered body that the C subset cannot take, or None.
 
-    Returns (what, text): the check that fired -- its own comment -- and the
-    source text it matched, for the diagnostic `emit_engine` reports when it
-    stubs the method.
+    Returns (what, text): the check that fired and the source text it
+    matched, for the stub diagnostic `emit_engine` reports.
 
-    Methods that still use GetComponents / leftover ``T[]`` locals /
-    ``Type.instances`` / unlowered Instantiate overloads / lambdas /
-    ``Type.Method(`` static calls / ``recv.Method(`` chains / C# typed
-    locals / C# member access / unbound method parameters are emitted as
-    empty stubs instead of failing crust (e.g. ``expected ';' after
-    'SoundEffect'`` / ``undeclared identifier 'cosmetic'``).
+    The Unity questions are asked here -- an `Instantiate` overload or
+    `GetComponents<T>` nothing lowered, a `Type.instances` array, a
+    component's `.gameObject` or `.activeSelf`, a parameter the emitter did
+    not make a C formal. The C# ones -- arrays, generic calls, lambdas,
+    calls, statics, member access, typed locals nothing lowered -- are
+    cs2cpp's (`residual_csharp`), told what is this engine's own C.
     """
-    _seen = []
     if not body or not str(body).strip():
         return None
-    # Matched with string and comment contents blanked (same length): a
-    # lowered body carries string literals -- the script's own path, in a
-    # null-reference message -- and `Objects (Scripts)/Player.cs` inside
-    # one read as an unlowered call, which threw away a method that was
-    # lowered completely. The text reported is the original's.
     raw = body
-    body = cs2cpp._blank(body)
+    scan = cs2cpp._blank(body)
 
-    def _rec(pattern, text, *flags):
-        m = re.search(pattern, text, *flags)
-        if m:
-            _seen.append(raw[m.start():m.end()] if text is body
-                         else m.group(0))
-        return m
+    def unity(pattern, what):
+        m = re.search(pattern, scan)
+        return (what, raw[m.start():m.end()]) if m else None
 
-    # Instantiate(this[, parent]) is rewritten; leftover overloads still stub.
-    if _rec(r"(?<![\w.])(?:Object\.)?Instantiate\s*\(", body):
-        return ('Instantiate(this[, parent]) is rewritten; leftover overloads still stub.', _seen[-1] if _seen else '')
-    # GetComponentsInChildren is rewritten; bare GetComponents (no InChildren) stubs.
-    if _rec(r"GetComponentsInChildren\s*<", body):
-        return ('GetComponentsInChildren is rewritten; bare GetComponents (no InChildren) stubs.', _seen[-1] if _seen else '')
-    if _rec(r"GetComponents\s*<", body):
-        return ('GetComponentsInChildren is rewritten; bare GetComponents (no InChildren) stubs.', _seen[-1] if _seen else '')
-    # C# array locals / fields left after rewrite: ``Renderer[] renderers``.
-    if _rec(r"(?<![\w.])\w+\s*\[\s*\]\s*\w+", body):
-        return ('C# array locals / fields left after rewrite: `Renderer[] renderers`.', _seen[-1] if _seen else '')
-    # Leftover generics not rewritten to C helpers.
-    if _rec(r"\w+\s*<\s*\w+\s*>\s*\(", body):
-        return ('Leftover generics not rewritten to C helpers.', _seen[-1] if _seen else '')
-    # Static array not lowered: ``Cosmetic.instances.Length`` / ``[i]``.
-    if _rec(r"(?<![\w._])[A-Z]\w*\.instances\b", body):
-        return ('Static array not lowered: `Cosmetic.instances.Length` / `[i]`.', _seen[-1] if _seen else '')
-    # C# lambda / expression-bodied leftovers (Action, LINQ, etc.).
-    if "=>" in body:
-        at = body.index("=>")
-        lo = raw.rfind("\n", 0, at) + 1
-        hi = raw.find("\n", at)
-        _seen.append(raw[lo:hi if hi >= 0 else len(raw)].strip())
-        return ('C# lambda / expression-bodied leftovers (Action, LINQ, etc.).', _seen[-1] if _seen else '')
-    # Bare C# instance/static method call not rewritten: ``End()`` (no ``_``).
-    # Allow value-type ctors kept as ``Vector2Int(`` / ``Color(``.
-    _ctor_ok = (
-        r"Vector2Int|Vector3Int|Vector4|Vector3|Vector2|"
-        r"Color|Quaternion|RectInt|Rect|Bounds"
-    )
-    if _rec(
-            r"(?<![\w.])(?!(?:%s)\b)[A-Z][a-zA-Z0-9]*\s*\(" % _ctor_ok,
-            body):
-        return ('Bare C# instance/static method call not rewritten: `End()` (no `_`). Allow value-type ctors kept as `Vector2Int(` / `Color(`.', _seen[-1] if _seen else '')
-    # Unlowered static call: ``EventManager.AddEvent(...)`` (Pascal Type.Method).
-    # Not ``P_equipped.push_back`` (underscored C ident).
-    if _rec(
-            r"(?<![\w_])[A-Z][a-zA-Z0-9]*\.[A-Z][a-zA-Z0-9]*\s*\(",
-            body):
-        return ('Unlowered static call: `EventManager.AddEvent(...)` (Pascal Type.Method). Not `P_equipped.push_back` (underscored C ident).', _seen[-1] if _seen else '')
-    # Unlowered static field: ``Vector3.zero`` / ``Random.value``.
-    if _rec(r"(?<![\w_])[A-Z][a-zA-Z0-9]*\.[a-z]\w*\b", body):
-        return ('Unlowered static field: `Vector3.zero` / `Random.value`.', _seen[-1] if _seen else '')
-    # Chained call/property on a call result: ``AudioManager_Instance().MakeSoundEffect``.
-    # Not the engine's own instance accessor, `Other_AT(idx).field`: a
-    # handle field's member reads through it (`cs2cpp.lower_packed_fields`),
-    # and it is C -- the struct in its slot.
-    for cm in re.finditer(r"\)\s*\.\s*[A-Za-z_]", body):
-        depth, j = 0, cm.start()
-        while j >= 0:
-            if body[j] == ")":
-                depth += 1
-            elif body[j] == "(":
-                depth -= 1
-                if depth == 0:
-                    break
-            j -= 1
-        if re.search(r"(?<![\w])[A-Za-z_]\w*_AT\s*$", body[:max(j, 0)]):
-            continue
-        _seen.append(raw[cm.start():cm.end()])
-        return ('Chained call/property on a call result: `AudioManager_Instance().MakeSoundEffect`.', _seen[-1] if _seen else '')
-    # C# typed local of a reference type: ``SoundEffect soundEffect =``.
-    # Not one of the engine's own C types, which the translator declares
-    # locals of itself -- `byte[]` becomes `ByteArray b = ..` -- and which
-    # this check used to take for leftover C#, stubbing the method.
-    for tm in re.finditer(
-            r"(?<![\w.])[A-Z]\w*(?:\s*\.\s*[A-Z]\w*)*\s+[a-z_]\w*\s*=",
-            body):
-        if re.match(r"[A-Z]\w*", tm.group(0)).group(0) in known_types:
-            continue
-        _seen.append(raw[tm.start():tm.end()])
-        return ('C# typed local of a reference type: `SoundEffect soundEffect =`.', _seen[-1] if _seen else '')
-    # Unity component handle still using ``recv.gameObject``.
-    if _rec(r"\w+\.gameObject\b", body):
-        return ('Unity component handle still using `recv.gameObject`.', _seen[-1] if _seen else '')
-    # Leftover C# / Unity member access (allow std::vector / string APIs).
-    _cxx_mem = (
-        r"size|push_back|pop_back|clear|empty|begin|end|insert|erase|"
-        r"find|count|at|resize|reserve|data|front|back|append|"
-        r"c_str|length|substr|compare"
-    )
-    # A field of a local the body declares with one of the engine's own C
-    # types (`Matrix4x4 l2w = ..; l2w.m00`) is C, not leftover C#; the C
-    # compiler checks the field.
-    engine_locals = set(re.findall(
-        r"(?<![\w.])(?:%s)\s+([A-Za-z_]\w*)\s*[=;]"
-        % "|".join(re.escape(t) for t in sorted(known_types)), body)
-    ) if known_types else set()
-    for mm in re.finditer(
-            r"(?<![:\w])\b([A-Za-z_]\w*)\.(?!(?:%s)\b)[A-Za-z_]\w*" % _cxx_mem,
-            body):
-        if mm.group(1) in engine_locals:
-            continue
-        _seen.append(raw[mm.start():mm.end()])
-        return ('Leftover C# / Unity member access (allow std::vector / string APIs).', _seen[-1] if _seen else '')
-    # C# property / field on a typed local still using ``recv.Name``.
-    if _rec(r"\b\w+\.(?:Length|Count|activeSelf)\b", body):
-        # Allow vector/map helpers already lowered (``foo.size()`` etc.).
-        if _rec(r"(?<!_)\w+\.(?:Length|Count)\b", body):
-            return ('Allow vector/map helpers already lowered (`foo.size()` etc.).', _seen[-1] if _seen else '')
-        if _rec(r"\w+\.activeSelf\b", body):
-            return ('Allow vector/map helpers already lowered (`foo.size()` etc.).', _seen[-1] if _seen else '')
+    for pattern, what in (
+            (r"(?<![\w.])(?:Object\.)?Instantiate\s*\(",
+             "Instantiate(this[, parent]) is rewritten; leftover overloads "
+             "still stub."),
+            (r"GetComponentsInChildren\s*<",
+             "GetComponentsInChildren is rewritten; bare GetComponents (no "
+             "InChildren) stubs."),
+            (r"GetComponents\s*<",
+             "GetComponentsInChildren is rewritten; bare GetComponents (no "
+             "InChildren) stubs."),
+            (r"(?<![\w._])[A-Z]\w*\.instances\b",
+             "Static array not lowered: `Cosmetic.instances.Length` / `[i]`."),
+            (r"\w+\.gameObject\b",
+             "Unity component handle still using `recv.gameObject`."),
+            (r"\w+\.activeSelf\b",
+             "Unity `activeSelf` on a receiver nothing lowered.")):
+        hit = unity(pattern, what)
+        if hit:
+            return hit
     # Instance method C# params not emitted as C formals (only ``i`` / coll).
     emitted = set(emitted_params or ()) | {"i"}
     for part in (args_str or "").split(","):
@@ -7396,19 +7303,22 @@ def _unlowered_csharp(body, args_str=None, emitted_params=None,
             continue
         part = re.sub(r"\b(?:ref|out|in|params)\s+", "", part)
         pm = re.match(r"([\w.<>]+)\s+(\w+)\s*$", part)
-        if not pm:
+        if not pm or pm.group(2) in emitted:
             continue
-        pname = pm.group(2)
-        if pname in emitted:
-            continue
-        if _rec(r"(?<![\w.])%s\b" % re.escape(pname), body):
-            return ('Instance method C# params not emitted as C formals (only `i` / coll).', _seen[-1] if _seen else '')
-    return None
+        hit = unity(r"(?<![\w.])%s\b" % re.escape(pm.group(2)),
+                    "Instance method C# params not emitted as C formals "
+                    "(only `i` / coll).")
+        if hit:
+            return hit
+    return cs2cpp.residual_csharp(body, _PACKED_STRINGS, known_types,
+                                  _UNITY_VALUE_CTORS)
 
 
-# ---------------------------------------------------------------------------
-# Layout plan
-# ---------------------------------------------------------------------------
+#: UnityEngine value types kept in a lowered body as constructor calls.
+_UNITY_VALUE_CTORS = ("Vector2Int", "Vector3Int", "Vector4", "Vector3",
+                      "Vector2", "Color", "Quaternion", "RectInt", "Rect",
+                      "Bounds")
+
 
 def _f16_bits(f):
     """IEEE-754 binary16 bits. Enough for static positions; not a libm."""
@@ -7806,7 +7716,7 @@ def _packed_size(members):
 # ---------------------------------------------------------------------------
 
 def _c_ident(name):
-    return re.sub(r"[^A-Za-z0-9_]", "_", name)
+    return cs2cpp.code_sub(r"[^A-Za-z0-9_]", "_", name)
 
 
 def apply_soa_layout(plan, vec4=False):
@@ -12268,16 +12178,16 @@ def _rewrite_new_vector_assigns(text, idn, two_d=True):
 
     flags = re.DOTALL
     for prop in ("position", "localPosition"):
-        text = re.sub(
+        text = cs2cpp.code_sub(
             r"transform\.%s\s*=\s*new\s+Vector2\s*\((.*?)\)\s*;" % prop,
             repl_eq, text, flags=flags)
-        text = re.sub(
+        text = cs2cpp.code_sub(
             r"transform\.%s\s*=\s*new\s+Vector3\s*\((.*?)\)\s*;" % prop,
             repl_eq, text, flags=flags)
-        text = re.sub(
+        text = cs2cpp.code_sub(
             r"transform\.%s\s*=\s*Vector3\.zero\s*;" % prop,
             repl_zero, text)
-        text = re.sub(
+        text = cs2cpp.code_sub(
             r"transform\.%s\s*\+=\s*new\s+Vector3\s*\((.*?)\)\s*;" % prop,
             repl_add, text, flags=flags)
     return text
@@ -12295,11 +12205,11 @@ def _rewrite_local_position_vec2_fields(text, cl):
             "%s_set_pos_x(i, %s_get_%s_x(i)); "
             "%s_set_pos_y(i, %s_get_%s_y(i));"
             % (idn, idn, vf, idn, idn, vf))
-        text = re.sub(
+        text = cs2cpp.code_sub(
             r"(?<![_\w])%s\s*=\s*(?:this\s*\.\s*)?transform\s*\.\s*"
             r"localPosition\s*;" % re.escape(vf),
             load, text)
-        text = re.sub(
+        text = cs2cpp.code_sub(
             r"(?:this\s*\.\s*)?transform\s*\.\s*localPosition\s*=\s*"
             r"(?<![_\w])%s\s*;" % re.escape(vf),
             store, text)
@@ -12332,11 +12242,11 @@ def _rewrite_local_position_vec3_fields(text, cl):
                 "%s_set_pos_x(i, %s_x);\n"
                 "%s_set_pos_y(i, %s_y);"
                 % (idn, vf, idn, vf))
-        text = re.sub(
+        text = cs2cpp.code_sub(
             r"(?<![_\w])%s\s*=\s*(?:this\s*\.\s*)?transform\s*\.\s*"
             r"localPosition\s*;" % vf,
             load, text)
-        text = re.sub(
+        text = cs2cpp.code_sub(
             r"(?:this\s*\.\s*)?transform\s*\.\s*localPosition\s*=\s*"
             r"(?<![_\w])%s\s*;" % vf,
             store, text)
@@ -12348,10 +12258,10 @@ def _rewrite_transform_matrices(text, cl, plan):
     if cl["name"] not in set(plan.get("transform_matrix_classes") or []):
         return text
     idn = _c_ident(cl["name"])
-    text = re.sub(
+    text = cs2cpp.code_sub(
         r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*localToWorldMatrix\b",
         "%s_localToWorldMatrix(i)" % idn, text)
-    text = re.sub(
+    text = cs2cpp.code_sub(
         r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*worldToLocalMatrix\b",
         "%s_worldToLocalMatrix(i)" % idn, text)
     return text
@@ -12414,7 +12324,7 @@ def _rewrite_transform_parent(text, cl, plan):
         return text
     idn = _c_ident(cl["name"])
     go_expr = "_engine_go_of_%s(i)" % idn
-    return re.sub(
+    return cs2cpp.code_sub(
         r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*parent\b",
         "Transform_get_parent(%s)" % go_expr,
         text)
@@ -12600,7 +12510,7 @@ def _rewrite_transform_game_object(text, cl, plan):
         return text
     idn = _c_ident(cl["name"])
     go_expr = "_engine_go_of_%s(i)" % idn
-    return re.sub(
+    return cs2cpp.code_sub(
         r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*gameObject\b",
         go_expr,
         text)
@@ -12747,7 +12657,7 @@ def _rewrite_transform_find(text, cl, plan):
         out.append(text[i:m.start()])
         if m.group("gofind"):
             parent = m.group("gofind")
-            parent = re.sub(
+            parent = cs2cpp.code_sub(
                 r"GameObject\s*\.\s*Find\s*\(", "GameObject_Find(", parent)
         else:
             recv = m.group("tr") or m.group("trecv")
@@ -13230,7 +13140,7 @@ def _rewrite_local_rotation_reads(text, cl, plan):
         return text
     idn = _c_ident(cl["name"])
     for axis in ("x", "y", "z", "w"):
-        text = re.sub(
+        text = cs2cpp.code_sub(
             r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*localRotation\s*\.\s*"
             + axis + r"\b",
             "_%s_rot_%s[i]" % (idn, axis),
@@ -13594,23 +13504,23 @@ def _rewrite_file_text_streams(text, cl):
         if f.get("ty") in ("StreamWriter", "StreamReader"):
             stream_names.add(f["name"])
 
-    text = re.sub(
+    text = cs2cpp.code_sub(
         r"(?:System\.IO\.)?File\.CreateText\s*\(",
         "File_CreateText(", text)
-    text = re.sub(
+    text = cs2cpp.code_sub(
         r"(?:System\.IO\.)?File\.OpenText\s*\(",
         "File_OpenText(", text)
-    text = re.sub(r"\bStreamWriter\b", "FILE *", text)
-    text = re.sub(r"\bStreamReader\b", "FILE *", text)
+    text = cs2cpp.code_sub(r"\bStreamWriter\b", "FILE *", text)
+    text = cs2cpp.code_sub(r"\bStreamReader\b", "FILE *", text)
 
     for name in sorted(stream_names, key=len, reverse=True):
-        text = re.sub(
+        text = cs2cpp.code_sub(
             r"(?<![.\w])%s\s*\.\s*WriteLine\s*\(" % re.escape(name),
             "StreamWriter_WriteLine(%s, " % name, text)
-        text = re.sub(
+        text = cs2cpp.code_sub(
             r"(?<![.\w])%s\s*\.\s*ReadLine\s*\(\s*\)" % re.escape(name),
             "StreamReader_ReadLine(%s)" % name, text)
-        text = re.sub(
+        text = cs2cpp.code_sub(
             r"(?<![.\w])%s\s*\.\s*Close\s*\(\s*\)" % re.escape(name),
             "Stream_Close(%s)" % name, text)
     return text
@@ -13729,12 +13639,12 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = cs2cpp.lower_body(body, _packed_model(plan))
     # (`true`/`false` -> 1/0 and the packed `this` -> `i`: `lower_body`.)
     # base.Awake() / base.OnEnable() — no C equivalent; drop.
-    text = re.sub(
+    text = cs2cpp.code_sub(
         r"(?<![\w.])base\s*\.\s*(?:Awake|OnEnable)\s*\(\s*\)\s*;?",
         "/* base.Awake */", text)
     # gameObject.SetActive(x) → GameObject_SetActive(this GO, x).
     if plan.get("go_names"):
-        text = re.sub(
+        text = cs2cpp.code_sub(
             r"(?<![\w.])gameObject\s*\.\s*SetActive\s*\(\s*([^)]+)\s*\)",
             r"GameObject_SetActive(_engine_go_of_%s(i), (\1))" % idn,
             text)
@@ -13768,7 +13678,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = _rewrite_local_position_vec3_fields(text, cl)
     # GameObject ≡ Transform index: drop redundant .transform on Find / GO.
     if plan.get("go_names"):
-        text = re.sub(
+        text = cs2cpp.code_sub(
             r"((?:GameObject\s*\.\s*Find|GameObject_Find)\s*\(\s*[^)]*\s*\))"
             r"\s*\.\s*transform\b",
             r"\1", text)
@@ -13776,8 +13686,8 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     # (Null comparisons against -1: `cs2cpp.lower_body`, above.)
     if plan.get("go_names"):
         # Transform / GameObject locals are GO indices.
-        text = re.sub(r"\bTransform\b(?=\s+\w)", "int", text)
-        text = re.sub(r"\bGameObject\b(?=\s+\w)", "int", text)
+        text = cs2cpp.code_sub(r"\bTransform\b(?=\s+\w)", "int", text)
+        text = cs2cpp.code_sub(r"\bGameObject\b(?=\s+\w)", "int", text)
     # C# string locals → const char * (ReadLine / path vars): cs2cpp's,
     # under the packed model.
     text = cs2cpp.lower_local_types(text, _packed_model(plan))
@@ -13788,42 +13698,42 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = _rewrite_getcomponentsinchildren(text, plan, cl["name"])
     text = _rewrite_audiosource_api(text, cl, add_locals=add_locals)
     # AudioSource / authored UI component locals are packed indices.
-    text = re.sub(r"\bAudioSource\b(?=\s+\w)", "int", text)
+    text = cs2cpp.code_sub(r"\bAudioSource\b(?=\s+\w)", "int", text)
     for ui_ty in sorted(_UI_GETCOMPONENT_TYPES, key=len, reverse=True):
-        text = re.sub(
+        text = cs2cpp.code_sub(
             r"\b%s\b(?=\s+\w)" % re.escape(ui_ty), "int", text)
     # Packed MonoBehaviour locals are instance indices.
     for cname in sorted(plan.get("classes") or (), key=len, reverse=True):
         if cname == cl.get("name"):
             continue
-        text = re.sub(
+        text = cs2cpp.code_sub(
             r"\b%s\b(?=\s+\w)" % re.escape(cname), "int", text)
     # API tokens before Vector2 rewrites so nested Mathf.Sin(...) keeps parens.
     text = cs2cpp.lower_bindings(text, _UNITY_API_CORE)
     # byte[] locals / params → ByteArray (File WriteAllBytes / ReadAllBytes).
     text = cs2cpp.lower_byte_arrays(text, _packed_model(plan))
-    text = re.sub(
+    text = cs2cpp.code_sub(
         r"(?<![\w.])(?:Object\.)?Destroy\s*\(\s*gameObject\s*\)",
         "Object_Destroy(_engine_go_of_%s(i))" % idn
         if plan.get("go_names") else "Object_Destroy(-1)",
         text)
-    text = re.sub(
+    text = cs2cpp.code_sub(
         r"(?<![\w.])(?:Object\.)?Destroy\s*\(\s*this\s*\)",
         "Object_Destroy(_engine_go_of_%s(i))" % idn
         if plan.get("go_names") else "Object_Destroy(-1)",
         text)
     # Destroy(goExpr) — Find result / GO local (already an index).
-    text = re.sub(
+    text = cs2cpp.code_sub(
         r"(?<![\w.])(?:Object\.)?Destroy\s*\(",
         "Object_Destroy(",
         text)
     text = cs2cpp.lower_bindings(text, _UNITY_API_SCENE)
     # Keyboard.current.<name>Key.isPressed → helpers (null-safe via connected).
-    text = re.sub(
+    text = cs2cpp.code_sub(
         r"(?:UnityEngine\.InputSystem\.)?Keyboard\.current\.(\w+)Key\.isPressed\b",
         lambda m: "Keyboard_%sKey_isPressed()" % m.group(1),
         text)
-    text = re.sub(
+    text = cs2cpp.code_sub(
         r"(?:UnityEngine\.InputSystem\.)?Keyboard\.current\b",
         "Keyboard_current()", text)
     # Debug.Log / print → Debug_Log. Drop optional context object arg.
@@ -13843,15 +13753,15 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = _wrap_log_component_tostring(text, add_locals)
     text = _wrap_log_collision2d_tostring(text, collision2d_param)
     text = cs2cpp.lower_bindings(text, _UNITY_API_MATHF)
-    text = re.sub(r"transform\.position\.x", idn + "_get_pos_x(i)", text)
-    text = re.sub(r"transform\.position\.y", idn + "_get_pos_y(i)", text)
-    text = re.sub(r"transform\.position\.z",
+    text = cs2cpp.code_sub(r"transform\.position\.x", idn + "_get_pos_x(i)", text)
+    text = cs2cpp.code_sub(r"transform\.position\.y", idn + "_get_pos_y(i)", text)
+    text = cs2cpp.code_sub(r"transform\.position\.z",
                   idn + "_get_pos_z(i)" if not cl["two_d"] else "0.f", text)
     # Packed pos is local under a live parent, else world — matches Unity
     # localPosition when parented / unparented respectively for our storage.
-    text = re.sub(r"transform\.localPosition\.x", idn + "_get_pos_x(i)", text)
-    text = re.sub(r"transform\.localPosition\.y", idn + "_get_pos_y(i)", text)
-    text = re.sub(r"transform\.localPosition\.z",
+    text = cs2cpp.code_sub(r"transform\.localPosition\.x", idn + "_get_pos_x(i)", text)
+    text = cs2cpp.code_sub(r"transform\.localPosition\.y", idn + "_get_pos_y(i)", text)
+    text = cs2cpp.code_sub(r"transform\.localPosition\.z",
                   idn + "_get_pos_z(i)" if not cl["two_d"] else "0.f", text)
     text = _rewrite_new_vector_assigns(text, idn, two_d=bool(cl.get("two_d")))
 
@@ -13862,15 +13772,15 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     }
     for vf in cl.get("vec2_fields") or []:
         # Whole-field write before .x/.y / bare-read rewrites.
-        text = re.sub(
+        text = cs2cpp.code_sub(
             r"(?<![_\w])%s\s*=\s*(.+?)\s*;" % re.escape(vf),
             lambda m, name=vf: (
                 "%s_set_%s_x(i, Vector2_x(%s)); %s_set_%s_y(i, Vector2_y(%s));"
                 % (idn, name, m.group(1), idn, name, m.group(1))),
             text)
-        text = re.sub(r"(?<![_\w])%s\.x\b" % vf, "%s_x" % vf, text)
-        text = re.sub(r"(?<![_\w])%s\.y\b" % vf, "%s_y" % vf, text)
-        text = re.sub(
+        text = cs2cpp.code_sub(r"(?<![_\w])%s\.x\b" % vf, "%s_x" % vf, text)
+        text = cs2cpp.code_sub(r"(?<![_\w])%s\.y\b" % vf, "%s_y" % vf, text)
+        text = cs2cpp.code_sub(
             r"(?<![_\w])%s\s*\+=\s*new\s+Vector2\s*\((.*)\)" % vf,
             lambda m, name=vf: (
                 (lambda args: (
@@ -13881,7 +13791,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
             ),
             text)
         # Remaining bare field reads → stack Vector2 from packed slots.
-        text = re.sub(
+        text = cs2cpp.code_sub(
             r"(?<![_\w])%s\b(?!\s*\.)" % re.escape(vf),
             "Vector2_make(%s_get_%s_x(i), %s_get_%s_y(i))" % (
                 idn, vf, idn, vf),
@@ -13892,7 +13802,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
             continue
         oidn = _c_ident(ocname)
         for vf in ocl.get("vec2_fields") or []:
-            text = re.sub(
+            text = cs2cpp.code_sub(
                 r"(?<![_\w])(\w+)\.%s\s*=\s*(.+?)\s*;" % re.escape(vf),
                 lambda m, o=oidn, f=vf: (
                     "%s_set_%s_x(%s, Vector2_x(%s)); "
@@ -13901,7 +13811,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
                        o, f, m.group(1), m.group(2))),
                 text)
             # recv.transform.localPosition = recv.vf (before bare-field read).
-            text = re.sub(
+            text = cs2cpp.code_sub(
                 r"(?<![_\w])(\w+)\s*\.\s*transform\s*\.\s*localPosition\s*=\s*"
                 r"(?<![_\w])\1\s*\.\s*%s\s*;" % re.escape(vf),
                 lambda m, o=oidn, f=vf: (
@@ -13910,38 +13820,38 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
                     % (o, m.group(1), o, f, m.group(1),
                        o, m.group(1), o, f, m.group(1))),
                 text)
-            text = re.sub(
+            text = cs2cpp.code_sub(
                 r"(?<![_\w])(\w+)\.%s\.x\b" % re.escape(vf),
                 r"%s_get_%s_x(\1)" % (oidn, vf),
                 text)
-            text = re.sub(
+            text = cs2cpp.code_sub(
                 r"(?<![_\w])(\w+)\.%s\.y\b" % re.escape(vf),
                 r"%s_get_%s_y(\1)" % (oidn, vf),
                 text)
-            text = re.sub(
+            text = cs2cpp.code_sub(
                 r"(?<![_\w])(\w+)\.%s\b(?!\s*\.)" % re.escape(vf),
                 lambda m, o=oidn, f=vf: (
                     "Vector2_make(%s_get_%s_x(%s), %s_get_%s_y(%s))"
                     % (o, f, m.group(1), o, f, m.group(1))),
                 text)
     # new Vector2(a, b) / Vector2(a, b) → Vector2_make; static presets.
-    text = re.sub(
+    text = cs2cpp.code_sub(
         r"(?<![\w.])new\s+Vector2\s*\(",
         "Vector2_make(", text)
-    text = re.sub(
+    text = cs2cpp.code_sub(
         r"(?<![\w.])Vector2\s*\(",
         "Vector2_make(", text)
-    text = re.sub(
+    text = cs2cpp.code_sub(
         r"(?<![\w.])Vector2\.zero\b", "Vector2_make(0.f, 0.f)", text)
-    text = re.sub(
+    text = cs2cpp.code_sub(
         r"(?<![\w.])Vector2\.one\b", "Vector2_make(1.f, 1.f)", text)
-    text = re.sub(
+    text = cs2cpp.code_sub(
         r"(?<![\w.])Vector2\.up\b", "Vector2_make(0.f, 1.f)", text)
-    text = re.sub(
+    text = cs2cpp.code_sub(
         r"(?<![\w.])Vector2\.down\b", "Vector2_make(0.f, -1.f)", text)
-    text = re.sub(
+    text = cs2cpp.code_sub(
         r"(?<![\w.])Vector2\.right\b", "Vector2_make(1.f, 0.f)", text)
-    text = re.sub(
+    text = cs2cpp.code_sub(
         r"(?<![\w.])Vector2\.left\b", "Vector2_make(-1.f, 0.f)", text)
     # Temps like Vector2_x(Vector2_make(a,b)) — fold to components.
     def _fold_v2_axis_ctors(src, axis_fn, axis):
@@ -13975,10 +13885,10 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = _fold_v2_axis_ctors(text, "Vector2_x", 0)
     text = _fold_v2_axis_ctors(text, "Vector2_y", 1)
     for vf in cl.get("vec2int_fields") or []:
-        text = re.sub(r"(?<![_\w])%s\.x\b" % vf, "%s_x" % vf, text)
-        text = re.sub(r"(?<![_\w])%s\.y\b" % vf, "%s_y" % vf, text)
+        text = cs2cpp.code_sub(r"(?<![_\w])%s\.x\b" % vf, "%s_x" % vf, text)
+        text = cs2cpp.code_sub(r"(?<![_\w])%s\.y\b" % vf, "%s_y" % vf, text)
         # Whole Vector2Int field (map key) → ctor from packed components.
-        text = re.sub(
+        text = cs2cpp.code_sub(
             r"(?<![_\w])%s\b(?!\s*\.)" % re.escape(vf),
             "Vector2Int(%s_get_%s_x(i), %s_get_%s_y(i))" % (
                 idn, vf, idn, vf),
@@ -13989,35 +13899,35 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
             continue
         oidn = _c_ident(ocname)
         for vf in ocl.get("vec2int_fields") or []:
-            text = re.sub(
+            text = cs2cpp.code_sub(
                 r"(?<![_\w])(\w+)\.%s\.x\b" % re.escape(vf),
                 r"%s_get_%s_x(\1)" % (oidn, vf),
                 text)
-            text = re.sub(
+            text = cs2cpp.code_sub(
                 r"(?<![_\w])(\w+)\.%s\.y\b" % re.escape(vf),
                 r"%s_get_%s_y(\1)" % (oidn, vf),
                 text)
-            text = re.sub(
+            text = cs2cpp.code_sub(
                 r"(?<![_\w])(\w+)\.%s\b(?!\s*\.)" % re.escape(vf),
                 lambda m, o=oidn, f=vf: (
                     "Vector2Int(%s_get_%s_x(%s), %s_get_%s_y(%s))"
                     % (o, f, m.group(1), o, f, m.group(1))),
                 text)
     # new Vector2Int(a, b) → Vector2Int(a, b) (cpprust stack ctor).
-    text = re.sub(
+    text = cs2cpp.code_sub(
         r"(?<![\w.])new\s+Vector2Int\s*\(",
         "Vector2Int(", text)
     for vf in cl.get("vec3_fields") or []:
-        text = re.sub(r"(?<![_\w])%s\.x\b" % vf, "%s_x" % vf, text)
-        text = re.sub(r"(?<![_\w])%s\.y\b" % vf, "%s_y" % vf, text)
-        text = re.sub(r"(?<![_\w])%s\.z\b" % vf, "%s_z" % vf, text)
+        text = cs2cpp.code_sub(r"(?<![_\w])%s\.x\b" % vf, "%s_x" % vf, text)
+        text = cs2cpp.code_sub(r"(?<![_\w])%s\.y\b" % vf, "%s_y" % vf, text)
+        text = cs2cpp.code_sub(r"(?<![_\w])%s\.z\b" % vf, "%s_z" % vf, text)
         # Property PascalCase → field (Offset → offset) for TransformPoint args.
         prop = vf[:1].upper() + vf[1:] if vf else vf
         if prop != vf:
-            text = re.sub(r"(?<![_\w])%s\.x\b" % prop, "%s_x" % vf, text)
-            text = re.sub(r"(?<![_\w])%s\.y\b" % prop, "%s_y" % vf, text)
-            text = re.sub(r"(?<![_\w])%s\.z\b" % prop, "%s_z" % vf, text)
-            text = re.sub(
+            text = cs2cpp.code_sub(r"(?<![_\w])%s\.x\b" % prop, "%s_x" % vf, text)
+            text = cs2cpp.code_sub(r"(?<![_\w])%s\.y\b" % prop, "%s_y" % vf, text)
+            text = cs2cpp.code_sub(r"(?<![_\w])%s\.z\b" % prop, "%s_z" % vf, text)
+            text = cs2cpp.code_sub(
                 r"(?<![_\w])%s(?![\w])" % prop,
                 vf, text)
     # The packed receiver: statics, field writes and reads through the
