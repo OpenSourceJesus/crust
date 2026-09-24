@@ -496,6 +496,623 @@ class TestSugar(unittest.TestCase):
         self.assertIn("[](int x) { return x + 1; }", cpp)
 
 
+class TestByteArrays(unittest.TestCase):
+    """`byte[]` is `vector<unsigned char>`, and has to *compile* as one.
+
+    `test_a_two_word_element_type_stays_whole` pins the C++ spelling; this
+    pins the C. The two came apart: cpprust expanded `__cpp_ref(T)` only
+    for a one-word `T`, so `__cpp_ref(unsigned char)` reached the C compiler
+    as an unknown type and no method taking a `byte[]` built at all.
+    """
+
+    @needs_cc
+    def test_a_byte_array_parameter_compiles_and_runs(self):
+        c = lower("public class A {\n"
+                  "    public int Sum(byte[] b) {\n"
+                  "        int t = 0;\n"
+                  "        foreach (var x in b) { t += x; }\n"
+                  "        return t;\n"
+                  "    }\n"
+                  "    public int Run() {\n"
+                  "        byte[] b = new byte[3];\n"
+                  "        b[0] = 40; b[2] = 2;\n"
+                  "        return Sum(b);\n"
+                  "    }\n"
+                  "}\n")
+        self.assertEqual(run_c(c, "int main(void) { A a; return A_Run(&a); }"),
+                         42)
+
+    @needs_cc
+    def test_new_array_has_its_length_and_is_zeroed(self):
+        # C# `new T[n]` is n default values. The prelude's `vector(int)`
+        # only reserves, so that spelling would have length 0.
+        c = lower("public class A {\n"
+                  "    public int Run() {\n"
+                  "        int[] xs = new int[5];\n"
+                  "        xs[2] = 7;\n"
+                  "        int t = 0;\n"
+                  "        foreach (var x in xs) { t += x; }\n"
+                  "        return t * 10 + xs.Length;\n"
+                  "    }\n"
+                  "}\n")
+        self.assertEqual(run_c(c, "int main(void) { A a; return A_Run(&a); }"),
+                         75)
+
+
+#: The example the feature was written against, moved into a method: the
+#: statements were top-level, which is refused (`TestTopLevelStatements`).
+PACKET = ("using System;\n"
+          "using System.Runtime.InteropServices;\n"
+          "\n"
+          "[StructLayout(LayoutKind.Sequential, Pack = 1)]\n"
+          "public struct PacketData\n"
+          "{\n"
+          "    public int Id;\n"
+          "    public float Value;\n"
+          "}\n"
+          "\n"
+          "public class Program\n"
+          "{\n"
+          "    public int Run()\n"
+          "    {\n"
+          "        PacketData packet = new PacketData { Id = 101, Value = 3.14f };\n"
+          "        byte[] rawBytes = MemoryMarshal.AsBytes("
+          "MemoryMarshal.CreateSpan(ref packet, 1)).ToArray();\n"
+          "        PacketData back = MemoryMarshal.Read<PacketData>(rawBytes);\n"
+          "\n"
+          "        if (rawBytes.Length != 8) { return 1; }\n"
+          # The bytes .NET produces on a little-endian machine: 101 as an
+          # int, then 3.14f as its IEEE-754 bits, 0x4048F5C3.
+          "        if (rawBytes[0] != 101 || rawBytes[1] != 0) { return 2; }\n"
+          "        if (rawBytes[4] != 0xC3 || rawBytes[5] != 0xF5) { return 3; }\n"
+          "        if (rawBytes[6] != 0x48 || rawBytes[7] != 0x40) { return 4; }\n"
+          "        if (back.Id != 101 || back.Value != 3.14f) { return 5; }\n"
+          "        return 0;\n"
+          "    }\n"
+          "}\n")
+
+_RUN_PROGRAM = "int main(void) { Program p; return Program_Run(&p); }"
+
+#: The same, after filling the stack below `main` with 0xAA. A fresh
+#: process's stack is often already zero, so without this a struct that
+#: was never zeroed reads as zero anyway and the zeroing tests pass whether
+#: or not anything zeroes it -- which is how they first passed.
+_RUN_ON_DIRTY_STACK = (
+    "static void dirty(void) { volatile unsigned char junk[8192];"
+    " volatile int i; for (i = 0; i < 8192; i++) { junk[i] = 0xAA; }"
+    # The counter shares the top of the frame with the caller's next
+    # locals, and it stops at 0x2000 -- low byte zero, which read as a
+    # zeroed field. Left at garbage like everything else.
+    " i = (int)0xAAAAAAAA; }\n"
+    "int main(void) { Program p; dirty(); return Program_Run(&p); }")
+
+_MM_HEAD = "using System.Runtime.InteropServices;\n"
+
+
+def _program(body, types=""):
+    return (_MM_HEAD + types + "public class Program {\n"
+            "    public int Run() {\n" + body + "\n    }\n}\n")
+
+
+class TestBlittableSerialization(unittest.TestCase):
+    """An unmanaged struct is its bytes, in C# and in the lowered C alike.
+
+    So `MemoryMarshal` over one is a byte copy, and the claim worth pinning
+    is not that it translates but that the bytes are the ones .NET would
+    produce -- checked here byte by byte, and round-tripped.
+    """
+
+    @needs_cc
+    def test_the_example_produces_dotnets_bytes(self):
+        if sys.byteorder != "little":                        # pragma: no cover
+            self.skipTest("expected bytes are little-endian")
+        self.assertEqual(run_c(lower(PACKET), _RUN_PROGRAM), 0)
+
+    def test_the_example_keeps_its_line_count(self):
+        self.assertEqual(cs2cpp.translate(PACKET, "t.cs").count("\n"),
+                         PACKET.count("\n"))
+
+    @unittest.skipIf(sys.byteorder != "little", "little-endian bytes")
+    def test_the_example_runs_under_shivyc(self):
+        # gcc and shivyc must agree on the layout, or one source has two
+        # byte formats. That agreement is why `Pack` is checked rather than
+        # emitted (`TestStructLayout`), so it is pinned on Crust's own
+        # compiler as well as the host's.
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        tmp = tempfile.mkdtemp(prefix="csrust-shivyc-")
+        try:
+            path = os.path.join(tmp, "t.c")
+            with open(path, "w") as f:
+                f.write(lower(PACKET) + "\n" + _RUN_PROGRAM + "\n")
+            exe = os.path.join(tmp, "t")
+            proc = subprocess.run(
+                [sys.executable, "-m", "shivyc.main", path, "-o", exe],
+                cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if proc.returncode != 0:
+                raise AssertionError("shivyc: %s" % (proc.stdout + proc.stderr)
+                                     .decode("utf-8", "replace")[-2000:])
+            self.assertEqual(subprocess.run([exe]).returncode, 0)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    @needs_cc
+    def test_write_into_an_allocated_buffer(self):
+        src = _program(
+            "        P p = new P { Id = 7, Value = 1.5f };\n"
+            "        byte[] buf = new byte[Marshal.SizeOf<P>()];\n"
+            "        MemoryMarshal.Write(buf, ref p);\n"
+            "        P q = MemoryMarshal.Read<P>(buf);\n"
+            "        if (buf.Length != 8) { return 1; }\n"
+            "        return q.Id;",
+            "public struct P { public int Id; public float Value; }\n")
+        self.assertEqual(run_c(lower(src), _RUN_PROGRAM), 7)
+
+    @needs_cc
+    def test_write_takes_in_as_well_as_ref(self):
+        src = _program(
+            "        P p = new P { Id = 9 };\n"
+            "        byte[] buf = new byte[4];\n"
+            "        MemoryMarshal.Write(buf, in p);\n"
+            "        return buf[0];",
+            "public struct P { public int Id; }\n")
+        self.assertEqual(run_c(lower(src), _RUN_PROGRAM), 9)
+
+    @needs_cc
+    def test_nested_structs_and_enums_round_trip(self):
+        # 4 + 2 + 1 + 1 for the header, 8 + 8 after it: 24, with no
+        # padding, which is also what .NET's sequential layout gives.
+        src = _program(
+            "        M m = new M { Seq = 1234567890123, X = 0.5 };\n"
+            "        m.Head.K = (Kind)2;\n"
+            "        m.Head.Len = 300;\n"
+            "        byte[] b = MemoryMarshal.AsBytes("
+            "MemoryMarshal.CreateSpan(ref m, 1)).ToArray();\n"
+            "        M r = MemoryMarshal.Read<M>(b);\n"
+            "        if (b.Length != 24) { return 1; }\n"
+            "        if (r.Seq != 1234567890123) { return 2; }\n"
+            "        if ((int)r.Head.K != 2 || r.Head.Len != 300) { return 3; }\n"
+            "        return 0;",
+            "public enum Kind { A, B, C }\n"
+            "public struct H { public Kind K; public short Len;"
+            " public byte Flags; public byte Pad; }\n"
+            "public struct M { public H Head; public long Seq;"
+            " public double X; }\n")
+        self.assertEqual(run_c(lower(src), _RUN_PROGRAM), 0)
+
+    @needs_cc
+    def test_an_auto_property_is_serialised_through_its_field(self):
+        src = _program(
+            "        A a = new A { X = 4, Y = 6 };\n"
+            "        byte[] b = MemoryMarshal.AsBytes("
+            "MemoryMarshal.CreateSpan(ref a, 1)).ToArray();\n"
+            "        A r = MemoryMarshal.Read<A>(b);\n"
+            "        return r.X * 10 + r.Y + b.Length * 100;",
+            "public struct A { public int X { get; set; } public int Y; }\n")
+        self.assertEqual(run_c(lower(src), _RUN_PROGRAM) & 0xff,
+                         (846) & 0xff)
+
+    @needs_cc
+    def test_a_short_buffer_aborts(self):
+        # `ArgumentOutOfRangeException` in .NET. Unhandled, that ends the
+        # process, which is what this does; the checked `except` model
+        # would make every C# caller handle it, and none of them do.
+        src = _program("        byte[] b = new byte[3];\n"
+                       "        P q = MemoryMarshal.Read<P>(b);\n"
+                       "        return 0;",
+                       "public struct P { public int Id; }\n")
+        self.assertNotEqual(run_c(lower(src), _RUN_PROGRAM), 0)
+
+    def test_the_helpers_sit_at_file_scope_in_a_namespace(self):
+        # Declared inside a namespace, `abort` came out as `Net_abort` and
+        # failed to link.
+        src = (_MM_HEAD + "namespace Net {\n"
+               "public struct P { public int Id; }\n"
+               "public class Program {\n"
+               "    public int Run() {\n"
+               "        byte[] b = new byte[4];\n"
+               "        return MemoryMarshal.Read<P>(b).Id;\n"
+               "    }\n"
+               "}\n"
+               "}\n")
+        c = lower(src)
+        self.assertNotIn("Net_abort", c)
+        if _CC is not None:
+            self.assertEqual(
+                run_c(c, "int main(void) { Net_Program p;"
+                         " return Net_Program_Run(&p); }"), 0)
+
+
+class TestObjectInitializers(unittest.TestCase):
+
+    @needs_cc
+    def test_unmentioned_fields_are_zero(self):
+        # In C# they are. Left uninitialised in C they are stack garbage,
+        # and serialising the struct puts that garbage in the bytes.
+        src = _program(
+            "        var p = new P { Id = 5 };\n"
+            "        byte[] b = MemoryMarshal.AsBytes("
+            "MemoryMarshal.CreateSpan(ref p, 1)).ToArray();\n"
+            "        return b[0] + b[4] + b[5] + b[6] + b[7];",
+            "public struct P { public int Id; public float Value; }\n")
+        self.assertEqual(run_c(lower(src), _RUN_ON_DIRTY_STACK), 5)
+
+    @needs_cc
+    def test_new_of_a_plain_struct_is_zeroed(self):
+        # Wide on purpose. A four-byte struct lands in the alignment gap
+        # beside gcc's stack canary, which `dirty` never writes, and read
+        # as zero with the zeroing removed.
+        src = _program("        P p = new P();\n"
+                       "        return (int)(p.A | p.B | p.C | p.D) + p.Id + 3;",
+                       "public struct P { public long A, B, C, D;"
+                       " public int Id; }\n")
+        self.assertEqual(run_c(lower(src), _RUN_ON_DIRTY_STACK), 3)
+
+    def test_a_multi_line_initializer_keeps_the_line_count(self):
+        src = _program("        P p = new P\n"
+                       "        {\n"
+                       "            Id = 11,\n"
+                       "            Value = 2.0f,\n"
+                       "        };\n"
+                       "        return p.Id;",
+                       "public struct P { public int Id; public float Value; }\n")
+        cpp = cs2cpp.translate(src, "t.cs")
+        self.assertEqual(cpp.count("\n"), src.count("\n"))
+        if _CC is not None:
+            self.assertEqual(run_c(lower(src), _RUN_PROGRAM), 11)
+
+    @needs_cc
+    def test_a_class_is_constructed_then_assigned(self):
+        # Not zeroed: a class with a constructor runs it, and the
+        # initializer's assignments come after, as in C#.
+        src = ("public class C {\n"
+               "    public int A; public int B;\n"
+               "    public C() { A = 1; B = 2; }\n"
+               "}\n" + _program("        C c = new C { B = 40 };\n"
+                                "        return c.A + c.B;"))
+        self.assertEqual(run_c(lower(src), _RUN_PROGRAM), 41)
+
+
+class TestStructLayout(unittest.TestCase):
+    """`[StructLayout]` is checked against the fields, then dropped.
+
+    `Sequential` is what a C struct already is. `Pack` is not emitted as
+    `#pragma pack`, because shivyc parses that pragma and lays the struct out
+    naturally anyway: one source would get two layouts, and nothing would
+    say so. A `Pack` that changes nothing is dropped; one that would move a
+    field is refused.
+    """
+
+    def assert_refuses(self, src, *needles):
+        TestRefusals.assert_refuses(self, src, *needles)
+
+    def test_pack_with_no_padding_to_remove_is_accepted(self):
+        c = lower("using System.Runtime.InteropServices;\n"
+                  "[StructLayout(LayoutKind.Sequential, Pack = 1)]\n"
+                  "public struct P { public int Id; public float Value; }\n")
+        self.assertIn("struct P", c)
+        self.assertNotIn("StructLayout", c)
+        self.assertNotIn("pragma", c)
+
+    def test_pack_that_moves_a_field_is_refused(self):
+        self.assert_refuses(
+            "[StructLayout(LayoutKind.Sequential, Pack = 1)]\n"
+            "public struct Q { public byte Tag; public int Id; }\n",
+            "`Pack = 1`", "`Id` at 1 instead of 4", "largest-first")
+
+    def test_pack_that_removes_tail_padding_is_refused(self):
+        self.assert_refuses(
+            "[StructLayout(LayoutKind.Sequential, Pack = 1)]\n"
+            "public struct Q { public int Id; public byte Tag; }\n",
+            "size 5 instead of 8")
+
+    def test_explicit_layout_is_refused(self):
+        self.assert_refuses(
+            "[StructLayout(LayoutKind.Explicit)]\n"
+            "public struct Q { public int Id; }\n", "`LayoutKind.Explicit`")
+
+    def test_the_attribute_may_share_the_struct_line(self):
+        c = lower("[StructLayout(LayoutKind.Sequential)] public struct Q"
+                  " { public int Id; }\n")
+        self.assertNotIn("StructLayout", c)
+
+    def test_a_pack_hidden_in_a_combined_attribute_is_not_dropped(self):
+        # A whole-line attribute is otherwise dropped unread, which would
+        # lose the `Pack` without a word.
+        self.assert_refuses(
+            "[Serializable, StructLayout(LayoutKind.Sequential, Pack = 1)]\n"
+            "public struct Q { public byte Tag; public int Id; }\n",
+            "its own brackets")
+
+
+class TestTopLevelStatements(unittest.TestCase):
+
+    def test_refused_at_the_first_statement(self):
+        src = ("using System;\n"
+               "\n"
+               "public struct P { public int Id; }\n"
+               "\n"
+               "P p = new P { Id = 1 };\n")
+        msg = refusal(src)
+        self.assertTrue(msg.startswith("test.cs:5:"), msg)
+        self.assertIn("top-level statement", msg)
+
+    def test_types_and_namespaces_alone_are_not_statements(self):
+        c = lower("using System;\n"
+                  "using X = System.Int32;\n"
+                  "public delegate int D(int x);\n"
+                  "namespace N {\n"
+                  "    public struct P { public int Id; };\n"
+                  "}\n")
+        self.assertIn("N_P", c)
+
+
+class TestPlainDataRefusals(unittest.TestCase):
+    """What a byte copy cannot honestly do, refused in C# terms."""
+
+    def assert_refuses(self, src, *needles):
+        TestRefusals.assert_refuses(self, src, *needles)
+
+    def test_a_reference_field_is_not_plain_data(self):
+        self.assert_refuses(_program(
+            "        Q q = new Q();\n"
+            "        byte[] b = MemoryMarshal.AsBytes("
+            "MemoryMarshal.CreateSpan(ref q, 1)).ToArray();\n"
+            "        return 0;",
+            "public struct Q { public int Id; public string Name; }\n"),
+            "unmanaged struct", "`Q.Name`", "`string`")
+
+    def test_a_class_is_not_plain_data(self):
+        self.assert_refuses(_program(
+            "        byte[] b = new byte[4];\n"
+            "        Q q = MemoryMarshal.Read<Q>(b);\n"
+            "        return 0;",
+            "public class Q { public int Id; }\n"), "`Q` is a class")
+
+    def test_a_struct_with_an_interface_carries_a_vtable(self):
+        self.assert_refuses(_program(
+            "        S s = new S();\n"
+            "        byte[] b = MemoryMarshal.AsBytes("
+            "MemoryMarshal.CreateSpan(ref s, 1)).ToArray();\n"
+            "        return 0;",
+            "public interface I { int G(); }\n"
+            "public struct S : I { public int X;"
+            " public virtual int G() { return X; } }\n"), "vtable")
+
+    def test_read_needs_a_parameterless_constructor(self):
+        self.assert_refuses(_program(
+            "        byte[] b = new byte[4];\n"
+            "        R r = MemoryMarshal.Read<R>(b);\n"
+            "        return 0;",
+            "public struct R { public int A;"
+            " public R(int a) { A = a; } }\n"), "parameterless")
+
+    def test_spans_are_refused(self):
+        self.assert_refuses(_program(
+            "        P p = new P();\n"
+            "        Span<byte> s = MemoryMarshal.AsBytes("
+            "MemoryMarshal.CreateSpan(ref p, 1));\n"
+            "        return 0;",
+            "public struct P { public int Id; }\n"), "`Span<T>`")
+
+    def test_as_bytes_without_to_array_is_refused(self):
+        self.assert_refuses(_program(
+            "        P p = new P();\n"
+            "        var s = MemoryMarshal.AsBytes("
+            "MemoryMarshal.CreateSpan(ref p, 1));\n"
+            "        return 0;",
+            "public struct P { public int Id; }\n"), ".ToArray()")
+
+    def test_a_longer_span_is_refused(self):
+        self.assert_refuses(_program(
+            "        P p = new P();\n"
+            "        byte[] b = MemoryMarshal.AsBytes("
+            "MemoryMarshal.CreateSpan(ref p, 2)).ToArray();\n"
+            "        return 0;",
+            "public struct P { public int Id; }\n"), "count of `1`")
+
+    def test_other_memory_marshal_members_are_refused(self):
+        self.assert_refuses(_program(
+            "        byte[] b = new byte[4];\n"
+            "        var x = MemoryMarshal.Cast<byte, int>(b);\n"
+            "        return 0;"), "`MemoryMarshal.Cast`", "`MemoryMarshal.Read<T>")
+
+    def test_a_call_site_ref_elsewhere_is_still_refused(self):
+        # `CreateSpan(ref x, 1)` is the one call-site `ref` read; the
+        # exemption must not reach anything else.
+        self.assert_refuses(
+            "public class A { public void F(ref int x) { } }\n", "`ref`")
+
+    def test_an_initializer_outside_a_declaration_is_refused(self):
+        self.assert_refuses(
+            "public struct P { public int Id; }\n"
+            "public class A { public P Make() { return new P { Id = 1 }; } }\n",
+            "object initializer", "Declare a local")
+
+    def test_a_collection_initializer_is_refused(self):
+        self.assert_refuses(_program(
+            "        var xs = new List<int> { 1, 2 };\n"
+            "        return 0;"), "Collection")
+
+    def test_an_array_initializer_is_refused(self):
+        self.assert_refuses(_program(
+            "        byte[] b = new byte[] { 1, 2 };\n"
+            "        return 0;"), "array initializer")
+
+    def test_an_array_of_objects_is_refused(self):
+        self.assert_refuses(
+            "public class C { public int A; }\n" + _program(
+                "        C[] cs = new C[3];\n"
+                "        return 0;"), "`new C[n]`", "primitive")
+
+
+class TestEnums(unittest.TestCase):
+    """`Kind.A` is `Kind_A`, and `Kind` is a typedef of its underlying type.
+
+    C puts every enum member in one file-wide namespace and leaves an
+    enum's size to the compiler; C# scopes members to their type and fixes
+    the size. The prefix answers the first, the typedef the second -- and
+    the second is not cosmetic: `TestEnums.test_a_byte_enum_is_one_byte`
+    is a serialised layout that moved with a four-byte enum.
+    """
+
+    def assert_refuses(self, src, *needles):
+        TestRefusals.assert_refuses(self, src, *needles)
+
+    @needs_cc
+    def test_members_switch_and_compare(self):
+        src = ("public enum Kind { A, B, C }\n" + _program(
+            "        Kind k = Kind.C;\n"
+            "        switch (k) {\n"
+            "            case Kind.A: return 1;\n"
+            "            case Kind.C: return 40 + (int)Kind.C;\n"
+            "            default: return 2;\n"
+            "        }"))
+        self.assertEqual(run_c(lower(src), _RUN_PROGRAM), 42)
+
+    def test_members_are_prefixed_by_their_type(self):
+        cpp = cs2cpp.translate("public enum Color { Red, Green }\n"
+                               "public enum Light { Red, Amber }\n", "t.cs")
+        # Two `Red`s, which C could not hold under one name.
+        self.assertIn("Color_Red", cpp)
+        self.assertIn("Light_Red", cpp)
+        self.assertIn("typedef int Color;", cpp)
+
+    @needs_cc
+    def test_explicit_values_and_sibling_references(self):
+        # `B = A + 4` names a sibling bare, which is in scope in C#.
+        src = ("public enum Kind\n"
+               "{\n"
+               "    A = 3,\n"
+               "    B = A + 4,\n"
+               "    C = 0x2,\n"
+               "}\n" + _program("        return (int)Kind.C * 100"
+                                " + (int)Kind.B;"))
+        cpp = cs2cpp.translate(src, "t.cs")
+        self.assertEqual(cpp.count("\n"), src.count("\n"))
+        self.assertEqual(run_c(lower(src), _RUN_PROGRAM), 207)
+
+    @needs_cc
+    def test_flags_combine(self):
+        src = ("[Flags] public enum Perm { None = 0, Read = 1, Write = 2 }\n"
+               + _program("        Perm p = Perm.Read | Perm.Write;\n"
+                          "        if ((p & Perm.Write) == 0) { return 99; }\n"
+                          "        return (int)p;"))
+        self.assertEqual(run_c(lower(src), _RUN_PROGRAM), 3)
+
+    @needs_cc
+    def test_parameters_returns_and_casts(self):
+        src = ("public enum Kind { A, B, C }\n"
+               "public class Program {\n"
+               "    Kind Next(Kind k) {\n"
+               "        if (k == Kind.C) { return Kind.A; }\n"
+               "        return (Kind)((int)k + 1);\n"
+               "    }\n"
+               "    public int Run() { return (int)Next(Next(Kind.A)); }\n"
+               "}\n")
+        self.assertEqual(run_c(lower(src), _RUN_PROGRAM), 2)
+
+    @needs_cc
+    def test_a_nested_enum_is_hoisted(self):
+        # cpprust has no nested enum: inside a struct it emitted
+        # `enum Type;` as a member. The declaration moves out, collapsed
+        # onto the class's line, and leaves its own lines blank.
+        src = ("public class Packet {\n"
+               "    public enum Type\n"
+               "    {\n"
+               "        Ping,\n"
+               "        Ack = 7,\n"
+               "    }\n"
+               "    public Type t;\n"
+               "    public void Mark() { t = Type.Ack; }\n"
+               "}\n"
+               "public class Program {\n"
+               "    public int Run() {\n"
+               "        Packet p = new Packet();\n"
+               "        p.Mark();\n"
+               "        Packet.Type x = Packet.Type.Ack;\n"
+               "        if (p.t != x) { return 1; }\n"
+               "        return (int)p.t;\n"
+               "    }\n"
+               "}\n")
+        cpp = cs2cpp.translate(src, "t.cs")
+        self.assertEqual(cpp.count("\n"), src.count("\n"))
+        self.assertEqual(run_c(lower(src), _RUN_PROGRAM), 7)
+
+    @needs_cc
+    def test_in_a_namespace(self):
+        src = ("namespace Net {\n"
+               "    public enum Kind { A, B }\n"
+               "    public class Program {\n"
+               "        public int Run() {\n"
+               "            Kind k = Kind.B;\n"
+               "            return (int)k + (int)Net.Kind.B;\n"
+               "        }\n"
+               "    }\n"
+               "}\n")
+        self.assertEqual(
+            run_c(lower(src), "int main(void) { Net_Program p;"
+                              " return Net_Program_Run(&p); }"), 2)
+
+    @needs_cc
+    def test_a_byte_enum_is_one_byte(self):
+        # 1 + 1 + 2: four bytes. A C enum here is four bytes wide on its
+        # own, which made the struct eight and moved `N`.
+        src = _program(
+            "        H h = new H { K = Kind.C, N = 9 };\n"
+            "        byte[] b = MemoryMarshal.AsBytes("
+            "MemoryMarshal.CreateSpan(ref h, 1)).ToArray();\n"
+            "        H r = MemoryMarshal.Read<H>(b);\n"
+            "        if (r.K != Kind.C || r.N != 9) { return 1; }\n"
+            "        return b.Length * 10 + b[0] + b[2];",
+            "public enum Kind : byte { A, B, C }\n"
+            "public struct H { public Kind K; public byte Pad;"
+            " public short N; }\n")
+        self.assertEqual(run_c(lower(src), _RUN_PROGRAM), 40 + 2 + 9)
+
+    @needs_cc
+    def test_an_enum_array_is_zeroed(self):
+        src = ("public enum Kind : byte { A, B }\n" + _program(
+            "        Kind[] ks = new Kind[3];\n"
+            "        ks[2] = Kind.B;\n"
+            "        return (int)ks[2] + ks.Length + (int)ks[0];"))
+        self.assertEqual(run_c(lower(src), _RUN_ON_DIRTY_STACK), 4)
+
+    @needs_cc
+    def test_a_property_may_share_the_enum_name(self):
+        src = ("public enum Color { Red, Green }\n"
+               "public class Box { public Color Color { get; set; } }\n"
+               + _program("        Box b = new Box();\n"
+                          "        b.Color = Color.Green;\n"
+                          "        return (int)b.Color;"))
+        self.assertEqual(run_c(lower(src), _RUN_PROGRAM), 1)
+
+    def test_a_field_sharing_the_enum_name_is_refused(self):
+        self.assert_refuses("public enum Color { Red }\n"
+                            "public class Box { public Color Color; }\n",
+                            "`Color`", "{ get; set; }")
+
+    def test_two_enums_of_one_name_are_refused(self):
+        self.assert_refuses("namespace A { public enum Kind { X } }\n"
+                            "namespace B { public enum Kind { Y } }\n",
+                            "two enums are named `Kind`")
+
+    def test_enum_methods_are_refused(self):
+        self.assert_refuses("public enum Kind { A }\n" + _program(
+            "        var k = Kind.Parse(\"A\");\n        return 0;"),
+            "`Kind.Parse`")
+        self.assert_refuses("public enum Kind { A }\n" + _program(
+            "        string s = Kind.A.ToString();\n        return 0;"),
+            "`ToString`")
+
+    def test_a_constant_past_int_is_refused(self):
+        self.assert_refuses(
+            "public enum Big : uint { Top = 0xFFFFFFFF }\n", "`int` range")
+
+    def test_a_non_integral_base_is_refused(self):
+        self.assert_refuses("public enum Kind : float { A }\n",
+                            "integral")
+
+
 class TestDigest(unittest.TestCase):
     """C# joins the same --emit-decls digest as C++ / rpython (CPPRPY.md)."""
 
