@@ -33,13 +33,16 @@ Pinned in `tests/test_csrust.py` (`TestSemantics`).
 | single inheritance, `virtual` / `abstract` | vtables |
 | `class Box<T>` | `template<typename T> class Box` → monomorphise |
 | `List<T>` / `Dictionary<K,V>` | `std::vector` / `std::map` |
+| `xs.Add(x)`, `xs.Count`, `Insert`, `RemoveAt`, `Remove`, `Clear`, `Contains`, `IndexOf` | vector members and helpers (§5) |
+| `Type.Method(..)` for a `static` method | `Type::Method(..)` |
+| a field named after a type (`public In In;`) | `this.In` where C# means the field (§5) |
 | `T[]`, jagged `T[][]`, `.Length` | `vector`, `.size()` |
 | `new T[n]` (primitive or enum `T`) | zero-filled `vector` of length `n` |
 | `new T { A = 1 }` in a declaration | `new T()` then `x.A = 1;` |
-| `new T()` on a plain struct | declared, then zeroed byte by byte |
+| `new T()` on a plain struct or class, declared or assigned | zeroed byte by byte |
 | `[StructLayout(Sequential/Auto, Pack, Size)]` | checked; a layout-changing `Pack` → `_Pragma("pack(..)")` pair (§2) |
 | `MemoryMarshal` over an unmanaged struct | byte-copy helpers (§2) |
-| `var`, `foreach`, `this.`, `null` | `auto`, range-`for`, `this->`, `NULL` |
+| `var`, `foreach`, `this.`, `null` | the written type (`var x = new T(..)`) or `auto`, range-`for`, `this->`, `NULL` |
 | auto-properties `{ get; set; }` | field + `get_` / `set_` |
 | `delegate` | `typedef` function pointer |
 | `x => …` lambdas | C++ lambdas |
@@ -55,6 +58,13 @@ top-level statements, `Span<T>` / `ReadOnlySpan<T>`, array initializers
 (`new T[] { … }`), collection initializers, object initializers outside a
 declaration, `new T[n]` for a non-primitive `T`, `LayoutKind.Explicit`,
 enum methods (`ToString`, `Parse`, `HasFlag` …).
+
+Not refused yet, and failing or misbehaving instead — gaps, not design:
+a list of lists (`List<List<int>>`) cannot be declared, because the C++
+half cannot copy a vector of vectors; a class *with* a constructor leaves
+the fields it does not assign uninitialised, where C# zeroes them (a class
+or struct with no constructor and plain fields is zeroed); and an identity
+cast to a struct type, `(In)x`, is not C.
 
 Top-level statements are refused rather than lowered because C# requires
 them *before* every type declaration (CS8803) and C needs them after: a
@@ -143,10 +153,10 @@ leave the pragmas behind. And on a struct with a field that is not plain
 data: packing misaligns an owner (a `string`, an array) that the generated
 code works through by address.
 
-Known gaps: pointer-sized `nint`/`nuint` fields are accepted, but not under
-`Pack`, whose check needs a fixed size. A struct used as a field must be
-declared before the struct using it — C# allows either order, C does not,
-and the pipeline does not reorder definitions (packed or not).
+Known gap: pointer-sized `nint`/`nuint` fields are accepted, but not under
+`Pack`, whose check needs a fixed size. A packed struct may be declared
+after the struct that holds it; §4 moves its definition and keeps its
+`Pack` when it does.
 
 ## Enums (§3)
 
@@ -180,13 +190,105 @@ same as an enum type (`public Color Color;`) — cpprust resolves a typedef by
 substituting its name wherever it appears as a word. The property form
 `public Color Color { get; set; }` works, since its storage is renamed.
 
+## Declaration order (§4)
+
+C# lets a type hold one declared below it. C needs a by-value field's
+struct complete first, and a class here is owned, so stored by value — a
+class holding a later class has the same need as a struct holding a later
+struct. So does a `List<Item>` field: `vector_Item` is itself held back
+until `Item` is complete.
+
+`csrust` passes `any_order=True` to the C++ half, which moves the struct
+definitions a holder needs to a slot just above it, dependencies first
+(`cpprust._order_plan`):
+
+```csharp
+public struct Q { public byte A; public In inner; }   // In is below
+public struct In { public int V; }
+```
+
+Method bodies count too. They are emitted with their class, so `Program`
+written first — the usual C# file — declaring a local, taking a parameter
+or returning a value of a later type needs that type complete just as a
+field does. Declarations are what count (`Row r`, `Row Make()`,
+`sizeof(Row)`, `Row(..)`), not every mention: a static call `Row.Make()`
+needs only a prototype.
+
+Only the struct definition moves. Method bodies stay where they were
+written, so everything they read is complete exactly as before, and the
+slot carries line anchors so diagnostics on either side still name the
+right line. A moved struct keeps the `Pack` it was written under and does
+not take the holder's — its `_Pragma` pair stays behind at its original
+position, so the move re-applies the packing in force there. Code that
+declares everything in order is untouched: nothing to move, byte-identical
+output.
+
+Refused, in C# terms:
+
+- a later type with a base class or an interface, held as a field or
+  declared in a method — its lowered struct is tied to its vtables where it
+  is declared. Declare it above the holder, or mark it `[Shared]`;
+- a cycle of fields (`A` holds `B` holds `A`). Ordinary C#, because fields
+  are references; here each would contain the other. Marking one `[Shared]`
+  makes a field of that type a reference again, and breaks it.
+
+## Lists, static calls, and names shared with types (§5)
+
+**`List<T>` members** are lowered only where the receiver is *known* to be
+a `List`: `Add` and `Count` are ordinary names, and a class of the
+author's may have its own. The receiver is resolved the way a reader
+would — a local or parameter declared above it in the method, a `foreach`
+variable, else a field of the class; then field by field, and element by
+element for `[..]` — and anything unresolved is left alone.
+
+| C# | lowers to |
+|----|-----------|
+| `xs.Add(x)` | `xs.push_back(x)`; a new object or call result is named, then moved in |
+| `xs.Count` | `xs.size()` |
+| `xs.Insert(i, x)`, `xs.RemoveAt(i)` | `insert` / `erase`, the index checked |
+| `xs.Clear()` | `xs.clear()` |
+| `xs.Contains(x)`, `xs.IndexOf(x)`, `xs.Remove(x)` | a per-element-type helper using `==` |
+
+An index outside the list aborts, as the unhandled
+`ArgumentOutOfRangeException` does; the vector's own `insert` would clamp
+it and `erase` ignore it. `Contains`/`IndexOf`/`Remove` are for primitive
+and enum elements, where C#'s `Equals` is `==`; for a class they are
+refused, since that `Equals` is not here. `Sort` and the rest of `List`,
+and LINQ's `Count()`, are refused naming what is supported.
+
+A `List` behind an auto-property (`public List<int> Items { get; set; }`)
+is reached through its storage, `_Items`, for every read and member call:
+the getter returns the list by value, and `b.Items.Add(1)` or
+`b.Items[0] = 5` through it would change a copy. In C# the getter returns
+the same list, so the storage is what that means. Assigning the property
+still goes through its setter.
+
+`var` is spelled out where the type is written on the right — `var xs =
+new List<int>()`, `var a = new int[n]` — and a `foreach` variable over a
+member chain gets its element type, because the C++ half deduces a loop
+variable only from a local's declared type. `foreach` over a list
+declared with `var` did not translate before this.
+
+**Static calls** through a type, `Type.Method(..)`, become
+`Type::Method(..)` when `Method` is declared `static` in that type.
+
+**A member named after a type** — `public In In;`, most often its own —
+is resolved per use, by C#'s rule: in `In.X`, an instance member means the
+field and a static one the type. Inside the owning class's methods, every
+use that means the field is given an explicit `this.`; `new In(..)`,
+`In x`, `(In)x`, `In[]`, generic arguments, `typeof`/`sizeof`/`nameof` and
+`In.Static` are the type and are left alone. A local or parameter of the
+same name shadows the field, as in C#. (The C that results, `struct Q { In
+In; }` followed by `In x;`, is valid C; shivyc's parser had to be fixed to
+accept it — see PREPROCESSOR.md.)
+
 ## Layout
 
 | file | role |
 |------|------|
 | `tools/cs2cpp.py` | refusals + C# → C++ subset (`translate`) |
 | `tools/csrust.py` | CLI; `cs2cpp.translate` then `cpprust.translate` |
-| `tests/test_csrust.py` | semantics, lowering, Shared, generics, except, digest, plain data, enums |
+| `tests/test_csrust.py` | semantics, lowering, Shared, generics, except, digest, plain data, enums, declaration order, lists, type-named fields |
 
 A Unity *scene* plus these scripts is a different job: see
 [UNITY_PACK.md](UNITY_PACK.md). That packer emits `engine.c` / `data.c`

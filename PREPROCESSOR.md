@@ -1435,3 +1435,20 @@ Not covered yet:
   `SetRel`/`ReadRel`) moves only 8 bytes on arm64. Present before this work;
   not fixed here because arm64 code could not be run to test a fix.
 
+## Struct member names do not hide typedefs
+
+C gives each struct its own namespace for members, so after
+`struct Q { In In; };` the name `In` is still the typedef and `In x;`
+declares one — gcc accepts it with `-std=c99 -pedantic`. ShivyC's parser,
+which decides typedef-or-identifier with a scoped symbol table, registered
+every declarator in the current scope, a struct member's included; the
+member then made `In` an ordinary identifier in the enclosing scope, and
+the declaration a parse error. `parse_struct_union_members`
+(`parser/declaration.py`) now parses the member list in a scope of its own,
+pushed and popped through the same journal the speculative parses use.
+Pinned by `tests/feature_tests/struct_member_typedef_name.c`, which fails
+to compile on the old parser. Found because C# lowers a field named after
+its own type (`public In In;`) to exactly this shape. Checked: feature
+tests and `test_crust` unchanged, assembly unchanged, `selfhost test`
+passes, and the parser still transpiles with py2c.
+

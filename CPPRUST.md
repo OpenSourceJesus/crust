@@ -2049,6 +2049,20 @@ module is not in the transpiled set — it leans on compiled-pattern objects
 and match methods that py2c does not lower, whereas `shivyc/crust.py` stays
 inside the supported subset on purpose.
 
+`translate(.., any_order=True)` lets a class hold, by value, a class or
+container instantiation declared *below* it. C++ does not allow that, so
+it is off by default and C++ input keeps C++'s rule; `tools/csrust.py`
+turns it on, because C# does allow it (see CSRUST.md §4). A class needs
+a unit complete when it holds one as a field, or when its methods declare
+one by value — a local, a parameter, a return, `sizeof`, a construction
+(a call through `Cls::name()` needs only the hoisted prototype). The struct
+definitions a holder needs are moved to a slot above it, dependencies
+first; method bodies stay in place, the slot carries line anchors, and a
+moved definition keeps the `#pragma pack` state it was written under.
+A needed class with a base or virtual members, or a by-value cycle, is an
+error. With nothing out of order the output is byte-identical to
+`any_order=False`.
+
 A subprocess removes the symbol entirely, so the self-hosted compiler links
 with no reference to this file. The protocol is one file and one exit
 status, with the diagnostic written to the output file on failure, so the
