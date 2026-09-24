@@ -438,7 +438,22 @@ def parse_struct_union_members(index):
     """Parse the list of members of struct or union as a list of Root nodes.
 
     index - index right past the open bracket starting the members list
+
+    The members are parsed in a scope of their own. A member name lives in
+    the struct's namespace, not the ordinary one, so it must not hide a
+    typedef: after `struct Q { In In; };`, `In other;` still declares an
+    `In`. Registered in the enclosing scope, the member made `In` an
+    ordinary identifier there and that declaration a parse error -- C that
+    gcc accepts with -pedantic, and the shape C# lowers `public In In;` to.
     """
+    p.symbols.new_scope()
+    members, index = _parse_struct_union_member_list(index)
+    p.symbols.end_scope()
+    return members, index
+
+
+def _parse_struct_union_member_list(index):
+    """The body of `parse_struct_union_members`, in its member scope."""
     members = []
 
     while True:
