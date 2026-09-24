@@ -433,6 +433,151 @@ def _lower_foreach(text):
     return "".join(out)
 
 
+class ObjectModel(object):
+    """How C# reference types are represented in the lowered code.
+
+    The one thing csrust and unity_pack lower differently. csrust's classes
+    are owned values, and `null` is C's `NULL`. unity_pack's are indices into
+    per-class instance arrays -- the "packed" model -- where a missing object
+    is `-1`. unity_pack's own script translator is being moved onto this
+    file one family at a time, and each family that depends on the model
+    adds what it needs here; `lower_body` is where the families live.
+
+    null_handle -- what `x == null` / `x != null` compares a reference with,
+                   or None to leave comparisons to `_lower_literals` (csrust,
+                   where a bare `null` is `NULL` everywhere).
+    bool_ints   -- `true` / `false` as `1` / `0` (plain C), rather than kept
+                   for the C++ subset, which has `bool`.
+    this_index  -- the packed receiver: an object *is* its index `i`, so
+                   `this.x` is `x` (the implicit-field lowering takes it
+                   from there) and a bare `this` is `i`. csrust keeps `this`
+                   and lowers `this.` to `this->` itself.
+    string_type -- the C type a `string` local is declared as, or None to
+                   leave `string` to the type map (csrust: its `string`).
+    byte_array  -- the C struct a `byte[]` is (`ByteArray`, with `.data` and
+                   `.length`), or None for the C# subset's own arrays.
+    """
+
+    def __init__(self, null_handle=None, bool_ints=False, this_index=False,
+                 string_type=None, byte_array=None):
+        self.null_handle = null_handle
+        self.bool_ints = bool_ints
+        self.this_index = this_index
+        self.string_type = string_type
+        self.byte_array = byte_array
+
+
+#: csrust: owned values; `null` is handled as a literal.
+OWNED = ObjectModel()
+
+
+def packed_model(has_objects, byte_arrays=False):
+    """unity_pack's: a reference is an index, null is -1.
+
+    `has_objects`: the project has objects to index; without them there is
+    nothing a comparison with null could mean. `byte_arrays`: the engine
+    emits its `ByteArray` struct, which a `byte[]` then is."""
+    return ObjectModel(null_handle="-1" if has_objects else None,
+                       bool_ints=True, this_index=True,
+                       string_type="const char *",
+                       byte_array="ByteArray" if byte_arrays else None)
+
+
+def lower_body(text, model):
+    """The C# language families cs2cpp owns, for a method body or a file.
+
+    `translate` runs them on a whole file, and unity_pack on each script
+    method body before its Unity API rewrites. Families so far: float
+    literals, comparisons with null, boolean literals, the packed `this`.
+    Each is matched outside strings and comments.
+    """
+    text = lower_float_literals(text)
+    if model.null_handle is not None:
+        text = _lower_null_compares(text, model.null_handle)
+    if model.bool_ints:
+        text = cpprust._sub_code(r"(?<![\w.])(true|false)\b",
+                                 lambda m: "1" if m.group(1) == "true" else "0",
+                                 text)
+    if model.this_index:
+        text = cpprust._sub_code(r"\bthis\s*\.\s*", lambda m: "", text)
+        text = cpprust._sub_code(r"(?<![\w.])this(?![\w])",
+                                 lambda m: "i", text)
+    return text
+
+
+def lower_local_types(text, model):
+    """C#'s own types, declared as the model represents them.
+
+    Separate from `lower_body` because unity_pack runs it later: its Unity
+    rewrites between the two read some declarations as C# wrote them. So
+    far: `string` locals.
+    """
+    if model.string_type is not None:
+        text = cpprust._sub_code(r"\bstring\b(?=\s+\w)",
+                                 lambda m: model.string_type, text)
+    return text
+
+
+def lower_byte_arrays(text, model):
+    """`byte[]` as the model's byte-array struct, where it has one.
+
+    The type, then each local's `.Length` as `.length` and `b[i]` as
+    `b.data[i]`. unity_pack runs this last of the families, after its File
+    and string rewrites, which read `byte[]` as C# wrote it.
+    """
+    if model.byte_array is None:
+        return text
+    t = model.byte_array
+    text = cpprust._sub_code(r"\bbyte\s*\[\s*\]", lambda m: t, text)
+    for name in sorted(set(re.findall(r"\b%s\s+(\w+)\b" % re.escape(t),
+                                      _blank(text)))):
+        text = cpprust._sub_code(
+            r"(?<![.\w])%s\.Length\b" % re.escape(name),
+            lambda m, n=name: "%s.length" % n, text)
+        text = cpprust._sub_code(
+            r"(?<![.\w])%s\s*\[(.*?)\]" % re.escape(name),
+            lambda m, n=name: "%s.data[%s]" % (n, m.group(1)), text)
+    return text
+
+
+def _lower_null_compares(text, value):
+    """`x == null` / `x != null` against the model's null reference.
+
+    Matched on a blanked scan, so `"== null"` inside a string is left alone.
+    """
+    scan = _blank(text)
+    out, pos = [], 0
+    for m in re.finditer(r"([!=])=\s*null\b", scan):
+        out.append(text[pos:m.start()])
+        out.append("%s= %s" % (m.group(1), value))
+        pos = m.end()
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def lower_float_literals(text):
+    """C# `0f` -> C `0.f`: C rejects a float suffix on an integer constant.
+
+    C# allows `0f` / `1F` (digits and a real-type suffix); C needs a
+    decimal point (`0.f`). A literal that already has one, or an exponent
+    (`1.5f`, `1e2f`), is valid in both and left alone. Matched on a blanked
+    scan, so a `"0f"` inside a string stays put.
+
+    Shared: `tools/unity_pack.py` lowers script bodies with it too. It was
+    written there first; the C# subset did not lower the suffix at all, so
+    `float x = 2f;` reached C as `2f` and did not compile.
+    """
+    scan = _blank(text)
+    out = []
+    pos = 0
+    for m in re.finditer(r"(?<![\w.])(\d+)([fF])\b", scan):
+        out.append(text[pos:m.start(1)])
+        out.append(m.group(1) + "." + m.group(2))
+        pos = m.end()
+    out.append(text[pos:])
+    return "".join(out)
+
+
 def _lower_literals(text):
     return cpprust._sub_code(r"(?<![\w.])null(?![\w])",
                              lambda m: "NULL", text)
@@ -2535,6 +2680,7 @@ def translate(text, path="<cs>"):
     text = _lower_foreach(text)
     text = _lower_this(text)
     text = _lower_literals(text)
+    text = lower_body(text, OWNED)
     text = _lower_throw_catch(text)
     text = _lower_lambdas(text)
     text = _lower_new(text, shared)

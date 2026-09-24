@@ -43,7 +43,7 @@ def translate(text, path="<cs>", owning=None, basedir=None, incdirs=(),
         cpp, path=path, owning=owning, basedir=basedir, incdirs=incdirs,
         defines=defines, clang=False if clang is None else clang,
         rtti=rtti, decls=decls, decls_out=decls_out,
-        contracts=contracts, mem_safe=mem_safe)
+        contracts=contracts, mem_safe=mem_safe, any_order=True)
 
 
 def main():
@@ -173,7 +173,8 @@ def main():
         result = cpprust.translate(
             cpp, path=src, owning=owning, basedir=basedir, incdirs=incdirs,
             defines=defines, clang=False, rtti=rtti, decls=decls,
-            decls_out=decls_out, contracts=contracts, mem_safe=mem_safe)
+            decls_out=decls_out, contracts=contracts, mem_safe=mem_safe,
+            any_order=True)
     except cpprust.CppError as e:
         # A C++ diagnostic reaching a C# author names a construct they did
         # not write. That is a gap in `_check_refusals`, not a user error,

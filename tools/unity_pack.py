@@ -58,12 +58,50 @@ def _assets_rel_path(path):
     return os.path.basename(path) if path else "<cs>"
 
 
-def _cs_diag(path, text, idx, code, message):
+def _cs_diag(path, text, idx, code, message, kind="error"):
     """Unity/csc diagnostic: `Assets/.../File.cs(line,col): error CSxxxx: …`."""
     line = text.count("\n", 0, idx) + 1
     col = idx - (text.rfind("\n", 0, idx) + 1) + 1
-    return "%s(%d,%d): error %s: %s" % (
-        _assets_rel_path(path), line, col, code, message)
+    return "%s(%d,%d): %s %s: %s" % (
+        _assets_rel_path(path), line, col, kind, code, message)
+
+
+def _report_stub(plan, site, cl, m, why):
+    """A method the translator could not lower: warn at its site, or refuse.
+
+    It used to become an empty function with no word said, which changed
+    what the program does -- a `Debug.Log` vanished, and so did whole
+    `File` calls when their lowering regressed, with the tests that pinned
+    them reporting only that a string was missing. Now it is a csc-style
+    diagnostic at the method, naming the C# that was left: a warning by
+    default, since the translator does not yet cover everything the packer
+    accepts, and an error under `pack(strict=True)` / `--strict`. Every stub
+    is also recorded in `plan["stubs"]`.
+
+    CS8000 is csc's "this language feature is not yet implemented", which
+    is exactly what a stub is.
+    """
+    what, text = why
+    text = " ".join(str(text).split())
+    message = ("`%s.%s` is not lowered yet (`%s`: %s); it is emitted as an "
+               "empty method" % (cl["name"], m["name"], text, what.rstrip(".")))
+    path = site.get("path") or "<cs>"
+    ft = site.get("file_text") or ""
+    at = int(site.get("body_abs") or 0)
+    plan.setdefault("stubs", []).append(
+        {"class": cl["name"], "method": m["name"], "path": path,
+         "text": text, "what": what})
+    if plan.get("strict"):
+        if ft:
+            raise PackError(_cs_diag(path, ft, at, "CS8000", message))
+        raise PackError("%s(1,1): error CS8000: %s"
+                        % (_assets_rel_path(path), message))
+    if ft:
+        diag = _cs_diag(path, ft, at, "CS8000", message, kind="warning")
+    else:
+        diag = "%s(1,1): warning CS8000: %s" % (_assets_rel_path(path),
+                                               message)
+    sys.stderr.write(diag + "\n")
 
 
 def _raise_cs(path, text, idx, code, message):
@@ -7200,7 +7238,28 @@ def _reachable_emit_methods(methods):
 
 
 def _lowered_body_still_csharp(body, args_str=None, emitted_params=None):
-    """True if *body* still has C# the C subset cannot parse.
+    """True if *body* still has C# the C subset cannot parse (see below)."""
+    return _unlowered_csharp(body, args_str, emitted_params) is not None
+
+
+def _engine_types_declared(lines):
+    """C type names the engine text so far defines (`} Name;`, typedefs)."""
+    text = "\n".join(lines)
+    names = set(re.findall(r"(?m)^\}\s*([A-Za-z_]\w*)\s*;", text))
+    names.update(re.findall(r"typedef\s+struct\s+([A-Za-z_]\w*)", text))
+    # C++-subset structs (`struct Vector2Int { .. }`, for map keys).
+    names.update(re.findall(r"(?m)^\s*struct\s+([A-Za-z_]\w*)\s*\{", text))
+    names.update(re.findall(r"typedef\s+[^;{}]*?\b([A-Za-z_]\w*)\s*;", text))
+    return names
+
+
+def _unlowered_csharp(body, args_str=None, emitted_params=None,
+                      known_types=()):
+    """What C# is left in *body* that the C subset cannot parse, or None.
+
+    Returns (what, text): the check that fired -- its own comment -- and the
+    source text it matched, for the diagnostic `emit_engine` reports when it
+    stubs the method.
 
     Methods that still use GetComponents / leftover ``T[]`` locals /
     ``Type.instances`` / unlowered Instantiate overloads / lambdas /
@@ -7209,75 +7268,111 @@ def _lowered_body_still_csharp(body, args_str=None, emitted_params=None):
     empty stubs instead of failing crust (e.g. ``expected ';' after
     'SoundEffect'`` / ``undeclared identifier 'cosmetic'``).
     """
+    _seen = []
     if not body or not str(body).strip():
-        return False
+        return None
+    # Matched with string and comment contents blanked (same length): a
+    # lowered body carries string literals -- the script's own path, in a
+    # null-reference message -- and `Objects (Scripts)/Player.cs` inside
+    # one read as an unlowered call, which threw away a method that was
+    # lowered completely. The text reported is the original's.
+    raw = body
+    body = cs2cpp._blank(body)
+
+    def _rec(pattern, text, *flags):
+        m = re.search(pattern, text, *flags)
+        if m:
+            _seen.append(raw[m.start():m.end()] if text is body
+                         else m.group(0))
+        return m
+
     # Instantiate(this[, parent]) is rewritten; leftover overloads still stub.
-    if re.search(r"(?<![\w.])(?:Object\.)?Instantiate\s*\(", body):
-        return True
+    if _rec(r"(?<![\w.])(?:Object\.)?Instantiate\s*\(", body):
+        return ('Instantiate(this[, parent]) is rewritten; leftover overloads still stub.', _seen[-1] if _seen else '')
     # GetComponentsInChildren is rewritten; bare GetComponents (no InChildren) stubs.
-    if re.search(r"GetComponentsInChildren\s*<", body):
-        return True
-    if re.search(r"GetComponents\s*<", body):
-        return True
+    if _rec(r"GetComponentsInChildren\s*<", body):
+        return ('GetComponentsInChildren is rewritten; bare GetComponents (no InChildren) stubs.', _seen[-1] if _seen else '')
+    if _rec(r"GetComponents\s*<", body):
+        return ('GetComponentsInChildren is rewritten; bare GetComponents (no InChildren) stubs.', _seen[-1] if _seen else '')
     # C# array locals / fields left after rewrite: ``Renderer[] renderers``.
-    if re.search(r"(?<![\w.])\w+\s*\[\s*\]\s*\w+", body):
-        return True
+    if _rec(r"(?<![\w.])\w+\s*\[\s*\]\s*\w+", body):
+        return ('C# array locals / fields left after rewrite: `Renderer[] renderers`.', _seen[-1] if _seen else '')
     # Leftover generics not rewritten to C helpers.
-    if re.search(r"\w+\s*<\s*\w+\s*>\s*\(", body):
-        return True
+    if _rec(r"\w+\s*<\s*\w+\s*>\s*\(", body):
+        return ('Leftover generics not rewritten to C helpers.', _seen[-1] if _seen else '')
     # Static array not lowered: ``Cosmetic.instances.Length`` / ``[i]``.
-    if re.search(r"(?<![\w._])[A-Z]\w*\.instances\b", body):
-        return True
+    if _rec(r"(?<![\w._])[A-Z]\w*\.instances\b", body):
+        return ('Static array not lowered: `Cosmetic.instances.Length` / `[i]`.', _seen[-1] if _seen else '')
     # C# lambda / expression-bodied leftovers (Action, LINQ, etc.).
     if "=>" in body:
-        return True
+        at = body.index("=>")
+        lo = raw.rfind("\n", 0, at) + 1
+        hi = raw.find("\n", at)
+        _seen.append(raw[lo:hi if hi >= 0 else len(raw)].strip())
+        return ('C# lambda / expression-bodied leftovers (Action, LINQ, etc.).', _seen[-1] if _seen else '')
     # Bare C# instance/static method call not rewritten: ``End()`` (no ``_``).
     # Allow value-type ctors kept as ``Vector2Int(`` / ``Color(``.
     _ctor_ok = (
         r"Vector2Int|Vector3Int|Vector4|Vector3|Vector2|"
         r"Color|Quaternion|RectInt|Rect|Bounds"
     )
-    if re.search(
+    if _rec(
             r"(?<![\w.])(?!(?:%s)\b)[A-Z][a-zA-Z0-9]*\s*\(" % _ctor_ok,
             body):
-        return True
+        return ('Bare C# instance/static method call not rewritten: `End()` (no `_`). Allow value-type ctors kept as `Vector2Int(` / `Color(`.', _seen[-1] if _seen else '')
     # Unlowered static call: ``EventManager.AddEvent(...)`` (Pascal Type.Method).
     # Not ``P_equipped.push_back`` (underscored C ident).
-    if re.search(
+    if _rec(
             r"(?<![\w_])[A-Z][a-zA-Z0-9]*\.[A-Z][a-zA-Z0-9]*\s*\(",
             body):
-        return True
+        return ('Unlowered static call: `EventManager.AddEvent(...)` (Pascal Type.Method). Not `P_equipped.push_back` (underscored C ident).', _seen[-1] if _seen else '')
     # Unlowered static field: ``Vector3.zero`` / ``Random.value``.
-    if re.search(r"(?<![\w_])[A-Z][a-zA-Z0-9]*\.[a-z]\w*\b", body):
-        return True
+    if _rec(r"(?<![\w_])[A-Z][a-zA-Z0-9]*\.[a-z]\w*\b", body):
+        return ('Unlowered static field: `Vector3.zero` / `Random.value`.', _seen[-1] if _seen else '')
     # Chained call/property on a call result: ``AudioManager_Instance().MakeSoundEffect``.
-    if re.search(r"\)\s*\.\s*[A-Za-z_]", body):
-        return True
+    if _rec(r"\)\s*\.\s*[A-Za-z_]", body):
+        return ('Chained call/property on a call result: `AudioManager_Instance().MakeSoundEffect`.', _seen[-1] if _seen else '')
     # C# typed local of a reference type: ``SoundEffect soundEffect =``.
-    if re.search(
+    # Not one of the engine's own C types, which the translator declares
+    # locals of itself -- `byte[]` becomes `ByteArray b = ..` -- and which
+    # this check used to take for leftover C#, stubbing the method.
+    for tm in re.finditer(
             r"(?<![\w.])[A-Z]\w*(?:\s*\.\s*[A-Z]\w*)*\s+[a-z_]\w*\s*=",
             body):
-        return True
+        if re.match(r"[A-Z]\w*", tm.group(0)).group(0) in known_types:
+            continue
+        _seen.append(raw[tm.start():tm.end()])
+        return ('C# typed local of a reference type: `SoundEffect soundEffect =`.', _seen[-1] if _seen else '')
     # Unity component handle still using ``recv.gameObject``.
-    if re.search(r"\w+\.gameObject\b", body):
-        return True
+    if _rec(r"\w+\.gameObject\b", body):
+        return ('Unity component handle still using `recv.gameObject`.', _seen[-1] if _seen else '')
     # Leftover C# / Unity member access (allow std::vector / string APIs).
     _cxx_mem = (
         r"size|push_back|pop_back|clear|empty|begin|end|insert|erase|"
         r"find|count|at|resize|reserve|data|front|back|append|"
         r"c_str|length|substr|compare"
     )
-    if re.search(
-            r"(?<![:\w])\b[A-Za-z_]\w*\.(?!(?:%s)\b)[A-Za-z_]\w*" % _cxx_mem,
+    # A field of a local the body declares with one of the engine's own C
+    # types (`Matrix4x4 l2w = ..; l2w.m00`) is C, not leftover C#; the C
+    # compiler checks the field.
+    engine_locals = set(re.findall(
+        r"(?<![\w.])(?:%s)\s+([A-Za-z_]\w*)\s*[=;]"
+        % "|".join(re.escape(t) for t in sorted(known_types)), body)
+    ) if known_types else set()
+    for mm in re.finditer(
+            r"(?<![:\w])\b([A-Za-z_]\w*)\.(?!(?:%s)\b)[A-Za-z_]\w*" % _cxx_mem,
             body):
-        return True
+        if mm.group(1) in engine_locals:
+            continue
+        _seen.append(raw[mm.start():mm.end()])
+        return ('Leftover C# / Unity member access (allow std::vector / string APIs).', _seen[-1] if _seen else '')
     # C# property / field on a typed local still using ``recv.Name``.
-    if re.search(r"\b\w+\.(?:Length|Count|activeSelf)\b", body):
+    if _rec(r"\b\w+\.(?:Length|Count|activeSelf)\b", body):
         # Allow vector/map helpers already lowered (``foo.size()`` etc.).
-        if re.search(r"(?<!_)\w+\.(?:Length|Count)\b", body):
-            return True
-        if re.search(r"\w+\.activeSelf\b", body):
-            return True
+        if _rec(r"(?<!_)\w+\.(?:Length|Count)\b", body):
+            return ('Allow vector/map helpers already lowered (`foo.size()` etc.).', _seen[-1] if _seen else '')
+        if _rec(r"\w+\.activeSelf\b", body):
+            return ('Allow vector/map helpers already lowered (`foo.size()` etc.).', _seen[-1] if _seen else '')
     # Instance method C# params not emitted as C formals (only ``i`` / coll).
     emitted = set(emitted_params or ()) | {"i"}
     for part in (args_str or "").split(","):
@@ -7291,9 +7386,9 @@ def _lowered_body_still_csharp(body, args_str=None, emitted_params=None):
         pname = pm.group(2)
         if pname in emitted:
             continue
-        if re.search(r"(?<![\w.])%s\b" % re.escape(pname), body):
-            return True
-    return False
+        if _rec(r"(?<![\w.])%s\b" % re.escape(pname), body):
+            return ('Instance method C# params not emitted as C formals (only `i` / coll).', _seen[-1] if _seen else '')
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -10469,18 +10564,26 @@ def emit_engine(plan, analyses, used_apis):
                     pm = re.match(r"([\w.<>]+)\s+(\w+)\s*$", part)
                     if pm:
                         emitted.add(pm.group(2))
-            if _lowered_body_still_csharp(
-                    body, args_str=m.get("args") or "",
-                    emitted_params=emitted):
+            why = _unlowered_csharp(
+                body, args_str=m.get("args") or "", emitted_params=emitted,
+                known_types=_engine_types_declared(lines))
+            if why is not None:
+                _report_stub(plan, site, cl, m, why)
                 if not m.get("static"):
                     p("    (void)i;")
                 if coll_param:
                     p("    (void)%s;" % coll_param)
                 # Keep lowered SetActive even when the rest of Awake stubs —
                 # SettingsMenu.Awake → gameObject.SetActive(false).
+                # Only a line that is itself fully lowered: the call can sit
+                # inside something that is not -- a lambda passed to a
+                # static helper -- and copying that line brought the C#
+                # into the stub, which crust then refused.
+                kt = _engine_types_declared(lines)
                 for line in body.split("\n"):
                     s = line.strip()
-                    if "GameObject_SetActive(" in s:
+                    if "GameObject_SetActive(" in s and \
+                            _unlowered_csharp(s, known_types=kt) is None:
                         p("    " + s.rstrip(";").rstrip() + ";")
                 p("    /* unlowered C# (GetComponentsInChildren / T[] / "
                   "leftover Instantiate / lambda / Type.Method) — stub */")
@@ -13312,25 +13415,6 @@ def _wrap_log_gameobject_tostring(text):
     return "".join(out)
 
 
-def _rewrite_csharp_float_literals(text):
-    """C# `0f` → C `0.f`. C rejects a float suffix on an integer constant.
-
-    C# allows `0f` / `1F` (digits + real-type-suffix). C needs a decimal
-    point (`0.f` / `0.0f`). Literals that already have `.` or an exponent
-    (`1.5f`, `1e2f`) are valid in both and left alone. Runs on a blanked
-    scan so `"0f"` in a string stays put.
-    """
-    scan = cs2cpp._blank(text)
-    out = []
-    pos = 0
-    for m in re.finditer(r"(?<![\w.])(\d+)([fF])\b", scan):
-        out.append(text[pos:m.start(1)])
-        out.append(m.group(1) + "." + m.group(2))
-        pos = m.end()
-    out.append(text[pos:])
-    return "".join(out)
-
-
 def _parse_byte_array_lit_inner(inner):
     """Parse `1, 2, 0xFF` inside `new byte[] { ... }` → list of 0..255 ints."""
     nums = []
@@ -13742,19 +13826,6 @@ def _rewrite_byte_array_lits(text, plan):
     return _NEW_BYTE_ARRAY_LIT.sub(repl, text)
 
 
-def _rewrite_bytearray_member_access(text):
-    """ByteArray locals: .Length → .length; [i] → .data[i]."""
-    names = set(re.findall(r"\bByteArray\s+(\w+)\b", text))
-    for name in names:
-        text = re.sub(
-            r"(?<![.\w])%s\.Length\b" % re.escape(name),
-            "%s.length" % name, text)
-        text = re.sub(
-            r"(?<![.\w])%s\s*\[(.*?)\]" % re.escape(name),
-            r"%s.data[\1]" % name, text)
-    return text
-
-
 def _rewrite_file_copy(text):
     """File.Copy(src, dest) / Copy(src, dest, overwrite) → File_Copy(..., int)."""
     if not re.search(r"(?:System\.IO\.)?File\.Copy\s*\(", text):
@@ -13846,6 +13917,13 @@ def _rewrite_file_text_streams(text, cl):
     return text
 
 
+def _packed_model(plan):
+    """cs2cpp's packed object model for this plan's engine."""
+    return cs2cpp.packed_model(
+        bool(plan.get("go_names")),
+        byte_arrays=plan.get("_byte_array_lit_i") is not None)
+
+
 def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     """C# subset method → C against packed arrays.
 
@@ -13854,12 +13932,11 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     field is already an index: `other.hp` → `_Other_inst_array[other].hp`.
     """
     idn = _c_ident(cl["name"])
-    text = _rewrite_csharp_float_literals(body)
-    text = re.sub(r"(?<![\w.])true\b", "1", text)
-    text = re.sub(r"(?<![\w.])false\b", "0", text)
-    text = re.sub(r"\bthis\.", "", text)
-    # Bare `this` is the packed instance index (Add(this), == this, …).
-    text = re.sub(r"(?<![\w.])this(?![\w])", "i", text)
+    # The C# language families cs2cpp owns -- float literals, null
+    # comparisons against the packed -1, `true`/`false`, the packed `this`
+    # as the index `i` -- then the Unity API rewrites.
+    text = cs2cpp.lower_body(body, _packed_model(plan))
+    # (`true`/`false` -> 1/0 and the packed `this` -> `i`: `lower_body`.)
     # base.Awake() / base.OnEnable() — no C equivalent; drop.
     text = re.sub(
         r"(?<![\w.])base\s*\.\s*(?:Awake|OnEnable)\s*\(\s*\)\s*;?",
@@ -13902,14 +13979,14 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
             r"\s*\.\s*transform\b",
             r"\1", text)
     # Unity Object null checks → packed index sentinel (-1).
+    # (Null comparisons against -1: `cs2cpp.lower_body`, above.)
     if plan.get("go_names"):
-        text = re.sub(r"==\s*null\b", "== -1", text)
-        text = re.sub(r"!=\s*null\b", "!= -1", text)
         # Transform / GameObject locals are GO indices.
         text = re.sub(r"\bTransform\b(?=\s+\w)", "int", text)
         text = re.sub(r"\bGameObject\b(?=\s+\w)", "int", text)
-    # C# string locals → const char * (ReadLine / path vars).
-    text = re.sub(r"\bstring\b(?=\s+\w)", "const char *", text)
+    # C# string locals → const char * (ReadLine / path vars): cs2cpp's,
+    # under the packed model.
+    text = cs2cpp.lower_local_types(text, _packed_model(plan))
     # Find/GetComponent before field rewrites so `.amp` stays on the target type.
     text = _rewrite_find_getcomponent(text, plan, cl["name"], site=site)
     text, add_locals = _rewrite_addcomponent(text, plan, cl["name"])
@@ -13980,9 +14057,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         r"(?:System\.IO\.)?File\.Delete\s*\(",
         "File_Delete(", text)
     # byte[] locals / params → ByteArray (File WriteAllBytes / ReadAllBytes).
-    if plan.get("_byte_array_lit_i") is not None:
-        text = re.sub(r"\bbyte\s*\[\s*\]", "ByteArray", text)
-        text = _rewrite_bytearray_member_access(text)
+    text = cs2cpp.lower_byte_arrays(text, _packed_model(plan))
     text = re.sub(
         r"(?<![\w.])(?:Object\.)?Destroy\s*\(\s*gameObject\s*\)",
         "Object_Destroy(_engine_go_of_%s(i))" % idn
@@ -15851,7 +15926,7 @@ def _emit_artifact_unchanged(outdir, cpp_name, c_name, cpp_text, force):
     return old == cpp_text
 
 
-def pack(root, outdir, soa=False, soa_vec4=False, force=False):
+def pack(root, outdir, soa=False, soa_vec4=False, force=False, strict=False):
     os.makedirs(outdir, exist_ok=True)
     fp, assets_fp, scripts_fp = _input_fingerprints(
         root, soa=soa, soa_vec4=soa_vec4)
@@ -16035,6 +16110,9 @@ def pack(root, outdir, soa=False, soa_vec4=False, force=False):
     plan["live_scale_classes"] = sorted(live_scale)
     os.makedirs(outdir, exist_ok=True)
     _progress("emitting engine.c (%d classes)" % len(plan["classes"]))
+    # A method the translator cannot lower is a warning, or with `strict`
+    # an error (`_report_stub`).
+    plan["strict"] = bool(strict)
     engine = emit_engine(plan, analyses, used_apis)
     _progress("emitting data.c (%d texture(s))" % len(plan.get("textures") or []))
     data = emit_data(plan, used_apis)
@@ -16233,9 +16311,13 @@ def main():
     soa = False
     soa_vec4 = False
     force = False
+    strict = False
     if "--force" in args:
         force = True
         args.remove("--force")
+    if "--strict" in args:
+        strict = True
+        args.remove("--strict")
     if "--soa-vec4" in args:
         soa_vec4 = True
         soa = True
@@ -16253,7 +16335,7 @@ def main():
     if len(args) != 1:
         sys.stderr.write(
             "usage: unity_pack.py <project-dir> [-o <out-dir>] "
-            "[--soa | --soa-vec4] [--force]\n"
+            "[--soa | --soa-vec4] [--force] [--strict]\n"
             "  default out-dir: $TMPDIR/<project folder>\n"
             "  player binary:   <productName>  (Windows: <productName>.exe)\n"
             "  --force:         ignore stamp; always re-emit and transpile\n")
@@ -16261,7 +16343,8 @@ def main():
     if outdir is None:
         outdir = default_pack_dir(args[0])
     try:
-        plan = pack(args[0], outdir, soa=soa, soa_vec4=soa_vec4, force=force)
+        plan = pack(args[0], outdir, soa=soa, soa_vec4=soa_vec4, force=force,
+                    strict=strict)
         exe = build_player_executable(
             outdir, plan.get("product_name") or "Player")
     except PackError as e:
