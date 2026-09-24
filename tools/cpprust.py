@@ -4449,6 +4449,16 @@ _SCALAR_TYPES = frozenset((
     "long", "char", "bool", "int", "size_t"))
 
 
+#: The type inside `__cpp_ref(..)` / `__cpp_rref(..)`. More than one word,
+#: because a scalar may be spelled in several: `vector<unsigned char>` is
+#: what a C# `byte[]` lowers to, and a one-word pattern left its
+#: `__cpp_ref(unsigned char)` unexpanded -- which C then read as a call to
+#: an unknown type, so no `byte[]` parameter or `push_back` compiled. A
+#: class name is still one word, so nothing that matched before matches
+#: differently now.
+_CPP_REF_TYPE = r"[\w:]+(?:\s+[\w:]+)*"
+
+
 def _expand_cpp_rref(params, names):
     """`__cpp_rref(T)` -> `T` for a scalar, `T &&` for a class.
 
@@ -4459,7 +4469,7 @@ def _expand_cpp_rref(params, names):
     all, so it binds a reference the move constructor then empties.
     """
     return _sub_code(
-        r"(?<![\w.>])__cpp_rref\s*\(\s*([\w:]+)\s*\)",
+        r"(?<![\w.>])__cpp_rref\s*\(\s*(%s)\s*\)" % _CPP_REF_TYPE,
         lambda mm: ("%s &&" % mm.group(1)
                     if mm.group(1) in names else mm.group(1)),
         params)
@@ -4481,7 +4491,7 @@ def _expand_cpp_ref(params, names):
     beside it.
     """
     return _sub_code(
-        r"(?<![\w.>])__cpp_ref\s*\(\s*([\w:]+)\s*\)",
+        r"(?<![\w.>])__cpp_ref\s*\(\s*(%s)\s*\)" % _CPP_REF_TYPE,
         lambda mm: ("const %s &" % mm.group(1)
                     if mm.group(1) in names else mm.group(1)),
         params)
