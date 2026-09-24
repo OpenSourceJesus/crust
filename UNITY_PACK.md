@@ -49,12 +49,20 @@ shrinks those:
 2. **`float16` for static background.** A sprite that is never written
    in `Update` / never spawned does not need `float32`. Stored as
    `uint16_t` bits; widened on read.
-3. **Bitfields** for ints whose scene values (and script literals)
-   fit. `hp` that is only ever 0..7 is `unsigned hp : 3`.
+3. **Bitfields** for ints whose every value is known: the scene's, and
+   the literals (or consts) scripts assign. `hp` that is only ever 0..7
+   is `unsigned hp : 3`. A field written with anything else —
+   `seen = target.hp`, `hp++`, `hp += n`, a parameter, or a write from
+   another script through a handle — keeps its C# width: nothing bounds
+   it, and a bitfield would truncate or wrap it silently (it did:
+   `seen = target.hp` with 5 stored 1).
 4. **Indices instead of pointers.** If a class has ≤256 instances
    *and the scripts never `Instantiate` / `Destroy` / `new GameObject`*,
    a reference is `uint8_t` into `_Coin_inst_array[]`. The translator
-   rewrites `other.hp` to `_Coin_inst_array[other].hp`.
+   rewrites `other.hp` to `Coin_AT(Owner_get_other(i)).hp`, the instance
+   in `other`'s slot. (Documented from the start, it only works as of the
+   move to cs2cpp: it used to come out `Owner_get_other(i).Owner_get_hp(i)`
+   and the method was silently emptied. `TestPackedFields` runs it.)
 
 A hand-placed 2D coin with `hp` and a `Vector2` position is typically
 **8–16 bytes**, not a Unity object header.
@@ -201,10 +209,26 @@ cs2cpp's families before its own Unity API rewrites:
 | `this.x`, bare `this` | `lower_body` | `x`, `i` — an object is its index |
 | `string` locals | `lower_local_types` | `const char *` |
 | `byte[]`, `.Length`, `[i]` | `lower_byte_arrays` | `ByteArray`, `.length`, `.data[i]` |
+| `"s" + x` | `lower_string_concat`, `scalar_kind` | `_str_plus_i/f/c/s(..)` |
+| `List<T>`, `Dictionary<K,V>`, `SortedList` | `lower_list_types`, `lower_map_types`, `lower_*_members_named` | `std::vector` / `std::map`; `Add`, `Clear`, `Count`, `ContainsKey`, `Remove` |
+| statics, fields, `other.hp` | `lower_packed_fields` | `Owner_name`, `Owner_get_x(i)` / `Owner_set_x(i, v)`, `Other_AT(..).hp` |
+
+Collection element types are this file's (`_collection_elem_c_ty`, passed
+to cs2cpp as the model's `elem_type`) and are lossy: `double` is `float`,
+and `long`, `uint` and `ulong` are `int`. They were so before the move and
+are unchanged; widening them would change every packed collection.
+Which names are collections, the `Other_list` statics and the instance
+aliases (`&items = Owner_items[i]`) stay here with the plan that knows them.
 
 Each moved as the same code, so the packed output did not change — the
 golden check is byte-identical after every step — except that cs2cpp
-matches outside strings and comments, where unity_pack's regexes did not.
+matches outside strings and comments, where unity_pack's regexes did not,
+and where a step fixed something, shown case by case in the golden diff:
+a field write is parsed to the end of its expression (the old rewrite
+closed the paren at the end of the line, wrong for two writes on one
+line), handle fields are rewritten before their reads, and an int written
+with a non-literal keeps its width (one corpus field, `pointsPerGem =
+amount`, had been a 1-bit bitfield).
 `Transform`, `GameObject` and `AudioSource` locals stay here: they are
 Unity types, the API layer's, not C#'s.
 

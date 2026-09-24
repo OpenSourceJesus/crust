@@ -294,7 +294,17 @@ object is `-1`. `cs2cpp.ObjectModel` holds everything the two differ on;
 cs2cpp.lower_body(text, model)         # float literals, null, booleans, `this`
 cs2cpp.lower_local_types(text, model)  # `string` locals
 cs2cpp.lower_byte_arrays(text, model)  # `byte[]`
+cs2cpp.lower_string_concat(text, model, string_idents)  # "s" + x
+cs2cpp.lower_list_types(text, model)   # List<T>; lower_list_members_named
+cs2cpp.lower_map_types(text, model)    # Dictionary<K,V>; lower_map_members_named
+cs2cpp.lower_packed_fields(text, owner, members, statics, handles, model)
 ```
+
+`LIST_METHODS` is the one table of collection method spellings, used by
+csrust's type-resolved `List` lowering and by the named lowering alike.
+A replacement that copies an operand reads it from the text, not the
+blanked copy it matched on (`_sub_orig`): a string key used to come out as
+spaces.
 
 `translate` runs `lower_body` under `OWNED` (so `2f` became `2.f` here as
 well — the subset used to pass it to C, which rejects it). Everything
