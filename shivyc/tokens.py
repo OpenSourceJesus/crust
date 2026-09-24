@@ -109,6 +109,10 @@ class Token:
         self.wide = False
         # Source logical line; set by the lexer, read by the preprocessor.
         self.logical_line = None
+        # On a `struct`/`union` keyword: the maximum member alignment
+        # `#pragma pack` / `__attribute__((packed))` asked for, 0 for
+        # natural. Set by `shivyc.pack`, read by the parser.
+        self.pack = 0
 
     def __repr__(self):  # pragma: no cover
         return self.content
