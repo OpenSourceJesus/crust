@@ -1634,7 +1634,7 @@ class Declaration(CNode):
                     members_set.add(name)
                     members.append((name, decl_info.ctype))
 
-        ctype.set_members(members, bitfields)
+        ctype.set_members(members, bitfields, node.pack)
         return ctype
 
     def _make_bitfield_member(self, decl_info, kind, members, anon_count):

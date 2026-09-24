@@ -7,7 +7,7 @@ from shivyc.errors import CompilerError
 from shivyc.il_gen import ILValue
 from shivyc.tree.expr_base import _RExprNode, _LExprNode
 from shivyc.tree.utils import (IndirectLValue, DirectLValue, RelativeLValue,
-                               BitFieldLValue, get_size)
+                               BitFieldLValue, UnalignedLValue, get_size)
 
 
 class AddrOf(_RExprNode):
@@ -191,6 +191,21 @@ class _ObjLookup(_LExprNode):
 
         return offset, ctype
 
+    def _wrap_unaligned(self, base_lvalue, struct_ctype, member_ctype,
+                        head_unaligned):
+        """Wrap the member in an UnalignedLValue if it can be misaligned.
+
+        It can when packing lowered its alignment, or when the object it is
+        a member of is itself possibly misaligned -- `p->inner.x`, with
+        `inner` in a packed struct, is as unaligned as `inner` is. A member
+        with alignment 1 never needs it.
+        """
+        if member_ctype.alignment() <= 1:
+            return base_lvalue
+        if head_unaligned or struct_ctype.maybe_misaligned(member_ctype):
+            return UnalignedLValue(base_lvalue)
+        return base_lvalue
+
     def _wrap_bitfield(self, base_lvalue, struct_ctype):
         """Wrap an lvalue in a BitFieldLValue if the member is a bitfield."""
         info = struct_ctype.get_bitfield(self.member.content)
@@ -221,7 +236,9 @@ class ObjMember(_ObjLookup):
             il_code.register_literal_var(shift, str(offset))
             out = ILValue(PointerCType(ctype))
             il_code.add(math_cmds.Add(out, struct_addr, shift))
-            return self._wrap_bitfield(IndirectLValue(out), head_val.ctype)
+            base = self._wrap_unaligned(IndirectLValue(out), head_val.ctype,
+                                        ctype, False)
+            return self._wrap_bitfield(base, head_val.ctype)
         struct_ctype = head_lv.ctype() if head_lv else None
         offset, ctype = self.get_offset_info(struct_ctype)
 
@@ -238,6 +255,8 @@ class ObjMember(_ObjLookup):
             il_code.add(math_cmds.Add(out, struct_addr, shift))
             base = IndirectLValue(out)
 
+        base = self._wrap_unaligned(base, struct_ctype, ctype,
+                                    isinstance(head_lv, UnalignedLValue))
         return self._wrap_bitfield(base, struct_ctype)
 
 
@@ -256,4 +275,6 @@ class ObjPtrMember(_ObjLookup):
 
         out = ILValue(PointerCType(ctype))
         il_code.add(math_cmds.Add(out, struct_addr, shift))
-        return self._wrap_bitfield(IndirectLValue(out), struct_addr.ctype.arg)
+        base = self._wrap_unaligned(IndirectLValue(out), struct_addr.ctype.arg,
+                                    ctype, False)
+        return self._wrap_bitfield(base, struct_addr.ctype.arg)

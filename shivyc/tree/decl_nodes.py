@@ -138,6 +138,9 @@ class _StructUnion(DeclNode):
     def __init__(self, tag: "object", members, r):
         self.tag = tag
         self.members = members
+        # Maximum member alignment from `#pragma pack` / `packed`, 0 for
+        # natural. Set by the parser from the keyword token.
+        self.pack = 0
 
         # These r and kind members are a little hacky. They allow the
         # make_specs_ctype function in tree.nodes.Declaration to treat this
