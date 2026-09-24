@@ -602,6 +602,38 @@ class TestStubDiagnostics(unittest.TestCase):
         self.assertEqual([(st["class"], st["method"])
                           for st in plan["stubs"]], [("Menu", "Start")])
 
+    @needs_cc
+    def test_api_names_inside_strings_are_printed_as_written(self):
+        # The Unity rewrites matched inside string literals:
+        # `Debug.Log("transform.position.x moved")` printed
+        # `Player_get_pos_x(i) moved`. They match code only now
+        # (`cs2cpp.code_sub`).
+        root = tempfile.mkdtemp(prefix="upack-strlit-")
+        shutil.copytree(PROJECT, os.path.join(root, "p"))
+        root = os.path.join(root, "p")
+        with open(os.path.join(root, "Assets", "Scripts", "Player.cs"), "w") as f:
+            f.write("using UnityEngine;\n"
+                    "public class Player : MonoBehaviour {\n"
+                    "    public int hp;\n"
+                    "    public float speed;\n"
+                    "    public void Update() {\n"
+                    "        transform.position = new Vector2(\n"
+                    "            transform.position.x + speed * Time.deltaTime,\n"
+                    "            transform.position.y);\n"
+                    "        // transform.position.x in a comment\n"
+                    "        Debug.Log(\"transform.position.x and Time.deltaTime\");\n"
+                    "    }\n"
+                    "}\n")
+        d = tempfile.mkdtemp(prefix="upack-strlit-out-")
+        with contextlib.redirect_stderr(io.StringIO()):
+            unity_pack.pack(root, d)
+        r = subprocess.run(["make", "-C", d], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr or r.stdout)
+        run = subprocess.run([os.path.join(d, "game"), "-logFile", "-"],
+                             capture_output=True, text=True, cwd=d, timeout=60)
+        self.assertIn("transform.position.x and Time.deltaTime", run.stdout)
+        self.assertNotIn("Player_get_pos_x(i) and", run.stdout)
+
     def test_strict_makes_a_stub_an_error(self):
         with self.assertRaises(unity_pack.PackError) as cm:
             with contextlib.redirect_stderr(io.StringIO()):

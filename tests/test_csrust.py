@@ -1915,6 +1915,74 @@ class TestBindings(unittest.TestCase):
             "int print = 1; Debug_Log(2);")
 
 
+class TestResidualCSharp(unittest.TestCase):
+    """`cs2cpp.residual_csharp`: the C# a lowered body still holds.
+
+    unity_pack stubs (and reports) a method whose body keeps any; the
+    language questions are asked here, and the engine says only what is
+    its own C.
+    """
+
+    M = cs2cpp.packed_model(True)
+
+    def left(self, text, **kw):
+        r = cs2cpp.residual_csharp(text, self.M, **kw)
+        return r[1] if r else None
+
+    def test_leftover_csharp_is_named(self):
+        self.assertEqual(self.left("Renderer[] rs = f();"), "Renderer[] rs")
+        self.assertEqual(self.left("x = Get<Foo>(1);"), "Get<Foo>(")
+        self.assertEqual(self.left("int k = 1;\nOn(() => { go(); });"),
+                         "On(() => { go(); });")
+        self.assertEqual(self.left("End();"), "End(")
+        self.assertEqual(self.left("x = Unknown.DoThing(1);"), "Unknown.DoThing(")
+        self.assertEqual(self.left("v = Vector3.zero;"), "Vector3.zero")
+        self.assertEqual(self.left("f().Go;"), ").G")
+
+    def test_lowered_c_is_not_csharp(self):
+        self.assertIsNone(self.left(
+            "Coin_set_hp(i, Enemy_AT(Coin_get_target(i)).hp);\n"
+            "items.push_back(3); n = items.size();\n"
+            'Debug_Log_s("see Objects (Scripts)/Player.cs");'))
+
+    def test_the_engine_says_what_is_its_own(self):
+        body = "Matrix4x4 m = Get_m(i);\nfloat a = m.m00;\nv = Vector2Int(1, 2);"
+        self.assertIsNotNone(self.left(body))
+        self.assertIsNone(self.left(body, known_types={"Matrix4x4"},
+                                    value_ctors=("Vector2Int",)))
+
+    def test_the_instance_accessor_comes_from_the_model(self):
+        # Under a model without one, `X_AT(..).f` is just a chained call.
+        self.assertIsNone(self.left("a = Enemy_AT(k).hp;"))
+        self.assertIsNotNone(cs2cpp.residual_csharp("a = Enemy_AT(k).hp;",
+                                                    cs2cpp.OWNED))
+
+
+class TestCodeSub(unittest.TestCase):
+    """`cs2cpp.code_sub`: `re.sub` that rewrites code, not what it prints."""
+
+    def test_like_re_sub_in_code(self):
+        self.assertEqual(
+            cs2cpp.code_sub(r"(\w+)\s*=\s*(\d+)", r"\2 := \1", "x = 3; y = 4;"),
+            re.sub(r"(\w+)\s*=\s*(\d+)", r"\2 := \1", "x = 3; y = 4;"))
+        self.assertEqual(
+            cs2cpp.code_sub(r"a(\d)", lambda m: "<%s>" % m.group(1), "a1 a2",
+                            count=1), "<1> a2")
+
+    def test_strings_and_comments_are_left_alone(self):
+        self.assertEqual(
+            cs2cpp.code_sub(r"transform\.position\.x", "P_get_x(i)",
+                            'a = transform.position.x; '
+                            's = "transform.position.x"; // transform.position.x'),
+            'a = P_get_x(i); s = "transform.position.x"; // transform.position.x')
+
+    def test_a_literal_is_still_read(self):
+        # A rewrite that needs a string's contents gets them.
+        self.assertEqual(
+            cs2cpp.code_sub(r'Find\("([^"]*)"\)', r"Find_\1()", 'g = Find("Enemy");'),
+            "g = Find_Enemy();")
+
+
 class TestDigest(unittest.TestCase):
     """C# joins the same --emit-decls digest as C++ / rpython (CPPRPY.md)."""
 
