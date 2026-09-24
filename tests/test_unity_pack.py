@@ -20,6 +20,7 @@ import re
 import contextlib
 import io
 import math
+import re
 import shutil
 import subprocess
 import sys
@@ -5460,7 +5461,7 @@ class TestSystems(unittest.TestCase):
         # Seed array must include a 0 for the authored inactive GO.
         self.assertRegex(
             eng,
-            r"static const int _seed\[\d+\] = \{[^}]*0[^}]*\}")
+            r"_engine_go_active_authored\[\d+\] = \{[^}]*0[^}]*\}")
         # Must not force every slot to 1 (old bug).
         self.assertNotRegex(
             eng,
@@ -7252,8 +7253,12 @@ class TestSystems(unittest.TestCase):
         d = tempfile.mkdtemp(prefix="upack-addcomp-")
         plan = unity_pack.pack(SYSTEMS, d)
         self.assertIn("SpriteRenderer", plan.get("addcomponent_types") or [])
-        self.assertIn("Graphics", plan.get("go_has_sprite") or [])
-        self.assertNotIn("Player", plan.get("go_has_sprite") or [])
+        names = plan.get("go_names") or []
+        has_sr = set(plan.get("go_has_sprite") or [])
+        self.assertIn("Graphics", names)
+        self.assertIn(names.index("Graphics"), has_sr)
+        if "Player" in names:
+            self.assertNotIn(names.index("Player"), has_sr)
         with open(os.path.join(d, "engine.c")) as f:
             eng = f.read()
         self.assertIn("GameObject_AddComponent_SpriteRenderer", eng)

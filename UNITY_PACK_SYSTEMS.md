@@ -1,6 +1,4 @@
 # UNITY_PACK_SYSTEMS — authored Unity systems only
-
-`unity_pack` speeds up what is already in the user's Unity (or Godot)
 project. It **does not invent assets**: no synthetic ParticleSystem
 pools, no default AnimationCurves, no scripted UI invent, no InputAction maps.
 Runtime `AddComponent<T>()` works for packed builtins (Camera, Light,
@@ -29,10 +27,6 @@ auto-vectorization remarks print on stderr. `make crust-check` recompiles
 the lowered `.c` files with crust. Microbenches
 `tools/unity_pack_bench_upload.py` and `tools/unity_pack_bench_csharp.py`
 time C under both gcc and clang when both are on PATH (`--cc` to restrict).
-
-What *is* lowered: APIs and methods on the MonoBehaviours / scene
-instances that are already placed.
-
 ## Input (host-fed)
 
 | Script uses | Emitted |
@@ -266,10 +260,10 @@ PNG UI sprites use `.meta` `spriteBorder` the same way. When
 crop is packed — otherwise every slice would stretch the whole atlas (e.g.
 Settings Menu Full appearing many times on Main Menu). Authored
 `Image.preserveAspect` (Simple type) fits the sprite inside the RectTransform
-instead of stretching to fill (Unity GenerateSimpleSprite). RectTransform
-`localScale` on an object and its ancestors accumulates into baked UI screen
-rects (e.g. a VerticalLayoutGroup scaled to 0.59 shrinks children and TMP
-like Unity Canvas space). Authored
+instead of stretching to fill (Unity GenerateSimpleSprite); raycast rect
+stays full size. RectTransform `localScale` on an object and its ancestors
+accumulates into baked UI screen rects (e.g. a VerticalLayoutGroup scaled
+to 0.59 shrinks children and TMP like Unity Canvas space). Authored
 `TextMeshProUGUI` draws when `m_fontAsset` resolves (Assets or Packages /
 PackageCache): SDF atlas + glyph tables bake `m_text` into a UI sprite
 tinted by `m_fontColor`. Button `m_OnClick` persistent `SetActive` calls
@@ -298,9 +292,6 @@ MonoBehaviours — package scripts are for reference resolution only.
 `Assets/**/Editor/**/*.cs` are skipped (Unity editor-only assemblies).
 
 ## Physics (Rigidbody / Rigidbody2D + FixedUpdate)
-
-| Script uses | Emitted |
-|-------------|---------|
 | Authored `!u!50` Rigidbody2D | Velocity / gravityScale / mass / **linearDamping** tables; Dynamic integrate |
 | Authored `!u!54` Rigidbody | 3D velocity + `useGravity` + **drag**; integrates under `Physics.gravity` |
 | `Physics2D.gravity` | `Physics2D_gravity_x/y` (default `(0, -9.81)`) |
@@ -308,7 +299,6 @@ MonoBehaviours — package scripts are for reference resolution only.
 | `GetComponent<Rigidbody2D>().velocity` / `.linearVelocity` / `.gravityScale` / `.linearDamping` | Reads/writes packed RB2D fields |
 | `GetComponent<Rigidbody>().velocity` / `.linearVelocity` / `.drag` | Reads/writes packed RB fields |
 | Field `Rigidbody2D rb` / `Rigidbody rb` + `.linearVelocity` / `.velocity` | Scene PPtr → packed RB index; `= ….SetX/Y/Z(…)` and `= new Vector2/3(…)` |
-| `Time.fixedDeltaTime` | Host-pokeable float (default `1/50`) |
 | `FixedUpdate` | Accumulator in `engine_tick`: zero or more steps of `fixedDeltaTime` per frame (Unity), then `engine_physics_fixed` each step |
 
 Linear damping uses Box2D’s factor `clamp(1 − damping · Δt, 0, 1)` on velocity
@@ -386,18 +376,14 @@ contain them are stubbed).
 
 Walks live `_engine_go_parent` (self + descendants). Packed MonoBehaviours and
 known builtins (`SpriteRenderer`, RB, uGUI, …) only — unknown `T` → CS0246.
-
-## Refused (would invent assets / components)
-
-| Script uses | Why refused |
-|-------------|-------------|
 | `ParticleSystem.Emit` / `AddComponent<ParticleSystem>` | Needs a ParticleSystem; packer will not invent a pool |
 | `AnimationCurve.Evaluate` | Needs authored curves; packer will not invent keyframes |
 | `InputAction` / `Gamepad.current` | Needs Input System assets / runtime |
 | `UnityEngine.UI` using / Image·Button·Canvas fields | Allowed (authored wiring) |
 | `GetComponent<Canvas\|Image\|RectTransform\|…>` | Live `_engine_go_*` maps (RectTransform ≡ GO); seeded authored |
 | `GetComponent<T>` for prefab/scene MBs | Live maps; prefab instances loaded when scene scripts reference `T` |
-| `AddComponent<Canvas>` / `typeof(Canvas)` / `ForceUpdateCanvases` | Refused invent — author `!u!223` in the scene |
+| `AddComponent<Canvas>` / `typeof(Canvas)` | Refused invent — author `!u!223` in the scene |
+| `Canvas.ForceUpdateCanvases()` | No-op (layout is bake-time / host) |
 | `List<T>` | ``std::vector`` (MB/component elems → ``int`` indices); ``Add``/``Count``; cross-class static ``Other.list`` → ``Other_list`` |
 | `Dictionary<K,V>` / `SortedList<K,V>` | ``std::map`` (``Add``→``[]=``, ``Clear``/``Count``/indexer); string keys via helper |
 | `Vector2` | C ``typedef struct`` + ``Vector2_make``; packed fields stay ``_x``/``_y`` |
@@ -440,31 +426,16 @@ python3 tools/unity_pack.py <project> -o /tmp/out --force  # always re-emit
 
 `build_player_executable` also skips compiling/linking when `.o` / the exe
 are newer than their inputs.
-
-## Tick order
-
-```
-Time_time += Time_deltaTime   // if Time.time used
 fixed_accum += min(Time_deltaTime, maximumDeltaTime≈1/3)
 while fixed_accum >= Time_fixedDeltaTime:
     foreach class: FixedUpdate    // if present
     engine_physics_fixed()        // authored Rigidbody / Rigidbody2D + collide
                                   // then OnCollisionEnter/Stay/Exit2D
     fixed_accum -= Time_fixedDeltaTime
-foreach class: Update
-```
-
-## Fixture
-
 `examples/unity_pack/SystemsScene` — Bouncer / Ball / Pad (each with
 authored SpriteRenderer), HeavyBall + Ground (`Ice.physicsMaterial2D`), Wave
 (`Animation` + legacy `Bob.anim`), Spinner (`Animator` + `Bob.controller`,
 idle — legacy clip is not Mecanim), Shade
 (Light only, no invent-draw), Main Camera:
-
-```
-python3 tools/unity_pack.py examples/unity_pack/SystemsScene -o /tmp/sys
-make -C /tmp/sys && /tmp/sys/game
 PROJECT="$(pwd)/examples/unity_pack/Slime Jump" \
   ./examples/unity_pack/run_gles2_window.sh
-```

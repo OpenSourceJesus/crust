@@ -444,7 +444,8 @@ def _check_refused_api(path, text, scan):
     """Packed-subset refusals → Unity/csc diagnostics at the use site.
 
     ``using UnityEngine.UI`` is allowed (authored Image/Button fields). Invent
-    (AddComponent<Canvas>, ForceUpdateCanvases, typeof(Canvas) spawn) is not.
+    (AddComponent<Canvas>, typeof(Canvas) spawn) is not. ForceUpdateCanvases
+    is a no-op stub (layout is bake-time / host).
     """
     # Scripted Canvas invent — not authored !u!223.
     m = re.search(
@@ -454,11 +455,6 @@ def _check_refused_api(path, text, scan):
     m = re.search(r"typeof\s*\(\s*(Canvas)\s*\)", scan)
     if m:
         _raise_cs(path, text, m.start(1), "CS0246", _CS0246 % "Canvas")
-    m = re.search(r"Canvas\.(ForceUpdateCanvases)\b", scan)
-    if m:
-        _raise_cs(
-            path, text, m.start(1), "CS0117",
-            "'Canvas' does not contain a definition for 'ForceUpdateCanvases'")
     m = re.search(r"(?<![\w.])InputAction\b", scan)
     if m:
         _raise_cs(path, text, m.start(), "CS0246", _CS0246 % "InputAction")
@@ -591,6 +587,10 @@ _UI_COMPONENT_FIELD_TYPES = frozenset((
 # GetComponent<T> for authored UI — opaque GO handles, not AddComponent invent.
 _UI_GETCOMPONENT_TYPES = _UI_COMPONENT_FIELD_TYPES
 
+# Every GameObject has a Transform (RectTransform is the uGUI subclass).
+# GetComponent<Transform|RectTransform>() ≡ GO index (same as .transform).
+_TRANSFORM_GETCOMPONENT_TYPES = frozenset(("Transform", "RectTransform"))
+
 
 def _progress(msg):
     """Incremental status for long packs (large scenes / many PNGs)."""
@@ -695,8 +695,8 @@ _REFUSED_API = {
         "runtime — unity_pack does not invent device graphs."
     ),
     "Canvas": (
-        "Scripted Canvas invent (AddComponent / typeof / ForceUpdateCanvases) "
-        "is refused — author a !u!223 Canvas + Image in the scene."
+        "Scripted Canvas invent (AddComponent / typeof) is refused — author "
+        "a !u!223 Canvas + Image in the scene. ForceUpdateCanvases is a no-op."
     ),
 }
 
@@ -913,6 +913,84 @@ def unity_persistent_data_path(company, product, home=None):
 def _read(path):
     with open(path) as f:
         return f.read()
+
+
+def _editor_build_settings_path(root):
+    return os.path.join(root, "ProjectSettings", "EditorBuildSettings.asset")
+
+
+def _parse_editor_build_scenes(root):
+    """EditorBuildSettings ``m_Scenes`` entries: ``{enabled, path, guid}``.
+
+    Missing file → empty list (caller falls back). Paths are project-relative
+    Unity paths (``Assets/...``).
+    """
+    path = _editor_build_settings_path(root)
+    if not os.path.isfile(path):
+        return []
+    try:
+        text = _read(path)
+    except IOError:
+        return []
+    out = []
+    for m in re.finditer(
+            r"(?m)^  - enabled:\s*(\d+)\s*\n"
+            r"    path:\s*(.+?)\s*\n"
+            r"    guid:\s*([0-9a-fA-F]+)\s*$",
+            text):
+        rel = m.group(2).strip().strip("'\"")
+        out.append({
+            "enabled": int(m.group(1)) != 0,
+            "path": rel.replace("\\", "/"),
+            "guid": m.group(3).lower(),
+        })
+    return out
+
+
+def _resolve_build_scene_path(root, entry, asset_guids=None):
+    """Absolute path for a build-settings scene entry, or None if missing."""
+    rel = (entry.get("path") or "").replace("\\", "/")
+    if not rel:
+        return None
+    cand = os.path.join(root, rel)
+    if os.path.isfile(cand):
+        return os.path.abspath(cand)
+    g = (entry.get("guid") or "").lower()
+    if g and asset_guids:
+        p = asset_guids.get(g)
+        if p and str(p).lower().endswith(".unity") and os.path.isfile(p):
+            return os.path.abspath(p)
+    return None
+
+
+def _unity_scenes_to_pack(root, asset_guids=None):
+    """``.unity`` paths to pack: first enabled EditorBuildSettings scene only.
+
+    Scenes not listed in build settings are never packed. Disabled build
+    entries are skipped. When ``EditorBuildSettings.asset`` is absent (tests /
+    tiny fixtures), fall back to every ``.unity`` under ``Assets/`` only —
+    never a whole-project walk that pulls vendor demo scenes.
+    """
+    root = os.path.abspath(root)
+    entries = _parse_editor_build_scenes(root)
+    if entries:
+        enabled = [e for e in entries if e.get("enabled")]
+        for e in enabled:
+            path = _resolve_build_scene_path(root, e, asset_guids=asset_guids)
+            if path:
+                return [path]
+        if enabled:
+            raise PackError(
+                "EditorBuildSettings: no enabled scene file found "
+                "(first entries: %s)" % ", ".join(
+                    e.get("path") or "?" for e in enabled[:3]))
+        raise PackError(
+            "EditorBuildSettings: no enabled scenes "
+            "(add a scene or enable one in File → Build Settings)")
+    assets = os.path.join(root, "Assets")
+    if os.path.isdir(assets):
+        return list(_walk_files(assets, (".unity",)))
+    return list(_walk_files(root, (".unity",)))
 
 
 def _walk_files(root, exts):
@@ -2048,8 +2126,13 @@ def _parse_ui_button(block):
                 "mode": int(cm.group(3)),
                 "bool_arg": int(cm.group(4)),
             })
+    # Behaviour.enabled false → Selectable does not receive clicks.
+    interactable = int(en.group(1)) if en else 1
+    if not mb_en:
+        interactable = 0
     return {
-        "interactable": int(en.group(1)) if en else 1,
+        "enabled": mb_en,
+        "interactable": interactable,
         "colors": colors,
         "onclick": calls,
     }
@@ -2192,6 +2275,9 @@ def _layout_child_sizes(child, axis, control, force_expand):
     le = child.get("layout_element") or {}
     if le.get("ignore"):
         return None
+    # Disabled LayoutElement → same as no LayoutElement (sizeDelta / control).
+    if not int(le.get("enabled", 1)):
+        le = {}
     rect = child.get("rect") or {}
     sd = rect.get("size_delta") or (0.0, 0.0)
     cur = abs(float(sd[axis]))
@@ -2277,6 +2363,8 @@ def _layout_group_calc_along_axis(parent, kids, axis):
             continue
         mn, pref, flex = sc
         le = ch.get("layout_element") or {}
+        if not int(le.get("enabled", 1)):
+            le = {}
         mx = float((le.get("max") or (-1.0, -1.0))[axis])
         if mx < 0.0:
             mx = float("inf")
@@ -2327,10 +2415,11 @@ def _layout_query_sizes(obj, axis, children_map):
     cur = abs(float(((obj.get("rect") or {}).get("size_delta") or (0.0, 0.0))[axis]))
     entries = []  # (priority, min, pref, max, flex)
     le = obj.get("layout_element")
-    if le and not le.get("ignore"):
+    if le and not le.get("ignore") and int(le.get("enabled", 1)):
         mn, pref, mx, flex = _layout_le_axis(le, axis, cur)
         entries.append((int(le.get("priority") or 1), mn, pref, mx, flex))
-    if obj.get("layout_group"):
+    lg = obj.get("layout_group")
+    if lg and int(lg.get("enabled", 1)):
         kids = [c for c in children_map.get(str(obj.get("xf_id") or ""), [])
                 if c.get("rect") is not None]
         mn, pref, mx, flex = _layout_group_calc_along_axis(obj, kids, axis)
@@ -2615,18 +2704,25 @@ def _apply_layout_groups(objects, screen_w, screen_h):
         return d
 
     fitters = [o for o in objects
-               if o.get("content_size_fitter") and o.get("rect") and o.get("xf_id")]
+               if o.get("content_size_fitter") and o.get("rect") and o.get("xf_id")
+               and int(o["content_size_fitter"].get("enabled", 1))]
     fitters.sort(key=lambda o: -_depth(o))
     for o in fitters:
         _apply_content_size_fitter(o, children, by_xf, screen_w, screen_h)
 
-    groups = [o for o in objects if o.get("layout_group") and o.get("xf_id")]
+    groups = [o for o in objects
+              if o.get("layout_group") and o.get("xf_id")
+              and int(o["layout_group"].get("enabled", 1))]
     groups.sort(key=lambda o: _depth(o))
     for parent in groups:
         kids = [c for c in children.get(str(parent["xf_id"]), [])
                 if c.get("rect") is not None]
         if not kids:
             continue
+        # Honor authored m_Children order (not objects[] discovery order).
+        order = {str(cid): i
+                 for i, cid in enumerate(parent.get("child_ids") or [])}
+        kids.sort(key=lambda c: order.get(str(c.get("xf_id")), 10 ** 9))
         # LayoutGroup uses parent.rect (pre-localScale); screen mapping
         # applies ancestor scales in _ui_screen_rect.
         cache = {}
@@ -2640,7 +2736,8 @@ def _apply_layout_groups(objects, screen_w, screen_h):
             parent, kids, 1, is_vert, parent_size)
 
     arfs = [o for o in objects
-            if o.get("aspect_ratio_fitter") and o.get("rect") and o.get("xf_id")]
+            if o.get("aspect_ratio_fitter") and o.get("rect") and o.get("xf_id")
+            and int(o["aspect_ratio_fitter"].get("enabled", 1))]
     arfs.sort(key=lambda o: _depth(o))
     for o in arfs:
         _apply_aspect_ratio_fitter(o, by_xf, screen_w, screen_h)
@@ -2983,6 +3080,10 @@ def _fit_preserve_aspect(rw, rh, src_w, src_h):
     return rw, rw * (sh / sw)
 
 
+# Alias used by tests / older call sites.
+_ui_preserve_aspect_draw_size = _fit_preserve_aspect
+
+
 def _sprite_border_from_meta(path):
     """PNG .meta spriteBorder {x,y,z,w} → (left, bottom, right, top)."""
     meta = path + ".meta"
@@ -2999,7 +3100,8 @@ def _sprite_border_from_meta(path):
             float(m.group(3)), float(m.group(4)))
 
 
-def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None):
+def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None,
+                    hierarchy=None):
     """Resolve authored uGUI Image / TextMeshProUGUI → world sprites.
 
     Screen Space Overlay (0) and Screen Space Camera (1): map canvas pixels to
@@ -3010,12 +3112,21 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None):
     RectTransform (Unity GenerateSimpleSprite) instead of stretching.
     Empty m_Sprite is skipped (no invent). TMP needs an authored font asset
     with atlas + glyph tables.
+
+    ``hierarchy`` supplies father links for stripped PrefabInstance transforms
+    so Canvas sorting walks past button roots that are not packed objects.
     """
     by_xf = {}
     for o in objects:
         xid = o.get("xf_id")
         if xid:
             by_xf[str(xid)] = o
+    hier_father = {}
+    for h in hierarchy or []:
+        xid = h.get("xf_id")
+        if xid is None:
+            continue
+        hier_father[str(xid)] = h.get("father_id")
     main = None
     for c in cameras or []:
         if c.get("main"):
@@ -3045,29 +3156,37 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None):
         guard = 0
         while fid and guard < 64:
             guard += 1
-            parent = by_xf.get(str(fid))
-            if not parent:
+            fid_s = str(fid)
+            parent = by_xf.get(fid_s)
+            if parent is not None:
+                if parent.get("canvas"):
+                    canvas = parent["canvas"]
+                    break
+                fid = parent.get("father_id")
+                continue
+            # Stripped PrefabInstance root: continue via hierarchy fathers.
+            if fid_s not in hier_father:
                 break
-            if parent.get("canvas"):
-                canvas = parent["canvas"]
-                break
-            fid = parent.get("father_id")
+            fid = hier_father[fid_s]
         if canvas is None:
             canvas = {"render_mode": 0, "sorting_layer_id": 0,
                       "sorting_order": 0, "enabled": 1}
         return canvas
 
     def _apply_layout(o, cx, cy, rw, rh, canvas, source, color, extra=None):
+        """Map rect to UI hit + sprite (rw/rh are draw size)."""
+        hit_rw = abs(float(rw))
+        hit_rh = abs(float(rh))
         wx = cam_x + (cx / float(sw) - 0.5) * world_w
         wy = cam_y + (cy / float(sh) - 0.5) * world_h
         o["pos"] = (wx, wy, float(o["pos"][2]) if o.get("pos") else 0.0)
         o["ui_hit"] = {
             "cx": float(cx), "cy": float(cy),
-            "hw": abs(float(rw)) * 0.5, "hh": abs(float(rh)) * 0.5,
+            "hw": hit_rw * 0.5, "hh": hit_rh * 0.5,
             "ncx": float(cx) / float(sw),
             "ncy": float(cy) / float(sh),
-            "nhw": abs(float(rw)) * 0.5 / float(sw),
-            "nhh": abs(float(rh)) * 0.5 / float(sh),
+            "nhw": hit_rw * 0.5 / float(sw),
+            "nhh": hit_rh * 0.5 / float(sh),
         }
         so = int(canvas.get("sorting_order") or 0)
         if source == "ui_tmp":
@@ -3091,12 +3210,12 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None):
             "m01": 0.0,
             "m10": 0.0,
             "m11": 1.0,
-            "half_w": abs(rw) * px_w * 0.5,
-            "half_h": abs(rh) * px_h * 0.5,
+            "half_w": hit_rw * px_w * 0.5,
+            "half_h": hit_rh * px_h * 0.5,
             "ncx": float(cx) / float(sw),
             "ncy": float(cy) / float(sh),
-            "nhw": abs(float(rw)) * 0.5 / float(sw),
-            "nhh": abs(float(rh)) * 0.5 / float(sh),
+            "nhw": hit_rw * 0.5 / float(sw),
+            "nhh": hit_rh * 0.5 / float(sh),
         }
         if extra:
             sp.update(extra)
@@ -3104,7 +3223,7 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None):
 
     for o in objects:
         ui = o.get("ui_image")
-        if not ui or not ui.get("has_sprite"):
+        if not ui or not ui.get("has_sprite") or not int(ui.get("enabled", 1)):
             continue
         canvas = _find_canvas(o)
         if not int(canvas.get("enabled", 1)):
@@ -3116,12 +3235,14 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None):
         builtin = bool(ui.get("builtin"))
         img_type = int(ui.get("image_type") or 0)
         ppu_mul = float(ui.get("pixels_per_unit_multiplier") or 1.0)
+        preserve = bool(int(ui.get("preserve_aspect") or 0))
         extra = {
             "builtin": builtin,
             "sprite_file_id": int(ui.get("sprite_file_id") or 0),
             "sprite_guid": ("builtin:uisprite" if builtin
                             else ui.get("sprite_guid")),
             "image_type": img_type,
+            "preserve_aspect": 1 if preserve else 0,
         }
         if builtin:
             src_w, src_h, src_rgba, border = _builtin_uisprite()
@@ -3146,7 +3267,6 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None):
         # Sliced (1): 9-slice fills the rect. Simple (0): stretch, or
         # preserveAspect-fit inside the rect (Unity Image.preserveAspect).
         draw_w, draw_h = abs(float(rw)), abs(float(rh))
-        preserve = bool(int(ui.get("preserve_aspect") or 0))
         if (img_type != 1 and preserve
                 and src_w > 0 and src_h > 0 and draw_w > 1e-6 and draw_h > 1e-6):
             draw_w, draw_h = _fit_preserve_aspect(
@@ -3164,7 +3284,6 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None):
         extra["tex_rgba"] = rgba
         extra["pixels_per_unit"] = 100.0
         extra["border"] = border
-        extra["preserve_aspect"] = 1 if preserve else 0
         _apply_layout(
             o, cx, cy, draw_w, draw_h, canvas, "ui",
             (ui.get("r", 1.0), ui.get("g", 1.0),
@@ -3235,6 +3354,85 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None):
 # Scene importers
 # ---------------------------------------------------------------------------
 
+def _editor_only_transform_ids(by_id):
+    """Transform fileIDs omitted by Unity's EditorOnly tag (incl. descendants).
+
+    Player builds strip GameObjects with ``m_TagString: EditorOnly`` and their
+    transform children. PrefabInstance roots with an ``m_TagString`` override
+    of EditorOnly are included the same way.
+    """
+    roots = set()
+    for go in by_id.values():
+        if go.get("kind") != "GameObject":
+            continue
+        if (go.get("tag") or "") != "EditorOnly":
+            continue
+        for mid in re.findall(r"fileID:\s*(\d+)", go.get("raw") or ""):
+            rec = by_id.get(mid)
+            if rec is not None and rec is not go and rec.get("kind") == "Transform":
+                roots.add(str(mid))
+                break
+    for pi in by_id.values():
+        if pi.get("kind") != "PrefabInstance":
+            continue
+        raw = pi.get("raw") or ""
+        tags = re.findall(
+            r"propertyPath:\s*m_TagString\s*\n\s*value:\s*(.+)", raw)
+        if not tags or tags[-1].strip() != "EditorOnly":
+            continue
+        pi_id = str(pi.get("file_id") or "")
+        if not pi_id:
+            continue
+        for rec in by_id.values():
+            if rec.get("kind") != "Transform":
+                continue
+            traw = rec.get("raw") or ""
+            if not re.search(
+                    r"(?m)^\s+m_PrefabInstance:\s*\{fileID:\s*%s\}"
+                    % re.escape(pi_id), traw):
+                continue
+            # Root of the instance: father is the PI's TransformParent.
+            father = rec.get("father_id")
+            tp = re.search(
+                r"(?m)^\s+m_TransformParent:\s*\{fileID:\s*(-?\d+)\}", raw)
+            parent = tp.group(1) if tp else "0"
+            if str(father or "0") == str(parent):
+                roots.add(str(rec["file_id"]))
+    father = {}
+    for rec in by_id.values():
+        if rec.get("kind") != "Transform":
+            continue
+        xid = str(rec.get("file_id") or "")
+        if not xid:
+            continue
+        fid = rec.get("father_id")
+        if fid and str(fid) not in ("0",):
+            father[xid] = str(fid)
+    cache = {}
+
+    def _under(xf):
+        if xf in cache:
+            return cache[xf]
+        if xf in roots:
+            cache[xf] = True
+            return True
+        p = father.get(xf)
+        if not p:
+            cache[xf] = False
+            return False
+        cache[xf] = _under(p)
+        return cache[xf]
+
+    out = set()
+    for rec in by_id.values():
+        if rec.get("kind") != "Transform":
+            continue
+        xid = str(rec.get("file_id") or "")
+        if xid and _under(xid):
+            out.add(xid)
+    return out
+
+
 def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
     """A Unity .unity YAML subset: GameObject + Transform + MonoBehaviour.
 
@@ -3245,6 +3443,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
     AudioSource (!u!82), Animation (!u!111), Animator (!u!95),
     PhysicsMaterial2D / PhysicMaterial, and AnimationClip / AnimatorController
     assets. Does not invent any of those — missing components stay missing.
+    GameObjects with the EditorOnly tag (and their transform descendants) are
+    omitted, matching Unity player builds.
     Returns (objects, lights, cameras, hierarchy).
     """
     guid_to_script = guid_to_script or {}
@@ -3308,6 +3508,9 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         nm = re.search(r"(?m)^\s+m_Name:\s*(.+)$", block)
         if nm:
             rec["name"] = nm.group(1).strip()
+        if kind == "GameObject":
+            act = re.search(r"(?m)^\s+m_IsActive:\s*(\d+)\s*$", block)
+            rec["active"] = int(act.group(1)) if act else 1
         tag = re.search(r"(?m)^\s+m_TagString:\s*(.+)$", block)
         if tag:
             rec["tag"] = tag.group(1).strip()
@@ -3343,6 +3546,13 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             fid = father.group(1)
             if fid != "0":
                 rec["father_id"] = fid
+        # Ordered child Transforms (layout groups / sibling index).
+        chm = re.search(
+            r"(?m)^\s+m_Children:\s*\n((?:[ \t]+-\s*\{fileID:\s*\d+\}\s*\n)*)",
+            block)
+        if chm:
+            rec["child_ids"] = re.findall(
+                r"fileID:\s*(\d+)", chm.group(1))
         # RectTransform layout (uGUI) — kept even when kind collapses to Transform.
         if type_id == "224" or "m_AnchorMin:" in block:
             rec["rect"] = {
@@ -3394,6 +3604,10 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                     sy if sy is not None else 1.0,
                     sz if sz is not None else 1.0,
                 )
+            ia = re.search(
+                r"propertyPath:\s*m_IsActive\s*\n\s*value:\s*(\d+)", block)
+            if ia:
+                rec["active"] = int(ia.group(1))
         gm = re.search(r"guid:\s*([0-9a-fA-F]+)", block)
         if gm:
             rec["guid"] = gm.group(1).lower()
@@ -3553,7 +3767,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                     "mb_file_id": file_id,
                     # 0 Simple, 1 Sliced, 2 Tiled, 3 Filled
                     "image_type": int(itype.group(1)) if itype else 0,
-                    "preserve_aspect": int(preserv.group(1)) if preserv else 0,
+                    "preserve_aspect": (
+                        int(preserv.group(1)) if preserv else 0),
                     "pixels_per_unit_multiplier": (
                         float(ppum.group(1)) if ppum else 1.0),
                 }
@@ -3779,6 +3994,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 rec[key] = pref[key]
 
     world_cache = {}
+    editor_only_xfs = _editor_only_transform_ids(by_id)
 
     # Join MonoBehaviour + Transform + SpriteRenderer onto the GameObject.
     gos = [r for r in by_id.values() if r.get("kind") == "GameObject"]
@@ -3880,6 +4096,12 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 a = dict(k["audiosource"])
                 a["file_id"] = k.get("file_id")
                 audiosources.append(a)
+        # Unity player builds omit EditorOnly-tagged GOs (and their children).
+        xf_id_early = str(xf["file_id"]) if xf and xf.get("file_id") else None
+        if xf_id_early and xf_id_early in editor_only_xfs:
+            continue
+        if (go.get("tag") or "") == "EditorOnly":
+            continue
         # Flatten authored Vector2 YAML into _x/_y for packed members.
         for vk, (vx, vy) in vec2_fields.items():
             fields[vk + "_x"] = vx
@@ -3891,6 +4113,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         local_pos, local_rot, local_scale = pos, rot, scale
         father_id = xf.get("father_id") if xf else None
         xf_id = xf.get("file_id") if xf else None
+        child_ids = list(xf.get("child_ids") or []) if xf else []
         # UI Canvas/Image/TMP layout is baked later from anchors + Screen size.
         if xf is not None and not ui_image and not ui_tmp and not canvas:
             pos, rot, scale = _resolve_world_trs(
@@ -3989,13 +4212,14 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         if script:
             class_name = _class_name_from_cs(script)
         # Every authored GO with a Transform — Find children need not be packed.
+        active = int(go.get("active", 1))
         if xf is not None:
             hierarchy.append({
                 "name": go.get("name") or "obj",
                 "xf_id": xf_id,
                 "father_id": father_id,
                 "go_id": go.get("file_id"),
-                "active": 1 if int(go.get("active", 1)) else 0,
+                "active": active,
                 "has_canvas": bool(canvas),
                 "has_image": bool(ui_image),
                 "has_button": bool(ui_button),
@@ -4103,7 +4327,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                     "father_id": father_id,
                     "xf_id": xf_id,
                     "go_id": go.get("file_id"),
-                    "active": 1 if int(go.get("active", 1)) else 0,
+                    "active": active,
                     "fields": {},
                     "script": None,
                     "class": "_Rect",
@@ -4137,7 +4361,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "father_id": father_id,
                 "xf_id": xf_id,
                 "go_id": go.get("file_id"),
-                "active": 1 if int(go.get("active", 1)) else 0,
+                "active": active,
                 "fields": {},
                 "script": None,
                 "class": "_Canvas",
@@ -4169,7 +4393,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "father_id": father_id,
             "xf_id": xf_id,
             "go_id": go.get("file_id"),
-            "active": 1 if int(go.get("active", 1)) else 0,
+            "active": active,
             "fields": fields,
             "object_refs": object_refs,
             "mb_ids": mb_ids,
@@ -4192,6 +4416,77 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "anim_player": player,
             "audiosources": audiosources,
         })
+    # Stripped PrefabInstance Transforms are not joined via m_Component, but
+    # scene children still m_Father them (e.g. button labels). Register those
+    # xfs so activeInHierarchy can walk to inactive layout parents.
+    existing_xf = {
+        str(h.get("xf_id")) for h in hierarchy if h.get("xf_id") is not None}
+    needed_xf = set()
+    for h in hierarchy:
+        fid = str(h.get("father_id") or "")
+        if fid not in ("", "0", "None"):
+            needed_xf.add(fid)
+    for o in objects:
+        fid = str(o.get("father_id") or "")
+        if fid not in ("", "0", "None"):
+            needed_xf.add(fid)
+    pending = set(needed_xf)
+    while pending:
+        xf = pending.pop()
+        if xf in existing_xf:
+            continue
+        if str(xf) in editor_only_xfs:
+            existing_xf.add(xf)
+            continue
+        rec = by_id.get(xf)
+        if not rec or rec.get("kind") != "Transform":
+            continue
+        raw = rec.get("raw") or ""
+        pm = re.search(
+            r"(?m)^\s+m_PrefabInstance:\s*\{fileID:\s*(\d+)\}", raw)
+        pi = by_id.get(pm.group(1)) if pm else None
+        pi_raw = (pi.get("raw") if pi else None) or ""
+        names = re.findall(
+            r"propertyPath:\s*m_Name\s*\n\s*value:\s*(.+)", pi_raw)
+        name = (names[-1].strip() if names
+                else (rec.get("name") or "Prefab"))
+        acts = re.findall(
+            r"propertyPath:\s*m_IsActive\s*\n\s*value:\s*(\d+)", pi_raw)
+        if acts:
+            active = int(acts[-1])
+        elif pi and "active" in pi:
+            active = int(pi["active"])
+        else:
+            active = int(rec.get("active", 1))
+        go_id = None
+        if pm:
+            for g in by_id.values():
+                if g.get("kind") != "GameObject":
+                    continue
+                graw = g.get("raw") or ""
+                if re.search(
+                        r"(?m)^\s+m_PrefabInstance:\s*\{fileID:\s*%s\}"
+                        % re.escape(pm.group(1)), graw):
+                    go_id = g.get("file_id")
+                    break
+        father_id = rec.get("father_id")
+        hierarchy.append({
+            "name": name,
+            "xf_id": xf,
+            "father_id": father_id,
+            "go_id": go_id,
+            "active": active,
+            "has_canvas": False,
+            "has_image": False,
+            "has_button": False,
+            "has_tmp": False,
+        })
+        existing_xf.add(xf)
+        fid = str(father_id or "")
+        if fid not in ("", "0", "None") and fid not in existing_xf:
+            pending.add(fid)
+    _materialize_prefab_instance_ui(
+        by_id, objects, asset_guids or {}, editor_only_xfs)
     # Stash clip assets on a sentinel for pack() — returned via lights? No.
     # Attach to a module-level isn't clean. Return clips via objects meta:
     # pack() reloads clips. Store on each player the clip snapshot.
@@ -4488,7 +4783,6 @@ def _append_prefab_instance_ui_objects(
             if father_id:
                 stub["rec"]["father_id"] = father_id
 
-
 def parse_godot_tscn(text):
     """Godot .tscn nodes with a script class name and exported numbers."""
     objects = []
@@ -4730,78 +5024,120 @@ def _ast_find_getcomponent_chains(text):
     return out
 
 
-def _build_go_tables(plan):
-    """Authored GameObject name → {MonoBehaviour class: instance index}.
+def _go_identity_key(o, fallback):
+    """Stable identity for an authored GameObject (not the display name).
 
-    Also returns parallel activeSelf flags from authored m_IsActive.
+    UI trees reuse names (``Text``, ``Sliding Area``, …). Parent / activeSelf
+    tables must key by fileID, or inactive parents like Settings Menu cannot
+    hide their children once a second GO shares the name (e.g. Player UI).
+    """
+    gid = o.get("go_id")
+    if gid is not None and str(gid) not in ("", "0"):
+        return "go:%s" % gid
+    xid = o.get("xf_id")
+    if xid is not None and str(xid) not in ("", "0"):
+        return "xf:%s" % xid
+    return fallback
+
+
+def _build_go_tables(plan):
+    """One GO-table slot per authored GameObject (unique fileID / Transform).
+
+    ``go_names`` may contain duplicates — ``GameObject.Find`` returns the first
+    match (Unity). Each instance / hierarchy entry gets ``go_index``.
+    ``go_components`` stays name → {class: instance idx} for the first GO of
+    each name (Find / GetComponent helpers).
     """
     names = []
-    actives = []
-    seen = set()
-    comps = {}  # name -> {class: idx}
+    key_to_i = {}
+
+    def _add(o, fallback):
+        k = _go_identity_key(o, fallback)
+        if k in key_to_i:
+            gi = key_to_i[k]
+        else:
+            gi = len(names)
+            key_to_i[k] = gi
+            names.append(o.get("name") or "obj")
+        o["go_index"] = gi
+        return gi
+
+    for i, h in enumerate(plan.get("scene_hierarchy") or []):
+        _add(h, "h:%d" % i)
+    comps = {}  # name -> {class: idx} (first GO with that name)
     for cname, cl in sorted(plan["classes"].items()):
         for i, o in enumerate(cl.get("instances") or []):
-            n = o.get("name") or "obj"
-            if n not in seen:
-                seen.add(n)
-                names.append(n)
-                actives.append(1 if int(o.get("active", 1)) else 0)
-            comps.setdefault(n, {})[cname] = i
-    return names, comps, actives
+            gi = _add(o, "c:%s:%d" % (cname, i))
+            n = names[gi]
+            slot = comps.setdefault(n, {})
+            if cname not in slot:
+                slot[cname] = i
+    return names, comps
+
+
+def _build_go_active(plan, go_names):
+    """Authored ``m_IsActive`` per go_names index (1 = activeSelf)."""
+    act = [1] * len(go_names or [])
+    for h in plan.get("scene_hierarchy") or []:
+        gi = h.get("go_index")
+        if gi is None or gi < 0 or gi >= len(act):
+            continue
+        act[gi] = 1 if int(h.get("active", 1)) else 0
+    for cl in (plan.get("classes") or {}).values():
+        for o in cl.get("instances") or []:
+            gi = o.get("go_index")
+            if gi is None or gi < 0 or gi >= len(act):
+                continue
+            # Only override when the instance recorded m_IsActive; missing
+            # must not clobber hierarchy (inactive parents like Settings Menu).
+            if "active" not in o:
+                continue
+            act[gi] = 1 if int(o.get("active", 1)) else 0
+    return act
 
 
 def _build_go_ui_component_maps(plan):
-    """Authored UI component presence: type → set of GO names."""
+    """Authored UI component presence: type → sorted GO indices."""
     maps = {t: set() for t in _UI_GETCOMPONENT_TYPES}
-    def mark(n, *tys):
-        if not n:
+
+    def mark(gi, *tys):
+        if gi is None or int(gi) < 0:
             return
+        gi = int(gi)
         for t in tys:
             if t in maps:
-                maps[t].add(n)
+                maps[t].add(gi)
 
     for cl in (plan.get("classes") or {}).values():
         for o in cl.get("instances") or []:
-            n = o.get("name") or "obj"
-            mark(n, "RectTransform")
+            gi = o.get("go_index")
+            mark(gi, "RectTransform")
             if o.get("canvas"):
-                mark(n, "Canvas")
+                mark(gi, "Canvas")
             if o.get("ui_image"):
-                mark(n, "Image", "RawImage", "Selectable")
+                mark(gi, "Image", "RawImage", "Selectable")
             if o.get("ui_button"):
-                mark(n, "Button", "Selectable")
+                mark(gi, "Button", "Selectable")
             if o.get("ui_tmp"):
-                mark(n, "TMP_Text", "TextMeshProUGUI", "TextMeshPro",
+                mark(gi, "TMP_Text", "TextMeshProUGUI", "TextMeshPro",
                      "Selectable")
     for h in plan.get("scene_hierarchy") or []:
-        n = h.get("name") or "obj"
-        mark(n, "RectTransform")
+        gi = h.get("go_index")
+        mark(gi, "RectTransform")
         if h.get("has_canvas"):
-            mark(n, "Canvas")
+            mark(gi, "Canvas")
         if h.get("has_image"):
-            mark(n, "Image", "RawImage", "Selectable")
+            mark(gi, "Image", "RawImage", "Selectable")
         if h.get("has_button"):
-            mark(n, "Button", "Selectable")
+            mark(gi, "Button", "Selectable")
         if h.get("has_tmp"):
-            mark(n, "TMP_Text", "TextMeshProUGUI", "TextMeshPro")
+            mark(gi, "TMP_Text", "TextMeshProUGUI", "TextMeshPro")
     return {t: sorted(s) for t, s in maps.items() if s}
 
 
-def _extend_go_tables_for_find(plan, names, comps, actives):
-    """Add authored hierarchy-only GOs so Transform.Find can see children."""
-    names = list(names)
-    actives = list(actives)
-    comps = {k: dict(v) for k, v in comps.items()}
-    seen = set(names)
-    for h in plan.get("scene_hierarchy") or []:
-        n = h.get("name") or "obj"
-        if n in seen:
-            continue
-        seen.add(n)
-        names.append(n)
-        actives.append(1 if int(h.get("active", 1)) else 0)
-        comps.setdefault(n, {})
-    return names, comps, actives
+def _extend_go_tables_for_find(plan, names, comps):
+    """No-op: ``_build_go_tables`` already includes hierarchy-only GOs."""
+    return names, comps
 
 
 def _build_go_parents(plan):
@@ -4809,42 +5145,40 @@ def _build_go_parents(plan):
     names = plan.get("go_names") or []
     if not names:
         return []
-    name_i = {n: i for i, n in enumerate(names)}
     xf_to_go = {}
-    # Packed MB instances first, then hierarchy-only GOs.
     for cl in plan["classes"].values():
         for o in cl.get("instances") or []:
-            n = o.get("name") or "obj"
+            gi = o.get("go_index")
             xid = o.get("xf_id")
-            if xid is not None and str(xid) != "0" and n in name_i:
-                xf_to_go[str(xid)] = name_i[n]
+            if gi is None or xid is None or str(xid) == "0":
+                continue
+            xf_to_go[str(xid)] = int(gi)
     for h in plan.get("scene_hierarchy") or []:
-        n = h.get("name") or "obj"
+        gi = h.get("go_index")
         xid = h.get("xf_id")
-        if xid is not None and str(xid) != "0" and n in name_i:
-            xf_to_go.setdefault(str(xid), name_i[n])
+        if gi is None or xid is None or str(xid) == "0":
+            continue
+        xf_to_go.setdefault(str(xid), int(gi))
     parents = [-1] * len(names)
     for cl in plan["classes"].values():
         for o in cl.get("instances") or []:
-            n = o.get("name") or "obj"
-            if n not in name_i:
+            gi = o.get("go_index")
+            if gi is None or gi < 0 or gi >= len(parents):
                 continue
-            gi = name_i[n]
             fid = o.get("father_id")
             if not fid or str(fid) == "0":
                 continue
-            parents[gi] = int(xf_to_go.get(str(fid), -1))
+            parents[int(gi)] = int(xf_to_go.get(str(fid), -1))
     for h in plan.get("scene_hierarchy") or []:
-        n = h.get("name") or "obj"
-        if n not in name_i:
+        gi = h.get("go_index")
+        if gi is None or gi < 0 or gi >= len(parents):
             continue
-        gi = name_i[n]
-        if parents[gi] >= 0:
+        if parents[int(gi)] >= 0:
             continue
         fid = h.get("father_id")
         if not fid or str(fid) == "0":
             continue
-        parents[gi] = int(xf_to_go.get(str(fid), -1))
+        parents[int(gi)] = int(xf_to_go.get(str(fid), -1))
     return parents
 
 
@@ -4867,14 +5201,18 @@ def _build_go_sibling_indices(go_parents):
 
 def _build_ui_buttons(plan):
     """Authored uGUI Buttons: normalized hit, ColorBlock, SetActive onClick."""
-    names = plan.get("go_names") or []
     go_by_id = {}
     for cl in plan["classes"].values():
         for o in cl.get("instances") or []:
             gid = str(o.get("go_id") or "")
-            n = o.get("name") or "obj"
-            if gid and n in names:
-                go_by_id[gid] = names.index(n)
+            gi = o.get("go_index")
+            if gid and gi is not None:
+                go_by_id[gid] = int(gi)
+    for h in plan.get("scene_hierarchy") or []:
+        gid = str(h.get("go_id") or "")
+        gi = h.get("go_index")
+        if gid and gi is not None:
+            go_by_id.setdefault(gid, int(gi))
     buttons = []
     for cl in plan["classes"].values():
         for o in cl.get("instances") or []:
@@ -4884,10 +5222,10 @@ def _build_ui_buttons(plan):
                 continue
             if not int(ub.get("interactable", 1)):
                 continue
-            n = o.get("name") or "obj"
-            if n not in names:
+            self_go = o.get("go_index")
+            if self_go is None:
                 continue
-            self_go = names.index(n)
+            self_go = int(self_go)
             calls = []
             for c in ub.get("onclick") or []:
                 if c.get("method") != "SetActive":
@@ -5042,13 +5380,21 @@ def _disallow_multiple_types(analyses):
 
 
 def _gos_with_sprite(plan):
-    """Authored GameObject names that already have a SpriteRenderer."""
-    names = set()
+    """Authored GO indices that already have a SpriteRenderer.
+
+    Call after ``_build_go_tables`` so ``go_index`` is stamped. Indices (not
+    display names) so duplicate UI names do not share sprite presence.
+    """
+    idxs = set()
     for cl in (plan.get("classes") or {}).values():
         for o in cl.get("instances") or []:
-            if o.get("sprite"):
-                names.add(o.get("name") or "")
-    return names
+            if not o.get("sprite"):
+                continue
+            gi = o.get("go_index")
+            if gi is None:
+                continue
+            idxs.add(int(gi))
+    return idxs
 
 
 def _validate_addcomponent_types(types, plan, analyses=None):
@@ -5075,6 +5421,7 @@ def _validate_getcomponent_types(types, plan, analyses=None):
              | _ADDABLE_BUILTINS
              | _PHYSICS_COMPONENTS
              | _UI_GETCOMPONENT_TYPES
+             | _TRANSFORM_GETCOMPONENT_TYPES
              | _analyzed_mb_typenames(analyses))
     # Base type with at least one packed subclass is known for GCIC.
     for t in types:
@@ -5371,6 +5718,7 @@ def _rewrite_getcomponentsinchildren(text, plan, this_class):
             or resolved in _PHYSICS_COMPONENTS
             or resolved in _ADDABLE_BUILTINS
             or resolved in _UI_GETCOMPONENT_TYPES
+            or resolved in _TRANSFORM_GETCOMPONENT_TYPES
             or resolved in set(plan.get("addcomponent_types") or [])
             or resolved in gcic
             or bool(_gcic_collector_types(
@@ -5429,7 +5777,8 @@ def _rewrite_getcomponentsinchildren(text, plan, this_class):
     elem_tys = set(gcic) | set(_GCIC_TYPE_ALIAS.keys()) | set(
         _GCIC_TYPE_ALIAS.values())
     elem_tys |= set(classes) | set(_ADDABLE_BUILTINS) | set(
-        _PHYSICS_COMPONENTS) | set(_UI_GETCOMPONENT_TYPES)
+        _PHYSICS_COMPONENTS) | set(_UI_GETCOMPONENT_TYPES) | set(
+        _TRANSFORM_GETCOMPONENT_TYPES)
     for ty in sorted(elem_tys, key=len, reverse=True):
         text = cs2cpp.code_sub(
             r"(?<![\w.])(?:UnityEngine\.)?%s\s+(\w+)\s*=" % re.escape(ty),
@@ -5620,21 +5969,24 @@ def _build_rigidbody_tables(plan):
     """Authored Rigidbody2D / Rigidbody → packed tables linked to MB instances."""
     rb2d = []
     rb3d = []
-    go_rb2d = {}  # go_name -> rb2d index
+    go_rb2d = {}  # go_index -> rb2d index
     go_rb3d = {}
     rb2d_by_file_id = {}
     rb3d_by_file_id = {}
     for cname, cl in sorted(plan["classes"].items()):
         for i, o in enumerate(cl.get("instances") or []):
             n = o.get("name") or "obj"
+            gi = o.get("go_index")
             r2 = o.get("rigidbody2d")
             if r2:
-                go_rb2d[n] = len(rb2d)
+                if gi is not None:
+                    go_rb2d[int(gi)] = len(rb2d)
                 fid = r2.get("file_id")
                 if fid is not None and str(fid) != "0":
                     rb2d_by_file_id[str(fid)] = len(rb2d)
                 rb2d.append({
                     "name": n,
+                    "go_index": gi,
                     "owner_class": cname,
                     "owner_inst": i,
                     "file_id": fid,
@@ -5647,12 +5999,14 @@ def _build_rigidbody_tables(plan):
                 })
             r3 = o.get("rigidbody")
             if r3:
-                go_rb3d[n] = len(rb3d)
+                if gi is not None:
+                    go_rb3d[int(gi)] = len(rb3d)
                 fid = r3.get("file_id")
                 if fid is not None and str(fid) != "0":
                     rb3d_by_file_id[str(fid)] = len(rb3d)
                 rb3d.append({
                     "name": n,
+                    "go_index": gi,
                     "owner_class": cname,
                     "owner_inst": i,
                     "file_id": fid,
@@ -5671,7 +6025,7 @@ def _build_rigidbody_tables(plan):
 def _build_audiosource_tables(plan):
     """Authored AudioSource (!u!82) → packed pool; clip guids → opaque indices."""
     sources = []
-    go_first = {}  # go_name → first AudioSource index (GetComponent)
+    go_first = {}  # go_index → first AudioSource index (GetComponent)
     by_file_id = {}
     clip_guids = []
     clip_i = {}
@@ -5688,15 +6042,17 @@ def _build_audiosource_tables(plan):
     for cname, cl in sorted(plan["classes"].items()):
         for i, o in enumerate(cl.get("instances") or []):
             n = o.get("name") or "obj"
+            gi = o.get("go_index")
             for a in o.get("audiosources") or []:
                 fid = a.get("file_id")
                 idx = len(sources)
-                if n not in go_first:
-                    go_first[n] = idx
+                if gi is not None and int(gi) not in go_first:
+                    go_first[int(gi)] = idx
                 if fid is not None and str(fid) != "0":
                     by_file_id[str(fid)] = idx
                 sources.append({
                     "name": n,
+                    "go_index": gi,
                     "owner_class": cname,
                     "owner_inst": i,
                     "file_id": fid,
@@ -6474,6 +6830,7 @@ def _rewrite_find_getcomponent(text, plan, this_class, site=None):
                 or comp in _PHYSICS_COMPONENTS
                 or comp in _ADDABLE_BUILTINS
                 or comp in _UI_GETCOMPONENT_TYPES
+                or comp in _TRANSFORM_GETCOMPONENT_TYPES
                 or comp in set(plan.get("addcomponent_types") or []))
 
     def _raise_unknown_comp(ch, comp):
@@ -6691,10 +7048,12 @@ def analyze_script(path, text=None, shallow=False):
             scan):
         apis.add("transform.localToWorldMatrix")
     # Canvas invent only — using UnityEngine.UI / Image fields are authored OK.
+    # ForceUpdateCanvases is lowered to a no-op (not invent).
     if (re.search(r"AddComponent\s*<\s*(?:UnityEngine\.)?Canvas\s*>", scan)
-            or re.search(r"typeof\s*\(\s*Canvas\s*\)", scan)
-            or re.search(r"Canvas\.ForceUpdateCanvases\b", scan)):
+            or re.search(r"typeof\s*\(\s*Canvas\s*\)", scan)):
         apis.add("Canvas")
+    if re.search(r"Canvas\.ForceUpdateCanvases\b", scan):
+        apis.add("Canvas.ForceUpdateCanvases")
     if re.search(r"\bInputAction\b", scan):
         apis.add("InputAction")
     if re.search(
@@ -6839,8 +7198,19 @@ def analyze_script(path, text=None, shallow=False):
         bases = _mb_bases_from_header(scan, name_end, brace)
         body = text[brace + 1:close]
         bscan = scan[brace + 1:close]
-        fields = _fields_in(body, bscan, body_abs=brace + 1)
-        methods = _methods_in(body, bscan, body_abs=brace + 1)
+        # Nested types are separate classes — blank their braces so outer
+        # fields/methods do not absorb nested members (e.g. DragUpdater.DoUpdate
+        # must not appear on _Scrollbar).
+        nested = []
+        for k2, n2, _s2, b2, c2 in types:
+            if k2 not in ("class", "struct") or n2 == name:
+                continue
+            if b2 > brace and c2 < close:
+                nested.append((b2 - (brace + 1), (c2 + 1) - (brace + 1)))
+        body_m = _blank_index_ranges(body, nested)
+        bscan_m = _blank_index_ranges(bscan, nested)
+        fields = _fields_in(body_m, bscan_m, body_abs=brace + 1)
+        methods = _methods_in(body_m, bscan_m, body_abs=brace + 1)
         refs = []
         for f in fields:
             if f["ty"] not in _PRIM and f["ty"] not in (
@@ -6991,6 +7361,21 @@ def _parse_csharp_field_init(ty, raw):
             return int(m.group(1))
         return None
     return None
+
+
+def _blank_index_ranges(s, ranges):
+    """Replace [lo, hi) spans with spaces (keep newlines) for nested skip."""
+    if not ranges or not s:
+        return s
+    chars = list(s)
+    n = len(chars)
+    for lo, hi in ranges:
+        a = max(0, int(lo))
+        b = min(n, int(hi))
+        for i in range(a, b):
+            if chars[i] != "\n":
+                chars[i] = " "
+    return "".join(chars)
 
 
 def _fields_in(body, bscan, body_abs=0):
@@ -7503,6 +7888,34 @@ def plan_layouts(objects, analyses, two_d=None):
     for o in objects:
         by_class.setdefault(o["class"], []).append(o)
 
+    # GetComponent / FindObjectOfType / MB field targets that lost every
+    # authored instance (trimmed assets) still need a packed class (n=0) so
+    # rewrite emits GameObject_GetComponent_* instead of CS0246.
+    analyzed = set()
+    for a in analyses:
+        for c in a.get("classes") or []:
+            analyzed.add(c["name"])
+    referenced = set()
+    for a in analyses:
+        referenced |= set(a.get("getcomponent_types") or [])
+        referenced |= set(a.get("getcomponentsinchildren_types") or [])
+        referenced |= set(a.get("addcomponent_types") or [])
+        referenced |= set(a.get("findobject_types") or [])
+        referenced |= set(a.get("singleton_instance_types") or [])
+        for c in a.get("classes") or []:
+            for f in c.get("fields") or []:
+                ty = f.get("ty") or ""
+                if ty in analyzed:
+                    referenced.add(ty)
+            for b in c.get("bases") or []:
+                if b in analyzed:
+                    referenced.add(b)
+    skip = (_ADDABLE_BUILTINS | _PHYSICS_COMPONENTS | _UI_GETCOMPONENT_TYPES
+            | _UI_COMPONENT_FIELD_TYPES | _TRANSFORM_GETCOMPONENT_TYPES)
+    for t in referenced:
+        if t in analyzed and t not in skip:
+            by_class.setdefault(t, [])
+
     spawn = any(a["spawns"] for a in analyses)
     uses_z = any(a["uses_z"] for a in analyses)
     if two_d is None:
@@ -7953,7 +8366,14 @@ def emit_engine(plan, analyses, used_apis):
         or want_file_delete or want_file_text_stream or want_file_copy)
     want_destroy = "Object.Destroy" in used_apis
     ui_buttons = plan.get("ui_buttons") or []
-    want_ui = bool(ui_buttons) or ("GameObject.SetActive" in used_apis)
+    authored_inactive = any(
+        int(o.get("active", 1)) == 0
+        for cl in plan["classes"].values()
+        for o in (cl.get("instances") or [])) or any(
+            int(h.get("active", 1)) == 0
+            for h in (plan.get("scene_hierarchy") or []))
+    want_ui = (bool(ui_buttons) or ("GameObject.SetActive" in used_apis)
+               or authored_inactive)
     want_go_tables = (
         want_find or want_transform_find or want_transform_parent
         or want_transform_go or want_set_parent or want_get_sibling
@@ -9036,16 +9456,15 @@ def emit_engine(plan, analyses, used_apis):
         # Per MonoBehaviour class: instance index at each GO, or -1.
         for cname in sorted(plan["classes"]):
             idn = _c_ident(cname)
-            vals = []
-            for n in go_names:
-                if cname in go_comps.get(n, {}):
-                    vals.append(str(go_comps[n][cname]))
-                else:
-                    vals.append("-1")
-            for _pad in range(go_spawn_budget):
-                vals.append("-1")
-            if not vals:
+            vals = ["-1"] * max(1, len(go_names) + go_spawn_budget)
+            if not go_names and not go_spawn_budget:
                 vals = ["-1"]
+            for i, o in enumerate(
+                    plan["classes"][cname].get("instances") or []):
+                gi = o.get("go_index")
+                if gi is None or gi < 0 or gi >= len(vals):
+                    continue
+                vals[int(gi)] = str(i)
             mb_extra = _mb_pool_extra(plan, cname)
             mb_add = int(add_budget.get(cname) or 0)
             mb_inst = int(inst_budget.get(cname) or 0)
@@ -9068,10 +9487,12 @@ def emit_engine(plan, analyses, used_apis):
             authored_n = int(plan["classes"][cname]["n"])
             cap_n = authored_n + mb_extra
             rev = ["-1"] * max(1, cap_n)
-            for n, cmap in go_comps.items():
-                if cname in cmap and n in go_names:
-                    gi = go_names.index(n)
-                    rev[cmap[cname]] = str(gi)
+            for i, o in enumerate(
+                    plan["classes"][cname].get("instances") or []):
+                gi = o.get("go_index")
+                if gi is None or i >= len(rev):
+                    continue
+                rev[i] = str(int(gi))
             if live_go:
                 p("static int _engine_%s_go_of[%d] = { %s };" % (
                     idn, len(rev), ", ".join(rev)))
@@ -9105,9 +9526,11 @@ def emit_engine(plan, analyses, used_apis):
             p("    return _object_tostring_buf;")
             p("}")
             p("")
-        # RectTransform ≡ Transform ≡ GO index (live handle, no side table).
-        if "RectTransform" in getcomponent_types and want_go_tables:
-            p("static int GameObject_GetComponent_RectTransform(int go) {")
+        # Transform / RectTransform ≡ GO index (live handle, no side table).
+        for tr_ty in sorted(getcomponent_types & _TRANSFORM_GETCOMPONENT_TYPES):
+            if not want_go_tables:
+                break
+            p("static int GameObject_GetComponent_%s(int go) {" % tr_ty)
             p("    if (go < 0 || go >= _engine_go_count) return -1;")
             p("    return go;")
             p("}")
@@ -9115,15 +9538,15 @@ def emit_engine(plan, analyses, used_apis):
         # Live uGUI GetComponent maps (mutable; seeded from authored presence).
         ui_gc = sorted(
             (getcomponent_types & _UI_GETCOMPONENT_TYPES)
-            - {"RectTransform"})
+            - _TRANSFORM_GETCOMPONENT_TYPES)
         if ui_gc and want_go_tables:
             ui_maps = plan.get("go_ui_components") or {}
             for ty in ui_gc:
                 idn = _c_ident(ty)
                 present = set(ui_maps.get(ty) or [])
                 vals = []
-                for i, n in enumerate(go_names if go_names else []):
-                    if n in present:
+                for i in range(len(go_names) if go_names else 0):
+                    if i in present:
                         vals.append(str(i))
                     else:
                         vals.append("-1")
@@ -9142,7 +9565,8 @@ def emit_engine(plan, analyses, used_apis):
         # Emit GetComponent_<T> for every packed class (and requested types).
         for cname in sorted(set(plan["classes"]) | (
                 getcomponent_types - _PHYSICS_COMPONENTS
-                - _UI_GETCOMPONENT_TYPES) | (
+                - _UI_GETCOMPONENT_TYPES
+                - _TRANSFORM_GETCOMPONENT_TYPES) | (
                 add_types - _ADDABLE_BUILTINS)):
             if cname not in plan["classes"]:
                 continue
@@ -9195,8 +9619,8 @@ def emit_engine(plan, analyses, used_apis):
                 p("")
         if want_rb2d:
             vals = []
-            for n in go_names:
-                vals.append(str(go_rb2d[n]) if n in go_rb2d else "-1")
+            for i in range(len(go_names) if go_names else 0):
+                vals.append(str(go_rb2d[i]) if i in go_rb2d else "-1")
             for _pad in range(go_spawn_budget):
                 vals.append("-1")
             if not vals:
@@ -9263,8 +9687,8 @@ def emit_engine(plan, analyses, used_apis):
                 p("")
         if want_rb3d:
             vals = []
-            for n in go_names:
-                vals.append(str(go_rb3d[n]) if n in go_rb3d else "-1")
+            for i in range(len(go_names) if go_names else 0):
+                vals.append(str(go_rb3d[i]) if i in go_rb3d else "-1")
             for _pad in range(go_spawn_budget):
                 vals.append("-1")
             if not vals:
@@ -9341,11 +9765,11 @@ def emit_engine(plan, analyses, used_apis):
                 bud = 1
             idn = _c_ident(type_name)
             go_n = max(1, len(go_names))
-            authored_names = authored_names or set()
+            authored = authored_names or set()
             init_vals = []
-            for n in (go_names if go_names else [""]):
-                # >=0 marks present (authored sentinel 0).
-                init_vals.append("0" if n in authored_names else "-1")
+            for i, _n in enumerate(go_names if go_names else [""]):
+                # >=0 marks present (authored sentinel 0). Keys are go indices.
+                init_vals.append("0" if i in authored else "-1")
             p("static int _engine_go_%s[%d] = { %s };" % (
                 idn, go_n, ", ".join(init_vals)))
             p("static int _%s_live = 0;" % idn)
@@ -9401,8 +9825,8 @@ def emit_engine(plan, analyses, used_apis):
             idn = "SpriteRenderer"
             go_n_sr = max(1, len(go_names) + go_spawn_budget)
             init_vals = []
-            for n in (go_names if go_names else []):
-                init_vals.append("0" if n in go_has_sprite else "-1")
+            for i, _n in enumerate(go_names if go_names else []):
+                init_vals.append("0" if i in go_has_sprite else "-1")
             for _pad in range(go_spawn_budget):
                 init_vals.append("-1")
             if not init_vals:
@@ -9477,8 +9901,10 @@ def emit_engine(plan, analyses, used_apis):
             go_n = max(1, len(go_names))
             go_as = plan.get("go_audiosource") or {}
             vals = []
-            for n in (go_names if go_names else [""]):
-                vals.append(str(int(go_as[n])) if n in go_as else "-1")
+            for i in range(len(go_names) if go_names else 0):
+                vals.append(str(int(go_as[i])) if i in go_as else "-1")
+            if not go_names:
+                vals = ["-1"]
             p("/* AudioSource — authored !u!82 + AddComponent pool (multi OK). */")
             p("extern int _AudioSource_count;")
             p("extern int _AudioSource_owner_go[%d];" % as_cap)
@@ -9670,11 +10096,10 @@ def emit_engine(plan, analyses, used_apis):
             p("    int i;")
             p("    if (_engine_go_active_inited) return;")
             p("    _engine_go_active_inited = 1;")
-            # Seed authored m_IsActive; spawn slots default active.
-            p("    static const int _seed[%d] = { %s };" % (
-                go_n, ", ".join(str(int(a)) for a in go_active[:go_n])))
+            p("    static const int _engine_go_active_authored[%d] = { %s };"
+              % (go_n, ", ".join(str(int(x)) for x in go_active[:go_n])))
             p("    for (i = 0; i < %d; i = i + 1)" % go_n)
-            p("        _engine_go_active[i] = _seed[i];")
+            p("        _engine_go_active[i] = _engine_go_active_authored[i];")
             p("}")
             p("static int _engine_go_active_in_hierarchy(int go) {")
             p("    int guard = 0;")
@@ -9943,15 +10368,16 @@ def emit_engine(plan, analyses, used_apis):
             idn = _c_ident(tname)
             collectors = _gcic_collector_types(
                 tname, plan, plan.get("mb_bases") or {})
-            # Need a GetComponent map / packed class / subclass / RectTransform.
+            # Need a GetComponent map / packed class / subclass / Transform.
             has_map = (
                 bool(collectors)
                 or tname in _PHYSICS_COMPONENTS
                 or tname in _ADDABLE_BUILTINS
                 or tname in _UI_GETCOMPONENT_TYPES
+                or tname in _TRANSFORM_GETCOMPONENT_TYPES
                 or tname in add_types
                 or tname == "SpriteRenderer")
-            if not has_map and tname != "RectTransform":
+            if not has_map:
                 continue
             p("static std::vector<int> GameObject_GetComponentsInChildren_%s("
               % idn)
@@ -12013,8 +12439,12 @@ def emit_engine(plan, analyses, used_apis):
             btn_by_go = {int(b["go"]): bi
                          for bi, b in enumerate(ui_buttons)}
             for i, _sp in spr_idx:
-                n = cl["instances"][i].get("name") or "obj"
-                gi = go_names.index(n) if n in go_names else -1
+                gi = cl["instances"][i].get("go_index")
+                if gi is None:
+                    n = cl["instances"][i].get("name") or "obj"
+                    gi = go_names.index(n) if n in go_names else -1
+                else:
+                    gi = int(gi)
                 go_vals.append(str(gi))
                 btn_vals.append(str(btn_by_go.get(gi, -1)))
             p("        static const int _spr_go[] = { %s };" % ", ".join(go_vals))
@@ -13743,6 +14173,26 @@ def _packed_model(plan):
         elem_type=lambda t: _collection_elem_c_ty(t, plan))
 
 
+def _rewrite_csharp_float_literals(text):
+    """C# `0f` → C `0.f`. C rejects a float suffix on an integer constant.
+
+    C# allows `0f` / `1F` (digits + real-type-suffix). C needs a decimal
+    point (`0.f` / `0.0f`). Literals that already have `.` or an exponent
+    (`1.5f`, `1e2f`) are valid in both and left alone. Runs on a blanked
+    scan so `"0f"` in a string stays put.
+    """
+    scan = cs2cpp._blank(text)
+    out = []
+    pos = 0
+    for m in re.finditer(r"(?<![\w.])(\d+)([fF])\b", scan):
+        out.append(text[pos:m.start(1)])
+        out.append(m.group(1) + "." + m.group(2))
+        pos = m.end()
+    out.append(text[pos:])
+    return "".join(out)
+
+
+
 def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     """C# subset method → C against packed arrays.
 
@@ -13751,11 +14201,12 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     field is already an index: `other.hp` → `_Other_inst_array[other].hp`.
     """
     idn = _c_ident(cl["name"])
-    # The C# language families cs2cpp owns -- float literals, null
-    # comparisons against the packed -1, `true`/`false`, the packed `this`
-    # as the index `i` -- then the Unity API rewrites.
-    text = cs2cpp.lower_body(body, _packed_model(plan))
-    # (`true`/`false` -> 1/0 and the packed `this` -> `i`: `lower_body`.)
+    text = _rewrite_csharp_float_literals(body)
+    text = re.sub(r"(?<![\w.])true\b", "1", text)
+    text = re.sub(r"(?<![\w.])false\b", "0", text)
+    text = re.sub(r"\bthis\.", "", text)
+    # Bare `this` is the packed instance index (Add(this), == this, …).
+    text = re.sub(r"(?<![\w.])this(?![\w])", "i", text)
     # base.Awake() / base.OnEnable() — no C equivalent; drop.
     text = cs2cpp.code_sub(
         r"(?<![\w.])base\s*\.\s*(?:Awake|OnEnable)\s*\(\s*\)\s*;?",
@@ -14244,11 +14695,10 @@ def emit_data(plan, used_apis=None):
             return list(vals) + [fill] * (as_cap - len(vals))
 
         p("int _AudioSource_count = %d;" % n)
-        go_names = plan.get("go_names") or []
-        name_i = {nm: i for i, nm in enumerate(go_names)}
         owner_gos = []
         for r in asrc_list:
-            owner_gos.append(int(name_i.get(r.get("name") or "", -1)))
+            gi = r.get("go_index")
+            owner_gos.append(int(gi) if gi is not None else -1)
         p("int _AudioSource_owner_go[%d] = { %s };" % (
             as_cap, ", ".join(str(int(v)) for v in _pad_as(owner_gos, -1))))
         p("int _AudioSource_play_on_awake[%d] = { %s };" % (
@@ -14928,12 +15378,11 @@ def _load_scenes_lights_cameras(root, assets):
     lights = []
     cameras = []
     hierarchy = []
-    _progress("finding .unity scenes")
-    scenes = list(_walk_files(root, (".unity",)))
-    _progress("parsing %d .unity scene(s)" % len(scenes))
+    scenes = _unity_scenes_to_pack(root, asset_guids=assets)
+    _progress("packing %d startup scene(s)" % len(scenes))
     for si, path in enumerate(scenes):
         _progress("  scene %d/%d %s" % (
-            si + 1, len(scenes), os.path.basename(path)))
+            si + 1, len(scenes), os.path.relpath(path, root)))
         objs, scene_lights, scene_cams, scene_hier = parse_unity_yaml(
             _read(path), guid_to_script=guids, asset_guids=assets)
         objects.extend(objs)
@@ -14973,6 +15422,9 @@ def _analyze_scripts_and_prefabs(root, objects, assets):
         sp = o.get("script")
         if sp:
             scene_scripts.add(os.path.abspath(sp))
+    # Prefer authored scene / prefab m_Script guids when GO join missed them.
+    scene_scripts |= _scripts_referenced_in_startup_scenes(
+        root, assets, guids)
     scripts = [p for p in _walk_files(root, (".cs",))
                if _is_player_csharp(root, p)]
     if scene_scripts:
@@ -15010,6 +15462,7 @@ def _analyze_scripts_and_prefabs(root, objects, assets):
         and t not in _ADDABLE_BUILTINS
         and t not in _PHYSICS_COMPONENTS
         and t not in _UI_GETCOMPONENT_TYPES
+        and t not in _TRANSFORM_GETCOMPONENT_TYPES
         and t in typename_map)
     if missing:
         _progress("loading prefab components for %s" % ", ".join(missing))
@@ -15452,8 +15905,7 @@ def _refused_api_site(analyses, api):
     patterns = {
         "Canvas": (
             r"AddComponent\s*<\s*(?:UnityEngine\.)?(Canvas)\s*>|"
-            r"typeof\s*\(\s*(Canvas)\s*\)|"
-            r"Canvas\.(ForceUpdateCanvases)\b"
+            r"typeof\s*\(\s*(Canvas)\s*\)"
         ),
         "InputAction": r"(?<![\w.])InputAction\b",
         "ParticleSystem.Emit": r"ParticleSystem\.(Emit)\b",
@@ -15493,8 +15945,9 @@ def _refused_api_site(analyses, api):
 # ---------------------------------------------------------------------------
 
 _STAMP_NAME = ".unity_pack_stamp.json"
-_STAMP_VERSION = 3
+_STAMP_VERSION = 4
 _SCENE_CACHE_NAME = ".unity_pack_scene_cache"
+_SCENE_CACHE_VERSION = 2
 # Authored inputs under Assets/ that affect emit (skip Library / PackageCache).
 _FINGERPRINT_EXTS = (
     ".cs", ".unity", ".prefab", ".meta",
@@ -15622,6 +16075,7 @@ def _write_scene_cache(outdir, assets_fp, objects, lights, cameras, hierarchy,
         for sp, rgba in saved:
             sp["tex_rgba"] = rgba
     payload = {
+        "cache_version": _SCENE_CACHE_VERSION,
         "assets_fingerprint": assets_fp,
         "objects": objs,
         "lights": copy.deepcopy(lights),
@@ -15647,6 +16101,8 @@ def _read_scene_cache(outdir, assets_fp):
     except Exception:
         return None
     if not isinstance(payload, dict):
+        return None
+    if int(payload.get("cache_version") or 0) != _SCENE_CACHE_VERSION:
         return None
     if payload.get("assets_fingerprint") != assets_fp:
         return None
@@ -15903,7 +16359,6 @@ def pack(root, outdir, soa=False, soa_vec4=False, force=False, strict=False,
     fot_types |= sing_types
     plan["findobject_types"] = sorted(fot_types)
     plan["singleton_instance_types"] = sorted(sing_types)
-    plan["go_has_sprite"] = sorted(_gos_with_sprite(plan))
     plan["lights"] = list(lights)
     plan["light_count"] = len(lights)
     plan["scene_hierarchy"] = list(hierarchy)
@@ -15945,10 +16400,11 @@ def pack(root, outdir, soa=False, soa_vec4=False, force=False, strict=False,
             or "transform.SetParent" in used_apis
             or "transform.GetSiblingIndex" in used_apis
             or ui_gc):
-        go_names, go_comps, go_active = _extend_go_tables_for_find(
-            plan, go_names, go_comps, go_active)
+        go_names, go_comps = _extend_go_tables_for_find(
+            plan, go_names, go_comps)
     plan["go_names"] = go_names
-    plan["go_active"] = go_active
+    plan["go_has_sprite"] = sorted(_gos_with_sprite(plan))
+    plan["go_active"] = _build_go_active(plan, go_names)
     plan["go_components"] = go_comps
     plan["go_ui_components"] = _build_go_ui_component_maps(plan)
     plan["go_parents"] = _build_go_parents(plan)
