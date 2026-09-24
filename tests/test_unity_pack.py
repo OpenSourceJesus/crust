@@ -974,6 +974,15 @@ class TestGpuHandles(unittest.TestCase):
     the Player -- so an 8-bit class holds 16-bit handles and the reverse.
     """
 
+    _root = None
+
+    @classmethod
+    def root_for_viewer(cls):
+        """The mixed-width handle project, for the viewer tests."""
+        if cls._root is None:
+            cls.setUpClass()
+        return cls._root
+
     @classmethod
     def setUpClass(cls):
         root = tempfile.mkdtemp(prefix="upack-gpuh-")
@@ -1021,6 +1030,7 @@ class TestGpuHandles(unittest.TestCase):
         with open(os.path.join(scenes, "S.unity"), "w") as f:
             f.write(scene)
         cls.root = root
+        TestGpuHandles._root = root
         cls.out = tempfile.mkdtemp(prefix="upack-gpuh-out-")
         with contextlib.redirect_stderr(io.StringIO()):
             unity_pack.pack(root, cls.out, gpu_handles=True)
@@ -1105,6 +1115,121 @@ class TestGpuHandles(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(d, "engine_handles.h")))
         with open(os.path.join(d, "engine.cpp")) as f:
             self.assertNotIn("engine_upload_handles", f.read())
+
+
+def _gl_runtime_dir():
+    """A directory to link -lEGL -lGLESv2 from: the dev symlinks when
+    installed, else links to the runtime libraries ldconfig knows (Mesa
+    without its -dev packages). None when there is no EGL / GLES at all."""
+    try:
+        out = subprocess.run(["ldconfig", "-p"], capture_output=True,
+                             text=True).stdout
+    except OSError:
+        return None
+    found = {}
+    for name in ("libEGL.so", "libGLESv2.so"):
+        m = re.search(r"\s(%s(?:\.\d+)*)\s.*=> (\S+)" % re.escape(name), out)
+        if m:
+            found[name] = m.group(2)
+    if len(found) < 2:
+        return None
+    d = tempfile.mkdtemp(prefix="upack-gllib-")
+    for name, path in found.items():
+        os.symlink(path, os.path.join(d, name))
+    return d
+
+
+def _gl_include_dir():
+    """Crust's own GL headers, and nothing else of shivyc/include (its libc
+    headers are not for gcc)."""
+    d = tempfile.mkdtemp(prefix="upack-glinc-")
+    for sub in ("EGL", "GLES2", "GLES3"):
+        os.symlink(os.path.join(ROOT, "shivyc", "include", sub),
+                   os.path.join(d, sub))
+    return d
+
+
+class TestGLES3View(unittest.TestCase):
+    """The default viewer is OpenGL ES 3.1 (gles3_render.h), for SSBOs.
+
+    It must draw what the GLES2 viewer draws: both render MiniScene
+    headless (EGL + Mesa's software rasteriser) and the frames must be
+    identical, byte for byte. Built against crust's own GL headers, so the
+    check runs on a machine with Mesa but without its -dev packages.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.libdir = _gl_runtime_dir()
+        cls.incdir = _gl_include_dir()
+
+    def _build(self, view, d, *defines):
+        if self.libdir is None:
+            self.skipTest("no libEGL / libGLESv2 here")
+        for src, obj, opt in (("engine.c", "engine.o", "-O3"),
+                              ("data.c", "data.o", "-O0")):
+            r = subprocess.run([_CC, opt, "-w", "-c", "-o",
+                                os.path.join(d, obj), os.path.join(d, src)],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+        exe = os.path.join(d, view.replace(".c", ""))
+        r = subprocess.run(
+            [_CC, "-O2", "-w", "-o", exe,
+             os.path.join(ROOT, "examples", "unity_pack", view),
+             os.path.join(d, "engine.o"), os.path.join(d, "data.o"),
+             "-I", self.incdir, "-I", d, "-L", self.libdir,
+             "-lEGL", "-lGLESv2", "-lm"] + list(defines),
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return exe
+
+    def _run(self, exe, *args):
+        env = os.environ.copy()
+        env["EGL_PLATFORM"] = "surfaceless"
+        env["LD_LIBRARY_PATH"] = self.libdir
+        run = subprocess.run([exe] + list(args), capture_output=True,
+                             text=True, env=env, timeout=120)
+        if "eglInitialize failed" in run.stdout or "no EGLConfig" in run.stdout:
+            self.skipTest("no EGL display with OpenGL ES 3 here")
+        return run
+
+    def test_the_gles3_frame_is_the_gles2_frame(self):
+        d = tempfile.mkdtemp(prefix="upack-gles3-")
+        with contextlib.redirect_stderr(io.StringIO()):
+            unity_pack.pack(PROJECT, d)
+        frames = {}
+        for view in ("gles2_view.c", "gles3_view.c"):
+            # At 8 bits a channel: the default RGBA4 target would round a
+            # small difference -- a 1% dimmer shader -- to the same pixels.
+            exe = self._build(view, d, "-DFBO_FORMAT=0x8058")
+            ppm = os.path.join(d, view + ".ppm")
+            run = self._run(exe, ppm)
+            self.assertEqual(run.returncode, 0, run.stdout[-600:])
+            self.assertIn("draws=3", run.stdout)
+            with open(ppm, "rb") as f:
+                frames[view] = f.read()
+        self.assertEqual(frames["gles2_view.c"], frames["gles3_view.c"])
+        # And the frame is a scene, not a clear: background and sprites.
+        body = frames["gles3_view.c"].split(b"255\n", 1)[1]
+        colours = set(body[i:i + 3] for i in range(0, len(body), 3))
+        self.assertGreaterEqual(len(colours), 3)
+
+    def test_handles_are_bound_at_ssbo_binding_1(self):
+        d = tempfile.mkdtemp(prefix="upack-gles3-h-")
+        with contextlib.redirect_stderr(io.StringIO()):
+            unity_pack.pack(TestGpuHandles.root_for_viewer(), d,
+                            gpu_handles=True)
+        exe = self._build("gles3_view.c", d)
+        run = self._run(exe)
+        self.assertIn("handles: 255 words at SSBO binding 1", run.stdout)
+
+    def test_the_header_matches_khronos(self):
+        r = subprocess.run(
+            [sys.executable, os.path.join(ROOT, "tools", "gles3_header_test.py")],
+            capture_output=True, text=True)
+        if r.stdout.startswith("SKIP"):
+            self.skipTest(r.stdout.strip())
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
 
 class TestSystems(unittest.TestCase):
