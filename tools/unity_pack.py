@@ -433,7 +433,7 @@ def _blank_unity_editor_regions(text):
 
 
 # BCL collection types the pack does not emit (would need heap `new` / generics).
-# List → vector; Dictionary / SortedList → map — see _rewrite_list / _rewrite_dictionary.
+# List → vector; Dictionary / SortedList → map — see cs2cpp.lower_packed_collections.
 _REFUSED_BCL_TYPES = frozenset((
     "HashSet", "Queue", "Stack",
     "LinkedList", "ConcurrentBag",
@@ -13511,161 +13511,6 @@ def _emit_vector2int_struct(p):
     p("")
 
 
-def _rewrite_dictionary(text, plan, cl):
-    """``Dictionary`` / ``SortedList`` → ``std::map`` (Add/Clear/Count/indexer)."""
-    idn = _c_ident(cl["name"])
-    dict_names = set()
-    for f in cl.get("class_consts") or []:
-        if _dict_kv_names(f.get("ty") or ""):
-            dict_names.add(f["name"])
-    inst_dict = {
-        f["name"]: f for f in (cl.get("dict_fields") or [])
-        if _dict_kv_names(f.get("ty") or "")
-    }
-    dict_names |= set(inst_dict)
-
-    # The collection itself -- types, declarations, temporaries -- is
-    # cs2cpp's, under the packed model (its element typing is this file's).
-    text, declared = cs2cpp.lower_map_types(text, _packed_model(plan))
-    dict_names |= declared
-    # Other classes' instance maps: recv.field → Class_field[recv].
-    for ocname, ocl in (plan.get("classes") or {}).items():
-        if ocname == cl.get("name"):
-            continue
-        oidn = _c_ident(ocname)
-        for f in ocl.get("dict_fields") or []:
-            if not _dict_kv_names(f.get("ty") or ""):
-                continue
-            fname = f["name"]
-            text = re.sub(
-                r"(?<![_\w])(\w+)\.%s\b" % re.escape(fname),
-                r"%s_%s[\1]" % (oidn, fname),
-                text)
-
-    dict_names |= set(re.findall(
-        r"\bstd::map<(?:[^<>]|<[^>]*>)+>\s+(\w+)\b", text))
-
-    key_cty = {}
-    for f in list(cl.get("class_consts") or []) + list(cl.get("dict_fields") or []):
-        kv = _dict_kv_names(f.get("ty") or "")
-        if kv:
-            key_cty[f["name"]] = _collection_elem_c_ty(kv[0], plan)
-    for ocname, ocl in (plan.get("classes") or {}).items():
-        oidn = _c_ident(ocname)
-        for f in ocl.get("dict_fields") or []:
-            kv = _dict_kv_names(f.get("ty") or "")
-            if kv:
-                key_cty["%s_%s" % (oidn, f["name"])] = _collection_elem_c_ty(
-                    kv[0], plan)
-    for m in re.finditer(
-            r"\bstd::map<\s*([^,>]+)\s*,[^>]+>\s+(\w+)\b", text):
-        key_cty[m.group(2)] = m.group(1).strip()
-
-    # Bind instance refs before method/indexer rewrites.
-    aliases = []
-    for name, f in sorted(inst_dict.items()):
-        if not re.search(r"(?<![_\w])%s(?![\w])" % re.escape(name), text):
-            continue
-        kv = _dict_kv_names(f.get("ty") or "")
-        if not kv:
-            continue
-        aliases.append(
-            "std::map<%s, %s> &%s = %s_%s[i];"
-            % (_collection_elem_c_ty(kv[0], plan),
-               _collection_elem_c_ty(kv[1], plan),
-               name, idn, name))
-    if aliases:
-        text = "\n".join(aliases) + "\n" + text
-
-    text = cs2cpp.lower_map_members_named(text, dict_names, key_cty)
-
-    # String-key indexer → helper (literals / const char* need an address).
-    for ocname, ocl in (plan.get("classes") or {}).items():
-        oidn = _c_ident(ocname)
-        for f in ocl.get("dict_fields") or []:
-            kv = _dict_kv_names(f.get("ty") or "")
-            if not kv or _collection_elem_c_ty(kv[0], plan) != "std::string":
-                continue
-            text = cs2cpp.lower_map_string_index(
-                text, r"%s_%s\s*\[[^\]]+\]" % (
-                    re.escape(oidn), re.escape(f["name"])),
-                _packed_model(plan))
-    for name in sorted(
-            [n for n in dict_names if key_cty.get(n) == "std::string"],
-            key=len, reverse=True):
-        text = cs2cpp.lower_map_string_index(
-            text, r"(?<![.\w])%s" % re.escape(name), _packed_model(plan))
-    return text
-
-
-def _rewrite_list(text, plan, cl):
-    """``List<T>`` / ``new List<T>()`` / ``.Add`` / ``.Count`` → ``std::vector``.
-
-    Element types that are packed classes become ``int`` indices (same as
-    other MonoBehaviour fields). Locals and static ``List`` fields only —
-    ``.Add`` / ``.Count`` rewrite is scoped to those names.
-    """
-    idn = _c_ident(cl["name"])
-    list_names = set()
-    for f in cl.get("class_consts") or []:
-        if _list_elem_name(f.get("ty") or ""):
-            list_names.add(f["name"])
-    inst_list = {
-        f["name"]: f for f in (cl.get("list_fields") or [])
-        if _list_elem_name(f.get("ty") or "")
-    }
-    list_names |= set(inst_list)
-
-    # The collection itself is cs2cpp's, under the packed model.
-    text, declared = cs2cpp.lower_list_types(text, _packed_model(plan))
-    list_names |= declared
-
-    # OtherClass.staticList → OtherClass_staticList (before .Count / .Add).
-    for ocname, ocl in (plan.get("classes") or {}).items():
-        if ocname == cl.get("name"):
-            continue
-        oidn = _c_ident(ocname)
-        for f in ocl.get("class_consts") or []:
-            if not _list_elem_name(f.get("ty") or ""):
-                continue
-            fname = f["name"]
-            mangled = "%s_%s" % (oidn, fname)
-            text = re.sub(
-                r"(?<![\w.])%s\s*\.\s*%s\.Add\s*\(" % (
-                    re.escape(ocname), re.escape(fname)),
-                "%s.%s(" % (mangled, cs2cpp.LIST_METHODS["Add"]), text)
-            text = re.sub(
-                r"(?<![\w.])%s\s*\.\s*%s\.Clear\s*\(\s*\)" % (
-                    re.escape(ocname), re.escape(fname)),
-                "%s.%s()" % (mangled, cs2cpp.LIST_METHODS["Clear"]), text)
-            text = re.sub(
-                r"(?<![\w.])%s\s*\.\s*%s\.Count\b" % (
-                    re.escape(ocname), re.escape(fname)),
-                "%s.%s()" % (mangled, cs2cpp.LIST_METHODS["Count"]), text)
-            text = re.sub(
-                r"(?<![\w.])%s\s*\.\s*%s\b" % (
-                    re.escape(ocname), re.escape(fname)),
-                mangled, text)
-            list_names.add(mangled)
-
-    list_names |= set(re.findall(r"\bstd::vector<\w+>\s+(\w+)\b", text))
-    text = cs2cpp.lower_list_members_named(text, list_names)
-    # Instance lists: bind a ref so `.push_back` / `.clear` lower.
-    aliases = []
-    for name, f in sorted(inst_list.items()):
-        if not re.search(r"(?<![_\w])%s(?![\w])" % re.escape(name), text):
-            continue
-        elem = _list_elem_name(f.get("ty") or "")
-        if not elem:
-            continue
-        aliases.append(
-            "std::vector<%s> &%s = %s_%s[i];"
-            % (_list_elem_c_ty(elem, plan), name, idn, name))
-    if aliases:
-        text = "\n".join(aliases) + "\n" + text
-    return text
-
-
 def _rewrite_byte_array_lits(text, plan):
     """new byte[] { a, b } → _engine_ba_N() (helpers emitted in engine.c)."""
     counter = plan.get("_byte_array_lit_i")
@@ -13780,6 +13625,88 @@ def _lower_string_concat(text, string_idents=None):
     return cs2cpp.lower_string_concat(text, _PACKED_STRINGS, string_idents)
 
 
+_B = cs2cpp.Binding
+_UE = ("UnityEngine",)
+
+#: UnityEngine (and System.IO) members that are one engine name each, as
+#: cs2cpp bindings. The API is this file's; applying it is cs2cpp's
+#: (`lower_bindings`), with the same boundaries for every entry.
+_UNITY_API_CORE = [
+    _B("GameObject.Find", "GameObject_Find", namespaces=_UE),
+    _B("Time.deltaTime", "Time_deltaTime", "value"),
+    _B("Time.fixedDeltaTime", "Time_fixedDeltaTime", "value"),
+    _B("Time.time", "Time_time", "value"),
+    _B("Screen.width", "Screen_width", "value"),
+    _B("Screen.height", "Screen_height", "value"),
+    _B("Application.dataPath", "Application_dataPath", "getter", _UE),
+    _B("Application.persistentDataPath", "Application_persistentDataPath",
+       "getter", _UE),
+    _B("Application.isEditor", "Application_isEditor", "getter", _UE),
+    _B("Application.isPlaying", "Application_isPlaying", "getter", _UE),
+    _B("Application.productName", "Application_productName", "getter", _UE),
+    _B("Application.OpenURL", "Application_OpenURL", namespaces=_UE),
+    # Quit() → Quit(0); Quit(code) keeps the arg.
+    _B("Application.Quit", "Application_Quit", namespaces=_UE,
+       no_args="Application_Quit(0)"),
+] + [_B("File." + m, "File_" + m, namespaces=("System.IO",))
+     for m in ("WriteAllText", "AppendAllText", "WriteAllBytes",
+               "ReadAllBytes", "Exists", "Delete")]
+
+_UNITY_API_SCENE = [
+    _B("Physics2D.gravity.x", "Physics2D_gravity_x", "value"),
+    _B("Physics2D.gravity.y", "Physics2D_gravity_y", "value"),
+    _B("Physics.gravity.x", "Physics_gravity_x", "value"),
+    _B("Physics.gravity.y", "Physics_gravity_y", "value"),
+    _B("Physics.gravity.z", "Physics_gravity_z", "value"),
+    _B("RenderSettings.ambientLight.r", "RenderSettings_ambient_r", "value"),
+    _B("RenderSettings.ambientLight.g", "RenderSettings_ambient_g", "value"),
+    _B("RenderSettings.ambientLight.b", "RenderSettings_ambient_b", "value"),
+    _B("Camera.main.orthographicSize", "Camera_main_orthographicSize", "value"),
+    _B("Camera.main.transform.position.x", "Camera_main_pos_x", "value"),
+    _B("Camera.main.transform.position.y", "Camera_main_pos_y", "value"),
+    _B("Camera.main.transform.position.z", "Camera_main_pos_z", "value"),
+    _B("Camera.main.nearClipPlane", "Camera_main_nearClipPlane", "value"),
+    _B("Camera.main.farClipPlane", "Camera_main_farClipPlane", "value"),
+] + [_B("Input." + m, "Input_" + m) for m in ("GetAxis", "GetButton", "GetKey")]
+
+_UNITY_API_LOG = [
+    _B("Debug.Log", "Debug_Log", "value", _UE),
+    _B("print", "Debug_Log", "callee"),
+]
+
+_UNITY_API_CONSOLE = [
+    _B("Console.WriteLine", "Console_WriteLine", "value", ("System",)),
+]
+
+_UNITY_API_MATHF = [_B("Mathf." + m, "Mathf_" + m)
+                    for m in ("Abs", "Min", "Max", "Clamp", "Lerp", "Sin",
+                              "Cos", "Sign")]
+
+
+def _packed_class(cl):
+    """The plan's collection fields of `cl`, as cs2cpp's `PackedClass`."""
+    static_lists, static_maps = [], []
+    for f in cl.get("class_consts") or []:
+        ty = f.get("ty") or ""
+        if _list_elem_name(ty):
+            static_lists.append((f["name"], _list_elem_name(ty)))
+        kv = _dict_kv_names(ty)
+        if kv:
+            static_maps.append((f["name"], kv[0], kv[1]))
+    inst_lists = [(f["name"], _list_elem_name(f.get("ty") or ""))
+                  for f in cl.get("list_fields") or []
+                  if _list_elem_name(f.get("ty") or "")]
+    inst_maps = [(f["name"],) + tuple(_dict_kv_names(f.get("ty") or ""))
+                 for f in cl.get("dict_fields") or []
+                 if _dict_kv_names(f.get("ty") or "")]
+    field_types = {}
+    for name, _cty, _bits, kind in cl.get("members") or []:
+        kind = str(kind)
+        field_types[name] = kind.split(":", 1)[1] if kind.startswith("idx:") else ""
+    return cs2cpp.PackedClass(cl["name"], _c_ident(cl["name"]), static_lists,
+                              inst_lists, static_maps, inst_maps, field_types)
+
+
 def _packed_model(plan):
     """cs2cpp's packed object model for this plan's engine."""
     return cs2cpp.packed_model(
@@ -13811,9 +13738,12 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
             r"(?<![\w.])gameObject\s*\.\s*SetActive\s*\(\s*([^)]+)\s*\)",
             r"GameObject_SetActive(_engine_go_of_%s(i), (\1))" % idn,
             text)
-    # Dictionary before List so 2-arg Add is not eaten by List.push_back.
-    text = _rewrite_dictionary(text, plan, cl)
-    text = _rewrite_list(text, plan, cl)
+    # Collections: cs2cpp lowers them from what the plan says about each
+    # class (maps before lists, so a two-argument `Add` is a map's).
+    text = cs2cpp.lower_packed_collections(
+        text, _packed_class(cl),
+        [_packed_class(o) for o in (plan.get("classes") or {}).values()],
+        _packed_model(plan))
     text = _rewrite_mb_static_and_singleton(text, plan, cl)
     text = _rewrite_toggle_is_on(text)
     text = _rewrite_byte_array_lits(text, plan)
@@ -13869,57 +13799,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         text = re.sub(
             r"\b%s\b(?=\s+\w)" % re.escape(cname), "int", text)
     # API tokens before Vector2 rewrites so nested Mathf.Sin(...) keeps parens.
-    text = re.sub(
-        r"(?:UnityEngine\.)?GameObject\s*\.\s*Find\s*\(",
-        "GameObject_Find(", text)
-    text = text.replace("Time.deltaTime", "Time_deltaTime")
-    text = text.replace("Time.fixedDeltaTime", "Time_fixedDeltaTime")
-    text = text.replace("Time.time", "Time_time")
-    text = text.replace("Screen.width", "Screen_width")
-    text = text.replace("Screen.height", "Screen_height")
-    text = re.sub(
-        r"(?<![\w])(?:UnityEngine\.)?Application\.dataPath\b",
-        "Application_dataPath()", text)
-    text = re.sub(
-        r"(?<![\w])(?:UnityEngine\.)?Application\.persistentDataPath\b",
-        "Application_persistentDataPath()", text)
-    text = re.sub(
-        r"(?<![\w])(?:UnityEngine\.)?Application\.isEditor\b",
-        "Application_isEditor()", text)
-    text = re.sub(
-        r"(?<![\w])(?:UnityEngine\.)?Application\.isPlaying\b",
-        "Application_isPlaying()", text)
-    text = re.sub(
-        r"(?<![\w])(?:UnityEngine\.)?Application\.productName\b",
-        "Application_productName()", text)
-    text = re.sub(
-        r"(?<![\w])(?:UnityEngine\.)?Application\.OpenURL\s*\(",
-        "Application_OpenURL(", text)
-    # Quit() → Quit(0); Quit(code) keeps the arg.
-    text = re.sub(
-        r"(?<![\w])(?:UnityEngine\.)?Application\.Quit\s*\(\s*\)",
-        "Application_Quit(0)", text)
-    text = re.sub(
-        r"(?<![\w])(?:UnityEngine\.)?Application\.Quit\s*\(",
-        "Application_Quit(", text)
-    text = re.sub(
-        r"(?:System\.IO\.)?File\.WriteAllText\s*\(",
-        "File_WriteAllText(", text)
-    text = re.sub(
-        r"(?:System\.IO\.)?File\.AppendAllText\s*\(",
-        "File_AppendAllText(", text)
-    text = re.sub(
-        r"(?:System\.IO\.)?File\.WriteAllBytes\s*\(",
-        "File_WriteAllBytes(", text)
-    text = re.sub(
-        r"(?:System\.IO\.)?File\.ReadAllBytes\s*\(",
-        "File_ReadAllBytes(", text)
-    text = re.sub(
-        r"(?:System\.IO\.)?File\.Exists\s*\(",
-        "File_Exists(", text)
-    text = re.sub(
-        r"(?:System\.IO\.)?File\.Delete\s*\(",
-        "File_Delete(", text)
+    text = cs2cpp.lower_bindings(text, _UNITY_API_CORE)
     # byte[] locals / params → ByteArray (File WriteAllBytes / ReadAllBytes).
     text = cs2cpp.lower_byte_arrays(text, _packed_model(plan))
     text = re.sub(
@@ -13937,31 +13817,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         r"(?<![\w.])(?:Object\.)?Destroy\s*\(",
         "Object_Destroy(",
         text)
-    text = text.replace("Physics2D.gravity.x", "Physics2D_gravity_x")
-    text = text.replace("Physics2D.gravity.y", "Physics2D_gravity_y")
-    text = text.replace("Physics.gravity.x", "Physics_gravity_x")
-    text = text.replace("Physics.gravity.y", "Physics_gravity_y")
-    text = text.replace("Physics.gravity.z", "Physics_gravity_z")
-    text = text.replace("RenderSettings.ambientLight.r",
-                        "RenderSettings_ambient_r")
-    text = text.replace("RenderSettings.ambientLight.g",
-                        "RenderSettings_ambient_g")
-    text = text.replace("RenderSettings.ambientLight.b",
-                        "RenderSettings_ambient_b")
-    text = text.replace("Camera.main.orthographicSize",
-                        "Camera_main_orthographicSize")
-    text = text.replace("Camera.main.transform.position.x",
-                        "Camera_main_pos_x")
-    text = text.replace("Camera.main.transform.position.y",
-                        "Camera_main_pos_y")
-    text = text.replace("Camera.main.transform.position.z",
-                        "Camera_main_pos_z")
-    text = text.replace("Camera.main.nearClipPlane",
-                        "Camera_main_nearClipPlane")
-    text = text.replace("Camera.main.farClipPlane",
-                        "Camera_main_farClipPlane")
-    text = re.sub(r"Input\.(GetAxis|GetButton|GetKey)\s*\(",
-                  lambda m: "Input_%s(" % m.group(1), text)
+    text = cs2cpp.lower_bindings(text, _UNITY_API_SCENE)
     # Keyboard.current.<name>Key.isPressed → helpers (null-safe via connected).
     text = re.sub(
         r"(?:UnityEngine\.InputSystem\.)?Keyboard\.current\.(\w+)Key\.isPressed\b",
@@ -13971,11 +13827,9 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         r"(?:UnityEngine\.InputSystem\.)?Keyboard\.current\b",
         "Keyboard_current()", text)
     # Debug.Log / print → Debug_Log. Drop optional context object arg.
-    text = re.sub(r"(?:UnityEngine\.)?Debug\.Log\b", "Debug_Log", text)
-    text = re.sub(r"(?<![\w.])print\b(?=\s*\()", "Debug_Log", text)
+    text = cs2cpp.lower_bindings(text, _UNITY_API_LOG)
     text = _strip_debug_log_context_arg(text)
-    text = re.sub(r"System\.Console\.WriteLine\b", "Console_WriteLine", text)
-    text = re.sub(r"(?<![\w.])Console\.WriteLine\b", "Console_WriteLine", text)
+    text = cs2cpp.lower_bindings(text, _UNITY_API_CONSOLE)
     string_idents = {
         f["name"] for f in (cl.get("class_consts") or [])
         if f.get("ty") == "string"
@@ -13988,8 +13842,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = _wrap_log_gameobject_tostring(text)
     text = _wrap_log_component_tostring(text, add_locals)
     text = _wrap_log_collision2d_tostring(text, collision2d_param)
-    text = re.sub(r"Mathf\.(Abs|Min|Max|Clamp|Lerp|Sin|Cos|Sign)\s*\(",
-                  lambda m: "Mathf_%s(" % m.group(1), text)
+    text = cs2cpp.lower_bindings(text, _UNITY_API_MATHF)
     text = re.sub(r"transform\.position\.x", idn + "_get_pos_x(i)", text)
     text = re.sub(r"transform\.position\.y", idn + "_get_pos_y(i)", text)
     text = re.sub(r"transform\.position\.z",

@@ -474,12 +474,16 @@ class ObjectModel(object):
                    instance by index: format strings over `cls`, `f`, `r`
                    (the receiver, an index), `v` (a value), `x` (an index).
                    None where fields are C++ members (csrust).
+    inst_collection -- where an instance's collection field lives: the
+                   packed engine keeps each in a table beside the instance
+                   array (`{cls}_{f}[{r}]`), not in the instance's slot.
     """
 
     def __init__(self, null_handle=None, bool_ints=False, this_index=False,
                  string_type=None, byte_array=None, string_plus=None,
                  string_calls=(), elem_type=None, map_at_string=None,
-                 field_get=None, field_set=None, static_field=None, at=None):
+                 field_get=None, field_set=None, static_field=None, at=None,
+                 inst_collection=None):
         self.null_handle = null_handle
         self.bool_ints = bool_ints
         self.this_index = this_index
@@ -493,6 +497,7 @@ class ObjectModel(object):
         self.field_set = field_set
         self.static_field = static_field
         self.at = at
+        self.inst_collection = inst_collection
 
 
 #: csrust: owned values; `null` is handled as a literal.
@@ -524,7 +529,8 @@ def packed_model(has_objects, byte_arrays=False, elem_type=None):
                        field_get="{cls}_get_{f}({r})",
                        field_set="{cls}_set_{f}({r}, {v})",
                        static_field="{cls}_{f}",
-                       at="{cls}_AT({x})")
+                       at="{cls}_AT({x})",
+                       inst_collection="{cls}_{f}[{r}]")
 
 
 def lower_body(text, model):
@@ -749,7 +755,7 @@ def _sub_orig(pat, fn, text):
     operand, a map key say, which may well be a string.
     """
     def repl(m):
-        return fn(lambda i: text[m.start(i):m.end(i)])
+        return fn(lambda i=0: text[m.start(i):m.end(i)])
     return cpprust._sub_code(pat, repl, text)
 
 
@@ -973,6 +979,213 @@ def lower_packed_fields(text, owner, members, statics, handle_fields, model,
         text = cpprust._sub_code(
             r"(?<![_\w.])%s(?![\w])" % re.escape(name),
             lambda m, nm=name: get(nm), text)
+    return text
+
+
+class PackedClass(object):
+    """What the packer's plan knows about one class's collection fields.
+
+    The plan decides; this is how it tells cs2cpp. `name` is the C# name,
+    `ident` its C identifier. Lists are `(field, element)`, maps `(field,
+    key, value)`, in C# types; `static_*` are class statics, `inst_*` one
+    per instance. `field_types` is what the plan knows of the other fields:
+    name -> C# class name for a field holding another class's instance,
+    or "" for one known to hold a plain value.
+    """
+
+    def __init__(self, name, ident, static_lists=(), inst_lists=(),
+                 static_maps=(), inst_maps=(), field_types=None):
+        self.name = name
+        self.ident = ident
+        self.static_lists = list(static_lists)
+        self.inst_lists = list(inst_lists)
+        self.static_maps = list(static_maps)
+        self.inst_maps = list(inst_maps)
+        self.field_types = dict(field_types or {})
+
+
+def _receiver_is_not(text, owner, recv, cls):
+    """Whether `recv` is visibly something other than an instance of `cls`:
+    a local declared with another type, or an `owner` field the plan knows
+    holds something else. Unknown is not "other"."""
+    if recv in owner.field_types:
+        return owner.field_types[recv] != cls
+    decls = re.findall(r"(?<![\w.])([A-Za-z_][\w.]*)\s+%s\s*[=;,)]"
+                       % re.escape(recv), _blank(text))
+    decls = [d for d in decls if d not in _NOT_A_TYPE]
+    return bool(decls) and decls[-1] != cls
+
+
+def _code_mentions(text, name):
+    return re.search(r"(?<![_\w])%s(?![\w])" % re.escape(name),
+                     _blank(text)) is not None
+
+
+def lower_packed_collections(text, owner, others, model, receiver="i"):
+    """Collections in a method of `owner`, a `PackedClass`, under the packed
+    model: maps first, then lists (a two-argument `Add` is a map's).
+
+    For each: its types and declarations (`lower_map_types` /
+    `lower_list_types`); the names that are collections here -- `owner`'s
+    fields, locals declared in the body, and other classes' reached by name
+    (a static list `Other.list` is `Other_list`; an instance map
+    `x.field` is `Other_field[x]`); an alias binding each instance field of
+    `owner` to its slot in the engine's table (`&items = Owner_items[i]`),
+    so members lower on a plain name; then the members, and a string-keyed
+    map's indexer through the engine's helper.
+
+    `x.field` for another class's instance map is matched on the field's
+    name; unity_pack took any `x`, and rewrote `v.cells` of an unrelated
+    `v` too. Now an `x` visibly of another type (a local, or a field the
+    plan knows) is left alone; an unknown one is still taken, as before.
+    """
+    others = [o for o in others if o.name != owner.name]
+    elem = lambda t: _elem(model, t)
+    # ---- maps
+    map_names = set(f for f, _k, _v in owner.static_maps + owner.inst_maps)
+    text, declared = lower_map_types(text, model)
+    map_names |= declared
+    for o in others:
+        for fname, _k, _v in o.inst_maps:
+            def other_map(g, o=o, fn=fname, before=text):
+                if _receiver_is_not(before, owner, g(1), o.name):
+                    return g(0)
+                return "%s_%s[%s]" % (o.ident, fn, g(1))
+            text = _sub_orig(
+                r"(?<![_\w])(\w+)\.%s\b" % re.escape(fname), other_map, text)
+    map_names |= set(re.findall(r"\bstd::map<(?:[^<>]|<[^>]*>)+>\s+(\w+)\b",
+                                _blank(text)))
+    key_types = {}
+    for fname, k, _v in owner.static_maps + owner.inst_maps:
+        key_types[fname] = elem(k)
+    for o in [owner] + others:
+        for fname, k, _v in o.inst_maps:
+            key_types["%s_%s" % (o.ident, fname)] = elem(k)
+    for m in re.finditer(r"\bstd::map<\s*([^,>]+)\s*,[^>]+>\s+(\w+)\b",
+                         _blank(text)):
+        key_types[m.group(2)] = m.group(1).strip()
+    aliases = []
+    for fname, k, v in sorted(owner.inst_maps):
+        if _code_mentions(text, fname):
+            aliases.append("std::map<%s, %s> &%s = %s;" % (
+                elem(k), elem(v), fname, model.inst_collection.format(
+                    cls=owner.ident, f=fname, r=receiver)))
+    if aliases:
+        text = "\n".join(aliases) + "\n" + text
+    text = lower_map_members_named(text, map_names, key_types)
+    for o in [owner] + others:
+        for fname, k, _v in o.inst_maps:
+            if elem(k) == "std::string":
+                text = lower_map_string_index(
+                    text, r"%s_%s\s*\[[^\]]+\]" % (re.escape(o.ident),
+                                                   re.escape(fname)), model)
+    for name in sorted([n for n in map_names
+                        if key_types.get(n) == "std::string"],
+                       key=len, reverse=True):
+        text = lower_map_string_index(
+            text, r"(?<![.\w])%s" % re.escape(name), model)
+    # ---- lists
+    list_names = set(f for f, _e in owner.static_lists + owner.inst_lists)
+    text, declared = lower_list_types(text, model)
+    list_names |= declared
+    for o in others:
+        for fname, _e in o.static_lists:
+            mangled = model.static_field.format(cls=o.ident, f=fname)
+            q = r"(?<![\w.])%s\s*\.\s*%s" % (re.escape(o.name),
+                                              re.escape(fname))
+            text = cpprust._sub_code(
+                q + r"\.Add\s*\(",
+                lambda m, mg=mangled: "%s.%s(" % (mg, LIST_METHODS["Add"]), text)
+            text = cpprust._sub_code(
+                q + r"\.Clear\s*\(\s*\)",
+                lambda m, mg=mangled: "%s.%s()" % (mg, LIST_METHODS["Clear"]),
+                text)
+            text = cpprust._sub_code(
+                q + r"\.Count\b",
+                lambda m, mg=mangled: "%s.%s()" % (mg, LIST_METHODS["Count"]),
+                text)
+            text = cpprust._sub_code(q + r"\b", lambda m, mg=mangled: mg, text)
+            list_names.add(mangled)
+    list_names |= set(re.findall(r"\bstd::vector<\w+>\s+(\w+)\b",
+                                 _blank(text)))
+    text = lower_list_members_named(text, list_names)
+    aliases = []
+    for fname, e in sorted(owner.inst_lists):
+        if _code_mentions(text, fname):
+            aliases.append("std::vector<%s> &%s = %s;" % (
+                elem(e), fname, model.inst_collection.format(
+                    cls=owner.ident, f=fname, r=receiver)))
+    if aliases:
+        text = "\n".join(aliases) + "\n" + text
+    return text
+
+
+class Binding(object):
+    """One library member, and the C that stands for it.
+
+    A binding table is how a caller -- unity_pack for UnityEngine, and in
+    time csrust for System -- says what its API is, and `lower_bindings`
+    applies it: the knowledge stays with the caller, the rewriting here.
+
+    path       -- the member as C# spells it, dotted: `Application.dataPath`,
+                  `Camera.main.orthographicSize`, or a bare `print`.
+    c          -- what it becomes.
+    form       -- "call":   `path(` -> `c(`
+                  "getter": `path`  -> `c()`   (a property the engine reads
+                                                through a function)
+                  "value":  `path`  -> `c`
+                  "callee": `path`  -> `c`, only where a `(` follows (the
+                                     name of a call, spacing kept)
+    namespaces -- qualifiers C# may write in front (`UnityEngine`,
+                  `System.IO`); optional.
+    no_args    -- for a call: what `path()` with no arguments becomes, when
+                  that differs (`Application.Quit()` -> `Application_Quit(0)`).
+    """
+
+    def __init__(self, path, c, form="call", namespaces=(), no_args=None):
+        self.path = path
+        self.c = c
+        self.form = form
+        self.namespaces = tuple(namespaces)
+        self.no_args = no_args
+
+
+def _binding_pattern(b):
+    dot = r"\s*\.\s*"
+    head = r"(?<![\w.])"
+    if b.namespaces:
+        head += r"(?:(?:%s)%s)?" % ("|".join(
+            dot.join(re.escape(p) for p in ns.split("."))
+            for ns in b.namespaces), dot)
+    return head + dot.join(re.escape(p) for p in b.path.split("."))
+
+
+def lower_bindings(text, bindings):
+    """Apply a binding table, in order, outside strings and comments.
+
+    Every entry gets the same boundaries: nothing word-like or a `.` just
+    before it, and a whole word at its end -- so `Time.time` is not the
+    front of `Time.timeScale`, and `File.Exists` not the back of
+    `MyFile.Exists`, which unity_pack's one-off patterns each got right
+    or wrong on their own.
+    """
+    for b in bindings:
+        pat = _binding_pattern(b)
+        if b.form == "call":
+            if b.no_args is not None:
+                text = cpprust._sub_code(pat + r"\s*\(\s*\)",
+                                         lambda m, r=b.no_args: r, text)
+            text = cpprust._sub_code(pat + r"\s*\(",
+                                     lambda m, c=b.c: c + "(", text)
+        elif b.form == "getter":
+            text = cpprust._sub_code(pat + r"(?![\w])",
+                                     lambda m, c=b.c: c + "()", text)
+        elif b.form == "callee":
+            text = cpprust._sub_code(pat + r"(?![\w])(?=\s*\()",
+                                     lambda m, c=b.c: c, text)
+        else:
+            text = cpprust._sub_code(pat + r"(?![\w])",
+                                     lambda m, c=b.c: c, text)
     return text
 
 
