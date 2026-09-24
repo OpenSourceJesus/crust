@@ -14,10 +14,16 @@ scene tables in `data.c` are just bytes, and `-O0` is faster to compile
 and does not fight the optimiser over initialisers.
 
 This is not Unity. It is a **subset** of C# plus a **subset** of the
-Unity (and later Godot / Blender) object model, lowered through the
-same discipline as `cs2cpp.py` / `csrust.py`: what is not in the
-subset is refused with a Unity/csc-style diagnostic
+Unity (and later Godot / Blender) object model, held to the same
+discipline as `cs2cpp.py` / `csrust.py`: what is not in the subset is
+refused with a Unity/csc-style diagnostic
 (`Assets/.../File.cs(line,col): error CSxxxx: …`) at the use site.
+
+Script bodies are still lowered by unity_pack's own translator, which is
+being replaced by `cs2cpp.py` one rewrite family at a time — see
+[Script lowering and the move to cs2cpp](#script-lowering-and-the-move-to-cs2cpp).
+A method it cannot lower yet is reported (`warning CS8000`), not
+silently emptied.
 
 After emit, `engine.cpp` / `data.cpp` / `main.cpp` (C++ subset twins of
 the `.c` files) are run through `cpprust._check_unsupported` and
@@ -85,6 +91,8 @@ python3 tools/unity_pack.py examples/unity_pack/MiniScene
 
 python3 tools/unity_pack.py examples/unity_pack/MiniScene -o /tmp/upack
 /tmp/upack/MiniScene
+
+python3 tools/unity_pack.py <project> --strict   # a stub is an error
 ```
 
 The linked player is `gles2_window.c` when `pkg-config glfw3` succeeds,
@@ -168,3 +176,83 @@ scene objects — see [UNITY_PACK_SYSTEMS.md](UNITY_PACK_SYSTEMS.md). The
 packer does not invent ParticleSystem pools, Canvas/UI, or InputAction maps.
 Authored AnimationClips / AnimatorControllers and Rigidbodies are packed.
 Fixture: `examples/unity_pack/SystemsScene`.
+
+## Script lowering and the move to cs2cpp
+
+unity_pack lowers script bodies with a translator of its own, written as
+regex rewrites against the packed object model. It should never have had
+one: `tools/cs2cpp.py` is the C# subset, and everything it does — enums,
+`List<T>`, `MemoryMarshal`, declaration order, its refusals — should apply
+to Unity scripts too. The translator is being moved onto cs2cpp one
+rewrite family at a time, with a "packed" object model cs2cpp understands
+(a class is an index into its instance array), until what remains here is
+the Unity API layer: Transform, GetComponent, Input and the like.
+
+**What has moved.** cs2cpp describes the difference between the two
+object models in one place, `cs2cpp.ObjectModel`; unity_pack builds the
+packed one from its plan (`_packed_model`) and hands script bodies to
+cs2cpp's families before its own Unity API rewrites:
+
+| family | cs2cpp | packed model |
+|--------|--------|--------------|
+| float literals `2f` | `lower_body` | `2.f` (csrust gained this too: it had none) |
+| `x == null` / `!= null` | `lower_body` | `-1`, the missing-object index |
+| `true` / `false` | `lower_body` | `1` / `0` |
+| `this.x`, bare `this` | `lower_body` | `x`, `i` — an object is its index |
+| `string` locals | `lower_local_types` | `const char *` |
+| `byte[]`, `.Length`, `[i]` | `lower_byte_arrays` | `ByteArray`, `.length`, `.data[i]` |
+
+Each moved as the same code, so the packed output did not change — the
+golden check is byte-identical after every step — except that cs2cpp
+matches outside strings and comments, where unity_pack's regexes did not.
+`Transform`, `GameObject` and `AudioSource` locals stay here: they are
+Unity types, the API layer's, not C#'s.
+
+**Stubs are diagnostics.** A method whose lowered body still holds C# the
+translator cannot handle is emitted as an empty method. That used to
+happen without a word, which changed what the program did — a
+`Debug.Log` vanished, a `File` call became a no-op. Now each one is a
+csc-style warning at the method, naming what was left:
+
+```
+Assets/Scripts/Menu.cs(3,19): warning CS8000: `Menu.Start` is not lowered yet
+  (`Unknown.DoThing(`: Unlowered static call …); it is emitted as an empty method
+```
+
+With `pack(strict=True)` / `--strict` it is an error, and every stub is
+recorded in `plan["stubs"]`. (CS8000 is csc's "not yet implemented".)
+Once the move to cs2cpp is done, strict becomes the default.
+
+Reporting them showed that the detector itself was emptying methods that
+were lowered completely: it matched inside string literals (a script path
+in a null-reference message, a URL) and took locals and fields of the
+engine's own C types (`ByteArray`, `Vector2`, `Vector2Int`, `Matrix4x4`)
+for leftover C#. Both are fixed — it matches with strings and comments
+blanked, and accepts the types the engine has declared — and a stub keeps
+a `SetActive` line only if that line is itself lowered (one inside a
+lambda had carried the lambda into the C). `TestStubDiagnostics` pins
+each.
+
+**The gate: `tools/unity_pack_golden.py`.** Every step of the move must
+leave the packed output exactly as it was, or change it on purpose and
+show where:
+
+```
+python3 tools/unity_pack_golden.py check      # re-pack every case, compare
+python3 tools/unity_pack_golden.py check -v   # ... with diffs
+python3 tools/unity_pack_golden.py record     # after an intended change
+```
+
+The corpus is every `unity_pack.pack(..)` call `tests/test_unity_pack.py`
+makes, over the small projects the tests author themselves: inputs,
+options, and a sha256 of `engine.cpp` / `data.cpp` / `main.cpp`
+(`tests/unity_golden/corpus.json`). A check skips cpprust + shivyc
+validation, which does not change the emitted text, so it takes seconds.
+
+**Fixtures.** `examples/unity_pack/MiniScene` is a self-authored project
+(scene, metas, a generated 8×8 PNG) and is tracked whole. SystemsScene is
+scripts-only in the repository; the tests that pack the whole project are
+marked `needs_systems` and skip unless its scene, art and ProjectSettings
+have been dropped in locally. Its golden cases go to a local file beside
+the cache and are checked when present.
+
