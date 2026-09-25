@@ -7002,6 +7002,10 @@ class TestSystems(unittest.TestCase):
         self.assertIn("_engine_ui_btn_call_count", eng)
         self.assertRegex(
             eng, r"_engine_ui_btn_call_count\[1\] = \{ 2 \}")
+        # onClick on pointer-up over press target (not pointer-down).
+        self.assertIn("_engine_ui_btn_press", eng)
+        self.assertIn("up_edge", eng)
+        self.assertIn("down_edge && hit >= 0", eng)
 
     def test_nested_canvas_keeps_rect_size(self):
         """Nested Canvas (sorting override) must not expand to full screen."""
@@ -10760,10 +10764,15 @@ class TestSystemsRuns(unittest.TestCase):
                 "          && buf[j].a > 0.99f) found = 1;\n"
                 "    if (!found) return 22; /* highlighted Image tint */\n"
                 "  }\n"
-                "  /* Click Button → SetActive(false) hides Image + TMP child. */\n"
+                "  /* Press on Button — still visible (onClick waits for release). */\n"
                 "  engine_pointer_x = 960.f;\n"
                 "  engine_pointer_y = 540.f;\n"
                 "  engine_pointer_down = 1;\n"
+                "  engine_tick();\n"
+                "  n = engine_collect_draws(buf, 128);\n"
+                "  if (n != 9) return 23; /* still drawn while pressed */\n"
+                "  /* Release while over → SetActive(false) hides Image + TMP. */\n"
+                "  engine_pointer_down = 0;\n"
                 "  engine_tick();\n"
                 "  n = engine_collect_draws(buf, 128);\n"
                 "  if (n != 7) return 19; /* Button + Text hidden */\n"

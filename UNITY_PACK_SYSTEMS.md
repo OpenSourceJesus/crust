@@ -270,8 +270,10 @@ to 0.59 shrinks children and TMP like Unity Canvas space). Authored
 `TextMeshProUGUI` draws when `m_fontAsset` resolves (Assets or Packages /
 PackageCache): SDF atlas + glyph tables bake `m_text` into a UI sprite
 tinted by `m_fontColor`. Button `m_OnClick` persistent `SetActive` calls
-fire on host pointer press (`engine_pointer_x/y/down`, screen space, origin
-bottom-left); inactive parents hide children (`activeInHierarchy`). Authored
+fire on pointer **release** while still over the button that received
+pointer-down (`engine_pointer_x/y/down`, screen space, origin bottom-left) —
+mouse-off does not cancel the pressed visual; releasing off-button skips
+`onClick`. Inactive parents hide children (`activeInHierarchy`). Authored
 `m_IsActive: 0` seeds `_engine_go_active` at load (not forced on).
 Stripped `PrefabInstance` roots (e.g. UI Button prefabs) are hydrated from
 the source `.prefab` + modifications so TMP children and layout groups see
