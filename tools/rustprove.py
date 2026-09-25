@@ -261,6 +261,15 @@ class Prover:
             return env, proc.obligation, proof
         raise last
 
+    def by_integers(self, env, goal, unfolding):
+        """`hoare.by_integers`: each `Int` split into its two shapes, then
+        `by_bounds` over the natural numbers that are left.  Tried only on
+        a goal that has an integer to split."""
+        if 'Int' not in self.H.readable(goal):
+            raise self.L.TheoremError("no integer to split")
+        return self.H.by_integers(env, goal, unfolding=unfolding,
+                                  limit=self.limit)
+
     def first_of(self, env, goal, unfolding, tactics):
         """The first tactic's proof that the kernel accepts."""
         failed = (self.H.TheoremError, self.H.ContractError,
@@ -313,7 +322,8 @@ class Prover:
             proc = self.H.read_procedure(fn.source, env, sig, post)
             proof = self.first_of(
                 env, proc.obligation, unfolding,
-                (self.by_every_bool, self.by_guards, self.by_bounds))
+                (self.by_every_bool, self.by_guards, self.by_bounds,
+                 self.by_integers))
             return env, proc.obligation, proof
         label = "ensures " + " and ".join(post)
         return in_big_stack(lambda: self.settles(work, name, label))
@@ -337,7 +347,8 @@ class Prover:
                 env, sig = self.fresh_env(fn)
                 proc = self.H.read_procedure(text, env, sig, ["result"])
                 proof = self.first_of(env, proc.obligation, unfolding,
-                                      (self.by_every_bool, self.by_bounds))
+                                      (self.by_every_bool, self.by_bounds,
+                                       self.by_integers))
                 return env, proc.obligation, proof
             out.append((label, in_big_stack(
                 lambda: self.settles(work, name, label, k))))

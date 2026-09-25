@@ -73,6 +73,7 @@ class Interp:
             'not': Closure(lambda b: not b),
             'fst': Closure(lambda p: p[0]),
             'snd': Closure(lambda p: p[1]),
+            'min_int': -(1 << (BITS - 1)), 'max_int': (1 << (BITS - 1)) - 1,
         }
 
     def emit(self, text):

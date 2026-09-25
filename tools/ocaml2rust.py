@@ -6,7 +6,8 @@ so an OCaml program runs as native code and its functions are in reach of
 the contract and proof tooling the Rust subset has (`rustproof`,
 `rustprove`).  The output is ordinary Rust in the subset, one file:
 
-  types        `int` -> i64, `bool` -> bool, `unit` -> nothing (a unit
+  types        `int` -> `ml_int` (an i64 the proof lift knows is 63-bit),
+               `bool` -> bool, `unit` -> nothing (a unit
                parameter is dropped, a unit result is no result), tuples ->
                tuples, `a -> b -> c` -> `fn(A, B) -> C`
   variants     one `enum` per type *and* instantiation -- `'a tree` used at
@@ -27,6 +28,11 @@ the contract and proof tooling the Rust subset has (`rustproof`,
                freed.  OCaml has a collector; this has an arena that is
                never returned.  Fine for a program that finishes, wrong for
                a server; say so where it matters.
+
+Contracts: `[@@requires e]` and `[@@ensures e]` after a function become
+`#[requires(..)]` / `#[ensures(..)]`, with exact arithmetic (a
+specification states the mathematical value); `rustprove` proves them about
+the Rust, and that no `ml_wrap` in it ever wraps.
 
 What it refuses, by name: partial application, a closure that captures a
 variable used as a value (a closed `fun` is lifted and passed as a `fn`),
@@ -52,6 +58,7 @@ class LowerError(Exception):
 
 
 BUILTINS = {'print_int', 'print_newline', 'not', 'fst', 'snd'}
+INT_CONSTANTS = {'min_int': -(1 << 62), 'max_int': (1 << 62) - 1}
 RUST_CTOR = {'[]': 'Nil', '::': 'Cons'}
 
 
@@ -64,10 +71,12 @@ class Ctx:
         self.local_fns = dict(local_fns or {})  # name -> LocalFn
         self.in_main = in_main
         self.tail = None                        # set while compiling a loop
+        self.contract = False                   # a clause: exact arithmetic
 
     def child(self):
         c = Ctx(self.sub, self.locals, self.local_fns, self.in_main)
         c.tail = self.tail
+        c.contract = self.contract
         return c
 
 
@@ -144,7 +153,7 @@ class Emitter:
         """The Rust type of a concrete type."""
         t = O.prune(t)
         if t.name == 'int':
-            return 'i64'
+            return 'ml_int'
         if t.name == 'bool':
             return 'bool'
         if t.name == 'unit':
@@ -272,7 +281,8 @@ class Emitter:
                                      d.ty, Ctx(sub), [], thunk=True)
             params, body = self.params_of(d)
             return self.function(self.instances[key], params, body, d.ty,
-                                 Ctx(sub), [], me=('g', name, key))
+                                 Ctx(sub), [], me=('g', name, key),
+                                 contracts=d.contracts)
         return self.instance(key, lambda: self.var(name) + suffix, job)
 
     @staticmethod
@@ -290,7 +300,7 @@ class Emitter:
 
     # -- functions --
     def function(self, name, params, body, ty, ctx, captures, thunk=False,
-                 me=None):
+                 me=None, contracts=()):
         """One Rust `fn`.  `me` identifies the OCaml function being compiled
         -- ('g', name) or ('l', LocalFn) -- so that a call to itself in tail
         position becomes a jump: the body is a `loop`, the parameters mutable
@@ -328,22 +338,45 @@ class Emitter:
         for _ in params:
             res = O.prune(res).args[1]
         ret = '' if self.is_unit(res) else ' -> %s' % self.rt(res)
+        attrs = self.contract_attrs(contracts, params, slots, ctx, looping)
         if looping:
             ctx.tail = (me, slots, [a for a in arg_types], self.is_unit(res))
             code = self.tail(body, ctx)
-            return 'fn %s(%s)%s { %sloop { %s%s } }' % (
-                name, ', '.join(rparams), ret, ''.join(inits),
+            return '%sfn %s(%s)%s { %sloop { %s%s } }' % (
+                attrs, name, ', '.join(rparams), ret, ''.join(inits),
                 ''.join(binds), code)
         lines = binds
         body_code = self.expr(body, ctx)
         if self.is_unit(res):
-            text = 'fn %s(%s) { %s%s}' % (name, ', '.join(rparams),
+            text = attrs + 'fn %s(%s) { %s%s}' % (name, ', '.join(rparams),
                                           ''.join(lines),
                                           self.stmt(body_code))
         else:
-            text = 'fn %s(%s)%s { %s%s }' % (name, ', '.join(rparams), ret,
+            text = attrs + 'fn %s(%s)%s { %s%s }' % (name, ', '.join(rparams), ret,
                                              ''.join(lines), body_code)
         return text
+
+    def contract_attrs(self, contracts, params, slots, ctx, looping):
+        """`#[requires(..)]` / `#[ensures(..)]` for `[@@requires ..]` and
+        `[@@ensures ..]`: the clauses read the parameters by their Rust
+        names (a looping function's are the `_in` ones), and `result`."""
+        if not contracts:
+            return ''
+        cctx = ctx.child()
+        cctx.contract = True
+        cctx.tail = None
+        for (p, _), slot in zip(params, slots):
+            if isinstance(p, O.Variable) and slot is not None:
+                cctx.locals[p.name] = (slot + ('_in' if looping else ''),
+                                       cctx.locals[p.name][1])
+        out = []
+        for kind, clause in contracts:
+            if kind == 'ensures':
+                cctx.locals['result'] = ('result', None)
+            # each on a line of its own: Crust loses a function whose
+            # attributes share its line
+            out.append('#[%s(%s)]\n' % (kind, self.expr(clause, cctx)))
+        return ''.join(out)
 
     def bind_pattern(self, p, code, t, ctx):
         """`let` statements binding an irrefutable pattern to `code`."""
@@ -427,6 +460,10 @@ class Emitter:
             op = {'=': '==', '<>': '!='}.get(op, op)
         elif op == 'mod':
             op = '%'
+        elif op in ('+', '-', '*') and ctx.contract:
+            # a contract states the mathematical value; the lift proves
+            # the code's arithmetic stays where the two agree
+            return '(%s %s %s)' % (a, op, b)
         elif op in ('+', '-', '*'):
             # OCaml's ints are 63 bits: the i64 result, reduced to 63 and
             # sign-extended, is exact -- 2^63 divides 2^64, so even a
@@ -475,6 +512,8 @@ class Emitter:
             inst = self.global_fn(name, self.types_at(e, d.scheme, ctx),
                                   e.line)
             return inst + '()' if kind == 'thunk' else inst
+        if name in INT_CONSTANTS:
+            return self.x_Const(O.Const(INT_CONSTANTS[name]), ctx)
         if name in BUILTINS:
             raise LowerError("`%s` must be applied" % name, e.line)
         raise LowerError("unbound `%s`" % name, e.line)
@@ -864,6 +903,9 @@ class Emitter:
             self.drain()
         self.drain()
         out = ['void *malloc(unsigned long);',
+               # OCaml's `int`: an i64 whose values stay in 63 bits, by name
+               # so the proof lift knows the range it may assume and owes
+               'type ml_int = i64;',
                # deep non-tail recursion, as OCaml allows it: raise the soft
                # stack limit to the hard one; Linux grows the main stack
                # against the limit in force when it faults, not at exec

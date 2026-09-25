@@ -97,9 +97,12 @@ class VariantDef(Node):
 
 class LetDef(Node):
     """`pattern params : ret_type = value`; a function when params exist."""
-    def __init__(self, pattern, params, ret_type, value):
+    def __init__(self, pattern, params, ret_type, value, contracts=()):
         self.pattern, self.params = pattern, params
         self.ret_type, self.value = ret_type, value
+        # [('requires' | 'ensures', expr)], from `[@@requires e]` and
+        # `[@@ensures e]` after the definition
+        self.contracts = list(contracts)
     def __repr__(self):
         return "LetDef(%s, params=%s, ret=%s, val=%s)" % (
             self.pattern, self.params, self.ret_type, self.value)
@@ -480,8 +483,38 @@ class Parser:
             self.next()
             ret = self.parse_type()
         self.expect('=')
-        return self.node(LetDef(pattern, params, ret, self.parse_expr()),
+        value = self.parse_expr()
+        contracts = []
+        while self.at_attribute():
+            aline = self.cur().line
+            self.next(), self.next(), self.next()
+            if not self.at_type('ID'):
+                self.fail("an attribute needs a name: `[@@name ..]`")
+            name = self.next().value
+            if name in ('requires', 'ensures'):
+                if not params:
+                    self.fail("a contract belongs on a function")
+                contracts.append((name, self.parse_expr()))
+                self.expect(']')
+            else:
+                # any other attribute (`[@@inline]`, ..) means nothing here
+                depth = 1
+                while depth:
+                    if self.at_type('EOF'):
+                        self.fail("unterminated attribute", aline)
+                    if self.at('['):
+                        depth += 1
+                    elif self.at(']'):
+                        depth -= 1
+                    self.next()
+        return self.node(LetDef(pattern, params, ret, value, contracts),
                          line)
+
+    def at_attribute(self):
+        """At `[@@`: an attribute after a definition, not a list."""
+        toks = self.tokens[self.pos:self.pos + 3]
+        return len(toks) == 3 and self.at('[') and \
+            all(t.type == 'OP' and t.value == '@' for t in toks[1:])
 
     def parse_params(self):
         params = []
@@ -647,6 +680,8 @@ class Parser:
         return self.parse_app()
 
     def starts_atom(self):
+        if self.at_attribute():
+            return False
         return self.at_type(*_STARTS_ATOM) or self.at(
             '(', '()', '[', '[]', 'true', 'false', 'begin')
 
@@ -928,6 +963,8 @@ class Checker:
             # the only effects: output, and what a backend must print
             'print_int': Scheme([], arrow(INT, UNIT)),
             'print_newline': Scheme([], arrow(UNIT, UNIT)),
+            # OCaml's 63-bit bounds
+            'min_int': Scheme([], INT), 'max_int': Scheme([], INT),
         }
         self.toplevel = []                      # (name, Scheme, LetDef)
 
@@ -1169,7 +1206,7 @@ class Checker:
             return lst
         raise CompileError("operator `%s` is not in the subset" % op, e.line)
 
-    def infer_fun(self, params, body, ret, env, line):
+    def infer_fun(self, params, body, ret, env, line, contracts=()):
         env = dict(env)
         types = []
         for p, t in params:
@@ -1183,6 +1220,14 @@ class Checker:
         if ret is not None:
             self.unify(rt, self.from_ast(ret, self.annot_vars, line),
                        body.line, "the result annotation")
+        for kind, c in contracts:
+            # a clause is a `bool` over the parameters, and `result` too for
+            # an `ensures`
+            cenv = dict(env)
+            if kind == 'ensures':
+                cenv['result'] = Scheme([], rt)
+            self.unify(self.infer(c, cenv), BOOL, c.line,
+                       "a `[@@%s]` clause" % kind)
         for pt in reversed(types):
             rt = arrow(pt, rt)
         return rt
@@ -1278,7 +1323,7 @@ class Checker:
         for d in group.defs:
             if d.params:
                 t = self.infer_fun(d.params, d.value, d.ret_type, env,
-                                   d.line)
+                                   d.line, d.contracts)
             else:
                 t = self.infer(d.value, env)
                 if d.ret_type is not None:
