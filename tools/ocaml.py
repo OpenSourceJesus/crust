@@ -166,6 +166,13 @@ class MatchBranch(Node):
     def __repr__(self): return "Branch(%s -> %s)" % (self.pattern, self.body)
 
 
+class Seq(Node):
+    """`first; second`: `first` is run for its effect."""
+    def __init__(self, first, second):
+        self.first, self.second = first, second
+    def __repr__(self): return "Seq(%s, %s)" % (self.first, self.second)
+
+
 class IfThen(Node):
     def __init__(self, cond, then, other):
         self.cond, self.then, self.other = cond, then, other
@@ -507,7 +514,36 @@ class Parser:
 
     # -- expressions --
     def parse_expr(self):
-        """The loosest level: `let`, `fun`, `match`, `if`, then tuples."""
+        """The loosest level: `e1; e2`, then `let`, `fun`, `match`, `if`,
+        tuples."""
+        line = self.cur().line
+        first = self.parse_expr_1()
+        if self.at(';') and not self.at(';;'):
+            self.next()
+            if self.at(')', 'end', 'in', '|', ']', ';;') or \
+                    self.at_type('EOF') or self.at('let') and \
+                    self.starts_toplevel_let():
+                return first                    # a trailing `;`
+            return self.node(Seq(first, self.parse_expr()), line)
+        return first
+
+    def starts_toplevel_let(self):
+        """A `let` after `;` at the top level begins the next item, not the
+        sequence's second half: find its `in` before the next top-level
+        `let`/`type`, or there is none."""
+        depth = 0
+        for t in self.tokens[self.pos + 1:]:
+            if t.type == 'KW' and t.value == 'let':
+                depth += 1
+            elif t.type == 'KW' and t.value == 'in':
+                if depth == 0:
+                    return False
+                depth -= 1
+            elif t.type == 'KW' and t.value == 'type' or t.type == 'EOF':
+                return True
+        return True
+
+    def parse_expr_1(self):
         line = self.cur().line
         if self.at('let'):
             group = self.parse_let_group()
@@ -767,8 +803,19 @@ class Parser:
             self.expect(')')
             return p
         if self.at('['):
-            self.fail("list patterns `[a; b]` are not in the subset; write "
-                      "`a :: b :: []`")
+            # `[p1; p2]` is `p1 :: p2 :: []`
+            self.next()
+            items = []
+            while not self.at(']'):
+                items.append(self.parse_pattern_cons())
+                if not self.at(';'):
+                    break
+                self.next()
+            self.expect(']')
+            out = self.node(ConstructorPat('[]', []), line)
+            for item in reversed(items):
+                out = self.node(ConstructorPat('::', [item, out]), line)
+            return out
         self.fail("expected a pattern, found `%s`" % (t.value or
                                                        'end of file'))
 
@@ -878,6 +925,9 @@ class Checker:
             'not': Scheme([], arrow(BOOL, BOOL)),
             'fst': Scheme([a], arrow(TCon('*', [a, b := TVar(0)]), a)),
             'snd': Scheme([a, b], arrow(TCon('*', [a, b]), b)),
+            # the only effects: output, and what a backend must print
+            'print_int': Scheme([], arrow(INT, UNIT)),
+            'print_newline': Scheme([], arrow(UNIT, UNIT)),
         }
         self.toplevel = []                      # (name, Scheme, LetDef)
 
@@ -1066,6 +1116,10 @@ class Checker:
             return f
         if isinstance(e, BinOp):
             return self.infer_binop(e, env)
+        if isinstance(e, Seq):
+            self.unify(self.infer(e.first, env), UNIT, e.first.line,
+                       "the left of `;`")
+            return self.infer(e.second, env)
         if isinstance(e, IfThen):
             self.unify(self.infer(e.cond, env), BOOL, e.cond.line,
                        "the condition of `if`")
@@ -1173,6 +1227,12 @@ class Checker:
             args, result = self.ctor_type(p.name, p.line, p)
             self.unify(t, result, p.line, "pattern `%s`" % p.name)
             subs = p.args
+            if len(args) > 1 and len(subs) == 1 and \
+                    isinstance(subs[0], Wildcard):
+                # `Rect _` matches any arity, as in OCaml
+                p.args = subs = [Wildcard() for _ in args]
+                for w in subs:
+                    w.line = p.line
             if len(args) == 1 and len(subs) > 1:
                 tup = TupleNode(subs)
                 tup.line = p.line
@@ -1238,6 +1298,9 @@ class Checker:
             else:                               # the value restriction
                 self.bind_pattern(d.pattern, t, out)
             d.ty = t
+            # kept for a backend that instantiates local definitions
+            d.scheme = out.get(d.pattern.name) \
+                if isinstance(d.pattern, Variable) else None
         return out
 
     def bind_generalized(self, p, t, env):
