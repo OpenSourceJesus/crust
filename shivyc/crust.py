@@ -2636,8 +2636,12 @@ class Parser:
     def _fn_clauses(self, name):
         out = []
         for kind, toks, line in self.fn_contracts:
-            if kind in ("invariant", "variant"):
+            if kind == "invariant":
                 self.err("`#[%s]` belongs on a loop, not a function", kind)
+            # A function's `#[variant]` is the measure its recursive calls
+            # decrease: a proof obligation `rustprove` discharges at each
+            # call site.  Checking it at run time would need the measure
+            # carried across calls, so it compiles to nothing here.
             if kind in ("requires", "ensures"):
                 out.append((kind, toks, line, name, toks))
         self.fn_contracts = []
