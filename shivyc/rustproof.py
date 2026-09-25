@@ -95,6 +95,10 @@ _SIGNED_WIDTH = {"i8": 8, "i16": 16, "i32": 32, "i64": 64, "i128": 128,
                  "isize": 64, "ml_int": 63}
 
 
+class _HeaderRead(Exception):
+    """`header()` has what it came for."""
+
+
 def _substitute(text, mapping):
     """A fragment expression with each parameter name replaced by the
     argument's expression -- through Python's own parser, not by text."""
@@ -180,6 +184,169 @@ def functions(source):
                 and toks[k + 1].kind == "ident":
             found[toks[k + 1].val] = k
     return found
+
+
+def _enums(toks):
+    """`enum Name { A, B(T, *mut U) }` at the top level:
+    {name: [(variant, [(type name, is a pointer)])]}.  A field type is a
+    Rust type name as written; `*mut U` is marked, U being what it holds."""
+    out, depth, k = {}, 0, 0
+    while k < len(toks):
+        t = toks[k]
+        if t.kind == "punc" and t.val == "{":
+            depth += 1
+        elif t.kind == "punc" and t.val == "}":
+            depth -= 1
+        elif depth == 0 and t.val == "enum" and toks[k + 1].kind == "ident" \
+                and toks[k + 2].val == "{":
+            name, j, variants = toks[k + 1].val, k + 3, []
+            while toks[j].val != "}":
+                vname = toks[j].val
+                j += 1
+                fields = []
+                if toks[j].val == "(":
+                    j += 1
+                    while toks[j].val != ")":
+                        ptr = False
+                        if toks[j].val == "*" and toks[j + 1].val == "mut":
+                            ptr, j = True, j + 2
+                        fields.append((toks[j].val, ptr))
+                        j += 1
+                        if toks[j].val == ",":
+                            j += 1
+                    j += 1
+                variants.append((vname, fields))
+                if toks[j].val == ",":
+                    j += 1
+            out[name] = variants
+            k = j + 1          # past the enum's own `}`: its `{` was never
+            continue           # counted, so counting this one breaks depth
+        k += 1
+    return out
+
+
+def _inhabitant(enums, ename, scalar, seen=()):
+    """Some value of the enum `ename`, as a tree of (variant, [field
+    values]) -- a constant variant if it has one, else the first variant
+    whose fields can all be built without going round again; `scalar(t)`
+    gives a value of a non-enum field type.  None if there is none."""
+    if ename in seen:
+        return None
+    variants = enums[ename]
+    for v, fields in sorted(variants, key=lambda vf: len(vf[1])):
+        vals = []
+        for fty, _ in fields:
+            if fty in enums:
+                sub = _inhabitant(enums, fty, scalar, seen + (ename,))
+                if sub is None:
+                    break
+                vals.append(sub)
+            else:
+                vals.append(scalar(fty))
+        else:
+            return (ename, v, vals)
+    return None
+
+
+def _inhabitant_text(enums, ename):
+    """_inhabitant as fragment text: `ml_expr__Num(Int(0))`."""
+    def scalar(fty):
+        if fty == "bool":
+            return "False"
+        return "Int(0)" if fty in _SIGNED_WIDTH else "0"
+    tree = _inhabitant(enums, ename, scalar)
+
+    def text(t):
+        if isinstance(t, tuple):
+            e, v, vals = t
+            return "%s__%s(%s)" % (e, v, ", ".join(text(x) for x in vals))
+        return t
+    return None if tree is None else text(tree)
+
+
+def _helper_templates(enums):
+    """What ocaml2rust writes for each enum -- the constructor box and, for
+    each variant, a test and one projection per field -- as
+    {function name: (kind, enum, variant, field index, source)}.  A
+    function of one of these names is modelled as what it is only if its
+    text is this, token for token."""
+    out = {}
+    for name, variants in enums.items():
+        out["ml_box_%s" % name] = ("box", name, None, None, (
+            "fn ml_box_%s(v: %s) -> *mut %s { let p: *mut %s = "
+            "malloc(size_of::<%s>()) as *mut %s; p[0] = v; p }"
+            % ((name,) * 6)))
+        many = len(variants) > 1
+        for v, fields in variants:
+            wild = "(%s)" % ", ".join("_" for _ in fields) if fields else ""
+            out["ml_is_%s_%s" % (name, v)] = ("is", name, v, None, (
+                "fn ml_is_%s_%s(v: %s) -> bool { match v { %s::%s%s => true"
+                "%s } }" % (name, v, name, name, v, wild,
+                            ", _ => false" if many else "")))
+            for k, (fty, ptr) in enumerate(fields):
+                pat = ", ".join("x" if i == k else "_"
+                                for i in range(len(fields)))
+                out["ml_%s_%s_%d" % (name, v, k)] = ("proj", name, v, k, (
+                    "fn ml_%s_%s_%d(v: %s) -> %s { match v { %s::%s(%s) => "
+                    "%s%s } }" % (name, v, k, name, fty, name, v, pat,
+                                  "x[0]" if ptr else "x",
+                                  ', _ => panic!("Match_failure")'
+                                  if many else "")))
+    return out
+
+
+def _heap_discipline(source, toks, enums, fn_index):
+    """The helpers an enum's code may use, if the source keeps the heap
+    discipline under which a pointer denotes the value it was made with;
+    else (None, the reason).
+
+    The discipline: every `*mut E` comes from `ml_box_E`, which allocates
+    and writes its argument once; nothing else in the source writes
+    through an index (`x[i] = ..`), and nothing frees.  Then no cell is
+    ever written after it is made, so reading `p[0]` is reading the value
+    `ml_box_E` was given -- and the model reads `ml_box_E(v)` as `v`."""
+    templates = _helper_templates(enums)
+    helpers = {}
+    for fname, (kind, e, v, k, text) in templates.items():
+        if fname not in fn_index:
+            continue
+        want = [t.val for t in tokenize(text) if t.kind != "eof"]
+        start = fn_index[fname]
+        got = [t.val for t in toks[start:start + len(want)]]
+        if got != want:
+            return None, ("`%s` is not the helper ocaml2rust writes, so "
+                          "what it does is not known" % fname)
+        helpers[fname] = (kind, e, v, k)
+    boxed = {fname for fname, h in helpers.items() if h[0] == "box"}
+    # outside the boxes: no write through an index, no free
+    spans = []
+    for fname in boxed:
+        start = fn_index[fname]
+        spans.append((start, start + len([
+            t for t in tokenize(templates[fname][4]) if t.kind != "eof"])))
+    inside = lambda j: any(a <= j < b for a, b in spans)
+    depth = 0
+    for j, t in enumerate(toks):
+        if inside(j):
+            continue
+        if t.val == "free" and toks[j + 1].val == "(":
+            return None, "the source frees memory"
+        if t.val == "[":
+            depth += 1
+        elif t.val == "]":
+            depth -= 1
+            if depth == 0 and toks[j + 1].val == "=" and \
+                    toks[j + 2].val != "=":
+                return None, ("the source writes through an index outside "
+                              "the constructor boxes (line %d)" % t.line)
+    for name, variants in enums.items():
+        for _v, fields in variants:
+            for fty, ptr in fields:
+                if ptr and (fty not in enums or
+                            "ml_box_%s" % fty not in boxed):
+                    return None, ("`%s` holds a `*mut %s` not made by "
+                                  "`ml_box_%s`" % (name, fty, fty))
+    return helpers, None
 
 
 def _structs(toks):
@@ -280,6 +447,16 @@ class _Unit:
         self.lifted_fns = {}
         self.in_progress = []
         self.structs = _structs(self.toks)
+        self.headers = {}
+        self.enums = _enums(self.toks)
+        self.helpers, self.heap_refusal = ({}, None) if not self.enums \
+            else _heap_discipline(source, self.toks, self.enums,
+                                  self.fn_index)
+
+    def header(self, name):
+        if name not in self.headers:
+            self.headers[name] = _FnLifter(self, name).header()
+        return self.headers[name]
 
     def lift(self, name):
         if name in self.lifted_fns:
@@ -368,6 +545,8 @@ class _FnLifter:
         self.guards = []
         self.wrap_pending = False       # the next signed op is ml_wrap's
         self.recursive = False          # calls itself (as `name__rec`)
+        self.group = set()              # mutually recursive partners called
+        self.self_rec = False           # calls itself
         self.tail_shape = False         # body is `let mut s = p; loop {..}`
         self.tail_slots = None          # the slots, inside that loop
         self.tail_slot_names = []
@@ -522,6 +701,17 @@ class _FnLifter:
 
     # -- the function ---------------------------------------------------------
 
+    def header(self):
+        """The function's parameters, `requires` and `#[variant]` as the
+        fragment reads them, without its body: what a call from another
+        member of a mutually recursive group owes."""
+        self.header_only = True
+        try:
+            self.run()
+        except _HeaderRead:
+            pass
+        return self
+
     def run(self):
         clauses = self.attributes()
         for kind, _toks, _line in clauses:
@@ -573,11 +763,16 @@ class _FnLifter:
         # parameters bound; a self-call substitutes its arguments into it
         # and into the `requires`.
         self.self_params = [frag for frag, _ in params]
+        self.params_typed = list(params)
         self.self_ret = ret
         self.fn_variant = None
         for kind, toks, line in clauses:
             if kind == "variant":
                 self.fn_variant = self.clause(toks, line, None)
+                for frag, ty in params:
+                    if frag == self.fn_variant and ty.kind == "enum":
+                        # a value of an enum type decreases by its size
+                        self.fn_variant = "ml_size_%s(%s)" % (ty.name, frag)
         self.fn_requires = requires
         # `name__pre`, which a caller's safety lift calls, reads each clause
         # again with `uN::MAX` as the symbol, taken as a parameter: the caller
@@ -593,6 +788,8 @@ class _FnLifter:
                     self.symbolic_max, self.maxes = True, pre_maxes
                     pre_requires.append(self.clause(toks, line, None))
                     self.symbolic_max, self.maxes = saved
+        if getattr(self, "header_only", False):
+            raise _HeaderRead()             # the `requires` are read now
         range_at = len(self.lines)
         if self.safety:
             self.emit("_ok = True")
@@ -621,9 +818,19 @@ class _FnLifter:
             self.emit("return _ok")
         # A fresh name is never reused, so a starting value cannot be read by
         # anything but the code that then assigns it.
-        inits = ["    %s = %s" % (n, "False" if t.kind == "bool" else
-                                 "Int(0)" if t.kind == "int" else "0")
-                 for n, t in self.nested_locals]
+        def start(t):
+            if t.kind == "bool":
+                return "False"
+            if t.kind == "int":
+                return "Int(0)"
+            if t.kind == "enum":
+                found = _inhabitant_text(self.unit.enums, t.name)
+                if found is None:
+                    self.fail("a local of type `%s`, which has no value "
+                              "that can be built to start from" % t.name)
+                return found
+            return "0"
+        inits = ["    %s = %s" % (n, start(t)) for n, t in self.nested_locals]
         # before any `if requires:` the safety lift wraps the body in, at the
         # function's own level, where the range facts go too
         self.lines[range_at:range_at] = inits
@@ -687,6 +894,8 @@ class _FnLifter:
                      self.callees)
         out.obligations = self.cond_labels
         out.recursive = self.recursive
+        out.group = set(self.group)
+        out.self_rec = self.self_rec
         out.rec_requires = list(requires)
         out.rec_variant = self.fn_variant
         used = []
@@ -778,6 +987,13 @@ class _FnLifter:
         if t.val in _SIGNED_WIDTH:
             self.next()
             return _Ty("int", _SIGNED_WIDTH[t.val])
+        if t.val in self.unit.enums:
+            if self.unit.heap_refusal:
+                self.fail("`%s` is lifted only under the heap discipline "
+                          "ocaml2rust keeps, and here %s"
+                          % (t.val, self.unit.heap_refusal))
+            self.next()
+            return _Ty("enum", 0, t.val)
         self.fail("%s has type `%s`, which is not lifted; the fragment has "
                   "unsigned integers and `bool`" % (where, t.val))
 
@@ -842,6 +1058,29 @@ class _FnLifter:
         if self.loop_attrs and not (t.val in ("while", "for") and
                                     t.kind == "kw"):
             self.fail("loop contracts must be on a `while` or `for` here")
+        if t.val == "panic" and self.peek().val == "!":
+            # reaching it is a panic: the safety lift owes that it is not
+            # reached (`False`, provable only where the branch is dead), and
+            # the model needs some value of the type here -- any will do
+            self.next()
+            self.expect("!")
+            self.expect("(")
+            depth = 1
+            while depth:
+                if self.at("("):
+                    depth += 1
+                elif self.at(")"):
+                    depth -= 1
+                self.next()
+            self.accept(";")
+            self.side("False", "`panic!` is reached")
+            value = self.placeholder(want if want is not None
+                                     else self.self_ret)
+            if mode == "ret":
+                self.emit("return %s" % value)
+            elif mode is not None:
+                self.emit("%s = %s" % (mode, value))
+            return True
         if t.kind == "kw" and t.val == "let":
             self.let_stmt()
             return False
@@ -1657,6 +1896,8 @@ class _FnLifter:
                 self.fail("the macro `%s!` is not lifted" % t.val)
             if self.at("::") and t.val in _UNSIGNED:
                 return self.int_limit(t.val)
+            if self.at("::") and t.val in self.unit.enums:
+                return self.enum_value(t.val)
             if self.at("::"):
                 self.fail("paths (`%s::..`) are not lifted" % t.val)
             if self.at("(") and t.val == "ml_wrap":
@@ -1737,6 +1978,17 @@ class _FnLifter:
         """A call to another function of the same source, lifted with it."""
         if fname == self.name and not self.in_clause:
             return self.self_call()
+        if not self.in_clause and fname in self.unit.in_progress:
+            # a call back into a function whose lift this one is inside:
+            # the two are mutually recursive
+            return self.group_call(fname)
+        if not self.in_clause and fname in self.unit.fn_index and \
+                fname not in (self.unit.helpers or {}):
+            callee = self.unit.lift(fname)
+            if self.name in getattr(callee, "group", ()):
+                return self.group_call(fname)
+        if fname in (self.unit.helpers or {}):
+            return self.helper_call(fname)
         callee = self.unit.lift(fname) if fname in self.unit.fn_index \
             else None
         if callee is None:
@@ -1779,6 +2031,90 @@ class _FnLifter:
         else:
             ret = _Ty("rec", 0, callee.ret)
         return "%s(%s)" % (fname, text), ret
+
+    def placeholder(self, ty):
+        """Some value of `ty`, for a place the code never reaches."""
+        if ty.kind == "bool":
+            return "False"
+        if ty.kind == "int":
+            return "Int(0)"
+        if ty.kind == "enum":
+            found = _inhabitant_text(self.unit.enums, ty.name)
+            if found is None:
+                self.fail("no `%s` to stand in for an unreachable value"
+                          % ty.name)
+            return found
+        return "0"
+
+    def rust_ty(self, rust):
+        """The lift's type for a Rust type name in an enum's declaration."""
+        if rust in self.unit.enums:
+            return _Ty("enum", 0, rust)
+        if rust in _SIGNED_WIDTH:
+            return _Ty("int", _SIGNED_WIDTH[rust])
+        if rust in _UNSIGNED:
+            return _Ty("nat", _UNSIGNED[rust])
+        if rust == "bool":
+            return _BOOL
+        self.fail("an enum field of type `%s` is not lifted" % rust)
+
+    def call_args(self):
+        self.expect("(")
+        args = []
+        while not self.at(")"):
+            args.append(self.binary(0))
+            if not self.accept(","):
+                break
+        self.expect(")")
+        return args
+
+    def enum_value(self, ename):
+        """`E::V` or `E::V(a, ..)`: the constructor, as `E__V(..)`."""
+        if self.unit.heap_refusal:
+            self.fail(self.unit.heap_refusal)
+        self.expect("::")
+        vname = self.next().val
+        variants = dict(self.unit.enums[ename])
+        if vname not in variants:
+            self.fail("`%s` has no variant `%s`" % (ename, vname))
+        fields = variants[vname]
+        args = self.call_args() if self.at("(") else []
+        if len(args) != len(fields):
+            self.fail("`%s::%s` takes %d value(s)" % (ename, vname,
+                                                       len(fields)))
+        texts = []
+        for (e, ty), (fty, _ptr) in zip(args, fields):
+            want = self.rust_ty(fty)
+            if want.kind == "int":
+                e, ty = _as_int(e, ty)
+            if ty.kind != want.kind or (want.kind == "enum" and
+                                        ty.name != want.name):
+                self.fail("`%s::%s` wants a `%s`" % (ename, vname, fty))
+            texts.append(e)
+        return "%s__%s(%s)" % (ename, vname, ", ".join(texts)), \
+            _Ty("enum", 0, ename)
+
+    def helper_call(self, fname):
+        """A call to one of the helpers ocaml2rust writes for an enum, as
+        what it does: `ml_box_E(v)` is `v` (under the heap discipline a
+        pointer is its value), a test is a test, and a projection owes
+        that its argument has the variant it projects from -- its `panic`
+        otherwise."""
+        kind, ename, vname, k = self.unit.helpers[fname]
+        args = self.call_args()
+        if len(args) != 1:
+            self.fail("`%s` takes one value" % fname)
+        (e, ty), = args
+        if kind == "box":
+            return e, ty
+        if kind == "is":
+            return "%s(%s)" % (fname, e), _BOOL
+        variants = self.unit.enums[ename]
+        if len(variants) > 1:
+            self.side("ml_is_%s_%s(%s)" % (ename, vname, e),
+                      "`%s` on another variant" % fname)
+        fty, _ptr = dict(variants)[vname][k]
+        return "%s(%s)" % (fname, e), self.rust_ty(fty)
 
     def at_tail_shape(self, frags):
         """Is the body `let mut s: T = p; .. loop { .. }` and nothing else,
@@ -1846,6 +2182,7 @@ class _FnLifter:
         non-negative `#[variant]` -- what the induction on the variant needs
         of every recursive call."""
         self.recursive = True
+        self.self_rec = True
         sub = lambda text: _substitute(text, dict(zip(self.self_params,
                                                       args)))
         v_now, v_next = self.fn_variant, sub(self.fn_variant)
@@ -1854,6 +2191,34 @@ class _FnLifter:
         self.side("(%s)" % " and ".join(owed),
                   "the recursive call's `requires` and `variant`")
         return "%s__rec(%s)" % (self.name, ", ".join(args))
+
+    def group_call(self, fname):
+        """A call to another member of this function's mutually recursive
+        group: `fname__rec(args)`, owing fname's `requires` at the
+        arguments and fname's `#[variant]` there below this one's -- one
+        well-founded induction over every frame of the group."""
+        head = self.unit.header(fname)
+        if self.fn_variant is None or head.fn_variant is None:
+            self.fail("`%s` and `%s` call each other: each needs a "
+                      "`#[variant(e)]`, the one measure every call between "
+                      "them decreases" % (self.name, fname))
+        args = [e for e, _ in self.call_args()]
+        if len(args) != len(head.self_params):
+            self.fail("`%s` takes %d argument(s)" % (fname,
+                                                     len(head.self_params)))
+        args = [_as_int(e, _LIT)[0] if _is_int(e) and pty.kind == "int"
+                else e for e, (_, pty) in zip(args, head.params_typed)]
+        sub = lambda text: _substitute(text, dict(zip(head.self_params,
+                                                      args)))
+        v_next = sub(head.fn_variant)
+        owed = [sub(r) for r in head.fn_requires] + [
+            "(Int(0) <= %s)" % v_next, "(%s < %s)" % (v_next,
+                                                      self.fn_variant)]
+        self.side("(%s)" % " and ".join(owed),
+                  "the call to `%s`'s `requires` and `variant`" % fname)
+        self.recursive = True
+        self.group.add(fname)
+        return "%s__rec(%s)" % (fname, ", ".join(args)), head.self_ret
 
     def self_call(self):
         """A call of the function to itself.  The model reads `name__rec`:
