@@ -42,6 +42,11 @@ float Camera_main_farClipPlane __attribute__((weak)) = 1000.f;
 float Camera_main_background_r __attribute__((weak)) = 0.05f;
 float Camera_main_background_g __attribute__((weak)) = 0.05f;
 float Camera_main_background_b __attribute__((weak)) = 0.08f;
+float Camera_main_aspect __attribute__((weak)) = 0.f; /* 0 → framebuffer */
+float Camera_main_rect_x __attribute__((weak)) = 0.f;
+float Camera_main_rect_y __attribute__((weak)) = 0.f;
+float Camera_main_rect_w __attribute__((weak)) = 1.f;
+float Camera_main_rect_h __attribute__((weak)) = 1.f;
 
 /* Weak so MiniScene (no Input) still links; SystemsScene data.c wins. */
 float engine_input_axis_Horizontal __attribute__((weak)) = 0.f;

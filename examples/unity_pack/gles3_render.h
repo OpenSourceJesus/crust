@@ -23,6 +23,11 @@
 extern float Camera_main_pos_x;
 extern float Camera_main_pos_y;
 extern float Camera_main_orthographicSize;
+extern float Camera_main_aspect; /* 0 → framebuffer aspect */
+extern float Camera_main_rect_x;
+extern float Camera_main_rect_y;
+extern float Camera_main_rect_w;
+extern float Camera_main_rect_h;
 extern float Camera_main_background_r;
 extern float Camera_main_background_g;
 extern float Camera_main_background_b;
@@ -277,17 +282,38 @@ static void g3_upload_handles(void)
 }
 
 /* Clear to the camera background and draw every sprite. Returns the draw
- * count (0: nothing to draw). */
+ * count (0: nothing to draw).
+ *
+ * CameraScript.HandleViewSize seeds Camera_main_aspect / Camera_main_rect_*;
+ * letterbox like gles2_window so Screen Space Camera UI matches Unity.
+ */
 static int g3_draw(int width, int height)
 {
     EngineDraw draws[MAX_DRAWS];
     int ndraw;
     int i;
+    int vx, vy, vw, vh;
+    float aspect;
 
     ndraw = engine_collect_draws(draws, MAX_DRAWS);
-    g3_refresh_camera_bounds((float)width / (float)height);
+    aspect = Camera_main_aspect;
+    if (aspect < 1e-6f)
+        aspect = height > 0 ? (float)width / (float)height : 1.0f;
+    g3_refresh_camera_bounds(aspect);
     g3_upload_handles();
+    /* Camera.rect letterbox: black bars outside the authored pixel rect. */
+    vx = (int)(Camera_main_rect_x * (float)width + 0.5f);
+    vy = (int)(Camera_main_rect_y * (float)height + 0.5f);
+    vw = (int)(Camera_main_rect_w * (float)width + 0.5f);
+    vh = (int)(Camera_main_rect_h * (float)height + 0.5f);
+    if (vw < 1)
+        vw = 1;
+    if (vh < 1)
+        vh = 1;
     glViewport(0, 0, width, height);
+    glClearColor(0.f, 0.f, 0.f, 1.f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glViewport(vx, vy, vw, vh);
     glClearColor(Camera_main_background_r, Camera_main_background_g,
                  Camera_main_background_b, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
