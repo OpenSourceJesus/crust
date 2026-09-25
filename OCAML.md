@@ -1,13 +1,13 @@
 # OCAML — an OCaml subset for Crust
 
-Two tools over one front end:
+Three tools over one front end, and a reference:
 
 | Tool | What it does |
 |------|--------------|
 | `tools/ocaml.py` | lexer, parser, Hindley–Milner type inference; `python3 tools/ocaml.py FILE.ml` prints each top-level name and its type |
 | `tools/ocamlproof.py` | each top-level definition as a proof of its type (Curry–Howard), checked by RosettaMath's `lean4.py` and then by Lean 4 |
-
-Compiling OCaml to run is the next phase (see *Next*).
+| `tools/ocaml2rust.py` | an OCaml program as Rust in Crust's subset, compiled to run; see below |
+| `tools/ocamlinterp.py` | the same program evaluated directly: the reference the compiled code is checked against |
 
 ## The front end (`tools/ocaml.py`)
 
@@ -20,8 +20,10 @@ backend knows what each value *is*.
 aliases; `let`, `let rec`, `let .. and ..`, parameters `x`, `(x : t)`, `()`,
 `_`, `(a, b)`, result annotations; integers, `true`/`false`, `()`,
 application, constructors (`P (a, b)` for `of int * int` is two arguments,
-for `of (int * int)` one tuple, as in OCaml), tuples, lists (`[]`, `::`,
+for `of (int * int)` one tuple, as in OCaml; `P _` matches either), tuples,
+lists (`[]`, `::`,
 `[a; b]`), `fun`, `function`, `match` with `when` guards, `if`/`else`,
+`e1; e2` (with `e1 : unit`), `print_int` and `print_newline`,
 `let .. in`, `+ - * / mod = <> < > <= >= && ||`, unary `-`, `not`,
 `(e : t)`, `begin .. end`, nested comments, and the refutation arm
 `_ -> .` — checked, not trusted: its pattern must reach a type with no
@@ -34,8 +36,8 @@ int, found bool"); exhaustiveness of every `match`, naming a missing case
 **Out**, each refused with its line: records, `ref`/`:=`/`!`, exceptions
 (`raise`, `try`, `exception`), modules and functors (`List.length` included),
 objects, labelled and optional arguments, polymorphic variants, GADTs,
-strings, floats, chars, arrays, or-patterns, list patterns `[a; b]` (write
-`a :: b :: []`), `if` without `else`, loops, `lazy`, `assert`.
+strings, floats, chars, arrays, or-patterns, `if` without `else`, loops,
+`lazy`, `assert`.  (List patterns `[a; b]` are in, as `a :: b :: []`.)
 
 **One tightening.** A type variable in an annotation is *rigid*:
 `let f (x : 'a) : 'b = x` is refused ("the annotation says 'a and 'b may
@@ -85,23 +87,73 @@ of the claim:
 Nothing in the lowering is trusted: a mistake there is a kernel refusal,
 and every theorem is re-checked by Lean from the exported file.
 
-## Next: compiling OCaml to run
+## Compiling OCaml to run (`tools/ocaml2rust.py`)
 
-Both targets inside Crust were probed:
+`python3 tools/ocaml2rust.py prog.ml -o prog.rs`, then
+`python3 -m shivyc.main prog.rs -o prog`. The Rust is ordinary Crust Rust,
+one file.
 
-| OCaml needs | Rust subset (`crust.py`) | RPython (`py2c`) |
-|-------------|--------------------------|------------------|
-| variants with payloads, `match` | yes (`enum`, `match`) | classes, `isinstance` |
-| recursive variants (lists, trees) | **no**: `Box<L>` inside `L` is refused | yes |
-| tuples, destructuring | tuples yes, `let (a, b) = p` **no** | yes |
-| polymorphism `'a` | generic `fn` yes, generic `enum` **no** | via the tagged `obj` word |
-| higher-order functions | `fn` pointers, closures | yes |
-| types for layout | written | inferred from names and annotations |
+| OCaml | Rust |
+|-------|------|
+| `int` | `i64`, every `+ - *` reduced to 63 bits and sign-extended (`ml_wrap`): exact OCaml arithmetic, overflow included |
+| `bool`, tuples | `bool`, tuples |
+| `unit` | nothing: a unit parameter is dropped, a unit result is no result |
+| `a -> b -> c` as a value | `fn(A, B) -> C` |
+| `'a tree` at `int` | its own `enum ml_tree_int`, one per instantiation |
+| a variant's payload of variant type | `*mut` to it: shared, as OCaml values are |
+| `'a list` | `enum ml_list_A { Nil, Cons(A, *mut ml_list_A) }` |
+| a polymorphic function | one `fn` per instantiation the program uses |
+| `let rec go .. in` | lambda-lifted, captures as leading parameters |
+| a self-call in tail position | a jump: the body is a `loop`, the call assigns the parameters and `continue`s |
+| `match` | tests and projections along paths, `&&`-short-circuited |
+| `print_int`, `print_newline` | `print!`, `println!` |
 
-Lowering to Rust puts the result in reach of `rustproof`/`rustprove` (the
-proofs of the rest of this series), with monomorphisation done by the
-OCaml front end, which knows every instantiation; it needs recursive enums
-and `let (a, b) = p` in `crust.py` first. Lowering to RPython (the sketch's
-emitter) runs today's shapes with no compiler changes, but every generated
-value would need an annotation for `py2c`, and it reaches the proof tooling
-only through the hand-model route.
+**Memory.** A constructor allocates with `malloc` and nothing is freed:
+OCaml's collector is replaced by an arena that is never returned. Right
+for a program that runs and finishes; wrong for a server.
+
+**Stack.** A tail call is a jump, so a loop written as tail recursion runs
+in constant stack (a million steps in 256 KB is a test). Deep *non*-tail
+recursion, which OCaml also allows, gets room from `main` raising the soft
+stack limit to the hard one.
+
+**Checked against.** `tools/ocamlinterp.py`, a direct evaluator of the same
+typed AST with OCaml's semantics: 63-bit integers, truncating `/` and `mod`,
+constant-space tail calls. `tests/test_ocaml_rust.py` compiles every
+program in `examples/ocaml/run/`, runs it, and compares with the
+interpreter *and* with the output pinned in the test. Arguments are
+evaluated left to right in both; OCaml leaves the order unspecified.
+
+**Refused, by name:** partial application, a closure that captures a
+variable used as a value (a closed `fun` is lifted and passed as a `fn`),
+`=` on anything but ints and bools, a variant inside a tuple payload
+(`of ('a t * int)`: write `of 'a t * int`). Dividing by zero is a machine
+fault where OCaml raises `Division_by_zero`.
+
+**Not yet: proofs about compiled OCaml.** The point of lowering to Rust is
+the contract and proof tooling (`rustproof`, `rustprove`), and it does not
+reach this code yet: the lift has unsigned integers only, and OCaml's `int`
+is signed; nor does it lift data enums, pointers or recursion. Signed
+integers in the lift and the kernel are the next step. Meanwhile
+`tools/ocamlproof.py` proves the logical fragment directly.
+
+### Fixes to the Rust front end this needed
+
+Each is pinned in `tests/test_ocaml_rust.py` (`TestRustFixes`):
+
+- An enum whose payload is a struct -- a user struct, a `Vec`, a `Box` --
+  did not compile: data enums were emitted before every struct. They now
+  go through the structs' dependency sort, their tags and declarations
+  first, so `Cons(i64, Box<List>)` inside `List` works too.
+- A tuple literal ignored its expected type: `(1, 2)` passed as `(i64,
+  i64)` was built as a different C struct.
+- A variant's payload types were not its constructor's signature.
+- A block that was another block's tail lost its value
+  (`fn f() -> i64 { { let a = 1; if a == 1 { 5 } else { 6 } } }` returned
+  garbage), and a unit `fn main` exited with its last `printf`'s byte
+  count. `return 3;` from a unit `main` still sets the exit status.
+
+Found and *not* fixed: a function named like an x86 register (`bx`, `ax`,
+`cl`, `si`, ..) is miscompiled -- `call bx` assembles as a call through the
+register. Emitted names all start with `ml_`, so compiled OCaml cannot hit
+it; hand-written C and Rust can.
