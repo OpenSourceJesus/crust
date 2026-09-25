@@ -6855,7 +6855,9 @@ class TestSystems(unittest.TestCase):
         self.assertIn("engine_pointer_x", eng)
         self.assertIn("_engine_ui_btn_tint", eng)
         self.assertIn("_engine_ui_btn_col_h", eng)
-        self.assertIn("_spr_ncx", eng)
+        self.assertIn("_engine_ui_screen_rect", eng)
+        self.assertIn("_engine_rt_apos_x", eng)
+        self.assertNotIn("static const float _spr_ncx[]", eng)
         self.assertIn("_spr_btn", eng)
         self.assertIn("/* Button_Text SpriteRenderer */", eng)
         data_c = open(os.path.join(d, "data.c")).read()
@@ -7381,6 +7383,384 @@ class TestSystems(unittest.TestCase):
         self.assertGreater(
             int(bsp.get("sorting_order") or 0),
             int(psp.get("sorting_order") or 0))
+
+    def test_tmp_overflow_expands_bake_past_rect(self):
+        """TMP Overflow (mode 0): glyphs taller than the rect are not clipped.
+
+        Settings-menu labels use fontSize > Rect height with top align; Unity
+        still draws descenders. Truncate keeps the authored clip box.
+        """
+        font_path = os.path.join(
+            ROOT, "examples", "unity_pack", "Slime Jump", "Assets",
+            "Others", "Fonts", "Montserrat-Black SDF.asset")
+        if not os.path.isfile(font_path):
+            self.skipTest("Montserrat SDF font missing")
+        unity_pack._TMP_FONT_CACHE.clear()
+        font = unity_pack._load_tmp_font_asset(font_path)
+        self.assertIsNotNone(font)
+        # Sound-like: size 76 in a 64px-tall top-aligned box.
+        tw, th, rgba, _sx, sy = unity_pack._rasterize_tmp_text(
+            font, "Sound", 76, (1, 1, 1, 1), 264, 64, 1, 256, 0)
+        self.assertGreater(th, 64)
+        self.assertLess(sy, 0.0)  # expanded downward past rect bottom
+        rows = [sum(rgba[y * tw * 4 + 3:(y + 1) * tw * 4:4])
+                for y in range(th)]
+        nz = [i for i, a in enumerate(rows) if a > 0]
+        self.assertTrue(nz)
+        self.assertEqual(nz[0], 0)  # ink reaches bake bottom (no clip)
+        tw2, th2, _r2, _sx2, _sy2 = unity_pack._rasterize_tmp_text(
+            font, "Sound", 76, (1, 1, 1, 1), 264, 64, 1, 256, 3)
+        self.assertEqual(th2, 64)
+
+    def test_methods_in_keeps_default_paren_args(self):
+        """``default(T)`` inside a param list must not drop the method."""
+        body = (
+            "\n\tvoid Do (InputDevice device = null, "
+            "InputDeviceChange change = default(InputDeviceChange))\n"
+            "\t{\n\t\tgameObject.SetActive(false);\n\t}\n"
+        )
+        ms = unity_pack._methods_in(body, body)
+        self.assertEqual([m["name"] for m in ms], ["Do"])
+        self.assertIn("default(InputDeviceChange)", ms[0]["args"])
+
+    def test_ui_child_image_sorts_above_parent_panel(self):
+        """Equal Canvas order: child UI Image sorts above ancestor Image.
+
+        Without Override Sorting, a full-screen menu Image and a child Button
+        Image share the root order — TMP (+1) would show while the Button is
+        covered. Hierarchy bump raises each child above its ancestor.
+        """
+        root = tempfile.mkdtemp(prefix="upack-ui-hier-sort-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scripts)
+        os.makedirs(scene)
+        host_guid = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+        img = "fe87c0e1cc204ed48ad3b37840f39efc"
+        builtin = "0000000000000000f000000000000000"
+        with open(os.path.join(scripts, "Host.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Host : MonoBehaviour { void Update() {} }\n"
+            )
+        with open(os.path.join(scripts, "Host.cs.meta"), "w") as f:
+            f.write("guid: %s\n" % host_guid)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Canvas\n"
+                "  m_IsActive: 1\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "  - component: {fileID: 4}\n"
+                "--- !u!224 &2\nRectTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_SizeDelta: {x: 0, y: 0}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!223 &3\nCanvas:\n  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n  m_RenderMode: 0\n"
+                "  m_OverrideSorting: 0\n"
+                "  m_SortingLayerID: 0\n"
+                "  m_SortingOrder: -2\n"
+                "--- !u!114 &4\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, guid: " + host_guid + "}\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Panel\n"
+                "  m_IsActive: 1\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "--- !u!224 &11\nRectTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Father: {fileID: 2}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_SizeDelta: {x: 0, y: 0}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!114 &12\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Enabled: 1\n"
+                "  m_Script: {fileID: 11500000, guid: " + img + "}\n"
+                "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+                "  m_Sprite: {fileID: 10905, guid: " + builtin + ", type: 0}\n"
+                "  m_Type: 0\n  m_PreserveAspect: 0\n"
+                "--- !u!1 &20\nGameObject:\n  m_Name: ChildBtn\n"
+                "  m_IsActive: 1\n"
+                "  m_Component:\n  - component: {fileID: 21}\n"
+                "  - component: {fileID: 22}\n"
+                "--- !u!224 &21\nRectTransform:\n"
+                "  m_GameObject: {fileID: 20}\n"
+                "  m_Father: {fileID: 11}\n"
+                "  m_AnchorMin: {x: 0.5, y: 0.5}\n"
+                "  m_AnchorMax: {x: 0.5, y: 0.5}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 100, y: 50}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!114 &22\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 20}\n"
+                "  m_Enabled: 1\n"
+                "  m_Script: {fileID: 11500000, guid: " + img + "}\n"
+                "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+                "  m_Sprite: {fileID: 10905, guid: " + builtin + ", type: 0}\n"
+                "  m_Type: 0\n  m_PreserveAspect: 1\n"
+            )
+        ps = os.path.join(root, "ProjectSettings")
+        os.makedirs(ps)
+        with open(os.path.join(ps, "EditorBuildSettings.asset"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1045 &1\nEditorBuildSettings:\n"
+                "  m_Scenes:\n"
+                "  - enabled: 1\n"
+                "    path: Assets/Scenes/S.unity\n"
+            )
+        with open(os.path.join(ps, "ProjectSettings.asset"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!129 &1\nPlayerSettings:\n"
+                "  defaultScreenWidth: 800\n"
+                "  defaultScreenHeight: 600\n"
+            )
+        objs, _a, _l, _c, _h = unity_pack.load_project(root)
+        panel = [o for o in objs if o.get("name") == "Panel"][0]
+        child = [o for o in objs if o.get("name") == "ChildBtn"][0]
+        psp = panel.get("sprite") or {}
+        csp = child.get("sprite") or {}
+        self.assertTrue(psp.get("has_sprite"))
+        self.assertTrue(csp.get("has_sprite"))
+        self.assertGreater(
+            int(csp.get("sorting_order") or 0),
+            int(psp.get("sorting_order") or 0))
+
+    def test_prefab_added_mb_setactive_hides_tmp_child(self):
+        """PrefabInstance m_AddedComponents MB packs and SetActive hides TMP.
+
+        Stripped PrefabInstance roots list AddedComponents only via
+        m_GameObject reverse refs — without joining them, Deactivate-style
+        scripts never run and child TMP stays visible while the Image is
+        covered / inactive.
+        """
+        root = tempfile.mkdtemp(prefix="upack-added-mb-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        prefabs = os.path.join(root, "Assets", "Prefabs")
+        scene = os.path.join(root, "Assets", "Scenes")
+        fonts = os.path.join(root, "Assets", "Fonts")
+        os.makedirs(scripts)
+        os.makedirs(prefabs)
+        os.makedirs(scene)
+        os.makedirs(fonts)
+        host_guid = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+        dea_guid = "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3"
+        pref_guid = "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"
+        img = "fe87c0e1cc204ed48ad3b37840f39efc"
+        builtin = "0000000000000000f000000000000000"
+        tmp = "f4688fdb7df04437aeb418b961361dc5"
+        font_guid = "8f586378b4e144a9851e7b34d9b748ee"
+        font_src = os.path.join(
+            ROOT, "examples", "unity_pack", "SystemsScene", "Assets",
+            "TextMesh Pro", "Resources", "Fonts & Materials",
+            "LiberationSans SDF.asset")
+        if not os.path.isfile(font_src):
+            font_src = os.path.join(
+                ROOT, "examples", "unity_pack", "Slime Jump", "Assets",
+                "Standard Assets", "TextMesh Pro", "Resources",
+                "Fonts & Materials", "LiberationSans SDF.asset")
+        if not os.path.isfile(font_src):
+            self.skipTest("LiberationSans SDF missing")
+        shutil.copy(font_src, os.path.join(fonts, "LiberationSans SDF.asset"))
+        with open(os.path.join(fonts, "LiberationSans SDF.asset.meta"),
+                  "w") as f:
+            f.write("guid: %s\n" % font_guid)
+        with open(os.path.join(scripts, "Host.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Host : MonoBehaviour { void Update() {} }\n"
+            )
+        with open(os.path.join(scripts, "Host.cs.meta"), "w") as f:
+            f.write("guid: %s\n" % host_guid)
+        with open(os.path.join(scripts, "DeactivateWhen.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class DeactivateWhen : MonoBehaviour {\n"
+                "    public bool deactivate;\n"
+                "    void Start() {\n"
+                "        if (deactivate) gameObject.SetActive(false);\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "DeactivateWhen.cs.meta"), "w") as f:
+            f.write("guid: %s\n" % dea_guid)
+        with open(os.path.join(prefabs, "Btn.prefab"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &100\nGameObject:\n  m_Name: UI Button\n"
+                "  m_IsActive: 1\n"
+                "  m_Component:\n  - component: {fileID: 200}\n"
+                "  - component: {fileID: 300}\n"
+                "--- !u!224 &200\nRectTransform:\n"
+                "  m_GameObject: {fileID: 100}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_AnchorMin: {x: 0.5, y: 0.5}\n"
+                "  m_AnchorMax: {x: 0.5, y: 0.5}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 200, y: 100}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "--- !u!114 &300\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 100}\n"
+                "  m_Enabled: 1\n"
+                "  m_Script: {fileID: 11500000, guid: " + img + "}\n"
+                "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+                "  m_Sprite: {fileID: 10905, guid: " + builtin + ", type: 0}\n"
+                "  m_Type: 0\n  m_PreserveAspect: 1\n"
+            )
+        with open(os.path.join(prefabs, "Btn.prefab.meta"), "w") as f:
+            f.write("guid: %s\n" % pref_guid)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Main Camera\n"
+                "  m_TagString: MainCamera\n  m_IsActive: 1\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "  - component: {fileID: 4}\n"
+                "--- !u!4 &2\nTransform:\n  m_GameObject: {fileID: 1}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: -10}\n"
+                "--- !u!20 &3\nCamera:\n  m_GameObject: {fileID: 1}\n"
+                "  orthographic: 1\n  orthographic size: 5\n"
+                "--- !u!114 &4\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, guid: " + host_guid + "}\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Canvas\n"
+                "  m_IsActive: 1\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "--- !u!224 &11\nRectTransform:\n"
+                "  m_GameObject: {fileID: 10}\n  m_Father: {fileID: 0}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_SizeDelta: {x: 0, y: 0}\n  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!223 &12\nCanvas:\n  m_GameObject: {fileID: 10}\n"
+                "  m_Enabled: 1\n  m_RenderMode: 0\n"
+                "  m_SortingOrder: 0\n"
+                "--- !u!1001 &50\nPrefabInstance:\n  m_Modification:\n"
+                "    m_TransformParent: {fileID: 11}\n"
+                "    m_Modifications:\n"
+                "    - target: {fileID: 100, guid: " + pref_guid + ", type: 3}\n"
+                "      propertyPath: m_Name\n      value: Action Button\n"
+                "      objectReference: {fileID: 0}\n"
+                "    - target: {fileID: 200, guid: " + pref_guid + ", type: 3}\n"
+                "      propertyPath: m_SizeDelta.x\n      value: 200\n"
+                "      objectReference: {fileID: 0}\n"
+                "    - target: {fileID: 200, guid: " + pref_guid + ", type: 3}\n"
+                "      propertyPath: m_SizeDelta.y\n      value: 100\n"
+                "      objectReference: {fileID: 0}\n"
+                "    - target: {fileID: 300, guid: " + pref_guid + ", type: 3}\n"
+                "      propertyPath: m_Sprite\n      value:\n"
+                "      objectReference: {fileID: 10905, guid: " + builtin
+                + ", type: 0}\n"
+                "    m_RemovedComponents: []\n"
+                "    m_RemovedGameObjects: []\n"
+                "    m_AddedGameObjects:\n"
+                "    - targetCorrespondingSourceObject: {fileID: 200, guid: "
+                + pref_guid + ", type: 3}\n"
+                "      insertIndex: -1\n      addedObject: {fileID: 71}\n"
+                "    m_AddedComponents:\n"
+                "    - targetCorrespondingSourceObject: {fileID: 100, guid: "
+                + pref_guid + ", type: 3}\n"
+                "      insertIndex: -1\n      addedObject: {fileID: 60}\n"
+                "  m_SourcePrefab: {fileID: 100100000, guid: " + pref_guid
+                + ", type: 3}\n"
+                "--- !u!224 &51 stripped\nRectTransform:\n"
+                "  m_CorrespondingSourceObject: {fileID: 200, guid: "
+                + pref_guid + ", type: 3}\n"
+                "  m_PrefabInstance: {fileID: 50}\n  m_PrefabAsset: {fileID: 0}\n"
+                "--- !u!1 &52 stripped\nGameObject:\n"
+                "  m_CorrespondingSourceObject: {fileID: 100, guid: "
+                + pref_guid + ", type: 3}\n"
+                "  m_PrefabInstance: {fileID: 50}\n  m_PrefabAsset: {fileID: 0}\n"
+                "--- !u!114 &60\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 52}\n  m_Enabled: 1\n"
+                "  m_Script: {fileID: 11500000, guid: " + dea_guid + "}\n"
+                "  deactivate: 1\n"
+                "--- !u!1 &70\nGameObject:\n  m_Name: Label\n"
+                "  m_IsActive: 1\n"
+                "  m_Component:\n  - component: {fileID: 71}\n"
+                "  - component: {fileID: 72}\n"
+                "--- !u!224 &71\nRectTransform:\n"
+                "  m_GameObject: {fileID: 70}\n  m_Father: {fileID: 51}\n"
+                "  m_AnchorMin: {x: 0.5, y: 0.5}\n"
+                "  m_AnchorMax: {x: 0.5, y: 0.5}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 180, y: 40}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "--- !u!114 &72\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 70}\n  m_Enabled: 1\n"
+                "  m_Script: {fileID: 11500000, guid: " + tmp + "}\n"
+                "  m_text: HELLO\n"
+                "  m_fontAsset: {fileID: 11400000, guid: " + font_guid
+                + ", type: 2}\n"
+                "  m_fontSize: 36\n"
+                "  m_fontColor: {r: 1, g: 1, b: 1, a: 1}\n"
+                "  m_HorizontalAlignment: 2\n"
+                "  m_VerticalAlignment: 512\n"
+                "  m_overflowMode: 0\n"
+            )
+        ps = os.path.join(root, "ProjectSettings")
+        os.makedirs(ps)
+        with open(os.path.join(ps, "EditorBuildSettings.asset"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1045 &1\nEditorBuildSettings:\n"
+                "  m_Scenes:\n"
+                "  - enabled: 1\n"
+                "    path: Assets/Scenes/S.unity\n"
+            )
+        with open(os.path.join(ps, "ProjectSettings.asset"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!129 &1\nPlayerSettings:\n"
+                "  defaultScreenWidth: 800\n"
+                "  defaultScreenHeight: 600\n"
+            )
+        objs, _a, _l, _c, _h = unity_pack.load_project(root)
+        dea = [o for o in objs
+               if o.get("class") == "DeactivateWhen"]
+        self.assertTrue(dea, "AddedComponent MB must pack")
+        btn = [o for o in objs
+               if o.get("name") == "Action Button" and o.get("ui_image")]
+        self.assertTrue(btn)
+        self.assertEqual(str(dea[0].get("go_id")), str(btn[0].get("go_id")))
+        d = tempfile.mkdtemp(prefix="upack-added-mb-out-")
+        plan = unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("DeactivateWhen_Start", eng)
+        self.assertIn("GameObject_SetActive", eng)
+        # Same go_index: SetActive on the MB hides Image + TMP via hierarchy.
+        parents = plan.get("go_parents") or []
+        dea_o = None
+        btn_o = None
+        lab_o = None
+        for cl in (plan.get("classes") or {}).values():
+            for o in cl.get("instances") or []:
+                if o.get("class") == "DeactivateWhen" or (
+                        (o.get("script") or "").endswith("DeactivateWhen.cs")):
+                    dea_o = o
+                if o.get("name") == "Action Button" and o.get("ui_image"):
+                    btn_o = o
+                if o.get("name") == "Label":
+                    lab_o = o
+        self.assertIsNotNone(dea_o)
+        self.assertIsNotNone(btn_o)
+        self.assertIsNotNone(lab_o)
+        self.assertEqual(dea_o.get("go_index"), btn_o.get("go_index"))
+        self.assertEqual(
+            parents[int(lab_o.get("go_index"))],
+            int(btn_o.get("go_index")))
 
     def test_preserve_aspect_top_left_pivot_draw_flush(self):
         """preserveAspect + pivot (0,1): sprite TL flush with rect TL."""
@@ -11421,6 +11801,248 @@ class TestSystemsRuns(unittest.TestCase):
             capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
         exe = os.path.join(d, "host_camz")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host,
+             os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+
+
+class TestLiveRectTransform(unittest.TestCase):
+    """Runtime RectTransform tables + C# anchoredPosition / sizeDelta."""
+
+    def _ui_project(self, script, go_name="Panel"):
+        root = tempfile.mkdtemp(prefix="upack-live-rt-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        hud = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        with open(os.path.join(scripts, "Hud.cs"), "w") as f:
+            f.write(script)
+        with open(os.path.join(scripts, "Hud.cs.meta"), "w") as f:
+            f.write("guid: %s\n" % hud)
+        tex = os.path.join(root, "Assets", "tex.png")
+        os.makedirs(os.path.dirname(tex), exist_ok=True)
+        # 2×2 white PNG
+        import struct, zlib
+        def chunk(tag, data):
+            return (struct.pack(">I", len(data)) + tag + data
+                    + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff))
+        raw = b"\x00" + b"\xff\xff\xff\xff" * 2
+        raw = raw + b"\x00" + b"\xff\xff\xff\xff" * 2
+        png = (b"\x89PNG\r\n\x1a\n"
+               + chunk(b"IHDR", struct.pack(">IIBBBBB", 2, 2, 8, 6, 0, 0, 0))
+               + chunk(b"IDAT", zlib.compress(raw))
+               + chunk(b"IEND", b""))
+        with open(tex, "wb") as f:
+            f.write(png)
+        with open(tex + ".meta", "w") as f:
+            f.write(
+                "guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+                "TextureImporter:\n  spritePixelsToUnits: 100\n"
+            )
+        ps = os.path.join(root, "ProjectSettings")
+        os.makedirs(ps)
+        with open(os.path.join(ps, "ProjectSettings.asset"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "PlayerSettings:\n"
+                "  defaultScreenWidth: 800\n"
+                "  defaultScreenHeight: 600\n"
+            )
+        with open(os.path.join(ps, "EditorBuildSettings.asset"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "EditorBuildSettings:\n"
+                "  m_Scenes:\n"
+                "  - enabled: 1\n"
+                "    path: Assets/Scenes/S.unity\n"
+            )
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        img = "fe87c0e1cc204ed48ad3b37840f39efc"
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                ("%%YAML 1.1\n"
+                 "--- !u!1 &100\nGameObject:\n  m_Name: Main Camera\n"
+                 "  m_TagString: MainCamera\n"
+                 "  m_Component:\n  - component: {fileID: 101}\n"
+                 "  - component: {fileID: 102}\n"
+                 "--- !u!4 &101\nTransform:\n"
+                 "  m_GameObject: {fileID: 100}\n"
+                 "  m_Father: {fileID: 0}\n"
+                 "  m_LocalPosition: {x: 0, y: 0, z: -10}\n"
+                 "--- !u!20 &102\nCamera:\n"
+                 "  m_GameObject: {fileID: 100}\n"
+                 "  m_Orthographic: 1\n"
+                 "  orthographic size: 5\n"
+                 "  m_BackGroundColor: {r: 0, g: 0, b: 0, a: 1}\n"
+                 "--- !u!1 &1\nGameObject:\n  m_Name: Canvas\n"
+                 "  m_Component:\n  - component: {fileID: 2}\n"
+                 "  - component: {fileID: 3}\n"
+                 "--- !u!224 &2\nRectTransform:\n"
+                 "  m_GameObject: {fileID: 1}\n"
+                 "  m_Father: {fileID: 0}\n"
+                 "  m_AnchorMin: {x: 0, y: 0}\n"
+                 "  m_AnchorMax: {x: 1, y: 1}\n"
+                 "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                 "  m_SizeDelta: {x: 0, y: 0}\n"
+                 "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                 "--- !u!223 &3\nCanvas:\n  m_GameObject: {fileID: 1}\n"
+                 "  m_Enabled: 1\n  m_RenderMode: 0\n"
+                 "--- !u!1 &10\nGameObject:\n  m_Name: %s\n"
+                 "  m_Component:\n  - component: {fileID: 11}\n"
+                 "  - component: {fileID: 12}\n"
+                 "  - component: {fileID: 13}\n"
+                 "--- !u!224 &11\nRectTransform:\n"
+                 "  m_GameObject: {fileID: 10}\n"
+                 "  m_Father: {fileID: 2}\n"
+                 "  m_AnchorMin: {x: 0.5, y: 0.5}\n"
+                 "  m_AnchorMax: {x: 0.5, y: 0.5}\n"
+                 "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                 "  m_SizeDelta: {x: 100, y: 80}\n"
+                 "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                 "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                 "--- !u!114 &12\nMonoBehaviour:\n"
+                 "  m_GameObject: {fileID: 10}\n"
+                 "  m_Script: {fileID: 11500000, guid: %s}\n"
+                 "  m_Sprite: {fileID: 21300000, "
+                 "guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, type: 3}\n"
+                 "  m_Type: 0\n"
+                 "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+                 "--- !u!114 &13\nMonoBehaviour:\n"
+                 "  m_GameObject: {fileID: 10}\n"
+                 "  m_Script: {fileID: 11500000, "
+                 "guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}\n"
+                 ) % (go_name, img)
+            )
+        return root
+
+    def test_live_rt_tables_emitted_for_ui(self):
+        """UI pack seeds mutable RT tables + screen-rect recompute."""
+        root = self._ui_project(
+            "using UnityEngine;\n"
+            "public class Hud : MonoBehaviour {\n"
+            "    void Update() {}\n"
+            "}\n"
+        )
+        d = tempfile.mkdtemp(prefix="upack-live-rt-out-")
+        plan = unity_pack.pack(root, d)
+        self.assertTrue(plan.get("live_rt"))
+        self.assertTrue(any(plan["live_rt"]["has"]))
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("_engine_rt_apos_x", eng)
+        self.assertIn("_engine_ui_screen_rect", eng)
+        self.assertIn("_engine_rt_sx", eng)
+        self.assertIn("_engine_ui_layout_w", eng)
+        self.assertIn("_engine_ui_layout_h", eng)
+        self.assertEqual(int(plan.get("ui_layout_width") or 0), 800)
+        self.assertEqual(int(plan.get("ui_layout_height") or 0), 600)
+        self.assertNotIn("static const float _spr_ncx[]", eng)
+
+    def test_anchored_position_setter_lowers(self):
+        """rectTransform.anchoredPosition = new Vector2 → RT setter."""
+        root = self._ui_project(
+            "using UnityEngine;\n"
+            "public class Hud : MonoBehaviour {\n"
+            "    public float scale;\n"
+            "    void Update() {\n"
+            "        rectTransform.anchoredPosition = new Vector2(40f, -20f);\n"
+            "        rectTransform.sizeDelta = new Vector2(120f, 90f);\n"
+            "        transform.localScale = new Vector3(0.5f, 0.5f, 1f);\n"
+            "        rectTransform.localScale = Vector3.one * scale;\n"
+            "    }\n"
+            "}\n"
+        )
+        d = tempfile.mkdtemp(prefix="upack-apos-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("RectTransform_set_anchoredPosition_xy", eng)
+        self.assertIn("RectTransform_set_sizeDelta_xy", eng)
+        self.assertIn("RectTransform_set_localScale_xy", eng)
+        self.assertRegex(
+            eng,
+            r"RectTransform_set_localScale_xy\s*\(\s*_engine_go_of_Hud\s*\(\s*i\s*\)\s*,"
+            r"\s*\(?\s*Hud_get_scale\s*\(\s*i\s*\)")
+
+    def test_scaffold_canvas_rect_on_hierarchy(self):
+        """Dropped Canvas scaffold still seeds live RT via hierarchy snapshot."""
+        root = self._ui_project(
+            "using UnityEngine;\n"
+            "public class Hud : MonoBehaviour { void Update() {} }\n"
+        )
+        objs, _a, _l, _c, hier = unity_pack.load_project(root)
+        self.assertNotIn("Canvas", {o["name"] for o in objs})
+        h_canvas = [h for h in hier if h.get("name") == "Canvas"]
+        self.assertEqual(len(h_canvas), 1)
+        self.assertIsNotNone(h_canvas[0].get("rect"))
+        self.assertTrue(int(h_canvas[0].get("canvas_root") or 0))
+        d = tempfile.mkdtemp(prefix="upack-rt-hier-")
+        plan = unity_pack.pack(root, d)
+        self.assertIn("Canvas", plan.get("go_names") or [])
+        gi = plan["go_names"].index("Canvas")
+        self.assertTrue(plan["live_rt"]["has"][gi])
+        self.assertTrue(plan["live_rt"]["canvas_root"][gi])
+        self.assertTrue(plan["live_rt"]["canvas"][gi])
+
+    @needs_cc
+    def test_mutating_apos_moves_draw(self):
+        """C# anchoredPosition setter moves UI draw; unmutated seed ≈ center."""
+        root = self._ui_project(
+            "using UnityEngine;\n"
+            "public class Hud : MonoBehaviour {\n"
+            "    void Update() {\n"
+            "        rectTransform.anchoredPosition = new Vector2(200f, 0f);\n"
+            "    }\n"
+            "}\n"
+        )
+        d = tempfile.mkdtemp(prefix="upack-apos-run-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("RectTransform_set_anchoredPosition_xy", eng)
+        host = os.path.join(d, "host_apos.c")
+        with open(host, "w") as f:
+            f.write(
+                "void engine_tick(void);\n"
+                "extern float Time_deltaTime;\n"
+                "typedef struct { float x, y, half_w, half_h;\n"
+                "                 float m00, m01, m10, m11;\n"
+                "                 float r, g, b; float a; int tex;\n"
+                "                 int sorting_layer; int sorting_order;\n"
+                "               } EngineDraw;\n"
+                "int engine_collect_draws(EngineDraw *out, int max);\n"
+                "int main(void) {\n"
+                "  EngineDraw buf[8];\n"
+                "  float x0, x1;\n"
+                "  int n;\n"
+                "  Time_deltaTime = 0.016f;\n"
+                "  n = engine_collect_draws(buf, 8);\n"
+                "  if (n < 1) return 1;\n"
+                "  x0 = buf[0].x;\n"
+                "  if (x0 < -0.05f || x0 > 0.05f) return 2;\n"
+                "  engine_tick();\n"
+                "  n = engine_collect_draws(buf, 8);\n"
+                "  if (n < 1) return 3;\n"
+                "  x1 = buf[0].x;\n"
+                "  if (x1 <= x0 + 0.5f) return 4;\n"
+                "  return 0;\n"
+                "}\n"
+            )
+        r = subprocess.run(
+            [_CC, "-O2", "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(
+            [_CC, "-O0", "-c", "-o", os.path.join(d, "data.o"),
+             os.path.join(d, "data.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        exe = os.path.join(d, "host_apos")
         r = subprocess.run(
             [_CC, "-O2", "-o", exe, host,
              os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],

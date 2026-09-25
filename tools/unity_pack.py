@@ -240,6 +240,14 @@ _TRANSFORM_SUPPORTED = frozenset({
     "worldToLocalMatrix", "localToWorldMatrix",
     "localPosition", "localRotation",
     "TransformPoint",
+    # RectTransform members (UI Transform is a RectTransform).
+    "anchoredPosition", "sizeDelta",
+})
+
+# MonoBehaviour.rectTransform members we lower (≡ GO index + live RT tables).
+_RECTTRANSFORM_SUPPORTED = frozenset({
+    "anchoredPosition", "sizeDelta", "localScale",
+    "parent", "gameObject", "SetParent", "GetSiblingIndex", "Find",
 })
 
 
@@ -317,6 +325,19 @@ def _check_transform_api(path, text, scan):
             "'Transform' does not contain a definition for '%s' and no "
             "accessible extension method '%s' accepting a first argument of "
             "type 'Transform' could be found (are you missing a using "
+            "directive or an assembly reference?)"
+            % (member, member))
+    for m in re.finditer(
+            r"(?<![.\w])(?:this\s*\.\s*)?rectTransform\s*\.\s*(\w+)", scan):
+        member = m.group(1)
+        if member in _RECTTRANSFORM_SUPPORTED:
+            continue
+        member_idx = m.start(1)
+        _raise_cs(
+            path, text, member_idx, "CS1061",
+            "'RectTransform' does not contain a definition for '%s' and no "
+            "accessible extension method '%s' accepting a first argument of "
+            "type 'RectTransform' could be found (are you missing a using "
             "directive or an assembly reference?)"
             % (member, member))
 
@@ -2283,6 +2304,8 @@ def _parse_ui_tmp(block, asset_guids):
     fs = re.search(r"(?m)^\s+m_fontSize:\s*([0-9.eE+-]+)", block)
     ha = re.search(r"(?m)^\s+m_HorizontalAlignment:\s*(\d+)", block)
     va = re.search(r"(?m)^\s+m_VerticalAlignment:\s*(\d+)", block)
+    # 0 Overflow, 1 Ellipsis, 2 Masking, 3 Truncate, …
+    ov = re.search(r"(?m)^\s+m_overflowMode:\s*(\d+)", block)
     has_font = bool(font_guid and font_guid in (asset_guids or {}))
     return {
         "text": text,
@@ -2295,6 +2318,7 @@ def _parse_ui_tmp(block, asset_guids):
         "font_size": float(fs.group(1)) if fs else 14.0,
         "h_align": int(ha.group(1)) if ha else 1,
         "v_align": int(va.group(1)) if va else 256,
+        "overflow_mode": int(ov.group(1)) if ov else 0,
         "enabled": int(en.group(1)) if en else 1,
     }
 
@@ -2500,6 +2524,171 @@ def _ui_screen_rect(o, by_xf, screen_w, screen_h, cache):
     cy = ply + float(lcy) * fsy
     cache[key] = (cx, cy, rw * fsx, rh * fsy)
     return cache[key]
+
+
+def _go_is_canvas_root(o, by_xf):
+    """True when Canvas fills the screen (no RectTransform/Canvas parent)."""
+    if not o.get("canvas"):
+        return False
+    fid = o.get("father_id")
+    parent = by_xf.get(str(fid)) if fid else None
+    if parent is not None and (
+            parent.get("rect") is not None or parent.get("canvas")):
+        return False
+    return True
+
+
+def _snapshot_ui_rects_onto_hierarchy(objects, hierarchy):
+    """Copy post-layout rect/scale/canvas onto hierarchy before scaffold drop.
+
+    Layout-only Canvas / Rect parents are dropped from ``objects`` as
+    ``ui_scaffold``, but live RT walks the GO parent chain. Snapshotting
+    authored rect state onto ``scene_hierarchy`` (keyed by ``xf_id``) lets
+    ``_build_rect_transforms`` seed after GO tables exist.
+    """
+    by_xf = {}
+    for o in objects:
+        xid = o.get("xf_id")
+        if xid is not None and str(xid) not in ("", "0"):
+            by_xf[str(xid)] = o
+    for h in hierarchy or []:
+        xid = h.get("xf_id")
+        if xid is None or str(xid) in ("", "0"):
+            continue
+        o = by_xf.get(str(xid))
+        if o is None:
+            continue
+        rect = o.get("rect")
+        if rect is not None:
+            h["rect"] = dict(rect)
+        ls = o.get("local_scale") or o.get("scale")
+        if ls is not None:
+            h["local_scale"] = (
+                float(ls[0]), float(ls[1]),
+                float(ls[2]) if len(ls) > 2 else 1.0)
+        if o.get("canvas"):
+            h["has_canvas"] = True
+            h["canvas_root"] = 1 if _go_is_canvas_root(o, by_xf) else 0
+        elif rect is not None and "canvas_root" not in h:
+            h["canvas_root"] = 0
+
+
+def _build_rect_transforms(plan):
+    """Per-GO RectTransform seed from hierarchy + packed instances (live)."""
+    names = plan.get("go_names") or []
+    n = len(names)
+    if n < 1:
+        return None
+    has = [0] * n
+    canvas = [0] * n
+    canvas_root = [0] * n
+    amin_x = [0.5] * n
+    amin_y = [0.5] * n
+    amax_x = [0.5] * n
+    amax_y = [0.5] * n
+    apos_x = [0.0] * n
+    apos_y = [0.0] * n
+    sd_x = [100.0] * n
+    sd_y = [100.0] * n
+    pivot_x = [0.5] * n
+    pivot_y = [0.5] * n
+    sx = [1.0] * n
+    sy = [1.0] * n
+
+    def _seed(gi, rect, local_scale, is_canvas, is_root):
+        if gi is None or int(gi) < 0 or int(gi) >= n:
+            return
+        gi = int(gi)
+        if rect is None and not is_canvas:
+            return
+        has[gi] = 1
+        if is_canvas:
+            canvas[gi] = 1
+        if is_root:
+            canvas_root[gi] = 1
+        r = rect or {}
+        amin = r.get("anchor_min") or (0.5, 0.5)
+        amax = r.get("anchor_max") or (0.5, 0.5)
+        apos = r.get("anchored_position") or (0.0, 0.0)
+        size = r.get("size_delta") or (100.0, 100.0)
+        pivot = r.get("pivot") or (0.5, 0.5)
+        amin_x[gi] = float(amin[0])
+        amin_y[gi] = float(amin[1])
+        amax_x[gi] = float(amax[0])
+        amax_y[gi] = float(amax[1])
+        apos_x[gi] = float(apos[0])
+        apos_y[gi] = float(apos[1])
+        sd_x[gi] = float(size[0])
+        sd_y[gi] = float(size[1])
+        pivot_x[gi] = float(pivot[0])
+        pivot_y[gi] = float(pivot[1])
+        sc = local_scale or (1.0, 1.0, 1.0)
+        sx[gi] = float(sc[0]) if len(sc) > 0 else 1.0
+        sy[gi] = float(sc[1]) if len(sc) > 1 else 1.0
+
+    # Hierarchy first — includes layout-only scaffolds snapshotted at drop.
+    for h in plan.get("scene_hierarchy") or []:
+        _seed(
+            h.get("go_index"),
+            h.get("rect"),
+            h.get("local_scale"),
+            bool(h.get("has_canvas")),
+            int(h.get("canvas_root") or 0) != 0)
+    # Packed instances may carry the same rect (post-layout); overlay.
+    for cl in (plan.get("classes") or {}).values():
+        for o in cl.get("instances") or []:
+            is_root = False
+            if o.get("canvas"):
+                # Prefer hierarchy canvas_root when stamped; else recompute.
+                gi = o.get("go_index")
+                if gi is not None and 0 <= int(gi) < n and canvas_root[int(gi)]:
+                    is_root = True
+                else:
+                    by_xf = {}
+                    for oo in cl.get("instances") or []:
+                        xid = oo.get("xf_id")
+                        if xid is not None and str(xid) not in ("", "0"):
+                            by_xf[str(xid)] = oo
+                    for hh in plan.get("scene_hierarchy") or []:
+                        xid = hh.get("xf_id")
+                        if xid is not None and str(xid) not in ("", "0"):
+                            by_xf.setdefault(str(xid), hh)
+                    is_root = _go_is_canvas_root(o, by_xf)
+            _seed(
+                o.get("go_index"),
+                o.get("rect"),
+                o.get("local_scale") or o.get("scale"),
+                bool(o.get("canvas")),
+                is_root)
+    if not any(has):
+        return None
+    return {
+        "has": has,
+        "canvas": canvas,
+        "canvas_root": canvas_root,
+        "amin_x": amin_x,
+        "amin_y": amin_y,
+        "amax_x": amax_x,
+        "amax_y": amax_y,
+        "apos_x": apos_x,
+        "apos_y": apos_y,
+        "sd_x": sd_x,
+        "sd_y": sd_y,
+        "pivot_x": pivot_x,
+        "pivot_y": pivot_y,
+        "sx": sx,
+        "sy": sy,
+    }
+
+
+def _plan_has_ui_draws(plan):
+    """True when any packed sprite is a baked uGUI Image/TMP draw."""
+    for cl in (plan.get("classes") or {}).values():
+        for o in cl.get("instances") or []:
+            sp = o.get("sprite") or {}
+            if sp.get("source") in ("ui", "ui_tmp"):
+                return True
+    return False
 
 
 def _layout_alignment_on_axis(child_alignment, axis):
@@ -3068,13 +3257,19 @@ def _sdf_coverage(byte_v):
 
 
 def _rasterize_tmp_text(font, text, font_size, color, box_w, box_h,
-                        h_align, v_align):
-    """Bake plain TMP string into an RGBA bitmap (y=0 bottom, OpenGL)."""
-    bw = max(1, int(round(float(box_w))))
-    bh = max(1, int(round(float(box_h))))
-    out = bytearray(bw * bh * 4)
+                        h_align, v_align, overflow_mode=0):
+    """Bake plain TMP string into an RGBA bitmap (y=0 bottom, OpenGL).
+
+    Returns ``(bw, bh, rgba, shift_x, shift_y)`` where shift is the offset of
+    the expanded bitmap center from the authored RectTransform center (pixels,
+    +x right / +y up). Overflow mode 0 (TMP Overflow) expands the bake so
+    glyphs that extend past the rect are not clipped — Unity still draws
+    them; Truncate/Ellipsis/Masking keep the rect clip.
+    """
+    bw0 = max(1, int(round(float(box_w))))
+    bh0 = max(1, int(round(float(box_h))))
     if not font or not text:
-        return bw, bh, bytes(out)
+        return bw0, bh0, bytes(bytearray(bw0 * bh0 * 4)), 0.0, 0.0
     ps = float(font["point_size"]) or 1.0
     scale = float(font_size) / ps
     glyphs = []
@@ -3093,18 +3288,55 @@ def _rasterize_tmp_text(font, text, font_size, color, box_w, box_h,
     visual_h = ascent - descent
     # Horizontal: 1 left, 2 center, 4 right (TMP bit flags).
     if h_align & 4:
-        pen_x = float(bw) - total_w
+        pen_x0 = float(bw0) - total_w
     elif h_align & 2:
-        pen_x = (float(bw) - total_w) * 0.5
+        pen_x0 = (float(bw0) - total_w) * 0.5
     else:
-        pen_x = 0.0
-    # Vertical: 256 top, 512 middle, 1024 bottom.
+        pen_x0 = 0.0
+    # Vertical: 256 top, 512 middle, 1024 bottom — relative to authored rect.
     if v_align & 1024:
-        baseline = -descent
+        baseline0 = -descent
     elif v_align & 512:
-        baseline = (float(bh) - visual_h) * 0.5 - descent
+        baseline0 = (float(bh0) - visual_h) * 0.5 - descent
     else:
-        baseline = float(bh) - ascent
+        baseline0 = float(bh0) - ascent
+    # Glyph AABB in authored-rect pixel space (may extend past edges).
+    min_x = 0.0
+    min_y = 0.0
+    max_x = float(bw0)
+    max_y = float(bh0)
+    pen = pen_x0
+    for g in glyphs:
+        gw = max(float(g["w"]) * scale, 0.0)
+        gh = max(float(g["h"]) * scale, 0.0)
+        gx0 = pen + float(g["bx"]) * scale
+        gy1 = baseline0 + float(g["by"]) * scale
+        gy0 = gy1 - gh
+        if gx0 < min_x:
+            min_x = gx0
+        if gx0 + gw > max_x:
+            max_x = gx0 + gw
+        if gy0 < min_y:
+            min_y = gy0
+        if gy1 > max_y:
+            max_y = gy1
+        pen += float(g["adv"]) * scale
+    # Overflow (0): expand. Other modes keep the rect (Unity clips / ellipsis).
+    if int(overflow_mode or 0) == 0:
+        pad_l = max(0.0, -min_x)
+        pad_b = max(0.0, -min_y)
+        pad_r = max(0.0, max_x - float(bw0))
+        pad_t = max(0.0, max_y - float(bh0))
+    else:
+        pad_l = pad_b = pad_r = pad_t = 0.0
+    bw = max(1, int(math.ceil(float(bw0) + pad_l + pad_r)))
+    bh = max(1, int(math.ceil(float(bh0) + pad_b + pad_t)))
+    # Expanded bitmap center vs authored rect center (screen +y up).
+    shift_x = (pad_r - pad_l) * 0.5
+    shift_y = (pad_t - pad_b) * 0.5
+    pen_x = pen_x0 + pad_l
+    baseline = baseline0 + pad_b
+    out = bytearray(bw * bh * 4)
     aw = int(font["atlas_w"])
     ah = int(font["atlas_h"])
     atlas = font["atlas"]
@@ -3150,7 +3382,7 @@ def _rasterize_tmp_text(font, text, font_size, color, box_w, box_h,
                 out[o + 2] = int(min(255, round(cb * 255.0 * cov)))
                 out[o + 3] = int(min(255, round(a * 255.0)))
         pen_x += float(g["adv"]) * scale
-    return bw, bh, bytes(out)
+    return bw, bh, bytes(out), shift_x, shift_y
 
 
 # Unity builtin UISprite (UI/Skin/UISprite.psd): ~32×32 white rounded rect.
@@ -3583,6 +3815,8 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None,
             pivot = (o.get("rect") or {}).get("pivot") or (0.5, 0.5)
             draw_cx, draw_cy = _preserve_aspect_draw_center(
                 cx, cy, rect_w, rect_h, draw_w, draw_h, pivot)
+            # Live recompute: fit from rect + src aspect (not baked ncx alone).
+            extra["src_aspect"] = float(src_w) / float(src_h)
         if img_type == 1 and any(b > 0 for b in border):
             tw, th, rgba = _bake_sliced_rgba(
                 src_rgba, src_w, src_h, border, rw, rh, ppu_mul)
@@ -3638,17 +3872,21 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None,
         fs = float(tmp.get("font_size") or 14.0)
         if lh > 1e-6:
             fs = fs * (abs(float(rh)) / float(lh))
-        tw, th, rgba = _rasterize_tmp_text(
+        tw, th, rgba, shift_x, shift_y = _rasterize_tmp_text(
             font, tmp["text"], fs,
             (1.0, 1.0, 1.0, 1.0),  # color via sprite tint (m_fontColor)
             rw, rh,
             int(tmp.get("h_align") or 1),
-            int(tmp.get("v_align") or 256))
+            int(tmp.get("v_align") or 256),
+            int(tmp.get("overflow_mode") or 0))
+        # Overflow expands the bake; keep authored alignment by shifting center.
+        draw_cx = float(cx) + float(shift_x)
+        draw_cy = float(cy) + float(shift_y)
         bake_guid = "tmpbake:%s:%s" % (
             o.get("go_id") or o.get("name") or "tmp",
             tmp.get("font_guid") or "")
         _apply_layout(
-            o, cx, cy, rw, rh, canvas, "ui_tmp",
+            o, draw_cx, draw_cy, tw, th, canvas, "ui_tmp",
             (tmp.get("r", 1.0), tmp.get("g", 1.0),
              tmp.get("b", 1.0), tmp.get("a", 1.0)),
             {
@@ -3661,6 +3899,57 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None,
                 "tex_rgba": rgba,
                 "pixels_per_unit": 100.0,
             })
+
+    # Unity Canvas: equal sortingOrder draws in hierarchy order (parents
+    # before children). Without a nested Override Sorting Canvas, a full-
+    # screen menu Image and a child Button Image share the root order —
+    # qsort ties then cover the Button while TMP (+1) still shows. Bump
+    # each UI sprite above the nearest ancestor UI sprite on the same layer.
+    _bump_ui_hierarchy_draw_order(objects, by_xf)
+
+
+def _bump_ui_hierarchy_draw_order(objects, by_xf):
+    """Raise child UI sorting_order above ancestor UI on the same layer."""
+    # Parent before child: walk by increasing depth from roots.
+    depth = {}
+
+    def _depth(o):
+        xid = str(o.get("xf_id") or id(o))
+        if xid in depth:
+            return depth[xid]
+        fid = o.get("father_id")
+        parent = by_xf.get(str(fid)) if fid else None
+        d = 0 if parent is None else _depth(parent) + 1
+        depth[xid] = d
+        return d
+
+    ordered = sorted(
+        (o for o in objects
+         if (o.get("sprite") or {}).get("source") in ("ui", "ui_tmp")),
+        key=_depth)
+    for o in ordered:
+        sp = o.get("sprite") or {}
+        # Nested Override Sorting sets an absolute order — leave it.
+        own_c = o.get("canvas") or {}
+        if int(own_c.get("override_sorting") or 0):
+            continue
+        fid = o.get("father_id")
+        cur = by_xf.get(str(fid)) if fid else None
+        guard = 0
+        while cur is not None and guard < 64:
+            guard += 1
+            psp = cur.get("sprite") or {}
+            if psp.get("source") in ("ui", "ui_tmp"):
+                # Same canvas sorting layer (TagManager id on the sprite).
+                if (int(psp.get("sorting_layer_id") or 0)
+                        == int(sp.get("sorting_layer_id") or 0)):
+                    po = int(psp.get("sorting_order") or 0)
+                    so = int(sp.get("sorting_order") or 0)
+                    if so <= po:
+                        sp["sorting_order"] = po + 1
+                break
+            fid = cur.get("father_id")
+            cur = by_xf.get(str(fid)) if fid else None
 
 
 # ---------------------------------------------------------------------------
@@ -4313,13 +4602,34 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
     world_cache = {}
     editor_only_xfs = _editor_only_transform_ids(by_id)
 
+    # PrefabInstance m_AddedComponents (and any MB whose m_GameObject points
+    # at a stripped GO) are not listed on the GO's m_Component — reverse-map
+    # them so DeactivateBasedOnInputDevice / nested scripts still pack.
+    mbs_by_go = {}
+    for rec in by_id.values():
+        if rec.get("kind") != "MonoBehaviour":
+            continue
+        raw = rec.get("raw") or ""
+        gm = re.search(
+            r"(?m)^\s+m_GameObject:\s*\{fileID:\s*(\d+)\}", raw)
+        if gm:
+            mbs_by_go.setdefault(gm.group(1), []).append(rec)
+
     # Join MonoBehaviour + Transform + SpriteRenderer onto the GameObject.
     gos = [r for r in by_id.values() if r.get("kind") == "GameObject"]
     for go in gos:
         kids = []
+        seen_kid = set()
         for mid in re.findall(r"fileID:\s*(\d+)", go["raw"]):
             if mid in by_id and by_id[mid] is not go:
                 kids.append(by_id[mid])
+                seen_kid.add(mid)
+        go_fid = str(go.get("file_id") or "")
+        for mb in mbs_by_go.get(go_fid, []):
+            mid = str(mb.get("file_id") or "")
+            if mid and mid not in seen_kid:
+                kids.append(mb)
+                seen_kid.add(mid)
         pos = (0.0, 0.0, 0.0)
         scale = (1.0, 1.0, 1.0)
         rot = (0.0, 0.0, 0.0, 1.0)
@@ -7719,6 +8029,34 @@ def analyze_script(path, text=None, shallow=False):
     if re.search(r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*localScale\b",
                  scan):
         apis.add("transform.localScale")
+    if re.search(
+            r"(?<![.\w])(?:this\s*\.\s*)?rectTransform\s*\.\s*localScale\b",
+            scan):
+        apis.add("transform.localScale")
+    if (re.search(
+            r"(?<![.\w])(?:this\s*\.\s*)?rectTransform\s*\.\s*"
+            r"anchoredPosition\b",
+            scan)
+            or re.search(
+                r"GetComponent\s*<\s*(?:UnityEngine\.)?RectTransform\s*>\s*"
+                r"(?:\([^)]*\))?\s*\.\s*anchoredPosition\b",
+                scan)
+            or re.search(
+                r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*"
+                r"anchoredPosition\b",
+                scan)):
+        apis.add("rectTransform.anchoredPosition")
+    if (re.search(
+            r"(?<![.\w])(?:this\s*\.\s*)?rectTransform\s*\.\s*sizeDelta\b",
+            scan)
+            or re.search(
+                r"GetComponent\s*<\s*(?:UnityEngine\.)?RectTransform\s*>\s*"
+                r"(?:\([^)]*\))?\s*\.\s*sizeDelta\b",
+                scan)
+            or re.search(
+                r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*sizeDelta\b",
+                scan)):
+        apis.add("rectTransform.sizeDelta")
     if re.search(r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*parent\b",
                  scan):
         apis.add("transform.parent")
@@ -7764,6 +8102,10 @@ def analyze_script(path, text=None, shallow=False):
         apis.add("Canvas.ForceUpdateCanvases")
     if re.search(r"\bInputAction\b", scan):
         apis.add("InputAction")
+    if re.search(
+            r"InputManager\s*\.\s*Using(?:Gamepad|Keyboard|Mouse|Phone)\b",
+            scan):
+        apis.add("InputManager.Using")
     if re.search(
             r"(?<![\w.])(?:System\.Collections\.Generic\.)?List\s*<",
             scan):
@@ -7986,12 +8328,29 @@ def _blank_method_bodies(bscan):
     """Replace method interiors with spaces so locals are not seen as fields."""
     import tools.cpprust as cpprust
     out = list(bscan)
-    for m in re.finditer(
+    head = re.compile(
             r"(?m)^[ \t]*(?:public|private|protected|internal)?"
             r"[ \t]*(?:static[ \t]+)?(?:override[ \t]+)?(?:virtual[ \t]+)?"
-            r"[\w.<>]+[ \t]+\w+[ \t]*\([^)]*\)\s*\{",
-            bscan):
-        open_i = m.end() - 1
+            r"[\w.<>]+[ \t]+\w+[ \t]*\(")
+    for m in head.finditer(bscan):
+        args_start = m.end()
+        depth = 1
+        j = args_start
+        while j < len(bscan) and depth > 0:
+            ch = bscan[j]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            j += 1
+        if depth != 0:
+            continue
+        k = j
+        while k < len(bscan) and bscan[k] in " \t\r\n":
+            k += 1
+        if k >= len(bscan) or bscan[k] != "{":
+            continue
+        open_i = k
         close = cpprust._match_brace(bscan, open_i)
         if close is None:
             continue
@@ -8167,32 +8526,55 @@ def _methods_in(body, bscan, body_abs=0):
         "remove", "where", "select", "from", "when",
     ))
     out = []
-    for m in re.finditer(
+    # Match `ret Name (` then scan args with nested-paren depth so
+    # `default(InputDeviceChange)` inside the parameter list is kept
+    # (a naive `[^)]*` stops at the first `)` and drops the method).
+    head = re.compile(
             r"(?m)^[ \t]*(?:public|private|protected|internal)?"
             r"[ \t]*(?:static[ \t]+)?(?:override[ \t]+)?(?:virtual[ \t]+)?"
-            r"([\w.<>]+)[ \t]+(\w+)[ \t]*\(([^)]*)\)\s*\{",
-            bscan):
+            r"([\w.<>]+)[ \t]+(\w+)[ \t]*\(")
+    for m in head.finditer(bscan):
         ret, name = m.group(1).strip(), m.group(2)
         # `else if (...) {` → ret=else, name=if — not a method.
         if ret in _NOT_METHOD or name in _NOT_METHOD:
             continue
         if "." in ret and ret.split(".")[-1] in _NOT_METHOD:
             continue
-        open_i = m.end() - 1
+        args_start = m.end()
+        depth = 1
+        j = args_start
+        while j < len(bscan) and depth > 0:
+            ch = bscan[j]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            j += 1
+        if depth != 0:
+            continue
+        args_str = bscan[args_start:j - 1]
+        # Skip whitespace to the opening `{`.
+        k = j
+        while k < len(bscan) and bscan[k] in " \t\r\n":
+            k += 1
+        if k >= len(bscan) or bscan[k] != "{":
+            continue
+        open_i = k
         # _match_brace lives on cpprust; cs2cpp uses it via import.
         import tools.cpprust as cpprust
         close = cpprust._match_brace(bscan, open_i)
         if close is None:
             continue
+        # Map scan indices to body (same length; body may differ in trivia).
         src = body[m.start():m.start() + (close - m.start()) + 1]
-        impl = body[m.end():m.start() + (close - m.start())]
-        decl = m.group(0)
+        impl = body[open_i + 1:close]
+        decl = bscan[m.start():open_i + 1]
         out.append({
             "ret": ret,
             "name": name,
-            "args": m.group(3).strip(),
+            "args": args_str.strip(),
             "body": impl,
-            "body_abs": int(body_abs) + int(m.end()),
+            "body_abs": int(body_abs) + int(open_i + 1),
             "src": src,
             "public": bool(re.search(r"\bpublic\b", decl)),
             "static": bool(re.search(r"\bstatic\b", decl)),
@@ -9151,13 +9533,20 @@ def emit_engine(plan, analyses, used_apis):
             int(h.get("active", 1)) == 0
             for h in (plan.get("scene_hierarchy") or []))
     want_ui = (bool(ui_buttons) or ("GameObject.SetActive" in used_apis)
-               or authored_inactive)
+               or authored_inactive or _plan_has_ui_draws(plan))
+    rt_apis = (
+        "rectTransform.anchoredPosition" in used_apis
+        or "rectTransform.sizeDelta" in used_apis)
+    want_live_rt = bool(
+        plan.get("live_rt")
+        and (_plan_has_ui_draws(plan) or bool(ui_buttons) or rt_apis
+             or "transform.localScale" in used_apis))
     want_go_tables = (
         want_find or want_transform_find or want_transform_parent
         or want_transform_go or want_set_parent or want_get_sibling
         or want_getcomponent or want_findobject
         or want_rb2d or want_rb3d or want_add_any or want_ui or want_destroy
-        or want_instantiate or want_gcic)
+        or want_instantiate or want_gcic or want_live_rt)
     # Instantiate(this, parent) / GetComponentsInChildren need live parents.
     if want_inst_parent or want_gcic:
         want_set_parent = True
@@ -9326,6 +9715,11 @@ def emit_engine(plan, analyses, used_apis):
         p("extern int engine_keyboard_connected;")
         for key in sorted(keyboard_keys):
             p("extern int engine_keyboard_%s;" % key)
+    if "InputManager.Using" in used_apis:
+        p("extern int engine_input_using_keyboard;")
+        p("extern int engine_input_using_mouse;")
+        p("extern int engine_input_using_gamepad;")
+        p("extern int engine_input_using_phone;")
     if want_ui:
         p("extern float engine_pointer_x; /* screen px, origin bottom-left */")
         p("extern float engine_pointer_y;")
@@ -10775,7 +11169,7 @@ def emit_engine(plan, analyses, used_apis):
         p("")
 
     if (want_ui or want_transform_find or want_transform_parent
-            or want_set_parent or want_get_sibling):
+            or want_set_parent or want_get_sibling or want_live_rt):
         go_names = plan.get("go_names") or []
         go_authored_n = len(go_names)
         go_n = max(1, go_authored_n + go_spawn_budget)
@@ -10795,7 +11189,7 @@ def emit_engine(plan, analyses, used_apis):
             go_sib = [0]
         want_go_parent_table = (
             want_ui or want_transform_find or want_transform_parent
-            or want_set_parent)
+            or want_set_parent or want_live_rt)
         if want_go_parent_table:
             p("/* Transform hierarchy (live GO parents; seeded from m_Father) */"
               if (want_set_parent or want_transform_find) else
@@ -10865,6 +11259,268 @@ def emit_engine(plan, analyses, used_apis):
             p("    return cur;")
             p("}")
             p("")
+
+        if want_live_rt:
+            rt = plan.get("live_rt") or {}
+            go_rt_n = go_n
+
+            def _rt_f(key, default=0.0):
+                vals = list(rt.get(key) or [])
+                while len(vals) < go_authored_n:
+                    vals.append(default)
+                vals = vals[:go_authored_n] + [default] * go_spawn_budget
+                if not vals:
+                    vals = [default]
+                return vals[:go_rt_n]
+
+            def _rt_i(key, default=0):
+                vals = list(rt.get(key) or [])
+                while len(vals) < go_authored_n:
+                    vals.append(default)
+                vals = vals[:go_authored_n] + [default] * go_spawn_budget
+                if not vals:
+                    vals = [default]
+                return vals[:go_rt_n]
+
+            p("/* Live RectTransform (seeded post-layout bake) */")
+            ulw = max(1, int(plan.get("ui_layout_width")
+                             or plan.get("screen_width") or 1024))
+            ulh = max(1, int(plan.get("ui_layout_height")
+                             or plan.get("screen_height") or 768))
+            p("static const float _engine_ui_layout_w = %sf;" % repr(float(ulw)))
+            p("static const float _engine_ui_layout_h = %sf;" % repr(float(ulh)))
+            p("static const int _engine_rt_has[%d] = { %s };" % (
+                go_rt_n, ", ".join(str(int(x)) for x in _rt_i("has"))))
+            p("static const int _engine_rt_canvas[%d] = { %s };" % (
+                go_rt_n, ", ".join(str(int(x)) for x in _rt_i("canvas"))))
+            p("static const int _engine_rt_canvas_root[%d] = { %s };" % (
+                go_rt_n,
+                ", ".join(str(int(x)) for x in _rt_i("canvas_root"))))
+            p("static float _engine_rt_amin_x[%d] = { %s };" % (
+                go_rt_n, ", ".join("%sf" % repr(float(x))
+                                   for x in _rt_f("amin_x", 0.5))))
+            p("static float _engine_rt_amin_y[%d] = { %s };" % (
+                go_rt_n, ", ".join("%sf" % repr(float(x))
+                                   for x in _rt_f("amin_y", 0.5))))
+            p("static float _engine_rt_amax_x[%d] = { %s };" % (
+                go_rt_n, ", ".join("%sf" % repr(float(x))
+                                   for x in _rt_f("amax_x", 0.5))))
+            p("static float _engine_rt_amax_y[%d] = { %s };" % (
+                go_rt_n, ", ".join("%sf" % repr(float(x))
+                                   for x in _rt_f("amax_y", 0.5))))
+            p("static float _engine_rt_apos_x[%d] = { %s };" % (
+                go_rt_n, ", ".join("%sf" % repr(float(x))
+                                   for x in _rt_f("apos_x"))))
+            p("static float _engine_rt_apos_y[%d] = { %s };" % (
+                go_rt_n, ", ".join("%sf" % repr(float(x))
+                                   for x in _rt_f("apos_y"))))
+            p("static float _engine_rt_sd_x[%d] = { %s };" % (
+                go_rt_n, ", ".join("%sf" % repr(float(x))
+                                   for x in _rt_f("sd_x", 100.0))))
+            p("static float _engine_rt_sd_y[%d] = { %s };" % (
+                go_rt_n, ", ".join("%sf" % repr(float(x))
+                                   for x in _rt_f("sd_y", 100.0))))
+            p("static float _engine_rt_pivot_x[%d] = { %s };" % (
+                go_rt_n, ", ".join("%sf" % repr(float(x))
+                                   for x in _rt_f("pivot_x", 0.5))))
+            p("static float _engine_rt_pivot_y[%d] = { %s };" % (
+                go_rt_n, ", ".join("%sf" % repr(float(x))
+                                   for x in _rt_f("pivot_y", 0.5))))
+            p("static float _engine_rt_sx[%d] = { %s };" % (
+                go_rt_n, ", ".join("%sf" % repr(float(x))
+                                   for x in _rt_f("sx", 1.0))))
+            p("static float _engine_rt_sy[%d] = { %s };" % (
+                go_rt_n, ", ".join("%sf" % repr(float(x))
+                                   for x in _rt_f("sy", 1.0))))
+            p("static void _engine_rt_pivot_center(")
+            p("    float parent_w, float parent_h,")
+            p("    float amin_x, float amin_y, float amax_x, float amax_y,")
+            p("    float apos_x, float apos_y, float size_x, float size_y,")
+            p("    float pivot_x, float pivot_y,")
+            p("    float *ocx, float *ocy, float *ow, float *oh) {")
+            p("    float ax0 = amin_x * parent_w;")
+            p("    float ax1 = amax_x * parent_w;")
+            p("    float ay0 = amin_y * parent_h;")
+            p("    float ay1 = amax_y * parent_h;")
+            p("    float w, h, cx, cy, pivot_px, pivot_py;")
+            p("    if ((ax1 - ax0 < 1e-6f && ax0 - ax1 < 1e-6f)")
+            p("        && (ay1 - ay0 < 1e-6f && ay0 - ay1 < 1e-6f)) {")
+            p("        w = size_x;")
+            p("        h = size_y;")
+            p("        pivot_px = ax0 + apos_x;")
+            p("        pivot_py = ay0 + apos_y;")
+            p("        cx = pivot_px + (0.5f - pivot_x) * w;")
+            p("        cy = pivot_py + (0.5f - pivot_y) * h;")
+            p("    } else {")
+            p("        w = (ax1 - ax0) + size_x;")
+            p("        h = (ay1 - ay0) + size_y;")
+            p("        cx = (ax0 + ax1) * 0.5f + apos_x;")
+            p("        cy = (ay0 + ay1) * 0.5f + apos_y;")
+            p("    }")
+            p("    *ocx = cx; *ocy = cy; *ow = w; *oh = h;")
+            p("}")
+            p("static void _engine_ui_local_wh(int go, float sw, float sh,")
+            p("                                float *ow, float *oh);")
+            p("static void _engine_ui_screen_rect(int go, float sw, float sh,")
+            p("    float *ocx, float *ocy, float *ow, float *oh);")
+            p("static void _engine_ui_local_wh(int go, float sw, float sh,")
+            p("                                float *ow, float *oh) {")
+            p("    int parent;")
+            p("    float pw, ph, lcx, lcy, rw, rh;")
+            p("    if (go < 0 || go >= %d || !_engine_rt_has[go]) {"
+              % go_rt_n)
+            p("        *ow = sw; *oh = sh;")
+            p("        return;")
+            p("    }")
+            p("    if (_engine_rt_canvas_root[go]) {")
+            p("        *ow = sw; *oh = sh;")
+            p("        return;")
+            p("    }")
+            p("    parent = _engine_go_parent[go];")
+            p("    if (parent >= 0 && parent < %d"
+              % go_rt_n)
+            p("        && (_engine_rt_has[parent]"
+              " || _engine_rt_canvas[parent])) {")
+            p("        _engine_ui_local_wh(parent, sw, sh, &pw, &ph);")
+            p("    } else {")
+            p("        pw = sw; ph = sh;")
+            p("    }")
+            p("    _engine_rt_pivot_center(")
+            p("        pw, ph,")
+            p("        _engine_rt_amin_x[go], _engine_rt_amin_y[go],")
+            p("        _engine_rt_amax_x[go], _engine_rt_amax_y[go],")
+            p("        _engine_rt_apos_x[go], _engine_rt_apos_y[go],")
+            p("        _engine_rt_sd_x[go], _engine_rt_sd_y[go],")
+            p("        _engine_rt_pivot_x[go], _engine_rt_pivot_y[go],")
+            p("        &lcx, &lcy, &rw, &rh);")
+            p("    if (rw < 0.f) rw = -rw;")
+            p("    if (rh < 0.f) rh = -rh;")
+            p("    *ow = rw; *oh = rh;")
+            p("}")
+            p("static void _engine_ui_screen_rect(int go, float sw, float sh,")
+            p("    float *ocx, float *ocy, float *ow, float *oh) {")
+            p("    int parent;")
+            p("    float pcx, pcy, pw, ph, plw, plh, fsx, fsy, plx, ply;")
+            p("    float lcx, lcy, rw, rh, sx, sy, rw0, rh0, px, py;")
+            p("    if (go < 0 || go >= %d || !_engine_rt_has[go]) {"
+              % go_rt_n)
+            p("        *ocx = sw * 0.5f; *ocy = sh * 0.5f;")
+            p("        *ow = sw; *oh = sh;")
+            p("        return;")
+            p("    }")
+            p("    if (_engine_rt_canvas_root[go]) {")
+            p("        *ocx = sw * 0.5f; *ocy = sh * 0.5f;")
+            p("        *ow = sw; *oh = sh;")
+            p("        return;")
+            p("    }")
+            p("    parent = _engine_go_parent[go];")
+            p("    if (parent >= 0 && parent < %d"
+              % go_rt_n)
+            p("        && (_engine_rt_has[parent]"
+              " || _engine_rt_canvas[parent])) {")
+            p("        _engine_ui_screen_rect("
+              "parent, sw, sh, &pcx, &pcy, &pw, &ph);")
+            p("        _engine_ui_local_wh(parent, sw, sh, &plw, &plh);")
+            p("        if (plw < 1e-8f) plw = 1e-8f;")
+            p("        if (plh < 1e-8f) plh = 1e-8f;")
+            p("        if (pw < 0.f) pw = -pw;")
+            p("        if (ph < 0.f) ph = -ph;")
+            p("        fsx = pw / plw;")
+            p("        fsy = ph / plh;")
+            p("        plx = pcx - pw * 0.5f;")
+            p("        ply = pcy - ph * 0.5f;")
+            p("    } else {")
+            p("        plw = sw; plh = sh;")
+            p("        fsx = 1.f; fsy = 1.f;")
+            p("        plx = 0.f; ply = 0.f;")
+            p("    }")
+            p("    _engine_rt_pivot_center(")
+            p("        plw, plh,")
+            p("        _engine_rt_amin_x[go], _engine_rt_amin_y[go],")
+            p("        _engine_rt_amax_x[go], _engine_rt_amax_y[go],")
+            p("        _engine_rt_apos_x[go], _engine_rt_apos_y[go],")
+            p("        _engine_rt_sd_x[go], _engine_rt_sd_y[go],")
+            p("        _engine_rt_pivot_x[go], _engine_rt_pivot_y[go],")
+            p("        &lcx, &lcy, &rw, &rh);")
+            p("    sx = _engine_rt_sx[go]; if (sx < 0.f) sx = -sx;")
+            p("    sy = _engine_rt_sy[go]; if (sy < 0.f) sy = -sy;")
+            p("    if (sx < 1e-8f) sx = 1.f;")
+            p("    if (sy < 1e-8f) sy = 1.f;")
+            p("    rw0 = rw; if (rw0 < 0.f) rw0 = -rw0;")
+            p("    rh0 = rh; if (rh0 < 0.f) rh0 = -rh0;")
+            p("    px = _engine_rt_pivot_x[go];")
+            p("    py = _engine_rt_pivot_y[go];")
+            p("    lcx = lcx + (0.5f - px) * rw0 * (sx - 1.f);")
+            p("    lcy = lcy + (0.5f - py) * rh0 * (sy - 1.f);")
+            p("    rw = rw0 * sx;")
+            p("    rh = rh0 * sy;")
+            p("    *ocx = plx + lcx * fsx;")
+            p("    *ocy = ply + lcy * fsy;")
+            p("    *ow = rw * fsx;")
+            p("    *oh = rh * fsy;")
+            p("}")
+            p("static float RectTransform_get_anchoredPosition_x(int go) {")
+            p("    if (go < 0 || go >= %d) return 0.f;" % go_rt_n)
+            p("    return _engine_rt_apos_x[go];")
+            p("}")
+            p("static float RectTransform_get_anchoredPosition_y(int go) {")
+            p("    if (go < 0 || go >= %d) return 0.f;" % go_rt_n)
+            p("    return _engine_rt_apos_y[go];")
+            p("}")
+            p("static void RectTransform_set_anchoredPosition_xy("
+              "int go, float x, float y) {")
+            p("    if (go < 0 || go >= %d) return;" % go_rt_n)
+            p("    _engine_rt_apos_x[go] = x;")
+            p("    _engine_rt_apos_y[go] = y;")
+            p("}")
+            p("static Vector2 RectTransform_get_anchoredPosition(int go) {")
+            p("    return Vector2_make("
+              "RectTransform_get_anchoredPosition_x(go), "
+              "RectTransform_get_anchoredPosition_y(go));")
+            p("}")
+            p("static void RectTransform_set_anchoredPosition("
+              "int go, Vector2 v) {")
+            p("    RectTransform_set_anchoredPosition_xy("
+              "go, Vector2_x(v), Vector2_y(v));")
+            p("}")
+            p("static float RectTransform_get_sizeDelta_x(int go) {")
+            p("    if (go < 0 || go >= %d) return 0.f;" % go_rt_n)
+            p("    return _engine_rt_sd_x[go];")
+            p("}")
+            p("static float RectTransform_get_sizeDelta_y(int go) {")
+            p("    if (go < 0 || go >= %d) return 0.f;" % go_rt_n)
+            p("    return _engine_rt_sd_y[go];")
+            p("}")
+            p("static void RectTransform_set_sizeDelta_xy("
+              "int go, float x, float y) {")
+            p("    if (go < 0 || go >= %d) return;" % go_rt_n)
+            p("    _engine_rt_sd_x[go] = x;")
+            p("    _engine_rt_sd_y[go] = y;")
+            p("}")
+            p("static Vector2 RectTransform_get_sizeDelta(int go) {")
+            p("    return Vector2_make("
+              "RectTransform_get_sizeDelta_x(go), "
+              "RectTransform_get_sizeDelta_y(go));")
+            p("}")
+            p("static void RectTransform_set_sizeDelta(int go, Vector2 v) {")
+            p("    RectTransform_set_sizeDelta_xy("
+              "go, Vector2_x(v), Vector2_y(v));")
+            p("}")
+            p("static void RectTransform_set_localScale_xy("
+              "int go, float sx, float sy) {")
+            p("    if (go < 0 || go >= %d) return;" % go_rt_n)
+            p("    _engine_rt_sx[go] = sx;")
+            p("    _engine_rt_sy[go] = sy;")
+            p("}")
+            p("static float RectTransform_get_localScale_x(int go) {")
+            p("    if (go < 0 || go >= %d) return 1.f;" % go_rt_n)
+            p("    return _engine_rt_sx[go];")
+            p("}")
+            p("static float RectTransform_get_localScale_y(int go) {")
+            p("    if (go < 0 || go >= %d) return 1.f;" % go_rt_n)
+            p("    return _engine_rt_sy[go];")
+            p("}")
+            p("")
         if want_ui:
             go_active = plan.get("go_active") or [1] * go_authored_n
             if len(go_active) < go_authored_n:
@@ -10914,16 +11570,21 @@ def emit_engine(plan, analyses, used_apis):
                         "%sf" % repr(float(b[key][i]))
                         for b in ui_buttons for i in range(4))
 
-                p("static const float _engine_ui_btn_ncx[%d] = { %s };" % (
-                    nbtn, ", ".join("%sf" % repr(b["ncx"]) for b in ui_buttons)))
-                p("static const float _engine_ui_btn_ncy[%d] = { %s };" % (
-                    nbtn, ", ".join("%sf" % repr(b["ncy"]) for b in ui_buttons)))
-                p("static const float _engine_ui_btn_nhw[%d] = { %s };" % (
-                    nbtn, ", ".join("%sf" % repr(b["nhw"]) for b in ui_buttons)))
-                p("static const float _engine_ui_btn_nhh[%d] = { %s };" % (
-                    nbtn, ", ".join("%sf" % repr(b["nhh"]) for b in ui_buttons)))
                 p("static const int _engine_ui_btn_go[%d] = { %s };" % (
                     nbtn, ", ".join(str(int(b["go"])) for b in ui_buttons)))
+                if not want_live_rt:
+                    p("static const float _engine_ui_btn_ncx[%d] = { %s };" % (
+                        nbtn, ", ".join(
+                            "%sf" % repr(b["ncx"]) for b in ui_buttons)))
+                    p("static const float _engine_ui_btn_ncy[%d] = { %s };" % (
+                        nbtn, ", ".join(
+                            "%sf" % repr(b["ncy"]) for b in ui_buttons)))
+                    p("static const float _engine_ui_btn_nhw[%d] = { %s };" % (
+                        nbtn, ", ".join(
+                            "%sf" % repr(b["nhw"]) for b in ui_buttons)))
+                    p("static const float _engine_ui_btn_nhh[%d] = { %s };" % (
+                        nbtn, ", ".join(
+                            "%sf" % repr(b["nhh"]) for b in ui_buttons)))
                 # Flat SetActive list: each Button may have N onClick targets
                 # (Play → activate Play Menu + deactivate Main Menu).
                 call_starts = []
@@ -11002,6 +11663,19 @@ def emit_engine(plan, analyses, used_apis):
             else:
                 p("    px = engine_pointer_x;")
                 p("    py = engine_pointer_y;")
+            # Live RT math is in pack-time canvas units; map pointer into
+            # that space when Screen/letterbox ≠ layout (window resize).
+            if want_live_rt:
+                p("    {")
+                p("        float lw = _engine_ui_layout_w;")
+                p("        float lh = _engine_ui_layout_h;")
+                p("        if (lw < 1.f) lw = 1.f;")
+                p("        if (lh < 1.f) lh = 1.f;")
+                p("        px = px * (lw / sw);")
+                p("        py = py * (lh / sh);")
+                p("        sw = lw;")
+                p("        sh = lh;")
+                p("    }")
             p("    hit = -1;")
             if ui_buttons:
                 p("    for (i = 0; i < _engine_ui_button_count; i = i + 1) {")
@@ -11018,10 +11692,23 @@ def emit_engine(plan, analyses, used_apis):
                 p("            _engine_ui_btn_tint[i * 4 + 3] = col[3];")
                 p("            continue;")
                 p("        }")
-                p("        cx = _engine_ui_btn_ncx[i] * sw;")
-                p("        cy = _engine_ui_btn_ncy[i] * sh;")
-                p("        hw = _engine_ui_btn_nhw[i] * sw;")
-                p("        hh = _engine_ui_btn_nhh[i] * sh;")
+                if want_live_rt:
+                    p("        {")
+                    p("            float rcx, rcy, rw, rh;")
+                    p("            _engine_ui_screen_rect("
+                      "go, sw, sh, &rcx, &rcy, &rw, &rh);")
+                    p("            if (rw < 0.f) rw = -rw;")
+                    p("            if (rh < 0.f) rh = -rh;")
+                    p("            cx = rcx;")
+                    p("            cy = rcy;")
+                    p("            hw = rw * 0.5f;")
+                    p("            hh = rh * 0.5f;")
+                    p("        }")
+                else:
+                    p("        cx = _engine_ui_btn_ncx[i] * sw;")
+                    p("        cy = _engine_ui_btn_ncy[i] * sh;")
+                    p("        hw = _engine_ui_btn_nhw[i] * sw;")
+                    p("        hh = _engine_ui_btn_nhh[i] * sh;")
                 p("        dx = px - cx; if (dx < 0.f) dx = -dx;")
                 p("        dy = py - cy; if (dy < 0.f) dy = -dy;")
                 p("        over = (dx <= hw && dy <= hh);")
@@ -11888,6 +12575,20 @@ def emit_engine(plan, analyses, used_apis):
             [m for _c, m in methods_by.get(cname, [])
              if m["name"] in emit_names and m["name"] != "OnEnable"])
         used_syms = set()
+        # Forward-declare helpers so Start can call Do before Do's body.
+        for c, m in methods_by.get(cname, []):
+            if m["name"] == "OnEnable" or m["name"] not in emit_names:
+                continue
+            if cl.get("ctor_forbidden"):
+                continue
+            if m["name"] in _UNITY_EMIT_MESSAGES:
+                continue
+            if m.get("static"):
+                continue
+            sym = _method_c_symbol(
+                idn, m["name"], m.get("args") or "",
+                m["name"] in overloaded)
+            p("static void %s(unsigned i);" % sym)
         for c, m in methods_by.get(cname, []):
             if m["name"] == "OnEnable":
                 continue
@@ -13281,19 +13982,38 @@ def emit_engine(plan, analyses, used_apis):
             str(i) for i, _sp in spr_idx))
         any_ui = any(sp.get("source") in ("ui", "ui_tmp")
                      for _i, sp in spr_idx)
+        need_spr_go = (want_ui or want_live_rt) and go_names
         if any_ui:
             p("        static const int _spr_ui[] = { %s };" % ", ".join(
                 "1" if sp.get("source") in ("ui", "ui_tmp") else "0"
                 for _i, sp in spr_idx))
-            p("        static const float _spr_ncx[] = { %s };" % ", ".join(
-                "%sf" % repr(float(sp.get("ncx", 0.5))) for _i, sp in spr_idx))
-            p("        static const float _spr_ncy[] = { %s };" % ", ".join(
-                "%sf" % repr(float(sp.get("ncy", 0.5))) for _i, sp in spr_idx))
-            p("        static const float _spr_nhw[] = { %s };" % ", ".join(
-                "%sf" % repr(float(sp.get("nhw", 0.0))) for _i, sp in spr_idx))
-            p("        static const float _spr_nhh[] = { %s };" % ", ".join(
-                "%sf" % repr(float(sp.get("nhh", 0.0))) for _i, sp in spr_idx))
-        if want_ui and go_names:
+            if want_live_rt:
+                p("        static const int _spr_preserve[] = { %s };" % (
+                    ", ".join(
+                        "1" if int(sp.get("preserve_aspect") or 0) else "0"
+                        for _i, sp in spr_idx)))
+                p("        static const float _spr_src_aspect[] = { %s };" % (
+                    ", ".join(
+                        "%sf" % repr(float(sp.get("src_aspect") or 1.0))
+                        for _i, sp in spr_idx)))
+            else:
+                p("        static const float _spr_ncx[] = { %s };" % (
+                    ", ".join(
+                        "%sf" % repr(float(sp.get("ncx", 0.5)))
+                        for _i, sp in spr_idx)))
+                p("        static const float _spr_ncy[] = { %s };" % (
+                    ", ".join(
+                        "%sf" % repr(float(sp.get("ncy", 0.5)))
+                        for _i, sp in spr_idx)))
+                p("        static const float _spr_nhw[] = { %s };" % (
+                    ", ".join(
+                        "%sf" % repr(float(sp.get("nhw", 0.0)))
+                        for _i, sp in spr_idx)))
+                p("        static const float _spr_nhh[] = { %s };" % (
+                    ", ".join(
+                        "%sf" % repr(float(sp.get("nhh", 0.0)))
+                        for _i, sp in spr_idx)))
+        if need_spr_go:
             go_vals = []
             btn_vals = []
             btn_by_go = {int(b["go"]): bi
@@ -13366,7 +14086,7 @@ def emit_engine(plan, analyses, used_apis):
 
         if any_ui:
             p("            if (_spr_ui[k]) {")
-            p("                float aspect, world_h, world_w;")
+            p("                float aspect, world_h, world_w, ncx, ncy, nhw, nhh;")
             if plan.get("camera"):
                 p("                aspect = Camera_main_aspect;")
                 p("                if (aspect < 1e-6f) {")
@@ -13384,12 +14104,57 @@ def emit_engine(plan, analyses, used_apis):
                 p("                aspect = sw / sh;")
             p("                world_h = 2.f * Camera_main_orthographicSize;")
             p("                world_w = world_h * aspect;")
+            if want_live_rt:
+                p("                {")
+                p("                    float sw = _engine_ui_layout_w;")
+                p("                    float sh = _engine_ui_layout_h;")
+                p("                    float rcx, rcy, rw, rh, dw, dh, dcx, dcy;")
+                p("                    float pivx, pivy, sa;")
+                p("                    int go = _spr_go[k];")
+                p("                    if (sw < 1.f) sw = 1.f;")
+                p("                    if (sh < 1.f) sh = 1.f;")
+                p("                    _engine_ui_screen_rect("
+                  "go, sw, sh, &rcx, &rcy, &rw, &rh);")
+                p("                    if (rw < 0.f) rw = -rw;")
+                p("                    if (rh < 0.f) rh = -rh;")
+                p("                    dw = rw; dh = rh;")
+                p("                    dcx = rcx; dcy = rcy;")
+                p("                    if (_spr_preserve[k]"
+                  " && rw > 1e-6f && rh > 1e-6f) {")
+                p("                        sa = _spr_src_aspect[k];")
+                p("                        if (sa < 1e-8f) sa = 1.f;")
+                p("                        if (rw / rh > sa) {")
+                p("                            dw = rh * sa;")
+                p("                            dh = rh;")
+                p("                        } else {")
+                p("                            dw = rw;")
+                p("                            dh = rw / sa;")
+                p("                        }")
+                p("                        pivx = (go >= 0)"
+                  " ? _engine_rt_pivot_x[go] : 0.5f;")
+                p("                        pivy = (go >= 0)"
+                  " ? _engine_rt_pivot_y[go] : 0.5f;")
+                p("                        dcx = rcx + (rw - dw)"
+                  " * (pivx - 0.5f);")
+                p("                        dcy = rcy + (rh - dh)"
+                  " * (pivy - 0.5f);")
+                p("                    }")
+                p("                    ncx = dcx / sw;")
+                p("                    ncy = dcy / sh;")
+                p("                    nhw = dw * 0.5f / sw;")
+                p("                    nhh = dh * 0.5f / sh;")
+                p("                }")
+            else:
+                p("                ncx = _spr_ncx[k];")
+                p("                ncy = _spr_ncy[k];")
+                p("                nhw = _spr_nhw[k];")
+                p("                nhh = _spr_nhh[k];")
             p("                out[n].x = Camera_main_pos_x")
-            p("                    + (_spr_ncx[k] - 0.5f) * world_w;")
+            p("                    + (ncx - 0.5f) * world_w;")
             p("                out[n].y = Camera_main_pos_y")
-            p("                    + (_spr_ncy[k] - 0.5f) * world_h;")
-            p("                out[n].half_w = _spr_nhw[k] * world_w;")
-            p("                out[n].half_h = _spr_nhh[k] * world_h;")
+            p("                    + (ncy - 0.5f) * world_h;")
+            p("                out[n].half_w = nhw * world_w;")
+            p("                out[n].half_h = nhh * world_h;")
             if use_mut:
                 p("                out[n].tex = _%s_draw_tex[i];" % idn)
             else:
@@ -13746,6 +14511,123 @@ def _rewrite_transform_parent(text, cl, plan):
         r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*parent\b",
         "Transform_get_parent(%s)" % go_expr,
         text)
+
+
+def _rewrite_recttransform_apis(text, cl, plan):
+    """Lower rectTransform.anchoredPosition / sizeDelta / localScale."""
+    if not plan.get("live_rt") or not plan.get("go_names"):
+        return text
+    idn = _c_ident(cl["name"])
+    this_go = "_engine_go_of_%s(i)" % idn
+    flags = re.DOTALL
+    # Receiver: rectTransform / transform / field / field[i] / a.b
+    _recv = (
+        r"((?:this\s*\.\s*)?rectTransform|(?:this\s*\.\s*)?transform|"
+        r"(?:[\w]+(?:\s*\.\s*[\w]+|\s*\[[^\]]+\])*))"
+    )
+
+    def _go_of(recv):
+        recv = (recv or "").strip()
+        if not recv or recv in ("rectTransform", "transform", "this"):
+            return this_go
+        if re.match(r"(?:this\s*\.\s*)?rectTransform\s*$", recv):
+            return this_go
+        if re.match(r"(?:this\s*\.\s*)?transform\s*$", recv):
+            return this_go
+        return recv
+
+    for prop, setter in (
+            ("anchoredPosition", "RectTransform_set_anchoredPosition_xy"),
+            ("sizeDelta", "RectTransform_set_sizeDelta_xy")):
+        def _repl_eq(m, setfn=setter):
+            go = _go_of(m.group(1))
+            args = _split_call_args(m.group(2))
+            if len(args) < 2:
+                return m.group(0)
+            return "%s(%s, (%s), (%s));" % (setfn, go, args[0], args[1])
+
+        text = cs2cpp.code_sub(
+            r"(?<![.\w])%s\s*\.\s*%s\s*=\s*new\s+Vector2\s*\((.*?)\)\s*;"
+            % (_recv, prop),
+            _repl_eq, text, flags=flags)
+        text = cs2cpp.code_sub(
+            r"(?<![.\w])%s\s*\.\s*%s\s*=\s*Vector2\.zero\s*;" % (_recv, prop),
+            lambda m, setfn=setter: "%s(%s, 0.f, 0.f);" % (
+                setfn, _go_of(m.group(1))),
+            text)
+
+        def _repl_vec(m, setfn=setter):
+            go = _go_of(m.group(1))
+            rhs = m.group(2).strip()
+            return (
+                "%s(%s, Vector2_x(%s), Vector2_y(%s));"
+                % (setfn, go, rhs, rhs))
+
+        text = cs2cpp.code_sub(
+            r"(?<![.\w])%s\s*\.\s*%s\s*=\s*([^;]+);" % (_recv, prop),
+            _repl_vec, text)
+
+    def _repl_scale(m):
+        go = _go_of(m.group(1))
+        args = _split_call_args(m.group(2))
+        if len(args) < 2:
+            return m.group(0)
+        return "RectTransform_set_localScale_xy(%s, (%s), (%s));" % (
+            go, args[0], args[1])
+
+    text = cs2cpp.code_sub(
+        r"(?<![.\w])%s\s*\.\s*localScale\s*=\s*new\s+Vector3\s*\((.*?)\)\s*;"
+        % _recv,
+        _repl_scale, text, flags=flags)
+    text = cs2cpp.code_sub(
+        r"(?<![.\w])%s\s*\.\s*localScale\s*=\s*new\s+Vector2\s*\((.*?)\)\s*;"
+        % _recv,
+        _repl_scale, text, flags=flags)
+
+    def _repl_scale_one(m):
+        go = _go_of(m.group(1))
+        s = m.group(2).strip()
+        return "RectTransform_set_localScale_xy(%s, (%s), (%s));" % (go, s, s)
+
+    text = cs2cpp.code_sub(
+        r"(?<![.\w])%s\s*\.\s*localScale\s*=\s*Vector3\s*\.\s*one\s*\*\s*([^;]+);"
+        % _recv,
+        _repl_scale_one, text)
+
+    for prop, gx, gy in (
+            ("anchoredPosition",
+             "RectTransform_get_anchoredPosition_x",
+             "RectTransform_get_anchoredPosition_y"),
+            ("sizeDelta",
+             "RectTransform_get_sizeDelta_x",
+             "RectTransform_get_sizeDelta_y")):
+        text = cs2cpp.code_sub(
+            r"(?<![.\w])%s\s*\.\s*%s\b(?!\s*[=.])" % (_recv, prop),
+            lambda m, x=gx, y=gy: "Vector2_make(%s(%s), %s(%s))" % (
+                x, _go_of(m.group(1)), y, _go_of(m.group(1))),
+            text)
+        text = cs2cpp.code_sub(
+            r"(?<![.\w])%s\s*\.\s*%s\s*\.\s*x\b" % (_recv, prop),
+            lambda m, x=gx: "%s(%s)" % (x, _go_of(m.group(1))),
+            text)
+        text = cs2cpp.code_sub(
+            r"(?<![.\w])%s\s*\.\s*%s\s*\.\s*y\b" % (_recv, prop),
+            lambda m, y=gy: "%s(%s)" % (y, _go_of(m.group(1))),
+            text)
+
+    text = cs2cpp.code_sub(
+        r"(?<![.\w])%s\s*\.\s*localScale\s*\.\s*x\b" % _recv,
+        lambda m: "RectTransform_get_localScale_x(%s)" % _go_of(m.group(1)),
+        text)
+    text = cs2cpp.code_sub(
+        r"(?<![.\w])%s\s*\.\s*localScale\s*\.\s*y\b" % _recv,
+        lambda m: "RectTransform_get_localScale_y(%s)" % _go_of(m.group(1)),
+        text)
+    # Remaining bare rectTransform → this GO (≡ GetComponent<RectTransform>).
+    text = cs2cpp.code_sub(
+        r"(?<![.\w])(?:this\s*\.\s*)?rectTransform\b",
+        this_go, text)
+    return text
 
 
 def _setparent_go_expr(recv, cl):
@@ -14781,7 +15663,12 @@ def _collection_elem_c_ty(elem, plan=None):
 
 def _plan_needs_vector2(plan, used_apis=None):
     """Emit Vector2 when scripts use the type or pack Vector2 fields."""
-    if used_apis and "Vector2" in used_apis:
+    if used_apis and (
+            "Vector2" in used_apis
+            or "rectTransform.anchoredPosition" in used_apis
+            or "rectTransform.sizeDelta" in used_apis):
+        return True
+    if plan and plan.get("live_rt"):
         return True
     for cl in (plan or {}).get("classes", {}).values():
         if cl.get("vec2_fields"):
@@ -15087,6 +15974,26 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
             r"(?<![\w.])gameObject\s*\.\s*SetActive\s*\(\s*([^)]+)\s*\)",
             r"GameObject_SetActive(_engine_go_of_%s(i), (\1))" % idn,
             text)
+    # InputSystem.onDeviceChange — no device-change bus in the desktop pack.
+    text = cs2cpp.code_sub(
+        r"InputSystem\s*\.\s*onDeviceChange\s*\+=\s*[^;]+;",
+        "/* InputSystem.onDeviceChange += */", text)
+    text = cs2cpp.code_sub(
+        r"InputSystem\s*\.\s*onDeviceChange\s*-=\s*[^;]+;",
+        "/* InputSystem.onDeviceChange -= */", text)
+    # Authored InputManager.Using* → host flags (keyboard/mouse default on).
+    text = cs2cpp.code_sub(
+        r"(?:[\w.]+\.)?InputManager\s*\.\s*Using(Gamepad|Keyboard|Mouse|Phone)\b",
+        lambda m: "engine_input_using_%s" % m.group(1).lower(),
+        text)
+    # Nested InputDevice enum members (declaration order when unspecified).
+    _input_dev = {
+        "KeyboardAndMouse": "0", "Phone": "1", "Gamepad": "2",
+    }
+    text = cs2cpp.code_sub(
+        r"(?:[\w.]+\.)?InputManager\s*\.\s*InputDevice\s*\.\s*(\w+)\b",
+        lambda m: _input_dev.get(m.group(1), "0"),
+        text)
     # Collections: cs2cpp lowers them from what the plan says about each
     # class (maps before lists, so a two-argument `Add` is a map's).
     text = cs2cpp.lower_packed_collections(
@@ -15107,6 +16014,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = _rewrite_quaternion_angle(text, cl)
     text = _rewrite_local_rotation_reads(text, cl, plan)
     text = _rewrite_transform_parent(text, cl, plan)
+    text = _rewrite_recttransform_apis(text, cl, plan)
     text = _rewrite_transform_set_parent(text, cl, plan)
     text = _rewrite_transform_get_sibling_index(text, cl, plan)
     text = _rewrite_transform_game_object(text, cl, plan)
@@ -15149,6 +16057,10 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
             r"\b%s\b(?=\s+\w)" % re.escape(cname), "int", text)
     # API tokens before Vector2 rewrites so nested Mathf.Sin(...) keeps parens.
     text = cs2cpp.lower_bindings(text, _UNITY_API_CORE)
+    # Layout is bake-time; authored ForceUpdateCanvases is intentionally a no-op.
+    text = cs2cpp.code_sub(
+        r"(?:UnityEngine\.)?Canvas\s*\.\s*ForceUpdateCanvases\s*\(\s*\)\s*;?",
+        "/* Canvas.ForceUpdateCanvases */", text)
     # byte[] locals / params → ByteArray (File WriteAllBytes / ReadAllBytes).
     text = cs2cpp.lower_byte_arrays(text, _packed_model(plan))
     text = cs2cpp.code_sub(
@@ -15384,6 +16296,38 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = cs2cpp.lower_packed_fields(
         text, idn, members, class_const_names, handle_fields,
         _packed_model(plan))
+    # Same-class instance calls: Do() / Do(a) → Class_Do(i) / Class_Do(i, a).
+    # Unity messages and private helpers share the packed instance index.
+    this_methods = set()
+    this_method_list = []
+    for _c, m in (plan.get("_methods_by") or {}).get(cl.get("name") or "", []):
+        if m.get("name") and not m.get("static"):
+            this_methods.add(m["name"])
+            this_method_list.append(m)
+    for m in cl.get("methods") or []:
+        if m.get("name") and not m.get("static"):
+            this_methods.add(m["name"])
+            this_method_list.append(m)
+    overloaded = _overload_method_names(this_method_list)
+    for mname in sorted(this_methods, key=len, reverse=True):
+        if mname in _UNITY_EMIT_MESSAGES:
+            # Awake/Start/Update are called from the tick loop, not inlined.
+            continue
+        # Overloads need arg-type dispatch — leave bare for the stub detector.
+        if mname in overloaded:
+            continue
+        sym = "%s_%s" % (idn, mname)
+
+        def _inst_call(m, s=sym):
+            args = (m.group(1) or "").strip()
+            if not args:
+                return "%s(i)" % s
+            return "%s(i, %s)" % (s, args)
+
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])%s\s*\(\s*([^)]*)\s*\)" % re.escape(mname),
+            _inst_call,
+            text)
     # A `_set_(` another rewrite left open at the end of its line.
     fixed = []
     for line in text.split("\n"):
@@ -15510,6 +16454,12 @@ def emit_data(plan, used_apis=None):
         p("int engine_keyboard_connected = 0;")
         for key in sorted(keyboard_keys):
             p("int engine_keyboard_%s = 0;" % key)
+    if "InputManager.Using" in used_apis:
+        # Desktop defaults: keyboard+mouse present, no gamepad/phone.
+        p("int engine_input_using_keyboard = 1;")
+        p("int engine_input_using_mouse = 1;")
+        p("int engine_input_using_gamepad = 0;")
+        p("int engine_input_using_phone = 0;")
     if plan.get("ui_buttons"):
         p("/* Host: screen-space pointer (origin bottom-left, y up). */")
         p("float engine_pointer_x = 0.f;")
@@ -16287,9 +17237,14 @@ def _load_scenes_lights_cameras(root, assets):
     _apply_layout_groups(objects, sw, sh)
     _bake_ui_images(
         objects, cameras, sw, sh, asset_guids=assets, hierarchy=hierarchy)
+    # Snapshot rect onto hierarchy before dropping layout-only scaffolds so
+    # live RT / GO parent chains still see Canvas / plain Rect parents.
+    _snapshot_ui_rects_onto_hierarchy(objects, hierarchy)
     objects = [o for o in objects if not o.get("ui_scaffold")]
     _apply_sprite_sorting(objects, sorting_layers)
     _attach_sprite_textures(objects, assets)
+    # Bake layout size (CanvasScaler may live only on dropped Canvas scaffold).
+    _load_scenes_lights_cameras.ui_layout = (int(sw), int(sh))
     return objects, lights, cameras, hierarchy
 
 
@@ -16870,7 +17825,7 @@ def _refused_api_site(analyses, api):
 _STAMP_NAME = ".unity_pack_stamp.json"
 _STAMP_VERSION = 4
 _SCENE_CACHE_NAME = ".unity_pack_scene_cache"
-_SCENE_CACHE_VERSION = 2
+_SCENE_CACHE_VERSION = 3
 # Authored inputs under Assets/ that affect emit (skip Library / PackageCache).
 _FINGERPRINT_EXTS = (
     ".cs", ".unity", ".prefab", ".meta",
@@ -17005,6 +17960,8 @@ def _write_scene_cache(outdir, assets_fp, objects, lights, cameras, hierarchy,
         "cameras": copy.deepcopy(cameras),
         "hierarchy": copy.deepcopy(hierarchy),
         "asset_guids": dict(asset_guids),
+        "ui_layout": list(
+            getattr(_load_scenes_lights_cameras, "ui_layout", None) or []),
     }
     path = _scene_cache_path(outdir)
     tmp = path + ".tmp"
@@ -17033,6 +17990,9 @@ def _read_scene_cache(outdir, assets_fp):
     asset_guids = payload.get("asset_guids")
     if not isinstance(objects, list) or not isinstance(asset_guids, dict):
         return None
+    ul = payload.get("ui_layout") or []
+    if isinstance(ul, (list, tuple)) and len(ul) >= 2:
+        _load_scenes_lights_cameras.ui_layout = (int(ul[0]), int(ul[1]))
     return (
         objects,
         list(payload.get("lights") or []),
@@ -17314,6 +18274,15 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
     plan["screen_fullscreen"] = sfs
     plan["screen_fullscreen_native"] = snative
     plan["screen_maximized"] = smax
+    # CanvasScaler / viewSize letterbox units used by _bake_ui_images.
+    # Live RT recompute must use the same space (not a resized Screen).
+    ul = getattr(_load_scenes_lights_cameras, "ui_layout", None)
+    if ul and len(ul) >= 2:
+        ulw, ulh = int(ul[0]), int(ul[1])
+    else:
+        ulw, ulh = _ui_layout_screen(root, objects)
+    plan["ui_layout_width"] = max(1, int(ulw))
+    plan["ui_layout_height"] = max(1, int(ulh))
     _seed_camera_script_view(plan, objects)
     go_names, go_comps = _build_go_tables(plan)
     ui_gc = set()
@@ -17334,6 +18303,7 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
     plan["go_parents"] = _build_go_parents(plan)
     plan["go_siblings"] = _build_go_sibling_indices(plan["go_parents"])
     plan["ui_buttons"] = _build_ui_buttons(plan)
+    plan["live_rt"] = _build_rect_transforms(plan)
     rb2d, rb3d, go_rb2d, go_rb3d, rb2d_by_fid, rb3d_by_fid = (
         _build_rigidbody_tables(plan))
     plan["rigidbody2d"] = rb2d

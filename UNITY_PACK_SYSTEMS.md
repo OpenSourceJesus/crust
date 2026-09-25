@@ -267,7 +267,17 @@ instead of stretching to fill (Unity `PreserveSpriteAspectRatio`); the fitted
 quad is offset by RectTransform.pivot (top-left pivot stays flush with the
 rect corner — not mid-letterboxed). Raycast rect stays full size. RectTransform `localScale` on an object and its ancestors
 accumulates into baked UI screen rects (e.g. a VerticalLayoutGroup scaled
-to 0.59 shrinks children and TMP like Unity Canvas space). Authored
+to 0.59 shrinks children and TMP like Unity Canvas space).
+`_apply_layout_groups` seeds live RectTransform tables (`anchoredPosition` /
+`sizeDelta` / anchors / pivot / scale xy); `engine_collect_draws` and
+`engine_ui_tick` recompute norms via `_engine_ui_screen_rect` in pack-time
+canvas units (`_engine_ui_layout_w/h` from CanvasScaler + viewSize letterbox,
+not a resized `Screen`). Authored C# may get/set
+`rectTransform.anchoredPosition`, `sizeDelta`, and UI `localScale` (xy).
+Layout-only Canvas / Rect parents are snapshotted onto `scene_hierarchy`
+before scaffold drop so the live GO parent chain keeps rect state.
+`Canvas.ForceUpdateCanvases` remains a no-op (no runtime VLG/HLG rebuild).
+Authored
 `TextMeshProUGUI` draws when `m_fontAsset` resolves (Assets or Packages /
 PackageCache): SDF atlas + glyph tables bake `m_text` into a UI sprite
 tinted by `m_fontColor`. Button `m_OnClick` persistent `SetActive` calls
@@ -286,7 +296,7 @@ the first draw. Canvas sorting layer/order apply to child Images/Buttons;
 TMP sorts one order above its Canvas. EventSystem / GraphicRaycaster /
 legacy `UI.Text` / `GridLayoutGroup` are not imported.
 `AddComponent<Canvas>` / `typeof(Canvas)` / `ForceUpdateCanvases`
-remain refused (no invent); `using UnityEngine.UI` and Image fields are fine.
+remain refused invent / no-op (no invent); `using UnityEngine.UI` and Image fields are fine.
 
 The GLES hosts (`gles2_window.c` / `gles2_view.c`) accept up to 512 draws and
 512 textures by default (`MAX_DRAWS` / `MAX_TEX`) so large UI menus are not
@@ -387,6 +397,8 @@ known builtins (`SpriteRenderer`, RB, uGUI, …) only — unknown `T` → CS0246
 | `InputAction` / `Gamepad.current` | Needs Input System assets / runtime |
 | `UnityEngine.UI` using / Image·Button·Canvas fields | Allowed (authored wiring) |
 | `GetComponent<Canvas\|Image\|RectTransform\|…>` | Live `_engine_go_*` maps (RectTransform ≡ GO); seeded authored |
+| `rectTransform.anchoredPosition` / `sizeDelta` get/set | Live `_engine_rt_*` tables; draws/hits recompute |
+| `transform.localScale` / `rectTransform.localScale` (UI) | Live `_engine_rt_sx/sy`; UI screen rect uses scale |
 | `GetComponent<T>` for prefab/scene MBs | Live maps; prefab instances loaded when scene scripts reference `T` |
 | `AddComponent<Canvas>` / `typeof(Canvas)` | Refused invent — author `!u!223` in the scene |
 | `Canvas.ForceUpdateCanvases()` | No-op (layout is bake-time / host) |
