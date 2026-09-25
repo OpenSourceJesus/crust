@@ -177,8 +177,51 @@ and what is left open (`sum_to`'s `+` does overflow for large `n`, an
 unbounded accumulator can wrap, `min_int / -1` does) in
 `TestRecursionAndDivision`, with Lean agreeing on every settled one.
 
-Not lifted yet: data enums and the pointers into them, so list and tree
-code compiles and runs but is not proved; mutual recursion.
+**Data.** Each enum ocaml2rust writes is, in the model, an inductive type
+in the kernel -- `ml_list_int` is `Nil | Cons of Int * ml_list_int`, the
+`*mut` in its declaration read as the value it points to. That reading is
+sound under a heap discipline, which the lift *checks* before modelling any
+enum (`_heap_discipline`): every `*mut E` comes from `ml_box_E`, whose text
+must be exactly what ocaml2rust writes (allocate, write the argument once,
+return); nothing else in the source writes through an index; nothing frees.
+No cell is ever written after it is made, so `p[0]` is always what
+`ml_box_E` was given, and `ml_box_E(v)` is modelled as `v`. A source that
+breaks any of this -- a changed box, one stray `p[0] = ..`, a `free` -- has
+its enums refused, with the reason. The test and projection helpers are
+checked against their templates the same way, then defined in the kernel by
+cases; a projection owes that its argument has the variant it projects from
+(its `panic!` otherwise), and the `panic!` that ends an exhaustive `match`
+owes `False` -- provable exactly where the tests before it cover every
+variant.
+
+`[@@variant l]` on a value of a variant type is its size, the number of
+constructors in it, so recursion down a list or a tree needs no measure
+written out: `size t < size (x :: t)` is computation. The tactic splits a
+value of an enum type on its constructors (a recursive field is not split
+again) and reduces any recursor on a constructor. `t <> Leaf` against a
+constant constructor is its test, in code and in a contract.
+`examples/ocaml/run/{lists,trees}.ml`: `length`, `sum`, a tree's `size`,
+`mirror`, `all_pos` and `insert` (`result <> Leaf`), everything proved but
+the additions a long enough list or big enough tree would overflow; Lean
+agrees on every one.
+
+**Mutual recursion.** Types declared `type a = .. and b = ..` that refer
+to each other are one *mutual* inductive group in the kernel
+(`lean4.mutual_inductive`, exported to Lean as a `mutual .. end` block):
+each recursor takes a motive per type and a case per constructor of the
+group, an induction hypothesis at the motive of each field's own type --
+Lean's own shape, which Lean confirms on every exported theorem. Sizes
+count across the group, so they compare between its types. Functions
+defined `let rec f .. and g ..` are proved as one induction: a call from
+`f` to `g` owes `g`'s `requires` and `g`'s variant non-negative and below
+`f`'s, and assumes `g`'s contract -- so `count_e`'s `result >= 1` rests on
+`count_s`'s contract, each proved from the other's for smaller values.
+`examples/ocaml/run/mutual.ml`: `expr`/`stmt` with `count_e`/`count_s`, and
+`even`/`odd`, everything proved but the additions that can overflow.
+
+Not lifted yet: equality on structured values beyond a constant
+constructor; polymorphic code except at its instances (which is what
+runs); closures.
 
 ### Fixes to the Rust front end this needed
 
