@@ -2086,10 +2086,24 @@ def _is_ui_image_mb(block, guid):
 
 
 def _is_ui_button_mb(block, guid):
+    """True for builtin Button or a Button subclass (e.g. UIButton).
+
+    Subclasses keep Selectable ColorBlock + Button.onClick in YAML; the
+    EditorClassIdentifier is often ``…UIButton``, which does not match
+    ``\\bButton`` (no word boundary inside the name).
+    """
     if (guid or "").lower() == _BUTTON_SCRIPT_GUID:
         return True
-    return bool(re.search(
-        r"(?m)^\s+m_EditorClassIdentifier:.*\bButton\s*$", block))
+    # UnityEngine.UI.Button (exact type name at end of identifier).
+    if re.search(
+            r"(?m)^\s+m_EditorClassIdentifier:.*(?:^|[.\s:])Button\s*$",
+            block):
+        return True
+    # Button / Button-subclass serialization shape (not Toggle/Slider).
+    if (re.search(r"(?m)^\s+m_Colors:\s*$", block)
+            and re.search(r"(?m)^\s+m_OnClick:\s*$", block)):
+        return True
+    return False
 
 
 def _is_ui_tmp_mb(block, guid):
@@ -2285,7 +2299,7 @@ def _parse_ui_tmp(block, asset_guids):
     }
 
 
-def _parse_ui_button(block):
+def _parse_ui_button(block, file_id=None):
     """Authored uGUI Button → interactable, ColorBlock, persistent onClick."""
     en = re.search(r"(?m)^\s+m_Interactable:\s*(\d+)", block)
     mb_en = _mb_enabled(block)
@@ -2345,6 +2359,8 @@ def _parse_ui_button(block):
         "interactable": interactable,
         "colors": colors,
         "onclick": calls,
+        # PrefabInstance m_OnClick mods target this MB fileID.
+        "mb_file_id": file_id,
     }
 
 
@@ -3983,7 +3999,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                         float(ppum.group(1)) if ppum else 1.0),
                 }
             elif _is_ui_button_mb(block, g):
-                rec["ui_button"] = _parse_ui_button(block)
+                rec["ui_button"] = _parse_ui_button(block, file_id)
             elif _is_ui_tmp_mb(block, g):
                 rec["ui_tmp"] = _parse_ui_tmp(block, asset_guids)
             elif _is_vlayout_mb(block, g):
