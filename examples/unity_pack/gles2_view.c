@@ -36,6 +36,11 @@ float Camera_main_farClipPlane __attribute__((weak)) = 1000.f;
 float Camera_main_background_r __attribute__((weak)) = 0.f;
 float Camera_main_background_g __attribute__((weak)) = 0.f;
 float Camera_main_background_b __attribute__((weak)) = 0.f;
+float Camera_main_aspect __attribute__((weak)) = 0.f; /* 0 → framebuffer */
+float Camera_main_rect_x __attribute__((weak)) = 0.f;
+float Camera_main_rect_y __attribute__((weak)) = 0.f;
+float Camera_main_rect_w __attribute__((weak)) = 1.f;
+float Camera_main_rect_h __attribute__((weak)) = 1.f;
 
 #define WIDTH  96
 #define HEIGHT 64
@@ -290,6 +295,8 @@ static int draw_scene(GLuint prog)
     EngineDraw draws[MAX_DRAWS];
     int ndraw;
     int i;
+    int vx, vy, vw, vh;
+    float aspect;
     GLuint vbo;
     GLsizei stride = (GLsizei)(VERT_STRIDE * sizeof(GLfloat));
 
@@ -301,11 +308,25 @@ static int draw_scene(GLuint prog)
     printf("draws=%d classes=%d textures=%d\n",
            ndraw, engine_class_count(), engine_texture_count());
 
-    refresh_camera_bounds((float)WIDTH / (float)HEIGHT);
+    aspect = Camera_main_aspect;
+    if (aspect < 1e-6f)
+        aspect = (float)WIDTH / (float)HEIGHT;
+    refresh_camera_bounds(aspect);
     glGenBuffers(1, &vbo);
     glBindBuffer(GL_ARRAY_BUFFER, vbo);
 
+    vx = (int)(Camera_main_rect_x * (float)WIDTH + 0.5f);
+    vy = (int)(Camera_main_rect_y * (float)HEIGHT + 0.5f);
+    vw = (int)(Camera_main_rect_w * (float)WIDTH + 0.5f);
+    vh = (int)(Camera_main_rect_h * (float)HEIGHT + 0.5f);
+    if (vw < 1)
+        vw = 1;
+    if (vh < 1)
+        vh = 1;
     glViewport(0, 0, WIDTH, HEIGHT);
+    glClearColor(0.f, 0.f, 0.f, 1.f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glViewport(vx, vy, vw, vh);
     glClearColor(Camera_main_background_r, Camera_main_background_g,
                  Camera_main_background_b, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);

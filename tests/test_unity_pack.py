@@ -20,6 +20,7 @@ import re
 import contextlib
 import io
 import math
+import re
 import shutil
 import subprocess
 import sys
@@ -60,6 +61,563 @@ class TestSceneImport(unittest.TestCase):
         self.assertEqual(objs[0]["pos"][0], 3.0)
 
 
+class TestBuildSettingsAndActive(unittest.TestCase):
+    """EditorBuildSettings first-enabled scene + authored m_IsActive."""
+
+    def _write_scene(self, root, rel, go_name, active=1, guid=None):
+        scenes = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scenes, exist_ok=True)
+        path = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(
+                "%%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: %s\n"
+                "  m_IsActive: %d\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 1, y: 2, z: 0}\n"
+                "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "  m_Father: {fileID: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1}\n"
+                % (go_name, active)
+            )
+        if guid:
+            with open(path + ".meta", "w") as f:
+                f.write("guid: %s\n" % guid)
+
+    def test_m_is_active_parsed(self):
+        text = (
+            "%YAML 1.1\n"
+            "--- !u!1 &1\nGameObject:\n  m_Name: Hidden\n"
+            "  m_IsActive: 0\n"
+            "  m_Component:\n  - component: {fileID: 2}\n"
+            "--- !u!4 &2\nTransform:\n"
+            "  m_GameObject: {fileID: 1}\n"
+            "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+            "  m_Father: {fileID: 0}\n"
+        )
+        objs, _l, _c, hier = unity_pack.parse_unity_yaml(text)
+        self.assertEqual(hier[0]["active"], 0)
+        # Hierarchy-only (no MB) — still records authored inactive.
+        self.assertTrue(any(int(h.get("active", 1)) == 0 for h in hier))
+
+    def test_editor_only_tag_skipped(self):
+        """GameObjects with EditorOnly tag (and children) are not packed."""
+        root = tempfile.mkdtemp(prefix="upack-editoronly-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        host_cs = os.path.join(scripts, "Host.cs")
+        with open(host_cs, "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Host : MonoBehaviour { void Update() {} }\n"
+            )
+        text = (
+            "%YAML 1.1\n"
+            "--- !u!1 &1\nGameObject:\n  m_Name: Keep\n"
+            "  m_TagString: Untagged\n"
+            "  m_IsActive: 1\n"
+            "  m_Component:\n  - component: {fileID: 2}\n"
+            "  - component: {fileID: 3}\n"
+            "--- !u!4 &2\nTransform:\n"
+            "  m_GameObject: {fileID: 1}\n"
+            "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+            "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+            "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+            "  m_Children:\n  - {fileID: 12}\n"
+            "  m_Father: {fileID: 0}\n"
+            "--- !u!114 &3\nMonoBehaviour:\n"
+            "  m_GameObject: {fileID: 1}\n"
+            "  m_Script: {fileID: 11500000, "
+            "guid: a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1, type: 3}\n"
+            "--- !u!1 &10\nGameObject:\n  m_Name: EditorRoot\n"
+            "  m_TagString: EditorOnly\n"
+            "  m_IsActive: 1\n"
+            "  m_Component:\n  - component: {fileID: 12}\n"
+            "  - component: {fileID: 13}\n"
+            "--- !u!4 &12\nTransform:\n"
+            "  m_GameObject: {fileID: 10}\n"
+            "  m_LocalPosition: {x: 1, y: 0, z: 0}\n"
+            "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+            "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+            "  m_Children:\n  - {fileID: 22}\n"
+            "  m_Father: {fileID: 2}\n"
+            "--- !u!114 &13\nMonoBehaviour:\n"
+            "  m_GameObject: {fileID: 10}\n"
+            "  m_Script: {fileID: 11500000, "
+            "guid: a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1, type: 3}\n"
+            "--- !u!1 &20\nGameObject:\n  m_Name: EditorChild\n"
+            "  m_TagString: Untagged\n"
+            "  m_IsActive: 1\n"
+            "  m_Component:\n  - component: {fileID: 22}\n"
+            "  - component: {fileID: 23}\n"
+            "--- !u!4 &22\nTransform:\n"
+            "  m_GameObject: {fileID: 20}\n"
+            "  m_LocalPosition: {x: 2, y: 0, z: 0}\n"
+            "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+            "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+            "  m_Father: {fileID: 12}\n"
+            "--- !u!114 &23\nMonoBehaviour:\n"
+            "  m_GameObject: {fileID: 20}\n"
+            "  m_Script: {fileID: 11500000, "
+            "guid: a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1, type: 3}\n"
+        )
+        guids = {"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1": host_cs}
+        objs, _l, _c, hier = unity_pack.parse_unity_yaml(
+            text, guid_to_script=guids)
+        names = sorted(o["name"] for o in objs)
+        self.assertEqual(names, ["Keep"])
+        hier_names = sorted(h["name"] for h in hier)
+        self.assertEqual(hier_names, ["Keep"])
+        self.assertNotIn("EditorRoot", hier_names)
+        self.assertNotIn("EditorChild", hier_names)
+
+    def test_only_first_enabled_build_scene_packed(self):
+        root = tempfile.mkdtemp(prefix="upack-build-scenes-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        ps = os.path.join(root, "ProjectSettings")
+        os.makedirs(scripts)
+        os.makedirs(ps)
+        with open(os.path.join(scripts, "Host.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Host : MonoBehaviour {\n"
+                "    void Update() { transform.position = "
+                "transform.position; }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Host.cs.meta"), "w") as f:
+            f.write("guid: a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\n")
+        self._write_scene(
+            root, "Assets/Scenes/Boot.unity", "BootGO", active=1,
+            guid="11111111111111111111111111111111")
+        self._write_scene(
+            root, "Assets/Scenes/Level.unity", "LevelGO", active=1,
+            guid="22222222222222222222222222222222")
+        self._write_scene(
+            root, "Assets/Demo/Extra.unity", "ExtraGO", active=1,
+            guid="33333333333333333333333333333333")
+        with open(os.path.join(ps, "EditorBuildSettings.asset"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1045 &1\nEditorBuildSettings:\n"
+                "  m_Scenes:\n"
+                "  - enabled: 1\n"
+                "    path: Assets/Scenes/Boot.unity\n"
+                "    guid: 11111111111111111111111111111111\n"
+                "  - enabled: 1\n"
+                "    path: Assets/Scenes/Level.unity\n"
+                "    guid: 22222222222222222222222222222222\n"
+                "  - enabled: 0\n"
+                "    path: Assets/Demo/Extra.unity\n"
+                "    guid: 33333333333333333333333333333333\n"
+            )
+        paths = unity_pack._unity_scenes_to_pack(root)
+        self.assertEqual(len(paths), 1)
+        self.assertTrue(paths[0].endswith("Boot.unity"))
+        objs, _a, _l, _c, hier = unity_pack.load_project(root)
+        names = {o["name"] for o in objs} | {h["name"] for h in hier}
+        self.assertIn("BootGO", names)
+        self.assertNotIn("LevelGO", names)
+        self.assertNotIn("ExtraGO", names)
+
+    def test_go_active_seeded_in_engine(self):
+        root = tempfile.mkdtemp(prefix="upack-active-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        ps = os.path.join(root, "ProjectSettings")
+        os.makedirs(scripts)
+        os.makedirs(ps)
+        with open(os.path.join(scripts, "Host.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Host : MonoBehaviour {\n"
+                "    void Update() { gameObject.SetActive(true); }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Host.cs.meta"), "w") as f:
+            f.write("guid: a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\n")
+        self._write_scene(
+            root, "Assets/Scenes/S.unity", "HiddenHost", active=0,
+            guid="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        with open(os.path.join(ps, "EditorBuildSettings.asset"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1045 &1\nEditorBuildSettings:\n"
+                "  m_Scenes:\n"
+                "  - enabled: 1\n"
+                "    path: Assets/Scenes/S.unity\n"
+                "    guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-active-out-")
+        plan = unity_pack.pack(root, d)
+        self.assertIn(0, plan.get("go_active") or [])
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("_engine_go_active_authored", eng)
+        self.assertRegex(eng, r"_engine_go_active_authored\[\d+\] = \{[^}]*0")
+
+    def test_duplicate_ui_names_keep_inactive_parent(self):
+        """Settings Menu children stay inactiveInHierarchy when Player UI
+        reuses the same display names (Text / Sliding Area / …)."""
+        text = (
+            "%YAML 1.1\n"
+            "--- !u!1 &10\nGameObject:\n  m_Name: Settings Menu\n"
+            "  m_IsActive: 0\n"
+            "  m_Component:\n  - component: {fileID: 11}\n"
+            "--- !u!224 &11\nRectTransform:\n"
+            "  m_GameObject: {fileID: 10}\n"
+            "  m_Father: {fileID: 0}\n"
+            "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+            "--- !u!1 &20\nGameObject:\n  m_Name: Text\n"
+            "  m_IsActive: 1\n"
+            "  m_Component:\n  - component: {fileID: 21}\n"
+            "--- !u!224 &21\nRectTransform:\n"
+            "  m_GameObject: {fileID: 20}\n"
+            "  m_Father: {fileID: 11}\n"
+            "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+            "--- !u!1 &30\nGameObject:\n  m_Name: Player\n"
+            "  m_IsActive: 0\n"
+            "  m_Component:\n  - component: {fileID: 31}\n"
+            "--- !u!4 &31\nTransform:\n"
+            "  m_GameObject: {fileID: 30}\n"
+            "  m_Father: {fileID: 0}\n"
+            "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+            "--- !u!1 &40\nGameObject:\n  m_Name: Text\n"
+            "  m_IsActive: 1\n"
+            "  m_Component:\n  - component: {fileID: 41}\n"
+            "--- !u!4 &41\nTransform:\n"
+            "  m_GameObject: {fileID: 40}\n"
+            "  m_Father: {fileID: 31}\n"
+            "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+        )
+        _objs, _l, _c, hier = unity_pack.parse_unity_yaml(text)
+        plan = {
+            "classes": {"Obj": {"instances": [], "n": 0}},
+            "scene_hierarchy": hier,
+        }
+        names, _comps = unity_pack._build_go_tables(plan)
+        plan["go_names"] = names
+        act = unity_pack._build_go_active(plan, names)
+        parents = unity_pack._build_go_parents(plan)
+        self.assertEqual(names.count("Text"), 2)
+        self.assertEqual(names.count("Settings Menu"), 1)
+        self.assertEqual(names.count("Player"), 1)
+        sm = names.index("Settings Menu")
+        pl = names.index("Player")
+        texts = [i for i, n in enumerate(names) if n == "Text"]
+        self.assertEqual(act[sm], 0)
+        self.assertEqual(act[pl], 0)
+        self.assertEqual(sorted(parents[t] for t in texts), sorted([sm, pl]))
+        self.assertEqual(parents.count(sm), 1)
+        self.assertEqual(parents.count(pl), 1)
+
+        def aih(g):
+            guard = 0
+            while g >= 0 and g < len(act) and guard < len(act) + 2:
+                if not act[g]:
+                    return 0
+                g = parents[g]
+                guard += 1
+            return 1
+
+        for t in texts:
+            self.assertEqual(aih(t), 0)
+
+    def test_go_active_pads_spawn_budget(self):
+        """Authored inactive GOs survive when go_n > len(go_active) (spawn)."""
+        root = tempfile.mkdtemp(prefix="upack-active-pad-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        ps = os.path.join(root, "ProjectSettings")
+        os.makedirs(scripts)
+        os.makedirs(ps)
+        with open(os.path.join(scripts, "Host.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "using UnityEngine.UI;\n"
+                "public class Host : MonoBehaviour {\n"
+                "    public GameObject menu;\n"
+                "    void Update() {\n"
+                "        if (menu != null) menu.SetActive(false);\n"
+                "        GameObject.Instantiate(menu);\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Host.cs.meta"), "w") as f:
+            f.write("guid: a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\n")
+        # Minimal scene: inactive Menu + Host (UI so active tables emit).
+        scenes = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scenes)
+        with open(os.path.join(scenes, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Host\n"
+                "  m_IsActive: 1\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1}\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Menu\n"
+                "  m_IsActive: 0\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "--- !u!224 &11\nRectTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+            )
+        with open(os.path.join(scenes, "S.unity.meta"), "w") as f:
+            f.write("guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n")
+        with open(os.path.join(ps, "EditorBuildSettings.asset"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1045 &1\nEditorBuildSettings:\n"
+                "  m_Scenes:\n"
+                "  - enabled: 1\n"
+                "    path: Assets/Scenes/S.unity\n"
+                "    guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-active-pad-out-")
+        plan = unity_pack.pack(root, d)
+        names = plan.get("go_names") or []
+        act = plan.get("go_active") or []
+        self.assertIn("Menu", names)
+        mi = names.index("Menu")
+        self.assertEqual(act[mi], 0)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        m = re.search(
+            r"_engine_go_active_authored\[(\d+)\] = \{([^}]+)\}", eng)
+        self.assertIsNotNone(m)
+        eact = [int(x.strip()) for x in m.group(2).split(",") if x.strip()]
+        self.assertGreaterEqual(len(eact), len(names))
+        self.assertEqual(eact[mi], 0)
+
+    def test_image_preserve_aspect_fits_inside_rect(self):
+        """Simple Image + preserveAspect letterboxes; hit rect stays full."""
+        # 200×100 sprite (2:1) in a 200×200 rect → draw 200×100.
+        dw, dh = unity_pack._ui_preserve_aspect_draw_size(200, 200, 200, 100)
+        self.assertAlmostEqual(dw, 200.0)
+        self.assertAlmostEqual(dh, 100.0)
+        # 100×100 sprite in a 200×100 rect → draw 100×100 (pillarbox).
+        dw, dh = unity_pack._ui_preserve_aspect_draw_size(200, 100, 100, 100)
+        self.assertAlmostEqual(dw, 100.0)
+        self.assertAlmostEqual(dh, 100.0)
+        # Main Menu: 3000×1500 (2:1) in 1920×1080 (16:9) → 1920×960.
+        dw, dh = unity_pack._ui_preserve_aspect_draw_size(
+            1920, 1080, 3000, 1500)
+        self.assertAlmostEqual(dw, 1920.0)
+        self.assertAlmostEqual(dh, 960.0)
+        text = (
+            "%YAML 1.1\n"
+            "--- !u!1 &1\nGameObject:\n  m_Name: Banner\n"
+            "  m_IsActive: 1\n"
+            "  m_Component:\n  - component: {fileID: 2}\n"
+            "  - component: {fileID: 4}\n"
+            "--- !u!224 &2\nRectTransform:\n"
+            "  m_GameObject: {fileID: 1}\n"
+            "  m_Father: {fileID: 0}\n"
+            "  m_AnchorMin: {x: 0, y: 0}\n"
+            "  m_AnchorMax: {x: 1, y: 1}\n"
+            "  m_SizeDelta: {x: 0, y: 0}\n"
+            "  m_Pivot: {x: 0.5, y: 0.5}\n"
+            "--- !u!114 &4\nMonoBehaviour:\n"
+            "  m_GameObject: {fileID: 1}\n"
+            "  m_Enabled: 1\n"
+            "  m_Script: {fileID: 11500000, "
+            "guid: fe87c0e1cc204ed48ad3b37840f39efc, type: 3}\n"
+            "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+            "  m_Sprite: {fileID: 21300000, "
+            "guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, type: 3}\n"
+            "  m_Type: 0\n"
+            "  m_PreserveAspect: 1\n"
+        )
+        objs, _l, _c, _h = unity_pack.parse_unity_yaml(
+            text, asset_guids={"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": "x.png"})
+        found = next(
+            (o for o in objs
+             if o.get("name") == "Banner" and o.get("ui_image")),
+            None)
+        self.assertIsNotNone(found)
+        self.assertEqual(int(found["ui_image"].get("preserve_aspect") or 0), 1)
+
+    def test_ui_canvas_sort_walks_stripped_prefab_parent(self):
+        """Labels under PrefabInstance roots inherit Canvas sorting_layer_id."""
+        text = (
+            "%YAML 1.1\n"
+            "--- !u!1 &1\nGameObject:\n  m_Name: Canvas\n"
+            "  m_IsActive: 1\n"
+            "  m_Component:\n  - component: {fileID: 2}\n"
+            "  - component: {fileID: 3}\n"
+            "--- !u!224 &2\nRectTransform:\n"
+            "  m_GameObject: {fileID: 1}\n"
+            "  m_Father: {fileID: 0}\n"
+            "--- !u!223 &3\nCanvas:\n"
+            "  m_GameObject: {fileID: 1}\n"
+            "  m_Enabled: 1\n"
+            "  m_RenderMode: 1\n"
+            "  m_SortingLayerID: 42\n"
+            "  m_SortingOrder: 0\n"
+            "--- !u!1001 &50\nPrefabInstance:\n"
+            "  m_Modification:\n"
+            "    m_TransformParent: {fileID: 2}\n"
+            "    m_Modifications:\n"
+            "    - target: {fileID: 99, guid: abcd, type: 3}\n"
+            "      propertyPath: m_Name\n"
+            "      value: Play Button\n"
+            "      objectReference: {fileID: 0}\n"
+            "    - target: {fileID: 88, guid: abcd, type: 3}\n"
+            "      propertyPath: m_Sprite\n"
+            "      value: \n"
+            "      objectReference: {fileID: 21300000, "
+            "guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, type: 3}\n"
+            "    - target: {fileID: 99, guid: abcd, type: 3}\n"
+            "      propertyPath: m_SizeDelta.x\n"
+            "      value: 100\n"
+            "      objectReference: {fileID: 0}\n"
+            "    - target: {fileID: 99, guid: abcd, type: 3}\n"
+            "      propertyPath: m_SizeDelta.y\n"
+            "      value: 40\n"
+            "      objectReference: {fileID: 0}\n"
+            "--- !u!224 &51 stripped\nRectTransform:\n"
+            "  m_CorrespondingSourceObject: {fileID: 1, guid: abcd, type: 3}\n"
+            "  m_PrefabInstance: {fileID: 50}\n"
+            "--- !u!1 &60\nGameObject:\n  m_Name: Label\n"
+            "  m_IsActive: 1\n"
+            "  m_Component:\n  - component: {fileID: 61}\n"
+            "  - component: {fileID: 62}\n"
+            "--- !u!224 &61\nRectTransform:\n"
+            "  m_GameObject: {fileID: 60}\n"
+            "  m_Father: {fileID: 51}\n"
+            "  m_AnchorMin: {x: 0, y: 0}\n"
+            "  m_AnchorMax: {x: 1, y: 1}\n"
+            "  m_SizeDelta: {x: 0, y: 0}\n"
+            "--- !u!114 &62\nMonoBehaviour:\n"
+            "  m_GameObject: {fileID: 60}\n"
+            "  m_Enabled: 1\n"
+            "  m_Script: {fileID: 11500000, "
+            "guid: fe87c0e1cc204ed48ad3b37840f39efc, type: 3}\n"
+            "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+            "  m_Sprite: {fileID: 21300000, "
+            "guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, type: 3}\n"
+            "  m_Type: 0\n"
+        )
+        guid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        # Minimal 2×2 PNG bytes via bake path — use temp file.
+        d = tempfile.mkdtemp(prefix="upack-ui-sort-")
+        png = os.path.join(d, "s.png")
+        # 1×1 red PNG
+        import struct, zlib
+        def chunk(tag, data):
+            return (struct.pack(">I", len(data)) + tag + data
+                    + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff))
+        raw = b"\x00\x00\x00" + b"\xff\x00\x00"  # filter+RGB
+        with open(png, "wb") as f:
+            f.write(
+                b"\x89PNG\r\n\x1a\n"
+                + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(raw))
+                + chunk(b"IEND", b""))
+        objs, _l, cams, hier = unity_pack.parse_unity_yaml(
+            text, asset_guids={guid: png})
+        # Canvas camera stub for bake.
+        cams = [{"main": True, "pos": (0, 0, -10), "orthographic_size": 5.0}]
+        unity_pack._bake_ui_images(
+            objs, cams, 200, 100, asset_guids={guid: png}, hierarchy=hier)
+        label = next(o for o in objs if o.get("name") == "Label")
+        btn = next((o for o in objs if o.get("name") == "Play Button"), None)
+        self.assertIsNotNone(btn)
+        self.assertIsNotNone(label.get("sprite"))
+        self.assertEqual(
+            int(label["sprite"].get("sorting_layer_id") or 0), 42)
+        self.assertEqual(
+            int(btn["sprite"].get("sorting_layer_id") or 0), 42)
+
+    def test_stripped_prefab_father_hides_inactive_branch(self):
+        """Children of stripped PrefabInstance xfs respect inactive parents."""
+        text = (
+            "%YAML 1.1\n"
+            "--- !u!1 &1\nGameObject:\n  m_Name: Menu\n"
+            "  m_IsActive: 1\n"
+            "  m_Component:\n  - component: {fileID: 2}\n"
+            "--- !u!224 &2\nRectTransform:\n"
+            "  m_GameObject: {fileID: 1}\n"
+            "  m_Father: {fileID: 0}\n"
+            "  m_Children:\n  - {fileID: 11}\n"
+            "--- !u!1 &10\nGameObject:\n  m_Name: Layout\n"
+            "  m_IsActive: 0\n"
+            "  m_Component:\n  - component: {fileID: 11}\n"
+            "--- !u!224 &11\nRectTransform:\n"
+            "  m_GameObject: {fileID: 10}\n"
+            "  m_Father: {fileID: 2}\n"
+            "--- !u!1001 &50\nPrefabInstance:\n"
+            "  m_Modification:\n"
+            "    m_TransformParent: {fileID: 11}\n"
+            "    m_Modifications:\n"
+            "    - target: {fileID: 99, guid: abcd, type: 3}\n"
+            "      propertyPath: m_Name\n"
+            "      value: Play Button\n"
+            "      objectReference: {fileID: 0}\n"
+            "    - target: {fileID: 99, guid: abcd, type: 3}\n"
+            "      propertyPath: m_IsActive\n"
+            "      value: 1\n"
+            "      objectReference: {fileID: 0}\n"
+            "--- !u!224 &51 stripped\nRectTransform:\n"
+            "  m_CorrespondingSourceObject: {fileID: 1, guid: abcd, type: 3}\n"
+            "  m_PrefabInstance: {fileID: 50}\n"
+            "--- !u!1 &60\nGameObject:\n  m_Name: Play Button Text\n"
+            "  m_IsActive: 1\n"
+            "  m_Component:\n  - component: {fileID: 61}\n"
+            "--- !u!224 &61\nRectTransform:\n"
+            "  m_GameObject: {fileID: 60}\n"
+            "  m_Father: {fileID: 51}\n"
+        )
+        _objs, _l, _c, hier = unity_pack.parse_unity_yaml(text)
+        self.assertTrue(any(str(h.get("xf_id")) == "51" for h in hier))
+        plan = {
+            "classes": {"Obj": {"instances": [], "n": 0}},
+            "scene_hierarchy": hier,
+        }
+        names, _comps = unity_pack._build_go_tables(plan)
+        plan["go_names"] = names
+        act = unity_pack._build_go_active(plan, names)
+        parents = unity_pack._build_go_parents(plan)
+        ti = names.index("Play Button Text")
+        layout = names.index("Layout")
+        self.assertEqual(act[layout], 0)
+
+        def aih(g):
+            guard = 0
+            while g >= 0 and g < len(act) and guard < len(act) + 2:
+                if not act[g]:
+                    return 0
+                g = parents[g]
+                guard += 1
+            return 1
+
+        self.assertEqual(aih(ti), 0)
+        g = ti
+        seen = set()
+        while g >= 0 and g not in seen:
+            seen.add(g)
+            if g == layout:
+                break
+            g = parents[g]
+        else:
+            self.fail("Play Button Text parent chain misses Layout")
+
+
 class TestLayout(unittest.TestCase):
 
     def setUp(self):
@@ -90,6 +648,108 @@ class TestLayout(unittest.TestCase):
         kinds = {m[0]: m[3] for m in self.plan["classes"]["Player"]["members"]}
         self.assertEqual(kinds["pos_x"], "f32")
         self.assertEqual(kinds["speed"], "f32")
+
+
+class TestMethodOverloads(unittest.TestCase):
+    """C# overloads must lower to distinct C free-function symbols."""
+
+    def test_overload_method_c_symbols_are_unique(self):
+        self.assertEqual(
+            unity_pack._method_arg_type_suffix("SpawnedEntry spawnedEntry"),
+            "SpawnedEntry")
+        self.assertEqual(
+            unity_pack._method_arg_type_suffix(
+                "GameObject clone, Transform trs"),
+            "GameObject_Transform")
+        self.assertEqual(
+            unity_pack._method_c_symbol(
+                "ObjectPool", "RemoveSpawnedEntry",
+                "SpawnedEntry spawnedEntry", True),
+            "ObjectPool_RemoveSpawnedEntry_SpawnedEntry")
+        self.assertEqual(
+            unity_pack._method_c_symbol(
+                "ObjectPool", "RemoveSpawnedEntry",
+                "GameObject clone, Transform trs", True),
+            "ObjectPool_RemoveSpawnedEntry_GameObject_Transform")
+        self.assertEqual(
+            unity_pack._method_c_symbol("ObjectPool", "Awake", "", False),
+            "ObjectPool_Awake")
+        root = tempfile.mkdtemp(prefix="upack-overload-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Pool.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Pool : MonoBehaviour {\n"
+                "    public void RemoveSpawnedEntry(int a) {}\n"
+                "    public void RemoveSpawnedEntry("
+                "GameObject go, Transform trs) {}\n"
+                "    void Update() { RemoveSpawnedEntry(1); }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Pool.cs.meta"), "w") as f:
+            f.write("guid: ccccccccccccccccdddddddddddddddd\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Pool\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "  m_Father: {fileID: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: ccccccccccccccccdddddddddddddddd, type: 3}\n"
+            )
+        ps = os.path.join(root, "ProjectSettings")
+        os.makedirs(ps)
+        with open(os.path.join(ps, "EditorBuildSettings.asset"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1045 &1\nEditorBuildSettings:\n"
+                "  m_Scenes:\n"
+                "  - enabled: 1\n"
+                "    path: Assets/Scenes/S.unity\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-overload-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("Pool_RemoveSpawnedEntry_int", eng)
+        self.assertIn("Pool_RemoveSpawnedEntry_GameObject_Transform", eng)
+        self.assertEqual(eng.count("static void Pool_RemoveSpawnedEntry("), 0)
+
+    def test_nested_class_methods_not_on_outer(self):
+        """Nested DoUpdate must not be attributed to the outer MonoBehaviour."""
+        root = tempfile.mkdtemp(prefix="upack-nested-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        path = os.path.join(scripts, "Host.cs")
+        with open(path, "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Host : MonoBehaviour {\n"
+                "    public void DoUpdate() {}\n"
+                "    class Nested {\n"
+                "        public void DoUpdate() {}\n"
+                "    }\n"
+                "}\n"
+            )
+        a = unity_pack.analyze_script(path)
+        by = {c["name"]: c for c in a["classes"]}
+        self.assertIn("Host", by)
+        self.assertIn("Nested", by)
+        host_names = [m["name"] for m in by["Host"].get("methods") or []]
+        self.assertEqual(host_names.count("DoUpdate"), 1)
+        nest_names = [m["name"] for m in by["Nested"].get("methods") or []]
+        self.assertEqual(nest_names.count("DoUpdate"), 1)
 
 
 class TestEmit(unittest.TestCase):
@@ -2056,6 +2716,78 @@ class TestSystems(unittest.TestCase):
         self.assertNotIn("\n0\n", "\n" + run.stdout)
         self.assertNotIn("\n1\n", "\n" + run.stdout)
 
+    def test_bare_singleton_instance_assign_this(self):
+        """Awake `instance = this` → Class_instance = i (not undeclared `instance`)."""
+        root = tempfile.mkdtemp(prefix="upack-inst-assign-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Cam.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Cam : MonoBehaviour {\n"
+                "    public static Cam instance;\n"
+                "    public static Cam Instance {\n"
+                "        get {\n"
+                "            if (instance == null)\n"
+                "                instance = FindObjectOfType<Cam>(true);\n"
+                "            return instance;\n"
+                "        }\n"
+                "    }\n"
+                "    void Awake() {\n"
+                "        instance = this;\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Cam.cs.meta"), "w") as f:
+            f.write("guid: camcamcamcamcamcamcamcamcamcam01\n")
+        with open(os.path.join(scripts, "Host.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Host : MonoBehaviour {\n"
+                "    void Start() {\n"
+                "        Debug.Log(Cam.Instance);\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Host.cs.meta"), "w") as f:
+            f.write("guid: hosthosthosthosthosthosthosthost01\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Cam\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Host\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: camcamcamcamcamcamcamcamcamcam01}\n"
+                "--- !u!4 &11\nTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &12\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: hosthosthosthosthosthosthosthost01}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-inst-assign-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.cpp")) as f:
+            eng = f.read()
+        self.assertIn("Cam_instance = i;", eng)
+        self.assertNotRegex(eng, r"(?<![\w.])instance\s*=\s*i")
+        self.assertIn("static int Cam_Instance(void)", eng)
+        awake = eng.split("static void Cam_Awake(", 1)[1].split("\n}", 1)[0]
+        self.assertNotIn("not lowered yet", awake)
+        self.assertIn("Cam_instance = i", awake)
+
     def test_toggle_is_on_does_not_span_prior_index_expr(self):
         """equipped[i]; … toggles[x].isOn must not merge (DOTALL bug → CS0000)."""
         src = (
@@ -2244,6 +2976,75 @@ class TestSystems(unittest.TestCase):
         self.assertNotIn("GetComponentsInChildren<Part>", eng)
         self.assertNotIn("unlowered C#", eng)
         self.assertNotIn("Part[]", eng)
+
+    def test_getcomponent_type_with_zero_instances_packs(self):
+        """GetComponent<T> when T.cs exists but no authored instance → n=0 class.
+
+        Trimming unused prefabs must not CS0246 on GetComponent for a type that
+        is still referenced from a packed script.
+        """
+        root = tempfile.mkdtemp(prefix="upack-gc-zero-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Part.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Part : MonoBehaviour {\n"
+                "    public int hp;\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Part.cs.meta"), "w") as f:
+            f.write("guid: a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\n")
+        with open(os.path.join(scripts, "Host.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Host : MonoBehaviour {\n"
+                "    public Part part;\n"
+                "    void Update() {\n"
+                "        part = GetComponent<Part>();\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Host.cs.meta"), "w") as f:
+            f.write("guid: b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Host\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, guid: b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2, type: 3}\n"
+                "  part: {fileID: 0}\n"
+            )
+        ps = os.path.join(root, "ProjectSettings")
+        os.makedirs(ps)
+        with open(os.path.join(ps, "EditorBuildSettings.asset"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1045 &1\nEditorBuildSettings:\n"
+                "  m_Scenes:\n"
+                "  - enabled: 1\n"
+                "    path: Assets/Scenes/S.unity\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-gc-zero-out-")
+        plan = unity_pack.pack(root, d)
+        self.assertIn("Part", plan["classes"])
+        self.assertEqual(plan["classes"]["Part"]["n"], 0)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("GameObject_GetComponent_Part", eng)
+        self.assertIn("GetComponent_Part", eng)
+        self.assertNotIn("error CS0246", eng)
 
     def test_getcomponentsinchildren_base_type_finds_subclass(self):
         """GetComponentsInChildren<Weapon> collects Blaster : Weapon instances."""
@@ -5460,7 +6261,7 @@ class TestSystems(unittest.TestCase):
         # Seed array must include a 0 for the authored inactive GO.
         self.assertRegex(
             eng,
-            r"static const int _seed\[\d+\] = \{[^}]*0[^}]*\}")
+            r"_engine_go_active_authored\[\d+\] = \{[^}]*0[^}]*\}")
         # Must not force every slot to 1 (old bug).
         self.assertNotRegex(
             eng,
@@ -5980,6 +6781,105 @@ class TestSystems(unittest.TestCase):
         wy = [o["pos"][1] for o in kids]
         self.assertGreater(wy[0], wy[1])
         self.assertGreater(wy[1], wy[2])
+
+    def test_disabled_vertical_layout_group_skips_bake(self):
+        """m_Enabled:0 VerticalLayoutGroup leaves authored child positions."""
+        root = tempfile.mkdtemp(prefix="upack-vlg-off-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Host.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Host : MonoBehaviour { void Update() {} }\n"
+            )
+        with open(os.path.join(scripts, "Host.cs.meta"), "w") as f:
+            f.write("guid: vlghostvlghostvlghostvlghost02\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        img = "fe87c0e1cc204ed48ad3b37840f39efc"
+        vlg = "59f8146938fff824cb5fd77236b75775"
+        builtin = "0000000000000000f000000000000000"
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Canvas\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!224 &2\nRectTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 0, y: 0}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!223 &3\nCanvas:\n  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n  m_RenderMode: 0\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Panel\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "  - component: {fileID: 13}\n"
+                "--- !u!224 &11\nRectTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Father: {fileID: 2}\n"
+                "  m_AnchorMin: {x: 0.5, y: 0.5}\n"
+                "  m_AnchorMax: {x: 0.5, y: 0.5}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 200, y: 300}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!114 &12\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Enabled: 0\n"
+                "  m_Script: {fileID: 11500000, guid: " + vlg + "}\n"
+                "  m_Padding:\n    m_Left: 0\n    m_Right: 0\n"
+                "    m_Top: 0\n    m_Bottom: 0\n"
+                "  m_ChildAlignment: 0\n  m_Spacing: 10\n"
+                "  m_ChildForceExpandWidth: 1\n"
+                "  m_ChildForceExpandHeight: 0\n"
+                "  m_ChildControlWidth: 1\n"
+                "  m_ChildControlHeight: 0\n"
+                "  m_ChildScaleWidth: 0\n  m_ChildScaleHeight: 0\n"
+                "  m_ReverseArrangement: 0\n"
+                "--- !u!114 &13\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: vlghostvlghostvlghostvlghost02}\n"
+            )
+            for i, fid in enumerate((20, 30, 40)):
+                xf, img_id = fid + 1, fid + 2
+                f.write(
+                    "--- !u!1 &%d\nGameObject:\n  m_Name: B%d\n"
+                    "  m_Component:\n  - component: {fileID: %d}\n"
+                    "  - component: {fileID: %d}\n"
+                    "--- !u!224 &%d\nRectTransform:\n"
+                    "  m_GameObject: {fileID: %d}\n"
+                    "  m_Father: {fileID: 11}\n"
+                    "  m_AnchorMin: {x: 0.5, y: 0.5}\n"
+                    "  m_AnchorMax: {x: 0.5, y: 0.5}\n"
+                    "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                    "  m_SizeDelta: {x: 100, y: 40}\n"
+                    "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                    "--- !u!114 &%d\nMonoBehaviour:\n"
+                    "  m_GameObject: {fileID: %d}\n"
+                    "  m_Script: {fileID: 11500000, guid: %s}\n"
+                    "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+                    "  m_Enabled: 1\n  m_Type: 0\n"
+                    "  m_Sprite: {fileID: 10905, guid: %s, type: 0}\n"
+                    % (fid, i, xf, img_id, xf, fid, img_id, fid, img, builtin)
+                )
+        objs, _a, _l, _c, _h = unity_pack.load_project(root)
+        panel = [o for o in objs if o["name"] == "Panel"][0]
+        self.assertEqual(int(panel.get("layout_group", {}).get("enabled", 1)), 0)
+        kids = sorted(
+            [o for o in objs if o["name"].startswith("B")],
+            key=lambda o: o["name"])
+        self.assertEqual(len(kids), 3)
+        for o in kids:
+            self.assertAlmostEqual(o["rect"]["anchored_position"][0], 0.0,
+                                   places=3)
+            self.assertAlmostEqual(o["rect"]["anchored_position"][1], 0.0,
+                                   places=3)
+            self.assertAlmostEqual(o["rect"]["size_delta"][0], 100.0, places=3)
 
     def test_content_size_fitter_preferred_from_vlayout(self):
         """ContentSizeFitter PreferredSize height = VLG preferred (children+spacing)."""
@@ -6719,6 +7619,104 @@ class TestSystems(unittest.TestCase):
             f.write("using UnityEngine;\nclass Tool {}\n")
         self.assertTrue(unity_pack._is_player_csharp(root, helpers))
 
+    def test_scene_mscript_guids_limit_analyzed_scripts(self):
+        """Stripped UI scenes must not full-analyze every Assets .cs.
+
+        When GO join leaves script=None, scan m_Script / m_SourcePrefab so
+        vendor files (e.g. Destructible2D Stack) stay out of full analyze.
+        """
+        root = tempfile.mkdtemp(prefix="upack-mscript-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        vendor = os.path.join(root, "Assets", "Vendor")
+        scenes = os.path.join(root, "Assets", "Scenes")
+        prefabs = os.path.join(root, "Assets", "Prefabs")
+        ps = os.path.join(root, "ProjectSettings")
+        for d in (scripts, vendor, scenes, prefabs, ps):
+            os.makedirs(d)
+        with open(os.path.join(scripts, "Host.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Host : MonoBehaviour {\n"
+                "    void Update() {}\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Host.cs.meta"), "w") as f:
+            f.write("guid: a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\n")
+        with open(os.path.join(vendor, "UsesStack.cs"), "w") as f:
+            f.write(
+                "using System.Collections.Generic;\n"
+                "using UnityEngine;\n"
+                "public class UsesStack : MonoBehaviour {\n"
+                "    static Stack<int> pool = new Stack<int>();\n"
+                "    void Update() { pool.Push(1); }\n"
+                "}\n"
+            )
+        with open(os.path.join(vendor, "UsesStack.cs.meta"), "w") as f:
+            f.write("guid: c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3\n")
+        with open(os.path.join(prefabs, "Host.prefab"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Host\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n  m_GameObject: {fileID: 1}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1, type: 3}\n"
+            )
+        with open(os.path.join(prefabs, "Host.prefab.meta"), "w") as f:
+            f.write("guid: d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4\n")
+        # UI-only scene GO (no joined project script) + PrefabInstance source.
+        with open(os.path.join(scenes, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Sprite\n"
+                "  m_IsActive: 1\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "--- !u!4 &11\nTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!212 &12\nSpriteRenderer:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Enabled: 1\n"
+                "  m_Sprite: {fileID: 0}\n"
+                "--- !u!1001 &20\nPrefabInstance:\n"
+                "  m_SourcePrefab: {fileID: 100100000, "
+                "guid: d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4, type: 3}\n"
+                # Also an authored Host m_Script that does not join a packed GO.
+                "--- !u!114 &30\nMonoBehaviour:\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1, type: 3}\n"
+            )
+        with open(os.path.join(ps, "EditorBuildSettings.asset"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1045 &1\nEditorBuildSettings:\n"
+                "  m_Scenes:\n"
+                "  - enabled: 1\n"
+                "    path: Assets/Scenes/S.unity\n"
+                "    guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+            )
+        assets = unity_pack._asset_guid_map(root)
+        guids = unity_pack._guid_map(root, asset_guids=assets)
+        refs = unity_pack._scripts_referenced_in_startup_scenes(
+            root, assets, guids)
+        self.assertTrue(any(p.endswith("Host.cs") for p in refs))
+        self.assertFalse(any(p.endswith("UsesStack.cs") for p in refs))
+        # Objects with script=None (SpriteRenderer only) + YAML refs → Host only.
+        objects = [{
+            "name": "Sprite", "script": None, "class": "Sprite",
+            "fields": {}, "pos": (0, 0, 0), "rot": (0, 0, 0, 1),
+        }]
+        analyses = unity_pack._analyze_scripts_and_prefabs(
+            root, objects, assets)
+        names = {c["name"] for a in analyses for c in a.get("classes") or []}
+        self.assertIn("Host", names)
+        self.assertNotIn("UsesStack", names)
+
     @needs_systems
     def test_emits_opt_in_stubs_not_invented_components(self):
         d = tempfile.mkdtemp(prefix="upack-sys-")
@@ -7252,8 +8250,12 @@ class TestSystems(unittest.TestCase):
         d = tempfile.mkdtemp(prefix="upack-addcomp-")
         plan = unity_pack.pack(SYSTEMS, d)
         self.assertIn("SpriteRenderer", plan.get("addcomponent_types") or [])
-        self.assertIn("Graphics", plan.get("go_has_sprite") or [])
-        self.assertNotIn("Player", plan.get("go_has_sprite") or [])
+        names = plan.get("go_names") or []
+        has_sr = set(plan.get("go_has_sprite") or [])
+        self.assertIn("Graphics", names)
+        self.assertIn(names.index("Graphics"), has_sr)
+        if "Player" in names:
+            self.assertNotIn(names.index("Player"), has_sr)
         with open(os.path.join(d, "engine.c")) as f:
             eng = f.read()
         self.assertIn("GameObject_AddComponent_SpriteRenderer", eng)
@@ -7778,6 +8780,51 @@ class TestSystems(unittest.TestCase):
         self.assertIn("GameObject_GetComponent_RectTransform", eng)
         self.assertIn("static int _engine_go_Canvas[", eng)
         self.assertNotIn("static const int _engine_go_Canvas[", eng)
+
+    def test_getcomponent_transform_is_go_index(self):
+        """GetComponent<Transform>() ≡ GO handle (same as .transform)."""
+        root = tempfile.mkdtemp(prefix="upack-gc-trs-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Pool.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Pool : MonoBehaviour {\n"
+                "    public GameObject prefab;\n"
+                "    void Start() {\n"
+                "        GameObject clone = Instantiate(prefab);\n"
+                "        Transform trs = clone.GetComponent<Transform>();\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Pool.cs.meta"), "w") as f:
+            f.write("guid: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Pool\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("GameObject_GetComponent_Transform", eng)
+        self.assertRegex(
+            eng,
+            r"static int GameObject_GetComponent_Transform\(int go\) \{\s*"
+            r"if \(go < 0 \|\| go >= _engine_go_count\) return -1;\s*"
+            r"return go;")
 
     def test_getcomponent_prefab_mb_is_live(self):
         """GetComponent<T> for a prefab-authored MB uses a live GO map."""
@@ -8390,6 +9437,226 @@ class TestSystems(unittest.TestCase):
         self.assertEqual(plan2["screen_width"], 1024)
         self.assertEqual(plan2["screen_height"], 768)
         self.assertEqual(plan2.get("screen_fullscreen"), 0)
+
+    def test_camera_script_view_pixels_and_rect(self):
+        """CameraScript.HandleViewSize letterbox math for 2:1 view on 16:9."""
+        pw, ph = unity_pack._camera_script_view_pixels(1920, 1080, 29.01, 14.505)
+        self.assertEqual((pw, ph), (1920, 960))
+        rx, ry, rw, rh = unity_pack._camera_script_rect(
+            1920, 1080, 29.01, 14.505)
+        self.assertAlmostEqual(rw, 1.0, places=5)
+        self.assertAlmostEqual(rh, 960.0 / 1080.0, places=5)
+        self.assertAlmostEqual(rx, 0.0, places=5)
+        self.assertAlmostEqual(ry, (1.0 - rh) * 0.5, places=5)
+        # No viewSize → player screen size (Unity default when unset).
+        root = tempfile.mkdtemp(prefix="upack-noscr-")
+        self.assertEqual(
+            unity_pack._ui_layout_screen(root, []),
+            (1024, 768))
+
+    def test_seed_camera_script_view_emits_aspect_rect(self):
+        """Authored viewSize seeds Camera_main_aspect / rect_* in data.c."""
+        plan = {
+            "camera": {
+                "pos": (0.0, 0.0, -10.0),
+                "orthographic_size": 5.0,
+                "orthographic": 1,
+                "near_clip": 0.3,
+                "far_clip": 1000.0,
+                "bg_r": 0.1, "bg_g": 0.2, "bg_b": 0.3,
+            },
+            "screen_width": 1920,
+            "screen_height": 1080,
+            "classes": {},
+        }
+        objs = [{"fields": {"viewSize_x": 29.01, "viewSize_y": 14.505}}]
+        unity_pack._seed_camera_script_view(plan, objs)
+        self.assertAlmostEqual(plan["camera_aspect"], 2.0, places=5)
+        self.assertAlmostEqual(plan["camera"]["orthographic_size"], 7.2525,
+                               places=4)
+        self.assertAlmostEqual(plan["camera_rect"][2], 1.0, places=5)
+        self.assertAlmostEqual(plan["camera_rect"][3], 960.0 / 1080.0,
+                               places=5)
+        data = unity_pack.emit_data(plan, used_apis=set())
+        self.assertIn("float Camera_main_aspect = 2.0", data)
+        self.assertIn("float Camera_main_rect_w = 1.0", data)
+        self.assertIn("float Camera_main_orthographicSize = 7.2525", data)
+
+    def test_seed_camera_no_viewsize_full_rect(self):
+        """Without viewSize, aspect follows screen and rect fills it."""
+        plan = {
+            "camera": {
+                "pos": (0.0, 0.0, -10.0),
+                "orthographic_size": 5.0,
+                "orthographic": 1,
+                "near_clip": 0.3,
+                "far_clip": 1000.0,
+                "bg_r": 0.1, "bg_g": 0.2, "bg_b": 0.3,
+            },
+            "screen_width": 1920,
+            "screen_height": 1080,
+            "classes": {},
+        }
+        unity_pack._seed_camera_script_view(plan, [])
+        self.assertAlmostEqual(plan["camera_aspect"], 1920.0 / 1080.0, places=5)
+        self.assertEqual(plan["camera_rect"], (0.0, 0.0, 1.0, 1.0))
+        data = unity_pack.emit_data(plan, used_apis=set())
+        self.assertIn("Camera_main_aspect", data)
+        self.assertIn("Camera_main_rect_x = 0.0", data)
+
+    def test_canvas_scaler_scale_with_screen_size(self):
+        """Scale With Screen Size match-height + disabled scaler no-op."""
+        # match=1 (height): sf = 1080/960 = 1.125 → canvas 1707×960.
+        scaler = {
+            "enabled": 1,
+            "ui_scale_mode": 1,
+            "scale_factor": 1.0,
+            "ref_x": 1920.0,
+            "ref_y": 960.0,
+            "screen_match_mode": 0,
+            "match": 1.0,
+        }
+        sf = unity_pack._canvas_scaler_scale_factor(1920, 1080, scaler)
+        self.assertAlmostEqual(sf, 1080.0 / 960.0, places=5)
+        self.assertEqual(
+            unity_pack._canvas_scaler_layout_pixels(1920, 1080, scaler),
+            (1707, 960))
+        # Constant Pixel Size scaleFactor 2 → half canvas units.
+        cps = {
+            "enabled": 1, "ui_scale_mode": 0, "scale_factor": 2.0,
+            "ref_x": 800, "ref_y": 600, "screen_match_mode": 0, "match": 0,
+        }
+        self.assertEqual(
+            unity_pack._canvas_scaler_layout_pixels(1920, 1080, cps),
+            (960, 540))
+        # Disabled → identity.
+        off = dict(scaler)
+        off["enabled"] = 0
+        self.assertEqual(
+            unity_pack._canvas_scaler_layout_pixels(1920, 1080, off),
+            (1920, 1080))
+        root = tempfile.mkdtemp(prefix="upack-scaler-")
+        ps = os.path.join(root, "ProjectSettings")
+        os.makedirs(ps)
+        with open(os.path.join(ps, "ProjectSettings.asset"), "w") as f:
+            f.write(
+                "PlayerSettings:\n"
+                "  defaultScreenWidth: 1920\n"
+                "  defaultScreenHeight: 1080\n"
+            )
+        objs_on = [{
+            "canvas": {"enabled": 1, "render_mode": 0},
+            "canvas_scaler": scaler,
+            "fields": {},
+        }]
+        self.assertEqual(
+            unity_pack._ui_layout_screen(root, objs_on), (1707, 960))
+        objs_off = [{
+            "canvas": {"enabled": 1, "render_mode": 0},
+            "canvas_scaler": off,
+            "fields": {},
+        }]
+        self.assertEqual(
+            unity_pack._ui_layout_screen(root, objs_off), (1920, 1080))
+        # viewSize letterbox then scaler: 1920×960 pixels, match height → sf=1.
+        objs_view = [{
+            "canvas": {"enabled": 1, "render_mode": 1},
+            "canvas_scaler": scaler,
+            "fields": {"viewSize_x": 29.01, "viewSize_y": 14.505},
+        }]
+        self.assertEqual(
+            unity_pack._ui_layout_screen(root, objs_view), (1920, 960))
+
+    def test_canvas_scaler_parsed_from_scene(self):
+        """CanvasScaler YAML attaches to Canvas scaffold with m_Enabled."""
+        scaler_guid = "0cd44c1031e13a943bb63640046fad76"
+        text = (
+            "%YAML 1.1\n"
+            "--- !u!1 &1\nGameObject:\n  m_Name: Canvas\n"
+            "  m_Component:\n  - component: {fileID: 2}\n"
+            "  - component: {fileID: 3}\n"
+            "  - component: {fileID: 4}\n"
+            "--- !u!224 &2\nRectTransform:\n"
+            "  m_GameObject: {fileID: 1}\n"
+            "  m_Father: {fileID: 0}\n"
+            "  m_AnchorMin: {x: 0, y: 0}\n"
+            "  m_AnchorMax: {x: 1, y: 1}\n"
+            "  m_SizeDelta: {x: 0, y: 0}\n"
+            "  m_Pivot: {x: 0.5, y: 0.5}\n"
+            "--- !u!223 &3\nCanvas:\n  m_GameObject: {fileID: 1}\n"
+            "  m_Enabled: 1\n  m_RenderMode: 1\n"
+            "--- !u!114 &4\nMonoBehaviour:\n"
+            "  m_GameObject: {fileID: 1}\n"
+            "  m_Enabled: 0\n"
+            "  m_Script: {fileID: 11500000, guid: " + scaler_guid + "}\n"
+            "  m_UiScaleMode: 1\n"
+            "  m_ReferenceResolution: {x: 1920, y: 960}\n"
+            "  m_ScreenMatchMode: 0\n"
+            "  m_MatchWidthOrHeight: 1\n"
+            "  m_ScaleFactor: 1\n"
+        )
+        objs, _l, _c, _h = unity_pack.parse_unity_yaml(text)
+        canvas = next(o for o in objs if o.get("canvas"))
+        cs = canvas.get("canvas_scaler") or {}
+        self.assertEqual(int(cs.get("enabled", 1)), 0)
+        self.assertEqual(int(cs.get("ui_scale_mode") or 0), 1)
+        self.assertAlmostEqual(float(cs.get("ref_x") or 0), 1920.0)
+        self.assertAlmostEqual(float(cs.get("ref_y") or 0), 960.0)
+        self.assertAlmostEqual(float(cs.get("match") or 0), 1.0)
+
+    def test_disabled_image_not_baked(self):
+        """Image m_Enabled:0 skips sprite bake (Graphic off)."""
+        guid = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        d = tempfile.mkdtemp(prefix="upack-img-off-")
+        png = os.path.join(d, "s.png")
+        import struct, zlib
+        def chunk(tag, data):
+            return (struct.pack(">I", len(data)) + tag + data
+                    + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff))
+        raw = b"\x00\x00\x00" + b"\xff\x00\x00"
+        with open(png, "wb") as f:
+            f.write(
+                b"\x89PNG\r\n\x1a\n"
+                + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(raw))
+                + chunk(b"IEND", b""))
+        text = (
+            "%YAML 1.1\n"
+            "--- !u!1 &1\nGameObject:\n  m_Name: Canvas\n"
+            "  m_Component:\n  - component: {fileID: 2}\n"
+            "  - component: {fileID: 3}\n"
+            "--- !u!224 &2\nRectTransform:\n"
+            "  m_GameObject: {fileID: 1}\n"
+            "  m_Father: {fileID: 0}\n"
+            "--- !u!223 &3\nCanvas:\n  m_GameObject: {fileID: 1}\n"
+            "  m_Enabled: 1\n  m_RenderMode: 0\n"
+            "--- !u!1 &10\nGameObject:\n  m_Name: OffImg\n"
+            "  m_Component:\n  - component: {fileID: 11}\n"
+            "  - component: {fileID: 12}\n"
+            "--- !u!224 &11\nRectTransform:\n"
+            "  m_GameObject: {fileID: 10}\n"
+            "  m_Father: {fileID: 2}\n"
+            "  m_AnchorMin: {x: 0.5, y: 0.5}\n"
+            "  m_AnchorMax: {x: 0.5, y: 0.5}\n"
+            "  m_SizeDelta: {x: 50, y: 50}\n"
+            "  m_Pivot: {x: 0.5, y: 0.5}\n"
+            "--- !u!114 &12\nMonoBehaviour:\n"
+            "  m_GameObject: {fileID: 10}\n"
+            "  m_Enabled: 0\n"
+            "  m_Script: {fileID: 11500000, "
+            "guid: fe87c0e1cc204ed48ad3b37840f39efc, type: 3}\n"
+            "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+            "  m_Sprite: {fileID: 21300000, guid: " + guid + ", type: 3}\n"
+            "  m_Type: 0\n"
+        )
+        objs, _l, cams, hier = unity_pack.parse_unity_yaml(
+            text, asset_guids={guid: png})
+        cams = [{"main": True, "pos": (0, 0, -10), "orthographic_size": 5.0}]
+        unity_pack._bake_ui_images(
+            objs, cams, 200, 100, asset_guids={guid: png}, hierarchy=hier)
+        img = next(o for o in objs if o.get("name") == "OffImg")
+        self.assertEqual(int(img["ui_image"].get("enabled", 1)), 0)
+        self.assertIsNone(img.get("sprite"))
 
     def test_keyboard_fqn_without_using_ok(self):
         root = tempfile.mkdtemp(prefix="upack-kb-fqn-")
