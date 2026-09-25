@@ -2,8 +2,8 @@
 
 Decisions for the next SoA / upload work (issue-style notes from
 performance writeups and #34-class benches). Crust already ships
-`--soa` and `engine_upload_positions`; this file records *where we aim*
-so follow-ups stay scoped.
+SoA-by-default packs and `engine_upload_positions`; this file records
+*where we aim* so follow-ups stay scoped.
 
 ## Answers (locked for this slice)
 
@@ -11,7 +11,7 @@ so follow-ups stay scoped.
 |---|---|
 | Graphics API / shading language | **OpenGL ES 2.0+ / GLSL** — matches `examples/gles2` and the GLFW window host. Vulkan/SPIR-V and D3D/HLSL stay out until a second backend exists. |
 | In-view / frustum before upload? | **Raw bulk upload first.** CPU frustum gather is a later opt-in; the preferred long-term path is GPU-driven culling (upload all positions once, cull in a compute/FS path). |
-| AoS vs SoA toggle | **`unity_pack.py --soa`** (and `--soa-vec4`). Default remains compact AoS structs. |
+| AoS vs SoA toggle | **SoA default**; **`unity_pack.py --aos`** for compact AoS structs; **`--soa-vec4`** for `float[N][4]`. |
 
 Note on terminology: some engine posts swap “SoA” and “AoS”. In this
 repo **SoA** means separate contiguous `float` tables per field (good for
@@ -46,18 +46,18 @@ Not in this slice. Order of attack:
 
 `uint8_t` / `uint16_t` handles instead of pointers are already emitted when
 the instance set is closed. Rounding packed struct sizes up to a power of
-two (so `base + (i << k)` replaces `i * sizeof`) is a follow-up under
-`--soa`; bitfields make exact pow2 padding fiddly and must not break
+two (so `base + (i << k)` replaces `i * sizeof`) is a follow-up for SoA
+packs; bitfields make exact pow2 padding fiddly and must not break
 layout tests.
 
 ## Compiler / packer switch (concrete)
 
 ```
-# compact AoS (default) — gather on upload
-python3 tools/unity_pack.py MiniScene -o /tmp/aos
+# SoA float[N][2|3] — default; stream tables on upload
+python3 tools/unity_pack.py MiniScene -o /tmp/soa
 
-# SoA float[N][2|3] — stream tables on upload
-python3 tools/unity_pack.py MiniScene -o /tmp/soa --soa
+# compact AoS — gather on upload
+python3 tools/unity_pack.py MiniScene -o /tmp/aos --aos
 
 # SoA float[N][4] — GPU UBO / vec4 friendly; .w = instance id
 python3 tools/unity_pack.py MiniScene -o /tmp/soa4 --soa-vec4

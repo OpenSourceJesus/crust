@@ -2086,10 +2086,24 @@ def _is_ui_image_mb(block, guid):
 
 
 def _is_ui_button_mb(block, guid):
+    """True for builtin Button or a Button subclass (e.g. UIButton).
+
+    Subclasses keep Selectable ColorBlock + Button.onClick in YAML; the
+    EditorClassIdentifier is often ``…UIButton``, which does not match
+    ``\\bButton`` (no word boundary inside the name).
+    """
     if (guid or "").lower() == _BUTTON_SCRIPT_GUID:
         return True
-    return bool(re.search(
-        r"(?m)^\s+m_EditorClassIdentifier:.*\bButton\s*$", block))
+    # UnityEngine.UI.Button (exact type name at end of identifier).
+    if re.search(
+            r"(?m)^\s+m_EditorClassIdentifier:.*(?:^|[.\s:])Button\s*$",
+            block):
+        return True
+    # Button / Button-subclass serialization shape (not Toggle/Slider).
+    if (re.search(r"(?m)^\s+m_Colors:\s*$", block)
+            and re.search(r"(?m)^\s+m_OnClick:\s*$", block)):
+        return True
+    return False
 
 
 def _is_ui_tmp_mb(block, guid):
@@ -2285,7 +2299,7 @@ def _parse_ui_tmp(block, asset_guids):
     }
 
 
-def _parse_ui_button(block):
+def _parse_ui_button(block, file_id=None):
     """Authored uGUI Button → interactable, ColorBlock, persistent onClick."""
     en = re.search(r"(?m)^\s+m_Interactable:\s*(\d+)", block)
     mb_en = _mb_enabled(block)
@@ -2345,6 +2359,8 @@ def _parse_ui_button(block):
         "interactable": interactable,
         "colors": colors,
         "onclick": calls,
+        # PrefabInstance m_OnClick mods target this MB fileID.
+        "mb_file_id": file_id,
     }
 
 
@@ -3983,7 +3999,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                         float(ppum.group(1)) if ppum else 1.0),
                 }
             elif _is_ui_button_mb(block, g):
-                rec["ui_button"] = _parse_ui_button(block)
+                rec["ui_button"] = _parse_ui_button(block, file_id)
             elif _is_ui_tmp_mb(block, g):
                 rec["ui_tmp"] = _parse_ui_tmp(block, asset_guids)
             elif _is_vlayout_mb(block, g):
@@ -4708,7 +4724,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         if fid not in ("", "0", "None") and fid not in existing_xf:
             pending.add(fid)
     _materialize_prefab_instance_ui(
-        by_id, objects, asset_guids or {}, editor_only_xfs)
+        by_id, objects, asset_guids or {}, editor_only_xfs,
+        guid_to_script)
     # Stash clip assets on a sentinel for pack() — returned via lights? No.
     # Attach to a module-level isn't clean. Return clips via objects meta:
     # pack() reloads clips. Store on each player the clip snapshot.
@@ -4757,7 +4774,8 @@ def _prefab_mod_rect(raw):
 
 
 def _materialize_prefab_instance_ui(by_id, objects, asset_guids,
-                                    editor_only_xfs=None):
+                                    editor_only_xfs=None,
+                                    guid_to_script=None):
     """Create drawable Image objects for PrefabInstance roots with sprite mods.
 
     Scene UI buttons are often PrefabInstances (stripped root Transform +
@@ -4766,6 +4784,7 @@ def _materialize_prefab_instance_ui(by_id, objects, asset_guids,
     when the parent walk stops at the stripped root.
     """
     asset_guids = asset_guids or {}
+    guid_to_script = guid_to_script or {}
     editor_only_xfs = editor_only_xfs or set()
     have_xf = {str(o.get("xf_id")) for o in objects if o.get("xf_id")}
     # PrefabInstance id → root stripped Transform (father == PI TransformParent).
@@ -4835,6 +4854,33 @@ def _materialize_prefab_instance_ui(by_id, objects, asset_guids,
         preserve = int(presc.group(1)) if presc else 1
         itype = re.search(
             r"propertyPath:\s*m_Type\s*\n\s*value:\s*(\d+)", raw)
+        # Pull Button / UIButton + scene onClick overrides from source prefab.
+        ui_button = None
+        src_m = re.search(
+            r"m_SourcePrefab:\s*\{fileID:\s*\d+,\s*guid:\s*([0-9a-fA-F]+)",
+            raw)
+        if src_m:
+            pref_guid = src_m.group(1).lower()
+            pref_path = asset_guids.get(pref_guid)
+            if (pref_path and str(pref_path).lower().endswith(".prefab")
+                    and os.path.isfile(pref_path)):
+                try:
+                    pref_objs, _l, _c, _h = _parsed_prefab_objects(
+                        pref_path, guid_to_script, asset_guids)
+                    src = next(
+                        (o for o in pref_objs if o.get("ui_button")), None)
+                    if src is None:
+                        src = next(
+                            (o for o in pref_objs if o.get("rect")), None)
+                    if src and src.get("ui_button"):
+                        ui_button = dict(src["ui_button"])
+                        ui_button = _apply_ui_button_onclick_mods(
+                            ui_button, raw, ui_button.get("mb_file_id"))
+                except Exception:
+                    ui_button = None
+        # Stable go_id for PrefabInstance roots (scene often has no GO stub).
+        if go_id is None:
+            go_id = "prefabinst:%s:%s" % (pi_id, xf_id)
         objects.append({
             "name": name,
             "pos": pi.get("pos") or (0.0, 0.0, 0.0),
@@ -4864,7 +4910,7 @@ def _materialize_prefab_instance_ui(by_id, objects, asset_guids,
                 "pixels_per_unit_multiplier": 1.0,
                 "preserve_aspect": preserve,
             },
-            "ui_button": None,
+            "ui_button": ui_button,
             "ui_tmp": None,
             "layout_group": None,
             "layout_element": None,
@@ -4882,14 +4928,27 @@ def _materialize_prefab_instance_ui(by_id, objects, asset_guids,
 
 
 
+_prefab_parse_cache = {}
+
+
 def _parsed_prefab_objects(path, guid_to_script, asset_guids):
     """Parse a .prefab once (cached) into packed-style objects."""
     key = os.path.abspath(path)
     if key not in _prefab_parse_cache:
-        _prefab_parse_cache[key] = parse_unity_yaml(
-            _read(path), guid_to_script=guid_to_script,
-            asset_guids=asset_guids)
-    return _prefab_parse_cache[key]
+        # Placeholder blocks recursive re-entry while parsing this prefab.
+        _prefab_parse_cache[key] = None
+        try:
+            _prefab_parse_cache[key] = parse_unity_yaml(
+                _read(path), guid_to_script=guid_to_script,
+                asset_guids=asset_guids)
+        except Exception:
+            _prefab_parse_cache.pop(key, None)
+            raise
+    cached = _prefab_parse_cache[key]
+    if cached is None:
+        # Nested PrefabInstance of the same asset — return empty.
+        return [], [], [], []
+    return cached
 
 
 def _prefab_mod_values(inst_raw, src_file_id):
@@ -4965,6 +5024,70 @@ def _apply_ui_image_sprite_mod(ui_image, inst_raw, asset_guids):
     ui_image["sprite_file_id"] = int(spr_fid)
     ui_image["sprite_guid"] = sg
     return ui_image
+
+
+def _apply_ui_button_onclick_mods(ui_button, inst_raw, mb_file_id=None):
+    """Merge PrefabInstance m_OnClick overrides onto a parsed ui_button.
+
+    Prefab Button.onClick is often empty; scene instances add SetActive calls
+    via propertyPath mods targeting the Button / UIButton MB fileID.
+    """
+    if not ui_button:
+        return ui_button
+    ui_button = dict(ui_button)
+    mb_id = str(mb_file_id or ui_button.get("mb_file_id") or "")
+    if not inst_raw or not mb_id:
+        return ui_button
+    # path → (value string, objectReference fileID)
+    mods = {}
+    for m in re.finditer(
+            r"target:\s*\{fileID:\s*%s,[^}]*\}\s*\n"
+            r"\s*propertyPath:\s*(m_OnClick[^\n]+)\s*\n"
+            r"\s*value:\s*([^\n]*)\s*\n"
+            r"\s*objectReference:\s*\{fileID:\s*(-?\d+)"
+            % re.escape(mb_id),
+            inst_raw):
+        mods[m.group(1).strip()] = (m.group(2).strip(), int(m.group(3)))
+    size_key = "m_OnClick.m_PersistentCalls.m_Calls.Array.size"
+    if size_key not in mods:
+        return ui_button
+    try:
+        n = int(float(mods[size_key][0]))
+    except ValueError:
+        return ui_button
+    if n <= 0:
+        ui_button["onclick"] = []
+        return ui_button
+    calls = []
+    for i in range(n):
+        prefix = ("m_OnClick.m_PersistentCalls.m_Calls.Array.data[%d]."
+                  % i)
+        method = (mods.get(prefix + "m_MethodName") or ("", 0))[0]
+        if not method:
+            continue
+        mode_s = (mods.get(prefix + "m_Mode") or ("1", 0))[0]
+        try:
+            mode = int(float(mode_s))
+        except ValueError:
+            mode = 1
+        bool_s = (mods.get(prefix + "m_Arguments.m_BoolArgument")
+                  or ("0", 0))[0]
+        try:
+            bool_arg = int(float(bool_s))
+        except ValueError:
+            bool_arg = 0
+        tgt_mod = mods.get(prefix + "m_Target")
+        tid = int(tgt_mod[1]) if tgt_mod else 0
+        if tid == 0:
+            continue
+        calls.append({
+            "target_go": str(tid),
+            "method": method,
+            "mode": mode,
+            "bool_arg": bool_arg,
+        })
+    ui_button["onclick"] = calls
+    return ui_button
 
 
 def _apply_rect_property_mods(rect, scale, mods):
@@ -5057,8 +5180,6 @@ def _append_prefab_instance_ui_objects(
         father_id = inst.get("father_id")
         for stub in stubs:
             xf_id = stub["scene_xf"]
-            if xf_id in existing_xf:
-                continue
             path = asset_guids.get(stub["guid"])
             if not path or not str(path).lower().endswith(".prefab"):
                 continue
@@ -5077,6 +5198,25 @@ def _append_prefab_instance_ui_objects(
                 # Prefab root often matches first object with a rect.
                 src = next((o for o in pref_objs if o.get("rect")), None)
             if src is None:
+                continue
+            ui_button = dict(src["ui_button"]) if src.get("ui_button") else None
+            if ui_button:
+                ui_button = _apply_ui_button_onclick_mods(
+                    ui_button, inst_raw, ui_button.get("mb_file_id"))
+            # Image-only materialize may have created this xf already — attach
+            # Button / UIButton ColorBlock + onClick from the source prefab.
+            if xf_id in existing_xf:
+                if ui_button:
+                    for o in objects:
+                        if str(o.get("xf_id")) != xf_id:
+                            continue
+                        if not o.get("ui_button"):
+                            o["ui_button"] = ui_button
+                        # Prefer a stable prefabinst go_id when scene stub
+                        # left go_id None (needed by _build_ui_buttons).
+                        if o.get("go_id") is None:
+                            o["go_id"] = "prefabinst:%s:%s" % (inst_id, xf_id)
+                        break
                 continue
             mods = _prefab_mod_values(inst_raw, stub["src_xf"])
             # m_IsActive targets the prefab GameObject fileID, not the RT.
@@ -5105,7 +5245,6 @@ def _append_prefab_instance_ui_objects(
             ui_image = dict(src["ui_image"]) if src.get("ui_image") else None
             ui_image = _apply_ui_image_sprite_mod(
                 ui_image, inst_raw, asset_guids)
-            ui_button = dict(src["ui_button"]) if src.get("ui_button") else None
             obj = {
                 "name": name,
                 "pos": src.get("pos") or (0.0, 0.0, 0.0),
@@ -5643,8 +5782,7 @@ def _build_ui_buttons(plan):
                     "target_go": int(tgt),
                     "bool_arg": int(c.get("bool_arg") or 0),
                 })
-            if not calls:
-                continue
+            # Tint / hit even when onClick has no SetActive (ColorBlock only).
             cols = ub.get("colors") or {}
             mult = float(cols.get("multiplier") or 1.0)
 
@@ -8705,8 +8843,8 @@ def apply_soa_layout(plan, vec4=False):
     """Move positions out of AoS structs into contiguous float SoA arrays.
 
     Matches the faster-than-Unity upload idea: GPU position upload reads a
-    packed float table, not scattered fields inside object structs. Opt-in
-    via --soa / --soa-vec4 so AoS remains the default for size-focused packs.
+    packed float table, not scattered fields inside object structs. Default
+    for packs; pass ``soa=False`` / ``--aos`` to keep positions in structs.
 
     vec4=True stores float[N][4] (xyz + instance id in w) so a std140 UBO
     of vec4 matches the CPU table without manual padding.
@@ -10643,12 +10781,17 @@ def emit_engine(plan, analyses, used_apis):
                     nbtn, ", ".join("%sf" % repr(b["nhh"]) for b in ui_buttons)))
                 p("static const int _engine_ui_btn_go[%d] = { %s };" % (
                     nbtn, ", ".join(str(int(b["go"])) for b in ui_buttons)))
+                # -1 when this Button has no SetActive onClick (tint-only).
                 p("static const int _engine_ui_btn_call_go[%d] = { %s };" % (
-                    nbtn, ", ".join(str(int(b["calls"][0]["target_go"]))
-                                    for b in ui_buttons)))
+                    nbtn, ", ".join(
+                        str(int(b["calls"][0]["target_go"]))
+                        if b.get("calls") else "-1"
+                        for b in ui_buttons)))
                 p("static const int _engine_ui_btn_call_bool[%d] = { %s };" % (
-                    nbtn, ", ".join(str(int(b["calls"][0]["bool_arg"]))
-                                    for b in ui_buttons)))
+                    nbtn, ", ".join(
+                        str(int(b["calls"][0]["bool_arg"]))
+                        if b.get("calls") else "0"
+                        for b in ui_buttons)))
                 # ColorBlock (× multiplier) — Normal / Highlighted / Pressed / Disabled
                 p("static const float _engine_ui_btn_col_n[%d] = { %s };" % (
                     nbtn * 4, _f4("normal")))
@@ -10731,8 +10874,9 @@ def emit_engine(plan, analyses, used_apis):
                 p("        _engine_ui_btn_tint[i * 4 + 3] = col[3];")
                 p("    }")
                 p("    if (pressed && hit >= 0) {")
-                p("        GameObject_SetActive(_engine_ui_btn_call_go[hit],")
-                p("                             _engine_ui_btn_call_bool[hit]);")
+                p("        if (_engine_ui_btn_call_go[hit] >= 0)")
+                p("            GameObject_SetActive(_engine_ui_btn_call_go[hit],")
+                p("                                 _engine_ui_btn_call_bool[hit]);")
                 p("    }")
             else:
                 p("    (void)i; (void)hit; (void)px; (void)py;")
@@ -16262,7 +16406,7 @@ def emit_soa_positions_glsl(plan):
     p("precision highp int;")
     p("")
     if not plan.get("soa"):
-        p("/* Pack was AoS — no SoA tables. Use engine_upload_positions gather. */")
+        p("/* Pack was AoS (--aos) — no SoA tables. Use engine_upload_positions gather. */")
         return "\n".join(lines) + "\n"
     stride = 4 if plan.get("soa_vec4") else None
     p("// std430: tight arrays. For std140 UBOs use --soa-vec4 and vec4[].")
@@ -16607,7 +16751,7 @@ def _fingerprint_entries(root):
     return entries
 
 
-def _hash_fingerprint_entries(entries, soa=False, soa_vec4=False,
+def _hash_fingerprint_entries(entries, soa=True, soa_vec4=False,
                               gpu_handles=False):
     h = hashlib.sha256()
     h.update(b"soa=%d\n" % (1 if soa else 0))
@@ -16620,7 +16764,7 @@ def _hash_fingerprint_entries(entries, soa=False, soa_vec4=False,
     return h.hexdigest()
 
 
-def _input_fingerprints(root, soa=False, soa_vec4=False, gpu_handles=False):
+def _input_fingerprints(root, soa=True, soa_vec4=False, gpu_handles=False):
     """(full, assets, scripts) fingerprints.
 
     *assets* covers tools, ProjectSettings, and non-``.cs`` Assets inputs.
@@ -16637,7 +16781,7 @@ def _input_fingerprints(root, soa=False, soa_vec4=False, gpu_handles=False):
     return full, assets, scripts
 
 
-def _input_fingerprint(root, soa=False, soa_vec4=False):
+def _input_fingerprint(root, soa=True, soa_vec4=False):
     """Cheap fingerprint of packer + project inputs (not PackageCache)."""
     return _input_fingerprints(root, soa=soa, soa_vec4=soa_vec4)[0]
 
@@ -16839,7 +16983,7 @@ def _emit_artifact_unchanged(outdir, cpp_name, c_name, cpp_text, force):
     return old == cpp_text
 
 
-def pack(root, outdir, soa=False, soa_vec4=False, force=False, strict=False,
+def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
          gpu_handles=False):
     os.makedirs(outdir, exist_ok=True)
     fp, assets_fp, scripts_fp = _input_fingerprints(
@@ -17246,7 +17390,7 @@ def build_player_executable(outdir, product):
 def main():
     args = list(sys.argv[1:])
     outdir = None
-    soa = False
+    soa = True
     soa_vec4 = False
     force = False
     strict = False
@@ -17260,13 +17404,19 @@ def main():
     if "--gpu-handles" in args:
         gpu_handles = True
         args.remove("--gpu-handles")
+    if "--soa" in args:
+        sys.stderr.write(
+            "unity_pack: --soa is gone; SoA positions are the default. "
+            "Use --aos for AoS structs, or --soa-vec4 for float[N][4].\n")
+        return 2
     if "--soa-vec4" in args:
         soa_vec4 = True
         soa = True
         args.remove("--soa-vec4")
-    if "--soa" in args:
-        soa = True
-        args.remove("--soa")
+    if "--aos" in args:
+        soa = False
+        soa_vec4 = False
+        args.remove("--aos")
     if "-o" in args:
         i = args.index("-o")
         if i + 1 >= len(args):
@@ -17277,9 +17427,10 @@ def main():
     if len(args) != 1:
         sys.stderr.write(
             "usage: unity_pack.py <project-dir> [-o <out-dir>] "
-            "[--soa | --soa-vec4] [--force] [--strict] [--gpu-handles]\n"
+            "[--aos | --soa-vec4] [--force] [--strict] [--gpu-handles]\n"
             "  default out-dir: $TMPDIR/<project folder>\n"
             "  player binary:   <productName>  (Windows: <productName>.exe)\n"
+            "  default layout:  SoA position tables (use --aos for AoS)\n"
             "  --force:         ignore stamp; always re-emit and transpile\n")
         return 2
     if outdir is None:

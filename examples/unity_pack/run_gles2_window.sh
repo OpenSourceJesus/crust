@@ -2,7 +2,7 @@
 # Pack a Unity project and run the GLFW / OpenGL ES player that unity_pack builds.
 #
 #     ./examples/unity_pack/run_gles2_window.sh
-#     ./examples/unity_pack/run_gles2_window.sh --soa
+#     ./examples/unity_pack/run_gles2_window.sh --aos
 #     PROJECT=/path/to/project ./examples/unity_pack/run_gles2_window.sh
 #
 # Default output: $TMPDIR/<project folder>/<productName>
@@ -11,20 +11,24 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 PROJECT="${PROJECT:-$ROOT/examples/unity_pack/MiniScene}"
-SOA=()
+LAYOUT=()
 
 for arg in "$@"; do
   case "$arg" in
-    --soa) SOA=(--soa) ;;
-    --soa-vec4) SOA=(--soa-vec4) ;;
+    --soa)
+      echo "$0: --soa is gone; SoA is the default. Use --aos or --soa-vec4." >&2
+      exit 2
+      ;;
+    --aos) LAYOUT=(--aos) ;;
+    --soa-vec4) LAYOUT=(--soa-vec4) ;;
     -h|--help)
-      echo "usage: $0 [--soa | --soa-vec4]"
+      echo "usage: $0 [--aos | --soa-vec4]"
       echo "  PROJECT=...  Unity project (default: MiniScene)"
       echo "  OUT=...    pack directory (default: \$TMPDIR/<project folder>)"
       exit 0
       ;;
     *)
-      echo "unknown option: $arg (try --soa or --soa-vec4)" >&2
+      echo "unknown option: $arg (try --aos or --soa-vec4)" >&2
       exit 2
       ;;
   esac
@@ -53,12 +57,12 @@ PY
 
 echo "== packing $PROJECT → $OUT =="
 PYTHONUNBUFFERED=1 PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-  python3 -u "$ROOT/tools/unity_pack.py" "$PROJECT" -o "$OUT" "${SOA[@]}"
+  python3 -u "$ROOT/tools/unity_pack.py" "$PROJECT" -o "$OUT" "${LAYOUT[@]}"
 
 if [[ ! -x "$EXE" ]]; then
   echo "unity_pack did not produce executable: $EXE" >&2
   exit 1
 fi
 
-echo "== GLFW window${SOA[*]:+ (SoA)}: $EXE (Application.Quit or window close) =="
+echo "== GLFW window${LAYOUT[*]:+ (${LAYOUT[*]})}: $EXE (Application.Quit or window close) =="
 exec "$EXE"

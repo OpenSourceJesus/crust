@@ -236,14 +236,9 @@ any scene with a Camera: crust ignores `__attribute__((weak))` on
 variables, so the viewers' default camera globals collide with `data.c`'s
 (the GLES2 viewer the same) — gcc builds are unaffected.
 
-## SoA positions (`--soa`) — faster GPU uploads
+## SoA positions (default) — faster GPU uploads
 
-Default packing keeps positions inside each instance struct (AoS). That
-matches a compact object, but a frame that uploads every position to the
-GPU must *gather* `pos_x`/`pos_y` out of each struct — the same pattern
-Unity-style engines use.
-
-`--soa` moves positions into contiguous tables:
+Default packing puts positions in contiguous tables (SoA):
 
 ```c
 float _Player_pos[N][2];   /* or [N][3] in 3D */
@@ -253,14 +248,16 @@ Script accessors still go through `Player_get_pos_x(i)` /
 `Player_set_pos_x(i, v)`, so gameplay code is unchanged. `engine_upload_positions`
 fills a flat `float[]` for the GPU: under SoA it `memcpy`s the tables (clang
 autovec remarks showed nested element copies were not beneficial); under
-AoS it gathers from struct fields. Host `Makefile` compiles `engine.c` with
-`-O3 -fno-math-errno` so `sinf`/`cosf`/`sqrtf` loops can autovec. Opt-in so
-size-focused packs stay AoS and you can benchmark both:
+AoS (`--aos`) it gathers from struct fields. Host `Makefile` compiles `engine.c`
+with `-O3 -fno-math-errno` so `sinf`/`cosf`/`sqrtf` loops can autovec.
+
+`--aos` keeps positions inside each instance struct for size-focused packs
+or AoS gather benchmarks:
 
 ```
-python3 tools/unity_pack.py examples/unity_pack/MiniScene -o /tmp/aos
-python3 tools/unity_pack.py examples/unity_pack/MiniScene -o /tmp/soa --soa
-python3 tools/unity_pack_bench_upload.py      # packed AoS vs SoA (MiniScene)
+python3 tools/unity_pack.py examples/unity_pack/MiniScene -o /tmp/soa
+python3 tools/unity_pack.py examples/unity_pack/MiniScene -o /tmp/aos --aos
+python3 tools/unity_pack_bench_upload.py      # packed SoA vs AoS (MiniScene)
 python3 tools/unity_pack_bench_csharp.py      # C SoA vs C# class AoS gather
 ```
 
