@@ -245,6 +245,8 @@ Authored `!u!223` Canvas (Screen Space Overlay / Camera) + uGUI `Image`
 or `Button` (with Image) draw via RectTransform size mapped into the
 main ortho camera. Nested RectTransforms (e.g. Button → label) use the
 parent pixel rect. Authored `VerticalLayoutGroup` /
+`HorizontalLayoutGroup` stack children in **`m_Children` order** (Unity
+sibling index), not YAML discovery order.
 `HorizontalLayoutGroup` (+ optional `LayoutElement` with min / preferred /
 flexible / max) are baked into child `anchoredPosition` / `sizeDelta` / top-left
 anchors before that bake (same stacking Unity's layout pass applies).

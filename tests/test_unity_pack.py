@@ -6719,6 +6719,10 @@ class TestSystems(unittest.TestCase):
                 "--- !u!224 &11\nRectTransform:\n"
                 "  m_GameObject: {fileID: 10}\n"
                 "  m_Father: {fileID: 2}\n"
+                "  m_Children:\n"
+                "  - {fileID: 21}\n"
+                "  - {fileID: 31}\n"
+                "  - {fileID: 41}\n"
                 "  m_AnchorMin: {x: 0.5, y: 0.5}\n"
                 "  m_AnchorMax: {x: 0.5, y: 0.5}\n"
                 "  m_AnchoredPosition: {x: 0, y: 0}\n"
@@ -6741,8 +6745,12 @@ class TestSystems(unittest.TestCase):
                 "  m_Script: {fileID: 11500000, "
                 "guid: vlghostvlghostvlghostvlghost01}\n"
             )
-            for i, fid in enumerate((20, 30, 40)):
+            # Declare children out of sibling order (B0, B2, B1 in YAML) so
+            # objects[] discovery ≠ m_Children; layout must still use
+            # m_Children (B0, B1, B2 → top→bottom).
+            for i, fid in enumerate((20, 40, 30)):
                 xf, img_id = fid + 1, fid + 2
+                name_i = {20: 0, 30: 1, 40: 2}[fid]
                 f.write(
                     "--- !u!1 &%d\nGameObject:\n  m_Name: B%d\n"
                     "  m_Component:\n  - component: {fileID: %d}\n"
@@ -6761,14 +6769,16 @@ class TestSystems(unittest.TestCase):
                     "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
                     "  m_Enabled: 1\n  m_Type: 0\n"
                     "  m_Sprite: {fileID: 10905, guid: %s, type: 0}\n"
-                    % (fid, i, xf, img_id, xf, fid, img_id, fid, img, builtin)
+                    % (fid, name_i, xf, img_id, xf, fid, img_id, fid, img,
+                       builtin)
                 )
         objs, _a, _l, _c, _h = unity_pack.load_project(root)
         panel = [o for o in objs if o["name"] == "Panel"][0]
+        self.assertEqual(
+            panel.get("child_ids"), ["21", "31", "41"])
         self.assertTrue(panel.get("layout_group", {}).get("vertical"))
-        kids = sorted(
-            [o for o in objs if o["name"].startswith("B")],
-            key=lambda o: o["name"])
+        by_name = {o["name"]: o for o in objs if o["name"].startswith("B")}
+        kids = [by_name["B0"], by_name["B1"], by_name["B2"]]
         self.assertEqual(len(kids), 3)
         # Stacked from top with spacing 10; width driven to panel 200.
         ys = [o["rect"]["anchored_position"][1] for o in kids]
