@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Microbench: AoS gather vs SoA contiguous position upload.
 
-Packs MiniScene twice (default AoS and --soa), links a tiny host that
+Packs MiniScene twice (default SoA and --aos), links a tiny host that
 calls engine_upload_positions many times, and prints ns/call.
 
 Runs under gcc and clang when both are installed (label cc=...).
@@ -72,8 +72,8 @@ def build_and_run(soa: bool, cc_name: str, cc_path: str) -> str:
     d = tempfile.mkdtemp(prefix="upack-bench-")
     cmd = [sys.executable, os.path.join(ROOT, "tools", "unity_pack.py"),
            PROJECT, "-o", d]
-    if soa:
-        cmd.append("--soa")
+    if not soa:
+        cmd.append("--aos")
     subprocess.check_call(cmd)
     host = os.path.join(d, "host.c")
     with open(host, "w") as f:

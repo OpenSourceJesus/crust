@@ -8705,8 +8705,8 @@ def apply_soa_layout(plan, vec4=False):
     """Move positions out of AoS structs into contiguous float SoA arrays.
 
     Matches the faster-than-Unity upload idea: GPU position upload reads a
-    packed float table, not scattered fields inside object structs. Opt-in
-    via --soa / --soa-vec4 so AoS remains the default for size-focused packs.
+    packed float table, not scattered fields inside object structs. Default
+    for packs; pass ``soa=False`` / ``--aos`` to keep positions in structs.
 
     vec4=True stores float[N][4] (xyz + instance id in w) so a std140 UBO
     of vec4 matches the CPU table without manual padding.
@@ -16262,7 +16262,7 @@ def emit_soa_positions_glsl(plan):
     p("precision highp int;")
     p("")
     if not plan.get("soa"):
-        p("/* Pack was AoS — no SoA tables. Use engine_upload_positions gather. */")
+        p("/* Pack was AoS (--aos) — no SoA tables. Use engine_upload_positions gather. */")
         return "\n".join(lines) + "\n"
     stride = 4 if plan.get("soa_vec4") else None
     p("// std430: tight arrays. For std140 UBOs use --soa-vec4 and vec4[].")
@@ -16607,7 +16607,7 @@ def _fingerprint_entries(root):
     return entries
 
 
-def _hash_fingerprint_entries(entries, soa=False, soa_vec4=False,
+def _hash_fingerprint_entries(entries, soa=True, soa_vec4=False,
                               gpu_handles=False):
     h = hashlib.sha256()
     h.update(b"soa=%d\n" % (1 if soa else 0))
@@ -16620,7 +16620,7 @@ def _hash_fingerprint_entries(entries, soa=False, soa_vec4=False,
     return h.hexdigest()
 
 
-def _input_fingerprints(root, soa=False, soa_vec4=False, gpu_handles=False):
+def _input_fingerprints(root, soa=True, soa_vec4=False, gpu_handles=False):
     """(full, assets, scripts) fingerprints.
 
     *assets* covers tools, ProjectSettings, and non-``.cs`` Assets inputs.
@@ -16637,7 +16637,7 @@ def _input_fingerprints(root, soa=False, soa_vec4=False, gpu_handles=False):
     return full, assets, scripts
 
 
-def _input_fingerprint(root, soa=False, soa_vec4=False):
+def _input_fingerprint(root, soa=True, soa_vec4=False):
     """Cheap fingerprint of packer + project inputs (not PackageCache)."""
     return _input_fingerprints(root, soa=soa, soa_vec4=soa_vec4)[0]
 
@@ -16839,7 +16839,7 @@ def _emit_artifact_unchanged(outdir, cpp_name, c_name, cpp_text, force):
     return old == cpp_text
 
 
-def pack(root, outdir, soa=False, soa_vec4=False, force=False, strict=False,
+def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
          gpu_handles=False):
     os.makedirs(outdir, exist_ok=True)
     fp, assets_fp, scripts_fp = _input_fingerprints(
@@ -17246,7 +17246,7 @@ def build_player_executable(outdir, product):
 def main():
     args = list(sys.argv[1:])
     outdir = None
-    soa = False
+    soa = True
     soa_vec4 = False
     force = False
     strict = False
@@ -17260,13 +17260,19 @@ def main():
     if "--gpu-handles" in args:
         gpu_handles = True
         args.remove("--gpu-handles")
+    if "--soa" in args:
+        sys.stderr.write(
+            "unity_pack: --soa is gone; SoA positions are the default. "
+            "Use --aos for AoS structs, or --soa-vec4 for float[N][4].\n")
+        return 2
     if "--soa-vec4" in args:
         soa_vec4 = True
         soa = True
         args.remove("--soa-vec4")
-    if "--soa" in args:
-        soa = True
-        args.remove("--soa")
+    if "--aos" in args:
+        soa = False
+        soa_vec4 = False
+        args.remove("--aos")
     if "-o" in args:
         i = args.index("-o")
         if i + 1 >= len(args):
@@ -17277,9 +17283,10 @@ def main():
     if len(args) != 1:
         sys.stderr.write(
             "usage: unity_pack.py <project-dir> [-o <out-dir>] "
-            "[--soa | --soa-vec4] [--force] [--strict] [--gpu-handles]\n"
+            "[--aos | --soa-vec4] [--force] [--strict] [--gpu-handles]\n"
             "  default out-dir: $TMPDIR/<project folder>\n"
             "  player binary:   <productName>  (Windows: <productName>.exe)\n"
+            "  default layout:  SoA position tables (use --aos for AoS)\n"
             "  --force:         ignore stamp; always re-emit and transpile\n")
         return 2
     if outdir is None:

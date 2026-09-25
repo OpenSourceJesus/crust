@@ -6,7 +6,7 @@ contiguous float buffer (the CPU side of a GPU upload).
 
   C#  — array of class instances with x,y,z; gather into float[]
   C AoS — array of structs; gather (Unity/engine default shape)
-  C SoA — float pos[N][3] table; contiguous memcpy (unity_pack --soa)
+  C SoA — float pos[N][3] table; contiguous memcpy (unity_pack default)
 
 C legs run under gcc and clang when both are installed (label cc=...).
 
@@ -197,7 +197,7 @@ C_SOA = r"""
 #define ITERS __ITERS__
 #define WARM 200
 
-/* Contiguous position table — unity_pack --soa shape. */
+/* Contiguous position table — unity_pack SoA (default) shape. */
 static float pos[N][3];
 static volatile float g_sink;
 
