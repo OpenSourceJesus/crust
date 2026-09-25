@@ -1491,17 +1491,19 @@ def _parse_sprite_sheet(asset_path):
 
 
 def _crop_rgba(rgba, tw, th, x, y, cw, ch):
-    """Crop RGBA bytes; Unity sprite rect ``y`` is from the texture bottom."""
+    """Crop RGBA bytes; Unity sprite rect ``y`` is from the texture bottom.
+
+    ``rgba`` from ``_load_png_rgba`` is already bottom-up (row 0 = texture
+    bottom, same as ``_sample_rgba``). Unity's rect ``y`` is that same origin,
+    so the crop starts at row ``y`` — do **not** convert as if the buffer were
+    PNG top-down (that pulls the wrong half when the slice is shorter than the
+    atlas, e.g. Sound Toggle icons padded above the sprite rect).
+    """
     tw, th = int(tw), int(th)
     x0 = max(0, min(tw, int(round(x))))
-    # Unity: y from bottom → PNG row from top.
-    y_bottom = int(round(y))
+    y0 = max(0, int(round(y)))
     ch_i = max(0, int(round(ch)))
     cw_i = max(0, int(round(cw)))
-    y0 = th - y_bottom - ch_i
-    if y0 < 0:
-        ch_i += y0
-        y0 = 0
     if x0 + cw_i > tw:
         cw_i = tw - x0
     if y0 + ch_i > th:
@@ -2368,11 +2370,15 @@ def _parse_ui_button(block, file_id=None):
             tid = int(cm.group(1))
             if tid == 0:
                 continue
+            span = cm.group(0)
+            sm = re.search(r"m_StringArgument:\s*(.*)", span)
+            string_arg = sm.group(1).strip() if sm else ""
             calls.append({
                 "target_go": str(tid),
                 "method": cm.group(2),
                 "mode": int(cm.group(3)),
                 "bool_arg": int(cm.group(4)),
+                "string_arg": string_arg,
             })
     # Behaviour.enabled false → Selectable does not receive clicks.
     interactable = int(en.group(1)) if en else 1
@@ -3755,6 +3761,12 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None,
             "ncy": float(cy) / float(sh),
             "nhw": hit_rw * 0.5 / float(sw),
             "nhh": hit_rh * 0.5 / float(sh),
+            # Live RT: draw size / center as fractions of RectTransform
+            # (TMP Overflow bake can be larger than the rect).
+            "draw_sx": 1.0,
+            "draw_sy": 1.0,
+            "shift_fx": 0.0,
+            "shift_fy": 0.0,
         }
         if extra:
             sp.update(extra)
@@ -3882,6 +3894,11 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None,
         # Overflow expands the bake; keep authored alignment by shifting center.
         draw_cx = float(cx) + float(shift_x)
         draw_cy = float(cy) + float(shift_y)
+        # Live RT rebuilds draw size from RectTransform; store expand / shift
+        # as fractions of the authored rect so overflow bakes are not squished
+        # into sizeDelta (tex taller than rect → vertical squash).
+        rect_w = max(abs(float(rw)), 1e-6)
+        rect_h = max(abs(float(rh)), 1e-6)
         bake_guid = "tmpbake:%s:%s" % (
             o.get("go_id") or o.get("name") or "tmp",
             tmp.get("font_guid") or "")
@@ -3898,6 +3915,10 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None,
                 "tex_h": th,
                 "tex_rgba": rgba,
                 "pixels_per_unit": 100.0,
+                "draw_sx": float(tw) / rect_w,
+                "draw_sy": float(th) / rect_h,
+                "shift_fx": float(shift_x) / rect_w,
+                "shift_fy": float(shift_y) / rect_h,
             })
 
     # Unity Canvas: equal sortingOrder draws in hierarchy order (parents
@@ -5137,6 +5158,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             p["clip"] = clip
     _append_prefab_instance_ui_objects(
         by_id, objects, hierarchy, asset_guids, guid_to_script)
+    _annotate_ui_button_onclick_targets(objects, by_id, guid_to_script)
     return objects, lights, cameras, hierarchy
 
 
@@ -5295,6 +5317,8 @@ def _materialize_prefab_instance_ui(by_id, objects, asset_guids,
                         ui_button = dict(src["ui_button"])
                         ui_button = _apply_ui_button_onclick_mods(
                             ui_button, raw, ui_button.get("mb_file_id"))
+                        _annotate_ui_button_onclick_targets(
+                            [{"ui_button": ui_button}], by_id, guid_to_script)
                 except Exception:
                     ui_button = None
         # Stable go_id for PrefabInstance roots (scene often has no GO stub).
@@ -5497,6 +5521,8 @@ def _apply_ui_button_onclick_mods(ui_button, inst_raw, mb_file_id=None):
             bool_arg = int(float(bool_s))
         except ValueError:
             bool_arg = 0
+        string_arg = (mods.get(prefix + "m_Arguments.m_StringArgument")
+                      or ("", 0))[0]
         tgt_mod = mods.get(prefix + "m_Target")
         tid = int(tgt_mod[1]) if tgt_mod else 0
         if tid == 0:
@@ -5506,9 +5532,121 @@ def _apply_ui_button_onclick_mods(ui_button, inst_raw, mb_file_id=None):
             "method": method,
             "mode": mode,
             "bool_arg": bool_arg,
+            "string_arg": string_arg,
         })
     ui_button["onclick"] = calls
     return ui_button
+
+
+def _annotate_ui_button_onclick_targets(objects, by_id, guid_to_script):
+    """Tag each onClick call: GameObject vs project MonoBehaviour class.
+
+    Persistent targets may be a GO (``SetActive``) or a script component
+    fileID (including stripped PrefabInstance MBs). Prefer ``m_Script``
+    guid — stripped blocks list the source-prefab guid first.
+    """
+    if not objects or not by_id:
+        return
+    guid_to_script = guid_to_script or {}
+    for o in objects:
+        ub = o.get("ui_button")
+        if not ub:
+            continue
+        for c in ub.get("onclick") or []:
+            tid = str(c.get("target_go") or "")
+            if not tid or tid == "0":
+                continue
+            rec = by_id.get(tid)
+            if not rec:
+                continue
+            kind = rec.get("kind")
+            if kind == "GameObject":
+                c["target_kind"] = "go"
+                continue
+            if kind != "MonoBehaviour":
+                continue
+            raw = rec.get("raw") or ""
+            gm = re.search(
+                r"m_Script:\s*\{fileID:\s*\d+,\s*guid:\s*([0-9a-fA-F]+)",
+                raw)
+            g = (gm.group(1).lower() if gm
+                 else (rec.get("guid") or "").lower())
+            sp = guid_to_script.get(g) if g else None
+            if not sp:
+                continue
+            cname = _class_name_from_cs(sp)
+            if cname:
+                c["target_kind"] = "mb"
+                c["target_class"] = cname
+
+
+def _onclick_mb_types(objects):
+    """Packed MonoBehaviour class names targeted by Button onClick."""
+    out = set()
+    for o in objects or []:
+        for c in (o.get("ui_button") or {}).get("onclick") or []:
+            if c.get("method") == "SetActive":
+                continue
+            cls = c.get("target_class")
+            if cls:
+                out.add(cls)
+    return out
+
+
+def _alias_onclick_mb_file_ids(objects):
+    """Attach scene onClick MB fileIDs onto packed instances' mb_ids.
+
+    Stripped PrefabInstance MBs (scene fileID) are not joined via m_Component;
+    Button targets still reference them. Alias onto the first instance of the
+    annotated target class so ``_mb_index`` resolves the click.
+    """
+    by_class = {}
+    for o in objects or []:
+        by_class.setdefault(o.get("class"), []).append(o)
+    for o in objects or []:
+        for c in (o.get("ui_button") or {}).get("onclick") or []:
+            if c.get("method") == "SetActive":
+                continue
+            cls = c.get("target_class")
+            tid = str(c.get("target_go") or "")
+            if not cls or not tid or tid == "0":
+                continue
+            for inst in by_class.get(cls) or []:
+                mbs = inst.setdefault("mb_ids", [])
+                if tid not in mbs:
+                    mbs.append(tid)
+                break
+
+
+def _mb_onclick_callable(analyses, cname, method, mode):
+    """True if *method* on *cname* is a public instance API we can dispatch.
+
+    PersistentListenerMode: 1=Void, 5=String, 6=Bool (SetActive path).
+    Only Void / String MB calls are wired; Bool stays on GameObject.SetActive.
+    """
+    if not cname or not method or method == "SetActive":
+        return False
+    want_string = int(mode or 0) == 5
+    want_void = int(mode or 0) in (0, 1)
+    if not want_string and not want_void:
+        return False
+    for a in analyses or []:
+        for c in a.get("classes") or []:
+            if c.get("name") != cname:
+                continue
+            for m in c.get("methods") or []:
+                if m.get("name") != method:
+                    continue
+                if not m.get("public") or m.get("static"):
+                    continue
+                args = (m.get("args") or "").strip()
+                if want_string:
+                    if re.match(
+                            r"(?:System\.)?string\s+\w+\s*$", args, re.I):
+                        return True
+                elif want_void and not args:
+                    return True
+    return False
 
 
 def _apply_rect_property_mods(rect, scale, mods):
@@ -5625,6 +5763,8 @@ def _append_prefab_instance_ui_objects(
             if ui_button:
                 ui_button = _apply_ui_button_onclick_mods(
                     ui_button, inst_raw, ui_button.get("mb_file_id"))
+                _annotate_ui_button_onclick_targets(
+                    [{"ui_button": ui_button}], by_id, guid_to_script)
             # Image-only materialize may have created this xf already — attach
             # Button / UIButton ColorBlock + onClick from the source prefab.
             if xf_id in existing_xf:
@@ -6197,8 +6337,13 @@ def _build_go_sibling_indices(go_parents):
     return sib
 
 
-def _build_ui_buttons(plan):
-    """Authored uGUI Buttons: normalized hit, ColorBlock, SetActive onClick."""
+def _build_ui_buttons(plan, analyses=None):
+    """Authored uGUI Buttons: normalized hit, ColorBlock, onClick dispatch.
+
+    Persistent ``SetActive`` targets resolve via GO fileID → go_index.
+    MonoBehaviour targets (string/void modes) resolve via mb_ids or the
+    annotated ``target_class`` from stripped PrefabInstance MBs.
+    """
     go_by_id = {}
     for cl in plan["classes"].values():
         for o in cl.get("instances") or []:
@@ -6211,6 +6356,12 @@ def _build_ui_buttons(plan):
         gi = h.get("go_index")
         if gid and gi is not None:
             go_by_id.setdefault(gid, int(gi))
+    mb_index = _mb_index(plan)
+    # class → first authored instance index (stripped MB fallback).
+    class_inst0 = {}
+    for cname, cl in (plan.get("classes") or {}).items():
+        if int(cl.get("n") or 0) > 0:
+            class_inst0[cname] = 0
     buttons = []
     for cl in plan["classes"].values():
         for o in cl.get("instances") or []:
@@ -6226,16 +6377,40 @@ def _build_ui_buttons(plan):
             self_go = int(self_go)
             calls = []
             for c in ub.get("onclick") or []:
-                if c.get("method") != "SetActive":
+                method = c.get("method") or ""
+                tid = str(c.get("target_go") or "")
+                mode = int(c.get("mode") or 0)
+                if method == "SetActive":
+                    tgt = go_by_id.get(tid)
+                    if tgt is None:
+                        continue
+                    calls.append({
+                        "kind": "setactive",
+                        "target_go": int(tgt),
+                        "bool_arg": int(c.get("bool_arg") or 0),
+                    })
                     continue
-                tgt = go_by_id.get(str(c.get("target_go") or ""))
-                if tgt is None:
+                # MonoBehaviour persistent call (String / Void).
+                cname = c.get("target_class")
+                inst = None
+                hit_mb = mb_index.get(tid)
+                if hit_mb:
+                    cname, inst = hit_mb[0], int(hit_mb[1])
+                elif cname and cname in class_inst0:
+                    inst = int(class_inst0[cname])
+                if cname is None or inst is None:
+                    continue
+                if not _mb_onclick_callable(analyses, cname, method, mode):
                     continue
                 calls.append({
-                    "target_go": int(tgt),
-                    "bool_arg": int(c.get("bool_arg") or 0),
+                    "kind": "mb",
+                    "mb_class": cname,
+                    "mb_inst": int(inst),
+                    "method": method,
+                    "mode": mode,
+                    "string_arg": c.get("string_arg") or "",
                 })
-            # Tint / hit even when onClick has no SetActive (ColorBlock only).
+            # Tint / hit even when onClick has no resolvable calls (ColorBlock).
             cols = ub.get("colors") or {}
             mult = float(cols.get("multiplier") or 1.0)
 
@@ -8696,7 +8871,18 @@ def _rewrite_mb_static_and_singleton(text, plan, cl):
         use_inst = ocname in singleton_types or ocname in (
             plan.get("findobject_types") or ())
         # Other.Instance.field / Other.instance.field
+        # Writes before reads — otherwise `Instance.f = v` becomes
+        # `Class_get_f(Class_Instance()) = v` (not an lvalue → CS0000).
         for vf in ocl.get("vec2_fields") or []:
+            text = cs2cpp.code_sub(
+                r"(?<![\w.])%s\s*\.\s*(?:Instance|instance)\s*\.\s*%s\s*=\s*"
+                r"([^;]+);"
+                % (re.escape(ocname), re.escape(vf)),
+                lambda m, o=oidn, f=vf, ix=inst: (
+                    "%s_set_%s_x(%s, Vector2_x(%s)); "
+                    "%s_set_%s_y(%s, Vector2_y(%s));"
+                    % (o, f, ix, m.group(1), o, f, ix, m.group(1))),
+                text)
             text = cs2cpp.code_sub(
                 r"(?<![\w.])%s\s*\.\s*(?:Instance|instance)\s*\.\s*%s\b"
                 % (re.escape(ocname), re.escape(vf)),
@@ -8709,6 +8895,12 @@ def _rewrite_mb_static_and_singleton(text, plan, cl):
                 continue
             if mem.startswith("pos_"):
                 continue
+            text = cs2cpp.code_sub(
+                r"(?<![\w.])%s\s*\.\s*(?:Instance|instance)\s*\.\s*%s\s*=\s*"
+                r"([^;]+);"
+                % (re.escape(ocname), re.escape(mem)),
+                "%s_set_%s(%s, (\\1));" % (oidn, mem, inst),
+                text)
             text = cs2cpp.code_sub(
                 r"(?<![\w.])%s\s*\.\s*(?:Instance|instance)\s*\.\s*%s\b"
                 % (re.escape(ocname), re.escape(mem)),
@@ -11585,32 +11777,75 @@ def emit_engine(plan, analyses, used_apis):
                     p("static const float _engine_ui_btn_nhh[%d] = { %s };" % (
                         nbtn, ", ".join(
                             "%sf" % repr(b["nhh"]) for b in ui_buttons)))
-                # Flat SetActive list: each Button may have N onClick targets
-                # (Play → activate Play Menu + deactivate Main Menu).
+                # Flat onClick list: SetActive(GO) and/or MB method(string).
                 call_starts = []
                 call_counts = []
-                call_gos = []
+                call_ops = []
+                call_gos = []  # GO index (SetActive) or MB instance index
                 call_bools = []
+                call_strs = []
+                # op 0 = SetActive; op >= 1 → mb_handlers[op-1]
+                # handler: (cname, method, pass_string)
+                mb_handlers = []
+                mb_handler_ix = {}
+
+                def _mb_op(cname, method, pass_string):
+                    key = (cname, method, bool(pass_string))
+                    if key not in mb_handler_ix:
+                        mb_handler_ix[key] = len(mb_handlers) + 1
+                        mb_handlers.append(key)
+                    return mb_handler_ix[key]
+
                 for b in ui_buttons:
-                    call_starts.append(len(call_gos))
+                    call_starts.append(len(call_ops))
                     calls = b.get("calls") or []
                     call_counts.append(len(calls))
                     for c in calls:
-                        call_gos.append(int(c["target_go"]))
-                        call_bools.append(int(c["bool_arg"]))
-                ncall = len(call_gos)
+                        if c.get("kind") == "mb":
+                            pass_str = int(c.get("mode") or 0) == 5
+                            call_ops.append(_mb_op(
+                                c["mb_class"], c["method"], pass_str))
+                            call_gos.append(int(c["mb_inst"]))
+                            call_bools.append(0)
+                            call_strs.append(c.get("string_arg") or "")
+                        else:
+                            call_ops.append(0)
+                            call_gos.append(int(c["target_go"]))
+                            call_bools.append(int(c["bool_arg"]))
+                            call_strs.append("")
+                ncall = len(call_ops)
                 p("static const int _engine_ui_btn_call_start[%d] = { %s };" % (
                     nbtn, ", ".join(str(s) for s in call_starts)))
                 p("static const int _engine_ui_btn_call_count[%d] = { %s };" % (
                     nbtn, ", ".join(str(c) for c in call_counts)))
                 if ncall:
+                    p("static const int _engine_ui_btn_call_op[%d] = { %s };" % (
+                        ncall, ", ".join(str(o) for o in call_ops)))
                     p("static const int _engine_ui_btn_call_go[%d] = { %s };" % (
                         ncall, ", ".join(str(g) for g in call_gos)))
                     p("static const int _engine_ui_btn_call_bool[%d] = { %s };"
                       % (ncall, ", ".join(str(b) for b in call_bools)))
+                    p("static const char *_engine_ui_btn_call_str[%d] = {"
+                      % ncall)
+                    for s in call_strs:
+                        p("    %s," % _c_string(s))
+                    p("};")
                 else:
+                    p("static const int _engine_ui_btn_call_op[1] = { 0 };")
                     p("static const int _engine_ui_btn_call_go[1] = { -1 };")
                     p("static const int _engine_ui_btn_call_bool[1] = { 0 };")
+                    p("static const char *_engine_ui_btn_call_str[1] = "
+                      "{ \"\" };")
+                plan["_ui_btn_mb_handlers"] = mb_handlers
+                # Forward-declare MB onClick targets (methods emit later).
+                for hcname, hmethod, hstr in mb_handlers:
+                    hidn = _c_ident(hcname)
+                    if hstr:
+                        p("static void %s_%s(unsigned i, const char *a);"
+                          % (hidn, hmethod))
+                    else:
+                        p("static void %s_%s(unsigned i);"
+                          % (hidn, hmethod))
                 # ColorBlock (× multiplier) — Normal / Highlighted / Pressed / Disabled
                 p("static const float _engine_ui_btn_col_n[%d] = { %s };" % (
                     nbtn * 4, _f4("normal")))
@@ -11737,11 +11972,28 @@ def emit_engine(plan, analyses, used_apis):
                 p("            j1 = j0 + _engine_ui_btn_call_count["
                   "_engine_ui_btn_press];")
                 p("            for (j = j0; j < j1; j = j + 1) {")
-                p("                if (_engine_ui_btn_call_go[j] >= 0)")
-                p("                    GameObject_SetActive("
+                p("                int op = _engine_ui_btn_call_op[j];")
+                p("                if (op == 0) {")
+                p("                    if (_engine_ui_btn_call_go[j] >= 0)")
+                p("                        GameObject_SetActive("
                   "_engine_ui_btn_call_go[j],")
-                p("                                         "
+                p("                                             "
                   "_engine_ui_btn_call_bool[j]);")
+                p("                }")
+                mb_handlers = plan.get("_ui_btn_mb_handlers") or []
+                for hi, (hcname, hmethod, hstr) in enumerate(mb_handlers):
+                    hidn = _c_ident(hcname)
+                    p("                else if (op == %d)" % (hi + 1))
+                    if hstr:
+                        p("                    %s_%s("
+                          "(unsigned)_engine_ui_btn_call_go[j],"
+                          % (hidn, hmethod))
+                        p("                        "
+                          "_engine_ui_btn_call_str[j]);")
+                    else:
+                        p("                    %s_%s("
+                          "(unsigned)_engine_ui_btn_call_go[j]);"
+                          % (hidn, hmethod))
                 p("            }")
                 p("        }")
                 p("        _engine_ui_btn_press = -1;")
@@ -12514,6 +12766,14 @@ def emit_engine(plan, analyses, used_apis):
                     path = ""
                 p("static const char %s_%s[] = %s;" % (
                     idn, fname, _c_string(path)))
+            elif f.get("ty") == "bool":
+                # `static bool flag;` / `= false` — mutable unless C# const.
+                truthy = default in (True, 1, "true", "True")
+                init = 1 if truthy else 0
+                if f.get("const"):
+                    p("static const int %s_%s = %d;" % (idn, fname, init))
+                else:
+                    p("static int %s_%s = %d;" % (idn, fname, init))
             elif isinstance(default, (int, float)) and default is not None:
                 if f.get("ty") == "float":
                     p("static const float %s_%s = %sf;" % (
@@ -12526,6 +12786,7 @@ def emit_engine(plan, analyses, used_apis):
             # List / Dictionary / SortedList / ref arrays: preamble above.
         if any(
                 f.get("ty") == "string"
+                or f.get("ty") == "bool"
                 or isinstance(f.get("default"), (int, float))
                 or f.get("ty") in ("StreamWriter", "StreamReader")
                 for f in (cl.get("class_consts") or [])):
@@ -12588,7 +12849,19 @@ def emit_engine(plan, analyses, used_apis):
             sym = _method_c_symbol(
                 idn, m["name"], m.get("args") or "",
                 m["name"] in overloaded)
-            p("static void %s(unsigned i);" % sym)
+            coll_param = None
+            if m["name"] in _COLLISION2D_MSGS:
+                coll_param = _collision2d_arg_name(m.get("args") or "")
+                if not coll_param:
+                    continue
+                p("static void %s(unsigned i, int %s);"
+                  % (sym, coll_param))
+            else:
+                plist = _method_c_params(m.get("args") or "")
+                if plist:
+                    p("static void %s(unsigned i, %s);" % (sym, plist))
+                else:
+                    p("static void %s(unsigned i);" % sym)
         for c, m in methods_by.get(cname, []):
             if m["name"] == "OnEnable":
                 continue
@@ -12639,19 +12912,23 @@ def emit_engine(plan, analyses, used_apis):
                 # Static bodies may still touch instance fields via bare names.
                 p("    unsigned i = 0;")
             else:
-                p("static void %s(unsigned i) {" % sym)
+                plist = _method_c_params(m.get("args") or "")
+                if plist:
+                    p("static void %s(unsigned i, %s) {" % (sym, plist))
+                else:
+                    p("static void %s(unsigned i) {" % sym)
             # Methods that still contain unlowered C# become stubs (Unity
             # messages included — empty body beats crust parse failures).
             emitted = set()
             if coll_param:
                 emitted.add(coll_param)
-            if m.get("static"):
-                for part in (m.get("args") or "").split(","):
-                    part = part.strip()
-                    part = re.sub(r"\b(?:ref|out|in|params)\s+", "", part)
-                    pm = re.match(r"([\w.<>]+)\s+(\w+)\s*$", part)
-                    if pm:
-                        emitted.add(pm.group(2))
+            # Instance + static param names are known locals for residual checks.
+            for part in (m.get("args") or "").split(","):
+                part = part.strip()
+                part = re.sub(r"\b(?:ref|out|in|params)\s+", "", part)
+                pm = re.match(r"([\w.<>]+)\s+(\w+)\s*$", part)
+                if pm:
+                    emitted.add(pm.group(2))
             why = _unlowered_csharp(
                 body, args_str=m.get("args") or "", emitted_params=emitted,
                 known_types=_engine_types_declared(lines))
@@ -12661,6 +12938,9 @@ def emit_engine(plan, analyses, used_apis):
                     p("    (void)i;")
                 if coll_param:
                     p("    (void)%s;" % coll_param)
+                for pname in sorted(emitted):
+                    if pname != coll_param:
+                        p("    (void)%s;" % pname)
                 # Keep lowered SetActive even when the rest of Awake stubs —
                 # SettingsMenu.Awake → gameObject.SetActive(false).
                 # Only a line that is itself fully lowered: the call can sit
@@ -13996,6 +14276,23 @@ def emit_engine(plan, analyses, used_apis):
                     ", ".join(
                         "%sf" % repr(float(sp.get("src_aspect") or 1.0))
                         for _i, sp in spr_idx)))
+                # TMP Overflow (etc.): draw can exceed RectTransform.
+                p("        static const float _spr_draw_sx[] = { %s };" % (
+                    ", ".join(
+                        "%sf" % repr(float(sp.get("draw_sx") or 1.0))
+                        for _i, sp in spr_idx)))
+                p("        static const float _spr_draw_sy[] = { %s };" % (
+                    ", ".join(
+                        "%sf" % repr(float(sp.get("draw_sy") or 1.0))
+                        for _i, sp in spr_idx)))
+                p("        static const float _spr_shift_fx[] = { %s };" % (
+                    ", ".join(
+                        "%sf" % repr(float(sp.get("shift_fx") or 0.0))
+                        for _i, sp in spr_idx)))
+                p("        static const float _spr_shift_fy[] = { %s };" % (
+                    ", ".join(
+                        "%sf" % repr(float(sp.get("shift_fy") or 0.0))
+                        for _i, sp in spr_idx)))
             else:
                 p("        static const float _spr_ncx[] = { %s };" % (
                     ", ".join(
@@ -14117,8 +14414,11 @@ def emit_engine(plan, analyses, used_apis):
                   "go, sw, sh, &rcx, &rcy, &rw, &rh);")
                 p("                    if (rw < 0.f) rw = -rw;")
                 p("                    if (rh < 0.f) rh = -rh;")
-                p("                    dw = rw; dh = rh;")
-                p("                    dcx = rcx; dcy = rcy;")
+                # Default = RectTransform; TMP Overflow scales past it.
+                p("                    dw = rw * _spr_draw_sx[k];")
+                p("                    dh = rh * _spr_draw_sy[k];")
+                p("                    dcx = rcx + rw * _spr_shift_fx[k];")
+                p("                    dcy = rcy + rh * _spr_shift_fy[k];")
                 p("                    if (_spr_preserve[k]"
                   " && rw > 1e-6f && rh > 1e-6f) {")
                 p("                        sa = _spr_src_aspect[k];")
@@ -17333,6 +17633,8 @@ def _analyze_scripts_and_prefabs(root, objects, assets):
                     continue
                 if b in typename_map:
                     needed.add(b)
+    # Button onClick → project MB (e.g. BeginGame on a stripped GameManager).
+    needed |= _onclick_mb_types(objects)
     have_classes = {o.get("class") for o in objects}
     missing = sorted(
         t for t in needed
@@ -17360,6 +17662,9 @@ def _analyze_scripts_and_prefabs(root, objects, assets):
             a["getcomponentsinchildren_types"] = set()
             a["addcomponent_types"] = set()
             analyses.append(a)
+
+    # Scene stripped MB fileIDs (Button onClick targets) → pack instance mb_ids.
+    _alias_onclick_mb_file_ids(objects)
 
     have = set()
     for a in analyses:
@@ -18302,7 +18607,7 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
     plan["go_ui_components"] = _build_go_ui_component_maps(plan, analyses)
     plan["go_parents"] = _build_go_parents(plan)
     plan["go_siblings"] = _build_go_sibling_indices(plan["go_parents"])
-    plan["ui_buttons"] = _build_ui_buttons(plan)
+    plan["ui_buttons"] = _build_ui_buttons(plan, analyses)
     plan["live_rt"] = _build_rect_transforms(plan)
     rb2d, rb3d, go_rb2d, go_rb3d, rb2d_by_fid, rb3d_by_fid = (
         _build_rigidbody_tables(plan))
