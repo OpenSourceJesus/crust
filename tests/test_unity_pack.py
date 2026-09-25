@@ -6718,6 +6718,19 @@ class TestSystems(unittest.TestCase):
         fw, fh = unity_pack._fit_preserve_aspect(100, 50, 50, 100)
         self.assertAlmostEqual(fh, 50.0, places=5)
         self.assertAlmostEqual(fw, 25.0, places=5)
+        # Top-left pivot: fitted draw TL stays on rect TL (Unity
+        # PreserveSpriteAspectRatio), not mid-letterboxed.
+        dcx, dcy = unity_pack._preserve_aspect_draw_center(
+            50.0, 50.0, 100.0, 100.0, 50.0, 100.0, (0.0, 1.0))
+        self.assertAlmostEqual(dcx, 25.0, places=5)
+        self.assertAlmostEqual(dcy, 50.0, places=5)
+        self.assertAlmostEqual(dcx - 25.0, 0.0, places=5)
+        self.assertAlmostEqual(dcy + 50.0, 100.0, places=5)
+        # Center pivot unchanged.
+        dcx, dcy = unity_pack._preserve_aspect_draw_center(
+            50.0, 50.0, 100.0, 100.0, 50.0, 100.0, (0.5, 0.5))
+        self.assertAlmostEqual(dcx, 50.0, places=5)
+        self.assertAlmostEqual(dcy, 50.0, places=5)
 
         root = tempfile.mkdtemp(prefix="upack-presasp-")
         scripts = os.path.join(root, "Assets", "Scripts")
@@ -7187,6 +7200,130 @@ class TestSystems(unittest.TestCase):
         self.assertAlmostEqual(hit.get("hw", 0) * 2, 100.0, places=3)
         self.assertAlmostEqual(hit.get("hh", 0) * 2, 50.0, places=3)
         self.assertLess(hit.get("nhw", 1), 0.2)
+
+    def test_preserve_aspect_top_left_pivot_draw_flush(self):
+        """preserveAspect + pivot (0,1): sprite TL flush with rect TL."""
+        root = tempfile.mkdtemp(prefix="upack-presasp-tl-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        spr = os.path.join(root, "Assets", "Sprites")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scripts)
+        os.makedirs(spr)
+        os.makedirs(scene)
+        import struct, zlib
+
+        def write_png(path, w, h):
+            def chunk(tag, body):
+                return (struct.pack(">I", len(body)) + tag + body
+                        + struct.pack(">I", zlib.crc32(tag + body) & 0xffffffff))
+            raw = b""
+            for _y in range(h):
+                raw += b"\x00" + (b"\xff\xff\xff\xff" * w)
+            with open(path, "wb") as out:
+                out.write(
+                    b"\x89PNG\r\n\x1a\n"
+                    + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+                    + chunk(b"IDAT", zlib.compress(raw, 9))
+                    + chunk(b"IEND", b""))
+
+        # Square sprite in a wide top-left rect → pillarbox; Unity keeps TL.
+        spr_guid = "e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3"
+        host_guid = "f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4"
+        write_png(os.path.join(spr, "sq.png"), 100, 100)
+        with open(os.path.join(spr, "sq.png.meta"), "w") as f:
+            f.write(
+                "guid: " + spr_guid + "\n"
+                "TextureImporter:\n"
+                "  spritePixelsToUnits: 100\n"
+            )
+        with open(os.path.join(scripts, "Host.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Host : MonoBehaviour { void Update() {} }\n"
+            )
+        with open(os.path.join(scripts, "Host.cs.meta"), "w") as f:
+            f.write("guid: " + host_guid + "\n")
+        img = "fe87c0e1cc204ed48ad3b37840f39efc"
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Canvas\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!224 &2\nRectTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_SizeDelta: {x: 0, y: 0}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!223 &3\nCanvas:\n  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n  m_RenderMode: 0\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Back\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "--- !u!224 &11\nRectTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Father: {fileID: 2}\n"
+                "  m_AnchorMin: {x: 0, y: 1}\n"
+                "  m_AnchorMax: {x: 0, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 400, y: 100}\n"
+                "  m_Pivot: {x: 0, y: 1}\n"
+                "--- !u!114 &12\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, guid: " + img + "}\n"
+                "  m_Sprite: {fileID: 21300000, guid: " + spr_guid + ", type: 3}\n"
+                "  m_Type: 0\n"
+                "  m_PreserveAspect: 1\n"
+                "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+                "--- !u!1 &100\nGameObject:\n  m_Name: Main Camera\n"
+                "  m_Component:\n  - component: {fileID: 101}\n"
+                "  - component: {fileID: 102}\n"
+                "--- !u!4 &101\nTransform:\n"
+                "  m_GameObject: {fileID: 100}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: -10}\n"
+                "--- !u!20 &102\nCamera:\n"
+                "  m_GameObject: {fileID: 100}\n"
+                "  orthographic: 1\n"
+                "  orthographic size: 5\n"
+            )
+        ps = os.path.join(root, "ProjectSettings")
+        os.makedirs(ps)
+        with open(os.path.join(ps, "EditorBuildSettings.asset"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1045 &1\nEditorBuildSettings:\n"
+                "  m_Scenes:\n"
+                "  - enabled: 1\n"
+                "    path: Assets/Scenes/S.unity\n"
+            )
+        with open(os.path.join(ps, "ProjectSettings.asset"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!129 &1\nPlayerSettings:\n"
+                "  defaultScreenWidth: 800\n"
+                "  defaultScreenHeight: 600\n"
+            )
+        objs, _a, _l, _c, _h = unity_pack.load_project(root)
+        back = [o for o in objs if o.get("name") == "Back"][0]
+        hit = back.get("ui_hit") or {}
+        sp = back.get("sprite") or {}
+        # Hit stays full 400×100; draw is 100×100 (square in wide rect).
+        self.assertAlmostEqual(hit.get("hw", 0) * 2, 400.0, places=2)
+        self.assertAlmostEqual(hit.get("hh", 0) * 2, 100.0, places=2)
+        self.assertAlmostEqual(float(sp.get("nhw", 0)) * 2 * 800.0, 100.0, places=1)
+        self.assertAlmostEqual(float(sp.get("nhh", 0)) * 2 * 600.0, 100.0, places=1)
+        # Draw TL = canvas top-left (0, 600); centered bug put left at 150.
+        draw_cx = float(sp.get("ncx", 0)) * 800.0
+        draw_cy = float(sp.get("ncy", 0)) * 600.0
+        draw_hw = float(sp.get("nhw", 0)) * 800.0
+        draw_hh = float(sp.get("nhh", 0)) * 600.0
+        left = draw_cx - draw_hw
+        top = draw_cy + draw_hh
+        self.assertAlmostEqual(left, 0.0, places=1)
+        self.assertAlmostEqual(top, 600.0, places=1)
 
     def test_prefab_uibutton_onclick_mods(self):
         """PrefabInstance UIButton picks up scene m_OnClick SetActive mods."""

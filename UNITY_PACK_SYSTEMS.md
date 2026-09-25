@@ -263,8 +263,9 @@ PNG UI sprites use `.meta` `spriteBorder` the same way. When
 crop is packed — otherwise every slice would stretch the whole atlas (e.g.
 Settings Menu Full appearing many times on Main Menu). Authored
 `Image.preserveAspect` (Simple type) fits the sprite inside the RectTransform
-instead of stretching to fill (Unity GenerateSimpleSprite); raycast rect
-stays full size. RectTransform `localScale` on an object and its ancestors
+instead of stretching to fill (Unity `PreserveSpriteAspectRatio`); the fitted
+quad is offset by RectTransform.pivot (top-left pivot stays flush with the
+rect corner — not mid-letterboxed). Raycast rect stays full size. RectTransform `localScale` on an object and its ancestors
 accumulates into baked UI screen rects (e.g. a VerticalLayoutGroup scaled
 to 0.59 shrinks children and TMP like Unity Canvas space). Authored
 `TextMeshProUGUI` draws when `m_fontAsset` resolves (Assets or Packages /

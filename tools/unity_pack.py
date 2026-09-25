@@ -3305,8 +3305,10 @@ def _bake_stretched_rgba(src, sw, sh, dst_w, dst_h):
 def _fit_preserve_aspect(rw, rh, src_w, src_h):
     """Fit sprite into rect keeping aspect (Unity Image.preserveAspect).
 
-    Returns (fit_w, fit_h) in the same units as *rw*/*rh*. The fitted quad is
-    centered in the RectTransform (Unity GenerateSimpleSprite).
+    Returns (fit_w, fit_h) in the same units as *rw*/*rh*. Draw center is
+    then shifted by ``_preserve_aspect_draw_center`` (Unity
+    ``PreserveSpriteAspectRatio`` uses RectTransform.pivot, not always
+    geometric center).
     """
     rw = abs(float(rw))
     rh = abs(float(rh))
@@ -3318,6 +3320,21 @@ def _fit_preserve_aspect(rw, rh, src_w, src_h):
         # Rect wider than sprite → height-limited.
         return rh * (sw / sh), rh
     return rw, rw * (sh / sw)
+
+
+def _preserve_aspect_draw_center(cx, cy, rw, rh, fw, fh, pivot):
+    """Center of preserveAspect draw quad (Unity PreserveSpriteAspectRatio).
+
+    Unity shrinks one axis then offsets that axis by
+    ``(old - new) * pivot`` so a top-left pivot keeps the fitted sprite
+    flush with the RectTransform top-left (not letterboxed to mid).
+    """
+    px = float((pivot or (0.5, 0.5))[0])
+    py = float((pivot or (0.5, 0.5))[1])
+    return (
+        float(cx) + (float(rw) - float(fw)) * (px - 0.5),
+        float(cy) + (float(rh) - float(fh)) * (py - 0.5),
+    )
 
 
 # Alias used by tests / older call sites.
@@ -3506,15 +3523,21 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None,
             tex_path = path
         # Sliced (1): 9-slice fills the rect. Simple (0): stretch, or
         # preserveAspect-fit inside the rect (Unity Image.preserveAspect).
-        draw_w, draw_h = abs(float(rw)), abs(float(rh))
+        rect_w, rect_h = abs(float(rw)), abs(float(rh))
+        draw_w, draw_h = rect_w, rect_h
+        draw_cx, draw_cy = float(cx), float(cy)
         if (img_type != 1 and preserve
                 and src_w > 0 and src_h > 0 and draw_w > 1e-6 and draw_h > 1e-6):
             draw_w, draw_h = _fit_preserve_aspect(
                 draw_w, draw_h, src_w, src_h)
+            pivot = (o.get("rect") or {}).get("pivot") or (0.5, 0.5)
+            draw_cx, draw_cy = _preserve_aspect_draw_center(
+                cx, cy, rect_w, rect_h, draw_w, draw_h, pivot)
         if img_type == 1 and any(b > 0 for b in border):
             tw, th, rgba = _bake_sliced_rgba(
                 src_rgba, src_w, src_h, border, rw, rh, ppu_mul)
-            draw_w, draw_h = abs(float(rw)), abs(float(rh))
+            draw_w, draw_h = rect_w, rect_h
+            draw_cx, draw_cy = float(cx), float(cy)
         else:
             tw, th, rgba = _bake_stretched_rgba(
                 src_rgba, src_w, src_h, draw_w, draw_h)
@@ -3525,7 +3548,7 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None,
         extra["pixels_per_unit"] = 100.0
         extra["border"] = border
         _apply_layout(
-            o, cx, cy, draw_w, draw_h, canvas, "ui",
+            o, draw_cx, draw_cy, draw_w, draw_h, canvas, "ui",
             (ui.get("r", 1.0), ui.get("g", 1.0),
              ui.get("b", 1.0), ui.get("a", 1.0)),
             extra)
@@ -3533,11 +3556,11 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None,
         if o.get("ui_hit") is not None:
             o["ui_hit"] = {
                 "cx": float(cx), "cy": float(cy),
-                "hw": abs(float(rw)) * 0.5, "hh": abs(float(rh)) * 0.5,
+                "hw": rect_w * 0.5, "hh": rect_h * 0.5,
                 "ncx": float(cx) / float(sw),
                 "ncy": float(cy) / float(sh),
-                "nhw": abs(float(rw)) * 0.5 / float(sw),
-                "nhh": abs(float(rh)) * 0.5 / float(sh),
+                "nhw": rect_w * 0.5 / float(sw),
+                "nhh": rect_h * 0.5 / float(sh),
             }
 
     for o in objects:
