@@ -2408,11 +2408,15 @@ def _ui_local_rect_wh(o, by_xf, screen_w, screen_h, cache):
         return cache[key]
     sw = float(screen_w)
     sh = float(screen_h)
-    if o.get("canvas"):
-        cache[key] = (sw, sh)
-        return cache[key]
     fid = o.get("father_id")
     parent = by_xf.get(str(fid)) if fid else None
+    # Root Canvas fills the screen. Nested Canvas keeps RectTransform size
+    # (Unity: Canvas does not override local rect).
+    if o.get("canvas") and not (
+            parent is not None and (
+                parent.get("rect") is not None or parent.get("canvas"))):
+        cache[key] = (sw, sh)
+        return cache[key]
     if parent is not None and (
             parent.get("rect") is not None or parent.get("canvas")):
         pw, ph = _ui_local_rect_wh(
@@ -2443,13 +2447,15 @@ def _ui_screen_rect(o, by_xf, screen_w, screen_h, cache):
         return cache[key]
     sw = float(screen_w)
     sh = float(screen_h)
-    # Canvas root pixel size is the screen (Overlay / Screen Space Camera),
-    # not the serialized anchors (often 0,0 with sizeDelta 0).
-    if o.get("canvas"):
-        cache[key] = (sw * 0.5, sh * 0.5, sw, sh)
-        return cache[key]
     fid = o.get("father_id")
     parent = by_xf.get(str(fid)) if fid else None
+    # Root Canvas pixel size is the screen (Overlay / Screen Space Camera).
+    # Nested Canvas (e.g. Back Button sorting override) keeps RectTransform.
+    if o.get("canvas") and not (
+            parent is not None and (
+                parent.get("rect") is not None or parent.get("canvas"))):
+        cache[key] = (sw * 0.5, sh * 0.5, sw, sh)
+        return cache[key]
     if parent is not None and (
             parent.get("rect") is not None or parent.get("canvas")):
         pcx, pcy, pw, ph = _ui_screen_rect(
