@@ -4494,6 +4494,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                             "local_scale": local_scale,
                             "father_id": father_id,
                             "xf_id": xf_id,
+                            "child_ids": child_ids,
                             "go_id": go.get("file_id"),
                             "active": 1 if int(go.get("active", 1)) else 0,
                             "fields": {},
@@ -4541,6 +4542,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                     "local_scale": local_scale,
                     "father_id": father_id,
                     "xf_id": xf_id,
+                    "child_ids": child_ids,
                     "go_id": go.get("file_id"),
                     "active": active,
                     "fields": {},
@@ -4576,6 +4578,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "local_scale": local_scale,
                 "father_id": father_id,
                 "xf_id": xf_id,
+                "child_ids": child_ids,
                 "go_id": go.get("file_id"),
                 "active": active,
                 "fields": {},
@@ -4609,13 +4612,14 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "local_scale": local_scale,
             "father_id": father_id,
             "xf_id": xf_id,
+            "child_ids": child_ids,
             "go_id": go.get("file_id"),
             "active": active,
             "fields": fields,
             "object_refs": object_refs,
             "mb_ids": mb_ids,
             "script": script,
-            "class": class_name or go.get("name") or "Obj",
+            "class": class_name or _scriptless_packed_class(go.get("name")),
             "sprite": sprite,
             "canvas": canvas,
             "rect": rect,
@@ -4845,7 +4849,7 @@ def _materialize_prefab_instance_ui(by_id, objects, asset_guids,
             "fields": {},
             "object_refs": {},
             "script": None,
-            "class": name,
+            "class": _scriptless_packed_class(name),
             "sprite": None,
             "canvas": None,
             "rect": _prefab_mod_rect(raw),
@@ -5205,7 +5209,7 @@ def parse_blender_json(text):
                     float(pos[2] if len(pos) > 2 else 0)),
             "fields": o.get("fields") or {},
             "script": None,
-            "class": o.get("class") or o.get("name") or "Obj",
+            "class": o.get("class") or _scriptless_packed_class(o.get("name")),
             "sprite": o.get("sprite"),
         })
     return out
@@ -5469,7 +5473,7 @@ def _build_go_active(plan, go_names):
     return act
 
 
-def _build_go_ui_component_maps(plan):
+def _build_go_ui_component_maps(plan, analyses=None):
     """Authored UI component presence: type → sorted GO indices."""
     maps = {t: set() for t in _UI_GETCOMPONENT_TYPES}
 
@@ -5505,6 +5509,35 @@ def _build_go_ui_component_maps(plan):
             mark(gi, "Button", "Selectable")
         if h.get("has_tmp"):
             mark(gi, "TMP_Text", "TextMeshProUGUI", "TextMeshPro")
+    # Project MB that subclasses a uGUI type (UIButton : Button): Unity's
+    # GetComponent<Button>() finds it via inheritance.
+    if analyses:
+        bases = {}
+        for a in analyses:
+            for c in a.get("classes") or []:
+                bases[c["name"]] = [
+                    b for b in (c.get("bases") or [])
+                    if b not in ("MonoBehaviour", "ScriptableObject",
+                                 "object", "Object", "System")]
+        memo = {}
+
+        def ui_ancestor_types(cname):
+            if cname in memo:
+                return memo[cname]
+            out = set()
+            for b in bases.get(cname) or []:
+                if b in maps:
+                    out.add(b)
+                out |= ui_ancestor_types(b)
+            memo[cname] = out
+            return out
+
+        for cname, cl in (plan.get("classes") or {}).items():
+            utys = ui_ancestor_types(cname)
+            if not utys:
+                continue
+            for o in cl.get("instances") or []:
+                mark(o.get("go_index"), *sorted(utys))
     return {t: sorted(s) for t, s in maps.items() if s}
 
 
@@ -6309,6 +6342,27 @@ def _wrap_log_component_tostring(text, locals_ty):
 
 
 _PHYSICS_COMPONENTS = frozenset(("Rigidbody2D", "Rigidbody"))
+
+# Names that already own GameObject_GetComponent_<T> / _engine_go_<T> helpers.
+# A scriptless GO named "Button" must not become packed class Button — C has
+# no overloading, so the UI helper and the packed-class emit would collide.
+_RESERVED_PACKED_CLASS_NAMES = (
+    _ADDABLE_BUILTINS | _PHYSICS_COMPONENTS | _UI_GETCOMPONENT_TYPES
+    | _TRANSFORM_GETCOMPONENT_TYPES | _REFUSED_ADDCOMPONENT)
+
+
+def _scriptless_packed_class(go_name):
+    """Packed class for a GameObject with no project MonoBehaviour script.
+
+    Unity GO names are labels, not component types. Reusing the name as a
+    packed class is fine for \"Play Button\", but names that match a Unity
+    builtin / uGUI type collide with GetComponent_<T> C symbols.
+    """
+    name = go_name or "Obj"
+    if name in _RESERVED_PACKED_CLASS_NAMES:
+        return "_Rect"
+    return name
+
 
 # GetComponentsInChildren<Renderer> → SpriteRenderer map (2D authored packs).
 _GCIC_TYPE_ALIAS = {
@@ -10011,12 +10065,16 @@ def emit_engine(plan, analyses, used_apis):
                 p("}")
                 p("")
         # Emit GetComponent_<T> for every packed class (and requested types).
+        # Skip names already owned by UI / physics / Transform helpers — a
+        # packed class must not redefine those C symbols.
         for cname in sorted(set(plan["classes"]) | (
                 getcomponent_types - _PHYSICS_COMPONENTS
                 - _UI_GETCOMPONENT_TYPES
                 - _TRANSFORM_GETCOMPONENT_TYPES) | (
                 add_types - _ADDABLE_BUILTINS)):
             if cname not in plan["classes"]:
+                continue
+            if cname in _RESERVED_PACKED_CLASS_NAMES:
                 continue
             idn = _c_ident(cname)
             mb_extra = _mb_pool_extra(plan, cname)
@@ -16941,7 +16999,7 @@ def pack(root, outdir, soa=False, soa_vec4=False, force=False, strict=False,
     plan["go_has_sprite"] = sorted(_gos_with_sprite(plan))
     plan["go_active"] = _build_go_active(plan, go_names)
     plan["go_components"] = go_comps
-    plan["go_ui_components"] = _build_go_ui_component_maps(plan)
+    plan["go_ui_components"] = _build_go_ui_component_maps(plan, analyses)
     plan["go_parents"] = _build_go_parents(plan)
     plan["go_siblings"] = _build_go_sibling_indices(plan["go_parents"])
     plan["ui_buttons"] = _build_ui_buttons(plan)

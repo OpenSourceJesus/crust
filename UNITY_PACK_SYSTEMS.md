@@ -157,7 +157,7 @@ slot (intensity 1, white) into the light table.
 | Script / scene uses | Emitted |
 |---------------------|---------|
 | Authored `!u!1` GameObject `m_TagString: EditorOnly` | Omitted from pack (and transform descendants), matching Unity player builds |
-| Authored CameraScript / GameCamera `viewSize` | Pack-time seed of `Camera_main_aspect`, `Camera_main_rect_*`, updated `orthographicSize` (HandleViewSize); GLES letterboxes; uGUI bake starts from the camera pixel rect |
+| Authored CameraScript / GameCamera `viewSize` | Pack-time seed of `Camera_main_aspect`, `Camera_main_rect_*`, updated `orthographicSize` (HandleViewSize); GLES2 **and** GLES3 hosts letterbox to that rect; uGUI bake starts from the camera pixel rect |
 | Authored uGUI `CanvasScaler` (`m_Enabled`) | Pack-time canvas units = pixelRect / scaleFactor (Constant Pixel Size / Scale With Screen Size Match·Expand·Shrink); disabled → raw pixel rect |
 | Authored uGUI layout / Image / TMP / Button `m_Enabled` | Disabled LayoutGroup / ContentSizeFitter / AspectRatioFitter skipped at bake; disabled Image/TMP not drawn; disabled Button not clickable |
 | Camera `m_Father` under a packed body | Live: `_engine_sync_camera_main` → `parent_world + local` each tick/draw |
@@ -245,6 +245,8 @@ Authored `!u!223` Canvas (Screen Space Overlay / Camera) + uGUI `Image`
 or `Button` (with Image) draw via RectTransform size mapped into the
 main ortho camera. Nested RectTransforms (e.g. Button → label) use the
 parent pixel rect. Authored `VerticalLayoutGroup` /
+`HorizontalLayoutGroup` stack children in **`m_Children` order** (Unity
+sibling index), not YAML discovery order.
 `HorizontalLayoutGroup` (+ optional `LayoutElement` with min / preferred /
 flexible / max) are baked into child `anchoredPosition` / `sizeDelta` / top-left
 anchors before that bake (same stacking Unity's layout pass applies).
