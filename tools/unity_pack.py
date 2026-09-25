@@ -5782,8 +5782,7 @@ def _build_ui_buttons(plan):
                     "target_go": int(tgt),
                     "bool_arg": int(c.get("bool_arg") or 0),
                 })
-            if not calls:
-                continue
+            # Tint / hit even when onClick has no SetActive (ColorBlock only).
             cols = ub.get("colors") or {}
             mult = float(cols.get("multiplier") or 1.0)
 
@@ -10782,12 +10781,17 @@ def emit_engine(plan, analyses, used_apis):
                     nbtn, ", ".join("%sf" % repr(b["nhh"]) for b in ui_buttons)))
                 p("static const int _engine_ui_btn_go[%d] = { %s };" % (
                     nbtn, ", ".join(str(int(b["go"])) for b in ui_buttons)))
+                # -1 when this Button has no SetActive onClick (tint-only).
                 p("static const int _engine_ui_btn_call_go[%d] = { %s };" % (
-                    nbtn, ", ".join(str(int(b["calls"][0]["target_go"]))
-                                    for b in ui_buttons)))
+                    nbtn, ", ".join(
+                        str(int(b["calls"][0]["target_go"]))
+                        if b.get("calls") else "-1"
+                        for b in ui_buttons)))
                 p("static const int _engine_ui_btn_call_bool[%d] = { %s };" % (
-                    nbtn, ", ".join(str(int(b["calls"][0]["bool_arg"]))
-                                    for b in ui_buttons)))
+                    nbtn, ", ".join(
+                        str(int(b["calls"][0]["bool_arg"]))
+                        if b.get("calls") else "0"
+                        for b in ui_buttons)))
                 # ColorBlock (× multiplier) — Normal / Highlighted / Pressed / Disabled
                 p("static const float _engine_ui_btn_col_n[%d] = { %s };" % (
                     nbtn * 4, _f4("normal")))
@@ -10870,8 +10874,9 @@ def emit_engine(plan, analyses, used_apis):
                 p("        _engine_ui_btn_tint[i * 4 + 3] = col[3];")
                 p("    }")
                 p("    if (pressed && hit >= 0) {")
-                p("        GameObject_SetActive(_engine_ui_btn_call_go[hit],")
-                p("                             _engine_ui_btn_call_bool[hit]);")
+                p("        if (_engine_ui_btn_call_go[hit] >= 0)")
+                p("            GameObject_SetActive(_engine_ui_btn_call_go[hit],")
+                p("                                 _engine_ui_btn_call_bool[hit]);")
                 p("    }")
             else:
                 p("    (void)i; (void)hit; (void)px; (void)py;")
