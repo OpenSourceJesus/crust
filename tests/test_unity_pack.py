@@ -2923,6 +2923,116 @@ class TestSystems(unittest.TestCase):
         self.assertNotIn("not lowered yet", awake)
         self.assertIn("Cam_instance = i", awake)
 
+    def test_singleton_instance_field_assign_uses_setter(self):
+        """Other.instance.field = v → Class_set_field(Class_Instance(), v)."""
+        root = tempfile.mkdtemp(prefix="upack-inst-field-set-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Lasso.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Lasso : MonoBehaviour {\n"
+                "    public static Lasso instance;\n"
+                "    public static Lasso Instance {\n"
+                "        get {\n"
+                "            if (instance == null)\n"
+                "                instance = FindObjectOfType<Lasso>(true);\n"
+                "            return instance;\n"
+                "        }\n"
+                "    }\n"
+                "    public int changeLengthInput;\n"
+                "    void Awake() { instance = this; }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Lasso.cs.meta"), "w") as f:
+            f.write("guid: lassolassolassolassolassolasso01\n")
+        with open(os.path.join(scripts, "Player.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Player : MonoBehaviour {\n"
+                "    public void SetChangeLengthInput(float amt) {\n"
+                "        Lasso.instance.changeLengthInput = (int) amt;\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Player.cs.meta"), "w") as f:
+            f.write("guid: playerplayerplayerplayerplayer01\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Lasso\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Player\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: lassolassolassolassolassolasso01}\n"
+                "  changeLengthInput: 0\n"
+                "--- !u!4 &11\nTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &12\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: playerplayerplayerplayerplayer01}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-inst-field-set-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.cpp")) as f:
+            eng = f.read()
+        self.assertIn(
+            "Lasso_set_changeLengthInput(Lasso_Instance(), ((int) amt));",
+            eng)
+        self.assertNotRegex(
+            eng, r"Lasso_get_changeLengthInput\([^)]*\)\s*=")
+
+    def test_static_bool_field_emits_mutable_storage(self):
+        """`static bool isLoading;` → `static int Class_isLoading = 0`."""
+        root = tempfile.mkdtemp(prefix="upack-static-bool-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "SM.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class SM : MonoBehaviour {\n"
+                "    public static bool isLoading;\n"
+                "    void Awake() { isLoading = false; }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "SM.cs.meta"), "w") as f:
+            f.write("guid: smsmsmsmsmsmsmsmsmsmsmsmsmsm01\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: SM\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: smsmsmsmsmsmsmsmsmsmsmsmsmsm01}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-static-bool-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.cpp")) as f:
+            eng = f.read()
+        self.assertIn("static int SM_isLoading = 0;", eng)
+        awake = eng.split("static void SM_Awake(", 1)[1].split("\n}", 1)[0]
+        self.assertIn("SM_isLoading = 0", awake)
+
     def test_toggle_is_on_does_not_span_prior_index_expr(self):
         """equipped[i]; … toggles[x].isOn must not merge (DOTALL bug → CS0000)."""
         src = (
@@ -6297,7 +6407,6 @@ class TestSystems(unittest.TestCase):
         self.assertEqual((cw, ch), (4, 4))
         self.assertEqual(crgba[0:4], b"\x00\xff\x00\xff")
 
-
     def test_sprite_sheet_crop_uses_bottom_up_y(self):
         """Sheet rect y is bottom-origin on an already bottom-up buffer.
 
@@ -8322,6 +8431,7 @@ class TestSystems(unittest.TestCase):
         plan = unity_pack.pack(root, d)
         self.assertTrue(plan.get("ui_buttons"))
         self.assertTrue(plan["ui_buttons"][0].get("calls"))
+
     def test_prefab_button_onclick_mb_string_method(self):
         """PrefabInstance Button onClick BeginGame(string) → engine dispatch."""
         root = tempfile.mkdtemp(prefix="upack-uibtn-mb-")

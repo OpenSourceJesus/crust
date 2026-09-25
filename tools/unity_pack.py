@@ -8871,7 +8871,18 @@ def _rewrite_mb_static_and_singleton(text, plan, cl):
         use_inst = ocname in singleton_types or ocname in (
             plan.get("findobject_types") or ())
         # Other.Instance.field / Other.instance.field
+        # Writes before reads — otherwise `Instance.f = v` becomes
+        # `Class_get_f(Class_Instance()) = v` (not an lvalue → CS0000).
         for vf in ocl.get("vec2_fields") or []:
+            text = cs2cpp.code_sub(
+                r"(?<![\w.])%s\s*\.\s*(?:Instance|instance)\s*\.\s*%s\s*=\s*"
+                r"([^;]+);"
+                % (re.escape(ocname), re.escape(vf)),
+                lambda m, o=oidn, f=vf, ix=inst: (
+                    "%s_set_%s_x(%s, Vector2_x(%s)); "
+                    "%s_set_%s_y(%s, Vector2_y(%s));"
+                    % (o, f, ix, m.group(1), o, f, ix, m.group(1))),
+                text)
             text = cs2cpp.code_sub(
                 r"(?<![\w.])%s\s*\.\s*(?:Instance|instance)\s*\.\s*%s\b"
                 % (re.escape(ocname), re.escape(vf)),
@@ -8884,6 +8895,12 @@ def _rewrite_mb_static_and_singleton(text, plan, cl):
                 continue
             if mem.startswith("pos_"):
                 continue
+            text = cs2cpp.code_sub(
+                r"(?<![\w.])%s\s*\.\s*(?:Instance|instance)\s*\.\s*%s\s*=\s*"
+                r"([^;]+);"
+                % (re.escape(ocname), re.escape(mem)),
+                "%s_set_%s(%s, (\\1));" % (oidn, mem, inst),
+                text)
             text = cs2cpp.code_sub(
                 r"(?<![\w.])%s\s*\.\s*(?:Instance|instance)\s*\.\s*%s\b"
                 % (re.escape(ocname), re.escape(mem)),
@@ -12749,6 +12766,14 @@ def emit_engine(plan, analyses, used_apis):
                     path = ""
                 p("static const char %s_%s[] = %s;" % (
                     idn, fname, _c_string(path)))
+            elif f.get("ty") == "bool":
+                # `static bool flag;` / `= false` — mutable unless C# const.
+                truthy = default in (True, 1, "true", "True")
+                init = 1 if truthy else 0
+                if f.get("const"):
+                    p("static const int %s_%s = %d;" % (idn, fname, init))
+                else:
+                    p("static int %s_%s = %d;" % (idn, fname, init))
             elif isinstance(default, (int, float)) and default is not None:
                 if f.get("ty") == "float":
                     p("static const float %s_%s = %sf;" % (
@@ -12761,6 +12786,7 @@ def emit_engine(plan, analyses, used_apis):
             # List / Dictionary / SortedList / ref arrays: preamble above.
         if any(
                 f.get("ty") == "string"
+                or f.get("ty") == "bool"
                 or isinstance(f.get("default"), (int, float))
                 or f.get("ty") in ("StreamWriter", "StreamReader")
                 for f in (cl.get("class_consts") or [])):
