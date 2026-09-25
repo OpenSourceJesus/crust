@@ -2486,8 +2486,16 @@ def _ui_screen_rect(o, by_xf, screen_w, screen_h, cache):
     lcx, lcy, rw, rh = _rect_pivot_center(
         plw, plh, amin, amax, apos, size, pivot)
     sx, sy = _ui_own_scale(o)
-    rw = abs(float(rw)) * sx
-    rh = abs(float(rh)) * sy
+    rw0 = abs(float(rw))
+    rh0 = abs(float(rh))
+    # Unity localScale is about the pivot — the pivot stays fixed; the
+    # geometric center moves toward it when scale ≠ 1 (center pivot: no move).
+    px = float(pivot[0])
+    py = float(pivot[1])
+    lcx = float(lcx) + (0.5 - px) * rw0 * (sx - 1.0)
+    lcy = float(lcy) + (0.5 - py) * rh0 * (sy - 1.0)
+    rw = rw0 * sx
+    rh = rh0 * sy
     cx = plx + float(lcx) * fsx
     cy = ply + float(lcy) * fsy
     cache[key] = (cx, cy, rw * fsx, rh * fsy)

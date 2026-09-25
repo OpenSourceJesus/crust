@@ -6632,6 +6632,82 @@ class TestSystems(unittest.TestCase):
         self.assertAlmostEqual(rh, 25.0, places=5)
 
 
+    def test_ui_local_scale_keeps_pivot_fixed(self):
+        """Own localScale shrinks about pivot — corner pivot stays anchored."""
+        by_xf = {
+            "1": {
+                "xf_id": "1",
+                "canvas": {"render_mode": 0, "enabled": 1},
+                "rect": {
+                    "anchor_min": (0.0, 0.0), "anchor_max": (1.0, 1.0),
+                    "anchored_position": (0.0, 0.0), "size_delta": (0.0, 0.0),
+                    "pivot": (0.5, 0.5),
+                },
+                "local_scale": (1.0, 1.0, 1.0),
+            },
+            "2": {
+                "xf_id": "2",
+                "father_id": "1",
+                "rect": {
+                    # Top-left of canvas; pivot top-left; scale 0.5.
+                    "anchor_min": (0.0, 1.0), "anchor_max": (0.0, 1.0),
+                    "anchored_position": (0.0, 0.0), "size_delta": (200.0, 100.0),
+                    "pivot": (0.0, 1.0),
+                },
+                "local_scale": (0.5, 0.5, 1.0),
+            },
+        }
+        cache = {}
+        cx, cy, rw, rh = unity_pack._ui_screen_rect(
+            by_xf["2"], by_xf, 800, 600, cache)
+        # Pivot stays at canvas top-left (0, 600); size 100×50.
+        self.assertAlmostEqual(rw, 100.0, places=5)
+        self.assertAlmostEqual(rh, 50.0, places=5)
+        left = cx - rw * 0.5
+        top = cy + rh * 0.5
+        self.assertAlmostEqual(left, 0.0, places=5)
+        self.assertAlmostEqual(top, 600.0, places=5)
+
+
+
+
+    def test_ui_local_scale_keeps_pivot_fixed(self):
+        """Own localScale shrinks about pivot — corner pivot stays anchored."""
+        by_xf = {
+            "1": {
+                "xf_id": "1",
+                "canvas": {"render_mode": 0, "enabled": 1},
+                "rect": {
+                    "anchor_min": (0.0, 0.0), "anchor_max": (1.0, 1.0),
+                    "anchored_position": (0.0, 0.0), "size_delta": (0.0, 0.0),
+                    "pivot": (0.5, 0.5),
+                },
+                "local_scale": (1.0, 1.0, 1.0),
+            },
+            "2": {
+                "xf_id": "2",
+                "father_id": "1",
+                "rect": {
+                    # Top-left of canvas; pivot top-left; scale 0.5.
+                    "anchor_min": (0.0, 1.0), "anchor_max": (0.0, 1.0),
+                    "anchored_position": (0.0, 0.0), "size_delta": (200.0, 100.0),
+                    "pivot": (0.0, 1.0),
+                },
+                "local_scale": (0.5, 0.5, 1.0),
+            },
+        }
+        cache = {}
+        cx, cy, rw, rh = unity_pack._ui_screen_rect(
+            by_xf["2"], by_xf, 800, 600, cache)
+        # Pivot stays at canvas top-left (0, 600); size 100×50.
+        self.assertAlmostEqual(rw, 100.0, places=5)
+        self.assertAlmostEqual(rh, 50.0, places=5)
+        left = cx - rw * 0.5
+        top = cy + rh * 0.5
+        self.assertAlmostEqual(left, 0.0, places=5)
+        self.assertAlmostEqual(top, 600.0, places=5)
+
+
     def test_image_preserve_aspect_fits_inside_rect(self):
         """m_PreserveAspect: 1 → Simple Image fits sprite aspect in the rect."""
         # Square rect, 2:1 sprite → width fills, height halves.
