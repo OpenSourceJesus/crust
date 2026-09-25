@@ -3362,11 +3362,14 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None,
     """Resolve authored uGUI Image / TextMeshProUGUI → world sprites.
 
     Screen Space Overlay (0) and Screen Space Camera (1): map canvas pixels to
-    the main ortho camera frustum. World Space (2) is not supported yet.
-    Project PNG sprites and Unity builtin UISprites draw; Image.type Sliced
-    9-slices with sprite borders (UISprite corners stay fixed). Authored
-    ``m_PreserveAspect`` on Simple Images fits the sprite inside the
-    RectTransform (Unity GenerateSimpleSprite) instead of stretching.
+    the main ortho camera frustum. Nested World Space (2) canvases under a
+    Screen Space ancestor still bake (use ancestor mode for mapping, nested
+    Override Sorting for draw order). Standalone World Space is mapped as
+    Overlay so Images are not dropped. Project PNG sprites and Unity builtin
+    UISprites draw; Image.type Sliced 9-slices with sprite borders (UISprite
+    corners stay fixed). Authored ``m_PreserveAspect`` on Simple Images fits
+    the sprite inside the RectTransform (Unity GenerateSimpleSprite) instead
+    of stretching.
     Empty m_Sprite is skipped (no invent). TMP needs an authored font asset
     with atlas + glyph tables.
 
@@ -3408,27 +3411,74 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None,
     png_cache = {}
 
     def _find_canvas(o):
-        canvas = None
-        fid = o.get("father_id")
+        """Resolve Canvas for bake: sorting from nested override, mode from SS.
+
+        PrefabInstance UI buttons often add a nested Canvas (World Space +
+        Override Sorting) on the button root. Sorting must come from that
+        nested canvas so Images draw above sibling menus; bake mapping still
+        needs Overlay / Screen Space Camera from an ancestor (nested World
+        Space alone would skip the draw).
+        """
+        default = {"render_mode": 0, "sorting_layer_id": 0,
+                   "sorting_order": 0, "enabled": 1, "override_sorting": 0}
+        # Nearest-first walk: self, then parents (packed or hierarchy stubs).
+        nodes = []
+        cur = o
         guard = 0
-        while fid and guard < 64:
+        seen = set()
+        while cur is not None and guard < 64:
             guard += 1
+            xid = str(cur.get("xf_id") or id(cur))
+            if xid in seen:
+                break
+            seen.add(xid)
+            nodes.append(cur)
+            fid = cur.get("father_id")
+            if not fid:
+                break
             fid_s = str(fid)
             parent = by_xf.get(fid_s)
             if parent is not None:
-                if parent.get("canvas"):
-                    canvas = parent["canvas"]
-                    break
-                fid = parent.get("father_id")
+                cur = parent
                 continue
-            # Stripped PrefabInstance root: continue via hierarchy fathers.
-            if fid_s not in hier_father:
-                break
-            fid = hier_father[fid_s]
-        if canvas is None:
-            canvas = {"render_mode": 0, "sorting_layer_id": 0,
-                      "sorting_order": 0, "enabled": 1}
-        return canvas
+            # Climb hierarchy-only fathers until a packed object appears.
+            hops = 0
+            while fid_s and hops < 64 and fid_s not in by_xf:
+                hops += 1
+                if fid_s not in hier_father:
+                    fid_s = None
+                    break
+                nxt = hier_father[fid_s]
+                fid_s = str(nxt) if nxt is not None else None
+            cur = by_xf.get(fid_s) if fid_s else None
+        sort_c = None
+        first_c = None
+        root_c = None
+        mode_c = None
+        for node in nodes:
+            c = node.get("canvas")
+            if not c:
+                continue
+            if first_c is None:
+                first_c = c
+            root_c = c
+            if sort_c is None and int(c.get("override_sorting") or 0):
+                sort_c = c
+            if (mode_c is None
+                    and int(c.get("render_mode", 0)) in (0, 1)):
+                mode_c = c
+        # No Override Sorting → inherit root canvas order (Unity default).
+        if sort_c is None:
+            sort_c = root_c or first_c
+        if sort_c is None:
+            return default
+        out = dict(sort_c)
+        if mode_c is not None:
+            out["render_mode"] = int(mode_c.get("render_mode", 0))
+        elif int(out.get("render_mode", 0)) not in (0, 1):
+            # Nested World Space with no SS ancestor: still map as Overlay.
+            out["render_mode"] = 0
+        return out
 
     def _apply_layout(o, cx, cy, rw, rh, canvas, source, color, extra=None):
         """Map rect to UI hit + sprite (rw/rh are draw size)."""
@@ -3967,6 +4017,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             pd = re.search(r"(?m)^\s+m_PlaneDistance:\s*([0-9.eE+-]+)", block)
             sid = re.search(r"(?m)^\s+m_SortingLayerID:\s*(-?\d+)", block)
             so = re.search(r"(?m)^\s+m_SortingOrder:\s*(-?\d+)", block)
+            ovs = re.search(r"(?m)^\s+m_OverrideSorting:\s*(\d+)", block)
             rec["canvas"] = {
                 "enabled": int(en.group(1)) if en else 1,
                 "render_mode": int(rm.group(1)) if rm else 0,
@@ -3974,6 +4025,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "plane_distance": float(pd.group(1)) if pd else 100.0,
                 "sorting_layer_id": int(sid.group(1)) if sid else 0,
                 "sorting_order": int(so.group(1)) if so else 0,
+                "override_sorting": int(ovs.group(1)) if ovs else 0,
             }
         if kind == "MonoBehaviour":
             # Builtin uGUI Image — not a project .cs, but authored scene UI.
@@ -4778,6 +4830,25 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
     return objects, lights, cameras, hierarchy
 
 
+def _canvas_by_gameobject(by_id):
+    """GameObject fileID → canvas dict from scene Canvas components.
+
+    PrefabInstance ``m_AddedComponents`` Canvas blocks reference the stripped
+    GO via ``m_GameObject``; the stripped GO YAML has no ``m_Component`` list,
+    so the main join loop never sees them without this reverse map.
+    """
+    out = {}
+    for rec in (by_id or {}).values():
+        if rec.get("kind") != "Canvas" or not rec.get("canvas"):
+            continue
+        raw = rec.get("raw") or ""
+        gm = re.search(
+            r"(?m)^\s+m_GameObject:\s*\{fileID:\s*(\d+)\}", raw)
+        if gm:
+            out[str(gm.group(1))] = dict(rec["canvas"])
+    return out
+
+
 def _prefab_mod_float(raw, path, default=None):
     """Last matching PrefabInstance modification float (root overrides win)."""
     matches = re.findall(
@@ -4824,6 +4895,7 @@ def _materialize_prefab_instance_ui(by_id, objects, asset_guids,
     guid_to_script = guid_to_script or {}
     editor_only_xfs = editor_only_xfs or set()
     have_xf = {str(o.get("xf_id")) for o in objects if o.get("xf_id")}
+    canvas_by_go = _canvas_by_gameobject(by_id)
     # PrefabInstance id → root stripped Transform (father == PI TransformParent).
     roots = {}
     for rec in by_id.values():
@@ -4918,6 +4990,8 @@ def _materialize_prefab_instance_ui(by_id, objects, asset_guids,
         # Stable go_id for PrefabInstance roots (scene often has no GO stub).
         if go_id is None:
             go_id = "prefabinst:%s:%s" % (pi_id, xf_id)
+        # Nested Canvas from PrefabInstance m_AddedComponents (override sort).
+        canvas = canvas_by_go.get(str(go_id)) if go_id else None
         objects.append({
             "name": name,
             "pos": pi.get("pos") or (0.0, 0.0, 0.0),
@@ -4934,7 +5008,7 @@ def _materialize_prefab_instance_ui(by_id, objects, asset_guids,
             "script": None,
             "class": _scriptless_packed_class(name),
             "sprite": None,
-            "canvas": None,
+            "canvas": canvas,
             "rect": _prefab_mod_rect(raw),
             "ui_image": {
                 "r": 1.0, "g": 1.0, "b": 1.0, "a": 1.0,
@@ -5189,6 +5263,7 @@ def _append_prefab_instance_ui_objects(
     if not asset_guids:
         return
     existing_xf = {str(o.get("xf_id")) for o in objects if o.get("xf_id")}
+    canvas_by_go = _canvas_by_gameobject(by_id)
     # PrefabInstance id → stripped Transform records that reference it.
     stripped_by_inst = {}
     for fid, rec in by_id.items():
@@ -5243,17 +5318,35 @@ def _append_prefab_instance_ui_objects(
             # Image-only materialize may have created this xf already — attach
             # Button / UIButton ColorBlock + onClick from the source prefab.
             if xf_id in existing_xf:
-                if ui_button:
-                    for o in objects:
-                        if str(o.get("xf_id")) != xf_id:
-                            continue
-                        if not o.get("ui_button"):
-                            o["ui_button"] = ui_button
-                        # Prefer a stable prefabinst go_id when scene stub
-                        # left go_id None (needed by _build_ui_buttons).
-                        if o.get("go_id") is None:
-                            o["go_id"] = "prefabinst:%s:%s" % (inst_id, xf_id)
-                        break
+                for o in objects:
+                    if str(o.get("xf_id")) != xf_id:
+                        continue
+                    if ui_button and not o.get("ui_button"):
+                        o["ui_button"] = ui_button
+                    # Prefer a stable prefabinst go_id when scene stub
+                    # left go_id None (needed by _build_ui_buttons).
+                    if o.get("go_id") is None:
+                        o["go_id"] = "prefabinst:%s:%s" % (inst_id, xf_id)
+                    # Nested Canvas from m_AddedComponents on stripped GO.
+                    if not o.get("canvas"):
+                        gid = None
+                        for g in by_id.values():
+                            if g.get("kind") != "GameObject":
+                                continue
+                            graw = g.get("raw") or ""
+                            if re.search(
+                                    r"(?m)^\s+m_PrefabInstance:\s*"
+                                    r"\{fileID:\s*%s\}"
+                                    % re.escape(inst_id), graw):
+                                gid = g.get("file_id")
+                                o["go_id"] = gid
+                                break
+                        if gid is None:
+                            gid = o.get("go_id")
+                        c = canvas_by_go.get(str(gid)) if gid else None
+                        if c:
+                            o["canvas"] = c
+                    break
                 continue
             mods = _prefab_mod_values(inst_raw, stub["src_xf"])
             # m_IsActive targets the prefab GameObject fileID, not the RT.
@@ -5282,6 +5375,18 @@ def _append_prefab_instance_ui_objects(
             ui_image = dict(src["ui_image"]) if src.get("ui_image") else None
             ui_image = _apply_ui_image_sprite_mod(
                 ui_image, inst_raw, asset_guids)
+            go_id = "prefabinst:%s:%s" % (inst_id, xf_id)
+            # Prefer stripped GameObject fileID when present (AddedComponents).
+            for g in by_id.values():
+                if g.get("kind") != "GameObject":
+                    continue
+                graw = g.get("raw") or ""
+                if re.search(
+                        r"(?m)^\s+m_PrefabInstance:\s*\{fileID:\s*%s\}"
+                        % re.escape(inst_id), graw):
+                    go_id = g.get("file_id")
+                    break
+            canvas = canvas_by_go.get(str(go_id)) if go_id else None
             obj = {
                 "name": name,
                 "pos": src.get("pos") or (0.0, 0.0, 0.0),
@@ -5292,13 +5397,13 @@ def _append_prefab_instance_ui_objects(
                 "scale": scale,
                 "father_id": father_id,
                 "xf_id": xf_id,
-                "go_id": "prefabinst:%s:%s" % (inst_id, xf_id),
+                "go_id": go_id,
                 "active": 1 if active else 0,
                 "fields": {},
                 "script": None,
                 "class": "_Rect",
                 "sprite": None,
-                "canvas": None,
+                "canvas": canvas,
                 "rect": rect,
                 "ui_image": ui_image,
                 "ui_button": ui_button,
@@ -5324,7 +5429,7 @@ def _append_prefab_instance_ui_objects(
                 "father_id": father_id,
                 "go_id": obj["go_id"],
                 "active": 1 if active else 0,
-                "has_canvas": False,
+                "has_canvas": bool(canvas),
                 "has_image": bool(ui_image),
                 "has_button": bool(ui_button),
                 "has_tmp": False,
@@ -5335,6 +5440,7 @@ def _append_prefab_instance_ui_objects(
             stub["rec"]["scale"] = scale
             if father_id:
                 stub["rec"]["father_id"] = father_id
+
 
 def parse_godot_tscn(text):
     """Godot .tscn nodes with a script class name and exported numbers."""
@@ -10855,13 +10961,6 @@ def emit_engine(plan, analyses, used_apis):
                     nbtn * 4, _f4("disabled")))
                 p("static float _engine_ui_btn_tint[%d];" % (nbtn * 4))
                 p("static int _engine_ui_btn_tint_inited;")
-                p("static void _engine_ui_btn_tint_init(void) {")
-                p("    int i;")
-                p("    if (_engine_ui_btn_tint_inited) return;")
-                p("    _engine_ui_btn_tint_inited = 1;")
-                p("    for (i = 0; i < %d; i = i + 1)" % (nbtn * 4))
-                p("        _engine_ui_btn_tint[i] = _engine_ui_btn_col_n[i];")
-                p("}")
                 # Button held after pointer-down on it; -1 = none.
                 # Stays until pointer-up (mouse-off does not cancel press).
                 p("static int _engine_ui_btn_press = -1;")

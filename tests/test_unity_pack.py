@@ -6631,46 +6631,6 @@ class TestSystems(unittest.TestCase):
         self.assertAlmostEqual(rw, 50.0, places=5)
         self.assertAlmostEqual(rh, 25.0, places=5)
 
-
-    def test_ui_local_scale_keeps_pivot_fixed(self):
-        """Own localScale shrinks about pivot — corner pivot stays anchored."""
-        by_xf = {
-            "1": {
-                "xf_id": "1",
-                "canvas": {"render_mode": 0, "enabled": 1},
-                "rect": {
-                    "anchor_min": (0.0, 0.0), "anchor_max": (1.0, 1.0),
-                    "anchored_position": (0.0, 0.0), "size_delta": (0.0, 0.0),
-                    "pivot": (0.5, 0.5),
-                },
-                "local_scale": (1.0, 1.0, 1.0),
-            },
-            "2": {
-                "xf_id": "2",
-                "father_id": "1",
-                "rect": {
-                    # Top-left of canvas; pivot top-left; scale 0.5.
-                    "anchor_min": (0.0, 1.0), "anchor_max": (0.0, 1.0),
-                    "anchored_position": (0.0, 0.0), "size_delta": (200.0, 100.0),
-                    "pivot": (0.0, 1.0),
-                },
-                "local_scale": (0.5, 0.5, 1.0),
-            },
-        }
-        cache = {}
-        cx, cy, rw, rh = unity_pack._ui_screen_rect(
-            by_xf["2"], by_xf, 800, 600, cache)
-        # Pivot stays at canvas top-left (0, 600); size 100×50.
-        self.assertAlmostEqual(rw, 100.0, places=5)
-        self.assertAlmostEqual(rh, 50.0, places=5)
-        left = cx - rw * 0.5
-        top = cy + rh * 0.5
-        self.assertAlmostEqual(left, 0.0, places=5)
-        self.assertAlmostEqual(top, 600.0, places=5)
-
-
-
-
     def test_ui_local_scale_keeps_pivot_fixed(self):
         """Own localScale shrinks about pivot — corner pivot stays anchored."""
         by_xf = {
@@ -7200,6 +7160,227 @@ class TestSystems(unittest.TestCase):
         self.assertAlmostEqual(hit.get("hw", 0) * 2, 100.0, places=3)
         self.assertAlmostEqual(hit.get("hh", 0) * 2, 50.0, places=3)
         self.assertLess(hit.get("nhw", 1), 0.2)
+
+    def test_prefab_added_canvas_override_sorting_bakes_above(self):
+        """PrefabInstance m_AddedComponents Canvas Override Sorting applies.
+
+        Stripped UI Button roots often add a nested Canvas (World Space +
+        override sort). Without attaching that Canvas, the Image inherits the
+        root order and can be covered by sibling menu Images while TMP (+1)
+        still shows. Nested World Space must still bake via ancestor SS mode.
+        """
+        root = tempfile.mkdtemp(prefix="upack-prefab-canvas-sort-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        prefabs = os.path.join(root, "Assets", "Prefabs")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scripts)
+        os.makedirs(prefabs)
+        os.makedirs(scene)
+        host_guid = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+        pref_guid = "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"
+        img = "fe87c0e1cc204ed48ad3b37840f39efc"
+        builtin = "0000000000000000f000000000000000"
+        with open(os.path.join(scripts, "Host.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Host : MonoBehaviour { void Update() {} }\n"
+            )
+        with open(os.path.join(scripts, "Host.cs.meta"), "w") as f:
+            f.write("guid: %s\n" % host_guid)
+        # Minimal UI Button prefab: root Image (empty sprite) + RectTransform.
+        with open(os.path.join(prefabs, "UIButton.prefab"), "w") as f:
+            f.write(
+                "%%YAML 1.1\n"
+                "--- !u!1 &100\nGameObject:\n  m_Name: UI Button\n"
+                "  m_IsActive: 1\n"
+                "  m_Component:\n  - component: {fileID: 200}\n"
+                "  - component: {fileID: 300}\n"
+                "--- !u!224 &200\nRectTransform:\n"
+                "  m_GameObject: {fileID: 100}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_AnchorMin: {x: 0.5, y: 0.5}\n"
+                "  m_AnchorMax: {x: 0.5, y: 0.5}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 200, y: 100}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "--- !u!114 &300\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 100}\n"
+                "  m_Enabled: 1\n"
+                "  m_Script: {fileID: 11500000, guid: " + img + "}\n"
+                "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+                "  m_Sprite: {fileID: 0}\n"
+                "  m_Type: 0\n"
+                "  m_PreserveAspect: 1\n"
+            )
+        with open(os.path.join(prefabs, "UIButton.prefab.meta"), "w") as f:
+            f.write("guid: %s\n" % pref_guid)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Canvas\n"
+                "  m_IsActive: 1\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "  - component: {fileID: 4}\n"
+                "--- !u!224 &2\nRectTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 0, y: 0}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!223 &3\nCanvas:\n  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n  m_RenderMode: 0\n"
+                "  m_OverrideSorting: 0\n"
+                "  m_SortingLayerID: 0\n"
+                "  m_SortingOrder: -2\n"
+                "--- !u!114 &4\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, guid: " + host_guid + "}\n"
+                # Full-screen panel that would cover a same-order button Image.
+                "--- !u!1 &20\nGameObject:\n  m_Name: Panel\n"
+                "  m_IsActive: 1\n"
+                "  m_Component:\n  - component: {fileID: 21}\n"
+                "  - component: {fileID: 22}\n"
+                "--- !u!224 &21\nRectTransform:\n"
+                "  m_GameObject: {fileID: 20}\n"
+                "  m_Father: {fileID: 2}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 0, y: 0}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!114 &22\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 20}\n"
+                "  m_Enabled: 1\n"
+                "  m_Script: {fileID: 11500000, guid: " + img + "}\n"
+                "  m_Sprite: {fileID: 10905, guid: " + builtin + ", type: 3}\n"
+                "  m_Type: 1\n"
+                "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+                # PrefabInstance UI button with stripped GO + added Canvas.
+                "--- !u!1001 &50\nPrefabInstance:\n"
+                "  m_Modification:\n"
+                "    m_TransformParent: {fileID: 2}\n"
+                "    m_Modifications:\n"
+                "    - target: {fileID: 200, guid: " + pref_guid + ", type: 3}\n"
+                "      propertyPath: m_AnchorMin.x\n"
+                "      value: 0.5\n"
+                "      objectReference: {fileID: 0}\n"
+                "    - target: {fileID: 200, guid: " + pref_guid + ", type: 3}\n"
+                "      propertyPath: m_AnchorMin.y\n"
+                "      value: 0.5\n"
+                "      objectReference: {fileID: 0}\n"
+                "    - target: {fileID: 200, guid: " + pref_guid + ", type: 3}\n"
+                "      propertyPath: m_AnchorMax.x\n"
+                "      value: 0.5\n"
+                "      objectReference: {fileID: 0}\n"
+                "    - target: {fileID: 200, guid: " + pref_guid + ", type: 3}\n"
+                "      propertyPath: m_AnchorMax.y\n"
+                "      value: 0.5\n"
+                "      objectReference: {fileID: 0}\n"
+                "    - target: {fileID: 200, guid: " + pref_guid + ", type: 3}\n"
+                "      propertyPath: m_SizeDelta.x\n"
+                "      value: 200\n"
+                "      objectReference: {fileID: 0}\n"
+                "    - target: {fileID: 200, guid: " + pref_guid + ", type: 3}\n"
+                "      propertyPath: m_SizeDelta.y\n"
+                "      value: 100\n"
+                "      objectReference: {fileID: 0}\n"
+                "    - target: {fileID: 200, guid: " + pref_guid + ", type: 3}\n"
+                "      propertyPath: m_AnchoredPosition.x\n"
+                "      value: 0\n"
+                "      objectReference: {fileID: 0}\n"
+                "    - target: {fileID: 200, guid: " + pref_guid + ", type: 3}\n"
+                "      propertyPath: m_AnchoredPosition.y\n"
+                "      value: 0\n"
+                "      objectReference: {fileID: 0}\n"
+                "    - target: {fileID: 300, guid: " + pref_guid + ", type: 3}\n"
+                "      propertyPath: m_Sprite\n"
+                "      value: \n"
+                "      objectReference: {fileID: 10905, guid: " + builtin
+                + ", type: 3}\n"
+                "    - target: {fileID: 100, guid: " + pref_guid + ", type: 3}\n"
+                "      propertyPath: m_Name\n"
+                "      value: Diff Button\n"
+                "      objectReference: {fileID: 0}\n"
+                "    - target: {fileID: 100, guid: " + pref_guid + ", type: 3}\n"
+                "      propertyPath: m_IsActive\n"
+                "      value: 1\n"
+                "      objectReference: {fileID: 0}\n"
+                "    m_RemovedComponents: []\n"
+                "    m_RemovedGameObjects: []\n"
+                "    m_AddedGameObjects: []\n"
+                "    m_AddedComponents:\n"
+                "    - targetCorrespondingSourceObject: "
+                "{fileID: 100, guid: " + pref_guid + ", type: 3}\n"
+                "      insertIndex: -1\n"
+                "      addedObject: {fileID: 53}\n"
+                "  m_SourcePrefab: {fileID: 100100000, guid: " + pref_guid
+                + ", type: 3}\n"
+                "--- !u!224 &51 stripped\nRectTransform:\n"
+                "  m_CorrespondingSourceObject: {fileID: 200, guid: "
+                + pref_guid + ", type: 3}\n"
+                "  m_PrefabInstance: {fileID: 50}\n"
+                "--- !u!1 &52 stripped\nGameObject:\n"
+                "  m_CorrespondingSourceObject: {fileID: 100, guid: "
+                + pref_guid + ", type: 3}\n"
+                "  m_PrefabInstance: {fileID: 50}\n"
+                "--- !u!223 &53\nCanvas:\n"
+                "  m_GameObject: {fileID: 52}\n"
+                "  m_Enabled: 1\n"
+                "  m_RenderMode: 2\n"
+                "  m_OverrideSorting: 1\n"
+                "  m_SortingLayerID: 0\n"
+                "  m_SortingOrder: 50\n"
+                "--- !u!1 &100\nGameObject:\n  m_Name: Main Camera\n"
+                "  m_Component:\n  - component: {fileID: 101}\n"
+                "  - component: {fileID: 102}\n"
+                "--- !u!4 &101\nTransform:\n"
+                "  m_GameObject: {fileID: 100}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: -10}\n"
+                "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "--- !u!20 &102\nCamera:\n"
+                "  m_GameObject: {fileID: 100}\n"
+                "  orthographic: 1\n"
+                "  orthographic size: 5\n"
+                "  m_BackGroundColor: {r: 0, g: 0, b: 0, a: 1}\n"
+            )
+        ps = os.path.join(root, "ProjectSettings")
+        os.makedirs(ps)
+        with open(os.path.join(ps, "EditorBuildSettings.asset"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1045 &1\nEditorBuildSettings:\n"
+                "  m_Scenes:\n"
+                "  - enabled: 1\n"
+                "    path: Assets/Scenes/S.unity\n"
+            )
+        with open(os.path.join(ps, "ProjectSettings.asset"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!129 &1\nPlayerSettings:\n"
+                "  defaultScreenWidth: 800\n"
+                "  defaultScreenHeight: 600\n"
+            )
+        objs, _a, _l, _c, _h = unity_pack.load_project(root)
+        btn = [o for o in objs if o.get("name") == "Diff Button"][0]
+        panel = [o for o in objs if o.get("name") == "Panel"][0]
+        self.assertTrue(btn.get("canvas"), "added Canvas must attach")
+        self.assertEqual(int(btn["canvas"].get("sorting_order") or 0), 50)
+        self.assertEqual(int(btn["canvas"].get("override_sorting") or 0), 1)
+        bsp = btn.get("sprite") or {}
+        psp = panel.get("sprite") or {}
+        self.assertTrue(bsp.get("has_sprite"), "button Image must bake")
+        self.assertTrue(psp.get("has_sprite"), "panel Image must bake")
+        self.assertEqual(int(bsp.get("sorting_order") or 0), 50)
+        self.assertEqual(int(psp.get("sorting_order") or 0), -2)
+        self.assertGreater(
+            int(bsp.get("sorting_order") or 0),
+            int(psp.get("sorting_order") or 0))
 
     def test_preserve_aspect_top_left_pivot_draw_flush(self):
         """preserveAspect + pivot (0,1): sprite TL flush with rect TL."""
