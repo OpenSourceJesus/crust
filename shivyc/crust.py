@@ -907,6 +907,7 @@ class Parser:
         self.no_struct_lit = 0          # >0 while parsing a condition
         self.behind_ref = 0             # >0 while parsing the pointee of `&`
         self.expected = []              # target types, for inferring `None`
+        self.synth_main = False         # parsing a unit `fn main` as C main
         self.tmp_n = 0                  # counter for generated temporaries
         self.pending = []               # statements hoisted out of `?`
         # While a `match` in value position is being lowered, a tail
@@ -2442,6 +2443,12 @@ class Parser:
                         and e.type.base in self.unit.fn_ptrs:
                     sig = self.unit.fn_ptrs[e.type.base]
                 params = (sig[1] if sig else []) or []
+                if not params and e.code in self.unit.variants:
+                    # a variant's payload is its signature: `Box::new(3)`
+                    # as a `Box<i64>` payload is `Box_long_new`
+                    payload = self._payload_of(e.code)
+                    if payload:
+                        params = [ty for _, ty in payload]
                 args, atypes, aexprs = [], [], []
                 while not self.at(")", "punc"):
                     want = params[len(args)] if len(args) < len(params) \
@@ -4232,7 +4239,15 @@ class Parser:
             if self.at(")", "punc"):
                 self.next()
                 return Expr("0", VOID)              # the unit value
-            first = self.parse_expr()
+            # A tuple literal where a tuple type is expected takes that
+            # type, element by element: `(1, 2)` as an `(i64, i64)` argument
+            # is that tuple, not an `(i32, i32)` one C cannot convert.
+            want = self.target
+            want_elems = self.unit.tuples.get(want.base) \
+                if want is not None and not want.ptr and not want.array \
+                else None
+            first = self.parse_expr_as(want_elems[0]) if want_elems \
+                else self.parse_expr()
             if self.at("..", "punc") or self.at("..=", "punc"):
                 # `(lo..hi)` -- a range, as an iterator's source.
                 ch = IterChain()
@@ -4250,12 +4265,18 @@ class Parser:
             while self.accept(","):
                 if self.at(")", "punc"):
                     break
-                items.append(self.parse_expr())
+                k = len(items)
+                items.append(self.parse_expr_as(want_elems[k])
+                             if want_elems and k < len(want_elems)
+                             else self.parse_expr())
             self.expect(")")
-            if any(i.type is None for i in items):
-                self.err("cannot infer the type of a tuple element; "
-                         "annotate it")
-            ty = self.unit.tuple_type([i.type for i in items])
+            if want_elems and len(want_elems) == len(items):
+                ty = want
+            else:
+                if any(i.type is None for i in items):
+                    self.err("cannot infer the type of a tuple element; "
+                             "annotate it")
+                ty = self.unit.tuple_type([i.type for i in items])
             inits = ", ".join("._%d = %s" % (k, i.code)
                               for k, i in enumerate(items))
             return Expr("(%s){%s}" % (ty.base, inits), ty)
@@ -4575,7 +4596,13 @@ class Parser:
             return
 
         if t.val == "{" and t.kind == "punc":
-            self.parse_block(out, indent, False)
+            # A nested block is the enclosing block's value when it is the
+            # last thing in it -- `tail_returns` was narrowed to exactly that
+            # above -- as `unsafe { .. }` below always was.  Passing False
+            # here dropped the value of `{ let a = 1; if a == 1 { 5 } else
+            # { 6 } }` at a function's tail: the C computed `5;` and
+            # returned whatever was in the register.
+            self.parse_block(out, indent, tail_returns)
             return
 
         if (t.val == "unsafe" and t.kind == "kw"
@@ -4795,7 +4822,8 @@ class Parser:
         value = None
         if self.cur.val not in ends and self.cur.kind != "eof":
             if t.val == "return":
-                value = self.parse_expr_as(self.ret_type)
+                value = self.parse_expr_as(INT if self.synth_main
+                                           else self.ret_type)
             elif t.val == "break":
                 k = self.loop_target(label, "break")
                 if not self.loop_values[k]:
@@ -4804,6 +4832,16 @@ class Parser:
             else:
                 self.err("`continue` takes no value")
         self.emit_pending(out, t.line, indent)
+        if t.val == "return" and value is not None and self.synth_main:
+            # `return 3;` in a unit `fn main` is Crust's way to set the exit
+            # status, as `int main`'s is: only a *tail* expression stops
+            # being the status (see `emit_fn_body`)
+            self.ret_type = INT
+            try:
+                self.emit_jump(out, t.line, indent, t.val, value, label)
+            finally:
+                self.ret_type = VOID
+            return
         self.emit_jump(out, t.line, indent, t.val, value, label)
 
     def tail_expect(self):
@@ -4868,7 +4906,9 @@ class Parser:
                     out.line_at(line, stmt, indent)
                 self.emit_drops(out, line, indent,
                                 self.live_frame_index(("func",)))
-                out.line_at(line, "return;", indent)
+                # a unit `main` is C's `int main`: leaving it early is exit 0
+                out.line_at(line, "return 0;" if self.synth_main
+                            else "return;", indent)
             else:
                 self._emit_return_value(out, line, indent, value)
         else:
@@ -6767,6 +6807,11 @@ class Parser:
         name = self.expect_ident()
         self.expect("{")
         variants, payloads = [], {}
+        # Known by name while its own payloads are parsed, so that
+        # `Cons(i64, Box<List>)` can instantiate `Box` over the enum being
+        # defined: a `Box` holds only a pointer to it, and a pointer to a
+        # declared-but-incomplete type is what C allows.
+        self.unit.enums.setdefault(name, [])
         while not self.at("}", "punc"):
             self.skip_attributes()
             vname = self.expect_ident()
@@ -7315,7 +7360,12 @@ class Parser:
         their name mangling and in the synthetic `self` parameter.
         """
         prev_ret = self.ret_type
-        self.ret_type = ret
+        # A unit `fn main()` becomes C's `int main` only in its signature: its
+        # body is still a unit function's, so a tail `println!(..)` is a
+        # statement and the process exits 0 -- not with printf's byte count.
+        self.ret_type = VOID if synth_main_ret else ret
+        prev_synth, self.synth_main = getattr(self, 'synth_main', False), \
+            synth_main_ret
         # Is this the `fn drop` of a user `impl Drop for T` whose fields also
         # need freeing? If so its epilogue carries the field glue, so that
         # `T_drop` remains the one complete destructor -- the symbol a C++
@@ -7373,6 +7423,7 @@ class Parser:
         out.line_at(close.line, "}", 0)
         self.scope_pop()
         self.ret_type = prev_ret
+        self.synth_main = prev_synth
 
 
 _RANK = {"signed char": 1, "unsigned char": 1, "short": 2, "unsigned short": 2,
@@ -10570,17 +10621,30 @@ def _toposort_structs(unit, order, skip=()):
 
     `skip` names structs defined elsewhere -- an included `.rs` module's
     `Option` and `Result` instantiations -- which must not be defined again.
+
+    A data-carrying enum is a node too: its payloads hold types by value
+    (`A(Point)`, `B(Vec<i64>)`, `Cons(i64, Box<List>)`), so its union must
+    come after them, and a struct holding the enum by value after it.  Its
+    tag and a forward declaration are emitted before any of this, which is
+    all a `Box<List>` inside `List` needs: a pointer.
     """
     emitted, result = set(), []
 
+    def fields_of(name):
+        if name in unit.structs:
+            return unit.structs[name]
+        return [f for fields in unit.data_enums[name].values()
+                for f in fields]
+
     def visit(name, stack):
-        if name in emitted or name in skip or name not in unit.structs:
+        if name in emitted or name in skip or (
+                name not in unit.structs and name not in unit.data_enums):
             return
         if name in stack:
-            raise CrustError("recursive struct `%s` (use a pointer field)"
-                             % name)
+            raise CrustError("recursive type `%s` holds itself by value "
+                             "(put the recursive part in a `Box`)" % name)
         stack.add(name)
-        for _, ftype in unit.structs[name]:
+        for _, ftype in fields_of(name):
             if not ftype.ptr:
                 visit(ftype.base, stack)
         stack.discard(name)
@@ -10590,6 +10654,32 @@ def _toposort_structs(unit, order, skip=()):
     for name in order:
         visit(name, set())
     return result
+
+
+def render_data_enum_head(name, variants):
+    """The part of a data enum nothing else has to precede: its tag, and
+    `struct Name` declared so that a pointer to it can be formed."""
+    return ("enum %s_tag { %s }; struct %s; typedef struct %s %s;"
+            % (name, ", ".join("%s_%s" % (name, v) for v, _ in variants),
+               name, name, name))
+
+
+def render_data_enum_body(name, variants, payloads):
+    """The payload structs and the tagged union, placed by
+    `_toposort_structs` after every type they hold by value."""
+    parts, members = [], []
+    for vname, _ in variants:
+        fields = payloads.get(vname)
+        if not fields:
+            continue
+        decls = " ".join(
+            ty.decl(fname or "_%d" % i) + ";"
+            for i, (fname, ty) in enumerate(fields))
+        parts.append("struct %s_%s_data { %s };" % (name, vname, decls))
+        members.append("struct %s_%s_data %s;" % (name, vname, vname))
+    parts.append("struct %s { enum %s_tag tag; union { %s } u; };"
+                 % (name, name, " ".join(members) or "char _empty;"))
+    return " ".join(parts)
 
 
 def render_data_enum(name, variants, payloads):
@@ -11212,10 +11302,12 @@ def translate(code, path=None):
         prelude.append("void *malloc(unsigned long);")
         prelude.append("void *realloc(void *, unsigned long);")
         prelude.append("void free(void *);")
+    data_enum_order = []
     for name in mod_enums + local["enums"]:
         if name in unit.data_enums:
-            prelude.append(render_data_enum(name, unit.enums[name],
-                                            unit.data_enums[name]))
+            # tag and declaration now; the union with the structs, below
+            prelude.append(render_data_enum_head(name, unit.enums[name]))
+            data_enum_order.append(name)
         else:
             prelude.append(_render_enum(name, unit.enums[name]))
     for name in sorted(unit.core_concrete):
@@ -11273,11 +11365,15 @@ def translate(code, path=None):
             prelude.append("struct %s; typedef struct %s %s;"
                            % (name, name, name))
     for name in _toposort_structs(
-            unit, core_structs + mod_structs + demand_structs
-            + local["structs"]
+            unit, data_enum_order + core_structs + mod_structs
+            + demand_structs + local["structs"]
             + unit.struct_order + generated,
             skip=included_options | included_results):
-        prelude.append(_render_struct(name, unit.structs[name]))
+        if name in unit.data_enums and name not in unit.structs:
+            prelude.append(render_data_enum_body(name, unit.enums[name],
+                                                 unit.data_enums[name]))
+        else:
+            prelude.append(_render_struct(name, unit.structs[name]))
     # Aliases after structs so `type Handle = Foo` can name a local struct.
     demand_aliases = [n for n in unit.demand_aliases
                       if n not in local_set and n not in mod_aliases
