@@ -88,6 +88,25 @@ _UNSIGNED = {"u8": 8, "u16": 16, "u32": 32, "u64": 64, "u128": 128,
              "usize": 64}
 _USIZE = _UNSIGNED["usize"]
 _SIGNED = ("i8", "i16", "i32", "i64", "i128", "isize")
+# Signed integers are the fragment's `Int`, with their widths.  `ml_int` is
+# what ocaml2rust calls OCaml's `int`: an `i64` at run time, whose values an
+# OCaml program keeps in 63 bits -- the range the lift assumes and owes.
+_SIGNED_WIDTH = {"i8": 8, "i16": 16, "i32": 32, "i64": 64, "i128": 128,
+                 "isize": 64, "ml_int": 63}
+
+
+def _int_lit_value(e):
+    """k, for the text `Int(k)`; else None."""
+    if e.startswith("Int(") and e.endswith(")"):
+        try:
+            return int(e[4:-1])
+        except ValueError:
+            return None
+    return None
+
+
+def _int_range(width):
+    return -(1 << (width - 1)), (1 << (width - 1)) - 1
 
 # Names a lifted variable must not take: Python's keywords, and the names
 # the fragment gives a meaning of its own.
@@ -279,6 +298,8 @@ class _Ty:
     def frag(self):
         if self.kind == "nat":
             return "Nat"
+        if self.kind == "int":
+            return "Int"
         if self.kind == "bool":
             return "Bool"
         if self.kind == "arr":
@@ -302,6 +323,15 @@ def _max(width):
 
 _BOOL = _Ty("bool")
 _LIT = _Ty("nat", 0)            # an integer literal: fits any width
+_ILIT = _Ty("int", 0)           # a signed literal (`5i64`): fits any width
+
+
+def _as_int(e, ty):
+    """An operand of signed arithmetic: an unsuffixed literal becomes
+    `Int(k)`; anything else must already be an integer."""
+    if ty.kind == "nat" and ty.width == 0 and _is_int(e):
+        return "Int(%s)" % e, _ILIT
+    return e, ty
 
 
 class _FnLifter:
@@ -322,6 +352,7 @@ class _FnLifter:
         self.cond_labels = []
         self.pending_conds = []
         self.guards = []
+        self.wrap_pending = False       # the next signed op is ml_wrap's
         self.maxes = []                 # widths whose `max_uN` is named
         # `uN::MAX` as the symbol rather than the number: in the safety lift,
         # and in a clause lifted for it, so a `requires` guarding the body
@@ -557,7 +588,8 @@ class _FnLifter:
             self.emit("return _ok")
         # A fresh name is never reused, so a starting value cannot be read by
         # anything but the code that then assigns it.
-        inits = ["    %s = %s" % (n, "False" if t.kind == "bool" else "0")
+        inits = ["    %s = %s" % (n, "False" if t.kind == "bool" else
+                                 "Int(0)" if t.kind == "int" else "0")
                  for n, t in self.nested_locals]
         self.lines[n_asserts:n_asserts] = inits
         extra = []
@@ -599,6 +631,16 @@ class _FnLifter:
                     ranges.append("    assert (len(%s) <= %s)"
                                   % (frag, lit(_USIZE)))
             self.lines[range_at:range_at] = ranges
+        # An integer parameter is inside its type: a hypothesis true of every
+        # call, in the model and the safety lift alike, stated as numbers --
+        # the signed ranges are not symbolic the way `max_uN` is.
+        int_ranges = []
+        for frag, ty in params:
+            if ty.kind == "int" and ty.width:
+                lo, hi = _int_range(ty.width)
+                int_ranges.append("    assert ((Int(%d) <= %s) and (%s <= Int(%d)))"
+                                  % (lo, frag, frag, hi))
+        self.lines[range_at:range_at] = int_ranges
         name = self.name + ("__safe" if self.safety else "")
         head = "def %s(%s) -> '%s':" % (
             name, ", ".join("%s: '%s'" % (n, t.frag())
@@ -695,9 +737,9 @@ class _FnLifter:
         if t.val == "bool":
             self.next()
             return _BOOL
-        if t.val in _SIGNED:
-            self.fail("%s is `%s`; signed integers are not lifted yet, only "
-                      "unsigned ones (which are Nat)" % (where, t.val))
+        if t.val in _SIGNED_WIDTH:
+            self.next()
+            return _Ty("int", _SIGNED_WIDTH[t.val])
         self.fail("%s has type `%s`, which is not lifted; the fragment has "
                   "unsigned integers and `bool`" % (where, t.val))
 
@@ -1333,6 +1375,9 @@ class _FnLifter:
         if op in ("|", "^", "&"):
             self.fail("bitwise `%s` is not lifted; the fragment's integers "
                       "are Nat, not bit vectors" % op)
+        if op in ("<<", ">>") and lty.kind == "int":
+            self.fail("a shift on a signed integer is not lifted: `>>` "
+                      "rounds toward minus infinity, which is not division")
         if op in ("<<", ">>"):
             if not _is_int(right):
                 self.fail("a shift by a non-literal amount is not lifted")
@@ -1349,6 +1394,10 @@ class _FnLifter:
             if lty.width:
                 self.overflow(out, lty.width, "`<<`")
             return out, lty
+        if op in ("==", "!=", "<", ">", "<=", ">=") and \
+                "int" in (lty.kind, rty.kind):
+            left, lty = _as_int(left, lty)
+            right, rty = _as_int(right, rty)
         if op in ("==", "!=", "<", ">", "<=", ">="):
             if lty.kind != rty.kind:
                 self.fail("comparing a `%s` with a `%s`" % (lty.frag(),
@@ -1359,6 +1408,8 @@ class _FnLifter:
                 # The fragment has no `!=`; it is `not ==`.
                 return "(not (%s == %s))" % (left, right), _BOOL
             return "(%s %s %s)" % (left, op, right), _BOOL
+        if "int" in (lty.kind, rty.kind):
+            return self.int_arith(op, left, lty, right, rty)
         self._check_ty(_LIT, lty)
         self._check_ty(_LIT, rty)
         py = {"+": "+", "-": "-", "*": "*", "/": "//", "%": "%"}[op]
@@ -1376,6 +1427,58 @@ class _FnLifter:
                               "(not (%s == 0))" % right),
                       "`%s` by zero" % op)
         return out, ty
+
+    def int_arith(self, op, left, lty, right, rty):
+        """Signed `+ - *`: exact in the model, with an obligation that the
+        result is inside its type -- or, for the argument of `ml_wrap`,
+        inside OCaml's 63 bits, where the wrap is the identity."""
+        left, lty = _as_int(left, lty)
+        right, rty = _as_int(right, rty)
+        self._check_ty(_ILIT, lty)
+        self._check_ty(_ILIT, rty)
+        if op not in ("+", "-", "*"):
+            self.fail("signed `%s` is not lifted yet (it truncates toward "
+                      "zero, which the fragment's `Int` does not model)" % op)
+        width = max(lty.width, rty.width)
+        ty = lty if lty.width >= rty.width else rty
+        a, b = _int_lit_value(left), _int_lit_value(right)
+        if a is not None and b is not None:
+            # two literals: the value, as a literal -- `0i64 - 2^62` is how a
+            # negative bound is written, and as a subtraction it would reach
+            # a hypothesis as arithmetic still to be done
+            v = {"+": a + b, "-": a - b, "*": a * b}[op]
+            wrapped = self.wrap_pending
+            self.wrap_pending = False
+            lo, hi = _int_range(63 if wrapped else (width or 64))
+            if not lo <= v <= hi:
+                self.fail("the constant `%s` does not fit its type" % v)
+            return "Int(%d)" % v, ty
+        out = "(%s %s %s)" % (left, op, right)
+        if self.wrap_pending:
+            self.wrap_pending = False       # this op is `ml_wrap`'s argument
+            self.int_bound(out, 63, "OCaml `int` `%s` may wrap" % op)
+        elif width:
+            self.int_bound(out, width, "`%s` may overflow i%d" % (op, width))
+        return out, ty
+
+    def ml_wrap(self):
+        """`ml_wrap(e)`, ocaml2rust's reduction of an `i64` result to OCaml's
+        63 bits.  The model is `e` itself; the obligation, raised by the
+        arithmetic that is `e`, is that it stays in 63 bits -- where the
+        reduction is the identity, and OCaml's `int` never wrapped."""
+        self.expect("(")
+        self.wrap_pending = True
+        try:
+            e, ty = self.expr()
+        finally:
+            self.wrap_pending = False
+        self.expect(")")
+        return e, _Ty("int", 63)
+
+    def int_bound(self, value, width, label):
+        lo, hi = _int_range(width)
+        self.side("((Int(%d) <= %s) and (%s <= Int(%d)))"
+                  % (lo, value, value, hi), label)
 
     def cast(self):
         e, ty = self.unary()
@@ -1404,7 +1507,16 @@ class _FnLifter:
                 self.fail("`!` on an integer is bitwise, which is not lifted")
             return "(not %s)" % e, _BOOL
         if t.kind == "punc" and t.val == "-":
-            self.fail("negation has no meaning on an unsigned value")
+            self.next()
+            e, ty = self.unary()
+            e, ty = _as_int(e, ty)
+            if ty.kind != "int":
+                self.fail("negation has no meaning on an unsigned value")
+            out = "(-%s)" % e
+            if ty.width:
+                self.int_bound(out, ty.width, "`-` may overflow i%d"
+                               % ty.width)
+            return out, ty
         if t.kind == "punc" and t.val in ("&", "*"):
             # Borrowing or dereferencing a slice or a struct changes nothing
             # the model sees; a reference to a scalar is not lifted.
@@ -1460,6 +1572,8 @@ class _FnLifter:
         t = self.cur
         if t.kind == "num":
             self.next()
+            if any(t.val.replace("_", "").endswith(x) for x in _SIGNED):
+                return "Int(%d)" % _int_literal(t, self), _ILIT
             return str(_int_literal(t, self)), _LIT
         if t.kind == "kw" and t.val in ("true", "false"):
             self.next()
@@ -1481,6 +1595,8 @@ class _FnLifter:
                 return self.int_limit(t.val)
             if self.at("::"):
                 self.fail("paths (`%s::..`) are not lifted" % t.val)
+            if self.at("(") and t.val == "ml_wrap":
+                return self.ml_wrap()
             if self.at("("):
                 return self.call(t.val)
             found = self.lookup(t.val)
@@ -1643,7 +1759,8 @@ def _int_literal(tok, lifter):
             break
     for suffix in _SIGNED:
         if text.endswith(suffix):
-            lifter.fail("the literal `%s` is signed" % tok.val)
+            text = text[:-len(suffix)]
+            break
     try:
         if text.startswith(("0x", "0X")):
             return int(text[2:], 16)
