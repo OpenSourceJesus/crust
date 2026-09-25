@@ -80,6 +80,7 @@ class Prover:
         self.lifted, self.refused = lift_all(source)
         self.own = set(self.lifted) | set(self.refused) if own is None \
             else set(own)
+        self.enum_sig = {}
         self.types = {"Nat": hoare.NAT, "Bool": hoare.BOOL,
                       "Array": hoare.BYTES, "Int": hoare.INT}
         # Every obligation the kernel settles, kept with the environment it
@@ -95,6 +96,8 @@ class Prover:
         defined, and the signatures to call them by."""
         H = self.H
         env = H.prelude()
+        enum_sig = self.define_enums(env, getattr(fn, "unit", None))
+        self.enum_sig = enum_sig
         for rec, fields in fn.records:
             H.record(env, rec, [(f, self.types[t]) for f, t in fields])
             self.types[rec] = self.L.Var(rec)
@@ -120,11 +123,211 @@ class Prover:
                                  ["result or not result"])
         for name, (args, ret) in signatures(fn).items():
             sig[name] = ([self.types[a] for a in args], self.types[ret])
+        sig.update(enum_sig)
         return env, sig
 
+    def define_enums(self, env, unit):
+        """Each enum of the source as a kernel inductive type -- a `*mut E`
+        field as E itself, the heap discipline (`_heap_discipline`) being
+        what makes a pointer its value -- with the helpers ocaml2rust
+        writes, under their Rust names: the constructors (`E__V`), the
+        tests (`ml_is_E_V`), the projections (`ml_E_V_k`, a default off
+        the variant, which the lift owes never happens), and `ml_size_E`,
+        the number of constructors in a value, for a `#[variant]`.
+        Returns their signatures, for the fragment."""
+        H, L = self.H, self.L
+        if unit is None or not unit.enums:
+            return {}
+        if unit.heap_refusal:
+            raise H.ContractError(unit.heap_refusal)
+        from shivyc.rustproof import _SIGNED_WIDTH, _UNSIGNED
+        enums = unit.enums
+
+        def ktype(rust):
+            if rust in enums:
+                return L.Var(rust)
+            if rust in _SIGNED_WIDTH:
+                return H.INT
+            if rust in _UNSIGNED:
+                return H.NAT
+            if rust == "bool":
+                return H.BOOL
+            raise H.ContractError("an enum field of type `%s`" % rust)
+        # groups: enums that reach each other through their fields
+        reach = {}
+        for e in enums:
+            seen, todo = set(), [e]
+            while todo:
+                x = todo.pop()
+                for _v, fields in enums[x]:
+                    for fty, _ in fields:
+                        if fty in enums and fty not in seen:
+                            seen.add(fty)
+                            todo.append(fty)
+            reach[e] = seen
+        groups, placed = [], set()
+        for e in enums:                        # dependencies first
+            if e in placed:
+                continue
+            group = [x for x in enums if x == e or (x in reach[e] and
+                                                    e in reach[x])]
+            groups.append(group)
+            placed |= set(group)
+        done, ordered = set(), []
+        while groups:
+            for g in groups:
+                needs = {f for x in g for f in reach[x]} - set(g)
+                if needs <= done:
+                    ordered.append(g)
+                    done |= set(g)
+                    groups.remove(g)
+                    break
+            else:
+                raise H.ContractError("enums that cannot be ordered")
+        sig = {}
+        for group in ordered:
+            for e in group:
+                H.TYPE_NAMES[e] = L.Var(e)
+                self.types[e] = L.Var(e)
+            if len(group) == 1:
+                e = group[0]
+                H.inductive(env, e, [
+                    ("%s.%s" % (e, v), [L.REC if fty == e else ktype(fty)
+                                        for fty, _ in fields])
+                    for v, fields in enums[e]])
+            else:
+                L.mutual_inductive(env, [
+                    (e, [("%s.%s" % (e, v), [
+                        L.MREC(fty) if fty in group else ktype(fty)
+                        for fty, _ in fields]) for v, fields in enums[e]])
+                    for e in group])
+            all_ctors = [(t, v, fields) for t in group
+                         for v, fields in enums[t]]
+
+            def size_of(e, group=group, all_ctors=all_ctors):
+                """e.rec into Nat with the *same* case for every
+                constructor of the group -- one more than the fields' sizes
+                -- so a size crosses into another type of the group as it
+                counts, and every type's size is the one count."""
+                minors = []
+                for t, v, fields in all_ctors:
+                    ih = [L.Var("_ih%d" % i) for i, (fty, _) in
+                          enumerate(fields) if fty in group]
+                    total = None
+                    for x in ih:
+                        total = x if total is None else H.app("add", total, x)
+                    out = L.App(L.Var("succ"), total if total is not None
+                                else H.numeral(0))
+                    for i, (fty, _) in reversed(list(enumerate(fields))):
+                        if fty in group:
+                            out = L.Lambda("_ih%d" % i, H.NAT, out)
+                    for i, (fty, _) in reversed(list(enumerate(fields))):
+                        out = L.Lambda("_f%d" % i, ktype(fty), out)
+                    minors.append(out)
+                motives = [L.Lambda("_", L.Var(t), H.NAT) for t in group]
+                return lambda x: H.app("%s.rec" % e, *(motives + minors + [x]))
+
+            def cases(e, target, body, group=group, all_ctors=all_ctors):
+                """e.rec into `target` -- the group's other types into Nat,
+                unused -- one case per constructor: body(variant, field
+                vars, ih vars) for e's, 0 for the others'."""
+                mot = lambda t: target if t == e else H.NAT
+                minors = []
+                for t, v, fields in all_ctors:
+                    fv = [L.Var("_f%d" % i) for i in range(len(fields))]
+                    ih = [L.Var("_ih%d" % i) for i, (fty, _) in
+                          enumerate(fields) if fty in group]
+                    out = body(v, fv, ih) if t == e else H.numeral(0)
+                    for i, (fty, _) in reversed(list(enumerate(fields))):
+                        if fty in group:
+                            out = L.Lambda("_ih%d" % i, mot(fty), out)
+                    for i, (fty, _) in reversed(list(enumerate(fields))):
+                        out = L.Lambda("_f%d" % i, ktype(fty), out)
+                    minors.append(out)
+                motives = [L.Lambda("_", L.Var(t), mot(t)) for t in group]
+                return lambda x: H.app("%s.rec" % e, *(motives + minors + [x]))
+
+            # every stand-in first: a projection off its variant gives one,
+            # and its field may be another type of the group
+            for part in ("stand_in", "helpers"):
+                for e in group:
+                    self._enum_helpers(env, e, enums, ktype, cases, sig, part)
+            # size: one more than the sizes of the fields in the group --
+            # every type's the same count, so they compare across the group
+            for e in group:
+                nat_size = size_of(e)
+                H.define(env, "ml_size_%s" % e, L.Pi("_", L.Var(e), H.INT),
+                         L.Lambda("v", L.Var(e), L.App(
+                             L.Var("Int.ofNat"), nat_size(L.Var("v")))))
+                sig["ml_size_%s" % e] = ([L.Var(e)], H.INT)
+        return sig
+
+    def _enum_helpers(self, env, e, enums, ktype, cases, sig, part):
+        """The constructor functions, tests and projections of enum `e`,
+        and `E__stand_in`, some value of it."""
+        H, L = self.H, self.L
+        from shivyc.rustproof import _inhabitant
+        E = L.Var(e)
+
+        def scalar(fty):
+            t = ktype(fty)
+            return H.int_literal(0) if t == H.INT else \
+                L.Var("false") if t == H.BOOL else H.numeral(0)
+        tree = _inhabitant(enums, e, scalar)
+        if part == "stand_in" and tree is not None:
+            def build(t):
+                if isinstance(t, tuple):
+                    en, v, vals = t
+                    return H.app("%s.%s" % (en, v), *map(build, vals)) \
+                        if vals else L.Var("%s.%s" % (en, v))
+                return t
+            H.define(env, "%s__stand_in" % e, E, build(tree))
+            H.STAND_INS[e] = "%s__stand_in" % e
+            sig["%s__stand_in" % e] = ([], E)
+        if part == "stand_in":
+            return
+
+        def default(ty):
+            if ty == H.INT:
+                return H.int_literal(0)
+            if ty == H.BOOL:
+                return L.Var("false")
+            if ty == H.NAT:
+                return H.numeral(0)
+            if ty.name + "__stand_in" in env:
+                return L.Var(ty.name + "__stand_in")
+            raise H.ContractError("no value of `%s` to stand in off its "
+                                  "variant" % ty.name)
+        vv = L.Var("v")
+        for v, fields in enums[e]:
+            ftys = [ktype(fty) for fty, _ in fields]
+            name = "%s__%s" % (e, v)
+            val, ty = L.Var("%s.%s" % (e, v)), E
+            if fields:
+                names = ["_a%d" % i for i in range(len(fields))]
+                val = H.app("%s.%s" % (e, v), *map(L.Var, names))
+                for n, t in reversed(list(zip(names, ftys))):
+                    val, ty = L.Lambda(n, t, val), L.Pi("_", t, ty)
+            H.define(env, name, ty, val)
+            sig[name] = (ftys, E)
+            H.define(env, "ml_is_%s_%s" % (e, v), L.Pi("_", E, H.BOOL),
+                     L.Lambda("v", E, cases(e, H.BOOL,
+                                            lambda v2, fv, ih, v=v: L.Var(
+                                                "true" if v2 == v else
+                                                "false"))(vv)))
+            sig["ml_is_%s_%s" % (e, v)] = ([E], H.BOOL)
+            for k, ft in enumerate(ftys):
+                pname = "ml_%s_%s_%d" % (e, v, k)
+                H.define(env, pname, L.Pi("_", E, ft), L.Lambda(
+                    "v", E, cases(e, ft, lambda v2, fv, ih, v=v, k=k, ft=ft:
+                                  fv[k] if v2 == v else default(ft))(vv)))
+                sig[pname] = ([E], ft)
+
     def sig(self, fn):
-        return {name: ([self.types[a] for a in args], self.types[ret])
-                for name, (args, ret) in signatures(fn).items()}
+        out = {name: ([self.types[a] for a in args], self.types[ret])
+               for name, (args, ret) in signatures(fn).items()}
+        out.update(getattr(self, "enum_sig", {}))
+        return out
 
     def trivial(self, fn):
         if fn.ret == "Bool":
@@ -283,6 +486,9 @@ class Prover:
         """The first tactic's proof that the kernel accepts."""
         failed = (self.H.TheoremError, self.H.ContractError,
                   self.L.KernelError)
+        # the enum helpers are definitions like any other: opened, so a
+        # test on a constructor computes and `size` counts
+        unfolding = set(unfolding) | set(self.enum_sig)
         for k, tactic in enumerate(tactics):
             try:
                 return tactic(env, goal, unfolding)
@@ -316,75 +522,94 @@ class Prover:
 
     def recursive_goal(self, fn, text, post, unfolding):
         """(env, goal) for a theorem about a recursive function: `text`'s
-        obligation with the recursive call a variable `g` -- about which
-        the goal assumes the contract, for arguments meeting the `requires`
-        with a smaller non-negative `#[variant]`:
+        obligation with each recursive call -- to itself, or to a partner
+        in a mutually recursive group -- a variable, about which the goal
+        assumes that function's contract, for arguments meeting its
+        `requires` with its `#[variant]` non-negative and below this
+        function's:
 
-            forall g p.., (forall a.., cond(a, p) -> post(a, g a)) -> ...
+            forall g.. p.., (forall a.., cond_g(a, p) -> post_g(a, g a))
+                            .. -> ...
 
-        Each call site owes `cond` as an obligation of its own, so this is
-        the step of a well-founded induction on the variant, whose
-        conclusion is the theorem for the function itself."""
+        Each call site owes `cond_g` as an obligation of its own, so this
+        is a step of one well-founded induction on the variants over every
+        frame of the group, whose conclusion is the theorem itself."""
         H, L = self.H, self.L
-        env, sig = self.fresh_env(fn)
-        rec = fn.name + "__rec"
-        ptypes = [self.types[t] for _, t in fn.params]
-        rtype = self.types[fn.ret]
-        fty = rtype
-        for t in reversed(ptypes):
-            fty = L.Pi("_", t, fty)
-        L.declare(env, rec, fty)
-        sig = dict(sig)
-        sig[rec] = (ptypes, rtype)
-        proc = H.read_procedure(text, env, sig, post)
-        names = [n for n, _ in fn.params]
-        anames = ["%s__a" % n for n in names]
-        to_a = dict(zip(names, anames))
         from shivyc.rustproof import _substitute
-        cond = " and ".join([_substitute(r, to_a) for r in fn.rec_requires]
-                            + ["(Int(0) <= %s)" % _substitute(
-                                fn.rec_variant, to_a),
-                               "(%s < %s)" % (_substitute(fn.rec_variant,
-                                                          to_a),
-                                              fn.rec_variant)])
-        both = ", ".join("%s: '%s'" % (n, t) for n, t in
-                         [(a, t) for a, (_, t) in zip(anames, fn.params)]
-                         + list(fn.params))
-        H.read_procedure("def %s__cond(%s) -> 'Bool':\n    return %s\n"
-                         % (fn.name, both, cond), env, None,
-                         ["result or not result"])
-        ens = " and ".join(_substitute(e, to_a) for e in fn.ensures) \
-            or "True"
-        H.read_procedure("def %s__post(%s, result: '%s') -> 'Bool':\n"
-                         "    return %s\n" % (
-                             fn.name, ", ".join("%s: '%s'" % (a, t) for a, (
-                                 _, t) in zip(anames, fn.params)),
-                             fn.ret, ens), env, None,
-                         ["result or not result"])
-        helpers = {fn.name + "__cond", fn.name + "__post"}
+        env, sig = self.fresh_env(fn)
+        sig = dict(sig)
+        targets = ([fn] if getattr(fn, "self_rec", fn.recursive and not
+                                   getattr(fn, "group", None)) else []) + \
+            [self.lifted[g] if g in self.lifted else
+             self.lift_other(fn, g) for g in sorted(getattr(fn, "group",
+                                                            ()))]
+        ftype = {}
+        for c in targets:
+            ptypes = [self.types[t] for _, t in c.params]
+            fty = self.types[c.ret]
+            for t in reversed(ptypes):
+                fty = L.Pi("_", t, fty)
+            ftype[c.name] = fty
+            L.declare(env, c.name + "__rec", fty)
+            sig[c.name + "__rec"] = (ptypes, self.types[c.ret])
+        proc = H.read_procedure(text, env, sig, post)
+        helpers, ihs = set(), []
+        for k, c in enumerate(targets):
+            names = [n for n, _ in c.params]
+            anames = ["%s__a%d" % (n, k) for n in names]
+            to_a = dict(zip(names, anames))
+            v_next = _substitute(c.rec_variant, to_a)
+            cond = " and ".join([_substitute(r, to_a) for r in c.rec_requires]
+                                + ["(Int(0) <= %s)" % v_next,
+                                   "(%s < %s)" % (v_next, fn.rec_variant)])
+            both = ", ".join("%s: '%s'" % (n, t) for n, t in
+                             [(a, t) for a, (_, t) in zip(anames, c.params)]
+                             + list(fn.params))
+            tag = "%s__%s" % (fn.name, c.name)
+            H.read_procedure("def %s__cond(%s) -> 'Bool':\n    return %s\n"
+                             % (tag, both, cond), env, dict(self.enum_sig),
+                             ["result or not result"])
+            ens = " and ".join(_substitute(e, to_a) for e in c.ensures) \
+                or "True"
+            H.read_procedure("def %s__post(%s, result: '%s') -> 'Bool':\n"
+                             "    return %s\n" % (
+                                 tag, ", ".join("%s: '%s'" % (a, t) for a, (
+                                     _, t) in zip(anames, c.params)),
+                                 c.ret, ens), env, dict(self.enum_sig),
+                             ["result or not result"])
+            helpers |= {tag + "__cond", tag + "__post"}
+            ihs.append((c, anames, tag))
         ob = H.unfold(proc.obligation, env, set(unfolding) | helpers)
-        # open the parameters, put the hypothesis after them
         pvars, body = [], ob
-        for _ in names:
+        for _ in fn.params:
             pvars.append(L.Var(body.var_name + "__p"))
             body = L.instantiate(body.body, pvars[-1])
-        avars = [L.Var(a + "__b") for a in anames]
-        call = L.Var(rec)
-        for a in avars:
-            call = L.App(call, a)
-        ih = L.Pi("_", L.App(L.Var("Holds"), H.unfold(H.app(
-            fn.name + "__cond", *(avars + pvars)), env, helpers)),
-            L.App(L.Var("Holds"), H.unfold(H.app(
-                fn.name + "__post", *(avars + [call])), env, helpers)))
-        for a in reversed(avars):
-            ih = L.Pi(a.name, H.INT if False else self.types[
-                fn.params[avars.index(a)][1]], L.abstract(ih, a.name))
-        goal = L.Pi("_ih", ih, body)
-        for (pv, t) in reversed(list(zip(pvars, ptypes))):
-            goal = L.Pi(pv.name, t, L.abstract(goal, pv.name))
-        goal = L.Pi("g", fty, L.abstract(goal, rec))
-        del env[rec]
+        goal = body
+        for c, anames, tag in reversed(ihs):
+            avars = [L.Var(a + "__b") for a in anames]
+            call = L.Var(c.name + "__rec")
+            for a in avars:
+                call = L.App(call, a)
+            ih = L.Pi("_", L.App(L.Var("Holds"), H.unfold(H.app(
+                tag + "__cond", *(avars + pvars)), env, helpers)),
+                L.App(L.Var("Holds"), H.unfold(H.app(
+                    tag + "__post", *(avars + [call])), env, helpers)))
+            for a, (_, t) in reversed(list(zip(avars, c.params))):
+                ih = L.Pi(a.name, self.types[t], L.abstract(ih, a.name))
+            goal = L.Pi("_ih_" + c.name, ih, goal)
+        for pv, (_, t) in reversed(list(zip(pvars, fn.params))):
+            goal = L.Pi(pv.name, self.types[t], L.abstract(goal, pv.name))
+        for c in reversed(targets):
+            goal = L.Pi("g_" + c.name, ftype[c.name],
+                        L.abstract(goal, c.name + "__rec"))
+            del env[c.name + "__rec"]
         return env, goal
+
+    def lift_other(self, fn, name):
+        """A group partner's lift, from the same source."""
+        out = fn.unit.lift(name)
+        self.lifted[name] = out
+        return out
 
     def goal_for(self, fn, text, post, unfolding):
         """(env, goal) for an obligation of `fn`: `recursive_goal` if it
@@ -415,11 +640,13 @@ class Prover:
             ens = " and ".join(_substitute(e, to_a) for e in c.ensures) \
                 or "True"
             H.read_procedure("def %s__cpre(%s) -> 'Bool':\n    return %s\n"
-                             % (c.name, params, pre), env, None,
+                             % (c.name, params, pre), env,
+                             dict(self.enum_sig),
                              ["result or not result"])
             H.read_procedure("def %s__cpost(%s, result: '%s') -> 'Bool':\n"
                              "    return %s\n" % (c.name, params, c.ret, ens),
-                             env, None, ["result or not result"])
+                             env, dict(self.enum_sig),
+                             ["result or not result"])
             helpers = {c.name + "__cpre", c.name + "__cpost"}
             avars = [L.Var(a + "__d") for a in anames]
             call = L.Var(c.name)

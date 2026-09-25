@@ -1227,8 +1227,19 @@ class Checker:
             cenv = dict(env)
             if kind == 'ensures':
                 cenv['result'] = Scheme([], rt)
-            self.unify(self.infer(c, cenv), INT if kind == 'variant' else
-                       BOOL, c.line, "a `[@@%s]` clause" % kind)
+            ct = self.infer(c, cenv)
+            if kind == 'variant':
+                # an `int`, or a value of a variant type -- whose size is
+                # the measure: `[@@variant l]` for recursion down a list
+                ct = prune(ct)
+                if not (isinstance(ct, TCon) and (
+                        ct.name in ('int', 'list') or
+                        ct.name in self.typedefs)):
+                    raise CompileError("a `[@@variant]` is an `int` or a "
+                                       "value of a variant type, not %s"
+                                       % show(ct), c.line)
+            else:
+                self.unify(ct, BOOL, c.line, "a `[@@%s]` clause" % kind)
         for pt in reversed(types):
             rt = arrow(pt, rt)
         return rt

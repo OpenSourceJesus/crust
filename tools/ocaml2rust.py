@@ -453,6 +453,17 @@ class Emitter:
 
     def x_BinOp(self, e, ctx):
         op = e.op
+        if op in ('=', '<>'):
+            # against a constant constructor, equality is its test --
+            # `t <> Leaf` is `not (is Leaf t)`, in code and in a contract
+            for const, other in ((e.right, e.left), (e.left, e.right)):
+                if isinstance(const, O.ConstructorApp) and not const.args:
+                    t = self.apply(other.ty, ctx.sub)
+                    ename = self.enum(t, e.line)
+                    rust, _ = self.ctor_fields(const.name, t)
+                    test = 'ml_is_%s_%s(%s)' % (ename, rust,
+                                                self.expr(other, ctx))
+                    return test if op == '=' else '(!%s)' % test
         a, b = self.expr(e.left, ctx), self.expr(e.right, ctx)
         if op in ('=', '<>', '<', '>', '<=', '>='):
             t = self.apply(e.left.ty, ctx.sub)
