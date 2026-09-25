@@ -80,6 +80,7 @@ class TestRefused(unittest.TestCase):
         "type t = A | B | C\nlet f x = match x with A -> 1 | B -> 2":
             "C is not matched",
         "let f l = match l with [] -> 0 | _ :: [] -> 1": "not exhaustive",
+        "let f l = match l with [] -> 0 | [_] -> 1": "not exhaustive",
         "let f (x : int) : 'a = match x with _ -> .": "can match it",
         "let f x = y": "unbound value `y`",
         "type r = { a : int }": "records",
