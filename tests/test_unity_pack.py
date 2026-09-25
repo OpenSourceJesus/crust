@@ -7412,6 +7412,17 @@ class TestSystems(unittest.TestCase):
             font, "Sound", 76, (1, 1, 1, 1), 264, 64, 1, 256, 3)
         self.assertEqual(th2, 64)
 
+    def test_methods_in_keeps_default_paren_args(self):
+        """``default(T)`` inside a param list must not drop the method."""
+        body = (
+            "\n\tvoid Do (InputDevice device = null, "
+            "InputDeviceChange change = default(InputDeviceChange))\n"
+            "\t{\n\t\tgameObject.SetActive(false);\n\t}\n"
+        )
+        ms = unity_pack._methods_in(body, body)
+        self.assertEqual([m["name"] for m in ms], ["Do"])
+        self.assertIn("default(InputDeviceChange)", ms[0]["args"])
+
     def test_ui_child_image_sorts_above_parent_panel(self):
         """Equal Canvas order: child UI Image sorts above ancestor Image.
 
@@ -7522,6 +7533,234 @@ class TestSystems(unittest.TestCase):
         self.assertGreater(
             int(csp.get("sorting_order") or 0),
             int(psp.get("sorting_order") or 0))
+
+    def test_prefab_added_mb_setactive_hides_tmp_child(self):
+        """PrefabInstance m_AddedComponents MB packs and SetActive hides TMP.
+
+        Stripped PrefabInstance roots list AddedComponents only via
+        m_GameObject reverse refs — without joining them, Deactivate-style
+        scripts never run and child TMP stays visible while the Image is
+        covered / inactive.
+        """
+        root = tempfile.mkdtemp(prefix="upack-added-mb-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        prefabs = os.path.join(root, "Assets", "Prefabs")
+        scene = os.path.join(root, "Assets", "Scenes")
+        fonts = os.path.join(root, "Assets", "Fonts")
+        os.makedirs(scripts)
+        os.makedirs(prefabs)
+        os.makedirs(scene)
+        os.makedirs(fonts)
+        host_guid = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+        dea_guid = "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3"
+        pref_guid = "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"
+        img = "fe87c0e1cc204ed48ad3b37840f39efc"
+        builtin = "0000000000000000f000000000000000"
+        tmp = "f4688fdb7df04437aeb418b961361dc5"
+        font_guid = "8f586378b4e144a9851e7b34d9b748ee"
+        font_src = os.path.join(
+            ROOT, "examples", "unity_pack", "SystemsScene", "Assets",
+            "TextMesh Pro", "Resources", "Fonts & Materials",
+            "LiberationSans SDF.asset")
+        if not os.path.isfile(font_src):
+            font_src = os.path.join(
+                ROOT, "examples", "unity_pack", "Slime Jump", "Assets",
+                "Standard Assets", "TextMesh Pro", "Resources",
+                "Fonts & Materials", "LiberationSans SDF.asset")
+        if not os.path.isfile(font_src):
+            self.skipTest("LiberationSans SDF missing")
+        shutil.copy(font_src, os.path.join(fonts, "LiberationSans SDF.asset"))
+        with open(os.path.join(fonts, "LiberationSans SDF.asset.meta"),
+                  "w") as f:
+            f.write("guid: %s\n" % font_guid)
+        with open(os.path.join(scripts, "Host.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Host : MonoBehaviour { void Update() {} }\n"
+            )
+        with open(os.path.join(scripts, "Host.cs.meta"), "w") as f:
+            f.write("guid: %s\n" % host_guid)
+        with open(os.path.join(scripts, "DeactivateWhen.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class DeactivateWhen : MonoBehaviour {\n"
+                "    public bool deactivate;\n"
+                "    void Start() {\n"
+                "        if (deactivate) gameObject.SetActive(false);\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "DeactivateWhen.cs.meta"), "w") as f:
+            f.write("guid: %s\n" % dea_guid)
+        with open(os.path.join(prefabs, "Btn.prefab"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &100\nGameObject:\n  m_Name: UI Button\n"
+                "  m_IsActive: 1\n"
+                "  m_Component:\n  - component: {fileID: 200}\n"
+                "  - component: {fileID: 300}\n"
+                "--- !u!224 &200\nRectTransform:\n"
+                "  m_GameObject: {fileID: 100}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_AnchorMin: {x: 0.5, y: 0.5}\n"
+                "  m_AnchorMax: {x: 0.5, y: 0.5}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 200, y: 100}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "--- !u!114 &300\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 100}\n"
+                "  m_Enabled: 1\n"
+                "  m_Script: {fileID: 11500000, guid: " + img + "}\n"
+                "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+                "  m_Sprite: {fileID: 10905, guid: " + builtin + ", type: 0}\n"
+                "  m_Type: 0\n  m_PreserveAspect: 1\n"
+            )
+        with open(os.path.join(prefabs, "Btn.prefab.meta"), "w") as f:
+            f.write("guid: %s\n" % pref_guid)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Main Camera\n"
+                "  m_TagString: MainCamera\n  m_IsActive: 1\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "  - component: {fileID: 4}\n"
+                "--- !u!4 &2\nTransform:\n  m_GameObject: {fileID: 1}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: -10}\n"
+                "--- !u!20 &3\nCamera:\n  m_GameObject: {fileID: 1}\n"
+                "  orthographic: 1\n  orthographic size: 5\n"
+                "--- !u!114 &4\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, guid: " + host_guid + "}\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Canvas\n"
+                "  m_IsActive: 1\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "--- !u!224 &11\nRectTransform:\n"
+                "  m_GameObject: {fileID: 10}\n  m_Father: {fileID: 0}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_SizeDelta: {x: 0, y: 0}\n  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!223 &12\nCanvas:\n  m_GameObject: {fileID: 10}\n"
+                "  m_Enabled: 1\n  m_RenderMode: 0\n"
+                "  m_SortingOrder: 0\n"
+                "--- !u!1001 &50\nPrefabInstance:\n  m_Modification:\n"
+                "    m_TransformParent: {fileID: 11}\n"
+                "    m_Modifications:\n"
+                "    - target: {fileID: 100, guid: " + pref_guid + ", type: 3}\n"
+                "      propertyPath: m_Name\n      value: Action Button\n"
+                "      objectReference: {fileID: 0}\n"
+                "    - target: {fileID: 200, guid: " + pref_guid + ", type: 3}\n"
+                "      propertyPath: m_SizeDelta.x\n      value: 200\n"
+                "      objectReference: {fileID: 0}\n"
+                "    - target: {fileID: 200, guid: " + pref_guid + ", type: 3}\n"
+                "      propertyPath: m_SizeDelta.y\n      value: 100\n"
+                "      objectReference: {fileID: 0}\n"
+                "    - target: {fileID: 300, guid: " + pref_guid + ", type: 3}\n"
+                "      propertyPath: m_Sprite\n      value:\n"
+                "      objectReference: {fileID: 10905, guid: " + builtin
+                + ", type: 0}\n"
+                "    m_RemovedComponents: []\n"
+                "    m_RemovedGameObjects: []\n"
+                "    m_AddedGameObjects:\n"
+                "    - targetCorrespondingSourceObject: {fileID: 200, guid: "
+                + pref_guid + ", type: 3}\n"
+                "      insertIndex: -1\n      addedObject: {fileID: 71}\n"
+                "    m_AddedComponents:\n"
+                "    - targetCorrespondingSourceObject: {fileID: 100, guid: "
+                + pref_guid + ", type: 3}\n"
+                "      insertIndex: -1\n      addedObject: {fileID: 60}\n"
+                "  m_SourcePrefab: {fileID: 100100000, guid: " + pref_guid
+                + ", type: 3}\n"
+                "--- !u!224 &51 stripped\nRectTransform:\n"
+                "  m_CorrespondingSourceObject: {fileID: 200, guid: "
+                + pref_guid + ", type: 3}\n"
+                "  m_PrefabInstance: {fileID: 50}\n  m_PrefabAsset: {fileID: 0}\n"
+                "--- !u!1 &52 stripped\nGameObject:\n"
+                "  m_CorrespondingSourceObject: {fileID: 100, guid: "
+                + pref_guid + ", type: 3}\n"
+                "  m_PrefabInstance: {fileID: 50}\n  m_PrefabAsset: {fileID: 0}\n"
+                "--- !u!114 &60\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 52}\n  m_Enabled: 1\n"
+                "  m_Script: {fileID: 11500000, guid: " + dea_guid + "}\n"
+                "  deactivate: 1\n"
+                "--- !u!1 &70\nGameObject:\n  m_Name: Label\n"
+                "  m_IsActive: 1\n"
+                "  m_Component:\n  - component: {fileID: 71}\n"
+                "  - component: {fileID: 72}\n"
+                "--- !u!224 &71\nRectTransform:\n"
+                "  m_GameObject: {fileID: 70}\n  m_Father: {fileID: 51}\n"
+                "  m_AnchorMin: {x: 0.5, y: 0.5}\n"
+                "  m_AnchorMax: {x: 0.5, y: 0.5}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 180, y: 40}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "--- !u!114 &72\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 70}\n  m_Enabled: 1\n"
+                "  m_Script: {fileID: 11500000, guid: " + tmp + "}\n"
+                "  m_text: HELLO\n"
+                "  m_fontAsset: {fileID: 11400000, guid: " + font_guid
+                + ", type: 2}\n"
+                "  m_fontSize: 36\n"
+                "  m_fontColor: {r: 1, g: 1, b: 1, a: 1}\n"
+                "  m_HorizontalAlignment: 2\n"
+                "  m_VerticalAlignment: 512\n"
+                "  m_overflowMode: 0\n"
+            )
+        ps = os.path.join(root, "ProjectSettings")
+        os.makedirs(ps)
+        with open(os.path.join(ps, "EditorBuildSettings.asset"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1045 &1\nEditorBuildSettings:\n"
+                "  m_Scenes:\n"
+                "  - enabled: 1\n"
+                "    path: Assets/Scenes/S.unity\n"
+            )
+        with open(os.path.join(ps, "ProjectSettings.asset"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!129 &1\nPlayerSettings:\n"
+                "  defaultScreenWidth: 800\n"
+                "  defaultScreenHeight: 600\n"
+            )
+        objs, _a, _l, _c, _h = unity_pack.load_project(root)
+        dea = [o for o in objs
+               if o.get("class") == "DeactivateWhen"]
+        self.assertTrue(dea, "AddedComponent MB must pack")
+        btn = [o for o in objs
+               if o.get("name") == "Action Button" and o.get("ui_image")]
+        self.assertTrue(btn)
+        self.assertEqual(str(dea[0].get("go_id")), str(btn[0].get("go_id")))
+        d = tempfile.mkdtemp(prefix="upack-added-mb-out-")
+        plan = unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("DeactivateWhen_Start", eng)
+        self.assertIn("GameObject_SetActive", eng)
+        # Same go_index: SetActive on the MB hides Image + TMP via hierarchy.
+        parents = plan.get("go_parents") or []
+        dea_o = None
+        btn_o = None
+        lab_o = None
+        for cl in (plan.get("classes") or {}).values():
+            for o in cl.get("instances") or []:
+                if o.get("class") == "DeactivateWhen" or (
+                        (o.get("script") or "").endswith("DeactivateWhen.cs")):
+                    dea_o = o
+                if o.get("name") == "Action Button" and o.get("ui_image"):
+                    btn_o = o
+                if o.get("name") == "Label":
+                    lab_o = o
+        self.assertIsNotNone(dea_o)
+        self.assertIsNotNone(btn_o)
+        self.assertIsNotNone(lab_o)
+        self.assertEqual(dea_o.get("go_index"), btn_o.get("go_index"))
+        self.assertEqual(
+            parents[int(lab_o.get("go_index"))],
+            int(btn_o.get("go_index")))
 
     def test_preserve_aspect_top_left_pivot_draw_flush(self):
         """preserveAspect + pivot (0,1): sprite TL flush with rect TL."""

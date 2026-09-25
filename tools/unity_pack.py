@@ -4414,13 +4414,34 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
     world_cache = {}
     editor_only_xfs = _editor_only_transform_ids(by_id)
 
+    # PrefabInstance m_AddedComponents (and any MB whose m_GameObject points
+    # at a stripped GO) are not listed on the GO's m_Component — reverse-map
+    # them so DeactivateBasedOnInputDevice / nested scripts still pack.
+    mbs_by_go = {}
+    for rec in by_id.values():
+        if rec.get("kind") != "MonoBehaviour":
+            continue
+        raw = rec.get("raw") or ""
+        gm = re.search(
+            r"(?m)^\s+m_GameObject:\s*\{fileID:\s*(\d+)\}", raw)
+        if gm:
+            mbs_by_go.setdefault(gm.group(1), []).append(rec)
+
     # Join MonoBehaviour + Transform + SpriteRenderer onto the GameObject.
     gos = [r for r in by_id.values() if r.get("kind") == "GameObject"]
     for go in gos:
         kids = []
+        seen_kid = set()
         for mid in re.findall(r"fileID:\s*(\d+)", go["raw"]):
             if mid in by_id and by_id[mid] is not go:
                 kids.append(by_id[mid])
+                seen_kid.add(mid)
+        go_fid = str(go.get("file_id") or "")
+        for mb in mbs_by_go.get(go_fid, []):
+            mid = str(mb.get("file_id") or "")
+            if mid and mid not in seen_kid:
+                kids.append(mb)
+                seen_kid.add(mid)
         pos = (0.0, 0.0, 0.0)
         scale = (1.0, 1.0, 1.0)
         rot = (0.0, 0.0, 0.0, 1.0)
@@ -7866,6 +7887,10 @@ def analyze_script(path, text=None, shallow=False):
     if re.search(r"\bInputAction\b", scan):
         apis.add("InputAction")
     if re.search(
+            r"InputManager\s*\.\s*Using(?:Gamepad|Keyboard|Mouse|Phone)\b",
+            scan):
+        apis.add("InputManager.Using")
+    if re.search(
             r"(?<![\w.])(?:System\.Collections\.Generic\.)?List\s*<",
             scan):
         apis.add("List")
@@ -8087,12 +8112,29 @@ def _blank_method_bodies(bscan):
     """Replace method interiors with spaces so locals are not seen as fields."""
     import tools.cpprust as cpprust
     out = list(bscan)
-    for m in re.finditer(
+    head = re.compile(
             r"(?m)^[ \t]*(?:public|private|protected|internal)?"
             r"[ \t]*(?:static[ \t]+)?(?:override[ \t]+)?(?:virtual[ \t]+)?"
-            r"[\w.<>]+[ \t]+\w+[ \t]*\([^)]*\)\s*\{",
-            bscan):
-        open_i = m.end() - 1
+            r"[\w.<>]+[ \t]+\w+[ \t]*\(")
+    for m in head.finditer(bscan):
+        args_start = m.end()
+        depth = 1
+        j = args_start
+        while j < len(bscan) and depth > 0:
+            ch = bscan[j]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            j += 1
+        if depth != 0:
+            continue
+        k = j
+        while k < len(bscan) and bscan[k] in " \t\r\n":
+            k += 1
+        if k >= len(bscan) or bscan[k] != "{":
+            continue
+        open_i = k
         close = cpprust._match_brace(bscan, open_i)
         if close is None:
             continue
@@ -8268,32 +8310,55 @@ def _methods_in(body, bscan, body_abs=0):
         "remove", "where", "select", "from", "when",
     ))
     out = []
-    for m in re.finditer(
+    # Match `ret Name (` then scan args with nested-paren depth so
+    # `default(InputDeviceChange)` inside the parameter list is kept
+    # (a naive `[^)]*` stops at the first `)` and drops the method).
+    head = re.compile(
             r"(?m)^[ \t]*(?:public|private|protected|internal)?"
             r"[ \t]*(?:static[ \t]+)?(?:override[ \t]+)?(?:virtual[ \t]+)?"
-            r"([\w.<>]+)[ \t]+(\w+)[ \t]*\(([^)]*)\)\s*\{",
-            bscan):
+            r"([\w.<>]+)[ \t]+(\w+)[ \t]*\(")
+    for m in head.finditer(bscan):
         ret, name = m.group(1).strip(), m.group(2)
         # `else if (...) {` → ret=else, name=if — not a method.
         if ret in _NOT_METHOD or name in _NOT_METHOD:
             continue
         if "." in ret and ret.split(".")[-1] in _NOT_METHOD:
             continue
-        open_i = m.end() - 1
+        args_start = m.end()
+        depth = 1
+        j = args_start
+        while j < len(bscan) and depth > 0:
+            ch = bscan[j]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            j += 1
+        if depth != 0:
+            continue
+        args_str = bscan[args_start:j - 1]
+        # Skip whitespace to the opening `{`.
+        k = j
+        while k < len(bscan) and bscan[k] in " \t\r\n":
+            k += 1
+        if k >= len(bscan) or bscan[k] != "{":
+            continue
+        open_i = k
         # _match_brace lives on cpprust; cs2cpp uses it via import.
         import tools.cpprust as cpprust
         close = cpprust._match_brace(bscan, open_i)
         if close is None:
             continue
+        # Map scan indices to body (same length; body may differ in trivia).
         src = body[m.start():m.start() + (close - m.start()) + 1]
-        impl = body[m.end():m.start() + (close - m.start())]
-        decl = m.group(0)
+        impl = body[open_i + 1:close]
+        decl = bscan[m.start():open_i + 1]
         out.append({
             "ret": ret,
             "name": name,
-            "args": m.group(3).strip(),
+            "args": args_str.strip(),
             "body": impl,
-            "body_abs": int(body_abs) + int(m.end()),
+            "body_abs": int(body_abs) + int(open_i + 1),
             "src": src,
             "public": bool(re.search(r"\bpublic\b", decl)),
             "static": bool(re.search(r"\bstatic\b", decl)),
@@ -9427,6 +9492,11 @@ def emit_engine(plan, analyses, used_apis):
         p("extern int engine_keyboard_connected;")
         for key in sorted(keyboard_keys):
             p("extern int engine_keyboard_%s;" % key)
+    if "InputManager.Using" in used_apis:
+        p("extern int engine_input_using_keyboard;")
+        p("extern int engine_input_using_mouse;")
+        p("extern int engine_input_using_gamepad;")
+        p("extern int engine_input_using_phone;")
     if want_ui:
         p("extern float engine_pointer_x; /* screen px, origin bottom-left */")
         p("extern float engine_pointer_y;")
@@ -15188,6 +15258,26 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
             r"(?<![\w.])gameObject\s*\.\s*SetActive\s*\(\s*([^)]+)\s*\)",
             r"GameObject_SetActive(_engine_go_of_%s(i), (\1))" % idn,
             text)
+    # InputSystem.onDeviceChange — no device-change bus in the desktop pack.
+    text = cs2cpp.code_sub(
+        r"InputSystem\s*\.\s*onDeviceChange\s*\+=\s*[^;]+;",
+        "/* InputSystem.onDeviceChange += */", text)
+    text = cs2cpp.code_sub(
+        r"InputSystem\s*\.\s*onDeviceChange\s*-=\s*[^;]+;",
+        "/* InputSystem.onDeviceChange -= */", text)
+    # Authored InputManager.Using* → host flags (keyboard/mouse default on).
+    text = cs2cpp.code_sub(
+        r"(?:[\w.]+\.)?InputManager\s*\.\s*Using(Gamepad|Keyboard|Mouse|Phone)\b",
+        lambda m: "engine_input_using_%s" % m.group(1).lower(),
+        text)
+    # Nested InputDevice enum members (declaration order when unspecified).
+    _input_dev = {
+        "KeyboardAndMouse": "0", "Phone": "1", "Gamepad": "2",
+    }
+    text = cs2cpp.code_sub(
+        r"(?:[\w.]+\.)?InputManager\s*\.\s*InputDevice\s*\.\s*(\w+)\b",
+        lambda m: _input_dev.get(m.group(1), "0"),
+        text)
     # Collections: cs2cpp lowers them from what the plan says about each
     # class (maps before lists, so a two-argument `Add` is a map's).
     text = cs2cpp.lower_packed_collections(
@@ -15611,6 +15701,12 @@ def emit_data(plan, used_apis=None):
         p("int engine_keyboard_connected = 0;")
         for key in sorted(keyboard_keys):
             p("int engine_keyboard_%s = 0;" % key)
+    if "InputManager.Using" in used_apis:
+        # Desktop defaults: keyboard+mouse present, no gamepad/phone.
+        p("int engine_input_using_keyboard = 1;")
+        p("int engine_input_using_mouse = 1;")
+        p("int engine_input_using_gamepad = 0;")
+        p("int engine_input_using_phone = 0;")
     if plan.get("ui_buttons"):
         p("/* Host: screen-space pointer (origin bottom-left, y up). */")
         p("float engine_pointer_x = 0.f;")
