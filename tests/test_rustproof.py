@@ -165,7 +165,8 @@ fn pick(x: u32) -> u32 {
 
     def test_refusals_name_the_construct(self):
         cases = {
-            "fn f(x: i32) -> i32 { x }": "signed",
+            "fn f(x: i32) -> i32 { x / 2 }": "signed `/`",
+            "fn f(x: i32) -> i32 { x >> 1 }": "signed integer",
             "fn f(x: &u32) -> u32 { *x }": "by reference",
             "fn f(x: u32) -> u32 { x.count_ones() }": "methods",
             "fn f(x: u32) -> u32 { loop { return x; } }": "`loop`",

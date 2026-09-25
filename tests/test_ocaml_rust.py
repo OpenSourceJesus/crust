@@ -127,6 +127,7 @@ EXPECTED = {
     "local.ml": "5050\n18\n01\n11\n",
     "higher.ml": "10\n24\n12\n1112\n1120\n15\n",
     "deep.ml": "5000050000\n10000100000\n",
+    "contracts.ml": "1078\n",
     "loop.ml": "2999998\n111\n",
 }
 
@@ -161,6 +162,70 @@ class TestCompiledOCaml(unittest.TestCase):
         want = "-4611686018427387904\n-3-1\n4611686018427387901\n"
         self.assertEqual(ocamlinterp.run(code), want)
         self.assertEqual(run(compile_rust(ocaml2rust.lower(code))), (0, want))
+
+
+class TestProvedOCaml(unittest.TestCase):
+    """Compiled OCaml under the Rust proof tooling: a contract written as
+    `[@@ensures ..]` is proved about the Rust, and each arithmetic
+    operation owes staying in OCaml's 63 bits -- which `abs` does not at
+    `min_int`, and a `[@@requires x > min_int]` makes it."""
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, os.path.join(ROOT, "..", "RosettaMath"))
+        import rustprove
+        with open(os.path.join(RUN, "contracts.ml")) as fh:
+            cls.rust = ocaml2rust.lower(fh.read())
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "contracts.rs")
+        with open(path, "w") as fh:
+            fh.write(cls.rust)
+        cls.prover = rustprove.Prover(*rustprove.load_unit(path))
+
+    def verdicts(self, name):
+        p = self.prover
+        fn = p.lifted[name]
+        out = {}
+        if fn.ensures:
+            out["ensures"] = bool(p.contract(name))
+        for label, ok in p.safety(name):
+            out[label.split(" (line")[0]] = ok
+        return out
+
+    def test_contracts_are_proved(self):
+        for name in ("ml_clamp__int", "ml_iabs", "ml_iabs2"):
+            with self.subTest(fn=name):
+                self.assertTrue(self.verdicts(name)["ensures"])
+
+    def test_abs_wraps_at_min_int(self):
+        self.assertEqual(self.verdicts("ml_iabs")
+                         ["OCaml `int` `-` may wrap"], False)
+
+    def test_excluding_min_int_proves_it(self):
+        self.assertEqual(self.verdicts("ml_iabs2")
+                         ["OCaml `int` `-` may wrap"], True)
+
+    def test_lean_agrees(self):
+        """Every obligation settled about the compiled OCaml -- the 63-bit
+        one included -- is a theorem Lean 4 accepts, with no axioms."""
+        import rustlean
+        if rustlean.find_lean() is None:
+            self.skipTest("lean not installed")
+        rustlean.prove_everything(self.prover)
+        verdicts = rustlean.check(self.prover.certificates,
+                                  tempfile.mkdtemp())
+        self.assertGreaterEqual(len(verdicts), 4)
+        self.assertTrue(all(v.agreed for v in verdicts),
+                        [str(v) for v in verdicts])
+
+    def test_contract_runs_too(self):
+        """Crust checks a contract at run time as well: calling clamp
+        against its `requires` stops the program."""
+        rust = self.rust.replace("ml_clamp__int(0i64, 10i64, 42i64)",
+                                 "ml_clamp__int(10i64, 0i64, 42i64)")
+        self.assertNotEqual(rust, self.rust)
+        rc, _ = run(compile_rust(rust, "broken"))
+        self.assertNotEqual(rc, 0)
 
 
 class TestRefused(unittest.TestCase):
