@@ -11810,3 +11810,247 @@ class TestSystemsRuns(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
 
 
+class TestLiveRectTransform(unittest.TestCase):
+    """Runtime RectTransform tables + C# anchoredPosition / sizeDelta."""
+
+    def _ui_project(self, script, go_name="Panel"):
+        root = tempfile.mkdtemp(prefix="upack-live-rt-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        hud = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        with open(os.path.join(scripts, "Hud.cs"), "w") as f:
+            f.write(script)
+        with open(os.path.join(scripts, "Hud.cs.meta"), "w") as f:
+            f.write("guid: %s\n" % hud)
+        tex = os.path.join(root, "Assets", "tex.png")
+        os.makedirs(os.path.dirname(tex), exist_ok=True)
+        # 2×2 white PNG
+        import struct, zlib
+        def chunk(tag, data):
+            return (struct.pack(">I", len(data)) + tag + data
+                    + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff))
+        raw = b"\x00" + b"\xff\xff\xff\xff" * 2
+        raw = raw + b"\x00" + b"\xff\xff\xff\xff" * 2
+        png = (b"\x89PNG\r\n\x1a\n"
+               + chunk(b"IHDR", struct.pack(">IIBBBBB", 2, 2, 8, 6, 0, 0, 0))
+               + chunk(b"IDAT", zlib.compress(raw))
+               + chunk(b"IEND", b""))
+        with open(tex, "wb") as f:
+            f.write(png)
+        with open(tex + ".meta", "w") as f:
+            f.write(
+                "guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+                "TextureImporter:\n  spritePixelsToUnits: 100\n"
+            )
+        ps = os.path.join(root, "ProjectSettings")
+        os.makedirs(ps)
+        with open(os.path.join(ps, "ProjectSettings.asset"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "PlayerSettings:\n"
+                "  defaultScreenWidth: 800\n"
+                "  defaultScreenHeight: 600\n"
+            )
+        with open(os.path.join(ps, "EditorBuildSettings.asset"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "EditorBuildSettings:\n"
+                "  m_Scenes:\n"
+                "  - enabled: 1\n"
+                "    path: Assets/Scenes/S.unity\n"
+            )
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        img = "fe87c0e1cc204ed48ad3b37840f39efc"
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                ("%%YAML 1.1\n"
+                 "--- !u!1 &100\nGameObject:\n  m_Name: Main Camera\n"
+                 "  m_TagString: MainCamera\n"
+                 "  m_Component:\n  - component: {fileID: 101}\n"
+                 "  - component: {fileID: 102}\n"
+                 "--- !u!4 &101\nTransform:\n"
+                 "  m_GameObject: {fileID: 100}\n"
+                 "  m_Father: {fileID: 0}\n"
+                 "  m_LocalPosition: {x: 0, y: 0, z: -10}\n"
+                 "--- !u!20 &102\nCamera:\n"
+                 "  m_GameObject: {fileID: 100}\n"
+                 "  m_Orthographic: 1\n"
+                 "  orthographic size: 5\n"
+                 "  m_BackGroundColor: {r: 0, g: 0, b: 0, a: 1}\n"
+                 "--- !u!1 &1\nGameObject:\n  m_Name: Canvas\n"
+                 "  m_Component:\n  - component: {fileID: 2}\n"
+                 "  - component: {fileID: 3}\n"
+                 "--- !u!224 &2\nRectTransform:\n"
+                 "  m_GameObject: {fileID: 1}\n"
+                 "  m_Father: {fileID: 0}\n"
+                 "  m_AnchorMin: {x: 0, y: 0}\n"
+                 "  m_AnchorMax: {x: 1, y: 1}\n"
+                 "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                 "  m_SizeDelta: {x: 0, y: 0}\n"
+                 "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                 "--- !u!223 &3\nCanvas:\n  m_GameObject: {fileID: 1}\n"
+                 "  m_Enabled: 1\n  m_RenderMode: 0\n"
+                 "--- !u!1 &10\nGameObject:\n  m_Name: %s\n"
+                 "  m_Component:\n  - component: {fileID: 11}\n"
+                 "  - component: {fileID: 12}\n"
+                 "  - component: {fileID: 13}\n"
+                 "--- !u!224 &11\nRectTransform:\n"
+                 "  m_GameObject: {fileID: 10}\n"
+                 "  m_Father: {fileID: 2}\n"
+                 "  m_AnchorMin: {x: 0.5, y: 0.5}\n"
+                 "  m_AnchorMax: {x: 0.5, y: 0.5}\n"
+                 "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                 "  m_SizeDelta: {x: 100, y: 80}\n"
+                 "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                 "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                 "--- !u!114 &12\nMonoBehaviour:\n"
+                 "  m_GameObject: {fileID: 10}\n"
+                 "  m_Script: {fileID: 11500000, guid: %s}\n"
+                 "  m_Sprite: {fileID: 21300000, "
+                 "guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, type: 3}\n"
+                 "  m_Type: 0\n"
+                 "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+                 "--- !u!114 &13\nMonoBehaviour:\n"
+                 "  m_GameObject: {fileID: 10}\n"
+                 "  m_Script: {fileID: 11500000, "
+                 "guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}\n"
+                 ) % (go_name, img)
+            )
+        return root
+
+    def test_live_rt_tables_emitted_for_ui(self):
+        """UI pack seeds mutable RT tables + screen-rect recompute."""
+        root = self._ui_project(
+            "using UnityEngine;\n"
+            "public class Hud : MonoBehaviour {\n"
+            "    void Update() {}\n"
+            "}\n"
+        )
+        d = tempfile.mkdtemp(prefix="upack-live-rt-out-")
+        plan = unity_pack.pack(root, d)
+        self.assertTrue(plan.get("live_rt"))
+        self.assertTrue(any(plan["live_rt"]["has"]))
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("_engine_rt_apos_x", eng)
+        self.assertIn("_engine_ui_screen_rect", eng)
+        self.assertIn("_engine_rt_sx", eng)
+        self.assertIn("_engine_ui_layout_w", eng)
+        self.assertIn("_engine_ui_layout_h", eng)
+        self.assertEqual(int(plan.get("ui_layout_width") or 0), 800)
+        self.assertEqual(int(plan.get("ui_layout_height") or 0), 600)
+        self.assertNotIn("static const float _spr_ncx[]", eng)
+
+    def test_anchored_position_setter_lowers(self):
+        """rectTransform.anchoredPosition = new Vector2 → RT setter."""
+        root = self._ui_project(
+            "using UnityEngine;\n"
+            "public class Hud : MonoBehaviour {\n"
+            "    public float scale;\n"
+            "    void Update() {\n"
+            "        rectTransform.anchoredPosition = new Vector2(40f, -20f);\n"
+            "        rectTransform.sizeDelta = new Vector2(120f, 90f);\n"
+            "        transform.localScale = new Vector3(0.5f, 0.5f, 1f);\n"
+            "        rectTransform.localScale = Vector3.one * scale;\n"
+            "    }\n"
+            "}\n"
+        )
+        d = tempfile.mkdtemp(prefix="upack-apos-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("RectTransform_set_anchoredPosition_xy", eng)
+        self.assertIn("RectTransform_set_sizeDelta_xy", eng)
+        self.assertIn("RectTransform_set_localScale_xy", eng)
+        self.assertRegex(
+            eng,
+            r"RectTransform_set_localScale_xy\s*\(\s*_engine_go_of_Hud\s*\(\s*i\s*\)\s*,"
+            r"\s*\(?\s*Hud_get_scale\s*\(\s*i\s*\)")
+
+    def test_scaffold_canvas_rect_on_hierarchy(self):
+        """Dropped Canvas scaffold still seeds live RT via hierarchy snapshot."""
+        root = self._ui_project(
+            "using UnityEngine;\n"
+            "public class Hud : MonoBehaviour { void Update() {} }\n"
+        )
+        objs, _a, _l, _c, hier = unity_pack.load_project(root)
+        self.assertNotIn("Canvas", {o["name"] for o in objs})
+        h_canvas = [h for h in hier if h.get("name") == "Canvas"]
+        self.assertEqual(len(h_canvas), 1)
+        self.assertIsNotNone(h_canvas[0].get("rect"))
+        self.assertTrue(int(h_canvas[0].get("canvas_root") or 0))
+        d = tempfile.mkdtemp(prefix="upack-rt-hier-")
+        plan = unity_pack.pack(root, d)
+        self.assertIn("Canvas", plan.get("go_names") or [])
+        gi = plan["go_names"].index("Canvas")
+        self.assertTrue(plan["live_rt"]["has"][gi])
+        self.assertTrue(plan["live_rt"]["canvas_root"][gi])
+        self.assertTrue(plan["live_rt"]["canvas"][gi])
+
+    @needs_cc
+    def test_mutating_apos_moves_draw(self):
+        """C# anchoredPosition setter moves UI draw; unmutated seed ≈ center."""
+        root = self._ui_project(
+            "using UnityEngine;\n"
+            "public class Hud : MonoBehaviour {\n"
+            "    void Update() {\n"
+            "        rectTransform.anchoredPosition = new Vector2(200f, 0f);\n"
+            "    }\n"
+            "}\n"
+        )
+        d = tempfile.mkdtemp(prefix="upack-apos-run-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("RectTransform_set_anchoredPosition_xy", eng)
+        host = os.path.join(d, "host_apos.c")
+        with open(host, "w") as f:
+            f.write(
+                "void engine_tick(void);\n"
+                "extern float Time_deltaTime;\n"
+                "typedef struct { float x, y, half_w, half_h;\n"
+                "                 float m00, m01, m10, m11;\n"
+                "                 float r, g, b; float a; int tex;\n"
+                "                 int sorting_layer; int sorting_order;\n"
+                "               } EngineDraw;\n"
+                "int engine_collect_draws(EngineDraw *out, int max);\n"
+                "int main(void) {\n"
+                "  EngineDraw buf[8];\n"
+                "  float x0, x1;\n"
+                "  int n;\n"
+                "  Time_deltaTime = 0.016f;\n"
+                "  n = engine_collect_draws(buf, 8);\n"
+                "  if (n < 1) return 1;\n"
+                "  x0 = buf[0].x;\n"
+                "  if (x0 < -0.05f || x0 > 0.05f) return 2;\n"
+                "  engine_tick();\n"
+                "  n = engine_collect_draws(buf, 8);\n"
+                "  if (n < 1) return 3;\n"
+                "  x1 = buf[0].x;\n"
+                "  if (x1 <= x0 + 0.5f) return 4;\n"
+                "  return 0;\n"
+                "}\n"
+            )
+        r = subprocess.run(
+            [_CC, "-O2", "-c", "-o", os.path.join(d, "engine.o"),
+             os.path.join(d, "engine.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = subprocess.run(
+            [_CC, "-O0", "-c", "-o", os.path.join(d, "data.o"),
+             os.path.join(d, "data.c")],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        exe = os.path.join(d, "host_apos")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host,
+             os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
