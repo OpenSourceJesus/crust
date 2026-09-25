@@ -6610,6 +6610,9 @@ class TestSystems(unittest.TestCase):
         objs, _a, _l, cams, _hier = unity_pack.load_project(SYSTEMS)
         btn = [o for o in objs if o["name"] == "Button"]
         self.assertEqual(len(btn), 1)
+        # Scriptless uGUI Button GO must not pack as class "Button" — that
+        # collides with GameObject_GetComponent_Button (C has no overloads).
+        self.assertEqual(btn[0]["class"], "_Rect")
         sp = btn[0]["sprite"]
         self.assertIsNotNone(sp)
         self.assertEqual(sp.get("source"), "ui")
@@ -6678,6 +6681,268 @@ class TestSystems(unittest.TestCase):
         ub = plan["ui_buttons"][0]
         self.assertAlmostEqual(ub["highlighted"][0], 0.78431374, places=5)
         self.assertAlmostEqual(ub["pressed"][0], 0.5882353, places=5)
+
+    def test_getcomponent_button_with_named_button_go(self):
+        """GetComponent<Button> + GO named Button → one C symbol, not two.
+
+        Scriptless UI GOs used to take class = go.name. A GO named \"Button\"
+        then emitted GameObject_GetComponent_Button alongside the uGUI helper.
+        """
+        root = tempfile.mkdtemp(prefix="upack-gc-btn-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        host_guid = "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"
+        with open(os.path.join(scripts, "Host.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "using UnityEngine.UI;\n"
+                "public class Host : MonoBehaviour {\n"
+                "    void Update() {\n"
+                "        GetComponent<Button>();\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Host.cs.meta"), "w") as f:
+            f.write("guid: %s\n" % host_guid)
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        img = "fe87c0e1cc204ed48ad3b37840f39efc"
+        btn = "4e29b1a8efbd4b44bb3f3716e73f07ff"
+        builtin = "0000000000000000f000000000000000"
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%%YAML 1.1\n"
+                "--- !u!1 &100\nGameObject:\n  m_Name: Main Camera\n"
+                "  m_Component:\n  - component: {fileID: 101}\n"
+                "  - component: {fileID: 102}\n"
+                "--- !u!4 &101\nTransform:\n"
+                "  m_GameObject: {fileID: 100}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: -10}\n"
+                "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "--- !u!20 &102\nCamera:\n"
+                "  m_GameObject: {fileID: 100}\n"
+                "  m_Orthographic: 1\n"
+                "  m_OrthographicSize: 5\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Canvas\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!224 &2\nRectTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 0, y: 0}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!223 &3\nCanvas:\n  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n  m_RenderMode: 0\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Button\n"
+                "  m_Component:\n"
+                "  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "  - component: {fileID: 13}\n"
+                "  - component: {fileID: 14}\n"
+                "--- !u!224 &11\nRectTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Father: {fileID: 2}\n"
+                "  m_AnchorMin: {x: 0.5, y: 0.5}\n"
+                "  m_AnchorMax: {x: 0.5, y: 0.5}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 160, y: 30}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!114 &12\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, guid: %s}\n"
+                "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+                "  m_Enabled: 1\n  m_Type: 1\n"
+                "  m_Sprite: {fileID: 10905, guid: %s, type: 0}\n"
+                "--- !u!114 &13\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, guid: %s}\n"
+                "  m_OnClick:\n    m_PersistentCalls:\n      m_Calls: []\n"
+                "--- !u!114 &14\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, guid: %s}\n"
+                % (img, builtin, btn, host_guid)
+            )
+        ps = os.path.join(root, "ProjectSettings")
+        os.makedirs(ps)
+        with open(os.path.join(ps, "EditorBuildSettings.asset"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1045 &1\nEditorBuildSettings:\n"
+                "  m_Scenes:\n"
+                "  - enabled: 1\n"
+                "    path: Assets/Scenes/S.unity\n"
+            )
+        objs, _a, _l, _c, _h = unity_pack.load_project(root)
+        btn_o = [o for o in objs if o["name"] == "Button"][0]
+        # Host script wins class; without Host, scriptless name would be _Rect.
+        self.assertNotEqual(btn_o["class"], "Button")
+        self.assertIsNotNone(btn_o.get("ui_button"))
+        d = tempfile.mkdtemp(prefix="upack-gc-btn-out-")
+        plan = unity_pack.pack(root, d)
+        self.assertNotIn("Button", plan["classes"])
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        # Definition once (call sites also mention the symbol).
+        self.assertEqual(
+            eng.count("static int GameObject_GetComponent_Button("), 1)
+        self.assertEqual(eng.count("static int _engine_go_Button["), 1)
+        self.assertNotIn("defined twice", eng)
+        self.assertIn("GetComponent_Button", eng)
+
+    def test_scriptless_button_go_class_is_rect(self):
+        """GO named Button with only uGUI components packs as _Rect, not Button."""
+        root = tempfile.mkdtemp(prefix="upack-btn-rect-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Host.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Host : MonoBehaviour { void Update() {} }\n"
+            )
+        with open(os.path.join(scripts, "Host.cs.meta"), "w") as f:
+            f.write("guid: d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        img = "fe87c0e1cc204ed48ad3b37840f39efc"
+        btn = "4e29b1a8efbd4b44bb3f3716e73f07ff"
+        builtin = "0000000000000000f000000000000000"
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%%YAML 1.1\n"
+                "--- !u!1 &100\nGameObject:\n  m_Name: Main Camera\n"
+                "  m_Component:\n  - component: {fileID: 101}\n"
+                "  - component: {fileID: 102}\n"
+                "--- !u!4 &101\nTransform:\n"
+                "  m_GameObject: {fileID: 100}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: -10}\n"
+                "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "--- !u!20 &102\nCamera:\n"
+                "  m_GameObject: {fileID: 100}\n"
+                "  m_Orthographic: 1\n"
+                "  m_OrthographicSize: 5\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Host\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2}\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Button\n"
+                "  m_Component:\n"
+                "  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "  - component: {fileID: 13}\n"
+                "--- !u!224 &11\nRectTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_AnchorMin: {x: 0.5, y: 0.5}\n"
+                "  m_AnchorMax: {x: 0.5, y: 0.5}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 160, y: 30}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!114 &12\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, guid: %s}\n"
+                "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+                "  m_Enabled: 1\n  m_Type: 1\n"
+                "  m_Sprite: {fileID: 10905, guid: %s, type: 0}\n"
+                "--- !u!114 &13\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, guid: %s}\n"
+                "  m_OnClick:\n    m_PersistentCalls:\n      m_Calls: []\n"
+                % (img, builtin, btn)
+            )
+        ps = os.path.join(root, "ProjectSettings")
+        os.makedirs(ps)
+        with open(os.path.join(ps, "EditorBuildSettings.asset"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1045 &1\nEditorBuildSettings:\n"
+                "  m_Scenes:\n"
+                "  - enabled: 1\n"
+                "    path: Assets/Scenes/S.unity\n"
+            )
+        objs, _a, _l, _c, _h = unity_pack.load_project(root)
+        btn_o = [o for o in objs if o["name"] == "Button"][0]
+        self.assertEqual(btn_o["class"], "_Rect")
+        d = tempfile.mkdtemp(prefix="upack-btn-rect-out-")
+        plan = unity_pack.pack(root, d)
+        self.assertNotIn("Button", plan["classes"])
+        self.assertIn("_Rect", plan["classes"])
+
+    def test_getcomponent_button_finds_uibutton_subclass(self):
+        """GetComponent<Button> finds GO with UIButton : Button (inheritance)."""
+        root = tempfile.mkdtemp(prefix="upack-uibtn-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        uibtn_guid = "e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3"
+        with open(os.path.join(scripts, "UIButton.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "using UnityEngine.UI;\n"
+                "public class UIButton : Button {\n"
+                "    void Update() {\n"
+                "        GetComponent<Button>();\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "UIButton.cs.meta"), "w") as f:
+            f.write("guid: %s\n" % uibtn_guid)
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Play\n"
+                "  m_Component:\n"
+                "  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, guid: %s}\n"
+                % uibtn_guid
+            )
+        ps = os.path.join(root, "ProjectSettings")
+        os.makedirs(ps)
+        with open(os.path.join(ps, "EditorBuildSettings.asset"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1045 &1\nEditorBuildSettings:\n"
+                "  m_Scenes:\n"
+                "  - enabled: 1\n"
+                "    path: Assets/Scenes/S.unity\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-uibtn-out-")
+        plan = unity_pack.pack(root, d)
+        self.assertIn("UIButton", plan["classes"])
+        ui_maps = plan.get("go_ui_components") or {}
+        self.assertIn("Button", ui_maps)
+        play_gi = plan["classes"]["UIButton"]["instances"][0]["go_index"]
+        self.assertIn(play_gi, ui_maps["Button"])
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertEqual(
+            eng.count("static int GameObject_GetComponent_Button("), 1)
+        self.assertIn("GameObject_GetComponent_UIButton", eng)
 
     def test_vertical_layout_group_stacks_children(self):
         """Authored VerticalLayoutGroup bakes child RectTransforms top→bottom."""
