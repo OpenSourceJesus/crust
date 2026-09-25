@@ -9495,6 +9495,113 @@ class TestSystems(unittest.TestCase):
         self.assertAlmostEqual(inner["rect"]["size_delta"][0], -200.0, places=3)
         self.assertAlmostEqual(inner["rect"]["size_delta"][1], 0.0, places=3)
 
+    def test_slider_update_visuals_drives_handle_anchors(self):
+        """Slider.UpdateVisuals: handle anchors follow normalized m_Value."""
+        root = tempfile.mkdtemp(prefix="upack-slider-vis-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Host.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Host : MonoBehaviour { void Update() {} }\n"
+            )
+        with open(os.path.join(scripts, "Host.cs.meta"), "w") as f:
+            f.write("guid: slidervisualsslidervisualssli01\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        # Builtin Slider guid; Image for handle draw optional.
+        slider = "67db9e8f0e2ae9c40bc1e2b64352a6b4"
+        img = "fe87c0e1cc204ed48ad3b37840f39efc"
+        builtin = "0000000000000000f000000000000000"
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Canvas\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!224 &2\nRectTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 0, y: 0}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!223 &3\nCanvas:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Volume Slider\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "--- !u!224 &11\nRectTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Father: {fileID: 2}\n"
+                "  m_Children:\n  - {fileID: 21}\n"
+                "  m_AnchorMin: {x: 0.5, y: 0.5}\n"
+                "  m_AnchorMax: {x: 0.5, y: 0.5}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 400, y: 40}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!114 &12\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Enabled: 1\n"
+                "  m_Script: {fileID: 11500000, guid: " + slider + "}\n"
+                "  m_FillRect: {fileID: 0}\n"
+                "  m_HandleRect: {fileID: 31}\n"
+                "  m_Direction: 0\n"
+                "  m_MinValue: 0\n"
+                "  m_MaxValue: 1\n"
+                "  m_Value: 0.75\n"
+                "--- !u!1 &20\nGameObject:\n  m_Name: Handle Slide Area\n"
+                "  m_Component:\n  - component: {fileID: 21}\n"
+                "--- !u!224 &21\nRectTransform:\n"
+                "  m_GameObject: {fileID: 20}\n"
+                "  m_Father: {fileID: 11}\n"
+                "  m_Children:\n  - {fileID: 31}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: -40, y: 0}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!1 &30\nGameObject:\n  m_Name: Handle\n"
+                "  m_Component:\n  - component: {fileID: 31}\n"
+                "  - component: {fileID: 32}\n"
+                "--- !u!224 &31\nRectTransform:\n"
+                "  m_GameObject: {fileID: 30}\n"
+                "  m_Father: {fileID: 21}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 0, y: 0}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 20, y: -10}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!114 &32\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 30}\n"
+                "  m_Enabled: 1\n"
+                "  m_Script: {fileID: 11500000, guid: " + img + "}\n"
+                "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+                "  m_Sprite: {fileID: 10913, guid: " + builtin + ", type: 0}\n"
+                "--- !u!1 &40\nGameObject:\n  m_Name: Host\n"
+                "  m_Component:\n  - component: {fileID: 41}\n"
+                "  - component: {fileID: 42}\n"
+                "--- !u!4 &41\nTransform:\n"
+                "  m_GameObject: {fileID: 40}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &42\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 40}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: slidervisualsslidervisualssli01}\n"
+            )
+        objs, _a, _l, _c, _h = unity_pack.load_project(root)
+        handle = [o for o in objs if o["name"] == "Handle"][0]
+        slider_o = [o for o in objs if o["name"] == "Volume Slider"][0]
+        self.assertIsNotNone(slider_o.get("ui_slider"))
+        self.assertAlmostEqual(slider_o["ui_slider"]["value"], 0.75, places=5)
+        # LTR → anchorMin/Max.x = normalizedValue; y stretches 0..1.
+        self.assertAlmostEqual(handle["rect"]["anchor_min"][0], 0.75, places=5)
+        self.assertAlmostEqual(handle["rect"]["anchor_max"][0], 0.75, places=5)
+        self.assertAlmostEqual(handle["rect"]["anchor_min"][1], 0.0, places=5)
+        self.assertAlmostEqual(handle["rect"]["anchor_max"][1], 1.0, places=5)
+
     def test_awake_setactive_false_emitted(self):
         """Awake gameObject.SetActive(false) runs before Start (SettingsMenu)."""
         root = tempfile.mkdtemp(prefix="upack-awake-sa-")

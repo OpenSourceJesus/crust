@@ -2074,6 +2074,8 @@ def _resolve_anim_child_path(owner, path, plan):
 # Builtin uGUI Image / Button MonoBehaviour script guids (UnityEngine.UI.dll).
 _IMAGE_SCRIPT_GUID = "fe87c0e1cc204ed48ad3b37840f39efc"
 _BUTTON_SCRIPT_GUID = "4e29b1a8efbd4b44bb3f3716e73f07ff"
+# UnityEngine.UI.Slider (handle/fill anchors driven by m_Value).
+_SLIDER_SCRIPT_GUID = "67db9e8f0e2ae9c40bc1e2b64352a6b4"
 # TextMeshProUGUI (com.unity.ugui / Unity.TextMeshPro).
 _TMP_UGUI_SCRIPT_GUID = "f4688fdb7df04437aeb418b961361dc5"
 # uGUI layout controllers (authored Vertical/HorizontalLayoutGroup).
@@ -2127,6 +2129,88 @@ def _is_ui_button_mb(block, guid):
             and re.search(r"(?m)^\s+m_OnClick:\s*$", block)):
         return True
     return False
+
+
+def _is_ui_slider_mb(block, guid):
+    """True for builtin Slider or a Slider subclass (e.g. ``_Slider``).
+
+    Shape: ``m_HandleRect`` + ``m_MinValue`` (Scrollbar has HandleRect but
+    not Min/MaxValue).
+    """
+    if (guid or "").lower() == _SLIDER_SCRIPT_GUID:
+        return True
+    if re.search(
+            r"(?m)^\s+m_EditorClassIdentifier:.*(?:^|[.\s:])_?Slider\s*$",
+            block):
+        return True
+    if (re.search(r"(?m)^\s+m_HandleRect:\s*", block)
+            and re.search(r"(?m)^\s+m_MinValue:\s*", block)
+            and re.search(r"(?m)^\s+m_MaxValue:\s*", block)):
+        return True
+    return False
+
+
+def _parse_ui_slider(block, file_id=None):
+    """Authored uGUI Slider → value range, direction, handle/fill, onValueChanged."""
+    def _fid(key):
+        m = re.search(
+            r"(?m)^\s+%s:\s*\{fileID:\s*(-?\d+)" % re.escape(key), block)
+        return int(m.group(1)) if m else 0
+
+    def _f(key, default):
+        m = re.search(
+            r"(?m)^\s+%s:\s*([0-9.eE+-]+)" % re.escape(key), block)
+        return float(m.group(1)) if m else float(default)
+
+    def _i(key, default):
+        m = re.search(r"(?m)^\s+%s:\s*(-?\d+)" % re.escape(key), block)
+        return int(m.group(1)) if m else int(default)
+
+    calls = []
+    oc = re.search(r"(?m)^\s+m_OnValueChanged:\s*$", block)
+    if oc:
+        chunk = block[oc.end():]
+        stop = re.search(r"(?m)^---\s", chunk)
+        if stop:
+            chunk = chunk[:stop.start()]
+        # Stop at next sibling field of Slider / _Slider extras.
+        stop2 = re.search(
+            r"(?m)^\s+(?:displayValueText|selectable|slidingAreaRectTrs|"
+            r"snapValues|indexOfCurrentSnapValue):\s*",
+            chunk)
+        if stop2:
+            chunk = chunk[:stop2.start()]
+        for cm in re.finditer(
+                r"m_Target:\s*\{fileID:\s*(-?\d+)\}[\s\S]*?"
+                r"m_MethodName:\s*(\w+)[\s\S]*?"
+                r"m_Mode:\s*(\d+)",
+                chunk):
+            tid = int(cm.group(1))
+            if tid == 0:
+                continue
+            calls.append({
+                "target_go": str(tid),
+                "method": cm.group(2),
+                "mode": int(cm.group(3)),
+            })
+    interactable = _i("m_Interactable", 1)
+    if not _mb_enabled(block):
+        interactable = 0
+    return {
+        "enabled": _mb_enabled(block),
+        "interactable": interactable,
+        "handle_rect_id": _fid("m_HandleRect"),
+        "fill_rect_id": _fid("m_FillRect"),
+        # _Slider companion field; 0 → use handle parent / slider root.
+        "slide_area_id": _fid("slidingAreaRectTrs"),
+        "direction": _i("m_Direction", 0),
+        "min": _f("m_MinValue", 0.0),
+        "max": _f("m_MaxValue", 1.0),
+        "value": _f("m_Value", 0.0),
+        "whole_numbers": _i("m_WholeNumbers", 0),
+        "on_value_changed": calls,
+        "mb_file_id": file_id,
+    }
 
 
 def _is_ui_tmp_mb(block, guid):
@@ -3176,6 +3260,71 @@ def _apply_layout_groups(objects, screen_w, screen_h):
     arfs.sort(key=lambda o: _depth(o))
     for o in arfs:
         _apply_aspect_ratio_fitter(o, by_xf, screen_w, screen_h)
+
+
+def _slider_normalized(value, vmin, vmax):
+    """Unity Slider.normalizedValue."""
+    lo = float(vmin)
+    hi = float(vmax)
+    if abs(hi - lo) < 1e-8:
+        return 0.0
+    t = (float(value) - lo) / (hi - lo)
+    if t < 0.0:
+        return 0.0
+    if t > 1.0:
+        return 1.0
+    return t
+
+
+def _apply_slider_visuals(objects):
+    """Bake Unity ``Slider.UpdateVisuals`` into handle/fill RectTransforms.
+
+    Scene YAML often leaves handle anchors at ``(0,0)-(0,0)`` because they
+    are driven at runtime. Without this, pack places the knob at the
+    Handle Slide Area's corner (often below/left of the track) instead of
+    along ``normalizedValue``.
+    """
+    by_xf = {}
+    for o in objects:
+        xid = o.get("xf_id")
+        if xid is not None and str(xid) not in ("", "0"):
+            by_xf[str(xid)] = o
+    for o in objects:
+        sl = o.get("ui_slider")
+        if not sl or not int(sl.get("enabled", 1)):
+            continue
+        direction = int(sl.get("direction") or 0)
+        # 0 LTR, 1 RTL, 2 BTT, 3 TTB — UnityEngine.UI.Slider.Direction.
+        axis = 0 if direction in (0, 1) else 1
+        reverse = direction in (1, 3)
+        nv = _slider_normalized(sl.get("value"), sl.get("min"), sl.get("max"))
+        t = (1.0 - nv) if reverse else nv
+        handle_id = int(sl.get("handle_rect_id") or 0)
+        if handle_id:
+            h = by_xf.get(str(handle_id))
+            if h is not None and h.get("rect") is not None:
+                rect = dict(h["rect"])
+                amin = [0.0, 0.0]
+                amax = [1.0, 1.0]
+                amin[axis] = t
+                amax[axis] = t
+                rect["anchor_min"] = (float(amin[0]), float(amin[1]))
+                rect["anchor_max"] = (float(amax[0]), float(amax[1]))
+                h["rect"] = rect
+        fill_id = int(sl.get("fill_rect_id") or 0)
+        if fill_id:
+            f = by_xf.get(str(fill_id))
+            if f is not None and f.get("rect") is not None:
+                rect = dict(f["rect"])
+                amin = [0.0, 0.0]
+                amax = [1.0, 1.0]
+                if reverse:
+                    amin[axis] = 1.0 - nv
+                else:
+                    amax[axis] = nv
+                rect["anchor_min"] = (float(amin[0]), float(amin[1]))
+                rect["anchor_max"] = (float(amax[0]), float(amax[1]))
+                f["rect"] = rect
 
 
 _TMP_FONT_CACHE = {}
@@ -4399,6 +4548,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 }
             elif _is_ui_button_mb(block, g):
                 rec["ui_button"] = _parse_ui_button(block, file_id)
+            elif _is_ui_slider_mb(block, g):
+                rec["ui_slider"] = _parse_ui_slider(block, file_id)
             elif _is_ui_tmp_mb(block, g):
                 rec["ui_tmp"] = _parse_ui_tmp(block, asset_guids)
             elif _is_vlayout_mb(block, g):
@@ -4667,6 +4818,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         sprite = None
         ui_image = None
         ui_button = None
+        ui_slider = None
         ui_tmp = None
         layout_group = None
         layout_element = None
@@ -4704,11 +4856,17 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 vec3_fields.update(k.get("vec3_fields") or {})
                 g = k.get("guid")
                 if g and g in guid_to_script:
-                    script = guid_to_script[g]
+                    # Prefer authored Slider (_Slider) over companion
+                    # _Selectable on the same GO so SetDisplayValue /
+                    # OnValueChanged resolve to a packed _Slider instance.
+                    if script is None or k.get("ui_slider"):
+                        script = guid_to_script[g]
                 if k.get("ui_image"):
                     ui_image = dict(k["ui_image"])
                 if k.get("ui_button"):
                     ui_button = dict(k["ui_button"])
+                if k.get("ui_slider"):
+                    ui_slider = dict(k["ui_slider"])
                 if k.get("ui_tmp"):
                     ui_tmp = dict(k["ui_tmp"])
                 if k.get("layout_group"):
@@ -5061,6 +5219,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "rect": rect,
             "ui_image": ui_image,
             "ui_button": ui_button,
+            "ui_slider": ui_slider,
             "ui_tmp": ui_tmp,
             "layout_group": layout_group,
             "layout_element": layout_element,
@@ -17535,6 +17694,7 @@ def _load_scenes_lights_cameras(root, assets):
     _apply_camera_script_view_to_cameras(cameras, objects)
     sw, sh = _ui_layout_screen(root, objects)
     _apply_layout_groups(objects, sw, sh)
+    _apply_slider_visuals(objects)
     _bake_ui_images(
         objects, cameras, sw, sh, asset_guids=assets, hierarchy=hierarchy)
     # Snapshot rect onto hierarchy before dropping layout-only scaffolds so

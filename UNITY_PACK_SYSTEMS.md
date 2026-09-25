@@ -272,7 +272,10 @@ to 0.59 shrinks children and TMP like Unity Canvas space).
 `sizeDelta` / anchors / pivot / scale xy); `engine_collect_draws` and
 `engine_ui_tick` recompute norms via `_engine_ui_screen_rect` in pack-time
 canvas units (`_engine_ui_layout_w/h` from CanvasScaler + viewSize letterbox,
-not a resized `Screen`). Authored C# may get/set
+not a resized `Screen`). After layout, `_apply_slider_visuals` bakes Unity
+`Slider.UpdateVisuals` into handle/fill anchors from authored `m_Value` /
+min/max/direction (YAML often leaves handles at `(0,0)` because they are
+driven at runtime). Authored C# may get/set
 `rectTransform.anchoredPosition`, `sizeDelta`, and UI `localScale` (xy).
 Layout-only Canvas / Rect parents are snapshotted onto `scene_hierarchy`
 before scaffold drop so the live GO parent chain keeps rect state.
