@@ -4724,7 +4724,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         if fid not in ("", "0", "None") and fid not in existing_xf:
             pending.add(fid)
     _materialize_prefab_instance_ui(
-        by_id, objects, asset_guids or {}, editor_only_xfs)
+        by_id, objects, asset_guids or {}, editor_only_xfs,
+        guid_to_script)
     # Stash clip assets on a sentinel for pack() — returned via lights? No.
     # Attach to a module-level isn't clean. Return clips via objects meta:
     # pack() reloads clips. Store on each player the clip snapshot.
@@ -4773,7 +4774,8 @@ def _prefab_mod_rect(raw):
 
 
 def _materialize_prefab_instance_ui(by_id, objects, asset_guids,
-                                    editor_only_xfs=None):
+                                    editor_only_xfs=None,
+                                    guid_to_script=None):
     """Create drawable Image objects for PrefabInstance roots with sprite mods.
 
     Scene UI buttons are often PrefabInstances (stripped root Transform +
@@ -4782,6 +4784,7 @@ def _materialize_prefab_instance_ui(by_id, objects, asset_guids,
     when the parent walk stops at the stripped root.
     """
     asset_guids = asset_guids or {}
+    guid_to_script = guid_to_script or {}
     editor_only_xfs = editor_only_xfs or set()
     have_xf = {str(o.get("xf_id")) for o in objects if o.get("xf_id")}
     # PrefabInstance id → root stripped Transform (father == PI TransformParent).
@@ -4851,6 +4854,33 @@ def _materialize_prefab_instance_ui(by_id, objects, asset_guids,
         preserve = int(presc.group(1)) if presc else 1
         itype = re.search(
             r"propertyPath:\s*m_Type\s*\n\s*value:\s*(\d+)", raw)
+        # Pull Button / UIButton + scene onClick overrides from source prefab.
+        ui_button = None
+        src_m = re.search(
+            r"m_SourcePrefab:\s*\{fileID:\s*\d+,\s*guid:\s*([0-9a-fA-F]+)",
+            raw)
+        if src_m:
+            pref_guid = src_m.group(1).lower()
+            pref_path = asset_guids.get(pref_guid)
+            if (pref_path and str(pref_path).lower().endswith(".prefab")
+                    and os.path.isfile(pref_path)):
+                try:
+                    pref_objs, _l, _c, _h = _parsed_prefab_objects(
+                        pref_path, guid_to_script, asset_guids)
+                    src = next(
+                        (o for o in pref_objs if o.get("ui_button")), None)
+                    if src is None:
+                        src = next(
+                            (o for o in pref_objs if o.get("rect")), None)
+                    if src and src.get("ui_button"):
+                        ui_button = dict(src["ui_button"])
+                        ui_button = _apply_ui_button_onclick_mods(
+                            ui_button, raw, ui_button.get("mb_file_id"))
+                except Exception:
+                    ui_button = None
+        # Stable go_id for PrefabInstance roots (scene often has no GO stub).
+        if go_id is None:
+            go_id = "prefabinst:%s:%s" % (pi_id, xf_id)
         objects.append({
             "name": name,
             "pos": pi.get("pos") or (0.0, 0.0, 0.0),
@@ -4880,7 +4910,7 @@ def _materialize_prefab_instance_ui(by_id, objects, asset_guids,
                 "pixels_per_unit_multiplier": 1.0,
                 "preserve_aspect": preserve,
             },
-            "ui_button": None,
+            "ui_button": ui_button,
             "ui_tmp": None,
             "layout_group": None,
             "layout_element": None,
@@ -4898,14 +4928,27 @@ def _materialize_prefab_instance_ui(by_id, objects, asset_guids,
 
 
 
+_prefab_parse_cache = {}
+
+
 def _parsed_prefab_objects(path, guid_to_script, asset_guids):
     """Parse a .prefab once (cached) into packed-style objects."""
     key = os.path.abspath(path)
     if key not in _prefab_parse_cache:
-        _prefab_parse_cache[key] = parse_unity_yaml(
-            _read(path), guid_to_script=guid_to_script,
-            asset_guids=asset_guids)
-    return _prefab_parse_cache[key]
+        # Placeholder blocks recursive re-entry while parsing this prefab.
+        _prefab_parse_cache[key] = None
+        try:
+            _prefab_parse_cache[key] = parse_unity_yaml(
+                _read(path), guid_to_script=guid_to_script,
+                asset_guids=asset_guids)
+        except Exception:
+            _prefab_parse_cache.pop(key, None)
+            raise
+    cached = _prefab_parse_cache[key]
+    if cached is None:
+        # Nested PrefabInstance of the same asset — return empty.
+        return [], [], [], []
+    return cached
 
 
 def _prefab_mod_values(inst_raw, src_file_id):
@@ -4981,6 +5024,70 @@ def _apply_ui_image_sprite_mod(ui_image, inst_raw, asset_guids):
     ui_image["sprite_file_id"] = int(spr_fid)
     ui_image["sprite_guid"] = sg
     return ui_image
+
+
+def _apply_ui_button_onclick_mods(ui_button, inst_raw, mb_file_id=None):
+    """Merge PrefabInstance m_OnClick overrides onto a parsed ui_button.
+
+    Prefab Button.onClick is often empty; scene instances add SetActive calls
+    via propertyPath mods targeting the Button / UIButton MB fileID.
+    """
+    if not ui_button:
+        return ui_button
+    ui_button = dict(ui_button)
+    mb_id = str(mb_file_id or ui_button.get("mb_file_id") or "")
+    if not inst_raw or not mb_id:
+        return ui_button
+    # path → (value string, objectReference fileID)
+    mods = {}
+    for m in re.finditer(
+            r"target:\s*\{fileID:\s*%s,[^}]*\}\s*\n"
+            r"\s*propertyPath:\s*(m_OnClick[^\n]+)\s*\n"
+            r"\s*value:\s*([^\n]*)\s*\n"
+            r"\s*objectReference:\s*\{fileID:\s*(-?\d+)"
+            % re.escape(mb_id),
+            inst_raw):
+        mods[m.group(1).strip()] = (m.group(2).strip(), int(m.group(3)))
+    size_key = "m_OnClick.m_PersistentCalls.m_Calls.Array.size"
+    if size_key not in mods:
+        return ui_button
+    try:
+        n = int(float(mods[size_key][0]))
+    except ValueError:
+        return ui_button
+    if n <= 0:
+        ui_button["onclick"] = []
+        return ui_button
+    calls = []
+    for i in range(n):
+        prefix = ("m_OnClick.m_PersistentCalls.m_Calls.Array.data[%d]."
+                  % i)
+        method = (mods.get(prefix + "m_MethodName") or ("", 0))[0]
+        if not method:
+            continue
+        mode_s = (mods.get(prefix + "m_Mode") or ("1", 0))[0]
+        try:
+            mode = int(float(mode_s))
+        except ValueError:
+            mode = 1
+        bool_s = (mods.get(prefix + "m_Arguments.m_BoolArgument")
+                  or ("0", 0))[0]
+        try:
+            bool_arg = int(float(bool_s))
+        except ValueError:
+            bool_arg = 0
+        tgt_mod = mods.get(prefix + "m_Target")
+        tid = int(tgt_mod[1]) if tgt_mod else 0
+        if tid == 0:
+            continue
+        calls.append({
+            "target_go": str(tid),
+            "method": method,
+            "mode": mode,
+            "bool_arg": bool_arg,
+        })
+    ui_button["onclick"] = calls
+    return ui_button
 
 
 def _apply_rect_property_mods(rect, scale, mods):
@@ -5073,8 +5180,6 @@ def _append_prefab_instance_ui_objects(
         father_id = inst.get("father_id")
         for stub in stubs:
             xf_id = stub["scene_xf"]
-            if xf_id in existing_xf:
-                continue
             path = asset_guids.get(stub["guid"])
             if not path or not str(path).lower().endswith(".prefab"):
                 continue
@@ -5093,6 +5198,25 @@ def _append_prefab_instance_ui_objects(
                 # Prefab root often matches first object with a rect.
                 src = next((o for o in pref_objs if o.get("rect")), None)
             if src is None:
+                continue
+            ui_button = dict(src["ui_button"]) if src.get("ui_button") else None
+            if ui_button:
+                ui_button = _apply_ui_button_onclick_mods(
+                    ui_button, inst_raw, ui_button.get("mb_file_id"))
+            # Image-only materialize may have created this xf already — attach
+            # Button / UIButton ColorBlock + onClick from the source prefab.
+            if xf_id in existing_xf:
+                if ui_button:
+                    for o in objects:
+                        if str(o.get("xf_id")) != xf_id:
+                            continue
+                        if not o.get("ui_button"):
+                            o["ui_button"] = ui_button
+                        # Prefer a stable prefabinst go_id when scene stub
+                        # left go_id None (needed by _build_ui_buttons).
+                        if o.get("go_id") is None:
+                            o["go_id"] = "prefabinst:%s:%s" % (inst_id, xf_id)
+                        break
                 continue
             mods = _prefab_mod_values(inst_raw, stub["src_xf"])
             # m_IsActive targets the prefab GameObject fileID, not the RT.
@@ -5121,7 +5245,6 @@ def _append_prefab_instance_ui_objects(
             ui_image = dict(src["ui_image"]) if src.get("ui_image") else None
             ui_image = _apply_ui_image_sprite_mod(
                 ui_image, inst_raw, asset_guids)
-            ui_button = dict(src["ui_button"]) if src.get("ui_button") else None
             obj = {
                 "name": name,
                 "pos": src.get("pos") or (0.0, 0.0, 0.0),
