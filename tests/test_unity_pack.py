@@ -9602,6 +9602,149 @@ class TestSystems(unittest.TestCase):
         self.assertAlmostEqual(handle["rect"]["anchor_min"][1], 0.0, places=5)
         self.assertAlmostEqual(handle["rect"]["anchor_max"][1], 1.0, places=5)
 
+    def test_slider_drag_emits_onvaluechanged(self):
+        """Slider drag tables + onValueChanged float/void dispatch."""
+        root = tempfile.mkdtemp(prefix="upack-slider-drag-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Host.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Host : MonoBehaviour {\n"
+                "  public static float Volume {\n"
+                "    get { return 1f; }\n"
+                "    set { /* nop */ }\n"
+                "  }\n"
+                "  void Update() {}\n"
+                "  public void SetDisplayValue() {}\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Host.cs.meta"), "w") as f:
+            f.write("guid: sliderdraghostsliderslide01\n")
+        slider = "67db9e8f0e2ae9c40bc1e2b64352a6b4"
+        img = "fe87c0e1cc204ed48ad3b37840f39efc"
+        builtin = "0000000000000000f000000000000000"
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &100\nGameObject:\n  m_Name: Main Camera\n"
+                "  m_TagString: MainCamera\n"
+                "  m_Component:\n  - component: {fileID: 101}\n"
+                "  - component: {fileID: 102}\n"
+                "--- !u!4 &101\nTransform:\n"
+                "  m_GameObject: {fileID: 100}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: -10}\n"
+                "--- !u!20 &102\nCamera:\n"
+                "  m_GameObject: {fileID: 100}\n"
+                "  orthographic: 1\n"
+                "  orthographic size: 5\n"
+                "  m_BackGroundColor: {r: 0, g: 0, b: 0, a: 1}\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Canvas\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!224 &2\nRectTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 0, y: 0}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!223 &3\nCanvas:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Volume Slider\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "--- !u!224 &11\nRectTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Father: {fileID: 2}\n"
+                "  m_Children:\n  - {fileID: 21}\n"
+                "  m_AnchorMin: {x: 0.5, y: 0.5}\n"
+                "  m_AnchorMax: {x: 0.5, y: 0.5}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 400, y: 40}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!114 &12\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Enabled: 1\n"
+                "  m_Interactable: 1\n"
+                "  m_Script: {fileID: 11500000, guid: " + slider + "}\n"
+                "  m_FillRect: {fileID: 0}\n"
+                "  m_HandleRect: {fileID: 31}\n"
+                "  m_Direction: 0\n"
+                "  m_MinValue: 0\n"
+                "  m_MaxValue: 1\n"
+                "  m_Value: 0.25\n"
+                "  m_OnValueChanged:\n"
+                "    m_PersistentCalls:\n"
+                "      m_Calls:\n"
+                "      - m_Target: {fileID: 42}\n"
+                "        m_MethodName: set_Volume\n"
+                "        m_Mode: 0\n"
+                "      - m_Target: {fileID: 42}\n"
+                "        m_MethodName: SetDisplayValue\n"
+                "        m_Mode: 1\n"
+                "--- !u!1 &20\nGameObject:\n  m_Name: Handle Slide Area\n"
+                "  m_Component:\n  - component: {fileID: 21}\n"
+                "--- !u!224 &21\nRectTransform:\n"
+                "  m_GameObject: {fileID: 20}\n"
+                "  m_Father: {fileID: 11}\n"
+                "  m_Children:\n  - {fileID: 31}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: -40, y: 0}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!1 &30\nGameObject:\n  m_Name: Handle\n"
+                "  m_Component:\n  - component: {fileID: 31}\n"
+                "  - component: {fileID: 32}\n"
+                "--- !u!224 &31\nRectTransform:\n"
+                "  m_GameObject: {fileID: 30}\n"
+                "  m_Father: {fileID: 21}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 0, y: 0}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 20, y: -10}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!114 &32\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 30}\n"
+                "  m_Enabled: 1\n"
+                "  m_Script: {fileID: 11500000, guid: " + img + "}\n"
+                "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+                "  m_Sprite: {fileID: 10913, guid: " + builtin + ", type: 0}\n"
+                "--- !u!1 &40\nGameObject:\n  m_Name: Host\n"
+                "  m_Component:\n  - component: {fileID: 41}\n"
+                "  - component: {fileID: 42}\n"
+                "--- !u!4 &41\nTransform:\n"
+                "  m_GameObject: {fileID: 40}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &42\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 40}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: sliderdraghostsliderslide01}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-slider-drag-out-")
+        plan = unity_pack.pack(root, d, force=True)
+        sliders = plan.get("ui_sliders") or []
+        self.assertEqual(len(sliders), 1)
+        sl = sliders[0]
+        self.assertGreaterEqual(sl["handle_go"], 0)
+        self.assertGreaterEqual(sl["slide_go"], 0)
+        methods = {c["method"]: c for c in sl["calls"]}
+        self.assertIn("set_Volume", methods)
+        self.assertTrue(methods["set_Volume"]["static"])
+        self.assertEqual(methods["set_Volume"]["mode"], 0)
+        self.assertIn("SetDisplayValue", methods)
+        self.assertFalse(methods["SetDisplayValue"]["static"])
+        with open(os.path.join(d, "engine.cpp")) as ef:
+            eng = ef.read()
+        self.assertIn("_engine_ui_sl_drag_to", eng)
+        self.assertIn("Host_set_Volume(v)", eng)
+        self.assertIn("Host_SetDisplayValue(", eng)
+
     def test_awake_setactive_false_emitted(self):
         """Awake gameObject.SetActive(false) runs before Start (SettingsMenu)."""
         root = tempfile.mkdtemp(prefix="upack-awake-sa-")

@@ -275,7 +275,14 @@ canvas units (`_engine_ui_layout_w/h` from CanvasScaler + viewSize letterbox,
 not a resized `Screen`). After layout, `_apply_slider_visuals` bakes Unity
 `Slider.UpdateVisuals` into handle/fill anchors from authored `m_Value` /
 min/max/direction (YAML often leaves handles at `(0,0)` because they are
-driven at runtime). Authored C# may get/set
+driven at runtime). At runtime, `engine_ui_tick` drags interactable Sliders
+(pointer-down on the slider rect, drag along the Handle Slide Area) and
+updates handle/fill live RectTransform anchors; when `m_Value` changes it
+fires `m_OnValueChanged` persistent calls — `UnityEvent<float>` mode 0/4
+passes the new float (including static property setters like
+`SettingsMenu.set_Volume`), mode 1 Void calls instance methods
+(`_Slider.SetDisplayValue` / `OnValueChanged`). GOs with both `_Slider` and
+`_Selectable` pack as `_Slider` so those callbacks resolve. Authored C# may get/set
 `rectTransform.anchoredPosition`, `sizeDelta`, and UI `localScale` (xy).
 Layout-only Canvas / Rect parents are snapshotted onto `scene_hierarchy`
 before scaffold drop so the live GO parent chain keeps rect state.
