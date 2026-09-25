@@ -3757,6 +3757,12 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None,
             "ncy": float(cy) / float(sh),
             "nhw": hit_rw * 0.5 / float(sw),
             "nhh": hit_rh * 0.5 / float(sh),
+            # Live RT: draw size / center as fractions of RectTransform
+            # (TMP Overflow bake can be larger than the rect).
+            "draw_sx": 1.0,
+            "draw_sy": 1.0,
+            "shift_fx": 0.0,
+            "shift_fy": 0.0,
         }
         if extra:
             sp.update(extra)
@@ -3884,6 +3890,11 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None,
         # Overflow expands the bake; keep authored alignment by shifting center.
         draw_cx = float(cx) + float(shift_x)
         draw_cy = float(cy) + float(shift_y)
+        # Live RT rebuilds draw size from RectTransform; store expand / shift
+        # as fractions of the authored rect so overflow bakes are not squished
+        # into sizeDelta (tex taller than rect → vertical squash).
+        rect_w = max(abs(float(rw)), 1e-6)
+        rect_h = max(abs(float(rh)), 1e-6)
         bake_guid = "tmpbake:%s:%s" % (
             o.get("go_id") or o.get("name") or "tmp",
             tmp.get("font_guid") or "")
@@ -3900,6 +3911,10 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None,
                 "tex_h": th,
                 "tex_rgba": rgba,
                 "pixels_per_unit": 100.0,
+                "draw_sx": float(tw) / rect_w,
+                "draw_sy": float(th) / rect_h,
+                "shift_fx": float(shift_x) / rect_w,
+                "shift_fy": float(shift_y) / rect_h,
             })
 
     # Unity Canvas: equal sortingOrder draws in hierarchy order (parents
@@ -13998,6 +14013,23 @@ def emit_engine(plan, analyses, used_apis):
                     ", ".join(
                         "%sf" % repr(float(sp.get("src_aspect") or 1.0))
                         for _i, sp in spr_idx)))
+                # TMP Overflow (etc.): draw can exceed RectTransform.
+                p("        static const float _spr_draw_sx[] = { %s };" % (
+                    ", ".join(
+                        "%sf" % repr(float(sp.get("draw_sx") or 1.0))
+                        for _i, sp in spr_idx)))
+                p("        static const float _spr_draw_sy[] = { %s };" % (
+                    ", ".join(
+                        "%sf" % repr(float(sp.get("draw_sy") or 1.0))
+                        for _i, sp in spr_idx)))
+                p("        static const float _spr_shift_fx[] = { %s };" % (
+                    ", ".join(
+                        "%sf" % repr(float(sp.get("shift_fx") or 0.0))
+                        for _i, sp in spr_idx)))
+                p("        static const float _spr_shift_fy[] = { %s };" % (
+                    ", ".join(
+                        "%sf" % repr(float(sp.get("shift_fy") or 0.0))
+                        for _i, sp in spr_idx)))
             else:
                 p("        static const float _spr_ncx[] = { %s };" % (
                     ", ".join(
@@ -14119,8 +14151,11 @@ def emit_engine(plan, analyses, used_apis):
                   "go, sw, sh, &rcx, &rcy, &rw, &rh);")
                 p("                    if (rw < 0.f) rw = -rw;")
                 p("                    if (rh < 0.f) rh = -rh;")
-                p("                    dw = rw; dh = rh;")
-                p("                    dcx = rcx; dcy = rcy;")
+                # Default = RectTransform; TMP Overflow scales past it.
+                p("                    dw = rw * _spr_draw_sx[k];")
+                p("                    dh = rh * _spr_draw_sy[k];")
+                p("                    dcx = rcx + rw * _spr_shift_fx[k];")
+                p("                    dcy = rcy + rh * _spr_shift_fy[k];")
                 p("                    if (_spr_preserve[k]"
                   " && rw > 1e-6f && rh > 1e-6f) {")
                 p("                        sa = _spr_src_aspect[k];")

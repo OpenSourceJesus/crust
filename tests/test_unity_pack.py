@@ -7509,6 +7509,134 @@ class TestSystems(unittest.TestCase):
             font, "Sound", 76, (1, 1, 1, 1), 264, 64, 1, 256, 3)
         self.assertEqual(th2, 64)
 
+    def test_tmp_overflow_draw_keeps_bake_aspect(self):
+        """Overflow-expanded TMP must not be vertically squished into the rect.
+
+        Live RT used to set draw size = RectTransform while the bake is taller
+        (fontSize > sizeDelta.y) — that stretches tex into a short quad.
+        Store draw_sy = tex_h/rect_h so live recompute matches bake aspect.
+        """
+        font_path = os.path.join(
+            ROOT, "examples", "unity_pack", "Slime Jump", "Assets",
+            "Others", "Fonts", "Montserrat-Black SDF.asset")
+        if not os.path.isfile(font_path):
+            self.skipTest("Montserrat SDF font missing")
+        font_guid = "d02e4aeb1d332f476b54d5e58027a01e"
+        tmp = "f4688fdb7df04437aeb418b961361dc5"
+        root = tempfile.mkdtemp(prefix="upack-tmp-ovf-aspect-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        fonts = os.path.join(root, "Assets", "Fonts")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scripts)
+        os.makedirs(fonts)
+        os.makedirs(scene)
+        host_guid = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+        shutil.copy(font_path, os.path.join(fonts, "Font.asset"))
+        with open(os.path.join(fonts, "Font.asset.meta"), "w") as f:
+            f.write("guid: %s\n" % font_guid)
+        with open(os.path.join(scripts, "Host.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Host : MonoBehaviour {\n"
+                "    void Update() {\n"
+                "        rectTransform.sizeDelta = new Vector2(300f, 64f);\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Host.cs.meta"), "w") as f:
+            f.write("guid: %s\n" % host_guid)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Main Camera\n"
+                "  m_TagString: MainCamera\n  m_IsActive: 1\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n  m_GameObject: {fileID: 1}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: -10}\n"
+                "--- !u!20 &3\nCamera:\n  m_GameObject: {fileID: 1}\n"
+                "  orthographic: 1\n  orthographic size: 5\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Canvas\n"
+                "  m_IsActive: 1\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "--- !u!224 &11\nRectTransform:\n"
+                "  m_GameObject: {fileID: 10}\n  m_Father: {fileID: 0}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_SizeDelta: {x: 0, y: 0}\n  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!223 &12\nCanvas:\n  m_GameObject: {fileID: 10}\n"
+                "  m_Enabled: 1\n  m_RenderMode: 0\n"
+                "--- !u!1 &20\nGameObject:\n  m_Name: Volume Text\n"
+                "  m_IsActive: 1\n"
+                "  m_Component:\n  - component: {fileID: 21}\n"
+                "  - component: {fileID: 22}\n"
+                "  - component: {fileID: 23}\n"
+                "--- !u!224 &21\nRectTransform:\n"
+                "  m_GameObject: {fileID: 20}\n  m_Father: {fileID: 11}\n"
+                "  m_AnchorMin: {x: 0.5, y: 0.5}\n"
+                "  m_AnchorMax: {x: 0.5, y: 0.5}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 316, y: 64}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "--- !u!114 &22\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 20}\n  m_Enabled: 1\n"
+                "  m_Script: {fileID: 11500000, guid: " + tmp + "}\n"
+                "  m_text: Volume\n"
+                "  m_fontAsset: {fileID: 11400000, guid: " + font_guid
+                + ", type: 2}\n"
+                "  m_fontSize: 76\n"
+                "  m_fontColor: {r: 1, g: 1, b: 1, a: 1}\n"
+                "  m_HorizontalAlignment: 1\n"
+                "  m_VerticalAlignment: 256\n"
+                "  m_overflowMode: 0\n"
+                "--- !u!114 &23\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 20}\n  m_Enabled: 1\n"
+                "  m_Script: {fileID: 11500000, guid: " + host_guid + "}\n"
+            )
+        ps = os.path.join(root, "ProjectSettings")
+        os.makedirs(ps)
+        with open(os.path.join(ps, "EditorBuildSettings.asset"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1045 &1\nEditorBuildSettings:\n"
+                "  m_Scenes:\n"
+                "  - enabled: 1\n"
+                "    path: Assets/Scenes/S.unity\n"
+            )
+        with open(os.path.join(ps, "ProjectSettings.asset"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!129 &1\nPlayerSettings:\n"
+                "  defaultScreenWidth: 800\n"
+                "  defaultScreenHeight: 600\n"
+            )
+        unity_pack._TMP_FONT_CACHE.clear()
+        objs, _a, _l, _c, _h = unity_pack.load_project(root)
+        label = [o for o in objs if o.get("name") == "Volume Text"][0]
+        sp = label.get("sprite") or {}
+        tw = int(sp.get("tex_w") or 0)
+        th = int(sp.get("tex_h") or 0)
+        self.assertGreater(th, 64, "Overflow must expand bake past rect")
+        # Baked draw half extents match tex pixel aspect (no bake-time squish).
+        self.assertAlmostEqual(
+            float(sp["half_w"]) / float(sp["half_h"]),
+            float(tw) / float(th), places=5)
+        # Live RT uses these to scale past RectTransform instead of stretching.
+        self.assertAlmostEqual(float(sp.get("draw_sx") or 0), tw / 316.0,
+                               places=4)
+        self.assertAlmostEqual(float(sp.get("draw_sy") or 0), th / 64.0,
+                               places=4)
+        self.assertGreater(float(sp.get("draw_sy") or 0), 1.0)
+        d = tempfile.mkdtemp(prefix="upack-tmp-ovf-aspect-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("_spr_draw_sy", eng)
+        self.assertIn("dw = rw * _spr_draw_sx[k]", eng)
+        self.assertIn("dh = rh * _spr_draw_sy[k]", eng)
+
     def test_methods_in_keeps_default_paren_args(self):
         """``default(T)`` inside a param list must not drop the method."""
         body = (
