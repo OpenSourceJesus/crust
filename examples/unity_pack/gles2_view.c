@@ -96,6 +96,43 @@ static void refresh_camera_bounds(float aspect)
     world_top = Camera_main_pos_y + half_h;
 }
 
+/* CameraScript.HandleViewSize: letterbox Camera.rect so authored
+ * Camera_main_aspect fits the FBO. Only runs when aspect,
+ * orthographicSize, or pixel size change. */
+static void handle_view_size(int pixel_w, int pixel_h)
+{
+    static int cached_w = -1, cached_h = -1;
+    static float cached_aspect = -1.f, cached_ortho = -1.f;
+    float aspect = Camera_main_aspect;
+    float ortho = Camera_main_orthographicSize;
+    float screen_aspect, rw, rh;
+
+    if (pixel_w < 1)
+        pixel_w = 1;
+    if (pixel_h < 1)
+        pixel_h = 1;
+    if (pixel_w == cached_w && pixel_h == cached_h
+        && aspect == cached_aspect && ortho == cached_ortho)
+        return;
+    cached_w = pixel_w;
+    cached_h = pixel_h;
+    cached_aspect = aspect;
+    cached_ortho = ortho;
+    if (aspect < 1e-6f)
+        return;
+    screen_aspect = (float)pixel_w / (float)pixel_h;
+    rw = aspect / screen_aspect;
+    if (rw > 1.f)
+        rw = 1.f;
+    rh = screen_aspect / aspect;
+    if (rh > 1.f)
+        rh = 1.f;
+    Camera_main_rect_w = rw;
+    Camera_main_rect_h = rh;
+    Camera_main_rect_x = 0.5f - rw * 0.5f;
+    Camera_main_rect_y = 0.5f - rh * 0.5f;
+}
+
 static float world_to_ndc_x(float x)
 {
     return 2.0f * (x - world_left) / (world_right - world_left) - 1.0f;
@@ -312,6 +349,7 @@ static int draw_scene(GLuint prog)
     if (aspect < 1e-6f)
         aspect = (float)WIDTH / (float)HEIGHT;
     refresh_camera_bounds(aspect);
+    handle_view_size(WIDTH, HEIGHT);
     glGenBuffers(1, &vbo);
     glBindBuffer(GL_ARRAY_BUFFER, vbo);
 

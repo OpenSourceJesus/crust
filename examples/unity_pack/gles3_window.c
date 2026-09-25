@@ -123,11 +123,22 @@ static void poll_input_axes(GLFWwindow *win)
 
 static void frame(GLFWwindow *win)
 {
-    int fbw, fbh;
+    int fbw, fbh, ww, wh;
 
+    glfwGetWindowSize(win, &ww, &wh);
+    glfwGetFramebufferSize(win, &fbw, &fbh);
+    /* Unity Screen tracks the game view; keep pointer / uGUI in sync. */
+    if (ww > 0 && wh > 0) {
+        Screen_width = ww;
+        Screen_height = wh;
+    }
+    /* Letterbox before tick so uGUI hits use the same Camera.rect as draw. */
+    if (fbw > 0 && fbh > 0)
+        g3_handle_view_size(fbw, fbh);
+    else if (ww > 0 && wh > 0)
+        g3_handle_view_size(ww, wh);
     poll_input_axes(win);
     engine_tick();
-    glfwGetFramebufferSize(win, &fbw, &fbh);
     if (fbw > 0 && fbh > 0)
         g3_draw(fbw, fbh);
     glfwSwapBuffers(win);

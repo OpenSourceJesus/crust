@@ -10440,6 +10440,14 @@ class TestSystems(unittest.TestCase):
         self.assertAlmostEqual(rh, 960.0 / 1080.0, places=5)
         self.assertAlmostEqual(rx, 0.0, places=5)
         self.assertAlmostEqual(ry, (1.0 - rh) * 0.5, places=5)
+        # Resized window (e.g. 1024×640): viewport must stay 2:1, not the
+        # baked 16:9 rect (that stretches art vertically).
+        rx, ry, rw, rh = unity_pack._camera_script_rect(
+            1024, 640, 29.01, 14.505)
+        self.assertAlmostEqual(rw, 1.0, places=5)
+        self.assertAlmostEqual(rh, 0.8, places=5)
+        self.assertAlmostEqual(
+            (1024 * rw) / (640 * rh), 2.0, places=5)
         # No viewSize → player screen size (Unity default when unset).
         root = tempfile.mkdtemp(prefix="upack-noscr-")
         self.assertEqual(

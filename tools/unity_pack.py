@@ -13247,7 +13247,13 @@ def emit_engine(plan, analyses, used_apis):
             p("                float aspect, world_h, world_w;")
             if plan.get("camera"):
                 p("                aspect = Camera_main_aspect;")
-                p("                if (aspect < 1e-6f) aspect = 1.f;")
+                p("                if (aspect < 1e-6f) {")
+                p("                    float sw = (float)Screen_width;")
+                p("                    float sh = (float)Screen_height;")
+                p("                    if (sw < 1.f) sw = 1.f;")
+                p("                    if (sh < 1.f) sh = 1.f;")
+                p("                    aspect = sw / sh;")
+                p("                }")
             else:
                 p("                float sw = (float)Screen_width;")
                 p("                float sh = (float)Screen_height;")

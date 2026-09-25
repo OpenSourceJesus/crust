@@ -120,6 +120,44 @@ static void refresh_camera_bounds(float aspect)
     world_top = Camera_main_pos_y + half_h;
 }
 
+/* CameraScript.HandleViewSize: letterbox Camera.rect so authored
+ * Camera_main_aspect fits the current pixel size. Only runs when aspect,
+ * orthographicSize, or pixel size change (baked rect assumes Player
+ * Settings screen aspect — a resize otherwise vertically stretches). */
+static void handle_view_size(int pixel_w, int pixel_h)
+{
+    static int cached_w = -1, cached_h = -1;
+    static float cached_aspect = -1.f, cached_ortho = -1.f;
+    float aspect = Camera_main_aspect;
+    float ortho = Camera_main_orthographicSize;
+    float screen_aspect, rw, rh;
+
+    if (pixel_w < 1)
+        pixel_w = 1;
+    if (pixel_h < 1)
+        pixel_h = 1;
+    if (pixel_w == cached_w && pixel_h == cached_h
+        && aspect == cached_aspect && ortho == cached_ortho)
+        return;
+    cached_w = pixel_w;
+    cached_h = pixel_h;
+    cached_aspect = aspect;
+    cached_ortho = ortho;
+    if (aspect < 1e-6f)
+        return;
+    screen_aspect = (float)pixel_w / (float)pixel_h;
+    rw = aspect / screen_aspect;
+    if (rw > 1.f)
+        rw = 1.f;
+    rh = screen_aspect / aspect;
+    if (rh > 1.f)
+        rh = 1.f;
+    Camera_main_rect_w = rw;
+    Camera_main_rect_h = rh;
+    Camera_main_rect_x = 0.5f - rw * 0.5f;
+    Camera_main_rect_y = 0.5f - rh * 0.5f;
+}
+
 static float world_to_ndc_x(float x)
 {
     return 2.0f * (x - world_left) / (world_right - world_left) - 1.0f;
@@ -319,13 +357,23 @@ static void frame(GLFWwindow *win)
 {
     EngineDraw draws[MAX_DRAWS];
     int ndraw, i;
-    int fbw, fbh;
+    int fbw, fbh, ww, wh;
     int vx, vy, vw, vh;
     float aspect;
 
+    glfwGetWindowSize(win, &ww, &wh);
+    glfwGetFramebufferSize(win, &fbw, &fbh);
+    /* Unity Screen tracks the game view; keep pointer / uGUI in sync. */
+    if (ww > 0 && wh > 0) {
+        Screen_width = ww;
+        Screen_height = wh;
+    }
+    if (fbw > 0 && fbh > 0)
+        handle_view_size(fbw, fbh);
+    else if (ww > 0 && wh > 0)
+        handle_view_size(ww, wh);
     poll_input_axes(win);
     engine_tick();
-    glfwGetFramebufferSize(win, &fbw, &fbh);
     aspect = Camera_main_aspect;
     if (aspect < 1e-6f)
         aspect = fbh > 0 ? (float)fbw / (float)fbh : 1.0f;
