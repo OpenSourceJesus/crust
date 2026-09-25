@@ -131,6 +131,9 @@ EXPECTED = {
     "division.ml": "4-3-1-4611686018427387904\n",
     "recursion.ml": "557\n",
     "tailrec.ml": "1010\n",
+    "lists.ml": "39\n",
+    "trees.ml": "331\n",
+    "mutual.ml": "31\n",
     "loop.ml": "2999998\n111\n",
 }
 
@@ -260,6 +263,44 @@ VERDICTS = {
         ("ml_go3", "ensures"): True,
         ("ml_go3", "the recursive call's"): True,
     },
+    # data: a variant is an inductive type, a `*mut` in it the value it
+    # points to (the heap discipline, checked); each projection owes its
+    # variant, each unreachable `panic!` owes `False`
+    "lists.ml": {
+        ("ml_length__int", "ensures"): True,
+        ("ml_length__int", "the recursive call's"): True,  # size t < size l
+        ("ml_length__int", "`ml_ml_list_int_Cons_1` on another"): True,
+        ("ml_length__int", "`panic!` is reached"): True,
+        ("ml_sum", "the recursive call's"): True,
+        ("ml_sum", "`panic!` is reached"): True,
+        ("ml_sum", "OCaml `int` `+` may wrap"): False,       # it can
+    },
+    "trees.ml": {
+        ("ml_size", "ensures"): True,
+        ("ml_size", "the recursive call's"): True,          # both subtrees
+        ("ml_mirror", "the recursive call's"): True,
+        ("ml_all_pos", "the recursive call's"): True,
+        ("ml_insert", "ensures"): True,                     # <> Leaf
+        ("ml_insert", "`ml_ml_tree_Node_1` on another"): True,
+        ("ml_insert", "`panic!` is reached"): True,
+    },
+    # mutual recursion: `expr` and `stmt` one mutual inductive group in
+    # the kernel (and a `mutual` block in Lean); a call between `count_e`
+    # and `count_s`, or `even` and `odd`, owes the callee's `requires` and
+    # its variant below the caller's -- one induction over the group
+    "mutual.ml": {
+        ("ml_count_e", "ensures"): True,     # through count_s's contract
+        ("ml_count_s", "ensures"): True,
+        ("ml_count_e", "the call to `ml_count_s`'s"): True,
+        ("ml_count_s", "the call to `ml_count_e`'s"): True,
+        ("ml_count_e", "the recursive call's"): True,
+        ("ml_count_e", "`panic!` is reached"): True,
+        ("ml_count_s", "`panic!` is reached"): True,
+        ("ml_count_e", "OCaml `int` `+` may wrap"): False,   # unbounded
+        ("ml_even", "the call to `ml_odd`'s"): True,
+        ("ml_odd", "the call to `ml_even`'s"): True,
+        ("ml_even", "OCaml `int` `-` may wrap"): True,
+    },
 }
 
 
@@ -311,6 +352,46 @@ class TestRecursionAndDivision(unittest.TestCase):
 
     def test_tail_recursion(self):
         self.check("tailrec.ml")
+
+    def test_lists(self):
+        self.check("lists.ml")
+
+    def test_trees(self):
+        self.check("trees.ml")
+
+    def test_the_heap_discipline_is_checked_not_assumed(self):
+        """A pointer is read as its value only where nothing could have
+        written it since: a changed box, a write through a pointer
+        elsewhere, or a `free` and the enum is not lifted at all."""
+        import shivyc.rustproof as R
+        with open(os.path.join(RUN, "lists.ml")) as fh:
+            rust = ocaml2rust.lower(fh.read())
+        self.assertIsNone(R._Unit(rust).heap_refusal)
+        cases = {
+            rust.replace("p[0] = v; p }", "p[0] = v; p[0] = v; p }", 1):
+                "not the helper",
+            rust + "fn evil(p: *mut ml_list_int) { p[0] = "
+                   "ml_list_int::Nil; }\n": "writes through an index",
+            rust + "fn evil(p: *mut ml_list_int) { free(p); }\n": "frees",
+        }
+        for src, why in cases.items():
+            with self.subTest(why=why):
+                self.assertIn(why, R._Unit(src).heap_refusal)
+                with self.assertRaises(R.LiftError):
+                    R.lift(src, "ml_length__int")
+
+    def test_mutual(self):
+        self.check("mutual.ml")
+
+    def test_mutual_functions_need_variants(self):
+        rust = ocaml2rust.lower(
+            "let rec f n = if n <= 0 then 0 else g (n - 1)\n"
+            "and g n = if n <= 0 then 1 else f (n - 1)\n"
+            "let () = print_int (f 3)")
+        import shivyc.rustproof as R
+        with self.assertRaises(R.LiftError) as cm:
+            R.lift(rust, "ml_f")
+        self.assertIn("variant", str(cm.exception))
 
     def test_a_recursive_function_needs_a_variant(self):
         rust = ocaml2rust.lower(
