@@ -3712,6 +3712,57 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None,
                 "pixels_per_unit": 100.0,
             })
 
+    # Unity Canvas: equal sortingOrder draws in hierarchy order (parents
+    # before children). Without a nested Override Sorting Canvas, a full-
+    # screen menu Image and a child Button Image share the root order —
+    # qsort ties then cover the Button while TMP (+1) still shows. Bump
+    # each UI sprite above the nearest ancestor UI sprite on the same layer.
+    _bump_ui_hierarchy_draw_order(objects, by_xf)
+
+
+def _bump_ui_hierarchy_draw_order(objects, by_xf):
+    """Raise child UI sorting_order above ancestor UI on the same layer."""
+    # Parent before child: walk by increasing depth from roots.
+    depth = {}
+
+    def _depth(o):
+        xid = str(o.get("xf_id") or id(o))
+        if xid in depth:
+            return depth[xid]
+        fid = o.get("father_id")
+        parent = by_xf.get(str(fid)) if fid else None
+        d = 0 if parent is None else _depth(parent) + 1
+        depth[xid] = d
+        return d
+
+    ordered = sorted(
+        (o for o in objects
+         if (o.get("sprite") or {}).get("source") in ("ui", "ui_tmp")),
+        key=_depth)
+    for o in ordered:
+        sp = o.get("sprite") or {}
+        # Nested Override Sorting sets an absolute order — leave it.
+        own_c = o.get("canvas") or {}
+        if int(own_c.get("override_sorting") or 0):
+            continue
+        fid = o.get("father_id")
+        cur = by_xf.get(str(fid)) if fid else None
+        guard = 0
+        while cur is not None and guard < 64:
+            guard += 1
+            psp = cur.get("sprite") or {}
+            if psp.get("source") in ("ui", "ui_tmp"):
+                # Same canvas sorting layer (TagManager id on the sprite).
+                if (int(psp.get("sorting_layer_id") or 0)
+                        == int(sp.get("sorting_layer_id") or 0)):
+                    po = int(psp.get("sorting_order") or 0)
+                    so = int(sp.get("sorting_order") or 0)
+                    if so <= po:
+                        sp["sorting_order"] = po + 1
+                break
+            fid = cur.get("father_id")
+            cur = by_xf.get(str(fid)) if fid else None
+
 
 # ---------------------------------------------------------------------------
 # Scene importers
