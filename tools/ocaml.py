@@ -491,7 +491,7 @@ class Parser:
             if not self.at_type('ID'):
                 self.fail("an attribute needs a name: `[@@name ..]`")
             name = self.next().value
-            if name in ('requires', 'ensures'):
+            if name in ('requires', 'ensures', 'variant'):
                 if not params:
                     self.fail("a contract belongs on a function")
                 contracts.append((name, self.parse_expr()))
@@ -1222,12 +1222,13 @@ class Checker:
                        body.line, "the result annotation")
         for kind, c in contracts:
             # a clause is a `bool` over the parameters, and `result` too for
-            # an `ensures`
+            # an `ensures`; a `variant` is the `int` a recursive call must
+            # decrease and keep non-negative
             cenv = dict(env)
             if kind == 'ensures':
                 cenv['result'] = Scheme([], rt)
-            self.unify(self.infer(c, cenv), BOOL, c.line,
-                       "a `[@@%s]` clause" % kind)
+            self.unify(self.infer(c, cenv), INT if kind == 'variant' else
+                       BOOL, c.line, "a `[@@%s]` clause" % kind)
         for pt in reversed(types):
             rt = arrow(pt, rt)
         return rt

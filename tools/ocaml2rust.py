@@ -32,7 +32,9 @@ the contract and proof tooling the Rust subset has (`rustproof`,
 Contracts: `[@@requires e]` and `[@@ensures e]` after a function become
 `#[requires(..)]` / `#[ensures(..)]`, with exact arithmetic (a
 specification states the mathematical value); `rustprove` proves them about
-the Rust, and that no `ml_wrap` in it ever wraps.
+the Rust, and that no `ml_wrap` in it ever wraps.  `[@@variant e]` on a
+recursive function becomes `#[variant(e)]`: the measure each recursive call
+-- or each `continue` of a tail-recursive loop -- must decrease.
 
 What it refuses, by name: partial application, a closure that captures a
 variable used as a value (a closed `fun` is lifted and passed as a `fn`),
@@ -460,6 +462,9 @@ class Emitter:
             op = {'=': '==', '<>': '!='}.get(op, op)
         elif op == 'mod':
             op = '%'
+        elif op == '/' and not ctx.contract:
+            # min_int / -1 is 2^62, which OCaml wraps to min_int
+            return 'ml_wrap(%s / %s)' % (a, b)
         elif op in ('+', '-', '*') and ctx.contract:
             # a contract states the mathematical value; the lift proves
             # the code's arithmetic stays where the two agree
@@ -676,7 +681,8 @@ class Emitter:
                                  Ctx(sub, {}, local_fns),
                                  [(c, self.apply(t, sub))
                                   for c, t in lf.captures],
-                                 me=('l', lf, key))
+                                 me=('l', lf, key),
+                                 contracts=lf.d.contracts)
         return self.instance(
             key, lambda: self.fresh(lf.d.pattern.name).lstrip('_'), job)
 

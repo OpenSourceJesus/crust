@@ -81,7 +81,7 @@ class Prover:
         self.own = set(self.lifted) | set(self.refused) if own is None \
             else set(own)
         self.types = {"Nat": hoare.NAT, "Bool": hoare.BOOL,
-                      "Array": hoare.BYTES}
+                      "Array": hoare.BYTES, "Int": hoare.INT}
         # Every obligation the kernel settles, kept with the environment it
         # was proved in, so a second kernel can be asked the same question.
         self.certificates = []
@@ -105,7 +105,16 @@ class Prover:
             for rec, fields in c.records:
                 H.record(env, rec, [(f, self.types[t]) for f, t in fields])
                 self.types[rec] = self.L.Var(rec)
-            H.read_procedure(c.source, env, self.sig(c), self.trivial(c))
+            if getattr(c, "recursive", False):
+                # known only by its contract, which is a hypothesis of every
+                # goal about a caller (`goal_for`); its own theorems prove it
+                fty = self.types[c.ret]
+                for _, t in reversed(c.params):
+                    fty = self.L.Pi("_", self.types[t], fty)
+                self.L.declare(env, c.name, fty)
+            else:
+                H.read_procedure(c.source, env, self.sig(c),
+                                 self.trivial(c))
             if c.pre_source is not None:
                 H.read_procedure(c.pre_source, env, None,
                                  ["result or not result"])
@@ -305,6 +314,132 @@ class Prover:
                 function, label, env, goal, proof, index))
         return True
 
+    def recursive_goal(self, fn, text, post, unfolding):
+        """(env, goal) for a theorem about a recursive function: `text`'s
+        obligation with the recursive call a variable `g` -- about which
+        the goal assumes the contract, for arguments meeting the `requires`
+        with a smaller non-negative `#[variant]`:
+
+            forall g p.., (forall a.., cond(a, p) -> post(a, g a)) -> ...
+
+        Each call site owes `cond` as an obligation of its own, so this is
+        the step of a well-founded induction on the variant, whose
+        conclusion is the theorem for the function itself."""
+        H, L = self.H, self.L
+        env, sig = self.fresh_env(fn)
+        rec = fn.name + "__rec"
+        ptypes = [self.types[t] for _, t in fn.params]
+        rtype = self.types[fn.ret]
+        fty = rtype
+        for t in reversed(ptypes):
+            fty = L.Pi("_", t, fty)
+        L.declare(env, rec, fty)
+        sig = dict(sig)
+        sig[rec] = (ptypes, rtype)
+        proc = H.read_procedure(text, env, sig, post)
+        names = [n for n, _ in fn.params]
+        anames = ["%s__a" % n for n in names]
+        to_a = dict(zip(names, anames))
+        from shivyc.rustproof import _substitute
+        cond = " and ".join([_substitute(r, to_a) for r in fn.rec_requires]
+                            + ["(Int(0) <= %s)" % _substitute(
+                                fn.rec_variant, to_a),
+                               "(%s < %s)" % (_substitute(fn.rec_variant,
+                                                          to_a),
+                                              fn.rec_variant)])
+        both = ", ".join("%s: '%s'" % (n, t) for n, t in
+                         [(a, t) for a, (_, t) in zip(anames, fn.params)]
+                         + list(fn.params))
+        H.read_procedure("def %s__cond(%s) -> 'Bool':\n    return %s\n"
+                         % (fn.name, both, cond), env, None,
+                         ["result or not result"])
+        ens = " and ".join(_substitute(e, to_a) for e in fn.ensures) \
+            or "True"
+        H.read_procedure("def %s__post(%s, result: '%s') -> 'Bool':\n"
+                         "    return %s\n" % (
+                             fn.name, ", ".join("%s: '%s'" % (a, t) for a, (
+                                 _, t) in zip(anames, fn.params)),
+                             fn.ret, ens), env, None,
+                         ["result or not result"])
+        helpers = {fn.name + "__cond", fn.name + "__post"}
+        ob = H.unfold(proc.obligation, env, set(unfolding) | helpers)
+        # open the parameters, put the hypothesis after them
+        pvars, body = [], ob
+        for _ in names:
+            pvars.append(L.Var(body.var_name + "__p"))
+            body = L.instantiate(body.body, pvars[-1])
+        avars = [L.Var(a + "__b") for a in anames]
+        call = L.Var(rec)
+        for a in avars:
+            call = L.App(call, a)
+        ih = L.Pi("_", L.App(L.Var("Holds"), H.unfold(H.app(
+            fn.name + "__cond", *(avars + pvars)), env, helpers)),
+            L.App(L.Var("Holds"), H.unfold(H.app(
+                fn.name + "__post", *(avars + [call])), env, helpers)))
+        for a in reversed(avars):
+            ih = L.Pi(a.name, H.INT if False else self.types[
+                fn.params[avars.index(a)][1]], L.abstract(ih, a.name))
+        goal = L.Pi("_ih", ih, body)
+        for (pv, t) in reversed(list(zip(pvars, ptypes))):
+            goal = L.Pi(pv.name, t, L.abstract(goal, pv.name))
+        goal = L.Pi("g", fty, L.abstract(goal, rec))
+        del env[rec]
+        return env, goal
+
+    def goal_for(self, fn, text, post, unfolding):
+        """(env, goal) for an obligation of `fn`: `recursive_goal` if it
+        calls itself, and for each recursive function it calls, that
+        function's contract as a hypothesis over a variable standing for
+        it --
+
+            forall h.., (forall a.., requires(a) -> ensures(a, h a)) -> ..
+
+        -- a callee known by its contract, proved by its own theorems."""
+        H, L = self.H, self.L
+        if getattr(fn, "recursive", False):
+            env, goal = self.recursive_goal(fn, text, post, unfolding)
+        else:
+            env, sig = self.fresh_env(fn)
+            goal = H.read_procedure(text, env, sig, post).obligation
+        from shivyc.rustproof import _substitute
+        for c in in_dependency_order(fn):
+            if c is fn or not getattr(c, "recursive", False):
+                continue
+            names = [n for n, _ in c.params]
+            anames = ["%s__c" % n for n in names]
+            to_a = dict(zip(names, anames))
+            params = ", ".join("%s: '%s'" % (a, t) for a, (_, t) in
+                               zip(anames, c.params))
+            pre = " and ".join(_substitute(r, to_a)
+                               for r in c.rec_requires) or "True"
+            ens = " and ".join(_substitute(e, to_a) for e in c.ensures) \
+                or "True"
+            H.read_procedure("def %s__cpre(%s) -> 'Bool':\n    return %s\n"
+                             % (c.name, params, pre), env, None,
+                             ["result or not result"])
+            H.read_procedure("def %s__cpost(%s, result: '%s') -> 'Bool':\n"
+                             "    return %s\n" % (c.name, params, c.ret, ens),
+                             env, None, ["result or not result"])
+            helpers = {c.name + "__cpre", c.name + "__cpost"}
+            avars = [L.Var(a + "__d") for a in anames]
+            call = L.Var(c.name)
+            for a in avars:
+                call = L.App(call, a)
+            hyp = L.Pi("_", L.App(L.Var("Holds"), H.unfold(H.app(
+                c.name + "__cpre", *avars), env, helpers)),
+                L.App(L.Var("Holds"), H.unfold(H.app(
+                    c.name + "__cpost", *(avars + [call])), env, helpers)))
+            for a, (_, t) in reversed(list(zip(avars, c.params))):
+                hyp = L.Pi(a.name, self.types[t], L.abstract(hyp, a.name))
+            fty = self.types[c.ret]
+            for _, t in reversed(c.params):
+                fty = L.Pi("_", self.types[t], fty)
+            goal = H.unfold(goal, env, set(unfolding) - {c.name})
+            goal = L.Pi(c.name + "__f", fty, L.abstract(
+                L.Pi("_" + c.name + "__contract", hyp, goal), c.name))
+            del env[c.name]
+        return env, goal
+
     def contract(self, name, ensures=None):
         """Does the kernel prove `name`'s `#[ensures]` (or `ensures`)?"""
         fn = self.lifted[name]
@@ -318,6 +453,13 @@ class Prover:
                          for p in post]
                 return self.through_loops(fn, fn.source, post, extra, [],
                                           unfolding)
+            if getattr(fn, "recursive", False) or any(
+                    getattr(c, "recursive", False)
+                    for c in in_dependency_order(fn)):
+                env, goal = self.goal_for(fn, fn.source, post, unfolding)
+                proof = self.first_of(env, goal, unfolding,
+                                      (self.by_bounds, self.by_integers))
+                return env, goal, proof
             env, sig = self.fresh_env(fn)
             proc = self.H.read_procedure(fn.source, env, sig, post)
             proof = self.first_of(
@@ -344,6 +486,14 @@ class Prover:
                         fn, text, ["result"],
                         ["(not _returned) or _return_value"], ["_ok"],
                         unfolding)
+                if getattr(fn, "recursive", False) or any(
+                        getattr(c, "recursive", False)
+                        for c in in_dependency_order(fn)):
+                    env, goal = self.goal_for(fn, text, ["result"],
+                                              unfolding)
+                    proof = self.first_of(env, goal, unfolding,
+                                          (self.by_bounds, self.by_integers))
+                    return env, goal, proof
                 env, sig = self.fresh_env(fn)
                 proc = self.H.read_procedure(text, env, sig, ["result"])
                 proof = self.first_of(env, proc.obligation, unfolding,
