@@ -2408,11 +2408,15 @@ def _ui_local_rect_wh(o, by_xf, screen_w, screen_h, cache):
         return cache[key]
     sw = float(screen_w)
     sh = float(screen_h)
-    if o.get("canvas"):
-        cache[key] = (sw, sh)
-        return cache[key]
     fid = o.get("father_id")
     parent = by_xf.get(str(fid)) if fid else None
+    # Root Canvas fills the screen. Nested Canvas keeps RectTransform size
+    # (Unity: Canvas does not override local rect).
+    if o.get("canvas") and not (
+            parent is not None and (
+                parent.get("rect") is not None or parent.get("canvas"))):
+        cache[key] = (sw, sh)
+        return cache[key]
     if parent is not None and (
             parent.get("rect") is not None or parent.get("canvas")):
         pw, ph = _ui_local_rect_wh(
@@ -2443,13 +2447,15 @@ def _ui_screen_rect(o, by_xf, screen_w, screen_h, cache):
         return cache[key]
     sw = float(screen_w)
     sh = float(screen_h)
-    # Canvas root pixel size is the screen (Overlay / Screen Space Camera),
-    # not the serialized anchors (often 0,0 with sizeDelta 0).
-    if o.get("canvas"):
-        cache[key] = (sw * 0.5, sh * 0.5, sw, sh)
-        return cache[key]
     fid = o.get("father_id")
     parent = by_xf.get(str(fid)) if fid else None
+    # Root Canvas pixel size is the screen (Overlay / Screen Space Camera).
+    # Nested Canvas (e.g. Back Button sorting override) keeps RectTransform.
+    if o.get("canvas") and not (
+            parent is not None and (
+                parent.get("rect") is not None or parent.get("canvas"))):
+        cache[key] = (sw * 0.5, sh * 0.5, sw, sh)
+        return cache[key]
     if parent is not None and (
             parent.get("rect") is not None or parent.get("canvas")):
         pcx, pcy, pw, ph = _ui_screen_rect(
@@ -10781,17 +10787,32 @@ def emit_engine(plan, analyses, used_apis):
                     nbtn, ", ".join("%sf" % repr(b["nhh"]) for b in ui_buttons)))
                 p("static const int _engine_ui_btn_go[%d] = { %s };" % (
                     nbtn, ", ".join(str(int(b["go"])) for b in ui_buttons)))
-                # -1 when this Button has no SetActive onClick (tint-only).
-                p("static const int _engine_ui_btn_call_go[%d] = { %s };" % (
-                    nbtn, ", ".join(
-                        str(int(b["calls"][0]["target_go"]))
-                        if b.get("calls") else "-1"
-                        for b in ui_buttons)))
-                p("static const int _engine_ui_btn_call_bool[%d] = { %s };" % (
-                    nbtn, ", ".join(
-                        str(int(b["calls"][0]["bool_arg"]))
-                        if b.get("calls") else "0"
-                        for b in ui_buttons)))
+                # Flat SetActive list: each Button may have N onClick targets
+                # (Play → activate Play Menu + deactivate Main Menu).
+                call_starts = []
+                call_counts = []
+                call_gos = []
+                call_bools = []
+                for b in ui_buttons:
+                    call_starts.append(len(call_gos))
+                    calls = b.get("calls") or []
+                    call_counts.append(len(calls))
+                    for c in calls:
+                        call_gos.append(int(c["target_go"]))
+                        call_bools.append(int(c["bool_arg"]))
+                ncall = len(call_gos)
+                p("static const int _engine_ui_btn_call_start[%d] = { %s };" % (
+                    nbtn, ", ".join(str(s) for s in call_starts)))
+                p("static const int _engine_ui_btn_call_count[%d] = { %s };" % (
+                    nbtn, ", ".join(str(c) for c in call_counts)))
+                if ncall:
+                    p("static const int _engine_ui_btn_call_go[%d] = { %s };" % (
+                        ncall, ", ".join(str(g) for g in call_gos)))
+                    p("static const int _engine_ui_btn_call_bool[%d] = { %s };"
+                      % (ncall, ", ".join(str(b) for b in call_bools)))
+                else:
+                    p("static const int _engine_ui_btn_call_go[1] = { -1 };")
+                    p("static const int _engine_ui_btn_call_bool[1] = { 0 };")
                 # ColorBlock (× multiplier) — Normal / Highlighted / Pressed / Disabled
                 p("static const float _engine_ui_btn_col_n[%d] = { %s };" % (
                     nbtn * 4, _f4("normal")))
@@ -10874,9 +10895,16 @@ def emit_engine(plan, analyses, used_apis):
                 p("        _engine_ui_btn_tint[i * 4 + 3] = col[3];")
                 p("    }")
                 p("    if (pressed && hit >= 0) {")
-                p("        if (_engine_ui_btn_call_go[hit] >= 0)")
-                p("            GameObject_SetActive(_engine_ui_btn_call_go[hit],")
-                p("                                 _engine_ui_btn_call_bool[hit]);")
+                p("        int j, j0, j1;")
+                p("        j0 = _engine_ui_btn_call_start[hit];")
+                p("        j1 = j0 + _engine_ui_btn_call_count[hit];")
+                p("        for (j = j0; j < j1; j = j + 1) {")
+                p("            if (_engine_ui_btn_call_go[j] >= 0)")
+                p("                GameObject_SetActive("
+                  "_engine_ui_btn_call_go[j],")
+                p("                                     "
+                  "_engine_ui_btn_call_bool[j]);")
+                p("        }")
                 p("    }")
             else:
                 p("    (void)i; (void)hit; (void)px; (void)py;")

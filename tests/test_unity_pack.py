@@ -6905,12 +6905,17 @@ class TestSystems(unittest.TestCase):
                 "  m_OnClick:\n"
                 "    m_PersistentCalls:\n"
                 "      m_Calls:\n"
+                "      - m_Target: {fileID: 30}\n"
+                "        m_MethodName: SetActive\n"
+                "        m_Mode: 6\n"
+                "        m_Arguments:\n"
+                "          m_BoolArgument: 1\n"
                 "      - m_Target: {fileID: 20}\n"
                 "        m_MethodName: SetActive\n"
                 "        m_Mode: 6\n"
                 "        m_Arguments:\n"
                 "          m_BoolArgument: 0\n"
-                "--- !u!1 &20\nGameObject:\n  m_Name: Panel\n"
+                "--- !u!1 &20\nGameObject:\n  m_Name: MainMenu\n"
                 "  m_IsActive: 1\n"
                 "  m_Component:\n  - component: {fileID: 21}\n"
                 "  - component: {fileID: 22}\n"
@@ -6924,6 +6929,21 @@ class TestSystems(unittest.TestCase):
                 "  m_Pivot: {x: 0.5, y: 0.5}\n"
                 "--- !u!114 &22\nMonoBehaviour:\n"
                 "  m_GameObject: {fileID: 20}\n"
+                "  m_Script: {fileID: 11500000, guid: " + host_guid + "}\n"
+                "--- !u!1 &30\nGameObject:\n  m_Name: PlayMenu\n"
+                "  m_IsActive: 0\n"
+                "  m_Component:\n  - component: {fileID: 31}\n"
+                "  - component: {fileID: 32}\n"
+                "--- !u!224 &31\nRectTransform:\n"
+                "  m_GameObject: {fileID: 30}\n"
+                "  m_Father: {fileID: 2}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 0, y: 0}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!114 &32\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 30}\n"
                 "  m_Script: {fileID: 11500000, guid: " + host_guid + "}\n"
                 "--- !u!1 &100\nGameObject:\n  m_Name: Main Camera\n"
                 "  m_Component:\n  - component: {fileID: 101}\n"
@@ -6960,7 +6980,10 @@ class TestSystems(unittest.TestCase):
         objs, _a, _l, _c, _h = unity_pack.load_project(root)
         play = [o for o in objs if o.get("name") == "Play"][0]
         self.assertIsNotNone(play.get("ui_button"))
+        self.assertEqual(len(play["ui_button"]["onclick"]), 2)
         self.assertEqual(play["ui_button"]["onclick"][0]["method"], "SetActive")
+        self.assertEqual(play["ui_button"]["onclick"][0]["bool_arg"], 1)
+        self.assertEqual(play["ui_button"]["onclick"][1]["bool_arg"], 0)
         self.assertAlmostEqual(
             play["ui_button"]["colors"]["pressed"][0], 0.5, places=5)
         self.assertIsNotNone(play.get("ui_hit"))
@@ -6969,10 +6992,122 @@ class TestSystems(unittest.TestCase):
         self.assertTrue(plan.get("ui_buttons"))
         ub = plan["ui_buttons"][0]
         self.assertAlmostEqual(ub["pressed"][0], 0.5, places=5)
-        self.assertTrue(ub.get("calls"))
+        self.assertEqual(len(ub.get("calls") or []), 2)
+        self.assertEqual(ub["calls"][0]["bool_arg"], 1)
+        self.assertEqual(ub["calls"][1]["bool_arg"], 0)
         eng = open(os.path.join(d, "engine.c")).read()
         self.assertIn("_engine_ui_btn_tint", eng)
         self.assertIn("_engine_ui_btn_col_h", eng)
+        self.assertIn("_engine_ui_btn_call_start", eng)
+        self.assertIn("_engine_ui_btn_call_count", eng)
+        self.assertRegex(
+            eng, r"_engine_ui_btn_call_count\[1\] = \{ 2 \}")
+
+    def test_nested_canvas_keeps_rect_size(self):
+        """Nested Canvas (sorting override) must not expand to full screen."""
+        root = tempfile.mkdtemp(prefix="upack-nested-canvas-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        host_guid = "f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6"
+        with open(os.path.join(scripts, "Host.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Host : MonoBehaviour { void Update() {} }\n"
+            )
+        with open(os.path.join(scripts, "Host.cs.meta"), "w") as f:
+            f.write("guid: %s\n" % host_guid)
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        img = "fe87c0e1cc204ed48ad3b37840f39efc"
+        builtin = "0000000000000000f000000000000000"
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Canvas\n"
+                "  m_IsActive: 1\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "  - component: {fileID: 4}\n"
+                "--- !u!224 &2\nRectTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 0, y: 0}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!223 &3\nCanvas:\n  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n  m_RenderMode: 0\n"
+                "--- !u!114 &4\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, guid: " + host_guid + "}\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Back Button\n"
+                "  m_IsActive: 1\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "  - component: {fileID: 13}\n"
+                "  - component: {fileID: 14}\n"
+                "--- !u!224 &11\nRectTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Father: {fileID: 2}\n"
+                "  m_LocalScale: {x: 0.5, y: 0.5, z: 0.5}\n"
+                "  m_AnchorMin: {x: 0, y: 1}\n"
+                "  m_AnchorMax: {x: 0, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 200, y: 100}\n"
+                "  m_Pivot: {x: 0, y: 1}\n"
+                "--- !u!223 &12\nCanvas:\n  m_GameObject: {fileID: 10}\n"
+                "  m_Enabled: 1\n  m_RenderMode: 2\n"
+                "--- !u!114 &13\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, guid: " + img + "}\n"
+                "  m_Sprite: {fileID: 10905, guid: " + builtin + ", type: 3}\n"
+                "  m_Type: 1\n"
+                "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+                "--- !u!114 &14\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, guid: " + host_guid + "}\n"
+                "--- !u!1 &100\nGameObject:\n  m_Name: Main Camera\n"
+                "  m_Component:\n  - component: {fileID: 101}\n"
+                "  - component: {fileID: 102}\n"
+                "--- !u!4 &101\nTransform:\n"
+                "  m_GameObject: {fileID: 100}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: -10}\n"
+                "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}\n"
+                "  m_LocalScale: {x: 1, y: 1, z: 1}\n"
+                "--- !u!20 &102\nCamera:\n"
+                "  m_GameObject: {fileID: 100}\n"
+                "  orthographic: 1\n"
+                "  orthographic size: 5\n"
+                "  m_BackGroundColor: {r: 0, g: 0, b: 0, a: 1}\n"
+            )
+        ps = os.path.join(root, "ProjectSettings")
+        os.makedirs(ps)
+        with open(os.path.join(ps, "EditorBuildSettings.asset"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1045 &1\nEditorBuildSettings:\n"
+                "  m_Scenes:\n"
+                "  - enabled: 1\n"
+                "    path: Assets/Scenes/S.unity\n"
+            )
+        with open(os.path.join(ps, "ProjectSettings.asset"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!129 &1\nPlayerSettings:\n"
+                "  defaultScreenWidth: 800\n"
+                "  defaultScreenHeight: 600\n"
+            )
+        objs, _a, _l, _c, _h = unity_pack.load_project(root)
+        back = [o for o in objs if o.get("name") == "Back Button"][0]
+        self.assertTrue(back.get("canvas"))
+        hit = back.get("ui_hit") or {}
+        # 200×100 sizeDelta × 0.5 scale → 100×50 screen; not full 800×600.
+        self.assertAlmostEqual(hit.get("hw", 0) * 2, 100.0, places=3)
+        self.assertAlmostEqual(hit.get("hh", 0) * 2, 50.0, places=3)
+        self.assertLess(hit.get("nhw", 1), 0.2)
+
     def test_prefab_uibutton_onclick_mods(self):
         """PrefabInstance UIButton picks up scene m_OnClick SetActive mods."""
         root = tempfile.mkdtemp(prefix="upack-uibtn-pref-")
