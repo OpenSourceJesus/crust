@@ -130,12 +130,26 @@ variable used as a value (a closed `fun` is lifted and passed as a `fn`),
 (`of ('a t * int)`: write `of 'a t * int`). Dividing by zero is a machine
 fault where OCaml raises `Division_by_zero`.
 
-**Not yet: proofs about compiled OCaml.** The point of lowering to Rust is
-the contract and proof tooling (`rustproof`, `rustprove`), and it does not
-reach this code yet: the lift has unsigned integers only, and OCaml's `int`
-is signed; nor does it lift data enums, pointers or recursion. Signed
-integers in the lift and the kernel are the next step. Meanwhile
-`tools/ocamlproof.py` proves the logical fragment directly.
+**Proofs about compiled OCaml.** A function carries its contract as OCaml
+item attributes, which OCaml itself ignores:
+
+```ocaml
+let iabs2 x = if x < 0 then 0 - x else x
+  [@@requires x > min_int] [@@ensures result >= 0]
+```
+
+The front end types each clause as a `bool` over the parameters (and
+`result`); the emitter writes them as `#[requires]`/`#[ensures]`, with exact
+arithmetic, since a specification states the mathematical value. OCaml's
+`int` is `ml_int` in the Rust -- an `i64` the lift knows to be 63-bit -- and
+`ml_wrap(e)` lifts as `e` with the obligation that `e` stays in 63 bits,
+where the wrap is the identity. So `rustprove` proves the contract about the
+compiled code and, separately, that no arithmetic in it wraps: for
+`iabs` without the `requires` that obligation stays open, because `abs
+min_int` is `min_int` in OCaml; with it, the obligation is proved. Lean 4
+accepts every settled obligation with no axioms (`TestProvedOCaml`). Crust
+also checks the contract at run time. Not lifted yet: data enums, pointers,
+recursion and loops in the emitted code, signed `/` and `%`.
 
 ### Fixes to the Rust front end this needed
 
@@ -152,6 +166,9 @@ Each is pinned in `tests/test_ocaml_rust.py` (`TestRustFixes`):
   (`fn f() -> i64 { { let a = 1; if a == 1 { 5 } else { 6 } } }` returned
   garbage), and a unit `fn main` exited with its last `printf`'s byte
   count. `return 3;` from a unit `main` still sets the exit status.
+
+Also found and not fixed: Crust loses a function whose attributes share its
+line (`#[ensures(..)] fn f ..`); the emitter puts each on its own line.
 
 Found and *not* fixed: a function named like an x86 register (`bx`, `ax`,
 `cl`, `si`, ..) is miscompiled -- `call bx` assembles as a call through the
