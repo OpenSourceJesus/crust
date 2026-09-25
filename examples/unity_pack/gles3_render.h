@@ -105,6 +105,44 @@ static void g3_refresh_camera_bounds(float aspect)
     g3_top = Camera_main_pos_y + half_h;
 }
 
+/* CameraScript.HandleViewSize: letterbox Camera.rect so authored
+ * Camera_main_aspect fits the current pixel size. Only runs when aspect,
+ * orthographicSize, or pixel size change (baked rect assumes Player
+ * Settings screen aspect — a resize otherwise vertically stretches). */
+static void g3_handle_view_size(int pixel_w, int pixel_h)
+{
+    static int cached_w = -1, cached_h = -1;
+    static float cached_aspect = -1.f, cached_ortho = -1.f;
+    float aspect = Camera_main_aspect;
+    float ortho = Camera_main_orthographicSize;
+    float screen_aspect, rw, rh;
+
+    if (pixel_w < 1)
+        pixel_w = 1;
+    if (pixel_h < 1)
+        pixel_h = 1;
+    if (pixel_w == cached_w && pixel_h == cached_h
+        && aspect == cached_aspect && ortho == cached_ortho)
+        return;
+    cached_w = pixel_w;
+    cached_h = pixel_h;
+    cached_aspect = aspect;
+    cached_ortho = ortho;
+    if (aspect < 1e-6f)
+        return;
+    screen_aspect = (float)pixel_w / (float)pixel_h;
+    rw = aspect / screen_aspect;
+    if (rw > 1.f)
+        rw = 1.f;
+    rh = screen_aspect / aspect;
+    if (rh > 1.f)
+        rh = 1.f;
+    Camera_main_rect_w = rw;
+    Camera_main_rect_h = rh;
+    Camera_main_rect_x = 0.5f - rw * 0.5f;
+    Camera_main_rect_y = 0.5f - rh * 0.5f;
+}
+
 static float g3_ndc_x(float x)
 {
     return 2.0f * (x - g3_left) / (g3_right - g3_left) - 1.0f;
@@ -301,6 +339,8 @@ static int g3_draw(int width, int height)
         aspect = height > 0 ? (float)width / (float)height : 1.0f;
     g3_refresh_camera_bounds(aspect);
     g3_upload_handles();
+    /* Recompute letterbox for this framebuffer (HandleViewSize). */
+    g3_handle_view_size(width, height);
     /* Camera.rect letterbox: black bars outside the authored pixel rect. */
     vx = (int)(Camera_main_rect_x * (float)width + 0.5f);
     vy = (int)(Camera_main_rect_y * (float)height + 0.5f);

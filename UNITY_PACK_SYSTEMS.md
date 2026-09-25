@@ -157,7 +157,7 @@ slot (intensity 1, white) into the light table.
 | Script / scene uses | Emitted |
 |---------------------|---------|
 | Authored `!u!1` GameObject `m_TagString: EditorOnly` | Omitted from pack (and transform descendants), matching Unity player builds |
-| Authored CameraScript / GameCamera `viewSize` | Pack-time seed of `Camera_main_aspect`, `Camera_main_rect_*`, updated `orthographicSize` (HandleViewSize); GLES2 **and** GLES3 hosts letterbox to that rect; uGUI bake starts from the camera pixel rect |
+| Authored CameraScript / GameCamera `viewSize` | Pack-time seed of `Camera_main_aspect`, updated `orthographicSize` (HandleViewSize); GLES hosts recompute `Camera_main_rect_*` when aspect, ortho size, or framebuffer size change (so a resized window does not vertically stretch); uGUI bake starts from the camera pixel rect |
 | Authored uGUI `CanvasScaler` (`m_Enabled`) | Pack-time canvas units = pixelRect / scaleFactor (Constant Pixel Size / Scale With Screen Size Match·Expand·Shrink); disabled → raw pixel rect |
 | Authored uGUI layout / Image / TMP / Button `m_Enabled` | Disabled LayoutGroup / ContentSizeFitter / AspectRatioFitter skipped at bake; disabled Image/TMP not drawn; disabled Button not clickable |
 | Camera `m_Father` under a packed body | Live: `_engine_sync_camera_main` → `parent_world + local` each tick/draw |
@@ -263,15 +263,18 @@ PNG UI sprites use `.meta` `spriteBorder` the same way. When
 crop is packed — otherwise every slice would stretch the whole atlas (e.g.
 Settings Menu Full appearing many times on Main Menu). Authored
 `Image.preserveAspect` (Simple type) fits the sprite inside the RectTransform
-instead of stretching to fill (Unity GenerateSimpleSprite); raycast rect
-stays full size. RectTransform `localScale` on an object and its ancestors
+instead of stretching to fill (Unity `PreserveSpriteAspectRatio`); the fitted
+quad is offset by RectTransform.pivot (top-left pivot stays flush with the
+rect corner — not mid-letterboxed). Raycast rect stays full size. RectTransform `localScale` on an object and its ancestors
 accumulates into baked UI screen rects (e.g. a VerticalLayoutGroup scaled
 to 0.59 shrinks children and TMP like Unity Canvas space). Authored
 `TextMeshProUGUI` draws when `m_fontAsset` resolves (Assets or Packages /
 PackageCache): SDF atlas + glyph tables bake `m_text` into a UI sprite
 tinted by `m_fontColor`. Button `m_OnClick` persistent `SetActive` calls
-fire on host pointer press (`engine_pointer_x/y/down`, screen space, origin
-bottom-left); inactive parents hide children (`activeInHierarchy`). Authored
+fire on pointer **release** while still over the button that received
+pointer-down (`engine_pointer_x/y/down`, screen space, origin bottom-left) —
+mouse-off does not cancel the pressed visual; releasing off-button skips
+`onClick`. Inactive parents hide children (`activeInHierarchy`). Authored
 `m_IsActive: 0` seeds `_engine_go_active` at load (not forced on).
 Stripped `PrefabInstance` roots (e.g. UI Button prefabs) are hydrated from
 the source `.prefab` + modifications so TMP children and layout groups see
