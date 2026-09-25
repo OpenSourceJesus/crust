@@ -2074,6 +2074,8 @@ def _resolve_anim_child_path(owner, path, plan):
 # Builtin uGUI Image / Button MonoBehaviour script guids (UnityEngine.UI.dll).
 _IMAGE_SCRIPT_GUID = "fe87c0e1cc204ed48ad3b37840f39efc"
 _BUTTON_SCRIPT_GUID = "4e29b1a8efbd4b44bb3f3716e73f07ff"
+# UnityEngine.UI.Slider (handle/fill anchors driven by m_Value).
+_SLIDER_SCRIPT_GUID = "67db9e8f0e2ae9c40bc1e2b64352a6b4"
 # TextMeshProUGUI (com.unity.ugui / Unity.TextMeshPro).
 _TMP_UGUI_SCRIPT_GUID = "f4688fdb7df04437aeb418b961361dc5"
 # uGUI layout controllers (authored Vertical/HorizontalLayoutGroup).
@@ -2127,6 +2129,88 @@ def _is_ui_button_mb(block, guid):
             and re.search(r"(?m)^\s+m_OnClick:\s*$", block)):
         return True
     return False
+
+
+def _is_ui_slider_mb(block, guid):
+    """True for builtin Slider or a Slider subclass (e.g. ``_Slider``).
+
+    Shape: ``m_HandleRect`` + ``m_MinValue`` (Scrollbar has HandleRect but
+    not Min/MaxValue).
+    """
+    if (guid or "").lower() == _SLIDER_SCRIPT_GUID:
+        return True
+    if re.search(
+            r"(?m)^\s+m_EditorClassIdentifier:.*(?:^|[.\s:])_?Slider\s*$",
+            block):
+        return True
+    if (re.search(r"(?m)^\s+m_HandleRect:\s*", block)
+            and re.search(r"(?m)^\s+m_MinValue:\s*", block)
+            and re.search(r"(?m)^\s+m_MaxValue:\s*", block)):
+        return True
+    return False
+
+
+def _parse_ui_slider(block, file_id=None):
+    """Authored uGUI Slider → value range, direction, handle/fill, onValueChanged."""
+    def _fid(key):
+        m = re.search(
+            r"(?m)^\s+%s:\s*\{fileID:\s*(-?\d+)" % re.escape(key), block)
+        return int(m.group(1)) if m else 0
+
+    def _f(key, default):
+        m = re.search(
+            r"(?m)^\s+%s:\s*([0-9.eE+-]+)" % re.escape(key), block)
+        return float(m.group(1)) if m else float(default)
+
+    def _i(key, default):
+        m = re.search(r"(?m)^\s+%s:\s*(-?\d+)" % re.escape(key), block)
+        return int(m.group(1)) if m else int(default)
+
+    calls = []
+    oc = re.search(r"(?m)^\s+m_OnValueChanged:\s*$", block)
+    if oc:
+        chunk = block[oc.end():]
+        stop = re.search(r"(?m)^---\s", chunk)
+        if stop:
+            chunk = chunk[:stop.start()]
+        # Stop at next sibling field of Slider / _Slider extras.
+        stop2 = re.search(
+            r"(?m)^\s+(?:displayValueText|selectable|slidingAreaRectTrs|"
+            r"snapValues|indexOfCurrentSnapValue):\s*",
+            chunk)
+        if stop2:
+            chunk = chunk[:stop2.start()]
+        for cm in re.finditer(
+                r"m_Target:\s*\{fileID:\s*(-?\d+)\}[\s\S]*?"
+                r"m_MethodName:\s*(\w+)[\s\S]*?"
+                r"m_Mode:\s*(\d+)",
+                chunk):
+            tid = int(cm.group(1))
+            if tid == 0:
+                continue
+            calls.append({
+                "target_go": str(tid),
+                "method": cm.group(2),
+                "mode": int(cm.group(3)),
+            })
+    interactable = _i("m_Interactable", 1)
+    if not _mb_enabled(block):
+        interactable = 0
+    return {
+        "enabled": _mb_enabled(block),
+        "interactable": interactable,
+        "handle_rect_id": _fid("m_HandleRect"),
+        "fill_rect_id": _fid("m_FillRect"),
+        # _Slider companion field; 0 → use handle parent / slider root.
+        "slide_area_id": _fid("slidingAreaRectTrs"),
+        "direction": _i("m_Direction", 0),
+        "min": _f("m_MinValue", 0.0),
+        "max": _f("m_MaxValue", 1.0),
+        "value": _f("m_Value", 0.0),
+        "whole_numbers": _i("m_WholeNumbers", 0),
+        "on_value_changed": calls,
+        "mb_file_id": file_id,
+    }
 
 
 def _is_ui_tmp_mb(block, guid):
@@ -3176,6 +3260,71 @@ def _apply_layout_groups(objects, screen_w, screen_h):
     arfs.sort(key=lambda o: _depth(o))
     for o in arfs:
         _apply_aspect_ratio_fitter(o, by_xf, screen_w, screen_h)
+
+
+def _slider_normalized(value, vmin, vmax):
+    """Unity Slider.normalizedValue."""
+    lo = float(vmin)
+    hi = float(vmax)
+    if abs(hi - lo) < 1e-8:
+        return 0.0
+    t = (float(value) - lo) / (hi - lo)
+    if t < 0.0:
+        return 0.0
+    if t > 1.0:
+        return 1.0
+    return t
+
+
+def _apply_slider_visuals(objects):
+    """Bake Unity ``Slider.UpdateVisuals`` into handle/fill RectTransforms.
+
+    Scene YAML often leaves handle anchors at ``(0,0)-(0,0)`` because they
+    are driven at runtime. Without this, pack places the knob at the
+    Handle Slide Area's corner (often below/left of the track) instead of
+    along ``normalizedValue``.
+    """
+    by_xf = {}
+    for o in objects:
+        xid = o.get("xf_id")
+        if xid is not None and str(xid) not in ("", "0"):
+            by_xf[str(xid)] = o
+    for o in objects:
+        sl = o.get("ui_slider")
+        if not sl or not int(sl.get("enabled", 1)):
+            continue
+        direction = int(sl.get("direction") or 0)
+        # 0 LTR, 1 RTL, 2 BTT, 3 TTB — UnityEngine.UI.Slider.Direction.
+        axis = 0 if direction in (0, 1) else 1
+        reverse = direction in (1, 3)
+        nv = _slider_normalized(sl.get("value"), sl.get("min"), sl.get("max"))
+        t = (1.0 - nv) if reverse else nv
+        handle_id = int(sl.get("handle_rect_id") or 0)
+        if handle_id:
+            h = by_xf.get(str(handle_id))
+            if h is not None and h.get("rect") is not None:
+                rect = dict(h["rect"])
+                amin = [0.0, 0.0]
+                amax = [1.0, 1.0]
+                amin[axis] = t
+                amax[axis] = t
+                rect["anchor_min"] = (float(amin[0]), float(amin[1]))
+                rect["anchor_max"] = (float(amax[0]), float(amax[1]))
+                h["rect"] = rect
+        fill_id = int(sl.get("fill_rect_id") or 0)
+        if fill_id:
+            f = by_xf.get(str(fill_id))
+            if f is not None and f.get("rect") is not None:
+                rect = dict(f["rect"])
+                amin = [0.0, 0.0]
+                amax = [1.0, 1.0]
+                if reverse:
+                    amin[axis] = 1.0 - nv
+                else:
+                    amax[axis] = nv
+                rect["anchor_min"] = (float(amin[0]), float(amin[1]))
+                rect["anchor_max"] = (float(amax[0]), float(amax[1]))
+                f["rect"] = rect
 
 
 _TMP_FONT_CACHE = {}
@@ -4399,6 +4548,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 }
             elif _is_ui_button_mb(block, g):
                 rec["ui_button"] = _parse_ui_button(block, file_id)
+            elif _is_ui_slider_mb(block, g):
+                rec["ui_slider"] = _parse_ui_slider(block, file_id)
             elif _is_ui_tmp_mb(block, g):
                 rec["ui_tmp"] = _parse_ui_tmp(block, asset_guids)
             elif _is_vlayout_mb(block, g):
@@ -4667,6 +4818,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         sprite = None
         ui_image = None
         ui_button = None
+        ui_slider = None
         ui_tmp = None
         layout_group = None
         layout_element = None
@@ -4704,11 +4856,17 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 vec3_fields.update(k.get("vec3_fields") or {})
                 g = k.get("guid")
                 if g and g in guid_to_script:
-                    script = guid_to_script[g]
+                    # Prefer authored Slider (_Slider) over companion
+                    # _Selectable on the same GO so SetDisplayValue /
+                    # OnValueChanged resolve to a packed _Slider instance.
+                    if script is None or k.get("ui_slider"):
+                        script = guid_to_script[g]
                 if k.get("ui_image"):
                     ui_image = dict(k["ui_image"])
                 if k.get("ui_button"):
                     ui_button = dict(k["ui_button"])
+                if k.get("ui_slider"):
+                    ui_slider = dict(k["ui_slider"])
                 if k.get("ui_tmp"):
                     ui_tmp = dict(k["ui_tmp"])
                 if k.get("layout_group"):
@@ -5061,6 +5219,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "rect": rect,
             "ui_image": ui_image,
             "ui_button": ui_button,
+            "ui_slider": ui_slider,
             "ui_tmp": ui_tmp,
             "layout_group": layout_group,
             "layout_element": layout_element,
@@ -5159,6 +5318,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
     _append_prefab_instance_ui_objects(
         by_id, objects, hierarchy, asset_guids, guid_to_script)
     _annotate_ui_button_onclick_targets(objects, by_id, guid_to_script)
+    _annotate_ui_slider_onvaluechanged_targets(objects, by_id, guid_to_script)
     return objects, lights, cameras, hierarchy
 
 
@@ -5356,6 +5516,7 @@ def _materialize_prefab_instance_ui(by_id, objects, asset_guids,
                 "preserve_aspect": preserve,
             },
             "ui_button": ui_button,
+            "ui_slider": None,
             "ui_tmp": None,
             "layout_group": None,
             "layout_element": None,
@@ -5545,14 +5706,27 @@ def _annotate_ui_button_onclick_targets(objects, by_id, guid_to_script):
     fileID (including stripped PrefabInstance MBs). Prefer ``m_Script``
     guid — stripped blocks list the source-prefab guid first.
     """
+    _annotate_ui_persistent_mb_targets(
+        objects, by_id, guid_to_script, "ui_button", "onclick")
+
+
+def _annotate_ui_slider_onvaluechanged_targets(objects, by_id, guid_to_script):
+    """Tag each Slider onValueChanged call with target MB class."""
+    _annotate_ui_persistent_mb_targets(
+        objects, by_id, guid_to_script, "ui_slider", "on_value_changed")
+
+
+def _annotate_ui_persistent_mb_targets(
+        objects, by_id, guid_to_script, obj_key, calls_key):
+    """Tag persistent UnityEvent calls with target_kind / target_class."""
     if not objects or not by_id:
         return
     guid_to_script = guid_to_script or {}
     for o in objects:
-        ub = o.get("ui_button")
-        if not ub:
+        blob = o.get(obj_key)
+        if not blob:
             continue
-        for c in ub.get("onclick") or []:
+        for c in blob.get(calls_key) or []:
             tid = str(c.get("target_go") or "")
             if not tid or tid == "0":
                 continue
@@ -5581,7 +5755,7 @@ def _annotate_ui_button_onclick_targets(objects, by_id, guid_to_script):
 
 
 def _onclick_mb_types(objects):
-    """Packed MonoBehaviour class names targeted by Button onClick."""
+    """Packed MonoBehaviour class names targeted by Button/Slider events."""
     out = set()
     for o in objects or []:
         for c in (o.get("ui_button") or {}).get("onclick") or []:
@@ -5590,21 +5764,26 @@ def _onclick_mb_types(objects):
             cls = c.get("target_class")
             if cls:
                 out.add(cls)
+        for c in (o.get("ui_slider") or {}).get("on_value_changed") or []:
+            cls = c.get("target_class")
+            if cls:
+                out.add(cls)
     return out
 
 
 def _alias_onclick_mb_file_ids(objects):
-    """Attach scene onClick MB fileIDs onto packed instances' mb_ids.
+    """Attach scene onClick/onValueChanged MB fileIDs onto packed mb_ids.
 
     Stripped PrefabInstance MBs (scene fileID) are not joined via m_Component;
-    Button targets still reference them. Alias onto the first instance of the
-    annotated target class so ``_mb_index`` resolves the click.
+    Button/Slider targets still reference them. Alias onto the first instance
+    of the annotated target class so ``_mb_index`` resolves the call.
     """
     by_class = {}
     for o in objects or []:
         by_class.setdefault(o.get("class"), []).append(o)
-    for o in objects or []:
-        for c in (o.get("ui_button") or {}).get("onclick") or []:
+
+    def _alias(calls):
+        for c in calls or []:
             if c.get("method") == "SetActive":
                 continue
             cls = c.get("target_class")
@@ -5616,6 +5795,10 @@ def _alias_onclick_mb_file_ids(objects):
                 if tid not in mbs:
                     mbs.append(tid)
                 break
+
+    for o in objects or []:
+        _alias((o.get("ui_button") or {}).get("onclick"))
+        _alias((o.get("ui_slider") or {}).get("on_value_changed"))
 
 
 def _mb_onclick_callable(analyses, cname, method, mode):
@@ -5645,6 +5828,51 @@ def _mb_onclick_callable(analyses, cname, method, mode):
                             r"(?:System\.)?string\s+\w+\s*$", args, re.I):
                         return True
                 elif want_void and not args:
+                    return True
+    return False
+
+
+def _mb_onvaluechanged_callable(analyses, cname, method, mode):
+    """True if *method* can be dispatched from Slider.onValueChanged.
+
+    UnityEvent<float>: mode 0/4 = EventDefined/Float (pass float);
+    mode 1 = Void. Static property setters (``set_Volume``) are allowed.
+    """
+    if not cname or not method:
+        return False
+    mode = int(mode or 0)
+    want_float = mode in (0, 4)
+    want_void = mode == 1
+    if not want_float and not want_void:
+        return False
+    for a in analyses or []:
+        for c in a.get("classes") or []:
+            if c.get("name") != cname:
+                continue
+            for m in c.get("methods") or []:
+                if m.get("name") != method:
+                    continue
+                if not m.get("public"):
+                    continue
+                args = (m.get("args") or "").strip()
+                if want_float:
+                    if re.match(
+                            r"(?:System\.)?float\s+\w+\s*$", args, re.I):
+                        return True
+                elif want_void and not args:
+                    # Instance void only (OnValueChanged / SetDisplayValue).
+                    if not m.get("static"):
+                        return True
+    return False
+
+
+def _mb_method_is_static(analyses, cname, method):
+    for a in analyses or []:
+        for c in a.get("classes") or []:
+            if c.get("name") != cname:
+                continue
+            for m in c.get("methods") or []:
+                if m.get("name") == method and m.get("static"):
                     return True
     return False
 
@@ -5765,6 +5993,7 @@ def _append_prefab_instance_ui_objects(
                     ui_button, inst_raw, ui_button.get("mb_file_id"))
                 _annotate_ui_button_onclick_targets(
                     [{"ui_button": ui_button}], by_id, guid_to_script)
+            ui_slider = dict(src["ui_slider"]) if src.get("ui_slider") else None
             # Image-only materialize may have created this xf already — attach
             # Button / UIButton ColorBlock + onClick from the source prefab.
             if xf_id in existing_xf:
@@ -5773,6 +6002,8 @@ def _append_prefab_instance_ui_objects(
                         continue
                     if ui_button and not o.get("ui_button"):
                         o["ui_button"] = ui_button
+                    if ui_slider and not o.get("ui_slider"):
+                        o["ui_slider"] = ui_slider
                     # Prefer a stable prefabinst go_id when scene stub
                     # left go_id None (needed by _build_ui_buttons).
                     if o.get("go_id") is None:
@@ -5857,6 +6088,7 @@ def _append_prefab_instance_ui_objects(
                 "rect": rect,
                 "ui_image": ui_image,
                 "ui_button": ui_button,
+                "ui_slider": ui_slider,
                 "ui_tmp": None,
                 "layout_group": None,
                 "layout_element": (
@@ -6441,6 +6673,113 @@ def _build_ui_buttons(plan, analyses=None):
         -int(b.get("sorting_order") or 0),
     ))
     return buttons
+
+
+def _build_ui_sliders(plan, analyses=None):
+    """Authored uGUI Sliders: drag hit GO, handle/fill, onValueChanged."""
+    go_by_id = {}
+    xf_to_go = {}
+    for cl in plan["classes"].values():
+        for o in cl.get("instances") or []:
+            gid = str(o.get("go_id") or "")
+            gi = o.get("go_index")
+            if gid and gi is not None:
+                go_by_id[gid] = int(gi)
+            xid = o.get("xf_id")
+            if xid is not None and gi is not None:
+                xf_to_go[str(xid)] = int(gi)
+    for h in plan.get("scene_hierarchy") or []:
+        gid = str(h.get("go_id") or "")
+        gi = h.get("go_index")
+        if gid and gi is not None:
+            go_by_id.setdefault(gid, int(gi))
+        xid = h.get("xf_id")
+        if xid is not None and gi is not None:
+            xf_to_go.setdefault(str(xid), int(gi))
+    # Handle RectTransform father → Handle Slide Area go_index.
+    handle_parent = {}
+    for cl in plan["classes"].values():
+        for o in cl.get("instances") or []:
+            xid = o.get("xf_id")
+            fid = o.get("father_id")
+            if xid is not None and fid is not None:
+                handle_parent[str(xid)] = str(fid)
+    for h in plan.get("scene_hierarchy") or []:
+        xid = h.get("xf_id")
+        fid = h.get("father_id")
+        if xid is not None and fid is not None:
+            handle_parent.setdefault(str(xid), str(fid))
+    mb_index = _mb_index(plan)
+    class_inst0 = {}
+    for cname, cl in (plan.get("classes") or {}).items():
+        if int(cl.get("n") or 0) > 0:
+            class_inst0[cname] = 0
+    sliders = []
+    for cl in plan["classes"].values():
+        for o in cl.get("instances") or []:
+            sl = o.get("ui_slider")
+            if not sl or not int(sl.get("enabled", 1)):
+                continue
+            if not int(sl.get("interactable", 1)):
+                continue
+            self_go = o.get("go_index")
+            if self_go is None:
+                continue
+            self_go = int(self_go)
+            handle_id = int(sl.get("handle_rect_id") or 0)
+            fill_id = int(sl.get("fill_rect_id") or 0)
+            slide_id = int(sl.get("slide_area_id") or 0)
+            handle_go = xf_to_go.get(str(handle_id), -1) if handle_id else -1
+            fill_go = xf_to_go.get(str(fill_id), -1) if fill_id else -1
+            slide_go = -1
+            if slide_id:
+                slide_go = xf_to_go.get(str(slide_id), -1)
+            if slide_go < 0 and handle_id:
+                parent_xf = handle_parent.get(str(handle_id))
+                if parent_xf:
+                    slide_go = xf_to_go.get(parent_xf, -1)
+            if slide_go < 0:
+                slide_go = self_go
+            calls = []
+            for c in sl.get("on_value_changed") or []:
+                method = c.get("method") or ""
+                tid = str(c.get("target_go") or "")
+                mode = int(c.get("mode") or 0)
+                cname = c.get("target_class")
+                inst = None
+                hit_mb = mb_index.get(tid)
+                if hit_mb:
+                    cname, inst = hit_mb[0], int(hit_mb[1])
+                elif cname and cname in class_inst0:
+                    inst = int(class_inst0[cname])
+                if cname is None or inst is None:
+                    continue
+                if not _mb_onvaluechanged_callable(
+                        analyses, cname, method, mode):
+                    continue
+                is_static = _mb_method_is_static(analyses, cname, method)
+                calls.append({
+                    "kind": "mb",
+                    "mb_class": cname,
+                    "mb_inst": int(inst),
+                    "method": method,
+                    "mode": mode,
+                    "static": bool(is_static),
+                })
+            direction = int(sl.get("direction") or 0)
+            sliders.append({
+                "go": self_go,
+                "slide_go": int(slide_go),
+                "handle_go": int(handle_go),
+                "fill_go": int(fill_go),
+                "direction": direction,
+                "min": float(sl.get("min") or 0.0),
+                "max": float(sl.get("max") or 1.0),
+                "value": float(sl.get("value") or 0.0),
+                "whole_numbers": int(sl.get("whole_numbers") or 0),
+                "calls": calls,
+            })
+    return sliders
 
 
 def _collect_addcomponent_types(analyses):
@@ -8436,6 +8775,8 @@ def analyze_script(path, text=None, shallow=False):
         bscan_m = _blank_index_ranges(bscan, nested)
         fields = _fields_in(body_m, bscan_m, body_abs=brace + 1)
         methods = _methods_in(body_m, bscan_m, body_abs=brace + 1)
+        methods.extend(
+            _properties_as_methods(body_m, bscan_m, body_abs=brace + 1))
         refs = []
         for f in fields:
             if f["ty"] not in _PRIM and f["ty"] not in (
@@ -8754,6 +9095,57 @@ def _methods_in(body, bscan, body_abs=0):
             "public": bool(re.search(r"\bpublic\b", decl)),
             "static": bool(re.search(r"\bstatic\b", decl)),
         })
+    return out
+
+
+def _properties_as_methods(body, bscan, body_abs=0):
+    """C# properties → ``get_Name`` / ``set_Name`` (UnityEvent wiring).
+
+    PersistentListenerMode targets property setters as ``set_Volume`` etc.
+    """
+    import tools.cpprust as cpprust
+    out = []
+    head = re.compile(
+        r"(?m)^[ \t]*(?:public|private|protected|internal)?"
+        r"[ \t]*(static[ \t]+)?(?:override[ \t]+)?(?:virtual[ \t]+)?"
+        r"([\w.<>]+)[ \t]+(\w+)[ \t\r\n]*\{")
+    for m in head.finditer(bscan):
+        is_static = bool(m.group(1))
+        ret, name = m.group(2).strip(), m.group(3)
+        if ret in ("if", "else", "for", "while", "switch", "catch", "using",
+                   "lock", "get", "set", "add", "remove"):
+            continue
+        # Skip methods: ``ret Name(`` was already handled; property has no `(`.
+        if m.start() > 0 and bscan[m.start() - 1] == "(":
+            continue
+        open_i = m.end() - 1
+        if open_i < 0 or bscan[open_i] != "{":
+            continue
+        close = cpprust._match_brace(bscan, open_i)
+        if close is None:
+            continue
+        prop_body = body[open_i + 1:close]
+        prop_scan = bscan[open_i + 1:close]
+        decl = bscan[m.start():open_i + 1]
+        is_public = bool(re.search(r"\bpublic\b", decl))
+        # set { ... } — implicit ``value`` parameter.
+        # Only setters are extracted (UnityEvent wires ``set_Name``); getters
+        # returning non-void would break the void method emitter.
+        sm = re.search(r"(?m)^\s*set\s*[ \t\r\n]*\{", prop_scan)
+        if sm:
+            sopen = sm.end() - 1
+            sclose = cpprust._match_brace(prop_scan, sopen)
+            if sclose is not None:
+                out.append({
+                    "ret": "void",
+                    "name": "set_" + name,
+                    "args": "%s value" % ret,
+                    "body": prop_body[sopen + 1:sclose],
+                    "body_abs": int(body_abs) + int(open_i + 1) + sopen + 1,
+                    "src": "",
+                    "public": is_public,
+                    "static": is_static,
+                })
     return out
 
 
@@ -9718,21 +10110,23 @@ def emit_engine(plan, analyses, used_apis):
         or want_file_delete or want_file_text_stream or want_file_copy)
     want_destroy = "Object.Destroy" in used_apis
     ui_buttons = plan.get("ui_buttons") or []
+    ui_sliders = plan.get("ui_sliders") or []
     authored_inactive = any(
         int(o.get("active", 1)) == 0
         for cl in plan["classes"].values()
         for o in (cl.get("instances") or [])) or any(
             int(h.get("active", 1)) == 0
             for h in (plan.get("scene_hierarchy") or []))
-    want_ui = (bool(ui_buttons) or ("GameObject.SetActive" in used_apis)
+    want_ui = (bool(ui_buttons) or bool(ui_sliders)
+               or ("GameObject.SetActive" in used_apis)
                or authored_inactive or _plan_has_ui_draws(plan))
     rt_apis = (
         "rectTransform.anchoredPosition" in used_apis
         or "rectTransform.sizeDelta" in used_apis)
     want_live_rt = bool(
         plan.get("live_rt")
-        and (_plan_has_ui_draws(plan) or bool(ui_buttons) or rt_apis
-             or "transform.localScale" in used_apis))
+        and (_plan_has_ui_draws(plan) or bool(ui_buttons) or bool(ui_sliders)
+             or rt_apis or "transform.localScale" in used_apis))
     want_go_tables = (
         want_find or want_transform_find or want_transform_parent
         or want_transform_go or want_set_parent or want_get_sibling
@@ -11867,6 +12261,226 @@ def emit_engine(plan, analyses, used_apis):
                 p("    for (i = 0; i < %d; i = i + 1)" % (nbtn * 4))
                 p("        _engine_ui_btn_tint[i] = _engine_ui_btn_col_n[i];")
                 p("}")
+            # Slider tables: drag + onValueChanged (UnityEvent<float>).
+            p("static const int _engine_ui_slider_count = %d;"
+              % len(ui_sliders))
+            if ui_sliders:
+                nsl = len(ui_sliders)
+                p("static const int _engine_ui_sl_go[%d] = { %s };" % (
+                    nsl, ", ".join(str(int(s["go"])) for s in ui_sliders)))
+                p("static const int _engine_ui_sl_slide_go[%d] = { %s };" % (
+                    nsl, ", ".join(
+                        str(int(s["slide_go"])) for s in ui_sliders)))
+                p("static const int _engine_ui_sl_handle_go[%d] = { %s };" % (
+                    nsl, ", ".join(
+                        str(int(s["handle_go"])) for s in ui_sliders)))
+                p("static const int _engine_ui_sl_fill_go[%d] = { %s };" % (
+                    nsl, ", ".join(
+                        str(int(s["fill_go"])) for s in ui_sliders)))
+                p("static const int _engine_ui_sl_dir[%d] = { %s };" % (
+                    nsl, ", ".join(
+                        str(int(s["direction"])) for s in ui_sliders)))
+                p("static const int _engine_ui_sl_whole[%d] = { %s };" % (
+                    nsl, ", ".join(
+                        str(int(s["whole_numbers"])) for s in ui_sliders)))
+                p("static const float _engine_ui_sl_min[%d] = { %s };" % (
+                    nsl, ", ".join(
+                        "%sf" % repr(float(s["min"])) for s in ui_sliders)))
+                p("static const float _engine_ui_sl_max[%d] = { %s };" % (
+                    nsl, ", ".join(
+                        "%sf" % repr(float(s["max"])) for s in ui_sliders)))
+                p("static float _engine_ui_sl_value[%d] = { %s };" % (
+                    nsl, ", ".join(
+                        "%sf" % repr(float(s["value"])) for s in ui_sliders)))
+                sl_starts = []
+                sl_counts = []
+                sl_ops = []
+                sl_insts = []
+                # handler: (cname, method, pass_float, is_static)
+                sl_handlers = []
+                sl_handler_ix = {}
+
+                def _sl_op(cname, method, pass_float, is_static):
+                    key = (cname, method, bool(pass_float), bool(is_static))
+                    if key not in sl_handler_ix:
+                        sl_handler_ix[key] = len(sl_handlers) + 1
+                        sl_handlers.append(key)
+                    return sl_handler_ix[key]
+
+                for s in ui_sliders:
+                    sl_starts.append(len(sl_ops))
+                    calls = s.get("calls") or []
+                    sl_counts.append(len(calls))
+                    for c in calls:
+                        mode = int(c.get("mode") or 0)
+                        pass_f = mode in (0, 4)
+                        sl_ops.append(_sl_op(
+                            c["mb_class"], c["method"], pass_f,
+                            bool(c.get("static"))))
+                        sl_insts.append(int(c["mb_inst"]))
+                nslc = len(sl_ops)
+                p("static const int _engine_ui_sl_call_start[%d] = { %s };" % (
+                    nsl, ", ".join(str(x) for x in sl_starts)))
+                p("static const int _engine_ui_sl_call_count[%d] = { %s };" % (
+                    nsl, ", ".join(str(x) for x in sl_counts)))
+                if nslc:
+                    p("static const int _engine_ui_sl_call_op[%d] = { %s };" % (
+                        nslc, ", ".join(str(x) for x in sl_ops)))
+                    p("static const int _engine_ui_sl_call_inst[%d] = { %s };"
+                      % (nslc, ", ".join(str(x) for x in sl_insts)))
+                else:
+                    p("static const int _engine_ui_sl_call_op[1] = { 0 };")
+                    p("static const int _engine_ui_sl_call_inst[1] = { 0 };")
+                plan["_ui_sl_mb_handlers"] = sl_handlers
+                for hcname, hmethod, hfloat, hstatic in sl_handlers:
+                    hidn = _c_ident(hcname)
+                    if hstatic and hfloat:
+                        p("static void %s_%s(float a);" % (hidn, hmethod))
+                    elif hstatic:
+                        p("static void %s_%s(void);" % (hidn, hmethod))
+                    elif hfloat:
+                        p("static void %s_%s(unsigned i, float a);"
+                          % (hidn, hmethod))
+                    else:
+                        p("static void %s_%s(unsigned i);" % (hidn, hmethod))
+                p("static int _engine_ui_sl_drag = -1;")
+                # Runtime UpdateVisuals: set handle/fill anchors from value.
+                p("static void _engine_ui_sl_update_visuals(int si) {")
+                p("    int hgo, fgo, dir, axis, rev;")
+                p("    float vmin, vmax, val, nv, t;")
+                p("    if (si < 0 || si >= _engine_ui_slider_count) return;")
+                p("    hgo = _engine_ui_sl_handle_go[si];")
+                p("    fgo = _engine_ui_sl_fill_go[si];")
+                p("    dir = _engine_ui_sl_dir[si];")
+                p("    axis = (dir == 0 || dir == 1) ? 0 : 1;")
+                p("    rev = (dir == 1 || dir == 3) ? 1 : 0;")
+                p("    vmin = _engine_ui_sl_min[si];")
+                p("    vmax = _engine_ui_sl_max[si];")
+                p("    val = _engine_ui_sl_value[si];")
+                p("    if (vmax - vmin < 1e-8f) nv = 0.f;")
+                p("    else {")
+                p("        nv = (val - vmin) / (vmax - vmin);")
+                p("        if (nv < 0.f) nv = 0.f;")
+                p("        if (nv > 1.f) nv = 1.f;")
+                p("    }")
+                p("    t = rev ? (1.f - nv) : nv;")
+                if want_live_rt:
+                    p("    if (hgo >= 0 && hgo < %d && _engine_rt_has[hgo]) {"
+                      % go_n)
+                    p("        if (axis == 0) {")
+                    p("            _engine_rt_amin_x[hgo] = t;")
+                    p("            _engine_rt_amax_x[hgo] = t;")
+                    p("            _engine_rt_amin_y[hgo] = 0.f;")
+                    p("            _engine_rt_amax_y[hgo] = 1.f;")
+                    p("        } else {")
+                    p("            _engine_rt_amin_y[hgo] = t;")
+                    p("            _engine_rt_amax_y[hgo] = t;")
+                    p("            _engine_rt_amin_x[hgo] = 0.f;")
+                    p("            _engine_rt_amax_x[hgo] = 1.f;")
+                    p("        }")
+                    p("    }")
+                    p("    if (fgo >= 0 && fgo < %d && _engine_rt_has[fgo]) {"
+                      % go_n)
+                    p("        if (axis == 0) {")
+                    p("            if (rev) {")
+                    p("                _engine_rt_amin_x[fgo] = 1.f - nv;")
+                    p("                _engine_rt_amax_x[fgo] = 1.f;")
+                    p("            } else {")
+                    p("                _engine_rt_amin_x[fgo] = 0.f;")
+                    p("                _engine_rt_amax_x[fgo] = nv;")
+                    p("            }")
+                    p("            _engine_rt_amin_y[fgo] = 0.f;")
+                    p("            _engine_rt_amax_y[fgo] = 1.f;")
+                    p("        } else {")
+                    p("            if (rev) {")
+                    p("                _engine_rt_amin_y[fgo] = 1.f - nv;")
+                    p("                _engine_rt_amax_y[fgo] = 1.f;")
+                    p("            } else {")
+                    p("                _engine_rt_amin_y[fgo] = 0.f;")
+                    p("                _engine_rt_amax_y[fgo] = nv;")
+                    p("            }")
+                    p("            _engine_rt_amin_x[fgo] = 0.f;")
+                    p("            _engine_rt_amax_x[fgo] = 1.f;")
+                    p("        }")
+                    p("    }")
+                p("}")
+                p("static void _engine_ui_sl_set_value(int si, float v) {")
+                p("    float vmin, vmax, old;")
+                p("    int j, j0, j1;")
+                p("    if (si < 0 || si >= _engine_ui_slider_count) return;")
+                p("    vmin = _engine_ui_sl_min[si];")
+                p("    vmax = _engine_ui_sl_max[si];")
+                p("    if (v < vmin) v = vmin;")
+                p("    if (v > vmax) v = vmax;")
+                p("    if (_engine_ui_sl_whole[si]) {")
+                p("        if (v >= 0.f) v = (float)((int)(v + 0.5f));")
+                p("        else v = (float)((int)(v - 0.5f));")
+                p("        if (v < vmin) v = vmin;")
+                p("        if (v > vmax) v = vmax;")
+                p("    }")
+                p("    old = _engine_ui_sl_value[si];")
+                p("    if (v == old) return;")
+                p("    _engine_ui_sl_value[si] = v;")
+                p("    _engine_ui_sl_update_visuals(si);")
+                p("    j0 = _engine_ui_sl_call_start[si];")
+                p("    j1 = j0 + _engine_ui_sl_call_count[si];")
+                p("    for (j = j0; j < j1; j = j + 1) {")
+                p("        int op = _engine_ui_sl_call_op[j];")
+                for hi, (hcname, hmethod, hfloat, hstatic) in enumerate(
+                        sl_handlers):
+                    hidn = _c_ident(hcname)
+                    p("        else if (op == %d)" % (hi + 1)
+                      if hi else "        if (op == %d)" % (hi + 1))
+                    if hstatic and hfloat:
+                        p("            %s_%s(v);" % (hidn, hmethod))
+                    elif hstatic:
+                        p("            %s_%s();" % (hidn, hmethod))
+                    elif hfloat:
+                        p("            %s_%s("
+                          "(unsigned)_engine_ui_sl_call_inst[j], v);"
+                          % (hidn, hmethod))
+                    else:
+                        p("            %s_%s("
+                          "(unsigned)_engine_ui_sl_call_inst[j]);"
+                          % (hidn, hmethod))
+                p("    }")
+                p("}")
+                p("static void _engine_ui_sl_drag_to(int si, float px, float py,"
+                  " float sw, float sh) {")
+                p("    int sgo, dir, axis, rev;")
+                p("    float cx, cy, rw, rh, left, bottom, t, vmin, vmax, v;")
+                p("    if (si < 0 || si >= _engine_ui_slider_count) return;")
+                p("    sgo = _engine_ui_sl_slide_go[si];")
+                p("    if (sgo < 0 || sgo >= %d) return;" % go_n)
+                if want_live_rt:
+                    p("    _engine_ui_screen_rect("
+                      "sgo, sw, sh, &cx, &cy, &rw, &rh);")
+                else:
+                    # Fallback: full layout — rare without live RT.
+                    p("    cx = sw * 0.5f; cy = sh * 0.5f;")
+                    p("    rw = sw; rh = sh;")
+                p("    if (rw < 0.f) rw = -rw;")
+                p("    if (rh < 0.f) rh = -rh;")
+                p("    left = cx - rw * 0.5f;")
+                p("    bottom = cy - rh * 0.5f;")
+                p("    dir = _engine_ui_sl_dir[si];")
+                p("    axis = (dir == 0 || dir == 1) ? 0 : 1;")
+                p("    rev = (dir == 1 || dir == 3) ? 1 : 0;")
+                p("    if (axis == 0) {")
+                p("        if (rw < 1e-6f) t = 0.f;")
+                p("        else t = (px - left) / rw;")
+                p("    } else {")
+                p("        if (rh < 1e-6f) t = 0.f;")
+                p("        else t = (py - bottom) / rh;")
+                p("    }")
+                p("    if (t < 0.f) t = 0.f;")
+                p("    if (t > 1.f) t = 1.f;")
+                p("    if (rev) t = 1.f - t;")
+                p("    vmin = _engine_ui_sl_min[si];")
+                p("    vmax = _engine_ui_sl_max[si];")
+                p("    v = vmin + t * (vmax - vmin);")
+                p("    _engine_ui_sl_set_value(si, v);")
+                p("}")
             p("static void engine_ui_tick(void) {")
             p("    int down_edge, up_edge, i, hit;")
             p("    float px, py, sw, sh;")
@@ -11910,6 +12524,37 @@ def emit_engine(plan, analyses, used_apis):
                 p("        py = py * (lh / sh);")
                 p("        sw = lw;")
                 p("        sh = lh;")
+                p("    }")
+            # Sliders first — drag takes priority over Button press.
+            if ui_sliders:
+                p("    {")
+                p("        int shit = -1;")
+                p("        for (i = 0; i < _engine_ui_slider_count; i = i + 1) {")
+                p("            int go = _engine_ui_sl_go[i];")
+                p("            float cx, cy, hw, hh, dx, dy, rw, rh;")
+                p("            if (go < 0 || go >= %d) continue;" % go_n)
+                p("            if (!_engine_go_active_in_hierarchy(go)) continue;")
+                if want_live_rt:
+                    p("            _engine_ui_screen_rect("
+                      "go, sw, sh, &cx, &cy, &rw, &rh);")
+                    p("            if (rw < 0.f) rw = -rw;")
+                    p("            if (rh < 0.f) rh = -rh;")
+                    p("            hw = rw * 0.5f;")
+                    p("            hh = rh * 0.5f;")
+                else:
+                    p("            cx = sw * 0.5f; cy = sh * 0.5f;")
+                    p("            hw = sw; hh = sh;")
+                p("            dx = px - cx; if (dx < 0.f) dx = -dx;")
+                p("            dy = py - cy; if (dy < 0.f) dy = -dy;")
+                p("            if (dx <= hw && dy <= hh && shit < 0) shit = i;")
+                p("        }")
+                p("        if (down_edge && shit >= 0)")
+                p("            _engine_ui_sl_drag = shit;")
+                p("        if (_engine_ui_sl_drag >= 0 && engine_pointer_down)")
+                p("            _engine_ui_sl_drag_to("
+                  "_engine_ui_sl_drag, px, py, sw, sh);")
+                p("        if (up_edge)")
+                p("            _engine_ui_sl_drag = -1;")
                 p("    }")
             p("    hit = -1;")
             if ui_buttons:
@@ -11961,7 +12606,11 @@ def emit_engine(plan, analyses, used_apis):
                 p("        _engine_ui_btn_tint[i * 4 + 2] = col[2];")
                 p("        _engine_ui_btn_tint[i * 4 + 3] = col[3];")
                 p("    }")
-                p("    if (down_edge && hit >= 0)")
+                # Skip Button press while a Slider is being dragged.
+                if ui_sliders:
+                    p("    if (down_edge && hit >= 0 && _engine_ui_sl_drag < 0)")
+                else:
+                    p("    if (down_edge && hit >= 0)")
                 p("        _engine_ui_btn_press = hit;")
                 p("    if (up_edge) {")
                 p("        if (_engine_ui_btn_press >= 0"
@@ -11998,9 +12647,11 @@ def emit_engine(plan, analyses, used_apis):
                 p("        }")
                 p("        _engine_ui_btn_press = -1;")
                 p("    }")
-            else:
+            elif not ui_sliders:
                 p("    (void)i; (void)hit; (void)px; (void)py;")
                 p("    (void)sw; (void)sh; (void)down_edge; (void)up_edge;")
+            else:
+                p("    (void)hit;")
             p("    _engine_pointer_was_down = engine_pointer_down;")
             p("}")
             p("")
@@ -17535,6 +18186,7 @@ def _load_scenes_lights_cameras(root, assets):
     _apply_camera_script_view_to_cameras(cameras, objects)
     sw, sh = _ui_layout_screen(root, objects)
     _apply_layout_groups(objects, sw, sh)
+    _apply_slider_visuals(objects)
     _bake_ui_images(
         objects, cameras, sw, sh, asset_guids=assets, hierarchy=hierarchy)
     # Snapshot rect onto hierarchy before dropping layout-only scaffolds so
@@ -18608,6 +19260,7 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
     plan["go_parents"] = _build_go_parents(plan)
     plan["go_siblings"] = _build_go_sibling_indices(plan["go_parents"])
     plan["ui_buttons"] = _build_ui_buttons(plan, analyses)
+    plan["ui_sliders"] = _build_ui_sliders(plan, analyses)
     plan["live_rt"] = _build_rect_transforms(plan)
     rb2d, rb3d, go_rb2d, go_rb3d, rb2d_by_fid, rb3d_by_fid = (
         _build_rigidbody_tables(plan))
