@@ -128,6 +128,9 @@ EXPECTED = {
     "higher.ml": "10\n24\n12\n1112\n1120\n15\n",
     "deep.ml": "5000050000\n10000100000\n",
     "contracts.ml": "1078\n",
+    "division.ml": "4-3-1-4611686018427387904\n",
+    "recursion.ml": "557\n",
+    "tailrec.ml": "1010\n",
     "loop.ml": "2999998\n111\n",
 }
 
@@ -226,6 +229,97 @@ class TestProvedOCaml(unittest.TestCase):
         self.assertNotEqual(rust, self.rust)
         rc, _ = run(compile_rust(rust, "broken"))
         self.assertNotEqual(rc, 0)
+
+
+# What the prover settles about each example, and what it must leave open:
+# an open obligation here is a real overflow or wrap, as much a claim as a
+# proof.  (function, label prefix) -> proved?
+VERDICTS = {
+    "division.ml": {
+        ("ml_half", "ensures"): True,
+        ("ml_half", "`/` by zero"): True,
+        ("ml_half", "OCaml `int` `/` may wrap"): True,       # |x/2| <= |x|
+        ("ml_safe_div", "`/` by zero"): True,
+        ("ml_safe_div", "OCaml `int` `/` may wrap"): False,  # min_int / -1
+        ("ml_rem", "`%` by zero"): True,
+    },
+    "recursion.ml": {
+        ("ml_dist", "ensures"): True,
+        ("ml_dist", "the recursive call's"): True,
+        ("ml_dist", "OCaml `int` `+` may wrap"): True,       # 1 + dist <= n
+        ("ml_sum_to", "ensures"): True,
+        ("ml_sum_to", "the recursive call's"): True,
+        ("ml_sum_to", "OCaml `int` `+` may wrap"): False,    # it does, for
+    },                                                        # large n
+    "tailrec.ml": {
+        ("ml_down", "ensures"): True,
+        ("ml_down", "the recursive call's"): True,
+        ("ml_down", "OCaml `int` `-` may wrap"): True,
+        ("ml_down", "OCaml `int` `+` may wrap"): False,      # acc unbounded
+        ("ml_count_up", "`ml_go3`'s `#[requires]`"): True,
+        ("ml_go3", "ensures"): True,
+        ("ml_go3", "the recursive call's"): True,
+    },
+}
+
+
+class TestRecursionAndDivision(unittest.TestCase):
+    """Signed `/` and `%`, recursion (the contract assumed for smaller
+    arguments, each call owing a smaller `[@@variant]`), and tail recursion
+    -- which ocaml2rust compiles to a loop, and the lift reads back as the
+    recursion it is -- each proved about the compiled Rust."""
+
+    def verdicts(self, prover):
+        out = {}
+        for name in prover.lifted:
+            if name not in prover.own:
+                continue
+            fn = prover.lifted[name]
+            if fn.ensures:
+                out[(name, "ensures")] = bool(prover.contract(name))
+            for label, ok in prover.safety(name):
+                out[(name, label)] = ok
+        return out
+
+    def check(self, example):
+        sys.path.insert(0, os.path.join(ROOT, "..", "RosettaMath"))
+        import rustprove
+        with open(os.path.join(RUN, example)) as fh:
+            rust = ocaml2rust.lower(fh.read())
+        path = os.path.join(tempfile.mkdtemp(), "p.rs")
+        with open(path, "w") as fh:
+            fh.write(rust)
+        prover = rustprove.Prover(*rustprove.load_unit(path))
+        got = self.verdicts(prover)
+        for (fn, prefix), want in VERDICTS[example].items():
+            found = [ok for (f, label), ok in got.items()
+                     if f == fn and label.startswith(prefix)]
+            with self.subTest(example=example, fn=fn, obligation=prefix):
+                self.assertTrue(found, "no such obligation")
+                self.assertEqual(all(found), want)
+        import rustlean
+        if rustlean.find_lean() is not None:
+            verdicts = rustlean.check(prover.certificates, tempfile.mkdtemp())
+            self.assertTrue(all(v.agreed for v in verdicts),
+                            [str(v) for v in verdicts])
+
+    def test_division(self):
+        self.check("division.ml")
+
+    def test_recursion(self):
+        self.check("recursion.ml")
+
+    def test_tail_recursion(self):
+        self.check("tailrec.ml")
+
+    def test_a_recursive_function_needs_a_variant(self):
+        rust = ocaml2rust.lower(
+            "let rec f n = if n <= 0 then 0 else f (n - 1)\n"
+            "  [@@ensures result = 0]\nlet () = print_int (f 3)")
+        import shivyc.rustproof as R
+        with self.assertRaises(R.LiftError) as cm:
+            R.lift(rust, "ml_f")
+        self.assertIn("variant", str(cm.exception))
 
 
 class TestRefused(unittest.TestCase):
