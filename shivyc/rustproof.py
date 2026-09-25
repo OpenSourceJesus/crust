@@ -95,6 +95,20 @@ _SIGNED_WIDTH = {"i8": 8, "i16": 16, "i32": 32, "i64": 64, "i128": 128,
                  "isize": 64, "ml_int": 63}
 
 
+def _substitute(text, mapping):
+    """A fragment expression with each parameter name replaced by the
+    argument's expression -- through Python's own parser, not by text."""
+    import ast
+    tree = ast.parse(text, mode="eval")
+
+    class Sub(ast.NodeTransformer):
+        def visit_Name(self, node):
+            if node.id in mapping:
+                return ast.parse("(%s)" % mapping[node.id], mode="eval").body
+            return node
+    return ast.unparse(Sub().visit(tree))
+
+
 def _int_lit_value(e):
     """k, for the text `Int(k)`; else None."""
     if e.startswith("Int(") and e.endswith(")"):
@@ -353,6 +367,12 @@ class _FnLifter:
         self.pending_conds = []
         self.guards = []
         self.wrap_pending = False       # the next signed op is ml_wrap's
+        self.recursive = False          # calls itself (as `name__rec`)
+        self.tail_shape = False         # body is `let mut s = p; loop {..}`
+        self.tail_slots = None          # the slots, inside that loop
+        self.tail_slot_names = []
+        self.fn_variant = None
+        self.fn_requires = []
         self.maxes = []                 # widths whose `max_uN` is named
         # `uN::MAX` as the symbol rather than the number: in the safety lift,
         # and in a clause lifted for it, so a `requires` guarding the body
@@ -505,7 +525,7 @@ class _FnLifter:
     def run(self):
         clauses = self.attributes()
         for kind, _toks, _line in clauses:
-            if kind in ("invariant", "variant"):
+            if kind == "invariant":
                 self.fail("`#[%s]` belongs on a loop" % kind)
         self.accept("pub")
         self.expect("fn")
@@ -548,6 +568,17 @@ class _FnLifter:
         # Preconditions first: the fragment reads leading `assert`s as the
         # precondition, which is what `#[requires]` is.
         requires = []
+        # A recursive function's `#[variant]`: a measure that each recursive
+        # call must decrease and keep non-negative.  Read here, with the
+        # parameters bound; a self-call substitutes its arguments into it
+        # and into the `requires`.
+        self.self_params = [frag for frag, _ in params]
+        self.self_ret = ret
+        self.fn_variant = None
+        for kind, toks, line in clauses:
+            if kind == "variant":
+                self.fn_variant = self.clause(toks, line, None)
+        self.fn_requires = requires
         # `name__pre`, which a caller's safety lift calls, reads each clause
         # again with `uN::MAX` as the symbol, taken as a parameter: the caller
         # passes its own `max_uN`, so a `requires(tid < usize::MAX)` means the
@@ -580,6 +611,8 @@ class _FnLifter:
 
         self.expect("{")
         n_asserts = len(self.lines)
+        self.tail_shape = self.state is None and self.at_tail_shape(
+            [f for f, _ in params])
         self.block_body("ret" if self.state is None else None, ret)
         if self.state is not None:
             self.emit("return %s" % self.state[1])
@@ -591,7 +624,9 @@ class _FnLifter:
         inits = ["    %s = %s" % (n, "False" if t.kind == "bool" else
                                  "Int(0)" if t.kind == "int" else "0")
                  for n, t in self.nested_locals]
-        self.lines[n_asserts:n_asserts] = inits
+        # before any `if requires:` the safety lift wraps the body in, at the
+        # function's own level, where the range facts go too
+        self.lines[range_at:range_at] = inits
         extra = []
         if self.safety and self.maxes:
             # A value of a Rust integer type is inside its range: a fact the
@@ -651,6 +686,9 @@ class _FnLifter:
                      [(n, t.frag()) for n, t in params], ret.frag(),
                      self.callees)
         out.obligations = self.cond_labels
+        out.recursive = self.recursive
+        out.rec_requires = list(requires)
+        out.rec_variant = self.fn_variant
         used = []
         for _n, t in params + [(None, ret)]:
             if t.kind == "rec" and t.name not in used:
@@ -818,6 +856,20 @@ class _FnLifter:
             e, _ = self.expr()
             self.accept(";")
             self.emit("return %s" % e)
+            return False
+        if t.kind == "kw" and t.val == "loop" and self.tail_shape and \
+                self.tail_slots is None:
+            return self.tail_loop()
+        if t.kind == "kw" and t.val == "continue" and self.tail_slots:
+            self.next()
+            self.accept(";")
+            # the call's arguments in the parameters' order: a slot's value
+            # now where the parameter has one, the parameter where it has
+            # none (a captured value, unchanged round the loop)
+            by_param = {self.lookup(param)[0]: self.lookup(slot)[0]
+                        for slot, param in self.tail_slots}
+            args = [by_param.get(p, p) for p in self.self_params]
+            self.emit("return %s" % self.rec_call(args))
             return False
         if t.kind == "kw" and t.val in ("loop", "break", "continue"):
             self.fail("`%s` is not lifted: a fold needs the loop's bound up "
@@ -1436,9 +1488,6 @@ class _FnLifter:
         right, rty = _as_int(right, rty)
         self._check_ty(_ILIT, lty)
         self._check_ty(_ILIT, rty)
-        if op not in ("+", "-", "*"):
-            self.fail("signed `%s` is not lifted yet (it truncates toward "
-                      "zero, which the fragment's `Int` does not model)" % op)
         width = max(lty.width, rty.width)
         ty = lty if lty.width >= rty.width else rty
         a, b = _int_lit_value(left), _int_lit_value(right)
@@ -1446,14 +1495,27 @@ class _FnLifter:
             # two literals: the value, as a literal -- `0i64 - 2^62` is how a
             # negative bound is written, and as a subtraction it would reach
             # a hypothesis as arithmetic still to be done
-            v = {"+": a + b, "-": a - b, "*": a * b}[op]
+            if op in ("/", "%") and b == 0:
+                self.fail("a constant division by zero")
+            q = abs(a) // abs(b) if b else 0
+            q = q if (a >= 0) == (b >= 0) else -q
+            v = {"+": a + b, "-": a - b, "*": a * b, "/": q,
+                 "%": a - q * b if b else 0}[op]
             wrapped = self.wrap_pending
             self.wrap_pending = False
             lo, hi = _int_range(63 if wrapped else (width or 64))
             if not lo <= v <= hi:
                 self.fail("the constant `%s` does not fit its type" % v)
             return "Int(%d)" % v, ty
-        out = "(%s %s %s)" % (left, op, right)
+        py = {"/": "//", "%": "%"}.get(op, op)   # the fragment reads `//` and
+        out = "(%s %s %s)" % (left, py, right)   # `%` on Int as truncating
+        if op in ("/", "%"):
+            # a zero divisor panics in Rust, raises Division_by_zero in OCaml
+            self.side("(not (%s == Int(0)))" % right, "`%s` by zero" % op)
+            if op == "%":
+                # |a % b| <= |a|: a remainder is always in range
+                self.wrap_pending = False
+                return out, ty
         if self.wrap_pending:
             self.wrap_pending = False       # this op is `ml_wrap`'s argument
             self.int_bound(out, 63, "OCaml `int` `%s` may wrap" % op)
@@ -1467,11 +1529,13 @@ class _FnLifter:
         arithmetic that is `e`, is that it stays in 63 bits -- where the
         reduction is the identity, and OCaml's `int` never wrapped."""
         self.expect("(")
-        self.wrap_pending = True
+        # nested: `ml_wrap(ml_wrap(a * b) + c)` -- the inner one's operation
+        # takes the flag, and this one's is back for the `+` after it
+        outer, self.wrap_pending = self.wrap_pending, True
         try:
             e, ty = self.expr()
         finally:
-            self.wrap_pending = False
+            self.wrap_pending = outer
         self.expect(")")
         return e, _Ty("int", 63)
 
@@ -1671,6 +1735,8 @@ class _FnLifter:
 
     def call(self, fname):
         """A call to another function of the same source, lifted with it."""
+        if fname == self.name and not self.in_clause:
+            return self.self_call()
         callee = self.unit.lift(fname) if fname in self.unit.fn_index \
             else None
         if callee is None:
@@ -1708,9 +1774,109 @@ class _FnLifter:
             ret = _BOOL
         elif callee.ret == "Nat":
             ret = _Ty("nat", 64)
+        elif callee.ret == "Int":
+            ret = _Ty("int", 64)
         else:
             ret = _Ty("rec", 0, callee.ret)
         return "%s(%s)" % (fname, text), ret
+
+    def at_tail_shape(self, frags):
+        """Is the body `let mut s: T = p; .. loop { .. }` and nothing else,
+        each `p` a parameter?  ocaml2rust writes a tail-recursive function
+        so; a `continue` in it is then the call `f(s ..)` it replaced --
+        its only state is the slots, and whatever the body declares is
+        fresh each time round."""
+        names = {rust for scope in self.scopes for rust, (f, _) in
+                 scope.items() if f in frags}
+        j, slots = self.i, []
+        toks = self.toks
+        while toks[j].val == "let" and toks[j + 1].val == "mut":
+            k = j + 2
+            if toks[k].kind != "ident":
+                return False
+            slot = toks[k].val
+            k += 1
+            if toks[k].val == ":":
+                while toks[k].val not in ("=", ";"):
+                    k += 1
+            if toks[k].val != "=" or toks[k + 1].val not in names or \
+                    toks[k + 2].val != ";":
+                return False
+            slots.append((slot, toks[k + 1].val))
+            j = k + 3
+        if not slots or toks[j].val != "loop" or toks[j + 1].val != "{":
+            return False
+        depth, k = 0, j + 1
+        while True:
+            if toks[k].val == "{":
+                depth += 1
+            elif toks[k].val == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            elif toks[k].kind == "eof":
+                return False
+            elif toks[k].val == "break":
+                return False
+            k += 1
+        if toks[k + 1].val != "}":
+            return False
+        self.tail_slot_names = slots
+        return True
+
+    def tail_loop(self):
+        """The `loop` of a tail-recursive body: its statements are the
+        function's, a `return` returns, and a `continue` is the recursive
+        call on the slots' current values."""
+        if self.fn_variant is None:
+            self.fail("`%s` loops by tail calls: it needs a "
+                      "`#[variant(e)]`, a measure each round decreases"
+                      % self.name)
+        self.next()
+        self.expect("{")
+        self.tail_slots = self.tail_slot_names
+        try:
+            self.block_body("ret", self.self_ret)
+        finally:
+            self.tail_slots = []
+        return False
+
+    def rec_call(self, args):
+        """`name__rec(args)`, owing the `requires` at `args` and a smaller
+        non-negative `#[variant]` -- what the induction on the variant needs
+        of every recursive call."""
+        self.recursive = True
+        sub = lambda text: _substitute(text, dict(zip(self.self_params,
+                                                      args)))
+        v_now, v_next = self.fn_variant, sub(self.fn_variant)
+        owed = [sub(r) for r in self.fn_requires] + [
+            "(Int(0) <= %s)" % v_next, "(%s < %s)" % (v_next, v_now)]
+        self.side("(%s)" % " and ".join(owed),
+                  "the recursive call's `requires` and `variant`")
+        return "%s__rec(%s)" % (self.name, ", ".join(args))
+
+    def self_call(self):
+        """A call of the function to itself.  The model reads `name__rec`:
+        a function about which the proof may assume only the contract, and
+        that only for arguments meeting the `requires` with a smaller
+        non-negative `#[variant]` -- which is what this call site owes."""
+        if self.fn_variant is None:
+            self.fail("`%s` calls itself: a recursive function needs a "
+                      "`#[variant(e)]`, a measure each call decreases"
+                      % self.name)
+        self.expect("(")
+        args = []
+        while not self.at(")"):
+            e, ty = self.binary(0)
+            args.append(_as_int(e, ty)[0] if self.self_ret.kind == "int"
+                        or ty.kind == "nat" and ty.width == 0 else e)
+            if not self.accept(","):
+                break
+        self.expect(")")
+        if len(args) != len(self.self_params):
+            self.fail("`%s` takes %d argument(s)" % (self.name,
+                                                     len(self.self_params)))
+        return self.rec_call(args), self.self_ret
 
 
 def _strip_old(toks, mutable, lifter, state=None):
