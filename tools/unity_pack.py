@@ -8595,6 +8595,8 @@ def analyze_script(path, text=None, shallow=False):
         bscan_m = _blank_index_ranges(bscan, nested)
         fields = _fields_in(body_m, bscan_m, body_abs=brace + 1)
         methods = _methods_in(body_m, bscan_m, body_abs=brace + 1)
+        methods.extend(
+            _properties_as_methods(body_m, bscan_m, body_abs=brace + 1))
         refs = []
         for f in fields:
             if f["ty"] not in _PRIM and f["ty"] not in (
@@ -8913,6 +8915,57 @@ def _methods_in(body, bscan, body_abs=0):
             "public": bool(re.search(r"\bpublic\b", decl)),
             "static": bool(re.search(r"\bstatic\b", decl)),
         })
+    return out
+
+
+def _properties_as_methods(body, bscan, body_abs=0):
+    """C# properties → ``get_Name`` / ``set_Name`` (UnityEvent wiring).
+
+    PersistentListenerMode targets property setters as ``set_Volume`` etc.
+    """
+    import tools.cpprust as cpprust
+    out = []
+    head = re.compile(
+        r"(?m)^[ \t]*(?:public|private|protected|internal)?"
+        r"[ \t]*(static[ \t]+)?(?:override[ \t]+)?(?:virtual[ \t]+)?"
+        r"([\w.<>]+)[ \t]+(\w+)[ \t\r\n]*\{")
+    for m in head.finditer(bscan):
+        is_static = bool(m.group(1))
+        ret, name = m.group(2).strip(), m.group(3)
+        if ret in ("if", "else", "for", "while", "switch", "catch", "using",
+                   "lock", "get", "set", "add", "remove"):
+            continue
+        # Skip methods: ``ret Name(`` was already handled; property has no `(`.
+        if m.start() > 0 and bscan[m.start() - 1] == "(":
+            continue
+        open_i = m.end() - 1
+        if open_i < 0 or bscan[open_i] != "{":
+            continue
+        close = cpprust._match_brace(bscan, open_i)
+        if close is None:
+            continue
+        prop_body = body[open_i + 1:close]
+        prop_scan = bscan[open_i + 1:close]
+        decl = bscan[m.start():open_i + 1]
+        is_public = bool(re.search(r"\bpublic\b", decl))
+        # set { ... } — implicit ``value`` parameter.
+        # Only setters are extracted (UnityEvent wires ``set_Name``); getters
+        # returning non-void would break the void method emitter.
+        sm = re.search(r"(?m)^\s*set\s*[ \t\r\n]*\{", prop_scan)
+        if sm:
+            sopen = sm.end() - 1
+            sclose = cpprust._match_brace(prop_scan, sopen)
+            if sclose is not None:
+                out.append({
+                    "ret": "void",
+                    "name": "set_" + name,
+                    "args": "%s value" % ret,
+                    "body": prop_body[sopen + 1:sclose],
+                    "body_abs": int(body_abs) + int(open_i + 1) + sopen + 1,
+                    "src": "",
+                    "public": is_public,
+                    "static": is_static,
+                })
     return out
 
 
