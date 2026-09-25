@@ -148,8 +148,37 @@ compiled code and, separately, that no arithmetic in it wraps: for
 `iabs` without the `requires` that obligation stays open, because `abs
 min_int` is `min_int` in OCaml; with it, the obligation is proved. Lean 4
 accepts every settled obligation with no axioms (`TestProvedOCaml`). Crust
-also checks the contract at run time. Not lifted yet: data enums, pointers,
-recursion and loops in the emitted code, signed `/` and `%`.
+also checks the contract at run time.
+
+**Division.** `/` and `mod` truncate toward zero, in the model as in OCaml
+and Rust. Each owes a divisor that is not zero (OCaml's
+`Division_by_zero`), and `/` owes staying in 63 bits: only `min_int / -1`
+leaves them, and OCaml wraps it to `min_int` -- which the emitted code now
+does too (`ml_wrap(a / b)`; it printed 2^62 before).
+
+**Recursion.** A recursive function carries `[@@variant e]`, an `int`
+measure. A recursive call is read as a variable `g` about which a proof
+may assume only the contract, and only for arguments meeting the
+`requires` with a smaller, non-negative variant; each call site owes
+exactly that as an obligation of its own. Every theorem about the function
+-- contract and safety alike -- is then the step of a well-founded
+induction on the variant, whose conclusion is the theorem for the function
+itself (as Dafny and Why3 reason about recursion). A function that calls a
+recursive one is proved with the callee's contract as a hypothesis, the
+callee's own theorems proving it.
+
+**Tail recursion.** ocaml2rust compiles a tail-recursive function to
+`let mut s = p; .. loop { .. continue .. }`. The lift recognises that
+shape -- its only state is the slots, whatever the body declares is fresh
+each time round -- and reads each `continue` back as the recursive call on
+the slots' current values; the same induction proves it.
+`examples/ocaml/run/{division,recursion,tailrec}.ml` pin what is proved
+and what is left open (`sum_to`'s `+` does overflow for large `n`, an
+unbounded accumulator can wrap, `min_int / -1` does) in
+`TestRecursionAndDivision`, with Lean agreeing on every settled one.
+
+Not lifted yet: data enums and the pointers into them, so list and tree
+code compiles and runs but is not proved; mutual recursion.
 
 ### Fixes to the Rust front end this needed
 
