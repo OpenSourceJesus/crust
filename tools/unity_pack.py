@@ -1491,17 +1491,19 @@ def _parse_sprite_sheet(asset_path):
 
 
 def _crop_rgba(rgba, tw, th, x, y, cw, ch):
-    """Crop RGBA bytes; Unity sprite rect ``y`` is from the texture bottom."""
+    """Crop RGBA bytes; Unity sprite rect ``y`` is from the texture bottom.
+
+    ``rgba`` from ``_load_png_rgba`` is already bottom-up (row 0 = texture
+    bottom, same as ``_sample_rgba``). Unity's rect ``y`` is that same origin,
+    so the crop starts at row ``y`` — do **not** convert as if the buffer were
+    PNG top-down (that pulls the wrong half when the slice is shorter than the
+    atlas, e.g. Sound Toggle icons padded above the sprite rect).
+    """
     tw, th = int(tw), int(th)
     x0 = max(0, min(tw, int(round(x))))
-    # Unity: y from bottom → PNG row from top.
-    y_bottom = int(round(y))
+    y0 = max(0, int(round(y)))
     ch_i = max(0, int(round(ch)))
     cw_i = max(0, int(round(cw)))
-    y0 = th - y_bottom - ch_i
-    if y0 < 0:
-        ch_i += y0
-        y0 = 0
     if x0 + cw_i > tw:
         cw_i = tw - x0
     if y0 + ch_i > th:

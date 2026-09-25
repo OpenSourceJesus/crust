@@ -6298,6 +6298,103 @@ class TestSystems(unittest.TestCase):
         self.assertEqual(crgba[0:4], b"\x00\xff\x00\xff")
 
 
+    def test_sprite_sheet_crop_uses_bottom_up_y(self):
+        """Sheet rect y is bottom-origin on an already bottom-up buffer.
+
+        ``_load_png_rgba`` flips PNG rows (row 0 = texture bottom). Cropping
+        with ``y0 = th - y - h`` (top-down conversion) grabs the wrong band
+        when the slice is shorter than the atlas — icon appears cut off at
+        the RectTransform bottom while the hit rect stays full.
+        """
+        import struct, zlib
+
+        def chunk(tag, body):
+            return (struct.pack(">I", len(body)) + tag + body
+                    + struct.pack(">I", zlib.crc32(tag + body) & 0xffffffff))
+
+        # Atlas 8×10. Unity rect (x=0,y=1,w=8,h=4): bottom-up rows 1..4.
+        # Wrong top-down conversion would take rows 5..8 instead.
+        # PNG top-down row r → buffer row (9-r). Paint RED into buffer 1..4
+        # (PNG rows 8..5) and GREEN decoy into buffer 5..8 (PNG rows 4..1).
+        w, h = 8, 10
+        red, green, clear = b"\xff\x00\x00\xff", b"\x00\xff\x00\xff", b"\x00\x00\x00\x00"
+        raw = b""
+        for png_y in range(h):
+            buf_y = (h - 1) - png_y
+            if 1 <= buf_y <= 4:
+                pix = red
+            elif 5 <= buf_y <= 8:
+                pix = green
+            else:
+                pix = clear
+            raw += b"\x00" + pix * w
+        root = tempfile.mkdtemp(prefix="upack-sheet-y-")
+        spr = os.path.join(root, "Assets", "Sprites")
+        os.makedirs(spr)
+        png = os.path.join(spr, "pad.png")
+        with open(png, "wb") as out:
+            out.write(
+                b"\x89PNG\r\n\x1a\n"
+                + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(raw, 9))
+                + chunk(b"IEND", b""))
+        fid = 777001
+        with open(png + ".meta", "w") as f:
+            f.write(
+                "guid: b22b22b22b22b22b22b22b22b22b22b2\n"
+                "TextureImporter:\n"
+                "  spriteMode: 2\n"
+                "  spritePixelsToUnits: 100\n"
+                "  spriteSheet:\n"
+                "    serializedVersion: 2\n"
+                "    sprites:\n"
+                "    - serializedVersion: 2\n"
+                "      name: icon\n"
+                "      rect:\n"
+                "        serializedVersion: 2\n"
+                "        x: 0\n"
+                "        y: 1\n"
+                "        width: 8\n"
+                "        height: 4\n"
+                "      border: {x: 0, y: 0, z: 0, w: 0}\n"
+                "      internalID: %d\n"
+                "    nameFileIdTable:\n"
+                "      icon: %d\n"
+                % (fid, fid)
+            )
+        unity_pack._SPRITE_SHEET_CACHE.clear()
+        cw, ch, crgba, _b = unity_pack._load_sprite_rgba(png, fid)
+        self.assertEqual((cw, ch), (8, 4))
+        # Every texel must be the RED slice — not the GREEN padding band.
+        for i in range(0, len(crgba), 4):
+            self.assertEqual(crgba[i:i + 4], red,
+                             "crop must use bottom-up y, not th-y-h")
+        # Direct crop helper agrees.
+        _tw, _th, full = unity_pack._load_png_rgba(png)
+        cw2, ch2, c2 = unity_pack._crop_rgba(full, 8, 10, 0, 1, 8, 4)
+        self.assertEqual((cw2, ch2), (8, 4))
+        self.assertEqual(c2, crgba)
+
+        # Real atlas regression: padded Multiple-mode icon (art near bottom).
+        slime = os.path.join(
+            ROOT, "examples", "unity_pack", "Slime Jump", "Assets",
+            "Art", "Textures", "Sound Toggle (Off).png")
+        if os.path.isfile(slime):
+            unity_pack._SPRITE_SHEET_CACHE.clear()
+            sw, sh, srgba, _sb = unity_pack._load_sprite_rgba(
+                slime, -6433588549950406020)
+            self.assertEqual((sw, sh), (115, 101))
+            # Bottom-up: opaque art fills most of the slice (not ~40% top band).
+            rows_with_alpha = []
+            for y in range(sh):
+                if any(srgba[(y * sw + x) * 4 + 3] > 0 for x in range(sw)):
+                    rows_with_alpha.append(y)
+            self.assertTrue(rows_with_alpha)
+            span = rows_with_alpha[-1] - rows_with_alpha[0] + 1
+            self.assertGreaterEqual(
+                span, 90,
+                "sheet crop must keep full icon height, not half-clip")
+
     def test_authored_m_isactive_zero_seeds_go_active(self):
         """Scene m_IsActive: 0 → _engine_go_active seed 0 (not forced on)."""
         root = tempfile.mkdtemp(prefix="upack-isactive-")
