@@ -280,11 +280,21 @@ before scaffold drop so the live GO parent chain keeps rect state.
 Authored
 `TextMeshProUGUI` draws when `m_fontAsset` resolves (Assets or Packages /
 PackageCache): SDF atlas + glyph tables bake `m_text` into a UI sprite
-tinted by `m_fontColor`. Button `m_OnClick` persistent `SetActive` calls
-fire on pointer **release** while still over the button that received
-pointer-down (`engine_pointer_x/y/down`, screen space, origin bottom-left) —
-mouse-off does not cancel the pressed visual; releasing off-button skips
-`onClick`. Inactive parents hide children (`activeInHierarchy`). Authored
+tinted by `m_fontColor`. Button `m_OnClick` persistent calls fire on pointer
+**release** while still over the button that received pointer-down
+(`engine_pointer_x/y/down`, screen space, origin bottom-left) — mouse-off does
+not cancel the pressed visual; releasing off-button skips `onClick`. Supported
+targets:
+- `GameObject.SetActive(bool)` (PersistentListenerMode.Bool) via GO fileID
+- packed MonoBehaviour public instance methods with a `string` argument
+  (PersistentListenerMode.String), including PrefabInstance overrides that
+  target a stripped MB fileID — resolved through `mb_ids` / script guid →
+  class instance; `engine_ui_tick` calls `Class_Method(instance, "arg")`.
+  Only methods that exist as lowered C on packed classes are wired. Bodies
+  that still call `SceneManager.LoadScene` / custom scene loaders may stub;
+  the click still invokes the method. Void MB methods (mode Void) are also
+  emitted when present.
+Inactive parents hide children (`activeInHierarchy`). Authored
 `m_IsActive: 0` seeds `_engine_go_active` at load (not forced on).
 Stripped `PrefabInstance` roots (e.g. UI Button prefabs) are hydrated from
 the source `.prefab` + modifications so TMP children and layout groups see
