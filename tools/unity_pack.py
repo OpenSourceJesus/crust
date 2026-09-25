@@ -2283,6 +2283,8 @@ def _parse_ui_tmp(block, asset_guids):
     fs = re.search(r"(?m)^\s+m_fontSize:\s*([0-9.eE+-]+)", block)
     ha = re.search(r"(?m)^\s+m_HorizontalAlignment:\s*(\d+)", block)
     va = re.search(r"(?m)^\s+m_VerticalAlignment:\s*(\d+)", block)
+    # 0 Overflow, 1 Ellipsis, 2 Masking, 3 Truncate, …
+    ov = re.search(r"(?m)^\s+m_overflowMode:\s*(\d+)", block)
     has_font = bool(font_guid and font_guid in (asset_guids or {}))
     return {
         "text": text,
@@ -2295,6 +2297,7 @@ def _parse_ui_tmp(block, asset_guids):
         "font_size": float(fs.group(1)) if fs else 14.0,
         "h_align": int(ha.group(1)) if ha else 1,
         "v_align": int(va.group(1)) if va else 256,
+        "overflow_mode": int(ov.group(1)) if ov else 0,
         "enabled": int(en.group(1)) if en else 1,
     }
 
@@ -3068,13 +3071,19 @@ def _sdf_coverage(byte_v):
 
 
 def _rasterize_tmp_text(font, text, font_size, color, box_w, box_h,
-                        h_align, v_align):
-    """Bake plain TMP string into an RGBA bitmap (y=0 bottom, OpenGL)."""
-    bw = max(1, int(round(float(box_w))))
-    bh = max(1, int(round(float(box_h))))
-    out = bytearray(bw * bh * 4)
+                        h_align, v_align, overflow_mode=0):
+    """Bake plain TMP string into an RGBA bitmap (y=0 bottom, OpenGL).
+
+    Returns ``(bw, bh, rgba, shift_x, shift_y)`` where shift is the offset of
+    the expanded bitmap center from the authored RectTransform center (pixels,
+    +x right / +y up). Overflow mode 0 (TMP Overflow) expands the bake so
+    glyphs that extend past the rect are not clipped — Unity still draws
+    them; Truncate/Ellipsis/Masking keep the rect clip.
+    """
+    bw0 = max(1, int(round(float(box_w))))
+    bh0 = max(1, int(round(float(box_h))))
     if not font or not text:
-        return bw, bh, bytes(out)
+        return bw0, bh0, bytes(bytearray(bw0 * bh0 * 4)), 0.0, 0.0
     ps = float(font["point_size"]) or 1.0
     scale = float(font_size) / ps
     glyphs = []
@@ -3093,18 +3102,55 @@ def _rasterize_tmp_text(font, text, font_size, color, box_w, box_h,
     visual_h = ascent - descent
     # Horizontal: 1 left, 2 center, 4 right (TMP bit flags).
     if h_align & 4:
-        pen_x = float(bw) - total_w
+        pen_x0 = float(bw0) - total_w
     elif h_align & 2:
-        pen_x = (float(bw) - total_w) * 0.5
+        pen_x0 = (float(bw0) - total_w) * 0.5
     else:
-        pen_x = 0.0
-    # Vertical: 256 top, 512 middle, 1024 bottom.
+        pen_x0 = 0.0
+    # Vertical: 256 top, 512 middle, 1024 bottom — relative to authored rect.
     if v_align & 1024:
-        baseline = -descent
+        baseline0 = -descent
     elif v_align & 512:
-        baseline = (float(bh) - visual_h) * 0.5 - descent
+        baseline0 = (float(bh0) - visual_h) * 0.5 - descent
     else:
-        baseline = float(bh) - ascent
+        baseline0 = float(bh0) - ascent
+    # Glyph AABB in authored-rect pixel space (may extend past edges).
+    min_x = 0.0
+    min_y = 0.0
+    max_x = float(bw0)
+    max_y = float(bh0)
+    pen = pen_x0
+    for g in glyphs:
+        gw = max(float(g["w"]) * scale, 0.0)
+        gh = max(float(g["h"]) * scale, 0.0)
+        gx0 = pen + float(g["bx"]) * scale
+        gy1 = baseline0 + float(g["by"]) * scale
+        gy0 = gy1 - gh
+        if gx0 < min_x:
+            min_x = gx0
+        if gx0 + gw > max_x:
+            max_x = gx0 + gw
+        if gy0 < min_y:
+            min_y = gy0
+        if gy1 > max_y:
+            max_y = gy1
+        pen += float(g["adv"]) * scale
+    # Overflow (0): expand. Other modes keep the rect (Unity clips / ellipsis).
+    if int(overflow_mode or 0) == 0:
+        pad_l = max(0.0, -min_x)
+        pad_b = max(0.0, -min_y)
+        pad_r = max(0.0, max_x - float(bw0))
+        pad_t = max(0.0, max_y - float(bh0))
+    else:
+        pad_l = pad_b = pad_r = pad_t = 0.0
+    bw = max(1, int(math.ceil(float(bw0) + pad_l + pad_r)))
+    bh = max(1, int(math.ceil(float(bh0) + pad_b + pad_t)))
+    # Expanded bitmap center vs authored rect center (screen +y up).
+    shift_x = (pad_r - pad_l) * 0.5
+    shift_y = (pad_t - pad_b) * 0.5
+    pen_x = pen_x0 + pad_l
+    baseline = baseline0 + pad_b
+    out = bytearray(bw * bh * 4)
     aw = int(font["atlas_w"])
     ah = int(font["atlas_h"])
     atlas = font["atlas"]
@@ -3638,17 +3684,21 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None,
         fs = float(tmp.get("font_size") or 14.0)
         if lh > 1e-6:
             fs = fs * (abs(float(rh)) / float(lh))
-        tw, th, rgba = _rasterize_tmp_text(
+        tw, th, rgba, shift_x, shift_y = _rasterize_tmp_text(
             font, tmp["text"], fs,
             (1.0, 1.0, 1.0, 1.0),  # color via sprite tint (m_fontColor)
             rw, rh,
             int(tmp.get("h_align") or 1),
-            int(tmp.get("v_align") or 256))
+            int(tmp.get("v_align") or 256),
+            int(tmp.get("overflow_mode") or 0))
+        # Overflow expands the bake; keep authored alignment by shifting center.
+        draw_cx = float(cx) + float(shift_x)
+        draw_cy = float(cy) + float(shift_y)
         bake_guid = "tmpbake:%s:%s" % (
             o.get("go_id") or o.get("name") or "tmp",
             tmp.get("font_guid") or "")
         _apply_layout(
-            o, cx, cy, rw, rh, canvas, "ui_tmp",
+            o, draw_cx, draw_cy, tw, th, canvas, "ui_tmp",
             (tmp.get("r", 1.0), tmp.get("g", 1.0),
              tmp.get("b", 1.0), tmp.get("a", 1.0)),
             {

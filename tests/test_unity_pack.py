@@ -6855,7 +6855,9 @@ class TestSystems(unittest.TestCase):
         self.assertIn("engine_pointer_x", eng)
         self.assertIn("_engine_ui_btn_tint", eng)
         self.assertIn("_engine_ui_btn_col_h", eng)
-        self.assertIn("_spr_ncx", eng)
+        self.assertIn("_engine_ui_screen_rect", eng)
+        self.assertIn("_engine_rt_apos_x", eng)
+        self.assertNotIn("static const float _spr_ncx[]", eng)
         self.assertIn("_spr_btn", eng)
         self.assertIn("/* Button_Text SpriteRenderer */", eng)
         data_c = open(os.path.join(d, "data.c")).read()
@@ -7381,6 +7383,34 @@ class TestSystems(unittest.TestCase):
         self.assertGreater(
             int(bsp.get("sorting_order") or 0),
             int(psp.get("sorting_order") or 0))
+
+    def test_tmp_overflow_expands_bake_past_rect(self):
+        """TMP Overflow (mode 0): glyphs taller than the rect are not clipped.
+
+        Settings-menu labels use fontSize > Rect height with top align; Unity
+        still draws descenders. Truncate keeps the authored clip box.
+        """
+        font_path = os.path.join(
+            ROOT, "examples", "unity_pack", "Slime Jump", "Assets",
+            "Others", "Fonts", "Montserrat-Black SDF.asset")
+        if not os.path.isfile(font_path):
+            self.skipTest("Montserrat SDF font missing")
+        unity_pack._TMP_FONT_CACHE.clear()
+        font = unity_pack._load_tmp_font_asset(font_path)
+        self.assertIsNotNone(font)
+        # Sound-like: size 76 in a 64px-tall top-aligned box.
+        tw, th, rgba, _sx, sy = unity_pack._rasterize_tmp_text(
+            font, "Sound", 76, (1, 1, 1, 1), 264, 64, 1, 256, 0)
+        self.assertGreater(th, 64)
+        self.assertLess(sy, 0.0)  # expanded downward past rect bottom
+        rows = [sum(rgba[y * tw * 4 + 3:(y + 1) * tw * 4:4])
+                for y in range(th)]
+        nz = [i for i, a in enumerate(rows) if a > 0]
+        self.assertTrue(nz)
+        self.assertEqual(nz[0], 0)  # ink reaches bake bottom (no clip)
+        tw2, th2, _r2, _sx2, _sy2 = unity_pack._rasterize_tmp_text(
+            font, "Sound", 76, (1, 1, 1, 1), 264, 64, 1, 256, 3)
+        self.assertEqual(th2, 64)
 
     def test_preserve_aspect_top_left_pivot_draw_flush(self):
         """preserveAspect + pivot (0,1): sprite TL flush with rect TL."""
@@ -11430,5 +11460,3 @@ class TestSystemsRuns(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
