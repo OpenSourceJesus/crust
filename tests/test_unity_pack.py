@@ -2664,6 +2664,593 @@ class TestSystems(unittest.TestCase):
         self.assertIn("CosmeticsMenu_equipped[n]", eng)
         self.assertNotIn("CosmeticsMenu.equipped", eng)
 
+    def _emitted_body(self, eng, sym):
+        """The lowered body of one emitted engine function."""
+        m = re.search(
+            r"(?ms)^static (?:void|int) %s\([^)]*\)\s*\{\n(.*?)^\}"
+            % re.escape(sym), eng)
+        self.assertIsNotNone(m, "%s not emitted" % sym)
+        return m.group(1)
+
+    def _write_iupdatable_project(self):
+        """A `_Scrollbar`-shaped project: static IUpdatable[], nested `new`."""
+        root = tempfile.mkdtemp(prefix="upack-iupd-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "IUpdatable.cs"), "w") as f:
+            f.write(
+                "public interface IUpdatable\n"
+                "{\n"
+                "    void DoUpdate ();\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "IUpdatable.cs.meta"), "w") as f:
+            f.write("guid: iupdiupdiupdiupdiupdiupdiupd0001\n")
+        with open(os.path.join(scripts, "GM.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class GM : MonoBehaviour {\n"
+                "    public static IUpdatable[] updatables ="
+                " new IUpdatable[0];\n"
+                "    void Update() {\n"
+                "        for (int i = 0; i < updatables.Length; i ++) {\n"
+                "            IUpdatable updatable = updatables[i];\n"
+                "            updatable.DoUpdate ();\n"
+                "        }\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "GM.cs.meta"), "w") as f:
+            f.write("guid: gmgmgmgmgmgmgmgmgmgmgmgmgmgm0001\n")
+        with open(os.path.join(scripts, "Host.cs"), "w") as f:
+            f.write(
+                "using System;\n"
+                "using Extensions;\n"
+                "using UnityEngine;\n"
+                "public class Host : MonoBehaviour, IUpdatable {\n"
+                "    public float value;\n"
+                "    U u;\n"
+                "    void Awake() {\n"
+                "        u = new U(this);\n"
+                "        GM.updatables = GM.updatables.Add(this);\n"
+                "        GM.updatables = GM.updatables.Add(u);\n"
+                "    }\n"
+                "    public void StartDrag() {\n"
+                "        GM.updatables = GM.updatables.Add(u);\n"
+                "    }\n"
+                "    public void EndDrag() {\n"
+                "        GM.updatables = GM.updatables.Remove(u);\n"
+                "    }\n"
+                "    public void OnDisable() {\n"
+                "        GM.updatables = GM.updatables.Remove(this);\n"
+                "    }\n"
+                "    public void DoUpdate() {\n"
+                "        value = value + 1f;\n"
+                "        Console.WriteLine(\"host_tick\");\n"
+                "    }\n"
+                "    class U : IUpdatable {\n"
+                "        Host host;\n"
+                "        public U (Host host) {\n"
+                "            this.host = host;\n"
+                "        }\n"
+                "        public void DoUpdate () {\n"
+                "            host.value = host.value + 2f;\n"
+                "            Console.WriteLine(\"u_tick\");\n"
+                "        }\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Host.cs.meta"), "w") as f:
+            f.write("guid: hosthosthosthosthosthosthost0001\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Host\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: hosthosthosthosthosthosthost0001}\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: GM\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "--- !u!4 &11\nTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &12\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: gmgmgmgmgmgmgmgmgmgmgmgmgmgm0001}\n"
+            )
+        return root
+
+    def test_static_iupdatable_array_nested_new_and_tick(self):
+        """static IUpdatable[] + nested `new` + the DoUpdate tick (_Scrollbar)."""
+        root = self._write_iupdatable_project()
+        d = tempfile.mkdtemp(prefix="upack-iupd-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.cpp")) as f:
+            eng = f.read()
+        # IUpdatable[] is a tagged ref vector: class id plus instance.
+        self.assertIn("struct _engine_iref {", eng)
+        self.assertIn("static std::vector<_engine_iref> GM_updatables;", eng)
+        self.assertNotIn("GM.updatables", eng)
+        # `new U(this)` allocates a pool slot and runs the constructor.
+        awake = self._emitted_body(eng, "Host_Awake")
+        self.assertIn("Object_New_U(i)", awake)
+        self.assertNotIn("unlowered C#", awake)
+        self.assertIn("U_U((unsigned)ex, host_);", eng)
+        # `this.host = host` — the parameter is renamed, not self-assigned.
+        ctor = self._emitted_body(eng, "U_U")
+        self.assertIn("U_set_host(i, host_)", ctor)
+        self.assertNotIn("unlowered C#", ctor)
+        # Extensions Add / Remove on the static array.
+        start = self._emitted_body(eng, "Host_StartDrag")
+        self.assertIn("_engine_iref_push(GM_updatables, ", start)
+        self.assertNotIn("unlowered C#", start)
+        end = self._emitted_body(eng, "Host_EndDrag")
+        self.assertIn("_engine_iref_erase(GM_updatables, ", end)
+        self.assertNotIn("unlowered C#", end)
+        dis = self._emitted_body(eng, "Host_OnDisable")
+        self.assertIn("_engine_iref_erase(GM_updatables, ", dis)
+        self.assertNotIn("unlowered C#", dis)
+        self.assertIn("push_back", eng)
+        # The authored Update loop over IUpdatable[] runs as a tick.
+        tick = self._emitted_body(eng, "_engine_iupdatable_tick")
+        self.assertIn("GM_updatables.size()", tick)
+        self.assertIn("Host_DoUpdate(_inst);", tick)
+        self.assertIn("U_DoUpdate(_inst);", tick)
+        self.assertIn("    _engine_iupdatable_tick();", eng)
+        self.assertNotIn("unlowered C#", self._emitted_body(eng, "U_DoUpdate"))
+
+    @needs_cc
+    def test_iupdatable_tick_runs_both_implementors(self):
+        """A tick calls DoUpdate on the MB and on the nested class it made."""
+        root = self._write_iupdatable_project()
+        d = tempfile.mkdtemp(prefix="upack-iupd-run-")
+        unity_pack.pack(root, d)
+        host = os.path.join(d, "host.c")
+        with open(host, "w") as f:
+            f.write(
+                "void engine_tick(void);\n"
+                "extern float Time_deltaTime;\n"
+                "int main(void) {\n"
+                "  Time_deltaTime = 0.1f;\n"
+                # Awake registers Host and its U; the tick runs both.
+                "  engine_tick();\n"
+                "  engine_tick();\n"
+                "  return 0;\n"
+                "}\n"
+            )
+        for src, opt in (("engine.c", "-O2"), ("data.c", "-O0")):
+            r = subprocess.run(
+                [_CC, opt, "-c", "-o",
+                 os.path.join(d, src.replace(".c", ".o")),
+                 os.path.join(d, src)],
+                capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+        exe = os.path.join(d, "game")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host,
+             os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        # Awake pushes the Host and the U it made; the tick runs both, in
+        # the order the array holds them, every frame.
+        self.assertEqual(
+            run.stdout.split(),
+            ["host_tick", "u_tick", "host_tick", "u_tick"])
+
+    def test_static_ref_array_of_packed_class_add_remove(self):
+        """static Sel[] instances = instances.Add(this) → std::vector<int>."""
+        root = tempfile.mkdtemp(prefix="upack-refarr-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Sel.cs"), "w") as f:
+            f.write(
+                "using Extensions;\n"
+                "using UnityEngine;\n"
+                "public class Sel : MonoBehaviour {\n"
+                "    public static Sel[] instances = new Sel[0];\n"
+                "    public void Register() {\n"
+                "        instances = instances.Add(this);\n"
+                "    }\n"
+                "    public void OnDisable() {\n"
+                "        instances = instances.Remove(this);\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Sel.cs.meta"), "w") as f:
+            f.write("guid: selselselselselselselselsel0001\n")
+        with open(os.path.join(scripts, "Menu.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Menu : MonoBehaviour {\n"
+                "    public int count;\n"
+                "    void Update() {\n"
+                "        count = Sel.instances.Length;\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Menu.cs.meta"), "w") as f:
+            f.write("guid: menumenumenumenumenumenumenu0001\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Sel\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: selselselselselselselselsel0001}\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Menu\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "--- !u!4 &11\nTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &12\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: menumenumenumenumenumenumenu0001}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-refarr-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.cpp")) as f:
+            eng = f.read()
+        # A T[] of a packed class holds indices — no class tag needed.
+        self.assertIn("static std::vector<int> Sel_instances;", eng)
+        reg = self._emitted_body(eng, "Sel_Register")
+        self.assertIn("Sel_instances.push_back(i);", reg)
+        self.assertNotIn("unlowered C#", reg)
+        dis = self._emitted_body(eng, "Sel_OnDisable")
+        self.assertIn("_engine_ref_erase(Sel_instances, i);", dis)
+        self.assertNotIn("unlowered C#", dis)
+        upd = self._emitted_body(eng, "Menu_Update")
+        self.assertIn("Sel_instances.size()", upd)
+        self.assertNotIn("unlowered C#", upd)
+        self.assertNotIn("Sel.instances", eng)
+
+    def _write_scrollbar_like_project(self):
+        """A `_Scrollbar`-shaped project: Transform / uGUI fields on a scene
+        Scrollbar, a nested drag helper, and the GetWorldRect extension."""
+        root = tempfile.mkdtemp(prefix="upack-bar-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+
+        def w(name, text, guid):
+            with open(os.path.join(scripts, name), "w") as f:
+                f.write(text)
+            with open(os.path.join(scripts, name + ".meta"), "w") as f:
+                f.write("guid: %s\n" % guid)
+
+        w("IUpdatable.cs",
+          "public interface IUpdatable\n{\n    void DoUpdate ();\n}\n",
+          "1a" * 16)
+        w("RectTransformExtensions.cs",
+          "using UnityEngine;\n"
+          "namespace Extensions {\n"
+          "  public static class RectTransformExtensions {\n"
+          "    public static Rect GetWorldRect (this RectTransform r) {\n"
+          "      Vector2 min = r.TransformPoint(r.rect.min);\n"
+          "      Vector2 max = r.TransformPoint(r.rect.max);\n"
+          "      return Rect.MinMaxRect(min.x, min.y, max.x, max.y);\n"
+          "    }\n"
+          "  }\n"
+          "}\n",
+          "2b" * 16)
+        w("GM.cs",
+          "using UnityEngine;\n"
+          "public class GM : MonoBehaviour {\n"
+          "    public static IUpdatable[] updatables = new IUpdatable[0];\n"
+          "    void Update () {\n"
+          "        for (int i = 0; i < updatables.Length; i ++) {\n"
+          "            IUpdatable updatable = updatables[i];\n"
+          "            updatable.DoUpdate ();\n"
+          "        }\n"
+          "    }\n"
+          "}\n",
+          "3c" * 16)
+        w("Bar.cs",
+          "using Extensions;\n"
+          "using UnityEngine;\n"
+          "using UnityEngine.UI;\n"
+          "using UnityEngine.InputSystem;\n"
+          "public class Bar : MonoBehaviour, IUpdatable {\n"
+          "  public Scrollbar scrollbar;\n"
+          "  public Transform handleTrs;\n"
+          "  public RectTransform contentRectTrs;\n"
+          "  DragUpdater dragUpdater;\n"
+          "  void Awake () {\n"
+          "    dragUpdater = new DragUpdater(this);\n"
+          "    RectTransform slidingArea = (RectTransform) handleTrs.parent;\n"
+          "    handleTrs.localPosition = Vector2.up * (slidingArea.rect.height"
+          " * scrollbar.value - slidingArea.rect.height / 2);\n"
+          "  }\n"
+          "  public void StartDrag () {\n"
+          "    GM.updatables = GM.updatables.Add(dragUpdater);\n"
+          "  }\n"
+          "  public void EndDrag () {\n"
+          "    GM.updatables = GM.updatables.Remove(dragUpdater);\n"
+          "  }\n"
+          "  public void DoUpdate () {\n"
+          "    RectTransform viewportRectTrs ="
+          " (RectTransform) contentRectTrs.parent;\n"
+          "    Rect rect = viewportRectTrs.GetWorldRect();\n"
+          "    Vector2 center = rect.center;\n"
+          "    rect.height -= contentRectTrs.GetWorldRect().size.y;\n"
+          "    rect.center = center;\n"
+          "    float value = Rect.PointToNormalized(rect,"
+          " contentRectTrs.GetWorldRect().center).y;\n"
+          "    RectTransform slidingArea = (RectTransform) handleTrs.parent;\n"
+          "    handleTrs.localPosition = Vector2.up * (slidingArea.rect.height"
+          " * value - slidingArea.rect.height / 2);\n"
+          "  }\n"
+          "  class DragUpdater : IUpdatable {\n"
+          "    Bar scrollbar;\n"
+          "    public DragUpdater (Bar scrollbar) {\n"
+          "      this.scrollbar = scrollbar;\n"
+          "    }\n"
+          "    public void DoUpdate () {\n"
+          "      float value = scrollbar.scrollbar.value;\n"
+          "      RectTransform slidingArea ="
+          " (RectTransform) scrollbar.handleTrs.parent;\n"
+          "      value = Rect.PointToNormalized(slidingArea.GetWorldRect(),"
+          " Camera.main.ScreenToWorldPoint("
+          "Mouse.current.position.ReadValue())).y;\n"
+          "      scrollbar.handleTrs.localPosition = Vector2.up *"
+          " (slidingArea.rect.height * value"
+          " - slidingArea.rect.height / 2);\n"
+          "      scrollbar.scrollbar.value = value;\n"
+          "    }\n"
+          "  }\n"
+          "}\n",
+          "4d" * 16)
+        sbar = "2a4db7a114972834c8e4117be1d82ba3"
+        img = "fe87c0e1cc204ed48ad3b37840f39efc"
+        builtin = "0000000000000000f000000000000000"
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &100\nGameObject:\n  m_Name: Main Camera\n"
+                "  m_TagString: MainCamera\n"
+                "  m_Component:\n  - component: {fileID: 101}\n"
+                "  - component: {fileID: 102}\n"
+                "--- !u!4 &101\nTransform:\n"
+                "  m_GameObject: {fileID: 100}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: -10}\n"
+                "--- !u!20 &102\nCamera:\n"
+                "  m_GameObject: {fileID: 100}\n"
+                "  orthographic: 1\n"
+                "  orthographic size: 5\n"
+                "  m_BackGroundColor: {r: 0, g: 0, b: 0, a: 1}\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Canvas\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!224 &2\nRectTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 0, y: 0}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!223 &3\nCanvas:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n"
+                "--- !u!1 &20\nGameObject:\n  m_Name: Viewport\n"
+                "  m_Component:\n  - component: {fileID: 21}\n"
+                "--- !u!224 &21\nRectTransform:\n"
+                "  m_GameObject: {fileID: 20}\n"
+                "  m_Father: {fileID: 2}\n"
+                "  m_Children:\n  - {fileID: 31}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 0, y: 0}\n"
+                "  m_Pivot: {x: 0, y: 1}\n"
+                "--- !u!1 &30\nGameObject:\n  m_Name: Content\n"
+                "  m_Component:\n  - component: {fileID: 31}\n"
+                "--- !u!224 &31\nRectTransform:\n"
+                "  m_GameObject: {fileID: 30}\n"
+                "  m_Father: {fileID: 21}\n"
+                "  m_AnchorMin: {x: 0, y: 1}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 0, y: 600}\n"
+                "  m_Pivot: {x: 0, y: 1}\n"
+                "--- !u!1 &40\nGameObject:\n  m_Name: Scrollbar\n"
+                "  m_Component:\n  - component: {fileID: 41}\n"
+                "  - component: {fileID: 42}\n"
+                "  - component: {fileID: 43}\n"
+                "--- !u!224 &41\nRectTransform:\n"
+                "  m_GameObject: {fileID: 40}\n"
+                "  m_Father: {fileID: 2}\n"
+                "  m_Children:\n  - {fileID: 71}\n"
+                "  m_AnchorMin: {x: 1, y: 0}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 20, y: 0}\n"
+                "  m_Pivot: {x: 1, y: 1}\n"
+                "--- !u!114 &42\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 40}\n"
+                "  m_Enabled: 1\n"
+                "  m_Interactable: 1\n"
+                "  m_Script: {fileID: 11500000, guid: " + sbar + "}\n"
+                "  m_HandleRect: {fileID: 51}\n"
+                "  m_Direction: 2\n"
+                "  m_Value: 1\n"
+                "  m_Size: 0.5\n"
+                "--- !u!114 &43\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 40}\n"
+                "  m_Enabled: 1\n"
+                "  m_Script: {fileID: 11500000, guid: " + "4d" * 16 + "}\n"
+                "  scrollbar: {fileID: 42}\n"
+                "  handleTrs: {fileID: 51}\n"
+                "  contentRectTrs: {fileID: 31}\n"
+                "--- !u!1 &70\nGameObject:\n  m_Name: Sliding Area\n"
+                "  m_Component:\n  - component: {fileID: 71}\n"
+                "--- !u!224 &71\nRectTransform:\n"
+                "  m_GameObject: {fileID: 70}\n"
+                "  m_Father: {fileID: 41}\n"
+                "  m_Children:\n  - {fileID: 51}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: -20, y: -20}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!1 &50\nGameObject:\n  m_Name: Handle\n"
+                "  m_Component:\n  - component: {fileID: 51}\n"
+                "  - component: {fileID: 52}\n"
+                "--- !u!224 &51\nRectTransform:\n"
+                "  m_GameObject: {fileID: 50}\n"
+                "  m_Father: {fileID: 71}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 0, y: 0}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 20, y: 20}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!114 &52\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 50}\n"
+                "  m_Enabled: 1\n"
+                "  m_Script: {fileID: 11500000, guid: " + img + "}\n"
+                "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+                "  m_Sprite: {fileID: 10913, guid: " + builtin + ", type: 0}\n"
+                "--- !u!1 &80\nGameObject:\n  m_Name: GM\n"
+                "  m_Component:\n  - component: {fileID: 81}\n"
+                "  - component: {fileID: 82}\n"
+                "--- !u!4 &81\nTransform:\n"
+                "  m_GameObject: {fileID: 80}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &82\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 80}\n"
+                "  m_Script: {fileID: 11500000, guid: " + "3c" * 16 + "}\n"
+            )
+        return root
+
+    def test_component_fields_pack_as_gameobject_indices(self):
+        """Transform / uGUI fields → GO index; rect, localPosition, value."""
+        root = self._write_scrollbar_like_project()
+        d = tempfile.mkdtemp(prefix="upack-bar-out-")
+        plan = unity_pack.pack(root, d)
+        # Every component reference resolves to the GameObject it names.
+        refs = plan.get("go_field_refs") or {}
+        names = plan.get("go_names") or []
+        for field, want in (("handleTrs", "Handle"),
+                            ("contentRectTrs", "Content"),
+                            ("scrollbar", "Scrollbar")):
+            go = refs[("Bar", field)][0]
+            self.assertGreaterEqual(go, 0, field)
+            self.assertEqual(names[go], want, field)
+        members = {n: k for n, _t, _b, k in plan["classes"]["Bar"]["members"]}
+        self.assertEqual(members["handleTrs"], "go")
+        self.assertEqual(members["contentRectTrs"], "go")
+        self.assertEqual(members["scrollbar"], "go")
+        with open(os.path.join(d, "engine.cpp")) as f:
+            eng = f.read()
+        awake = self._emitted_body(eng, "Bar_Awake")
+        self.assertIn("Transform_get_parent(Bar_get_handleTrs(i))", awake)
+        self.assertIn("RectTransform_get_rect_height(slidingArea)", awake)
+        self.assertIn("Scrollbar_get_value(Bar_get_scrollbar(i))", awake)
+        self.assertIn("RectTransform_set_localPosition_xy(", awake)
+        self.assertNotIn("unlowered C#", awake)
+
+    def test_get_world_rect_camera_and_mouse_lower(self):
+        """GetWorldRect / ScreenToWorldPoint / Mouse position + Rect props."""
+        root = self._write_scrollbar_like_project()
+        d = tempfile.mkdtemp(prefix="upack-bar-wr-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.cpp")) as f:
+            eng = f.read()
+        self.assertIn("static Rect RectTransform_GetWorldRect(int go)", eng)
+        self.assertIn(
+            "static Vector2 Camera_main_ScreenToWorldPoint(Vector2 p)", eng)
+        self.assertIn("static Vector2 Mouse_current_position(void)", eng)
+        upd = self._emitted_body(eng, "Bar_DoUpdate")
+        # Rect properties are functions; its fields stay fields.
+        self.assertIn("Rect rect = RectTransform_GetWorldRect(", upd)
+        self.assertIn("Vector2 center = Rect_center(rect);", upd)
+        self.assertIn("rect.height -= Rect_size_y(", upd)
+        self.assertIn("Rect_set_center(&rect, center);", upd)
+        self.assertIn("Vector2_y(Rect_PointToNormalized(", upd)
+        self.assertNotIn("unlowered C#", upd)
+        drag = self._emitted_body(eng, "DragUpdater_DoUpdate")
+        self.assertIn(
+            "Camera_main_ScreenToWorldPoint(Mouse_current_position())", drag)
+        self.assertIn("RectTransform_GetWorldRect(slidingArea)", drag)
+        self.assertIn("Scrollbar_set_value(", drag)
+        self.assertNotIn("unlowered C#", drag)
+        # The drag helper still registers through the IUpdatable array.
+        self.assertIn("_engine_iref_push(GM_updatables, ",
+                      self._emitted_body(eng, "Bar_StartDrag"))
+        self.assertIn("_engine_iref_erase(GM_updatables, ",
+                      self._emitted_body(eng, "Bar_EndDrag"))
+
+    def test_rect_point_to_normalized(self):
+        """Rect.PointToNormalized(r, p) → the clamped [0,1] rect helper."""
+        root = tempfile.mkdtemp(prefix="upack-rectptn-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Probe.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Probe : MonoBehaviour {\n"
+                "    public float v;\n"
+                "    void Update() {\n"
+                "        Rect r = new Rect(0f, 0f, 10f, 4f);\n"
+                "        Vector2 n = Rect.PointToNormalized("
+                "r, new Vector2(5f, 1f));\n"
+                "        v = n.y;\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Probe.cs.meta"), "w") as f:
+            f.write("guid: rectptnrectptnrectptnrectptn01\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Probe\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: rectptnrectptnrectptnrectptn01}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-rectptn-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.cpp")) as f:
+            eng = f.read()
+        self.assertIn(
+            "static Vector2 Rect_PointToNormalized(Rect r, Vector2 p)", eng)
+        self.assertIn("Mathf_InverseLerp(", eng)
+        upd = self._emitted_body(eng, "Probe_Update")
+        self.assertIn("Rect_make(0.f, 0.f, 10.f, 4.f)", upd)
+        self.assertIn("Rect_PointToNormalized(r, Vector2_make(", upd)
+        self.assertNotIn("Rect.PointToNormalized", upd)
+        self.assertNotIn("unlowered C#", upd)
+
     def test_static_method_and_singleton_instance(self):
         """Other.StaticMethod(Other.Instance.field) → Class_Method(get(Instance()))."""
         root = tempfile.mkdtemp(prefix="upack-static-")
@@ -3049,6 +3636,54 @@ class TestSystems(unittest.TestCase):
             "(false));",
             out)
         self.assertNotIn("Toggle_set_isOn(CosmeticsMenu_equipped[i]", out)
+
+    def test_nonvoid_public_method_emits_stub(self):
+        """int CompareTo-style methods must not emit `return 1` as void."""
+        root = tempfile.mkdtemp(prefix="upack-nonvoid-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Item.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Item : MonoBehaviour {\n"
+                "    public int Rank(Item other) {\n"
+                "        if (transform.GetSiblingIndex() > "
+                "other.transform.GetSiblingIndex())\n"
+                "            return 1;\n"
+                "        return -1;\n"
+                "    }\n"
+                "    void Update() {}\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Item.cs.meta"), "w") as f:
+            f.write("guid: nonvoid000000000000000000000001\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Item\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: nonvoid000000000000000000000001}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-nonvoid-out-")
+        with contextlib.redirect_stderr(io.StringIO()):
+            unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("static void Item_Rank(unsigned i", eng)
+        self.assertIn("unlowered C#", eng)
+        # Must not leave a valued return inside the void function.
+        rank = eng[eng.find("static void Item_Rank"):]
+        rank = rank[:rank.find("\n}")]
+        self.assertNotRegex(rank, r"return\s+-?\d+")
 
     def test_unlowered_public_method_emits_stub(self):
         """Public GetComponents (no InChildren) helpers → empty stub."""
@@ -9745,6 +10380,338 @@ class TestSystems(unittest.TestCase):
         self.assertIn("Host_set_Volume(v)", eng)
         self.assertIn("Host_SetDisplayValue(", eng)
 
+    def test_toggle_scrollbar_scrollrect_interaction(self):
+        """Toggle click, Scrollbar handle bake, ScrollRect tables emit."""
+        root = tempfile.mkdtemp(prefix="upack-sct-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Host.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Host : MonoBehaviour {\n"
+                "  public void OnToggle(bool on) {}\n"
+                "  void Update() {}\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Host.cs.meta"), "w") as f:
+            f.write("guid: scthostguidscthostguidscth01\n")
+        toggle = "9085046f02f69544eb97fd06b6048fe2"
+        sbar = "2a4db7a114972834c8e4117be1d82ba3"
+        srect = "1aa08ab6e0800fa44ae55d278d1423e3"
+        img = "fe87c0e1cc204ed48ad3b37840f39efc"
+        builtin = "0000000000000000f000000000000000"
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &100\nGameObject:\n  m_Name: Main Camera\n"
+                "  m_TagString: MainCamera\n"
+                "  m_Component:\n  - component: {fileID: 101}\n"
+                "  - component: {fileID: 102}\n"
+                "--- !u!4 &101\nTransform:\n"
+                "  m_GameObject: {fileID: 100}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: -10}\n"
+                "--- !u!20 &102\nCamera:\n"
+                "  m_GameObject: {fileID: 100}\n"
+                "  orthographic: 1\n"
+                "  orthographic size: 5\n"
+                "  m_BackGroundColor: {r: 0, g: 0, b: 0, a: 1}\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Canvas\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!224 &2\nRectTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 0, y: 0}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!223 &3\nCanvas:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Scroll View\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "--- !u!224 &11\nRectTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Father: {fileID: 2}\n"
+                "  m_Children:\n  - {fileID: 21}\n  - {fileID: 41}\n"
+                "  m_AnchorMin: {x: 0.5, y: 0.5}\n"
+                "  m_AnchorMax: {x: 0.5, y: 0.5}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 400, y: 300}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!114 &12\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Enabled: 1\n"
+                "  m_Script: {fileID: 11500000, guid: " + srect + "}\n"
+                "  m_Content: {fileID: 31}\n"
+                "  m_Horizontal: 0\n"
+                "  m_Vertical: 1\n"
+                "  m_Viewport: {fileID: 21}\n"
+                "  m_HorizontalScrollbar: {fileID: 0}\n"
+                "  m_VerticalScrollbar: {fileID: 42}\n"
+                "--- !u!1 &20\nGameObject:\n  m_Name: Viewport\n"
+                "  m_Component:\n  - component: {fileID: 21}\n"
+                "--- !u!224 &21\nRectTransform:\n"
+                "  m_GameObject: {fileID: 20}\n"
+                "  m_Father: {fileID: 11}\n"
+                "  m_Children:\n  - {fileID: 31}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 0, y: 0}\n"
+                "  m_Pivot: {x: 0, y: 1}\n"
+                "--- !u!1 &30\nGameObject:\n  m_Name: Content\n"
+                "  m_Component:\n  - component: {fileID: 31}\n"
+                "--- !u!224 &31\nRectTransform:\n"
+                "  m_GameObject: {fileID: 30}\n"
+                "  m_Father: {fileID: 21}\n"
+                "  m_AnchorMin: {x: 0, y: 1}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 0, y: 600}\n"
+                "  m_Pivot: {x: 0, y: 1}\n"
+                "--- !u!1 &40\nGameObject:\n  m_Name: Scrollbar\n"
+                "  m_Component:\n  - component: {fileID: 41}\n"
+                "  - component: {fileID: 42}\n"
+                "--- !u!224 &41\nRectTransform:\n"
+                "  m_GameObject: {fileID: 40}\n"
+                "  m_Father: {fileID: 11}\n"
+                "  m_Children:\n  - {fileID: 51}\n"
+                "  m_AnchorMin: {x: 1, y: 0}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 20, y: 0}\n"
+                "  m_Pivot: {x: 1, y: 1}\n"
+                "--- !u!114 &42\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 40}\n"
+                "  m_Enabled: 1\n"
+                "  m_Interactable: 1\n"
+                "  m_Script: {fileID: 11500000, guid: " + sbar + "}\n"
+                "  m_HandleRect: {fileID: 51}\n"
+                "  m_Direction: 2\n"
+                "  m_Value: 1\n"
+                "  m_Size: 0.5\n"
+                "--- !u!1 &50\nGameObject:\n  m_Name: Handle\n"
+                "  m_Component:\n  - component: {fileID: 51}\n"
+                "  - component: {fileID: 52}\n"
+                "--- !u!224 &51\nRectTransform:\n"
+                "  m_GameObject: {fileID: 50}\n"
+                "  m_Father: {fileID: 41}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 0, y: 0}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 20, y: 20}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!114 &52\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 50}\n"
+                "  m_Enabled: 1\n"
+                "  m_Script: {fileID: 11500000, guid: " + img + "}\n"
+                "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+                "  m_Sprite: {fileID: 10913, guid: " + builtin + ", type: 0}\n"
+                "--- !u!1 &60\nGameObject:\n  m_Name: MyToggle\n"
+                "  m_Component:\n  - component: {fileID: 61}\n"
+                "  - component: {fileID: 62}\n"
+                "  - component: {fileID: 63}\n"
+                "--- !u!224 &61\nRectTransform:\n"
+                "  m_GameObject: {fileID: 60}\n"
+                "  m_Father: {fileID: 2}\n"
+                "  m_AnchorMin: {x: 0.5, y: 0.5}\n"
+                "  m_AnchorMax: {x: 0.5, y: 0.5}\n"
+                "  m_AnchoredPosition: {x: 0, y: -200}\n"
+                "  m_SizeDelta: {x: 100, y: 100}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!114 &62\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 60}\n"
+                "  m_Enabled: 1\n"
+                "  m_Interactable: 1\n"
+                "  m_Script: {fileID: 11500000, guid: " + toggle + "}\n"
+                "  graphic: {fileID: 0}\n"
+                "  onValueChanged:\n"
+                "    m_PersistentCalls:\n"
+                "      m_Calls:\n"
+                "      - m_Target: {fileID: 72}\n"
+                "        m_MethodName: OnToggle\n"
+                "        m_Mode: 0\n"
+                "        m_Arguments:\n"
+                "          m_BoolArgument: 0\n"
+                "  m_IsOn: 0\n"
+                "--- !u!114 &63\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 60}\n"
+                "  m_Enabled: 1\n"
+                "  m_Script: {fileID: 11500000, guid: " + img + "}\n"
+                "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+                "  m_Sprite: {fileID: 10913, guid: " + builtin + ", type: 0}\n"
+                "--- !u!1 &70\nGameObject:\n  m_Name: Host\n"
+                "  m_Component:\n  - component: {fileID: 71}\n"
+                "  - component: {fileID: 72}\n"
+                "--- !u!4 &71\nTransform:\n"
+                "  m_GameObject: {fileID: 70}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &72\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 70}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: scthostguidscthostguidscth01}\n"
+            )
+        objs, _a, _l, _c, _h = unity_pack.load_project(root)
+        handle = [o for o in objs if o["name"] == "Handle"][0]
+        # BTT value=1 size=0.5 → amin.y=0.5 amax.y=1.
+        self.assertAlmostEqual(handle["rect"]["anchor_min"][1], 0.5, places=5)
+        self.assertAlmostEqual(handle["rect"]["anchor_max"][1], 1.0, places=5)
+        d = tempfile.mkdtemp(prefix="upack-sct-out-")
+        plan = unity_pack.pack(root, d, force=True)
+        self.assertEqual(len(plan.get("ui_toggles") or []), 1)
+        self.assertEqual(len(plan.get("ui_scrollbars") or []), 1)
+        self.assertEqual(len(plan.get("ui_scrollrects") or []), 1)
+        self.assertEqual(plan["ui_scrollbars"][0]["scrollrect"], 0)
+        self.assertEqual(plan["ui_scrollrects"][0]["vbar"], 0)
+        methods = {c["method"] for c in plan["ui_toggles"][0]["calls"]}
+        self.assertIn("OnToggle", methods)
+        with open(os.path.join(d, "engine.cpp")) as ef:
+            eng = ef.read()
+        self.assertIn("_engine_ui_tg_set", eng)
+        self.assertIn("_engine_ui_sb_drag_to", eng)
+        self.assertIn("_engine_ui_sr_drag_to", eng)
+        self.assertIn("Host_OnToggle(", eng)
+
+    def test_eventtrigger_pointer_enter_and_down(self):
+        """EventTrigger fires PointerEnter (eventID 0) and PointerDown MB calls.
+
+        eventID 0 must not be dropped by falsy ``or -1`` checks.
+        """
+        root = tempfile.mkdtemp(prefix="upack-et-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Host.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Host : MonoBehaviour {\n"
+                "  public void Bang() {}\n"
+                "  public void SetFlag(bool v) {}\n"
+                "  void Update() {}\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Host.cs.meta"), "w") as f:
+            f.write("guid: hostethostethostethostethostet01\n")
+        et = "d0b148fe25e99eb48b9724523833bab1"
+        img = "fe87c0e1cc204ed48ad3b37840f39efc"
+        builtin = "0000000000000000f000000000000000"
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &100\nGameObject:\n  m_Name: Main Camera\n"
+                "  m_TagString: MainCamera\n"
+                "  m_Component:\n  - component: {fileID: 101}\n"
+                "  - component: {fileID: 102}\n"
+                "--- !u!4 &101\nTransform:\n"
+                "  m_GameObject: {fileID: 100}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: -10}\n"
+                "--- !u!20 &102\nCamera:\n"
+                "  m_GameObject: {fileID: 100}\n"
+                "  orthographic: 1\n"
+                "  orthographic size: 5\n"
+                "  m_BackGroundColor: {r: 0, g: 0, b: 0, a: 1}\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Canvas\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "--- !u!224 &11\nRectTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 0, y: 0}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!223 &12\nCanvas:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Enabled: 1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Host\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "  - component: {fileID: 4}\n"
+                "  - component: {fileID: 5}\n"
+                "--- !u!224 &2\nRectTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Father: {fileID: 11}\n"
+                "  m_AnchorMin: {x: 0.5, y: 0.5}\n"
+                "  m_AnchorMax: {x: 0.5, y: 0.5}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 100, y: 40}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: hostethostethostethostethostet01}\n"
+                "--- !u!114 &4\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n"
+                "  m_Script: {fileID: 11500000, guid: " + img + "}\n"
+                "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+                "  m_Sprite: {fileID: 21300000, guid: " + builtin + "}\n"
+                "--- !u!114 &5\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n"
+                "  m_Script: {fileID: 11500000, guid: " + et + "}\n"
+                "  m_EditorClassIdentifier: "
+                "UnityEngine.UI::UnityEngine.EventSystems.EventTrigger\n"
+                "  m_Delegates:\n"
+                "  - eventID: 2\n"
+                "    callback:\n"
+                "      m_PersistentCalls:\n"
+                "        m_Calls:\n"
+                "        - m_Target: {fileID: 3}\n"
+                "          m_TargetAssemblyTypeName: Host, Assembly-CSharp\n"
+                "          m_MethodName: SetFlag\n"
+                "          m_Mode: 6\n"
+                "          m_Arguments:\n"
+                "            m_ObjectArgument: {fileID: 0}\n"
+                "            m_ObjectArgumentAssemblyTypeName: "
+                "UnityEngine.Object, UnityEngine\n"
+                "            m_IntArgument: 0\n"
+                "            m_FloatArgument: 0\n"
+                "            m_StringArgument: \n"
+                "            m_BoolArgument: 1\n"
+                "          m_CallState: 2\n"
+                "  - eventID: 0\n"
+                "    callback:\n"
+                "      m_PersistentCalls:\n"
+                "        m_Calls:\n"
+                "        - m_Target: {fileID: 3}\n"
+                "          m_TargetAssemblyTypeName: Host, Assembly-CSharp\n"
+                "          m_MethodName: Bang\n"
+                "          m_Mode: 1\n"
+                "          m_Arguments:\n"
+                "            m_ObjectArgument: {fileID: 0}\n"
+                "            m_ObjectArgumentAssemblyTypeName: "
+                "UnityEngine.Object, UnityEngine\n"
+                "            m_IntArgument: 0\n"
+                "            m_FloatArgument: 0\n"
+                "            m_StringArgument: \n"
+                "            m_BoolArgument: 0\n"
+                "          m_CallState: 2\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-et-out-")
+        plan = unity_pack.pack(root, d)
+        ets = plan.get("ui_eventtriggers") or []
+        self.assertEqual(len(ets), 1)
+        eids = {e["event_id"]: e for e in ets[0]["events"]}
+        self.assertIn(0, eids)
+        self.assertIn(2, eids)
+        self.assertEqual(eids[0]["calls"][0]["method"], "Bang")
+        self.assertEqual(eids[2]["calls"][0]["method"], "SetFlag")
+        with open(os.path.join(d, "engine.cpp")) as ef:
+            eng = ef.read()
+        self.assertIn("_engine_ui_et_fire", eng)
+        self.assertIn("Host_Bang(", eng)
+        self.assertIn("Host_SetFlag(", eng)
+        self.assertIn("_engine_ui_et_fire(i, 0);", eng)
+        self.assertIn("_engine_ui_et_fire(ehit, 2);", eng)
+
     def test_awake_setactive_false_emitted(self):
         """Awake gameObject.SetActive(false) runs before Start (SettingsMenu)."""
         root = tempfile.mkdtemp(prefix="upack-awake-sa-")
@@ -9794,6 +10761,65 @@ class TestSystems(unittest.TestCase):
         # SetActive alone sets want_ui; ColorBlock tint must not be referenced
         # without authored Buttons (would be undeclared).
         self.assertNotIn("_engine_ui_btn_tint_init", eng)
+
+    def test_awake_parent_gameobject_setactive_survives_stub(self):
+        """CosmeticsMenu: transform.parent.gameObject.SetActive kept in stub."""
+        root = tempfile.mkdtemp(prefix="upack-awake-par-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Panel.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Panel : MonoBehaviour {\n"
+                "    void Awake() {\n"
+                "        if (transform.parent != null)\n"
+                "            transform.parent.gameObject.SetActive(false);\n"
+                "        gameObject.SetActive(false);\n"
+                "        Unknown.DoThing();\n"
+                "    }\n"
+                "    void Update() {}\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Panel.cs.meta"), "w") as f:
+            f.write("guid: awakeparawakeparawakeparawake01\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Unlockables Menu\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "--- !u!4 &11\nTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Panel\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Father: {fileID: 11}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: awakeparawakeparawakeparawake01}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-awake-par-out-")
+        with contextlib.redirect_stderr(io.StringIO()):
+            unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        start = eng.find("static void Panel_Awake")
+        self.assertGreaterEqual(start, 0)
+        end = eng.find("\n}", start)
+        awake = eng[start:end]
+        self.assertIn(
+            "GameObject_SetActive(Transform_get_parent("
+            "_engine_go_of_Panel(i)), (0))",
+            awake)
+        self.assertIn(
+            "GameObject_SetActive(_engine_go_of_Panel(i), (0))", awake)
+        self.assertIn("static int Transform_get_parent", eng)
 
     def test_setactive_with_sprite_omits_btn_tint(self):
         """want_ui from SetActive + SpriteRenderer, no Button → no tint refs."""
@@ -10975,6 +12001,66 @@ class TestSystems(unittest.TestCase):
             "Can't add component 'SpriteRenderer' to Player because such a "
             "component is already added to the game object!",
             run.stderr)
+
+    @needs_cc
+    def test_collider2d_without_rigidbody_emits_empty_rb_tables(self):
+        """Collider2D collide refs mass/vel — data must define tables even if
+        the scene has no authored Rigidbody2D (Main Menu / GetComponent only)."""
+        root = tempfile.mkdtemp(prefix="upack-col-norb-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Hit.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Hit : MonoBehaviour {\n"
+                "    void Start() {\n"
+                "        Rigidbody2D rb = GetComponent<Rigidbody2D>();\n"
+                "        if (rb != null) {}\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Hit.cs.meta"), "w") as f:
+            f.write("guid: colnorb000000000000000000000001\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Hit\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "  - component: {fileID: 4}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: colnorb000000000000000000000001}\n"
+                "--- !u!61 &4\nBoxCollider2D:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n"
+                "  m_IsTrigger: 1\n"
+                "  m_Offset: {x: 0, y: 0}\n"
+                "  m_Size: {x: 1, y: 1}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-col-norb-out-")
+        with contextlib.redirect_stderr(io.StringIO()):
+            plan = unity_pack.pack(root, d)
+        self.assertEqual(plan.get("rigidbody2d") or [], [])
+        self.assertTrue(plan.get("collider2d"))
+        with open(os.path.join(d, "data.c")) as f:
+            data = f.read()
+        self.assertIn("int _Rigidbody2D_count = 0;", data)
+        self.assertIn("float _Rigidbody2D_mass[1]", data)
+        self.assertIn("float _Rigidbody2D_vel_x[1]", data)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("_Rigidbody2D_mass[", eng)
+        # Player link must resolve RB symbols (data.o + engine.o).
+        exe = unity_pack.build_player_executable(
+            d, plan.get("product_name") or "Player")
+        self.assertTrue(os.path.isfile(exe))
 
     @needs_systems
     def test_authored_rigidbody2d_is_packed(self):

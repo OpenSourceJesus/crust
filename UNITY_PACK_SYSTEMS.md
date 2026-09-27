@@ -282,7 +282,21 @@ fires `m_OnValueChanged` persistent calls — `UnityEvent<float>` mode 0/4
 passes the new float (including static property setters like
 `SettingsMenu.set_Volume`), mode 1 Void calls instance methods
 (`_Slider.SetDisplayValue` / `OnValueChanged`). GOs with both `_Slider` and
-`_Selectable` pack as `_Slider` so those callbacks resolve. Authored C# may get/set
+`_Selectable` pack as `_Slider` so those callbacks resolve. **Toggle** click
+(pointer-up over the pressed target) flips authored `m_IsOn`, seeds
+`Toggle_set/get_isOn`, shows/hides the `graphic` Image GO when present, and
+fires `onValueChanged` (`UnityEvent<bool>` mode 0 → isOn, mode 1 Void,
+mode 6 fixed bool). **Scrollbar** bakes `UpdateVisuals` (handle anchors from
+`m_Value`/`m_Size`/direction) and supports slide-area drag with float
+`onValueChanged`. **ScrollRect** drags the viewport to move content
+`anchoredPosition` (clamped), syncs linked Scrollbar value/size, and
+scrollbar value changes drive content normalized position. **EventTrigger**
+(UnityEngine.EventSystems) packs `m_Delegates` for PointerEnter/Exit/Down/Up/
+Click and BeginDrag/EndDrag; `engine_ui_tick` tracks hover/press edges and
+fires matching persistent calls (Void/Bool/Float/String, plus Object when the
+arg is a `RectTransform` → packed GO index). `AudioClip` Object args are
+skipped until clip tables feed sound APIs. PointerEnter is eventID **0** —
+builders must not treat `0` as missing. Authored C# may get/set
 `rectTransform.anchoredPosition`, `sizeDelta`, and UI `localScale` (xy).
 Layout-only Canvas / Rect parents are snapshotted onto `scene_hierarchy`
 before scaffold drop so the live GO parent chain keeps rect state.
@@ -312,7 +326,10 @@ real RectTransforms instead of full-screen fallbacks. Authored `m_Sprite`
 `objectReference` overrides on those instances supply Image sprites when the
 prefab default is null. `Awake` runs once before `Start` so
 authored `gameObject.SetActive(false)` (e.g. SettingsMenu) hides UI before
-the first draw. Canvas sorting layer/order apply to child Images/Buttons;
+the first draw. `transform.parent.gameObject.SetActive(false)` (e.g.
+CosmeticsMenu → Unlockables Menu) lowers to
+`GameObject_SetActive(Transform_get_parent(go), …)` and is kept even when
+the rest of Awake stubs. Canvas sorting layer/order apply to child Images/Buttons;
 TMP sorts one order above its Canvas. EventSystem / GraphicRaycaster /
 legacy `UI.Text` / `GridLayoutGroup` are not imported.
 `AddComponent<Canvas>` / `typeof(Canvas)` / `ForceUpdateCanvases`
@@ -401,6 +418,77 @@ name `"(Clone)"`, and wire live `_engine_go_T` / parent tables. Prefab /
 position / rotation overloads stay unlowered (public helpers that still
 contain them are stubbed).
 
+## Component reference fields (Transform / RectTransform / uGUI)
+
+An authored field holding a component is packed as the **GameObject index**
+it names: Transform ≡ RectTransform ≡ GameObject here, and every engine
+helper for them takes a GO. The scene's fileID — a Transform's, a uGUI
+component's, or a GameObject's — resolves to that one GO slot; an empty
+reference is null (`-1`), not GO 0.
+
+| Script uses | Emitted |
+|-------------|---------|
+| `public Transform handleTrs` / `RectTransform` / `Image` / `Scrollbar` / … | `go` member; `Owner_get_handleTrs(i)` → GO index |
+| `(RectTransform) x` / `(Transform) x` | The same index — the cast is dropped |
+| `handleTrs.parent` | `Transform_get_parent(go)` (live parent table) |
+| `rt.rect.width` / `.height` / `.x` / `.y` / `rt.rect` | `RectTransform_get_rect_*(go)` — Unity's local rect: size before `localScale`, pivot at the origin |
+| `rt.localPosition` get / set | `RectTransform_get/set_localPosition_*` — the pivot in the parent's rect, origin at its centre; the setter moves `anchoredPosition` by the same delta |
+| `rt.GetWorldRect()` (`Extensions`) | `RectTransform_GetWorldRect(go)` — the laid-out UI rect through the camera map |
+| `scrollbar.value` / `slider.value` get / set | `Scrollbar_get/set_value(go)` — the engine's own UI tables, so a set fires `onValueChanged` and moves the handle |
+| `Camera.main.ScreenToWorldPoint(p)` | `Camera_main_ScreenToWorldPoint` — orthographic, in the camera's `Camera.rect` viewport |
+| `Mouse.current.position.ReadValue()` | `Mouse_current_position()` → host pointer, screen px from bottom-left |
+| `Vector2.up * x` (and `down`/`left`/`right`/`one`) | `Vector2_make(0.f, x)` — C has no `Vector2 * float` |
+
+`GetWorldRect` is the camera-inverse of the element's laid-out screen rect,
+so it is in the same world units as `ScreenToWorldPoint` — the two compare,
+which is what the drag idiom `PointToNormalized(rect.GetWorldRect(),
+Camera.main.ScreenToWorldPoint(mouse))` needs. It is exact for UI the main
+orthographic camera draws (Screen Space – Camera / World Space).
+
+`Rect` packs as a C struct: `x` / `y` / `width` / `height` are fields in
+both languages, while `center`, `size`, `min` and `max` are C# properties
+and become `Rect_center(r)` etc.; `rect.center = v` moves the rect through
+`Rect_set_center`.
+
+## Static reference arrays (`T[]`, interfaces) and `new`
+
+A `static T[]` of a packed class or an authored interface is the collection
+the project keeps growing, so it packs as one vector rather than the copies
+`Extensions.CollectionExtensions` makes.
+
+| Script uses | Emitted |
+|-------------|---------|
+| `static T[] xs` (T a packed class) | `std::vector<int> Owner_xs` — instance indices |
+| `static I[] xs` (I an authored interface) | `std::vector<_engine_iref> Owner_xs` — `{cls, inst}`, since implementors are separate arrays |
+| `xs = xs.Add(this)` / `xs = xs.Add(field)` | `Owner_xs.push_back(idx)`, or `_engine_iref_push(Owner_xs, class_id, idx)` |
+| `xs = xs.Remove(x)` | `_engine_ref_erase` / `_engine_iref_erase` — first match, as `List.Remove` |
+| `Other.xs` / `Other.xs.Length` | `Other_xs` / `Other_xs.size()` |
+| `new T(args)` (T packed, scene places none) | `Object_New_T(args)` — next pool slot, then `T_T(i, args)` |
+| `T (args) { this.f = f; }` | `T_T(unsigned i, int f_)` — a parameter shadowing a field is renamed, not self-assigned |
+
+`new T(args)` budget is one spare instance slot per authored instance of each
+class that constructs `T`; a full pool returns `-1` (null), as `Instantiate`
+does. A plain C# object gets no GameObject.
+
+An interface whose method an authored `Update` calls over such an array
+(`IUpdatable.DoUpdate`) gets `_engine_<iface>_tick`, run from `engine_tick`:
+it walks the vector and dispatches on the class tag. The authored loop itself
+stays unlowered — C has no virtual call to make on an interface reference.
+Only an interface some `Update` really ticks this way gets one.
+
+The interface's own file is analyzed even though no scene names it (an
+interface is not a component); nothing else in that file packs.
+
+`base.Awake()` / `base.OnEnable()` / `base.OnDisable()` are dropped: a base
+class is its own packed array with its own instances. `OnEnable` bodies are
+not emitted at all (no enable-time call site exists), so nothing registers
+into these arrays at enable time — only `StartDrag`-style calls and
+`OnDisable` do.
+
+A C# **property** only lowers as `set_Name` (what UnityEvent wiring targets);
+a body that still names one has a read the pack cannot answer, and reports
+as a stub rather than emitting the bare name.
+
 ## GetComponentsInChildren
 
 | Script uses | Emitted |
@@ -425,6 +513,7 @@ known builtins (`SpriteRenderer`, RB, uGUI, …) only — unknown `T` → CS0246
 | `List<T>` | ``std::vector`` (MB/component elems → ``int`` indices); ``Add``/``Count``; cross-class static ``Other.list`` → ``Other_list`` |
 | `Dictionary<K,V>` / `SortedList<K,V>` | ``std::map`` (``Add``→``[]=``, ``Clear``/``Count``/indexer); string keys via helper |
 | `Vector2` | C ``typedef struct`` + ``Vector2_make``; packed fields stay ``_x``/``_y`` |
+| `Rect` / `Rect.PointToNormalized(r, p)` | C ``typedef struct`` + ``Rect_make``; ``Rect_PointToNormalized`` via ``Mathf_InverseLerp`` (clamped [0,1], Unity's) |
 | `T.StaticMethod` / `T.Instance` / `FindObjectOfType<T>` | ``T_StaticMethod(args)``; ``T_Instance()`` caches ``Object_FindObjectOfType_T(1)`` (live GO map scan, skips Destroyed; re-finds when null); explicit ``FindObjectOfType<T>()`` → ``Object_FindObjectOfType_T(0)`` |
 | `Toggle[]` / ``.isOn`` | ``std::vector<int>`` GO idxs; ``Toggle_set/get_isOn`` |
 | `HashSet` / … | BCL collections not lowered — CS0246 at the type token |
