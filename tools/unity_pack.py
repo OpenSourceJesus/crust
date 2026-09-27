@@ -868,33 +868,58 @@ def _resolve_build_scene_path(root, entry, asset_guids=None):
 
 
 def _unity_scenes_to_pack(root, asset_guids=None):
-    """``.unity`` paths to pack: first enabled EditorBuildSettings scene only.
+    """``.unity`` paths to pack, in build order: every enabled
+    EditorBuildSettings scene. A scene's position here is its
+    ``buildIndex``; the first is the one the player starts in.
 
     Scenes not listed in build settings are never packed. Disabled build
-    entries are skipped. When ``EditorBuildSettings.asset`` is absent (tests /
-    tiny fixtures), fall back to every ``.unity`` under ``Assets/`` only —
-    never a whole-project walk that pulls vendor demo scenes.
+    entries are skipped (they have no build index). When
+    ``EditorBuildSettings.asset`` is absent (tests / tiny fixtures), fall
+    back to every ``.unity`` under ``Assets/`` in path order — never a
+    whole-project walk that pulls vendor demo scenes.
     """
     root = os.path.abspath(root)
     entries = _parse_editor_build_scenes(root)
     if entries:
         enabled = [e for e in entries if e.get("enabled")]
+        out = []
         for e in enabled:
             path = _resolve_build_scene_path(root, e, asset_guids=asset_guids)
-            if path:
-                return [path]
-        if enabled:
-            raise PackError(
-                "EditorBuildSettings: no enabled scene file found "
-                "(first entries: %s)" % ", ".join(
-                    e.get("path") or "?" for e in enabled[:3]))
+            if not path:
+                raise PackError(
+                    "EditorBuildSettings: enabled scene %s not found"
+                    % (e.get("path") or e.get("guid") or "?"))
+            out.append(path)
+        if out:
+            return out
         raise PackError(
             "EditorBuildSettings: no enabled scenes "
             "(add a scene or enable one in File → Build Settings)")
     assets = os.path.join(root, "Assets")
     if os.path.isdir(assets):
-        return list(_walk_files(assets, (".unity",)))
-    return list(_walk_files(root, (".unity",)))
+        return sorted(_walk_files(assets, (".unity",)))
+    return sorted(_walk_files(root, (".unity",)))
+
+
+#: fileIDs are unique only within one scene file. Scenes after the first get
+#: theirs XORed with ``index << _SCENE_FILE_ID_SHIFT`` so merged scene graphs
+#: cannot alias; references carrying a ``guid`` point into other assets and
+#: keep their IDs.
+_SCENE_FILE_ID_SHIFT = 56
+_LOCAL_FILE_ID_RE = re.compile(
+    r"(^--- !u!\d+ &(?=\d+\s)|\{fileID: (?=\d+\}))(\d+)", re.M)
+
+
+def _scene_local_file_ids(text, scene_index):
+    """*text* with its scene-local fileIDs made unique to *scene_index*."""
+    if not scene_index:
+        return text
+    tag = scene_index << _SCENE_FILE_ID_SHIFT
+
+    def _sub(m):
+        fid = int(m.group(2))
+        return m.group(1) + str(fid ^ tag) if fid else m.group(0)
+    return _LOCAL_FILE_ID_RE.sub(_sub, text)
 
 
 def _walk_files(root, exts):
@@ -4103,6 +4128,19 @@ def _build_go_active(plan, go_names):
 
 
 
+def _build_go_scene(plan, go_names):
+    """Build index of the scene each go_names entry was authored in."""
+    sc = [0] * len(go_names or [])
+    recs = list(plan.get("scene_hierarchy") or [])
+    for cl in (plan.get("classes") or {}).values():
+        recs.extend(cl.get("instances") or [])
+    for o in recs:
+        gi = o.get("go_index")
+        if gi is not None and 0 <= gi < len(sc) and o.get("scene"):
+            sc[gi] = int(o["scene"])
+    return sc
+
+
 def _extend_go_tables_for_find(plan, names, comps):
     """No-op: ``_build_go_tables`` already includes hierarchy-only GOs."""
     return names, comps
@@ -5486,6 +5524,8 @@ def analyze_script(path, text=None, shallow=False):
         apis.add("Mouse.current.position")
     if re.search(r"\bInputAction\b", scan):
         apis.add("InputAction")
+    if re.search(r"(?<![\w.])SceneManager\s*\.", scan):
+        apis.add("SceneManager")
     if re.search(
             r"InputManager\s*\.\s*Using(?:Gamepad|Keyboard|Mouse|Phone)\b",
             scan):
@@ -5513,7 +5553,7 @@ def analyze_script(path, text=None, shallow=False):
             r"(?<![\w.])(\w+)\s*\.\s*(?:Instance|instance)\b", scan):
         # CosmeticsMenu.Instance — not foo.instance unless type-like name.
         tname = m.group(1)
-        if tname[:1].isupper():
+        if tname.lstrip("_")[:1].isupper():
             apis.add("Singleton.Instance")
             singleton_instance_types.add(tname)
             findobject_types.add(tname)  # Instance getter needs FindObjectOfType
@@ -5689,6 +5729,10 @@ def analyze_script(path, text=None, shallow=False):
             "name": name, "kind": kind, "fields": fields,
             "methods": methods, "refs": refs,
             "properties": _property_names(bscan_m),
+            "static_getters": cs2cpp.static_getter_exprs(
+                body_m, bscan_m,
+                [f["name"] for f in fields] + [mm["name"] for mm in methods]
+                + list(_property_names(bscan_m))),
             "bases": bases,
             "path": path,
             "file_text": text,
@@ -5904,13 +5948,52 @@ def _param_c_ty(ty):
     return "int"
 
 
+#: Project root whose C# sources say what kind of type a name is, and the
+#: per-root name → {kinds} index built from them on first use.
+_TYPE_DECL_ROOT = [None]
+_TYPE_DECL_KINDS = {}
+
+
+def _csharp_type_decl_kind(name):
+    """``enum`` / ``struct`` / ``class`` / ``interface`` for a type the
+    project or its packages declare, or None when it is undeclared or
+    declared as more than one kind (then nothing can be assumed)."""
+    root = _TYPE_DECL_ROOT[0]
+    if not root:
+        return None
+    kinds = _TYPE_DECL_KINDS.get(root)
+    if kinds is None:
+        kinds = {}
+        pat = re.compile(r"\b(enum|struct|class|interface)\s+([A-Za-z_]\w*)")
+        for sub in ("Assets", "Packages", os.path.join("Library", "PackageCache")):
+            for dp, _dn, fns in os.walk(os.path.join(root, sub)):
+                for fn in fns:
+                    if not fn.endswith(".cs"):
+                        continue
+                    try:
+                        with open(os.path.join(dp, fn), encoding="utf-8",
+                                  errors="replace") as f:
+                            text = f.read()
+                    except OSError:
+                        continue
+                    for m in pat.finditer(cs2cpp._blank(text)):
+                        kinds.setdefault(m.group(2), set()).add(m.group(1))
+        _TYPE_DECL_KINDS[root] = kinds
+    found = kinds.get(name) or set()
+    return next(iter(found)) if len(found) == 1 else None
+
+
 def _default_arg_c(expr, ty=None):
     """C for a C# default parameter value, or None when it needs type-aware
     lowering this does not do (enum members, constants, expressions).
-    ``null`` needs the parameter type *ty*: a packed handle is -1 (the packed
-    model's null), a string or array pointer is 0; nullable value types
-    (``int?``) are not modelled."""
+    ``null`` / ``default`` need the parameter type *ty*: a packed handle is
+    -1 (the packed model's null), a string or array pointer is 0, a number
+    or enum is 0; ``default(T)`` names its type. Structs and nullable value
+    types (``int?``) are not modelled."""
     e = (expr or "").strip()
+    dm = re.fullmatch(r"default\s*\(\s*([\w.]+)\s*\)", e)
+    if dm:
+        e, ty = "default", dm.group(1)
     if re.fullmatch(r"-?\d+[uUlL]*", e):
         return re.sub(r"[uUlL]+$", "", e)
     if re.fullmatch(r"-?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?[fFdDmM]?", e):
@@ -5928,6 +6011,14 @@ def _default_arg_c(expr, ty=None):
         base = ty.split(".")[-1]
         if e == "null" and base not in _PRIMITIVE_PARAM_TYPES:
             return "-1"
+        if e == "default":
+            if base in _PRIMITIVE_PARAM_TYPES:
+                return "0"
+            kind = _csharp_type_decl_kind(base)
+            if kind == "enum":
+                return "0"
+            if kind in ("class", "interface"):
+                return "-1"
     return None
 
 
@@ -5936,7 +6027,7 @@ _STATIC_NUMERIC_TYPES = frozenset((
     "float", "double", "byte", "sbyte", "short", "ushort", "int", "uint",
     "long", "ulong"))
 
-# C# value types that cannot be null (their `default` is not filled either).
+# C# value types that cannot be null (their `default` is 0).
 _PRIMITIVE_PARAM_TYPES = frozenset((
     "float", "double", "byte", "sbyte", "short", "ushort", "int", "uint",
     "long", "ulong", "bool", "char", "decimal"))
@@ -6014,12 +6105,260 @@ def _method_c_params(args_str):
                      for p in cs2cpp.parse_params(args_str))
 
 
+_ARG_INT_TYPES = frozenset(("int", "uint", "long", "ulong", "short",
+                            "ushort", "byte", "sbyte"))
+
+
+def _overload_arg_fit(ptype, kind):
+    """How well an argument of scalar *kind* (``s``/``c``/``i``/``f``) fits a
+    parameter of C# type *ptype*: 0 no, 1 convertible, 2 exact."""
+    t = (ptype or "").split(".")[-1]
+    if t == "string":
+        return 2 if kind == "s" else 0
+    if kind == "s":
+        return 0
+    if t in _ARG_INT_TYPES:
+        return 2 if kind == "i" else 1
+    if t in ("float", "double"):
+        return 2 if kind == "f" else 1
+    if t == "char":
+        return 2 if kind == "c" else 1
+    return 1
+
+
+def _pick_overload(cands, args, string_idents):
+    """The one overload in *cands* that the (lowered) argument text *args*
+    selects, or None when none or several fit equally well."""
+    given = cs2cpp.split_call_args(args) if args.strip() else []
+    if any(_NAMED_ARG_RE.match(g) for g in given):
+        return None
+    best, best_score, tie = None, -1, False
+    for m in cands:
+        params = cs2cpp.parse_params(m.get("args") or "")
+        need = sum(1 for prm in params if prm.default is None)
+        if not need <= len(given) <= len(params):
+            continue
+        score = 0
+        for g, prm in zip(given, params):
+            fit = _overload_arg_fit(
+                prm.type, _c_expr_scalar_kind(g, string_idents=string_idents))
+            if not fit:
+                break
+            score += fit
+        else:
+            if score > best_score:
+                best, best_score, tie = m, score, False
+            elif score == best_score:
+                tie = True
+    return None if tie else best
+
+
+def _rewrite_method_calls(text, call_re, cands, oidn, receiver, overloaded,
+                          string_idents, protos=None):
+    """Calls matched by *call_re* (through the opening parenthesis) to one of
+    *cands* (same-named methods of class *oidn*) → ``Sym(receiver, args)``.
+    Overloads are picked by argument type; a call none or several fit is
+    left as written. *protos* collects the callee prototypes."""
+    pat = re.compile(call_re)
+    out = []
+    pos = 0
+    while True:
+        m = pat.search(text, pos)
+        if not m:
+            break
+        open_i = m.end() - 1
+        args, end = _match_call_args(text, open_i)
+        if end <= open_i:
+            break
+        args = _rewrite_method_calls(args, call_re, cands, oidn, receiver,
+                                     overloaded, string_idents, protos)
+        meth = (_pick_overload(cands, args, string_idents) if overloaded
+                else cands[0])
+        out.append(text[pos:m.start()])
+        if meth is None:
+            out.append(text[m.start():open_i + 1] + args + ")")
+            pos = end
+            continue
+        margs = meth.get("args") or ""
+        sym = _method_c_symbol(oidn, meth["name"], margs, overloaded)
+        a = _call_with_defaults(args, cs2cpp.parse_params(margs)).strip()
+        out.append("%s(%s%s)" % (sym, receiver, (", " + a) if a else ""))
+        if protos is not None:
+            plist = _method_c_params(margs)
+            protos.add("static void %s(unsigned i%s);"
+                       % (sym, (", " + plist) if plist else ""))
+        pos = end
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _returns_void(m):
+    """Methods emit as `static void`; a valued one is always a stub."""
+    return (m.get("ret") or "void").strip().split(".")[-1] == "void"
+
+
+def _rewrite_singleton_method_calls(text, plan, cl, site, string_idents):
+    """``Other.Instance.Method(args)`` (already ``Other_Instance().Method(``)
+    → ``Other_Method(<Other_Instance() or NullReferenceException>, args)``
+    for the instance methods ``Other`` emits."""
+    if "_Instance()" not in text:
+        return text
+    nre_site = site or {"class": cl.get("name") or "?", "method": "?",
+                        "path": "?"}
+    for ocname, pairs in (plan.get("_methods_by") or {}).items():
+        ocl = (plan.get("classes") or {}).get(ocname) or {}
+        if ocl.get("ctor_forbidden"):
+            continue
+        oidn = _c_ident(ocname)
+        inst_re = r"(?<![\w.])%s_Instance\(\)\s*\.\s*" % re.escape(oidn)
+        if not re.search(inst_re, text):
+            continue
+        emit_names = _reachable_emit_methods([m for _c, m in pairs])
+        overloaded = _overload_method_names(
+            [m for _c, m in pairs
+             if m["name"] in emit_names and m["name"] != "OnEnable"])
+        groups = {}
+        for _c, m in pairs:
+            n = m.get("name") or ""
+            if (m.get("static") or n not in emit_names or n == "OnEnable"
+                    or n in _UNITY_EMIT_MESSAGES or n in _COLLISION2D_MSGS
+                    or not _returns_void(m)):
+                continue
+            groups.setdefault(n, []).append(m)
+        receiver = (
+            "({ int _up_recv = %s_Instance(); if (_up_recv < 0) %s; "
+            "(unsigned)_up_recv; })" % (oidn, _nre_at_expr(nre_site, 0)))
+        protos = site.setdefault("protos", set()) if site is not None else None
+        for n in sorted(groups, key=len, reverse=True):
+            text = _rewrite_method_calls(
+                text, inst_re + re.escape(n) + r"\s*\(", groups[n], oidn,
+                receiver, n in overloaded, string_idents, protos)
+    return text
+
+
 def _array_elem_name(ty):
     """Element type from ``T[]``, or None."""
     if not ty:
         return None
     m = re.match(r"^([\w.]+)\s*\[\s*\]\s*$", str(ty).strip())
     return m.group(1).split(".")[-1] if m else None
+
+
+def _collect_static_getters(analyses):
+    """``{class: {property: expr}}`` from ``cs2cpp.static_getter_exprs``."""
+    out = {}
+    for a in analyses:
+        for c in a.get("classes") or []:
+            if c.get("static_getters"):
+                out.setdefault(c["name"], {}).update(c["static_getters"])
+    return out
+
+
+def _inline_static_getters(text, cl, plan):
+    """Reads of an inlinable static property (``Type.Name``, or bare ``Name``
+    inside *Type*) become ``(expr)``. Assignments are left alone."""
+    getters = plan.get("static_getters") or {}
+    for cname, props in getters.items():
+        for pname, expr in props.items():
+            names = [r"(?:[\w.]+\.)?%s\s*\.\s*%s" % (re.escape(cname), re.escape(pname))]
+            if cname == cl.get("name"):
+                names.append(re.escape(pname))
+            for pat in names:
+                text = cs2cpp.code_sub(
+                    r"(?<![\w.])%s\b(?!\s*(?:[-+*/%%&|^]|<<|>>|\?\?)?=(?!=))" % pat,
+                    "(%s)" % expr, text)
+    return text
+
+
+_SCENE_MANAGER = r"(?<![\w.])(?:UnityEngine\s*\.\s*SceneManagement\s*\.\s*)?SceneManager\s*\.\s*"
+
+
+def _lower_scene_manager(text, string_idents=(), scene_idents=()):
+    """UnityEngine.SceneManagement → the packed SceneManager (a Scene is its
+    build index; loads apply at the start of the next frame).
+
+    ``LoadScene`` / ``LoadSceneAsync`` / ``UnloadSceneAsync`` take a build
+    index, a scene name or path, or a Scene; ``GetActiveScene``,
+    ``GetSceneByBuildIndex`` / ``GetSceneByName``, ``sceneCount`` and
+    ``sceneCountInBuildSettings`` read the scene tables; a Scene's ``name``,
+    ``path``, ``buildIndex`` and ``isLoaded`` do too."""
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])(?:UnityEngine\s*\.\s*SceneManagement\s*\.\s*)?"
+        r"LoadSceneMode\s*\.\s*(Single|Additive)\b",
+        lambda m: "1" if m.group(1) == "Additive" else "0", text)
+    strings = set(string_idents)
+
+    def _is_string(arg):
+        a = arg.strip()
+        while a.startswith("(") and a.endswith(")"):
+            a = a[1:-1].strip()
+        return (a.startswith('"') or a.startswith("$\"")
+                or re.fullmatch(r"\w+", a) is not None and a in strings
+                or re.search(r"\.\s*name\s*$|Scene_name\s*\(|\.\s*ToString\s*\(", a)
+                is not None
+                or re.search(r'"\s*\+|\+\s*"', a) is not None)
+
+    def _calls(t, name_re, emit):
+        out, pos = [], 0
+        pat = re.compile(_SCENE_MANAGER + name_re + r"\s*\(")
+        while True:
+            m = pat.search(t, pos)
+            if not m:
+                break
+            args, end = _match_call_args(t, m.end() - 1)
+            if end <= m.end() - 1:
+                break
+            parts = cs2cpp.split_call_args(args) if args.strip() else []
+            out.append(t[pos:m.start()])
+            out.append(emit(m, parts))
+            pos = end
+        out.append(t[pos:])
+        return "".join(out)
+
+    def _load(m, parts):
+        if not parts:
+            return m.group(0) + ")"
+        mode = parts[1].strip() if len(parts) > 1 else "0"
+        fn = ("SceneManager_LoadSceneName" if _is_string(parts[0])
+              else "SceneManager_LoadScene")
+        return "%s(%s, %s)" % (fn, parts[0].strip(), mode)
+
+    def _unload(m, parts):
+        if len(parts) != 1:
+            return m.group(0) + ", ".join(parts) + ")"
+        fn = ("SceneManager_UnloadSceneName" if _is_string(parts[0])
+              else "SceneManager_UnloadScene")
+        return "%s(%s)" % (fn, parts[0].strip())
+
+    text = _calls(text, r"(?:LoadSceneAsync|LoadScene)", _load)
+    text = _calls(text, r"(?:UnloadSceneAsync|UnloadScene)", _unload)
+    text = cs2cpp.code_sub(_SCENE_MANAGER + r"GetActiveScene\s*\(\s*\)",
+                           "(_engine_scene_active)", text)
+    text = cs2cpp.code_sub(_SCENE_MANAGER + r"GetSceneByBuildIndex\s*\(",
+                           "_engine_scene_by_index(", text)
+    text = cs2cpp.code_sub(_SCENE_MANAGER + r"GetSceneByName\s*\(",
+                           "_engine_scene_index_of(", text)
+    text = cs2cpp.code_sub(_SCENE_MANAGER + r"sceneCountInBuildSettings\b",
+                           "_engine_scene_count", text)
+    text = cs2cpp.code_sub(_SCENE_MANAGER + r"sceneCount\b",
+                           "SceneManager_sceneCount()", text)
+    # Scene members: on a Scene expression in parentheses, or a Scene local.
+    members = {"name": "Scene_name(%s)", "path": "Scene_path(%s)",
+               "isLoaded": "Scene_isLoaded(%s)", "buildIndex": "(%s)"}
+    for _pass in range(4):
+        text = cs2cpp.code_sub(
+            r"\(\s*\(\s*_engine_scene_active\s*\)\s*\)",
+            "(_engine_scene_active)", text)
+    text = cs2cpp.code_sub(
+        r"(\(_engine_scene_active\)"
+        r"|_engine_scene_(?:index_of|by_index)\([^()]*\))"
+        r"\s*\.\s*(name|path|isLoaded|buildIndex)\b",
+        lambda m: members[m.group(2)] % m.group(1), text)
+    for ident in scene_idents:
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])%s\s*\.\s*(name|path|isLoaded|buildIndex)\b" % re.escape(ident),
+            lambda m, ident=ident: members[m.group(1)] % ident, text)
+    return text
 
 
 def _collect_interfaces(analyses):
@@ -6166,6 +6505,13 @@ def _rewrite_mb_static_and_singleton(text, plan, cl):
                 "Vector2_make(%s_get_%s_x(%s), %s_get_%s_y(%s))"
                 % (oidn, vf, inst, oidn, vf, inst),
                 text)
+        for f in sorted((ocl.get("class_consts") or []),
+                        key=lambda f: -len(f["name"])):
+            if _is_scalar_static(f):
+                text = cs2cpp.code_sub(
+                    r"(?<![\w.])%s\s*\.\s*%s\b(?!\s*\()"
+                    % (re.escape(ocname), re.escape(f["name"])),
+                    "%s_%s" % (oidn, f["name"]), text)
         member_names = {n for n, _t, _b, _k in (ocl.get("members") or [])}
         for mem in sorted(member_names, key=len, reverse=True):
             if mem.endswith("_x") or mem.endswith("_y") or mem.endswith("_z"):
@@ -7800,11 +8146,15 @@ def _emit_engine_gameobject_tables(
         p("    return _engine_%s_go_of[i];" % idn)
         p("}")
     if want_find:
+        multi = _multi_scene(plan)
+        if multi:
+            p("static int _engine_go_in_loaded_scene(int go);")
         p("static int GameObject_Find(const char *name) {")
         p("    int i;")
         p("    if (!name) return -1;")
         p("    for (i = 0; i < _engine_go_count; i = i + 1)")
-        p("        if (strcmp(_engine_go_name[i], name) == 0) return i;")
+        p("        if (strcmp(_engine_go_name[i], name) == 0%s) return i;"
+          % (" && _engine_go_in_loaded_scene(i)" if multi else ""))
         p("    return -1;")
         p("}")
         p("")
@@ -9642,6 +9992,359 @@ def _emit_engine_ui_button_clicks(
         p("    (void)hit;")
 
 
+def _multi_scene(plan):
+    """Scenes can be (re)loaded at runtime: more than one build scene, or a
+    script calls SceneManager (reloading the only scene restarts it)."""
+    n = len(plan.get("scenes") or [])
+    return n > 1 or (n == 1 and bool(plan.get("scene_manager")))
+
+
+def _emit_engine_scene_tables(go_authored_n, go_n, p, plan):
+    """_emit_engine_ui: SceneManager build scenes, which are loaded, and the
+    scene each GameObject belongs to. Returns whether there is more than one
+    scene (otherwise nothing is emitted)."""
+    if not _multi_scene(plan):
+        return False
+    scenes = plan["scenes"]
+    sn = len(scenes)
+    seed = [int(s) for s in (plan.get("go_scene") or [])[:go_authored_n]]
+    seed += [0] * (go_n - len(seed))
+    p("/* SceneManager: build scenes in buildIndex order. The first is loaded")
+    p(" * at startup; LoadScene / UnloadSceneAsync requests are applied at the")
+    p(" * start of the next frame (_engine_scene_apply_pending). */")
+    p("static const int _engine_scene_count = %d;" % sn)
+    p("static const char *const _engine_scene_name[%d] = { %s };" % (
+        sn, ", ".join(_c_string(s["name"]) for s in scenes)))
+    p("static const char *const _engine_scene_path[%d] = { %s };" % (
+        sn, ", ".join(_c_string(s["path"]) for s in scenes)))
+    p("static int _engine_scene_loaded[%d] = { %s };" % (
+        sn, ", ".join("1" if i == 0 else "0" for i in range(sn))))
+    p("static int _engine_scene_active = 0;")
+    p("static int _engine_scene_pending = -1;")
+    p("static int _engine_scene_pending_add[%d];" % sn)
+    p("static int _engine_scene_pending_unload[%d];" % sn)
+    p("/* Scene of each GameObject; a root's decides for its children.")
+    p(" * -1 = DontDestroyOnLoad, -2 = a clone destroyed with its scene. */")
+    p("static int _engine_go_scene[%d] = { %s };" % (
+        go_n, ", ".join(str(s) for s in seed)))
+    p("static int _engine_go_root_scene_loaded(int root) {")
+    p("    int s;")
+    p("    if (root < 0 || root >= %d) return 1;" % go_n)
+    p("    s = _engine_go_scene[root];")
+    p("    if (s == -1) return 1;")
+    p("    return s >= 0 && s < %d && _engine_scene_loaded[s];" % sn)
+    p("}")
+    p("static int _engine_scene_str_eq(const char *a, const char *b) {")
+    p("    int i = 0;")
+    p("    if (!a || !b) return 0;")
+    p("    while (a[i] && a[i] == b[i]) i = i + 1;")
+    p("    return a[i] == b[i];")
+    p("}")
+    p("/* Build index for a scene name or path (with or without .unity). */")
+    p("static int _engine_scene_index_of(const char *name) {")
+    p("    int s, i;")
+    p("    char buf[512];")
+    p("    for (s = 0; s < %d; s = s + 1) {" % sn)
+    p("        if (_engine_scene_str_eq(name, _engine_scene_name[s])"
+      " || _engine_scene_str_eq(name, _engine_scene_path[s]))")
+    p("            return s;")
+    p("        i = 0;")
+    p("        while (_engine_scene_path[s][i] && i < 511) {")
+    p("            buf[i] = _engine_scene_path[s][i];")
+    p("            i = i + 1;")
+    p("        }")
+    p("        buf[i] = 0;")
+    p("        if (i > 6) buf[i - 6] = 0; /* drop \".unity\" */")
+    p("        if (_engine_scene_str_eq(name, buf)) return s;")
+    p("    }")
+    p("    return -1;")
+    p("}")
+    p("static void SceneManager_LoadScene(int s, int additive) {")
+    p("    if (s < 0 || s >= %d) {" % sn)
+    p("        fprintf(stderr, \"Cannot load scene: Invalid scene name (empty"
+      " string) and invalid build index %d\\n\", s);")
+    p("        return;")
+    p("    }")
+    p("    if (additive) _engine_scene_pending_add[s] = 1;")
+    p("    else _engine_scene_pending = s;")
+    p("}")
+    p("static void SceneManager_LoadSceneName(const char *name, int additive) {")
+    p("    int s = _engine_scene_index_of(name);")
+    p("    if (s < 0) {")
+    p("        fprintf(stderr, \"Scene '%s' couldn't be loaded because it has"
+      " not been added to the build settings or the AssetBundle has not been"
+      " loaded.\\n\", name ? name : \"\");")
+    p("        return;")
+    p("    }")
+    p("    SceneManager_LoadScene(s, additive);")
+    p("}")
+    p("static void SceneManager_UnloadScene(int s) {")
+    p("    if (s < 0 || s >= %d) return;" % sn)
+    p("    _engine_scene_pending_unload[s] = 1;")
+    p("}")
+    p("static void SceneManager_UnloadSceneName(const char *name) {")
+    p("    SceneManager_UnloadScene(_engine_scene_index_of(name));")
+    p("}")
+    p("static int SceneManager_sceneCount(void) {")
+    p("    int s, n = 0;")
+    p("    for (s = 0; s < %d; s = s + 1) n = n + _engine_scene_loaded[s];" % sn)
+    p("    return n;")
+    p("}")
+    p("static const char *Scene_name(int s) {")
+    p("    return (s >= 0 && s < %d) ? _engine_scene_name[s] : \"\";" % sn)
+    p("}")
+    p("static const char *Scene_path(int s) {")
+    p("    return (s >= 0 && s < %d) ? _engine_scene_path[s] : \"\";" % sn)
+    p("}")
+    p("static int Scene_isLoaded(int s) {")
+    p("    return s >= 0 && s < %d && _engine_scene_loaded[s];" % sn)
+    p("}")
+    p("static int _engine_scene_by_index(int s) {")
+    p("    return (s >= 0 && s < %d) ? s : -1;" % sn)
+    p("}")
+    p("static void _engine_scene_apply_pending(void);")
+    p("")
+    return True
+
+
+_MUTABLE_ARRAY_DECL_RE = re.compile(
+    r"^(?:static|extern) ((?:unsigned |signed )?[A-Za-z_]\w*) (_\w+)"
+    r"((?:\[\d+\])+)(?: = .*|);$", re.M)
+_ANY_ARRAY_DECL_RE = re.compile(
+    r"^(?:static |extern )?(?:const )?(?:unsigned |signed )?[A-Za-z_]\w* "
+    r"(_\w+)((?:\[\d+\])+)", re.M)
+
+
+def _scene_row_groups(text, plan, class_ids):
+    """File-scope mutable arrays of the emitted engine, grouped by what a row
+    is: ``(kind, key, rows, [(type, name, dims)])``. *kind* is ``go`` (a
+    GameObject index), ``class`` (an instance of class *key*), ``owner``
+    (a component whose ``<key>owner_class`` / ``owner_inst`` name its
+    instance) or ``ui`` (an element whose ``<key>go`` names its GameObject).
+    Arrays that fit none (per-scene state, counters, scratch) are left out."""
+    go_n = max(1, len(plan.get("go_names") or [])
+               + int(plan.get("instantiate_go_budget") or 0))
+    declared = {m.group(1): [int(d) for d in re.findall(r"\d+", m.group(2))]
+                for m in _ANY_ARRAY_DECL_RE.finditer(text)}
+    caps = {}
+    for cname in class_ids:
+        cl = plan["classes"][cname]
+        caps[_c_ident(cname)] = (
+            max(1, int(cl["n"]) + _mb_pool_extra(plan, cname)), cname)
+    idns = sorted(caps, key=len, reverse=True)
+    groups = {}
+    for m in _MUTABLE_ARRAY_DECL_RE.finditer(text):
+        ty, name, dims_s = m.group(1), m.group(2), m.group(3)
+        if ty == "const":
+            continue
+        dims = [int(d) for d in re.findall(r"\d+", dims_s)]
+        if name.startswith(("_engine_scene_", "_engine_snap_")) \
+                or name == "_engine_go_scene":
+            continue
+        key = None
+        if name.startswith("_engine_go_") and dims[0] == go_n:
+            key = ("go", "", go_n)
+        else:
+            for idn in idns:
+                if (name.startswith("_%s_" % idn)
+                        or name.startswith("_engine_%s_" % idn)) \
+                        and dims[0] == caps[idn][0]:
+                    key = ("class", caps[idn][1], caps[idn][0])
+                    break
+        if key is None:
+            um = re.match(r"(_engine_ui_[a-z]+_)", name)
+            om = re.match(r"(_[A-Z]\w*?_)", name)
+            if um and (um.group(1) + "go") in declared \
+                    and declared[um.group(1) + "go"][0] == dims[0]:
+                key = ("ui", um.group(1), dims[0])
+            elif om and (om.group(1) + "owner_class") in declared \
+                    and (om.group(1) + "owner_inst") in declared \
+                    and declared[om.group(1) + "owner_class"][0] == dims[0]:
+                key = ("owner", om.group(1), dims[0])
+            elif dims[0] == go_n and name.startswith("_engine_"):
+                key = ("go", "", go_n)
+        if key is None:
+            continue
+        groups.setdefault(key, []).append((ty, name, dims))
+    return [(k[0], k[1], k[2], v) for k, v in sorted(groups.items())]
+
+
+def _emit_engine_scene_apply(lines, plan, class_ids):
+    """emit_engine (last): SceneManager scene transitions.
+
+    The first frame snapshots every per-GameObject / per-instance table
+    (``_scene_row_groups``); loading a scene that was loaded before puts
+    its authored rows back, so it starts as authored, and clears the
+    instances' Awake / Start flags. Unloading a scene destroys the clones
+    spawned into it. DontDestroyOnLoad roots and C# statics are untouched."""
+    p = lines.append
+    text = "\n".join(lines)
+    groups = _scene_row_groups(text, plan, class_ids)
+    sn = len(plan["scenes"])
+    go_auth = len(plan.get("go_names") or [])
+    go_n = max(1, go_auth + int(plan.get("instantiate_go_budget") or 0))
+    parent_mutable = re.search(
+        r"^static int _engine_go_parent\[", text, re.M) is not None
+    destroy = re.search(
+        r"^static int _engine_go_destroyed\[", text, re.M) is not None
+    p("/* ---- SceneManager: scene transitions ---- */")
+    p("static const int _engine_go_scene_authored[%d] = { %s };" % (
+        max(1, go_auth), ", ".join(
+            str(int(s)) for s in (plan.get("go_scene") or [0])[:max(1, go_auth)])))
+    p("static int _engine_scene_snapped;")
+    p("static int _engine_scene_was_loaded[%d];" % sn)
+    for _kind, _key, _rows, arrays in groups:
+        for ty, name, dims in arrays:
+            p("static %s _engine_snap%s%s;" % (
+                ty, name, "".join("[%d]" % d for d in dims)))
+    p("/* An authored GameObject of scene s (not moved to DontDestroyOnLoad). */")
+    p("static int _engine_scene_owns_row(int go, int s) {")
+    p("    if (go < 0 || go >= %d) return 0;" % go_auth)
+    p("    if (_engine_go_scene_authored[go] != s) return 0;")
+    p("    return _engine_go_scene[_engine_go_root(go)] != -1;")
+    p("}")
+
+    def _copy(dst, src, dims, ind, row="i"):
+        idx = "[%s]" % row
+        loops = []
+        for k, d in enumerate(dims[1:]):
+            loops.append((chr(ord("j") + k), d))
+        for v, d in loops:
+            p(ind + "for (%s = 0; %s < %d; %s = %s + 1)" % (v, v, d, v, v))
+            ind += "    "
+            idx += "[%s]" % v
+        p(ind + "%s%s = %s%s;" % (dst, idx, src, idx))
+
+    depth = max([len(d) for _k, _y, _r, a in groups for _t, _n, d in a] or [1])
+    loop_vars = ", ".join(["i"] + [chr(ord("j") + k) for k in range(depth - 1)])
+    p("static void _engine_scene_snapshot(void) {")
+    p("    int %s;" % loop_vars)
+    for _kind, _key, rows, arrays in groups:
+        p("    for (i = 0; i < %d; i = i + 1) {" % rows)
+        for _ty, name, dims in arrays:
+            _copy("_engine_snap" + name, name, dims, "        ")
+        p("    }")
+    p("}")
+    p("static void _engine_scene_restore(int s) {")
+    p("    int %s;" % loop_vars)
+    for kind, key, rows, arrays in groups:
+        if kind == "go":
+            own, limit = "_engine_scene_owns_row(i, s)", min(rows, go_auth)
+        elif kind == "class":
+            idn = _c_ident(key)
+            own = "_engine_scene_owns_row(_engine_go_of_%s((unsigned)i), s)" % idn
+            limit = min(rows, int(plan["classes"][key]["n"]))
+        elif kind == "owner":
+            own = ("_engine_scene_owns_row(_engine_owner_go(%sowner_class[i], "
+                   "(unsigned)%sowner_inst[i]), s)" % (key, key))
+            limit = rows
+            if "_engine_owner_go(" not in text:
+                continue
+        else:
+            own, limit = "_engine_scene_owns_row(%sgo[i], s)" % key, rows
+        if limit <= 0:
+            continue
+        p("    for (i = 0; i < %d; i = i + 1) {" % limit)
+        p("        if (!(%s)) continue;" % own)
+        for _ty, name, dims in arrays:
+            _copy(name, "_engine_snap" + name, dims, "        ")
+        p("    }")
+    p("}")
+    p("static void _engine_scene_unload(int s) {")
+    p("    int go;")
+    p("    _engine_scene_loaded[s] = 0;")
+    p("    for (go = %d; go < _engine_go_count && go < %d; go = go + 1) {"
+      % (go_auth, go_n))
+    p("        if (_engine_go_scene[_engine_go_root(go)] != s) continue;")
+    if parent_mutable:
+        p("        _engine_go_parent[go] = -1;")
+    if destroy:
+        p("        _engine_go_destroyed[go] = 1;")
+    p("        _engine_go_scene[go] = -2;")
+    p("    }")
+    p("}")
+    p("static void _engine_scene_load(int s) {")
+    p("    if (_engine_scene_was_loaded[s]) _engine_scene_restore(s);")
+    p("    _engine_scene_was_loaded[s] = 1;")
+    p("    _engine_scene_loaded[s] = 1;")
+    p("}")
+    _emit_engine_scene_camera(p, plan)
+    p("static void _engine_scene_apply_pending(void) {")
+    p("    int s;")
+    p("    if (!_engine_scene_snapped) {")
+    p("        _engine_go_active_init();")
+    p("        _engine_scene_snapshot();")
+    p("        _engine_scene_snapped = 1;")
+    p("        _engine_scene_was_loaded[0] = 1;")
+    p("    }")
+    p("    if (_engine_scene_pending >= 0) {")
+    p("        int t = _engine_scene_pending;")
+    p("        _engine_scene_pending = -1;")
+    p("        for (s = 0; s < %d; s = s + 1)" % sn)
+    p("            if (_engine_scene_loaded[s]) _engine_scene_unload(s);")
+    p("        _engine_scene_load(t);")
+    p("        _engine_scene_active = t;")
+    p("        _engine_scene_set_camera(t);")
+    p("    }")
+    p("    for (s = 0; s < %d; s = s + 1) {" % sn)
+    p("        if (!_engine_scene_pending_add[s]) continue;")
+    p("        _engine_scene_pending_add[s] = 0;")
+    p("        if (!_engine_scene_loaded[s]) _engine_scene_load(s);")
+    p("    }")
+    p("    for (s = 0; s < %d; s = s + 1) {" % sn)
+    p("        if (!_engine_scene_pending_unload[s]) continue;")
+    p("        _engine_scene_pending_unload[s] = 0;")
+    p("        /* Unity refuses to unload the last loaded scene. */")
+    p("        if (!_engine_scene_loaded[s] || SceneManager_sceneCount() < 2)")
+    p("            continue;")
+    p("        _engine_scene_unload(s);")
+    p("        if (_engine_scene_active == s) {")
+    p("            int k;")
+    p("            for (k = 0; k < %d; k = k + 1)" % sn)
+    p("                if (_engine_scene_loaded[k]) { _engine_scene_active = k; break; }")
+    p("        }")
+    p("    }")
+    p("}")
+    p("")
+
+
+def _emit_engine_scene_camera(p, plan):
+    """_emit_engine_scene_apply: Camera.main becomes the loaded scene's
+    MainCamera (else its first Camera); a scene without one keeps the last."""
+    if not plan.get("camera"):
+        p("static void _engine_scene_set_camera(int s) { (void)s; }")
+        return
+    sn = len(plan["scenes"])
+    per = []
+    for s in range(sn):
+        cams = [c for c in (plan.get("cameras") or []) if int(c.get("scene") or 0) == s]
+        main = next((c for c in cams if c.get("main")), cams[0] if cams else None)
+        per.append(main)
+    fields = (
+        ("pos_x", lambda c: c["pos"][0]), ("pos_y", lambda c: c["pos"][1]),
+        ("pos_z", lambda c: c["pos"][2]),
+        ("orthographicSize", lambda c: c["orthographic_size"]),
+        ("nearClipPlane", lambda c: c.get("near_clip", 0.3)),
+        ("farClipPlane", lambda c: c.get("far_clip", 1000.0)),
+        ("background_r", lambda c: c["bg_r"]), ("background_g", lambda c: c["bg_g"]),
+        ("background_b", lambda c: c["bg_b"]),
+    )
+    p("static const int _engine_scene_has_camera[%d] = { %s };" % (
+        sn, ", ".join("1" if c else "0" for c in per)))
+    for fname, get in fields:
+        p("static const float _engine_scene_cam_%s[%d] = { %s };" % (
+            fname, sn, ", ".join(
+                "%sf" % repr(float(get(c))) if c else "0.f" for c in per)))
+    p("static const int _engine_scene_cam_orthographic[%d] = { %s };" % (
+        sn, ", ".join(str(int(c["orthographic"])) if c else "0" for c in per)))
+    p("static void _engine_scene_set_camera(int s) {")
+    p("    if (s < 0 || s >= %d || !_engine_scene_has_camera[s]) return;" % sn)
+    for fname, _get in fields:
+        p("    Camera_main_%s = _engine_scene_cam_%s[s];" % (fname, fname))
+    p("    Camera_main_orthographic = _engine_scene_cam_orthographic[s];")
+    p("}")
+
+
 def _emit_engine_ui(
         go_authored_n, go_n, go_spawn_budget, p, plan, ui_buttons, ui_eventtriggers,
         ui_scrollbars, ui_scrollrects, ui_sliders, ui_toggles, want_live_rt, want_ui):
@@ -9657,6 +10360,7 @@ def _emit_engine_ui(
     ] + [1] * go_spawn_budget
     if not go_active:
         go_active = [1]
+    multi_scene = _emit_engine_scene_tables(go_authored_n, go_n, p, plan)
     p("/* GameObject.activeSelf — host pointer + authored Button */")
     p("static int _engine_go_active[%d];" % go_n)
     p("static int _engine_go_active_inited;")
@@ -9672,15 +10376,41 @@ def _emit_engine_ui(
     p("}")
     p("static int _engine_go_active_in_hierarchy(int go) {")
     p("    int guard = 0;")
+    if multi_scene:
+        p("    int root = go;")
     p("    _engine_go_active_init();")
     p("    while (go >= 0 && go < %d && guard < %d) {"
       % (go_n, go_n + 2))
     p("        if (!_engine_go_active[go]) return 0;")
+    if multi_scene:
+        p("        root = go;")
     p("        go = _engine_go_parent[go];")
     p("        guard = guard + 1;")
     p("    }")
-    p("    return 1;")
+    if multi_scene:
+        p("    return _engine_go_root_scene_loaded(root);")
+    else:
+        p("    return 1;")
     p("}")
+    if multi_scene:
+        p("static int _engine_go_root(int go) {")
+        p("    int guard = 0;")
+        p("    while (go >= 0 && go < %d && guard < %d"
+          " && _engine_go_parent[go] >= 0) {" % (go_n, go_n + 2))
+        p("        go = _engine_go_parent[go];")
+        p("        guard = guard + 1;")
+        p("    }")
+        p("    return go;")
+        p("}")
+        p("static int _engine_go_in_loaded_scene(int go) {")
+        p("    return _engine_go_root_scene_loaded(_engine_go_root(go));")
+        p("}")
+        p("/* Object.DontDestroyOnLoad: only a root GameObject moves (Unity). */")
+        p("static void Object_DontDestroyOnLoad(int go) {")
+        p("    if (go < 0 || go >= %d || _engine_go_parent[go] >= 0) return;"
+          % go_n)
+        p("    _engine_go_scene[go] = -1;")
+        p("}")
     p("static void GameObject_SetActive(int go, int active) {")
     p("    _engine_go_active_init();")
     p("    if (go < 0 || go >= %d) return;" % go_n)
@@ -10151,6 +10881,8 @@ def _emit_engine_instantiate(
                 p("    go = _engine_go_count;")
                 p("    _engine_go_count = _engine_go_count + 1;")
             p("    _engine_go_name[go] = \"(Clone)\";")
+            if _multi_scene(plan):
+                p("    _engine_go_scene[go] = _engine_scene_active;")
             if want_ui:
                 # Instantiate copies activeSelf from the source GO.
                 p("    _engine_go_active_init();")
@@ -10307,6 +11039,8 @@ def _emit_engine_find_object_of_type(
             p("    for (go = 0; go < _engine_go_count; go = go + 1) {")
             if want_destroy:
                 p("        if (_engine_go_destroyed[go]) continue;")
+            if _multi_scene(plan):
+                p("        if (!_engine_go_in_loaded_scene(go)) continue;")
             p("        ci = _engine_go_%s[go];" % idn)
             p("        if (ci < 0) continue;")
             if want_ui:
@@ -10332,6 +11066,8 @@ def _emit_engine_find_object_of_type(
             p("        if (go >= 0 && go < _engine_go_count")
             if want_destroy:
                 p("            && !_engine_go_destroyed[go]")
+            if _multi_scene(plan):
+                p("            && _engine_go_in_loaded_scene(go)")
             p("            && _engine_go_%s[go] == %s_instance)"
               % (idn, idn))
             p("            return %s_instance;" % idn)
@@ -10603,10 +11339,74 @@ def _emit_engine_live_rotation(p, want_live_rot):
         p("")
 
 
+def _emit_class_scalar_statics(p, plan, cl, idn):
+    """emit_engine: a class's scalar const / static fields, ahead of
+    every class group so other classes' methods can use them."""
+    # Class-level const / static fields (FRAME_CNT, LOG_FILE_PATH, …).
+    data_path = plan.get("data_path") or ""
+    persistent_path = plan.get("persistent_data_path") or ""
+    for f in cl.get("class_consts") or []:
+        fname = f["name"]
+        default = f.get("default")
+        if f.get("ty") == "string":
+            if isinstance(default, dict) and default.get("kind") == "dataPath+":
+                path = data_path + (default.get("suffix") or "")
+            elif isinstance(default, dict) and default.get("kind") == "dataPath":
+                path = data_path
+            elif (isinstance(default, dict)
+                  and default.get("kind") == "persistentDataPath+"):
+                path = persistent_path + (default.get("suffix") or "")
+            elif (isinstance(default, dict)
+                  and default.get("kind") == "persistentDataPath"):
+                path = persistent_path
+            elif isinstance(default, str):
+                path = default
+            else:
+                path = ""
+            p("static const char %s_%s[] = %s;" % (
+                idn, fname, _c_string(path)))
+        elif f.get("ty") == "bool":
+            # `static bool flag;` / `= false` — mutable unless C# const.
+            truthy = default in (True, 1, "true", "True")
+            init = 1 if truthy else 0
+            if f.get("const"):
+                p("static const int %s_%s = %d;" % (idn, fname, init))
+            else:
+                p("static int %s_%s = %d;" % (idn, fname, init))
+        elif (isinstance(default, (int, float))
+              or (default is None
+                  and f.get("ty") in _STATIC_NUMERIC_TYPES)):
+            # C# `const` stays const; a plain `static` is mutable, and an
+            # uninitialized one starts at 0 as in C#.
+            qual = "static const" if f.get("const") else "static"
+            val = default if default is not None else 0
+            if f.get("ty") in ("float", "double"):
+                p("%s float %s_%s = %sf;" % (
+                    qual, idn, fname, repr(float(val))))
+            else:
+                p("%s int %s_%s = %d;" % (
+                    qual, idn, fname, int(val)))
+        elif f.get("ty") in ("StreamWriter", "StreamReader"):
+            p("static FILE *%s_%s;" % (idn, fname))
+        # List / Dictionary / SortedList / ref arrays: preamble above.
+    if any(_is_scalar_static(f) for f in (cl.get("class_consts") or [])):
+        p("")
+
+
+def _is_scalar_static(f):
+    """A class const / static field `_emit_class_scalar_statics` emits as a
+    plain `Class_name` C variable."""
+    return (f.get("ty") in ("string", "bool", "StreamWriter", "StreamReader")
+            or isinstance(f.get("default"), (int, float))
+            or (f.get("default") is None
+                and f.get("ty") in _STATIC_NUMERIC_TYPES))
+
+
 def _emit_engine_static_collections(_emitted_coll, p, plan):
     """emit_engine: Class-level static List / Dictionary storage."""
     for cname, cl in sorted(plan["classes"].items()):
         idn = _c_ident(cname)
+        _emit_class_scalar_statics(p, plan, cl, idn)
         cap = max(1, int(cl.get("n") or 0))
         for f in cl.get("class_consts") or []:
             if _list_elem_name(f.get("ty") or ""):
@@ -10660,62 +11460,6 @@ def _emit_engine_class_groups(
         p("/* ---- %s group: instance array is defined in data.c ---- */" % idn)
         p("#define %s_AT(i) (_%s_inst_array[(i)])" % (idn, idn))
         p("")
-        # Class-level const / static fields (FRAME_CNT, LOG_FILE_PATH, …).
-        data_path = plan.get("data_path") or ""
-        persistent_path = plan.get("persistent_data_path") or ""
-        for f in cl.get("class_consts") or []:
-            fname = f["name"]
-            default = f.get("default")
-            if f.get("ty") == "string":
-                if isinstance(default, dict) and default.get("kind") == "dataPath+":
-                    path = data_path + (default.get("suffix") or "")
-                elif isinstance(default, dict) and default.get("kind") == "dataPath":
-                    path = data_path
-                elif (isinstance(default, dict)
-                      and default.get("kind") == "persistentDataPath+"):
-                    path = persistent_path + (default.get("suffix") or "")
-                elif (isinstance(default, dict)
-                      and default.get("kind") == "persistentDataPath"):
-                    path = persistent_path
-                elif isinstance(default, str):
-                    path = default
-                else:
-                    path = ""
-                p("static const char %s_%s[] = %s;" % (
-                    idn, fname, _c_string(path)))
-            elif f.get("ty") == "bool":
-                # `static bool flag;` / `= false` — mutable unless C# const.
-                truthy = default in (True, 1, "true", "True")
-                init = 1 if truthy else 0
-                if f.get("const"):
-                    p("static const int %s_%s = %d;" % (idn, fname, init))
-                else:
-                    p("static int %s_%s = %d;" % (idn, fname, init))
-            elif (isinstance(default, (int, float))
-                  or (default is None
-                      and f.get("ty") in _STATIC_NUMERIC_TYPES)):
-                # C# `const` stays const; a plain `static` is mutable, and an
-                # uninitialized one starts at 0 as in C#.
-                qual = "static const" if f.get("const") else "static"
-                val = default if default is not None else 0
-                if f.get("ty") in ("float", "double"):
-                    p("%s float %s_%s = %sf;" % (
-                        qual, idn, fname, repr(float(val))))
-                else:
-                    p("%s int %s_%s = %d;" % (
-                        qual, idn, fname, int(val)))
-            elif f.get("ty") in ("StreamWriter", "StreamReader"):
-                p("static FILE *%s_%s;" % (idn, fname))
-            # List / Dictionary / SortedList / ref arrays: preamble above.
-        if any(
-                f.get("ty") == "string"
-                or f.get("ty") == "bool"
-                or isinstance(f.get("default"), (int, float))
-                or (f.get("default") is None
-                    and f.get("ty") in _STATIC_NUMERIC_TYPES)
-                or f.get("ty") in ("StreamWriter", "StreamReader")
-                for f in (cl.get("class_consts") or [])):
-            p("")
         # Position accessors: SoA table or AoS fields.
         if cl.get("soa_dims"):
             logical = _soa_axis_count(cl)
@@ -10807,10 +11551,13 @@ def _emit_engine_class_groups(
                 "path": _assets_rel_path(c.get("path") or cl.get("path") or ""),
                 "body_abs": int(m.get("body_abs") or 0),
                 "file_text": c.get("file_text") or "",
+                "args": m.get("args") or "",
             }
             body = _lower_method_body(
                 m["body"], cl, plan, site=site,
                 collision2d_param=coll_param)
+            for proto in sorted(site.get("protos") or ()):
+                p(proto)
             # Site marker so crust/shivyc failures map back to C#.
             cs_line = 1
             ft = site.get("file_text") or ""
@@ -10968,12 +11715,23 @@ def _emit_engine_class_groups(
             p("")
             continue
 
-        if has_awake or has_start:
+        # Several scenes: only instances in a loaded scene run, and each
+        # authored instance gets Awake / Start when its scene (re)loads.
+        multi = _multi_scene(plan)
+        live = ("_engine_go_in_loaded_scene(_engine_go_of_%s((unsigned)n))"
+                % idn)
+        if multi and (has_awake or has_start):
+            p("/* Awake (1) / Start (2) done, per instance (scene reloads clear it) */")
+            p("static unsigned char _%s_life[%d];"
+              % (idn, max(1, int(cl["n"]) + _mb_pool_extra(plan, cname))))
+        elif has_awake or has_start:
             p("static int _%s_started = 0;" % idn)
         p("void %s_FixedTick(void) {" % idn)
         if has_fixed:
             p("    int n;")
             p("    for (n = 0; n < _%s_inst_count; n = n + 1) {" % idn)
+            if multi:
+                p("        if (!%s) continue;" % live)
             _call_script("FixedUpdate", "        ")
             p("    }")
         else:
@@ -10983,7 +11741,19 @@ def _emit_engine_class_groups(
         p("void %s_Tick(void) {" % idn)
         if has_awake or has_start or has_update:
             p("    int n;")
-        if has_awake or has_start:
+        if multi and (has_awake or has_start):
+            for method, bit in (("Awake", 1), ("Start", 2)):
+                if not (has_awake if method == "Awake" else has_start):
+                    continue
+                p("    for (n = 0; n < _%s_inst_count && n < %d; n = n + 1) {"
+                  % (idn, int(cl["n"])))
+                p("        if ((_%s_life[n] & %d) || !%s) continue;"
+                  % (idn, bit, live))
+                p("        _%s_life[n] = (unsigned char)(_%s_life[n] | %d);"
+                  % (idn, idn, bit))
+                _call_script(method, "        ")
+                p("    }")
+        elif has_awake or has_start:
             p("    if (!_%s_started) {" % idn)
             p("        _%s_started = 1;" % idn)
             if has_awake:
@@ -11005,6 +11775,8 @@ def _emit_engine_class_groups(
                 p("            if (_dgo >= 0 && _engine_go_destroyed[_dgo])")
                 p("                continue;")
                 p("        }")
+            if multi:
+                p("        if (!%s) continue;" % live)
             _call_script("Update", "        ")
             p("    }")
         elif not has_awake and not has_start:
@@ -11694,6 +12466,31 @@ def _emit_engine_box2d_exports(
             p("    if (a < 0 || b < 0) return;")
         p("}")
         p("")
+        if plan.get("physics2d_live"):
+            p("/* Whether a body's GameObject is in the simulation (active, in a")
+            p(" * loaded scene); the glue disables the bodies that are not. */")
+            p("static int _engine_owner_go(int oc, unsigned oi) {")
+            p("    switch (oc) {")
+            for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
+                p("    case %d: return _engine_go_of_%s(oi);"
+                  % (cid, _c_ident(cname)))
+            p("    default: return -1;")
+            p("    }")
+            p("}")
+            p("int engine_rb2d_live(int rb) {")
+            p("    int go = _engine_owner_go(_Rigidbody2D_owner_class[rb],")
+            p("                              (unsigned)_Rigidbody2D_owner_inst[rb]);")
+            p("    return go < 0 || _engine_go_active_in_hierarchy(go);")
+            p("}")
+            p("int engine_col2d_live(int ci) {")
+            if want_col2d and col2d_list:
+                p("    int go = _engine_owner_go(_Collider2D_owner_class[ci],")
+                p("                              (unsigned)_Collider2D_owner_inst[ci]);")
+                p("    return go < 0 || _engine_go_active_in_hierarchy(go);")
+            else:
+                p("    return ci >= 0;")
+            p("}")
+            p("")
 
 
 def _emit_engine_physics_fixed(
@@ -12334,7 +13131,9 @@ def emit_engine(plan, analyses, used_apis):
                or bool(ui_scrollrects) or bool(ui_toggles)
                or bool(ui_eventtriggers)
                or ("GameObject.SetActive" in used_apis)
-               or authored_inactive or _plan_has_ui_draws(plan))
+               or authored_inactive or _plan_has_ui_draws(plan)
+               or _multi_scene(plan))
+    plan["physics2d_live"] = _multi_scene(plan)
     rt_apis = (
         "rectTransform.anchoredPosition" in used_apis
         or "rectTransform.sizeDelta" in used_apis)
@@ -13335,6 +14134,8 @@ def emit_engine(plan, analyses, used_apis):
     p("    int _fixed_guard;")
     p("    if (_dt > 0.33333334f) _dt = 0.33333334f; /* Time.maximumDeltaTime */")
     p("    if (_dt < 0.f) _dt = 0.f;")
+    if _multi_scene(plan):
+        p("    _engine_scene_apply_pending();")
     if "Time.time" in used_apis:
         p("    Time_time = Time_time + Time_deltaTime;")
     if want_ui:
@@ -13490,6 +14291,8 @@ def emit_engine(plan, analyses, used_apis):
     p("    return n;")
     p("}")
     p("")
+    if _multi_scene(plan):
+        _emit_engine_scene_apply(lines, plan, class_ids)
     return "\n".join(lines) + "\n"
 
 
@@ -15394,6 +16197,30 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         r"(?:[\w.]+\.)?InputManager\s*\.\s*InputDevice\s*\.\s*(\w+)\b",
         lambda m: _input_dev.get(m.group(1), "0"),
         text)
+    text = _inline_static_getters(text, cl, plan)
+    if null_handle is not None:
+        text = cs2cpp._lower_null_compares(text, null_handle)
+    ddol = r"(?<![\w.])(?:(?:UnityEngine\s*\.\s*)?Object\s*\.\s*)?DontDestroyOnLoad\s*\(\s*"
+    if _multi_scene(plan) and plan.get("go_names"):
+        params = cs2cpp.parse_params((site or {}).get("args") or "")
+        file_text = (site or {}).get("file_text") or ""
+        strings = {prm.name for prm in params if prm.type in ("string", "String")}
+        strings |= set(re.findall(r"\bstring\s+(\w+)\s*[;=,)]", file_text))
+        scenes = {prm.name for prm in params if prm.type.split(".")[-1] == "Scene"}
+        scenes |= set(re.findall(r"(?<![\w.])Scene\s+(\w+)\s*[;=]", text))
+        text = _lower_scene_manager(text, strings, scenes)
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])(?:UnityEngine\s*\.\s*SceneManagement\s*\.\s*)?Scene"
+            r"(?=\s+\w+\s*[;=])", "int", text)
+        text = cs2cpp.code_sub(
+            ddol + r"(?:gameObject|this|transform)\s*\)",
+            "Object_DontDestroyOnLoad(_engine_go_of_%s(i))" % idn, text)
+        text = cs2cpp.code_sub(ddol, "Object_DontDestroyOnLoad(", text)
+    else:
+        # One scene that is never reloaded: nothing is ever unloaded.
+        text = cs2cpp.code_sub(
+            ddol + r"(?:gameObject|this|transform)\s*\)",
+            "/* DontDestroyOnLoad */ (void)0", text)
     # Collections: cs2cpp lowers them from what the plan says about each
     # class (maps before lists, so a two-argument `Add` is a map's).
     text = cs2cpp.lower_packed_collections(
@@ -15723,8 +16550,12 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         if mname in _UNITY_EMIT_MESSAGES:
             # Awake/Start/Update are called from the tick loop, not inlined.
             continue
-        # Overloads need arg-type dispatch — leave bare for the stub detector.
         if mname in overloaded:
+            cands = [tm for tm in this_method_list if tm.get("name") == mname]
+            if all(_returns_void(tm) for tm in cands):
+                text = _rewrite_method_calls(
+                    text, r"(?<![\w.])%s\s*\(" % re.escape(mname),
+                    cands, idn, "i", True, string_idents)
             continue
         sym = "%s_%s" % (idn, mname)
         params = []
@@ -15744,6 +16575,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
             r"(?<![\w.])%s\s*\(\s*([^)]*)\s*\)" % re.escape(mname),
             _inst_call,
             text)
+    text = _rewrite_singleton_method_calls(text, plan, cl, site, string_idents)
     # A `_set_(` another rewrite left open at the end of its line.
     fixed = []
     for line in text.split("\n"):
@@ -16615,6 +17447,15 @@ def _load_prefab_objects_for_types(root, type_names, guids, assets, typename_map
     return out
 
 
+def _scene_list(root, paths):
+    """Build scenes in buildIndex order: ``{name, path}`` (Unity ``Scene.name``
+    is the file name without ``.unity``; ``Scene.path`` is project-relative)."""
+    return [{
+        "name": os.path.splitext(os.path.basename(p))[0],
+        "path": os.path.relpath(p, root).replace(os.sep, "/"),
+    } for p in paths]
+
+
 def _load_scenes_lights_cameras(root, assets):
     """Parse scenes / tscn / blender JSON → objects, lights, cameras, hierarchy.
 
@@ -16626,16 +17467,20 @@ def _load_scenes_lights_cameras(root, assets):
     cameras = []
     hierarchy = []
     scenes = _unity_scenes_to_pack(root, asset_guids=assets)
-    _progress("packing %d startup scene(s)" % len(scenes))
+    _progress("packing %d build scene(s)" % len(scenes))
     for si, path in enumerate(scenes):
         _progress("  scene %d/%d %s" % (
             si + 1, len(scenes), os.path.relpath(path, root)))
         objs, scene_lights, scene_cams, scene_hier = parse_unity_yaml(
-            _read(path), guid_to_script=guids, asset_guids=assets)
+            _scene_local_file_ids(_read(path), si),
+            guid_to_script=guids, asset_guids=assets)
+        for rec in objs + scene_lights + scene_cams + scene_hier:
+            rec["scene"] = si
         objects.extend(objs)
         lights.extend(scene_lights)
         cameras.extend(scene_cams)
         hierarchy.extend(scene_hier)
+    _load_scenes_lights_cameras.scenes = _scene_list(root, scenes)
     for path in _walk_files(root, (".tscn",)):
         objects.extend(parse_godot_tscn(_read(path)))
     for path in _walk_files(root, (".json",)):
@@ -17250,7 +18095,7 @@ def _refused_api_site(analyses, api):
 _STAMP_NAME = ".unity_pack_stamp.json"
 _STAMP_VERSION = 4
 _SCENE_CACHE_NAME = ".unity_pack_scene_cache"
-_SCENE_CACHE_VERSION = 3
+_SCENE_CACHE_VERSION = 4
 # Authored inputs under Assets/ that affect emit (skip Library / PackageCache).
 _FINGERPRINT_EXTS = (
     ".cs", ".unity", ".prefab", ".meta",
@@ -17387,6 +18232,8 @@ def _write_scene_cache(outdir, assets_fp, objects, lights, cameras, hierarchy,
         "asset_guids": dict(asset_guids),
         "ui_layout": list(
             getattr(_load_scenes_lights_cameras, "ui_layout", None) or []),
+        "scenes": list(
+            getattr(_load_scenes_lights_cameras, "scenes", None) or []),
     }
     path = _scene_cache_path(outdir)
     tmp = path + ".tmp"
@@ -17418,6 +18265,7 @@ def _read_scene_cache(outdir, assets_fp):
     ul = payload.get("ui_layout") or []
     if isinstance(ul, (list, tuple)) and len(ul) >= 2:
         _load_scenes_lights_cameras.ui_layout = (int(ul[0]), int(ul[1]))
+    _load_scenes_lights_cameras.scenes = list(payload.get("scenes") or [])
     return (
         objects,
         list(payload.get("lights") or []),
@@ -17567,6 +18415,7 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
     Box2D's event arrays.
     """
     physics_key = "box2d+inject" if physics_inject else "box2d"
+    _TYPE_DECL_ROOT[0] = os.path.abspath(root)
     os.makedirs(outdir, exist_ok=True)
     fp, assets_fp, scripts_fp = _input_fingerprints(
         root, soa=soa, soa_vec4=soa_vec4, gpu_handles=gpu_handles)
@@ -17660,6 +18509,8 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
     plan["getcomponentsinchildren_types"] = sorted(gcic_types)
     plan["mb_bases"] = _collect_mb_bases(analyses)
     plan["interfaces"] = _collect_interfaces(analyses)
+    plan["scene_manager"] = "SceneManager" in used_apis
+    plan["static_getters"] = _collect_static_getters(analyses)
     plan["addcomponent_types"] = sorted(add_types)
     plan["addcomponent_budget"] = _addcomponent_budget(analyses, plan)
     plan["instantiate_budget"] = _instantiate_budget(analyses, plan)
@@ -17737,6 +18588,9 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
     plan["go_names"] = go_names
     plan["go_has_sprite"] = sorted(_gos_with_sprite(plan))
     plan["go_active"] = _build_go_active(plan, go_names)
+    plan["scenes"] = list(
+        getattr(_load_scenes_lights_cameras, "scenes", None) or [])
+    plan["go_scene"] = _build_go_scene(plan, go_names)
     plan["go_components"] = go_comps
     plan["go_ui_components"] = _build_go_ui_component_maps(plan, analyses)
     plan["go_parents"] = _build_go_parents(plan)

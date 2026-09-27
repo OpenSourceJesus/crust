@@ -181,7 +181,7 @@ class TestBuildSettingsAndActive(unittest.TestCase):
         self.assertNotIn("EditorRoot", hier_names)
         self.assertNotIn("EditorChild", hier_names)
 
-    def test_only_first_enabled_build_scene_packed(self):
+    def test_enabled_build_scenes_packed_in_build_order(self):
         root = tempfile.mkdtemp(prefix="upack-build-scenes-")
         scripts = os.path.join(root, "Assets", "Scripts")
         ps = os.path.join(root, "ProjectSettings")
@@ -222,13 +222,18 @@ class TestBuildSettingsAndActive(unittest.TestCase):
                 "    guid: 33333333333333333333333333333333\n"
             )
         paths = unity_pack._unity_scenes_to_pack(root)
-        self.assertEqual(len(paths), 1)
+        self.assertEqual(len(paths), 2)
         self.assertTrue(paths[0].endswith("Boot.unity"))
+        self.assertTrue(paths[1].endswith("Level.unity"))
         objs, _a, _l, _c, hier = unity_pack.load_project(root)
-        names = {o["name"] for o in objs} | {h["name"] for h in hier}
-        self.assertIn("BootGO", names)
-        self.assertNotIn("LevelGO", names)
-        self.assertNotIn("ExtraGO", names)
+        scene_of = {h["name"]: h["scene"] for h in hier}
+        self.assertEqual(scene_of, {"BootGO": 0, "LevelGO": 1})
+        # Both scenes author fileIDs 1..3: they must stay distinct objects.
+        self.assertEqual(sorted(o["name"] for o in objs), ["BootGO", "LevelGO"])
+        self.assertEqual(len({h["xf_id"] for h in hier}), 2)
+        self.assertEqual(
+            [s["name"] for s in unity_pack._load_scenes_lights_cameras.scenes],
+            ["Boot", "Level"])
 
     def test_go_active_seeded_in_engine(self):
         root = tempfile.mkdtemp(prefix="upack-active-")
@@ -14144,6 +14149,22 @@ class TestParamLists(_ScriptPackMixin, unittest.TestCase):
         self.assertIn("other == -1", eng)
         self.assertEqual(self._total_after_four_updates(d), 420)
 
+    @needs_cc
+    def test_default_of_enum_and_class_param(self):
+        d, eng = self._pack(
+            "using UnityEngine;\n"
+            "public enum Mode { Off, On }\n"
+            "public class Tally : MonoBehaviour {\n"
+            "    public int total;\n"
+            "    void Hit(Tally other = default(Tally), Mode m = default(Mode),\n"
+            "             int k = default) {\n"
+            "        if (other == null) { total = total + 5 + k; }\n"
+            "    }\n"
+            "    void Update() { Hit(); }\n"
+            "}\n")
+        self.assertIn("Tally_Hit(i, -1, 0, 0);", eng)
+        self.assertEqual(self._total_after_four_updates(d), 20)
+
     def test_non_literal_default_is_still_refused(self):
         # A named constant needs type-aware lowering: the call is left short
         # and the pack refuses it with a clear argument-count error.
@@ -14399,6 +14420,282 @@ class TestBox2DPhysicsBackend(unittest.TestCase):
     def test_box2d_injected_matches_standard(self):
         """Contact markers instead of event arrays: identical results."""
         self.assertEqual(self._run(inject=True), self._run(inject=False))
+
+
+class TestSceneManager(unittest.TestCase):
+    """Every enabled build scene is packed and SceneManager swaps them."""
+
+    def _project(self, scripts, scenes):
+        root = tempfile.mkdtemp(prefix="upack-scenes-")
+        self.addCleanup(shutil.rmtree, root, True)
+        for sub in ("Assets/Scripts", "Assets/Scenes", "ProjectSettings"):
+            os.makedirs(os.path.join(root, sub))
+        guids = {}
+        for i, (cls, src) in enumerate(sorted(scripts.items())):
+            guids[cls] = ("%02x" % (i + 0xa0)) * 16
+            path = os.path.join(root, "Assets", "Scripts", cls + ".cs")
+            with open(path, "w") as f:
+                f.write(src)
+            with open(path + ".meta", "w") as f:
+                f.write("guid: %s\n" % guids[cls])
+        build = []
+        for si, (sname, gos) in enumerate(scenes):
+            out = ["%YAML 1.1"]
+            for gi, (go_name, cls) in enumerate(gos):
+                go, xf, mb = 3 * gi + 1, 3 * gi + 2, 3 * gi + 3
+                out += [
+                    "--- !u!1 &%d" % go, "GameObject:",
+                    "  m_Name: %s" % go_name, "  m_IsActive: 1",
+                    "  m_Component:",
+                    "  - component: {fileID: %d}" % xf,
+                    "  - component: {fileID: %d}" % mb,
+                    "--- !u!4 &%d" % xf, "Transform:",
+                    "  m_GameObject: {fileID: %d}" % go,
+                    "  m_LocalPosition: {x: 0, y: 0, z: 0}",
+                    "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}",
+                    "  m_LocalScale: {x: 1, y: 1, z: 1}",
+                    "  m_Father: {fileID: 0}",
+                    "--- !u!114 &%d" % mb, "MonoBehaviour:",
+                    "  m_GameObject: {fileID: %d}" % go,
+                    "  m_Script: {fileID: 11500000, guid: %s, type: 3}"
+                    % guids[cls],
+                ]
+            path = os.path.join(root, "Assets", "Scenes", sname + ".unity")
+            with open(path, "w") as f:
+                f.write("\n".join(out) + "\n")
+            sg = ("%02x" % (si + 0x11)) * 16
+            with open(path + ".meta", "w") as f:
+                f.write("guid: %s\n" % sg)
+            build.append("  - enabled: 1\n    path: Assets/Scenes/%s.unity\n"
+                         "    guid: %s\n" % (sname, sg))
+        with open(os.path.join(root, "ProjectSettings",
+                               "EditorBuildSettings.asset"), "w") as f:
+            f.write("%YAML 1.1\n--- !u!1045 &1\nEditorBuildSettings:\n"
+                    "  m_Scenes:\n" + "".join(build))
+        return root
+
+    def _frames(self, scripts, scenes, n):
+        """Pack, build and tick `n` frames; return each frame's log lines."""
+        root = self._project(scripts, scenes)
+        d = tempfile.mkdtemp(prefix="upack-scenes-out-")
+        self.addCleanup(shutil.rmtree, d, True)
+        with contextlib.redirect_stderr(io.StringIO()):
+            unity_pack.pack(root, d, force=True)
+        host = os.path.join(d, "host.c")
+        with open(host, "w") as f:
+            f.write(
+                "#include <stdio.h>\n"
+                "void engine_tick(void);\n"
+                "void engine_set_log_file(const char *path);\n"
+                "extern float Time_deltaTime;\n"
+                "float engine_pointer_x, engine_pointer_y;\n"
+                "int engine_pointer_down;\n"
+                "int main(void) {\n"
+                "    int f;\n"
+                "    engine_set_log_file(\"-\");\n"
+                "    Time_deltaTime = 0.02f;\n"
+                "    for (f = 0; f < %d; f++) {\n"
+                "        printf(\"@frame\\n\");\n"
+                "        engine_tick();\n"
+                "    }\n"
+                "    return 0;\n"
+                "}\n" % n)
+        exe = os.path.join(d, "host")
+        subprocess.run(
+            [_CC, "-o", exe, host, os.path.join(d, "engine.c"),
+             os.path.join(d, "data.c"), "-lm"],
+            check=True, capture_output=True)
+        out = subprocess.run([exe], check=True, capture_output=True,
+                             text=True).stdout
+        return [sorted(l for l in chunk.splitlines() if l)
+                for chunk in out.split("@frame\n")[1:]]
+
+    @needs_cc
+    def test_load_scene_swaps_and_reloads_as_authored(self):
+        menu = (
+            "using UnityEngine;\nusing UnityEngine.SceneManagement;\n"
+            "public class Menu : MonoBehaviour {\n"
+            "    public int ticks;\n    public int awakes;\n"
+            "    public static int loads;\n"
+            "    void Awake() { awakes = awakes + 1; loads = loads + 1; }\n"
+            "    void Update() {\n"
+            "        ticks = ticks + 1;\n"
+            "        Debug.Log(\"menu \" + ticks + \" \" + awakes"
+            " + \" \" + loads);\n"
+            "        if (ticks == 3) SceneManager.LoadScene(\"Level\");\n"
+            "    }\n}\n")
+        level = (
+            "using UnityEngine;\nusing UnityEngine.SceneManagement;\n"
+            "public class Level : MonoBehaviour {\n"
+            "    public int ticks;\n"
+            "    static Scene Current {"
+            " get { return SceneManager.GetActiveScene(); } }\n"
+            "    void Update() {\n"
+            "        ticks = ticks + 1;\n"
+            "        Debug.Log(\"level \" + ticks + \" \""
+            " + SceneManager.GetActiveScene().name + \" \""
+            " + Current.buildIndex);\n"
+            "        if (ticks == 2) SceneManager.LoadScene(0);\n"
+            "    }\n}\n")
+        frames = self._frames(
+            {"Menu": menu, "Level": level},
+            [("Menu", [("M", "Menu")]), ("Level", [("L", "Level")])], 9)
+        self.assertEqual(frames, [
+            ["menu 1 1 1"], ["menu 2 1 1"], ["menu 3 1 1"],
+            ["level 1 Level 1"], ["level 2 Level 1"],
+            # Menu comes back as authored (Awake again); statics persist.
+            ["menu 1 1 2"], ["menu 2 1 2"], ["menu 3 1 2"],
+            ["level 1 Level 1"],
+        ])
+
+    @needs_cc
+    def test_dont_destroy_on_load_survives_scene_swap(self):
+        keeper = (
+            "using UnityEngine;\n"
+            "public class Keeper : MonoBehaviour {\n"
+            "    public int ticks;\n"
+            "    void Awake() { DontDestroyOnLoad(gameObject); }\n"
+            "    void Update() {"
+            " ticks = ticks + 1; Debug.Log(\"keeper \" + ticks); }\n}\n")
+        driver = (
+            "using UnityEngine;\nusing UnityEngine.SceneManagement;\n"
+            "public class Driver%s : MonoBehaviour {\n"
+            "    public int ticks;\n"
+            "    void Update() {\n"
+            "        ticks = ticks + 1;\n"
+            "        Debug.Log(\"%s \" + ticks);\n"
+            "        if (ticks == 2) SceneManager.LoadScene(%d);\n"
+            "    }\n}\n")
+        frames = self._frames(
+            {"Keeper": keeper, "DriverA": driver % ("A", "A", 1),
+             "DriverB": driver % ("B", "B", 0)},
+            [("First", [("K", "Keeper"), ("A", "DriverA")]),
+             ("Second", [("B", "DriverB")])], 5)
+        self.assertEqual(frames[0], ["A 1", "keeper 1"])
+        self.assertEqual(frames[2], ["B 1", "keeper 3"])
+        self.assertIn("A 1", frames[4])
+        self.assertIn("keeper 5", frames[4])
+
+    @needs_cc
+    def test_additive_load_and_unload(self):
+        menu = (
+            "using UnityEngine;\nusing UnityEngine.SceneManagement;\n"
+            "public class Menu : MonoBehaviour {\n"
+            "    public int ticks;\n"
+            "    void Update() {\n"
+            "        ticks = ticks + 1;\n"
+            "        Debug.Log(\"menu \" + ticks + \" \""
+            " + SceneManager.sceneCount);\n"
+            "        if (ticks == 1)"
+            " SceneManager.LoadScene(\"Level\", LoadSceneMode.Additive);\n"
+            "        if (ticks == 3) SceneManager.UnloadSceneAsync(\"Level\");\n"
+            "    }\n}\n")
+        level = (
+            "using UnityEngine;\n"
+            "public class Level : MonoBehaviour {\n"
+            "    public int ticks;\n"
+            "    void Update() {"
+            " ticks = ticks + 1; Debug.Log(\"level \" + ticks); }\n}\n")
+        frames = self._frames(
+            {"Menu": menu, "Level": level},
+            [("Menu", [("M", "Menu")]), ("Level", [("L", "Level")])], 4)
+        self.assertEqual(frames, [
+            ["menu 1 1"], ["level 1", "menu 2 2"], ["level 2", "menu 3 2"],
+            ["menu 4 1"],
+        ])
+
+    @needs_cc
+    def test_find_skips_scenes_not_loaded(self):
+        looker = (
+            "using UnityEngine;\n"
+            "public class Looker : MonoBehaviour {\n"
+            "    void Update() {\n"
+            "        if (GameObject.Find(\"Elsewhere\") == null)"
+            " Debug.Log(\"missing\");\n"
+            "        else Debug.Log(\"found\");\n"
+            "    }\n}\n")
+        idle = ("using UnityEngine;\n"
+                "public class Idle : MonoBehaviour {\n"
+                "    public int n;\n}\n")
+        frames = self._frames(
+            {"Looker": looker, "Idle": idle},
+            [("Here", [("L", "Looker")]),
+             ("There", [("Elsewhere", "Idle")])], 1)
+        self.assertEqual(frames, [["missing"]])
+
+    @needs_cc
+    def test_singleton_instance_calls_pick_overloads(self):
+        single = (
+            "using UnityEngine;\n"
+            "public class Single<T> : MonoBehaviour where T : MonoBehaviour {\n"
+            "    public static T instance;\n"
+            "    public static T Instance {\n"
+            "        get {\n"
+            "            if (instance == null) instance = FindObjectOfType<T>();\n"
+            "            return instance;\n"
+            "        }\n"
+            "    }\n}\n")
+        manager = (
+            "using UnityEngine;\n"
+            "public class _Manager : Single<_Manager> {\n"
+            "    public static int total;\n"
+            "    public void Add(int n) { total = total + n; }\n"
+            "    public void Add(string s) { total = total + 100; }\n"
+            "    public void Twice() { Add(1); Add(\"x\"); }\n"
+            "}\n")
+        user = (
+            "using UnityEngine;\n"
+            "public class User : MonoBehaviour {\n"
+            "    public int ticks;\n"
+            "    void Update() {\n"
+            "        ticks = ticks + 1;\n"
+            "        _Manager.Instance.Add(ticks);\n"
+            "        _Manager.instance.Twice();\n"
+            "        Debug.Log(\"total \" + _Manager.total);\n"
+            "    }\n}\n")
+        frames = self._frames(
+            {"Single": single, "_Manager": manager, "User": user},
+            [("Only", [("M", "_Manager"), ("U", "User")])], 2)
+        self.assertEqual(frames, [["total 102"], ["total 205"]])
+
+    def test_static_getter_inlining_leaves_input_manager_flags(self):
+        root = self._project(
+            {"InputManager": "using UnityEngine;\n"
+                             "using UnityEngine.InputSystem;\n"
+                             "public class InputManager : MonoBehaviour {\n"
+                             "    public static bool UsingMouse {\n"
+                             "        get { return Mouse.current != null; }\n"
+                             "    }\n"
+                             "    public int n;\n}\n",
+             "User": "using UnityEngine;\n"
+                     "public class User : MonoBehaviour {\n"
+                     "    public int n;\n"
+                     "    void Update() {\n"
+                     "        if (InputManager.UsingMouse) n = n + 1;\n"
+                     "    }\n}\n"},
+            [("Only", [("I", "InputManager"), ("U", "User")])])
+        d = tempfile.mkdtemp(prefix="upack-scenes-out-")
+        self.addCleanup(shutil.rmtree, d, True)
+        with contextlib.redirect_stderr(io.StringIO()):
+            unity_pack.pack(root, d, force=True)
+        with open(os.path.join(d, "engine.c")) as f:
+            engine = f.read()
+        body = engine[engine.index("static void User_Update"):]
+        self.assertIn("engine_input_using_mouse", body[:body.index("}")])
+
+    def test_single_scene_without_scene_manager_has_no_scene_runtime(self):
+        root = self._project(
+            {"Tally": "using UnityEngine;\n"
+                      "public class Tally : MonoBehaviour {\n"
+                      "    public int n;\n"
+                      "    void Update() { n = n + 1; }\n}\n"},
+            [("Only", [("T", "Tally")])])
+        d = tempfile.mkdtemp(prefix="upack-scenes-out-")
+        self.addCleanup(shutil.rmtree, d, True)
+        with contextlib.redirect_stderr(io.StringIO()):
+            unity_pack.pack(root, d, force=True)
+        with open(os.path.join(d, "engine.c")) as f:
+            self.assertNotIn("_engine_scene_", f.read())
 
 
 if __name__ == "__main__":

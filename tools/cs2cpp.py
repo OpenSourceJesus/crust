@@ -508,7 +508,8 @@ OWNED = ObjectModel()
 _PACKED_STRING_CALLS = ("Application_dataPath()",
                         "Application_persistentDataPath()",
                         "Application_productName()",
-                        "StreamReader_ReadLine(")
+                        "StreamReader_ReadLine(",
+                        "Scene_name(", "Scene_path(")
 
 
 def packed_model(has_objects, byte_arrays=False, elem_type=None):
@@ -3969,6 +3970,52 @@ def properties_as_methods(body, bscan, body_abs=0):
                     "public": is_public,
                     "static": is_static,
                 })
+    return out
+
+
+def static_getter_exprs(body, bscan, member_names=()):
+    """``{Name: expr}`` for static get-only properties whose getter is one
+    ``return expr;`` (or ``=> expr``) naming none of *member_names* (the
+    declaring type's own members), so a read can be replaced by the
+    expression anywhere: ``static Scene Current { get { return
+    SceneManager.GetActiveScene(); } }``."""
+    import tools.cpprust as cpprust
+    own = set(member_names)
+    out = {}
+    head = re.compile(
+        r"(?m)^[ \t]*(?:public|private|protected|internal)?[ \t]*static[ \t]+"
+        r"([\w.<>]+)[ \t]+(\w+)[ \t\r\n]*(\{|=>)")
+    for m in head.finditer(bscan):
+        name = m.group(2)
+        if m.group(1) in ("class", "struct", "enum", "interface"):
+            continue
+        if m.group(3) == "=>":
+            end = bscan.find(";", m.end())
+            if end < 0:
+                continue
+            expr = body[m.end():end].strip()
+        else:
+            open_i = m.end() - 1
+            close = cpprust._match_brace(bscan, open_i)
+            if close is None:
+                continue
+            inner = bscan[open_i + 1:close]
+            if re.search(r"\bset\b", inner):
+                continue
+            gm = re.fullmatch(
+                r"\s*get\s*(?:\{\s*return\s+(.+?)\s*;\s*\}|=>\s*(.+?)\s*;)\s*",
+                inner, re.S)
+            if not gm:
+                continue
+            g0 = open_i + 1 + gm.start(1 if gm.group(1) is not None else 2)
+            g1 = open_i + 1 + gm.end(1 if gm.group(1) is not None else 2)
+            expr = body[g0:g1].strip()
+        if not expr or ";" in expr or "{" in expr:
+            continue
+        idents = set(re.findall(r"(?<![\w.])([A-Za-z_]\w*)", _blank(expr)))
+        if idents & (own | {name}):
+            continue
+        out[name] = expr
     return out
 
 
