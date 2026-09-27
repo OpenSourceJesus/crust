@@ -362,6 +362,51 @@ Only **authored** Rigidbody components start packed; `AddComponent<Rigidbody>` /
 `AddComponent<Rigidbody2D>` GetOrAdds a Dynamic body with Unity defaults
 (mass 1, gravity on / gravityScale 1).
 
+### Box2D-Packed backend (`--physics box2d`)
+
+`--physics box2d` replaces the 2D integrator and AABB contacts with a Box2D
+world from [Box2D-Packed](https://github.com/crustos/box2d). The packed tables,
+position accessors, and `OnCollisionEnter2D` / `Stay2D` / `Exit2D` dispatch stay
+as they are. Each fixed step, `engine_physics_fixed` calls `engine_box2d_step()`,
+generated into `physics_box2d.c` by the Box2D-Packed repo's `box2d_unity.py`:
+
+1. Push what scripts changed: `linearVelocity`, `transform.position` (a
+   teleport), `gravityScale`, `linearDamping`, `Physics2D.gravity`.
+2. `b2World_Step` with 4 substeps.
+3. Pull positions and velocities into the packed tables.
+4. Report touching pairs. unity_pack sends Enter / Stay / Exit by comparing with
+   the previous step, as with the built-in physics.
+
+```sh
+python3 tools/unity_pack.py <project> -o /tmp/out --physics box2d --box2d ~/box2d
+python3 tools/unity_pack.py <project> -o /tmp/out --physics box2d --physics-inject --box2d ~/box2d
+```
+
+| Option | Effect |
+|--------|--------|
+| `--physics builtin` | Default. unity_pack's own integrator and AABB contacts. |
+| `--physics box2d` | Box2D-Packed. Touching pairs come from Box2D's contact events. |
+| `--physics-inject` | Touching pairs are recorded at Box2D-Packed's `contact_begin` / `contact_end` injection markers instead of its event arrays. Scripts still run after the step. |
+| `--box2d PATH` | Box2D-Packed checkout. Default `$BOX2D_PACKED_ROOT`. |
+| `--box2d-lto` | Link-time optimization across Box2D-Packed and the glue. |
+
+| Unity | Box2D |
+|-------|-------|
+| Rigidbody2D Dynamic / Kinematic / Static | dynamic / kinematic / static body |
+| Rigidbody2D mass | body mass |
+| BoxCollider2D, CircleCollider2D, offset, rotation | offset box, circle |
+| Collider2D without a Rigidbody2D | static body |
+| `m_IsTrigger` | sensor, no collision messages |
+| Friction, bounciness, combine modes | world friction and restitution callbacks with the same PhysicsMaterialCombine rules |
+
+Differences from the built-in physics: bodies stack and push each other as
+Box2D solves them, with no "lower body is support" rule. Body rotation is
+locked, because packed rigidbodies have no rotation yet. `engine.c` stays in
+the crust subset. Only `physics_box2d.c` includes Box2D, and it is compiled with
+gcc outside the cpprust gate. The Box2D-Packed repo's
+`test/unity/run_unity_tests.py` packs a bouncing-ball and crate-stack scene with
+all three settings and checks that they agree.
+
 ## Colliders (BoxCollider2D / CircleCollider2D / BoxCollider / SphereCollider)
 
 | Scene authors | Emitted |
