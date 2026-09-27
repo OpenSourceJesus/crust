@@ -14001,5 +14001,147 @@ class TestLiveRectTransform(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stderr or run.stdout)
 
 
+
+_BOX2D_ROOT = os.environ.get("BOX2D_PACKED_ROOT")
+needs_box2d = unittest.skipUnless(
+    _BOX2D_ROOT and os.path.isfile(os.path.join(_BOX2D_ROOT or "", "box2d_unity.py"))
+    and _CC is not None,
+    "set BOX2D_PACKED_ROOT to a Box2D-Packed checkout to run")
+
+
+class TestBox2DPhysicsBackend(unittest.TestCase):
+    """--physics box2d: Box2D-Packed replaces the 2D integrator and AABB
+    contacts; OnCollisionEnter/Stay/Exit2D still come from unity_pack after
+    the step. See box2d_unity.py in the Box2D-Packed repository."""
+
+    def _project(self):
+        root = tempfile.mkdtemp(prefix="upack-b2d-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Ball.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Ball : MonoBehaviour {\n"
+                "    public int enters;\n"
+                "    public int exits;\n"
+                "    void OnCollisionEnter2D(Collision2D coll) {\n"
+                "        enters = enters + 1;\n"
+                "        if (enters < 4) {\n"
+                "            GetComponent<Rigidbody2D>().velocity = new Vector2(0, 6);\n"
+                "        }\n"
+                "    }\n"
+                "    void OnCollisionExit2D(Collision2D coll) {\n"
+                "        exits = exits + 1;\n"
+                "    }\n"
+                "}\n")
+        with open(os.path.join(scripts, "Ball.cs.meta"), "w") as f:
+            f.write("guid: b2dball00000000000000000000000a\n")
+        scenes = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scenes)
+        with open(os.path.join(scenes, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Ground\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: -2.5, z: 0}\n"
+                "--- !u!61 &3\nBoxCollider2D:\n  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n  m_IsTrigger: 0\n"
+                "  m_Offset: {x: 0, y: 0}\n  m_Size: {x: 20, y: 1}\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Ball\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n  - component: {fileID: 13}\n"
+                "  - component: {fileID: 14}\n"
+                "--- !u!4 &11\nTransform:\n  m_GameObject: {fileID: 10}\n"
+                "  m_LocalPosition: {x: 0, y: 2, z: 0}\n"
+                "--- !u!50 &12\nRigidbody2D:\n  m_GameObject: {fileID: 10}\n"
+                "  m_BodyType: 0\n  m_Mass: 1\n  m_GravityScale: 1\n"
+                "  m_LinearDamping: 0\n"
+                "--- !u!58 &13\nCircleCollider2D:\n  m_GameObject: {fileID: 10}\n"
+                "  m_Enabled: 1\n  m_IsTrigger: 0\n"
+                "  m_Offset: {x: 0, y: 0}\n  m_Radius: 0.5\n"
+                "--- !u!114 &14\nMonoBehaviour:\n  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: b2dball00000000000000000000000a}\n"
+                "  enters: 0\n  exits: 0\n")
+        return root
+
+    def test_box2d_needs_a_checkout(self):
+        root = self._project()
+        d = tempfile.mkdtemp(prefix="upack-b2d-none-")
+        old = os.environ.pop("BOX2D_PACKED_ROOT", None)
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(unity_pack.PackError) as cm:
+                    unity_pack.pack(root, d, physics="box2d", force=True)
+        finally:
+            if old is not None:
+                os.environ["BOX2D_PACKED_ROOT"] = old
+        self.assertIn("BOX2D_PACKED_ROOT", cm.exception.message)
+
+    def test_unknown_backend_is_refused(self):
+        with self.assertRaises(unity_pack.PackError):
+            unity_pack.pack(self._project(), tempfile.mkdtemp(), physics="havok")
+
+    def _run(self, inject):
+        root = self._project()
+        d = tempfile.mkdtemp(prefix="upack-b2d-out-")
+        with contextlib.redirect_stderr(io.StringIO()):
+            plan = unity_pack.pack(root, d, physics="box2d",
+                                   physics_inject=inject,
+                                   box2d_root=_BOX2D_ROOT, force=True)
+            unity_pack.build_player_executable(
+                d, plan.get("product_name") or "Player",
+                box2d_root=_BOX2D_ROOT)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("engine_box2d_step();", eng)
+        self.assertNotIn("    engine_physics_collide2d();", eng)
+        self.assertTrue(os.path.isfile(os.path.join(d, "physics_box2d.c")))
+        self.assertEqual(
+            os.path.isfile(os.path.join(d, "box2d_inject.json")), inject)
+        host = os.path.join(d, "host.c")
+        with open(host, "w") as f:
+            f.write(
+                "#include <stdio.h>\n"
+                "void engine_tick(void);\n"
+                "extern float Time_deltaTime;\n"
+                "typedef struct { int enters; int exits; } Ball;\n"
+                "extern Ball _Ball_inst_array[];\n"
+                "extern float _Ball_pos[][2];\n"
+                "int main(void) {\n"
+                "  int i;\n"
+                "  Time_deltaTime = 0.02f;\n"
+                "  for (i = 0; i < 300; i = i + 1) engine_tick();\n"
+                "  printf(\"%d %d %.4f\\n\", _Ball_inst_array[0].enters,\n"
+                "         _Ball_inst_array[0].exits, _Ball_pos[0][1]);\n"
+                "  return 0;\n"
+                "}\n")
+        exe = os.path.join(d, "host")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host, os.path.join(d, "engine.o"),
+             os.path.join(d, "data.o"), os.path.join(d, "physics_box2d.o"),
+             os.path.join(d, "box2d", "libbox2d.a"), "-lpthread", "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        return run.stdout.strip()
+
+    @needs_box2d
+    def test_box2d_messages_and_rest(self):
+        """Three scripted bounces: 4 Enter, 3 Exit; the ball rests on Ground."""
+        out = self._run(inject=False)
+        enters, exits, y = out.split()
+        self.assertEqual((int(enters), int(exits)), (4, 3))
+        self.assertAlmostEqual(float(y), -1.5, delta=0.02)
+
+    @needs_box2d
+    def test_box2d_injected_matches_standard(self):
+        """Contact markers instead of event arrays: identical results."""
+        self.assertEqual(self._run(inject=True), self._run(inject=False))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
