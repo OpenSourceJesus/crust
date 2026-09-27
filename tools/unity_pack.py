@@ -17090,11 +17090,76 @@ def emit_engine(plan, analyses, used_apis):
         p("}")
         p("")
 
-    if want_rb2d or want_rb3d:
+    box2d_backend = (plan.get("physics_backend") == "box2d"
+                     and (want_rb2d or want_col2d))
+    if box2d_backend:
+        # Box2D-Packed (box2d_unity.py) replaces the 2D integrator and AABB
+        # contacts. engine.c exports scalar accessors for the generated glue in
+        # physics_box2d.c and keeps sending OnCollision*2D after the step.
+        p("/* Box2D-Packed 2D physics (unity_pack --physics box2d) */")
+        p("void engine_box2d_step(void);")
+        p("void engine_rb2d_get_pos(int rb, float *x, float *y) {")
+        p("    unsigned oi = (unsigned)_Rigidbody2D_owner_inst[rb];")
+        p("    *x = 0.f;")
+        p("    *y = 0.f;")
+        p("    switch (_Rigidbody2D_owner_class[rb]) {")
+        for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
+            idn = _c_ident(cname)
+            cl = plan["classes"][cname]
+            if not _class_has_position(cl) or cl.get("static"):
+                continue
+            p("    case %d:" % cid)
+            p("        *x = %s_get_pos_x(oi);" % idn)
+            p("        *y = %s_get_pos_y(oi);" % idn)
+            p("        break;")
+        p("    default: break;")
+        p("    }")
+        p("}")
+        p("")
+        p("void engine_rb2d_set_pos(int rb, float x, float y) {")
+        p("    unsigned oi = (unsigned)_Rigidbody2D_owner_inst[rb];")
+        p("    switch (_Rigidbody2D_owner_class[rb]) {")
+        for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
+            idn = _c_ident(cname)
+            cl = plan["classes"][cname]
+            if not _class_has_position(cl) or cl.get("static"):
+                continue
+            p("    case %d:" % cid)
+            p("        %s_set_pos_x(oi, x);" % idn)
+            p("        %s_set_pos_y(oi, y);" % idn)
+            p("        break;")
+        p("    default: break;")
+        p("    }")
+        p("}")
+        p("")
+        p("void engine_col2d_center(int ci, float *x, float *y) {")
+        if want_col2d and col2d_list:
+            p("    _col2d_center(ci, x, y);")
+        else:
+            p("    if (ci < 0) return;")
+            p("    *x = 0.f;")
+            p("    *y = 0.f;")
+        p("}")
+        p("")
+        p("void engine_col2d_contact(int a, int b) {")
+        if want_collision2d_msgs:
+            p("    _col2d_add_contact(a, b);")
+        else:
+            p("    if (a < 0 || b < 0) return;")
+        p("}")
+        p("")
+
+    if want_rb2d or want_rb3d or box2d_backend:
         p("/* Authored Rigidbody / Rigidbody2D — gravity + integrate after FixedUpdate */")
         p("static void engine_physics_fixed(void) {")
         p("    int i;")
-        if want_rb2d and rb2d_list:
+        if box2d_backend:
+            if want_collision2d_msgs:
+                p("    _col2d_contact_n = 0;")
+            p("    engine_box2d_step();")
+            if want_collision2d_msgs:
+                p("    engine_physics_collide2d_messages();")
+        if want_rb2d and rb2d_list and not box2d_backend:
             p("    for (i = 0; i < _Rigidbody2D_count; i = i + 1) {")
             p("        unsigned oi;")
             p("        float vx, vy;")
@@ -17174,7 +17239,7 @@ def emit_engine(plan, analyses, used_apis):
             p("        default: break;")
             p("        }")
             p("    }")
-        if want_col2d and col2d_list:
+        if want_col2d and col2d_list and not box2d_backend:
             p("    engine_physics_collide2d();")
         if want_col3d and col3d_list:
             p("    engine_physics_collide3d();")
@@ -17376,7 +17441,7 @@ def emit_engine(plan, analyses, used_apis):
     p("    while (_engine_fixed_accum >= _fixed_dt && _fixed_guard < 50) {")
     for cname in sorted(plan["classes"]):
         p("        %s_FixedTick();" % _c_ident(cname))
-    if want_rb2d or want_rb3d:
+    if want_rb2d or want_rb3d or box2d_backend:
         p("        engine_physics_fixed();")
     p("        _engine_fixed_accum = _engine_fixed_accum - _fixed_dt;")
     p("        _fixed_guard = _fixed_guard + 1;")
@@ -22107,6 +22172,7 @@ def _plan_from_stamp(stamp):
         "two_d": bool(stamp.get("two_d")),
         "soa": bool(stamp.get("soa")),
         "soa_vec4": bool(stamp.get("soa_vec4")),
+        "physics": stamp.get("physics") or "builtin",
     }
 
 
@@ -22154,7 +22220,18 @@ def _emit_artifact_unchanged(outdir, cpp_name, c_name, cpp_text, force):
 
 
 def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
-         gpu_handles=False):
+         gpu_handles=False, physics="builtin", physics_inject=False,
+         box2d_root=None):
+    """Pack the Unity-subset project at *root* into *outdir*.
+
+    physics="box2d" replaces the 2D integrator and AABB contacts with
+    Box2D-Packed (box2d_unity.py in the Box2D-Packed repo at box2d_root, or
+    $BOX2D_PACKED_ROOT). physics_inject=True routes contact begin / end
+    through box2d_pack injection markers instead of Box2D's event arrays.
+    """
+    if physics not in ("builtin", "box2d"):
+        raise PackError("unknown physics backend %r (builtin, box2d)" % physics)
+    physics_key = physics + ("+inject" if physics == "box2d" and physics_inject else "")
     os.makedirs(outdir, exist_ok=True)
     fp, assets_fp, scripts_fp = _input_fingerprints(
         root, soa=soa, soa_vec4=soa_vec4, gpu_handles=gpu_handles)
@@ -22164,6 +22241,7 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
                 and stamp.get("input_fingerprint") == fp
                 and bool(stamp.get("soa")) == bool(soa)
                 and bool(stamp.get("soa_vec4")) == bool(soa_vec4)
+                and (stamp.get("physics") or "builtin") == physics_key
                 and _outputs_complete(outdir)):
             _progress("unchanged; skipping pack (stamp match)")
             return _plan_from_stamp(stamp)
@@ -22367,6 +22445,7 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
     # A method the translator cannot lower is a warning, or with `strict`
     # an error (`_report_stub`).
     plan["strict"] = bool(strict)
+    plan["physics_backend"] = physics
     engine = emit_engine(plan, analyses, used_apis)
     if gpu_handles:
         # Packed handle streams for a GLES 3.1 SSBO (`_handle_streams`).
@@ -22410,6 +22489,13 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
         os.path.join(outdir, "engine_draw.h"), emit_engine_draw_h())
     _write_if_different(
         os.path.join(outdir, "Makefile"), emit_makefile(outdir))
+    if physics == "box2d":
+        _load_box2d_unity(box2d_root).emit_glue(
+            outdir, plan, inject=bool(physics_inject))
+    else:
+        for stale in ("physics_box2d.c", "box2d_inject.json"):
+            if os.path.exists(os.path.join(outdir, stale)):
+                os.remove(os.path.join(outdir, stale))
     shdir = os.path.join(outdir, "shaders")
     os.makedirs(shdir, exist_ok=True)
     for plat in ("linux", "apple", "windows", "wasm"):
@@ -22431,6 +22517,7 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
         "scripts_fingerprint": scripts_fp,
         "soa": bool(soa),
         "soa_vec4": bool(soa_vec4),
+        "physics": physics_key,
         "product_name": plan.get("product_name") or "Player",
         "two_d": bool(plan.get("two_d")),
         "classes": _class_stamp_entries(plan),
@@ -22467,7 +22554,23 @@ def default_pack_dir(root):
     return os.path.join(tempfile.gettempdir(), project_folder_name(root))
 
 
-def build_player_executable(outdir, product):
+def _load_box2d_unity(box2d_root=None):
+    """Import box2d_unity.py from a Box2D-Packed checkout."""
+    root = box2d_root or os.environ.get("BOX2D_PACKED_ROOT")
+    if not root:
+        raise PackError(
+            "--physics box2d needs a Box2D-Packed checkout: pass --box2d PATH "
+            "or set BOX2D_PACKED_ROOT")
+    root = os.path.abspath(root)
+    if not os.path.isfile(os.path.join(root, "box2d_unity.py")):
+        raise PackError("no box2d_unity.py in %s (Box2D-Packed checkout?)" % root)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    import box2d_unity
+    return box2d_unity
+
+
+def build_player_executable(outdir, product, box2d_root=None, box2d_lto=False):
     """Compile packed C sources and link a player named after productName.
 
     Prefers examples/unity_pack/gles3_window.c (OpenGL ES 3.1; gles2_window.c
@@ -22526,6 +22629,24 @@ def build_player_executable(outdir, product):
     else:
         _progress("data.o up to date")
 
+    # Box2D-Packed physics (--physics box2d): generated glue + the library
+    physics_objs = []
+    physics_libs = []
+    glue_c = os.path.join(outdir, "physics_box2d.c")
+    if os.path.isfile(glue_c):
+        b2u = _load_box2d_unity(box2d_root)
+        inject = os.path.isfile(os.path.join(outdir, "box2d_inject.json"))
+        _progress("building Box2D-Packed%s" % (" (injected)" if inject else ""))
+        try:
+            lib, inc, defs = b2u.build_library(outdir, inject=inject, lto=box2d_lto)
+        except Exception as e:  # box2d_pack.BuildError carries the compiler output
+            raise PackError("Box2D-Packed build failed: %s" % e)
+        glue_o = os.path.join(outdir, "physics_box2d.o")
+        _run([cc, "-O3", "-std=c17", "-c", "-o", glue_o, glue_c, "-I", inc]
+             + defs + (["-flto"] if box2d_lto else []))
+        physics_objs = [glue_o]
+        physics_libs = [lib, "-lpthread"]
+
     # OpenGL ES 3.1 by default -- what has SSBOs, for `--gpu-handles` --
     # and ES 2.0 for hardware without it (UNITY_PACK_GLES2=1).
     host = os.path.normpath(os.path.join(
@@ -22550,14 +22671,15 @@ def build_player_executable(outdir, product):
         except (OSError, subprocess.CalledProcessError):
             use_window = False
     if use_window:
-        deps = [host, engine_o, data_o]
+        deps = [host, engine_o, data_o] + physics_objs
         render_h = os.path.join(os.path.dirname(host), "gles3_render.h")
         if os.path.isfile(render_h):
             deps.append(render_h)
         if _needs_rebuild(exe, *deps):
             _progress("linking window player %s" % exe)
-            _run([cc, "-O2", "-o", exe, host, engine_o, data_o,
-                  "-I", outdir] + cflags + libs + ["-lGLESv2", "-lm"])
+            _run([cc, "-O2", "-o", exe, host, engine_o, data_o]
+                 + physics_objs + ["-I", outdir] + cflags + libs
+                 + ["-lGLESv2"] + physics_libs + ["-lm"])
             # (gles3_window.c includes gles3_render.h beside it.)
         else:
             _progress("player up to date")
@@ -22569,9 +22691,10 @@ def build_player_executable(outdir, product):
             _run([cc, "-O2", "-c", "-o", main_o, main_c])
         else:
             _progress("main.o up to date")
-        if _needs_rebuild(exe, engine_o, data_o, main_o):
+        if _needs_rebuild(exe, engine_o, data_o, main_o, *physics_objs):
             _progress("linking headless player %s" % exe)
-            _run([cc, "-O2", "-o", exe, engine_o, data_o, main_o, "-lm"])
+            _run([cc, "-O2", "-o", exe, engine_o, data_o, main_o]
+                 + physics_objs + physics_libs + ["-lm"])
         else:
             _progress("player up to date")
     return exe
@@ -22607,6 +22730,30 @@ def main():
         soa = False
         soa_vec4 = False
         args.remove("--aos")
+    physics = "builtin"
+    if "--physics" in args:
+        i = args.index("--physics")
+        if i + 1 >= len(args):
+            sys.stderr.write("unity_pack: --physics needs builtin or box2d\n")
+            return 2
+        physics = args[i + 1]
+        del args[i:i + 2]
+    physics_inject = False
+    if "--physics-inject" in args:
+        physics_inject = True
+        args.remove("--physics-inject")
+    box2d_lto = False
+    if "--box2d-lto" in args:
+        box2d_lto = True
+        args.remove("--box2d-lto")
+    box2d_root = None
+    if "--box2d" in args:
+        i = args.index("--box2d")
+        if i + 1 >= len(args):
+            sys.stderr.write("unity_pack: --box2d needs a Box2D-Packed checkout\n")
+            return 2
+        box2d_root = args[i + 1]
+        del args[i:i + 2]
     if "-o" in args:
         i = args.index("-o")
         if i + 1 >= len(args):
@@ -22618,6 +22765,7 @@ def main():
         sys.stderr.write(
             "usage: unity_pack.py <project-dir> [-o <out-dir>] "
             "[--aos | --soa-vec4] [--force] [--strict] [--gpu-handles]\n"
+            "       [--physics builtin|box2d] [--physics-inject] [--box2d PATH] [--box2d-lto]\n"
             "  default out-dir: $TMPDIR/<project folder>\n"
             "  player binary:   <productName>  (Windows: <productName>.exe)\n"
             "  default layout:  SoA position tables (use --aos for AoS)\n"
@@ -22627,9 +22775,11 @@ def main():
         outdir = default_pack_dir(args[0])
     try:
         plan = pack(args[0], outdir, soa=soa, soa_vec4=soa_vec4, force=force,
-                    strict=strict, gpu_handles=gpu_handles)
+                    strict=strict, gpu_handles=gpu_handles, physics=physics,
+                    physics_inject=physics_inject, box2d_root=box2d_root)
         exe = build_player_executable(
-            outdir, plan.get("product_name") or "Player")
+            outdir, plan.get("product_name") or "Player",
+            box2d_root=box2d_root, box2d_lto=box2d_lto)
     except PackError as e:
         # csc/Unity diagnostics print verbatim; other refusals keep the prefix.
         if ": error CS" in e.message:
