@@ -76,11 +76,10 @@ def _assets_rel_path(path):
 
 
 def _cs_diag(path, text, idx, code, message, kind="error"):
-    """Unity/csc diagnostic: `Assets/.../File.cs(line,col): error CSxxxx: …`."""
-    line = text.count("\n", 0, idx) + 1
-    col = idx - (text.rfind("\n", 0, idx) + 1) + 1
-    return "%s(%d,%d): %s %s: %s" % (
-        _assets_rel_path(path), line, col, kind, code, message)
+    """Unity/csc diagnostic: `Assets/.../File.cs(line,col): error CSxxxx: …`.
+    cs2cpp.cs_diag with Unity's `Assets/` path display."""
+    return cs2cpp.cs_diag(path, text, idx, code, message, kind,
+                          display_path=_assets_rel_path)
 
 
 def _report_stub(plan, site, cl, m, why):
@@ -126,14 +125,10 @@ def _raise_cs(path, text, idx, code, message):
 
 
 def _raise_cs_at_site(site, body_idx, code, message):
-    """CS diagnostic using method-body offset + emit site (path / file_text)."""
-    path = site.get("path") or "<cs>"
-    ft = site.get("file_text") or ""
-    if not ft:
-        raise PackError("%s(1,1): error %s: %s" % (
-            _assets_rel_path(path), code, message))
-    abs_i = int(site.get("body_abs") or 0) + int(body_idx or 0)
-    _raise_cs(path, ft, abs_i, code, message)
+    """CS diagnostic using method-body offset + emit site (path / file_text).
+    cs2cpp.cs_diag_at_site with Unity's `Assets/` path display."""
+    raise PackError(cs2cpp.cs_diag_at_site(site, body_idx, code, message,
+                                           display_path=_assets_rel_path))
 
 
 def _raise_unknown_component_type(t, analyses, ops=("AddComponent", "GetComponent")):
@@ -10121,8 +10116,11 @@ _UNITY_EMIT_MESSAGES = frozenset({
 
 
 def _param_c_ty(ty):
-    """C type for a C# method parameter."""
+    """C type for a C# method parameter. ``T[]`` is a pointer to T's C type."""
     ty = (ty or "").split(".")[-1].strip()
+    if ty.endswith("[]"):
+        elem = _param_c_ty(ty[:-2])
+        return elem + ("*" if elem.endswith("*") else " *")
     if ty in ("float", "double"):
         return "float"
     if ty == "string":
@@ -10136,20 +10134,8 @@ def _param_c_ty(ty):
 
 def _method_c_params(args_str):
     """C param list string from C# ``(byte amount, Cosmetic c)``."""
-    args_str = (args_str or "").strip()
-    if not args_str:
-        return ""
-    parts = []
-    for part in args_str.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        part = re.sub(r"\b(?:ref|out|in|params)\s+", "", part)
-        m = re.match(r"([\w.<>]+)\s+(\w+)\s*$", part)
-        if not m:
-            continue
-        parts.append("%s %s" % (_param_c_ty(m.group(1)), m.group(2)))
-    return ", ".join(parts)
+    return ", ".join("%s %s" % (_param_c_ty(p.type), p.name)
+                     for p in cs2cpp.parse_params(args_str))
 
 
 def _array_elem_name(ty):

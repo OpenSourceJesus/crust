@@ -3579,6 +3579,45 @@ if __name__ == "__main__":
 
 
 # ---------------------------------------------------------------------------
+# csc-style diagnostics: `File.cs(line,col): error CSxxxx: message`.
+# unity_pack wraps these with a display_path that prints `Assets/...` paths.
+# ---------------------------------------------------------------------------
+
+
+def line_col(text, idx):
+    """1-based (line, column) of *idx* in *text*."""
+    line = text.count("\n", 0, idx) + 1
+    col = idx - (text.rfind("\n", 0, idx) + 1) + 1
+    return line, col
+
+
+def _basename_or_placeholder(path):
+    return os.path.basename(path) if path else "<cs>"
+
+
+def cs_diag(path, text, idx, code, message, kind="error", display_path=None):
+    """csc-style diagnostic at *idx* of *text*. *display_path* formats the
+    path (default: the file name, or ``<cs>`` when there is none)."""
+    fmt = display_path or _basename_or_placeholder
+    line, col = line_col(text, idx)
+    return "%s(%d,%d): %s %s: %s" % (fmt(path), line, col, kind, code, message)
+
+
+def cs_diag_at_site(site, body_idx, code, message, kind="error",
+                    display_path=None):
+    """csc-style diagnostic at offset *body_idx* of a method body. *site*
+    gives the file: ``path``, ``file_text`` and the body's offset in it,
+    ``body_abs``. Without file text, the position is ``(1,1)``."""
+    fmt = display_path or _basename_or_placeholder
+    path = site.get("path") or "<cs>"
+    ft = site.get("file_text") or ""
+    if not ft:
+        return "%s(1,1): %s %s: %s" % (fmt(path), kind, code, message)
+    abs_i = int(site.get("body_abs") or 0) + int(body_idx or 0)
+    return cs_diag(path, ft, abs_i, code, message, kind, display_path)
+
+
+# ---------------------------------------------------------------------------
 # C# structure and literal helpers shared with tools/unity_pack.py. Moved from
 # unity_pack unchanged, apart from public names; nothing here is Unity-specific.
 # ---------------------------------------------------------------------------
@@ -3817,15 +3856,73 @@ def properties_as_methods(body, bscan, body_abs=0):
     return out
 
 
+class Param(object):
+    """One C# method parameter: ``params int[] rest = null``."""
+
+    __slots__ = ("modifier", "type", "name", "default")
+
+    def __init__(self, modifier, type_, name, default):
+        self.modifier = modifier
+        self.type = type_
+        self.name = name
+        self.default = default
+
+    def __repr__(self):
+        return "Param(%r, %r, %r, %r)" % (
+            self.modifier, self.type, self.name, self.default)
+
+
+_PARAM_RE = re.compile(
+    r"(?:(ref|out|in|params)\s+)?"
+    r"([\w.]+(?:\s*<[^=]*>)?(?:\s*\[[\s,]*\])*)\s+(\w+)\s*$")
+
+
+def _top_level_equals(text):
+    """Index of the first ``=`` outside brackets and literals, or -1."""
+    depth = 0
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if c in "\"'@$":
+            end = _skip_literal(text, i)
+            if end != i:
+                i = end
+                continue
+        if c in "([{<":
+            depth += 1
+        elif c in ")]}>":
+            depth -= 1
+        elif c == "=" and depth == 0:
+            return i
+        i += 1
+    return -1
+
+
+def parse_params(args_str):
+    """Parameters of a C# list, in order. Commas inside generic arguments and
+    default values do not split; ``ref`` / ``out`` / ``in`` / ``params`` are
+    kept as ``modifier``; ``= value`` is kept as ``default``. A part that is
+    not ``Type name`` is skipped."""
+    params = []
+    for part in _split_top_level(args_str or "", angle=True):
+        if not part:
+            continue
+        default = None
+        eq = _top_level_equals(part)
+        if eq >= 0:
+            default = part[eq + 1:].strip()
+            part = part[:eq].strip()
+        m = _PARAM_RE.match(part)
+        if not m:
+            continue
+        ty = re.sub(r"\s+", "", m.group(2))
+        params.append(Param(m.group(1), ty, m.group(3), default))
+    return params
+
+
 def method_c_arg_names(args_str):
     """Parameter names of a C# list, in order — to pass them straight on."""
-    names = []
-    for part in (args_str or "").split(","):
-        part = re.sub(r"\b(?:ref|out|in|params)\s+", "", part.strip())
-        m = re.match(r"([\w.<>]+)\s+(\w+)\s*$", part)
-        if m:
-            names.append(m.group(2))
-    return names
+    return [p.name for p in parse_params(args_str)]
 
 
 def method_arg_type_suffix(args_str):
@@ -3833,18 +3930,15 @@ def method_arg_type_suffix(args_str):
 
     ``SpawnedEntry spawnedEntry`` → ``SpawnedEntry``;
     ``GameObject clone, Transform trs`` → ``GameObject_Transform``;
-    empty args → ``void``.
+    ``Dictionary<int, string> d`` → ``Dictionary_int_string``;
+    ``int[] xs`` → ``int_array``; empty args → ``void``.
     """
     types = []
-    for part in (args_str or "").split(","):
-        part = part.strip()
-        if not part:
-            continue
-        part = re.sub(r"\b(?:ref|out|in|params)\s+", "", part)
-        m = re.match(r"([\w.<>]+)\s+(\w+)\s*$", part)
-        if not m:
-            continue
-        ty = m.group(1).split(".")[-1]
+    for p in parse_params(args_str):
+        ty = p.type.split(".")[-1]
+        # int[] -> int_array, float[,] -> float_array2: distinct from scalars
+        ty = re.sub(r"\[(,*)\]", lambda m: "_array%s" % (
+            len(m.group(1)) + 1 if m.group(1) else ""), ty)
         ty = re.sub(r"[<>\[\],\s]+", "_", ty).strip("_")
         if ty:
             types.append(c_ident(ty))
@@ -3878,18 +3972,64 @@ def c_ident(name):
     return code_sub(r"[^A-Za-z0-9_]", "_", name)
 
 
-def split_call_args(argstr):
-    """Split `a, b` or `a, b, c` on commas at paren depth 0."""
+def _skip_literal(text, i):
+    """Index just past the C# string or char literal starting at *i*, or *i*
+    when none starts there. Handles escapes, verbatim ``@"a""b"`` and
+    interpolated ``$"..."`` / ``$@"..."`` prefixes."""
+    j = i
+    verbatim = False
+    while j < len(text) and text[j] in "$@":
+        verbatim = verbatim or text[j] == "@"
+        j += 1
+    if j >= len(text) or text[j] not in "\"'" or (j > i and text[j] != '"'):
+        return i
+    quote = text[j]
+    j += 1
+    while j < len(text):
+        c = text[j]
+        if verbatim and c == '"':
+            if j + 1 < len(text) and text[j + 1] == '"':
+                j += 2
+                continue
+            return j + 1
+        if not verbatim and c == "\\":
+            j += 2
+            continue
+        if c == quote:
+            return j + 1
+        j += 1
+    return j
+
+
+def _split_top_level(text, angle=False):
+    """Split *text* on commas outside brackets and string / char literals.
+    With *angle*, ``<...>`` counts as brackets too (parameter lists, where
+    ``<`` only opens a generic type)."""
+    opens = "([{<" if angle else "([{"
+    closes = ")]}>" if angle else ")]}"
     parts = []
     depth = 0
     start = 0
-    for i, c in enumerate(argstr):
-        if c == "(":
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if c in "\"'@$":
+            end = _skip_literal(text, i)
+            if end != i:
+                i = end
+                continue
+        if c in opens:
             depth += 1
-        elif c == ")":
+        elif c in closes:
             depth -= 1
         elif c == "," and depth == 0:
-            parts.append(argstr[start:i].strip())
+            parts.append(text[start:i].strip())
             start = i + 1
-    parts.append(argstr[start:].strip())
+        i += 1
+    parts.append(text[start:].strip())
     return parts
+
+
+def split_call_args(argstr):
+    """Split `a, b` or `a, b, c` on commas outside brackets and literals."""
+    return _split_top_level(argstr)
