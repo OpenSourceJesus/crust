@@ -291,6 +291,22 @@ rewrite family at a time, with a "packed" object model cs2cpp understands
 (a class is an index into its instance array), until what remains here is
 the Unity API layer: Transform, GetComponent, Input and the like.
 
+**C# structure and literal helpers.** The parts of unity_pack that read C#
+itself, with nothing Unity-specific in them, live in cs2cpp as public
+functions: `methods_in`, `interface_methods`, `property_names`,
+`properties_as_methods`, `blank_method_bodies`, `MODIFIERS`, the overload
+naming `method_c_symbol`, `method_arg_type_suffix`, `method_c_arg_names`,
+`overload_method_names`, and `c_string`, `string_literal_value`,
+`split_call_args`, `match_call_args`, `c_ident`. They moved unchanged, and
+packed output was byte-identical before and after. unity_pack keeps the old
+underscore names as aliases. `tests/test_cs2cpp_helpers.py` tests them
+directly and records two known gaps as expected failures:
+`split_call_args` splits inside string literals, and `method_c_arg_names`
+misses array parameters such as `params int[] rest`. Helpers that look
+general but read Unity values stay in unity_pack: `_parse_csharp_field_init`
+(`Application.dataPath`, `new Vector2(...)`), `_param_c_ty` (components as
+packed indices), and the csc diagnostics that print `Assets/` paths.
+
 **What has moved.** cs2cpp describes the difference between the two
 object models in one place, `cs2cpp.ObjectModel`; unity_pack builds the
 packed one from its plan (`_packed_model`) and hands script bodies to
