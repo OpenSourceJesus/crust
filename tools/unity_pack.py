@@ -374,30 +374,7 @@ _PACK_PP_DEFINES = frozenset((
 
 def _eval_unity_pp_expr(expr, defined=_PACK_PP_DEFINES):
     """Evaluate a Unity ``#if`` / ``#elif`` expression for the packed player."""
-    tokens = re.findall(
-        r"\b[A-Za-z_][A-Za-z0-9_]*\b|\b\d+\b|&&|\|\||!|\(|\)", expr)
-    if not tokens:
-        return False
-    out = []
-    for t in tokens:
-        if t == "&&":
-            out.append("and")
-        elif t == "||":
-            out.append("or")
-        elif t == "!":
-            out.append("not")
-        elif t in ("(", ")"):
-            out.append(t)
-        elif t.isdigit():
-            out.append(t)
-        elif t in defined:
-            out.append("True")
-        else:
-            out.append("False")
-    try:
-        return bool(eval(" ".join(out), {"__builtins__": {}}, {}))
-    except Exception:
-        return False
+    return cs2cpp.eval_pp_expr(expr, defined)
 
 
 def _blank_unity_editor_regions(text):
@@ -407,62 +384,9 @@ def _blank_unity_editor_regions(text):
     pack symbols) are false; ``UNITY_STANDALONE`` / ``UNITY_STANDALONE_LINUX``
     are true. ``#else`` / ``#elif`` follow C# preprocessor rules so mobile-only
     ``new NestedClass`` and editor OnValidate never reach method lowering.
+    cs2cpp.blank_inactive_pp_regions with the pack's defines.
     """
-    lines = text.split("\n")
-    out = []
-    # Each frame: parent_active, any_branch_taken, current_active
-    stack = []
-
-    def emitting():
-        return stack[-1][2] if stack else True
-
-    def blank(line):
-        return " " * len(line)
-
-    for line in lines:
-        s = line.lstrip()
-        if s.startswith("#"):
-            low = s.lower()
-            if re.match(r"#if\b", low):
-                expr = s[3:].strip()
-                expr = re.split(r"//|/\*", expr, maxsplit=1)[0].strip()
-                parent = emitting()
-                val = _eval_unity_pp_expr(expr) if parent else False
-                stack.append([parent, val, parent and val])
-                out.append(blank(line))
-                continue
-            if re.match(r"#elif\b", low) and stack:
-                expr = s[5:].strip()
-                expr = re.split(r"//|/\*", expr, maxsplit=1)[0].strip()
-                parent, taken, _cur = stack[-1]
-                if not parent or taken:
-                    stack[-1][2] = False
-                else:
-                    val = _eval_unity_pp_expr(expr)
-                    stack[-1][1] = taken or val
-                    stack[-1][2] = val
-                out.append(blank(line))
-                continue
-            if re.match(r"#else\b", low) and stack:
-                parent, taken, _cur = stack[-1]
-                stack[-1][2] = bool(parent and not taken)
-                stack[-1][1] = True
-                out.append(blank(line))
-                continue
-            if re.match(r"#endif\b", low) and stack:
-                stack.pop()
-                out.append(blank(line))
-                continue
-            if not emitting():
-                out.append(blank(line))
-            else:
-                out.append(line)
-            continue
-        if emitting():
-            out.append(line)
-        else:
-            out.append(blank(line))
-    return "\n".join(out)
+    return cs2cpp.blank_inactive_pp_regions(text, _PACK_PP_DEFINES)
 
 
 # BCL collection types the pack does not emit (would need heap `new` / generics).
@@ -554,15 +478,11 @@ def _check_csharp_lex(path, text):
     """
     text = _blank_unity_editor_regions(text)
     scan = cs2cpp._blank(text)
-    for m in re.finditer(r"(?<![\w.])\d+\.([fFdDmM])\b", scan):
-        suffix = m.group(1)
-        _raise_cs(
-            path, text, m.start(1), "CS1061",
-            "'int' does not contain a definition for '%s' and no accessible "
-            "extension method '%s' accepting a first argument of type 'int' "
-            "could be found (are you missing a using directive or an "
-            "assembly reference?)"
-            % (suffix, suffix))
+    # General C# lexing (cs2cpp), then the Unity API checks below.
+    err = cs2cpp.real_literal_error(path, text, scan,
+                                    display_path=_assets_rel_path)
+    if err:
+        raise PackError(err)
     # transform.position is Vector3; += Vector2 is ambiguous (CS0034).
     # Assignment `= new Vector2(...)` is fine via Vector2→Vector3 implicit.
     for m in re.finditer(
@@ -10132,6 +10052,64 @@ def _param_c_ty(ty):
     return "int"
 
 
+def _default_arg_c(expr):
+    """C for a C# default parameter value, or None when it needs type-aware
+    lowering (``null``, enum members, constants, expressions)."""
+    e = (expr or "").strip()
+    if re.fullmatch(r"-?\d+[uUlL]*", e):
+        return re.sub(r"[uUlL]+$", "", e)
+    if re.fullmatch(r"-?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?[fFdDmM]?", e):
+        return re.sub(r"[dDmM]$", "", e)
+    if e == "true":
+        return "1"
+    if e == "false":
+        return "0"
+    if re.fullmatch(r'"(?:[^"\\\n]|\\.)*"', e):
+        return e
+    return None
+
+
+def _call_with_defaults(args, params):
+    """Argument text *args* of a call, with the defaults of missing trailing
+    parameters appended. Unchanged when nothing is missing, when a missing
+    parameter has no default, or when a default is not a plain literal (the
+    pack then refuses the call with an argument-count error, as before)."""
+    given = cs2cpp.split_call_args(args) if args.strip() else []
+    if len(given) >= len(params) or any(":" in g for g in given):
+        return args
+    extra = []
+    for prm in params[len(given):]:
+        c = _default_arg_c(prm.default) if prm.default is not None else None
+        if c is None:
+            return args
+        extra.append(c)
+    return ", ".join(([args.strip()] if given else []) + extra)
+
+
+def _fill_defaults_after(text, sym, params):
+    """Fill missing default arguments in every ``sym(...)`` call in *text*."""
+    if not any(prm.default is not None for prm in params):
+        return text
+    out = []
+    pos = 0
+    pat = re.compile(r"(?<![\w.])%s\s*\(" % re.escape(sym))
+    while True:
+        m = pat.search(text, pos)
+        if not m:
+            break
+        open_i = m.end() - 1
+        args, end = _match_call_args(text, open_i)
+        if end <= open_i:
+            break
+        new_args = _call_with_defaults(args, params)
+        out.append(text[pos:open_i + 1])
+        out.append(new_args)
+        out.append(")")
+        pos = end
+    out.append(text[pos:])
+    return "".join(out)
+
+
 def _method_c_params(args_str):
     """C param list string from C# ``(byte amount, Cosmetic c)``."""
     return ", ".join("%s %s" % (_param_c_ty(p.type), p.name)
@@ -10378,6 +10356,8 @@ def _rewrite_mb_static_and_singleton(text, plan, cl):
                 text = re.sub(
                     r"(?<![\w.])%s\s*\(" % re.escape(mname),
                     "%s(" % sym, text)
+            text = _fill_defaults_after(
+                text, sym, cs2cpp.parse_params(m.get("args") or ""))
     return text
 
 
@@ -15824,12 +15804,8 @@ def emit_engine(plan, analyses, used_apis):
             if coll_param:
                 emitted.add(coll_param)
             # Instance + static param names are known locals for residual checks.
-            for part in (m.get("args") or "").split(","):
-                part = part.strip()
-                part = re.sub(r"\b(?:ref|out|in|params)\s+", "", part)
-                pm = re.match(r"([\w.<>]+)\s+(\w+)\s*$", part)
-                if pm:
-                    emitted.add(pm.group(2))
+            for prm in cs2cpp.parse_params(m.get("args") or ""):
+                emitted.add(prm.name)
             why = _unlowered_csharp(
                 body, args_str=m.get("args") or "", emitted_params=emitted,
                 known_types=_engine_types_declared(lines),
@@ -19818,9 +19794,15 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         if mname in overloaded:
             continue
         sym = "%s_%s" % (idn, mname)
+        params = []
+        for tm in this_method_list:
+            if tm.get("name") == mname:
+                params = cs2cpp.parse_params(tm.get("args") or "")
+                break
 
-        def _inst_call(m, s=sym):
+        def _inst_call(m, s=sym, params=params):
             args = (m.group(1) or "").strip()
+            args = _call_with_defaults(args, params).strip()
             if not args:
                 return "%s(i)" % s
             return "%s(i, %s)" % (s, args)

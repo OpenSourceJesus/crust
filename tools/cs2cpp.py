@@ -3618,6 +3618,122 @@ def cs_diag_at_site(site, body_idx, code, message, kind="error",
 
 
 # ---------------------------------------------------------------------------
+# C# preprocessor regions and lexical checks. unity_pack supplies its player's
+# defined symbols (UNITY_STANDALONE, ...) and its `Assets/` path display.
+# ---------------------------------------------------------------------------
+
+
+def eval_pp_expr(expr, defined):
+    """Evaluate a C# ``#if`` / ``#elif`` expression: symbols in *defined* are
+    true, all others false."""
+    tokens = re.findall(
+        r"\b[A-Za-z_][A-Za-z0-9_]*\b|\b\d+\b|&&|\|\||!|\(|\)", expr)
+    if not tokens:
+        return False
+    out = []
+    for t in tokens:
+        if t == "&&":
+            out.append("and")
+        elif t == "||":
+            out.append("or")
+        elif t == "!":
+            out.append("not")
+        elif t in ("(", ")"):
+            out.append(t)
+        elif t.isdigit():
+            out.append(t)
+        elif t in defined:
+            out.append("True")
+        else:
+            out.append("False")
+    try:
+        return bool(eval(" ".join(out), {"__builtins__": {}}, {}))
+    except Exception:
+        return False
+
+
+def blank_inactive_pp_regions(text, defined):
+    """Blank the lines of inactive ``#if`` / ``#elif`` / ``#else`` regions, and
+    the directive lines themselves, keeping line and column positions.
+    Symbols in *defined* are true; ``#else`` / ``#elif`` follow C# rules."""
+    lines = text.split("\n")
+    out = []
+    # Each frame: parent_active, any_branch_taken, current_active
+    stack = []
+
+    def emitting():
+        return stack[-1][2] if stack else True
+
+    def blank(line):
+        return " " * len(line)
+
+    for line in lines:
+        s = line.lstrip()
+        if s.startswith("#"):
+            low = s.lower()
+            if re.match(r"#if\b", low):
+                expr = s[3:].strip()
+                expr = re.split(r"//|/\*", expr, maxsplit=1)[0].strip()
+                parent = emitting()
+                val = eval_pp_expr(expr, defined) if parent else False
+                stack.append([parent, val, parent and val])
+                out.append(blank(line))
+                continue
+            if re.match(r"#elif\b", low) and stack:
+                expr = s[5:].strip()
+                expr = re.split(r"//|/\*", expr, maxsplit=1)[0].strip()
+                parent, taken, _cur = stack[-1]
+                if not parent or taken:
+                    stack[-1][2] = False
+                else:
+                    val = eval_pp_expr(expr, defined)
+                    stack[-1][1] = taken or val
+                    stack[-1][2] = val
+                out.append(blank(line))
+                continue
+            if re.match(r"#else\b", low) and stack:
+                parent, taken, _cur = stack[-1]
+                stack[-1][2] = bool(parent and not taken)
+                stack[-1][1] = True
+                out.append(blank(line))
+                continue
+            if re.match(r"#endif\b", low) and stack:
+                stack.pop()
+                out.append(blank(line))
+                continue
+            if not emitting():
+                out.append(blank(line))
+            else:
+                out.append(line)
+            continue
+        if emitting():
+            out.append(line)
+        else:
+            out.append(blank(line))
+    return "\n".join(out)
+
+
+def real_literal_error(path, text, scan=None, display_path=None):
+    """csc's diagnostic for the first C++-style real literal (``0.f``), or
+    None. C# real literals need digits after ``.`` (``0.0f``) or a bare
+    suffix (``0f``); ``0.f`` lexes as integer ``0``, ``.``, identifier ``f``
+    and csc reports CS1061. *scan* is ``_blank(text)`` when the caller has it.
+    """
+    if scan is None:
+        scan = _blank(text)
+    for m in re.finditer(r"(?<![\w.])\d+\.([fFdDmM])\b", scan):
+        suffix = m.group(1)
+        return cs_diag(
+            path, text, m.start(1), "CS1061",
+            "'int' does not contain a definition for '%s' and no accessible "
+            "extension method '%s' accepting a first argument of type 'int' "
+            "could be found (are you missing a using directive or an "
+            "assembly reference?)"
+            % (suffix, suffix), display_path=display_path)
+    return None
+
+
+# ---------------------------------------------------------------------------
 # C# structure and literal helpers shared with tools/unity_pack.py. Moved from
 # unity_pack unchanged, apart from public names; nothing here is Unity-specific.
 # ---------------------------------------------------------------------------
