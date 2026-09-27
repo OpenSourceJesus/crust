@@ -1,8 +1,7 @@
 """C# structure and literal helpers in tools/cs2cpp.py.
 
-These moved from tools/unity_pack.py unchanged (unity_pack keeps the old
-underscore names as aliases). Nothing here is Unity-specific. Two known gaps
-are recorded as expected failures.
+These moved from tools/unity_pack.py (unity_pack keeps the old underscore
+names as aliases). Nothing here is Unity-specific.
 """
 
 from __future__ import annotations
@@ -34,11 +33,21 @@ class TestCallArgs(unittest.TestCase):
         self.assertEqual(cs2cpp.split_call_args("a, f(b, c), d"),
                          ["a", "f(b, c)", "d"])
 
-    @unittest.expectedFailure
     def test_split_respects_string_literals(self):
-        # Known gap: commas inside string literals split the argument.
         self.assertEqual(cs2cpp.split_call_args('a, "x,y", d'),
                          ["a", '"x,y"', "d"])
+        self.assertEqual(cs2cpp.split_call_args('"a\\",b", c'),
+                         ['"a\\",b"', "c"])
+
+    def test_split_respects_other_literals_and_braces(self):
+        self.assertEqual(cs2cpp.split_call_args("'a', ',', b"),
+                         ["'a'", "','", "b"])
+        self.assertEqual(cs2cpp.split_call_args('@"q"",""z", d'),
+                         ['@"q"",""z"', "d"])
+        self.assertEqual(cs2cpp.split_call_args('$"{a},{b}", d'),
+                         ['$"{a},{b}"', "d"])
+        self.assertEqual(cs2cpp.split_call_args("new int[] { 1, 2 }, x"),
+                         ["new int[] { 1, 2 }", "x"])
 
     def test_match_call_args(self):
         text = "foo(1, g(2), 3) + 4"
@@ -51,17 +60,45 @@ class TestMethodSignatures(unittest.TestCase):
         self.assertEqual(cs2cpp.method_c_arg_names("int a, ref float b"),
                          ["a", "b"])
 
-    @unittest.expectedFailure
     def test_arg_names_with_array_params(self):
-        # Known gap: `params int[] rest` is not matched, so `rest` is lost.
         self.assertEqual(
             cs2cpp.method_c_arg_names("int a, params int[] rest"),
             ["a", "rest"])
+
+    def test_parse_params(self):
+        ps = cs2cpp.parse_params(
+            'Dictionary<int, string> d, string s = "a,b", out Vector2 v, '
+            "params float[,] grid")
+        self.assertEqual(
+            [(p.modifier, p.type, p.name, p.default) for p in ps],
+            [(None, "Dictionary<int,string>", "d", None),
+             (None, "string", "s", '"a,b"'),
+             ("out", "Vector2", "v", None),
+             ("params", "float[,]", "grid", None)])
+
+    def test_names_params_and_suffix_agree(self):
+        # unity_pack passes method_c_arg_names to a function declared with
+        # _method_c_params: the two must list the same parameters.
+        for args in ("int a, params int[] rest", "int a = 5, bool b = true",
+                     "Dictionary<int, string> d, float f", ""):
+            names = cs2cpp.method_c_arg_names(args)
+            params = unity_pack._method_c_params(args)
+            self.assertEqual(
+                [p.split()[-1] for p in params.split(", ")] if params else [],
+                names)
 
     def test_overload_symbols(self):
         self.assertEqual(cs2cpp.method_arg_type_suffix("int a, float b"),
                          "int_float")
         self.assertEqual(cs2cpp.method_arg_type_suffix(""), "void")
+        self.assertEqual(
+            cs2cpp.method_arg_type_suffix("Dictionary<int, string> d, float f"),
+            "Dictionary_int_string_float")
+        # Arrays stay distinct from scalars, so overloads cannot collide
+        self.assertEqual(cs2cpp.method_arg_type_suffix("int a, int[] b"),
+                         "int_int_array")
+        self.assertNotEqual(cs2cpp.method_arg_type_suffix("int a, int[] b"),
+                            cs2cpp.method_arg_type_suffix("int a, int b"))
         self.assertEqual(
             cs2cpp.method_c_symbol("Counter", "Add", "int a, int b", True),
             "Counter_Add_int_int")
@@ -72,6 +109,47 @@ class TestMethodSignatures(unittest.TestCase):
     def test_modifiers(self):
         self.assertEqual(cs2cpp.MODIFIERS, frozenset(
             ("public", "private", "protected", "internal", "static")))
+
+
+class TestDiagnostics(unittest.TestCase):
+    TEXT = "class A {\n  void F() {\n    bad();\n  }\n}\n"
+
+    def test_line_col(self):
+        self.assertEqual(cs2cpp.line_col(self.TEXT, self.TEXT.index("bad")),
+                         (3, 5))
+        self.assertEqual(cs2cpp.line_col("", 0), (1, 1))
+
+    def test_cs_diag_default_path(self):
+        i = self.TEXT.index("bad")
+        self.assertEqual(
+            cs2cpp.cs_diag("/proj/Assets/Scripts/A.cs", self.TEXT, i,
+                           "CS0103", "nope"),
+            "A.cs(3,5): error CS0103: nope")
+        self.assertEqual(cs2cpp.cs_diag("", "", 0, "CS1", "m", "warning"),
+                         "<cs>(1,1): warning CS1: m")
+
+    def test_cs_diag_display_path(self):
+        self.assertEqual(
+            cs2cpp.cs_diag("a/b.cs", "x", 0, "CS1", "m",
+                           display_path=lambda p: "[" + p + "]"),
+            "[a/b.cs](1,1): error CS1: m")
+
+    def test_cs_diag_at_site(self):
+        body_abs = self.TEXT.index("{\n    bad")
+        site = {"path": "/p/X.cs", "file_text": self.TEXT,
+                "body_abs": body_abs}
+        self.assertEqual(cs2cpp.cs_diag_at_site(site, 6, "CS0", "m"),
+                         "X.cs(3,5): error CS0: m")
+        self.assertEqual(cs2cpp.cs_diag_at_site({"path": "/p/X.cs"}, 6,
+                                                "CS0", "m"),
+                         "X.cs(1,1): error CS0: m")
+
+    def test_unity_pack_prints_assets_paths(self):
+        i = self.TEXT.index("bad")
+        self.assertEqual(
+            unity_pack._cs_diag("/proj/Assets/Scripts/A.cs", self.TEXT, i,
+                                "CS0103", "nope"),
+            "Assets/Scripts/A.cs(3,5): error CS0103: nope")
 
 
 class TestUnityPackAliases(unittest.TestCase):
