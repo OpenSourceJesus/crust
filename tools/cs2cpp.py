@@ -3576,3 +3576,320 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+# ---------------------------------------------------------------------------
+# C# structure and literal helpers shared with tools/unity_pack.py. Moved from
+# unity_pack unchanged, apart from public names; nothing here is Unity-specific.
+# ---------------------------------------------------------------------------
+
+
+def c_string(s):
+    """Quote a Python str as a C string literal."""
+    return '"%s"' % (
+        s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+        .replace("\r", "\\r").replace("\0", "\\0")
+    )
+
+
+def string_literal_value(expr):
+    """Return the string inside a C# literal, or None if not a plain literal."""
+    s = (expr or "").strip()
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        return s[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+    return None
+
+
+def match_call_args(text, open_paren):
+    """Index of '(' → (args_str, index_after_closing_paren) or None."""
+    if open_paren >= len(text) or text[open_paren] != "(":
+        return None
+    depth = 1
+    j = open_paren + 1
+    while j < len(text) and depth:
+        c = text[j]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return text[open_paren + 1:j], j + 1
+        j += 1
+    return None
+
+
+def blank_method_bodies(bscan):
+    """Replace method interiors with spaces so locals are not seen as fields."""
+    import tools.cpprust as cpprust
+    out = list(bscan)
+    head = re.compile(
+            r"(?m)^[ \t]*(?:public|private|protected|internal)?"
+            r"[ \t]*(?:static[ \t]+)?(?:override[ \t]+)?(?:virtual[ \t]+)?"
+            r"[\w.<>]+[ \t]+\w+[ \t]*\(")
+    for m in head.finditer(bscan):
+        args_start = m.end()
+        depth = 1
+        j = args_start
+        while j < len(bscan) and depth > 0:
+            ch = bscan[j]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            j += 1
+        if depth != 0:
+            continue
+        k = j
+        while k < len(bscan) and bscan[k] in " \t\r\n":
+            k += 1
+        if k >= len(bscan) or bscan[k] != "{":
+            continue
+        open_i = k
+        close = cpprust._match_brace(bscan, open_i)
+        if close is None:
+            continue
+        for i in range(open_i + 1, close):
+            if out[i] not in "\n\r":
+                out[i] = " "
+    return "".join(out)
+
+
+def methods_in(body, bscan, body_abs=0):
+    # Control-flow / type keywords must not look like `ret Name(...) {`.
+    _NOT_METHOD = frozenset((
+        "if", "else", "for", "foreach", "while", "do", "switch", "case",
+        "catch", "using", "lock", "fixed", "return", "new", "typeof",
+        "sizeof", "checked", "unchecked", "await", "throw", "goto",
+        "break", "continue", "default", "in", "out", "ref", "is", "as",
+        "true", "false", "null", "this", "base", "get", "set", "add",
+        "remove", "where", "select", "from", "when",
+    ))
+    out = []
+    # Match `ret Name (` then scan args with nested-paren depth so
+    # `default(InputDeviceChange)` inside the parameter list is kept
+    # (a naive `[^)]*` stops at the first `)` and drops the method).
+    head = re.compile(
+            r"(?m)^[ \t]*(?:public|private|protected|internal)?"
+            r"[ \t]*(?:static[ \t]+)?(?:override[ \t]+)?(?:virtual[ \t]+)?"
+            r"([\w.<>]+)[ \t]+(\w+)[ \t]*\(")
+    for m in head.finditer(bscan):
+        ret, name = m.group(1).strip(), m.group(2)
+        # `else if (...) {` → ret=else, name=if — not a method.
+        if ret in _NOT_METHOD or name in _NOT_METHOD:
+            continue
+        if "." in ret and ret.split(".")[-1] in _NOT_METHOD:
+            continue
+        # `public DragUpdater (..)` — a constructor has no return type, so
+        # the modifier is what the return-type group matched. It returns
+        # the instance, which the packed emit already has as `i`: void.
+        ctor = ret in MODIFIERS
+        if ctor:
+            ret = "void"
+        args_start = m.end()
+        depth = 1
+        j = args_start
+        while j < len(bscan) and depth > 0:
+            ch = bscan[j]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            j += 1
+        if depth != 0:
+            continue
+        args_str = bscan[args_start:j - 1]
+        # Skip whitespace to the opening `{`.
+        k = j
+        while k < len(bscan) and bscan[k] in " \t\r\n":
+            k += 1
+        if k >= len(bscan) or bscan[k] != "{":
+            continue
+        open_i = k
+        # _match_brace lives on cpprust; cs2cpp uses it via import.
+        import tools.cpprust as cpprust
+        close = cpprust._match_brace(bscan, open_i)
+        if close is None:
+            continue
+        # Map scan indices to body (same length; body may differ in trivia).
+        src = body[m.start():m.start() + (close - m.start()) + 1]
+        impl = body[open_i + 1:close]
+        decl = bscan[m.start():open_i + 1]
+        out.append({
+            "ret": ret,
+            "name": name,
+            "args": args_str.strip(),
+            "body": impl,
+            "body_abs": int(body_abs) + int(open_i + 1),
+            "src": src,
+            "ctor": ctor,
+            "public": bool(re.search(r"\bpublic\b", decl)),
+            "static": bool(re.search(r"\bstatic\b", decl)) and not ctor,
+        })
+    return out
+
+
+def interface_methods(bscan):
+    """`void DoUpdate ();` in an interface body — signatures, no bodies."""
+    out = []
+    for m in re.finditer(
+            r"(?m)^[ \t]*([\w.<>]+(?:\s*\[\s*\])?)[ \t]+(\w+)[ \t]*"
+            r"\(([^)]*)\)[ \t]*;", bscan):
+        ret, name = m.group(1).strip(), m.group(2)
+        if ret in ("return", "new", "throw"):
+            continue
+        out.append({"ret": ret, "name": name, "args": m.group(3).strip()})
+    return out
+
+
+MODIFIERS = frozenset(("public", "private", "protected", "internal",
+                        "static"))
+
+
+def property_names(bscan):
+    """C# property names a type body declares (`public bool Equipped { .. }`).
+
+    Only setters lower (`set_Name`, for UnityEvent wiring); a body that
+    still names one has a read the pack cannot answer.
+    """
+    out = set()
+    for m in re.finditer(
+            r"(?m)^[ \t]*(?:public|private|protected|internal)?"
+            r"[ \t]*(?:static[ \t]+)?(?:override[ \t]+)?(?:virtual[ \t]+)?"
+            r"([\w.<>]+)[ \t]+(\w+)[ \t\r\n]*\{", bscan):
+        if m.group(1) in ("if", "else", "for", "while", "switch", "catch",
+                          "using", "lock", "get", "set", "add", "remove",
+                          "class", "struct", "enum", "interface", "namespace"):
+            continue
+        if m.start() > 0 and bscan[m.start() - 1] == "(":
+            continue
+        out.add(m.group(2))
+    return sorted(out)
+
+
+def properties_as_methods(body, bscan, body_abs=0):
+    """C# properties → ``get_Name`` / ``set_Name`` (UnityEvent wiring).
+
+    PersistentListenerMode targets property setters as ``set_Volume`` etc.
+    """
+    import tools.cpprust as cpprust
+    out = []
+    head = re.compile(
+        r"(?m)^[ \t]*(?:public|private|protected|internal)?"
+        r"[ \t]*(static[ \t]+)?(?:override[ \t]+)?(?:virtual[ \t]+)?"
+        r"([\w.<>]+)[ \t]+(\w+)[ \t\r\n]*\{")
+    for m in head.finditer(bscan):
+        is_static = bool(m.group(1))
+        ret, name = m.group(2).strip(), m.group(3)
+        if ret in ("if", "else", "for", "while", "switch", "catch", "using",
+                   "lock", "get", "set", "add", "remove"):
+            continue
+        # Skip methods: ``ret Name(`` was already handled; property has no `(`.
+        if m.start() > 0 and bscan[m.start() - 1] == "(":
+            continue
+        open_i = m.end() - 1
+        if open_i < 0 or bscan[open_i] != "{":
+            continue
+        close = cpprust._match_brace(bscan, open_i)
+        if close is None:
+            continue
+        prop_body = body[open_i + 1:close]
+        prop_scan = bscan[open_i + 1:close]
+        decl = bscan[m.start():open_i + 1]
+        is_public = bool(re.search(r"\bpublic\b", decl))
+        # set { ... } — implicit ``value`` parameter.
+        # Only setters are extracted (UnityEvent wires ``set_Name``); getters
+        # returning non-void would break the void method emitter.
+        sm = re.search(r"(?m)^\s*set\s*[ \t\r\n]*\{", prop_scan)
+        if sm:
+            sopen = sm.end() - 1
+            sclose = cpprust._match_brace(prop_scan, sopen)
+            if sclose is not None:
+                out.append({
+                    "ret": "void",
+                    "name": "set_" + name,
+                    "args": "%s value" % ret,
+                    "body": prop_body[sopen + 1:sclose],
+                    "body_abs": int(body_abs) + int(open_i + 1) + sopen + 1,
+                    "src": "",
+                    "public": is_public,
+                    "static": is_static,
+                })
+    return out
+
+
+def method_c_arg_names(args_str):
+    """Parameter names of a C# list, in order — to pass them straight on."""
+    names = []
+    for part in (args_str or "").split(","):
+        part = re.sub(r"\b(?:ref|out|in|params)\s+", "", part.strip())
+        m = re.match(r"([\w.<>]+)\s+(\w+)\s*$", part)
+        if m:
+            names.append(m.group(2))
+    return names
+
+
+def method_arg_type_suffix(args_str):
+    """C# param list → type suffix for overload mangling.
+
+    ``SpawnedEntry spawnedEntry`` → ``SpawnedEntry``;
+    ``GameObject clone, Transform trs`` → ``GameObject_Transform``;
+    empty args → ``void``.
+    """
+    types = []
+    for part in (args_str or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        part = re.sub(r"\b(?:ref|out|in|params)\s+", "", part)
+        m = re.match(r"([\w.<>]+)\s+(\w+)\s*$", part)
+        if not m:
+            continue
+        ty = m.group(1).split(".")[-1]
+        ty = re.sub(r"[<>\[\],\s]+", "_", ty).strip("_")
+        if ty:
+            types.append(c_ident(ty))
+    return "_".join(types) if types else "void"
+
+
+def method_c_symbol(class_idn, method_name, args_str, overloaded):
+    """C free-function name for a MonoBehaviour method.
+
+    C has no overloading — when *overloaded* is true, append a param-type
+    suffix so ``RemoveSpawnedEntry(SpawnedEntry)`` and
+    ``RemoveSpawnedEntry(GameObject, Transform)`` become distinct symbols.
+    """
+    base = "%s_%s" % (class_idn, method_name)
+    if not overloaded:
+        return base
+    return "%s_%s" % (base, method_arg_type_suffix(args_str))
+
+
+def overload_method_names(methods):
+    """Method names that appear more than once (C# overloads)."""
+    counts = {}
+    for m in methods or []:
+        n = m.get("name") or ""
+        if n:
+            counts[n] = counts.get(n, 0) + 1
+    return {n for n, c in counts.items() if c > 1}
+
+
+def c_ident(name):
+    return code_sub(r"[^A-Za-z0-9_]", "_", name)
+
+
+def split_call_args(argstr):
+    """Split `a, b` or `a, b, c` on commas at paren depth 0."""
+    parts = []
+    depth = 0
+    start = 0
+    for i, c in enumerate(argstr):
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        elif c == "," and depth == 0:
+            parts.append(argstr[start:i].strip())
+            start = i + 1
+    parts.append(argstr[start:].strip())
+    return parts
