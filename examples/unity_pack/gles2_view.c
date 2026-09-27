@@ -283,6 +283,14 @@ static int init_egl(void)
     return 1;
 }
 
+
+/* The target's format: GL_RGBA4 by default, as gles3_view.c. The tests compare
+ * the two viewers at 8 bits a channel (-DFBO_FORMAT=0x8058, GL_RGBA8), where
+ * RGBA4 would round small color differences to the same pixels. */
+#ifndef FBO_FORMAT
+#define FBO_FORMAT GL_RGBA4
+#endif
+
 static int init_fbo(void)
 {
     GLuint fbo, rbo;
@@ -291,7 +299,7 @@ static int init_fbo(void)
     glBindFramebuffer(GL_FRAMEBUFFER, fbo);
     glGenRenderbuffers(1, &rbo);
     glBindRenderbuffer(GL_RENDERBUFFER, rbo);
-    glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA4, WIDTH, HEIGHT);
+    glRenderbufferStorage(GL_RENDERBUFFER, FBO_FORMAT, WIDTH, HEIGHT);
     glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                               GL_RENDERBUFFER, rbo);
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
