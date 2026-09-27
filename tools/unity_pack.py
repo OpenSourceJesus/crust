@@ -7698,6 +7698,31 @@ def _instantiate_budget(analyses, plan):
     return budget
 
 
+def _new_budget(analyses, plan):
+    """Extra instance slots for ``new T(..)`` of a packed non-scene class.
+
+    A nested helper class (`_Scrollbar.DragUpdater`) is packed like any
+    other but the scene places none of it: its array exists with no slot
+    to allocate. Budget is one spare per authored instance of each class
+    whose body constructs it -- the same promise `Instantiate` makes,
+    and the same clip when the pool is full.
+    """
+    budget = {}
+    classes = plan.get("classes") or {}
+    class_n = {n: int(cl.get("n") or 0) for n, cl in classes.items()}
+    for a in analyses:
+        for c in a.get("classes") or []:
+            n = max(1, class_n.get(c["name"], 1) or 1)
+            bodies = cs2cpp._blank(
+                "\n".join(m.get("body") or "" for m in c.get("methods") or []))
+            for m in re.finditer(r"(?<![\w.])new\s+([\w.]+)\s*\(", bodies):
+                t = m.group(1).split(".")[-1]
+                if t not in classes or t in _ADDABLE_BUILTINS:
+                    continue
+                budget[t] = budget.get(t, 0) + n
+    return budget
+
+
 def _class_index_width(cname, n, spawn, annotated=None):
     """(C type, bits, bounded) of an index into `cname`'s instance array.
 
@@ -7741,7 +7766,8 @@ def _mb_pool_extra(plan, cname):
         return max(0, int(cl["max_instances"]) - int(cl.get("n") or 0))
     add = int((plan.get("addcomponent_budget") or {}).get(cname) or 0)
     inst = int((plan.get("instantiate_budget") or {}).get(cname) or 0)
-    return add + inst
+    new = int((plan.get("new_budget") or {}).get(cname) or 0)
+    return add + inst + new
 
 
 def _disallow_multiple_types(analyses):
@@ -8026,6 +8052,27 @@ def _gcic_go_expr(recv, cl, plan, locals_ty):
         return "_engine_go_of_%s(%s)" % (_c_ident(ty), recv)
     # Unknown — treat as GO index (Transform/GO local after rewrite).
     return recv
+
+
+def _rewrite_new_packed_class(text, plan):
+    """``new T(args)`` of a packed class → ``Object_New_T(args)``.
+
+    Runs after `this` → `i`, so a constructor argument that is the caller
+    is already the index the packed constructor takes. Value types
+    (`new Vector2(..)`), collections and arrays are other rewrites'.
+    """
+    budget = plan.get("new_budget") or {}
+    if not budget:
+        return text
+    for cname in sorted(budget, key=len, reverse=True):
+        if cname not in (plan.get("classes") or {}):
+            continue
+        if not int(budget.get(cname) or 0):
+            continue
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])new\s+(?:[\w.]+\s*\.\s*)?%s\s*\(" % re.escape(cname),
+            "Object_New_%s(" % _c_ident(cname), text)
+    return text
 
 
 def _rewrite_getcomponentsinchildren(text, plan, this_class):
@@ -9958,6 +10005,12 @@ def _methods_in(body, bscan, body_abs=0):
             continue
         if "." in ret and ret.split(".")[-1] in _NOT_METHOD:
             continue
+        # `public DragUpdater (..)` — a constructor has no return type, so
+        # the modifier is what the return-type group matched. It returns
+        # the instance, which the packed emit already has as `i`: void.
+        ctor = ret in _MODIFIERS
+        if ctor:
+            ret = "void"
         args_start = m.end()
         depth = 1
         j = args_start
@@ -9994,10 +10047,17 @@ def _methods_in(body, bscan, body_abs=0):
             "body": impl,
             "body_abs": int(body_abs) + int(open_i + 1),
             "src": src,
+            "ctor": ctor,
             "public": bool(re.search(r"\bpublic\b", decl)),
-            "static": bool(re.search(r"\bstatic\b", decl)),
+            "static": bool(re.search(r"\bstatic\b", decl)) and not ctor,
         })
     return out
+
+
+#: C# access modifiers, which `_methods_in` reads as a return type when the
+#: declaration is a constructor's (`public Foo (..)`).
+_MODIFIERS = frozenset(("public", "private", "protected", "internal",
+                        "static"))
 
 
 def _property_names(bscan):
@@ -10093,6 +10153,17 @@ def _param_c_ty(ty):
         return "int"
     # MonoBehaviour / component / enum handles → packed index.
     return "int"
+
+
+def _method_c_arg_names(args_str):
+    """Parameter names of a C# list, in order — to pass them straight on."""
+    names = []
+    for part in (args_str or "").split(","):
+        part = re.sub(r"\b(?:ref|out|in|params)\s+", "", part.strip())
+        m = re.match(r"([\w.<>]+)\s+(\w+)\s*$", part)
+        if m:
+            names.append(m.group(2))
+    return names
 
 
 def _method_arg_type_suffix(args_str):
@@ -10322,6 +10393,106 @@ def _rewrite_toggle_is_on(text):
         r"Toggle_get_isOn(\1)",
         text)
     return text
+
+
+def _unstored_field_names(cl, plan):
+    """Authored fields -- the class's and its bases' -- with no packed slot.
+
+    A `Transform` reference, a uGUI handle, an instance `string`, a field
+    declared on a base class (inheritance is not modelled: a base is its
+    own packed array): the struct has no member for any of them.
+    """
+    stored = {n for n, _ty, _bits, _kind in cl.get("members") or []}
+    for key in ("class_consts", "dict_fields", "list_fields",
+                "ref_array_fields"):
+        stored |= {f["name"] for f in cl.get(key) or []}
+    fields = list(cl.get("fields") or [])
+    bases = plan.get("mb_bases") or {}
+    classes = plan.get("classes") or {}
+    seen = {cl.get("name")}
+    queue = list(bases.get(cl.get("name")) or [])
+    while queue:
+        b = queue.pop()
+        if b in seen:
+            continue
+        seen.add(b)
+        fields.extend((classes.get(b) or {}).get("fields") or [])
+        queue.extend(bases.get(b) or [])
+    out = set()
+    for f in fields:
+        name = f.get("name")
+        if not name or name in stored:
+            continue
+        # Vector2 / Vector3 fields are stored as their _x/_y/_z components.
+        if any(("%s_%s" % (name, ax)) in stored for ax in ("x", "y", "z")):
+            continue
+        out.add(name)
+    return out
+
+
+def _writes_unstored_field(body, cl, plan):
+    """The `this.f = v` of a field the pack keeps no storage for, or None.
+
+    Read on the authored C#, where `this.` says field and not local, so a
+    parameter of the same name cannot be mistaken for one. There is no C
+    name to assign, so the method reports as unlowered instead of emitting
+    a dangling identifier.
+    """
+    unstored = _unstored_field_names(cl, plan)
+    if not unstored:
+        return None
+    scan = cs2cpp._blank(body or "")
+    for m in re.finditer(r"(?<![\w.])this\s*\.\s*(\w+)\s*=(?!=)", scan):
+        if m.group(1) in unstored:
+            return (body or "")[m.start():m.end()]
+    return None
+
+
+def _class_field_names(cl):
+    """Every name a body of `cl` can mean a field by (packed, static, authored)."""
+    names = {n for n, _ty, _bits, _kind in cl.get("members") or []}
+    names |= {f["name"] for f in cl.get("fields") or []}
+    names |= {f["name"] for f in cl.get("class_consts") or []}
+    return names
+
+
+def _rename_shadowed_params(cl, m):
+    """A parameter that shadows a field of `cl` (`this.x = x`), renamed.
+
+    C# tells the two apart by `this.`, which the packed lowering strips
+    before fields become accessors -- so a constructor's `this.scrollbar =
+    scrollbar` read as the field assigned to itself. The emitted C tells
+    them apart by name instead: the parameter becomes `scrollbar_` in both
+    the signature and the body, and the field keeps the authored name.
+    """
+    args = m.get("args") or ""
+    if not args.strip():
+        return m
+    fields = _class_field_names(cl)
+    if not fields:
+        return m
+    body = m.get("body") or ""
+    renamed = False
+    for part in args.split(","):
+        part = re.sub(r"\b(?:ref|out|in|params)\s+", "", part.strip())
+        pm = re.match(r"([\w.<>]+)\s+(\w+)\s*$", part)
+        if not pm or pm.group(2) not in fields:
+            continue
+        old = pm.group(2)
+        new = old + "_"
+        while new in fields:
+            new += "_"
+        # `this.x` keeps the field (the `.` is in the lookbehind); every
+        # other mention of the name in the body is the parameter.
+        body = cs2cpp.code_sub(r"(?<![\w.])%s\b" % re.escape(old), new, body)
+        args = re.sub(r"(?<![\w.])%s\b" % re.escape(old), new, args)
+        renamed = True
+    if not renamed:
+        return m
+    out = dict(m)
+    out["args"] = args
+    out["body"] = body
+    return out
 
 
 def _reachable_emit_methods(methods):
@@ -15076,9 +15247,9 @@ def emit_engine(plan, analyses, used_apis):
     methods_by = {}
     for a in analyses:
         for c in a["classes"]:
+            cl = (plan.get("classes") or {}).get(c["name"]) or c
             methods_by.setdefault(c["name"], []).extend(
-                [(c, m) for m in c["methods"]
-                 if m["name"] not in ("Start",) or True])
+                [(c, _rename_shadowed_params(cl, m)) for m in c["methods"]])
     plan["_methods_by"] = methods_by
 
     # MonoBehaviour OnCollision*2D(Collision2D) → dispatch after collide2d.
@@ -15175,6 +15346,39 @@ def emit_engine(plan, analyses, used_apis):
                 idn, f["name"], cap))
             _emitted_coll = True
     if _emitted_coll:
+        p("")
+
+    # `new T(..)` of a packed class the scene places none of (a nested
+    # helper like `_Scrollbar.DragUpdater`): take the next pool slot and
+    # run the constructor on it. No GameObject — a plain C# object has none.
+    for cname in sorted(plan.get("new_budget") or {}):
+        if cname not in plan["classes"]:
+            continue
+        if not int((plan["new_budget"] or {}).get(cname) or 0):
+            continue
+        cl = plan["classes"][cname]
+        idn = _c_ident(cname)
+        cap = max(1, int(cl["n"]) + _mb_pool_extra(plan, cname))
+        ctors = [m for _c, m in methods_by.get(cname, [])
+                 if m.get("ctor") and m.get("name") == cname]
+        ctor = ctors[0] if len(ctors) == 1 else None
+        plist = _method_c_params(ctor.get("args") or "") if ctor else ""
+        if ctor:
+            p("static void %s_%s(unsigned i%s);" % (
+                idn, cname, (", " + plist) if plist else ""))
+        p("/* new %s(..) — next free pool slot, then the constructor. */"
+          % cname)
+        p("static int Object_New_%s(%s) {" % (idn, plist or "void"))
+        p("    int ex;")
+        p("    if (_%s_inst_count >= %d) return -1;" % (idn, cap))
+        p("    ex = _%s_inst_count;" % idn)
+        p("    _%s_inst_count = _%s_inst_count + 1;" % (idn, idn))
+        if ctor:
+            names = _method_c_arg_names(ctor.get("args") or "")
+            p("    %s_%s((unsigned)ex%s);" % (
+                idn, cname, "".join(", " + n for n in names)))
+        p("    return ex;")
+        p("}")
         p("")
 
     # A class reached through another's handle field (`other.hp` ->
@@ -15414,6 +15618,15 @@ def emit_engine(plan, analyses, used_apis):
                         "valued return in void method emit",
                         "return …;",
                     )
+                else:
+                    hit = _writes_unstored_field(m.get("body") or "", cl, plan)
+                    if hit:
+                        why = (
+                            "field the pack keeps no storage for (a "
+                            "Transform / component reference, or one "
+                            "declared on a base class)",
+                            hit,
+                        )
             if why is not None:
                 _report_stub(plan, site, cl, m, why)
                 if not m.get("static"):
@@ -18839,6 +19052,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = _rewrite_find_getcomponent(text, plan, cl["name"], site=site)
     text, add_locals = _rewrite_addcomponent(text, plan, cl["name"])
     text = _rewrite_instantiate(text, plan, cl["name"])
+    text = _rewrite_new_packed_class(text, plan)
     text = _rewrite_getcomponentsinchildren(text, plan, cl["name"])
     text = _rewrite_audiosource_api(text, cl, add_locals=add_locals)
     # AudioSource / authored UI component locals are packed indices.
@@ -21036,6 +21250,7 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
     plan["addcomponent_types"] = sorted(add_types)
     plan["addcomponent_budget"] = _addcomponent_budget(analyses, plan)
     plan["instantiate_budget"] = _instantiate_budget(analyses, plan)
+    plan["new_budget"] = _new_budget(analyses, plan)
     # Each clone takes a GameObject too: a `[MaxInstances(N)]` class's share
     # of the pool is what fills it to N, not the one spare per call site.
     plan["instantiate_go_budget"] = sum(
