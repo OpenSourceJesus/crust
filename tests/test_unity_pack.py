@@ -2925,6 +2925,55 @@ class TestSystems(unittest.TestCase):
         self.assertNotIn("unlowered C#", upd)
         self.assertNotIn("Sel.instances", eng)
 
+    def test_rect_point_to_normalized(self):
+        """Rect.PointToNormalized(r, p) → the clamped [0,1] rect helper."""
+        root = tempfile.mkdtemp(prefix="upack-rectptn-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Probe.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Probe : MonoBehaviour {\n"
+                "    public float v;\n"
+                "    void Update() {\n"
+                "        Rect r = new Rect(0f, 0f, 10f, 4f);\n"
+                "        Vector2 n = Rect.PointToNormalized("
+                "r, new Vector2(5f, 1f));\n"
+                "        v = n.y;\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Probe.cs.meta"), "w") as f:
+            f.write("guid: rectptnrectptnrectptnrectptn01\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Probe\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: rectptnrectptnrectptnrectptn01}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-rectptn-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.cpp")) as f:
+            eng = f.read()
+        self.assertIn(
+            "static Vector2 Rect_PointToNormalized(Rect r, Vector2 p)", eng)
+        self.assertIn("Mathf_InverseLerp(", eng)
+        upd = self._emitted_body(eng, "Probe_Update")
+        self.assertIn("Rect_make(0.f, 0.f, 10.f, 4.f)", upd)
+        self.assertIn("Rect_PointToNormalized(r, Vector2_make(", upd)
+        self.assertNotIn("Rect.PointToNormalized", upd)
+        self.assertNotIn("unlowered C#", upd)
+
     def test_static_method_and_singleton_instance(self):
         """Other.StaticMethod(Other.Instance.field) → Class_Method(get(Instance()))."""
         root = tempfile.mkdtemp(prefix="upack-static-")

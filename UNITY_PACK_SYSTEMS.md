@@ -481,6 +481,7 @@ known builtins (`SpriteRenderer`, RB, uGUI, …) only — unknown `T` → CS0246
 | `List<T>` | ``std::vector`` (MB/component elems → ``int`` indices); ``Add``/``Count``; cross-class static ``Other.list`` → ``Other_list`` |
 | `Dictionary<K,V>` / `SortedList<K,V>` | ``std::map`` (``Add``→``[]=``, ``Clear``/``Count``/indexer); string keys via helper |
 | `Vector2` | C ``typedef struct`` + ``Vector2_make``; packed fields stay ``_x``/``_y`` |
+| `Rect` / `Rect.PointToNormalized(r, p)` | C ``typedef struct`` + ``Rect_make``; ``Rect_PointToNormalized`` via ``Mathf_InverseLerp`` (clamped [0,1], Unity's) |
 | `T.StaticMethod` / `T.Instance` / `FindObjectOfType<T>` | ``T_StaticMethod(args)``; ``T_Instance()`` caches ``Object_FindObjectOfType_T(1)`` (live GO map scan, skips Destroyed; re-finds when null); explicit ``FindObjectOfType<T>()`` → ``Object_FindObjectOfType_T(0)`` |
 | `Toggle[]` / ``.isOn`` | ``std::vector<int>`` GO idxs; ``Toggle_set/get_isOn`` |
 | `HashSet` / … | BCL collections not lowered — CS0246 at the type token |

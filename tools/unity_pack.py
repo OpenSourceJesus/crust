@@ -9668,6 +9668,9 @@ def analyze_script(path, text=None, shallow=False):
         apis.add("Canvas")
     if re.search(r"Canvas\.ForceUpdateCanvases\b", scan):
         apis.add("Canvas.ForceUpdateCanvases")
+    if re.search(r"(?<![\w.])(?:UnityEngine\.)?Rect\s*\.\s*"
+                 r"PointToNormalized\s*\(", scan):
+        apis.add("Rect.PointToNormalized")
     if re.search(r"\bInputAction\b", scan):
         apis.add("InputAction")
     if re.search(
@@ -11337,6 +11340,10 @@ def emit_engine(plan, analyses, used_apis):
     want_live_rot = bool(plan.get("live_rot_classes"))
     want_transform_matrix = bool(plan.get("transform_matrix_classes"))
     want_quat_angle = "Quaternion.Angle" in used_apis
+    # UnityEngine.Rect as a value type: any script that builds or reads one.
+    want_rect = bool(used_apis & {
+        "Rect.PointToNormalized", "RectTransform.rect",
+        "Extensions.GetWorldRect"})
     if ("File.WriteAllBytes" in used_apis
             or "File.ReadAllBytes" in used_apis):
         if "File.WriteAllBytes" in used_apis:
@@ -11577,6 +11584,8 @@ def emit_engine(plan, analyses, used_apis):
         _emit_vector2_struct(p)
     if _plan_needs_vector2int(plan, used_apis):
         _emit_vector2int_struct(p)
+    if want_rect:
+        _emit_rect_struct(p, "Rect.PointToNormalized" in used_apis)
     if want_iref:
         _emit_iref_struct(p)
     if static_ref_arrays:
@@ -17809,6 +17818,115 @@ def _rewrite_transform_parent(text, cl, plan):
         text)
 
 
+#: Emitted helpers that hand back a `Rect` — a receiver its properties read.
+_RECT_VALUE_CALLS = ("RectTransform_GetWorldRect", "RectTransform_get_rect",
+                     "Rect_MinMaxRect", "Rect_make")
+
+#: Emitted helpers that hand back a `Vector2`, so `.x` / `.y` on the result
+#: is the struct's field and not C# nothing lowered.
+_VECTOR2_VALUE_CALLS = (
+    "Vector2_make", "Rect_center", "Rect_size", "Rect_min", "Rect_max",
+    "Rect_PointToNormalized", "Camera_main_ScreenToWorldPoint",
+    "Mouse_current_position", "RectTransform_get_localPosition",
+    "RectTransform_get_anchoredPosition", "RectTransform_get_sizeDelta")
+
+
+def _rect_receiver(text, scan, end):
+    """The Rect expression ending at *end*, as (start, source), or None."""
+    j = end - 1
+    while j >= 0 and scan[j] in " \t":
+        j -= 1
+    if j < 0:
+        return None
+    if scan[j] == ")":
+        depth = 0
+        while j >= 0:
+            if scan[j] == ")":
+                depth += 1
+            elif scan[j] == "(":
+                depth -= 1
+                if depth == 0:
+                    break
+            j -= 1
+        if j < 0:
+            return None
+    else:
+        # A bare name: the last character is its own, not a call's `(`.
+        j += 1
+    k = j
+    while k > 0 and (scan[k - 1].isalnum() or scan[k - 1] == "_"):
+        k -= 1
+    if k == j:
+        return None
+    return k, text[k:end]
+
+
+def _rewrite_rect_members(text):
+    """Unity `Rect` properties on a Rect value: center / size / min / max.
+
+    `x`, `y`, `width` and `height` are fields of the emitted struct and read
+    as they are written; these four are C# properties. `rect.center = v`
+    moves the rect, so it goes through the setter on the local's address.
+    """
+    props = ("center", "size", "min", "max")
+    names = set(re.findall(r"(?<![\w.])Rect\s+(\w+)\s*[=;]",
+                           cs2cpp._blank(text)))
+    # `rect.center = v` — a property write on a Rect local.
+    for n in sorted(names):
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])%s\s*\.\s*center\s*=\s*([^;]+);" % re.escape(n),
+            lambda m, nm=n: "Rect_set_center(&%s, %s);" % (
+                nm, m.group(1).strip()),
+            text)
+    i = 0
+    while True:
+        scan = cs2cpp._blank(text)
+        m = re.compile(
+            r"\.\s*(%s)\b(\s*\.\s*([xy])\b)?" % "|".join(props)).search(scan, i)
+        if not m:
+            break
+        got = _rect_receiver(text, scan, m.start())
+        if got is None:
+            i = m.end()
+            continue
+        start, recv = got
+        head = re.match(r"\w+", recv).group(0)
+        if head not in _RECT_VALUE_CALLS and head not in names:
+            i = m.end()
+            continue
+        fn = "Rect_%s" % m.group(1)
+        if m.group(3):
+            fn = "%s_%s" % (fn, m.group(3))
+        text = text[:start] + "%s(%s)" % (fn, recv) + text[m.end():]
+        i = start
+    return _rewrite_vector2_value_axis(text)
+
+
+def _rewrite_vector2_value_axis(text):
+    """`.x` / `.y` on a Vector2 an emitted helper returned → `Vector2_x(..)`.
+
+    C cannot take a member of a call's result in this subset, and the stub
+    detector reads one as C# nothing lowered.
+    """
+    i = 0
+    while True:
+        scan = cs2cpp._blank(text)
+        m = re.compile(r"\)\s*\.\s*([xy])\b").search(scan, i)
+        if not m:
+            return text
+        got = _rect_receiver(text, scan, m.start() + 1)
+        if got is None:
+            i = m.end()
+            continue
+        start, recv = got
+        if re.match(r"\w+", recv).group(0) not in _VECTOR2_VALUE_CALLS:
+            i = m.end()
+            continue
+        text = (text[:start] + "Vector2_%s(%s)" % (m.group(1), recv)
+                + text[m.end():])
+        i = start
+
+
 def _rewrite_recttransform_apis(text, cl, plan):
     """Lower rectTransform.anchoredPosition / sizeDelta / localScale."""
     if not plan.get("live_rt") or not plan.get("go_names"):
@@ -18962,7 +19080,8 @@ def _plan_needs_vector2(plan, used_apis=None):
     if used_apis and (
             "Vector2" in used_apis
             or "rectTransform.anchoredPosition" in used_apis
-            or "rectTransform.sizeDelta" in used_apis):
+            or "rectTransform.sizeDelta" in used_apis
+            or "Rect.PointToNormalized" in used_apis):
         return True
     if plan and plan.get("live_rt"):
         return True
@@ -19000,6 +19119,65 @@ def _emit_vector2_struct(p):
     p("}")
     p("static float Vector2_x(Vector2 v) { return v.x; }")
     p("static float Vector2_y(Vector2 v) { return v.y; }")
+    p("")
+
+
+def _emit_rect_struct(p, want_point_to_normalized=True):
+    """UnityEngine.Rect: the struct, and the properties C# reads off one.
+
+    `x`/`y`/`width`/`height` are fields in both languages and need nothing.
+    `center`, `size`, `min` and `max` are C# properties, so each is a small
+    function here; `center` also assigns, which moves the rect.
+    """
+    p("/* UnityEngine.Rect — x/y is the min corner (Unity's own layout). */")
+    p("typedef struct Rect {")
+    p("    float x;")
+    p("    float y;")
+    p("    float width;")
+    p("    float height;")
+    p("} Rect;")
+    p("static Rect Rect_make(float ax, float ay, float aw, float ah) {")
+    p("    Rect r; r.x = ax; r.y = ay; r.width = aw; r.height = ah;")
+    p("    return r;")
+    p("}")
+    p("static Rect Rect_MinMaxRect(float x0, float y0, float x1, float y1) {")
+    p("    return Rect_make(x0, y0, x1 - x0, y1 - y0);")
+    p("}")
+    p("static float Rect_center_x(Rect r) { return r.x + r.width * 0.5f; }")
+    p("static float Rect_center_y(Rect r) { return r.y + r.height * 0.5f; }")
+    p("static Vector2 Rect_center(Rect r) {")
+    p("    return Vector2_make(Rect_center_x(r), Rect_center_y(r));")
+    p("}")
+    p("static float Rect_size_x(Rect r) { return r.width; }")
+    p("static float Rect_size_y(Rect r) { return r.height; }")
+    p("static Vector2 Rect_size(Rect r) {")
+    p("    return Vector2_make(r.width, r.height);")
+    p("}")
+    p("static Vector2 Rect_min(Rect r) { return Vector2_make(r.x, r.y); }")
+    p("static Vector2 Rect_max(Rect r) {")
+    p("    return Vector2_make(r.x + r.width, r.y + r.height);")
+    p("}")
+    p("/* `rect.center = v` keeps the size and moves the min corner. */")
+    p("static void Rect_set_center(Rect *r, Vector2 v) {")
+    p("    r->x = Vector2_x(v) - r->width * 0.5f;")
+    p("    r->y = Vector2_y(v) - r->height * 0.5f;")
+    p("}")
+    if want_point_to_normalized:
+        p("/* Mathf.InverseLerp — 0 on a degenerate range, clamped [0,1]. */")
+        p("static float Mathf_InverseLerp(float a, float b, float v) {")
+        p("    float t;")
+        p("    if (a == b) return 0.f;")
+        p("    t = (v - a) / (b - a);")
+        p("    if (t < 0.f) t = 0.f;")
+        p("    if (t > 1.f) t = 1.f;")
+        p("    return t;")
+        p("}")
+        p("/* Rect.PointToNormalized(r, p) — the point in the rect's [0,1]. */")
+        p("static Vector2 Rect_PointToNormalized(Rect r, Vector2 p) {")
+        p("    return Vector2_make(")
+        p("        Mathf_InverseLerp(r.x, r.x + r.width, p.x),")
+        p("        Mathf_InverseLerp(r.y, r.y + r.height, p.y));")
+        p("}")
     p("")
 
 
@@ -19240,6 +19418,11 @@ _UNITY_API_MATHF = [_B("Mathf." + m, "Mathf_" + m)
                     for m in ("Abs", "Min", "Max", "Clamp", "Lerp", "Sin",
                               "Cos", "Sign")]
 
+_UNITY_API_RECT = [
+    _B("Rect.PointToNormalized", "Rect_PointToNormalized", namespaces=_UE),
+    _B("Rect.MinMaxRect", "Rect_MinMaxRect", namespaces=_UE),
+]
+
 
 def _packed_class(cl):
     """The plan's collection fields of `cl`, as cs2cpp's `PackedClass`."""
@@ -19451,6 +19634,8 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = _wrap_log_component_tostring(text, add_locals)
     text = _wrap_log_collision2d_tostring(text, collision2d_param)
     text = cs2cpp.lower_bindings(text, _UNITY_API_MATHF)
+    text = cs2cpp.lower_bindings(text, _UNITY_API_RECT)
+    text = _rewrite_rect_members(text)
     text = cs2cpp.code_sub(r"transform\.position\.x", idn + "_get_pos_x(i)", text)
     text = cs2cpp.code_sub(r"transform\.position\.y", idn + "_get_pos_y(i)", text)
     text = cs2cpp.code_sub(r"transform\.position\.z",
@@ -19532,6 +19717,10 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
                     "Vector2_make(%s_get_%s_x(%s), %s_get_%s_y(%s))"
                     % (o, f, m.group(1), o, f, m.group(1))),
                 text)
+    # new Rect(x, y, w, h) → the engine's value-type constructor.
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])new\s+Rect\s*\(",
+        "Rect_make(", text)
     # new Vector2(a, b) / Vector2(a, b) → Vector2_make; static presets.
     text = cs2cpp.code_sub(
         r"(?<![\w.])new\s+Vector2\s*\(",
