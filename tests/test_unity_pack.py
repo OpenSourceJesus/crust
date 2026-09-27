@@ -2664,6 +2664,267 @@ class TestSystems(unittest.TestCase):
         self.assertIn("CosmeticsMenu_equipped[n]", eng)
         self.assertNotIn("CosmeticsMenu.equipped", eng)
 
+    def _emitted_body(self, eng, sym):
+        """The lowered body of one emitted engine function."""
+        m = re.search(
+            r"(?ms)^static (?:void|int) %s\([^)]*\)\s*\{\n(.*?)^\}"
+            % re.escape(sym), eng)
+        self.assertIsNotNone(m, "%s not emitted" % sym)
+        return m.group(1)
+
+    def _write_iupdatable_project(self):
+        """A `_Scrollbar`-shaped project: static IUpdatable[], nested `new`."""
+        root = tempfile.mkdtemp(prefix="upack-iupd-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "IUpdatable.cs"), "w") as f:
+            f.write(
+                "public interface IUpdatable\n"
+                "{\n"
+                "    void DoUpdate ();\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "IUpdatable.cs.meta"), "w") as f:
+            f.write("guid: iupdiupdiupdiupdiupdiupdiupd0001\n")
+        with open(os.path.join(scripts, "GM.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class GM : MonoBehaviour {\n"
+                "    public static IUpdatable[] updatables ="
+                " new IUpdatable[0];\n"
+                "    void Update() {\n"
+                "        for (int i = 0; i < updatables.Length; i ++) {\n"
+                "            IUpdatable updatable = updatables[i];\n"
+                "            updatable.DoUpdate ();\n"
+                "        }\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "GM.cs.meta"), "w") as f:
+            f.write("guid: gmgmgmgmgmgmgmgmgmgmgmgmgmgm0001\n")
+        with open(os.path.join(scripts, "Host.cs"), "w") as f:
+            f.write(
+                "using System;\n"
+                "using Extensions;\n"
+                "using UnityEngine;\n"
+                "public class Host : MonoBehaviour, IUpdatable {\n"
+                "    public float value;\n"
+                "    U u;\n"
+                "    void Awake() {\n"
+                "        u = new U(this);\n"
+                "        GM.updatables = GM.updatables.Add(this);\n"
+                "        GM.updatables = GM.updatables.Add(u);\n"
+                "    }\n"
+                "    public void StartDrag() {\n"
+                "        GM.updatables = GM.updatables.Add(u);\n"
+                "    }\n"
+                "    public void EndDrag() {\n"
+                "        GM.updatables = GM.updatables.Remove(u);\n"
+                "    }\n"
+                "    public void OnDisable() {\n"
+                "        GM.updatables = GM.updatables.Remove(this);\n"
+                "    }\n"
+                "    public void DoUpdate() {\n"
+                "        value = value + 1f;\n"
+                "        Console.WriteLine(\"host_tick\");\n"
+                "    }\n"
+                "    class U : IUpdatable {\n"
+                "        Host host;\n"
+                "        public U (Host host) {\n"
+                "            this.host = host;\n"
+                "        }\n"
+                "        public void DoUpdate () {\n"
+                "            host.value = host.value + 2f;\n"
+                "            Console.WriteLine(\"u_tick\");\n"
+                "        }\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Host.cs.meta"), "w") as f:
+            f.write("guid: hosthosthosthosthosthosthost0001\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Host\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: hosthosthosthosthosthosthost0001}\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: GM\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "--- !u!4 &11\nTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &12\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: gmgmgmgmgmgmgmgmgmgmgmgmgmgm0001}\n"
+            )
+        return root
+
+    def test_static_iupdatable_array_nested_new_and_tick(self):
+        """static IUpdatable[] + nested `new` + the DoUpdate tick (_Scrollbar)."""
+        root = self._write_iupdatable_project()
+        d = tempfile.mkdtemp(prefix="upack-iupd-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.cpp")) as f:
+            eng = f.read()
+        # IUpdatable[] is a tagged ref vector: class id plus instance.
+        self.assertIn("struct _engine_iref {", eng)
+        self.assertIn("static std::vector<_engine_iref> GM_updatables;", eng)
+        self.assertNotIn("GM.updatables", eng)
+        # `new U(this)` allocates a pool slot and runs the constructor.
+        awake = self._emitted_body(eng, "Host_Awake")
+        self.assertIn("Object_New_U(i)", awake)
+        self.assertNotIn("unlowered C#", awake)
+        self.assertIn("U_U((unsigned)ex, host_);", eng)
+        # `this.host = host` — the parameter is renamed, not self-assigned.
+        ctor = self._emitted_body(eng, "U_U")
+        self.assertIn("U_set_host(i, host_)", ctor)
+        self.assertNotIn("unlowered C#", ctor)
+        # Extensions Add / Remove on the static array.
+        start = self._emitted_body(eng, "Host_StartDrag")
+        self.assertIn("_engine_iref_push(GM_updatables, ", start)
+        self.assertNotIn("unlowered C#", start)
+        end = self._emitted_body(eng, "Host_EndDrag")
+        self.assertIn("_engine_iref_erase(GM_updatables, ", end)
+        self.assertNotIn("unlowered C#", end)
+        dis = self._emitted_body(eng, "Host_OnDisable")
+        self.assertIn("_engine_iref_erase(GM_updatables, ", dis)
+        self.assertNotIn("unlowered C#", dis)
+        self.assertIn("push_back", eng)
+        # The authored Update loop over IUpdatable[] runs as a tick.
+        tick = self._emitted_body(eng, "_engine_iupdatable_tick")
+        self.assertIn("GM_updatables.size()", tick)
+        self.assertIn("Host_DoUpdate(_inst);", tick)
+        self.assertIn("U_DoUpdate(_inst);", tick)
+        self.assertIn("    _engine_iupdatable_tick();", eng)
+        self.assertNotIn("unlowered C#", self._emitted_body(eng, "U_DoUpdate"))
+
+    @needs_cc
+    def test_iupdatable_tick_runs_both_implementors(self):
+        """A tick calls DoUpdate on the MB and on the nested class it made."""
+        root = self._write_iupdatable_project()
+        d = tempfile.mkdtemp(prefix="upack-iupd-run-")
+        unity_pack.pack(root, d)
+        host = os.path.join(d, "host.c")
+        with open(host, "w") as f:
+            f.write(
+                "void engine_tick(void);\n"
+                "extern float Time_deltaTime;\n"
+                "int main(void) {\n"
+                "  Time_deltaTime = 0.1f;\n"
+                # Awake registers Host and its U; the tick runs both.
+                "  engine_tick();\n"
+                "  engine_tick();\n"
+                "  return 0;\n"
+                "}\n"
+            )
+        for src, opt in (("engine.c", "-O2"), ("data.c", "-O0")):
+            r = subprocess.run(
+                [_CC, opt, "-c", "-o",
+                 os.path.join(d, src.replace(".c", ".o")),
+                 os.path.join(d, src)],
+                capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+        exe = os.path.join(d, "game")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host,
+             os.path.join(d, "engine.o"), os.path.join(d, "data.o"), "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run = subprocess.run([exe], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        # Awake pushes the Host and the U it made; the tick runs both, in
+        # the order the array holds them, every frame.
+        self.assertEqual(
+            run.stdout.split(),
+            ["host_tick", "u_tick", "host_tick", "u_tick"])
+
+    def test_static_ref_array_of_packed_class_add_remove(self):
+        """static Sel[] instances = instances.Add(this) → std::vector<int>."""
+        root = tempfile.mkdtemp(prefix="upack-refarr-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Sel.cs"), "w") as f:
+            f.write(
+                "using Extensions;\n"
+                "using UnityEngine;\n"
+                "public class Sel : MonoBehaviour {\n"
+                "    public static Sel[] instances = new Sel[0];\n"
+                "    public void Register() {\n"
+                "        instances = instances.Add(this);\n"
+                "    }\n"
+                "    public void OnDisable() {\n"
+                "        instances = instances.Remove(this);\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Sel.cs.meta"), "w") as f:
+            f.write("guid: selselselselselselselselsel0001\n")
+        with open(os.path.join(scripts, "Menu.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Menu : MonoBehaviour {\n"
+                "    public int count;\n"
+                "    void Update() {\n"
+                "        count = Sel.instances.Length;\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Menu.cs.meta"), "w") as f:
+            f.write("guid: menumenumenumenumenumenumenu0001\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Sel\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: selselselselselselselselsel0001}\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Menu\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "--- !u!4 &11\nTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &12\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: menumenumenumenumenumenumenu0001}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-refarr-out-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.cpp")) as f:
+            eng = f.read()
+        # A T[] of a packed class holds indices — no class tag needed.
+        self.assertIn("static std::vector<int> Sel_instances;", eng)
+        reg = self._emitted_body(eng, "Sel_Register")
+        self.assertIn("Sel_instances.push_back(i);", reg)
+        self.assertNotIn("unlowered C#", reg)
+        dis = self._emitted_body(eng, "Sel_OnDisable")
+        self.assertIn("_engine_ref_erase(Sel_instances, i);", dis)
+        self.assertNotIn("unlowered C#", dis)
+        upd = self._emitted_body(eng, "Menu_Update")
+        self.assertIn("Sel_instances.size()", upd)
+        self.assertNotIn("unlowered C#", upd)
+        self.assertNotIn("Sel.instances", eng)
+
     def test_static_method_and_singleton_instance(self):
         """Other.StaticMethod(Other.Instance.field) → Class_Method(get(Instance()))."""
         root = tempfile.mkdtemp(prefix="upack-static-")

@@ -418,6 +418,45 @@ name `"(Clone)"`, and wire live `_engine_go_T` / parent tables. Prefab /
 position / rotation overloads stay unlowered (public helpers that still
 contain them are stubbed).
 
+## Static reference arrays (`T[]`, interfaces) and `new`
+
+A `static T[]` of a packed class or an authored interface is the collection
+the project keeps growing, so it packs as one vector rather than the copies
+`Extensions.CollectionExtensions` makes.
+
+| Script uses | Emitted |
+|-------------|---------|
+| `static T[] xs` (T a packed class) | `std::vector<int> Owner_xs` — instance indices |
+| `static I[] xs` (I an authored interface) | `std::vector<_engine_iref> Owner_xs` — `{cls, inst}`, since implementors are separate arrays |
+| `xs = xs.Add(this)` / `xs = xs.Add(field)` | `Owner_xs.push_back(idx)`, or `_engine_iref_push(Owner_xs, class_id, idx)` |
+| `xs = xs.Remove(x)` | `_engine_ref_erase` / `_engine_iref_erase` — first match, as `List.Remove` |
+| `Other.xs` / `Other.xs.Length` | `Other_xs` / `Other_xs.size()` |
+| `new T(args)` (T packed, scene places none) | `Object_New_T(args)` — next pool slot, then `T_T(i, args)` |
+| `T (args) { this.f = f; }` | `T_T(unsigned i, int f_)` — a parameter shadowing a field is renamed, not self-assigned |
+
+`new T(args)` budget is one spare instance slot per authored instance of each
+class that constructs `T`; a full pool returns `-1` (null), as `Instantiate`
+does. A plain C# object gets no GameObject.
+
+An interface whose method an authored `Update` calls over such an array
+(`IUpdatable.DoUpdate`) gets `_engine_<iface>_tick`, run from `engine_tick`:
+it walks the vector and dispatches on the class tag. The authored loop itself
+stays unlowered — C has no virtual call to make on an interface reference.
+Only an interface some `Update` really ticks this way gets one.
+
+The interface's own file is analyzed even though no scene names it (an
+interface is not a component); nothing else in that file packs.
+
+`base.Awake()` / `base.OnEnable()` / `base.OnDisable()` are dropped: a base
+class is its own packed array with its own instances. `OnEnable` bodies are
+not emitted at all (no enable-time call site exists), so nothing registers
+into these arrays at enable time — only `StartDrag`-style calls and
+`OnDisable` do.
+
+A C# **property** only lowers as `set_Name` (what UnityEvent wiring targets);
+a body that still names one has a read the pack cannot answer, and reports
+as a stub rather than emitting the bare name.
+
 ## GetComponentsInChildren
 
 | Script uses | Emitted |

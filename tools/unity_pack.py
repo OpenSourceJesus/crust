@@ -8990,6 +8990,112 @@ def _rewrite_extensions_set_world_scale(text, cl, plan):
     return "".join(out)
 
 
+def _class_id(plan, cname):
+    """The packed class's id — the tag `_engine_iref` and the ticks use."""
+    return {n: i for i, n in enumerate(sorted(plan.get("classes") or ()))}.get(
+        cname, -1)
+
+
+def _named_ref_class(name, cl, plan, text):
+    """The packed class a body's name holds an instance of, or None.
+
+    A handle field of `cl` (`DragUpdater dragUpdater`), then a local
+    declared with a packed type (`Cosmetic c = ..`).
+    """
+    for fname, _ty, _bits, kind in cl.get("members") or []:
+        if fname == name and str(kind).startswith("idx:"):
+            other = kind.split(":", 1)[1]
+            if other in (plan.get("classes") or {}):
+                return other
+    for f in cl.get("fields") or []:
+        if f.get("name") == name and f.get("ty") in (plan.get("classes") or {}):
+            return f["ty"]
+    m = re.search(r"(?<![\w.])([A-Z][\w.]*)\s+%s\s*=" % re.escape(name),
+                  cs2cpp._blank(text))
+    if m:
+        ty = m.group(1).split(".")[-1]
+        if ty in (plan.get("classes") or {}):
+            return ty
+    return None
+
+
+def _rewrite_static_ref_arrays(text, cl, plan):
+    """Static `T[]` fields as their packed vector — Extensions, reads, length.
+
+    The authored ``GameManager.updatables = GameManager.updatables.Add(this)``
+    copies the array to add one element (`Extensions.CollectionExtensions`);
+    the pack keeps the one vector the copy was building and appends to it.
+    ``Remove`` erases the first match, as `List.Remove` does.
+
+    A `T[]` of a packed class holds instance indices, so its element is the
+    index the body already names. An interface's holds `_engine_iref`: the
+    implementors are separate packed arrays, and an element has to say
+    which class before it says which instance.
+    """
+    arrays = _any_static_ref_arrays(plan)
+    if not arrays:
+        return text
+    this_name = cl.get("name")
+    bases = plan.get("mb_bases") or {}
+    # Every qualified `Other.field` before any bare name, so this class's
+    # own `instances` does not match the tail of another's.
+    targets = []
+    for cname, fname, elem, iface in arrays:
+        mangled = "%s_%s" % (_c_ident(cname), fname)
+        targets.append((
+            r"(?<![\w.])%s\s*\.\s*%s\b" % (re.escape(cname), re.escape(fname)),
+            mangled, elem, iface))
+    for cname, fname, elem, iface in arrays:
+        if cname == this_name:
+            targets.append((r"(?<![\w.])%s\b" % re.escape(fname),
+                            "%s_%s" % (_c_ident(cname), fname), elem, iface))
+
+    def element(arg):
+        """(class, index expression) for the ref an argument names."""
+        arg = arg.strip()
+        if arg == "i":
+            return this_name, "i"
+        other = _named_ref_class(arg, cl, plan, text)
+        return (other, arg) if other else (None, None)
+
+    for pat, mangled, elem, iface in targets:
+        for method in ("Add", "Remove"):
+            while True:
+                m = re.search(
+                    pat + r"\s*=\s*" + pat + r"\s*\.\s*%s\s*\(" % method,
+                    cs2cpp._blank(text))
+                if not m:
+                    break
+                parsed = _match_call_args(text, m.end() - 1)
+                if not parsed:
+                    break
+                args_str, after = parsed
+                end = after
+                while end < len(text) and text[end] in " \t":
+                    end += 1
+                if end < len(text) and text[end] == ";":
+                    end += 1
+                ocname, expr = element(args_str)
+                if ocname is None or (
+                        iface and not _mb_is_a(ocname, elem, bases)) or (
+                        not iface and ocname != elem):
+                    break
+                if iface:
+                    call = "_engine_iref_%s(%s, %d, %s);" % (
+                        "push" if method == "Add" else "erase",
+                        mangled, _class_id(plan, ocname), expr)
+                elif method == "Add":
+                    call = "%s.push_back(%s);" % (mangled, expr)
+                else:
+                    call = "_engine_ref_erase(%s, %s);" % (mangled, expr)
+                text = text[:m.start()] + call + text[end:]
+    for pat, mangled, _elem, _iface in targets:
+        text = cs2cpp.code_sub(pat + r"\s*\.\s*Length\b",
+                               "%s.size()" % mangled, text)
+        text = cs2cpp.code_sub(pat, mangled, text)
+    return text
+
+
 def _rewrite_rigidbody_assigns(text, plan, this_class):
     """Lower Rigidbody(2D).linearVelocity / .velocity assigns.
 
@@ -9698,6 +9804,15 @@ def analyze_script(path, text=None, shallow=False):
         scan))
 
     types = cs2cpp._find_types(scan)
+    interfaces = []
+    for kind, name, _start, brace, close in types:
+        if kind != "interface":
+            continue
+        interfaces.append({
+            "name": name,
+            "methods": _interface_methods(scan[brace + 1:close]),
+            "path": path,
+        })
     classes = []
     for kind, name, start, brace, close in types:
         if kind not in ("class", "struct"):
@@ -9780,6 +9895,7 @@ def analyze_script(path, text=None, shallow=False):
         "findobject_types": findobject_types,
         "singleton_instance_types": singleton_instance_types,
         "classes": classes,
+        "interfaces": interfaces,
         "literals": [int(x) for x in re.findall(r"(?<![\w.])(\d+)", scan)
                      if int(x) < 1 << 20],
     }
@@ -10054,6 +10170,19 @@ def _methods_in(body, bscan, body_abs=0):
     return out
 
 
+def _interface_methods(bscan):
+    """`void DoUpdate ();` in an interface body — signatures, no bodies."""
+    out = []
+    for m in re.finditer(
+            r"(?m)^[ \t]*([\w.<>]+(?:\s*\[\s*\])?)[ \t]+(\w+)[ \t]*"
+            r"\(([^)]*)\)[ \t]*;", bscan):
+        ret, name = m.group(1).strip(), m.group(2)
+        if ret in ("return", "new", "throw"):
+            continue
+        out.append({"ret": ret, "name": name, "args": m.group(3).strip()})
+    return out
+
+
 #: C# access modifiers, which `_methods_in` reads as a return type when the
 #: declaration is a constructor's (`public Foo (..)`).
 _MODIFIERS = frozenset(("public", "private", "protected", "internal",
@@ -10236,6 +10365,113 @@ def _array_elem_name(ty):
         return None
     m = re.match(r"^([\w.]+)\s*\[\s*\]\s*$", str(ty).strip())
     return m.group(1).split(".")[-1] if m else None
+
+
+def _collect_interfaces(analyses):
+    """Authored interface name → what it declares (`IUpdatable.DoUpdate`)."""
+    out = {}
+    for a in analyses or []:
+        for i in a.get("interfaces") or []:
+            out[i["name"]] = i
+    return out
+
+
+#: The tagged reference an interface-typed collection holds. A `T[]` of a
+#: packed class is a vector of indices into that one array; an `IUpdatable[]`
+#: names instances of *different* classes, so each element carries which.
+_IREF_TYPE = "_engine_iref"
+
+
+def _static_ref_array(f, plan):
+    """A static ``T[]`` the pack holds as a vector: (elem, interface?) or None.
+
+    `T` a packed class is a vector of its instance indices; `T` an authored
+    interface is a vector of `_engine_iref`, since its implementors live in
+    different instance arrays and an index alone would not say which.
+    """
+    if not (f.get("static") or f.get("const")):
+        return None
+    elem = _array_elem_name(f.get("ty") or "")
+    if not elem:
+        return None
+    if elem in (plan.get("interfaces") or {}):
+        return elem, True
+    if elem in (plan.get("classes") or {}):
+        return elem, False
+    return None
+
+
+def _static_ref_arrays(cl, plan):
+    """`cl`'s static ref arrays, as (field, element, interface?)."""
+    out = []
+    for f in cl.get("class_consts") or []:
+        got = _static_ref_array(f, plan)
+        if got:
+            out.append((f["name"], got[0], got[1]))
+    return out
+
+
+def _any_static_ref_arrays(plan):
+    """Every static ref array in the plan, as (class, field, elem, iface?)."""
+    out = []
+    for cname, cl in sorted((plan.get("classes") or {}).items()):
+        for fname, elem, iface in _static_ref_arrays(cl, plan):
+            out.append((cname, fname, elem, iface))
+    return out
+
+
+def _iface_implementors(iface, plan):
+    """Packed classes whose bases name *iface* (`class _Scrollbar : IUpdatable`)."""
+    bases = plan.get("mb_bases") or {}
+    return [c for c in sorted(plan.get("classes") or ())
+            if _mb_is_a(c, iface, bases)]
+
+
+def _iface_tick_arrays(plan, analyses):
+    """Interface static arrays an authored Update walks — iface → (method, fields).
+
+    ``GameManager.Update`` iterates ``updatables`` calling ``DoUpdate`` on
+    each element. That loop does not lower: an element is an interface
+    reference, not an index, and C has no virtual call to make on it. The
+    pack runs the dispatch itself instead, from ``engine_tick``.
+
+    Only an interface some authored Update-family method actually ticks
+    this way gets one; an array that is merely declared is left alone, so
+    nothing calls a method the project never called each frame.
+    """
+    out = {}
+    arrays = [(c, f, e) for c, f, e, iface in _any_static_ref_arrays(plan)
+              if iface]
+    ifaces = plan.get("interfaces") or {}
+    for iface in sorted({e for _c, _f, e in arrays}):
+        fields = [(c, f) for c, f, e in arrays if e == iface]
+        for decl in (ifaces.get(iface) or {}).get("methods") or []:
+            if (decl.get("ret") or "void") != "void":
+                continue
+            if (decl.get("args") or "").strip():
+                continue
+            if _authored_iface_tick(decl["name"], fields, analyses):
+                out[iface] = (decl["name"], fields)
+                break
+    return out
+
+
+def _authored_iface_tick(mname, fields, analyses):
+    """True if an authored Update-family body loops a field calling *mname*."""
+    names = {f for _c, f in fields}
+    for a in analyses or []:
+        for c in a.get("classes") or []:
+            for m in c.get("methods") or []:
+                if m.get("name") not in ("Update", "FixedUpdate", "LateUpdate"):
+                    continue
+                body = cs2cpp._blank(m.get("body") or "")
+                # `updatable.DoUpdate ()` — the call is on a receiver.
+                if not re.search(r"(?<![\w])%s\s*\(" % re.escape(mname), body):
+                    continue
+                if any(re.search(r"(?<![\w.])%s\b" % re.escape(n), body)
+                       for n in names):
+                    return True
+    return False
 
 
 def _rewrite_mb_static_and_singleton(text, plan, cl):
@@ -11283,8 +11519,10 @@ def emit_engine(plan, analyses, used_apis):
             for f in cl["ref_array_fields"]:
                 if _array_elem_name(f.get("ty") or "") == "Toggle":
                     want_toggle_is_on = True
-    if want_ref_array:
-        want_list = True  # std::vector for Toggle[] / MB[] tables
+    static_ref_arrays = _any_static_ref_arrays(plan)
+    want_iref = any(iface for _c, _f, _e, iface in static_ref_arrays)
+    if want_ref_array or static_ref_arrays:
+        want_list = True  # std::vector for Toggle[] / MB[] / static T[] tables
     if want_gcic:
         want_list = True  # std::vector for GetComponentsInChildren results
     if not want_map_string and want_dict:
@@ -11339,6 +11577,10 @@ def emit_engine(plan, analyses, used_apis):
         _emit_vector2_struct(p)
     if _plan_needs_vector2int(plan, used_apis):
         _emit_vector2int_struct(p)
+    if want_iref:
+        _emit_iref_struct(p)
+    if static_ref_arrays:
+        _emit_ref_vector_helpers(p, want_iref)
     if want_map_string:
         p("/* SortedList/Dictionary string keys — literals need an address. */")
         p("static int *_engine_map_at_si(std::map<std::string, int> &m,")
@@ -15318,6 +15560,13 @@ def emit_engine(plan, analyses, used_apis):
                 p("static std::vector<%s> %s_%s;" % (
                     _list_elem_c_ty(elem, plan), idn, f["name"]))
                 _emitted_coll = True
+            elif _static_ref_array(f, plan):
+                # Static T[] of a packed class / authored interface: the
+                # array the Extensions Add/Remove kept copying.
+                _elem, _iface = _static_ref_array(f, plan)
+                p("static std::vector<%s> %s_%s;" % (
+                    _IREF_TYPE if _iface else "int", idn, f["name"]))
+                _emitted_coll = True
             elif _dict_kv_names(f.get("ty") or ""):
                 k, v = _dict_kv_names(f["ty"])
                 p("static std::map<%s, %s> %s_%s;" % (
@@ -15401,6 +15650,9 @@ def emit_engine(plan, analyses, used_apis):
     if _handle_targets:
         p("")
 
+
+    # Nullary instance methods, by (class, name), for the interface ticks.
+    emitted_syms = {}
     class_properties = {}
     for a in analyses:
         for c in a.get("classes") or []:
@@ -15571,6 +15823,8 @@ def emit_engine(plan, analyses, used_apis):
                     n += 1
                 sym = "%s_%d" % (sym, n)
             used_syms.add(sym)
+            if not m.get("static") and not (m.get("args") or "").strip():
+                emitted_syms.setdefault((cname, m["name"]), sym)
             if coll_param:
                 p("static void %s(unsigned i, int %s) {"
                   % (sym, coll_param))
@@ -16802,6 +17056,36 @@ def emit_engine(plan, analyses, used_apis):
         p("}")
         p("")
 
+    iface_ticks = _iface_tick_arrays(plan, analyses)
+    iface_tick_fns = []
+    for iface in sorted(iface_ticks):
+        mname, fields = iface_ticks[iface]
+        cases = []
+        for ocname in _iface_implementors(iface, plan):
+            sym = emitted_syms.get((ocname, mname))
+            if sym:
+                cases.append((_class_id(plan, ocname), sym))
+        if not cases:
+            continue
+        fn = "_engine_%s_tick" % _c_ident(iface).lower()
+        iface_tick_fns.append(fn)
+        p("/* %s.%s — the authored Update loop over %s[]. */"
+          % (iface, mname, iface))
+        p("static void %s(void) {" % fn)
+        p("    int k;")
+        for ocname, fname in fields:
+            vec = "%s_%s" % (_c_ident(ocname), fname)
+            p("    for (k = 0; k < (int)%s.size(); k = k + 1) {" % vec)
+            p("        unsigned _inst = (unsigned)%s[k].inst;" % vec)
+            p("        switch (%s[k].cls) {" % vec)
+            for cid, sym in cases:
+                p("        case %d: %s(_inst); break;" % (cid, sym))
+            p("        default: break;")
+            p("        }")
+            p("    }")
+        p("}")
+        p("")
+
     p("void engine_tick(void) {")
     p("    /* Unity fixed clock: accumulate frame dt, step at fixedDeltaTime. */")
     p("    static float _engine_fixed_accum = 0.f;")
@@ -16830,6 +17114,8 @@ def emit_engine(plan, analyses, used_apis):
     p("    }")
     for cname in sorted(plan["classes"]):
         p("    %s_Tick();" % _c_ident(cname))
+    for fn in iface_tick_fns:
+        p("    %s();" % fn)
     if plan.get("camera_follows_parent"):
         p("    _engine_sync_camera_main();")
     p("}")
@@ -18717,6 +19003,53 @@ def _emit_vector2_struct(p):
     p("")
 
 
+def _emit_iref_struct(p):
+    """The tagged reference an interface-typed collection holds."""
+    # A C++-subset `struct` (not a C `typedef struct`): cpprust forward
+    # declares one of these, so the vector instantiated over it may come
+    # first in the lowered C.
+    p("/* An interface reference: which packed class, which instance. */")
+    p("struct %s {" % _IREF_TYPE)
+    p("    int cls;")
+    p("    int inst;")
+    p("};")
+    p("")
+
+
+def _emit_ref_vector_helpers(p, want_iref):
+    """`arr = arr.Add(x)` / `.Remove(x)` on a static ref array (Extensions).
+
+    The authored extensions copy the array; the pack keeps one vector and
+    appends to / erases from it, which is what the copy was for.
+    """
+    p("/* Extensions.Add / Extensions.Remove on a packed static T[]. */")
+    p("static void _engine_ref_erase(std::vector<int> &v, int x) {")
+    p("    int k;")
+    p("    for (k = 0; k < (int)v.size(); k = k + 1) {")
+    p("        if (v[k] == x) { v.erase(v.begin() + k); return; }")
+    p("    }")
+    p("}")
+    if want_iref:
+        p("static void _engine_iref_push(std::vector<%s> &v," % _IREF_TYPE)
+        p("                             int cls, int inst) {")
+        p("    %s r;" % _IREF_TYPE)
+        p("    r.cls = cls;")
+        p("    r.inst = inst;")
+        p("    v.push_back(r);")
+        p("}")
+        p("static void _engine_iref_erase(std::vector<%s> &v," % _IREF_TYPE)
+        p("                              int cls, int inst) {")
+        p("    int k;")
+        p("    for (k = 0; k < (int)v.size(); k = k + 1) {")
+        p("        if (v[k].cls == cls && v[k].inst == inst) {")
+        p("            v.erase(v.begin() + k);")
+        p("            return;")
+        p("        }")
+        p("    }")
+        p("}")
+    p("")
+
+
 def _emit_vector2int_struct(p):
     """Vector2Int with compare — required for std::map keys."""
     p("/* UnityEngine.Vector2Int — map keys need compare. */")
@@ -18974,10 +19307,12 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = re.sub(r"\bthis\.", "", text)
     # Bare `this` is the packed instance index (Add(this), == this, …).
     text = re.sub(r"(?<![\w.])this(?![\w])", "i", text)
-    # base.Awake() / base.OnEnable() — no C equivalent; drop.
+    # base.Awake() / base.OnEnable() / base.OnDisable() — a base class is
+    # its own packed array with its own instances, so there is no C call
+    # to make here; drop, as the message itself already is for OnEnable.
     text = cs2cpp.code_sub(
-        r"(?<![\w.])base\s*\.\s*(?:Awake|OnEnable)\s*\(\s*\)\s*;?",
-        "/* base.Awake */", text)
+        r"(?<![\w.])base\s*\.\s*(Awake|OnEnable|OnDisable)\s*\(\s*\)\s*;?",
+        lambda m: "/* base.%s */" % m.group(1), text)
     # gameObject.SetActive(x) → GameObject_SetActive(this GO, x).
     if plan.get("go_names"):
         text = cs2cpp.code_sub(
@@ -19010,6 +19345,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         text, _packed_class(cl),
         [_packed_class(o) for o in (plan.get("classes") or {}).values()],
         _packed_model(plan))
+    text = _rewrite_static_ref_arrays(text, cl, plan)
     text = _rewrite_mb_static_and_singleton(text, plan, cl)
     text = _rewrite_toggle_is_on(text)
     text = _rewrite_byte_array_lits(text, plan)
@@ -20164,6 +20500,59 @@ def emit_shader_compiler(platform):
 # Drive
 # ---------------------------------------------------------------------------
 
+#: Bases that are never an authored interface — no file worth looking for.
+_NOT_AN_INTERFACE_BASE = frozenset((
+    "MonoBehaviour", "ScriptableObject", "Object", "object", "System"))
+
+
+def _interface_names_in_cs(path):
+    """Interface names a .cs file declares."""
+    try:
+        text = _read(path)
+    except OSError:
+        return []
+    if "interface" not in text:
+        return []
+    return re.findall(r"(?<![\w.])interface\s+(\w+)", cs2cpp._blank(text))
+
+
+def _analyze_base_interfaces(root, guids, analyses):
+    """Analyses holding only the interfaces the scene's classes implement.
+
+    An interface is not a component, so no scene names its file; the one
+    reference is `class _Scrollbar : IUpdatable` in a script that is in a
+    scene. What the interface declares decides how an `IUpdatable[]`
+    packs, so its file has to be read. Nothing else in that file counts
+    -- no scene places it, and giving it a packed class here would invent
+    an object the project never has.
+    """
+    wanted = set()
+    for a in analyses:
+        for c in a.get("classes") or []:
+            wanted |= set(c.get("bases") or [])
+    wanted -= {c["name"] for a in analyses for c in a.get("classes") or []}
+    wanted -= _NOT_AN_INTERFACE_BASE
+    if not wanted:
+        return []
+    done = {os.path.abspath(a.get("path") or "") for a in analyses}
+    paths = set()
+    for _g, path in (guids or {}).items():
+        if not path or not _is_player_csharp(root, path):
+            continue
+        path = os.path.abspath(path)
+        if path in done:
+            continue
+        if any(n in wanted for n in _interface_names_in_cs(path)):
+            paths.add(path)
+    out = []
+    for path in sorted(paths):
+        a = analyze_script(path)
+        out.append(dict(a, apis=set(), classes=[], spawns=False,
+                        uses_z=False, writes_pos=False, writes_rot=False,
+                        literals=[]))
+    return out
+
+
 def _mb_typename_to_script(root, guids):
     """MonoBehaviour class name → authored .cs path under Assets/."""
     out = {}
@@ -20381,6 +20770,8 @@ def _analyze_scripts_and_prefabs(root, objects, assets):
             a["getcomponentsinchildren_types"] = set()
             a["addcomponent_types"] = set()
             analyses.append(a)
+
+    analyses.extend(_analyze_base_interfaces(root, guids, analyses))
 
     # Scene stripped MB fileIDs (Button onClick targets) → pack instance mb_ids.
     _alias_onclick_mb_file_ids(objects)
@@ -21247,6 +21638,7 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
     _validate_getcomponent_types(gcic_types, plan, analyses)
     plan["getcomponentsinchildren_types"] = sorted(gcic_types)
     plan["mb_bases"] = _collect_mb_bases(analyses)
+    plan["interfaces"] = _collect_interfaces(analyses)
     plan["addcomponent_types"] = sorted(add_types)
     plan["addcomponent_budget"] = _addcomponent_budget(analyses, plan)
     plan["instantiate_budget"] = _instantiate_budget(analyses, plan)
