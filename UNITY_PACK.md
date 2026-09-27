@@ -311,8 +311,25 @@ so the three cannot disagree. It keeps generic arguments with commas
 values. A default parameter used to vanish from the C signature, and the pack
 failed with `use of undeclared identifier`. `split_call_args` no longer
 splits inside string, verbatim, interpolated or char literals, or inside
-`{ }` and `[ ]`. Calls that omit a default argument are not filled in yet:
-the pack stops with `incorrect number of arguments for function call`.
+`{ }` and `[ ]`.
+
+Calls that omit trailing default arguments get them filled in, for instance
+and static methods: `Bump()` with `void Bump(int by = 1)` lowers to
+`Tally_Bump(i, 1)`. Integer and real literals, `true` / `false` and regular
+string literals are filled. `null`, enum members, constants, expressions and
+named arguments (`Bump(by: 2)`) need type-aware lowering and are not filled
+yet: the call stays short and the pack stops with `incorrect number of
+arguments for function call`. Calls that pass every argument are unchanged.
+
+The C# preprocessor and lexical checks are general too:
+`cs2cpp.eval_pp_expr` and `cs2cpp.blank_inactive_pp_regions` take the set of
+defined symbols, and unity_pack passes its player's (`UNITY_STANDALONE`,
+`UNITY_STANDALONE_LINUX`; `UNITY_EDITOR` and mobile symbols undefined).
+`cs2cpp.real_literal_error` reports C++-style real literals such as `0.f`
+(CS1061). `_check_csharp_lex` keeps only the Unity checks: the
+`transform.position += new Vector2` ambiguity (CS0034) and the File,
+Application, Quaternion, Transform and refused-API checks. Old and new output
+matched on 7,500 random cases.
 
 csc-style diagnostics are `cs2cpp.cs_diag` and `cs2cpp.cs_diag_at_site`,
 with a `display_path` hook. unity_pack's `_cs_diag` and `_raise_cs_at_site`
@@ -321,8 +338,8 @@ checked identical to the old code on 6,000 random cases.
 
 Helpers that look general but read Unity values stay in unity_pack:
 `_parse_csharp_field_init` (`Application.dataPath`, `new Vector2(...)`),
-`_param_c_ty` (components as packed indices), `_check_csharp_lex` (Unity API
-checks) and `_unlowered_csharp` (Unity value constructors).
+`_param_c_ty` (components as packed indices), the Unity API checks in
+`_check_csharp_lex`, and `_unlowered_csharp` (Unity value constructors).
 
 **What has moved.** cs2cpp describes the difference between the two
 object models in one place, `cs2cpp.ObjectModel`; unity_pack builds the
