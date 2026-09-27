@@ -2080,6 +2080,8 @@ _SLIDER_SCRIPT_GUID = "67db9e8f0e2ae9c40bc1e2b64352a6b4"
 _SCROLLBAR_SCRIPT_GUID = "2a4db7a114972834c8e4117be1d82ba3"
 _SCROLLRECT_SCRIPT_GUID = "1aa08ab6e0800fa44ae55d278d1423e3"
 _TOGGLE_SCRIPT_GUID = "9085046f02f69544eb97fd06b6048fe2"
+# UnityEngine.EventSystems.EventTrigger (UnityEngine.UI.dll).
+_EVENTTRIGGER_SCRIPT_GUID = "d0b148fe25e99eb48b9724523833bab1"
 # TextMeshProUGUI (com.unity.ugui / Unity.TextMeshPro).
 _TMP_UGUI_SCRIPT_GUID = "f4688fdb7df04437aeb418b961361dc5"
 # uGUI layout controllers (authored Vertical/HorizontalLayoutGroup).
@@ -2384,6 +2386,84 @@ def _parse_ui_toggle(block, file_id=None):
         "is_on": _i("m_IsOn", 1),
         "graphic_id": graphic,
         "on_value_changed": calls,
+        "mb_file_id": file_id,
+    }
+
+
+def _is_ui_eventtrigger_mb(block, guid):
+    """True for UnityEngine.EventSystems.EventTrigger."""
+    if (guid or "").lower() == _EVENTTRIGGER_SCRIPT_GUID:
+        return True
+    return bool(re.search(
+        r"(?m)^\s+m_EditorClassIdentifier:.*\bEventTrigger\s*$", block))
+
+
+def _parse_ui_eventtrigger(block, file_id=None):
+    """Authored EventTrigger → delegates (eventID + persistent calls).
+
+    EventTriggerType: PointerEnter=0, Exit=1, Down=2, Up=3, Click=4,
+    BeginDrag=13, EndDrag=14 (others ignored until needed).
+    PersistentListenerMode: Void=1, Object=2, Float=4, String=5, Bool=6.
+    """
+    delegates = []
+    dm = re.search(r"(?m)^\s+m_Delegates:\s*$", block)
+    if not dm:
+        return {
+            "enabled": _mb_enabled(block),
+            "delegates": [],
+            "mb_file_id": file_id,
+        }
+    chunk = block[dm.end():]
+    stop = re.search(r"(?m)^---\s", chunk)
+    if stop:
+        chunk = chunk[:stop.start()]
+    parts = re.split(r"(?m)^  - eventID:\s*", chunk)
+    for part in parts[1:]:
+        em = re.match(r"(\d+)", part)
+        if not em:
+            continue
+        event_id = int(em.group(1))
+        calls = []
+        for cm in re.finditer(
+                r"m_Target:\s*\{fileID:\s*(-?\d+)(?:,\s*guid:\s*"
+                r"([0-9a-fA-F]+))?[^}]*\}[\s\S]*?"
+                r"m_TargetAssemblyTypeName:\s*([^\n]+)[\s\S]*?"
+                r"m_MethodName:\s*(\w+)[\s\S]*?"
+                r"m_Mode:\s*(\d+)[\s\S]*?"
+                r"m_ObjectArgument:\s*\{fileID:\s*(-?\d+)(?:,\s*guid:\s*"
+                r"([0-9a-fA-F]+))?[^}]*\}[\s\S]*?"
+                r"m_ObjectArgumentAssemblyTypeName:\s*([^\n]+)[\s\S]*?"
+                r"m_IntArgument:\s*(-?\d+)[\s\S]*?"
+                r"m_FloatArgument:\s*([^\n]+)[\s\S]*?"
+                r"m_StringArgument:\s*(.*)[\s\S]*?"
+                r"m_BoolArgument:\s*(\d+)",
+                part):
+            tid = int(cm.group(1))
+            if tid == 0 and not cm.group(2):
+                continue
+            try:
+                farg = float(cm.group(10).strip())
+            except ValueError:
+                farg = 0.0
+            calls.append({
+                "target_go": str(tid),
+                "target_guid": (cm.group(2) or "").lower(),
+                "target_assembly": (cm.group(3) or "").strip(),
+                "method": cm.group(4),
+                "mode": int(cm.group(5)),
+                "object_arg": str(int(cm.group(6))),
+                "object_arg_guid": (cm.group(7) or "").lower(),
+                "object_arg_type": (cm.group(8) or "").strip(),
+                "int_arg": int(cm.group(9)),
+                "float_arg": farg,
+                "string_arg": (cm.group(11) or "").strip(),
+                "bool_arg": int(cm.group(12)),
+            })
+        if calls:
+            delegates.append({"event_id": event_id, "calls": calls})
+    return {
+        "enabled": _mb_enabled(block),
+        "delegates": delegates,
         "mb_file_id": file_id,
     }
 
@@ -4779,6 +4859,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 rec["ui_scrollrect"] = _parse_ui_scrollrect(block, file_id)
             elif _is_ui_toggle_mb(block, g):
                 rec["ui_toggle"] = _parse_ui_toggle(block, file_id)
+            elif _is_ui_eventtrigger_mb(block, g):
+                rec["ui_eventtrigger"] = _parse_ui_eventtrigger(block, file_id)
             elif _is_ui_tmp_mb(block, g):
                 rec["ui_tmp"] = _parse_ui_tmp(block, asset_guids)
             elif _is_vlayout_mb(block, g):
@@ -5051,6 +5133,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         ui_scrollbar = None
         ui_scrollrect = None
         ui_toggle = None
+        ui_eventtrigger = None
         ui_tmp = None
         layout_group = None
         layout_element = None
@@ -5105,6 +5188,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                     ui_scrollrect = dict(k["ui_scrollrect"])
                 if k.get("ui_toggle"):
                     ui_toggle = dict(k["ui_toggle"])
+                if k.get("ui_eventtrigger"):
+                    ui_eventtrigger = dict(k["ui_eventtrigger"])
                 if k.get("ui_tmp"):
                     ui_tmp = dict(k["ui_tmp"])
                 if k.get("layout_group"):
@@ -5461,6 +5546,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "ui_scrollbar": ui_scrollbar,
             "ui_scrollrect": ui_scrollrect,
             "ui_toggle": ui_toggle,
+            "ui_eventtrigger": ui_eventtrigger,
             "ui_tmp": ui_tmp,
             "layout_group": layout_group,
             "layout_element": layout_element,
@@ -5563,6 +5649,7 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
     _annotate_ui_scrollbar_onvaluechanged_targets(
         objects, by_id, guid_to_script)
     _annotate_ui_toggle_onvaluechanged_targets(objects, by_id, guid_to_script)
+    _annotate_ui_eventtrigger_targets(objects, by_id, guid_to_script)
     return objects, lights, cameras, hierarchy
 
 
@@ -5971,6 +6058,75 @@ def _annotate_ui_toggle_onvaluechanged_targets(objects, by_id, guid_to_script):
         objects, by_id, guid_to_script, "ui_toggle", "on_value_changed")
 
 
+def _annotate_ui_eventtrigger_targets(objects, by_id, guid_to_script):
+    """Tag EventTrigger delegate calls with target MB class / Slider / GO."""
+    if not objects or not by_id:
+        return
+    guid_to_script = guid_to_script or {}
+    for o in objects:
+        et = o.get("ui_eventtrigger")
+        if not et:
+            continue
+        for d in et.get("delegates") or []:
+            for c in d.get("calls") or []:
+                tid = str(c.get("target_go") or "")
+                asm = (c.get("target_assembly") or "").split(",")[0].strip()
+                if asm.endswith(".Slider") or asm == "UnityEngine.UI.Slider":
+                    if (c.get("method") or "") in ("set_value", "set_Value"):
+                        c["target_kind"] = "slider"
+                        continue
+                if not tid or tid == "0":
+                    tg = (c.get("target_guid") or "").lower()
+                    sp = guid_to_script.get(tg) if tg else None
+                    if sp:
+                        cname = _class_name_from_cs(sp)
+                        if cname:
+                            c["target_kind"] = "mb"
+                            c["target_class"] = cname
+                    continue
+                rec = by_id.get(tid)
+                if not rec:
+                    short = asm.split(".")[-1] if asm else ""
+                    if short:
+                        c["target_kind"] = "mb"
+                        c["target_class"] = short
+                    continue
+                kind = rec.get("kind")
+                if kind == "GameObject":
+                    c["target_kind"] = "go"
+                    continue
+                if kind != "MonoBehaviour":
+                    continue
+                raw = rec.get("raw") or ""
+                gm = re.search(
+                    r"m_Script:\s*\{fileID:\s*\d+,\s*guid:\s*([0-9a-fA-F]+)",
+                    raw)
+                g = (gm.group(1).lower() if gm
+                     else (rec.get("guid") or "").lower())
+                sp = guid_to_script.get(g) if g else None
+                if not sp:
+                    short = asm.split(".")[-1] if asm else ""
+                    if short:
+                        c["target_kind"] = "mb"
+                        c["target_class"] = short
+                    continue
+                cname = _class_name_from_cs(sp)
+                if cname:
+                    c["target_kind"] = "mb"
+                    c["target_class"] = cname
+                oty = (c.get("object_arg_type") or "")
+                if "RectTransform" in oty:
+                    oid = str(c.get("object_arg") or "0")
+                    trec = by_id.get(oid)
+                    if trec and trec.get("kind") == "Transform":
+                        rawt = trec.get("raw") or ""
+                        gm2 = re.search(
+                            r"(?m)^\s+m_GameObject:\s*\{fileID:\s*(-?\d+)\}",
+                            rawt)
+                        if gm2:
+                            c["object_go"] = str(int(gm2.group(1)))
+
+
 def _annotate_ui_persistent_mb_targets(
         objects, by_id, guid_to_script, obj_key, calls_key):
     """Tag persistent UnityEvent calls with target_kind / target_class."""
@@ -6024,6 +6180,13 @@ def _onclick_mb_types(objects):
                 cls = c.get("target_class")
                 if cls:
                     out.add(cls)
+        et = o.get("ui_eventtrigger")
+        if et:
+            for d in et.get("delegates") or []:
+                for c in d.get("calls") or []:
+                    cls = c.get("target_class")
+                    if cls:
+                        out.add(cls)
     return out
 
 
@@ -6057,6 +6220,10 @@ def _alias_onclick_mb_file_ids(objects):
         _alias((o.get("ui_slider") or {}).get("on_value_changed"))
         _alias((o.get("ui_scrollbar") or {}).get("on_value_changed"))
         _alias((o.get("ui_toggle") or {}).get("on_value_changed"))
+        et = o.get("ui_eventtrigger")
+        if et:
+            for d in et.get("delegates") or []:
+                _alias(d.get("calls"))
 
 
 def _mb_onclick_callable(analyses, cname, method, mode):
@@ -6084,6 +6251,69 @@ def _mb_onclick_callable(analyses, cname, method, mode):
                 if want_string:
                     if re.match(
                             r"(?:System\.)?string\s+\w+\s*$", args, re.I):
+                        return True
+                elif want_void and not args:
+                    return True
+    return False
+
+
+def _mb_eventtrigger_callable(analyses, cname, method, mode, object_arg_type=""):
+    """True if EventTrigger can dispatch *method* (Void/Bool/Float/String/Object).
+
+    Object mode: RectTransform → packed GO index int; AudioClip skipped
+    (no clip table wired into MakeSoundEffect yet).
+    """
+    if not cname or not method or method == "SetActive":
+        return False
+    mode = int(mode or 0)
+    oty = object_arg_type or ""
+    if mode == 2:
+        if "RectTransform" not in oty:
+            return False
+        # Accept any public instance method with one int-like / component arg.
+        for a in analyses or []:
+            for c in a.get("classes") or []:
+                if c.get("name") != cname:
+                    continue
+                for m in c.get("methods") or []:
+                    if m.get("name") != method:
+                        continue
+                    if not m.get("public") or m.get("static"):
+                        continue
+                    args = (m.get("args") or "").strip()
+                    if re.match(
+                            r"(?:UnityEngine\.)?(?:RectTransform|Transform|"
+                            r"GameObject|int)\s+\w+\s*$",
+                            args):
+                        return True
+        return False
+    want_string = mode == 5
+    want_bool = mode == 6
+    want_float = mode == 4
+    want_void = mode in (0, 1)
+    if not (want_string or want_bool or want_float or want_void):
+        return False
+    for a in analyses or []:
+        for c in a.get("classes") or []:
+            if c.get("name") != cname:
+                continue
+            for m in c.get("methods") or []:
+                if m.get("name") != method:
+                    continue
+                if not m.get("public") or m.get("static"):
+                    continue
+                args = (m.get("args") or "").strip()
+                if want_string:
+                    if re.match(
+                            r"(?:System\.)?string\s+\w+\s*$", args, re.I):
+                        return True
+                elif want_bool:
+                    if re.match(
+                            r"(?:System\.)?bool\s+\w+\s*$", args, re.I):
+                        return True
+                elif want_float:
+                    if re.match(
+                            r"(?:System\.)?float\s+\w+\s*$", args, re.I):
                         return True
                 elif want_void and not args:
                     return True
@@ -7260,6 +7490,146 @@ def _build_ui_toggles(plan, analyses=None):
                 "calls": calls,
             })
     return toggles
+
+
+def _build_ui_eventtriggers(plan, analyses=None):
+    """Authored EventTrigger → hit GO + per-event persistent calls.
+
+    Supported eventIDs: PointerEnter/Exit/Down/Up/Click, BeginDrag, EndDrag.
+    Object(RectTransform) → GO index int; AudioClip object args skipped.
+    """
+    go_by_id, _xf, _hp = _ui_xf_go_maps(plan)
+    mb_index = _mb_index(plan)
+    class_inst0 = {}
+    for cname, cl in (plan.get("classes") or {}).items():
+        if int(cl.get("n") or 0) > 0:
+            class_inst0[cname] = 0
+    # Slider go → ui_sliders index for set_value.
+    sl_by_go = {}
+    for i, sl in enumerate(plan.get("ui_sliders") or []):
+        sl_by_go[int(sl["go"])] = i
+    # Also map Slider MB fileID → slider index via instances.
+    sl_by_mb = {}
+    for cl in plan["classes"].values():
+        for o in cl.get("instances") or []:
+            us = o.get("ui_slider")
+            if not us:
+                continue
+            gi = o.get("go_index")
+            if gi is None:
+                continue
+            si = sl_by_go.get(int(gi))
+            if si is None:
+                continue
+            mid = str(us.get("mb_file_id") or "")
+            if mid:
+                sl_by_mb[mid] = si
+            for mid2 in o.get("mb_ids") or []:
+                sl_by_mb[str(mid2)] = si
+    supported = frozenset({0, 1, 2, 3, 4, 13, 14})
+    triggers = []
+    for cl in plan["classes"].values():
+        for o in cl.get("instances") or []:
+            et = o.get("ui_eventtrigger")
+            hit = o.get("ui_hit")
+            if not et or not hit:
+                continue
+            if not int(et.get("enabled", 1)):
+                continue
+            self_go = o.get("go_index")
+            if self_go is None:
+                continue
+            self_go = int(self_go)
+            events = []
+            for d in et.get("delegates") or []:
+                # eventID 0 (PointerEnter) is valid — do not use `or -1`.
+                raw_eid = d.get("event_id")
+                if raw_eid is None:
+                    continue
+                eid = int(raw_eid)
+                if eid not in supported:
+                    continue
+                calls = []
+                for c in d.get("calls") or []:
+                    method = c.get("method") or ""
+                    mode = int(c.get("mode") or 0)
+                    tid = str(c.get("target_go") or "")
+                    if c.get("target_kind") == "slider" or (
+                            method in ("set_value", "set_Value")
+                            and mode == 4):
+                        si = sl_by_mb.get(tid)
+                        if si is None and tid in go_by_id:
+                            si = sl_by_go.get(go_by_id[tid])
+                        if si is None:
+                            continue
+                        calls.append({
+                            "kind": "slider_set",
+                            "slider": int(si),
+                            "float_arg": float(c.get("float_arg") or 0.0),
+                        })
+                        continue
+                    if method == "SetActive":
+                        tgt = go_by_id.get(tid)
+                        if tgt is None:
+                            continue
+                        calls.append({
+                            "kind": "setactive",
+                            "target_go": int(tgt),
+                            "bool_arg": int(c.get("bool_arg") or 0),
+                        })
+                        continue
+                    cname = c.get("target_class")
+                    inst = None
+                    hit_mb = mb_index.get(tid)
+                    if hit_mb:
+                        cname, inst = hit_mb[0], int(hit_mb[1])
+                    elif cname and cname in class_inst0:
+                        inst = int(class_inst0[cname])
+                    if cname is None or inst is None:
+                        continue
+                    if not _mb_eventtrigger_callable(
+                            analyses, cname, method, mode,
+                            c.get("object_arg_type") or ""):
+                        continue
+                    entry = {
+                        "kind": "mb",
+                        "mb_class": cname,
+                        "mb_inst": int(inst),
+                        "method": method,
+                        "mode": mode,
+                        "bool_arg": int(c.get("bool_arg") or 0),
+                        "float_arg": float(c.get("float_arg") or 0.0),
+                        "string_arg": c.get("string_arg") or "",
+                        "object_go": -1,
+                    }
+                    if mode == 2:
+                        og = c.get("object_go")
+                        if og and str(og) in go_by_id:
+                            entry["object_go"] = int(go_by_id[str(og)])
+                        else:
+                            continue
+                    calls.append(entry)
+                if calls:
+                    events.append({"event_id": eid, "calls": calls})
+            if not events:
+                continue
+            triggers.append({
+                "go": self_go,
+                "ncx": float(hit.get("ncx", 0.5)),
+                "ncy": float(hit.get("ncy", 0.5)),
+                "nhw": float(hit.get("nhw", 0.0)),
+                "nhh": float(hit.get("nhh", 0.0)),
+                "sorting_layer": int((o.get("sprite") or {}).get(
+                    "sorting_layer") or 0),
+                "sorting_order": int((o.get("sprite") or {}).get(
+                    "sorting_order") or 0),
+                "events": events,
+            })
+    triggers.sort(key=lambda t: (
+        -int(t.get("sorting_layer") or 0),
+        -int(t.get("sorting_order") or 0),
+    ))
+    return triggers
 
 
 def _link_scrollrects_scrollbars(plan):
@@ -10668,6 +11038,7 @@ def emit_engine(plan, analyses, used_apis):
     ui_scrollbars = plan.get("ui_scrollbars") or []
     ui_scrollrects = plan.get("ui_scrollrects") or []
     ui_toggles = plan.get("ui_toggles") or []
+    ui_eventtriggers = plan.get("ui_eventtriggers") or []
     authored_inactive = any(
         int(o.get("active", 1)) == 0
         for cl in plan["classes"].values()
@@ -10676,6 +11047,7 @@ def emit_engine(plan, analyses, used_apis):
             for h in (plan.get("scene_hierarchy") or []))
     want_ui = (bool(ui_buttons) or bool(ui_sliders) or bool(ui_scrollbars)
                or bool(ui_scrollrects) or bool(ui_toggles)
+               or bool(ui_eventtriggers)
                or ("GameObject.SetActive" in used_apis)
                or authored_inactive or _plan_has_ui_draws(plan))
     rt_apis = (
@@ -10685,6 +11057,7 @@ def emit_engine(plan, analyses, used_apis):
         plan.get("live_rt")
         and (_plan_has_ui_draws(plan) or bool(ui_buttons) or bool(ui_sliders)
              or bool(ui_scrollbars) or bool(ui_scrollrects) or bool(ui_toggles)
+             or bool(ui_eventtriggers)
              or rt_apis or "transform.localScale" in used_apis))
     want_go_tables = (
         want_find or want_transform_find or want_transform_parent
@@ -13557,6 +13930,202 @@ def emit_engine(plan, analyses, used_apis):
                           % (hidn, hmethod))
                 p("    }")
                 p("}")
+            # ---- EventTrigger ----
+            p("static const int _engine_ui_et_count = %d;"
+              % len(ui_eventtriggers))
+            if ui_eventtriggers:
+                net = len(ui_eventtriggers)
+                p("static const int _engine_ui_et_go[%d] = { %s };" % (
+                    net, ", ".join(
+                        str(int(t["go"])) for t in ui_eventtriggers)))
+                # Flatten events + calls.
+                ev_starts, ev_counts = [], []
+                ev_ids, ev_call_starts, ev_call_counts = [], [], []
+                call_ops, call_insts, call_bools = [], [], []
+                call_floats, call_strs, call_objs = [], [], []
+                et_handlers = []
+                et_handler_ix = {}
+
+                def _et_op(cname, method, sig):
+                    # sig: 'void'|'string'|'bool'|'float'|'obj'
+                    key = (cname, method, sig)
+                    if key not in et_handler_ix:
+                        et_handler_ix[key] = len(et_handlers) + 1
+                        et_handlers.append(key)
+                    return et_handler_ix[key]
+
+                for t in ui_eventtriggers:
+                    ev_starts.append(len(ev_ids))
+                    events = t.get("events") or []
+                    ev_counts.append(len(events))
+                    for ev in events:
+                        ev_ids.append(int(ev["event_id"]))
+                        ev_call_starts.append(len(call_ops))
+                        calls = ev.get("calls") or []
+                        ev_call_counts.append(len(calls))
+                        for c in calls:
+                            kind = c.get("kind")
+                            if kind == "setactive":
+                                call_ops.append(0)
+                                call_insts.append(0)
+                                call_bools.append(int(c.get("bool_arg") or 0))
+                                call_floats.append(0.0)
+                                call_strs.append("")
+                                call_objs.append(int(c["target_go"]))
+                            elif kind == "slider_set":
+                                call_ops.append(-1)
+                                call_insts.append(int(c["slider"]))
+                                call_bools.append(0)
+                                call_floats.append(float(c.get("float_arg") or 0))
+                                call_strs.append("")
+                                call_objs.append(-1)
+                            else:
+                                mode = int(c.get("mode") or 0)
+                                if mode == 5:
+                                    sig = "string"
+                                elif mode == 6:
+                                    sig = "bool"
+                                elif mode == 4:
+                                    sig = "float"
+                                elif mode == 2:
+                                    sig = "obj"
+                                else:
+                                    sig = "void"
+                                call_ops.append(_et_op(
+                                    c["mb_class"], c["method"], sig))
+                                call_insts.append(int(c["mb_inst"]))
+                                call_bools.append(int(c.get("bool_arg") or 0))
+                                call_floats.append(float(
+                                    c.get("float_arg") or 0.0))
+                                call_strs.append(c.get("string_arg") or "")
+                                call_objs.append(int(c.get("object_go")
+                                                     if c.get("object_go")
+                                                     is not None else -1))
+                nev = len(ev_ids)
+                ncall = len(call_ops)
+                p("static const int _engine_ui_et_ev_start[%d] = { %s };" % (
+                    net, ", ".join(str(x) for x in ev_starts)))
+                p("static const int _engine_ui_et_ev_count[%d] = { %s };" % (
+                    net, ", ".join(str(x) for x in ev_counts)))
+                if nev:
+                    p("static const int _engine_ui_et_ev_id[%d] = { %s };" % (
+                        nev, ", ".join(str(x) for x in ev_ids)))
+                    p("static const int _engine_ui_et_ev_call_start[%d] = "
+                      "{ %s };" % (
+                          nev, ", ".join(str(x) for x in ev_call_starts)))
+                    p("static const int _engine_ui_et_ev_call_count[%d] = "
+                      "{ %s };" % (
+                          nev, ", ".join(str(x) for x in ev_call_counts)))
+                else:
+                    p("static const int _engine_ui_et_ev_id[1] = { 0 };")
+                    p("static const int _engine_ui_et_ev_call_start[1] = "
+                      "{ 0 };")
+                    p("static const int _engine_ui_et_ev_call_count[1] = "
+                      "{ 0 };")
+                if ncall:
+                    p("static const int _engine_ui_et_call_op[%d] = { %s };" % (
+                        ncall, ", ".join(str(x) for x in call_ops)))
+                    p("static const int _engine_ui_et_call_inst[%d] = { %s };"
+                      % (ncall, ", ".join(str(x) for x in call_insts)))
+                    p("static const int _engine_ui_et_call_bool[%d] = { %s };"
+                      % (ncall, ", ".join(str(x) for x in call_bools)))
+                    p("static const float _engine_ui_et_call_float[%d] = "
+                      "{ %s };" % (
+                          ncall, ", ".join(
+                              "%sf" % repr(float(x)) for x in call_floats)))
+                    p("static const char *_engine_ui_et_call_str[%d] = {"
+                      % ncall)
+                    p("    " + ", ".join(_c_string(s) for s in call_strs))
+                    p("};")
+                    p("static const int _engine_ui_et_call_obj[%d] = { %s };"
+                      % (ncall, ", ".join(str(x) for x in call_objs)))
+                else:
+                    p("static const int _engine_ui_et_call_op[1] = { 0 };")
+                    p("static const int _engine_ui_et_call_inst[1] = { 0 };")
+                    p("static const int _engine_ui_et_call_bool[1] = { 0 };")
+                    p("static const float _engine_ui_et_call_float[1] = "
+                      "{ 0.f };")
+                    p("static const char *_engine_ui_et_call_str[1] = "
+                      "{ \"\" };")
+                    p("static const int _engine_ui_et_call_obj[1] = { -1 };")
+                plan["_ui_et_mb_handlers"] = et_handlers
+                for hcname, hmethod, sig in et_handlers:
+                    hidn = _c_ident(hcname)
+                    if sig == "string":
+                        p("static void %s_%s(unsigned i, const char *a);"
+                          % (hidn, hmethod))
+                    elif sig == "bool":
+                        p("static void %s_%s(unsigned i, int a);"
+                          % (hidn, hmethod))
+                    elif sig == "float":
+                        p("static void %s_%s(unsigned i, float a);"
+                          % (hidn, hmethod))
+                    elif sig == "obj":
+                        p("static void %s_%s(unsigned i, int a);"
+                          % (hidn, hmethod))
+                    else:
+                        p("static void %s_%s(unsigned i);" % (hidn, hmethod))
+                p("static int _engine_ui_et_hover[%d];" % net)
+                p("static int _engine_ui_et_press = -1;")
+                p("static void _engine_ui_et_fire(int ti, int eid) {")
+                p("    int e0, e1, e, j, j0, j1, op;")
+                p("    if (ti < 0 || ti >= _engine_ui_et_count) return;")
+                p("    e0 = _engine_ui_et_ev_start[ti];")
+                p("    e1 = e0 + _engine_ui_et_ev_count[ti];")
+                p("    for (e = e0; e < e1; e = e + 1) {")
+                p("        if (_engine_ui_et_ev_id[e] != eid) continue;")
+                p("        j0 = _engine_ui_et_ev_call_start[e];")
+                p("        j1 = j0 + _engine_ui_et_ev_call_count[e];")
+                p("        for (j = j0; j < j1; j = j + 1) {")
+                p("            op = _engine_ui_et_call_op[j];")
+                p("            if (op == 0) {")
+                p("                if (_engine_ui_et_call_obj[j] >= 0)")
+                p("                    GameObject_SetActive("
+                  "_engine_ui_et_call_obj[j],")
+                p("                                         "
+                  "_engine_ui_et_call_bool[j]);")
+                p("            } else if (op == -1) {")
+                if ui_sliders:
+                    p("                _engine_ui_sl_set_value("
+                      "_engine_ui_et_call_inst[j],")
+                    p("                    _engine_ui_et_call_float[j]);")
+                else:
+                    p("                (void)_engine_ui_et_call_inst[j];")
+                p("            }")
+                for hi, (hcname, hmethod, sig) in enumerate(et_handlers):
+                    hidn = _c_ident(hcname)
+                    p("            else if (op == %d)" % (hi + 1))
+                    if sig == "string":
+                        p("                %s_%s("
+                          "(unsigned)_engine_ui_et_call_inst[j],"
+                          % (hidn, hmethod))
+                        p("                    "
+                          "_engine_ui_et_call_str[j]);")
+                    elif sig == "bool":
+                        p("                %s_%s("
+                          "(unsigned)_engine_ui_et_call_inst[j],"
+                          % (hidn, hmethod))
+                        p("                    "
+                          "_engine_ui_et_call_bool[j]);")
+                    elif sig == "float":
+                        p("                %s_%s("
+                          "(unsigned)_engine_ui_et_call_inst[j],"
+                          % (hidn, hmethod))
+                        p("                    "
+                          "_engine_ui_et_call_float[j]);")
+                    elif sig == "obj":
+                        p("                %s_%s("
+                          "(unsigned)_engine_ui_et_call_inst[j],"
+                          % (hidn, hmethod))
+                        p("                    "
+                          "_engine_ui_et_call_obj[j]);")
+                    else:
+                        p("                %s_%s("
+                          "(unsigned)_engine_ui_et_call_inst[j]);"
+                          % (hidn, hmethod))
+                p("        }")
+                p("    }")
+                p("}")
             p("static void engine_ui_tick(void) {")
             p("    int down_edge, up_edge, i, hit;")
             p("    float px, py, sw, sh;")
@@ -13745,6 +14314,43 @@ def emit_engine(plan, analyses, used_apis):
                   " !Toggle_get_isOn(go));")
                 p("            }")
                 p("            _engine_ui_tg_press = -1;")
+                p("        }")
+                p("    }")
+            # EventTrigger: PointerEnter/Exit/Down/Up/Click + Begin/EndDrag.
+            if ui_eventtriggers:
+                p("    {")
+                p("        int ehit = -1;")
+                _emit_hit_loop(
+                    "_engine_ui_et_count", "_engine_ui_et_go", "ehit")
+                p("        for (i = 0; i < _engine_ui_et_count; i = i + 1) {")
+                p("            int over = (ehit == i);")
+                p("            int was = _engine_ui_et_hover[i];")
+                p("            if (over && !was)")
+                p("                _engine_ui_et_fire(i, 0); /* PointerEnter */")
+                p("            if (!over && was)")
+                p("                _engine_ui_et_fire(i, 1); /* PointerExit */")
+                p("            _engine_ui_et_hover[i] = over;")
+                p("        }")
+                busy = []
+                if ui_scrollbars:
+                    busy.append("_engine_ui_sb_drag < 0")
+                if ui_scrollrects:
+                    busy.append("_engine_ui_sr_drag < 0")
+                if ui_sliders:
+                    busy.append("_engine_ui_sl_drag < 0")
+                busy_expr = (" && ".join(busy)) if busy else "1"
+                p("        if (down_edge && ehit >= 0 && (%s)) {" % busy_expr)
+                p("            _engine_ui_et_press = ehit;")
+                p("            _engine_ui_et_fire(ehit, 2); /* PointerDown */")
+                p("            _engine_ui_et_fire(ehit, 13); /* BeginDrag */")
+                p("        }")
+                p("        if (up_edge && _engine_ui_et_press >= 0) {")
+                p("            int pr = _engine_ui_et_press;")
+                p("            _engine_ui_et_fire(pr, 3); /* PointerUp */")
+                p("            _engine_ui_et_fire(pr, 14); /* EndDrag */")
+                p("            if (ehit == pr)")
+                p("                _engine_ui_et_fire(pr, 4); /* PointerClick */")
+                p("            _engine_ui_et_press = -1;")
                 p("        }")
                 p("    }")
             p("    hit = -1;")
@@ -20513,6 +21119,7 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
     plan["ui_scrollrects"] = _build_ui_scrollrects(plan, analyses)
     _link_scrollrects_scrollbars(plan)
     plan["ui_toggles"] = _build_ui_toggles(plan, analyses)
+    plan["ui_eventtriggers"] = _build_ui_eventtriggers(plan, analyses)
     plan["live_rt"] = _build_rect_transforms(plan)
     rb2d, rb3d, go_rb2d, go_rb3d, rb2d_by_fid, rb3d_by_fid = (
         _build_rigidbody_tables(plan))

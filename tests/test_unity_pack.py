@@ -9990,6 +9990,141 @@ class TestSystems(unittest.TestCase):
         self.assertIn("_engine_ui_sr_drag_to", eng)
         self.assertIn("Host_OnToggle(", eng)
 
+    def test_eventtrigger_pointer_enter_and_down(self):
+        """EventTrigger fires PointerEnter (eventID 0) and PointerDown MB calls.
+
+        eventID 0 must not be dropped by falsy ``or -1`` checks.
+        """
+        root = tempfile.mkdtemp(prefix="upack-et-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Host.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Host : MonoBehaviour {\n"
+                "  public void Bang() {}\n"
+                "  public void SetFlag(bool v) {}\n"
+                "  void Update() {}\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Host.cs.meta"), "w") as f:
+            f.write("guid: hostethostethostethostethostet01\n")
+        et = "d0b148fe25e99eb48b9724523833bab1"
+        img = "fe87c0e1cc204ed48ad3b37840f39efc"
+        builtin = "0000000000000000f000000000000000"
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &100\nGameObject:\n  m_Name: Main Camera\n"
+                "  m_TagString: MainCamera\n"
+                "  m_Component:\n  - component: {fileID: 101}\n"
+                "  - component: {fileID: 102}\n"
+                "--- !u!4 &101\nTransform:\n"
+                "  m_GameObject: {fileID: 100}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: -10}\n"
+                "--- !u!20 &102\nCamera:\n"
+                "  m_GameObject: {fileID: 100}\n"
+                "  orthographic: 1\n"
+                "  orthographic size: 5\n"
+                "  m_BackGroundColor: {r: 0, g: 0, b: 0, a: 1}\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Canvas\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "--- !u!224 &11\nRectTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 0, y: 0}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!223 &12\nCanvas:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Enabled: 1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Host\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "  - component: {fileID: 4}\n"
+                "  - component: {fileID: 5}\n"
+                "--- !u!224 &2\nRectTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Father: {fileID: 11}\n"
+                "  m_AnchorMin: {x: 0.5, y: 0.5}\n"
+                "  m_AnchorMax: {x: 0.5, y: 0.5}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 100, y: 40}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: hostethostethostethostethostet01}\n"
+                "--- !u!114 &4\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n"
+                "  m_Script: {fileID: 11500000, guid: " + img + "}\n"
+                "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+                "  m_Sprite: {fileID: 21300000, guid: " + builtin + "}\n"
+                "--- !u!114 &5\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n"
+                "  m_Script: {fileID: 11500000, guid: " + et + "}\n"
+                "  m_EditorClassIdentifier: "
+                "UnityEngine.UI::UnityEngine.EventSystems.EventTrigger\n"
+                "  m_Delegates:\n"
+                "  - eventID: 2\n"
+                "    callback:\n"
+                "      m_PersistentCalls:\n"
+                "        m_Calls:\n"
+                "        - m_Target: {fileID: 3}\n"
+                "          m_TargetAssemblyTypeName: Host, Assembly-CSharp\n"
+                "          m_MethodName: SetFlag\n"
+                "          m_Mode: 6\n"
+                "          m_Arguments:\n"
+                "            m_ObjectArgument: {fileID: 0}\n"
+                "            m_ObjectArgumentAssemblyTypeName: "
+                "UnityEngine.Object, UnityEngine\n"
+                "            m_IntArgument: 0\n"
+                "            m_FloatArgument: 0\n"
+                "            m_StringArgument: \n"
+                "            m_BoolArgument: 1\n"
+                "          m_CallState: 2\n"
+                "  - eventID: 0\n"
+                "    callback:\n"
+                "      m_PersistentCalls:\n"
+                "        m_Calls:\n"
+                "        - m_Target: {fileID: 3}\n"
+                "          m_TargetAssemblyTypeName: Host, Assembly-CSharp\n"
+                "          m_MethodName: Bang\n"
+                "          m_Mode: 1\n"
+                "          m_Arguments:\n"
+                "            m_ObjectArgument: {fileID: 0}\n"
+                "            m_ObjectArgumentAssemblyTypeName: "
+                "UnityEngine.Object, UnityEngine\n"
+                "            m_IntArgument: 0\n"
+                "            m_FloatArgument: 0\n"
+                "            m_StringArgument: \n"
+                "            m_BoolArgument: 0\n"
+                "          m_CallState: 2\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-et-out-")
+        plan = unity_pack.pack(root, d)
+        ets = plan.get("ui_eventtriggers") or []
+        self.assertEqual(len(ets), 1)
+        eids = {e["event_id"]: e for e in ets[0]["events"]}
+        self.assertIn(0, eids)
+        self.assertIn(2, eids)
+        self.assertEqual(eids[0]["calls"][0]["method"], "Bang")
+        self.assertEqual(eids[2]["calls"][0]["method"], "SetFlag")
+        with open(os.path.join(d, "engine.cpp")) as ef:
+            eng = ef.read()
+        self.assertIn("_engine_ui_et_fire", eng)
+        self.assertIn("Host_Bang(", eng)
+        self.assertIn("Host_SetFlag(", eng)
+        self.assertIn("_engine_ui_et_fire(i, 0);", eng)
+        self.assertIn("_engine_ui_et_fire(ehit, 2);", eng)
+
     def test_awake_setactive_false_emitted(self):
         """Awake gameObject.SetActive(false) runs before Start (SettingsMenu)."""
         root = tempfile.mkdtemp(prefix="upack-awake-sa-")

@@ -290,7 +290,13 @@ mode 6 fixed bool). **Scrollbar** bakes `UpdateVisuals` (handle anchors from
 `m_Value`/`m_Size`/direction) and supports slide-area drag with float
 `onValueChanged`. **ScrollRect** drags the viewport to move content
 `anchoredPosition` (clamped), syncs linked Scrollbar value/size, and
-scrollbar value changes drive content normalized position. Authored C# may get/set
+scrollbar value changes drive content normalized position. **EventTrigger**
+(UnityEngine.EventSystems) packs `m_Delegates` for PointerEnter/Exit/Down/Up/
+Click and BeginDrag/EndDrag; `engine_ui_tick` tracks hover/press edges and
+fires matching persistent calls (Void/Bool/Float/String, plus Object when the
+arg is a `RectTransform` → packed GO index). `AudioClip` Object args are
+skipped until clip tables feed sound APIs. PointerEnter is eventID **0** —
+builders must not treat `0` as missing. Authored C# may get/set
 `rectTransform.anchoredPosition`, `sizeDelta`, and UI `localScale` (xy).
 Layout-only Canvas / Rect parents are snapshotted onto `scene_hierarchy`
 before scaffold drop so the live GO parent chain keeps rect state.
