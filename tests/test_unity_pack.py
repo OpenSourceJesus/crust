@@ -10040,6 +10040,65 @@ class TestSystems(unittest.TestCase):
         # without authored Buttons (would be undeclared).
         self.assertNotIn("_engine_ui_btn_tint_init", eng)
 
+    def test_awake_parent_gameobject_setactive_survives_stub(self):
+        """CosmeticsMenu: transform.parent.gameObject.SetActive kept in stub."""
+        root = tempfile.mkdtemp(prefix="upack-awake-par-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Panel.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Panel : MonoBehaviour {\n"
+                "    void Awake() {\n"
+                "        if (transform.parent != null)\n"
+                "            transform.parent.gameObject.SetActive(false);\n"
+                "        gameObject.SetActive(false);\n"
+                "        Unknown.DoThing();\n"
+                "    }\n"
+                "    void Update() {}\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Panel.cs.meta"), "w") as f:
+            f.write("guid: awakeparawakeparawakeparawake01\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Unlockables Menu\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "--- !u!4 &11\nTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Panel\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Father: {fileID: 11}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: awakeparawakeparawakeparawake01}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-awake-par-out-")
+        with contextlib.redirect_stderr(io.StringIO()):
+            unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        start = eng.find("static void Panel_Awake")
+        self.assertGreaterEqual(start, 0)
+        end = eng.find("\n}", start)
+        awake = eng[start:end]
+        self.assertIn(
+            "GameObject_SetActive(Transform_get_parent("
+            "_engine_go_of_Panel(i)), (0))",
+            awake)
+        self.assertIn(
+            "GameObject_SetActive(_engine_go_of_Panel(i), (0))", awake)
+        self.assertIn("static int Transform_get_parent", eng)
+
     def test_setactive_with_sprite_omits_btn_tint(self):
         """want_ui from SetActive + SpriteRenderer, no Button → no tint refs."""
         root = tempfile.mkdtemp(prefix="upack-sa-spr-")

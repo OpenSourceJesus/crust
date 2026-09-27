@@ -9111,6 +9111,10 @@ def analyze_script(path, text=None, shallow=False):
     if re.search(r"(?<![\w.])(?:this\s*\.\s*)?gameObject\s*\.\s*SetActive\s*\(",
                  scan):
         apis.add("GameObject.SetActive")
+    # transform.parent.gameObject.SetActive / anyRecv.gameObject.SetActive
+    if re.search(r"\.\s*gameObject\s*\.\s*SetActive\s*\(", scan):
+        apis.add("GameObject.SetActive")
+        apis.add("transform.gameObject")
     # foo.transform.SetParent / trs.SetParent (Transform receiver).
     if re.search(r"\.\s*transform\s*\.\s*SetParent\s*\(", scan):
         apis.add("transform.SetParent")
@@ -16674,11 +16678,26 @@ def _parse_vector3_expr(a):
 
 
 def _rewrite_transform_parent(text, cl, plan):
-    """Lower transform.parent → Transform_get_parent(this_go)."""
+    """Lower transform.parent → Transform_get_parent(this_go).
+
+    ``transform.parent.gameObject`` is the same index (Transform ≡ GameObject).
+    ``transform.parent.gameObject.SetActive(x)`` (CosmeticsMenu.Awake) must
+    lower before the stub salvage, or only ``gameObject.SetActive`` survives.
+    """
     if not plan.get("go_names"):
         return text
     idn = _c_ident(cl["name"])
     go_expr = "_engine_go_of_%s(i)" % idn
+    text = cs2cpp.code_sub(
+        r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*parent\s*\.\s*"
+        r"gameObject\s*\.\s*SetActive\s*\(\s*([^)]+)\s*\)",
+        r"GameObject_SetActive(Transform_get_parent(%s), (\1))" % go_expr,
+        text)
+    text = cs2cpp.code_sub(
+        r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*parent\s*\.\s*"
+        r"gameObject\b",
+        "Transform_get_parent(%s)" % go_expr,
+        text)
     return cs2cpp.code_sub(
         r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*parent\b",
         "Transform_get_parent(%s)" % go_expr,

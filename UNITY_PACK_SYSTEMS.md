@@ -320,7 +320,10 @@ real RectTransforms instead of full-screen fallbacks. Authored `m_Sprite`
 `objectReference` overrides on those instances supply Image sprites when the
 prefab default is null. `Awake` runs once before `Start` so
 authored `gameObject.SetActive(false)` (e.g. SettingsMenu) hides UI before
-the first draw. Canvas sorting layer/order apply to child Images/Buttons;
+the first draw. `transform.parent.gameObject.SetActive(false)` (e.g.
+CosmeticsMenu → Unlockables Menu) lowers to
+`GameObject_SetActive(Transform_get_parent(go), …)` and is kept even when
+the rest of Awake stubs. Canvas sorting layer/order apply to child Images/Buttons;
 TMP sorts one order above its Canvas. EventSystem / GraphicRaycaster /
 legacy `UI.Text` / `GridLayoutGroup` are not imported.
 `AddComponent<Canvas>` / `typeof(Canvas)` / `ForceUpdateCanvases`
