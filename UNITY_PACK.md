@@ -300,12 +300,29 @@ naming `method_c_symbol`, `method_arg_type_suffix`, `method_c_arg_names`,
 `split_call_args`, `match_call_args`, `c_ident`. They moved unchanged, and
 packed output was byte-identical before and after. unity_pack keeps the old
 underscore names as aliases. `tests/test_cs2cpp_helpers.py` tests them
-directly and records two known gaps as expected failures:
-`split_call_args` splits inside string literals, and `method_c_arg_names`
-misses array parameters such as `params int[] rest`. Helpers that look
-general but read Unity values stay in unity_pack: `_parse_csharp_field_init`
-(`Application.dataPath`, `new Vector2(...)`), `_param_c_ty` (components as
-packed indices), and the csc diagnostics that print `Assets/` paths.
+directly.
+
+Parameter lists are parsed once, by `cs2cpp.parse_params`, for the C
+signature (`_method_c_params`), the argument names passed on
+(`method_c_arg_names`) and the overload suffix (`method_arg_type_suffix`),
+so the three cannot disagree. It keeps generic arguments with commas
+(`Dictionary<int, string>`), array types (`params int[] rest`, suffix
+`int_array`, C type `int *`), `ref` / `out` / `in` / `params`, and default
+values. A default parameter used to vanish from the C signature, and the pack
+failed with `use of undeclared identifier`. `split_call_args` no longer
+splits inside string, verbatim, interpolated or char literals, or inside
+`{ }` and `[ ]`. Calls that omit a default argument are not filled in yet:
+the pack stops with `incorrect number of arguments for function call`.
+
+csc-style diagnostics are `cs2cpp.cs_diag` and `cs2cpp.cs_diag_at_site`,
+with a `display_path` hook. unity_pack's `_cs_diag` and `_raise_cs_at_site`
+pass `_assets_rel_path`, so paths print as `Assets/...`; their output was
+checked identical to the old code on 6,000 random cases.
+
+Helpers that look general but read Unity values stay in unity_pack:
+`_parse_csharp_field_init` (`Application.dataPath`, `new Vector2(...)`),
+`_param_c_ty` (components as packed indices), `_check_csharp_lex` (Unity API
+checks) and `_unlowered_csharp` (Unity value constructors).
 
 **What has moved.** cs2cpp describes the difference between the two
 object models in one place, `cs2cpp.ObjectModel`; unity_pack builds the
