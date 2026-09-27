@@ -9303,6 +9303,7 @@ def analyze_script(path, text=None, shallow=False):
         classes.append({
             "name": name, "kind": kind, "fields": fields,
             "methods": methods, "refs": refs,
+            "properties": _property_names(bscan_m),
             "bases": bases,
             "path": path,
             "file_text": text,
@@ -9590,6 +9591,27 @@ def _methods_in(body, bscan, body_abs=0):
             "static": bool(re.search(r"\bstatic\b", decl)),
         })
     return out
+
+
+def _property_names(bscan):
+    """C# property names a type body declares (`public bool Equipped { .. }`).
+
+    Only setters lower (`set_Name`, for UnityEvent wiring); a body that
+    still names one has a read the pack cannot answer.
+    """
+    out = set()
+    for m in re.finditer(
+            r"(?m)^[ \t]*(?:public|private|protected|internal)?"
+            r"[ \t]*(?:static[ \t]+)?(?:override[ \t]+)?(?:virtual[ \t]+)?"
+            r"([\w.<>]+)[ \t]+(\w+)[ \t\r\n]*\{", bscan):
+        if m.group(1) in ("if", "else", "for", "while", "switch", "catch",
+                          "using", "lock", "get", "set", "add", "remove",
+                          "class", "struct", "enum", "interface", "namespace"):
+            continue
+        if m.start() > 0 and bscan[m.start() - 1] == "(":
+            continue
+        out.add(m.group(2))
+    return sorted(out)
 
 
 def _properties_as_methods(body, bscan, body_abs=0):
@@ -9942,7 +9964,7 @@ def _engine_types_declared(lines):
 
 
 def _unlowered_csharp(body, args_str=None, emitted_params=None,
-                      known_types=()):
+                      known_types=(), properties=()):
     """What is left in a lowered body that the C subset cannot take, or None.
 
     Returns (what, text): the check that fired and the source text it
@@ -9981,6 +10003,14 @@ def _unlowered_csharp(body, args_str=None, emitted_params=None,
             (r"\w+\.activeSelf\b",
              "Unity `activeSelf` on a receiver nothing lowered.")):
         hit = unity(pattern, what)
+        if hit:
+            return hit
+    # A C# property the pack does not answer: only setters lower, so a name
+    # left standing is a read (`Equipped = Equipped`), not C.
+    for prop in sorted(properties or ()):
+        hit = unity(r"(?<![\w.])%s(?![\w])" % re.escape(prop),
+                    "C# property read (only `set_Name` lowers, for "
+                    "UnityEvent wiring).")
         if hit:
             return hit
     # Instance method C# params not emitted as C formals (only ``i`` / coll).
@@ -14531,6 +14561,12 @@ def emit_engine(plan, analyses, used_apis):
     if _handle_targets:
         p("")
 
+    class_properties = {}
+    for a in analyses:
+        for c in a.get("classes") or []:
+            if c.get("properties"):
+                class_properties.setdefault(c["name"], set()).update(
+                    c["properties"])
     for cname, cl in sorted(plan["classes"].items()):
         idn = _c_ident(cname)
         p("/* ---- %s group: instance array is defined in data.c ---- */" % idn)
@@ -14724,7 +14760,24 @@ def emit_engine(plan, analyses, used_apis):
                     emitted.add(pm.group(2))
             why = _unlowered_csharp(
                 body, args_str=m.get("args") or "", emitted_params=emitted,
-                known_types=_engine_types_declared(lines))
+                known_types=_engine_types_declared(lines),
+                properties=class_properties.get(cname) or ())
+            # MB methods always emit as `static void`. A non-void C# return
+            # (CompareTo → int, bool helpers, …) that otherwise lowers cleanly
+            # still leaves `return 1;` and crust refuses CS0000.
+            if why is None:
+                ret_cs = (m.get("ret") or "void").strip()
+                ret_base = ret_cs.split(".")[-1]
+                if ret_base and ret_base != "void":
+                    why = (
+                        "non-void return type (methods emit as static void)",
+                        ret_cs,
+                    )
+                elif re.search(r"(?m)^\s*return\s+[^;\s]", body):
+                    why = (
+                        "valued return in void method emit",
+                        "return …;",
+                    )
             if why is not None:
                 _report_stub(plan, site, cl, m, why)
                 if not m.get("static"):

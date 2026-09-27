@@ -3050,6 +3050,54 @@ class TestSystems(unittest.TestCase):
             out)
         self.assertNotIn("Toggle_set_isOn(CosmeticsMenu_equipped[i]", out)
 
+    def test_nonvoid_public_method_emits_stub(self):
+        """int CompareTo-style methods must not emit `return 1` as void."""
+        root = tempfile.mkdtemp(prefix="upack-nonvoid-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Item.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Item : MonoBehaviour {\n"
+                "    public int Rank(Item other) {\n"
+                "        if (transform.GetSiblingIndex() > "
+                "other.transform.GetSiblingIndex())\n"
+                "            return 1;\n"
+                "        return -1;\n"
+                "    }\n"
+                "    void Update() {}\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Item.cs.meta"), "w") as f:
+            f.write("guid: nonvoid000000000000000000000001\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Item\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: nonvoid000000000000000000000001}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-nonvoid-out-")
+        with contextlib.redirect_stderr(io.StringIO()):
+            unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("static void Item_Rank(unsigned i", eng)
+        self.assertIn("unlowered C#", eng)
+        # Must not leave a valued return inside the void function.
+        rank = eng[eng.find("static void Item_Rank"):]
+        rank = rank[:rank.find("\n}")]
+        self.assertNotRegex(rank, r"return\s+-?\d+")
+
     def test_unlowered_public_method_emits_stub(self):
         """Public GetComponents (no InChildren) helpers → empty stub."""
         root = tempfile.mkdtemp(prefix="upack-stub-")
