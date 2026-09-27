@@ -14144,6 +14144,22 @@ class TestParamLists(_ScriptPackMixin, unittest.TestCase):
         self.assertIn("other == -1", eng)
         self.assertEqual(self._total_after_four_updates(d), 420)
 
+    @needs_cc
+    def test_default_of_enum_and_class_param(self):
+        d, eng = self._pack(
+            "using UnityEngine;\n"
+            "public enum Mode { Off, On }\n"
+            "public class Tally : MonoBehaviour {\n"
+            "    public int total;\n"
+            "    void Hit(Tally other = default(Tally), Mode m = default(Mode),\n"
+            "             int k = default) {\n"
+            "        if (other == null) { total = total + 5 + k; }\n"
+            "    }\n"
+            "    void Update() { Hit(); }\n"
+            "}\n")
+        self.assertIn("Tally_Hit(i, -1, 0, 0);", eng)
+        self.assertEqual(self._total_after_four_updates(d), 20)
+
     def test_non_literal_default_is_still_refused(self):
         # A named constant needs type-aware lowering: the call is left short
         # and the pack refuses it with a clear argument-count error.

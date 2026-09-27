@@ -5904,13 +5904,52 @@ def _param_c_ty(ty):
     return "int"
 
 
+#: Project root whose C# sources say what kind of type a name is, and the
+#: per-root name → {kinds} index built from them on first use.
+_TYPE_DECL_ROOT = [None]
+_TYPE_DECL_KINDS = {}
+
+
+def _csharp_type_decl_kind(name):
+    """``enum`` / ``struct`` / ``class`` / ``interface`` for a type the
+    project or its packages declare, or None when it is undeclared or
+    declared as more than one kind (then nothing can be assumed)."""
+    root = _TYPE_DECL_ROOT[0]
+    if not root:
+        return None
+    kinds = _TYPE_DECL_KINDS.get(root)
+    if kinds is None:
+        kinds = {}
+        pat = re.compile(r"\b(enum|struct|class|interface)\s+([A-Za-z_]\w*)")
+        for sub in ("Assets", "Packages", os.path.join("Library", "PackageCache")):
+            for dp, _dn, fns in os.walk(os.path.join(root, sub)):
+                for fn in fns:
+                    if not fn.endswith(".cs"):
+                        continue
+                    try:
+                        with open(os.path.join(dp, fn), encoding="utf-8",
+                                  errors="replace") as f:
+                            text = f.read()
+                    except OSError:
+                        continue
+                    for m in pat.finditer(cs2cpp._blank(text)):
+                        kinds.setdefault(m.group(2), set()).add(m.group(1))
+        _TYPE_DECL_KINDS[root] = kinds
+    found = kinds.get(name) or set()
+    return next(iter(found)) if len(found) == 1 else None
+
+
 def _default_arg_c(expr, ty=None):
     """C for a C# default parameter value, or None when it needs type-aware
     lowering this does not do (enum members, constants, expressions).
-    ``null`` needs the parameter type *ty*: a packed handle is -1 (the packed
-    model's null), a string or array pointer is 0; nullable value types
-    (``int?``) are not modelled."""
+    ``null`` / ``default`` need the parameter type *ty*: a packed handle is
+    -1 (the packed model's null), a string or array pointer is 0, a number
+    or enum is 0; ``default(T)`` names its type. Structs and nullable value
+    types (``int?``) are not modelled."""
     e = (expr or "").strip()
+    dm = re.fullmatch(r"default\s*\(\s*([\w.]+)\s*\)", e)
+    if dm:
+        e, ty = "default", dm.group(1)
     if re.fullmatch(r"-?\d+[uUlL]*", e):
         return re.sub(r"[uUlL]+$", "", e)
     if re.fullmatch(r"-?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?[fFdDmM]?", e):
@@ -5928,6 +5967,14 @@ def _default_arg_c(expr, ty=None):
         base = ty.split(".")[-1]
         if e == "null" and base not in _PRIMITIVE_PARAM_TYPES:
             return "-1"
+        if e == "default":
+            if base in _PRIMITIVE_PARAM_TYPES:
+                return "0"
+            kind = _csharp_type_decl_kind(base)
+            if kind == "enum":
+                return "0"
+            if kind in ("class", "interface"):
+                return "-1"
     return None
 
 
@@ -5936,7 +5983,7 @@ _STATIC_NUMERIC_TYPES = frozenset((
     "float", "double", "byte", "sbyte", "short", "ushort", "int", "uint",
     "long", "ulong"))
 
-# C# value types that cannot be null (their `default` is not filled either).
+# C# value types that cannot be null (their `default` is 0).
 _PRIMITIVE_PARAM_TYPES = frozenset((
     "float", "double", "byte", "sbyte", "short", "ushort", "int", "uint",
     "long", "ulong", "bool", "char", "decimal"))
@@ -17567,6 +17614,7 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
     Box2D's event arrays.
     """
     physics_key = "box2d+inject" if physics_inject else "box2d"
+    _TYPE_DECL_ROOT[0] = os.path.abspath(root)
     os.makedirs(outdir, exist_ok=True)
     fp, assets_fp, scripts_fp = _input_fingerprints(
         root, soa=soa, soa_vec4=soa_vec4, gpu_handles=gpu_handles)
