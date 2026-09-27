@@ -14623,6 +14623,41 @@ class TestSceneManager(unittest.TestCase):
              ("There", [("Elsewhere", "Idle")])], 1)
         self.assertEqual(frames, [["missing"]])
 
+    @needs_cc
+    def test_singleton_instance_calls_pick_overloads(self):
+        single = (
+            "using UnityEngine;\n"
+            "public class Single<T> : MonoBehaviour where T : MonoBehaviour {\n"
+            "    public static T instance;\n"
+            "    public static T Instance {\n"
+            "        get {\n"
+            "            if (instance == null) instance = FindObjectOfType<T>();\n"
+            "            return instance;\n"
+            "        }\n"
+            "    }\n}\n")
+        manager = (
+            "using UnityEngine;\n"
+            "public class _Manager : Single<_Manager> {\n"
+            "    public static int total;\n"
+            "    public void Add(int n) { total = total + n; }\n"
+            "    public void Add(string s) { total = total + 100; }\n"
+            "    public void Twice() { Add(1); Add(\"x\"); }\n"
+            "}\n")
+        user = (
+            "using UnityEngine;\n"
+            "public class User : MonoBehaviour {\n"
+            "    public int ticks;\n"
+            "    void Update() {\n"
+            "        ticks = ticks + 1;\n"
+            "        _Manager.Instance.Add(ticks);\n"
+            "        _Manager.instance.Twice();\n"
+            "        Debug.Log(\"total \" + _Manager.total);\n"
+            "    }\n}\n")
+        frames = self._frames(
+            {"Single": single, "_Manager": manager, "User": user},
+            [("Only", [("M", "_Manager"), ("U", "User")])], 2)
+        self.assertEqual(frames, [["total 102"], ["total 205"]])
+
     def test_static_getter_inlining_leaves_input_manager_flags(self):
         root = self._project(
             {"InputManager": "using UnityEngine;\n"

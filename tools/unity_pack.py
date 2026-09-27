@@ -5553,7 +5553,7 @@ def analyze_script(path, text=None, shallow=False):
             r"(?<![\w.])(\w+)\s*\.\s*(?:Instance|instance)\b", scan):
         # CosmeticsMenu.Instance — not foo.instance unless type-like name.
         tname = m.group(1)
-        if tname[:1].isupper():
+        if tname.lstrip("_")[:1].isupper():
             apis.add("Singleton.Instance")
             singleton_instance_types.add(tname)
             findobject_types.add(tname)  # Instance getter needs FindObjectOfType
@@ -6103,6 +6103,137 @@ def _method_c_params(args_str):
     """C param list string from C# ``(byte amount, Cosmetic c)``."""
     return ", ".join("%s %s" % (_param_c_ty(p.type), p.name)
                      for p in cs2cpp.parse_params(args_str))
+
+
+_ARG_INT_TYPES = frozenset(("int", "uint", "long", "ulong", "short",
+                            "ushort", "byte", "sbyte"))
+
+
+def _overload_arg_fit(ptype, kind):
+    """How well an argument of scalar *kind* (``s``/``c``/``i``/``f``) fits a
+    parameter of C# type *ptype*: 0 no, 1 convertible, 2 exact."""
+    t = (ptype or "").split(".")[-1]
+    if t == "string":
+        return 2 if kind == "s" else 0
+    if kind == "s":
+        return 0
+    if t in _ARG_INT_TYPES:
+        return 2 if kind == "i" else 1
+    if t in ("float", "double"):
+        return 2 if kind == "f" else 1
+    if t == "char":
+        return 2 if kind == "c" else 1
+    return 1
+
+
+def _pick_overload(cands, args, string_idents):
+    """The one overload in *cands* that the (lowered) argument text *args*
+    selects, or None when none or several fit equally well."""
+    given = cs2cpp.split_call_args(args) if args.strip() else []
+    if any(_NAMED_ARG_RE.match(g) for g in given):
+        return None
+    best, best_score, tie = None, -1, False
+    for m in cands:
+        params = cs2cpp.parse_params(m.get("args") or "")
+        need = sum(1 for prm in params if prm.default is None)
+        if not need <= len(given) <= len(params):
+            continue
+        score = 0
+        for g, prm in zip(given, params):
+            fit = _overload_arg_fit(
+                prm.type, _c_expr_scalar_kind(g, string_idents=string_idents))
+            if not fit:
+                break
+            score += fit
+        else:
+            if score > best_score:
+                best, best_score, tie = m, score, False
+            elif score == best_score:
+                tie = True
+    return None if tie else best
+
+
+def _rewrite_method_calls(text, call_re, cands, oidn, receiver, overloaded,
+                          string_idents, protos=None):
+    """Calls matched by *call_re* (through the opening parenthesis) to one of
+    *cands* (same-named methods of class *oidn*) → ``Sym(receiver, args)``.
+    Overloads are picked by argument type; a call none or several fit is
+    left as written. *protos* collects the callee prototypes."""
+    pat = re.compile(call_re)
+    out = []
+    pos = 0
+    while True:
+        m = pat.search(text, pos)
+        if not m:
+            break
+        open_i = m.end() - 1
+        args, end = _match_call_args(text, open_i)
+        if end <= open_i:
+            break
+        args = _rewrite_method_calls(args, call_re, cands, oidn, receiver,
+                                     overloaded, string_idents, protos)
+        meth = (_pick_overload(cands, args, string_idents) if overloaded
+                else cands[0])
+        out.append(text[pos:m.start()])
+        if meth is None:
+            out.append(text[m.start():open_i + 1] + args + ")")
+            pos = end
+            continue
+        margs = meth.get("args") or ""
+        sym = _method_c_symbol(oidn, meth["name"], margs, overloaded)
+        a = _call_with_defaults(args, cs2cpp.parse_params(margs)).strip()
+        out.append("%s(%s%s)" % (sym, receiver, (", " + a) if a else ""))
+        if protos is not None:
+            plist = _method_c_params(margs)
+            protos.add("static void %s(unsigned i%s);"
+                       % (sym, (", " + plist) if plist else ""))
+        pos = end
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _returns_void(m):
+    """Methods emit as `static void`; a valued one is always a stub."""
+    return (m.get("ret") or "void").strip().split(".")[-1] == "void"
+
+
+def _rewrite_singleton_method_calls(text, plan, cl, site, string_idents):
+    """``Other.Instance.Method(args)`` (already ``Other_Instance().Method(``)
+    → ``Other_Method(<Other_Instance() or NullReferenceException>, args)``
+    for the instance methods ``Other`` emits."""
+    if "_Instance()" not in text:
+        return text
+    nre_site = site or {"class": cl.get("name") or "?", "method": "?",
+                        "path": "?"}
+    for ocname, pairs in (plan.get("_methods_by") or {}).items():
+        ocl = (plan.get("classes") or {}).get(ocname) or {}
+        if ocl.get("ctor_forbidden"):
+            continue
+        oidn = _c_ident(ocname)
+        inst_re = r"(?<![\w.])%s_Instance\(\)\s*\.\s*" % re.escape(oidn)
+        if not re.search(inst_re, text):
+            continue
+        emit_names = _reachable_emit_methods([m for _c, m in pairs])
+        overloaded = _overload_method_names(
+            [m for _c, m in pairs
+             if m["name"] in emit_names and m["name"] != "OnEnable"])
+        groups = {}
+        for _c, m in pairs:
+            n = m.get("name") or ""
+            if (m.get("static") or n not in emit_names or n == "OnEnable"
+                    or n in _UNITY_EMIT_MESSAGES or n in _COLLISION2D_MSGS
+                    or not _returns_void(m)):
+                continue
+            groups.setdefault(n, []).append(m)
+        receiver = (
+            "({ int _up_recv = %s_Instance(); if (_up_recv < 0) %s; "
+            "(unsigned)_up_recv; })" % (oidn, _nre_at_expr(nre_site, 0)))
+        protos = site.setdefault("protos", set()) if site is not None else None
+        for n in sorted(groups, key=len, reverse=True):
+            text = _rewrite_method_calls(
+                text, inst_re + re.escape(n) + r"\s*\(", groups[n], oidn,
+                receiver, n in overloaded, string_idents, protos)
+    return text
 
 
 def _array_elem_name(ty):
@@ -11425,6 +11556,8 @@ def _emit_engine_class_groups(
             body = _lower_method_body(
                 m["body"], cl, plan, site=site,
                 collision2d_param=coll_param)
+            for proto in sorted(site.get("protos") or ()):
+                p(proto)
             # Site marker so crust/shivyc failures map back to C#.
             cs_line = 1
             ft = site.get("file_text") or ""
@@ -16417,8 +16550,12 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         if mname in _UNITY_EMIT_MESSAGES:
             # Awake/Start/Update are called from the tick loop, not inlined.
             continue
-        # Overloads need arg-type dispatch — leave bare for the stub detector.
         if mname in overloaded:
+            cands = [tm for tm in this_method_list if tm.get("name") == mname]
+            if all(_returns_void(tm) for tm in cands):
+                text = _rewrite_method_calls(
+                    text, r"(?<![\w.])%s\s*\(" % re.escape(mname),
+                    cands, idn, "i", True, string_idents)
             continue
         sym = "%s_%s" % (idn, mname)
         params = []
@@ -16438,6 +16575,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
             r"(?<![\w.])%s\s*\(\s*([^)]*)\s*\)" % re.escape(mname),
             _inst_call,
             text)
+    text = _rewrite_singleton_method_calls(text, plan, cl, site, string_idents)
     # A `_set_(` another rewrite left open at the end of its line.
     fixed = []
     for line in text.split("\n"):
