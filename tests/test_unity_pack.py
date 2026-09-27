@@ -14422,5 +14422,83 @@ class TestBox2DPhysicsBackend(unittest.TestCase):
         self.assertEqual(self._run(inject=True), self._run(inject=False))
 
 
+class TestSceneManager(unittest.TestCase):
+    """Every enabled build scene is packed and SceneManager swaps them."""
+
+    def _project(self, scripts, scenes):
+        root = tempfile.mkdtemp(prefix="upack-scenes-")
+        self.addCleanup(shutil.rmtree, root, True)
+        for sub in ("Assets/Scripts", "Assets/Scenes", "ProjectSettings"):
+            os.makedirs(os.path.join(root, sub))
+        guids = {}
+        for i, (cls, src) in enumerate(sorted(scripts.items())):
+            guids[cls] = ("%02x" % (i + 0xa0)) * 16
+            path = os.path.join(root, "Assets", "Scripts", cls + ".cs")
+            with open(path, "w") as f:
+                f.write(src)
+            with open(path + ".meta", "w") as f:
+                f.write("guid: %s\n" % guids[cls])
+        build = []
+        for si, (sname, gos) in enumerate(scenes):
+            out = ["%YAML 1.1"]
+            for gi, (go_name, cls) in enumerate(gos):
+                go, xf, mb = 3 * gi + 1, 3 * gi + 2, 3 * gi + 3
+                out += [
+                    "--- !u!1 &%d" % go, "GameObject:",
+                    "  m_Name: %s" % go_name, "  m_IsActive: 1",
+                    "  m_Component:",
+                    "  - component: {fileID: %d}" % xf,
+                    "  - component: {fileID: %d}" % mb,
+                    "--- !u!4 &%d" % xf, "Transform:",
+                    "  m_GameObject: {fileID: %d}" % go,
+                    "  m_LocalPosition: {x: 0, y: 0, z: 0}",
+                    "  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}",
+                    "  m_LocalScale: {x: 1, y: 1, z: 1}",
+                    "  m_Father: {fileID: 0}",
+                    "--- !u!114 &%d" % mb, "MonoBehaviour:",
+                    "  m_GameObject: {fileID: %d}" % go,
+                    "  m_Script: {fileID: 11500000, guid: %s, type: 3}"
+                    % guids[cls],
+                ]
+            path = os.path.join(root, "Assets", "Scenes", sname + ".unity")
+            with open(path, "w") as f:
+                f.write("\n".join(out) + "\n")
+            sg = ("%02x" % (si + 0x11)) * 16
+            with open(path + ".meta", "w") as f:
+                f.write("guid: %s\n" % sg)
+            build.append("  - enabled: 1\n    path: Assets/Scenes/%s.unity\n"
+                         "    guid: %s\n" % (sname, sg))
+        with open(os.path.join(root, "ProjectSettings",
+                               "EditorBuildSettings.asset"), "w") as f:
+            f.write("%YAML 1.1\n--- !u!1045 &1\nEditorBuildSettings:\n"
+                    "  m_Scenes:\n" + "".join(build))
+        return root
+
+    def test_static_getter_inlining_leaves_input_manager_flags(self):
+        root = self._project(
+            {"InputManager": "using UnityEngine;\n"
+                             "using UnityEngine.InputSystem;\n"
+                             "public class InputManager : MonoBehaviour {\n"
+                             "    public static bool UsingMouse {\n"
+                             "        get { return Mouse.current != null; }\n"
+                             "    }\n"
+                             "    public int n;\n}\n",
+             "User": "using UnityEngine;\n"
+                     "public class User : MonoBehaviour {\n"
+                     "    public int n;\n"
+                     "    void Update() {\n"
+                     "        if (InputManager.UsingMouse) n = n + 1;\n"
+                     "    }\n}\n"},
+            [("Only", [("I", "InputManager"), ("U", "User")])])
+        d = tempfile.mkdtemp(prefix="upack-scenes-out-")
+        self.addCleanup(shutil.rmtree, d, True)
+        with contextlib.redirect_stderr(io.StringIO()):
+            unity_pack.pack(root, d, force=True)
+        with open(os.path.join(d, "engine.c")) as f:
+            engine = f.read()
+        body = engine[engine.index("static void User_Update"):]
+        self.assertIn("engine_input_using_mouse", body[:body.index("}")])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

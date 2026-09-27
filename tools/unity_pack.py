@@ -5714,6 +5714,10 @@ def analyze_script(path, text=None, shallow=False):
             "name": name, "kind": kind, "fields": fields,
             "methods": methods, "refs": refs,
             "properties": _property_names(bscan_m),
+            "static_getters": cs2cpp.static_getter_exprs(
+                body_m, bscan_m,
+                [f["name"] for f in fields] + [mm["name"] for mm in methods]
+                + list(_property_names(bscan_m))),
             "bases": bases,
             "path": path,
             "file_text": text,
@@ -6092,6 +6096,32 @@ def _array_elem_name(ty):
         return None
     m = re.match(r"^([\w.]+)\s*\[\s*\]\s*$", str(ty).strip())
     return m.group(1).split(".")[-1] if m else None
+
+
+def _collect_static_getters(analyses):
+    """``{class: {property: expr}}`` from ``cs2cpp.static_getter_exprs``."""
+    out = {}
+    for a in analyses:
+        for c in a.get("classes") or []:
+            if c.get("static_getters"):
+                out.setdefault(c["name"], {}).update(c["static_getters"])
+    return out
+
+
+def _inline_static_getters(text, cl, plan):
+    """Reads of an inlinable static property (``Type.Name``, or bare ``Name``
+    inside *Type*) become ``(expr)``. Assignments are left alone."""
+    getters = plan.get("static_getters") or {}
+    for cname, props in getters.items():
+        for pname, expr in props.items():
+            names = [r"(?:[\w.]+\.)?%s\s*\.\s*%s" % (re.escape(cname), re.escape(pname))]
+            if cname == cl.get("name"):
+                names.append(re.escape(pname))
+            for pat in names:
+                text = cs2cpp.code_sub(
+                    r"(?<![\w.])%s\b(?!\s*(?:[-+*/%%&|^]|<<|>>|\?\?)?=(?!=))" % pat,
+                    "(%s)" % expr, text)
+    return text
 
 
 def _collect_interfaces(analyses):
@@ -15466,6 +15496,9 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
         r"(?:[\w.]+\.)?InputManager\s*\.\s*InputDevice\s*\.\s*(\w+)\b",
         lambda m: _input_dev.get(m.group(1), "0"),
         text)
+    text = _inline_static_getters(text, cl, plan)
+    if null_handle is not None:
+        text = cs2cpp._lower_null_compares(text, null_handle)
     # Collections: cs2cpp lowers them from what the plan says about each
     # class (maps before lists, so a two-argument `Add` is a map's).
     text = cs2cpp.lower_packed_collections(
@@ -17749,6 +17782,7 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
     plan["getcomponentsinchildren_types"] = sorted(gcic_types)
     plan["mb_bases"] = _collect_mb_bases(analyses)
     plan["interfaces"] = _collect_interfaces(analyses)
+    plan["static_getters"] = _collect_static_getters(analyses)
     plan["addcomponent_types"] = sorted(add_types)
     plan["addcomponent_budget"] = _addcomponent_budget(analyses, plan)
     plan["instantiate_budget"] = _instantiate_budget(analyses, plan)
