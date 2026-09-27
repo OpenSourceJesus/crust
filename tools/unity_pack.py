@@ -10052,9 +10052,12 @@ def _param_c_ty(ty):
     return "int"
 
 
-def _default_arg_c(expr):
+def _default_arg_c(expr, ty=None):
     """C for a C# default parameter value, or None when it needs type-aware
-    lowering (``null``, enum members, constants, expressions)."""
+    lowering this does not do (enum members, constants, expressions).
+    ``null`` needs the parameter type *ty*: a packed handle is -1 (the packed
+    model's null), a string or array pointer is 0; nullable value types
+    (``int?``) are not modelled."""
     e = (expr or "").strip()
     if re.fullmatch(r"-?\d+[uUlL]*", e):
         return re.sub(r"[uUlL]+$", "", e)
@@ -10066,24 +10069,67 @@ def _default_arg_c(expr):
         return "0"
     if re.fullmatch(r'"(?:[^"\\\n]|\\.)*"', e):
         return e
+    if e in ("null", "default") and ty and not ty.endswith("?"):
+        cty = _param_c_ty(ty)
+        if cty.endswith("*"):
+            return "0"
+        base = ty.split(".")[-1]
+        if e == "null" and base not in _PRIMITIVE_PARAM_TYPES:
+            return "-1"
     return None
 
 
+# Numeric C# types a class-level static field is emitted for (as int / float).
+_STATIC_NUMERIC_TYPES = frozenset((
+    "float", "double", "byte", "sbyte", "short", "ushort", "int", "uint",
+    "long", "ulong"))
+
+# C# value types that cannot be null (their `default` is not filled either).
+_PRIMITIVE_PARAM_TYPES = frozenset((
+    "float", "double", "byte", "sbyte", "short", "ushort", "int", "uint",
+    "long", "ulong", "bool", "char", "decimal"))
+
+# `name: value` -- a named argument, not `a ? b : c` or `global::X`.
+_NAMED_ARG_RE = re.compile(r"\s*([A-Za-z_]\w*)\s*:(?!:)\s*(.*\S)\s*$", re.S)
+
+
 def _call_with_defaults(args, params):
-    """Argument text *args* of a call, with the defaults of missing trailing
-    parameters appended. Unchanged when nothing is missing, when a missing
-    parameter has no default, or when a default is not a plain literal (the
-    pack then refuses the call with an argument-count error, as before)."""
+    """Argument text *args* of a call, completed against *params*: named
+    arguments (``by: 2``) are put in declaration order and missing trailing
+    parameters get their defaults. Unchanged when nothing is missing or
+    named, or when an argument cannot be placed or a default cannot be
+    lowered (the pack then refuses the call, as before)."""
     given = cs2cpp.split_call_args(args) if args.strip() else []
-    if len(given) >= len(params) or any(":" in g for g in given):
+    positional = []
+    named = {}
+    for g in given:
+        m = _NAMED_ARG_RE.match(g)
+        if m:
+            named[m.group(1)] = m.group(2)
+        elif named:
+            return args  # positional after named: not C# we lower
+        else:
+            positional.append(g)
+    if not named and len(positional) >= len(params):
         return args
-    extra = []
-    for prm in params[len(given):]:
-        c = _default_arg_c(prm.default) if prm.default is not None else None
+    if len(positional) > len(params):
+        return args
+    names = [prm.name for prm in params]
+    if any(n not in names or names.index(n) < len(positional) for n in named):
+        return args
+    out = list(positional)
+    for prm in params[len(positional):]:
+        if prm.name in named:
+            out.append(named[prm.name])
+            continue
+        c = (_default_arg_c(prm.default, prm.type)
+             if prm.default is not None else None)
         if c is None:
             return args
-        extra.append(c)
-    return ", ".join(([args.strip()] if given else []) + extra)
+        out.append(c)
+    if not named:
+        return ", ".join(([args.strip()] if positional else []) + out[len(positional):])
+    return ", ".join(out)
 
 
 def _fill_defaults_after(text, sym, params):
@@ -15652,13 +15698,19 @@ def emit_engine(plan, analyses, used_apis):
                     p("static const int %s_%s = %d;" % (idn, fname, init))
                 else:
                     p("static int %s_%s = %d;" % (idn, fname, init))
-            elif isinstance(default, (int, float)) and default is not None:
-                if f.get("ty") == "float":
-                    p("static const float %s_%s = %sf;" % (
-                        idn, fname, repr(float(default))))
+            elif (isinstance(default, (int, float))
+                  or (default is None
+                      and f.get("ty") in _STATIC_NUMERIC_TYPES)):
+                # C# `const` stays const; a plain `static` is mutable, and an
+                # uninitialized one starts at 0 as in C#.
+                qual = "static const" if f.get("const") else "static"
+                val = default if default is not None else 0
+                if f.get("ty") in ("float", "double"):
+                    p("%s float %s_%s = %sf;" % (
+                        qual, idn, fname, repr(float(val))))
                 else:
-                    p("static const int %s_%s = %d;" % (
-                        idn, fname, int(default)))
+                    p("%s int %s_%s = %d;" % (
+                        qual, idn, fname, int(val)))
             elif f.get("ty") in ("StreamWriter", "StreamReader"):
                 p("static FILE *%s_%s;" % (idn, fname))
             # List / Dictionary / SortedList / ref arrays: preamble above.
@@ -15666,6 +15718,8 @@ def emit_engine(plan, analyses, used_apis):
                 f.get("ty") == "string"
                 or f.get("ty") == "bool"
                 or isinstance(f.get("default"), (int, float))
+                or (f.get("default") is None
+                    and f.get("ty") in _STATIC_NUMERIC_TYPES)
                 or f.get("ty") in ("StreamWriter", "StreamReader")
                 for f in (cl.get("class_consts") or [])):
             p("")
@@ -19389,8 +19443,11 @@ def _packed_class(cl):
 
 def _packed_model(plan):
     """cs2cpp's packed object model for this plan's engine."""
+    # A packed class reference is an index into its instance array whether or
+    # not the scripts also use the GameObject tables, so null is -1 whenever
+    # there are packed classes.
     return cs2cpp.packed_model(
-        bool(plan.get("go_names")),
+        bool(plan.get("go_names")) or bool(plan.get("classes")),
         byte_arrays=plan.get("_byte_array_lit_i") is not None,
         elem_type=lambda t: _collection_elem_c_ty(t, plan))
 
@@ -19429,6 +19486,12 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = re.sub(r"\bthis\.", "", text)
     # Bare `this` is the packed instance index (Add(this), == this, …).
     text = re.sub(r"(?<![\w.])this(?![\w])", "i", text)
+    # `x == null` / `x != null` against the packed null (-1). This was part of
+    # cs2cpp.lower_body, which the inline rewrites above replaced; the null
+    # comparisons were lost with it and reached C as an undeclared `null`.
+    null_handle = _packed_model(plan).null_handle
+    if null_handle is not None:
+        text = cs2cpp._lower_null_compares(text, null_handle)
     # base.Awake() / base.OnEnable() / base.OnDisable() — a base class is
     # its own packed array with its own instances, so there is no C call
     # to make here; drop, as the message itself already is for OnEnable.
@@ -19499,7 +19562,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
             r"\s*\.\s*transform\b",
             r"\1", text)
     # Unity Object null checks → packed index sentinel (-1).
-    # (Null comparisons against -1: `cs2cpp.lower_body`, above.)
+    # (Null comparisons against -1: `_lower_null_compares`, above.)
     if plan.get("go_names"):
         # Transform / GameObject locals are GO indices.
         text = cs2cpp.code_sub(r"\bTransform\b(?=\s+\w)", "int", text)
