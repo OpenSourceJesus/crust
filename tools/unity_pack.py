@@ -7991,6 +7991,39 @@ def _collision2d_arg_name(args):
     return m.group(1) if m else None
 
 
+def _want_rb2d_tables(plan, used_apis=None, getcomponent_types=None):
+    """True when engine/data must emit Rigidbody2D packed tables.
+
+    Authored bodies, AddComponent, GetComponent, and Collider2D collide all
+    touch ``_Rigidbody2D_*``. Collide alone is enough: resolution reads mass
+    and velocity even when every collider's rb index is -1.
+    """
+    used_apis = used_apis or set()
+    gct = set(getcomponent_types or ())
+    gct |= set(plan.get("getcomponent_types") or [])
+    add_types = set(plan.get("addcomponent_types") or [])
+    return (
+        bool(plan.get("rigidbody2d"))
+        or "Rigidbody2D" in gct
+        or "Rigidbody2D" in used_apis
+        or "Rigidbody2D" in add_types
+        or bool(plan.get("collider2d")))
+
+
+def _want_rb3d_tables(plan, used_apis=None, getcomponent_types=None):
+    """True when engine/data must emit Rigidbody (3D) packed tables."""
+    used_apis = used_apis or set()
+    gct = set(getcomponent_types or ())
+    gct |= set(plan.get("getcomponent_types") or [])
+    add_types = set(plan.get("addcomponent_types") or [])
+    return (
+        bool(plan.get("rigidbody"))
+        or "Rigidbody" in gct
+        or "Rigidbody" in used_apis
+        or "Rigidbody" in add_types
+        or bool(plan.get("collider3d")))
+
+
 def _build_rigidbody_tables(plan):
     """Authored Rigidbody2D / Rigidbody → packed tables linked to MB instances."""
     rb2d = []
@@ -10568,15 +10601,8 @@ def emit_engine(plan, analyses, used_apis):
     disallow_multi = set(plan.get("disallow_multiple_types")
                          or _DISALLOW_MULTIPLE_BUILTINS)
     go_has_sprite = set(plan.get("go_has_sprite") or [])
-    want_rb2d = (
-        bool(rb2d_list)
-        or "Rigidbody2D" in getcomponent_types
-        or "Rigidbody2D" in used_apis
-        or "Rigidbody2D" in add_types)
-    want_rb3d = (
-        bool(rb3d_list)
-        or "Rigidbody" in getcomponent_types
-        or "Rigidbody" in add_types)
+    want_rb2d = _want_rb2d_tables(plan, used_apis, getcomponent_types)
+    want_rb3d = _want_rb3d_tables(plan, used_apis, getcomponent_types)
     want_col2d = bool(col2d_list) or bool(
         add_types & {"BoxCollider2D", "CircleCollider2D"})
     want_col3d = bool(col3d_list) or bool(
@@ -18498,13 +18524,19 @@ def emit_data(plan, used_apis=None):
     rb3d_list = plan.get("rigidbody") or []
     add_budget = plan.get("addcomponent_budget") or {}
     add_types = set(plan.get("addcomponent_types") or [])
+    want_rb2d = _want_rb2d_tables(plan, used_apis)
+    want_rb3d = _want_rb3d_tables(plan, used_apis)
+    # Capacity tracks authored + AddComponent budget; want_* may still force
+    # a 1-slot empty table so engine externs resolve.
     rb2d_cap = len(rb2d_list) + int(add_budget.get("Rigidbody2D") or 0)
     rb3d_cap = len(rb3d_list) + int(add_budget.get("Rigidbody") or 0)
+    if want_rb2d:
+        rb2d_cap = max(1, rb2d_cap)
+    if want_rb3d:
+        rb3d_cap = max(1, rb3d_cap)
     light_budget = int(add_budget.get("Light") or 0)
-    want_phys = "Physics2D.gravity" in used_apis or bool(rb2d_list) or (
-        "Rigidbody2D" in add_types)
-    want_phys3 = "Physics.gravity" in used_apis or bool(rb3d_list) or (
-        "Rigidbody" in add_types)
+    want_phys = "Physics2D.gravity" in used_apis or want_rb2d
+    want_phys3 = "Physics.gravity" in used_apis or want_rb3d
     want_input = bool(used_apis & _WANT_INPUT)
     want_keyboard = "Keyboard.current" in used_apis
     keyboard_keys = set(plan.get("keyboard_keys") or [])
@@ -18626,7 +18658,7 @@ def emit_data(plan, used_apis=None):
             light_cap, ", ".join("%sf" % repr(v) for v in cg)))
         p("float _Light_color_b[%d] = { %s };" % (
             light_cap, ", ".join("%sf" % repr(v) for v in cb)))
-    if rb2d_cap:
+    if want_rb2d:
         n = len(rb2d_list)
         cap = rb2d_cap
         p("int _Rigidbody2D_count = %d;" % n)
@@ -18699,7 +18731,7 @@ def emit_data(plan, used_apis=None):
         p("int _AudioSource_playing[%d] = { %s };" % (
             as_cap, ", ".join(str(int(v)) for v in _pad_as(
                 [r.get("playing", 0) for r in asrc_list]))))
-    if rb3d_cap:
+    if want_rb3d:
         n = len(rb3d_list)
         cap = rb3d_cap
         p("int _Rigidbody_count = %d;" % n)
@@ -20369,6 +20401,7 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
     for a in analyses:
         gc_types |= set(a.get("getcomponent_types") or [])
     _validate_getcomponent_types(gc_types, plan, analyses)
+    plan["getcomponent_types"] = sorted(gc_types)
     gcic_types = set()
     for a in analyses:
         gcic_types |= set(a.get("getcomponentsinchildren_types") or [])

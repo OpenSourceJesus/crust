@@ -11221,6 +11221,66 @@ class TestSystems(unittest.TestCase):
             "component is already added to the game object!",
             run.stderr)
 
+    @needs_cc
+    def test_collider2d_without_rigidbody_emits_empty_rb_tables(self):
+        """Collider2D collide refs mass/vel — data must define tables even if
+        the scene has no authored Rigidbody2D (Main Menu / GetComponent only)."""
+        root = tempfile.mkdtemp(prefix="upack-col-norb-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Hit.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Hit : MonoBehaviour {\n"
+                "    void Start() {\n"
+                "        Rigidbody2D rb = GetComponent<Rigidbody2D>();\n"
+                "        if (rb != null) {}\n"
+                "    }\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Hit.cs.meta"), "w") as f:
+            f.write("guid: colnorb000000000000000000000001\n")
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Hit\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "  - component: {fileID: 4}\n"
+                "--- !u!4 &2\nTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: colnorb000000000000000000000001}\n"
+                "--- !u!61 &4\nBoxCollider2D:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n"
+                "  m_IsTrigger: 1\n"
+                "  m_Offset: {x: 0, y: 0}\n"
+                "  m_Size: {x: 1, y: 1}\n"
+            )
+        d = tempfile.mkdtemp(prefix="upack-col-norb-out-")
+        with contextlib.redirect_stderr(io.StringIO()):
+            plan = unity_pack.pack(root, d)
+        self.assertEqual(plan.get("rigidbody2d") or [], [])
+        self.assertTrue(plan.get("collider2d"))
+        with open(os.path.join(d, "data.c")) as f:
+            data = f.read()
+        self.assertIn("int _Rigidbody2D_count = 0;", data)
+        self.assertIn("float _Rigidbody2D_mass[1]", data)
+        self.assertIn("float _Rigidbody2D_vel_x[1]", data)
+        with open(os.path.join(d, "engine.c")) as f:
+            eng = f.read()
+        self.assertIn("_Rigidbody2D_mass[", eng)
+        # Player link must resolve RB symbols (data.o + engine.o).
+        exe = unity_pack.build_player_executable(
+            d, plan.get("product_name") or "Player")
+        self.assertTrue(os.path.isfile(exe))
+
     @needs_systems
     def test_authored_rigidbody2d_is_packed(self):
         objs, _a, _l, _c, _hier = unity_pack.load_project(SYSTEMS)
