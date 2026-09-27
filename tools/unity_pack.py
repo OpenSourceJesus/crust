@@ -868,33 +868,58 @@ def _resolve_build_scene_path(root, entry, asset_guids=None):
 
 
 def _unity_scenes_to_pack(root, asset_guids=None):
-    """``.unity`` paths to pack: first enabled EditorBuildSettings scene only.
+    """``.unity`` paths to pack, in build order: every enabled
+    EditorBuildSettings scene. A scene's position here is its
+    ``buildIndex``; the first is the one the player starts in.
 
     Scenes not listed in build settings are never packed. Disabled build
-    entries are skipped. When ``EditorBuildSettings.asset`` is absent (tests /
-    tiny fixtures), fall back to every ``.unity`` under ``Assets/`` only —
-    never a whole-project walk that pulls vendor demo scenes.
+    entries are skipped (they have no build index). When
+    ``EditorBuildSettings.asset`` is absent (tests / tiny fixtures), fall
+    back to every ``.unity`` under ``Assets/`` in path order — never a
+    whole-project walk that pulls vendor demo scenes.
     """
     root = os.path.abspath(root)
     entries = _parse_editor_build_scenes(root)
     if entries:
         enabled = [e for e in entries if e.get("enabled")]
+        out = []
         for e in enabled:
             path = _resolve_build_scene_path(root, e, asset_guids=asset_guids)
-            if path:
-                return [path]
-        if enabled:
-            raise PackError(
-                "EditorBuildSettings: no enabled scene file found "
-                "(first entries: %s)" % ", ".join(
-                    e.get("path") or "?" for e in enabled[:3]))
+            if not path:
+                raise PackError(
+                    "EditorBuildSettings: enabled scene %s not found"
+                    % (e.get("path") or e.get("guid") or "?"))
+            out.append(path)
+        if out:
+            return out
         raise PackError(
             "EditorBuildSettings: no enabled scenes "
             "(add a scene or enable one in File → Build Settings)")
     assets = os.path.join(root, "Assets")
     if os.path.isdir(assets):
-        return list(_walk_files(assets, (".unity",)))
-    return list(_walk_files(root, (".unity",)))
+        return sorted(_walk_files(assets, (".unity",)))
+    return sorted(_walk_files(root, (".unity",)))
+
+
+#: fileIDs are unique only within one scene file. Scenes after the first get
+#: theirs XORed with ``index << _SCENE_FILE_ID_SHIFT`` so merged scene graphs
+#: cannot alias; references carrying a ``guid`` point into other assets and
+#: keep their IDs.
+_SCENE_FILE_ID_SHIFT = 56
+_LOCAL_FILE_ID_RE = re.compile(
+    r"(^--- !u!\d+ &(?=\d+\s)|\{fileID: (?=\d+\}))(\d+)", re.M)
+
+
+def _scene_local_file_ids(text, scene_index):
+    """*text* with its scene-local fileIDs made unique to *scene_index*."""
+    if not scene_index:
+        return text
+    tag = scene_index << _SCENE_FILE_ID_SHIFT
+
+    def _sub(m):
+        fid = int(m.group(2))
+        return m.group(1) + str(fid ^ tag) if fid else m.group(0)
+    return _LOCAL_FILE_ID_RE.sub(_sub, text)
 
 
 def _walk_files(root, exts):
@@ -16662,6 +16687,15 @@ def _load_prefab_objects_for_types(root, type_names, guids, assets, typename_map
     return out
 
 
+def _scene_list(root, paths):
+    """Build scenes in buildIndex order: ``{name, path}`` (Unity ``Scene.name``
+    is the file name without ``.unity``; ``Scene.path`` is project-relative)."""
+    return [{
+        "name": os.path.splitext(os.path.basename(p))[0],
+        "path": os.path.relpath(p, root).replace(os.sep, "/"),
+    } for p in paths]
+
+
 def _load_scenes_lights_cameras(root, assets):
     """Parse scenes / tscn / blender JSON → objects, lights, cameras, hierarchy.
 
@@ -16673,16 +16707,20 @@ def _load_scenes_lights_cameras(root, assets):
     cameras = []
     hierarchy = []
     scenes = _unity_scenes_to_pack(root, asset_guids=assets)
-    _progress("packing %d startup scene(s)" % len(scenes))
+    _progress("packing %d build scene(s)" % len(scenes))
     for si, path in enumerate(scenes):
         _progress("  scene %d/%d %s" % (
             si + 1, len(scenes), os.path.relpath(path, root)))
         objs, scene_lights, scene_cams, scene_hier = parse_unity_yaml(
-            _read(path), guid_to_script=guids, asset_guids=assets)
+            _scene_local_file_ids(_read(path), si),
+            guid_to_script=guids, asset_guids=assets)
+        for rec in objs + scene_lights + scene_cams + scene_hier:
+            rec["scene"] = si
         objects.extend(objs)
         lights.extend(scene_lights)
         cameras.extend(scene_cams)
         hierarchy.extend(scene_hier)
+    _load_scenes_lights_cameras.scenes = _scene_list(root, scenes)
     for path in _walk_files(root, (".tscn",)):
         objects.extend(parse_godot_tscn(_read(path)))
     for path in _walk_files(root, (".json",)):
@@ -17297,7 +17335,7 @@ def _refused_api_site(analyses, api):
 _STAMP_NAME = ".unity_pack_stamp.json"
 _STAMP_VERSION = 4
 _SCENE_CACHE_NAME = ".unity_pack_scene_cache"
-_SCENE_CACHE_VERSION = 3
+_SCENE_CACHE_VERSION = 4
 # Authored inputs under Assets/ that affect emit (skip Library / PackageCache).
 _FINGERPRINT_EXTS = (
     ".cs", ".unity", ".prefab", ".meta",
@@ -17434,6 +17472,8 @@ def _write_scene_cache(outdir, assets_fp, objects, lights, cameras, hierarchy,
         "asset_guids": dict(asset_guids),
         "ui_layout": list(
             getattr(_load_scenes_lights_cameras, "ui_layout", None) or []),
+        "scenes": list(
+            getattr(_load_scenes_lights_cameras, "scenes", None) or []),
     }
     path = _scene_cache_path(outdir)
     tmp = path + ".tmp"
@@ -17465,6 +17505,7 @@ def _read_scene_cache(outdir, assets_fp):
     ul = payload.get("ui_layout") or []
     if isinstance(ul, (list, tuple)) and len(ul) >= 2:
         _load_scenes_lights_cameras.ui_layout = (int(ul[0]), int(ul[1]))
+    _load_scenes_lights_cameras.scenes = list(payload.get("scenes") or [])
     return (
         objects,
         list(payload.get("lights") or []),

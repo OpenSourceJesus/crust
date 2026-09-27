@@ -181,7 +181,7 @@ class TestBuildSettingsAndActive(unittest.TestCase):
         self.assertNotIn("EditorRoot", hier_names)
         self.assertNotIn("EditorChild", hier_names)
 
-    def test_only_first_enabled_build_scene_packed(self):
+    def test_enabled_build_scenes_packed_in_build_order(self):
         root = tempfile.mkdtemp(prefix="upack-build-scenes-")
         scripts = os.path.join(root, "Assets", "Scripts")
         ps = os.path.join(root, "ProjectSettings")
@@ -222,13 +222,18 @@ class TestBuildSettingsAndActive(unittest.TestCase):
                 "    guid: 33333333333333333333333333333333\n"
             )
         paths = unity_pack._unity_scenes_to_pack(root)
-        self.assertEqual(len(paths), 1)
+        self.assertEqual(len(paths), 2)
         self.assertTrue(paths[0].endswith("Boot.unity"))
+        self.assertTrue(paths[1].endswith("Level.unity"))
         objs, _a, _l, _c, hier = unity_pack.load_project(root)
-        names = {o["name"] for o in objs} | {h["name"] for h in hier}
-        self.assertIn("BootGO", names)
-        self.assertNotIn("LevelGO", names)
-        self.assertNotIn("ExtraGO", names)
+        scene_of = {h["name"]: h["scene"] for h in hier}
+        self.assertEqual(scene_of, {"BootGO": 0, "LevelGO": 1})
+        # Both scenes author fileIDs 1..3: they must stay distinct objects.
+        self.assertEqual(sorted(o["name"] for o in objs), ["BootGO", "LevelGO"])
+        self.assertEqual(len({h["xf_id"] for h in hier}), 2)
+        self.assertEqual(
+            [s["name"] for s in unity_pack._load_scenes_lights_cameras.scenes],
+            ["Boot", "Level"])
 
     def test_go_active_seeded_in_engine(self):
         root = tempfile.mkdtemp(prefix="upack-active-")
