@@ -14009,49 +14009,40 @@ class TestLiveRectTransform(unittest.TestCase):
 class TestParamLists(unittest.TestCase):
     """Parameter lists go through cs2cpp.parse_params: defaults, arrays and
     commas inside literals. A default parameter used to vanish from the C
-    signature, and the pack failed with `use of undeclared identifier`."""
+    signature, and the pack failed with `use of undeclared identifier`.
+    Calls that omit a literal default now get it filled in."""
 
-    @needs_cc
-    def test_default_param_and_string_comma(self):
+    SCENE = (
+        "%YAML 1.1\n"
+        "--- !u!1 &1\nGameObject:\n  m_Name: Tally\n"
+        "  m_Component:\n  - component: {fileID: 2}\n"
+        "  - component: {fileID: 3}\n"
+        "--- !u!4 &2\nTransform:\n  m_GameObject: {fileID: 1}\n"
+        "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+        "--- !u!114 &3\nMonoBehaviour:\n  m_GameObject: {fileID: 1}\n"
+        "  m_Script: {fileID: 11500000, "
+        "guid: 7a11e0000000000000000000000000aa}\n"
+        "  total: 0\n")
+
+    def _pack(self, script):
         root = tempfile.mkdtemp(prefix="upack-params-")
         scripts = os.path.join(root, "Assets", "Scripts")
         os.makedirs(scripts)
         with open(os.path.join(scripts, "Tally.cs"), "w") as f:
-            f.write(
-                "using UnityEngine;\n"
-                "public class Tally : MonoBehaviour {\n"
-                "    public int total;\n"
-                "    void Bump(int by = 1) { total = total + by; }\n"
-                "    void Note(string msg, int n) { total = total + n; }\n"
-                "    void Sum(int a, int[] rest) { total = total + a; }\n"
-                "    void Update() {\n"
-                "        Bump(3);\n"
-                "        Note(\"a,b\", 2);\n"
-                "    }\n"
-                "}\n")
+            f.write(script)
         with open(os.path.join(scripts, "Tally.cs.meta"), "w") as f:
             f.write("guid: 7a11e0000000000000000000000000aa\n")
         scenes = os.path.join(root, "Assets", "Scenes")
         os.makedirs(scenes)
         with open(os.path.join(scenes, "S.unity"), "w") as f:
-            f.write(
-                "%YAML 1.1\n"
-                "--- !u!1 &1\nGameObject:\n  m_Name: Tally\n"
-                "  m_Component:\n  - component: {fileID: 2}\n"
-                "  - component: {fileID: 3}\n"
-                "--- !u!4 &2\nTransform:\n  m_GameObject: {fileID: 1}\n"
-                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
-                "--- !u!114 &3\nMonoBehaviour:\n  m_GameObject: {fileID: 1}\n"
-                "  m_Script: {fileID: 11500000, "
-                "guid: 7a11e0000000000000000000000000aa}\n"
-                "  total: 0\n")
+            f.write(self.SCENE)
         d = tempfile.mkdtemp(prefix="upack-params-out-")
         with contextlib.redirect_stderr(io.StringIO()):
             unity_pack.pack(root, d, force=True)
         with open(os.path.join(d, "engine.c")) as f:
-            eng = f.read()
-        self.assertIn("Tally_Bump(unsigned i, int by)", eng)
-        self.assertIn('Tally_Note(i, "a,b", 2);', eng)
+            return d, f.read()
+
+    def _total_after_four_updates(self, d):
         host = os.path.join(d, "host.c")
         with open(host, "w") as f:
             f.write(
@@ -14080,7 +14071,58 @@ class TestParamLists(unittest.TestCase):
                            capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
         out = subprocess.run([exe], capture_output=True, text=True).stdout
-        self.assertEqual(out.strip(), "20")  # 4 updates of 3 + 2
+        return int(out.strip())
+
+    @needs_cc
+    def test_default_param_and_string_comma(self):
+        d, eng = self._pack(
+            "using UnityEngine;\n"
+            "public class Tally : MonoBehaviour {\n"
+            "    public int total;\n"
+            "    void Bump(int by = 1) { total = total + by; }\n"
+            "    void Note(string msg, int n) { total = total + n; }\n"
+            "    void Sum(int a, int[] rest) { total = total + a; }\n"
+            "    void Update() {\n"
+            "        Bump(3);\n"
+            "        Note(\"a,b\", 2);\n"
+            "    }\n"
+            "}\n")
+        self.assertIn("Tally_Bump(unsigned i, int by)", eng)
+        self.assertIn('Tally_Note(i, "a,b", 2);', eng)
+        self.assertEqual(self._total_after_four_updates(d), 20)  # 4 x (3+2)
+
+    @needs_cc
+    def test_omitted_defaults_are_filled(self):
+        d, eng = self._pack(
+            "using UnityEngine;\n"
+            "public class Tally : MonoBehaviour {\n"
+            "    public int total;\n"
+            "    void Bump(int by = 1) { total = total + by; }\n"
+            "    void Note(string msg, int n = 2) { total = total + n; }\n"
+            "    static void Grow(int k = 4) { Debug.Log(k); }\n"
+            "    void Update() {\n"
+            "        Bump();\n"
+            "        Note(\"a,b\");\n"
+            "        Grow();\n"
+            "    }\n"
+            "}\n")
+        self.assertIn("Tally_Bump(i, 1);", eng)
+        self.assertIn('Tally_Note(i, "a,b", 2);', eng)
+        self.assertIn("Tally_Grow(4);", eng)
+        self.assertEqual(self._total_after_four_updates(d), 12)  # 4 x (1+2)
+
+    def test_non_literal_default_is_still_refused(self):
+        # `null` needs type-aware lowering: the call is left short and the
+        # pack refuses it with a clear argument-count error.
+        with self.assertRaises(unity_pack.PackError) as cm:
+            self._pack(
+                "using UnityEngine;\n"
+                "public class Tally : MonoBehaviour {\n"
+                "    public int total;\n"
+                "    void Hit(Tally other = null) { total = total + 1; }\n"
+                "    void Update() { Hit(); }\n"
+                "}\n")
+        self.assertIn("incorrect number of arguments", cm.exception.message)
 
 _BOX2D_ROOT = unity_pack.find_box2d_root()
 needs_box2d = unittest.skipUnless(

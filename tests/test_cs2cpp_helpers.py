@@ -152,6 +152,54 @@ class TestDiagnostics(unittest.TestCase):
             "Assets/Scripts/A.cs(3,5): error CS0103: nope")
 
 
+class TestPreprocessor(unittest.TestCase):
+    def test_eval_pp_expr(self):
+        d = frozenset(("DEBUG", "FAST"))
+        self.assertTrue(cs2cpp.eval_pp_expr("DEBUG", d))
+        self.assertFalse(cs2cpp.eval_pp_expr("TRACE", d))
+        self.assertTrue(cs2cpp.eval_pp_expr("DEBUG && !TRACE", d))
+        self.assertTrue(cs2cpp.eval_pp_expr("(TRACE || FAST) && DEBUG", d))
+        self.assertFalse(cs2cpp.eval_pp_expr("", d))
+
+    def test_blank_inactive_regions(self):
+        src = ("a();\n"
+               "#if DEBUG\n"
+               "b();\n"
+               "#elif TRACE\n"
+               "c();\n"
+               "#else\n"
+               "d();\n"
+               "#endif\n"
+               "e();")
+        out = cs2cpp.blank_inactive_pp_regions(src, frozenset(("DEBUG",)))
+        self.assertEqual(len(out), len(src))  # positions are kept
+        kept = [line for line in out.split("\n") if line.strip()]
+        self.assertEqual(kept, ["a();", "b();", "e();"])
+        out = cs2cpp.blank_inactive_pp_regions(src, frozenset())
+        kept = [line for line in out.split("\n") if line.strip()]
+        self.assertEqual(kept, ["a();", "d();", "e();"])
+
+
+class TestLexicalChecks(unittest.TestCase):
+    def test_valid_real_literals(self):
+        text = 'float a = 0.0f; var b = 2f; double c = 1.5; s = "0.f"; // 0.f'
+        self.assertIsNone(cs2cpp.real_literal_error("A.cs", text))
+
+    def test_cpp_style_real_literal(self):
+        text = "class A {\n  float a = 0.f;\n}\n"
+        err = cs2cpp.real_literal_error("/p/A.cs", text)
+        self.assertTrue(err.startswith(
+            "A.cs(2,15): error CS1061: 'int' does not contain a definition "
+            "for 'f'"), err)
+
+    def test_unity_pack_keeps_assets_paths(self):
+        text = "class A {\n  float a = 0.f;\n}\n"
+        with self.assertRaises(unity_pack.PackError) as cm:
+            unity_pack._check_csharp_lex("/p/Assets/Scripts/A.cs", text)
+        self.assertTrue(cm.exception.message.startswith(
+            "Assets/Scripts/A.cs(2,15): error CS1061"))
+
+
 class TestUnityPackAliases(unittest.TestCase):
     def test_old_names_are_the_moved_functions(self):
         for old, new in (("_methods_in", "methods_in"),
