@@ -11333,7 +11333,7 @@ class TestSystems(unittest.TestCase):
         self.assertIn("wz - Camera_main_pos_z", engine)
         self.assertIn("out[n].m00", engine)
         self.assertIn("_spr_sin", engine)
-        self.assertIn("engine_physics_collide2d", engine)
+        self.assertIn("engine_box2d_step", engine)
         self.assertIn("engine_animation_tick", engine)
         self.assertIn("_AnimPlayer_count", data)
         self.assertIn("_AnimKey_y", data)
@@ -12085,7 +12085,7 @@ class TestSystems(unittest.TestCase):
         self.assertIn("_engine_fixed_accum", eng)
         self.assertIn("_Rigidbody2D_linear_damping", eng)
         self.assertIn("GameObject_GetComponent_Rigidbody2D", eng)
-        self.assertIn("engine_physics_collide2d", eng)
+        self.assertIn("engine_box2d_step();", eng)
         self.assertIn("Player_OnCollisionEnter2D", eng)
         self.assertIn("Collision2D_ToString", eng)
         self.assertIn("engine_physics_collide2d_messages", eng)
@@ -12101,8 +12101,11 @@ class TestSystems(unittest.TestCase):
         self.assertAlmostEqual(ground["collider2d"]["friction"], 0.4)
         ground_row = [c for c in plan["collider2d"] if c["name"] == "Ground"][0]
         self.assertAlmostEqual(ground_row["friction"], 0.4)
-        self.assertIn("_Collider2D_friction", eng)
-        self.assertIn("_phys_mat_combine", eng)
+        # Friction and bounciness combine in Box2D-Packed's material callbacks.
+        with open(os.path.join(d, "physics_box2d.c")) as f:
+            glue = f.read()
+        self.assertIn("_Collider2D_friction", glue)
+        self.assertIn("b2u_combine", glue)
 
     @needs_systems
     def test_rigidbody_field_linear_velocity_setx(self):
@@ -13564,7 +13567,7 @@ class TestSystemsRuns(unittest.TestCase):
         self.assertIn("Player_OnCollisionEnter2D(unsigned i, int coll)", eng)
         self.assertIn("Collision2D_ToString", eng)
         self.assertIn("_col2d_add_contact", eng)
-        self.assertIn("inv_a / inv_sum", eng)
+        self.assertIn("engine_box2d_step();", eng)
         host = os.path.join(d, "host.c")
         with open(host, "w") as f:
             f.write(
@@ -14002,17 +14005,17 @@ class TestLiveRectTransform(unittest.TestCase):
 
 
 
-_BOX2D_ROOT = os.environ.get("BOX2D_PACKED_ROOT")
+_BOX2D_ROOT = unity_pack.find_box2d_root()
 needs_box2d = unittest.skipUnless(
-    _BOX2D_ROOT and os.path.isfile(os.path.join(_BOX2D_ROOT or "", "box2d_unity.py"))
-    and _CC is not None,
-    "set BOX2D_PACKED_ROOT to a Box2D-Packed checkout to run")
+    _BOX2D_ROOT is not None and _CC is not None,
+    "2D physics is Box2D-Packed: set BOX2D_PACKED_ROOT or clone "
+    "https://github.com/crustos/box2d beside this repository")
 
 
 class TestBox2DPhysicsBackend(unittest.TestCase):
-    """--physics box2d: Box2D-Packed replaces the 2D integrator and AABB
-    contacts; OnCollisionEnter/Stay/Exit2D still come from unity_pack after
-    the step. See box2d_unity.py in the Box2D-Packed repository."""
+    """2D physics is Box2D-Packed; OnCollisionEnter/Stay/Exit2D still come
+    from unity_pack after the step. See box2d_unity.py in the Box2D-Packed
+    repository."""
 
     def _project(self):
         root = tempfile.mkdtemp(prefix="upack-b2d-")
@@ -14071,24 +14074,34 @@ class TestBox2DPhysicsBackend(unittest.TestCase):
         root = self._project()
         d = tempfile.mkdtemp(prefix="upack-b2d-none-")
         old = os.environ.pop("BOX2D_PACKED_ROOT", None)
+        find = unity_pack.find_box2d_root
+        unity_pack.find_box2d_root = lambda box2d_root=None: None
         try:
             with contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaises(unity_pack.PackError) as cm:
-                    unity_pack.pack(root, d, physics="box2d", force=True)
+                    unity_pack.pack(root, d, force=True)
         finally:
+            unity_pack.find_box2d_root = find
             if old is not None:
                 os.environ["BOX2D_PACKED_ROOT"] = old
         self.assertIn("BOX2D_PACKED_ROOT", cm.exception.message)
 
-    def test_unknown_backend_is_refused(self):
-        with self.assertRaises(unity_pack.PackError):
-            unity_pack.pack(self._project(), tempfile.mkdtemp(), physics="havok")
+    def test_physics_flag_is_gone(self):
+        err = io.StringIO()
+        argv = sys.argv
+        sys.argv = ["unity_pack.py", self._project(), "--physics", "builtin"]
+        try:
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(unity_pack.main(), 2)
+        finally:
+            sys.argv = argv
+        self.assertIn("--physics is gone", err.getvalue())
 
     def _run(self, inject):
         root = self._project()
         d = tempfile.mkdtemp(prefix="upack-b2d-out-")
         with contextlib.redirect_stderr(io.StringIO()):
-            plan = unity_pack.pack(root, d, physics="box2d",
+            plan = unity_pack.pack(root, d,
                                    physics_inject=inject,
                                    box2d_root=_BOX2D_ROOT, force=True)
             unity_pack.build_player_executable(
@@ -14097,7 +14110,7 @@ class TestBox2DPhysicsBackend(unittest.TestCase):
         with open(os.path.join(d, "engine.c")) as f:
             eng = f.read()
         self.assertIn("engine_box2d_step();", eng)
-        self.assertNotIn("    engine_physics_collide2d();", eng)
+        self.assertNotIn("static void engine_physics_collide2d(void)", eng)
         self.assertTrue(os.path.isfile(os.path.join(d, "physics_box2d.c")))
         self.assertEqual(
             os.path.isfile(os.path.join(d, "box2d_inject.json")), inject)
@@ -14136,6 +14149,68 @@ class TestBox2DPhysicsBackend(unittest.TestCase):
         enters, exits, y = out.split()
         self.assertEqual((int(enters), int(exits)), (4, 3))
         self.assertAlmostEqual(float(y), -1.5, delta=0.02)
+
+    @needs_box2d
+    def test_rigidbody2d_without_colliders_falls(self):
+        """No Collider2D tables in data.c: the glue still links, and a body
+        added with AddComponent<Rigidbody2D> falls under gravity."""
+        root = tempfile.mkdtemp(prefix="upack-b2d-nocol-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Faller.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Faller : MonoBehaviour {\n"
+                "    void Start() {\n"
+                "        transform.position = new Vector3(0, 5, 0);\n"
+                "        gameObject.AddComponent<Rigidbody2D>();\n"
+                "    }\n"
+                "}\n")
+        with open(os.path.join(scripts, "Faller.cs.meta"), "w") as f:
+            f.write("guid: b2dfall00000000000000000000000a\n")
+        scenes = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scenes)
+        with open(os.path.join(scenes, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Faller\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!4 &2\nTransform:\n  m_GameObject: {fileID: 1}\n"
+                "  m_LocalPosition: {x: 0, y: 5, z: 0}\n"
+                "--- !u!114 &3\nMonoBehaviour:\n  m_GameObject: {fileID: 1}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: b2dfall00000000000000000000000a}\n")
+        d = tempfile.mkdtemp(prefix="upack-b2d-nocol-out-")
+        with contextlib.redirect_stderr(io.StringIO()):
+            plan = unity_pack.pack(root, d, box2d_root=_BOX2D_ROOT, force=True)
+            unity_pack.build_player_executable(
+                d, plan.get("product_name") or "Player", box2d_root=_BOX2D_ROOT)
+        host = os.path.join(d, "host.c")
+        with open(host, "w") as f:
+            f.write(
+                "#include <stdio.h>\n"
+                "void engine_tick(void);\n"
+                "extern float Time_deltaTime;\n"
+                "extern float _Faller_pos[][2];\n"
+                "int main(void) {\n"
+                "  int i;\n"
+                "  Time_deltaTime = 0.02f;\n"
+                "  for (i = 0; i < 60; i = i + 1) engine_tick();\n"
+                "  printf(\"%.3f\\n\", _Faller_pos[0][1]);\n"
+                "  return 0;\n"
+                "}\n")
+        exe = os.path.join(d, "host")
+        r = subprocess.run(
+            [_CC, "-O2", "-o", exe, host, os.path.join(d, "engine.o"),
+             os.path.join(d, "data.o"), os.path.join(d, "physics_box2d.o"),
+             os.path.join(d, "box2d", "libbox2d.a"), "-lpthread", "-lm"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        y = float(subprocess.run([exe], capture_output=True, text=True).stdout)
+        # Free fall from 5 for 1.2 s ends near -2.06; allow a step of latency.
+        self.assertLess(y, -1.5)
+        self.assertGreater(y, -2.5)
 
     @needs_box2d
     def test_box2d_injected_matches_standard(self):
