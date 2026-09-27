@@ -608,6 +608,12 @@ _UI_COMPONENT_FIELD_TYPES = frozenset((
 # GetComponent<T> for authored UI — opaque GO handles, not AddComponent invent.
 _UI_GETCOMPONENT_TYPES = _UI_COMPONENT_FIELD_TYPES
 
+# Authored fields packed as a GameObject index. A component reference is
+# only ever used through the engine's GO-keyed helpers (`Transform_get_parent`,
+# `RectTransform_get_rect_height`, …), so the GO is the handle.
+_GO_HANDLE_FIELD_TYPES = _UI_COMPONENT_FIELD_TYPES | frozenset(
+    ("Transform", "GameObject"))
+
 # Every GameObject has a Transform (RectTransform is the uGUI subclass).
 # GetComponent<Transform|RectTransform>() ≡ GO index (same as .transform).
 _TRANSFORM_GETCOMPONENT_TYPES = frozenset(("Transform", "RectTransform"))
@@ -5351,6 +5357,10 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 "xf_id": xf_id,
                 "father_id": father_id,
                 "go_id": go.get("file_id"),
+                # Every component on this GO, so an authored field holding
+                # one (`public Scrollbar scrollbar`) resolves to the GO.
+                "comp_ids": [str(k.get("file_id")) for k in kids
+                             if k.get("file_id") is not None],
                 "active": active,
                 "has_canvas": bool(canvas),
                 "has_image": bool(ui_image),
@@ -5535,6 +5545,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "fields": fields,
             "object_refs": object_refs,
             "mb_ids": mb_ids,
+            "comp_ids": [str(k.get("file_id")) for k in kids
+                         if k.get("file_id") is not None],
             "script": script,
             "class": class_name or _scriptless_packed_class(go.get("name")),
             "sprite": sprite,
@@ -8887,6 +8899,45 @@ def _resolve_transform_field_targets(plan):
     plan["sprite_draw_mutable"] = sorted(mutable)
 
 
+def _resolve_go_field_refs(plan):
+    """Authored component-reference fields → the GameObject index they name.
+
+    The scene stores a fileID: a Transform / RectTransform's own, a uGUI
+    component's, or a GameObject's. All three resolve to the one GO table
+    slot, which is what the engine's helpers take. A reference the scene
+    leaves empty (or that names something outside the packed tables) is
+    null, not GO 0 -- which is another object.
+    """
+    go_by_id, xf_to_go, _parents = _ui_xf_go_maps(plan)
+    comp_to_go = {}
+    records = [o for cl in plan["classes"].values()
+               for o in cl.get("instances") or []]
+    records += list(plan.get("scene_hierarchy") or [])
+    for o in records:
+        gi = o.get("go_index")
+        if gi is None:
+            continue
+        for fid in (o.get("comp_ids") or []) + (o.get("mb_ids") or []):
+            comp_to_go.setdefault(str(fid), int(gi))
+    refs = {}
+    for cname, cl in plan["classes"].items():
+        for f in cl.get("fields") or []:
+            if f.get("ty") not in _GO_HANDLE_FIELD_TYPES:
+                continue
+            row = []
+            for o in cl.get("instances") or []:
+                fid = str((o.get("object_refs") or {}).get(f["name"]) or "")
+                go = -1
+                if fid:
+                    for table in (xf_to_go, go_by_id, comp_to_go):
+                        if fid in table:
+                            go = int(table[fid])
+                            break
+                row.append(go)
+            refs[(cname, f["name"])] = row
+    plan["go_field_refs"] = refs
+
+
 def _match_call_args(text, open_paren):
     """Index of '(' → (args_str, index_after_closing_paren) or None."""
     if open_paren >= len(text) or text[open_paren] != "(":
@@ -9621,8 +9672,9 @@ def analyze_script(path, text=None, shallow=False):
                 r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*sizeDelta\b",
                 scan)):
         apis.add("rectTransform.sizeDelta")
-    if re.search(r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*parent\b",
-                 scan):
+    # `transform.parent`, and `handleTrs.parent` on a component field: both
+    # walk the same live parent table.
+    if re.search(r"(?<![.\w])\w+\s*\.\s*parent\b", scan):
         apis.add("transform.parent")
     if re.search(r"(?<![.\w])(?:this\s*\.\s*)?transform\s*\.\s*gameObject\b",
                  scan):
@@ -9671,6 +9723,17 @@ def analyze_script(path, text=None, shallow=False):
     if re.search(r"(?<![\w.])(?:UnityEngine\.)?Rect\s*\.\s*"
                  r"PointToNormalized\s*\(", scan):
         apis.add("Rect.PointToNormalized")
+    # `trs.rect.height` — the RectTransform's own rect, not `Camera.rect`.
+    if re.search(r"(?<![\w.])\w+\s*\.\s*rect\s*\.\s*"
+                 r"(?:width|height|min|max|center|size|x|y)\b", scan):
+        apis.add("RectTransform.rect")
+    if re.search(r"(?<![\w.])GetWorldRect\s*\(\s*\)", scan):
+        apis.add("Extensions.GetWorldRect")
+    if re.search(r"(?<![\w.])Camera\s*\.\s*main\s*\.\s*"
+                 r"ScreenToWorldPoint\s*\(", scan):
+        apis.add("Camera.main.ScreenToWorldPoint")
+    if re.search(r"(?<![\w.])Mouse\s*\.\s*current\s*\.\s*position\b", scan):
+        apis.add("Mouse.current.position")
     if re.search(r"\bInputAction\b", scan):
         apis.add("InputAction")
     if re.search(
@@ -11125,11 +11188,12 @@ def plan_layouts(objects, analyses, two_d=None):
                     members.append((fname + "_y", "float", 32, "f32"))
                     members.append((fname + "_z", "float", 32, "f32"))
                 continue  # otherwise transform owns position; full Vector3 later
-            if ty == "Transform":
-                # Resolved via object_refs → target class/inst (SetWorldScale).
-                continue
-            if ty in _UI_COMPONENT_FIELD_TYPES:
-                # Authored uGUI / TMP refs — drawn from scene, not packed MB idx.
+            if ty in _GO_HANDLE_FIELD_TYPES:
+                # A Transform / uGUI / TMP reference names a component, and
+                # every engine UI helper addresses one by its GameObject
+                # (Transform ≡ RectTransform ≡ GameObject index here). The
+                # scene's fileID resolves to that GO in `_resolve_go_field_refs`.
+                members.append((fname, "uint32_t", 32, "go"))
                 continue
             if _array_elem_name(ty):
                 # Toggle[] / MB[] — parallel std::vector<int> of GO / inst idxs.
@@ -11344,6 +11408,9 @@ def emit_engine(plan, analyses, used_apis):
     want_rect = bool(used_apis & {
         "Rect.PointToNormalized", "RectTransform.rect",
         "Extensions.GetWorldRect"})
+    want_screen_to_world = bool(plan.get("camera")) and bool(used_apis & {
+        "Camera.main.ScreenToWorldPoint", "Extensions.GetWorldRect"})
+    want_mouse_position = "Mouse.current.position" in used_apis
     if ("File.WriteAllBytes" in used_apis
             or "File.ReadAllBytes" in used_apis):
         if "File.WriteAllBytes" in used_apis:
@@ -13206,6 +13273,45 @@ def emit_engine(plan, analyses, used_apis):
             p("}")
             p("")
 
+        if want_screen_to_world:
+            p("/* Camera.main.ScreenToWorldPoint — orthographic, in the")
+            p("   camera's own viewport rect (Camera.rect), which is what")
+            p("   the pack draws and hit-tests against. */")
+            p("static void _engine_camera_viewport(")
+            p("    float *ovx, float *ovy, float *ovw, float *ovh) {")
+            p("    float sw = (float)Screen_width;")
+            p("    float sh = (float)Screen_height;")
+            p("    if (sw < 1.f) sw = 1.f;")
+            p("    if (sh < 1.f) sh = 1.f;")
+            p("    *ovx = Camera_main_rect_x * sw;")
+            p("    *ovy = Camera_main_rect_y * sh;")
+            p("    *ovw = Camera_main_rect_w * sw;")
+            p("    *ovh = Camera_main_rect_h * sh;")
+            p("    if (*ovw < 1.f) *ovw = 1.f;")
+            p("    if (*ovh < 1.f) *ovh = 1.f;")
+            p("}")
+            p("static Vector2 Camera_main_ScreenToWorldPoint(Vector2 p) {")
+            p("    float vx, vy, vw, vh, ppu;")
+            p("    _engine_camera_viewport(&vx, &vy, &vw, &vh);")
+            p("    ppu = Camera_main_orthographicSize;")
+            p("    if (ppu < 1e-8f) ppu = 1.f;")
+            p("    ppu = vh * 0.5f / ppu;")
+            p("    if (ppu < 1e-8f) ppu = 1.f;")
+            p("    return Vector2_make(")
+            p("        Camera_main_pos_x")
+            p("            + (Vector2_x(p) - vx - vw * 0.5f) / ppu,")
+            p("        Camera_main_pos_y")
+            p("            + (Vector2_y(p) - vy - vh * 0.5f) / ppu);")
+            p("}")
+            p("")
+        if want_mouse_position:
+            p("/* Mouse.current.position.ReadValue() — the host pointer, in")
+            p("   screen pixels from the bottom-left (Unity's origin). */")
+            p("static Vector2 Mouse_current_position(void) {")
+            p("    return Vector2_make(engine_pointer_x, engine_pointer_y);")
+            p("}")
+            p("")
+
         if want_live_rt:
             rt = plan.get("live_rt") or {}
             go_rt_n = go_n
@@ -13466,6 +13572,129 @@ def emit_engine(plan, analyses, used_apis):
             p("    if (go < 0 || go >= %d) return 1.f;" % go_rt_n)
             p("    return _engine_rt_sy[go];")
             p("}")
+            p("/* The parent's own rect, which anchors measure against. */")
+            p("static void _engine_rt_parent_wh(int go,"
+              " float *opw, float *oph) {")
+            p("    int parent;")
+            p("    *opw = _engine_ui_layout_w;")
+            p("    *oph = _engine_ui_layout_h;")
+            p("    if (go < 0 || go >= %d) return;" % go_rt_n)
+            p("    parent = _engine_go_parent[go];")
+            p("    if (parent >= 0 && parent < %d)" % go_rt_n)
+            p("        _engine_ui_local_wh(parent, _engine_ui_layout_w,")
+            p("                            _engine_ui_layout_h, opw, oph);")
+            p("}")
+            p("/* RectTransform.rect — Unity's local rect: the size before")
+            p("   localScale, with the pivot at the origin. */")
+            p("static float RectTransform_get_rect_width(int go) {")
+            p("    float w, h;")
+            p("    _engine_ui_local_wh(go, _engine_ui_layout_w,")
+            p("                        _engine_ui_layout_h, &w, &h);")
+            p("    if (w < 0.f) w = -w;")
+            p("    return w;")
+            p("}")
+            p("static float RectTransform_get_rect_height(int go) {")
+            p("    float w, h;")
+            p("    _engine_ui_local_wh(go, _engine_ui_layout_w,")
+            p("                        _engine_ui_layout_h, &w, &h);")
+            p("    if (h < 0.f) h = -h;")
+            p("    return h;")
+            p("}")
+            p("static float RectTransform_get_rect_x(int go) {")
+            p("    float px = 0.5f;")
+            p("    if (go >= 0 && go < %d) px = _engine_rt_pivot_x[go];"
+              % go_rt_n)
+            p("    return -px * RectTransform_get_rect_width(go);")
+            p("}")
+            p("static float RectTransform_get_rect_y(int go) {")
+            p("    float py = 0.5f;")
+            p("    if (go >= 0 && go < %d) py = _engine_rt_pivot_y[go];"
+              % go_rt_n)
+            p("    return -py * RectTransform_get_rect_height(go);")
+            p("}")
+            if want_rect:
+                p("static Rect RectTransform_get_rect(int go) {")
+                p("    return Rect_make(")
+                p("        RectTransform_get_rect_x(go),")
+                p("        RectTransform_get_rect_y(go),")
+                p("        RectTransform_get_rect_width(go),")
+                p("        RectTransform_get_rect_height(go));")
+                p("}")
+            p("/* Transform.localPosition of a RectTransform: its pivot, in")
+            p("   the parent's rect with the origin at the centre (Unity). */")
+            p("static void _engine_rt_local_pivot(int go,"
+              " float *ox, float *oy) {")
+            p("    float pw, ph, cx, cy, w, h;")
+            p("    *ox = 0.f; *oy = 0.f;")
+            p("    if (go < 0 || go >= %d) return;" % go_rt_n)
+            p("    _engine_rt_parent_wh(go, &pw, &ph);")
+            p("    _engine_rt_pivot_center(")
+            p("        pw, ph,")
+            p("        _engine_rt_amin_x[go], _engine_rt_amin_y[go],")
+            p("        _engine_rt_amax_x[go], _engine_rt_amax_y[go],")
+            p("        _engine_rt_apos_x[go], _engine_rt_apos_y[go],")
+            p("        _engine_rt_sd_x[go], _engine_rt_sd_y[go],")
+            p("        _engine_rt_pivot_x[go], _engine_rt_pivot_y[go],")
+            p("        &cx, &cy, &w, &h);")
+            p("    *ox = cx + (_engine_rt_pivot_x[go] - 0.5f) * w - pw * 0.5f;")
+            p("    *oy = cy + (_engine_rt_pivot_y[go] - 0.5f) * h - ph * 0.5f;")
+            p("}")
+            p("static float RectTransform_get_localPosition_x(int go) {")
+            p("    float x, y; _engine_rt_local_pivot(go, &x, &y); return x;")
+            p("}")
+            p("static float RectTransform_get_localPosition_y(int go) {")
+            p("    float x, y; _engine_rt_local_pivot(go, &x, &y); return y;")
+            p("}")
+            p("static Vector2 RectTransform_get_localPosition(int go) {")
+            p("    return Vector2_make(RectTransform_get_localPosition_x(go),")
+            p("                        RectTransform_get_localPosition_y(go));")
+            p("}")
+            p("/* localPosition moves the pivot; anchoredPosition offsets it")
+            p("   from the anchor by the same amount, so apply the delta. */")
+            p("static void RectTransform_set_localPosition_xy("
+              "int go, float x, float y) {")
+            p("    float cx, cy;")
+            p("    _engine_rt_local_pivot(go, &cx, &cy);")
+            p("    RectTransform_set_anchoredPosition_xy(")
+            p("        go,")
+            p("        RectTransform_get_anchoredPosition_x(go) + (x - cx),")
+            p("        RectTransform_get_anchoredPosition_y(go) + (y - cy));")
+            p("}")
+            p("static void RectTransform_set_localPosition("
+              "int go, Vector2 v) {")
+            p("    RectTransform_set_localPosition_xy("
+              "go, Vector2_x(v), Vector2_y(v));")
+            p("}")
+            if want_rect and plan.get("camera"):
+                p("/* UI layout space → world, the inverse of what the")
+                p("   camera does to draw it (same map as the pointer's). */")
+                p("static Vector2 _engine_ui_layout_to_world(Vector2 p) {")
+                p("    float vx, vy, vw, vh;")
+                p("    _engine_camera_viewport(&vx, &vy, &vw, &vh);")
+                p("    return Camera_main_ScreenToWorldPoint(Vector2_make(")
+                p("        vx + Vector2_x(p) * (vw / _engine_ui_layout_w),")
+                p("        vy + Vector2_y(p) * (vh / _engine_ui_layout_h)));")
+                p("}")
+                p("/* Extensions.GetWorldRect — the element's rect in world")
+                p("   units: the UI rect the engine lays out in screen space,")
+                p("   through the same camera map ScreenToWorldPoint uses. */")
+                p("static Rect RectTransform_GetWorldRect(int go) {")
+                p("    float cx, cy, w, h;")
+                p("    Vector2 lo, hi;")
+                p("    _engine_ui_screen_rect(go, _engine_ui_layout_w,")
+                p("                           _engine_ui_layout_h,")
+                p("                           &cx, &cy, &w, &h);")
+                p("    if (w < 0.f) w = -w;")
+                p("    if (h < 0.f) h = -h;")
+                p("    lo = _engine_ui_layout_to_world(")
+                p("        Vector2_make(cx - w * 0.5f, cy - h * 0.5f));")
+                p("    hi = _engine_ui_layout_to_world(")
+                p("        Vector2_make(cx + w * 0.5f, cy + h * 0.5f));")
+                p("    return Rect_make(")
+                p("        Vector2_x(lo), Vector2_y(lo),")
+                p("        Vector2_x(hi) - Vector2_x(lo),")
+                p("        Vector2_y(hi) - Vector2_y(lo));")
+                p("}")
             p("")
         if want_ui:
             go_active = plan.get("go_active") or [1] * go_authored_n
@@ -13804,6 +14033,24 @@ def emit_engine(plan, analyses, used_apis):
                           "(unsigned)_engine_ui_sl_call_inst[j]);"
                           % (hidn, hmethod))
                 p("    }")
+                p("}")
+                p("/* `slider.value` on an authored Slider field: the field")
+                p("   packs as the component's GameObject. */")
+                p("static int _engine_ui_sl_of_go(int go) {")
+                p("    int i;")
+                p("    if (go < 0) return -1;")
+                p("    for (i = 0; i < _engine_ui_slider_count; i = i + 1)")
+                p("        if (_engine_ui_sl_go[i] == go) return i;")
+                p("    return -1;")
+                p("}")
+                p("static float Slider_get_value(int go) {")
+                p("    int si = _engine_ui_sl_of_go(go);")
+                p("    if (si < 0) return 0.f;")
+                p("    return _engine_ui_sl_value[si];")
+                p("}")
+                p("static void Slider_set_value(int go, float v) {")
+                p("    int si = _engine_ui_sl_of_go(go);")
+                p("    if (si >= 0) _engine_ui_sl_set_value(si, v);")
                 p("}")
                 p("static void _engine_ui_sl_drag_to(int si, float px, float py,"
                   " float sw, float sh) {")
@@ -15659,6 +15906,18 @@ def emit_engine(plan, analyses, used_apis):
     if _handle_targets:
         p("")
 
+    # A component-reference field read through another class's handle
+    # (`scrollbar.handleTrs`) is reached from that class's group, which may
+    # come first: declare the accessors up front, as the `_AT` macros are.
+    _go_accessors = [
+        (_c_ident(_cn), _n)
+        for _cn, _cl in sorted(plan["classes"].items())
+        for _n, _t, _b, _k in _cl["members"] if _k == "go"]
+    for _oidn, _n in _go_accessors:
+        p("static int %s_get_%s(unsigned i);" % (_oidn, _n))
+        p("static void %s_set_%s(unsigned i, int v);" % (_oidn, _n))
+    if _go_accessors:
+        p("")
 
     # Nullary instance methods, by (class, name), for the interface ticks.
     emitted_syms = {}
@@ -15742,11 +16001,12 @@ def emit_engine(plan, analyses, used_apis):
                   % (idn, name, idn, name))
                 p("static void %s_set_%s(unsigned i, float v) { %s_AT(i).%s = v; }"
                   % (idn, name, idn, name))
-            elif str(kind).startswith("idx:"):
-                # A handle: an index into another class's array, or null.
-                # Null is the field's all-ones value -- an index can be 0,
-                # and a narrow unsigned field cannot hold -1 -- read back as
-                # -1, so `x != null` (`!= -1`) compares signed with signed.
+            elif kind == "go" or str(kind).startswith("idx:"):
+                # A handle: a GameObject index, or an index into another
+                # class's array, or null. Null is the field's all-ones value
+                # -- an index can be 0, and a narrow unsigned field cannot
+                # hold -1 -- read back as -1, so `x != null` (`!= -1`)
+                # compares signed with signed.
                 sent = _idx_null(bits)
                 p("static int %s_get_%s(unsigned i) { unsigned v = %s_AT(i).%s;"
                   " return v == %su ? -1 : (int)v; }"
@@ -17818,6 +18078,152 @@ def _rewrite_transform_parent(text, cl, plan):
         text)
 
 
+#: A cast between a GameObject and one of its components is a no-op here:
+#: both are the same GO index (`(RectTransform) handleTrs.parent`).
+_GO_CAST_TYPES = ("RectTransform", "Transform", "GameObject")
+
+#: uGUI components whose `value` the engine's own UI tables hold.
+_GO_VALUE_COMPONENTS = ("Scrollbar", "Slider")
+
+
+def _go_handle_receivers(text, cl, plan):
+    """Expressions in a body that name a GameObject, as (pattern, C, C# type).
+
+    A GO-handle field of this class (`handleTrs`), the same reached through
+    another class's handle (`scrollbar.handleTrs`), and a local declared
+    with a component type (`RectTransform slidingArea = ..`). Qualified
+    forms come first, so a bare field name cannot match the tail of one.
+    The C expression keeps bare field names: `lower_packed_fields` turns
+    those into the packed accessor afterwards.
+    """
+    classes = plan.get("classes") or {}
+    field_ty = {f["name"]: f.get("ty") for f in cl.get("fields") or []}
+    out = []
+    for hname, _t, _b, kind in cl.get("members") or []:
+        if not str(kind).startswith("idx:"):
+            continue
+        other = kind.split(":", 1)[1]
+        ocl = classes.get(other)
+        if not ocl:
+            continue
+        oty = {f["name"]: f.get("ty") for f in ocl.get("fields") or []}
+        for on, _t2, _b2, ok in ocl.get("members") or []:
+            if ok != "go":
+                continue
+            out.append((
+                r"(?<![\w.])%s\s*\.\s*%s\b" % (re.escape(hname),
+                                               re.escape(on)),
+                "%s_get_%s(%s)" % (_c_ident(other), on, hname),
+                oty.get(on)))
+    named = {n: field_ty.get(n) for n, _t, _b, k in cl.get("members") or []
+             if k == "go"}
+    decl = r"(?<![\w.])(%s)\s+(\w+)\s*[=;]" % "|".join(
+        re.escape(t) for t in sorted(_GO_HANDLE_FIELD_TYPES))
+    for m in re.finditer(decl, cs2cpp._blank(text)):
+        named[m.group(2)] = m.group(1)
+    for n in sorted(named):
+        out.append((r"(?<![\w.])%s\b" % re.escape(n), n, named[n]))
+    return out
+
+
+def _rewrite_go_handle_members(text, cl, plan):
+    """Component references as GameObject indices: `handleTrs.parent`, `.rect`.
+
+    An authored `Transform` / `RectTransform` / uGUI field packs as the GO
+    it names, and every engine helper for those takes a GO. What is left is
+    the member syntax, which C does not have: each property becomes the
+    helper call, on the receiver's GO.
+    """
+    recvs = _go_handle_receivers(text, cl, plan)
+    if not recvs:
+        return text
+    text = cs2cpp.code_sub(
+        r"\(\s*(?:UnityEngine\.)?(?:%s)\s*\)\s*" % "|".join(_GO_CAST_TYPES),
+        "", text)
+    for pat, expr, ty in recvs:
+        for prop, fn in (("width", "RectTransform_get_rect_width"),
+                         ("height", "RectTransform_get_rect_height"),
+                         ("x", "RectTransform_get_rect_x"),
+                         ("y", "RectTransform_get_rect_y")):
+            text = cs2cpp.code_sub(
+                pat + r"\s*\.\s*rect\s*\.\s*%s\b" % prop,
+                lambda m, f=fn, e=expr: "%s(%s)" % (f, e), text)
+        text = cs2cpp.code_sub(
+            pat + r"\s*\.\s*rect\b(?!\s*\.)",
+            lambda m, e=expr: "RectTransform_get_rect(%s)" % e, text)
+        text = cs2cpp.code_sub(
+            pat + r"\s*\.\s*GetWorldRect\s*\(\s*\)",
+            lambda m, e=expr: "RectTransform_GetWorldRect(%s)" % e, text)
+        # Assignment before the read, or the read pattern eats the `=`.
+        text = cs2cpp.code_sub(
+            pat + r"\s*\.\s*localPosition\s*=\s*([^;]+);",
+            lambda m, e=expr: (
+                "RectTransform_set_localPosition_xy(%s, Vector2_x(%s), "
+                "Vector2_y(%s));" % (e, m.group(1).strip(),
+                                     m.group(1).strip())),
+            text)
+        for axis in ("x", "y"):
+            text = cs2cpp.code_sub(
+                pat + r"\s*\.\s*localPosition\s*\.\s*%s\b" % axis,
+                lambda m, a=axis, e=expr: (
+                    "RectTransform_get_localPosition_%s(%s)" % (a, e)),
+                text)
+        text = cs2cpp.code_sub(
+            pat + r"\s*\.\s*localPosition\b",
+            lambda m, e=expr: "RectTransform_get_localPosition(%s)" % e, text)
+        if ty in _GO_VALUE_COMPONENTS:
+            text = cs2cpp.code_sub(
+                pat + r"\s*\.\s*value\s*=\s*([^;]+);",
+                lambda m, t=ty, e=expr: "%s_set_value(%s, %s);" % (
+                    t, e, m.group(1).strip()),
+                text)
+            text = cs2cpp.code_sub(
+                pat + r"\s*\.\s*value\b",
+                lambda m, t=ty, e=expr: "%s_get_value(%s)" % (t, e), text)
+        text = cs2cpp.code_sub(
+            pat + r"\s*\.\s*parent\b",
+            lambda m, e=expr: "Transform_get_parent(%s)" % e, text)
+    return text
+
+
+def _rewrite_vector2_axis_scale(text):
+    """`Vector2.up * x` → its components. C has no `Vector2 * float`."""
+    axes = {"up": ("0.f", "%s"), "down": ("0.f", "-%s"),
+            "right": ("%s", "0.f"), "left": ("-%s", "0.f"),
+            "one": ("%s", "%s")}
+    pat = re.compile(
+        r"(?<![\w.])(?:UnityEngine\.)?Vector2\s*\.\s*"
+        r"(up|down|left|right|one)\s*\*\s*")
+    out = []
+    i = 0
+    while True:
+        m = pat.search(cs2cpp._blank(text), i)
+        if not m:
+            out.append(text[i:])
+            break
+        out.append(text[i:m.start()])
+        j = m.end()
+        scalar = None
+        if j < len(text) and text[j] == "(":
+            parsed = _match_call_args(text, j)
+            if parsed:
+                scalar, j = "(%s)" % parsed[0], parsed[1]
+        else:
+            tm = re.match(r"[\w.]+", text[j:])
+            if tm:
+                scalar, j = tm.group(0), j + tm.end()
+        if scalar is None:
+            out.append(text[m.start():m.end()])
+            i = m.end()
+            continue
+        fx, fy = axes[m.group(1)]
+        out.append("Vector2_make(%s, %s)" % (
+            fx % scalar if "%s" in fx else fx,
+            fy % scalar if "%s" in fy else fy))
+        i = j
+    return "".join(out)
+
+
 #: Emitted helpers that hand back a `Rect` — a receiver its properties read.
 _RECT_VALUE_CALLS = ("RectTransform_GetWorldRect", "RectTransform_get_rect",
                      "Rect_MinMaxRect", "Rect_make")
@@ -19421,6 +19827,10 @@ _UNITY_API_MATHF = [_B("Mathf." + m, "Mathf_" + m)
 _UNITY_API_RECT = [
     _B("Rect.PointToNormalized", "Rect_PointToNormalized", namespaces=_UE),
     _B("Rect.MinMaxRect", "Rect_MinMaxRect", namespaces=_UE),
+    _B("Camera.main.ScreenToWorldPoint", "Camera_main_ScreenToWorldPoint",
+       namespaces=_UE),
+    _B("Mouse.current.position.ReadValue", "Mouse_current_position",
+       namespaces=("UnityEngine.InputSystem",)),
 ]
 
 
@@ -19543,6 +19953,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = _rewrite_quaternion_angle(text, cl)
     text = _rewrite_local_rotation_reads(text, cl, plan)
     text = _rewrite_transform_parent(text, cl, plan)
+    text = _rewrite_go_handle_members(text, cl, plan)
     text = _rewrite_recttransform_apis(text, cl, plan)
     text = _rewrite_transform_set_parent(text, cl, plan)
     text = _rewrite_transform_get_sibling_index(text, cl, plan)
@@ -19721,6 +20132,7 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = cs2cpp.code_sub(
         r"(?<![\w.])new\s+Rect\s*\(",
         "Rect_make(", text)
+    text = _rewrite_vector2_axis_scale(text)
     # new Vector2(a, b) / Vector2(a, b) → Vector2_make; static presets.
     text = cs2cpp.code_sub(
         r"(?<![\w.])new\s+Vector2\s*\(",
@@ -20471,10 +20883,17 @@ def emit_data(plan, used_apis=None):
             p("")
         p("%s _%s_inst_array[%d] = {" % (idn, idn, cap))
         mb_index = _mb_index(plan)
-        for o in cl["instances"]:
+        go_refs = plan.get("go_field_refs") or {}
+        for inst_i, o in enumerate(cl["instances"]):
             parts = []
             sx, sy, sz = _instance_storage_pos(o)
             for name, ty, bits, kind in cl["members"]:
+                if kind == "go":
+                    row = go_refs.get((cname, name)) or []
+                    go = row[inst_i] if inst_i < len(row) else -1
+                    parts.append(str(int(go)) if int(go) >= 0
+                                 else "%du" % _idx_null(bits))
+                    continue
                 if name == "pos_x":
                     parts.append(_init_num(sx, kind))
                 elif name == "pos_y":
@@ -21930,6 +22349,7 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
     plan["go_audiosource"] = go_as
     plan["audiosource_by_file_id"] = as_by_fid
     plan["audioclip_guids"] = clip_guids
+    _resolve_go_field_refs(plan)
     _attach_transform_parents(plan)
     if "transform.SetParent" in used_apis:
         plan["has_transform_parents"] = True

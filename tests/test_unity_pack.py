@@ -2925,6 +2925,283 @@ class TestSystems(unittest.TestCase):
         self.assertNotIn("unlowered C#", upd)
         self.assertNotIn("Sel.instances", eng)
 
+    def _write_scrollbar_like_project(self):
+        """A `_Scrollbar`-shaped project: Transform / uGUI fields on a scene
+        Scrollbar, a nested drag helper, and the GetWorldRect extension."""
+        root = tempfile.mkdtemp(prefix="upack-bar-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+
+        def w(name, text, guid):
+            with open(os.path.join(scripts, name), "w") as f:
+                f.write(text)
+            with open(os.path.join(scripts, name + ".meta"), "w") as f:
+                f.write("guid: %s\n" % guid)
+
+        w("IUpdatable.cs",
+          "public interface IUpdatable\n{\n    void DoUpdate ();\n}\n",
+          "1a" * 16)
+        w("RectTransformExtensions.cs",
+          "using UnityEngine;\n"
+          "namespace Extensions {\n"
+          "  public static class RectTransformExtensions {\n"
+          "    public static Rect GetWorldRect (this RectTransform r) {\n"
+          "      Vector2 min = r.TransformPoint(r.rect.min);\n"
+          "      Vector2 max = r.TransformPoint(r.rect.max);\n"
+          "      return Rect.MinMaxRect(min.x, min.y, max.x, max.y);\n"
+          "    }\n"
+          "  }\n"
+          "}\n",
+          "2b" * 16)
+        w("GM.cs",
+          "using UnityEngine;\n"
+          "public class GM : MonoBehaviour {\n"
+          "    public static IUpdatable[] updatables = new IUpdatable[0];\n"
+          "    void Update () {\n"
+          "        for (int i = 0; i < updatables.Length; i ++) {\n"
+          "            IUpdatable updatable = updatables[i];\n"
+          "            updatable.DoUpdate ();\n"
+          "        }\n"
+          "    }\n"
+          "}\n",
+          "3c" * 16)
+        w("Bar.cs",
+          "using Extensions;\n"
+          "using UnityEngine;\n"
+          "using UnityEngine.UI;\n"
+          "using UnityEngine.InputSystem;\n"
+          "public class Bar : MonoBehaviour, IUpdatable {\n"
+          "  public Scrollbar scrollbar;\n"
+          "  public Transform handleTrs;\n"
+          "  public RectTransform contentRectTrs;\n"
+          "  DragUpdater dragUpdater;\n"
+          "  void Awake () {\n"
+          "    dragUpdater = new DragUpdater(this);\n"
+          "    RectTransform slidingArea = (RectTransform) handleTrs.parent;\n"
+          "    handleTrs.localPosition = Vector2.up * (slidingArea.rect.height"
+          " * scrollbar.value - slidingArea.rect.height / 2);\n"
+          "  }\n"
+          "  public void StartDrag () {\n"
+          "    GM.updatables = GM.updatables.Add(dragUpdater);\n"
+          "  }\n"
+          "  public void EndDrag () {\n"
+          "    GM.updatables = GM.updatables.Remove(dragUpdater);\n"
+          "  }\n"
+          "  public void DoUpdate () {\n"
+          "    RectTransform viewportRectTrs ="
+          " (RectTransform) contentRectTrs.parent;\n"
+          "    Rect rect = viewportRectTrs.GetWorldRect();\n"
+          "    Vector2 center = rect.center;\n"
+          "    rect.height -= contentRectTrs.GetWorldRect().size.y;\n"
+          "    rect.center = center;\n"
+          "    float value = Rect.PointToNormalized(rect,"
+          " contentRectTrs.GetWorldRect().center).y;\n"
+          "    RectTransform slidingArea = (RectTransform) handleTrs.parent;\n"
+          "    handleTrs.localPosition = Vector2.up * (slidingArea.rect.height"
+          " * value - slidingArea.rect.height / 2);\n"
+          "  }\n"
+          "  class DragUpdater : IUpdatable {\n"
+          "    Bar scrollbar;\n"
+          "    public DragUpdater (Bar scrollbar) {\n"
+          "      this.scrollbar = scrollbar;\n"
+          "    }\n"
+          "    public void DoUpdate () {\n"
+          "      float value = scrollbar.scrollbar.value;\n"
+          "      RectTransform slidingArea ="
+          " (RectTransform) scrollbar.handleTrs.parent;\n"
+          "      value = Rect.PointToNormalized(slidingArea.GetWorldRect(),"
+          " Camera.main.ScreenToWorldPoint("
+          "Mouse.current.position.ReadValue())).y;\n"
+          "      scrollbar.handleTrs.localPosition = Vector2.up *"
+          " (slidingArea.rect.height * value"
+          " - slidingArea.rect.height / 2);\n"
+          "      scrollbar.scrollbar.value = value;\n"
+          "    }\n"
+          "  }\n"
+          "}\n",
+          "4d" * 16)
+        sbar = "2a4db7a114972834c8e4117be1d82ba3"
+        img = "fe87c0e1cc204ed48ad3b37840f39efc"
+        builtin = "0000000000000000f000000000000000"
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &100\nGameObject:\n  m_Name: Main Camera\n"
+                "  m_TagString: MainCamera\n"
+                "  m_Component:\n  - component: {fileID: 101}\n"
+                "  - component: {fileID: 102}\n"
+                "--- !u!4 &101\nTransform:\n"
+                "  m_GameObject: {fileID: 100}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: -10}\n"
+                "--- !u!20 &102\nCamera:\n"
+                "  m_GameObject: {fileID: 100}\n"
+                "  orthographic: 1\n"
+                "  orthographic size: 5\n"
+                "  m_BackGroundColor: {r: 0, g: 0, b: 0, a: 1}\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Canvas\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!224 &2\nRectTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 0, y: 0}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!223 &3\nCanvas:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n"
+                "--- !u!1 &20\nGameObject:\n  m_Name: Viewport\n"
+                "  m_Component:\n  - component: {fileID: 21}\n"
+                "--- !u!224 &21\nRectTransform:\n"
+                "  m_GameObject: {fileID: 20}\n"
+                "  m_Father: {fileID: 2}\n"
+                "  m_Children:\n  - {fileID: 31}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 0, y: 0}\n"
+                "  m_Pivot: {x: 0, y: 1}\n"
+                "--- !u!1 &30\nGameObject:\n  m_Name: Content\n"
+                "  m_Component:\n  - component: {fileID: 31}\n"
+                "--- !u!224 &31\nRectTransform:\n"
+                "  m_GameObject: {fileID: 30}\n"
+                "  m_Father: {fileID: 21}\n"
+                "  m_AnchorMin: {x: 0, y: 1}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 0, y: 600}\n"
+                "  m_Pivot: {x: 0, y: 1}\n"
+                "--- !u!1 &40\nGameObject:\n  m_Name: Scrollbar\n"
+                "  m_Component:\n  - component: {fileID: 41}\n"
+                "  - component: {fileID: 42}\n"
+                "  - component: {fileID: 43}\n"
+                "--- !u!224 &41\nRectTransform:\n"
+                "  m_GameObject: {fileID: 40}\n"
+                "  m_Father: {fileID: 2}\n"
+                "  m_Children:\n  - {fileID: 71}\n"
+                "  m_AnchorMin: {x: 1, y: 0}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 20, y: 0}\n"
+                "  m_Pivot: {x: 1, y: 1}\n"
+                "--- !u!114 &42\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 40}\n"
+                "  m_Enabled: 1\n"
+                "  m_Interactable: 1\n"
+                "  m_Script: {fileID: 11500000, guid: " + sbar + "}\n"
+                "  m_HandleRect: {fileID: 51}\n"
+                "  m_Direction: 2\n"
+                "  m_Value: 1\n"
+                "  m_Size: 0.5\n"
+                "--- !u!114 &43\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 40}\n"
+                "  m_Enabled: 1\n"
+                "  m_Script: {fileID: 11500000, guid: " + "4d" * 16 + "}\n"
+                "  scrollbar: {fileID: 42}\n"
+                "  handleTrs: {fileID: 51}\n"
+                "  contentRectTrs: {fileID: 31}\n"
+                "--- !u!1 &70\nGameObject:\n  m_Name: Sliding Area\n"
+                "  m_Component:\n  - component: {fileID: 71}\n"
+                "--- !u!224 &71\nRectTransform:\n"
+                "  m_GameObject: {fileID: 70}\n"
+                "  m_Father: {fileID: 41}\n"
+                "  m_Children:\n  - {fileID: 51}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: -20, y: -20}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!1 &50\nGameObject:\n  m_Name: Handle\n"
+                "  m_Component:\n  - component: {fileID: 51}\n"
+                "  - component: {fileID: 52}\n"
+                "--- !u!224 &51\nRectTransform:\n"
+                "  m_GameObject: {fileID: 50}\n"
+                "  m_Father: {fileID: 71}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 0, y: 0}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 20, y: 20}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!114 &52\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 50}\n"
+                "  m_Enabled: 1\n"
+                "  m_Script: {fileID: 11500000, guid: " + img + "}\n"
+                "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+                "  m_Sprite: {fileID: 10913, guid: " + builtin + ", type: 0}\n"
+                "--- !u!1 &80\nGameObject:\n  m_Name: GM\n"
+                "  m_Component:\n  - component: {fileID: 81}\n"
+                "  - component: {fileID: 82}\n"
+                "--- !u!4 &81\nTransform:\n"
+                "  m_GameObject: {fileID: 80}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &82\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 80}\n"
+                "  m_Script: {fileID: 11500000, guid: " + "3c" * 16 + "}\n"
+            )
+        return root
+
+    def test_component_fields_pack_as_gameobject_indices(self):
+        """Transform / uGUI fields → GO index; rect, localPosition, value."""
+        root = self._write_scrollbar_like_project()
+        d = tempfile.mkdtemp(prefix="upack-bar-out-")
+        plan = unity_pack.pack(root, d)
+        # Every component reference resolves to the GameObject it names.
+        refs = plan.get("go_field_refs") or {}
+        names = plan.get("go_names") or []
+        for field, want in (("handleTrs", "Handle"),
+                            ("contentRectTrs", "Content"),
+                            ("scrollbar", "Scrollbar")):
+            go = refs[("Bar", field)][0]
+            self.assertGreaterEqual(go, 0, field)
+            self.assertEqual(names[go], want, field)
+        members = {n: k for n, _t, _b, k in plan["classes"]["Bar"]["members"]}
+        self.assertEqual(members["handleTrs"], "go")
+        self.assertEqual(members["contentRectTrs"], "go")
+        self.assertEqual(members["scrollbar"], "go")
+        with open(os.path.join(d, "engine.cpp")) as f:
+            eng = f.read()
+        awake = self._emitted_body(eng, "Bar_Awake")
+        self.assertIn("Transform_get_parent(Bar_get_handleTrs(i))", awake)
+        self.assertIn("RectTransform_get_rect_height(slidingArea)", awake)
+        self.assertIn("Scrollbar_get_value(Bar_get_scrollbar(i))", awake)
+        self.assertIn("RectTransform_set_localPosition_xy(", awake)
+        self.assertNotIn("unlowered C#", awake)
+
+    def test_get_world_rect_camera_and_mouse_lower(self):
+        """GetWorldRect / ScreenToWorldPoint / Mouse position + Rect props."""
+        root = self._write_scrollbar_like_project()
+        d = tempfile.mkdtemp(prefix="upack-bar-wr-")
+        unity_pack.pack(root, d)
+        with open(os.path.join(d, "engine.cpp")) as f:
+            eng = f.read()
+        self.assertIn("static Rect RectTransform_GetWorldRect(int go)", eng)
+        self.assertIn(
+            "static Vector2 Camera_main_ScreenToWorldPoint(Vector2 p)", eng)
+        self.assertIn("static Vector2 Mouse_current_position(void)", eng)
+        upd = self._emitted_body(eng, "Bar_DoUpdate")
+        # Rect properties are functions; its fields stay fields.
+        self.assertIn("Rect rect = RectTransform_GetWorldRect(", upd)
+        self.assertIn("Vector2 center = Rect_center(rect);", upd)
+        self.assertIn("rect.height -= Rect_size_y(", upd)
+        self.assertIn("Rect_set_center(&rect, center);", upd)
+        self.assertIn("Vector2_y(Rect_PointToNormalized(", upd)
+        self.assertNotIn("unlowered C#", upd)
+        drag = self._emitted_body(eng, "DragUpdater_DoUpdate")
+        self.assertIn(
+            "Camera_main_ScreenToWorldPoint(Mouse_current_position())", drag)
+        self.assertIn("RectTransform_GetWorldRect(slidingArea)", drag)
+        self.assertIn("Scrollbar_set_value(", drag)
+        self.assertNotIn("unlowered C#", drag)
+        # The drag helper still registers through the IUpdatable array.
+        self.assertIn("_engine_iref_push(GM_updatables, ",
+                      self._emitted_body(eng, "Bar_StartDrag"))
+        self.assertIn("_engine_iref_erase(GM_updatables, ",
+                      self._emitted_body(eng, "Bar_EndDrag"))
+
     def test_rect_point_to_normalized(self):
         """Rect.PointToNormalized(r, p) → the clamped [0,1] rect helper."""
         root = tempfile.mkdtemp(prefix="upack-rectptn-")

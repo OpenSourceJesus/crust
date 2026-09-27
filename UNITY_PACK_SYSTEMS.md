@@ -418,6 +418,38 @@ name `"(Clone)"`, and wire live `_engine_go_T` / parent tables. Prefab /
 position / rotation overloads stay unlowered (public helpers that still
 contain them are stubbed).
 
+## Component reference fields (Transform / RectTransform / uGUI)
+
+An authored field holding a component is packed as the **GameObject index**
+it names: Transform ≡ RectTransform ≡ GameObject here, and every engine
+helper for them takes a GO. The scene's fileID — a Transform's, a uGUI
+component's, or a GameObject's — resolves to that one GO slot; an empty
+reference is null (`-1`), not GO 0.
+
+| Script uses | Emitted |
+|-------------|---------|
+| `public Transform handleTrs` / `RectTransform` / `Image` / `Scrollbar` / … | `go` member; `Owner_get_handleTrs(i)` → GO index |
+| `(RectTransform) x` / `(Transform) x` | The same index — the cast is dropped |
+| `handleTrs.parent` | `Transform_get_parent(go)` (live parent table) |
+| `rt.rect.width` / `.height` / `.x` / `.y` / `rt.rect` | `RectTransform_get_rect_*(go)` — Unity's local rect: size before `localScale`, pivot at the origin |
+| `rt.localPosition` get / set | `RectTransform_get/set_localPosition_*` — the pivot in the parent's rect, origin at its centre; the setter moves `anchoredPosition` by the same delta |
+| `rt.GetWorldRect()` (`Extensions`) | `RectTransform_GetWorldRect(go)` — the laid-out UI rect through the camera map |
+| `scrollbar.value` / `slider.value` get / set | `Scrollbar_get/set_value(go)` — the engine's own UI tables, so a set fires `onValueChanged` and moves the handle |
+| `Camera.main.ScreenToWorldPoint(p)` | `Camera_main_ScreenToWorldPoint` — orthographic, in the camera's `Camera.rect` viewport |
+| `Mouse.current.position.ReadValue()` | `Mouse_current_position()` → host pointer, screen px from bottom-left |
+| `Vector2.up * x` (and `down`/`left`/`right`/`one`) | `Vector2_make(0.f, x)` — C has no `Vector2 * float` |
+
+`GetWorldRect` is the camera-inverse of the element's laid-out screen rect,
+so it is in the same world units as `ScreenToWorldPoint` — the two compare,
+which is what the drag idiom `PointToNormalized(rect.GetWorldRect(),
+Camera.main.ScreenToWorldPoint(mouse))` needs. It is exact for UI the main
+orthographic camera draws (Screen Space – Camera / World Space).
+
+`Rect` packs as a C struct: `x` / `y` / `width` / `height` are fields in
+both languages, while `center`, `size`, `min` and `max` are C# properties
+and become `Rect_center(r)` etc.; `rect.center = v` moves the rect through
+`Rect_set_center`.
+
 ## Static reference arrays (`T[]`, interfaces) and `new`
 
 A `static T[]` of a packed class or an authored interface is the collection
