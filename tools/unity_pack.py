@@ -2076,6 +2076,10 @@ _IMAGE_SCRIPT_GUID = "fe87c0e1cc204ed48ad3b37840f39efc"
 _BUTTON_SCRIPT_GUID = "4e29b1a8efbd4b44bb3f3716e73f07ff"
 # UnityEngine.UI.Slider (handle/fill anchors driven by m_Value).
 _SLIDER_SCRIPT_GUID = "67db9e8f0e2ae9c40bc1e2b64352a6b4"
+# UnityEngine.UI.Scrollbar / ScrollRect / Toggle.
+_SCROLLBAR_SCRIPT_GUID = "2a4db7a114972834c8e4117be1d82ba3"
+_SCROLLRECT_SCRIPT_GUID = "1aa08ab6e0800fa44ae55d278d1423e3"
+_TOGGLE_SCRIPT_GUID = "9085046f02f69544eb97fd06b6048fe2"
 # TextMeshProUGUI (com.unity.ugui / Unity.TextMeshPro).
 _TMP_UGUI_SCRIPT_GUID = "f4688fdb7df04437aeb418b961361dc5"
 # uGUI layout controllers (authored Vertical/HorizontalLayoutGroup).
@@ -2208,6 +2212,177 @@ def _parse_ui_slider(block, file_id=None):
         "max": _f("m_MaxValue", 1.0),
         "value": _f("m_Value", 0.0),
         "whole_numbers": _i("m_WholeNumbers", 0),
+        "on_value_changed": calls,
+        "mb_file_id": file_id,
+    }
+
+
+def _is_ui_scrollbar_mb(block, guid):
+    """True for builtin Scrollbar (HandleRect + Size, no Min/MaxValue)."""
+    if (guid or "").lower() == _SCROLLBAR_SCRIPT_GUID:
+        return True
+    if re.search(
+            r"(?m)^\s+m_EditorClassIdentifier:.*(?:^|[.\s:])Scrollbar\s*$",
+            block):
+        return True
+    if (re.search(r"(?m)^\s+m_HandleRect:\s*", block)
+            and re.search(r"(?m)^\s+m_Size:\s*", block)
+            and not re.search(r"(?m)^\s+m_MinValue:\s*", block)):
+        return True
+    return False
+
+
+def _parse_ui_scrollbar(block, file_id=None):
+    """Authored uGUI Scrollbar → value/size/direction/handle/onValueChanged."""
+    def _fid(key):
+        m = re.search(
+            r"(?m)^\s+%s:\s*\{fileID:\s*(-?\d+)" % re.escape(key), block)
+        return int(m.group(1)) if m else 0
+
+    def _f(key, default):
+        m = re.search(
+            r"(?m)^\s+%s:\s*([0-9.eE+-]+)" % re.escape(key), block)
+        return float(m.group(1)) if m else float(default)
+
+    def _i(key, default):
+        m = re.search(r"(?m)^\s+%s:\s*(-?\d+)" % re.escape(key), block)
+        return int(m.group(1)) if m else int(default)
+
+    calls = []
+    oc = re.search(r"(?m)^\s+m_OnValueChanged:\s*$", block)
+    if oc:
+        chunk = block[oc.end():]
+        stop = re.search(r"(?m)^---\s", chunk)
+        if stop:
+            chunk = chunk[:stop.start()]
+        for cm in re.finditer(
+                r"m_Target:\s*\{fileID:\s*(-?\d+)\}[\s\S]*?"
+                r"m_MethodName:\s*(\w+)[\s\S]*?"
+                r"m_Mode:\s*(\d+)",
+                chunk):
+            tid = int(cm.group(1))
+            if tid == 0:
+                continue
+            calls.append({
+                "target_go": str(tid),
+                "method": cm.group(2),
+                "mode": int(cm.group(3)),
+            })
+    interactable = _i("m_Interactable", 1)
+    enabled = _mb_enabled(block)
+    if not enabled:
+        interactable = 0
+    return {
+        "enabled": enabled,
+        "interactable": interactable,
+        "handle_rect_id": _fid("m_HandleRect"),
+        "direction": _i("m_Direction", 0),
+        "value": _f("m_Value", 0.0),
+        "size": _f("m_Size", 0.2),
+        "on_value_changed": calls,
+        "mb_file_id": file_id,
+    }
+
+
+def _is_ui_scrollrect_mb(block, guid):
+    if (guid or "").lower() == _SCROLLRECT_SCRIPT_GUID:
+        return True
+    if re.search(
+            r"(?m)^\s+m_EditorClassIdentifier:.*(?:^|[.\s:])ScrollRect\s*$",
+            block):
+        return True
+    if (re.search(r"(?m)^\s+m_Content:\s*", block)
+            and re.search(r"(?m)^\s+m_Viewport:\s*", block)):
+        return True
+    return False
+
+
+def _parse_ui_scrollrect(block, file_id=None):
+    """Authored uGUI ScrollRect → content/viewport/scrollbar links."""
+    def _fid(key):
+        m = re.search(
+            r"(?m)^\s+%s:\s*\{fileID:\s*(-?\d+)" % re.escape(key), block)
+        return int(m.group(1)) if m else 0
+
+    def _i(key, default):
+        m = re.search(r"(?m)^\s+%s:\s*(-?\d+)" % re.escape(key), block)
+        return int(m.group(1)) if m else int(default)
+
+    return {
+        "enabled": _mb_enabled(block),
+        "content_id": _fid("m_Content"),
+        "viewport_id": _fid("m_Viewport"),
+        "horizontal": _i("m_Horizontal", 1),
+        "vertical": _i("m_Vertical", 1),
+        "hbar_mb_id": _fid("m_HorizontalScrollbar"),
+        "vbar_mb_id": _fid("m_VerticalScrollbar"),
+        "mb_file_id": file_id,
+    }
+
+
+def _is_ui_toggle_mb(block, guid):
+    if (guid or "").lower() == _TOGGLE_SCRIPT_GUID:
+        return True
+    if re.search(
+            r"(?m)^\s+m_EditorClassIdentifier:.*(?:^|[.\s:])Toggle\s*$",
+            block):
+        return True
+    if (re.search(r"(?m)^\s+m_IsOn:\s*", block)
+            and (re.search(r"(?m)^\s+onValueChanged:\s*$", block)
+                 or re.search(r"(?m)^\s+m_OnValueChanged:\s*$", block))):
+        return True
+    return False
+
+
+def _parse_ui_toggle(block, file_id=None):
+    """Authored uGUI Toggle → isOn, graphic, onValueChanged (bool)."""
+    def _fid(key):
+        m = re.search(
+            r"(?m)^\s+%s:\s*\{fileID:\s*(-?\d+)" % re.escape(key), block)
+        return int(m.group(1)) if m else 0
+
+    def _i(key, default):
+        m = re.search(r"(?m)^\s+%s:\s*(-?\d+)" % re.escape(key), block)
+        return int(m.group(1)) if m else int(default)
+
+    calls = []
+    oc = re.search(r"(?m)^\s+(?:m_)?OnValueChanged:\s*$", block)
+    if not oc:
+        oc = re.search(r"(?m)^\s+onValueChanged:\s*$", block)
+    if oc:
+        chunk = block[oc.end():]
+        stop = re.search(r"(?m)^---\s", chunk)
+        if stop:
+            chunk = chunk[:stop.start()]
+        stop2 = re.search(r"(?m)^\s+m_IsOn:\s*", chunk)
+        if stop2:
+            chunk = chunk[:stop2.start()]
+        for cm in re.finditer(
+                r"m_Target:\s*\{fileID:\s*(-?\d+)\}[\s\S]*?"
+                r"m_MethodName:\s*(\w+)[\s\S]*?"
+                r"m_Mode:\s*(\d+)[\s\S]*?"
+                r"m_BoolArgument:\s*(\d+)",
+                chunk):
+            tid = int(cm.group(1))
+            if tid == 0:
+                continue
+            calls.append({
+                "target_go": str(tid),
+                "method": cm.group(2),
+                "mode": int(cm.group(3)),
+                "bool_arg": int(cm.group(4)),
+            })
+    interactable = _i("m_Interactable", 1)
+    if not _mb_enabled(block):
+        interactable = 0
+    graphic = _fid("graphic")
+    if not graphic:
+        graphic = _fid("m_Graphic")
+    return {
+        "enabled": _mb_enabled(block),
+        "interactable": interactable,
+        "is_on": _i("m_IsOn", 1),
+        "graphic_id": graphic,
         "on_value_changed": calls,
         "mb_file_id": file_id,
     }
@@ -3325,6 +3500,54 @@ def _apply_slider_visuals(objects):
                 rect["anchor_min"] = (float(amin[0]), float(amin[1]))
                 rect["anchor_max"] = (float(amax[0]), float(amax[1]))
                 f["rect"] = rect
+
+
+def _apply_scrollbar_visuals(objects):
+    """Bake Unity ``Scrollbar.UpdateVisuals`` into handle RectTransform anchors.
+
+    Handle spans ``size`` along the axis and sits at ``value * (1 - size)``.
+    """
+    by_xf = {}
+    for o in objects:
+        xid = o.get("xf_id")
+        if xid is not None and str(xid) not in ("", "0"):
+            by_xf[str(xid)] = o
+    for o in objects:
+        sb = o.get("ui_scrollbar")
+        if not sb:
+            continue
+        direction = int(sb.get("direction") or 0)
+        axis = 0 if direction in (0, 1) else 1
+        reverse = direction in (1, 3)
+        val = float(sb.get("value") or 0.0)
+        if val < 0.0:
+            val = 0.0
+        if val > 1.0:
+            val = 1.0
+        size = float(sb.get("size") or 0.2)
+        if size < 0.0:
+            size = 0.0
+        if size > 1.0:
+            size = 1.0
+        movement = val * (1.0 - size)
+        handle_id = int(sb.get("handle_rect_id") or 0)
+        if not handle_id:
+            continue
+        h = by_xf.get(str(handle_id))
+        if h is None or h.get("rect") is None:
+            continue
+        rect = dict(h["rect"])
+        amin = [0.0, 0.0]
+        amax = [1.0, 1.0]
+        if reverse:
+            amin[axis] = 1.0 - movement - size
+            amax[axis] = 1.0 - movement
+        else:
+            amin[axis] = movement
+            amax[axis] = movement + size
+        rect["anchor_min"] = (float(amin[0]), float(amin[1]))
+        rect["anchor_max"] = (float(amax[0]), float(amax[1]))
+        h["rect"] = rect
 
 
 _TMP_FONT_CACHE = {}
@@ -4550,6 +4773,12 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                 rec["ui_button"] = _parse_ui_button(block, file_id)
             elif _is_ui_slider_mb(block, g):
                 rec["ui_slider"] = _parse_ui_slider(block, file_id)
+            elif _is_ui_scrollbar_mb(block, g):
+                rec["ui_scrollbar"] = _parse_ui_scrollbar(block, file_id)
+            elif _is_ui_scrollrect_mb(block, g):
+                rec["ui_scrollrect"] = _parse_ui_scrollrect(block, file_id)
+            elif _is_ui_toggle_mb(block, g):
+                rec["ui_toggle"] = _parse_ui_toggle(block, file_id)
             elif _is_ui_tmp_mb(block, g):
                 rec["ui_tmp"] = _parse_ui_tmp(block, asset_guids)
             elif _is_vlayout_mb(block, g):
@@ -4819,6 +5048,9 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         ui_image = None
         ui_button = None
         ui_slider = None
+        ui_scrollbar = None
+        ui_scrollrect = None
+        ui_toggle = None
         ui_tmp = None
         layout_group = None
         layout_element = None
@@ -4867,6 +5099,12 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
                     ui_button = dict(k["ui_button"])
                 if k.get("ui_slider"):
                     ui_slider = dict(k["ui_slider"])
+                if k.get("ui_scrollbar"):
+                    ui_scrollbar = dict(k["ui_scrollbar"])
+                if k.get("ui_scrollrect"):
+                    ui_scrollrect = dict(k["ui_scrollrect"])
+                if k.get("ui_toggle"):
+                    ui_toggle = dict(k["ui_toggle"])
                 if k.get("ui_tmp"):
                     ui_tmp = dict(k["ui_tmp"])
                 if k.get("layout_group"):
@@ -5220,6 +5458,9 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
             "ui_image": ui_image,
             "ui_button": ui_button,
             "ui_slider": ui_slider,
+            "ui_scrollbar": ui_scrollbar,
+            "ui_scrollrect": ui_scrollrect,
+            "ui_toggle": ui_toggle,
             "ui_tmp": ui_tmp,
             "layout_group": layout_group,
             "layout_element": layout_element,
@@ -5319,6 +5560,9 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         by_id, objects, hierarchy, asset_guids, guid_to_script)
     _annotate_ui_button_onclick_targets(objects, by_id, guid_to_script)
     _annotate_ui_slider_onvaluechanged_targets(objects, by_id, guid_to_script)
+    _annotate_ui_scrollbar_onvaluechanged_targets(
+        objects, by_id, guid_to_script)
+    _annotate_ui_toggle_onvaluechanged_targets(objects, by_id, guid_to_script)
     return objects, lights, cameras, hierarchy
 
 
@@ -5716,6 +5960,17 @@ def _annotate_ui_slider_onvaluechanged_targets(objects, by_id, guid_to_script):
         objects, by_id, guid_to_script, "ui_slider", "on_value_changed")
 
 
+def _annotate_ui_scrollbar_onvaluechanged_targets(
+        objects, by_id, guid_to_script):
+    _annotate_ui_persistent_mb_targets(
+        objects, by_id, guid_to_script, "ui_scrollbar", "on_value_changed")
+
+
+def _annotate_ui_toggle_onvaluechanged_targets(objects, by_id, guid_to_script):
+    _annotate_ui_persistent_mb_targets(
+        objects, by_id, guid_to_script, "ui_toggle", "on_value_changed")
+
+
 def _annotate_ui_persistent_mb_targets(
         objects, by_id, guid_to_script, obj_key, calls_key):
     """Tag persistent UnityEvent calls with target_kind / target_class."""
@@ -5755,7 +6010,7 @@ def _annotate_ui_persistent_mb_targets(
 
 
 def _onclick_mb_types(objects):
-    """Packed MonoBehaviour class names targeted by Button/Slider events."""
+    """Packed MonoBehaviour class names targeted by Button/Slider/Toggle events."""
     out = set()
     for o in objects or []:
         for c in (o.get("ui_button") or {}).get("onclick") or []:
@@ -5764,10 +6019,11 @@ def _onclick_mb_types(objects):
             cls = c.get("target_class")
             if cls:
                 out.add(cls)
-        for c in (o.get("ui_slider") or {}).get("on_value_changed") or []:
-            cls = c.get("target_class")
-            if cls:
-                out.add(cls)
+        for key in ("ui_slider", "ui_scrollbar", "ui_toggle"):
+            for c in (o.get(key) or {}).get("on_value_changed") or []:
+                cls = c.get("target_class")
+                if cls:
+                    out.add(cls)
     return out
 
 
@@ -5775,8 +6031,8 @@ def _alias_onclick_mb_file_ids(objects):
     """Attach scene onClick/onValueChanged MB fileIDs onto packed mb_ids.
 
     Stripped PrefabInstance MBs (scene fileID) are not joined via m_Component;
-    Button/Slider targets still reference them. Alias onto the first instance
-    of the annotated target class so ``_mb_index`` resolves the call.
+    Button/Slider/Toggle targets still reference them. Alias onto the first
+    instance of the annotated target class so ``_mb_index`` resolves the call.
     """
     by_class = {}
     for o in objects or []:
@@ -5799,6 +6055,8 @@ def _alias_onclick_mb_file_ids(objects):
     for o in objects or []:
         _alias((o.get("ui_button") or {}).get("onclick"))
         _alias((o.get("ui_slider") or {}).get("on_value_changed"))
+        _alias((o.get("ui_scrollbar") or {}).get("on_value_changed"))
+        _alias((o.get("ui_toggle") or {}).get("on_value_changed"))
 
 
 def _mb_onclick_callable(analyses, cname, method, mode):
@@ -5833,7 +6091,7 @@ def _mb_onclick_callable(analyses, cname, method, mode):
 
 
 def _mb_onvaluechanged_callable(analyses, cname, method, mode):
-    """True if *method* can be dispatched from Slider.onValueChanged.
+    """True if *method* can be dispatched from Slider/Scrollbar.onValueChanged.
 
     UnityEvent<float>: mode 0/4 = EventDefined/Float (pass float);
     mode 1 = Void. Static property setters (``set_Volume``) are allowed.
@@ -5863,6 +6121,38 @@ def _mb_onvaluechanged_callable(analyses, cname, method, mode):
                     # Instance void only (OnValueChanged / SetDisplayValue).
                     if not m.get("static"):
                         return True
+    return False
+
+
+def _mb_ontoggle_callable(analyses, cname, method, mode):
+    """True if *method* can be dispatched from Toggle.onValueChanged.
+
+    UnityEvent<bool>: mode 0 = EventDefined (pass isOn), mode 1 = Void,
+    mode 6 = Bool (fixed m_BoolArgument).
+    """
+    if not cname or not method:
+        return False
+    mode = int(mode or 0)
+    want_bool = mode in (0, 6)
+    want_void = mode == 1
+    if not want_bool and not want_void:
+        return False
+    for a in analyses or []:
+        for c in a.get("classes") or []:
+            if c.get("name") != cname:
+                continue
+            for m in c.get("methods") or []:
+                if m.get("name") != method:
+                    continue
+                if not m.get("public"):
+                    continue
+                args = (m.get("args") or "").strip()
+                if want_bool:
+                    if re.match(
+                            r"(?:System\.)?bool\s+\w+\s*$", args, re.I):
+                        return True
+                elif want_void and not args and not m.get("static"):
+                    return True
     return False
 
 
@@ -6780,6 +7070,210 @@ def _build_ui_sliders(plan, analyses=None):
                 "calls": calls,
             })
     return sliders
+
+
+def _ui_xf_go_maps(plan):
+    """go_id→go_index, xf_id→go_index, handle_parent xf→father xf."""
+    go_by_id = {}
+    xf_to_go = {}
+    handle_parent = {}
+    for cl in plan["classes"].values():
+        for o in cl.get("instances") or []:
+            gid = str(o.get("go_id") or "")
+            gi = o.get("go_index")
+            if gid and gi is not None:
+                go_by_id[gid] = int(gi)
+            xid = o.get("xf_id")
+            if xid is not None and gi is not None:
+                xf_to_go[str(xid)] = int(gi)
+            fid = o.get("father_id")
+            if xid is not None and fid is not None:
+                handle_parent[str(xid)] = str(fid)
+    for h in plan.get("scene_hierarchy") or []:
+        gid = str(h.get("go_id") or "")
+        gi = h.get("go_index")
+        if gid and gi is not None:
+            go_by_id.setdefault(gid, int(gi))
+        xid = h.get("xf_id")
+        if xid is not None and gi is not None:
+            xf_to_go.setdefault(str(xid), int(gi))
+        fid = h.get("father_id")
+        if xid is not None and fid is not None:
+            handle_parent.setdefault(str(xid), str(fid))
+    return go_by_id, xf_to_go, handle_parent
+
+
+def _ui_mb_call_resolve(plan, analyses, calls, callable_fn):
+    """Resolve persistent UnityEvent calls → mb dispatch entries."""
+    mb_index = _mb_index(plan)
+    class_inst0 = {}
+    for cname, cl in (plan.get("classes") or {}).items():
+        if int(cl.get("n") or 0) > 0:
+            class_inst0[cname] = 0
+    out = []
+    for c in calls or []:
+        method = c.get("method") or ""
+        tid = str(c.get("target_go") or "")
+        mode = int(c.get("mode") or 0)
+        cname = c.get("target_class")
+        inst = None
+        hit_mb = mb_index.get(tid)
+        if hit_mb:
+            cname, inst = hit_mb[0], int(hit_mb[1])
+        elif cname and cname in class_inst0:
+            inst = int(class_inst0[cname])
+        if cname is None or inst is None:
+            continue
+        if not callable_fn(analyses, cname, method, mode):
+            continue
+        out.append({
+            "kind": "mb",
+            "mb_class": cname,
+            "mb_inst": int(inst),
+            "method": method,
+            "mode": mode,
+            "static": bool(_mb_method_is_static(analyses, cname, method)),
+            "bool_arg": int(c.get("bool_arg") or 0),
+        })
+    return out
+
+
+def _build_ui_scrollbars(plan, analyses=None):
+    """Authored uGUI Scrollbars: handle drag + onValueChanged."""
+    _go_by_id, xf_to_go, handle_parent = _ui_xf_go_maps(plan)
+    bars = []
+    for cl in plan["classes"].values():
+        for o in cl.get("instances") or []:
+            sb = o.get("ui_scrollbar")
+            if not sb:
+                continue
+            self_go = o.get("go_index")
+            if self_go is None:
+                continue
+            self_go = int(self_go)
+            handle_id = int(sb.get("handle_rect_id") or 0)
+            handle_go = xf_to_go.get(str(handle_id), -1) if handle_id else -1
+            slide_go = -1
+            if handle_id:
+                parent_xf = handle_parent.get(str(handle_id))
+                if parent_xf:
+                    slide_go = xf_to_go.get(parent_xf, -1)
+            if slide_go < 0:
+                slide_go = self_go
+            calls = _ui_mb_call_resolve(
+                plan, analyses, sb.get("on_value_changed"),
+                _mb_onvaluechanged_callable)
+            bars.append({
+                "go": self_go,
+                "slide_go": int(slide_go),
+                "handle_go": int(handle_go),
+                "direction": int(sb.get("direction") or 0),
+                "value": float(sb.get("value") or 0.0),
+                "size": float(sb.get("size") or 0.2),
+                "interactable": int(sb.get("interactable", 1)),
+                "mb_file_id": str(sb.get("mb_file_id") or ""),
+                "calls": calls,
+            })
+    return bars
+
+
+def _build_ui_scrollrects(plan, analyses=None):
+    """Authored uGUI ScrollRects: viewport drag + linked scrollbars."""
+    _go_by_id, xf_to_go, _hp = _ui_xf_go_maps(plan)
+    # Scrollbar MB fileID → index in ui_scrollbars.
+    sb_by_mb = {}
+    for i, sb in enumerate(plan.get("ui_scrollbars") or []):
+        mid = str(sb.get("mb_file_id") or "")
+        if mid and mid != "None":
+            sb_by_mb[mid] = i
+    rects = []
+    for cl in plan["classes"].values():
+        for o in cl.get("instances") or []:
+            sr = o.get("ui_scrollrect")
+            if not sr or not int(sr.get("enabled", 1)):
+                continue
+            self_go = o.get("go_index")
+            if self_go is None:
+                continue
+            self_go = int(self_go)
+            content_id = int(sr.get("content_id") or 0)
+            viewport_id = int(sr.get("viewport_id") or 0)
+            content_go = (
+                xf_to_go.get(str(content_id), -1) if content_id else -1)
+            viewport_go = (
+                xf_to_go.get(str(viewport_id), -1) if viewport_id else -1)
+            if viewport_go < 0:
+                viewport_go = self_go
+            hbar = sb_by_mb.get(str(sr.get("hbar_mb_id") or ""), -1)
+            vbar = sb_by_mb.get(str(sr.get("vbar_mb_id") or ""), -1)
+            rects.append({
+                "go": self_go,
+                "content_go": int(content_go),
+                "viewport_go": int(viewport_go),
+                "horizontal": int(sr.get("horizontal", 1)),
+                "vertical": int(sr.get("vertical", 1)),
+                "hbar": int(hbar) if hbar is not None else -1,
+                "vbar": int(vbar) if vbar is not None else -1,
+            })
+    return rects
+
+
+def _build_ui_toggles(plan, analyses=None):
+    """Authored uGUI Toggles: click to flip isOn + onValueChanged(bool)."""
+    _go_by_id, xf_to_go, _hp = _ui_xf_go_maps(plan)
+    # Image MB fileID → go_index (Toggle.graphic).
+    img_mb_to_go = {}
+    for cl in plan["classes"].values():
+        for o in cl.get("instances") or []:
+            ui = o.get("ui_image")
+            gi = o.get("go_index")
+            if not ui or gi is None:
+                continue
+            mid = str(ui.get("mb_file_id") or "")
+            if mid and mid not in ("", "None", "0"):
+                img_mb_to_go[mid] = int(gi)
+    toggles = []
+    for cl in plan["classes"].values():
+        for o in cl.get("instances") or []:
+            tg = o.get("ui_toggle")
+            if not tg or not int(tg.get("enabled", 1)):
+                continue
+            if not int(tg.get("interactable", 1)):
+                continue
+            self_go = o.get("go_index")
+            if self_go is None:
+                continue
+            self_go = int(self_go)
+            gid = int(tg.get("graphic_id") or 0)
+            graphic_go = -1
+            if gid:
+                graphic_go = img_mb_to_go.get(str(gid), -1)
+                if graphic_go < 0:
+                    graphic_go = xf_to_go.get(str(gid), -1)
+            calls = _ui_mb_call_resolve(
+                plan, analyses, tg.get("on_value_changed"),
+                _mb_ontoggle_callable)
+            toggles.append({
+                "go": self_go,
+                "is_on": int(tg.get("is_on") or 0),
+                "graphic_go": int(graphic_go),
+                "calls": calls,
+            })
+    return toggles
+
+
+def _link_scrollrects_scrollbars(plan):
+    """Annotate scrollbars with owning ScrollRect index + axis."""
+    bars = plan.get("ui_scrollbars") or []
+    for b in bars:
+        b["scrollrect"] = -1
+        b["scroll_axis"] = 0
+    for ri, r in enumerate(plan.get("ui_scrollrects") or []):
+        for key, axis in (("hbar", 0), ("vbar", 1)):
+            bi = int(r.get(key) if r.get(key) is not None else -1)
+            if 0 <= bi < len(bars):
+                bars[bi]["scrollrect"] = int(ri)
+                bars[bi]["scroll_axis"] = int(axis)
 
 
 def _collect_addcomponent_types(analyses):
@@ -10111,13 +10605,17 @@ def emit_engine(plan, analyses, used_apis):
     want_destroy = "Object.Destroy" in used_apis
     ui_buttons = plan.get("ui_buttons") or []
     ui_sliders = plan.get("ui_sliders") or []
+    ui_scrollbars = plan.get("ui_scrollbars") or []
+    ui_scrollrects = plan.get("ui_scrollrects") or []
+    ui_toggles = plan.get("ui_toggles") or []
     authored_inactive = any(
         int(o.get("active", 1)) == 0
         for cl in plan["classes"].values()
         for o in (cl.get("instances") or [])) or any(
             int(h.get("active", 1)) == 0
             for h in (plan.get("scene_hierarchy") or []))
-    want_ui = (bool(ui_buttons) or bool(ui_sliders)
+    want_ui = (bool(ui_buttons) or bool(ui_sliders) or bool(ui_scrollbars)
+               or bool(ui_scrollrects) or bool(ui_toggles)
                or ("GameObject.SetActive" in used_apis)
                or authored_inactive or _plan_has_ui_draws(plan))
     rt_apis = (
@@ -10126,6 +10624,7 @@ def emit_engine(plan, analyses, used_apis):
     want_live_rt = bool(
         plan.get("live_rt")
         and (_plan_has_ui_draws(plan) or bool(ui_buttons) or bool(ui_sliders)
+             or bool(ui_scrollbars) or bool(ui_scrollrects) or bool(ui_toggles)
              or rt_apis or "transform.localScale" in used_apis))
     want_go_tables = (
         want_find or want_transform_find or want_transform_parent
@@ -10163,7 +10662,7 @@ def emit_engine(plan, analyses, used_apis):
     want_list = "List" in used_apis
     want_dict = "Dictionary" in used_apis or "SortedList" in used_apis
     want_ref_array = False
-    want_toggle_is_on = False
+    want_toggle_is_on = bool(ui_toggles)
     want_map_string = False
     for cl in plan["classes"].values():
         for f in (cl.get("class_consts") or []) + (cl.get("dict_fields") or []) + (
@@ -11743,7 +12242,13 @@ def emit_engine(plan, analyses, used_apis):
     if want_toggle_is_on:
         go_n = max(1, len(plan.get("go_names") or []) or 1)
         p("/* UnityEngine.UI.Toggle.isOn — host-visible per GO index. */")
-        p("static int _Toggle_isOn[%d];" % go_n)
+        seed = [0] * go_n
+        for tg in (plan.get("ui_toggles") or []):
+            gi = int(tg.get("go") or -1)
+            if 0 <= gi < go_n:
+                seed[gi] = 1 if int(tg.get("is_on") or 0) else 0
+        p("static int _Toggle_isOn[%d] = { %s };" % (
+            go_n, ", ".join(str(int(x)) for x in seed)))
         p("static void Toggle_set_isOn(int go, int v) {")
         p("    if (go < 0 || go >= %d) return;" % go_n)
         p("    _Toggle_isOn[go] = v ? 1 : 0;")
@@ -12481,6 +12986,517 @@ def emit_engine(plan, analyses, used_apis):
                 p("    v = vmin + t * (vmax - vmin);")
                 p("    _engine_ui_sl_set_value(si, v);")
                 p("}")
+            # ---- Scrollbar ----
+            p("static const int _engine_ui_scrollbar_count = %d;"
+              % len(ui_scrollbars))
+            if ui_scrollbars:
+                nsb = len(ui_scrollbars)
+                p("static const int _engine_ui_sb_go[%d] = { %s };" % (
+                    nsb, ", ".join(str(int(s["go"])) for s in ui_scrollbars)))
+                p("static const int _engine_ui_sb_slide_go[%d] = { %s };" % (
+                    nsb, ", ".join(
+                        str(int(s["slide_go"])) for s in ui_scrollbars)))
+                p("static const int _engine_ui_sb_handle_go[%d] = { %s };" % (
+                    nsb, ", ".join(
+                        str(int(s["handle_go"])) for s in ui_scrollbars)))
+                p("static const int _engine_ui_sb_dir[%d] = { %s };" % (
+                    nsb, ", ".join(
+                        str(int(s["direction"])) for s in ui_scrollbars)))
+                p("static const int _engine_ui_sb_interact[%d] = { %s };" % (
+                    nsb, ", ".join(
+                        str(int(s["interactable"])) for s in ui_scrollbars)))
+                p("static const int _engine_ui_sb_scrollrect[%d] = { %s };" % (
+                    nsb, ", ".join(
+                        str(int(s.get("scrollrect", -1)))
+                        for s in ui_scrollbars)))
+                p("static const int _engine_ui_sb_axis[%d] = { %s };" % (
+                    nsb, ", ".join(
+                        str(int(s.get("scroll_axis", 0)))
+                        for s in ui_scrollbars)))
+                p("static float _engine_ui_sb_value[%d] = { %s };" % (
+                    nsb, ", ".join(
+                        "%sf" % repr(float(s["value"]))
+                        for s in ui_scrollbars)))
+                p("static float _engine_ui_sb_size[%d] = { %s };" % (
+                    nsb, ", ".join(
+                        "%sf" % repr(float(s["size"]))
+                        for s in ui_scrollbars)))
+                sb_starts, sb_counts, sb_ops, sb_insts = [], [], [], []
+                sb_handlers = []
+                sb_handler_ix = {}
+
+                def _sb_op(cname, method, pass_float, is_static):
+                    key = (cname, method, bool(pass_float), bool(is_static))
+                    if key not in sb_handler_ix:
+                        sb_handler_ix[key] = len(sb_handlers) + 1
+                        sb_handlers.append(key)
+                    return sb_handler_ix[key]
+
+                for s in ui_scrollbars:
+                    sb_starts.append(len(sb_ops))
+                    calls = s.get("calls") or []
+                    sb_counts.append(len(calls))
+                    for c in calls:
+                        mode = int(c.get("mode") or 0)
+                        sb_ops.append(_sb_op(
+                            c["mb_class"], c["method"], mode in (0, 4),
+                            bool(c.get("static"))))
+                        sb_insts.append(int(c["mb_inst"]))
+                nsc = len(sb_ops)
+                p("static const int _engine_ui_sb_call_start[%d] = { %s };" % (
+                    nsb, ", ".join(str(x) for x in sb_starts)))
+                p("static const int _engine_ui_sb_call_count[%d] = { %s };" % (
+                    nsb, ", ".join(str(x) for x in sb_counts)))
+                if nsc:
+                    p("static const int _engine_ui_sb_call_op[%d] = { %s };" % (
+                        nsc, ", ".join(str(x) for x in sb_ops)))
+                    p("static const int _engine_ui_sb_call_inst[%d] = { %s };"
+                      % (nsc, ", ".join(str(x) for x in sb_insts)))
+                else:
+                    p("static const int _engine_ui_sb_call_op[1] = { 0 };")
+                    p("static const int _engine_ui_sb_call_inst[1] = { 0 };")
+                plan["_ui_sb_mb_handlers"] = sb_handlers
+                for hcname, hmethod, hfloat, hstatic in sb_handlers:
+                    hidn = _c_ident(hcname)
+                    if hstatic and hfloat:
+                        p("static void %s_%s(float a);" % (hidn, hmethod))
+                    elif hstatic:
+                        p("static void %s_%s(void);" % (hidn, hmethod))
+                    elif hfloat:
+                        p("static void %s_%s(unsigned i, float a);"
+                          % (hidn, hmethod))
+                    else:
+                        p("static void %s_%s(unsigned i);" % (hidn, hmethod))
+                p("static int _engine_ui_sb_drag = -1;")
+                p("static int _engine_ui_sb_syncing;")
+                if want_live_rt:
+                    p("static void _engine_ui_sb_update_visuals(int si) {")
+                    p("    int hgo, dir, axis, rev;")
+                    p("    float val, size, movement;")
+                    p("    if (si < 0 || si >= _engine_ui_scrollbar_count)"
+                      " return;")
+                    p("    hgo = _engine_ui_sb_handle_go[si];")
+                    p("    if (hgo < 0 || hgo >= %d || !_engine_rt_has[hgo])"
+                      " return;" % go_n)
+                    p("    dir = _engine_ui_sb_dir[si];")
+                    p("    axis = (dir == 0 || dir == 1) ? 0 : 1;")
+                    p("    rev = (dir == 1 || dir == 3) ? 1 : 0;")
+                    p("    val = _engine_ui_sb_value[si];")
+                    p("    size = _engine_ui_sb_size[si];")
+                    p("    if (val < 0.f) val = 0.f;")
+                    p("    if (val > 1.f) val = 1.f;")
+                    p("    if (size < 0.f) size = 0.f;")
+                    p("    if (size > 1.f) size = 1.f;")
+                    p("    movement = val * (1.f - size);")
+                    p("    if (axis == 0) {")
+                    p("        if (rev) {")
+                    p("            _engine_rt_amin_x[hgo] = 1.f - movement"
+                      " - size;")
+                    p("            _engine_rt_amax_x[hgo] = 1.f - movement;")
+                    p("        } else {")
+                    p("            _engine_rt_amin_x[hgo] = movement;")
+                    p("            _engine_rt_amax_x[hgo] = movement + size;")
+                    p("        }")
+                    p("        _engine_rt_amin_y[hgo] = 0.f;")
+                    p("        _engine_rt_amax_y[hgo] = 1.f;")
+                    p("    } else {")
+                    p("        if (rev) {")
+                    p("            _engine_rt_amin_y[hgo] = 1.f - movement"
+                      " - size;")
+                    p("            _engine_rt_amax_y[hgo] = 1.f - movement;")
+                    p("        } else {")
+                    p("            _engine_rt_amin_y[hgo] = movement;")
+                    p("            _engine_rt_amax_y[hgo] = movement + size;")
+                    p("        }")
+                    p("        _engine_rt_amin_x[hgo] = 0.f;")
+                    p("        _engine_rt_amax_x[hgo] = 1.f;")
+                    p("    }")
+                    p("}")
+                else:
+                    p("static void _engine_ui_sb_update_visuals(int si) {"
+                      " (void)si; }")
+                # Forward decls for ScrollRect helpers used by scrollbar set.
+                p("static void _engine_ui_sr_apply_norm(int ri, int axis,"
+                  " float nv);")
+                p("static void _engine_ui_sb_set_value(int si, float v,"
+                  " int from_sr) {")
+                p("    float old;")
+                p("    int j, j0, j1, sri;")
+                p("    if (si < 0 || si >= _engine_ui_scrollbar_count) return;")
+                p("    if (v < 0.f) v = 0.f;")
+                p("    if (v > 1.f) v = 1.f;")
+                p("    old = _engine_ui_sb_value[si];")
+                p("    if (v == old) {")
+                p("        _engine_ui_sb_update_visuals(si);")
+                p("        return;")
+                p("    }")
+                p("    _engine_ui_sb_value[si] = v;")
+                p("    _engine_ui_sb_update_visuals(si);")
+                p("    if (!from_sr) {")
+                p("        sri = _engine_ui_sb_scrollrect[si];")
+                p("        if (sri >= 0 && !_engine_ui_sb_syncing)")
+                p("            _engine_ui_sr_apply_norm("
+                  "sri, _engine_ui_sb_axis[si], v);")
+                p("    }")
+                p("    j0 = _engine_ui_sb_call_start[si];")
+                p("    j1 = j0 + _engine_ui_sb_call_count[si];")
+                p("    for (j = j0; j < j1; j = j + 1) {")
+                p("        int op = _engine_ui_sb_call_op[j];")
+                for hi, (hcname, hmethod, hfloat, hstatic) in enumerate(
+                        sb_handlers):
+                    hidn = _c_ident(hcname)
+                    line = ("        if (op == %d)" if hi == 0
+                            else "        else if (op == %d)")
+                    p(line % (hi + 1))
+                    if hstatic and hfloat:
+                        p("            %s_%s(v);" % (hidn, hmethod))
+                    elif hstatic:
+                        p("            %s_%s();" % (hidn, hmethod))
+                    elif hfloat:
+                        p("            %s_%s("
+                          "(unsigned)_engine_ui_sb_call_inst[j], v);"
+                          % (hidn, hmethod))
+                    else:
+                        p("            %s_%s("
+                          "(unsigned)_engine_ui_sb_call_inst[j]);"
+                          % (hidn, hmethod))
+                p("    }")
+                p("}")
+                p("/* `scrollbar.value` on an authored Scrollbar field: the")
+                p("   field packs as the component's GameObject. */")
+                p("static int _engine_ui_sb_of_go(int go) {")
+                p("    int i;")
+                p("    if (go < 0) return -1;")
+                p("    for (i = 0; i < _engine_ui_scrollbar_count;"
+                  " i = i + 1)")
+                p("        if (_engine_ui_sb_go[i] == go) return i;")
+                p("    return -1;")
+                p("}")
+                p("static float Scrollbar_get_value(int go) {")
+                p("    int si = _engine_ui_sb_of_go(go);")
+                p("    if (si < 0) return 0.f;")
+                p("    return _engine_ui_sb_value[si];")
+                p("}")
+                p("static void Scrollbar_set_value(int go, float v) {")
+                p("    int si = _engine_ui_sb_of_go(go);")
+                p("    if (si >= 0) _engine_ui_sb_set_value(si, v, 0);")
+                p("}")
+                p("static void _engine_ui_sb_drag_to(int si, float px, float py,"
+                  " float sw, float sh) {")
+                p("    int sgo, dir, axis, rev;")
+                p("    float cx, cy, rw, rh, left, bottom, t, size, rem;")
+                p("    if (si < 0 || si >= _engine_ui_scrollbar_count) return;")
+                p("    sgo = _engine_ui_sb_slide_go[si];")
+                p("    if (sgo < 0 || sgo >= %d) return;" % go_n)
+                if want_live_rt:
+                    p("    _engine_ui_screen_rect("
+                      "sgo, sw, sh, &cx, &cy, &rw, &rh);")
+                else:
+                    p("    cx = sw * 0.5f; cy = sh * 0.5f; rw = sw; rh = sh;")
+                p("    if (rw < 0.f) rw = -rw;")
+                p("    if (rh < 0.f) rh = -rh;")
+                p("    left = cx - rw * 0.5f;")
+                p("    bottom = cy - rh * 0.5f;")
+                p("    dir = _engine_ui_sb_dir[si];")
+                p("    axis = (dir == 0 || dir == 1) ? 0 : 1;")
+                p("    rev = (dir == 1 || dir == 3) ? 1 : 0;")
+                p("    size = _engine_ui_sb_size[si];")
+                p("    if (axis == 0) {")
+                p("        rem = rw * (1.f - size);")
+                p("        if (rem < 1e-6f) t = 0.f;")
+                p("        else t = (px - left - rw * size * 0.5f) / rem;")
+                p("    } else {")
+                p("        rem = rh * (1.f - size);")
+                p("        if (rem < 1e-6f) t = 0.f;")
+                p("        else t = (py - bottom - rh * size * 0.5f) / rem;")
+                p("    }")
+                p("    if (t < 0.f) t = 0.f;")
+                p("    if (t > 1.f) t = 1.f;")
+                p("    if (rev) t = 1.f - t;")
+                p("    _engine_ui_sb_set_value(si, t, 0);")
+                p("}")
+            # ---- ScrollRect ----
+            p("static const int _engine_ui_scrollrect_count = %d;"
+              % len(ui_scrollrects))
+            if ui_scrollrects:
+                nsr = len(ui_scrollrects)
+                p("static const int _engine_ui_sr_go[%d] = { %s };" % (
+                    nsr, ", ".join(
+                        str(int(s["go"])) for s in ui_scrollrects)))
+                p("static const int _engine_ui_sr_content[%d] = { %s };" % (
+                    nsr, ", ".join(
+                        str(int(s["content_go"])) for s in ui_scrollrects)))
+                p("static const int _engine_ui_sr_viewport[%d] = { %s };" % (
+                    nsr, ", ".join(
+                        str(int(s["viewport_go"])) for s in ui_scrollrects)))
+                p("static const int _engine_ui_sr_h[%d] = { %s };" % (
+                    nsr, ", ".join(
+                        str(int(s["horizontal"])) for s in ui_scrollrects)))
+                p("static const int _engine_ui_sr_v[%d] = { %s };" % (
+                    nsr, ", ".join(
+                        str(int(s["vertical"])) for s in ui_scrollrects)))
+                p("static const int _engine_ui_sr_hbar[%d] = { %s };" % (
+                    nsr, ", ".join(
+                        str(int(s["hbar"])) for s in ui_scrollrects)))
+                p("static const int _engine_ui_sr_vbar[%d] = { %s };" % (
+                    nsr, ", ".join(
+                        str(int(s["vbar"])) for s in ui_scrollrects)))
+                p("static int _engine_ui_sr_drag = -1;")
+                p("static float _engine_ui_sr_drag_px;")
+                p("static float _engine_ui_sr_drag_py;")
+                p("static float _engine_ui_sr_drag_ax;")
+                p("static float _engine_ui_sr_drag_ay;")
+                if want_live_rt:
+                    p("static void _engine_ui_sr_apply_norm(int ri, int axis,"
+                      " float nv) {")
+                    p("    int cgo, vgo;")
+                    p("    float ccx, ccy, crw, crh, vcx, vcy, vrw, vrh;")
+                    p("    float scrollable;")
+                    p("    if (ri < 0 || ri >= _engine_ui_scrollrect_count)"
+                      " return;")
+                    p("    if (nv < 0.f) nv = 0.f;")
+                    p("    if (nv > 1.f) nv = 1.f;")
+                    p("    cgo = _engine_ui_sr_content[ri];")
+                    p("    vgo = _engine_ui_sr_viewport[ri];")
+                    p("    if (cgo < 0 || cgo >= %d || vgo < 0 || vgo >= %d)"
+                      " return;" % (go_n, go_n))
+                    p("    if (!_engine_rt_has[cgo] || !_engine_rt_has[vgo])"
+                      " return;")
+                    p("    _engine_ui_screen_rect("
+                      "cgo, _engine_ui_layout_w, _engine_ui_layout_h,"
+                      " &ccx, &ccy, &crw, &crh);")
+                    p("    _engine_ui_screen_rect("
+                      "vgo, _engine_ui_layout_w, _engine_ui_layout_h,"
+                      " &vcx, &vcy, &vrw, &vrh);")
+                    p("    if (crw < 0.f) crw = -crw;")
+                    p("    if (crh < 0.f) crh = -crh;")
+                    p("    if (vrw < 0.f) vrw = -vrw;")
+                    p("    if (vrh < 0.f) vrh = -vrh;")
+                    p("    if (axis == 0) {")
+                    p("        scrollable = crw - vrw;")
+                    p("        if (scrollable < 0.f) scrollable = 0.f;")
+                    p("        _engine_rt_apos_x[cgo] = -(nv * scrollable);")
+                    p("    } else {")
+                    p("        scrollable = crh - vrh;")
+                    p("        if (scrollable < 0.f) scrollable = 0.f;")
+                    p("        _engine_rt_apos_y[cgo] ="
+                      " (1.f - nv) * scrollable;")
+                    p("    }")
+                    p("}")
+                    if ui_scrollbars:
+                        p("static void _engine_ui_sr_sync_bars(int ri) {")
+                        p("    int cgo, vgo, hbi, vbi;")
+                        p("    float ccx, ccy, crw, crh, vcx, vcy, vrw, vrh;")
+                        p("    float scrollable, nv;")
+                        p("    if (ri < 0 || ri >= _engine_ui_scrollrect_count)"
+                          " return;")
+                        p("    cgo = _engine_ui_sr_content[ri];")
+                        p("    vgo = _engine_ui_sr_viewport[ri];")
+                        p("    if (cgo < 0 || cgo >= %d || vgo < 0 || vgo >= %d)"
+                          " return;" % (go_n, go_n))
+                        p("    if (!_engine_rt_has[cgo] || !_engine_rt_has[vgo])"
+                          " return;")
+                        p("    _engine_ui_screen_rect("
+                          "cgo, _engine_ui_layout_w, _engine_ui_layout_h,"
+                          " &ccx, &ccy, &crw, &crh);")
+                        p("    _engine_ui_screen_rect("
+                          "vgo, _engine_ui_layout_w, _engine_ui_layout_h,"
+                          " &vcx, &vcy, &vrw, &vrh);")
+                        p("    if (crw < 0.f) crw = -crw;")
+                        p("    if (crh < 0.f) crh = -crh;")
+                        p("    if (vrw < 0.f) vrw = -vrw;")
+                        p("    if (vrh < 0.f) vrh = -vrh;")
+                        p("    _engine_ui_sb_syncing = 1;")
+                        p("    hbi = _engine_ui_sr_hbar[ri];")
+                        p("    if (hbi >= 0 && _engine_ui_sr_h[ri]) {")
+                        p("        scrollable = crw - vrw;")
+                        p("        if (scrollable < 1e-6f) nv = 0.f;")
+                        p("        else {")
+                        p("            nv = -_engine_rt_apos_x[cgo] / scrollable;")
+                        p("            if (nv < 0.f) nv = 0.f;")
+                        p("            if (nv > 1.f) nv = 1.f;")
+                        p("        }")
+                        p("        if (crw > 1e-6f)")
+                        p("            _engine_ui_sb_size[hbi] ="
+                          " (vrw < crw) ? (vrw / crw) : 1.f;")
+                        p("        _engine_ui_sb_set_value(hbi, nv, 1);")
+                        p("    }")
+                        p("    vbi = _engine_ui_sr_vbar[ri];")
+                        p("    if (vbi >= 0 && _engine_ui_sr_v[ri]) {")
+                        p("        scrollable = crh - vrh;")
+                        p("        if (scrollable < 1e-6f) nv = 1.f;")
+                        p("        else {")
+                        p("            nv = 1.f - (_engine_rt_apos_y[cgo]"
+                          " / scrollable);")
+                        p("            if (nv < 0.f) nv = 0.f;")
+                        p("            if (nv > 1.f) nv = 1.f;")
+                        p("        }")
+                        p("        if (crh > 1e-6f)")
+                        p("            _engine_ui_sb_size[vbi] ="
+                          " (vrh < crh) ? (vrh / crh) : 1.f;")
+                        p("        _engine_ui_sb_set_value(vbi, nv, 1);")
+                        p("    }")
+                        p("    _engine_ui_sb_syncing = 0;")
+                        p("}")
+                    else:
+                        p("static void _engine_ui_sr_sync_bars(int ri) {"
+                          " (void)ri; }")
+                    p("static void _engine_ui_sr_drag_to(int ri, float px,"
+                      " float py) {")
+                    p("    int cgo;")
+                    p("    float dx, dy, ccx, ccy, crw, crh, vcx, vcy, vrw, vrh;")
+                    p("    float scrollable, ax, ay;")
+                    p("    if (ri < 0 || ri >= _engine_ui_scrollrect_count)"
+                      " return;")
+                    p("    cgo = _engine_ui_sr_content[ri];")
+                    p("    if (cgo < 0 || cgo >= %d || !_engine_rt_has[cgo])"
+                      " return;" % go_n)
+                    p("    dx = px - _engine_ui_sr_drag_px;")
+                    p("    dy = py - _engine_ui_sr_drag_py;")
+                    p("    ax = _engine_ui_sr_drag_ax;")
+                    p("    ay = _engine_ui_sr_drag_ay;")
+                    p("    if (_engine_ui_sr_h[ri]) ax = ax + dx;")
+                    p("    if (_engine_ui_sr_v[ri]) ay = ay + dy;")
+                    p("    _engine_ui_screen_rect("
+                      "cgo, _engine_ui_layout_w, _engine_ui_layout_h,"
+                      " &ccx, &ccy, &crw, &crh);")
+                    p("    _engine_ui_screen_rect("
+                      "_engine_ui_sr_viewport[ri],"
+                      " _engine_ui_layout_w, _engine_ui_layout_h,"
+                      " &vcx, &vcy, &vrw, &vrh);")
+                    p("    if (crw < 0.f) crw = -crw;")
+                    p("    if (crh < 0.f) crh = -crh;")
+                    p("    if (vrw < 0.f) vrw = -vrw;")
+                    p("    if (vrh < 0.f) vrh = -vrh;")
+                    p("    if (_engine_ui_sr_h[ri]) {")
+                    p("        scrollable = crw - vrw;")
+                    p("        if (scrollable < 0.f) scrollable = 0.f;")
+                    p("        if (ax > 0.f) ax = 0.f;")
+                    p("        if (ax < -scrollable) ax = -scrollable;")
+                    p("        _engine_rt_apos_x[cgo] = ax;")
+                    p("    }")
+                    p("    if (_engine_ui_sr_v[ri]) {")
+                    p("        scrollable = crh - vrh;")
+                    p("        if (scrollable < 0.f) scrollable = 0.f;")
+                    p("        if (ay < 0.f) ay = 0.f;")
+                    p("        if (ay > scrollable) ay = scrollable;")
+                    p("        _engine_rt_apos_y[cgo] = ay;")
+                    p("    }")
+                    p("    _engine_ui_sr_sync_bars(ri);")
+                    p("}")
+                else:
+                    p("static void _engine_ui_sr_apply_norm(int ri, int axis,"
+                      " float nv) { (void)ri; (void)axis; (void)nv; }")
+                    p("static void _engine_ui_sr_sync_bars(int ri) {"
+                      " (void)ri; }")
+                    p("static void _engine_ui_sr_drag_to(int ri, float px,"
+                      " float py) { (void)ri; (void)px; (void)py; }")
+            elif ui_scrollbars:
+                # Scrollbar set_value forward-declared apply_norm — stub it.
+                p("static void _engine_ui_sr_apply_norm(int ri, int axis,"
+                  " float nv) { (void)ri; (void)axis; (void)nv; }")
+            # ---- Toggle ----
+            p("static const int _engine_ui_toggle_count = %d;"
+              % len(ui_toggles))
+            if ui_toggles:
+                ntg = len(ui_toggles)
+                p("static const int _engine_ui_tg_go[%d] = { %s };" % (
+                    ntg, ", ".join(str(int(t["go"])) for t in ui_toggles)))
+                p("static const int _engine_ui_tg_graphic[%d] = { %s };" % (
+                    ntg, ", ".join(
+                        str(int(t["graphic_go"])) for t in ui_toggles)))
+                tg_starts, tg_counts, tg_ops, tg_insts, tg_bools = (
+                    [], [], [], [], [])
+                tg_handlers = []
+                tg_handler_ix = {}
+
+                def _tg_op(cname, method, pass_bool, is_static):
+                    key = (cname, method, bool(pass_bool), bool(is_static))
+                    if key not in tg_handler_ix:
+                        tg_handler_ix[key] = len(tg_handlers) + 1
+                        tg_handlers.append(key)
+                    return tg_handler_ix[key]
+
+                for t in ui_toggles:
+                    tg_starts.append(len(tg_ops))
+                    calls = t.get("calls") or []
+                    tg_counts.append(len(calls))
+                    for c in calls:
+                        mode = int(c.get("mode") or 0)
+                        pass_b = mode in (0, 6)
+                        tg_ops.append(_tg_op(
+                            c["mb_class"], c["method"], pass_b,
+                            bool(c.get("static"))))
+                        tg_insts.append(int(c["mb_inst"]))
+                        # mode 6 uses fixed bool; mode 0 uses live isOn.
+                        tg_bools.append(int(c.get("bool_arg") or 0)
+                                        if mode == 6 else -1)
+                ntc = len(tg_ops)
+                p("static const int _engine_ui_tg_call_start[%d] = { %s };" % (
+                    ntg, ", ".join(str(x) for x in tg_starts)))
+                p("static const int _engine_ui_tg_call_count[%d] = { %s };" % (
+                    ntg, ", ".join(str(x) for x in tg_counts)))
+                if ntc:
+                    p("static const int _engine_ui_tg_call_op[%d] = { %s };" % (
+                        ntc, ", ".join(str(x) for x in tg_ops)))
+                    p("static const int _engine_ui_tg_call_inst[%d] = { %s };"
+                      % (ntc, ", ".join(str(x) for x in tg_insts)))
+                    p("static const int _engine_ui_tg_call_bool[%d] = { %s };"
+                      % (ntc, ", ".join(str(x) for x in tg_bools)))
+                else:
+                    p("static const int _engine_ui_tg_call_op[1] = { 0 };")
+                    p("static const int _engine_ui_tg_call_inst[1] = { 0 };")
+                    p("static const int _engine_ui_tg_call_bool[1] = { -1 };")
+                plan["_ui_tg_mb_handlers"] = tg_handlers
+                for hcname, hmethod, hbool, hstatic in tg_handlers:
+                    hidn = _c_ident(hcname)
+                    if hstatic and hbool:
+                        p("static void %s_%s(int a);" % (hidn, hmethod))
+                    elif hstatic:
+                        p("static void %s_%s(void);" % (hidn, hmethod))
+                    elif hbool:
+                        p("static void %s_%s(unsigned i, int a);"
+                          % (hidn, hmethod))
+                    else:
+                        p("static void %s_%s(unsigned i);" % (hidn, hmethod))
+                p("static int _engine_ui_tg_press = -1;")
+                p("static void _engine_ui_tg_set(int ti, int on) {")
+                p("    int go, g, j, j0, j1, barg;")
+                p("    if (ti < 0 || ti >= _engine_ui_toggle_count) return;")
+                p("    go = _engine_ui_tg_go[ti];")
+                p("    if (go < 0 || go >= %d) return;" % go_n)
+                p("    on = on ? 1 : 0;")
+                p("    if (Toggle_get_isOn(go) == on) return;")
+                p("    Toggle_set_isOn(go, on);")
+                p("    g = _engine_ui_tg_graphic[ti];")
+                p("    if (g >= 0 && g < %d)" % go_n)
+                p("        GameObject_SetActive(g, on);")
+                p("    j0 = _engine_ui_tg_call_start[ti];")
+                p("    j1 = j0 + _engine_ui_tg_call_count[ti];")
+                p("    for (j = j0; j < j1; j = j + 1) {")
+                p("        int op = _engine_ui_tg_call_op[j];")
+                p("        barg = _engine_ui_tg_call_bool[j];")
+                p("        if (barg < 0) barg = on;")
+                for hi, (hcname, hmethod, hbool, hstatic) in enumerate(
+                        tg_handlers):
+                    hidn = _c_ident(hcname)
+                    line = ("        if (op == %d)" if hi == 0
+                            else "        else if (op == %d)")
+                    p(line % (hi + 1))
+                    if hstatic and hbool:
+                        p("            %s_%s(barg);" % (hidn, hmethod))
+                    elif hstatic:
+                        p("            %s_%s();" % (hidn, hmethod))
+                    elif hbool:
+                        p("            %s_%s("
+                          "(unsigned)_engine_ui_tg_call_inst[j], barg);"
+                          % (hidn, hmethod))
+                    else:
+                        p("            %s_%s("
+                          "(unsigned)_engine_ui_tg_call_inst[j]);"
+                          % (hidn, hmethod))
+                p("    }")
+                p("}")
             p("static void engine_ui_tick(void) {")
             p("    int down_edge, up_edge, i, hit;")
             p("    float px, py, sw, sh;")
@@ -12525,29 +13541,117 @@ def emit_engine(plan, analyses, used_apis):
                 p("        sw = lw;")
                 p("        sh = lh;")
                 p("    }")
-            # Sliders first — drag takes priority over Button press.
-            if ui_sliders:
-                p("    {")
-                p("        int shit = -1;")
-                p("        for (i = 0; i < _engine_ui_slider_count; i = i + 1) {")
-                p("            int go = _engine_ui_sl_go[i];")
+            # Helper: hit-test a GO rect.
+            def _emit_hit_loop(count_sym, go_arr, result_var, extra_ok=None):
+                p("        %s = -1;" % result_var)
+                p("        for (i = 0; i < %s; i = i + 1) {" % count_sym)
+                p("            int go = %s[i];" % go_arr)
                 p("            float cx, cy, hw, hh, dx, dy, rw, rh;")
+                if extra_ok:
+                    p("            if (!(%s)) continue;" % extra_ok)
                 p("            if (go < 0 || go >= %d) continue;" % go_n)
-                p("            if (!_engine_go_active_in_hierarchy(go)) continue;")
+                p("            if (!_engine_go_active_in_hierarchy(go))"
+                  " continue;")
                 if want_live_rt:
                     p("            _engine_ui_screen_rect("
                       "go, sw, sh, &cx, &cy, &rw, &rh);")
                     p("            if (rw < 0.f) rw = -rw;")
                     p("            if (rh < 0.f) rh = -rh;")
-                    p("            hw = rw * 0.5f;")
-                    p("            hh = rh * 0.5f;")
+                    p("            hw = rw * 0.5f; hh = rh * 0.5f;")
                 else:
                     p("            cx = sw * 0.5f; cy = sh * 0.5f;")
                     p("            hw = sw; hh = sh;")
                 p("            dx = px - cx; if (dx < 0.f) dx = -dx;")
                 p("            dy = py - cy; if (dy < 0.f) dy = -dy;")
-                p("            if (dx <= hw && dy <= hh && shit < 0) shit = i;")
+                p("            if (dx <= hw && dy <= hh && %s < 0)"
+                  " %s = i;" % (result_var, result_var))
                 p("        }")
+
+            # Scrollbar drag (interactable only).
+            if ui_scrollbars:
+                p("    {")
+                p("        int shit = -1;")
+                _emit_hit_loop(
+                    "_engine_ui_scrollbar_count", "_engine_ui_sb_go", "shit",
+                    extra_ok="_engine_ui_sb_interact[i]")
+                p("        if (down_edge && shit >= 0)")
+                p("            _engine_ui_sb_drag = shit;")
+                p("        if (_engine_ui_sb_drag >= 0 && engine_pointer_down)")
+                p("            _engine_ui_sb_drag_to("
+                  "_engine_ui_sb_drag, px, py, sw, sh);")
+                p("        if (up_edge)")
+                p("            _engine_ui_sb_drag = -1;")
+                p("    }")
+            # ScrollRect drag (viewport) — skip if scrollbar already dragging.
+            if ui_scrollrects:
+                p("    {")
+                p("        int rhit = -1;")
+                if ui_scrollbars:
+                    p("        if (_engine_ui_sb_drag < 0) {")
+                # Hit-test viewport GO, not root.
+                p("            for (i = 0; i < _engine_ui_scrollrect_count;"
+                  " i = i + 1) {")
+                p("                int go = _engine_ui_sr_viewport[i];")
+                p("                float cx, cy, hw, hh, dx, dy, rw, rh;")
+                p("                if (go < 0 || go >= %d) continue;" % go_n)
+                p("                if (!_engine_go_active_in_hierarchy(go))"
+                  " continue;")
+                if want_live_rt:
+                    p("                _engine_ui_screen_rect("
+                      "go, sw, sh, &cx, &cy, &rw, &rh);")
+                    p("                if (rw < 0.f) rw = -rw;")
+                    p("                if (rh < 0.f) rh = -rh;")
+                    p("                hw = rw * 0.5f; hh = rh * 0.5f;")
+                else:
+                    p("                cx = sw * 0.5f; cy = sh * 0.5f;")
+                    p("                hw = sw; hh = sh;")
+                p("                dx = px - cx; if (dx < 0.f) dx = -dx;")
+                p("                dy = py - cy; if (dy < 0.f) dy = -dy;")
+                p("                if (dx <= hw && dy <= hh && rhit < 0)"
+                  " rhit = i;")
+                p("            }")
+                if ui_scrollbars:
+                    p("        }")
+                p("        if (down_edge && rhit >= 0) {")
+                p("            int cgo;")
+                p("            _engine_ui_sr_drag = rhit;")
+                p("            _engine_ui_sr_drag_px = px;")
+                p("            _engine_ui_sr_drag_py = py;")
+                p("            cgo = _engine_ui_sr_content[rhit];")
+                p("            _engine_ui_sr_drag_ax = 0.f;")
+                p("            _engine_ui_sr_drag_ay = 0.f;")
+                if want_live_rt:
+                    p("            if (cgo >= 0 && cgo < %d"
+                      " && _engine_rt_has[cgo]) {" % go_n)
+                    p("                _engine_ui_sr_drag_ax ="
+                      " _engine_rt_apos_x[cgo];")
+                    p("                _engine_ui_sr_drag_ay ="
+                      " _engine_rt_apos_y[cgo];")
+                    p("            }")
+                p("        }")
+                p("        if (_engine_ui_sr_drag >= 0 && engine_pointer_down)")
+                p("            _engine_ui_sr_drag_to("
+                  "_engine_ui_sr_drag, px, py);")
+                p("        if (up_edge)")
+                p("            _engine_ui_sr_drag = -1;")
+                p("    }")
+            # Sliders — drag takes priority over Button press.
+            if ui_sliders:
+                p("    {")
+                p("        int shit = -1;")
+                skip = []
+                if ui_scrollbars:
+                    skip.append("_engine_ui_sb_drag < 0")
+                if ui_scrollrects:
+                    skip.append("_engine_ui_sr_drag < 0")
+                if skip:
+                    p("        if (%s) {" % " && ".join(skip))
+                    _emit_hit_loop(
+                        "_engine_ui_slider_count", "_engine_ui_sl_go", "shit")
+                    p("        }")
+                else:
+                    _emit_hit_loop(
+                        "_engine_ui_slider_count", "_engine_ui_sl_go", "shit")
                 p("        if (down_edge && shit >= 0)")
                 p("            _engine_ui_sl_drag = shit;")
                 p("        if (_engine_ui_sl_drag >= 0 && engine_pointer_down)")
@@ -12555,6 +13659,33 @@ def emit_engine(plan, analyses, used_apis):
                   "_engine_ui_sl_drag, px, py, sw, sh);")
                 p("        if (up_edge)")
                 p("            _engine_ui_sl_drag = -1;")
+                p("    }")
+            # Toggle click (pointer-up over pressed target).
+            if ui_toggles:
+                p("    {")
+                p("        int thit = -1;")
+                _emit_hit_loop(
+                    "_engine_ui_toggle_count", "_engine_ui_tg_go", "thit")
+                busy = []
+                if ui_scrollbars:
+                    busy.append("_engine_ui_sb_drag < 0")
+                if ui_scrollrects:
+                    busy.append("_engine_ui_sr_drag < 0")
+                if ui_sliders:
+                    busy.append("_engine_ui_sl_drag < 0")
+                busy_expr = (" && ".join(busy)) if busy else "1"
+                p("        if (down_edge && thit >= 0 && (%s))" % busy_expr)
+                p("            _engine_ui_tg_press = thit;")
+                p("        if (up_edge) {")
+                p("            if (_engine_ui_tg_press >= 0"
+                  " && thit == _engine_ui_tg_press) {")
+                p("                int go = _engine_ui_tg_go["
+                  "_engine_ui_tg_press];")
+                p("                _engine_ui_tg_set(_engine_ui_tg_press,"
+                  " !Toggle_get_isOn(go));")
+                p("            }")
+                p("            _engine_ui_tg_press = -1;")
+                p("        }")
                 p("    }")
             p("    hit = -1;")
             if ui_buttons:
@@ -12606,9 +13737,19 @@ def emit_engine(plan, analyses, used_apis):
                 p("        _engine_ui_btn_tint[i * 4 + 2] = col[2];")
                 p("        _engine_ui_btn_tint[i * 4 + 3] = col[3];")
                 p("    }")
-                # Skip Button press while a Slider is being dragged.
+                # Skip Button press while a Slider/Scrollbar/ScrollRect drags.
+                busy = []
                 if ui_sliders:
-                    p("    if (down_edge && hit >= 0 && _engine_ui_sl_drag < 0)")
+                    busy.append("_engine_ui_sl_drag < 0")
+                if ui_scrollbars:
+                    busy.append("_engine_ui_sb_drag < 0")
+                if ui_scrollrects:
+                    busy.append("_engine_ui_sr_drag < 0")
+                if ui_toggles:
+                    busy.append("_engine_ui_tg_press < 0")
+                if busy:
+                    p("    if (down_edge && hit >= 0 && %s)"
+                      % " && ".join(busy))
                 else:
                     p("    if (down_edge && hit >= 0)")
                 p("        _engine_ui_btn_press = hit;")
@@ -12647,7 +13788,8 @@ def emit_engine(plan, analyses, used_apis):
                 p("        }")
                 p("        _engine_ui_btn_press = -1;")
                 p("    }")
-            elif not ui_sliders:
+            elif not (ui_sliders or ui_scrollbars or ui_scrollrects
+                      or ui_toggles):
                 p("    (void)i; (void)hit; (void)px; (void)py;")
                 p("    (void)sw; (void)sh; (void)down_edge; (void)up_edge;")
             else:
@@ -18187,6 +19329,7 @@ def _load_scenes_lights_cameras(root, assets):
     sw, sh = _ui_layout_screen(root, objects)
     _apply_layout_groups(objects, sw, sh)
     _apply_slider_visuals(objects)
+    _apply_scrollbar_visuals(objects)
     _bake_ui_images(
         objects, cameras, sw, sh, asset_guids=assets, hierarchy=hierarchy)
     # Snapshot rect onto hierarchy before dropping layout-only scaffolds so
@@ -19261,6 +20404,10 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
     plan["go_siblings"] = _build_go_sibling_indices(plan["go_parents"])
     plan["ui_buttons"] = _build_ui_buttons(plan, analyses)
     plan["ui_sliders"] = _build_ui_sliders(plan, analyses)
+    plan["ui_scrollbars"] = _build_ui_scrollbars(plan, analyses)
+    plan["ui_scrollrects"] = _build_ui_scrollrects(plan, analyses)
+    _link_scrollrects_scrollbars(plan)
+    plan["ui_toggles"] = _build_ui_toggles(plan, analyses)
     plan["live_rt"] = _build_rect_transforms(plan)
     rb2d, rb3d, go_rb2d, go_rb3d, rb2d_by_fid, rb3d_by_fid = (
         _build_rigidbody_tables(plan))

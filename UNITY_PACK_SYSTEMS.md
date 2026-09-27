@@ -282,7 +282,15 @@ fires `m_OnValueChanged` persistent calls — `UnityEvent<float>` mode 0/4
 passes the new float (including static property setters like
 `SettingsMenu.set_Volume`), mode 1 Void calls instance methods
 (`_Slider.SetDisplayValue` / `OnValueChanged`). GOs with both `_Slider` and
-`_Selectable` pack as `_Slider` so those callbacks resolve. Authored C# may get/set
+`_Selectable` pack as `_Slider` so those callbacks resolve. **Toggle** click
+(pointer-up over the pressed target) flips authored `m_IsOn`, seeds
+`Toggle_set/get_isOn`, shows/hides the `graphic` Image GO when present, and
+fires `onValueChanged` (`UnityEvent<bool>` mode 0 → isOn, mode 1 Void,
+mode 6 fixed bool). **Scrollbar** bakes `UpdateVisuals` (handle anchors from
+`m_Value`/`m_Size`/direction) and supports slide-area drag with float
+`onValueChanged`. **ScrollRect** drags the viewport to move content
+`anchoredPosition` (clamped), syncs linked Scrollbar value/size, and
+scrollbar value changes drive content normalized position. Authored C# may get/set
 `rectTransform.anchoredPosition`, `sizeDelta`, and UI `localScale` (xy).
 Layout-only Canvas / Rect parents are snapshotted onto `scene_hierarchy`
 before scaffold drop so the live GO parent chain keeps rect state.

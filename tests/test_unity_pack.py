@@ -9745,6 +9745,203 @@ class TestSystems(unittest.TestCase):
         self.assertIn("Host_set_Volume(v)", eng)
         self.assertIn("Host_SetDisplayValue(", eng)
 
+    def test_toggle_scrollbar_scrollrect_interaction(self):
+        """Toggle click, Scrollbar handle bake, ScrollRect tables emit."""
+        root = tempfile.mkdtemp(prefix="upack-sct-")
+        scripts = os.path.join(root, "Assets", "Scripts")
+        os.makedirs(scripts)
+        with open(os.path.join(scripts, "Host.cs"), "w") as f:
+            f.write(
+                "using UnityEngine;\n"
+                "public class Host : MonoBehaviour {\n"
+                "  public void OnToggle(bool on) {}\n"
+                "  void Update() {}\n"
+                "}\n"
+            )
+        with open(os.path.join(scripts, "Host.cs.meta"), "w") as f:
+            f.write("guid: scthostguidscthostguidscth01\n")
+        toggle = "9085046f02f69544eb97fd06b6048fe2"
+        sbar = "2a4db7a114972834c8e4117be1d82ba3"
+        srect = "1aa08ab6e0800fa44ae55d278d1423e3"
+        img = "fe87c0e1cc204ed48ad3b37840f39efc"
+        builtin = "0000000000000000f000000000000000"
+        scene = os.path.join(root, "Assets", "Scenes")
+        os.makedirs(scene)
+        with open(os.path.join(scene, "S.unity"), "w") as f:
+            f.write(
+                "%YAML 1.1\n"
+                "--- !u!1 &100\nGameObject:\n  m_Name: Main Camera\n"
+                "  m_TagString: MainCamera\n"
+                "  m_Component:\n  - component: {fileID: 101}\n"
+                "  - component: {fileID: 102}\n"
+                "--- !u!4 &101\nTransform:\n"
+                "  m_GameObject: {fileID: 100}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: -10}\n"
+                "--- !u!20 &102\nCamera:\n"
+                "  m_GameObject: {fileID: 100}\n"
+                "  orthographic: 1\n"
+                "  orthographic size: 5\n"
+                "  m_BackGroundColor: {r: 0, g: 0, b: 0, a: 1}\n"
+                "--- !u!1 &1\nGameObject:\n  m_Name: Canvas\n"
+                "  m_Component:\n  - component: {fileID: 2}\n"
+                "  - component: {fileID: 3}\n"
+                "--- !u!224 &2\nRectTransform:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Father: {fileID: 0}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 0, y: 0}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!223 &3\nCanvas:\n"
+                "  m_GameObject: {fileID: 1}\n"
+                "  m_Enabled: 1\n"
+                "--- !u!1 &10\nGameObject:\n  m_Name: Scroll View\n"
+                "  m_Component:\n  - component: {fileID: 11}\n"
+                "  - component: {fileID: 12}\n"
+                "--- !u!224 &11\nRectTransform:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Father: {fileID: 2}\n"
+                "  m_Children:\n  - {fileID: 21}\n  - {fileID: 41}\n"
+                "  m_AnchorMin: {x: 0.5, y: 0.5}\n"
+                "  m_AnchorMax: {x: 0.5, y: 0.5}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 400, y: 300}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!114 &12\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 10}\n"
+                "  m_Enabled: 1\n"
+                "  m_Script: {fileID: 11500000, guid: " + srect + "}\n"
+                "  m_Content: {fileID: 31}\n"
+                "  m_Horizontal: 0\n"
+                "  m_Vertical: 1\n"
+                "  m_Viewport: {fileID: 21}\n"
+                "  m_HorizontalScrollbar: {fileID: 0}\n"
+                "  m_VerticalScrollbar: {fileID: 42}\n"
+                "--- !u!1 &20\nGameObject:\n  m_Name: Viewport\n"
+                "  m_Component:\n  - component: {fileID: 21}\n"
+                "--- !u!224 &21\nRectTransform:\n"
+                "  m_GameObject: {fileID: 20}\n"
+                "  m_Father: {fileID: 11}\n"
+                "  m_Children:\n  - {fileID: 31}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 0, y: 0}\n"
+                "  m_Pivot: {x: 0, y: 1}\n"
+                "--- !u!1 &30\nGameObject:\n  m_Name: Content\n"
+                "  m_Component:\n  - component: {fileID: 31}\n"
+                "--- !u!224 &31\nRectTransform:\n"
+                "  m_GameObject: {fileID: 30}\n"
+                "  m_Father: {fileID: 21}\n"
+                "  m_AnchorMin: {x: 0, y: 1}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 0, y: 600}\n"
+                "  m_Pivot: {x: 0, y: 1}\n"
+                "--- !u!1 &40\nGameObject:\n  m_Name: Scrollbar\n"
+                "  m_Component:\n  - component: {fileID: 41}\n"
+                "  - component: {fileID: 42}\n"
+                "--- !u!224 &41\nRectTransform:\n"
+                "  m_GameObject: {fileID: 40}\n"
+                "  m_Father: {fileID: 11}\n"
+                "  m_Children:\n  - {fileID: 51}\n"
+                "  m_AnchorMin: {x: 1, y: 0}\n"
+                "  m_AnchorMax: {x: 1, y: 1}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 20, y: 0}\n"
+                "  m_Pivot: {x: 1, y: 1}\n"
+                "--- !u!114 &42\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 40}\n"
+                "  m_Enabled: 1\n"
+                "  m_Interactable: 1\n"
+                "  m_Script: {fileID: 11500000, guid: " + sbar + "}\n"
+                "  m_HandleRect: {fileID: 51}\n"
+                "  m_Direction: 2\n"
+                "  m_Value: 1\n"
+                "  m_Size: 0.5\n"
+                "--- !u!1 &50\nGameObject:\n  m_Name: Handle\n"
+                "  m_Component:\n  - component: {fileID: 51}\n"
+                "  - component: {fileID: 52}\n"
+                "--- !u!224 &51\nRectTransform:\n"
+                "  m_GameObject: {fileID: 50}\n"
+                "  m_Father: {fileID: 41}\n"
+                "  m_AnchorMin: {x: 0, y: 0}\n"
+                "  m_AnchorMax: {x: 0, y: 0}\n"
+                "  m_AnchoredPosition: {x: 0, y: 0}\n"
+                "  m_SizeDelta: {x: 20, y: 20}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!114 &52\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 50}\n"
+                "  m_Enabled: 1\n"
+                "  m_Script: {fileID: 11500000, guid: " + img + "}\n"
+                "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+                "  m_Sprite: {fileID: 10913, guid: " + builtin + ", type: 0}\n"
+                "--- !u!1 &60\nGameObject:\n  m_Name: MyToggle\n"
+                "  m_Component:\n  - component: {fileID: 61}\n"
+                "  - component: {fileID: 62}\n"
+                "  - component: {fileID: 63}\n"
+                "--- !u!224 &61\nRectTransform:\n"
+                "  m_GameObject: {fileID: 60}\n"
+                "  m_Father: {fileID: 2}\n"
+                "  m_AnchorMin: {x: 0.5, y: 0.5}\n"
+                "  m_AnchorMax: {x: 0.5, y: 0.5}\n"
+                "  m_AnchoredPosition: {x: 0, y: -200}\n"
+                "  m_SizeDelta: {x: 100, y: 100}\n"
+                "  m_Pivot: {x: 0.5, y: 0.5}\n"
+                "--- !u!114 &62\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 60}\n"
+                "  m_Enabled: 1\n"
+                "  m_Interactable: 1\n"
+                "  m_Script: {fileID: 11500000, guid: " + toggle + "}\n"
+                "  graphic: {fileID: 0}\n"
+                "  onValueChanged:\n"
+                "    m_PersistentCalls:\n"
+                "      m_Calls:\n"
+                "      - m_Target: {fileID: 72}\n"
+                "        m_MethodName: OnToggle\n"
+                "        m_Mode: 0\n"
+                "        m_Arguments:\n"
+                "          m_BoolArgument: 0\n"
+                "  m_IsOn: 0\n"
+                "--- !u!114 &63\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 60}\n"
+                "  m_Enabled: 1\n"
+                "  m_Script: {fileID: 11500000, guid: " + img + "}\n"
+                "  m_Color: {r: 1, g: 1, b: 1, a: 1}\n"
+                "  m_Sprite: {fileID: 10913, guid: " + builtin + ", type: 0}\n"
+                "--- !u!1 &70\nGameObject:\n  m_Name: Host\n"
+                "  m_Component:\n  - component: {fileID: 71}\n"
+                "  - component: {fileID: 72}\n"
+                "--- !u!4 &71\nTransform:\n"
+                "  m_GameObject: {fileID: 70}\n"
+                "  m_LocalPosition: {x: 0, y: 0, z: 0}\n"
+                "--- !u!114 &72\nMonoBehaviour:\n"
+                "  m_GameObject: {fileID: 70}\n"
+                "  m_Script: {fileID: 11500000, "
+                "guid: scthostguidscthostguidscth01}\n"
+            )
+        objs, _a, _l, _c, _h = unity_pack.load_project(root)
+        handle = [o for o in objs if o["name"] == "Handle"][0]
+        # BTT value=1 size=0.5 → amin.y=0.5 amax.y=1.
+        self.assertAlmostEqual(handle["rect"]["anchor_min"][1], 0.5, places=5)
+        self.assertAlmostEqual(handle["rect"]["anchor_max"][1], 1.0, places=5)
+        d = tempfile.mkdtemp(prefix="upack-sct-out-")
+        plan = unity_pack.pack(root, d, force=True)
+        self.assertEqual(len(plan.get("ui_toggles") or []), 1)
+        self.assertEqual(len(plan.get("ui_scrollbars") or []), 1)
+        self.assertEqual(len(plan.get("ui_scrollrects") or []), 1)
+        self.assertEqual(plan["ui_scrollbars"][0]["scrollrect"], 0)
+        self.assertEqual(plan["ui_scrollrects"][0]["vbar"], 0)
+        methods = {c["method"] for c in plan["ui_toggles"][0]["calls"]}
+        self.assertIn("OnToggle", methods)
+        with open(os.path.join(d, "engine.cpp")) as ef:
+            eng = ef.read()
+        self.assertIn("_engine_ui_tg_set", eng)
+        self.assertIn("_engine_ui_sb_drag_to", eng)
+        self.assertIn("_engine_ui_sr_drag_to", eng)
+        self.assertIn("Host_OnToggle(", eng)
+
     def test_awake_setactive_false_emitted(self):
         """Awake gameObject.SetActive(false) runs before Start (SettingsMenu)."""
         root = tempfile.mkdtemp(prefix="upack-awake-sa-")
