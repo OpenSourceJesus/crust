@@ -40,12 +40,19 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import tools.cs2cpp as cs2cpp  # noqa: E402
 
+# unity_pack is split by subsystem; each module's names are re-exported here.
+from tools.unity_pack_common import *  # noqa: E402,F401,F403
+from tools.unity_pack_physics import *  # noqa: E402,F401,F403
+from tools.unity_pack_sprites import *  # noqa: E402,F401,F403
+from tools.unity_pack_ui import *  # noqa: E402,F401,F403
+from tools.unity_pack_anim import *  # noqa: E402,F401,F403
+from tools.unity_pack_audio import *  # noqa: E402,F401,F403
+from tools.unity_pack_build import *  # noqa: E402,F401,F403
+
 # C# helpers that moved to cs2cpp; the old names stay for callers and tests.
 _c_string = cs2cpp.c_string
 _string_literal_value = cs2cpp.string_literal_value
 _match_call_args = cs2cpp.match_call_args
-_split_call_args = cs2cpp.split_call_args
-_c_ident = cs2cpp.c_ident
 _MODIFIERS = cs2cpp.MODIFIERS
 _methods_in = cs2cpp.methods_in
 _interface_methods = cs2cpp.interface_methods
@@ -57,11 +64,6 @@ _method_c_symbol = cs2cpp.method_c_symbol
 _overload_method_names = cs2cpp.overload_method_names
 _blank_method_bodies = cs2cpp.blank_method_bodies
 
-
-class PackError(Exception):
-    def __init__(self, message):
-        self.message = message
-        Exception.__init__(self, message)
 
 
 def _assets_rel_path(path):
@@ -254,12 +256,6 @@ _TRANSFORM_SUPPORTED = frozenset({
     "TransformPoint",
     # RectTransform members (UI Transform is a RectTransform).
     "anchoredPosition", "sizeDelta",
-})
-
-# MonoBehaviour.rectTransform members we lower (≡ GO index + live RT tables).
-_RECTTRANSFORM_SUPPORTED = frozenset({
-    "anchoredPosition", "sizeDelta", "localScale",
-    "parent", "gameObject", "SetParent", "GetSiblingIndex", "Find",
 })
 
 
@@ -527,18 +523,6 @@ _REFUSED_ADDCOMPONENT = frozenset((
     "Canvas",
 ))
 
-# Authored uGUI / TMP component field types — scene-drawn, not packed MB arrays.
-_UI_COMPONENT_FIELD_TYPES = frozenset((
-    "Image", "RawImage", "Button", "Text", "Toggle", "Slider", "Scrollbar",
-    "ScrollRect", "Dropdown", "InputField", "Mask", "RectMask2D",
-    "Canvas", "CanvasGroup", "CanvasScaler", "GraphicRaycaster",
-    "RectTransform", "Selectable",
-    "TMP_Text", "TextMeshProUGUI", "TextMeshPro",
-    "TMP_InputField", "TMP_Dropdown",
-))
-
-# GetComponent<T> for authored UI — opaque GO handles, not AddComponent invent.
-_UI_GETCOMPONENT_TYPES = _UI_COMPONENT_FIELD_TYPES
 
 # Authored fields packed as a GameObject index. A component reference is
 # only ever used through the engine's GO-keyed helpers (`Transform_get_parent`,
@@ -550,11 +534,6 @@ _GO_HANDLE_FIELD_TYPES = _UI_COMPONENT_FIELD_TYPES | frozenset(
 # GetComponent<Transform|RectTransform>() ≡ GO index (same as .transform).
 _TRANSFORM_GETCOMPONENT_TYPES = frozenset(("Transform", "RectTransform"))
 
-
-def _progress(msg):
-    """Incremental status for long packs (large scenes / many PNGs)."""
-    sys.stderr.write("unity_pack: %s\n" % msg)
-    sys.stderr.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -733,44 +712,6 @@ def player_identity(root):
     return company, product
 
 
-def player_screen(root):
-    """defaultScreenWidth / Height from ProjectSettings (Unity Player Settings).
-
-    Missing keys → Unity standalone defaults 1024×768. Values ≤0 are clamped
-    to 1 so hosts never create a zero-size window.
-    """
-    width, height, _fs, _native, _max = player_display(root)
-    return width, height
-
-
-def _camera_script_view_pixels(screen_w, screen_h, view_w, view_h):
-    """Pixel size of ``Camera.rect`` after CameraScript.HandleViewSize.
-
-    Letterboxes / pillarboxes so the camera aspect (viewSize) fits inside the
-    player screen. Matches Unity's normalized viewport when clamped to [0,1].
-    """
-    sw = max(1, int(screen_w))
-    sh = max(1, int(screen_h))
-    vw = float(view_w)
-    vh = float(view_h)
-    if vw < 1e-6 or vh < 1e-6:
-        return sw, sh
-    cam_aspect = vw / vh
-    screen_aspect = float(sw) / float(sh)
-    # CameraScript: size = (cam/screen, min(1, screen/cam)); then clamp.
-    rw = min(1.0, cam_aspect / screen_aspect)
-    rh = min(1.0, screen_aspect / cam_aspect)
-    return (max(1, int(round(sw * rw))), max(1, int(round(sh * rh))))
-
-
-def _authored_camera_view_size(objects):
-    """GameCamera / CameraScript ``viewSize`` (world units), or None."""
-    for o in objects or []:
-        fields = o.get("fields") or {}
-        if "viewSize_x" in fields and "viewSize_y" in fields:
-            return float(fields["viewSize_x"]), float(fields["viewSize_y"])
-    return None
-
 
 def _apply_camera_script_view_to_cameras(cameras, objects):
     """Match CameraScript.HandleViewSize orthographicSize on the main camera."""
@@ -791,99 +732,6 @@ def _apply_camera_script_view_to_cameras(cameras, objects):
         main = cameras[0]
     main["orthographic_size"] = ortho
 
-
-def _find_canvas_scaler(objects):
-    """Authored CanvasScaler on a Canvas GO, else any object, else None."""
-    fallback = None
-    for o in objects or []:
-        cs = o.get("canvas_scaler")
-        if not cs:
-            continue
-        if o.get("canvas"):
-            return cs
-        if fallback is None:
-            fallback = cs
-    return fallback
-
-
-def _canvas_scaler_scale_factor(pixel_w, pixel_h, scaler):
-    """Unity CanvasScaler.scaleFactor for the given pixel rect.
-
-    Disabled / missing scaler → 1. Constant Physical Size is not modeled
-    (returns 1). Scale With Screen Size matches Unity's log2 lerp /
-    Expand / Shrink screen-match modes.
-    """
-    if not scaler or not int(scaler.get("enabled", 1)):
-        return 1.0
-    mode = int(scaler.get("ui_scale_mode") or 0)
-    if mode == 0:  # Constant Pixel Size
-        sf = float(scaler.get("scale_factor") or 1.0)
-        return sf if sf > 1e-6 else 1.0
-    if mode == 1:  # Scale With Screen Size
-        rw = float(scaler.get("ref_x") or 800.0)
-        rh = float(scaler.get("ref_y") or 600.0)
-        if rw < 1e-6:
-            rw = 1.0
-        if rh < 1e-6:
-            rh = 1.0
-        pw, ph = float(pixel_w), float(pixel_h)
-        if pw < 1e-6:
-            pw = 1.0
-        if ph < 1e-6:
-            ph = 1.0
-        smm = int(scaler.get("screen_match_mode") or 0)
-        if smm == 1:  # Expand
-            return min(pw / rw, ph / rh)
-        if smm == 2:  # Shrink
-            return max(pw / rw, ph / rh)
-        # Match Width Or Height
-        match = max(0.0, min(1.0, float(scaler.get("match") or 0.0)))
-        log_w = math.log(pw / rw) / math.log(2.0)
-        log_h = math.log(ph / rh) / math.log(2.0)
-        return 2.0 ** (log_w * (1.0 - match) + log_h * match)
-    return 1.0
-
-
-def _canvas_scaler_layout_pixels(pixel_w, pixel_h, scaler):
-    """Canvas root size in canvas units: pixelRect / scaleFactor."""
-    sf = _canvas_scaler_scale_factor(pixel_w, pixel_h, scaler)
-    if sf < 1e-6:
-        sf = 1.0
-    return (max(1, int(round(float(pixel_w) / sf))),
-            max(1, int(round(float(pixel_h) / sf))))
-
-
-def _ui_layout_screen(root, objects):
-    """Screen size used for uGUI bake (Canvas Scaler / Camera.rect pixel size).
-
-    When an authored CameraScript ``viewSize`` is present, start from the
-    letterboxed camera pixel rect (e.g. 1920×960 for view 2:1 on 1920×1080).
-    An enabled CanvasScaler then converts that pixel rect to canvas units
-    (pixelRect / scaleFactor), matching Screen Space Camera + scaler.
-    """
-    sw, sh = player_screen(root)
-    view = _authored_camera_view_size(objects)
-    if view is not None:
-        sw, sh = _camera_script_view_pixels(sw, sh, view[0], view[1])
-    scaler = _find_canvas_scaler(objects)
-    if scaler and int(scaler.get("enabled", 1)):
-        return _canvas_scaler_layout_pixels(sw, sh, scaler)
-    return sw, sh
-
-
-def _camera_script_rect(screen_w, screen_h, view_w, view_h):
-    """Normalized Camera.rect (x, y, w, h) for CameraScript.HandleViewSize."""
-    sw = max(1, float(screen_w))
-    sh = max(1, float(screen_h))
-    vw = float(view_w)
-    vh = float(view_h)
-    if vw < 1e-6 or vh < 1e-6:
-        return 0.0, 0.0, 1.0, 1.0
-    cam_aspect = vw / vh
-    screen_aspect = sw / sh
-    rw = min(1.0, cam_aspect / screen_aspect)
-    rh = min(1.0, screen_aspect / cam_aspect)
-    return (0.5 - rw * 0.5), (0.5 - rh * 0.5), rw, rh
 
 
 def _seed_camera_script_view(plan, objects):
@@ -913,44 +761,6 @@ def _seed_camera_script_view(plan, objects):
     plan["camera_rect"] = _camera_script_rect(sw, sh, vw, vh)
 
 
-def player_display(root):
-    """Player Settings display tuple.
-
-    Returns (width, height, fullscreen, native_resolution, maximized).
-
-    fullscreenMode (Unity FullScreenMode):
-      0 ExclusiveFullScreen, 1 FullScreenWindow → fullscreen 1
-      2 MaximizedWindow → maximized 1
-      3 Windowed / omitted → windowed (safe default for pack hosts / CI)
-    defaultIsNativeResolution 1 → fullscreen hosts use the monitor video mode.
-    """
-    width, height = 1024, 768
-    fullscreen_mode = 3  # Windowed when unset
-    native = 1
-    settings = os.path.join(root, "ProjectSettings", "ProjectSettings.asset")
-    if os.path.isfile(settings):
-        text = _read(settings)
-        m = re.search(r"(?m)^\s*defaultScreenWidth:\s*(-?\d+)\s*$", text)
-        if m:
-            width = int(m.group(1))
-        m = re.search(r"(?m)^\s*defaultScreenHeight:\s*(-?\d+)\s*$", text)
-        if m:
-            height = int(m.group(1))
-        m = re.search(r"(?m)^\s*fullscreenMode:\s*(-?\d+)\s*$", text)
-        if m:
-            fullscreen_mode = int(m.group(1))
-        m = re.search(
-            r"(?m)^\s*defaultIsNativeResolution:\s*(-?\d+)\s*$", text)
-        if m:
-            native = int(m.group(1))
-    if width < 1:
-        width = 1
-    if height < 1:
-        height = 1
-    fullscreen = 1 if fullscreen_mode in (0, 1) else 0
-    maximized = 1 if fullscreen_mode == 2 else 0
-    return width, height, fullscreen, (1 if native else 0), maximized
-
 
 def _load_sorting_layers(root):
     """TagManager.asset m_SortingLayers → [{name, unique_id}, ...] in draw order.
@@ -978,29 +788,6 @@ def _load_sorting_layers(root):
         layers = [{"name": "Default", "unique_id": 0}]
     return layers
 
-
-def _apply_sprite_sorting(objects, sorting_layers):
-    """Resolve SpriteRenderer sorting_layer index from TagManager uniqueIDs."""
-    id_to_idx = {}
-    for i, L in enumerate(sorting_layers or []):
-        id_to_idx[int(L["unique_id"])] = i
-    for o in objects:
-        sp = o.get("sprite")
-        if not sp:
-            continue
-        lid = int(sp.get("sorting_layer_id") or 0)
-        if lid in id_to_idx:
-            sp["sorting_layer"] = id_to_idx[lid]
-        else:
-            # Fall back to authored m_SortingLayer index (clamped).
-            idx = int(sp.get("sorting_layer_yaml") or 0)
-            n = len(sorting_layers) if sorting_layers else 1
-            if idx < 0:
-                idx = 0
-            if idx >= n:
-                idx = n - 1
-            sp["sorting_layer"] = idx
-        sp["sorting_order"] = int(sp.get("sorting_order") or 0)
 
 
 def unity_player_log_path(company, product, home=None):
@@ -1030,10 +817,6 @@ def unity_persistent_data_path(company, product, home=None):
         return os.path.join(base, "AppData", "LocalLow", company, product)
     return os.path.join(home, ".config", "unity3d", company, product)
 
-
-def _read(path):
-    with open(path) as f:
-        return f.read()
 
 
 def _editor_build_settings_path(root):
@@ -1234,241 +1017,6 @@ def _asset_guid_map(root):
     return out
 
 
-def _paeth(a, b, c):
-    p = a + b - c
-    pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
-    if pa <= pb and pa <= pc:
-        return a
-    if pb <= pc:
-        return b
-    return c
-
-
-def _load_png_rgba(path):
-    """Decode an 8-bit non-interlaced PNG to (w, h, rgba_bytes).
-
-    Supports color types 2 (RGB) and 6 (RGBA). Used so editing a referenced
-    sprite asset changes packed visuals — no invented placeholder colors.
-    """
-    import struct
-    import zlib
-
-    with open(path, "rb") as f:
-        data = f.read()
-    if data[:8] != b"\x89PNG\r\n\x1a\n":
-        raise PackError("not a PNG: %s" % path)
-    pos = 8
-    w = h = None
-    color_type = None
-    idat = []
-    while pos + 8 <= len(data):
-        length = struct.unpack(">I", data[pos:pos + 4])[0]
-        tag = data[pos + 4:pos + 8]
-        chunk = data[pos + 8:pos + 8 + length]
-        pos = pos + 12 + length
-        if tag == b"IHDR":
-            w, h, bit_depth, color_type, comp, filt, inter = struct.unpack(
-                ">IIBBBBB", chunk)
-            if bit_depth != 8 or inter != 0 or comp != 0 or filt != 0:
-                raise PackError(
-                    "unsupported PNG (need 8-bit non-interlaced): %s" % path)
-            if color_type not in (2, 6):
-                raise PackError(
-                    "unsupported PNG color type %d (need RGB/RGBA): %s"
-                    % (color_type, path))
-        elif tag == b"IDAT":
-            idat.append(chunk)
-        elif tag == b"IEND":
-            break
-    if w is None or not idat:
-        raise PackError("incomplete PNG: %s" % path)
-    bpp = 4 if color_type == 6 else 3
-    raw = zlib.decompress(b"".join(idat))
-    stride = w * bpp
-    expect = (stride + 1) * h
-    if len(raw) < expect:
-        raise PackError("PNG IDAT too short: %s" % path)
-    rows = []
-    prev = bytearray(stride)
-    off = 0
-    for _y in range(h):
-        ftype = raw[off]
-        off += 1
-        row = bytearray(raw[off:off + stride])
-        off += stride
-        if ftype == 0:
-            pass
-        elif ftype == 1:  # Sub
-            for i in range(stride):
-                left = row[i - bpp] if i >= bpp else 0
-                row[i] = (row[i] + left) & 255
-        elif ftype == 2:  # Up
-            for i in range(stride):
-                row[i] = (row[i] + prev[i]) & 255
-        elif ftype == 3:  # Average
-            for i in range(stride):
-                left = row[i - bpp] if i >= bpp else 0
-                row[i] = (row[i] + ((left + prev[i]) // 2)) & 255
-        elif ftype == 4:  # Paeth
-            for i in range(stride):
-                left = row[i - bpp] if i >= bpp else 0
-                up = prev[i]
-                ul = prev[i - bpp] if i >= bpp else 0
-                row[i] = (row[i] + _paeth(left, up, ul)) & 255
-        else:
-            raise PackError("bad PNG filter %d in %s" % (ftype, path))
-        rows.append(bytes(row))
-        prev = row
-    # PNG stores top row first; OpenGL / Unity sprite UVs treat the first
-    # texel row as the bottom. Flip so authored art is not Y-mirrored.
-    rows.reverse()
-    if color_type == 6:
-        rgba = b"".join(rows)
-    else:
-        out = bytearray(w * h * 4)
-        i = 0
-        for row in rows:
-            for x in range(w):
-                o = x * 3
-                out[i] = row[o]
-                out[i + 1] = row[o + 1]
-                out[i + 2] = row[o + 2]
-                out[i + 3] = 255
-                i += 4
-        rgba = bytes(out)
-    return w, h, rgba
-
-
-def _pixels_per_unit(asset_path):
-    """Unity TextureImporter `spritePixelsToUnits` (Sprite.pixelsPerUnit).
-
-    Default 100 matches Unity when the .meta omits the field.
-    """
-    meta = asset_path + ".meta"
-    try:
-        text = _read(meta)
-    except IOError:
-        return 100.0
-    m = re.search(r"(?m)^\s*spritePixelsToUnits:\s*([0-9.]+)\s*$", text)
-    if not m:
-        return 100.0
-    v = float(m.group(1))
-    return v if v > 0.0 else 100.0
-
-
-_SPRITE_SHEET_CACHE = {}
-
-
-def _parse_sprite_sheet(asset_path):
-    """TextureImporter.spriteSheet → {internalID: rect dict}.
-
-    ``spriteMode: 2`` (Multiple) packs several sprites in one PNG; Image /
-    SpriteRenderer ``m_Sprite: {fileID, guid}`` names a sheet entry by
-    ``internalID``. Rect ``y`` is from the texture bottom (Unity).
-    """
-    meta = asset_path + ".meta"
-    abspath = os.path.abspath(meta)
-    if abspath in _SPRITE_SHEET_CACHE:
-        return _SPRITE_SHEET_CACHE[abspath]
-    out = {}
-    try:
-        text = _read(meta)
-    except IOError:
-        _SPRITE_SHEET_CACHE[abspath] = out
-        return out
-    mode_m = re.search(r"(?m)^\s*spriteMode:\s*(\d+)\s*$", text)
-    mode = int(mode_m.group(1)) if mode_m else 1
-    # Always index sheet entries when present — Single-mode metas may still
-    # list one sprite; Multiple requires them. fileID lookup is opt-in.
-    sheet = re.search(r"(?m)^\s*spriteSheet:\s*$", text)
-    if not sheet:
-        _SPRITE_SHEET_CACHE[abspath] = out
-        return out
-    body = text[sheet.end():]
-    # Stop before mipmapLimit / userData / next top-level key at column 0–2.
-    stop = re.search(r"(?m)^(mipmapLimitGroupName|userData|assetBundleName):",
-                     body)
-    if stop:
-        body = body[:stop.start()]
-    for m in re.finditer(
-            r"(?ms)^\s{4}-\s+serializedVersion:\s*\d+\s*\n"
-            r"\s+name:\s*(.*?)\n"
-            r"\s+rect:\s*\n"
-            r"\s+serializedVersion:\s*\d+\s*\n"
-            r"\s+x:\s*([^\n]+)\s*\n"
-            r"\s+y:\s*([^\n]+)\s*\n"
-            r"\s+width:\s*([^\n]+)\s*\n"
-            r"\s+height:\s*([^\n]+)\s*\n"
-            r".*?"
-            r"\s+border:\s*\{x:\s*([^,}]+),\s*y:\s*([^,}]+),"
-            r"\s*z:\s*([^,}]+),\s*w:\s*([^}]+)\}"
-            r".*?"
-            r"\s+internalID:\s*(-?\d+)",
-            body):
-        iid = int(m.group(10))
-        out[iid] = {
-            "name": m.group(1).strip(),
-            "x": float(m.group(2)),
-            "y": float(m.group(3)),
-            "w": float(m.group(4)),
-            "h": float(m.group(5)),
-            "border": (float(m.group(6)), float(m.group(7)),
-                       float(m.group(8)), float(m.group(9))),
-            "sprite_mode": mode,
-        }
-    _SPRITE_SHEET_CACHE[abspath] = out
-    return out
-
-
-def _crop_rgba(rgba, tw, th, x, y, cw, ch):
-    """Crop RGBA bytes; Unity sprite rect ``y`` is from the texture bottom.
-
-    ``rgba`` from ``_load_png_rgba`` is already bottom-up (row 0 = texture
-    bottom, same as ``_sample_rgba``). Unity's rect ``y`` is that same origin,
-    so the crop starts at row ``y`` — do **not** convert as if the buffer were
-    PNG top-down (that pulls the wrong half when the slice is shorter than the
-    atlas, e.g. Sound Toggle icons padded above the sprite rect).
-    """
-    tw, th = int(tw), int(th)
-    x0 = max(0, min(tw, int(round(x))))
-    y0 = max(0, int(round(y)))
-    ch_i = max(0, int(round(ch)))
-    cw_i = max(0, int(round(cw)))
-    if x0 + cw_i > tw:
-        cw_i = tw - x0
-    if y0 + ch_i > th:
-        ch_i = th - y0
-    if cw_i < 1 or ch_i < 1:
-        return 0, 0, b""
-    rows = []
-    for row in range(ch_i):
-        o = ((y0 + row) * tw + x0) * 4
-        rows.append(rgba[o:o + cw_i * 4])
-    return cw_i, ch_i, b"".join(rows)
-
-
-def _load_sprite_rgba(path, file_id=None):
-    """Load PNG and crop to the spriteSheet entry for ``file_id`` when set.
-
-    ``spriteMode: Multiple`` textures share one guid; each Image/SpriteRenderer
-    names a sub-rect via ``m_Sprite`` fileID (= sheet ``internalID``). Without
-    the crop, every reference draws the whole atlas (e.g. Settings Menu Full
-    appearing inside every small button that used a sheet slice).
-    """
-    w, h, rgba = _load_png_rgba(path)
-    fid = int(file_id or 0)
-    if fid == 0 or fid == 21300000:
-        return w, h, rgba, _sprite_border_from_meta(path)
-    sheet = _parse_sprite_sheet(path)
-    entry = sheet.get(fid)
-    if not entry:
-        return w, h, rgba, _sprite_border_from_meta(path)
-    cw, ch, cropped = _crop_rgba(
-        rgba, w, h, entry["x"], entry["y"], entry["w"], entry["h"])
-    if cw < 1 or ch < 1:
-        return w, h, rgba, entry.get("border") or (0.0, 0.0, 0.0, 0.0)
-    return cw, ch, cropped, entry.get("border") or (0.0, 0.0, 0.0, 0.0)
-
 
 def _quat_rotate_vec(qx, qy, qz, qw, vx, vy, vz):
     """Apply Unity quaternion (x,y,z,w) to a vector."""
@@ -1514,21 +1062,6 @@ def _quat_xy_basis(qx, qy, qz, qw):
     return m00, m01, m10, m11
 
 
-# Unity defaults when Collider/Rigidbody m_Material is {fileID: 0}.
-_DEFAULT_MAT2D = {
-    "friction": 0.4,
-    "bounciness": 0.0,
-    "friction_combine": 0,  # Average
-    "bounce_combine": 0,
-}
-_DEFAULT_MAT3D = {
-    "dynamic_friction": 0.6,
-    "static_friction": 0.6,
-    "bounciness": 0.0,
-    "friction_combine": 0,
-    "bounce_combine": 0,
-}
-
 
 def _parse_material_guid(block):
     """m_Material: {fileID: 0} or {fileID: 6200000, guid: …, type: 2}."""
@@ -1542,49 +1075,6 @@ def _parse_material_guid(block):
         return None
     return m.group(2).lower()
 
-
-def _parse_physics_material2d(text):
-    fr = re.search(r"(?m)^\s+friction:\s*([0-9.eE+-]+)", text)
-    bn = re.search(r"(?m)^\s+bounciness:\s*([0-9.eE+-]+)", text)
-    fc = re.search(r"(?m)^\s+m_FrictionCombine:\s*(\d+)", text)
-    bc = re.search(r"(?m)^\s+m_BounceCombine:\s*(\d+)", text)
-    return {
-        "friction": float(fr.group(1)) if fr else 0.4,
-        "bounciness": float(bn.group(1)) if bn else 0.0,
-        "friction_combine": int(fc.group(1)) if fc else 0,
-        "bounce_combine": int(bc.group(1)) if bc else 0,
-    }
-
-
-def _parse_physic_material3d(text):
-    df = re.search(r"(?m)^\s+dynamicFriction:\s*([0-9.eE+-]+)", text)
-    sf = re.search(r"(?m)^\s+staticFriction:\s*([0-9.eE+-]+)", text)
-    bn = re.search(r"(?m)^\s+bounciness:\s*([0-9.eE+-]+)", text)
-    fc = re.search(r"(?m)^\s+frictionCombine:\s*(\d+)", text)
-    bc = re.search(r"(?m)^\s+bounceCombine:\s*(\d+)", text)
-    return {
-        "dynamic_friction": float(df.group(1)) if df else 0.6,
-        "static_friction": float(sf.group(1)) if sf else 0.6,
-        "bounciness": float(bn.group(1)) if bn else 0.0,
-        "friction_combine": int(fc.group(1)) if fc else 0,
-        "bounce_combine": int(bc.group(1)) if bc else 0,
-    }
-
-
-def _load_physics_materials(asset_guids):
-    """guid → PhysicsMaterial2D / PhysicMaterial from project assets."""
-    mats2d = {}
-    mats3d = {}
-    for guid, path in (asset_guids or {}).items():
-        low = path.lower()
-        try:
-            if low.endswith(".physicsmaterial2d"):
-                mats2d[guid.lower()] = _parse_physics_material2d(_read(path))
-            elif low.endswith(".physicmaterial"):
-                mats3d[guid.lower()] = _parse_physic_material3d(_read(path))
-        except (IOError, OSError):
-            continue
-    return mats2d, mats3d
 
 
 def _resolve_mat2d(col_guid, rb_guid, mats2d):
@@ -1607,176 +1097,6 @@ def _resolve_mat3d(col_guid, rb_guid, mats3d):
 # ---------------------------------------------------------------------------
 # AnimationClip / AnimatorController (authored assets)
 # ---------------------------------------------------------------------------
-
-def _parse_vec3_keyframes(curve_text):
-    """Extract (time, x, y, z) keys from an AnimationClip Vector3 curve."""
-    keys = []
-    for m in re.finditer(
-            r"time:\s*([0-9.eE+-]+)\s*\n\s*value:\s*\{x:\s*([^,}]+),\s*y:\s*"
-            r"([^,}]+),\s*z:\s*([^}]+)\}",
-            curve_text):
-        keys.append((
-            float(m.group(1)),
-            float(m.group(2)),
-            float(m.group(3)),
-            float(m.group(4)),
-        ))
-    keys.sort(key=lambda k: k[0])
-    return keys
-
-
-def _parse_float_keyframes(curve_text):
-    keys = []
-    for m in re.finditer(
-            r"time:\s*([0-9.eE+-]+)\s*\n\s*value:\s*([0-9.eE+-]+)",
-            curve_text):
-        keys.append((float(m.group(1)), float(m.group(2))))
-    keys.sort(key=lambda k: k[0])
-    return keys
-
-
-def _curve_path_is_root(path_line):
-    """Unity root curves use `path:` empty or `path: \"\"`."""
-    if path_line is None:
-        return True
-    v = path_line.strip()
-    return v == "" or v == '""'
-
-
-def _parse_pptr_sprite_curves(text):
-    """Authored m_PPtrCurves with attribute m_Sprite → path + (t, guid) keys."""
-    out = []
-    sm = re.search(
-        r"(?ms)^  m_PPtrCurves:\s*\n(.*?)(?=^  m_[A-Z]|\Z)", text)
-    if not sm:
-        return out
-    body = sm.group(1)
-    if body.strip().startswith("[]"):
-        return out
-    for cm in re.finditer(
-            r"(?ms)^  - serializedVersion:.*?"
-            r"(?=^  - serializedVersion:|^  m_|\Z)", body):
-        block = cm.group(0)
-        attr = re.search(r"(?m)^\s+attribute:\s*(.+)$", block)
-        if not attr or attr.group(1).strip() != "m_Sprite":
-            continue
-        path_m = re.search(r"(?m)^\s+path:\s*(.*)$", block)
-        path = path_m.group(1).strip().strip('"') if path_m else ""
-        keys = []
-        for km in re.finditer(
-                r"(?m)^\s+- time:\s*([0-9.eE+-]+)\s*\n"
-                r"\s+value:\s*\{fileID:\s*-?\d+,\s*guid:\s*"
-                r"([0-9a-fA-F]+)",
-                block):
-            keys.append((float(km.group(1)), km.group(2).lower()))
-        if keys:
-            out.append({"path": path, "keys": keys})
-    return out
-
-
-def _parse_animation_clip(text):
-    """Authored .anim → length, loop, legacy, root position/euler/scale keys."""
-    nm = re.search(r"(?m)^\s+m_Name:\s*(.+)$", text)
-    stop = re.search(r"(?m)^\s+m_StopTime:\s*([0-9.eE+-]+)", text)
-    loop = re.search(r"(?m)^\s+m_LoopTime:\s*(\d+)", text)
-    wrap = re.search(r"(?m)^\s+m_WrapMode:\s*(\d+)", text)
-    legacy = re.search(r"(?m)^\s+m_Legacy:\s*(\d+)", text)
-    # WrapMode 2 = Loop; LoopTime 1 also loops.
-    do_loop = 1
-    if loop:
-        do_loop = int(loop.group(1))
-    elif wrap and int(wrap.group(1)) == 2:
-        do_loop = 1
-    elif wrap:
-        do_loop = 0
-
-    def _root_vec3_curves(section_name):
-        out = []
-        # Each list entry: "- curve:" … "path: …"
-        sm = re.search(
-            r"(?ms)^  %s:\s*\n(.*?)(?=^  m_[A-Z]|\Z)" % section_name, text)
-        if not sm:
-            # empty list form: m_PositionCurves: []
-            return out
-        body = sm.group(1)
-        if body.strip().startswith("[]"):
-            return out
-        for cm in re.finditer(
-                r"(?ms)^  - curve:\n(.*?)(?=^  - curve:|^  m_|\Z)", body):
-            block = cm.group(1)
-            pm = re.search(r"(?m)^\s+path:\s*(.*)$", block)
-            path = pm.group(1) if pm else ""
-            if not _curve_path_is_root(path):
-                continue
-            keys = _parse_vec3_keyframes(block)
-            if keys:
-                out.extend(keys)
-        return out
-
-    pos = _root_vec3_curves("m_PositionCurves")
-    euler = _root_vec3_curves("m_EulerCurves")
-    scale = _root_vec3_curves("m_ScaleCurves")
-    sprite_curves = _parse_pptr_sprite_curves(text)
-    length = float(stop.group(1)) if stop else 0.0
-    if length <= 0.0:
-        for keys in (pos, euler, scale):
-            if keys:
-                length = max(length, keys[-1][0])
-        for sc in sprite_curves:
-            if sc["keys"]:
-                length = max(length, sc["keys"][-1][0])
-        if length <= 0.0:
-            length = 1.0
-    return {
-        "name": (nm.group(1).strip() if nm else "Clip"),
-        "length": length,
-        "loop": do_loop,
-        "legacy": int(legacy.group(1)) if legacy else 0,
-        "pos_keys": pos,
-        "euler_keys": euler,
-        "scale_keys": scale,
-        "sprite_curves": sprite_curves,
-    }
-
-
-def _parse_animator_controller_default_clip(text):
-    """Return motion clip guid of the default AnimatorState, or None."""
-    dm = re.search(
-        r"(?m)^\s+m_DefaultState:\s*\{fileID:\s*(-?\d+)\}", text)
-    if not dm:
-        return None
-    default_id = dm.group(1)
-    # Find AnimatorState block with that fileID and its m_Motion guid.
-    for m in re.finditer(
-            r"(?ms)^--- !u!1102 &(-?\d+)\n(.*?)(?=^--- |\Z)", text):
-        if m.group(1) != default_id:
-            continue
-        block = m.group(2)
-        gm = re.search(
-            r"m_Motion:\s*\{fileID:\s*(-?\d+)(?:,\s*guid:\s*"
-            r"([0-9a-fA-F]+))?",
-            block)
-        if gm and gm.group(2):
-            return gm.group(2).lower()
-        return None
-    return None
-
-
-def _load_animation_assets(asset_guids):
-    """guid → AnimationClip dict; guid → default clip guid for controllers."""
-    clips = {}
-    controllers = {}
-    for guid, path in (asset_guids or {}).items():
-        low = path.lower()
-        try:
-            if low.endswith(".anim"):
-                clips[guid.lower()] = _parse_animation_clip(_read(path))
-            elif low.endswith(".controller"):
-                controllers[guid.lower()] = _parse_animator_controller_default_clip(
-                    _read(path))
-        except (IOError, OSError):
-            continue
-    return clips, controllers
 
 
 def _parse_asset_guid_ref(block, field):
@@ -1838,572 +1158,13 @@ def _resolve_world_trs(xf_id, by_id, cache=None, stack=None):
     return out
 
 
-def _attach_sprite_textures(objects, asset_guids):
-    """Load PNG pixels for each SpriteRenderer that references a project sprite.
 
-    World half-extents follow Unity: (pixels / pixelsPerUnit) * scale / 2.
-    Multiple-mode sheet slices are cropped by ``sprite_file_id`` (internalID).
-    """
-    todo = [o for o in objects if o.get("sprite")]
-    n = len(todo)
-    cache = {}  # (path, file_id) -> (w, h, rgba, ppu, border) or None
-    if n:
-        _progress("loading sprites for %d SpriteRenderer(s)" % n)
-    for i, o in enumerate(todo):
-        if n >= 8 and ((i + 1) % 100 == 0 or i + 1 == n):
-            _progress("  sprites %d/%d (%d unique PNG(s))" % (
-                i + 1, n, len(cache)))
-        sp = o.get("sprite")
-        if not sp:
-            continue
-        if sp.get("builtin") or "tex_rgba" in sp:
-            if "a" not in sp:
-                sp["a"] = 1.0
-            continue
-        path = asset_guids.get(sp.get("sprite_guid") or "")
-        if not path or not path.lower().endswith(".png"):
-            o["sprite"] = None
-            continue
-        fid = int(sp.get("sprite_file_id") or 0)
-        key = (path, fid)
-        if key not in cache:
-            try:
-                w, h, rgba, border = _load_sprite_rgba(path, fid)
-                cache[key] = (w, h, rgba, _pixels_per_unit(path), border)
-            except (PackError, IOError):
-                cache[key] = None
-        hit = cache[key]
-        if hit is None:
-            o["sprite"] = None
-            continue
-        w, h, rgba, ppu, border = hit
-        sx = abs(float(sp.get("scale_x", 1.0)))
-        sy = abs(float(sp.get("scale_y", 1.0)))
-        sp["tex_path"] = path
-        sp["tex_w"] = w
-        sp["tex_h"] = h
-        sp["tex_rgba"] = rgba
-        sp["pixels_per_unit"] = ppu
-        sp["border"] = border
-        if sp.get("source") not in ("ui", "ui_tmp"):
-            sp["half_w"] = (float(w) / ppu) * sx * 0.5
-            sp["half_h"] = (float(h) / ppu) * sy * 0.5
-        if "a" not in sp:
-            sp["a"] = 1.0
-
-
-def _collect_textures(objects):
-    """Deduplicate sprite PNGs → plan texture table; set tex_id on sprites.
-
-    Key is (guid, sprite_file_id) so Multiple-mode sheet slices stay distinct.
-    """
-    textures = []
-    by_key = {}
-    for o in objects:
-        sp = o.get("sprite")
-        if not sp or "tex_rgba" not in sp:
-            continue
-        g = sp["sprite_guid"]
-        fid = int(sp.get("sprite_file_id") or 0)
-        key = (g, fid)
-        if key not in by_key:
-            by_key[key] = len(textures)
-            textures.append({
-                "guid": g,
-                "file_id": fid,
-                "path": sp["tex_path"],
-                "w": sp["tex_w"],
-                "h": sp["tex_h"],
-                "rgba": sp["tex_rgba"],
-                "ppu": float(sp.get("pixels_per_unit") or 100.0),
-            })
-        sp["tex_id"] = by_key[key]
-    return textures
-
-
-def _ensure_texture_guids(textures, guids, asset_guids):
-    """Load PNGs for animation-only sprite guids into the texture table.
-
-    Idle.anim swaps to Eyes Closed which may not be any SpriteRenderer's
-    initial m_Sprite — still must pack those texels.
-    """
-    by_key = {(t["guid"], int(t.get("file_id") or 0)): i
-              for i, t in enumerate(textures)}
-    # Also index plain guid → first tex for anim lookups that omit fileID.
-    by_guid = {}
-    for i, t in enumerate(textures):
-        by_guid.setdefault(t["guid"], i)
-    cache = {}
-    for raw in guids or []:
-        g = (raw or "").lower()
-        if not g or g in by_guid:
-            continue
-        path = (asset_guids or {}).get(g)
-        if not path or not path.lower().endswith(".png"):
-            continue
-        if path not in cache:
-            try:
-                w, h, rgba, _border = _load_sprite_rgba(path, 0)
-                cache[path] = (w, h, rgba, _pixels_per_unit(path))
-            except (PackError, IOError):
-                cache[path] = None
-        hit = cache[path]
-        if hit is None:
-            continue
-        w, h, rgba, ppu = hit
-        idx = len(textures)
-        by_key[(g, 0)] = idx
-        by_guid[g] = idx
-        textures.append({
-            "guid": g,
-            "file_id": 0,
-            "path": path,
-            "w": w,
-            "h": h,
-            "rgba": rgba,
-            "ppu": float(ppu),
-        })
-    return by_guid
-
-
-def _anim_sprite_guids(objects):
-    """All sprite PNG guids referenced by authored AnimationClip PPtr curves."""
-    out = []
-    for o in objects or []:
-        p = o.get("anim_player")
-        if not p or not p.get("clip"):
-            continue
-        for sc in p["clip"].get("sprite_curves") or []:
-            for _t, g in sc.get("keys") or []:
-                if g:
-                    out.append(g)
-    return out
-
-
-def _resolve_anim_child_path(owner, path, plan):
-    """Unity curve path under Animator owner → (class, inst, obj) or None."""
-    path = (path or "").strip().strip('"')
-    index = {}
-    for cname, cl in plan["classes"].items():
-        for i, o in enumerate(cl.get("instances") or []):
-            fid = str(o.get("father_id") or "0")
-            index.setdefault((fid, o.get("name")), []).append((cname, i, o))
-    if not path:
-        return None
-    cur_xf = str(owner.get("xf_id") or "0")
-    hit = None
-    for part in path.split("/"):
-        kids = index.get((cur_xf, part))
-        if not kids:
-            return None
-        hit = kids[0]
-        cur_xf = str(hit[2].get("xf_id") or "0")
-    return hit
-
-
-# Builtin uGUI Image / Button MonoBehaviour script guids (UnityEngine.UI.dll).
-_IMAGE_SCRIPT_GUID = "fe87c0e1cc204ed48ad3b37840f39efc"
-_BUTTON_SCRIPT_GUID = "4e29b1a8efbd4b44bb3f3716e73f07ff"
-# UnityEngine.UI.Slider (handle/fill anchors driven by m_Value).
-_SLIDER_SCRIPT_GUID = "67db9e8f0e2ae9c40bc1e2b64352a6b4"
-# UnityEngine.UI.Scrollbar / ScrollRect / Toggle.
-_SCROLLBAR_SCRIPT_GUID = "2a4db7a114972834c8e4117be1d82ba3"
-_SCROLLRECT_SCRIPT_GUID = "1aa08ab6e0800fa44ae55d278d1423e3"
-_TOGGLE_SCRIPT_GUID = "9085046f02f69544eb97fd06b6048fe2"
-# UnityEngine.EventSystems.EventTrigger (UnityEngine.UI.dll).
-_EVENTTRIGGER_SCRIPT_GUID = "d0b148fe25e99eb48b9724523833bab1"
-# TextMeshProUGUI (com.unity.ugui / Unity.TextMeshPro).
-_TMP_UGUI_SCRIPT_GUID = "f4688fdb7df04437aeb418b961361dc5"
 # uGUI layout controllers (authored Vertical/HorizontalLayoutGroup).
 _VLAYOUT_SCRIPT_GUID = "59f8146938fff824cb5fd77236b75775"
 _HLAYOUT_SCRIPT_GUID = "30649d3a9faa99c48a7b1166b86bf2a0"
 _LAYOUT_ELEMENT_GUID = "306cc8c2b49d7114eaa3623786fc2126"
 _CONTENT_SIZE_FITTER_GUID = "3245ec927659c4140ac4f8d17403cc18"
 _ASPECT_RATIO_FITTER_GUID = "86710e43de46f6f4bac7c8e50813a599"
-# uGUI CanvasScaler (UnityEngine.UI.dll).
-_CANVAS_SCALER_GUID = "0cd44c1031e13a943bb63640046fad76"
-# Unity "Resources/unity_builtin_extra" — UISprite, Background, Knob, …
-_UNITY_BUILTIN_GUID = "0000000000000000f000000000000000"
-
-
-def _is_unity_builtin_guid(guid):
-    return (guid or "").lower() == _UNITY_BUILTIN_GUID
-
-
-def _yaml_vec2(block, key, default=(0.0, 0.0)):
-    m = re.search(
-        r"(?m)^\s+%s:\s*\{x:\s*([^,}]+),\s*y:\s*([^}]+)\}" % re.escape(key),
-        block)
-    if not m:
-        return default
-    return (float(m.group(1)), float(m.group(2)))
-
-
-def _is_ui_image_mb(block, guid):
-    if (guid or "").lower() == _IMAGE_SCRIPT_GUID:
-        return True
-    return bool(re.search(
-        r"(?m)^\s+m_EditorClassIdentifier:.*\bImage\s*$", block))
-
-
-def _is_ui_button_mb(block, guid):
-    """True for builtin Button or a Button subclass (e.g. UIButton).
-
-    Subclasses keep Selectable ColorBlock + Button.onClick in YAML; the
-    EditorClassIdentifier is often ``…UIButton``, which does not match
-    ``\\bButton`` (no word boundary inside the name).
-    """
-    if (guid or "").lower() == _BUTTON_SCRIPT_GUID:
-        return True
-    # UnityEngine.UI.Button (exact type name at end of identifier).
-    if re.search(
-            r"(?m)^\s+m_EditorClassIdentifier:.*(?:^|[.\s:])Button\s*$",
-            block):
-        return True
-    # Button / Button-subclass serialization shape (not Toggle/Slider).
-    if (re.search(r"(?m)^\s+m_Colors:\s*$", block)
-            and re.search(r"(?m)^\s+m_OnClick:\s*$", block)):
-        return True
-    return False
-
-
-def _is_ui_slider_mb(block, guid):
-    """True for builtin Slider or a Slider subclass (e.g. ``_Slider``).
-
-    Shape: ``m_HandleRect`` + ``m_MinValue`` (Scrollbar has HandleRect but
-    not Min/MaxValue).
-    """
-    if (guid or "").lower() == _SLIDER_SCRIPT_GUID:
-        return True
-    if re.search(
-            r"(?m)^\s+m_EditorClassIdentifier:.*(?:^|[.\s:])_?Slider\s*$",
-            block):
-        return True
-    if (re.search(r"(?m)^\s+m_HandleRect:\s*", block)
-            and re.search(r"(?m)^\s+m_MinValue:\s*", block)
-            and re.search(r"(?m)^\s+m_MaxValue:\s*", block)):
-        return True
-    return False
-
-
-def _parse_ui_slider(block, file_id=None):
-    """Authored uGUI Slider → value range, direction, handle/fill, onValueChanged."""
-    def _fid(key):
-        m = re.search(
-            r"(?m)^\s+%s:\s*\{fileID:\s*(-?\d+)" % re.escape(key), block)
-        return int(m.group(1)) if m else 0
-
-    def _f(key, default):
-        m = re.search(
-            r"(?m)^\s+%s:\s*([0-9.eE+-]+)" % re.escape(key), block)
-        return float(m.group(1)) if m else float(default)
-
-    def _i(key, default):
-        m = re.search(r"(?m)^\s+%s:\s*(-?\d+)" % re.escape(key), block)
-        return int(m.group(1)) if m else int(default)
-
-    calls = []
-    oc = re.search(r"(?m)^\s+m_OnValueChanged:\s*$", block)
-    if oc:
-        chunk = block[oc.end():]
-        stop = re.search(r"(?m)^---\s", chunk)
-        if stop:
-            chunk = chunk[:stop.start()]
-        # Stop at next sibling field of Slider / _Slider extras.
-        stop2 = re.search(
-            r"(?m)^\s+(?:displayValueText|selectable|slidingAreaRectTrs|"
-            r"snapValues|indexOfCurrentSnapValue):\s*",
-            chunk)
-        if stop2:
-            chunk = chunk[:stop2.start()]
-        for cm in re.finditer(
-                r"m_Target:\s*\{fileID:\s*(-?\d+)\}[\s\S]*?"
-                r"m_MethodName:\s*(\w+)[\s\S]*?"
-                r"m_Mode:\s*(\d+)",
-                chunk):
-            tid = int(cm.group(1))
-            if tid == 0:
-                continue
-            calls.append({
-                "target_go": str(tid),
-                "method": cm.group(2),
-                "mode": int(cm.group(3)),
-            })
-    interactable = _i("m_Interactable", 1)
-    if not _mb_enabled(block):
-        interactable = 0
-    return {
-        "enabled": _mb_enabled(block),
-        "interactable": interactable,
-        "handle_rect_id": _fid("m_HandleRect"),
-        "fill_rect_id": _fid("m_FillRect"),
-        # _Slider companion field; 0 → use handle parent / slider root.
-        "slide_area_id": _fid("slidingAreaRectTrs"),
-        "direction": _i("m_Direction", 0),
-        "min": _f("m_MinValue", 0.0),
-        "max": _f("m_MaxValue", 1.0),
-        "value": _f("m_Value", 0.0),
-        "whole_numbers": _i("m_WholeNumbers", 0),
-        "on_value_changed": calls,
-        "mb_file_id": file_id,
-    }
-
-
-def _is_ui_scrollbar_mb(block, guid):
-    """True for builtin Scrollbar (HandleRect + Size, no Min/MaxValue)."""
-    if (guid or "").lower() == _SCROLLBAR_SCRIPT_GUID:
-        return True
-    if re.search(
-            r"(?m)^\s+m_EditorClassIdentifier:.*(?:^|[.\s:])Scrollbar\s*$",
-            block):
-        return True
-    if (re.search(r"(?m)^\s+m_HandleRect:\s*", block)
-            and re.search(r"(?m)^\s+m_Size:\s*", block)
-            and not re.search(r"(?m)^\s+m_MinValue:\s*", block)):
-        return True
-    return False
-
-
-def _parse_ui_scrollbar(block, file_id=None):
-    """Authored uGUI Scrollbar → value/size/direction/handle/onValueChanged."""
-    def _fid(key):
-        m = re.search(
-            r"(?m)^\s+%s:\s*\{fileID:\s*(-?\d+)" % re.escape(key), block)
-        return int(m.group(1)) if m else 0
-
-    def _f(key, default):
-        m = re.search(
-            r"(?m)^\s+%s:\s*([0-9.eE+-]+)" % re.escape(key), block)
-        return float(m.group(1)) if m else float(default)
-
-    def _i(key, default):
-        m = re.search(r"(?m)^\s+%s:\s*(-?\d+)" % re.escape(key), block)
-        return int(m.group(1)) if m else int(default)
-
-    calls = []
-    oc = re.search(r"(?m)^\s+m_OnValueChanged:\s*$", block)
-    if oc:
-        chunk = block[oc.end():]
-        stop = re.search(r"(?m)^---\s", chunk)
-        if stop:
-            chunk = chunk[:stop.start()]
-        for cm in re.finditer(
-                r"m_Target:\s*\{fileID:\s*(-?\d+)\}[\s\S]*?"
-                r"m_MethodName:\s*(\w+)[\s\S]*?"
-                r"m_Mode:\s*(\d+)",
-                chunk):
-            tid = int(cm.group(1))
-            if tid == 0:
-                continue
-            calls.append({
-                "target_go": str(tid),
-                "method": cm.group(2),
-                "mode": int(cm.group(3)),
-            })
-    interactable = _i("m_Interactable", 1)
-    enabled = _mb_enabled(block)
-    if not enabled:
-        interactable = 0
-    return {
-        "enabled": enabled,
-        "interactable": interactable,
-        "handle_rect_id": _fid("m_HandleRect"),
-        "direction": _i("m_Direction", 0),
-        "value": _f("m_Value", 0.0),
-        "size": _f("m_Size", 0.2),
-        "on_value_changed": calls,
-        "mb_file_id": file_id,
-    }
-
-
-def _is_ui_scrollrect_mb(block, guid):
-    if (guid or "").lower() == _SCROLLRECT_SCRIPT_GUID:
-        return True
-    if re.search(
-            r"(?m)^\s+m_EditorClassIdentifier:.*(?:^|[.\s:])ScrollRect\s*$",
-            block):
-        return True
-    if (re.search(r"(?m)^\s+m_Content:\s*", block)
-            and re.search(r"(?m)^\s+m_Viewport:\s*", block)):
-        return True
-    return False
-
-
-def _parse_ui_scrollrect(block, file_id=None):
-    """Authored uGUI ScrollRect → content/viewport/scrollbar links."""
-    def _fid(key):
-        m = re.search(
-            r"(?m)^\s+%s:\s*\{fileID:\s*(-?\d+)" % re.escape(key), block)
-        return int(m.group(1)) if m else 0
-
-    def _i(key, default):
-        m = re.search(r"(?m)^\s+%s:\s*(-?\d+)" % re.escape(key), block)
-        return int(m.group(1)) if m else int(default)
-
-    return {
-        "enabled": _mb_enabled(block),
-        "content_id": _fid("m_Content"),
-        "viewport_id": _fid("m_Viewport"),
-        "horizontal": _i("m_Horizontal", 1),
-        "vertical": _i("m_Vertical", 1),
-        "hbar_mb_id": _fid("m_HorizontalScrollbar"),
-        "vbar_mb_id": _fid("m_VerticalScrollbar"),
-        "mb_file_id": file_id,
-    }
-
-
-def _is_ui_toggle_mb(block, guid):
-    if (guid or "").lower() == _TOGGLE_SCRIPT_GUID:
-        return True
-    if re.search(
-            r"(?m)^\s+m_EditorClassIdentifier:.*(?:^|[.\s:])Toggle\s*$",
-            block):
-        return True
-    if (re.search(r"(?m)^\s+m_IsOn:\s*", block)
-            and (re.search(r"(?m)^\s+onValueChanged:\s*$", block)
-                 or re.search(r"(?m)^\s+m_OnValueChanged:\s*$", block))):
-        return True
-    return False
-
-
-def _parse_ui_toggle(block, file_id=None):
-    """Authored uGUI Toggle → isOn, graphic, onValueChanged (bool)."""
-    def _fid(key):
-        m = re.search(
-            r"(?m)^\s+%s:\s*\{fileID:\s*(-?\d+)" % re.escape(key), block)
-        return int(m.group(1)) if m else 0
-
-    def _i(key, default):
-        m = re.search(r"(?m)^\s+%s:\s*(-?\d+)" % re.escape(key), block)
-        return int(m.group(1)) if m else int(default)
-
-    calls = []
-    oc = re.search(r"(?m)^\s+(?:m_)?OnValueChanged:\s*$", block)
-    if not oc:
-        oc = re.search(r"(?m)^\s+onValueChanged:\s*$", block)
-    if oc:
-        chunk = block[oc.end():]
-        stop = re.search(r"(?m)^---\s", chunk)
-        if stop:
-            chunk = chunk[:stop.start()]
-        stop2 = re.search(r"(?m)^\s+m_IsOn:\s*", chunk)
-        if stop2:
-            chunk = chunk[:stop2.start()]
-        for cm in re.finditer(
-                r"m_Target:\s*\{fileID:\s*(-?\d+)\}[\s\S]*?"
-                r"m_MethodName:\s*(\w+)[\s\S]*?"
-                r"m_Mode:\s*(\d+)[\s\S]*?"
-                r"m_BoolArgument:\s*(\d+)",
-                chunk):
-            tid = int(cm.group(1))
-            if tid == 0:
-                continue
-            calls.append({
-                "target_go": str(tid),
-                "method": cm.group(2),
-                "mode": int(cm.group(3)),
-                "bool_arg": int(cm.group(4)),
-            })
-    interactable = _i("m_Interactable", 1)
-    if not _mb_enabled(block):
-        interactable = 0
-    graphic = _fid("graphic")
-    if not graphic:
-        graphic = _fid("m_Graphic")
-    return {
-        "enabled": _mb_enabled(block),
-        "interactable": interactable,
-        "is_on": _i("m_IsOn", 1),
-        "graphic_id": graphic,
-        "on_value_changed": calls,
-        "mb_file_id": file_id,
-    }
-
-
-def _is_ui_eventtrigger_mb(block, guid):
-    """True for UnityEngine.EventSystems.EventTrigger."""
-    if (guid or "").lower() == _EVENTTRIGGER_SCRIPT_GUID:
-        return True
-    return bool(re.search(
-        r"(?m)^\s+m_EditorClassIdentifier:.*\bEventTrigger\s*$", block))
-
-
-def _parse_ui_eventtrigger(block, file_id=None):
-    """Authored EventTrigger → delegates (eventID + persistent calls).
-
-    EventTriggerType: PointerEnter=0, Exit=1, Down=2, Up=3, Click=4,
-    BeginDrag=13, EndDrag=14 (others ignored until needed).
-    PersistentListenerMode: Void=1, Object=2, Float=4, String=5, Bool=6.
-    """
-    delegates = []
-    dm = re.search(r"(?m)^\s+m_Delegates:\s*$", block)
-    if not dm:
-        return {
-            "enabled": _mb_enabled(block),
-            "delegates": [],
-            "mb_file_id": file_id,
-        }
-    chunk = block[dm.end():]
-    stop = re.search(r"(?m)^---\s", chunk)
-    if stop:
-        chunk = chunk[:stop.start()]
-    parts = re.split(r"(?m)^  - eventID:\s*", chunk)
-    for part in parts[1:]:
-        em = re.match(r"(\d+)", part)
-        if not em:
-            continue
-        event_id = int(em.group(1))
-        calls = []
-        for cm in re.finditer(
-                r"m_Target:\s*\{fileID:\s*(-?\d+)(?:,\s*guid:\s*"
-                r"([0-9a-fA-F]+))?[^}]*\}[\s\S]*?"
-                r"m_TargetAssemblyTypeName:\s*([^\n]+)[\s\S]*?"
-                r"m_MethodName:\s*(\w+)[\s\S]*?"
-                r"m_Mode:\s*(\d+)[\s\S]*?"
-                r"m_ObjectArgument:\s*\{fileID:\s*(-?\d+)(?:,\s*guid:\s*"
-                r"([0-9a-fA-F]+))?[^}]*\}[\s\S]*?"
-                r"m_ObjectArgumentAssemblyTypeName:\s*([^\n]+)[\s\S]*?"
-                r"m_IntArgument:\s*(-?\d+)[\s\S]*?"
-                r"m_FloatArgument:\s*([^\n]+)[\s\S]*?"
-                r"m_StringArgument:\s*(.*)[\s\S]*?"
-                r"m_BoolArgument:\s*(\d+)",
-                part):
-            tid = int(cm.group(1))
-            if tid == 0 and not cm.group(2):
-                continue
-            try:
-                farg = float(cm.group(10).strip())
-            except ValueError:
-                farg = 0.0
-            calls.append({
-                "target_go": str(tid),
-                "target_guid": (cm.group(2) or "").lower(),
-                "target_assembly": (cm.group(3) or "").strip(),
-                "method": cm.group(4),
-                "mode": int(cm.group(5)),
-                "object_arg": str(int(cm.group(6))),
-                "object_arg_guid": (cm.group(7) or "").lower(),
-                "object_arg_type": (cm.group(8) or "").strip(),
-                "int_arg": int(cm.group(9)),
-                "float_arg": farg,
-                "string_arg": (cm.group(11) or "").strip(),
-                "bool_arg": int(cm.group(12)),
-            })
-        if calls:
-            delegates.append({"event_id": event_id, "calls": calls})
-    return {
-        "enabled": _mb_enabled(block),
-        "delegates": delegates,
-        "mb_file_id": file_id,
-    }
-
-
-def _is_ui_tmp_mb(block, guid):
-    if (guid or "").lower() == _TMP_UGUI_SCRIPT_GUID:
-        return True
-    return bool(re.search(
-        r"(?m)^\s+m_EditorClassIdentifier:.*\bTextMeshProUGUI\s*$", block))
-
 
 def _is_vlayout_mb(block, guid):
     g = (guid or "").lower()
@@ -2446,52 +1207,6 @@ def _is_aspect_ratio_fitter_mb(block, guid):
         r"(?m)^\s+m_EditorClassIdentifier:.*\bAspectRatioFitter\s*$", block))
 
 
-def _is_canvas_scaler_mb(block, guid):
-    g = (guid or "").lower()
-    if g == _CANVAS_SCALER_GUID:
-        return True
-    return bool(re.search(
-        r"(?m)^\s+m_EditorClassIdentifier:.*\bCanvasScaler\s*$", block))
-
-
-def _mb_enabled(block, default=1):
-    """Authored Behaviour.m_Enabled (1 when YAML omits the field)."""
-    en = re.search(r"(?m)^\s+m_Enabled:\s*(\d+)", block)
-    return int(en.group(1)) if en else default
-
-
-def _parse_pad_int(block, key, default=0):
-    m = re.search(r"(?m)^\s+%s:\s*(-?\d+)" % re.escape(key), block)
-    return int(m.group(1)) if m else default
-
-
-def _parse_hv_layout_group(block, vertical):
-    """Authored Vertical/HorizontalLayoutGroup → bake dict."""
-    sp = re.search(r"(?m)^\s+m_Spacing:\s*([0-9.eE+-]+)", block)
-    return {
-        "enabled": _mb_enabled(block),
-        "vertical": bool(vertical),
-        "pad_left": _parse_pad_int(block, "m_Left", 0),
-        "pad_right": _parse_pad_int(block, "m_Right", 0),
-        "pad_top": _parse_pad_int(block, "m_Top", 0),
-        "pad_bottom": _parse_pad_int(block, "m_Bottom", 0),
-        "spacing": float(sp.group(1)) if sp else 0.0,
-        "child_alignment": _parse_pad_int(block, "m_ChildAlignment", 0),
-        "child_force_expand_width": _parse_pad_int(
-            block, "m_ChildForceExpandWidth", 1),
-        "child_force_expand_height": _parse_pad_int(
-            block, "m_ChildForceExpandHeight", 1),
-        "child_control_width": _parse_pad_int(
-            block, "m_ChildControlWidth", 1),
-        "child_control_height": _parse_pad_int(
-            block, "m_ChildControlHeight", 1),
-        "child_scale_width": _parse_pad_int(
-            block, "m_ChildScaleWidth", 0),
-        "child_scale_height": _parse_pad_int(
-            block, "m_ChildScaleHeight", 0),
-        "reverse": _parse_pad_int(block, "m_ReverseArrangement", 0),
-    }
-
 
 def _parse_layout_element(block):
     def _f(key):
@@ -2533,438 +1248,6 @@ def _parse_aspect_ratio_fitter(block):
     }
 
 
-def _parse_canvas_scaler(block):
-    """Authored CanvasScaler → ui scale mode, reference resolution, match."""
-    ref = _yaml_vec2(block, "m_ReferenceResolution", (800.0, 600.0))
-    sf = re.search(r"(?m)^\s+m_ScaleFactor:\s*([0-9.eE+-]+)", block)
-    match = re.search(
-        r"(?m)^\s+m_MatchWidthOrHeight:\s*([0-9.eE+-]+)", block)
-    return {
-        "enabled": _mb_enabled(block),
-        # 0 Constant Pixel Size, 1 Scale With Screen Size, 2 Constant Physical
-        "ui_scale_mode": _parse_pad_int(block, "m_UiScaleMode", 0),
-        "scale_factor": float(sf.group(1)) if sf else 1.0,
-        "ref_x": float(ref[0]),
-        "ref_y": float(ref[1]),
-        # 0 Match Width Or Height, 1 Expand, 2 Shrink
-        "screen_match_mode": _parse_pad_int(block, "m_ScreenMatchMode", 0),
-        "match": float(match.group(1)) if match else 0.0,
-    }
-
-
-def _parse_ui_tmp(block, asset_guids):
-    """Authored TextMeshProUGUI → text, font guid, color, size, alignment."""
-    en = re.search(r"(?m)^\s+m_Enabled:\s*(\d+)", block)
-    tm = re.search(r"(?m)^\s+m_text:\s*(.*)$", block)
-    text = ""
-    if tm:
-        raw = tm.group(1).strip()
-        if raw.startswith("'") and raw.endswith("'") and len(raw) >= 2:
-            text = raw[1:-1]
-        elif raw.startswith('"') and raw.endswith('"') and len(raw) >= 2:
-            text = raw[1:-1]
-        else:
-            text = raw
-    fg = re.search(
-        r"m_fontAsset:\s*\{fileID:\s*-?\d+,\s*guid:\s*([0-9a-fA-F]+)",
-        block)
-    font_guid = fg.group(1).lower() if fg else None
-    col = re.search(
-        r"m_fontColor:\s*\{r:\s*([^,}]+),\s*g:\s*([^,}]+),"
-        r"\s*b:\s*([^,}]+),\s*a:\s*([^}]+)\}", block)
-    fs = re.search(r"(?m)^\s+m_fontSize:\s*([0-9.eE+-]+)", block)
-    ha = re.search(r"(?m)^\s+m_HorizontalAlignment:\s*(\d+)", block)
-    va = re.search(r"(?m)^\s+m_VerticalAlignment:\s*(\d+)", block)
-    # 0 Overflow, 1 Ellipsis, 2 Masking, 3 Truncate, …
-    ov = re.search(r"(?m)^\s+m_overflowMode:\s*(\d+)", block)
-    has_font = bool(font_guid and font_guid in (asset_guids or {}))
-    return {
-        "text": text,
-        "font_guid": font_guid,
-        "has_font": has_font,
-        "r": float(col.group(1)) if col else 1.0,
-        "g": float(col.group(2)) if col else 1.0,
-        "b": float(col.group(3)) if col else 1.0,
-        "a": float(col.group(4)) if col else 1.0,
-        "font_size": float(fs.group(1)) if fs else 14.0,
-        "h_align": int(ha.group(1)) if ha else 1,
-        "v_align": int(va.group(1)) if va else 256,
-        "overflow_mode": int(ov.group(1)) if ov else 0,
-        "enabled": int(en.group(1)) if en else 1,
-    }
-
-
-def _parse_ui_button(block, file_id=None):
-    """Authored uGUI Button → interactable, ColorBlock, persistent onClick."""
-    en = re.search(r"(?m)^\s+m_Interactable:\s*(\d+)", block)
-    mb_en = _mb_enabled(block)
-
-    def _col(key, default):
-        m = re.search(
-            r"%s:\s*\{r:\s*([^,}]+),\s*g:\s*([^,}]+),"
-            r"\s*b:\s*([^,}]+),\s*a:\s*([^}]+)\}" % re.escape(key),
-            block)
-        if not m:
-            return default
-        return (float(m.group(1)), float(m.group(2)),
-                float(m.group(3)), float(m.group(4)))
-
-    mult = re.search(r"(?m)^\s+m_ColorMultiplier:\s*([0-9.eE+-]+)", block)
-    colors = {
-        "normal": _col("m_NormalColor", (1.0, 1.0, 1.0, 1.0)),
-        "highlighted": _col("m_HighlightedColor",
-                            (0.9607843, 0.9607843, 0.9607843, 1.0)),
-        "pressed": _col("m_PressedColor",
-                        (0.78431374, 0.78431374, 0.78431374, 1.0)),
-        "selected": _col("m_SelectedColor",
-                         (0.9607843, 0.9607843, 0.9607843, 1.0)),
-        "disabled": _col("m_DisabledColor",
-                         (0.78431374, 0.78431374, 0.78431374, 0.5019608)),
-        "multiplier": float(mult.group(1)) if mult else 1.0,
-    }
-    calls = []
-    oc = re.search(r"(?m)^\s+m_OnClick:\s*$", block)
-    if oc:
-        chunk = block[oc.end():]
-        # End of this MonoBehaviour document (next ---) or next sibling field.
-        stop = re.search(r"(?m)^---\s", chunk)
-        if stop:
-            chunk = chunk[:stop.start()]
-        for cm in re.finditer(
-                r"m_Target:\s*\{fileID:\s*(-?\d+)\}[\s\S]*?"
-                r"m_MethodName:\s*(\w+)[\s\S]*?"
-                r"m_Mode:\s*(\d+)[\s\S]*?"
-                r"m_BoolArgument:\s*(\d+)",
-                chunk):
-            tid = int(cm.group(1))
-            if tid == 0:
-                continue
-            span = cm.group(0)
-            sm = re.search(r"m_StringArgument:\s*(.*)", span)
-            string_arg = sm.group(1).strip() if sm else ""
-            calls.append({
-                "target_go": str(tid),
-                "method": cm.group(2),
-                "mode": int(cm.group(3)),
-                "bool_arg": int(cm.group(4)),
-                "string_arg": string_arg,
-            })
-    # Behaviour.enabled false → Selectable does not receive clicks.
-    interactable = int(en.group(1)) if en else 1
-    if not mb_en:
-        interactable = 0
-    return {
-        "enabled": mb_en,
-        "interactable": interactable,
-        "colors": colors,
-        "onclick": calls,
-        # PrefabInstance m_OnClick mods target this MB fileID.
-        "mb_file_id": file_id,
-    }
-
-
-def _rect_pivot_center(parent_w, parent_h, amin, amax, apos, size, pivot):
-    """Canvas-local rect → (center_x, center_y, width, height) in parent pixels.
-
-    Parent origin is bottom-left. Point anchors use sizeDelta as size; stretch
-    anchors use (anchor span * parent) + sizeDelta.
-    """
-    ax0 = float(amin[0]) * parent_w
-    ax1 = float(amax[0]) * parent_w
-    ay0 = float(amin[1]) * parent_h
-    ay1 = float(amax[1]) * parent_h
-    if abs(ax1 - ax0) < 1e-6 and abs(ay1 - ay0) < 1e-6:
-        w = float(size[0])
-        h = float(size[1])
-        pivot_x = ax0 + float(apos[0])
-        pivot_y = ay0 + float(apos[1])
-        cx = pivot_x + (0.5 - float(pivot[0])) * w
-        cy = pivot_y + (0.5 - float(pivot[1])) * h
-        return cx, cy, w, h
-    w = (ax1 - ax0) + float(size[0])
-    h = (ay1 - ay0) + float(size[1])
-    cx = (ax0 + ax1) * 0.5 + float(apos[0])
-    cy = (ay0 + ay1) * 0.5 + float(apos[1])
-    return cx, cy, w, h
-
-
-def _ui_own_scale(o):
-    """Abs RectTransform.localScale xy (Unity UI); zero → 1."""
-    sc = o.get("local_scale") or o.get("scale") or (1.0, 1.0, 1.0)
-    sx = abs(float(sc[0])) if len(sc) > 0 else 1.0
-    sy = abs(float(sc[1])) if len(sc) > 1 else 1.0
-    if sx < 1e-8:
-        sx = 1.0
-    if sy < 1e-8:
-        sy = 1.0
-    return sx, sy
-
-
-def _ui_local_rect_wh(o, by_xf, screen_w, screen_h, cache):
-    """RectTransform.rect width/height before localScale (Unity layout space)."""
-    key = "L:" + str(o.get("xf_id") or id(o))
-    if key in cache:
-        return cache[key]
-    sw = float(screen_w)
-    sh = float(screen_h)
-    fid = o.get("father_id")
-    parent = by_xf.get(str(fid)) if fid else None
-    # Root Canvas fills the screen. Nested Canvas keeps RectTransform size
-    # (Unity: Canvas does not override local rect).
-    if o.get("canvas") and not (
-            parent is not None and (
-                parent.get("rect") is not None or parent.get("canvas"))):
-        cache[key] = (sw, sh)
-        return cache[key]
-    if parent is not None and (
-            parent.get("rect") is not None or parent.get("canvas")):
-        pw, ph = _ui_local_rect_wh(
-            parent, by_xf, screen_w, screen_h, cache)
-    else:
-        pw, ph = sw, sh
-    rect = o.get("rect") or {}
-    amin = rect.get("anchor_min") or (0.5, 0.5)
-    amax = rect.get("anchor_max") or (0.5, 0.5)
-    apos = rect.get("anchored_position") or (0.0, 0.0)
-    size = rect.get("size_delta") or (100.0, 100.0)
-    pivot = rect.get("pivot") or (0.5, 0.5)
-    _lcx, _lcy, rw, rh = _rect_pivot_center(
-        pw, ph, amin, amax, apos, size, pivot)
-    cache[key] = (abs(float(rw)), abs(float(rh)))
-    return cache[key]
-
-
-def _ui_screen_rect(o, by_xf, screen_w, screen_h, cache):
-    """Pixel rect (cx, cy, w, h) in screen space for a RectTransform object.
-
-    Layout math uses parent ``rect`` (pre-localScale). Ancestor
-    ``localScale`` accumulates into screen size — Unity Canvas space —
-    so a VerticalLayoutGroup scaled to 0.59 shrinks children and TMP.
-    """
-    key = str(o.get("xf_id") or id(o))
-    if key in cache:
-        return cache[key]
-    sw = float(screen_w)
-    sh = float(screen_h)
-    fid = o.get("father_id")
-    parent = by_xf.get(str(fid)) if fid else None
-    # Root Canvas pixel size is the screen (Overlay / Screen Space Camera).
-    # Nested Canvas (e.g. Back Button sorting override) keeps RectTransform.
-    if o.get("canvas") and not (
-            parent is not None and (
-                parent.get("rect") is not None or parent.get("canvas"))):
-        cache[key] = (sw * 0.5, sh * 0.5, sw, sh)
-        return cache[key]
-    if parent is not None and (
-            parent.get("rect") is not None or parent.get("canvas")):
-        pcx, pcy, pw, ph = _ui_screen_rect(
-            parent, by_xf, screen_w, screen_h, cache)
-        plw, plh = _ui_local_rect_wh(
-            parent, by_xf, screen_w, screen_h, cache)
-        if plw < 1e-8:
-            plw = 1e-8
-        if plh < 1e-8:
-            plh = 1e-8
-        # parent.rect → screen (includes parent localScale + ancestors).
-        fsx = abs(float(pw)) / plw
-        fsy = abs(float(ph)) / plh
-        plx = pcx - abs(float(pw)) * 0.5
-        ply = pcy - abs(float(ph)) * 0.5
-    else:
-        # Root under Canvas / missing parent → full screen.
-        plw, plh = sw, sh
-        fsx, fsy = 1.0, 1.0
-        plx, ply = 0.0, 0.0
-    rect = o.get("rect") or {}
-    amin = rect.get("anchor_min") or (0.5, 0.5)
-    amax = rect.get("anchor_max") or (0.5, 0.5)
-    apos = rect.get("anchored_position") or (0.0, 0.0)
-    size = rect.get("size_delta") or (100.0, 100.0)
-    pivot = rect.get("pivot") or (0.5, 0.5)
-    # Child rect in parent.rect space (Unity LayoutGroup / anchors).
-    lcx, lcy, rw, rh = _rect_pivot_center(
-        plw, plh, amin, amax, apos, size, pivot)
-    sx, sy = _ui_own_scale(o)
-    rw0 = abs(float(rw))
-    rh0 = abs(float(rh))
-    # Unity localScale is about the pivot — the pivot stays fixed; the
-    # geometric center moves toward it when scale ≠ 1 (center pivot: no move).
-    px = float(pivot[0])
-    py = float(pivot[1])
-    lcx = float(lcx) + (0.5 - px) * rw0 * (sx - 1.0)
-    lcy = float(lcy) + (0.5 - py) * rh0 * (sy - 1.0)
-    rw = rw0 * sx
-    rh = rh0 * sy
-    cx = plx + float(lcx) * fsx
-    cy = ply + float(lcy) * fsy
-    cache[key] = (cx, cy, rw * fsx, rh * fsy)
-    return cache[key]
-
-
-def _go_is_canvas_root(o, by_xf):
-    """True when Canvas fills the screen (no RectTransform/Canvas parent)."""
-    if not o.get("canvas"):
-        return False
-    fid = o.get("father_id")
-    parent = by_xf.get(str(fid)) if fid else None
-    if parent is not None and (
-            parent.get("rect") is not None or parent.get("canvas")):
-        return False
-    return True
-
-
-def _snapshot_ui_rects_onto_hierarchy(objects, hierarchy):
-    """Copy post-layout rect/scale/canvas onto hierarchy before scaffold drop.
-
-    Layout-only Canvas / Rect parents are dropped from ``objects`` as
-    ``ui_scaffold``, but live RT walks the GO parent chain. Snapshotting
-    authored rect state onto ``scene_hierarchy`` (keyed by ``xf_id``) lets
-    ``_build_rect_transforms`` seed after GO tables exist.
-    """
-    by_xf = {}
-    for o in objects:
-        xid = o.get("xf_id")
-        if xid is not None and str(xid) not in ("", "0"):
-            by_xf[str(xid)] = o
-    for h in hierarchy or []:
-        xid = h.get("xf_id")
-        if xid is None or str(xid) in ("", "0"):
-            continue
-        o = by_xf.get(str(xid))
-        if o is None:
-            continue
-        rect = o.get("rect")
-        if rect is not None:
-            h["rect"] = dict(rect)
-        ls = o.get("local_scale") or o.get("scale")
-        if ls is not None:
-            h["local_scale"] = (
-                float(ls[0]), float(ls[1]),
-                float(ls[2]) if len(ls) > 2 else 1.0)
-        if o.get("canvas"):
-            h["has_canvas"] = True
-            h["canvas_root"] = 1 if _go_is_canvas_root(o, by_xf) else 0
-        elif rect is not None and "canvas_root" not in h:
-            h["canvas_root"] = 0
-
-
-def _build_rect_transforms(plan):
-    """Per-GO RectTransform seed from hierarchy + packed instances (live)."""
-    names = plan.get("go_names") or []
-    n = len(names)
-    if n < 1:
-        return None
-    has = [0] * n
-    canvas = [0] * n
-    canvas_root = [0] * n
-    amin_x = [0.5] * n
-    amin_y = [0.5] * n
-    amax_x = [0.5] * n
-    amax_y = [0.5] * n
-    apos_x = [0.0] * n
-    apos_y = [0.0] * n
-    sd_x = [100.0] * n
-    sd_y = [100.0] * n
-    pivot_x = [0.5] * n
-    pivot_y = [0.5] * n
-    sx = [1.0] * n
-    sy = [1.0] * n
-
-    def _seed(gi, rect, local_scale, is_canvas, is_root):
-        if gi is None or int(gi) < 0 or int(gi) >= n:
-            return
-        gi = int(gi)
-        if rect is None and not is_canvas:
-            return
-        has[gi] = 1
-        if is_canvas:
-            canvas[gi] = 1
-        if is_root:
-            canvas_root[gi] = 1
-        r = rect or {}
-        amin = r.get("anchor_min") or (0.5, 0.5)
-        amax = r.get("anchor_max") or (0.5, 0.5)
-        apos = r.get("anchored_position") or (0.0, 0.0)
-        size = r.get("size_delta") or (100.0, 100.0)
-        pivot = r.get("pivot") or (0.5, 0.5)
-        amin_x[gi] = float(amin[0])
-        amin_y[gi] = float(amin[1])
-        amax_x[gi] = float(amax[0])
-        amax_y[gi] = float(amax[1])
-        apos_x[gi] = float(apos[0])
-        apos_y[gi] = float(apos[1])
-        sd_x[gi] = float(size[0])
-        sd_y[gi] = float(size[1])
-        pivot_x[gi] = float(pivot[0])
-        pivot_y[gi] = float(pivot[1])
-        sc = local_scale or (1.0, 1.0, 1.0)
-        sx[gi] = float(sc[0]) if len(sc) > 0 else 1.0
-        sy[gi] = float(sc[1]) if len(sc) > 1 else 1.0
-
-    # Hierarchy first — includes layout-only scaffolds snapshotted at drop.
-    for h in plan.get("scene_hierarchy") or []:
-        _seed(
-            h.get("go_index"),
-            h.get("rect"),
-            h.get("local_scale"),
-            bool(h.get("has_canvas")),
-            int(h.get("canvas_root") or 0) != 0)
-    # Packed instances may carry the same rect (post-layout); overlay.
-    for cl in (plan.get("classes") or {}).values():
-        for o in cl.get("instances") or []:
-            is_root = False
-            if o.get("canvas"):
-                # Prefer hierarchy canvas_root when stamped; else recompute.
-                gi = o.get("go_index")
-                if gi is not None and 0 <= int(gi) < n and canvas_root[int(gi)]:
-                    is_root = True
-                else:
-                    by_xf = {}
-                    for oo in cl.get("instances") or []:
-                        xid = oo.get("xf_id")
-                        if xid is not None and str(xid) not in ("", "0"):
-                            by_xf[str(xid)] = oo
-                    for hh in plan.get("scene_hierarchy") or []:
-                        xid = hh.get("xf_id")
-                        if xid is not None and str(xid) not in ("", "0"):
-                            by_xf.setdefault(str(xid), hh)
-                    is_root = _go_is_canvas_root(o, by_xf)
-            _seed(
-                o.get("go_index"),
-                o.get("rect"),
-                o.get("local_scale") or o.get("scale"),
-                bool(o.get("canvas")),
-                is_root)
-    if not any(has):
-        return None
-    return {
-        "has": has,
-        "canvas": canvas,
-        "canvas_root": canvas_root,
-        "amin_x": amin_x,
-        "amin_y": amin_y,
-        "amax_x": amax_x,
-        "amax_y": amax_y,
-        "apos_x": apos_x,
-        "apos_y": apos_y,
-        "sd_x": sd_x,
-        "sd_y": sd_y,
-        "pivot_x": pivot_x,
-        "pivot_y": pivot_y,
-        "sx": sx,
-        "sy": sy,
-    }
-
-
-def _plan_has_ui_draws(plan):
-    """True when any packed sprite is a baked uGUI Image/TMP draw."""
-    for cl in (plan.get("classes") or {}).values():
-        for o in cl.get("instances") or []:
-            sp = o.get("sprite") or {}
-            if sp.get("source") in ("ui", "ui_tmp"):
-                return True
-    return False
-
 
 def _layout_alignment_on_axis(child_alignment, axis):
     """TextAnchor → 0 left/top, 0.5 middle, 1 right/bottom (Unity LayoutGroup)."""
@@ -2973,37 +1256,6 @@ def _layout_alignment_on_axis(child_alignment, axis):
         return (a % 3) * 0.5
     return (a // 3) * 0.5
 
-
-def _layout_child_sizes(child, axis, control, force_expand):
-    """(min, preferred, flexible) along *axis* — authored LayoutElement or sizeDelta."""
-    le = child.get("layout_element") or {}
-    if le.get("ignore"):
-        return None
-    # Disabled LayoutElement → same as no LayoutElement (sizeDelta / control).
-    if not int(le.get("enabled", 1)):
-        le = {}
-    rect = child.get("rect") or {}
-    sd = rect.get("size_delta") or (0.0, 0.0)
-    cur = abs(float(sd[axis]))
-    if not control:
-        return cur, cur, 0.0
-    mn = float((le.get("min") or (-1.0, -1.0))[axis])
-    pref = float((le.get("preferred") or (-1.0, -1.0))[axis])
-    flex = float((le.get("flexible") or (-1.0, -1.0))[axis])
-    mx = float((le.get("max") or (-1.0, -1.0))[axis])
-    if mn < 0.0:
-        mn = 0.0
-    if pref < 0.0:
-        pref = cur
-    if flex < 0.0:
-        flex = 0.0
-    if mx >= 0.0 and pref > mx:
-        pref = mx
-    if mx >= 0.0 and mn > mx:
-        mn = mx
-    if force_expand:
-        flex = max(flex, 1.0)
-    return mn, pref, flex
 
 
 def _layout_set_size_with_current_anchors(obj, axis, size, parent_size):
@@ -3039,75 +1291,6 @@ def _layout_le_axis(le, axis, cur):
         mn = mx
     return mn, pref, mx, flex
 
-
-def _layout_group_calc_along_axis(parent, kids, axis):
-    """Unity HorizontalOrVerticalLayoutGroup.CalcAlongAxis totals."""
-    lg = parent.get("layout_group") or {}
-    is_vert = bool(lg.get("vertical"))
-    control = bool(lg.get(
-        "child_control_width" if axis == 0 else "child_control_height", 1))
-    force = bool(lg.get(
-        "child_force_expand_width" if axis == 0
-        else "child_force_expand_height", 1))
-    use_scale = bool(lg.get(
-        "child_scale_width" if axis == 0 else "child_scale_height", 0))
-    spacing = float(lg.get("spacing") or 0.0)
-    pad = ((float(lg.get("pad_left") or 0.0) + float(lg.get("pad_right") or 0.0))
-           if axis == 0 else
-           (float(lg.get("pad_top") or 0.0) + float(lg.get("pad_bottom") or 0.0)))
-    along_other = bool(is_vert) ^ (axis == 1)
-    total_min = pad
-    total_pref = pad
-    total_max = pad if not along_other else float("inf")
-    total_flex = 0.0
-    n = 0
-    for ch in kids:
-        sc = _layout_child_sizes(ch, axis, control, force)
-        if sc is None:
-            continue
-        mn, pref, flex = sc
-        le = ch.get("layout_element") or {}
-        if not int(le.get("enabled", 1)):
-            le = {}
-        mx = float((le.get("max") or (-1.0, -1.0))[axis])
-        if mx < 0.0:
-            mx = float("inf")
-        scale = 1.0
-        if use_scale:
-            ls = ch.get("local_scale") or (1.0, 1.0, 1.0)
-            scale = abs(float(ls[axis]))
-            if scale < 1e-8:
-                scale = 1.0
-        mn *= scale
-        pref *= scale
-        mx = mx * scale if mx < float("inf") else mx
-        flex *= scale
-        if along_other:
-            total_min = max(mn + pad, total_min)
-            if mx < float("inf"):
-                total_max = min(mx + pad, total_max)
-            total_pref = max(pref + pad, total_pref)
-            total_flex = max(flex, total_flex)
-        else:
-            total_min += mn + spacing
-            total_pref += pref + spacing
-            if mx < float("inf"):
-                total_max += mx + spacing
-            else:
-                total_max = float("inf")
-            total_flex += flex
-        n += 1
-    if not along_other and n > 0:
-        total_min -= spacing
-        total_pref -= spacing
-        if total_max < float("inf"):
-            total_max -= spacing
-    if total_max < float("inf"):
-        if total_pref > total_max:
-            total_pref = total_max
-        if total_pref < total_min:
-            total_pref = total_min
-    return total_min, total_pref, total_max, total_flex
 
 
 def _layout_query_sizes(obj, axis, children_map):
@@ -3147,17 +1330,6 @@ def _layout_query_sizes(obj, axis, children_map):
         pref = mn
     return mn, pref, mx, flex
 
-
-def _layout_parent_pixel_size(obj, by_xf, screen_w, screen_h):
-    """Parent RectTransform.rect size (pre-localScale) for layout fitters."""
-    fid = obj.get("father_id")
-    parent = by_xf.get(str(fid)) if fid else None
-    if parent is None:
-        return (float(screen_w), float(screen_h))
-    cache = {}
-    pw, ph = _ui_local_rect_wh(
-        parent, by_xf, screen_w, screen_h, cache)
-    return (abs(pw), abs(ph))
 
 
 def _apply_content_size_fitter(obj, children_map, by_xf, screen_w, screen_h):
@@ -3447,370 +1619,6 @@ def _apply_layout_groups(objects, screen_w, screen_h):
         _apply_aspect_ratio_fitter(o, by_xf, screen_w, screen_h)
 
 
-def _slider_normalized(value, vmin, vmax):
-    """Unity Slider.normalizedValue."""
-    lo = float(vmin)
-    hi = float(vmax)
-    if abs(hi - lo) < 1e-8:
-        return 0.0
-    t = (float(value) - lo) / (hi - lo)
-    if t < 0.0:
-        return 0.0
-    if t > 1.0:
-        return 1.0
-    return t
-
-
-def _apply_slider_visuals(objects):
-    """Bake Unity ``Slider.UpdateVisuals`` into handle/fill RectTransforms.
-
-    Scene YAML often leaves handle anchors at ``(0,0)-(0,0)`` because they
-    are driven at runtime. Without this, pack places the knob at the
-    Handle Slide Area's corner (often below/left of the track) instead of
-    along ``normalizedValue``.
-    """
-    by_xf = {}
-    for o in objects:
-        xid = o.get("xf_id")
-        if xid is not None and str(xid) not in ("", "0"):
-            by_xf[str(xid)] = o
-    for o in objects:
-        sl = o.get("ui_slider")
-        if not sl or not int(sl.get("enabled", 1)):
-            continue
-        direction = int(sl.get("direction") or 0)
-        # 0 LTR, 1 RTL, 2 BTT, 3 TTB — UnityEngine.UI.Slider.Direction.
-        axis = 0 if direction in (0, 1) else 1
-        reverse = direction in (1, 3)
-        nv = _slider_normalized(sl.get("value"), sl.get("min"), sl.get("max"))
-        t = (1.0 - nv) if reverse else nv
-        handle_id = int(sl.get("handle_rect_id") or 0)
-        if handle_id:
-            h = by_xf.get(str(handle_id))
-            if h is not None and h.get("rect") is not None:
-                rect = dict(h["rect"])
-                amin = [0.0, 0.0]
-                amax = [1.0, 1.0]
-                amin[axis] = t
-                amax[axis] = t
-                rect["anchor_min"] = (float(amin[0]), float(amin[1]))
-                rect["anchor_max"] = (float(amax[0]), float(amax[1]))
-                h["rect"] = rect
-        fill_id = int(sl.get("fill_rect_id") or 0)
-        if fill_id:
-            f = by_xf.get(str(fill_id))
-            if f is not None and f.get("rect") is not None:
-                rect = dict(f["rect"])
-                amin = [0.0, 0.0]
-                amax = [1.0, 1.0]
-                if reverse:
-                    amin[axis] = 1.0 - nv
-                else:
-                    amax[axis] = nv
-                rect["anchor_min"] = (float(amin[0]), float(amin[1]))
-                rect["anchor_max"] = (float(amax[0]), float(amax[1]))
-                f["rect"] = rect
-
-
-def _apply_scrollbar_visuals(objects):
-    """Bake Unity ``Scrollbar.UpdateVisuals`` into handle RectTransform anchors.
-
-    Handle spans ``size`` along the axis and sits at ``value * (1 - size)``.
-    """
-    by_xf = {}
-    for o in objects:
-        xid = o.get("xf_id")
-        if xid is not None and str(xid) not in ("", "0"):
-            by_xf[str(xid)] = o
-    for o in objects:
-        sb = o.get("ui_scrollbar")
-        if not sb:
-            continue
-        direction = int(sb.get("direction") or 0)
-        axis = 0 if direction in (0, 1) else 1
-        reverse = direction in (1, 3)
-        val = float(sb.get("value") or 0.0)
-        if val < 0.0:
-            val = 0.0
-        if val > 1.0:
-            val = 1.0
-        size = float(sb.get("size") or 0.2)
-        if size < 0.0:
-            size = 0.0
-        if size > 1.0:
-            size = 1.0
-        movement = val * (1.0 - size)
-        handle_id = int(sb.get("handle_rect_id") or 0)
-        if not handle_id:
-            continue
-        h = by_xf.get(str(handle_id))
-        if h is None or h.get("rect") is None:
-            continue
-        rect = dict(h["rect"])
-        amin = [0.0, 0.0]
-        amax = [1.0, 1.0]
-        if reverse:
-            amin[axis] = 1.0 - movement - size
-            amax[axis] = 1.0 - movement
-        else:
-            amin[axis] = movement
-            amax[axis] = movement + size
-        rect["anchor_min"] = (float(amin[0]), float(amin[1]))
-        rect["anchor_max"] = (float(amax[0]), float(amax[1]))
-        h["rect"] = rect
-
-
-_TMP_FONT_CACHE = {}
-
-
-def _load_tmp_font_asset(path):
-    """Parse authored TMP Font Asset YAML → atlas + glyph metrics."""
-    abspath = os.path.abspath(path)
-    if abspath in _TMP_FONT_CACHE:
-        return _TMP_FONT_CACHE[abspath]
-    text = _read(path)
-    point = re.search(r"(?m)^\s+m_PointSize:\s*([0-9.eE+-]+)", text)
-    ascent = re.search(r"(?m)^\s+m_AscentLine:\s*([0-9.eE+-]+)", text)
-    descent = re.search(r"(?m)^\s+m_DescentLine:\s*([0-9.eE+-]+)", text)
-    line_h = re.search(r"(?m)^\s+m_LineHeight:\s*([0-9.eE+-]+)", text)
-    aw = re.search(r"(?m)^\s+m_AtlasWidth:\s*(\d+)", text)
-    ah = re.search(r"(?m)^\s+m_AtlasHeight:\s*(\d+)", text)
-    tw = re.search(r"(?m)^\s+m_Width:\s*(\d+)", text)
-    th = re.search(r"(?m)^\s+m_Height:\s*(\d+)", text)
-    atlas_w = int(aw.group(1) if aw else (tw.group(1) if tw else 0))
-    atlas_h = int(ah.group(1) if ah else (th.group(1) if th else 0))
-    td = re.search(r"_typelessdata:\s*([0-9a-fA-F]+)", text)
-    if not td or atlas_w < 1 or atlas_h < 1:
-        _TMP_FONT_CACHE[abspath] = None
-        return None
-    hexdata = td.group(1)
-    expect = atlas_w * atlas_h * 2  # Alpha8 → 2 hex chars per byte
-    if len(hexdata) < expect:
-        _TMP_FONT_CACHE[abspath] = None
-        return None
-    try:
-        atlas = bytes.fromhex(hexdata[:expect])
-    except ValueError:
-        _TMP_FONT_CACHE[abspath] = None
-        return None
-    # Keep Texture2D row order (top-first). GlyphRect.y is from the top of
-    # the atlas in TextCore / TMP font assets.
-    chars = {}
-    for m in re.finditer(
-            r"m_Unicode:\s*(\d+)\s*\n\s+m_GlyphIndex:\s*(\d+)", text):
-        chars[int(m.group(1))] = int(m.group(2))
-    glyphs = {}
-    for m in re.finditer(
-            r"- m_Index:\s*(\d+)\s*\n\s+m_Metrics:\s*\n"
-            r"\s+m_Width:\s*([^\n]+)\s*\n\s+m_Height:\s*([^\n]+)\s*\n"
-            r"\s+m_HorizontalBearingX:\s*([^\n]+)\s*\n"
-            r"\s+m_HorizontalBearingY:\s*([^\n]+)\s*\n"
-            r"\s+m_HorizontalAdvance:\s*([^\n]+)\s*\n"
-            r"\s+m_GlyphRect:\s*\n\s+m_X:\s*(\d+)\s*\n\s+m_Y:\s*(\d+)\s*\n"
-            r"\s+m_Width:\s*(\d+)\s*\n\s+m_Height:\s*(\d+)",
-            text):
-        glyphs[int(m.group(1))] = {
-            "w": float(m.group(2)), "h": float(m.group(3)),
-            "bx": float(m.group(4)), "by": float(m.group(5)),
-            "adv": float(m.group(6)),
-            "rx": int(m.group(7)), "ry": int(m.group(8)),
-            "rw": int(m.group(9)), "rh": int(m.group(10)),
-        }
-    font = {
-        "path": abspath,
-        "point_size": float(point.group(1)) if point else 72.0,
-        "ascent": float(ascent.group(1)) if ascent else 0.0,
-        "descent": float(descent.group(1)) if descent else 0.0,
-        "line_height": float(line_h.group(1)) if line_h else 0.0,
-        "atlas_w": atlas_w,
-        "atlas_h": atlas_h,
-        "atlas": atlas,
-        "chars": chars,
-        "glyphs": glyphs,
-    }
-    _TMP_FONT_CACHE[abspath] = font
-    return font
-
-
-def _sdf_coverage(byte_v):
-    """Approximate TMP SDF atlas byte → coverage (edge at ~0.5)."""
-    t = byte_v / 255.0
-    # smoothstep(0.45, 0.55, t)
-    if t <= 0.45:
-        return 0.0
-    if t >= 0.55:
-        return 1.0
-    x = (t - 0.45) / 0.10
-    return x * x * (3.0 - 2.0 * x)
-
-
-def _rasterize_tmp_text(font, text, font_size, color, box_w, box_h,
-                        h_align, v_align, overflow_mode=0):
-    """Bake plain TMP string into an RGBA bitmap (y=0 bottom, OpenGL).
-
-    Returns ``(bw, bh, rgba, shift_x, shift_y)`` where shift is the offset of
-    the expanded bitmap center from the authored RectTransform center (pixels,
-    +x right / +y up). Overflow mode 0 (TMP Overflow) expands the bake so
-    glyphs that extend past the rect are not clipped — Unity still draws
-    them; Truncate/Ellipsis/Masking keep the rect clip.
-    """
-    bw0 = max(1, int(round(float(box_w))))
-    bh0 = max(1, int(round(float(box_h))))
-    if not font or not text:
-        return bw0, bh0, bytes(bytearray(bw0 * bh0 * 4)), 0.0, 0.0
-    ps = float(font["point_size"]) or 1.0
-    scale = float(font_size) / ps
-    glyphs = []
-    total_w = 0.0
-    for ch in text:
-        gi = font["chars"].get(ord(ch))
-        if gi is None:
-            continue
-        g = font["glyphs"].get(gi)
-        if not g:
-            continue
-        glyphs.append(g)
-        total_w += float(g["adv"]) * scale
-    ascent = float(font["ascent"]) * scale
-    descent = float(font["descent"]) * scale  # typically negative
-    visual_h = ascent - descent
-    # Horizontal: 1 left, 2 center, 4 right (TMP bit flags).
-    if h_align & 4:
-        pen_x0 = float(bw0) - total_w
-    elif h_align & 2:
-        pen_x0 = (float(bw0) - total_w) * 0.5
-    else:
-        pen_x0 = 0.0
-    # Vertical: 256 top, 512 middle, 1024 bottom — relative to authored rect.
-    if v_align & 1024:
-        baseline0 = -descent
-    elif v_align & 512:
-        baseline0 = (float(bh0) - visual_h) * 0.5 - descent
-    else:
-        baseline0 = float(bh0) - ascent
-    # Glyph AABB in authored-rect pixel space (may extend past edges).
-    min_x = 0.0
-    min_y = 0.0
-    max_x = float(bw0)
-    max_y = float(bh0)
-    pen = pen_x0
-    for g in glyphs:
-        gw = max(float(g["w"]) * scale, 0.0)
-        gh = max(float(g["h"]) * scale, 0.0)
-        gx0 = pen + float(g["bx"]) * scale
-        gy1 = baseline0 + float(g["by"]) * scale
-        gy0 = gy1 - gh
-        if gx0 < min_x:
-            min_x = gx0
-        if gx0 + gw > max_x:
-            max_x = gx0 + gw
-        if gy0 < min_y:
-            min_y = gy0
-        if gy1 > max_y:
-            max_y = gy1
-        pen += float(g["adv"]) * scale
-    # Overflow (0): expand. Other modes keep the rect (Unity clips / ellipsis).
-    if int(overflow_mode or 0) == 0:
-        pad_l = max(0.0, -min_x)
-        pad_b = max(0.0, -min_y)
-        pad_r = max(0.0, max_x - float(bw0))
-        pad_t = max(0.0, max_y - float(bh0))
-    else:
-        pad_l = pad_b = pad_r = pad_t = 0.0
-    bw = max(1, int(math.ceil(float(bw0) + pad_l + pad_r)))
-    bh = max(1, int(math.ceil(float(bh0) + pad_b + pad_t)))
-    # Expanded bitmap center vs authored rect center (screen +y up).
-    shift_x = (pad_r - pad_l) * 0.5
-    shift_y = (pad_t - pad_b) * 0.5
-    pen_x = pen_x0 + pad_l
-    baseline = baseline0 + pad_b
-    out = bytearray(bw * bh * 4)
-    aw = int(font["atlas_w"])
-    ah = int(font["atlas_h"])
-    atlas = font["atlas"]
-    cr = float(color[0])
-    cg = float(color[1])
-    cb = float(color[2])
-    ca = float(color[3])
-    for g in glyphs:
-        gw = max(float(g["w"]) * scale, 0.0)
-        gh = max(float(g["h"]) * scale, 0.0)
-        gx0 = pen_x + float(g["bx"]) * scale
-        gy1 = baseline + float(g["by"]) * scale  # top
-        gy0 = gy1 - gh  # bottom
-        rx, ry, rw, rh = int(g["rx"]), int(g["ry"]), int(g["rw"]), int(g["rh"])
-        # GlyphRect Y is from the top of the (top-first) atlas. Empirically
-        # TMP SDF glyphs sample with v increasing toward the bottom of the
-        # rect (matches LiberationSans SDF packing).
-        for py in range(int(math.floor(gy0)), int(math.ceil(gy1))):
-            if py < 0 or py >= bh:
-                continue
-            v = (py + 0.5 - gy0) / gh if gh > 1e-6 else 0.0
-            if v < 0.0 or v > 1.0:
-                continue
-            sy = v * max(rh - 1, 0)
-            for px in range(int(math.floor(gx0)), int(math.ceil(gx0 + gw))):
-                if px < 0 or px >= bw:
-                    continue
-                u = (px + 0.5 - gx0) / gw if gw > 1e-6 else 0.0
-                if u < 0.0 or u > 1.0:
-                    continue
-                sx = u * max(rw - 1, 0)
-                ix = rx + int(round(sx))
-                iy = ry + int(round(sy))
-                if ix < 0 or iy < 0 or ix >= aw or iy >= ah:
-                    continue
-                cov = _sdf_coverage(atlas[iy * aw + ix])
-                if cov <= 0.0:
-                    continue
-                o = (py * bw + px) * 4
-                a = cov * ca
-                out[o] = int(min(255, round(cr * 255.0 * cov)))
-                out[o + 1] = int(min(255, round(cg * 255.0 * cov)))
-                out[o + 2] = int(min(255, round(cb * 255.0 * cov)))
-                out[o + 3] = int(min(255, round(a * 255.0)))
-        pen_x += float(g["adv"]) * scale
-    return bw, bh, bytes(out), shift_x, shift_y
-
-
-# Unity builtin UISprite (UI/Skin/UISprite.psd): ~32×32 white rounded rect.
-# Border matches the corner radius so Image.type=Sliced keeps fixed corners.
-_UISPRITE_SIZE = 32
-_UISPRITE_RADIUS = 6  # matches Unity UISprite corner / border scale
-
-
-def _builtin_uisprite():
-    """Generate Unity-like UISprite RGBA (y=0 bottom) + 9-slice border LBRT."""
-    s = _UISPRITE_SIZE
-    r = float(_UISPRITE_RADIUS)
-    rgba = bytearray(s * s * 4)
-    for y in range(s):
-        # Atlas math in top-first space, then store bottom-first.
-        yt = (s - 1 - y) + 0.5
-        for x in range(s):
-            xt = x + 0.5
-            # Distance outside rounded rect (0 inside).
-            cx = min(max(xt, r), s - r)
-            cy = min(max(yt, r), s - r)
-            dx = xt - cx
-            dy = yt - cy
-            dist = math.sqrt(dx * dx + dy * dy) - r
-            # 1px AA fringe.
-            if dist <= -0.5:
-                a = 1.0
-            elif dist >= 0.5:
-                a = 0.0
-            else:
-                a = 0.5 - dist
-            if a <= 0.0:
-                continue
-            o = (y * s + x) * 4
-            v = int(min(255, round(a * 255.0)))
-            rgba[o] = rgba[o + 1] = rgba[o + 2] = 255
-            rgba[o + 3] = v
-    border = (_UISPRITE_RADIUS,) * 4  # left, bottom, right, top
-    return s, s, bytes(rgba), border
-
 
 def _sample_rgba(tex, tw, th, u, v):
     """Bilinear sample RGBA texture (y=0 bottom); u/v in [0,1]."""
@@ -3922,25 +1730,6 @@ def _bake_stretched_rgba(src, sw, sh, dst_w, dst_h):
     return dw, dh, bytes(out)
 
 
-def _fit_preserve_aspect(rw, rh, src_w, src_h):
-    """Fit sprite into rect keeping aspect (Unity Image.preserveAspect).
-
-    Returns (fit_w, fit_h) in the same units as *rw*/*rh*. Draw center is
-    then shifted by ``_preserve_aspect_draw_center`` (Unity
-    ``PreserveSpriteAspectRatio`` uses RectTransform.pivot, not always
-    geometric center).
-    """
-    rw = abs(float(rw))
-    rh = abs(float(rh))
-    sw = float(src_w)
-    sh = float(src_h)
-    if rw < 1e-6 or rh < 1e-6 or sw < 1e-6 or sh < 1e-6:
-        return rw, rh
-    if rw / rh > sw / sh:
-        # Rect wider than sprite → height-limited.
-        return rh * (sw / sh), rh
-    return rw, rw * (sh / sw)
-
 
 def _preserve_aspect_draw_center(cx, cy, rw, rh, fw, fh, pivot):
     """Center of preserveAspect draw quad (Unity PreserveSpriteAspectRatio).
@@ -3956,25 +1745,6 @@ def _preserve_aspect_draw_center(cx, cy, rw, rh, fw, fh, pivot):
         float(cy) + (float(rh) - float(fh)) * (py - 0.5),
     )
 
-
-# Alias used by tests / older call sites.
-_ui_preserve_aspect_draw_size = _fit_preserve_aspect
-
-
-def _sprite_border_from_meta(path):
-    """PNG .meta spriteBorder {x,y,z,w} → (left, bottom, right, top)."""
-    meta = path + ".meta"
-    if not os.path.isfile(meta):
-        return (0.0, 0.0, 0.0, 0.0)
-    text = _read(meta)
-    m = re.search(
-        r"spriteBorder:\s*\{x:\s*([^,}]+),\s*y:\s*([^,}]+),"
-        r"\s*z:\s*([^,}]+),\s*w:\s*([^}]+)\}",
-        text)
-    if not m:
-        return (0.0, 0.0, 0.0, 0.0)
-    return (float(m.group(1)), float(m.group(2)),
-            float(m.group(3)), float(m.group(4)))
 
 
 def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None,
@@ -4310,49 +2080,6 @@ def _bake_ui_images(objects, cameras, screen_w, screen_h, asset_guids=None,
     # each UI sprite above the nearest ancestor UI sprite on the same layer.
     _bump_ui_hierarchy_draw_order(objects, by_xf)
 
-
-def _bump_ui_hierarchy_draw_order(objects, by_xf):
-    """Raise child UI sorting_order above ancestor UI on the same layer."""
-    # Parent before child: walk by increasing depth from roots.
-    depth = {}
-
-    def _depth(o):
-        xid = str(o.get("xf_id") or id(o))
-        if xid in depth:
-            return depth[xid]
-        fid = o.get("father_id")
-        parent = by_xf.get(str(fid)) if fid else None
-        d = 0 if parent is None else _depth(parent) + 1
-        depth[xid] = d
-        return d
-
-    ordered = sorted(
-        (o for o in objects
-         if (o.get("sprite") or {}).get("source") in ("ui", "ui_tmp")),
-        key=_depth)
-    for o in ordered:
-        sp = o.get("sprite") or {}
-        # Nested Override Sorting sets an absolute order — leave it.
-        own_c = o.get("canvas") or {}
-        if int(own_c.get("override_sorting") or 0):
-            continue
-        fid = o.get("father_id")
-        cur = by_xf.get(str(fid)) if fid else None
-        guard = 0
-        while cur is not None and guard < 64:
-            guard += 1
-            psp = cur.get("sprite") or {}
-            if psp.get("source") in ("ui", "ui_tmp"):
-                # Same canvas sorting layer (TagManager id on the sprite).
-                if (int(psp.get("sorting_layer_id") or 0)
-                        == int(sp.get("sorting_layer_id") or 0)):
-                    po = int(psp.get("sorting_order") or 0)
-                    so = int(sp.get("sorting_order") or 0)
-                    if so <= po:
-                        sp["sorting_order"] = po + 1
-                break
-            fid = cur.get("father_id")
-            cur = by_xf.get(str(fid)) if fid else None
 
 
 # ---------------------------------------------------------------------------
@@ -5529,7 +3256,8 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
         names = re.findall(
             r"propertyPath:\s*m_Name\s*\n\s*value:\s*(.+)", pi_raw)
         name = (names[-1].strip() if names
-                else (rec.get("name") or "Prefab"))
+                else (_prefab_root_name(pi_raw, asset_guids)
+                      or rec.get("name") or "Prefab"))
         acts = re.findall(
             r"propertyPath:\s*m_IsActive\s*\n\s*value:\s*(\d+)", pi_raw)
         if acts:
@@ -5589,55 +3317,48 @@ def parse_unity_yaml(text, guid_to_script=None, asset_guids=None):
     return objects, lights, cameras, hierarchy
 
 
-def _canvas_by_gameobject(by_id):
-    """GameObject fileID → canvas dict from scene Canvas components.
 
-    PrefabInstance ``m_AddedComponents`` Canvas blocks reference the stripped
-    GO via ``m_GameObject``; the stripped GO YAML has no ``m_Component`` list,
-    so the main join loop never sees them without this reverse map.
+_PREFAB_ROOT_NAME_CACHE = {}
+
+
+def _prefab_root_name(pi_raw, asset_guids):
+    """Name of the root GameObject of a PrefabInstance's source prefab.
+
+    Unity names an instance after its prefab's root object unless the scene
+    overrides `m_Name`. The root is the GameObject whose Transform /
+    RectTransform has no father. None when the prefab cannot be read.
     """
-    out = {}
-    for rec in (by_id or {}).values():
-        if rec.get("kind") != "Canvas" or not rec.get("canvas"):
-            continue
-        raw = rec.get("raw") or ""
-        gm = re.search(
-            r"(?m)^\s+m_GameObject:\s*\{fileID:\s*(\d+)\}", raw)
-        if gm:
-            out[str(gm.group(1))] = dict(rec["canvas"])
-    return out
-
-
-def _prefab_mod_float(raw, path, default=None):
-    """Last matching PrefabInstance modification float (root overrides win)."""
-    matches = re.findall(
-        r"propertyPath:\s*%s\s*\n\s*value:\s*([^\n]+)" % path, raw or "")
-    if not matches:
-        return default
+    m = re.search(r"m_SourcePrefab:\s*\{[^}]*guid:\s*([0-9a-fA-F]+)", pi_raw or "")
+    if not m:
+        return None
+    path = (asset_guids or {}).get(m.group(1).lower())
+    if not path or not os.path.isfile(path):
+        return None
+    if path in _PREFAB_ROOT_NAME_CACHE:
+        return _PREFAB_ROOT_NAME_CACHE[path]
+    name = None
     try:
-        return float(matches[-1].strip())
-    except ValueError:
-        return default
-
-
-
-def _prefab_mod_rect(raw):
-    """RectTransform fields from PrefabInstance m_Modifications."""
-    def f(path, d):
-        v = _prefab_mod_float(raw, path, None)
-        return d if v is None else v
-
-    return {
-        "anchor_min": (f(r"m_AnchorMin\.x", 0.5), f(r"m_AnchorMin\.y", 0.5)),
-        "anchor_max": (f(r"m_AnchorMax\.x", 0.5), f(r"m_AnchorMax\.y", 0.5)),
-        "anchored_position": (
-            f(r"m_AnchoredPosition\.x", 0.0),
-            f(r"m_AnchoredPosition\.y", 0.0)),
-        "size_delta": (
-            f(r"m_SizeDelta\.x", 100.0), f(r"m_SizeDelta\.y", 100.0)),
-        "pivot": (f(r"m_Pivot\.x", 0.5), f(r"m_Pivot\.y", 0.5)),
-    }
-
+        text = _read(path)
+    except OSError:
+        text = ""
+    docs = re.split(r"(?m)^--- !u!(\d+) &(\d+)[^\n]*\n", text)
+    go_names = {}
+    root_go = None
+    for i in range(1, len(docs) - 2, 3):
+        cls, body = docs[i], docs[i + 2]
+        if cls == "1":
+            nm = re.search(r"(?m)^\s+m_Name:\s*(.*)$", body)
+            if nm:
+                go_names[docs[i + 1]] = nm.group(1).strip()
+        elif cls in ("4", "224") and root_go is None:
+            if re.search(r"(?m)^\s+m_Father:\s*\{fileID:\s*0\}", body):
+                g = re.search(r"(?m)^\s+m_GameObject:\s*\{fileID:\s*(\d+)\}", body)
+                if g:
+                    root_go = g.group(1)
+    if root_go is not None:
+        name = go_names.get(root_go) or None
+    _PREFAB_ROOT_NAME_CACHE[path] = name
+    return name
 
 
 def _materialize_prefab_instance_ui(by_id, objects, asset_guids,
@@ -5699,7 +3420,9 @@ def _materialize_prefab_instance_ui(by_id, objects, asset_guids,
             continue
         names = re.findall(
             r"propertyPath:\s*m_Name\s*\n\s*value:\s*(.+)", raw)
-        name = names[-1].strip() if names else (xf_rec.get("name") or "Prefab")
+        name = (names[-1].strip() if names
+                else (_prefab_root_name(raw, asset_guids)
+                      or xf_rec.get("name") or "Prefab"))
         acts = re.findall(
             r"propertyPath:\s*m_IsActive\s*\n\s*value:\s*(\d+)", raw)
         # Prefer last m_IsActive on the root GO (often after child toggles).
@@ -5838,268 +3561,6 @@ def _prefab_mod_values(inst_raw, src_file_id):
     return out
 
 
-def _prefab_sprite_object_refs(inst_raw):
-    """(target_mb_file_id, sprite_file_id, sprite_guid) for m_Sprite mods."""
-    out = []
-    if not inst_raw:
-        return out
-    for m in re.finditer(
-            r"target:\s*\{fileID:\s*(-?\d+),[^}]*\}\s*\n"
-            r"\s*propertyPath:\s*m_Sprite\s*\n"
-            r"\s*value:\s*[^\n]*\s*\n"
-            r"\s*objectReference:\s*\{fileID:\s*(-?\d+)"
-            r"(?:,\s*guid:\s*([0-9a-fA-F]+))?",
-            inst_raw):
-        spr_fid = int(m.group(2))
-        if spr_fid == 0:
-            continue
-        sg = m.group(3).lower() if m.group(3) else None
-        out.append((m.group(1), spr_fid, sg))
-    return out
-
-
-def _apply_ui_image_sprite_mod(ui_image, inst_raw, asset_guids):
-    """Apply authored PrefabInstance m_Sprite objectReference to *ui_image*."""
-    if ui_image is None:
-        ui_image = {
-            "r": 1.0, "g": 1.0, "b": 1.0, "a": 1.0,
-            "enabled": 1, "has_sprite": False, "builtin": False,
-            "sprite_file_id": 0, "sprite_guid": None,
-            "image_type": 0, "pixels_per_unit_multiplier": 1.0,
-        }
-    else:
-        ui_image = dict(ui_image)
-    mb_id = str(ui_image.get("mb_file_id") or "")
-    refs = _prefab_sprite_object_refs(inst_raw)
-    chosen = None
-    for target, spr_fid, sg in refs:
-        if mb_id and str(target) == mb_id:
-            chosen = (spr_fid, sg)
-            break
-    # Root Image often has empty m_Sprite; take the first override for this
-    # instance when mb_file_id is unknown (still authored, not invented).
-    if chosen is None and refs and not ui_image.get("has_sprite"):
-        chosen = (refs[0][1], refs[0][2])
-    if not chosen:
-        return ui_image
-    spr_fid, sg = chosen
-    builtin = False
-    has_sprite = False
-    if sg and sg in (asset_guids or {}):
-        has_sprite = True
-    elif _is_unity_builtin_guid(sg):
-        has_sprite = True
-        builtin = True
-    if not has_sprite:
-        return ui_image
-    ui_image["has_sprite"] = True
-    ui_image["builtin"] = builtin
-    ui_image["sprite_file_id"] = int(spr_fid)
-    ui_image["sprite_guid"] = sg
-    return ui_image
-
-
-def _apply_ui_button_onclick_mods(ui_button, inst_raw, mb_file_id=None):
-    """Merge PrefabInstance m_OnClick overrides onto a parsed ui_button.
-
-    Prefab Button.onClick is often empty; scene instances add SetActive calls
-    via propertyPath mods targeting the Button / UIButton MB fileID.
-    """
-    if not ui_button:
-        return ui_button
-    ui_button = dict(ui_button)
-    mb_id = str(mb_file_id or ui_button.get("mb_file_id") or "")
-    if not inst_raw or not mb_id:
-        return ui_button
-    # path → (value string, objectReference fileID)
-    mods = {}
-    for m in re.finditer(
-            r"target:\s*\{fileID:\s*%s,[^}]*\}\s*\n"
-            r"\s*propertyPath:\s*(m_OnClick[^\n]+)\s*\n"
-            r"\s*value:\s*([^\n]*)\s*\n"
-            r"\s*objectReference:\s*\{fileID:\s*(-?\d+)"
-            % re.escape(mb_id),
-            inst_raw):
-        mods[m.group(1).strip()] = (m.group(2).strip(), int(m.group(3)))
-    size_key = "m_OnClick.m_PersistentCalls.m_Calls.Array.size"
-    if size_key not in mods:
-        return ui_button
-    try:
-        n = int(float(mods[size_key][0]))
-    except ValueError:
-        return ui_button
-    if n <= 0:
-        ui_button["onclick"] = []
-        return ui_button
-    calls = []
-    for i in range(n):
-        prefix = ("m_OnClick.m_PersistentCalls.m_Calls.Array.data[%d]."
-                  % i)
-        method = (mods.get(prefix + "m_MethodName") or ("", 0))[0]
-        if not method:
-            continue
-        mode_s = (mods.get(prefix + "m_Mode") or ("1", 0))[0]
-        try:
-            mode = int(float(mode_s))
-        except ValueError:
-            mode = 1
-        bool_s = (mods.get(prefix + "m_Arguments.m_BoolArgument")
-                  or ("0", 0))[0]
-        try:
-            bool_arg = int(float(bool_s))
-        except ValueError:
-            bool_arg = 0
-        string_arg = (mods.get(prefix + "m_Arguments.m_StringArgument")
-                      or ("", 0))[0]
-        tgt_mod = mods.get(prefix + "m_Target")
-        tid = int(tgt_mod[1]) if tgt_mod else 0
-        if tid == 0:
-            continue
-        calls.append({
-            "target_go": str(tid),
-            "method": method,
-            "mode": mode,
-            "bool_arg": bool_arg,
-            "string_arg": string_arg,
-        })
-    ui_button["onclick"] = calls
-    return ui_button
-
-
-def _annotate_ui_button_onclick_targets(objects, by_id, guid_to_script):
-    """Tag each onClick call: GameObject vs project MonoBehaviour class.
-
-    Persistent targets may be a GO (``SetActive``) or a script component
-    fileID (including stripped PrefabInstance MBs). Prefer ``m_Script``
-    guid — stripped blocks list the source-prefab guid first.
-    """
-    _annotate_ui_persistent_mb_targets(
-        objects, by_id, guid_to_script, "ui_button", "onclick")
-
-
-def _annotate_ui_slider_onvaluechanged_targets(objects, by_id, guid_to_script):
-    """Tag each Slider onValueChanged call with target MB class."""
-    _annotate_ui_persistent_mb_targets(
-        objects, by_id, guid_to_script, "ui_slider", "on_value_changed")
-
-
-def _annotate_ui_scrollbar_onvaluechanged_targets(
-        objects, by_id, guid_to_script):
-    _annotate_ui_persistent_mb_targets(
-        objects, by_id, guid_to_script, "ui_scrollbar", "on_value_changed")
-
-
-def _annotate_ui_toggle_onvaluechanged_targets(objects, by_id, guid_to_script):
-    _annotate_ui_persistent_mb_targets(
-        objects, by_id, guid_to_script, "ui_toggle", "on_value_changed")
-
-
-def _annotate_ui_eventtrigger_targets(objects, by_id, guid_to_script):
-    """Tag EventTrigger delegate calls with target MB class / Slider / GO."""
-    if not objects or not by_id:
-        return
-    guid_to_script = guid_to_script or {}
-    for o in objects:
-        et = o.get("ui_eventtrigger")
-        if not et:
-            continue
-        for d in et.get("delegates") or []:
-            for c in d.get("calls") or []:
-                tid = str(c.get("target_go") or "")
-                asm = (c.get("target_assembly") or "").split(",")[0].strip()
-                if asm.endswith(".Slider") or asm == "UnityEngine.UI.Slider":
-                    if (c.get("method") or "") in ("set_value", "set_Value"):
-                        c["target_kind"] = "slider"
-                        continue
-                if not tid or tid == "0":
-                    tg = (c.get("target_guid") or "").lower()
-                    sp = guid_to_script.get(tg) if tg else None
-                    if sp:
-                        cname = _class_name_from_cs(sp)
-                        if cname:
-                            c["target_kind"] = "mb"
-                            c["target_class"] = cname
-                    continue
-                rec = by_id.get(tid)
-                if not rec:
-                    short = asm.split(".")[-1] if asm else ""
-                    if short:
-                        c["target_kind"] = "mb"
-                        c["target_class"] = short
-                    continue
-                kind = rec.get("kind")
-                if kind == "GameObject":
-                    c["target_kind"] = "go"
-                    continue
-                if kind != "MonoBehaviour":
-                    continue
-                raw = rec.get("raw") or ""
-                gm = re.search(
-                    r"m_Script:\s*\{fileID:\s*\d+,\s*guid:\s*([0-9a-fA-F]+)",
-                    raw)
-                g = (gm.group(1).lower() if gm
-                     else (rec.get("guid") or "").lower())
-                sp = guid_to_script.get(g) if g else None
-                if not sp:
-                    short = asm.split(".")[-1] if asm else ""
-                    if short:
-                        c["target_kind"] = "mb"
-                        c["target_class"] = short
-                    continue
-                cname = _class_name_from_cs(sp)
-                if cname:
-                    c["target_kind"] = "mb"
-                    c["target_class"] = cname
-                oty = (c.get("object_arg_type") or "")
-                if "RectTransform" in oty:
-                    oid = str(c.get("object_arg") or "0")
-                    trec = by_id.get(oid)
-                    if trec and trec.get("kind") == "Transform":
-                        rawt = trec.get("raw") or ""
-                        gm2 = re.search(
-                            r"(?m)^\s+m_GameObject:\s*\{fileID:\s*(-?\d+)\}",
-                            rawt)
-                        if gm2:
-                            c["object_go"] = str(int(gm2.group(1)))
-
-
-def _annotate_ui_persistent_mb_targets(
-        objects, by_id, guid_to_script, obj_key, calls_key):
-    """Tag persistent UnityEvent calls with target_kind / target_class."""
-    if not objects or not by_id:
-        return
-    guid_to_script = guid_to_script or {}
-    for o in objects:
-        blob = o.get(obj_key)
-        if not blob:
-            continue
-        for c in blob.get(calls_key) or []:
-            tid = str(c.get("target_go") or "")
-            if not tid or tid == "0":
-                continue
-            rec = by_id.get(tid)
-            if not rec:
-                continue
-            kind = rec.get("kind")
-            if kind == "GameObject":
-                c["target_kind"] = "go"
-                continue
-            if kind != "MonoBehaviour":
-                continue
-            raw = rec.get("raw") or ""
-            gm = re.search(
-                r"m_Script:\s*\{fileID:\s*\d+,\s*guid:\s*([0-9a-fA-F]+)",
-                raw)
-            g = (gm.group(1).lower() if gm
-                 else (rec.get("guid") or "").lower())
-            sp = guid_to_script.get(g) if g else None
-            if not sp:
-                continue
-            cname = _class_name_from_cs(sp)
-            if cname:
-                c["target_kind"] = "mb"
-                c["target_class"] = cname
-
 
 def _onclick_mb_types(objects):
     """Packed MonoBehaviour class names targeted by Button/Slider/Toggle events."""
@@ -6161,226 +3622,6 @@ def _alias_onclick_mb_file_ids(objects):
             for d in et.get("delegates") or []:
                 _alias(d.get("calls"))
 
-
-def _mb_onclick_callable(analyses, cname, method, mode):
-    """True if *method* on *cname* is a public instance API we can dispatch.
-
-    PersistentListenerMode: 1=Void, 5=String, 6=Bool (SetActive path).
-    Only Void / String MB calls are wired; Bool stays on GameObject.SetActive.
-    """
-    if not cname or not method or method == "SetActive":
-        return False
-    want_string = int(mode or 0) == 5
-    want_void = int(mode or 0) in (0, 1)
-    if not want_string and not want_void:
-        return False
-    for a in analyses or []:
-        for c in a.get("classes") or []:
-            if c.get("name") != cname:
-                continue
-            for m in c.get("methods") or []:
-                if m.get("name") != method:
-                    continue
-                if not m.get("public") or m.get("static"):
-                    continue
-                args = (m.get("args") or "").strip()
-                if want_string:
-                    if re.match(
-                            r"(?:System\.)?string\s+\w+\s*$", args, re.I):
-                        return True
-                elif want_void and not args:
-                    return True
-    return False
-
-
-def _mb_eventtrigger_callable(analyses, cname, method, mode, object_arg_type=""):
-    """True if EventTrigger can dispatch *method* (Void/Bool/Float/String/Object).
-
-    Object mode: RectTransform → packed GO index int; AudioClip skipped
-    (no clip table wired into MakeSoundEffect yet).
-    """
-    if not cname or not method or method == "SetActive":
-        return False
-    mode = int(mode or 0)
-    oty = object_arg_type or ""
-    if mode == 2:
-        if "RectTransform" not in oty:
-            return False
-        # Accept any public instance method with one int-like / component arg.
-        for a in analyses or []:
-            for c in a.get("classes") or []:
-                if c.get("name") != cname:
-                    continue
-                for m in c.get("methods") or []:
-                    if m.get("name") != method:
-                        continue
-                    if not m.get("public") or m.get("static"):
-                        continue
-                    args = (m.get("args") or "").strip()
-                    if re.match(
-                            r"(?:UnityEngine\.)?(?:RectTransform|Transform|"
-                            r"GameObject|int)\s+\w+\s*$",
-                            args):
-                        return True
-        return False
-    want_string = mode == 5
-    want_bool = mode == 6
-    want_float = mode == 4
-    want_void = mode in (0, 1)
-    if not (want_string or want_bool or want_float or want_void):
-        return False
-    for a in analyses or []:
-        for c in a.get("classes") or []:
-            if c.get("name") != cname:
-                continue
-            for m in c.get("methods") or []:
-                if m.get("name") != method:
-                    continue
-                if not m.get("public") or m.get("static"):
-                    continue
-                args = (m.get("args") or "").strip()
-                if want_string:
-                    if re.match(
-                            r"(?:System\.)?string\s+\w+\s*$", args, re.I):
-                        return True
-                elif want_bool:
-                    if re.match(
-                            r"(?:System\.)?bool\s+\w+\s*$", args, re.I):
-                        return True
-                elif want_float:
-                    if re.match(
-                            r"(?:System\.)?float\s+\w+\s*$", args, re.I):
-                        return True
-                elif want_void and not args:
-                    return True
-    return False
-
-
-def _mb_onvaluechanged_callable(analyses, cname, method, mode):
-    """True if *method* can be dispatched from Slider/Scrollbar.onValueChanged.
-
-    UnityEvent<float>: mode 0/4 = EventDefined/Float (pass float);
-    mode 1 = Void. Static property setters (``set_Volume``) are allowed.
-    """
-    if not cname or not method:
-        return False
-    mode = int(mode or 0)
-    want_float = mode in (0, 4)
-    want_void = mode == 1
-    if not want_float and not want_void:
-        return False
-    for a in analyses or []:
-        for c in a.get("classes") or []:
-            if c.get("name") != cname:
-                continue
-            for m in c.get("methods") or []:
-                if m.get("name") != method:
-                    continue
-                if not m.get("public"):
-                    continue
-                args = (m.get("args") or "").strip()
-                if want_float:
-                    if re.match(
-                            r"(?:System\.)?float\s+\w+\s*$", args, re.I):
-                        return True
-                elif want_void and not args:
-                    # Instance void only (OnValueChanged / SetDisplayValue).
-                    if not m.get("static"):
-                        return True
-    return False
-
-
-def _mb_ontoggle_callable(analyses, cname, method, mode):
-    """True if *method* can be dispatched from Toggle.onValueChanged.
-
-    UnityEvent<bool>: mode 0 = EventDefined (pass isOn), mode 1 = Void,
-    mode 6 = Bool (fixed m_BoolArgument).
-    """
-    if not cname or not method:
-        return False
-    mode = int(mode or 0)
-    want_bool = mode in (0, 6)
-    want_void = mode == 1
-    if not want_bool and not want_void:
-        return False
-    for a in analyses or []:
-        for c in a.get("classes") or []:
-            if c.get("name") != cname:
-                continue
-            for m in c.get("methods") or []:
-                if m.get("name") != method:
-                    continue
-                if not m.get("public"):
-                    continue
-                args = (m.get("args") or "").strip()
-                if want_bool:
-                    if re.match(
-                            r"(?:System\.)?bool\s+\w+\s*$", args, re.I):
-                        return True
-                elif want_void and not args and not m.get("static"):
-                    return True
-    return False
-
-
-def _mb_method_is_static(analyses, cname, method):
-    for a in analyses or []:
-        for c in a.get("classes") or []:
-            if c.get("name") != cname:
-                continue
-            for m in c.get("methods") or []:
-                if m.get("name") == method and m.get("static"):
-                    return True
-    return False
-
-
-def _apply_rect_property_mods(rect, scale, mods):
-    """Mutate rect/scale from PrefabInstance propertyPath overrides."""
-    rect = dict(rect or {})
-    amin = list(rect.get("anchor_min") or (0.5, 0.5))
-    amax = list(rect.get("anchor_max") or (0.5, 0.5))
-    apos = list(rect.get("anchored_position") or (0.0, 0.0))
-    size = list(rect.get("size_delta") or (0.0, 0.0))
-    pivot = list(rect.get("pivot") or (0.5, 0.5))
-    sc = list(scale or (1.0, 1.0, 1.0))
-    while len(sc) < 3:
-        sc.append(1.0)
-
-    def _f(key, default=None):
-        if key not in mods:
-            return default
-        try:
-            return float(mods[key])
-        except ValueError:
-            return default
-
-    for axis, idx in (("x", 0), ("y", 1)):
-        v = _f("m_AnchorMin.%s" % axis)
-        if v is not None:
-            amin[idx] = v
-        v = _f("m_AnchorMax.%s" % axis)
-        if v is not None:
-            amax[idx] = v
-        v = _f("m_AnchoredPosition.%s" % axis)
-        if v is not None:
-            apos[idx] = v
-        v = _f("m_SizeDelta.%s" % axis)
-        if v is not None:
-            size[idx] = v
-        v = _f("m_Pivot.%s" % axis)
-        if v is not None:
-            pivot[idx] = v
-        v = _f("m_LocalScale.%s" % axis)
-        if v is not None:
-            sc[idx] = v
-    v = _f("m_LocalScale.z")
-    if v is not None:
-        sc[2] = v
-    rect["anchor_min"] = (float(amin[0]), float(amin[1]))
-    rect["anchor_max"] = (float(amax[0]), float(amax[1]))
-    rect["anchored_position"] = (float(apos[0]), float(apos[1]))
-    rect["size_delta"] = (float(size[0]), float(size[1]))
-    rect["pivot"] = (float(pivot[0]), float(pivot[1]))
-    return rect, (float(sc[0]), float(sc[1]), float(sc[2]))
 
 
 def _append_prefab_instance_ui_objects(
@@ -6635,30 +3876,6 @@ def parse_blender_json(text):
     return out
 
 
-def _class_name_from_cs(path):
-    """The component a script file defines: the class named after the file.
-
-    That is Unity's rule for a MonoBehaviour (`Bullet.cs` holds `Bullet`).
-    The first class in the file used to be taken instead, so a helper
-    declared above the component -- an attribute class for
-    `[MaxInstances(N)]`, a small struct -- became the scene object's class.
-    Without a class of the file's name, the first class, as before.
-    """
-    try:
-        text = _read(path)
-    except IOError:
-        return None
-    scan = cs2cpp._blank(text)
-    stem = os.path.splitext(os.path.basename(path))[0]
-    first = None
-    for kind, name, _s, _b, _c in cs2cpp._find_types(scan):
-        if kind in ("class", "struct"):
-            if name == stem:
-                return name
-            if first is None:
-                first = name
-    return first
-
 
 def _ast_find_getcomponent_chains(text):
     """Locate `GameObject.Find(...).GetComponent<T>()` chains via cpprust AST.
@@ -6885,73 +4102,6 @@ def _build_go_active(plan, go_names):
     return act
 
 
-def _build_go_ui_component_maps(plan, analyses=None):
-    """Authored UI component presence: type → sorted GO indices."""
-    maps = {t: set() for t in _UI_GETCOMPONENT_TYPES}
-
-    def mark(gi, *tys):
-        if gi is None or int(gi) < 0:
-            return
-        gi = int(gi)
-        for t in tys:
-            if t in maps:
-                maps[t].add(gi)
-
-    for cl in (plan.get("classes") or {}).values():
-        for o in cl.get("instances") or []:
-            gi = o.get("go_index")
-            mark(gi, "RectTransform")
-            if o.get("canvas"):
-                mark(gi, "Canvas")
-            if o.get("ui_image"):
-                mark(gi, "Image", "RawImage", "Selectable")
-            if o.get("ui_button"):
-                mark(gi, "Button", "Selectable")
-            if o.get("ui_tmp"):
-                mark(gi, "TMP_Text", "TextMeshProUGUI", "TextMeshPro",
-                     "Selectable")
-    for h in plan.get("scene_hierarchy") or []:
-        gi = h.get("go_index")
-        mark(gi, "RectTransform")
-        if h.get("has_canvas"):
-            mark(gi, "Canvas")
-        if h.get("has_image"):
-            mark(gi, "Image", "RawImage", "Selectable")
-        if h.get("has_button"):
-            mark(gi, "Button", "Selectable")
-        if h.get("has_tmp"):
-            mark(gi, "TMP_Text", "TextMeshProUGUI", "TextMeshPro")
-    # Project MB that subclasses a uGUI type (UIButton : Button): Unity's
-    # GetComponent<Button>() finds it via inheritance.
-    if analyses:
-        bases = {}
-        for a in analyses:
-            for c in a.get("classes") or []:
-                bases[c["name"]] = [
-                    b for b in (c.get("bases") or [])
-                    if b not in ("MonoBehaviour", "ScriptableObject",
-                                 "object", "Object", "System")]
-        memo = {}
-
-        def ui_ancestor_types(cname):
-            if cname in memo:
-                return memo[cname]
-            out = set()
-            for b in bases.get(cname) or []:
-                if b in maps:
-                    out.add(b)
-                out |= ui_ancestor_types(b)
-            memo[cname] = out
-            return out
-
-        for cname, cl in (plan.get("classes") or {}).items():
-            utys = ui_ancestor_types(cname)
-            if not utys:
-                continue
-            for o in cl.get("instances") or []:
-                mark(o.get("go_index"), *sorted(utys))
-    return {t: sorted(s) for t, s in maps.items() if s}
-
 
 def _extend_go_tables_for_find(plan, names, comps):
     """No-op: ``_build_go_tables`` already includes hierarchy-only GOs."""
@@ -7016,562 +4166,6 @@ def _build_go_sibling_indices(go_parents):
             sib[go] = idx
     return sib
 
-
-def _build_ui_buttons(plan, analyses=None):
-    """Authored uGUI Buttons: normalized hit, ColorBlock, onClick dispatch.
-
-    Persistent ``SetActive`` targets resolve via GO fileID → go_index.
-    MonoBehaviour targets (string/void modes) resolve via mb_ids or the
-    annotated ``target_class`` from stripped PrefabInstance MBs.
-    """
-    go_by_id = {}
-    for cl in plan["classes"].values():
-        for o in cl.get("instances") or []:
-            gid = str(o.get("go_id") or "")
-            gi = o.get("go_index")
-            if gid and gi is not None:
-                go_by_id[gid] = int(gi)
-    for h in plan.get("scene_hierarchy") or []:
-        gid = str(h.get("go_id") or "")
-        gi = h.get("go_index")
-        if gid and gi is not None:
-            go_by_id.setdefault(gid, int(gi))
-    mb_index = _mb_index(plan)
-    # class → first authored instance index (stripped MB fallback).
-    class_inst0 = {}
-    for cname, cl in (plan.get("classes") or {}).items():
-        if int(cl.get("n") or 0) > 0:
-            class_inst0[cname] = 0
-    buttons = []
-    for cl in plan["classes"].values():
-        for o in cl.get("instances") or []:
-            ub = o.get("ui_button")
-            hit = o.get("ui_hit")
-            if not ub or not hit:
-                continue
-            if not int(ub.get("interactable", 1)):
-                continue
-            self_go = o.get("go_index")
-            if self_go is None:
-                continue
-            self_go = int(self_go)
-            calls = []
-            for c in ub.get("onclick") or []:
-                method = c.get("method") or ""
-                tid = str(c.get("target_go") or "")
-                mode = int(c.get("mode") or 0)
-                if method == "SetActive":
-                    tgt = go_by_id.get(tid)
-                    if tgt is None:
-                        continue
-                    calls.append({
-                        "kind": "setactive",
-                        "target_go": int(tgt),
-                        "bool_arg": int(c.get("bool_arg") or 0),
-                    })
-                    continue
-                # MonoBehaviour persistent call (String / Void).
-                cname = c.get("target_class")
-                inst = None
-                hit_mb = mb_index.get(tid)
-                if hit_mb:
-                    cname, inst = hit_mb[0], int(hit_mb[1])
-                elif cname and cname in class_inst0:
-                    inst = int(class_inst0[cname])
-                if cname is None or inst is None:
-                    continue
-                if not _mb_onclick_callable(analyses, cname, method, mode):
-                    continue
-                calls.append({
-                    "kind": "mb",
-                    "mb_class": cname,
-                    "mb_inst": int(inst),
-                    "method": method,
-                    "mode": mode,
-                    "string_arg": c.get("string_arg") or "",
-                })
-            # Tint / hit even when onClick has no resolvable calls (ColorBlock).
-            cols = ub.get("colors") or {}
-            mult = float(cols.get("multiplier") or 1.0)
-
-            def _scale(key, default):
-                c = cols.get(key) or default
-                return tuple(float(c[i]) * mult for i in range(4))
-
-            buttons.append({
-                "go": self_go,
-                "ncx": float(hit.get("ncx", 0.5)),
-                "ncy": float(hit.get("ncy", 0.5)),
-                "nhw": float(hit.get("nhw", 0.0)),
-                "nhh": float(hit.get("nhh", 0.0)),
-                "normal": _scale("normal", (1, 1, 1, 1)),
-                "highlighted": _scale(
-                    "highlighted", (0.96, 0.96, 0.96, 1)),
-                "pressed": _scale("pressed", (0.78, 0.78, 0.78, 1)),
-                "disabled": _scale(
-                    "disabled", (0.78, 0.78, 0.78, 0.5)),
-                "sorting_layer": int((o.get("sprite") or {}).get(
-                    "sorting_layer") or 0),
-                "sorting_order": int((o.get("sprite") or {}).get(
-                    "sorting_order") or 0),
-                "calls": calls,
-            })
-    buttons.sort(key=lambda b: (
-        -int(b.get("sorting_layer") or 0),
-        -int(b.get("sorting_order") or 0),
-    ))
-    return buttons
-
-
-def _build_ui_sliders(plan, analyses=None):
-    """Authored uGUI Sliders: drag hit GO, handle/fill, onValueChanged."""
-    go_by_id = {}
-    xf_to_go = {}
-    for cl in plan["classes"].values():
-        for o in cl.get("instances") or []:
-            gid = str(o.get("go_id") or "")
-            gi = o.get("go_index")
-            if gid and gi is not None:
-                go_by_id[gid] = int(gi)
-            xid = o.get("xf_id")
-            if xid is not None and gi is not None:
-                xf_to_go[str(xid)] = int(gi)
-    for h in plan.get("scene_hierarchy") or []:
-        gid = str(h.get("go_id") or "")
-        gi = h.get("go_index")
-        if gid and gi is not None:
-            go_by_id.setdefault(gid, int(gi))
-        xid = h.get("xf_id")
-        if xid is not None and gi is not None:
-            xf_to_go.setdefault(str(xid), int(gi))
-    # Handle RectTransform father → Handle Slide Area go_index.
-    handle_parent = {}
-    for cl in plan["classes"].values():
-        for o in cl.get("instances") or []:
-            xid = o.get("xf_id")
-            fid = o.get("father_id")
-            if xid is not None and fid is not None:
-                handle_parent[str(xid)] = str(fid)
-    for h in plan.get("scene_hierarchy") or []:
-        xid = h.get("xf_id")
-        fid = h.get("father_id")
-        if xid is not None and fid is not None:
-            handle_parent.setdefault(str(xid), str(fid))
-    mb_index = _mb_index(plan)
-    class_inst0 = {}
-    for cname, cl in (plan.get("classes") or {}).items():
-        if int(cl.get("n") or 0) > 0:
-            class_inst0[cname] = 0
-    sliders = []
-    for cl in plan["classes"].values():
-        for o in cl.get("instances") or []:
-            sl = o.get("ui_slider")
-            if not sl or not int(sl.get("enabled", 1)):
-                continue
-            if not int(sl.get("interactable", 1)):
-                continue
-            self_go = o.get("go_index")
-            if self_go is None:
-                continue
-            self_go = int(self_go)
-            handle_id = int(sl.get("handle_rect_id") or 0)
-            fill_id = int(sl.get("fill_rect_id") or 0)
-            slide_id = int(sl.get("slide_area_id") or 0)
-            handle_go = xf_to_go.get(str(handle_id), -1) if handle_id else -1
-            fill_go = xf_to_go.get(str(fill_id), -1) if fill_id else -1
-            slide_go = -1
-            if slide_id:
-                slide_go = xf_to_go.get(str(slide_id), -1)
-            if slide_go < 0 and handle_id:
-                parent_xf = handle_parent.get(str(handle_id))
-                if parent_xf:
-                    slide_go = xf_to_go.get(parent_xf, -1)
-            if slide_go < 0:
-                slide_go = self_go
-            calls = []
-            for c in sl.get("on_value_changed") or []:
-                method = c.get("method") or ""
-                tid = str(c.get("target_go") or "")
-                mode = int(c.get("mode") or 0)
-                cname = c.get("target_class")
-                inst = None
-                hit_mb = mb_index.get(tid)
-                if hit_mb:
-                    cname, inst = hit_mb[0], int(hit_mb[1])
-                elif cname and cname in class_inst0:
-                    inst = int(class_inst0[cname])
-                if cname is None or inst is None:
-                    continue
-                if not _mb_onvaluechanged_callable(
-                        analyses, cname, method, mode):
-                    continue
-                is_static = _mb_method_is_static(analyses, cname, method)
-                calls.append({
-                    "kind": "mb",
-                    "mb_class": cname,
-                    "mb_inst": int(inst),
-                    "method": method,
-                    "mode": mode,
-                    "static": bool(is_static),
-                })
-            direction = int(sl.get("direction") or 0)
-            sliders.append({
-                "go": self_go,
-                "slide_go": int(slide_go),
-                "handle_go": int(handle_go),
-                "fill_go": int(fill_go),
-                "direction": direction,
-                "min": float(sl.get("min") or 0.0),
-                "max": float(sl.get("max") or 1.0),
-                "value": float(sl.get("value") or 0.0),
-                "whole_numbers": int(sl.get("whole_numbers") or 0),
-                "calls": calls,
-            })
-    return sliders
-
-
-def _ui_xf_go_maps(plan):
-    """go_id→go_index, xf_id→go_index, handle_parent xf→father xf."""
-    go_by_id = {}
-    xf_to_go = {}
-    handle_parent = {}
-    for cl in plan["classes"].values():
-        for o in cl.get("instances") or []:
-            gid = str(o.get("go_id") or "")
-            gi = o.get("go_index")
-            if gid and gi is not None:
-                go_by_id[gid] = int(gi)
-            xid = o.get("xf_id")
-            if xid is not None and gi is not None:
-                xf_to_go[str(xid)] = int(gi)
-            fid = o.get("father_id")
-            if xid is not None and fid is not None:
-                handle_parent[str(xid)] = str(fid)
-    for h in plan.get("scene_hierarchy") or []:
-        gid = str(h.get("go_id") or "")
-        gi = h.get("go_index")
-        if gid and gi is not None:
-            go_by_id.setdefault(gid, int(gi))
-        xid = h.get("xf_id")
-        if xid is not None and gi is not None:
-            xf_to_go.setdefault(str(xid), int(gi))
-        fid = h.get("father_id")
-        if xid is not None and fid is not None:
-            handle_parent.setdefault(str(xid), str(fid))
-    return go_by_id, xf_to_go, handle_parent
-
-
-def _ui_mb_call_resolve(plan, analyses, calls, callable_fn):
-    """Resolve persistent UnityEvent calls → mb dispatch entries."""
-    mb_index = _mb_index(plan)
-    class_inst0 = {}
-    for cname, cl in (plan.get("classes") or {}).items():
-        if int(cl.get("n") or 0) > 0:
-            class_inst0[cname] = 0
-    out = []
-    for c in calls or []:
-        method = c.get("method") or ""
-        tid = str(c.get("target_go") or "")
-        mode = int(c.get("mode") or 0)
-        cname = c.get("target_class")
-        inst = None
-        hit_mb = mb_index.get(tid)
-        if hit_mb:
-            cname, inst = hit_mb[0], int(hit_mb[1])
-        elif cname and cname in class_inst0:
-            inst = int(class_inst0[cname])
-        if cname is None or inst is None:
-            continue
-        if not callable_fn(analyses, cname, method, mode):
-            continue
-        out.append({
-            "kind": "mb",
-            "mb_class": cname,
-            "mb_inst": int(inst),
-            "method": method,
-            "mode": mode,
-            "static": bool(_mb_method_is_static(analyses, cname, method)),
-            "bool_arg": int(c.get("bool_arg") or 0),
-        })
-    return out
-
-
-def _build_ui_scrollbars(plan, analyses=None):
-    """Authored uGUI Scrollbars: handle drag + onValueChanged."""
-    _go_by_id, xf_to_go, handle_parent = _ui_xf_go_maps(plan)
-    bars = []
-    for cl in plan["classes"].values():
-        for o in cl.get("instances") or []:
-            sb = o.get("ui_scrollbar")
-            if not sb:
-                continue
-            self_go = o.get("go_index")
-            if self_go is None:
-                continue
-            self_go = int(self_go)
-            handle_id = int(sb.get("handle_rect_id") or 0)
-            handle_go = xf_to_go.get(str(handle_id), -1) if handle_id else -1
-            slide_go = -1
-            if handle_id:
-                parent_xf = handle_parent.get(str(handle_id))
-                if parent_xf:
-                    slide_go = xf_to_go.get(parent_xf, -1)
-            if slide_go < 0:
-                slide_go = self_go
-            calls = _ui_mb_call_resolve(
-                plan, analyses, sb.get("on_value_changed"),
-                _mb_onvaluechanged_callable)
-            bars.append({
-                "go": self_go,
-                "slide_go": int(slide_go),
-                "handle_go": int(handle_go),
-                "direction": int(sb.get("direction") or 0),
-                "value": float(sb.get("value") or 0.0),
-                "size": float(sb.get("size") or 0.2),
-                "interactable": int(sb.get("interactable", 1)),
-                "mb_file_id": str(sb.get("mb_file_id") or ""),
-                "calls": calls,
-            })
-    return bars
-
-
-def _build_ui_scrollrects(plan, analyses=None):
-    """Authored uGUI ScrollRects: viewport drag + linked scrollbars."""
-    _go_by_id, xf_to_go, _hp = _ui_xf_go_maps(plan)
-    # Scrollbar MB fileID → index in ui_scrollbars.
-    sb_by_mb = {}
-    for i, sb in enumerate(plan.get("ui_scrollbars") or []):
-        mid = str(sb.get("mb_file_id") or "")
-        if mid and mid != "None":
-            sb_by_mb[mid] = i
-    rects = []
-    for cl in plan["classes"].values():
-        for o in cl.get("instances") or []:
-            sr = o.get("ui_scrollrect")
-            if not sr or not int(sr.get("enabled", 1)):
-                continue
-            self_go = o.get("go_index")
-            if self_go is None:
-                continue
-            self_go = int(self_go)
-            content_id = int(sr.get("content_id") or 0)
-            viewport_id = int(sr.get("viewport_id") or 0)
-            content_go = (
-                xf_to_go.get(str(content_id), -1) if content_id else -1)
-            viewport_go = (
-                xf_to_go.get(str(viewport_id), -1) if viewport_id else -1)
-            if viewport_go < 0:
-                viewport_go = self_go
-            hbar = sb_by_mb.get(str(sr.get("hbar_mb_id") or ""), -1)
-            vbar = sb_by_mb.get(str(sr.get("vbar_mb_id") or ""), -1)
-            rects.append({
-                "go": self_go,
-                "content_go": int(content_go),
-                "viewport_go": int(viewport_go),
-                "horizontal": int(sr.get("horizontal", 1)),
-                "vertical": int(sr.get("vertical", 1)),
-                "hbar": int(hbar) if hbar is not None else -1,
-                "vbar": int(vbar) if vbar is not None else -1,
-            })
-    return rects
-
-
-def _build_ui_toggles(plan, analyses=None):
-    """Authored uGUI Toggles: click to flip isOn + onValueChanged(bool)."""
-    _go_by_id, xf_to_go, _hp = _ui_xf_go_maps(plan)
-    # Image MB fileID → go_index (Toggle.graphic).
-    img_mb_to_go = {}
-    for cl in plan["classes"].values():
-        for o in cl.get("instances") or []:
-            ui = o.get("ui_image")
-            gi = o.get("go_index")
-            if not ui or gi is None:
-                continue
-            mid = str(ui.get("mb_file_id") or "")
-            if mid and mid not in ("", "None", "0"):
-                img_mb_to_go[mid] = int(gi)
-    toggles = []
-    for cl in plan["classes"].values():
-        for o in cl.get("instances") or []:
-            tg = o.get("ui_toggle")
-            if not tg or not int(tg.get("enabled", 1)):
-                continue
-            if not int(tg.get("interactable", 1)):
-                continue
-            self_go = o.get("go_index")
-            if self_go is None:
-                continue
-            self_go = int(self_go)
-            gid = int(tg.get("graphic_id") or 0)
-            graphic_go = -1
-            if gid:
-                graphic_go = img_mb_to_go.get(str(gid), -1)
-                if graphic_go < 0:
-                    graphic_go = xf_to_go.get(str(gid), -1)
-            calls = _ui_mb_call_resolve(
-                plan, analyses, tg.get("on_value_changed"),
-                _mb_ontoggle_callable)
-            toggles.append({
-                "go": self_go,
-                "is_on": int(tg.get("is_on") or 0),
-                "graphic_go": int(graphic_go),
-                "calls": calls,
-            })
-    return toggles
-
-
-def _build_ui_eventtriggers(plan, analyses=None):
-    """Authored EventTrigger → hit GO + per-event persistent calls.
-
-    Supported eventIDs: PointerEnter/Exit/Down/Up/Click, BeginDrag, EndDrag.
-    Object(RectTransform) → GO index int; AudioClip object args skipped.
-    """
-    go_by_id, _xf, _hp = _ui_xf_go_maps(plan)
-    mb_index = _mb_index(plan)
-    class_inst0 = {}
-    for cname, cl in (plan.get("classes") or {}).items():
-        if int(cl.get("n") or 0) > 0:
-            class_inst0[cname] = 0
-    # Slider go → ui_sliders index for set_value.
-    sl_by_go = {}
-    for i, sl in enumerate(plan.get("ui_sliders") or []):
-        sl_by_go[int(sl["go"])] = i
-    # Also map Slider MB fileID → slider index via instances.
-    sl_by_mb = {}
-    for cl in plan["classes"].values():
-        for o in cl.get("instances") or []:
-            us = o.get("ui_slider")
-            if not us:
-                continue
-            gi = o.get("go_index")
-            if gi is None:
-                continue
-            si = sl_by_go.get(int(gi))
-            if si is None:
-                continue
-            mid = str(us.get("mb_file_id") or "")
-            if mid:
-                sl_by_mb[mid] = si
-            for mid2 in o.get("mb_ids") or []:
-                sl_by_mb[str(mid2)] = si
-    supported = frozenset({0, 1, 2, 3, 4, 13, 14})
-    triggers = []
-    for cl in plan["classes"].values():
-        for o in cl.get("instances") or []:
-            et = o.get("ui_eventtrigger")
-            hit = o.get("ui_hit")
-            if not et or not hit:
-                continue
-            if not int(et.get("enabled", 1)):
-                continue
-            self_go = o.get("go_index")
-            if self_go is None:
-                continue
-            self_go = int(self_go)
-            events = []
-            for d in et.get("delegates") or []:
-                # eventID 0 (PointerEnter) is valid — do not use `or -1`.
-                raw_eid = d.get("event_id")
-                if raw_eid is None:
-                    continue
-                eid = int(raw_eid)
-                if eid not in supported:
-                    continue
-                calls = []
-                for c in d.get("calls") or []:
-                    method = c.get("method") or ""
-                    mode = int(c.get("mode") or 0)
-                    tid = str(c.get("target_go") or "")
-                    if c.get("target_kind") == "slider" or (
-                            method in ("set_value", "set_Value")
-                            and mode == 4):
-                        si = sl_by_mb.get(tid)
-                        if si is None and tid in go_by_id:
-                            si = sl_by_go.get(go_by_id[tid])
-                        if si is None:
-                            continue
-                        calls.append({
-                            "kind": "slider_set",
-                            "slider": int(si),
-                            "float_arg": float(c.get("float_arg") or 0.0),
-                        })
-                        continue
-                    if method == "SetActive":
-                        tgt = go_by_id.get(tid)
-                        if tgt is None:
-                            continue
-                        calls.append({
-                            "kind": "setactive",
-                            "target_go": int(tgt),
-                            "bool_arg": int(c.get("bool_arg") or 0),
-                        })
-                        continue
-                    cname = c.get("target_class")
-                    inst = None
-                    hit_mb = mb_index.get(tid)
-                    if hit_mb:
-                        cname, inst = hit_mb[0], int(hit_mb[1])
-                    elif cname and cname in class_inst0:
-                        inst = int(class_inst0[cname])
-                    if cname is None or inst is None:
-                        continue
-                    if not _mb_eventtrigger_callable(
-                            analyses, cname, method, mode,
-                            c.get("object_arg_type") or ""):
-                        continue
-                    entry = {
-                        "kind": "mb",
-                        "mb_class": cname,
-                        "mb_inst": int(inst),
-                        "method": method,
-                        "mode": mode,
-                        "bool_arg": int(c.get("bool_arg") or 0),
-                        "float_arg": float(c.get("float_arg") or 0.0),
-                        "string_arg": c.get("string_arg") or "",
-                        "object_go": -1,
-                    }
-                    if mode == 2:
-                        og = c.get("object_go")
-                        if og and str(og) in go_by_id:
-                            entry["object_go"] = int(go_by_id[str(og)])
-                        else:
-                            continue
-                    calls.append(entry)
-                if calls:
-                    events.append({"event_id": eid, "calls": calls})
-            if not events:
-                continue
-            triggers.append({
-                "go": self_go,
-                "ncx": float(hit.get("ncx", 0.5)),
-                "ncy": float(hit.get("ncy", 0.5)),
-                "nhw": float(hit.get("nhw", 0.0)),
-                "nhh": float(hit.get("nhh", 0.0)),
-                "sorting_layer": int((o.get("sprite") or {}).get(
-                    "sorting_layer") or 0),
-                "sorting_order": int((o.get("sprite") or {}).get(
-                    "sorting_order") or 0),
-                "events": events,
-            })
-    triggers.sort(key=lambda t: (
-        -int(t.get("sorting_layer") or 0),
-        -int(t.get("sorting_order") or 0),
-    ))
-    return triggers
-
-
-def _link_scrollrects_scrollbars(plan):
-    """Annotate scrollbars with owning ScrollRect index + axis."""
-    bars = plan.get("ui_scrollbars") or []
-    for b in bars:
-        b["scrollrect"] = -1
-        b["scroll_axis"] = 0
-    for ri, r in enumerate(plan.get("ui_scrollrects") or []):
-        for key, axis in (("hbar", 0), ("vbar", 1)):
-            bi = int(r.get(key) if r.get(key) is not None else -1)
-            if 0 <= bi < len(bars):
-                bars[bi]["scrollrect"] = int(ri)
-                bars[bi]["scroll_axis"] = int(axis)
 
 
 def _collect_addcomponent_types(analyses):
@@ -7708,23 +4302,6 @@ def _disallow_multiple_types(analyses):
     return out
 
 
-def _gos_with_sprite(plan):
-    """Authored GO indices that already have a SpriteRenderer.
-
-    Call after ``_build_go_tables`` so ``go_index`` is stamped. Indices (not
-    display names) so duplicate UI names do not share sprite presence.
-    """
-    idxs = set()
-    for cl in (plan.get("classes") or {}).values():
-        for o in cl.get("instances") or []:
-            if not o.get("sprite"):
-                continue
-            gi = o.get("go_index")
-            if gi is None:
-                continue
-            idxs.add(int(gi))
-    return idxs
-
 
 def _validate_addcomponent_types(types, plan, analyses=None):
     known = set(plan.get("classes") or {}) | _ADDABLE_BUILTINS
@@ -7765,121 +4342,6 @@ def _validate_getcomponent_types(types, plan, analyses=None):
                 ops=("GetComponent", "GetComponentsInChildren",
                      "AddComponent"))
 
-
-def _rewrite_audiosource_api(text, cl, add_locals=None):
-    """Lower AudioSource playOnAwake/loop/volume/clip/Play/Stop / .gameObject."""
-    as_recvs = set()
-    for f in cl.get("fields") or []:
-        if f.get("ty") == "AudioSource":
-            as_recvs.add(f["name"])
-    for name, _ty, _bits, kind in cl.get("members") or []:
-        if str(kind) == "idx:AudioSource":
-            as_recvs.add(name)
-    for lm in re.finditer(r"\bAudioSource\s+(\w+)\b", text):
-        as_recvs.add(lm.group(1))
-    for name, ty in (add_locals or {}).items():
-        if ty == "AudioSource":
-            as_recvs.add(name)
-    if not as_recvs:
-        return text
-
-    def repl_go(m):
-        recv = m.group(1)
-        if recv not in as_recvs:
-            return m.group(0)
-        return "_AudioSource_owner_go[%s]" % recv
-
-    text = cs2cpp.code_sub(
-        r"(?<![.\w])(\w+)\s*\.\s*gameObject\b",
-        repl_go, text)
-
-    bool_map = {
-        "playOnAwake": "play_on_awake",
-        "loop": "loop",
-        "mute": "mute",
-    }
-
-    def repl_bool(m):
-        recv, prop, rhs = m.group(1), m.group(2), m.group(3).strip()
-        if recv not in as_recvs:
-            return m.group(0)
-        field = bool_map[prop]
-        if rhs in ("false", "False", "0"):
-            val = "0"
-        elif rhs in ("true", "True", "1"):
-            val = "1"
-        else:
-            val = "(%s) ? 1 : 0" % rhs
-        return "_AudioSource_%s[%s] = %s;" % (field, recv, val)
-
-    text = cs2cpp.code_sub(
-        r"(?<![.\w])(\w+)\s*\.\s*(playOnAwake|loop|mute)\s*=\s*([^;]+);",
-        repl_bool, text)
-
-    def repl_float(m):
-        recv, prop, rhs = m.group(1), m.group(2), m.group(3).strip()
-        if recv not in as_recvs:
-            return m.group(0)
-        return "_AudioSource_%s[%s] = %s;" % (prop, recv, rhs)
-
-    text = cs2cpp.code_sub(
-        r"(?<![.\w])(\w+)\s*\.\s*(volume|pitch)\s*=\s*([^;]+);",
-        repl_float, text)
-
-    def repl_clip(m):
-        recv, rhs = m.group(1), m.group(2).strip()
-        if recv not in as_recvs:
-            return m.group(0)
-        if rhs == "null":
-            rhs = "-1"
-        return "_AudioSource_clip[%s] = %s;" % (recv, rhs)
-
-    text = cs2cpp.code_sub(
-        r"(?<![.\w])(\w+)\s*\.\s*clip\s*=\s*([^;]+);",
-        repl_clip, text)
-
-    def repl_call(m):
-        recv, meth = m.group(1), m.group(2)
-        if recv not in as_recvs:
-            return m.group(0)
-        return "AudioSource_%s(%s)" % (meth, recv)
-
-    text = cs2cpp.code_sub(
-        r"(?<![.\w])(\w+)\s*\.\s*(Play|Stop)\s*\(\s*\)",
-        repl_call, text)
-
-    # Bool/float reads: recv.volume / recv.loop
-    def repl_read_float(m):
-        recv, prop = m.group(1), m.group(2)
-        if recv not in as_recvs:
-            return m.group(0)
-        return "_AudioSource_%s[%s]" % (prop, recv)
-
-    text = cs2cpp.code_sub(
-        r"(?<![.\w])(\w+)\s*\.\s*(volume|pitch)\b",
-        repl_read_float, text)
-
-    def repl_read_bool(m):
-        recv, prop = m.group(1), m.group(2)
-        if recv not in as_recvs:
-            return m.group(0)
-        field = bool_map[prop]
-        return "_AudioSource_%s[%s]" % (field, recv)
-
-    text = cs2cpp.code_sub(
-        r"(?<![.\w])(\w+)\s*\.\s*(playOnAwake|loop|mute)\b",
-        repl_read_bool, text)
-
-    def repl_read_clip(m):
-        recv = m.group(1)
-        if recv not in as_recvs:
-            return m.group(0)
-        return "_AudioSource_clip[%s]" % recv
-
-    text = cs2cpp.code_sub(
-        r"(?<![.\w])(\w+)\s*\.\s*clip\b",
-        repl_read_clip, text)
-    return text
 
 
 def _rewrite_instantiate(text, plan, this_class):
@@ -8210,42 +4672,6 @@ def _rewrite_addcomponent(text, plan, this_class):
     return text, locals_ty
 
 
-def _wrap_log_collision2d_tostring(text, param):
-    """Console/Debug of a Collision2D param → Collision2D_ToString(handle)."""
-    if not param:
-        return text
-    out = []
-    i = 0
-    while True:
-        m = re.search(r"(?:Console_WriteLine|Debug_Log)\s*\(", text[i:])
-        if not m:
-            out.append(text[i:])
-            break
-        out.append(text[i:i + m.start()])
-        call = m.group(0)
-        callee = re.match(r"(Console_WriteLine|Debug_Log)", call).group(1)
-        start = i + m.end()
-        depth = 1
-        j = start
-        while j < len(text) and depth:
-            c = text[j]
-            if c == "(":
-                depth += 1
-            elif c == ")":
-                depth -= 1
-                if depth == 0:
-                    break
-            j += 1
-        if depth != 0:
-            out.append(text[i + m.start():])
-            break
-        args = text[start:j].strip()
-        if args == param:
-            args = "Collision2D_ToString(%s)" % param
-        out.append("%s(%s)" % (callee, args))
-        i = j + 1
-    return "".join(out)
-
 
 def _wrap_log_component_tostring(text, locals_ty):
     """Console/Debug of an AddComponent local → Type_ToString(index)."""
@@ -8285,7 +4711,6 @@ def _wrap_log_component_tostring(text, locals_ty):
     return "".join(out)
 
 
-_PHYSICS_COMPONENTS = frozenset(("Rigidbody2D", "Rigidbody"))
 
 # Names that already own GameObject_GetComponent_<T> / _engine_go_<T> helpers.
 # A scriptless GO named "Button" must not become packed class Button — C has
@@ -8317,158 +4742,6 @@ _GCIC_TYPE_ALIAS = {
 def _gcic_resolve_type(tname):
     """Map polymorphic GetComponentsInChildren type → packed GO-map type."""
     return _GCIC_TYPE_ALIAS.get(tname, tname)
-
-# MonoBehaviour 2D collision messages (Unity Physics2D).
-_COLLISION2D_MSGS = (
-    "OnCollisionEnter2D",
-    "OnCollisionStay2D",
-    "OnCollisionExit2D",
-)
-
-
-def _collision2d_arg_name(args):
-    """Param name from `OnCollisionEnter2D(Collision2D coll)`, or None."""
-    if not args:
-        return None
-    m = re.match(
-        r"(?:UnityEngine\.)?Collision2D\s+(\w+)\s*$",
-        args.strip())
-    return m.group(1) if m else None
-
-
-def _want_rb2d_tables(plan, used_apis=None, getcomponent_types=None):
-    """True when engine/data must emit Rigidbody2D packed tables.
-
-    Authored bodies, AddComponent, GetComponent, and Collider2D collide all
-    touch ``_Rigidbody2D_*``. Collide alone is enough: resolution reads mass
-    and velocity even when every collider's rb index is -1.
-    """
-    used_apis = used_apis or set()
-    gct = set(getcomponent_types or ())
-    gct |= set(plan.get("getcomponent_types") or [])
-    add_types = set(plan.get("addcomponent_types") or [])
-    return (
-        bool(plan.get("rigidbody2d"))
-        or "Rigidbody2D" in gct
-        or "Rigidbody2D" in used_apis
-        or "Rigidbody2D" in add_types
-        or bool(plan.get("collider2d")))
-
-
-def _want_rb3d_tables(plan, used_apis=None, getcomponent_types=None):
-    """True when engine/data must emit Rigidbody (3D) packed tables."""
-    used_apis = used_apis or set()
-    gct = set(getcomponent_types or ())
-    gct |= set(plan.get("getcomponent_types") or [])
-    add_types = set(plan.get("addcomponent_types") or [])
-    return (
-        bool(plan.get("rigidbody"))
-        or "Rigidbody" in gct
-        or "Rigidbody" in used_apis
-        or "Rigidbody" in add_types
-        or bool(plan.get("collider3d")))
-
-
-def _build_rigidbody_tables(plan):
-    """Authored Rigidbody2D / Rigidbody → packed tables linked to MB instances."""
-    rb2d = []
-    rb3d = []
-    go_rb2d = {}  # go_index -> rb2d index
-    go_rb3d = {}
-    rb2d_by_file_id = {}
-    rb3d_by_file_id = {}
-    for cname, cl in sorted(plan["classes"].items()):
-        for i, o in enumerate(cl.get("instances") or []):
-            n = o.get("name") or "obj"
-            gi = o.get("go_index")
-            r2 = o.get("rigidbody2d")
-            if r2:
-                if gi is not None:
-                    go_rb2d[int(gi)] = len(rb2d)
-                fid = r2.get("file_id")
-                if fid is not None and str(fid) != "0":
-                    rb2d_by_file_id[str(fid)] = len(rb2d)
-                rb2d.append({
-                    "name": n,
-                    "go_index": gi,
-                    "owner_class": cname,
-                    "owner_inst": i,
-                    "file_id": fid,
-                    "body_type": int(r2.get("body_type") or 0),
-                    "mass": float(r2.get("mass") or 1.0),
-                    "gravity_scale": float(r2.get("gravity_scale") or 1.0),
-                    "linear_damping": float(r2.get("linear_damping") or 0.0),
-                    "vel_x": float(r2.get("vel_x") or 0.0),
-                    "vel_y": float(r2.get("vel_y") or 0.0),
-                })
-            r3 = o.get("rigidbody")
-            if r3:
-                if gi is not None:
-                    go_rb3d[int(gi)] = len(rb3d)
-                fid = r3.get("file_id")
-                if fid is not None and str(fid) != "0":
-                    rb3d_by_file_id[str(fid)] = len(rb3d)
-                rb3d.append({
-                    "name": n,
-                    "go_index": gi,
-                    "owner_class": cname,
-                    "owner_inst": i,
-                    "file_id": fid,
-                    "mass": float(r3.get("mass") or 1.0),
-                    "use_gravity": int(r3.get("use_gravity")
-                                       if r3.get("use_gravity") is not None
-                                       else 1),
-                    "drag": float(r3.get("drag") or 0.0),
-                    "vel_x": float(r3.get("vel_x") or 0.0),
-                    "vel_y": float(r3.get("vel_y") or 0.0),
-                    "vel_z": float(r3.get("vel_z") or 0.0),
-                })
-    return (rb2d, rb3d, go_rb2d, go_rb3d, rb2d_by_file_id, rb3d_by_file_id)
-
-
-def _build_audiosource_tables(plan):
-    """Authored AudioSource (!u!82) → packed pool; clip guids → opaque indices."""
-    sources = []
-    go_first = {}  # go_index → first AudioSource index (GetComponent)
-    by_file_id = {}
-    clip_guids = []
-    clip_i = {}
-
-    def _clip_idx(guid):
-        g = (guid or "").lower()
-        if not g:
-            return -1
-        if g not in clip_i:
-            clip_i[g] = len(clip_guids)
-            clip_guids.append(g)
-        return clip_i[g]
-
-    for cname, cl in sorted(plan["classes"].items()):
-        for i, o in enumerate(cl.get("instances") or []):
-            n = o.get("name") or "obj"
-            gi = o.get("go_index")
-            for a in o.get("audiosources") or []:
-                fid = a.get("file_id")
-                idx = len(sources)
-                if gi is not None and int(gi) not in go_first:
-                    go_first[int(gi)] = idx
-                if fid is not None and str(fid) != "0":
-                    by_file_id[str(fid)] = idx
-                sources.append({
-                    "name": n,
-                    "go_index": gi,
-                    "owner_class": cname,
-                    "owner_inst": i,
-                    "file_id": fid,
-                    "play_on_awake": int(a.get("play_on_awake") or 0),
-                    "volume": float(a.get("volume") or 1.0),
-                    "pitch": float(a.get("pitch") or 1.0),
-                    "loop": int(a.get("loop") or 0),
-                    "mute": int(a.get("mute") or 0),
-                    "clip": _clip_idx(a.get("clip_guid")),
-                    "playing": 0,
-                })
-    return sources, go_first, by_file_id, clip_guids
 
 
 def _attach_transform_parents(plan):
@@ -8537,242 +4810,6 @@ def _instance_storage_pos(o):
     return (float(p[0]), float(p[1]),
             float(p[2]) if len(p) > 2 else 0.0)
 
-
-def _build_collider2d_tables(plan):
-    """Authored BoxCollider2D / CircleCollider2D → packed contact table."""
-    cols = []
-    class_ids = {n: i for i, n in enumerate(sorted(plan["classes"]))}
-    # Map (class, inst) → rb2d index for dynamic flag.
-    rb_of = {}
-    for ri, r in enumerate(plan.get("rigidbody2d") or []):
-        rb_of[(r["owner_class"], r["owner_inst"])] = ri
-    for cname, cl in sorted(plan["classes"].items()):
-        cid = class_ids[cname]
-        for i, o in enumerate(cl.get("instances") or []):
-            c = o.get("collider2d")
-            if not c or not c.get("enabled", 1):
-                continue
-            rb_i = rb_of.get((cname, i))
-            body = 2  # static (no RB)
-            if rb_i is not None:
-                body = int((plan["rigidbody2d"][rb_i]).get("body_type") or 0)
-            kind = 0 if c.get("kind") == "box" else 1
-            cols.append({
-                "name": o.get("name") or "obj",
-                "owner_class": cname,
-                "owner_class_id": cid,
-                "owner_inst": i,
-                "rb2d": rb_i if rb_i is not None else -1,
-                "body_type": body,  # 0 dynamic, 1 kinematic, 2 static
-                "kind": kind,
-                "is_trigger": int(c.get("is_trigger") or 0),
-                "ox": float(c.get("ox") or 0.0),
-                "oy": float(c.get("oy") or 0.0),
-                "hw": float(c.get("hw") or 0.5),
-                "hh": float(c.get("hh") or 0.5),
-                "cos_z": float(c.get("cos_z") or 1.0),
-                "sin_z": float(c.get("sin_z") or 0.0),
-                "friction": float(c.get("friction")
-                                  if c.get("friction") is not None
-                                  else _DEFAULT_MAT2D["friction"]),
-                "bounciness": float(c.get("bounciness")
-                                    if c.get("bounciness") is not None
-                                    else 0.0),
-                "friction_combine": int(c.get("friction_combine") or 0),
-                "bounce_combine": int(c.get("bounce_combine") or 0),
-            })
-    return cols
-
-
-def _build_collider3d_tables(plan):
-    """Authored BoxCollider / SphereCollider → packed contact table."""
-    cols = []
-    class_ids = {n: i for i, n in enumerate(sorted(plan["classes"]))}
-    rb_of = {}
-    for ri, r in enumerate(plan.get("rigidbody") or []):
-        rb_of[(r["owner_class"], r["owner_inst"])] = ri
-    for cname, cl in sorted(plan["classes"].items()):
-        cid = class_ids[cname]
-        for i, o in enumerate(cl.get("instances") or []):
-            c = o.get("collider3d")
-            if not c or not c.get("enabled", 1):
-                continue
-            rb_i = rb_of.get((cname, i))
-            body = 0 if rb_i is not None else 2  # dynamic if RB else static
-            kind = 0 if c.get("kind") == "box" else 1
-            cols.append({
-                "name": o.get("name") or "obj",
-                "owner_class": cname,
-                "owner_class_id": cid,
-                "owner_inst": i,
-                "rb3d": rb_i if rb_i is not None else -1,
-                "body_type": body,
-                "kind": kind,
-                "is_trigger": int(c.get("is_trigger") or 0),
-                "ox": float(c.get("ox") or 0.0),
-                "oy": float(c.get("oy") or 0.0),
-                "oz": float(c.get("oz") or 0.0),
-                "hw": float(c.get("hw") or 0.5),
-                "hh": float(c.get("hh") or 0.5),
-                "hd": float(c.get("hd") or 0.5),
-                "dynamic_friction": float(
-                    c.get("dynamic_friction")
-                    if c.get("dynamic_friction") is not None
-                    else _DEFAULT_MAT3D["dynamic_friction"]),
-                "static_friction": float(
-                    c.get("static_friction")
-                    if c.get("static_friction") is not None
-                    else _DEFAULT_MAT3D["static_friction"]),
-                "bounciness": float(c.get("bounciness")
-                                    if c.get("bounciness") is not None
-                                    else 0.0),
-                "friction_combine": int(c.get("friction_combine") or 0),
-                "bounce_combine": int(c.get("bounce_combine") or 0),
-            })
-    return cols
-
-
-def _build_animation_tables(plan):
-    """Authored Animation / Animator players + shared clip keyframe tables.
-
-    Root position curves write absolute Transform.localPosition values from
-    the clip (Bob.anim x=2 → Spinner/Wave at x=2). Legacy clips bind only to
-    Animation; Mecanim clips only to Animator — see parse_unity_yaml.
-
-    m_PPtrCurves attribute m_Sprite swap SpriteRenderer.tex on the path child
-    (Idle.anim → Graphics).
-    """
-    clips_by_guid = {}
-    clip_list = []
-    players = []
-    class_ids = {n: i for i, n in enumerate(sorted(plan["classes"]))}
-    textures = plan.get("textures") or []
-    guid_to_tex = {t["guid"]: i for i, t in enumerate(textures)}
-
-    def _ensure_clip(guid, clip):
-        if guid in clips_by_guid:
-            return clips_by_guid[guid]
-        # Empty m_PositionCurves → no root motion; do not invent (0,0,0) keys
-        # (that teleports the Transform every tick — Idle.anim is sprite-only).
-        pos = list(clip.get("pos_keys") or [])
-        idx = len(clip_list)
-        entry = {
-            "guid": guid,
-            "name": clip.get("name") or "Clip",
-            "length": float(clip.get("length") or 1.0),
-            "loop": int(clip.get("loop") or 0),
-            "legacy": int(clip.get("legacy") or 0),
-            "pos_keys": pos,
-            "sprite_curves": list(clip.get("sprite_curves") or []),
-            "key_begin": 0,
-            "key_count": len(pos),
-        }
-        clips_by_guid[guid] = idx
-        clip_list.append(entry)
-        return idx
-
-    for cname, cl in sorted(plan["classes"].items()):
-        cid = class_ids[cname]
-        for i, o in enumerate(cl.get("instances") or []):
-            p = o.get("anim_player")
-            if not p or not p.get("clip"):
-                continue
-            guid = p["clip_guid"]
-            ci = _ensure_clip(guid, p["clip"])
-            rest = o.get("local_pos") or o.get("pos") or (0.0, 0.0, 0.0)
-            players.append({
-                "name": o.get("name") or "obj",
-                "owner_class": cname,
-                "owner_class_id": cid,
-                "owner_inst": i,
-                "owner_obj": o,
-                "clip": ci,
-                "playing": int(p.get("playing") or 0),
-                "speed": float(p.get("speed") or 1.0),
-                "loop": int(p.get("loop")
-                            if p.get("loop") is not None
-                            else clip_list[ci]["loop"]),
-                # Rest kept for diagnostics; tick writes absolute curve samples.
-                "rest_x": float(rest[0]),
-                "rest_y": float(rest[1]),
-                "rest_z": float(rest[2]) if len(rest) > 2 else 0.0,
-                "kind": 0 if p.get("kind") == "animation" else 1,
-                "sprite_bind_begin": 0,
-                "sprite_bind_count": 0,
-            })
-
-    keys = []
-    for c in clip_list:
-        c["key_begin"] = len(keys)
-        for t, x, y, z in c["pos_keys"]:
-            keys.append({"t": t, "x": x, "y": y, "z": z})
-        c["key_count"] = len(c["pos_keys"])
-
-    sprite_keys = []
-    sprite_binds = []
-    mutable = set()
-    for pl in players:
-        clip = clip_list[pl["clip"]]
-        curves = clip.get("sprite_curves") or []
-        if not curves:
-            pl.pop("owner_obj", None)
-            continue
-        owner = pl.get("owner_obj")
-        begin = len(sprite_binds)
-        for sc in curves:
-            path = (sc.get("path") or "").strip().strip('"')
-            hit = _resolve_anim_child_path(owner, path, plan)
-            if hit:
-                tc, ti, to = hit
-            elif not path:
-                tc, ti, to = (
-                    pl["owner_class"], pl["owner_inst"], owner)
-            else:
-                continue
-            if not to:
-                continue
-            sp = to.get("sprite") or {}
-            ls = to.get("local_scale") or (1.0, 1.0, 1.0)
-            sx = abs(float(sp.get("scale_x", ls[0])))
-            sy = abs(float(sp.get("scale_y", ls[1])))
-            skb = len(sprite_keys)
-            for t, g in sc.get("keys") or []:
-                tid = guid_to_tex.get(g)
-                if tid is None:
-                    continue
-                tex = textures[tid]
-                ppu = float(tex.get("ppu") or 100.0)
-                if ppu <= 0.0:
-                    ppu = 100.0
-                hw = (float(tex["w"]) / ppu) * sx * 0.5
-                hh = (float(tex["h"]) / ppu) * sy * 0.5
-                sprite_keys.append({
-                    "t": float(t), "tex": int(tid),
-                    "hw": hw, "hh": hh,
-                })
-            skc = len(sprite_keys) - skb
-            if skc <= 0:
-                continue
-            sprite_binds.append({
-                "target_class": tc,
-                "target_class_id": int(class_ids[tc]),
-                "target_inst": int(ti),
-                "key_begin": skb,
-                "key_count": skc,
-            })
-            mutable.add(tc)
-        pl["sprite_bind_begin"] = begin
-        pl["sprite_bind_count"] = len(sprite_binds) - begin
-        pl.pop("owner_obj", None)
-
-    plan["sprite_draw_mutable"] = sorted(mutable)
-    return {
-        "clips": clip_list,
-        "keys": keys,
-        "players": players,
-        "sprite_keys": sprite_keys,
-        "sprite_binds": sprite_binds,
-    }
 
 
 def _resolve_transform_field_targets(plan):
@@ -9044,191 +5081,6 @@ def _rewrite_static_ref_arrays(text, cl, plan):
         text = cs2cpp.code_sub(pat, mangled, text)
     return text
 
-
-def _rewrite_rigidbody_assigns(text, plan, this_class):
-    """Lower Rigidbody(2D).linearVelocity / .velocity assigns.
-
-    Supports:
-      GetComponent<Rigidbody2D>().linearVelocity = new Vector2(x, y);
-      rb.linearVelocity = rb.linearVelocity.SetX(expr);
-      rb.linearVelocity = new Vector2(x, y);
-    and Rigidbody / SetY / SetZ / velocity aliases.
-    """
-    this_idn = _c_ident(this_class)
-    go_this = "_engine_go_of_%s(i)" % this_idn
-    cl = (plan.get("classes") or {}).get(this_class) or {}
-    rb2d_fields = [
-        f["name"] for f in (cl.get("fields") or [])
-        if f.get("ty") == "Rigidbody2D"]
-    rb3d_fields = [
-        f["name"] for f in (cl.get("fields") or [])
-        if f.get("ty") == "Rigidbody"]
-
-    def repl_2d_new(m):
-        args = _split_call_args(m.group(1))
-        if len(args) < 2:
-            return m.group(0)
-        return (
-            "{ int _up_rb = GameObject_GetComponent_Rigidbody2D(%s); "
-            "if (_up_rb >= 0) { _Rigidbody2D_vel_x[_up_rb] = (%s); "
-            "_Rigidbody2D_vel_y[_up_rb] = (%s); } }"
-            % (go_this, args[0], args[1])
-        )
-
-    def repl_3d_new(m):
-        args = _split_call_args(m.group(1))
-        if len(args) < 3:
-            return m.group(0)
-        return (
-            "{ int _up_rb = GameObject_GetComponent_Rigidbody(%s); "
-            "if (_up_rb >= 0) { _Rigidbody_vel_x[_up_rb] = (%s); "
-            "_Rigidbody_vel_y[_up_rb] = (%s); "
-            "_Rigidbody_vel_z[_up_rb] = (%s); } }"
-            % (go_this, args[0], args[1], args[2])
-        )
-
-    text = cs2cpp.code_sub(
-        r"(?:this\s*\.\s*)?GetComponent\s*<\s*(?:UnityEngine\.)?Rigidbody2D\s*>"
-        r"\s*\(\s*\)\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
-        r"new\s+Vector2\s*\((.*?)\)\s*;",
-        repl_2d_new, text, flags=re.S)
-    text = cs2cpp.code_sub(
-        r"(?:this\s*\.\s*)?GetComponent\s*<\s*(?:UnityEngine\.)?Rigidbody\s*>"
-        r"\s*\(\s*\)\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
-        r"new\s+Vector3\s*\((.*?)\)\s*;",
-        repl_3d_new, text, flags=re.S)
-
-    def repl_2d_setx(m):
-        return (
-            "{ int _up_rb = GameObject_GetComponent_Rigidbody2D(%s); "
-            "if (_up_rb >= 0) { _Rigidbody2D_vel_x[_up_rb] = (%s); } }"
-            % (go_this, m.group(1).strip())
-        )
-
-    def repl_2d_sety(m):
-        return (
-            "{ int _up_rb = GameObject_GetComponent_Rigidbody2D(%s); "
-            "if (_up_rb >= 0) { _Rigidbody2D_vel_y[_up_rb] = (%s); } }"
-            % (go_this, m.group(1).strip())
-        )
-
-    text = cs2cpp.code_sub(
-        r"(?:this\s*\.\s*)?GetComponent\s*<\s*(?:UnityEngine\.)?Rigidbody2D\s*>"
-        r"\s*\(\s*\)\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
-        r"(?:this\s*\.\s*)?GetComponent\s*<\s*(?:UnityEngine\.)?Rigidbody2D\s*>"
-        r"\s*\(\s*\)\s*\.\s*(?:linearVelocity|velocity)\s*\.\s*SetX\s*\((.*?)\)\s*;",
-        repl_2d_setx, text, flags=re.S)
-    text = cs2cpp.code_sub(
-        r"(?:this\s*\.\s*)?GetComponent\s*<\s*(?:UnityEngine\.)?Rigidbody2D\s*>"
-        r"\s*\(\s*\)\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
-        r"(?:this\s*\.\s*)?GetComponent\s*<\s*(?:UnityEngine\.)?Rigidbody2D\s*>"
-        r"\s*\(\s*\)\s*\.\s*(?:linearVelocity|velocity)\s*\.\s*SetY\s*\((.*?)\)\s*;",
-        repl_2d_sety, text, flags=re.S)
-
-    def repl_3d_set(axis):
-        def _repl(m):
-            return (
-                "{ int _up_rb = GameObject_GetComponent_Rigidbody(%s); "
-                "if (_up_rb >= 0) { _Rigidbody_vel_%s[_up_rb] = (%s); } }"
-                % (go_this, axis, m.group(1).strip())
-            )
-        return _repl
-
-    for axis in ("X", "Y", "Z"):
-        text = cs2cpp.code_sub(
-            r"(?:this\s*\.\s*)?GetComponent\s*<\s*(?:UnityEngine\.)?Rigidbody\s*>"
-            r"\s*\(\s*\)\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
-            r"(?:this\s*\.\s*)?GetComponent\s*<\s*(?:UnityEngine\.)?Rigidbody\s*>"
-            r"\s*\(\s*\)\s*\.\s*(?:linearVelocity|velocity)\s*\.\s*Set%s\s*\((.*?)\)\s*;"
-            % axis,
-            repl_3d_set(axis.lower()), text, flags=re.S)
-
-    # Field-based: rb.linearVelocity = rb.linearVelocity.SetX(expr);
-    for fname in rb2d_fields:
-        get_rb = "(int)%s_get_%s(i)" % (this_idn, fname)
-
-        def _set_xy(x_expr, y_expr, gr=get_rb):
-            return (
-                "{ int _up_rb = %s; if (_up_rb >= 0) { "
-                "_Rigidbody2D_vel_x[_up_rb] = (%s); "
-                "_Rigidbody2D_vel_y[_up_rb] = (%s); } }"
-                % (gr, x_expr, y_expr)
-            )
-
-        def repl_setx(m, fn=fname, gr=get_rb):
-            # Keep y; set x from SetX arg.
-            return (
-                "{ int _up_rb = %s; if (_up_rb >= 0) { "
-                "_Rigidbody2D_vel_x[_up_rb] = (%s); } }"
-                % (gr, m.group(1).strip())
-            )
-
-        def repl_sety(m, fn=fname, gr=get_rb):
-            return (
-                "{ int _up_rb = %s; if (_up_rb >= 0) { "
-                "_Rigidbody2D_vel_y[_up_rb] = (%s); } }"
-                % (gr, m.group(1).strip())
-            )
-
-        def repl_new2(m, gr=get_rb):
-            args = _split_call_args(m.group(1))
-            if len(args) < 2:
-                return m.group(0)
-            return _set_xy(args[0], args[1], gr)
-
-        text = cs2cpp.code_sub(
-            r"(?<![_\w])%s\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
-            r"(?:this\s*\.\s*)?%s\s*\.\s*(?:linearVelocity|velocity)\s*"
-            r"\.\s*SetX\s*\((.*?)\)\s*;"
-            % (re.escape(fname), re.escape(fname)),
-            repl_setx, text, flags=re.S)
-        text = cs2cpp.code_sub(
-            r"(?<![_\w])%s\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
-            r"(?:this\s*\.\s*)?%s\s*\.\s*(?:linearVelocity|velocity)\s*"
-            r"\.\s*SetY\s*\((.*?)\)\s*;"
-            % (re.escape(fname), re.escape(fname)),
-            repl_sety, text, flags=re.S)
-        text = cs2cpp.code_sub(
-            r"(?<![_\w])%s\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
-            r"new\s+Vector2\s*\((.*?)\)\s*;" % re.escape(fname),
-            repl_new2, text, flags=re.S)
-
-    for fname in rb3d_fields:
-        get_rb = "(int)%s_get_%s(i)" % (this_idn, fname)
-
-        def _axis_set(axis, m, gr=get_rb):
-            return (
-                "{ int _up_rb = %s; if (_up_rb >= 0) { "
-                "_Rigidbody_vel_%s[_up_rb] = (%s); } }"
-                % (gr, axis, m.group(1).strip())
-            )
-
-        def repl_new3(m, gr=get_rb):
-            args = _split_call_args(m.group(1))
-            if len(args) < 3:
-                return m.group(0)
-            return (
-                "{ int _up_rb = %s; if (_up_rb >= 0) { "
-                "_Rigidbody_vel_x[_up_rb] = (%s); "
-                "_Rigidbody_vel_y[_up_rb] = (%s); "
-                "_Rigidbody_vel_z[_up_rb] = (%s); } }"
-                % (gr, args[0], args[1], args[2])
-            )
-
-        for axis in ("X", "Y", "Z"):
-            text = cs2cpp.code_sub(
-                r"(?<![_\w])%s\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
-                r"(?:this\s*\.\s*)?%s\s*\.\s*(?:linearVelocity|velocity)\s*"
-                r"\.\s*Set%s\s*\((.*?)\)\s*;"
-                % (re.escape(fname), re.escape(fname), axis),
-                lambda m, ax=axis.lower(): _axis_set(ax, m),
-                text, flags=re.S)
-        text = cs2cpp.code_sub(
-            r"(?<![_\w])%s\s*\.\s*(?:linearVelocity|velocity)\s*=\s*"
-            r"new\s+Vector3\s*\((.*?)\)\s*;" % re.escape(fname),
-            repl_new3, text, flags=re.S)
-
-    return text
 
 
 def _nre_at_expr(site, line):
@@ -10407,34 +6259,6 @@ def _rewrite_mb_static_and_singleton(text, plan, cl):
     return text
 
 
-def _rewrite_toggle_is_on(text):
-    """``arr[i].isOn = v`` / ``toggle.isOn`` → ``Toggle_set/get_isOn``.
-
-    Runs after singleton/ref-array rewrites so ``Instance.toggles[i].isOn``
-    is already ``Class_toggles[i].isOn``. Index expr must stay on one
-    bracket pair (no DOTALL) so ``equipped[i]; … toggles[x].isOn`` cannot
-    merge into one match.
-    """
-    # Allow calls inside the index (IndexOf(x)) but not `;` / newlines / `]`.
-    idx = r"([^\]\n;]*)"
-    text = cs2cpp.code_sub(
-        r"(\w+)\s*\[%s\]\s*\.\s*isOn\s*=\s*([^;]+);" % idx,
-        r"Toggle_set_isOn(\1[\2], (\3));",
-        text)
-    text = cs2cpp.code_sub(
-        r"(?<![\w.])(\w+)\s*\.\s*isOn\s*=\s*([^;]+);",
-        r"Toggle_set_isOn(\1, (\2));",
-        text)
-    text = cs2cpp.code_sub(
-        r"(\w+)\s*\[%s\]\s*\.\s*isOn\b" % idx,
-        r"Toggle_get_isOn(\1[\2])",
-        text)
-    text = cs2cpp.code_sub(
-        r"(?<![\w.])(\w+)\s*\.\s*isOn\b",
-        r"Toggle_get_isOn(\1)",
-        text)
-    return text
-
 
 def _unstored_field_names(cl, plan):
     """Authored fields -- the class's and its bases' -- with no packed slot.
@@ -11131,6 +6955,5251 @@ def _soa_axis_count(cl):
     return 2 if cl["two_d"] else 3
 
 
+# emit_engine is split into these section functions, in emission order. Each takes
+# the emit_engine locals it reads; the section code itself is unchanged.
+
+
+def _emit_engine_anim_decls(
+        anim_clips, anim_keys, anim_plan, anim_players, p, want_anim):
+    """emit_engine: Animation player externs used by the sections below."""
+    if want_anim and anim_players:
+        np = max(1, len(anim_players))
+        nc = max(1, len(anim_clips))
+        nk = max(1, len(anim_keys))
+        p("extern const int _AnimPlayer_count;")
+        p("extern int _AnimPlayer_playing[%d];" % np)
+        p("extern float _AnimPlayer_time[%d];" % np)
+        p("extern const float _AnimPlayer_speed[%d];" % np)
+        p("extern const int _AnimPlayer_loop[%d];" % np)
+        p("extern const int _AnimPlayer_clip[%d];" % np)
+        p("extern const int _AnimPlayer_owner_class[%d];" % np)
+        p("extern const int _AnimPlayer_owner_inst[%d];" % np)
+        p("extern const float _AnimPlayer_rest_x[%d];" % np)
+        p("extern const float _AnimPlayer_rest_y[%d];" % np)
+        p("extern const float _AnimPlayer_rest_z[%d];" % np)
+        p("extern const int _AnimClip_count;")
+        p("extern const float _AnimClip_length[%d];" % nc)
+        p("extern const int _AnimClip_key_begin[%d];" % nc)
+        p("extern const int _AnimClip_key_count[%d];" % nc)
+        p("extern const int _AnimKey_count;")
+        p("extern const float _AnimKey_t[%d];" % nk)
+        p("extern const float _AnimKey_x[%d];" % nk)
+        p("extern const float _AnimKey_y[%d];" % nk)
+        p("extern const float _AnimKey_z[%d];" % nk)
+        anim_skeys = anim_plan.get("sprite_keys") or []
+        anim_sbinds = anim_plan.get("sprite_binds") or []
+        if anim_skeys or anim_sbinds:
+            nsk = max(1, len(anim_skeys))
+            nsb = max(1, len(anim_sbinds))
+            p("extern const int _AnimPlayer_sprite_bind_begin[%d];" % np)
+            p("extern const int _AnimPlayer_sprite_bind_count[%d];" % np)
+            p("extern const int _AnimSpriteBind_count;")
+            p("extern const int _AnimSpriteBind_target_class[%d];" % nsb)
+            p("extern const int _AnimSpriteBind_target_inst[%d];" % nsb)
+            p("extern const int _AnimSpriteBind_key_begin[%d];" % nsb)
+            p("extern const int _AnimSpriteBind_key_count[%d];" % nsb)
+            p("extern const int _AnimSpriteKey_count;")
+            p("extern const float _AnimSpriteKey_t[%d];" % nsk)
+            p("extern const int _AnimSpriteKey_tex[%d];" % nsk)
+            p("extern const float _AnimSpriteKey_hw[%d];" % nsk)
+            p("extern const float _AnimSpriteKey_hh[%d];" % nsk)
+
+
+def _emit_engine_debug_log(p, plan, want_log):
+    """emit_engine: Debug.Log / Console output and the player log file."""
+    if want_log:
+        company = plan.get("company_name") or "DefaultCompany"
+        product = plan.get("product_name") or "Player"
+        # Unity default: platform Player.log under company/product — not cwd.
+        # -logFile - → stdout; -logFile path → that file.
+        p("/* Debug.Log / print → Unity Player.log path (not cwd, not stdout) */")
+        p("static const char _engine_company[] = %s;" % _c_string(company))
+        p("static const char _engine_product[] = %s;" % _c_string(product))
+        p("static FILE *_engine_log_fp;")
+        p("static int _engine_log_stdout;")
+        p("static const char *_engine_log_override; /* NULL = platform default */")
+        p("static int _engine_log_opened;")
+        p("static char _engine_log_default[1024];")
+        p("")
+        p("#ifndef CRUST_NO_POSIX_MKDIR")
+        p("static int _engine_mkdir_p(char *path) {")
+        p("    char *p;")
+        p("    if (!path || !path[0]) return -1;")
+        p("    for (p = path + 1; *p; p++) {")
+        # Brace after #endif so both #ifdef arms share one `{` — duplicate
+        # opens across #else break raw brace walks (cpprust _toplevel_start).
+        p("#ifdef _WIN32")
+        p("        if (*p == '/' || *p == '\\\\')")
+        p("#else")
+        p("        if (*p == '/')")
+        p("#endif")
+        p("        {")
+        p("            char sep = *p;")
+        p("            *p = 0;")
+        p("            if (ENGINE_MKDIR(path) != 0 && errno != EEXIST) {")
+        p("                *p = sep; return -1;")
+        p("            }")
+        p("            *p = sep;")
+        p("        }")
+        p("    }")
+        p("    if (ENGINE_MKDIR(path) != 0 && errno != EEXIST) return -1;")
+        p("    return 0;")
+        p("}")
+        p("#endif")
+        p("")
+        p("static const char *_engine_default_log_path(void) {")
+        p("    const char *home;")
+        p("#ifndef CRUST_NO_POSIX_MKDIR")
+        p("    char dir[1024];")
+        p("    int n, i;")
+        p("#else")
+        p("    int n;")
+        p("#endif")
+        p("#ifdef _WIN32")
+        p("    home = getenv(\"USERPROFILE\");")
+        p("    if (!home || !home[0]) home = \".\";")
+        p("    n = snprintf(_engine_log_default, sizeof _engine_log_default,")
+        p("        \"%s\\\\AppData\\\\LocalLow\\\\%s\\\\%s\\\\Player.log\",")
+        p("        home, _engine_company, _engine_product);")
+        p("#elif defined(__APPLE__)")
+        p("    home = getenv(\"HOME\");")
+        p("    if (!home || !home[0]) home = \".\";")
+        p("    n = snprintf(_engine_log_default, sizeof _engine_log_default,")
+        p("        \"%s/Library/Logs/%s/%s/Player.log\",")
+        p("        home, _engine_company, _engine_product);")
+        p("#else")
+        p("    home = getenv(\"HOME\");")
+        p("    if (!home || !home[0]) home = \".\";")
+        p("    n = snprintf(_engine_log_default, sizeof _engine_log_default,")
+        p("        \"%s/.config/unity3d/%s/%s/Player.log\",")
+        p("        home, _engine_company, _engine_product);")
+        p("#endif")
+        p("    if (n < 0 || (size_t)n >= sizeof _engine_log_default) return 0;")
+        p("#ifndef CRUST_NO_POSIX_MKDIR")
+        p("    if ((size_t)n >= sizeof dir) return 0;")
+        p("    for (i = 0; i < n; i++) dir[i] = _engine_log_default[i];")
+        p("    dir[n] = 0;")
+        p("    for (i = n - 1; i >= 0; i--) {")
+        p("#ifdef _WIN32")
+        p("        if (dir[i] == '/' || dir[i] == '\\\\')")
+        p("#else")
+        p("        if (dir[i] == '/')")
+        p("#endif")
+        p("        { dir[i] = 0; break; }")
+        p("    }")
+        p("    if (dir[0]) _engine_mkdir_p(dir);")
+        p("#endif")
+        p("    return _engine_log_default;")
+        p("}")
+        p("")
+        p("void engine_set_log_file(const char *path) {")
+        p("    if (_engine_log_fp && !_engine_log_stdout) {")
+        p("        fclose(_engine_log_fp);")
+        p("        _engine_log_fp = 0;")
+        p("    }")
+        p("    _engine_log_opened = 0;")
+        p("    if (path && path[0] == '-' && path[1] == 0) {")
+        p("        _engine_log_stdout = 1;")
+        p("        _engine_log_override = 0;")
+        p("    } else if (path && path[0]) {")
+        p("        _engine_log_stdout = 0;")
+        p("        _engine_log_override = path;")
+        p("    } else {")
+        p("        _engine_log_stdout = 0;")
+        p("        _engine_log_override = 0;")
+        p("    }")
+        p("}")
+        p("")
+        p("const char *engine_console_log_path(void) {")
+        p("    if (_engine_log_stdout) return \"-\";")
+        p("    if (_engine_log_override) return _engine_log_override;")
+        p("    return _engine_default_log_path();")
+        p("}")
+        p("")
+        p("static FILE *_engine_log(void) {")
+        p("    if (_engine_log_stdout) return stdout;")
+        p("    if (!_engine_log_opened) {")
+        p("        const char *path;")
+        p("        _engine_log_opened = 1;")
+        p("        path = _engine_log_override ? _engine_log_override")
+        p("                                   : _engine_default_log_path();")
+        p("        if (path) _engine_log_fp = fopen(path, \"w\");")
+        p("        if (!_engine_log_fp) {")
+        p("            _engine_log_stdout = 1;")
+        p("            return stdout;")
+        p("        }")
+        p("    }")
+        p("    return _engine_log_fp;")
+        p("}")
+        p("")
+        p("static void Debug_Log_f(float v) {")
+        p("    FILE *f = _engine_log();")
+        p("    if (!f) return;")
+        p("    fprintf(f, \"%g\\n\", (double)v);")
+        p("    fflush(f);")
+        p("}")
+        p("static void Debug_Log_i(int v) {")
+        p("    FILE *f = _engine_log();")
+        p("    if (!f) return;")
+        p("    fprintf(f, \"%d\\n\", v);")
+        p("    fflush(f);")
+        p("}")
+        p("static void Debug_Log_s(const char *s) {")
+        p("    FILE *f = _engine_log();")
+        p("    if (!f) return;")
+        p("    fputs(s ? s : \"Null\", f);")
+        p("    fputc('\\n', f);")
+        p("    fflush(f);")
+        p("}")
+        p("/* Call sites pick Debug_Log_{i,f,s} at rewrite (no C11 generics). */")
+        p("")
+    else:
+        p("void engine_set_log_file(const char *path) { (void)path; }")
+        p("const char *engine_console_log_path(void) { return \"\"; }")
+        p("")
+
+
+def _emit_engine_file_bytes(
+        p, plan, want_file_append, want_file_bytes, want_file_read_bytes,
+        want_file_write, want_file_write_bytes, want_file_write_ops, want_log):
+    """emit_engine: System.IO byte arrays: File.WriteAllBytes / ReadAllBytes."""
+    if want_file_write_ops or want_file_read_bytes:
+        if want_file_bytes:
+            p("/* System.IO byte[] → ByteArray (WriteAllBytes / ReadAllBytes) */")
+            p("typedef struct {")
+            p("    const unsigned char *data;")
+            p("    int length;")
+            p("} ByteArray;")
+            p("")
+        if want_file_write_ops:
+            p("/* System.IO.File.WriteAllText / AppendAllText / WriteAllBytes */")
+            if not want_log:
+                p("#ifndef CRUST_NO_POSIX_MKDIR")
+                p("static int _engine_mkdir_p(char *path) {")
+                p("    char *p;")
+                p("    if (!path || !path[0]) return -1;")
+                p("    for (p = path + 1; *p; p++) {")
+                p("#ifdef _WIN32")
+                p("        if (*p == '/' || *p == '\\\\')")
+                p("#else")
+                p("        if (*p == '/')")
+                p("#endif")
+                p("        {")
+                p("            char sep = *p;")
+                p("            *p = 0;")
+                p("            if (ENGINE_MKDIR(path) != 0 && errno != EEXIST) {")
+                p("                *p = sep; return -1;")
+                p("            }")
+                p("            *p = sep;")
+                p("        }")
+                p("    }")
+                p("    if (ENGINE_MKDIR(path) != 0 && errno != EEXIST) return -1;")
+                p("    return 0;")
+                p("}")
+                p("#endif")
+                p("")
+            p("static void File_WriteContents(const char *path,")
+            p("                               const char *contents,")
+            p("                               const char *mode) {")
+            p("    FILE *fp;")
+            p("#ifndef CRUST_NO_POSIX_MKDIR")
+            p("    char dir[1024];")
+            p("    int n, i;")
+            p("    if (path && path[0]) {")
+            p("        n = (int)strlen(path);")
+            p("        if (n > 0 && (size_t)n < sizeof dir) {")
+            p("            for (i = 0; i < n; i++) dir[i] = path[i];")
+            p("            dir[n] = 0;")
+            p("            for (i = n - 1; i >= 0; i--) {")
+            p("#ifdef _WIN32")
+            p("                if (dir[i] == '/' || dir[i] == '\\\\')")
+            p("#else")
+            p("                if (dir[i] == '/')")
+            p("#endif")
+            p("                {")
+            p("                    dir[i] = 0;")
+            p("                    if (dir[0]) _engine_mkdir_p(dir);")
+            p("                    break;")
+            p("                }")
+            p("            }")
+            p("        }")
+            p("    }")
+            p("#endif")
+            p("    fp = fopen(path ? path : \"\", mode ? mode : \"w\");")
+            p("    if (!fp) return;")
+            p("    if (contents) fputs(contents, fp);")
+            p("    fclose(fp);")
+            p("}")
+            if want_file_write:
+                p("static void File_WriteAllText(const char *path,")
+                p("                              const char *contents) {")
+                p("    File_WriteContents(path, contents, \"w\");")
+                p("}")
+            if want_file_append:
+                p("static void File_AppendAllText(const char *path,")
+                p("                               const char *contents) {")
+                p("    File_WriteContents(path, contents, \"a\");")
+                p("}")
+            if want_file_write_bytes:
+                p("static void File_WriteAllBytes(const char *path, ByteArray bytes) {")
+                p("    FILE *fp;")
+                p("#ifndef CRUST_NO_POSIX_MKDIR")
+                p("    char dir[1024];")
+                p("    int n, i;")
+                p("    if (path && path[0]) {")
+                p("        n = (int)strlen(path);")
+                p("        if (n > 0 && (size_t)n < sizeof dir) {")
+                p("            for (i = 0; i < n; i++) dir[i] = path[i];")
+                p("            dir[n] = 0;")
+                p("            for (i = n - 1; i >= 0; i--) {")
+                p("#ifdef _WIN32")
+                p("                if (dir[i] == '/' || dir[i] == '\\\\')")
+                p("#else")
+                p("                if (dir[i] == '/')")
+                p("#endif")
+                p("                {")
+                p("                    dir[i] = 0;")
+                p("                    if (dir[0]) _engine_mkdir_p(dir);")
+                p("                    break;")
+                p("                }")
+                p("            }")
+                p("        }")
+                p("    }")
+                p("#endif")
+                p("    fp = fopen(path ? path : \"\", \"wb\");")
+                p("    if (!fp) return;")
+                p("    if (bytes.data && bytes.length > 0)")
+                p("        fwrite(bytes.data, 1, (size_t)bytes.length, fp);")
+                p("    fclose(fp);")
+                p("}")
+                # Literal helpers collected while lowering method bodies.
+                for bi, nums in enumerate(plan.get("byte_array_lits") or []):
+                    if not nums:
+                        p("static unsigned char _engine_ba_%d_data[1] = { 0 };"
+                          % bi)
+                        p("static ByteArray _engine_ba_%d(void) {" % bi)
+                        p("    ByteArray b;")
+                        p("    b.data = _engine_ba_%d_data;" % bi)
+                        p("    b.length = 0;")
+                        p("    return b;")
+                        p("}")
+                    else:
+                        p("static unsigned char _engine_ba_%d_data[%d] = { %s };"
+                          % (bi, len(nums),
+                             ", ".join(str(int(x) & 0xFF) for x in nums)))
+                        p("static ByteArray _engine_ba_%d(void) {" % bi)
+                        p("    ByteArray b;")
+                        p("    b.data = _engine_ba_%d_data;" % bi)
+                        p("    b.length = %d;" % len(nums))
+                        p("    return b;")
+                        p("}")
+        if want_file_read_bytes:
+            p("/* System.IO.File.ReadAllBytes — malloc buffer (no free). */")
+            p("static ByteArray File_ReadAllBytes(const char *path) {")
+            p("    ByteArray out;")
+            p("    FILE *fp;")
+            p("    unsigned char chunk[4096];")
+            p("    unsigned char *buf;")
+            p("    size_t cap, len, n;")
+            p("    out.data = 0;")
+            p("    out.length = 0;")
+            p("    if (!path || !path[0]) return out;")
+            p("    fp = fopen(path, \"rb\");")
+            p("    if (!fp) return out;")
+            p("    cap = 4096;")
+            p("    len = 0;")
+            p("    buf = (unsigned char *)malloc(cap);")
+            p("    if (!buf) { fclose(fp); return out; }")
+            p("    for (;;) {")
+            p("        n = fread(chunk, 1, sizeof chunk, fp);")
+            p("        if (n == 0) break;")
+            p("        if (len + n > cap) {")
+            p("            cap = cap + n + 4096;")
+            p("            {")
+            p("                unsigned char *nb = (unsigned char *)realloc(buf, cap);")
+            p("                if (!nb) { free(buf); fclose(fp); return out; }")
+            p("                buf = nb;")
+            p("            }")
+            p("        }")
+            p("        memcpy(buf + len, chunk, n);")
+            p("        len += n;")
+            p("    }")
+            p("    fclose(fp);")
+            p("    out.data = buf;")
+            p("    out.length = (int)len;")
+            p("    return out;")
+            p("}")
+        p("")
+
+
+def _emit_engine_file_copy(p, want_file_copy):
+    """emit_engine: System.IO.File.Copy."""
+    if want_file_copy:
+        # Copy(src, dest[, overwrite]) — fread/fwrite; no throw.
+        p("/* System.IO.File.Copy — fread/fwrite (+ mkdir dest parent) */")
+        p("static void File_Copy(const char *src, const char *dst,")
+        p("                      int overwrite) {")
+        p("    FILE *in;")
+        p("    FILE *out;")
+        p("    unsigned char buf[4096];")
+        p("    size_t n;")
+        p("    if (!src || !src[0] || !dst || !dst[0]) return;")
+        p("    if (!overwrite) {")
+        p("        out = fopen(dst, \"rb\");")
+        p("        if (out) { fclose(out); return; }")
+        p("    }")
+        p("#ifndef CRUST_NO_POSIX_MKDIR")
+        p("    {")
+        p("        char dir[1024];")
+        p("        int dn, i;")
+        p("        dn = (int)strlen(dst);")
+        p("        if (dn > 0 && (size_t)dn < sizeof dir) {")
+        p("            for (i = 0; i < dn; i++) dir[i] = dst[i];")
+        p("            dir[dn] = 0;")
+        p("            for (i = dn - 1; i >= 0; i--) {")
+        p("#ifdef _WIN32")
+        p("                if (dir[i] == '/' || dir[i] == '\\\\')")
+        p("#else")
+        p("                if (dir[i] == '/')")
+        p("#endif")
+        p("                {")
+        p("                    dir[i] = 0;")
+        p("                    if (dir[0]) _engine_mkdir_p(dir);")
+        p("                    break;")
+        p("                }")
+        p("            }")
+        p("        }")
+        p("    }")
+        p("#endif")
+        p("    in = fopen(src, \"rb\");")
+        p("    if (!in) return;")
+        p("    out = fopen(dst, \"wb\");")
+        p("    if (!out) { fclose(in); return; }")
+        p("    for (;;) {")
+        p("        n = fread(buf, 1, sizeof buf, in);")
+        p("        if (n == 0) break;")
+        p("        if (fwrite(buf, 1, n, out) != n) break;")
+        p("    }")
+        p("    fclose(in);")
+        p("    fclose(out);")
+        p("}")
+        p("")
+
+
+def _emit_engine_file_streams(
+        p, want_file_create_text, want_file_open_text, want_file_text_stream):
+    """emit_engine: System.IO.StreamWriter / StreamReader text streams."""
+    if want_file_text_stream:
+        p("/* System.IO.StreamWriter / StreamReader — FILE* text streams */")
+        p("typedef FILE *StreamWriter;")
+        p("typedef FILE *StreamReader;")
+        p("")
+        if want_file_create_text:
+            p("/* System.IO.File.CreateText — fopen \"w\" (+ mkdir). */")
+            p("static StreamWriter File_CreateText(const char *path) {")
+            p("    FILE *fp;")
+            p("#ifndef CRUST_NO_POSIX_MKDIR")
+            p("    char dir[1024];")
+            p("    int n, i;")
+            p("    if (path && path[0]) {")
+            p("        n = (int)strlen(path);")
+            p("        if (n > 0 && (size_t)n < sizeof dir) {")
+            p("            for (i = 0; i < n; i++) dir[i] = path[i];")
+            p("            dir[n] = 0;")
+            p("            for (i = n - 1; i >= 0; i--) {")
+            p("#ifdef _WIN32")
+            p("                if (dir[i] == '/' || dir[i] == '\\\\')")
+            p("#else")
+            p("                if (dir[i] == '/')")
+            p("#endif")
+            p("                {")
+            p("                    dir[i] = 0;")
+            p("                    if (dir[0]) _engine_mkdir_p(dir);")
+            p("                    break;")
+            p("                }")
+            p("            }")
+            p("        }")
+            p("    }")
+            p("#endif")
+            p("    fp = fopen(path ? path : \"\", \"w\");")
+            p("    return fp;")
+            p("}")
+            p("")
+        if want_file_open_text:
+            p("/* System.IO.File.OpenText — fopen \"r\". */")
+            p("static StreamReader File_OpenText(const char *path) {")
+            p("    if (!path || !path[0]) return 0;")
+            p("    return fopen(path, \"r\");")
+            p("}")
+            p("")
+        if want_file_create_text:
+            p("static void StreamWriter_WriteLine(StreamWriter fp,")
+            p("                                   const char *s) {")
+            p("    if (!fp) return;")
+            p("    fputs(s ? s : \"\", fp);")
+            p("    fputc('\\n', fp);")
+            p("    fflush(fp);")
+            p("}")
+            p("")
+        if want_file_open_text:
+            # Alternate two buffers so consecutive ReadLine() keep both lines.
+            p("static char _engine_readline_buf[2][4096];")
+            p("static int _engine_readline_i;")
+            p("static const char *StreamReader_ReadLine(StreamReader fp) {")
+            p("    char *buf;")
+            p("    size_t n;")
+            p("    if (!fp) return \"\";")
+            p("    buf = _engine_readline_buf[_engine_readline_i++ & 1];")
+            p("    if (!fgets(buf, (int)sizeof _engine_readline_buf[0], fp))")
+            p("        return \"\";")
+            p("    n = strlen(buf);")
+            p("    if (n > 0 && buf[n - 1] == '\\n') buf[n - 1] = 0;")
+            p("    if (n > 1 && buf[n - 2] == '\\r') buf[n - 2] = 0;")
+            p("    return buf;")
+            p("}")
+            p("")
+        p("static void Stream_Close(FILE *fp) {")
+        p("    if (fp) fclose(fp);")
+        p("}")
+        p("")
+
+
+def _emit_engine_add_rigidbody2d(
+        add_budget, class_ids, disallow_multi, go_names, go_rb2d, go_spawn_budget, p,
+        rb2d_cap, want_rb2d):
+    """_emit_engine_gameobject_tables: AddComponent<Rigidbody2D> into the packed Rigidbody2D tables."""
+    if want_rb2d:
+        vals = []
+        for i in range(len(go_names) if go_names else 0):
+            vals.append(str(go_rb2d[i]) if i in go_rb2d else "-1")
+        for _pad in range(go_spawn_budget):
+            vals.append("-1")
+        if not vals:
+            vals = ["-1"]
+        rb2d_add = int(add_budget.get("Rigidbody2D") or 0)
+        if rb2d_add:
+            p("static int _engine_go_Rigidbody2D[%d] = { %s };" % (
+                len(vals), ", ".join(vals)))
+        else:
+            p("static const int _engine_go_Rigidbody2D[%d] = { %s };" % (
+                len(vals), ", ".join(vals)))
+        p("static int GameObject_GetComponent_Rigidbody2D(int go) {")
+        p("    if (go < 0 || go >= _engine_go_count) return -1;")
+        p("    return _engine_go_Rigidbody2D[go];")
+        p("}")
+        p("")
+        if rb2d_add:
+            p("static int GameObject_AddComponent_Rigidbody2D(int go) {")
+            p("    int ex, oi, oc, c;")
+            p("    if (go < 0 || go >= _engine_go_count) return -1;")
+            p("    ex = _engine_go_Rigidbody2D[go];")
+            if "Rigidbody2D" in disallow_multi:
+                p("    if (ex >= 0) {")
+                p("        _engine_cant_add_component(\"Rigidbody2D\", go);")
+                p("        return -1;")
+                p("    }")
+            else:
+                p("    if (ex >= 0) return ex;")
+            p("    if (_Rigidbody2D_count >= %d) return -1;" % max(1, rb2d_cap))
+            p("    ex = _Rigidbody2D_count;")
+            p("    _Rigidbody2D_count = _Rigidbody2D_count + 1;")
+            p("    _engine_go_Rigidbody2D[go] = ex;")
+            p("    _Rigidbody2D_vel_x[ex] = 0.f;")
+            p("    _Rigidbody2D_vel_y[ex] = 0.f;")
+            p("    _Rigidbody2D_gravity_scale[ex] = 1.f;")
+            p("    _Rigidbody2D_linear_damping[ex] = 0.f;")
+            p("    _Rigidbody2D_mass[ex] = 1.f;")
+            p("    _Rigidbody2D_body_type[ex] = 0;")
+            p("    oc = -1; oi = 0;")
+            for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
+                idn = _c_ident(cname)
+                p("    c = _engine_go_%s[go];" % idn)
+                p("    if (c >= 0) { oc = %d; oi = c; }" % cid)
+            p("    _Rigidbody2D_owner_class[ex] = oc;")
+            p("    _Rigidbody2D_owner_inst[ex] = oi;")
+            p("    return ex;")
+            p("}")
+            p("")
+            p("static char _Rigidbody2D_tostring_buf[256];")
+            p("static const char *Rigidbody2D_ToString(int ci) {")
+            p("    int n, go;")
+            p("    if (ci < 0 || ci >= _Rigidbody2D_count) return \"null\";")
+            p("    for (go = 0; go < _engine_go_count; go = go + 1)")
+            p("        if (_engine_go_Rigidbody2D[go] == ci) break;")
+            p("    if (go >= _engine_go_count) return \"null\";")
+            p("    n = snprintf(_Rigidbody2D_tostring_buf,")
+            p("                 sizeof _Rigidbody2D_tostring_buf,")
+            p("                 \"%s (UnityEngine.Rigidbody2D)\",")
+            p("                 _engine_go_name[go]);")
+            p("    if (n < 0 || (size_t)n >= sizeof _Rigidbody2D_tostring_buf)")
+            p("        return _engine_go_name[go];")
+            p("    return _Rigidbody2D_tostring_buf;")
+            p("}")
+            p("")
+
+
+def _emit_engine_add_rigidbody(
+        add_budget, class_ids, disallow_multi, go_names, go_rb3d, go_spawn_budget, p,
+        rb3d_cap, want_rb3d):
+    """_emit_engine_gameobject_tables: AddComponent<Rigidbody> into the packed Rigidbody tables."""
+    if want_rb3d:
+        vals = []
+        for i in range(len(go_names) if go_names else 0):
+            vals.append(str(go_rb3d[i]) if i in go_rb3d else "-1")
+        for _pad in range(go_spawn_budget):
+            vals.append("-1")
+        if not vals:
+            vals = ["-1"]
+        rb3d_add = int(add_budget.get("Rigidbody") or 0)
+        if rb3d_add:
+            p("static int _engine_go_Rigidbody[%d] = { %s };" % (
+                len(vals), ", ".join(vals)))
+        else:
+            p("static const int _engine_go_Rigidbody[%d] = { %s };" % (
+                len(vals), ", ".join(vals)))
+        p("static int GameObject_GetComponent_Rigidbody(int go) {")
+        p("    if (go < 0 || go >= _engine_go_count) return -1;")
+        p("    return _engine_go_Rigidbody[go];")
+        p("}")
+        p("")
+        if rb3d_add:
+            p("static int GameObject_AddComponent_Rigidbody(int go) {")
+            p("    int ex, oi, oc, c;")
+            p("    if (go < 0 || go >= _engine_go_count) return -1;")
+            p("    ex = _engine_go_Rigidbody[go];")
+            if "Rigidbody" in disallow_multi:
+                p("    if (ex >= 0) {")
+                p("        _engine_cant_add_component(\"Rigidbody\", go);")
+                p("        return -1;")
+                p("    }")
+            else:
+                p("    if (ex >= 0) return ex;")
+            p("    if (_Rigidbody_count >= %d) return -1;" % max(1, rb3d_cap))
+            p("    ex = _Rigidbody_count;")
+            p("    _Rigidbody_count = _Rigidbody_count + 1;")
+            p("    _engine_go_Rigidbody[go] = ex;")
+            p("    _Rigidbody_vel_x[ex] = 0.f;")
+            p("    _Rigidbody_vel_y[ex] = 0.f;")
+            p("    _Rigidbody_vel_z[ex] = 0.f;")
+            p("    _Rigidbody_mass[ex] = 1.f;")
+            p("    _Rigidbody_drag[ex] = 0.f;")
+            p("    _Rigidbody_use_gravity[ex] = 1;")
+            p("    oc = -1; oi = 0;")
+            for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
+                idn = _c_ident(cname)
+                p("    c = _engine_go_%s[go];" % idn)
+                p("    if (c >= 0) { oc = %d; oi = c; }" % cid)
+            p("    _Rigidbody_owner_class[ex] = oc;")
+            p("    _Rigidbody_owner_inst[ex] = oi;")
+            p("    return ex;")
+            p("}")
+            p("")
+            p("static char _Rigidbody_tostring_buf[256];")
+            p("static const char *Rigidbody_ToString(int ci) {")
+            p("    int n, go;")
+            p("    if (ci < 0 || ci >= _Rigidbody_count) return \"null\";")
+            p("    for (go = 0; go < _engine_go_count; go = go + 1)")
+            p("        if (_engine_go_Rigidbody[go] == ci) break;")
+            p("    if (go >= _engine_go_count) return \"null\";")
+            p("    n = snprintf(_Rigidbody_tostring_buf,")
+            p("                 sizeof _Rigidbody_tostring_buf,")
+            p("                 \"%s (UnityEngine.Rigidbody)\",")
+            p("                 _engine_go_name[go]);")
+            p("    if (n < 0 || (size_t)n >= sizeof _Rigidbody_tostring_buf)")
+            p("        return _engine_go_name[go];")
+            p("    return _Rigidbody_tostring_buf;")
+            p("}")
+            p("")
+
+
+def _emit_engine_add_audio(add_budget, go_names, p, plan, want_add_audio):
+    """_emit_engine_gameobject_tables: AddComponent<AudioSource>."""
+    if want_add_audio:
+        asrc = plan.get("audiosources") or []
+        as_budget = int(add_budget.get("AudioSource") or 0)
+        as_cap = max(1, len(asrc) + as_budget)
+        go_n = max(1, len(go_names))
+        go_as = plan.get("go_audiosource") or {}
+        vals = []
+        for i in range(len(go_names) if go_names else 0):
+            vals.append(str(int(go_as[i])) if i in go_as else "-1")
+        if not go_names:
+            vals = ["-1"]
+        p("/* AudioSource — authored !u!82 + AddComponent pool (multi OK). */")
+        p("extern int _AudioSource_count;")
+        p("extern int _AudioSource_owner_go[%d];" % as_cap)
+        p("extern int _AudioSource_play_on_awake[%d];" % as_cap)
+        p("extern int _AudioSource_loop[%d];" % as_cap)
+        p("extern int _AudioSource_mute[%d];" % as_cap)
+        p("extern float _AudioSource_volume[%d];" % as_cap)
+        p("extern float _AudioSource_pitch[%d];" % as_cap)
+        p("extern int _AudioSource_clip[%d];" % as_cap)
+        p("extern int _AudioSource_playing[%d];" % as_cap)
+        p("static int _engine_go_AudioSource[%d] = { %s };" % (
+            go_n, ", ".join(vals)))
+        p("static int GameObject_GetComponent_AudioSource(int go) {")
+        p("    if (go < 0 || go >= _engine_go_count) return -1;")
+        p("    return _engine_go_AudioSource[go];")
+        p("}")
+        p("static int GameObject_AddComponent_AudioSource(int go) {")
+        p("    int ex, first;")
+        p("    if (go < 0 || go >= _engine_go_count) return -1;")
+        p("    first = _engine_go_AudioSource[go];")
+        p("    if (_AudioSource_count >= %d) return -1;" % as_cap)
+        p("    ex = _AudioSource_count;")
+        p("    _AudioSource_count = _AudioSource_count + 1;")
+        p("    if (first < 0)")
+        p("        _engine_go_AudioSource[go] = ex;")
+        p("    _AudioSource_owner_go[ex] = go;")
+        p("    _AudioSource_play_on_awake[ex] = 1;")
+        p("    _AudioSource_loop[ex] = 0;")
+        p("    _AudioSource_mute[ex] = 0;")
+        p("    _AudioSource_volume[ex] = 1.f;")
+        p("    _AudioSource_pitch[ex] = 1.f;")
+        p("    _AudioSource_clip[ex] = -1;")
+        p("    _AudioSource_playing[ex] = 0;")
+        p("    return ex;")
+        p("}")
+        p("static void AudioSource_Play(int ci) {")
+        p("    if (ci < 0 || ci >= _AudioSource_count) return;")
+        p("    if (_AudioSource_mute[ci]) return;")
+        p("    _AudioSource_playing[ci] = 1;")
+        p("    /* host may observe _AudioSource_playing / clip */")
+        p("}")
+        p("static void AudioSource_Stop(int ci) {")
+        p("    if (ci < 0 || ci >= _AudioSource_count) return;")
+        p("    _AudioSource_playing[ci] = 0;")
+        p("}")
+        p("static char _AudioSource_tostring_buf[256];")
+        p("static const char *AudioSource_ToString(int ci) {")
+        p("    int n, go;")
+        p("    if (ci < 0 || ci >= _AudioSource_count) return \"null\";")
+        p("    go = _AudioSource_owner_go[ci];")
+        p("    if (go < 0 || go >= _engine_go_count) return \"null\";")
+        p("    n = snprintf(_AudioSource_tostring_buf,")
+        p("                 sizeof _AudioSource_tostring_buf,")
+        p("                 \"%s (UnityEngine.AudioSource)\",")
+        p("                 _engine_go_name[go]);")
+        p("    if (n < 0 || (size_t)n >= sizeof _AudioSource_tostring_buf)")
+        p("        return _engine_go_name[go];")
+        p("    return _AudioSource_tostring_buf;")
+        p("}")
+        p("")
+
+
+def _emit_engine_gameobject_tables(
+        add_budget, add_types, class_ids, disallow_multi, findobject_types,
+        getcomponent_types, getcomponentsinchildren_types, go_has_sprite,
+        go_spawn_budget, inst_budget, light_cap, p, plan, rb2d_cap, rb3d_cap,
+        used_apis, want_add_any, want_add_audio, want_add_camera, want_add_light,
+        want_add_sprite, want_find, want_findobject, want_go_tables, want_instantiate,
+        want_rb2d, want_rb3d):
+    """emit_engine: GameObject tables: names, components, active flags, AddComponent."""
+    if not (want_go_tables):
+        return
+    go_names = plan.get("go_names") or []
+    go_comps = plan.get("go_components") or {}
+    go_rb2d = plan.get("go_rigidbody2d") or {}
+    go_rb3d = plan.get("go_rigidbody") or {}
+    go_authored = len(go_names)
+    go_cap = max(1, go_authored + go_spawn_budget)
+    p("/* GameObject.Find / GetComponent — live GO tables (seeded authored) */")
+    if go_spawn_budget:
+        p("static int _engine_go_count = %d;" % go_authored)
+        p("static const int _engine_go_cap = %d;" % go_cap)
+    else:
+        p("static const int _engine_go_count = %d;" % go_authored)
+    if go_names or go_spawn_budget:
+        p("static const char *_engine_go_name[%d] = {" % go_cap)
+        for n in go_names:
+            p("    %s," % _c_string(n))
+        for _pad in range(go_spawn_budget):
+            p("    \"\", /* instantiate spare */")
+        if not go_names and not go_spawn_budget:
+            p("    \"\",")
+        p("};")
+    else:
+        p("static const char *_engine_go_name[1] = { \"\" };")
+    # Unity catches script exceptions: log + unwind the current method.
+    p("static jmp_buf _engine_script_jmp;")
+    p("static int _engine_in_script = 0;")
+    p("static void _engine_null_reference_at(")
+    p("    const char *cls, const char *method,")
+    p("    const char *path, int line) {")
+    p("    fprintf(stderr, \"NullReferenceException: Object reference "
+      "not set to an instance of an object\\n\");")
+    p("    if (cls && method && path && path[0] && line > 0)")
+    p("        fprintf(stderr, \"%s.%s () (at %s:%d)\\n\",")
+    p("                cls, method, path, line);")
+    p("    else if (cls && method)")
+    p("        fprintf(stderr, \"%s.%s ()\\n\", cls, method);")
+    p("    if (_engine_in_script)")
+    p("        longjmp(_engine_script_jmp, 1);")
+    p("}")
+    p("")
+    if want_add_any:
+        p("static void _engine_cant_add_component("
+          "const char *comp, int go) {")
+        p("    const char *gon;")
+        p("    if (go < 0 || go >= _engine_go_count) gon = \"\";")
+        p("    else gon = _engine_go_name[go];")
+        p("    fprintf(stderr, \"Can't add component '%s' to %s "
+          "because such a component is already added to the "
+          "game object!\\n\",")
+        p("            comp, gon);")
+        p("}")
+        p("")
+    # Per MonoBehaviour class: instance index at each GO, or -1.
+    for cname in sorted(plan["classes"]):
+        idn = _c_ident(cname)
+        vals = ["-1"] * max(1, len(go_names) + go_spawn_budget)
+        if not go_names and not go_spawn_budget:
+            vals = ["-1"]
+        for i, o in enumerate(
+                plan["classes"][cname].get("instances") or []):
+            gi = o.get("go_index")
+            if gi is None or gi < 0 or gi >= len(vals):
+                continue
+            vals[int(gi)] = str(i)
+        mb_extra = _mb_pool_extra(plan, cname)
+        mb_add = int(add_budget.get(cname) or 0)
+        mb_inst = int(inst_budget.get(cname) or 0)
+        # Live GO→component map whenever GetComponent/AddComponent/
+        # Instantiate/FindObjectOfType can see runtime changes.
+        live_go = (
+            mb_extra
+            or cname in getcomponent_types
+            or cname in findobject_types
+            or "GetComponent" in used_apis
+            or want_findobject
+            or want_instantiate)
+        if live_go:
+            p("static int _engine_go_%s[%d] = { %s };" % (
+                idn, len(vals), ", ".join(vals)))
+        else:
+            p("static const int _engine_go_%s[%d] = { %s };" % (
+                idn, len(vals), ", ".join(vals)))
+        # this instance i → GO index (for GetComponent on this).
+        authored_n = int(plan["classes"][cname]["n"])
+        cap_n = authored_n + mb_extra
+        rev = ["-1"] * max(1, cap_n)
+        for i, o in enumerate(
+                plan["classes"][cname].get("instances") or []):
+            gi = o.get("go_index")
+            if gi is None or i >= len(rev):
+                continue
+            rev[i] = str(int(gi))
+        if live_go:
+            p("static int _engine_%s_go_of[%d] = { %s };" % (
+                idn, len(rev), ", ".join(rev)))
+        else:
+            p("static const int _engine_%s_go_of[%d] = { %s };" % (
+                idn, len(rev), ", ".join(rev)))
+        p("static int _engine_go_of_%s(unsigned i) {" % idn)
+        p("    if (i >= %du) return -1;" % len(rev))
+        p("    return _engine_%s_go_of[i];" % idn)
+        p("}")
+    if want_find:
+        p("static int GameObject_Find(const char *name) {")
+        p("    int i;")
+        p("    if (!name) return -1;")
+        p("    for (i = 0; i < _engine_go_count; i = i + 1)")
+        p("        if (strcmp(_engine_go_name[i], name) == 0) return i;")
+        p("    return -1;")
+        p("}")
+        p("")
+        # Unity prints "null" for a missing Object (Find miss / destroyed).
+        p("/* UnityEngine.Object.ToString — \"name (Type)\", else \"null\" */")
+        p("static char _object_tostring_buf[256];")
+        p("static const char *Object_ToString(int go) {")
+        p("    int n;")
+        p("    if (go < 0 || go >= _engine_go_count) return \"null\";")
+        p("    n = snprintf(_object_tostring_buf, sizeof _object_tostring_buf,")
+        p("                 \"%s (UnityEngine.GameObject)\",")
+        p("                 _engine_go_name[go]);")
+        p("    if (n < 0 || (size_t)n >= sizeof _object_tostring_buf)")
+        p("        return _engine_go_name[go];")
+        p("    return _object_tostring_buf;")
+        p("}")
+        p("")
+    # Transform / RectTransform ≡ GO index (live handle, no side table).
+    for tr_ty in sorted(getcomponent_types & _TRANSFORM_GETCOMPONENT_TYPES):
+        if not want_go_tables:
+            break
+        p("static int GameObject_GetComponent_%s(int go) {" % tr_ty)
+        p("    if (go < 0 || go >= _engine_go_count) return -1;")
+        p("    return go;")
+        p("}")
+        p("")
+    # Live uGUI GetComponent maps (mutable; seeded from authored presence).
+    ui_gc = sorted(
+        (getcomponent_types & _UI_GETCOMPONENT_TYPES)
+        - _TRANSFORM_GETCOMPONENT_TYPES)
+    if ui_gc and want_go_tables:
+        ui_maps = plan.get("go_ui_components") or {}
+        for ty in ui_gc:
+            idn = _c_ident(ty)
+            present = set(ui_maps.get(ty) or [])
+            vals = []
+            for i in range(len(go_names) if go_names else 0):
+                if i in present:
+                    vals.append(str(i))
+                else:
+                    vals.append("-1")
+            for _pad in range(go_spawn_budget):
+                vals.append("-1")
+            if not vals:
+                vals = ["-1"]
+            p("/* GetComponent<%s> — live GO map */" % ty)
+            p("static int _engine_go_%s[%d] = { %s };" % (
+                idn, len(vals), ", ".join(vals)))
+            p("static int GameObject_GetComponent_%s(int go) {" % idn)
+            p("    if (go < 0 || go >= _engine_go_count) return -1;")
+            p("    return _engine_go_%s[go];" % idn)
+            p("}")
+            p("")
+    # Emit GetComponent_<T> for every packed class (and requested types).
+    # Skip names already owned by UI / physics / Transform helpers — a
+    # packed class must not redefine those C symbols.
+    for cname in sorted(set(plan["classes"]) | (
+            getcomponent_types - _PHYSICS_COMPONENTS
+            - _UI_GETCOMPONENT_TYPES
+            - _TRANSFORM_GETCOMPONENT_TYPES) | (
+            add_types - _ADDABLE_BUILTINS)):
+        if cname not in plan["classes"]:
+            continue
+        if cname in _RESERVED_PACKED_CLASS_NAMES:
+            continue
+        idn = _c_ident(cname)
+        mb_extra = _mb_pool_extra(plan, cname)
+        mb_add = int(add_budget.get(cname) or 0)
+        p("static int GameObject_GetComponent_%s(int go) {" % idn)
+        p("    if (go < 0 || go >= _engine_go_count) return -1;")
+        p("    return _engine_go_%s[go];" % idn)
+        p("}")
+        p("")
+        if mb_add:
+            cap = int(plan["classes"][cname]["n"]) + mb_extra
+            p("static int GameObject_AddComponent_%s(int go) {" % idn)
+            p("    int ex;")
+            p("    if (go < 0 || go >= _engine_go_count) return -1;")
+            p("    ex = _engine_go_%s[go];" % idn)
+            if cname in disallow_multi:
+                p("    if (ex >= 0) {")
+                p("        _engine_cant_add_component(\"%s\", go);"
+                  % cname)
+                p("        return -1;")
+                p("    }")
+            else:
+                p("    if (ex >= 0) return ex;")
+            p("    if (_%s_inst_count >= %d) return -1;" % (idn, cap))
+            p("    ex = _%s_inst_count;" % idn)
+            p("    _%s_inst_count = _%s_inst_count + 1;" % (idn, idn))
+            p("    _engine_go_%s[go] = ex;" % idn)
+            p("    if (ex >= 0 && ex < %d)" % cap)
+            p("        _engine_%s_go_of[ex] = go;" % idn)
+            p("    return ex;")
+            p("}")
+            p("")
+            p("static char _%s_tostring_buf[256];" % idn)
+            p("static const char *%s_ToString(int ci) {" % idn)
+            p("    int n, go;")
+            p("    if (ci < 0 || ci >= _%s_inst_count) return \"null\";"
+              % idn)
+            p("    go = _engine_%s_go_of[ci];" % idn)
+            p("    if (go < 0 || go >= _engine_go_count) return \"null\";")
+            p("    n = snprintf(_%s_tostring_buf, sizeof _%s_tostring_buf,"
+              % (idn, idn))
+            p("                 \"%%s (%s)\", _engine_go_name[go]);" % cname)
+            p("    if (n < 0 || (size_t)n >= sizeof _%s_tostring_buf)"
+              % idn)
+            p("        return _engine_go_name[go];")
+            p("    return _%s_tostring_buf;" % idn)
+            p("}")
+            p("")
+    _emit_engine_add_rigidbody2d(
+            add_budget, class_ids, disallow_multi, go_names, go_rb2d, go_spawn_budget,
+            p, rb2d_cap, want_rb2d)
+    _emit_engine_add_rigidbody(
+            add_budget, class_ids, disallow_multi, go_names, go_rb3d, go_spawn_budget,
+            p, rb3d_cap, want_rb3d)
+
+    # Camera / Light / SpriteRenderer / Collider AddComponent pools.
+    def _emit_simple_add(type_name, unity_name, budget_key=None,
+                         authored_names=None):
+        bk = budget_key or type_name
+        bud = int(add_budget.get(bk) or 0)
+        if type_name not in add_types and not bud:
+            return
+        if bud <= 0:
+            bud = 1
+        idn = _c_ident(type_name)
+        go_n = max(1, len(go_names))
+        authored = authored_names or set()
+        init_vals = []
+        for i, _n in enumerate(go_names if go_names else [""]):
+            # >=0 marks present (authored sentinel 0). Keys are go indices.
+            init_vals.append("0" if i in authored else "-1")
+        p("static int _engine_go_%s[%d] = { %s };" % (
+            idn, go_n, ", ".join(init_vals)))
+        p("static int _%s_live = 0;" % idn)
+        p("static const int _%s_cap = %d;" % (idn, bud))
+        p("static int _%s_owner_go[%d];" % (idn, bud))
+        p("static int GameObject_GetComponent_%s(int go) {" % idn)
+        p("    if (go < 0 || go >= _engine_go_count) return -1;")
+        p("    return _engine_go_%s[go];" % idn)
+        p("}")
+        p("static int GameObject_AddComponent_%s(int go) {" % idn)
+        p("    int ex;")
+        p("    if (go < 0 || go >= _engine_go_count) return -1;")
+        p("    ex = _engine_go_%s[go];" % idn)
+        if type_name in disallow_multi:
+            p("    if (ex >= 0) {")
+            p("        _engine_cant_add_component(\"%s\", go);"
+              % type_name)
+            p("        return -1;")
+            p("    }")
+        else:
+            p("    if (ex >= 0) return ex;")
+        p("    if (_%s_live >= _%s_cap) return -1;" % (idn, idn))
+        p("    ex = _%s_live;" % idn)
+        p("    _%s_live = _%s_live + 1;" % (idn, idn))
+        p("    _engine_go_%s[go] = ex;" % idn)
+        p("    _%s_owner_go[ex] = go;" % idn)
+        p("    return ex;")
+        p("}")
+        p("static char _%s_tostring_buf[256];" % idn)
+        p("static const char *%s_ToString(int ci) {" % idn)
+        p("    int n, go;")
+        p("    if (ci < 0 || ci >= _%s_live) return \"null\";" % idn)
+        p("    go = _%s_owner_go[ci];" % idn)
+        p("    if (go < 0 || go >= _engine_go_count) return \"null\";")
+        p("    n = snprintf(_%s_tostring_buf, sizeof _%s_tostring_buf,"
+          % (idn, idn))
+        p("                 \"%%s (%s)\", _engine_go_name[go]);"
+          % unity_name)
+        p("    if (n < 0 || (size_t)n >= sizeof _%s_tostring_buf)" % idn)
+        p("        return _engine_go_name[go];")
+        p("    return _%s_tostring_buf;" % idn)
+        p("}")
+        p("")
+
+    if want_add_camera:
+        _emit_simple_add("Camera", "UnityEngine.Camera")
+    if want_add_sprite:
+        _emit_simple_add("SpriteRenderer", "UnityEngine.SpriteRenderer",
+                         authored_names=go_has_sprite)
+    elif ("SpriteRenderer" in getcomponent_types
+          or "SpriteRenderer" in getcomponentsinchildren_types):
+        # GetComponent / GetComponentsInChildren without AddComponent pool.
+        idn = "SpriteRenderer"
+        go_n_sr = max(1, len(go_names) + go_spawn_budget)
+        init_vals = []
+        for i, _n in enumerate(go_names if go_names else []):
+            init_vals.append("0" if i in go_has_sprite else "-1")
+        for _pad in range(go_spawn_budget):
+            init_vals.append("-1")
+        if not init_vals:
+            init_vals = ["-1"]
+        p("/* SpriteRenderer — authored presence (GetComponent / "
+          "GetComponentsInChildren) */")
+        p("static int _engine_go_%s[%d] = { %s };" % (
+            idn, len(init_vals), ", ".join(init_vals)))
+        p("static int GameObject_GetComponent_%s(int go) {" % idn)
+        p("    if (go < 0 || go >= _engine_go_count) return -1;")
+        p("    return _engine_go_%s[go];" % idn)
+        p("}")
+        p("")
+    if want_add_light:
+        # Light also grows the authored light tables when present.
+        bud = int(add_budget.get("Light") or 0) or 1
+        go_n = max(1, len(go_names))
+        p("static int _engine_go_Light[%d];" % go_n)
+        p("static int _Light_go_inited = 0;")
+        p("static void _Light_ensure_go_map(void) {")
+        p("    int i;")
+        p("    if (_Light_go_inited) return;")
+        p("    _Light_go_inited = 1;")
+        p("    for (i = 0; i < _engine_go_count; i = i + 1)")
+        p("        _engine_go_Light[i] = -1;")
+        p("}")
+        p("static int GameObject_GetComponent_Light(int go) {")
+        p("    _Light_ensure_go_map();")
+        p("    if (go < 0 || go >= _engine_go_count) return -1;")
+        p("    return _engine_go_Light[go];")
+        p("}")
+        p("static int GameObject_AddComponent_Light(int go) {")
+        p("    int ex;")
+        p("    _Light_ensure_go_map();")
+        p("    if (go < 0 || go >= _engine_go_count) return -1;")
+        p("    ex = _engine_go_Light[go];")
+        if "Light" in disallow_multi:
+            p("    if (ex >= 0) {")
+            p("        _engine_cant_add_component(\"Light\", go);")
+            p("        return -1;")
+            p("    }")
+        else:
+            p("    if (ex >= 0) return ex;")
+        p("    if (_Light_count >= %d) return -1;" % max(1, light_cap))
+        p("    ex = _Light_count;")
+        p("    _Light_count = _Light_count + 1;")
+        p("    _engine_go_Light[go] = ex;")
+        p("    _Light_intensity[ex] = 1.f;")
+        p("    _Light_color_r[ex] = 1.f;")
+        p("    _Light_color_g[ex] = 1.f;")
+        p("    _Light_color_b[ex] = 1.f;")
+        p("    return ex;")
+        p("}")
+        p("static char _Light_tostring_buf[256];")
+        p("static const char *Light_ToString(int ci) {")
+        p("    int n, go;")
+        p("    if (ci < 0 || ci >= _Light_count) return \"null\";")
+        p("    for (go = 0; go < _engine_go_count; go = go + 1)")
+        p("        if (_engine_go_Light[go] == ci) break;")
+        p("    if (go >= _engine_go_count) return \"null\";")
+        p("    n = snprintf(_Light_tostring_buf, sizeof _Light_tostring_buf,")
+        p("                 \"%s (UnityEngine.Light)\", _engine_go_name[go]);")
+        p("    if (n < 0 || (size_t)n >= sizeof _Light_tostring_buf)")
+        p("        return _engine_go_name[go];")
+        p("    return _Light_tostring_buf;")
+        p("}")
+        p("")
+    _emit_engine_add_audio(add_budget, go_names, p, plan, want_add_audio)
+    for col_ty, unity_ty in (
+            ("BoxCollider2D", "UnityEngine.BoxCollider2D"),
+            ("CircleCollider2D", "UnityEngine.CircleCollider2D"),
+            ("BoxCollider", "UnityEngine.BoxCollider"),
+            ("SphereCollider", "UnityEngine.SphereCollider")):
+        if col_ty in add_types:
+            _emit_simple_add(col_ty, unity_ty)
+
+
+def _emit_engine_live_rect_transforms(
+        go_authored_n, go_n, go_spawn_budget, p, plan, want_live_rt, want_rect):
+    """_emit_engine_ui_transform_tables: Live RectTransform tables that scripts can move and resize."""
+    if want_live_rt:
+        rt = plan.get("live_rt") or {}
+        go_rt_n = go_n
+
+        def _rt_f(key, default=0.0):
+            vals = list(rt.get(key) or [])
+            while len(vals) < go_authored_n:
+                vals.append(default)
+            vals = vals[:go_authored_n] + [default] * go_spawn_budget
+            if not vals:
+                vals = [default]
+            return vals[:go_rt_n]
+
+        def _rt_i(key, default=0):
+            vals = list(rt.get(key) or [])
+            while len(vals) < go_authored_n:
+                vals.append(default)
+            vals = vals[:go_authored_n] + [default] * go_spawn_budget
+            if not vals:
+                vals = [default]
+            return vals[:go_rt_n]
+
+        p("/* Live RectTransform (seeded post-layout bake) */")
+        ulw = max(1, int(plan.get("ui_layout_width")
+                         or plan.get("screen_width") or 1024))
+        ulh = max(1, int(plan.get("ui_layout_height")
+                         or plan.get("screen_height") or 768))
+        p("static const float _engine_ui_layout_w = %sf;" % repr(float(ulw)))
+        p("static const float _engine_ui_layout_h = %sf;" % repr(float(ulh)))
+        p("static const int _engine_rt_has[%d] = { %s };" % (
+            go_rt_n, ", ".join(str(int(x)) for x in _rt_i("has"))))
+        p("static const int _engine_rt_canvas[%d] = { %s };" % (
+            go_rt_n, ", ".join(str(int(x)) for x in _rt_i("canvas"))))
+        p("static const int _engine_rt_canvas_root[%d] = { %s };" % (
+            go_rt_n,
+            ", ".join(str(int(x)) for x in _rt_i("canvas_root"))))
+        p("static float _engine_rt_amin_x[%d] = { %s };" % (
+            go_rt_n, ", ".join("%sf" % repr(float(x))
+                               for x in _rt_f("amin_x", 0.5))))
+        p("static float _engine_rt_amin_y[%d] = { %s };" % (
+            go_rt_n, ", ".join("%sf" % repr(float(x))
+                               for x in _rt_f("amin_y", 0.5))))
+        p("static float _engine_rt_amax_x[%d] = { %s };" % (
+            go_rt_n, ", ".join("%sf" % repr(float(x))
+                               for x in _rt_f("amax_x", 0.5))))
+        p("static float _engine_rt_amax_y[%d] = { %s };" % (
+            go_rt_n, ", ".join("%sf" % repr(float(x))
+                               for x in _rt_f("amax_y", 0.5))))
+        p("static float _engine_rt_apos_x[%d] = { %s };" % (
+            go_rt_n, ", ".join("%sf" % repr(float(x))
+                               for x in _rt_f("apos_x"))))
+        p("static float _engine_rt_apos_y[%d] = { %s };" % (
+            go_rt_n, ", ".join("%sf" % repr(float(x))
+                               for x in _rt_f("apos_y"))))
+        p("static float _engine_rt_sd_x[%d] = { %s };" % (
+            go_rt_n, ", ".join("%sf" % repr(float(x))
+                               for x in _rt_f("sd_x", 100.0))))
+        p("static float _engine_rt_sd_y[%d] = { %s };" % (
+            go_rt_n, ", ".join("%sf" % repr(float(x))
+                               for x in _rt_f("sd_y", 100.0))))
+        p("static float _engine_rt_pivot_x[%d] = { %s };" % (
+            go_rt_n, ", ".join("%sf" % repr(float(x))
+                               for x in _rt_f("pivot_x", 0.5))))
+        p("static float _engine_rt_pivot_y[%d] = { %s };" % (
+            go_rt_n, ", ".join("%sf" % repr(float(x))
+                               for x in _rt_f("pivot_y", 0.5))))
+        p("static float _engine_rt_sx[%d] = { %s };" % (
+            go_rt_n, ", ".join("%sf" % repr(float(x))
+                               for x in _rt_f("sx", 1.0))))
+        p("static float _engine_rt_sy[%d] = { %s };" % (
+            go_rt_n, ", ".join("%sf" % repr(float(x))
+                               for x in _rt_f("sy", 1.0))))
+        p("static void _engine_rt_pivot_center(")
+        p("    float parent_w, float parent_h,")
+        p("    float amin_x, float amin_y, float amax_x, float amax_y,")
+        p("    float apos_x, float apos_y, float size_x, float size_y,")
+        p("    float pivot_x, float pivot_y,")
+        p("    float *ocx, float *ocy, float *ow, float *oh) {")
+        p("    float ax0 = amin_x * parent_w;")
+        p("    float ax1 = amax_x * parent_w;")
+        p("    float ay0 = amin_y * parent_h;")
+        p("    float ay1 = amax_y * parent_h;")
+        p("    float w, h, cx, cy, pivot_px, pivot_py;")
+        p("    if ((ax1 - ax0 < 1e-6f && ax0 - ax1 < 1e-6f)")
+        p("        && (ay1 - ay0 < 1e-6f && ay0 - ay1 < 1e-6f)) {")
+        p("        w = size_x;")
+        p("        h = size_y;")
+        p("        pivot_px = ax0 + apos_x;")
+        p("        pivot_py = ay0 + apos_y;")
+        p("        cx = pivot_px + (0.5f - pivot_x) * w;")
+        p("        cy = pivot_py + (0.5f - pivot_y) * h;")
+        p("    } else {")
+        p("        w = (ax1 - ax0) + size_x;")
+        p("        h = (ay1 - ay0) + size_y;")
+        p("        cx = (ax0 + ax1) * 0.5f + apos_x;")
+        p("        cy = (ay0 + ay1) * 0.5f + apos_y;")
+        p("    }")
+        p("    *ocx = cx; *ocy = cy; *ow = w; *oh = h;")
+        p("}")
+        p("static void _engine_ui_local_wh(int go, float sw, float sh,")
+        p("                                float *ow, float *oh);")
+        p("static void _engine_ui_screen_rect(int go, float sw, float sh,")
+        p("    float *ocx, float *ocy, float *ow, float *oh);")
+        p("static void _engine_ui_local_wh(int go, float sw, float sh,")
+        p("                                float *ow, float *oh) {")
+        p("    int parent;")
+        p("    float pw, ph, lcx, lcy, rw, rh;")
+        p("    if (go < 0 || go >= %d || !_engine_rt_has[go]) {"
+          % go_rt_n)
+        p("        *ow = sw; *oh = sh;")
+        p("        return;")
+        p("    }")
+        p("    if (_engine_rt_canvas_root[go]) {")
+        p("        *ow = sw; *oh = sh;")
+        p("        return;")
+        p("    }")
+        p("    parent = _engine_go_parent[go];")
+        p("    if (parent >= 0 && parent < %d"
+          % go_rt_n)
+        p("        && (_engine_rt_has[parent]"
+          " || _engine_rt_canvas[parent])) {")
+        p("        _engine_ui_local_wh(parent, sw, sh, &pw, &ph);")
+        p("    } else {")
+        p("        pw = sw; ph = sh;")
+        p("    }")
+        p("    _engine_rt_pivot_center(")
+        p("        pw, ph,")
+        p("        _engine_rt_amin_x[go], _engine_rt_amin_y[go],")
+        p("        _engine_rt_amax_x[go], _engine_rt_amax_y[go],")
+        p("        _engine_rt_apos_x[go], _engine_rt_apos_y[go],")
+        p("        _engine_rt_sd_x[go], _engine_rt_sd_y[go],")
+        p("        _engine_rt_pivot_x[go], _engine_rt_pivot_y[go],")
+        p("        &lcx, &lcy, &rw, &rh);")
+        p("    if (rw < 0.f) rw = -rw;")
+        p("    if (rh < 0.f) rh = -rh;")
+        p("    *ow = rw; *oh = rh;")
+        p("}")
+        p("static void _engine_ui_screen_rect(int go, float sw, float sh,")
+        p("    float *ocx, float *ocy, float *ow, float *oh) {")
+        p("    int parent;")
+        p("    float pcx, pcy, pw, ph, plw, plh, fsx, fsy, plx, ply;")
+        p("    float lcx, lcy, rw, rh, sx, sy, rw0, rh0, px, py;")
+        p("    if (go < 0 || go >= %d || !_engine_rt_has[go]) {"
+          % go_rt_n)
+        p("        *ocx = sw * 0.5f; *ocy = sh * 0.5f;")
+        p("        *ow = sw; *oh = sh;")
+        p("        return;")
+        p("    }")
+        p("    if (_engine_rt_canvas_root[go]) {")
+        p("        *ocx = sw * 0.5f; *ocy = sh * 0.5f;")
+        p("        *ow = sw; *oh = sh;")
+        p("        return;")
+        p("    }")
+        p("    parent = _engine_go_parent[go];")
+        p("    if (parent >= 0 && parent < %d"
+          % go_rt_n)
+        p("        && (_engine_rt_has[parent]"
+          " || _engine_rt_canvas[parent])) {")
+        p("        _engine_ui_screen_rect("
+          "parent, sw, sh, &pcx, &pcy, &pw, &ph);")
+        p("        _engine_ui_local_wh(parent, sw, sh, &plw, &plh);")
+        p("        if (plw < 1e-8f) plw = 1e-8f;")
+        p("        if (plh < 1e-8f) plh = 1e-8f;")
+        p("        if (pw < 0.f) pw = -pw;")
+        p("        if (ph < 0.f) ph = -ph;")
+        p("        fsx = pw / plw;")
+        p("        fsy = ph / plh;")
+        p("        plx = pcx - pw * 0.5f;")
+        p("        ply = pcy - ph * 0.5f;")
+        p("    } else {")
+        p("        plw = sw; plh = sh;")
+        p("        fsx = 1.f; fsy = 1.f;")
+        p("        plx = 0.f; ply = 0.f;")
+        p("    }")
+        p("    _engine_rt_pivot_center(")
+        p("        plw, plh,")
+        p("        _engine_rt_amin_x[go], _engine_rt_amin_y[go],")
+        p("        _engine_rt_amax_x[go], _engine_rt_amax_y[go],")
+        p("        _engine_rt_apos_x[go], _engine_rt_apos_y[go],")
+        p("        _engine_rt_sd_x[go], _engine_rt_sd_y[go],")
+        p("        _engine_rt_pivot_x[go], _engine_rt_pivot_y[go],")
+        p("        &lcx, &lcy, &rw, &rh);")
+        p("    sx = _engine_rt_sx[go]; if (sx < 0.f) sx = -sx;")
+        p("    sy = _engine_rt_sy[go]; if (sy < 0.f) sy = -sy;")
+        p("    if (sx < 1e-8f) sx = 1.f;")
+        p("    if (sy < 1e-8f) sy = 1.f;")
+        p("    rw0 = rw; if (rw0 < 0.f) rw0 = -rw0;")
+        p("    rh0 = rh; if (rh0 < 0.f) rh0 = -rh0;")
+        p("    px = _engine_rt_pivot_x[go];")
+        p("    py = _engine_rt_pivot_y[go];")
+        p("    lcx = lcx + (0.5f - px) * rw0 * (sx - 1.f);")
+        p("    lcy = lcy + (0.5f - py) * rh0 * (sy - 1.f);")
+        p("    rw = rw0 * sx;")
+        p("    rh = rh0 * sy;")
+        p("    *ocx = plx + lcx * fsx;")
+        p("    *ocy = ply + lcy * fsy;")
+        p("    *ow = rw * fsx;")
+        p("    *oh = rh * fsy;")
+        p("}")
+        p("static float RectTransform_get_anchoredPosition_x(int go) {")
+        p("    if (go < 0 || go >= %d) return 0.f;" % go_rt_n)
+        p("    return _engine_rt_apos_x[go];")
+        p("}")
+        p("static float RectTransform_get_anchoredPosition_y(int go) {")
+        p("    if (go < 0 || go >= %d) return 0.f;" % go_rt_n)
+        p("    return _engine_rt_apos_y[go];")
+        p("}")
+        p("static void RectTransform_set_anchoredPosition_xy("
+          "int go, float x, float y) {")
+        p("    if (go < 0 || go >= %d) return;" % go_rt_n)
+        p("    _engine_rt_apos_x[go] = x;")
+        p("    _engine_rt_apos_y[go] = y;")
+        p("}")
+        p("static Vector2 RectTransform_get_anchoredPosition(int go) {")
+        p("    return Vector2_make("
+          "RectTransform_get_anchoredPosition_x(go), "
+          "RectTransform_get_anchoredPosition_y(go));")
+        p("}")
+        p("static void RectTransform_set_anchoredPosition("
+          "int go, Vector2 v) {")
+        p("    RectTransform_set_anchoredPosition_xy("
+          "go, Vector2_x(v), Vector2_y(v));")
+        p("}")
+        p("static float RectTransform_get_sizeDelta_x(int go) {")
+        p("    if (go < 0 || go >= %d) return 0.f;" % go_rt_n)
+        p("    return _engine_rt_sd_x[go];")
+        p("}")
+        p("static float RectTransform_get_sizeDelta_y(int go) {")
+        p("    if (go < 0 || go >= %d) return 0.f;" % go_rt_n)
+        p("    return _engine_rt_sd_y[go];")
+        p("}")
+        p("static void RectTransform_set_sizeDelta_xy("
+          "int go, float x, float y) {")
+        p("    if (go < 0 || go >= %d) return;" % go_rt_n)
+        p("    _engine_rt_sd_x[go] = x;")
+        p("    _engine_rt_sd_y[go] = y;")
+        p("}")
+        p("static Vector2 RectTransform_get_sizeDelta(int go) {")
+        p("    return Vector2_make("
+          "RectTransform_get_sizeDelta_x(go), "
+          "RectTransform_get_sizeDelta_y(go));")
+        p("}")
+        p("static void RectTransform_set_sizeDelta(int go, Vector2 v) {")
+        p("    RectTransform_set_sizeDelta_xy("
+          "go, Vector2_x(v), Vector2_y(v));")
+        p("}")
+        p("static void RectTransform_set_localScale_xy("
+          "int go, float sx, float sy) {")
+        p("    if (go < 0 || go >= %d) return;" % go_rt_n)
+        p("    _engine_rt_sx[go] = sx;")
+        p("    _engine_rt_sy[go] = sy;")
+        p("}")
+        p("static float RectTransform_get_localScale_x(int go) {")
+        p("    if (go < 0 || go >= %d) return 1.f;" % go_rt_n)
+        p("    return _engine_rt_sx[go];")
+        p("}")
+        p("static float RectTransform_get_localScale_y(int go) {")
+        p("    if (go < 0 || go >= %d) return 1.f;" % go_rt_n)
+        p("    return _engine_rt_sy[go];")
+        p("}")
+        p("/* The parent's own rect, which anchors measure against. */")
+        p("static void _engine_rt_parent_wh(int go,"
+          " float *opw, float *oph) {")
+        p("    int parent;")
+        p("    *opw = _engine_ui_layout_w;")
+        p("    *oph = _engine_ui_layout_h;")
+        p("    if (go < 0 || go >= %d) return;" % go_rt_n)
+        p("    parent = _engine_go_parent[go];")
+        p("    if (parent >= 0 && parent < %d)" % go_rt_n)
+        p("        _engine_ui_local_wh(parent, _engine_ui_layout_w,")
+        p("                            _engine_ui_layout_h, opw, oph);")
+        p("}")
+        p("/* RectTransform.rect — Unity's local rect: the size before")
+        p("   localScale, with the pivot at the origin. */")
+        p("static float RectTransform_get_rect_width(int go) {")
+        p("    float w, h;")
+        p("    _engine_ui_local_wh(go, _engine_ui_layout_w,")
+        p("                        _engine_ui_layout_h, &w, &h);")
+        p("    if (w < 0.f) w = -w;")
+        p("    return w;")
+        p("}")
+        p("static float RectTransform_get_rect_height(int go) {")
+        p("    float w, h;")
+        p("    _engine_ui_local_wh(go, _engine_ui_layout_w,")
+        p("                        _engine_ui_layout_h, &w, &h);")
+        p("    if (h < 0.f) h = -h;")
+        p("    return h;")
+        p("}")
+        p("static float RectTransform_get_rect_x(int go) {")
+        p("    float px = 0.5f;")
+        p("    if (go >= 0 && go < %d) px = _engine_rt_pivot_x[go];"
+          % go_rt_n)
+        p("    return -px * RectTransform_get_rect_width(go);")
+        p("}")
+        p("static float RectTransform_get_rect_y(int go) {")
+        p("    float py = 0.5f;")
+        p("    if (go >= 0 && go < %d) py = _engine_rt_pivot_y[go];"
+          % go_rt_n)
+        p("    return -py * RectTransform_get_rect_height(go);")
+        p("}")
+        if want_rect:
+            p("static Rect RectTransform_get_rect(int go) {")
+            p("    return Rect_make(")
+            p("        RectTransform_get_rect_x(go),")
+            p("        RectTransform_get_rect_y(go),")
+            p("        RectTransform_get_rect_width(go),")
+            p("        RectTransform_get_rect_height(go));")
+            p("}")
+        p("/* Transform.localPosition of a RectTransform: its pivot, in")
+        p("   the parent's rect with the origin at the centre (Unity). */")
+        p("static void _engine_rt_local_pivot(int go,"
+          " float *ox, float *oy) {")
+        p("    float pw, ph, cx, cy, w, h;")
+        p("    *ox = 0.f; *oy = 0.f;")
+        p("    if (go < 0 || go >= %d) return;" % go_rt_n)
+        p("    _engine_rt_parent_wh(go, &pw, &ph);")
+        p("    _engine_rt_pivot_center(")
+        p("        pw, ph,")
+        p("        _engine_rt_amin_x[go], _engine_rt_amin_y[go],")
+        p("        _engine_rt_amax_x[go], _engine_rt_amax_y[go],")
+        p("        _engine_rt_apos_x[go], _engine_rt_apos_y[go],")
+        p("        _engine_rt_sd_x[go], _engine_rt_sd_y[go],")
+        p("        _engine_rt_pivot_x[go], _engine_rt_pivot_y[go],")
+        p("        &cx, &cy, &w, &h);")
+        p("    *ox = cx + (_engine_rt_pivot_x[go] - 0.5f) * w - pw * 0.5f;")
+        p("    *oy = cy + (_engine_rt_pivot_y[go] - 0.5f) * h - ph * 0.5f;")
+        p("}")
+        p("static float RectTransform_get_localPosition_x(int go) {")
+        p("    float x, y; _engine_rt_local_pivot(go, &x, &y); return x;")
+        p("}")
+        p("static float RectTransform_get_localPosition_y(int go) {")
+        p("    float x, y; _engine_rt_local_pivot(go, &x, &y); return y;")
+        p("}")
+        p("static Vector2 RectTransform_get_localPosition(int go) {")
+        p("    return Vector2_make(RectTransform_get_localPosition_x(go),")
+        p("                        RectTransform_get_localPosition_y(go));")
+        p("}")
+        p("/* localPosition moves the pivot; anchoredPosition offsets it")
+        p("   from the anchor by the same amount, so apply the delta. */")
+        p("static void RectTransform_set_localPosition_xy("
+          "int go, float x, float y) {")
+        p("    float cx, cy;")
+        p("    _engine_rt_local_pivot(go, &cx, &cy);")
+        p("    RectTransform_set_anchoredPosition_xy(")
+        p("        go,")
+        p("        RectTransform_get_anchoredPosition_x(go) + (x - cx),")
+        p("        RectTransform_get_anchoredPosition_y(go) + (y - cy));")
+        p("}")
+        p("static void RectTransform_set_localPosition("
+          "int go, Vector2 v) {")
+        p("    RectTransform_set_localPosition_xy("
+          "go, Vector2_x(v), Vector2_y(v));")
+        p("}")
+        if want_rect and plan.get("camera"):
+            p("/* UI layout space → world, the inverse of what the")
+            p("   camera does to draw it (same map as the pointer's). */")
+            p("static Vector2 _engine_ui_layout_to_world(Vector2 p) {")
+            p("    float vx, vy, vw, vh;")
+            p("    _engine_camera_viewport(&vx, &vy, &vw, &vh);")
+            p("    return Camera_main_ScreenToWorldPoint(Vector2_make(")
+            p("        vx + Vector2_x(p) * (vw / _engine_ui_layout_w),")
+            p("        vy + Vector2_y(p) * (vh / _engine_ui_layout_h)));")
+            p("}")
+            p("/* Extensions.GetWorldRect — the element's rect in world")
+            p("   units: the UI rect the engine lays out in screen space,")
+            p("   through the same camera map ScreenToWorldPoint uses. */")
+            p("static Rect RectTransform_GetWorldRect(int go) {")
+            p("    float cx, cy, w, h;")
+            p("    Vector2 lo, hi;")
+            p("    _engine_ui_screen_rect(go, _engine_ui_layout_w,")
+            p("                           _engine_ui_layout_h,")
+            p("                           &cx, &cy, &w, &h);")
+            p("    if (w < 0.f) w = -w;")
+            p("    if (h < 0.f) h = -h;")
+            p("    lo = _engine_ui_layout_to_world(")
+            p("        Vector2_make(cx - w * 0.5f, cy - h * 0.5f));")
+            p("    hi = _engine_ui_layout_to_world(")
+            p("        Vector2_make(cx + w * 0.5f, cy + h * 0.5f));")
+            p("    return Rect_make(")
+            p("        Vector2_x(lo), Vector2_y(lo),")
+            p("        Vector2_x(hi) - Vector2_x(lo),")
+            p("        Vector2_y(hi) - Vector2_y(lo));")
+            p("}")
+        p("")
+
+
+def _emit_engine_ui_buttons(p, plan, ui_buttons, want_live_rt):
+    """_emit_engine_ui: Button tables and onClick targets."""
+    if ui_buttons:
+        nbtn = len(ui_buttons)
+
+        def _f4(key):
+            return ", ".join(
+                "%sf" % repr(float(b[key][i]))
+                for b in ui_buttons for i in range(4))
+
+        p("static const int _engine_ui_btn_go[%d] = { %s };" % (
+            nbtn, ", ".join(str(int(b["go"])) for b in ui_buttons)))
+        if not want_live_rt:
+            p("static const float _engine_ui_btn_ncx[%d] = { %s };" % (
+                nbtn, ", ".join(
+                    "%sf" % repr(b["ncx"]) for b in ui_buttons)))
+            p("static const float _engine_ui_btn_ncy[%d] = { %s };" % (
+                nbtn, ", ".join(
+                    "%sf" % repr(b["ncy"]) for b in ui_buttons)))
+            p("static const float _engine_ui_btn_nhw[%d] = { %s };" % (
+                nbtn, ", ".join(
+                    "%sf" % repr(b["nhw"]) for b in ui_buttons)))
+            p("static const float _engine_ui_btn_nhh[%d] = { %s };" % (
+                nbtn, ", ".join(
+                    "%sf" % repr(b["nhh"]) for b in ui_buttons)))
+        # Flat onClick list: SetActive(GO) and/or MB method(string).
+        call_starts = []
+        call_counts = []
+        call_ops = []
+        call_gos = []  # GO index (SetActive) or MB instance index
+        call_bools = []
+        call_strs = []
+        # op 0 = SetActive; op >= 1 → mb_handlers[op-1]
+        # handler: (cname, method, pass_string)
+        mb_handlers = []
+        mb_handler_ix = {}
+
+        def _mb_op(cname, method, pass_string):
+            key = (cname, method, bool(pass_string))
+            if key not in mb_handler_ix:
+                mb_handler_ix[key] = len(mb_handlers) + 1
+                mb_handlers.append(key)
+            return mb_handler_ix[key]
+
+        for b in ui_buttons:
+            call_starts.append(len(call_ops))
+            calls = b.get("calls") or []
+            call_counts.append(len(calls))
+            for c in calls:
+                if c.get("kind") == "mb":
+                    pass_str = int(c.get("mode") or 0) == 5
+                    call_ops.append(_mb_op(
+                        c["mb_class"], c["method"], pass_str))
+                    call_gos.append(int(c["mb_inst"]))
+                    call_bools.append(0)
+                    call_strs.append(c.get("string_arg") or "")
+                else:
+                    call_ops.append(0)
+                    call_gos.append(int(c["target_go"]))
+                    call_bools.append(int(c["bool_arg"]))
+                    call_strs.append("")
+        ncall = len(call_ops)
+        p("static const int _engine_ui_btn_call_start[%d] = { %s };" % (
+            nbtn, ", ".join(str(s) for s in call_starts)))
+        p("static const int _engine_ui_btn_call_count[%d] = { %s };" % (
+            nbtn, ", ".join(str(c) for c in call_counts)))
+        if ncall:
+            p("static const int _engine_ui_btn_call_op[%d] = { %s };" % (
+                ncall, ", ".join(str(o) for o in call_ops)))
+            p("static const int _engine_ui_btn_call_go[%d] = { %s };" % (
+                ncall, ", ".join(str(g) for g in call_gos)))
+            p("static const int _engine_ui_btn_call_bool[%d] = { %s };"
+              % (ncall, ", ".join(str(b) for b in call_bools)))
+            p("static const char *_engine_ui_btn_call_str[%d] = {"
+              % ncall)
+            for s in call_strs:
+                p("    %s," % _c_string(s))
+            p("};")
+        else:
+            p("static const int _engine_ui_btn_call_op[1] = { 0 };")
+            p("static const int _engine_ui_btn_call_go[1] = { -1 };")
+            p("static const int _engine_ui_btn_call_bool[1] = { 0 };")
+            p("static const char *_engine_ui_btn_call_str[1] = "
+              "{ \"\" };")
+        plan["_ui_btn_mb_handlers"] = mb_handlers
+        # Forward-declare MB onClick targets (methods emit later).
+        for hcname, hmethod, hstr in mb_handlers:
+            hidn = _c_ident(hcname)
+            if hstr:
+                p("static void %s_%s(unsigned i, const char *a);"
+                  % (hidn, hmethod))
+            else:
+                p("static void %s_%s(unsigned i);"
+                  % (hidn, hmethod))
+        # ColorBlock (× multiplier) — Normal / Highlighted / Pressed / Disabled
+        p("static const float _engine_ui_btn_col_n[%d] = { %s };" % (
+            nbtn * 4, _f4("normal")))
+        p("static const float _engine_ui_btn_col_h[%d] = { %s };" % (
+            nbtn * 4, _f4("highlighted")))
+        p("static const float _engine_ui_btn_col_p[%d] = { %s };" % (
+            nbtn * 4, _f4("pressed")))
+        p("static const float _engine_ui_btn_col_d[%d] = { %s };" % (
+            nbtn * 4, _f4("disabled")))
+        p("static float _engine_ui_btn_tint[%d];" % (nbtn * 4))
+        p("static int _engine_ui_btn_tint_inited;")
+        # Button held after pointer-down on it; -1 = none.
+        # Stays until pointer-up (mouse-off does not cancel press).
+        p("static int _engine_ui_btn_press = -1;")
+        p("static void _engine_ui_btn_tint_init(void) {")
+        p("    int i;")
+        p("    if (_engine_ui_btn_tint_inited) return;")
+        p("    _engine_ui_btn_tint_inited = 1;")
+        p("    for (i = 0; i < %d; i = i + 1)" % (nbtn * 4))
+        p("        _engine_ui_btn_tint[i] = _engine_ui_btn_col_n[i];")
+        p("}")
+
+
+def _emit_engine_ui_sliders(go_n, p, plan, ui_sliders, want_live_rt):
+    """_emit_engine_ui: Slider tables, value updates and onValueChanged."""
+    if ui_sliders:
+        nsl = len(ui_sliders)
+        p("static const int _engine_ui_sl_go[%d] = { %s };" % (
+            nsl, ", ".join(str(int(s["go"])) for s in ui_sliders)))
+        p("static const int _engine_ui_sl_slide_go[%d] = { %s };" % (
+            nsl, ", ".join(
+                str(int(s["slide_go"])) for s in ui_sliders)))
+        p("static const int _engine_ui_sl_handle_go[%d] = { %s };" % (
+            nsl, ", ".join(
+                str(int(s["handle_go"])) for s in ui_sliders)))
+        p("static const int _engine_ui_sl_fill_go[%d] = { %s };" % (
+            nsl, ", ".join(
+                str(int(s["fill_go"])) for s in ui_sliders)))
+        p("static const int _engine_ui_sl_dir[%d] = { %s };" % (
+            nsl, ", ".join(
+                str(int(s["direction"])) for s in ui_sliders)))
+        p("static const int _engine_ui_sl_whole[%d] = { %s };" % (
+            nsl, ", ".join(
+                str(int(s["whole_numbers"])) for s in ui_sliders)))
+        p("static const float _engine_ui_sl_min[%d] = { %s };" % (
+            nsl, ", ".join(
+                "%sf" % repr(float(s["min"])) for s in ui_sliders)))
+        p("static const float _engine_ui_sl_max[%d] = { %s };" % (
+            nsl, ", ".join(
+                "%sf" % repr(float(s["max"])) for s in ui_sliders)))
+        p("static float _engine_ui_sl_value[%d] = { %s };" % (
+            nsl, ", ".join(
+                "%sf" % repr(float(s["value"])) for s in ui_sliders)))
+        sl_starts = []
+        sl_counts = []
+        sl_ops = []
+        sl_insts = []
+        # handler: (cname, method, pass_float, is_static)
+        sl_handlers = []
+        sl_handler_ix = {}
+
+        def _sl_op(cname, method, pass_float, is_static):
+            key = (cname, method, bool(pass_float), bool(is_static))
+            if key not in sl_handler_ix:
+                sl_handler_ix[key] = len(sl_handlers) + 1
+                sl_handlers.append(key)
+            return sl_handler_ix[key]
+
+        for s in ui_sliders:
+            sl_starts.append(len(sl_ops))
+            calls = s.get("calls") or []
+            sl_counts.append(len(calls))
+            for c in calls:
+                mode = int(c.get("mode") or 0)
+                pass_f = mode in (0, 4)
+                sl_ops.append(_sl_op(
+                    c["mb_class"], c["method"], pass_f,
+                    bool(c.get("static"))))
+                sl_insts.append(int(c["mb_inst"]))
+        nslc = len(sl_ops)
+        p("static const int _engine_ui_sl_call_start[%d] = { %s };" % (
+            nsl, ", ".join(str(x) for x in sl_starts)))
+        p("static const int _engine_ui_sl_call_count[%d] = { %s };" % (
+            nsl, ", ".join(str(x) for x in sl_counts)))
+        if nslc:
+            p("static const int _engine_ui_sl_call_op[%d] = { %s };" % (
+                nslc, ", ".join(str(x) for x in sl_ops)))
+            p("static const int _engine_ui_sl_call_inst[%d] = { %s };"
+              % (nslc, ", ".join(str(x) for x in sl_insts)))
+        else:
+            p("static const int _engine_ui_sl_call_op[1] = { 0 };")
+            p("static const int _engine_ui_sl_call_inst[1] = { 0 };")
+        plan["_ui_sl_mb_handlers"] = sl_handlers
+        for hcname, hmethod, hfloat, hstatic in sl_handlers:
+            hidn = _c_ident(hcname)
+            if hstatic and hfloat:
+                p("static void %s_%s(float a);" % (hidn, hmethod))
+            elif hstatic:
+                p("static void %s_%s(void);" % (hidn, hmethod))
+            elif hfloat:
+                p("static void %s_%s(unsigned i, float a);"
+                  % (hidn, hmethod))
+            else:
+                p("static void %s_%s(unsigned i);" % (hidn, hmethod))
+        p("static int _engine_ui_sl_drag = -1;")
+        # Runtime UpdateVisuals: set handle/fill anchors from value.
+        p("static void _engine_ui_sl_update_visuals(int si) {")
+        p("    int hgo, fgo, dir, axis, rev;")
+        p("    float vmin, vmax, val, nv, t;")
+        p("    if (si < 0 || si >= _engine_ui_slider_count) return;")
+        p("    hgo = _engine_ui_sl_handle_go[si];")
+        p("    fgo = _engine_ui_sl_fill_go[si];")
+        p("    dir = _engine_ui_sl_dir[si];")
+        p("    axis = (dir == 0 || dir == 1) ? 0 : 1;")
+        p("    rev = (dir == 1 || dir == 3) ? 1 : 0;")
+        p("    vmin = _engine_ui_sl_min[si];")
+        p("    vmax = _engine_ui_sl_max[si];")
+        p("    val = _engine_ui_sl_value[si];")
+        p("    if (vmax - vmin < 1e-8f) nv = 0.f;")
+        p("    else {")
+        p("        nv = (val - vmin) / (vmax - vmin);")
+        p("        if (nv < 0.f) nv = 0.f;")
+        p("        if (nv > 1.f) nv = 1.f;")
+        p("    }")
+        p("    t = rev ? (1.f - nv) : nv;")
+        if want_live_rt:
+            p("    if (hgo >= 0 && hgo < %d && _engine_rt_has[hgo]) {"
+              % go_n)
+            p("        if (axis == 0) {")
+            p("            _engine_rt_amin_x[hgo] = t;")
+            p("            _engine_rt_amax_x[hgo] = t;")
+            p("            _engine_rt_amin_y[hgo] = 0.f;")
+            p("            _engine_rt_amax_y[hgo] = 1.f;")
+            p("        } else {")
+            p("            _engine_rt_amin_y[hgo] = t;")
+            p("            _engine_rt_amax_y[hgo] = t;")
+            p("            _engine_rt_amin_x[hgo] = 0.f;")
+            p("            _engine_rt_amax_x[hgo] = 1.f;")
+            p("        }")
+            p("    }")
+            p("    if (fgo >= 0 && fgo < %d && _engine_rt_has[fgo]) {"
+              % go_n)
+            p("        if (axis == 0) {")
+            p("            if (rev) {")
+            p("                _engine_rt_amin_x[fgo] = 1.f - nv;")
+            p("                _engine_rt_amax_x[fgo] = 1.f;")
+            p("            } else {")
+            p("                _engine_rt_amin_x[fgo] = 0.f;")
+            p("                _engine_rt_amax_x[fgo] = nv;")
+            p("            }")
+            p("            _engine_rt_amin_y[fgo] = 0.f;")
+            p("            _engine_rt_amax_y[fgo] = 1.f;")
+            p("        } else {")
+            p("            if (rev) {")
+            p("                _engine_rt_amin_y[fgo] = 1.f - nv;")
+            p("                _engine_rt_amax_y[fgo] = 1.f;")
+            p("            } else {")
+            p("                _engine_rt_amin_y[fgo] = 0.f;")
+            p("                _engine_rt_amax_y[fgo] = nv;")
+            p("            }")
+            p("            _engine_rt_amin_x[fgo] = 0.f;")
+            p("            _engine_rt_amax_x[fgo] = 1.f;")
+            p("        }")
+            p("    }")
+        p("}")
+        p("static void _engine_ui_sl_set_value(int si, float v) {")
+        p("    float vmin, vmax, old;")
+        p("    int j, j0, j1;")
+        p("    if (si < 0 || si >= _engine_ui_slider_count) return;")
+        p("    vmin = _engine_ui_sl_min[si];")
+        p("    vmax = _engine_ui_sl_max[si];")
+        p("    if (v < vmin) v = vmin;")
+        p("    if (v > vmax) v = vmax;")
+        p("    if (_engine_ui_sl_whole[si]) {")
+        p("        if (v >= 0.f) v = (float)((int)(v + 0.5f));")
+        p("        else v = (float)((int)(v - 0.5f));")
+        p("        if (v < vmin) v = vmin;")
+        p("        if (v > vmax) v = vmax;")
+        p("    }")
+        p("    old = _engine_ui_sl_value[si];")
+        p("    if (v == old) return;")
+        p("    _engine_ui_sl_value[si] = v;")
+        p("    _engine_ui_sl_update_visuals(si);")
+        p("    j0 = _engine_ui_sl_call_start[si];")
+        p("    j1 = j0 + _engine_ui_sl_call_count[si];")
+        p("    for (j = j0; j < j1; j = j + 1) {")
+        p("        int op = _engine_ui_sl_call_op[j];")
+        for hi, (hcname, hmethod, hfloat, hstatic) in enumerate(
+                sl_handlers):
+            hidn = _c_ident(hcname)
+            p("        else if (op == %d)" % (hi + 1)
+              if hi else "        if (op == %d)" % (hi + 1))
+            if hstatic and hfloat:
+                p("            %s_%s(v);" % (hidn, hmethod))
+            elif hstatic:
+                p("            %s_%s();" % (hidn, hmethod))
+            elif hfloat:
+                p("            %s_%s("
+                  "(unsigned)_engine_ui_sl_call_inst[j], v);"
+                  % (hidn, hmethod))
+            else:
+                p("            %s_%s("
+                  "(unsigned)_engine_ui_sl_call_inst[j]);"
+                  % (hidn, hmethod))
+        p("    }")
+        p("}")
+        p("/* `slider.value` on an authored Slider field: the field")
+        p("   packs as the component's GameObject. */")
+        p("static int _engine_ui_sl_of_go(int go) {")
+        p("    int i;")
+        p("    if (go < 0) return -1;")
+        p("    for (i = 0; i < _engine_ui_slider_count; i = i + 1)")
+        p("        if (_engine_ui_sl_go[i] == go) return i;")
+        p("    return -1;")
+        p("}")
+        p("static float Slider_get_value(int go) {")
+        p("    int si = _engine_ui_sl_of_go(go);")
+        p("    if (si < 0) return 0.f;")
+        p("    return _engine_ui_sl_value[si];")
+        p("}")
+        p("static void Slider_set_value(int go, float v) {")
+        p("    int si = _engine_ui_sl_of_go(go);")
+        p("    if (si >= 0) _engine_ui_sl_set_value(si, v);")
+        p("}")
+        p("static void _engine_ui_sl_drag_to(int si, float px, float py,"
+          " float sw, float sh) {")
+        p("    int sgo, dir, axis, rev;")
+        p("    float cx, cy, rw, rh, left, bottom, t, vmin, vmax, v;")
+        p("    if (si < 0 || si >= _engine_ui_slider_count) return;")
+        p("    sgo = _engine_ui_sl_slide_go[si];")
+        p("    if (sgo < 0 || sgo >= %d) return;" % go_n)
+        if want_live_rt:
+            p("    _engine_ui_screen_rect("
+              "sgo, sw, sh, &cx, &cy, &rw, &rh);")
+        else:
+            # Fallback: full layout — rare without live RT.
+            p("    cx = sw * 0.5f; cy = sh * 0.5f;")
+            p("    rw = sw; rh = sh;")
+        p("    if (rw < 0.f) rw = -rw;")
+        p("    if (rh < 0.f) rh = -rh;")
+        p("    left = cx - rw * 0.5f;")
+        p("    bottom = cy - rh * 0.5f;")
+        p("    dir = _engine_ui_sl_dir[si];")
+        p("    axis = (dir == 0 || dir == 1) ? 0 : 1;")
+        p("    rev = (dir == 1 || dir == 3) ? 1 : 0;")
+        p("    if (axis == 0) {")
+        p("        if (rw < 1e-6f) t = 0.f;")
+        p("        else t = (px - left) / rw;")
+        p("    } else {")
+        p("        if (rh < 1e-6f) t = 0.f;")
+        p("        else t = (py - bottom) / rh;")
+        p("    }")
+        p("    if (t < 0.f) t = 0.f;")
+        p("    if (t > 1.f) t = 1.f;")
+        p("    if (rev) t = 1.f - t;")
+        p("    vmin = _engine_ui_sl_min[si];")
+        p("    vmax = _engine_ui_sl_max[si];")
+        p("    v = vmin + t * (vmax - vmin);")
+        p("    _engine_ui_sl_set_value(si, v);")
+        p("}")
+
+
+def _emit_engine_ui_scrollbars(go_n, p, plan, ui_scrollbars, want_live_rt):
+    """_emit_engine_ui: Scrollbar tables, value updates and onValueChanged."""
+    if ui_scrollbars:
+        nsb = len(ui_scrollbars)
+        p("static const int _engine_ui_sb_go[%d] = { %s };" % (
+            nsb, ", ".join(str(int(s["go"])) for s in ui_scrollbars)))
+        p("static const int _engine_ui_sb_slide_go[%d] = { %s };" % (
+            nsb, ", ".join(
+                str(int(s["slide_go"])) for s in ui_scrollbars)))
+        p("static const int _engine_ui_sb_handle_go[%d] = { %s };" % (
+            nsb, ", ".join(
+                str(int(s["handle_go"])) for s in ui_scrollbars)))
+        p("static const int _engine_ui_sb_dir[%d] = { %s };" % (
+            nsb, ", ".join(
+                str(int(s["direction"])) for s in ui_scrollbars)))
+        p("static const int _engine_ui_sb_interact[%d] = { %s };" % (
+            nsb, ", ".join(
+                str(int(s["interactable"])) for s in ui_scrollbars)))
+        p("static const int _engine_ui_sb_scrollrect[%d] = { %s };" % (
+            nsb, ", ".join(
+                str(int(s.get("scrollrect", -1)))
+                for s in ui_scrollbars)))
+        p("static const int _engine_ui_sb_axis[%d] = { %s };" % (
+            nsb, ", ".join(
+                str(int(s.get("scroll_axis", 0)))
+                for s in ui_scrollbars)))
+        p("static float _engine_ui_sb_value[%d] = { %s };" % (
+            nsb, ", ".join(
+                "%sf" % repr(float(s["value"]))
+                for s in ui_scrollbars)))
+        p("static float _engine_ui_sb_size[%d] = { %s };" % (
+            nsb, ", ".join(
+                "%sf" % repr(float(s["size"]))
+                for s in ui_scrollbars)))
+        sb_starts, sb_counts, sb_ops, sb_insts = [], [], [], []
+        sb_handlers = []
+        sb_handler_ix = {}
+
+        def _sb_op(cname, method, pass_float, is_static):
+            key = (cname, method, bool(pass_float), bool(is_static))
+            if key not in sb_handler_ix:
+                sb_handler_ix[key] = len(sb_handlers) + 1
+                sb_handlers.append(key)
+            return sb_handler_ix[key]
+
+        for s in ui_scrollbars:
+            sb_starts.append(len(sb_ops))
+            calls = s.get("calls") or []
+            sb_counts.append(len(calls))
+            for c in calls:
+                mode = int(c.get("mode") or 0)
+                sb_ops.append(_sb_op(
+                    c["mb_class"], c["method"], mode in (0, 4),
+                    bool(c.get("static"))))
+                sb_insts.append(int(c["mb_inst"]))
+        nsc = len(sb_ops)
+        p("static const int _engine_ui_sb_call_start[%d] = { %s };" % (
+            nsb, ", ".join(str(x) for x in sb_starts)))
+        p("static const int _engine_ui_sb_call_count[%d] = { %s };" % (
+            nsb, ", ".join(str(x) for x in sb_counts)))
+        if nsc:
+            p("static const int _engine_ui_sb_call_op[%d] = { %s };" % (
+                nsc, ", ".join(str(x) for x in sb_ops)))
+            p("static const int _engine_ui_sb_call_inst[%d] = { %s };"
+              % (nsc, ", ".join(str(x) for x in sb_insts)))
+        else:
+            p("static const int _engine_ui_sb_call_op[1] = { 0 };")
+            p("static const int _engine_ui_sb_call_inst[1] = { 0 };")
+        plan["_ui_sb_mb_handlers"] = sb_handlers
+        for hcname, hmethod, hfloat, hstatic in sb_handlers:
+            hidn = _c_ident(hcname)
+            if hstatic and hfloat:
+                p("static void %s_%s(float a);" % (hidn, hmethod))
+            elif hstatic:
+                p("static void %s_%s(void);" % (hidn, hmethod))
+            elif hfloat:
+                p("static void %s_%s(unsigned i, float a);"
+                  % (hidn, hmethod))
+            else:
+                p("static void %s_%s(unsigned i);" % (hidn, hmethod))
+        p("static int _engine_ui_sb_drag = -1;")
+        p("static int _engine_ui_sb_syncing;")
+        if want_live_rt:
+            p("static void _engine_ui_sb_update_visuals(int si) {")
+            p("    int hgo, dir, axis, rev;")
+            p("    float val, size, movement;")
+            p("    if (si < 0 || si >= _engine_ui_scrollbar_count)"
+              " return;")
+            p("    hgo = _engine_ui_sb_handle_go[si];")
+            p("    if (hgo < 0 || hgo >= %d || !_engine_rt_has[hgo])"
+              " return;" % go_n)
+            p("    dir = _engine_ui_sb_dir[si];")
+            p("    axis = (dir == 0 || dir == 1) ? 0 : 1;")
+            p("    rev = (dir == 1 || dir == 3) ? 1 : 0;")
+            p("    val = _engine_ui_sb_value[si];")
+            p("    size = _engine_ui_sb_size[si];")
+            p("    if (val < 0.f) val = 0.f;")
+            p("    if (val > 1.f) val = 1.f;")
+            p("    if (size < 0.f) size = 0.f;")
+            p("    if (size > 1.f) size = 1.f;")
+            p("    movement = val * (1.f - size);")
+            p("    if (axis == 0) {")
+            p("        if (rev) {")
+            p("            _engine_rt_amin_x[hgo] = 1.f - movement"
+              " - size;")
+            p("            _engine_rt_amax_x[hgo] = 1.f - movement;")
+            p("        } else {")
+            p("            _engine_rt_amin_x[hgo] = movement;")
+            p("            _engine_rt_amax_x[hgo] = movement + size;")
+            p("        }")
+            p("        _engine_rt_amin_y[hgo] = 0.f;")
+            p("        _engine_rt_amax_y[hgo] = 1.f;")
+            p("    } else {")
+            p("        if (rev) {")
+            p("            _engine_rt_amin_y[hgo] = 1.f - movement"
+              " - size;")
+            p("            _engine_rt_amax_y[hgo] = 1.f - movement;")
+            p("        } else {")
+            p("            _engine_rt_amin_y[hgo] = movement;")
+            p("            _engine_rt_amax_y[hgo] = movement + size;")
+            p("        }")
+            p("        _engine_rt_amin_x[hgo] = 0.f;")
+            p("        _engine_rt_amax_x[hgo] = 1.f;")
+            p("    }")
+            p("}")
+        else:
+            p("static void _engine_ui_sb_update_visuals(int si) {"
+              " (void)si; }")
+        # Forward decls for ScrollRect helpers used by scrollbar set.
+        p("static void _engine_ui_sr_apply_norm(int ri, int axis,"
+          " float nv);")
+        p("static void _engine_ui_sb_set_value(int si, float v,"
+          " int from_sr) {")
+        p("    float old;")
+        p("    int j, j0, j1, sri;")
+        p("    if (si < 0 || si >= _engine_ui_scrollbar_count) return;")
+        p("    if (v < 0.f) v = 0.f;")
+        p("    if (v > 1.f) v = 1.f;")
+        p("    old = _engine_ui_sb_value[si];")
+        p("    if (v == old) {")
+        p("        _engine_ui_sb_update_visuals(si);")
+        p("        return;")
+        p("    }")
+        p("    _engine_ui_sb_value[si] = v;")
+        p("    _engine_ui_sb_update_visuals(si);")
+        p("    if (!from_sr) {")
+        p("        sri = _engine_ui_sb_scrollrect[si];")
+        p("        if (sri >= 0 && !_engine_ui_sb_syncing)")
+        p("            _engine_ui_sr_apply_norm("
+          "sri, _engine_ui_sb_axis[si], v);")
+        p("    }")
+        p("    j0 = _engine_ui_sb_call_start[si];")
+        p("    j1 = j0 + _engine_ui_sb_call_count[si];")
+        p("    for (j = j0; j < j1; j = j + 1) {")
+        p("        int op = _engine_ui_sb_call_op[j];")
+        for hi, (hcname, hmethod, hfloat, hstatic) in enumerate(
+                sb_handlers):
+            hidn = _c_ident(hcname)
+            line = ("        if (op == %d)" if hi == 0
+                    else "        else if (op == %d)")
+            p(line % (hi + 1))
+            if hstatic and hfloat:
+                p("            %s_%s(v);" % (hidn, hmethod))
+            elif hstatic:
+                p("            %s_%s();" % (hidn, hmethod))
+            elif hfloat:
+                p("            %s_%s("
+                  "(unsigned)_engine_ui_sb_call_inst[j], v);"
+                  % (hidn, hmethod))
+            else:
+                p("            %s_%s("
+                  "(unsigned)_engine_ui_sb_call_inst[j]);"
+                  % (hidn, hmethod))
+        p("    }")
+        p("}")
+        p("/* `scrollbar.value` on an authored Scrollbar field: the")
+        p("   field packs as the component's GameObject. */")
+        p("static int _engine_ui_sb_of_go(int go) {")
+        p("    int i;")
+        p("    if (go < 0) return -1;")
+        p("    for (i = 0; i < _engine_ui_scrollbar_count;"
+          " i = i + 1)")
+        p("        if (_engine_ui_sb_go[i] == go) return i;")
+        p("    return -1;")
+        p("}")
+        p("static float Scrollbar_get_value(int go) {")
+        p("    int si = _engine_ui_sb_of_go(go);")
+        p("    if (si < 0) return 0.f;")
+        p("    return _engine_ui_sb_value[si];")
+        p("}")
+        p("static void Scrollbar_set_value(int go, float v) {")
+        p("    int si = _engine_ui_sb_of_go(go);")
+        p("    if (si >= 0) _engine_ui_sb_set_value(si, v, 0);")
+        p("}")
+        p("static void _engine_ui_sb_drag_to(int si, float px, float py,"
+          " float sw, float sh) {")
+        p("    int sgo, dir, axis, rev;")
+        p("    float cx, cy, rw, rh, left, bottom, t, size, rem;")
+        p("    if (si < 0 || si >= _engine_ui_scrollbar_count) return;")
+        p("    sgo = _engine_ui_sb_slide_go[si];")
+        p("    if (sgo < 0 || sgo >= %d) return;" % go_n)
+        if want_live_rt:
+            p("    _engine_ui_screen_rect("
+              "sgo, sw, sh, &cx, &cy, &rw, &rh);")
+        else:
+            p("    cx = sw * 0.5f; cy = sh * 0.5f; rw = sw; rh = sh;")
+        p("    if (rw < 0.f) rw = -rw;")
+        p("    if (rh < 0.f) rh = -rh;")
+        p("    left = cx - rw * 0.5f;")
+        p("    bottom = cy - rh * 0.5f;")
+        p("    dir = _engine_ui_sb_dir[si];")
+        p("    axis = (dir == 0 || dir == 1) ? 0 : 1;")
+        p("    rev = (dir == 1 || dir == 3) ? 1 : 0;")
+        p("    size = _engine_ui_sb_size[si];")
+        p("    if (axis == 0) {")
+        p("        rem = rw * (1.f - size);")
+        p("        if (rem < 1e-6f) t = 0.f;")
+        p("        else t = (px - left - rw * size * 0.5f) / rem;")
+        p("    } else {")
+        p("        rem = rh * (1.f - size);")
+        p("        if (rem < 1e-6f) t = 0.f;")
+        p("        else t = (py - bottom - rh * size * 0.5f) / rem;")
+        p("    }")
+        p("    if (t < 0.f) t = 0.f;")
+        p("    if (t > 1.f) t = 1.f;")
+        p("    if (rev) t = 1.f - t;")
+        p("    _engine_ui_sb_set_value(si, t, 0);")
+        p("}")
+
+
+def _emit_engine_ui_scrollrects(go_n, p, ui_scrollbars, ui_scrollrects, want_live_rt):
+    """_emit_engine_ui: ScrollRect tables and content scrolling."""
+    if ui_scrollrects:
+        nsr = len(ui_scrollrects)
+        p("static const int _engine_ui_sr_go[%d] = { %s };" % (
+            nsr, ", ".join(
+                str(int(s["go"])) for s in ui_scrollrects)))
+        p("static const int _engine_ui_sr_content[%d] = { %s };" % (
+            nsr, ", ".join(
+                str(int(s["content_go"])) for s in ui_scrollrects)))
+        p("static const int _engine_ui_sr_viewport[%d] = { %s };" % (
+            nsr, ", ".join(
+                str(int(s["viewport_go"])) for s in ui_scrollrects)))
+        p("static const int _engine_ui_sr_h[%d] = { %s };" % (
+            nsr, ", ".join(
+                str(int(s["horizontal"])) for s in ui_scrollrects)))
+        p("static const int _engine_ui_sr_v[%d] = { %s };" % (
+            nsr, ", ".join(
+                str(int(s["vertical"])) for s in ui_scrollrects)))
+        p("static const int _engine_ui_sr_hbar[%d] = { %s };" % (
+            nsr, ", ".join(
+                str(int(s["hbar"])) for s in ui_scrollrects)))
+        p("static const int _engine_ui_sr_vbar[%d] = { %s };" % (
+            nsr, ", ".join(
+                str(int(s["vbar"])) for s in ui_scrollrects)))
+        p("static int _engine_ui_sr_drag = -1;")
+        p("static float _engine_ui_sr_drag_px;")
+        p("static float _engine_ui_sr_drag_py;")
+        p("static float _engine_ui_sr_drag_ax;")
+        p("static float _engine_ui_sr_drag_ay;")
+        if want_live_rt:
+            p("static void _engine_ui_sr_apply_norm(int ri, int axis,"
+              " float nv) {")
+            p("    int cgo, vgo;")
+            p("    float ccx, ccy, crw, crh, vcx, vcy, vrw, vrh;")
+            p("    float scrollable;")
+            p("    if (ri < 0 || ri >= _engine_ui_scrollrect_count)"
+              " return;")
+            p("    if (nv < 0.f) nv = 0.f;")
+            p("    if (nv > 1.f) nv = 1.f;")
+            p("    cgo = _engine_ui_sr_content[ri];")
+            p("    vgo = _engine_ui_sr_viewport[ri];")
+            p("    if (cgo < 0 || cgo >= %d || vgo < 0 || vgo >= %d)"
+              " return;" % (go_n, go_n))
+            p("    if (!_engine_rt_has[cgo] || !_engine_rt_has[vgo])"
+              " return;")
+            p("    _engine_ui_screen_rect("
+              "cgo, _engine_ui_layout_w, _engine_ui_layout_h,"
+              " &ccx, &ccy, &crw, &crh);")
+            p("    _engine_ui_screen_rect("
+              "vgo, _engine_ui_layout_w, _engine_ui_layout_h,"
+              " &vcx, &vcy, &vrw, &vrh);")
+            p("    if (crw < 0.f) crw = -crw;")
+            p("    if (crh < 0.f) crh = -crh;")
+            p("    if (vrw < 0.f) vrw = -vrw;")
+            p("    if (vrh < 0.f) vrh = -vrh;")
+            p("    if (axis == 0) {")
+            p("        scrollable = crw - vrw;")
+            p("        if (scrollable < 0.f) scrollable = 0.f;")
+            p("        _engine_rt_apos_x[cgo] = -(nv * scrollable);")
+            p("    } else {")
+            p("        scrollable = crh - vrh;")
+            p("        if (scrollable < 0.f) scrollable = 0.f;")
+            p("        _engine_rt_apos_y[cgo] ="
+              " (1.f - nv) * scrollable;")
+            p("    }")
+            p("}")
+            if ui_scrollbars:
+                p("static void _engine_ui_sr_sync_bars(int ri) {")
+                p("    int cgo, vgo, hbi, vbi;")
+                p("    float ccx, ccy, crw, crh, vcx, vcy, vrw, vrh;")
+                p("    float scrollable, nv;")
+                p("    if (ri < 0 || ri >= _engine_ui_scrollrect_count)"
+                  " return;")
+                p("    cgo = _engine_ui_sr_content[ri];")
+                p("    vgo = _engine_ui_sr_viewport[ri];")
+                p("    if (cgo < 0 || cgo >= %d || vgo < 0 || vgo >= %d)"
+                  " return;" % (go_n, go_n))
+                p("    if (!_engine_rt_has[cgo] || !_engine_rt_has[vgo])"
+                  " return;")
+                p("    _engine_ui_screen_rect("
+                  "cgo, _engine_ui_layout_w, _engine_ui_layout_h,"
+                  " &ccx, &ccy, &crw, &crh);")
+                p("    _engine_ui_screen_rect("
+                  "vgo, _engine_ui_layout_w, _engine_ui_layout_h,"
+                  " &vcx, &vcy, &vrw, &vrh);")
+                p("    if (crw < 0.f) crw = -crw;")
+                p("    if (crh < 0.f) crh = -crh;")
+                p("    if (vrw < 0.f) vrw = -vrw;")
+                p("    if (vrh < 0.f) vrh = -vrh;")
+                p("    _engine_ui_sb_syncing = 1;")
+                p("    hbi = _engine_ui_sr_hbar[ri];")
+                p("    if (hbi >= 0 && _engine_ui_sr_h[ri]) {")
+                p("        scrollable = crw - vrw;")
+                p("        if (scrollable < 1e-6f) nv = 0.f;")
+                p("        else {")
+                p("            nv = -_engine_rt_apos_x[cgo] / scrollable;")
+                p("            if (nv < 0.f) nv = 0.f;")
+                p("            if (nv > 1.f) nv = 1.f;")
+                p("        }")
+                p("        if (crw > 1e-6f)")
+                p("            _engine_ui_sb_size[hbi] ="
+                  " (vrw < crw) ? (vrw / crw) : 1.f;")
+                p("        _engine_ui_sb_set_value(hbi, nv, 1);")
+                p("    }")
+                p("    vbi = _engine_ui_sr_vbar[ri];")
+                p("    if (vbi >= 0 && _engine_ui_sr_v[ri]) {")
+                p("        scrollable = crh - vrh;")
+                p("        if (scrollable < 1e-6f) nv = 1.f;")
+                p("        else {")
+                p("            nv = 1.f - (_engine_rt_apos_y[cgo]"
+                  " / scrollable);")
+                p("            if (nv < 0.f) nv = 0.f;")
+                p("            if (nv > 1.f) nv = 1.f;")
+                p("        }")
+                p("        if (crh > 1e-6f)")
+                p("            _engine_ui_sb_size[vbi] ="
+                  " (vrh < crh) ? (vrh / crh) : 1.f;")
+                p("        _engine_ui_sb_set_value(vbi, nv, 1);")
+                p("    }")
+                p("    _engine_ui_sb_syncing = 0;")
+                p("}")
+            else:
+                p("static void _engine_ui_sr_sync_bars(int ri) {"
+                  " (void)ri; }")
+            p("static void _engine_ui_sr_drag_to(int ri, float px,"
+              " float py) {")
+            p("    int cgo;")
+            p("    float dx, dy, ccx, ccy, crw, crh, vcx, vcy, vrw, vrh;")
+            p("    float scrollable, ax, ay;")
+            p("    if (ri < 0 || ri >= _engine_ui_scrollrect_count)"
+              " return;")
+            p("    cgo = _engine_ui_sr_content[ri];")
+            p("    if (cgo < 0 || cgo >= %d || !_engine_rt_has[cgo])"
+              " return;" % go_n)
+            p("    dx = px - _engine_ui_sr_drag_px;")
+            p("    dy = py - _engine_ui_sr_drag_py;")
+            p("    ax = _engine_ui_sr_drag_ax;")
+            p("    ay = _engine_ui_sr_drag_ay;")
+            p("    if (_engine_ui_sr_h[ri]) ax = ax + dx;")
+            p("    if (_engine_ui_sr_v[ri]) ay = ay + dy;")
+            p("    _engine_ui_screen_rect("
+              "cgo, _engine_ui_layout_w, _engine_ui_layout_h,"
+              " &ccx, &ccy, &crw, &crh);")
+            p("    _engine_ui_screen_rect("
+              "_engine_ui_sr_viewport[ri],"
+              " _engine_ui_layout_w, _engine_ui_layout_h,"
+              " &vcx, &vcy, &vrw, &vrh);")
+            p("    if (crw < 0.f) crw = -crw;")
+            p("    if (crh < 0.f) crh = -crh;")
+            p("    if (vrw < 0.f) vrw = -vrw;")
+            p("    if (vrh < 0.f) vrh = -vrh;")
+            p("    if (_engine_ui_sr_h[ri]) {")
+            p("        scrollable = crw - vrw;")
+            p("        if (scrollable < 0.f) scrollable = 0.f;")
+            p("        if (ax > 0.f) ax = 0.f;")
+            p("        if (ax < -scrollable) ax = -scrollable;")
+            p("        _engine_rt_apos_x[cgo] = ax;")
+            p("    }")
+            p("    if (_engine_ui_sr_v[ri]) {")
+            p("        scrollable = crh - vrh;")
+            p("        if (scrollable < 0.f) scrollable = 0.f;")
+            p("        if (ay < 0.f) ay = 0.f;")
+            p("        if (ay > scrollable) ay = scrollable;")
+            p("        _engine_rt_apos_y[cgo] = ay;")
+            p("    }")
+            p("    _engine_ui_sr_sync_bars(ri);")
+            p("}")
+        else:
+            p("static void _engine_ui_sr_apply_norm(int ri, int axis,"
+              " float nv) { (void)ri; (void)axis; (void)nv; }")
+            p("static void _engine_ui_sr_sync_bars(int ri) {"
+              " (void)ri; }")
+            p("static void _engine_ui_sr_drag_to(int ri, float px,"
+              " float py) { (void)ri; (void)px; (void)py; }")
+    elif ui_scrollbars:
+        # Scrollbar set_value forward-declared apply_norm — stub it.
+        p("static void _engine_ui_sr_apply_norm(int ri, int axis,"
+          " float nv) { (void)ri; (void)axis; (void)nv; }")
+
+
+def _emit_engine_ui_toggles(go_n, p, plan, ui_toggles):
+    """_emit_engine_ui: Toggle tables and onValueChanged."""
+    if ui_toggles:
+        ntg = len(ui_toggles)
+        p("static const int _engine_ui_tg_go[%d] = { %s };" % (
+            ntg, ", ".join(str(int(t["go"])) for t in ui_toggles)))
+        p("static const int _engine_ui_tg_graphic[%d] = { %s };" % (
+            ntg, ", ".join(
+                str(int(t["graphic_go"])) for t in ui_toggles)))
+        tg_starts, tg_counts, tg_ops, tg_insts, tg_bools = (
+            [], [], [], [], [])
+        tg_handlers = []
+        tg_handler_ix = {}
+
+        def _tg_op(cname, method, pass_bool, is_static):
+            key = (cname, method, bool(pass_bool), bool(is_static))
+            if key not in tg_handler_ix:
+                tg_handler_ix[key] = len(tg_handlers) + 1
+                tg_handlers.append(key)
+            return tg_handler_ix[key]
+
+        for t in ui_toggles:
+            tg_starts.append(len(tg_ops))
+            calls = t.get("calls") or []
+            tg_counts.append(len(calls))
+            for c in calls:
+                mode = int(c.get("mode") or 0)
+                pass_b = mode in (0, 6)
+                tg_ops.append(_tg_op(
+                    c["mb_class"], c["method"], pass_b,
+                    bool(c.get("static"))))
+                tg_insts.append(int(c["mb_inst"]))
+                # mode 6 uses fixed bool; mode 0 uses live isOn.
+                tg_bools.append(int(c.get("bool_arg") or 0)
+                                if mode == 6 else -1)
+        ntc = len(tg_ops)
+        p("static const int _engine_ui_tg_call_start[%d] = { %s };" % (
+            ntg, ", ".join(str(x) for x in tg_starts)))
+        p("static const int _engine_ui_tg_call_count[%d] = { %s };" % (
+            ntg, ", ".join(str(x) for x in tg_counts)))
+        if ntc:
+            p("static const int _engine_ui_tg_call_op[%d] = { %s };" % (
+                ntc, ", ".join(str(x) for x in tg_ops)))
+            p("static const int _engine_ui_tg_call_inst[%d] = { %s };"
+              % (ntc, ", ".join(str(x) for x in tg_insts)))
+            p("static const int _engine_ui_tg_call_bool[%d] = { %s };"
+              % (ntc, ", ".join(str(x) for x in tg_bools)))
+        else:
+            p("static const int _engine_ui_tg_call_op[1] = { 0 };")
+            p("static const int _engine_ui_tg_call_inst[1] = { 0 };")
+            p("static const int _engine_ui_tg_call_bool[1] = { -1 };")
+        plan["_ui_tg_mb_handlers"] = tg_handlers
+        for hcname, hmethod, hbool, hstatic in tg_handlers:
+            hidn = _c_ident(hcname)
+            if hstatic and hbool:
+                p("static void %s_%s(int a);" % (hidn, hmethod))
+            elif hstatic:
+                p("static void %s_%s(void);" % (hidn, hmethod))
+            elif hbool:
+                p("static void %s_%s(unsigned i, int a);"
+                  % (hidn, hmethod))
+            else:
+                p("static void %s_%s(unsigned i);" % (hidn, hmethod))
+        p("static int _engine_ui_tg_press = -1;")
+        p("static void _engine_ui_tg_set(int ti, int on) {")
+        p("    int go, g, j, j0, j1, barg;")
+        p("    if (ti < 0 || ti >= _engine_ui_toggle_count) return;")
+        p("    go = _engine_ui_tg_go[ti];")
+        p("    if (go < 0 || go >= %d) return;" % go_n)
+        p("    on = on ? 1 : 0;")
+        p("    if (Toggle_get_isOn(go) == on) return;")
+        p("    Toggle_set_isOn(go, on);")
+        p("    g = _engine_ui_tg_graphic[ti];")
+        p("    if (g >= 0 && g < %d)" % go_n)
+        p("        GameObject_SetActive(g, on);")
+        p("    j0 = _engine_ui_tg_call_start[ti];")
+        p("    j1 = j0 + _engine_ui_tg_call_count[ti];")
+        p("    for (j = j0; j < j1; j = j + 1) {")
+        p("        int op = _engine_ui_tg_call_op[j];")
+        p("        barg = _engine_ui_tg_call_bool[j];")
+        p("        if (barg < 0) barg = on;")
+        for hi, (hcname, hmethod, hbool, hstatic) in enumerate(
+                tg_handlers):
+            hidn = _c_ident(hcname)
+            line = ("        if (op == %d)" if hi == 0
+                    else "        else if (op == %d)")
+            p(line % (hi + 1))
+            if hstatic and hbool:
+                p("            %s_%s(barg);" % (hidn, hmethod))
+            elif hstatic:
+                p("            %s_%s();" % (hidn, hmethod))
+            elif hbool:
+                p("            %s_%s("
+                  "(unsigned)_engine_ui_tg_call_inst[j], barg);"
+                  % (hidn, hmethod))
+            else:
+                p("            %s_%s("
+                  "(unsigned)_engine_ui_tg_call_inst[j]);"
+                  % (hidn, hmethod))
+        p("    }")
+        p("}")
+
+
+def _emit_engine_ui_eventtriggers(p, plan, ui_eventtriggers, ui_sliders):
+    """_emit_engine_ui: EventTrigger tables and dispatch."""
+    if ui_eventtriggers:
+        net = len(ui_eventtriggers)
+        p("static const int _engine_ui_et_go[%d] = { %s };" % (
+            net, ", ".join(
+                str(int(t["go"])) for t in ui_eventtriggers)))
+        # Flatten events + calls.
+        ev_starts, ev_counts = [], []
+        ev_ids, ev_call_starts, ev_call_counts = [], [], []
+        call_ops, call_insts, call_bools = [], [], []
+        call_floats, call_strs, call_objs = [], [], []
+        et_handlers = []
+        et_handler_ix = {}
+
+        def _et_op(cname, method, sig):
+            # sig: 'void'|'string'|'bool'|'float'|'obj'
+            key = (cname, method, sig)
+            if key not in et_handler_ix:
+                et_handler_ix[key] = len(et_handlers) + 1
+                et_handlers.append(key)
+            return et_handler_ix[key]
+
+        for t in ui_eventtriggers:
+            ev_starts.append(len(ev_ids))
+            events = t.get("events") or []
+            ev_counts.append(len(events))
+            for ev in events:
+                ev_ids.append(int(ev["event_id"]))
+                ev_call_starts.append(len(call_ops))
+                calls = ev.get("calls") or []
+                ev_call_counts.append(len(calls))
+                for c in calls:
+                    kind = c.get("kind")
+                    if kind == "setactive":
+                        call_ops.append(0)
+                        call_insts.append(0)
+                        call_bools.append(int(c.get("bool_arg") or 0))
+                        call_floats.append(0.0)
+                        call_strs.append("")
+                        call_objs.append(int(c["target_go"]))
+                    elif kind == "slider_set":
+                        call_ops.append(-1)
+                        call_insts.append(int(c["slider"]))
+                        call_bools.append(0)
+                        call_floats.append(float(c.get("float_arg") or 0))
+                        call_strs.append("")
+                        call_objs.append(-1)
+                    else:
+                        mode = int(c.get("mode") or 0)
+                        if mode == 5:
+                            sig = "string"
+                        elif mode == 6:
+                            sig = "bool"
+                        elif mode == 4:
+                            sig = "float"
+                        elif mode == 2:
+                            sig = "obj"
+                        else:
+                            sig = "void"
+                        call_ops.append(_et_op(
+                            c["mb_class"], c["method"], sig))
+                        call_insts.append(int(c["mb_inst"]))
+                        call_bools.append(int(c.get("bool_arg") or 0))
+                        call_floats.append(float(
+                            c.get("float_arg") or 0.0))
+                        call_strs.append(c.get("string_arg") or "")
+                        call_objs.append(int(c.get("object_go")
+                                             if c.get("object_go")
+                                             is not None else -1))
+        nev = len(ev_ids)
+        ncall = len(call_ops)
+        p("static const int _engine_ui_et_ev_start[%d] = { %s };" % (
+            net, ", ".join(str(x) for x in ev_starts)))
+        p("static const int _engine_ui_et_ev_count[%d] = { %s };" % (
+            net, ", ".join(str(x) for x in ev_counts)))
+        if nev:
+            p("static const int _engine_ui_et_ev_id[%d] = { %s };" % (
+                nev, ", ".join(str(x) for x in ev_ids)))
+            p("static const int _engine_ui_et_ev_call_start[%d] = "
+              "{ %s };" % (
+                  nev, ", ".join(str(x) for x in ev_call_starts)))
+            p("static const int _engine_ui_et_ev_call_count[%d] = "
+              "{ %s };" % (
+                  nev, ", ".join(str(x) for x in ev_call_counts)))
+        else:
+            p("static const int _engine_ui_et_ev_id[1] = { 0 };")
+            p("static const int _engine_ui_et_ev_call_start[1] = "
+              "{ 0 };")
+            p("static const int _engine_ui_et_ev_call_count[1] = "
+              "{ 0 };")
+        if ncall:
+            p("static const int _engine_ui_et_call_op[%d] = { %s };" % (
+                ncall, ", ".join(str(x) for x in call_ops)))
+            p("static const int _engine_ui_et_call_inst[%d] = { %s };"
+              % (ncall, ", ".join(str(x) for x in call_insts)))
+            p("static const int _engine_ui_et_call_bool[%d] = { %s };"
+              % (ncall, ", ".join(str(x) for x in call_bools)))
+            p("static const float _engine_ui_et_call_float[%d] = "
+              "{ %s };" % (
+                  ncall, ", ".join(
+                      "%sf" % repr(float(x)) for x in call_floats)))
+            p("static const char *_engine_ui_et_call_str[%d] = {"
+              % ncall)
+            p("    " + ", ".join(_c_string(s) for s in call_strs))
+            p("};")
+            p("static const int _engine_ui_et_call_obj[%d] = { %s };"
+              % (ncall, ", ".join(str(x) for x in call_objs)))
+        else:
+            p("static const int _engine_ui_et_call_op[1] = { 0 };")
+            p("static const int _engine_ui_et_call_inst[1] = { 0 };")
+            p("static const int _engine_ui_et_call_bool[1] = { 0 };")
+            p("static const float _engine_ui_et_call_float[1] = "
+              "{ 0.f };")
+            p("static const char *_engine_ui_et_call_str[1] = "
+              "{ \"\" };")
+            p("static const int _engine_ui_et_call_obj[1] = { -1 };")
+        plan["_ui_et_mb_handlers"] = et_handlers
+        for hcname, hmethod, sig in et_handlers:
+            hidn = _c_ident(hcname)
+            if sig == "string":
+                p("static void %s_%s(unsigned i, const char *a);"
+                  % (hidn, hmethod))
+            elif sig == "bool":
+                p("static void %s_%s(unsigned i, int a);"
+                  % (hidn, hmethod))
+            elif sig == "float":
+                p("static void %s_%s(unsigned i, float a);"
+                  % (hidn, hmethod))
+            elif sig == "obj":
+                p("static void %s_%s(unsigned i, int a);"
+                  % (hidn, hmethod))
+            else:
+                p("static void %s_%s(unsigned i);" % (hidn, hmethod))
+        p("static int _engine_ui_et_hover[%d];" % net)
+        p("static int _engine_ui_et_press = -1;")
+        p("static void _engine_ui_et_fire(int ti, int eid) {")
+        p("    int e0, e1, e, j, j0, j1, op;")
+        p("    if (ti < 0 || ti >= _engine_ui_et_count) return;")
+        p("    e0 = _engine_ui_et_ev_start[ti];")
+        p("    e1 = e0 + _engine_ui_et_ev_count[ti];")
+        p("    for (e = e0; e < e1; e = e + 1) {")
+        p("        if (_engine_ui_et_ev_id[e] != eid) continue;")
+        p("        j0 = _engine_ui_et_ev_call_start[e];")
+        p("        j1 = j0 + _engine_ui_et_ev_call_count[e];")
+        p("        for (j = j0; j < j1; j = j + 1) {")
+        p("            op = _engine_ui_et_call_op[j];")
+        p("            if (op == 0) {")
+        p("                if (_engine_ui_et_call_obj[j] >= 0)")
+        p("                    GameObject_SetActive("
+          "_engine_ui_et_call_obj[j],")
+        p("                                         "
+          "_engine_ui_et_call_bool[j]);")
+        p("            } else if (op == -1) {")
+        if ui_sliders:
+            p("                _engine_ui_sl_set_value("
+              "_engine_ui_et_call_inst[j],")
+            p("                    _engine_ui_et_call_float[j]);")
+        else:
+            p("                (void)_engine_ui_et_call_inst[j];")
+        p("            }")
+        for hi, (hcname, hmethod, sig) in enumerate(et_handlers):
+            hidn = _c_ident(hcname)
+            p("            else if (op == %d)" % (hi + 1))
+            if sig == "string":
+                p("                %s_%s("
+                  "(unsigned)_engine_ui_et_call_inst[j],"
+                  % (hidn, hmethod))
+                p("                    "
+                  "_engine_ui_et_call_str[j]);")
+            elif sig == "bool":
+                p("                %s_%s("
+                  "(unsigned)_engine_ui_et_call_inst[j],"
+                  % (hidn, hmethod))
+                p("                    "
+                  "_engine_ui_et_call_bool[j]);")
+            elif sig == "float":
+                p("                %s_%s("
+                  "(unsigned)_engine_ui_et_call_inst[j],"
+                  % (hidn, hmethod))
+                p("                    "
+                  "_engine_ui_et_call_float[j]);")
+            elif sig == "obj":
+                p("                %s_%s("
+                  "(unsigned)_engine_ui_et_call_inst[j],"
+                  % (hidn, hmethod))
+                p("                    "
+                  "_engine_ui_et_call_obj[j]);")
+            else:
+                p("                %s_%s("
+                  "(unsigned)_engine_ui_et_call_inst[j]);"
+                  % (hidn, hmethod))
+        p("        }")
+        p("    }")
+        p("}")
+
+
+def _emit_engine_ui_button_clicks(
+        go_n, p, plan, ui_buttons, ui_scrollbars, ui_scrollrects, ui_sliders,
+        ui_toggles, want_live_rt):
+    """_emit_engine_ui: Button hit-testing and onClick dispatch in the pointer update."""
+    if ui_buttons:
+        p("    for (i = 0; i < _engine_ui_button_count; i = i + 1) {")
+        p("        int go = _engine_ui_btn_go[i];")
+        p("        float cx, cy, hw, hh, dx, dy;")
+        p("        const float *col;")
+        p("        int over;")
+        p("        if (go < 0 || go >= %d) continue;" % go_n)
+        p("        if (!_engine_go_active_in_hierarchy(go)) {")
+        p("            col = &_engine_ui_btn_col_d[i * 4];")
+        p("            _engine_ui_btn_tint[i * 4 + 0] = col[0];")
+        p("            _engine_ui_btn_tint[i * 4 + 1] = col[1];")
+        p("            _engine_ui_btn_tint[i * 4 + 2] = col[2];")
+        p("            _engine_ui_btn_tint[i * 4 + 3] = col[3];")
+        p("            continue;")
+        p("        }")
+        if want_live_rt:
+            p("        {")
+            p("            float rcx, rcy, rw, rh;")
+            p("            _engine_ui_screen_rect("
+              "go, sw, sh, &rcx, &rcy, &rw, &rh);")
+            p("            if (rw < 0.f) rw = -rw;")
+            p("            if (rh < 0.f) rh = -rh;")
+            p("            cx = rcx;")
+            p("            cy = rcy;")
+            p("            hw = rw * 0.5f;")
+            p("            hh = rh * 0.5f;")
+            p("        }")
+        else:
+            p("        cx = _engine_ui_btn_ncx[i] * sw;")
+            p("        cy = _engine_ui_btn_ncy[i] * sh;")
+            p("        hw = _engine_ui_btn_nhw[i] * sw;")
+            p("        hh = _engine_ui_btn_nhh[i] * sh;")
+        p("        dx = px - cx; if (dx < 0.f) dx = -dx;")
+        p("        dy = py - cy; if (dy < 0.f) dy = -dy;")
+        p("        over = (dx <= hw && dy <= hh);")
+        p("        if (over && hit < 0) hit = i;")
+        # Pressed visual sticks to the button that received pointer-down
+        # even after mouse-off (Unity Selectable.IsPressed).
+        p("        if (i == _engine_ui_btn_press && engine_pointer_down)")
+        p("            col = &_engine_ui_btn_col_p[i * 4];")
+        p("        else if (over)")
+        p("            col = &_engine_ui_btn_col_h[i * 4];")
+        p("        else")
+        p("            col = &_engine_ui_btn_col_n[i * 4];")
+        p("        _engine_ui_btn_tint[i * 4 + 0] = col[0];")
+        p("        _engine_ui_btn_tint[i * 4 + 1] = col[1];")
+        p("        _engine_ui_btn_tint[i * 4 + 2] = col[2];")
+        p("        _engine_ui_btn_tint[i * 4 + 3] = col[3];")
+        p("    }")
+        # Skip Button press while a Slider/Scrollbar/ScrollRect drags.
+        busy = []
+        if ui_sliders:
+            busy.append("_engine_ui_sl_drag < 0")
+        if ui_scrollbars:
+            busy.append("_engine_ui_sb_drag < 0")
+        if ui_scrollrects:
+            busy.append("_engine_ui_sr_drag < 0")
+        if ui_toggles:
+            busy.append("_engine_ui_tg_press < 0")
+        if busy:
+            p("    if (down_edge && hit >= 0 && %s)"
+              % " && ".join(busy))
+        else:
+            p("    if (down_edge && hit >= 0)")
+        p("        _engine_ui_btn_press = hit;")
+        p("    if (up_edge) {")
+        p("        if (_engine_ui_btn_press >= 0"
+          " && hit == _engine_ui_btn_press) {")
+        p("            int j, j0, j1;")
+        p("            j0 = _engine_ui_btn_call_start["
+          "_engine_ui_btn_press];")
+        p("            j1 = j0 + _engine_ui_btn_call_count["
+          "_engine_ui_btn_press];")
+        p("            for (j = j0; j < j1; j = j + 1) {")
+        p("                int op = _engine_ui_btn_call_op[j];")
+        p("                if (op == 0) {")
+        p("                    if (_engine_ui_btn_call_go[j] >= 0)")
+        p("                        GameObject_SetActive("
+          "_engine_ui_btn_call_go[j],")
+        p("                                             "
+          "_engine_ui_btn_call_bool[j]);")
+        p("                }")
+        mb_handlers = plan.get("_ui_btn_mb_handlers") or []
+        for hi, (hcname, hmethod, hstr) in enumerate(mb_handlers):
+            hidn = _c_ident(hcname)
+            p("                else if (op == %d)" % (hi + 1))
+            if hstr:
+                p("                    %s_%s("
+                  "(unsigned)_engine_ui_btn_call_go[j],"
+                  % (hidn, hmethod))
+                p("                        "
+                  "_engine_ui_btn_call_str[j]);")
+            else:
+                p("                    %s_%s("
+                  "(unsigned)_engine_ui_btn_call_go[j]);"
+                  % (hidn, hmethod))
+        p("            }")
+        p("        }")
+        p("        _engine_ui_btn_press = -1;")
+        p("    }")
+    elif not (ui_sliders or ui_scrollbars or ui_scrollrects
+              or ui_toggles):
+        p("    (void)i; (void)hit; (void)px; (void)py;")
+        p("    (void)sw; (void)sh; (void)down_edge; (void)up_edge;")
+    else:
+        p("    (void)hit;")
+
+
+def _emit_engine_ui(
+        go_authored_n, go_n, go_spawn_budget, p, plan, ui_buttons, ui_eventtriggers,
+        ui_scrollbars, ui_scrollrects, ui_sliders, ui_toggles, want_live_rt, want_ui):
+    """_emit_engine_ui_transform_tables: uGUI: rects, Canvas scaling, Button / Toggle / Slider / Scrollbar / ScrollRect / EventTrigger dispatch."""
+    if not (want_ui):
+        return
+    go_active = plan.get("go_active") or [1] * go_authored_n
+    if len(go_active) < go_authored_n:
+        go_active = list(go_active) + [1] * (
+            go_authored_n - len(go_active))
+    go_active = [
+        1 if int(a) else 0 for a in go_active[:go_authored_n]
+    ] + [1] * go_spawn_budget
+    if not go_active:
+        go_active = [1]
+    p("/* GameObject.activeSelf — host pointer + authored Button */")
+    p("static int _engine_go_active[%d];" % go_n)
+    p("static int _engine_go_active_inited;")
+    p("static int _engine_pointer_was_down;")
+    p("static void _engine_go_active_init(void) {")
+    p("    int i;")
+    p("    if (_engine_go_active_inited) return;")
+    p("    _engine_go_active_inited = 1;")
+    p("    static const int _engine_go_active_authored[%d] = { %s };"
+      % (go_n, ", ".join(str(int(x)) for x in go_active[:go_n])))
+    p("    for (i = 0; i < %d; i = i + 1)" % go_n)
+    p("        _engine_go_active[i] = _engine_go_active_authored[i];")
+    p("}")
+    p("static int _engine_go_active_in_hierarchy(int go) {")
+    p("    int guard = 0;")
+    p("    _engine_go_active_init();")
+    p("    while (go >= 0 && go < %d && guard < %d) {"
+      % (go_n, go_n + 2))
+    p("        if (!_engine_go_active[go]) return 0;")
+    p("        go = _engine_go_parent[go];")
+    p("        guard = guard + 1;")
+    p("    }")
+    p("    return 1;")
+    p("}")
+    p("static void GameObject_SetActive(int go, int active) {")
+    p("    _engine_go_active_init();")
+    p("    if (go < 0 || go >= %d) return;" % go_n)
+    p("    _engine_go_active[go] = active ? 1 : 0;")
+    p("}")
+    p("")
+    p("static const int _engine_ui_button_count = %d;" % len(ui_buttons))
+    _emit_engine_ui_buttons(p, plan, ui_buttons, want_live_rt)
+    # Slider tables: drag + onValueChanged (UnityEvent<float>).
+    p("static const int _engine_ui_slider_count = %d;"
+      % len(ui_sliders))
+    _emit_engine_ui_sliders(go_n, p, plan, ui_sliders, want_live_rt)
+    # ---- Scrollbar ----
+    p("static const int _engine_ui_scrollbar_count = %d;"
+      % len(ui_scrollbars))
+    _emit_engine_ui_scrollbars(go_n, p, plan, ui_scrollbars, want_live_rt)
+    # ---- ScrollRect ----
+    p("static const int _engine_ui_scrollrect_count = %d;"
+      % len(ui_scrollrects))
+    _emit_engine_ui_scrollrects(go_n, p, ui_scrollbars, ui_scrollrects, want_live_rt)
+    # ---- Toggle ----
+    p("static const int _engine_ui_toggle_count = %d;"
+      % len(ui_toggles))
+    _emit_engine_ui_toggles(go_n, p, plan, ui_toggles)
+    # ---- EventTrigger ----
+    p("static const int _engine_ui_et_count = %d;"
+      % len(ui_eventtriggers))
+    _emit_engine_ui_eventtriggers(p, plan, ui_eventtriggers, ui_sliders)
+    p("static void engine_ui_tick(void) {")
+    p("    int down_edge, up_edge, i, hit;")
+    p("    float px, py, sw, sh;")
+    p("    _engine_go_active_init();")
+    if ui_buttons:
+        p("    _engine_ui_btn_tint_init();")
+    # Unity Button: onClick on pointer-up over the pressed target,
+    # not on pointer-down.
+    p("    down_edge = engine_pointer_down && !_engine_pointer_was_down;")
+    p("    up_edge = !engine_pointer_down && _engine_pointer_was_down;")
+    p("    sw = (float)Screen_width;")
+    p("    sh = (float)Screen_height;")
+    p("    if (sw < 1.f) sw = 1.f;")
+    p("    if (sh < 1.f) sh = 1.f;")
+    # UI bake / hits are relative to Camera.rect pixel rect (HandleViewSize).
+    if plan.get("camera"):
+        p("    {")
+        p("        float vx = Camera_main_rect_x * sw;")
+        p("        float vy = Camera_main_rect_y * sh;")
+        p("        float vw = Camera_main_rect_w * sw;")
+        p("        float vh = Camera_main_rect_h * sh;")
+        p("        if (vw < 1.f) vw = 1.f;")
+        p("        if (vh < 1.f) vh = 1.f;")
+        p("        sw = vw;")
+        p("        sh = vh;")
+        p("        px = engine_pointer_x - vx;")
+        p("        py = engine_pointer_y - vy;")
+        p("    }")
+    else:
+        p("    px = engine_pointer_x;")
+        p("    py = engine_pointer_y;")
+    # Live RT math is in pack-time canvas units; map pointer into
+    # that space when Screen/letterbox ≠ layout (window resize).
+    if want_live_rt:
+        p("    {")
+        p("        float lw = _engine_ui_layout_w;")
+        p("        float lh = _engine_ui_layout_h;")
+        p("        if (lw < 1.f) lw = 1.f;")
+        p("        if (lh < 1.f) lh = 1.f;")
+        p("        px = px * (lw / sw);")
+        p("        py = py * (lh / sh);")
+        p("        sw = lw;")
+        p("        sh = lh;")
+        p("    }")
+    # Helper: hit-test a GO rect.
+    def _emit_hit_loop(count_sym, go_arr, result_var, extra_ok=None):
+        p("        %s = -1;" % result_var)
+        p("        for (i = 0; i < %s; i = i + 1) {" % count_sym)
+        p("            int go = %s[i];" % go_arr)
+        p("            float cx, cy, hw, hh, dx, dy, rw, rh;")
+        if extra_ok:
+            p("            if (!(%s)) continue;" % extra_ok)
+        p("            if (go < 0 || go >= %d) continue;" % go_n)
+        p("            if (!_engine_go_active_in_hierarchy(go))"
+          " continue;")
+        if want_live_rt:
+            p("            _engine_ui_screen_rect("
+              "go, sw, sh, &cx, &cy, &rw, &rh);")
+            p("            if (rw < 0.f) rw = -rw;")
+            p("            if (rh < 0.f) rh = -rh;")
+            p("            hw = rw * 0.5f; hh = rh * 0.5f;")
+        else:
+            p("            cx = sw * 0.5f; cy = sh * 0.5f;")
+            p("            hw = sw; hh = sh;")
+        p("            dx = px - cx; if (dx < 0.f) dx = -dx;")
+        p("            dy = py - cy; if (dy < 0.f) dy = -dy;")
+        p("            if (dx <= hw && dy <= hh && %s < 0)"
+          " %s = i;" % (result_var, result_var))
+        p("        }")
+
+    # Scrollbar drag (interactable only).
+    if ui_scrollbars:
+        p("    {")
+        p("        int shit = -1;")
+        _emit_hit_loop(
+            "_engine_ui_scrollbar_count", "_engine_ui_sb_go", "shit",
+            extra_ok="_engine_ui_sb_interact[i]")
+        p("        if (down_edge && shit >= 0)")
+        p("            _engine_ui_sb_drag = shit;")
+        p("        if (_engine_ui_sb_drag >= 0 && engine_pointer_down)")
+        p("            _engine_ui_sb_drag_to("
+          "_engine_ui_sb_drag, px, py, sw, sh);")
+        p("        if (up_edge)")
+        p("            _engine_ui_sb_drag = -1;")
+        p("    }")
+    # ScrollRect drag (viewport) — skip if scrollbar already dragging.
+    if ui_scrollrects:
+        p("    {")
+        p("        int rhit = -1;")
+        if ui_scrollbars:
+            p("        if (_engine_ui_sb_drag < 0) {")
+        # Hit-test viewport GO, not root.
+        p("            for (i = 0; i < _engine_ui_scrollrect_count;"
+          " i = i + 1) {")
+        p("                int go = _engine_ui_sr_viewport[i];")
+        p("                float cx, cy, hw, hh, dx, dy, rw, rh;")
+        p("                if (go < 0 || go >= %d) continue;" % go_n)
+        p("                if (!_engine_go_active_in_hierarchy(go))"
+          " continue;")
+        if want_live_rt:
+            p("                _engine_ui_screen_rect("
+              "go, sw, sh, &cx, &cy, &rw, &rh);")
+            p("                if (rw < 0.f) rw = -rw;")
+            p("                if (rh < 0.f) rh = -rh;")
+            p("                hw = rw * 0.5f; hh = rh * 0.5f;")
+        else:
+            p("                cx = sw * 0.5f; cy = sh * 0.5f;")
+            p("                hw = sw; hh = sh;")
+        p("                dx = px - cx; if (dx < 0.f) dx = -dx;")
+        p("                dy = py - cy; if (dy < 0.f) dy = -dy;")
+        p("                if (dx <= hw && dy <= hh && rhit < 0)"
+          " rhit = i;")
+        p("            }")
+        if ui_scrollbars:
+            p("        }")
+        p("        if (down_edge && rhit >= 0) {")
+        p("            int cgo;")
+        p("            _engine_ui_sr_drag = rhit;")
+        p("            _engine_ui_sr_drag_px = px;")
+        p("            _engine_ui_sr_drag_py = py;")
+        p("            cgo = _engine_ui_sr_content[rhit];")
+        p("            _engine_ui_sr_drag_ax = 0.f;")
+        p("            _engine_ui_sr_drag_ay = 0.f;")
+        if want_live_rt:
+            p("            if (cgo >= 0 && cgo < %d"
+              " && _engine_rt_has[cgo]) {" % go_n)
+            p("                _engine_ui_sr_drag_ax ="
+              " _engine_rt_apos_x[cgo];")
+            p("                _engine_ui_sr_drag_ay ="
+              " _engine_rt_apos_y[cgo];")
+            p("            }")
+        p("        }")
+        p("        if (_engine_ui_sr_drag >= 0 && engine_pointer_down)")
+        p("            _engine_ui_sr_drag_to("
+          "_engine_ui_sr_drag, px, py);")
+        p("        if (up_edge)")
+        p("            _engine_ui_sr_drag = -1;")
+        p("    }")
+    # Sliders — drag takes priority over Button press.
+    if ui_sliders:
+        p("    {")
+        p("        int shit = -1;")
+        skip = []
+        if ui_scrollbars:
+            skip.append("_engine_ui_sb_drag < 0")
+        if ui_scrollrects:
+            skip.append("_engine_ui_sr_drag < 0")
+        if skip:
+            p("        if (%s) {" % " && ".join(skip))
+            _emit_hit_loop(
+                "_engine_ui_slider_count", "_engine_ui_sl_go", "shit")
+            p("        }")
+        else:
+            _emit_hit_loop(
+                "_engine_ui_slider_count", "_engine_ui_sl_go", "shit")
+        p("        if (down_edge && shit >= 0)")
+        p("            _engine_ui_sl_drag = shit;")
+        p("        if (_engine_ui_sl_drag >= 0 && engine_pointer_down)")
+        p("            _engine_ui_sl_drag_to("
+          "_engine_ui_sl_drag, px, py, sw, sh);")
+        p("        if (up_edge)")
+        p("            _engine_ui_sl_drag = -1;")
+        p("    }")
+    # Toggle click (pointer-up over pressed target).
+    if ui_toggles:
+        p("    {")
+        p("        int thit = -1;")
+        _emit_hit_loop(
+            "_engine_ui_toggle_count", "_engine_ui_tg_go", "thit")
+        busy = []
+        if ui_scrollbars:
+            busy.append("_engine_ui_sb_drag < 0")
+        if ui_scrollrects:
+            busy.append("_engine_ui_sr_drag < 0")
+        if ui_sliders:
+            busy.append("_engine_ui_sl_drag < 0")
+        busy_expr = (" && ".join(busy)) if busy else "1"
+        p("        if (down_edge && thit >= 0 && (%s))" % busy_expr)
+        p("            _engine_ui_tg_press = thit;")
+        p("        if (up_edge) {")
+        p("            if (_engine_ui_tg_press >= 0"
+          " && thit == _engine_ui_tg_press) {")
+        p("                int go = _engine_ui_tg_go["
+          "_engine_ui_tg_press];")
+        p("                _engine_ui_tg_set(_engine_ui_tg_press,"
+          " !Toggle_get_isOn(go));")
+        p("            }")
+        p("            _engine_ui_tg_press = -1;")
+        p("        }")
+        p("    }")
+    # EventTrigger: PointerEnter/Exit/Down/Up/Click + Begin/EndDrag.
+    if ui_eventtriggers:
+        p("    {")
+        p("        int ehit = -1;")
+        _emit_hit_loop(
+            "_engine_ui_et_count", "_engine_ui_et_go", "ehit")
+        p("        for (i = 0; i < _engine_ui_et_count; i = i + 1) {")
+        p("            int over = (ehit == i);")
+        p("            int was = _engine_ui_et_hover[i];")
+        p("            if (over && !was)")
+        p("                _engine_ui_et_fire(i, 0); /* PointerEnter */")
+        p("            if (!over && was)")
+        p("                _engine_ui_et_fire(i, 1); /* PointerExit */")
+        p("            _engine_ui_et_hover[i] = over;")
+        p("        }")
+        busy = []
+        if ui_scrollbars:
+            busy.append("_engine_ui_sb_drag < 0")
+        if ui_scrollrects:
+            busy.append("_engine_ui_sr_drag < 0")
+        if ui_sliders:
+            busy.append("_engine_ui_sl_drag < 0")
+        busy_expr = (" && ".join(busy)) if busy else "1"
+        p("        if (down_edge && ehit >= 0 && (%s)) {" % busy_expr)
+        p("            _engine_ui_et_press = ehit;")
+        p("            _engine_ui_et_fire(ehit, 2); /* PointerDown */")
+        p("            _engine_ui_et_fire(ehit, 13); /* BeginDrag */")
+        p("        }")
+        p("        if (up_edge && _engine_ui_et_press >= 0) {")
+        p("            int pr = _engine_ui_et_press;")
+        p("            _engine_ui_et_fire(pr, 3); /* PointerUp */")
+        p("            _engine_ui_et_fire(pr, 14); /* EndDrag */")
+        p("            if (ehit == pr)")
+        p("                _engine_ui_et_fire(pr, 4); /* PointerClick */")
+        p("            _engine_ui_et_press = -1;")
+        p("        }")
+        p("    }")
+    p("    hit = -1;")
+    _emit_engine_ui_button_clicks(
+            go_n, p, plan, ui_buttons, ui_scrollbars, ui_scrollrects, ui_sliders,
+            ui_toggles, want_live_rt)
+    p("    _engine_pointer_was_down = engine_pointer_down;")
+    p("}")
+    p("")
+
+
+def _emit_engine_ui_transform_tables(
+        go_spawn_budget, p, plan, ui_buttons, ui_eventtriggers, ui_scrollbars,
+        ui_scrollrects, ui_sliders, ui_toggles, want_gcic, want_get_sibling,
+        want_instantiate, want_live_rt, want_mouse_position, want_rect,
+        want_screen_to_world, want_set_parent, want_transform_find,
+        want_transform_parent, want_ui):
+    """emit_engine: uGUI and Transform hierarchy tables: RectTransforms, parents, siblings, UI events."""
+    if not (want_ui or want_transform_find or want_transform_parent or want_set_parent or want_get_sibling or want_live_rt):
+        return
+    go_names = plan.get("go_names") or []
+    go_authored_n = len(go_names)
+    go_n = max(1, go_authored_n + go_spawn_budget)
+    go_parents = plan.get("go_parents") or ([-1] * max(1, go_authored_n))
+    if len(go_parents) < go_authored_n:
+        go_parents = list(go_parents) + [-1] * (
+            go_authored_n - len(go_parents))
+    go_parents = list(go_parents[:go_authored_n]) + [-1] * go_spawn_budget
+    if not go_parents:
+        go_parents = [-1]
+    go_sib = plan.get("go_siblings") or (
+        _build_go_sibling_indices(go_parents[:max(1, go_authored_n)]))
+    if len(go_sib) < go_authored_n:
+        go_sib = list(go_sib) + [0] * (go_authored_n - len(go_sib))
+    go_sib = list(go_sib[:go_authored_n]) + [0] * go_spawn_budget
+    if not go_sib:
+        go_sib = [0]
+    want_go_parent_table = (
+        want_ui or want_transform_find or want_transform_parent
+        or want_set_parent or want_live_rt)
+    if want_go_parent_table:
+        p("/* Transform hierarchy (live GO parents; seeded from m_Father) */"
+          if (want_set_parent or want_transform_find) else
+          "/* Authored Transform hierarchy (m_Father → GO index) */")
+        # Mutable whenever Find, SetParent, Instantiate, or GCIC runs.
+        if (want_set_parent or want_transform_find or want_instantiate
+                or want_gcic):
+            p("static int _engine_go_parent[%d] = { %s };" % (
+                go_n, ", ".join(str(int(x)) for x in go_parents[:go_n])))
+        else:
+            p("static const int _engine_go_parent[%d] = { %s };" % (
+                go_n, ", ".join(str(int(x)) for x in go_parents[:go_n])))
+    if want_get_sibling:
+        # Sibling order among children of the same parent (Unity).
+        # Mutable when SetParent can change order; else authored seed.
+        p("/* Live sibling indices (seeded from GO order under parent) */")
+        if want_set_parent:
+            p("static int _engine_go_sib[%d] = { %s };" % (
+                go_n, ", ".join(str(int(x)) for x in go_sib[:go_n])))
+        else:
+            p("static const int _engine_go_sib[%d] = { %s };" % (
+                go_n, ", ".join(str(int(x)) for x in go_sib[:go_n])))
+        p("static int Transform_GetSiblingIndex(int go) {")
+        p("    if (go < 0 || go >= %d) return 0;" % go_n)
+        p("    return _engine_go_sib[go];")
+        p("}")
+        p("")
+    if want_transform_parent:
+        p("static int Transform_get_parent(int go) {")
+        p("    if (go < 0 || go >= %d) return -1;" % go_n)
+        p("    return _engine_go_parent[go];")
+        p("}")
+        p("")
+    if want_transform_find:
+        # Unity Transform.Find: direct child or path with '/'; -1 = null.
+        # Walks the live parent table (updated by SetParent).
+        p("static int Transform_Find(int parent, const char *path) {")
+        p("    char seg[256];")
+        p("    const char *p;")
+        p("    int i, n, cur, found;")
+        p("    if (parent < 0 || parent >= %d || !path || !path[0])"
+          % go_n)
+        p("        return -1;")
+        p("    cur = parent;")
+        p("    p = path;")
+        p("    while (*p) {")
+        p("        n = 0;")
+        p("        while (*p && *p != '/' && n < 255) {")
+        p("            seg[n] = *p;")
+        p("            n = n + 1;")
+        p("            p = p + 1;")
+        p("        }")
+        p("        seg[n] = 0;")
+        p("        if (*p == '/') p = p + 1;")
+        p("        if (n == 0) return -1;")
+        p("        found = -1;")
+        p("        for (i = 0; i < %d; i = i + 1) {" % go_n)
+        p("            if (_engine_go_parent[i] == cur")
+        p("                && strcmp(_engine_go_name[i], seg) == 0) {")
+        p("                found = i;")
+        p("                break;")
+        p("            }")
+        p("        }")
+        p("        if (found < 0) return -1;")
+        p("        cur = found;")
+        p("    }")
+        p("    return cur;")
+        p("}")
+        p("")
+
+    if want_screen_to_world:
+        p("/* Camera.main.ScreenToWorldPoint — orthographic, in the")
+        p("   camera's own viewport rect (Camera.rect), which is what")
+        p("   the pack draws and hit-tests against. */")
+        p("static void _engine_camera_viewport(")
+        p("    float *ovx, float *ovy, float *ovw, float *ovh) {")
+        p("    float sw = (float)Screen_width;")
+        p("    float sh = (float)Screen_height;")
+        p("    if (sw < 1.f) sw = 1.f;")
+        p("    if (sh < 1.f) sh = 1.f;")
+        p("    *ovx = Camera_main_rect_x * sw;")
+        p("    *ovy = Camera_main_rect_y * sh;")
+        p("    *ovw = Camera_main_rect_w * sw;")
+        p("    *ovh = Camera_main_rect_h * sh;")
+        p("    if (*ovw < 1.f) *ovw = 1.f;")
+        p("    if (*ovh < 1.f) *ovh = 1.f;")
+        p("}")
+        p("static Vector2 Camera_main_ScreenToWorldPoint(Vector2 p) {")
+        p("    float vx, vy, vw, vh, ppu;")
+        p("    _engine_camera_viewport(&vx, &vy, &vw, &vh);")
+        p("    ppu = Camera_main_orthographicSize;")
+        p("    if (ppu < 1e-8f) ppu = 1.f;")
+        p("    ppu = vh * 0.5f / ppu;")
+        p("    if (ppu < 1e-8f) ppu = 1.f;")
+        p("    return Vector2_make(")
+        p("        Camera_main_pos_x")
+        p("            + (Vector2_x(p) - vx - vw * 0.5f) / ppu,")
+        p("        Camera_main_pos_y")
+        p("            + (Vector2_y(p) - vy - vh * 0.5f) / ppu);")
+        p("}")
+        p("")
+    if want_mouse_position:
+        p("/* Mouse.current.position.ReadValue() — the host pointer, in")
+        p("   screen pixels from the bottom-left (Unity's origin). */")
+        p("static Vector2 Mouse_current_position(void) {")
+        p("    return Vector2_make(engine_pointer_x, engine_pointer_y);")
+        p("}")
+        p("")
+
+    _emit_engine_live_rect_transforms(
+            go_authored_n, go_n, go_spawn_budget, p, plan, want_live_rt, want_rect)
+    _emit_engine_ui(
+            go_authored_n, go_n, go_spawn_budget, p, plan, ui_buttons,
+            ui_eventtriggers, ui_scrollbars, ui_scrollrects, ui_sliders, ui_toggles,
+            want_live_rt, want_ui)
+
+
+def _emit_engine_instantiate(
+        add_budget, go_spawn_budget, inst_budget, p, plan, want_destroy,
+        want_get_sibling, want_go_tables, want_inst_parent, want_instantiate,
+        want_set_parent, want_transform_parent, want_ui):
+    """emit_engine: Object.Instantiate, after the GameObject and parent tables."""
+    if want_instantiate and want_go_tables:
+        go_names_i = plan.get("go_names") or []
+        go_cap_i = max(1, len(go_names_i) + go_spawn_budget)
+        for cname in sorted(inst_budget.keys()):
+            if cname not in plan["classes"]:
+                continue
+            if not int(inst_budget.get(cname) or 0):
+                continue
+            cl = plan["classes"][cname]
+            idn = _c_ident(cname)
+            mb_extra = _mb_pool_extra(plan, cname)
+            mb_add = int(add_budget.get(cname) or 0)
+            cap = int(cl["n"]) + mb_extra
+            p("/* Object.Instantiate(%s[, parent]) — clone + optional parent */"
+              % cname)
+            p("static int Object_Instantiate_%s(int src, int parent_go) {"
+              % idn)
+            p("    int ex, go;")
+            p("    if (src < 0 || src >= _%s_inst_count) return -1;" % idn)
+            reuse = (cl.get("max_instances") is not None and want_destroy)
+            if reuse:
+                # `[MaxInstances(N)]` caps *live* instances: once the array
+                # is full, a destroyed one's slot -- instance and GameObject
+                # -- is taken over (everything below rewrites it for the
+                # clone). Only when none is free does the spawn clip.
+                go_full = ("_engine_go_count >= _engine_go_cap"
+                           if go_spawn_budget
+                           else "_engine_go_count >= %d" % go_cap_i)
+                p("    ex = -1;")
+                p("    go = -1;")
+                p("    if (_%s_inst_count >= %d || %s) {" % (idn, cap, go_full))
+                p("        int _k;")
+                p("        for (_k = 0; _k < _%s_inst_count; _k = _k + 1) {" % idn)
+                p("            int _g = _engine_%s_go_of[_k];" % idn)
+                p("            if (_g >= 0 && _g < %d && _engine_go_destroyed[_g]) {"
+                  % go_cap_i)
+                p("                ex = _k;")
+                p("                go = _g;")
+                p("                break;")
+                p("            }")
+                p("        }")
+                p("        if (ex < 0) return -1;")
+                p("    } else {")
+                p("        go = _engine_go_count;")
+                p("        _engine_go_count = _engine_go_count + 1;")
+                p("    }")
+            else:
+                p("    if (_%s_inst_count >= %d) return -1;" % (idn, cap))
+                if go_spawn_budget:
+                    p("    if (_engine_go_count >= _engine_go_cap) return -1;")
+                else:
+                    p("    if (_engine_go_count >= %d) return -1;" % go_cap_i)
+                p("    go = _engine_go_count;")
+                p("    _engine_go_count = _engine_go_count + 1;")
+            p("    _engine_go_name[go] = \"(Clone)\";")
+            if want_ui:
+                # Instantiate copies activeSelf from the source GO.
+                p("    _engine_go_active_init();")
+                p("    {")
+                p("        int _sgo = _engine_%s_go_of[src];" % idn)
+                p("        if (_sgo >= 0 && _sgo < %d)" % go_cap_i)
+                p("            _engine_go_active[go] = _engine_go_active[_sgo];")
+                p("        else")
+                p("            _engine_go_active[go] = 1;")
+                p("    }")
+            if want_destroy:
+                p("    if (go >= 0 && go < %d)" % go_cap_i)
+                p("        _engine_go_destroyed[go] = 0;")
+            if reuse:
+                p("    if (ex < 0) {")
+                p("        ex = _%s_inst_count;" % idn)
+                p("        _%s_inst_count = _%s_inst_count + 1;" % (idn, idn))
+                p("    }")
+            else:
+                p("    ex = _%s_inst_count;" % idn)
+                p("    _%s_inst_count = _%s_inst_count + 1;" % (idn, idn))
+            p("    _%s_inst_array[ex] = _%s_inst_array[src];" % (idn, idn))
+            if cl.get("soa_dims"):
+                dims = int(cl["soa_dims"])
+                p("    {")
+                p("        int _a;")
+                p("        for (_a = 0; _a < %d; _a = _a + 1)" % dims)
+                p("            _%s_pos[ex][_a] = _%s_pos[src][_a];"
+                  % (idn, idn))
+                p("    }")
+            p("    _engine_go_%s[go] = ex;" % idn)
+            p("    if (ex >= 0 && ex < %d)" % cap)
+            p("        _engine_%s_go_of[ex] = go;" % idn)
+            if want_set_parent or want_inst_parent or want_transform_parent:
+                p("    if (parent_go >= 0 && parent_go < go)")
+                p("        _engine_go_parent[go] = parent_go;")
+                p("    else")
+                p("        _engine_go_parent[go] = -1;")
+                if want_get_sibling:
+                    p("    {")
+                    p("        int _i, _max = -1;")
+                    p("        for (_i = 0; _i < go; _i = _i + 1)")
+                    p("            if (_engine_go_parent[_i] == "
+                      "_engine_go_parent[go]")
+                    p("                && _engine_go_sib[_i] > _max)")
+                    p("                _max = _engine_go_sib[_i];")
+                    p("        _engine_go_sib[go] = _max + 1;")
+                    p("    }")
+            else:
+                p("    (void)parent_go;")
+            p("    return ex;")
+            p("}")
+            p("")
+            if not mb_add:
+                p("static char _%s_tostring_buf[256];" % idn)
+                p("static const char *%s_ToString(int ci) {" % idn)
+                p("    int n, go;")
+                p("    if (ci < 0 || ci >= _%s_inst_count) return \"null\";"
+                  % idn)
+                p("    go = _engine_%s_go_of[ci];" % idn)
+                p("    if (go < 0 || go >= _engine_go_count) return \"null\";")
+                p("    n = snprintf(_%s_tostring_buf, sizeof _%s_tostring_buf,"
+                  % (idn, idn))
+                p("                 \"%%s (%s)\", _engine_go_name[go]);" % cname)
+                p("    if (n < 0 || (size_t)n >= sizeof _%s_tostring_buf)"
+                  % idn)
+                p("        return _engine_go_name[go];")
+                p("    return _%s_tostring_buf;" % idn)
+                p("}")
+                p("")
+
+
+def _emit_engine_get_components_in_children(
+        add_types, getcomponentsinchildren_types, p, plan, want_destroy, want_gcic,
+        want_go_tables, want_ui):
+    """emit_engine: GameObject.GetComponentsInChildren<T>: a live subtree walk."""
+    if want_gcic and want_go_tables:
+        p("/* GetComponentsInChildren<T> — live subtree walk → vector */")
+        p("static int _engine_go_is_child_of(int go, int root) {")
+        p("    int cur, guard;")
+        p("    if (go < 0 || root < 0) return 0;")
+        p("    if (go == root) return 1;")
+        p("    cur = go;")
+        p("    guard = 0;")
+        p("    while (cur >= 0 && guard < _engine_go_count + 2) {")
+        p("        cur = _engine_go_parent[cur];")
+        p("        if (cur == root) return 1;")
+        p("        guard = guard + 1;")
+        p("    }")
+        p("    return 0;")
+        p("}")
+        p("")
+        for tname in sorted(getcomponentsinchildren_types):
+            idn = _c_ident(tname)
+            collectors = _gcic_collector_types(
+                tname, plan, plan.get("mb_bases") or {})
+            # Need a GetComponent map / packed class / subclass / Transform.
+            has_map = (
+                bool(collectors)
+                or tname in _PHYSICS_COMPONENTS
+                or tname in _ADDABLE_BUILTINS
+                or tname in _UI_GETCOMPONENT_TYPES
+                or tname in _TRANSFORM_GETCOMPONENT_TYPES
+                or tname in add_types
+                or tname == "SpriteRenderer")
+            if not has_map:
+                continue
+            p("static std::vector<int> GameObject_GetComponentsInChildren_%s("
+              % idn)
+            p("    int root, int includeInactive) {")
+            p("    std::vector<int> out;")
+            p("    int go, ci;")
+            if not want_ui:
+                p("    (void)includeInactive;")
+            p("    if (root < 0 || root >= _engine_go_count) return out;")
+            p("    for (go = 0; go < _engine_go_count; go = go + 1) {")
+            p("        if (!_engine_go_is_child_of(go, root)) continue;")
+            if want_destroy:
+                p("        if (_engine_go_destroyed[go]) continue;")
+            if want_ui:
+                p("        if (!includeInactive")
+                p("            && !_engine_go_active_in_hierarchy(go))")
+                p("            continue;")
+            if tname == "RectTransform":
+                p("        out.push_back(go);")
+            elif collectors:
+                # Unity polymorphism: Weapon finds Blaster : Weapon, etc.
+                for cname in collectors:
+                    cidn = _c_ident(cname)
+                    p("        ci = GameObject_GetComponent_%s(go);" % cidn)
+                    p("        if (ci >= 0) out.push_back(ci);")
+            else:
+                p("        ci = GameObject_GetComponent_%s(go);" % idn)
+                p("        if (ci >= 0) out.push_back(ci);")
+            p("    }")
+            p("    return out;")
+            p("}")
+            p("")
+
+
+def _emit_engine_find_object_of_type(
+        findobject_packed, p, plan, singleton_instance_types, want_destroy,
+        want_findobject, want_ui):
+    """emit_engine: Object.FindObjectOfType<T> and Type.Instance."""
+    if want_findobject and findobject_packed:
+        p("/* Object.FindObjectOfType<T> — first live component index */")
+        for cname in findobject_packed:
+            idn = _c_ident(cname)
+            p("static int Object_FindObjectOfType_%s(int includeInactive) {"
+              % idn)
+            p("    int go, ci;")
+            if not want_ui:
+                p("    (void)includeInactive;")
+            p("    for (go = 0; go < _engine_go_count; go = go + 1) {")
+            if want_destroy:
+                p("        if (_engine_go_destroyed[go]) continue;")
+            p("        ci = _engine_go_%s[go];" % idn)
+            p("        if (ci < 0) continue;")
+            if want_ui:
+                p("        if (!includeInactive")
+                p("            && !_engine_go_active_in_hierarchy(go))")
+                p("            continue;")
+            p("        return ci;")
+            p("    }")
+            p("    return -1;")
+            p("}")
+            p("")
+        for cname in sorted(singleton_instance_types):
+            if cname not in plan["classes"]:
+                continue
+            idn = _c_ident(cname)
+            p("/* %s.Instance — cache until destroyed / missing */"
+              % cname)
+            p("static int %s_instance = -1;" % idn)
+            p("static int %s_Instance(void) {" % idn)
+            p("    int go;")
+            p("    if (%s_instance >= 0) {" % idn)
+            p("        go = _engine_%s_go_of[%s_instance];" % (idn, idn))
+            p("        if (go >= 0 && go < _engine_go_count")
+            if want_destroy:
+                p("            && !_engine_go_destroyed[go]")
+            p("            && _engine_go_%s[go] == %s_instance)"
+              % (idn, idn))
+            p("            return %s_instance;" % idn)
+            p("        %s_instance = -1;" % idn)
+            p("    }")
+            p("    %s_instance = Object_FindObjectOfType_%s(1);"
+              % (idn, idn))
+            p("    return %s_instance;" % idn)
+            p("}")
+            p("")
+
+
+def _emit_engine_live_rotation(p, want_live_rot):
+    """emit_engine: Transform.Rotate and live rotation helpers."""
+    if want_live_rot:
+        p("/* Transform.Rotate(Space.Self): localRotation *= Euler(deg). */")
+        p("static void _engine_transform_rotate_local(")
+        p("    float *qx, float *qy, float *qz, float *qw,")
+        p("    float *m00, float *m01, float *m10, float *m11,")
+        p("    float ex_deg, float ey_deg, float ez_deg) {")
+        p("    float hx = ex_deg * 0.008726646259971648f;")
+        p("    float hy = ey_deg * 0.008726646259971648f;")
+        p("    float hz = ez_deg * 0.008726646259971648f;")
+        p("    float cx = cosf(hx); float sx = sinf(hx);")
+        p("    float cy = cosf(hy); float sy = sinf(hy);")
+        p("    float cz = cosf(hz); float sz = sinf(hz);")
+        p("    float ex = sx * cy * cz + cx * sy * sz;")
+        p("    float ey = cx * sy * cz - sx * cy * sz;")
+        p("    float ez = cx * cy * sz - sx * sy * cz;")
+        p("    float ew = cx * cy * cz + sx * sy * sz;")
+        p("    float nx = (*qw) * ex + (*qx) * ew + (*qy) * ez - (*qz) * ey;")
+        p("    float ny = (*qw) * ey - (*qx) * ez + (*qy) * ew + (*qz) * ex;")
+        p("    float nz = (*qw) * ez + (*qx) * ey - (*qy) * ex + (*qz) * ew;")
+        p("    float nw = (*qw) * ew - (*qx) * ex - (*qy) * ey - (*qz) * ez;")
+        p("    float m = sqrtf(nx * nx + ny * ny + nz * nz + nw * nw);")
+        p("    if (m > 1e-8f) {")
+        p("        nx = nx / m; ny = ny / m; nz = nz / m; nw = nw / m;")
+        p("    } else {")
+        p("        nx = 0.f; ny = 0.f; nz = 0.f; nw = 1.f;")
+        p("    }")
+        p("    *qx = nx; *qy = ny; *qz = nz; *qw = nw;")
+        p("    /* Ortho XY basis: R * (lx,ly,0) — X/Y tilt foreshortens. */")
+        p("    *m00 = 1.f - 2.f * (ny * ny + nz * nz);")
+        p("    *m01 = 2.f * (nx * ny - nz * nw);")
+        p("    *m10 = 2.f * (nx * ny + nz * nw);")
+        p("    *m11 = 1.f - 2.f * (nx * nx + nz * nz);")
+        p("}")
+        p("")
+        p("/* Quaternion.LookRotation(forward, up) → local quat + XY basis. */")
+        p("static void _engine_quat_look_rotation(")
+        p("    float *qx, float *qy, float *qz, float *qw,")
+        p("    float *m00, float *m01, float *m10, float *m11,")
+        p("    float dx, float dy, float dz,")
+        p("    float ux, float uy, float uz) {")
+        p("    float len = sqrtf(dx * dx + dy * dy + dz * dz);")
+        p("    float rx, ry, rz, rlen;")
+        p("    float m00r, m01r, m02r, m10r, m11r, m12r, m20r, m21r, m22r;")
+        p("    float trace, s, nx, ny, nz, nw;")
+        p("    float uxi = ux, uyi = uy, uzi = uz;")
+        p("    if (len < 1e-8f) {")
+        p("        *qx = 0.f; *qy = 0.f; *qz = 0.f; *qw = 1.f;")
+        p("        *m00 = 1.f; *m01 = 0.f; *m10 = 0.f; *m11 = 1.f;")
+        p("        return;")
+        p("    }")
+        p("    dx = dx / len; dy = dy / len; dz = dz / len;")
+        p("    rx = uyi * dz - uzi * dy;")
+        p("    ry = uzi * dx - uxi * dz;")
+        p("    rz = uxi * dy - uyi * dx;")
+        p("    rlen = sqrtf(rx * rx + ry * ry + rz * rz);")
+        p("    if (rlen < 1e-6f) {")
+        p("        uxi = 0.f; uyi = 0.f; uzi = 1.f;")
+        p("        rx = uyi * dz - uzi * dy;")
+        p("        ry = uzi * dx - uxi * dz;")
+        p("        rz = uxi * dy - uyi * dx;")
+        p("        rlen = sqrtf(rx * rx + ry * ry + rz * rz);")
+        p("        if (rlen < 1e-8f) {")
+        p("            *qx = 0.f; *qy = 0.f; *qz = 0.f; *qw = 1.f;")
+        p("            *m00 = 1.f; *m01 = 0.f; *m10 = 0.f; *m11 = 1.f;")
+        p("            return;")
+        p("        }")
+        p("    }")
+        p("    rx = rx / rlen; ry = ry / rlen; rz = rz / rlen;")
+        p("    ux = dy * rz - dz * ry;")
+        p("    uy = dz * rx - dx * rz;")
+        p("    uz = dx * ry - dy * rx;")
+        p("    /* Columns = right, up, forward (Unity LookRotation). */")
+        p("    m00r = rx; m01r = ux; m02r = dx;")
+        p("    m10r = ry; m11r = uy; m12r = dy;")
+        p("    m20r = rz; m21r = uz; m22r = dz;")
+        p("    trace = m00r + m11r + m22r;")
+        p("    if (trace > 0.f) {")
+        p("        s = 0.5f / sqrtf(trace + 1.f);")
+        p("        nw = 0.25f / s;")
+        p("        nx = (m21r - m12r) * s;")
+        p("        ny = (m02r - m20r) * s;")
+        p("        nz = (m10r - m01r) * s;")
+        p("    } else if (m00r > m11r && m00r > m22r) {")
+        p("        s = 2.f * sqrtf(1.f + m00r - m11r - m22r);")
+        p("        nw = (m21r - m12r) / s;")
+        p("        nx = 0.25f * s;")
+        p("        ny = (m01r + m10r) / s;")
+        p("        nz = (m02r + m20r) / s;")
+        p("    } else if (m11r > m22r) {")
+        p("        s = 2.f * sqrtf(1.f + m11r - m00r - m22r);")
+        p("        nw = (m02r - m20r) / s;")
+        p("        nx = (m01r + m10r) / s;")
+        p("        ny = 0.25f * s;")
+        p("        nz = (m12r + m21r) / s;")
+        p("    } else {")
+        p("        s = 2.f * sqrtf(1.f + m22r - m00r - m11r);")
+        p("        nw = (m10r - m01r) / s;")
+        p("        nx = (m02r + m20r) / s;")
+        p("        ny = (m12r + m21r) / s;")
+        p("        nz = 0.25f * s;")
+        p("    }")
+        p("    *qx = nx; *qy = ny; *qz = nz; *qw = nw;")
+        p("    *m00 = 1.f - 2.f * (ny * ny + nz * nz);")
+        p("    *m01 = 2.f * (nx * ny - nz * nw);")
+        p("    *m10 = 2.f * (nx * ny + nz * nw);")
+        p("    *m11 = 1.f - 2.f * (nx * nx + nz * nz);")
+        p("}")
+        p("")
+        p("/* Transform.LookAt: localRotation = LookRotation(to-from, up). */")
+        p("static void _engine_transform_look_at(")
+        p("    float *qx, float *qy, float *qz, float *qw,")
+        p("    float *m00, float *m01, float *m10, float *m11,")
+        p("    float fx, float fy, float fz,")
+        p("    float tx, float ty, float tz) {")
+        p("    float dx = tx - fx;")
+        p("    float dy = ty - fy;")
+        p("    float dz = tz - fz;")
+        p("    _engine_quat_look_rotation(")
+        p("        qx, qy, qz, qw, m00, m01, m10, m11,")
+        p("        dx, dy, dz, 0.f, 1.f, 0.f);")
+        p("}")
+        p("")
+        p("/* Transform.eulerAngles get: quat → degrees (Unity ZXY). */")
+        p("static void _engine_quat_to_euler_deg(")
+        p("    float qx, float qy, float qz, float qw,")
+        p("    float *ex, float *ey, float *ez) {")
+        p("    float sqx = qx * qx;")
+        p("    float sqy = qy * qy;")
+        p("    float sqz = qz * qz;")
+        p("    float sqw = qw * qw;")
+        p("    float unit = sqx + sqy + sqz + sqw;")
+        p("    float test = qx * qy + qz * qw;")
+        p("    float rad2deg = 57.29577951308232f;")
+        p("    if (test > 0.499f * unit) {")
+        p("        *ey = 2.f * atan2f(qx, qw) * rad2deg;")
+        p("        *ex = 90.f;")
+        p("        *ez = 0.f;")
+        p("    } else if (test < -0.499f * unit) {")
+        p("        *ey = -2.f * atan2f(qx, qw) * rad2deg;")
+        p("        *ex = -90.f;")
+        p("        *ez = 0.f;")
+        p("    } else {")
+        p("        *ey = atan2f(2.f * qy * qw - 2.f * qx * qz,")
+        p("                    sqx - sqy - sqz + sqw) * rad2deg;")
+        p("        *ex = asinf(2.f * test / unit) * rad2deg;")
+        p("        *ez = atan2f(2.f * qx * qw - 2.f * qy * qz,")
+        p("                    -sqx + sqy - sqz + sqw) * rad2deg;")
+        p("    }")
+        p("}")
+        p("")
+        p("/* Transform.eulerAngles set: localRotation = Euler(deg). */")
+        p("static void _engine_transform_set_euler(")
+        p("    float *qx, float *qy, float *qz, float *qw,")
+        p("    float *m00, float *m01, float *m10, float *m11,")
+        p("    float ex_deg, float ey_deg, float ez_deg) {")
+        p("    float hx = ex_deg * 0.008726646259971648f;")
+        p("    float hy = ey_deg * 0.008726646259971648f;")
+        p("    float hz = ez_deg * 0.008726646259971648f;")
+        p("    float cx = cosf(hx); float sx = sinf(hx);")
+        p("    float cy = cosf(hy); float sy = sinf(hy);")
+        p("    float cz = cosf(hz); float sz = sinf(hz);")
+        p("    float nx = sx * cy * cz + cx * sy * sz;")
+        p("    float ny = cx * sy * cz - sx * cy * sz;")
+        p("    float nz = cx * cy * sz - sx * sy * cz;")
+        p("    float nw = cx * cy * cz + sx * sy * sz;")
+        p("    *qx = nx; *qy = ny; *qz = nz; *qw = nw;")
+        p("    *m00 = 1.f - 2.f * (ny * ny + nz * nz);")
+        p("    *m01 = 2.f * (nx * ny - nz * nw);")
+        p("    *m10 = 2.f * (nx * ny + nz * nw);")
+        p("    *m11 = 1.f - 2.f * (nx * nx + nz * nz);")
+        p("}")
+        p("")
+        p("/* Transform.rotation set: localRotation = quat (unparented≈world). */")
+        p("static void _engine_transform_set_quat(")
+        p("    float *qx, float *qy, float *qz, float *qw,")
+        p("    float *m00, float *m01, float *m10, float *m11,")
+        p("    float nx, float ny, float nz, float nw) {")
+        p("    float m = sqrtf(nx * nx + ny * ny + nz * nz + nw * nw);")
+        p("    if (m > 1e-8f) {")
+        p("        nx = nx / m; ny = ny / m; nz = nz / m; nw = nw / m;")
+        p("    } else {")
+        p("        nx = 0.f; ny = 0.f; nz = 0.f; nw = 1.f;")
+        p("    }")
+        p("    *qx = nx; *qy = ny; *qz = nz; *qw = nw;")
+        p("    *m00 = 1.f - 2.f * (ny * ny + nz * nz);")
+        p("    *m01 = 2.f * (nx * ny - nz * nw);")
+        p("    *m10 = 2.f * (nx * ny + nz * nw);")
+        p("    *m11 = 1.f - 2.f * (nx * nx + nz * nz);")
+        p("}")
+        p("")
+        p("/* Quaternion.Slerp(a, b, t) — shortest-path spherical lerp. */")
+        p("static void _engine_quat_slerp(")
+        p("    float ax, float ay, float az, float aw,")
+        p("    float bx, float by, float bz, float bw,")
+        p("    float t,")
+        p("    float *ox, float *oy, float *oz, float *ow) {")
+        p("    float dot = ax * bx + ay * by + az * bz + aw * bw;")
+        p("    float theta, st, wa, wb, nx, ny, nz, nw, m;")
+        p("    if (t <= 0.f) {")
+        p("        *ox = ax; *oy = ay; *oz = az; *ow = aw;")
+        p("        return;")
+        p("    }")
+        p("    if (t >= 1.f) {")
+        p("        *ox = bx; *oy = by; *oz = bz; *ow = bw;")
+        p("        return;")
+        p("    }")
+        p("    if (dot < 0.f) {")
+        p("        bx = -bx; by = -by; bz = -bz; bw = -bw;")
+        p("        dot = -dot;")
+        p("    }")
+        p("    if (dot > 0.9995f) {")
+        p("        nx = ax + t * (bx - ax);")
+        p("        ny = ay + t * (by - ay);")
+        p("        nz = az + t * (bz - az);")
+        p("        nw = aw + t * (bw - aw);")
+        p("    } else {")
+        p("        if (dot > 1.f) dot = 1.f;")
+        p("        theta = acosf(dot);")
+        p("        st = sinf(theta);")
+        p("        if (st < 1e-8f) {")
+        p("            *ox = ax; *oy = ay; *oz = az; *ow = aw;")
+        p("            return;")
+        p("        }")
+        p("        wa = sinf((1.f - t) * theta) / st;")
+        p("        wb = sinf(t * theta) / st;")
+        p("        nx = wa * ax + wb * bx;")
+        p("        ny = wa * ay + wb * by;")
+        p("        nz = wa * az + wb * bz;")
+        p("        nw = wa * aw + wb * bw;")
+        p("    }")
+        p("    m = sqrtf(nx * nx + ny * ny + nz * nz + nw * nw);")
+        p("    if (m > 1e-8f) {")
+        p("        *ox = nx / m; *oy = ny / m; *oz = nz / m; *ow = nw / m;")
+        p("    } else {")
+        p("        *ox = 0.f; *oy = 0.f; *oz = 0.f; *ow = 1.f;")
+        p("    }")
+        p("}")
+        p("")
+        p("/* Quaternion.Inverse(q) — conjugate / |q|^2 (Unity). */")
+        p("static void _engine_quat_inverse(")
+        p("    float x, float y, float z, float w,")
+        p("    float *ox, float *oy, float *oz, float *ow) {")
+        p("    float n2 = x * x + y * y + z * z + w * w;")
+        p("    float inv;")
+        p("    if (n2 < 1e-20f) {")
+        p("        *ox = 0.f; *oy = 0.f; *oz = 0.f; *ow = 1.f;")
+        p("        return;")
+        p("    }")
+        p("    inv = 1.f / n2;")
+        p("    *ox = -x * inv;")
+        p("    *oy = -y * inv;")
+        p("    *oz = -z * inv;")
+        p("    *ow = w * inv;")
+        p("}")
+        p("")
+
+
+def _emit_engine_static_collections(_emitted_coll, p, plan):
+    """emit_engine: Class-level static List / Dictionary storage."""
+    for cname, cl in sorted(plan["classes"].items()):
+        idn = _c_ident(cname)
+        cap = max(1, int(cl.get("n") or 0))
+        for f in cl.get("class_consts") or []:
+            if _list_elem_name(f.get("ty") or ""):
+                elem = _list_elem_name(f["ty"])
+                p("static std::vector<%s> %s_%s;" % (
+                    _list_elem_c_ty(elem, plan), idn, f["name"]))
+                _emitted_coll = True
+            elif _static_ref_array(f, plan):
+                # Static T[] of a packed class / authored interface: the
+                # array the Extensions Add/Remove kept copying.
+                _elem, _iface = _static_ref_array(f, plan)
+                p("static std::vector<%s> %s_%s;" % (
+                    _IREF_TYPE if _iface else "int", idn, f["name"]))
+                _emitted_coll = True
+            elif _dict_kv_names(f.get("ty") or ""):
+                k, v = _dict_kv_names(f["ty"])
+                p("static std::map<%s, %s> %s_%s;" % (
+                    _collection_elem_c_ty(k, plan),
+                    _collection_elem_c_ty(v, plan),
+                    idn, f["name"]))
+                _emitted_coll = True
+        for f in cl.get("list_fields") or []:
+            elem = _list_elem_name(f.get("ty") or "")
+            if not elem:
+                continue
+            p("static std::vector<%s> %s_%s[%d];" % (
+                _list_elem_c_ty(elem, plan), idn, f["name"], cap))
+            _emitted_coll = True
+        for f in cl.get("ref_array_fields") or []:
+            p("static std::vector<int> %s_%s;" % (idn, f["name"]))
+            _emitted_coll = True
+        for f in cl.get("dict_fields") or []:
+            kv = _dict_kv_names(f.get("ty") or "")
+            if not kv:
+                continue
+            k, v = kv
+            p("static std::map<%s, %s> %s_%s[%d];" % (
+                _collection_elem_c_ty(k, plan),
+                _collection_elem_c_ty(v, plan),
+                idn, f["name"], cap))
+            _emitted_coll = True
+    return _emitted_coll
+
+
+def _emit_engine_class_groups(
+        class_properties, emitted_syms, lines, methods_by, p, plan, want_destroy,
+        want_go_tables):
+    """emit_engine: Per-class groups: instance arrays, accessors, statics and script methods."""
+    for cname, cl in sorted(plan["classes"].items()):
+        idn = _c_ident(cname)
+        p("/* ---- %s group: instance array is defined in data.c ---- */" % idn)
+        p("#define %s_AT(i) (_%s_inst_array[(i)])" % (idn, idn))
+        p("")
+        # Class-level const / static fields (FRAME_CNT, LOG_FILE_PATH, …).
+        data_path = plan.get("data_path") or ""
+        persistent_path = plan.get("persistent_data_path") or ""
+        for f in cl.get("class_consts") or []:
+            fname = f["name"]
+            default = f.get("default")
+            if f.get("ty") == "string":
+                if isinstance(default, dict) and default.get("kind") == "dataPath+":
+                    path = data_path + (default.get("suffix") or "")
+                elif isinstance(default, dict) and default.get("kind") == "dataPath":
+                    path = data_path
+                elif (isinstance(default, dict)
+                      and default.get("kind") == "persistentDataPath+"):
+                    path = persistent_path + (default.get("suffix") or "")
+                elif (isinstance(default, dict)
+                      and default.get("kind") == "persistentDataPath"):
+                    path = persistent_path
+                elif isinstance(default, str):
+                    path = default
+                else:
+                    path = ""
+                p("static const char %s_%s[] = %s;" % (
+                    idn, fname, _c_string(path)))
+            elif f.get("ty") == "bool":
+                # `static bool flag;` / `= false` — mutable unless C# const.
+                truthy = default in (True, 1, "true", "True")
+                init = 1 if truthy else 0
+                if f.get("const"):
+                    p("static const int %s_%s = %d;" % (idn, fname, init))
+                else:
+                    p("static int %s_%s = %d;" % (idn, fname, init))
+            elif (isinstance(default, (int, float))
+                  or (default is None
+                      and f.get("ty") in _STATIC_NUMERIC_TYPES)):
+                # C# `const` stays const; a plain `static` is mutable, and an
+                # uninitialized one starts at 0 as in C#.
+                qual = "static const" if f.get("const") else "static"
+                val = default if default is not None else 0
+                if f.get("ty") in ("float", "double"):
+                    p("%s float %s_%s = %sf;" % (
+                        qual, idn, fname, repr(float(val))))
+                else:
+                    p("%s int %s_%s = %d;" % (
+                        qual, idn, fname, int(val)))
+            elif f.get("ty") in ("StreamWriter", "StreamReader"):
+                p("static FILE *%s_%s;" % (idn, fname))
+            # List / Dictionary / SortedList / ref arrays: preamble above.
+        if any(
+                f.get("ty") == "string"
+                or f.get("ty") == "bool"
+                or isinstance(f.get("default"), (int, float))
+                or (f.get("default") is None
+                    and f.get("ty") in _STATIC_NUMERIC_TYPES)
+                or f.get("ty") in ("StreamWriter", "StreamReader")
+                for f in (cl.get("class_consts") or [])):
+            p("")
+        # Position accessors: SoA table or AoS fields.
+        if cl.get("soa_dims"):
+            logical = _soa_axis_count(cl)
+            axes = ("pos_x", "pos_y", "pos_z")[:logical]
+            for axis_i, axis in enumerate(axes):
+                p("static float %s_get_%s(unsigned i) { return _%s_pos[i][%d]; }"
+                  % (idn, axis, idn, axis_i))
+                p("static void %s_set_%s(unsigned i, float v) { _%s_pos[i][%d] = v; }"
+                  % (idn, axis, idn, axis_i))
+        # Accessors so generated script C never writes a pointer.
+        for name, ty, bits, kind in cl["members"]:
+            if kind == "f16":
+                p("static float %s_get_%s(unsigned i) { return f16_to_f32(%s_AT(i).%s); }"
+                  % (idn, name, idn, name))
+                p("static void %s_set_%s(unsigned i, float v) { %s_AT(i).%s = f32_to_f16(v); }"
+                  % (idn, name, idn, name))
+            elif kind == "f32":
+                p("static float %s_get_%s(unsigned i) { return %s_AT(i).%s; }"
+                  % (idn, name, idn, name))
+                p("static void %s_set_%s(unsigned i, float v) { %s_AT(i).%s = v; }"
+                  % (idn, name, idn, name))
+            elif kind == "go" or str(kind).startswith("idx:"):
+                # A handle: a GameObject index, or an index into another
+                # class's array, or null. Null is the field's all-ones value
+                # -- an index can be 0, and a narrow unsigned field cannot
+                # hold -1 -- read back as -1, so `x != null` (`!= -1`)
+                # compares signed with signed.
+                sent = _idx_null(bits)
+                p("static int %s_get_%s(unsigned i) { unsigned v = %s_AT(i).%s;"
+                  " return v == %su ? -1 : (int)v; }"
+                  % (idn, name, idn, name, sent))
+                p("static void %s_set_%s(unsigned i, int v) {"
+                  " %s_AT(i).%s = v < 0 ? %su : (unsigned)v; }"
+                  % (idn, name, idn, name, sent))
+            else:
+                p("static unsigned %s_get_%s(unsigned i) { return (unsigned)%s_AT(i).%s; }"
+                  % (idn, name, idn, name))
+                p("static void %s_set_%s(unsigned i, unsigned v) { %s_AT(i).%s = v; }"
+                  % (idn, name, idn, name))
+        p("")
+        emit_names = _reachable_emit_methods(
+            [m for _c, m in methods_by.get(cname, [])])
+        overloaded = _overload_method_names(
+            [m for _c, m in methods_by.get(cname, [])
+             if m["name"] in emit_names and m["name"] != "OnEnable"])
+        used_syms = set()
+        # Forward-declare helpers so Start can call Do before Do's body.
+        for c, m in methods_by.get(cname, []):
+            if m["name"] == "OnEnable" or m["name"] not in emit_names:
+                continue
+            if cl.get("ctor_forbidden"):
+                continue
+            if m["name"] in _UNITY_EMIT_MESSAGES:
+                continue
+            if m.get("static"):
+                continue
+            sym = _method_c_symbol(
+                idn, m["name"], m.get("args") or "",
+                m["name"] in overloaded)
+            coll_param = None
+            if m["name"] in _COLLISION2D_MSGS:
+                coll_param = _collision2d_arg_name(m.get("args") or "")
+                if not coll_param:
+                    continue
+                p("static void %s(unsigned i, int %s);"
+                  % (sym, coll_param))
+            else:
+                plist = _method_c_params(m.get("args") or "")
+                if plist:
+                    p("static void %s(unsigned i, %s);" % (sym, plist))
+                else:
+                    p("static void %s(unsigned i);" % sym)
+        for c, m in methods_by.get(cname, []):
+            if m["name"] == "OnEnable":
+                continue
+            if m["name"] not in emit_names:
+                continue
+            # TypeInitializer failed — do not lower or run script methods.
+            if cl.get("ctor_forbidden"):
+                continue
+            coll_param = None
+            if m["name"] in _COLLISION2D_MSGS:
+                coll_param = _collision2d_arg_name(m.get("args") or "")
+                if not coll_param:
+                    continue
+            site = {
+                "class": cname,
+                "method": m["name"],
+                "path": _assets_rel_path(c.get("path") or cl.get("path") or ""),
+                "body_abs": int(m.get("body_abs") or 0),
+                "file_text": c.get("file_text") or "",
+            }
+            body = _lower_method_body(
+                m["body"], cl, plan, site=site,
+                collision2d_param=coll_param)
+            # Site marker so crust/shivyc failures map back to C#.
+            cs_line = 1
+            ft = site.get("file_text") or ""
+            if ft and site.get("body_abs"):
+                cs_line = ft.count("\n", 0, int(site["body_abs"])) + 1
+            p("/* unity_pack:site %s:%d */" % (
+                site.get("path") or "<cs>", cs_line))
+            sym = _method_c_symbol(
+                idn, m["name"], m.get("args") or "",
+                m["name"] in overloaded)
+            # Same name+args twice (nested leak / duplicate analysis) → unique.
+            if sym in used_syms:
+                n = 2
+                while ("%s_%d" % (sym, n)) in used_syms:
+                    n += 1
+                sym = "%s_%d" % (sym, n)
+            used_syms.add(sym)
+            if not m.get("static") and not (m.get("args") or "").strip():
+                emitted_syms.setdefault((cname, m["name"]), sym)
+            if coll_param:
+                p("static void %s(unsigned i, int %s) {"
+                  % (sym, coll_param))
+            elif m.get("static"):
+                plist = _method_c_params(m.get("args") or "")
+                p("static void %s(%s) {" % (
+                    sym, plist if plist else "void"))
+                # Static bodies may still touch instance fields via bare names.
+                p("    unsigned i = 0;")
+            else:
+                plist = _method_c_params(m.get("args") or "")
+                if plist:
+                    p("static void %s(unsigned i, %s) {" % (sym, plist))
+                else:
+                    p("static void %s(unsigned i) {" % sym)
+            # Methods that still contain unlowered C# become stubs (Unity
+            # messages included — empty body beats crust parse failures).
+            emitted = set()
+            if coll_param:
+                emitted.add(coll_param)
+            # Instance + static param names are known locals for residual checks.
+            for prm in cs2cpp.parse_params(m.get("args") or ""):
+                emitted.add(prm.name)
+            why = _unlowered_csharp(
+                body, args_str=m.get("args") or "", emitted_params=emitted,
+                known_types=_engine_types_declared(lines),
+                properties=class_properties.get(cname) or ())
+            # MB methods always emit as `static void`. A non-void C# return
+            # (CompareTo → int, bool helpers, …) that otherwise lowers cleanly
+            # still leaves `return 1;` and crust refuses CS0000.
+            if why is None:
+                ret_cs = (m.get("ret") or "void").strip()
+                ret_base = ret_cs.split(".")[-1]
+                if ret_base and ret_base != "void":
+                    why = (
+                        "non-void return type (methods emit as static void)",
+                        ret_cs,
+                    )
+                elif re.search(r"(?m)^\s*return\s+[^;\s]", body):
+                    why = (
+                        "valued return in void method emit",
+                        "return …;",
+                    )
+                else:
+                    hit = _writes_unstored_field(m.get("body") or "", cl, plan)
+                    if hit:
+                        why = (
+                            "field the pack keeps no storage for (a "
+                            "Transform / component reference, or one "
+                            "declared on a base class)",
+                            hit,
+                        )
+            if why is not None:
+                _report_stub(plan, site, cl, m, why)
+                if not m.get("static"):
+                    p("    (void)i;")
+                if coll_param:
+                    p("    (void)%s;" % coll_param)
+                for pname in sorted(emitted):
+                    if pname != coll_param:
+                        p("    (void)%s;" % pname)
+                # Keep lowered SetActive even when the rest of Awake stubs —
+                # SettingsMenu.Awake → gameObject.SetActive(false).
+                # Only a line that is itself fully lowered: the call can sit
+                # inside something that is not -- a lambda passed to a
+                # static helper -- and copying that line brought the C#
+                # into the stub, which crust then refused.
+                kt = _engine_types_declared(lines)
+                for line in body.split("\n"):
+                    s = line.strip()
+                    if "GameObject_SetActive(" in s and \
+                            _unlowered_csharp(s, known_types=kt) is None:
+                        p("    " + s.rstrip(";").rstrip() + ";")
+                p("    /* unlowered C# (GetComponentsInChildren / T[] / "
+                  "leftover Instantiate / lambda / Type.Method) — stub */")
+            else:
+                for line in body.split("\n"):
+                    if line.strip():
+                        p("    " + line.rstrip())
+            p("}")
+            p("")
+
+        # Tick: Start once (Unity), then FixedUpdate / Update.
+        # Script exceptions longjmp here — Unity continues the player loop.
+        def _call_script(method, indent="            "):
+            if want_go_tables:
+                p(indent + "_engine_in_script = 1;")
+                p(indent + "if (setjmp(_engine_script_jmp) == 0)")
+                p(indent + "    %s_%s((unsigned)n);" % (idn, method))
+                p(indent + "_engine_in_script = 0;")
+            else:
+                p(indent + "%s_%s((unsigned)n);" % (idn, method))
+
+        has_awake = any(m["name"] == "Awake"
+                        for _c, m in methods_by.get(cname, []))
+        has_start = any(m["name"] == "Start"
+                        for _c, m in methods_by.get(cname, []))
+        has_fixed = any(m["name"] == "FixedUpdate"
+                        for _c, m in methods_by.get(cname, []))
+        has_update = any(m["name"] == "Update"
+                         for _c, m in methods_by.get(cname, []))
+        ctor_forbidden = list(cl.get("ctor_forbidden") or [])
+        if ctor_forbidden:
+            # Unity TypeInitializationException — spam each frame, no script.
+            fb = ctor_forbidden[0]
+            api = fb.get("api") or "persistentDataPath"
+            line = int(fb.get("line") or 0)
+            spath = _assets_rel_path(
+                cl.get("script_path") or cl.get("path") or "")
+            p("void %s_FixedTick(void) { /* type init failed */ }" % idn)
+            p("")
+            p("void %s_Tick(void) {" % idn)
+            p("    int n;")
+            p("    for (n = 0; n < _%s_inst_count; n = n + 1) {" % idn)
+            p("        const char *_gon = \"\";")
+            if want_go_tables:
+                p("        {")
+                p("            int _dgo = _engine_go_of_%s((unsigned)n);" % idn)
+                p("            if (_dgo >= 0 && _dgo < _engine_go_count)")
+                p("                _gon = _engine_go_name[_dgo];")
+                p("        }")
+            else:
+                # Fall back to authored instance name.
+                for i, o in enumerate(cl.get("instances") or []):
+                    if i == 0:
+                        p("        if (n == 0) _gon = %s;"
+                          % _c_string(o.get("name") or cname))
+                    else:
+                        p("        else if (n == %d) _gon = %s;"
+                          % (i, _c_string(o.get("name") or cname)))
+            p("        _engine_unity_ctor_forbidden(")
+            p("            %s, %s, _gon, %s, %d);"
+              % (_c_string(api), _c_string(cname), _c_string(spath), line))
+            p("    }")
+            p("}")
+            p("")
+            continue
+
+        if has_awake or has_start:
+            p("static int _%s_started = 0;" % idn)
+        p("void %s_FixedTick(void) {" % idn)
+        if has_fixed:
+            p("    int n;")
+            p("    for (n = 0; n < _%s_inst_count; n = n + 1) {" % idn)
+            _call_script("FixedUpdate", "        ")
+            p("    }")
+        else:
+            p("    /* no FixedUpdate */")
+        p("}")
+        p("")
+        p("void %s_Tick(void) {" % idn)
+        if has_awake or has_start or has_update:
+            p("    int n;")
+        if has_awake or has_start:
+            p("    if (!_%s_started) {" % idn)
+            p("        _%s_started = 1;" % idn)
+            if has_awake:
+                p("        for (n = 0; n < _%s_inst_count; n = n + 1) {"
+                  % idn)
+                _call_script("Awake", "            ")
+                p("        }")
+            if has_start:
+                p("        for (n = 0; n < _%s_inst_count; n = n + 1) {"
+                  % idn)
+                _call_script("Start", "            ")
+                p("        }")
+            p("    }")
+        if has_update:
+            p("    for (n = 0; n < _%s_inst_count; n = n + 1) {" % idn)
+            if want_destroy and plan.get("go_names"):
+                p("        {")
+                p("            int _dgo = _engine_go_of_%s((unsigned)n);" % idn)
+                p("            if (_dgo >= 0 && _engine_go_destroyed[_dgo])")
+                p("                continue;")
+                p("        }")
+            _call_script("Update", "        ")
+            p("    }")
+        elif not has_awake and not has_start:
+            p("    /* no Update */")
+        p("}")
+        p("")
+
+
+def _emit_engine_world_positions(
+        class_ids, p, plan, want_get_sibling, want_go_tables, want_set_parent):
+    """emit_engine: World positions through Transform parents."""
+    if plan.get("has_transform_parents") or want_set_parent:
+        for cname, cl in sorted(plan["classes"].items()):
+            idn = _c_ident(cname)
+            if not _class_has_position(cl):
+                continue
+            n = max(1, cl["n"] + _mb_pool_extra(plan, cname))
+            pcs = []
+            pis = []
+            for o in cl["instances"]:
+                pcs.append(str(int(o.get("xf_parent_class_id", -1))))
+                pis.append(str(int(o.get("xf_parent_inst") or 0)))
+            for _pad in range(_mb_pool_extra(plan, cname)):
+                pcs.append("-1")
+                pis.append("0")
+            while len(pcs) < n:
+                pcs.append("-1")
+                pis.append("0")
+            if want_set_parent:
+                p("static int _%s_xf_parent_class[%d] = { %s };"
+                  % (idn, n, ", ".join(pcs)))
+                p("static unsigned _%s_xf_parent_inst[%d] = { %s };"
+                  % (idn, n, ", ".join(pis)))
+            else:
+                p("static const int _%s_xf_parent_class[%d] = { %s };"
+                  % (idn, n, ", ".join(pcs)))
+                p("static const unsigned _%s_xf_parent_inst[%d] = { %s };"
+                  % (idn, n, ", ".join(pis)))
+        p("")
+        p("/* Live m_Father — world position follows parent at runtime. */")
+        p("static void _engine_world_pos(int class_id, unsigned inst,")
+        p("                             float *x, float *y, float *z,")
+        p("                             int depth) {")
+        p("    float lx = 0.f, ly = 0.f, lz = 0.f;")
+        p("    int pc = -1;")
+        p("    unsigned pi = 0u;")
+        p("    if (depth > 64) { *x = 0.f; *y = 0.f; *z = 0.f; return; }")
+        p("    switch (class_id) {")
+        for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
+            idn = _c_ident(cname)
+            cl = plan["classes"][cname]
+            if not _class_has_position(cl):
+                continue
+            p("    case %d:" % cid)
+            p("        lx = %s_get_pos_x(inst);" % idn)
+            p("        ly = %s_get_pos_y(inst);" % idn)
+            if cl.get("two_d"):
+                p("        lz = 0.f;")
+            else:
+                p("        lz = %s_get_pos_z(inst);" % idn)
+            p("        pc = _%s_xf_parent_class[inst];" % idn)
+            p("        pi = _%s_xf_parent_inst[inst];" % idn)
+            p("        break;")
+        p("    default:")
+        p("        *x = 0.f; *y = 0.f; *z = 0.f;")
+        p("        return;")
+        p("    }")
+        p("    if (pc < 0) { *x = lx; *y = ly; *z = lz; return; }")
+        p("    {")
+        p("        float px, py, pz;")
+        p("        _engine_world_pos(pc, pi, &px, &py, &pz, depth + 1);")
+        p("        *x = px + lx;")
+        p("        *y = py + ly;")
+        p("        *z = pz + lz;")
+        p("    }")
+        p("}")
+        p("")
+
+        if want_set_parent and want_go_tables:
+            go_n = max(1, len(plan.get("go_names") or []))
+            pos_classes = [
+                (cname, class_ids[cname], _c_ident(cname))
+                for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1])
+                if _class_has_position(plan["classes"][cname])
+            ]
+            p("/* GO → packed (class, inst) for SetParent / world composition. */")
+            p("static int _engine_go_xf(int go, int *oc, unsigned *oi) {")
+            p("    int inst;")
+            p("    if (go < 0 || go >= %d) return 0;" % go_n)
+            for cname, cid, idn in pos_classes:
+                p("    inst = _engine_go_%s[go];" % idn)
+                p("    if (inst >= 0) { *oc = %d; *oi = (unsigned)inst; return 1; }"
+                  % cid)
+            p("    return 0;")
+            p("}")
+            p("static void _engine_set_xf_parent(int child_go, int parent_go) {")
+            p("    int pc = -1;")
+            p("    unsigned pi = 0u;")
+            p("    int inst;")
+            p("    if (parent_go >= 0)")
+            p("        _engine_go_xf(parent_go, &pc, &pi);")
+            for cname, cid, idn in pos_classes:
+                p("    inst = _engine_go_%s[child_go];" % idn)
+                p("    if (inst >= 0) {")
+                p("        _%s_xf_parent_class[inst] = pc;" % idn)
+                p("        _%s_xf_parent_inst[inst] = pi;" % idn)
+                p("    }")
+            p("}")
+            p("static void _engine_set_local_pos_go(int go,")
+            p("    float lx, float ly, float lz) {")
+            p("    int inst;")
+            for cname, cid, idn in pos_classes:
+                cl = plan["classes"][cname]
+                if cl.get("static"):
+                    continue  # f16 pack — no setters
+                p("    inst = _engine_go_%s[go];" % idn)
+                p("    if (inst >= 0) {")
+                p("        %s_set_pos_x((unsigned)inst, lx);" % idn)
+                p("        %s_set_pos_y((unsigned)inst, ly);" % idn)
+                if not cl.get("two_d"):
+                    p("        %s_set_pos_z((unsigned)inst, lz);" % idn)
+                p("    }")
+            p("}")
+            p("/* Transform.SetParent(parent, worldPositionStays=true). */")
+            p("static void Transform_SetParent(int child, int parent,")
+            p("                               int world_stays) {")
+            p("    int guard = 0;")
+            p("    int g;")
+            p("    int cc = -1;")
+            p("    unsigned ci = 0u;")
+            p("    float wx = 0.f, wy = 0.f, wz = 0.f;")
+            p("    float px = 0.f, py = 0.f, pz = 0.f;")
+            if want_get_sibling:
+                p("    int old_parent, old_sib, i, max_sib;")
+            p("    if (child < 0 || child >= %d) return;" % go_n)
+            p("    if (parent == child) return;")
+            p("    if (parent >= %d) parent = -1;" % go_n)
+            p("    g = parent;")
+            p("    while (g >= 0 && guard < %d) {" % (go_n + 2))
+            p("        if (g == child) return;")
+            p("        g = _engine_go_parent[g];")
+            p("        guard = guard + 1;")
+            p("    }")
+            p("    if (world_stays && _engine_go_xf(child, &cc, &ci))")
+            p("        _engine_world_pos(cc, ci, &wx, &wy, &wz, 0);")
+            if want_get_sibling:
+                # Detach: close gap among old siblings; attach as last child.
+                p("    old_parent = _engine_go_parent[child];")
+                p("    old_sib = _engine_go_sib[child];")
+                p("    for (i = 0; i < %d; i = i + 1) {" % go_n)
+                p("        if (i == child) continue;")
+                p("        if (_engine_go_parent[i] == old_parent")
+                p("            && _engine_go_sib[i] > old_sib)")
+                p("            _engine_go_sib[i] = _engine_go_sib[i] - 1;")
+                p("    }")
+            p("    _engine_go_parent[child] = parent;")
+            if want_get_sibling:
+                p("    max_sib = -1;")
+                p("    for (i = 0; i < %d; i = i + 1) {" % go_n)
+                p("        if (i == child) continue;")
+                p("        if (_engine_go_parent[i] == parent")
+                p("            && _engine_go_sib[i] > max_sib)")
+                p("            max_sib = _engine_go_sib[i];")
+                p("    }")
+                p("    _engine_go_sib[child] = max_sib + 1;")
+            p("    _engine_set_xf_parent(child, parent);")
+            p("    if (world_stays && _engine_go_xf(child, &cc, &ci)) {")
+            p("        if (parent >= 0) {")
+            p("            int pc = -1;")
+            p("            unsigned pi = 0u;")
+            p("            if (_engine_go_xf(parent, &pc, &pi))")
+            p("                _engine_world_pos(pc, pi, &px, &py, &pz, 0);")
+            p("        }")
+            p("        _engine_set_local_pos_go(child,")
+            p("            wx - px, wy - py, wz - pz);")
+            p("    }")
+            p("}")
+            p("")
+
+
+def _emit_engine_transform_point(class_ids, p, plan, tp_classes):
+    """emit_engine: Transform.TransformPoint."""
+    if tp_classes:
+        # Unity Transform.TransformPoint: world = T + R * (S * local).
+        # T is live world position; R/S are this transform's live local basis.
+        # Parent chain translation matches _engine_world_pos (pack TRS subset).
+        p("/* Transform.TransformPoint — live local→world (current TRS). */")
+        p("static void _engine_transform_point(")
+        p("    float wx, float wy, float wz,")
+        p("    float m00, float m01, float m10, float m11,")
+        p("    float sx, float sy,")
+        p("    float lx, float ly, float lz,")
+        p("    float *ox, float *oy, float *oz) {")
+        p("    float px = lx * sx;")
+        p("    float py = ly * sy;")
+        p("    *ox = wx + m00 * px + m01 * py;")
+        p("    *oy = wy + m10 * px + m11 * py;")
+        p("    *oz = wz + lz;")
+        p("}")
+        p("")
+        has_parents = bool(plan.get("has_transform_parents"))
+        for cname in sorted(tp_classes):
+            if cname not in plan["classes"]:
+                continue
+            cl = plan["classes"][cname]
+            idn = _c_ident(cname)
+            cid = class_ids[cname]
+            p("static void %s_TransformPoint(unsigned i," % idn)
+            p("    float lx, float ly, float lz,")
+            p("    float *ox, float *oy, float *oz) {")
+            p("    float wx, wy, wz;")
+            if has_parents and _class_has_position(cl):
+                p("    _engine_world_pos(%d, i, &wx, &wy, &wz, 0);" % cid)
+            elif _class_has_position(cl):
+                p("    wx = %s_get_pos_x(i);" % idn)
+                p("    wy = %s_get_pos_y(i);" % idn)
+                if cl.get("two_d"):
+                    p("    wz = 0.f;")
+                else:
+                    p("    wz = %s_get_pos_z(i);" % idn)
+            else:
+                p("    wx = 0.f; wy = 0.f; wz = 0.f;")
+            p("    _engine_transform_point(")
+            p("        wx, wy, wz,")
+            p("        _%s_rot_m00[i], _%s_rot_m01[i]," % (idn, idn))
+            p("        _%s_rot_m10[i], _%s_rot_m11[i]," % (idn, idn))
+            p("        _%s_scale_x[i], _%s_scale_y[i]," % (idn, idn))
+            p("        lx, ly, lz, ox, oy, oz);")
+            p("}")
+            p("static float %s_TransformPoint_x(unsigned i," % idn)
+            p("    float lx, float ly, float lz) {")
+            p("    float ox, oy, oz;")
+            p("    %s_TransformPoint(i, lx, ly, lz, &ox, &oy, &oz);" % idn)
+            p("    return ox;")
+            p("}")
+            p("static float %s_TransformPoint_y(unsigned i," % idn)
+            p("    float lx, float ly, float lz) {")
+            p("    float ox, oy, oz;")
+            p("    %s_TransformPoint(i, lx, ly, lz, &ox, &oy, &oz);" % idn)
+            p("    return oy;")
+            p("}")
+            p("static float %s_TransformPoint_z(unsigned i," % idn)
+            p("    float lx, float ly, float lz) {")
+            p("    float ox, oy, oz;")
+            p("    %s_TransformPoint(i, lx, ly, lz, &ox, &oy, &oz);" % idn)
+            p("    return oz;")
+            p("}")
+            p("")
+
+
+def _emit_engine_transform_matrices(class_ids, matrix_classes, p, plan):
+    """emit_engine: Live localToWorld / worldToLocal matrices."""
+    if matrix_classes:
+        # Same affine subset as TransformPoint: T + R_xy * (S * p).
+        p("/* Live localToWorld / worldToLocal from current pos / rot / scale. */")
+        p("static Matrix4x4 _engine_matrix_identity(void) {")
+        p("    Matrix4x4 m;")
+        p("    m.m00 = 1.f; m.m01 = 0.f; m.m02 = 0.f; m.m03 = 0.f;")
+        p("    m.m10 = 0.f; m.m11 = 1.f; m.m12 = 0.f; m.m13 = 0.f;")
+        p("    m.m20 = 0.f; m.m21 = 0.f; m.m22 = 1.f; m.m23 = 0.f;")
+        p("    m.m30 = 0.f; m.m31 = 0.f; m.m32 = 0.f; m.m33 = 1.f;")
+        p("    return m;")
+        p("}")
+        p("static Matrix4x4 _engine_local_to_world_matrix(")
+        p("    float wx, float wy, float wz,")
+        p("    float r00, float r01, float r10, float r11,")
+        p("    float sx, float sy) {")
+        p("    Matrix4x4 m = _engine_matrix_identity();")
+        p("    m.m00 = r00 * sx; m.m01 = r01 * sy; m.m03 = wx;")
+        p("    m.m10 = r10 * sx; m.m11 = r11 * sy; m.m13 = wy;")
+        p("    m.m23 = wz;")
+        p("    return m;")
+        p("}")
+        p("static Matrix4x4 _engine_world_to_local_matrix(")
+        p("    float wx, float wy, float wz,")
+        p("    float r00, float r01, float r10, float r11,")
+        p("    float sx, float sy) {")
+        p("    Matrix4x4 m = _engine_matrix_identity();")
+        p("    float a00 = r00 * sx; float a01 = r01 * sy;")
+        p("    float a10 = r10 * sx; float a11 = r11 * sy;")
+        p("    float det = a00 * a11 - a01 * a10;")
+        p("    float inv00, inv01, inv10, inv11;")
+        p("    if (det > -1e-12f && det < 1e-12f) {")
+        p("        return m;")
+        p("    }")
+        p("    inv00 = a11 / det; inv01 = -a01 / det;")
+        p("    inv10 = -a10 / det; inv11 = a00 / det;")
+        p("    m.m00 = inv00; m.m01 = inv01;")
+        p("    m.m10 = inv10; m.m11 = inv11;")
+        p("    m.m03 = -(inv00 * wx + inv01 * wy);")
+        p("    m.m13 = -(inv10 * wx + inv11 * wy);")
+        p("    m.m23 = -wz;")
+        p("    return m;")
+        p("}")
+        p("")
+        has_parents = bool(plan.get("has_transform_parents"))
+        for cname in sorted(matrix_classes):
+            if cname not in plan["classes"]:
+                continue
+            cl = plan["classes"][cname]
+            idn = _c_ident(cname)
+            cid = class_ids[cname]
+
+            def _emit_world_xyz():
+                if has_parents and _class_has_position(cl):
+                    p("    _engine_world_pos(%d, i, &wx, &wy, &wz, 0);" % cid)
+                elif _class_has_position(cl):
+                    p("    wx = %s_get_pos_x(i);" % idn)
+                    p("    wy = %s_get_pos_y(i);" % idn)
+                    if cl.get("two_d"):
+                        p("    wz = 0.f;")
+                    else:
+                        p("    wz = %s_get_pos_z(i);" % idn)
+                else:
+                    p("    wx = 0.f; wy = 0.f; wz = 0.f;")
+
+            p("static Matrix4x4 %s_localToWorldMatrix(unsigned i) {" % idn)
+            p("    float wx, wy, wz;")
+            _emit_world_xyz()
+            p("    return _engine_local_to_world_matrix(")
+            p("        wx, wy, wz,")
+            p("        _%s_rot_m00[i], _%s_rot_m01[i]," % (idn, idn))
+            p("        _%s_rot_m10[i], _%s_rot_m11[i]," % (idn, idn))
+            p("        _%s_scale_x[i], _%s_scale_y[i]);" % (idn, idn))
+            p("}")
+            p("static Matrix4x4 %s_worldToLocalMatrix(unsigned i) {" % idn)
+            p("    float wx, wy, wz;")
+            _emit_world_xyz()
+            p("    return _engine_world_to_local_matrix(")
+            p("        wx, wy, wz,")
+            p("        _%s_rot_m00[i], _%s_rot_m01[i]," % (idn, idn))
+            p("        _%s_rot_m10[i], _%s_rot_m11[i]," % (idn, idn))
+            p("        _%s_scale_x[i], _%s_scale_y[i]);" % (idn, idn))
+            p("}")
+            p("")
+
+
+def _emit_engine_colliders_2d(
+        class_ids, col2d_list, collision2d_handlers, p, plan, want_col2d,
+        want_collision2d_msgs, want_go_tables):
+    """emit_engine: Collider2D centers and OnCollision*2D messages (physics is Box2D-Packed)."""
+    if want_col2d and col2d_list:
+        p("/* Authored BoxCollider2D / CircleCollider2D — centers for Box2D-Packed */")
+        p("static void _col2d_center(int ci, float *out_x, float *out_y) {")
+        p("    unsigned oi = (unsigned)_Collider2D_owner_inst[ci];")
+        p("    float px = 0.f, py = 0.f;")
+        p("    float c = _Collider2D_cos[ci], s = _Collider2D_sin[ci];")
+        p("    float ox = _Collider2D_ox[ci], oy = _Collider2D_oy[ci];")
+        p("    switch (_Collider2D_owner_class[ci]) {")
+        for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
+            idn = _c_ident(cname)
+            cl = plan["classes"][cname]
+            if not _class_has_position(cl):
+                continue
+            p("    case %d:" % cid)
+            if plan.get("has_transform_parents"):
+                p("        {")
+                p("            float wx, wy, wz;")
+                p("            _engine_world_pos(%d, oi, &wx, &wy, &wz, 0);"
+                  % cid)
+                p("            px = wx; py = wy;")
+                p("        }")
+            else:
+                p("        px = %s_get_pos_x(oi);" % idn)
+                p("        py = %s_get_pos_y(oi);" % idn)
+            p("        break;")
+        p("    default: break;")
+        p("    }")
+        p("    *out_x = px + c * ox - s * oy;")
+        p("    *out_y = py + s * ox + c * oy;")
+        p("}")
+        p("")
+        if want_collision2d_msgs:
+            nc = max(1, len(col2d_list))
+            max_pairs = max(1, nc * (nc - 1) // 2)
+            p("/* MonoBehaviour OnCollisionEnter/Stay/Exit2D after contacts */")
+            p("static int _col2d_contact_a[%d];" % max_pairs)
+            p("static int _col2d_contact_b[%d];" % max_pairs)
+            p("static int _col2d_contact_n;")
+            p("static int _col2d_prev_a[%d];" % max_pairs)
+            p("static int _col2d_prev_b[%d];" % max_pairs)
+            p("static int _col2d_prev_n;")
+            p("")
+            p("static void _col2d_add_contact(int a, int b) {")
+            p("    int lo, hi, i;")
+            p("    lo = (a < b) ? a : b;")
+            p("    hi = (a < b) ? b : a;")
+            p("    for (i = 0; i < _col2d_contact_n; i = i + 1)")
+            p("        if (_col2d_contact_a[i] == lo && _col2d_contact_b[i] == hi)")
+            p("            return;")
+            p("    if (_col2d_contact_n >= %d) return;" % max_pairs)
+            p("    _col2d_contact_a[_col2d_contact_n] = lo;")
+            p("    _col2d_contact_b[_col2d_contact_n] = hi;")
+            p("    _col2d_contact_n = _col2d_contact_n + 1;")
+            p("}")
+            p("")
+            p("static int _col2d_pair_in(int lo, int hi,")
+            p("    const int *pa, const int *pb, int n) {")
+            p("    int i;")
+            p("    for (i = 0; i < n; i = i + 1)")
+            p("        if (pa[i] == lo && pb[i] == hi) return 1;")
+            p("    return 0;")
+            p("}")
+            p("")
+            p("static void _col2d_send_msg(int ci_self, int ci_other, int kind) {")
+            p("    /* kind: 0 Enter, 1 Stay, 2 Exit */")
+            p("    int oc = _Collider2D_owner_class[ci_self];")
+            p("    unsigned oi = (unsigned)_Collider2D_owner_inst[ci_self];")
+            p("    switch (oc) {")
+            for cname in sorted(collision2d_handlers.keys()):
+                cid = class_ids.get(cname)
+                if cid is None:
+                    continue
+                idn = _c_ident(cname)
+                msgs = collision2d_handlers[cname]
+                p("    case %d:" % cid)
+                for kind_i, msg in enumerate(
+                        ("OnCollisionEnter2D",
+                         "OnCollisionStay2D",
+                         "OnCollisionExit2D")):
+                    if msg not in msgs:
+                        continue
+                    p("        if (kind == %d) {" % kind_i)
+                    if want_go_tables:
+                        p("            _engine_in_script = 1;")
+                        p("            if (setjmp(_engine_script_jmp) == 0)")
+                        p("                %s_%s(oi, ci_other);"
+                          % (idn, msg))
+                        p("            _engine_in_script = 0;")
+                    else:
+                        p("            %s_%s(oi, ci_other);" % (idn, msg))
+                    p("        }")
+                p("        break;")
+            p("    default: break;")
+            p("    }")
+            p("}")
+            p("")
+            p("static void engine_physics_collide2d_messages(void) {")
+            p("    int i, lo, hi;")
+            p("    for (i = 0; i < _col2d_contact_n; i = i + 1) {")
+            p("        lo = _col2d_contact_a[i];")
+            p("        hi = _col2d_contact_b[i];")
+            p("        if (_col2d_pair_in(lo, hi, _col2d_prev_a, _col2d_prev_b,")
+            p("                           _col2d_prev_n)) {")
+            p("            _col2d_send_msg(lo, hi, 1);")
+            p("            _col2d_send_msg(hi, lo, 1);")
+            p("        } else {")
+            p("            _col2d_send_msg(lo, hi, 0);")
+            p("            _col2d_send_msg(hi, lo, 0);")
+            p("        }")
+            p("    }")
+            p("    for (i = 0; i < _col2d_prev_n; i = i + 1) {")
+            p("        lo = _col2d_prev_a[i];")
+            p("        hi = _col2d_prev_b[i];")
+            p("        if (!_col2d_pair_in(lo, hi, _col2d_contact_a,")
+            p("                            _col2d_contact_b, _col2d_contact_n)) {")
+            p("            _col2d_send_msg(lo, hi, 2);")
+            p("            _col2d_send_msg(hi, lo, 2);")
+            p("        }")
+            p("    }")
+            p("    _col2d_prev_n = _col2d_contact_n;")
+            p("    for (i = 0; i < _col2d_contact_n; i = i + 1) {")
+            p("        _col2d_prev_a[i] = _col2d_contact_a[i];")
+            p("        _col2d_prev_b[i] = _col2d_contact_b[i];")
+            p("    }")
+            p("}")
+            p("")
+
+
+def _emit_engine_colliders_3d(class_ids, col3d_list, p, plan, want_col3d):
+    """emit_engine: BoxCollider / SphereCollider AABB contacts."""
+    if want_col3d and col3d_list:
+        p("/* Authored BoxCollider / SphereCollider — AABB contacts */")
+        p("static void _col3d_center(int ci, float *ox, float *oy, float *oz) {")
+        p("    unsigned oi = (unsigned)_Collider3D_owner_inst[ci];")
+        p("    float px = 0.f, py = 0.f, pz = 0.f;")
+        p("    switch (_Collider3D_owner_class[ci]) {")
+        for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
+            idn = _c_ident(cname)
+            cl = plan["classes"][cname]
+            if not _class_has_position(cl):
+                continue
+            p("    case %d:" % cid)
+            if plan.get("has_transform_parents"):
+                p("        {")
+                p("            float wx, wy, wz;")
+                p("            _engine_world_pos(%d, oi, &wx, &wy, &wz, 0);"
+                  % cid)
+                p("            px = wx; py = wy; pz = wz;")
+                p("        }")
+            else:
+                p("        px = %s_get_pos_x(oi);" % idn)
+                p("        py = %s_get_pos_y(oi);" % idn)
+                if not cl.get("two_d"):
+                    p("        pz = %s_get_pos_z(oi);" % idn)
+            p("        break;")
+        p("    default: break;")
+        p("    }")
+        p("    *ox = px + _Collider3D_ox[ci];")
+        p("    *oy = py + _Collider3D_oy[ci];")
+        p("    *oz = pz + _Collider3D_oz[ci];")
+        p("}")
+        p("")
+        p("static void _col3d_set_pos(int ci, float nx, float ny, float nz) {")
+        p("    unsigned oi = (unsigned)_Collider3D_owner_inst[ci];")
+        p("    switch (_Collider3D_owner_class[ci]) {")
+        for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
+            idn = _c_ident(cname)
+            cl = plan["classes"][cname]
+            if not _class_has_position(cl) or cl.get("static"):
+                continue
+            p("    case %d:" % cid)
+            p("        %s_set_pos_x(oi, nx);" % idn)
+            p("        %s_set_pos_y(oi, ny);" % idn)
+            if not cl.get("two_d"):
+                p("        %s_set_pos_z(oi, nz);" % idn)
+            p("        break;")
+        p("    default: break;")
+        p("    }")
+        p("}")
+        p("")
+        p("static void _col3d_get_pos(int ci, float *ox, float *oy, float *oz) {")
+        p("    unsigned oi = (unsigned)_Collider3D_owner_inst[ci];")
+        p("    *ox = 0.f; *oy = 0.f; *oz = 0.f;")
+        p("    switch (_Collider3D_owner_class[ci]) {")
+        for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
+            idn = _c_ident(cname)
+            cl = plan["classes"][cname]
+            if not _class_has_position(cl):
+                continue
+            p("    case %d:" % cid)
+            if plan.get("has_transform_parents"):
+                p("        _engine_world_pos(%d, oi, ox, oy, oz, 0);" % cid)
+            else:
+                p("        *ox = %s_get_pos_x(oi);" % idn)
+                p("        *oy = %s_get_pos_y(oi);" % idn)
+                if not cl.get("two_d"):
+                    p("        *oz = %s_get_pos_z(oi);" % idn)
+            p("        break;")
+        p("    default: break;")
+        p("    }")
+        p("}")
+        p("")
+        p("static void engine_physics_collide3d(void) {")
+        p("    int a, b;")
+        p("    for (a = 0; a < _Collider3D_count; a = a + 1) {")
+        p("        float ax, ay, az, bx, by, bz, dx, dy, dz;")
+        p("        float px, py, pz, ahw, ahh, ahd, bhw, bhh, bhd;")
+        p("        float sep, tx, ty, tz, nx, ny, nz;")
+        p("        float vx, vy, vz, vn, vtx, vty, vtz, fr_d, fr_s, fr, bn, sc, vt_len;")
+        p("        int rb;")
+        p("        if (_Collider3D_body_type[a] != 0) continue;")
+        p("        if (_Collider3D_is_trigger[a]) continue;")
+        p("        rb = _Collider3D_rb3d[a];")
+        p("        if (rb < 0) continue;")
+        p("        _col3d_center(a, &ax, &ay, &az);")
+        p("        if (_Collider3D_kind[a] == 1) {")
+        p("            ahw = _Collider3D_hw[a]; ahh = ahw; ahd = ahw;")
+        p("        } else {")
+        p("            ahw = _Collider3D_hw[a];")
+        p("            ahh = _Collider3D_hh[a];")
+        p("            ahd = _Collider3D_hd[a];")
+        p("        }")
+        p("        for (b = 0; b < _Collider3D_count; b = b + 1) {")
+        p("            if (a == b) continue;")
+        p("            if (_Collider3D_is_trigger[b]) continue;")
+        p("            _col3d_center(b, &bx, &by, &bz);")
+        p("            if (_Collider3D_kind[b] == 1) {")
+        p("                bhw = _Collider3D_hw[b]; bhh = bhw; bhd = bhw;")
+        p("            } else {")
+        p("                bhw = _Collider3D_hw[b];")
+        p("                bhh = _Collider3D_hh[b];")
+        p("                bhd = _Collider3D_hd[b];")
+        p("            }")
+        p("            dx = ax - bx; dy = ay - by; dz = az - bz;")
+        p("            px = (ahw + bhw) - (dx < 0.f ? -dx : dx);")
+        p("            py = (ahh + bhh) - (dy < 0.f ? -dy : dy);")
+        p("            pz = (ahd + bhd) - (dz < 0.f ? -dz : dz);")
+        p("            if (px <= 0.f || py <= 0.f || pz <= 0.f) continue;")
+        p("            _col3d_get_pos(a, &tx, &ty, &tz);")
+        p("            nx = 0.f; ny = 0.f; nz = 0.f;")
+        p("            if (px <= py && px <= pz) {")
+        p("                sep = (dx < 0.f) ? -px : px;")
+        p("                tx = tx + sep;")
+        p("                nx = (sep < 0.f) ? -1.f : 1.f;")
+        p("            } else if (py <= px && py <= pz) {")
+        p("                sep = (dy < 0.f) ? -py : py;")
+        p("                ty = ty + sep;")
+        p("                ny = (sep < 0.f) ? -1.f : 1.f;")
+        p("            } else {")
+        p("                sep = (dz < 0.f) ? -pz : pz;")
+        p("                tz = tz + sep;")
+        p("                nz = (sep < 0.f) ? -1.f : 1.f;")
+        p("            }")
+        p("            _col3d_set_pos(a, tx, ty, tz);")
+        p("            fr_d = _phys_mat_combine(")
+        p("                _Collider3D_dynamic_friction[a],")
+        p("                _Collider3D_dynamic_friction[b],")
+        p("                _Collider3D_friction_combine[a],")
+        p("                _Collider3D_friction_combine[b]);")
+        p("            fr_s = _phys_mat_combine(")
+        p("                _Collider3D_static_friction[a],")
+        p("                _Collider3D_static_friction[b],")
+        p("                _Collider3D_friction_combine[a],")
+        p("                _Collider3D_friction_combine[b]);")
+        p("            bn = _phys_mat_combine(")
+        p("                _Collider3D_bounciness[a], _Collider3D_bounciness[b],")
+        p("                _Collider3D_bounce_combine[a],")
+        p("                _Collider3D_bounce_combine[b]);")
+        p("            vx = _Rigidbody_vel_x[rb];")
+        p("            vy = _Rigidbody_vel_y[rb];")
+        p("            vz = _Rigidbody_vel_z[rb];")
+        p("            vn = vx * nx + vy * ny + vz * nz;")
+        p("            vtx = vx - vn * nx;")
+        p("            vty = vy - vn * ny;")
+        p("            vtz = vz - vn * nz;")
+        p("            vt_len = sqrtf(vtx * vtx + vty * vty + vtz * vtz);")
+        p("            fr = (vt_len < 0.01f) ? fr_s : fr_d;")
+        p("            if (vn < 0.f) vn = -bn * vn;")
+        p("            sc = 1.f - fr;")
+        p("            if (sc < 0.f) sc = 0.f;")
+        p("            if (sc > 1.f) sc = 1.f;")
+        p("            _Rigidbody_vel_x[rb] = vtx * sc + vn * nx;")
+        p("            _Rigidbody_vel_y[rb] = vty * sc + vn * ny;")
+        p("            _Rigidbody_vel_z[rb] = vtz * sc + vn * nz;")
+        p("            _col3d_center(a, &ax, &ay, &az);")
+        p("        }")
+        p("    }")
+        p("}")
+        p("")
+
+
+def _emit_engine_box2d_exports(
+        box2d_backend, class_ids, col2d_list, p, plan, want_col2d,
+        want_collision2d_msgs):
+    """emit_engine: Accessors exported to the Box2D-Packed glue (physics_box2d.c)."""
+    if box2d_backend:
+        p("/* Box2D-Packed 2D physics (physics_box2d.c) */")
+        p("void engine_box2d_step(void);")
+        p("void engine_rb2d_get_pos(int rb, float *x, float *y) {")
+        p("    unsigned oi = (unsigned)_Rigidbody2D_owner_inst[rb];")
+        p("    *x = 0.f;")
+        p("    *y = 0.f;")
+        p("    switch (_Rigidbody2D_owner_class[rb]) {")
+        for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
+            idn = _c_ident(cname)
+            cl = plan["classes"][cname]
+            if not _class_has_position(cl) or cl.get("static"):
+                continue
+            p("    case %d:" % cid)
+            p("        *x = %s_get_pos_x(oi);" % idn)
+            p("        *y = %s_get_pos_y(oi);" % idn)
+            p("        break;")
+        p("    default: break;")
+        p("    }")
+        p("}")
+        p("")
+        p("void engine_rb2d_set_pos(int rb, float x, float y) {")
+        p("    unsigned oi = (unsigned)_Rigidbody2D_owner_inst[rb];")
+        p("    switch (_Rigidbody2D_owner_class[rb]) {")
+        for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
+            idn = _c_ident(cname)
+            cl = plan["classes"][cname]
+            if not _class_has_position(cl) or cl.get("static"):
+                continue
+            p("    case %d:" % cid)
+            p("        %s_set_pos_x(oi, x);" % idn)
+            p("        %s_set_pos_y(oi, y);" % idn)
+            p("        break;")
+        p("    default: break;")
+        p("    }")
+        p("}")
+        p("")
+        p("void engine_col2d_center(int ci, float *x, float *y) {")
+        if want_col2d and col2d_list:
+            p("    _col2d_center(ci, x, y);")
+        else:
+            p("    if (ci < 0) return;")
+            p("    *x = 0.f;")
+            p("    *y = 0.f;")
+        p("}")
+        p("")
+        p("void engine_col2d_contact(int a, int b) {")
+        if want_collision2d_msgs:
+            p("    _col2d_add_contact(a, b);")
+        else:
+            p("    if (a < 0 || b < 0) return;")
+        p("}")
+        p("")
+
+
+def _emit_engine_physics_fixed(
+        box2d_backend, class_ids, col3d_list, p, plan, rb3d_list, want_col3d,
+        want_collision2d_msgs, want_rb2d, want_rb3d):
+    """emit_engine: engine_physics_fixed: Box2D-Packed (2D) and Rigidbody integration (3D)."""
+    if want_rb2d or want_rb3d or box2d_backend:
+        p("/* Box2D-Packed (2D) and authored Rigidbody integration (3D) after FixedUpdate */")
+        p("static void engine_physics_fixed(void) {")
+        p("    int i;")
+        if box2d_backend:
+            if want_collision2d_msgs:
+                p("    _col2d_contact_n = 0;")
+            p("    engine_box2d_step();")
+            if want_collision2d_msgs:
+                p("    engine_physics_collide2d_messages();")
+        if want_rb3d and rb3d_list:
+            p("    for (i = 0; i < _Rigidbody_count; i = i + 1) {")
+            p("        unsigned oi;")
+            p("        float vx, vy, vz;")
+            p("        if (_Rigidbody_use_gravity[i]) {")
+            p("            _Rigidbody_vel_x[i] = _Rigidbody_vel_x[i]")
+            p("                + Physics_gravity_x * Time_fixedDeltaTime;")
+            p("            _Rigidbody_vel_y[i] = _Rigidbody_vel_y[i]")
+            p("                + Physics_gravity_y * Time_fixedDeltaTime;")
+            p("            _Rigidbody_vel_z[i] = _Rigidbody_vel_z[i]")
+            p("                + Physics_gravity_z * Time_fixedDeltaTime;")
+            p("        }")
+            p("        {")
+            p("            float d = 1.f - _Rigidbody_drag[i] * Time_fixedDeltaTime;")
+            p("            if (d < 0.f) d = 0.f;")
+            p("            if (d > 1.f) d = 1.f;")
+            p("            _Rigidbody_vel_x[i] = _Rigidbody_vel_x[i] * d;")
+            p("            _Rigidbody_vel_y[i] = _Rigidbody_vel_y[i] * d;")
+            p("            _Rigidbody_vel_z[i] = _Rigidbody_vel_z[i] * d;")
+            p("        }")
+            p("        vx = _Rigidbody_vel_x[i] * Time_fixedDeltaTime;")
+            p("        vy = _Rigidbody_vel_y[i] * Time_fixedDeltaTime;")
+            p("        vz = _Rigidbody_vel_z[i] * Time_fixedDeltaTime;")
+            p("        oi = (unsigned)_Rigidbody_owner_inst[i];")
+            p("        switch (_Rigidbody_owner_class[i]) {")
+            for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
+                idn = _c_ident(cname)
+                cl = plan["classes"][cname]
+                if not _class_has_position(cl) or cl.get("static"):
+                    continue
+                p("        case %d:" % cid)
+                p("            %s_set_pos_x(oi, %s_get_pos_x(oi) + vx);"
+                  % (idn, idn))
+                p("            %s_set_pos_y(oi, %s_get_pos_y(oi) + vy);"
+                  % (idn, idn))
+                if not cl.get("two_d"):
+                    p("            %s_set_pos_z(oi, %s_get_pos_z(oi) + vz);"
+                      % (idn, idn))
+                p("            break;")
+            p("        default: break;")
+            p("        }")
+            p("    }")
+        if want_col3d and col3d_list:
+            p("    engine_physics_collide3d();")
+        p("}")
+        p("")
+
+
+def _emit_engine_animation(anim_plan, anim_players, class_ids, p, plan, want_anim):
+    """emit_engine: Animation / Animator sampling: root position and sprite curves."""
+    if want_anim and anim_players:
+        p("/* Authored Animation / Animator — root pos + m_Sprite PPtr */")
+        p("static float _anim_sample(const float *times, const float *vals,")
+        p("                         int begin, int count, float t) {")
+        p("    int i;")
+        p("    float t0, t1, u;")
+        p("    if (count <= 0) return 0.f;")
+        p("    if (count == 1) return vals[begin];")
+        p("    if (t <= times[begin]) return vals[begin];")
+        p("    if (t >= times[begin + count - 1])")
+        p("        return vals[begin + count - 1];")
+        p("    for (i = 0; i < count - 1; i = i + 1) {")
+        p("        t0 = times[begin + i];")
+        p("        t1 = times[begin + i + 1];")
+        p("        if (t >= t0 && t <= t1) {")
+        p("            u = (t1 > t0) ? (t - t0) / (t1 - t0) : 0.f;")
+        p("            return vals[begin + i]")
+        p("                + (vals[begin + i + 1] - vals[begin + i]) * u;")
+        p("        }")
+        p("    }")
+        p("    return vals[begin + count - 1];")
+        p("}")
+        p("")
+        anim_skeys = anim_plan.get("sprite_keys") or []
+        anim_sbinds = anim_plan.get("sprite_binds") or []
+        if anim_skeys and anim_sbinds:
+            p("/* Discrete PPtr hold (Unity SpriteRenderer.m_Sprite keys). */")
+            p("static int _anim_sample_hold_i(const float *times,")
+            p("                              const int *vals,")
+            p("                              int begin, int count, float t) {")
+            p("    int i;")
+            p("    if (count <= 0) return 0;")
+            p("    if (count == 1) return vals[begin];")
+            p("    if (t <= times[begin]) return vals[begin];")
+            p("    for (i = 0; i < count - 1; i = i + 1) {")
+            p("        if (t >= times[begin + i]")
+            p("            && t < times[begin + i + 1])")
+            p("            return vals[begin + i];")
+            p("    }")
+            p("    return vals[begin + count - 1];")
+            p("}")
+            p("")
+            p("static float _anim_sample_hold(const float *times,")
+            p("                              const float *vals,")
+            p("                              int begin, int count, float t) {")
+            p("    int i;")
+            p("    if (count <= 0) return 0.f;")
+            p("    if (count == 1) return vals[begin];")
+            p("    if (t <= times[begin]) return vals[begin];")
+            p("    for (i = 0; i < count - 1; i = i + 1) {")
+            p("        if (t >= times[begin + i]")
+            p("            && t < times[begin + i + 1])")
+            p("            return vals[begin + i];")
+            p("    }")
+            p("    return vals[begin + count - 1];")
+            p("}")
+            p("")
+        p("static void engine_animation_tick(void) {")
+        p("    int i;")
+        p("    for (i = 0; i < _AnimPlayer_count; i = i + 1) {")
+        p("        int ci, kb, kc;")
+        p("        float t, len, nx, ny, nz;")
+        p("        unsigned oi;")
+        p("        if (!_AnimPlayer_playing[i]) continue;")
+        p("        ci = _AnimPlayer_clip[i];")
+        p("        len = _AnimClip_length[ci];")
+        p("        if (len <= 0.f) continue;")
+        p("        _AnimPlayer_time[i] = _AnimPlayer_time[i]")
+        p("            + Time_deltaTime * _AnimPlayer_speed[i];")
+        p("        t = _AnimPlayer_time[i];")
+        p("        if (_AnimPlayer_loop[i]) {")
+        p("            while (t >= len) t = t - len;")
+        p("            while (t < 0.f) t = t + len;")
+        p("            _AnimPlayer_time[i] = t;")
+        p("        } else if (t > len) {")
+        p("            t = len;")
+        p("            _AnimPlayer_time[i] = t;")
+        p("            _AnimPlayer_playing[i] = 0;")
+        p("        }")
+        p("        kb = _AnimClip_key_begin[ci];")
+        p("        kc = _AnimClip_key_count[ci];")
+        # Absolute localPosition only when the clip authors root PositionCurves.
+        p("        if (kc > 0) {")
+        p("            nx = _anim_sample(_AnimKey_t, _AnimKey_x, kb, kc, t);")
+        p("            ny = _anim_sample(_AnimKey_t, _AnimKey_y, kb, kc, t);")
+        p("            nz = _anim_sample(_AnimKey_t, _AnimKey_z, kb, kc, t);")
+        p("            oi = (unsigned)_AnimPlayer_owner_inst[i];")
+        p("            switch (_AnimPlayer_owner_class[i]) {")
+        for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
+            idn = _c_ident(cname)
+            cl = plan["classes"][cname]
+            if not _class_has_position(cl) or cl.get("static"):
+                continue
+            p("            case %d:" % cid)
+            p("                %s_set_pos_x(oi, nx);" % idn)
+            p("                %s_set_pos_y(oi, ny);" % idn)
+            if not cl.get("two_d"):
+                p("                %s_set_pos_z(oi, nz);" % idn)
+            p("                break;")
+        p("            default: break;")
+        p("            }")
+        p("        }")
+        if anim_skeys and anim_sbinds:
+            mutable = set(plan.get("sprite_draw_mutable") or [])
+            p("        {")
+            p("            int b0 = _AnimPlayer_sprite_bind_begin[i];")
+            p("            int bc = _AnimPlayer_sprite_bind_count[i];")
+            p("            int b;")
+            p("            for (b = 0; b < bc; b = b + 1) {")
+            p("                int bi = b0 + b;")
+            p("                int skb = _AnimSpriteBind_key_begin[bi];")
+            p("                int skc = _AnimSpriteBind_key_count[bi];")
+            p("                int tex; float hw, hh;")
+            p("                unsigned ti;")
+            p("                if (skc <= 0) continue;")
+            p("                tex = _anim_sample_hold_i(")
+            p("                    _AnimSpriteKey_t, _AnimSpriteKey_tex,")
+            p("                    skb, skc, t);")
+            p("                hw = _anim_sample_hold(")
+            p("                    _AnimSpriteKey_t, _AnimSpriteKey_hw,")
+            p("                    skb, skc, t);")
+            p("                hh = _anim_sample_hold(")
+            p("                    _AnimSpriteKey_t, _AnimSpriteKey_hh,")
+            p("                    skb, skc, t);")
+            p("                ti = (unsigned)_AnimSpriteBind_target_inst[bi];")
+            p("                switch (_AnimSpriteBind_target_class[bi]) {")
+            for cname in sorted(mutable):
+                if cname not in class_ids:
+                    continue
+                cid = class_ids[cname]
+                idn = _c_ident(cname)
+                p("                case %d:" % cid)
+                p("                    _%s_draw_tex[ti] = tex;" % idn)
+                p("                    _%s_draw_hw[ti] = hw;" % idn)
+                p("                    _%s_draw_hh[ti] = hh;" % idn)
+                p("                    break;")
+            p("                default: break;")
+            p("                }")
+            p("            }")
+            p("        }")
+        p("    }")
+        p("}")
+        p("")
+
+
+def _emit_engine_class_draws(
+        any_sprite, class_ids, go_names, has_cam, mutable_spr, p, plan, ui_buttons,
+        want_live_rt, want_ui):
+    """emit_engine: Per-class sprite draws."""
+    for cname, cl in sorted(plan["classes"].items()):
+        idn = _c_ident(cname)
+        if not _class_has_position(cl):
+            continue
+        spr_idx = []
+        for i, o in enumerate(cl["instances"]):
+            sp = o.get("sprite")
+            if sp and sp.get("enabled", 1) and "tex_id" in sp:
+                spr_idx.append((i, sp))
+        if not spr_idx:
+            continue
+        any_sprite = True
+        use_mut = cname in mutable_spr
+        use_scale = cname in set(plan.get("live_scale_classes") or [])
+        use_rot = cname in set(plan.get("live_rot_classes") or [])
+        p("    { /* %s SpriteRenderer */" % idn)
+        p("        static const float _spr_r[] = { %s };" % ", ".join(
+            "%sf" % repr(float(sp["r"])) for _i, sp in spr_idx))
+        p("        static const float _spr_g[] = { %s };" % ", ".join(
+            "%sf" % repr(float(sp["g"])) for _i, sp in spr_idx))
+        p("        static const float _spr_b[] = { %s };" % ", ".join(
+            "%sf" % repr(float(sp["b"])) for _i, sp in spr_idx))
+        p("        static const float _spr_a[] = { %s };" % ", ".join(
+            "%sf" % repr(float(sp.get("a", 1.0))) for _i, sp in spr_idx))
+        if not use_mut:
+            p("        static const float _spr_hw[] = { %s };" % ", ".join(
+                "%sf" % repr(float(sp["half_w"])) for _i, sp in spr_idx))
+            p("        static const float _spr_hh[] = { %s };" % ", ".join(
+                "%sf" % repr(float(sp["half_h"])) for _i, sp in spr_idx))
+            p("        static const int _spr_tex[] = { %s };" % ", ".join(
+                str(int(sp["tex_id"])) for _i, sp in spr_idx))
+        if not use_rot:
+            p("        static const float _spr_m00[] = { %s };" % ", ".join(
+                "%sf" % repr(float(sp.get("m00", sp.get("cos_z", 1.0))))
+                for _i, sp in spr_idx))
+            p("        static const float _spr_m01[] = { %s };" % ", ".join(
+                "%sf" % repr(float(sp.get("m01", -float(sp.get("sin_z", 0.0)))))
+                for _i, sp in spr_idx))
+            p("        static const float _spr_m10[] = { %s };" % ", ".join(
+                "%sf" % repr(float(sp.get("m10", sp.get("sin_z", 0.0))))
+                for _i, sp in spr_idx))
+            p("        static const float _spr_m11[] = { %s };" % ", ".join(
+                "%sf" % repr(float(sp.get("m11", sp.get("cos_z", 1.0))))
+                for _i, sp in spr_idx))
+        p("        static const int _spr_layer[] = { %s };" % ", ".join(
+            str(int(sp.get("sorting_layer") or 0)) for _i, sp in spr_idx))
+        p("        static const int _spr_order[] = { %s };" % ", ".join(
+            str(int(sp.get("sorting_order") or 0)) for _i, sp in spr_idx))
+        p("        static const unsigned _spr_i[] = { %s };" % ", ".join(
+            str(i) for i, _sp in spr_idx))
+        any_ui = any(sp.get("source") in ("ui", "ui_tmp")
+                     for _i, sp in spr_idx)
+        need_spr_go = (want_ui or want_live_rt) and go_names
+        if any_ui:
+            p("        static const int _spr_ui[] = { %s };" % ", ".join(
+                "1" if sp.get("source") in ("ui", "ui_tmp") else "0"
+                for _i, sp in spr_idx))
+            if want_live_rt:
+                p("        static const int _spr_preserve[] = { %s };" % (
+                    ", ".join(
+                        "1" if int(sp.get("preserve_aspect") or 0) else "0"
+                        for _i, sp in spr_idx)))
+                p("        static const float _spr_src_aspect[] = { %s };" % (
+                    ", ".join(
+                        "%sf" % repr(float(sp.get("src_aspect") or 1.0))
+                        for _i, sp in spr_idx)))
+                # TMP Overflow (etc.): draw can exceed RectTransform.
+                p("        static const float _spr_draw_sx[] = { %s };" % (
+                    ", ".join(
+                        "%sf" % repr(float(sp.get("draw_sx") or 1.0))
+                        for _i, sp in spr_idx)))
+                p("        static const float _spr_draw_sy[] = { %s };" % (
+                    ", ".join(
+                        "%sf" % repr(float(sp.get("draw_sy") or 1.0))
+                        for _i, sp in spr_idx)))
+                p("        static const float _spr_shift_fx[] = { %s };" % (
+                    ", ".join(
+                        "%sf" % repr(float(sp.get("shift_fx") or 0.0))
+                        for _i, sp in spr_idx)))
+                p("        static const float _spr_shift_fy[] = { %s };" % (
+                    ", ".join(
+                        "%sf" % repr(float(sp.get("shift_fy") or 0.0))
+                        for _i, sp in spr_idx)))
+            else:
+                p("        static const float _spr_ncx[] = { %s };" % (
+                    ", ".join(
+                        "%sf" % repr(float(sp.get("ncx", 0.5)))
+                        for _i, sp in spr_idx)))
+                p("        static const float _spr_ncy[] = { %s };" % (
+                    ", ".join(
+                        "%sf" % repr(float(sp.get("ncy", 0.5)))
+                        for _i, sp in spr_idx)))
+                p("        static const float _spr_nhw[] = { %s };" % (
+                    ", ".join(
+                        "%sf" % repr(float(sp.get("nhw", 0.0)))
+                        for _i, sp in spr_idx)))
+                p("        static const float _spr_nhh[] = { %s };" % (
+                    ", ".join(
+                        "%sf" % repr(float(sp.get("nhh", 0.0)))
+                        for _i, sp in spr_idx)))
+        if need_spr_go:
+            go_vals = []
+            btn_vals = []
+            btn_by_go = {int(b["go"]): bi
+                         for bi, b in enumerate(ui_buttons)}
+            for i, _sp in spr_idx:
+                gi = cl["instances"][i].get("go_index")
+                if gi is None:
+                    n = cl["instances"][i].get("name") or "obj"
+                    gi = go_names.index(n) if n in go_names else -1
+                else:
+                    gi = int(gi)
+                go_vals.append(str(gi))
+                btn_vals.append(str(btn_by_go.get(gi, -1)))
+            p("        static const int _spr_go[] = { %s };" % ", ".join(go_vals))
+            # ColorBlock tint table only exists when authored Buttons do.
+            if ui_buttons:
+                p("        static const int _spr_btn[] = { %s };" % ", ".join(
+                    btn_vals))
+        p("        int k;")
+        p("        for (k = 0; k < %d && n < max; k = k + 1) {" % len(spr_idx))
+        p("            unsigned i = _spr_i[k];")
+        if want_ui:
+            p("            if (_spr_go[k] >= 0) {")
+            p("                if (!_engine_go_active_in_hierarchy(_spr_go[k]))")
+            p("                    continue;")
+            p("            }")
+        cid = class_ids[cname]
+
+        def _emit_world_draw(ind):
+            """World-space sprite path (non-UI), indented with ``ind``."""
+            if plan.get("has_transform_parents"):
+                p(ind + "float wx, wy, wz;")
+                p(ind + "_engine_world_pos(%d, i, &wx, &wy, &wz, 0);" % cid)
+                if has_cam:
+                    p(ind + "{")
+                    p(ind + "    float depth = wz - Camera_main_pos_z;")
+                    p(ind + "    if (depth < Camera_main_nearClipPlane"
+                      " || depth > Camera_main_farClipPlane)")
+                    p(ind + "        continue;")
+                    p(ind + "}")
+                p(ind + "out[n].x = wx;")
+                p(ind + "out[n].y = wy;")
+            else:
+                if has_cam:
+                    if cl.get("two_d"):
+                        p(ind + "float oz = 0.f;")
+                    else:
+                        p(ind + "float oz = %s_get_pos_z(i);" % idn)
+                    p(ind + "{")
+                    p(ind + "    float depth = oz - Camera_main_pos_z;")
+                    p(ind + "    if (depth < Camera_main_nearClipPlane"
+                      " || depth > Camera_main_farClipPlane)")
+                    p(ind + "        continue;")
+                    p(ind + "}")
+                p(ind + "out[n].x = %s_get_pos_x(i);" % idn)
+                p(ind + "out[n].y = %s_get_pos_y(i);" % idn)
+            if use_mut:
+                p(ind + "out[n].half_w = _%s_draw_hw[i];" % idn)
+                p(ind + "out[n].half_h = _%s_draw_hh[i];" % idn)
+                p(ind + "out[n].tex = _%s_draw_tex[i];" % idn)
+            else:
+                p(ind + "out[n].half_w = _spr_hw[k];")
+                p(ind + "out[n].half_h = _spr_hh[k];")
+                p(ind + "out[n].tex = _spr_tex[k];")
+            if use_scale:
+                p(ind + "out[n].half_w = out[n].half_w * _%s_scale_x[i];"
+                  % idn)
+                p(ind + "out[n].half_h = out[n].half_h * _%s_scale_y[i];"
+                  % idn)
+
+        if any_ui:
+            p("            if (_spr_ui[k]) {")
+            p("                float aspect, world_h, world_w, ncx, ncy, nhw, nhh;")
+            if plan.get("camera"):
+                p("                aspect = Camera_main_aspect;")
+                p("                if (aspect < 1e-6f) {")
+                p("                    float sw = (float)Screen_width;")
+                p("                    float sh = (float)Screen_height;")
+                p("                    if (sw < 1.f) sw = 1.f;")
+                p("                    if (sh < 1.f) sh = 1.f;")
+                p("                    aspect = sw / sh;")
+                p("                }")
+            else:
+                p("                float sw = (float)Screen_width;")
+                p("                float sh = (float)Screen_height;")
+                p("                if (sw < 1.f) sw = 1.f;")
+                p("                if (sh < 1.f) sh = 1.f;")
+                p("                aspect = sw / sh;")
+            p("                world_h = 2.f * Camera_main_orthographicSize;")
+            p("                world_w = world_h * aspect;")
+            if want_live_rt:
+                p("                {")
+                p("                    float sw = _engine_ui_layout_w;")
+                p("                    float sh = _engine_ui_layout_h;")
+                p("                    float rcx, rcy, rw, rh, dw, dh, dcx, dcy;")
+                p("                    float pivx, pivy, sa;")
+                p("                    int go = _spr_go[k];")
+                p("                    if (sw < 1.f) sw = 1.f;")
+                p("                    if (sh < 1.f) sh = 1.f;")
+                p("                    _engine_ui_screen_rect("
+                  "go, sw, sh, &rcx, &rcy, &rw, &rh);")
+                p("                    if (rw < 0.f) rw = -rw;")
+                p("                    if (rh < 0.f) rh = -rh;")
+                # Default = RectTransform; TMP Overflow scales past it.
+                p("                    dw = rw * _spr_draw_sx[k];")
+                p("                    dh = rh * _spr_draw_sy[k];")
+                p("                    dcx = rcx + rw * _spr_shift_fx[k];")
+                p("                    dcy = rcy + rh * _spr_shift_fy[k];")
+                p("                    if (_spr_preserve[k]"
+                  " && rw > 1e-6f && rh > 1e-6f) {")
+                p("                        sa = _spr_src_aspect[k];")
+                p("                        if (sa < 1e-8f) sa = 1.f;")
+                p("                        if (rw / rh > sa) {")
+                p("                            dw = rh * sa;")
+                p("                            dh = rh;")
+                p("                        } else {")
+                p("                            dw = rw;")
+                p("                            dh = rw / sa;")
+                p("                        }")
+                p("                        pivx = (go >= 0)"
+                  " ? _engine_rt_pivot_x[go] : 0.5f;")
+                p("                        pivy = (go >= 0)"
+                  " ? _engine_rt_pivot_y[go] : 0.5f;")
+                p("                        dcx = rcx + (rw - dw)"
+                  " * (pivx - 0.5f);")
+                p("                        dcy = rcy + (rh - dh)"
+                  " * (pivy - 0.5f);")
+                p("                    }")
+                p("                    ncx = dcx / sw;")
+                p("                    ncy = dcy / sh;")
+                p("                    nhw = dw * 0.5f / sw;")
+                p("                    nhh = dh * 0.5f / sh;")
+                p("                }")
+            else:
+                p("                ncx = _spr_ncx[k];")
+                p("                ncy = _spr_ncy[k];")
+                p("                nhw = _spr_nhw[k];")
+                p("                nhh = _spr_nhh[k];")
+            p("                out[n].x = Camera_main_pos_x")
+            p("                    + (ncx - 0.5f) * world_w;")
+            p("                out[n].y = Camera_main_pos_y")
+            p("                    + (ncy - 0.5f) * world_h;")
+            p("                out[n].half_w = nhw * world_w;")
+            p("                out[n].half_h = nhh * world_h;")
+            if use_mut:
+                p("                out[n].tex = _%s_draw_tex[i];" % idn)
+            else:
+                p("                out[n].tex = _spr_tex[k];")
+            p("            } else {")
+            _emit_world_draw("                ")
+            p("            }")
+        else:
+            _emit_world_draw("            ")
+        if use_rot:
+            p("            out[n].m00 = _%s_rot_m00[i];" % idn)
+            p("            out[n].m01 = _%s_rot_m01[i];" % idn)
+            p("            out[n].m10 = _%s_rot_m10[i];" % idn)
+            p("            out[n].m11 = _%s_rot_m11[i];" % idn)
+        else:
+            p("            out[n].m00 = _spr_m00[k];")
+            p("            out[n].m01 = _spr_m01[k];")
+            p("            out[n].m10 = _spr_m10[k];")
+            p("            out[n].m11 = _spr_m11[k];")
+        p("            out[n].r = _spr_r[k];")
+        p("            out[n].g = _spr_g[k];")
+        p("            out[n].b = _spr_b[k];")
+        p("            out[n].a = _spr_a[k];")
+        if want_ui and ui_buttons:
+            # ColorBlock multiplies Image.m_Color (Unity Selectable).
+            # Tint helpers are only emitted when ui_buttons is non-empty;
+            # want_ui alone can be SetActive without any Button.
+            p("            if (_spr_btn[k] >= 0) {")
+            p("                int bi = _spr_btn[k] * 4;")
+            p("                _engine_ui_btn_tint_init();")
+            p("                out[n].r = out[n].r * _engine_ui_btn_tint[bi];")
+            p("                out[n].g = out[n].g"
+              " * _engine_ui_btn_tint[bi + 1];")
+            p("                out[n].b = out[n].b"
+              " * _engine_ui_btn_tint[bi + 2];")
+            p("                out[n].a = out[n].a"
+              " * _engine_ui_btn_tint[bi + 3];")
+            p("            }")
+        p("            out[n].sorting_layer = _spr_layer[k];")
+        p("            out[n].sorting_order = _spr_order[k];")
+        p("            n = n + 1;")
+        p("        }")
+        p("    }")
+    return any_sprite
+
+
 def emit_engine(plan, analyses, used_apis):
     lines = []
     p = lines.append
@@ -11537,47 +12606,8 @@ def emit_engine(plan, analyses, used_apis):
         p("extern const float _Collider3D_bounciness[%d];" % n3c)
         p("extern const int _Collider3D_friction_combine[%d];" % n3c)
         p("extern const int _Collider3D_bounce_combine[%d];" % n3c)
-    if want_anim and anim_players:
-        np = max(1, len(anim_players))
-        nc = max(1, len(anim_clips))
-        nk = max(1, len(anim_keys))
-        p("extern const int _AnimPlayer_count;")
-        p("extern int _AnimPlayer_playing[%d];" % np)
-        p("extern float _AnimPlayer_time[%d];" % np)
-        p("extern const float _AnimPlayer_speed[%d];" % np)
-        p("extern const int _AnimPlayer_loop[%d];" % np)
-        p("extern const int _AnimPlayer_clip[%d];" % np)
-        p("extern const int _AnimPlayer_owner_class[%d];" % np)
-        p("extern const int _AnimPlayer_owner_inst[%d];" % np)
-        p("extern const float _AnimPlayer_rest_x[%d];" % np)
-        p("extern const float _AnimPlayer_rest_y[%d];" % np)
-        p("extern const float _AnimPlayer_rest_z[%d];" % np)
-        p("extern const int _AnimClip_count;")
-        p("extern const float _AnimClip_length[%d];" % nc)
-        p("extern const int _AnimClip_key_begin[%d];" % nc)
-        p("extern const int _AnimClip_key_count[%d];" % nc)
-        p("extern const int _AnimKey_count;")
-        p("extern const float _AnimKey_t[%d];" % nk)
-        p("extern const float _AnimKey_x[%d];" % nk)
-        p("extern const float _AnimKey_y[%d];" % nk)
-        p("extern const float _AnimKey_z[%d];" % nk)
-        anim_skeys = anim_plan.get("sprite_keys") or []
-        anim_sbinds = anim_plan.get("sprite_binds") or []
-        if anim_skeys or anim_sbinds:
-            nsk = max(1, len(anim_skeys))
-            nsb = max(1, len(anim_sbinds))
-            p("extern const int _AnimPlayer_sprite_bind_begin[%d];" % np)
-            p("extern const int _AnimPlayer_sprite_bind_count[%d];" % np)
-            p("extern const int _AnimSpriteBind_count;")
-            p("extern const int _AnimSpriteBind_target_class[%d];" % nsb)
-            p("extern const int _AnimSpriteBind_target_inst[%d];" % nsb)
-            p("extern const int _AnimSpriteBind_key_begin[%d];" % nsb)
-            p("extern const int _AnimSpriteBind_key_count[%d];" % nsb)
-            p("extern const int _AnimSpriteKey_count;")
-            p("extern const float _AnimSpriteKey_t[%d];" % nsk)
-            p("extern const int _AnimSpriteKey_tex[%d];" % nsk)
-            p("extern const float _AnimSpriteKey_hw[%d];" % nsk)
-            p("extern const float _AnimSpriteKey_hh[%d];" % nsk)
+    _emit_engine_anim_decls(
+            anim_clips, anim_keys, anim_plan, anim_players, p, want_anim)
     mutable_spr = set(plan.get("sprite_draw_mutable") or [])
     for cname in sorted(mutable_spr):
         if cname not in plan["classes"]:
@@ -11825,329 +12855,16 @@ def emit_engine(plan, analyses, used_apis):
           % go_cap_d)
         p("}")
         p("")
-    if want_log:
-        company = plan.get("company_name") or "DefaultCompany"
-        product = plan.get("product_name") or "Player"
-        # Unity default: platform Player.log under company/product — not cwd.
-        # -logFile - → stdout; -logFile path → that file.
-        p("/* Debug.Log / print → Unity Player.log path (not cwd, not stdout) */")
-        p("static const char _engine_company[] = %s;" % _c_string(company))
-        p("static const char _engine_product[] = %s;" % _c_string(product))
-        p("static FILE *_engine_log_fp;")
-        p("static int _engine_log_stdout;")
-        p("static const char *_engine_log_override; /* NULL = platform default */")
-        p("static int _engine_log_opened;")
-        p("static char _engine_log_default[1024];")
-        p("")
-        p("#ifndef CRUST_NO_POSIX_MKDIR")
-        p("static int _engine_mkdir_p(char *path) {")
-        p("    char *p;")
-        p("    if (!path || !path[0]) return -1;")
-        p("    for (p = path + 1; *p; p++) {")
-        # Brace after #endif so both #ifdef arms share one `{` — duplicate
-        # opens across #else break raw brace walks (cpprust _toplevel_start).
-        p("#ifdef _WIN32")
-        p("        if (*p == '/' || *p == '\\\\')")
-        p("#else")
-        p("        if (*p == '/')")
-        p("#endif")
-        p("        {")
-        p("            char sep = *p;")
-        p("            *p = 0;")
-        p("            if (ENGINE_MKDIR(path) != 0 && errno != EEXIST) {")
-        p("                *p = sep; return -1;")
-        p("            }")
-        p("            *p = sep;")
-        p("        }")
-        p("    }")
-        p("    if (ENGINE_MKDIR(path) != 0 && errno != EEXIST) return -1;")
-        p("    return 0;")
-        p("}")
-        p("#endif")
-        p("")
-        p("static const char *_engine_default_log_path(void) {")
-        p("    const char *home;")
-        p("#ifndef CRUST_NO_POSIX_MKDIR")
-        p("    char dir[1024];")
-        p("    int n, i;")
-        p("#else")
-        p("    int n;")
-        p("#endif")
-        p("#ifdef _WIN32")
-        p("    home = getenv(\"USERPROFILE\");")
-        p("    if (!home || !home[0]) home = \".\";")
-        p("    n = snprintf(_engine_log_default, sizeof _engine_log_default,")
-        p("        \"%s\\\\AppData\\\\LocalLow\\\\%s\\\\%s\\\\Player.log\",")
-        p("        home, _engine_company, _engine_product);")
-        p("#elif defined(__APPLE__)")
-        p("    home = getenv(\"HOME\");")
-        p("    if (!home || !home[0]) home = \".\";")
-        p("    n = snprintf(_engine_log_default, sizeof _engine_log_default,")
-        p("        \"%s/Library/Logs/%s/%s/Player.log\",")
-        p("        home, _engine_company, _engine_product);")
-        p("#else")
-        p("    home = getenv(\"HOME\");")
-        p("    if (!home || !home[0]) home = \".\";")
-        p("    n = snprintf(_engine_log_default, sizeof _engine_log_default,")
-        p("        \"%s/.config/unity3d/%s/%s/Player.log\",")
-        p("        home, _engine_company, _engine_product);")
-        p("#endif")
-        p("    if (n < 0 || (size_t)n >= sizeof _engine_log_default) return 0;")
-        p("#ifndef CRUST_NO_POSIX_MKDIR")
-        p("    if ((size_t)n >= sizeof dir) return 0;")
-        p("    for (i = 0; i < n; i++) dir[i] = _engine_log_default[i];")
-        p("    dir[n] = 0;")
-        p("    for (i = n - 1; i >= 0; i--) {")
-        p("#ifdef _WIN32")
-        p("        if (dir[i] == '/' || dir[i] == '\\\\')")
-        p("#else")
-        p("        if (dir[i] == '/')")
-        p("#endif")
-        p("        { dir[i] = 0; break; }")
-        p("    }")
-        p("    if (dir[0]) _engine_mkdir_p(dir);")
-        p("#endif")
-        p("    return _engine_log_default;")
-        p("}")
-        p("")
-        p("void engine_set_log_file(const char *path) {")
-        p("    if (_engine_log_fp && !_engine_log_stdout) {")
-        p("        fclose(_engine_log_fp);")
-        p("        _engine_log_fp = 0;")
-        p("    }")
-        p("    _engine_log_opened = 0;")
-        p("    if (path && path[0] == '-' && path[1] == 0) {")
-        p("        _engine_log_stdout = 1;")
-        p("        _engine_log_override = 0;")
-        p("    } else if (path && path[0]) {")
-        p("        _engine_log_stdout = 0;")
-        p("        _engine_log_override = path;")
-        p("    } else {")
-        p("        _engine_log_stdout = 0;")
-        p("        _engine_log_override = 0;")
-        p("    }")
-        p("}")
-        p("")
-        p("const char *engine_console_log_path(void) {")
-        p("    if (_engine_log_stdout) return \"-\";")
-        p("    if (_engine_log_override) return _engine_log_override;")
-        p("    return _engine_default_log_path();")
-        p("}")
-        p("")
-        p("static FILE *_engine_log(void) {")
-        p("    if (_engine_log_stdout) return stdout;")
-        p("    if (!_engine_log_opened) {")
-        p("        const char *path;")
-        p("        _engine_log_opened = 1;")
-        p("        path = _engine_log_override ? _engine_log_override")
-        p("                                   : _engine_default_log_path();")
-        p("        if (path) _engine_log_fp = fopen(path, \"w\");")
-        p("        if (!_engine_log_fp) {")
-        p("            _engine_log_stdout = 1;")
-        p("            return stdout;")
-        p("        }")
-        p("    }")
-        p("    return _engine_log_fp;")
-        p("}")
-        p("")
-        p("static void Debug_Log_f(float v) {")
-        p("    FILE *f = _engine_log();")
-        p("    if (!f) return;")
-        p("    fprintf(f, \"%g\\n\", (double)v);")
-        p("    fflush(f);")
-        p("}")
-        p("static void Debug_Log_i(int v) {")
-        p("    FILE *f = _engine_log();")
-        p("    if (!f) return;")
-        p("    fprintf(f, \"%d\\n\", v);")
-        p("    fflush(f);")
-        p("}")
-        p("static void Debug_Log_s(const char *s) {")
-        p("    FILE *f = _engine_log();")
-        p("    if (!f) return;")
-        p("    fputs(s ? s : \"Null\", f);")
-        p("    fputc('\\n', f);")
-        p("    fflush(f);")
-        p("}")
-        p("/* Call sites pick Debug_Log_{i,f,s} at rewrite (no C11 generics). */")
-        p("")
-    else:
-        p("void engine_set_log_file(const char *path) { (void)path; }")
-        p("const char *engine_console_log_path(void) { return \"\"; }")
-        p("")
+    _emit_engine_debug_log(p, plan, want_log)
     if not want_data_path:
         p("const char *engine_data_path(void) { return \"\"; }")
         p("")
     if not want_persistent_data_path:
         p("const char *engine_persistent_data_path(void) { return \"\"; }")
         p("")
-    if want_file_write_ops or want_file_read_bytes:
-        if want_file_bytes:
-            p("/* System.IO byte[] → ByteArray (WriteAllBytes / ReadAllBytes) */")
-            p("typedef struct {")
-            p("    const unsigned char *data;")
-            p("    int length;")
-            p("} ByteArray;")
-            p("")
-        if want_file_write_ops:
-            p("/* System.IO.File.WriteAllText / AppendAllText / WriteAllBytes */")
-            if not want_log:
-                p("#ifndef CRUST_NO_POSIX_MKDIR")
-                p("static int _engine_mkdir_p(char *path) {")
-                p("    char *p;")
-                p("    if (!path || !path[0]) return -1;")
-                p("    for (p = path + 1; *p; p++) {")
-                p("#ifdef _WIN32")
-                p("        if (*p == '/' || *p == '\\\\')")
-                p("#else")
-                p("        if (*p == '/')")
-                p("#endif")
-                p("        {")
-                p("            char sep = *p;")
-                p("            *p = 0;")
-                p("            if (ENGINE_MKDIR(path) != 0 && errno != EEXIST) {")
-                p("                *p = sep; return -1;")
-                p("            }")
-                p("            *p = sep;")
-                p("        }")
-                p("    }")
-                p("    if (ENGINE_MKDIR(path) != 0 && errno != EEXIST) return -1;")
-                p("    return 0;")
-                p("}")
-                p("#endif")
-                p("")
-            p("static void File_WriteContents(const char *path,")
-            p("                               const char *contents,")
-            p("                               const char *mode) {")
-            p("    FILE *fp;")
-            p("#ifndef CRUST_NO_POSIX_MKDIR")
-            p("    char dir[1024];")
-            p("    int n, i;")
-            p("    if (path && path[0]) {")
-            p("        n = (int)strlen(path);")
-            p("        if (n > 0 && (size_t)n < sizeof dir) {")
-            p("            for (i = 0; i < n; i++) dir[i] = path[i];")
-            p("            dir[n] = 0;")
-            p("            for (i = n - 1; i >= 0; i--) {")
-            p("#ifdef _WIN32")
-            p("                if (dir[i] == '/' || dir[i] == '\\\\')")
-            p("#else")
-            p("                if (dir[i] == '/')")
-            p("#endif")
-            p("                {")
-            p("                    dir[i] = 0;")
-            p("                    if (dir[0]) _engine_mkdir_p(dir);")
-            p("                    break;")
-            p("                }")
-            p("            }")
-            p("        }")
-            p("    }")
-            p("#endif")
-            p("    fp = fopen(path ? path : \"\", mode ? mode : \"w\");")
-            p("    if (!fp) return;")
-            p("    if (contents) fputs(contents, fp);")
-            p("    fclose(fp);")
-            p("}")
-            if want_file_write:
-                p("static void File_WriteAllText(const char *path,")
-                p("                              const char *contents) {")
-                p("    File_WriteContents(path, contents, \"w\");")
-                p("}")
-            if want_file_append:
-                p("static void File_AppendAllText(const char *path,")
-                p("                               const char *contents) {")
-                p("    File_WriteContents(path, contents, \"a\");")
-                p("}")
-            if want_file_write_bytes:
-                p("static void File_WriteAllBytes(const char *path, ByteArray bytes) {")
-                p("    FILE *fp;")
-                p("#ifndef CRUST_NO_POSIX_MKDIR")
-                p("    char dir[1024];")
-                p("    int n, i;")
-                p("    if (path && path[0]) {")
-                p("        n = (int)strlen(path);")
-                p("        if (n > 0 && (size_t)n < sizeof dir) {")
-                p("            for (i = 0; i < n; i++) dir[i] = path[i];")
-                p("            dir[n] = 0;")
-                p("            for (i = n - 1; i >= 0; i--) {")
-                p("#ifdef _WIN32")
-                p("                if (dir[i] == '/' || dir[i] == '\\\\')")
-                p("#else")
-                p("                if (dir[i] == '/')")
-                p("#endif")
-                p("                {")
-                p("                    dir[i] = 0;")
-                p("                    if (dir[0]) _engine_mkdir_p(dir);")
-                p("                    break;")
-                p("                }")
-                p("            }")
-                p("        }")
-                p("    }")
-                p("#endif")
-                p("    fp = fopen(path ? path : \"\", \"wb\");")
-                p("    if (!fp) return;")
-                p("    if (bytes.data && bytes.length > 0)")
-                p("        fwrite(bytes.data, 1, (size_t)bytes.length, fp);")
-                p("    fclose(fp);")
-                p("}")
-                # Literal helpers collected while lowering method bodies.
-                for bi, nums in enumerate(plan.get("byte_array_lits") or []):
-                    if not nums:
-                        p("static unsigned char _engine_ba_%d_data[1] = { 0 };"
-                          % bi)
-                        p("static ByteArray _engine_ba_%d(void) {" % bi)
-                        p("    ByteArray b;")
-                        p("    b.data = _engine_ba_%d_data;" % bi)
-                        p("    b.length = 0;")
-                        p("    return b;")
-                        p("}")
-                    else:
-                        p("static unsigned char _engine_ba_%d_data[%d] = { %s };"
-                          % (bi, len(nums),
-                             ", ".join(str(int(x) & 0xFF) for x in nums)))
-                        p("static ByteArray _engine_ba_%d(void) {" % bi)
-                        p("    ByteArray b;")
-                        p("    b.data = _engine_ba_%d_data;" % bi)
-                        p("    b.length = %d;" % len(nums))
-                        p("    return b;")
-                        p("}")
-        if want_file_read_bytes:
-            p("/* System.IO.File.ReadAllBytes — malloc buffer (no free). */")
-            p("static ByteArray File_ReadAllBytes(const char *path) {")
-            p("    ByteArray out;")
-            p("    FILE *fp;")
-            p("    unsigned char chunk[4096];")
-            p("    unsigned char *buf;")
-            p("    size_t cap, len, n;")
-            p("    out.data = 0;")
-            p("    out.length = 0;")
-            p("    if (!path || !path[0]) return out;")
-            p("    fp = fopen(path, \"rb\");")
-            p("    if (!fp) return out;")
-            p("    cap = 4096;")
-            p("    len = 0;")
-            p("    buf = (unsigned char *)malloc(cap);")
-            p("    if (!buf) { fclose(fp); return out; }")
-            p("    for (;;) {")
-            p("        n = fread(chunk, 1, sizeof chunk, fp);")
-            p("        if (n == 0) break;")
-            p("        if (len + n > cap) {")
-            p("            cap = cap + n + 4096;")
-            p("            {")
-            p("                unsigned char *nb = (unsigned char *)realloc(buf, cap);")
-            p("                if (!nb) { free(buf); fclose(fp); return out; }")
-            p("                buf = nb;")
-            p("            }")
-            p("        }")
-            p("        memcpy(buf + len, chunk, n);")
-            p("        len += n;")
-            p("    }")
-            p("    fclose(fp);")
-            p("    out.data = buf;")
-            p("    out.length = (int)len;")
-            p("    return out;")
-            p("}")
-        p("")
+    _emit_engine_file_bytes(
+            p, plan, want_file_append, want_file_bytes, want_file_read_bytes,
+            want_file_write, want_file_write_bytes, want_file_write_ops, want_log)
     if want_file_exists:
         # fopen probe — no unistd/access (crust subset); dirs fail like .NET.
         p("/* System.IO.File.Exists */")
@@ -12168,129 +12885,9 @@ def emit_engine(plan, analyses, used_apis):
         p("    (void)remove(path);")
         p("}")
         p("")
-    if want_file_copy:
-        # Copy(src, dest[, overwrite]) — fread/fwrite; no throw.
-        p("/* System.IO.File.Copy — fread/fwrite (+ mkdir dest parent) */")
-        p("static void File_Copy(const char *src, const char *dst,")
-        p("                      int overwrite) {")
-        p("    FILE *in;")
-        p("    FILE *out;")
-        p("    unsigned char buf[4096];")
-        p("    size_t n;")
-        p("    if (!src || !src[0] || !dst || !dst[0]) return;")
-        p("    if (!overwrite) {")
-        p("        out = fopen(dst, \"rb\");")
-        p("        if (out) { fclose(out); return; }")
-        p("    }")
-        p("#ifndef CRUST_NO_POSIX_MKDIR")
-        p("    {")
-        p("        char dir[1024];")
-        p("        int dn, i;")
-        p("        dn = (int)strlen(dst);")
-        p("        if (dn > 0 && (size_t)dn < sizeof dir) {")
-        p("            for (i = 0; i < dn; i++) dir[i] = dst[i];")
-        p("            dir[dn] = 0;")
-        p("            for (i = dn - 1; i >= 0; i--) {")
-        p("#ifdef _WIN32")
-        p("                if (dir[i] == '/' || dir[i] == '\\\\')")
-        p("#else")
-        p("                if (dir[i] == '/')")
-        p("#endif")
-        p("                {")
-        p("                    dir[i] = 0;")
-        p("                    if (dir[0]) _engine_mkdir_p(dir);")
-        p("                    break;")
-        p("                }")
-        p("            }")
-        p("        }")
-        p("    }")
-        p("#endif")
-        p("    in = fopen(src, \"rb\");")
-        p("    if (!in) return;")
-        p("    out = fopen(dst, \"wb\");")
-        p("    if (!out) { fclose(in); return; }")
-        p("    for (;;) {")
-        p("        n = fread(buf, 1, sizeof buf, in);")
-        p("        if (n == 0) break;")
-        p("        if (fwrite(buf, 1, n, out) != n) break;")
-        p("    }")
-        p("    fclose(in);")
-        p("    fclose(out);")
-        p("}")
-        p("")
-    if want_file_text_stream:
-        p("/* System.IO.StreamWriter / StreamReader — FILE* text streams */")
-        p("typedef FILE *StreamWriter;")
-        p("typedef FILE *StreamReader;")
-        p("")
-        if want_file_create_text:
-            p("/* System.IO.File.CreateText — fopen \"w\" (+ mkdir). */")
-            p("static StreamWriter File_CreateText(const char *path) {")
-            p("    FILE *fp;")
-            p("#ifndef CRUST_NO_POSIX_MKDIR")
-            p("    char dir[1024];")
-            p("    int n, i;")
-            p("    if (path && path[0]) {")
-            p("        n = (int)strlen(path);")
-            p("        if (n > 0 && (size_t)n < sizeof dir) {")
-            p("            for (i = 0; i < n; i++) dir[i] = path[i];")
-            p("            dir[n] = 0;")
-            p("            for (i = n - 1; i >= 0; i--) {")
-            p("#ifdef _WIN32")
-            p("                if (dir[i] == '/' || dir[i] == '\\\\')")
-            p("#else")
-            p("                if (dir[i] == '/')")
-            p("#endif")
-            p("                {")
-            p("                    dir[i] = 0;")
-            p("                    if (dir[0]) _engine_mkdir_p(dir);")
-            p("                    break;")
-            p("                }")
-            p("            }")
-            p("        }")
-            p("    }")
-            p("#endif")
-            p("    fp = fopen(path ? path : \"\", \"w\");")
-            p("    return fp;")
-            p("}")
-            p("")
-        if want_file_open_text:
-            p("/* System.IO.File.OpenText — fopen \"r\". */")
-            p("static StreamReader File_OpenText(const char *path) {")
-            p("    if (!path || !path[0]) return 0;")
-            p("    return fopen(path, \"r\");")
-            p("}")
-            p("")
-        if want_file_create_text:
-            p("static void StreamWriter_WriteLine(StreamWriter fp,")
-            p("                                   const char *s) {")
-            p("    if (!fp) return;")
-            p("    fputs(s ? s : \"\", fp);")
-            p("    fputc('\\n', fp);")
-            p("    fflush(fp);")
-            p("}")
-            p("")
-        if want_file_open_text:
-            # Alternate two buffers so consecutive ReadLine() keep both lines.
-            p("static char _engine_readline_buf[2][4096];")
-            p("static int _engine_readline_i;")
-            p("static const char *StreamReader_ReadLine(StreamReader fp) {")
-            p("    char *buf;")
-            p("    size_t n;")
-            p("    if (!fp) return \"\";")
-            p("    buf = _engine_readline_buf[_engine_readline_i++ & 1];")
-            p("    if (!fgets(buf, (int)sizeof _engine_readline_buf[0], fp))")
-            p("        return \"\";")
-            p("    n = strlen(buf);")
-            p("    if (n > 0 && buf[n - 1] == '\\n') buf[n - 1] = 0;")
-            p("    if (n > 1 && buf[n - 2] == '\\r') buf[n - 2] = 0;")
-            p("    return buf;")
-            p("}")
-            p("")
-        p("static void Stream_Close(FILE *fp) {")
-        p("    if (fp) fclose(fp);")
-        p("}")
-        p("")
+    _emit_engine_file_copy(p, want_file_copy)
+    _emit_engine_file_streams(
+            p, want_file_create_text, want_file_open_text, want_file_text_stream)
     if want_console:
         p("/* System.Console.WriteLine → stdout (terminal), not Player.log */")
         p("static void Console_WriteLine_f(float v) {")
@@ -12319,582 +12916,13 @@ def emit_engine(plan, analyses, used_apis):
     p("}")
     p("")
 
-    if want_go_tables:
-        go_names = plan.get("go_names") or []
-        go_comps = plan.get("go_components") or {}
-        go_rb2d = plan.get("go_rigidbody2d") or {}
-        go_rb3d = plan.get("go_rigidbody") or {}
-        go_authored = len(go_names)
-        go_cap = max(1, go_authored + go_spawn_budget)
-        p("/* GameObject.Find / GetComponent — live GO tables (seeded authored) */")
-        if go_spawn_budget:
-            p("static int _engine_go_count = %d;" % go_authored)
-            p("static const int _engine_go_cap = %d;" % go_cap)
-        else:
-            p("static const int _engine_go_count = %d;" % go_authored)
-        if go_names or go_spawn_budget:
-            p("static const char *_engine_go_name[%d] = {" % go_cap)
-            for n in go_names:
-                p("    %s," % _c_string(n))
-            for _pad in range(go_spawn_budget):
-                p("    \"\", /* instantiate spare */")
-            if not go_names and not go_spawn_budget:
-                p("    \"\",")
-            p("};")
-        else:
-            p("static const char *_engine_go_name[1] = { \"\" };")
-        # Unity catches script exceptions: log + unwind the current method.
-        p("static jmp_buf _engine_script_jmp;")
-        p("static int _engine_in_script = 0;")
-        p("static void _engine_null_reference_at(")
-        p("    const char *cls, const char *method,")
-        p("    const char *path, int line) {")
-        p("    fprintf(stderr, \"NullReferenceException: Object reference "
-          "not set to an instance of an object\\n\");")
-        p("    if (cls && method && path && path[0] && line > 0)")
-        p("        fprintf(stderr, \"%s.%s () (at %s:%d)\\n\",")
-        p("                cls, method, path, line);")
-        p("    else if (cls && method)")
-        p("        fprintf(stderr, \"%s.%s ()\\n\", cls, method);")
-        p("    if (_engine_in_script)")
-        p("        longjmp(_engine_script_jmp, 1);")
-        p("}")
-        p("")
-        if want_add_any:
-            p("static void _engine_cant_add_component("
-              "const char *comp, int go) {")
-            p("    const char *gon;")
-            p("    if (go < 0 || go >= _engine_go_count) gon = \"\";")
-            p("    else gon = _engine_go_name[go];")
-            p("    fprintf(stderr, \"Can't add component '%s' to %s "
-              "because such a component is already added to the "
-              "game object!\\n\",")
-            p("            comp, gon);")
-            p("}")
-            p("")
-        # Per MonoBehaviour class: instance index at each GO, or -1.
-        for cname in sorted(plan["classes"]):
-            idn = _c_ident(cname)
-            vals = ["-1"] * max(1, len(go_names) + go_spawn_budget)
-            if not go_names and not go_spawn_budget:
-                vals = ["-1"]
-            for i, o in enumerate(
-                    plan["classes"][cname].get("instances") or []):
-                gi = o.get("go_index")
-                if gi is None or gi < 0 or gi >= len(vals):
-                    continue
-                vals[int(gi)] = str(i)
-            mb_extra = _mb_pool_extra(plan, cname)
-            mb_add = int(add_budget.get(cname) or 0)
-            mb_inst = int(inst_budget.get(cname) or 0)
-            # Live GO→component map whenever GetComponent/AddComponent/
-            # Instantiate/FindObjectOfType can see runtime changes.
-            live_go = (
-                mb_extra
-                or cname in getcomponent_types
-                or cname in findobject_types
-                or "GetComponent" in used_apis
-                or want_findobject
-                or want_instantiate)
-            if live_go:
-                p("static int _engine_go_%s[%d] = { %s };" % (
-                    idn, len(vals), ", ".join(vals)))
-            else:
-                p("static const int _engine_go_%s[%d] = { %s };" % (
-                    idn, len(vals), ", ".join(vals)))
-            # this instance i → GO index (for GetComponent on this).
-            authored_n = int(plan["classes"][cname]["n"])
-            cap_n = authored_n + mb_extra
-            rev = ["-1"] * max(1, cap_n)
-            for i, o in enumerate(
-                    plan["classes"][cname].get("instances") or []):
-                gi = o.get("go_index")
-                if gi is None or i >= len(rev):
-                    continue
-                rev[i] = str(int(gi))
-            if live_go:
-                p("static int _engine_%s_go_of[%d] = { %s };" % (
-                    idn, len(rev), ", ".join(rev)))
-            else:
-                p("static const int _engine_%s_go_of[%d] = { %s };" % (
-                    idn, len(rev), ", ".join(rev)))
-            p("static int _engine_go_of_%s(unsigned i) {" % idn)
-            p("    if (i >= %du) return -1;" % len(rev))
-            p("    return _engine_%s_go_of[i];" % idn)
-            p("}")
-        if want_find:
-            p("static int GameObject_Find(const char *name) {")
-            p("    int i;")
-            p("    if (!name) return -1;")
-            p("    for (i = 0; i < _engine_go_count; i = i + 1)")
-            p("        if (strcmp(_engine_go_name[i], name) == 0) return i;")
-            p("    return -1;")
-            p("}")
-            p("")
-            # Unity prints "null" for a missing Object (Find miss / destroyed).
-            p("/* UnityEngine.Object.ToString — \"name (Type)\", else \"null\" */")
-            p("static char _object_tostring_buf[256];")
-            p("static const char *Object_ToString(int go) {")
-            p("    int n;")
-            p("    if (go < 0 || go >= _engine_go_count) return \"null\";")
-            p("    n = snprintf(_object_tostring_buf, sizeof _object_tostring_buf,")
-            p("                 \"%s (UnityEngine.GameObject)\",")
-            p("                 _engine_go_name[go]);")
-            p("    if (n < 0 || (size_t)n >= sizeof _object_tostring_buf)")
-            p("        return _engine_go_name[go];")
-            p("    return _object_tostring_buf;")
-            p("}")
-            p("")
-        # Transform / RectTransform ≡ GO index (live handle, no side table).
-        for tr_ty in sorted(getcomponent_types & _TRANSFORM_GETCOMPONENT_TYPES):
-            if not want_go_tables:
-                break
-            p("static int GameObject_GetComponent_%s(int go) {" % tr_ty)
-            p("    if (go < 0 || go >= _engine_go_count) return -1;")
-            p("    return go;")
-            p("}")
-            p("")
-        # Live uGUI GetComponent maps (mutable; seeded from authored presence).
-        ui_gc = sorted(
-            (getcomponent_types & _UI_GETCOMPONENT_TYPES)
-            - _TRANSFORM_GETCOMPONENT_TYPES)
-        if ui_gc and want_go_tables:
-            ui_maps = plan.get("go_ui_components") or {}
-            for ty in ui_gc:
-                idn = _c_ident(ty)
-                present = set(ui_maps.get(ty) or [])
-                vals = []
-                for i in range(len(go_names) if go_names else 0):
-                    if i in present:
-                        vals.append(str(i))
-                    else:
-                        vals.append("-1")
-                for _pad in range(go_spawn_budget):
-                    vals.append("-1")
-                if not vals:
-                    vals = ["-1"]
-                p("/* GetComponent<%s> — live GO map */" % ty)
-                p("static int _engine_go_%s[%d] = { %s };" % (
-                    idn, len(vals), ", ".join(vals)))
-                p("static int GameObject_GetComponent_%s(int go) {" % idn)
-                p("    if (go < 0 || go >= _engine_go_count) return -1;")
-                p("    return _engine_go_%s[go];" % idn)
-                p("}")
-                p("")
-        # Emit GetComponent_<T> for every packed class (and requested types).
-        # Skip names already owned by UI / physics / Transform helpers — a
-        # packed class must not redefine those C symbols.
-        for cname in sorted(set(plan["classes"]) | (
-                getcomponent_types - _PHYSICS_COMPONENTS
-                - _UI_GETCOMPONENT_TYPES
-                - _TRANSFORM_GETCOMPONENT_TYPES) | (
-                add_types - _ADDABLE_BUILTINS)):
-            if cname not in plan["classes"]:
-                continue
-            if cname in _RESERVED_PACKED_CLASS_NAMES:
-                continue
-            idn = _c_ident(cname)
-            mb_extra = _mb_pool_extra(plan, cname)
-            mb_add = int(add_budget.get(cname) or 0)
-            p("static int GameObject_GetComponent_%s(int go) {" % idn)
-            p("    if (go < 0 || go >= _engine_go_count) return -1;")
-            p("    return _engine_go_%s[go];" % idn)
-            p("}")
-            p("")
-            if mb_add:
-                cap = int(plan["classes"][cname]["n"]) + mb_extra
-                p("static int GameObject_AddComponent_%s(int go) {" % idn)
-                p("    int ex;")
-                p("    if (go < 0 || go >= _engine_go_count) return -1;")
-                p("    ex = _engine_go_%s[go];" % idn)
-                if cname in disallow_multi:
-                    p("    if (ex >= 0) {")
-                    p("        _engine_cant_add_component(\"%s\", go);"
-                      % cname)
-                    p("        return -1;")
-                    p("    }")
-                else:
-                    p("    if (ex >= 0) return ex;")
-                p("    if (_%s_inst_count >= %d) return -1;" % (idn, cap))
-                p("    ex = _%s_inst_count;" % idn)
-                p("    _%s_inst_count = _%s_inst_count + 1;" % (idn, idn))
-                p("    _engine_go_%s[go] = ex;" % idn)
-                p("    if (ex >= 0 && ex < %d)" % cap)
-                p("        _engine_%s_go_of[ex] = go;" % idn)
-                p("    return ex;")
-                p("}")
-                p("")
-                p("static char _%s_tostring_buf[256];" % idn)
-                p("static const char *%s_ToString(int ci) {" % idn)
-                p("    int n, go;")
-                p("    if (ci < 0 || ci >= _%s_inst_count) return \"null\";"
-                  % idn)
-                p("    go = _engine_%s_go_of[ci];" % idn)
-                p("    if (go < 0 || go >= _engine_go_count) return \"null\";")
-                p("    n = snprintf(_%s_tostring_buf, sizeof _%s_tostring_buf,"
-                  % (idn, idn))
-                p("                 \"%%s (%s)\", _engine_go_name[go]);" % cname)
-                p("    if (n < 0 || (size_t)n >= sizeof _%s_tostring_buf)"
-                  % idn)
-                p("        return _engine_go_name[go];")
-                p("    return _%s_tostring_buf;" % idn)
-                p("}")
-                p("")
-        if want_rb2d:
-            vals = []
-            for i in range(len(go_names) if go_names else 0):
-                vals.append(str(go_rb2d[i]) if i in go_rb2d else "-1")
-            for _pad in range(go_spawn_budget):
-                vals.append("-1")
-            if not vals:
-                vals = ["-1"]
-            rb2d_add = int(add_budget.get("Rigidbody2D") or 0)
-            if rb2d_add:
-                p("static int _engine_go_Rigidbody2D[%d] = { %s };" % (
-                    len(vals), ", ".join(vals)))
-            else:
-                p("static const int _engine_go_Rigidbody2D[%d] = { %s };" % (
-                    len(vals), ", ".join(vals)))
-            p("static int GameObject_GetComponent_Rigidbody2D(int go) {")
-            p("    if (go < 0 || go >= _engine_go_count) return -1;")
-            p("    return _engine_go_Rigidbody2D[go];")
-            p("}")
-            p("")
-            if rb2d_add:
-                p("static int GameObject_AddComponent_Rigidbody2D(int go) {")
-                p("    int ex, oi, oc, c;")
-                p("    if (go < 0 || go >= _engine_go_count) return -1;")
-                p("    ex = _engine_go_Rigidbody2D[go];")
-                if "Rigidbody2D" in disallow_multi:
-                    p("    if (ex >= 0) {")
-                    p("        _engine_cant_add_component(\"Rigidbody2D\", go);")
-                    p("        return -1;")
-                    p("    }")
-                else:
-                    p("    if (ex >= 0) return ex;")
-                p("    if (_Rigidbody2D_count >= %d) return -1;" % max(1, rb2d_cap))
-                p("    ex = _Rigidbody2D_count;")
-                p("    _Rigidbody2D_count = _Rigidbody2D_count + 1;")
-                p("    _engine_go_Rigidbody2D[go] = ex;")
-                p("    _Rigidbody2D_vel_x[ex] = 0.f;")
-                p("    _Rigidbody2D_vel_y[ex] = 0.f;")
-                p("    _Rigidbody2D_gravity_scale[ex] = 1.f;")
-                p("    _Rigidbody2D_linear_damping[ex] = 0.f;")
-                p("    _Rigidbody2D_mass[ex] = 1.f;")
-                p("    _Rigidbody2D_body_type[ex] = 0;")
-                p("    oc = -1; oi = 0;")
-                for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
-                    idn = _c_ident(cname)
-                    p("    c = _engine_go_%s[go];" % idn)
-                    p("    if (c >= 0) { oc = %d; oi = c; }" % cid)
-                p("    _Rigidbody2D_owner_class[ex] = oc;")
-                p("    _Rigidbody2D_owner_inst[ex] = oi;")
-                p("    return ex;")
-                p("}")
-                p("")
-                p("static char _Rigidbody2D_tostring_buf[256];")
-                p("static const char *Rigidbody2D_ToString(int ci) {")
-                p("    int n, go;")
-                p("    if (ci < 0 || ci >= _Rigidbody2D_count) return \"null\";")
-                p("    for (go = 0; go < _engine_go_count; go = go + 1)")
-                p("        if (_engine_go_Rigidbody2D[go] == ci) break;")
-                p("    if (go >= _engine_go_count) return \"null\";")
-                p("    n = snprintf(_Rigidbody2D_tostring_buf,")
-                p("                 sizeof _Rigidbody2D_tostring_buf,")
-                p("                 \"%s (UnityEngine.Rigidbody2D)\",")
-                p("                 _engine_go_name[go]);")
-                p("    if (n < 0 || (size_t)n >= sizeof _Rigidbody2D_tostring_buf)")
-                p("        return _engine_go_name[go];")
-                p("    return _Rigidbody2D_tostring_buf;")
-                p("}")
-                p("")
-        if want_rb3d:
-            vals = []
-            for i in range(len(go_names) if go_names else 0):
-                vals.append(str(go_rb3d[i]) if i in go_rb3d else "-1")
-            for _pad in range(go_spawn_budget):
-                vals.append("-1")
-            if not vals:
-                vals = ["-1"]
-            rb3d_add = int(add_budget.get("Rigidbody") or 0)
-            if rb3d_add:
-                p("static int _engine_go_Rigidbody[%d] = { %s };" % (
-                    len(vals), ", ".join(vals)))
-            else:
-                p("static const int _engine_go_Rigidbody[%d] = { %s };" % (
-                    len(vals), ", ".join(vals)))
-            p("static int GameObject_GetComponent_Rigidbody(int go) {")
-            p("    if (go < 0 || go >= _engine_go_count) return -1;")
-            p("    return _engine_go_Rigidbody[go];")
-            p("}")
-            p("")
-            if rb3d_add:
-                p("static int GameObject_AddComponent_Rigidbody(int go) {")
-                p("    int ex, oi, oc, c;")
-                p("    if (go < 0 || go >= _engine_go_count) return -1;")
-                p("    ex = _engine_go_Rigidbody[go];")
-                if "Rigidbody" in disallow_multi:
-                    p("    if (ex >= 0) {")
-                    p("        _engine_cant_add_component(\"Rigidbody\", go);")
-                    p("        return -1;")
-                    p("    }")
-                else:
-                    p("    if (ex >= 0) return ex;")
-                p("    if (_Rigidbody_count >= %d) return -1;" % max(1, rb3d_cap))
-                p("    ex = _Rigidbody_count;")
-                p("    _Rigidbody_count = _Rigidbody_count + 1;")
-                p("    _engine_go_Rigidbody[go] = ex;")
-                p("    _Rigidbody_vel_x[ex] = 0.f;")
-                p("    _Rigidbody_vel_y[ex] = 0.f;")
-                p("    _Rigidbody_vel_z[ex] = 0.f;")
-                p("    _Rigidbody_mass[ex] = 1.f;")
-                p("    _Rigidbody_drag[ex] = 0.f;")
-                p("    _Rigidbody_use_gravity[ex] = 1;")
-                p("    oc = -1; oi = 0;")
-                for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
-                    idn = _c_ident(cname)
-                    p("    c = _engine_go_%s[go];" % idn)
-                    p("    if (c >= 0) { oc = %d; oi = c; }" % cid)
-                p("    _Rigidbody_owner_class[ex] = oc;")
-                p("    _Rigidbody_owner_inst[ex] = oi;")
-                p("    return ex;")
-                p("}")
-                p("")
-                p("static char _Rigidbody_tostring_buf[256];")
-                p("static const char *Rigidbody_ToString(int ci) {")
-                p("    int n, go;")
-                p("    if (ci < 0 || ci >= _Rigidbody_count) return \"null\";")
-                p("    for (go = 0; go < _engine_go_count; go = go + 1)")
-                p("        if (_engine_go_Rigidbody[go] == ci) break;")
-                p("    if (go >= _engine_go_count) return \"null\";")
-                p("    n = snprintf(_Rigidbody_tostring_buf,")
-                p("                 sizeof _Rigidbody_tostring_buf,")
-                p("                 \"%s (UnityEngine.Rigidbody)\",")
-                p("                 _engine_go_name[go]);")
-                p("    if (n < 0 || (size_t)n >= sizeof _Rigidbody_tostring_buf)")
-                p("        return _engine_go_name[go];")
-                p("    return _Rigidbody_tostring_buf;")
-                p("}")
-                p("")
-
-        # Camera / Light / SpriteRenderer / Collider AddComponent pools.
-        def _emit_simple_add(type_name, unity_name, budget_key=None,
-                             authored_names=None):
-            bk = budget_key or type_name
-            bud = int(add_budget.get(bk) or 0)
-            if type_name not in add_types and not bud:
-                return
-            if bud <= 0:
-                bud = 1
-            idn = _c_ident(type_name)
-            go_n = max(1, len(go_names))
-            authored = authored_names or set()
-            init_vals = []
-            for i, _n in enumerate(go_names if go_names else [""]):
-                # >=0 marks present (authored sentinel 0). Keys are go indices.
-                init_vals.append("0" if i in authored else "-1")
-            p("static int _engine_go_%s[%d] = { %s };" % (
-                idn, go_n, ", ".join(init_vals)))
-            p("static int _%s_live = 0;" % idn)
-            p("static const int _%s_cap = %d;" % (idn, bud))
-            p("static int _%s_owner_go[%d];" % (idn, bud))
-            p("static int GameObject_GetComponent_%s(int go) {" % idn)
-            p("    if (go < 0 || go >= _engine_go_count) return -1;")
-            p("    return _engine_go_%s[go];" % idn)
-            p("}")
-            p("static int GameObject_AddComponent_%s(int go) {" % idn)
-            p("    int ex;")
-            p("    if (go < 0 || go >= _engine_go_count) return -1;")
-            p("    ex = _engine_go_%s[go];" % idn)
-            if type_name in disallow_multi:
-                p("    if (ex >= 0) {")
-                p("        _engine_cant_add_component(\"%s\", go);"
-                  % type_name)
-                p("        return -1;")
-                p("    }")
-            else:
-                p("    if (ex >= 0) return ex;")
-            p("    if (_%s_live >= _%s_cap) return -1;" % (idn, idn))
-            p("    ex = _%s_live;" % idn)
-            p("    _%s_live = _%s_live + 1;" % (idn, idn))
-            p("    _engine_go_%s[go] = ex;" % idn)
-            p("    _%s_owner_go[ex] = go;" % idn)
-            p("    return ex;")
-            p("}")
-            p("static char _%s_tostring_buf[256];" % idn)
-            p("static const char *%s_ToString(int ci) {" % idn)
-            p("    int n, go;")
-            p("    if (ci < 0 || ci >= _%s_live) return \"null\";" % idn)
-            p("    go = _%s_owner_go[ci];" % idn)
-            p("    if (go < 0 || go >= _engine_go_count) return \"null\";")
-            p("    n = snprintf(_%s_tostring_buf, sizeof _%s_tostring_buf,"
-              % (idn, idn))
-            p("                 \"%%s (%s)\", _engine_go_name[go]);"
-              % unity_name)
-            p("    if (n < 0 || (size_t)n >= sizeof _%s_tostring_buf)" % idn)
-            p("        return _engine_go_name[go];")
-            p("    return _%s_tostring_buf;" % idn)
-            p("}")
-            p("")
-
-        if want_add_camera:
-            _emit_simple_add("Camera", "UnityEngine.Camera")
-        if want_add_sprite:
-            _emit_simple_add("SpriteRenderer", "UnityEngine.SpriteRenderer",
-                             authored_names=go_has_sprite)
-        elif ("SpriteRenderer" in getcomponent_types
-              or "SpriteRenderer" in getcomponentsinchildren_types):
-            # GetComponent / GetComponentsInChildren without AddComponent pool.
-            idn = "SpriteRenderer"
-            go_n_sr = max(1, len(go_names) + go_spawn_budget)
-            init_vals = []
-            for i, _n in enumerate(go_names if go_names else []):
-                init_vals.append("0" if i in go_has_sprite else "-1")
-            for _pad in range(go_spawn_budget):
-                init_vals.append("-1")
-            if not init_vals:
-                init_vals = ["-1"]
-            p("/* SpriteRenderer — authored presence (GetComponent / "
-              "GetComponentsInChildren) */")
-            p("static int _engine_go_%s[%d] = { %s };" % (
-                idn, len(init_vals), ", ".join(init_vals)))
-            p("static int GameObject_GetComponent_%s(int go) {" % idn)
-            p("    if (go < 0 || go >= _engine_go_count) return -1;")
-            p("    return _engine_go_%s[go];" % idn)
-            p("}")
-            p("")
-        if want_add_light:
-            # Light also grows the authored light tables when present.
-            bud = int(add_budget.get("Light") or 0) or 1
-            go_n = max(1, len(go_names))
-            p("static int _engine_go_Light[%d];" % go_n)
-            p("static int _Light_go_inited = 0;")
-            p("static void _Light_ensure_go_map(void) {")
-            p("    int i;")
-            p("    if (_Light_go_inited) return;")
-            p("    _Light_go_inited = 1;")
-            p("    for (i = 0; i < _engine_go_count; i = i + 1)")
-            p("        _engine_go_Light[i] = -1;")
-            p("}")
-            p("static int GameObject_GetComponent_Light(int go) {")
-            p("    _Light_ensure_go_map();")
-            p("    if (go < 0 || go >= _engine_go_count) return -1;")
-            p("    return _engine_go_Light[go];")
-            p("}")
-            p("static int GameObject_AddComponent_Light(int go) {")
-            p("    int ex;")
-            p("    _Light_ensure_go_map();")
-            p("    if (go < 0 || go >= _engine_go_count) return -1;")
-            p("    ex = _engine_go_Light[go];")
-            if "Light" in disallow_multi:
-                p("    if (ex >= 0) {")
-                p("        _engine_cant_add_component(\"Light\", go);")
-                p("        return -1;")
-                p("    }")
-            else:
-                p("    if (ex >= 0) return ex;")
-            p("    if (_Light_count >= %d) return -1;" % max(1, light_cap))
-            p("    ex = _Light_count;")
-            p("    _Light_count = _Light_count + 1;")
-            p("    _engine_go_Light[go] = ex;")
-            p("    _Light_intensity[ex] = 1.f;")
-            p("    _Light_color_r[ex] = 1.f;")
-            p("    _Light_color_g[ex] = 1.f;")
-            p("    _Light_color_b[ex] = 1.f;")
-            p("    return ex;")
-            p("}")
-            p("static char _Light_tostring_buf[256];")
-            p("static const char *Light_ToString(int ci) {")
-            p("    int n, go;")
-            p("    if (ci < 0 || ci >= _Light_count) return \"null\";")
-            p("    for (go = 0; go < _engine_go_count; go = go + 1)")
-            p("        if (_engine_go_Light[go] == ci) break;")
-            p("    if (go >= _engine_go_count) return \"null\";")
-            p("    n = snprintf(_Light_tostring_buf, sizeof _Light_tostring_buf,")
-            p("                 \"%s (UnityEngine.Light)\", _engine_go_name[go]);")
-            p("    if (n < 0 || (size_t)n >= sizeof _Light_tostring_buf)")
-            p("        return _engine_go_name[go];")
-            p("    return _Light_tostring_buf;")
-            p("}")
-            p("")
-        if want_add_audio:
-            asrc = plan.get("audiosources") or []
-            as_budget = int(add_budget.get("AudioSource") or 0)
-            as_cap = max(1, len(asrc) + as_budget)
-            go_n = max(1, len(go_names))
-            go_as = plan.get("go_audiosource") or {}
-            vals = []
-            for i in range(len(go_names) if go_names else 0):
-                vals.append(str(int(go_as[i])) if i in go_as else "-1")
-            if not go_names:
-                vals = ["-1"]
-            p("/* AudioSource — authored !u!82 + AddComponent pool (multi OK). */")
-            p("extern int _AudioSource_count;")
-            p("extern int _AudioSource_owner_go[%d];" % as_cap)
-            p("extern int _AudioSource_play_on_awake[%d];" % as_cap)
-            p("extern int _AudioSource_loop[%d];" % as_cap)
-            p("extern int _AudioSource_mute[%d];" % as_cap)
-            p("extern float _AudioSource_volume[%d];" % as_cap)
-            p("extern float _AudioSource_pitch[%d];" % as_cap)
-            p("extern int _AudioSource_clip[%d];" % as_cap)
-            p("extern int _AudioSource_playing[%d];" % as_cap)
-            p("static int _engine_go_AudioSource[%d] = { %s };" % (
-                go_n, ", ".join(vals)))
-            p("static int GameObject_GetComponent_AudioSource(int go) {")
-            p("    if (go < 0 || go >= _engine_go_count) return -1;")
-            p("    return _engine_go_AudioSource[go];")
-            p("}")
-            p("static int GameObject_AddComponent_AudioSource(int go) {")
-            p("    int ex, first;")
-            p("    if (go < 0 || go >= _engine_go_count) return -1;")
-            p("    first = _engine_go_AudioSource[go];")
-            p("    if (_AudioSource_count >= %d) return -1;" % as_cap)
-            p("    ex = _AudioSource_count;")
-            p("    _AudioSource_count = _AudioSource_count + 1;")
-            p("    if (first < 0)")
-            p("        _engine_go_AudioSource[go] = ex;")
-            p("    _AudioSource_owner_go[ex] = go;")
-            p("    _AudioSource_play_on_awake[ex] = 1;")
-            p("    _AudioSource_loop[ex] = 0;")
-            p("    _AudioSource_mute[ex] = 0;")
-            p("    _AudioSource_volume[ex] = 1.f;")
-            p("    _AudioSource_pitch[ex] = 1.f;")
-            p("    _AudioSource_clip[ex] = -1;")
-            p("    _AudioSource_playing[ex] = 0;")
-            p("    return ex;")
-            p("}")
-            p("static void AudioSource_Play(int ci) {")
-            p("    if (ci < 0 || ci >= _AudioSource_count) return;")
-            p("    if (_AudioSource_mute[ci]) return;")
-            p("    _AudioSource_playing[ci] = 1;")
-            p("    /* host may observe _AudioSource_playing / clip */")
-            p("}")
-            p("static void AudioSource_Stop(int ci) {")
-            p("    if (ci < 0 || ci >= _AudioSource_count) return;")
-            p("    _AudioSource_playing[ci] = 0;")
-            p("}")
-            p("static char _AudioSource_tostring_buf[256];")
-            p("static const char *AudioSource_ToString(int ci) {")
-            p("    int n, go;")
-            p("    if (ci < 0 || ci >= _AudioSource_count) return \"null\";")
-            p("    go = _AudioSource_owner_go[ci];")
-            p("    if (go < 0 || go >= _engine_go_count) return \"null\";")
-            p("    n = snprintf(_AudioSource_tostring_buf,")
-            p("                 sizeof _AudioSource_tostring_buf,")
-            p("                 \"%s (UnityEngine.AudioSource)\",")
-            p("                 _engine_go_name[go]);")
-            p("    if (n < 0 || (size_t)n >= sizeof _AudioSource_tostring_buf)")
-            p("        return _engine_go_name[go];")
-            p("    return _AudioSource_tostring_buf;")
-            p("}")
-            p("")
-        for col_ty, unity_ty in (
-                ("BoxCollider2D", "UnityEngine.BoxCollider2D"),
-                ("CircleCollider2D", "UnityEngine.CircleCollider2D"),
-                ("BoxCollider", "UnityEngine.BoxCollider"),
-                ("SphereCollider", "UnityEngine.SphereCollider")):
-            if col_ty in add_types:
-                _emit_simple_add(col_ty, unity_ty)
+    _emit_engine_gameobject_tables(
+            add_budget, add_types, class_ids, disallow_multi, findobject_types,
+            getcomponent_types, getcomponentsinchildren_types, go_has_sprite,
+            go_spawn_budget, inst_budget, light_cap, p, plan, rb2d_cap, rb3d_cap,
+            used_apis, want_add_any, want_add_audio, want_add_camera, want_add_light,
+            want_add_sprite, want_find, want_findobject, want_go_tables,
+            want_instantiate, want_rb2d, want_rb3d)
 
     if want_toggle_is_on:
         go_n = max(1, len(plan.get("go_names") or []) or 1)
@@ -12916,2198 +12944,29 @@ def emit_engine(plan, analyses, used_apis):
         p("}")
         p("")
 
-    if (want_ui or want_transform_find or want_transform_parent
-            or want_set_parent or want_get_sibling or want_live_rt):
-        go_names = plan.get("go_names") or []
-        go_authored_n = len(go_names)
-        go_n = max(1, go_authored_n + go_spawn_budget)
-        go_parents = plan.get("go_parents") or ([-1] * max(1, go_authored_n))
-        if len(go_parents) < go_authored_n:
-            go_parents = list(go_parents) + [-1] * (
-                go_authored_n - len(go_parents))
-        go_parents = list(go_parents[:go_authored_n]) + [-1] * go_spawn_budget
-        if not go_parents:
-            go_parents = [-1]
-        go_sib = plan.get("go_siblings") or (
-            _build_go_sibling_indices(go_parents[:max(1, go_authored_n)]))
-        if len(go_sib) < go_authored_n:
-            go_sib = list(go_sib) + [0] * (go_authored_n - len(go_sib))
-        go_sib = list(go_sib[:go_authored_n]) + [0] * go_spawn_budget
-        if not go_sib:
-            go_sib = [0]
-        want_go_parent_table = (
-            want_ui or want_transform_find or want_transform_parent
-            or want_set_parent or want_live_rt)
-        if want_go_parent_table:
-            p("/* Transform hierarchy (live GO parents; seeded from m_Father) */"
-              if (want_set_parent or want_transform_find) else
-              "/* Authored Transform hierarchy (m_Father → GO index) */")
-            # Mutable whenever Find, SetParent, Instantiate, or GCIC runs.
-            if (want_set_parent or want_transform_find or want_instantiate
-                    or want_gcic):
-                p("static int _engine_go_parent[%d] = { %s };" % (
-                    go_n, ", ".join(str(int(x)) for x in go_parents[:go_n])))
-            else:
-                p("static const int _engine_go_parent[%d] = { %s };" % (
-                    go_n, ", ".join(str(int(x)) for x in go_parents[:go_n])))
-        if want_get_sibling:
-            # Sibling order among children of the same parent (Unity).
-            # Mutable when SetParent can change order; else authored seed.
-            p("/* Live sibling indices (seeded from GO order under parent) */")
-            if want_set_parent:
-                p("static int _engine_go_sib[%d] = { %s };" % (
-                    go_n, ", ".join(str(int(x)) for x in go_sib[:go_n])))
-            else:
-                p("static const int _engine_go_sib[%d] = { %s };" % (
-                    go_n, ", ".join(str(int(x)) for x in go_sib[:go_n])))
-            p("static int Transform_GetSiblingIndex(int go) {")
-            p("    if (go < 0 || go >= %d) return 0;" % go_n)
-            p("    return _engine_go_sib[go];")
-            p("}")
-            p("")
-        if want_transform_parent:
-            p("static int Transform_get_parent(int go) {")
-            p("    if (go < 0 || go >= %d) return -1;" % go_n)
-            p("    return _engine_go_parent[go];")
-            p("}")
-            p("")
-        if want_transform_find:
-            # Unity Transform.Find: direct child or path with '/'; -1 = null.
-            # Walks the live parent table (updated by SetParent).
-            p("static int Transform_Find(int parent, const char *path) {")
-            p("    char seg[256];")
-            p("    const char *p;")
-            p("    int i, n, cur, found;")
-            p("    if (parent < 0 || parent >= %d || !path || !path[0])"
-              % go_n)
-            p("        return -1;")
-            p("    cur = parent;")
-            p("    p = path;")
-            p("    while (*p) {")
-            p("        n = 0;")
-            p("        while (*p && *p != '/' && n < 255) {")
-            p("            seg[n] = *p;")
-            p("            n = n + 1;")
-            p("            p = p + 1;")
-            p("        }")
-            p("        seg[n] = 0;")
-            p("        if (*p == '/') p = p + 1;")
-            p("        if (n == 0) return -1;")
-            p("        found = -1;")
-            p("        for (i = 0; i < %d; i = i + 1) {" % go_n)
-            p("            if (_engine_go_parent[i] == cur")
-            p("                && strcmp(_engine_go_name[i], seg) == 0) {")
-            p("                found = i;")
-            p("                break;")
-            p("            }")
-            p("        }")
-            p("        if (found < 0) return -1;")
-            p("        cur = found;")
-            p("    }")
-            p("    return cur;")
-            p("}")
-            p("")
-
-        if want_screen_to_world:
-            p("/* Camera.main.ScreenToWorldPoint — orthographic, in the")
-            p("   camera's own viewport rect (Camera.rect), which is what")
-            p("   the pack draws and hit-tests against. */")
-            p("static void _engine_camera_viewport(")
-            p("    float *ovx, float *ovy, float *ovw, float *ovh) {")
-            p("    float sw = (float)Screen_width;")
-            p("    float sh = (float)Screen_height;")
-            p("    if (sw < 1.f) sw = 1.f;")
-            p("    if (sh < 1.f) sh = 1.f;")
-            p("    *ovx = Camera_main_rect_x * sw;")
-            p("    *ovy = Camera_main_rect_y * sh;")
-            p("    *ovw = Camera_main_rect_w * sw;")
-            p("    *ovh = Camera_main_rect_h * sh;")
-            p("    if (*ovw < 1.f) *ovw = 1.f;")
-            p("    if (*ovh < 1.f) *ovh = 1.f;")
-            p("}")
-            p("static Vector2 Camera_main_ScreenToWorldPoint(Vector2 p) {")
-            p("    float vx, vy, vw, vh, ppu;")
-            p("    _engine_camera_viewport(&vx, &vy, &vw, &vh);")
-            p("    ppu = Camera_main_orthographicSize;")
-            p("    if (ppu < 1e-8f) ppu = 1.f;")
-            p("    ppu = vh * 0.5f / ppu;")
-            p("    if (ppu < 1e-8f) ppu = 1.f;")
-            p("    return Vector2_make(")
-            p("        Camera_main_pos_x")
-            p("            + (Vector2_x(p) - vx - vw * 0.5f) / ppu,")
-            p("        Camera_main_pos_y")
-            p("            + (Vector2_y(p) - vy - vh * 0.5f) / ppu);")
-            p("}")
-            p("")
-        if want_mouse_position:
-            p("/* Mouse.current.position.ReadValue() — the host pointer, in")
-            p("   screen pixels from the bottom-left (Unity's origin). */")
-            p("static Vector2 Mouse_current_position(void) {")
-            p("    return Vector2_make(engine_pointer_x, engine_pointer_y);")
-            p("}")
-            p("")
-
-        if want_live_rt:
-            rt = plan.get("live_rt") or {}
-            go_rt_n = go_n
-
-            def _rt_f(key, default=0.0):
-                vals = list(rt.get(key) or [])
-                while len(vals) < go_authored_n:
-                    vals.append(default)
-                vals = vals[:go_authored_n] + [default] * go_spawn_budget
-                if not vals:
-                    vals = [default]
-                return vals[:go_rt_n]
-
-            def _rt_i(key, default=0):
-                vals = list(rt.get(key) or [])
-                while len(vals) < go_authored_n:
-                    vals.append(default)
-                vals = vals[:go_authored_n] + [default] * go_spawn_budget
-                if not vals:
-                    vals = [default]
-                return vals[:go_rt_n]
-
-            p("/* Live RectTransform (seeded post-layout bake) */")
-            ulw = max(1, int(plan.get("ui_layout_width")
-                             or plan.get("screen_width") or 1024))
-            ulh = max(1, int(plan.get("ui_layout_height")
-                             or plan.get("screen_height") or 768))
-            p("static const float _engine_ui_layout_w = %sf;" % repr(float(ulw)))
-            p("static const float _engine_ui_layout_h = %sf;" % repr(float(ulh)))
-            p("static const int _engine_rt_has[%d] = { %s };" % (
-                go_rt_n, ", ".join(str(int(x)) for x in _rt_i("has"))))
-            p("static const int _engine_rt_canvas[%d] = { %s };" % (
-                go_rt_n, ", ".join(str(int(x)) for x in _rt_i("canvas"))))
-            p("static const int _engine_rt_canvas_root[%d] = { %s };" % (
-                go_rt_n,
-                ", ".join(str(int(x)) for x in _rt_i("canvas_root"))))
-            p("static float _engine_rt_amin_x[%d] = { %s };" % (
-                go_rt_n, ", ".join("%sf" % repr(float(x))
-                                   for x in _rt_f("amin_x", 0.5))))
-            p("static float _engine_rt_amin_y[%d] = { %s };" % (
-                go_rt_n, ", ".join("%sf" % repr(float(x))
-                                   for x in _rt_f("amin_y", 0.5))))
-            p("static float _engine_rt_amax_x[%d] = { %s };" % (
-                go_rt_n, ", ".join("%sf" % repr(float(x))
-                                   for x in _rt_f("amax_x", 0.5))))
-            p("static float _engine_rt_amax_y[%d] = { %s };" % (
-                go_rt_n, ", ".join("%sf" % repr(float(x))
-                                   for x in _rt_f("amax_y", 0.5))))
-            p("static float _engine_rt_apos_x[%d] = { %s };" % (
-                go_rt_n, ", ".join("%sf" % repr(float(x))
-                                   for x in _rt_f("apos_x"))))
-            p("static float _engine_rt_apos_y[%d] = { %s };" % (
-                go_rt_n, ", ".join("%sf" % repr(float(x))
-                                   for x in _rt_f("apos_y"))))
-            p("static float _engine_rt_sd_x[%d] = { %s };" % (
-                go_rt_n, ", ".join("%sf" % repr(float(x))
-                                   for x in _rt_f("sd_x", 100.0))))
-            p("static float _engine_rt_sd_y[%d] = { %s };" % (
-                go_rt_n, ", ".join("%sf" % repr(float(x))
-                                   for x in _rt_f("sd_y", 100.0))))
-            p("static float _engine_rt_pivot_x[%d] = { %s };" % (
-                go_rt_n, ", ".join("%sf" % repr(float(x))
-                                   for x in _rt_f("pivot_x", 0.5))))
-            p("static float _engine_rt_pivot_y[%d] = { %s };" % (
-                go_rt_n, ", ".join("%sf" % repr(float(x))
-                                   for x in _rt_f("pivot_y", 0.5))))
-            p("static float _engine_rt_sx[%d] = { %s };" % (
-                go_rt_n, ", ".join("%sf" % repr(float(x))
-                                   for x in _rt_f("sx", 1.0))))
-            p("static float _engine_rt_sy[%d] = { %s };" % (
-                go_rt_n, ", ".join("%sf" % repr(float(x))
-                                   for x in _rt_f("sy", 1.0))))
-            p("static void _engine_rt_pivot_center(")
-            p("    float parent_w, float parent_h,")
-            p("    float amin_x, float amin_y, float amax_x, float amax_y,")
-            p("    float apos_x, float apos_y, float size_x, float size_y,")
-            p("    float pivot_x, float pivot_y,")
-            p("    float *ocx, float *ocy, float *ow, float *oh) {")
-            p("    float ax0 = amin_x * parent_w;")
-            p("    float ax1 = amax_x * parent_w;")
-            p("    float ay0 = amin_y * parent_h;")
-            p("    float ay1 = amax_y * parent_h;")
-            p("    float w, h, cx, cy, pivot_px, pivot_py;")
-            p("    if ((ax1 - ax0 < 1e-6f && ax0 - ax1 < 1e-6f)")
-            p("        && (ay1 - ay0 < 1e-6f && ay0 - ay1 < 1e-6f)) {")
-            p("        w = size_x;")
-            p("        h = size_y;")
-            p("        pivot_px = ax0 + apos_x;")
-            p("        pivot_py = ay0 + apos_y;")
-            p("        cx = pivot_px + (0.5f - pivot_x) * w;")
-            p("        cy = pivot_py + (0.5f - pivot_y) * h;")
-            p("    } else {")
-            p("        w = (ax1 - ax0) + size_x;")
-            p("        h = (ay1 - ay0) + size_y;")
-            p("        cx = (ax0 + ax1) * 0.5f + apos_x;")
-            p("        cy = (ay0 + ay1) * 0.5f + apos_y;")
-            p("    }")
-            p("    *ocx = cx; *ocy = cy; *ow = w; *oh = h;")
-            p("}")
-            p("static void _engine_ui_local_wh(int go, float sw, float sh,")
-            p("                                float *ow, float *oh);")
-            p("static void _engine_ui_screen_rect(int go, float sw, float sh,")
-            p("    float *ocx, float *ocy, float *ow, float *oh);")
-            p("static void _engine_ui_local_wh(int go, float sw, float sh,")
-            p("                                float *ow, float *oh) {")
-            p("    int parent;")
-            p("    float pw, ph, lcx, lcy, rw, rh;")
-            p("    if (go < 0 || go >= %d || !_engine_rt_has[go]) {"
-              % go_rt_n)
-            p("        *ow = sw; *oh = sh;")
-            p("        return;")
-            p("    }")
-            p("    if (_engine_rt_canvas_root[go]) {")
-            p("        *ow = sw; *oh = sh;")
-            p("        return;")
-            p("    }")
-            p("    parent = _engine_go_parent[go];")
-            p("    if (parent >= 0 && parent < %d"
-              % go_rt_n)
-            p("        && (_engine_rt_has[parent]"
-              " || _engine_rt_canvas[parent])) {")
-            p("        _engine_ui_local_wh(parent, sw, sh, &pw, &ph);")
-            p("    } else {")
-            p("        pw = sw; ph = sh;")
-            p("    }")
-            p("    _engine_rt_pivot_center(")
-            p("        pw, ph,")
-            p("        _engine_rt_amin_x[go], _engine_rt_amin_y[go],")
-            p("        _engine_rt_amax_x[go], _engine_rt_amax_y[go],")
-            p("        _engine_rt_apos_x[go], _engine_rt_apos_y[go],")
-            p("        _engine_rt_sd_x[go], _engine_rt_sd_y[go],")
-            p("        _engine_rt_pivot_x[go], _engine_rt_pivot_y[go],")
-            p("        &lcx, &lcy, &rw, &rh);")
-            p("    if (rw < 0.f) rw = -rw;")
-            p("    if (rh < 0.f) rh = -rh;")
-            p("    *ow = rw; *oh = rh;")
-            p("}")
-            p("static void _engine_ui_screen_rect(int go, float sw, float sh,")
-            p("    float *ocx, float *ocy, float *ow, float *oh) {")
-            p("    int parent;")
-            p("    float pcx, pcy, pw, ph, plw, plh, fsx, fsy, plx, ply;")
-            p("    float lcx, lcy, rw, rh, sx, sy, rw0, rh0, px, py;")
-            p("    if (go < 0 || go >= %d || !_engine_rt_has[go]) {"
-              % go_rt_n)
-            p("        *ocx = sw * 0.5f; *ocy = sh * 0.5f;")
-            p("        *ow = sw; *oh = sh;")
-            p("        return;")
-            p("    }")
-            p("    if (_engine_rt_canvas_root[go]) {")
-            p("        *ocx = sw * 0.5f; *ocy = sh * 0.5f;")
-            p("        *ow = sw; *oh = sh;")
-            p("        return;")
-            p("    }")
-            p("    parent = _engine_go_parent[go];")
-            p("    if (parent >= 0 && parent < %d"
-              % go_rt_n)
-            p("        && (_engine_rt_has[parent]"
-              " || _engine_rt_canvas[parent])) {")
-            p("        _engine_ui_screen_rect("
-              "parent, sw, sh, &pcx, &pcy, &pw, &ph);")
-            p("        _engine_ui_local_wh(parent, sw, sh, &plw, &plh);")
-            p("        if (plw < 1e-8f) plw = 1e-8f;")
-            p("        if (plh < 1e-8f) plh = 1e-8f;")
-            p("        if (pw < 0.f) pw = -pw;")
-            p("        if (ph < 0.f) ph = -ph;")
-            p("        fsx = pw / plw;")
-            p("        fsy = ph / plh;")
-            p("        plx = pcx - pw * 0.5f;")
-            p("        ply = pcy - ph * 0.5f;")
-            p("    } else {")
-            p("        plw = sw; plh = sh;")
-            p("        fsx = 1.f; fsy = 1.f;")
-            p("        plx = 0.f; ply = 0.f;")
-            p("    }")
-            p("    _engine_rt_pivot_center(")
-            p("        plw, plh,")
-            p("        _engine_rt_amin_x[go], _engine_rt_amin_y[go],")
-            p("        _engine_rt_amax_x[go], _engine_rt_amax_y[go],")
-            p("        _engine_rt_apos_x[go], _engine_rt_apos_y[go],")
-            p("        _engine_rt_sd_x[go], _engine_rt_sd_y[go],")
-            p("        _engine_rt_pivot_x[go], _engine_rt_pivot_y[go],")
-            p("        &lcx, &lcy, &rw, &rh);")
-            p("    sx = _engine_rt_sx[go]; if (sx < 0.f) sx = -sx;")
-            p("    sy = _engine_rt_sy[go]; if (sy < 0.f) sy = -sy;")
-            p("    if (sx < 1e-8f) sx = 1.f;")
-            p("    if (sy < 1e-8f) sy = 1.f;")
-            p("    rw0 = rw; if (rw0 < 0.f) rw0 = -rw0;")
-            p("    rh0 = rh; if (rh0 < 0.f) rh0 = -rh0;")
-            p("    px = _engine_rt_pivot_x[go];")
-            p("    py = _engine_rt_pivot_y[go];")
-            p("    lcx = lcx + (0.5f - px) * rw0 * (sx - 1.f);")
-            p("    lcy = lcy + (0.5f - py) * rh0 * (sy - 1.f);")
-            p("    rw = rw0 * sx;")
-            p("    rh = rh0 * sy;")
-            p("    *ocx = plx + lcx * fsx;")
-            p("    *ocy = ply + lcy * fsy;")
-            p("    *ow = rw * fsx;")
-            p("    *oh = rh * fsy;")
-            p("}")
-            p("static float RectTransform_get_anchoredPosition_x(int go) {")
-            p("    if (go < 0 || go >= %d) return 0.f;" % go_rt_n)
-            p("    return _engine_rt_apos_x[go];")
-            p("}")
-            p("static float RectTransform_get_anchoredPosition_y(int go) {")
-            p("    if (go < 0 || go >= %d) return 0.f;" % go_rt_n)
-            p("    return _engine_rt_apos_y[go];")
-            p("}")
-            p("static void RectTransform_set_anchoredPosition_xy("
-              "int go, float x, float y) {")
-            p("    if (go < 0 || go >= %d) return;" % go_rt_n)
-            p("    _engine_rt_apos_x[go] = x;")
-            p("    _engine_rt_apos_y[go] = y;")
-            p("}")
-            p("static Vector2 RectTransform_get_anchoredPosition(int go) {")
-            p("    return Vector2_make("
-              "RectTransform_get_anchoredPosition_x(go), "
-              "RectTransform_get_anchoredPosition_y(go));")
-            p("}")
-            p("static void RectTransform_set_anchoredPosition("
-              "int go, Vector2 v) {")
-            p("    RectTransform_set_anchoredPosition_xy("
-              "go, Vector2_x(v), Vector2_y(v));")
-            p("}")
-            p("static float RectTransform_get_sizeDelta_x(int go) {")
-            p("    if (go < 0 || go >= %d) return 0.f;" % go_rt_n)
-            p("    return _engine_rt_sd_x[go];")
-            p("}")
-            p("static float RectTransform_get_sizeDelta_y(int go) {")
-            p("    if (go < 0 || go >= %d) return 0.f;" % go_rt_n)
-            p("    return _engine_rt_sd_y[go];")
-            p("}")
-            p("static void RectTransform_set_sizeDelta_xy("
-              "int go, float x, float y) {")
-            p("    if (go < 0 || go >= %d) return;" % go_rt_n)
-            p("    _engine_rt_sd_x[go] = x;")
-            p("    _engine_rt_sd_y[go] = y;")
-            p("}")
-            p("static Vector2 RectTransform_get_sizeDelta(int go) {")
-            p("    return Vector2_make("
-              "RectTransform_get_sizeDelta_x(go), "
-              "RectTransform_get_sizeDelta_y(go));")
-            p("}")
-            p("static void RectTransform_set_sizeDelta(int go, Vector2 v) {")
-            p("    RectTransform_set_sizeDelta_xy("
-              "go, Vector2_x(v), Vector2_y(v));")
-            p("}")
-            p("static void RectTransform_set_localScale_xy("
-              "int go, float sx, float sy) {")
-            p("    if (go < 0 || go >= %d) return;" % go_rt_n)
-            p("    _engine_rt_sx[go] = sx;")
-            p("    _engine_rt_sy[go] = sy;")
-            p("}")
-            p("static float RectTransform_get_localScale_x(int go) {")
-            p("    if (go < 0 || go >= %d) return 1.f;" % go_rt_n)
-            p("    return _engine_rt_sx[go];")
-            p("}")
-            p("static float RectTransform_get_localScale_y(int go) {")
-            p("    if (go < 0 || go >= %d) return 1.f;" % go_rt_n)
-            p("    return _engine_rt_sy[go];")
-            p("}")
-            p("/* The parent's own rect, which anchors measure against. */")
-            p("static void _engine_rt_parent_wh(int go,"
-              " float *opw, float *oph) {")
-            p("    int parent;")
-            p("    *opw = _engine_ui_layout_w;")
-            p("    *oph = _engine_ui_layout_h;")
-            p("    if (go < 0 || go >= %d) return;" % go_rt_n)
-            p("    parent = _engine_go_parent[go];")
-            p("    if (parent >= 0 && parent < %d)" % go_rt_n)
-            p("        _engine_ui_local_wh(parent, _engine_ui_layout_w,")
-            p("                            _engine_ui_layout_h, opw, oph);")
-            p("}")
-            p("/* RectTransform.rect — Unity's local rect: the size before")
-            p("   localScale, with the pivot at the origin. */")
-            p("static float RectTransform_get_rect_width(int go) {")
-            p("    float w, h;")
-            p("    _engine_ui_local_wh(go, _engine_ui_layout_w,")
-            p("                        _engine_ui_layout_h, &w, &h);")
-            p("    if (w < 0.f) w = -w;")
-            p("    return w;")
-            p("}")
-            p("static float RectTransform_get_rect_height(int go) {")
-            p("    float w, h;")
-            p("    _engine_ui_local_wh(go, _engine_ui_layout_w,")
-            p("                        _engine_ui_layout_h, &w, &h);")
-            p("    if (h < 0.f) h = -h;")
-            p("    return h;")
-            p("}")
-            p("static float RectTransform_get_rect_x(int go) {")
-            p("    float px = 0.5f;")
-            p("    if (go >= 0 && go < %d) px = _engine_rt_pivot_x[go];"
-              % go_rt_n)
-            p("    return -px * RectTransform_get_rect_width(go);")
-            p("}")
-            p("static float RectTransform_get_rect_y(int go) {")
-            p("    float py = 0.5f;")
-            p("    if (go >= 0 && go < %d) py = _engine_rt_pivot_y[go];"
-              % go_rt_n)
-            p("    return -py * RectTransform_get_rect_height(go);")
-            p("}")
-            if want_rect:
-                p("static Rect RectTransform_get_rect(int go) {")
-                p("    return Rect_make(")
-                p("        RectTransform_get_rect_x(go),")
-                p("        RectTransform_get_rect_y(go),")
-                p("        RectTransform_get_rect_width(go),")
-                p("        RectTransform_get_rect_height(go));")
-                p("}")
-            p("/* Transform.localPosition of a RectTransform: its pivot, in")
-            p("   the parent's rect with the origin at the centre (Unity). */")
-            p("static void _engine_rt_local_pivot(int go,"
-              " float *ox, float *oy) {")
-            p("    float pw, ph, cx, cy, w, h;")
-            p("    *ox = 0.f; *oy = 0.f;")
-            p("    if (go < 0 || go >= %d) return;" % go_rt_n)
-            p("    _engine_rt_parent_wh(go, &pw, &ph);")
-            p("    _engine_rt_pivot_center(")
-            p("        pw, ph,")
-            p("        _engine_rt_amin_x[go], _engine_rt_amin_y[go],")
-            p("        _engine_rt_amax_x[go], _engine_rt_amax_y[go],")
-            p("        _engine_rt_apos_x[go], _engine_rt_apos_y[go],")
-            p("        _engine_rt_sd_x[go], _engine_rt_sd_y[go],")
-            p("        _engine_rt_pivot_x[go], _engine_rt_pivot_y[go],")
-            p("        &cx, &cy, &w, &h);")
-            p("    *ox = cx + (_engine_rt_pivot_x[go] - 0.5f) * w - pw * 0.5f;")
-            p("    *oy = cy + (_engine_rt_pivot_y[go] - 0.5f) * h - ph * 0.5f;")
-            p("}")
-            p("static float RectTransform_get_localPosition_x(int go) {")
-            p("    float x, y; _engine_rt_local_pivot(go, &x, &y); return x;")
-            p("}")
-            p("static float RectTransform_get_localPosition_y(int go) {")
-            p("    float x, y; _engine_rt_local_pivot(go, &x, &y); return y;")
-            p("}")
-            p("static Vector2 RectTransform_get_localPosition(int go) {")
-            p("    return Vector2_make(RectTransform_get_localPosition_x(go),")
-            p("                        RectTransform_get_localPosition_y(go));")
-            p("}")
-            p("/* localPosition moves the pivot; anchoredPosition offsets it")
-            p("   from the anchor by the same amount, so apply the delta. */")
-            p("static void RectTransform_set_localPosition_xy("
-              "int go, float x, float y) {")
-            p("    float cx, cy;")
-            p("    _engine_rt_local_pivot(go, &cx, &cy);")
-            p("    RectTransform_set_anchoredPosition_xy(")
-            p("        go,")
-            p("        RectTransform_get_anchoredPosition_x(go) + (x - cx),")
-            p("        RectTransform_get_anchoredPosition_y(go) + (y - cy));")
-            p("}")
-            p("static void RectTransform_set_localPosition("
-              "int go, Vector2 v) {")
-            p("    RectTransform_set_localPosition_xy("
-              "go, Vector2_x(v), Vector2_y(v));")
-            p("}")
-            if want_rect and plan.get("camera"):
-                p("/* UI layout space → world, the inverse of what the")
-                p("   camera does to draw it (same map as the pointer's). */")
-                p("static Vector2 _engine_ui_layout_to_world(Vector2 p) {")
-                p("    float vx, vy, vw, vh;")
-                p("    _engine_camera_viewport(&vx, &vy, &vw, &vh);")
-                p("    return Camera_main_ScreenToWorldPoint(Vector2_make(")
-                p("        vx + Vector2_x(p) * (vw / _engine_ui_layout_w),")
-                p("        vy + Vector2_y(p) * (vh / _engine_ui_layout_h)));")
-                p("}")
-                p("/* Extensions.GetWorldRect — the element's rect in world")
-                p("   units: the UI rect the engine lays out in screen space,")
-                p("   through the same camera map ScreenToWorldPoint uses. */")
-                p("static Rect RectTransform_GetWorldRect(int go) {")
-                p("    float cx, cy, w, h;")
-                p("    Vector2 lo, hi;")
-                p("    _engine_ui_screen_rect(go, _engine_ui_layout_w,")
-                p("                           _engine_ui_layout_h,")
-                p("                           &cx, &cy, &w, &h);")
-                p("    if (w < 0.f) w = -w;")
-                p("    if (h < 0.f) h = -h;")
-                p("    lo = _engine_ui_layout_to_world(")
-                p("        Vector2_make(cx - w * 0.5f, cy - h * 0.5f));")
-                p("    hi = _engine_ui_layout_to_world(")
-                p("        Vector2_make(cx + w * 0.5f, cy + h * 0.5f));")
-                p("    return Rect_make(")
-                p("        Vector2_x(lo), Vector2_y(lo),")
-                p("        Vector2_x(hi) - Vector2_x(lo),")
-                p("        Vector2_y(hi) - Vector2_y(lo));")
-                p("}")
-            p("")
-        if want_ui:
-            go_active = plan.get("go_active") or [1] * go_authored_n
-            if len(go_active) < go_authored_n:
-                go_active = list(go_active) + [1] * (
-                    go_authored_n - len(go_active))
-            go_active = [
-                1 if int(a) else 0 for a in go_active[:go_authored_n]
-            ] + [1] * go_spawn_budget
-            if not go_active:
-                go_active = [1]
-            p("/* GameObject.activeSelf — host pointer + authored Button */")
-            p("static int _engine_go_active[%d];" % go_n)
-            p("static int _engine_go_active_inited;")
-            p("static int _engine_pointer_was_down;")
-            p("static void _engine_go_active_init(void) {")
-            p("    int i;")
-            p("    if (_engine_go_active_inited) return;")
-            p("    _engine_go_active_inited = 1;")
-            p("    static const int _engine_go_active_authored[%d] = { %s };"
-              % (go_n, ", ".join(str(int(x)) for x in go_active[:go_n])))
-            p("    for (i = 0; i < %d; i = i + 1)" % go_n)
-            p("        _engine_go_active[i] = _engine_go_active_authored[i];")
-            p("}")
-            p("static int _engine_go_active_in_hierarchy(int go) {")
-            p("    int guard = 0;")
-            p("    _engine_go_active_init();")
-            p("    while (go >= 0 && go < %d && guard < %d) {"
-              % (go_n, go_n + 2))
-            p("        if (!_engine_go_active[go]) return 0;")
-            p("        go = _engine_go_parent[go];")
-            p("        guard = guard + 1;")
-            p("    }")
-            p("    return 1;")
-            p("}")
-            p("static void GameObject_SetActive(int go, int active) {")
-            p("    _engine_go_active_init();")
-            p("    if (go < 0 || go >= %d) return;" % go_n)
-            p("    _engine_go_active[go] = active ? 1 : 0;")
-            p("}")
-            p("")
-            p("static const int _engine_ui_button_count = %d;" % len(ui_buttons))
-            if ui_buttons:
-                nbtn = len(ui_buttons)
-
-                def _f4(key):
-                    return ", ".join(
-                        "%sf" % repr(float(b[key][i]))
-                        for b in ui_buttons for i in range(4))
-
-                p("static const int _engine_ui_btn_go[%d] = { %s };" % (
-                    nbtn, ", ".join(str(int(b["go"])) for b in ui_buttons)))
-                if not want_live_rt:
-                    p("static const float _engine_ui_btn_ncx[%d] = { %s };" % (
-                        nbtn, ", ".join(
-                            "%sf" % repr(b["ncx"]) for b in ui_buttons)))
-                    p("static const float _engine_ui_btn_ncy[%d] = { %s };" % (
-                        nbtn, ", ".join(
-                            "%sf" % repr(b["ncy"]) for b in ui_buttons)))
-                    p("static const float _engine_ui_btn_nhw[%d] = { %s };" % (
-                        nbtn, ", ".join(
-                            "%sf" % repr(b["nhw"]) for b in ui_buttons)))
-                    p("static const float _engine_ui_btn_nhh[%d] = { %s };" % (
-                        nbtn, ", ".join(
-                            "%sf" % repr(b["nhh"]) for b in ui_buttons)))
-                # Flat onClick list: SetActive(GO) and/or MB method(string).
-                call_starts = []
-                call_counts = []
-                call_ops = []
-                call_gos = []  # GO index (SetActive) or MB instance index
-                call_bools = []
-                call_strs = []
-                # op 0 = SetActive; op >= 1 → mb_handlers[op-1]
-                # handler: (cname, method, pass_string)
-                mb_handlers = []
-                mb_handler_ix = {}
-
-                def _mb_op(cname, method, pass_string):
-                    key = (cname, method, bool(pass_string))
-                    if key not in mb_handler_ix:
-                        mb_handler_ix[key] = len(mb_handlers) + 1
-                        mb_handlers.append(key)
-                    return mb_handler_ix[key]
-
-                for b in ui_buttons:
-                    call_starts.append(len(call_ops))
-                    calls = b.get("calls") or []
-                    call_counts.append(len(calls))
-                    for c in calls:
-                        if c.get("kind") == "mb":
-                            pass_str = int(c.get("mode") or 0) == 5
-                            call_ops.append(_mb_op(
-                                c["mb_class"], c["method"], pass_str))
-                            call_gos.append(int(c["mb_inst"]))
-                            call_bools.append(0)
-                            call_strs.append(c.get("string_arg") or "")
-                        else:
-                            call_ops.append(0)
-                            call_gos.append(int(c["target_go"]))
-                            call_bools.append(int(c["bool_arg"]))
-                            call_strs.append("")
-                ncall = len(call_ops)
-                p("static const int _engine_ui_btn_call_start[%d] = { %s };" % (
-                    nbtn, ", ".join(str(s) for s in call_starts)))
-                p("static const int _engine_ui_btn_call_count[%d] = { %s };" % (
-                    nbtn, ", ".join(str(c) for c in call_counts)))
-                if ncall:
-                    p("static const int _engine_ui_btn_call_op[%d] = { %s };" % (
-                        ncall, ", ".join(str(o) for o in call_ops)))
-                    p("static const int _engine_ui_btn_call_go[%d] = { %s };" % (
-                        ncall, ", ".join(str(g) for g in call_gos)))
-                    p("static const int _engine_ui_btn_call_bool[%d] = { %s };"
-                      % (ncall, ", ".join(str(b) for b in call_bools)))
-                    p("static const char *_engine_ui_btn_call_str[%d] = {"
-                      % ncall)
-                    for s in call_strs:
-                        p("    %s," % _c_string(s))
-                    p("};")
-                else:
-                    p("static const int _engine_ui_btn_call_op[1] = { 0 };")
-                    p("static const int _engine_ui_btn_call_go[1] = { -1 };")
-                    p("static const int _engine_ui_btn_call_bool[1] = { 0 };")
-                    p("static const char *_engine_ui_btn_call_str[1] = "
-                      "{ \"\" };")
-                plan["_ui_btn_mb_handlers"] = mb_handlers
-                # Forward-declare MB onClick targets (methods emit later).
-                for hcname, hmethod, hstr in mb_handlers:
-                    hidn = _c_ident(hcname)
-                    if hstr:
-                        p("static void %s_%s(unsigned i, const char *a);"
-                          % (hidn, hmethod))
-                    else:
-                        p("static void %s_%s(unsigned i);"
-                          % (hidn, hmethod))
-                # ColorBlock (× multiplier) — Normal / Highlighted / Pressed / Disabled
-                p("static const float _engine_ui_btn_col_n[%d] = { %s };" % (
-                    nbtn * 4, _f4("normal")))
-                p("static const float _engine_ui_btn_col_h[%d] = { %s };" % (
-                    nbtn * 4, _f4("highlighted")))
-                p("static const float _engine_ui_btn_col_p[%d] = { %s };" % (
-                    nbtn * 4, _f4("pressed")))
-                p("static const float _engine_ui_btn_col_d[%d] = { %s };" % (
-                    nbtn * 4, _f4("disabled")))
-                p("static float _engine_ui_btn_tint[%d];" % (nbtn * 4))
-                p("static int _engine_ui_btn_tint_inited;")
-                # Button held after pointer-down on it; -1 = none.
-                # Stays until pointer-up (mouse-off does not cancel press).
-                p("static int _engine_ui_btn_press = -1;")
-                p("static void _engine_ui_btn_tint_init(void) {")
-                p("    int i;")
-                p("    if (_engine_ui_btn_tint_inited) return;")
-                p("    _engine_ui_btn_tint_inited = 1;")
-                p("    for (i = 0; i < %d; i = i + 1)" % (nbtn * 4))
-                p("        _engine_ui_btn_tint[i] = _engine_ui_btn_col_n[i];")
-                p("}")
-            # Slider tables: drag + onValueChanged (UnityEvent<float>).
-            p("static const int _engine_ui_slider_count = %d;"
-              % len(ui_sliders))
-            if ui_sliders:
-                nsl = len(ui_sliders)
-                p("static const int _engine_ui_sl_go[%d] = { %s };" % (
-                    nsl, ", ".join(str(int(s["go"])) for s in ui_sliders)))
-                p("static const int _engine_ui_sl_slide_go[%d] = { %s };" % (
-                    nsl, ", ".join(
-                        str(int(s["slide_go"])) for s in ui_sliders)))
-                p("static const int _engine_ui_sl_handle_go[%d] = { %s };" % (
-                    nsl, ", ".join(
-                        str(int(s["handle_go"])) for s in ui_sliders)))
-                p("static const int _engine_ui_sl_fill_go[%d] = { %s };" % (
-                    nsl, ", ".join(
-                        str(int(s["fill_go"])) for s in ui_sliders)))
-                p("static const int _engine_ui_sl_dir[%d] = { %s };" % (
-                    nsl, ", ".join(
-                        str(int(s["direction"])) for s in ui_sliders)))
-                p("static const int _engine_ui_sl_whole[%d] = { %s };" % (
-                    nsl, ", ".join(
-                        str(int(s["whole_numbers"])) for s in ui_sliders)))
-                p("static const float _engine_ui_sl_min[%d] = { %s };" % (
-                    nsl, ", ".join(
-                        "%sf" % repr(float(s["min"])) for s in ui_sliders)))
-                p("static const float _engine_ui_sl_max[%d] = { %s };" % (
-                    nsl, ", ".join(
-                        "%sf" % repr(float(s["max"])) for s in ui_sliders)))
-                p("static float _engine_ui_sl_value[%d] = { %s };" % (
-                    nsl, ", ".join(
-                        "%sf" % repr(float(s["value"])) for s in ui_sliders)))
-                sl_starts = []
-                sl_counts = []
-                sl_ops = []
-                sl_insts = []
-                # handler: (cname, method, pass_float, is_static)
-                sl_handlers = []
-                sl_handler_ix = {}
-
-                def _sl_op(cname, method, pass_float, is_static):
-                    key = (cname, method, bool(pass_float), bool(is_static))
-                    if key not in sl_handler_ix:
-                        sl_handler_ix[key] = len(sl_handlers) + 1
-                        sl_handlers.append(key)
-                    return sl_handler_ix[key]
-
-                for s in ui_sliders:
-                    sl_starts.append(len(sl_ops))
-                    calls = s.get("calls") or []
-                    sl_counts.append(len(calls))
-                    for c in calls:
-                        mode = int(c.get("mode") or 0)
-                        pass_f = mode in (0, 4)
-                        sl_ops.append(_sl_op(
-                            c["mb_class"], c["method"], pass_f,
-                            bool(c.get("static"))))
-                        sl_insts.append(int(c["mb_inst"]))
-                nslc = len(sl_ops)
-                p("static const int _engine_ui_sl_call_start[%d] = { %s };" % (
-                    nsl, ", ".join(str(x) for x in sl_starts)))
-                p("static const int _engine_ui_sl_call_count[%d] = { %s };" % (
-                    nsl, ", ".join(str(x) for x in sl_counts)))
-                if nslc:
-                    p("static const int _engine_ui_sl_call_op[%d] = { %s };" % (
-                        nslc, ", ".join(str(x) for x in sl_ops)))
-                    p("static const int _engine_ui_sl_call_inst[%d] = { %s };"
-                      % (nslc, ", ".join(str(x) for x in sl_insts)))
-                else:
-                    p("static const int _engine_ui_sl_call_op[1] = { 0 };")
-                    p("static const int _engine_ui_sl_call_inst[1] = { 0 };")
-                plan["_ui_sl_mb_handlers"] = sl_handlers
-                for hcname, hmethod, hfloat, hstatic in sl_handlers:
-                    hidn = _c_ident(hcname)
-                    if hstatic and hfloat:
-                        p("static void %s_%s(float a);" % (hidn, hmethod))
-                    elif hstatic:
-                        p("static void %s_%s(void);" % (hidn, hmethod))
-                    elif hfloat:
-                        p("static void %s_%s(unsigned i, float a);"
-                          % (hidn, hmethod))
-                    else:
-                        p("static void %s_%s(unsigned i);" % (hidn, hmethod))
-                p("static int _engine_ui_sl_drag = -1;")
-                # Runtime UpdateVisuals: set handle/fill anchors from value.
-                p("static void _engine_ui_sl_update_visuals(int si) {")
-                p("    int hgo, fgo, dir, axis, rev;")
-                p("    float vmin, vmax, val, nv, t;")
-                p("    if (si < 0 || si >= _engine_ui_slider_count) return;")
-                p("    hgo = _engine_ui_sl_handle_go[si];")
-                p("    fgo = _engine_ui_sl_fill_go[si];")
-                p("    dir = _engine_ui_sl_dir[si];")
-                p("    axis = (dir == 0 || dir == 1) ? 0 : 1;")
-                p("    rev = (dir == 1 || dir == 3) ? 1 : 0;")
-                p("    vmin = _engine_ui_sl_min[si];")
-                p("    vmax = _engine_ui_sl_max[si];")
-                p("    val = _engine_ui_sl_value[si];")
-                p("    if (vmax - vmin < 1e-8f) nv = 0.f;")
-                p("    else {")
-                p("        nv = (val - vmin) / (vmax - vmin);")
-                p("        if (nv < 0.f) nv = 0.f;")
-                p("        if (nv > 1.f) nv = 1.f;")
-                p("    }")
-                p("    t = rev ? (1.f - nv) : nv;")
-                if want_live_rt:
-                    p("    if (hgo >= 0 && hgo < %d && _engine_rt_has[hgo]) {"
-                      % go_n)
-                    p("        if (axis == 0) {")
-                    p("            _engine_rt_amin_x[hgo] = t;")
-                    p("            _engine_rt_amax_x[hgo] = t;")
-                    p("            _engine_rt_amin_y[hgo] = 0.f;")
-                    p("            _engine_rt_amax_y[hgo] = 1.f;")
-                    p("        } else {")
-                    p("            _engine_rt_amin_y[hgo] = t;")
-                    p("            _engine_rt_amax_y[hgo] = t;")
-                    p("            _engine_rt_amin_x[hgo] = 0.f;")
-                    p("            _engine_rt_amax_x[hgo] = 1.f;")
-                    p("        }")
-                    p("    }")
-                    p("    if (fgo >= 0 && fgo < %d && _engine_rt_has[fgo]) {"
-                      % go_n)
-                    p("        if (axis == 0) {")
-                    p("            if (rev) {")
-                    p("                _engine_rt_amin_x[fgo] = 1.f - nv;")
-                    p("                _engine_rt_amax_x[fgo] = 1.f;")
-                    p("            } else {")
-                    p("                _engine_rt_amin_x[fgo] = 0.f;")
-                    p("                _engine_rt_amax_x[fgo] = nv;")
-                    p("            }")
-                    p("            _engine_rt_amin_y[fgo] = 0.f;")
-                    p("            _engine_rt_amax_y[fgo] = 1.f;")
-                    p("        } else {")
-                    p("            if (rev) {")
-                    p("                _engine_rt_amin_y[fgo] = 1.f - nv;")
-                    p("                _engine_rt_amax_y[fgo] = 1.f;")
-                    p("            } else {")
-                    p("                _engine_rt_amin_y[fgo] = 0.f;")
-                    p("                _engine_rt_amax_y[fgo] = nv;")
-                    p("            }")
-                    p("            _engine_rt_amin_x[fgo] = 0.f;")
-                    p("            _engine_rt_amax_x[fgo] = 1.f;")
-                    p("        }")
-                    p("    }")
-                p("}")
-                p("static void _engine_ui_sl_set_value(int si, float v) {")
-                p("    float vmin, vmax, old;")
-                p("    int j, j0, j1;")
-                p("    if (si < 0 || si >= _engine_ui_slider_count) return;")
-                p("    vmin = _engine_ui_sl_min[si];")
-                p("    vmax = _engine_ui_sl_max[si];")
-                p("    if (v < vmin) v = vmin;")
-                p("    if (v > vmax) v = vmax;")
-                p("    if (_engine_ui_sl_whole[si]) {")
-                p("        if (v >= 0.f) v = (float)((int)(v + 0.5f));")
-                p("        else v = (float)((int)(v - 0.5f));")
-                p("        if (v < vmin) v = vmin;")
-                p("        if (v > vmax) v = vmax;")
-                p("    }")
-                p("    old = _engine_ui_sl_value[si];")
-                p("    if (v == old) return;")
-                p("    _engine_ui_sl_value[si] = v;")
-                p("    _engine_ui_sl_update_visuals(si);")
-                p("    j0 = _engine_ui_sl_call_start[si];")
-                p("    j1 = j0 + _engine_ui_sl_call_count[si];")
-                p("    for (j = j0; j < j1; j = j + 1) {")
-                p("        int op = _engine_ui_sl_call_op[j];")
-                for hi, (hcname, hmethod, hfloat, hstatic) in enumerate(
-                        sl_handlers):
-                    hidn = _c_ident(hcname)
-                    p("        else if (op == %d)" % (hi + 1)
-                      if hi else "        if (op == %d)" % (hi + 1))
-                    if hstatic and hfloat:
-                        p("            %s_%s(v);" % (hidn, hmethod))
-                    elif hstatic:
-                        p("            %s_%s();" % (hidn, hmethod))
-                    elif hfloat:
-                        p("            %s_%s("
-                          "(unsigned)_engine_ui_sl_call_inst[j], v);"
-                          % (hidn, hmethod))
-                    else:
-                        p("            %s_%s("
-                          "(unsigned)_engine_ui_sl_call_inst[j]);"
-                          % (hidn, hmethod))
-                p("    }")
-                p("}")
-                p("/* `slider.value` on an authored Slider field: the field")
-                p("   packs as the component's GameObject. */")
-                p("static int _engine_ui_sl_of_go(int go) {")
-                p("    int i;")
-                p("    if (go < 0) return -1;")
-                p("    for (i = 0; i < _engine_ui_slider_count; i = i + 1)")
-                p("        if (_engine_ui_sl_go[i] == go) return i;")
-                p("    return -1;")
-                p("}")
-                p("static float Slider_get_value(int go) {")
-                p("    int si = _engine_ui_sl_of_go(go);")
-                p("    if (si < 0) return 0.f;")
-                p("    return _engine_ui_sl_value[si];")
-                p("}")
-                p("static void Slider_set_value(int go, float v) {")
-                p("    int si = _engine_ui_sl_of_go(go);")
-                p("    if (si >= 0) _engine_ui_sl_set_value(si, v);")
-                p("}")
-                p("static void _engine_ui_sl_drag_to(int si, float px, float py,"
-                  " float sw, float sh) {")
-                p("    int sgo, dir, axis, rev;")
-                p("    float cx, cy, rw, rh, left, bottom, t, vmin, vmax, v;")
-                p("    if (si < 0 || si >= _engine_ui_slider_count) return;")
-                p("    sgo = _engine_ui_sl_slide_go[si];")
-                p("    if (sgo < 0 || sgo >= %d) return;" % go_n)
-                if want_live_rt:
-                    p("    _engine_ui_screen_rect("
-                      "sgo, sw, sh, &cx, &cy, &rw, &rh);")
-                else:
-                    # Fallback: full layout — rare without live RT.
-                    p("    cx = sw * 0.5f; cy = sh * 0.5f;")
-                    p("    rw = sw; rh = sh;")
-                p("    if (rw < 0.f) rw = -rw;")
-                p("    if (rh < 0.f) rh = -rh;")
-                p("    left = cx - rw * 0.5f;")
-                p("    bottom = cy - rh * 0.5f;")
-                p("    dir = _engine_ui_sl_dir[si];")
-                p("    axis = (dir == 0 || dir == 1) ? 0 : 1;")
-                p("    rev = (dir == 1 || dir == 3) ? 1 : 0;")
-                p("    if (axis == 0) {")
-                p("        if (rw < 1e-6f) t = 0.f;")
-                p("        else t = (px - left) / rw;")
-                p("    } else {")
-                p("        if (rh < 1e-6f) t = 0.f;")
-                p("        else t = (py - bottom) / rh;")
-                p("    }")
-                p("    if (t < 0.f) t = 0.f;")
-                p("    if (t > 1.f) t = 1.f;")
-                p("    if (rev) t = 1.f - t;")
-                p("    vmin = _engine_ui_sl_min[si];")
-                p("    vmax = _engine_ui_sl_max[si];")
-                p("    v = vmin + t * (vmax - vmin);")
-                p("    _engine_ui_sl_set_value(si, v);")
-                p("}")
-            # ---- Scrollbar ----
-            p("static const int _engine_ui_scrollbar_count = %d;"
-              % len(ui_scrollbars))
-            if ui_scrollbars:
-                nsb = len(ui_scrollbars)
-                p("static const int _engine_ui_sb_go[%d] = { %s };" % (
-                    nsb, ", ".join(str(int(s["go"])) for s in ui_scrollbars)))
-                p("static const int _engine_ui_sb_slide_go[%d] = { %s };" % (
-                    nsb, ", ".join(
-                        str(int(s["slide_go"])) for s in ui_scrollbars)))
-                p("static const int _engine_ui_sb_handle_go[%d] = { %s };" % (
-                    nsb, ", ".join(
-                        str(int(s["handle_go"])) for s in ui_scrollbars)))
-                p("static const int _engine_ui_sb_dir[%d] = { %s };" % (
-                    nsb, ", ".join(
-                        str(int(s["direction"])) for s in ui_scrollbars)))
-                p("static const int _engine_ui_sb_interact[%d] = { %s };" % (
-                    nsb, ", ".join(
-                        str(int(s["interactable"])) for s in ui_scrollbars)))
-                p("static const int _engine_ui_sb_scrollrect[%d] = { %s };" % (
-                    nsb, ", ".join(
-                        str(int(s.get("scrollrect", -1)))
-                        for s in ui_scrollbars)))
-                p("static const int _engine_ui_sb_axis[%d] = { %s };" % (
-                    nsb, ", ".join(
-                        str(int(s.get("scroll_axis", 0)))
-                        for s in ui_scrollbars)))
-                p("static float _engine_ui_sb_value[%d] = { %s };" % (
-                    nsb, ", ".join(
-                        "%sf" % repr(float(s["value"]))
-                        for s in ui_scrollbars)))
-                p("static float _engine_ui_sb_size[%d] = { %s };" % (
-                    nsb, ", ".join(
-                        "%sf" % repr(float(s["size"]))
-                        for s in ui_scrollbars)))
-                sb_starts, sb_counts, sb_ops, sb_insts = [], [], [], []
-                sb_handlers = []
-                sb_handler_ix = {}
-
-                def _sb_op(cname, method, pass_float, is_static):
-                    key = (cname, method, bool(pass_float), bool(is_static))
-                    if key not in sb_handler_ix:
-                        sb_handler_ix[key] = len(sb_handlers) + 1
-                        sb_handlers.append(key)
-                    return sb_handler_ix[key]
-
-                for s in ui_scrollbars:
-                    sb_starts.append(len(sb_ops))
-                    calls = s.get("calls") or []
-                    sb_counts.append(len(calls))
-                    for c in calls:
-                        mode = int(c.get("mode") or 0)
-                        sb_ops.append(_sb_op(
-                            c["mb_class"], c["method"], mode in (0, 4),
-                            bool(c.get("static"))))
-                        sb_insts.append(int(c["mb_inst"]))
-                nsc = len(sb_ops)
-                p("static const int _engine_ui_sb_call_start[%d] = { %s };" % (
-                    nsb, ", ".join(str(x) for x in sb_starts)))
-                p("static const int _engine_ui_sb_call_count[%d] = { %s };" % (
-                    nsb, ", ".join(str(x) for x in sb_counts)))
-                if nsc:
-                    p("static const int _engine_ui_sb_call_op[%d] = { %s };" % (
-                        nsc, ", ".join(str(x) for x in sb_ops)))
-                    p("static const int _engine_ui_sb_call_inst[%d] = { %s };"
-                      % (nsc, ", ".join(str(x) for x in sb_insts)))
-                else:
-                    p("static const int _engine_ui_sb_call_op[1] = { 0 };")
-                    p("static const int _engine_ui_sb_call_inst[1] = { 0 };")
-                plan["_ui_sb_mb_handlers"] = sb_handlers
-                for hcname, hmethod, hfloat, hstatic in sb_handlers:
-                    hidn = _c_ident(hcname)
-                    if hstatic and hfloat:
-                        p("static void %s_%s(float a);" % (hidn, hmethod))
-                    elif hstatic:
-                        p("static void %s_%s(void);" % (hidn, hmethod))
-                    elif hfloat:
-                        p("static void %s_%s(unsigned i, float a);"
-                          % (hidn, hmethod))
-                    else:
-                        p("static void %s_%s(unsigned i);" % (hidn, hmethod))
-                p("static int _engine_ui_sb_drag = -1;")
-                p("static int _engine_ui_sb_syncing;")
-                if want_live_rt:
-                    p("static void _engine_ui_sb_update_visuals(int si) {")
-                    p("    int hgo, dir, axis, rev;")
-                    p("    float val, size, movement;")
-                    p("    if (si < 0 || si >= _engine_ui_scrollbar_count)"
-                      " return;")
-                    p("    hgo = _engine_ui_sb_handle_go[si];")
-                    p("    if (hgo < 0 || hgo >= %d || !_engine_rt_has[hgo])"
-                      " return;" % go_n)
-                    p("    dir = _engine_ui_sb_dir[si];")
-                    p("    axis = (dir == 0 || dir == 1) ? 0 : 1;")
-                    p("    rev = (dir == 1 || dir == 3) ? 1 : 0;")
-                    p("    val = _engine_ui_sb_value[si];")
-                    p("    size = _engine_ui_sb_size[si];")
-                    p("    if (val < 0.f) val = 0.f;")
-                    p("    if (val > 1.f) val = 1.f;")
-                    p("    if (size < 0.f) size = 0.f;")
-                    p("    if (size > 1.f) size = 1.f;")
-                    p("    movement = val * (1.f - size);")
-                    p("    if (axis == 0) {")
-                    p("        if (rev) {")
-                    p("            _engine_rt_amin_x[hgo] = 1.f - movement"
-                      " - size;")
-                    p("            _engine_rt_amax_x[hgo] = 1.f - movement;")
-                    p("        } else {")
-                    p("            _engine_rt_amin_x[hgo] = movement;")
-                    p("            _engine_rt_amax_x[hgo] = movement + size;")
-                    p("        }")
-                    p("        _engine_rt_amin_y[hgo] = 0.f;")
-                    p("        _engine_rt_amax_y[hgo] = 1.f;")
-                    p("    } else {")
-                    p("        if (rev) {")
-                    p("            _engine_rt_amin_y[hgo] = 1.f - movement"
-                      " - size;")
-                    p("            _engine_rt_amax_y[hgo] = 1.f - movement;")
-                    p("        } else {")
-                    p("            _engine_rt_amin_y[hgo] = movement;")
-                    p("            _engine_rt_amax_y[hgo] = movement + size;")
-                    p("        }")
-                    p("        _engine_rt_amin_x[hgo] = 0.f;")
-                    p("        _engine_rt_amax_x[hgo] = 1.f;")
-                    p("    }")
-                    p("}")
-                else:
-                    p("static void _engine_ui_sb_update_visuals(int si) {"
-                      " (void)si; }")
-                # Forward decls for ScrollRect helpers used by scrollbar set.
-                p("static void _engine_ui_sr_apply_norm(int ri, int axis,"
-                  " float nv);")
-                p("static void _engine_ui_sb_set_value(int si, float v,"
-                  " int from_sr) {")
-                p("    float old;")
-                p("    int j, j0, j1, sri;")
-                p("    if (si < 0 || si >= _engine_ui_scrollbar_count) return;")
-                p("    if (v < 0.f) v = 0.f;")
-                p("    if (v > 1.f) v = 1.f;")
-                p("    old = _engine_ui_sb_value[si];")
-                p("    if (v == old) {")
-                p("        _engine_ui_sb_update_visuals(si);")
-                p("        return;")
-                p("    }")
-                p("    _engine_ui_sb_value[si] = v;")
-                p("    _engine_ui_sb_update_visuals(si);")
-                p("    if (!from_sr) {")
-                p("        sri = _engine_ui_sb_scrollrect[si];")
-                p("        if (sri >= 0 && !_engine_ui_sb_syncing)")
-                p("            _engine_ui_sr_apply_norm("
-                  "sri, _engine_ui_sb_axis[si], v);")
-                p("    }")
-                p("    j0 = _engine_ui_sb_call_start[si];")
-                p("    j1 = j0 + _engine_ui_sb_call_count[si];")
-                p("    for (j = j0; j < j1; j = j + 1) {")
-                p("        int op = _engine_ui_sb_call_op[j];")
-                for hi, (hcname, hmethod, hfloat, hstatic) in enumerate(
-                        sb_handlers):
-                    hidn = _c_ident(hcname)
-                    line = ("        if (op == %d)" if hi == 0
-                            else "        else if (op == %d)")
-                    p(line % (hi + 1))
-                    if hstatic and hfloat:
-                        p("            %s_%s(v);" % (hidn, hmethod))
-                    elif hstatic:
-                        p("            %s_%s();" % (hidn, hmethod))
-                    elif hfloat:
-                        p("            %s_%s("
-                          "(unsigned)_engine_ui_sb_call_inst[j], v);"
-                          % (hidn, hmethod))
-                    else:
-                        p("            %s_%s("
-                          "(unsigned)_engine_ui_sb_call_inst[j]);"
-                          % (hidn, hmethod))
-                p("    }")
-                p("}")
-                p("/* `scrollbar.value` on an authored Scrollbar field: the")
-                p("   field packs as the component's GameObject. */")
-                p("static int _engine_ui_sb_of_go(int go) {")
-                p("    int i;")
-                p("    if (go < 0) return -1;")
-                p("    for (i = 0; i < _engine_ui_scrollbar_count;"
-                  " i = i + 1)")
-                p("        if (_engine_ui_sb_go[i] == go) return i;")
-                p("    return -1;")
-                p("}")
-                p("static float Scrollbar_get_value(int go) {")
-                p("    int si = _engine_ui_sb_of_go(go);")
-                p("    if (si < 0) return 0.f;")
-                p("    return _engine_ui_sb_value[si];")
-                p("}")
-                p("static void Scrollbar_set_value(int go, float v) {")
-                p("    int si = _engine_ui_sb_of_go(go);")
-                p("    if (si >= 0) _engine_ui_sb_set_value(si, v, 0);")
-                p("}")
-                p("static void _engine_ui_sb_drag_to(int si, float px, float py,"
-                  " float sw, float sh) {")
-                p("    int sgo, dir, axis, rev;")
-                p("    float cx, cy, rw, rh, left, bottom, t, size, rem;")
-                p("    if (si < 0 || si >= _engine_ui_scrollbar_count) return;")
-                p("    sgo = _engine_ui_sb_slide_go[si];")
-                p("    if (sgo < 0 || sgo >= %d) return;" % go_n)
-                if want_live_rt:
-                    p("    _engine_ui_screen_rect("
-                      "sgo, sw, sh, &cx, &cy, &rw, &rh);")
-                else:
-                    p("    cx = sw * 0.5f; cy = sh * 0.5f; rw = sw; rh = sh;")
-                p("    if (rw < 0.f) rw = -rw;")
-                p("    if (rh < 0.f) rh = -rh;")
-                p("    left = cx - rw * 0.5f;")
-                p("    bottom = cy - rh * 0.5f;")
-                p("    dir = _engine_ui_sb_dir[si];")
-                p("    axis = (dir == 0 || dir == 1) ? 0 : 1;")
-                p("    rev = (dir == 1 || dir == 3) ? 1 : 0;")
-                p("    size = _engine_ui_sb_size[si];")
-                p("    if (axis == 0) {")
-                p("        rem = rw * (1.f - size);")
-                p("        if (rem < 1e-6f) t = 0.f;")
-                p("        else t = (px - left - rw * size * 0.5f) / rem;")
-                p("    } else {")
-                p("        rem = rh * (1.f - size);")
-                p("        if (rem < 1e-6f) t = 0.f;")
-                p("        else t = (py - bottom - rh * size * 0.5f) / rem;")
-                p("    }")
-                p("    if (t < 0.f) t = 0.f;")
-                p("    if (t > 1.f) t = 1.f;")
-                p("    if (rev) t = 1.f - t;")
-                p("    _engine_ui_sb_set_value(si, t, 0);")
-                p("}")
-            # ---- ScrollRect ----
-            p("static const int _engine_ui_scrollrect_count = %d;"
-              % len(ui_scrollrects))
-            if ui_scrollrects:
-                nsr = len(ui_scrollrects)
-                p("static const int _engine_ui_sr_go[%d] = { %s };" % (
-                    nsr, ", ".join(
-                        str(int(s["go"])) for s in ui_scrollrects)))
-                p("static const int _engine_ui_sr_content[%d] = { %s };" % (
-                    nsr, ", ".join(
-                        str(int(s["content_go"])) for s in ui_scrollrects)))
-                p("static const int _engine_ui_sr_viewport[%d] = { %s };" % (
-                    nsr, ", ".join(
-                        str(int(s["viewport_go"])) for s in ui_scrollrects)))
-                p("static const int _engine_ui_sr_h[%d] = { %s };" % (
-                    nsr, ", ".join(
-                        str(int(s["horizontal"])) for s in ui_scrollrects)))
-                p("static const int _engine_ui_sr_v[%d] = { %s };" % (
-                    nsr, ", ".join(
-                        str(int(s["vertical"])) for s in ui_scrollrects)))
-                p("static const int _engine_ui_sr_hbar[%d] = { %s };" % (
-                    nsr, ", ".join(
-                        str(int(s["hbar"])) for s in ui_scrollrects)))
-                p("static const int _engine_ui_sr_vbar[%d] = { %s };" % (
-                    nsr, ", ".join(
-                        str(int(s["vbar"])) for s in ui_scrollrects)))
-                p("static int _engine_ui_sr_drag = -1;")
-                p("static float _engine_ui_sr_drag_px;")
-                p("static float _engine_ui_sr_drag_py;")
-                p("static float _engine_ui_sr_drag_ax;")
-                p("static float _engine_ui_sr_drag_ay;")
-                if want_live_rt:
-                    p("static void _engine_ui_sr_apply_norm(int ri, int axis,"
-                      " float nv) {")
-                    p("    int cgo, vgo;")
-                    p("    float ccx, ccy, crw, crh, vcx, vcy, vrw, vrh;")
-                    p("    float scrollable;")
-                    p("    if (ri < 0 || ri >= _engine_ui_scrollrect_count)"
-                      " return;")
-                    p("    if (nv < 0.f) nv = 0.f;")
-                    p("    if (nv > 1.f) nv = 1.f;")
-                    p("    cgo = _engine_ui_sr_content[ri];")
-                    p("    vgo = _engine_ui_sr_viewport[ri];")
-                    p("    if (cgo < 0 || cgo >= %d || vgo < 0 || vgo >= %d)"
-                      " return;" % (go_n, go_n))
-                    p("    if (!_engine_rt_has[cgo] || !_engine_rt_has[vgo])"
-                      " return;")
-                    p("    _engine_ui_screen_rect("
-                      "cgo, _engine_ui_layout_w, _engine_ui_layout_h,"
-                      " &ccx, &ccy, &crw, &crh);")
-                    p("    _engine_ui_screen_rect("
-                      "vgo, _engine_ui_layout_w, _engine_ui_layout_h,"
-                      " &vcx, &vcy, &vrw, &vrh);")
-                    p("    if (crw < 0.f) crw = -crw;")
-                    p("    if (crh < 0.f) crh = -crh;")
-                    p("    if (vrw < 0.f) vrw = -vrw;")
-                    p("    if (vrh < 0.f) vrh = -vrh;")
-                    p("    if (axis == 0) {")
-                    p("        scrollable = crw - vrw;")
-                    p("        if (scrollable < 0.f) scrollable = 0.f;")
-                    p("        _engine_rt_apos_x[cgo] = -(nv * scrollable);")
-                    p("    } else {")
-                    p("        scrollable = crh - vrh;")
-                    p("        if (scrollable < 0.f) scrollable = 0.f;")
-                    p("        _engine_rt_apos_y[cgo] ="
-                      " (1.f - nv) * scrollable;")
-                    p("    }")
-                    p("}")
-                    if ui_scrollbars:
-                        p("static void _engine_ui_sr_sync_bars(int ri) {")
-                        p("    int cgo, vgo, hbi, vbi;")
-                        p("    float ccx, ccy, crw, crh, vcx, vcy, vrw, vrh;")
-                        p("    float scrollable, nv;")
-                        p("    if (ri < 0 || ri >= _engine_ui_scrollrect_count)"
-                          " return;")
-                        p("    cgo = _engine_ui_sr_content[ri];")
-                        p("    vgo = _engine_ui_sr_viewport[ri];")
-                        p("    if (cgo < 0 || cgo >= %d || vgo < 0 || vgo >= %d)"
-                          " return;" % (go_n, go_n))
-                        p("    if (!_engine_rt_has[cgo] || !_engine_rt_has[vgo])"
-                          " return;")
-                        p("    _engine_ui_screen_rect("
-                          "cgo, _engine_ui_layout_w, _engine_ui_layout_h,"
-                          " &ccx, &ccy, &crw, &crh);")
-                        p("    _engine_ui_screen_rect("
-                          "vgo, _engine_ui_layout_w, _engine_ui_layout_h,"
-                          " &vcx, &vcy, &vrw, &vrh);")
-                        p("    if (crw < 0.f) crw = -crw;")
-                        p("    if (crh < 0.f) crh = -crh;")
-                        p("    if (vrw < 0.f) vrw = -vrw;")
-                        p("    if (vrh < 0.f) vrh = -vrh;")
-                        p("    _engine_ui_sb_syncing = 1;")
-                        p("    hbi = _engine_ui_sr_hbar[ri];")
-                        p("    if (hbi >= 0 && _engine_ui_sr_h[ri]) {")
-                        p("        scrollable = crw - vrw;")
-                        p("        if (scrollable < 1e-6f) nv = 0.f;")
-                        p("        else {")
-                        p("            nv = -_engine_rt_apos_x[cgo] / scrollable;")
-                        p("            if (nv < 0.f) nv = 0.f;")
-                        p("            if (nv > 1.f) nv = 1.f;")
-                        p("        }")
-                        p("        if (crw > 1e-6f)")
-                        p("            _engine_ui_sb_size[hbi] ="
-                          " (vrw < crw) ? (vrw / crw) : 1.f;")
-                        p("        _engine_ui_sb_set_value(hbi, nv, 1);")
-                        p("    }")
-                        p("    vbi = _engine_ui_sr_vbar[ri];")
-                        p("    if (vbi >= 0 && _engine_ui_sr_v[ri]) {")
-                        p("        scrollable = crh - vrh;")
-                        p("        if (scrollable < 1e-6f) nv = 1.f;")
-                        p("        else {")
-                        p("            nv = 1.f - (_engine_rt_apos_y[cgo]"
-                          " / scrollable);")
-                        p("            if (nv < 0.f) nv = 0.f;")
-                        p("            if (nv > 1.f) nv = 1.f;")
-                        p("        }")
-                        p("        if (crh > 1e-6f)")
-                        p("            _engine_ui_sb_size[vbi] ="
-                          " (vrh < crh) ? (vrh / crh) : 1.f;")
-                        p("        _engine_ui_sb_set_value(vbi, nv, 1);")
-                        p("    }")
-                        p("    _engine_ui_sb_syncing = 0;")
-                        p("}")
-                    else:
-                        p("static void _engine_ui_sr_sync_bars(int ri) {"
-                          " (void)ri; }")
-                    p("static void _engine_ui_sr_drag_to(int ri, float px,"
-                      " float py) {")
-                    p("    int cgo;")
-                    p("    float dx, dy, ccx, ccy, crw, crh, vcx, vcy, vrw, vrh;")
-                    p("    float scrollable, ax, ay;")
-                    p("    if (ri < 0 || ri >= _engine_ui_scrollrect_count)"
-                      " return;")
-                    p("    cgo = _engine_ui_sr_content[ri];")
-                    p("    if (cgo < 0 || cgo >= %d || !_engine_rt_has[cgo])"
-                      " return;" % go_n)
-                    p("    dx = px - _engine_ui_sr_drag_px;")
-                    p("    dy = py - _engine_ui_sr_drag_py;")
-                    p("    ax = _engine_ui_sr_drag_ax;")
-                    p("    ay = _engine_ui_sr_drag_ay;")
-                    p("    if (_engine_ui_sr_h[ri]) ax = ax + dx;")
-                    p("    if (_engine_ui_sr_v[ri]) ay = ay + dy;")
-                    p("    _engine_ui_screen_rect("
-                      "cgo, _engine_ui_layout_w, _engine_ui_layout_h,"
-                      " &ccx, &ccy, &crw, &crh);")
-                    p("    _engine_ui_screen_rect("
-                      "_engine_ui_sr_viewport[ri],"
-                      " _engine_ui_layout_w, _engine_ui_layout_h,"
-                      " &vcx, &vcy, &vrw, &vrh);")
-                    p("    if (crw < 0.f) crw = -crw;")
-                    p("    if (crh < 0.f) crh = -crh;")
-                    p("    if (vrw < 0.f) vrw = -vrw;")
-                    p("    if (vrh < 0.f) vrh = -vrh;")
-                    p("    if (_engine_ui_sr_h[ri]) {")
-                    p("        scrollable = crw - vrw;")
-                    p("        if (scrollable < 0.f) scrollable = 0.f;")
-                    p("        if (ax > 0.f) ax = 0.f;")
-                    p("        if (ax < -scrollable) ax = -scrollable;")
-                    p("        _engine_rt_apos_x[cgo] = ax;")
-                    p("    }")
-                    p("    if (_engine_ui_sr_v[ri]) {")
-                    p("        scrollable = crh - vrh;")
-                    p("        if (scrollable < 0.f) scrollable = 0.f;")
-                    p("        if (ay < 0.f) ay = 0.f;")
-                    p("        if (ay > scrollable) ay = scrollable;")
-                    p("        _engine_rt_apos_y[cgo] = ay;")
-                    p("    }")
-                    p("    _engine_ui_sr_sync_bars(ri);")
-                    p("}")
-                else:
-                    p("static void _engine_ui_sr_apply_norm(int ri, int axis,"
-                      " float nv) { (void)ri; (void)axis; (void)nv; }")
-                    p("static void _engine_ui_sr_sync_bars(int ri) {"
-                      " (void)ri; }")
-                    p("static void _engine_ui_sr_drag_to(int ri, float px,"
-                      " float py) { (void)ri; (void)px; (void)py; }")
-            elif ui_scrollbars:
-                # Scrollbar set_value forward-declared apply_norm — stub it.
-                p("static void _engine_ui_sr_apply_norm(int ri, int axis,"
-                  " float nv) { (void)ri; (void)axis; (void)nv; }")
-            # ---- Toggle ----
-            p("static const int _engine_ui_toggle_count = %d;"
-              % len(ui_toggles))
-            if ui_toggles:
-                ntg = len(ui_toggles)
-                p("static const int _engine_ui_tg_go[%d] = { %s };" % (
-                    ntg, ", ".join(str(int(t["go"])) for t in ui_toggles)))
-                p("static const int _engine_ui_tg_graphic[%d] = { %s };" % (
-                    ntg, ", ".join(
-                        str(int(t["graphic_go"])) for t in ui_toggles)))
-                tg_starts, tg_counts, tg_ops, tg_insts, tg_bools = (
-                    [], [], [], [], [])
-                tg_handlers = []
-                tg_handler_ix = {}
-
-                def _tg_op(cname, method, pass_bool, is_static):
-                    key = (cname, method, bool(pass_bool), bool(is_static))
-                    if key not in tg_handler_ix:
-                        tg_handler_ix[key] = len(tg_handlers) + 1
-                        tg_handlers.append(key)
-                    return tg_handler_ix[key]
-
-                for t in ui_toggles:
-                    tg_starts.append(len(tg_ops))
-                    calls = t.get("calls") or []
-                    tg_counts.append(len(calls))
-                    for c in calls:
-                        mode = int(c.get("mode") or 0)
-                        pass_b = mode in (0, 6)
-                        tg_ops.append(_tg_op(
-                            c["mb_class"], c["method"], pass_b,
-                            bool(c.get("static"))))
-                        tg_insts.append(int(c["mb_inst"]))
-                        # mode 6 uses fixed bool; mode 0 uses live isOn.
-                        tg_bools.append(int(c.get("bool_arg") or 0)
-                                        if mode == 6 else -1)
-                ntc = len(tg_ops)
-                p("static const int _engine_ui_tg_call_start[%d] = { %s };" % (
-                    ntg, ", ".join(str(x) for x in tg_starts)))
-                p("static const int _engine_ui_tg_call_count[%d] = { %s };" % (
-                    ntg, ", ".join(str(x) for x in tg_counts)))
-                if ntc:
-                    p("static const int _engine_ui_tg_call_op[%d] = { %s };" % (
-                        ntc, ", ".join(str(x) for x in tg_ops)))
-                    p("static const int _engine_ui_tg_call_inst[%d] = { %s };"
-                      % (ntc, ", ".join(str(x) for x in tg_insts)))
-                    p("static const int _engine_ui_tg_call_bool[%d] = { %s };"
-                      % (ntc, ", ".join(str(x) for x in tg_bools)))
-                else:
-                    p("static const int _engine_ui_tg_call_op[1] = { 0 };")
-                    p("static const int _engine_ui_tg_call_inst[1] = { 0 };")
-                    p("static const int _engine_ui_tg_call_bool[1] = { -1 };")
-                plan["_ui_tg_mb_handlers"] = tg_handlers
-                for hcname, hmethod, hbool, hstatic in tg_handlers:
-                    hidn = _c_ident(hcname)
-                    if hstatic and hbool:
-                        p("static void %s_%s(int a);" % (hidn, hmethod))
-                    elif hstatic:
-                        p("static void %s_%s(void);" % (hidn, hmethod))
-                    elif hbool:
-                        p("static void %s_%s(unsigned i, int a);"
-                          % (hidn, hmethod))
-                    else:
-                        p("static void %s_%s(unsigned i);" % (hidn, hmethod))
-                p("static int _engine_ui_tg_press = -1;")
-                p("static void _engine_ui_tg_set(int ti, int on) {")
-                p("    int go, g, j, j0, j1, barg;")
-                p("    if (ti < 0 || ti >= _engine_ui_toggle_count) return;")
-                p("    go = _engine_ui_tg_go[ti];")
-                p("    if (go < 0 || go >= %d) return;" % go_n)
-                p("    on = on ? 1 : 0;")
-                p("    if (Toggle_get_isOn(go) == on) return;")
-                p("    Toggle_set_isOn(go, on);")
-                p("    g = _engine_ui_tg_graphic[ti];")
-                p("    if (g >= 0 && g < %d)" % go_n)
-                p("        GameObject_SetActive(g, on);")
-                p("    j0 = _engine_ui_tg_call_start[ti];")
-                p("    j1 = j0 + _engine_ui_tg_call_count[ti];")
-                p("    for (j = j0; j < j1; j = j + 1) {")
-                p("        int op = _engine_ui_tg_call_op[j];")
-                p("        barg = _engine_ui_tg_call_bool[j];")
-                p("        if (barg < 0) barg = on;")
-                for hi, (hcname, hmethod, hbool, hstatic) in enumerate(
-                        tg_handlers):
-                    hidn = _c_ident(hcname)
-                    line = ("        if (op == %d)" if hi == 0
-                            else "        else if (op == %d)")
-                    p(line % (hi + 1))
-                    if hstatic and hbool:
-                        p("            %s_%s(barg);" % (hidn, hmethod))
-                    elif hstatic:
-                        p("            %s_%s();" % (hidn, hmethod))
-                    elif hbool:
-                        p("            %s_%s("
-                          "(unsigned)_engine_ui_tg_call_inst[j], barg);"
-                          % (hidn, hmethod))
-                    else:
-                        p("            %s_%s("
-                          "(unsigned)_engine_ui_tg_call_inst[j]);"
-                          % (hidn, hmethod))
-                p("    }")
-                p("}")
-            # ---- EventTrigger ----
-            p("static const int _engine_ui_et_count = %d;"
-              % len(ui_eventtriggers))
-            if ui_eventtriggers:
-                net = len(ui_eventtriggers)
-                p("static const int _engine_ui_et_go[%d] = { %s };" % (
-                    net, ", ".join(
-                        str(int(t["go"])) for t in ui_eventtriggers)))
-                # Flatten events + calls.
-                ev_starts, ev_counts = [], []
-                ev_ids, ev_call_starts, ev_call_counts = [], [], []
-                call_ops, call_insts, call_bools = [], [], []
-                call_floats, call_strs, call_objs = [], [], []
-                et_handlers = []
-                et_handler_ix = {}
-
-                def _et_op(cname, method, sig):
-                    # sig: 'void'|'string'|'bool'|'float'|'obj'
-                    key = (cname, method, sig)
-                    if key not in et_handler_ix:
-                        et_handler_ix[key] = len(et_handlers) + 1
-                        et_handlers.append(key)
-                    return et_handler_ix[key]
-
-                for t in ui_eventtriggers:
-                    ev_starts.append(len(ev_ids))
-                    events = t.get("events") or []
-                    ev_counts.append(len(events))
-                    for ev in events:
-                        ev_ids.append(int(ev["event_id"]))
-                        ev_call_starts.append(len(call_ops))
-                        calls = ev.get("calls") or []
-                        ev_call_counts.append(len(calls))
-                        for c in calls:
-                            kind = c.get("kind")
-                            if kind == "setactive":
-                                call_ops.append(0)
-                                call_insts.append(0)
-                                call_bools.append(int(c.get("bool_arg") or 0))
-                                call_floats.append(0.0)
-                                call_strs.append("")
-                                call_objs.append(int(c["target_go"]))
-                            elif kind == "slider_set":
-                                call_ops.append(-1)
-                                call_insts.append(int(c["slider"]))
-                                call_bools.append(0)
-                                call_floats.append(float(c.get("float_arg") or 0))
-                                call_strs.append("")
-                                call_objs.append(-1)
-                            else:
-                                mode = int(c.get("mode") or 0)
-                                if mode == 5:
-                                    sig = "string"
-                                elif mode == 6:
-                                    sig = "bool"
-                                elif mode == 4:
-                                    sig = "float"
-                                elif mode == 2:
-                                    sig = "obj"
-                                else:
-                                    sig = "void"
-                                call_ops.append(_et_op(
-                                    c["mb_class"], c["method"], sig))
-                                call_insts.append(int(c["mb_inst"]))
-                                call_bools.append(int(c.get("bool_arg") or 0))
-                                call_floats.append(float(
-                                    c.get("float_arg") or 0.0))
-                                call_strs.append(c.get("string_arg") or "")
-                                call_objs.append(int(c.get("object_go")
-                                                     if c.get("object_go")
-                                                     is not None else -1))
-                nev = len(ev_ids)
-                ncall = len(call_ops)
-                p("static const int _engine_ui_et_ev_start[%d] = { %s };" % (
-                    net, ", ".join(str(x) for x in ev_starts)))
-                p("static const int _engine_ui_et_ev_count[%d] = { %s };" % (
-                    net, ", ".join(str(x) for x in ev_counts)))
-                if nev:
-                    p("static const int _engine_ui_et_ev_id[%d] = { %s };" % (
-                        nev, ", ".join(str(x) for x in ev_ids)))
-                    p("static const int _engine_ui_et_ev_call_start[%d] = "
-                      "{ %s };" % (
-                          nev, ", ".join(str(x) for x in ev_call_starts)))
-                    p("static const int _engine_ui_et_ev_call_count[%d] = "
-                      "{ %s };" % (
-                          nev, ", ".join(str(x) for x in ev_call_counts)))
-                else:
-                    p("static const int _engine_ui_et_ev_id[1] = { 0 };")
-                    p("static const int _engine_ui_et_ev_call_start[1] = "
-                      "{ 0 };")
-                    p("static const int _engine_ui_et_ev_call_count[1] = "
-                      "{ 0 };")
-                if ncall:
-                    p("static const int _engine_ui_et_call_op[%d] = { %s };" % (
-                        ncall, ", ".join(str(x) for x in call_ops)))
-                    p("static const int _engine_ui_et_call_inst[%d] = { %s };"
-                      % (ncall, ", ".join(str(x) for x in call_insts)))
-                    p("static const int _engine_ui_et_call_bool[%d] = { %s };"
-                      % (ncall, ", ".join(str(x) for x in call_bools)))
-                    p("static const float _engine_ui_et_call_float[%d] = "
-                      "{ %s };" % (
-                          ncall, ", ".join(
-                              "%sf" % repr(float(x)) for x in call_floats)))
-                    p("static const char *_engine_ui_et_call_str[%d] = {"
-                      % ncall)
-                    p("    " + ", ".join(_c_string(s) for s in call_strs))
-                    p("};")
-                    p("static const int _engine_ui_et_call_obj[%d] = { %s };"
-                      % (ncall, ", ".join(str(x) for x in call_objs)))
-                else:
-                    p("static const int _engine_ui_et_call_op[1] = { 0 };")
-                    p("static const int _engine_ui_et_call_inst[1] = { 0 };")
-                    p("static const int _engine_ui_et_call_bool[1] = { 0 };")
-                    p("static const float _engine_ui_et_call_float[1] = "
-                      "{ 0.f };")
-                    p("static const char *_engine_ui_et_call_str[1] = "
-                      "{ \"\" };")
-                    p("static const int _engine_ui_et_call_obj[1] = { -1 };")
-                plan["_ui_et_mb_handlers"] = et_handlers
-                for hcname, hmethod, sig in et_handlers:
-                    hidn = _c_ident(hcname)
-                    if sig == "string":
-                        p("static void %s_%s(unsigned i, const char *a);"
-                          % (hidn, hmethod))
-                    elif sig == "bool":
-                        p("static void %s_%s(unsigned i, int a);"
-                          % (hidn, hmethod))
-                    elif sig == "float":
-                        p("static void %s_%s(unsigned i, float a);"
-                          % (hidn, hmethod))
-                    elif sig == "obj":
-                        p("static void %s_%s(unsigned i, int a);"
-                          % (hidn, hmethod))
-                    else:
-                        p("static void %s_%s(unsigned i);" % (hidn, hmethod))
-                p("static int _engine_ui_et_hover[%d];" % net)
-                p("static int _engine_ui_et_press = -1;")
-                p("static void _engine_ui_et_fire(int ti, int eid) {")
-                p("    int e0, e1, e, j, j0, j1, op;")
-                p("    if (ti < 0 || ti >= _engine_ui_et_count) return;")
-                p("    e0 = _engine_ui_et_ev_start[ti];")
-                p("    e1 = e0 + _engine_ui_et_ev_count[ti];")
-                p("    for (e = e0; e < e1; e = e + 1) {")
-                p("        if (_engine_ui_et_ev_id[e] != eid) continue;")
-                p("        j0 = _engine_ui_et_ev_call_start[e];")
-                p("        j1 = j0 + _engine_ui_et_ev_call_count[e];")
-                p("        for (j = j0; j < j1; j = j + 1) {")
-                p("            op = _engine_ui_et_call_op[j];")
-                p("            if (op == 0) {")
-                p("                if (_engine_ui_et_call_obj[j] >= 0)")
-                p("                    GameObject_SetActive("
-                  "_engine_ui_et_call_obj[j],")
-                p("                                         "
-                  "_engine_ui_et_call_bool[j]);")
-                p("            } else if (op == -1) {")
-                if ui_sliders:
-                    p("                _engine_ui_sl_set_value("
-                      "_engine_ui_et_call_inst[j],")
-                    p("                    _engine_ui_et_call_float[j]);")
-                else:
-                    p("                (void)_engine_ui_et_call_inst[j];")
-                p("            }")
-                for hi, (hcname, hmethod, sig) in enumerate(et_handlers):
-                    hidn = _c_ident(hcname)
-                    p("            else if (op == %d)" % (hi + 1))
-                    if sig == "string":
-                        p("                %s_%s("
-                          "(unsigned)_engine_ui_et_call_inst[j],"
-                          % (hidn, hmethod))
-                        p("                    "
-                          "_engine_ui_et_call_str[j]);")
-                    elif sig == "bool":
-                        p("                %s_%s("
-                          "(unsigned)_engine_ui_et_call_inst[j],"
-                          % (hidn, hmethod))
-                        p("                    "
-                          "_engine_ui_et_call_bool[j]);")
-                    elif sig == "float":
-                        p("                %s_%s("
-                          "(unsigned)_engine_ui_et_call_inst[j],"
-                          % (hidn, hmethod))
-                        p("                    "
-                          "_engine_ui_et_call_float[j]);")
-                    elif sig == "obj":
-                        p("                %s_%s("
-                          "(unsigned)_engine_ui_et_call_inst[j],"
-                          % (hidn, hmethod))
-                        p("                    "
-                          "_engine_ui_et_call_obj[j]);")
-                    else:
-                        p("                %s_%s("
-                          "(unsigned)_engine_ui_et_call_inst[j]);"
-                          % (hidn, hmethod))
-                p("        }")
-                p("    }")
-                p("}")
-            p("static void engine_ui_tick(void) {")
-            p("    int down_edge, up_edge, i, hit;")
-            p("    float px, py, sw, sh;")
-            p("    _engine_go_active_init();")
-            if ui_buttons:
-                p("    _engine_ui_btn_tint_init();")
-            # Unity Button: onClick on pointer-up over the pressed target,
-            # not on pointer-down.
-            p("    down_edge = engine_pointer_down && !_engine_pointer_was_down;")
-            p("    up_edge = !engine_pointer_down && _engine_pointer_was_down;")
-            p("    sw = (float)Screen_width;")
-            p("    sh = (float)Screen_height;")
-            p("    if (sw < 1.f) sw = 1.f;")
-            p("    if (sh < 1.f) sh = 1.f;")
-            # UI bake / hits are relative to Camera.rect pixel rect (HandleViewSize).
-            if plan.get("camera"):
-                p("    {")
-                p("        float vx = Camera_main_rect_x * sw;")
-                p("        float vy = Camera_main_rect_y * sh;")
-                p("        float vw = Camera_main_rect_w * sw;")
-                p("        float vh = Camera_main_rect_h * sh;")
-                p("        if (vw < 1.f) vw = 1.f;")
-                p("        if (vh < 1.f) vh = 1.f;")
-                p("        sw = vw;")
-                p("        sh = vh;")
-                p("        px = engine_pointer_x - vx;")
-                p("        py = engine_pointer_y - vy;")
-                p("    }")
-            else:
-                p("    px = engine_pointer_x;")
-                p("    py = engine_pointer_y;")
-            # Live RT math is in pack-time canvas units; map pointer into
-            # that space when Screen/letterbox ≠ layout (window resize).
-            if want_live_rt:
-                p("    {")
-                p("        float lw = _engine_ui_layout_w;")
-                p("        float lh = _engine_ui_layout_h;")
-                p("        if (lw < 1.f) lw = 1.f;")
-                p("        if (lh < 1.f) lh = 1.f;")
-                p("        px = px * (lw / sw);")
-                p("        py = py * (lh / sh);")
-                p("        sw = lw;")
-                p("        sh = lh;")
-                p("    }")
-            # Helper: hit-test a GO rect.
-            def _emit_hit_loop(count_sym, go_arr, result_var, extra_ok=None):
-                p("        %s = -1;" % result_var)
-                p("        for (i = 0; i < %s; i = i + 1) {" % count_sym)
-                p("            int go = %s[i];" % go_arr)
-                p("            float cx, cy, hw, hh, dx, dy, rw, rh;")
-                if extra_ok:
-                    p("            if (!(%s)) continue;" % extra_ok)
-                p("            if (go < 0 || go >= %d) continue;" % go_n)
-                p("            if (!_engine_go_active_in_hierarchy(go))"
-                  " continue;")
-                if want_live_rt:
-                    p("            _engine_ui_screen_rect("
-                      "go, sw, sh, &cx, &cy, &rw, &rh);")
-                    p("            if (rw < 0.f) rw = -rw;")
-                    p("            if (rh < 0.f) rh = -rh;")
-                    p("            hw = rw * 0.5f; hh = rh * 0.5f;")
-                else:
-                    p("            cx = sw * 0.5f; cy = sh * 0.5f;")
-                    p("            hw = sw; hh = sh;")
-                p("            dx = px - cx; if (dx < 0.f) dx = -dx;")
-                p("            dy = py - cy; if (dy < 0.f) dy = -dy;")
-                p("            if (dx <= hw && dy <= hh && %s < 0)"
-                  " %s = i;" % (result_var, result_var))
-                p("        }")
-
-            # Scrollbar drag (interactable only).
-            if ui_scrollbars:
-                p("    {")
-                p("        int shit = -1;")
-                _emit_hit_loop(
-                    "_engine_ui_scrollbar_count", "_engine_ui_sb_go", "shit",
-                    extra_ok="_engine_ui_sb_interact[i]")
-                p("        if (down_edge && shit >= 0)")
-                p("            _engine_ui_sb_drag = shit;")
-                p("        if (_engine_ui_sb_drag >= 0 && engine_pointer_down)")
-                p("            _engine_ui_sb_drag_to("
-                  "_engine_ui_sb_drag, px, py, sw, sh);")
-                p("        if (up_edge)")
-                p("            _engine_ui_sb_drag = -1;")
-                p("    }")
-            # ScrollRect drag (viewport) — skip if scrollbar already dragging.
-            if ui_scrollrects:
-                p("    {")
-                p("        int rhit = -1;")
-                if ui_scrollbars:
-                    p("        if (_engine_ui_sb_drag < 0) {")
-                # Hit-test viewport GO, not root.
-                p("            for (i = 0; i < _engine_ui_scrollrect_count;"
-                  " i = i + 1) {")
-                p("                int go = _engine_ui_sr_viewport[i];")
-                p("                float cx, cy, hw, hh, dx, dy, rw, rh;")
-                p("                if (go < 0 || go >= %d) continue;" % go_n)
-                p("                if (!_engine_go_active_in_hierarchy(go))"
-                  " continue;")
-                if want_live_rt:
-                    p("                _engine_ui_screen_rect("
-                      "go, sw, sh, &cx, &cy, &rw, &rh);")
-                    p("                if (rw < 0.f) rw = -rw;")
-                    p("                if (rh < 0.f) rh = -rh;")
-                    p("                hw = rw * 0.5f; hh = rh * 0.5f;")
-                else:
-                    p("                cx = sw * 0.5f; cy = sh * 0.5f;")
-                    p("                hw = sw; hh = sh;")
-                p("                dx = px - cx; if (dx < 0.f) dx = -dx;")
-                p("                dy = py - cy; if (dy < 0.f) dy = -dy;")
-                p("                if (dx <= hw && dy <= hh && rhit < 0)"
-                  " rhit = i;")
-                p("            }")
-                if ui_scrollbars:
-                    p("        }")
-                p("        if (down_edge && rhit >= 0) {")
-                p("            int cgo;")
-                p("            _engine_ui_sr_drag = rhit;")
-                p("            _engine_ui_sr_drag_px = px;")
-                p("            _engine_ui_sr_drag_py = py;")
-                p("            cgo = _engine_ui_sr_content[rhit];")
-                p("            _engine_ui_sr_drag_ax = 0.f;")
-                p("            _engine_ui_sr_drag_ay = 0.f;")
-                if want_live_rt:
-                    p("            if (cgo >= 0 && cgo < %d"
-                      " && _engine_rt_has[cgo]) {" % go_n)
-                    p("                _engine_ui_sr_drag_ax ="
-                      " _engine_rt_apos_x[cgo];")
-                    p("                _engine_ui_sr_drag_ay ="
-                      " _engine_rt_apos_y[cgo];")
-                    p("            }")
-                p("        }")
-                p("        if (_engine_ui_sr_drag >= 0 && engine_pointer_down)")
-                p("            _engine_ui_sr_drag_to("
-                  "_engine_ui_sr_drag, px, py);")
-                p("        if (up_edge)")
-                p("            _engine_ui_sr_drag = -1;")
-                p("    }")
-            # Sliders — drag takes priority over Button press.
-            if ui_sliders:
-                p("    {")
-                p("        int shit = -1;")
-                skip = []
-                if ui_scrollbars:
-                    skip.append("_engine_ui_sb_drag < 0")
-                if ui_scrollrects:
-                    skip.append("_engine_ui_sr_drag < 0")
-                if skip:
-                    p("        if (%s) {" % " && ".join(skip))
-                    _emit_hit_loop(
-                        "_engine_ui_slider_count", "_engine_ui_sl_go", "shit")
-                    p("        }")
-                else:
-                    _emit_hit_loop(
-                        "_engine_ui_slider_count", "_engine_ui_sl_go", "shit")
-                p("        if (down_edge && shit >= 0)")
-                p("            _engine_ui_sl_drag = shit;")
-                p("        if (_engine_ui_sl_drag >= 0 && engine_pointer_down)")
-                p("            _engine_ui_sl_drag_to("
-                  "_engine_ui_sl_drag, px, py, sw, sh);")
-                p("        if (up_edge)")
-                p("            _engine_ui_sl_drag = -1;")
-                p("    }")
-            # Toggle click (pointer-up over pressed target).
-            if ui_toggles:
-                p("    {")
-                p("        int thit = -1;")
-                _emit_hit_loop(
-                    "_engine_ui_toggle_count", "_engine_ui_tg_go", "thit")
-                busy = []
-                if ui_scrollbars:
-                    busy.append("_engine_ui_sb_drag < 0")
-                if ui_scrollrects:
-                    busy.append("_engine_ui_sr_drag < 0")
-                if ui_sliders:
-                    busy.append("_engine_ui_sl_drag < 0")
-                busy_expr = (" && ".join(busy)) if busy else "1"
-                p("        if (down_edge && thit >= 0 && (%s))" % busy_expr)
-                p("            _engine_ui_tg_press = thit;")
-                p("        if (up_edge) {")
-                p("            if (_engine_ui_tg_press >= 0"
-                  " && thit == _engine_ui_tg_press) {")
-                p("                int go = _engine_ui_tg_go["
-                  "_engine_ui_tg_press];")
-                p("                _engine_ui_tg_set(_engine_ui_tg_press,"
-                  " !Toggle_get_isOn(go));")
-                p("            }")
-                p("            _engine_ui_tg_press = -1;")
-                p("        }")
-                p("    }")
-            # EventTrigger: PointerEnter/Exit/Down/Up/Click + Begin/EndDrag.
-            if ui_eventtriggers:
-                p("    {")
-                p("        int ehit = -1;")
-                _emit_hit_loop(
-                    "_engine_ui_et_count", "_engine_ui_et_go", "ehit")
-                p("        for (i = 0; i < _engine_ui_et_count; i = i + 1) {")
-                p("            int over = (ehit == i);")
-                p("            int was = _engine_ui_et_hover[i];")
-                p("            if (over && !was)")
-                p("                _engine_ui_et_fire(i, 0); /* PointerEnter */")
-                p("            if (!over && was)")
-                p("                _engine_ui_et_fire(i, 1); /* PointerExit */")
-                p("            _engine_ui_et_hover[i] = over;")
-                p("        }")
-                busy = []
-                if ui_scrollbars:
-                    busy.append("_engine_ui_sb_drag < 0")
-                if ui_scrollrects:
-                    busy.append("_engine_ui_sr_drag < 0")
-                if ui_sliders:
-                    busy.append("_engine_ui_sl_drag < 0")
-                busy_expr = (" && ".join(busy)) if busy else "1"
-                p("        if (down_edge && ehit >= 0 && (%s)) {" % busy_expr)
-                p("            _engine_ui_et_press = ehit;")
-                p("            _engine_ui_et_fire(ehit, 2); /* PointerDown */")
-                p("            _engine_ui_et_fire(ehit, 13); /* BeginDrag */")
-                p("        }")
-                p("        if (up_edge && _engine_ui_et_press >= 0) {")
-                p("            int pr = _engine_ui_et_press;")
-                p("            _engine_ui_et_fire(pr, 3); /* PointerUp */")
-                p("            _engine_ui_et_fire(pr, 14); /* EndDrag */")
-                p("            if (ehit == pr)")
-                p("                _engine_ui_et_fire(pr, 4); /* PointerClick */")
-                p("            _engine_ui_et_press = -1;")
-                p("        }")
-                p("    }")
-            p("    hit = -1;")
-            if ui_buttons:
-                p("    for (i = 0; i < _engine_ui_button_count; i = i + 1) {")
-                p("        int go = _engine_ui_btn_go[i];")
-                p("        float cx, cy, hw, hh, dx, dy;")
-                p("        const float *col;")
-                p("        int over;")
-                p("        if (go < 0 || go >= %d) continue;" % go_n)
-                p("        if (!_engine_go_active_in_hierarchy(go)) {")
-                p("            col = &_engine_ui_btn_col_d[i * 4];")
-                p("            _engine_ui_btn_tint[i * 4 + 0] = col[0];")
-                p("            _engine_ui_btn_tint[i * 4 + 1] = col[1];")
-                p("            _engine_ui_btn_tint[i * 4 + 2] = col[2];")
-                p("            _engine_ui_btn_tint[i * 4 + 3] = col[3];")
-                p("            continue;")
-                p("        }")
-                if want_live_rt:
-                    p("        {")
-                    p("            float rcx, rcy, rw, rh;")
-                    p("            _engine_ui_screen_rect("
-                      "go, sw, sh, &rcx, &rcy, &rw, &rh);")
-                    p("            if (rw < 0.f) rw = -rw;")
-                    p("            if (rh < 0.f) rh = -rh;")
-                    p("            cx = rcx;")
-                    p("            cy = rcy;")
-                    p("            hw = rw * 0.5f;")
-                    p("            hh = rh * 0.5f;")
-                    p("        }")
-                else:
-                    p("        cx = _engine_ui_btn_ncx[i] * sw;")
-                    p("        cy = _engine_ui_btn_ncy[i] * sh;")
-                    p("        hw = _engine_ui_btn_nhw[i] * sw;")
-                    p("        hh = _engine_ui_btn_nhh[i] * sh;")
-                p("        dx = px - cx; if (dx < 0.f) dx = -dx;")
-                p("        dy = py - cy; if (dy < 0.f) dy = -dy;")
-                p("        over = (dx <= hw && dy <= hh);")
-                p("        if (over && hit < 0) hit = i;")
-                # Pressed visual sticks to the button that received pointer-down
-                # even after mouse-off (Unity Selectable.IsPressed).
-                p("        if (i == _engine_ui_btn_press && engine_pointer_down)")
-                p("            col = &_engine_ui_btn_col_p[i * 4];")
-                p("        else if (over)")
-                p("            col = &_engine_ui_btn_col_h[i * 4];")
-                p("        else")
-                p("            col = &_engine_ui_btn_col_n[i * 4];")
-                p("        _engine_ui_btn_tint[i * 4 + 0] = col[0];")
-                p("        _engine_ui_btn_tint[i * 4 + 1] = col[1];")
-                p("        _engine_ui_btn_tint[i * 4 + 2] = col[2];")
-                p("        _engine_ui_btn_tint[i * 4 + 3] = col[3];")
-                p("    }")
-                # Skip Button press while a Slider/Scrollbar/ScrollRect drags.
-                busy = []
-                if ui_sliders:
-                    busy.append("_engine_ui_sl_drag < 0")
-                if ui_scrollbars:
-                    busy.append("_engine_ui_sb_drag < 0")
-                if ui_scrollrects:
-                    busy.append("_engine_ui_sr_drag < 0")
-                if ui_toggles:
-                    busy.append("_engine_ui_tg_press < 0")
-                if busy:
-                    p("    if (down_edge && hit >= 0 && %s)"
-                      % " && ".join(busy))
-                else:
-                    p("    if (down_edge && hit >= 0)")
-                p("        _engine_ui_btn_press = hit;")
-                p("    if (up_edge) {")
-                p("        if (_engine_ui_btn_press >= 0"
-                  " && hit == _engine_ui_btn_press) {")
-                p("            int j, j0, j1;")
-                p("            j0 = _engine_ui_btn_call_start["
-                  "_engine_ui_btn_press];")
-                p("            j1 = j0 + _engine_ui_btn_call_count["
-                  "_engine_ui_btn_press];")
-                p("            for (j = j0; j < j1; j = j + 1) {")
-                p("                int op = _engine_ui_btn_call_op[j];")
-                p("                if (op == 0) {")
-                p("                    if (_engine_ui_btn_call_go[j] >= 0)")
-                p("                        GameObject_SetActive("
-                  "_engine_ui_btn_call_go[j],")
-                p("                                             "
-                  "_engine_ui_btn_call_bool[j]);")
-                p("                }")
-                mb_handlers = plan.get("_ui_btn_mb_handlers") or []
-                for hi, (hcname, hmethod, hstr) in enumerate(mb_handlers):
-                    hidn = _c_ident(hcname)
-                    p("                else if (op == %d)" % (hi + 1))
-                    if hstr:
-                        p("                    %s_%s("
-                          "(unsigned)_engine_ui_btn_call_go[j],"
-                          % (hidn, hmethod))
-                        p("                        "
-                          "_engine_ui_btn_call_str[j]);")
-                    else:
-                        p("                    %s_%s("
-                          "(unsigned)_engine_ui_btn_call_go[j]);"
-                          % (hidn, hmethod))
-                p("            }")
-                p("        }")
-                p("        _engine_ui_btn_press = -1;")
-                p("    }")
-            elif not (ui_sliders or ui_scrollbars or ui_scrollrects
-                      or ui_toggles):
-                p("    (void)i; (void)hit; (void)px; (void)py;")
-                p("    (void)sw; (void)sh; (void)down_edge; (void)up_edge;")
-            else:
-                p("    (void)hit;")
-            p("    _engine_pointer_was_down = engine_pointer_down;")
-            p("}")
-            p("")
+    _emit_engine_ui_transform_tables(
+            go_spawn_budget, p, plan, ui_buttons, ui_eventtriggers, ui_scrollbars,
+            ui_scrollrects, ui_sliders, ui_toggles, want_gcic, want_get_sibling,
+            want_instantiate, want_live_rt, want_mouse_position, want_rect,
+            want_screen_to_world, want_set_parent, want_transform_find,
+            want_transform_parent, want_ui)
 
     # Object.Instantiate(this[, parent]) — after GO + parent tables.
-    if want_instantiate and want_go_tables:
-        go_names_i = plan.get("go_names") or []
-        go_cap_i = max(1, len(go_names_i) + go_spawn_budget)
-        for cname in sorted(inst_budget.keys()):
-            if cname not in plan["classes"]:
-                continue
-            if not int(inst_budget.get(cname) or 0):
-                continue
-            cl = plan["classes"][cname]
-            idn = _c_ident(cname)
-            mb_extra = _mb_pool_extra(plan, cname)
-            mb_add = int(add_budget.get(cname) or 0)
-            cap = int(cl["n"]) + mb_extra
-            p("/* Object.Instantiate(%s[, parent]) — clone + optional parent */"
-              % cname)
-            p("static int Object_Instantiate_%s(int src, int parent_go) {"
-              % idn)
-            p("    int ex, go;")
-            p("    if (src < 0 || src >= _%s_inst_count) return -1;" % idn)
-            reuse = (cl.get("max_instances") is not None and want_destroy)
-            if reuse:
-                # `[MaxInstances(N)]` caps *live* instances: once the array
-                # is full, a destroyed one's slot -- instance and GameObject
-                # -- is taken over (everything below rewrites it for the
-                # clone). Only when none is free does the spawn clip.
-                go_full = ("_engine_go_count >= _engine_go_cap"
-                           if go_spawn_budget
-                           else "_engine_go_count >= %d" % go_cap_i)
-                p("    ex = -1;")
-                p("    go = -1;")
-                p("    if (_%s_inst_count >= %d || %s) {" % (idn, cap, go_full))
-                p("        int _k;")
-                p("        for (_k = 0; _k < _%s_inst_count; _k = _k + 1) {" % idn)
-                p("            int _g = _engine_%s_go_of[_k];" % idn)
-                p("            if (_g >= 0 && _g < %d && _engine_go_destroyed[_g]) {"
-                  % go_cap_i)
-                p("                ex = _k;")
-                p("                go = _g;")
-                p("                break;")
-                p("            }")
-                p("        }")
-                p("        if (ex < 0) return -1;")
-                p("    } else {")
-                p("        go = _engine_go_count;")
-                p("        _engine_go_count = _engine_go_count + 1;")
-                p("    }")
-            else:
-                p("    if (_%s_inst_count >= %d) return -1;" % (idn, cap))
-                if go_spawn_budget:
-                    p("    if (_engine_go_count >= _engine_go_cap) return -1;")
-                else:
-                    p("    if (_engine_go_count >= %d) return -1;" % go_cap_i)
-                p("    go = _engine_go_count;")
-                p("    _engine_go_count = _engine_go_count + 1;")
-            p("    _engine_go_name[go] = \"(Clone)\";")
-            if want_ui:
-                # Instantiate copies activeSelf from the source GO.
-                p("    _engine_go_active_init();")
-                p("    {")
-                p("        int _sgo = _engine_%s_go_of[src];" % idn)
-                p("        if (_sgo >= 0 && _sgo < %d)" % go_cap_i)
-                p("            _engine_go_active[go] = _engine_go_active[_sgo];")
-                p("        else")
-                p("            _engine_go_active[go] = 1;")
-                p("    }")
-            if want_destroy:
-                p("    if (go >= 0 && go < %d)" % go_cap_i)
-                p("        _engine_go_destroyed[go] = 0;")
-            if reuse:
-                p("    if (ex < 0) {")
-                p("        ex = _%s_inst_count;" % idn)
-                p("        _%s_inst_count = _%s_inst_count + 1;" % (idn, idn))
-                p("    }")
-            else:
-                p("    ex = _%s_inst_count;" % idn)
-                p("    _%s_inst_count = _%s_inst_count + 1;" % (idn, idn))
-            p("    _%s_inst_array[ex] = _%s_inst_array[src];" % (idn, idn))
-            if cl.get("soa_dims"):
-                dims = int(cl["soa_dims"])
-                p("    {")
-                p("        int _a;")
-                p("        for (_a = 0; _a < %d; _a = _a + 1)" % dims)
-                p("            _%s_pos[ex][_a] = _%s_pos[src][_a];"
-                  % (idn, idn))
-                p("    }")
-            p("    _engine_go_%s[go] = ex;" % idn)
-            p("    if (ex >= 0 && ex < %d)" % cap)
-            p("        _engine_%s_go_of[ex] = go;" % idn)
-            if want_set_parent or want_inst_parent or want_transform_parent:
-                p("    if (parent_go >= 0 && parent_go < go)")
-                p("        _engine_go_parent[go] = parent_go;")
-                p("    else")
-                p("        _engine_go_parent[go] = -1;")
-                if want_get_sibling:
-                    p("    {")
-                    p("        int _i, _max = -1;")
-                    p("        for (_i = 0; _i < go; _i = _i + 1)")
-                    p("            if (_engine_go_parent[_i] == "
-                      "_engine_go_parent[go]")
-                    p("                && _engine_go_sib[_i] > _max)")
-                    p("                _max = _engine_go_sib[_i];")
-                    p("        _engine_go_sib[go] = _max + 1;")
-                    p("    }")
-            else:
-                p("    (void)parent_go;")
-            p("    return ex;")
-            p("}")
-            p("")
-            if not mb_add:
-                p("static char _%s_tostring_buf[256];" % idn)
-                p("static const char *%s_ToString(int ci) {" % idn)
-                p("    int n, go;")
-                p("    if (ci < 0 || ci >= _%s_inst_count) return \"null\";"
-                  % idn)
-                p("    go = _engine_%s_go_of[ci];" % idn)
-                p("    if (go < 0 || go >= _engine_go_count) return \"null\";")
-                p("    n = snprintf(_%s_tostring_buf, sizeof _%s_tostring_buf,"
-                  % (idn, idn))
-                p("                 \"%%s (%s)\", _engine_go_name[go]);" % cname)
-                p("    if (n < 0 || (size_t)n >= sizeof _%s_tostring_buf)"
-                  % idn)
-                p("        return _engine_go_name[go];")
-                p("    return _%s_tostring_buf;" % idn)
-                p("}")
-                p("")
+    _emit_engine_instantiate(
+            add_budget, go_spawn_budget, inst_budget, p, plan, want_destroy,
+            want_get_sibling, want_go_tables, want_inst_parent, want_instantiate,
+            want_set_parent, want_transform_parent, want_ui)
 
     # GameObject.GetComponentsInChildren<T> — after parent tables + GO maps.
-    if want_gcic and want_go_tables:
-        p("/* GetComponentsInChildren<T> — live subtree walk → vector */")
-        p("static int _engine_go_is_child_of(int go, int root) {")
-        p("    int cur, guard;")
-        p("    if (go < 0 || root < 0) return 0;")
-        p("    if (go == root) return 1;")
-        p("    cur = go;")
-        p("    guard = 0;")
-        p("    while (cur >= 0 && guard < _engine_go_count + 2) {")
-        p("        cur = _engine_go_parent[cur];")
-        p("        if (cur == root) return 1;")
-        p("        guard = guard + 1;")
-        p("    }")
-        p("    return 0;")
-        p("}")
-        p("")
-        for tname in sorted(getcomponentsinchildren_types):
-            idn = _c_ident(tname)
-            collectors = _gcic_collector_types(
-                tname, plan, plan.get("mb_bases") or {})
-            # Need a GetComponent map / packed class / subclass / Transform.
-            has_map = (
-                bool(collectors)
-                or tname in _PHYSICS_COMPONENTS
-                or tname in _ADDABLE_BUILTINS
-                or tname in _UI_GETCOMPONENT_TYPES
-                or tname in _TRANSFORM_GETCOMPONENT_TYPES
-                or tname in add_types
-                or tname == "SpriteRenderer")
-            if not has_map:
-                continue
-            p("static std::vector<int> GameObject_GetComponentsInChildren_%s("
-              % idn)
-            p("    int root, int includeInactive) {")
-            p("    std::vector<int> out;")
-            p("    int go, ci;")
-            if not want_ui:
-                p("    (void)includeInactive;")
-            p("    if (root < 0 || root >= _engine_go_count) return out;")
-            p("    for (go = 0; go < _engine_go_count; go = go + 1) {")
-            p("        if (!_engine_go_is_child_of(go, root)) continue;")
-            if want_destroy:
-                p("        if (_engine_go_destroyed[go]) continue;")
-            if want_ui:
-                p("        if (!includeInactive")
-                p("            && !_engine_go_active_in_hierarchy(go))")
-                p("            continue;")
-            if tname == "RectTransform":
-                p("        out.push_back(go);")
-            elif collectors:
-                # Unity polymorphism: Weapon finds Blaster : Weapon, etc.
-                for cname in collectors:
-                    cidn = _c_ident(cname)
-                    p("        ci = GameObject_GetComponent_%s(go);" % cidn)
-                    p("        if (ci >= 0) out.push_back(ci);")
-            else:
-                p("        ci = GameObject_GetComponent_%s(go);" % idn)
-                p("        if (ci >= 0) out.push_back(ci);")
-            p("    }")
-            p("    return out;")
-            p("}")
-            p("")
+    _emit_engine_get_components_in_children(
+            add_types, getcomponentsinchildren_types, p, plan, want_destroy, want_gcic,
+            want_go_tables, want_ui)
 
     # Object.FindObjectOfType / Type.Instance — after GO maps (and optional
     # active-hierarchy helpers when want_ui).
-    if want_findobject and findobject_packed:
-        p("/* Object.FindObjectOfType<T> — first live component index */")
-        for cname in findobject_packed:
-            idn = _c_ident(cname)
-            p("static int Object_FindObjectOfType_%s(int includeInactive) {"
-              % idn)
-            p("    int go, ci;")
-            if not want_ui:
-                p("    (void)includeInactive;")
-            p("    for (go = 0; go < _engine_go_count; go = go + 1) {")
-            if want_destroy:
-                p("        if (_engine_go_destroyed[go]) continue;")
-            p("        ci = _engine_go_%s[go];" % idn)
-            p("        if (ci < 0) continue;")
-            if want_ui:
-                p("        if (!includeInactive")
-                p("            && !_engine_go_active_in_hierarchy(go))")
-                p("            continue;")
-            p("        return ci;")
-            p("    }")
-            p("    return -1;")
-            p("}")
-            p("")
-        for cname in sorted(singleton_instance_types):
-            if cname not in plan["classes"]:
-                continue
-            idn = _c_ident(cname)
-            p("/* %s.Instance — cache until destroyed / missing */"
-              % cname)
-            p("static int %s_instance = -1;" % idn)
-            p("static int %s_Instance(void) {" % idn)
-            p("    int go;")
-            p("    if (%s_instance >= 0) {" % idn)
-            p("        go = _engine_%s_go_of[%s_instance];" % (idn, idn))
-            p("        if (go >= 0 && go < _engine_go_count")
-            if want_destroy:
-                p("            && !_engine_go_destroyed[go]")
-            p("            && _engine_go_%s[go] == %s_instance)"
-              % (idn, idn))
-            p("            return %s_instance;" % idn)
-            p("        %s_instance = -1;" % idn)
-            p("    }")
-            p("    %s_instance = Object_FindObjectOfType_%s(1);"
-              % (idn, idn))
-            p("    return %s_instance;" % idn)
-            p("}")
-            p("")
+    _emit_engine_find_object_of_type(
+            findobject_packed, p, plan, singleton_instance_types, want_destroy,
+            want_findobject, want_ui)
 
     p("static float f16_to_f32(uint16_t h) {")
     p("    unsigned s = (h >> 15) & 1u;")
@@ -15188,261 +13047,7 @@ def emit_engine(plan, analyses, used_apis):
         p("}")
         p("")
 
-    if want_live_rot:
-        p("/* Transform.Rotate(Space.Self): localRotation *= Euler(deg). */")
-        p("static void _engine_transform_rotate_local(")
-        p("    float *qx, float *qy, float *qz, float *qw,")
-        p("    float *m00, float *m01, float *m10, float *m11,")
-        p("    float ex_deg, float ey_deg, float ez_deg) {")
-        p("    float hx = ex_deg * 0.008726646259971648f;")
-        p("    float hy = ey_deg * 0.008726646259971648f;")
-        p("    float hz = ez_deg * 0.008726646259971648f;")
-        p("    float cx = cosf(hx); float sx = sinf(hx);")
-        p("    float cy = cosf(hy); float sy = sinf(hy);")
-        p("    float cz = cosf(hz); float sz = sinf(hz);")
-        p("    float ex = sx * cy * cz + cx * sy * sz;")
-        p("    float ey = cx * sy * cz - sx * cy * sz;")
-        p("    float ez = cx * cy * sz - sx * sy * cz;")
-        p("    float ew = cx * cy * cz + sx * sy * sz;")
-        p("    float nx = (*qw) * ex + (*qx) * ew + (*qy) * ez - (*qz) * ey;")
-        p("    float ny = (*qw) * ey - (*qx) * ez + (*qy) * ew + (*qz) * ex;")
-        p("    float nz = (*qw) * ez + (*qx) * ey - (*qy) * ex + (*qz) * ew;")
-        p("    float nw = (*qw) * ew - (*qx) * ex - (*qy) * ey - (*qz) * ez;")
-        p("    float m = sqrtf(nx * nx + ny * ny + nz * nz + nw * nw);")
-        p("    if (m > 1e-8f) {")
-        p("        nx = nx / m; ny = ny / m; nz = nz / m; nw = nw / m;")
-        p("    } else {")
-        p("        nx = 0.f; ny = 0.f; nz = 0.f; nw = 1.f;")
-        p("    }")
-        p("    *qx = nx; *qy = ny; *qz = nz; *qw = nw;")
-        p("    /* Ortho XY basis: R * (lx,ly,0) — X/Y tilt foreshortens. */")
-        p("    *m00 = 1.f - 2.f * (ny * ny + nz * nz);")
-        p("    *m01 = 2.f * (nx * ny - nz * nw);")
-        p("    *m10 = 2.f * (nx * ny + nz * nw);")
-        p("    *m11 = 1.f - 2.f * (nx * nx + nz * nz);")
-        p("}")
-        p("")
-        p("/* Quaternion.LookRotation(forward, up) → local quat + XY basis. */")
-        p("static void _engine_quat_look_rotation(")
-        p("    float *qx, float *qy, float *qz, float *qw,")
-        p("    float *m00, float *m01, float *m10, float *m11,")
-        p("    float dx, float dy, float dz,")
-        p("    float ux, float uy, float uz) {")
-        p("    float len = sqrtf(dx * dx + dy * dy + dz * dz);")
-        p("    float rx, ry, rz, rlen;")
-        p("    float m00r, m01r, m02r, m10r, m11r, m12r, m20r, m21r, m22r;")
-        p("    float trace, s, nx, ny, nz, nw;")
-        p("    float uxi = ux, uyi = uy, uzi = uz;")
-        p("    if (len < 1e-8f) {")
-        p("        *qx = 0.f; *qy = 0.f; *qz = 0.f; *qw = 1.f;")
-        p("        *m00 = 1.f; *m01 = 0.f; *m10 = 0.f; *m11 = 1.f;")
-        p("        return;")
-        p("    }")
-        p("    dx = dx / len; dy = dy / len; dz = dz / len;")
-        p("    rx = uyi * dz - uzi * dy;")
-        p("    ry = uzi * dx - uxi * dz;")
-        p("    rz = uxi * dy - uyi * dx;")
-        p("    rlen = sqrtf(rx * rx + ry * ry + rz * rz);")
-        p("    if (rlen < 1e-6f) {")
-        p("        uxi = 0.f; uyi = 0.f; uzi = 1.f;")
-        p("        rx = uyi * dz - uzi * dy;")
-        p("        ry = uzi * dx - uxi * dz;")
-        p("        rz = uxi * dy - uyi * dx;")
-        p("        rlen = sqrtf(rx * rx + ry * ry + rz * rz);")
-        p("        if (rlen < 1e-8f) {")
-        p("            *qx = 0.f; *qy = 0.f; *qz = 0.f; *qw = 1.f;")
-        p("            *m00 = 1.f; *m01 = 0.f; *m10 = 0.f; *m11 = 1.f;")
-        p("            return;")
-        p("        }")
-        p("    }")
-        p("    rx = rx / rlen; ry = ry / rlen; rz = rz / rlen;")
-        p("    ux = dy * rz - dz * ry;")
-        p("    uy = dz * rx - dx * rz;")
-        p("    uz = dx * ry - dy * rx;")
-        p("    /* Columns = right, up, forward (Unity LookRotation). */")
-        p("    m00r = rx; m01r = ux; m02r = dx;")
-        p("    m10r = ry; m11r = uy; m12r = dy;")
-        p("    m20r = rz; m21r = uz; m22r = dz;")
-        p("    trace = m00r + m11r + m22r;")
-        p("    if (trace > 0.f) {")
-        p("        s = 0.5f / sqrtf(trace + 1.f);")
-        p("        nw = 0.25f / s;")
-        p("        nx = (m21r - m12r) * s;")
-        p("        ny = (m02r - m20r) * s;")
-        p("        nz = (m10r - m01r) * s;")
-        p("    } else if (m00r > m11r && m00r > m22r) {")
-        p("        s = 2.f * sqrtf(1.f + m00r - m11r - m22r);")
-        p("        nw = (m21r - m12r) / s;")
-        p("        nx = 0.25f * s;")
-        p("        ny = (m01r + m10r) / s;")
-        p("        nz = (m02r + m20r) / s;")
-        p("    } else if (m11r > m22r) {")
-        p("        s = 2.f * sqrtf(1.f + m11r - m00r - m22r);")
-        p("        nw = (m02r - m20r) / s;")
-        p("        nx = (m01r + m10r) / s;")
-        p("        ny = 0.25f * s;")
-        p("        nz = (m12r + m21r) / s;")
-        p("    } else {")
-        p("        s = 2.f * sqrtf(1.f + m22r - m00r - m11r);")
-        p("        nw = (m10r - m01r) / s;")
-        p("        nx = (m02r + m20r) / s;")
-        p("        ny = (m12r + m21r) / s;")
-        p("        nz = 0.25f * s;")
-        p("    }")
-        p("    *qx = nx; *qy = ny; *qz = nz; *qw = nw;")
-        p("    *m00 = 1.f - 2.f * (ny * ny + nz * nz);")
-        p("    *m01 = 2.f * (nx * ny - nz * nw);")
-        p("    *m10 = 2.f * (nx * ny + nz * nw);")
-        p("    *m11 = 1.f - 2.f * (nx * nx + nz * nz);")
-        p("}")
-        p("")
-        p("/* Transform.LookAt: localRotation = LookRotation(to-from, up). */")
-        p("static void _engine_transform_look_at(")
-        p("    float *qx, float *qy, float *qz, float *qw,")
-        p("    float *m00, float *m01, float *m10, float *m11,")
-        p("    float fx, float fy, float fz,")
-        p("    float tx, float ty, float tz) {")
-        p("    float dx = tx - fx;")
-        p("    float dy = ty - fy;")
-        p("    float dz = tz - fz;")
-        p("    _engine_quat_look_rotation(")
-        p("        qx, qy, qz, qw, m00, m01, m10, m11,")
-        p("        dx, dy, dz, 0.f, 1.f, 0.f);")
-        p("}")
-        p("")
-        p("/* Transform.eulerAngles get: quat → degrees (Unity ZXY). */")
-        p("static void _engine_quat_to_euler_deg(")
-        p("    float qx, float qy, float qz, float qw,")
-        p("    float *ex, float *ey, float *ez) {")
-        p("    float sqx = qx * qx;")
-        p("    float sqy = qy * qy;")
-        p("    float sqz = qz * qz;")
-        p("    float sqw = qw * qw;")
-        p("    float unit = sqx + sqy + sqz + sqw;")
-        p("    float test = qx * qy + qz * qw;")
-        p("    float rad2deg = 57.29577951308232f;")
-        p("    if (test > 0.499f * unit) {")
-        p("        *ey = 2.f * atan2f(qx, qw) * rad2deg;")
-        p("        *ex = 90.f;")
-        p("        *ez = 0.f;")
-        p("    } else if (test < -0.499f * unit) {")
-        p("        *ey = -2.f * atan2f(qx, qw) * rad2deg;")
-        p("        *ex = -90.f;")
-        p("        *ez = 0.f;")
-        p("    } else {")
-        p("        *ey = atan2f(2.f * qy * qw - 2.f * qx * qz,")
-        p("                    sqx - sqy - sqz + sqw) * rad2deg;")
-        p("        *ex = asinf(2.f * test / unit) * rad2deg;")
-        p("        *ez = atan2f(2.f * qx * qw - 2.f * qy * qz,")
-        p("                    -sqx + sqy - sqz + sqw) * rad2deg;")
-        p("    }")
-        p("}")
-        p("")
-        p("/* Transform.eulerAngles set: localRotation = Euler(deg). */")
-        p("static void _engine_transform_set_euler(")
-        p("    float *qx, float *qy, float *qz, float *qw,")
-        p("    float *m00, float *m01, float *m10, float *m11,")
-        p("    float ex_deg, float ey_deg, float ez_deg) {")
-        p("    float hx = ex_deg * 0.008726646259971648f;")
-        p("    float hy = ey_deg * 0.008726646259971648f;")
-        p("    float hz = ez_deg * 0.008726646259971648f;")
-        p("    float cx = cosf(hx); float sx = sinf(hx);")
-        p("    float cy = cosf(hy); float sy = sinf(hy);")
-        p("    float cz = cosf(hz); float sz = sinf(hz);")
-        p("    float nx = sx * cy * cz + cx * sy * sz;")
-        p("    float ny = cx * sy * cz - sx * cy * sz;")
-        p("    float nz = cx * cy * sz - sx * sy * cz;")
-        p("    float nw = cx * cy * cz + sx * sy * sz;")
-        p("    *qx = nx; *qy = ny; *qz = nz; *qw = nw;")
-        p("    *m00 = 1.f - 2.f * (ny * ny + nz * nz);")
-        p("    *m01 = 2.f * (nx * ny - nz * nw);")
-        p("    *m10 = 2.f * (nx * ny + nz * nw);")
-        p("    *m11 = 1.f - 2.f * (nx * nx + nz * nz);")
-        p("}")
-        p("")
-        p("/* Transform.rotation set: localRotation = quat (unparented≈world). */")
-        p("static void _engine_transform_set_quat(")
-        p("    float *qx, float *qy, float *qz, float *qw,")
-        p("    float *m00, float *m01, float *m10, float *m11,")
-        p("    float nx, float ny, float nz, float nw) {")
-        p("    float m = sqrtf(nx * nx + ny * ny + nz * nz + nw * nw);")
-        p("    if (m > 1e-8f) {")
-        p("        nx = nx / m; ny = ny / m; nz = nz / m; nw = nw / m;")
-        p("    } else {")
-        p("        nx = 0.f; ny = 0.f; nz = 0.f; nw = 1.f;")
-        p("    }")
-        p("    *qx = nx; *qy = ny; *qz = nz; *qw = nw;")
-        p("    *m00 = 1.f - 2.f * (ny * ny + nz * nz);")
-        p("    *m01 = 2.f * (nx * ny - nz * nw);")
-        p("    *m10 = 2.f * (nx * ny + nz * nw);")
-        p("    *m11 = 1.f - 2.f * (nx * nx + nz * nz);")
-        p("}")
-        p("")
-        p("/* Quaternion.Slerp(a, b, t) — shortest-path spherical lerp. */")
-        p("static void _engine_quat_slerp(")
-        p("    float ax, float ay, float az, float aw,")
-        p("    float bx, float by, float bz, float bw,")
-        p("    float t,")
-        p("    float *ox, float *oy, float *oz, float *ow) {")
-        p("    float dot = ax * bx + ay * by + az * bz + aw * bw;")
-        p("    float theta, st, wa, wb, nx, ny, nz, nw, m;")
-        p("    if (t <= 0.f) {")
-        p("        *ox = ax; *oy = ay; *oz = az; *ow = aw;")
-        p("        return;")
-        p("    }")
-        p("    if (t >= 1.f) {")
-        p("        *ox = bx; *oy = by; *oz = bz; *ow = bw;")
-        p("        return;")
-        p("    }")
-        p("    if (dot < 0.f) {")
-        p("        bx = -bx; by = -by; bz = -bz; bw = -bw;")
-        p("        dot = -dot;")
-        p("    }")
-        p("    if (dot > 0.9995f) {")
-        p("        nx = ax + t * (bx - ax);")
-        p("        ny = ay + t * (by - ay);")
-        p("        nz = az + t * (bz - az);")
-        p("        nw = aw + t * (bw - aw);")
-        p("    } else {")
-        p("        if (dot > 1.f) dot = 1.f;")
-        p("        theta = acosf(dot);")
-        p("        st = sinf(theta);")
-        p("        if (st < 1e-8f) {")
-        p("            *ox = ax; *oy = ay; *oz = az; *ow = aw;")
-        p("            return;")
-        p("        }")
-        p("        wa = sinf((1.f - t) * theta) / st;")
-        p("        wb = sinf(t * theta) / st;")
-        p("        nx = wa * ax + wb * bx;")
-        p("        ny = wa * ay + wb * by;")
-        p("        nz = wa * az + wb * bz;")
-        p("        nw = wa * aw + wb * bw;")
-        p("    }")
-        p("    m = sqrtf(nx * nx + ny * ny + nz * nz + nw * nw);")
-        p("    if (m > 1e-8f) {")
-        p("        *ox = nx / m; *oy = ny / m; *oz = nz / m; *ow = nw / m;")
-        p("    } else {")
-        p("        *ox = 0.f; *oy = 0.f; *oz = 0.f; *ow = 1.f;")
-        p("    }")
-        p("}")
-        p("")
-        p("/* Quaternion.Inverse(q) — conjugate / |q|^2 (Unity). */")
-        p("static void _engine_quat_inverse(")
-        p("    float x, float y, float z, float w,")
-        p("    float *ox, float *oy, float *oz, float *ow) {")
-        p("    float n2 = x * x + y * y + z * z + w * w;")
-        p("    float inv;")
-        p("    if (n2 < 1e-20f) {")
-        p("        *ox = 0.f; *oy = 0.f; *oz = 0.f; *ow = 1.f;")
-        p("        return;")
-        p("    }")
-        p("    inv = 1.f / n2;")
-        p("    *ox = -x * inv;")
-        p("    *oy = -y * inv;")
-        p("    *oz = -z * inv;")
-        p("    *ow = w * inv;")
-        p("}")
-        p("")
+    _emit_engine_live_rotation(p, want_live_rot)
 
     if want_live_rot or want_quat_angle:
         p("/* Quaternion.Angle(a, b) — degrees between rotations (Unity). */")
@@ -15542,49 +13147,7 @@ def emit_engine(plan, analyses, used_apis):
 
     # Collection / ref-array tables before any method body (cross-class use).
     _emitted_coll = False
-    for cname, cl in sorted(plan["classes"].items()):
-        idn = _c_ident(cname)
-        cap = max(1, int(cl.get("n") or 0))
-        for f in cl.get("class_consts") or []:
-            if _list_elem_name(f.get("ty") or ""):
-                elem = _list_elem_name(f["ty"])
-                p("static std::vector<%s> %s_%s;" % (
-                    _list_elem_c_ty(elem, plan), idn, f["name"]))
-                _emitted_coll = True
-            elif _static_ref_array(f, plan):
-                # Static T[] of a packed class / authored interface: the
-                # array the Extensions Add/Remove kept copying.
-                _elem, _iface = _static_ref_array(f, plan)
-                p("static std::vector<%s> %s_%s;" % (
-                    _IREF_TYPE if _iface else "int", idn, f["name"]))
-                _emitted_coll = True
-            elif _dict_kv_names(f.get("ty") or ""):
-                k, v = _dict_kv_names(f["ty"])
-                p("static std::map<%s, %s> %s_%s;" % (
-                    _collection_elem_c_ty(k, plan),
-                    _collection_elem_c_ty(v, plan),
-                    idn, f["name"]))
-                _emitted_coll = True
-        for f in cl.get("list_fields") or []:
-            elem = _list_elem_name(f.get("ty") or "")
-            if not elem:
-                continue
-            p("static std::vector<%s> %s_%s[%d];" % (
-                _list_elem_c_ty(elem, plan), idn, f["name"], cap))
-            _emitted_coll = True
-        for f in cl.get("ref_array_fields") or []:
-            p("static std::vector<int> %s_%s;" % (idn, f["name"]))
-            _emitted_coll = True
-        for f in cl.get("dict_fields") or []:
-            kv = _dict_kv_names(f.get("ty") or "")
-            if not kv:
-                continue
-            k, v = kv
-            p("static std::map<%s, %s> %s_%s[%d];" % (
-                _collection_elem_c_ty(k, plan),
-                _collection_elem_c_ty(v, plan),
-                idn, f["name"], cap))
-            _emitted_coll = True
+    _emitted_coll = _emit_engine_static_collections(_emitted_coll, p, plan)
     if _emitted_coll:
         p("")
 
@@ -15662,686 +13225,21 @@ def emit_engine(plan, analyses, used_apis):
             if c.get("properties"):
                 class_properties.setdefault(c["name"], set()).update(
                     c["properties"])
-    for cname, cl in sorted(plan["classes"].items()):
-        idn = _c_ident(cname)
-        p("/* ---- %s group: instance array is defined in data.c ---- */" % idn)
-        p("#define %s_AT(i) (_%s_inst_array[(i)])" % (idn, idn))
-        p("")
-        # Class-level const / static fields (FRAME_CNT, LOG_FILE_PATH, …).
-        data_path = plan.get("data_path") or ""
-        persistent_path = plan.get("persistent_data_path") or ""
-        for f in cl.get("class_consts") or []:
-            fname = f["name"]
-            default = f.get("default")
-            if f.get("ty") == "string":
-                if isinstance(default, dict) and default.get("kind") == "dataPath+":
-                    path = data_path + (default.get("suffix") or "")
-                elif isinstance(default, dict) and default.get("kind") == "dataPath":
-                    path = data_path
-                elif (isinstance(default, dict)
-                      and default.get("kind") == "persistentDataPath+"):
-                    path = persistent_path + (default.get("suffix") or "")
-                elif (isinstance(default, dict)
-                      and default.get("kind") == "persistentDataPath"):
-                    path = persistent_path
-                elif isinstance(default, str):
-                    path = default
-                else:
-                    path = ""
-                p("static const char %s_%s[] = %s;" % (
-                    idn, fname, _c_string(path)))
-            elif f.get("ty") == "bool":
-                # `static bool flag;` / `= false` — mutable unless C# const.
-                truthy = default in (True, 1, "true", "True")
-                init = 1 if truthy else 0
-                if f.get("const"):
-                    p("static const int %s_%s = %d;" % (idn, fname, init))
-                else:
-                    p("static int %s_%s = %d;" % (idn, fname, init))
-            elif (isinstance(default, (int, float))
-                  or (default is None
-                      and f.get("ty") in _STATIC_NUMERIC_TYPES)):
-                # C# `const` stays const; a plain `static` is mutable, and an
-                # uninitialized one starts at 0 as in C#.
-                qual = "static const" if f.get("const") else "static"
-                val = default if default is not None else 0
-                if f.get("ty") in ("float", "double"):
-                    p("%s float %s_%s = %sf;" % (
-                        qual, idn, fname, repr(float(val))))
-                else:
-                    p("%s int %s_%s = %d;" % (
-                        qual, idn, fname, int(val)))
-            elif f.get("ty") in ("StreamWriter", "StreamReader"):
-                p("static FILE *%s_%s;" % (idn, fname))
-            # List / Dictionary / SortedList / ref arrays: preamble above.
-        if any(
-                f.get("ty") == "string"
-                or f.get("ty") == "bool"
-                or isinstance(f.get("default"), (int, float))
-                or (f.get("default") is None
-                    and f.get("ty") in _STATIC_NUMERIC_TYPES)
-                or f.get("ty") in ("StreamWriter", "StreamReader")
-                for f in (cl.get("class_consts") or [])):
-            p("")
-        # Position accessors: SoA table or AoS fields.
-        if cl.get("soa_dims"):
-            logical = _soa_axis_count(cl)
-            axes = ("pos_x", "pos_y", "pos_z")[:logical]
-            for axis_i, axis in enumerate(axes):
-                p("static float %s_get_%s(unsigned i) { return _%s_pos[i][%d]; }"
-                  % (idn, axis, idn, axis_i))
-                p("static void %s_set_%s(unsigned i, float v) { _%s_pos[i][%d] = v; }"
-                  % (idn, axis, idn, axis_i))
-        # Accessors so generated script C never writes a pointer.
-        for name, ty, bits, kind in cl["members"]:
-            if kind == "f16":
-                p("static float %s_get_%s(unsigned i) { return f16_to_f32(%s_AT(i).%s); }"
-                  % (idn, name, idn, name))
-                p("static void %s_set_%s(unsigned i, float v) { %s_AT(i).%s = f32_to_f16(v); }"
-                  % (idn, name, idn, name))
-            elif kind == "f32":
-                p("static float %s_get_%s(unsigned i) { return %s_AT(i).%s; }"
-                  % (idn, name, idn, name))
-                p("static void %s_set_%s(unsigned i, float v) { %s_AT(i).%s = v; }"
-                  % (idn, name, idn, name))
-            elif kind == "go" or str(kind).startswith("idx:"):
-                # A handle: a GameObject index, or an index into another
-                # class's array, or null. Null is the field's all-ones value
-                # -- an index can be 0, and a narrow unsigned field cannot
-                # hold -1 -- read back as -1, so `x != null` (`!= -1`)
-                # compares signed with signed.
-                sent = _idx_null(bits)
-                p("static int %s_get_%s(unsigned i) { unsigned v = %s_AT(i).%s;"
-                  " return v == %su ? -1 : (int)v; }"
-                  % (idn, name, idn, name, sent))
-                p("static void %s_set_%s(unsigned i, int v) {"
-                  " %s_AT(i).%s = v < 0 ? %su : (unsigned)v; }"
-                  % (idn, name, idn, name, sent))
-            else:
-                p("static unsigned %s_get_%s(unsigned i) { return (unsigned)%s_AT(i).%s; }"
-                  % (idn, name, idn, name))
-                p("static void %s_set_%s(unsigned i, unsigned v) { %s_AT(i).%s = v; }"
-                  % (idn, name, idn, name))
-        p("")
-        emit_names = _reachable_emit_methods(
-            [m for _c, m in methods_by.get(cname, [])])
-        overloaded = _overload_method_names(
-            [m for _c, m in methods_by.get(cname, [])
-             if m["name"] in emit_names and m["name"] != "OnEnable"])
-        used_syms = set()
-        # Forward-declare helpers so Start can call Do before Do's body.
-        for c, m in methods_by.get(cname, []):
-            if m["name"] == "OnEnable" or m["name"] not in emit_names:
-                continue
-            if cl.get("ctor_forbidden"):
-                continue
-            if m["name"] in _UNITY_EMIT_MESSAGES:
-                continue
-            if m.get("static"):
-                continue
-            sym = _method_c_symbol(
-                idn, m["name"], m.get("args") or "",
-                m["name"] in overloaded)
-            coll_param = None
-            if m["name"] in _COLLISION2D_MSGS:
-                coll_param = _collision2d_arg_name(m.get("args") or "")
-                if not coll_param:
-                    continue
-                p("static void %s(unsigned i, int %s);"
-                  % (sym, coll_param))
-            else:
-                plist = _method_c_params(m.get("args") or "")
-                if plist:
-                    p("static void %s(unsigned i, %s);" % (sym, plist))
-                else:
-                    p("static void %s(unsigned i);" % sym)
-        for c, m in methods_by.get(cname, []):
-            if m["name"] == "OnEnable":
-                continue
-            if m["name"] not in emit_names:
-                continue
-            # TypeInitializer failed — do not lower or run script methods.
-            if cl.get("ctor_forbidden"):
-                continue
-            coll_param = None
-            if m["name"] in _COLLISION2D_MSGS:
-                coll_param = _collision2d_arg_name(m.get("args") or "")
-                if not coll_param:
-                    continue
-            site = {
-                "class": cname,
-                "method": m["name"],
-                "path": _assets_rel_path(c.get("path") or cl.get("path") or ""),
-                "body_abs": int(m.get("body_abs") or 0),
-                "file_text": c.get("file_text") or "",
-            }
-            body = _lower_method_body(
-                m["body"], cl, plan, site=site,
-                collision2d_param=coll_param)
-            # Site marker so crust/shivyc failures map back to C#.
-            cs_line = 1
-            ft = site.get("file_text") or ""
-            if ft and site.get("body_abs"):
-                cs_line = ft.count("\n", 0, int(site["body_abs"])) + 1
-            p("/* unity_pack:site %s:%d */" % (
-                site.get("path") or "<cs>", cs_line))
-            sym = _method_c_symbol(
-                idn, m["name"], m.get("args") or "",
-                m["name"] in overloaded)
-            # Same name+args twice (nested leak / duplicate analysis) → unique.
-            if sym in used_syms:
-                n = 2
-                while ("%s_%d" % (sym, n)) in used_syms:
-                    n += 1
-                sym = "%s_%d" % (sym, n)
-            used_syms.add(sym)
-            if not m.get("static") and not (m.get("args") or "").strip():
-                emitted_syms.setdefault((cname, m["name"]), sym)
-            if coll_param:
-                p("static void %s(unsigned i, int %s) {"
-                  % (sym, coll_param))
-            elif m.get("static"):
-                plist = _method_c_params(m.get("args") or "")
-                p("static void %s(%s) {" % (
-                    sym, plist if plist else "void"))
-                # Static bodies may still touch instance fields via bare names.
-                p("    unsigned i = 0;")
-            else:
-                plist = _method_c_params(m.get("args") or "")
-                if plist:
-                    p("static void %s(unsigned i, %s) {" % (sym, plist))
-                else:
-                    p("static void %s(unsigned i) {" % sym)
-            # Methods that still contain unlowered C# become stubs (Unity
-            # messages included — empty body beats crust parse failures).
-            emitted = set()
-            if coll_param:
-                emitted.add(coll_param)
-            # Instance + static param names are known locals for residual checks.
-            for prm in cs2cpp.parse_params(m.get("args") or ""):
-                emitted.add(prm.name)
-            why = _unlowered_csharp(
-                body, args_str=m.get("args") or "", emitted_params=emitted,
-                known_types=_engine_types_declared(lines),
-                properties=class_properties.get(cname) or ())
-            # MB methods always emit as `static void`. A non-void C# return
-            # (CompareTo → int, bool helpers, …) that otherwise lowers cleanly
-            # still leaves `return 1;` and crust refuses CS0000.
-            if why is None:
-                ret_cs = (m.get("ret") or "void").strip()
-                ret_base = ret_cs.split(".")[-1]
-                if ret_base and ret_base != "void":
-                    why = (
-                        "non-void return type (methods emit as static void)",
-                        ret_cs,
-                    )
-                elif re.search(r"(?m)^\s*return\s+[^;\s]", body):
-                    why = (
-                        "valued return in void method emit",
-                        "return …;",
-                    )
-                else:
-                    hit = _writes_unstored_field(m.get("body") or "", cl, plan)
-                    if hit:
-                        why = (
-                            "field the pack keeps no storage for (a "
-                            "Transform / component reference, or one "
-                            "declared on a base class)",
-                            hit,
-                        )
-            if why is not None:
-                _report_stub(plan, site, cl, m, why)
-                if not m.get("static"):
-                    p("    (void)i;")
-                if coll_param:
-                    p("    (void)%s;" % coll_param)
-                for pname in sorted(emitted):
-                    if pname != coll_param:
-                        p("    (void)%s;" % pname)
-                # Keep lowered SetActive even when the rest of Awake stubs —
-                # SettingsMenu.Awake → gameObject.SetActive(false).
-                # Only a line that is itself fully lowered: the call can sit
-                # inside something that is not -- a lambda passed to a
-                # static helper -- and copying that line brought the C#
-                # into the stub, which crust then refused.
-                kt = _engine_types_declared(lines)
-                for line in body.split("\n"):
-                    s = line.strip()
-                    if "GameObject_SetActive(" in s and \
-                            _unlowered_csharp(s, known_types=kt) is None:
-                        p("    " + s.rstrip(";").rstrip() + ";")
-                p("    /* unlowered C# (GetComponentsInChildren / T[] / "
-                  "leftover Instantiate / lambda / Type.Method) — stub */")
-            else:
-                for line in body.split("\n"):
-                    if line.strip():
-                        p("    " + line.rstrip())
-            p("}")
-            p("")
-
-        # Tick: Start once (Unity), then FixedUpdate / Update.
-        # Script exceptions longjmp here — Unity continues the player loop.
-        def _call_script(method, indent="            "):
-            if want_go_tables:
-                p(indent + "_engine_in_script = 1;")
-                p(indent + "if (setjmp(_engine_script_jmp) == 0)")
-                p(indent + "    %s_%s((unsigned)n);" % (idn, method))
-                p(indent + "_engine_in_script = 0;")
-            else:
-                p(indent + "%s_%s((unsigned)n);" % (idn, method))
-
-        has_awake = any(m["name"] == "Awake"
-                        for _c, m in methods_by.get(cname, []))
-        has_start = any(m["name"] == "Start"
-                        for _c, m in methods_by.get(cname, []))
-        has_fixed = any(m["name"] == "FixedUpdate"
-                        for _c, m in methods_by.get(cname, []))
-        has_update = any(m["name"] == "Update"
-                         for _c, m in methods_by.get(cname, []))
-        ctor_forbidden = list(cl.get("ctor_forbidden") or [])
-        if ctor_forbidden:
-            # Unity TypeInitializationException — spam each frame, no script.
-            fb = ctor_forbidden[0]
-            api = fb.get("api") or "persistentDataPath"
-            line = int(fb.get("line") or 0)
-            spath = _assets_rel_path(
-                cl.get("script_path") or cl.get("path") or "")
-            p("void %s_FixedTick(void) { /* type init failed */ }" % idn)
-            p("")
-            p("void %s_Tick(void) {" % idn)
-            p("    int n;")
-            p("    for (n = 0; n < _%s_inst_count; n = n + 1) {" % idn)
-            p("        const char *_gon = \"\";")
-            if want_go_tables:
-                p("        {")
-                p("            int _dgo = _engine_go_of_%s((unsigned)n);" % idn)
-                p("            if (_dgo >= 0 && _dgo < _engine_go_count)")
-                p("                _gon = _engine_go_name[_dgo];")
-                p("        }")
-            else:
-                # Fall back to authored instance name.
-                for i, o in enumerate(cl.get("instances") or []):
-                    if i == 0:
-                        p("        if (n == 0) _gon = %s;"
-                          % _c_string(o.get("name") or cname))
-                    else:
-                        p("        else if (n == %d) _gon = %s;"
-                          % (i, _c_string(o.get("name") or cname)))
-            p("        _engine_unity_ctor_forbidden(")
-            p("            %s, %s, _gon, %s, %d);"
-              % (_c_string(api), _c_string(cname), _c_string(spath), line))
-            p("    }")
-            p("}")
-            p("")
-            continue
-
-        if has_awake or has_start:
-            p("static int _%s_started = 0;" % idn)
-        p("void %s_FixedTick(void) {" % idn)
-        if has_fixed:
-            p("    int n;")
-            p("    for (n = 0; n < _%s_inst_count; n = n + 1) {" % idn)
-            _call_script("FixedUpdate", "        ")
-            p("    }")
-        else:
-            p("    /* no FixedUpdate */")
-        p("}")
-        p("")
-        p("void %s_Tick(void) {" % idn)
-        if has_awake or has_start or has_update:
-            p("    int n;")
-        if has_awake or has_start:
-            p("    if (!_%s_started) {" % idn)
-            p("        _%s_started = 1;" % idn)
-            if has_awake:
-                p("        for (n = 0; n < _%s_inst_count; n = n + 1) {"
-                  % idn)
-                _call_script("Awake", "            ")
-                p("        }")
-            if has_start:
-                p("        for (n = 0; n < _%s_inst_count; n = n + 1) {"
-                  % idn)
-                _call_script("Start", "            ")
-                p("        }")
-            p("    }")
-        if has_update:
-            p("    for (n = 0; n < _%s_inst_count; n = n + 1) {" % idn)
-            if want_destroy and plan.get("go_names"):
-                p("        {")
-                p("            int _dgo = _engine_go_of_%s((unsigned)n);" % idn)
-                p("            if (_dgo >= 0 && _engine_go_destroyed[_dgo])")
-                p("                continue;")
-                p("        }")
-            _call_script("Update", "        ")
-            p("    }")
-        elif not has_awake and not has_start:
-            p("    /* no Update */")
-        p("}")
-        p("")
+    _emit_engine_class_groups(
+            class_properties, emitted_syms, lines, methods_by, p, plan, want_destroy,
+            want_go_tables)
 
     # Live Transform hierarchy (m_Father): world = parent_world + local.
     # SetParent also needs these tables (mutable) even with no authored parents.
     want_set_parent = "transform.SetParent" in used_apis
-    if plan.get("has_transform_parents") or want_set_parent:
-        for cname, cl in sorted(plan["classes"].items()):
-            idn = _c_ident(cname)
-            if not _class_has_position(cl):
-                continue
-            n = max(1, cl["n"] + _mb_pool_extra(plan, cname))
-            pcs = []
-            pis = []
-            for o in cl["instances"]:
-                pcs.append(str(int(o.get("xf_parent_class_id", -1))))
-                pis.append(str(int(o.get("xf_parent_inst") or 0)))
-            for _pad in range(_mb_pool_extra(plan, cname)):
-                pcs.append("-1")
-                pis.append("0")
-            while len(pcs) < n:
-                pcs.append("-1")
-                pis.append("0")
-            if want_set_parent:
-                p("static int _%s_xf_parent_class[%d] = { %s };"
-                  % (idn, n, ", ".join(pcs)))
-                p("static unsigned _%s_xf_parent_inst[%d] = { %s };"
-                  % (idn, n, ", ".join(pis)))
-            else:
-                p("static const int _%s_xf_parent_class[%d] = { %s };"
-                  % (idn, n, ", ".join(pcs)))
-                p("static const unsigned _%s_xf_parent_inst[%d] = { %s };"
-                  % (idn, n, ", ".join(pis)))
-        p("")
-        p("/* Live m_Father — world position follows parent at runtime. */")
-        p("static void _engine_world_pos(int class_id, unsigned inst,")
-        p("                             float *x, float *y, float *z,")
-        p("                             int depth) {")
-        p("    float lx = 0.f, ly = 0.f, lz = 0.f;")
-        p("    int pc = -1;")
-        p("    unsigned pi = 0u;")
-        p("    if (depth > 64) { *x = 0.f; *y = 0.f; *z = 0.f; return; }")
-        p("    switch (class_id) {")
-        for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
-            idn = _c_ident(cname)
-            cl = plan["classes"][cname]
-            if not _class_has_position(cl):
-                continue
-            p("    case %d:" % cid)
-            p("        lx = %s_get_pos_x(inst);" % idn)
-            p("        ly = %s_get_pos_y(inst);" % idn)
-            if cl.get("two_d"):
-                p("        lz = 0.f;")
-            else:
-                p("        lz = %s_get_pos_z(inst);" % idn)
-            p("        pc = _%s_xf_parent_class[inst];" % idn)
-            p("        pi = _%s_xf_parent_inst[inst];" % idn)
-            p("        break;")
-        p("    default:")
-        p("        *x = 0.f; *y = 0.f; *z = 0.f;")
-        p("        return;")
-        p("    }")
-        p("    if (pc < 0) { *x = lx; *y = ly; *z = lz; return; }")
-        p("    {")
-        p("        float px, py, pz;")
-        p("        _engine_world_pos(pc, pi, &px, &py, &pz, depth + 1);")
-        p("        *x = px + lx;")
-        p("        *y = py + ly;")
-        p("        *z = pz + lz;")
-        p("    }")
-        p("}")
-        p("")
-
-        if want_set_parent and want_go_tables:
-            go_n = max(1, len(plan.get("go_names") or []))
-            pos_classes = [
-                (cname, class_ids[cname], _c_ident(cname))
-                for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1])
-                if _class_has_position(plan["classes"][cname])
-            ]
-            p("/* GO → packed (class, inst) for SetParent / world composition. */")
-            p("static int _engine_go_xf(int go, int *oc, unsigned *oi) {")
-            p("    int inst;")
-            p("    if (go < 0 || go >= %d) return 0;" % go_n)
-            for cname, cid, idn in pos_classes:
-                p("    inst = _engine_go_%s[go];" % idn)
-                p("    if (inst >= 0) { *oc = %d; *oi = (unsigned)inst; return 1; }"
-                  % cid)
-            p("    return 0;")
-            p("}")
-            p("static void _engine_set_xf_parent(int child_go, int parent_go) {")
-            p("    int pc = -1;")
-            p("    unsigned pi = 0u;")
-            p("    int inst;")
-            p("    if (parent_go >= 0)")
-            p("        _engine_go_xf(parent_go, &pc, &pi);")
-            for cname, cid, idn in pos_classes:
-                p("    inst = _engine_go_%s[child_go];" % idn)
-                p("    if (inst >= 0) {")
-                p("        _%s_xf_parent_class[inst] = pc;" % idn)
-                p("        _%s_xf_parent_inst[inst] = pi;" % idn)
-                p("    }")
-            p("}")
-            p("static void _engine_set_local_pos_go(int go,")
-            p("    float lx, float ly, float lz) {")
-            p("    int inst;")
-            for cname, cid, idn in pos_classes:
-                cl = plan["classes"][cname]
-                if cl.get("static"):
-                    continue  # f16 pack — no setters
-                p("    inst = _engine_go_%s[go];" % idn)
-                p("    if (inst >= 0) {")
-                p("        %s_set_pos_x((unsigned)inst, lx);" % idn)
-                p("        %s_set_pos_y((unsigned)inst, ly);" % idn)
-                if not cl.get("two_d"):
-                    p("        %s_set_pos_z((unsigned)inst, lz);" % idn)
-                p("    }")
-            p("}")
-            p("/* Transform.SetParent(parent, worldPositionStays=true). */")
-            p("static void Transform_SetParent(int child, int parent,")
-            p("                               int world_stays) {")
-            p("    int guard = 0;")
-            p("    int g;")
-            p("    int cc = -1;")
-            p("    unsigned ci = 0u;")
-            p("    float wx = 0.f, wy = 0.f, wz = 0.f;")
-            p("    float px = 0.f, py = 0.f, pz = 0.f;")
-            if want_get_sibling:
-                p("    int old_parent, old_sib, i, max_sib;")
-            p("    if (child < 0 || child >= %d) return;" % go_n)
-            p("    if (parent == child) return;")
-            p("    if (parent >= %d) parent = -1;" % go_n)
-            p("    g = parent;")
-            p("    while (g >= 0 && guard < %d) {" % (go_n + 2))
-            p("        if (g == child) return;")
-            p("        g = _engine_go_parent[g];")
-            p("        guard = guard + 1;")
-            p("    }")
-            p("    if (world_stays && _engine_go_xf(child, &cc, &ci))")
-            p("        _engine_world_pos(cc, ci, &wx, &wy, &wz, 0);")
-            if want_get_sibling:
-                # Detach: close gap among old siblings; attach as last child.
-                p("    old_parent = _engine_go_parent[child];")
-                p("    old_sib = _engine_go_sib[child];")
-                p("    for (i = 0; i < %d; i = i + 1) {" % go_n)
-                p("        if (i == child) continue;")
-                p("        if (_engine_go_parent[i] == old_parent")
-                p("            && _engine_go_sib[i] > old_sib)")
-                p("            _engine_go_sib[i] = _engine_go_sib[i] - 1;")
-                p("    }")
-            p("    _engine_go_parent[child] = parent;")
-            if want_get_sibling:
-                p("    max_sib = -1;")
-                p("    for (i = 0; i < %d; i = i + 1) {" % go_n)
-                p("        if (i == child) continue;")
-                p("        if (_engine_go_parent[i] == parent")
-                p("            && _engine_go_sib[i] > max_sib)")
-                p("            max_sib = _engine_go_sib[i];")
-                p("    }")
-                p("    _engine_go_sib[child] = max_sib + 1;")
-            p("    _engine_set_xf_parent(child, parent);")
-            p("    if (world_stays && _engine_go_xf(child, &cc, &ci)) {")
-            p("        if (parent >= 0) {")
-            p("            int pc = -1;")
-            p("            unsigned pi = 0u;")
-            p("            if (_engine_go_xf(parent, &pc, &pi))")
-            p("                _engine_world_pos(pc, pi, &px, &py, &pz, 0);")
-            p("        }")
-            p("        _engine_set_local_pos_go(child,")
-            p("            wx - px, wy - py, wz - pz);")
-            p("    }")
-            p("}")
-            p("")
+    _emit_engine_world_positions(
+            class_ids, p, plan, want_get_sibling, want_go_tables, want_set_parent)
 
     tp_classes = set(plan.get("transform_point_classes") or [])
-    if tp_classes:
-        # Unity Transform.TransformPoint: world = T + R * (S * local).
-        # T is live world position; R/S are this transform's live local basis.
-        # Parent chain translation matches _engine_world_pos (pack TRS subset).
-        p("/* Transform.TransformPoint — live local→world (current TRS). */")
-        p("static void _engine_transform_point(")
-        p("    float wx, float wy, float wz,")
-        p("    float m00, float m01, float m10, float m11,")
-        p("    float sx, float sy,")
-        p("    float lx, float ly, float lz,")
-        p("    float *ox, float *oy, float *oz) {")
-        p("    float px = lx * sx;")
-        p("    float py = ly * sy;")
-        p("    *ox = wx + m00 * px + m01 * py;")
-        p("    *oy = wy + m10 * px + m11 * py;")
-        p("    *oz = wz + lz;")
-        p("}")
-        p("")
-        has_parents = bool(plan.get("has_transform_parents"))
-        for cname in sorted(tp_classes):
-            if cname not in plan["classes"]:
-                continue
-            cl = plan["classes"][cname]
-            idn = _c_ident(cname)
-            cid = class_ids[cname]
-            p("static void %s_TransformPoint(unsigned i," % idn)
-            p("    float lx, float ly, float lz,")
-            p("    float *ox, float *oy, float *oz) {")
-            p("    float wx, wy, wz;")
-            if has_parents and _class_has_position(cl):
-                p("    _engine_world_pos(%d, i, &wx, &wy, &wz, 0);" % cid)
-            elif _class_has_position(cl):
-                p("    wx = %s_get_pos_x(i);" % idn)
-                p("    wy = %s_get_pos_y(i);" % idn)
-                if cl.get("two_d"):
-                    p("    wz = 0.f;")
-                else:
-                    p("    wz = %s_get_pos_z(i);" % idn)
-            else:
-                p("    wx = 0.f; wy = 0.f; wz = 0.f;")
-            p("    _engine_transform_point(")
-            p("        wx, wy, wz,")
-            p("        _%s_rot_m00[i], _%s_rot_m01[i]," % (idn, idn))
-            p("        _%s_rot_m10[i], _%s_rot_m11[i]," % (idn, idn))
-            p("        _%s_scale_x[i], _%s_scale_y[i]," % (idn, idn))
-            p("        lx, ly, lz, ox, oy, oz);")
-            p("}")
-            p("static float %s_TransformPoint_x(unsigned i," % idn)
-            p("    float lx, float ly, float lz) {")
-            p("    float ox, oy, oz;")
-            p("    %s_TransformPoint(i, lx, ly, lz, &ox, &oy, &oz);" % idn)
-            p("    return ox;")
-            p("}")
-            p("static float %s_TransformPoint_y(unsigned i," % idn)
-            p("    float lx, float ly, float lz) {")
-            p("    float ox, oy, oz;")
-            p("    %s_TransformPoint(i, lx, ly, lz, &ox, &oy, &oz);" % idn)
-            p("    return oy;")
-            p("}")
-            p("static float %s_TransformPoint_z(unsigned i," % idn)
-            p("    float lx, float ly, float lz) {")
-            p("    float ox, oy, oz;")
-            p("    %s_TransformPoint(i, lx, ly, lz, &ox, &oy, &oz);" % idn)
-            p("    return oz;")
-            p("}")
-            p("")
+    _emit_engine_transform_point(class_ids, p, plan, tp_classes)
 
     matrix_classes = set(plan.get("transform_matrix_classes") or [])
-    if matrix_classes:
-        # Same affine subset as TransformPoint: T + R_xy * (S * p).
-        p("/* Live localToWorld / worldToLocal from current pos / rot / scale. */")
-        p("static Matrix4x4 _engine_matrix_identity(void) {")
-        p("    Matrix4x4 m;")
-        p("    m.m00 = 1.f; m.m01 = 0.f; m.m02 = 0.f; m.m03 = 0.f;")
-        p("    m.m10 = 0.f; m.m11 = 1.f; m.m12 = 0.f; m.m13 = 0.f;")
-        p("    m.m20 = 0.f; m.m21 = 0.f; m.m22 = 1.f; m.m23 = 0.f;")
-        p("    m.m30 = 0.f; m.m31 = 0.f; m.m32 = 0.f; m.m33 = 1.f;")
-        p("    return m;")
-        p("}")
-        p("static Matrix4x4 _engine_local_to_world_matrix(")
-        p("    float wx, float wy, float wz,")
-        p("    float r00, float r01, float r10, float r11,")
-        p("    float sx, float sy) {")
-        p("    Matrix4x4 m = _engine_matrix_identity();")
-        p("    m.m00 = r00 * sx; m.m01 = r01 * sy; m.m03 = wx;")
-        p("    m.m10 = r10 * sx; m.m11 = r11 * sy; m.m13 = wy;")
-        p("    m.m23 = wz;")
-        p("    return m;")
-        p("}")
-        p("static Matrix4x4 _engine_world_to_local_matrix(")
-        p("    float wx, float wy, float wz,")
-        p("    float r00, float r01, float r10, float r11,")
-        p("    float sx, float sy) {")
-        p("    Matrix4x4 m = _engine_matrix_identity();")
-        p("    float a00 = r00 * sx; float a01 = r01 * sy;")
-        p("    float a10 = r10 * sx; float a11 = r11 * sy;")
-        p("    float det = a00 * a11 - a01 * a10;")
-        p("    float inv00, inv01, inv10, inv11;")
-        p("    if (det > -1e-12f && det < 1e-12f) {")
-        p("        return m;")
-        p("    }")
-        p("    inv00 = a11 / det; inv01 = -a01 / det;")
-        p("    inv10 = -a10 / det; inv11 = a00 / det;")
-        p("    m.m00 = inv00; m.m01 = inv01;")
-        p("    m.m10 = inv10; m.m11 = inv11;")
-        p("    m.m03 = -(inv00 * wx + inv01 * wy);")
-        p("    m.m13 = -(inv10 * wx + inv11 * wy);")
-        p("    m.m23 = -wz;")
-        p("    return m;")
-        p("}")
-        p("")
-        has_parents = bool(plan.get("has_transform_parents"))
-        for cname in sorted(matrix_classes):
-            if cname not in plan["classes"]:
-                continue
-            cl = plan["classes"][cname]
-            idn = _c_ident(cname)
-            cid = class_ids[cname]
-
-            def _emit_world_xyz():
-                if has_parents and _class_has_position(cl):
-                    p("    _engine_world_pos(%d, i, &wx, &wy, &wz, 0);" % cid)
-                elif _class_has_position(cl):
-                    p("    wx = %s_get_pos_x(i);" % idn)
-                    p("    wy = %s_get_pos_y(i);" % idn)
-                    if cl.get("two_d"):
-                        p("    wz = 0.f;")
-                    else:
-                        p("    wz = %s_get_pos_z(i);" % idn)
-                else:
-                    p("    wx = 0.f; wy = 0.f; wz = 0.f;")
-
-            p("static Matrix4x4 %s_localToWorldMatrix(unsigned i) {" % idn)
-            p("    float wx, wy, wz;")
-            _emit_world_xyz()
-            p("    return _engine_local_to_world_matrix(")
-            p("        wx, wy, wz,")
-            p("        _%s_rot_m00[i], _%s_rot_m01[i]," % (idn, idn))
-            p("        _%s_rot_m10[i], _%s_rot_m11[i]," % (idn, idn))
-            p("        _%s_scale_x[i], _%s_scale_y[i]);" % (idn, idn))
-            p("}")
-            p("static Matrix4x4 %s_worldToLocalMatrix(unsigned i) {" % idn)
-            p("    float wx, wy, wz;")
-            _emit_world_xyz()
-            p("    return _engine_world_to_local_matrix(")
-            p("        wx, wy, wz,")
-            p("        _%s_rot_m00[i], _%s_rot_m01[i]," % (idn, idn))
-            p("        _%s_rot_m10[i], _%s_rot_m11[i]," % (idn, idn))
-            p("        _%s_scale_x[i], _%s_scale_y[i]);" % (idn, idn))
-            p("}")
-            p("")
+    _emit_engine_transform_matrices(class_ids, matrix_classes, p, plan)
 
     if plan.get("camera_follows_parent"):
         cam = plan["camera"]
@@ -16379,551 +13277,25 @@ def emit_engine(plan, analyses, used_apis):
         p("}")
         p("")
 
-    if want_col2d and col2d_list:
-        p("/* Authored BoxCollider2D / CircleCollider2D — centers for Box2D-Packed */")
-        p("static void _col2d_center(int ci, float *out_x, float *out_y) {")
-        p("    unsigned oi = (unsigned)_Collider2D_owner_inst[ci];")
-        p("    float px = 0.f, py = 0.f;")
-        p("    float c = _Collider2D_cos[ci], s = _Collider2D_sin[ci];")
-        p("    float ox = _Collider2D_ox[ci], oy = _Collider2D_oy[ci];")
-        p("    switch (_Collider2D_owner_class[ci]) {")
-        for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
-            idn = _c_ident(cname)
-            cl = plan["classes"][cname]
-            if not _class_has_position(cl):
-                continue
-            p("    case %d:" % cid)
-            if plan.get("has_transform_parents"):
-                p("        {")
-                p("            float wx, wy, wz;")
-                p("            _engine_world_pos(%d, oi, &wx, &wy, &wz, 0);"
-                  % cid)
-                p("            px = wx; py = wy;")
-                p("        }")
-            else:
-                p("        px = %s_get_pos_x(oi);" % idn)
-                p("        py = %s_get_pos_y(oi);" % idn)
-            p("        break;")
-        p("    default: break;")
-        p("    }")
-        p("    *out_x = px + c * ox - s * oy;")
-        p("    *out_y = py + s * ox + c * oy;")
-        p("}")
-        p("")
-        if want_collision2d_msgs:
-            nc = max(1, len(col2d_list))
-            max_pairs = max(1, nc * (nc - 1) // 2)
-            p("/* MonoBehaviour OnCollisionEnter/Stay/Exit2D after contacts */")
-            p("static int _col2d_contact_a[%d];" % max_pairs)
-            p("static int _col2d_contact_b[%d];" % max_pairs)
-            p("static int _col2d_contact_n;")
-            p("static int _col2d_prev_a[%d];" % max_pairs)
-            p("static int _col2d_prev_b[%d];" % max_pairs)
-            p("static int _col2d_prev_n;")
-            p("")
-            p("static void _col2d_add_contact(int a, int b) {")
-            p("    int lo, hi, i;")
-            p("    lo = (a < b) ? a : b;")
-            p("    hi = (a < b) ? b : a;")
-            p("    for (i = 0; i < _col2d_contact_n; i = i + 1)")
-            p("        if (_col2d_contact_a[i] == lo && _col2d_contact_b[i] == hi)")
-            p("            return;")
-            p("    if (_col2d_contact_n >= %d) return;" % max_pairs)
-            p("    _col2d_contact_a[_col2d_contact_n] = lo;")
-            p("    _col2d_contact_b[_col2d_contact_n] = hi;")
-            p("    _col2d_contact_n = _col2d_contact_n + 1;")
-            p("}")
-            p("")
-            p("static int _col2d_pair_in(int lo, int hi,")
-            p("    const int *pa, const int *pb, int n) {")
-            p("    int i;")
-            p("    for (i = 0; i < n; i = i + 1)")
-            p("        if (pa[i] == lo && pb[i] == hi) return 1;")
-            p("    return 0;")
-            p("}")
-            p("")
-            p("static void _col2d_send_msg(int ci_self, int ci_other, int kind) {")
-            p("    /* kind: 0 Enter, 1 Stay, 2 Exit */")
-            p("    int oc = _Collider2D_owner_class[ci_self];")
-            p("    unsigned oi = (unsigned)_Collider2D_owner_inst[ci_self];")
-            p("    switch (oc) {")
-            for cname in sorted(collision2d_handlers.keys()):
-                cid = class_ids.get(cname)
-                if cid is None:
-                    continue
-                idn = _c_ident(cname)
-                msgs = collision2d_handlers[cname]
-                p("    case %d:" % cid)
-                for kind_i, msg in enumerate(
-                        ("OnCollisionEnter2D",
-                         "OnCollisionStay2D",
-                         "OnCollisionExit2D")):
-                    if msg not in msgs:
-                        continue
-                    p("        if (kind == %d) {" % kind_i)
-                    if want_go_tables:
-                        p("            _engine_in_script = 1;")
-                        p("            if (setjmp(_engine_script_jmp) == 0)")
-                        p("                %s_%s(oi, ci_other);"
-                          % (idn, msg))
-                        p("            _engine_in_script = 0;")
-                    else:
-                        p("            %s_%s(oi, ci_other);" % (idn, msg))
-                    p("        }")
-                p("        break;")
-            p("    default: break;")
-            p("    }")
-            p("}")
-            p("")
-            p("static void engine_physics_collide2d_messages(void) {")
-            p("    int i, lo, hi;")
-            p("    for (i = 0; i < _col2d_contact_n; i = i + 1) {")
-            p("        lo = _col2d_contact_a[i];")
-            p("        hi = _col2d_contact_b[i];")
-            p("        if (_col2d_pair_in(lo, hi, _col2d_prev_a, _col2d_prev_b,")
-            p("                           _col2d_prev_n)) {")
-            p("            _col2d_send_msg(lo, hi, 1);")
-            p("            _col2d_send_msg(hi, lo, 1);")
-            p("        } else {")
-            p("            _col2d_send_msg(lo, hi, 0);")
-            p("            _col2d_send_msg(hi, lo, 0);")
-            p("        }")
-            p("    }")
-            p("    for (i = 0; i < _col2d_prev_n; i = i + 1) {")
-            p("        lo = _col2d_prev_a[i];")
-            p("        hi = _col2d_prev_b[i];")
-            p("        if (!_col2d_pair_in(lo, hi, _col2d_contact_a,")
-            p("                            _col2d_contact_b, _col2d_contact_n)) {")
-            p("            _col2d_send_msg(lo, hi, 2);")
-            p("            _col2d_send_msg(hi, lo, 2);")
-            p("        }")
-            p("    }")
-            p("    _col2d_prev_n = _col2d_contact_n;")
-            p("    for (i = 0; i < _col2d_contact_n; i = i + 1) {")
-            p("        _col2d_prev_a[i] = _col2d_contact_a[i];")
-            p("        _col2d_prev_b[i] = _col2d_contact_b[i];")
-            p("    }")
-            p("}")
-            p("")
-    if want_col3d and col3d_list:
-        p("/* Authored BoxCollider / SphereCollider — AABB contacts */")
-        p("static void _col3d_center(int ci, float *ox, float *oy, float *oz) {")
-        p("    unsigned oi = (unsigned)_Collider3D_owner_inst[ci];")
-        p("    float px = 0.f, py = 0.f, pz = 0.f;")
-        p("    switch (_Collider3D_owner_class[ci]) {")
-        for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
-            idn = _c_ident(cname)
-            cl = plan["classes"][cname]
-            if not _class_has_position(cl):
-                continue
-            p("    case %d:" % cid)
-            if plan.get("has_transform_parents"):
-                p("        {")
-                p("            float wx, wy, wz;")
-                p("            _engine_world_pos(%d, oi, &wx, &wy, &wz, 0);"
-                  % cid)
-                p("            px = wx; py = wy; pz = wz;")
-                p("        }")
-            else:
-                p("        px = %s_get_pos_x(oi);" % idn)
-                p("        py = %s_get_pos_y(oi);" % idn)
-                if not cl.get("two_d"):
-                    p("        pz = %s_get_pos_z(oi);" % idn)
-            p("        break;")
-        p("    default: break;")
-        p("    }")
-        p("    *ox = px + _Collider3D_ox[ci];")
-        p("    *oy = py + _Collider3D_oy[ci];")
-        p("    *oz = pz + _Collider3D_oz[ci];")
-        p("}")
-        p("")
-        p("static void _col3d_set_pos(int ci, float nx, float ny, float nz) {")
-        p("    unsigned oi = (unsigned)_Collider3D_owner_inst[ci];")
-        p("    switch (_Collider3D_owner_class[ci]) {")
-        for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
-            idn = _c_ident(cname)
-            cl = plan["classes"][cname]
-            if not _class_has_position(cl) or cl.get("static"):
-                continue
-            p("    case %d:" % cid)
-            p("        %s_set_pos_x(oi, nx);" % idn)
-            p("        %s_set_pos_y(oi, ny);" % idn)
-            if not cl.get("two_d"):
-                p("        %s_set_pos_z(oi, nz);" % idn)
-            p("        break;")
-        p("    default: break;")
-        p("    }")
-        p("}")
-        p("")
-        p("static void _col3d_get_pos(int ci, float *ox, float *oy, float *oz) {")
-        p("    unsigned oi = (unsigned)_Collider3D_owner_inst[ci];")
-        p("    *ox = 0.f; *oy = 0.f; *oz = 0.f;")
-        p("    switch (_Collider3D_owner_class[ci]) {")
-        for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
-            idn = _c_ident(cname)
-            cl = plan["classes"][cname]
-            if not _class_has_position(cl):
-                continue
-            p("    case %d:" % cid)
-            if plan.get("has_transform_parents"):
-                p("        _engine_world_pos(%d, oi, ox, oy, oz, 0);" % cid)
-            else:
-                p("        *ox = %s_get_pos_x(oi);" % idn)
-                p("        *oy = %s_get_pos_y(oi);" % idn)
-                if not cl.get("two_d"):
-                    p("        *oz = %s_get_pos_z(oi);" % idn)
-            p("        break;")
-        p("    default: break;")
-        p("    }")
-        p("}")
-        p("")
-        p("static void engine_physics_collide3d(void) {")
-        p("    int a, b;")
-        p("    for (a = 0; a < _Collider3D_count; a = a + 1) {")
-        p("        float ax, ay, az, bx, by, bz, dx, dy, dz;")
-        p("        float px, py, pz, ahw, ahh, ahd, bhw, bhh, bhd;")
-        p("        float sep, tx, ty, tz, nx, ny, nz;")
-        p("        float vx, vy, vz, vn, vtx, vty, vtz, fr_d, fr_s, fr, bn, sc, vt_len;")
-        p("        int rb;")
-        p("        if (_Collider3D_body_type[a] != 0) continue;")
-        p("        if (_Collider3D_is_trigger[a]) continue;")
-        p("        rb = _Collider3D_rb3d[a];")
-        p("        if (rb < 0) continue;")
-        p("        _col3d_center(a, &ax, &ay, &az);")
-        p("        if (_Collider3D_kind[a] == 1) {")
-        p("            ahw = _Collider3D_hw[a]; ahh = ahw; ahd = ahw;")
-        p("        } else {")
-        p("            ahw = _Collider3D_hw[a];")
-        p("            ahh = _Collider3D_hh[a];")
-        p("            ahd = _Collider3D_hd[a];")
-        p("        }")
-        p("        for (b = 0; b < _Collider3D_count; b = b + 1) {")
-        p("            if (a == b) continue;")
-        p("            if (_Collider3D_is_trigger[b]) continue;")
-        p("            _col3d_center(b, &bx, &by, &bz);")
-        p("            if (_Collider3D_kind[b] == 1) {")
-        p("                bhw = _Collider3D_hw[b]; bhh = bhw; bhd = bhw;")
-        p("            } else {")
-        p("                bhw = _Collider3D_hw[b];")
-        p("                bhh = _Collider3D_hh[b];")
-        p("                bhd = _Collider3D_hd[b];")
-        p("            }")
-        p("            dx = ax - bx; dy = ay - by; dz = az - bz;")
-        p("            px = (ahw + bhw) - (dx < 0.f ? -dx : dx);")
-        p("            py = (ahh + bhh) - (dy < 0.f ? -dy : dy);")
-        p("            pz = (ahd + bhd) - (dz < 0.f ? -dz : dz);")
-        p("            if (px <= 0.f || py <= 0.f || pz <= 0.f) continue;")
-        p("            _col3d_get_pos(a, &tx, &ty, &tz);")
-        p("            nx = 0.f; ny = 0.f; nz = 0.f;")
-        p("            if (px <= py && px <= pz) {")
-        p("                sep = (dx < 0.f) ? -px : px;")
-        p("                tx = tx + sep;")
-        p("                nx = (sep < 0.f) ? -1.f : 1.f;")
-        p("            } else if (py <= px && py <= pz) {")
-        p("                sep = (dy < 0.f) ? -py : py;")
-        p("                ty = ty + sep;")
-        p("                ny = (sep < 0.f) ? -1.f : 1.f;")
-        p("            } else {")
-        p("                sep = (dz < 0.f) ? -pz : pz;")
-        p("                tz = tz + sep;")
-        p("                nz = (sep < 0.f) ? -1.f : 1.f;")
-        p("            }")
-        p("            _col3d_set_pos(a, tx, ty, tz);")
-        p("            fr_d = _phys_mat_combine(")
-        p("                _Collider3D_dynamic_friction[a],")
-        p("                _Collider3D_dynamic_friction[b],")
-        p("                _Collider3D_friction_combine[a],")
-        p("                _Collider3D_friction_combine[b]);")
-        p("            fr_s = _phys_mat_combine(")
-        p("                _Collider3D_static_friction[a],")
-        p("                _Collider3D_static_friction[b],")
-        p("                _Collider3D_friction_combine[a],")
-        p("                _Collider3D_friction_combine[b]);")
-        p("            bn = _phys_mat_combine(")
-        p("                _Collider3D_bounciness[a], _Collider3D_bounciness[b],")
-        p("                _Collider3D_bounce_combine[a],")
-        p("                _Collider3D_bounce_combine[b]);")
-        p("            vx = _Rigidbody_vel_x[rb];")
-        p("            vy = _Rigidbody_vel_y[rb];")
-        p("            vz = _Rigidbody_vel_z[rb];")
-        p("            vn = vx * nx + vy * ny + vz * nz;")
-        p("            vtx = vx - vn * nx;")
-        p("            vty = vy - vn * ny;")
-        p("            vtz = vz - vn * nz;")
-        p("            vt_len = sqrtf(vtx * vtx + vty * vty + vtz * vtz);")
-        p("            fr = (vt_len < 0.01f) ? fr_s : fr_d;")
-        p("            if (vn < 0.f) vn = -bn * vn;")
-        p("            sc = 1.f - fr;")
-        p("            if (sc < 0.f) sc = 0.f;")
-        p("            if (sc > 1.f) sc = 1.f;")
-        p("            _Rigidbody_vel_x[rb] = vtx * sc + vn * nx;")
-        p("            _Rigidbody_vel_y[rb] = vty * sc + vn * ny;")
-        p("            _Rigidbody_vel_z[rb] = vtz * sc + vn * nz;")
-        p("            _col3d_center(a, &ax, &ay, &az);")
-        p("        }")
-        p("    }")
-        p("}")
-        p("")
+    _emit_engine_colliders_2d(
+            class_ids, col2d_list, collision2d_handlers, p, plan, want_col2d,
+            want_collision2d_msgs, want_go_tables)
+    _emit_engine_colliders_3d(class_ids, col3d_list, p, plan, want_col3d)
 
     # 2D physics is Box2D-Packed (box2d_unity.py in the Box2D-Packed repo).
     # engine.c exports scalar accessors for the generated glue in
     # physics_box2d.c and keeps sending OnCollision*2D after the step.
     box2d_backend = bool(want_rb2d or want_col2d)
     plan["box2d_physics"] = box2d_backend
-    if box2d_backend:
-        p("/* Box2D-Packed 2D physics (physics_box2d.c) */")
-        p("void engine_box2d_step(void);")
-        p("void engine_rb2d_get_pos(int rb, float *x, float *y) {")
-        p("    unsigned oi = (unsigned)_Rigidbody2D_owner_inst[rb];")
-        p("    *x = 0.f;")
-        p("    *y = 0.f;")
-        p("    switch (_Rigidbody2D_owner_class[rb]) {")
-        for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
-            idn = _c_ident(cname)
-            cl = plan["classes"][cname]
-            if not _class_has_position(cl) or cl.get("static"):
-                continue
-            p("    case %d:" % cid)
-            p("        *x = %s_get_pos_x(oi);" % idn)
-            p("        *y = %s_get_pos_y(oi);" % idn)
-            p("        break;")
-        p("    default: break;")
-        p("    }")
-        p("}")
-        p("")
-        p("void engine_rb2d_set_pos(int rb, float x, float y) {")
-        p("    unsigned oi = (unsigned)_Rigidbody2D_owner_inst[rb];")
-        p("    switch (_Rigidbody2D_owner_class[rb]) {")
-        for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
-            idn = _c_ident(cname)
-            cl = plan["classes"][cname]
-            if not _class_has_position(cl) or cl.get("static"):
-                continue
-            p("    case %d:" % cid)
-            p("        %s_set_pos_x(oi, x);" % idn)
-            p("        %s_set_pos_y(oi, y);" % idn)
-            p("        break;")
-        p("    default: break;")
-        p("    }")
-        p("}")
-        p("")
-        p("void engine_col2d_center(int ci, float *x, float *y) {")
-        if want_col2d and col2d_list:
-            p("    _col2d_center(ci, x, y);")
-        else:
-            p("    if (ci < 0) return;")
-            p("    *x = 0.f;")
-            p("    *y = 0.f;")
-        p("}")
-        p("")
-        p("void engine_col2d_contact(int a, int b) {")
-        if want_collision2d_msgs:
-            p("    _col2d_add_contact(a, b);")
-        else:
-            p("    if (a < 0 || b < 0) return;")
-        p("}")
-        p("")
+    _emit_engine_box2d_exports(
+            box2d_backend, class_ids, col2d_list, p, plan, want_col2d,
+            want_collision2d_msgs)
 
-    if want_rb2d or want_rb3d or box2d_backend:
-        p("/* Box2D-Packed (2D) and authored Rigidbody integration (3D) after FixedUpdate */")
-        p("static void engine_physics_fixed(void) {")
-        p("    int i;")
-        if box2d_backend:
-            if want_collision2d_msgs:
-                p("    _col2d_contact_n = 0;")
-            p("    engine_box2d_step();")
-            if want_collision2d_msgs:
-                p("    engine_physics_collide2d_messages();")
-        if want_rb3d and rb3d_list:
-            p("    for (i = 0; i < _Rigidbody_count; i = i + 1) {")
-            p("        unsigned oi;")
-            p("        float vx, vy, vz;")
-            p("        if (_Rigidbody_use_gravity[i]) {")
-            p("            _Rigidbody_vel_x[i] = _Rigidbody_vel_x[i]")
-            p("                + Physics_gravity_x * Time_fixedDeltaTime;")
-            p("            _Rigidbody_vel_y[i] = _Rigidbody_vel_y[i]")
-            p("                + Physics_gravity_y * Time_fixedDeltaTime;")
-            p("            _Rigidbody_vel_z[i] = _Rigidbody_vel_z[i]")
-            p("                + Physics_gravity_z * Time_fixedDeltaTime;")
-            p("        }")
-            p("        {")
-            p("            float d = 1.f - _Rigidbody_drag[i] * Time_fixedDeltaTime;")
-            p("            if (d < 0.f) d = 0.f;")
-            p("            if (d > 1.f) d = 1.f;")
-            p("            _Rigidbody_vel_x[i] = _Rigidbody_vel_x[i] * d;")
-            p("            _Rigidbody_vel_y[i] = _Rigidbody_vel_y[i] * d;")
-            p("            _Rigidbody_vel_z[i] = _Rigidbody_vel_z[i] * d;")
-            p("        }")
-            p("        vx = _Rigidbody_vel_x[i] * Time_fixedDeltaTime;")
-            p("        vy = _Rigidbody_vel_y[i] * Time_fixedDeltaTime;")
-            p("        vz = _Rigidbody_vel_z[i] * Time_fixedDeltaTime;")
-            p("        oi = (unsigned)_Rigidbody_owner_inst[i];")
-            p("        switch (_Rigidbody_owner_class[i]) {")
-            for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
-                idn = _c_ident(cname)
-                cl = plan["classes"][cname]
-                if not _class_has_position(cl) or cl.get("static"):
-                    continue
-                p("        case %d:" % cid)
-                p("            %s_set_pos_x(oi, %s_get_pos_x(oi) + vx);"
-                  % (idn, idn))
-                p("            %s_set_pos_y(oi, %s_get_pos_y(oi) + vy);"
-                  % (idn, idn))
-                if not cl.get("two_d"):
-                    p("            %s_set_pos_z(oi, %s_get_pos_z(oi) + vz);"
-                      % (idn, idn))
-                p("            break;")
-            p("        default: break;")
-            p("        }")
-            p("    }")
-        if want_col3d and col3d_list:
-            p("    engine_physics_collide3d();")
-        p("}")
-        p("")
+    _emit_engine_physics_fixed(
+            box2d_backend, class_ids, col3d_list, p, plan, rb3d_list, want_col3d,
+            want_collision2d_msgs, want_rb2d, want_rb3d)
 
-    if want_anim and anim_players:
-        p("/* Authored Animation / Animator — root pos + m_Sprite PPtr */")
-        p("static float _anim_sample(const float *times, const float *vals,")
-        p("                         int begin, int count, float t) {")
-        p("    int i;")
-        p("    float t0, t1, u;")
-        p("    if (count <= 0) return 0.f;")
-        p("    if (count == 1) return vals[begin];")
-        p("    if (t <= times[begin]) return vals[begin];")
-        p("    if (t >= times[begin + count - 1])")
-        p("        return vals[begin + count - 1];")
-        p("    for (i = 0; i < count - 1; i = i + 1) {")
-        p("        t0 = times[begin + i];")
-        p("        t1 = times[begin + i + 1];")
-        p("        if (t >= t0 && t <= t1) {")
-        p("            u = (t1 > t0) ? (t - t0) / (t1 - t0) : 0.f;")
-        p("            return vals[begin + i]")
-        p("                + (vals[begin + i + 1] - vals[begin + i]) * u;")
-        p("        }")
-        p("    }")
-        p("    return vals[begin + count - 1];")
-        p("}")
-        p("")
-        anim_skeys = anim_plan.get("sprite_keys") or []
-        anim_sbinds = anim_plan.get("sprite_binds") or []
-        if anim_skeys and anim_sbinds:
-            p("/* Discrete PPtr hold (Unity SpriteRenderer.m_Sprite keys). */")
-            p("static int _anim_sample_hold_i(const float *times,")
-            p("                              const int *vals,")
-            p("                              int begin, int count, float t) {")
-            p("    int i;")
-            p("    if (count <= 0) return 0;")
-            p("    if (count == 1) return vals[begin];")
-            p("    if (t <= times[begin]) return vals[begin];")
-            p("    for (i = 0; i < count - 1; i = i + 1) {")
-            p("        if (t >= times[begin + i]")
-            p("            && t < times[begin + i + 1])")
-            p("            return vals[begin + i];")
-            p("    }")
-            p("    return vals[begin + count - 1];")
-            p("}")
-            p("")
-            p("static float _anim_sample_hold(const float *times,")
-            p("                              const float *vals,")
-            p("                              int begin, int count, float t) {")
-            p("    int i;")
-            p("    if (count <= 0) return 0.f;")
-            p("    if (count == 1) return vals[begin];")
-            p("    if (t <= times[begin]) return vals[begin];")
-            p("    for (i = 0; i < count - 1; i = i + 1) {")
-            p("        if (t >= times[begin + i]")
-            p("            && t < times[begin + i + 1])")
-            p("            return vals[begin + i];")
-            p("    }")
-            p("    return vals[begin + count - 1];")
-            p("}")
-            p("")
-        p("static void engine_animation_tick(void) {")
-        p("    int i;")
-        p("    for (i = 0; i < _AnimPlayer_count; i = i + 1) {")
-        p("        int ci, kb, kc;")
-        p("        float t, len, nx, ny, nz;")
-        p("        unsigned oi;")
-        p("        if (!_AnimPlayer_playing[i]) continue;")
-        p("        ci = _AnimPlayer_clip[i];")
-        p("        len = _AnimClip_length[ci];")
-        p("        if (len <= 0.f) continue;")
-        p("        _AnimPlayer_time[i] = _AnimPlayer_time[i]")
-        p("            + Time_deltaTime * _AnimPlayer_speed[i];")
-        p("        t = _AnimPlayer_time[i];")
-        p("        if (_AnimPlayer_loop[i]) {")
-        p("            while (t >= len) t = t - len;")
-        p("            while (t < 0.f) t = t + len;")
-        p("            _AnimPlayer_time[i] = t;")
-        p("        } else if (t > len) {")
-        p("            t = len;")
-        p("            _AnimPlayer_time[i] = t;")
-        p("            _AnimPlayer_playing[i] = 0;")
-        p("        }")
-        p("        kb = _AnimClip_key_begin[ci];")
-        p("        kc = _AnimClip_key_count[ci];")
-        # Absolute localPosition only when the clip authors root PositionCurves.
-        p("        if (kc > 0) {")
-        p("            nx = _anim_sample(_AnimKey_t, _AnimKey_x, kb, kc, t);")
-        p("            ny = _anim_sample(_AnimKey_t, _AnimKey_y, kb, kc, t);")
-        p("            nz = _anim_sample(_AnimKey_t, _AnimKey_z, kb, kc, t);")
-        p("            oi = (unsigned)_AnimPlayer_owner_inst[i];")
-        p("            switch (_AnimPlayer_owner_class[i]) {")
-        for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
-            idn = _c_ident(cname)
-            cl = plan["classes"][cname]
-            if not _class_has_position(cl) or cl.get("static"):
-                continue
-            p("            case %d:" % cid)
-            p("                %s_set_pos_x(oi, nx);" % idn)
-            p("                %s_set_pos_y(oi, ny);" % idn)
-            if not cl.get("two_d"):
-                p("                %s_set_pos_z(oi, nz);" % idn)
-            p("                break;")
-        p("            default: break;")
-        p("            }")
-        p("        }")
-        if anim_skeys and anim_sbinds:
-            mutable = set(plan.get("sprite_draw_mutable") or [])
-            p("        {")
-            p("            int b0 = _AnimPlayer_sprite_bind_begin[i];")
-            p("            int bc = _AnimPlayer_sprite_bind_count[i];")
-            p("            int b;")
-            p("            for (b = 0; b < bc; b = b + 1) {")
-            p("                int bi = b0 + b;")
-            p("                int skb = _AnimSpriteBind_key_begin[bi];")
-            p("                int skc = _AnimSpriteBind_key_count[bi];")
-            p("                int tex; float hw, hh;")
-            p("                unsigned ti;")
-            p("                if (skc <= 0) continue;")
-            p("                tex = _anim_sample_hold_i(")
-            p("                    _AnimSpriteKey_t, _AnimSpriteKey_tex,")
-            p("                    skb, skc, t);")
-            p("                hw = _anim_sample_hold(")
-            p("                    _AnimSpriteKey_t, _AnimSpriteKey_hw,")
-            p("                    skb, skc, t);")
-            p("                hh = _anim_sample_hold(")
-            p("                    _AnimSpriteKey_t, _AnimSpriteKey_hh,")
-            p("                    skb, skc, t);")
-            p("                ti = (unsigned)_AnimSpriteBind_target_inst[bi];")
-            p("                switch (_AnimSpriteBind_target_class[bi]) {")
-            for cname in sorted(mutable):
-                if cname not in class_ids:
-                    continue
-                cid = class_ids[cname]
-                idn = _c_ident(cname)
-                p("                case %d:" % cid)
-                p("                    _%s_draw_tex[ti] = tex;" % idn)
-                p("                    _%s_draw_hw[ti] = hw;" % idn)
-                p("                    _%s_draw_hh[ti] = hh;" % idn)
-                p("                    break;")
-            p("                default: break;")
-            p("                }")
-            p("            }")
-            p("        }")
-        p("    }")
-        p("}")
-        p("")
+    _emit_engine_animation(anim_plan, anim_players, class_ids, p, plan, want_anim)
 
     iface_ticks = _iface_tick_arrays(plan, analyses)
     iface_tick_fns = []
@@ -17060,294 +13432,9 @@ def emit_engine(plan, analyses, used_apis):
     has_cam = bool(plan.get("camera"))
     mutable_spr = set(plan.get("sprite_draw_mutable") or [])
     go_names = plan.get("go_names") or []
-    for cname, cl in sorted(plan["classes"].items()):
-        idn = _c_ident(cname)
-        if not _class_has_position(cl):
-            continue
-        spr_idx = []
-        for i, o in enumerate(cl["instances"]):
-            sp = o.get("sprite")
-            if sp and sp.get("enabled", 1) and "tex_id" in sp:
-                spr_idx.append((i, sp))
-        if not spr_idx:
-            continue
-        any_sprite = True
-        use_mut = cname in mutable_spr
-        use_scale = cname in set(plan.get("live_scale_classes") or [])
-        use_rot = cname in set(plan.get("live_rot_classes") or [])
-        p("    { /* %s SpriteRenderer */" % idn)
-        p("        static const float _spr_r[] = { %s };" % ", ".join(
-            "%sf" % repr(float(sp["r"])) for _i, sp in spr_idx))
-        p("        static const float _spr_g[] = { %s };" % ", ".join(
-            "%sf" % repr(float(sp["g"])) for _i, sp in spr_idx))
-        p("        static const float _spr_b[] = { %s };" % ", ".join(
-            "%sf" % repr(float(sp["b"])) for _i, sp in spr_idx))
-        p("        static const float _spr_a[] = { %s };" % ", ".join(
-            "%sf" % repr(float(sp.get("a", 1.0))) for _i, sp in spr_idx))
-        if not use_mut:
-            p("        static const float _spr_hw[] = { %s };" % ", ".join(
-                "%sf" % repr(float(sp["half_w"])) for _i, sp in spr_idx))
-            p("        static const float _spr_hh[] = { %s };" % ", ".join(
-                "%sf" % repr(float(sp["half_h"])) for _i, sp in spr_idx))
-            p("        static const int _spr_tex[] = { %s };" % ", ".join(
-                str(int(sp["tex_id"])) for _i, sp in spr_idx))
-        if not use_rot:
-            p("        static const float _spr_m00[] = { %s };" % ", ".join(
-                "%sf" % repr(float(sp.get("m00", sp.get("cos_z", 1.0))))
-                for _i, sp in spr_idx))
-            p("        static const float _spr_m01[] = { %s };" % ", ".join(
-                "%sf" % repr(float(sp.get("m01", -float(sp.get("sin_z", 0.0)))))
-                for _i, sp in spr_idx))
-            p("        static const float _spr_m10[] = { %s };" % ", ".join(
-                "%sf" % repr(float(sp.get("m10", sp.get("sin_z", 0.0))))
-                for _i, sp in spr_idx))
-            p("        static const float _spr_m11[] = { %s };" % ", ".join(
-                "%sf" % repr(float(sp.get("m11", sp.get("cos_z", 1.0))))
-                for _i, sp in spr_idx))
-        p("        static const int _spr_layer[] = { %s };" % ", ".join(
-            str(int(sp.get("sorting_layer") or 0)) for _i, sp in spr_idx))
-        p("        static const int _spr_order[] = { %s };" % ", ".join(
-            str(int(sp.get("sorting_order") or 0)) for _i, sp in spr_idx))
-        p("        static const unsigned _spr_i[] = { %s };" % ", ".join(
-            str(i) for i, _sp in spr_idx))
-        any_ui = any(sp.get("source") in ("ui", "ui_tmp")
-                     for _i, sp in spr_idx)
-        need_spr_go = (want_ui or want_live_rt) and go_names
-        if any_ui:
-            p("        static const int _spr_ui[] = { %s };" % ", ".join(
-                "1" if sp.get("source") in ("ui", "ui_tmp") else "0"
-                for _i, sp in spr_idx))
-            if want_live_rt:
-                p("        static const int _spr_preserve[] = { %s };" % (
-                    ", ".join(
-                        "1" if int(sp.get("preserve_aspect") or 0) else "0"
-                        for _i, sp in spr_idx)))
-                p("        static const float _spr_src_aspect[] = { %s };" % (
-                    ", ".join(
-                        "%sf" % repr(float(sp.get("src_aspect") or 1.0))
-                        for _i, sp in spr_idx)))
-                # TMP Overflow (etc.): draw can exceed RectTransform.
-                p("        static const float _spr_draw_sx[] = { %s };" % (
-                    ", ".join(
-                        "%sf" % repr(float(sp.get("draw_sx") or 1.0))
-                        for _i, sp in spr_idx)))
-                p("        static const float _spr_draw_sy[] = { %s };" % (
-                    ", ".join(
-                        "%sf" % repr(float(sp.get("draw_sy") or 1.0))
-                        for _i, sp in spr_idx)))
-                p("        static const float _spr_shift_fx[] = { %s };" % (
-                    ", ".join(
-                        "%sf" % repr(float(sp.get("shift_fx") or 0.0))
-                        for _i, sp in spr_idx)))
-                p("        static const float _spr_shift_fy[] = { %s };" % (
-                    ", ".join(
-                        "%sf" % repr(float(sp.get("shift_fy") or 0.0))
-                        for _i, sp in spr_idx)))
-            else:
-                p("        static const float _spr_ncx[] = { %s };" % (
-                    ", ".join(
-                        "%sf" % repr(float(sp.get("ncx", 0.5)))
-                        for _i, sp in spr_idx)))
-                p("        static const float _spr_ncy[] = { %s };" % (
-                    ", ".join(
-                        "%sf" % repr(float(sp.get("ncy", 0.5)))
-                        for _i, sp in spr_idx)))
-                p("        static const float _spr_nhw[] = { %s };" % (
-                    ", ".join(
-                        "%sf" % repr(float(sp.get("nhw", 0.0)))
-                        for _i, sp in spr_idx)))
-                p("        static const float _spr_nhh[] = { %s };" % (
-                    ", ".join(
-                        "%sf" % repr(float(sp.get("nhh", 0.0)))
-                        for _i, sp in spr_idx)))
-        if need_spr_go:
-            go_vals = []
-            btn_vals = []
-            btn_by_go = {int(b["go"]): bi
-                         for bi, b in enumerate(ui_buttons)}
-            for i, _sp in spr_idx:
-                gi = cl["instances"][i].get("go_index")
-                if gi is None:
-                    n = cl["instances"][i].get("name") or "obj"
-                    gi = go_names.index(n) if n in go_names else -1
-                else:
-                    gi = int(gi)
-                go_vals.append(str(gi))
-                btn_vals.append(str(btn_by_go.get(gi, -1)))
-            p("        static const int _spr_go[] = { %s };" % ", ".join(go_vals))
-            # ColorBlock tint table only exists when authored Buttons do.
-            if ui_buttons:
-                p("        static const int _spr_btn[] = { %s };" % ", ".join(
-                    btn_vals))
-        p("        int k;")
-        p("        for (k = 0; k < %d && n < max; k = k + 1) {" % len(spr_idx))
-        p("            unsigned i = _spr_i[k];")
-        if want_ui:
-            p("            if (_spr_go[k] >= 0) {")
-            p("                if (!_engine_go_active_in_hierarchy(_spr_go[k]))")
-            p("                    continue;")
-            p("            }")
-        cid = class_ids[cname]
-
-        def _emit_world_draw(ind):
-            """World-space sprite path (non-UI), indented with ``ind``."""
-            if plan.get("has_transform_parents"):
-                p(ind + "float wx, wy, wz;")
-                p(ind + "_engine_world_pos(%d, i, &wx, &wy, &wz, 0);" % cid)
-                if has_cam:
-                    p(ind + "{")
-                    p(ind + "    float depth = wz - Camera_main_pos_z;")
-                    p(ind + "    if (depth < Camera_main_nearClipPlane"
-                      " || depth > Camera_main_farClipPlane)")
-                    p(ind + "        continue;")
-                    p(ind + "}")
-                p(ind + "out[n].x = wx;")
-                p(ind + "out[n].y = wy;")
-            else:
-                if has_cam:
-                    if cl.get("two_d"):
-                        p(ind + "float oz = 0.f;")
-                    else:
-                        p(ind + "float oz = %s_get_pos_z(i);" % idn)
-                    p(ind + "{")
-                    p(ind + "    float depth = oz - Camera_main_pos_z;")
-                    p(ind + "    if (depth < Camera_main_nearClipPlane"
-                      " || depth > Camera_main_farClipPlane)")
-                    p(ind + "        continue;")
-                    p(ind + "}")
-                p(ind + "out[n].x = %s_get_pos_x(i);" % idn)
-                p(ind + "out[n].y = %s_get_pos_y(i);" % idn)
-            if use_mut:
-                p(ind + "out[n].half_w = _%s_draw_hw[i];" % idn)
-                p(ind + "out[n].half_h = _%s_draw_hh[i];" % idn)
-                p(ind + "out[n].tex = _%s_draw_tex[i];" % idn)
-            else:
-                p(ind + "out[n].half_w = _spr_hw[k];")
-                p(ind + "out[n].half_h = _spr_hh[k];")
-                p(ind + "out[n].tex = _spr_tex[k];")
-            if use_scale:
-                p(ind + "out[n].half_w = out[n].half_w * _%s_scale_x[i];"
-                  % idn)
-                p(ind + "out[n].half_h = out[n].half_h * _%s_scale_y[i];"
-                  % idn)
-
-        if any_ui:
-            p("            if (_spr_ui[k]) {")
-            p("                float aspect, world_h, world_w, ncx, ncy, nhw, nhh;")
-            if plan.get("camera"):
-                p("                aspect = Camera_main_aspect;")
-                p("                if (aspect < 1e-6f) {")
-                p("                    float sw = (float)Screen_width;")
-                p("                    float sh = (float)Screen_height;")
-                p("                    if (sw < 1.f) sw = 1.f;")
-                p("                    if (sh < 1.f) sh = 1.f;")
-                p("                    aspect = sw / sh;")
-                p("                }")
-            else:
-                p("                float sw = (float)Screen_width;")
-                p("                float sh = (float)Screen_height;")
-                p("                if (sw < 1.f) sw = 1.f;")
-                p("                if (sh < 1.f) sh = 1.f;")
-                p("                aspect = sw / sh;")
-            p("                world_h = 2.f * Camera_main_orthographicSize;")
-            p("                world_w = world_h * aspect;")
-            if want_live_rt:
-                p("                {")
-                p("                    float sw = _engine_ui_layout_w;")
-                p("                    float sh = _engine_ui_layout_h;")
-                p("                    float rcx, rcy, rw, rh, dw, dh, dcx, dcy;")
-                p("                    float pivx, pivy, sa;")
-                p("                    int go = _spr_go[k];")
-                p("                    if (sw < 1.f) sw = 1.f;")
-                p("                    if (sh < 1.f) sh = 1.f;")
-                p("                    _engine_ui_screen_rect("
-                  "go, sw, sh, &rcx, &rcy, &rw, &rh);")
-                p("                    if (rw < 0.f) rw = -rw;")
-                p("                    if (rh < 0.f) rh = -rh;")
-                # Default = RectTransform; TMP Overflow scales past it.
-                p("                    dw = rw * _spr_draw_sx[k];")
-                p("                    dh = rh * _spr_draw_sy[k];")
-                p("                    dcx = rcx + rw * _spr_shift_fx[k];")
-                p("                    dcy = rcy + rh * _spr_shift_fy[k];")
-                p("                    if (_spr_preserve[k]"
-                  " && rw > 1e-6f && rh > 1e-6f) {")
-                p("                        sa = _spr_src_aspect[k];")
-                p("                        if (sa < 1e-8f) sa = 1.f;")
-                p("                        if (rw / rh > sa) {")
-                p("                            dw = rh * sa;")
-                p("                            dh = rh;")
-                p("                        } else {")
-                p("                            dw = rw;")
-                p("                            dh = rw / sa;")
-                p("                        }")
-                p("                        pivx = (go >= 0)"
-                  " ? _engine_rt_pivot_x[go] : 0.5f;")
-                p("                        pivy = (go >= 0)"
-                  " ? _engine_rt_pivot_y[go] : 0.5f;")
-                p("                        dcx = rcx + (rw - dw)"
-                  " * (pivx - 0.5f);")
-                p("                        dcy = rcy + (rh - dh)"
-                  " * (pivy - 0.5f);")
-                p("                    }")
-                p("                    ncx = dcx / sw;")
-                p("                    ncy = dcy / sh;")
-                p("                    nhw = dw * 0.5f / sw;")
-                p("                    nhh = dh * 0.5f / sh;")
-                p("                }")
-            else:
-                p("                ncx = _spr_ncx[k];")
-                p("                ncy = _spr_ncy[k];")
-                p("                nhw = _spr_nhw[k];")
-                p("                nhh = _spr_nhh[k];")
-            p("                out[n].x = Camera_main_pos_x")
-            p("                    + (ncx - 0.5f) * world_w;")
-            p("                out[n].y = Camera_main_pos_y")
-            p("                    + (ncy - 0.5f) * world_h;")
-            p("                out[n].half_w = nhw * world_w;")
-            p("                out[n].half_h = nhh * world_h;")
-            if use_mut:
-                p("                out[n].tex = _%s_draw_tex[i];" % idn)
-            else:
-                p("                out[n].tex = _spr_tex[k];")
-            p("            } else {")
-            _emit_world_draw("                ")
-            p("            }")
-        else:
-            _emit_world_draw("            ")
-        if use_rot:
-            p("            out[n].m00 = _%s_rot_m00[i];" % idn)
-            p("            out[n].m01 = _%s_rot_m01[i];" % idn)
-            p("            out[n].m10 = _%s_rot_m10[i];" % idn)
-            p("            out[n].m11 = _%s_rot_m11[i];" % idn)
-        else:
-            p("            out[n].m00 = _spr_m00[k];")
-            p("            out[n].m01 = _spr_m01[k];")
-            p("            out[n].m10 = _spr_m10[k];")
-            p("            out[n].m11 = _spr_m11[k];")
-        p("            out[n].r = _spr_r[k];")
-        p("            out[n].g = _spr_g[k];")
-        p("            out[n].b = _spr_b[k];")
-        p("            out[n].a = _spr_a[k];")
-        if want_ui and ui_buttons:
-            # ColorBlock multiplies Image.m_Color (Unity Selectable).
-            # Tint helpers are only emitted when ui_buttons is non-empty;
-            # want_ui alone can be SetActive without any Button.
-            p("            if (_spr_btn[k] >= 0) {")
-            p("                int bi = _spr_btn[k] * 4;")
-            p("                _engine_ui_btn_tint_init();")
-            p("                out[n].r = out[n].r * _engine_ui_btn_tint[bi];")
-            p("                out[n].g = out[n].g"
-              " * _engine_ui_btn_tint[bi + 1];")
-            p("                out[n].b = out[n].b"
-              " * _engine_ui_btn_tint[bi + 2];")
-            p("                out[n].a = out[n].a"
-              " * _engine_ui_btn_tint[bi + 3];")
-            p("            }")
-        p("            out[n].sorting_layer = _spr_layer[k];")
-        p("            out[n].sorting_order = _spr_order[k];")
-        p("            n = n + 1;")
-        p("        }")
-        p("    }")
+    any_sprite = _emit_engine_class_draws(
+            any_sprite, class_ids, go_names, has_cam, mutable_spr, p, plan, ui_buttons,
+            want_live_rt, want_ui)
     if not any_sprite:
         p("    /* no authored SpriteRenderers — nothing to draw */")
     elif want_draw_sort:
@@ -17807,9 +13894,6 @@ def _rewrite_vector2_axis_scale(text):
     return "".join(out)
 
 
-#: Emitted helpers that hand back a `Rect` — a receiver its properties read.
-_RECT_VALUE_CALLS = ("RectTransform_GetWorldRect", "RectTransform_get_rect",
-                     "Rect_MinMaxRect", "Rect_make")
 
 #: Emitted helpers that hand back a `Vector2`, so `.x` / `.y` on the result
 #: is the struct's field and not C# nothing lowered.
@@ -17819,35 +13903,6 @@ _VECTOR2_VALUE_CALLS = (
     "Mouse_current_position", "RectTransform_get_localPosition",
     "RectTransform_get_anchoredPosition", "RectTransform_get_sizeDelta")
 
-
-def _rect_receiver(text, scan, end):
-    """The Rect expression ending at *end*, as (start, source), or None."""
-    j = end - 1
-    while j >= 0 and scan[j] in " \t":
-        j -= 1
-    if j < 0:
-        return None
-    if scan[j] == ")":
-        depth = 0
-        while j >= 0:
-            if scan[j] == ")":
-                depth += 1
-            elif scan[j] == "(":
-                depth -= 1
-                if depth == 0:
-                    break
-            j -= 1
-        if j < 0:
-            return None
-    else:
-        # A bare name: the last character is its own, not a call's `(`.
-        j += 1
-    k = j
-    while k > 0 and (scan[k - 1].isalnum() or scan[k - 1] == "_"):
-        k -= 1
-    if k == j:
-        return None
-    return k, text[k:end]
 
 
 def _rewrite_rect_members(text):
@@ -17915,122 +13970,6 @@ def _rewrite_vector2_value_axis(text):
                 + text[m.end():])
         i = start
 
-
-def _rewrite_recttransform_apis(text, cl, plan):
-    """Lower rectTransform.anchoredPosition / sizeDelta / localScale."""
-    if not plan.get("live_rt") or not plan.get("go_names"):
-        return text
-    idn = _c_ident(cl["name"])
-    this_go = "_engine_go_of_%s(i)" % idn
-    flags = re.DOTALL
-    # Receiver: rectTransform / transform / field / field[i] / a.b
-    _recv = (
-        r"((?:this\s*\.\s*)?rectTransform|(?:this\s*\.\s*)?transform|"
-        r"(?:[\w]+(?:\s*\.\s*[\w]+|\s*\[[^\]]+\])*))"
-    )
-
-    def _go_of(recv):
-        recv = (recv or "").strip()
-        if not recv or recv in ("rectTransform", "transform", "this"):
-            return this_go
-        if re.match(r"(?:this\s*\.\s*)?rectTransform\s*$", recv):
-            return this_go
-        if re.match(r"(?:this\s*\.\s*)?transform\s*$", recv):
-            return this_go
-        return recv
-
-    for prop, setter in (
-            ("anchoredPosition", "RectTransform_set_anchoredPosition_xy"),
-            ("sizeDelta", "RectTransform_set_sizeDelta_xy")):
-        def _repl_eq(m, setfn=setter):
-            go = _go_of(m.group(1))
-            args = _split_call_args(m.group(2))
-            if len(args) < 2:
-                return m.group(0)
-            return "%s(%s, (%s), (%s));" % (setfn, go, args[0], args[1])
-
-        text = cs2cpp.code_sub(
-            r"(?<![.\w])%s\s*\.\s*%s\s*=\s*new\s+Vector2\s*\((.*?)\)\s*;"
-            % (_recv, prop),
-            _repl_eq, text, flags=flags)
-        text = cs2cpp.code_sub(
-            r"(?<![.\w])%s\s*\.\s*%s\s*=\s*Vector2\.zero\s*;" % (_recv, prop),
-            lambda m, setfn=setter: "%s(%s, 0.f, 0.f);" % (
-                setfn, _go_of(m.group(1))),
-            text)
-
-        def _repl_vec(m, setfn=setter):
-            go = _go_of(m.group(1))
-            rhs = m.group(2).strip()
-            return (
-                "%s(%s, Vector2_x(%s), Vector2_y(%s));"
-                % (setfn, go, rhs, rhs))
-
-        text = cs2cpp.code_sub(
-            r"(?<![.\w])%s\s*\.\s*%s\s*=\s*([^;]+);" % (_recv, prop),
-            _repl_vec, text)
-
-    def _repl_scale(m):
-        go = _go_of(m.group(1))
-        args = _split_call_args(m.group(2))
-        if len(args) < 2:
-            return m.group(0)
-        return "RectTransform_set_localScale_xy(%s, (%s), (%s));" % (
-            go, args[0], args[1])
-
-    text = cs2cpp.code_sub(
-        r"(?<![.\w])%s\s*\.\s*localScale\s*=\s*new\s+Vector3\s*\((.*?)\)\s*;"
-        % _recv,
-        _repl_scale, text, flags=flags)
-    text = cs2cpp.code_sub(
-        r"(?<![.\w])%s\s*\.\s*localScale\s*=\s*new\s+Vector2\s*\((.*?)\)\s*;"
-        % _recv,
-        _repl_scale, text, flags=flags)
-
-    def _repl_scale_one(m):
-        go = _go_of(m.group(1))
-        s = m.group(2).strip()
-        return "RectTransform_set_localScale_xy(%s, (%s), (%s));" % (go, s, s)
-
-    text = cs2cpp.code_sub(
-        r"(?<![.\w])%s\s*\.\s*localScale\s*=\s*Vector3\s*\.\s*one\s*\*\s*([^;]+);"
-        % _recv,
-        _repl_scale_one, text)
-
-    for prop, gx, gy in (
-            ("anchoredPosition",
-             "RectTransform_get_anchoredPosition_x",
-             "RectTransform_get_anchoredPosition_y"),
-            ("sizeDelta",
-             "RectTransform_get_sizeDelta_x",
-             "RectTransform_get_sizeDelta_y")):
-        text = cs2cpp.code_sub(
-            r"(?<![.\w])%s\s*\.\s*%s\b(?!\s*[=.])" % (_recv, prop),
-            lambda m, x=gx, y=gy: "Vector2_make(%s(%s), %s(%s))" % (
-                x, _go_of(m.group(1)), y, _go_of(m.group(1))),
-            text)
-        text = cs2cpp.code_sub(
-            r"(?<![.\w])%s\s*\.\s*%s\s*\.\s*x\b" % (_recv, prop),
-            lambda m, x=gx: "%s(%s)" % (x, _go_of(m.group(1))),
-            text)
-        text = cs2cpp.code_sub(
-            r"(?<![.\w])%s\s*\.\s*%s\s*\.\s*y\b" % (_recv, prop),
-            lambda m, y=gy: "%s(%s)" % (y, _go_of(m.group(1))),
-            text)
-
-    text = cs2cpp.code_sub(
-        r"(?<![.\w])%s\s*\.\s*localScale\s*\.\s*x\b" % _recv,
-        lambda m: "RectTransform_get_localScale_x(%s)" % _go_of(m.group(1)),
-        text)
-    text = cs2cpp.code_sub(
-        r"(?<![.\w])%s\s*\.\s*localScale\s*\.\s*y\b" % _recv,
-        lambda m: "RectTransform_get_localScale_y(%s)" % _go_of(m.group(1)),
-        text)
-    # Remaining bare rectTransform → this GO (≡ GetComponent<RectTransform>).
-    text = cs2cpp.code_sub(
-        r"(?<![.\w])(?:this\s*\.\s*)?rectTransform\b",
-        this_go, text)
-    return text
 
 
 def _setparent_go_expr(recv, cl):
@@ -19111,64 +15050,6 @@ def _emit_vector2_struct(p):
     p("")
 
 
-def _emit_rect_struct(p, want_point_to_normalized=True):
-    """UnityEngine.Rect: the struct, and the properties C# reads off one.
-
-    `x`/`y`/`width`/`height` are fields in both languages and need nothing.
-    `center`, `size`, `min` and `max` are C# properties, so each is a small
-    function here; `center` also assigns, which moves the rect.
-    """
-    p("/* UnityEngine.Rect — x/y is the min corner (Unity's own layout). */")
-    p("typedef struct Rect {")
-    p("    float x;")
-    p("    float y;")
-    p("    float width;")
-    p("    float height;")
-    p("} Rect;")
-    p("static Rect Rect_make(float ax, float ay, float aw, float ah) {")
-    p("    Rect r; r.x = ax; r.y = ay; r.width = aw; r.height = ah;")
-    p("    return r;")
-    p("}")
-    p("static Rect Rect_MinMaxRect(float x0, float y0, float x1, float y1) {")
-    p("    return Rect_make(x0, y0, x1 - x0, y1 - y0);")
-    p("}")
-    p("static float Rect_center_x(Rect r) { return r.x + r.width * 0.5f; }")
-    p("static float Rect_center_y(Rect r) { return r.y + r.height * 0.5f; }")
-    p("static Vector2 Rect_center(Rect r) {")
-    p("    return Vector2_make(Rect_center_x(r), Rect_center_y(r));")
-    p("}")
-    p("static float Rect_size_x(Rect r) { return r.width; }")
-    p("static float Rect_size_y(Rect r) { return r.height; }")
-    p("static Vector2 Rect_size(Rect r) {")
-    p("    return Vector2_make(r.width, r.height);")
-    p("}")
-    p("static Vector2 Rect_min(Rect r) { return Vector2_make(r.x, r.y); }")
-    p("static Vector2 Rect_max(Rect r) {")
-    p("    return Vector2_make(r.x + r.width, r.y + r.height);")
-    p("}")
-    p("/* `rect.center = v` keeps the size and moves the min corner. */")
-    p("static void Rect_set_center(Rect *r, Vector2 v) {")
-    p("    r->x = Vector2_x(v) - r->width * 0.5f;")
-    p("    r->y = Vector2_y(v) - r->height * 0.5f;")
-    p("}")
-    if want_point_to_normalized:
-        p("/* Mathf.InverseLerp — 0 on a degenerate range, clamped [0,1]. */")
-        p("static float Mathf_InverseLerp(float a, float b, float v) {")
-        p("    float t;")
-        p("    if (a == b) return 0.f;")
-        p("    t = (v - a) / (b - a);")
-        p("    if (t < 0.f) t = 0.f;")
-        p("    if (t > 1.f) t = 1.f;")
-        p("    return t;")
-        p("}")
-        p("/* Rect.PointToNormalized(r, p) — the point in the rect's [0,1]. */")
-        p("static Vector2 Rect_PointToNormalized(Rect r, Vector2 p) {")
-        p("    return Vector2_make(")
-        p("        Mathf_InverseLerp(r.x, r.x + r.width, p.x),")
-        p("        Mathf_InverseLerp(r.y, r.y + r.height, p.y));")
-        p("}")
-    p("")
-
 
 def _emit_iref_struct(p):
     """The tagged reference an interface-typed collection holds."""
@@ -19350,8 +15231,6 @@ def _lower_string_concat(text, string_idents=None):
     return cs2cpp.lower_string_concat(text, _PACKED_STRINGS, string_idents)
 
 
-_B = cs2cpp.Binding
-_UE = ("UnityEngine",)
 
 #: UnityEngine (and System.IO) members that are one engine name each, as
 #: cs2cpp bindings. The API is this file's; applying it is cs2cpp's
@@ -19406,15 +15285,6 @@ _UNITY_API_CONSOLE = [
 _UNITY_API_MATHF = [_B("Mathf." + m, "Mathf_" + m)
                     for m in ("Abs", "Min", "Max", "Clamp", "Lerp", "Sin",
                               "Cos", "Sign")]
-
-_UNITY_API_RECT = [
-    _B("Rect.PointToNormalized", "Rect_PointToNormalized", namespaces=_UE),
-    _B("Rect.MinMaxRect", "Rect_MinMaxRect", namespaces=_UE),
-    _B("Camera.main.ScreenToWorldPoint", "Camera_main_ScreenToWorldPoint",
-       namespaces=_UE),
-    _B("Mouse.current.position.ReadValue", "Mouse_current_position",
-       namespaces=("UnityEngine.InputSystem",)),
-]
 
 
 def _packed_class(cl):
@@ -20564,29 +16434,6 @@ def _rb_field_init_index(plan, o, fname, kind):
     return -1
 
 
-def _audiosource_field_init_index(plan, o, fname):
-    """Serialized AudioSource field → packed table index (-1 if missing)."""
-    refs = o.get("object_refs") or {}
-    fid = refs.get(fname)
-    by_fid = plan.get("audiosource_by_file_id") or {}
-    by_go = plan.get("go_audiosource") or {}
-    if fid is not None and str(fid) != "0" and str(fid) in by_fid:
-        return int(by_fid[str(fid)])
-    n = o.get("name") or "obj"
-    if n in by_go:
-        return int(by_go[n])
-    return -1
-
-
-def _mb_index(plan):
-    """A script component's fileID -> (class, instance index)."""
-    out = {}
-    for cname, cl in (plan.get("classes") or {}).items():
-        for i, o in enumerate(cl.get("instances") or []):
-            for mb in o.get("mb_ids") or []:
-                out[str(mb)] = (cname, i)
-    return out
-
 
 def _idx_null(bits):
     """A handle field's null: its all-ones value (255 for a uint8_t)."""
@@ -20601,63 +16448,6 @@ def _init_num(v, kind):
     return str(int(v))
 
 
-def emit_makefile(outdir, box2d=False, box2d_inject=False):
-    """Makefile for the packed player. With *box2d*, the player links the
-    Box2D-Packed glue (physics_box2d.c) and box2d/libbox2d.a, which
-    build_player_executable builds with box2d_pack."""
-    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    py = sys.executable
-    physics_objs = " physics_box2d.o" if box2d else ""
-    physics_libs = " box2d/libbox2d.a -lpthread" if box2d else ""
-    physics_rule = ""
-    if box2d:
-        physics_rule = (
-            "physics_box2d.o: physics_box2d.c\n"
-            "\t$(CC) -O3 -std=c17 -I box2d/box2d_src/include%s -c -o $@ $<\n"
-            % (" -DB2_PACK_INJECTED=1" if box2d_inject else ""))
-    # Absolute paths so `make crust-check` works from the outdir.
-    head = (
-        "# generated — engine.c is cpprust-lowered C (from engine.cpp subset); "
-        "data.c / main.c stay C\n"
-        "# CC=clang for clang builds; make vectorize-report for loop/SLP miss remarks\n"
-        "CC ?= gcc\n"
-        "CLANG ?= clang\n"
-        "CFLAGS_ENGINE ?= -O3 -fno-math-errno\n"
-        "CRUST_ROOT ?= %s\n"
-        "CRUST_PY ?= %s\n"
-        "CRUST = $(CRUST_PY) -m shivyc.main --no-cache\n"
-        ".PHONY: all crust-check vectorize-report clean\n"
-        "all: game\n"
-        "engine.o: engine.c\n"
-        "\t$(CC) $(CFLAGS_ENGINE) -c -o $@ $<\n"
-        "data.o: data.c\n"
-        "\t$(CC) -O0 -c -o $@ $<\n"
-        "main.o: main.c engine_draw.h\n"
-        "\t$(CC) -O2 -c -o $@ $<\n"
-    ) % (repo, py)
-    link = (
-        "game: engine.o data.o main.o%s\n"
-        "\t$(CC) -O2 -o $@ engine.o data.o main.o%s%s -lm\n"
-    ) % (physics_objs, physics_objs, physics_libs)
-    tail = (
-        "# Clang remarks: which loops miss auto-vectorization (stderr).\n"
-        "vectorize-report: engine.c\n"
-        "\t$(CLANG) $(CFLAGS_ENGINE) "
-        "-Rpass-missed=loop-vectorize,slp-vectorize "
-        "-c -o engine.vectorize.o engine.c\n"
-        "# Recompile lowered C with crust/shivyc (C++ twins gate at pack time).\n"
-        "crust-check: engine.c data.c main.c engine.cpp data.cpp main.cpp\n"
-        "\tcd $(CRUST_ROOT) && $(CRUST) -c -D CRUST_NO_POSIX_MKDIR "
-        "-o $(CURDIR)/engine.crust.o $(CURDIR)/engine.c\n"
-        "\tcd $(CRUST_ROOT) && $(CRUST) -c -D CRUST_NO_POSIX_MKDIR "
-        "-o $(CURDIR)/data.crust.o $(CURDIR)/data.c\n"
-        "\tcd $(CRUST_ROOT) && $(CRUST) -c "
-        "-o $(CURDIR)/main.crust.o $(CURDIR)/main.c\n"
-        "clean:\n"
-        "\trm -f engine.o data.o main.o game engine.vectorize.o "
-        "engine.crust.o data.crust.o main.crust.o%s\n"
-    ) % physics_objs
-    return head + physics_rule + link + tail
 
 def emit_main():
     """Headless host so `make` links: tick a second, print draw count."""
@@ -22082,180 +17872,12 @@ def project_folder_name(root):
     return os.path.basename(os.path.abspath(root).rstrip(os.sep)) or "Player"
 
 
-def exe_filename(product):
-    """Player binary name: productName plus the platform executable suffix."""
-    name = (product or "Player").strip() or "Player"
-    name = name.replace("/", "_").replace("\\", "_").replace("\0", "_")
-    if sys.platform.startswith("win"):
-        for ch in '<>:"|?*':
-            name = name.replace(ch, "_")
-        if not name.lower().endswith(".exe"):
-            name += ".exe"
-    return name
-
 
 def default_pack_dir(root):
     """$TMPDIR/<project folder> — default place for sources and the player."""
     import tempfile
     return os.path.join(tempfile.gettempdir(), project_folder_name(root))
 
-
-def find_box2d_root(box2d_root=None):
-    """Box2D-Packed checkout: *box2d_root*, $BOX2D_PACKED_ROOT, or a ``box2d``
-    directory beside this repository. None when there is none."""
-    candidates = [box2d_root, os.environ.get("BOX2D_PACKED_ROOT"),
-                  os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-                      os.path.abspath(__file__)))), "box2d")]
-    for c in candidates:
-        if c and os.path.isfile(os.path.join(c, "box2d_unity.py")):
-            return os.path.abspath(c)
-    return None
-
-
-def _load_box2d_unity(box2d_root=None):
-    """Import box2d_unity.py from a Box2D-Packed checkout."""
-    root = find_box2d_root(box2d_root)
-    if not root:
-        raise PackError(
-            "2D physics (Rigidbody2D / Collider2D) uses Box2D-Packed: pass "
-            "--box2d PATH, set BOX2D_PACKED_ROOT, or clone "
-            "https://github.com/crustos/box2d beside this repository")
-    if not os.path.isfile(os.path.join(root, "box2d_unity.py")):
-        raise PackError("no box2d_unity.py in %s (Box2D-Packed checkout?)" % root)
-    if root not in sys.path:
-        sys.path.insert(0, root)
-    import box2d_unity
-    return box2d_unity
-
-
-def build_player_executable(outdir, product, box2d_root=None, box2d_lto=False):
-    """Compile packed C sources and link a player named after productName.
-
-    Prefers examples/unity_pack/gles3_window.c (OpenGL ES 3.1; gles2_window.c
-    with UNITY_PACK_GLES2=1) when pkg-config finds glfw3.
-    Otherwise links the generated headless main.c.
-
-    ``engine.c`` is the cpprust-lowered C from the ``engine.cpp`` subset
-    (``std::vector`` → crust ``vector_int``, …). ``data.c`` / ``main.c`` are
-    already C. The host player builds with ``gcc`` (``CC``).
-
-    Object files and the exe are rebuilt only when their inputs are newer
-    (or missing), so an incremental pack that left ``.c`` untouched does not
-    force a full recompile.
-    """
-    import subprocess
-    cc = os.environ.get("CC") or "gcc"
-    exe = os.path.join(outdir, exe_filename(product))
-    engine_c = os.path.join(outdir, "engine.c")
-    data_c = os.path.join(outdir, "data.c")
-    engine_o = os.path.join(outdir, "engine.o")
-    data_o = os.path.join(outdir, "data.o")
-
-    def _run(cmd):
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        if r.returncode != 0:
-            err = (r.stderr or r.stdout or "").strip()
-            raise PackError(
-                "player build failed (%s): %s" % (
-                    " ".join(cmd[:6]), err or ("exit %d" % r.returncode)))
-
-    def _needs_rebuild(target, *inputs):
-        if not os.path.isfile(target):
-            return True
-        try:
-            t_m = os.path.getmtime(target)
-        except OSError:
-            return True
-        for inp in inputs:
-            if not inp or not os.path.isfile(inp):
-                return True
-            try:
-                if os.path.getmtime(inp) > t_m:
-                    return True
-            except OSError:
-                return True
-        return False
-
-    if _needs_rebuild(engine_o, engine_c):
-        _progress("compiling engine.c")
-        _run([cc, "-O3", "-fno-math-errno", "-c", "-o", engine_o, engine_c])
-    else:
-        _progress("engine.o up to date")
-    if _needs_rebuild(data_o, data_c):
-        _progress("compiling data.c")
-        _run([cc, "-O0", "-c", "-o", data_o, data_c])
-    else:
-        _progress("data.o up to date")
-
-    # Box2D-Packed 2D physics: generated glue + the library
-    physics_objs = []
-    physics_libs = []
-    glue_c = os.path.join(outdir, "physics_box2d.c")
-    if os.path.isfile(glue_c):
-        b2u = _load_box2d_unity(box2d_root)
-        inject = os.path.isfile(os.path.join(outdir, "box2d_inject.json"))
-        _progress("building Box2D-Packed%s" % (" (injected)" if inject else ""))
-        try:
-            lib, inc, defs = b2u.build_library(outdir, inject=inject, lto=box2d_lto)
-        except Exception as e:  # box2d_pack.BuildError carries the compiler output
-            raise PackError("Box2D-Packed build failed: %s" % e)
-        glue_o = os.path.join(outdir, "physics_box2d.o")
-        _run([cc, "-O3", "-std=c17", "-c", "-o", glue_o, glue_c, "-I", inc]
-             + defs + (["-flto"] if box2d_lto else []))
-        physics_objs = [glue_o]
-        physics_libs = [lib, "-lpthread"]
-
-    # OpenGL ES 3.1 by default -- what has SSBOs, for `--gpu-handles` --
-    # and ES 2.0 for hardware without it (UNITY_PACK_GLES2=1).
-    host = os.path.normpath(os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "..", "examples", "unity_pack",
-        "gles2_window.c" if os.environ.get("UNITY_PACK_GLES2")
-        else "gles3_window.c"))
-    use_window = False
-    cflags = []
-    libs = []
-    if os.path.isfile(host):
-        try:
-            chk = subprocess.run(
-                ["pkg-config", "--exists", "glfw3"],
-                capture_output=True)
-            if chk.returncode == 0:
-                cflags = subprocess.check_output(
-                    ["pkg-config", "--cflags", "glfw3"], text=True).split()
-                libs = subprocess.check_output(
-                    ["pkg-config", "--libs", "glfw3"], text=True).split()
-                use_window = True
-        except (OSError, subprocess.CalledProcessError):
-            use_window = False
-    if use_window:
-        deps = [host, engine_o, data_o] + physics_objs
-        render_h = os.path.join(os.path.dirname(host), "gles3_render.h")
-        if os.path.isfile(render_h):
-            deps.append(render_h)
-        if _needs_rebuild(exe, *deps):
-            _progress("linking window player %s" % exe)
-            _run([cc, "-O2", "-o", exe, host, engine_o, data_o]
-                 + physics_objs + ["-I", outdir] + cflags + libs
-                 + ["-lGLESv2"] + physics_libs + ["-lm"])
-            # (gles3_window.c includes gles3_render.h beside it.)
-        else:
-            _progress("player up to date")
-    else:
-        main_c = os.path.join(outdir, "main.c")
-        main_o = os.path.join(outdir, "main.o")
-        if _needs_rebuild(main_o, main_c):
-            _progress("compiling main.c")
-            _run([cc, "-O2", "-c", "-o", main_o, main_c])
-        else:
-            _progress("main.o up to date")
-        if _needs_rebuild(exe, engine_o, data_o, main_o, *physics_objs):
-            _progress("linking headless player %s" % exe)
-            _run([cc, "-O2", "-o", exe, engine_o, data_o, main_o]
-                 + physics_objs + physics_libs + ["-lm"])
-        else:
-            _progress("player up to date")
-    return exe
 
 
 def main():
