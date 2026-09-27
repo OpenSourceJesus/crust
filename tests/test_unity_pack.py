@@ -14006,11 +14006,8 @@ class TestLiveRectTransform(unittest.TestCase):
 
 
 
-class TestParamLists(unittest.TestCase):
-    """Parameter lists go through cs2cpp.parse_params: defaults, arrays and
-    commas inside literals. A default parameter used to vanish from the C
-    signature, and the pack failed with `use of undeclared identifier`.
-    Calls that omit a literal default now get it filled in."""
+class _ScriptPackMixin(object):
+    """Pack a one-script `Tally` project and run four engine ticks."""
 
     SCENE = (
         "%YAML 1.1\n"
@@ -14073,6 +14070,15 @@ class TestParamLists(unittest.TestCase):
         out = subprocess.run([exe], capture_output=True, text=True).stdout
         return int(out.strip())
 
+
+
+class TestParamLists(_ScriptPackMixin, unittest.TestCase):
+    """Parameter lists go through cs2cpp.parse_params: defaults, arrays and
+    commas inside literals. A default parameter used to vanish from the C
+    signature, and the pack failed with `use of undeclared identifier`.
+    Calls that omit a literal or null default get it filled in, and named
+    arguments are put in declaration order."""
+
     @needs_cc
     def test_default_param_and_string_comma(self):
         d, eng = self._pack(
@@ -14111,18 +14117,69 @@ class TestParamLists(unittest.TestCase):
         self.assertIn("Tally_Grow(4);", eng)
         self.assertEqual(self._total_after_four_updates(d), 12)  # 4 x (1+2)
 
+    @needs_cc
+    def test_named_arguments_and_null_default(self):
+        d, eng = self._pack(
+            "using UnityEngine;\n"
+            "public class Tally : MonoBehaviour {\n"
+            "    public int total;\n"
+            "    void Bump(int by = 1, int times = 1) { total = total + by * times; }\n"
+            "    void Hit(Tally other = null) {\n"
+            "        if (other == null) { total = total + 100; }\n"
+            "    }\n"
+            "    void Update() {\n"
+            "        Bump(by: 2);\n"
+            "        Bump(times: 3, by: 1);\n"
+            "        Hit();\n"
+            "    }\n"
+            "}\n")
+        self.assertIn("Tally_Bump(i, 2, 1);", eng)
+        self.assertIn("Tally_Bump(i, 1, 3);", eng)
+        self.assertIn("Tally_Hit(i, -1);", eng)  # null handle is -1
+        self.assertIn("other == -1", eng)
+        self.assertEqual(self._total_after_four_updates(d), 420)
+
     def test_non_literal_default_is_still_refused(self):
-        # `null` needs type-aware lowering: the call is left short and the
-        # pack refuses it with a clear argument-count error.
+        # A named constant needs type-aware lowering: the call is left short
+        # and the pack refuses it with a clear argument-count error.
         with self.assertRaises(unity_pack.PackError) as cm:
             self._pack(
                 "using UnityEngine;\n"
                 "public class Tally : MonoBehaviour {\n"
                 "    public int total;\n"
-                "    void Hit(Tally other = null) { total = total + 1; }\n"
-                "    void Update() { Hit(); }\n"
+                "    const int MAX = 3;\n"
+                "    void Bump(int by = MAX) { total = total + by; }\n"
+                "    void Update() { Bump(); }\n"
                 "}\n")
         self.assertIn("incorrect number of arguments", cm.exception.message)
+
+
+class TestStaticFields(_ScriptPackMixin, unittest.TestCase):
+    """Class-level static fields. An uninitialized `static int` had no C
+    definition, and `static int n = 5` was emitted `const`, so a script
+    that wrote it failed. C# `const` stays const."""
+
+    @needs_cc
+    def test_static_fields_are_mutable_and_defined(self):
+        d, eng = self._pack(
+            "using UnityEngine;\n"
+            "public class Tally : MonoBehaviour {\n"
+            "    public int total;\n"
+            "    static int bonus;\n"
+            "    static int count = 5;\n"
+            "    const int STEP = 2;\n"
+            "    static void Grow(int k = 4) { bonus = bonus + k; }\n"
+            "    void Update() {\n"
+            "        Grow();\n"
+            "        count = count + STEP;\n"
+            "        total = bonus + count;\n"
+            "    }\n"
+            "}\n")
+        self.assertIn("static int Tally_bonus = 0;", eng)
+        self.assertIn("static int Tally_count = 5;", eng)
+        self.assertIn("static const int Tally_STEP = 2;", eng)
+        # After 4 updates: bonus 16, count 5 + 4 * 2 = 13.
+        self.assertEqual(self._total_after_four_updates(d), 29)
 
 _BOX2D_ROOT = unity_pack.find_box2d_root()
 needs_box2d = unittest.skipUnless(
