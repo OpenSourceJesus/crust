@@ -16627,7 +16627,8 @@ def emit_engine(plan, analyses, used_apis):
         p("}")
         p("")
 
-    if want_col2d or want_col3d:
+    if want_col3d:
+        # 2D friction / bounciness combine in Box2D-Packed (box2d_unity.py).
         p("/* PhysicsMaterialCombine: Average=0 Multiply=1 Minimum=2 Maximum=3 */")
         p("static float _phys_mat_combine(float a, float b, int ca, int cb) {")
         p("    int mode = ca > cb ? ca : cb;")
@@ -16640,7 +16641,7 @@ def emit_engine(plan, analyses, used_apis):
         p("")
 
     if want_col2d and col2d_list:
-        p("/* Authored BoxCollider2D / CircleCollider2D — AABB contacts */")
+        p("/* Authored BoxCollider2D / CircleCollider2D — centers for Box2D-Packed */")
         p("static void _col2d_center(int ci, float *out_x, float *out_y) {")
         p("    unsigned oi = (unsigned)_Collider2D_owner_inst[ci];")
         p("    float px = 0.f, py = 0.f;")
@@ -16668,47 +16669,6 @@ def emit_engine(plan, analyses, used_apis):
         p("    }")
         p("    *out_x = px + c * ox - s * oy;")
         p("    *out_y = py + s * ox + c * oy;")
-        p("}")
-        p("")
-        p("static void _col2d_set_pos(int ci, float nx, float ny) {")
-        p("    unsigned oi = (unsigned)_Collider2D_owner_inst[ci];")
-        p("    switch (_Collider2D_owner_class[ci]) {")
-        for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
-            idn = _c_ident(cname)
-            cl = plan["classes"][cname]
-            if not _class_has_position(cl) or cl.get("static"):
-                continue
-            p("    case %d:" % cid)
-            p("        %s_set_pos_x(oi, nx);" % idn)
-            p("        %s_set_pos_y(oi, ny);" % idn)
-            p("        break;")
-        p("    default: break;")
-        p("    }")
-        p("}")
-        p("")
-        p("static void _col2d_get_pos(int ci, float *ox, float *oy) {")
-        p("    unsigned oi = (unsigned)_Collider2D_owner_inst[ci];")
-        p("    *ox = 0.f; *oy = 0.f;")
-        p("    switch (_Collider2D_owner_class[ci]) {")
-        for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
-            idn = _c_ident(cname)
-            cl = plan["classes"][cname]
-            if not _class_has_position(cl):
-                continue
-            p("    case %d:" % cid)
-            if plan.get("has_transform_parents"):
-                p("        {")
-                p("            float wx, wy, wz;")
-                p("            _engine_world_pos(%d, oi, &wx, &wy, &wz, 0);"
-                  % cid)
-                p("            *ox = wx; *oy = wy;")
-                p("        }")
-            else:
-                p("        *ox = %s_get_pos_x(oi);" % idn)
-                p("        *oy = %s_get_pos_y(oi);" % idn)
-            p("        break;")
-        p("    default: break;")
-        p("    }")
         p("}")
         p("")
         if want_collision2d_msgs:
@@ -16806,130 +16766,6 @@ def emit_engine(plan, analyses, used_apis):
             p("    }")
             p("}")
             p("")
-        p("static void engine_physics_collide2d(void) {")
-        p("    int a, b;")
-        if want_collision2d_msgs:
-            p("    _col2d_contact_n = 0;")
-        p("    /* Unordered pairs once. Dynamic-static moves only the dynamic.")
-        p("     * Dynamic-dynamic splits by inverse mass; on a vertical MTV the")
-        p("     * lower body is treated as immovable so stacks do not drive the")
-        p("     * support through a static floor. */")
-        p("    for (a = 0; a < _Collider2D_count; a = a + 1) {")
-        p("        float ax, ay, bx, by, dx, dy, px, py, ahw, ahh, bhw, bhh;")
-        p("        float c, s, sx, sy, nx, ny, fr, bn, sc;")
-        p("        float inv_a, inv_b, inv_sum, wa, wb;")
-        p("        int a_dyn, b_dyn, rb_a, rb_b;")
-        p("        if (_Collider2D_is_trigger[a]) continue;")
-        p("        a_dyn = (_Collider2D_body_type[a] == 0")
-        p("                 && _Collider2D_rb2d[a] >= 0);")
-        p("        for (b = a + 1; b < _Collider2D_count; b = b + 1) {")
-        p("            float tx, ty, vx, vy, vn, vtx, vty;")
-        p("            if (_Collider2D_is_trigger[b]) continue;")
-        p("            b_dyn = (_Collider2D_body_type[b] == 0")
-        p("                     && _Collider2D_rb2d[b] >= 0);")
-        p("            if (!a_dyn && !b_dyn) continue;")
-        p("            _col2d_center(a, &ax, &ay);")
-        p("            c = _Collider2D_cos[a]; s = _Collider2D_sin[a];")
-        p("            if (_Collider2D_kind[a] == 1) {")
-        p("                ahw = _Collider2D_hw[a]; ahh = ahw;")
-        p("            } else {")
-        p("                ahw = fabsf(c) * _Collider2D_hw[a]")
-        p("                    + fabsf(s) * _Collider2D_hh[a];")
-        p("                ahh = fabsf(s) * _Collider2D_hw[a]")
-        p("                    + fabsf(c) * _Collider2D_hh[a];")
-        p("            }")
-        p("            _col2d_center(b, &bx, &by);")
-        p("            c = _Collider2D_cos[b]; s = _Collider2D_sin[b];")
-        p("            if (_Collider2D_kind[b] == 1) {")
-        p("                bhw = _Collider2D_hw[b]; bhh = bhw;")
-        p("            } else {")
-        p("                bhw = fabsf(c) * _Collider2D_hw[b]")
-        p("                    + fabsf(s) * _Collider2D_hh[b];")
-        p("                bhh = fabsf(s) * _Collider2D_hw[b]")
-        p("                    + fabsf(c) * _Collider2D_hh[b];")
-        p("            }")
-        p("            dx = ax - bx; dy = ay - by;")
-        p("            px = (ahw + bhw) - (dx < 0.f ? -dx : dx);")
-        p("            py = (ahh + bhh) - (dy < 0.f ? -dy : dy);")
-        p("            if (px <= 0.f || py <= 0.f) continue;")
-        if want_collision2d_msgs:
-            p("            _col2d_add_contact(a, b);")
-        p("            sx = 0.f; sy = 0.f; nx = 0.f; ny = 0.f;")
-        p("            if (px < py) {")
-        p("                sx = (dx < 0.f) ? -px : px;")
-        p("                nx = (sx < 0.f) ? -1.f : 1.f;")
-        p("            } else {")
-        p("                sy = (dy < 0.f) ? -py : py;")
-        p("                ny = (sy < 0.f) ? -1.f : 1.f;")
-        p("            }")
-        p("            rb_a = _Collider2D_rb2d[a];")
-        p("            rb_b = _Collider2D_rb2d[b];")
-        p("            inv_a = 0.f;")
-        p("            inv_b = 0.f;")
-        p("            if (a_dyn) {")
-        p("                inv_a = 1.f / _Rigidbody2D_mass[rb_a];")
-        p("                if (inv_a < 0.f) inv_a = 0.f;")
-        p("            }")
-        p("            if (b_dyn) {")
-        p("                inv_b = 1.f / _Rigidbody2D_mass[rb_b];")
-        p("                if (inv_b < 0.f) inv_b = 0.f;")
-        p("            }")
-        p("            /* Vertical stack: lower dynamic is a support. */")
-        p("            if (a_dyn && b_dyn && !(px < py)) {")
-        p("                if (ay < by) inv_a = 0.f;")
-        p("                else inv_b = 0.f;")
-        p("            }")
-        p("            inv_sum = inv_a + inv_b;")
-        p("            if (inv_sum <= 1e-8f) continue;")
-        p("            wa = inv_a / inv_sum;")
-        p("            wb = inv_b / inv_sum;")
-        p("            if (a_dyn && wa > 0.f) {")
-        p("                _col2d_get_pos(a, &tx, &ty);")
-        p("                _col2d_set_pos(a, tx + sx * wa, ty + sy * wa);")
-        p("            }")
-        p("            if (b_dyn && wb > 0.f) {")
-        p("                _col2d_get_pos(b, &tx, &ty);")
-        p("                _col2d_set_pos(b, tx - sx * wb, ty - sy * wb);")
-        p("            }")
-        p("            fr = _phys_mat_combine(")
-        p("                _Collider2D_friction[a], _Collider2D_friction[b],")
-        p("                _Collider2D_friction_combine[a],")
-        p("                _Collider2D_friction_combine[b]);")
-        p("            bn = _phys_mat_combine(")
-        p("                _Collider2D_bounciness[a], _Collider2D_bounciness[b],")
-        p("                _Collider2D_bounce_combine[a],")
-        p("                _Collider2D_bounce_combine[b]);")
-        p("            sc = 1.f - fr;")
-        p("            if (sc < 0.f) sc = 0.f;")
-        p("            if (sc > 1.f) sc = 1.f;")
-        p("            if (a_dyn && wa > 0.f) {")
-        p("                vx = _Rigidbody2D_vel_x[rb_a];")
-        p("                vy = _Rigidbody2D_vel_y[rb_a];")
-        p("                vn = vx * nx + vy * ny;")
-        p("                vtx = vx - vn * nx;")
-        p("                vty = vy - vn * ny;")
-        p("                if (vn < 0.f) vn = -bn * vn;")
-        p("                _Rigidbody2D_vel_x[rb_a] = vtx * sc + vn * nx;")
-        p("                _Rigidbody2D_vel_y[rb_a] = vty * sc + vn * ny;")
-        p("            }")
-        p("            if (b_dyn && wb > 0.f) {")
-        p("                /* Normal for b is opposite. */")
-        p("                vx = _Rigidbody2D_vel_x[rb_b];")
-        p("                vy = _Rigidbody2D_vel_y[rb_b];")
-        p("                vn = vx * (-nx) + vy * (-ny);")
-        p("                vtx = vx - vn * (-nx);")
-        p("                vty = vy - vn * (-ny);")
-        p("                if (vn < 0.f) vn = -bn * vn;")
-        p("                _Rigidbody2D_vel_x[rb_b] = vtx * sc + vn * (-nx);")
-        p("                _Rigidbody2D_vel_y[rb_b] = vty * sc + vn * (-ny);")
-        p("            }")
-        p("        }")
-        p("    }")
-        if want_collision2d_msgs:
-            p("    engine_physics_collide2d_messages();")
-        p("}")
-        p("")
-
     if want_col3d and col3d_list:
         p("/* Authored BoxCollider / SphereCollider — AABB contacts */")
         p("static void _col3d_center(int ci, float *ox, float *oy, float *oz) {")
@@ -17090,13 +16926,13 @@ def emit_engine(plan, analyses, used_apis):
         p("}")
         p("")
 
-    box2d_backend = (plan.get("physics_backend") == "box2d"
-                     and (want_rb2d or want_col2d))
+    # 2D physics is Box2D-Packed (box2d_unity.py in the Box2D-Packed repo).
+    # engine.c exports scalar accessors for the generated glue in
+    # physics_box2d.c and keeps sending OnCollision*2D after the step.
+    box2d_backend = bool(want_rb2d or want_col2d)
+    plan["box2d_physics"] = box2d_backend
     if box2d_backend:
-        # Box2D-Packed (box2d_unity.py) replaces the 2D integrator and AABB
-        # contacts. engine.c exports scalar accessors for the generated glue in
-        # physics_box2d.c and keeps sending OnCollision*2D after the step.
-        p("/* Box2D-Packed 2D physics (unity_pack --physics box2d) */")
+        p("/* Box2D-Packed 2D physics (physics_box2d.c) */")
         p("void engine_box2d_step(void);")
         p("void engine_rb2d_get_pos(int rb, float *x, float *y) {")
         p("    unsigned oi = (unsigned)_Rigidbody2D_owner_inst[rb];")
@@ -17150,7 +16986,7 @@ def emit_engine(plan, analyses, used_apis):
         p("")
 
     if want_rb2d or want_rb3d or box2d_backend:
-        p("/* Authored Rigidbody / Rigidbody2D — gravity + integrate after FixedUpdate */")
+        p("/* Box2D-Packed (2D) and authored Rigidbody integration (3D) after FixedUpdate */")
         p("static void engine_physics_fixed(void) {")
         p("    int i;")
         if box2d_backend:
@@ -17159,44 +16995,6 @@ def emit_engine(plan, analyses, used_apis):
             p("    engine_box2d_step();")
             if want_collision2d_msgs:
                 p("    engine_physics_collide2d_messages();")
-        if want_rb2d and rb2d_list and not box2d_backend:
-            p("    for (i = 0; i < _Rigidbody2D_count; i = i + 1) {")
-            p("        unsigned oi;")
-            p("        float vx, vy;")
-            p("        if (_Rigidbody2D_body_type[i] != 0) continue; /* Dynamic only */")
-            p("        _Rigidbody2D_vel_x[i] = _Rigidbody2D_vel_x[i]")
-            p("            + Physics2D_gravity_x * _Rigidbody2D_gravity_scale[i]")
-            p("              * Time_fixedDeltaTime;")
-            p("        _Rigidbody2D_vel_y[i] = _Rigidbody2D_vel_y[i]")
-            p("            + Physics2D_gravity_y * _Rigidbody2D_gravity_scale[i]")
-            p("              * Time_fixedDeltaTime;")
-            # Box2D / Unity: v *= clamp(1 - damping * dt, 0, 1)
-            p("        {")
-            p("            float d = 1.f - _Rigidbody2D_linear_damping[i]")
-            p("                * Time_fixedDeltaTime;")
-            p("            if (d < 0.f) d = 0.f;")
-            p("            if (d > 1.f) d = 1.f;")
-            p("            _Rigidbody2D_vel_x[i] = _Rigidbody2D_vel_x[i] * d;")
-            p("            _Rigidbody2D_vel_y[i] = _Rigidbody2D_vel_y[i] * d;")
-            p("        }")
-            p("        vx = _Rigidbody2D_vel_x[i] * Time_fixedDeltaTime;")
-            p("        vy = _Rigidbody2D_vel_y[i] * Time_fixedDeltaTime;")
-            p("        oi = (unsigned)_Rigidbody2D_owner_inst[i];")
-            p("        switch (_Rigidbody2D_owner_class[i]) {")
-            for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
-                idn = _c_ident(cname)
-                cl = plan["classes"][cname]
-                if not _class_has_position(cl) or cl.get("static"):
-                    continue
-                p("        case %d:" % cid)
-                p("            %s_set_pos_x(oi, %s_get_pos_x(oi) + vx);"
-                  % (idn, idn))
-                p("            %s_set_pos_y(oi, %s_get_pos_y(oi) + vy);"
-                  % (idn, idn))
-                p("            break;")
-            p("        default: break;")
-            p("        }")
-            p("    }")
         if want_rb3d and rb3d_list:
             p("    for (i = 0; i < _Rigidbody_count; i = i + 1) {")
             p("        unsigned oi;")
@@ -17239,8 +17037,6 @@ def emit_engine(plan, analyses, used_apis):
             p("        default: break;")
             p("        }")
             p("    }")
-        if want_col2d and col2d_list and not box2d_backend:
-            p("    engine_physics_collide2d();")
         if want_col3d and col3d_list:
             p("    engine_physics_collide3d();")
         p("}")
@@ -21068,11 +20864,22 @@ def _init_num(v, kind):
     return str(int(v))
 
 
-def emit_makefile(outdir):
+def emit_makefile(outdir, box2d=False, box2d_inject=False):
+    """Makefile for the packed player. With *box2d*, the player links the
+    Box2D-Packed glue (physics_box2d.c) and box2d/libbox2d.a, which
+    build_player_executable builds with box2d_pack."""
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     py = sys.executable
+    physics_objs = " physics_box2d.o" if box2d else ""
+    physics_libs = " box2d/libbox2d.a -lpthread" if box2d else ""
+    physics_rule = ""
+    if box2d:
+        physics_rule = (
+            "physics_box2d.o: physics_box2d.c\n"
+            "\t$(CC) -O3 -std=c17 -I box2d/box2d_src/include%s -c -o $@ $<\n"
+            % (" -DB2_PACK_INJECTED=1" if box2d_inject else ""))
     # Absolute paths so `make crust-check` works from the outdir.
-    return (
+    head = (
         "# generated — engine.c is cpprust-lowered C (from engine.cpp subset); "
         "data.c / main.c stay C\n"
         "# CC=clang for clang builds; make vectorize-report for loop/SLP miss remarks\n"
@@ -21090,8 +20897,12 @@ def emit_makefile(outdir):
         "\t$(CC) -O0 -c -o $@ $<\n"
         "main.o: main.c engine_draw.h\n"
         "\t$(CC) -O2 -c -o $@ $<\n"
-        "game: engine.o data.o main.o\n"
-        "\t$(CC) -O2 -o $@ engine.o data.o main.o -lm\n"
+    ) % (repo, py)
+    link = (
+        "game: engine.o data.o main.o%s\n"
+        "\t$(CC) -O2 -o $@ engine.o data.o main.o%s%s -lm\n"
+    ) % (physics_objs, physics_objs, physics_libs)
+    tail = (
         "# Clang remarks: which loops miss auto-vectorization (stderr).\n"
         "vectorize-report: engine.c\n"
         "\t$(CLANG) $(CFLAGS_ENGINE) "
@@ -21107,10 +20918,9 @@ def emit_makefile(outdir):
         "-o $(CURDIR)/main.crust.o $(CURDIR)/main.c\n"
         "clean:\n"
         "\trm -f engine.o data.o main.o game engine.vectorize.o "
-        "engine.crust.o data.crust.o main.crust.o\n"
-        % (repo, py)
-    )
-
+        "engine.crust.o data.crust.o main.crust.o%s\n"
+    ) % physics_objs
+    return head + physics_rule + link + tail
 
 def emit_main():
     """Headless host so `make` links: tick a second, print draw count."""
@@ -22172,7 +21982,7 @@ def _plan_from_stamp(stamp):
         "two_d": bool(stamp.get("two_d")),
         "soa": bool(stamp.get("soa")),
         "soa_vec4": bool(stamp.get("soa_vec4")),
-        "physics": stamp.get("physics") or "builtin",
+        "physics": stamp.get("physics") or "box2d",
     }
 
 
@@ -22220,18 +22030,16 @@ def _emit_artifact_unchanged(outdir, cpp_name, c_name, cpp_text, force):
 
 
 def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
-         gpu_handles=False, physics="builtin", physics_inject=False,
-         box2d_root=None):
+         gpu_handles=False, physics_inject=False, box2d_root=None):
     """Pack the Unity-subset project at *root* into *outdir*.
 
-    physics="box2d" replaces the 2D integrator and AABB contacts with
-    Box2D-Packed (box2d_unity.py in the Box2D-Packed repo at box2d_root, or
-    $BOX2D_PACKED_ROOT). physics_inject=True routes contact begin / end
-    through box2d_pack injection markers instead of Box2D's event arrays.
+    2D physics (Rigidbody2D, Collider2D) is Box2D-Packed: box2d_unity.py from
+    the Box2D-Packed checkout at *box2d_root*, $BOX2D_PACKED_ROOT, or a
+    ``box2d`` directory beside this repository. physics_inject=True routes
+    contact begin / end through box2d_pack injection markers instead of
+    Box2D's event arrays.
     """
-    if physics not in ("builtin", "box2d"):
-        raise PackError("unknown physics backend %r (builtin, box2d)" % physics)
-    physics_key = physics + ("+inject" if physics == "box2d" and physics_inject else "")
+    physics_key = "box2d+inject" if physics_inject else "box2d"
     os.makedirs(outdir, exist_ok=True)
     fp, assets_fp, scripts_fp = _input_fingerprints(
         root, soa=soa, soa_vec4=soa_vec4, gpu_handles=gpu_handles)
@@ -22241,7 +22049,7 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
                 and stamp.get("input_fingerprint") == fp
                 and bool(stamp.get("soa")) == bool(soa)
                 and bool(stamp.get("soa_vec4")) == bool(soa_vec4)
-                and (stamp.get("physics") or "builtin") == physics_key
+                and stamp.get("physics") == physics_key
                 and _outputs_complete(outdir)):
             _progress("unchanged; skipping pack (stamp match)")
             return _plan_from_stamp(stamp)
@@ -22445,7 +22253,6 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
     # A method the translator cannot lower is a warning, or with `strict`
     # an error (`_report_stub`).
     plan["strict"] = bool(strict)
-    plan["physics_backend"] = physics
     engine = emit_engine(plan, analyses, used_apis)
     if gpu_handles:
         # Packed handle streams for a GLES 3.1 SSBO (`_handle_streams`).
@@ -22488,8 +22295,10 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
     _write_if_different(
         os.path.join(outdir, "engine_draw.h"), emit_engine_draw_h())
     _write_if_different(
-        os.path.join(outdir, "Makefile"), emit_makefile(outdir))
-    if physics == "box2d":
+        os.path.join(outdir, "Makefile"),
+        emit_makefile(outdir, box2d=bool(plan.get("box2d_physics")),
+                      box2d_inject=bool(physics_inject)))
+    if plan.get("box2d_physics"):
         _load_box2d_unity(box2d_root).emit_glue(
             outdir, plan, inject=bool(physics_inject))
     else:
@@ -22554,14 +22363,26 @@ def default_pack_dir(root):
     return os.path.join(tempfile.gettempdir(), project_folder_name(root))
 
 
+def find_box2d_root(box2d_root=None):
+    """Box2D-Packed checkout: *box2d_root*, $BOX2D_PACKED_ROOT, or a ``box2d``
+    directory beside this repository. None when there is none."""
+    candidates = [box2d_root, os.environ.get("BOX2D_PACKED_ROOT"),
+                  os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+                      os.path.abspath(__file__)))), "box2d")]
+    for c in candidates:
+        if c and os.path.isfile(os.path.join(c, "box2d_unity.py")):
+            return os.path.abspath(c)
+    return None
+
+
 def _load_box2d_unity(box2d_root=None):
     """Import box2d_unity.py from a Box2D-Packed checkout."""
-    root = box2d_root or os.environ.get("BOX2D_PACKED_ROOT")
+    root = find_box2d_root(box2d_root)
     if not root:
         raise PackError(
-            "--physics box2d needs a Box2D-Packed checkout: pass --box2d PATH "
-            "or set BOX2D_PACKED_ROOT")
-    root = os.path.abspath(root)
+            "2D physics (Rigidbody2D / Collider2D) uses Box2D-Packed: pass "
+            "--box2d PATH, set BOX2D_PACKED_ROOT, or clone "
+            "https://github.com/crustos/box2d beside this repository")
     if not os.path.isfile(os.path.join(root, "box2d_unity.py")):
         raise PackError("no box2d_unity.py in %s (Box2D-Packed checkout?)" % root)
     if root not in sys.path:
@@ -22629,7 +22450,7 @@ def build_player_executable(outdir, product, box2d_root=None, box2d_lto=False):
     else:
         _progress("data.o up to date")
 
-    # Box2D-Packed physics (--physics box2d): generated glue + the library
+    # Box2D-Packed 2D physics: generated glue + the library
     physics_objs = []
     physics_libs = []
     glue_c = os.path.join(outdir, "physics_box2d.c")
@@ -22730,14 +22551,11 @@ def main():
         soa = False
         soa_vec4 = False
         args.remove("--aos")
-    physics = "builtin"
     if "--physics" in args:
-        i = args.index("--physics")
-        if i + 1 >= len(args):
-            sys.stderr.write("unity_pack: --physics needs builtin or box2d\n")
-            return 2
-        physics = args[i + 1]
-        del args[i:i + 2]
+        sys.stderr.write(
+            "unity_pack: --physics is gone; 2D physics is always Box2D-Packed "
+            "(--box2d PATH, $BOX2D_PACKED_ROOT, or ../box2d).\n")
+        return 2
     physics_inject = False
     if "--physics-inject" in args:
         physics_inject = True
@@ -22765,7 +22583,7 @@ def main():
         sys.stderr.write(
             "usage: unity_pack.py <project-dir> [-o <out-dir>] "
             "[--aos | --soa-vec4] [--force] [--strict] [--gpu-handles]\n"
-            "       [--physics builtin|box2d] [--physics-inject] [--box2d PATH] [--box2d-lto]\n"
+            "       [--physics-inject] [--box2d PATH] [--box2d-lto]\n"
             "  default out-dir: $TMPDIR/<project folder>\n"
             "  player binary:   <productName>  (Windows: <productName>.exe)\n"
             "  default layout:  SoA position tables (use --aos for AoS)\n"
@@ -22775,7 +22593,7 @@ def main():
         outdir = default_pack_dir(args[0])
     try:
         plan = pack(args[0], outdir, soa=soa, soa_vec4=soa_vec4, force=force,
-                    strict=strict, gpu_handles=gpu_handles, physics=physics,
+                    strict=strict, gpu_handles=gpu_handles,
                     physics_inject=physics_inject, box2d_root=box2d_root)
         exe = build_player_executable(
             outdir, plan.get("product_name") or "Player",
