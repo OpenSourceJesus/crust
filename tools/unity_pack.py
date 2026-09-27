@@ -4128,6 +4128,19 @@ def _build_go_active(plan, go_names):
 
 
 
+def _build_go_scene(plan, go_names):
+    """Build index of the scene each go_names entry was authored in."""
+    sc = [0] * len(go_names or [])
+    recs = list(plan.get("scene_hierarchy") or [])
+    for cl in (plan.get("classes") or {}).values():
+        recs.extend(cl.get("instances") or [])
+    for o in recs:
+        gi = o.get("go_index")
+        if gi is not None and 0 <= gi < len(sc) and o.get("scene"):
+            sc[gi] = int(o["scene"])
+    return sc
+
+
 def _extend_go_tables_for_find(plan, names, comps):
     """No-op: ``_build_go_tables`` already includes hierarchy-only GOs."""
     return names, comps
@@ -5511,6 +5524,8 @@ def analyze_script(path, text=None, shallow=False):
         apis.add("Mouse.current.position")
     if re.search(r"\bInputAction\b", scan):
         apis.add("InputAction")
+    if re.search(r"(?<![\w.])SceneManager\s*\.", scan):
+        apis.add("SceneManager")
     if re.search(
             r"InputManager\s*\.\s*Using(?:Gamepad|Keyboard|Mouse|Phone)\b",
             scan):
@@ -6121,6 +6136,97 @@ def _inline_static_getters(text, cl, plan):
                 text = cs2cpp.code_sub(
                     r"(?<![\w.])%s\b(?!\s*(?:[-+*/%%&|^]|<<|>>|\?\?)?=(?!=))" % pat,
                     "(%s)" % expr, text)
+    return text
+
+
+_SCENE_MANAGER = r"(?<![\w.])(?:UnityEngine\s*\.\s*SceneManagement\s*\.\s*)?SceneManager\s*\.\s*"
+
+
+def _lower_scene_manager(text, string_idents=(), scene_idents=()):
+    """UnityEngine.SceneManagement → the packed SceneManager (a Scene is its
+    build index; loads apply at the start of the next frame).
+
+    ``LoadScene`` / ``LoadSceneAsync`` / ``UnloadSceneAsync`` take a build
+    index, a scene name or path, or a Scene; ``GetActiveScene``,
+    ``GetSceneByBuildIndex`` / ``GetSceneByName``, ``sceneCount`` and
+    ``sceneCountInBuildSettings`` read the scene tables; a Scene's ``name``,
+    ``path``, ``buildIndex`` and ``isLoaded`` do too."""
+    text = cs2cpp.code_sub(
+        r"(?<![\w.])(?:UnityEngine\s*\.\s*SceneManagement\s*\.\s*)?"
+        r"LoadSceneMode\s*\.\s*(Single|Additive)\b",
+        lambda m: "1" if m.group(1) == "Additive" else "0", text)
+    strings = set(string_idents)
+
+    def _is_string(arg):
+        a = arg.strip()
+        while a.startswith("(") and a.endswith(")"):
+            a = a[1:-1].strip()
+        return (a.startswith('"') or a.startswith("$\"")
+                or re.fullmatch(r"\w+", a) is not None and a in strings
+                or re.search(r"\.\s*name\s*$|Scene_name\s*\(|\.\s*ToString\s*\(", a)
+                is not None
+                or re.search(r'"\s*\+|\+\s*"', a) is not None)
+
+    def _calls(t, name_re, emit):
+        out, pos = [], 0
+        pat = re.compile(_SCENE_MANAGER + name_re + r"\s*\(")
+        while True:
+            m = pat.search(t, pos)
+            if not m:
+                break
+            args, end = _match_call_args(t, m.end() - 1)
+            if end <= m.end() - 1:
+                break
+            parts = cs2cpp.split_call_args(args) if args.strip() else []
+            out.append(t[pos:m.start()])
+            out.append(emit(m, parts))
+            pos = end
+        out.append(t[pos:])
+        return "".join(out)
+
+    def _load(m, parts):
+        if not parts:
+            return m.group(0) + ")"
+        mode = parts[1].strip() if len(parts) > 1 else "0"
+        fn = ("SceneManager_LoadSceneName" if _is_string(parts[0])
+              else "SceneManager_LoadScene")
+        return "%s(%s, %s)" % (fn, parts[0].strip(), mode)
+
+    def _unload(m, parts):
+        if len(parts) != 1:
+            return m.group(0) + ", ".join(parts) + ")"
+        fn = ("SceneManager_UnloadSceneName" if _is_string(parts[0])
+              else "SceneManager_UnloadScene")
+        return "%s(%s)" % (fn, parts[0].strip())
+
+    text = _calls(text, r"(?:LoadSceneAsync|LoadScene)", _load)
+    text = _calls(text, r"(?:UnloadSceneAsync|UnloadScene)", _unload)
+    text = cs2cpp.code_sub(_SCENE_MANAGER + r"GetActiveScene\s*\(\s*\)",
+                           "(_engine_scene_active)", text)
+    text = cs2cpp.code_sub(_SCENE_MANAGER + r"GetSceneByBuildIndex\s*\(",
+                           "_engine_scene_by_index(", text)
+    text = cs2cpp.code_sub(_SCENE_MANAGER + r"GetSceneByName\s*\(",
+                           "_engine_scene_index_of(", text)
+    text = cs2cpp.code_sub(_SCENE_MANAGER + r"sceneCountInBuildSettings\b",
+                           "_engine_scene_count", text)
+    text = cs2cpp.code_sub(_SCENE_MANAGER + r"sceneCount\b",
+                           "SceneManager_sceneCount()", text)
+    # Scene members: on a Scene expression in parentheses, or a Scene local.
+    members = {"name": "Scene_name(%s)", "path": "Scene_path(%s)",
+               "isLoaded": "Scene_isLoaded(%s)", "buildIndex": "(%s)"}
+    for _pass in range(4):
+        text = cs2cpp.code_sub(
+            r"\(\s*\(\s*_engine_scene_active\s*\)\s*\)",
+            "(_engine_scene_active)", text)
+    text = cs2cpp.code_sub(
+        r"(\(_engine_scene_active\)"
+        r"|_engine_scene_(?:index_of|by_index)\([^()]*\))"
+        r"\s*\.\s*(name|path|isLoaded|buildIndex)\b",
+        lambda m: members[m.group(2)] % m.group(1), text)
+    for ident in scene_idents:
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])%s\s*\.\s*(name|path|isLoaded|buildIndex)\b" % re.escape(ident),
+            lambda m, ident=ident: members[m.group(1)] % ident, text)
     return text
 
 
@@ -7902,11 +8008,15 @@ def _emit_engine_gameobject_tables(
         p("    return _engine_%s_go_of[i];" % idn)
         p("}")
     if want_find:
+        multi = _multi_scene(plan)
+        if multi:
+            p("static int _engine_go_in_loaded_scene(int go);")
         p("static int GameObject_Find(const char *name) {")
         p("    int i;")
         p("    if (!name) return -1;")
         p("    for (i = 0; i < _engine_go_count; i = i + 1)")
-        p("        if (strcmp(_engine_go_name[i], name) == 0) return i;")
+        p("        if (strcmp(_engine_go_name[i], name) == 0%s) return i;"
+          % (" && _engine_go_in_loaded_scene(i)" if multi else ""))
         p("    return -1;")
         p("}")
         p("")
@@ -9744,6 +9854,359 @@ def _emit_engine_ui_button_clicks(
         p("    (void)hit;")
 
 
+def _multi_scene(plan):
+    """Scenes can be (re)loaded at runtime: more than one build scene, or a
+    script calls SceneManager (reloading the only scene restarts it)."""
+    n = len(plan.get("scenes") or [])
+    return n > 1 or (n == 1 and bool(plan.get("scene_manager")))
+
+
+def _emit_engine_scene_tables(go_authored_n, go_n, p, plan):
+    """_emit_engine_ui: SceneManager build scenes, which are loaded, and the
+    scene each GameObject belongs to. Returns whether there is more than one
+    scene (otherwise nothing is emitted)."""
+    if not _multi_scene(plan):
+        return False
+    scenes = plan["scenes"]
+    sn = len(scenes)
+    seed = [int(s) for s in (plan.get("go_scene") or [])[:go_authored_n]]
+    seed += [0] * (go_n - len(seed))
+    p("/* SceneManager: build scenes in buildIndex order. The first is loaded")
+    p(" * at startup; LoadScene / UnloadSceneAsync requests are applied at the")
+    p(" * start of the next frame (_engine_scene_apply_pending). */")
+    p("static const int _engine_scene_count = %d;" % sn)
+    p("static const char *const _engine_scene_name[%d] = { %s };" % (
+        sn, ", ".join(_c_string(s["name"]) for s in scenes)))
+    p("static const char *const _engine_scene_path[%d] = { %s };" % (
+        sn, ", ".join(_c_string(s["path"]) for s in scenes)))
+    p("static int _engine_scene_loaded[%d] = { %s };" % (
+        sn, ", ".join("1" if i == 0 else "0" for i in range(sn))))
+    p("static int _engine_scene_active = 0;")
+    p("static int _engine_scene_pending = -1;")
+    p("static int _engine_scene_pending_add[%d];" % sn)
+    p("static int _engine_scene_pending_unload[%d];" % sn)
+    p("/* Scene of each GameObject; a root's decides for its children.")
+    p(" * -1 = DontDestroyOnLoad, -2 = a clone destroyed with its scene. */")
+    p("static int _engine_go_scene[%d] = { %s };" % (
+        go_n, ", ".join(str(s) for s in seed)))
+    p("static int _engine_go_root_scene_loaded(int root) {")
+    p("    int s;")
+    p("    if (root < 0 || root >= %d) return 1;" % go_n)
+    p("    s = _engine_go_scene[root];")
+    p("    if (s == -1) return 1;")
+    p("    return s >= 0 && s < %d && _engine_scene_loaded[s];" % sn)
+    p("}")
+    p("static int _engine_scene_str_eq(const char *a, const char *b) {")
+    p("    int i = 0;")
+    p("    if (!a || !b) return 0;")
+    p("    while (a[i] && a[i] == b[i]) i = i + 1;")
+    p("    return a[i] == b[i];")
+    p("}")
+    p("/* Build index for a scene name or path (with or without .unity). */")
+    p("static int _engine_scene_index_of(const char *name) {")
+    p("    int s, i;")
+    p("    char buf[512];")
+    p("    for (s = 0; s < %d; s = s + 1) {" % sn)
+    p("        if (_engine_scene_str_eq(name, _engine_scene_name[s])"
+      " || _engine_scene_str_eq(name, _engine_scene_path[s]))")
+    p("            return s;")
+    p("        i = 0;")
+    p("        while (_engine_scene_path[s][i] && i < 511) {")
+    p("            buf[i] = _engine_scene_path[s][i];")
+    p("            i = i + 1;")
+    p("        }")
+    p("        buf[i] = 0;")
+    p("        if (i > 6) buf[i - 6] = 0; /* drop \".unity\" */")
+    p("        if (_engine_scene_str_eq(name, buf)) return s;")
+    p("    }")
+    p("    return -1;")
+    p("}")
+    p("static void SceneManager_LoadScene(int s, int additive) {")
+    p("    if (s < 0 || s >= %d) {" % sn)
+    p("        fprintf(stderr, \"Cannot load scene: Invalid scene name (empty"
+      " string) and invalid build index %d\\n\", s);")
+    p("        return;")
+    p("    }")
+    p("    if (additive) _engine_scene_pending_add[s] = 1;")
+    p("    else _engine_scene_pending = s;")
+    p("}")
+    p("static void SceneManager_LoadSceneName(const char *name, int additive) {")
+    p("    int s = _engine_scene_index_of(name);")
+    p("    if (s < 0) {")
+    p("        fprintf(stderr, \"Scene '%s' couldn't be loaded because it has"
+      " not been added to the build settings or the AssetBundle has not been"
+      " loaded.\\n\", name ? name : \"\");")
+    p("        return;")
+    p("    }")
+    p("    SceneManager_LoadScene(s, additive);")
+    p("}")
+    p("static void SceneManager_UnloadScene(int s) {")
+    p("    if (s < 0 || s >= %d) return;" % sn)
+    p("    _engine_scene_pending_unload[s] = 1;")
+    p("}")
+    p("static void SceneManager_UnloadSceneName(const char *name) {")
+    p("    SceneManager_UnloadScene(_engine_scene_index_of(name));")
+    p("}")
+    p("static int SceneManager_sceneCount(void) {")
+    p("    int s, n = 0;")
+    p("    for (s = 0; s < %d; s = s + 1) n = n + _engine_scene_loaded[s];" % sn)
+    p("    return n;")
+    p("}")
+    p("static const char *Scene_name(int s) {")
+    p("    return (s >= 0 && s < %d) ? _engine_scene_name[s] : \"\";" % sn)
+    p("}")
+    p("static const char *Scene_path(int s) {")
+    p("    return (s >= 0 && s < %d) ? _engine_scene_path[s] : \"\";" % sn)
+    p("}")
+    p("static int Scene_isLoaded(int s) {")
+    p("    return s >= 0 && s < %d && _engine_scene_loaded[s];" % sn)
+    p("}")
+    p("static int _engine_scene_by_index(int s) {")
+    p("    return (s >= 0 && s < %d) ? s : -1;" % sn)
+    p("}")
+    p("static void _engine_scene_apply_pending(void);")
+    p("")
+    return True
+
+
+_MUTABLE_ARRAY_DECL_RE = re.compile(
+    r"^(?:static|extern) ((?:unsigned |signed )?[A-Za-z_]\w*) (_\w+)"
+    r"((?:\[\d+\])+)(?: = .*|);$", re.M)
+_ANY_ARRAY_DECL_RE = re.compile(
+    r"^(?:static |extern )?(?:const )?(?:unsigned |signed )?[A-Za-z_]\w* "
+    r"(_\w+)((?:\[\d+\])+)", re.M)
+
+
+def _scene_row_groups(text, plan, class_ids):
+    """File-scope mutable arrays of the emitted engine, grouped by what a row
+    is: ``(kind, key, rows, [(type, name, dims)])``. *kind* is ``go`` (a
+    GameObject index), ``class`` (an instance of class *key*), ``owner``
+    (a component whose ``<key>owner_class`` / ``owner_inst`` name its
+    instance) or ``ui`` (an element whose ``<key>go`` names its GameObject).
+    Arrays that fit none (per-scene state, counters, scratch) are left out."""
+    go_n = max(1, len(plan.get("go_names") or [])
+               + int(plan.get("instantiate_go_budget") or 0))
+    declared = {m.group(1): [int(d) for d in re.findall(r"\d+", m.group(2))]
+                for m in _ANY_ARRAY_DECL_RE.finditer(text)}
+    caps = {}
+    for cname in class_ids:
+        cl = plan["classes"][cname]
+        caps[_c_ident(cname)] = (
+            max(1, int(cl["n"]) + _mb_pool_extra(plan, cname)), cname)
+    idns = sorted(caps, key=len, reverse=True)
+    groups = {}
+    for m in _MUTABLE_ARRAY_DECL_RE.finditer(text):
+        ty, name, dims_s = m.group(1), m.group(2), m.group(3)
+        if ty == "const":
+            continue
+        dims = [int(d) for d in re.findall(r"\d+", dims_s)]
+        if name.startswith(("_engine_scene_", "_engine_snap_")) \
+                or name == "_engine_go_scene":
+            continue
+        key = None
+        if name.startswith("_engine_go_") and dims[0] == go_n:
+            key = ("go", "", go_n)
+        else:
+            for idn in idns:
+                if (name.startswith("_%s_" % idn)
+                        or name.startswith("_engine_%s_" % idn)) \
+                        and dims[0] == caps[idn][0]:
+                    key = ("class", caps[idn][1], caps[idn][0])
+                    break
+        if key is None:
+            um = re.match(r"(_engine_ui_[a-z]+_)", name)
+            om = re.match(r"(_[A-Z]\w*?_)", name)
+            if um and (um.group(1) + "go") in declared \
+                    and declared[um.group(1) + "go"][0] == dims[0]:
+                key = ("ui", um.group(1), dims[0])
+            elif om and (om.group(1) + "owner_class") in declared \
+                    and (om.group(1) + "owner_inst") in declared \
+                    and declared[om.group(1) + "owner_class"][0] == dims[0]:
+                key = ("owner", om.group(1), dims[0])
+            elif dims[0] == go_n and name.startswith("_engine_"):
+                key = ("go", "", go_n)
+        if key is None:
+            continue
+        groups.setdefault(key, []).append((ty, name, dims))
+    return [(k[0], k[1], k[2], v) for k, v in sorted(groups.items())]
+
+
+def _emit_engine_scene_apply(lines, plan, class_ids):
+    """emit_engine (last): SceneManager scene transitions.
+
+    The first frame snapshots every per-GameObject / per-instance table
+    (``_scene_row_groups``); loading a scene that was loaded before puts
+    its authored rows back, so it starts as authored, and clears the
+    instances' Awake / Start flags. Unloading a scene destroys the clones
+    spawned into it. DontDestroyOnLoad roots and C# statics are untouched."""
+    p = lines.append
+    text = "\n".join(lines)
+    groups = _scene_row_groups(text, plan, class_ids)
+    sn = len(plan["scenes"])
+    go_auth = len(plan.get("go_names") or [])
+    go_n = max(1, go_auth + int(plan.get("instantiate_go_budget") or 0))
+    parent_mutable = re.search(
+        r"^static int _engine_go_parent\[", text, re.M) is not None
+    destroy = re.search(
+        r"^static int _engine_go_destroyed\[", text, re.M) is not None
+    p("/* ---- SceneManager: scene transitions ---- */")
+    p("static const int _engine_go_scene_authored[%d] = { %s };" % (
+        max(1, go_auth), ", ".join(
+            str(int(s)) for s in (plan.get("go_scene") or [0])[:max(1, go_auth)])))
+    p("static int _engine_scene_snapped;")
+    p("static int _engine_scene_was_loaded[%d];" % sn)
+    for _kind, _key, _rows, arrays in groups:
+        for ty, name, dims in arrays:
+            p("static %s _engine_snap%s%s;" % (
+                ty, name, "".join("[%d]" % d for d in dims)))
+    p("/* An authored GameObject of scene s (not moved to DontDestroyOnLoad). */")
+    p("static int _engine_scene_owns_row(int go, int s) {")
+    p("    if (go < 0 || go >= %d) return 0;" % go_auth)
+    p("    if (_engine_go_scene_authored[go] != s) return 0;")
+    p("    return _engine_go_scene[_engine_go_root(go)] != -1;")
+    p("}")
+
+    def _copy(dst, src, dims, ind, row="i"):
+        idx = "[%s]" % row
+        loops = []
+        for k, d in enumerate(dims[1:]):
+            loops.append((chr(ord("j") + k), d))
+        for v, d in loops:
+            p(ind + "for (%s = 0; %s < %d; %s = %s + 1)" % (v, v, d, v, v))
+            ind += "    "
+            idx += "[%s]" % v
+        p(ind + "%s%s = %s%s;" % (dst, idx, src, idx))
+
+    depth = max([len(d) for _k, _y, _r, a in groups for _t, _n, d in a] or [1])
+    loop_vars = ", ".join(["i"] + [chr(ord("j") + k) for k in range(depth - 1)])
+    p("static void _engine_scene_snapshot(void) {")
+    p("    int %s;" % loop_vars)
+    for _kind, _key, rows, arrays in groups:
+        p("    for (i = 0; i < %d; i = i + 1) {" % rows)
+        for _ty, name, dims in arrays:
+            _copy("_engine_snap" + name, name, dims, "        ")
+        p("    }")
+    p("}")
+    p("static void _engine_scene_restore(int s) {")
+    p("    int %s;" % loop_vars)
+    for kind, key, rows, arrays in groups:
+        if kind == "go":
+            own, limit = "_engine_scene_owns_row(i, s)", min(rows, go_auth)
+        elif kind == "class":
+            idn = _c_ident(key)
+            own = "_engine_scene_owns_row(_engine_go_of_%s((unsigned)i), s)" % idn
+            limit = min(rows, int(plan["classes"][key]["n"]))
+        elif kind == "owner":
+            own = ("_engine_scene_owns_row(_engine_owner_go(%sowner_class[i], "
+                   "(unsigned)%sowner_inst[i]), s)" % (key, key))
+            limit = rows
+            if "_engine_owner_go(" not in text:
+                continue
+        else:
+            own, limit = "_engine_scene_owns_row(%sgo[i], s)" % key, rows
+        if limit <= 0:
+            continue
+        p("    for (i = 0; i < %d; i = i + 1) {" % limit)
+        p("        if (!(%s)) continue;" % own)
+        for _ty, name, dims in arrays:
+            _copy(name, "_engine_snap" + name, dims, "        ")
+        p("    }")
+    p("}")
+    p("static void _engine_scene_unload(int s) {")
+    p("    int go;")
+    p("    _engine_scene_loaded[s] = 0;")
+    p("    for (go = %d; go < _engine_go_count && go < %d; go = go + 1) {"
+      % (go_auth, go_n))
+    p("        if (_engine_go_scene[_engine_go_root(go)] != s) continue;")
+    if parent_mutable:
+        p("        _engine_go_parent[go] = -1;")
+    if destroy:
+        p("        _engine_go_destroyed[go] = 1;")
+    p("        _engine_go_scene[go] = -2;")
+    p("    }")
+    p("}")
+    p("static void _engine_scene_load(int s) {")
+    p("    if (_engine_scene_was_loaded[s]) _engine_scene_restore(s);")
+    p("    _engine_scene_was_loaded[s] = 1;")
+    p("    _engine_scene_loaded[s] = 1;")
+    p("}")
+    _emit_engine_scene_camera(p, plan)
+    p("static void _engine_scene_apply_pending(void) {")
+    p("    int s;")
+    p("    if (!_engine_scene_snapped) {")
+    p("        _engine_go_active_init();")
+    p("        _engine_scene_snapshot();")
+    p("        _engine_scene_snapped = 1;")
+    p("        _engine_scene_was_loaded[0] = 1;")
+    p("    }")
+    p("    if (_engine_scene_pending >= 0) {")
+    p("        int t = _engine_scene_pending;")
+    p("        _engine_scene_pending = -1;")
+    p("        for (s = 0; s < %d; s = s + 1)" % sn)
+    p("            if (_engine_scene_loaded[s]) _engine_scene_unload(s);")
+    p("        _engine_scene_load(t);")
+    p("        _engine_scene_active = t;")
+    p("        _engine_scene_set_camera(t);")
+    p("    }")
+    p("    for (s = 0; s < %d; s = s + 1) {" % sn)
+    p("        if (!_engine_scene_pending_add[s]) continue;")
+    p("        _engine_scene_pending_add[s] = 0;")
+    p("        if (!_engine_scene_loaded[s]) _engine_scene_load(s);")
+    p("    }")
+    p("    for (s = 0; s < %d; s = s + 1) {" % sn)
+    p("        if (!_engine_scene_pending_unload[s]) continue;")
+    p("        _engine_scene_pending_unload[s] = 0;")
+    p("        /* Unity refuses to unload the last loaded scene. */")
+    p("        if (!_engine_scene_loaded[s] || SceneManager_sceneCount() < 2)")
+    p("            continue;")
+    p("        _engine_scene_unload(s);")
+    p("        if (_engine_scene_active == s) {")
+    p("            int k;")
+    p("            for (k = 0; k < %d; k = k + 1)" % sn)
+    p("                if (_engine_scene_loaded[k]) { _engine_scene_active = k; break; }")
+    p("        }")
+    p("    }")
+    p("}")
+    p("")
+
+
+def _emit_engine_scene_camera(p, plan):
+    """_emit_engine_scene_apply: Camera.main becomes the loaded scene's
+    MainCamera (else its first Camera); a scene without one keeps the last."""
+    if not plan.get("camera"):
+        p("static void _engine_scene_set_camera(int s) { (void)s; }")
+        return
+    sn = len(plan["scenes"])
+    per = []
+    for s in range(sn):
+        cams = [c for c in (plan.get("cameras") or []) if int(c.get("scene") or 0) == s]
+        main = next((c for c in cams if c.get("main")), cams[0] if cams else None)
+        per.append(main)
+    fields = (
+        ("pos_x", lambda c: c["pos"][0]), ("pos_y", lambda c: c["pos"][1]),
+        ("pos_z", lambda c: c["pos"][2]),
+        ("orthographicSize", lambda c: c["orthographic_size"]),
+        ("nearClipPlane", lambda c: c.get("near_clip", 0.3)),
+        ("farClipPlane", lambda c: c.get("far_clip", 1000.0)),
+        ("background_r", lambda c: c["bg_r"]), ("background_g", lambda c: c["bg_g"]),
+        ("background_b", lambda c: c["bg_b"]),
+    )
+    p("static const int _engine_scene_has_camera[%d] = { %s };" % (
+        sn, ", ".join("1" if c else "0" for c in per)))
+    for fname, get in fields:
+        p("static const float _engine_scene_cam_%s[%d] = { %s };" % (
+            fname, sn, ", ".join(
+                "%sf" % repr(float(get(c))) if c else "0.f" for c in per)))
+    p("static const int _engine_scene_cam_orthographic[%d] = { %s };" % (
+        sn, ", ".join(str(int(c["orthographic"])) if c else "0" for c in per)))
+    p("static void _engine_scene_set_camera(int s) {")
+    p("    if (s < 0 || s >= %d || !_engine_scene_has_camera[s]) return;" % sn)
+    for fname, _get in fields:
+        p("    Camera_main_%s = _engine_scene_cam_%s[s];" % (fname, fname))
+    p("    Camera_main_orthographic = _engine_scene_cam_orthographic[s];")
+    p("}")
+
+
 def _emit_engine_ui(
         go_authored_n, go_n, go_spawn_budget, p, plan, ui_buttons, ui_eventtriggers,
         ui_scrollbars, ui_scrollrects, ui_sliders, ui_toggles, want_live_rt, want_ui):
@@ -9759,6 +10222,7 @@ def _emit_engine_ui(
     ] + [1] * go_spawn_budget
     if not go_active:
         go_active = [1]
+    multi_scene = _emit_engine_scene_tables(go_authored_n, go_n, p, plan)
     p("/* GameObject.activeSelf — host pointer + authored Button */")
     p("static int _engine_go_active[%d];" % go_n)
     p("static int _engine_go_active_inited;")
@@ -9774,15 +10238,41 @@ def _emit_engine_ui(
     p("}")
     p("static int _engine_go_active_in_hierarchy(int go) {")
     p("    int guard = 0;")
+    if multi_scene:
+        p("    int root = go;")
     p("    _engine_go_active_init();")
     p("    while (go >= 0 && go < %d && guard < %d) {"
       % (go_n, go_n + 2))
     p("        if (!_engine_go_active[go]) return 0;")
+    if multi_scene:
+        p("        root = go;")
     p("        go = _engine_go_parent[go];")
     p("        guard = guard + 1;")
     p("    }")
-    p("    return 1;")
+    if multi_scene:
+        p("    return _engine_go_root_scene_loaded(root);")
+    else:
+        p("    return 1;")
     p("}")
+    if multi_scene:
+        p("static int _engine_go_root(int go) {")
+        p("    int guard = 0;")
+        p("    while (go >= 0 && go < %d && guard < %d"
+          " && _engine_go_parent[go] >= 0) {" % (go_n, go_n + 2))
+        p("        go = _engine_go_parent[go];")
+        p("        guard = guard + 1;")
+        p("    }")
+        p("    return go;")
+        p("}")
+        p("static int _engine_go_in_loaded_scene(int go) {")
+        p("    return _engine_go_root_scene_loaded(_engine_go_root(go));")
+        p("}")
+        p("/* Object.DontDestroyOnLoad: only a root GameObject moves (Unity). */")
+        p("static void Object_DontDestroyOnLoad(int go) {")
+        p("    if (go < 0 || go >= %d || _engine_go_parent[go] >= 0) return;"
+          % go_n)
+        p("    _engine_go_scene[go] = -1;")
+        p("}")
     p("static void GameObject_SetActive(int go, int active) {")
     p("    _engine_go_active_init();")
     p("    if (go < 0 || go >= %d) return;" % go_n)
@@ -10253,6 +10743,8 @@ def _emit_engine_instantiate(
                 p("    go = _engine_go_count;")
                 p("    _engine_go_count = _engine_go_count + 1;")
             p("    _engine_go_name[go] = \"(Clone)\";")
+            if _multi_scene(plan):
+                p("    _engine_go_scene[go] = _engine_scene_active;")
             if want_ui:
                 # Instantiate copies activeSelf from the source GO.
                 p("    _engine_go_active_init();")
@@ -10409,6 +10901,8 @@ def _emit_engine_find_object_of_type(
             p("    for (go = 0; go < _engine_go_count; go = go + 1) {")
             if want_destroy:
                 p("        if (_engine_go_destroyed[go]) continue;")
+            if _multi_scene(plan):
+                p("        if (!_engine_go_in_loaded_scene(go)) continue;")
             p("        ci = _engine_go_%s[go];" % idn)
             p("        if (ci < 0) continue;")
             if want_ui:
@@ -10434,6 +10928,8 @@ def _emit_engine_find_object_of_type(
             p("        if (go >= 0 && go < _engine_go_count")
             if want_destroy:
                 p("            && !_engine_go_destroyed[go]")
+            if _multi_scene(plan):
+                p("            && _engine_go_in_loaded_scene(go)")
             p("            && _engine_go_%s[go] == %s_instance)"
               % (idn, idn))
             p("            return %s_instance;" % idn)
@@ -10909,6 +11405,7 @@ def _emit_engine_class_groups(
                 "path": _assets_rel_path(c.get("path") or cl.get("path") or ""),
                 "body_abs": int(m.get("body_abs") or 0),
                 "file_text": c.get("file_text") or "",
+                "args": m.get("args") or "",
             }
             body = _lower_method_body(
                 m["body"], cl, plan, site=site,
@@ -11070,12 +11567,23 @@ def _emit_engine_class_groups(
             p("")
             continue
 
-        if has_awake or has_start:
+        # Several scenes: only instances in a loaded scene run, and each
+        # authored instance gets Awake / Start when its scene (re)loads.
+        multi = _multi_scene(plan)
+        live = ("_engine_go_in_loaded_scene(_engine_go_of_%s((unsigned)n))"
+                % idn)
+        if multi and (has_awake or has_start):
+            p("/* Awake (1) / Start (2) done, per instance (scene reloads clear it) */")
+            p("static unsigned char _%s_life[%d];"
+              % (idn, max(1, int(cl["n"]) + _mb_pool_extra(plan, cname))))
+        elif has_awake or has_start:
             p("static int _%s_started = 0;" % idn)
         p("void %s_FixedTick(void) {" % idn)
         if has_fixed:
             p("    int n;")
             p("    for (n = 0; n < _%s_inst_count; n = n + 1) {" % idn)
+            if multi:
+                p("        if (!%s) continue;" % live)
             _call_script("FixedUpdate", "        ")
             p("    }")
         else:
@@ -11085,7 +11593,19 @@ def _emit_engine_class_groups(
         p("void %s_Tick(void) {" % idn)
         if has_awake or has_start or has_update:
             p("    int n;")
-        if has_awake or has_start:
+        if multi and (has_awake or has_start):
+            for method, bit in (("Awake", 1), ("Start", 2)):
+                if not (has_awake if method == "Awake" else has_start):
+                    continue
+                p("    for (n = 0; n < _%s_inst_count && n < %d; n = n + 1) {"
+                  % (idn, int(cl["n"])))
+                p("        if ((_%s_life[n] & %d) || !%s) continue;"
+                  % (idn, bit, live))
+                p("        _%s_life[n] = (unsigned char)(_%s_life[n] | %d);"
+                  % (idn, idn, bit))
+                _call_script(method, "        ")
+                p("    }")
+        elif has_awake or has_start:
             p("    if (!_%s_started) {" % idn)
             p("        _%s_started = 1;" % idn)
             if has_awake:
@@ -11107,6 +11627,8 @@ def _emit_engine_class_groups(
                 p("            if (_dgo >= 0 && _engine_go_destroyed[_dgo])")
                 p("                continue;")
                 p("        }")
+            if multi:
+                p("        if (!%s) continue;" % live)
             _call_script("Update", "        ")
             p("    }")
         elif not has_awake and not has_start:
@@ -11796,6 +12318,31 @@ def _emit_engine_box2d_exports(
             p("    if (a < 0 || b < 0) return;")
         p("}")
         p("")
+        if plan.get("physics2d_live"):
+            p("/* Whether a body's GameObject is in the simulation (active, in a")
+            p(" * loaded scene); the glue disables the bodies that are not. */")
+            p("static int _engine_owner_go(int oc, unsigned oi) {")
+            p("    switch (oc) {")
+            for cname, cid in sorted(class_ids.items(), key=lambda kv: kv[1]):
+                p("    case %d: return _engine_go_of_%s(oi);"
+                  % (cid, _c_ident(cname)))
+            p("    default: return -1;")
+            p("    }")
+            p("}")
+            p("int engine_rb2d_live(int rb) {")
+            p("    int go = _engine_owner_go(_Rigidbody2D_owner_class[rb],")
+            p("                              (unsigned)_Rigidbody2D_owner_inst[rb]);")
+            p("    return go < 0 || _engine_go_active_in_hierarchy(go);")
+            p("}")
+            p("int engine_col2d_live(int ci) {")
+            if want_col2d and col2d_list:
+                p("    int go = _engine_owner_go(_Collider2D_owner_class[ci],")
+                p("                              (unsigned)_Collider2D_owner_inst[ci]);")
+                p("    return go < 0 || _engine_go_active_in_hierarchy(go);")
+            else:
+                p("    return ci >= 0;")
+            p("}")
+            p("")
 
 
 def _emit_engine_physics_fixed(
@@ -12436,7 +12983,9 @@ def emit_engine(plan, analyses, used_apis):
                or bool(ui_scrollrects) or bool(ui_toggles)
                or bool(ui_eventtriggers)
                or ("GameObject.SetActive" in used_apis)
-               or authored_inactive or _plan_has_ui_draws(plan))
+               or authored_inactive or _plan_has_ui_draws(plan)
+               or _multi_scene(plan))
+    plan["physics2d_live"] = _multi_scene(plan)
     rt_apis = (
         "rectTransform.anchoredPosition" in used_apis
         or "rectTransform.sizeDelta" in used_apis)
@@ -13437,6 +13986,8 @@ def emit_engine(plan, analyses, used_apis):
     p("    int _fixed_guard;")
     p("    if (_dt > 0.33333334f) _dt = 0.33333334f; /* Time.maximumDeltaTime */")
     p("    if (_dt < 0.f) _dt = 0.f;")
+    if _multi_scene(plan):
+        p("    _engine_scene_apply_pending();")
     if "Time.time" in used_apis:
         p("    Time_time = Time_time + Time_deltaTime;")
     if want_ui:
@@ -13592,6 +14143,8 @@ def emit_engine(plan, analyses, used_apis):
     p("    return n;")
     p("}")
     p("")
+    if _multi_scene(plan):
+        _emit_engine_scene_apply(lines, plan, class_ids)
     return "\n".join(lines) + "\n"
 
 
@@ -15499,6 +16052,27 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = _inline_static_getters(text, cl, plan)
     if null_handle is not None:
         text = cs2cpp._lower_null_compares(text, null_handle)
+    ddol = r"(?<![\w.])(?:(?:UnityEngine\s*\.\s*)?Object\s*\.\s*)?DontDestroyOnLoad\s*\(\s*"
+    if _multi_scene(plan) and plan.get("go_names"):
+        params = cs2cpp.parse_params((site or {}).get("args") or "")
+        file_text = (site or {}).get("file_text") or ""
+        strings = {prm.name for prm in params if prm.type in ("string", "String")}
+        strings |= set(re.findall(r"\bstring\s+(\w+)\s*[;=,)]", file_text))
+        scenes = {prm.name for prm in params if prm.type.split(".")[-1] == "Scene"}
+        scenes |= set(re.findall(r"(?<![\w.])Scene\s+(\w+)\s*[;=]", text))
+        text = _lower_scene_manager(text, strings, scenes)
+        text = cs2cpp.code_sub(
+            r"(?<![\w.])(?:UnityEngine\s*\.\s*SceneManagement\s*\.\s*)?Scene"
+            r"(?=\s+\w+\s*[;=])", "int", text)
+        text = cs2cpp.code_sub(
+            ddol + r"(?:gameObject|this|transform)\s*\)",
+            "Object_DontDestroyOnLoad(_engine_go_of_%s(i))" % idn, text)
+        text = cs2cpp.code_sub(ddol, "Object_DontDestroyOnLoad(", text)
+    else:
+        # One scene that is never reloaded: nothing is ever unloaded.
+        text = cs2cpp.code_sub(
+            ddol + r"(?:gameObject|this|transform)\s*\)",
+            "/* DontDestroyOnLoad */ (void)0", text)
     # Collections: cs2cpp lowers them from what the plan says about each
     # class (maps before lists, so a two-argument `Add` is a map's).
     text = cs2cpp.lower_packed_collections(
@@ -17782,6 +18356,7 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
     plan["getcomponentsinchildren_types"] = sorted(gcic_types)
     plan["mb_bases"] = _collect_mb_bases(analyses)
     plan["interfaces"] = _collect_interfaces(analyses)
+    plan["scene_manager"] = "SceneManager" in used_apis
     plan["static_getters"] = _collect_static_getters(analyses)
     plan["addcomponent_types"] = sorted(add_types)
     plan["addcomponent_budget"] = _addcomponent_budget(analyses, plan)
@@ -17860,6 +18435,9 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
     plan["go_names"] = go_names
     plan["go_has_sprite"] = sorted(_gos_with_sprite(plan))
     plan["go_active"] = _build_go_active(plan, go_names)
+    plan["scenes"] = list(
+        getattr(_load_scenes_lights_cameras, "scenes", None) or [])
+    plan["go_scene"] = _build_go_scene(plan, go_names)
     plan["go_components"] = go_comps
     plan["go_ui_components"] = _build_go_ui_component_maps(plan, analyses)
     plan["go_parents"] = _build_go_parents(plan)

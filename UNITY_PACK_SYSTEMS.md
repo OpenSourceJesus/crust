@@ -314,9 +314,9 @@ targets:
   (PersistentListenerMode.String), including PrefabInstance overrides that
   target a stripped MB fileID — resolved through `mb_ids` / script guid →
   class instance; `engine_ui_tick` calls `Class_Method(instance, "arg")`.
-  Only methods that exist as lowered C on packed classes are wired. Bodies
-  that still call `SceneManager.LoadScene` / custom scene loaders may stub;
-  the click still invokes the method. Void MB methods (mode Void) are also
+  Only methods that exist as lowered C on packed classes are wired
+  (`SceneManager.LoadScene` bodies lower; see Build scenes and
+  SceneManager). Void MB methods (mode Void) are also
   emitted when present.
 Inactive parents hide children (`activeInHierarchy`). Authored
 `m_IsActive: 0` seeds `_engine_go_active` at load (not forced on).
@@ -572,16 +572,44 @@ known builtins (`SpriteRenderer`, RB, uGUI, …) only — unknown `T` → CS0246
 Pack / crust / cpprust failures report as Unity/csc diagnostics
 (`Assets/…(line,col): error CSxxxx: …`), not raw `engine.cpp` subset prose.
 
-## Startup scene (EditorBuildSettings)
+## Build scenes and SceneManager (EditorBuildSettings)
 
-Pack loads **only the first enabled** scene in
-`ProjectSettings/EditorBuildSettings.asset`. Other enabled scenes are not
-merged into the startup world (no invent of `SceneManager.LoadScene` yet).
+Pack loads **every enabled** scene in
+`ProjectSettings/EditorBuildSettings.asset`, in build order; the build
+index is the position among enabled entries, and the first one is loaded
+at startup. An enabled entry whose `.unity` is missing is a `PackError`.
 Scenes absent from build settings (and disabled build entries) are not
-packed — vendor demo `.unity` files under `Assets/` stay out.
+packed — vendor demo `.unity` files under `Assets/` stay out. fileIDs are
+unique only per scene file, so scene *n* ≥ 1 has its local fileIDs XORed
+with `n << 56` before parsing (guid-qualified references are left alone).
 
 When `EditorBuildSettings.asset` is missing (tiny fixtures), every `.unity`
-under `Assets/` is used.
+under `Assets/` is used, sorted by path.
+
+With more than one scene (or one scene whose scripts use `SceneManager`)
+the engine carries a scene runtime (`_engine_scene_*`):
+
+| Script uses | Emitted |
+|-------------|---------|
+| `SceneManager.LoadScene(name \| path \| index[, LoadSceneMode.Single])` | Applied at the start of the next frame: every loaded scene is unloaded, the target loaded and made active, its main Camera becomes current |
+| `LoadScene(…, LoadSceneMode.Additive)` / `LoadSceneAsync` | Target loaded alongside (async completes on the next frame) |
+| `SceneManager.UnloadSceneAsync` / `UnloadScene` | Scene unloaded next frame (the last loaded scene is not) |
+| `GetActiveScene()` / `GetSceneByBuildIndex` / `GetSceneByName` | Scene index; `.name`, `.path`, `.isLoaded`, `.buildIndex` |
+| `SceneManager.sceneCount` / `sceneCountInBuildSettings` | Loaded / packed scene counts |
+| `DontDestroyOnLoad(gameObject)` | Root GameObject leaves its scene and survives unloads |
+| Static get-only property `return expr;` (`CurrentScene => SceneManager.GetActiveScene()`) | Inlined at reads |
+
+An unloaded scene's objects are frozen: no Awake / Start / Update /
+FixedUpdate, no draws, UI or physics (Box2D bodies are disabled through the
+`physics2d_live` gate), and `GameObject.Find` / `FindObjectOfType` /
+`T.Instance` skip them. Loading a scene again restores every per-GameObject,
+per-instance and UI row it owns to the authored values snapshotted on the
+first frame, and Awake / Start run again; clones spawned into a scene are
+destroyed with it. C# statics persist across loads, as in Unity. A
+`DontDestroyOnLoad` object is not duplicated when its scene reloads (Unity
+instantiates a second copy, which singleton scripts usually destroy).
+Methods returning `AsyncOperation` are still stubbed (all non-void methods
+are).
 
 Full script analyze is limited to project `.cs` files referenced by
 startup-scene / source-prefab `m_Script` guids (and joined `object["script"]`

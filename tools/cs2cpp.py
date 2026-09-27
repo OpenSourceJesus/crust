@@ -508,7 +508,8 @@ OWNED = ObjectModel()
 _PACKED_STRING_CALLS = ("Application_dataPath()",
                         "Application_persistentDataPath()",
                         "Application_productName()",
-                        "StreamReader_ReadLine(")
+                        "StreamReader_ReadLine(",
+                        "Scene_name(", "Scene_path(")
 
 
 def packed_model(has_objects, byte_arrays=False, elem_type=None):
