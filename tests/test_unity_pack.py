@@ -33,7 +33,9 @@ sys.path.insert(0, ROOT)
 import tools.cs2cpp as cs2cpp  # noqa: E402
 import tools.unity_pack as unity_pack  # noqa: E402
 
-PROJECT = os.path.join(ROOT, "examples", "unity_pack", "MiniScene")
+# MiniScene, the small board-and-coins project the emit tests pack. The copy in
+# examples/ is scripts-only (see .gitignore), so the tests use this complete one.
+PROJECT = os.path.join(ROOT, "tests", "fixtures", "MiniScene")
 _CC = shutil.which("gcc") or shutil.which("cc")
 needs_cc = unittest.skipIf(_CC is None, "no C compiler")
 
@@ -7155,11 +7157,12 @@ class TestSystems(unittest.TestCase):
             raw = b""
             for _y in range(h):
                 raw += b"\x00" + (b"\xff\xff\xff\xff" * w)
-            open(path, "wb").write(
-                b"\x89PNG\r\n\x1a\n"
-                + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
-                + chunk(b"IDAT", zlib.compress(raw, 9))
-                + chunk(b"IEND", b""))
+            with open(path, "wb") as png:
+                png.write(
+                    b"\x89PNG\r\n\x1a\n"
+                    + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+                    + chunk(b"IDAT", zlib.compress(raw, 9))
+                    + chunk(b"IEND", b""))
 
         write_png(os.path.join(spr, "q.png"), 8, 8)
         with open(os.path.join(spr, "q.png.meta"), "w") as f:
@@ -7269,11 +7272,12 @@ class TestSystems(unittest.TestCase):
             raw = b""
             for _y in range(h):
                 raw += b"\x00" + (b"\xff\x00\x00\xff" * w)
-            open(path, "wb").write(
-                b"\x89PNG\r\n\x1a\n"
-                + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
-                + chunk(b"IDAT", zlib.compress(raw, 9))
-                + chunk(b"IEND", b""))
+            with open(path, "wb") as png:
+                png.write(
+                    b"\x89PNG\r\n\x1a\n"
+                    + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+                    + chunk(b"IDAT", zlib.compress(raw, 9))
+                    + chunk(b"IEND", b""))
 
         write_png(os.path.join(spr_dir, "btn.png"), 8, 8)
         with open(os.path.join(spr_dir, "btn.png.meta"), "w") as f:
@@ -10837,11 +10841,12 @@ class TestSystems(unittest.TestCase):
             raw = b""
             for _y in range(h):
                 raw += b"\x00" + (b"\xff\xff\xff\xff" * w)
-            open(path, "wb").write(
-                b"\x89PNG\r\n\x1a\n"
-                + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
-                + chunk(b"IDAT", zlib.compress(raw, 9))
-                + chunk(b"IEND", b""))
+            with open(path, "wb") as png:
+                png.write(
+                    b"\x89PNG\r\n\x1a\n"
+                    + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+                    + chunk(b"IDAT", zlib.compress(raw, 9))
+                    + chunk(b"IEND", b""))
 
         write_png(os.path.join(spr, "q.png"), 8, 8)
         with open(os.path.join(spr, "q.png.meta"), "w") as f:
@@ -14250,14 +14255,16 @@ class TestBox2DPhysicsBackend(unittest.TestCase):
         root = self._project()
         d = tempfile.mkdtemp(prefix="upack-b2d-none-")
         old = os.environ.pop("BOX2D_PACKED_ROOT", None)
-        find = unity_pack.find_box2d_root
-        unity_pack.find_box2d_root = lambda box2d_root=None: None
+        # Patch where _load_box2d_unity looks it up (unity_pack_physics).
+        import tools.unity_pack_physics as physics
+        find = physics.find_box2d_root
+        physics.find_box2d_root = lambda box2d_root=None: None
         try:
             with contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaises(unity_pack.PackError) as cm:
                     unity_pack.pack(root, d, force=True)
         finally:
-            unity_pack.find_box2d_root = find
+            physics.find_box2d_root = find
             if old is not None:
                 os.environ["BOX2D_PACKED_ROOT"] = old
         self.assertIn("BOX2D_PACKED_ROOT", cm.exception.message)
