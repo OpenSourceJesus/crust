@@ -6374,6 +6374,13 @@ def _rewrite_mb_static_and_singleton(text, plan, cl):
                 "Vector2_make(%s_get_%s_x(%s), %s_get_%s_y(%s))"
                 % (oidn, vf, inst, oidn, vf, inst),
                 text)
+        for f in sorted((ocl.get("class_consts") or []),
+                        key=lambda f: -len(f["name"])):
+            if _is_scalar_static(f):
+                text = cs2cpp.code_sub(
+                    r"(?<![\w.])%s\s*\.\s*%s\b(?!\s*\()"
+                    % (re.escape(ocname), re.escape(f["name"])),
+                    "%s_%s" % (oidn, f["name"]), text)
         member_names = {n for n, _t, _b, _k in (ocl.get("members") or [])}
         for mem in sorted(member_names, key=len, reverse=True):
             if mem.endswith("_x") or mem.endswith("_y") or mem.endswith("_z"):
@@ -11201,10 +11208,74 @@ def _emit_engine_live_rotation(p, want_live_rot):
         p("")
 
 
+def _emit_class_scalar_statics(p, plan, cl, idn):
+    """emit_engine: a class's scalar const / static fields, ahead of
+    every class group so other classes' methods can use them."""
+    # Class-level const / static fields (FRAME_CNT, LOG_FILE_PATH, …).
+    data_path = plan.get("data_path") or ""
+    persistent_path = plan.get("persistent_data_path") or ""
+    for f in cl.get("class_consts") or []:
+        fname = f["name"]
+        default = f.get("default")
+        if f.get("ty") == "string":
+            if isinstance(default, dict) and default.get("kind") == "dataPath+":
+                path = data_path + (default.get("suffix") or "")
+            elif isinstance(default, dict) and default.get("kind") == "dataPath":
+                path = data_path
+            elif (isinstance(default, dict)
+                  and default.get("kind") == "persistentDataPath+"):
+                path = persistent_path + (default.get("suffix") or "")
+            elif (isinstance(default, dict)
+                  and default.get("kind") == "persistentDataPath"):
+                path = persistent_path
+            elif isinstance(default, str):
+                path = default
+            else:
+                path = ""
+            p("static const char %s_%s[] = %s;" % (
+                idn, fname, _c_string(path)))
+        elif f.get("ty") == "bool":
+            # `static bool flag;` / `= false` — mutable unless C# const.
+            truthy = default in (True, 1, "true", "True")
+            init = 1 if truthy else 0
+            if f.get("const"):
+                p("static const int %s_%s = %d;" % (idn, fname, init))
+            else:
+                p("static int %s_%s = %d;" % (idn, fname, init))
+        elif (isinstance(default, (int, float))
+              or (default is None
+                  and f.get("ty") in _STATIC_NUMERIC_TYPES)):
+            # C# `const` stays const; a plain `static` is mutable, and an
+            # uninitialized one starts at 0 as in C#.
+            qual = "static const" if f.get("const") else "static"
+            val = default if default is not None else 0
+            if f.get("ty") in ("float", "double"):
+                p("%s float %s_%s = %sf;" % (
+                    qual, idn, fname, repr(float(val))))
+            else:
+                p("%s int %s_%s = %d;" % (
+                    qual, idn, fname, int(val)))
+        elif f.get("ty") in ("StreamWriter", "StreamReader"):
+            p("static FILE *%s_%s;" % (idn, fname))
+        # List / Dictionary / SortedList / ref arrays: preamble above.
+    if any(_is_scalar_static(f) for f in (cl.get("class_consts") or [])):
+        p("")
+
+
+def _is_scalar_static(f):
+    """A class const / static field `_emit_class_scalar_statics` emits as a
+    plain `Class_name` C variable."""
+    return (f.get("ty") in ("string", "bool", "StreamWriter", "StreamReader")
+            or isinstance(f.get("default"), (int, float))
+            or (f.get("default") is None
+                and f.get("ty") in _STATIC_NUMERIC_TYPES))
+
+
 def _emit_engine_static_collections(_emitted_coll, p, plan):
     """emit_engine: Class-level static List / Dictionary storage."""
     for cname, cl in sorted(plan["classes"].items()):
         idn = _c_ident(cname)
+        _emit_class_scalar_statics(p, plan, cl, idn)
         cap = max(1, int(cl.get("n") or 0))
         for f in cl.get("class_consts") or []:
             if _list_elem_name(f.get("ty") or ""):
@@ -11258,62 +11329,6 @@ def _emit_engine_class_groups(
         p("/* ---- %s group: instance array is defined in data.c ---- */" % idn)
         p("#define %s_AT(i) (_%s_inst_array[(i)])" % (idn, idn))
         p("")
-        # Class-level const / static fields (FRAME_CNT, LOG_FILE_PATH, …).
-        data_path = plan.get("data_path") or ""
-        persistent_path = plan.get("persistent_data_path") or ""
-        for f in cl.get("class_consts") or []:
-            fname = f["name"]
-            default = f.get("default")
-            if f.get("ty") == "string":
-                if isinstance(default, dict) and default.get("kind") == "dataPath+":
-                    path = data_path + (default.get("suffix") or "")
-                elif isinstance(default, dict) and default.get("kind") == "dataPath":
-                    path = data_path
-                elif (isinstance(default, dict)
-                      and default.get("kind") == "persistentDataPath+"):
-                    path = persistent_path + (default.get("suffix") or "")
-                elif (isinstance(default, dict)
-                      and default.get("kind") == "persistentDataPath"):
-                    path = persistent_path
-                elif isinstance(default, str):
-                    path = default
-                else:
-                    path = ""
-                p("static const char %s_%s[] = %s;" % (
-                    idn, fname, _c_string(path)))
-            elif f.get("ty") == "bool":
-                # `static bool flag;` / `= false` — mutable unless C# const.
-                truthy = default in (True, 1, "true", "True")
-                init = 1 if truthy else 0
-                if f.get("const"):
-                    p("static const int %s_%s = %d;" % (idn, fname, init))
-                else:
-                    p("static int %s_%s = %d;" % (idn, fname, init))
-            elif (isinstance(default, (int, float))
-                  or (default is None
-                      and f.get("ty") in _STATIC_NUMERIC_TYPES)):
-                # C# `const` stays const; a plain `static` is mutable, and an
-                # uninitialized one starts at 0 as in C#.
-                qual = "static const" if f.get("const") else "static"
-                val = default if default is not None else 0
-                if f.get("ty") in ("float", "double"):
-                    p("%s float %s_%s = %sf;" % (
-                        qual, idn, fname, repr(float(val))))
-                else:
-                    p("%s int %s_%s = %d;" % (
-                        qual, idn, fname, int(val)))
-            elif f.get("ty") in ("StreamWriter", "StreamReader"):
-                p("static FILE *%s_%s;" % (idn, fname))
-            # List / Dictionary / SortedList / ref arrays: preamble above.
-        if any(
-                f.get("ty") == "string"
-                or f.get("ty") == "bool"
-                or isinstance(f.get("default"), (int, float))
-                or (f.get("default") is None
-                    and f.get("ty") in _STATIC_NUMERIC_TYPES)
-                or f.get("ty") in ("StreamWriter", "StreamReader")
-                for f in (cl.get("class_consts") or [])):
-            p("")
         # Position accessors: SoA table or AoS fields.
         if cl.get("soa_dims"):
             logical = _soa_axis_count(cl)

@@ -101,6 +101,7 @@ Unity's `UnityException` / `TypeInitializationException` every frame and
 | `FindObjectOfType<T>(includeInactive?)` | Scan live `_engine_go_T[]` (skip Destroyed; optional inactive) → first index or **-1** |
 | `T.Instance` / `T.instance` | ``T_Instance()`` — cache until destroyed/missing, then ``FindObjectOfType<T>(true)`` |
 | Bare `instance = this` (singleton Awake) | ``T_instance = i`` (sets the same cache field ``T_Instance()`` reads) |
+| `T.staticField` (bool / number / string) | ``T_staticField`` (class statics are emitted before every class group) |
 | `Find(...).GetComponent<T>().field` | NRE if Find missed or component/field receiver is null |
 | `transform.Find(name)` / nested `"A/B"` | Child GO via **live** parent table (seeded from authored `m_Father`; updated by `SetParent`) → index or **-1** |
 | `go.transform.Find` / `Transform` local `.Find` | Same — receiver is the live GO index |
