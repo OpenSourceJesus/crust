@@ -280,6 +280,44 @@ packer does not invent ParticleSystem pools, Canvas/UI, or InputAction maps.
 Authored AnimationClips / AnimatorControllers and Rigidbodies are packed.
 Fixture: `examples/unity_pack/SystemsScene`.
 
+## Source layout
+
+`tools/unity_pack.py` is split by subsystem. Each module holds whole
+functions moved out of it unchanged, and unity_pack re-exports every name,
+so `unity_pack.<name>` keeps working for callers and tests. Modules import
+only the ones above them in this list:
+
+| Module | Contents |
+|--------|----------|
+| `unity_pack_common.py` | `PackError`, progress output, shared leaf helpers |
+| `unity_pack_physics.py` | Rigidbody / Collider tables, physics materials, collision messages, the Box2D-Packed checkout |
+| `unity_pack_sprites.py` | PNG decoding, sprite sheets, texture GUIDs, sprite sorting |
+| `unity_pack_ui.py` | uGUI: RectTransform, Canvas / CanvasScaler, Image, Button, Toggle, Slider, Scrollbar, ScrollRect, EventTrigger, layout groups, TextMeshPro |
+| `unity_pack_anim.py` | AnimationClip / AnimatorController parsing, keyframes, animation tables |
+| `unity_pack_audio.py` | AudioSource tables and API rewrites |
+| `unity_pack_build.py` | Makefile and player executable, including the Box2D-Packed glue |
+| `unity_pack.py` | scene import, script analysis and lowering, `emit_engine`, `emit_data`, `pack`, CLI |
+
+The split was checked by importing the old and new code side by side: every
+top-level name is still present, every function's bytecode is identical, and
+packed output is byte-identical. `parse_unity_yaml` (about 1,100 lines) is
+still a single function.
+
+`emit_engine` was one 6,300-line function. It is now about 1,300 lines that
+call 34 section functions, `_emit_engine_*`, in emission order, none longer
+than about 400 lines: `_emit_engine_debug_log`, `_emit_engine_gameobject_tables`,
+`_emit_engine_ui` and its widgets (`_emit_engine_ui_buttons`, `_ui_sliders`,
+...), `_emit_engine_class_groups`, `_emit_engine_colliders_2d`,
+`_emit_engine_physics_fixed`, `_emit_engine_animation`, and so on. Each
+section's code is unchanged; it takes the emit_engine locals it reads as
+parameters and returns the few it sets for later sections. The interfaces
+come from a definite-assignment analysis of emit_engine, and the split was
+checked by running the whole test suite with every emit_engine call compared
+against the unsplit one: same C output and same changes to the plan.
+
+The emit tests pack `tests/fixtures/MiniScene`, a complete copy of the small
+board project; `examples/unity_pack/MiniScene` keeps only its scripts.
+
 ## Script lowering and the move to cs2cpp
 
 unity_pack lowers script bodies with a translator of its own, written as
