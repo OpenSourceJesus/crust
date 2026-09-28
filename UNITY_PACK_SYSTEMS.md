@@ -386,6 +386,11 @@ unity_pack keeps the packed tables, the position accessors, and the
 5. Report touching pairs. unity_pack sends Enter / Stay / Exit by comparing with
    the previous step.
 
+`Physics2D.gravity`, `Physics.gravity` and `Time.fixedDeltaTime` start at the
+project's `Physics2DSettings.asset` / `DynamicsManager.asset` `m_Gravity` and
+`TimeManager.asset` Fixed Timestep (a float, or the newer `m_Count` /
+`m_Rate` rational), with Unity's defaults when a file is missing.
+
 Box2D-Packed is found through `--box2d PATH`, `$BOX2D_PACKED_ROOT`, or a `box2d`
 checkout beside this repository. A project with 2D physics and no checkout is
 refused with a message that says so. 3D physics (Rigidbody, BoxCollider,

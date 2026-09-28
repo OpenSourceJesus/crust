@@ -14939,6 +14939,56 @@ class TestBox2DPhysicsBackend(unittest.TestCase):
         self.assertEqual(self._run(inject=True), self._run(inject=False))
 
 
+class TestProjectPhysicsSettings(unittest.TestCase):
+    """Physics2D / Physics gravity and Fixed Timestep come from ProjectSettings."""
+
+    def _root(self, time_manager):
+        root = tempfile.mkdtemp(prefix="upack-physset-")
+        ps = os.path.join(root, "ProjectSettings")
+        os.makedirs(ps)
+        for name, body in (
+                ("Physics2DSettings.asset",
+                 "Physics2DSettings:\n  m_Gravity: {x: 1.5, y: -25}\n"),
+                ("DynamicsManager.asset",
+                 "PhysicsManager:\n  m_Gravity: {x: 0, y: -3, z: 2}\n"),
+                ("TimeManager.asset", time_manager)):
+            with open(os.path.join(ps, name), "w") as f:
+                f.write(body)
+        return root
+
+    def test_float_and_rational_timestep(self):
+        s = unity_pack.unity_physics_settings(
+            self._root("TimeManager:\n  Fixed Timestep: 0.0125\n"))
+        self.assertEqual(s["gravity2d"], (1.5, -25.0))
+        self.assertEqual(s["gravity3d"], (0.0, -3.0, 2.0))
+        self.assertEqual(s["fixed_dt"], 0.0125)
+        s = unity_pack.unity_physics_settings(self._root(
+            "TimeManager:\n  Fixed Timestep:\n    m_Count: 1411199\n"
+            "    m_Rate:\n      m_Denominator: 1\n"
+            "      m_Numerator: 141120000\n"))
+        self.assertAlmostEqual(s["fixed_dt"], 0.01, places=6)
+        self.assertEqual(
+            unity_pack.unity_physics_settings(tempfile.mkdtemp()),
+            {"gravity2d": (0.0, -9.81), "gravity3d": (0.0, -9.81, 0.0),
+             "fixed_dt": 0.02})
+
+    @needs_box2d
+    def test_packed_gravity_is_authored(self):
+        root = TestBox2DPhysicsBackend()._project()
+        shutil.copytree(
+            os.path.join(self._root("TimeManager:\n  Fixed Timestep: 0.01\n"),
+                         "ProjectSettings"),
+            os.path.join(root, "ProjectSettings"))
+        d = tempfile.mkdtemp(prefix="upack-physset-out-")
+        with contextlib.redirect_stderr(io.StringIO()):
+            unity_pack.pack(root, d, box2d_root=_BOX2D_ROOT, force=True)
+        with open(os.path.join(d, "data.c")) as f:
+            data = f.read()
+        self.assertIn("float Physics2D_gravity_x = 1.5f;", data)
+        self.assertIn("float Physics2D_gravity_y = -25.0f;", data)
+        self.assertIn("float Time_fixedDeltaTime = 0.01f;", data)
+
+
 class TestSceneManager(unittest.TestCase):
     """Every enabled build scene is packed and SceneManager swaps them."""
 

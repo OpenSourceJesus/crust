@@ -716,6 +716,42 @@ def player_identity(root):
     return company, product
 
 
+def unity_physics_settings(root):
+    """Authored Physics2D.gravity, Physics.gravity, Time.fixedDeltaTime.
+
+    Unity defaults (0,-9.81), (0,-9.81,0), 0.02 when a setting is absent.
+    Fixed Timestep is a float in older assets, a rational (m_Count ticks at
+    m_Numerator / m_Denominator Hz) in newer ones.
+    """
+    ps = os.path.join(root, "ProjectSettings")
+    num = r"\s*([-0-9.eE+]+)"
+
+    def asset(name):
+        path = os.path.join(ps, name)
+        return _read(path) if os.path.isfile(path) else ""
+
+    out = {"gravity2d": (0.0, -9.81), "gravity3d": (0.0, -9.81, 0.0),
+           "fixed_dt": 0.02}
+    m = re.search(r"m_Gravity:\s*\{x:%s,\s*y:%s\}" % (num, num),
+                  asset("Physics2DSettings.asset"))
+    if m:
+        out["gravity2d"] = (float(m.group(1)), float(m.group(2)))
+    m = re.search(r"m_Gravity:\s*\{x:%s,\s*y:%s,\s*z:%s\}" % (num, num, num),
+                  asset("DynamicsManager.asset"))
+    if m:
+        out["gravity3d"] = tuple(float(m.group(k)) for k in (1, 2, 3))
+    tm = asset("TimeManager.asset")
+    m = re.search(r"(?m)^\s*Fixed Timestep:%s\s*$" % num, tm)
+    r = re.search(r"Fixed Timestep:\s*\n\s*m_Count:%s\s*\n\s*m_Rate:\s*\n"
+                  r"\s*m_Denominator:%s\s*\n\s*m_Numerator:%s" % (num, num, num),
+                  tm)
+    if m:
+        out["fixed_dt"] = float(m.group(1))
+    elif r and float(r.group(3)) > 0:
+        out["fixed_dt"] = (float(r.group(1)) * float(r.group(2))
+                           / float(r.group(3)))
+    return out
+
 
 def _apply_camera_script_view_to_cameras(cameras, objects):
     """Match CameraScript.HandleViewSize orthographicSize on the main camera."""
@@ -17099,17 +17135,18 @@ def emit_data(plan, used_apis=None):
         # Godot's physics ticks and gravity: pixels / s^2, y down.
         p("float Time_fixedDeltaTime = %sf;" % repr(float(godot["fixed_dt"])))
     else:
-        p("float Time_fixedDeltaTime = 0.02f;")
+        uphys = plan.get("unity_physics") or unity_physics_settings("")
+        p("float Time_fixedDeltaTime = %sf;" % repr(float(uphys["fixed_dt"])))
     if want_phys and godot:
         p("float Physics2D_gravity_x = %sf;" % repr(float(godot["gravity"][0])))
         p("float Physics2D_gravity_y = %sf;" % repr(float(godot["gravity"][1])))
     elif want_phys:
-        p("float Physics2D_gravity_x = 0.f;")
-        p("float Physics2D_gravity_y = -9.81f;")
+        for axis, v in zip("xy", uphys["gravity2d"]):
+            p("float Physics2D_gravity_%s = %sf;" % (axis, repr(float(v))))
     if want_phys3:
-        p("float Physics_gravity_x = 0.f;")
-        p("float Physics_gravity_y = -9.81f;")
-        p("float Physics_gravity_z = 0.f;")
+        g3 = uphys["gravity3d"] if not godot else (0.0, -9.81, 0.0)
+        for axis, v in zip("xyz", g3):
+            p("float Physics_gravity_%s = %sf;" % (axis, repr(float(v))))
     if want_ambient:
         # Unity default ambient-ish grey; host may override.
         p("float RenderSettings_ambient_r = 0.2f;")
@@ -19097,6 +19134,8 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
     plan = plan_layouts(objects, analyses)
     if _godot.is_godot_project(root):
         plan["godot"] = _godot.physics_settings(root)
+    else:
+        plan["unity_physics"] = unity_physics_settings(root)
     if soa or soa_vec4:
         plan = apply_soa_layout(plan, vec4=bool(soa_vec4))
     else:
