@@ -697,7 +697,8 @@ same project into the same outdir:
   `.cpp` is byte-identical (and the lowered `.c` exists). Other outputs use
   write-if-different so mtimes stay put for `gcc`.
 
-Fingerprint covers `tools/unity_pack.py`, `tools/cpprust.py`,
+Fingerprint covers `tools/unity_pack*.py`, `tools/cs2cpp.py`,
+`tools/cpprust.py`, Box2D-Packed's `box2d_unity.py`,
 `ProjectSettings/`, and authored `Assets/` extensions (`.cs`, scenes,
 prefabs, metas, common textures/audio, etc.). It does **not** walk
 `Library/PackageCache` — after a UPM-only change, pass `--force`.

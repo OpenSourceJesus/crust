@@ -19067,20 +19067,26 @@ def _file_fingerprint_entry(path, root):
     return (rel, int(st.st_size), int(mtime_ns))
 
 
-def _fingerprint_entries(root):
-    """Sorted (relpath, size, mtime_ns) for packer + project inputs."""
+def _fingerprint_entries(root, box2d_root=None):
+    """Sorted (relpath, size, mtime_ns) for packer + project inputs.
+
+    Every module that shapes the output counts, the Box2D-Packed glue
+    generator included: an edit to any of them is a new pack.
+    """
     root = os.path.abspath(root)
     entries = []
     tools_dir = os.path.dirname(os.path.abspath(__file__))
-    for name in ("unity_pack.py", "cpprust.py"):
-        p = os.path.join(tools_dir, name)
-        if os.path.isfile(p):
-            try:
-                st = os.stat(p)
-            except OSError:
-                continue
-            mtime_ns = getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))
-            entries.append(("tools/%s" % name, int(st.st_size), int(mtime_ns)))
+    names = sorted(n for n in os.listdir(tools_dir)
+                   if n.startswith("unity_pack") and n.endswith(".py"))
+    for name in names + ["cs2cpp.py", "cpprust.py"]:
+        e = _file_fingerprint_entry(os.path.join(tools_dir, name), tools_dir)
+        if e:
+            entries.append(("tools/%s" % name,) + e[1:])
+    b2d = find_box2d_root(box2d_root)
+    if b2d:
+        e = _file_fingerprint_entry(os.path.join(b2d, "box2d_unity.py"), b2d)
+        if e:
+            entries.append(("box2d/box2d_unity.py",) + e[1:])
     ps = os.path.join(root, "ProjectSettings")
     if os.path.isdir(ps):
         for dirpath, _dns, names in os.walk(ps):
@@ -19124,13 +19130,14 @@ def _hash_fingerprint_entries(entries, soa=True, soa_vec4=False,
     return h.hexdigest()
 
 
-def _input_fingerprints(root, soa=True, soa_vec4=False, gpu_handles=False):
+def _input_fingerprints(root, soa=True, soa_vec4=False, gpu_handles=False,
+                        box2d_root=None):
     """(full, assets, scripts) fingerprints.
 
     *assets* covers tools, ProjectSettings, and non-``.cs`` Assets inputs.
     *scripts* covers ``Assets/**/*.cs`` only. *full* is the early-exit key.
     """
-    entries = _fingerprint_entries(root)
+    entries = _fingerprint_entries(root, box2d_root)
     script_entries = [e for e in entries if e[0].endswith(".cs")]
     asset_entries = [e for e in entries if not e[0].endswith(".cs")]
     full = _hash_fingerprint_entries(entries, soa=soa, soa_vec4=soa_vec4,
@@ -19366,7 +19373,8 @@ def pack(root, outdir, soa=True, soa_vec4=False, force=False, strict=False,
     _TYPE_DECL_ROOT[0] = os.path.abspath(root)
     os.makedirs(outdir, exist_ok=True)
     fp, assets_fp, scripts_fp = _input_fingerprints(
-        root, soa=soa, soa_vec4=soa_vec4, gpu_handles=gpu_handles)
+        root, soa=soa, soa_vec4=soa_vec4, gpu_handles=gpu_handles,
+        box2d_root=box2d_root)
     if not force:
         stamp = _read_stamp(outdir)
         if (stamp
