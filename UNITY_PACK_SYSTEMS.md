@@ -35,7 +35,8 @@ time C under both gcc and clang when both are on PATH (`--cc` to restrict).
 | `Input.GetButton("Jump")` | Host int `engine_input_button_Jump` |
 | `Input.GetKey("a")` | Host table `engine_input_key[256]` |
 | `Keyboard.current` | Non-NULL when `engine_keyboard_connected` |
-| `Keyboard.current.<name>Key.isPressed` | Host int `engine_keyboard_<name>` |
+| `Keyboard.current.<name>Key.isPressed` | Host int `engine_keyboard_<name>`; the GLFW hosts feed letters, digits, space, enter, escape, tab, backspace, shift / ctrl / alt, arrows |
+| `.wasPressedThisFrame` / `.wasReleasedThisFrame` | Key state latched once per `engine_tick` |
 
 Legacy Input Manager and Input System `Keyboard.current` (connected
 device + key state). Bare `Keyboard` needs `using UnityEngine.InputSystem;`

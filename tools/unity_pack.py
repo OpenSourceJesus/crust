@@ -13910,6 +13910,26 @@ def emit_engine(plan, analyses, used_apis):
               % key)
             p("}")
             p("")
+        p("/* wasPressed/ReleasedThisFrame: key state latched once per"
+          " engine_tick. */")
+        for key in sorted(keyboard_keys):
+            p("static int _engine_kb_now_%s, _engine_kb_was_%s;"
+              % (key, key))
+            p("static int Keyboard_%sKey_wasPressedThisFrame(void) {" % key)
+            p("    return _engine_kb_now_%s && !_engine_kb_was_%s;"
+              % (key, key))
+            p("}")
+            p("static int Keyboard_%sKey_wasReleasedThisFrame(void) {" % key)
+            p("    return !_engine_kb_now_%s && _engine_kb_was_%s;"
+              % (key, key))
+            p("}")
+        p("static void _engine_keyboard_latch(void) {")
+        for key in sorted(keyboard_keys):
+            p("    _engine_kb_was_%s = _engine_kb_now_%s;" % (key, key))
+            p("    _engine_kb_now_%s = Keyboard_%sKey_isPressed();"
+              % (key, key))
+        p("}")
+        p("")
     if want_str_plus:
         # C# "" + 1 → "1"; C's ""+1 is pointer arithmetic (often prints garbage).
         # Ring of buffers: nested _str_plus_*(prev, x) must not snprintf into
@@ -14517,6 +14537,8 @@ def emit_engine(plan, analyses, used_apis):
     p("    if (_dt < 0.f) _dt = 0.f;")
     if _multi_scene(plan):
         p("    _engine_scene_apply_pending();")
+    if want_keyboard:
+        p("    _engine_keyboard_latch();")
     if "Time.time" in used_apis:
         p("    Time_time = Time_time + Time_deltaTime;")
     if want_ui:
@@ -16720,8 +16742,9 @@ def _lower_method_body(body, cl, plan, site=None, collision2d_param=None):
     text = cs2cpp.lower_bindings(text, _UNITY_API_SCENE)
     # Keyboard.current.<name>Key.isPressed → helpers (null-safe via connected).
     text = cs2cpp.code_sub(
-        r"(?:UnityEngine\.InputSystem\.)?Keyboard\.current\.(\w+)Key\.isPressed\b",
-        lambda m: "Keyboard_%sKey_isPressed()" % m.group(1),
+        r"(?:UnityEngine\.InputSystem\.)?Keyboard\.current\.(\w+)Key\."
+        r"(isPressed|wasPressedThisFrame|wasReleasedThisFrame)\b",
+        lambda m: "Keyboard_%sKey_%s()" % (m.group(1), m.group(2)),
         text)
     text = cs2cpp.code_sub(
         r"(?:UnityEngine\.InputSystem\.)?Keyboard\.current\b",
